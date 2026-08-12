@@ -1835,3 +1835,339 @@ class TestUnlabeledScoringIsPure:
         mod.score_unlabeled_query(hits, baseline=baseline)
         assert hits == before_hits
         assert baseline == before_baseline
+
+
+# ---------------------------------------------------------------------------
+# The decision-table artifact contract
+# ---------------------------------------------------------------------------
+#
+# This artifact exists to be READ by whoever lands task 3111, so its contract
+# is about disclosure, not only about numbers.  Four things a reader cannot
+# reconstruct from a bare table have to be stated per arm:
+#
+#   (a) the record-id ALIASING — a grouped document is emitted under its
+#       canonical's record_id, so a member folding upward scores as "canonical
+#       found".  Both rates are printed side by side.
+#   (b) the SIGHTING-CREDITING knob — a fixed policy at :927 in the landed
+#       code, a dial here, and the claim-recall ceiling moves with it.
+#   (c) whether the arm SUPPRESSES, split from whether it needs `contested`,
+#       because those are different blockers.
+#   (d) that PRD V2's esc-5712 protection is UNIMPLEMENTABLE today, naming
+#       the live vocabulary set that does not contain `contested`.
+#
+# And a refusal: a partial table must never render as a complete one.
+
+
+REQUIRED_SELECTION_METRICS = (
+    'claim_recall',
+    'tokens_per_query',
+    'topic_diversity',
+    'baseline_retention_at_k',
+    'window_displacement',
+    'canonical_aliased_in_top_k',
+    'canonical_unaliased_in_top_k',
+)
+
+
+def _arm_block(arm, *, labeled=True, k=10, drop=None, means=None):
+    """A minimal well-formed scored-arm block, with one metric optionally dropped."""
+    base = {
+        'claim_recall': 0.5,
+        'tokens_per_query': 100.0,
+        'topic_diversity': 3.0,
+        'baseline_retention_at_k': 1.0,
+        'window_displacement': 0.0,
+        'canonical_aliased_in_top_k': 0.9,
+        'canonical_unaliased_in_top_k': 0.4,
+    }
+    if means:
+        base.update(means)
+    if drop:
+        base.pop(drop)
+    return {
+        'arm': arm,
+        'label': _mod().ARM_LABELS[arm],
+        'k': k,
+        'labeled': labeled,
+        'query_count': 4,
+        'rows': [],
+        'means': base,
+    }
+
+
+def _scored(drop=None, drop_arm=None, means_by_arm=None, omit_arm=None):
+    mod = _mod()
+    means_by_arm = means_by_arm or {}
+    e2, production = {}, {}
+    for arm in mod.ARM_KEYS:
+        if arm == omit_arm:
+            continue
+        e2[arm] = _arm_block(
+            arm, labeled=True, k=10,
+            drop=drop if arm == (drop_arm or arm) else None,
+            means=means_by_arm.get(arm),
+        )
+        prod_means = {
+            'claim_recall': None,
+            'canonical_aliased_in_top_k': None,
+            'canonical_unaliased_in_top_k': None,
+        }
+        production[arm] = _arm_block(
+            arm, labeled=False, k=5, means=prod_means,
+        )
+    return {
+        'shape': 'c_peers',
+        'sighting_crediting': 'uncredited',
+        'per_topic_cap': 1,
+        'token_estimator': 'char-proxy',
+        'e2': e2,
+        'production': production,
+    }
+
+
+class TestThePartialTableRefusal:
+    """Mirrors `_check_arms` / IncompleteReportError (:1887-1920)."""
+
+    def test_a_complete_scoring_builds(self):
+        report = _mod().build_selection_report(_scored())
+        assert report['arms']
+
+    def test_a_missing_arm_is_refused(self):
+        mod = _mod()
+        with pytest.raises(mod.IncompleteSelectionError) as exc:
+            mod.build_selection_report(_scored(omit_arm='topic_diversity_cap'))
+        assert 'topic_diversity_cap' in str(exc.value)
+
+    def test_an_unknown_arm_is_refused_alongside_the_missing_one(self):
+        """The unknown name is the actionable half — a typo, not a crash."""
+        mod = _mod()
+        scored = _scored(omit_arm='topic_diversity_cap')
+        scored['e2']['topic_diversity_kap'] = _arm_block('flat_read')
+        with pytest.raises(mod.IncompleteSelectionError) as exc:
+            mod.build_selection_report(scored)
+        message = str(exc.value)
+        assert 'topic_diversity_kap' in message
+        assert 'topic_diversity_cap' in message
+
+    @pytest.mark.parametrize('metric', REQUIRED_SELECTION_METRICS)
+    def test_a_missing_metric_is_refused_by_name(self, metric):
+        mod = _mod()
+        with pytest.raises(mod.IncompleteSelectionError) as exc:
+            mod.build_selection_report(_scored(drop=metric, drop_arm='promoting_pin'))
+        assert metric in str(exc.value)
+        assert 'promoting_pin' in str(exc.value)
+
+    def test_a_none_metric_is_NOT_a_missing_one(self):
+        """A measured no-measurement is legitimate; an ABSENT key is not.
+
+        The production half is built entirely of Nones by construction — a
+        refusal that could not tell the two apart would make the honest
+        half of this artifact unrenderable.
+        """
+        mod = _mod()
+        report = mod.build_selection_report(
+            _scored(means_by_arm={'flat_read': {'claim_recall': None}}),
+        )
+        assert report['arms']['flat_read']['e2']['claim_recall'] is None
+
+
+class TestTheAliasingDisclosure:
+    """(a) — the unaliased rate is printed BESIDE the aliased one, per arm."""
+
+    def test_both_rates_appear_for_every_arm(self):
+        mod = _mod()
+        report = mod.build_selection_report(_scored())
+        for arm in mod.ARM_KEYS:
+            block = report['arms'][arm]['e2']
+            assert 'canonical_aliased_in_top_k' in block
+            assert 'canonical_unaliased_in_top_k' in block
+
+    def test_the_markdown_prints_both_columns(self):
+        mod = _mod()
+        markdown = mod.render_selection_markdown(mod.build_selection_report(_scored()))
+        assert 'aliased' in markdown.lower()
+        assert 'unaliased' in markdown.lower()
+
+    def test_the_markdown_explains_the_aliasing_mechanism(self):
+        """A reader must not have to infer it from a gap between two numbers."""
+        mod = _mod()
+        markdown = mod.render_selection_markdown(mod.build_selection_report(_scored()))
+        assert 'record_id' in markdown
+        assert 'canonical' in markdown.lower()
+
+    def test_it_does_not_cite_b_grouped_0_97_as_a_retrieval_property(self):
+        """The E2 table's 0.97 is a property of the TRANSFORM, not of retrieval.
+
+        The artifact may name the number — that is the finding — but it must
+        not present it as retrieval having found the canonical.
+        """
+        mod = _mod()
+        markdown = mod.render_selection_markdown(mod.build_selection_report(_scored()))
+        for line in markdown.splitlines():
+            if '0.97' in line:
+                lowered = line.lower()
+                assert 'alias' in lowered or 'transform' in lowered or 'not ' in lowered
+
+
+class TestTheSightingCreditingKnob:
+    """(b) — never left implicit."""
+
+    def test_the_setting_is_stated_in_the_report(self):
+        mod = _mod()
+        report = mod.build_selection_report(_scored())
+        assert report['sighting_crediting'] in ('uncredited', 'rendered')
+
+    def test_the_markdown_names_the_knob_and_its_setting(self):
+        mod = _mod()
+        markdown = mod.render_selection_markdown(mod.build_selection_report(_scored()))
+        lowered = markdown.lower()
+        assert 'sighting' in lowered
+        assert 'uncredited' in lowered
+
+    def test_the_markdown_states_the_ceiling_arithmetic(self):
+        """With sightings uncredited the recall ceiling is fixed by arithmetic,
+        not by the transform — a reader comparing arms has to know that."""
+        mod = _mod()
+        markdown = mod.render_selection_markdown(mod.build_selection_report(_scored()))
+        assert 'ceiling' in markdown.lower()
+
+
+class TestTheSuppressionColumn:
+    """(c) — suppressing, and needing `contested`, are DIFFERENT facts."""
+
+    def test_arm_two_is_marked_suppressing(self):
+        mod = _mod()
+        report = mod.build_selection_report(_scored())
+        spec = report['arms']['topic_keyed_grouped']['spec']
+        assert spec['drops_ranked_records'] is True
+        assert spec['requires_contested_key_for_v2'] is True
+
+    def test_arm_one_needs_no_contested_key(self):
+        mod = _mod()
+        spec = mod.build_selection_report(_scored())['arms']['promoting_pin']['spec']
+        assert spec['requires_contested_key_for_v2'] is False
+        assert spec['drops_ranked_records'] is False
+        assert spec['displaces_at_window_edge'] is True
+
+    def test_arm_three_suppresses_yet_needs_no_contested_key(self):
+        """The distinction that decides what 3111 can land TODAY."""
+        mod = _mod()
+        spec = mod.build_selection_report(_scored())['arms']['topic_diversity_cap']['spec']
+        assert spec['drops_ranked_records'] is True
+        assert spec['requires_contested_key_for_v2'] is False
+
+    def test_the_markdown_states_it_per_arm(self):
+        mod = _mod()
+        markdown = mod.render_selection_markdown(mod.build_selection_report(_scored()))
+        lowered = markdown.lower()
+        assert 'suppress' in lowered
+        assert 'contested' in lowered
+
+    def test_the_two_flags_are_not_collapsed_into_one_column(self):
+        """Collapsing them would tell 3111 the cap is blocked on a key that
+        does not exist — the opposite of the truth."""
+        mod = _mod()
+        report = mod.build_selection_report(_scored())
+        cap = report['arms']['topic_diversity_cap']['spec']
+        grouped = report['arms']['topic_keyed_grouped']['spec']
+        assert cap['drops_ranked_records'] == grouped['drops_ranked_records']
+        assert cap['requires_contested_key_for_v2'] != grouped['requires_contested_key_for_v2']
+
+
+class TestTheV2Impossibility:
+    """(d) — the hard constraint, stated verbatim and evidenced."""
+
+    def test_the_markdown_quotes_the_v2_protection(self):
+        mod = _mod()
+        markdown = mod.render_selection_markdown(mod.build_selection_report(_scored()))
+        assert 'contested children are never suppressed' in markdown.lower()
+
+    def test_it_names_esc_5712(self):
+        mod = _mod()
+        markdown = mod.render_selection_markdown(mod.build_selection_report(_scored()))
+        assert 'esc-5712' in markdown.lower()
+
+    def test_it_names_the_live_reserved_vocabulary_set(self):
+        """Not asserted from memory: the five keys, and `contested` absent."""
+        mod = _mod()
+        markdown = mod.render_selection_markdown(mod.build_selection_report(_scored()))
+        for key in ('topic', 'canonical', 'kind', 'parent_id', 'supersedes'):
+            assert key in markdown
+        assert 'RESERVED_VOCABULARY_KEYS' in markdown
+        assert 'memory_metadata.py' in markdown
+
+    def test_the_named_set_matches_the_live_one(self):
+        """A hard-coded list here would rot silently the day a key is added."""
+        from fused_memory.memory_metadata import (  # noqa: PLC0415
+            RESERVED_VOCABULARY_KEYS,
+        )
+
+        mod = _mod()
+        assert set(mod.RESERVED_VOCABULARY_KEYS) == set(RESERVED_VOCABULARY_KEYS)
+        assert 'contested' not in RESERVED_VOCABULARY_KEYS
+
+    def test_it_states_contested_is_a_fixture_field(self):
+        mod = _mod()
+        markdown = mod.render_selection_markdown(mod.build_selection_report(_scored()))
+        lowered = markdown.lower()
+        assert 'fixture' in lowered
+        assert 'no writer' in lowered or 'has no writer' in lowered
+
+
+class TestTheRecommendation:
+    """The artifact is FOR task 3111. It must answer 3111's question."""
+
+    def test_there_is_a_recommendation_section(self):
+        mod = _mod()
+        markdown = mod.render_selection_markdown(mod.build_selection_report(_scored()))
+        assert '## Recommendation' in markdown
+
+    def test_it_names_task_3111(self):
+        mod = _mod()
+        markdown = mod.render_selection_markdown(mod.build_selection_report(_scored()))
+        assert '3111' in markdown
+
+    def test_it_names_exactly_one_winner_from_the_arm_set(self):
+        mod = _mod()
+        report = mod.build_selection_report(_scored())
+        assert report['recommendation']['arm'] in mod.ARM_KEYS
+
+    def test_the_recommendation_carries_its_rationale(self):
+        mod = _mod()
+        report = mod.build_selection_report(_scored())
+        assert len(report['recommendation']['rationale']) > 40
+
+    def test_every_arm_has_exactly_one_row_in_the_markdown(self):
+        mod = _mod()
+        markdown = mod.render_selection_markdown(mod.build_selection_report(_scored()))
+        for arm in mod.ARM_KEYS:
+            label = mod.ARM_LABELS[arm]
+            rows = [ln for ln in markdown.splitlines()
+                    if ln.startswith('| ') and label in ln]
+            assert len(rows) == 1, f'{arm}: {len(rows)} rows'
+
+
+class TestTheNoMeasurementConvention:
+    """A None must never print as 0.00 — reuses `_cell` / `_NO_MEASUREMENT`."""
+
+    def test_a_none_renders_as_the_em_dash(self):
+        mod = _mod()
+        markdown = mod.render_selection_markdown(mod.build_selection_report(_scored()))
+        assert _bake_off()._NO_MEASUREMENT in markdown
+
+    def test_the_production_labeled_columns_render_as_no_measurement(self):
+        mod = _mod()
+        markdown = mod.render_selection_markdown(mod.build_selection_report(_scored()))
+        section = markdown.split('Production')[-1]
+        assert '0.00' not in section.split('## ')[0]
+
+    def test_the_reason_for_the_dash_is_printed(self):
+        mod = _mod()
+        markdown = mod.render_selection_markdown(mod.build_selection_report(_scored()))
+        assert 'unlabeled' in markdown.lower()
+        assert 'ground truth' in markdown.lower()
+
+    def test_it_reuses_the_bake_offs_cell_renderer(self):
+        """INV-5: there is not a second `—` convention in this repo."""
+        mod = _mod()
+        assert mod._cell is _bake_off()._cell
