@@ -15,6 +15,7 @@ test_usage_gate_exhaustive.py) so it stays independent of the big suites.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from datetime import UTC, datetime
@@ -329,6 +330,94 @@ class TestInvokeSlotScope:
 
         assert acct.phase == AccountPhase.CAPPED
         assert acct.scope_caps == {}
+
+
+# ===========================================================================
+# Task 4096 — a scoped CapHit must still release the PROBE_IN_FLIGHT claim
+# ===========================================================================
+
+
+async def _probe_in_flight_slot(gate, *, scope):
+    """Drive gate's sole account to PROBE_IN_FLIGHT through before_invoke().
+
+    ``acct.probing = True`` uses the legacy boolean shim (no ``_transition``, so
+    no resume-probe background task is started — this file's ``make_gate`` only
+    AsyncMocks ``_run_probe``); ``before_invoke`` then takes the real
+    ``if acct.probing:`` branch (usage_gate.py:867) and performs the genuine
+    PROBING -> PROBE_IN_FLIGHT transition, so ``_open`` is correctly cleared and
+    the lease generation matches (no spurious stale-lease warning).
+    """
+    acct = gate._accounts[0]
+    acct.probing = True
+    lease = await gate.before_invoke(scope=scope)
+    assert acct.phase == AccountPhase.PROBE_IN_FLIGHT
+    assert gate._open.is_set() is False  # single-account gate closed by the claim
+    return acct, InvokeSlot(gate, lease, scope=scope)
+
+
+class TestScopedCapHitReleasesProbeSlot:
+    """A scoped ``CapHit`` reported while the account is PROBE_IN_FLIGHT must
+    release the probe claim, exactly as the ``NearCap`` arm already does.
+
+    The scoped ``_handle_cap_detected`` branch deliberately bypasses
+    ``_transition`` (invariant S5), so — unlike the unscoped CapHit, which
+    releases the claim as a side effect of the CAPPED transition — nothing else
+    on this path can clear PROBE_IN_FLIGHT, and ``report()``'s
+    ``finally: _settled = True`` suppresses ``invoke_slot()``'s ``__aexit__``
+    safety net. This locks ``report()``'s own docstring invariant: the claim
+    "is released on every path", and a scoped cap "leaves the account phase
+    AVAILABLE".
+    """
+
+    async def test_scoped_cap_hit_releases_probe_and_leaves_account_selectable(self):
+        gate = make_gate(['a'])
+        target = datetime(2026, 5, 1, 18, 0, tzinfo=UTC)
+        acct, slot = await _probe_in_flight_slot(gate, scope=SCOPE)
+
+        slot.report(CapHit(resets_at=target, reason='x'))
+
+        assert slot._settled is True
+        # S5 attribution preserved — the fix must not weaken the scoped cap write.
+        sc = acct.scope_caps[SCOPE]
+        assert sc.capped is True
+        assert sc.resets_at == target
+        # The probe claim is released (report()'s own documented invariant).
+        assert acct.phase == AccountPhase.AVAILABLE
+        assert acct.probe_in_flight is False
+        assert gate._open.is_set() is True  # DD-5: gate not deadlocked
+
+        # Bounded: in the RED state before_invoke() blocks forever at
+        # usage_gate.py:995-996, so a bare await would fail as a 60s suite
+        # timeout instead of a sub-second, legible TimeoutError.
+        lease = await asyncio.wait_for(gate.before_invoke(), timeout=1.0)
+        assert lease is not None
+        assert lease.name == 'a'
+
+    async def test_unscoped_cap_hit_still_caps_account(self):
+        gate = make_gate(['a'])
+        target = datetime(2026, 5, 1, 18, 0, tzinfo=UTC)
+        acct, slot = await _probe_in_flight_slot(gate, scope=None)
+
+        slot.report(CapHit(resets_at=target, reason='x'))
+
+        assert acct.phase == AccountPhase.CAPPED
+        assert acct.resets_at == target
+        assert acct.scope_caps == {}
+        # The gate must STAY closed — the added release is a no-op here (the
+        # idempotency already pinned by test_usage_gate_exhaustive.py's
+        # test_noop_after_handle_cap_detected_already_cleared).
+        assert gate._open.is_set() is False
+
+    async def test_scoped_cap_hit_preserves_near_cap_annotation(self):
+        gate = make_gate(['a'])
+        acct, slot = await _probe_in_flight_slot(gate, scope=SCOPE)
+        acct.near_cap = True
+
+        slot.report(CapHit(resets_at=None, reason='x'))
+
+        # release_probe_slot passes clear_near_cap=False (usage_gate.py:2127).
+        assert acct.near_cap is True
+        assert acct.phase == AccountPhase.AVAILABLE
 
 
 # ===========================================================================
