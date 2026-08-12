@@ -497,6 +497,17 @@ Which exit status each outcome must write is specified normatively in
 
 ### 3.7 Recovery and failure paths
 
+The normative specification of the task-status × escalation-state graph is
+[docs/task-escalation-state-spec.md](docs/task-escalation-state-spec.md) — §4
+is the state × owner table, §5 the outcome contract, §7 the recovery and sweep
+contract. This section is the *descriptive* introduction to it: where the two
+disagree, the spec states the intent and the divergence is a defect (the spec's
+§8 keeps the live divergence register). The two invariants this section leans
+on, INV-6 `status-matches-liveness` and INV-7 `holds-owned-and-bounded`, are
+stated normatively in
+[docs/legibility/design-invariants.md](docs/legibility/design-invariants.md)
+and are not restated here.
+
 - **What `_mark_blocked` actually is.** `_mark_blocked`
   (`orchestrator/src/orchestrator/workflow.py`, ~:14384) is the choke point for
   `TaskWorkflow`'s **own** failure parks, and the only `blocked` writer that
@@ -540,12 +551,55 @@ Which exit status each outcome must write is specified normatively in
   the sanctioned carve-out. `infra-hold`, unlike `blocked`, *does* have a
   single production writer — `_mark_blocked(block_status='infra-hold')`, called
   from `workflow.py` ~:7363.
-- **Stranded tasks.** `Harness._reconcile_stranded_in_progress` sweeps
-  `in-progress` tasks with no live claimant back to `pending`, or to `done`
-  with `found_on_main` provenance if the work is already on `main`. A
-  scheduler phase (`_phase_redispatch_stranded_blocked`) does the same for
-  stranded `blocked` tasks whose dependencies have since resolved and whose
-  escalation has closed.
+- **Stranded tasks.** `Harness._reconcile_stranded_in_progress` (`harness.py`
+  ~:4660) sweeps `in-progress` tasks with no live claimant, delegating per task
+  to `_reconcile_one_stranded` (~:5247). Liveness is not guessed: it is the
+  `claimant_run_id` + `heartbeat_at` + `is_stranded` oracle in
+  `shared/src/shared/task_claimant.py`. The classification itself is a single
+  table, `_RECOVERY` in
+  `orchestrator/src/orchestrator/task_ground_truth.py` (~:591), keyed by
+  (status × branch-state × open-escalation × deploy-phase) and defaulting
+  fail-safe to `LEAVE` for any shape it does not recognize — including every
+  shape with a live claimant. `RecoveryAction` has exactly four members
+  (~:91): `MARK_DONE_WITH_PROVENANCE` (branch on `main` or carrying a merge
+  marker → `found_on_main`, behind the provenance and delivered-checks gates),
+  `REVERT_TO_PENDING` (branch off-main or gone, no open record),
+  `RE_FILE_ESCALATION` (a row that lost its record — re-files a
+  `stranded_blocked` L1 and deliberately changes **no** status), and `LEAVE`.
+  The matching sweep for stranded `blocked` rows is the scheduler phase
+  `_phase_redispatch_stranded_blocked` (`scheduler.py` ~:5655).
+- **Pin discrimination — what an open record actually vetoes.** The shared
+  classifier `escalation/src/escalation/pins.py` distinguishes a **dead own-L0**
+  (`DEAD_L0`) from a **queue-backed L1/L2 handoff** (`QUEUE_HANDOFF`) from a
+  non-pinning `info` annotation, fails safe *to* pinning on an unknown severity,
+  and treats an unreadable store as a distinguishable third result
+  (`classify_pins(records=None)` → `store_unavailable`) rather than as "no
+  records". It is **already consumed in production by the done-flip gate**
+  (`harness.py` ~:10711, asking `PinReport.vetoes_done_flip`; task 3534 / spec
+  §8-E8) — which is why a genuinely-landed task carrying a lone `escalate_info`
+  record no longer re-dispatches forever. What is **not** yet rewired is the
+  *stranded-recovery* veto: `_shape()` still folds the question to
+  `has_open_escalation = bool(report.open_escalations)`
+  (`task_ground_truth.py` ~:682) and the scheduler phase still short-circuits
+  on a bare `get_by_task(tid, status='pending')` truthiness read
+  (`scheduler.py` ~:5756), so at those two sites an open record of *any* level
+  and *any* severity holds a strand off. The plumbing is already in place —
+  `EscalationRef` carries `severity` and `filing_claimant_run_id` precisely so
+  a consumer can feed `classify_pins` without re-reading the store (~:504).
+  One gap is deliberately still open and should not be read as settled: when no
+  escalation queue is injected, `_resolve_open_escalations` returns `[]`, which
+  is indistinguishable from a genuine "no open escalations" (~:520) — the
+  collapse the `store_unavailable` result exists to prevent. That is task 3535.
+- **Converting a pinned strand (normative — NOT yet landed).** The spec's
+  recovery rule is that a stranded row carrying a genuinely-pinning record must
+  be **converted to `blocked`** and attributed to that record —
+  `CONVERT_TO_BLOCKED` — rather than reverted to `pending` underneath the
+  responder or left stranded: nothing new is filed, in-flight work is
+  preserved, and the row re-couples to the ladder's existing wake edges. Read
+  this as intent, not as current behaviour: `RecoveryAction` has no such member
+  today (the enum is the four above, and `CONVERT_TO_BLOCKED` appears nowhere
+  in code). It lands via `plans/task-escalation-state-graph-prd.md` leaf δ, in
+  log-mode first with enforcement behind the soak gate.
 - **Orphaned worktrees.** `Harness._reap_orphan_worktrees` (`harness.py`
   ~:4063) quarantines, then reaps, `.worktrees/*` directories left behind by a
   crashed or killed workflow.
