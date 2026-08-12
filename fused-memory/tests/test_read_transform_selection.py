@@ -913,3 +913,293 @@ class TestArmTwoIsDeclaredSuppressing:
 
         assert len(result.records) < len(hits)
         assert 'amend-1' not in _ids(result.records)
+
+
+# ---------------------------------------------------------------------------
+# Arm (3): the TOPIC-DIVERSITY CAP (MMR-style)
+# ---------------------------------------------------------------------------
+#
+# The cheapest member of the family: it renders nothing, credits nothing and
+# synthesizes nothing.  It only ever DROPS, which is why it is a suppressing
+# read — and yet it reads only `metadata['topic']`, so unlike arm (2) it is
+# landable today with no `contested` key in existence.  Those two facts are
+# what step-19's report column has to state separately.
+
+
+def _capped_corpus():
+    """Two crowded topics plus untopiced slab records.
+
+    Rank order is the list order.  `t-a` is crowded with its canonical
+    ranked SECOND, behind a peer — the case that separates "keep the
+    best-ranked member" from "keep the canonical".
+    """
+    return [
+        _rec('a-peer', topic='t-a', content='a peer body'),
+        _rec('a-canon', topic='t-a', canonical=True, content='a canonical body'),
+        _rec('slab-1', topic=None, content='distractor one'),
+        _rec('b-canon', topic='t-b', canonical=True, content='b canonical body'),
+        _rec('b-peer', topic='t-b', content='b peer body'),
+        _rec('slab-2', topic=None, content='distractor two'),
+    ]
+
+
+class TestTopicDiversityCapKeepsOnePerTopic:
+    """At most `per_topic` records of any one topic survive the window."""
+
+    def test_at_most_one_record_per_topic_survives(self):
+        mod = _mod()
+        hits = _capped_corpus()
+
+        kept = mod.apply_topic_diversity_cap(hits, _canonical_index(*hits))
+
+        topics = [r.metadata['topic'] for r in kept if 'topic' in r.metadata]
+        assert sorted(topics) == ['t-a', 't-b']
+
+    def test_per_topic_is_a_dial_not_a_hardcoded_one(self):
+        mod = _mod()
+        hits = _capped_corpus()
+
+        kept = mod.apply_topic_diversity_cap(
+            hits, _canonical_index(*hits), per_topic=2,
+        )
+
+        # Both topics had exactly two members, so a cap of 2 drops nothing.
+        assert _ids(kept) == _ids(hits)
+
+    def test_the_canonical_wins_even_when_a_peer_outranked_it(self):
+        """Diversity picks the ANCHOR, not merely the luckiest ANN result.
+
+        `a-peer` ranks above `a-canon`.  Keeping the peer would hand the
+        reader one arbitrary member of the topic; keeping the canonical
+        hands them the topic's anchor, which is the whole reason the write
+        shape marks one.
+        """
+        mod = _mod()
+        hits = _capped_corpus()
+
+        kept = mod.apply_topic_diversity_cap(hits, _canonical_index(*hits))
+
+        assert 'a-canon' in _ids(kept)
+        assert 'a-peer' not in _ids(kept)
+
+    def test_the_survivor_sits_at_the_topics_BEST_member_rank(self):
+        """Best-rank, agreeing with arm (2) and with `rescore` (:3246).
+
+        Demoting the survivor to the canonical's own (worse) rank would
+        make the arm look worse at every k as an artifact of THIS
+        transform rather than of the read shape.
+        """
+        mod = _mod()
+        hits = _capped_corpus()
+
+        kept = mod.apply_topic_diversity_cap(hits, _canonical_index(*hits))
+
+        # `a-peer` held rank 0; its topic keeps that slot, with `a-canon` in it.
+        assert _ids(kept) == ['a-canon', 'slab-1', 'b-canon', 'slab-2']
+
+    def test_a_topic_whose_canonical_never_ranked_keeps_its_best_peer(self):
+        """The cap only ever DROPS — it never pulls an unranked record in.
+
+        Injecting the absent canonical here would be arm (1)'s promotion,
+        and would credit this arm for retrieval the store never performed.
+        """
+        mod = _mod()
+        absent_canonical = _rec('c-canon', topic='t-c', canonical=True)
+        hits = [
+            _rec('c-peer-lo', topic='t-c', content='c lower'),
+            _rec('c-peer-hi', topic='t-c', content='c higher'),
+        ]
+
+        kept = mod.apply_topic_diversity_cap(
+            hits, _canonical_index(*hits, absent_canonical),
+        )
+
+        assert _ids(kept) == ['c-peer-lo']
+        assert 'c-canon' not in _ids(kept)
+
+
+class TestTheDistractorSlabIsNeverCapped:
+    """Untopiced records are invisible to a topic cap, by construction.
+
+    `_distractor_records` (:545) stamps `category` and NOT ONE reserved
+    vocabulary key — deliberately, so a distractor cannot become a right
+    answer.  A cap that quietly collapsed them to one would delete the
+    contamination variable the whole bake-off is controlled on.
+    """
+
+    def test_every_untopiced_record_survives_by_identity(self):
+        mod = _mod()
+        hits = _capped_corpus()
+
+        kept = mod.apply_topic_diversity_cap(hits, _canonical_index(*hits))
+
+        slab = [r for r in hits if 'topic' not in r.metadata]
+        assert len(slab) == 2
+        for record in slab:
+            assert any(out is record for out in kept)
+
+    def test_an_all_slab_window_is_returned_completely_untouched(self):
+        mod = _mod()
+        hits = [_rec(f'slab-{i}', topic=None, content=f'd{i}') for i in range(5)]
+
+        kept = mod.apply_topic_diversity_cap(hits, _canonical_index(*hits))
+
+        assert len(kept) == len(hits)
+        for out, original in zip(kept, hits):
+            assert out is original
+
+
+class TestTheCapSynthesizesNothing:
+    """No rendering, no crediting, no new records — the cheapest arm."""
+
+    def test_every_returned_record_is_an_input_record_by_identity(self):
+        mod = _mod()
+        hits = _capped_corpus()
+
+        kept = mod.apply_topic_diversity_cap(hits, _canonical_index(*hits))
+
+        for out in kept:
+            assert any(out is original for original in hits), (
+                f'{out.record_id} was synthesized; the cap must only drop'
+            )
+
+    def test_it_returns_a_bare_list_not_a_provenance_carrying_result(self):
+        """Nothing is aliased, so there is nothing to disclose.
+
+        Arm (2) returns a `TransformResult` because it MINTS documents under
+        a canonical's record_id.  The cap mints nothing, so a provenance
+        channel here would be permanently empty ceremony.
+        """
+        mod = _mod()
+        hits = _capped_corpus()
+
+        kept = mod.apply_topic_diversity_cap(hits, _canonical_index(*hits))
+
+        assert isinstance(kept, list)
+        assert not hasattr(kept, 'provenance')
+
+
+class TestTheCapReadsNoContestedKey:
+    """Why this arm is landable today and arm (2) is not."""
+
+    def test_the_signature_takes_no_contested_channel(self):
+        import inspect  # noqa: PLC0415
+
+        params = inspect.signature(_mod().apply_topic_diversity_cap).parameters
+
+        assert not [p for p in params if 'contested' in p], (
+            'the cap must be computable from `topic` alone — `contested` is '
+            'absent from RESERVED_VOCABULARY_KEYS and has no writer'
+        )
+
+    def test_a_contested_looking_metadata_key_changes_nothing(self):
+        mod = _mod()
+        hits = _capped_corpus()
+        marked = copy.deepcopy(hits)
+        for record in marked:
+            record.metadata['contested'] = True
+
+        assert _ids(mod.apply_topic_diversity_cap(
+            marked, _canonical_index(*marked),
+        )) == _ids(mod.apply_topic_diversity_cap(hits, _canonical_index(*hits)))
+
+
+class TestTheCapFreesWindowSlots:
+    """The token consequence, pinned rather than left implicit.
+
+    The cap returns a SHORTER LIST; it does not pad.  So at a fixed reader
+    budget k the freed slots are BACKFILLED from deeper in the ranking —
+    records that ranked below k before the transform are now inside it.
+    That is the behaviour chosen, and it is asserted both ways round so it
+    cannot drift into silent truncation.
+    """
+
+    def test_the_returned_list_is_shorter_than_the_input(self):
+        mod = _mod()
+        hits = _capped_corpus()
+
+        kept = mod.apply_topic_diversity_cap(hits, _canonical_index(*hits))
+
+        assert len(kept) == 4
+        assert len(kept) < len(hits)
+
+    def test_a_record_from_below_k_is_backfilled_into_the_window(self):
+        mod = _mod()
+        hits = _capped_corpus()
+        k = 3
+
+        kept = mod.apply_topic_diversity_cap(hits, _canonical_index(*hits))
+
+        before = _ids(hits[:k])
+        after = _ids(kept[:k])
+        assert 'b-canon' not in before
+        assert 'b-canon' in after, 'the freed slot must backfill, not blank'
+
+    def test_capping_lowers_the_token_bill_at_a_fixed_budget(self):
+        """Why the freed slot is worth measuring at all."""
+        mod = _mod()
+        bake_off = _bake_off()
+        estimator = bake_off.resolve_token_estimator()
+        hits = [
+            _rec('a-1', topic='t-a', content='x' * 400),
+            _rec('a-2', topic='t-a', canonical=True, content='y' * 400),
+        ]
+
+        kept = mod.apply_topic_diversity_cap(hits, _canonical_index(*hits))
+
+        flat = bake_off.tokens_returned(hits, 5, estimator)
+        capped = bake_off.tokens_returned(kept, 5, estimator)
+        assert capped['tokens'] < flat['tokens']
+        assert capped['payloads_counted'] == 1
+
+
+class TestTheCapIsPure:
+    """No mutation of the hits, the index, or any record."""
+
+    def test_neither_the_hits_nor_the_index_nor_a_record_is_mutated(self):
+        mod = _mod()
+        hits = _capped_corpus()
+        index = _canonical_index(*hits)
+        hits_before = copy.deepcopy(hits)
+        index_before = copy.deepcopy(index)
+
+        mod.apply_topic_diversity_cap(hits, index)
+
+        assert _ids(hits) == _ids(hits_before)
+        assert [r.metadata for r in hits] == [r.metadata for r in hits_before]
+        assert [r.content for r in hits] == [r.content for r in hits_before]
+        assert sorted(index) == sorted(index_before)
+
+    def test_it_is_deterministic_across_repeated_application(self):
+        mod = _mod()
+        hits = _capped_corpus()
+        index = _canonical_index(*hits)
+
+        once = mod.apply_topic_diversity_cap(hits, index)
+        twice = mod.apply_topic_diversity_cap(hits, index)
+        assert _ids(once) == _ids(twice)
+        # Idempotent: capping an already-capped window is a no-op.
+        assert _ids(mod.apply_topic_diversity_cap(once, index)) == _ids(once)
+
+
+class TestArmThreeSuppressesYetIsLandableToday:
+    """The distinction step-19's report column exists to make.
+
+    Arm (3) DROPS ranked records — it is a suppressing read in the PRD V2
+    sense — and yet it needs no `contested` key to compute, so it can ship
+    today.  Collapsing those into one "suppressing" boolean would tell 3111
+    the opposite of the truth.
+    """
+
+    def test_it_drops_ranked_records_but_needs_no_contested_key(self):
+        spec = _mod().ARM_SPECS['topic_diversity_cap']
+
+        assert spec.drops_ranked_records is True
+        assert spec.requires_contested_key_for_v2 is False
+        assert spec.displaces_at_window_edge is False
+
+    def test_all_three_arms_are_declared(self):
+        """The decision table cannot render an arm nobody declared."""
+        assert sorted(_mod().ARM_SPECS) == [
+            'promoting_pin', 'topic_diversity_cap', 'topic_keyed_grouped',
+        ]
