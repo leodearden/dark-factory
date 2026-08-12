@@ -1095,7 +1095,15 @@ class TaskCurator:
         )
 
         if probe is None:
-            probe = make_source_and_history_probe(self._cwd)
+            # Off the event loop: make_source_and_history_probe resolves the
+            # git top level via _resolve_git_toplevel — a blocking
+            # `git rev-parse --show-toplevel` subprocess bounded only by a 10s
+            # timeout. Typically milliseconds, but it is a fork/exec on the
+            # loop thread, and curate() reaches this on EVERY task submission
+            # while holding the per-project curator write lock. Mirrors
+            # curate_batch_prepared's construction (see the batch
+            # claim-verification block below), which already offloads.
+            probe = await asyncio.to_thread(make_source_and_history_probe, self._cwd)
 
         text = f'{candidate.title}\n{candidate.description}\n{candidate.details}'
         # Offload to a worker thread: probe (when not injected by a test) is
@@ -1104,7 +1112,8 @@ class TaskCurator:
         # exact case this guard targets) a full-history `git log --all -S`
         # pickaxe too, up to ~10s each. Running it inline here would stall
         # the curator/reconciliation event loop for every other coroutine
-        # sharing it. unverified_claims_in_text itself stays pure/sync.
+        # sharing it. Both the construction (above) and this verification
+        # call are offloaded; unverified_claims_in_text itself stays pure/sync.
         unverified = await asyncio.to_thread(unverified_claims_in_text, text, probe)
         for claim in unverified:
             logger.warning(
