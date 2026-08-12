@@ -9,6 +9,8 @@ Covers:
   clean-restart race into a retryable blip instead of a hard client failure.
 """
 
+from collections.abc import Callable
+
 import pytest
 
 import fused_memory.server.main as main_module
@@ -22,7 +24,13 @@ class _RaisingApp:
         raise RuntimeError('boom')
 
 
-async def _collect(shield: _ASGIExceptionShield) -> list[dict]:
+def _make_shield_call(shield: _ASGIExceptionShield) -> tuple[list[dict], Callable]:
+    """Build a `sent` sink plus an `invoke()` coroutine for driving `shield`.
+
+    Unlike `_collect`, this hands back `sent` before the call happens, so a
+    caller whose shielded call RAISES (e.g. KeyboardInterrupt/SystemExit
+    propagation) can still inspect whatever was sent up to that point.
+    """
     sent: list[dict] = []
 
     async def send(message: dict) -> None:
@@ -32,7 +40,16 @@ async def _collect(shield: _ASGIExceptionShield) -> list[dict]:
         return {'type': 'http.request'}
 
     scope = {'type': 'http', 'method': 'POST', 'path': '/mcp/'}
-    await shield(scope, receive, send)
+
+    async def invoke() -> None:
+        await shield(scope, receive, send)
+
+    return sent, invoke
+
+
+async def _collect(shield: _ASGIExceptionShield) -> list[dict]:
+    sent, invoke = _make_shield_call(shield)
+    await invoke()
     return sent
 
 
