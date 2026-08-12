@@ -932,7 +932,8 @@ def extract_snapshot_edge_task_ids(fact: str) -> set[int]:
       1. Gate on SNAPSHOT_STATUS_RE against the raw fact text; short-circuit
          to the empty set when absent.
       2. Individual form: extract ids via INDIVIDUAL_SNAPSHOT_RE, which
-         anchors 'task N' / '#N' / 'df N' (TASK_REF_RE's own grammar)
+         anchors 'task N' / '#N' / 'df N' / 'task/N' (TASK_REF_RE's own
+         grammar; the slash form was admitted by task 3403)
          directly to an adjacent status marker (only an optional copula
          and/or article may sit in between — deliberately NOT the
          preposition 'in') — so an incidental status word elsewhere in

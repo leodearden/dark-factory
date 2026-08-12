@@ -232,7 +232,8 @@ def extract_batch_plan_task_ids(text: str) -> set[int]:
 # contradiction from the extremely common, legitimate shape of two DIFFERENT
 # tasks with different statuses ("Task 100 is done. Task 200 is still
 # pending."). Anchoring on the SAME explicit task reference ('task N'/'df
-# N'/'#N', not bare digits — avoids false ids from dates/commit hashes/ports)
+# N'/'#N'/'task/N', not bare digits — avoids false ids from dates/commit
+# hashes/ports)
 # appearing with both a non-terminal and a terminal marker is what makes this
 # detector precise enough to safely reject rather than merely warn.
 #
@@ -258,8 +259,31 @@ def extract_batch_plan_task_ids(text: str) -> set[int]:
 # cheap phrase-level qualifier that reliably disambiguates; the resulting
 # recall loss is acceptable under the fail-open-on-under-firing philosophy
 # documented above.
+#
+# REFERENCE GRAMMAR (task 3403). The separator between the anchor and the digits
+# is '\s*[#/]?\s*', so the grammar admits 'task 94', 'df 94', '#94', 'task #94',
+# 'task # 94' AND the slash form 'task/94' — the orchestrator's own branch-name
+# convention, the spelling that appears in every merge commit subject ('Merge
+# task/3698 into main') and throughout recon prose about branches and worktrees.
+# Until the slash was admitted that entire spelling was invisible to every
+# consumer of this regex; it was the second half of the task-3403 defect (probe
+# memory 80d3f4c9-c334-490e-ab14-443b8aebb5c1). Prior art for the same reference
+# form, with the same anchoring discipline, is audit_found_on_main_provenance.py.
+#
+# '[#/]' is deliberately a CHARACTER CLASS, not a second alternation arm with a
+# group of its own: TASK_REF_RE.groups must stay 1. Both detectors below call
+# int(m) over TASK_REF_RE.findall(clause) — a second group makes findall return
+# tuples, and that raises — and stale_priority_override_edge_sweep reads
+# .group(1).
+#
+# The anchors stay '\btask\b' / '\bdf\b' — NOT 'task\w*', and the '/' is not
+# folded into the anchor. That is what keeps 'get_task', 'task_knowledge_sync'
+# and the PLURAL path segment in '.worktrees/tasks/94/plan.json' from reading as
+# references; audit_duplicate_memories' untasked-snapshot accounting depends on
+# it. The trailing '\b' on the digit group is what stops 'task/339' being read
+# out of 'task/3399'.
 TASK_REF_RE: re.Pattern[str] = re.compile(
-    r'(?:\btask\b|\bdf\b|#)\s*#?\s*(\d+)\b',
+    r'(?:\btask\b|\bdf\b|#)\s*[#/]?\s*(\d+)\b',
     re.IGNORECASE,
 )
 
@@ -335,7 +359,8 @@ def find_conflicting_task_status_ids(text: str) -> set[int]:
     ('config.yaml', 'CLAUDE.md:95', 'v1.2.3') do not shatter a sentence
     (task 3403). Within each
     clause, extracts explicit task references via TASK_REF_RE ('task N'/'df
-    N'/'#N', not bare digits) and tags each referenced id as non-terminal when
+    N'/'#N'/'task/N', not bare digits) and tags each referenced id as
+    non-terminal when
     the clause matches NON_TERMINAL_STATUS_RE and/or terminal when a
     negation-stripped copy of the clause matches TERMINAL_OUTCOME_RE. Returns
     the set of ids tagged both ways across the whole text (not necessarily in
@@ -467,7 +492,7 @@ def frames_live_task_status_as_current_fact(text: str) -> bool:
 #
 # Detection mirrors find_conflicting_task_status_ids exactly: clause-split on
 # _CLAUSE_SPLIT_RE, extract explicit task refs per clause via TASK_REF_RE
-# ('task N'/'df N'/'#N', NOT bare digits), and tag a clause's ids when
+# ('task N'/'df N'/'#N'/'task/N', NOT bare digits), and tag a clause's ids when
 # PRESENT_TENSE_COMPLETION_RE matches a copy of the clause with the
 # NEGATED_TERMINAL_RE and FUTURE_ASPIRATIONAL_RE spans stripped out. Requiring
 # the explicit task-ref anchor is what lets copula-framed completion words
@@ -545,7 +570,8 @@ def find_present_tense_completion_claim_task_ids(text: str) -> set[int]:
     ('config.yaml', 'CLAUDE.md:95', 'v1.2.3') do not shatter a sentence
     (task 3403). Within each
     clause, extracts explicit task references via TASK_REF_RE ('task N'/'df
-    N'/'#N', not bare digits) and tags each referenced id as a completion claim
+    N'/'#N'/'task/N', not bare digits) and tags each referenced id as a
+    completion claim
     when PRESENT_TENSE_COMPLETION_RE matches a copy of the clause with the
     NEGATED_TERMINAL_RE and FUTURE_ASPIRATIONAL_RE spans removed — so a negated
     ("has not yet landed") or aspirational ("will land", "planned to resolve")
