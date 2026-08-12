@@ -327,8 +327,16 @@ class TestNonMappingEscalationSection:
         (``DashboardConfig.__post_init__``), not just the private discovery
         helper — a future try/except added only around the helper's callers
         would leave a helper-only suite green over a still-broken startup.
+
+        ``main_root`` carries a VALID config so the assertion can tell
+        "survived and skipped the bad root" apart from "gave up on
+        everything": against an all-broken fixture, both an implementation
+        that aborts the whole discovery loop on the first malformed root
+        and one that unconditionally returns ``{}`` would still pass a bare
+        ``== {}`` assertion.
         """
         main_root = tmp_path / 'main'
+        _write_yaml(main_root / 'dark-factory-orchestrator.yaml', {'escalation': {'port': 9101}})
         broken_root = tmp_path / 'broken'
         broken_canonical = broken_root / 'dark-factory-orchestrator.yaml'
         broken_canonical.parent.mkdir(parents=True, exist_ok=True)
@@ -337,7 +345,13 @@ class TestNonMappingEscalationSection:
         with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
             cfg = DashboardConfig(project_root=main_root, known_project_roots=[broken_root])
 
-        assert cfg.escalation_urls == {}
+        # The good root still resolves despite the broken sibling.
+        assert cfg.escalation_urls == {'main': 'http://127.0.0.1:9101/mcp'}
+        messages = [r.getMessage() for r in caplog.records if r.name == _LOGGER_NAME]
+        mapping_msgs = [
+            m for m in messages if 'not a mapping' in m and str(broken_canonical) in m
+        ]
+        assert len(mapping_msgs) == 1
 
 
 class TestMultiRootDiscovery:
