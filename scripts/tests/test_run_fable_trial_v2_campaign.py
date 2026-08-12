@@ -25,7 +25,6 @@ from pathlib import Path
 import pytest
 import run_fable_trial_v2_campaign as mod
 
-
 _PRE_SIGMA = (mod.MARKER_KEY,)
 """``drop_metrics`` argument for a cell that PREDATES eval-revival σ (task 3628).
 
