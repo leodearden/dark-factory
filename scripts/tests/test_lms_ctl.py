@@ -192,6 +192,160 @@ def test_restarting_an_arm_overwrites_its_previous_baseline(
     assert lms_vram.read_baseline('qwen3.5-9b').used_mib == 8000
 
 
+# ---------------------------------------------------------------------------
+# the baseline carries WHO held the card, and a polluted card refuses a start
+# ---------------------------------------------------------------------------
+#
+# Measured on this host 2026-08-06: ollama (`/usr/local/lib/ollama/llama-server`,
+# pid 905936) held 10314 MiB with qwen3:14b resident on keep_alive while a slate
+# ran against the same card.  `ollama.service` is a persistent unit here, so
+# this is a recurring condition and not a one-off.
+#
+# The load-bearing assertion is again a NEGATIVE one: an arm must not be
+# launched onto a polluted card AND THEN judged against it.  Every number that
+# run produced would be uninterpretable, and the artifact would not say so.
+
+WHISPER = lms_vram.GpuConsumer(pid=7575, process_name='python', used_mib=4050)
+OLLAMA = lms_vram.GpuConsumer(
+    pid=905936, process_name='/usr/local/lib/ollama/llama-server', used_mib=10314,
+)
+
+
+def test_start_records_the_consumer_inventory_alongside_the_reading(
+    fake_systemctl, baseline_dir,
+):
+    """Who held the card is evidence, and it is captured by the start event for
+    the same reason the reading is: it cannot be typed in afterwards."""
+    lms_ctl.start(_arm(), gpu=MEASURED_GPU, consumers=[WHISPER])
+
+    record = lms_vram.read_baseline_record('qwen3.5-9b')
+
+    assert record.reading.used_mib == MEASURED_GPU.used_mib
+    assert record.consumers == [WHISPER]
+
+
+def test_start_probes_the_inventory_at_the_same_moment_as_the_reading(
+    fake_systemctl, baseline_dir, monkeypatch,
+):
+    """One capture, not two.  A reading and an inventory taken at different
+    moments would describe a card that never existed."""
+    probed = []
+    monkeypatch.setattr(
+        lms_vram, 'probe_gpu', lambda *a, **k: probed.append('reading') or MEASURED_GPU,
+    )
+    monkeypatch.setattr(
+        lms_vram, 'probe_gpu_consumers',
+        lambda *a, **k: probed.append('consumers') or [WHISPER],
+    )
+
+    lms_ctl.start(_arm())
+
+    assert probed == ['reading', 'consumers']
+    assert lms_vram.read_baseline_record('qwen3.5-9b').consumers == [WHISPER]
+
+
+def test_start_refuses_a_polluted_card_and_launches_nothing(
+    fake_systemctl, baseline_dir,
+):
+    """The refusal must come BEFORE the side effect, exactly as the pre-flight's
+    does.  Starting the arm and then discovering the card was polluted leaves a
+    running unit whose every measurement is void."""
+    with pytest.raises(lms_vram.PollutedBaselineError) as excinfo:
+        lms_ctl.start(_arm(), gpu=MEASURED_GPU, consumers=[WHISPER, OLLAMA])
+
+    assert '/usr/local/lib/ollama/llama-server' in str(excinfo.value)
+    assert not lms_vram.baseline_path('qwen3.5-9b').exists()
+    assert fake_systemctl.calls() == []
+
+
+def test_a_polluted_refusal_does_not_clobber_an_earlier_clean_baseline(
+    fake_systemctl, baseline_dir,
+):
+    lms_ctl.start(_arm(), gpu=MEASURED_GPU, consumers=[WHISPER])
+
+    with pytest.raises(lms_vram.PollutedBaselineError):
+        lms_ctl.start(
+            _arm(),
+            gpu=lms_vram.GpuReading(total_mib=24576, used_mib=17676, free_mib=6447),
+            consumers=[WHISPER, OLLAMA],
+        )
+
+    assert lms_vram.read_baseline_record('qwen3.5-9b').reading.used_mib == 7362
+
+
+# ---------------------------------------------------------------------------
+# the CLI's exit codes: a polluted card and an oversized arm have OPPOSITE fixes
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def cli_gpu(monkeypatch):
+    """Patch the two GPU probes the CLI's `start` reaches for.
+
+    Returns a setter so each test states the card's condition rather than
+    threading it through the fixture signature.
+    """
+    state = {'reading': MEASURED_GPU, 'consumers': [WHISPER]}
+    monkeypatch.setattr(lms_vram, 'probe_gpu', lambda *a, **k: state['reading'])
+    monkeypatch.setattr(
+        lms_vram, 'probe_gpu_consumers', lambda *a, **k: list(state['consumers']),
+    )
+    return state
+
+
+def test_cli_start_on_a_clean_card_succeeds(
+    fake_systemctl, baseline_dir, cli_gpu, capsys,
+):
+    code = lms_ctl.main(['start', 'qwen3.5-9b'])
+
+    assert code == 0
+    assert ['start', 'lms-arm@qwen3.5-9b.service'] in fake_systemctl.calls()
+
+
+def test_cli_start_returns_a_distinct_code_when_the_card_is_polluted(
+    fake_systemctl, baseline_dir, cli_gpu, capsys,
+):
+    """5, not the generic 4.
+
+    4 means "this arm is too big for this card" -- the fix is a smaller arm or
+    a bigger budget.  5 means "another process is holding the card" -- the fix
+    is to free the card and try the same arm again.  Collapsing them sends an
+    operator down the wrong path.
+    """
+    cli_gpu['consumers'] = [WHISPER, OLLAMA]
+
+    code = lms_ctl.main(['start', 'qwen3.5-9b'])
+
+    assert code == 5
+    assert ['start', 'lms-arm@qwen3.5-9b.service'] not in fake_systemctl.calls()
+
+
+def test_cli_start_names_the_offending_consumer_on_stderr(
+    fake_systemctl, baseline_dir, cli_gpu, capsys,
+):
+    """An operator reading only stderr must know which process to deal with,
+    and must not be left expecting this tool to have stopped it."""
+    cli_gpu['consumers'] = [WHISPER, OLLAMA]
+
+    lms_ctl.main(['start', 'qwen3.5-9b'])
+
+    err = capsys.readouterr().err
+    assert '905936' in err
+    assert '/usr/local/lib/ollama/llama-server' in err
+    assert '10314' in err
+    assert 'keep_alive' in err
+
+
+def test_cli_start_still_returns_4_when_the_arm_simply_does_not_fit(
+    fake_systemctl, baseline_dir, cli_gpu, capsys,
+):
+    """The pre-existing refusal keeps its own code, so the two stay separable."""
+    code = lms_ctl.main(['start', 'moe-stretch'])
+
+    assert code == 4
+    assert ['start', 'lms-arm@moe-stretch.service'] not in fake_systemctl.calls()
+
+
 def test_stop_issues_exactly_one_systemctl_stop(fake_systemctl):
     lms_ctl.stop(_arm())
 
