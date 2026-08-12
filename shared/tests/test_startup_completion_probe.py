@@ -147,3 +147,64 @@ class TestScrubbedKeysDoNotCollide:
         assert _encoded_is_clean(result), (
             'the collision disambiguator must not re-form a credential-shaped run'
         )
+
+
+#: A leaf whose RAW form carries only a 63-char run (below the 64 threshold) but
+#: whose JSON ENCODING carries 64: ``json.dumps`` renders the tab as ``\t``, and
+#: the escape's literal ``t`` is in ``[A-Za-z0-9_-]``, extending the run by one.
+_ENCODING_EXTENDED_LEAF = '\t' + 'A' * 63
+
+
+class TestEncodedDomainParity:
+    """``_scrub_value`` must produce a value clean in its JSON-ENCODED form.
+
+    The live instance of the same defect the key route makes latent: ``_gate``
+    SCANS ``json.dumps(observation)`` while ``_scrub_value`` SUBSTITUTES on raw
+    string leaves.  The two domains differ, so JSON escaping can manufacture a
+    64-char base64url run that raw scrubbing cannot see — and the post-scrub
+    ``assert_no_credential_material``, which scans the encoded form again, then
+    raises out of the never-raise branch.
+
+    Reachable today through ``run_exit.stderr_tail``: arbitrary CLI stderr, where
+    tabs, control characters and non-ASCII are routine, gated by
+    ``_gate(_drain_exit(...))`` after every sample has already been paid for.
+    """
+
+    def test_premise_json_escaping_can_manufacture_a_run(self):
+        # Pin the premise itself, so this class cannot pass vacuously if the
+        # pattern or its lookarounds ever change.
+        raw_hit = probe.scan_for_credential_material(
+            _ENCODING_EXTENDED_LEAF, probe._GENERIC_CREDENTIAL_PATTERNS
+        )
+        encoded_hit = probe.scan_for_credential_material(
+            json.dumps(_ENCODING_EXTENDED_LEAF), probe._GENERIC_CREDENTIAL_PATTERNS
+        )
+        assert raw_hit is None, 'the raw leaf must be BELOW the run threshold'
+        assert encoded_hit is not None, 'the encoded leaf must be AT the run threshold'
+
+    def test_gate_does_not_raise_on_an_encoding_extended_stderr_tail(self):
+        observation = _minimal_observation(
+            run_exit={'stderr_tail': _ENCODING_EXTENDED_LEAF}
+        )
+        result = probe._gate(observation)
+        scf.assert_no_credential_material(
+            json.dumps(result), source='synthetic:encoded-stderr-tail'
+        )
+
+    def test_gate_does_not_raise_on_an_encoding_extended_key(self):
+        observation = _minimal_observation(
+            transcript_records=[{_ENCODING_EXTENDED_LEAF: 1}]
+        )
+        result = probe._gate(observation)
+        scf.assert_no_credential_material(
+            json.dumps(result), source='synthetic:encoded-key'
+        )
+
+    def test_gate_does_not_raise_on_a_non_string_scalar_whose_encoding_trips(self):
+        # A 70-digit int is not a str, so no substitution branch sees it at all —
+        # but json.dumps renders it as 70 base64url-class characters.
+        observation = _minimal_observation(config_dir_tree=[{'size': int('9' * 70)}])
+        result = probe._gate(observation)
+        scf.assert_no_credential_material(
+            json.dumps(result), source='synthetic:encoded-scalar'
+        )
