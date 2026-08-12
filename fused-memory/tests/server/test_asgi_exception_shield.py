@@ -9,6 +9,7 @@ Covers:
   clean-restart race into a retryable blip instead of a hard client failure.
 """
 
+import asyncio
 from collections.abc import Callable
 
 import pytest
@@ -86,3 +87,39 @@ class TestASGIExceptionShieldDuringShutdown:
 
         monkeypatch.setattr(main_module, '_operator_stop_received', True)
         assert main_module._is_shutdown_initiated() is True
+
+
+class _CancelledApp:
+    """Minimal ASGI app that raises asyncio.CancelledError before sending anything."""
+
+    async def __call__(self, scope, receive, send):
+        raise asyncio.CancelledError()
+
+
+class TestASGIExceptionShieldCancelledError:
+    """Pins the shield's motivating failure mode: the 2026-04-23 wedge.
+
+    `asyncio.CancelledError` is a BaseException, not an Exception — unlike
+    the RuntimeError used elsewhere in this file. A refactor that narrowed
+    `except BaseException` to `except Exception` in
+    `_ASGIExceptionShield.__call__` would leave every other test in this
+    file green while letting CancelledError cascade into the shared task
+    group again, exactly like the incident this class exists to prevent.
+    This test is the one that would catch that regression.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('stop_received', 'expected_status'), [(False, 500), (True, 503)])
+    async def test_cancelled_error_is_swallowed(self, monkeypatch, stop_received, expected_status):
+        monkeypatch.setattr(main_module, '_operator_stop_received', stop_received)
+        shield = _ASGIExceptionShield(_CancelledApp())
+
+        # Reaching this line at all proves the CancelledError was swallowed
+        # by the shield rather than propagating out of `await shield(...)`.
+        sent = await _collect(shield)
+
+        start = next(m for m in sent if m['type'] == 'http.response.start')
+        assert start['status'] == expected_status
+        assert any(m['type'] == 'http.response.body' for m in sent)
+        if expected_status == 503:
+            assert dict(start['headers'])[b'retry-after'] == b'5'
