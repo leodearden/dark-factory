@@ -114,7 +114,31 @@ _ESCALATION_TOOLS = [
     'mcp__escalation__escalate_blocker',
 ]
 
-_ESCALATION_INSTRUCTIONS = """
+# Split (task 4169): the original single `_ESCALATION_INSTRUCTIONS` literal
+# ended with a paragraph telling every escalating role that `level=1` is "the
+# STEWARD's route, not yours" -- correct for the six non-steward escalating
+# roles below, but wrong for STEWARD itself, whose own body mandates
+# `escalate_blocker(..., level=1)` re-escalation in four places (Rule 2
+# be-conservative, Rule 6 wip_conflict/unmerged_state, MAX_TURNS,
+# CLI_INPUT_REJECTED -- see STEWARD's system_prompt below). Appending the
+# "not yours" gate after those mandates made the steward's LAST-read
+# instruction about escalation levels contradict its own mandated recourse.
+#
+# ESCALATION_LADDER_CORE carries the mechanics (what escalate_info /
+# escalate_blocker do, severity policy, the level=0-vs-1 ladder) and goes to
+# EVERY escalating role, steward included -- it is what the steward's own
+# level=1 mandates depend on. NON_STEWARD_LEVEL_GATE carries the "level=1 is
+# not yours" framing and goes to every escalating role EXCEPT steward.
+#
+# `_ESCALATION_INSTRUCTIONS` (the pre-split name) is kept alive as their
+# concatenation rather than renamed: (1) it keeps the six non-steward splice
+# sites below byte-identical to before the split, and (2)
+# escalation/src/escalation/server.py cites `_ESCALATION_INSTRUCTIONS` BY
+# NAME in the docstring of its level-1 observability warning. Plain `+`
+# concatenation, like every other splice in this file -- these prompts are
+# deliberately not f-strings (see the MANDATED_STAGING_COMMAND note above).
+# Regression-guarded by orchestrator/tests/test_roles_escalation_ladder.py.
+ESCALATION_LADDER_CORE = """
 ## Escalation
 
 If you encounter a problem you cannot solve at your scope, you can escalate:
@@ -168,7 +192,13 @@ steward); if the steward cannot resolve it, re-escalate by passing `level=1` to
 human is needed).  `escalate_blocker` accepts only `level=0` (the default) or
 `level=1` — anything else is rejected with an `{'error': ...}` response and
 nothing is filed.
+"""
 
+# The "level=1 is not yours" framing. Correct for every escalating role
+# EXCEPT steward -- see the comment above ESCALATION_LADDER_CORE. Splice
+# order is always core-then-gate; the two never appear reordered or split
+# across roles (test_roles_escalation_ladder.py::test_composite_is_core_plus_gate).
+NON_STEWARD_LEVEL_GATE = """
 **`level=1` is the STEWARD's route, not yours.** As a non-steward role your
 filings belong at `level=0` (the default): that is where the steward — the
 consumer that can actually resolve your blocker — reads them.  Level 1 skips
@@ -178,6 +208,8 @@ would lose a legitimate steward filing — but every one is **logged at WARNING
 naming your role and task_id**.  Filing at level 1 to jump the queue buys no
 faster resolution, only an audit trail showing you bypassed your handler.
 """
+
+_ESCALATION_INSTRUCTIONS = ESCALATION_LADDER_CORE + NON_STEWARD_LEVEL_GATE
 
 _MEMORY_TOOLS = [
     'mcp__fused-memory__add_memory',
@@ -1612,7 +1644,7 @@ convert it into a task candidate and then close it:
       ticket id (or the created/combined task id) so the same note is not swept
       again on a later session. An info-note that describes NO actionable work
       is left as-is — only work-describing notes become candidates.
-""" + _ESCALATION_INSTRUCTIONS,
+""" + ESCALATION_LADDER_CORE,
     allowed_tools=[
         'Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep',
         *_ESCALATION_TOOLS,

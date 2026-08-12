@@ -33,10 +33,10 @@ prompt edits; it has no correctness content in either direction.
 from __future__ import annotations
 
 from orchestrator.agents.roles import (
+    _ESCALATION_INSTRUCTIONS,
     ESCALATION_LADDER_CORE,
     NON_STEWARD_LEVEL_GATE,
     ROLES,
-    _ESCALATION_INSTRUCTIONS,
 )
 
 # The one role whose own prompt body mandates `escalate_blocker(..., level=1)`
