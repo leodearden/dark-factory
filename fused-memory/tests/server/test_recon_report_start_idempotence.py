@@ -99,6 +99,7 @@ class TestStartReportPreservesExistingEntry:
             'existing_finding_id': real_id,
         }
         report = state.get_assembled_report('r1', 'memory_consolidator')
+        assert report is not None
         assert any(item['finding_id'] == real_id for item in report['flagged_items'])
 
         dup_null = state.add_finding(
