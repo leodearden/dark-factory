@@ -3661,6 +3661,89 @@ def _match_clock_marker(line: str, cfg: ClockStopConfig) -> str | None:
     return None
 
 
+_CS_ATTRIBUTION_SLACK_MIN = 0.5      # seconds
+_CS_ATTRIBUTION_SLACK_FRAC = 0.02    # 2% of the named limit
+
+
+def _clock_stop_attribution_slack(limit: float) -> float:
+    """One-sided slack for clock-stop attribution: ``max(0.5s, 2% of limit)``.
+
+    Absorbs float/scheduling noise around a genuine deadline expiry without
+    ever accepting a stop that occurred meaningfully before *limit* elapsed
+    (task 3806 / esc-3694-3 — see :func:`_clock_stop_reason`).
+    """
+    return max(_CS_ATTRIBUTION_SLACK_MIN, _CS_ATTRIBUTION_SLACK_FRAC * limit)
+
+
+def _clock_stop_reason(*, kind: str, limit: float, elapsed: float, remaining: float) -> str:
+    """Format a clock-stop timeout reason, attributing it to *kind* only when
+    the stop is CONSISTENT with the deadline actually armed (task 3806 /
+    esc-3694-3).
+
+    Without this check, esc-3694-3 reported ``wall-clock budget (5400s),
+    wall time 561.1s`` — a message that names a 5400s budget as the cause of
+    a stop that happened after only 561.1s, while the armed deadline still
+    had ~4839s left.  That combination is impossible: this helper refuses to
+    emit it.
+
+    Attribution requires BOTH conjuncts to hold, with
+    ``slack = _clock_stop_attribution_slack(limit)``:
+
+    1. ``remaining <= slack`` — the armed deadline actually elapsed.
+    2. ``limit <= elapsed + slack`` — the self-consistency invariant: a
+       reason may never name a budget larger than the elapsed time that
+       triggered it.
+
+    The slack is one-sided-safe: an ``asyncio`` timer can only fire LATE,
+    never early, and callers measure ``t0`` before the first
+    ``time.monotonic()`` read, so a genuine expiry always satisfies
+    ``elapsed >= limit``.  Slack therefore only absorbs float/scheduling
+    noise on the near side and can never turn a real timeout into a false
+    "unattributed" verdict — the failure mode that would matter, since it
+    would make ordinary verify timeouts look like infrastructure anomalies.
+
+    When either conjunct fails, the stop is reported as unattributed
+    (external or aggregate deadline) rather than blamed on *kind*, carrying
+    the real *elapsed* and the shortfall (*remaining*) instead.
+
+    Both returned strings are free of ``':'`` — ``_extract_cause_hint``'s
+    ``clock-stop timed out[^:]+:`` pattern stops matching at the first
+    colon, so a colon anywhere in the reason would silently drop the cause
+    hint for every clock-stop escalation.
+
+    Parameters
+    ----------
+    kind : str
+        Human label of the deadline armed for the read that stopped
+        (``'wall-clock budget'`` | ``'heartbeat-idle backstop'`` |
+        ``'max-total-stopped cap'``).
+    limit : float
+        The configured number *kind* names, in seconds.
+    elapsed : float
+        Wall seconds since the clock-stop loop started, measured AT THE
+        STOP — not at the top of the loop iteration, which is what let
+        esc-3694-3's reported elapsed go stale at the last read instead of
+        the actual stop time.
+    remaining : float
+        Seconds the armed deadline still had left AT THE STOP.  ``<= 0``
+        means it genuinely fired.
+
+    Returns
+    -------
+    str
+        A colon-free reason string, either attributed
+        (``f'{kind} ({limit:.0f}s), wall time {elapsed:.1f}s'`` — byte-
+        identical to the pre-task-3806 shape) or unattributed.
+    """
+    slack = _clock_stop_attribution_slack(limit)
+    if remaining <= slack and limit <= elapsed + slack:
+        return f'{kind} ({limit:.0f}s), wall time {elapsed:.1f}s'
+    return (
+        f'unattributed stop (external or aggregate deadline) - armed {kind} '
+        f'had {remaining:.1f}s left, limit {limit:.0f}s, wall time {elapsed:.1f}s'
+    )
+
+
 async def _run_cmd(
     cmd: str,
     cwd: Path,
