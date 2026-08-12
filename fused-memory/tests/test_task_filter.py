@@ -3330,6 +3330,122 @@ class TestClauseSplitRe:
 
 
 # ---------------------------------------------------------------------------
+# Task-reference grammar — TASK_REF_RE (task 3403)
+# ---------------------------------------------------------------------------
+
+
+class TestTaskRefRe:
+    """Tests for TASK_REF_RE in task_filter.py — the shared explicit
+    task-reference grammar.
+
+    Task 3403, second half. The separator between the anchor and the digits was
+    ``\\s*#?\\s*``, which admits 'task 94', 'df 94', '#94', 'task #94' and
+    'task # 94' but NOT 'task/94' — the orchestrator's own branch-name
+    convention, the form that appears in every merge commit subject ('Merge
+    task/3698 into main') and throughout recon prose about branches and
+    worktrees. Adding '/' to that separator character class is what this
+    widening does; the prior art is
+    audit_found_on_main_provenance.py:98, which already spells the same
+    reference form with the same trailing-\\b discipline.
+
+    This regex is the most consequential in the module: two of its three
+    out-of-module consumers end in memory_service.update_edge(invalid_at=...),
+    a real Graphiti edge retirement. So the negative cases below matter as much
+    as the positive ones — they are the net that keeps the anchoring honest.
+    ``\\btask\\b`` (not ``task\\w*``) is what keeps 'get_task' and
+    'task_knowledge_sync' from being read as references, and the trailing
+    ``\\b`` on the digit group is what stops 'task/339' being read out of
+    'task/3399'.
+    """
+
+    # ------------------------------------------------------------------ #
+    # slash form — the new grammar (task 3403)
+    # ------------------------------------------------------------------ #
+
+    def test_positive_slash_form_references(self):
+        """The 'task/<id>' branch-name form, and its df/spaced variants, must
+        each resolve to the bare id. All MEASURED [] before the widening.
+        """
+        from fused_memory.reconciliation.task_filter import TASK_REF_RE
+
+        for text in ('task/94', 'df/94', 'task / 94', 'Task/94'):
+            assert TASK_REF_RE.findall(text) == ['94'], (
+                f"Expected ['94'] for the slash-form task reference.\ntext={text!r}"
+            )
+
+    # ------------------------------------------------------------------ #
+    # pre-existing forms must not regress
+    # ------------------------------------------------------------------ #
+
+    def test_positive_existing_forms_still_match(self):
+        """Every reference form the grammar already admitted must survive the
+        widening unchanged — the '/' is added to the existing separator, it does
+        not replace anything.
+        """
+        from fused_memory.reconciliation.task_filter import TASK_REF_RE
+
+        for text in ('task 94', 'df 94', '#94', 'task #94', 'task # 94'):
+            assert TASK_REF_RE.findall(text) == ['94'], (
+                f"Expected ['94'] for a pre-existing task-reference form."
+                f'\ntext={text!r}'
+            )
+
+    # ------------------------------------------------------------------ #
+    # word-boundary guard — the false positives that must stay excluded
+    # ------------------------------------------------------------------ #
+
+    def test_negative_word_boundary_guard_holds(self):
+        """The anchor must stay ``\\btask\\b``/``\\bdf\\b``, never ``task\\w*`` and
+        never a '/'-folded anchor.
+
+        Each of these is a real shape from the corpus that must NOT read as a
+        task reference: a tool name ('get_task'), a recon stage name
+        ('task_knowledge_sync'), a worktree path whose segment is the PLURAL
+        'tasks' (not ``\\btask\\b``), and a filesystem path that merely follows
+        the word 'task'. All four MEASURED [] both before and after the
+        widening; they are the regression net that keeps a future widening
+        honest. The audit script's
+        test_untasked_snapshot_is_counted_not_silently_dropped depends on the
+        first two in particular.
+        """
+        from fused_memory.reconciliation.task_filter import TASK_REF_RE
+
+        for text in (
+            'get_task reports status="in-progress"',
+            'task_knowledge_sync 12',
+            '.worktrees/tasks/94/plan.json',
+            'task /tmp/5 was written',
+        ):
+            assert TASK_REF_RE.findall(text) == [], (
+                f'Expected [] — this must not read as an explicit task '
+                f'reference.\ntext={text!r}'
+            )
+
+    # ------------------------------------------------------------------ #
+    # arity: exactly one capture group
+    # ------------------------------------------------------------------ #
+
+    def test_task_ref_re_has_exactly_one_capture_group(self):
+        """The id must be the pattern's ONLY group.
+
+        Load-bearing in three places: find_conflicting_task_status_ids and
+        find_present_tense_completion_claim_task_ids both call ``int(m)`` over
+        ``TASK_REF_RE.findall(clause)`` — a second group makes findall return
+        tuples and that raises — and
+        stale_priority_override_edge_sweep.extract_priority_override_task_id
+        reads ``.group(1)``. This is why the slash form is added as a character
+        class in the existing separator (``\\s*[#/]?\\s*``) rather than as a new
+        alternation arm.
+        """
+        from fused_memory.reconciliation.task_filter import TASK_REF_RE
+
+        assert TASK_REF_RE.groups == 1, (
+            f'Expected TASK_REF_RE to carry exactly one capture group (the id), '
+            f'so findall returns plain strings.\npattern={TASK_REF_RE.pattern!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # Conflicting task-status framing detection (task 2276)
 # ---------------------------------------------------------------------------
 
@@ -3413,6 +3529,23 @@ class TestConflictingTaskStatusFraming:
             f'Expected find_conflicting_task_status_ids to return {{4802}} when a '
             f'dotted filename separates the ref from its status marker.'
             f'\ntext={text!r}'
+        )
+
+    def test_positive_slash_form_task_ref(self):
+        """Task 3403: a contradiction narrated with the 'task/<id>' branch-name
+        form must fire just as it does for 'task <id>'.
+
+        That form is the orchestrator's own branch convention and appears
+        throughout recon prose about branches and merges, so a detector blind to
+        it was blind to a large slice of the corpus. MEASURED: set() before the
+        widening.
+        """
+        from fused_memory.reconciliation.task_filter import find_conflicting_task_status_ids
+
+        text = 'task/4802 is still pending. task/4802 landed as merge commit abc.'
+        assert find_conflicting_task_status_ids(text) == {4802}, (
+            f'Expected find_conflicting_task_status_ids to return {{4802}} for the '
+            f'slash-form branch-name reference.\ntext={text!r}'
         )
 
     def test_is_conflicting_task_status_framing_true_for_incident_shape(self):
