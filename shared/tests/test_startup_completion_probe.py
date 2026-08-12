@@ -105,3 +105,45 @@ class TestScrubValueScrubsDictKeys:
     def test_non_string_keys_round_trip_untouched(self):
         result = probe._scrub_value({1: 'x'}, probe._GENERIC_CREDENTIAL_PATTERNS)
         assert result == {1: 'x'}, 'a non-string key must not be coerced or rewritten'
+
+
+class TestScrubbedKeysDoNotCollide:
+    """Scrubbing keys must not silently drop an entry.
+
+    Two distinct keys can both rewrite to ``<redacted>`` and collapse into one
+    dict entry — silent data loss, which is exactly the fail-soft this repo's
+    design invariants reject (loud-over-silent-degradation / no-silent-fail-soft).
+    A gate whose job is to make a capture legible must not quietly delete half of
+    what it was asked to redact.
+    """
+
+    def test_two_credential_shaped_keys_both_survive(self):
+        value = {_LONG_RUN: 1, 'B' * 70: 2}
+        result = probe._scrub_value(value, probe._GENERIC_CREDENTIAL_PATTERNS)
+        assert len(result) == 2, f'a scrubbed key collision dropped an entry: {result!r}'
+        assert list(result.values()) == [1, 2], 'values must survive in insertion order'
+        assert len(set(result)) == 2, 'the two scrubbed keys must stay distinct'
+
+    def test_scrubbed_key_colliding_with_a_literal_key_survives(self):
+        # '<redacted>' can already be present as a literal key — a previous scrub
+        # pass, or a value the CLI itself emitted.
+        value = {'<redacted>': 0, _LONG_RUN: 1}
+        result = probe._scrub_value(value, probe._GENERIC_CREDENTIAL_PATTERNS)
+        assert len(result) == 2, f'a scrubbed key collided with a literal key: {result!r}'
+        assert sorted(result.values()) == [0, 1]
+
+    def test_collision_disambiguation_is_deterministic(self):
+        value = {_LONG_RUN: 1, 'B' * 70: 2, 'C' * 70: 3}
+        first = probe._scrub_value(value, probe._GENERIC_CREDENTIAL_PATTERNS)
+        second = probe._scrub_value(dict(value), probe._GENERIC_CREDENTIAL_PATTERNS)
+        # A re-run of the probe over equal input must not produce a differently
+        # keyed row, or two captures of the same shape would not compare equal.
+        assert first == second
+        assert list(first) == list(second)
+
+    def test_disambiguated_keys_stay_credential_clean(self):
+        value = {_LONG_RUN: 1, 'B' * 70: 2}
+        result = probe._scrub_value(value, probe._GENERIC_CREDENTIAL_PATTERNS)
+        assert _encoded_is_clean(result), (
+            'the collision disambiguator must not re-form a credential-shaped run'
+        )
