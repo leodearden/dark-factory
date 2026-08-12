@@ -1,12 +1,29 @@
-"""Tests for _ASGIExceptionShield's shutdown-aware status code (task 2705).
+"""Tests for _ASGIExceptionShield's shutdown-aware status codes and
+BaseException containment (task 2705; extended by task 4067).
 
 Covers:
 - Normal operation: an exception escaping the wrapped app still yields a
-  bare 500 (unchanged pre-existing behaviour).
+  bare 500 (unchanged pre-existing behaviour). [task 2705]
 - Shutdown window: once the module-level operator-stop flag is set, the
   same exception yields 503 with a Retry-After header instead — orchestrator
   retry loops treat {502,503,504} as retryable but not 500, so this turns a
   clean-restart race into a retryable blip instead of a hard client failure.
+  [task 2705]
+- CancelledError containment: asyncio.CancelledError — a BaseException, the
+  shield's motivating 2026-04-23 failure mode — is swallowed rather than
+  re-raised, and still yields 500/503 per the shutdown flag. RuntimeError
+  alone (used by the two cases above) was insufficient: it is an Exception,
+  so a refactor narrowing `except BaseException` to `except Exception`
+  would leave those tests green while re-opening the wedge. [task 4067;
+  provenance: a code-review suggestion recovered from task 2705, see
+  task 4023]
+- response_started suppression: once the wrapped app has already sent
+  `http.response.start`, the fallback response is suppressed entirely — no
+  second start message, no fallback body — while the exception is still
+  contained. [task 4067, see task 4023]
+- Interpreter exit: KeyboardInterrupt/SystemExit still propagate out of the
+  shield uncontained, with nothing sent before the re-raise. [task 4067,
+  see task 4023]
 """
 
 import asyncio
