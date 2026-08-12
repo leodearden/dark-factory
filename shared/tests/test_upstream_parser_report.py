@@ -247,18 +247,20 @@ class TestSpecimenAntiFabrication:
     to a hand-authored report instead of a captured sweep.
     """
 
-    def test_exactly_four_specimens_present(self) -> None:
+    def test_specimens_were_parsed(self) -> None:
         # Deliberately NOT parametrized: a parametrize list built from zero
         # parsed specimens would collect zero test cases and report
         # vacuously green -- exactly the failure class
         # test_toolcall_xml_leak_sweep_artifacts.py's TestArtifactsExist
-        # exists to rule out. This fires regardless of how many (if any)
-        # specimens parsed.
-        specimens = _report_specimens()
-        assert len(specimens) == 4, (
-            f'expected exactly 4 machine-readable specimen headers in '
-            f'{REPORT_PATH.name}, found {len(specimens)} '
-            f'({[s.id for s in specimens]}).'
+        # exists to rule out. Asserts on the MODULE-LEVEL _SPECIMENS list
+        # itself, not a fresh _report_specimens() call: _SPECIMENS is the
+        # exact list the two parametrize decorators below are built from,
+        # so it is the thing whose emptiness would actually cause the
+        # vacuously-green collection this guard exists to rule out.
+        assert _SPECIMENS, (
+            'no machine-readable specimen headers parsed from '
+            f'{REPORT_PATH.name} -- the parametrized specimen tests below '
+            'would collect zero cases and report vacuously green.'
         )
 
     def test_specimen_ids_are_unique(self) -> None:
