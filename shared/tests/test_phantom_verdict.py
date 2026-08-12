@@ -26,6 +26,7 @@ from __future__ import annotations
 import enum
 
 import pytest
+
 from shared.phantom_verdict import (
     UNPARSEABLE_ISSUE_PREFIX,
     UNPARSEABLE_VERDICT_CODE,

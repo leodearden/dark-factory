@@ -136,9 +136,15 @@ class TestReconciliationHealthRowPhantom:
         `ok: false` elsewhere in the health rows cannot satisfy or break it.
         A phantom is `warn` (yellow): the run genuinely went unreviewed, which
         is degraded, but no judge found anything serious.
+
+        The scope terminator is `};` — the end of the branch's `return {...};`
+        — NOT a bare `}`.  A bare `}` stops at the first `${...}` template
+        interpolation in the `sub` string, truncating the match before the
+        `ok:` / `warn:` keys this test exists to inspect, which would leave
+        both assertions below scanning text that can never contain them.
         """
         match = re.search(
-            r'is_phantom[\s\S]{0,400}?\}', tab_overview_jsx_code
+            r'is_phantom[\s\S]{0,400}?\};', tab_overview_jsx_code
         )
         assert match, 'no is_phantom branch found in tab_overview.jsx render code'
         branch = match.group(0)
