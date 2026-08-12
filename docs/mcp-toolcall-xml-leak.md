@@ -12,7 +12,9 @@ this repo now does about them.
 > literal into a source, test, or doc file forces the authoring agent to emit
 > that literal inside its own tool call — reproducing the exact bug this
 > document describes and corrupting the file being written. The same rule is
-> enforced in code with the `\x3c` escape; see the comment at the top of
+> enforced in code with the `\x3c` escape; see the "Sentinel-literal hazard"
+> section at the top of `shared/src/shared/toolcall_markup.py` — the owner of
+> the rule — and, secondarily, the matching comment in
 > `fused-memory/src/fused_memory/utils/toolcall_xml_leak.py`.
 
 ---
@@ -500,6 +502,10 @@ Not addressed here.
 - `fused-memory/tests/test_toolcall_xml_leak_sweep_artifacts.py` — validates any
   committed sweep artifact by re-running `classify_record` over each record's own
   stored content; hermetic, so it does not need Qdrant up
+- `shared/src/shared/toolcall_markup.py` (task 3688) — the owner of the
+  envelope-literal enumeration (INV-5); `markup_tripwire` and
+  `toolcall_xml_leak` both re-export from it (§1, "The single literal
+  source")
 - `fused-memory/src/fused_memory/utils/toolcall_xml_leak.py` — the detector,
   and the rationale for its deliberately conservative real-whitespace
   discriminator (which excludes the tasks 2938/2939 false-positive shape)
