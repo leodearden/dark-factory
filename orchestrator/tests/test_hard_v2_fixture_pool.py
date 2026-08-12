@@ -153,12 +153,16 @@ class TestCandidatesBlock:
         for tid in ('3378', '3586'):
             row = by_id[('reify', tid)]
             assert row['status'] == 'cancelled', tid
-            # The reason must state whether abandonment was benign — a
-            # cancelled task may have been abandoned BECAUSE it was ill-posed,
-            # which is a confound, not a hard task.
-            assert 'benign' in row['reason'].lower(), (
-                f'reify {tid}: reason must state whether abandonment was benign'
-            )
+            assert row['reason'].strip(), tid
+        # The pair is SPLIT, and the split is the invariant worth pinning:
+        # `cancelled` alone does not decide membership, so each was adjudicated
+        # against its own escalation history. 3378 was abandoned BECAUSE it was
+        # ill-posed (its required signature referenced types absent from main),
+        # so an exhaustion there measures the spec rather than the model — a
+        # confound, excluded. 3586 was abandoned on cost while its brief named
+        # concrete deliverables, i.e. a genuine hard task, so it is included.
+        assert by_id[('reify', '3378')]['decision'] == 'exclude'
+        assert by_id[('reify', '3586')]['decision'] == 'include'
 
     def test_the_pending_reify_task_is_adjudicated(self, manifest: dict) -> None:
         # 5208 is a third non-done candidate the PRD did not name.
