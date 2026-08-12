@@ -9,7 +9,7 @@ drift guard — share one implementation instead of drifting apart.
 
 Consumers import from this module directly::
 
-    from shared.reify_checkout import REIFY_ROOT_ENV, resolve_reify_root
+    from shared.reify_checkout import REIFY_ROOT_ENV, reify_skip_reason, resolve_reify_root
 
 It is deliberately NOT re-exported from ``shared/__init__.py`` — see
 ``shared/tests/test_public_api.py``, which pins ``shared.__all__`` to the union
@@ -19,8 +19,10 @@ convention for this kind of module here (``shared.testing``,
 
 This module is pure stdlib on purpose: it must NOT import pytest, which is in
 shared's ``[dependency-groups] dev`` and not its ``[project]`` dependencies.
-Test-support callers get a skip *reason* string back and turn it into a
-``pytest.skip`` / ``pytest.mark.skipif`` themselves.
+Test-support callers get a skip *reason* string from `reify_skip_reason` and
+turn it into a ``pytest.skip`` / ``pytest.mark.skipif`` themselves — which is
+also the shape the two consumers need anyway, since they need DIFFERENT ones
+(a runtime skip inside a test body vs a module-level skipif marker).
 """
 
 from __future__ import annotations
@@ -28,7 +30,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-__all__ = ['REIFY_ROOT_ENV', 'resolve_reify_root']
+__all__ = ['REIFY_ROOT_ENV', 'reify_skip_reason', 'resolve_reify_root']
 
 #: The one env var steering every reify-dependent test in dark-factory.  Named
 #: here rather than respelled at each call site, so one `export REIFY_ROOT=...`
@@ -96,4 +98,45 @@ def resolve_reify_root(marker: str | Path, *, start: Path) -> Path | None:
     for ancestor in Path(start).resolve().parents:
         if (ancestor / 'reify' / marker).is_file():
             return ancestor / 'reify'
+    return None
+
+
+def reify_skip_reason(marker: str | Path, root: Path | None) -> str | None:
+    """Why a reify-dependent test cannot run against *root*, or None if it can.
+
+    Returns ``None`` when ``root / marker`` is a real file — the gate must RUN.
+    Otherwise returns a non-empty reason string for the caller to feed to
+    ``pytest.skip`` / ``pytest.mark.skipif``.  It never returns ``''``: a falsy
+    reason would silently DISABLE a call site that gates on truthiness, turning
+    a skip into a phantom pass.
+
+    The two non-None arms are deliberately distinct (carried over from task
+    3843's ``_skip_unless_checkout``), and conflating them is the failure this
+    exists to prevent:
+
+      * ``root is None`` is the legitimate standalone-checkout discovery MISS —
+        nobody has a reify sibling checked out here.  That is expected and
+        benign, so the reason says what was searched for and how to override it,
+        and deliberately does NOT name a path: nobody named one.
+      * a non-None *root* whose *marker* is missing is an operator's REIFY_ROOT
+        naming a path that is not there.  `resolve_reify_root` only ever
+        DISCOVERS a root whose marker IS a file, so this state can arise from
+        the override arm alone — which is exactly why the message names the
+        path: it is the path *you* named.  The override is honored verbatim
+        rather than silently falling back to discovery, so a typo is
+        self-evident in ``pytest -rs`` output instead of quietly answering for a
+        different repo than the operator asked for.
+    """
+    if root is None:
+        return (
+            f'reify checkout not discoverable (no ancestor carries reify/{marker}); '
+            f'set {REIFY_ROOT_ENV} to override'
+        )
+    if not (root / marker).is_file():
+        named_by = (
+            f' (named by {REIFY_ROOT_ENV})'
+            if os.environ.get(REIFY_ROOT_ENV, '').strip()
+            else ''
+        )
+        return f'reify checkout at {root}{named_by} has no {marker}'
     return None
