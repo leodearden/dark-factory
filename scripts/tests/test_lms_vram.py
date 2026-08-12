@@ -632,3 +632,147 @@ def test_the_inventory_note_says_it_is_not_a_full_accounting():
     assert 'inventory' in note
     assert 'not' in note and 'accounting' in note
     assert 'graphics' in note
+
+
+# ---------------------------------------------------------------------------
+# (g) the baseline pollution predicate — a positive ALLOWLIST
+# ---------------------------------------------------------------------------
+#
+# `lms_ctl.start` records the baseline BEFORE `systemctl start`, so at that
+# instant nothing of ours is on the card.  Anything sizeable is therefore a
+# surprise, and a positive allowlist is both safe and maximally strict: it
+# catches ollama AND anything nobody anticipated.
+#
+# The probe-time guard (section (i)) cannot use the same rule, because there the
+# arm's own container is legitimately a NEW consumer and
+# `--query-compute-apps=pid,process_name,used_memory` cannot tell a
+# containerised vLLM `python` from any other `python`.  That asymmetry is
+# deliberate, not an oversight.
+
+
+def _consumer(pid=7575, process_name='python', used_mib=4050):
+    return lms_vram.GpuConsumer(
+        pid=pid, process_name=process_name, used_mib=used_mib,
+    )
+
+
+#: whisper-writer as measured on this host: resident since 2026-07-03, and
+#: required resident by PRD D10.
+WHISPER = _consumer()
+
+#: ollama as measured 2026-08-06, qwen3:14b resident on keep_alive.  The
+#: reading that motivated this whole guard.
+OLLAMA = _consumer(
+    pid=905936, process_name='/usr/local/lib/ollama/llama-server', used_mib=10314,
+)
+
+
+def test_the_pollution_floor_is_the_tasks_one_gib():
+    """Below this a consumer is noise, not a finding."""
+    assert lms_vram.POLLUTION_FLOOR_MIB == 1024
+
+
+def test_the_expected_consumer_allowlist_is_whisper_writer_alone():
+    (whisper,) = lms_vram.EXPECTED_CONSUMERS
+
+    assert 'whisper' in whisper.label.lower()
+    # Derived, not guessed: every whisper-writer reading recorded on this host
+    # is 4050 MiB. 6144 sits far above that (reload drift) and far below the
+    # 10314 MiB ollama holding that motivated the guard.
+    assert whisper.ceiling_mib == 6144
+    assert whisper.ceiling_mib > 4050
+    assert whisper.ceiling_mib < 10314
+
+
+@pytest.mark.parametrize(
+    'process_name', ['python', 'python3', '/usr/bin/python3', '/usr/bin/python'],
+)
+def test_the_whisper_writer_pattern_matches_a_bare_or_pathed_python(process_name):
+    (whisper,) = lms_vram.EXPECTED_CONSUMERS
+
+    assert whisper.matches(process_name)
+
+
+@pytest.mark.parametrize(
+    'process_name',
+    [
+        '/usr/local/lib/ollama/llama-server',
+        'llama-server',
+        'pythonish',
+        '/opt/not-python',
+    ],
+)
+def test_the_whisper_writer_pattern_does_not_match_anything_else(process_name):
+    (whisper,) = lms_vram.EXPECTED_CONSUMERS
+
+    assert not whisper.matches(process_name)
+
+
+def test_whisper_writer_alone_at_its_measured_size_is_a_clean_baseline():
+    assert lms_vram.unexpected_baseline_consumers([WHISPER]) == []
+
+
+def test_an_empty_card_is_a_clean_baseline():
+    assert lms_vram.unexpected_baseline_consumers([]) == []
+
+
+def test_the_measured_ollama_holding_pollutes_the_baseline():
+    """The exact 2026-08-06 reading: whisper-writer plus 10314 MiB of ollama."""
+    offenders = lms_vram.unexpected_baseline_consumers([WHISPER, OLLAMA])
+
+    assert offenders == [OLLAMA]
+
+
+def test_a_stray_under_the_floor_is_noise_and_not_pollution():
+    """A few hundred MiB cannot move a budget verdict, and flagging it would
+    make the guard cry wolf until an operator learns to ignore it."""
+    stray = _consumer(pid=4242, process_name='/usr/bin/glxgears', used_mib=512)
+
+    assert lms_vram.unexpected_baseline_consumers([WHISPER, stray]) == []
+
+
+def test_a_stranger_over_the_floor_pollutes_even_if_nobody_anticipated_it():
+    """The allowlist is positive precisely so an UNANTICIPATED holder is caught.
+    Nothing of ours is on the card at baseline, so there is no false-positive
+    direction to protect."""
+    stranger = _consumer(pid=4242, process_name='/opt/somebody/inference', used_mib=2048)
+
+    assert lms_vram.unexpected_baseline_consumers([stranger]) == [stranger]
+
+
+def test_an_oversized_python_cannot_ride_the_whisper_writer_allowlist():
+    """Otherwise any containerised vLLM left over from a previous slate could
+    sit in a 'clean' baseline under the name `python` and be subtracted from
+    the next arm's footprint."""
+    fat_python = _consumer(pid=4242, process_name='python', used_mib=9000)
+
+    assert lms_vram.unexpected_baseline_consumers([fat_python]) == [fat_python]
+
+
+def test_the_whisper_writer_ceiling_admits_a_reading_at_the_ceiling_exactly():
+    at_ceiling = _consumer(used_mib=6144)
+    over_ceiling = _consumer(used_mib=6145)
+
+    assert lms_vram.unexpected_baseline_consumers([at_ceiling]) == []
+    assert lms_vram.unexpected_baseline_consumers([over_ceiling]) == [over_ceiling]
+
+
+def test_polluted_baseline_error_is_a_vram_probe_error():
+    """So every existing `except VramProbeError` handler still catches it, and
+    a polluted baseline can never escape a caller that was already careful."""
+    assert issubclass(lms_vram.PollutedBaselineError, lms_vram.VramProbeError)
+
+
+def test_the_polluted_baseline_error_names_the_offending_consumer():
+    """An operator reading only stderr must know WHICH process to deal with."""
+    message = str(lms_vram.PollutedBaselineError([OLLAMA]))
+
+    assert '905936' in message
+    assert '/usr/local/lib/ollama/llama-server' in message
+    assert '10314' in message
+
+
+def test_the_polluted_baseline_error_carries_the_offenders_for_a_caller():
+    error = lms_vram.PollutedBaselineError([OLLAMA])
+
+    assert error.consumers == [OLLAMA]
