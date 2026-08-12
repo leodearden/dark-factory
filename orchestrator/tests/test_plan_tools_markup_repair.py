@@ -26,6 +26,7 @@ module's OWN BYTES at import, so a future editor cannot quietly reintroduce one
 from __future__ import annotations
 
 import copy
+import errno
 import inspect
 import json
 import logging
@@ -1488,6 +1489,58 @@ class TestAtomicWritePlan:
         assert str(target) in str(excinfo.value)
         assert target.read_bytes() == before_bytes
         assert set(plan_dir.iterdir()) == before_entries
+
+    def test_a_mode_lookup_failure_surfaces_as_PlanWriteError(self, plan_dir, monkeypatch):
+        """``_target_file_mode`` deliberately swallows only ``FileNotFoundError``.
+
+        Any OTHER ``OSError`` from ``target.stat()`` (EACCES on the parent dir,
+        ELOOP, ENAMETOOLONG) must still turn into the documented
+        ``PlanWriteError`` — the docstring promises 'Any failure ... raises
+        PlanWriteError naming the path', and today the lookup sits BEFORE the
+        try block that makes that true.
+        """
+        target = plan_dir / 'plan.json'
+        before_bytes = target.read_bytes()
+        before_entries = set(plan_dir.iterdir())
+
+        def boom(_target):
+            raise OSError(errno.EACCES, 'Permission denied')
+
+        monkeypatch.setattr(plan_tools, '_target_file_mode', boom)
+
+        with pytest.raises(plan_tools.PlanWriteError) as excinfo:
+            plan_tools._atomic_write_plan(target, corrupt_plan())
+
+        assert str(target) in str(excinfo.value), (
+            'the failure must name the path — loud, not a silent skip'
+        )
+        assert target.read_bytes() == before_bytes
+        assert set(plan_dir.iterdir()) == before_entries, (
+            'no .plan.json.*.tmp residue may be left behind'
+        )
+
+    def test_a_mode_lookup_failure_names_both_the_lane_and_resolved_paths(
+        self, lane_and_meta, monkeypatch
+    ):
+        """Mirrors ``test_dangling_symlink_fails_loudly_without_materialising_a_file``.
+
+        This is the half of the docstring contract the current ordering cannot
+        honour: when the target is a lane symlink, the wrapper's message must
+        name BOTH the original lane path and the resolved meta-root path.
+        """
+        lane_plan, real_plan = lane_and_meta
+
+        def boom(_target):
+            raise OSError(errno.EACCES, 'Permission denied')
+
+        monkeypatch.setattr(plan_tools, '_target_file_mode', boom)
+
+        with pytest.raises(plan_tools.PlanWriteError) as excinfo:
+            plan_tools._atomic_write_plan(lane_plan, corrupt_plan())
+
+        message = str(excinfo.value)
+        assert str(lane_plan) in message, 'the ORIGINAL path must be named'
+        assert str(real_plan) in message, 'the RESOLVED path must be named too'
 
     def test_writing_a_plan_that_does_not_serialize_leaves_no_residue(self, plan_dir):
         """An unserializable payload must not strand a temp file either."""
