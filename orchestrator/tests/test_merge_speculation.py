@@ -2042,10 +2042,10 @@ class TestLateArrivalAttaches:
             if call == 0:
                 gate_a_entered.set()
                 await gate_a_release.wait()
-            return MagicMock(
+            # task 3980: _fake_verify_result, not a bare MagicMock — see the
+            # TestNoBareVerifyResultDoubles guard at the foot of this module.
+            return _fake_verify_result(
                 passed=True, summary='ok', test_output='ok',
-                lint_output='', type_output='', category='',
-                timed_out=False, verify_skipped=False,
             )
 
         # ── B's remote runner — passes immediately (no gate needed for step-1) ─
@@ -2272,10 +2272,10 @@ class TestLateArrivalCleanCAS:
             if call == 0:
                 gate_a_entered.set()
                 await gate_a_release.wait()
-            return MagicMock(
+            # task 3980: _fake_verify_result, not a bare MagicMock — see the
+            # TestNoBareVerifyResultDoubles guard at the foot of this module.
+            return _fake_verify_result(
                 passed=True, summary='ok', test_output='ok',
-                lint_output='', type_output='', category='',
-                timed_out=False, verify_skipped=False,
             )
 
         # ── Gate B's REMOTE verify — hold until A has landed ─────────────────
@@ -2730,10 +2730,10 @@ class TestLateArrivalGuards:
 
         # ── A's local verify: passes immediately (no gate) ───────────────────
         async def _passing_local(*args: Any, **kwargs: Any) -> MagicMock:
-            return MagicMock(
+            # task 3980: _fake_verify_result, not a bare MagicMock — see the
+            # TestNoBareVerifyResultDoubles guard at the foot of this module.
+            return _fake_verify_result(
                 passed=True, summary='ok', test_output='ok',
-                lint_output='', type_output='', category='',
-                timed_out=False, verify_skipped=False,
             )
 
         # ── B's remote runner: passes immediately ────────────────────────────
@@ -2836,10 +2836,10 @@ class TestLateArrivalGuards:
             if call == 0:
                 gate_a_entered.set()
                 await gate_a_release.wait()
-            return MagicMock(
+            # task 3980: _fake_verify_result, not a bare MagicMock — see the
+            # TestNoBareVerifyResultDoubles guard at the foot of this module.
+            return _fake_verify_result(
                 passed=True, summary='ok', test_output='ok',
-                lint_output='', type_output='', category='',
-                timed_out=False, verify_skipped=False,
             )
 
         gate_b_prerelease = asyncio.Event()
@@ -2940,10 +2940,10 @@ class TestLateArrivalGuards:
             if call == 0:
                 gate_a_entered.set()
                 await gate_a_release.wait()
-            return MagicMock(
+            # task 3980: _fake_verify_result, not a bare MagicMock — see the
+            # TestNoBareVerifyResultDoubles guard at the foot of this module.
+            return _fake_verify_result(
                 passed=True, summary='ok', test_output='ok',
-                lint_output='', type_output='', category='',
-                timed_out=False, verify_skipped=False,
             )
 
         gate_b_prerelease = asyncio.Event()
@@ -3057,10 +3057,10 @@ class TestLateArrivalGuards:
             if call == 0:
                 gate_a_entered.set()
                 await gate_a_release.wait()
-            return MagicMock(
+            # task 3980: _fake_verify_result, not a bare MagicMock — see the
+            # TestNoBareVerifyResultDoubles guard at the foot of this module.
+            return _fake_verify_result(
                 passed=True, summary='ok', test_output='ok',
-                lint_output='', type_output='', category='',
-                timed_out=False, verify_skipped=False,
             )
 
         gate_b_prerelease = asyncio.Event()
@@ -3195,10 +3195,10 @@ class TestLateArrivalGuards:
             if call == 0:
                 gate_a_entered.set()
                 await gate_a_release.wait()
-            return MagicMock(
+            # task 3980: _fake_verify_result, not a bare MagicMock — see the
+            # TestNoBareVerifyResultDoubles guard at the foot of this module.
+            return _fake_verify_result(
                 passed=True, summary='ok', test_output='ok',
-                lint_output='', type_output='', category='',
-                timed_out=False, verify_skipped=False,
             )
 
         gate_b_prerelease = asyncio.Event()
@@ -3376,10 +3376,10 @@ class TestLateArrivalSubmissionOrderCAS:
             if call == 0:
                 gate_a_entered.set()
                 await gate_a_release.wait()
-            return MagicMock(
+            # task 3980: _fake_verify_result, not a bare MagicMock — see the
+            # TestNoBareVerifyResultDoubles guard at the foot of this module.
+            return _fake_verify_result(
                 passed=True, summary='ok', test_output='ok',
-                lint_output='', type_output='', category='',
-                timed_out=False, verify_skipped=False,
             )
 
         # ── Gate B's REMOTE verify ─────────────────────────────────────────────
