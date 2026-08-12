@@ -1450,3 +1450,62 @@ class TestTheMetricIsPure:
 
         assert _ids(result.records) == records_before
         assert result.provenance == provenance_before
+
+
+class TestOnlyASynthesizedRecordCanAlias:
+    """The discriminator that lets a flat arm be scored with no disclosure.
+
+    A missing `provenance` must not mean "unknown" unconditionally: a
+    STORED record carrying the canonical's id simply IS the canonical, and
+    reporting `None` for every flat arm would render the honest column as
+    no-measurement across most of the table.  Only a SYNTHESIZED document
+    can alias, and a synthesized document is self-identifying by `role`.
+    """
+
+    def test_a_stored_canonical_needs_no_disclosure_to_be_credited(self):
+        mod = _mod()
+        hits, _, canonical = _aliasing_corpus(canonical_ranked=True)
+
+        measured = mod.canonical_discoverability(
+            hits, 't-a', canonical.record_id, k=5,
+        )
+
+        assert measured['unaliased_in_top_k'] is True
+        assert measured['unaliased_rank'] == 2
+
+    def test_a_synthesized_document_without_disclosure_is_unknown_not_credited(
+        self,
+    ):
+        """The fallback must fail CLOSED, never open."""
+        mod = _mod()
+        bake_off = _bake_off()
+        hits, index, canonical = _aliasing_corpus(canonical_ranked=False)
+
+        result = mod.apply_topic_keyed_grouped_read(
+            hits, index, render_sightings=False,
+        )
+        document = result.records[0]
+
+        # Self-identifying: the role is what the metric reads, so pin it.
+        assert document.role == bake_off.GROUPED_ROLE
+        assert mod.canonical_discoverability(
+            result.records, 't-a', canonical.record_id, k=5,
+        )['unaliased_in_top_k'] is None
+
+    def test_disclosure_beats_the_role_fallback_when_both_are_present(self):
+        """Provenance is EVIDENCE; the role is only a discriminator.
+
+        A grouped document whose canonical really did rank is credited —
+        the role alone would have refused it, so the disclosure must win.
+        """
+        mod = _mod()
+        hits, index, canonical = _aliasing_corpus(canonical_ranked=True)
+
+        result = mod.apply_topic_keyed_grouped_read(
+            hits, index, render_sightings=False,
+        )
+
+        assert mod.canonical_discoverability(
+            result.records, 't-a', canonical.record_id, k=5,
+            provenance=result.provenance,
+        )['unaliased_in_top_k'] is True

@@ -641,3 +641,115 @@ def apply_topic_diversity_cap(
     # so the order is total and the transform deterministic.
     output.sort(key=lambda pair: pair[0])
     return [record for _, record in output]
+
+
+# ---------------------------------------------------------------------------
+# The de-aliased canonical metric
+# ---------------------------------------------------------------------------
+
+
+def canonical_discoverability(
+    hits: list[Any],
+    topic: str,
+    canonical_record_id: str,
+    k: int,
+    *,
+    provenance: dict[str, DocumentProvenance] | None = None,
+) -> dict[str, Any]:
+    """Was the topic's canonical found — aliased, and for real?
+
+    ``topic_discoverability`` (:1116) credits the canonical on
+    ``hit.record_id == canonical_record_id``.  A grouped read emits its
+    document under the canonical's OWN ``record_id``
+    (``apply_grouped_read``:934-935, and
+    :func:`apply_topic_keyed_grouped_read` for the same reason — the
+    document IS the canonical, amended), so any member folding upward
+    scores as "canonical found" whether or not the canonical's own stored
+    record ever ranked.  That is a property of the TRANSFORM, not of
+    retrieval, and it is the mechanism behind b_grouped's 0.97
+    canonical-in-top-5 in the committed E2 table.
+
+    WHY BOTH RATES, RATHER THAN A FIXED COLUMN
+    ------------------------------------------
+    Simply switching to the honest semantics would make this table silently
+    incomparable with the committed one, and would erase a real finding: a
+    grouped read genuinely DOES put the canonical's body in the reader's
+    window, which is a reader benefit and why the behaviour is arguably
+    correct rather than a bug.  So both are reported and the reader is told
+    which is which:
+
+      * ``aliased_*`` — the legacy ``record_id``-match semantics, preserved
+        exactly so the column stays comparable across tables.
+      * ``unaliased_*`` — the canonical's OWN stored record actually
+        ranked.
+
+    The GAP between them IS the aliasing, quantified per arm.
+
+    EVIDENCE, NOT INFERENCE
+    -----------------------
+    A synthesized document is indistinguishable from a stored record at the
+    ``record_id`` level — that is the entire problem — so the honest rate
+    cannot be computed from *hits* alone.  It is read from the transform's
+    own *provenance*, emitted by the transform that did the folding.  With
+    no provenance the unaliased verdict is ``None``: **no measurement, not
+    a measured zero**, and never a quiet fallback to crediting.  A flat arm
+    synthesizes nothing, so passing ``{}`` (rather than ``None``) correctly
+    reports the two as equal.
+
+    Ranks are **1-based**, and ``None`` when the canonical is absent
+    entirely — inherited from ``topic_discoverability``, where ``0`` would
+    collide with a real rank under a 0-based reading and would average as
+    "very good" in a mean-rank summary.  A canonical ranked OUTSIDE the
+    window still reports its rank: "absent from top-5" and "absent
+    entirely" are different findings.
+
+    Rank/set-based only: no score is read.  Pure.
+    """
+    # The aliased half is DELEGATED, not restated, so it cannot drift from
+    # the semantics the committed E2 table was measured under (INV-5).
+    landed = bake_off().topic_discoverability(
+        hits, topic, canonical_record_id, k,
+    )
+    aliased_rank = landed['canonical_rank']
+
+    matched = next(
+        (hit for hit in hits if hit.record_id == canonical_record_id), None,
+    )
+    #: Only a SYNTHESIZED document can alias.  A stored record carrying the
+    #: canonical's id simply IS the canonical, so a flat arm needs no
+    #: disclosure to be scored honestly — which is why a missing
+    #: *provenance* is not automatically an unknown.
+    synthesized = matched is not None and matched.role == bake_off().GROUPED_ROLE
+
+    unaliased_rank: int | None = aliased_rank
+    unaliased_in_top_k: bool | None
+    disclosure = None if provenance is None else provenance.get(canonical_record_id)
+
+    if disclosure is not None:
+        if not disclosure.canonical_was_itself_ranked:
+            # A document minted under the canonical's id, and the canonical
+            # itself never ranked.  The reader DID receive its body — which
+            # is why the aliased column is not "wrong" — but retrieval did
+            # not find it.
+            unaliased_rank = None
+    elif synthesized:
+        # A synthesized document with no disclosure.  Aliasing is invisible
+        # in the record alone — that is the entire problem — so this is
+        # unknowable, and an unknown is not a zero.
+        return {
+            'aliased_in_top_k': landed['canonical_in_top_k'],
+            'aliased_rank': aliased_rank,
+            'unaliased_in_top_k': None,
+            'unaliased_rank': None,
+            'topic_member_count': landed['topic_member_count'],
+        }
+
+    unaliased_in_top_k = unaliased_rank is not None and unaliased_rank <= k
+
+    return {
+        'aliased_in_top_k': landed['canonical_in_top_k'],
+        'aliased_rank': aliased_rank,
+        'unaliased_in_top_k': unaliased_in_top_k,
+        'unaliased_rank': unaliased_rank,
+        'topic_member_count': landed['topic_member_count'],
+    }
