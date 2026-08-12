@@ -1041,11 +1041,12 @@ def test_cancel_request_reaps_start_new_session_escapes(tmp_path):
     assert rc == 0, f'cancel_request returned {rc}, expected 0'
     assert not pgid_file_path.exists(), 'pgid file must be removed on success'
 
-    # Reap root_proc zombie BEFORE checking alive status.
-    # cancel_request kills root with SIGKILL, which makes it a zombie (state 'Z')
-    # until its parent (this test process) calls wait().  os.kill(pid, 0) returns
-    # success for zombies — they are still in /proc — so the alive check below
-    # would incorrectly report root as alive if we don't wait first.
+    # Reap the root zombie so this pytest process doesn't leak a child entry,
+    # and to confirm root actually exited (rather than merely left the
+    # tracked-pid set for some other reason). Note this is no longer
+    # load-bearing for the alive check below: _is_running already treats
+    # state 'Z' as dead, so a not-yet-reaped root zombie wouldn't be
+    # misreported as alive even without this wait.
     root_proc.wait(timeout=5)
 
     # Poll (rather than sleep a fixed amount) until every tracked pid is
@@ -1053,10 +1054,15 @@ def test_cancel_request_reaps_start_new_session_escapes(tmp_path):
     # final reap are all asynchronous — a fixed sleep races host scheduling
     # load, while a bounded poll only waits as long as actually needed and
     # still fails loudly if a pid is never reaped (see _wait_until_all_dead).
-    still_alive = _wait_until_all_dead(all_pids, timeout=5.0)
+    # timeout is intentionally left at _wait_until_all_dead's own default
+    # (single source of truth) rather than repeated here.
+    still_alive = _wait_until_all_dead(all_pids)
     assert still_alive == [], (
         f'These pids survived cancel_request (start_new_session escapes not reaped?): '
-        f'{still_alive}'
+        f'{still_alive}. (On the off chance one of these pid numbers was '
+        f'recycled by the host to an unrelated process during the poll '
+        f'window rather than being a genuine escapee, cross-check it '
+        f'against read_ppid_map() output captured around this time.)'
     )
 
 
