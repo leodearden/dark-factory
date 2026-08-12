@@ -107,7 +107,7 @@ def _build_journal(
     rows: list[tuple[str, str, str]],
 ) -> Path:
     """Write a synthetic journal at `path`. Rows are (operation, kind, params)."""
-    import sqlite3 # noqa: PLC0415
+    import sqlite3  # noqa: PLC0415
 
     con = sqlite3.connect(str(path))
     try:
@@ -125,7 +125,7 @@ def _build_journal(
 
 
 def _search_rows(text: str, n: int, *, limit: int = 5) -> list[tuple[str, str, str]]:
-    import json # noqa: PLC0415
+    import json  # noqa: PLC0415
 
     params = json.dumps({'query': text, 'limit': limit})
     return [('search', 'read', params)] * n
@@ -360,9 +360,9 @@ class TestReadOnlyAccess:
             con.close()
 
     def test_a_write_attempt_raises(self, tmp_path):
-        import sqlite3 # noqa: PLC0415
+        import sqlite3  # noqa: PLC0415
 
-        import pytest # noqa: PLC0415
+        import pytest  # noqa: PLC0415
 
         mod = _mod()
         db = _standard_journal(tmp_path)
@@ -374,7 +374,7 @@ class TestReadOnlyAccess:
             con.close()
 
     def test_harvesting_does_not_modify_the_journal(self, tmp_path):
-        import hashlib # noqa: PLC0415
+        import hashlib  # noqa: PLC0415
 
         mod = _mod()
         db = _standard_journal(tmp_path)
@@ -387,7 +387,7 @@ class TestLoudDegradation:
     """An unreadable journal is a named error, never an empty sample."""
 
     def test_an_absent_journal_raises_a_named_error(self, tmp_path):
-        import pytest # noqa: PLC0415
+        import pytest  # noqa: PLC0415
 
         mod = _mod()
         missing = tmp_path / 'nope.db'
@@ -398,8 +398,9 @@ class TestLoudDegradation:
     def test_a_journal_without_write_ops_raises_rather_than_returning_empty(
         self, tmp_path
     ):
-        import pytest # noqa: PLC0415
-        import sqlite3 # noqa: PLC0415
+        import sqlite3  # noqa: PLC0415
+
+        import pytest  # noqa: PLC0415
 
         mod = _mod()
         db = tmp_path / 'wrong.db'
@@ -411,7 +412,7 @@ class TestLoudDegradation:
             mod.harvest(db)
 
     def test_no_fixture_is_written_when_the_journal_is_unavailable(self, tmp_path):
-        import pytest # noqa: PLC0415
+        import pytest  # noqa: PLC0415
 
         mod = _mod()
         out = tmp_path / 'production_query_sample.jsonl'
@@ -421,7 +422,7 @@ class TestLoudDegradation:
 
     def test_an_empty_journal_writes_no_fixture_either(self, tmp_path):
         """Zero traffic must not silently become an empty-but-valid fixture."""
-        import pytest # noqa: PLC0415
+        import pytest  # noqa: PLC0415
 
         mod = _mod()
         db = _build_journal(tmp_path / 'j.db', [])
@@ -435,7 +436,7 @@ class TestFixtureWrite:
     """The committed fixture is JSONL plus a provenance sidecar."""
 
     def test_main_writes_jsonl_rows_and_a_sidecar(self, tmp_path):
-        import json # noqa: PLC0415
+        import json  # noqa: PLC0415
 
         mod = _mod()
         db = _standard_journal(tmp_path)

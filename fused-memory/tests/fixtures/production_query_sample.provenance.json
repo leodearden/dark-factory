@@ -1,0 +1,51 @@
+{
+  "family_share": 0.645068,
+  "harvested_at": "2026-08-12T18:13:02.261832+00:00",
+  "journal_path": "/home/leo/src/dark-factory/data/reconciliation/write_journal.db",
+  "literal_share": 0.519665,
+  "search_limit": 5,
+  "seed": 4004,
+  "tail_count": 152127,
+  "tail_distinct": 133283,
+  "tail_sample": 40,
+  "tail_share": 0.354932,
+  "tail_top": 20,
+  "templates": [
+    {
+      "distinct_instances": 1,
+      "match": "literal",
+      "observed_count": 74103,
+      "template": "project overview architecture goals",
+      "text": "project overview architecture goals",
+      "traffic_share": 0.172892
+    },
+    {
+      "distinct_instances": 1,
+      "match": "literal",
+      "observed_count": 74346,
+      "template": "coding conventions and project norms",
+      "text": "coding conventions and project norms",
+      "traffic_share": 0.173459
+    },
+    {
+      "distinct_instances": 1,
+      "match": "literal",
+      "observed_count": 74284,
+      "template": "recent decisions and rationale",
+      "text": "recent decisions and rationale",
+      "traffic_share": 0.173314
+    },
+    {
+      "distinct_instances": 5663,
+      "match": "parameterized",
+      "observed_count": 53749,
+      "template": "task {task_id} context and related decisions",
+      "text": "task reify_task_12 context and related decisions",
+      "traffic_share": 0.125403
+    }
+  ],
+  "total_search_ops": 428609,
+  "unlabeled": true,
+  "unlabeled_reason": "Production queries carry no ground truth: the journal records what was asked, never what should have been returned. Rows therefore carry no expects_claim_ids, and labeled metrics render as no-measurement downstream.",
+  "unparsed_search_ops": 8
+}
