@@ -304,7 +304,15 @@ else
        --print-verdicts 2>&1)" && _orch_parity_exit=0 || _orch_parity_exit=$?
   printf '%s\n' "$_orch_parity_out"
 
-  if ! printf '%s\n' "$_orch_parity_out" | grep -q '\[orchestrator_unit_parity\]'; then
+  # The tag is matched in BASH, not through `printf ... | grep -q`. grep exits
+  # the instant it matches and the tag is on line 1, so once the report exceeds
+  # the pipe buffer (~64KB) the printf dies of SIGPIPE, `pipefail` makes the
+  # pipeline return 141, and `!` turns that into "it did not run" with the tag
+  # plainly present — a verdict manufactured by the mechanism rather than read
+  # from the checker, which is the exact class of failure this guard removes.
+  # `[[ ]]` forks nothing and cannot be signalled. (Measured: the pipe form
+  # flips at ~82KB of tagged output; the pattern below does not.)
+  if [[ "$_orch_parity_out" != *'[orchestrator_unit_parity]'* ]]; then
     fail "Orchestrator parity gate produced no [orchestrator_unit_parity] report"
     fail "  (status $_orch_parity_exit) — it did not run, so its status says"
     fail "  nothing about this host. Check the script path and its flags."
@@ -756,7 +764,10 @@ else
        --repo-root     "$REPO_ROOT" 2>&1)" && _dash_parity_exit=0 || _dash_parity_exit=$?
   printf '%s\n' "$_dash_parity_out"
 
-  if ! printf '%s\n' "$_dash_parity_out" | grep -q '\[dashboard_unit_parity\]'; then
+  # Matched in bash, not through a pipe to grep — see the orchestrator gate
+  # above for why a `printf | grep -q` here can report "it did not run" on a
+  # report that carries the tag.
+  if [[ "$_dash_parity_out" != *'[dashboard_unit_parity]'* ]]; then
     fail "Dashboard parity gate produced no [dashboard_unit_parity] report"
     fail "  (status $_dash_parity_exit) — it did not run, so its status says"
     fail "  nothing about this host. Check the script path and its flags."
@@ -946,7 +957,18 @@ else
        && _fm_parity_exit=0 || _fm_parity_exit=$?
   printf '%s\n' "$_fm_parity_out"
 
-  if ! printf '%s\n' "$_fm_parity_out" | grep -qE '^\[(ok|skip|drift|fixed)\]'; then
+  # The marker is line-ANCHORED (the equivalent of `grep -E '^\[(ok|...)\]'`),
+  # so an argparse usage line's `[--fix]` and python3's mid-line `[Errno 2]`
+  # cannot pass for a report. Prefixing a newline makes the first line match
+  # the same way as any other. Done in bash rather than through a pipe to grep
+  # for the SIGPIPE reason spelled out at the orchestrator gate above.
+  _fm_parity_reported=0
+  case $'\n'"$_fm_parity_out" in
+    *$'\n'"[ok]"*|*$'\n'"[skip]"*|*$'\n'"[drift]"*|*$'\n'"[fixed]"*)
+      _fm_parity_reported=1 ;;
+  esac
+
+  if [ "$_fm_parity_reported" -eq 0 ]; then
     fail "Fused-memory parity check produced no recognizable report"
     fail "  (status $_fm_parity_exit) — it did not run, so its status says"
     fail "  nothing about this host. Check the script path and its flags."
@@ -997,7 +1019,10 @@ else
        && _dash_post_parity_exit=0 || _dash_post_parity_exit=$?
   printf '%s\n' "$_dash_post_parity_out"
 
-  if ! printf '%s\n' "$_dash_post_parity_out" | grep -q '\[dashboard_unit_parity\]'; then
+  # Matched in bash, not through a pipe to grep — see the orchestrator gate for
+  # why a `printf | grep -q` here can report "it did not run" on a report that
+  # carries the tag.
+  if [[ "$_dash_post_parity_out" != *'[dashboard_unit_parity]'* ]]; then
     fail "Dashboard post-install check produced no [dashboard_unit_parity] report"
     fail "  (status $_dash_post_parity_exit) — it did not run, so its status says"
     fail "  nothing about this host. Check the script path and its flags."

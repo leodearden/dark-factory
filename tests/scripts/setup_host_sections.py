@@ -14,11 +14,17 @@ section it cares about by the COMMENTS that delimit it and gets back that text,
 verbatim, to run in a hermetic tmp tree.
 
 Endpoints are DERIVED from markers, never pinned line numbers, so a slice
-follows a reflow of its block instead of silently shifting off it. Markers are
-deliberately the section COMMENTS rather than the checker filenames: a checker
-name occurs more than once in this file (invocation + the warn text that names
-the remediation command), so a filename-anchored slice is ambiguous, and each
-gate fix adds a further occurrence via its `_..._script=` assignment.
+follows a reflow of its block instead of silently shifting off it.
+
+MARKERS ARE CODE, NOT COMMENT PROSE. Each parity block hoists a uniquely-named
+`_<gate>_parity_script="$REPO_ROOT/scripts/check_<x>_unit_parity.py"`
+assignment at its top, and that line is the anchor. Anchoring on the section
+comment instead would make CI red for a reworded comment or a fixed typo — zero
+behavioural change — and anchoring on the bare checker FILENAME is ambiguous,
+because a name occurs more than once in this file (the assignment plus the warn
+text naming the remediation command). The assignment line is unique per site
+and is exactly what the structural sweep in test_check_dashboard_unit_parity.py
+keys on, so both mechanisms share one anchor.
 
 NOTHING HERE TOUCHES REAL SYSTEMD. `repo_root` and `unit_dir` are always
 tmp_path trees supplied by the caller, and `systemctl` is always a PATH stub
@@ -26,9 +32,9 @@ that exits 0 — the sliced sections do call `systemctl --user enable`.
 
 Generalized from the reference implementation at
 tests/scripts/test_check_orchestrator_unit_parity.py:1044-1119 (task 3424).
-That file deliberately still carries its own copy: it is the just-landed
-reference for this pattern, and rewriting it to import this module would be
-churn and merge conflict for no behavioural gain.
+That file deliberately still carries its own copy: migrating it needs an edit
+to a file this task holds no lock on. See the amendment note in the commit that
+introduced this paragraph.
 """
 
 from __future__ import annotations
@@ -36,8 +42,10 @@ from __future__ import annotations
 import os
 import pathlib
 import subprocess
+from collections.abc import Iterable
 
-SETUP_HOST_PATH = pathlib.Path(__file__).parents[2] / "scripts" / "setup-host.sh"
+REPO_ROOT = pathlib.Path(__file__).parents[2]
+SETUP_HOST_PATH = REPO_ROOT / "scripts" / "setup-host.sh"
 
 # The four logging shims, reduced to PLAIN TEXT so assertions can match on
 # prefixes without ANSI escapes. Prefixes mirror the reference harness.
@@ -67,15 +75,13 @@ def setup_host_text() -> str:
     return SETUP_HOST_PATH.read_text(encoding="utf-8")
 
 
-def slice_section(
-    start_marker: str, end_marker: str, *, occurrence: int = 0
-) -> str:
+def slice_section(start_marker: str, end_marker: str) -> str:
     """Return setup-host.sh from the line carrying *start_marker* through *end_marker*.
 
-    The slice runs from the START of the line containing the ``occurrence``-th
-    (0-based) instance of *start_marker* through the END of the line containing
-    the first *end_marker* at or after it — both endpoints derived, so the slice
-    survives a reflow of the block.
+    The slice runs from the START of the line containing the first instance of
+    *start_marker* through the END of the line containing the first
+    *end_marker* at or after it — both endpoints derived, so the slice survives
+    a reflow of the block.
 
     Raises AssertionError NAMING the missing marker when either is absent. That
     matters: the silent alternative is a slice of the wrong (or empty) region,
@@ -84,14 +90,11 @@ def slice_section(
     """
     text = setup_host_text()
 
-    pos = -1
-    for n in range(occurrence + 1):
-        pos = text.find(start_marker, pos + 1)
-        assert pos != -1, (
-            f"start_marker {start_marker!r} (occurrence {occurrence}) not found "
-            f"in {SETUP_HOST_PATH} — only {n} occurrence(s) present. A renamed "
-            f"section comment must fail here, not slice an empty region."
-        )
+    pos = text.find(start_marker)
+    assert pos != -1, (
+        f"start_marker {start_marker!r} not found in {SETUP_HOST_PATH}. A "
+        f"renamed anchor must fail here, not slice an empty region."
+    )
 
     start = text.rfind("\n", 0, pos) + 1
 
@@ -144,3 +147,69 @@ def run_section(
     return subprocess.run(
         ["bash", str(script)], capture_output=True, text=True, env=env
     )
+
+
+def usage_error_checker(script_name: str, usage_flags: str, rejected: str) -> str:
+    """A stub checker body shaped like argparse rejecting a RENAMED flag.
+
+    One of the two ways a parity checker exits 2 without having checked
+    anything (the other is `python3` refusing to open a script that was renamed
+    or moved). Its stderr deliberately carries bracketed tokens — `[-h]`,
+    `[--fix]` — because a marker match that is not line-anchored would read
+    those as a report and hand the gate a verdict the checker never gave.
+    """
+    return (
+        "import sys\n"
+        f"sys.stderr.write('usage: {script_name} {usage_flags}\\n"
+        f"error: unrecognized arguments: {rejected}\\n')\n"
+        "sys.exit(2)\n"
+    )
+
+
+def write_checker(
+    repo_root: pathlib.Path,
+    filename: str,
+    *,
+    body: str | None = None,
+    siblings: Iterable[str] = (),
+) -> pathlib.Path:
+    """Put a parity checker at ``repo_root/scripts/<filename>``.
+
+    With *body* None the REAL checker is copied out of the repo (plus any
+    *siblings* it imports), so the gate under test drives the real one and only
+    the TREE is fake. With *body* set, that text is written instead — the stub
+    path used to simulate a checker that exits without reporting.
+    """
+    scripts = repo_root / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    target = scripts / filename
+    if body is not None:
+        target.write_text(body, encoding="utf-8")
+        return target
+    for name in (filename, *siblings):
+        (scripts / name).write_text(
+            (REPO_ROOT / "scripts" / name).read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+    return target
+
+
+def checker_repo(
+    tmp_path: pathlib.Path,
+    filename: str,
+    *,
+    body: str | None = None,
+    siblings: Iterable[str] = (),
+    with_checker: bool = True,
+) -> pathlib.Path:
+    """A minimal tmp REPO_ROOT holding only ``scripts/`` and maybe the checker.
+
+    Enough for any gate block whose only repo-side dependency is the checker
+    itself. Callers needing more of the tree (committed units, a service
+    template) build their own root and call `write_checker` on it.
+    """
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True, exist_ok=True)
+    if with_checker:
+        write_checker(repo, filename, body=body, siblings=siblings)
+    return repo

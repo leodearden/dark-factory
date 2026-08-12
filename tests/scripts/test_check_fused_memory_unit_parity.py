@@ -17,7 +17,12 @@ import sys
 import types
 
 import pytest
-from setup_host_sections import run_section, slice_section
+from setup_host_sections import (
+    run_section,
+    slice_section,
+    usage_error_checker,
+    write_checker,
+)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 CHECKER_PATH = REPO_ROOT / "scripts" / "check_fused_memory_unit_parity.py"
@@ -603,7 +608,12 @@ def test_parity_checker_callable_as_subprocess(tmp_path: pathlib.Path):
 # Nothing here touches ~/.config/systemd/user or real systemd: REPO_ROOT and
 # UNIT_DIR are tmp_path trees and `systemctl` is a PATH stub that exits 0.
 
-_GATE_START = "# Fused-memory unit parity check"
+# Anchored on the block's hoisted `_fm_parity_script=` assignment — CODE, and
+# unique to this site — not on the section comment above it. A comment anchor
+# turns a reworded comment or a fixed typo into a red CI run for no behavioural
+# change, and it is the same line the structural sweep in
+# test_check_dashboard_unit_parity.py keys on, so both share one anchor.
+_GATE_START = "_fm_parity_script="
 _GATE_END = "\nfi\n"
 
 # The status is believed only when the checker's own report is present. Unlike
@@ -633,12 +643,7 @@ def _gate_repo(
         TEMPLATE_PATH.read_text(encoding="utf-8"), encoding="utf-8"
     )
     if with_checker:
-        (repo / "scripts" / "check_fused_memory_unit_parity.py").write_text(
-            checker_body
-            if checker_body is not None
-            else CHECKER_PATH.read_text(encoding="utf-8"),
-            encoding="utf-8",
-        )
+        write_checker(repo, CHECKER_PATH.name, body=checker_body)
     return repo
 
 
@@ -665,13 +670,13 @@ def _run_gate(
 
 
 # The argparse-shaped stub: exit 2, usage-shaped stderr, and no report marker —
-# what renaming a flag in a future refactor would actually produce.
-_USAGE_ERROR_CHECKER = (
-    "import sys\n"
-    "sys.stderr.write('usage: check_fused_memory_unit_parity.py [-h] "
-    "[--installed INSTALLED] [--template TEMPLATE] [--fix]\\n"
-    "error: unrecognized arguments: --installed\\n')\n"
-    "sys.exit(2)\n"
+# what renaming a flag in a future refactor would actually produce. The real
+# flag spellings are kept because their bracketed tokens ([-h], [--fix]) are
+# precisely what a non-line-anchored marker match would misread as a report.
+_USAGE_ERROR_CHECKER = usage_error_checker(
+    CHECKER_PATH.name,
+    "[-h] [--installed INSTALLED] [--template TEMPLATE] [--fix]",
+    "--installed",
 )
 
 

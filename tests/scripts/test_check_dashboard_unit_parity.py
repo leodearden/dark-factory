@@ -30,7 +30,14 @@ import sys
 import types
 
 import pytest
-from setup_host_sections import run_section, setup_host_text, slice_section
+from setup_host_sections import (
+    checker_repo,
+    run_section,
+    setup_host_text,
+    slice_section,
+    usage_error_checker,
+    write_checker,
+)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 CHECKER_PATH = REPO_ROOT / "scripts" / "check_dashboard_unit_parity.py"
@@ -2343,17 +2350,20 @@ def test_checker_subprocess_unit_flag_narrows_the_run(tmp_path: pathlib.Path):
 # Nothing here touches ~/.config/systemd/user or real systemd: REPO_ROOT and
 # UNIT_DIR are tmp_path trees and `systemctl` is a PATH stub that exits 0.
 
-_SECTION_8_START = 'info "Installing dashboard systemd units"'
+# Anchored on the block's hoisted `_dash_parity_script=` assignment — CODE, and
+# unique to this site — so a reworded section comment cannot turn CI red for no
+# behavioural change. The end anchor is the install's own `ok` line, because
+# this slice must cover the render/cp/enable that FOLLOWS the gate: whether the
+# units still land is half of what these tests assert.
+_SECTION_8_START = "_dash_parity_script="
 _SECTION_8_END = 'ok "Dashboard units installed'
 
 # The argparse-shaped stub: exit 2, usage-shaped stderr, and no
 # [dashboard_unit_parity] report — what renaming a flag would actually produce.
-_USAGE_ERROR_CHECKER = (
-    "import sys\n"
-    "sys.stderr.write('usage: check_dashboard_unit_parity.py [-h] "
-    "[--installed-dir INSTALLED_DIR] [--repo-root REPO_ROOT]\\n"
-    "error: unrecognized arguments: --installed-dir\\n')\n"
-    "sys.exit(2)\n"
+_USAGE_ERROR_CHECKER = usage_error_checker(
+    CHECKER_PATH.name,
+    "[-h] [--installed-dir INSTALLED_DIR] [--repo-root REPO_ROOT]",
+    "--installed-dir",
 )
 
 
@@ -2378,16 +2388,12 @@ def _gate_repo(
         encoding="utf-8",
     )
     if with_checker:
-        if checker_body is None:
-            for name in ("check_dashboard_unit_parity.py", "systemd_unit_parity.py"):
-                (repo / "scripts" / name).write_text(
-                    (REPO_ROOT / "scripts" / name).read_text(encoding="utf-8"),
-                    encoding="utf-8",
-                )
-        else:
-            (repo / "scripts" / "check_dashboard_unit_parity.py").write_text(
-                checker_body, encoding="utf-8"
-            )
+        write_checker(
+            repo,
+            CHECKER_PATH.name,
+            body=checker_body,
+            siblings=("systemd_unit_parity.py",),
+        )
     return repo
 
 
@@ -2584,7 +2590,11 @@ def test_section_8_reports_not_yet_installed_on_a_bare_host(tmp_path: pathlib.Pa
 # strongest of the three: a post-install check that silently never ran is the
 # LAST word the operator reads about whether the install took.
 
-_SECTION_12_START = "# Dashboard unit parity — POST-INSTALL SANITY CHECK ONLY."
+# Anchored on the block's hoisted `_dash_post_parity_script=` assignment, for
+# the same reason as section 8: code, unique to this site, and the same line the
+# sweep below discovers — not the section comment, whose wording is not a
+# behavioural contract.
+_SECTION_12_START = "_dash_post_parity_script="
 _SECTION_12_END = "\nfi\n"
 
 
@@ -2699,37 +2709,47 @@ def test_section_12_reports_the_install_did_not_take_on_drift(
 # without failing here. Sites are DERIVED from the file text rather than
 # hardcoded, so a new checker is covered the moment it is wired up.
 
-_PARITY_SCRIPT_RE = re.compile(r"scripts/check_\w+_unit_parity\.py")
-_GREP_ON_MARKER_RE = re.compile(r"grep -qE?\s+'[^']*\[")
-_EXISTENCE_GUARD_RE = re.compile(r"\[\s+!?\s*-f\s")
-_EQ_2_RE = re.compile(r"-eq 2")
+_PARITY_SCRIPT_RE = re.compile(r"scripts/(check_\w+_unit_parity\.py)")
+
+# Deliberate, updated by hand when a site is added or removed. Today: the
+# orchestrator gate, the section-8 dashboard pre-install gate, the section-12
+# fused-memory health check, and the section-12 dashboard post-install check.
+#
+# An inequality would let the post-install site — the one this change fixes —
+# be deleted outright with the guard still green, and the sweep below runs one
+# case per DISCOVERED site, so there is no cap to keep a new one from being
+# inspected.
+_KNOWN_PARITY_CALL_SITES = 4
 
 
-def _parity_call_sites() -> list[tuple[int, str]]:
-    """Every parity-checker call site in setup-host.sh, as (line number, block).
+def _parity_call_sites() -> list[tuple[int, str, str]]:
+    """Every parity-checker call site, as (line number, checker filename, block).
 
     A site is a NON-COMMENT line naming a `scripts/check_*_unit_parity.py`
-    path — either the hoisted `_x_script="..."` assignment or a direct `python3
-    "..."` invocation. Its block runs to the next column-0 `fi`, which closes
-    the enclosing verdict construct at all sites.
+    path — either the hoisted `_x_parity_script="..."` assignment or a direct
+    `python3 "..."` invocation. Its block runs to the next column-0 `fi`, which
+    closes the enclosing verdict construct at all sites.
 
     Comment lines are excluded deliberately: the fused-memory block cites
     `tests/scripts/test_check_fused_memory_unit_parity.py` by name, and a
     citation is not a call site.
     """
     text = setup_host_text()
-    sites: list[tuple[int, str]] = []
+    sites: list[tuple[int, str, str]] = []
     offset = 0
     for lineno, line in enumerate(text.splitlines(), start=1):
         start = offset
         offset += len(line) + 1
-        if line.lstrip().startswith("#") or not _PARITY_SCRIPT_RE.search(line):
+        if line.lstrip().startswith("#"):
+            continue
+        match = _PARITY_SCRIPT_RE.search(line)
+        if not match:
             continue
         end = text.find("\nfi\n", start)
         assert end != -1, (
             f"No column-0 `fi` closes the parity block starting at line {lineno}."
         )
-        sites.append((lineno, text[start : end + len("\nfi\n")]))
+        sites.append((lineno, match.group(1), text[start : end + len("\nfi\n")]))
     return sites
 
 
@@ -2737,52 +2757,91 @@ def test_the_sweep_finds_every_known_parity_call_site():
     """Guard against a vacuous sweep: matching nothing must not read as passing."""
     sites = _parity_call_sites()
 
-    assert len(sites) >= 3, (
-        "Expected at least the orchestrator, dashboard pre-install and "
-        f"fused-memory call sites; found {len(sites)}: "
-        f"{[lineno for lineno, _ in sites]}. If the sweep below stops matching, "
-        "it silently stops guarding anything."
+    assert len(sites) == _KNOWN_PARITY_CALL_SITES, (
+        f"Expected {_KNOWN_PARITY_CALL_SITES} parity call sites (orchestrator, "
+        f"dashboard pre-install, fused-memory, dashboard post-install); found "
+        f"{len(sites)}: {[(lineno, name) for lineno, name, _ in sites]}. "
+        "Adding or removing a site is a deliberate act — update the count here "
+        "in the same change. If the sweep below stops matching, it silently "
+        "stops guarding anything."
     )
 
 
-@pytest.mark.parametrize("_idx", range(8))
-def test_every_parity_call_site_guards_its_script_and_validates_its_output(_idx: int):
-    """No call site may branch on a parity-checker exit status it cannot trust.
+# Collected at import time from the file itself, so a fifth call site becomes a
+# fifth CASE automatically. (The previous shape — a fixed `range(8)` with a
+# skip for out-of-range indices — silently never inspected a ninth site: the
+# same "green because it never ran" failure this whole change is about,
+# reproduced one level up in its own guard.)
+_PARITY_CALL_SITES = _parity_call_sites()
+
+
+@pytest.mark.parametrize(
+    "lineno,checker,block",
+    _PARITY_CALL_SITES,
+    ids=[f"L{lineno}-{name}" for lineno, name, _ in _PARITY_CALL_SITES],
+)
+def test_every_parity_call_site_refuses_a_status_the_checker_did_not_produce(
+    tmp_path: pathlib.Path, lineno: int, checker: str, block: str
+):
+    """No call site may report a verdict its checker never gave.
 
     Exit 2 is overloaded three ways — the checker's own benign verdict,
     `python3` refusing to open a missing script, and argparse rejecting an
-    unknown flag — so every site must (i) verify the script exists and
-    (ii) confirm the checker's own bracketed report is present BEFORE reading
-    the status.
+    unknown flag. So each site is RUN here against both non-checker sources of
+    a 2, and must speak only in `fail()`: no `OK `, no `WARN `, no `==> `,
+    because every one of those is the block telling the operator something
+    about a host nothing examined.
 
-    Parametrized over a fixed range so an added call site surfaces as a new
-    failing case rather than silently extending an existing one.
+    Behavioural on purpose. The predecessor asserted on setup-host.sh's SOURCE
+    SPELLING (a literal `grep -q`, a POSIX `[ -f `), which rejected strictly
+    more robust code: matching the marker with bash's own `[[ ]]`/`case`
+    instead of `printf | grep -q` removes a real SIGPIPE misread, and the
+    lexical form called that a regression. It also checked ordering by textual
+    offset, so a site that validated in dead code and then branched on the bare
+    status would have passed. Running the block answers the question the
+    spelling was standing in for, and leaves a future author free to write the
+    guard however reads best.
+
+    WHAT THIS DOES NOT PIN, measured by mutation: deleting a site's `[ ! -f ]`
+    existence guard does NOT fail here, and correctly so. Without it `python3`
+    reaches a script that is not there, exits 2 with no marker on stdout, and
+    the output validation refuses that status exactly as before — so the
+    epistemics survive and only the operator-facing wording gets worse. The
+    marker check is the load-bearing guard; the existence test is legibility.
+    Deleting the output validation instead (the real defect) does fail here.
     """
-    sites = _parity_call_sites()
-    if _idx >= len(sites):
-        pytest.skip(f"only {len(sites)} parity call sites")
-    lineno, block = sites[_idx]
-
-    assert _EXISTENCE_GUARD_RE.search(block), (
-        f"The parity call site at setup-host.sh:{lineno} does not guard the "
-        f"script path with a `[ -f ` / `[ ! -f ` existence test, so a renamed "
-        f"or moved checker reaches python3 and its exit 2 is read as a "
-        f"verdict.\n{block}"
+    cases = (
+        ("a renamed or moved checker (python3 itself exits 2)", None, False),
+        (
+            "a renamed flag (argparse exits 2)",
+            usage_error_checker(checker, "[-h] [--some-flag SOME_FLAG]", "--some-flag"),
+            True,
+        ),
     )
 
-    grep_match = _GREP_ON_MARKER_RE.search(block)
-    assert grep_match, (
-        f"The parity call site at setup-host.sh:{lineno} does not validate the "
-        f"checker's output with a `grep -q`/`grep -qE` on a bracketed marker, "
-        f"so it believes a status that may not have come from the checker at "
-        f"all.\n{block}"
-    )
-
-    eq_2 = _EQ_2_RE.search(block)
-    if eq_2:
-        assert grep_match.start() < eq_2.start(), (
-            f"The parity call site at setup-host.sh:{lineno} compares the exit "
-            f"status against 2 BEFORE validating that the output came from the "
-            f"checker. The validation must gate the ladder, not follow it.\n"
-            f"{block}"
+    for index, (label, body, with_checker) in enumerate(cases):
+        work = tmp_path / f"case{index}"
+        work.mkdir()
+        repo = checker_repo(work, checker, body=body, with_checker=with_checker)
+        result = run_section(
+            work,
+            block,
+            repo_root=repo,
+            unit_dir=work / "installed",
+            # Set upstream in the real script; only the section-8 slice reads it.
+            env_extra={"UV_PATH": "/usr/bin/uv"},
         )
+        out = result.stdout + result.stderr
+
+        assert "FAIL " in out, (
+            f"The parity call site at setup-host.sh:{lineno} ran with {label} "
+            f"and never said so. A status the checker did not produce must be "
+            f"reported loudly, not read as a verdict.\n{out}\n---\n{block}"
+        )
+        for prefix, kind in (("OK ", "ok"), ("WARN ", "warn"), ("==> ", "info")):
+            assert prefix not in out, (
+                f"The parity call site at setup-host.sh:{lineno} emitted a "
+                f"{kind}() line with {label} — it reported something about "
+                f"this host on the strength of an exit status the checker "
+                f"never produced.\n{out}\n---\n{block}"
+            )
