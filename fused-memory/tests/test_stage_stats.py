@@ -380,6 +380,124 @@ async def test_derive_stage_stats_post_execute_dead_episode_still_counts(journal
     assert observed['episodes_added'] == 1
 
 
+# ── writes_dead_lettered ────────────────────────────────────────────────
+
+
+def test_writes_dead_lettered_is_a_canonical_computed_key():
+    """Exclusion alone makes the numbers truthful but SILENT: a stage whose
+    every write died reports graphiti_writes_queued: 0, indistinguishable from
+    a stage that wrote nothing. This counter is what makes it diagnosable, and
+    membership in the frozenset is what propagates it to the judge."""
+    assert 'writes_dead_lettered' in _COMPUTED_STAT_KEYS
+
+
+@pytest.mark.asyncio
+async def test_writes_dead_lettered_present_at_zero_with_no_ops(journal):
+    run_id = str(uuid.uuid4())
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed['writes_dead_lettered'] == 0
+
+
+@pytest.mark.asyncio
+async def test_dead_graphiti_enqueue_counts_as_dead_lettered_not_queued(journal):
+    """The pair that makes the meaning change legible rather than silent:
+    graphiti_writes_queued == 0 AND writes_dead_lettered == 1."""
+    run_id = str(uuid.uuid4())
+    op_id = await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={'memory_ids': [], 'stores': ['graphiti']},
+    )
+    await _stamp_terminal(journal, op_id, status='dead', error='backend refused')
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed == _expected(writes_dead_lettered=1)
+
+
+@pytest.mark.asyncio
+async def test_post_execute_dead_counts_in_both_keys(journal):
+    """The DELIBERATE overlap: a post-execute dead-letter both landed (the
+    backend write succeeded) and dead-lettered (it still needs operator
+    attention and must not be blind-replayed). The two keys answer different
+    questions, and this op is honestly BOTH."""
+    run_id = str(uuid.uuid4())
+    op_id = await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={'memory_ids': [], 'stores': ['graphiti']},
+    )
+    await _stamp_terminal(
+        journal, op_id, status='dead',
+        error=POST_EXECUTE_DEAD_PREFIX + 'callback blew up',
+    )
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed == _expected(graphiti_writes_queued=1, writes_dead_lettered=1)
+
+
+@pytest.mark.asyncio
+async def test_writes_dead_lettered_zero_for_completed_and_null_ops(journal):
+    """Only a dead-letter counts — a confirmed-landed write and an unstamped
+    one (NULL) must not inflate the counter."""
+    run_id = str(uuid.uuid4())
+
+    completed_id = await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={'memory_ids': ['m1'], 'stores': ['mem0']},
+    )
+    await _stamp_terminal(journal, completed_id, status='completed')
+    await _log_write(
+        journal, causation_id=run_id, operation='add_episode',
+        result_summary={'status': 'added'},
+    )
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed == _expected(memories_added=1, episodes_added=1)
+
+
+@pytest.mark.asyncio
+async def test_writes_dead_lettered_respects_stage_scoping(journal):
+    """A dead op belonging to a sibling stage must not be tallied here —
+    the counter sits behind the same agent_id filter as every other."""
+    run_id = str(uuid.uuid4())
+    op_id = await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        agent_id=_OTHER_STAGE_AGENT_ID,
+        result_summary={'memory_ids': [], 'stores': ['graphiti']},
+    )
+    await _stamp_terminal(journal, op_id, status='dead', error='boom')
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed == _expected()
+
+
+@pytest.mark.asyncio
+async def test_writes_dead_lettered_scoped_to_mapped_operations(journal):
+    """A dead op whose operation is not in _OP_TO_STAT is not counted — the
+    counter stays scoped to operations this module actually knows about."""
+    run_id = str(uuid.uuid4())
+    assert 'get_status' not in _OP_TO_STAT
+    op_id = await _log_write(
+        journal, causation_id=run_id, operation='get_status',
+        result_summary={'status': 'ok'},
+    )
+    await _stamp_terminal(journal, op_id, status='dead', error='boom')
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed == _expected()
+
+
 @pytest.mark.asyncio
 async def test_derive_stage_stats_completed_ops_still_count(journal):
     """NON-REGRESSION: terminal_status='completed' is the durable queue
