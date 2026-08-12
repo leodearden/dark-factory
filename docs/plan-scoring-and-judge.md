@@ -807,7 +807,25 @@ therefore valid ground-truth-independently.
 |---|---|---|
 | Cell metrics | `judged_without_reference` | — |
 | Composite row | `plan_quality_judged_without_reference` | `pq_no_ref` on `format_composite_table`, beside `pq_excluded` / `pq_no_plan` |
-| θ table | `judged_without_reference`, per-config **and** report-level | `judged_without_reference` in the `plan_quality by config:` block, plus a trailer line stating the total against the scored pool (suppressed when zero) |
+| θ table | `judged_without_reference`, per-config **and** report-level | `judged_without_reference` in the `plan_quality by config:` block, plus a trailer line stating the total against the scored pool (suppressed only when the bound is *measured* and zero) |
+
+**Absence is not `False`.** The marker is three-valued everywhere it is read.
+`EvalMetrics.to_dict` writes the key on *every* architect cell, so a healthy
+cell says `False` explicitly; a cell whose metrics predate task 3628 carries no
+key at all, and its validity was therefore never measured. The report layer
+keeps those apart (`report._judged_without_reference`): one keyless cell in a
+config's admitted pool makes that config's count — and the report-level total —
+`None`, rendered `-`, with `judged_without_reference_unmeasured` carrying how
+many cells drove it and the trailer printing `UNMEASURED` rather than being
+suppressed. Reporting `0` there would let a rebuild over the 2026-07-27 / 07-29
+corpus — the campaign this doc's provenance note says was judged blind on half
+the hard subset — render byte-identically to a campaign graded entirely against
+landed diffs, which is the very degradation σ exists to remove, reintroduced at
+the reader. It is the same read-time discipline `report._plan_quality_score`
+applies to the no-plan floor, and the same rule
+`scripts/run_fable_trial_v2_campaign.py` (task 3632) states as its rule 3 and
+enforces per cell with `MARKER_KEY not in metrics`; the two consumers of this
+one field must not answer the same question differently.
 
 **Provenance — this doc was already half-telling the story.** The
 `reify_task_12` cell cited above carried no `reference` block, and neither did

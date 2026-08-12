@@ -263,6 +263,20 @@ def _mresult(
     )
 
 
+def _keyless(result):
+    """Strip the σ validity marker, minting a PRE-σ cell (task 3628).
+
+    ``_mresult`` builds its metrics through ``EvalMetrics.to_dict``, which
+    emits ``judged_without_reference`` on every cell — the production shape.
+    The 2026-07-27 / 07-29 results already on disk predate the field entirely,
+    and that shape is not constructible any other way; the report layer must
+    read it as UNMEASURED rather than as a measured False, so the tests need a
+    way to say "written before the instrument existed" out loud.
+    """
+    result.metrics.pop('judged_without_reference', None)
+    return result
+
+
 def _union_dataset():
     """Configs A,B across fixtures f1,f2 (3 trials each); C in f1 ONLY (3 trials).
 
@@ -541,6 +555,66 @@ class TestBuildCompositeReport:
 
         assert rows['capped']['plan_quality_cap_excluded'] == 1
         assert rows['capped']['plan_quality_judged_without_reference'] == 0
+
+    def test_a_keyless_admitted_cell_makes_the_row_count_unmeasured(self):
+        """ABSENCE IS NOT FALSE on the composite surface either.
+
+        The composite row is the surface ``select_survivors`` ranks on, so a
+        fabricated 0 here reads as "this candidate's plan_quality was fully
+        validity-bounded" for a corpus in which nothing bounded it — the same
+        inversion task 3632's ``count_judged_without_reference`` refuses per
+        candidate (reviewer: architecture-coherence).
+        """
+        from orchestrator.evals.report import build_composite_report
+
+        results = [
+            _mresult('f1', 'mixed', 1, quality=1.0, cost_usd=1.0,
+                     duration_ms=1000, role_under_test='architect',
+                     plan_quality=0.8, plan_steps=6,
+                     judged_without_reference=True),
+            _keyless(_mresult('f2', 'mixed', 1, quality=1.0, cost_usd=1.0,
+                              duration_ms=1000, role_under_test='architect',
+                              plan_quality=0.6, plan_steps=6)),
+        ]
+        rows = {r['config']: r for r in build_composite_report(results)['configs']}
+        row = rows['mixed']
+
+        assert row['plan_quality_judged_without_reference'] is None
+        assert row['plan_quality_judged_without_reference_unmeasured'] == 1
+        # Unmeasured BOUND, not an exclusion: both cells are still pooled.
+        assert row['plan_quality_n'] == 2
+        assert row['plan_quality'] == pytest.approx(0.7)
+
+    def test_unmeasured_agrees_across_both_surfaces(self):
+        """The None must appear on BOTH surfaces or on neither.
+
+        The existing agreement test pins the two accumulators on a measured
+        corpus; this is the same pin for the corpus that is already on disk —
+        the one where the two could most damagingly disagree, because θ's
+        trailer and the composite row are read side by side.
+        """
+        from orchestrator.evals.report import (
+            build_composite_report,
+            build_plan_quality_report,
+        )
+
+        results = [
+            _keyless(_mresult('f1', 'legacy', 1, quality=1.0, cost_usd=1.0,
+                              duration_ms=1000, role_under_test='architect',
+                              plan_quality=0.8, plan_steps=6)),
+            _keyless(_mresult('f2', 'legacy', 1, quality=1.0, cost_usd=1.0,
+                              duration_ms=1000, role_under_test='architect',
+                              plan_quality=0.6, plan_steps=6)),
+        ]
+        rows = {r['config']: r for r in build_composite_report(results)['configs']}
+        plan_report = build_plan_quality_report(results)
+
+        assert rows['legacy']['plan_quality_judged_without_reference'] is None
+        assert plan_report['judged_without_reference'] is None
+        assert (
+            rows['legacy']['plan_quality_judged_without_reference_unmeasured']
+            == plan_report['judged_without_reference_unmeasured'] == 2
+        )
 
     def test_price_table_echo_and_sorted_rows(self):
         from orchestrator.evals.report import build_composite_report
@@ -2484,6 +2558,20 @@ class TestJudgedWithoutReferenceRendering:
                      plan_quality=0.8, plan_steps=6),
         ]
 
+    @staticmethod
+    def _legacy_results():
+        """A PRE-σ campaign: every cell scored, none of them measured."""
+        return [
+            _keyless(_mresult('f1', 'arch-legacy', 1, quality=1.0,
+                              cost_usd=0.30, duration_ms=60000,
+                              role_under_test='architect',
+                              plan_quality=0.8, plan_steps=6)),
+            _keyless(_mresult('f2', 'arch-legacy', 1, quality=1.0,
+                              cost_usd=0.30, duration_ms=60000,
+                              role_under_test='architect',
+                              plan_quality=0.6, plan_steps=6)),
+        ]
+
     def test_composite_column_is_inserted_beside_its_siblings(self):
         from orchestrator.evals.report import _COMPOSITE_COLUMNS
 
@@ -2550,17 +2638,26 @@ class TestJudgedWithoutReferenceRendering:
         out = format_plan_quality_table(
             build_plan_quality_report(self._blind_results())
         )
-        line = next(
-            ln for ln in out.splitlines()
-            if ln.startswith('judged without reference:')
-        )
         # 1 of the 2 scored cells — the bound stated against its own pool,
         # beside the existing `excluded: N ... of M architect cell(s)` line.
-        assert '1' in line and '2' in line
+        # Asserted as an EXACT substring, not as "'1' in line and '2' in line"
+        # (reviewer: test-quality): the loose form passes on a TRANSPOSED line
+        # reading "2 of 1", which is precisely the count/pool confusion this
+        # trailer exists to prevent.
+        assert 'judged without reference: 1 of 2 scored cell(s)' in out
         assert 'excluded:' in out
 
     def test_a_clean_campaign_does_not_grow_a_scary_line(self):
-        """Absent, or reading 0 — never an alarming line on a healthy run."""
+        """A MEASURED-clean run prints no line at all.
+
+        Asserted outright rather than as "absent OR starting with 0"
+        (reviewer: test-quality): ``format_plan_quality_table`` guards the
+        trailer with a conditional, so the disjunct could never fail and the
+        test could not detect a count mis-plumbed to always read 0. Paired with
+        the two tests below, which prove the line DOES appear when the bound is
+        non-zero and when it is unmeasured — suppression is then a behaviour
+        rather than a tautology.
+        """
         from orchestrator.evals.report import (
             build_plan_quality_report,
             format_plan_quality_table,
@@ -2573,4 +2670,84 @@ class TestJudgedWithoutReferenceRendering:
             ln for ln in out.splitlines()
             if ln.startswith('judged without reference:')
         ]
-        assert lines == [] or lines[0].split(':')[1].strip().startswith('0')
+        assert lines == []
+
+    def test_a_blind_campaign_does_grow_the_line(self):
+        """The suppression's twin: exactly one trailer when the bound is real."""
+        from orchestrator.evals.report import (
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        out = format_plan_quality_table(
+            build_plan_quality_report(self._blind_results())
+        )
+        lines = [
+            ln for ln in out.splitlines()
+            if ln.startswith('judged without reference:')
+        ]
+        assert len(lines) == 1, lines
+
+    # -- the PRE-σ corpus already on disk (reviewer: architecture-coherence) --
+    #
+    # Rebuilding a report over the 2026-07-27 / 07-29 results — the campaign
+    # this repo's own docs say was judged blind on half the hard subset — must
+    # not render byte-identically to a campaign graded against real landed
+    # diffs. Absence is not False on any surface an operator reads.
+
+    def test_composite_table_renders_a_dash_for_an_unmeasured_bound(self):
+        from orchestrator.evals.report import (
+            build_composite_report,
+            format_composite_table,
+        )
+
+        out = format_composite_table(
+            build_composite_report(self._legacy_results())
+        )
+        header = out.splitlines()[1].split()
+        cells = _table_row_cells(out, 'arch-legacy')
+
+        assert cells[header.index('pq_no_ref')] == '-'
+
+    def test_mean_section_renders_a_dash_for_an_unmeasured_bound(self):
+        from orchestrator.evals.report import (
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        out = format_plan_quality_table(
+            build_plan_quality_report(self._legacy_results())
+        )
+        section = 'plan_quality by config:'
+        header = out.partition(section)[2].splitlines()[1].split()
+        cells = _table_row_cells(out, 'arch-legacy', section=section)
+
+        assert cells[header.index('judged_without_reference')] == '-'
+
+    def test_trailer_is_printed_not_suppressed_when_unmeasured(self):
+        """The one case the old `if count:` guard silently swallowed.
+
+        A pre-σ report has a count of 0 measured-blind cells, so a guard on the
+        count alone suppressed the line — making "nothing bounded these scores"
+        render exactly like "every score was graded against a landed diff".
+        """
+        from orchestrator.evals.report import (
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        out = format_plan_quality_table(
+            build_plan_quality_report(self._legacy_results())
+        )
+        line = next(
+            ln for ln in out.splitlines()
+            if ln.startswith('judged without reference:')
+        )
+
+        assert 'UNMEASURED' in line
+        # Stated against the same pool as its measured twin, and naming how
+        # much of that pool is unmeasured — 2 of 2 here, which an operator must
+        # be able to tell from 1 of 50.
+        assert '2 of 2 scored cell(s)' in line
+        # …and it must not read as the clean answer.
+        assert 'judged without reference: 0 ' not in out

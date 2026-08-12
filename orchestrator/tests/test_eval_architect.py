@@ -3078,7 +3078,7 @@ def _architect_result(
     config_name: str = 'architect-sonnet-high',
     plan_quality: float = 0.75,
     plan_steps: int = 6,
-    judged_without_reference: bool = False,
+    judged_without_reference: bool | None = False,
 ):
     """An architect cell that DID produce a plan.
 
@@ -3088,8 +3088,12 @@ def _architect_result(
     distinct no-plan shape, requested explicitly by the tests that exercise it.
 
     ``judged_without_reference`` (task 3628) mints a cell whose score came from
-    a judge handed an EMPTY reference diff. Note the DEFAULT omits the key
-    entirely, so the default cell doubles as the legacy-metrics shape.
+    a judge handed an EMPTY reference diff. THREE-VALUED on purpose, because
+    the report layer is: ``True``/``False`` both WRITE the key — the production
+    shape, since ``EvalMetrics.to_dict`` emits it on every cell — while
+    ``None`` OMITS it, minting the pre-σ legacy shape whose validity was never
+    measured. The default is an explicit ``False``: a healthy modern cell, not
+    a legacy one.
     """
     from orchestrator.evals.runner import EvalResult
 
@@ -3099,8 +3103,8 @@ def _architect_result(
         'plan_steps': plan_steps,
         'composite_score': 0.0,
     }
-    if judged_without_reference:
-        metrics['judged_without_reference'] = True
+    if judged_without_reference is not None:
+        metrics['judged_without_reference'] = judged_without_reference
 
     return EvalResult(
         task_id=task_id,
@@ -3285,18 +3289,30 @@ class TestPlanQualityReport:
     # BOUNDS validity rather than excluding. The flagged cell stays in `n` and
     # in `mean_plan_quality` at its real score.
 
-    def test_rows_carry_judged_without_reference_defaulting_false(self):
+    def test_rows_distinguish_measured_false_from_an_absent_marker(self):
+        """THREE-VALUED: True, False, and None-for-never-measured.
+
+        The row must not collapse absence into False (reviewer:
+        architecture-coherence). A metrics dict written before σ landed never
+        had its validity measured, and reading it back as False asserts the
+        reassuring answer to a question the instrument never asked — the exact
+        inversion of the rule the sibling consumer
+        ``scripts/run_fable_trial_v2_campaign.py`` enforces per cell.
+        """
         from orchestrator.evals.report import build_plan_quality_report
 
         report = build_plan_quality_report([
             _architect_result(task_id='t1', judged_without_reference=True),
-            _architect_result(task_id='t2'),
+            _architect_result(task_id='t2', judged_without_reference=False),
+            _architect_result(task_id='t3', judged_without_reference=None),
         ])
         by_task = {r['task_id']: r for r in report['rows']}
 
         assert by_task['t1']['judged_without_reference'] is True
-        # A metrics dict predating the field reads back default-safe.
+        # MEASURED clean — the instrument ran and found a reference diff.
         assert by_task['t2']['judged_without_reference'] is False
+        # NEVER MEASURED — a metrics dict predating the field.
+        assert by_task['t3']['judged_without_reference'] is None
 
     def test_per_config_count_bounds_but_does_not_exclude(self):
         """The flagged cells are COUNTED yet still averaged in.
@@ -3364,6 +3380,92 @@ class TestPlanQualityReport:
         assert sum(
             c['judged_without_reference'] for c in report['configs']
         ) == report['judged_without_reference']
+
+    def test_one_keyless_admitted_cell_makes_the_count_unmeasured(self):
+        """ABSENCE POISONS THE COUNT: None, never a partial sum reading as whole.
+
+        A config whose pool mixes measured and pre-σ cells cannot report how
+        many of its scores were judged blind — it can only report that it does
+        not know. Reporting the measured ones' count (here 1) would understate
+        the bound while wearing the appearance of a complete answer. This is
+        ``count_judged_without_reference``'s per-candidate rule (task 3632)
+        applied per config, so the two consumers of one field answer the same
+        question identically.
+        """
+        from orchestrator.evals.report import build_plan_quality_report
+
+        cfg = 'architect-opus-high'
+        report = build_plan_quality_report([
+            _architect_result(
+                task_id='t1', config_name=cfg, judged_without_reference=True,
+            ),
+            _architect_result(
+                task_id='t2', config_name=cfg, judged_without_reference=None,
+            ),
+        ])
+        agg = {c['config_name']: c for c in report['configs']}[cfg]
+
+        assert agg['judged_without_reference'] is None
+        # …with the size of the unmeasured population beside it: 1-of-2 and
+        # 2-of-2 are different findings and the None alone cannot say which.
+        assert agg['judged_without_reference_unmeasured'] == 1
+        # The cells are still in the pool at their real scores — an unmeasured
+        # BOUND excludes nothing, exactly as a measured one does not.
+        assert agg['n'] == 2
+        # …and the campaign-wide total is unknown for the same reason.
+        assert report['judged_without_reference'] is None
+        assert report['judged_without_reference_unmeasured'] == 1
+
+    def test_a_fully_measured_campaign_still_reports_a_number(self):
+        """The None is not contagious to a corpus the instrument DID measure.
+
+        The negative twin of the test above: absence poisons the count, but a
+        campaign whose every admitted cell carries the key reports a real
+        count — including a real ZERO, which is the one case where 0 is the
+        honest answer.
+        """
+        from orchestrator.evals.report import build_plan_quality_report
+
+        cfg = 'architect-opus-high'
+        report = build_plan_quality_report([
+            _architect_result(
+                task_id='t1', config_name=cfg, judged_without_reference=False,
+            ),
+            _architect_result(
+                task_id='t2', config_name=cfg, judged_without_reference=False,
+            ),
+        ])
+        agg = {c['config_name']: c for c in report['configs']}[cfg]
+
+        assert agg['judged_without_reference'] == 0
+        assert agg['judged_without_reference_unmeasured'] == 0
+        assert report['judged_without_reference'] == 0
+
+    def test_a_keyless_cap_tainted_cell_does_not_poison_the_count(self):
+        """Scoped to the ADMITTED pool, absence included.
+
+        A cap-tainted cell has no plan_quality to bound whether or not it
+        carries the marker, so its keylessness must not make the config's bound
+        unknown — otherwise every campaign with one cap-window cell would read
+        UNMEASURED forever.
+        """
+        from orchestrator.evals.report import build_plan_quality_report
+
+        cfg = 'architect-opus-high'
+        capped = _cap_tainted_result(task_id='t2', config_name=cfg)
+        capped.metrics.pop('judged_without_reference', None)
+
+        report = build_plan_quality_report([
+            _architect_result(
+                task_id='t1', config_name=cfg, judged_without_reference=True,
+            ),
+            capped,
+        ])
+        agg = {c['config_name']: c for c in report['configs']}[cfg]
+
+        assert agg['cap_excluded'] == 1
+        assert agg['judged_without_reference'] == 1
+        assert agg['judged_without_reference_unmeasured'] == 0
 
     def test_non_architect_rows_are_not_counted(self):
         """Architect-scoped, like every other count on this surface."""
