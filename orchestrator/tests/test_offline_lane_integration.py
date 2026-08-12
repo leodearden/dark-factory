@@ -665,6 +665,112 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
         )
 
 
+def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfig) -> None:
+    """`_LANE_PASS_BOUND_SECS` must clear a MEASURED floor and stay under a
+    stated fraction of the effective per-test CEILING — the two-sided
+    contract task 3836 landed for the sibling foreign-holder constants
+    (``test_lane_lock_leak_guard.py``'s
+    `test_foreign_holder_bounds_clear_measured_spawn_latency` +
+    `test_foreign_holder_bounds_stay_clear_of_the_global_pytest_timeout`),
+    adapted here for this module's own lane-pass bound.
+
+    FLOOR — `_LANE_PASS_BOUND_SECS` must be at least 5x
+    `_MEASURED_SPAWN_LATENCY_SECS` (task 3451's measured worst-case
+    happy-path subprocess spawn latency: n=3, 2.13/3.10/4.71s,
+    load-per-core 6.6). The multiplier of 5 is DERIVED, not guessed: it is
+    the measured worst-case count of subprocess spawns that occur INSIDE a
+    single `_run_lane` window, and that worst case lives in the SIBLING
+    infra module (``test_offline_lane_infra_integration.py``'s
+    `test_ib6_real_infra_runner_over_stub_classified_set_files_fix_task`):
+    `_run_once`'s 3 git spawns (`get_main_sha`, `worktree list`, `worktree
+    add`) plus the real infra seam spawning `run_all.sh` twice (the initial
+    run and the isolated confirmation re-run). Later passes swap `worktree
+    add` for `reset --hard` + `clean -xfd` — 4 spawns, still under 5. This
+    module's own tests sit well under that shared worst case (the numeric
+    `suite_runner` seam here is always a bare injected callable, never a
+    real subprocess); the floor is still asserted here so this module's copy
+    of `_LANE_PASS_BOUND_SECS` cannot drift from the infra module's without
+    either invariant catching it.
+
+    CEILING — the marker-less worst case (one `_LANE_PASS_BOUND_SECS`, since
+    steps 2/4 of task 4030 covered every test that composes past a single
+    pass — a premise `test_every_composing_caller_carries_a_timeout_override`
+    makes executable rather than prose-only, named here the same way
+    `test_no_foreign_holder_consumer_opts_out_of_the_global_timeout` backs
+    its own sibling ceiling invariant) must stay at or under
+    `_MARKERLESS_CEILING_FRACTION` (0.6, task 3836's own fraction) of the
+    EFFECTIVE per-test timeout, resolved via `_effective_per_test_timeout`
+    (imported function-locally from `test_lane_lock_leak_guard` — never
+    duplicated or re-derived from a bare `tomllib` read; that module is task
+    3836's and already correct, and importing it inherits its correctness).
+    Why 60%, made concrete rather than left abstract: pytest-timeout 2.4.0
+    installs its timer in `pytest_runtest_protocol` whenever `func_only` is
+    False (the default; `timeout_func_only` is not set anywhere in this
+    repo), so the 60s budget covers FIXTURE SETUP AND TEARDOWN, not just the
+    call phase. Every test in both offline-lane modules transitively pulls
+    the `repo` fixture, whose `_setup_repo` costs 5 git spawns (`init`,
+    `config` x2, `add`, `commit`), and each `_drive_advance` costs 4 more
+    (`add`, `commit`, `rev-parse`, plus `_note_merge_all`'s `git diff`) — the
+    24s of headroom the 0.6 fraction leaves at a 60s timeout is what pays
+    for that out-of-bound work.
+
+    When no timeout is in effect at all, this either fails loudly (this
+    module's own `orchestrator/pyproject.toml` is the governing inifile —
+    genuine drift, the premise these bounds are sized against no longer
+    holds) or skips, naming the governing inifile (an invocation artifact,
+    e.g. a root-bound run).
+    """
+    from test_lane_lock_leak_guard import _effective_per_test_timeout  # noqa: PLC0415
+
+    floor = 5 * _MEASURED_SPAWN_LATENCY_SECS
+    assert floor <= _LANE_PASS_BOUND_SECS, (
+        f'_LANE_PASS_BOUND_SECS ({_LANE_PASS_BOUND_SECS}) must clear 5x the measured '
+        f'worst-case happy-path subprocess spawn latency ({_MEASURED_SPAWN_LATENCY_SECS}s, '
+        f'task 3451: n=3 2.13/3.10/4.71, load-per-core 6.6) = {floor}s. The 5-spawn '
+        f'multiplier is the measured worst-case count of subprocess spawns inside a '
+        f'single _run_lane window (see '
+        f'test_ib6_real_infra_runner_over_stub_classified_set_files_fix_task in '
+        f'test_offline_lane_infra_integration.py: 3 git spawns from _run_once plus 2 '
+        f'real infra run_all.sh spawns).'
+    )
+
+    global_timeout = _effective_per_test_timeout(pytestconfig)
+    if global_timeout is None:
+        orchestrator_pyproject = Path(__file__).resolve().parents[1] / 'pyproject.toml'
+        governing_inifile = pytestconfig.inipath
+        if governing_inifile is not None and governing_inifile.resolve() == orchestrator_pyproject:
+            pytest.fail(
+                f'{governing_inifile} is the governing inifile for this run, yet no '
+                f'per-test timeout is in effect (checked --timeout, PYTEST_TIMEOUT, and '
+                f'[tool.pytest.ini_options].timeout) — this is a genuine regression: the '
+                f'pytest-timeout / os._exit() premise _LANE_PASS_BOUND_SECS is sized '
+                f'against no longer holds. Either restore the timeout key or re-derive '
+                f'this bound without it.'
+            )
+        pytest.skip(
+            f'no per-test timeout is in effect under the governing inifile '
+            f'{governing_inifile!r} — this is not {orchestrator_pyproject}, so this is '
+            f'an invocation artifact (e.g. a root-bound run), not drift; the '
+            f'pytest-timeout ceiling this invariant checks does not apply to this run'
+        )
+
+    ceiling = _MARKERLESS_CEILING_FRACTION * global_timeout
+    assert ceiling >= _LANE_PASS_BOUND_SECS, (
+        f'_LANE_PASS_BOUND_SECS ({_LANE_PASS_BOUND_SECS}s) exceeds '
+        f'{_MARKERLESS_CEILING_FRACTION * 100:.0f}% of the effective per-test timeout '
+        f'({global_timeout}s, resolved from {pytestconfig.inipath}) = {ceiling}s. Every '
+        f'test composing past a single _run_lane pass carries its own '
+        f'@pytest.mark.timeout override (enforced by '
+        f'test_every_composing_caller_carries_a_timeout_override), so this bounds ONLY '
+        f"the marker-less budget — a single _run_lane pass. The remaining "
+        f'{(1 - _MARKERLESS_CEILING_FRACTION) * 100:.0f}% is headroom for the real-git '
+        f"fixture work (the repo fixture's _setup_repo, and each _drive_advance) that "
+        f'shares the same per-test budget, since pytest-timeout installs its timer in '
+        f'pytest_runtest_protocol (func_only=False, unset in this repo) and so times '
+        f'fixture setup/teardown too, not just the call phase.'
+    )
+
+
 # ---------------------------------------------------------------------------
 # B1 — advance triggers a from-head run
 # ---------------------------------------------------------------------------
