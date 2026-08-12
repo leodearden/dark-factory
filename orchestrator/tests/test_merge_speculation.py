@@ -2433,13 +2433,21 @@ class TestLateArrivalFailCascade:
     """
 
     async def test_predecessor_fail_cascades_to_late_arrival(
-        self, spec_git_repo: Path,
+        self, spec_git_repo: Path, caplog: pytest.LogCaptureFixture,
     ) -> None:
         """A fails; cascade cancels B's remote verify, remerges B, B lands as 'done'.
 
         Immediately GREEN after step-2 because B is structurally a speculative
         descendant and the existing head-failure cascade path handles it.
         """
+        # task 3980: this is the ONLY late-arrival test that reaches the merge
+        # disposition classifier -- classify_merge_failure_disposition runs only
+        # on a FAILING verify, and every other late-arrival test is an all-pass
+        # path (measured: 0 occurrences of the record below in the other two
+        # named offenders). So it is the correct and only anchor for proving the
+        # DONE-WHEN 4 assertions below are not silently riding a fail-open.
+        caplog.set_level(logging.WARNING, logger='orchestrator.merge_disposition')
+
         git_config = _make_late_arrival_git_config()
         git_ops = GitOps(git_config, spec_git_repo)
         fake_event_store = _LateArrivalFakeEventStore()
@@ -2547,6 +2555,49 @@ class TestLateArrivalFailCascade:
 
         with contextlib.suppress(Exception):
             await asyncio.wait_for(worker_task, timeout=5.0)
+
+        # ── NON-VACUITY PRECONDITION (task 3980) ──────────────────────────────
+        # This is a PRECONDITION on the DONE-WHEN 4 assertions below, not an
+        # extra behaviour check: those assertions only carry signal if the merge
+        # disposition classifier actually RAN on A's failing verify.
+        #
+        # classify_merge_failure_disposition calls
+        # _extract_failing_tests_and_candidate_files, which joins
+        # `verify_result.cause_hint` with `verify_result.test_output`
+        # (merge_disposition.py:218-221) under an `if part` filter.  An unspecced
+        # MagicMock double leaves `cause_hint` UNSET, so attribute access
+        # auto-vivifies a TRUTHY child Mock that survives that filter and then
+        # raises `TypeError: sequence item 0: expected str instance, MagicMock
+        # found` out of str.join.  The classifier catches it and degrades to
+        # INDETERMINATE (fail-open, I3) at merge_disposition.py:710-719.
+        #
+        # A fail-open is indistinguishable from a genuine INDETERMINATE verdict
+        # downstream, so every disposition-sensitive assertion silently rides the
+        # degraded branch and can never go red.  Assert the OUTCOME (the
+        # classifier ran and did not fail open) rather than the wording of any
+        # source comment.
+        fail_open = [
+            r for r in caplog.records
+            if r.name == 'orchestrator.merge_disposition'
+            and 'degrading to INDETERMINATE (fail-open, I3)' in r.getMessage()
+        ]
+        fail_open_detail = '\n'.join(
+            f'  - {r.getMessage()}'
+            + (f'\n    underlying: {r.exc_info[1]!r}' if r.exc_info else '')
+            for r in fail_open
+        )
+        assert not fail_open, (
+            'merge disposition classifier FAILED OPEN — every disposition-'
+            'sensitive assertion in this test is therefore VACUOUS.\n'
+            f'{len(fail_open)} fail-open WARNING(s) captured:\n'
+            f'{fail_open_detail}\n'
+            'Remedy: the verify-result double returned by this test\'s patched '
+            'run_scoped_verification must be built with _fake_verify_result(...) '
+            '(a MagicMock(spec=VerifyResult) seeded from the real dataclass '
+            'defaults, so cause_hint is a real str) rather than a bare MagicMock, '
+            'whose unset cause_hint auto-vivifies a truthy child Mock and breaks '
+            'the str.join at merge_disposition.py:218.'
+        )
 
         # ── A failed (verify returned passed=False) ────────────────────────────
         assert outcome_a.status != 'done', (
