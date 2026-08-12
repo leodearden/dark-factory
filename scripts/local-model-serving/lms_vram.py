@@ -234,7 +234,19 @@ class PollutionState(StrEnum):
     UNMEASURED = 'UNMEASURED'
 
 
-class ExpectedConsumer(BaseModel):
+class ConsumerPattern(BaseModel):
+    """A named process signature, matched against ``process_name``."""
+
+    model_config = ConfigDict(frozen=True)
+
+    label: str
+    name_pattern: str
+
+    def matches(self, process_name: str) -> bool:
+        return re.search(self.name_pattern, process_name) is not None
+
+
+class ExpectedConsumer(ConsumerPattern):
     """One process this host is KNOWN to run on the GPU at baseline.
 
     A ceiling, not just a name: an allowlist keyed on the process name alone
@@ -242,14 +254,7 @@ class ExpectedConsumer(BaseModel):
     any size.
     """
 
-    model_config = ConfigDict(frozen=True)
-
-    label: str
-    name_pattern: str
     ceiling_mib: int
-
-    def matches(self, process_name: str) -> bool:
-        return re.search(self.name_pattern, process_name) is not None
 
 
 #: Below this a consumer cannot move a budget verdict, and flagging it would
@@ -277,6 +282,21 @@ EXPECTED_CONSUMERS: tuple[ExpectedConsumer, ...] = (
         label='whisper-writer (PRD D10 requires it resident)',
         name_pattern=r'(?:^|/)python3?$',
         ceiling_mib=6144,
+    ),
+)
+
+#: Processes known to hold this card that are definitely NOT an arm.  Used only
+#: at probe time, where the positive allowlist above cannot be applied.
+#:
+#: ``ollama.service`` is a persistent unit on this host and holds its model on
+#: ``keep_alive``; on 2026-08-06 it held 10314 MiB through a whole slate run.
+#: The ``/usr/local/lib/ollama/`` path is what makes it decidable -- a
+#: containerised vLLM arm never matches it, so this cannot fire on a healthy
+#: run.  Same no-environment-override discipline as :data:`EXPECTED_CONSUMERS`.
+KNOWN_FOREIGN_CONSUMERS: tuple[ConsumerPattern, ...] = (
+    ConsumerPattern(
+        label='ollama (persistent unit; holds its model on keep_alive)',
+        name_pattern=r'(?:^|/)ollama/',
     ),
 )
 
@@ -571,6 +591,95 @@ def unexpected_baseline_consumers(
         if not expected:
             offenders.append(consumer)
     return offenders
+
+
+def classify_pollution(
+    baseline_consumers: Sequence[GpuConsumer],
+    probe_consumers: Sequence[GpuConsumer],
+) -> tuple[PollutionState, str]:
+    """Can the memory delta between these two readings be attributed to the arm?
+
+    NOT the same rule as :func:`unexpected_baseline_consumers`, and the
+    asymmetry is the crux of the design.  Arms run as docker containers,
+    nvidia-smi reports HOST pids, and
+    ``--query-compute-apps=pid,process_name,used_memory`` cannot tell a
+    containerised vLLM ``python`` from any other ``python``.  So at probe time
+    the arm's own container is an unrecognisable newcomer, and a negative
+    allowlist would mark every healthy run POLLUTED.
+
+    Two things ARE decidable, and this function uses only those:
+
+    1. A NEWCOMER matching :data:`KNOWN_FOREIGN_CONSUMERS` over the floor.
+       ollama's ``/usr/local/lib/ollama/`` path is not something an arm wears.
+    2. Any change over the floor in a consumer PRESENT AT BOTH readings,
+       matched by pid.  Such a consumer is non-arm by construction: the arm was
+       not running when the baseline was taken.
+
+    BOTH DIRECTIONS of (2) are pollution.  Growth over-charges the arm.  A
+    shrink -- or a vanish -- UNDER-charges it, leaving ``used - baseline``
+    smaller than the arm truly took, and that flattering direction is precisely
+    the one a fabricated artifact wants.  Passing for the wrong reason is not a
+    pass.
+
+    THE NAMED RESIDUAL: a newcomer that matches no foreign pattern and is not
+    the arm cannot be discriminated from ``--query-compute-apps`` alone.  It is
+    recorded verbatim in the report's inventory as the audit trail rather than
+    silently attributed to anybody.  Resolving it exactly would need
+    ``docker top`` or cgroup introspection to map host pids back to
+    ``lms-arm-<arm_id>`` containers; that buys a new docker dependency and a
+    resolver whose own failure would mark every real run POLLUTED, so it is
+    deliberately out of scope.  Stating the limit is honest; implying full
+    attribution would not be.
+    """
+    reasons: list[str] = []
+
+    baseline_by_pid = {c.pid: c for c in baseline_consumers}
+    probe_by_pid = {c.pid: c for c in probe_consumers}
+
+    for consumer in probe_consumers:
+        if consumer.pid in baseline_by_pid:
+            continue
+        if consumer.used_mib < POLLUTION_FLOOR_MIB:
+            continue
+        foreign = next(
+            (p for p in KNOWN_FOREIGN_CONSUMERS if p.matches(consumer.process_name)),
+            None,
+        )
+        if foreign is not None:
+            reasons.append(
+                f'{foreign.label} arrived while the arm ran: pid {consumer.pid} '
+                f'{consumer.process_name} holding {consumer.used_mib} MiB '
+                f'({consumer.used_gib} GiB). Its memory is inside the probe '
+                "reading and is charged to the arm by `used - baseline`"
+            )
+
+    for pid, before in baseline_by_pid.items():
+        after = probe_by_pid.get(pid)
+        now_mib = after.used_mib if after is not None else 0
+        drift = now_mib - before.used_mib
+        if abs(drift) < POLLUTION_FLOOR_MIB:
+            continue
+        # Present before the arm started, so by construction not the arm.
+        if drift > 0:
+            reasons.append(
+                f'pid {pid} {before.process_name} GREW from {before.used_mib} to '
+                f'{now_mib} MiB while the arm ran (+{drift} MiB). It was on the '
+                'card before the arm started, so that growth is not the arm, '
+                'but `used - baseline` OVER-CHARGES the arm for it'
+            )
+        else:
+            gone = ' (it is gone from the probe reading entirely)' if after is None else ''
+            reasons.append(
+                f'pid {pid} {before.process_name} SHRANK from {before.used_mib} to '
+                f'{now_mib} MiB while the arm ran ({drift} MiB){gone}. This is the '
+                'FLATTERING direction: `used - baseline` now UNDER-CHARGES the '
+                'arm by that much, so a PASS here would be a pass for the wrong '
+                'reason'
+            )
+
+    if not reasons:
+        return PollutionState.CLEAN, ''
+    return PollutionState.POLLUTED, '; '.join(reasons)
 
 
 def probe_gpu_snapshot(runner: GpuRunner | None = None) -> GpuSnapshot:
