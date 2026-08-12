@@ -1630,7 +1630,7 @@ class TestProceduralTopicClusterTopicIdSlug:
         than at an operator's config load.
         """
         clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
-        assert len(clusters) >= 5
+        assert clusters, 'the seed must not be empty, or this asserts nothing'
         for cluster in clusters:
             assert is_valid_topic_slug(cluster.topic_id)
 
@@ -1723,27 +1723,58 @@ MERGE_BASE_NEGATIVE_CONTROL_NOTE = (
 class TestProceduralTopicGuardClustersDefault:
     """ReconciliationConfig seeds all known topic-guard clusters by default.
 
-    Mix of known-contradictory (plan-tools, venv-shadowing, architect
-    report_task_already_done main-reachability) and known-recurring
-    (pytest-xdist, architect plan-revalidation after requeue/lock, `ruff
-    format` not an enforced gate) topics -- see the >=6 count and the
-    per-topic-id assertions below.
+    Mix of known-contradictory (architect report_task_already_done
+    main-reachability) and known-recurring (pytest-xdist, architect
+    plan-revalidation after requeue/lock, `ruff format` not an enforced
+    gate) topics -- see the exact-set assertion below.
+
+    The set is asserted EXACTLY, not as a lower bound. It was a ``>= 6``
+    floor plus per-id ``in`` checks, which could only catch a cluster going
+    MISSING; retiring a cluster is now a normal operation on this seed
+    (two already have been), so the failure this class must catch is a
+    cluster silently coming BACK.
     """
+
+    # The four survivors, in seed order.
+    EXPECTED = (
+        'pytest-xdist-serial-override',
+        'architect-report-task-already-done-main-reachability',
+        'architect-plan-revalidation-requeue-lock',
+        'ruff-format-not-an-enforced-gate',
+    )
+
+    # Retired, and pinned as retired. Both carried a hint routing a blocked
+    # writer to a human gate task that is now ``done`` (2841 / 2844), and
+    # both double-counted one concept as two spelling-variant phrases
+    # ('eval-worktree' / 'eval worktree') at min_phrase_hits=2 -- so merely
+    # NAMING the eval worktree in both spellings scored 2 and blocked the
+    # write with no on-topic content in it at all. The matcher-level fix for
+    # that double-count is task 4179; these two do not wait for it.
+    RETIRED = (
+        'eval-worktree-plan-tools-missing',
+        'eval-worktree-venv-shadowing',
+    )
 
     def test_default_seeds_non_empty_clusters(self):
         clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
         assert isinstance(clusters, list)
-        assert len(clusters) >= 6
+        assert len(clusters) == len(self.EXPECTED)
 
-    def test_default_seeds_all_known_topic_ids(self):
+    def test_default_seeds_exactly_the_known_topic_ids(self):
         clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
-        topic_ids = {c.topic_id for c in clusters}
-        assert 'eval-worktree-plan-tools-missing' in topic_ids
-        assert 'eval-worktree-venv-shadowing' in topic_ids
-        assert 'pytest-xdist-serial-override' in topic_ids
-        assert 'architect-report-task-already-done-main-reachability' in topic_ids
-        assert 'architect-plan-revalidation-requeue-lock' in topic_ids
-        assert 'ruff-format-not-an-enforced-gate' in topic_ids
+        assert [c.topic_id for c in clusters] == list(self.EXPECTED)
+
+    @pytest.mark.parametrize('topic_id', RETIRED)
+    def test_retired_cluster_is_absent(self, topic_id):
+        """A retired cluster must stay retired.
+
+        Asserted per-id (rather than folded into the exact-set test above)
+        so a reinstatement names WHICH cluster came back in the failure
+        line, and so the two retirements cannot be undone by an edit that
+        happens to keep the count at four.
+        """
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        assert topic_id not in {c.topic_id for c in clusters}
 
     def test_pytest_xdist_cluster_hint_points_at_canonical_memory(self):
         cluster = _seeded_cluster('pytest-xdist-serial-override')
@@ -1771,7 +1802,14 @@ class TestProceduralTopicGuardClustersDefault:
         format' (ruff-format cluster, task 3435) and bare 'plan.json' beside
         '.task/plan.json' (plan-revalidation cluster). So the guard is
         asserted over EVERY seeded cluster rather than one, and holds for all
-        six today.
+        four today.
+
+        NOT sufficient on its own: the two RETIRED eval-worktree clusters
+        each carried 'eval-worktree' beside 'eval worktree' -- one concept,
+        two spelling-variant phrases, neither nesting inside the other --
+        which scored two distinct hits off a single mention and passed this
+        test cleanly. Sibling spelling variants are task 4179's matcher-level
+        fix, not this invariant's.
 
         Compared by INDEX, not identity: two phrases that are accidentally
         equal must fail here too (an exact duplicate is the degenerate
@@ -1933,14 +1971,19 @@ class TestArchitectPlanRevalidationRequeueLockCluster:
         clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
         assert find_matching_topic_cluster('A warm-lane reseed happened.', clusters) is None
 
-    def test_full_default_cluster_list_resolves_here_not_plan_tools_cluster(self):
-        # eval-worktree-plan-tools-missing is seeded earlier in the default
-        # list and find_matching_topic_cluster returns the FIRST qualifying
-        # cluster, so a plan-revalidation note must not be shadowed by it.
-        # The note below hits only 1 distinct phrase on that earlier cluster
-        # ('plan.json', via '.task/plan.json') -- below its min_phrase_hits
-        # of 2 -- so matching correctly falls through to this cluster's own
-        # >=2 hits ('.task/plan.json', 'plan-revalidation', 'requeue rebase').
+    def test_full_default_cluster_list_resolves_here_not_another_cluster(self):
+        # find_matching_topic_cluster returns the FIRST qualifying cluster in
+        # seed order, so a plan-revalidation note must reach THIS cluster and
+        # not be shadowed by an earlier one. Historically the shadowing risk
+        # was concrete: eval-worktree-plan-tools-missing was seeded first and
+        # carried bare 'plan.json', which the note below substring-matches
+        # via '.task/plan.json' -- 1 distinct hit, below that cluster's
+        # min_phrase_hits of 2, so it fell through even then. That cluster is
+        # now retired, which removes the risk rather than the need for the
+        # test: this pins that a note reaches its own cluster against the
+        # WHOLE seeded list, not against this cluster in isolation.
+        # The note scores >=2 here ('.task/plan.json', 'plan-revalidation',
+        # 'requeue rebase').
         clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
         note = (
             'During architect plan-revalidation after a requeue rebase, check '

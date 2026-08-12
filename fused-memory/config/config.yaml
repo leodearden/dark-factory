@@ -208,47 +208,54 @@ reconciliation:
     max_probe_interval_secs: 1800
     accounts_file: "${DARK_FACTORY_ROOT:/home/leo/src/dark-factory}/config/usage-accounts.yaml"
   # ---------------------------------------------------------------------------
-  # Write-time procedural_knowledge topic guard: OPERATOR OVERRIDE of the seeded
-  # cluster list (config/schema.py::_default_topic_guard_clusters).
+  # Write-time procedural_knowledge topic guard: TEMPORARY SHIM.
   #
-  # WHY THIS KEY EXISTS AT ALL: it retires ONE cluster,
-  # `eval-worktree-plan-tools-missing`. Measured over the archived
-  # dispatched-agent corpus, that cluster fired 14 of the 30 topic-cluster
-  # soft-blocks and 13 of those 14 were OFF-TOPIC false positives. Two defects:
-  #   1. No anchor requirement. Its topic is "plan-tools MCP server MISSING in
-  #      the eval worktree", but its phrase list was the ordinary vocabulary of
-  #      the plan subsystem (plan-tools / plan_tools / plan.json / create_plan /
-  #      add_plan_step) at min_phrase_hits=2, so any note mentioning plan-tools
-  #      tripped it with no eval-worktree context at all. Casualties included a
-  #      finding that eval-lane agents leak escalations into the production
-  #      queue, and a measurement of 144 markup-corrupted plan.json fields.
-  #   2. Spelling variants double-counted: `eval-worktree`/`eval worktree` and
-  #      `plan-tools`/`plan_tools` are one concept each but two phrase strings,
-  #      so a note naming only the concept scored 2 and met a threshold of 2.
-  # Decisive: the cluster's own hint routes writers to human gate task 2841,
-  # which is `done`. The cluster existed to stop accretion on a topic pending an
-  # OPEN human review; that review closed, so it is now pure cost.
+  # THIS BLOCK IS NOW A DUPLICATE OF THE SEED. The four clusters below are
+  # byte-for-byte the same four that config/schema.py::
+  # _default_topic_guard_clusters() returns. It is deletable -- in a one-line
+  # follow-up commit that removes this key entirely -- ONCE THE RUNNING
+  # fused-memory SERVER HAS RESTARTED onto the code that ships that four-cluster
+  # seed. Until then it is load-bearing. Do not "tidy" it away early.
   #
-  # THE TRAP, for whoever edits this next: a pydantic default_factory fires ONLY
-  # when the YAML key is ABSENT. This key therefore REPLACES the whole seeded
-  # list -- the five clusters below are the survivors, reproduced VERBATIM from
-  # the seed. Deleting one here deletes it live. If a future seed adds a SEVENTH
-  # cluster in schema.py, this override will mask it until it is copied here.
+  # WHY IT MUST OUTLIVE THE CODE CHANGE BY ONE RESTART: a pydantic
+  # default_factory fires ONLY when the YAML key is ABSENT. A running server
+  # holds the OLD schema module in memory, so deleting this key while old code
+  # is loaded makes the very next reload_config (or any restart that precedes
+  # the deploy) fall back to the OLD SIX-cluster seed -- silently RE-ARMING both
+  # retired clusters. Keeping the override pinned at four keeps the live guard
+  # correct under EVERY ordering of (config edit, code deploy, restart, reload).
+  #
+  # WHAT WAS RETIRED, so a re-adder knows what they are re-adding:
+  #   * `eval-worktree-plan-tools-missing` (gate task 2841, `done`). Measured
+  #     over the archived dispatched-agent corpus it fired 14 of the 30
+  #     topic-cluster soft-blocks and 13 of those 14 were OFF-TOPIC false
+  #     positives -- its phrase list was the ordinary vocabulary of the plan
+  #     subsystem (plan-tools / plan_tools / plan.json / create_plan /
+  #     add_plan_step) at min_phrase_hits=2, with no eval-worktree anchor
+  #     required. Casualties included a finding that eval-lane agents leak
+  #     escalations into the production queue, and a measurement of 144
+  #     markup-corrupted plan.json fields.
+  #   * `eval-worktree-venv-shadowing` (gate task 2844, `done`). Fired 0 times
+  #     over the same 24-day corpus, so its removal is cruft removal, not
+  #     incident response -- but it carried `eval-worktree` AND `eval worktree`
+  #     at min_phrase_hits=2, so a note that merely NAMED the eval worktree in
+  #     both spellings was soft-blocked and routed to a closed gate, with no
+  #     venv or shadowing content in it at all.
+  # Both share the decisive reason: a cluster exists to stop accretion on a
+  # topic pending an OPEN human review, and both those reviews have closed. They
+  # also share the spelling-variant double-count defect (one concept, two phrase
+  # strings, threshold of 2); the matcher-level fix for that is task 4179 and is
+  # NOT what retired these.
+  #
+  # THE OTHER HALF OF THE TRAP, for whoever edits this next: because this key
+  # REPLACES the whole seeded list, deleting one cluster here deletes it live,
+  # and if a future schema.py seed adds a FIFTH cluster this override will MASK
+  # it until it is copied here. That masking hazard is exactly why this block
+  # should be deleted at the first safe opportunity rather than maintained.
   # (Green-tier hot-reloadable: reload_config applies an edit here to a running
   # server, no restart -- see config/reload.py RELOADABLE_FIELDS. The list is one
   # atomic leaf, so it reloads whole.)
   procedural_knowledge_topic_guard_clusters:
-  - topic_id: eval-worktree-venv-shadowing
-    phrases:
-    - eval-worktree
-    - eval worktree
-    - editable install
-    - venv shadowing
-    - .venv shadow
-    min_phrase_hits: 2
-    hint: Known-contradictory topic (venv / editable-install shadowing in the eval worktree)
-      gated to human task 2844. Do NOT add another entry -- update/consolidate the existing
-      entries, or add context to gate task 2844.
   - topic_id: pytest-xdist-serial-override
     phrases:
     - pytest-xdist

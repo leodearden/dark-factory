@@ -48,16 +48,24 @@ class TestTopicSlug:
     """`topic` slug shape — PRD D4 (one topic namespace, one shared regex)."""
 
     def test_accepts_every_seeded_topic_cluster_id(self):
-        """PRD §10 hard requirement: the regex MUST accept all 6 seeded
+        """PRD §10 hard requirement: the regex MUST accept all 4 seeded
         ``ProceduralTopicCluster.topic_id`` values.
 
         The seeded ids are imported rather than hand-copied so this stays
         enforced if the seeded set is ever edited (D4 makes cluster ids and
         ``metadata.topic`` the same namespace, so a regex that rejected a
         seeded id would split the namespace it exists to unify).
+
+        The count was 6 until the two eval-worktree clusters were retired
+        (both their human gates are ``done``). The tripwire is kept rather
+        than loosened to ``>= 1``: it is what forces a re-read of the regex
+        whenever the seeded set changes. The seed's own membership contract
+        lives in ``test_config_schema.py``'s
+        ``TestProceduralTopicGuardClustersDefault``, which pins the exact
+        surviving ids and the absence of both retired ones.
         """
         clusters = _default_topic_guard_clusters()
-        assert len(clusters) == 6, 'seeded cluster set changed — re-verify the regex'
+        assert len(clusters) == 4, 'seeded cluster set changed — re-verify the regex'
         for cluster in clusters:
             assert TOPIC_SLUG_RE.match(cluster.topic_id), (
                 f'seeded cluster id {cluster.topic_id!r} must match the slug regex'
@@ -70,7 +78,7 @@ class TestTopicSlug:
             'a',
             'a-b',
             'x1-2y',
-            'eval-worktree-venv-shadowing',
+            'pytest-xdist-serial-override',  # a real, still-seeded cluster id
             'a' * TOPIC_SLUG_MAX_LEN,  # exactly at the cap
         ],
     )
