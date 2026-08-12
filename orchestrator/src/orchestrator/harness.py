@@ -9808,7 +9808,12 @@ class Harness:
             self._recovery_streak_filed_at = memo
         return memo
 
-    def _release_recovery_veto_streaks(self, tally: RecoverySweepTally) -> None:
+    def _release_recovery_veto_streaks(
+        self,
+        tally: RecoverySweepTally,
+        *,
+        sites: Sequence[RecoverySite] = (RecoverySite.reconcile_sweep,),
+    ) -> None:
         """End-of-pass: drop every streak this sweep did NOT re-observe.
 
         The release transition is derived from the pass's own tally rather than
@@ -9820,6 +9825,13 @@ class Harness:
         stale pending alarm silences this detector for that task for the life of
         the queue (see :func:`resolve_recovery_veto_streak_escalation`).
 
+        ``sites`` is the set of sites the CALLING sweep drives, because only
+        that sweep's own candidate set says anything about them: the reconcile
+        sweep and the deterministic recon sweep enumerate DIFFERENT tasks, so a
+        blanket release would let one resolve the other's live alarm on the
+        strength of a pass that never looked.  It defaults to the reconcile
+        sweep so every pre-existing caller is untouched.
+
         Whole-body guarded: this is bookkeeping, and bookkeeping never aborts a
         sweep.
         """
@@ -9829,16 +9841,34 @@ class Harness:
                 return
             cfg = getattr(self.config, 'recovery_emission', None)
             threshold = cfg.veto_streak_threshold if cfg is not None else 3
+            driven = {str(s) for s in sites}
             stale = [
                 (site, tid) for site, tid in tracker.tracked()
-                if site == RecoverySite.reconcile_sweep
-                and tid not in tally.observed_task_ids
+                if str(site) in driven and tid not in tally.observed_task_ids
             ]
             for site, tid in stale:
                 # clear() RETURNS the streak it popped, which is exactly the
                 # "how long was this held" the resolver needs to decide whether
                 # a PRIOR process could have filed before a restart.
                 recovered_streak = tracker.clear(site, tid)
+                # The sentinel task id and the filed_at memo are keyed on
+                # task_id ALONE, while the tracker is keyed on (site, task_id)
+                # — so every charging site observing one task SHARES a single
+                # alarm.  Releasing per-site would therefore resolve an alarm
+                # another site's still-live hold justifies, and that site's next
+                # pass would re-file it: an alarm FLAP on an operator's queue,
+                # strictly worse than the stale alarm it set out to fix.
+                # Matching the release granularity to the sentinel's own is what
+                # prevents that, and it fails toward NOT releasing — the safe
+                # direction, since a stale alarm is visible and a flap is noise.
+                # This also closes the same latent hazard in the pre-existing
+                # reconcile-only path, which shares the sentinel with both
+                # deterministic sites.
+                if any(
+                    other_tid == tid and other_site in STREAK_CHARGING_SITES
+                    for other_site, other_tid in tracker.tracked()
+                ):
+                    continue
                 resolve_recovery_veto_streak_escalation(
                     escalation_queue=self._escalation_queue,
                     task_id=tid,
@@ -12775,8 +12805,15 @@ class Harness:
 
     async def _recover_stranded_deterministic_task(
         self, tid: str, task: dict, metadata: dict,
+        *, tally: RecoverySweepTally | None = None,
     ) -> None:
         """Recover a task-2059-shaped stranded deterministic task (Source A).
+
+        ``tally`` is the calling sweep's per-pass recovery accumulator, OPTIONAL
+        and defaulted so every direct caller keeps working untouched (the same
+        additive pattern ``_reconcile_one_stranded`` uses).  A pass that supplies
+        one gets this site's holds folded in, which is what lets the sweep
+        release the streak alarms of tasks it no longer holds.
 
         Dedup-guarded: skips when a pending escalation already exists for
         *tid* — self-dedupes across sweep passes once filed.  That skip logs
@@ -12828,6 +12865,7 @@ class Harness:
                     (metadata.get('deploy_state') or {}).get('phase'),
                 ),
                 records=_dedup_rows,
+                tally=tally,
             )
             return
 
@@ -13193,6 +13231,14 @@ class Harness:
         tasks = await self.scheduler.get_tasks(statuses=['blocked'])
         task_by_id: dict[str, dict] = {}
         recovered_this_pass: set[str] = set()
+        # ONE tally across BOTH deterministic sites, deliberately: they are two
+        # halves of one duplicated predicate (task eta / 3541 collapses them)
+        # and the streak alarm they can file is keyed on task_id alone, so
+        # "held ANYWHERE in this pass" is exactly the right release granularity.
+        # Bookkeeping only — this sweep has its own logging and does NOT log a
+        # second summary line; part (2)'s unconditional summary belongs to the
+        # reconcile sweep.
+        recovery_tally = RecoverySweepTally()
         for task in tasks:
             tid = str(task.get('id', ''))
             if not tid:
@@ -13239,9 +13285,12 @@ class Harness:
                                 (metadata.get('deploy_state') or {}).get('phase'),
                             ),
                             records=_deploy_rows,
+                            tally=recovery_tally,
                         )
                         continue
-                    await self._recover_stranded_deterministic_task(tid, task, metadata)
+                    await self._recover_stranded_deterministic_task(
+                        tid, task, metadata, tally=recovery_tally,
+                    )
                     recovered_this_pass.add(tid)
                 elif _is_gate:
                     # Gate strand: the discriminator is an archive-INCLUSIVE,
@@ -13271,6 +13320,22 @@ class Harness:
                     'task %s: %s: %s',
                     tid, type(exc).__name__, exc,
                 )
+
+        # Source A is the only part of this pass that can CHARGE a veto streak,
+        # so its end is this sweep's release point.  Both deterministic sites
+        # are named because this pass drives both; releasing only the one that
+        # happened to fire would leave the other's entry to grow forever.
+        # Deliberately after the loop rather than at method exit: the alarm it
+        # may resolve is itself a pending record, and standing it down here
+        # keeps Source B's re-globbed get_pending() from re-observing an
+        # escalation this pass just closed.
+        self._release_recovery_veto_streaks(
+            recovery_tally,
+            sites=(
+                RecoverySite.deterministic_recon_sweep,
+                RecoverySite.deterministic_recon_deploy,
+            ),
+        )
 
         pending = self._escalation_queue.get_pending()
 

@@ -60,7 +60,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import _init_harness_state_for_test, wire_scheduler_liveness_mock
@@ -820,7 +820,10 @@ class TestRunDeterministicReconSweep:
         await h._run_deterministic_recon_sweep()
 
         h._recover_stranded_deterministic_task.assert_awaited_once_with(
-            'tid-a', task, metadata
+            # tally=: the pass's recovery accumulator, threaded so this site's
+            # holds reach the sweep's streak release (task 3535 S28).  ANY, not
+            # a literal: what is asserted here is the POSITIONAL contract.
+            'tid-a', task, metadata, tally=ANY,
         )
         h._revalidate_open_deterministic_escalation.assert_not_awaited()
 
@@ -925,7 +928,10 @@ class TestRunDeterministicReconSweep:
         await h._run_deterministic_recon_sweep()
 
         h._recover_stranded_deterministic_task.assert_awaited_once_with(
-            'tid-a', task, metadata
+            # tally=: the pass's recovery accumulator, threaded so this site's
+            # holds reach the sweep's streak release (task 3535 S28).  ANY, not
+            # a literal: what is asserted here is the POSITIONAL contract.
+            'tid-a', task, metadata, tally=ANY,
         )
         h._revalidate_open_deterministic_escalation.assert_not_awaited()
 
@@ -967,7 +973,7 @@ class TestRunDeterministicReconSweep:
 
         calls: list[str] = []
 
-        async def _recover(tid, task, meta):
+        async def _recover(tid, task, meta, *, tally=None):
             calls.append(tid)
             if tid == 'tid-bad':
                 raise RuntimeError('boom')
