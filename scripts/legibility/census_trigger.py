@@ -29,6 +29,15 @@ THREE-VALUED (task 3291):
   * absent — never censused, or η not yet writing it. Condition (b) fails
     SAFE.
 
+ANY other on-disk value is a fourth, MALFORMED case (task 4085): the state
+file is hand-seedable (skills/census/SKILL.md), so a quoted `"2872"`, a float,
+a JSON `true` or a negative count are all expected operator-authored inputs.
+Those also fail SAFE — one WARNING naming the value and its type, condition
+(b) inert, conditions (a)/(c) unaffected — rather than crashing (`"2872"`
+raised `TypeError` out of the subtraction) or silently computing a nonsense
+delta (`true` is an `int` subclass, so it meant a baseline of 1). The value is
+VALIDATED, never coerced: see `compute_tasks_landed`.
+
 Only a real int ever arms condition (b). A FABRICATED `0` used to be the
 fourth case, and it was the dangerous one: `census.py` wrote 0 whenever the
 get_statuses call failed, and that 0 was persisted as a real baseline on
@@ -583,7 +592,9 @@ def compute_tasks_landed(*, state: dict | None, status_fetcher) -> int | None:
 
     Returns `None` (never fires condition (b)) plus exactly one WARNING
     when: `status_fetcher` is `None`; `state` has no `last_census_done_count`
-    baseline (§7.5 extended read contract, see module docstring); calling
+    baseline (§7.5 extended read contract, see module docstring);
+    `last_census_done_count` is PRESENT but is not a non-negative int -- a
+    malformed hand-seeded baseline (task 4085; see below); calling
     `status_fetcher` raises for any reason; or the fetched payload is not a
     usable `{"statuses": {id: status}}` envelope (matching get_statuses' real
     shape -- fused-memory/src/fused_memory/server/tools.py:2665). In
@@ -596,12 +607,43 @@ def compute_tasks_landed(*, state: dict | None, status_fetcher) -> int | None:
     A bad payload and an unreachable server deliberately share ONE code path
     and ONE warning, so there is no separate failure mode to reason about --
     only the warning TEXT distinguishes them in the journal.
+
+    The baseline is VALIDATED, never coerced. `int("2872")` would silently
+    bless a malformed state file and arm an expensive census run on an
+    unaudited number -- exactly the defect class task 3291 closed on the fetch
+    side (see `extract_done_count` on the fabricated-0 baseline). A value that
+    is not what the documented contract says is REPORTED, not repaired behind
+    the operator's back.
     """
     baseline = (state or {}).get("last_census_done_count")
     if baseline is None:
         logger.warning(
             "tasks-landed: no last_census_done_count baseline in census state "
             "-- condition (b) fails safe (no fire)"
+        )
+        return None
+
+    # Checked BEFORE the status_fetcher guard on purpose: this is a state-side
+    # fault, and reporting the more specific one first is what makes a
+    # mis-seeded baseline visible on the default trickle wiring, where
+    # `run_nightly` passes `status_fetcher=None` and the fetcher guard would
+    # otherwise return first -- leaving a corrupt state file unreported.
+    # `bool` is rejected explicitly because it is an `int` subclass, so a
+    # hand-seeded JSON `true` would otherwise mean `baseline == 1` and arm
+    # condition (b) with every done task ever, silently. A negative count is
+    # definitionally impossible and inflates the delta in the fire-ward
+    # direction. `StatusFetchUnavailable` is deliberately NOT raised here --
+    # that exception is a FETCH-side signal that `census.run_census` reads as
+    # "the done-count could not be observed"; this is a different fault with a
+    # different owner (the operator's state file).
+    if not isinstance(baseline, int) or isinstance(baseline, bool) or baseline < 0:
+        logger.warning(
+            "tasks-landed: last_census_done_count is not a non-negative int "
+            "(got %s: %s) -- condition (b) fails safe (no fire); the census-state "
+            "baseline is hand-seedable (skills/census/SKILL.md) and this one is "
+            "unusable",
+            type(baseline).__name__,
+            _bounded_repr(baseline),
         )
         return None
 
