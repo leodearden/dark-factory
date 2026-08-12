@@ -25,10 +25,15 @@ from fused_memory.server.mem0_update_authz import resolve_mem0_update_authorizat
 
 
 def _service(**mem0_update_kwargs):
-    """A minimal stand-in for MemoryService carrying a real config object."""
+    """A minimal stand-in for MemoryService carrying a real config object.
+
+    ``mem0_update`` is ALWAYS rebuilt from an explicit ``Mem0UpdateConfig`` so
+    these tests pin schema defaults deterministically — a bare
+    ``FusedMemoryConfig()`` is a BaseSettings that loads ``config/config.yaml``
+    from the test cwd, and inheriting whatever that file says is how
+    TestLiveRead became a 65b011ed8c tripwire casualty."""
     config = FusedMemoryConfig()
-    if mem0_update_kwargs:
-        config.mem0_update = Mem0UpdateConfig(**mem0_update_kwargs)
+    config.mem0_update = Mem0UpdateConfig(**mem0_update_kwargs)
     return SimpleNamespace(config=config)
 
 
@@ -36,17 +41,20 @@ class TestLiveRead:
     """config/reload.py's precondition for registering the five leaves."""
 
     def test_reads_config_live_on_every_call(self):
+        # 'stranger-' as the not-on-the-bar example, NOT 'curator-': that was
+        # this test's original choice, and the esc-3524-1 grant then put
+        # curator- on the default bar and broke the first assertion.
         svc = _service()
         first = resolve_mem0_update_authorization(
-            svc, agent_id='curator-gate', content_amend=True, metadata_patch=False,
+            svc, agent_id='stranger-session', content_amend=True, metadata_patch=False,
         )
-        assert first.allowed is False, 'curator-gate is not on the default bar'
+        assert first.allowed is False, 'stranger- is not on the default bar'
 
         # Mutate the SHARED config object in place, exactly as reload_config does.
-        svc.config.mem0_update.content_amend_allowed_agent_prefixes.append('curator-')
+        svc.config.mem0_update.content_amend_allowed_agent_prefixes.append('stranger-')
 
         second = resolve_mem0_update_authorization(
-            svc, agent_id='curator-gate', content_amend=True, metadata_patch=False,
+            svc, agent_id='stranger-session', content_amend=True, metadata_patch=False,
         )
         assert second.allowed is True, (
             'the resolver must re-read config on every call; a value captured at '

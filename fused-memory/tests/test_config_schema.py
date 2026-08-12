@@ -725,11 +725,22 @@ class TestMem0UpdateConfig:
         """A named kill switch, defaulting ON — the tool ships usable."""
         assert Mem0UpdateConfig().enabled is True
 
-    def test_default_content_amend_allowlist_is_recon_stage(self):
-        assert Mem0UpdateConfig().content_amend_allowed_agent_prefixes == ['recon-stage-']
+    def test_default_content_amend_allowlist_is_recon_stage_and_curator(self):
+        """recon-stage- admits every reconciliation stage; curator- admits the
+        interactive consolidation sitting (esc-3524-1 ruling (b), promoted to
+        an all-deployments schema default by ruling 2026-08-12 because
+        skills/curate-fused-memories does not work without the grant)."""
+        assert Mem0UpdateConfig().content_amend_allowed_agent_prefixes == [
+            'recon-stage-', 'curator-',
+        ]
 
-    def test_default_metadata_patch_allowlist_is_recon_stage(self):
-        assert Mem0UpdateConfig().metadata_patch_allowed_agent_prefixes == ['recon-stage-']
+    def test_default_metadata_patch_allowlist_is_recon_stage_and_curator(self):
+        """curator- deliberately holds BOTH arms: gate 3200's retain-and-tag
+        stamps retained peers via metadata-only patches, so content_amend alone
+        would be the destructive half without the preserving half."""
+        assert Mem0UpdateConfig().metadata_patch_allowed_agent_prefixes == [
+            'recon-stage-', 'curator-',
+        ]
 
     def test_default_storm_threshold_is_20(self):
         assert Mem0UpdateConfig().storm_threshold == 20
@@ -746,8 +757,10 @@ class TestMem0UpdateConfig:
         cfg = Mem0UpdateConfig()
         assert cfg.content_amend_allowed_agent_prefixes is not \
             cfg.metadata_patch_allowed_agent_prefixes
-        cfg.metadata_patch_allowed_agent_prefixes.append('curator-')
-        assert cfg.content_amend_allowed_agent_prefixes == ['recon-stage-'], (
+        cfg.metadata_patch_allowed_agent_prefixes.append('auditor-')
+        assert cfg.content_amend_allowed_agent_prefixes == [
+            'recon-stage-', 'curator-',
+        ], (
             'widening one list must not mutate the other, got '
             f'{cfg.content_amend_allowed_agent_prefixes!r}'
         )
@@ -755,7 +768,7 @@ class TestMem0UpdateConfig:
     def test_separate_instances_do_not_share_lists(self):
         a, b = Mem0UpdateConfig(), Mem0UpdateConfig()
         a.content_amend_allowed_agent_prefixes.append('x-')
-        assert b.content_amend_allowed_agent_prefixes == ['recon-stage-']
+        assert b.content_amend_allowed_agent_prefixes == ['recon-stage-', 'curator-']
 
     # --- overrides accepted ---
 
@@ -763,13 +776,13 @@ class TestMem0UpdateConfig:
         cfg = Mem0UpdateConfig(
             enabled=False,
             content_amend_allowed_agent_prefixes=[],
-            metadata_patch_allowed_agent_prefixes=['recon-stage-', 'curator-'],
+            metadata_patch_allowed_agent_prefixes=['recon-stage-', 'auditor-'],
             storm_threshold=5,
             storm_window_seconds=600.0,
         )
         assert cfg.enabled is False
         assert cfg.content_amend_allowed_agent_prefixes == []
-        assert cfg.metadata_patch_allowed_agent_prefixes == ['recon-stage-', 'curator-']
+        assert cfg.metadata_patch_allowed_agent_prefixes == ['recon-stage-', 'auditor-']
         assert cfg.storm_threshold == 5
         assert cfg.storm_window_seconds == 600.0
 
@@ -793,12 +806,21 @@ class TestMem0UpdateConfig:
 
     # --- wired onto FusedMemoryConfig as a top-level section ---
 
-    def test_top_level_field_with_default_factory(self):
-        """An unconfigured deployment still gets the narrow allowlists."""
+    def test_top_level_field_with_default_factory(self, tmp_path, monkeypatch):
+        """An unconfigured deployment still gets the narrow allowlists.
+
+        CONFIG_PATH is pinned at a missing file because a bare
+        ``FusedMemoryConfig()`` is a BaseSettings that otherwise loads
+        ``config/config.yaml`` from the test cwd — which made this test
+        silently assert on the shipped YAML, not the schema default, and
+        was one of the three 65b011ed8c tripwire casualties."""
+        monkeypatch.setenv('CONFIG_PATH', str(tmp_path / 'missing.yaml'))
         cfg = FusedMemoryConfig()
         assert isinstance(cfg.mem0_update, Mem0UpdateConfig)
         assert cfg.mem0_update.enabled is True
-        assert cfg.mem0_update.content_amend_allowed_agent_prefixes == ['recon-stage-']
+        assert cfg.mem0_update.content_amend_allowed_agent_prefixes == [
+            'recon-stage-', 'curator-',
+        ]
 
     def test_field_is_bare_submodel_not_optional(self):
         """Bare (non-Optional) so config/reload.py's _iter_leaves descends into

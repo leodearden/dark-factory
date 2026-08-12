@@ -207,6 +207,100 @@ reconciliation:
     probe_interval_secs: 300
     max_probe_interval_secs: 1800
     accounts_file: "${DARK_FACTORY_ROOT:/home/leo/src/dark-factory}/config/usage-accounts.yaml"
+  # ---------------------------------------------------------------------------
+  # Write-time procedural_knowledge topic guard: OPERATOR OVERRIDE of the seeded
+  # cluster list (config/schema.py::_default_topic_guard_clusters).
+  #
+  # WHY THIS KEY EXISTS AT ALL: it retires ONE cluster,
+  # `eval-worktree-plan-tools-missing`. Measured over the archived
+  # dispatched-agent corpus, that cluster fired 14 of the 30 topic-cluster
+  # soft-blocks and 13 of those 14 were OFF-TOPIC false positives. Two defects:
+  #   1. No anchor requirement. Its topic is "plan-tools MCP server MISSING in
+  #      the eval worktree", but its phrase list was the ordinary vocabulary of
+  #      the plan subsystem (plan-tools / plan_tools / plan.json / create_plan /
+  #      add_plan_step) at min_phrase_hits=2, so any note mentioning plan-tools
+  #      tripped it with no eval-worktree context at all. Casualties included a
+  #      finding that eval-lane agents leak escalations into the production
+  #      queue, and a measurement of 144 markup-corrupted plan.json fields.
+  #   2. Spelling variants double-counted: `eval-worktree`/`eval worktree` and
+  #      `plan-tools`/`plan_tools` are one concept each but two phrase strings,
+  #      so a note naming only the concept scored 2 and met a threshold of 2.
+  # Decisive: the cluster's own hint routes writers to human gate task 2841,
+  # which is `done`. The cluster existed to stop accretion on a topic pending an
+  # OPEN human review; that review closed, so it is now pure cost.
+  #
+  # THE TRAP, for whoever edits this next: a pydantic default_factory fires ONLY
+  # when the YAML key is ABSENT. This key therefore REPLACES the whole seeded
+  # list -- the five clusters below are the survivors, reproduced VERBATIM from
+  # the seed. Deleting one here deletes it live. If a future seed adds a SEVENTH
+  # cluster in schema.py, this override will mask it until it is copied here.
+  # (Green-tier hot-reloadable: reload_config applies an edit here to a running
+  # server, no restart -- see config/reload.py RELOADABLE_FIELDS. The list is one
+  # atomic leaf, so it reloads whole.)
+  procedural_knowledge_topic_guard_clusters:
+  - topic_id: eval-worktree-venv-shadowing
+    phrases:
+    - eval-worktree
+    - eval worktree
+    - editable install
+    - venv shadowing
+    - .venv shadow
+    min_phrase_hits: 2
+    hint: Known-contradictory topic (venv / editable-install shadowing in the eval worktree)
+      gated to human task 2844. Do NOT add another entry -- update/consolidate the existing
+      entries, or add context to gate task 2844.
+  - topic_id: pytest-xdist-serial-override
+    phrases:
+    - pytest-xdist
+    - -n0
+    - --dist loadgroup
+    - max-worker-restart
+    - -p no:xdist
+    min_phrase_hits: 2
+    hint: Known-recurring topic (pytest-xdist -n0 serial-override workaround for the hardcoded
+      -n auto addopts in orchestrator/fused-memory pyproject.toml). Do NOT add another entry
+      -- update/consolidate canonical memory 8bb3eb15-1133-4e7b-ac1f-5bac10329b51.
+  - topic_id: architect-report-task-already-done-main-reachability
+    phrases:
+    - report_task_already_done
+    - main-reachable
+    - merge-base --is-ancestor
+    - _handle_already_done_report
+    min_phrase_hits: 2
+    sufficient_phrases:
+    - report_task_already_done
+    - _handle_already_done_report
+    hint: Known-contradictory topic (architect report_task_already_done requires a main-reachable
+      commit) gated to human task 3011. Do NOT add another entry -- update/consolidate the existing
+      entries, or add context to gate task 3011.
+  - topic_id: architect-plan-revalidation-requeue-lock
+    phrases:
+    - .task/plan.json
+    - plan-revalidation
+    - requeue rebase
+    - lost-plan reconstruction
+    - committed TDD steps
+    - lane reseed
+    min_phrase_hits: 2
+    hint: Known-recurring topic (architect plan-revalidation after a requeue rebase, a lock
+      loss, or a warm-lane reseed that left .task/plan.json a dangling symlink) gated to human
+      task 2973 -- see canonical memory 6a96a020-6193-4a7e-82a6-4f27bcf5378e (plan.json gitignore
+      wipe) and 974b0adb-ed54-44bd-aa12-aeaeae8b3ea6 (lost-plan reconstruction). The reseed
+      sub-case has no canonical entry yet, so if that is what you are writing up, add it as
+      context on gate task 2973 rather than merging it into either entry above. Do NOT add another
+      entry -- update/consolidate the existing entries, or add context to gate task 2973.
+  - topic_id: ruff-format-not-an-enforced-gate
+    phrases:
+    - ruff format
+    - ruff check
+    - enforced gate
+    - enforced lint gate
+    - format-clean
+    min_phrase_hits: 2
+    hint: Known-recurring topic (`ruff format` is not an enforced gate; only `ruff check` /
+      pyright gate commits) gated to human task 3342, whose ~14-entry cluster spans BOTH procedural_knowledge
+      and preferences_and_norms and is still awaiting a consolidation ruling. Do NOT add another
+      entry -- update/consolidate the existing entries, or add context to gate task 3342.
 
 curator:
   # Cancelled-premise blocklist: YAML file listing premises proven wrong by
@@ -269,40 +363,32 @@ summary_rebuild:
 # id. All five leaves are green-tier hot-reloadable (see OPERATIONS.md §6);
 # every value below is the shipped default, shown so the knobs are discoverable
 # without reading the schema. Uncomment to change one.
-mem0_update:
-  # Kill switch. false denies every caller on the very next call, allowlisted
-  # or not — this is the knob to flip during a runaway-rewrite incident.
-  enabled: true
-  # Two independent agent_id-prefix allowlists, one per arm. Widening the
-  # metadata bar ALONE is the supported way to admit an interactive tagging
-  # flow without granting content-amend authority: a mistagged record is cheap
-  # to notice and cheap to correct, a silent content rewrite is neither.
-  # agent_id is self-reported, so this deters misuse by cooperating callers
-  # rather than enforcing a security boundary.
-  #
-  # 'curator-' ADDED 2026-08-11 by Leo's ruling (b) on esc-3524-1 — see that
-  # record's triage addendum for the full rationale. It admits the interactive
-  # memory-consolidation sitting (task 3524 / gate 3625) rather than routing
-  # those consolidations through a recon-stage agent, which was the rejected
-  # option (a). Deliberately a DEDICATED NARROW prefix that a sitting session
-  # opts into by self-reporting agent_id='curator-<something>', NOT the everyday
-  # 'claude-interactive' — admitting that would grant silent history-rewrite
-  # authority to every ordinary interactive session in every project sharing
-  # this config.
-  #
-  # BOTH arms carry it, and that is required rather than incidental: gate 3200
-  # ratified Option C's retain-and-tag write shape (2026-08-11), whose folded
-  # entries are RETAINED as topic-tagged peers via a metadata-only patch. A
-  # sitting granted content_amend alone could rewrite the canonical but not
-  # stamp the peers it retains, i.e. it could do the destructive half and not
-  # the preserving half.
-  content_amend_allowed_agent_prefixes: ['recon-stage-', 'curator-']
-  metadata_patch_allowed_agent_prefixes: ['recon-stage-', 'curator-']
-  # Content-amend burst alarm: escalates, never blocks (a hard block would
-  # risk a legitimate large consolidation cycle failing mid-run over its own
-  # success count). Metadata-only calls do not count toward it.
-  storm_threshold: 20
-  storm_window_seconds: 3600.0
+# mem0_update:
+#   # Kill switch. false denies every caller on the very next call, allowlisted
+#   # or not — this is the knob to flip during a runaway-rewrite incident.
+#   enabled: true
+#   # Two independent agent_id-prefix allowlists, one per arm. Widening the
+#   # metadata bar ALONE is the supported way to admit an interactive tagging
+#   # flow without granting content-amend authority: a mistagged record is cheap
+#   # to notice and cheap to correct, a silent content rewrite is neither.
+#   # agent_id is self-reported, so this deters misuse by cooperating callers
+#   # rather than enforcing a security boundary.
+#   #
+#   # curator- is part of the SCHEMA DEFAULT (ruling 2026-08-12, promoting the
+#   # 2026-08-11 esc-3524-1 ruling (b) from a per-machine override here to an
+#   # all-deployments default): it admits the interactive memory-consolidation
+#   # sitting defined by skills/curate-fused-memories, which cannot work
+#   # without the grant. Both arms deliberately — gate 3200's retain-and-tag
+#   # stamps retained peers via metadata-only patches, so content_amend alone
+#   # would be the destructive half without the preserving half. Full
+#   # rationale: the Mem0UpdateConfig field descriptions in config/schema.py.
+#   content_amend_allowed_agent_prefixes: ['recon-stage-', 'curator-']
+#   metadata_patch_allowed_agent_prefixes: ['recon-stage-', 'curator-']
+#   # Content-amend burst alarm: escalates, never blocks (a hard block would
+#   # risk a legitimate large consolidation cycle failing mid-run over its own
+#   # success count). Metadata-only calls do not count toward it.
+#   storm_threshold: 20
+#   storm_window_seconds: 3600.0
 
 write_triage:
   # CALIBRATION OUTPUT — do not hand-edit.

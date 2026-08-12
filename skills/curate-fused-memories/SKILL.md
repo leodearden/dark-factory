@@ -58,11 +58,14 @@ Each arm sits behind an **agent_id-prefix allowlist** read **live off config on
 every call**, plus a kill switch that outranks both. Read these two sources —
 they are short and they are the law:
 
-- `fused-memory/config/config.yaml`, the `mem0_update:` block (~line 272). As of
-  2026-08-11 both arms' allowlists are `['recon-stage-', 'curator-']` (snapshot —
-  re-read the file; the block's long comment records Leo's ruling (b) on
-  esc-3524-1 and why **both** arms must carry `curator-`: retain-and-tag needs
-  the preserving half, not just the destructive half).
+- `fused-memory/src/fused_memory/config/schema.py`, `Mem0UpdateConfig` — since
+  2026-08-12 the `curator-` grant is the **schema default**: both arms'
+  `default_factory` lists are `['recon-stage-', 'curator-']`, and
+  `config.yaml`'s `mem0_update:` block ships fully commented out (an active
+  block there is an operator override that trips a deliberate tripwire test).
+  The field descriptions record Leo's ruling (b) on esc-3524-1 and why **both**
+  arms must carry `curator-`: retain-and-tag needs the preserving half, not
+  just the destructive half.
 - `fused-memory/src/fused_memory/server/mem0_update_authz.py` — the resolver.
   Note `resolve_mem0_update_enabled` (the `mem0_update.enabled` kill switch,
   evaluated first, denies everyone when off) and that every fallback is
@@ -235,12 +238,16 @@ closure. Without it, you are hand-sequencing `add_memory` + `update_memory` +
 **0c. Read the live authority config.**
 
 ```bash
-sed -n '272,306p' fused-memory/config/config.yaml    # the mem0_update: block
+grep -n "allowed_agent_prefixes" \
+  fused-memory/src/fused_memory/config/schema.py      # the shipped defaults
+grep -n "^mem0_update:" fused-memory/config/config.yaml || echo "no override"
 ```
 
-Expect `enabled: true` and `curator-` in BOTH arms' allowlists (snapshot
-2026-08-11 — the file is the source; the running server re-reads it live on
-every call, so what the file says after the last reload is what gates you).
+Expect `curator-` in BOTH arms' `default_factory` lists and NO active
+`mem0_update:` override in config.yaml (snapshot 2026-08-12 — the grant is the
+schema default; an uncommented YAML block means an operator has overridden it,
+and what the running server holds is whatever config it booted/reloaded with,
+which is exactly why the probe in 0d, not this read, is the ground truth).
 
 **0d. The cheap authority probe.** Authorization is checked **before** any
 record lookup or mutation (`server/tools.py` `update_memory` step (2), ~:4287 —

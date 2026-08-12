@@ -486,13 +486,19 @@ the authoritative list rather than treating this enumeration as exhaustive:
 - `mem0_update.content_amend_allowed_agent_prefixes` and
   `mem0_update.metadata_patch_allowed_agent_prefixes` — two independently
   configurable `agent_id`-prefix allowlists, both shipping as
-  `['recon-stage-']`. They are separate because the arms carry different
-  risk: widening **`metadata_patch_allowed_agent_prefixes` alone** is the
-  supported way to admit an interactive curator-gate tagging flow without
-  granting anyone content-amend authority. A mistagged record is cheap to
-  notice and cheap to correct; a silent content rewrite is neither.
-  (`agent_id` is self-reported, so this is a misuse deterrent for
-  cooperating callers, not a security boundary.)
+  `['recon-stage-', 'curator-']`: `recon-stage-` admits every
+  reconciliation stage agent, and `curator-` admits the interactive
+  memory-consolidation sitting defined by `skills/curate-fused-memories`
+  (esc-3524-1 ruling (b), promoted to an all-deployments schema default on
+  2026-08-12; it deliberately holds both arms because retain-and-tag
+  stamps retained peers via metadata-only patches). The lists are separate
+  because the arms carry different risk: widening
+  **`metadata_patch_allowed_agent_prefixes` alone** remains the supported
+  way to admit a new interactive tagging flow without granting anyone
+  content-amend authority. A mistagged record is cheap to notice and cheap
+  to correct; a silent content rewrite is neither. (`agent_id` is
+  self-reported, so this is a misuse deterrent for cooperating callers,
+  not a security boundary.)
 - `mem0_update.storm_threshold` and `mem0_update.storm_window_seconds` —
   the content-amend burst alarm (escalates, never blocks; metadata-only
   calls do not count toward it). Genuinely reload-safe because the shared

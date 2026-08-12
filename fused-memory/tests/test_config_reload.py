@@ -438,9 +438,11 @@ class TestMem0UpdateLeavesAreGreenTier:
         [
             ('mem0_update.enabled', False),
             ('mem0_update.content_amend_allowed_agent_prefixes', []),
+            # NB: must differ from the shipped default (which already carries
+            # recon-stage- and curator-), or the diff is vacuously empty.
             (
                 'mem0_update.metadata_patch_allowed_agent_prefixes',
-                ['recon-stage-', 'curator-'],
+                ['recon-stage-', 'curator-', 'auditor-'],
             ),
             ('mem0_update.storm_threshold', 5),
             ('mem0_update.storm_window_seconds', 600.0),
@@ -489,8 +491,13 @@ class TestMem0UpdateLeavesAreGreenTier:
         )
 
     def test_widened_metadata_bar_is_observed_live(self):
-        """The operator story: admit a curator-gate metadata patch on a running
-        server WITHOUT granting content-amend authority."""
+        """The operator story: admit an interactive tagging flow on a running
+        server WITHOUT granting content-amend authority.
+
+        auditor- as the example prefix, NOT curator-: curator- moved onto the
+        shipped default of BOTH arms (esc-3524-1 + the 2026-08-12 ruling), so
+        widening to it would be a vacuous no-op diff and the content-amend
+        denial below would fail."""
         from types import SimpleNamespace
 
         from fused_memory.server.mem0_update_authz import resolve_mem0_update_authorization
@@ -502,15 +509,15 @@ class TestMem0UpdateLeavesAreGreenTier:
         object.__setattr__(
             fresh.mem0_update,
             'metadata_patch_allowed_agent_prefixes',
-            ['recon-stage-', 'curator-'],
+            ['recon-stage-', 'curator-', 'auditor-'],
         )
         apply_reload(live, fresh)
 
         assert resolve_mem0_update_authorization(
-            svc, agent_id='curator-gate', content_amend=False, metadata_patch=True,
+            svc, agent_id='auditor-session', content_amend=False, metadata_patch=True,
         ).allowed is True
         assert resolve_mem0_update_authorization(
-            svc, agent_id='curator-gate', content_amend=True, metadata_patch=False,
+            svc, agent_id='auditor-session', content_amend=True, metadata_patch=False,
         ).allowed is False, 'widening one bar must not widen the other'
 
 

@@ -10,6 +10,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+#### `update_memory`'s default allowlists now admit `curator-` on both arms (esc-3524-1)
+
+**Behaviour change, operator-visible.** `Mem0UpdateConfig`'s
+`content_amend_allowed_agent_prefixes` and `metadata_patch_allowed_agent_prefixes`
+default to `['recon-stage-', 'curator-']` instead of `['recon-stage-']`. The
+`curator-` prefix is the dedicated opt-in identity for the interactive
+memory-consolidation sitting (`skills/curate-fused-memories`), granted both arms
+by Leo's ruling (b) on esc-3524-1 (2026-08-11) and promoted from a per-machine
+`config.yaml` override to an all-deployments schema default on 2026-08-12 — the
+sitting skill does not work without it. `config.yaml`'s `mem0_update:` block is
+fully commented out again; the premise tripwire in
+`test_recon_amend_tool_advertisement.py` (which fired on the 2026-08-11 override
+commit `65b011ed8c` and turned main red) is re-armed: it still fails on any
+active YAML override of these leaves. No recon-stage capability changed;
+`agent_id` remains self-reported (a misuse deterrent, not a security boundary).
+
 #### `delete_memory`'s citation gate now applies to EVERY caller (task 3624)
 
 **Behaviour change, operator-visible.** A `store='mem0'` `delete_memory` call

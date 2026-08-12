@@ -1947,29 +1947,40 @@ class Mem0UpdateConfig(BaseModel):
         ),
     )
     content_amend_allowed_agent_prefixes: list[str] = Field(
-        default_factory=lambda: ['recon-stage-'],
+        default_factory=lambda: ['recon-stage-', 'curator-'],
         description=(
-            'agent_id prefixes authorized to AMEND CONTENT in place. Defaults to '
-            'the narrow recon-stage- bar (the same literal prefix '
-            'add_system_record gates on) because a content amend is a silent '
-            'history-rewrite primitive. NOTE: agent_id is SELF-REPORTED, so this '
-            'is a misuse deterrent for cooperating callers, not cryptographic '
-            'authorization. Deliberately a separate list from '
-            'metadata_patch_allowed_agent_prefixes so the two bars move '
-            'independently. Green-tier hot-reloadable via reload_config.'
+            'agent_id prefixes authorized to AMEND CONTENT in place. Narrow by '
+            'design, because a content amend is a silent history-rewrite '
+            'primitive. recon-stage- (the same literal prefix add_system_record '
+            'gates on) admits every reconciliation stage agent; curator- is the '
+            'dedicated prefix an interactive memory-consolidation sitting opts '
+            'into while executing skills/curate-fused-memories (esc-3524-1 '
+            'ruling (b), 2026-08-11; made an all-deployments schema default '
+            'rather than a per-machine config.yaml override by ruling '
+            '2026-08-12 — the skill does not work without it). Deliberately NOT '
+            'the everyday claude-interactive, which would grant silent '
+            'history-rewrite authority to every interactive session. NOTE: '
+            'agent_id is SELF-REPORTED, so this is a misuse deterrent for '
+            'cooperating callers, not cryptographic authorization. Deliberately '
+            'a separate list from metadata_patch_allowed_agent_prefixes so the '
+            'two bars move independently. Green-tier hot-reloadable via '
+            'reload_config.'
         ),
     )
     metadata_patch_allowed_agent_prefixes: list[str] = Field(
-        default_factory=lambda: ['recon-stage-'],
+        default_factory=lambda: ['recon-stage-', 'curator-'],
         description=(
             'agent_id prefixes authorized to PATCH METADATA in place. Ships '
             'identical to the content-amend list but is independently '
-            'configurable, and that is the point: widening THIS list alone is the '
-            'supported way to admit an interactive curator-gate flow (tagging a '
-            'survivor with topic=) without granting content-amend authority. A '
-            'mistagged patch is cheap to notice and cheap to correct; a runaway '
-            'silent content rewrite is not. Green-tier hot-reloadable via '
-            'reload_config.'
+            'configurable, and that is the point: widening THIS list alone '
+            'remains the supported way to admit a new interactive tagging flow '
+            'without granting content-amend authority. A mistagged patch is '
+            'cheap to notice and cheap to correct; a runaway silent content '
+            'rewrite is not. curator- deliberately holds BOTH arms, not only '
+            'this one: gate 3200 ratified retain-and-tag, whose folded entries '
+            'are retained as topic-stamped peers via a metadata-only patch — '
+            'content_amend alone would be the destructive half without the '
+            'preserving half. Green-tier hot-reloadable via reload_config.'
         ),
     )
     storm_threshold: int = Field(
