@@ -719,3 +719,77 @@ class TestMalformedDeclarationIsRejectedLoudly:
                 content='Fixed the bug in Task 3127.',
                 group_id=GROUP,
             )
+
+
+class TestDeclaredTriState:
+    """``[]`` and ``None`` are behaviourally DISTINCT (resolved decision 2).
+
+    ``None`` means "never considered" and falls through the chain. ``[]`` means
+    "considered, none apply" and is honoured as a genuine declaration, so ι's
+    telemetry can separate "the agent considered referents and found none
+    apply" from ``source='none'`` ("nobody declared anything and nothing was
+    derivable"). Under ``if declared:`` the two collapse and the tri-state
+    becomes a docstring claim rather than a behaviour — which is what these
+    tests exist to prevent.
+    """
+
+    def test_an_empty_declaration_is_honoured_rather_than_falling_through(self):
+        resolution = resolve_referents(
+            declared=[],
+            metadata={'task_id': 3668},
+            content='Fixed the bug in Task 3127.',
+            group_id=GROUP,
+        )
+        assert resolution.source == 'declared'
+        assert resolution.referents == ()
+
+    def test_an_empty_declaration_never_conflicts_with_the_scan(self):
+        """Rejecting here would be rejecting on ABSENCE, which resolved
+        decision 3 forbids: agents that do not retry — notably /reflect at
+        session end — lose the memory outright."""
+        resolution = resolve_referents(
+            declared=[],
+            metadata={},
+            content='Fixed the bug in Task 3127.',
+            group_id=GROUP,
+        )
+        assert resolution.conflicts == ()
+
+    def test_none_falls_through_to_the_metadata_bridge(self):
+        """The distinguishing half: identical inputs, only ``declared``
+        differs, and the resolution lands on a different source."""
+        resolution = resolve_referents(
+            declared=None,
+            metadata={'task_id': 3668},
+            content='Fixed the bug in Task 3127.',
+            group_id=GROUP,
+        )
+        assert resolution.source == 'metadata'
+        assert resolution.referents == (Referent(kind='task', number='3668'),)
+
+    def test_an_empty_declaration_is_distinguishable_from_source_none(self):
+        """With nothing else available either, the two rows STILL differ — this
+        is the distinction ι counts as "the agent considered referents" versus
+        "the agent never looked"."""
+        considered = resolve_referents(
+            declared=[], metadata={}, content='', group_id=GROUP
+        )
+        never_looked = resolve_referents(
+            declared=None, metadata={}, content='', group_id=GROUP
+        )
+        assert considered.source == 'declared'
+        assert never_looked.source == 'none'
+        assert considered.referents == never_looked.referents == ()
+
+    def test_an_empty_declaration_still_reports_ambiguity_from_the_scan(self):
+        resolution = resolve_referents(
+            declared=[],
+            metadata={},
+            content='task 2500 duplicates dark_factory:2500',
+            group_id='reify',
+        )
+        assert resolution.source == 'declared'
+        assert resolution.ambiguous == (
+            Referent(kind='task', number='2500'),
+            Referent(kind='task', project_id='dark_factory', number='2500'),
+        )
