@@ -111,9 +111,11 @@ _MARKUP_HINT = (
     'This write carries raw MCP envelope markup (see matched_pattern/field), '
     'which indicates the caller serialized part of its own tool-call envelope '
     'into the payload. Strip the leaked envelope fragment and resubmit. Do NOT '
-    'work around this by rewording the payload around the fragment: DF task '
-    '3083 owns the root cause and the retroactive corpus sweep, so report a '
-    'recurrence there. If the markup is quoted deliberately (e.g. documenting '
+    'work around this by rewording the payload around the fragment. DF task '
+    '3083 delivered the root cause and the corpus sweep but is DONE and CLOSED '
+    'to appends; its successor plans/toolcall-markup-containment-prd.md owns '
+    'the live work, so report a recurrence against that PRD, not against 3083. '
+    'If the markup is quoted deliberately (e.g. documenting '
     "the leak itself), override with metadata={'" + MARKUP_OVERRIDE_KEY + "': True}."
 )
 
@@ -131,9 +133,10 @@ _MARKUP_STORM_WINDOW_SECONDS = 3600.0
 _MARKUP_STORM_HINT = (
     'Multiple MCP-envelope-markup writes were rejected in a short window: the '
     'upstream serialization leak is ACTIVE right now. This is not a sign the '
-    'tripwire is misfiring — do NOT disable it. DF task 3083 owns the root '
-    'cause and the retroactive corpus sweep; attach the offending agent_id, '
-    'field and matched_pattern there.'
+    'tripwire is misfiring — do NOT disable it. DF task 3083 is DONE and CLOSED '
+    'to appends; its successor plans/toolcall-markup-containment-prd.md owns '
+    'the live root-cause, repair and retro-sweep work — attach the offending '
+    'agent_id, field and matched_pattern against that PRD, not against 3083.'
 )
 
 # Escalation wiring, copied shape-for-shape from
@@ -466,10 +469,17 @@ def emit_markup_storm_escalation(
         'now, not that the tripwire is misfiring — do NOT disable it, or '
         'further specimens will land permanently in the corpus.',
         '',
-        'DF task 3083 owns the root cause, the Qdrant payload text-match read '
-        'tool and the retroactive corpus sweep. Attach the agent_id, field and '
-        'matched_pattern from the rejection responses (grep the server logs for '
-        "'markup_tripwire_storm') to 3083.",
+        'DF task 3083 delivered the root cause and the Qdrant payload '
+        'text-match read tool, but it is DONE and CLOSED to appends — nothing '
+        'reads what is attached there, and its metadata is APPEND-ONLY: a key '
+        'can be added or overwritten, but none can be removed or renamed, '
+        'because deletion needs metadata_mode=replace and any faithful replace '
+        'payload carries done_provenance, which the write-authority floor '
+        'refuses. Its successor plans/toolcall-markup-containment-prd.md '
+        'owns the live blast-radius, deterministic-repair and retro-sweep work. '
+        'Attach the agent_id, field and matched_pattern from the rejection '
+        "responses (grep the server logs for 'markup_tripwire_storm') against "
+        "that PRD's open leaves, not against 3083.",
     ])
 
     try:
@@ -481,12 +491,14 @@ def emit_markup_storm_escalation(
             category=_CATEGORY,
             summary=(
                 f'{count} MCP write(s) rejected for leaked envelope markup in '
-                f'{window_seconds}s — serialization leak active (see DF 3083)'
+                f'{window_seconds}s — serialization leak active '
+                '(see plans/toolcall-markup-containment-prd.md)'
             ),
             detail=detail,
             suggested_action=(
                 'identify the leaking caller from the rejection logs and report '
-                'it on DF task 3083'
+                'it against plans/toolcall-markup-containment-prd.md — DF task '
+                '3083 is done and closed to appends'
             ),
             level=1,
         )
