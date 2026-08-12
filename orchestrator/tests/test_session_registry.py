@@ -4179,7 +4179,7 @@ class TestStdlibOnlySelfContainment:
     should read the module docstring before deleting it.
     """
 
-    def test_imports_under_a_bare_interpreter_with_no_workspace_packages(self):
+    def test_imports_under_a_bare_interpreter_with_no_workspace_packages(self, tmp_path):
         """`import orchestrator.session_registry` succeeds with only orchestrator/src."""
         interpreter = _non_venv_interpreter()
         if interpreter is None:
@@ -4192,12 +4192,26 @@ class TestStdlibOnlySelfContainment:
             'PYTHONDONTWRITEBYTECODE': '1',
         }
 
-        # Guard against a vacuous pass: if this host can already import
-        # `shared` with only orchestrator/src on the path, the assertion below
-        # would succeed even with the contract broken.
+        # ``cwd=tmp_path`` on both runs below is LOAD-BEARING, not tidiness.
+        # Python puts the process's own cwd on sys.path, so a run from the REPO
+        # ROOT resolves ``<repo>/shared`` — the wrapper directory, NOT the real
+        # ``shared/src/shared`` package — as an empty NAMESPACE package.  The
+        # probe's ``shared`` import then succeeds, this test skips, and the
+        # contract goes unpinned.  Measured: inert from the repo root, live from
+        # ``orchestrator/``.  The canonical test_command runs
+        # ``cd orchestrator && pytest tests/``, so it only bit an ad-hoc
+        # ``pytest orchestrator/tests/...`` from the root — which is exactly what
+        # someone checking this one file types.  A neutral cwd holds either way.
+        #
+        # Guard against a vacuous pass: on a host where ``shared`` really is
+        # installed into this interpreter, the assertion below would succeed even
+        # with the contract broken.  Probe the SAME import shape the contract
+        # forbids — a bare ``import shared`` is satisfied by a namespace dir that
+        # ``from shared import safe_io`` still fails on, so probing the bare form
+        # can only ever over-skip.
         probe = subprocess.run(
-            [interpreter, '-c', 'import shared'],
-            env=env, capture_output=True, text=True, timeout=60,
+            [interpreter, '-c', 'from shared import safe_io'],
+            env=env, cwd=tmp_path, capture_output=True, text=True, timeout=60,
         )
         if probe.returncode == 0:
             pytest.skip(
@@ -4207,7 +4221,7 @@ class TestStdlibOnlySelfContainment:
 
         result = subprocess.run(
             [interpreter, '-c', 'import orchestrator.session_registry'],
-            env=env, capture_output=True, text=True, timeout=60,
+            env=env, cwd=tmp_path, capture_output=True, text=True, timeout=60,
         )
 
         assert result.returncode == 0, (
