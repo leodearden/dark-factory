@@ -656,21 +656,21 @@ def test_parse_invariant_headings_ignores_every_decoy_shape() -> None:
 
 
 @pytest.mark.parametrize(
-    ("markdown_text", "case", "expected_phrase"),
+    ("markdown_text", "case", "expected_evidence"),
     [
+        pytest.param(_HEADINGS_NONE, "zero headings", [], id="zero-headings"),
+        pytest.param(_HEADINGS_GAP, "non-contiguous", [repr([1, 2, 4])], id="numbering-gap"),
+        pytest.param(_HEADINGS_OFFSET, "does not start at 1", [repr([2, 3])], id="offset-start"),
         pytest.param(
-            _HEADINGS_NONE, "zero headings", "no `## INV-N `slug`` headings", id="zero-headings"
+            _HEADINGS_DUP_SLUG, "duplicate slug", [repr(["a-slug"])], id="duplicate-slug"
         ),
-        pytest.param(_HEADINGS_GAP, "non-contiguous", "contiguous", id="numbering-gap"),
-        pytest.param(_HEADINGS_OFFSET, "does not start at 1", "contiguous", id="offset-start"),
-        pytest.param(_HEADINGS_DUP_SLUG, "duplicate slug", "duplicate slug", id="duplicate-slug"),
         pytest.param(
-            _HEADINGS_DUP_NUMBER, "duplicate number", "duplicate number", id="duplicate-number"
+            _HEADINGS_DUP_NUMBER, "duplicate number", [repr([2])], id="duplicate-number"
         ),
     ],
 )
 def test_parse_invariant_headings_fails_loudly(
-    markdown_text: str, case: str, expected_phrase: str
+    markdown_text: str, case: str, expected_evidence: list[str]
 ) -> None:
     """(c-g) Every malformed family RAISES and names its ``source``.
 
@@ -685,13 +685,28 @@ def test_parse_invariant_headings_fails_loudly(
     Naming ``source`` in the message is what makes a red run actionable: four
     different docs are parsed by this one extractor, so "which doc broke" is not
     recoverable from the traceback alone.
+
+    ``expected_evidence`` pins the REPR OF THE OFFENDING VALUE — the numbers that
+    are not contiguous, the slug or number that repeats — never a phrase of the
+    message's English, matching the policy the rest of this module already
+    follows. A wording pin is red on a harmless reword and green on a message
+    degraded to uselessness as long as the one word survives; the offending-value
+    repr is exactly the datum a reader needs to go fix the doc, and it also
+    discriminates the gap case from the offset case, which a shared "contiguous"
+    substring never did. The zero-headings case carries no offending value — its
+    whole contract is that it raises at all instead of returning ``[]`` — so the
+    raise plus the ``source`` name is all there is to assert.
     """
     with pytest.raises(AssertionError) as excinfo:
         parse_invariant_headings(markdown_text, source=_FIXTURE_SOURCE)
 
     message = str(excinfo.value)
     assert _FIXTURE_SOURCE in message, f"{case}: message must name the source doc: {message!r}"
-    assert expected_phrase in message, f"{case}: message must diagnose the defect: {message!r}"
+    for evidence in expected_evidence:
+        assert evidence in message, (
+            f"{case}: message must quote the offending value {evidence}, so a "
+            f"reader can see what to fix: {message!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -841,23 +856,34 @@ def test_marked_span_returns_only_the_text_between_the_markers() -> None:
 _FIXTURE_BEGIN_MARKER = f"<!-- {_FIXTURE_SPAN_NAME}:begin"
 _FIXTURE_END_MARKER = f"<!-- {_FIXTURE_SPAN_NAME}:end -->"
 
+# The bare marker NAMES, without the `<!-- ` comment opener. The inverted-span
+# message quotes both of them (it has no whole comment to quote — the defect is
+# their relative order, not either one's text).
+_FIXTURE_BEGIN_NAME = f"{_FIXTURE_SPAN_NAME}:begin"
+_FIXTURE_END_NAME = f"{_FIXTURE_SPAN_NAME}:end"
+
 
 @pytest.mark.parametrize(
-    ("markdown_text", "case", "expected_phrase"),
+    ("markdown_text", "case", "expected_markers"),
     [
-        pytest.param(_SPAN_NO_BEGIN, "missing begin", _FIXTURE_BEGIN_MARKER, id="missing-begin"),
-        pytest.param(_SPAN_NO_END, "missing end", _FIXTURE_END_MARKER, id="missing-end"),
+        pytest.param(_SPAN_NO_BEGIN, "missing begin", [_FIXTURE_BEGIN_MARKER], id="missing-begin"),
+        pytest.param(_SPAN_NO_END, "missing end", [_FIXTURE_END_MARKER], id="missing-end"),
         pytest.param(
-            _SPAN_DUPLICATE_BEGIN, "duplicate begin", _FIXTURE_BEGIN_MARKER, id="duplicate-begin"
+            _SPAN_DUPLICATE_BEGIN, "duplicate begin", [_FIXTURE_BEGIN_MARKER], id="duplicate-begin"
         ),
         pytest.param(
-            _SPAN_DUPLICATE_END, "duplicate end", _FIXTURE_END_MARKER, id="duplicate-end"
+            _SPAN_DUPLICATE_END, "duplicate end", [_FIXTURE_END_MARKER], id="duplicate-end"
         ),
-        pytest.param(_SPAN_INVERTED, "inverted", "precedes", id="inverted-markers"),
+        pytest.param(
+            _SPAN_INVERTED,
+            "inverted",
+            [_FIXTURE_BEGIN_NAME, _FIXTURE_END_NAME],
+            id="inverted-markers",
+        ),
     ],
 )
 def test_marked_span_fails_loudly_on_a_broken_marker(
-    markdown_text: str, case: str, expected_phrase: str
+    markdown_text: str, case: str, expected_markers: list[str]
 ) -> None:
     """A missing, duplicated or inverted marker RAISES — never returns ''.
 
@@ -866,12 +892,14 @@ def test_marked_span_fails_loudly_on_a_broken_marker(
     level down — silently taking the first span leaves the second copy unpinned
     and free to drift, which is precisely the defect this module exists to catch.
 
-    The four marker cases pin the MARKER LITERAL the message must quote, not a
-    rendered count. Which of begin/end broke is the fact a reader needs in order
-    to go fix the doc; "found 2" is the same message's formatting, and pinning it
-    turns a reword red while leaving a message that dropped the marker name —
-    the part that makes it actionable — green. Inversion keeps a semantic phrase
-    because it is a distinct assertion, not a different input to the same one.
+    Every case pins the MARKER LITERALS the message must quote — caller-supplied
+    data, not a rendered count and not a phrase of the message's English. Which
+    marker broke is the fact a reader needs in order to go fix the doc; "found 2"
+    is the same message's formatting, and pinning it turns a reword red while
+    leaving a message that dropped the marker name — the part that makes it
+    actionable — green. Inversion is the same rule applied to a two-marker
+    defect: it quotes BOTH names, since the defect is their order rather than
+    either one's text, so the assertion stays on data the caller handed in.
     """
     with pytest.raises(AssertionError) as excinfo:
         marked_span(markdown_text, _FIXTURE_SPAN_NAME, source=_FIXTURE_SOURCE)
@@ -879,7 +907,11 @@ def test_marked_span_fails_loudly_on_a_broken_marker(
     message = str(excinfo.value)
     assert _FIXTURE_SOURCE in message, f"{case}: message must name the source: {message!r}"
     assert _FIXTURE_SPAN_NAME in message, f"{case}: must name the marker: {message!r}"
-    assert expected_phrase in message, f"{case}: must diagnose the defect: {message!r}"
+    for marker in expected_markers:
+        assert marker in message, (
+            f"{case}: message must quote the offending marker `{marker}`, so a "
+            f"reader can see which one to fix: {message!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
