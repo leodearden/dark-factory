@@ -374,8 +374,20 @@ def resolve_referents(
     # `.referents`.
     ambiguous = scan.ambiguous
 
-    # An explicit declaration is the strongest source and is honoured verbatim.
-    if declared:
+    # An explicit declaration is the strongest source and is honoured verbatim,
+    # INCLUDING the empty one. Two things a later reader will want to
+    # "simplify", and must not:
+    #
+    # 1. `if declared:` collapses [] onto None and makes the PRD's tri-state a
+    #    lie. The distinction is exactly what ι counts as "the agent CONSIDERED
+    #    referents and none applied" (declared=[]) versus "the agent never
+    #    looked" (declared=None, nothing derivable -> source='none').
+    # 2. declared=[] produces NO conflict even when the scan DID find
+    #    referents. That is deliberate, not an oversight: resolved decision 3
+    #    rejects on conflict, never on ABSENCE, and a downstream verifier must
+    #    in any case no-op on an empty referent set — there is nothing to test
+    #    membership against — exactly as it already does for source='none'.
+    if declared is not None:
         return ReferentResolution(
             source='declared',
             referents=_declared_referents(declared, group_id=group_id),
