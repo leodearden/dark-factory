@@ -6,6 +6,11 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from shared.phantom_verdict import (
+    UNPARSEABLE_ISSUE_PREFIX,
+    UNPARSEABLE_VERDICT_CODE,
+    is_phantom_verdict_row,
+)
 from shared.testing import make_gate_mock
 
 from fused_memory.config.schema import ReconciliationConfig
@@ -14,6 +19,7 @@ from fused_memory.models.reconciliation import (
     VerdictAction,
     VerdictSeverity,
 )
+from fused_memory.reconciliation import judge as judge_module
 from fused_memory.reconciliation.judge import Judge, is_phantom_verdict
 from fused_memory.reconciliation.prompts.judge import JUDGE_SYSTEM_PROMPT
 
@@ -894,6 +900,131 @@ class TestIsPhantomVerdict:
             }],
         )
         assert is_phantom_verdict(verdict) is False
+
+
+class TestPhantomRuleIsTheSharedRule:
+    """Drift guard: judge.py's phantom detection must BE the shared rule
+    (``shared.phantom_verdict``), not a second copy of it.
+
+    Task 3287 hoisted the rule to ``shared`` because its two new consumers
+    cannot import judge.py — ``journal.py`` would be a circular import
+    (judge.py already imports journal at module scope) and the ``dashboard``
+    package deliberately does not depend on ``fused-memory`` at all.  The
+    hoist is only worth anything if judge.py DELEGATES rather than keeping a
+    parallel implementation, so that is what these cases pin.
+
+    The class above (``TestIsPhantomVerdict``, task 3070) stays untouched and
+    remains the behavioural net: together, "the behaviour is still right" and
+    "the behaviour comes from one place" are the two halves of the contract.
+    """
+
+    def test_issue_prefix_constant_is_rebound_from_shared(self):
+        """Identity, not equality: the prefix must be THE shared object.
+
+        This is the load-bearing half of the constant guard.  ``'Judge
+        response could not be parsed'`` contains spaces, so CPython does not
+        intern it — a re-typed literal in judge.py would be an equal but
+        distinct object and this assertion goes red.
+        """
+        assert judge_module._UNPARSEABLE_ISSUE_PREFIX is UNPARSEABLE_ISSUE_PREFIX
+
+    def test_verdict_code_constant_is_rebound_from_shared(self):
+        """Same identity check for the structured marker.
+
+        Honest caveat: this assertion is WEAKER than it looks and passed even
+        before the hoist.  ``'unparseable_judge_response'`` is
+        identifier-shaped (alphanumerics + underscores only), so CPython
+        interns it at compile time and two independently-typed literals are
+        already the same object.  It is kept because it becomes meaningful the
+        moment the marker gains a non-identifier character (a space, a hyphen,
+        a colon), and because a reader comparing the two constant guards
+        should not have to wonder why only one exists.  The real drift guard
+        for this constant is the equivalence corpus below, which fails for any
+        divergence in either constant regardless of interning.
+        """
+        assert judge_module._UNPARSEABLE_VERDICT_CODE is UNPARSEABLE_VERDICT_CODE
+
+    @pytest.mark.parametrize(
+        ('severity', 'findings'),
+        [
+            pytest.param(
+                VerdictSeverity.serious,
+                [_marked_phantom_finding()],
+                id='marked-phantom-serious',
+            ),
+            pytest.param(
+                VerdictSeverity.moderate,
+                [_marked_phantom_finding()],
+                id='marked-phantom-moderate-severity-agnostic',
+            ),
+            pytest.param(
+                VerdictSeverity.serious,
+                [_legacy_phantom_finding()],
+                id='legacy-unmarked-phantom',
+            ),
+            pytest.param(
+                VerdictSeverity.moderate,
+                [_legacy_phantom_finding()],
+                id='legacy-shape-at-moderate',
+            ),
+            pytest.param(
+                VerdictSeverity.serious,
+                [
+                    {
+                        'issue': f'Substantive content issue #{i}',
+                        'severity': 'serious',
+                        'recommendation': f'Fix issue #{i}',
+                    }
+                    for i in range(5)
+                ],
+                id='genuine-five-finding-serious-bc9459b8',
+            ),
+            pytest.param(
+                VerdictSeverity.serious,
+                [_legacy_phantom_finding(), {'issue': 'A second, genuine finding'}],
+                id='two-findings-not-phantom',
+            ),
+            pytest.param(
+                VerdictSeverity.serious,
+                [
+                    {
+                        'issue': (
+                            'Note: the historical "Judge response could not be '
+                            'parsed" error was a logging artifact.'
+                        )
+                    }
+                ],
+                id='prefix-mentioned-mid-string',
+            ),
+            pytest.param(VerdictSeverity.serious, [], id='empty-findings'),
+            pytest.param(VerdictSeverity.ok, [], id='ordinary-ok'),
+            pytest.param(
+                VerdictSeverity.minor,
+                [{'issue': 'minor drift in entity summary wording'}],
+                id='ordinary-minor',
+            ),
+            pytest.param(VerdictSeverity.serious, [{}], id='finding-without-issue'),
+            pytest.param(
+                VerdictSeverity.serious, [{'issue': None}], id='issue-is-none'
+            ),
+        ],
+    )
+    def test_model_api_agrees_with_shared_row_predicate(self, severity, findings):
+        """The model-typed API and the row-level primitive must never disagree.
+
+        This is the guard that actually catches divergence: it compares the
+        two implementations' ANSWERS across every shape task 3070 and task
+        3287 care about, so a judge.py edit that changes a conjunct — or a
+        constant, interned or not — turns this red even though the public
+        signature is unchanged.
+        """
+        verdict = JudgeVerdict(
+            run_id='run-equivalence',
+            reviewed_at=datetime.now(UTC),
+            severity=severity,
+            findings=findings,
+        )
+        assert is_phantom_verdict(verdict) is is_phantom_verdict_row(severity, findings)
 
 
 # --- Error trend detection tests ---
