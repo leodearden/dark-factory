@@ -23,6 +23,7 @@ from datetime import datetime
 import lms_manifest
 import lms_vram
 import pytest
+from pydantic import ValidationError
 
 # Verbatim `nvidia-smi --query-gpu=memory.total,memory.used,memory.free
 # --format=csv,noheader,nounits` output captured on this host 2026-08-05.
@@ -592,7 +593,7 @@ def test_parse_compute_apps_keeps_a_comma_inside_a_process_name():
 def test_a_consumer_is_frozen():
     consumer = lms_vram.GpuConsumer(pid=7575, process_name='python', used_mib=4050)
 
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         consumer.used_mib = 0
 
 

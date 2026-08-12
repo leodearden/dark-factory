@@ -85,6 +85,28 @@ _NVIDIA_SMI_IDENTITY_QUERY = [
     '--format=csv,noheader',
 ]
 
+#: WHO holds the card, as opposed to HOW MUCH of it is held.  `memory.used`
+#: above cannot distinguish an arm's own allocation from a foreign process
+#: that happened to be resident at the same moment (task 3755).
+_NVIDIA_SMI_COMPUTE_APPS_QUERY = [
+    'nvidia-smi',
+    '--query-compute-apps=pid,process_name,used_memory',
+    '--format=csv,noheader,nounits',
+]
+
+#: What the consumer list is, and — more importantly — what it is not.
+#: Travels into the health artifact beside every inventory so a downstream
+#: reader cannot mistake it for a balance sheet of the card.
+CONSUMER_INVENTORY_NOTE = (
+    'INVENTORY, not an accounting: `nvidia-smi --query-compute-apps` lists only '
+    'CUDA compute applications. It does not list the KDE/X11 graphics contexts '
+    '(Xorg, plasmashell, kwin_x11, and ~40 small KDE clients) that hold the '
+    'remaining ~3.3 GiB on this host — which is exactly why the measured '
+    f'operating budget is ~{MEASURED_OPERATING_BUDGET_GIB} GiB rather than '
+    f'{NOMINAL_CEILING_GIB}. These entries name who else held the card; they do '
+    'not sum to memory.used.'
+)
+
 _INTEGER = re.compile(r'^\d+$')
 
 #: used + free never sums exactly to total (driver/ECC reserve ~450 MiB here),
@@ -140,6 +162,26 @@ class GpuIdentity(BaseModel):
 
     name: str
     driver_version: str
+
+
+class GpuConsumer(BaseModel):
+    """One CUDA compute application holding VRAM, as nvidia-smi names it.
+
+    The unit of :data:`CONSUMER_INVENTORY_NOTE`.  ``memory.used`` answers how
+    much of the card is held; this answers by whom, which is the only thing
+    that can tell an arm's own allocation apart from a foreign process that
+    happened to be resident at the same moment.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    pid: int
+    process_name: str
+    used_mib: int
+
+    @property
+    def used_gib(self) -> float:
+        return round(self.used_mib / MIB_PER_GIB, 2)
 
 
 class GpuSnapshot(BaseModel):
@@ -301,6 +343,84 @@ def probe_gpu_identity(runner: GpuRunner | None = None) -> GpuIdentity:
             f'could not run {" ".join(_NVIDIA_SMI_IDENTITY_QUERY)}: {exc}'
         ) from exc
     return parse_nvidia_smi_identity_csv(output)
+
+
+def parse_nvidia_smi_compute_apps_csv(text: str) -> list[GpuConsumer]:
+    """Parse `--query-compute-apps=pid,process_name,used_memory` rows.
+
+    EMPTY OUTPUT IS A LEGITIMATE EMPTY LIST, and that is the one place this
+    parser is deliberately laxer than :func:`parse_nvidia_smi_csv`.  A card
+    with no compute application on it prints nothing at all, and that is
+    precisely the reading a clean baseline is supposed to produce; raising
+    there would make the healthiest possible slate the one this tooling
+    refuses to record.  A row that is PRESENT but unreadable is the opposite
+    case and always raises: a blank, ``[N/A]``, non-integer or unit-suffixed
+    field, a header row (the caller dropped ``noheader``), or fewer than three
+    fields.
+
+    One bad row poisons the whole inventory rather than being skipped.  A
+    partial list that reads as complete is exactly what would let an unlisted
+    holder pass for absent — the failure this guard exists to prevent.
+
+    Each row is split on its FIRST and LAST comma, not on every comma: a
+    process path may legitimately contain one, and treating that as a
+    field-count error would turn a real (possibly large) GPU holder into a
+    blanket refusal.
+    """
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+    consumers: list[GpuConsumer] = []
+    for line in lines:
+        first = line.find(',')
+        last = line.rfind(',')
+        if first == -1 or last == first:
+            raise VramProbeError(
+                f'expected 3 comma-separated fields (pid, process_name, '
+                f'used_memory) in compute-apps row {line!r}'
+            )
+
+        pid_field = line[:first].strip()
+        process_name = line[first + 1:last].strip()
+        used_field = line[last + 1:].strip()
+
+        if not _INTEGER.match(pid_field) or not _INTEGER.match(used_field):
+            raise VramProbeError(
+                f'nvidia-smi compute-apps row {line!r} carries a non-integer pid '
+                'or used_memory. A blank, a [N/A], a units suffix (the caller '
+                'dropped `nounits`) or a header row all land here; none may be '
+                'coerced to 0, which would hide a process holding the card'
+            )
+        if not process_name or process_name.startswith('[N/A'):
+            raise VramProbeError(
+                f'nvidia-smi compute-apps row {line!r} names no process; an '
+                'anonymous holder cannot be told apart from the arm itself'
+            )
+
+        consumers.append(GpuConsumer(
+            pid=int(pid_field),
+            process_name=process_name,
+            used_mib=int(used_field),
+        ))
+
+    return consumers
+
+
+def probe_gpu_consumers(runner: GpuRunner | None = None) -> list[GpuConsumer]:
+    """Read who currently holds VRAM on this card.
+
+    Same injected-runner discipline as :func:`probe_gpu`: the subprocess never
+    runs in this suite, and a probe failure raises rather than yielding an
+    empty list.  An empty list means "nobody holds the card", which is a
+    materially different claim from "the probe did not run".
+    """
+    run = runner if runner is not None else _default_runner
+    try:
+        output = run(list(_NVIDIA_SMI_COMPUTE_APPS_QUERY))
+    except Exception as exc:
+        raise VramProbeError(
+            f'could not run {" ".join(_NVIDIA_SMI_COMPUTE_APPS_QUERY)}: {exc}'
+        ) from exc
+    return parse_nvidia_smi_compute_apps_csv(output)
 
 
 def probe_gpu_snapshot(runner: GpuRunner | None = None) -> GpuSnapshot:
