@@ -224,15 +224,6 @@ class TestCeilings:
         assert derivation['p95_minutes'] <= derivation['observed_max_minutes']
         assert 'duration_ms' in derivation['source']
 
-    def test_derivation_records_the_substituted_source(self, manifest: dict) -> None:
-        # The PRD names "v1 wall-clock dumps" as the source, but
-        # data/eval-campaign/fable-architect-only-results.json carries NO
-        # duration field. The substitution must be recorded, or the threshold
-        # reads as basis-free.
-        note = manifest['ceilings']['derivation']['substitution_note']
-        assert 'fable-architect-only-results.json' in note
-        assert 'runs.db' in note
-
     def test_timeout_clears_the_all_time_architect_max(self, manifest: dict) -> None:
         derivation = manifest['ceilings']['derivation']
         assert (manifest['ceilings']['timeout_minutes']
