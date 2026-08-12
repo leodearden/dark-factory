@@ -524,3 +524,55 @@ the curator after 4023 lands (spawn_context tag, curator dedup as safety)?
 (2) file which of the 5 re-file candidates? (3) 3726: proceed as the L1 half
 of the ratified combination (and resolve the 3465 collision)? (4) skill edits
 per B2 once signed off.
+
+---
+
+# Addendum C (2026-08-12): suggestion backfill executed — 130 tasks filed
+
+Per the operator's round-4 ruling (judge current value via workflow, file only
+what passes the bar), the recovered-suggestion corpus (780 tasks, 2,323 unique
+non-blocking review suggestions from `.worktrees/.task-meta/`) ran through a
+26-batch judge stage (verify-against-current-tree, default-SKIP rubric) and a
+per-batch adversarial confirm stage (reject-when-uncertain). Outcome:
+
+- **Skipped by judges: 1,888** — dominant reasons: trivial-nit ~447,
+  vague-non-actionable ~387, test-cosmetics ~367, stale-code-changed ~189,
+  already-fixed ~172, already-covered ~119, style-churn ~52 (CONTRIBUTING §3).
+- **Rejected by the adversarial gate: 167** (ledger preserved).
+- **Diverted to needs-human: 27** design-level items — must not become tasks
+  per the operator's design-concern norm; list embedded below for review.
+- **KEPT AND FILED: 130/130 created, zero failed/refused/combined** — tasks
+  **4040–4169**, each with verbatim judged content, priority, files, and
+  provenance (`source: review-suggestion-backfill`, origin task +
+  task 4023 cross-ref). Verified against tickets.db: 130 tickets, all
+  `created`, 130 unique task ids; content/priority readbacks spot-checked.
+- High-priority filed: **4124** (check-config prints OK + exit 0 on an
+  unparseable config — reproduced live), **4116** (write journal records
+  success=True for writes that never landed), **4121** (verify_cmd quote-splice
+  lets recovery flags land inside a -k expression), **4080**
+  (test_locking parents[5] skips cross-repo lock tests), **4130**
+  (stash_failed missing from steward destructive-git safety rule), **4169**
+  (steward system prompt self-contradiction on level=1 ownership).
+
+Ledgers (filed / rejected / needs-human / kept-candidates JSON) preserved at
+`~/.claude/fleet/sessions/investigate-df-2558759/`.
+
+**Needs-human list (27; design-level, not filed):** origin task → summary —
+2301 spawn-forest outstanding=False forcing; 2360 watchdog idle-kill bound
+broadened to every role; 2372 Layer-A classifier also applied at merge-phase
+recovery; 2383 INTEGRATION_SKEW still spawns branch-diff debugger; 2391
+main-tip-sweep admission-slot docstring claim; 2408 stranded-blocked
+redispatch unstated precondition; 2415 cross_graph_move MERGE-fold edge
+recreation; 2425 recon_report cited-task fold anchor keying; 2432 recon_report
+projectless dedup key; 2437 stage3 ledger-primary presence-check semantics;
+2511 session_hooks trusts inherited CLAUDE_S* env; 2559 recon prompts ship
+~200-line retired apparatus; 2561 _tag_task_modules permanent sentinel-freeze;
+2567 MAIN_PROBE worktree sharing; 2630 stale_task_scoped L2 auto-close
+carve-out breadth; 2768 merge-flake suppression inside drift-detective path;
+2822 full local merge-verify before every remote; 3018 ephemeral worktrees
+under merge_verify_lease; 3032 hardcoded MERGE_REMEDIABLE_ESC_CATEGORIES; 3363
+root_scan_succeeded vs per-eval internal_error; 3410 clamp_unit_score Infinity
+ordering; 3424 setup-host all-or-nothing unit gate; 3474 audit CLI prints
+before exit-3 check; 3764 shared 3-strike streak across failure classes; 3786
+isolated-rerun discriminator precedence; 3779 INV-8 narrowing exemption
+breadth; 3811 anti-drift note placement.
