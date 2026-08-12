@@ -793,3 +793,193 @@ class TestDeclaredTriState:
             Referent(kind='task', number='2500'),
             Referent(kind='task', project_id='dark_factory', number='2500'),
         )
+
+
+class TestConflictsAreReportedNotEnforced:
+    """``.conflicts`` names the DECLARED referents the scanned prose contradicts.
+
+    γ REPORTS; δ's ``_entities_gate`` decides whether to reject. A resolver
+    that silently degraded to the scan on conflict would produce a write the
+    caller never asked for, so ``.referents`` is deliberately left untouched.
+    """
+
+    def test_the_prd_headline_row_names_the_declared_referent(self):
+        """Content cites Task 3127, the caller declared 3129 — the
+        adjacent-number misattribution this PRD exists to prevent."""
+        resolution = resolve_referents(
+            declared=[{'kind': 'task', 'id': 3129}],
+            metadata={},
+            content='Fixed the bug in Task 3127.',
+            group_id=GROUP,
+        )
+        assert resolution.conflicts == (Referent(kind='task', number='3129'),)
+
+    def test_both_numbers_are_recoverable_so_the_gate_can_name_them_both(self):
+        """δ's structured error must name the declared referent AND what the
+        prose actually said. The declared side comes from ``.conflicts``; the
+        prose side is the derived resolution of the same content, which is
+        exactly what δ gets by resolving with ``declared=None``."""
+        content = 'Fixed the bug in Task 3127.'
+        declared = resolve_referents(
+            declared=[{'kind': 'task', 'id': 3129}],
+            metadata={},
+            content=content,
+            group_id=GROUP,
+        )
+        prose = resolve_referents(declared=None, metadata={}, content=content, group_id=GROUP)
+        assert declared.conflicts == (Referent(kind='task', number='3129'),)
+        assert prose.referents == (Referent(kind='task', number='3127'),)
+
+    def test_a_conflict_leaves_the_referents_untouched(self):
+        """γ is mechanism, δ is policy: degrading to the scan here would
+        silently write to a task the caller never declared."""
+        resolution = resolve_referents(
+            declared=[{'kind': 'task', 'id': 3129}],
+            metadata={},
+            content='Fixed the bug in Task 3127.',
+            group_id=GROUP,
+        )
+        assert resolution.referents == (Referent(kind='task', number='3129'),)
+        assert resolution.source == 'declared'
+
+    def test_agreement_is_not_a_conflict(self):
+        """PRD row: declared referent, correct endpoint -> declaration
+        honoured, no conflict."""
+        resolution = resolve_referents(
+            declared=[{'kind': 'task', 'id': 3127}],
+            metadata={},
+            content='Fixed the bug in Task 3127.',
+            group_id=GROUP,
+        )
+        assert resolution.conflicts == ()
+        assert resolution.referents == (Referent(kind='task', number='3127'),)
+
+    def test_a_declared_subset_of_the_scanned_referents_is_not_a_conflict(self):
+        """Prose that mentions MORE than the caller declared is normal: a
+        memory may cite several tasks while being ABOUT one."""
+        resolution = resolve_referents(
+            declared=[{'kind': 'task', 'id': 3129}],
+            metadata={},
+            content='Task 3127 and task 3129 both landed.',
+            group_id=GROUP,
+        )
+        assert resolution.conflicts == ()
+
+    def test_a_superset_conflicts_per_ref(self):
+        """The adjacent-number typo is caught even when another declared
+        referent IS corroborated — which is precisely what a set-level
+        "declared and scanned are disjoint" verdict would miss."""
+        resolution = resolve_referents(
+            declared=[{'kind': 'task', 'id': 3127}, {'kind': 'task', 'id': 3129}],
+            metadata={},
+            content='Fixed the bug in Task 3127.',
+            group_id=GROUP,
+        )
+        assert resolution.conflicts == (Referent(kind='task', number='3129'),)
+        assert resolution.referents == (
+            Referent(kind='task', number='3127'),
+            Referent(kind='task', number='3129'),
+        )
+
+    @pytest.mark.parametrize(
+        'content',
+        [
+            'the merge-lane hardening task',
+            'Task θ2=2184 is the one that landed.',
+            'Reworked 1251 and the watcher backstop.',
+        ],
+        ids=['title-only', 'greek-alias', 'bare-digit-node-name'],
+    )
+    def test_the_scanners_blind_list_never_manufactures_a_conflict(self, content):
+        """The load-bearing consequence of resolved decision 8: the scanner
+        cannot see title-only references, Greek aliases or bare-digit node
+        names, so its SILENCE is uninformative and must never reject an honest
+        write. An empty per-kind scan never conflicts."""
+        resolution = resolve_referents(
+            declared=[{'kind': 'task', 'id': 3129}],
+            metadata={},
+            content=content,
+            group_id=GROUP,
+        )
+        assert resolution.conflicts == ()
+
+    def test_precision_fixtures_never_manufacture_a_conflict(self):
+        """A source location is not a task mention, so declaring 2091 against
+        'graphiti_client.py:2091' must not read as a contradiction."""
+        resolution = resolve_referents(
+            declared=[{'kind': 'task', 'id': 2091}],
+            metadata={},
+            content='raised at graphiti_client.py:2091',
+            group_id=GROUP,
+        )
+        assert resolution.conflicts == ()
+
+    def test_the_project_axis_conflicts(self):
+        """The prose names a DIFFERENT project's task with the same number —
+        the cross-project collapse this PRD exists to detect, and invisible to
+        any rule that compared bare numbers."""
+        resolution = resolve_referents(
+            declared=[{'kind': 'task', 'id': 3129}],
+            metadata={},
+            content='mirrors reify:3129',
+            group_id=GROUP,
+        )
+        assert resolution.conflicts == (Referent(kind='task', number='3129'),)
+
+    def test_a_declaration_resolves_an_ambiguity_rather_than_contradicting_it(self):
+        """Membership is tested against ``refs | ambiguous``, so naming an
+        ambiguous referent SETTLES the contest the prose left open — the single
+        most useful thing a declaration can do."""
+        resolution = resolve_referents(
+            declared=[{'kind': 'task', 'id': 2500}],
+            metadata={},
+            content='task 2500 duplicates dark_factory:2500',
+            group_id='reify',
+        )
+        assert resolution.conflicts == ()
+        assert resolution.source == 'declared'
+        assert resolution.referents == (Referent(kind='task', number='2500'),)
+        assert resolution.ambiguous == (
+            Referent(kind='task', number='2500'),
+            Referent(kind='task', project_id='dark_factory', number='2500'),
+        )
+
+    def test_an_empty_declaration_never_conflicts(self):
+        """Re-pinned here alongside the positive cases: rejecting on ABSENCE is
+        what resolved decision 3 forbids."""
+        resolution = resolve_referents(
+            declared=[], metadata={}, content='Fixed the bug in Task 3127.', group_id=GROUP
+        )
+        assert resolution.conflicts == ()
+
+    def test_conflicts_are_deduped_and_in_declared_order(self):
+        resolution = resolve_referents(
+            declared=[
+                {'kind': 'task', 'id': 3129},
+                {'kind': 'task', 'id': 2500},
+                {'kind': 'task', 'id': '3129'},
+            ],
+            metadata={},
+            content='Fixed the bug in Task 3127.',
+            group_id=GROUP,
+        )
+        assert resolution.conflicts == (
+            Referent(kind='task', number='3129'),
+            Referent(kind='task', number='2500'),
+        )
+
+    @pytest.mark.parametrize(
+        'declared,metadata',
+        [(None, {'task_id': 3129}), (None, {})],
+        ids=['metadata', 'derived'],
+    )
+    def test_the_lower_sources_never_conflict(self, declared, metadata):
+        """Conflicts are a property of what the CALLER declared, never of
+        ambient harness state and never of the scan against itself."""
+        resolution = resolve_referents(
+            declared=declared,
+            metadata=metadata,
+            content='Fixed the bug in Task 3127.',
+            group_id=GROUP,
+        )
+        assert resolution.conflicts == ()
