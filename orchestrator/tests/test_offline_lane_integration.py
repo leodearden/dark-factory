@@ -592,6 +592,80 @@ def _materialized_worktree_names(worktree_base: Path) -> set[str]:
 
 
 # ---------------------------------------------------------------------------
+# Timeout-bound invariants (task 4030)
+# ---------------------------------------------------------------------------
+
+
+def test_every_composing_caller_carries_a_timeout_override() -> None:
+    """Every test that composes bounded waits PAST a single `_run_lane` pass
+    must carry its own `@pytest.mark.timeout` override wide enough to cover
+    its own worst-case bounded-wait sum — otherwise it can silently collide
+    with this module's pyproject-configured 60s per-test default.
+
+    Makes WORK item 2's open re-verification question ("does EVERY chaining
+    caller carry such an override?") executable rather than prose. The table
+    below maps each composing test FUNCTION OBJECT — never a string, so a
+    rename breaks this test loudly instead of silently dropping a row — to
+    its worst-case bounded-wait sum, expressed in terms of this module's
+    named timeout constants (never bare literals).
+
+    ``test_b2_coalesces_burst_of_advances_to_one_rerun`` is deliberately
+    ABSENT from this table: it starts `_run_lane(expected_passes=2)` via
+    `asyncio.create_task` and then awaits `runner.wait_entered()` — those two
+    bounded waits race the SAME wall clock (max, not sum), so its worst case
+    is a single `_LANE_PASS_BOUND_SECS`, the marker-less budget
+    `test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling` pins.
+
+    Correlation is done via `fn.pytestmark` introspection — pytest's own
+    applied-marker list for a given test function — rather than the coarse
+    `_TIMEOUT_MARKER_RE` text scan `test_lane_lock_leak_guard.py`'s sibling
+    invariant (`test_no_foreign_holder_consumer_opts_out_of_the_global_timeout`)
+    uses. That invariant only needs to know whether ANY
+    `@pytest.mark.timeout` appears ANYWHERE in a file, so a deliberately
+    coarse regex is an acceptable, cheap check for it. This invariant is
+    finer-grained: it must correlate a marker to a SPECIFIC test and compare
+    its VALUE against that test's own computed worst case. `fn.pytestmark`
+    gives that directly, with no AST analysis and no false positives from
+    this module's own prose mentions of the marker.
+    """
+    worst_case_secs = {
+        test_b5_same_set_recurrence_updates_not_duplicates: 2 * _LANE_PASS_BOUND_SECS,
+        test_b7_stall_promotes_to_blocker: 6 * _LANE_PASS_BOUND_SECS,
+        test_b3_never_a_gate: (
+            _LANE_PASS_BOUND_SECS
+            + _NOTE_OFFLINE_LANE_BOUND_SECS
+            + _NOTE_MERGE_ALL_BOUND_SECS
+        ),
+    }
+    for fn, worst_case in worst_case_secs.items():
+        markers = [m for m in fn.pytestmark if m.name == 'timeout']
+        assert markers, (
+            f'{fn.__name__} composes bounded waits to a worst case of '
+            f'{worst_case}s but carries no @pytest.mark.timeout override. '
+            f'Left uncovered, this can silently collide with the 60s '
+            f'orchestrator/pyproject.toml per-test default — under '
+            f'timeout_method="thread" with --max-worker-restart=0, '
+            f'pytest-timeout os._exit()s the xdist worker instead of '
+            f"failing cleanly, discarding _run_lane's own well-located "
+            f'TimeoutError. Add @pytest.mark.timeout(N) with N > {worst_case}.'
+        )
+        value = markers[0].args[0] if markers[0].args else markers[0].kwargs.get(
+            'timeout', markers[0].kwargs.get('seconds'),
+        )
+        assert value > worst_case, (
+            f'{fn.__name__} carries @pytest.mark.timeout({value}) but its '
+            f'own worst-case bounded-wait sum is {worst_case}s — the '
+            f'override does not actually clear what it exists to cover. '
+            f'Left uncovered, this can silently collide with the 60s '
+            f'orchestrator/pyproject.toml per-test default — under '
+            f'timeout_method="thread" with --max-worker-restart=0, '
+            f'pytest-timeout os._exit()s the xdist worker instead of '
+            f"failing cleanly, discarding _run_lane's own well-located "
+            f'TimeoutError.'
+        )
+
+
+# ---------------------------------------------------------------------------
 # B1 — advance triggers a from-head run
 # ---------------------------------------------------------------------------
 
