@@ -744,7 +744,6 @@ def _atomic_write_plan(path: Path, plan: dict) -> None:
 
     plan['_schema_version'] = PLAN_SCHEMA_VERSION
     payload = json.dumps(plan, indent=2) + '\n'
-    mode = _target_file_mode(target)
 
     fd, tmp_name = tempfile.mkstemp(
         dir=target.parent, prefix='.plan.json.', suffix='.tmp'
@@ -758,7 +757,12 @@ def _atomic_write_plan(path: Path, plan: dict) -> None:
         # Before the swap, never after: the replaced file must already carry the
         # right bits, or a reader between the two calls sees the 0600 mkstemp
         # forced — a window with the same shape as the torn read B12 forbids.
-        os.chmod(tmp_path, mode)
+        # Looked up HERE, inside the wrapper, so a stat() failure other than
+        # FileNotFoundError (EACCES, ELOOP, ENAMETOOLONG — _target_file_mode
+        # deliberately swallows only the former) surfaces as PlanWriteError
+        # naming the path, per this function's own docstring, instead of
+        # escaping bare before the try block ever ran.
+        os.chmod(tmp_path, _target_file_mode(target))
         _verify_plan_json(tmp_path)
         os.replace(tmp_path, target)
     except Exception as exc:
