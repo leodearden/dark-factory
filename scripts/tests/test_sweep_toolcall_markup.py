@@ -507,3 +507,147 @@ def test_discovery_tolerates_absent_lane_directories(tmp_path):
     error.
     """
     assert sweep.discover_targets(tmp_path / 'empty-root') == []
+
+
+# ---------------------------------------------------------------------------
+# step-3 — the must-not-touch guard, DECLARED and machine-checked.
+# ---------------------------------------------------------------------------
+
+#: Repo-relative path of the second committed-evidence file: 41 verbatim leak
+#: records captured by the 2026-08-05 dry-run sweep.
+DRY_RUN_REPORT_REL = 'docs/toolcall-xml-leak-sweep-2026-08-05/dry-run-report.json'
+
+
+def test_never_touch_is_a_declared_frozenset_naming_both_evidence_files():
+    """The guard is a DECLARED constant, not an emergent property of the glob.
+
+    Discovery already fails to yield these two files, so this constant is
+    strictly redundant against today's ``discover_targets`` — and that is the
+    point. It is defence in depth against a future widening of the globs, and
+    it makes the "never touch committed evidence" rule greppable rather than
+    implicit in a path pattern.
+    """
+    assert isinstance(sweep.NEVER_TOUCH, frozenset)
+    assert INVENTORY_REL in sweep.NEVER_TOUCH
+    assert DRY_RUN_REPORT_REL in sweep.NEVER_TOUCH
+
+
+def test_never_touch_refuses_a_directly_handed_target(sweep_root):
+    """Handed straight to the writer gate, bypassing discovery, it still refuses.
+
+    The realistic path to this bug is not a bad glob — it is an operator (or a
+    future caller) passing a path in directly. The guard has to live at the
+    write boundary, not only at discovery.
+    """
+    evidence = sweep_root / INVENTORY_REL
+    write_escalation(evidence, {'specimen': 'quoted leak text'})
+    before = evidence.read_bytes()
+
+    outcome = sweep.resolve_write_target(
+        sweep.Target(path=evidence, lane=sweep.LANE_ESCALATIONS), sweep_root
+    )
+
+    assert isinstance(outcome, sweep.Refusal)
+    assert outcome.reason == sweep.REASON_NEVER_TOUCH
+    assert str(evidence) in str(outcome.path), 'the refusal must name the path'
+    assert evidence.read_bytes() == before
+
+
+def test_never_touch_refuses_via_realpath_not_just_the_literal_path(sweep_root):
+    """A symlink whose TARGET is committed evidence is refused too.
+
+    Checking only the discovered path would be defeated by exactly the shape
+    this corpus is full of: every live orphaned plan is a symlink. The guard
+    resolves first, then matches.
+    """
+    evidence = sweep_root / DRY_RUN_REPORT_REL
+    write_escalation(evidence, {'records': ['verbatim leak']})
+    before = evidence.read_bytes()
+
+    link = sweep_root / '.worktrees-orphaned' / '9003-2026' / '.task' / 'plan.json'
+    link.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(str(evidence), str(link))
+
+    outcome = sweep.resolve_write_target(
+        sweep.Target(path=link, lane=sweep.LANE_PLANS), sweep_root
+    )
+
+    assert isinstance(outcome, sweep.Refusal)
+    assert outcome.reason == sweep.REASON_NEVER_TOUCH, (
+        'never-touch must be checked BEFORE the plan-location gate, so the '
+        'refusal names the real hazard rather than a generic location miss'
+    )
+    assert evidence.read_bytes() == before
+
+
+def test_plan_symlink_outside_the_sanctioned_locations_is_refused(sweep_root, tmp_path):
+    """A plan link resolving anywhere else gets a DISTINCT reason.
+
+    The two sanctioned locations are the orphaned worktree's own ``.task/``
+    (a plain file) and ``<root>/.worktrees/.task-meta/<id>/plan.json`` (the
+    shared meta-root all five live orphaned plans point into). Anything else
+    means the link is not what this sweep thinks it is, and following it would
+    write through to an unknown file.
+    """
+    outside = tmp_path / 'elsewhere' / 'plan.json'
+    write_plan(outside, make_plan('9004', ['clean']))
+    before = outside.read_bytes()
+
+    link = sweep_root / '.worktrees-orphaned' / '9004-2026' / '.task' / 'plan.json'
+    link.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(str(outside), str(link))
+
+    outcome = sweep.resolve_write_target(
+        sweep.Target(path=link, lane=sweep.LANE_PLANS), sweep_root
+    )
+
+    assert isinstance(outcome, sweep.Refusal)
+    assert outcome.reason == sweep.REASON_UNSANCTIONED_PLAN_LOCATION
+    assert outcome.reason != sweep.REASON_NEVER_TOUCH, 'a DISTINCT reason'
+    assert outside.read_bytes() == before
+
+
+def test_sanctioned_plan_targets_resolve(sweep_root):
+    """Both sanctioned shapes resolve, and the meta-root link resolves THROUGH.
+
+    The resolved ``write_path`` is what ``os.replace`` will land on, so for the
+    symlinked plan it must be the meta-root FILE, never the link itself —
+    replacing the link with a regular file re-forks the lane and meta-root
+    copies (the esc-5205-9 divergence plan_tools:715 documents).
+    """
+    plain = sweep_root / '.worktrees-orphaned' / '9001-2026' / '.task' / 'plan.json'
+    resolved = sweep.resolve_write_target(
+        sweep.Target(path=plain, lane=sweep.LANE_PLANS), sweep_root
+    )
+    assert isinstance(resolved, sweep.ResolvedTarget)
+    assert resolved.write_path == plain
+
+    link = sweep_root / '.worktrees-orphaned' / '9002-2026' / '.task' / 'plan.json'
+    resolved_link = sweep.resolve_write_target(
+        sweep.Target(path=link, lane=sweep.LANE_PLANS), sweep_root
+    )
+    assert isinstance(resolved_link, sweep.ResolvedTarget)
+    assert resolved_link.write_path == (
+        sweep_root / '.worktrees' / '.task-meta' / '9002' / 'plan.json'
+    )
+    assert resolved_link.write_path != link, 'must resolve THROUGH the symlink'
+
+
+def test_refusals_are_returned_not_raised(sweep_root):
+    """Refusals are structured VALUES carrying (path, lane, reason).
+
+    Never raised-and-swallowed: `scripts` is inside
+    shared/tests/silent_fallthrough_scan.py's _SCOPE_ROOTS, so a broad
+    `except Exception` funnelling into a default would trip the ratchet — and
+    would also lose the reason a human needs to adjudicate the refusal.
+    """
+    evidence = sweep_root / INVENTORY_REL
+    write_escalation(evidence, {'specimen': 'x'})
+    refusal = sweep.resolve_write_target(
+        sweep.Target(path=evidence, lane=sweep.LANE_ESCALATIONS), sweep_root
+    )
+    assert isinstance(refusal, tuple), 'a NamedTuple value, not an exception'
+    assert isinstance(refusal, sweep.Refusal)
+    assert refusal.path is not None
+    assert refusal.lane == sweep.LANE_ESCALATIONS
+    assert isinstance(refusal.reason, str) and refusal.reason

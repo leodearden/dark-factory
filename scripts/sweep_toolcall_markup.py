@@ -53,6 +53,7 @@ lines 52-62. If you need a literal here, import it; do not type it.
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import NamedTuple
@@ -84,12 +85,18 @@ __all__ = [
     'INVOKE_CLOSER',
     'LANE_ESCALATIONS',
     'LANE_PLANS',
+    'NEVER_TOUCH',
     'PREFILTER_NEEDLES',
+    'REASON_NEVER_TOUCH',
+    'REASON_UNSANCTIONED_PLAN_LOCATION',
+    'Refusal',
     'Repair',
+    'ResolvedTarget',
     'Target',
     'detect',
     'discover_targets',
     'repair',
+    'resolve_write_target',
 ]
 
 # ---------------------------------------------------------------------------
@@ -187,3 +194,131 @@ def discover_targets(root: Path | str) -> list[Target]:
                 targets.append(Target(path=candidate, lane=LANE_PLANS))
 
     return sorted(targets)
+
+
+# ---------------------------------------------------------------------------
+# The must-not-touch guard, and write-target resolution.
+# ---------------------------------------------------------------------------
+
+#: Repo-relative paths this sweep must NEVER rewrite, whatever it is handed.
+#:
+#: Both are COMMITTED EVIDENCE that legitimately quotes leak specimens, so
+#: their corrupted-looking strings are the artifact, not a defect:
+#:
+#: * ``docs/task-recovery-2026-05-13/worktree-inventory.json`` — 355 KB of
+#:   git-tracked recovery inventory quoting real specimens. It is replicated
+#:   into EVERY worktree checkout, so it appears beneath every orphaned lane;
+#:   that is what makes it the likeliest thing a widened plans glob would eat.
+#: * ``docs/toolcall-xml-leak-sweep-2026-08-05/dry-run-report.json`` — the 41
+#:   verbatim leak records captured by the earlier dry-run sweep. "Repairing"
+#:   the report of a leak destroys the record OF the leak.
+#:
+#: Finding 4 of the capability manifest names both. This constant is strictly
+#: redundant against today's :func:`discover_targets`, which cannot yield
+#: either — and that redundancy is the point. It is defence in depth against a
+#: future widening of the globs, and it makes the rule greppable rather than
+#: implicit in a path pattern.
+NEVER_TOUCH: frozenset[str] = frozenset({
+    'docs/task-recovery-2026-05-13/worktree-inventory.json',
+    'docs/toolcall-xml-leak-sweep-2026-08-05/dry-run-report.json',
+})
+
+#: Refusal reasons. Named constants rather than inline strings so the report
+#: renderer, the tests and the operator all key on ONE spelling.
+REASON_NEVER_TOUCH = 'never-touch'
+REASON_UNSANCTIONED_PLAN_LOCATION = 'unsanctioned-plan-location'
+
+#: The shared meta-root a lane's plan.json is symlinked into.
+_META_ROOT = ('.worktrees', '.task-meta')
+
+
+class ResolvedTarget(NamedTuple):
+    """A target cleared for writing, with the path the swap will land on."""
+
+    #: The path as discovered — the link, when the target is a symlink.
+    path: Path
+    lane: str
+    #: The ``os.path.realpath``-resolved file. THIS is what ``os.replace``
+    #: must land on. Landing on the LINK instead would replace it with a
+    #: regular file and re-fork the lane and meta-root copies — the esc-5205-9
+    #: stale-plan divergence ``plan_tools._atomic_write_plan`` documents at
+    #: line 715.
+    write_path: Path
+
+
+class Refusal(NamedTuple):
+    """A target this sweep declines to write, and why.
+
+    Returned as a VALUE, never raised-and-swallowed. ``scripts`` is inside
+    ``shared/tests/silent_fallthrough_scan.py``'s ``_SCOPE_ROOTS``, so a broad
+    ``except Exception`` funnelling into a default would trip the ratchet — and
+    would also discard the reason a human needs in order to adjudicate the
+    refusal. Every refusal reaches the report.
+    """
+
+    path: Path
+    lane: str
+    reason: str
+
+
+def _matches_never_touch(path: Path) -> bool:
+    """True if *path* ends with a :data:`NEVER_TOUCH` entry, component-wise.
+
+    Anchored on a ``/`` boundary so a sibling like
+    ``…/not-the-worktree-inventory.json`` cannot match by mere suffix.
+    """
+    text = path.as_posix()
+    return any(text == rel or text.endswith('/' + rel) for rel in NEVER_TOUCH)
+
+
+def _is_sanctioned_plan_location(resolved: Path, root_real: Path) -> bool:
+    """True if *resolved* is one of the two shapes a plan may legally be.
+
+    Measured at plan time: all five live ``.worktrees-orphaned/*/.task/
+    plan.json`` are ABSOLUTE symlinks into ``<root>/.worktrees/.task-meta/
+    <id>/plan.json``. Both that shape and a plain file in the orphaned
+    worktree's own ``.task/`` are sanctioned; anything else means the link is
+    not what this sweep believes it is, and following it would write through to
+    an unknown file.
+    """
+    try:
+        parts = resolved.relative_to(root_real).parts
+    except ValueError:
+        return False  # resolves outside the repo root entirely
+    if len(parts) != 4:
+        return False
+    if parts[0] == _ORPHANED_DIR and parts[2:] == _PLAN_TAIL:
+        return True
+    return parts[:2] == _META_ROOT and parts[3] == 'plan.json'
+
+
+def resolve_write_target(target: Target, root: Path | str) -> ResolvedTarget | Refusal:
+    """Clear *target* for writing, or refuse it with a reason.
+
+    Resolves symlinks FIRST and matches the guards against the resolved path as
+    well as the literal one. Checking only the discovered path would be
+    defeated by exactly the shape this corpus is full of — every live orphaned
+    plan is a symlink — so a link pointing at committed evidence has to be
+    caught by its target, not its name.
+
+    :data:`NEVER_TOUCH` is checked BEFORE the plan-location gate so the refusal
+    names the real hazard rather than a generic location miss.
+
+    This function performs no I/O beyond path resolution and never writes.
+    """
+    root_real = Path(os.path.realpath(root))
+    resolved = Path(os.path.realpath(target.path))
+
+    if _matches_never_touch(target.path) or _matches_never_touch(resolved):
+        return Refusal(path=target.path, lane=target.lane, reason=REASON_NEVER_TOUCH)
+
+    if target.lane == LANE_PLANS and not _is_sanctioned_plan_location(
+        resolved, root_real
+    ):
+        return Refusal(
+            path=target.path,
+            lane=target.lane,
+            reason=REASON_UNSANCTIONED_PLAN_LOCATION,
+        )
+
+    return ResolvedTarget(path=target.path, lane=target.lane, write_path=resolved)
