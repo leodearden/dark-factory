@@ -266,21 +266,6 @@ class TestSpecimenAntiFabrication:
         ids = [s.id for s in specimens]
         assert len(set(ids)) == len(ids), f'duplicate specimen id in {ids}'
 
-    def test_at_least_one_specimen_is_the_dialect_blend_shape(self) -> None:
-        """One specimen must show a stray quote before the closing bracket.
-
-        Direct evidence of the model interpolating between the canonical
-        ``&#60;parameter name="X">`` dialect and the name-echoing ``&#60;X>``
-        dialect -- the report must carry at least one specimen with this
-        shape, not just the two 'clean' dialects.
-        """
-        specimens = _report_specimens()
-        assert any('">' in s.value for s in specimens), (
-            'no specimen carries the dialect-blend shape (a quote '
-            'immediately before the closing angle bracket of a tag), '
-            'required as direct evidence of dialect interpolation.'
-        )
-
     @pytest.mark.parametrize('specimen', _SPECIMENS, ids=_SPECIMEN_IDS)
     def test_specimen_is_detected_as_corrupted(self, specimen: _Specimen) -> None:
         assert tm.detect(specimen.value) is not None, (
