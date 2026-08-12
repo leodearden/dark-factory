@@ -52,6 +52,9 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import NamedTuple
+
+import pytest
 
 import shared.toolcall_markup as tm
 
@@ -123,3 +126,188 @@ class TestContainment:
             f'alternative at {match!r} — a future re-extraction of the '
             'transcript archive could pick this report up as a specimen.'
         )
+
+
+# ---------------------------------------------------------------------------
+# Specimen anti-fabrication gate
+#
+# Each specimen in the report carries a one-line, machine-readable HTML
+# comment immediately above its fenced block: id / tool / param / supplied /
+# schema / dropped. HTML comments are invisible in rendered markdown, so an
+# upstream reader sees a clean document while this module gets an
+# unambiguous parse target -- deliberately not a sidecar data file (which
+# would break self-containment: the .md gets filed upstream on its own and
+# a sidecar would stay behind) and not a parse of the visible prose table
+# (which would drift on harmless formatting edits and would smuggle in the
+# prose-pinning rule 5 forbids).
+# ---------------------------------------------------------------------------
+
+# Positional groups, not Python's named-group syntax -- deliberately,
+# mirroring toolcall_markup.py's own _CLOSER_RE / _CANONICAL_OPENER_RE /
+# _ECHO_OPENER_RE, none of which use named groups either. Spelling a named
+# group out requires an opening angle bracket immediately followed by an
+# identifier and, eventually, a closing one -- structurally the exact
+# open-tag shape this module exists to keep out of its own source, even
+# though it is regex syntax rather than an envelope literal.
+# Group order: id, tool, param, supplied, schema, dropped, block.
+_SPECIMEN_HEADER_RE = re.compile(
+    r'\x3c!--\s*specimen\s+'
+    r'id="([^"]*)"\s+'
+    r'tool="([^"]*)"\s+'
+    r'param="([^"]*)"\s+'
+    r'supplied="([^"]*)"\s+'
+    r'schema="([^"]*)"\s+'
+    r'dropped="([^"]*)"\s*'
+    r'--&gt;\s*'
+    r'```text\s*\n'
+    r'(.*?)\n'
+    r'```',
+    re.DOTALL,
+)
+
+
+class _Specimen(NamedTuple):
+    id: str
+    tool: str
+    param: str
+    supplied: list[str]
+    schema: list[str]
+    dropped: frozenset[str]
+    #: The fenced block's content, un-escaped ('&#60;' -> a real opening
+    #: angle bracket) IN MEMORY ONLY. Never written back to any file.
+    value: str
+
+
+def _parse_list(raw: str) -> list[str]:
+    return [item for item in raw.split(',') if item]
+
+
+def _parse_specimens(text: str) -> list[_Specimen]:
+    """Every (header, fenced block) pair in *text*, un-escaped. Pure."""
+    specimens = []
+    for match in _SPECIMEN_HEADER_RE.finditer(text):
+        (
+            specimen_id, tool, param, supplied_raw, schema_raw, dropped_raw, block,
+        ) = match.groups()
+        specimens.append(
+            _Specimen(
+                id=specimen_id,
+                tool=tool,
+                param=param,
+                supplied=_parse_list(supplied_raw),
+                schema=_parse_list(schema_raw),
+                dropped=frozenset(_parse_list(dropped_raw)),
+                value=block.replace('&#60;', '\x3c'),
+            )
+        )
+    return specimens
+
+
+def _report_specimens() -> list[_Specimen]:
+    """Specimens parsed fresh from the committed report, or [] if absent.
+
+    Never raises on a missing report: TestContainment.test_report_exists is
+    the assertion that owns that failure mode. A collection-time exception
+    here would instead abort collecting this WHOLE module, hiding every
+    other test's result behind an import error.
+    """
+    if not REPORT_PATH.is_file():
+        return []
+    return _parse_specimens(_read_report())
+
+
+# Parsed once at collection time, mirroring
+# test_toolcall_xml_leak_sweep_artifacts.py's _REPORT_PATHS: a later pytest
+# invocation re-imports this module and re-reads the (by-then-edited) file,
+# so this reflects whatever is committed at the moment a run starts.
+_SPECIMENS = _report_specimens()
+_SPECIMEN_IDS = [s.id for s in _SPECIMENS]
+
+
+class TestSpecimenAntiFabrication:
+    """Every specimen the report presents must be a REAL corrupted call.
+
+    Un-escapes each specimen's fenced block back to real text and replays it
+    through PRODUCTION ``shared.toolcall_markup.repair()`` -- the exact call
+    shape the report's own claims describe. A specimen typed from
+    imagination, with a plausible-looking but wrong ``dropped`` list, cannot
+    satisfy this: ``repair()`` independently re-derives what it would
+    recover, and the report's claim must equal that exactly. This is the
+    same anti-fabrication shape as
+    ``fused-memory/tests/test_toolcall_xml_leak_sweep_artifacts.py``, applied
+    to a hand-authored report instead of a captured sweep.
+    """
+
+    def test_exactly_four_specimens_present(self) -> None:
+        # Deliberately NOT parametrized: a parametrize list built from zero
+        # parsed specimens would collect zero test cases and report
+        # vacuously green -- exactly the failure class
+        # test_toolcall_xml_leak_sweep_artifacts.py's TestArtifactsExist
+        # exists to rule out. This fires regardless of how many (if any)
+        # specimens parsed.
+        specimens = _report_specimens()
+        assert len(specimens) == 4, (
+            f'expected exactly 4 machine-readable specimen headers in '
+            f'{REPORT_PATH.name}, found {len(specimens)} '
+            f'({[s.id for s in specimens]}).'
+        )
+
+    def test_specimen_ids_are_unique(self) -> None:
+        specimens = _report_specimens()
+        ids = [s.id for s in specimens]
+        assert len(set(ids)) == len(ids), f'duplicate specimen id in {ids}'
+
+    def test_at_least_one_specimen_is_the_dialect_blend_shape(self) -> None:
+        """One specimen must show a stray quote before the closing bracket.
+
+        Direct evidence of the model interpolating between the canonical
+        ``&#60;parameter name="X">`` dialect and the name-echoing ``&#60;X>``
+        dialect -- the report must carry at least one specimen with this
+        shape, not just the two 'clean' dialects.
+        """
+        specimens = _report_specimens()
+        assert any('">' in s.value for s in specimens), (
+            'no specimen carries the dialect-blend shape (a quote '
+            'immediately before the closing angle bracket of a tag), '
+            'required as direct evidence of dialect interpolation.'
+        )
+
+    @pytest.mark.parametrize('specimen', _SPECIMENS, ids=_SPECIMEN_IDS)
+    def test_specimen_is_detected_as_corrupted(self, specimen: _Specimen) -> None:
+        assert tm.detect(specimen.value) is not None, (
+            f'{specimen.id}: un-escaped value carries no envelope literal '
+            'that shared.toolcall_markup.detect() recognizes -- this is not '
+            'actually a corrupted specimen.'
+        )
+
+    @pytest.mark.parametrize('specimen', _SPECIMENS, ids=_SPECIMEN_IDS)
+    def test_production_repair_reproduces_the_claimed_drop(
+        self, specimen: _Specimen
+    ) -> None:
+        result = tm.repair(
+            specimen.value, specimen.param, specimen.schema, specimen.supplied
+        )
+        assert result is not None, (
+            f'{specimen.id}: shared.toolcall_markup.repair() refused to '
+            'repair this specimen -- the report claims a repairable '
+            'specimen that production code does not independently agree is '
+            'repairable.'
+        )
+        assert set(result.recovered) == specimen.dropped, (
+            f'{specimen.id}: repair() recovered {sorted(result.recovered)}, '
+            f'but the report claims dropped={sorted(specimen.dropped)}. The '
+            "report's claim must equal what production code independently "
+            'recovers.'
+        )
+        assert tm.detect(result.clean_value) is None, (
+            f'{specimen.id}: repair() clean_value still trips detect()'
+        )
+        assert specimen.value.startswith(result.clean_value), (
+            f'{specimen.id}: clean_value is not a prefix of the specimen '
+            'value (invariant D5)'
+        )
+        for name, recovered_value in result.recovered.items():
+            assert recovered_value in specimen.value, (
+                f'{specimen.id}: recovered value for {name!r} is not a '
+                'verbatim substring of the specimen value (invariant D5)'
+            )
