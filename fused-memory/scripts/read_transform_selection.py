@@ -246,6 +246,20 @@ ARM_SPECS: dict[str, ArmSpec] = {
         requires_contested_key_for_v2=True,
         displaces_at_window_edge=False,
     ),
+    'topic_diversity_cap': ArmSpec(
+        key='topic_diversity_cap',
+        label='topic-diversity cap',
+        # It DROPS ranked records — a suppressing read in the PRD V2 sense.
+        drops_ranked_records=True,
+        # ...and yet it is LANDABLE TODAY.  The cap is computed from
+        # `metadata['topic']` alone, so it never needs to ask whether a
+        # record is contested.  That is why these two flags are separate:
+        # collapsing them into one "suppressing" boolean would tell 3111
+        # this arm is blocked on a key that does not exist, which is the
+        # opposite of the truth.
+        requires_contested_key_for_v2=False,
+        displaces_at_window_edge=False,
+    ),
 }
 
 
@@ -506,3 +520,124 @@ def claim_recall_ceiling(
         if record.metadata.get('kind') != 'sighting' or record.record_id in contested
     }
     return len(reachable) / len(all_claims)
+
+
+# ---------------------------------------------------------------------------
+# Arm (3): the TOPIC-DIVERSITY CAP (MMR-style)
+# ---------------------------------------------------------------------------
+
+
+def apply_topic_diversity_cap(
+    hits: list[Any],
+    canonical_by_topic: dict[str, Any],
+    *,
+    per_topic: int = 1,
+) -> list[Any]:
+    """Keep at most *per_topic* records of any one topic in the window.
+
+    The cheapest member of the family: it renders nothing, credits nothing
+    and synthesizes nothing.  Every record it returns is a record it was
+    given — the transform ONLY DROPS.  So there is no document to alias, no
+    crediting policy to set, and no provenance channel to carry: it returns
+    a bare list, where arm (2) must return a :class:`TransformResult`
+    because it mints documents under a canonical's ``record_id``.
+
+    WHICH MEMBER SURVIVES
+    ---------------------
+    The topic's CANONICAL, when the canonical is itself among the ranked
+    members; otherwise the best-ranked member.  Diversity should hand the
+    reader the topic's ANCHOR rather than whichever member ANN happened to
+    like most, which is the whole reason the write shape marks one.
+
+    The cap NEVER pulls an unranked record in — not even the canonical.
+    Injecting an absent canonical here would be arm (1)'s promotion, and
+    would credit this arm for retrieval the store never performed.  A topic
+    whose canonical never ranked therefore keeps its best peer, and the
+    reader simply does not learn the anchor exists.
+
+    WHERE THE SURVIVOR SITS
+    -----------------------
+    At the topic's BEST held rank, the same min-rank rule
+    :func:`apply_topic_keyed_grouped_read` applies and that ``rescore``
+    (:3246) applies to score.  Demoting the survivor to the canonical's own
+    (worse) rank would make this arm look worse at every *k* as an artifact
+    of the transform rather than of the read shape.  Survivors are emitted
+    in their ORIGINAL relative order, so when nothing is dropped the window
+    is returned exactly as it came in — the cap is order-stable, and
+    idempotent on an already-capped window.
+
+    UNTOPICED RECORDS ARE INVISIBLE TO IT
+    -------------------------------------
+    The 300-record distractor slab (``_distractor_records``, :545) carries
+    ``category`` and NOT ONE reserved vocabulary key, deliberately, so that
+    a distractor cannot become a right answer.  A topic cap that collapsed
+    untopiced records would delete the contamination variable the whole
+    bake-off is controlled on, so they pass through untouched and un-capped.
+
+    THE FREED SLOT BACKFILLS
+    ------------------------
+    The returned list is SHORTER; it is never padded.  At a fixed reader
+    budget *k* the freed slots are therefore filled from deeper in the
+    ranking — records that ranked below *k* move inside it.  That is the
+    token win worth measuring, and it is what the report's token column
+    prices.
+
+    SUPPRESSION, STATED
+    -------------------
+    This arm DROPS ranked records, so it is a suppressing read in the PRD
+    **V2** sense — and yet it computes from ``metadata['topic']`` alone and
+    reads nothing from a ``contested`` key, so unlike arm (2) it is
+    LANDABLE TODAY.  Those are the two separate flags on
+    ``ARM_SPECS['topic_diversity_cap']``; see :class:`ArmSpec` for why they
+    are not one boolean.
+
+    Pure — never mutates *hits*, *canonical_by_topic*, or any record.
+    """
+    if per_topic < 1:
+        # Loud, not fail-soft: a cap of 0 would empty every topic out of the
+        # window and report the result as a measurement.
+        raise ValueError(f'per_topic must be >= 1, got {per_topic}')
+
+    #: topic -> [(rank, record)], in rank order.
+    members: dict[str, list[tuple[int, Any]]] = {}
+    output: list[tuple[int, Any]] = []
+
+    for rank, hit in enumerate(hits):
+        topic = hit.metadata.get('topic')
+        if topic is None:
+            # Untopiced: straight through, by identity, in place.
+            output.append((rank, hit))
+            continue
+        members.setdefault(topic, []).append((rank, hit))
+
+    for topic, ranked in members.items():
+        if len(ranked) <= per_topic:
+            # Nothing to drop — every member keeps its own rank.
+            output.extend(ranked)
+            continue
+
+        canonical = canonical_by_topic.get(topic)
+        canonical_id = None if canonical is None else canonical.record_id
+        # Preference order for SELECTION: the canonical (only if it is
+        # itself among the ranked members), then the rest by rank.  This
+        # decides WHICH records survive, not where they sit.
+        preferred = sorted(
+            ranked, key=lambda pair: (pair[1].record_id != canonical_id, pair[0]),
+        )
+        # Placement: the topic's best-held rank slots, with the survivors in
+        # their ORIGINAL relative order.  Carried as (rank, record) pairs
+        # throughout — resolving a record back to its position by value
+        # would let two records with identical fields resolve to the same
+        # slot, which is a real corpus (peers share content shape), and
+        # would silently drop one of them.
+        chosen = sorted(preferred[:per_topic], key=lambda pair: pair[0])
+        slots = [rank for rank, _ in ranked[:len(chosen)]]
+        output.extend(
+            (slot, record)
+            for slot, (_, record) in zip(slots, chosen, strict=True)
+        )
+
+    # Stable sort on the original rank: each rank is consumed at most once,
+    # so the order is total and the transform deterministic.
+    output.sort(key=lambda pair: pair[0])
+    return [record for _, record in output]
