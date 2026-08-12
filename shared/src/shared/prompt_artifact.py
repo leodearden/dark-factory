@@ -27,6 +27,7 @@ same on-disk state.
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import urllib.parse
@@ -38,6 +39,13 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 
 from shared import safe_io
 from shared.safe_io import load_json_or_warn
+
+logger = logging.getLogger(__name__)
+
+# Per-process dedup set for unreadable-sidecar warnings. Bounded by the number
+# of distinct provenance paths that go unreadable in a process lifetime; a
+# restart re-enables the warning (mirrors safe_io._warned_corrupt_paths:29).
+_warned_unreadable_provenance_paths: set[str] = set()
 
 __all__ = [
     'ArtifactProvenance',
@@ -176,7 +184,7 @@ def _load_valid_provenance(
     """
     try:
         parsed, _ok = load_json_or_warn(path, default=None)
-    except OSError:
+    except OSError as exc:
         # The sidecar exists but is unreadable — a permission flip mid-
         # operation, or the path replaced by a directory. safe_io
         # deliberately propagates every non-FileNotFoundError OSError so its
@@ -185,6 +193,22 @@ def _load_valid_provenance(
         # the fault is absorbed here rather than by widening safe_io.
         # (FileNotFoundError is an OSError subclass but is already handled
         # inside safe_io, so it never reaches this handler.)
+        #
+        # Absorbed but NOT silent: this fallback is on a per-invocation hot
+        # path (task_curator resolves through it every reconciliation cycle),
+        # so a root that goes unreadable would otherwise revert every prompt
+        # to baseline indistinguishably from "nothing pinned". The dedup set
+        # gates the WARNING only (once per path per process); the fail-safe
+        # return always runs — the same split safe_io documents at :56-61.
+        key = str(path)
+        if key not in _warned_unreadable_provenance_paths:
+            _warned_unreadable_provenance_paths.add(key)
+            logger.warning(
+                'prompt_artifact: unreadable provenance sidecar at %s (%s); falling back '
+                'to the in-code prompt for this key',
+                path,
+                exc,
+            )
         return None
     if parsed is None:
         return None
