@@ -3898,3 +3898,113 @@ class TestLateArrivalWaitsAreLoadIndependent:
             'worker_task teardown waits are deliberately exempt (best-effort '
             'cleanup inside contextlib.suppress, asserting nothing).'
         )
+
+
+# ===========================================================================
+# Task 3980 step-9: no unspecced VerifyResult-shaped double may survive here
+# ===========================================================================
+
+
+def _bare_verify_result_double_offenders(source: str) -> list[str]:
+    """Statically scan *source* for unspecced VerifyResult-shaped MagicMocks.
+
+    The tell is a ``passed=`` keyword: it is VerifyResult's first field and no
+    other double in this file carries it. Keying on ``passed=`` rather than on
+    ``MagicMock`` alone is what lets the many legitimate non-VerifyResult
+    MagicMocks here through untouched.
+
+    Flags a construction regardless of POSITION — ``return MagicMock(...)``, an
+    assignment, or an argument. Position-blindness is the whole point: this
+    repo's dedicated detector, fused-memory/scripts/check_bare_magicmock_config.py,
+    provably cannot catch this shape for three independent reasons, any one of
+    which is fatal — it inspects only ``ast.Assign``/``ast.AnnAssign`` while all
+    ten sites behind task 3980 were ``return MagicMock(...)``; its
+    ``_is_config_name`` matches only config/cfg/*_config/*_cfg targets; and its
+    remedies are pydantic-specific (``pydantic_spec`` reads ``model_fields``)
+    while VerifyResult is a stdlib dataclass. Widening that shared, seven-caller
+    gate is filed as a separate follow-up; this gives the file coverage now.
+
+    A ``spec=``/``spec_set=`` argument exempts a site, because that is precisely
+    what makes an unknown-attribute READ raise AttributeError instead of
+    auto-vivifying a truthy child Mock — the root-cause fix rather than a
+    ``cause_hint=''`` patch for today's one known field.
+
+    Must never raise: a crash here would fail the module over an unrelated
+    edit. Unparseable source returns [].
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+
+    name = Path(__file__).name
+    offenders: list[str] = []
+
+    def _is_magicmock(func: ast.expr) -> bool:
+        # Both the bare `MagicMock(...)` this file imports and a qualified
+        # `mock.MagicMock(...)` / `unittest.mock.MagicMock(...)`.
+        if isinstance(func, ast.Name):
+            return func.id == 'MagicMock'
+        if isinstance(func, ast.Attribute):
+            return func.attr == 'MagicMock'
+        return False
+
+    def _visit(node: ast.AST, scope: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(
+                child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+            ):
+                _visit(child, f'{scope}::{child.name}' if scope else child.name)
+                continue
+            if isinstance(child, ast.Call) and _is_magicmock(child.func):
+                kwargs = {kw.arg for kw in child.keywords}
+                if 'passed' in kwargs and not ({'spec', 'spec_set'} & kwargs):
+                    offenders.append(
+                        f'{name}:{child.lineno} — {scope or "<module>"} — '
+                        f'MagicMock(passed=...) with no spec=.'
+                    )
+            _visit(child, scope)
+
+    _visit(tree, '')
+    return offenders
+
+
+class TestNoBareVerifyResultDoubles:
+    """Enforced invariant: every VerifyResult-shaped double in this module is
+    built through ``_fake_verify_result``, never as a bare MagicMock.
+
+    Task 3980 measured what a bare one costs. An unconfigured attribute READ on
+    a bare MagicMock auto-vivifies a truthy child Mock rather than returning a
+    real default, so the ten inline doubles here — every one of which omitted
+    ``cause_hint`` — made merge_disposition.py's
+    ``_extract_failing_tests_and_candidate_files`` (:218-221) raise
+    ``TypeError: sequence item 0: expected str instance, MagicMock found`` out
+    of ``str.join``. ``classify_merge_failure_disposition`` (:710-719) swallows
+    that into a silent fail-open (WARNING + INDETERMINATE), which is
+    indistinguishable downstream from a genuine verdict — so the affected
+    assertions only APPEARED to exercise disposition classification.
+
+    Every one of these sites also passed ``verify_skipped=``, which is not a
+    VerifyResult field at all (it lives on MergeOutcome, merge_types.py:945).
+    Nothing objected, because a bare MagicMock accepts any kwarg. That is the
+    same silent-drift failure mode from the other direction, and it is why the
+    remedy is ``spec=VerifyResult`` rather than adding ``cause_hint=''``.
+    """
+
+    def test_no_unspecced_verify_result_double_survives(self) -> None:
+        offenders = _bare_verify_result_double_offenders(Path(__file__).read_text())
+
+        assert not offenders, (
+            'These VerifyResult-shaped doubles are still unspecced MagicMocks:\n'
+            + '\n'.join(f'  - {offender}' for offender in offenders)
+            + '\n\nRemedy: build them with _fake_verify_result(...) (task 3477, '
+            'imported at the top of this module). It seeds a '
+            'MagicMock(spec=VerifyResult) from dataclasses.fields(VerifyResult), '
+            'so every real field gets its real default (cause_hint becomes a '
+            'real str), an unknown-attribute READ raises AttributeError instead '
+            'of auto-vivifying a truthy Mock, and an unknown override such as '
+            'verify_skipped= is rejected with TypeError instead of silently '
+            'setattr-ing onto the mock. Drop lint_output/type_output/timed_out/'
+            'category unless the test needs a non-default value — restating a '
+            'default inline is how these doubles drifted in the first place.'
+        )
