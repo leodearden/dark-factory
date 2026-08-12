@@ -4101,13 +4101,17 @@ class TaskKnowledgeSync(BaseStage):
         # Step 5 in the Your Task block below ("read-modify-write +
         # metadata_mode='replace' for hint conversion") is grounded in Mem0
         # memory 0b0eeb8d (old-wins semantics for list-format hints under
-        # append=True).  A bare append=False RMW is no longer sanctioned — the
-        # task-2180 metadata-wipe guard in _resolve_metadata_mode now rejects it
-        # — so the reshape writes the COMPLETE blob back under the explicit
-        # metadata_mode='replace' co-signal instead.  The memory id is kept here
-        # rather than in the prompt string so the LLM is not burdened with an
-        # opaque reference it cannot look up, and the traceability survives
-        # prompt rewording.
+        # the additive merge).  A bare append=False RMW is no longer sanctioned
+        # — the task-2180 metadata-wipe guard in _resolve_metadata_mode now
+        # rejects it — so the reshape writes the COMPLETE blob back under the
+        # explicit metadata_mode='replace' co-signal instead.  That
+        # 'replace'-alongside-append=True combination stays sanctioned; what is
+        # NOT is metadata_mode='merge' alongside append=True, which
+        # _resolve_metadata_mode also now rejects (task 3581) because honouring
+        # 'merge' shallow-overwrote a task's whole memory_hints key.  The memory
+        # id is kept here rather than in the prompt string so the LLM is not
+        # burdened with an opaque reference it cannot look up, and the
+        # traceability survives prompt rewording.
         return f"""## Stage 2: Task-Knowledge Sync
 ## Project: {self.project_id}
 
@@ -4131,14 +4135,16 @@ to check context, then write appropriate memories.
 delete tasks. Update dependent tasks.
 3. For AI-generated tasks: cross-reference against knowledge graph for factual consistency.
 4. Attach memory_hints to tasks that would benefit from knowledge context at execution time. \
-Use entity references + semantic queries, NOT inline content.
+Use entity references + semantic queries, NOT inline content. Request the ADDITIVE merge by \
+passing `append=True` ALONE or the equivalent `metadata_mode='additive'` — never `append=True` \
+together with `metadata_mode='merge'`, which is a contradiction the backend now rejects.
 5. For tasks listed in **Tasks Needing Memory Hint Attention**: reshape legacy list-format \
 memory_hints via read-modify-write — call `get_task` to read the FULL current metadata, convert \
 the hints to the canonical `{{entities, queries}}` dict shape and merge them into that metadata \
 locally, then write the COMPLETE metadata blob back with `metadata_mode='replace'`. Do NOT use a \
 bare `append=False` (the task-2180 metadata-wipe guard now rejects it), and do NOT rely on \
-Stage 2's default `append=True` merge — it silently discards legacy list-format hints under \
-old-wins semantics.
+Stage 2's additive attach merge from step 4 — it silently discards legacy list-format hints \
+under old-wins semantics.
 6. Proactively review the **Proactive Task Sample** regardless of Stage 1 findings: check \
 in-progress tasks for completion knowledge to capture, blocked tasks for unblock conditions \
 that may now be met, and done tasks for missing knowledge capture. **For each done task, \
@@ -4820,11 +4826,13 @@ def _needs_hint_conversion(task: dict) -> bool:
        or ints) → False (skip). Any truthy non-list value is treated as
        already-converted — narrowing to dict is a separable robustness change.
 
-    Per Mem0 memory ``0b0eeb8d``: Stage 2's ``append=True`` merge silently discards
-    list-format hints under old-wins semantics, so list-format must be re-classified
-    as a conversion target so the LLM uses read-modify-write, writing the complete
-    metadata blob back with ``metadata_mode='replace'`` (a bare ``append=False`` is
-    now rejected by the task-2180 metadata-wipe guard).
+    Per Mem0 memory ``0b0eeb8d``: Stage 2's ADDITIVE attach merge (``append=True``
+    alone, or ``metadata_mode='additive'``) silently discards list-format hints under
+    old-wins semantics, so list-format must be re-classified as a conversion target so
+    the LLM uses read-modify-write, writing the complete metadata blob back with
+    ``metadata_mode='replace'`` (a bare ``append=False`` is now rejected by the
+    task-2180 metadata-wipe guard, and ``metadata_mode='merge'`` alongside
+    ``append=True`` by the task-3581 nested-clobber guard).
     """
     metadata = task.get('metadata')
     task_hints = metadata.get('memory_hints') if isinstance(metadata, dict) else None

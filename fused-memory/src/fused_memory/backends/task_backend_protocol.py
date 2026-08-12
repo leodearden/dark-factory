@@ -215,6 +215,17 @@ class TaskBackendProtocol(Protocol):
           merge.  Omit both to get the merge default.  ``append`` also
           independently governs details-append when ``details``/``prompt`` is
           supplied — a bare ``append=False`` with NO metadata is not rejected.
+        * ``metadata_mode='merge'`` **alongside** ``append=True`` on a metadata
+          write is **rejected** — the one carve-out to the precedence above.
+          The pair is a contradiction ('merge' is shallow last-write-wins,
+          ``append=True`` means 'additive'), and silently resolving it to
+          'merge' overwrote nested keys wholesale — a task's whole
+          ``memory_hints`` blob, authored entities/queries and all, replaced by
+          the incoming stub (the task-3581 nested-metadata clobber).  Pass
+          ``metadata_mode='additive'`` (or ``append=True`` alone) to UNION, or
+          drop ``append`` to CONFIRM the shallow overwrite.  ``('replace',
+          True)`` and ``('additive', False)`` are unaffected, and as with the
+          task-2180 guard a details-only write (NO metadata) is not rejected.
 
         **Implementations MUST reject a non-None ``status`` by raising** (e.g.
         ``TaskmasterError('TASKMASTER_TOOL_ERROR', …)``).  ``set_task_status``
