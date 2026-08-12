@@ -44,6 +44,10 @@ from dataclasses import dataclass
 from typing import Literal
 
 from fused_memory.utils.canonical_labels import Referent, parse_node_name, scan_content
+from fused_memory.utils.validation import (
+    PathShapedProjectIdError,
+    canonicalize_project_id,
+)
 
 #: The CLOSED vocabulary of resolution sources, in precedence order (strongest
 #: first). Exported as one tuple so task ι's declaration-rate telemetry
@@ -123,6 +127,52 @@ class ReferentResolution:
     #: Reported verbatim from the scan whatever the winning source, and NEVER
     #: promoted into :attr:`referents`: ambiguity is recorded, not guessed.
     ambiguous: ReferentSet = ()
+
+
+def _declared_referents(declared: list[dict], *, group_id: str) -> ReferentSet:
+    """Parse the caller's explicit referent entries into a referent set.
+
+    Entry shape is ``{'kind': 'task', 'id': <digits>, 'project_id': <optional>}``.
+    ``kind`` defaults to ``'task'`` — the same default :class:`Referent` itself
+    carries, so canonical_labels stays the single site for it.
+
+    A ``project_id`` equal to the canonicalized *group_id* is RECLASSIFIED to
+    an own-project referent, mirroring ``scan_content``'s self-qualified
+    reclassification EXACTLY. Without that, a self-qualified declaration could
+    never compare equal to the scanned form and the conflict check would fire
+    on a caller who was right.
+
+    De-duplicated on ``(kind, project_id, number)`` with first-seen order
+    preserved — the same key and the same discipline ``scan_content`` uses.
+    """
+    try:
+        local_project = canonicalize_project_id(group_id)
+    except PathShapedProjectIdError:
+        # scan_content answers an empty scan for a path-shaped group_id; here
+        # there is still a declaration to honour, so only the self-qualified
+        # RECLASSIFICATION is unavailable. Comparing against a sentinel no
+        # canonical project id can equal keeps a foreign declaration foreign
+        # rather than silently collapsing it onto the local project.
+        local_project = ''
+
+    referents: list[Referent] = []
+    seen: set[tuple[str, str, str]] = set()
+    for entry in declared:
+        raw_project = entry.get('project_id') or ''
+        project_id = canonicalize_project_id(raw_project) if raw_project else ''
+        if project_id and local_project and project_id == local_project:
+            project_id = ''
+        referent = Referent(
+            kind=entry.get('kind', 'task'),
+            number=str(entry['id']).strip(),
+            project_id=project_id,
+        )
+        key = (referent.kind, referent.project_id, referent.number)
+        if key in seen:
+            continue
+        seen.add(key)
+        referents.append(referent)
+    return tuple(referents)
 
 
 def _metadata_referents(metadata: dict) -> ReferentSet:
@@ -224,6 +274,14 @@ def resolve_referents(
     # referents are recorded, never guessed, and never promoted into
     # `.referents`.
     ambiguous = scan.ambiguous
+
+    # An explicit declaration is the strongest source and is honoured verbatim.
+    if declared:
+        return ReferentResolution(
+            source='declared',
+            referents=_declared_referents(declared, group_id=group_id),
+            ambiguous=ambiguous,
+        )
 
     # Ambient metadata outranks the prose but is never reconciled against it:
     # `.conflicts` stays empty on this path, because metadata is not a CLAIM
