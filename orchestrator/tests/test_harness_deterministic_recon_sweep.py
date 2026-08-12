@@ -77,6 +77,12 @@ from orchestrator.harness import (
     _deterministic_gate_stranded,
     _recon_inspect_unit,
 )
+from orchestrator.recovery_emission import (
+    RECOVERY_VETO_STREAK_SENTINEL_PREFIX,
+    RecoverySite,
+    RecoverySweepTally,
+    RecoveryVetoStreakTracker,
+)
 
 # ---------------------------------------------------------------------------
 # step-1: Config field presence and defaults
@@ -1737,4 +1743,287 @@ class TestDeterministicReconZeroBehaviorChange:
         ]
         assert submitted == ['tid-free'], (
             'a telemetry failure on one task must not collateral-strand its sibling'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Task 3535 S27 — the deterministic-recon sweep's MISSING RELEASE HALF.
+#
+# Both deterministic sites are in ``STREAK_CHARGING_SITES``, so both can file a
+# blocking L1 against ``__recovery_veto_streak__<tid>``.  The only release path
+# is site-filtered to ``reconcile_sweep`` and driven only from
+# ``_reconcile_stranded_in_progress``, so a deterministic hold that CLEARS
+# leaves (a) an operator holding a blocking alarm for a resolved condition and
+# (b) the detector permanently silenced for that task, because the emitter
+# dedups on ``has_open_l1`` — both failures ``resolve_recovery_veto_streak_
+# escalation``'s own docstring calls "NOT optional polish".  The tracker and the
+# filed_at memo also grow one permanent entry per deterministic task ever held,
+# against ``RecoveryVetoStreakTracker``'s stated "proportional to the tasks
+# CURRENTLY held" footprint contract.
+#
+# The sentinel and the memo are keyed on task_id ALONE while the tracker is
+# keyed on ``(site, task_id)``, so two charging sites SHARE one alarm.  That is
+# why the release must be guarded on no OTHER charging site still holding the
+# tid: an unguarded per-site release would resolve an alarm the other sweep's
+# live hold still justifies, and the next pass would re-file it — an alarm flap
+# on an operator's queue, strictly worse than the stale alarm it fixed.
+# ---------------------------------------------------------------------------
+
+class _FakeClock:
+    """A monotonic clock, so the alarm's SPAN dimension is drivable.
+
+    The predicate is two-dimensional (streak AND elapsed span); a test that
+    could not control time could only ever exercise one half of it.
+    """
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, secs: float) -> None:
+        self.now += secs
+
+
+#: ``deterministic_recon_sweep_interval_secs`` — the real pass cadence, and
+#: half the published derivation for ``veto_streak_min_span_secs``.
+_RECON_INTERVAL = 900.0
+
+
+def _streak_recon_harness(tmp_path: Path) -> tuple[Harness, _FakeClock]:
+    """A recon harness on a REAL EscalationQueue, with a drivable clock.
+
+    Real queue, not a mock: the sentinel alarm's ``has_open_l1`` dedup, its
+    resolution and the re-file-after-recurrence all live in the queue's own
+    archive handling, and a mock would assert none of it.
+    """
+    h = _make_recon_harness()
+    h.event_store = EventStore(tmp_path / 'runs.db', 'run-test')
+    h._escalation_queue = EscalationQueue(tmp_path / 'queue')
+    clock = _FakeClock()
+    h._recovery_veto_tracker = RecoveryVetoStreakTracker(clock=clock)
+    h._recon_unit_inspector = AsyncMock(return_value={
+        'MainPID': 4321, 'ActiveState': 'active',
+    })
+    # Sources B and C are orthogonal to the release half; keep them inert so a
+    # test failure here can only mean the release misbehaved.
+    h.scheduler.get_task = AsyncMock(return_value=None)
+    h._revalidate_open_l2 = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    h._revalidate_open_deterministic_escalation = AsyncMock()  # type: ignore[method-assign]
+    return h, clock
+
+
+def _hold(h: Harness, tid: str = 'tid-pinned', esc_id: str = 'esc-pin-1') -> Escalation:
+    """Put a REAL pending record on *tid*, so the sweep's dedup skips it."""
+    esc = _pinning_esc(esc_id, task_id=tid)
+    h._escalation_queue.submit(esc)  # type: ignore[union-attr]
+    return esc
+
+
+def _sentinel_alarms(h: Harness, tid: str = 'tid-pinned') -> list:
+    """Pending veto-streak alarms filed against *tid*'s SENTINEL id."""
+    return h._escalation_queue.get_by_task(  # type: ignore[union-attr]
+        f'{RECOVERY_VETO_STREAK_SENTINEL_PREFIX}{tid}', status='pending',
+    )
+
+
+async def _recon_passes(
+    h: Harness, clock: _FakeClock, count: int, *, interval: float = _RECON_INTERVAL,
+) -> None:
+    """Run *count* deterministic passes *interval* apart, as the loop would."""
+    for i in range(count):
+        if i:
+            clock.advance(interval)
+        await h._run_deterministic_recon_sweep()
+
+
+def _tracked_for(h: Harness, tid: str) -> set[str]:
+    """Every SITE currently tracking a veto streak for *tid*."""
+    return {
+        str(site) for site, tracked_tid in h._recovery_veto_tracker.tracked()
+        if tracked_tid == tid
+    }
+
+
+class TestDeterministicReconStreakRelease:
+    """A deterministic hold that ENDS must stand its alarm down."""
+
+    @pytest.mark.asyncio
+    async def test_a_sustained_hold_files_one_alarm(self, tmp_path: Path) -> None:
+        """The charge half — already true, pinned here as this section's premise."""
+        h, clock = _streak_recon_harness(tmp_path)
+        h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
+        _hold(h)
+
+        await _recon_passes(h, clock, 3)
+
+        alarms = _sentinel_alarms(h)
+        assert len(alarms) == 1, f'expected one sentinel alarm, got {alarms}'
+        assert alarms[0].level == 1
+
+    @pytest.mark.asyncio
+    async def test_the_next_pass_after_the_hold_clears_resolves_the_alarm(
+        self, tmp_path: Path,
+    ) -> None:
+        """The missing half: today this alarm stays pending forever."""
+        h, clock = _streak_recon_harness(tmp_path)
+        h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
+        held = _hold(h)
+        await _recon_passes(h, clock, 3)
+        assert len(_sentinel_alarms(h)) == 1
+
+        h._escalation_queue.resolve(held.id, 'unblocked')  # type: ignore[union-attr]
+        clock.advance(_RECON_INTERVAL)
+        await h._run_deterministic_recon_sweep()
+
+        assert _sentinel_alarms(h) == [], (
+            'the hold ended, so its alarm must stand down — otherwise an '
+            'operator holds a blocking L1 for a resolved condition'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_release_drops_the_tracker_and_memo_entries(
+        self, tmp_path: Path,
+    ) -> None:
+        """The footprint contract: proportional to CURRENTLY-held tasks.
+
+        This process runs for weeks; one permanent entry per deterministic task
+        ever held is an unbounded leak, not a rounding error.
+        """
+        h, clock = _streak_recon_harness(tmp_path)
+        h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
+        held = _hold(h)
+        await _recon_passes(h, clock, 3)
+        assert _tracked_for(h, 'tid-pinned') == {'deterministic_recon_sweep'}
+
+        h._escalation_queue.resolve(held.id, 'unblocked')  # type: ignore[union-attr]
+        clock.advance(_RECON_INTERVAL)
+        await h._run_deterministic_recon_sweep()
+
+        assert _tracked_for(h, 'tid-pinned') == set()
+        assert 'tid-pinned' not in getattr(h, '_recovery_streak_filed_at', {})
+
+    @pytest.mark.asyncio
+    async def test_a_later_recurrence_files_a_new_alarm(self, tmp_path: Path) -> None:
+        """Without the release, ``has_open_l1`` silences this detector for the
+        task for the life of the queue — one incident per task, ever."""
+        h, clock = _streak_recon_harness(tmp_path)
+        h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
+        held = _hold(h)
+        await _recon_passes(h, clock, 3)
+        first = _sentinel_alarms(h)[0].id
+
+        # The hold clears; the next pass releases and RE-FILES on the real tid
+        # (RE-FILE-NEVER-FLIP), which is what holds the task again below.
+        h._escalation_queue.resolve(held.id, 'unblocked')  # type: ignore[union-attr]
+        clock.advance(_RECON_INTERVAL)
+        await h._run_deterministic_recon_sweep()
+        assert _sentinel_alarms(h) == []
+
+        await _recon_passes(h, clock, 3)
+
+        alarms = _sentinel_alarms(h)
+        assert len(alarms) == 1, f'the recurrence must alarm again, got {alarms}'
+        assert alarms[0].id != first, 'a NEW alarm, not the resurrected old one'
+
+    @pytest.mark.asyncio
+    async def test_the_release_writes_nothing_to_the_subject_task(
+        self, tmp_path: Path,
+    ) -> None:
+        """Zero behavior change still binds: the release is bookkeeping."""
+        h, clock = _streak_recon_harness(tmp_path)
+        h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
+        held = _hold(h)
+        await _recon_passes(h, clock, 3)
+        h._escalation_queue.resolve(held.id, 'unblocked')  # type: ignore[union-attr]
+        clock.advance(_RECON_INTERVAL)
+
+        await h._run_deterministic_recon_sweep()
+
+        h.scheduler.set_task_status.assert_not_called()  # type: ignore[attr-defined]
+        # The pass RE-FILED for the real tid (unchanged behaviour); the release
+        # itself contributed no record of its own to the subject.
+        real = h._escalation_queue.get_by_task('tid-pinned', status='pending')  # type: ignore[union-attr]
+        assert [e.category for e in real] == ['stranded_blocked']
+
+
+class TestDeterministicReconStreakReleaseIsSiteScoped:
+    """The two sweeps have DIFFERENT candidate sets, so neither may stand down
+    the other's live alarm."""
+
+    @pytest.mark.asyncio
+    async def test_a_deterministic_pass_leaves_a_reconcile_streak_alone(
+        self, tmp_path: Path,
+    ) -> None:
+        """``T-other`` is not in the deterministic candidate set at all."""
+        h, clock = _streak_recon_harness(tmp_path)
+        h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
+        _hold(h)
+        h._recovery_veto_tracker.observe(
+            RecoverySite.reconcile_sweep, 'T-other', 'sig',
+        )
+
+        await _recon_passes(h, clock, 3)
+
+        assert _tracked_for(h, 'T-other') == {'reconcile_sweep'}, (
+            'a sweep may only release streaks for the sites IT drives'
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_deterministic_pass_will_not_resolve_a_still_held_alarm(
+        self, tmp_path: Path,
+    ) -> None:
+        """CROSS-SITE SUPPRESSION — the flap this guard exists to prevent.
+
+        The sentinel and the memo are task-scoped while the tracker is
+        (site, task_id)-scoped, so one alarm covers both sites.  Resolving it
+        while the reconcile sweep still holds the task would simply re-file on
+        the next reconcile pass: an alarm flap, worse than the stale alarm.
+        """
+        h, clock = _streak_recon_harness(tmp_path)
+        h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
+        held = _hold(h)
+        await _recon_passes(h, clock, 3)
+        assert len(_sentinel_alarms(h)) == 1
+        for _ in range(3):
+            h._recovery_veto_tracker.observe(
+                RecoverySite.reconcile_sweep, 'tid-pinned', 'sig',
+            )
+
+        h._escalation_queue.resolve(held.id, 'unblocked')  # type: ignore[union-attr]
+        clock.advance(_RECON_INTERVAL)
+        await h._run_deterministic_recon_sweep()
+
+        assert _tracked_for(h, 'tid-pinned') == {'reconcile_sweep'}, (
+            'the deterministic entry pops; the reconcile one is not this '
+            "pass's to touch"
+        )
+        assert len(_sentinel_alarms(h)) == 1, (
+            'still held at another charging site — the alarm stays up'
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_reconcile_release_will_not_resolve_a_deterministic_hold(
+        self, tmp_path: Path,
+    ) -> None:
+        """The mirror direction, on the PRE-EXISTING reconcile-only path — the
+        same latent hazard, which the cross-site guard closes for both."""
+        h, clock = _streak_recon_harness(tmp_path)
+        h.scheduler.get_tasks = AsyncMock(return_value=[_pinned_deploy_strand()])
+        _hold(h)
+        await _recon_passes(h, clock, 3)
+        assert len(_sentinel_alarms(h)) == 1
+        for _ in range(3):
+            h._recovery_veto_tracker.observe(
+                RecoverySite.reconcile_sweep, 'tid-pinned', 'sig',
+            )
+
+        # A reconcile pass that swept nothing: its own entry is stale.
+        h._release_recovery_veto_streaks(RecoverySweepTally())
+
+        assert _tracked_for(h, 'tid-pinned') == {'deterministic_recon_sweep'}
+        assert len(_sentinel_alarms(h)) == 1, (
+            'the deterministic sweep still holds this task — its shared alarm '
+            'must not be stood down by the other sweep'
         )
