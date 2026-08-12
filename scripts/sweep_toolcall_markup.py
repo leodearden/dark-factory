@@ -228,6 +228,17 @@ NEVER_TOUCH: frozenset[str] = frozenset({
 #: renderer, the tests and the operator all key on ONE spelling.
 REASON_NEVER_TOUCH = 'never-touch'
 REASON_UNSANCTIONED_PLAN_LOCATION = 'unsanctioned-plan-location'
+#: The orphaned plan's symlink target no longer exists. Refused rather than
+#: followed, because os.replace onto a dangling link CREATES a regular file —
+#: inventing a plan for a lane whose meta-root was already reclaimed.
+REASON_DANGLING_SYMLINK = 'dangling-symlink'
+#: The plan resolves into a meta-root that a LIVE `.worktrees/<id>` lane still
+#: shares, so rewriting it would rewrite a plan a running task is reading.
+#: PRD D4 assigns those to task 3692's lazy write-back, not to this sweep;
+#: this is how that split is enforced mechanically instead of by assumption.
+#: Measured at plan time: `.worktrees/3415` is live, which leaves exactly one
+#: repairable orphaned plan (3162) in the corpus today.
+REASON_LIVE_LANE_PRESENT = 'live-lane-present'
 
 #: The shared meta-root a lane's plan.json is symlinked into.
 _META_ROOT = ('.worktrees', '.task-meta')
@@ -313,16 +324,69 @@ def resolve_write_target(target: Target, root: Path | str) -> ResolvedTarget | R
     if _matches_never_touch(target.path) or _matches_never_touch(resolved):
         return Refusal(path=target.path, lane=target.lane, reason=REASON_NEVER_TOUCH)
 
-    if target.lane == LANE_PLANS and not _is_sanctioned_plan_location(
-        resolved, root_real
-    ):
-        return Refusal(
-            path=target.path,
-            lane=target.lane,
-            reason=REASON_UNSANCTIONED_PLAN_LOCATION,
-        )
+    if target.lane == LANE_PLANS:
+        if not _is_sanctioned_plan_location(resolved, root_real):
+            return Refusal(
+                path=target.path,
+                lane=target.lane,
+                reason=REASON_UNSANCTIONED_PLAN_LOCATION,
+            )
+
+        if not resolved.exists():
+            # A dangling link. Refusing here is load-bearing: an unguarded
+            # os.replace onto this path would CREATE a regular file, inventing
+            # a plan for a lane whose meta-root was already reclaimed.
+            return Refusal(
+                path=target.path, lane=target.lane, reason=REASON_DANGLING_SYMLINK
+            )
+
+        lane_id = _meta_root_lane_id(resolved, root_real)
+        if lane_id is not None and (root_real / '.worktrees' / lane_id).exists():
+            return Refusal(
+                path=target.path, lane=target.lane, reason=REASON_LIVE_LANE_PRESENT
+            )
 
     return ResolvedTarget(path=target.path, lane=target.lane, write_path=resolved)
+
+
+def _meta_root_lane_id(resolved: Path, root_real: Path) -> str | None:
+    """The lane id *resolved* belongs to, if it lives in the shared meta-root.
+
+    ``None`` for a plain-file plan in an orphaned worktree's own ``.task/``:
+    that file is not shared with anything, so there is no lane whose liveness
+    could make it unsafe. Deriving an "id" from whatever directory happened to
+    be the parent would yield ``.task`` there and check a path that is not a
+    lane at all.
+    """
+    try:
+        parts = resolved.relative_to(root_real).parts
+    except ValueError:
+        return None
+    if len(parts) == 4 and parts[:2] == _META_ROOT:
+        return parts[2]
+    return None
+
+
+def dedupe_by_realpath(targets: list[Target]) -> list[Target]:
+    """Drop targets whose realpath a previous target already claims.
+
+    Order-preserving, so the FIRST discovery of a shared file wins and the
+    result stays as deterministic as :func:`discover_targets`.
+
+    Several orphaned lanes can symlink into the same meta-root file. Writing it
+    twice in one run is not merely wasteful: the second pass would re-read the
+    first pass's output, and any asymmetry between the two would surface as
+    churn an operator cannot account for.
+    """
+    seen: set[Path] = set()
+    kept: list[Target] = []
+    for target in targets:
+        resolved = Path(os.path.realpath(target.path))
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        kept.append(target)
+    return kept
 
 
 # ---------------------------------------------------------------------------

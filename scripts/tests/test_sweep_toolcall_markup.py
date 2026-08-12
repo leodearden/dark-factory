@@ -1105,3 +1105,117 @@ def test_loaded_documents_carry_the_raw_bytes_for_the_round_trip_check(tmp_path)
     assert isinstance(loaded, sweep.LoadedDocument)
     assert loaded.raw == path.read_text(encoding='utf-8')
     assert json.loads(loaded.raw) == loaded.obj
+
+
+# ---------------------------------------------------------------------------
+# step-11 — plans-lane symlink resolution, liveness, dedupe.
+# ---------------------------------------------------------------------------
+
+
+def _plan_target(root, lane_dir):
+    return sweep.Target(
+        path=root / '.worktrees-orphaned' / lane_dir / '.task' / 'plan.json',
+        lane=sweep.LANE_PLANS,
+    )
+
+
+def test_a_symlinked_plan_resolves_to_the_meta_root_and_stays_a_link(sweep_root):
+    """(a) The write lands on the FILE; the LINK is never the write target.
+
+    ``os.replace`` onto the link path would replace it with a regular file and
+    re-fork the lane and meta-root copies — the esc-5205-9 stale-plan
+    divergence ``plan_tools._atomic_write_plan`` documents at line 715. The
+    link must therefore still be a link after resolution, and forever after.
+    """
+    target = _plan_target(sweep_root, '9002-2026')
+    resolved = sweep.resolve_write_target(target, sweep_root)
+
+    assert isinstance(resolved, sweep.ResolvedTarget)
+    assert resolved.write_path == (
+        sweep_root / '.worktrees' / '.task-meta' / '9002' / 'plan.json'
+    )
+    assert target.path.is_symlink(), 'resolution must not disturb the link'
+
+
+def test_a_plan_whose_meta_root_a_live_lane_shares_is_skipped(sweep_root):
+    """(b) PRD D4's terminal-vs-live split, enforced MECHANICALLY.
+
+    The meta-root is SHARED with the live lane. Measured at plan time:
+    ``.worktrees/3415`` exists right now, so sweeping "the orphaned 3415 plan"
+    would in fact rewrite a plan a RUNNING task is reading. PRD D4 assigns
+    those to task 3692's lazy write-back, not to this sweep — and this skip is
+    how that assignment is enforced instead of assumed.
+    """
+    (sweep_root / '.worktrees' / '9002').mkdir(parents=True)
+    link = _plan_target(sweep_root, '9002-2026').path
+    meta = sweep_root / '.worktrees' / '.task-meta' / '9002' / 'plan.json'
+    before = meta.read_bytes()
+
+    refusal = sweep.resolve_write_target(_plan_target(sweep_root, '9002-2026'), sweep_root)
+
+    assert isinstance(refusal, sweep.Refusal)
+    assert refusal.reason == sweep.REASON_LIVE_LANE_PRESENT
+    assert meta.read_bytes() == before
+    assert link.is_symlink()
+
+
+def test_two_orphaned_lanes_sharing_a_realpath_are_swept_once(sweep_root):
+    """(c) Dedupe by REALPATH, so a shared meta-root is never written twice.
+
+    Writing the same file twice in one run is not merely wasteful: the second
+    pass would re-read the first pass's output, and any asymmetry between the
+    two would show up as churn an operator cannot explain.
+    """
+    meta = sweep_root / '.worktrees' / '.task-meta' / '9002' / 'plan.json'
+    second = sweep_root / '.worktrees-orphaned' / '9002-dup' / '.task' / 'plan.json'
+    second.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(str(meta), str(second))
+
+    targets = sweep.discover_targets(sweep_root)
+    assert len([t for t in targets if t.path in (second, _plan_target(sweep_root, '9002-2026').path)]) == 2
+
+    deduped = sweep.dedupe_by_realpath(targets)
+    resolved_paths = [Path(os.path.realpath(t.path)) for t in deduped]
+    assert len(resolved_paths) == len(set(resolved_paths)), 'no realpath twice'
+    assert sum(1 for p in resolved_paths if p == meta) == 1
+
+
+def test_a_dangling_plan_symlink_is_reported_and_materialises_nothing(sweep_root):
+    """(d) A dangling link is a reported refusal, never a created file.
+
+    The hazard is specific: an unguarded ``os.replace`` onto a dangling link
+    path CREATES a regular file there, inventing a plan for a lane whose
+    meta-root was already reclaimed.
+    """
+    link = sweep_root / '.worktrees-orphaned' / '9007-2026' / '.task' / 'plan.json'
+    link.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(str(sweep_root / '.worktrees' / '.task-meta' / '9007' / 'plan.json'), str(link))
+
+    refusal = sweep.resolve_write_target(_plan_target(sweep_root, '9007-2026'), sweep_root)
+
+    assert isinstance(refusal, sweep.Refusal)
+    assert refusal.reason == sweep.REASON_DANGLING_SYMLINK
+    assert link.is_symlink() and not link.exists(), 'still dangling, nothing created'
+    assert not (sweep_root / '.worktrees' / '.task-meta' / '9007').exists()
+
+
+def test_a_plain_file_plan_is_repaired_in_place(sweep_root):
+    """(e) Not every orphaned plan is a link; a real file writes to itself."""
+    target = _plan_target(sweep_root, '9001-2026')
+    resolved = sweep.resolve_write_target(target, sweep_root)
+
+    assert isinstance(resolved, sweep.ResolvedTarget)
+    assert resolved.write_path == target.path
+    assert not target.path.is_symlink()
+
+
+def test_liveness_is_checked_only_for_meta_root_resolutions(sweep_root):
+    """A plain-file plan has no lane id to check, so liveness cannot apply.
+
+    Guards against a liveness check that derived an "id" from whatever
+    directory happened to be the parent — for a plain file that is ``.task``,
+    and ``<root>/.worktrees/.task`` is not a lane.
+    """
+    (sweep_root / '.worktrees' / '.task').mkdir(parents=True, exist_ok=True)
+    resolved = sweep.resolve_write_target(_plan_target(sweep_root, '9001-2026'), sweep_root)
+    assert isinstance(resolved, sweep.ResolvedTarget)
