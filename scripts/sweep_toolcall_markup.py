@@ -53,6 +53,7 @@ lines 52-62. If you need a literal here, import it; do not type it.
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -633,3 +634,86 @@ def repair_document(obj: Any) -> tuple[Any, list[Outcome]]:
         ))
 
     return current, outcomes
+
+
+# ---------------------------------------------------------------------------
+# Loading and gating one target.
+# ---------------------------------------------------------------------------
+
+#: The escalation statuses this sweep will rewrite. Design decision 3.
+#:
+#: `data/escalations` is written CONTINUOUSLY by the live queue, and this
+#: script's temp-verify-replace prevents a torn READ but not a lost UPDATE: the
+#: queue's own concurrency control is a `{escalation_id}.json.lock` sidecar
+#: (queue.py:36-60) that this script deliberately does not take. Restricting to
+#: terminal records is what makes that safe, and it costs almost nothing —
+#: measured at plan time, 59 of the 60 corrupted files are already archived and
+#: terminal, so exactly ONE pending record is skipped.
+TERMINAL_STATUSES = frozenset({'resolved', 'dismissed'})
+
+#: The record's status is not in :data:`TERMINAL_STATUSES` — including an
+#: unrecognised one, which skips in the FAIL-SAFE direction rather than
+#: guessing at a lifecycle state this sweep does not model.
+REASON_NON_TERMINAL = 'non-terminal'
+#: A JSON document under ``data/escalations`` that is not a record at all (no
+#: ``id`` / ``status``). Excluded on SHAPE, never on "we found no markup" —
+#: ``b3-state.json`` carries flagged strings and matches the glob.
+REASON_NOT_AN_ESCALATION_RECORD = 'not-an-escalation-record'
+#: The file could not be read or parsed. Reported so the sweep continues to the
+#: next file: aborting the run on one bad file would leave the corpus
+#: half-swept with no record of where it stopped.
+REASON_UNPARSEABLE = 'unparseable'
+
+
+class LoadedDocument(NamedTuple):
+    """A target that passed its lane's gate, with its bytes and its parse."""
+
+    target: Target
+    #: The source text EXACTLY as read. Carried rather than re-read later
+    #: because re-reading would race the live queue writer — the round-trip
+    #: precondition must check the same bytes the parse came from.
+    raw: str
+    obj: Any
+
+
+def _is_escalation_record(obj: Any) -> bool:
+    """True if *obj* has the shape of an escalation record."""
+    return isinstance(obj, dict) and 'id' in obj and 'status' in obj
+
+
+def load_target(target: Target) -> LoadedDocument | Refusal:
+    """Read, parse and gate one target.
+
+    Error handling is NARROW by construction — only ``OSError``,
+    ``UnicodeDecodeError`` and ``json.JSONDecodeError`` are caught, each
+    recorded with a reason and returned as a value. ``scripts`` is inside
+    ``shared/tests/silent_fallthrough_scan.py``'s ``_SCOPE_ROOTS``, so a broad
+    ``except Exception`` funnelling into a default would trip the ratchet; more
+    to the point, it would swallow a genuine bug in the repairer as though it
+    were a malformed file.
+
+    The escalation lane is gated on terminal status; the plans lane is NOT. A
+    plan has no ``status`` field to read — its liveness gate is the
+    ``.worktrees/<id>`` check in :func:`resolve_write_target`'s caller. Applying
+    the escalation gate to plans would skip every plan in the corpus while
+    still reporting a clean run.
+    """
+    try:
+        raw = target.path.read_text(encoding='utf-8')
+        obj = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return Refusal(path=target.path, lane=target.lane, reason=REASON_UNPARSEABLE)
+
+    if target.lane == LANE_ESCALATIONS:
+        if not _is_escalation_record(obj):
+            return Refusal(
+                path=target.path,
+                lane=target.lane,
+                reason=REASON_NOT_AN_ESCALATION_RECORD,
+            )
+        if obj.get('status') not in TERMINAL_STATUSES:
+            return Refusal(
+                path=target.path, lane=target.lane, reason=REASON_NON_TERMINAL
+            )
+
+    return LoadedDocument(target=target, raw=raw, obj=obj)

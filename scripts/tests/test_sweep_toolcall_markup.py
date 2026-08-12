@@ -991,3 +991,117 @@ def test_a_non_converging_document_reports_did_not_converge(monkeypatch):
     assert len([o for o in outcomes if o.action == sweep.ACTION_REPAIRED]) == (
         sweep._MAX_REPAIR_ROUNDS
     ), 'one repair per round, and the loop stopped AT the bound'
+
+
+# ---------------------------------------------------------------------------
+# step-9 — the escalation lane's terminal-status gate.
+# ---------------------------------------------------------------------------
+
+
+def _load(path, lane=None):
+    """Run one path through the load/gate stage."""
+    if lane is None:
+        lane = sweep.LANE_PLANS if path.name == 'plan.json' else sweep.LANE_ESCALATIONS
+    return sweep.load_target(sweep.Target(path=path, lane=lane))
+
+
+@pytest.mark.parametrize('status', ['resolved', 'dismissed'])
+def test_terminal_escalation_records_are_swept(tmp_path, status):
+    """Both terminal statuses load. These are the 59 archived corrupted files."""
+    path = write_escalation(
+        tmp_path / f'esc-{status}.json',
+        make_escalation('esc-1-1', status, _swallowed('D.', 'detail', 'root_cause', 'r')),
+    )
+    loaded = _load(path)
+    assert isinstance(loaded, sweep.LoadedDocument)
+    assert loaded.obj['status'] == status
+
+
+@pytest.mark.parametrize('status', ['pending', 'in-progress', 'some-future-status'])
+def test_non_terminal_and_unknown_statuses_are_skipped(tmp_path, status):
+    """Anything not terminal is skipped and REPORTED, never silently clean.
+
+    An unknown status skips in the fail-safe direction: this sweep's atomicity
+    prevents a torn READ but not a lost UPDATE against the live queue writer,
+    so a record whose lifecycle state it does not understand is left alone.
+
+    Byte-identity under ``--apply`` is asserted end-to-end in the second-run
+    test; what is pinned here is that the gate refuses before a write is ever
+    considered.
+    """
+    path = write_escalation(
+        tmp_path / f'esc-{status}.json',
+        make_escalation('esc-1-1', status, _swallowed('D.', 'detail', 'root_cause', 'r')),
+    )
+    refusal = _load(path)
+    assert isinstance(refusal, sweep.Refusal)
+    assert refusal.reason == sweep.REASON_NON_TERMINAL
+
+
+def test_a_non_record_json_document_is_skipped_even_when_flagged(tmp_path):
+    """``b3-state.json`` shape: no ``id``/``status``, but flagged content.
+
+    It lives inside data/escalations and matches the glob, so only a SHAPE
+    check excludes it. Skipping it on "no detectable markup" would be luck,
+    not a rule — hence the flagged string in the fixture.
+    """
+    path = write_escalation(
+        tmp_path / 'b3-state.json',
+        {'generated_at': 'now', 'note': _swallowed('B3.', 'detail', 'root_cause', 'r')},
+    )
+    refusal = _load(path)
+    assert isinstance(refusal, sweep.Refusal)
+    assert refusal.reason == sweep.REASON_NOT_AN_ESCALATION_RECORD
+
+
+def test_an_unparseable_file_is_reported_not_raised(tmp_path):
+    """A malformed file yields a reason, so the sweep can continue past it.
+
+    Aborting the whole run on one bad file would leave the corpus half-swept
+    with no record of where it stopped.
+    """
+    path = tmp_path / 'broken.json'
+    path.write_text('{"id": "esc-1-1", "status": "resolved",', encoding='utf-8')
+    refusal = _load(path)
+    assert isinstance(refusal, sweep.Refusal)
+    assert refusal.reason == sweep.REASON_UNPARSEABLE
+
+
+def test_an_unreadable_file_is_reported_not_raised(tmp_path):
+    """Undecodable bytes are a reported refusal too, not a traceback."""
+    path = tmp_path / 'binary.json'
+    path.write_bytes(b'\xff\xfe\x00 not utf-8 at all')
+    refusal = _load(path)
+    assert isinstance(refusal, sweep.Refusal)
+    assert refusal.reason == sweep.REASON_UNPARSEABLE
+
+
+def test_the_plans_lane_is_not_subject_to_the_terminal_status_gate(tmp_path):
+    """A plan has no ``status`` field to read — its gate is lane liveness.
+
+    Applying the escalation gate to plans would skip every plan in the corpus
+    while reporting a clean run, which is the failure this test exists to stop.
+    """
+    path = write_plan(
+        tmp_path / 'plan.json',
+        make_plan('9006', [_truncated('R.', 'rationale')]),
+    )
+    loaded = _load(path, lane=sweep.LANE_PLANS)
+    assert isinstance(loaded, sweep.LoadedDocument)
+    assert 'status' not in loaded.obj
+
+
+def test_loaded_documents_carry_the_raw_bytes_for_the_round_trip_check(tmp_path):
+    """The raw source text travels with the parse.
+
+    Re-reading the file later to compare formatting would race the live queue
+    writer; the round-trip precondition has to check the SAME bytes the parse
+    came from.
+    """
+    path = write_escalation(
+        tmp_path / 'esc-2-2.json', make_escalation('esc-2-2', 'resolved', 'clean')
+    )
+    loaded = _load(path)
+    assert isinstance(loaded, sweep.LoadedDocument)
+    assert loaded.raw == path.read_text(encoding='utf-8')
+    assert json.loads(loaded.raw) == loaded.obj
