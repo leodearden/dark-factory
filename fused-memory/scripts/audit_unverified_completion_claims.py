@@ -55,10 +55,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
+import logging
+import os
 import re
 import sys
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from fused_memory.models.enums import MemoryCategory
@@ -739,6 +744,392 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     return parser
+
+
+# --------------------------------------------------------------------------- #
+# Wiring
+# --------------------------------------------------------------------------- #
+
+logger = logging.getLogger('audit_unverified_completion_claims')
+
+
+@dataclass(frozen=True, slots=True)
+class Probes:
+    """The three authority probes, resolved EAGERLY and passed as one facade.
+
+    Injected exactly as ``audit_found_on_main_provenance`` injects its
+    ``GitFacts`` facade, which is what lets ``_run`` be exercised end-to-end
+    with no Taskmaster, no ticket DB and no git.
+    """
+
+    task_status_probe: Callable[[str, str | None], str | None]
+    ticket_probe: Callable[[str], dict[str, Any] | None | Any]
+    commit_probe: Callable[[str, str | None], bool | None]
+
+
+def _known_projects(args: argparse.Namespace) -> list[str]:
+    """The graphs to sweep, defaulting to :data:`DEFAULT_PROJECT`."""
+    return list(args.project) if args.project else [DEFAULT_PROJECT]
+
+
+def _load_config(config_path: str | None = None) -> Any:
+    """Load a :class:`FusedMemoryConfig`.
+
+    It is a pydantic ``BaseSettings``, so the bare constructor IS the loader
+    (server/main.py:521, maintenance/_utils.py:79) — there is no ``.load()``
+    or ``.from_yaml()`` classmethod. A ``--config`` path is applied through
+    ``CONFIG_PATH`` — the env var ``settings_customise_sources`` already reads
+    (config/schema.py:2047) — so this script does not invent a second
+    config-resolution path that could drift from the server's.
+    """
+    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+
+    if config_path:
+        os.environ['CONFIG_PATH'] = str(config_path)
+    return FusedMemoryConfig()
+
+
+def _resolve_uri(args: argparse.Namespace) -> str | None:
+    """Resolve the FalkorDB URI from --uri, then the env, then the config."""
+    if args.uri:
+        return str(args.uri)
+    env_uri = os.environ.get('FALKORDB_URI')
+    if env_uri:
+        return env_uri
+    try:
+        config = _load_config(args.config)
+        return getattr(getattr(config.graphiti, 'falkordb', None), 'uri', None)
+    except Exception:
+        logger.warning(
+            'could not resolve a FalkorDB uri from config; falling back to the '
+            'client default', exc_info=True,
+        )
+        return None
+
+
+async def _build_ticket_probe(
+    db_path: Path, refs: Iterable[str]
+) -> Callable[[str], dict[str, Any] | None | Any]:
+    """Build the ticket probe, probing store AVAILABILITY exactly once.
+
+    THE DELIBERATE DIVERGENCE from the live write-path gate.
+    ``TaskInterceptor.get_ticket_row`` returns ``None`` BOTH for "no such
+    ticket" and for "no ticket store configured" (task_interceptor.py:
+    3006-3012), and ``completion_claim_gate._verify_ticket`` maps a ``None``
+    row to ``'mismatch'`` (:575). On the write path that conflation is
+    contained upstream by the ``_taskmaster_configured`` guard and costs at
+    most one spurious tag on one episode. In a BATCH sweep the same conflation
+    is a different animal: if tickets.db is merely absent or unopenable, every
+    ticket claim in the entire corpus prints as a fabrication accusation
+    against a named agent.
+
+    So availability is established ONCE, up front, and unavailability yields
+    :data:`UNRESOLVABLE` for every ref — never ``None``. The gate's own module
+    makes this distinction load-bearing at the sentinel level (:123-127,
+    INV-2), so honouring it here follows its stated intent rather than
+    departing from it.
+    """
+    rows: dict[str, Any] = {}
+    available = False
+    if not db_path.exists():
+        logger.warning(
+            'no ticket store at %s; every ticket claim is UNVERIFIABLE '
+            '(never a mismatch)', db_path,
+        )
+    else:
+        try:
+            from fused_memory.middleware.ticket_store import TicketStore  # noqa: PLC0415
+
+            store = TicketStore(db_path)
+            await store.initialize()
+            available = True
+            for ref in dict.fromkeys(refs):
+                try:
+                    # A globally unique PK lookup over the one shared
+                    # tickets.db, so it needs no project and answers a
+                    # cross-project claim correctly. A key present-but-None is
+                    # the genuine "no such ticket" (a mismatch); an ABSENT key
+                    # stays unresolvable.
+                    rows[ref] = await store.get(ref)
+                except Exception:
+                    logger.warning(
+                        'ticket lookup failed for %r; UNVERIFIABLE', ref,
+                        exc_info=True,
+                    )
+        except Exception:
+            logger.warning(
+                'ticket store at %s could not be opened; every ticket claim is '
+                'UNVERIFIABLE (never a mismatch)', db_path, exc_info=True,
+            )
+            available = False
+
+    def probe(ref: str) -> dict[str, Any] | None | Any:
+        if not available:
+            return UNRESOLVABLE
+        if ref in rows:
+            return rows[ref]
+        return UNRESOLVABLE
+
+    return probe
+
+
+async def _build_task_status_probe(
+    project_roots: dict[str, str], refs_by_project: dict[str | None, set[str]]
+) -> Callable[[str, str | None], str | None]:
+    """Build the task-status probe from ONE batched read per claimed project.
+
+    Batched rather than one read per claim (which would multiply authority
+    traffic by the claim count for no gain), and scoped to the CLAIMED project
+    rather than the writer's (a sha or task id claimed for dark_factory is not
+    answered by reify's tree). An absent key is the unresolvable signal.
+    """
+    resolved: dict[tuple[str | None, str], str] = {}
+    for project, refs in refs_by_project.items():
+        root = project_roots.get(project) if project else None
+        if not root:
+            logger.warning(
+                'project %r is not registered; %d task claim(s) are UNVERIFIABLE',
+                project, len(refs),
+            )
+            continue
+        try:
+            from fused_memory.backends.sqlite_task_backend import (  # noqa: PLC0415
+                SqliteTaskBackend,
+            )
+
+            # project_root is a METHOD argument, not a constructor kwarg, and
+            # get_statuses is a coroutine (backends/sqlite_task_backend.py:1662).
+            backend = SqliteTaskBackend()
+            statuses = await backend.get_statuses(root, ids=sorted(refs))
+        except Exception:
+            logger.warning(
+                'get_statuses failed for project %r; %d task claim(s) are '
+                'UNVERIFIABLE', project, len(refs), exc_info=True,
+            )
+            continue
+        for key, value in (statuses or {}).items():
+            if isinstance(value, str):
+                resolved[(project, str(key))] = value
+
+    def probe(ref: str, project_id: str | None) -> str | None:
+        return resolved.get((project_id, ref))
+
+    return probe
+
+
+def _build_commit_probe(
+    project_roots: dict[str, str],
+) -> Callable[[str, str | None], bool | None]:
+    """Build the commit probe over the IMPORTED :func:`make_commit_probe`.
+
+    Rooted at the CLAIMED project's repository. An unregistered project is
+    unresolvable, never a miss — reporting "no such commit" because the wrong
+    repo was searched would be a false accusation.
+    """
+    from fused_memory.services.completion_claim_gate import (  # noqa: PLC0415
+        make_commit_probe,
+    )
+
+    cache: dict[str, Callable[[str], bool | None]] = {}
+
+    def probe(ref: str, project_id: str | None) -> bool | None:
+        root = project_roots.get(project_id) if project_id else None
+        if not root:
+            return None
+        if project_id not in cache:
+            try:
+                cache[str(project_id)] = make_commit_probe(root)
+            except Exception:
+                logger.warning(
+                    'could not build a commit probe for %r; UNVERIFIABLE',
+                    project_id, exc_info=True,
+                )
+                return None
+        try:
+            return cache[str(project_id)](ref)
+        except Exception:
+            logger.warning('commit probe failed for %r; UNVERIFIABLE', ref)
+            return None
+
+    return probe
+
+
+def _default_project_roots() -> dict[str, str]:
+    """Map project_id -> project_root via the server's OWN registry builder.
+
+    :func:`build_known_projects_map` (models/scope.py:282) is the same helper
+    the server uses to populate the ``known_projects`` map it hands the live
+    gate, and it defaults its extra roots from ``known_project_roots_from_env``
+    — which is what lets one sweep answer claims about BOTH dark_factory and
+    reify. Re-deriving the mapping here would risk answering a cross-project
+    claim against the wrong tree.
+    """
+    try:
+        from fused_memory.models.scope import (  # noqa: PLC0415
+            build_known_projects_map,
+        )
+
+        primary = os.environ.get('PROJECT_ROOT') or str(
+            Path(__file__).resolve().parent.parent.parent
+        )
+        return build_known_projects_map(primary)
+    except Exception:
+        logger.warning('could not load the project registry', exc_info=True)
+        return {}
+
+
+async def _run(
+    args: argparse.Namespace,
+    *,
+    reader_factory: Callable[[str], Any] | None = None,
+    probes: Probes | None = None,
+) -> int:
+    """Sweep every requested graph and print one JSON report to stdout.
+
+    Exit codes: ``0`` ran, ``1`` infra failure (NOTHING is printed — a
+    truncated report that looks complete is worse than none), ``2``
+    ``--fail-on-mismatch`` and at least one mismatch was found.
+    """
+    if probes is None or reader_factory is None:
+        logging.basicConfig(
+            level=logging.INFO, format='%(levelname)s %(name)s: %(message)s',
+            stream=sys.stderr,
+        )
+
+    projects = _known_projects(args)
+    categories = frozenset(
+        c.strip() for c in str(args.categories).split(',') if c.strip()
+    )
+    known_project_ids = frozenset(projects)
+
+    # ---- read (may fail; nothing is printed if it does) -------------------- #
+    try:
+        make_reader: Callable[[str], Any]
+        if reader_factory is not None:
+            make_reader = reader_factory
+        else:
+            uri = _resolve_uri(args)
+
+            def _default_reader(project: str) -> Any:
+                return EpisodeReader(graph_name=project, uri=uri)
+
+            make_reader = _default_reader
+
+        readers: dict[str, Any] = {p: make_reader(p) for p in projects}
+        population: list[CorpusRecord] = []
+        for project, reader in readers.items():
+            records = await reader.fetch_population(limit=args.limit)
+            logger.info('%s: read %d episode(s)', project, len(records))
+            population.extend(records)
+    except Exception:
+        logger.error(
+            'could not read the episode population — no report is emitted '
+            'rather than a partial one that would read as complete',
+            exc_info=True,
+        )
+        return 1
+
+    scanned = scan_records(
+        population,
+        default_project_id=projects[0],
+        known_project_ids=known_project_ids,
+        categories=categories,
+    )
+
+    # ---- resolve the three authorities ONCE, eagerly, batched -------------- #
+    if probes is None:
+        project_roots = _default_project_roots()
+        refs_by_project: dict[str | None, set[str]] = {}
+        ticket_refs: list[str] = []
+        for item in scanned:
+            for claim in item.claims:
+                if claim.subject == 'task':
+                    refs_by_project.setdefault(claim.project_id, set()).add(claim.ref)
+                elif claim.subject == 'ticket':
+                    ticket_refs.append(claim.ref)
+        probes = Probes(
+            task_status_probe=await _build_task_status_probe(
+                project_roots, refs_by_project
+            ),
+            ticket_probe=await _build_ticket_probe(
+                Path(_default_ticket_db_path()), ticket_refs
+            ),
+            commit_probe=_build_commit_probe(project_roots),
+        )
+
+    findings = adjudicate(
+        scanned,
+        task_status_probe=probes.task_status_probe,
+        ticket_probe=probes.ticket_probe,
+        commit_probe=probes.commit_probe,
+    )
+
+    # ---- attach the harm artefacts to each flagged episode ----------------- #
+    edge_cache: dict[tuple[str, str], tuple[str, ...]] = {}
+    enriched: list[Finding] = []
+    for finding in findings:
+        key = (finding.project_id, finding.record_uuid)
+        if key not in edge_cache:
+            reader = readers.get(finding.project_id)
+            try:
+                edge_cache[key] = (
+                    await reader.fetch_derived_edges(finding.record_uuid)
+                    if reader is not None
+                    else ()
+                )
+            except Exception:
+                logger.warning(
+                    'could not enumerate derived edges for episode %s',
+                    finding.record_uuid, exc_info=True,
+                )
+                edge_cache[key] = ()
+        enriched.append(
+            Finding(**{**vars_of(finding), 'derived_edge_uuids': edge_cache[key]})
+        )
+
+    report = build_report(
+        enriched,
+        swept_at=datetime.now(UTC).isoformat(),
+        scanned_count=len(population),
+        records_with_claims=len(scanned),
+        projects=projects,
+        categories=sorted(categories),
+        include_unverifiable=bool(args.include_unverifiable),
+    )
+    if args.limit is not None:
+        report['limit'] = args.limit
+
+    print(json.dumps(report, indent=2, default=str))
+
+    if args.fail_on_mismatch and report['summary']['mismatch']:
+        return 2
+    return 0
+
+
+def vars_of(finding: Finding) -> dict[str, Any]:
+    """Field dict for a slots dataclass (``vars()`` does not work on slots)."""
+    return {
+        field: getattr(finding, field)
+        for field in Finding.__dataclass_fields__  # type: ignore[attr-defined]
+    }
+
+
+def _default_ticket_db_path() -> str:
+    """The shared tickets.db path, best effort.
+
+    Missing is a NORMAL outcome here, not an error: it lands every ticket claim
+    on UNVERIFIABLE via :func:`_build_ticket_probe`.
+    """
+    try:
+        config = _load_config()
+        recon = getattr(config, 'reconciliation', None)
+        data_dir = getattr(recon, 'data_dir', None) if recon else None
+        # tickets.db is a sibling of reconciliation.db inside the recon data
+        # dir — the construction at server/main.py:1546.
+        return str(Path(data_dir or './data') / 'tickets.db')
+    except Exception:
+        logger.warning('could not resolve the ticket db path', exc_info=True)
+    return str(Path('./data') / 'tickets.db')
 
 
 def main() -> int:
