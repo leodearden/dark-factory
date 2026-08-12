@@ -5078,6 +5078,29 @@ class TestLivenessSnapshotSubjectTaskIds:
             _memory('6b245659', _LIVENESS_SNAPSHOT_94_JUL24, category=_OS),
         ) == {'94'}
 
+    def test_slash_form_content_ref_alone_still_groups_a_snapshot(self):
+        """A record whose only task reference is the slash form (task 3403).
+
+        'task/94' is the orchestrator's own branch-name convention and the
+        spelling the real corpus reaches for when a snapshot is about a
+        branch or worktree; before task 3403 widened the shared TASK_REF_RE
+        grammar it was not a reference at all, so such a record had NO
+        subject and was silently ungroupable. MEASURED set() before the
+        widening.
+
+        This is the report-only path (a recurrence report, never a delete
+        candidate), so the widening buys recall here at no risk to the
+        corpus -- which is the recall this task was filed for.
+        """
+        assert liveness_snapshot_subject_task_ids(
+            _memory(
+                'm',
+                'Liveness check performed at 2026-07-24T10:00Z: task/94 '
+                'reports status=in-progress.',
+                category=_OS,
+            ),
+        ) == {'94'}
+
     def test_no_metadata_id_and_no_content_ref_is_empty(self):
         assert liveness_snapshot_subject_task_ids(
             _memory('m', 'a note that names no task at all'),

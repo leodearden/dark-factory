@@ -1325,6 +1325,55 @@ class TestExtractSnapshotEdgeTaskIds:
         """
         assert extract_snapshot_edge_task_ids(fact) == expected
 
+    # ----------------------------------------------------------------- #
+    # task 3403 — slash-form task references
+    # ----------------------------------------------------------------- #
+
+    def test_slash_form_reference_is_extracted(self):
+        """'Task/5 is pending' -> {5}.
+
+        This module hand-copies nothing: INDIVIDUAL_SNAPSHOT_RE and
+        SNAPSHOT_STATUS_PHRASE_RE are both built by splicing
+        TASK_REF_RE.pattern, precisely so the shared reference grammar
+        stays in sync. Task 3403 widened that grammar to admit the
+        orchestrator's own 'task/<id>' branch-name form, and this test
+        exercises the propagation through the module's public entry point
+        rather than re-testing the composites. MEASURED set() before the
+        widening.
+
+        Direction of risk, stated plainly: this path ends in
+        memory_service.update_edge(invalid_at=...), so a slash-form
+        reference now makes an edge retirable once its task goes terminal.
+        That is correct RECALL, not over-selection — a slash-form reference
+        IS a task reference, and a snapshot asserting 'task/5 is pending'
+        goes just as stale as one asserting 'task 5 is pending'. The
+        anchoring that bounds over-selection ('\\btask\\b', and the trailing
+        '\\b' on the digits) is untouched.
+        """
+        assert extract_snapshot_edge_task_ids('Task/5 is pending') == {5}
+
+    def test_slash_form_intervening_reference_still_re_subjects_the_gap(self):
+        """'Task 5 blocks task/9 in blocked status' -> {9}, not {5}.
+
+        The task-3042 fix (_GAP_NO_TASK_REF, wired into
+        SNAPSHOT_STATUS_PHRASE_RE's open-class gap) must survive the
+        widening: the gap is built from TASK_REF_RE too, so once the
+        grammar admits the slash form the gap must refuse to span a
+        slash-form reference exactly as it already refuses to span a spaced
+        one. Otherwise the widening would reintroduce 3042's
+        both-error-directions-at-once bug through the back door — the 'in
+        blocked status' phrase binding to the outer task 5 (a
+        permanently-true historical fact this sweep would then retire) AND
+        consuming task/9, so the edge that genuinely IS a blocked-status
+        snapshot stays invisible to the sweep.
+
+        MEASURED set() before the widening — the slash reference was simply
+        not a reference then, so neither id was reachable.
+        """
+        assert extract_snapshot_edge_task_ids(
+            'Task 5 blocks task/9 in blocked status'
+        ) == {9}
+
 
 # --------------------------------------------------------------------------- #
 # extract_snapshot_edge_task_ids — catastrophic-backtracking regression
