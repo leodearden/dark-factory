@@ -24,6 +24,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 __all__ = [
+    'HUMAN_CURATOR_ADJUDICATED_AT_KEY',
     'HUMAN_CURATOR_GATE_KEY',
     'KNOWN_ROLE_NAMES',
     'BeforeDone',
@@ -102,6 +103,15 @@ KNOWN_ROLE_NAMES: frozenset[str] = frozenset(
 # key — imports it from here rather than restating the literal, so the write
 # boundary's rejection and the runner's dispatch-time guard cannot drift apart.
 HUMAN_CURATOR_GATE_KEY: str = 'human_curator_gate'
+
+# The human-curator-gate contract's STAMP half (task 3341): the ISO-8601 stamp
+# that proves a human actually performed the per-entry content review the
+# marker above demands. Blessed in _BLESSED_METADATA_KEYS alongside the
+# marker. No validator here reads it today (3369 only reads the marker), but
+# it is still declared here as this key's SINGLE definition codebase-wide
+# (task 3420) — orchestrator.deterministic_runner imports it rather than
+# restating the literal, for the same drift reason as the marker above.
+HUMAN_CURATOR_ADJUDICATED_AT_KEY: str = 'human_curator_adjudicated_at'
 
 
 def validate_model_overrides(value: object) -> None:
@@ -981,7 +991,7 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # one above precisely so the human content curator is not conflated
         # with the automated task curator.
         HUMAN_CURATOR_GATE_KEY,
-        'human_curator_adjudicated_at',
+        HUMAN_CURATOR_ADJUDICATED_AT_KEY,
         # Orchestrator block-stamp (task 3697): written by workflow.py
         # `_mark_blocked` on every block, read by agents/briefing.py for the
         # stale-briefing check; 78 tasks carry it (census 2026-08-06). The
