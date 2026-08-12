@@ -18,7 +18,7 @@ headroom off a broken probe, which is precisely the reading an operator would
 trust.
 """
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 
 import lms_manifest
 import lms_vram
@@ -776,3 +776,180 @@ def test_the_polluted_baseline_error_carries_the_offenders_for_a_caller():
     error = lms_vram.PollutedBaselineError([OLLAMA])
 
     assert error.consumers == [OLLAMA]
+
+
+# ---------------------------------------------------------------------------
+# (h) the baseline store carries the inventory, and refuses a polluted one
+# ---------------------------------------------------------------------------
+#
+# "Do not record a polluted baseline" is enforced AT THE WRITE, not at every
+# read.  Enforcing at the write means no polluted file can exist for any later
+# reader to pick up, and it matches the refusal already sited in `lms_ctl.start`
+# for a failed pre-flight -- "a refused arm leaves no baseline behind for
+# another arm's report to pick up".
+#
+# `consumers` is a REQUIRED keyword, not an optional one.  An optional inventory
+# would let a caller record a baseline carrying no evidence about who else held
+# the card, and downstream that absence reads as "clean".
+
+
+def test_the_recorded_baseline_carries_the_consumer_inventory(tmp_path, monkeypatch):
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path))
+
+    lms_vram.record_baseline('qwen3.5-9b', _reading(), consumers=[WHISPER])
+    record = lms_vram.read_baseline_record('qwen3.5-9b')
+
+    assert record.reading.used_mib == 7310
+    assert record.reading.free_mib == 16813
+    assert record.reading.total_mib == 24576
+    assert record.consumers == [WHISPER]
+
+
+def test_an_empty_inventory_round_trips_as_an_empty_inventory(tmp_path, monkeypatch):
+    """A card nobody holds is a real, and ideal, baseline state.  It must not
+    be confused with "nobody looked"."""
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path))
+
+    lms_vram.record_baseline('qwen3.5-9b', _reading(), consumers=[])
+
+    assert lms_vram.read_baseline_record('qwen3.5-9b').consumers == []
+
+
+def test_the_recorded_record_is_stamped_with_an_aware_utc_time(tmp_path, monkeypatch):
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path))
+
+    lms_vram.record_baseline('qwen3.5-9b', _reading(), consumers=[WHISPER])
+    record = lms_vram.read_baseline_record('qwen3.5-9b')
+
+    assert record.measured_at.tzinfo is not None
+
+
+def test_recording_a_polluted_baseline_is_refused_and_writes_nothing(
+    tmp_path, monkeypatch,
+):
+    """The measured 2026-08-06 hazard, refused at the write.
+
+    Not "written and flagged": a file on disk would be picked up by the next
+    healthcheck as the number to subtract from an arm's footprint, and a flag
+    inside it only helps a reader who thought to look.
+    """
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path))
+
+    with pytest.raises(lms_vram.PollutedBaselineError) as excinfo:
+        lms_vram.record_baseline(
+            'qwen3.5-9b', _reading(), consumers=[WHISPER, OLLAMA],
+        )
+
+    assert '/usr/local/lib/ollama/llama-server' in str(excinfo.value)
+    assert not lms_vram.baseline_path('qwen3.5-9b').exists()
+
+
+def test_a_refused_baseline_does_not_clobber_a_previously_clean_one(
+    tmp_path, monkeypatch,
+):
+    """The refusal is raised BEFORE any write, so a truncate-then-fail cannot
+    destroy a good measurement and leave a half-file behind."""
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path))
+    lms_vram.record_baseline('qwen3.5-9b', _reading(used_mib=7310), consumers=[WHISPER])
+
+    with pytest.raises(lms_vram.PollutedBaselineError):
+        lms_vram.record_baseline(
+            'qwen3.5-9b', _reading(used_mib=17000, free_mib=7123),
+            consumers=[WHISPER, OLLAMA],
+        )
+
+    survivor = lms_vram.read_baseline_record('qwen3.5-9b')
+    assert survivor.reading.used_mib == 7310
+    assert survivor.consumers == [WHISPER]
+
+
+def test_a_baseline_payload_with_no_consumers_key_raises_rather_than_reading_clean(
+    tmp_path, monkeypatch,
+):
+    """A baseline written before this guard existed carries no evidence about
+    who held the card.  Defaulting it to `[]` would make the one baseline we
+    know NOTHING about look like the cleanest possible reading.
+
+    Baselines live in $XDG_RUNTIME_DIR and are per-boot, so the staleness window
+    is bounded and the fix is a single command -- which the message must name.
+    """
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path))
+    path = lms_vram.baseline_path('qwen3.5-9b')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        'arm_id': 'qwen3.5-9b',
+        'measured_at': '2026-08-06T12:00:00+00:00',
+        'total_mib': 24576,
+        'used_mib': 7310,
+        'free_mib': 16813,
+    }))
+
+    with pytest.raises(lms_vram.VramProbeError, match='lms_ctl start'):
+        lms_vram.read_baseline_record('qwen3.5-9b')
+
+
+def test_reading_a_missing_baseline_record_raises(tmp_path, monkeypatch):
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path))
+
+    with pytest.raises(lms_vram.VramProbeError, match='no baseline'):
+        lms_vram.read_baseline_record('qwen3.5-9b')
+
+
+def test_read_baseline_records_returns_the_chosen_records_own_consumers(
+    tmp_path, monkeypatch,
+):
+    """The reading and the inventory can never come from different moments.
+
+    Picking the lowest-used READING from one arm and the inventory from another
+    would describe a card that never existed -- and the mismatch would be
+    invisible in the artifact, which is the worst property a record can have.
+    """
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path))
+    stray = _consumer(pid=331, process_name='/usr/bin/glxgears', used_mib=512)
+    lms_vram.record_baseline(
+        'a', _reading(used_mib=7310, free_mib=16813), consumers=[WHISPER],
+    )
+    lms_vram.record_baseline(
+        'b', _reading(used_mib=9000, free_mib=15123), consumers=[WHISPER, stray],
+    )
+
+    chosen = lms_vram.read_baseline_records(['a', 'b'])
+
+    assert chosen.reading.used_mib == 7310
+    assert chosen.reading.free_mib == 16813
+    assert chosen.consumers == [WHISPER]
+
+
+def test_read_baseline_records_raises_when_asked_for_nothing(tmp_path, monkeypatch):
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path))
+
+    with pytest.raises(lms_vram.VramProbeError):
+        lms_vram.read_baseline_records([])
+
+
+def test_read_baseline_and_read_baselines_still_hand_back_a_plain_reading(
+    tmp_path, monkeypatch,
+):
+    """Existing callers are unchanged: the record is the new value, and the two
+    older accessors stay thin wrappers over its reading."""
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path))
+    lms_vram.record_baseline('a', _reading(used_mib=7310), consumers=[WHISPER])
+    lms_vram.record_baseline(
+        'b', _reading(used_mib=9000, free_mib=15123), consumers=[WHISPER],
+    )
+
+    assert isinstance(lms_vram.read_baseline('a'), lms_vram.GpuReading)
+    assert lms_vram.read_baseline('a').used_mib == 7310
+    assert isinstance(lms_vram.read_baselines(['a', 'b']), lms_vram.GpuReading)
+    assert lms_vram.read_baselines(['a', 'b']).used_mib == 7310
+
+
+def test_a_baseline_record_is_frozen():
+    record = lms_vram.GpuBaseline(
+        reading=_reading(),
+        consumers=[WHISPER],
+        measured_at=datetime.now(UTC),
+    )
+
+    with pytest.raises(ValidationError):
+        record.consumers = []
