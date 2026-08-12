@@ -497,6 +497,14 @@ def probe_health(
     hung asyncio loop never trips systemd's own watchdog) manifests as no
     HTTP response at all within the timeout — that is the only case that
     should return False here.
+
+    TWO CALLERS, ONE FAIL-DIRECTION (task 3765). This now serves both the kill
+    decision's /alive probe (_fused_memory_liveness_verdict passes
+    FUSED_MEMORY_ALIVE_URL explicitly) and its original FUSED_MEMORY_HEALTH_URL
+    default. The inverted fail-direction above is correct for both and stays
+    untouched: /alive returns only 200, so its "responded at all" reading is
+    trivially the same signal, and /health's 503-means-alive reading is exactly
+    what keeps a degraded store from being mistaken for a dead loop.
     """
     try:
         with urllib.request.urlopen(url, timeout=timeout):
@@ -518,13 +526,29 @@ def _fused_memory_liveness_verdict() -> str:
     (which restarts on anything but 'healthy') and _print_fused_memory_liveness()
     (the --report row).
 
+    MEASURES ALIVENESS, VIA THE ZERO-I/O /alive ROUTE (task 3765). /health is
+    deliberately NOT consulted here: it awaits two sequential backing-store
+    round-trips (FalkorDB then Qdrant, each under asyncio.timeout(5)), which
+    makes any verdict drawn from it a LOAD measurement rather than a liveness
+    one — a slow store or a busy-but-advancing loop manufactured a false
+    'wedged' and got the single shared MCP server restarted for nothing. The
+    detector survives the swap because /alive is served by the SAME asyncio
+    loop, so a genuinely hung loop still fails to answer it (task 1731: the
+    systemd WATCHDOG=1 ping runs on a dedicated OS thread and so can never
+    catch a hung loop; only an HTTP fetch served by that loop can).
+
+    /health remains the READINESS signal and keeps its own consumers:
+    _fused_memory_recon_busy_verdict() (which needs the recon_busy body that
+    /alive by construction does not carry) and, through it,
+    _print_fused_memory_liveness()'s recon-busy column.
+
     The port probe runs first and short-circuits before the (up to 15s)
-    health fetch, so a fully-dead unit is classified quickly without waiting
+    /alive fetch, so a fully-dead unit is classified quickly without waiting
     on probe_health()'s timeout.
     """
     if not probe_port(FUSED_MEMORY_PORT):
         return "port-down"
-    if probe_health():
+    if probe_health(FUSED_MEMORY_ALIVE_URL, timeout=FUSED_MEMORY_ALIVE_TIMEOUT_SECS):
         return "healthy"
     return "wedged"
 
@@ -1402,7 +1426,7 @@ def fused_memory_liveness_pass() -> None:
     WATCHED and main()'s loop are pinned by exact-equality drift tests. This
     sibling pass reuses is_unit_enabled + STARTUP_GRACE_SECS gating verbatim
     from main(), and _fused_memory_liveness_verdict() (B2) for the combined
-    port+/health verdict.
+    port+/alive verdict.
 
     THE KILL DECISION IS BOUNDED IN TIME (task 3764). A restart requires
     FM_LIVENESS_STREAK_THRESHOLD CONSECUTIVE non-healthy verdicts — 'port-down'
@@ -1424,13 +1448,22 @@ def fused_memory_liveness_pass() -> None:
     genuinely wedged asyncio loop (wedged by definition) still reaches it on
     the third tick.
 
+    COMPLEMENTARY TO /alive (task 3765). The verdict's HTTP probe now targets
+    the zero-I/O /alive route instead of /health. The two mitigations remove
+    DIFFERENT false-positive classes and neither is sufficient alone: /alive
+    removes the BACKING-STORE class (a slow FalkorDB/Qdrant reading as a
+    wedge), while this streak removes the TRANSIENT-STALL class (an
+    event-loop stall long enough to blow any timeout, which blocks /alive
+    exactly as it blocked /health). That is why the /alive budget was NOT
+    shortened below the /health one — see FUSED_MEMORY_ALIVE_TIMEOUT_SECS.
+
     DELIBERATELY UNCHANGED:
       - probe_health()'s inverted fail-direction — an HTTP response INCLUDING
         a 503 means alive, since a degraded backing store is not something a
         restart fixes;
       - _fused_memory_liveness_verdict()'s port-probe short-circuit, so a
         fully-dead unit is still classified without waiting on the up-to-15s
-        /health fetch;
+        /alive fetch;
       - the is_unit_enabled and STARTUP_GRACE_SECS gates above, which still
         return before any streak read or write (operator intent and a
         not-yet-bound port are neither failure evidence nor recovery);
