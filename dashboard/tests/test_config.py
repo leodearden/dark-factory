@@ -24,6 +24,13 @@ def _write_yaml(path, data) -> None:
     path.write_text(yaml.safe_dump(data))
 
 
+def _write_raw(path, text: str) -> None:
+    """Write literal (possibly malformed) YAML text — for cases ``_write_yaml``
+    can't produce, e.g. unparseable or wrong-typed-at-the-root documents."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
 class TestCanonicalConfigPreferred:
     """Scope 1: canonical name wins; legacy spellings are a warned fallback."""
 
@@ -95,8 +102,7 @@ class TestCanonicalConfigPreferred:
         root = tmp_path / 'myproj'
         # Earlier spelling (first in _LEGACY_CONFIG_NAMES): yields no URL.
         earlier = root / 'orchestrator.yaml'
-        earlier.parent.mkdir(parents=True, exist_ok=True)
-        earlier.write_text(earlier_raw)
+        _write_raw(earlier, earlier_raw)
         # Later spelling (last in _LEGACY_CONFIG_NAMES): valid port.
         _write_yaml(root / 'orchestrator/config.yaml', {'escalation': {'port': 9202}})
 
@@ -190,7 +196,7 @@ class TestNoUrlWarnsNamingRoot:
         """
         root = tmp_path / 'myproj'
         _write_yaml(root / 'orchestrator.yaml', {'escalation': {'port': 9202}})
-        (root / 'dark-factory-orchestrator.yaml').write_text('escalation: [unclosed')
+        _write_raw(root / 'dark-factory-orchestrator.yaml', 'escalation: [unclosed')
 
         with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
             result = _discover_escalation_urls([root])
@@ -239,8 +245,7 @@ class TestNonMappingEscalationSection:
         """
         root = tmp_path / 'myproj'
         canonical_path = root / 'dark-factory-orchestrator.yaml'
-        canonical_path.parent.mkdir(parents=True, exist_ok=True)
-        canonical_path.write_text(raw_body)
+        _write_raw(canonical_path, raw_body)
 
         with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
             result = _discover_escalation_urls([root])
@@ -284,8 +289,7 @@ class TestNonMappingEscalationSection:
         """
         root = tmp_path / 'myproj'
         canonical_path = root / 'dark-factory-orchestrator.yaml'
-        canonical_path.parent.mkdir(parents=True, exist_ok=True)
-        canonical_path.write_text(raw_body)
+        _write_raw(canonical_path, raw_body)
 
         with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
             result = _discover_escalation_urls([root])
@@ -312,7 +316,7 @@ class TestNonMappingEscalationSection:
         """
         root = tmp_path / 'myproj'
         _write_yaml(root / 'orchestrator.yaml', {'escalation': {'port': 9202}})
-        (root / 'dark-factory-orchestrator.yaml').write_text('escalation: not-a-dict')
+        _write_raw(root / 'dark-factory-orchestrator.yaml', 'escalation: not-a-dict')
 
         with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
             result = _discover_escalation_urls([root])
@@ -388,8 +392,7 @@ class TestNonMappingEscalationSection:
         _write_yaml(main_root / 'dark-factory-orchestrator.yaml', {'escalation': {'port': 9101}})
         broken_root = tmp_path / 'broken'
         broken_canonical = broken_root / 'dark-factory-orchestrator.yaml'
-        broken_canonical.parent.mkdir(parents=True, exist_ok=True)
-        broken_canonical.write_text('escalation: not-a-dict')
+        _write_raw(broken_canonical, 'escalation: not-a-dict')
 
         with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
             cfg = DashboardConfig(project_root=main_root, known_project_roots=[broken_root])
