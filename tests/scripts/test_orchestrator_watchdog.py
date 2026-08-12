@@ -4456,6 +4456,11 @@ def _install_url_dispatching_urlopen(
             raise outcome
         if callable(outcome):
             return outcome(url)
+        if not isinstance(outcome, int):
+            pytest.fail(
+                f"outcome for {url!r} must be an int status code, an Exception "
+                f"instance, or a callable — got {outcome!r}"
+            )
         return _FakeHealthResponse(outcome)
 
     monkeypatch.setattr(wdog.urllib.request, "urlopen", fake_urlopen)
