@@ -156,7 +156,14 @@ To be filed via the curator path (plain `submit_task`; curator dedup is the prot
 
 ## Filed Tasks
 
-_none filed._
+Recorded retroactively (2026-08-12, by task 3614). This section read `_none filed._` while two tasks had in fact been filed from these candidates — itself an instance of §3.4's finding that rendered surfaces omit their own basis.
+
+| Candidate | Task | Scope actually taken |
+|---|---|---|
+| R3, and cluster 1.1 facet **(a)** | **3610** — "Census R6 (07-31 R1-R3 refile + 3278 residual)" | Relax `is_harness_injected_turn`'s all-three-headings co-occurrence requirement (the §6 discriminating check, verified still failing on main); add exit-code / designed-outcome awareness to `tool_error` extraction. Its title says "R1-R3", but its FIX list covers only these two — R1 and R2 were left undischarged. |
+| R1, R2 | **3614** — "Legibility digest: discharge 07-31 census R1 and R2" | R1: new `is_pasted_report_turn` predicate excluding pasted recon run-review dumps from gold user turns (facet **(b)**, distinct from 3610's facet (a) — see that task's separate-predicate rationale), plus quantified item-truncation marking (`... [item truncated: N of M bytes dropped]`) and a `truncated_items` frontmatter key. R2: `n_user_turns` frontmatter key making `score` reconstructible from the frontmatter alone. |
+
+**R4** (CLAUDE.md `git commit --only` pathspec hazard) and **R5** (shared-document re-read/freshness convention) remain **unfiled** as of this edit — verified against the task corpus 2026-08-12; the nearest matches (3058, 2745, 3060) address adjacent but distinct surfaces and do not cover either candidate.
 
 ## Cost
 
