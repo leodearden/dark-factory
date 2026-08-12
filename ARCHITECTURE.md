@@ -821,11 +821,42 @@ flowchart LR
 
   | Action | Effect on the task |
   |---|---|
-  | `resume` | → `pending` (or `resume_from_pause` for a paused workflow) |
+  | `resume` | → `pending`, `resume_from_pause` (two preconditions — see below) |
   | `restart` | → `pending`, `restart_from_scratch` |
   | `park` | → `blocked`; the L2 escalation stays open |
   | `abandon` | → `cancelled` |
   | `close_only` | no task effect — closes the escalation without touching the task |
+
+  The table is Table B (`escalation/src/escalation/action_effects.py`), and
+  `resolve_issue` itself writes **no** task status — it changes only the
+  escalation record and consults `effect_for` purely as a legality gate
+  (`escalation/src/escalation/server.py`); the task-status effect is applied by
+  the orchestrator harness. `resume_from_pause` is the *disposition* name that
+  routes the effect, not a second target status: the row is
+  `('resume', ANY, ANY) → TaskEffect('pending', 'resume_from_pause')`, and the
+  one production comparison against it (`harness.py` ~:12658) routes to
+  `_cascade_unblock_member`, which sources its target from that same row and so
+  writes `pending`. There is no distinct paused-workflow target.
+
+  Two preconditions on `resume` are worth stating, because together they are
+  why a **stranded** row is unreachable by it:
+
+  1. **Status string equality, not liveness.** `_cascade_unblock_member`
+     (`harness.py` ~:13440) re-reads the row and returns early at
+     `if status != 'blocked'` (~:13524). Every other status — including an
+     `in-progress` row whose claimant is long dead — is DEBUG-skipped.
+     (`infra-hold` has its own pre-gate just above, which writes `in-progress`
+     instead.) The flip itself sits behind a same-signature re-block guard.
+  2. **L0 resolutions never reach it.** `_on_escalation_resolved`
+     (~:12564) nests the entire resume disposition inside
+     `if escalation.level >= 1` (~:12665), so resolving an L0 produces no
+     status change at all.
+
+  Normatively this is a defect, not a design: the spec
+  ([docs/task-escalation-state-spec.md](docs/task-escalation-state-spec.md)
+  §7.4, PRD leaf ζ) requires `resume` to key off **claimant liveness** rather
+  than `status == 'blocked'` string equality, and requires the L0-resolution
+  path to reach orphaned rows. Neither has landed yet.
 
   A level cap prevents the watcher's own MCP connection from resolving
   anything at L2 (`level_forbidden`) — except a narrow, evidence-gated
