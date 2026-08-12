@@ -669,14 +669,41 @@ def _fmt_duration(seconds: float) -> str:
     return f'{seconds / 3600.0:.1f} h'
 
 
+def _entry_id(entry: Any) -> str:
+    """Normalise one entry to an escalation ID string.
+
+    Id-normalisation is part of :func:`_flatten_ids`' contract, not a caller's
+    duty — do not "simplify" this back to a bare ``str()``.  Callers legitimately
+    hold RECORDS rather than pre-extracted ids (``EscalationRef`` at the
+    reconcile sweep, a raw queue ``Escalation`` at the scheduler and
+    deterministic-recon sites), and passing those records straight through is
+    what lets the tally, :func:`as_ageable_records` and
+    :func:`escalation_ages_secs` all read the SAME objects instead of two
+    divergently-normalised copies.  Without this, a record folds as its whole
+    dataclass repr and the operator-facing summary becomes unreadable.
+
+    Provably inert for the already-correct path: a plain ``str`` has no ``.id``,
+    so a bucketed mapping of id strings is byte-identical through here.
+
+    Total by construction — an entry exposing no ``.id`` degrades to its
+    ``str()`` rather than raising.  This runs inside a sweep, and a dropped id
+    would read as "nothing held this".
+    """
+    return str(getattr(entry, 'id', entry))
+
+
 def _flatten_ids(escalation_ids: Any) -> list[str]:
-    """Flatten a bucketed id mapping (or a bare sequence) to a sorted list."""
+    """Flatten a bucketed id mapping (or a bare sequence) to a sorted list.
+
+    Entries may be id strings OR records carrying an ``.id`` — see
+    :func:`_entry_id`.
+    """
     if isinstance(escalation_ids, dict):
         flat: list[str] = []
         for ids in escalation_ids.values():
-            flat.extend(str(i) for i in (ids or ()))
+            flat.extend(_entry_id(i) for i in (ids or ()))
         return sorted(set(flat))
-    return sorted({str(i) for i in (escalation_ids or ())})
+    return sorted({_entry_id(i) for i in (escalation_ids or ())})
 
 
 def emit_recovery_veto_streak_escalation(
@@ -953,7 +980,11 @@ class RecoverySweepTally:
     """
 
     held: int = 0
-    #: The ids that did the holding, de-duplicated, in first-seen order.
+    #: The escalation IDS that did the holding, de-duplicated.  Ordered
+    #: first-seen ACROSS successive :meth:`record` calls, and sorted WITHIN one
+    #: call's own id set (``_flatten_ids`` sorts what it flattens).  Entries
+    #: arrive as records or as bare id strings and are normalised to ids by
+    #: :func:`_entry_id` — never as reprs.
     pinning_ids: list[str] = field(default_factory=list)
     #: LeaveReason spelling -> count, for every NON-veto fall-through.
     left: dict[str, int] = field(default_factory=dict)
