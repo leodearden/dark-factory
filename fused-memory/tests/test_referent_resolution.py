@@ -31,6 +31,7 @@ from fused_memory.utils.referent_resolution import (
     ReferentResolution,
     resolve_referents,
 )
+from fused_memory.utils.validation import InputValidationError
 
 #: The group every derived-path test scans in, unless it needs a foreign one.
 GROUP = 'dark_factory'
@@ -564,3 +565,157 @@ class TestDeclaredPrecedence:
             Referent(kind='task', number='2500'),
             Referent(kind='task', project_id='dark_factory', number='2500'),
         )
+
+
+class TestMalformedDeclarationIsRejectedLoudly:
+    """A malformed ``declared`` entry RAISES; it is never dropped, and never
+    smuggled into ``.conflicts``.
+
+    Three failure shapes were available and only one is honest. Reporting a
+    typo through ``.conflicts`` would tell the agent "your declaration
+    contradicts your prose" and send it hunting a semantic disagreement that
+    does not exist — and a malformed entry is not a ``Referent`` anyway, which
+    is what ``.conflicts`` is typed as. Silently DROPPING a bad entry is worse:
+    it flips ``.source`` down to 'metadata' or 'derived', loses the caller's
+    intent invisibly, and corrupts the very declaration-rate telemetry ι is
+    being built to read — the silent-degradation failure this repo's
+    loud-over-silent norm forbids.
+
+    ``InputValidationError`` is reused rather than a new type: it documents
+    itself as exactly this, it subclasses ValueError so ``except ValueError``
+    callers keep working, and δ's boundary then sees ONE exception type.
+    """
+
+    @pytest.mark.parametrize(
+        'declared',
+        [
+            {'kind': 'task', 'id': 3127},
+            'task:3127',
+            3127,
+        ],
+        ids=['bare-dict', 'bare-string', 'bare-int'],
+    )
+    def test_a_non_list_declared_is_rejected(self, declared):
+        with pytest.raises(InputValidationError):
+            resolve_referents(
+                declared=declared,  # type: ignore[arg-type]
+                metadata={},
+                content='',
+                group_id=GROUP,
+            )
+
+    @pytest.mark.parametrize(
+        'entry',
+        [3127, 'Task 3127', None, ['task', 3127]],
+        ids=['int', 'string', 'none', 'list'],
+    )
+    def test_a_non_dict_entry_is_rejected(self, entry):
+        with pytest.raises(InputValidationError):
+            resolve_referents(
+                declared=[entry],  # type: ignore[list-item]
+                metadata={},
+                content='',
+                group_id=GROUP,
+            )
+
+    @pytest.mark.parametrize(
+        'entry',
+        [
+            {'kind': 'task'},
+            {'id': ''},
+            {'id': '  '},
+            {'id': '3127a'},
+            {'id': 'Task 3127'},
+            {'id': '٣'},
+            {'id': 3.0},
+            {'id': None},
+            {'id': True},
+        ],
+        ids=[
+            'missing-id',
+            'empty-id',
+            'whitespace-id',
+            'trailing-junk-id',
+            'label-spelled-id',
+            'non-ascii-digit-id',
+            'float-id',
+            'none-id',
+            'bool-must-not-become-task-1',
+        ],
+    )
+    def test_an_unusable_id_is_rejected(self, entry):
+        with pytest.raises(InputValidationError):
+            resolve_referents(declared=[entry], metadata={}, content='', group_id=GROUP)
+
+    def test_an_unknown_key_is_rejected_rather_than_ignored(self):
+        """A camelCase typo would otherwise SILENTLY resolve to an
+        OWN-project referent — a confidently wrong answer about which project
+        a fact belongs to, which is the exact class of error this PRD exists
+        to eliminate."""
+        with pytest.raises(InputValidationError):
+            resolve_referents(
+                declared=[{'kind': 'task', 'id': 3127, 'projectId': 'reify'}],
+                metadata={},
+                content='',
+                group_id=GROUP,
+            )
+
+    def test_an_unregistered_kind_is_rejected_as_an_input_validation_error(self):
+        """Caught from ``Referent.__post_init__`` and re-raised, so δ's
+        boundary sees ONE exception type rather than a bare ValueError leaking
+        through from the vocabulary module."""
+        with pytest.raises(InputValidationError) as excinfo:
+            resolve_referents(
+                declared=[{'kind': 'escalation', 'id': 3127}],
+                metadata={},
+                content='',
+                group_id=GROUP,
+            )
+        # __post_init__'s message already names the registered kinds and where
+        # to add one; re-raising must preserve that remediation, not replace it.
+        assert '_KIND_LABELS' in str(excinfo.value)
+
+    def test_a_path_shaped_project_id_is_refused_not_canonicalized(self):
+        """Normalizing a mangled path would mint a NEW, wrong canonical key
+        (RCA §4) — the referent would then confidently name a project that
+        does not exist."""
+        with pytest.raises(InputValidationError):
+            resolve_referents(
+                declared=[{'kind': 'task', 'id': 132, 'project_id': '../etc'}],
+                metadata={},
+                content='',
+                group_id=GROUP,
+            )
+
+    def test_the_message_names_the_offending_entry_and_a_remediation_hint(self):
+        """Follows ``require_full_uuid``'s shape: a single module-level hint
+        constant folded into the raised message, so the remediation text has
+        one site."""
+        with pytest.raises(InputValidationError) as excinfo:
+            resolve_referents(
+                declared=[{'kind': 'task', 'id': '3127a'}], metadata={}, content='', group_id=GROUP
+            )
+        message = str(excinfo.value)
+        assert '3127a' in message
+        assert "'kind'" in message and "'id'" in message and "'project_id'" in message
+
+    def test_an_oversized_entry_cannot_blow_up_the_error_message(self):
+        """``_safe_repr``'s truncation discipline, copied so a pathological
+        declaration cannot produce an unbounded exception message."""
+        with pytest.raises(InputValidationError) as excinfo:
+            resolve_referents(
+                declared=[{'id': 'x' * 10_000}], metadata={}, content='', group_id=GROUP
+            )
+        assert len(str(excinfo.value)) < 2_000
+
+    def test_a_malformed_entry_never_degrades_the_source_or_lands_in_conflicts(self):
+        """The NEGATIVE assertion: the call RAISES rather than returning, so a
+        bad entry can neither flip ``.source`` down to a lower source nor be
+        reported as a semantic conflict."""
+        with pytest.raises(InputValidationError):
+            resolve_referents(
+                declared=[{'kind': 'task', 'id': 3127}, {'id': 'oops'}],
+                metadata={'task_id': 3668},
+                content='Fixed the bug in Task 3127.',
+                group_id=GROUP,
+            )
