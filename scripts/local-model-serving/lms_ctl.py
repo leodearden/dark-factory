@@ -107,15 +107,30 @@ def start(
     arm: ArmEntry,
     gpu: lms_vram.GpuReading | None = None,
     *,
+    consumers: list[lms_vram.GpuConsumer] | None = None,
     exclusive: bool = False,
 ) -> None:
+    """Start one arm, capturing the baseline the budget verdict will subtract.
+
+    Probes WHO holds the card alongside HOW MUCH is held, as one capture: a
+    reading taken at one instant paired with an inventory from another would
+    describe a card that never existed.
+
+    Ordering is refuse-then-record-then-start throughout.  A polluted card
+    raises out of :func:`lms_vram.record_baseline` before any systemctl call,
+    so an arm is never launched onto a card it will then be measured against
+    unfairly -- every number such a run produced would be uninterpretable, and
+    nothing downstream would say so.
+    """
     reading = gpu if gpu is not None else lms_vram.probe_gpu()
+    held_by = consumers if consumers is not None else lms_vram.probe_gpu_consumers()
     preflight(arm, reading, exclusive=exclusive)
     # The reading the pre-flight just admitted this arm on IS the "immediately
     # before it started" baseline the budget verdict subtracts (esc-3713-6).
     # Recorded here, after the refusal path and before the side effect, so a
     # refused arm leaves no baseline behind for another arm's report to pick up.
-    lms_vram.record_baseline(arm.arm_id, reading)
+    # This call also RAISES on a polluted card, and does so before it writes.
+    lms_vram.record_baseline(arm.arm_id, reading, consumers=held_by)
     _systemctl('start', unit_name(arm))
 
 
@@ -257,6 +272,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.verb == 'start':
         try:
             start(arm, exclusive=not args.no_exclusive)
+        # BEFORE the VramProbeError branch it subclasses. These two refusals
+        # have OPPOSITE fixes and so must not collapse into one code: 4 means
+        # this arm is too big for this card (use a smaller arm, or a bigger
+        # budget), 5 means another process is holding the card (free it and
+        # start the same arm again).
+        except lms_vram.PollutedBaselineError as exc:
+            print(f'lms_ctl: refusing to start {arm.arm_id}: {exc}', file=sys.stderr)
+            return 5
         except (ArmPreflightError, lms_vram.VramProbeError) as exc:
             print(f'lms_ctl: refusing to start {arm.arm_id}: {exc}', file=sys.stderr)
             return 4

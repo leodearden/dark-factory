@@ -263,12 +263,14 @@ def test_a_polluted_refusal_does_not_clobber_an_earlier_clean_baseline(
 ):
     lms_ctl.start(_arm(), gpu=MEASURED_GPU, consumers=[WHISPER])
 
+    # A card where ollama is resident but the arm would still FIT, so the
+    # pollution guard is what refuses and not the pre-flight. On a busier card
+    # the pre-flight often fires first; both refusals are correct, and this
+    # test is about the one that is new.
+    polluted = lms_vram.GpuReading(total_mib=24576, used_mib=14364, free_mib=10212)
+
     with pytest.raises(lms_vram.PollutedBaselineError):
-        lms_ctl.start(
-            _arm(),
-            gpu=lms_vram.GpuReading(total_mib=24576, used_mib=17676, free_mib=6447),
-            consumers=[WHISPER, OLLAMA],
-        )
+        lms_ctl.start(_arm(), gpu=polluted, consumers=[WHISPER, OLLAMA])
 
     assert lms_vram.read_baseline_record('qwen3.5-9b').reading.used_mib == 7362
 
@@ -339,11 +341,19 @@ def test_cli_start_names_the_offending_consumer_on_stderr(
 def test_cli_start_still_returns_4_when_the_arm_simply_does_not_fit(
     fake_systemctl, baseline_dir, cli_gpu, capsys,
 ):
-    """The pre-existing refusal keeps its own code, so the two stay separable."""
-    code = lms_ctl.main(['start', 'moe-stretch'])
+    """The pre-existing refusal keeps its own code, so the two stay separable.
+
+    The card is nearly full but nothing FOREIGN holds it -- whisper-writer is
+    expected here -- so this is an oversized arm, not a polluted slate.
+    """
+    cli_gpu['reading'] = lms_vram.GpuReading(
+        total_mib=24576, used_mib=20000, free_mib=4576,
+    )
+
+    code = lms_ctl.main(['start', 'qwen3.5-9b'])
 
     assert code == 4
-    assert ['start', 'lms-arm@moe-stretch.service'] not in fake_systemctl.calls()
+    assert ['start', 'lms-arm@qwen3.5-9b.service'] not in fake_systemctl.calls()
 
 
 def test_stop_issues_exactly_one_systemctl_stop(fake_systemctl):
