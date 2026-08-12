@@ -53,6 +53,8 @@ lines 52-62. If you need a literal here, import it; do not type it.
 """
 from __future__ import annotations
 
+import argparse
+import difflib
 import json
 import os
 import stat
@@ -483,6 +485,11 @@ class Outcome(NamedTuple):
     recovered_names: tuple[str, ...]
     #: '' when the action is a repair.
     reason: str
+    #: For a REFUSAL: :data:`RESIDUE_LEAK` when the string carries the PRD
+    #: section-2 leak signature, :data:`RESIDUE_QUOTED_ONLY` when it merely
+    #: quotes an envelope literal in prose. '' otherwise. Report-only — it
+    #: never gates a repair.
+    residue: str = ''
 
 
 def _join(path: str, key: str) -> str:
@@ -559,6 +566,7 @@ def _repair_dict(node: dict, path: str, outcomes: list[Outcome]) -> tuple[dict, 
                     action=ACTION_REFUSED,
                     recovered_names=(),
                     reason=_classify_refusal(value, key, schema),
+                    residue=RESIDUE_LEAK if has_leak_signature(value) else RESIDUE_QUOTED_ONLY,
                 ))
                 continue
 
@@ -569,6 +577,7 @@ def _repair_dict(node: dict, path: str, outcomes: list[Outcome]) -> tuple[dict, 
                     action=ACTION_REFUSED,
                     recovered_names=(),
                     reason=REASON_SELF_NAMING_TAIL,
+                    residue=RESIDUE_LEAK if has_leak_signature(value) else RESIDUE_QUOTED_ONLY,
                 ))
                 continue
 
@@ -936,3 +945,210 @@ def write_repaired(
         if tmp_path is not None:
             tmp_path.unlink(missing_ok=True)
     return None
+
+
+# ---------------------------------------------------------------------------
+# Residue classification (design decision 7) — REPORT-ONLY.
+# ---------------------------------------------------------------------------
+
+#: The refused string carries the PRD section-2 leak signature: real corruption
+#: a human needs to adjudicate.
+RESIDUE_LEAK = 'leak_unrepaired'
+#: The refused string merely QUOTES an envelope literal in prose. Measured
+#: live: 81 of the 144 detect()-flagged strings are this, 39 of them
+#: evidence[].observation fields in records ABOUT markup incidents.
+RESIDUE_QUOTED_ONLY = 'quoted_only'
+
+#: The section-2 collection predicate, assembled from the shared constants
+#: rather than from newly spelled literals — so this never becomes a third
+#: enumeration site (INV-5) and no raw sentinel enters this file.
+#:
+#: Report-only, and deliberately never a gate: repair()'s accept conditions are
+#: far stricter than this predicate, and every one of the 26 live repairs also
+#: matches it, so a leak in a shape this predicate misses is still REPAIRED.
+#:
+#: `fused_memory.utils.toolcall_xml_leak.has_toolcall_xml_leak` was evaluated
+#: as the ready-made predicate and rejected on measurement: it matches only 16
+#: of the 63, being calibrated for task-text with a mandatory-whitespace
+#: discriminator.
+_LEAK_SIGNATURE_NEEDLES = (INVOKE_CLOSER, CANONICAL_OPENER_PREFIX)
+
+
+def has_leak_signature(value: str) -> bool:
+    """True if *value* carries the section-2 leak signature."""
+    return any(needle in value for needle in _LEAK_SIGNATURE_NEEDLES)
+
+
+# ---------------------------------------------------------------------------
+# The CLI.
+# ---------------------------------------------------------------------------
+
+#: Nothing left to repair. The BINDING signal: a second run must produce this.
+EXIT_CLEAN = 0
+#: Repairable strings remain — always the case for a dry run that found any.
+EXIT_REPAIRABLE_REMAINS = 1
+#: A write or verification failed. Distinct from 1 because it needs an
+#: operator, not another run.
+EXIT_WRITE_FAILED = 2
+
+_LANE_CHOICES = (LANE_ESCALATIONS, LANE_PLANS, 'all')
+
+
+class Summary(NamedTuple):
+    """Counters for one sweep run."""
+
+    files_scanned: int
+    strings_detected: int
+    repaired: int
+    leak_unrepaired: int
+    quoted_only: int
+    skipped: dict[str, int]
+    failed: int
+    pending: int
+
+    def as_dict(self) -> dict:
+        return dict(self._asdict())
+
+    def exit_code(self) -> int:
+        """Residue NEVER sets the exit status.
+
+        37 predicate-matching strings legitimately refuse repair today and will
+        still be there after ``--apply``. Keying the exit code on residue would
+        make the second run red forever and destroy the very signal this task
+        is measured by — the residue is not re-runnable work, it needs a human.
+        """
+        if self.failed:
+            return EXIT_WRITE_FAILED
+        return EXIT_REPAIRABLE_REMAINS if self.pending else EXIT_CLEAN
+
+
+def run_sweep(root: Path | str, lane: str = 'all', apply: bool = False):
+    """Sweep *root*; return ``(summary, diffs)``.
+
+    Pipeline order is deliberate: load-and-gate, then resolve-the-write-target,
+    THEN repair. Resolving before repairing means a gate-skip (a live lane, a
+    dangling link, committed evidence) is counted as ``skipped`` and never as
+    pending work — otherwise a permanently-skipped file would keep the exit
+    code at 1 forever and break the second-run-zero invariant.
+    """
+    root_path = Path(root)
+    targets = discover_targets(root_path)
+    if lane != 'all':
+        targets = [t for t in targets if t.lane == lane]
+    targets = dedupe_by_realpath(targets)
+
+    skipped: dict[str, int] = {}
+    diffs: list[str] = []
+    scanned = detected = repaired_count = leaks = quotes = failed = pending = 0
+
+    for target in targets:
+        scanned += 1
+
+        loaded = load_target(target)
+        if isinstance(loaded, Refusal):
+            skipped[loaded.reason] = skipped.get(loaded.reason, 0) + 1
+            continue
+
+        resolved = resolve_write_target(target, root_path)
+        if isinstance(resolved, Refusal):
+            skipped[resolved.reason] = skipped.get(resolved.reason, 0) + 1
+            continue
+
+        if not round_trips(loaded.raw, loaded.obj):
+            reason = REASON_FORMAT_NOT_REPRODUCIBLE
+            skipped[reason] = skipped.get(reason, 0) + 1
+            continue
+
+        new_obj, outcomes = repair_document(loaded.obj)
+        for outcome in outcomes:
+            if outcome.action == ACTION_REPAIRED:
+                detected += 1
+                repaired_count += 1
+            elif outcome.action == ACTION_REFUSED:
+                detected += 1
+                if outcome.residue == RESIDUE_LEAK:
+                    leaks += 1
+                else:
+                    quotes += 1
+
+        if not any(o.action == ACTION_REPAIRED for o in outcomes):
+            continue
+
+        payload = serialize_like(loaded.raw, new_obj)
+        if apply:
+            failure = write_repaired(resolved, loaded.raw, new_obj)
+            if failure is not None:
+                failed += 1
+                pending += 1
+        else:
+            diffs.append(''.join(difflib.unified_diff(
+                loaded.raw.splitlines(keepends=True),
+                payload.splitlines(keepends=True),
+                fromfile=str(target.path),
+                tofile=str(target.path) + ' (repaired)',
+            )))
+            pending += 1
+
+    return Summary(
+        files_scanned=scanned,
+        strings_detected=detected,
+        repaired=repaired_count,
+        leak_unrepaired=leaks,
+        quoted_only=quotes,
+        skipped=skipped,
+        failed=failed,
+        pending=pending,
+    ), diffs
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Entry point. Dry run is the DEFAULT; ``--apply`` is required to write."""
+    parser = argparse.ArgumentParser(
+        prog='sweep_toolcall_markup',
+        description=(
+            'Retro-sweep leaked tool-call markup out of TERMINAL persisted '
+            'state: data/escalations/**/*.json (resolved/dismissed records '
+            'only) and .worktrees-orphaned/*/.task/plan.json. Dry run by '
+            'default. Never touches '
+            'docs/task-recovery-2026-05-13/worktree-inventory.json or '
+            'docs/toolcall-xml-leak-sweep-2026-08-05/dry-run-report.json, '
+            'which are committed evidence that legitimately quotes specimens.'
+        ),
+    )
+    parser.add_argument(
+        '--root',
+        default=str(Path(__file__).resolve().parent.parent),
+        help='repo root to sweep (default: this script\'s own checkout)',
+    )
+    parser.add_argument(
+        '--apply', action='store_true',
+        help='actually rewrite files (default: report only)',
+    )
+    parser.add_argument('--lane', choices=_LANE_CHOICES, default='all')
+    parser.add_argument(
+        '--json', action='store_true', dest='as_json',
+        help='emit the summary as JSON instead of text',
+    )
+    args = parser.parse_args(argv)
+
+    summary, diffs = run_sweep(args.root, lane=args.lane, apply=args.apply)
+
+    if args.as_json:
+        print(json.dumps(summary.as_dict(), indent=2, sort_keys=True))
+        return summary.exit_code()
+
+    for diff in diffs:
+        print(diff, end='')
+    print(f'files scanned      : {summary.files_scanned}')
+    print(f'strings detected   : {summary.strings_detected}')
+    print(f'repaired           : {summary.repaired}')
+    print(f'leak (unrepaired)  : {summary.leak_unrepaired}')
+    print(f'quoted only        : {summary.quoted_only}')
+    print(f'write failures     : {summary.failed}')
+    for reason in sorted(summary.skipped):
+        print(f'skipped/{reason:<10}: {summary.skipped[reason]}')
+    return summary.exit_code()
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

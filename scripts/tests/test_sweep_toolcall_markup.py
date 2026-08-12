@@ -1395,3 +1395,121 @@ def test_the_swap_lands_on_the_meta_root_file_never_on_the_link(sweep_root):
     assert link.is_symlink(), 'the LINK must never be replaced by a regular file'
     assert json.loads(link.read_text(encoding='utf-8')) == {'swapped': True}
     assert json.loads(resolved.write_path.read_text(encoding='utf-8')) == {'swapped': True}
+
+
+# ---------------------------------------------------------------------------
+# step-17 — the CLI. Dry run is the DEFAULT.
+# ---------------------------------------------------------------------------
+
+
+def _run_json(capsys, *argv):
+    code = sweep.main(list(argv) + ['--json'])
+    return code, json.loads(capsys.readouterr().out)
+
+
+def test_dry_run_is_the_default_and_writes_nothing(sweep_root, capsys):
+    """No --apply, no writes. Every byte AND every link-ness preserved.
+
+    The snapshot compares the whole tree rather than the interesting files,
+    because "writes nothing" is only meaningful as a statement about
+    everything the run could have touched.
+    """
+    before = read_bytes_map(sweep_root)
+    code, summary = _run_json(capsys, '--root', str(sweep_root))
+    assert read_bytes_map(sweep_root) == before
+    assert code == sweep.EXIT_REPAIRABLE_REMAINS
+    assert summary['repaired'] > 0, 'the fixture must have repairable work'
+
+
+def test_dry_run_emits_a_unified_diff_per_repairable_file(sweep_root, capsys):
+    """An operator reviews the diff before ever passing --apply."""
+    sweep.main(['--root', str(sweep_root)])
+    out = capsys.readouterr().out
+    assert '@@' in out, 'a unified diff hunk header'
+    assert 'esc-2-1.json' in out
+    assert '---' in out and '+++' in out
+
+
+def test_the_summary_carries_every_named_counter(sweep_root, capsys):
+    """The report's shape is part of the contract, not incidental output."""
+    _code, summary = _run_json(capsys, '--root', str(sweep_root))
+    for key in (
+        'files_scanned', 'strings_detected', 'repaired',
+        'leak_unrepaired', 'quoted_only', 'skipped', 'failed',
+    ):
+        assert key in summary, key
+    assert isinstance(summary['skipped'], dict), 'skips are broken out BY REASON'
+    assert summary['skipped'].get(sweep.REASON_NON_TERMINAL) == 1, 'the pending record'
+    assert summary['skipped'].get(sweep.REASON_NOT_AN_ESCALATION_RECORD) == 1
+
+
+def test_a_tree_with_nothing_repairable_exits_clean(tmp_path, capsys):
+    """Exit 0 is the green signal the second run has to be able to produce."""
+    write_escalation(
+        tmp_path / 'data' / 'escalations' / 'esc-9-1.json',
+        make_escalation('esc-9-1', 'resolved', 'perfectly clean'),
+    )
+    code, summary = _run_json(capsys, '--root', str(tmp_path))
+    assert code == sweep.EXIT_CLEAN
+    assert summary['repaired'] == 0
+
+
+def test_residue_is_split_into_leak_shaped_and_merely_quoting(tmp_path, capsys):
+    """detect() flags 144 strings live but only 63 carry the leak signature.
+
+    Reporting all refusals undifferentiated would bury the ones that are real
+    corruption under prose that merely QUOTES a tag — 39 of which are
+    evidence[].observation fields in records ABOUT markup incidents.
+    """
+    escalations = tmp_path / 'data' / 'escalations'
+    write_escalation(
+        escalations / 'esc-leak.json',
+        make_escalation(
+            'esc-leak', 'resolved',
+            _swallowed('D.', 'detail', 'evidence', 'x'),
+        ),
+    )
+    write_escalation(
+        escalations / 'esc-quote.json',
+        make_escalation(
+            'esc-quote', 'resolved',
+            'The agent emitted ' + _closer('description') + ' and lost an argument.',
+        ),
+    )
+    _code, summary = _run_json(capsys, '--root', str(tmp_path))
+    assert summary['leak_unrepaired'] == 1
+    assert summary['quoted_only'] == 1
+
+
+def test_residue_never_sets_a_non_zero_exit(tmp_path, capsys):
+    """37 refusals legitimately remain after --apply, forever.
+
+    Keying the exit code on residue would make the second run red permanently
+    and destroy the very signal this task is measured by.
+    """
+    write_escalation(
+        tmp_path / 'data' / 'escalations' / 'esc-r.json',
+        make_escalation('esc-r', 'resolved', _swallowed('D.', 'detail', 'evidence', 'x')),
+    )
+    code, summary = _run_json(capsys, '--root', str(tmp_path), '--apply')
+    assert summary['leak_unrepaired'] == 1
+    assert code == sweep.EXIT_CLEAN, 'unrepairable residue is reported, not failed'
+
+
+def test_the_lane_flag_narrows_the_sweep(sweep_root, capsys):
+    """--lane lets an operator run one corpus at a time."""
+    _c, plans_only = _run_json(capsys, '--root', str(sweep_root), '--lane', 'plans')
+    _c2, esc_only = _run_json(capsys, '--root', str(sweep_root), '--lane', 'escalations')
+    assert plans_only['files_scanned'] == 2
+    assert esc_only['files_scanned'] == 4
+
+
+def test_the_script_source_spells_no_raw_envelope_literal():
+    """Mirrors this test module's own self-check, for the script under test.
+
+    Every sentinel it needs is imported from shared.toolcall_markup, so a raw
+    chr(60)+'/' in its source would mean someone re-spelled one — which is both
+    a third enumeration site (INV-5) and the authoring hazard itself.
+    """
+    source = Path(sweep.__file__).read_text(encoding='utf-8')
+    assert (chr(60) + '/') not in source
