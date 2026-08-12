@@ -43,7 +43,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from fused_memory.utils.canonical_labels import Referent
+from fused_memory.utils.canonical_labels import Referent, scan_content
 
 #: The CLOSED vocabulary of resolution sources, in precedence order (strongest
 #: first). Exported as one tuple so task ι's declaration-rate telemetry
@@ -123,3 +123,65 @@ class ReferentResolution:
     #: Reported verbatim from the scan whatever the winning source, and NEVER
     #: promoted into :attr:`referents`: ambiguity is recorded, not guessed.
     ambiguous: ReferentSet = ()
+
+
+def resolve_referents(
+    *,
+    declared: list[dict] | None,
+    metadata: dict,
+    content: str,
+    group_id: str,
+) -> ReferentResolution:
+    """Resolve which referents one write is about, and from which source.
+
+    Precedence, strictly — ``declared`` > ``metadata['task_id']`` > derived
+    scan > ``none``. Exactly ONE source is authoritative per resolution, which
+    is why :attr:`ReferentResolution.source` is singular: this is an override
+    chain, not a union of everything available.
+
+    An EMPTY :attr:`~ReferentResolution.referents` carries nothing to test
+    membership against, so a downstream verifier must no-op on it regardless
+    of ``.source`` — already the PRD's stated behaviour for the
+    ``source='none'`` row ("no repair attempted"), and it extends unchanged to
+    every other source that resolves empty.
+
+    Args:
+        declared: The caller's explicit referent entries, or None. TRI-STATE:
+            None means "never considered" and falls through; ``[]`` means
+            "considered, none apply" and is honoured as a declaration.
+        metadata: The write's ambient metadata; ``task_id`` is bridged from it.
+        content: The verbatim body to scan.
+        group_id: The group the content belongs to (= the local project_id).
+
+    These are the PRD's exact four parameters and no more. In particular there
+    is deliberately no ``known_project_ids``: ``scan_content`` is called in its
+    documented PERMISSIVE mode, and threading a live project registry is a
+    wiring concern belonging to the leaf that owns the wiring (δ/ε). Adding an
+    unspecified fifth parameter here would fork, mid-batch, the signature those
+    siblings are being written against.
+    """
+    # ALWAYS scan, unconditionally, BEFORE any precedence branching.
+    #
+    # Do not "optimize" this into the derived branch. Two consumer-visible
+    # fields need the scan whatever source wins: `.conflicts` is DEFINED as
+    # declared-versus-scan, and `.ambiguous` must read identically whether the
+    # effective referents came from a declaration, from metadata, or from the
+    # scan. A caller forced to check `.source` before trusting `.ambiguous`
+    # would have to re-derive the scan itself — a second scan site, and exactly
+    # the INV-5 lockstep duplication canonical_labels exists to prevent.
+    #
+    # The cost is two regex passes over already-in-memory content, negligible
+    # against the LLM-composed Graphiti write this precedes.
+    scan = scan_content(content, group_id=group_id)
+
+    # `.ambiguous` is the scan's verbatim answer on every path. Ambiguous
+    # referents are recorded, never guessed, and never promoted into
+    # `.referents`.
+    ambiguous = scan.ambiguous
+
+    # scan.refs already excludes the ambiguous ones, so the derived set needs
+    # no further filtering here.
+    if scan.refs:
+        return ReferentResolution(source='derived', referents=scan.refs, ambiguous=ambiguous)
+
+    return ReferentResolution(source='none', ambiguous=ambiguous)
