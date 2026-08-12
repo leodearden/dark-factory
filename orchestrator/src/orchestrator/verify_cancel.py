@@ -300,16 +300,40 @@ def cancel_request(
         remove_pgid_file(path)
         return 0
 
-    # NOTE — stale-file / PID-reuse window:
-    # If verify-merge dies without running its finally-block (hard crash, OOM,
-    # host reset) the pgid file is left on disk.  After the original process is
-    # gone the OS may recycle that pid/pgid for an unrelated process; a later
-    # cancel_request call would then SIGKILL the wrong process.
-    # The window is bounded: modern kernels recycle pids slowly (default
-    # pid_max = 32768), and the stale file is cleaned up by the next successful
-    # cancel-verify or on host reboot.  A future β hardening: stamp a boot-id
-    # alongside the pgid (e.g. /proc/sys/kernel/random/boot_id) and validate
-    # it here before killing.
+    # NOTE — stale-file / PID-reuse window.  Both of this note's original
+    # "the window is bounded" premises were MEASURED FALSE on 2026-08-12; the
+    # corrected picture is below.
+    #
+    # If verify-merge dies without running its finally-block the pgid file is
+    # left on disk.  The dominant cause is not a crash: it is
+    # ``fire_watchdog_kill``'s ``os._exit(1)`` (below), which by design skips
+    # every finally — 64 leftover files accumulated on the reify laptop in the
+    # 21 days after that host first ran the watchdog, ~54% of its dispatches.
+    #
+    # (a) pid recycling is NOT slow.  pid_max is 4194304 — not the 32768
+    #     default this note assumed — on BOTH the workstation and the laptop,
+    #     and the laptop's counter demonstrably wrapped on 2026-08-11.
+    # (b) Stale files are NOT cleaned on host reboot.  PGID_DIR_NAME lives
+    #     under worktree_base, a persistent repo path deliberately outside any
+    #     registered worktree (see the module docstring) — nothing prunes it.
+    #     Nine files dated 2026-07-22/23 survived the laptop's 2026-07-25 boot.
+    #
+    # What that does NOT mean: the per-request files are near-harmless for
+    # cancel_request specifically, for a reason the original note missed —
+    # request_ids are ``uuid4().hex`` (verify_runner.py), so a stale file's id
+    # is never revisited and this function never re-reads one.
+    #
+    # The real exposure is the FIXED-key holder file (LOCK_HOLDER_PGID_KEY),
+    # which every run overwrites and which ``_merge_verify_lease_active``
+    # (git_ops.py) probes with ``os.killpg(pgid, 0)``.  A recycled pid there
+    # reads as a LIVE holder and fails CLOSED: reset_persistent_merge_worktree
+    # raises MergeVerifyLeaseHeld and remove_merge_worktree_guarded skips
+    # removal — i.e. a wedged warm lane, not a mis-aimed SIGKILL.  Bounded only
+    # by the next run that acquires the build lane lock and overwrites it.
+    #
+    # Hardening (unchanged, now better motivated): stamp a boot-id alongside
+    # the pgid (e.g. /proc/sys/kernel/random/boot_id) and validate it before
+    # trusting the value, plus a GC for the leaked per-request files.
 
     # Step 2: snapshot PPID map BEFORE any kills (invariant: snapshot precedes kill).
     # Killing the root reparents its survivors to init, severing the /proc parent
