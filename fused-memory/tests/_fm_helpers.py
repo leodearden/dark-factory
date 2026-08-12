@@ -781,6 +781,49 @@ def unique_graph_name(slug: str) -> str:
     return f'_test_{slug}_{uuid.uuid4().hex[:8]}'
 
 
+def resolve_xdist_worker_id(request_or_session: pytest.FixtureRequest | pytest.Session) -> str:
+    """Return this worker's id ('gw0', 'gw1', …) or 'master' — without the xdist PLUGIN.
+
+    Backs the session-scoped ``worker_id`` fixture in ``tests/conftest.py``,
+    which exists because ``worker_id`` was otherwise supplied *solely* by
+    pytest-xdist (``xdist/plugin.py``).  The offline-deep lane's serial confirm
+    re-run appends ``-p no:xdist -o addopts=`` (see
+    ``orchestrator/src/orchestrator/verify_cmd.py``), and ``-p no:xdist``
+    unregisters the plugin along with its FIXTURES — not just its ``-n`` /
+    ``--dist`` CLI options.  Every test requesting ``worker_id`` therefore
+    ERRORED at setup with ``fixture 'worker_id' not found`` in that re-run, and
+    a developer typing ``pytest -p no:xdist`` locally hit the same wall.
+
+    It DELEGATES to xdist's own ``get_xdist_worker_id`` rather than
+    reimplementing its three lines of ``workerinput`` logic.  A conftest
+    fixture SHADOWS a same-named plugin fixture, so the shim takes over
+    ``worker_id`` for every fused-memory test — including healthy
+    ``-n auto --dist loadgroup`` runs, where per-worker isolation is the whole
+    point.  Any semantic drift from xdist would silently collapse worker
+    namespaces and cause the cross-worker collisions those suffixes exist to
+    prevent; delegating makes such drift structurally impossible, which is what
+    makes the shadowing provably safe.
+
+    The import is function-local and deliberate: ``-p no:xdist`` unregisters the
+    PLUGIN but leaves the MODULE importable, so delegation works in exactly the
+    case that is otherwise broken.
+
+    There is deliberately no ``except ImportError: return 'master'`` fallback.
+    pytest-xdist is a declared dev dependency here and this project's addopts
+    hardcode ``-n auto``, so a venv genuinely missing the module is broken
+    rather than a supported configuration — and quietly collapsing every worker
+    onto one shared 'master' namespace there would reintroduce precisely the
+    collisions above, as flaky live-service tests instead of a clear error.
+
+    Args:
+        request_or_session: a pytest ``request`` or ``session`` object — the
+            same parameter xdist's own function takes.
+    """
+    from xdist.plugin import get_xdist_worker_id
+
+    return get_xdist_worker_id(request_or_session)
+
+
 # ---------------------------------------------------------------------------
 # Shared poll_until() helper (task 2377)
 # ---------------------------------------------------------------------------
