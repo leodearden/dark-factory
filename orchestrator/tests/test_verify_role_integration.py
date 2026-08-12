@@ -31,10 +31,12 @@ REIFY_ROOT
 """
 from __future__ import annotations
 
+import importlib.util
 import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Literal
 
@@ -290,3 +292,169 @@ def test_command_lines_excludes_env_comment_substrings() -> None:
     assert any("cargo nextest run" in ln for ln in helper_lines), (
         "_command_lines did not return the cargo-nextest line"
     )
+
+
+# ---------------------------------------------------------------------------
+# Off-machine gate resolution — the layout-independence demonstration
+#
+# A test that merely passes on THIS machine does not discriminate: the gate's
+# old hardcoded ``/home/leo/src/reify`` default resolves to a path that really
+# exists here, so "the integration test ran" was equally consistent with a
+# working resolver and with a broken one that happened to name the developer's
+# own checkout.  These cases load a COPY of this module out of a SYNTHETIC
+# checkout tree and assert on the constants it resolves there, so the answer is
+# about the planted layout rather than about this host.
+#
+# The RED is host-independent in both directions: a fixed literal can never
+# equal a tmp_path, and a tmp_path with no reify in its ancestry must resolve
+# to None on a machine where /home/leo/src/reify exists.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def planted_env(monkeypatch):
+    """Neutralize the ambient env that would otherwise steer a module copy.
+
+    REIFY_ROOT would override the discovery the planted-layout cases exist to
+    exercise; CI would make the copy's import-time warning block fire on the
+    deliberately-unresolvable trees.  Returns monkeypatch so a case can set
+    REIFY_ROOT back to a value it chose itself.
+    """
+    monkeypatch.delenv("REIFY_ROOT", raising=False)
+    monkeypatch.delenv("CI", raising=False)
+    return monkeypatch
+
+
+def _load_module_copy(tmp_path: Path, tests_relpath: str, *, plant_verify_sh: bool = True):
+    """Import a COPY of THIS module from a synthetic checkout layout.
+
+    Plants ``<tmp>/src/reify/scripts/verify.sh`` (a real file; content
+    irrelevant) when requested, creates ``<tmp>/src/<tests_relpath>/``, copies
+    this module in, and loads it via ``spec_from_file_location``.
+
+    The copy's ``orchestrator.config`` / ``orchestrator.verify`` /
+    ``shared.reify_checkout`` imports resolve from the parent process's
+    sys.path, while its ``__file__`` is the PLANTED path — so its import-time
+    constant resolution walks the SYNTHETIC ancestry, which is the whole point.
+    The temporary sys.modules entry is popped in a finally block so no copy
+    outlives the call.
+    """
+    src = tmp_path / "src"
+    if plant_verify_sh:
+        planted = src / "reify" / "scripts" / "verify.sh"
+        planted.parent.mkdir(parents=True, exist_ok=True)
+        planted.write_text("#!/bin/sh\necho stub\n")
+
+    tests_dir = src / tests_relpath
+    tests_dir.mkdir(parents=True, exist_ok=True)
+    copied = tests_dir / "test_copy_probe.py"
+    shutil.copy2(__file__, copied)
+
+    module_name = "_reify_gate_probe_" + re.sub(r"\W+", "_", tests_relpath)
+    spec = importlib.util.spec_from_file_location(module_name, copied)
+    assert spec is not None and spec.loader is not None, f"could not load {copied}"
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = mod
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        sys.modules.pop(module_name, None)
+    return mod
+
+
+_BARE_LAYOUT = "dark-factory/orchestrator/tests"
+_WORKTREE_LAYOUT = "dark-factory/.worktrees/3978/orchestrator/tests"
+
+
+def test_gate_resolves_against_the_planted_checkout_not_this_machine(tmp_path, planted_env):
+    """The gate must find the reify sibling of the tree it is RUNNING in."""
+    mod = _load_module_copy(tmp_path, _BARE_LAYOUT)
+
+    expected = tmp_path / "src" / "reify" / "scripts" / "verify.sh"
+    assert expected == mod.REIFY_VERIFY_SH, (
+        f"the gate resolved to {mod.REIFY_VERIFY_SH!r} instead of the reify "
+        f"checkout planted beside it at {expected!r} — a hardcoded default "
+        f"answers for this developer's machine rather than for the tree under test"
+    )
+
+
+def test_gate_admits_the_run_from_a_planted_checkout(tmp_path, planted_env):
+    """Resolution is not enough — the skip decision must ADMIT the run.
+
+    Asserts on the reify half alone (``_REIFY_SKIP_REASON``), not the composed
+    ``_SKIP_REASON``, so this case stays green on a host without nice/ionice
+    instead of smuggling a host dependency into the very test written to
+    remove one.
+    """
+    mod = _load_module_copy(tmp_path, _BARE_LAYOUT)
+
+    assert mod._REIFY_SKIP_REASON is None, (
+        f"the gate would SKIP against a planted checkout that really carries "
+        f"scripts/verify.sh: {mod._REIFY_SKIP_REASON!r}"
+    )
+
+
+def test_worktree_and_bare_layouts_resolve_to_the_same_planted_checkout(tmp_path, planted_env):
+    """No fixed parents[N] index can satisfy both layouts."""
+    bare = _load_module_copy(tmp_path, _BARE_LAYOUT)
+    worktree = _load_module_copy(tmp_path, _WORKTREE_LAYOUT)
+
+    expected = tmp_path / "src" / "reify" / "scripts" / "verify.sh"
+    assert expected == worktree.REIFY_VERIFY_SH
+    assert worktree.REIFY_VERIFY_SH == bare.REIFY_VERIFY_SH, (
+        f"'.worktrees/<id>' adds exactly two path segments, so a fixed "
+        f"parents[N] cannot be correct in both layouts (got "
+        f"worktree={worktree.REIFY_VERIFY_SH!r} vs bare={bare.REIFY_VERIFY_SH!r})"
+    )
+    assert worktree._REIFY_SKIP_REASON is None
+
+
+def test_discovery_miss_skips_instead_of_answering_from_this_machine(tmp_path, planted_env):
+    """THE structural pin against a hardcoded default.
+
+    Nothing named reify exists anywhere in the planted ancestry, so the honest
+    answer is None + a skip.  A hardcoded ``/home/leo/src/reify`` produces a
+    path that EXISTS on this machine, so the gate would silently run the
+    cross-repo integration against a checkout unrelated to the tree under test.
+    """
+    mod = _load_module_copy(tmp_path, _BARE_LAYOUT, plant_verify_sh=False)
+
+    assert mod.REIFY_VERIFY_SH is None, (
+        f"no reify checkout exists in the planted ancestry, but the gate "
+        f"resolved {mod.REIFY_VERIFY_SH!r} — an off-tree answer"
+    )
+    reason = mod._REIFY_SKIP_REASON
+    assert isinstance(reason, str) and reason
+    assert "REIFY_ROOT" in reason, f"the skip must name the override: {reason!r}"
+    assert "scripts/verify.sh" in reason, f"the skip must name the marker: {reason!r}"
+
+
+def test_env_override_is_honored_verbatim_and_names_the_bad_path(tmp_path, planted_env):
+    """A REIFY_ROOT typo must skip loudly, not fall back to a lucky discovery."""
+    bad_root = tmp_path / "does-not-exist" / "reify-typo"
+    planted_env.setenv("REIFY_ROOT", str(bad_root))
+
+    mod = _load_module_copy(tmp_path, _BARE_LAYOUT)
+
+    assert bad_root.resolve() == mod.REIFY_ROOT, (
+        f"REIFY_ROOT must win over the discoverable planted sibling, not be "
+        f"shadowed by it (got {mod.REIFY_ROOT!r})"
+    )
+    assert (tmp_path / "src" / "reify") != mod.REIFY_ROOT, (
+        "a typo'd REIFY_ROOT silently falling back to a discovered checkout "
+        "would answer for a DIFFERENT repo than the operator named"
+    )
+    reason = mod._REIFY_SKIP_REASON
+    assert isinstance(reason, str) and reason
+    assert str(bad_root) in reason, (
+        f"the skip reason must name the bad path verbatim so it is self-evident "
+        f"in `pytest -rs` output which path was wrong (got {reason!r})"
+    )
+
+
+def test_verify_sh_constant_tracks_the_resolved_root(tmp_path, planted_env):
+    """Wiring pin: the two module constants must not re-diverge."""
+    mod = _load_module_copy(tmp_path, _BARE_LAYOUT)
+
+    assert mod.REIFY_ROOT is not None
+    assert mod.REIFY_VERIFY_SH == mod.REIFY_ROOT / mod._REIFY_VERIFY_RELPATH
