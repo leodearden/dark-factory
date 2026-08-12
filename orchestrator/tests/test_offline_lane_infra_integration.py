@@ -557,6 +557,75 @@ async def _drive_infra_reds(
 
 
 # ---------------------------------------------------------------------------
+# Timeout-bound invariants (task 4030)
+# ---------------------------------------------------------------------------
+
+
+def test_every_composing_caller_carries_a_timeout_override() -> None:
+    """Every test that composes bounded waits PAST a single `_run_lane` pass
+    must carry its own `@pytest.mark.timeout` override wide enough to cover
+    its own worst-case bounded-wait sum — otherwise it can silently collide
+    with this module's pyproject-configured 60s per-test default.
+
+    This module's own copy of ``test_offline_lane_integration.py``'s
+    invariant of the same name (these two modules are deliberate lock-step
+    siblings — this module's own `_run_lane` docstring says it was "Adapted
+    verbatim from test_offline_lane_integration.py"). See that sibling test
+    for the full rationale on why correlation is done via `fn.pytestmark`
+    introspection (pytest's own applied-marker list for a given test
+    function) rather than the coarse `_TIMEOUT_MARKER_RE` file-wide regex
+    scan `test_lane_lock_leak_guard.py`'s sibling invariant uses: that check
+    only needs to know whether ANY `@pytest.mark.timeout` appears ANYWHERE
+    in a file, while this one must correlate a marker to a SPECIFIC test and
+    compare its VALUE against that test's own computed worst case.
+
+    The table below maps each composing test FUNCTION OBJECT — never a
+    string, so a rename breaks this test loudly instead of silently dropping
+    a row — to its worst-case bounded-wait sum, expressed in terms of this
+    module's named timeout constants (never bare literals).
+    ``test_ib2_infra_run_in_flight_never_gates_merge`` has the identical
+    uncovered shape as the sibling module's ``test_b3_never_a_gate``: it
+    races a 30s `_run_lane` bound concurrently against `wait_entered` (max,
+    not sum), then runs `_assert_infra_never_a_gate`'s 0.5 + 15.0 bounds
+    SEQUENTIALLY after it.
+    """
+    worst_case_secs = {
+        test_ib4_same_infra_set_recurrence_updates_not_duplicates: 2 * _LANE_PASS_BOUND_SECS,
+        test_ib2_infra_run_in_flight_never_gates_merge: (
+            _LANE_PASS_BOUND_SECS
+            + _NOTE_OFFLINE_LANE_BOUND_SECS
+            + _NOTE_MERGE_ALL_BOUND_SECS
+        ),
+    }
+    for fn, worst_case in worst_case_secs.items():
+        markers = [m for m in fn.pytestmark if m.name == 'timeout']
+        assert markers, (
+            f'{fn.__name__} composes bounded waits to a worst case of '
+            f'{worst_case}s but carries no @pytest.mark.timeout override. '
+            f'Left uncovered, this can silently collide with the 60s '
+            f'orchestrator/pyproject.toml per-test default — under '
+            f'timeout_method="thread" with --max-worker-restart=0, '
+            f'pytest-timeout os._exit()s the xdist worker instead of '
+            f"failing cleanly, discarding _run_lane's own well-located "
+            f'TimeoutError. Add @pytest.mark.timeout(N) with N > {worst_case}.'
+        )
+        value = markers[0].args[0] if markers[0].args else markers[0].kwargs.get(
+            'timeout', markers[0].kwargs.get('seconds'),
+        )
+        assert value > worst_case, (
+            f'{fn.__name__} carries @pytest.mark.timeout({value}) but its '
+            f'own worst-case bounded-wait sum is {worst_case}s — the '
+            f'override does not actually clear what it exists to cover. '
+            f'Left uncovered, this can silently collide with the 60s '
+            f'orchestrator/pyproject.toml per-test default — under '
+            f'timeout_method="thread" with --max-worker-restart=0, '
+            f'pytest-timeout os._exit()s the xdist worker instead of '
+            f"failing cleanly, discarding _run_lane's own well-located "
+            f'TimeoutError.'
+        )
+
+
+# ---------------------------------------------------------------------------
 # IB1 — advance triggers a from-head infra sub-run
 # ---------------------------------------------------------------------------
 
