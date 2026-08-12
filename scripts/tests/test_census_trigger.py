@@ -1116,6 +1116,59 @@ def test_decide_for_project_row6_malformed_state_no_fire_one_warning(tmp_path, c
     assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
 
 
+def test_decide_for_project_survives_a_raising_compute_tasks_landed(
+    tmp_path, caplog, monkeypatch
+):
+    """`decide_for_project` must never propagate — and must degrade condition
+    (b) ALONE, keeping (a) and (c) alive.
+
+    The callee is monkeypatched to raise rather than fed a bad baseline, and
+    that is deliberate: a bad baseline no longer raises, so a state-file-driven
+    test would silently become a duplicate of the compute_tasks_landed tests
+    above and this guard would ship untested. Injecting a raising callee pins
+    the contract independently of which inner fault happens to be possible
+    today.
+
+    The stakes are in the degradation granularity. Today the whole call chain
+    is unguarded, so via the `evaluate` CLI a single fault in (b) is caught only
+    by main()'s outermost catch-all, which discards the ENTIRE evaluation — the
+    max-interval backstop that exists precisely to survive a broken (b) is taken
+    out by the same fault."""
+    _write_codebook(tmp_path)
+    _write_census_state(
+        tmp_path,
+        last_census_at=(NOW - timedelta(days=9)).isoformat(),
+        last_census_report="plans/confusion-census-prior.md",
+        last_census_done_count=500,
+    )
+
+    def _boom(*, state, status_fetcher):
+        raise RuntimeError("baseline exploded")
+
+    monkeypatch.setattr(ct, "compute_tasks_landed", _boom)
+
+    with caplog.at_level(logging.WARNING):
+        decision = ct.decide_for_project(
+            tmp_path, now=NOW, status_fetcher=_wrapped_fetcher(_done_statuses(550))
+        )
+
+    assert isinstance(decision, ct.Decision)
+    assert decision.fire is False
+
+    # Degraded to a fail-safe None delta, NOT to a fabricated number: this is
+    # the exact line evaluate() emits for `tasks_landed=None`.
+    assert any("tasks-landed: delta unavailable" in r for r in decision.reasons)
+    # ...while conditions (a) and (c) still evaluated — the whole point of
+    # degrading (b) alone.
+    assert any("max-interval" in r for r in decision.reasons)
+    assert any("novelty-spike" in r for r in decision.reasons)
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "RuntimeError" in warnings[0].getMessage()
+    assert "baseline exploded" in warnings[0].getMessage()
+
+
 # ---------------------------------------------------------------------------
 # step-19: RED — CLI `evaluate` subcommand (always exits 0, fail-safe)
 # ---------------------------------------------------------------------------
