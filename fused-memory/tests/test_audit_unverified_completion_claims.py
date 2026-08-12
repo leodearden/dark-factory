@@ -12,6 +12,7 @@ import json
 import re
 import types
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -180,7 +181,7 @@ class TestScanRecords:
     from being read as a completion (the gate's own docstring, :20-26).
     """
 
-    def _scan(self, records: list[object]) -> list[object]:
+    def _scan(self, records: list[object]) -> list[Any]:
         return scan_records(
             records,
             default_project_id='reify',
@@ -277,7 +278,7 @@ class TestAdjudicate:
         category: str = 'temporal_facts',
         uuid: str = 'ep-1',
         created_at: str = '2026-07-26T00:00:00Z',
-    ) -> list[object]:
+    ) -> list[Any]:
         scanned = scan_records(
             [_record(uuid=uuid, text=text, category=category, created_at=created_at)],
             default_project_id='reify',
@@ -801,7 +802,7 @@ class TestRunEndToEnd:
         reader: object,
         probes: object,
         **arg_overrides: object,
-    ) -> tuple[int, dict[str, object] | None, str]:
+    ) -> tuple[int, dict[str, Any] | None, str]:
         code = await _run(
             _args(**arg_overrides),
             reader_factory=lambda project: reader,
@@ -828,6 +829,7 @@ class TestRunEndToEnd:
             capsys, reader, _probes(ticket=None)
         )
         assert code == 0
+        assert report is not None
         assert report['summary']['mismatch'] == 1
 
         code, _report, _ = await self._run_capture(
@@ -859,6 +861,7 @@ class TestRunEndToEnd:
         _code, report, _ = await self._run_capture(
             capsys, reader, _probes(ticket=None)
         )
+        assert report is not None
         assert report['findings'][0]['derived_edge_uuids'] == [edge]
         assert reader.edge_lookups == [episode]
 
@@ -879,6 +882,7 @@ class TestRunEndToEnd:
         _code, report, _ = await self._run_capture(
             capsys, reader, _probes(ticket=UNRESOLVABLE), include_unverifiable=True
         )
+        assert report is not None
         assert report['summary']['mismatch'] == 0
         assert report['summary']['unverifiable'] == 5
         assert all(f['status'] == 'unverifiable' for f in report['findings'])
@@ -911,6 +915,7 @@ class TestRunEndToEnd:
                 commit_probe=lambda ref, project_id: None,
             ),
         )
+        assert report is not None
         assert report['summary']['mismatch'] == 1
         assert report['summary']['unverifiable'] == 1
         assert [f['status'] for f in report['findings']] == ['mismatch']
