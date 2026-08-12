@@ -497,17 +497,62 @@ Which exit status each outcome must write is specified normatively in
 
 ### 3.7 Recovery and failure paths
 
-- **`_mark_blocked`** is the sole choke point that stamps a task `blocked`
-  and files the corresponding escalation — no code path blocks a task
-  silently.
+- **What `_mark_blocked` actually is.** `_mark_blocked`
+  (`orchestrator/src/orchestrator/workflow.py`, ~:14384) is the choke point for
+  `TaskWorkflow`'s **own** failure parks, and the only `blocked` writer that
+  also spawns the dry-run unblock proposal. It is **not** the only writer of
+  the status: 17+ sites across six modules stamp `blocked` without it.
+  By family, one anchor each —
+  - **Sibling workflow paths** — `_persist_blocked_row` (~:6702, whose
+    docstring says it deliberately bypasses `_mark_blocked` to avoid spawning
+    `_spawn_dry_run_unblock`), train attribution `_attribute_train_failure`
+    (~:11226), and `_handle_terminal_exit_on_block` (~:14206), reachable both
+    from `_mark_blocked` *and* independently from the dispatch-time
+    `TerminalExitRejection` handler.
+  - **Harness escalate-and-block gates** (`harness.py`) —
+    `_block_and_escalate_external_dep` (~:6384),
+    `_block_and_escalate_delivered_check` (~:6457),
+    `_block_and_escalate_cross_repo` (~:7193),
+    `_block_and_escalate_substrate_flip` (~:7327).
+  - **Table B `park`** — `_action_teardown_and_set_status` (`harness.py`
+    ~:12720), the human-resolution effect in §6.
+  - **`DeterministicRunner`** — five `_file_*_and_block` methods
+    (`deterministic_runner.py` ~:1141/:1284/:1382/:1867/:1966). Each wraps the
+    status write in `try`/`except` and *log-and-swallows* a failure (the
+    escalation is already durable), so it can file the record and still not
+    write `blocked`. These are also the `pending → blocked` edge §3.8 depends
+    on — no workflow, and so no `_mark_blocked`, is ever involved.
+  - **Scheduler retry caps** — `trigger_retry_cap_exhausted` (`scheduler.py`
+    ~:7466).
+  - **Human `release_workflow`** — `escalation/src/escalation/server.py`
+    (~:1879), which parks only on the no-live-claimant arm.
+  - **Reconciliation** — `_sweep_block_orphan`
+    (`fused-memory/.../reconciliation/targeted.py` ~:1264), the
+    `deferred → blocked` edge.
+  - And the generic MCP surface: `set_task_status` validates only that the
+    status string is in the vocabulary, so any client can write `blocked` with
+    zero orchestrator involvement.
+
+  The invariant that actually makes a block non-silent is therefore **not**
+  single-writership but ownership: every `blocked` row is expected to carry an
+  open escalation record or gate marker that owns its re-entry (spec §3-S3;
+  INV-7 `holds-owned-and-bounded`), with the deterministic-MILESTONE park as
+  the sanctioned carve-out. `infra-hold`, unlike `blocked`, *does* have a
+  single production writer — `_mark_blocked(block_status='infra-hold')`, called
+  from `workflow.py` ~:7363.
 - **Stranded tasks.** `Harness._reconcile_stranded_in_progress` sweeps
   `in-progress` tasks with no live claimant back to `pending`, or to `done`
   with `found_on_main` provenance if the work is already on `main`. A
   scheduler phase (`_phase_redispatch_stranded_blocked`) does the same for
   stranded `blocked` tasks whose dependencies have since resolved and whose
   escalation has closed.
-- **Orphaned worktrees.** The orphan-L0-reaper quarantines, then reaps,
-  `.worktrees/*` directories left behind by a crashed or killed workflow.
+- **Orphaned worktrees.** `Harness._reap_orphan_worktrees` (`harness.py`
+  ~:4063) quarantines, then reaps, `.worktrees/*` directories left behind by a
+  crashed or killed workflow.
+- **Orphaned L0 records.** A *separate* sweep,
+  `Harness._reap_orphan_l0_escalations` (`harness.py` ~:10961), reclaims L0
+  escalation *records* whose steward died without escalating (§6). The two are
+  easily conflated — one reaps directories, the other reaps queue rows.
 - **Retry caps** bound every retryable failure mode (`requeue_cap=3`,
   `transient_requeue_cap=10`, `max_consecutive_infra_resumes=3`,
   `max_consecutive_merge_thrash=2`, `max_failure_signature_repeat=3`) — past

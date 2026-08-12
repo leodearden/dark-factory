@@ -144,7 +144,7 @@ class TestArchitectureDiagramMatchesTransitionTable:
             "§3.8's deterministic-tasks contract runs on: a `metadata."
             'always_escalates` gate parks a never-dispatched `pending` task at '
             '`blocked` while its born-at-L2 record is open. The writers are '
-            '`DeterministicRunner._block_with_infra_issue` and '
-            '`_block_with_stop_instruction` (orchestrator/src/orchestrator/'
+            '`DeterministicRunner._file_infra_issue_and_block` and '
+            '`_file_stop_instruction_and_block` (orchestrator/src/orchestrator/'
             'deterministic_runner.py) — neither goes through `_mark_blocked`.'
         )
