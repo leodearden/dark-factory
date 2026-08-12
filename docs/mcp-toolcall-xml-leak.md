@@ -117,6 +117,28 @@ in this repo, though:
 
 Both catch `None`. Neither logs anything.
 
+### The single literal source (INV-5)
+
+`shared/src/shared/toolcall_markup.py` (task 3688) is now the **one** place
+the envelope literals are enumerated.
+`fused_memory.server.markup_tripwire.MCP_MARKUP_PATTERNS`
+(`markup_tripwire.py:63`) and
+`fused_memory.utils.toolcall_xml_leak.PREFILTER_NEEDLES`
+(`toolcall_xml_leak.py:124`) are both now **re-exports** of names defined
+there — two named predicates over one literal set, not two literal sets —
+and no third site enumerates them.
+
+That arrangement preserves the write-time recall-first vs. read-time
+precision calibration split: `MCP_MARKUP_PATTERNS` still over-reports on
+purpose at the write boundary, where a false positive costs only a retry,
+and `PREFILTER_NEEDLES` still under-reports on purpose over already-stored
+content, where a false positive would silently rewrite a user's memory.
+What the consolidation removes is the divergence that used to sit
+underneath that split — the write-time list carried one closing tag while
+the read-time list carried four. That divergence is exactly what made the
+original diagnosis ambiguous: a mis-closed `description` could not report
+its own tag, so the write-time guard blamed whatever happened to follow it.
+
 ---
 
 ## 2. The two manifestations
