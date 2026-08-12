@@ -5253,11 +5253,17 @@ class TestFindLivenessSnapshotRecurrences:
 
         The real motivating record (1eef7df7) reports identical values for
         both its subjects, so the detector fires on the corpus that motivated
-        it. Per-subject clause scoping was tried and rejected on evidence:
-        `_CLAUSE_SPLIT_RE` splits on `.`, shattering filenames mid-sentence,
-        and the real content writes `task/94`, which `TASK_REF_RE` does not
-        match -- it yields the EMPTY SET on all four real records. This is a
-        RECALL gap in a report-only path, never a wrong delete.
+        it. This is a RECALL gap in a report-only path, never a wrong delete.
+
+        Per-subject clause scoping was genuinely inert when this was written:
+        `_CLAUSE_SPLIT_RE` split on EVERY `.`, shattering filenames
+        mid-sentence, and the real content writes `task/94`, which
+        `TASK_REF_RE` did not match -- together they yielded the EMPTY SET on
+        all four real records. Task 3403 fixed both regexes at the source, so
+        that evidence no longer argues against the technique; the rescope is
+        filed separately (ticket tkt_0RSCGSWBBW66VDBWYSYDQWF9PM). Until it
+        lands, the whole-record union key is what ships and this test is what
+        pins it -- the assertions below are unchanged by 3403.
         """
         divergent = (
             'Point-in-time liveness check performed 2026-07-26 on task 94: '

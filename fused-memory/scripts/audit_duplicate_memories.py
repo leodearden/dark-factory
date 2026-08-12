@@ -700,16 +700,27 @@ def find_liveness_snapshot_recurrences(
     detector fires on the corpus that motivated it; a future divergent one
     would be a RECALL gap in a report-only path, never a wrong delete.
 
-    Per-subject key scoping was tried and rejected on evidence, not taste.
-    Splitting content into per-task clauses with
-    ``task_filter._CLAUSE_SPLIT_RE`` and keying each subject on its own clause
-    (the technique ``task_filter.find_conflicting_task_status_ids`` uses)
-    yields the EMPTY SET on all four real records: ``_CLAUSE_SPLIT_RE`` splits
-    on ``.``, which shatters ``dark-factory-orchestrator.yaml`` and
+    The limitation above is a deliberate NOT-YET-DONE, not a dead end. Per-
+    subject key scoping — splitting content into per-task clauses with
+    ``task_filter._CLAUSE_SPLIT_RE`` and keying each subject on its own clause,
+    the technique ``task_filter.find_conflicting_task_status_ids`` uses — was
+    genuinely inert when this function was written: ``_CLAUSE_SPLIT_RE`` split
+    on EVERY ``.``, shattering ``dark-factory-orchestrator.yaml`` and
     ``CLAUDE.md:95`` mid-sentence, and the nearby reference is written
-    ``task/94``, which ``TASK_REF_RE``'s ``\\s*#?\\s*`` separator does not
-    match. Adopting it would trade a bounded, pinned recall gap for a detector
-    inert on its own motivating corpus.
+    ``task/94``, which ``TASK_REF_RE``'s ``\\s*#?\\s*`` separator did not
+    match. Task 3403 fixed both regexes at the source
+    (``\\.(?!\\w)|[;\\n!?]`` and ``\\s*[#/]?\\s*`` respectively), so the
+    technique is viable now and that evidence no longer argues against it.
+
+    What this function DOES is still the whole-record union key described
+    above, and ``test_divergent_per_task_statuses_do_not_group`` still pins it.
+    The rescope is filed separately (ticket
+    tkt_0RSCGSWBBW66VDBWYSYDQWF9PM) rather than folded into 3403, which was
+    kept to the regexes plus their regression net so a bisect stays
+    unambiguous if the two Graphiti edge-invalidation sweeps that share
+    ``TASK_REF_RE`` misbehave in production. Whoever picks it up should
+    re-measure the clause technique against the four real records rather than
+    assume it now returns non-empty.
 
     Args:
         memories: Raw memory list (any/all categories).

@@ -884,7 +884,27 @@ LIST_INTRODUCER_RE: re.Pattern[str] = re.compile(
 
 # Clause-ish boundary used to close a colon-introduced list segment (no
 # closing delimiter of its own) and as a fallback for an unterminated
-# bracket segment. Mirrors task_filter._CLAUSE_SPLIT_RE.
+# bracket segment.
+#
+# This DIVERGED from task_filter._CLAUSE_SPLIT_RE at task 3403, which narrowed
+# that one's dot to '\.(?!\w)' so dotted technical tokens stop shattering a
+# sentence. The narrowing is deliberately NOT copied here, despite the two
+# having started out identical, because the two splitters bound different
+# things with OPPOSITE fail-safe directions:
+#
+#   task_filter._CLAUSE_SPLIT_RE scopes a task-ref-to-status association
+#   feeding a SOFT-BLOCK write gate. A longer clause there costs a
+#   rephrase-and-retry, never data — so widening it is safe.
+#
+#   _CLAUSE_BOUNDARY_RE closes a segment from which BARE DIGITS are harvested
+#   as task ids, and that path ends in memory_service.update_edge(
+#   invalid_at=...) — a real Graphiti edge retirement. A longer segment here
+#   absorbs more incidental digits, i.e. over-selection, which this module's
+#   docstring explicitly forbids: under-selection self-heals next cycle or is
+#   caught by Stage 2, over-selection wrongly retires true facts.
+#
+# So keep the original narrow [.;\n!?] form. Copying the widening for symmetry
+# would trade a bounded soft-block for a permanent wrong invalidation.
 _CLAUSE_BOUNDARY_RE: re.Pattern[str] = re.compile(r'[.;\n!?]')
 
 # Bare digit token — used only within an already-detected, marker-anchored
