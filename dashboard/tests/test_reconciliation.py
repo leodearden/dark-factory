@@ -626,11 +626,16 @@ class TestGetLatestVerdict:
 
         assert result is not None
         assert isinstance(result, dict)
-        expected_keys = {'run_id', 'severity', 'action_taken', 'reviewed_at'}
+        expected_keys = {
+            'run_id', 'severity', 'action_taken', 'reviewed_at', 'is_phantom',
+        }
         assert set(result.keys()) == expected_keys
         assert result['run_id'] == 'run-001'
         assert result['severity'] == 'low'
         assert result['action_taken'] == 'logged'
+        # The conftest fixture row is an ordinary verdict (severity='low', a
+        # single substantive finding) — a genuine review, not a phantom.
+        assert result['is_phantom'] is False
 
     async def test_empty_table(self, empty_recon_conn):
         """Returns None when judge_verdicts table has no data."""
@@ -645,6 +650,177 @@ class TestGetLatestVerdict:
 
         result = await get_latest_verdict(None)
         assert result is None
+
+
+class TestGetLatestVerdictPhantom:
+    """get_latest_verdict must flag a PHANTOM newest verdict.
+
+    A phantom is the placeholder the reconciliation judge fabricates when it
+    could not parse its own model output — the run went UNREVIEWED.  Left
+    unannotated, the dashboard's Reconciliation health row renders it as a red
+    ``verdict: serious · halt``, reporting a serious finding no judge ever
+    made.  Measured (task 3287): the newest row on the live DB today is an
+    ordinary ``ok``, so this is a LATENT mis-render — it was visible across
+    the 2026-07-20..29 stretch and returns the next time a phantom is newest.
+
+    The contract is ANNOTATE, never rewrite or skip: the phantom's own
+    severity and action are still reported verbatim, because a phantom being
+    newest is itself real signal an operator needs.
+    """
+
+    @staticmethod
+    def _verdict_insert(run_id, reviewed_at, severity, findings, action):
+        return (
+            'INSERT INTO judge_verdicts '
+            '(run_id, reviewed_at, severity, findings, action_taken) '
+            'VALUES (?, ?, ?, ?, ?)',
+            (run_id, reviewed_at, severity, findings, action),
+        )
+
+    # The post-2947 structured-marker shape, as stored in the live DB.
+    MARKED_PHANTOM_JSON = (
+        '[{"code": "unparseable_judge_response", "issue": "Judge response '
+        'could not be parsed: Expecting value: line 1 column 1", '
+        '"severity": "serious"}]'
+    )
+    # The pre-2947 legacy shape (live rows e87d8e4a, 09d14a75): no code key.
+    LEGACY_PHANTOM_JSON = (
+        '[{"issue": "Judge response could not be parsed: Expecting value: '
+        'line 1 column 1", "severity": "serious"}]'
+    )
+    # The sole genuine serious verdict (bc9459b8): five findings, no marker.
+    GENUINE_SERIOUS_JSON = (
+        '[{"issue": "Task Knowledge Sync stage failed"}, '
+        '{"issue": "second"}, {"issue": "third"}, '
+        '{"issue": "fourth"}, {"issue": "fifth"}]'
+    )
+
+    async def test_marked_phantom_is_flagged_and_reported_verbatim(self, tmp_path):
+        """(a) Marked phantom → is_phantom True, severity/action UNCHANGED."""
+        from _dashboard_helpers import make_recon_db
+
+        from dashboard.data.reconciliation import get_latest_verdict
+
+        inserts = [
+            self._verdict_insert(
+                'run-older', '2026-07-19T00:00:00+00:00', 'ok', '[]', 'none',
+            ),
+            self._verdict_insert(
+                'run-phantom', '2026-07-25T00:00:00+00:00', 'serious',
+                self.MARKED_PHANTOM_JSON, 'halt',
+            ),
+        ]
+        async with make_recon_db(tmp_path, inserts, name='marked.db') as db:
+            result = await get_latest_verdict(db)
+
+        assert result is not None
+        assert result['is_phantom'] is True
+        # Annotate, never rewrite: the stored row is left intact for forensics
+        # (task 3070's decision), so the read layer reports what is actually
+        # in the DB and lets the renderer decide how to present it.
+        assert result['run_id'] == 'run-phantom'
+        assert result['severity'] == 'serious'
+        assert result['action_taken'] == 'halt'
+
+    async def test_legacy_unmarked_phantom_is_flagged(self, tmp_path):
+        """(b) The pre-2947 shape has no marker and is caught by the fallback."""
+        from _dashboard_helpers import make_recon_db
+
+        from dashboard.data.reconciliation import get_latest_verdict
+
+        inserts = [
+            self._verdict_insert(
+                'e87d8e4a', '2026-07-20T00:00:00+00:00', 'serious',
+                self.LEGACY_PHANTOM_JSON, 'halt',
+            ),
+        ]
+        async with make_recon_db(tmp_path, inserts, name='legacy.db') as db:
+            result = await get_latest_verdict(db)
+
+        assert result is not None
+        assert result['is_phantom'] is True
+
+    async def test_genuine_serious_verdict_is_not_flagged(self, tmp_path):
+        """(c) A real five-finding serious review must NOT be flagged.
+
+        The regression that would matter most: suppressing a genuine serious
+        verdict is strictly worse than the over-report being fixed.
+        """
+        from _dashboard_helpers import make_recon_db
+
+        from dashboard.data.reconciliation import get_latest_verdict
+
+        inserts = [
+            self._verdict_insert(
+                'bc9459b8', '2026-04-19T00:00:00+00:00', 'serious',
+                self.GENUINE_SERIOUS_JSON, 'halt',
+            ),
+        ]
+        async with make_recon_db(tmp_path, inserts, name='genuine.db') as db:
+            result = await get_latest_verdict(db)
+
+        assert result is not None
+        assert result['is_phantom'] is False
+        assert result['severity'] == 'serious'
+
+    @pytest.mark.parametrize(
+        ('findings_value', 'case_id'),
+        [
+            ("'not json'", 'malformed'),
+            ('NULL', 'null'),
+            ("'{\"not\": \"a list\"}'", 'json-object-not-list'),
+        ],
+    )
+    async def test_unparseable_findings_column_is_not_phantom_and_does_not_raise(
+        self, tmp_path, findings_value, case_id
+    ):
+        """(d) A malformed/NULL findings column degrades to False, never raises.
+
+        Uses the file's narrow ``(json.JSONDecodeError, TypeError)`` idiom
+        rather than a broad except, so a genuinely unexpected error still
+        surfaces instead of being swallowed.
+        """
+        from _dashboard_helpers import make_recon_db
+
+        from dashboard.data.reconciliation import get_latest_verdict
+
+        inserts = [
+            'INSERT INTO judge_verdicts '
+            '(run_id, reviewed_at, severity, findings, action_taken) '
+            "VALUES ('run-bad', '2026-07-25T00:00:00+00:00', 'serious', "
+            f'{findings_value}, {chr(39)}halt{chr(39)})',
+        ]
+        async with make_recon_db(tmp_path, inserts, name=f'{case_id}.db') as db:
+            result = await get_latest_verdict(db)
+
+        assert result is not None
+        assert result['is_phantom'] is False
+
+    async def test_findings_json_is_not_shipped_in_the_payload(self, tmp_path):
+        """(e) ``findings`` is loaded to classify, then dropped.
+
+        ``/api/v2/dashboard/recon`` is a poll endpoint and the boolean is the
+        whole answer — shipping the raw JSON blob on every poll would be pure
+        overhead.
+        """
+        from _dashboard_helpers import make_recon_db
+
+        from dashboard.data.reconciliation import get_latest_verdict
+
+        inserts = [
+            self._verdict_insert(
+                'run-phantom', '2026-07-25T00:00:00+00:00', 'serious',
+                self.MARKED_PHANTOM_JSON, 'halt',
+            ),
+        ]
+        async with make_recon_db(tmp_path, inserts, name='nofindings.db') as db:
+            result = await get_latest_verdict(db)
+
+        assert result is not None
+        assert 'findings' not in result
+        assert set(result.keys()) == {
+            'run_id', 'severity', 'action_taken', 'reviewed_at', 'is_phantom',
+        }
 
 
 class TestExceptionLogging:
