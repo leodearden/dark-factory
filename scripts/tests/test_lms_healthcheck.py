@@ -1292,7 +1292,7 @@ def cli_env(monkeypatch, tmp_path):
 
     monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path / 'baselines'))
     for arm_id in lms_manifest.load_arms().arm_ids():
-        lms_vram.record_baseline(arm_id, _baseline())
+        lms_vram.record_baseline(arm_id, _baseline(), consumers=[])
     monkeypatch.setattr(lms_vram, 'probe_gpu_snapshot', lambda *a, **k: _snapshot())
     monkeypatch.setattr(lms_healthcheck, 'probe_arm', probe)
     monkeypatch.setattr(lms_ctl, 'active_arms', lambda: set())
