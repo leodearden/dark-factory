@@ -112,9 +112,16 @@ async def _log_write(
     agent_id: str = _STAGE_AGENT_ID,
     result_summary: dict | str | None = None,
     success: bool = True,
-) -> None:
+) -> str:
+    """Journal one Layer-1 write_op and return its ``write_op_id``.
+
+    The id is returned (rather than discarded inline) so a test can hand it to
+    :func:`_stamp_terminal` afterwards. Keyword-only signature and defaults are
+    unchanged, so existing call sites that ignore the return value still work.
+    """
+    write_op_id = str(uuid.uuid4())
     await journal.log_write_op(
-        write_op_id=str(uuid.uuid4()),
+        write_op_id=write_op_id,
         causation_id=causation_id,
         source='mcp_tool',
         operation=operation,
@@ -122,6 +129,31 @@ async def _log_write(
         agent_id=agent_id,
         result_summary=result_summary,
         success=success,
+    )
+    return write_op_id
+
+
+async def _stamp_terminal(
+    journal: WriteJournal,
+    write_op_id: str,
+    *,
+    status: str,
+    error: str | None = None,
+) -> None:
+    """Stamp a durable-queue terminal outcome onto an already-journalled op.
+
+    ORDER IS LOAD-BEARING: ``_log_write`` must be awaited for ``write_op_id``
+    BEFORE this call. The row then already carries ``causation_id`` /
+    ``agent_id`` / ``operation``, so ``record_terminal_outcome``'s UPSERT takes
+    its ``ON CONFLICT(id) DO UPDATE`` path — which deliberately touches only
+    the three terminal columns. Stamping first would instead INSERT a
+    ``source='durable_queue'`` row with a NULL ``causation_id``, which
+    ``get_ops_by_causation`` never returns.
+    """
+    await journal.record_terminal_outcome(
+        write_op_id=write_op_id,
+        terminal_status=status,
+        terminal_error=error,
     )
 
 
