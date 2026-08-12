@@ -8,6 +8,7 @@ Built bottom-up in TDD order (see task 2492's plan.json):
   - TestUnpinRollback: unpin() is the rollback lever, restores the in-code constant.
   - TestKeyIsolationAndPathSafety: per-model/per-harness isolation + traversal safety.
   - TestFailSafeUnverifiablePin: half-written/corrupt pins fall back to in-code.
+  - TestUnreadableProvenanceWarns: the unreadable-sidecar fallback is loud, not silent.
   - TestAtomicWriteText: _atomic_write_text's failure/cleanup path.
   - TestDefaultArtifactsRoot: default_artifacts_root() env override + monorepo walk-up.
 """
@@ -15,6 +16,7 @@ Built bottom-up in TDD order (see task 2492's plan.json):
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +59,19 @@ def _make_spec(**overrides):
     )
     kwargs.update(overrides)
     return PromptSpec(**kwargs)
+
+
+@pytest.fixture(autouse=True)
+def clear_warned_unreadable_paths():
+    """Clear the per-process dedup set before and after each test.
+
+    Mirrors shared/tests/test_safe_io.py lines 13-24. Without it the
+    module-level set leaks across tests and the warn-once assertions in
+    ``TestUnreadableProvenanceWarns`` become test-order dependent.
+    """
+    prompt_artifact._warned_unreadable_provenance_paths.clear()
+    yield
+    prompt_artifact._warned_unreadable_provenance_paths.clear()
 
 
 class TestArtifactProvenance:
@@ -712,6 +727,81 @@ class TestFailSafeUnverifiablePin:
         assert resolved.text == spec.in_code_constant
         assert resolved.provenance is None
         assert resolved.source == 'in_code'
+
+
+class TestUnreadableProvenanceWarns:
+    """The unreadable-sidecar fallback must be loud, not silent (INV-4 storm-escape).
+
+    An artifacts root that goes unreadable reverts every prompt to baseline on
+    every resolve — for ``task_curator._resolve_curator_prompt`` that is every
+    reconciliation cycle — and is otherwise indistinguishable from "nothing
+    pinned". So the guard emits one deduped WARNING per path per process
+    (mirroring ``safe_io._warned_corrupt_paths``), carrying the path and the
+    OSError as structured facts at the failure point.
+    """
+
+    def test_unreadable_sidecar_warns_once_per_path_per_process(self, tmp_path, caplog):
+        store = PromptArtifactStore(tmp_path)
+        spec = _make_spec()
+        key_dir = store._key_dir('reviewer', 'claude-opus-4', 'v1')
+        key_dir.mkdir(parents=True)
+        (key_dir / 'heuristics.txt').write_text('some heuristics', encoding='utf-8')
+        provenance_path = key_dir / 'provenance.json'
+        provenance_path.mkdir()
+
+        with caplog.at_level(logging.WARNING):
+            first = store.resolve(spec, executor_model='claude-opus-4', harness_version='v1')
+            store.resolve(spec, executor_model='claude-opus-4', harness_version='v1')
+            store.read_provenance('reviewer', 'claude-opus-4', 'v1')
+
+        assert len(caplog.records) == 1, (
+            f'Expected exactly one WARNING across three reads of the same '
+            f'unreadable path, got: {caplog.records}'
+        )
+        assert str(provenance_path) in caplog.records[0].message
+        # The WARNING is additive: the fail-safe behaviour is unchanged.
+        assert first.source == 'in_code'
+        assert first.text == spec.in_code_constant
+
+    def test_distinct_unreadable_paths_each_warn(self, tmp_path, caplog):
+        """Dedup is per-path, not a global one-shot — a second failing key must
+        not be masked by the first key's warning.
+        """
+        store = PromptArtifactStore(tmp_path)
+        spec = _make_spec()
+        for executor_model in ('claude-opus-4', 'claude-sonnet-4'):
+            key_dir = store._key_dir('reviewer', executor_model, 'v1')
+            key_dir.mkdir(parents=True)
+            (key_dir / 'heuristics.txt').write_text('some heuristics', encoding='utf-8')
+            (key_dir / 'provenance.json').mkdir()
+
+        with caplog.at_level(logging.WARNING):
+            for executor_model in ('claude-opus-4', 'claude-sonnet-4'):
+                resolved = store.resolve(spec, executor_model=executor_model, harness_version='v1')
+                assert resolved.source == 'in_code'
+
+        assert len(caplog.records) == 2, (
+            f'Expected one WARNING per distinct unreadable path, got: {caplog.records}'
+        )
+
+    def test_valid_and_absent_provenance_emit_no_warning(self, tmp_path, caplog):
+        """Guard against over-logging on the two hot happy paths: a good pin and
+        nothing pinned at all are both silent.
+        """
+        store = PromptArtifactStore(tmp_path)
+        spec = _make_spec()
+        provenance = ArtifactProvenance(**_provenance_kwargs(harness_version='v1'))
+        store.pin('reviewer', 'claude-opus-4', 'v1', heuristics='h', provenance=provenance)
+
+        with caplog.at_level(logging.WARNING):
+            pinned = store.resolve(spec, executor_model='claude-opus-4', harness_version='v1')
+            unpinned = store.resolve(spec, executor_model='claude-sonnet-4', harness_version='v1')
+
+        assert pinned.source == 'artifact'
+        assert unpinned.source == 'in_code'
+        assert len(caplog.records) == 0, (
+            f'Expected no WARNING on the valid/absent paths, got: {caplog.records}'
+        )
 
 
 class TestAtomicWriteText:
