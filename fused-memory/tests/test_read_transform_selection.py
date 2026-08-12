@@ -1509,3 +1509,329 @@ class TestOnlyASynthesizedRecordCanAlias:
             result.records, 't-a', canonical.record_id, k=5,
             provenance=result.provenance,
         )['unaliased_in_top_k'] is True
+
+
+# ---------------------------------------------------------------------------
+# The UNLABELED production scoring path
+# ---------------------------------------------------------------------------
+#
+# The E2 query set is blind-authored but LABELED: every `Query` carries
+# `expects_claim_ids` (:199), `cross_validate_fixtures` (:477) requires it
+# non-empty, and `load_query_set` (:368) validates `kind in QUERY_KINDS`.
+# Production queries have none of that — the journal records what was asked,
+# never what should have come back.
+#
+# So they cannot ride the E2 loader, and the two sets must not silently
+# merge: a production row entering the labeled corpus would either crash the
+# cross-validator or, worse, be scored against an empty expectation set and
+# report a recall.  The loaders therefore reject each other's rows BY NAME,
+# and the labeled metrics return None — no measurement, never a measured
+# zero — for every unlabeled query.
+
+
+PRODUCTION_FIXTURE = FIXTURES_DIR / 'production_query_sample.jsonl'
+
+
+def _prod_rows(tmp_path, rows):
+    """Write `rows` as a production-shaped JSONL fixture."""
+    import json  # noqa: PLC0415
+
+    path = tmp_path / 'prod.jsonl'
+    path.write_text(''.join(json.dumps(r, sort_keys=True) + '\n' for r in rows))
+    return path
+
+
+def _prod_row(query_id='prod-brief-abc', text='project overview architecture goals',
+              source='briefing_template', observed_count=74103,
+              traffic_share=0.172892, observed_limit=5):
+    return {
+        'query_id': query_id,
+        'text': text,
+        'source': source,
+        'observed_count': observed_count,
+        'traffic_share': traffic_share,
+        'observed_limit': observed_limit,
+    }
+
+
+class TestTheTwoQuerySetsDoNotSilentlyMerge:
+    """A labeled loader and an unlabeled loader, each refusing the other's rows."""
+
+    def test_the_production_loader_accepts_label_free_rows(self, tmp_path):
+        mod = _mod()
+        path = _prod_rows(tmp_path, [_prod_row()])
+        queries = mod.load_production_queries(path)
+        assert len(queries) == 1
+        assert queries[0].text == 'project overview architecture goals'
+        assert queries[0].observed_limit == 5
+
+    def test_the_committed_production_fixture_loads(self):
+        """The real harvested sample is loadable as-is."""
+        mod = _mod()
+        queries = mod.load_production_queries(PRODUCTION_FIXTURE)
+        assert len(queries) >= 4
+        briefing = [q for q in queries if q.source == 'briefing_template']
+        assert len(briefing) == 4
+
+    def test_the_e2_loader_rejects_a_production_row_by_name(self, tmp_path):
+        """`load_query_set` must refuse an unlabeled row, loudly."""
+        mod, bake = _mod(), _bake_off()
+        path = _prod_rows(tmp_path, [_prod_row()])
+        with pytest.raises(bake.FixtureError) as exc:
+            bake.load_query_set(path)
+        assert 'kind' in str(exc.value)
+        assert mod # the two loaders coexist; neither shadows the other
+
+    def test_the_production_loader_rejects_a_labeled_row_by_name(self, tmp_path):
+        """The symmetric guard: an E2 row must not sneak into the unlabeled set.
+
+        Without this, a labeled row would be scored on the unlabeled path and
+        its ground truth silently discarded — the merge this pair exists to
+        prevent, in the other direction.
+        """
+        mod = _mod()
+        row = _prod_row()
+        row['expects_claim_ids'] = ['claim-1']
+        path = _prod_rows(tmp_path, [row])
+        with pytest.raises(mod.ProductionQuerySetError) as exc:
+            mod.load_production_queries(path)
+        assert 'expects_claim_ids' in str(exc.value)
+
+    def test_a_production_query_exposes_no_expectation_attribute(self, tmp_path):
+        """Not merely absent from the file — absent from the object.
+
+        An `expects_claim_ids` attribute defaulting to `[]` would let a
+        scorer compute `0/0` and report a recall for a query that has no
+        ground truth at all.
+        """
+        mod = _mod()
+        queries = mod.load_production_queries(_prod_rows(tmp_path, [_prod_row()]))
+        assert not hasattr(queries[0], 'expects_claim_ids')
+        assert not hasattr(queries[0], 'topic')
+
+    def test_a_duplicate_query_id_is_refused(self, tmp_path):
+        mod = _mod()
+        path = _prod_rows(tmp_path, [_prod_row(), _prod_row()])
+        with pytest.raises(mod.ProductionQuerySetError):
+            mod.load_production_queries(path)
+
+    def test_a_missing_required_field_is_refused_by_name(self, tmp_path):
+        mod = _mod()
+        row = _prod_row()
+        del row['traffic_share']
+        path = _prod_rows(tmp_path, [row])
+        with pytest.raises(mod.ProductionQuerySetError) as exc:
+            mod.load_production_queries(path)
+        assert 'traffic_share' in str(exc.value)
+
+
+class TestProductionIsScoredAtProductionsOwnK:
+    """briefing.py fires at limit=5 (:1376), not the E2 default of 10."""
+
+    def test_the_production_k_is_five(self):
+        assert _mod().PRODUCTION_K == 5
+
+    def test_scoring_defaults_to_that_k(self):
+        mod = _mod()
+        hits = [_rec(f'r{i}', topic=f't{i}') for i in range(8)]
+        scored = mod.score_unlabeled_query(hits, baseline=hits)
+        assert scored['k'] == 5
+        assert scored['window_size'] == 5
+
+    def test_a_shorter_window_reports_its_real_size(self):
+        mod = _mod()
+        hits = [_rec('r0'), _rec('r1', topic='t2')]
+        scored = mod.score_unlabeled_query(hits, baseline=hits)
+        assert scored['window_size'] == 2
+
+
+class TestLabeledMetricsAreNoneNotZero:
+    """The whole point: an unlabeled query yields no labeled number."""
+
+    def test_claim_recall_is_none(self):
+        mod = _mod()
+        hits = [_rec('r0', claim_ids=['c1']), _rec('r1', claim_ids=['c2'])]
+        scored = mod.score_unlabeled_query(hits, baseline=hits)
+        assert scored['claim_recall'] is None
+        assert scored['claim_recall'] != 0.0
+
+    def test_canonical_discoverability_is_none_on_both_rates(self):
+        """Even the aliased rate is unavailable: there is no canonical to seek."""
+        mod = _mod()
+        hits = [_rec('r0', canonical=True), _rec('r1')]
+        scored = mod.score_unlabeled_query(hits, baseline=hits)
+        assert scored['canonical_aliased_in_top_k'] is None
+        assert scored['canonical_unaliased_in_top_k'] is None
+
+    def test_the_reason_travels_with_the_none(self):
+        """A `—` in the table must be explainable without reading this file."""
+        mod = _mod()
+        hits = [_rec('r0')]
+        scored = mod.score_unlabeled_query(hits, baseline=hits)
+        assert scored['unlabeled'] is True
+        assert 'ground truth' in scored['unlabeled_reason'].lower()
+
+    def test_a_canonical_in_the_window_still_scores_none(self):
+        """Presence is not ground truth.
+
+        A production query CAN return a canonical record — that says nothing
+        about whether it was the RIGHT answer, which is exactly what a
+        discoverability rate claims to measure.
+        """
+        mod = _mod()
+        hits = [_rec('r0', canonical=True, topic='t1')]
+        scored = mod.score_unlabeled_query(hits, baseline=hits)
+        assert scored['canonical_aliased_in_top_k'] is None
+
+
+class TestComputableMetricsAreProduced:
+    """What CAN be measured without labels, is."""
+
+    def test_tokens_per_query_is_measured(self):
+        mod = _mod()
+        hits = [_rec('r0', content='x' * 100), _rec('r1', content='y' * 100)]
+        scored = mod.score_unlabeled_query(hits, baseline=hits)
+        assert isinstance(scored['tokens_per_query'], int)
+        assert scored['tokens_per_query'] > 0
+
+    def test_the_token_estimator_is_named(self):
+        """Inherited from the E2 table: a token count without its estimator
+        is not comparable across tables."""
+        mod = _mod()
+        scored = mod.score_unlabeled_query([_rec('r0')], baseline=[_rec('r0')])
+        assert scored['token_estimator']
+
+    def test_topic_diversity_counts_distinct_topics_in_the_window(self):
+        mod = _mod()
+        hits = [
+            _rec('r0', topic='alpha'), _rec('r1', topic='alpha'),
+            _rec('r2', topic='beta'), _rec('r3', topic='gamma'),
+            _rec('r4', topic='beta'),
+        ]
+        scored = mod.score_unlabeled_query(hits, baseline=hits)
+        assert scored['topic_diversity'] == 3
+
+    def test_untopiced_records_do_not_inflate_diversity(self):
+        """The 300-record distractor slab carries only `category`."""
+        mod = _mod()
+        hits = [_rec('r0', topic='alpha'), _rec('d0', topic=None), _rec('d1', topic=None)]
+        scored = mod.score_unlabeled_query(hits, baseline=hits)
+        assert scored['topic_diversity'] == 1
+        assert scored['untopiced_in_window'] == 2
+
+    def test_baseline_retention_is_one_when_the_window_is_unchanged(self):
+        mod = _mod()
+        hits = [_rec(f'r{i}', topic=f't{i}') for i in range(5)]
+        scored = mod.score_unlabeled_query(hits, baseline=hits)
+        assert scored['baseline_retention_at_k'] == 1.0
+        assert scored['window_displacement'] == 0
+
+    def test_baseline_retention_falls_when_a_record_is_dropped(self):
+        mod = _mod()
+        baseline = [_rec(f'r{i}', topic=f't{i}') for i in range(5)]
+        transformed = baseline[:4] # the cap dropped one
+        scored = mod.score_unlabeled_query(transformed, baseline=baseline)
+        assert scored['baseline_retention_at_k'] == 0.8
+        assert scored['window_displacement'] == 1
+
+    def test_a_record_pushed_past_the_window_edge_counts_as_displaced(self):
+        """Arm (1)'s honest cost: promotion at a full window evicts the k-th."""
+        mod = _mod()
+        baseline = [_rec(f'r{i}', topic=f't{i}') for i in range(5)]
+        promoted = _rec('rX', topic='tX')
+        transformed = [promoted, *baseline[:4]] # r4 truncated away at k=5
+        scored = mod.score_unlabeled_query(transformed, baseline=baseline)
+        assert scored['window_displacement'] == 1
+        assert scored['baseline_retention_at_k'] == 0.8
+
+    def test_a_pure_reorder_inside_the_window_displaces_nothing(self):
+        """Displacement is eviction, not motion — the two are different costs."""
+        mod = _mod()
+        baseline = [_rec(f'r{i}', topic=f't{i}') for i in range(5)]
+        scored = mod.score_unlabeled_query(list(reversed(baseline)), baseline=baseline)
+        assert scored['window_displacement'] == 0
+        assert scored['baseline_retention_at_k'] == 1.0
+        assert scored['window_reordered'] is True
+
+
+class TestRetentionAndDisplacementDivergeUnderGrouping:
+    """Arm (2)'s exact story: knowledge retained, records displaced.
+
+    A grouped document absorbs its members' bodies, so the KNOWLEDGE of a
+    folded member is still in the reader's window — retention holds. But the
+    member is no longer an independent hit, which is the suppression cost —
+    displacement records it. Collapsing the two into one number would hide
+    whichever half a reader cared about.
+    """
+
+    def test_a_folded_member_is_retained_but_displaced(self):
+        mod = _mod()
+        canonical = _rec('c1', topic='alpha', canonical=True)
+        peer = _rec('p1', topic='alpha')
+        baseline = [canonical, peer, _rec('r2', topic='beta')]
+        result = mod.apply_topic_keyed_grouped_read(
+            baseline, {'alpha': [canonical, peer]}, render_sightings=False,
+        )
+        scored = mod.score_unlabeled_query(
+            result.records, baseline=baseline, provenance=result.provenance,
+        )
+        assert scored['baseline_retention_at_k'] == 1.0, 'p1 folded, not lost'
+        assert scored['window_displacement'] == 1, 'p1 is no longer its own hit'
+
+    def test_without_provenance_a_folded_member_reads_as_lost(self):
+        """The disclosure is load-bearing, not decoration."""
+        mod = _mod()
+        canonical = _rec('c1', topic='alpha', canonical=True)
+        peer = _rec('p1', topic='alpha')
+        baseline = [canonical, peer]
+        result = mod.apply_topic_keyed_grouped_read(
+            baseline, {'alpha': [canonical, peer]}, render_sightings=False,
+        )
+        scored = mod.score_unlabeled_query(result.records, baseline=baseline)
+        assert scored['baseline_retention_at_k'] == 0.5
+
+
+class TestNoneNeverAveragesInAsZero:
+    """`_mean` (:3286) is reused, not restated — and its discipline holds here."""
+
+    def test_an_all_none_column_aggregates_to_none(self):
+        mod = _mod()
+        rows = [
+            {'claim_recall': None, 'tokens_per_query': 10},
+            {'claim_recall': None, 'tokens_per_query': 20},
+        ]
+        agg = mod.aggregate_unlabeled(rows)
+        assert agg['claim_recall'] is None
+        assert agg['tokens_per_query'] == 15.0
+
+    def test_a_none_does_not_drag_a_measured_column_down(self):
+        mod = _mod()
+        rows = [
+            {'baseline_retention_at_k': 1.0},
+            {'baseline_retention_at_k': None},
+            {'baseline_retention_at_k': 0.5},
+        ]
+        agg = mod.aggregate_unlabeled(rows)
+        assert agg['baseline_retention_at_k'] == 0.75 # not 0.5
+
+    def test_it_delegates_to_the_bake_offs_mean(self):
+        """INV-5: there is not a second mean in this repo."""
+        mod = _mod()
+        assert mod._mean is _bake_off()._mean
+
+    def test_an_empty_row_set_aggregates_to_none_not_zero(self):
+        mod = _mod()
+        agg = mod.aggregate_unlabeled([])
+        assert agg['tokens_per_query'] is None
+
+
+class TestUnlabeledScoringIsPure:
+    def test_it_mutates_neither_hits_nor_baseline(self):
+        mod = _mod()
+        hits = [_rec('r0', topic='a'), _rec('r1', topic='b')]
+        baseline = [_rec('r0', topic='a'), _rec('r1', topic='b'), _rec('r2', topic='c')]
+        before_hits = copy.deepcopy(hits)
+        before_baseline = copy.deepcopy(baseline)
+        mod.score_unlabeled_query(hits, baseline=baseline)
+        assert hits == before_hits
+        assert baseline == before_baseline
