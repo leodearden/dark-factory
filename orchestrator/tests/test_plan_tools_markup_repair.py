@@ -302,6 +302,92 @@ def _observed_plan_keys(root) -> dict[str | None, set[str]]:
     return observed
 
 
+def _alternate_writer_changed_the_cell(
+    root, collection: str | None, field: str, tool_name: str
+) -> bool:
+    """True iff calling the DECLARED alternate *tool_name* actually rewrites the
+    (*collection*, *field*) cell of a plan seeded through the real writers.
+
+    THE BEHAVIOURAL PROOF ``also_written_by`` NEEDS. A signature check
+    (``field in _tool_params(impl)``) can only see a writer that takes the
+    field AS A PARAMETER — false for ``mark_step_committed``, which prepends a
+    provenance tag to ``description`` by re-reading and rewriting the plan
+    without ever taking a ``description`` argument at all. Proving the write
+    behaviourally is the invariant the signature proxy was standing in for.
+
+    Builds the plan exactly as :func:`_observed_plan_keys` does (same five
+    real writers), snapshots the addressed cell, invokes *tool_name* with
+    arguments synthesized from ITS OWN live signature — never a hardcoded
+    call — and reports whether the cell changed while its item still exists.
+    A parameter name this synthesis does not recognise raises loudly rather
+    than being silently left unset, so a probe can never pass by having
+    quietly called the alternate with a hole in its arguments.
+
+    An alternate whose guard depends on state this fixture cannot supply
+    (currently only ``mark_step_committed``, via ``_sha_exists_on_branch`` —
+    ``root`` here is not a git repository) is the CALLER's responsibility to
+    satisfy first, e.g. via ``monkeypatch``.
+    """
+    artifacts = TaskArtifacts(root)
+    artifacts.init('test-1', 'Test task', 'A test')
+    plan_tools._create_plan(artifacts, 'test-1', 'A title.', 'An analysis.', ['a.py'])
+    plan_tools._add_prerequisite(artifacts, 'pre-1', 'A prerequisite.')
+    plan_tools._add_plan_step(artifacts, 'step-1', 'test', 'A step.')
+    plan_tools._add_design_decision(artifacts, 'A decision.', 'A rationale.')
+    plan_tools._add_reuse_item(artifacts, 'A thing', 'somewhere.py', 'By importing it.')
+
+    seeded_id = None
+    if collection is not None:
+        items = artifacts.read_plan()[collection]
+        assert items and isinstance(items[0], dict), (
+            f'the seeded plan has no item in {collection!r} to probe'
+        )
+        seeded_id = items[0]['id']
+
+    def _cell() -> tuple[object, bool]:
+        """(value, item still present) at the (collection, field) address."""
+        plan = artifacts.read_plan()
+        if collection is None:
+            return plan.get(field), True
+        for item in plan.get(collection, []):
+            if isinstance(item, dict) and item.get('id') == seeded_id:
+                return item.get(field), True
+        return None, False
+
+    before, _ = _cell()
+
+    impl = getattr(plan_tools, '_' + tool_name)
+    kwargs: dict[str, object] = {}
+    for name in inspect.signature(impl).parameters:
+        if name == 'artifacts':
+            continue
+        if name in ('step_id', 'prereq_id'):
+            kwargs[name] = seeded_id
+        elif name == 'step_type':
+            kwargs[name] = 'test'
+        elif name == 'sha':
+            kwargs[name] = 'a' * 40
+        elif name == 'files':
+            kwargs[name] = ['a.py']
+        elif name == 'task_id':
+            kwargs[name] = 'test-1'
+        elif name in (
+            'description', 'analysis', 'title', 'decision', 'rationale',
+            'what', 'where', 'how',
+        ):
+            kwargs[name] = f'Probe marker for {tool_name}.{name}.'
+        else:
+            raise AssertionError(
+                f'_alternate_writer_changed_the_cell does not know how to '
+                f'synthesize a value for {impl.__name__}({name!r}) — extend '
+                'the probe rather than silently probing nothing'
+            )
+    impl(artifacts, **kwargs)
+
+    after, still_exists = _cell()
+    return still_exists and after != before
+
+
 class TestRepairableFieldTable:
     """``_REPAIRABLE_PLAN_FIELDS`` is the single declared repairable surface."""
 
@@ -482,6 +568,34 @@ class TestRepairableFieldTable:
                 f'{record.collection}.{record.field} declares non-prose '
                 f'recovery targets {sorted(illegal)}'
             )
+
+    def test_a_tag_prepending_writer_is_declared_like_any_other(
+        self, tmp_path, monkeypatch
+    ):
+        """S3 (task 3982): ``mark_step_committed`` belongs in ``also_written_by``.
+
+        It prepends a ``[COMMITTED <sha12>]`` provenance tag to ``description``
+        on either collection WITHOUT ever taking a ``description`` parameter —
+        the exact shape a signature-based check cannot see. PROVE the premise
+        first (the probe below), THEN assert the declaration — half (c) is the
+        invariant; the table is only a restatement of it.
+        """
+        monkeypatch.setattr(plan_tools, '_sha_exists_on_branch', lambda *_a, **_k: True)
+
+        for collection in ('steps', 'prerequisites'):
+            assert _alternate_writer_changed_the_cell(
+                tmp_path / collection, collection, 'description', 'mark_step_committed'
+            ), (
+                f'mark_step_committed is supposed to rewrite {collection}.description '
+                '(it prepends a [COMMITTED <sha>] tag) but the probe observed no change'
+            )
+
+        alternates = {
+            (r.collection, r.field): set(r.also_written_by)
+            for r in plan_tools._REPAIRABLE_PLAN_FIELDS
+        }
+        assert 'mark_step_committed' in alternates[('steps', 'description')]
+        assert 'mark_step_committed' in alternates[('prerequisites', 'description')]
 
 
 # ---------------------------------------------------------------------------
