@@ -21,6 +21,18 @@ the upstream format changes, this module must be updated by hand.
    Anyone renaming the ``run`` command or its ``--prd``/``--config`` flags
    must update ``find_running_orchestrators`` to match.
 
+2. Config DEFAULTS layering (:func:`read_max_concurrent_tasks`) — the
+   orchestrator's effective config is ``_deep_merge(_load_defaults(),
+   project_config)`` (``orchestrator/src/orchestrator/config.py``), so a key
+   a project's YAML omits is still in force from
+   ``orchestrator/src/orchestrator/defaults.yaml``. Reading a project YAML
+   alone therefore under-reports, and for a parity DENOMINATOR that silently
+   disables the alarm rather than loosening it. The one default this module
+   needs is restated as
+   :data:`_ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS`; anyone changing
+   ``max_concurrent_tasks`` in ``defaults.yaml`` must update it (a test
+   asserts the two agree whenever the orchestrator source is present).
+
 RETIRED: this module used to re-derive a second format — the ``.task/``
 artifact layout (``metadata.json``, ``plan.json``, ``iterations.jsonl``,
 ``reviews/*.json``) — via a hand-rolled reader (``read_task_artifacts`` /
@@ -127,13 +139,41 @@ def _load_config_mapping(path: Path) -> dict | None:
     return raw if isinstance(raw, dict) else None
 
 
+# FORMAT COUPLING item 2 (see the module docstring). Restates
+# ``orchestrator/src/orchestrator/defaults.yaml``'s ``max_concurrent_tasks``,
+# which ``orchestrator.config`` deep-merges UNDER every project config. A
+# project that omits the key therefore runs with this cap, not with no cap —
+# so the reader must layer it the same way or the parity alarm silently never
+# fires for those projects (the exact E12 miss it exists to catch).
+# ``dashboard/tests/test_orchestrator.py`` asserts this constant against that
+# file whenever the orchestrator source is present, so drift fails a test
+# rather than degrading an alarm.
+_ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS = 24
+
+_CAP_KEY_ABSENT = object()
+"""Sentinel: the config mapping has no ``max_concurrent_tasks`` key at all.
+
+Distinct from an explicit ``max_concurrent_tasks:`` (YAML null). Absent means
+"the orchestrator's own default applies"; an explicit null is a config defect —
+``OrchestratorConfig`` types the field ``int``, so such a config fails
+validation and no orchestrator runs from it at all.
+"""
+
+
 def _coerce_concurrency_cap(value: object, path: Path) -> int | None:
     """Coerce a raw ``max_concurrent_tasks`` value to a usable cap, or ``None``.
 
     ``None`` means UNKNOWN, which the parity alarm must never conflate with
-    "not breaching". Absent/null is silent (a project simply may not set a
-    cap); a *malformed* value logs a WARNING naming the file and the value,
-    because that is a config defect an operator needs to see.
+    "not breaching", and is now reserved STRICTLY for "the file is unreadable
+    or the value is malformed". A malformed value logs a WARNING naming the
+    file and the value, because that is a config defect an operator needs
+    to see.
+
+    An ABSENT key (*value* is :data:`_CAP_KEY_ABSENT`) is not unknown: the
+    orchestrator deep-merges ``defaults.yaml`` under the project config, so
+    the project runs with :data:`_ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS`.
+    Returning ``None`` here would exclude the whole project from the parity
+    alarm — of the live configs under ``/home/leo/src``, two omit the key.
 
     Boundaries:
 
@@ -143,12 +183,19 @@ def _coerce_concurrency_cap(value: object, path: Path) -> int | None:
       in-progress against a 0 cap are a genuine breach; reporting that as
       unknown would hide it.
     * Negative caps are nonsense and rejected.
+    * An explicit YAML null is MALFORMED, not absent — see
+      :data:`_CAP_KEY_ABSENT`.
     * A numeric *string* is accepted after ``${VAR:default}`` expansion —
       that is how a config spells an env-driven int.
     """
-    if value is None:
-        logger.debug('No max_concurrent_tasks in %s', path)
-        return None
+    if value is _CAP_KEY_ABSENT:
+        logger.debug(
+            'No max_concurrent_tasks in %s — applying the orchestrator default '
+            'of %d (defaults.yaml is merged under every project config)',
+            path,
+            _ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS,
+        )
+        return _ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS
 
     raw = value
     if isinstance(value, bool):
@@ -188,12 +235,22 @@ def read_max_concurrent_tasks(project_root: Path | str) -> int | None:
     breach after a cap raise and invent one after a cut. Callers must treat
     ``None`` as UNKNOWN, never as "not breaching".
 
+    ``None`` is reserved for a config that is ABSENT, unreadable, or carries a
+    malformed value. A readable config that simply OMITS the key yields the
+    orchestrator's own default
+    (:data:`_ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS`), because
+    ``orchestrator.config`` deep-merges ``defaults.yaml`` under every project
+    config — every running orchestrator has a cap, whether or not its YAML
+    spells one. Reading such a project as capless would drop it out of the
+    parity alarm entirely.
+
     Resolution mirrors ``dashboard.config._discover_root_escalation_url`` and
     reuses its filename constants so the two cannot fork: the canonical
     ``dark-factory-orchestrator.yaml`` is authoritative once it exists on
-    disk (a present-but-capless live config must not be masked by a stale
-    legacy file), and only its outright absence falls through to
-    ``_LEGACY_CONFIG_NAMES`` in order, taking the first that yields a cap.
+    disk (a live config must not be masked by a stale legacy file — including
+    when it omits the key, where the default applies rather than the legacy
+    file's value), and only its outright absence falls through to
+    ``_LEGACY_CONFIG_NAMES`` in order, taking the first readable one.
 
     Unlike that startup-time discovery helper, the legacy-spelling nudge here
     is logged at DEBUG, not WARNING: this runs every collection cycle
@@ -211,7 +268,9 @@ def read_max_concurrent_tasks(project_root: Path | str) -> int | None:
         data = _load_config_mapping(canonical)
         if data is None:
             return None
-        return _coerce_concurrency_cap(data.get('max_concurrent_tasks'), canonical)
+        return _coerce_concurrency_cap(
+            data.get('max_concurrent_tasks', _CAP_KEY_ABSENT), canonical
+        )
 
     for legacy_name in _LEGACY_CONFIG_NAMES:
         legacy_path = root / legacy_name
@@ -220,7 +279,9 @@ def read_max_concurrent_tasks(project_root: Path | str) -> int | None:
         data = _load_config_mapping(legacy_path)
         if data is None:
             continue
-        cap = _coerce_concurrency_cap(data.get('max_concurrent_tasks'), legacy_path)
+        cap = _coerce_concurrency_cap(
+            data.get('max_concurrent_tasks', _CAP_KEY_ABSENT), legacy_path
+        )
         if cap is not None:
             logger.debug(
                 'Project %s: read max_concurrent_tasks from legacy config path %s '
