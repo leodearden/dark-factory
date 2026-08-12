@@ -442,3 +442,125 @@ class TestMetadataBridgeDropsUnusableValues:
         )
         assert resolution.referents == (Referent(kind='task', number='3127'),)
         assert resolution.source == 'derived'
+
+
+class TestDeclaredPath:
+    """An explicit declaration is the strongest source and is honoured verbatim.
+
+    Entry shape is the PRD's: ``{'kind': 'task', 'id': 3127}``, with an
+    optional ``project_id``.
+    """
+
+    @pytest.mark.parametrize(
+        'entry',
+        [
+            {'kind': 'task', 'id': 3127},
+            {'kind': 'task', 'id': '3127'},
+            {'id': 3127},
+        ],
+        ids=['int-id', 'str-id', 'kind-omitted'],
+    )
+    def test_a_well_formed_entry_resolves_to_its_referent(self, entry):
+        """``kind`` defaults to 'task' — the same default ``Referent`` itself
+        carries, so canonical_labels stays the single site for it."""
+        resolution = resolve_referents(
+            declared=[entry], metadata={}, content='', group_id=GROUP
+        )
+        assert resolution.referents == (Referent(kind='task', number='3127'),)
+        assert resolution.source == 'declared'
+
+    def test_digits_are_preserved_verbatim(self):
+        """'0132' is a DIFFERENT referent from '132'; int-normalizing a
+        declared id would silently repoint the caller's own assertion."""
+        padded = resolve_referents(
+            declared=[{'id': '0132'}], metadata={}, content='', group_id=GROUP
+        )
+        bare = resolve_referents(declared=[{'id': 132}], metadata={}, content='', group_id=GROUP)
+        assert padded.referents == (Referent(kind='task', number='0132'),)
+        assert bare.referents == (Referent(kind='task', number='132'),)
+        assert padded.referents != bare.referents
+
+    def test_an_optional_project_id_declares_a_foreign_referent(self):
+        resolution = resolve_referents(
+            declared=[{'kind': 'task', 'id': 132, 'project_id': 'reify'}],
+            metadata={},
+            content='',
+            group_id=GROUP,
+        )
+        assert resolution.referents[0].node_name == 'reify:132'
+
+    def test_a_non_canonical_project_id_is_canonicalized(self):
+        """Case and hyphen/underscore spelling are rendering choices, not
+        different projects — the same normalization ``scan_content`` applies
+        before comparing, so the two sides stay comparable in step-13."""
+        resolution = resolve_referents(
+            declared=[{'kind': 'task', 'id': 132, 'project_id': 'Reify-X'}],
+            metadata={},
+            content='',
+            group_id=GROUP,
+        )
+        assert resolution.referents == (
+            Referent(kind='task', project_id='reify_x', number='132'),
+        )
+
+    def test_a_self_qualified_project_id_is_reclassified_as_own_project(self):
+        """Mirrors ``scan_content``'s self-qualified reclassification EXACTLY.
+        Without it a self-qualified declaration could never compare equal to
+        the scanned form, and the conflict check would fire on a caller who
+        was right."""
+        resolution = resolve_referents(
+            declared=[{'kind': 'task', 'id': 132, 'project_id': 'Dark-Factory'}],
+            metadata={},
+            content='',
+            group_id=GROUP,
+        )
+        assert resolution.referents == (Referent(kind='task', number='132'),)
+        assert resolution.referents[0].node_name == 'Task 132'
+
+    def test_duplicate_entries_collapse_preserving_first_seen_order(self):
+        """De-duplicated on (kind, project_id, number) — the same key and the
+        same discipline ``scan_content``'s dedup uses."""
+        resolution = resolve_referents(
+            declared=[
+                {'kind': 'task', 'id': 3127},
+                {'kind': 'task', 'id': 2500},
+                {'kind': 'task', 'id': '3127'},
+            ],
+            metadata={},
+            content='',
+            group_id=GROUP,
+        )
+        assert resolution.referents == (
+            Referent(kind='task', number='3127'),
+            Referent(kind='task', number='2500'),
+        )
+
+
+class TestDeclaredPrecedence:
+    """A declaration beats BOTH lower sources."""
+
+    def test_declared_outranks_metadata_and_the_scan(self):
+        resolution = resolve_referents(
+            declared=[{'kind': 'task', 'id': 5000}],
+            metadata={'task_id': 3668},
+            content='Fixed the bug in Task 3127.',
+            group_id=GROUP,
+        )
+        assert resolution.referents == (Referent(kind='task', number='5000'),)
+        assert resolution.source == 'declared'
+
+    def test_ambiguity_is_still_reported_under_a_declaration(self):
+        """The always-scan contract: ``.ambiguous`` reads the same whatever
+        source won, so a declaring caller never has to re-derive the scan
+        itself to learn the content was contested."""
+        resolution = resolve_referents(
+            declared=[{'kind': 'task', 'id': 5000}],
+            metadata={},
+            content='task 2500 duplicates dark_factory:2500',
+            group_id='reify',
+        )
+        assert resolution.source == 'declared'
+        assert resolution.ambiguous == (
+            Referent(kind='task', number='2500'),
+            Referent(kind='task', project_id='dark_factory', number='2500'),
+        )
