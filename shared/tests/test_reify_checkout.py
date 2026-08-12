@@ -295,6 +295,7 @@ class TestReifySkipReason:
         which reads as though the operator named a path when nobody did.
         """
         reason = reify_skip_reason(_VERIFY_MARKER, None)
+        assert isinstance(reason, str) and reason
         assert 'None' not in reason, (
             f'discovery-miss reason must not stringify the absent root: {reason!r}'
         )
@@ -317,6 +318,8 @@ class TestReifySkipReason:
         miss_reason = reify_skip_reason(_VERIFY_MARKER, None)
         named_reason = reify_skip_reason(_VERIFY_MARKER, bad_root)
 
+        assert isinstance(miss_reason, str) and miss_reason
+        assert isinstance(named_reason, str) and named_reason
         assert miss_reason != named_reason
         assert str(bad_root) in named_reason
         assert str(bad_root) not in miss_reason
