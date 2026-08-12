@@ -93,11 +93,13 @@ Exactly four vars are visible to the spawned session:
 | Var | What it is for |
 |-----|----------------|
 | `CLAUDE_SPAWN_SESSION_ID` | The child's own session-registry slug. Its `SessionStart`/`Notification`/`Stop` hooks key their record writes on this, so they converge on the record this spawn already created rather than forking a second one. |
-| `CLAUDE_SPAWN_PARENT_ID` | The child's parent-of-record — the direct spawner, or the shared ancestor in [sibling mode](#sibling-mode-claude_spawn_modesibling). Empty when the child is a root. |
+| `CLAUDE_SPAWN_PARENT_ID` | The child's parent-of-record — the direct spawner, or the shared ancestor in [sibling mode](#sibling-mode-claude_spawn_modesibling). *Absent* when the child is a root (the export is emitted only for a non-empty parent), not present-but-empty. |
 | `CLAUDE_SPAWN_WM_TITLE` | The exact window-title marker handed to the terminal emulator, so the child's own hook can resolve its live window id via `wmctrl -l`. Set only when a non-empty `<title>` was passed. |
 | `CLAUDE_SPAWN_RESULT_FILE` | Where the child writes its outcome — see [Result-handback](#result-handback-resultmd). |
 
-On a session-registry fault **none** of the four is set. In particular `CLAUDE_SPAWN_RESULT_FILE` is then *absent* rather than pointing at the spawner's own file, so a child can never overwrite its parent's outcome record.
+Three of the four are gated on the session-registry record dir, so on a **registry fault none of `CLAUDE_SPAWN_SESSION_ID` / `CLAUDE_SPAWN_PARENT_ID` / `CLAUDE_SPAWN_RESULT_FILE` is set**. In particular `CLAUDE_SPAWN_RESULT_FILE` is then *absent* rather than pointing at the spawner's own file, so a child can never overwrite its parent's outcome record. `CLAUDE_SPAWN_WM_TITLE` is the exception: it is gated only on a non-empty `<title>` — it has nothing to do with the registry, only with what title was handed to the emulator — so it is still exported on that path.
+
+Because the namespace is cleared unconditionally, "not set" always means **absent**, never inherited-from-the-spawner. A session can therefore read the presence of one of these vars as a fact about *itself*.
 
 **Everything else is a per-launch INPUT**: `CLAUDE_SPAWN_MODE`, `BACKEND`, `MODEL`, `CLAUDE_ARGS`, `TMUX_SESSION`, `ROLE`, `PROJECT`, `TASK_ID`, `ESCALATION_ID`, and Fleet Cockpit's `SKIP_PERMS`/`SCRIPT`. Each is consumed by the invocation it is passed to and then removed from the child's environment. **Callers must set these explicitly on every spawn** — they no longer propagate transitively to grandchildren the way ambient inheritance used to carry them. Identity is not lost by this: `ROLE`/`PROJECT`/`TASK_ID`/`ESCALATION_ID` are stamped onto the session-registry record by the `launching` write, which happens before and outside the payload, so they remain readable from `record.json`; they simply no longer travel in the environment.
 
