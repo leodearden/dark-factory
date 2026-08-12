@@ -35,6 +35,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from fused_memory.services.durable_queue import POST_EXECUTE_DEAD_PREFIX
+
 # Operation → stat-key mapping. This is the canonical set of write-journal
 # operations this module knows how to tally into a stage's stats.
 _OP_TO_STAT: dict[str, str] = {
@@ -89,10 +91,29 @@ def _landed(op: dict) -> bool:
     counting behaviour, so a partially-applied migration or a new queue state
     can never silently zero a stage's real counters.
 
+    ONE EXCEPTION, where ``'dead'`` still counts as landed: a *post-execute*
+    dead-letter. ``'dead'`` alone means only "the queue exhausted its
+    attempts" and does NOT imply the write never happened — when the backend
+    write succeeded and only the callback or completion commit kept failing,
+    ``DurableWriteQueue`` prefixes ``terminal_error`` with
+    ``POST_EXECUTE_DEAD_PREFIX`` precisely so consumers can separate the two
+    cases (see that constant's defining comment in ``services.durable_queue``).
+    Excluding those would UNDERCOUNT writes that genuinely persisted — the
+    opposite error from the over-counting this gate exists to fix. Such an op
+    is still tallied under ``writes_dead_lettered``: it landed, and it also
+    still needs operator attention because it must not be blind-replayed.
+
+    The ``isinstance`` guard is explicit because ``terminal_error`` is
+    ``str | None`` — a dead-letter carrying no error string is reachable, is
+    treated as NOT landed, and must not raise ``AttributeError``.
+
     Applied by ``derive_stage_stats`` once per op, NOT by the ``_count_*``
     helpers — those stay purely about ``result_summary`` shape.
     """
-    return op.get('terminal_status') != 'dead'
+    if op.get('terminal_status') != 'dead':
+        return True
+    error = op.get('terminal_error')
+    return isinstance(error, str) and error.startswith(POST_EXECUTE_DEAD_PREFIX)
 
 
 def _count_update_edge(op: dict) -> bool:
