@@ -118,6 +118,16 @@ _NOTE_MERGE_ALL_BOUND_SECS = 15.0
 # full derivation.
 _MEASURED_SPAWN_LATENCY_SECS = 4.71
 
+# task 3836's own fraction, reused rather than re-derived: the CEILING a
+# marker-less test's worst-case bounded-wait budget must stay under, as a
+# fraction of the effective per-test pytest-timeout. The remaining 40% is
+# headroom for real-git fixture setup/teardown sharing the same per-test
+# budget (pytest-timeout times the whole `pytest_runtest_protocol`, not just
+# the call phase, whenever `func_only` is unset -- true everywhere in this
+# repo). See `test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling`
+# for the full derivation.
+_MARKERLESS_CEILING_FRACTION = 0.6
+
 # Default git_overrides for _build_infra_worker — declared with an explicit
 # dict[str, Any] value type (rather than left as an inline dict literal,
 # which pyright would infer as the concrete dict[str, bool] and then reject
