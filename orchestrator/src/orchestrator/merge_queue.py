@@ -6059,6 +6059,22 @@ async def build_chain(
         await release_chain_build_lane(git_ops, lane, warm=warm)
         raise
 
+    # One line per chain build, not per item — this runs on the dispatch path.
+    # Logged BEFORE the empty-links return so every build that reached the
+    # merge loop is observable, not just the ones that produced links: a
+    # truncation at position 0 is the single most interesting outcome and was
+    # previously the only one that left no trace at all.  `merge_error` is the
+    # documented fault bucket (missing ref, hook rejection) as opposed to the
+    # benign caps (conflict / already_merged / train_request), and ε's
+    # telemetry reader does not exist yet, so it escalates to WARNING — a
+    # silent fault here is exactly the shape the no-silent-fail-soft design
+    # invariant exists to prevent.
+    logger.log(
+        logging.WARNING if truncated_reason == 'merge_error' else logging.INFO,
+        'build_chain: depth=%d built=%d tip=%s truncated_at=%s reason=%s lane=%s',
+        depth, len(links), tip[:8], truncated_at, truncated_reason, lane.name,
+    )
+
     if not links:
         # An empty result never holds a lane, so a caller that skips the
         # release on the empty path cannot leak one.
@@ -6068,11 +6084,6 @@ async def build_chain(
             truncated_at=truncated_at, truncated_reason=truncated_reason,
         )
 
-    # One line per chain build, not per item — this runs on the dispatch path.
-    logger.info(
-        'build_chain: depth=%d built=%d tip=%s truncated_at=%s lane=%s',
-        depth, len(links), tip[:8], truncated_at, lane.name,
-    )
     return ChainResult(
         links=links, tip=tip,
         truncated_at=truncated_at, truncated_reason=truncated_reason,

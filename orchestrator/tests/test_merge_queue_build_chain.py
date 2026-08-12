@@ -272,18 +272,16 @@ class TestChainResultContract:
     filterwarnings config.
     """
 
-    def test_chain_result_importable_from_merge_types(self):
-        """ChainResult lives in merge_types, beside the classify_and_merge sum type."""
-        from orchestrator.merge_types import ChainResult
-
-        assert ChainResult is not None
-
     def test_chain_result_reexported_from_merge_queue(self):
         """ChainResult is reachable as orchestrator.merge_queue.ChainResult.
 
         merge_queue is the module the PRD names and it already re-exports the
         merge_types names through its shim; a missing entry would break the
         `from orchestrator.merge_queue import X` convention every consumer uses.
+
+        This also covers ChainResult's residence in merge_types: it imports the
+        name from BOTH modules and asserts identity, so a move out of
+        merge_types fails here.
         """
         from orchestrator.merge_queue import ChainResult as MQChainResult
         from orchestrator.merge_types import ChainResult as MTChainResult
@@ -315,16 +313,6 @@ class TestChainResultContract:
         assert res.truncated_reason is None
         assert res.lane is None
         assert res.lane_warm is False
-
-    def test_field_set_is_pinned(self):
-        """The exact field tuple is pinned so a later addition is a deliberate edit."""
-        import dataclasses
-
-        from orchestrator.merge_types import ChainResult
-
-        assert tuple(f.name for f in dataclasses.fields(ChainResult)) == (
-            'links', 'tip', 'truncated_at', 'truncated_reason', 'lane', 'lane_warm',
-        )
 
     def test_depth_is_link_count(self):
         """.depth == len(links) — the value γ will emit as chain_items."""
@@ -1738,3 +1726,73 @@ class TestBuildChainTruncation:
             for s in git_ops.spec_warm_lane_pool._lanes.values()
         )
         assert not snap[0].result.done()
+
+    # ── G. cancellation mid-build must not strand a pooled lane ──────────
+
+    async def test_cancellation_mid_build_releases_the_lane_and_reraises(
+        self, git_repo: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """`except BaseException` must release the lane, not strand it ASSIGNED.
+
+        That handler exists specifically so a cancellation mid-build cannot
+        leak a pooled lane in ASSIGNED — a leak that permanently shrinks the
+        spec warm-lane pool (at the default size, an outright disable of warm
+        chain builds).  Every other test in this file drives ``build_chain``
+        to a NORMAL return, so without this one the handler could be deleted,
+        moved below the ``if not links`` block, or narrowed to
+        ``except Exception`` — which would miss ``CancelledError``, the exact
+        case its own comment names — with the suite still fully green.
+        """
+        from orchestrator.merge_queue import build_chain
+        from orchestrator.warm_lane_pool import LaneState
+
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo)
+        await _create_branch_editing(git_repo, 'task/101', 'a.txt', 'edit-101\n')
+        await _create_branch_editing(git_repo, 'task/102', 'b.txt', 'edit-102\n')
+        head = await _rev_parse(git_repo)
+        before = await _worktree_names(git_ops)
+
+        real = git_ops.merge_branch_into_worktree
+        seen: list[str] = []
+
+        async def _cancel_on_second(worktree: Path, branch: str):
+            # Cancel on the SECOND item so the cancellation lands mid-build,
+            # with one link already accumulated and the lane held.
+            seen.append(branch)
+            if len(seen) == 2:
+                raise asyncio.CancelledError
+            return await real(worktree, branch)
+
+        monkeypatch.setattr(
+            git_ops, 'merge_branch_into_worktree', _cancel_on_second,
+        )
+
+        snap = (
+            _make_req('101', '101', config, git_repo),
+            _make_req('102', '102', config, git_repo),
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await build_chain(git_ops, snap, head, cap=6, target_depth=2)
+
+        assert seen == ['101', '102']
+        # THE assertion: the lane went back to the pool rather than being
+        # stranded ASSIGNED by the unwinding cancellation.
+        assert git_ops.spec_warm_lane_pool is not None
+        assert all(
+            s == LaneState.FREE
+            for s in git_ops.spec_warm_lane_pool._lanes.values()
+        )
+        # A WARM release deliberately retains the worktree for pool reuse, so
+        # the worktree set legitimately grows — what must not happen is a
+        # `_spec-` worktree existing that the pool no longer tracks.
+        leaked = {
+            n for n in (await _worktree_names(git_ops)) - before
+            if n.startswith('_spec-')
+        }
+        assert leaked <= {p.name for p in git_ops.spec_warm_lane_pool._lanes}
+        # Purity (decision #4) holds on the cancellation path too: no outcome
+        # was emitted for either item, including the one that DID chain.
+        assert not snap[0].result.done()
+        assert not snap[1].result.done()

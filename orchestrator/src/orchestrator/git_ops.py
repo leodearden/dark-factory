@@ -9340,7 +9340,7 @@ class GitOps:
         caller.  Used by :func:`orchestrator.merge_queue.build_chain` to merge
         k queued items sequentially into ONE scratch lane.
 
-        Four deliberate divergences from :meth:`merge_to_main`:
+        Five deliberate divergences from :meth:`merge_to_main`:
 
         1. **Never provisions or removes a worktree.**  No
            :meth:`_create_merge_worktree`, no :meth:`cleanup_merge_worktree` —
