@@ -145,11 +145,12 @@ its own tag, so the write-time guard blamed whatever happened to follow it.
 
 ### Vector 1 — sibling-argument loss (silent, and the dangerous one)
 
-Early termination swallows not just the rest of the offending argument but
-**every argument that followed it**. `priority` never reaches the MCP
-boundary, arrives as `None`, and `priority or 'medium'` substitutes a
-plausible wrong value. The intended priority survives only as *text inside the
-description*, where nothing reads it.
+Over-consumption swallows every parameter between the mis-closed tag and the
+terminator it falls back to, so those parameters silently never reach the MCP
+boundary. `priority` never reaches the MCP boundary, arrives as `None`, and
+`priority or 'medium'` substitutes a plausible wrong value. The intended
+priority survives only as *text inside the description*, where nothing reads
+it.
 
 Nothing is logged. Nothing looks broken. The task simply runs at the wrong
 priority forever.
@@ -165,16 +166,19 @@ vector.
 
 ### Vector 2 — content self-duplication (visible)
 
-The truncated argument's remainder is re-appended into the same field,
-yielding a visible tail plus a verbatim self-duplicate of the body text.
+The text over-consumption dumped into the surviving value leaves a visible
+tail plus a verbatim duplicate of the body text — the same shape the sweep
+classifies as `repairable_duplicate` (§5).
 
 Evidence: Mem0 records **9f2d2ae6** and **c759c53b** (both 2026-07-27).
 
-These are the same defect seen from two sides: vector 1 is what happens to the
-arguments *after* the truncation point, vector 2 is what happens to the text
-*at* it. Treating them as one is not a rhetorical claim — it is enforced in
-code by a single shared detector,
-`fused_memory.utils.toolcall_xml_leak`, which all three consumers import.
+These are the same defect seen from two sides: vector 1 is what happens to
+the parameters over-consumption swallowed, vector 2 is what happens to the
+text it dumped into the surviving value. Treating them as one is not a
+rhetorical claim — it is enforced in code by a single shared detector,
+`fused_memory.utils.toolcall_xml_leak` (whose literals are now
+`shared.toolcall_markup` re-exports; see §1), which all three consumers
+import.
 
 ---
 
