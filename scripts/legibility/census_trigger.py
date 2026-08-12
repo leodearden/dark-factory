@@ -1231,6 +1231,16 @@ def decide_for_project(
     short-circuits to a fail-safe `Decision(fire=False, ...)` immediately
     (before touching the codebook or `status_fetcher`) -- `load_census_state`
     has already logged its one WARNING, so nothing else needs to.
+
+    This function NEVER raises: it always returns a `Decision`. Each risky
+    input is guarded at its own call site (the codebook load, the tasks-landed
+    computation) and degrades to a neutral value plus one WARNING, so a fault
+    in one signal takes out only the condition it feeds -- never the whole
+    evaluation. That matters because the caller's fallback is coarse: the
+    `evaluate` CLI's outermost catch-all turns any escaping exception into a
+    blanket NO-FIRE, which would suppress the (a) max-interval backstop that
+    exists precisely to survive a broken (b). `nightly.evaluate_census_step`
+    documents this guarantee of this function; it is held here.
     """
     project_root = Path(project_root)
     now = now if now is not None else datetime.now(UTC)
@@ -1266,7 +1276,21 @@ def decide_for_project(
             datetime.fromisoformat(raw_last_census_at) if raw_last_census_at else None
         )
 
-    tasks_landed = compute_tasks_landed(state=state, status_fetcher=status_fetcher)
+    try:
+        tasks_landed = compute_tasks_landed(state=state, status_fetcher=status_fetcher)
+    except Exception as exc:  # noqa: BLE001 - a fail-safe decision must never crash the caller
+        logger.warning(
+            "tasks-landed computation failed unexpectedly (%s) -- condition (b) "
+            "fails safe (no fire); conditions (a)/(c) are unaffected: %s",
+            type(exc).__name__,
+            exc,
+        )
+        # `None`, never `0` and never a re-raise: `evaluate()` already renders
+        # None as "tasks-landed: delta unavailable ... -> N/A", so condition (b)
+        # goes inert while the (a) max-interval backstop and (c) novelty-spike
+        # still evaluate. Re-raising would let one fault in (b) discard the
+        # whole decision via the CLI's outermost catch-all.
+        tasks_landed = None
 
     return evaluate(
         now=now,
