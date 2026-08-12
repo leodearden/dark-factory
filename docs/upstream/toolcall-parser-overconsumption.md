@@ -229,3 +229,44 @@ current figure: two independent snapshots showing the same shape, at
 different points in time and different sample sizes, is stronger evidence
 that this is a persistent property of the defect than either measurement
 would be alone.
+
+## What we're asking for
+
+When the parser fails to find the closing tag it expects for a parameter, it
+should raise a parse error identifying the parameter and the tag it found
+instead — not consume forward and silently fold the intervening text into
+that parameter's value.
+
+To be precise about where the fault lies: the *originating* mistake is on
+the model's side. It emits a closing tag in the wrong form — usually by
+echoing the parameter's own name instead of using the generic closer, and
+occasionally by blending the two forms together, as in specimen S1 above.
+This report is not asking the harness to accept that wrong form as valid
+input; that would treat a symptom as though it were a feature. It is asking
+the harness to stop *amplifying* a model-side formatting mistake into a
+silent loss of data the harness itself had no part in causing.
+
+That distinction is the entire severity argument here. A model emitting a
+slightly wrong closing tag is a mistake that can be improved at the model or
+prompt level over time, and imperfectly, at that. A parser that responds to
+it by discarding unrelated, correctly-formed arguments with no diagnostic of
+any kind is a defect that only the parser's own maintainers can fix, and it
+will keep costing real, silently-wrong data for as long as it goes unfixed
+— regardless of how good the model gets, since the failure only needs to
+happen once per call to lose everything after it.
+
+## Scope of this report
+
+We have already implemented deterministic detection and recovery for this
+failure on our own side, downstream of the parser: a corrupted value can be
+identified reliably, and, as shown above, the parameters it swallowed can be
+recovered without guessing in the large majority of cases. That containment
+is not what this report is about, and we are not blocked by this issue day
+to day.
+
+We are filing this because the amplification into silent data loss happens
+*at* the parser, upstream of anything a downstream consumer can fix. No
+amount of downstream detection or repair prevents the loss from happening in
+the first place — it only cleans up after it, for the calls where cleanup
+turns out to be possible at all. Fixing this at the source is the only way
+to stop it from happening.
