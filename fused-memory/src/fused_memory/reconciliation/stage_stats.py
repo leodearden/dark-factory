@@ -28,6 +28,14 @@ that issued it has finished and reported. ``derive_stage_stats`` therefore
 applies ``_landed`` (reading ``write_ops.terminal_status``, stamped back by
 ``DurableWriteQueue``'s terminal hook) on top of the existing ``success``
 gates, so an operation whose writes all died reports 0 rather than green.
+
+Excluding them would be truthful but SILENT, so a third fact is reported
+alongside: ``writes_dead_lettered`` answers "did the write reach the queue's
+dead-letter state". The pair is self-explaining — ``graphiti_writes_queued: 0``
+next to ``writes_dead_lettered: 12`` means the stage's writes DIED, which is a
+failure, not the no-op that a bare ``0`` would suggest. The two overlap on
+exactly one case (a post-execute dead-letter, which both landed and
+dead-lettered); ``_COMPUTED_STAT_KEYS`` documents why that is deliberate.
 """
 
 from __future__ import annotations
@@ -52,14 +60,32 @@ _OP_TO_STAT: dict[str, str] = {
     'replay_to_graphiti': 'episodes_replayed',
 }
 
-# The complete set of counter keys derive_stage_stats produces. Includes the
-# virtual 'graphiti_writes_queued' key derived from ops rather than mapped 1:1
-# in _OP_TO_STAT (the residual of add_memory ops where memory_ids is empty but
-# stores includes graphiti). Every one of these keys is always present in the
-# returned dict, 0-default, so downstream override logic has a complete,
-# deterministic key set to iterate regardless of what ops actually occurred.
+# The complete set of counter keys derive_stage_stats produces. Includes two
+# VIRTUAL keys derived from op state rather than mapped 1:1 in _OP_TO_STAT:
+#
+#   'graphiti_writes_queued' — the residual of add_memory ops where memory_ids
+#       is empty but stores includes graphiti.
+#   'writes_dead_lettered'   — ops the durable queue drove to its dead-letter
+#       state (terminal_status == 'dead').
+#
+# The two facts these keys report are deliberately distinct. Every counter
+# other than 'writes_dead_lettered' answers "did the write LAND" (see
+# ``_landed``); 'writes_dead_lettered' answers "did the write reach the
+# queue's dead-letter state". They overlap on exactly one case — a
+# post-execute dead-letter, which landed AND dead-lettered — and that overlap
+# is intentional, not double-counting: the write persisted, and the item still
+# needs operator attention because it must not be blind-replayed.
+#
+# KNOWN LIMITATION: a dead-letter whose Layer-1 row was never journalled has
+# no agent_id/operation, so it is invisible here — the same agent_id
+# dependency already documented in this module's docstring.
+#
+# Every one of these keys is always present in the returned dict, 0-default,
+# so downstream override logic has a complete, deterministic key set to
+# iterate regardless of what ops actually occurred.
 _COMPUTED_STAT_KEYS: frozenset[str] = frozenset(_OP_TO_STAT.values()) | {
     'graphiti_writes_queued',
+    'writes_dead_lettered',
 }
 
 
@@ -217,6 +243,17 @@ def derive_stage_stats(ops: list[dict], stage_agent_id: str) -> dict[str, int]:
         stat_key = _OP_TO_STAT.get(operation)
         if stat_key is None:
             continue
+
+        if op.get('terminal_status') == 'dead':
+            # Gated on the RAW status, not on _landed: a post-execute
+            # dead-letter DID land (and so still counts toward its landed
+            # counter below) but is surfaced here too, because it needs
+            # operator attention and must not be blind-replayed. Also
+            # deliberately NOT gated on `success` — reaching the dead-letter
+            # queue is an outcome fact independent of whether the enqueue was
+            # accepted, and AND-ing them would make an odd combination vanish
+            # from the counter instead of being reported.
+            counts['writes_dead_lettered'] += 1
 
         if not _landed(op):
             continue

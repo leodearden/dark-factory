@@ -305,7 +305,8 @@ async def test_derive_stage_stats_dead_graphiti_enqueue_not_counted(journal):
     ops = await journal.get_ops_by_causation(run_id)
     observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
 
-    assert observed == _expected()
+    # Every LANDED counter is 0; the death itself is reported separately.
+    assert observed == _expected(writes_dead_lettered=1)
 
 
 @pytest.mark.asyncio
@@ -321,7 +322,7 @@ async def test_derive_stage_stats_dead_add_episode_not_counted(journal):
     ops = await journal.get_ops_by_causation(run_id)
     observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
 
-    assert observed == _expected()
+    assert observed == _expected(writes_dead_lettered=1)
 
 
 @pytest.mark.asyncio
@@ -337,7 +338,7 @@ async def test_derive_stage_stats_dead_add_memory_with_ids_not_counted(journal):
     ops = await journal.get_ops_by_causation(run_id)
     observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
 
-    assert observed == _expected()
+    assert observed == _expected(writes_dead_lettered=1)
 
 
 @pytest.mark.asyncio
