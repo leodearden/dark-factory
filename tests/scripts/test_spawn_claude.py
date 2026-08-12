@@ -2186,6 +2186,19 @@ def test_spawn_fail_soft_skips_result_handback_when_registry_faults(
 # existing caller byte-identical.
 
 
+def _fake_claude_argv_capture_line(capture_file: pathlib.Path) -> str:
+    """The single shell line that dumps a fake ``claude``'s argv, NUL-delimited,
+    to *capture_file*.
+
+    Factored out so the argv-only writer below and the full-environment writer
+    used by the task-4015 tests (which captures argv *alongside* the
+    environment, and so cannot simply call the argv-only writer -- both write
+    the same ``bin_dir/claude`` path, and the second would overwrite the
+    first) stay byte-identical in what they record.
+    """
+    return f'printf "%s\\0" "$@" > {capture_file!s}\n'
+
+
 def _write_fake_claude_capturing_argv(
     bin_dir: pathlib.Path, capture_file: pathlib.Path
 ) -> None:
@@ -2204,8 +2217,8 @@ def _write_fake_claude_capturing_argv(
     p = bin_dir / "claude"
     p.write_text(
         "#!/usr/bin/env bash\n"
-        f'printf "%s\\0" "$@" > {capture_file!s}\n'
-        "exit 0\n"
+        + _fake_claude_argv_capture_line(capture_file)
+        + "exit 0\n"
     )
     p.chmod(0o755)
 
@@ -3111,32 +3124,73 @@ def test_sibling_mode_foreground_emulator_is_fire_and_forget(tmp_path: pathlib.P
 # clean systemd unit too -- same rationale as the task-3062 tests above.
 
 
-def _write_fake_claude_capturing_spawn_namespace(
-    bin_dir: pathlib.Path, capture_file: pathlib.Path
+def _write_fake_claude_dumping_full_env(
+    bin_dir: pathlib.Path,
+    capture_file: pathlib.Path,
+    argv_file: pathlib.Path | None = None,
 ) -> None:
-    """Write a fake ``claude`` that captures the ENTIRE ``CLAUDE_SPAWN_*``
-    namespace visible in its own environment to *capture_file*, then exits 0.
+    """Write a fake ``claude`` that dumps its ENTIRE environment (NUL-delimited,
+    via ``env -0``) to *capture_file* -- and, when *argv_file* is given, its
+    own argv alongside -- then exits 0.
 
-    Prefix-generic on purpose -- unlike ``_write_fake_claude_capturing_env``,
-    which echoes four vars by name. The whole point of the task-4015 tests is
-    that a var this file never names (a future launch knob) must not survive
-    into the child either, so the capture itself cannot be an enumeration.
+    The full environment, not just the ``CLAUDE_SPAWN_*`` slice, and it is the
+    ONLY env capture these tests use. Two reasons it is worth capturing more
+    than is asserted:
 
-    The trailing ``exit 0`` is load-bearing: ``grep`` exits 1 when it matches
-    nothing, and an EMPTY namespace is a PASSING outcome here -- without the
-    explicit exit, the fully-scrubbed case would surface as a nonzero spawn
-    exit code rather than as the pass it is.
+    - It is exactly what the spawned session's Bash tool would hand to the
+      next spawn-claude.sh it runs, so it can be fed straight back in as a
+      second invocation's environment (see the two-level test below).
+    - NUL delimiting is the only unambiguous framing. An environment value may
+      itself contain newlines -- the same reason
+      ``_write_fake_claude_capturing_argv`` is NUL-delimited -- so a line-wise
+      ``env`` capture would split such a value across "lines", and a parser
+      partitioning each on its first ``=`` would record a bogus key from the
+      continuation. A ``not in captured`` assertion could then pass for
+      entirely the wrong reason, which is precisely what the task-4015 tests
+      must not do.
 
-    Emits ``KEY=value`` lines, so the capture reads back through the existing
-    ``_parse_captured_env`` -- no new parser.
+    Read back with ``_read_env0`` (everything) or ``_read_spawn_namespace``
+    (just the launch namespace) / ``_read_argv``.
     """
     p = bin_dir / "claude"
-    p.write_text(
-        "#!/usr/bin/env bash\n"
-        f"env | grep '^CLAUDE_SPAWN_' | sort > {capture_file!s}\n"
-        "exit 0\n"
-    )
+    body = f"env -0 > {capture_file!s}\n"
+    if argv_file is not None:
+        body += _fake_claude_argv_capture_line(argv_file)
+    p.write_text("#!/usr/bin/env bash\n" + body + "exit 0\n")
     p.chmod(0o755)
+
+
+def _read_env0(capture_file: pathlib.Path) -> dict[str, str]:
+    """Read a NUL-delimited ``env -0`` capture into a dict.
+
+    Partitions each entry on its FIRST ``=`` (a value may contain further
+    ``=`` characters) and drops the trailing empty element left by the final
+    NUL terminator -- the env-shaped counterpart of ``_read_argv``.
+    """
+    parsed: dict[str, str] = {}
+    for entry in capture_file.read_bytes().decode().split("\0"):
+        if not entry:
+            continue
+        key, _, value = entry.partition("=")
+        parsed[key] = value
+    return parsed
+
+
+def _read_spawn_namespace(capture_file: pathlib.Path) -> dict[str, str]:
+    """The ``CLAUDE_SPAWN_*`` slice of a full ``env -0`` capture.
+
+    Filtering by prefix here rather than with ``env | grep`` inside the fake
+    claude keeps the capture NUL-delimited end to end (see above), and keeps
+    the filter prefix-generic: the whole point of the tests below is that a
+    var this file never names -- a future launch knob -- must not survive into
+    the child either, so neither the capture nor the read may be an
+    enumeration.
+    """
+    return {
+        k: v
+        for k, v in _read_env0(capture_file).items()
+        if k.startswith("CLAUDE_SPAWN_")
+    }
 
 
 def test_spawn_unsets_inherited_launch_inputs_from_child_env(
@@ -3159,8 +3213,8 @@ def test_spawn_unsets_inherited_launch_inputs_from_child_env(
     inherited vars reach the child by plain environment inheritance.
     """
     bin_dir = _make_bin_dir(tmp_path)
-    capture_file = tmp_path / "captured_namespace.txt"
-    _write_fake_claude_capturing_spawn_namespace(bin_dir, capture_file)
+    capture_file = tmp_path / "captured_env.bin"
+    _write_fake_claude_dumping_full_env(bin_dir, capture_file)
     _write_foreground_terminal(bin_dir, "xterm")
 
     env = _base_env(bin_dir, "xterm")
@@ -3172,7 +3226,7 @@ def test_spawn_unsets_inherited_launch_inputs_from_child_env(
     result = _run_spawn(env, tmp_path)
     assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
 
-    captured = _parse_captured_env(capture_file)
+    captured = _read_spawn_namespace(capture_file)
     for var in (
         "CLAUDE_SPAWN_CLAUDE_ARGS",
         "CLAUDE_SPAWN_MODE",
@@ -3217,8 +3271,8 @@ def test_spawn_unset_is_prefix_generic_not_an_enumerated_list(
     sweep entirely fails here too, not only in the test above.
     """
     bin_dir = _make_bin_dir(tmp_path)
-    capture_file = tmp_path / "captured_namespace.txt"
-    _write_fake_claude_capturing_spawn_namespace(bin_dir, capture_file)
+    capture_file = tmp_path / "captured_env.bin"
+    _write_fake_claude_dumping_full_env(bin_dir, capture_file)
     _write_foreground_terminal(bin_dir, "xterm")
 
     env = _base_env(bin_dir, "xterm")
@@ -3228,7 +3282,7 @@ def test_spawn_unset_is_prefix_generic_not_an_enumerated_list(
     result = _run_spawn(env, tmp_path)
     assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
 
-    captured = _parse_captured_env(capture_file)
+    captured = _read_spawn_namespace(capture_file)
     assert "CLAUDE_SPAWN_FUTURE_KNOB" not in captured, (
         "the unset must be prefix-generic (${!CLAUDE_SPAWN_@}), so a var "
         "that exists nowhere in the codebase is stripped too -- an "
@@ -3267,8 +3321,8 @@ def test_spawn_registry_fault_unsets_parent_result_file_rather_than_inheriting_i
     fail-soft -- the exit-code contract is asserted unchanged.
     """
     bin_dir = _make_bin_dir(tmp_path)
-    capture_file = tmp_path / "captured_namespace.txt"
-    _write_fake_claude_capturing_spawn_namespace(bin_dir, capture_file)
+    capture_file = tmp_path / "captured_env.bin"
+    _write_fake_claude_dumping_full_env(bin_dir, capture_file)
     _write_foreground_terminal(bin_dir, "xterm")
 
     env = _base_env(bin_dir, "xterm")
@@ -3285,7 +3339,7 @@ def test_spawn_registry_fault_unsets_parent_result_file_rather_than_inheriting_i
         f"expected 0, got {result.returncode}\nstderr: {result.stderr.decode()}"
     )
 
-    captured = _parse_captured_env(capture_file)
+    captured = _read_spawn_namespace(capture_file)
     assert captured.get("CLAUDE_SPAWN_RESULT_FILE") != parent_result, (
         "a child must never inherit its SPAWNER's result file -- it would "
         f"overwrite the parent's outcome record. Child saw: {captured!r}"
@@ -3294,49 +3348,6 @@ def test_spawn_registry_fault_unsets_parent_result_file_rather_than_inheriting_i
         "with no record dir of its own the child must see NO result file at "
         f"all, not a stale inherited one. Child saw: {captured!r}"
     )
-
-
-def _write_fake_claude_dumping_full_env(
-    bin_dir: pathlib.Path,
-    capture_file: pathlib.Path,
-    argv_file: pathlib.Path | None = None,
-) -> None:
-    """Write a fake ``claude`` that dumps its ENTIRE environment (NUL-delimited,
-    via ``env -0``) to *capture_file* -- and, when *argv_file* is given, its
-    own argv alongside -- then exits 0.
-
-    The full environment, not just the CLAUDE_SPAWN_* slice: this is exactly
-    what the spawned session's Bash tool would hand to the next
-    spawn-claude.sh it runs, so it can be fed straight back in as a second
-    invocation's environment (see the two-level test below).
-
-    NUL-delimited for the same reason ``_write_fake_claude_capturing_argv``
-    is: an environment value may itself contain newlines, so a newline
-    separator could not delimit entries unambiguously. Read back with
-    ``_read_env0`` / ``_read_argv``.
-    """
-    p = bin_dir / "claude"
-    body = f"env -0 > {capture_file!s}\n"
-    if argv_file is not None:
-        body += f'printf "%s\\0" "$@" > {argv_file!s}\n'
-    p.write_text("#!/usr/bin/env bash\n" + body + "exit 0\n")
-    p.chmod(0o755)
-
-
-def _read_env0(capture_file: pathlib.Path) -> dict[str, str]:
-    """Read a NUL-delimited ``env -0`` capture into a dict.
-
-    Partitions each entry on its FIRST ``=`` (a value may contain further
-    ``=`` characters) and drops the trailing empty element left by the final
-    NUL terminator -- the env-shaped counterpart of ``_read_argv``.
-    """
-    parsed: dict[str, str] = {}
-    for entry in capture_file.read_bytes().decode().split("\0"):
-        if not entry:
-            continue
-        key, _, value = entry.partition("=")
-        parsed[key] = value
-    return parsed
 
 
 def test_spawned_session_cannot_reserve_its_own_launch_args_to_a_grandchild(
@@ -3386,11 +3397,12 @@ def test_spawned_session_cannot_reserve_its_own_launch_args_to_a_grandchild(
         f"this invocation (requirement 4) -- got: {child_argv!r}"
     )
 
+    # The FULL environment here, not just the launch namespace -- level 2 feeds
+    # it back in verbatim as the next invocation's environment, PATH and all.
     child_env = _read_env0(child_env_file)
     assert "CLAUDE_SPAWN_CLAUDE_ARGS" not in child_env, (
         f"the recovered session must not carry its own launch args forward "
-        f"in its environment, got: "
-        f"{ {k: v for k, v in child_env.items() if k.startswith('CLAUDE_SPAWN_')} !r}"
+        f"in its environment, got: {_read_spawn_namespace(child_env_file)!r}"
     )
 
     # --- level 2: what that session's next /spawn would actually run ------
@@ -3435,8 +3447,8 @@ def test_sanitization_preserves_launcher_stamped_record_identity(
     spawn_env exists to defend against.
     """
     bin_dir = _make_bin_dir(tmp_path)
-    capture_file = tmp_path / "captured_namespace.txt"
-    _write_fake_claude_capturing_spawn_namespace(bin_dir, capture_file)
+    capture_file = tmp_path / "captured_env.bin"
+    _write_fake_claude_dumping_full_env(bin_dir, capture_file)
     _write_foreground_terminal(bin_dir, "xterm")
 
     env = _base_env(bin_dir, "xterm")
@@ -3457,7 +3469,7 @@ def test_sanitization_preserves_launcher_stamped_record_identity(
         f"same for the stamped task_id, got {record.task_id!r}"
     )
 
-    captured = _parse_captured_env(capture_file)
+    captured = _read_spawn_namespace(capture_file)
     assert "CLAUDE_SPAWN_ROLE" not in captured, (
         f"identity belongs on the record, not in the child's environment "
         f"where it would be re-served to the next spawn: {captured!r}"
