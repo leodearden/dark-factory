@@ -184,12 +184,24 @@ def _scrub_value(value: Any, patterns: tuple[tuple[str, str], ...]) -> Any:
     if isinstance(value, str):
         return _scrub_text(value, patterns)
     if isinstance(value, dict):
-        return {
-            (_scrub_text(key, patterns) if isinstance(key, str) else key): _scrub_value(
-                item, patterns
-            )
-            for key, item in value.items()
-        }
+        out: dict[Any, Any] = {}
+        for key, item in value.items():
+            scrubbed_key = _scrub_text(key, patterns) if isinstance(key, str) else key
+            # Two distinct keys can scrub to the same '<redacted>' token (or
+            # collide with a literal one already present), and letting the last
+            # write win would silently DROP an entry — precisely the silent
+            # degradation this gate exists to prevent.  Disambiguate instead,
+            # counting up from 2 in insertion order so a re-run of the probe over
+            # the same observation stays byte-reproducible.  '#' is outside the
+            # `[A-Za-z0-9_-]` credential-run character class, so the suffix can
+            # neither extend an adjacent run nor re-form a match of its own.
+            if scrubbed_key in out:
+                suffix = 2
+                while f'{scrubbed_key}#{suffix}' in out:
+                    suffix += 1
+                scrubbed_key = f'{scrubbed_key}#{suffix}'
+            out[scrubbed_key] = _scrub_value(item, patterns)
+        return out
     if isinstance(value, list):
         return [_scrub_value(item, patterns) for item in value]
     return value
