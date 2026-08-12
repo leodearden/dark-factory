@@ -2016,18 +2016,29 @@ def _fused_memory_recon_busy_verdict() -> str:
 def _print_fused_memory_liveness() -> None:
     """Print a single labelled fused-memory row for ``--report``.
 
+    THE ROW DELIBERATELY SHOWS TWO DIFFERENT SIGNALS (task 3765): ALIVENESS
+    (is the asyncio loop still serving?) from the zero-I/O /alive fetch, and
+    READINESS (are the backing stores usable?) from the recon-busy /health
+    fetch. So a row can legitimately read "healthy" while a store is degraded
+    — that combination is the whole point of the split, not an inconsistency.
+    The label names /alive because that is where the verdict actually comes
+    from: this row is the operator's answer to "why did / did not the watchdog
+    kill fused-memory", so naming a route the verdict no longer consults would
+    send them to inspect the wrong signal.
+
     Strictly read-only, mirroring report()'s I7/I8 guarantee. Three fields,
     all read-only:
       - liveness verdict via _fused_memory_liveness_verdict() (port probe +
-        /health fetch only — no is_unit_enabled/STARTUP_GRACE_SECS gating,
+        /alive fetch only — no is_unit_enabled/STARTUP_GRACE_SECS gating,
         since report() likewise shows every unit's raw verdict
         unconditionally);
       - DEPLOY-AGE from fused-memory's OWN deploy clock
         (_read_last_fm_deploy_epoch), rendered hours-to-one-decimal exactly
         like report()'s DEPLOY-AGE column, or 'unknown' when the fm clock has
         never been stamped / is unreadable (fail-open);
-      - recon-busy via _fused_memory_recon_busy_verdict() (fail-soft
-        'unknown');
+      - recon-busy via _fused_memory_recon_busy_verdict(), still sourced from
+        a /health fetch (fail-soft 'unknown') — /alive carries no recon_busy
+        body by construction, so this column was deliberately NOT repointed;
       - streak from _read_fm_liveness_streak(), rendered
         "<count>/<FM_LIVENESS_STREAK_THRESHOLD>" or 'none' (task 3764) — this
         is what lets an operator answer "why didn't the watchdog restart
@@ -2088,7 +2099,7 @@ def _print_fused_memory_liveness() -> None:
         log(f"could not read the {FUSED_MEMORY_UNIT} liveness restart clock: {exc}")
         restart_age_str = "unknown"
     print(
-        f"{FUSED_MEMORY_UNIT} liveness (port {FUSED_MEMORY_PORT} + /health): "
+        f"{FUSED_MEMORY_UNIT} liveness (port {FUSED_MEMORY_PORT} + /alive): "
         f"{verdict} | DEPLOY-AGE: {deploy_age_str} | recon-busy: {recon_busy} "
         f"| streak: {streak_str} | LIVENESS-RESTART-AGE: {restart_age_str}"
     )
