@@ -1096,6 +1096,176 @@ def test_b6_probe_port_matches_the_dashboard_units_listen_port():
     )
 
 
+def test_b6_escalation_queue_dir_matches_the_configured_escalation_queue_dir(monkeypatch):
+    """ESCALATION_QUEUE_DIR is pinned against the yaml's ``escalation.queue_dir``.
+
+    Same pairing-pin idiom as
+    test_b6_probe_port_matches_the_dashboard_units_listen_port above: nothing
+    else ties the two together — the watchdog hardcodes the queue directory and
+    the orchestrator config names it, and neither reads the other. Unpinned, a
+    repoint of ``escalation.queue_dir`` (or of ``project_root``) leaves the
+    watchdog writing its born-at-L2 ceiling records into a directory the
+    escalation server and the dashboard no longer read: the ceiling trips, the
+    watchdog correctly goes quiet, and the escalation nobody can see is the only
+    thing that would have told an operator why — undetectable from the journal
+    alone, which shows exactly the same "stopped restarting" line either way.
+
+    The resolution mirrors production rather than re-deriving it: ``orchestrator
+    .harness`` builds the real queue directory as
+    ``Path(config.project_root) / config.escalation.queue_dir`` (against
+    ``EscalationConfig.queue_dir``, a plain relative str), so joining the yaml's
+    own ``project_root`` onto its own ``queue_dir`` asserts against the path the
+    escalation server and the dashboard actually read, and closes BOTH drift
+    axes in one assertion.
+    """
+    # ESCALATION_QUEUE_DIR is os.environ.get("DASHBOARD_WATCHDOG_QUEUE_DIR",
+    # <default>) resolved at IMPORT time, and _load_watchdog() re-execs the
+    # module on every call, so an ambient override would silently substitute a
+    # different value into the comparison. The DEFAULT is what must be pinned:
+    # dashboard/dark-factory-dashboard-watchdog.service declares no
+    # ``Environment=`` at all, so the default is literally what runs in
+    # production. (Hence also: not the queue_env fixture, which sets that very
+    # variable to a tmp dir and would make this pin fail spuriously.)
+    monkeypatch.delenv("DASHBOARD_WATCHDOG_QUEUE_DIR", raising=False)
+    mod = _load_watchdog()
+
+    cfg = yaml.safe_load(ORCH_CONFIG_PATH.read_text(encoding="utf-8"))
+    configured = _configured_escalation_queue_dir(cfg, ORCH_CONFIG_PATH)
+
+    assert pathlib.Path(mod.ESCALATION_QUEUE_DIR) == configured, (
+        f"the watchdog queues escalations in {mod.ESCALATION_QUEUE_DIR!r} but "
+        f"{ORCH_CONFIG_PATH} resolves escalation.queue_dir to {str(configured)!r}; "
+        "the watchdog's born-at-L2 ceiling records would land in a directory "
+        "the escalation server and dashboard do not read, so the ceiling trips, "
+        "the watchdog goes quiet, and the escalation is invisible — "
+        "indistinguishable in the journal from a watchdog that simply stopped"
+    )
+
+
+def test_b6_escalation_queue_dir_pin_is_not_vacuous(monkeypatch):
+    """The pin above passes by construction today — prove it can still fail.
+
+    A guard that cannot be shown to fire is worth no more than no guard at all,
+    so both drift axes are exercised against a deliberately repointed config:
+    moving ``escalation.queue_dir`` and moving ``project_root`` must each make
+    the resolved path differ from the watchdog's constant.
+    """
+    monkeypatch.delenv("DASHBOARD_WATCHDOG_QUEUE_DIR", raising=False)
+    mod = _load_watchdog()
+    shipped = pathlib.Path(mod.ESCALATION_QUEUE_DIR)
+    fake_path = pathlib.Path("/fake/dark-factory-orchestrator.yaml")
+
+    # Axis 1 — escalation.queue_dir repointed.
+    drifted_queue_dir = _configured_escalation_queue_dir(
+        {
+            "project_root": "/home/leo/src/dark-factory",
+            "escalation": {"queue_dir": "data/escalations-moved"},
+        },
+        fake_path,
+    )
+    assert drifted_queue_dir != shipped, (
+        "a repointed escalation.queue_dir resolved to the shipped "
+        f"{shipped}, so the pin above could never fire on that drift"
+    )
+
+    # Axis 2 — project_root repointed, queue_dir untouched.
+    drifted_project_root = _configured_escalation_queue_dir(
+        {
+            "project_root": "/srv/dark-factory",
+            "escalation": {"queue_dir": "data/escalations"},
+        },
+        fake_path,
+    )
+    assert drifted_project_root != shipped, (
+        "a repointed project_root resolved to the shipped "
+        f"{shipped}, so the pin above would stay silently green while the "
+        "escalation server read a different tree"
+    )
+
+
+def test_configured_escalation_queue_dir_error_paths() -> None:
+    """The helper raises AssertionError NAMING the config file on a bad schema.
+
+    Mirrors test_extract_escalation_port_error_paths in
+    tests/scripts/test_orchestrator_watchdog.py: the behavioural contract is
+    that a schema rename (e.g. ``escalation`` -> ``escalation_mcp``) surfaces as
+    a named-file diagnostic instead of a bare KeyError. Verified by matching
+    only on re.escape(str(config_path)).
+    """
+    config_path = pathlib.Path("/fake/dark-factory-orchestrator.yaml")
+    path_pattern = re.escape(str(config_path))
+
+    # Non-dict cfg (e.g. an empty YAML file parsed to None)
+    with pytest.raises(AssertionError, match=path_pattern):
+        _configured_escalation_queue_dir(None, config_path)
+
+    # Missing 'escalation' key at top level
+    with pytest.raises(AssertionError, match=path_pattern):
+        _configured_escalation_queue_dir(
+            {"project_root": "/home/leo/src/dark-factory", "other_key": 5}, config_path
+        )
+
+    # 'escalation' present but missing 'queue_dir'
+    with pytest.raises(AssertionError, match=path_pattern):
+        _configured_escalation_queue_dir(
+            {"project_root": "/home/leo/src/dark-factory", "escalation": {"port": 8102}},
+            config_path,
+        )
+
+    # Missing 'project_root' — the value the relative queue_dir resolves against
+    with pytest.raises(AssertionError, match=path_pattern):
+        _configured_escalation_queue_dir(
+            {"escalation": {"queue_dir": "data/escalations"}}, config_path
+        )
+
+
+def test_configured_escalation_queue_dir_expands_the_project_root_default(monkeypatch):
+    """``${VAR:default}`` resolves to the LITERAL default, never the environment.
+
+    The watchdog's REPO_DIR is a hardcoded constant on purpose ("so a stray copy
+    of this script cannot silently supervise a different tree"), so its correct
+    counterpart is the yaml's hardcoded default. Resolving through os.environ
+    would make the pin's verdict depend on whether PROJECT_ROOT happens to be
+    exported in the verify lane, the merge worktree or a developer's shell — a
+    guard that cries wolf gets deleted.
+    """
+    config_path = pathlib.Path("/fake/dark-factory-orchestrator.yaml")
+
+    # The shipped form: the literal default is taken.
+    assert _configured_escalation_queue_dir(
+        {
+            "project_root": "${PROJECT_ROOT:/home/leo/src/dark-factory}",
+            "escalation": {"queue_dir": "data/escalations"},
+        },
+        config_path,
+    ) == pathlib.Path("/home/leo/src/dark-factory/data/escalations")
+
+    # A set PROJECT_ROOT must NOT change the result — the helper reads the
+    # yaml's literal default and never consults the ambient environment.
+    monkeypatch.setenv("PROJECT_ROOT", "/some/other/root")
+    assert _configured_escalation_queue_dir(
+        {
+            "project_root": "${PROJECT_ROOT:/home/leo/src/dark-factory}",
+            "escalation": {"queue_dir": "data/escalations"},
+        },
+        config_path,
+    ) == pathlib.Path("/home/leo/src/dark-factory/data/escalations")
+
+    # A plain unwrapped value is used verbatim.
+    assert _configured_escalation_queue_dir(
+        {"project_root": "/some/root", "escalation": {"queue_dir": "data/escalations"}},
+        config_path,
+    ) == pathlib.Path("/some/root/data/escalations")
+
+    # An ABSOLUTE queue_dir wins over project_root, exactly as production's
+    # pathlib join does — os.path.join(root, *value.split("/")) would instead
+    # report a false PASS on precisely the repoint this guard exists to catch.
+    assert _configured_escalation_queue_dir(
+        {"project_root": "/some/root", "escalation": {"queue_dir": "/srv/escalations"}},
+        config_path,
+    ) == pathlib.Path("/srv/escalations")
+
+
 def test_b6_unit_is_oneshot_and_journal_logged():
     """Type=oneshot is what makes each tick a fresh process (hence the
     persisted state), and journal routing is the only way an operator can see
