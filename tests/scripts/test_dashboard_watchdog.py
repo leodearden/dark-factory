@@ -9,8 +9,11 @@ No live systemd runtime and no running dashboard are needed — every
 
 This file runs in the ``scripts/`` verify lane
 (scripts/orchestrator.yaml: ``uv run --project shared pytest tests/scripts/``),
-whose environment is stdlib-only: ``shared`` does NOT depend on ``escalation``,
-so nothing here may import it.  The storm escape's literal acceptance signal
+whose environment is that of the ``shared`` project: ``shared`` does NOT depend
+on ``escalation``, so nothing here may import it.  Declared ``shared``
+dependencies ARE fair game — ``yaml`` (pyyaml>=6.0) is one, and is imported bare
+below rather than behind an importorskip that could only ever turn a broken
+environment into a silent SKIP.  The storm escape's literal acceptance signal
 ("exactly ONE born-at-L2 record on disk") is asserted against the REAL
 ``escalation.submit`` writer in
 dashboard/tests/test_dashboard_watchdog_storm_escape.py instead.
@@ -19,6 +22,7 @@ dashboard/tests/test_dashboard_watchdog_storm_escape.py instead.
 import importlib.util
 import os
 import pathlib
+import re
 import subprocess
 import time
 import types
@@ -26,6 +30,7 @@ import urllib.error
 import urllib.parse
 
 import pytest  # pyright: ignore[reportMissingImports]
+import yaml
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 WATCHDOG_PATH = REPO_ROOT / "scripts" / "dashboard-watchdog.py"
@@ -940,6 +945,13 @@ WATCHDOG_TIMER_PATH = REPO_ROOT / "dashboard" / "dark-factory-dashboard-watchdog
 #: names the port the probe URL has to reach.
 DASHBOARD_SERVICE_PATH = REPO_ROOT / "dashboard" / "dark-factory-dashboard.service"
 
+#: The orchestrator config — the only other place in the repo that names the
+#: escalation queue directory the watchdog writes its born-at-L2 into.
+#: ``dark-factory-orchestrator.yaml`` is the canonical required basename (the
+#: dashboard's escalation-URL discovery keys on it); the legacy spellings are a
+#: discovery fallback for unmigrated projects, not a name to accept here.
+ORCH_CONFIG_PATH = REPO_ROOT / "dark-factory-orchestrator.yaml"
+
 #: The deep, DB-touching endpoint the retired inline shell probed. Used to
 #: dispatch the probe fake by URL below, which is how "the watchdog never
 #: REQUESTS the deep endpoint" is asserted as behaviour rather than as text.
@@ -1094,6 +1106,70 @@ def test_b6_probe_port_matches_the_dashboard_units_listen_port():
         f"{DASHBOARD_SERVICE_PATH.name} serves on {unit_port}; the probe would "
         "fail forever against a healthy dashboard"
     )
+
+
+#: ``project_root: "${PROJECT_ROOT:/home/leo/src/dark-factory}"`` — the
+#: interpolation grammar of YamlSettingsSource._expand_env_vars in
+#: orchestrator/src/orchestrator/config.py, reused so the two cannot disagree
+#: about what the form means. The DEFAULT group is what this file takes.
+_ENV_DEFAULT_RE = re.compile(r"\$\{([^:}]+)(?::([^}]*))?\}")
+
+
+def _configured_escalation_queue_dir(cfg: object, config_path: pathlib.Path) -> pathlib.Path:
+    """Resolve ``escalation.queue_dir`` against ``project_root`` from a parsed config.
+
+    PURE by design: it takes an already-parsed mapping rather than a path to
+    read, precisely so the error paths and the drift cases below can exercise it
+    against a synthetic config without touching the real file — which is what
+    gives the pin an honest failing state, since the shipped values agree today.
+
+    Uses .get() chaining (no raw [] indexing) so a schema rename surfaces as an
+    AssertionError naming the offending config file path, not a bare KeyError —
+    the same shape as _extract_escalation_port in
+    tests/scripts/test_orchestrator_watchdog.py for the sibling
+    ``escalation.port`` coupling.
+
+    ``project_root``'s ``${VAR:default}`` form resolves to the LITERAL default,
+    never through os.environ: the counterpart being pinned is the watchdog's
+    hardcoded REPO_DIR, so an ambient-environment-dependent verdict would make
+    the guard fire (or not) on facts about the shell rather than about the repo.
+    """
+    assert isinstance(cfg, dict), (
+        f"{config_path}: config did not parse to a mapping (schema may have changed)"
+    )
+
+    escalation = cfg.get("escalation")
+    assert isinstance(escalation, dict), (
+        f"{config_path}: missing 'escalation' (schema may have changed)"
+    )
+
+    queue_dir = escalation.get("queue_dir")
+    assert queue_dir is not None, (
+        f"{config_path}: missing 'escalation.queue_dir' (schema may have changed)"
+    )
+
+    project_root = cfg.get("project_root")
+    assert project_root is not None, (
+        f"{config_path}: missing 'project_root' (schema may have changed); "
+        "escalation.queue_dir is relative and has nothing to resolve against"
+    )
+
+    match = _ENV_DEFAULT_RE.fullmatch(str(project_root))
+    if match is not None:
+        assert match.group(2), (
+            f"{config_path}: project_root is {project_root!r}, a ${{VAR}} form with no "
+            "literal default — there is no environment-independent value to pin against"
+        )
+        resolved_root = match.group(2)
+    else:
+        resolved_root = str(project_root)
+
+    # pathlib's `/`, mirroring production's Path(config.project_root) /
+    # config.escalation.queue_dir join in ``orchestrator.harness``. Never
+    # os.path.join(root, *value.split("/")): that turns an absolute repoint like
+    # "/srv/escalations" into "<root>/srv/escalations" and reports a false PASS
+    # on exactly the drift this helper exists to catch.
+    return pathlib.Path(resolved_root) / str(queue_dir)
 
 
 def test_b6_escalation_queue_dir_matches_the_configured_escalation_queue_dir(monkeypatch):
