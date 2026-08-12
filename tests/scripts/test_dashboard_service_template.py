@@ -11,6 +11,7 @@ See also:
   - dashboard/src/dashboard/config.py — DashboardConfig.from_env handling of DASHBOARD_KNOWN_PROJECT_ROOTS (COMMA-separated split)
 """
 
+import os
 import pathlib
 import re
 import shutil
@@ -1298,6 +1299,54 @@ def test_ignored_directive_filter_matches_both_systemd_spellings() -> None:
 
     # A clean run reports nothing.
     assert _ignored_directive_lines("", HARDCODED) == []
+
+
+def _systemd_analyze_verify_skip_reason() -> str | None:
+    """Return why the systemd-analyze verify test must skip, or None to run it.
+
+    Two independent preconditions, checked in order:
+
+    1. The ``systemd-analyze`` binary must be on PATH.
+    2. ``XDG_RUNTIME_DIR`` must be set to a non-empty value.  Measured
+       2026-08-12 in this worktree (systemd 255.4): with the variable unset,
+       ``systemd-analyze verify --user`` cannot initialise a --user manager
+       at all and its combined stdout+stderr is ONLY "Failed to lookup
+       RuntimeDirectory path: No such device or address" / "Failed to
+       initialize manager: No such device or address" (exit 1) -- it never
+       gets far enough to emit the per-unit diagnostic lines the guarded
+       test greps for, so ``assert not ignored`` there would pass having
+       checked nothing.  An empty value reproduces that identical no-op
+       byte-for-byte, which is why this checks truthiness
+       (``os.environ.get(...)``) rather than key membership -- and a
+       nonexistent-but-declared path (e.g. /tmp/does-not-exist) still yields
+       real per-unit diagnostics at exit 0, which is why this does not
+       "harden" into a directory-existence check either.  Contexts that hit
+       this in practice: cron, ssh host-cmd, any headless invocation with no
+       pam_systemd session -- ``shutil.which()`` succeeds there and the old
+       inline decorator condition never fired.  DBUS_SESSION_BUS_ADDRESS was
+       also measured (unsetting it alone still yields real diagnostics at
+       exit 0) and is deliberately NOT checked here: requiring it too would
+       over-skip on hosts where the guarded test works correctly.
+    """
+    if shutil.which("systemd-analyze") is None:
+        return (
+            "no systemd-analyze on this PATH; the file-content invariants "
+            "above are the primary guard and this module requires no "
+            "systemd runtime"
+        )
+    if not os.environ.get("XDG_RUNTIME_DIR"):
+        return (
+            "XDG_RUNTIME_DIR is not set (or is empty): systemd-analyze "
+            "verify --user cannot initialise a --user manager without it "
+            'and prints only "Failed to lookup RuntimeDirectory path" / '
+            '"Failed to initialize manager", emitting zero per-unit '
+            "diagnostic lines -- the guarded assertion would pass having "
+            "checked nothing"
+        )
+    return None
+
+
+_SYSTEMD_ANALYZE_SKIP_REASON = _systemd_analyze_verify_skip_reason()
 
 
 def test_systemd_analyze_skip_reason_requires_both_binary_and_user_runtime_dir(
