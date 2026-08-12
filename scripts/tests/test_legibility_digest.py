@@ -28,10 +28,9 @@ import logging
 import re
 import zlib
 
+import digest as mod
 import pytest
 import yaml
-
-import digest as mod
 from legibility import inventory as inventory_mod
 
 
@@ -457,9 +456,8 @@ class TestAsUnreadableFileError:
         # OSError. A shape wrongly added here would be caught and re-wrapped
         # rather than propagating, and gzip.BadGzipFile in particular must
         # keep reaching callers by its own inheritance.
-        assert inventory_mod.UNREADABLE_FILE_ERRORS == (
-            EOFError, zlib.error, UnicodeDecodeError,
-        )
+        expected_shapes = (EOFError, zlib.error, UnicodeDecodeError)
+        assert tuple(inventory_mod.UNREADABLE_FILE_ERRORS) == expected_shapes
         assert not any(
             issubclass(exc_type, OSError)
             for exc_type in inventory_mod.UNREADABLE_FILE_ERRORS

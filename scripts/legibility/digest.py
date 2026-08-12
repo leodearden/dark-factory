@@ -83,11 +83,11 @@ def load_transcript(path: Any) -> list[dict[str, Any]]:
     agreement directly, including that they share the one implementation.
     """
     records: list[dict[str, Any]] = []
-    if str(path).endswith('.gz'):
-        f = gzip.open(path, 'rt', encoding='utf-8')
-    else:
-        f = open(path, encoding='utf-8')
-    with f:
+    with (
+        gzip.open(path, 'rt', encoding='utf-8')
+        if str(path).endswith('.gz')
+        else open(path, encoding='utf-8')
+    ) as f:
         # Wrap only the read/decompress iteration — decompression happens
         # lazily HERE, per chunk, not at open() — leaving the JSONDecodeError
         # skip inside the loop so the file-level vs line-level split above is
