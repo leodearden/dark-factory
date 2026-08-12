@@ -1203,3 +1203,250 @@ class TestArmThreeSuppressesYetIsLandableToday:
         assert sorted(_mod().ARM_SPECS) == [
             'promoting_pin', 'topic_diversity_cap', 'topic_keyed_grouped',
         ]
+
+
+# ---------------------------------------------------------------------------
+# Killing the record-id aliasing in the metric
+# ---------------------------------------------------------------------------
+#
+# `topic_discoverability` (:1116) credits the canonical on
+# `hit.record_id == canonical_record_id`, and a grouped read emits its
+# document UNDER THE CANONICAL'S OWN record_id (`apply_grouped_read`:934-935,
+# and arm (2) here for the same reason — the document IS the canonical,
+# amended).  So any member folding upward is scored as "canonical found",
+# whether or not the canonical's own stored record ever ranked.  That is the
+# mechanism behind b_grouped's 0.97 canonical-in-top-5 in the committed E2
+# table, and it is a property of the TRANSFORM, not of retrieval.
+#
+# The fix is not to redefine the column — that would silently make the new
+# table incomparable with the committed one, and would hide that a grouped
+# read really does put the canonical's body in the reader's window, which is
+# a genuine reader benefit.  Both rates are reported side by side, and the
+# GAP between them IS the aliasing, quantified per arm.
+
+
+def _aliasing_corpus(canonical_ranked: bool):
+    """A topic whose canonical did — or did not — itself rank.
+
+    The only difference between the two worlds is whether the store
+    returned the canonical.  Everything the transform does is identical,
+    which is what isolates aliasing as the cause of any divergence.
+    """
+    canonical = _rec('anchor', topic='t-a', canonical=True, content='the anchor')
+    peer = _rec('peer-1', topic='t-a', kind='amendment', content='an amendment')
+    hits = [peer, canonical] if canonical_ranked else [peer]
+    return hits, _topic_index(peer, canonical), canonical
+
+
+class TestSynthesizedDocumentsAlwaysCarryProvenance:
+    """A minted record must never be indistinguishable from a stored one."""
+
+    def test_every_synthesized_record_has_a_provenance_entry(self):
+        mod = _mod()
+        hits, index, _ = _aliasing_corpus(canonical_ranked=False)
+
+        result = mod.apply_topic_keyed_grouped_read(
+            hits, index, render_sightings=False,
+        )
+
+        for record in result.records:
+            if any(record is original for original in hits):
+                continue  # a stored record, passed through — nothing aliased
+            assert record.record_id in result.provenance, (
+                f'{record.record_id} was synthesized with no disclosure'
+            )
+
+    def test_the_disclosure_names_the_members_and_the_canonical_fact(self):
+        mod = _mod()
+        hits, index, canonical = _aliasing_corpus(canonical_ranked=False)
+
+        result = mod.apply_topic_keyed_grouped_read(
+            hits, index, render_sightings=False,
+        )
+        disclosure = result.provenance[canonical.record_id]
+
+        assert disclosure.aliased_from == ('peer-1',)
+        assert disclosure.canonical_was_itself_ranked is False
+
+    def test_a_pass_through_record_is_disclosed_as_nothing(self):
+        """No fold, no provenance — the channel must not cry wolf."""
+        mod = _mod()
+        hits = [_rec('slab-1', topic=None)]
+
+        result = mod.apply_topic_keyed_grouped_read(
+            hits, _topic_index(*hits), render_sightings=False,
+        )
+
+        assert result.provenance == {}
+
+
+class TestCanonicalDiscoverabilityReportsBothRates:
+    """One column that cannot be read two ways becomes two columns."""
+
+    def test_it_returns_an_aliased_and_an_unaliased_verdict(self):
+        mod = _mod()
+        hits, _, canonical = _aliasing_corpus(canonical_ranked=True)
+
+        measured = mod.canonical_discoverability(
+            hits, 't-a', canonical.record_id, k=5,
+        )
+
+        assert set(measured) >= {
+            'aliased_in_top_k', 'aliased_rank',
+            'unaliased_in_top_k', 'unaliased_rank',
+        }
+
+    def test_a_flat_arm_reports_the_two_identically(self):
+        """The column stays comparable across arms.
+
+        A flat read synthesizes nothing, so there is nothing to alias and
+        the two rates MUST agree.  If they could differ here, the pair
+        would be measuring something other than aliasing.
+        """
+        mod = _mod()
+        hits, _, canonical = _aliasing_corpus(canonical_ranked=True)
+
+        measured = mod.canonical_discoverability(
+            hits, 't-a', canonical.record_id, k=5,
+        )
+
+        assert measured['aliased_in_top_k'] == measured['unaliased_in_top_k']
+        assert measured['aliased_rank'] == measured['unaliased_rank']
+
+    def test_it_agrees_with_the_landed_metric_on_the_aliased_half(self):
+        """The legacy semantics are preserved exactly, not re-derived.
+
+        Cross-checked against the LANDED `topic_discoverability` rather
+        than against a restatement of it, so the two cannot drift and the
+        new table's aliased column stays comparable with the committed one.
+        """
+        mod = _mod()
+        bake_off = _bake_off()
+        hits, _, canonical = _aliasing_corpus(canonical_ranked=True)
+
+        measured = mod.canonical_discoverability(
+            hits, 't-a', canonical.record_id, k=5,
+        )
+        landed = bake_off.topic_discoverability(hits, 't-a', canonical.record_id, 5)
+
+        assert measured['aliased_in_top_k'] == landed['canonical_in_top_k']
+        assert measured['aliased_rank'] == landed['canonical_rank']
+
+    def test_an_absent_canonical_is_found_by_neither(self):
+        mod = _mod()
+        hits = [_rec('unrelated', topic='t-z')]
+
+        measured = mod.canonical_discoverability(hits, 't-a', 'anchor', k=5)
+
+        assert measured['aliased_in_top_k'] is False
+        assert measured['unaliased_in_top_k'] is False
+        # `None`, never 0 — a 0 rank would collide with a real rank under a
+        # 0-based reading and average as "very good" in a mean-rank summary.
+        assert measured['aliased_rank'] is None
+        assert measured['unaliased_rank'] is None
+
+    def test_ranked_but_outside_the_window_is_not_the_same_as_absent(self):
+        """Inherited from `topic_discoverability`: two different findings."""
+        mod = _mod()
+        canonical = _rec('anchor', topic='t-a', canonical=True)
+        hits = [_rec(f'slab-{i}', topic=None) for i in range(5)] + [canonical]
+
+        measured = mod.canonical_discoverability(hits, 't-a', 'anchor', k=5)
+
+        assert measured['unaliased_in_top_k'] is False
+        assert measured['unaliased_rank'] == 6
+
+
+class TestTheTwoRatesDiverge:
+    """THE DECISIVE TEST.
+
+    If no input can make aliased and unaliased differ, the pair is not
+    measuring what it claims and the second column is decoration.
+    """
+
+    def test_a_fold_credits_the_aliased_rate_and_not_the_unaliased_one(self):
+        mod = _mod()
+        hits, index, canonical = _aliasing_corpus(canonical_ranked=False)
+
+        result = mod.apply_topic_keyed_grouped_read(
+            hits, index, render_sightings=False,
+        )
+        measured = mod.canonical_discoverability(
+            result.records, 't-a', canonical.record_id, k=5,
+            provenance=result.provenance,
+        )
+
+        # The store never returned the canonical...
+        assert canonical.record_id not in _ids(hits)
+        # ...yet the document carries its record_id, so the legacy column
+        # scores it found.  That is the aliasing, isolated.
+        assert measured['aliased_in_top_k'] is True
+        assert measured['aliased_rank'] == 1
+        # The honest column refuses the credit.
+        assert measured['unaliased_in_top_k'] is False
+        assert measured['unaliased_rank'] is None
+
+    def test_the_gap_closes_when_the_canonical_really_did_rank(self):
+        """Same transform, same fold — only retrieval differs.
+
+        This is the control for the test above: a grouped read is NOT
+        inherently aliasing, it aliases only when it folds a canonical the
+        store never surfaced.  So the unaliased column credits a real
+        retrieval even when it arrives inside a synthesized document.
+        """
+        mod = _mod()
+        hits, index, canonical = _aliasing_corpus(canonical_ranked=True)
+
+        result = mod.apply_topic_keyed_grouped_read(
+            hits, index, render_sightings=False,
+        )
+        measured = mod.canonical_discoverability(
+            result.records, 't-a', canonical.record_id, k=5,
+            provenance=result.provenance,
+        )
+
+        assert result.provenance[canonical.record_id].canonical_was_itself_ranked
+        assert measured['aliased_in_top_k'] is True
+        assert measured['unaliased_in_top_k'] is True
+
+    def test_without_the_provenance_the_metric_cannot_tell_and_says_so(self):
+        """Aliasing is invisible in the record alone.
+
+        A synthesized document is byte-indistinguishable from a stored one
+        at the `record_id` level — that is the entire problem.  So passing
+        no provenance must NOT quietly fall back to crediting: it reports
+        the aliased rate and `None` for the unaliased one, which the report
+        renders as no-measurement rather than as a measured zero.
+        """
+        mod = _mod()
+        hits, index, canonical = _aliasing_corpus(canonical_ranked=False)
+
+        result = mod.apply_topic_keyed_grouped_read(
+            hits, index, render_sightings=False,
+        )
+        measured = mod.canonical_discoverability(
+            result.records, 't-a', canonical.record_id, k=5,
+        )
+
+        assert measured['aliased_in_top_k'] is True
+        assert measured['unaliased_in_top_k'] is None
+        assert measured['unaliased_rank'] is None
+
+
+class TestTheMetricIsPure:
+    def test_it_mutates_neither_the_hits_nor_the_provenance(self):
+        mod = _mod()
+        hits, index, canonical = _aliasing_corpus(canonical_ranked=False)
+        result = mod.apply_topic_keyed_grouped_read(
+            hits, index, render_sightings=False,
+        )
+        records_before = _ids(result.records)
+        provenance_before = dict(result.provenance)
+
+        mod.canonical_discoverability(
+            result.records, 't-a', canonical.record_id, k=5,
+            provenance=result.provenance,
+        )
+
+        assert _ids(result.records) == records_before
+        assert result.provenance == provenance_before
