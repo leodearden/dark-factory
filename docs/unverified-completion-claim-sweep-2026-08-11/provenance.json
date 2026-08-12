@@ -1,0 +1,58 @@
+{
+  "task_id": "3381",
+  "escalation": "esc-3085-1",
+  "git_sha": "a138751e80a95ad0d10d7cbf9b99bc70d246fdac",
+  "branch": "task/3381",
+  "swept_at": "2026-08-12T13:08:06.153106+00:00",
+  "started_at": "2026-08-12T13:07:41Z",
+  "finished_at": "2026-08-12T13:08:07Z",
+  "exit_code": 0,
+  "cwd": "/home/leo/src/dark-factory/.worktrees/3381/fused-memory",
+  "argv": [
+    "uv", "run", "python", "scripts/audit_unverified_completion_claims.py",
+    "--project", "dark_factory",
+    "--project", "reify",
+    "--include-unverifiable"
+  ],
+  "env": {
+    "PROJECT_ROOT": "/home/leo/src/dark-factory",
+    "DASHBOARD_KNOWN_PROJECT_ROOTS": "/home/leo/src/dark-factory,/home/leo/src/reify",
+    "RECONCILIATION_DATA_DIR": "/home/leo/src/dark-factory/data/reconciliation"
+  },
+  "episodic_population": {
+    "dark_factory": {
+      "count_at_run": 3030,
+      "count_measured_earlier": 2995,
+      "earlier_measured_at": "2026-08-12T10:39Z",
+      "measured_via": "GRAPH.RO_QUERY dark_factory \"MATCH (e:Episodic) RETURN count(e)\""
+    },
+    "reify": {
+      "count_at_run": 4547,
+      "count_measured_earlier": 4547,
+      "earlier_measured_at": "2026-08-12T10:39Z",
+      "measured_via": "GRAPH.RO_QUERY reify \"MATCH (e:Episodic) RETURN count(e)\""
+    },
+    "total_at_run": 7577
+  },
+  "authorities_resolved": {
+    "task_status": {
+      "dark_factory": "/home/leo/src/dark-factory/.taskmaster/tasks/tasks.db",
+      "reify": "/home/leo/src/reify/.taskmaster/tasks/tasks.db",
+      "unregistered": {
+        "know_live": "7 task claim(s) -> unverifiable"
+      }
+    },
+    "ticket_store": "/home/leo/src/dark-factory/data/reconciliation/tickets.db (initialized OK)",
+    "commit_probe": "git cat-file in the CLAIMED project's repo"
+  },
+  "notes": [
+    "report.json is byte-for-byte the script's stdout. It was neither pretty-printed nor hand-edited. All logging went to stderr.",
+    "FIRST RUN DISCARDED. An initial run at 10:42Z from the same cwd WITHOUT the three env vars above resolved an empty project registry ('project dark_factory is not registered' / 'project reify is not registered', 1035 task claims) and found no tickets.db, so every task and ticket claim fell to 'unverifiable'. That run's output is NOT the committed artifact. The script warned loudly on stderr for each case rather than failing silently, which is how the mis-scoped run was caught. The registry is built by build_known_projects_map (models/scope.py:282), whose extra roots default to the DASHBOARD_KNOWN_PROJECT_ROOTS env var; a standalone CLI run does not inherit the server's environment, so it must be supplied. RECONCILIATION_DATA_DIR is needed because the configured default './data/reconciliation' is relative to the PROJECT ROOT, while the sweep runs from fused-memory/.",
+    "THE DENOMINATOR IS A MOVING TARGET. The dark_factory graph grew from 2995 to 3030 Episodic nodes over the ~2.5h between the two measurements above. The store is live and being written throughout; 7577 is a snapshot at run time, not a fixed population.",
+    "ZERO ticket-subject findings. summary.by_subject carries only commit (35) and task (161) — no ticket key at all. The ticket store WAS available and initialized for this run, so this is a real negative, not an unavailability artifact: esc-3085-1 instance (2)'s exact shape (a completion claim naming a tkt_ id that the registry does not hold) did not recur anywhere in the swept corpus.",
+    "esc-3085-1 INSTANCE (2) WAS SWEPT AND CAME BACK CLEAN. Episode 02090224-7bc9-4485-9291-6748e1042ac9 is still present in the REIFY graph with source_description 'add_memory:temporal_facts' (in scope, and with no [unverified_claim] prefix — it predates the gate), and it appears in none of the 196 findings. Ticket tkt_0RRRC5AASJ9Z630VP4PCN9H376 DOES exist in tickets.db (status='combined', task_id='5638', created 2026-07-27T08:30:56Z, resolved 08:31:29Z, reason beginning 'drop: Candidate is fully covered by pool Task 5638'), so _verify_ticket correctly returns verified. Measured directly against the graph and the ticket DB on 2026-08-12. See investigation.md for the hypothesis about what remains false in that record and why an existence-only ticket check cannot see it.",
+    "The 166 'mismatch' findings in report.json are the SCRIPT'S RAW VERDICTS, not adjudicated fabrications. Manual adjudication of every one of them is recorded in investigation.md, which identifies three systematic false-positive classes and concludes that 0 are confirmed new fabrications of the esc-3085-1 shape. report.json is committed unedited precisely so that adjudication can be re-checked against the raw output.",
+    "Cross-repo commit verification (investigation.md class C) was performed OUT OF BAND with `git cat-file -e <sha>^{commit}` run directly in /home/leo/src/dark-factory and /home/leo/src/reify at 2026-08-12T13:1xZ, at dark-factory HEAD a138751e80 and reify HEAD 3e39c86729. The script itself never performs that cross-repo check; it probes only the claimed project.",
+    "INVARIANT HELD: this sweep invalidated nothing and deleted nothing. Every episode and edge the report names is left exactly as it was, for human adjudication. The script has no --apply/--invalidate/--delete path, an absence pinned by TestReadOnlyByConstruction, and reads exclusively over GRAPH.RO_QUERY."
+  ]
+}
