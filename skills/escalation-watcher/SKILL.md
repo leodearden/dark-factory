@@ -617,14 +617,16 @@ task β, `orchestrator/src/orchestrator/merge_disposition.py`). It is a **closed
 | `branch_bug` | No landed commit is implicated — the failure is the branch's own bug. |
 | `indeterminate` | The classifier couldn't reach a verdict (evidence inconclusive, or an internal error — fail-open). Treat exactly like today's undifferentiated failure. |
 
-**Where it surfaces:** `integration_skew` does **not** get its own escalation
-category — it still arrives here as an ordinary `task_failure` / `wip_conflict`
-escalation. What changes is the content: the task's block reason carries an
-appended suffix of the form `integration_skew: port landed commit(s) <sha[, sha...]>
+**Where it surfaces:** `integration_skew` **does** get its own escalation
+category: the workflow layer files the block with `category='integration_skew'`
+and `suggested_action='port_landed_change'` (workflow.py, INTEGRATION_SKEW
+disposition branch). The task's block reason also carries an appended suffix of
+the form `integration_skew: port landed commit(s) <sha[, sha...]>
 touching <files> — do not hunt your own diff`, and the same disposition +
 implicated commits + overlap files are available verbatim in `merge_status`'s
-`failure_diagnostic` field. Look for that suffix/field before you (or a spawned
-`/unblock` session) start reading the branch's own diff for a bug that isn't there.
+`failure_diagnostic` field. Look for that category/suffix/field before you (or a
+spawned `/unblock` session) start reading the branch's own diff for a bug that
+isn't there.
 
 **Triage rule — the load-bearing part:**
 

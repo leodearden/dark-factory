@@ -1197,6 +1197,12 @@ async def main_baseline_failing_ids(
             return _cached_ids
 
     try:
+        # warm_seed=True: this probe shares the rolling warm-lane CoW base
+        # with the ordinary task verifies it adjudicates, so any warm-base
+        # artifact bias is common-mode across both sides of the comparison;
+        # the COLD ground truth stays with MAIN_SWEEP and the
+        # '_mainsweepconfirm-' confirm worktree (operator sign-off
+        # 2026-08-12, task-2567 suggestion).
         async with git_ops.ephemeral_worktree(  # type: ignore[union-attr]
             WorktreeKind.MAIN_PROBE, main_sha, warm_seed=True,
         ) as tmp_path:
@@ -5586,8 +5592,13 @@ async def run_full_verification(
     branch).  Defaults to ``'task'``, which keeps the primary production
     caller ``review_checkpoint.py`` (and every other existing caller)
     byte-identical.  ``run_main_tip_sweep`` passes ``role='background'`` so
-    the sweep's fan-out acquires the background admission slot and the
-    nice-19/ionice-idle tier instead.
+    the sweep's fan-out runs in the nice-19/ionice-idle CPU tier.  Admission,
+    however, comes from the SHARED task pool (``verify_admission_task_slots``
+    — no dedicated background pool exists), so at the default single slot a
+    sweep leg can add latency to task verifies while it holds the slot.
+    Accepted trade-off (operator ruling 2026-08-12, task-2391 suggestion):
+    one pool is the admission gate's entire point — a single bound on total
+    concurrent pytest — and the inversion is per-leg-bounded and latency-only.
 
     Discovery reuse: ``config._module_configs`` uses a sentinel of ``None`` to
     mean "discovery never ran".  When it holds any dict (including ``{}``,
@@ -6824,6 +6835,12 @@ async def verify_failure_is_preexisting_on_main(
         # starts from a pre-built main and verifies in the warm timeout tier
         # instead of a cold ~30-45min recompile. Fails soft to cold when no
         # warm base exists — see ephemeral_worktree's warm_seed docstring.
+        # Sharing the warm base with ordinary task verification means any
+        # stale-artifact bias is common-mode across the "preexisting on
+        # main?" comparison; the COLD ground truth remains MAIN_SWEEP plus
+        # the '_mainsweepconfirm-' confirm worktree (operator sign-off
+        # 2026-08-12, task-2567 suggestion — cold here would cost 30-45min
+        # per probe on the contagion-guard hot path).
         async with git_ops.ephemeral_worktree(  # type: ignore[union-attr]
             WorktreeKind.MAIN_PROBE, main_sha, warm_seed=True,
         ) as tmp_path:
@@ -7893,6 +7910,12 @@ class _RerunPolicy:
     one of those is pinned by an existing assertion. Capturing them as a
     ``call_site -> policy`` table gives exactly ONE body to drift from while
     keeping each site's calibration independent and visible in one place.
+
+    Shape note (operator ruling 2026-08-12, task-3786 suggestion): the
+    verbatim-log-preservation fields are deliberate while only two call
+    sites exist; re-judge the 8-field shape when the third call site
+    (task kappa's ``chronic_marker``) arrives — that consumer is the real
+    test of whether the shape generalizes.
     """
 
     #: Caller name embedded in every log line so an operator can attribute a
