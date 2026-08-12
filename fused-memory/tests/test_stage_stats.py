@@ -22,6 +22,7 @@ from fused_memory.reconciliation.stage_stats import (
     _landed,
     derive_stage_stats,
 )
+from fused_memory.services.durable_queue import POST_EXECUTE_DEAD_PREFIX
 from fused_memory.services.write_journal import WriteJournal
 
 _STAGE_AGENT_ID = 'recon-stage-memory_consolidator'
@@ -255,6 +256,34 @@ def test_landed_true_when_terminal_status_key_absent():
     assert _landed({}) is True
 
 
+def test_landed_true_for_post_execute_dead_letter():
+    """The ONE case where 'dead' still counts: the backend write LANDED and
+    only the callback / completion-commit kept failing, which the durable
+    queue marks by prefixing terminal_error with POST_EXECUTE_DEAD_PREFIX.
+
+    Excluding these would UNDERCOUNT writes that genuinely happened — the
+    opposite error from the over-counting this task fixes.
+    """
+    op = {
+        'terminal_status': 'dead',
+        'terminal_error': POST_EXECUTE_DEAD_PREFIX + 'callback blew up',
+    }
+    assert _landed(op) is True
+
+
+def test_landed_false_for_dead_with_ordinary_error():
+    """A dead-letter whose error carries no post-execute prefix never reached
+    the backend."""
+    assert _landed({'terminal_status': 'dead', 'terminal_error': 'boom'}) is False
+
+
+def test_landed_false_for_dead_with_null_error():
+    """record_terminal_outcome's terminal_error is `str | None = None`, so a
+    dead-letter carrying no error string is reachable. It is NOT assumed to
+    have landed — and the isinstance guard means it does not raise."""
+    assert _landed({'terminal_status': 'dead', 'terminal_error': None}) is False
+
+
 # ── derive_stage_stats: dead-lettered writes must not count as landed ────
 
 
@@ -309,6 +338,46 @@ async def test_derive_stage_stats_dead_add_memory_with_ids_not_counted(journal):
     observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
 
     assert observed == _expected()
+
+
+@pytest.mark.asyncio
+async def test_derive_stage_stats_post_execute_dead_graphiti_enqueue_still_counts(journal):
+    """A post-execute dead-letter DID land: the backend write succeeded and
+    only the callback kept failing. It must still count toward its landed
+    counter, or the fix trades over-counting for under-counting."""
+    run_id = str(uuid.uuid4())
+    op_id = await _log_write(
+        journal, causation_id=run_id, operation='add_memory',
+        result_summary={'memory_ids': [], 'stores': ['graphiti']},
+    )
+    await _stamp_terminal(
+        journal, op_id, status='dead',
+        error=POST_EXECUTE_DEAD_PREFIX + 'callback blew up',
+    )
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed['graphiti_writes_queued'] == 1
+
+
+@pytest.mark.asyncio
+async def test_derive_stage_stats_post_execute_dead_episode_still_counts(journal):
+    """The generic-counter branch honours the post-execute exception too."""
+    run_id = str(uuid.uuid4())
+    op_id = await _log_write(
+        journal, causation_id=run_id, operation='add_episode',
+        result_summary={'status': 'added'},
+    )
+    await _stamp_terminal(
+        journal, op_id, status='dead',
+        error=POST_EXECUTE_DEAD_PREFIX + 'completion commit failed',
+    )
+
+    ops = await journal.get_ops_by_causation(run_id)
+    observed = derive_stage_stats(ops, _STAGE_AGENT_ID)
+
+    assert observed['episodes_added'] == 1
 
 
 @pytest.mark.asyncio
