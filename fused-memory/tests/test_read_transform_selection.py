@@ -653,7 +653,14 @@ class TestSightingCreditingIsAnExplicitKnob:
 
         cheap = bake_off.tokens_returned(counted.records, 5, estimator)
         dear = bake_off.tokens_returned(rendered.records, 5, estimator)
-        assert dear['total_tokens'] > cheap['total_tokens']
+        # `tokens_returned` (:1245) returns {'tokens', 'estimator',
+        # 'payloads_counted'} — the count is read under its real key rather
+        # than a guessed one, so this priced comparison stays directly
+        # comparable with the committed E2 table's token column.
+        assert dear['tokens'] > cheap['tokens']
+        # Both sides must have gone through the SAME estimator, or the
+        # comparison prices two different rulers instead of two policies.
+        assert dear['estimator'] == cheap['estimator'] == estimator[0]
 
 
 class TestClaimRecallCeiling:
