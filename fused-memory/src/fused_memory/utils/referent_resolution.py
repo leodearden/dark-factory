@@ -45,9 +45,29 @@ from typing import Literal
 
 from fused_memory.utils.canonical_labels import Referent, parse_node_name, scan_content
 from fused_memory.utils.validation import (
+    InputValidationError,
     PathShapedProjectIdError,
+    _safe_repr,
     canonicalize_project_id,
 )
+
+#: Remediation text for a rejected ``declared`` entry. Single-sourced here and
+#: folded into the raised message, following ``require_full_uuid``
+#: (validation.py): an exception has no room for a separate structured key, so
+#: the accepted shape has to travel with the error itself.
+_DECLARED_REFERENT_HINT = (
+    "Each declared referent must be a dict of the shape {'kind': 'task', "
+    "'id': <digits>, 'project_id': <optional project key>} — 'kind' and "
+    "'project_id' are optional and default to 'task' and the local project. "
+    "'id' must be the task number's digits (an int, or a string of ASCII "
+    'digits), never a label like "Task 3127" and never a bool.'
+)
+
+#: The complete set of keys a declared entry may carry. Closed deliberately:
+#: an unrecognized key ('projectId') would otherwise be silently ignored and
+#: resolve to an OWN-project referent — a confidently wrong answer about which
+#: project a fact belongs to.
+_DECLARED_ENTRY_KEYS = frozenset({'kind', 'id', 'project_id'})
 
 #: The CLOSED vocabulary of resolution sources, in precedence order (strongest
 #: first). Exported as one tuple so task ι's declaration-rate telemetry
@@ -129,6 +149,38 @@ class ReferentResolution:
     ambiguous: ReferentSet = ()
 
 
+def _declared_number(entry: dict) -> str:
+    """Return the entry's task number as verbatim digits, or raise.
+
+    Digits are never int-normalized: ``'0132'`` is a DIFFERENT referent from
+    ``'132'``, so coercing would silently repoint the caller's own assertion.
+    """
+    if 'id' not in entry:
+        raise InputValidationError(
+            f"declared referent {_safe_repr(entry)} is missing required key 'id'. "
+            f'{_DECLARED_REFERENT_HINT}'
+        )
+    value = entry['id']
+    # bool FIRST: bool subclasses int, so {'id': True} would otherwise become
+    # Task 1. The lesson is already encoded in validation._is_plain_int.
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise InputValidationError(
+            f'declared referent {_safe_repr(entry)} has a non-integer id '
+            f'{_safe_repr(value)}. {_DECLARED_REFERENT_HINT}'
+        )
+    number = str(value).strip()
+    # String predicates rather than a compiled '^\\d+$': INV-5 forbids a second
+    # copy of the label vocabulary in this module. The isascii() half is
+    # precision, not ceremony — str.isdigit() accepts Arabic-Indic and
+    # superscript digits, and a Unicode digit is not a task id.
+    if not number or not (number.isascii() and number.isdigit()):
+        raise InputValidationError(
+            f'declared referent {_safe_repr(entry)} has an id that is not a '
+            f'run of ASCII digits: {_safe_repr(value)}. {_DECLARED_REFERENT_HINT}'
+        )
+    return number
+
+
 def _declared_referents(declared: list[dict], *, group_id: str) -> ReferentSet:
     """Parse the caller's explicit referent entries into a referent set.
 
@@ -144,7 +196,20 @@ def _declared_referents(declared: list[dict], *, group_id: str) -> ReferentSet:
 
     De-duplicated on ``(kind, project_id, number)`` with first-seen order
     preserved — the same key and the same discipline ``scan_content`` uses.
+
+    A malformed entry RAISES :class:`InputValidationError`; it is never
+    dropped and never smuggled into ``.conflicts``. Dropping would flip
+    ``.source`` down to a lower source, lose the caller's intent invisibly and
+    corrupt the declaration-rate telemetry ι reads — the silent degradation
+    this repo's loud-over-silent norm forbids. Reporting it as a conflict
+    would tell the agent its declaration contradicts its prose and send it
+    hunting a semantic disagreement that does not exist.
     """
+    if not isinstance(declared, list):
+        raise InputValidationError(
+            f'declared referents must be a list, got {_safe_repr(declared)}. '
+            f'{_DECLARED_REFERENT_HINT}'
+        )
     try:
         local_project = canonicalize_project_id(group_id)
     except PathShapedProjectIdError:
@@ -158,15 +223,49 @@ def _declared_referents(declared: list[dict], *, group_id: str) -> ReferentSet:
     referents: list[Referent] = []
     seen: set[tuple[str, str, str]] = set()
     for entry in declared:
+        if not isinstance(entry, dict):
+            raise InputValidationError(
+                f'declared referent {_safe_repr(entry)} is not a dict. '
+                f'{_DECLARED_REFERENT_HINT}'
+            )
+        if unknown := set(entry) - _DECLARED_ENTRY_KEYS:
+            # Rejected, not ignored: 'projectId' would otherwise resolve
+            # silently to an own-project referent.
+            raise InputValidationError(
+                f'declared referent {_safe_repr(entry)} has unrecognized '
+                f'key(s) {sorted(unknown)}. {_DECLARED_REFERENT_HINT}'
+            )
+        number = _declared_number(entry)
+
         raw_project = entry.get('project_id') or ''
-        project_id = canonicalize_project_id(raw_project) if raw_project else ''
+        try:
+            project_id = canonicalize_project_id(raw_project) if raw_project else ''
+        except PathShapedProjectIdError as exc:
+            # Never canonicalized: normalizing a mangled path would mint a
+            # NEW, wrong canonical key (RCA §4), and the referent would then
+            # confidently name a project that does not exist.
+            raise InputValidationError(
+                f'declared referent {_safe_repr(entry)} has a path-shaped '
+                f'project_id: {exc} {_DECLARED_REFERENT_HINT}'
+            ) from exc
         if project_id and local_project and project_id == local_project:
             project_id = ''
-        referent = Referent(
-            kind=entry.get('kind', 'task'),
-            number=str(entry['id']).strip(),
-            project_id=project_id,
-        )
+
+        try:
+            referent = Referent(
+                kind=entry.get('kind', 'task'),
+                number=number,
+                project_id=project_id,
+            )
+        except ValueError as exc:
+            # An unregistered kind. Re-raised as InputValidationError so δ's
+            # boundary sees ONE exception type, preserving __post_init__'s
+            # message, which already names the registered kinds and where to
+            # add one.
+            raise InputValidationError(
+                f'declared referent {_safe_repr(entry)} is invalid: {exc} '
+                f'{_DECLARED_REFERENT_HINT}'
+            ) from exc
         key = (referent.kind, referent.project_id, referent.number)
         if key in seen:
             continue
