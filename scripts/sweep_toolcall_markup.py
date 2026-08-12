@@ -56,7 +56,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 # shared/src bootstrap. Same idiom and same precedence argument as
 # scripts/scan_task_toolcall_leaks.py:113-115 and
@@ -322,3 +322,255 @@ def resolve_write_target(target: Target, root: Path | str) -> ResolvedTarget | R
         )
 
     return ResolvedTarget(path=target.path, lane=target.lane, write_path=resolved)
+
+
+# ---------------------------------------------------------------------------
+# repair_document — the uniform per-OBJECT rule.
+# ---------------------------------------------------------------------------
+#
+# WHY A PER-OBJECT RULE RATHER THAN A TOOL SCHEMA (design decision 1).
+#
+# `repair()` wants (param, schema_params, supplied) — the shape of a live MCP
+# tool call. A persisted JSON document has no tool call, so the mapping has to
+# be invented. The sound one is per containing OBJECT:
+#
+#   schema_params = that object's OWN keys   — a recovered name must name a
+#                                              real field of this very record;
+#   legal targets = sibling keys whose current value is a string HOLE
+#                   (empty or whitespace-only);
+#   supplied      = every other key, so repair()'s own B8/B9 accept conditions
+#                   do the refusing rather than a second policy layer here.
+#
+# Delegating to `orchestrator.mcp.plan_tools._repair_plan_fields` was the first
+# choice (INV-5, no lockstep duplication) and it imports fine under a full
+# venv — but the gated test command for this module is
+# `uv run --project shared pytest scripts/tests/`, and `import fastmcp` FAILS
+# in that env (re-measured this iteration), so plan_tools cannot be imported
+# where its behaviour would be exercised.
+#
+# The uniform rule needs no tool schema at all, and it is strictly NARROWER
+# than a parameter-name-keyed recovery on both hazards plan_tools names:
+#   * a recovered name that is not already a key of this record is refused, so
+#     no junk key (`step_type` beside `type`) can be invented;
+#   * a target whose current value is not a STRING is always in `supplied`, so
+#     a bare str can never land on `evidence: []` or on a `files` list and
+#     silently change that field's type.
+# Measured parity on the live corpora: identical 26/26 escalation repairs to
+# the tool-schema table, and identical 5/5 `rationale` repairs to epsilon's own
+# `_repair_plan_fields`. The envelope-literal enumeration itself is still taken
+# solely from `shared.toolcall_markup`, which is the INV-5 property that
+# actually matters here.
+
+#: A repair was applied: the field was truncated to its clean prefix and every
+#: recovered sibling restored.
+ACTION_REPAIRED = 'repaired'
+#: The string was flagged by detect() but repair() declined. The value is left
+#: BYTE-IDENTICAL and the reason is reported for human adjudication.
+ACTION_REFUSED = 'refused'
+
+#: The tail parsed and every recovered name IS a field of this record, but at
+#: least one of them currently holds authored content (or a non-string value)
+#: rather than an empty string hole. Restoring would DISPLACE that content,
+#: which design decision 2 forbids: the swallowed text still survives inside
+#: the corrupted field, so refusing loses nothing while overwriting would
+#: destroy a real value to rescue another.
+REASON_NO_STRING_HOLE_TARGET = 'no-string-hole-target'
+#: repair() declined even with the string-hole constraint lifted: the tail did
+#: not parse with zero leftover, or a recovered name is not a field of this
+#: record at all, or the clean prefix would itself still carry markup.
+REASON_UNREPAIRABLE = 'unrepairable'
+#: The tail names the very field it mis-closed. Applying it would make the
+#: field's clean prefix and its recovered value fight over one key, and one of
+#: them would be silently dropped — so this refuses instead.
+REASON_SELF_NAMING_TAIL = 'self-naming-tail'
+
+
+class Outcome(NamedTuple):
+    """What happened to one detect()-flagged string, and where."""
+
+    #: Dotted/indexed location within the document, e.g.
+    #: ``design_decisions[1].rationale``. Built for the operator's report.
+    json_path: str
+    field: str
+    action: str
+    #: Names restored into their holes. EMPTY on a successful repair is the
+    #: B4 last-parameter case (the mis-closed field was the call's final
+    #: argument, so nothing was dropped) — every corrupted plan rationale
+    #: measured live is this shape.
+    recovered_names: tuple[str, ...]
+    #: '' when the action is a repair.
+    reason: str
+
+
+def _join(path: str, key: str) -> str:
+    """Extend a json path by one object key."""
+    return f'{path}.{key}' if path else key
+
+
+def _string_holes(node: dict) -> set[str]:
+    """Keys of *node* whose current value is an empty/whitespace-only string.
+
+    The "hole" concept is adopted from ``plan_tools._is_authored`` and
+    TIGHTENED for this sweep: a legal target must additionally be STRING-typed.
+    ``None`` and empty containers are holes to plan_tools but are NOT targets
+    here, because filling one with a recovered ``str`` would change that
+    field's type. Non-string holes are simply left in ``supplied``, which
+    routes them through repair()'s existing B9 refusal instead of adding a
+    second policy layer.
+    """
+    return {
+        key
+        for key, value in node.items()
+        if isinstance(value, str) and not value.strip()
+    }
+
+
+def _classify_refusal(value: str, field: str, schema: set[str]) -> str:
+    """Name the reason repair() declined *value*.
+
+    Re-runs repair() ONCE with the string-hole constraint lifted (``supplied``
+    empty). If it then succeeds, the tail parsed and every recovered name is a
+    real field of this record, so the only thing that blocked the real call was
+    a target already holding content — :data:`REASON_NO_STRING_HOLE_TARGET`.
+    Otherwise the refusal is structural — :data:`REASON_UNREPAIRABLE`.
+
+    Deliberately re-uses repair() rather than re-parsing the tail here: this
+    module implements no matching or parsing of its own (INV-5), so the reason
+    is DERIVED from the same algorithm that made the decision. It runs only on
+    the refusal path, never on the clean or repaired paths.
+    """
+    if repair(value, field, schema, ()) is not None:
+        return REASON_NO_STRING_HOLE_TARGET
+    return REASON_UNREPAIRABLE
+
+
+def _repair_dict(node: dict, path: str, outcomes: list[Outcome]) -> tuple[dict, bool]:
+    """Repair one object's own string fields, then recurse into its children.
+
+    Copy-on-write: *node* itself is returned unchanged unless something
+    actually changed, so a clean document comes back by IDENTITY. That is not
+    tidiness — the sweep decides whether to rewrite a file by whether the
+    document changed, so a repairer that copied unconditionally would make
+    every file look dirty and rewrite the whole corpus.
+    """
+    working = node
+    changed = False
+
+    for key in list(node.keys()):
+        value = working[key]
+
+        if isinstance(value, str):
+            if detect(value) is None:
+                continue
+            # Recomputed per FIELD, not once per object: a hole filled by an
+            # earlier repair in this same pass is no longer a hole, and two
+            # corrupted fields must never both claim it.
+            schema = set(working.keys())
+            targets = _string_holes(working) - {key}
+            result = repair(value, key, schema, schema - targets - {key})
+
+            if result is None:
+                outcomes.append(Outcome(
+                    json_path=_join(path, key),
+                    field=key,
+                    action=ACTION_REFUSED,
+                    recovered_names=(),
+                    reason=_classify_refusal(value, key, schema),
+                ))
+                continue
+
+            if key in result.recovered:
+                outcomes.append(Outcome(
+                    json_path=_join(path, key),
+                    field=key,
+                    action=ACTION_REFUSED,
+                    recovered_names=(),
+                    reason=REASON_SELF_NAMING_TAIL,
+                ))
+                continue
+
+            if working is node:
+                working = dict(node)
+            working[key] = result.clean_value
+            for name, recovered_value in result.recovered.items():
+                working[name] = recovered_value
+            changed = True
+            outcomes.append(Outcome(
+                json_path=_join(path, key),
+                field=key,
+                action=ACTION_REPAIRED,
+                recovered_names=tuple(sorted(result.recovered)),
+                reason='',
+            ))
+
+        elif isinstance(value, (dict, list)):
+            new_child, child_changed = _repair_node(value, _join(path, key), outcomes)
+            if child_changed:
+                if working is node:
+                    working = dict(node)
+                working[key] = new_child
+                changed = True
+
+    return working, changed
+
+
+def _repair_list(node: list, path: str, outcomes: list[Outcome]) -> tuple[list, bool]:
+    """Recurse into a list's object/list elements, copy-on-write.
+
+    Bare strings inside a list are deliberately NOT repaired: a list element
+    has no sibling keys, so there is no object to derive schema_params from and
+    nowhere legal to restore a recovered value to. Such a string would be
+    truncate-only, which design decision 2 forbids.
+    """
+    working = node
+    changed = False
+    for index, item in enumerate(node):
+        if not isinstance(item, (dict, list)):
+            continue
+        new_item, item_changed = _repair_node(item, f'{path}[{index}]', outcomes)
+        if item_changed:
+            if working is node:
+                working = list(node)
+            working[index] = new_item
+            changed = True
+    return working, changed
+
+
+def _repair_node(node, path: str, outcomes: list[Outcome]):
+    """Dispatch one node of the document walk."""
+    if isinstance(node, dict):
+        return _repair_dict(node, path, outcomes)
+    if isinstance(node, list):
+        return _repair_list(node, path, outcomes)
+    return node, False
+
+
+def repair_document(obj: Any) -> tuple[Any, list[Outcome]]:
+    """Repair every repairable string in *obj*; return ``(new_obj, outcomes)``.
+
+    Typed ``Any`` in and ``Any`` out on purpose: the argument is a decoded JSON
+    document, so its static type is the open ``dict | list | str | int | float
+    | bool | None`` union and every caller immediately subscripts the result by
+    a key it knows from the record shape. Narrowing the return to ``dict``
+    would be a lie for a document whose root is a list; leaving it unannotated
+    made pyright infer ``dict | list`` and reject every ``result['field']`` at
+    24 call sites. The real shape guarantee is structural and is asserted in
+    the tests, not expressible here.
+
+    Walks every dict in the document depth-first and applies the uniform
+    per-object rule documented above. A refused string is left BYTE-IDENTICAL
+    and reported with its reason; a clean document is returned by identity with
+    zero outcomes.
+
+    Restore-or-refuse (design decision 2): a repair never truncates alone. The
+    swallowed text currently survives inside the corrupted field, so writing
+    back only ``clean_value`` would DELETE it — destroying exactly the values
+    cancelled task 3662 identified as the harm. Every applied repair is
+    therefore lossless: ``clean_value`` is a prefix and every recovered value a
+    verbatim substring (invariant D5, enforced by construction in repair()), so
+    the union of the rewritten fields contains every byte of the original
+    except the markup tags themselves.
+    """
+    outcomes: list[Outcome] = []
+    new_obj, _changed = _repair_node(obj, '', outcomes)
+    return new_obj, outcomes

@@ -651,3 +651,245 @@ def test_refusals_are_returned_not_raised(sweep_root):
     assert refusal.path is not None
     assert refusal.lane == sweep.LANE_ESCALATIONS
     assert isinstance(refusal.reason, str) and refusal.reason
+
+
+# ---------------------------------------------------------------------------
+# step-5 — repair_document, the uniform per-OBJECT rule.
+# ---------------------------------------------------------------------------
+
+
+def _swallowed_echo(prefix: str, misclose: str, param: str, value: str) -> str:
+    """The NAME-ECHOING dialect: the dropped param closes on its own name.
+
+    The model drifts into this spelling, and it is not symmetric with the
+    canonical one — a canonical opener closes with ``parameter`` while this one
+    closes with ``X``. Both dialects appear in the live corpus, so both are
+    exercised.
+    """
+    return (
+        prefix
+        + _closer(misclose)
+        + '\n'
+        + '\x3c'
+        + param
+        + '>'
+        + value
+        + _closer(param)
+        + '\n'
+        + INVOKE_CLOSER
+        + '\n'
+    )
+
+
+def test_repair_restores_a_swallowed_sibling_into_its_string_hole():
+    """Case (a): the canonical repair, and invariant D5 asserted DIRECTLY.
+
+    The uniform rule: schema_params = the containing object's own keys, legal
+    targets = sibling keys currently holding a string HOLE, supplied =
+    everything else. So a recovered name must name a real field of THIS record
+    and must land on a hole — never displacing authored content.
+    """
+    intended = 'The detail the agent meant to write.'
+    action = 'Re-run the merge worker after the lock clears.'
+    record = make_escalation(
+        'esc-7-1', 'resolved', _swallowed_echo(intended, 'detail', 'suggested_action', action)
+    )
+    original = json.loads(json.dumps(record))
+
+    repaired, outcomes = sweep.repair_document(record)
+
+    assert repaired['detail'] == intended
+    assert repaired['suggested_action'] == action
+
+    # D5, asserted rather than assumed: recovery never fabricates.
+    assert original['detail'].startswith(repaired['detail']), 'clean value is a PREFIX'
+    assert repaired['suggested_action'] in original['detail'], 'recovered is a SUBSTRING'
+
+    # Every other key identical by value AND type.
+    for key in original:
+        if key in ('detail', 'suggested_action'):
+            continue
+        assert repaired[key] == original[key]
+        assert type(repaired[key]) is type(original[key])
+
+    assert [o.action for o in outcomes] == [sweep.ACTION_REPAIRED]
+    assert outcomes[0].field == 'detail'
+    assert outcomes[0].recovered_names == ('suggested_action',)
+
+
+def test_repair_refuses_when_the_recovered_name_is_a_list_typed_field():
+    """Case (b): a tail naming ``evidence`` while ``evidence: []``.
+
+    This is the single largest refusal class measured live. A bare str landing
+    on a list-typed field would change that field's TYPE, so a non-string is
+    never a legal target — it stays in ``supplied`` and repair()'s own B9
+    condition does the refusing. The document comes back byte-identical.
+
+    Uses the CANONICAL dialect deliberately, because that is what the live
+    corpus carries for this class — and the dialect is load-bearing here. See
+    :func:`test_echo_dialect_falls_through_to_a_later_candidate` for the
+    measured asymmetry.
+    """
+    record = make_escalation(
+        'esc-7-2', 'resolved', _swallowed('Detail.', 'detail', 'evidence', 'some text')
+    )
+    before = json.dumps(record, indent=2)
+
+    repaired, outcomes = sweep.repair_document(record)
+
+    assert json.dumps(repaired, indent=2) == before, 'byte-identical'
+    assert [o.action for o in outcomes] == [sweep.ACTION_REFUSED]
+    assert outcomes[0].reason == sweep.REASON_NO_STRING_HOLE_TARGET
+    assert repaired['evidence'] == [], 'type unchanged'
+
+
+def test_repair_refuses_a_recovered_name_absent_from_the_record():
+    """Case (c): the recovered name is not a field of THIS record at all.
+
+    Stricter than a parameter-name-keyed recovery would be: it is what stops a
+    junk key being invented beside a real one.
+    """
+    record = make_escalation(
+        'esc-7-3', 'resolved', _swallowed_echo('Detail.', 'detail', 'not_a_field', 'text')
+    )
+    before = json.dumps(record, indent=2)
+
+    repaired, outcomes = sweep.repair_document(record)
+
+    assert json.dumps(repaired, indent=2) == before
+    assert [o.action for o in outcomes] == [sweep.ACTION_REFUSED]
+    assert 'not_a_field' not in repaired, 'no key may be invented'
+    assert outcomes[0].reason != sweep.REASON_NO_STRING_HOLE_TARGET, (
+        'a name that is not a field at all is a DIFFERENT refusal from a name '
+        'that is a field but holds content'
+    )
+
+
+def test_repair_refuses_rather_than_displacing_authored_text():
+    """Case (d): the named sibling already holds authored content (B9).
+
+    Design decision 2's restore-or-refuse rule. Overwriting here would destroy
+    a real value to rescue another — strictly worse than leaving the corruption
+    in place, where the swallowed text at least still survives.
+    """
+    authored = 'A root cause someone actually wrote.'
+    record = make_escalation(
+        'esc-7-4',
+        'resolved',
+        _swallowed('Detail.', 'detail', 'root_cause', 'the recovered one'),
+        root_cause=authored,
+    )
+    before = json.dumps(record, indent=2)
+
+    repaired, outcomes = sweep.repair_document(record)
+
+    assert json.dumps(repaired, indent=2) == before
+    assert repaired['root_cause'] == authored, 'authored text survives untouched'
+    assert [o.action for o in outcomes] == [sweep.ACTION_REFUSED]
+    assert outcomes[0].reason == sweep.REASON_NO_STRING_HOLE_TARGET
+
+
+def test_repair_reaches_corruption_nested_in_a_list_of_objects():
+    """Case (e): ``design_decisions[1].rationale``, via the recursive walk.
+
+    Every corrupted string in the live orphaned-plan corpus is at this depth,
+    so a top-level-only walk would find none of them.
+    """
+    plan = make_plan(
+        '9005',
+        [
+            'clean first',
+            _truncated('The second rationale.', 'rationale'),
+            'clean third',
+        ],
+    )
+    original = json.loads(json.dumps(plan))
+
+    repaired, outcomes = sweep.repair_document(plan)
+
+    decisions = repaired['design_decisions']
+    assert decisions[1]['rationale'] == 'The second rationale.'
+    assert decisions[0] == original['design_decisions'][0], 'siblings untouched'
+    assert decisions[2] == original['design_decisions'][2], 'siblings untouched'
+    assert decisions[1]['decision'] == original['design_decisions'][1]['decision']
+    assert repaired['steps'] == original['steps']
+    assert repaired['_schema_version'] == 1
+
+    assert [o.action for o in outcomes] == [sweep.ACTION_REPAIRED]
+    assert outcomes[0].json_path == 'design_decisions[1].rationale'
+    assert outcomes[0].recovered_names == (), 'B4 last-parameter: nothing dropped'
+
+
+def test_repair_of_a_clean_document_is_identity_with_no_outcomes():
+    """Case (f): unchanged, zero outcomes, and the SAME object back.
+
+    Identity matters beyond tidiness: the sweep decides whether to rewrite a
+    file by whether anything changed, so a repairer that deep-copied every
+    document unconditionally would make every file look dirty.
+    """
+    record = make_escalation('esc-7-5', 'dismissed', 'A perfectly clean detail.')
+
+    repaired, outcomes = sweep.repair_document(record)
+
+    assert outcomes == []
+    assert repaired is record, 'no copy churn on the clean path'
+
+
+def test_repair_leaves_quoting_prose_alone_when_it_cannot_be_repaired():
+    """Prose that merely QUOTES an envelope literal is flagged but not rewritten.
+
+    81 of the 144 detect()-flagged strings measured live are this: records
+    ABOUT markup incidents, 39 of them in evidence[].observation. detect() is
+    deliberately wider than repair(), which is why repair() — not detect() — is
+    the gate on every write.
+    """
+    prose = 'The agent emitted ' + _closer('description') + ' and the argument was dropped.'
+    record = make_escalation('esc-7-6', 'dismissed', prose)
+    before = json.dumps(record, indent=2)
+
+    repaired, outcomes = sweep.repair_document(record)
+
+    assert json.dumps(repaired, indent=2) == before
+    assert [o.action for o in outcomes] == [sweep.ACTION_REFUSED]
+
+
+def test_echo_dialect_falls_through_to_a_later_candidate():
+    """MEASURED asymmetry between the two dialects. Documented, not asserted away.
+
+    When the tail names a sibling that is NOT a legal target, what repair()
+    does next depends on which dialect the tail is written in:
+
+    * CANONICAL — the later candidate is the ``parameter`` closer, and the
+      clean prefix it would produce still contains the opener prefix, which IS
+      an enumerated literal. repair()'s prefix-clean accept condition therefore
+      rejects it and the whole value is refused. This is the live corpus's
+      shape and the source of the 37 measured refusals.
+    * NAME-ECHOING — the later candidate is the pseudo-parameter's own closer,
+      and neither it nor its opener is an enumerated literal, so the prefix
+      comes back clean and repair() ACCEPTS a truncation at that point.
+
+    The echo outcome is cosmetic — it strips the trailing invoke terminator and
+    leaves the earlier mis-close sitting in the value as prose. It is still
+    LOSSLESS (invariant D5: the result is a prefix of the input, so no byte of
+    the swallowed text is destroyed), and the result no longer trips detect(),
+    so the second-run-zero invariant is unaffected.
+
+    This sweep does NOT add a second policy layer to override it. repair() is
+    the gate by design (decision 7), and re-deciding its verdict here would
+    mean re-implementing the matching this module deliberately owns none of
+    (INV-5). The behaviour belongs to ``shared.toolcall_markup`` (task 3688);
+    this test pins what the sweep actually inherits so a future change there is
+    visible here rather than silent.
+    """
+    record = make_escalation(
+        'esc-7-7', 'resolved', _swallowed_echo('Detail.', 'detail', 'evidence', 'some text')
+    )
+    original_detail = record['detail']
+
+    repaired, outcomes = sweep.repair_document(record)
+
+    assert [o.action for o in outcomes] == [sweep.ACTION_REPAIRED]
+    assert outcomes[0].recovered_names == (), 'nothing was restored — a truncation'
+    assert original_detail.startswith(repaired['detail']), 'D5 still holds: a PREFIX'
+    assert repaired['evidence'] == [], 'the list-typed field is still NOT displaced'
+    assert detect(repaired['detail']) is None, 'and the result no longer trips detect()'
