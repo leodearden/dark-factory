@@ -4909,6 +4909,18 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: Not Found section renders bare '(turn 13) does not exist' as a template, dropping any diagnostic context for why the turn is missing or what was expected
+  - date: '2026-08-13'
+    project: dark_factory
+    session: 545a880e-7545-4d5f-96ef-12123e03d5c9
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Digest renders guard signal as bare template '(turn 3) blocked:' without the matched substring or guard context; df_guard:1 fired but details dropped
+  - date: '2026-08-13'
+    project: dark_factory
+    session: f557508d-67e0-4ca3-90ba-d1b9733f05e2
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Session digest renders guard trip as bare template '(turn 3) blocked:' with no matched substring, detail, or explanation following
 - id: entry-cand-20260722-34
   title: Census-verifier agent doesn't know the transcript storage path convention, so it blind-searches the filesystem and repeatedly hits approval gates
   severity: medium
@@ -12679,3 +12691,29 @@ candidates:
     origin_phase: implement
     manifested_phase: implement
     evidence_quote: 'Read call with raw input `{"file_path": "...", "offset": 3500, , "limit": 340}` — double comma indicates elided empty parameter value.'
+- id: cand-20260813-1
+  title: Recon agent fails to locate reconciliation module during file-path verification
+  cause: grep -r 'stranded' over reconciliation source exits with code 2 (file/directory not found or permission denied) when verifying paths for task 4223 (Stage 1 stranded-task heuristic). Task references code locations that either don't exist, are inaccessible, or have been concurrently deleted by machine-operated checkout processes.
+  area: recon system, file prediction, path verification, machine-operated checkout collision
+  first_seen: '2026-08-13'
+  disposition: pending
+  sightings:
+  - date: '2026-08-13'
+    project: dark_factory
+    session: e22ae7be-e7aa-42ff-8f9e-9dd987010720
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: 'Bash({"command": "grep -r \"stranded\" /home/leo/src/dark-factory/fused-memory/src/fused_memory/reconciliation/ --include=\"*.py\" 2>/dev/null"}) -> Exit code 2; session agent_class=recon dispatched to predict files for task 4223 (Stage 1 reconciliation heuristic)'
+- id: cand-20260813-2
+  title: Digest 'User Corrections' bucket captures skill invocations and interrupts
+  cause: Digest extraction pipeline mislabels skill command invocations (/reflect) and request interrupts as corrective feedback, conflating execution events with actual user corrections/feedback
+  area: digest-extraction
+  first_seen: '2026-08-13'
+  disposition: pending
+  sightings:
+  - date: '2026-08-13'
+    project: dark_factory
+    session: 3e39be6d-2c6a-4756-893b-0b58be9834d3
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: session digest 'User Corrections' section lists '(turn 5) <command-message>reflect</command-message> <command-name>/reflect</command-name>' and '(turn 18) [Request interrupted by user]' — neither are corrective feedback; the interrupt also appears separately under 'Interrupts' section, suggesting misclassification or duplication
