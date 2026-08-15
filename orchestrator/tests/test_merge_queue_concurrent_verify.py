@@ -218,13 +218,21 @@ _KNOWN_WAIT_CONSTANTS: dict[str, float] = {
 # budget in loop-responsive time, so its worst-case WALL clock is the nominal
 # `timeout` stretched by RESPONSIVE_WAIT_STRETCH and hard-bounded by
 # RESPONSIVE_WAIT_WALL_CAP.  IMPORTED, not re-derived: the helper computes its
-# own per-call default cap from the very same constant, so this bill is an
-# EXACT upper bound on the helper's behaviour and the two cannot drift.  (An
-# earlier revision re-derived the ratio here while the helper used a flat 90s
-# default; that under-counted every small-nominal site — the reviewer finding
-# on esc-3980-3.)  Fixing the ratio at 2 is what lets a reviewer check the
-# paired-mark arithmetic instead of trusting a number: the worst per-method
-# budget in test_merge_speculation.py is 125s, and 125 x 2 = 250s still clears
+# own per-call default cap from the very same constant, so the RATIO cannot
+# drift and this bill is an exact upper bound for any site that leaves
+# `max_wall_s` at its default.  (An earlier revision re-derived the ratio here
+# while the helper used a flat 90s default; that under-counted every
+# small-nominal site — the reviewer finding on esc-3980-3.)  The exactness is
+# NOT unconditional: an explicit `max_wall_s=` wins over the scaled default
+# inside the helper and the branch below does not scan for it, so such a site
+# would be under-billed.  No scanned late-arrival site passes `max_wall_s`
+# (only the hermetic unit tests do, and they carry no mark obligation), so the
+# claim holds over the audited corpus today — closing that gap structurally is
+# tracked as follow-up.  Fixing the ratio at 2 is what lets a reviewer check
+# the paired-mark arithmetic instead of trusting a number: the worst
+# per-method budget in test_merge_speculation.py is 125s nominal
+# (TestLateArrivalCleanCAS / TestLateArrivalSubmissionOrderCAS /
+# TestLateArrivalFailCascade), and 125 x 2 = 250s still clears
 # HEAVY_BARRIER_TEST_TIMEOUT (300s).
 _RESPONSIVE_WAIT_STRETCH = RESPONSIVE_WAIT_STRETCH
 
@@ -285,9 +293,11 @@ def _call_wait_budget(call: ast.Call) -> float:
         # task 3980: the nominal `timeout` is charged in loop-responsive
         # time, so real wall clock can run past it under starvation. Bill
         # the stretched worst case, hard-bounded by the wall cap the helper
-        # itself enforces -- a wait_responsive call can NEVER consume more
-        # wall clock than RESPONSIVE_WAIT_WALL_CAP, whatever its nominal
-        # budget.
+        # itself enforces -- a wait_responsive call that leaves `max_wall_s`
+        # at its default can never consume more wall clock than
+        # RESPONSIVE_WAIT_WALL_CAP, whatever its nominal budget.  A site
+        # passing an explicit `max_wall_s` is NOT covered by that bound and is
+        # not scanned here; see the RESPONSIVE_WAIT_STRETCH comment above.
         nominal = _KNOWN_WAIT_CONSTANTS['MERGE_RESULT_TIMEOUT']
         for kw in call.keywords:
             if kw.arg == 'timeout':

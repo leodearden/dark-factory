@@ -2480,7 +2480,7 @@ class TestLateArrivalCleanCAS:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: worst per-method wait budget 105s, x2 stretched
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: worst per-method wait budget 125s, x2 stretched
 class TestLateArrivalFailCascade:
     """Step-5 RED→GREEN — predecessor failing invalidates the late arrival (DONE-WHEN 4).
 
@@ -3811,8 +3811,10 @@ class TestTimeoutMarkCoverage:
     test_merge_queue_concurrent_verify.py, but hard-scoped it to that file's
     own ``Path(__file__)`` -- so THIS module, which carries the merge-spec
     late-arrival block, was never covered despite having five classes whose
-    worst-case per-method budget is 105s-125s against a 60s pyproject default
-    and ZERO ``@pytest.mark.timeout`` marks anywhere in the file.
+    worst-case per-method budget was then 105s-125s nominal against a 60s
+    pyproject default and ZERO ``@pytest.mark.timeout`` marks anywhere in the
+    file.  (Those are the step-3 figures; step-6's migration raised the
+    nominal range to 110s-125s, i.e. 215s-245s as the auditor now bills it.)
 
     The helpers are IMPORTED from test_merge_queue_concurrent_verify rather
     than reimplemented: they are deliberately pure (source text in, offender
@@ -3828,7 +3830,8 @@ class TestTimeoutMarkCoverage:
     ceiling. The helper computes its own default cap from that SAME formula
     (esc-3980-3 reviewer finding: a flat default made this bill an
     under-count for every small-nominal site), so the scan is an exact upper
-    bound on real wall clock. That stretch is why this guard has to exist BEFORE any wait in
+    bound on real wall clock for every site that leaves ``max_wall_s`` at its
+    default -- which is every scanned site in this file. That stretch is why this guard has to exist BEFORE any wait in
     this file is migrated: a stretched wait under an inadequate mark is
     strictly worse than the flake it fixes.
     """
@@ -3842,6 +3845,15 @@ class TestTimeoutMarkCoverage:
         mark at all -- TestLateArrivalCleanCAS 125s,
         TestLateArrivalSubmissionOrderCAS 125s, TestLateArrivalAttaches 110s,
         TestLateArrivalGuards 110s, TestLateArrivalFailCascade 105s.
+
+        Those are the NOMINAL step-3 figures, kept as the historical record of
+        what made this guard go red; do not read them as current.  Step-6's
+        migration to ``wait_responsive`` raised FailCascade to 125s nominal
+        (it replaced that method's ``timeout=25.0`` with
+        MERGE_RESULT_TIMEOUT), and ``_call_wait_budget`` now bills every
+        ``wait_responsive`` site stretched, so recomputing today yields
+        215/245/245/215/245 against the 300s marks.  The assertion below
+        recomputes from source rather than from any number written here.
         """
         source = Path(__file__).read_text()
         budgets = _worst_per_method_wait_budget(source)
