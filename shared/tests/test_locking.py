@@ -227,6 +227,47 @@ _EXTENSIONLESS_ACCEPT_PATHS = [
     'scripts/cargo-audit-orphans',
 ]
 
+# ---------------------------------------------------------------------------
+# _resolve_reify_checkout — marker-bound adapter over `shared.reify_checkout`,
+# the single source of layout-independent reify-checkout discovery AND of the
+# skip wording that goes with it (established by task 3843 in the γ suite,
+# fused-memory/tests/test_lock_charter_guard.py, and promoted to shared/ by
+# task 3978 so orchestrator's scripts/verify.sh gate resolves through the same
+# walk).  Feeds the module-level constants below once they are rewired to it.
+# ---------------------------------------------------------------------------
+
+_REIFY_GUARD_RELPATH = Path('scripts') / 'lock-charter-guard.sh'
+
+
+def _resolve_reify_checkout(start: Path | None = None) -> reify_checkout.ReifyCheckout:
+    """Locate the reify checkout carrying THIS module's guard script.
+
+    Marker-bound adapter over the shared single source.  Every semantic —
+    discovery order, REIFY_ROOT precedence, the measured worktree-vs-bare-
+    checkout evidence table (and why "change parents[5] to parents[3]" is a
+    REGRESSION rather than a fix), and why an override absent on disk is
+    honored VERBATIM — lives in `shared.reify_checkout.resolve_reify_checkout`.
+    Do not restate or re-derive them here, and do not reintroduce a local copy
+    of the ancestor walk.
+
+    Returns the shared `ReifyCheckout` — root AND provenance — rather than a
+    bare path, so the skip reason is formatted from the very resolution that
+    produced the root, instead of re-deriving provenance separately and
+    risking the two disagreeing.
+
+    *start* defaults to THIS file, and that default belongs here rather than
+    in the shared helper: the walk has to begin at the CALL SITE, and shared's
+    own ``__file__`` would start it in ``shared/src/shared/`` instead of here.
+    """
+    # Called through the module attribute on purpose: the delegation pin in
+    # TestReifyCheckoutAdapter patches `reify_checkout.resolve_reify_checkout`,
+    # which a `from ... import resolve_reify_checkout` binding would put out of
+    # its reach.
+    return reify_checkout.resolve_reify_checkout(
+        _REIFY_GUARD_RELPATH, start=start or Path(__file__)
+    )
+
+
 # Repo roots for the tracked-corpus self-audit sweep.  dark-factory is resolved
 # from this file (works in a worktree too: <root>/shared/tests/ -> parents[2]);
 # reify is a sibling under the same src/ directory.  Same resolution the γ suite
