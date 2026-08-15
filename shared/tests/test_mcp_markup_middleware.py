@@ -2458,3 +2458,66 @@ class TestB14RequiredParameterAbsorptionFromCorpus:
         assert isinstance(payload['repaired_call']['where'], str)
         assert payload['repaired_call']['where']
         assert h.recorder.calls == []
+
+
+class TestB14OrderingDependsOnStrictInputValidationBeingOff:
+    """The one configuration that INVERTS the ordering, pinned as code.
+
+    B14's negative half. With ``strict_input_validation`` on,
+    ``mixins/mcp_operations.py:77`` registers the SDK handler with
+    ``validate_input=True``, and ``mcp/server/lowlevel/server.py:528-532`` then
+    jsonschema-validates against ``tool.inputSchema`` and returns an error
+    result BEFORE FastMCP's handler is ever invoked — so the middleware chain is
+    never entered at all.
+
+    Same input, both halves: the specimen the class above repairs is here
+    SILENTLY UNREPAIRABLE. No ``markup_detected`` fact is emitted, no storm is
+    counted, and the leak becomes invisible to every consumer downstream — the
+    exact silent fail-soft this guard exists to end.
+
+    Not hypothetical. The flag is settable three ways — the ``FastMCP(...)``
+    constructor kwarg, the global settings object, and the
+    ``FASTMCP_STRICT_INPUT_VALIDATION`` environment variable — so one variable
+    would disable required-parameter repair across all four of task 3690's
+    registration sites at once. A dependency that load-bearing and that easy to
+    flip has to fail a test, not merely contradict a docstring.
+    """
+
+    def test_the_default_is_off(self):
+        """Fails loudly if a future fastmcp upgrade flips the default.
+
+        Measured on fastmcp 3.2.2: the constructor resolves the flag to an
+        INSTANCE attribute (``server.py:371-374``), falling back to
+        ``fastmcp.settings.strict_input_validation``, whose default is False
+        (``settings.py:297-311``). Asserted on the instance because that is what
+        a registration site actually gets.
+        """
+        assert not FastMCP('probe').strict_input_validation
+
+    @BOTH_POLICIES
+    async def test_turning_it_on_bypasses_the_guard_entirely(self, policy):
+        """Tier-independent — the bypass is a property of the framework.
+
+        Showing it under both tiers is what makes this a containment statement
+        rather than a quirk of one path.
+        """
+        h = build_harness(policy, strict_input_validation=True)
+
+        with pytest.raises(ToolError) as excinfo:
+            await h.call(
+                'add_memory_strict',
+                {'content': TestB14RequiredParameterAbsorption.CONTENT},
+            )
+
+        text = str(excinfo.value)
+        assert 'project_id' in text, text
+        assert 'validation' in text.lower(), (
+            'the caller must be getting an INPUT-VALIDATION rejection, not the '
+            f'guard\'s own markup error: {text}'
+        )
+        assert h.recorder.calls == []
+        assert h.facts == [], (
+            'the middleware never ran, so nothing observed the leak — this '
+            'empty list IS the finding, not an incidental assertion'
+        )
+        assert h.escalations == []
