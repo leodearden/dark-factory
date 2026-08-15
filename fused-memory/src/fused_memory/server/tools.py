@@ -4823,6 +4823,68 @@ def create_mcp_server(
                     'to': canonical_id,
                 })
 
+            # (5c) THE DELETE IS EARNED, NOT ASSUMED. Three distinct ways the
+            # re-homing can fail to be PROVEN complete, and any one of them
+            # refuses this id's delete:
+            #
+            #   a patch was refused        -> a child is knowably still here
+            #   the listing was truncated  -> a set we could not fully SEE is
+            #                                 a set we cannot prove we moved
+            #   the live re-count is > 0   -> every patch said success and a
+            #                                 child stayed put anyway
+            #
+            # The third is why the patch return values cannot be the
+            # evidence: corroborate-after-acting, the same discipline 3197's
+            # cascade applies to its own child deletes. It costs one count
+            # and is paid ONLY when there was something to move — a parent
+            # the scan found childless has nothing that could have failed to
+            # move, and re-counting would re-ask the same question in the
+            # same instant.
+            #
+            # THIS IS THE ONE PLACE THIS OP COULD HAVE BECOME THE CALLER THAT
+            # ROUTES AROUND `ParentHasChildrenError`, AND DELIBERATELY DOES
+            # NOT. Forcing the delete with `cascade=True` would DESTROY the
+            # children this whole path exists to preserve, converting a
+            # reported, recoverable refusal into permanent data loss. The
+            # refusal keeps the supersede alive and NAMED, which a caller can
+            # fix; a cascade could not be undone by anyone.
+            blockers: list[str] = []
+            if stranded_children:
+                blockers.append(
+                    'these children could not be re-homed: '
+                    + ', '.join(stranded_children)
+                )
+            if scan.truncated:
+                # "at least" is load-bearing: the scan was capped, so the
+                # count is a FLOOR. Reporting it bare would read as
+                # exhaustive — the overclaim this op exists to eliminate.
+                blockers.append(
+                    f'the child listing was truncated at least {len(scan.ids)} '
+                    'child(ren) in, so the full set could not be seen'
+                )
+            elif moved_children:
+                still_here = await memory_service.count_memories_by_metadata(
+                    project_id=project_id, filters={'parent_id': supersede_id}
+                )
+                if still_here:
+                    blockers.append(
+                        f'{still_here} child(ren) still name it as parent after '
+                        'every re-home patch reported success'
+                    )
+            if blockers:
+                # Reported like any other undone delete — in `failed_deletes`
+                # for what did not happen and why, and picked up by the
+                # survivors re-read for what is still in the corpus.
+                failed_deletes.append({
+                    'id': supersede_id,
+                    'error': (
+                        f'refused to delete {supersede_id}: deleting it would '
+                        'orphan its children — ' + '; '.join(blockers)
+                    ),
+                    'error_type': 'ReparentIncomplete',
+                })
+                continue
+
             try:
                 await memory_service.delete_memory(
                     memory_id=supersede_id,
