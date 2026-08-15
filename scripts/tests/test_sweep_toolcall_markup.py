@@ -1612,3 +1612,201 @@ def test_a_write_failure_exits_2_names_the_path_and_does_not_abort(sweep_root, c
     # ...and the sweep carried on to the other lane.
     plan = json.loads(plan_path.read_text(encoding='utf-8'))
     assert detect(plan['design_decisions'][0]['rationale']) is None, 'others repaired'
+
+
+# ---------------------------------------------------------------------------
+# step-21 — outcome accumulation across the convergence rounds.
+#
+# The two outcome classes have genuinely different arity semantics, and the
+# blanket ``outcomes.extend(round_outcomes)`` conflated them. A REPAIRED
+# outcome records work APPLIED in that round — cumulative. A REFUSED outcome is
+# a pure function of the CURRENT document state, re-derived from scratch on
+# every pass: a string that refuses in round 1 is still present and still
+# refuses in round 2, so extending across rounds emits it once PER ROUND.
+#
+# The harm is operator-facing, not cosmetic: the residue counts ARE the
+# human-adjudication queue this report exists to produce, so an inflated count
+# is a corrupted report. Worse, the inflation is ASYMMETRIC between runs — a
+# document that mixes repairs with refusals loops twice on run 1 and only once
+# on run 2, so an operator diffing the two runs sees residue DROP with no
+# repair to explain it, reading as if unrepairable residue had been silently
+# fixed.
+#
+# Every count pinned below was MEASURED against the committed code before these
+# tests were written, not derived from reading it.
+# ---------------------------------------------------------------------------
+
+
+def _mixed_record(esc_id: str = 'esc-mix-1') -> dict:
+    """One repairable ``detail`` plus one prose-quoting ``summary``.
+
+    The minimal document that exercises the bug: it must mix a repair (so the
+    loop runs a second round at all) with a refusal (so that refusal is
+    re-derived on the second pass). ``summary`` sorts BEFORE ``detail`` in the
+    live record's key order, so the buggy accumulation emits it, then the
+    repair, then it again.
+    """
+    return make_escalation(
+        esc_id,
+        'resolved',
+        _swallowed_echo('The intended detail.', 'detail', 'suggested_action', 'Do the thing.'),
+        summary='The agent emitted ' + _closer('description') + ' and lost an argument.',
+    )
+
+
+def test_a_refusal_is_not_duplicated_across_convergence_rounds():
+    """Case (a): the unit-level reproduction.
+
+    MEASURED against the committed code, this document returned
+    ``[('summary', 'refused'), ('detail', 'repaired'), ('summary', 'refused')]``
+    — three outcomes for a document holding exactly two flagged strings.
+
+    The ``== 1`` is deliberate and load-bearing: ``>= 1`` would pass on the
+    buggy code, which is precisely the assertion that would have let this ship.
+    """
+    record = _mixed_record()
+
+    _repaired, outcomes = sweep.repair_document(record)
+
+    pairs = [(o.field, o.action) for o in outcomes]
+    assert len(pairs) == 2, f'one outcome per flagged string, got {pairs}'
+    assert pairs.count(('summary', sweep.ACTION_REFUSED)) == 1, (
+        'the refusal is re-derived every pass; it must be REPORTED once'
+    )
+    assert ('detail', sweep.ACTION_REPAIRED) in pairs
+
+
+def test_the_report_counts_each_flagged_string_exactly_once(tmp_path):
+    """Case (b): end-to-end, with the TRUE counts pinned as literals.
+
+    MEASURED against the committed code, this one-file tree reported
+    ``strings_detected=3, repaired=1, quoted_only=2`` for a document holding 2
+    flagged strings and 1 residue. These are the human-adjudication queue, so
+    the numbers are the contract.
+    """
+    write_escalation(
+        tmp_path / 'data' / 'escalations' / 'esc-mix-1.json', _mixed_record()
+    )
+
+    summary, _diffs = sweep.run_sweep(tmp_path, apply=False)
+
+    assert summary.strings_detected == 2, 'two flagged strings in the document'
+    assert summary.repaired == 1
+    assert summary.quoted_only == 1, 'ONE prose-quoting residue, not two'
+    assert summary.leak_unrepaired == 0
+
+
+def test_residue_counts_are_stable_across_apply_runs(tmp_path):
+    """Case (c): the operator-facing harm — run-to-run diff stability.
+
+    MEASURED against the committed code: ``--apply`` run 1 reported
+    ``strings_detected=3, quoted_only=2`` while run 2 reported
+    ``strings_detected=1, quoted_only=1``. Residue appeared to drop by one with
+    zero repairs in run 2 to explain it — indistinguishable, from the report
+    alone, from unrepairable residue being silently fixed.
+
+    What must hold: the residue counters are IDENTICAL across the two runs (the
+    residue genuinely did not change), and the whole delta in
+    ``strings_detected`` is exactly the repair run 1 applied.
+    """
+    write_escalation(
+        tmp_path / 'data' / 'escalations' / 'esc-mix-1.json', _mixed_record()
+    )
+
+    first, _d1 = sweep.run_sweep(tmp_path, apply=True)
+    second, _d2 = sweep.run_sweep(tmp_path, apply=True)
+
+    assert second.repaired == 0, 'the second run is a no-op: second-run-zero'
+    assert second.quoted_only == first.quoted_only, (
+        'the surviving residue did not change, so its count must not either'
+    )
+    assert second.leak_unrepaired == first.leak_unrepaired
+    # ...and the one number that DOES legitimately move is fully explained by
+    # the repair, so the two reports diff legibly.
+    assert first.strings_detected - first.repaired == second.strings_detected
+
+
+def test_a_refusal_that_only_appears_in_a_later_round_is_still_reported():
+    """Case (d): anti-over-correction — keep the TERMINAL round's refusals.
+
+    The failure mode of a naive "report only round 1" correction. Here the hole
+    (``root_cause``) sorts BEFORE the corrupted field, so the walk has already
+    passed it when round 1's repair lands the nested markup in it: the residue
+    is genuinely invisible until round 2. MEASURED, the outcomes are
+    ``[('detail', 'repaired'), ('root_cause', 'refused')]`` — the refusal
+    appears in NO round but the last.
+
+    This is the nested double-leak shape (cancelled task 3654) that motivates
+    the convergence loop existing at all, so dropping its refusal would make
+    the loop report less than no loop did.
+    """
+    inner = 'rc_text' + _lit('triage_note') + 'tn_text'
+    record = {
+        'id': 'esc-late-1',
+        'status': 'resolved',
+        # The hole is ordered BEFORE the field that will fill it.
+        'root_cause': '',
+        'detail': (
+            'Intended.' + _closer('detail') + '\n' + _lit('root_cause') + inner
+            + _closer('parameter') + '\n' + INVOKE_CLOSER + '\n'
+        ),
+        'summary': 'a one-line summary',
+    }
+
+    repaired, outcomes = sweep.repair_document(record)
+
+    assert repaired['detail'] == 'Intended.'
+    assert repaired['root_cause'] == inner, 'the recovered value still carries markup'
+    assert detect(repaired['root_cause']) is not None, 'so it IS residue'
+
+    pairs = [(o.field, o.action) for o in outcomes]
+    assert pairs.count(('root_cause', sweep.ACTION_REFUSED)) == 1, (
+        'a refusal only visible in the terminal round must still be reported'
+    )
+    assert pairs.count(('detail', sweep.ACTION_REPAIRED)) == 1
+
+
+def test_the_did_not_converge_path_does_not_duplicate_refusals(monkeypatch):
+    """Case (e): the second, easily-missed exit path composes the same way.
+
+    ``repair_document`` returns from inside the loop on convergence and falls
+    through the ``for``/``else`` when the bound is hit. Fixing only the in-loop
+    return would leave the non-convergence branch appending
+    :data:`ACTION_DID_NOT_CONVERGE` to the OLD accumulated list, silently
+    keeping the duplicate-refusal bug on exactly the path that already means
+    something has gone wrong.
+
+    Stubbed like :func:`test_a_non_converging_document_reports_did_not_converge`
+    — no real document can reach the bound (B5 refuses a nested parse) — but
+    this stub also REFUSES one field, so the run has refusals to duplicate.
+    """
+    def _repairs_detail_only(value, param, schema_params, supplied):
+        if param != 'detail':
+            return None
+        return sweep.Repair(
+            clean_value=value,
+            recovered={'root_cause': 'restored by the stub'},
+            pattern=INVOKE_CLOSER,
+            misclose=INVOKE_CLOSER,
+        )
+
+    monkeypatch.setattr(sweep, 'repair', _repairs_detail_only)
+    record = make_escalation(
+        'esc-8-3',
+        'resolved',
+        'detail ' + INVOKE_CLOSER,
+        summary='The agent emitted ' + _closer('description') + ' and lost an argument.',
+    )
+
+    _repaired, outcomes = sweep.repair_document(record)
+
+    pairs = [(o.field, o.action) for o in outcomes]
+    assert pairs.count(('summary', sweep.ACTION_REFUSED)) == 1, (
+        'the refusal is re-derived on all four rounds; report it ONCE'
+    )
+    assert len([o for o in outcomes if o.action == sweep.ACTION_DID_NOT_CONVERGE]) == 1, (
+        'and the loud non-convergence outcome survives the partition'
+    )
+    assert len([o for o in outcomes if o.action == sweep.ACTION_REPAIRED]) == (
+        sweep._MAX_REPAIR_ROUNDS
+    ), 'repairs still ACCUMULATE across rounds — one per round'
