@@ -645,7 +645,7 @@ class _FakeGraph:
 def _episode_row(
     uuid: str = 'ep-1',
     name: str = 'episode',
-    group_id: str = 'reify',
+    group_id: str | None = 'reify',
     source_description: str = 'add_memory:temporal_facts',
     created_at: str = '2026-07-26T00:00:00Z',
     content: str = ESC_3085_1_INSTANCE_1,
@@ -717,6 +717,29 @@ class TestEpisodeReader:
         await EpisodeReader(graph=graph).fetch_population(limit=2)
         query, _params = graph.queries[0]
         assert 'LIMIT 2' in query
+
+    async def test_fetch_population_stamps_the_graph_it_queried(self) -> None:
+        """``graph_name`` and ``project_id`` are two DIFFERENT facts.
+
+        ``graph_name`` is WHICH GRAPH WAS QUERIED (the ``--project`` value);
+        ``project_id`` is the record's own Graphiti ``group_id``. They coincide
+        for most rows and diverge for exactly the rows the edge lookup used to
+        lose, so neither may overwrite the other.
+        """
+        graph = _FakeGraph(rows=[_episode_row(group_id='know_live')])
+        reader = EpisodeReader(graph=graph, graph_name='dark_factory')
+        records = await reader.fetch_population()
+        assert len(records) == 1
+        assert records[0].graph_name == 'dark_factory'
+        assert records[0].project_id == 'know_live'
+
+    async def test_null_group_id_still_falls_back_to_graph_name(self) -> None:
+        """The pre-existing fallback survives the new field."""
+        graph = _FakeGraph(rows=[_episode_row(group_id=None)])
+        reader = EpisodeReader(graph=graph, graph_name='dark_factory')
+        records = await reader.fetch_population()
+        assert records[0].project_id == 'dark_factory'
+        assert records[0].graph_name == 'dark_factory'
 
     async def test_reader_constructs_no_graphiti_driver(self) -> None:
         """graphiti_core's FalkorDriver.__init__ fire-and-forgets
@@ -920,3 +943,80 @@ class TestRunEndToEnd:
         assert report['summary']['unverifiable'] == 1
         assert [f['status'] for f in report['findings']] == ['mismatch']
         assert report['truncated_by']['withheld'] == 1
+
+
+@pytest.mark.asyncio
+class TestDerivedEdgeLookupKeying:
+    """The derived-edge reader is looked up by the GRAPH THAT WAS SWEPT.
+
+    A graph legitimately holds episodes whose ``group_id`` differs from the
+    graph name — the committed pre-fix report.json shows 15 such findings under
+    ``know_live`` / ``knowlive`` / ``solar_challenge_platform``, every one of
+    them carrying ``derived_edge_uuids: []``. Those episodes were never queried
+    at all: the lookup was keyed on the record's ``project_id`` against a dict
+    keyed by ``--project`` graph names, so it silently resolved to no reader and
+    the miss serialized as a measured zero.
+    """
+
+    async def _run_capture(
+        self,
+        capsys,
+        reader: object,
+        probes: object,
+        **arg_overrides: object,
+    ) -> tuple[int, dict[str, Any] | None]:
+        code = await _run(
+            _args(project=['dark_factory'], **arg_overrides),
+            reader_factory=lambda project: reader,
+            probes=probes,
+        )
+        out = capsys.readouterr().out
+        return code, (json.loads(out) if out.strip() else None)
+
+    async def test_foreign_group_id_episode_is_still_queried_for_edges(
+        self, capsys
+    ) -> None:
+        """The regression: fetch_derived_edges was not called AT ALL."""
+        episode = '02090224-7bc9-4485-9291-6748e1042ac9'
+        edge = '7dbf12cf-9251-4674-b396-8eefdf651d1c'
+        reader = _FakeReader(
+            [
+                _record(
+                    uuid=episode,
+                    text=ESC_3085_1_INSTANCE_1,
+                    project_id='know_live',
+                    graph_name='dark_factory',
+                )
+            ],
+            edges={episode: (edge,)},
+        )
+        _code, report = await self._run_capture(
+            capsys, reader, _probes(task_status='in-progress')
+        )
+        assert reader.edge_lookups == [episode]
+        assert report is not None
+        assert report['findings'][0]['derived_edge_uuids'] == [edge]
+
+    async def test_report_row_names_both_the_graph_and_the_group(
+        self, capsys
+    ) -> None:
+        """Two distinct facts, both reported; ``by_project`` keeps meaning the
+        record's own claimed project, which investigation.md already uses."""
+        reader = _FakeReader(
+            [
+                _record(
+                    uuid='ep-1',
+                    text=ESC_3085_1_INSTANCE_1,
+                    project_id='know_live',
+                    graph_name='dark_factory',
+                )
+            ],
+        )
+        _code, report = await self._run_capture(
+            capsys, reader, _probes(task_status='in-progress')
+        )
+        assert report is not None
+        finding = report['findings'][0]
+        assert finding['project_id'] == 'know_live'
+        assert finding['graph_name'] == 'dark_factory'
+        assert report['summary']['by_project'] == {'know_live': 1}
