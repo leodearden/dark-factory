@@ -107,7 +107,31 @@ Phase enum everywhere: `prd | decompose | architect | implement | verify | revie
 
 ### 7.2 Digest (extractor output)
 
-One markdown file per session: YAML frontmatter `{session, cwd, encoded_dir, agent_class, date, size_bytes, score, signal_counts: {tool_error, self_correct, not_found, df_guard, interrupt}}` + sections: user turns (non-sidechain), error neighborhoods (is_error tool_result + preceding attempt), self-corrections with context, retry loops. Soft cap 15KB (truncate lowest-signal sections last).
+One markdown file per session: YAML frontmatter `{session, cwd, encoded_dir, agent_class, date, size_bytes, score, instrument_version, signal_counts: {tool_error, self_correct, not_found, df_guard, interrupt, designed_outcome}}` + sections: user turns (non-sidechain), error neighborhoods (is_error tool_result + preceding attempt, genuine failures only), self-corrections with context, retry loops, designed outcomes. Soft cap 15KB (truncate lowest-signal sections last).
+
+`instrument_version` and `designed_outcome` are **appended last** to their respective key lists, so the pre-existing prefix order stays byte-stable for anything diffing rendered frontmatter.
+
+#### 7.2.1 Designed outcomes (task 3610)
+
+Not every `is_error` tool_result is a failure. A **designed outcome** is a machine-recognisable non-failure that the harness produces on purpose, and it is tallied and rendered **separately** from genuine `tool_error`s:
+
+- **Self-declared** — `WATCHER_REARM_OUTCOME: CEILING|FIRED` (`scripts/watcher-rearm.sh:228-237`). Only those two. `KILLED` and `ERROR` remain genuine `tool_error`s: the shell contract classes them as real failures, and suppressing all four because they share a marker token would trade one over-count for an under-count and hide genuine watcher breakage.
+- **Bare exit 124** — `timeout(1)`'s ceiling exit with no declaration, i.e. the bounded-wait shape.
+
+Designed outcomes are **reported but unweighted**: `signal_counts.designed_outcome` carries the count, but `SIGNAL_WEIGHTS` deliberately has no entry for it, so a designed outcome contributes **zero** to the confusion score and cannot lift a session's sampling rank. `sampling.py`'s parallel `SignalCounts.total_signal` likewise excludes it. The genuine/designed split is a **total, lossless partition** of the `is_error` neighborhoods, so `tool_error + designed_outcome` still equals the number of structured errors. Both digest sections surface the exit code as a structured `[exit N]` marker, so a bare 124 stays distinguishable to a human reader even when the error prose is byte-truncated.
+
+Motivation: `plans/confusion-census-2026-07-31.md:97` (cluster 1.3) found session `a189558e` reporting 4 `tool_error`s of which 3 were benign ceilings, burying the single genuine exit-2 failure.
+
+#### 7.2.2 Instrument provenance (task 3610)
+
+`instrument_version` is a monotonically bumped integer recording **which generation of the instrument produced a given digest**. Bump it whenever a signal detector or the gold-turn filter changes *semantics* — i.e. whenever the same transcript would now yield different `signal_counts`, a different gold section, or a different section partition. Pure refactors, renderer cosmetics and new frontmatter keys do not bump it.
+
+- **1** — the implicit pre-3610 baseline, **never emitted**. An **absent** `instrument_version` key is the normative "this digest predates task 3610's filter change" marker. There is no sentinel value and no backfill: digests are rendered on demand and cached only in-process, so there is no persisted corpus to migrate.
+- **2** — the relaxed anchor+corroborator briefing filter plus the genuine/designed error split.
+
+This is the pre-fix-trace vs live-regression discriminator that `plans/confusion-census-2026-07-31.md:151` (§6) asked the next census for.
+
+**07-31 census R1–R3 (`plans/confusion-census-2026-07-31.md:129-135`)**: R3 (exit-code / designed-outcome awareness) is discharged here, together with the R6 gold-turn filter relaxation. **R1** (pasted-report-content and mid-field truncation marking) and **R2** (`n_user_turns` frontmatter itemization) remain **open** and are tracked under a separate low-priority follow-up — they are named in task 3610's title but absent from its FIX list, so they were deliberately not folded in here.
 
 ### 7.3 Coding record (coder output → merger input)
 
