@@ -744,6 +744,21 @@ def _index_escalations(
     which is exactly why the issue names BOTH ids: the operator can see the
     colliding pair without depending on which one won.
 
+    The loser is deliberately NOT carried into ``unmatched_escalations``,
+    unlike the unfingerprinted case below — this is intentional, not an
+    oversight.  It is not unreachable from the payload the way an unnamed drop
+    would be: the issue above already names BOTH ids, so the operator can see
+    the colliding pair without a second list.  And carrying it could assert a
+    FALSEHOOD — the loser shares the winner's fingerprint, so if a metric row
+    claims that fingerprint the loser IS explained, and listing it under
+    ``no_matching_verdict`` would fire the parity signal on a fully-explained
+    escalation, exactly the failure :func:`_unmatched_projection`'s reason
+    vocabulary exists to prevent.  If no row claims the fingerprint, the winner
+    already lands in ``unmatched_escalations`` under it, so the fact is
+    surfaced either way.  The unfingerprinted case below is genuinely
+    different: it can never join ANY row and has no sibling record carrying
+    its signal, which is why it alone is both named and carried.
+
     An OPEN record whose ``dedupe_fingerprint`` is absent or not a string is
     the last place a live alarm could leave this payload: it cannot key the
     index, and ``unmatched_escalations`` is derived FROM the index, so a bare
