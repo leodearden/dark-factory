@@ -27,7 +27,7 @@ plans/evidence/scheduler-scoring-2026-08-06/PARKING_MODEL_REPORT.md
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -37,8 +37,28 @@ from orchestrator.scheduler import Scheduler
 FIXED_DT = datetime(2026, 8, 1, 0, 0, 0, tzinfo=UTC)
 
 
-def _make_scheduler(**config_overrides) -> Scheduler:
-    """A bare Scheduler on a frozen wall clock.
+class _Clock:
+    """A SETTABLE wall clock, shared by the Scheduler and its lock table.
+
+    ``Scheduler`` passes its ``_wall_now`` down to the ``ModuleLockTable``, so
+    one instance drives both park install stamps and hold elapsed times —
+    which is exactly the coupling production has, and the reason park age can
+    be driven without poking ``_park_install_at``.
+
+    Tests set ``.now`` directly rather than only advancing it: several install
+    a park in the PAST and then return to ``FIXED_DT``, so the park has a
+    chosen age while every other timestamp stays at the same reference.
+    """
+
+    def __init__(self, now: datetime = FIXED_DT) -> None:
+        self.now = now
+
+    def __call__(self) -> datetime:
+        return self.now
+
+
+def _make_scheduler(*, clock: _Clock | None = None, **config_overrides) -> Scheduler:
+    """A bare Scheduler on a frozen (or caller-driven) wall clock.
 
     ``max_per_module=1`` matches the shape the parking model measured (one
     holder per module), and the frozen clock makes park age and realized hold
@@ -47,7 +67,7 @@ def _make_scheduler(**config_overrides) -> Scheduler:
     all, and overriding it must not raise a duplicate-kwarg TypeError.
     """
     config = OrchestratorConfig(**{'max_per_module': 1, **config_overrides})
-    return Scheduler(config, wall_time_source=lambda: FIXED_DT)
+    return Scheduler(config, wall_time_source=clock or (lambda: FIXED_DT))
 
 
 def _task(task_id: str, files: list[str]) -> dict:
@@ -93,7 +113,7 @@ def _hold(
         f'{holder} could not take {modules} — test setup is wrong, not the code'
     )
     scheduler._hold_history.observe_acquired(
-        holder, modules, at=FIXED_DT.timestamp() - elapsed
+        holder, modules, at=scheduler._wall_now().timestamp() - elapsed
     )
 
 
@@ -293,3 +313,347 @@ def test_module_held_by_two_takes_the_soonest_holders_remaining():
         'mod-a': ['h-slow', 'h-soon'],  # sorted by id, not by remaining
     }, 'setup guard: the module must actually be AT its limit of 2'
     assert scheduler._provable_assembly_delay('p') == pytest.approx(300.0)
+
+
+# ===========================================================================
+# _backfill_admission — C7's predicate as a truth table
+# ===========================================================================
+#
+# A PURE DECISION: returns a grant on admit, None on refuse, and mutates
+# nothing.  The acquisition it enables still goes through try_acquire under
+# the lock (INV-3), so a wrong "admit" costs a failed acquire, never a
+# double-held module.
+#
+# The standard shape every case below perturbs exactly one clause of:
+#
+#     h  holds  GAP_MODULE           (predicted median 1000s, elapsed 100s
+#                                     -> 900s provably left)
+#     p  parked on [c's module, GAP_MODULE], installed 60s ago
+#     c  wants its own module, blocked ONLY by p's park, module median 100s
+#
+#     bound = 100 * 2.5 = 250  <=  gap = 900   -> ADMIT
+#
+# Every figure is exact: odd-length synthetic windows give integral medians,
+# and the elapsed times are literals.
+
+CANDIDATE_FILES = ['pkg_c/src/pkg_c/thing.py']
+GAP_MODULES = ['gapmod/src/gapmod/held.py']
+CANDIDATE_SPANS = (50.0, 100.0, 150.0)      # median 100.0
+GAP_SPANS = (900.0, 1000.0, 1100.0)         # median 1000.0
+
+
+def _park_blocked_candidate(
+    scheduler: Scheduler,
+    clock: _Clock,
+    *,
+    candidate_spans: tuple[float, ...] = CANDIDATE_SPANS,
+    gap_spans: tuple[float, ...] = GAP_SPANS,
+    gap_elapsed: float | None = 100.0,
+    park_age: float = 60.0,
+    owner: str = 'p',
+) -> tuple[dict, list[str]]:
+    """Build the standard C7 shape; return the candidate ``(task, modules)``.
+
+    ``gap_elapsed=None`` means NOBODY holds the gap module, so *owner* can
+    assemble right now and has no gap to lend.
+
+    Order matters and is production's order: the holder takes its lock BEFORE
+    any park exists (a park blocks a foreign acquire), and the park is stamped
+    by winding the shared clock back ``park_age`` seconds and forward again,
+    so the age comes from the real ``install_parks`` stamping seam rather than
+    from poking ``_park_install_at``.
+    """
+    task = _task('c', CANDIDATE_FILES)
+    modules = scheduler._get_modules(task)
+
+    if gap_elapsed is not None:
+        assert scheduler.lock_table.try_acquire('h', GAP_MODULES), (
+            'setup: the gap holder must take its lock before any park exists'
+        )
+
+    clock.now = FIXED_DT - timedelta(seconds=park_age)
+    scheduler.lock_table.install_parks(owner, modules + GAP_MODULES, 'medium')
+    clock.now = FIXED_DT
+
+    if candidate_spans:
+        _feed_spans(scheduler, modules, list(candidate_spans))
+    if gap_spans:
+        _feed_spans(scheduler, GAP_MODULES, list(gap_spans))
+    if gap_elapsed is not None:
+        scheduler._hold_history.observe_acquired(
+            'h', GAP_MODULES, at=FIXED_DT.timestamp() - gap_elapsed
+        )
+    return task, modules
+
+
+# --- Admits ---------------------------------------------------------------
+
+
+def test_ordinary_admit_returns_a_grant_carrying_every_admission_fact():
+    """The happy path, and the full grant payload (INV-2).
+
+    predicted AND the bound it was compared against are both on the record,
+    so the later overstay settlement can say WHY a hold was a breach without
+    anyone reconstructing the arithmetic from log lines.
+    """
+    clock = _Clock()
+    scheduler = _make_scheduler(clock=clock)
+    task, modules = _park_blocked_candidate(scheduler, clock)
+    parks_before = scheduler.lock_table.snapshot_parks()
+
+    grant = scheduler._backfill_admission('c', task, modules)
+
+    assert grant is not None
+    assert grant.task_id == 'c'
+    assert grant.modules == tuple(modules)
+    assert grant.park_owners == ('p',)
+    assert grant.predicted_hold == pytest.approx(100.0)
+    assert grant.safety_factor == pytest.approx(2.5)
+    assert grant.admission_bound == pytest.approx(250.0)
+    assert grant.provable_assembly_delay == pytest.approx(900.0)
+    assert grant.granted_at == 0.0, (
+        'granted_at is stamped at DISPATCH, not at admission: admission is a '
+        'pure decision that try_acquire may still discard'
+    )
+    # Pure decision — no state moved.
+    assert scheduler.lock_table.snapshot_parks() == parks_before
+    # snapshot_holders is {module: task_id}, so the candidate is looked for
+    # among the VALUES.
+    assert 'c' not in scheduler.lock_table.snapshot_holders().values(), (
+        'admission decides; try_acquire is what actually takes the lock'
+    )
+
+
+def test_bound_exactly_equal_to_the_gap_admits():
+    """C7's operator is ``<=``: meeting the gap exactly is an admit.
+
+    An off-by-one to ``<`` here would be invisible in production — it would
+    just look like slightly fewer backfills — so the equality case gets its
+    own test rather than riding along with the ordinary admit.
+    """
+    clock = _Clock()
+    scheduler = _make_scheduler(clock=clock)
+    # 1000 - 750 = 250 left, and the bound is 100 * 2.5 = 250.
+    task, modules = _park_blocked_candidate(scheduler, clock, gap_elapsed=750.0)
+
+    grant = scheduler._backfill_admission('c', task, modules)
+
+    assert grant is not None
+    assert grant.admission_bound == pytest.approx(grant.provable_assembly_delay)
+
+
+def test_park_exactly_at_the_age_cutoff_admits():
+    """``age > cutoff`` refuses, so age == cutoff still admits."""
+    clock = _Clock()
+    scheduler = _make_scheduler(clock=clock)
+    task, modules = _park_blocked_candidate(scheduler, clock, park_age=3600.0)
+
+    assert scheduler._backfill_admission('c', task, modules) is not None
+
+
+def test_the_configured_safety_factor_is_read_not_inlined():
+    """The same scenario admits at 2.5 and refuses at 4.0.
+
+    PRD Open Q3 ships 2.5 and lets production overstay data settle it, which
+    only works if the leaf is actually consulted.  A constant inlined at the
+    comparison would pass every other test in this file.
+    """
+    gap_elapsed = 700.0  # 1000 - 700 = 300 left
+
+    clock_lenient = _Clock()
+    lenient = _make_scheduler(clock=clock_lenient, backfill_safety_factor=2.5)
+    task, modules = _park_blocked_candidate(lenient, clock_lenient, gap_elapsed=gap_elapsed)
+    grant = lenient._backfill_admission('c', task, modules)
+    assert grant is not None, '100 * 2.5 = 250 fits in a 300s gap'
+    assert grant.admission_bound == pytest.approx(250.0)
+
+    clock_strict = _Clock()
+    strict = _make_scheduler(clock=clock_strict, backfill_safety_factor=4.0)
+    task, modules = _park_blocked_candidate(strict, clock_strict, gap_elapsed=gap_elapsed)
+    assert strict._backfill_admission('c', task, modules) is None, (
+        '100 * 4.0 = 400 does NOT fit in the same 300s gap'
+    )
+
+
+# --- Refusals: one named test per clause ----------------------------------
+
+
+def test_refuses_a_candidate_that_is_not_park_blocked_at_all():
+    """Nothing to backfill through → None; the ordinary outcome stands."""
+    clock = _Clock()
+    scheduler = _make_scheduler(clock=clock)
+    task = _task('c', CANDIDATE_FILES)
+    modules = scheduler._get_modules(task)
+    _feed_spans(scheduler, modules, list(CANDIDATE_SPANS))
+
+    assert scheduler._backfill_admission('c', task, modules) is None
+
+
+def test_refuses_a_candidate_blocked_by_a_real_holder_rather_than_a_park():
+    """A HOLDER is not a park.
+
+    Backfill borrows an idle gap in front of a waiting task; it has no answer
+    for a module that is genuinely occupied, and PRD section 7 rejects
+    preempting a held lock outright.
+    """
+    clock = _Clock()
+    scheduler = _make_scheduler(clock=clock)
+    task = _task('c', CANDIDATE_FILES)
+    modules = scheduler._get_modules(task)
+    _feed_spans(scheduler, modules, list(CANDIDATE_SPANS))
+    _hold(scheduler, 'occupier', modules, elapsed=10.0)
+
+    assert not scheduler.lock_table.try_acquire('c', modules), (
+        'setup guard: c must really be blocked, just not by a park'
+    )
+    assert scheduler._backfill_admission('c', task, modules) is None
+
+
+def test_the_kill_switch_refuses_an_otherwise_perfect_admit():
+    """backfill_enabled=False → None even when every other clause passes."""
+    clock = _Clock()
+    scheduler = _make_scheduler(clock=clock, backfill_enabled=False)
+    task, modules = _park_blocked_candidate(scheduler, clock)
+
+    assert scheduler._backfill_admission('c', task, modules) is None
+
+
+def test_an_empty_hold_history_refuses():
+    """PRD: "An empty history must refuse, not admit."
+
+    A predicate that accepts the empty case certifies STRUCTURE (c is blocked
+    by exactly one park) rather than CAPABILITY (c's hold is short enough to
+    fit) — the whole point of the safety factor is lost.
+    """
+    clock = _Clock()
+    scheduler = _make_scheduler(clock=clock)
+    task, modules = _park_blocked_candidate(scheduler, clock, candidate_spans=())
+
+    assert scheduler.predicted_hold(task) is None, (
+        'setup guard: the candidate must have NO samples on its own module'
+    )
+    assert scheduler._backfill_admission('c', task, modules) is None
+
+
+def test_below_the_sample_floor_refuses():
+    """Two samples under the default floor of three → None."""
+    clock = _Clock()
+    scheduler = _make_scheduler(clock=clock)
+    task, modules = _park_blocked_candidate(
+        scheduler, clock, candidate_spans=(50.0, 150.0)
+    )
+
+    assert scheduler.predicted_hold(task) is None
+    assert scheduler._backfill_admission('c', task, modules) is None
+
+
+def test_a_park_older_than_the_cutoff_refuses():
+    """The clause the model demanded by name.
+
+    Without an age cutoff, reify starver 4956 flips from
+    eventually-dispatched to never-dispatched in-window
+    (PARKING_MODEL_REPORT.md:256): a park that keeps being back-filled past
+    is a park that never assembles.
+    """
+    clock = _Clock()
+    scheduler = _make_scheduler(clock=clock)
+    task, modules = _park_blocked_candidate(scheduler, clock, park_age=3601.0)
+
+    assert scheduler._backfill_admission('c', task, modules) is None
+
+
+def test_an_unparseable_park_install_stamp_refuses():
+    """Unknown age must refuse, never read as "brand new".
+
+    park_age_secs answers None here (deliberately unlike the dashboard's
+    display-oriented fail-soft-to-0), and admission must honour it: a soft
+    zero would make a corrupt stamp the most permissive state in the system.
+    """
+    clock = _Clock()
+    scheduler = _make_scheduler(clock=clock)
+    task, modules = _park_blocked_candidate(scheduler, clock)
+    scheduler.lock_table._park_install_at['p'] = 'not-a-timestamp'
+
+    assert scheduler.lock_table.park_age_secs('p', now=FIXED_DT) is None
+    assert scheduler._backfill_admission('c', task, modules) is None
+
+
+def test_a_missing_park_install_stamp_refuses():
+    """Same answer when the stamp is absent rather than corrupt."""
+    clock = _Clock()
+    scheduler = _make_scheduler(clock=clock)
+    task, modules = _park_blocked_candidate(scheduler, clock)
+    del scheduler.lock_table._park_install_at['p']
+
+    assert scheduler.lock_table.park_age_secs('p', now=FIXED_DT) is None
+    assert scheduler._backfill_admission('c', task, modules) is None
+
+
+def test_a_predicted_hold_larger_than_the_gap_refuses():
+    """bound 250 against a 200s gap → None."""
+    clock = _Clock()
+    scheduler = _make_scheduler(clock=clock)
+    # 1000 - 800 = 200 left, under the bound of 100 * 2.5 = 250.
+    task, modules = _park_blocked_candidate(scheduler, clock, gap_elapsed=800.0)
+
+    assert scheduler._provable_assembly_delay('p') == pytest.approx(200.0)
+    assert scheduler._backfill_admission('c', task, modules) is None
+
+
+def test_a_park_waiting_on_nothing_refuses_even_a_tiny_candidate():
+    """No gap to lend → None, however short the candidate's hold.
+
+    p is parked but nothing blocks it, so it assembles on the next tick.  Any
+    borrowed time here comes straight out of p's own dispatch.
+    """
+    clock = _Clock()
+    scheduler = _make_scheduler(clock=clock)
+    task, modules = _park_blocked_candidate(
+        scheduler, clock, candidate_spans=(1.0, 1.0, 1.0), gap_elapsed=None
+    )
+
+    assert scheduler.predicted_hold(task) == pytest.approx(1.0)
+    assert scheduler._provable_assembly_delay('p') == 0.0
+    assert scheduler._backfill_admission('c', task, modules) is None
+
+
+def test_two_blocking_parks_refuse_when_only_one_of_them_qualifies():
+    """Admission is a CONJUNCTION over every blocking park.
+
+    Acquisition has to bypass ALL of them to dispatch, so "find one willing
+    lender" would admit a candidate that then fails to acquire — churn with
+    no dispatch, and a grant event describing a borrow that never happened.
+    """
+
+    def _build(*, with_second_park: bool) -> tuple[Scheduler, dict, list[str]]:
+        clock = _Clock()
+        scheduler = _make_scheduler(clock=clock)
+        task = _task('c', ['pkg_c/src/pkg_c/one.py', 'pkg_c/src/pkg_c/two.py'])
+        modules = scheduler._get_modules(task)
+        assert len(modules) == 2, 'setup: the candidate needs two distinct modules'
+
+        assert scheduler.lock_table.try_acquire('h', GAP_MODULES)
+        # p1 is a model citizen: fresh park, 900s of provable wait.
+        clock.now = FIXED_DT - timedelta(seconds=60.0)
+        scheduler.lock_table.install_parks('p1', [modules[0]] + GAP_MODULES, 'medium')
+        if with_second_park:
+            # p2 fails every clause it can: ancient, and waiting on nothing.
+            clock.now = FIXED_DT - timedelta(seconds=7200.0)
+            scheduler.lock_table.install_parks('p2', [modules[1]], 'medium')
+        clock.now = FIXED_DT
+
+        _feed_spans(scheduler, modules, list(CANDIDATE_SPANS))
+        _feed_spans(scheduler, GAP_MODULES, list(GAP_SPANS))
+        scheduler._hold_history.observe_acquired(
+            'h', GAP_MODULES, at=FIXED_DT.timestamp() - 100.0
+        )
+        return scheduler, task, modules
+
+    both, task, modules = _build(with_second_park=True)
+    assert both.lock_table.park_owners_blocking('c', modules) == ['p1', 'p2']
+    assert both._backfill_admission('c', task, modules) is None
+
+    # Non-vacuity: p1 alone DOES qualify, so the refusal above is the
+    # conjunction talking, not a broken scenario.
+    only_p1, task, modules = _build(with_second_park=False)
+    assert only_p1._backfill_admission('c', task, modules) is not None
