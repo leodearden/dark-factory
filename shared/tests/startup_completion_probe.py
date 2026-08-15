@@ -83,7 +83,11 @@ from shared.cli_invoke import (  # noqa: E402
     count_transcript_turns,
     read_transcript_records,
 )
-from shared.config_dir import TaskConfigDir  # noqa: E402
+from shared.config_dir import (  # noqa: E402
+    CONFIG_DIR_PREFIX,
+    TaskConfigDir,
+    sweep_stale_pid_dirs,
+)
 
 MODES = ('healthy', 'build_wedge', 'uv_wedge', 'mcp_wedge', 'replay')
 
@@ -764,6 +768,71 @@ def _spawn_env(config_dir: Path, oauth_token: str | None) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
+#: Probe config-dir naming, mirroring ``usage_gate``'s pair (task 3086).
+#: ``_PROBE_TASK_ID_PREFIX`` is the task-id stem handed to ``TaskConfigDir``;
+#: ``_PROBE_DIR_PREFIX`` is the resulting on-disk prefix the sweep keys off.
+#: Both the construction site and the sweep build from the same constant, so
+#: the swept prefix and the created names cannot drift apart.  The resulting
+#: name is byte-identical to the one this probe has always written, so nothing
+#: that recorded provenance from an earlier run shifts.
+_PROBE_TASK_ID_PREFIX = 'startup-probe-'
+_PROBE_DIR_PREFIX = CONFIG_DIR_PREFIX + _PROBE_TASK_ID_PREFIX
+
+#: Set once the stale-probe-dir sweep has run in this process.  The sweep
+#: reclaims OTHER (dead) processes' leftovers, so it is a process-wide one-shot:
+#: re-running it per probe re-scans /tmp for no benefit.
+_probe_dir_sweep_done: bool = False
+
+
+def _sweep_stale_probe_dirs_once() -> int:
+    """Reclaim dead-PID probe config dirs left by earlier processes.
+
+    Runs at most once per process.  Returns the number of dirs removed (0 when
+    already swept this process, or on failure).
+
+    The SIGKILL half of config-dir reclamation, and the only half that covers a
+    hard kill: ``cleanup_at_exit`` handles a clean exit and ``run_live_probe``'s
+    ``finally`` handles a raise, but no teardown hook survives ``SIGKILL`` — and
+    what is stranded is a 0600 ``.credentials.json`` holding a live OAuth access
+    token.  Only reclaiming other processes' dead-PID leftovers bounds the
+    on-disk population, which is why ``usage_gate`` pairs the same two
+    mechanisms for its own probe dirs.
+
+    Never raises, for ANY exception class: tmp hygiene must not be able to fail
+    a capture that costs real money to retake.  The probe has no logger and
+    prints its warnings to stderr (see :func:`_gate`), so this does too.
+    """
+    global _probe_dir_sweep_done
+    if _probe_dir_sweep_done:
+        return 0
+    # Set BEFORE the call, not after, so a raising sweep still cannot re-run on
+    # every subsequent probe.
+    _probe_dir_sweep_done = True
+    try:
+        reclaimed = sweep_stale_pid_dirs(_PROBE_DIR_PREFIX)
+        if reclaimed:
+            # Silent on the zero case so the steady state stays quiet; loud when
+            # there is something to say, so an operator can see the /tmp
+            # population draining rather than rebuilding.
+            print(
+                f'startup_completion_probe: reclaimed {reclaimed} stale probe config '
+                f'dir(s) under {_PROBE_DIR_PREFIX} (dead-PID sweep).',
+                file=sys.stderr,
+            )
+        return reclaimed
+    except Exception as exc:  # noqa: BLE001  (deliberately broad — see docstring)
+        # sweep_stale_pid_dirs already contains OSError internally, so anything
+        # reaching here is UNFORESEEN.  Letting it escape would abort a probe run
+        # over a stale /tmp dir, which is strictly worse than leaving one behind.
+        print(
+            f'startup_completion_probe: WARNING — stale probe-dir sweep of '
+            f'{_PROBE_DIR_PREFIX} failed ({exc!r}); continuing without it (the next '
+            f'process start retries).',
+            file=sys.stderr,
+        )
+        return 0
+
+
 def _drain_exit(
     proc: subprocess.Popen,
     *,
@@ -833,6 +902,7 @@ def run_live_probe(
     keep_config_dir: bool,
 ) -> list[dict]:
     """Spawn *mode*'s target and emit one observation per sample."""
+    _sweep_stale_probe_dirs_once()
     session_id = str(uuid.uuid4())
     cli_version = _cli_version()
     token_pair = _oauth_token()
@@ -844,7 +914,8 @@ def run_live_probe(
     # run_live_probe entirely (SystemExit, KeyboardInterrupt) but nothing
     # survives SIGKILL; the dead-PID sweep below is the other half.
     config = TaskConfigDir(
-        f'startup-probe-{mode}-{os.getpid()}', cleanup_at_exit=not keep_config_dir
+        f'{_PROBE_TASK_ID_PREFIX}{mode}-{os.getpid()}',
+        cleanup_at_exit=not keep_config_dir,
     )
     config_dir = config.path
 
