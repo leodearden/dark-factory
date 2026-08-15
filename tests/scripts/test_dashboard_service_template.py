@@ -1488,6 +1488,62 @@ def test_slowest_client_poll_is_derived_from_every_registered_poller() -> None:
     )
 
 
+def test_every_client_setinterval_is_registered_or_allowlisted() -> None:
+    """Every recurring timer in the client must be classified, not merely absent.
+
+    This is the guard that would have caught the defect this module now carries
+    a correction for.  tab_overview.jsx polled /api/load every 5000ms for the
+    entire life of the keep-alive invariant; the derivation read data.js and
+    nothing else, so the second poller was never part of the bound and
+    keep-alive sat exactly ON its boundary (5000 > 5000 is false) with the whole
+    suite green.  Nothing failed, because nothing was looking.
+
+    So membership is checked from the CLIENT side, not just the registry side:
+    every setInterval under the shipped redux tree must be accounted for by one
+    of two explicit decisions, and an unclassified one fails loudly with both
+    remedies named.  Files are globbed live rather than enumerated, so a new
+    client file is covered the moment it lands rather than when someone
+    remembers to add it here.
+    """
+    sources = sorted(
+        path
+        for path in REDUX_DIR.rglob("*")
+        if path.suffix in (".js", ".jsx") and path.is_file()
+    )
+    assert sources, (
+        f"No .js/.jsx sources found under {REDUX_DIR}. This guard would pass "
+        "vacuously — update REDUX_DIR to wherever the client moved rather than "
+        "leaving every client timer unchecked."
+    )
+
+    unclassified, stale = _unclassified_setinterval_sites(
+        sources,
+        known_consts={entry.const_name for entry in CLIENT_POLLERS},
+        allowlist=NON_POLLING_TIMERS,
+    )
+
+    assert not unclassified, (
+        "Unclassified setInterval call site(s) in the dashboard client: "
+        f"{unclassified}. Every recurring timer must be an explicit decision, "
+        "because a timer that performs HTTP holds its own keep-alive connection "
+        "and reuses it at its own interval — which is how tab_overview.jsx's 5s "
+        "/api/load poll went unnoticed while the keep-alive floor was derived "
+        "from data.js alone.\n"
+        "  - If it PERFORMS HTTP: name its period as a *_POLL_INTERVAL_MS "
+        "constant and register it in CLIENT_POLLERS. If it is the slowest "
+        "poller this raises the --timeout-keep-alive floor, and "
+        "test_keep_alive_timeout_is_pinned_above_poll_interval will say so.\n"
+        "  - If it is a pure UI tick that opens NO connection: add it to "
+        "NON_POLLING_TIMERS with a reason."
+    )
+    assert not stale, (
+        f"NON_POLLING_TIMERS entries matching no live call site: {stale}. "
+        "An entry that matches nothing checks nothing, so it silently rots this "
+        "gate — remove it, or fix it to match the timer it was meant to cover. "
+        "Note a commented-out call site does not count as live."
+    )
+
+
 def test_shutdown_drain_is_bounded_in_both_unit_files() -> None:
     """Both unit files must bound uvicorn's drain below systemd's SIGKILL deadline.
 
