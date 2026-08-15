@@ -400,6 +400,9 @@ class TestMetadataBridgeDropsUnusableValues:
             {'task_id': {'id': 3127}},
             {'task_id': '٣'},
             {'task_id': 3.0},
+            None,
+            'task_id=3127',
+            [('task_id', 3127)],
         ],
         ids=[
             'absent',
@@ -413,6 +416,9 @@ class TestMetadataBridgeDropsUnusableValues:
             'dict',
             'non-ascii-digit',
             'float',
+            'metadata-is-none',
+            'metadata-is-a-string',
+            'metadata-is-a-list-of-pairs',
         ],
     )
     def test_unusable_values_yield_the_empty_resolution(self, metadata):
@@ -430,6 +436,29 @@ class TestMetadataBridgeDropsUnusableValues:
             declared=None, metadata={'task_id': [5040, 5149]}, content='', group_id=GROUP
         )
         assert resolution.referents == ()
+
+    def test_an_unusable_metadata_CONTAINER_also_falls_through_to_the_scan(self):
+        """An unusable ambient CONTAINER is dropped exactly as an unusable
+        ambient VALUE is — one contract, one degradation story.
+
+        ``metadata=None`` is not hypothetical: every metadata-bearing signature
+        in server/tools.py is ``metadata: dict | None = None``, and tools.py
+        guards it with ``isinstance(metadata, dict)`` at four sites, i.e.
+        non-dict metadata demonstrably reaches that boundary. Before this it
+        raised ``AttributeError: 'NoneType' object has no attribute 'get'``,
+        which BOTH escapes the ``except InputValidationError`` gate
+        ``_declared_referents``' docstring promises δ can rely on AND
+        contradicts this function's own stated contract that an unusable value
+        is DROPPED, never raised on.
+        """
+        resolution = resolve_referents(
+            declared=None,
+            metadata=None,
+            content='Fixed the bug in Task 3127.',
+            group_id=GROUP,
+        )
+        assert resolution.referents == (Referent(kind='task', number='3127'),)
+        assert resolution.source == 'derived'
 
     def test_a_dropped_task_id_falls_through_to_the_derived_scan(self):
         """Proves the bridge falls THROUGH rather than short-circuiting to
