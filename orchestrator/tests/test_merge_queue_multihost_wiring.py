@@ -2764,12 +2764,35 @@ class TestClearVerifyHostUnreachable:
 
 
 class _FakeAllocatorForReprobe:
-    """Fake HostAllocator for reprobe tests: configurable quarantined remote list."""
+    """Fake HostAllocator for reprobe tests: configurable quarantined remote list.
 
-    def __init__(self, quarantined: dict):
-        """quarantined: {name: runner_mock} for all quarantined remotes."""
+    Task 3043 extends this double IN PLACE with the tracker-driven reprobe API
+    (``remote_runner`` / ``readmit`` / ``is_parked``) so ONE fake serves both the
+    quarantine-set-driven cases the task-1795 suite pins and the *strand* shapes
+    only a tracker-driven sweep can reach: a host that is tracked as
+    RunnerUnavailable but is NOT in the quarantine set, which
+    ``quarantined_remote_runners()`` structurally cannot report.
+    """
+
+    def __init__(
+        self,
+        quarantined: dict,
+        *,
+        unquarantined: dict | None = None,
+        parked: set[str] | None = None,
+    ):
+        """quarantined: {name: runner_mock} for all quarantined remotes.
+
+        unquarantined: {name: runner_mock} for declared remotes that are NOT in
+        the quarantine set — the strand shape (PARKED-but-unquarantined, or
+        recorded by a path that never reached the allocator).
+        parked: names whose slot is PARKED (held, non-acquirable).
+        """
         self._quarantined = dict(quarantined)
+        self._remotes = {**dict(quarantined), **dict(unquarantined or {})}
+        self._parked = set(parked or ())
         self.cleared: list[str] = []
+        self.readmitted: list[str] = []
 
     def quarantined_remote_runners(self):
         return list(self._quarantined.items())
@@ -2777,6 +2800,27 @@ class _FakeAllocatorForReprobe:
     def clear_quarantine(self, name: str) -> None:
         self.cleared.append(name)
         self._quarantined.pop(name, None)
+
+    # ── task 3043: tracker-driven reprobe API ───────────────────────────────
+
+    def remote_runner(self, name: str):
+        """Resolve a runner for ANY declared remote — quarantined or not."""
+        return self._remotes.get(name)
+
+    def readmit(self, name: str) -> None:
+        """Un-quarantine AND un-PARK, mirroring ``HostAllocator.readmit``.
+
+        Delegates to :meth:`clear_quarantine` so the quarantine-set effect is
+        identical to the old recovery call (that is why the 1795 suite's
+        ``alloc.cleared`` assertions keep holding), and additionally frees a
+        PARKED slot — the part ``clear_quarantine`` alone cannot do.
+        """
+        self.readmitted.append(name)
+        self._parked.discard(name)
+        self.clear_quarantine(name)
+
+    def is_parked(self, name: str) -> bool:
+        return name in self._parked
 
 
 @pytest.mark.asyncio
@@ -3043,6 +3087,349 @@ class TestReprobeQuarantinedHosts:
         assert l1_escs == [], (
             f'no L1 alarm expected with secs=0; got: {l1_escs}'
         )
+
+
+# ---------------------------------------------------------------------------
+# 3043/step-11 RED: reprobe candidacy is TRACKER-driven and recovery un-PARKs
+# ---------------------------------------------------------------------------
+
+
+class _RunnerNoProbeClean:
+    """Remote-runner double that exposes health() but NO probe_clean attribute.
+
+    Pins the ``getattr``-tolerant contract: a runner that does not implement the
+    optional cleanliness probe is treated as clean, so lightweight doubles and
+    non-ssh runners never become permanently unrecoverable.
+    """
+
+    def __init__(self, *, healthy: bool = True):
+        self._healthy = healthy
+        self.health_calls = 0
+
+    async def health(self) -> bool:
+        self.health_calls += 1
+        return self._healthy
+
+
+@pytest.mark.asyncio
+class TestReprobeIsTrackerDriven:
+    """_reprobe_quarantined_hosts candidacy comes from the RU tracker (task 3043 INV-B).
+
+    Today candidacy is the CONJUNCTION "in the allocator quarantine set AND in
+    ``worker._runner_unavailable``" (merge_queue.py), so a host recorded by a
+    path that never reached the allocator — an orphaned verify task's escaping
+    ``RunnerUnavailable``, or a ``cancel_and_release`` that PARKed the slot
+    without quarantining — is a permanent strand: non-acquirable, tracked, and
+    structurally invisible to the sweep.  Inverting to the single positive
+    condition "the tracker says this host is unavailable, so probe it" makes
+    recovery reachable for every RU-class strand while STILL excluding
+    divergence-quarantined hosts (never tracked), preserving Invariant 5 by
+    construction instead of by a double-membership coincidence.
+
+    RED until step-12 rewrites candidate selection + recovery.
+    """
+
+    # Reuse the 1795 suite's construction helpers verbatim (not copies), so the
+    # tracker-driven cases are built exactly like the quarantine-driven ones.
+    _make_worker_with_reprobe = TestReprobeQuarantinedHosts._make_worker_with_reprobe
+    _seed_ru_tracker = TestReprobeQuarantinedHosts._seed_ru_tracker
+
+    # ── (a) STRAND CASE: tracked but NOT quarantined ────────────────────────
+
+    async def test_tracked_but_unquarantined_host_is_probed(self):
+        """The core regression: candidacy must not require quarantine membership.
+
+        `quarantined_remote_runners()` returns [] for this host, so today's
+        conjunction never even reaches its `health()` call.
+        """
+        worker, eq = self._make_worker_with_reprobe()
+
+        runner = MagicMock()
+        runner.health = AsyncMock(return_value=True)
+        alloc = _FakeAllocatorForReprobe({}, unquarantined={'strand-host': runner})
+        worker._host_allocator = alloc  # type: ignore[assignment]
+        assert alloc.quarantined_remote_runners() == [], (
+            'fixture precondition: the strand host is NOT in the quarantine set'
+        )
+
+        now = 1000.0
+        self._seed_ru_tracker(worker, 'strand-host', first_unavailable_at=now - 300.0)
+
+        await worker._reprobe_quarantined_hosts(now)
+
+        runner.health.assert_awaited_once()
+
+    async def test_tracked_but_unquarantined_host_recovers_fully(self):
+        """Strand host + green health() → readmitted, tracker popped, L1 resolved, event emitted."""
+        from orchestrator.event_store import EventType
+        from orchestrator.merge_queue import _verify_host_unreachable_sentinel
+
+        worker, eq = self._make_worker_with_reprobe()
+        es = _FakeEventStore()
+        worker._event_store = es  # type: ignore[assignment]
+
+        runner = MagicMock()
+        runner.health = AsyncMock(return_value=True)
+        alloc = _FakeAllocatorForReprobe({}, unquarantined={'strand-host': runner})
+        worker._host_allocator = alloc  # type: ignore[assignment]
+
+        now = 1000.0
+        self._seed_ru_tracker(worker, 'strand-host', first_unavailable_at=now - 300.0)
+        eq.seed_pending_l1(_verify_host_unreachable_sentinel('strand-host'))
+
+        await worker._reprobe_quarantined_hosts(now)
+
+        assert alloc.readmitted == ['strand-host'], 'strand host must be re-engaged in the pool'
+        assert 'strand-host' not in worker._runner_unavailable, 'tracker entry must be popped'
+        assert 'esc-1001' in [r[0] for r in eq.resolved], 'open L1 must be resolved on recovery'
+        info_escs = [e for e in eq.submitted if getattr(e, 'severity', None) == 'info']
+        assert info_escs, 'expected the info-severity recovery escalation'
+        assert EventType.verify_host_recovered in [e['event_type'] for e in es.emitted]
+
+    # ── (b) recovery uses readmit(), not clear_quarantine() alone ───────────
+
+    async def test_recovery_calls_readmit_not_clear_quarantine_only(self):
+        """A quarantine-set host also recovers via readmit().
+
+        `clear_quarantine` alone cannot un-PARK, so a recovery that only
+        discards the quarantine leaves the host unquarantined, untracked AND
+        non-acquirable — invisible to every recovery mechanism.
+        """
+        worker, eq = self._make_worker_with_reprobe()
+
+        runner = MagicMock()
+        runner.health = AsyncMock(return_value=True)
+        alloc = _FakeAllocatorForReprobe({'good-host': runner})
+        worker._host_allocator = alloc  # type: ignore[assignment]
+
+        now = 1000.0
+        self._seed_ru_tracker(worker, 'good-host', first_unavailable_at=now - 30.0)
+
+        await worker._reprobe_quarantined_hosts(now)
+
+        assert alloc.readmitted == ['good-host'], (
+            'recovery must call readmit(); clear_quarantine() alone leaves a PARKED slot unusable'
+        )
+
+    # ── (c) PARK SAFETY: un-PARK only on a clean probe ──────────────────────
+
+    async def test_parked_host_with_dirty_probe_is_not_readmitted(self):
+        """health() green but probe_clean() False → stays parked AND stays tracked.
+
+        PARK means "the cancel RPC failed, so a stale verify may still be
+        running there"; freeing the slot on mere ssh reachability could
+        double-dispatch onto a host still churning on the previous merge.
+        """
+        worker, eq = self._make_worker_with_reprobe()
+
+        runner = MagicMock()
+        runner.health = AsyncMock(return_value=True)
+        runner.probe_clean = AsyncMock(return_value=False)
+        alloc = _FakeAllocatorForReprobe(
+            {}, unquarantined={'parked-host': runner}, parked={'parked-host'}
+        )
+        worker._host_allocator = alloc  # type: ignore[assignment]
+
+        now = 1000.0
+        self._seed_ru_tracker(worker, 'parked-host', first_unavailable_at=now - 300.0)
+
+        await worker._reprobe_quarantined_hosts(now)
+
+        assert alloc.readmitted == [], 'a dirty parked host must not be re-admitted'
+        assert 'parked-host' in worker._runner_unavailable, (
+            'tracker entry must survive so the NEXT sweep retries the host'
+        )
+
+    async def test_parked_host_with_clean_probe_is_readmitted(self):
+        """health() green AND probe_clean() True → re-admitted and tracker popped."""
+        worker, eq = self._make_worker_with_reprobe()
+
+        runner = MagicMock()
+        runner.health = AsyncMock(return_value=True)
+        runner.probe_clean = AsyncMock(return_value=True)
+        alloc = _FakeAllocatorForReprobe(
+            {}, unquarantined={'parked-host': runner}, parked={'parked-host'}
+        )
+        worker._host_allocator = alloc  # type: ignore[assignment]
+
+        now = 1000.0
+        self._seed_ru_tracker(worker, 'parked-host', first_unavailable_at=now - 300.0)
+
+        await worker._reprobe_quarantined_hosts(now)
+
+        assert alloc.readmitted == ['parked-host']
+        assert 'parked-host' not in worker._runner_unavailable
+
+    async def test_runner_without_probe_clean_is_treated_as_clean(self):
+        """A parked host whose runner has no probe_clean attribute still recovers."""
+        worker, eq = self._make_worker_with_reprobe()
+
+        runner = _RunnerNoProbeClean(healthy=True)
+        assert not hasattr(runner, 'probe_clean'), 'fixture precondition'
+        alloc = _FakeAllocatorForReprobe(
+            {}, unquarantined={'simple-host': runner}, parked={'simple-host'}
+        )
+        worker._host_allocator = alloc  # type: ignore[assignment]
+
+        now = 1000.0
+        self._seed_ru_tracker(worker, 'simple-host', first_unavailable_at=now - 300.0)
+
+        await worker._reprobe_quarantined_hosts(now)
+
+        assert runner.health_calls == 1
+        assert alloc.readmitted == ['simple-host'], (
+            'a runner without the optional cleanliness probe must not be unrecoverable'
+        )
+
+    async def test_unparked_host_is_not_gated_on_probe_clean(self):
+        """The probe_clean gate applies ONLY to a PARKED slot."""
+        worker, eq = self._make_worker_with_reprobe()
+
+        runner = MagicMock()
+        runner.health = AsyncMock(return_value=True)
+        runner.probe_clean = AsyncMock(return_value=False)
+        # Quarantined but NOT parked: nothing to un-PARK, so no cleanliness gate.
+        alloc = _FakeAllocatorForReprobe({'free-host': runner}, parked=set())
+        worker._host_allocator = alloc  # type: ignore[assignment]
+
+        now = 1000.0
+        self._seed_ru_tracker(worker, 'free-host', first_unavailable_at=now - 30.0)
+
+        await worker._reprobe_quarantined_hosts(now)
+
+        assert alloc.readmitted == ['free-host']
+        assert 'free-host' not in worker._runner_unavailable
+
+    # ── (d) INVARIANT 5: divergence quarantines are never auto-cleared ──────
+
+    async def test_quarantined_but_untracked_host_is_never_probed(self):
+        """Verdict-divergence shape: in the quarantine set, absent from the tracker.
+
+        Tracker-driven candidacy must keep skipping it — clearing on mere ssh
+        reachability would bypass the verdict parity gate (Invariant 5).
+        """
+        worker, eq = self._make_worker_with_reprobe()
+
+        runner = MagicMock()
+        runner.health = AsyncMock(return_value=True)
+        alloc = _FakeAllocatorForReprobe({'diverged-host': runner})
+        worker._host_allocator = alloc  # type: ignore[assignment]
+
+        # Deliberately NOT seeded in worker._runner_unavailable.
+        await worker._reprobe_quarantined_hosts(1000.0)
+
+        runner.health.assert_not_called()
+        assert alloc.readmitted == [], 'a divergence quarantine must never be auto-readmitted'
+        assert alloc.cleared == []
+        assert 'diverged-host' in dict(alloc.quarantined_remote_runners())
+
+    async def test_divergence_host_skipped_while_tracked_host_recovers(self):
+        """One sweep: the tracked host recovers, the divergence-quarantined one does not."""
+        worker, eq = self._make_worker_with_reprobe()
+
+        diverged = MagicMock()
+        diverged.health = AsyncMock(return_value=True)
+        tracked = MagicMock()
+        tracked.health = AsyncMock(return_value=True)
+        alloc = _FakeAllocatorForReprobe({'diverged-host': diverged, 'ru-host': tracked})
+        worker._host_allocator = alloc  # type: ignore[assignment]
+
+        now = 1000.0
+        self._seed_ru_tracker(worker, 'ru-host', first_unavailable_at=now - 30.0)
+
+        await worker._reprobe_quarantined_hosts(now)
+
+        diverged.health.assert_not_called()
+        assert alloc.readmitted == ['ru-host']
+
+    # ── (f) sweep robustness ────────────────────────────────────────────────
+
+    async def test_tracker_mutation_mid_sweep_does_not_raise(self):
+        """Recording a NEW unavailable host from inside a probe must not abort the sweep.
+
+        The sweep pops entries itself (via _record_runner_recovered), so it must
+        iterate a snapshot of the tracker keys, not the live dict.
+        """
+        worker, eq = self._make_worker_with_reprobe()
+
+        async def _health_that_mutates_tracker():
+            self._seed_ru_tracker(worker, 'late-host', first_unavailable_at=999.0)
+            return True
+
+        runner = MagicMock()
+        runner.health = AsyncMock(side_effect=_health_that_mutates_tracker)
+        alloc = _FakeAllocatorForReprobe({}, unquarantined={'mutator-host': runner})
+        worker._host_allocator = alloc  # type: ignore[assignment]
+
+        now = 1000.0
+        self._seed_ru_tracker(worker, 'mutator-host', first_unavailable_at=now - 30.0)
+
+        # Must not raise RuntimeError: dictionary changed size during iteration
+        await worker._reprobe_quarantined_hosts(now)
+
+        assert alloc.readmitted == ['mutator-host']
+        assert 'late-host' in worker._runner_unavailable
+
+    async def test_one_host_failure_does_not_abort_tracker_driven_sweep(self):
+        """A raising health() on one tracked host still lets the others recover."""
+        worker, eq = self._make_worker_with_reprobe()
+
+        bad = MagicMock()
+        bad.health = AsyncMock(side_effect=Exception('unexpected ssh crash'))
+        good = MagicMock()
+        good.health = AsyncMock(return_value=True)
+        alloc = _FakeAllocatorForReprobe(
+            {}, unquarantined={'crash-host': bad, 'ok-host': good}
+        )
+        worker._host_allocator = alloc  # type: ignore[assignment]
+
+        now = 1000.0
+        self._seed_ru_tracker(worker, 'crash-host', first_unavailable_at=now - 10.0)
+        self._seed_ru_tracker(worker, 'ok-host', first_unavailable_at=now - 10.0)
+
+        await worker._reprobe_quarantined_hosts(now)
+
+        assert alloc.readmitted == ['ok-host']
+        assert 'crash-host' in worker._runner_unavailable
+
+    async def test_unresolvable_runner_does_not_abort_sweep(self):
+        """A tracked host with no resolvable runner is skipped, not fatal."""
+        worker, eq = self._make_worker_with_reprobe()
+
+        good = MagicMock()
+        good.health = AsyncMock(return_value=True)
+        alloc = _FakeAllocatorForReprobe({}, unquarantined={'ok-host': good})
+        worker._host_allocator = alloc  # type: ignore[assignment]
+
+        now = 1000.0
+        # 'ghost-host' is tracked but the allocator knows nothing about it.
+        self._seed_ru_tracker(worker, 'ghost-host', first_unavailable_at=now - 10.0)
+        self._seed_ru_tracker(worker, 'ok-host', first_unavailable_at=now - 10.0)
+
+        await worker._reprobe_quarantined_hosts(now)
+
+        assert alloc.readmitted == ['ok-host']
+        assert 'ghost-host' in worker._runner_unavailable
+
+    async def test_still_unreachable_tracked_host_keeps_time_based_alarm(self):
+        """The time-based alarm branch is unchanged on the tracker-driven path."""
+        worker, eq = self._make_worker_with_reprobe(escalate_after_secs=5.0)
+
+        runner = MagicMock()
+        runner.health = AsyncMock(return_value=False)
+        alloc = _FakeAllocatorForReprobe({}, unquarantined={'down-host': runner})
+        worker._host_allocator = alloc  # type: ignore[assignment]
+
+        now = 1000.0
+        self._seed_ru_tracker(worker, 'down-host', first_unavailable_at=now - 60.0)
+
+        await worker._reprobe_quarantined_hosts(now)
+
+        assert [e for e in eq.submitted if getattr(e, 'level', 0) == 1], (
+            'expected the L1 time-based alarm for a still-unreachable tracked host'
+        )
+        assert alloc.readmitted == []
+        assert 'down-host' in worker._runner_unavailable
 
 
 # ---------------------------------------------------------------------------
