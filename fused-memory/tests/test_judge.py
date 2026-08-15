@@ -2044,6 +2044,115 @@ async def test_call_judge_cli_forwards_cwd_to_invoke_claude_agent(mock_journal, 
     assert call_kwargs['cwd'] == Path(explore_root)
 
 
+@pytest.mark.asyncio
+async def test_call_judge_cli_scopes_mcp_to_no_servers(mock_journal):
+    """The judge strict-scopes its run to ZERO MCP servers.
+
+    ``disallowed_tools=['*']`` alone does NOT keep MCP tools unreachable here:
+    under an ``output_schema`` cli_invoke expands the wildcard into a
+    BUILT-INS-ONLY deny-list carrying no MCP tool pattern, and ``cwd`` is
+    ``explore_codebase_root`` (the project root, task 1989), which holds a live
+    ``.mcp.json`` the CLI would ambient-merge — under ``bypassPermissions``,
+    that is unreviewed access to tools like ``halt_scheduler`` /
+    ``delete_memory``.  Closing it takes a truthy scoping ``mcp_config`` plus
+    ``strict_mcp_config=True``; the four pre-existing guarantees are asserted
+    alongside so this fix cannot be traded against them.
+    """
+    from pathlib import Path
+    from unittest.mock import AsyncMock
+
+    from shared.cli_invoke import AgentResult
+
+    from fused_memory.reconciliation.judge import JUDGE_VERDICT_SCHEMA
+
+    config = _make_judge_config(
+        judge_llm_provider='claude_cli',
+        judge_llm_model='claude-sonnet-4-5',
+    )
+    judge = Judge(config=config, journal=mock_journal, usage_gate=make_gate_mock())
+
+    # A usable structured payload: a success carrying none is classified as
+    # cli_output_empty infra, which would mask this test's kwargs assertions.
+    fake_result = AgentResult(
+        success=True,
+        output='',
+        structured_output={'severity': 'ok', 'findings': []},
+        session_id='jsess-mcp',
+    )
+
+    with patch(
+        'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+    ) as mock_invoke:
+        mock_invoke.return_value = fake_result
+
+        await judge._call_judge_cli('Evaluate this run.')
+
+    mock_invoke.assert_called_once()
+    call_kwargs = mock_invoke.call_args.kwargs
+
+    assert call_kwargs['strict_mcp_config'] is True
+    assert call_kwargs['mcp_config'] == {'mcpServers': {}}
+    # Restated at the call site so an inline `{}` regression fails HERE too:
+    # the --strict-mcp-config emit is gated on `if mcp_config:`.
+    assert call_kwargs['mcp_config'], 'mcp_config must be TRUTHY or the strict flag is never emitted'
+
+    # Unregressed pre-existing guarantees.
+    assert call_kwargs['disallowed_tools'] == ['*']
+    assert call_kwargs['output_schema'] is JUDGE_VERDICT_SCHEMA
+    assert call_kwargs['permission_mode'] == 'bypassPermissions'
+    assert call_kwargs['cwd'] == Path(config.explore_codebase_root)
+
+
+@pytest.mark.asyncio
+async def test_call_judge_cli_forwards_mcp_scoping_to_invoke_claude_agent(mock_journal, tmp_path):
+    """Both MCP-scoping kwargs survive invoke_with_cap_retry's forwarding layer.
+
+    ``invoke_with_cap_retry`` takes ``**invoke_kwargs`` and forwards them blind,
+    so the kwargs-level test above proves only that the judge NAMES these
+    kwargs — a misspelled or unsupported one would sail past that mock and
+    surface as a TypeError only in production.  Patching one level lower with
+    ``usage_gate=None`` (the single-invocation fast path) runs the real
+    forwarding code, closing that gap — same rationale as
+    test_call_judge_cli_forwards_cwd_to_invoke_claude_agent above.
+
+    Deliberately NOT asserted: that the ambient .mcp.json is actually
+    suppressed.  That is the external CLI's own documented
+    ``--strict-mcp-config`` contract, not hermetically testable here.
+    """
+    from unittest.mock import AsyncMock
+
+    from shared.cli_invoke import AgentResult
+
+    # Use tmp_path so the cwd Path actually exists on disk.
+    config = _make_judge_config(
+        judge_llm_provider='claude_cli',
+        judge_llm_model='claude-sonnet-4-5',
+        explore_codebase_root=str(tmp_path),
+    )
+
+    fake_result = AgentResult(
+        success=True,
+        output='',
+        structured_output={'severity': 'ok', 'findings': []},
+        session_id='jsess-mcp-deep',
+    )
+
+    with patch(
+        'shared.cli_invoke.invoke_claude_agent',
+        new_callable=AsyncMock,
+    ) as mock_agent:
+        mock_agent.return_value = fake_result
+
+        judge = Judge(config=config, journal=mock_journal, usage_gate=None)
+        await judge._call_judge_cli('Evaluate this run.')
+
+    mock_agent.assert_called_once()
+    call_kwargs = mock_agent.call_args.kwargs
+    assert call_kwargs['strict_mcp_config'] is True
+    assert call_kwargs['mcp_config'] == {'mcpServers': {}}
+
+
 # ---------------------------------------------------------------------------
 # CLI failure path surfaces stderr + summary in JudgeInfraError
 # ---------------------------------------------------------------------------
