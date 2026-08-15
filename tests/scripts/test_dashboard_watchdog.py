@@ -1202,6 +1202,20 @@ def test_b6_escalation_queue_dir_matches_the_configured_escalation_queue_dir(mon
     # ``Environment=`` at all, so the default is literally what runs in
     # production. (Hence also: not the queue_env fixture, which sets that very
     # variable to a tmp dir and would make this pin fail spuriously.)
+    #
+    # That premise is load-bearing enough to CHECK rather than assert in prose:
+    # everything below compares two defaults, so adding an
+    # ``Environment=DASHBOARD_WATCHDOG_QUEUE_DIR=...`` to the unit would leave
+    # this pin green while production wrote its born-at-L2 records somewhere
+    # else entirely — the exact failure this test exists to catch, arriving
+    # through the one door a default-vs-yaml comparison leaves open.
+    unit = WATCHDOG_UNIT_PATH.read_text(encoding="utf-8")
+    assert "DASHBOARD_WATCHDOG_QUEUE_DIR" not in unit, (
+        f"{WATCHDOG_UNIT_PATH.name} overrides DASHBOARD_WATCHDOG_QUEUE_DIR, so "
+        "pinning the module default no longer pins production; pin the unit's "
+        "own value against the config instead"
+    )
+
     monkeypatch.delenv("DASHBOARD_WATCHDOG_QUEUE_DIR", raising=False)
     mod = _load_watchdog()
 
