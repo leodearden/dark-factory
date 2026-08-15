@@ -2,7 +2,7 @@
 
 **Write shape:** `c_peers` (ratified by E2 gate ζ). This document does not re-litigate the write shape; it chooses the READ transform layered on top of it.
 **Token estimator:** `char-proxy:4-chars-per-token` — the same one the committed E2 table resolved, so the token columns are directly comparable across the two artifacts.
-**Windows:** authored set at k=10; production set at k=5, because the briefing assembler fires at `limit=5` (`orchestrator/src/orchestrator/agents/briefing.py`:1376) and a wider window would measure a read no production caller gets.
+**Windows:** authored set at k=10; production set at k=5 **by choice**. The four briefing-assembler queries — the modal read — do fire at `limit=5` (`orchestrator/src/orchestrator/agents/briefing.py`:1376), and that line governs nothing else: the sampled residual tail comes from other callers, measured in the journal at limits from 3 to 50. The tail is scored at the briefing's k for comparability, not because that k was observed on it; each row carries its own measured `observed_limits` histogram in the sample and the JSON artifact.
 
 ## The decision table
 
@@ -73,14 +73,21 @@ Sampled READ-ONLY from the reconciliation write journal (`fused-memory/scripts/h
 
 | query template | match | observed | share of all search traffic |
 | --- | --- | --- | --- |
-| `project overview architecture goals` | literal | 74,103 | 17.29% |
-| `coding conventions and project norms` | literal | 74,346 | 17.35% |
-| `recent decisions and rationale` | literal | 74,284 | 17.33% |
-| `task {task_id} context and related decisions` | parameterized | 53,749 | 12.54% |
+| `project overview architecture goals` | literal | 74,702 | 17.31% |
+| `coding conventions and project norms` | literal | 74,944 | 17.36% |
+| `recent decisions and rationale` | literal | 74,884 | 17.35% |
+| `task {task_id} context and related decisions` | parameterized | 54,097 | 12.53% |
 
-Together the four templates are **64.51%** of all search traffic in the journal, so an arm's cost on them is not a corner case — it is the modal read. The rest of the sample is a bounded deterministic tail draw from the long tail of one-off queries.
+Together the four templates are **64.55%** of all search traffic in the journal, so an arm's cost on them is not a corner case — it is the modal read. The rest of the sample is a bounded deterministic tail draw from the long tail of one-off queries.
 
-These queries fire at `limit=5` in production (`briefing.py`:1376), which is the window the production half of the table above is scored at.
+### The scoring window is a choice, not a reading
+
+**These four templates** fire at `limit=5` in production (`briefing.py`:1376). That line governs the briefing assembler and nothing else, so it is not evidence about any other query.
+
+* briefing family, measured: `3`×1, `5`×278,617, `6`×1, `10`×4, `20`×4
+* sampled tail, measured: `3`×2, `4`×2, `5`×104, `6`×19, `8`×36, `10`×599, `15`×194, `20`×75, `30`×11, `50`×99
+
+The production half of the table above is scored at k=5 for **every** row, tail included. For the tail that is a CHOICE — made so the production columns are comparable with each other and with the authored set — and not a limit observed on those queries. The per-row readings are in `observed_limits` in both the sample fixture and the JSON artifact; a reader who wants each row scored at its own k has the numbers to ask for it.
 
 ## Why the production columns carry no labels
 

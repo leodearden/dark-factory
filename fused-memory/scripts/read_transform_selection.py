@@ -53,6 +53,7 @@ metric raises rather than rendering a partial row.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from pathlib import Path
 from typing import Any
 
@@ -846,7 +847,19 @@ class ProductionQuery:
     source: str
     observed_count: int
     traffic_share: float | None
-    observed_limit: int = PRODUCTION_K
+    observed_limit: int | None = None
+    """The limit EVERY journal instance of this query agreed on, else None.
+
+    ``None`` is *no single limit was observed*, never a default.  It used to
+    default to :data:`PRODUCTION_K`, which stamped 5 onto tail rows whose
+    callers were measured running at 3-50 — a field named ``observed_limit``
+    carrying a number nothing observed.  The scoring window is
+    :data:`PRODUCTION_K` by CHOICE and says so; this field is a reading.
+    """
+
+    observed_limits: dict[str, int] = dataclass_field(default_factory=dict)
+    """The full measured ``{limit: count}`` histogram for this query."""
+
     template: str | None = None
     match: str | None = None
 
@@ -905,6 +918,26 @@ def _check_production_types(row: dict[str, Any], *, where: str) -> None:
             'ops in the journal and must be a non-negative int.'
         )
 
+    limit = row.get('observed_limit')
+    if limit is not None and (
+        isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0
+    ):
+        raise ProductionQuerySetError(
+            f'{where}: query {query_id!r} has a non-positive-integer '
+            f"'observed_limit' ({limit!r}). It is the limit every journal "
+            'instance of this query agreed on, and must be a positive int or '
+            'null (null = no single limit was observed; it is NOT a licence '
+            'to substitute the scoring window).'
+        )
+
+    limits = row.get('observed_limits')
+    if limits is not None and not isinstance(limits, dict):
+        raise ProductionQuerySetError(
+            f'{where}: query {query_id!r} has a non-object '
+            f"'observed_limits' ({limits!r}). It is the measured "
+            '{limit: count} histogram from the journal.'
+        )
+
 
 def load_production_queries(path: str | Path) -> list[ProductionQuery]:
     """Read the harvested production sample (unlabeled by construction).
@@ -954,7 +987,11 @@ def load_production_queries(path: str | Path) -> list[ProductionQuery]:
             source=row['source'],
             observed_count=int(row['observed_count']),
             traffic_share=row['traffic_share'],
-            observed_limit=int(row.get('observed_limit', PRODUCTION_K)),
+            # NOT defaulted to PRODUCTION_K: an absent or null reading is
+            # "nothing observed", and coercing it to the scoring window is
+            # exactly the fabrication this field was corrected for.
+            observed_limit=row.get('observed_limit'),
+            observed_limits=dict(row.get('observed_limits') or {}),
             template=row.get('template'),
             match=row.get('match'),
         ))
@@ -1698,9 +1735,14 @@ def render_selection_markdown(report: dict[str, Any]) -> str:
         'the committed E2 table resolved, so the token columns are directly '
         'comparable across the two artifacts.')
     add(f'**Windows:** authored set at k={report["e2_k"]}; production set at '
-        f'k={report["production_k"]}, because the briefing assembler fires at '
-        '`limit=5` (`orchestrator/src/orchestrator/agents/briefing.py`:1376) '
-        'and a wider window would measure a read no production caller gets.')
+        f'k={report["production_k"]} **by choice**. The four briefing-'
+        'assembler queries — the modal read — do fire at `limit=5` '
+        '(`orchestrator/src/orchestrator/agents/briefing.py`:1376), and that '
+        'line governs nothing else: the sampled residual tail comes from '
+        'other callers, measured in the journal at limits from 3 to 50. The '
+        'tail is scored at the briefing\'s k for comparability, not because '
+        'that k was observed on it; each row carries its own measured '
+        '`observed_limits` histogram in the sample and the JSON artifact.')
     add('')
     add('## The decision table')
     add('')
@@ -1887,9 +1929,41 @@ def render_selection_markdown(report: dict[str, Any]) -> str:
                 'the sample is a bounded deterministic tail draw from the '
                 'long tail of one-off queries.')
             add('')
-        add('These queries fire at `limit=5` in production '
-            '(`briefing.py`:1376), which is the window the production half '
-            'of the table above is scored at.')
+        add('### The scoring window is a choice, not a reading')
+        add('')
+        add('**These four templates** fire at `limit=5` in production '
+            '(`briefing.py`:1376). That line governs the briefing assembler '
+            'and nothing else, so it is not evidence about any other query.')
+        add('')
+        briefing_hist = production.get('briefing_observed_limits') or {}
+        tail_hist = production.get('tail_observed_limits') or {}
+
+        def _render_hist(hist: dict[str, Any]) -> str:
+            # Sorted NUMERICALLY here rather than trusted from the mapping:
+            # the JSON artifact is written with `sort_keys=True`, which
+            # orders '10' before '3', so a renderer that trusted iteration
+            # order would not survive its own round-trip — and that
+            # round-trip is the committed-artifact test's whole proof that
+            # no number was hand-edited into the markdown.
+            keys = sorted(
+                hist, key=lambda k: (0, int(k)) if str(k).isdigit() else (1, 0)
+            )
+            return ', '.join(f'`{k}`×{hist[k]:,}' for k in keys)
+
+        if briefing_hist:
+            add(f'* briefing family, measured: {_render_hist(briefing_hist)}')
+        if tail_hist:
+            add(f'* sampled tail, measured: {_render_hist(tail_hist)}')
+        if briefing_hist or tail_hist:
+            add('')
+        add(f'The production half of the table above is scored at '
+            f'k={report["production_k"]} for **every** row, tail included. '
+            'For the tail that is a CHOICE — made so the production columns '
+            'are comparable with each other and with the authored set — and '
+            'not a limit observed on those queries. The per-row readings are '
+            'in `observed_limits` in both the sample fixture and the JSON '
+            'artifact; a reader who wants each row scored at its own k has '
+            'the numbers to ask for it.')
         add('')
 
     # --- the honest tail ---------------------------------------------
@@ -1959,6 +2033,36 @@ class ProductionFetchError(RuntimeError):
     """The production half of the cache is absent, stale or truncated."""
 
 
+#: Why the production half is scored at :data:`PRODUCTION_K`.  Stated as a
+#: CHOICE: `briefing.py`:1376 governs the four briefing queries and nothing
+#: else, and the residual tail's callers were measured running at 3-50.
+_SCORED_LIMIT_BASIS = (
+    'briefing.py:1376 fires the four briefing-assembler queries at limit=5, '
+    'and they are the modal read. It governs no other caller: the residual '
+    'tail was measured in the journal running at limits from 3 to 50, so the '
+    'tail is scored at k=5 by CHOICE — for comparability with the briefing '
+    'half and with the E2 set — not because 5 was observed on it. Each row '
+    "carries its own measured 'observed_limits' histogram."
+)
+
+
+def _merge_limit_histograms(queries: Any) -> dict[str, int]:
+    """Sum the per-query measured limit histograms of `queries`.
+
+    Rows harvested before the limit was measured carry no histogram at all;
+    they contribute nothing rather than a fabricated bucket, so an empty
+    result reads as "not measured" instead of "measured as none".
+    """
+    merged: dict[str, int] = {}
+    for query in queries:
+        for limit, count in (getattr(query, 'observed_limits', None) or {}).items():
+            merged[str(limit)] = merged.get(str(limit), 0) + int(count)
+    return {
+        key: merged[key]
+        for key in sorted(merged, key=lambda k: (0, int(k)) if k.isdigit() else (1, 0))
+    }
+
+
 def production_query_provenance(
     queries: list[ProductionQuery],
     *,
@@ -2000,7 +2104,20 @@ def production_query_provenance(
         'family_share': round(sum(measured), 6) if measured else None,
         'sampled_query_count': len(queries),
         'tail_query_count': len(queries) - len(templates),
-        'observed_limit': queries[0].observed_limit if queries else None,
+        # The window the production half is SCORED at is a choice, so it is
+        # named one.  It used to be published as `observed_limit` taken from
+        # `queries[0]` — the first briefing row — which described neither
+        # the tail (measured at 3-50) nor anything the scorer consulted.
+        'scored_limit': PRODUCTION_K,
+        'scored_limit_is_a_choice': True,
+        'scored_limit_basis': _SCORED_LIMIT_BASIS,
+        # ...and the READINGS, per half, so the choice is auditable.
+        'briefing_observed_limits': _merge_limit_histograms(
+            q for q in queries if q.source == 'briefing_template'
+        ),
+        'tail_observed_limits': _merge_limit_histograms(
+            q for q in queries if q.source != 'briefing_template'
+        ),
         'unlabeled': True,
         'unlabeled_reason': _UNLABELED_REASON,
     }
@@ -2011,7 +2128,9 @@ def production_query_provenance(
             for key in (
                 'harvested_at', 'journal_path', 'total_search_ops',
                 'literal_share', 'family_share', 'tail_share', 'tail_count',
-                'tail_distinct', 'search_limit', 'seed',
+                'tail_distinct', 'scored_limit', 'scored_limit_is_a_choice',
+                'scored_limit_basis', 'briefing_observed_limits',
+                'tail_observed_limits', 'seed',
             )
             if key in sidecar
         }

@@ -205,61 +205,112 @@
       "path": "fused-memory/tests/fixtures/e2_distractor_slab.jsonl"
     },
     {
-      "commit": "ef7d7bee0e54ff7247a320fad0353792945b94ae",
+      "commit": "2b826410ffc6593a44b69bdbd287df9180e58b88",
       "path": "fused-memory/tests/fixtures/production_query_sample.jsonl"
     },
     {
-      "commit": "7b62fe7e0d2f9a30c458e2eb8ad3066ef9c8dc02",
+      "commit": "239bcf0f810c60b76216e6a675020fc7cf13beb8",
       "path": "fused-memory/tests/fixtures/e2_fetch_cache.json"
     }
   ],
   "per_topic_cap": 1,
   "production_k": 5,
   "production_queries": {
-    "family_share": 0.645068,
-    "harvest": {
-      "family_share": 0.645068,
-      "harvested_at": "2026-08-12T18:13:02.261832+00:00",
-      "journal_path": "/home/leo/src/dark-factory/data/reconciliation/write_journal.db",
-      "literal_share": 0.519665,
-      "search_limit": 5,
-      "seed": 4004,
-      "tail_count": 152127,
-      "tail_distinct": 133283,
-      "tail_share": 0.354932,
-      "total_search_ops": 428609
+    "briefing_observed_limits": {
+      "10": 4,
+      "20": 4,
+      "3": 1,
+      "5": 278617,
+      "6": 1
     },
-    "observed_limit": 5,
+    "family_share": 0.645536,
+    "harvest": {
+      "briefing_observed_limits": {
+        "10": 4,
+        "20": 4,
+        "3": 1,
+        "5": 278617,
+        "6": 1
+      },
+      "family_share": 0.645536,
+      "harvested_at": "2026-08-15T22:49:03.292761+00:00",
+      "journal_path": "/home/leo/src/dark-factory/data/reconciliation/write_journal.db",
+      "literal_share": 0.520202,
+      "scored_limit": 5,
+      "scored_limit_basis": "briefing.py:1376 fires the four briefing-assembler queries at limit=5. It governs nothing else. The residual tail is arbitrary other callers running at 3-50, so scoring the tail at 5 is a CHOICE made for comparability with the briefing half, not a limit observed on those queries. Per-row observed_limits carry what was actually recorded.",
+      "scored_limit_is_a_choice": true,
+      "seed": 4004,
+      "tail_count": 152994,
+      "tail_distinct": 134007,
+      "tail_observed_limits": {
+        "1": 15,
+        "10": 52697,
+        "100": 6,
+        "12": 227,
+        "15": 6391,
+        "2": 53,
+        "20": 3441,
+        "200": 1,
+        "25": 95,
+        "3": 2011,
+        "30": 286,
+        "4": 1176,
+        "40": 13,
+        "5": 54423,
+        "50": 1139,
+        "6": 9804,
+        "60": 1,
+        "7": 2,
+        "8": 21213
+      },
+      "tail_share": 0.354464,
+      "total_search_ops": 431621
+    },
     "sampled_query_count": 44,
+    "scored_limit": 5,
+    "scored_limit_basis": "briefing.py:1376 fires the four briefing-assembler queries at limit=5, and they are the modal read. It governs no other caller: the residual tail was measured in the journal running at limits from 3 to 50, so the tail is scored at k=5 by CHOICE — for comparability with the briefing half and with the E2 set — not because 5 was observed on it. Each row carries its own measured 'observed_limits' histogram.",
+    "scored_limit_is_a_choice": true,
+    "tail_observed_limits": {
+      "10": 599,
+      "15": 194,
+      "20": 75,
+      "3": 2,
+      "30": 11,
+      "4": 2,
+      "5": 104,
+      "50": 99,
+      "6": 19,
+      "8": 36
+    },
     "tail_query_count": 40,
     "templates": [
       {
         "match": "literal",
-        "observed_count": 74103,
+        "observed_count": 74702,
         "template": "project overview architecture goals",
         "text": "project overview architecture goals",
-        "traffic_share": 0.172892
+        "traffic_share": 0.173073
       },
       {
         "match": "literal",
-        "observed_count": 74346,
+        "observed_count": 74944,
         "template": "coding conventions and project norms",
         "text": "coding conventions and project norms",
-        "traffic_share": 0.173459
+        "traffic_share": 0.173634
       },
       {
         "match": "literal",
-        "observed_count": 74284,
+        "observed_count": 74884,
         "template": "recent decisions and rationale",
         "text": "recent decisions and rationale",
-        "traffic_share": 0.173314
+        "traffic_share": 0.173495
       },
       {
         "match": "parameterized",
-        "observed_count": 53749,
+        "observed_count": 54097,
         "template": "task {task_id} context and related decisions",
         "text": "task reify_task_12 context and related decisions",
-        "traffic_share": 0.125403
+        "traffic_share": 0.125334
       }
     ],
     "unlabeled": true,

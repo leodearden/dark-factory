@@ -33,6 +33,8 @@ import importlib.util
 import types
 from pathlib import Path
 
+import pytest
+
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'harvest_production_queries.py'
 )
@@ -340,11 +342,110 @@ class TestFixtureRowShape:
         briefing = [r for r in rows if r['source'] == 'briefing_template']
         assert len(briefing) == 4
 
-    def test_rows_record_productions_search_limit_of_five(self, tmp_path):
-        """briefing.py fires at limit=5, not the E2 default of 10."""
+    def test_rows_record_the_limit_the_journal_actually_recorded(self, tmp_path):
+        """`observed_limit` is a READING, not the briefing constant.
+
+        In the standard journal every op happens to run at 5, so every row
+        reports 5 — but it reports it because that is what was measured.
+        """
         mod = _mod()
         rows = mod.harvest(_standard_journal(tmp_path), tail_sample=3).rows
-        assert all(r['observed_limit'] == 5 for r in rows if r['source'] == 'briefing_template')
+        assert all(r['observed_limit'] == 5 for r in rows)
+        assert all(r['observed_limits'] == {'5': r['observed_count']}
+                   for r in rows if r['source'] == 'production_tail')
+
+    def test_a_tail_row_is_not_stamped_with_the_briefing_limit(self, tmp_path):
+        """The regression: briefing.py:1376 governs the briefing family ONLY.
+
+        A tail query fired by some other caller at limit=20 must report 20.
+        Stamping BRIEFING_SEARCH_LIMIT on it published a number nothing
+        observed, under a field named `observed_limit`, into the artifact a
+        selection gate reads.
+        """
+        mod = _mod()
+        rows = _search_rows(OVERVIEW, 10)
+        rows += _search_rows('a tail query some other caller fires', 7, limit=20)
+        db = _build_journal(tmp_path / 'j.db', rows)
+        harvested = mod.harvest(db, tail_sample=3).rows
+        tail = [r for r in harvested if r['source'] == 'production_tail']
+        assert len(tail) == 1
+        assert tail[0]['observed_limit'] == 20
+        assert tail[0]['observed_limit'] != mod.BRIEFING_SEARCH_LIMIT
+        assert tail[0]['observed_limits'] == {'20': 7}
+
+    def test_a_query_whose_instances_disagree_reports_no_single_limit(self, tmp_path):
+        """Disagreement is None — never a modal pick, never a default.
+
+        The full histogram rides alongside, so a reader who wants a modal
+        value takes it from the measurement and owns that choice explicitly.
+        """
+        mod = _mod()
+        rows = _search_rows(OVERVIEW, 10)
+        rows += _search_rows('mixed limit tail query', 6, limit=10)
+        rows += _search_rows('mixed limit tail query', 2, limit=50)
+        db = _build_journal(tmp_path / 'j.db', rows)
+        tail = [r for r in mod.harvest(db, tail_sample=3).rows
+                if r['source'] == 'production_tail']
+        assert len(tail) == 1
+        assert tail[0]['observed_limit'] is None
+        assert tail[0]['observed_limits'] == {'10': 6, '50': 2}
+
+    def test_the_sidecar_reports_the_scored_limit_as_a_choice(self, tmp_path):
+        """The scoring window is named a choice and sits beside the readings."""
+        mod = _mod()
+        rows = _search_rows(OVERVIEW, 10)
+        rows += _search_rows('a tail query', 4, limit=30)
+        db = _build_journal(tmp_path / 'j.db', rows)
+        prov = mod.harvest(db, tail_sample=3).provenance()
+        assert prov['scored_limit'] == mod.BRIEFING_SEARCH_LIMIT
+        assert prov['scored_limit_is_a_choice'] is True
+        assert 'CHOICE' in prov['scored_limit_basis']
+        assert prov['briefing_observed_limits'] == {'5': 10}
+        assert prov['tail_observed_limits'] == {'30': 4}
+
+    def test_an_op_with_no_usable_limit_is_bucketed_not_defaulted(self, tmp_path):
+        """A missing limit is `unspecified`, not silently the scoring window."""
+        import json  # noqa: PLC0415
+
+        mod = _mod()
+        rows = _search_rows(OVERVIEW, 10)
+        rows += [('search', 'read', json.dumps({'query': 'no limit recorded'}))] * 3
+        db = _build_journal(tmp_path / 'j.db', rows)
+        tail = [r for r in mod.harvest(db, tail_sample=3).rows
+                if r['source'] == 'production_tail']
+        assert tail[0]['observed_limits'] == {mod.UNSPECIFIED_LIMIT: 3}
+        assert tail[0]['observed_limit'] is None
+
+
+class TestPinnedTail:
+    """A pinned harvest re-measures without re-drawing the query set.
+
+    The journal is appended to by a running server, so an unpinned
+    re-harvest draws different tail queries — every one a miss in the
+    committed fetch cache, i.e. correcting one field would demand a paid
+    re-seed. Pinning holds WHICH queries are emitted fixed while every
+    count, share and limit is measured fresh.
+    """
+
+    def test_a_pin_holds_the_tail_query_set_fixed(self, tmp_path):
+        mod = _mod()
+        rows = _search_rows(OVERVIEW, 10)
+        rows += _search_rows('pinned tail query', 4, limit=10)
+        rows += _search_rows('newly arrived tail query', 9, limit=8)
+        db = _build_journal(tmp_path / 'j.db', rows)
+        pinned = mod.harvest(db, tail_sample=5, pin_tail_texts=['pinned tail query'])
+        tail = [r for r in pinned.rows if r['source'] == 'production_tail']
+        assert [r['text'] for r in tail] == ['pinned tail query']
+        # ...and the retained row is still MEASURED, not copied forward.
+        assert tail[0]['observed_limit'] == 10
+        assert tail[0]['observed_count'] == 4
+
+    def test_pinning_to_a_query_the_journal_lacks_raises(self, tmp_path):
+        """Emitting a pinned row with no observations would fabricate it."""
+        mod = _mod()
+        db = _build_journal(tmp_path / 'j.db', _search_rows(OVERVIEW, 10))
+        with pytest.raises(mod.EmptyHarvestError, match='pinned tail'):
+            mod.harvest(db, pin_tail_texts=['a query nobody ever ran'])
 
 
 class TestReadOnlyAccess:
@@ -453,7 +554,13 @@ class TestFixtureWrite:
         assert prov['tail_share'] == 0.20
         assert prov['tail_distinct'] == 40
         assert 'harvested_at' in prov
-        assert prov['search_limit'] == 5
+        # The scoring window is published as a CHOICE, beside the readings —
+        # there is no bare `search_limit` a reader could mistake for one.
+        assert 'search_limit' not in prov
+        assert prov['scored_limit'] == 5
+        assert prov['scored_limit_is_a_choice'] is True
+        assert prov['briefing_observed_limits'] == {'5': 160}
+        assert prov['tail_observed_limits'] == {'5': 40}
 
     def test_the_written_fixture_round_trips_through_the_reader(self, tmp_path):
         mod = _mod()
