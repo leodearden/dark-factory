@@ -2,9 +2,11 @@
 
 <!-- GENERATED FILE — do not edit by hand.
      Rendered from `_meta/curation.json` by
-     `scripts/mint_hard_v2_fixtures.py --author`, and pinned
+     `scripts/mint_hard_v2_fixtures.py --render`, and pinned
      byte-for-byte by `test_hard_v2_fixture_pool.py`. Edit the
-     manifest and regenerate. -->
+     manifest and re-run --render. (--author re-derives the whole
+     manifest from the LIVE runs.db files and refuses on census
+     drift, so it is not the regeneration path.) -->
 
 - **Task**: 3631 — fable-trial-v2 β1: mint the curated v2 hard fixture pool
 - **PRD**: `plans/fable-architect-trial-v2-prd.md`

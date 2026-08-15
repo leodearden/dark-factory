@@ -20,6 +20,19 @@ asserts the re-render is byte-identical to the committed file — so the human
 table can never silently drift from the machine manifest. Edit
 `_meta/curation.json` and regenerate; do not edit `CURATION.md` by hand.
 
+Regenerate with:
+
+```bash
+python3 scripts/mint_hard_v2_fixtures.py --render   # manifest -> CURATION.md
+```
+
+`--render` reads only the committed manifest and touches no database. Do NOT
+use `--author` for this: it re-derives the whole manifest from the three live
+`runs.db` files and refuses on any census drift — and additive drift (new
+architect exhaustions, which keep landing) is expected and harmless — so it is
+not a regeneration path and would overwrite a manifest edit rather than render
+it.
+
 ## Why this directory can never leak into a default eval run
 
 `cli._load_fixture_dir` (`orchestrator/src/orchestrator/cli.py`) globs

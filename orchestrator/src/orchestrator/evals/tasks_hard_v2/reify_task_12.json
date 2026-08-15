@@ -27,6 +27,7 @@
     "plan_source": "standing_fixture",
     "derived_from": "orchestrator/src/orchestrator/evals/tasks/reify_task_12.json",
     "baseline_source": "standing_fixture_inherited",
+    "post_commit_reachable_from_main": false,
     "continuity_note": "Re-banded from the standing corpus, not censused. pre_task_commit / post_task_commit / task_definition are carried verbatim from orchestrator/src/orchestrator/evals/tasks/reify_task_12.json and asserted equal by test; the reference block was captured here from those same SHAs. The baseline is INHERITED, not ladder-resolved.",
     "eval_branch_pinned": false,
     "eval_branch_pin_error": "pin_eval_branch(evals/reify_task_12) failed: Command git update-ref refs/heads/evals/reify_task_12 0a605a351aad740b3025bb4c160e84a1c7a8240e failed (rc=128): fatal: update_ref failed for ref 'refs/heads/evals/reify_task_12': cannot lock ref 'refs/heads/evals/reify_task_12': Unable to create '/home/leo/src/reify/.git/refs/heads/evals/reify_task_12.lock': Permission denied",
@@ -41,13 +42,14 @@
     }
   },
   "verify_outcome": {
-    "source": "landed",
-    "passed": true,
+    "source": "landed_branch_tip",
+    "passed": null,
     "commands": {
       "test": "cargo test --workspace",
       "lint": "cargo clippy --workspace",
       "typecheck": ""
-    }
+    },
+    "reason": "post_task_commit 0a605a351aad740b3025bb4c160e84a1c7a8240e is NOT reachable from main in /home/leo/src/reify (measured at mint time with `git merge-base --is-ancestor`): it is the task-branch tip the canonical fixture recorded, not a merge commit on main. The \"merged to main \u21d2 gates passed at the post commit\" premise therefore cannot be established AT THIS SHA, and orchestrator/src/orchestrator/evals/tasks/reify_task_12.json carries no verify_outcome to inherit, so `passed` is recorded as unknown rather than asserted. This does not weaken the fixture: it is scored on plan quality against its reference diff, never on a landed gate result. The commands are carried for provenance only."
   },
   "plan": {
     "task_id": "reify_task_12",

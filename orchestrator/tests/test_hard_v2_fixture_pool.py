@@ -34,7 +34,12 @@ CURATION_JSON = META_DIR / 'curation.json'
 CURATION_MD = POOL_DIR / 'CURATION.md'
 STANDING_TASKS_DIR = EVALS_DIR / 'tasks'
 
-# The recorded census: the pool's provenance, per project.
+# The recorded census: the pool's provenance, per project. Deliberately a
+# literal HERE and nowhere else — this is the PRD-recorded expectation, the
+# independent external pin the manifest is checked against. The driver no
+# longer carries its own copy: `expected_census_counts()` reads the committed
+# manifest, so a drifted db is measured against the artifact rather than
+# against a second literal that could disagree with it.
 EXPECTED_CENSUS_COUNTS = {'reify': 36, 'dark_factory': 4, 'know_live': 1}
 EXPECTED_TOTAL = 41
 
@@ -51,6 +56,18 @@ CONTINUITY_RUNG = 'standing_fixture_inherited'
 # re-banded into the v2 cohort under their EXISTING ids, so these three ids are
 # the one intended overlap with the standing corpus.
 CONTINUITY_IDS = ('reify_task_12', 'reify_task_27', 'df_task_18')
+
+
+def _fixture_id(row: dict) -> str:
+    """The fixture id a manifest candidate row mints to.
+
+    Derived through ``task_sampler.repo_of_project`` — the SAME table
+    ``build_fixture_record`` derives the real id from — rather than a
+    project→repo literal re-declared in this file, which could drift from it
+    without any test noticing.
+    """
+    from orchestrator.evals.task_sampler import repo_of_project
+    return f'{repo_of_project(row["project"])}_task_{row["task_id"]}'
 
 
 @pytest.fixture(scope='module')
@@ -301,12 +318,10 @@ class TestMintedPool:
         # No orphan fixture, no unminted include. The pool is exactly the
         # manifest's included census candidates PLUS its continuity block —
         # the two are the only sources a fixture may come from.
-        expected = set()
-        for c in manifest['candidates']:
-            if c['decision'] == 'include':
-                repo = {'reify': 'reify', 'dark_factory': 'df',
-                        'know_live': 'kl'}[c['project']]
-                expected.add(f'{repo}_task_{c["task_id"]}')
+        expected = {
+            _fixture_id(c) for c in manifest['candidates']
+            if c['decision'] == 'include'
+        }
         expected |= {e['id'] for e in manifest['continuity']['fixtures']}
         assert {f['id'] for f in pool} == expected
 
@@ -397,17 +412,42 @@ class TestMintedPool:
     ) -> None:
         # The curation's adjudicated status travels WITH the fixture, so the
         # cancelled case is self-describing from the JSON alone.
-        by_id = {}
-        repo_of_project = {'reify': 'reify', 'dark_factory': 'df',
-                           'know_live': 'kl'}
-        for c in manifest['candidates']:
-            if c['decision'] == 'include':
-                fid = f'{repo_of_project[c["project"]]}_task_{c["task_id"]}'
-                by_id[fid] = c['status']
+        by_id = {
+            _fixture_id(c): c['status'] for c in manifest['candidates']
+            if c['decision'] == 'include'
+        }
         for f in pool:
             if f['id'] not in by_id:
                 continue  # continuity fixtures are not census candidates
             assert f['provenance']['task_status'] == by_id[f['id']], f['id']
+
+    def test_no_fixture_ships_an_unretrievable_reference(
+        self, pool: list[dict],
+    ) -> None:
+        # The pool's single most load-bearing durability property: a reference
+        # whose post commit is GC-eligible can EVAPORATE, taking the fixture's
+        # plan_quality ground truth with it. Every referenced/continuity
+        # fixture in this pool shipped with `eval_branch_pinned: false` (the
+        # source checkouts are read-only from here), so the only thing keeping
+        # them retrievable is that the commit is reachable another way —
+        # ancestry of main, or an existing ref. `_pin_or_record_failure`
+        # measures that at mint time and writes the verdict into
+        # `eval_branch_pin_impact`; an 'ACTION NEEDED' verdict means nothing
+        # holds the commit. Refuse to ship one.
+        for f in pool:
+            if 'reference' not in f:
+                continue  # planRate-only: nothing to retrieve, asserted elsewhere
+            prov = f['provenance']
+            if prov.get('eval_branch_pinned') is True:
+                continue  # evals/<id> holds it directly
+            impact = prov.get('eval_branch_pin_impact', '')
+            assert impact.startswith('None for retrievability'), (
+                f'{f["id"]} ships a reference that is neither pinned nor shown '
+                f'retrievable: eval_branch_pinned='
+                f'{prov.get("eval_branch_pinned")!r}, impact={impact!r}. Its '
+                f'reference diff can be lost to GC, and with it the fixture\'s '
+                f'plan_quality ground truth.'
+            )
 
     def test_the_cancelled_include_asserts_no_passing_gates(
         self, pool: list[dict],
@@ -420,9 +460,8 @@ class TestMintedPool:
 
 
 def _mint_modes(manifest: dict) -> dict[str, str]:
-    repo_of_project = {'reify': 'reify', 'dark_factory': 'df', 'know_live': 'kl'}
     return {
-        f'{repo_of_project[c["project"]]}_task_{c["task_id"]}': c['mint_mode']
+        _fixture_id(c): c['mint_mode']
         for c in manifest['candidates'] if c['decision'] == 'include'
     }
 
@@ -432,11 +471,17 @@ def _mint_modes(manifest: dict) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 class TestStandingCorpusIsolation:
-    def test_standing_corpus_still_holds_its_22_fixtures(self) -> None:
+    def test_standing_corpus_still_loads_with_unique_ids(self) -> None:
+        # A FLOOR, not an exact count: β1 does not own evals/tasks/ and that
+        # corpus is expected to grow (ι2 back-fills references into it), so
+        # pinning 22 would fail an unrelated task's legitimate addition from a
+        # test named for the v2 hard pool. What β1 actually guarantees — no
+        # collision with the standing corpus — is asserted by
+        # `test_the_only_id_overlap_is_the_declared_continuity_set` below.
         from orchestrator.cli import _load_fixture_dir
         standing = _load_fixture_dir(STANDING_TASKS_DIR)
-        assert len(standing) == 22
-        assert len({f['id'] for f in standing}) == 22
+        assert len(standing) >= 22
+        assert len({f['id'] for f in standing}) == len(standing)
 
     def test_the_only_id_overlap_is_the_declared_continuity_set(
         self, pool: list[dict], manifest: dict,
@@ -465,6 +510,29 @@ class TestStandingCorpusIsolation:
 @pytest.fixture(scope='module')
 def continuity(manifest: dict) -> list[dict]:
     return manifest['continuity']['fixtures']
+
+
+def _pre_beta1_anchor() -> str:
+    """The revision the standing corpus is compared against: this branch's
+    merge-base with main, i.e. the tree before β1's first commit.
+
+    Skips (loudly, never silently passes) when no ``main`` ref exists in the
+    checkout — a shallow/detached clone cannot answer "before β1" at all, and
+    a vacuous comparison against HEAD would read as a guarantee it is not.
+    """
+    import subprocess
+    for main_ref in ('main', 'origin/main'):
+        proc = subprocess.run(
+            ['git', 'merge-base', 'HEAD', main_ref],
+            cwd=str(REPO_ROOT), capture_output=True, text=True,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return proc.stdout.strip()
+    pytest.skip(
+        'no main / origin/main ref in this checkout, so the pre-β1 anchor is '
+        'unavailable; the standing-corpus isolation invariant is still covered '
+        'by the disjointness and no-v2-cohort tests'
+    )
 
 
 def _source_fixture(entry: dict) -> dict:
@@ -551,23 +619,56 @@ class TestContinuityFixtures:
             assert got['provenance']['baseline_source'] == CONTINUITY_RUNG, \
                 entry['id']
 
-    def test_source_fixtures_are_byte_unchanged_versus_git_head(
+    def test_source_fixtures_are_byte_unchanged_since_before_beta1(
         self, continuity: list[dict],
     ) -> None:
         # β1 must not edit the standing corpus. Byte-level, against git — a
         # weaker "the file still parses" check would not catch a re-authored
         # brief being written back into tasks/.
+        #
+        # The anchor is this branch's merge-base with main, NOT HEAD. HEAD is
+        # vacuous: an edit to evals/tasks/ would arrive as a COMMIT, HEAD would
+        # move with it and the comparison would pass unconditionally. The
+        # merge-base is the tree as it stood before β1's first commit, so the
+        # assertion actually spans the work being reviewed.
         import subprocess
+        anchor = _pre_beta1_anchor()
         for entry in continuity:
             src = entry['source_path']
-            head = subprocess.run(
-                ['git', 'show', f'HEAD:{src}'],
+            before = subprocess.run(
+                ['git', 'show', f'{anchor}:{src}'],
                 cwd=str(REPO_ROOT), capture_output=True, check=True,
             ).stdout
-            assert (REPO_ROOT / src).read_bytes() == head, (
-                f'{src} differs from git HEAD — β1 must not touch the '
-                f'standing corpus'
+            assert (REPO_ROOT / src).read_bytes() == before, (
+                f'{src} differs from {anchor} (this branch\'s merge-base with '
+                f'main) — β1 must not touch the standing corpus'
             )
+
+    def test_verify_outcome_provenance_matches_measured_reachability(
+        self, continuity: list[dict],
+    ) -> None:
+        # `build_fixture_record` stamps `{source:'landed', passed:True}`
+        # unconditionally, on the premise "the task merged to main ⇒ its gates
+        # passed at the post commit". For these three that premise is not
+        # established: their post commits are the task-BRANCH TIPS the
+        # canonical fixtures recorded, and the canonical fixtures carry no
+        # verify_outcome to inherit. So the mint MEASURES reachability and the
+        # stamp must follow the measurement — a `passed: true` that no
+        # reachable commit backs is the same fabricated ground truth the
+        # planRate-only path refuses.
+        for entry in continuity:
+            got = _minted(entry)
+            where = entry['id']
+            reachable = got['provenance']['post_commit_reachable_from_main']
+            outcome = got['verify_outcome']
+            if reachable:
+                assert outcome['source'] == 'landed', where
+                assert outcome['passed'] is True, where
+            else:
+                assert outcome['source'] == 'landed_branch_tip', where
+                assert outcome['passed'] is None, where
+                assert outcome['reason'].strip(), where
+                assert outcome['commands'] == got['verify_commands'], where
 
 
 class TestMetaLayout:

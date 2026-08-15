@@ -11,6 +11,12 @@ Two modes:
     reproducibility fix for v1, whose sampling driver was gitignored and whose
     pool therefore could not be re-derived.
 
+``--render``
+    Re-render ``CURATION.md`` from the COMMITTED ``_meta/curation.json`` — a
+    pure function of the manifest, with no database access at all. This is the
+    regeneration path after a manifest edit; ``--author`` is not, because it
+    re-derives the manifest from the live dbs and refuses on census drift.
+
 ``--mint``
     Read the committed ``_meta/curation.json``, drive the canonical
     ``task_sampler`` minting pipeline (``capture_reference`` /
@@ -45,9 +51,28 @@ SOURCE_CHECKOUTS: dict[str, str] = {
 
 # The recorded per-project distinct counts. The census asserts against these so
 # a drifted db is caught loudly rather than silently re-scoping the pool.
-EXPECTED_CENSUS_COUNTS: dict[str, int] = {
+#
+# The committed manifest's `census.counts` block IS this record once the
+# manifest exists, so `expected_census_counts()` reads it from there — the
+# driver and the artifact it produced cannot disagree. The literal below is
+# the BOOTSTRAP value only, used before any manifest has been authored.
+_BOOTSTRAP_CENSUS_COUNTS: dict[str, int] = {
     'reify': 36, 'dark_factory': 4, 'know_live': 1,
 }
+
+
+def expected_census_counts() -> dict[str, int]:
+    """Return the recorded per-project census counts.
+
+    Read from the committed ``_meta/curation.json`` when it exists (the single
+    machine-readable source of truth), falling back to the bootstrap literal
+    only when no manifest has been authored yet.
+    """
+    try:
+        counts = json.loads(CURATION_JSON.read_text())['census']['counts']
+    except (OSError, ValueError, KeyError, TypeError):
+        return dict(_BOOTSTRAP_CENSUS_COUNTS)
+    return {str(project): int(n) for project, n in counts.items()}
 
 # ---------------------------------------------------------------------------
 # The census filter
@@ -431,23 +456,35 @@ def enrich_from_task_db(
               file=sys.stderr)
         return candidates
 
-    conn = connect_ro(db_path)
+    # Same guard as the sampler's: a locked or schema-drifted db degrades to
+    # recorded stubs rather than aborting with a raw traceback. The stubs are
+    # not silently minted — `_run_mint` refuses an include row that resolves
+    # to an empty title/description.
     try:
-        rows = {
-            str(r['id']): r for r in conn.execute(
-                'SELECT id, title, description, status, metadata FROM tasks'
-            )
-        }
-    finally:
-        conn.close()
+        conn = connect_ro(db_path)
+        try:
+            rows = {
+                str(r['id']): r for r in conn.execute(
+                    'SELECT id, title, description, status, metadata FROM tasks'
+                )
+            }
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        print(f'WARNING: read of {db_path} failed ({exc}); candidates stay stubs',
+              file=sys.stderr)
+        return candidates
 
     for cand in candidates:
         row = rows.get(str(cand.task_id))
         if row is None:
             continue
-        cand.title = row['title'] or ''
-        cand.description = row['description'] or ''
-        cand.status = row['status'] or ''
+        # `or cand.<field>` preserves an already-populated value, matching
+        # `enrich_candidates_from_task_db`: a blank column must not blank out
+        # a field the caller already had.
+        cand.title = row['title'] or cand.title
+        cand.description = row['description'] or cand.description
+        cand.status = row['status'] or cand.status
         raw_meta = row['metadata']
         if raw_meta:
             try:
@@ -523,8 +560,9 @@ def run_census(strict: bool = True) -> int:
               f'{(c.title or "")[:48]}')
 
     print()
+    recorded = expected_census_counts()
     for project, n in counts.items():
-        expected = EXPECTED_CENSUS_COUNTS[project]
+        expected = recorded.get(project)
         flag = 'OK' if n == expected else f'DRIFT (expected {expected})'
         print(f'{project:<14}{n:>4}  {flag}')
     total = sum(counts.values())
@@ -541,8 +579,8 @@ def run_census(strict: bool = True) -> int:
               f'max={max(minutes):.1f}m p95={_percentile(minutes, 95):.1f}m '
               f'p50={_percentile(minutes, 50):.1f}m')
 
-    if strict and counts != EXPECTED_CENSUS_COUNTS:
-        print(f'\nCENSUS DRIFT: got {counts}, expected {EXPECTED_CENSUS_COUNTS}. '
+    if strict and counts != recorded:
+        print(f'\nCENSUS DRIFT: got {counts}, expected {recorded}. '
               f'{CENSUS_DRIFT_GUIDANCE}', file=sys.stderr)
         return 1
     return 0
@@ -611,18 +649,36 @@ MAX_ARCHITECT_TURNS = 120
 TIMEOUT_MINUTES = 180
 
 _ALL_ARCHITECT_DURATION_SQL = """\
-SELECT MAX(duration_ms) FROM events
+SELECT MAX(duration_ms), COUNT(*) FROM events
 WHERE event_type='invocation_end' AND role='architect' AND duration_ms IS NOT NULL\
 """
 
 
-def _all_architect_max_ms(runs_db: Path | str) -> int:
+class WallClockEvidenceMissing(RuntimeError):
+    """No ``duration_ms`` evidence, so ``timeout_minutes`` cannot be derived.
+
+    Raised rather than dividing by a zero denominator: the whole point of the
+    ceilings block is that the timeout is DERIVED from measured wall-clock and
+    shown not to bind, so a run with no measurement must stop at the missing
+    evidence — not emit a ZeroDivisionError from inside an f-string several
+    frames from the cause, and certainly not a basis-free threshold.
+    """
+
+
+def _all_architect_duration_stats(runs_db: Path | str) -> tuple[int, int]:
+    """Return ``(max_duration_ms, n)`` over EVERY architect invocation.
+
+    The count is measured alongside the max so the note that reports the
+    sample size can never carry a stale hardcoded n next to a fresh max.
+    """
     conn = connect_ro(runs_db)
     try:
         row = conn.execute(_ALL_ARCHITECT_DURATION_SQL).fetchone()
     finally:
         conn.close()
-    return int(row[0]) if row and row[0] else 0
+    if not row:
+        return 0, 0
+    return (int(row[0]) if row[0] else 0), (int(row[1]) if row[1] else 0)
 
 
 def _build_ceilings() -> dict:
@@ -636,16 +692,36 @@ def _build_ceilings() -> dict:
     """
     census_ms: list[int] = []
     all_max_ms = 0
+    all_n = 0
     for root_str in SOURCE_CHECKOUTS.values():
         runs_db = Path(root_str) / 'data' / 'orchestrator' / 'runs.db'
         census_ms.extend(census_durations_ms(runs_db))
-        all_max_ms = max(all_max_ms, _all_architect_max_ms(runs_db))
+        root_max_ms, root_n = _all_architect_duration_stats(runs_db)
+        all_max_ms = max(all_max_ms, root_max_ms)
+        all_n += root_n
 
     minutes = sorted(d / 60_000 for d in census_ms)
     observed_max = round(max(minutes), 1) if minutes else 0.0
     p95 = round(_percentile(minutes, 95), 1) if minutes else 0.0
     p50 = round(_percentile(minutes, 50), 1) if minutes else 0.0
     all_max = round(all_max_ms / 60_000, 1)
+
+    # Both are headroom DENOMINATORS below. A checkout whose runs.db carries no
+    # populated duration_ms (fresh, truncated, or schema-drifted) would turn
+    # this deliberately loud script into an opaque ZeroDivisionError raised
+    # from inside an f-string, so name the missing evidence instead.
+    if observed_max <= 0 or all_max <= 0:
+        raise WallClockEvidenceMissing(
+            f'_build_ceilings: no wall-clock evidence to derive '
+            f'timeout_minutes from — observed max-at-exhaustion '
+            f'{observed_max} min over n={len(minutes)} census invocation(s), '
+            f'all-architect max {all_max} min over n={all_n} invocation(s). '
+            f'Expected populated events.duration_ms in '
+            f'{[str(Path(r) / "data" / "orchestrator" / "runs.db") for r in SOURCE_CHECKOUTS.values()]}. '
+            f'Refusing to emit a ceilings block whose headroom cannot be '
+            f'computed: the threshold would then be a guess, which is exactly '
+            f'what this derivation exists to prevent.'
+        )
 
     return {
         'max_architect_turns': MAX_ARCHITECT_TURNS,
@@ -677,10 +753,13 @@ def _build_ceilings() -> dict:
             'p95_minutes': p95,
             'p50_minutes': p50,
             'all_architect_max_minutes': all_max,
+            'all_architect_sample_n': all_n,
             'all_architect_sample_note': (
-                'all_architect_max_minutes is the max over EVERY architect '
-                'invocation_end in the three checkouts (n=14701), not just the '
-                'census population — the strictest bound available.'
+                f'all_architect_max_minutes is the max over EVERY architect '
+                f'invocation_end carrying a duration_ms in the three '
+                f'checkouts (n={all_n}), not just the census population — the '
+                f'strictest bound available. Measured alongside the max, so '
+                f'the two can never be reported from different populations.'
             ),
             'headroom': (
                 f'{TIMEOUT_MINUTES} min is '
@@ -712,10 +791,11 @@ def author_manifest(census_date: str) -> dict:
         per_project[project] = collect_candidates(project, Path(root_str))
 
     counts = {p: len(c) for p, c in per_project.items()}
-    if counts != EXPECTED_CENSUS_COUNTS:
+    recorded = expected_census_counts()
+    if counts != recorded:
         raise RuntimeError(
             f'author_manifest: census drift — got {counts}, expected '
-            f'{EXPECTED_CENSUS_COUNTS}. Refusing to author a manifest whose '
+            f'{recorded}. Refusing to author a manifest whose '
             f'pool silently differs from the recorded one. '
             f'{CENSUS_DRIFT_GUIDANCE}'
         )
@@ -813,9 +893,11 @@ def render_curation_md(manifest: dict) -> str:
     add('')
     add('<!-- GENERATED FILE — do not edit by hand.')
     add('     Rendered from `_meta/curation.json` by')
-    add('     `scripts/mint_hard_v2_fixtures.py --author`, and pinned')
+    add('     `scripts/mint_hard_v2_fixtures.py --render`, and pinned')
     add('     byte-for-byte by `test_hard_v2_fixture_pool.py`. Edit the')
-    add('     manifest and regenerate. -->')
+    add('     manifest and re-run --render. (--author re-derives the whole')
+    add('     manifest from the LIVE runs.db files and refuses on census')
+    add('     drift, so it is not the regeneration path.) -->')
     add('')
     add(f'- **Task**: {manifest["task"]}')
     add(f'- **PRD**: `{manifest["prd"]}`')
@@ -932,6 +1014,30 @@ def render_curation_md(manifest: dict) -> str:
     return '\n'.join(out) + '\n'
 
 
+def run_render() -> int:
+    """Re-render ``CURATION.md`` from the COMMITTED manifest. No db access.
+
+    This is the regeneration path the README and the generated-file header
+    name. ``--author`` cannot serve as one: it re-derives the whole manifest
+    from the three LIVE ``runs.db`` files and refuses on ANY census drift,
+    while purely additive drift (new architect exhaustions, which keep
+    landing) is expected and harmless — so ``--author`` becomes unrunnable
+    over time, and after a manifest hand-edit it would in any case overwrite
+    the edit rather than render it. ``--render`` is a pure function of the
+    committed manifest, which is exactly what the byte-equality test pins.
+    """
+    if not CURATION_JSON.exists():
+        raise RuntimeError(
+            f'run_render: no manifest at {CURATION_JSON}. CURATION.md is '
+            f'generated FROM the manifest, so there is nothing to render; '
+            f'author the manifest first (--author).'
+        )
+    manifest = json.loads(CURATION_JSON.read_text())
+    CURATION_MD.write_text(render_curation_md(manifest))
+    print(f'wrote {CURATION_MD} (rendered from {CURATION_JSON}; no db access)')
+    return 0
+
+
 def run_author(census_date: str) -> int:
     manifest = author_manifest(census_date)
     CURATION_JSON.parent.mkdir(parents=True, exist_ok=True)
@@ -949,7 +1055,9 @@ def run_author(census_date: str) -> int:
 # --mint — drive the canonical task_sampler pipeline over the include rows
 # ---------------------------------------------------------------------------
 
-_REPO_OF_PROJECT = {'reify': 'reify', 'dark_factory': 'df', 'know_live': 'kl'}
+# The project → repo-stratum mapping is NOT re-declared here: it lives in
+# task_sampler.repo_of_project(), the same table build_fixture_record derives
+# each fixture id from. A local literal copy could drift from it silently.
 
 
 def _is_ancestor_of_main(repo_root: Path | str, commit: str) -> bool:
@@ -1112,6 +1220,36 @@ async def _mint_continuity_one(sampler, entry: dict, sampled_at: str, seed: int,
     record['provenance']['merge_sha'] = None
     record['provenance']['derived_from'] = entry['source_path']
     record['provenance']['baseline_source'] = CONTINUITY_BASELINE_SOURCE
+
+    # build_fixture_record stamps `{source:'landed', passed:True}`
+    # unconditionally, on the documented premise "the task merged to main ⇒ its
+    # gates passed at the post commit". MEASURE that premise instead of
+    # asserting it: these three fixtures predate provenance capture and their
+    # post commits are task-BRANCH TIPS, not merges reachable from main, so at
+    # this SHA the premise is not established — and the canonical fixture
+    # records no verify_outcome to inherit either. Same refusal to fabricate a
+    # gate result as the planRate-only path in `_mint_one`.
+    reachable = _is_ancestor_of_main(cand.project_root, cand.post_commit)
+    record['provenance']['post_commit_reachable_from_main'] = reachable
+    if not reachable:
+        record['verify_outcome'] = {
+            'source': 'landed_branch_tip',
+            'passed': None,
+            'commands': dict(src['verify_commands']),
+            'reason': (
+                f'post_task_commit {cand.post_commit} is NOT reachable from '
+                f'main in {cand.project_root} (measured at mint time with '
+                f'`git merge-base --is-ancestor`): it is the task-branch tip '
+                f'the canonical fixture recorded, not a merge commit on main. '
+                f'The "merged to main ⇒ gates passed at the post commit" '
+                f'premise therefore cannot be established AT THIS SHA, and '
+                f'{entry["source_path"]} carries no verify_outcome to inherit, '
+                f'so `passed` is recorded as unknown rather than asserted. '
+                f'This does not weaken the fixture: it is scored on plan '
+                f'quality against its reference diff, never on a landed gate '
+                f'result. The commands are carried for provenance only.'
+            ),
+        }
     record['provenance']['continuity_note'] = (
         f'Re-banded from the standing corpus, not censused. '
         f'pre_task_commit / post_task_commit / task_definition are carried '
@@ -1141,7 +1279,7 @@ async def _mint_continuity_one(sampler, entry: dict, sampled_at: str, seed: int,
 async def _mint_one(sampler, row: dict, sampled_at: str, seed: int,
                     ceilings: dict) -> dict:
     """Build one fixture record from an adjudicated ``include`` row."""
-    repo = _REPO_OF_PROJECT[row['project']]
+    repo = sampler.repo_of_project(row['project'])
     cand = sampler.CompletedTaskCandidate(
         task_id=row['task_id'],
         project=row['project'],
@@ -1245,6 +1383,20 @@ async def _run_mint(sampled_at: str, seed: int) -> int:
         ]
         enrich_from_task_db(cands, root / '.taskmaster' / 'tasks' / 'tasks.db')
         for row, cand in zip(rows, cands, strict=True):
+            # The enrichment degrades to a stub (unreadable db, id absent from
+            # the tasks table, blanked columns) rather than raising. Minting
+            # that stub would write a fixture with an empty name and an empty
+            # task_definition — an architect handed no brief at all — so the
+            # stub is refused HERE, where the cause is known.
+            if not (cand.title or '').strip() or not (cand.description or '').strip():
+                raise RuntimeError(
+                    f'_run_mint: include row {project}/{row["task_id"]} '
+                    f'resolved to an empty title/description from '
+                    f'{root}/.taskmaster/tasks/tasks.db (title={cand.title!r}, '
+                    f'brief_chars={cand.brief_chars}). Refusing to mint a '
+                    f'fixture with no brief; re-run --census to see whether '
+                    f'the task id still resolves in that db.'
+                )
             row['title'] = cand.title
             row['description'] = cand.description
             row['complexity'] = cand.complexity
@@ -1288,6 +1440,10 @@ def main(argv: list[str] | None = None) -> int:
                       help='Re-run the architect-exhaustion census and print it')
     mode.add_argument('--author', action='store_true',
                       help='(Re)generate _meta/curation.json from the live dbs')
+    mode.add_argument('--render', action='store_true',
+                      help='Re-render CURATION.md from the COMMITTED manifest '
+                           '(no db access) — the regeneration path after a '
+                           'manifest edit')
     mode.add_argument('--mint', action='store_true',
                       help='Mint the fixture JSONs from the manifest include rows')
     parser.add_argument('--census-date', default=None,
@@ -1311,6 +1467,8 @@ def main(argv: list[str] | None = None) -> int:
         if not args.census_date:
             parser.error('--author requires --census-date')
         return run_author(args.census_date)
+    if args.render:
+        return run_render()
     if args.mint:
         if not args.sampled_at:
             parser.error('--mint requires --sampled-at')

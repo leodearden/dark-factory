@@ -414,3 +414,112 @@ class TestPlanRateOnlyVerifyOutcome:
         rec = _mint(_planrate_row(status='done'))
         assert rec['verify_outcome']['source'] == 'unavailable'
         assert "'done'" in rec['verify_outcome']['reason']
+
+
+# ---------------------------------------------------------------------------
+# (d) --render — the documented regeneration path, with no db access
+# ---------------------------------------------------------------------------
+
+class TestRenderMode:
+    def test_render_reproduces_the_committed_curation_md(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # `--author` re-derives the manifest from the three LIVE runs.db files
+        # and refuses on any census drift, which the driver's own guidance
+        # calls expected and harmless — so it cannot be the regeneration path
+        # the README and the generated-file header point at. `--render` is,
+        # and it reads only the committed manifest.
+        import json as _json
+        committed = driver.CURATION_MD.read_text()
+        manifest = _json.loads(driver.CURATION_JSON.read_text())
+        out = tmp_path / 'CURATION.md'
+        monkeypatch.setattr(driver, 'CURATION_MD', out)
+        assert driver.run_render() == 0
+        assert out.read_text() == driver.render_curation_md(manifest)
+        assert out.read_text() == committed
+
+    def test_render_refuses_when_the_manifest_is_absent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Loud-over-silent: CURATION.md is generated FROM the manifest, so a
+        # missing manifest is an error, never an empty/stale render.
+        monkeypatch.setattr(driver, 'CURATION_JSON', tmp_path / 'nope.json')
+        monkeypatch.setattr(driver, 'CURATION_MD', tmp_path / 'CURATION.md')
+        with pytest.raises(RuntimeError, match='no manifest'):
+            driver.run_render()
+
+
+# ---------------------------------------------------------------------------
+# (e) The ceilings derivation refuses to divide by absent evidence
+# ---------------------------------------------------------------------------
+
+class TestCeilingsEvidenceGuard:
+    def test_missing_duration_evidence_raises_a_named_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # timeout_minutes is DERIVED: its headroom divides by the observed
+        # max-at-exhaustion and the all-time architect max. A runs.db with no
+        # populated duration_ms (fresh, truncated, schema-drifted) makes both
+        # denominators zero, and this script's whole design is to fail loudly
+        # at the missing evidence rather than emit a ZeroDivisionError from
+        # inside an f-string — or, worse, a basis-free threshold.
+        root = tmp_path / 'checkout'
+        (root / 'data' / 'orchestrator').mkdir(parents=True)
+        db = _make_runs_db(tmp_path, [
+            # A census-matching exhaustion, but with NO duration recorded.
+            {'task_id': '100', 'data': '{"subtype": "error_max_turns", "turns": 121}'},
+        ])
+        db.rename(root / 'data' / 'orchestrator' / 'runs.db')
+        monkeypatch.setattr(driver, 'SOURCE_CHECKOUTS', {'reify': str(root)})
+        with pytest.raises(driver.WallClockEvidenceMissing, match='wall-clock'):
+            driver._build_ceilings()
+
+
+# ---------------------------------------------------------------------------
+# (f) Task-db enrichment degrades the same way the sampler's does
+# ---------------------------------------------------------------------------
+
+class TestEnrichFromTaskDb:
+    def _cand(self) -> object:
+        return driver.Candidate(
+            task_id='7', project='reify', project_root='/home/leo/src/reify',
+            title='pre-existing title', description='pre-existing brief',
+            status='done',
+        )
+
+    def test_unreadable_db_degrades_to_stubs_instead_of_raising(
+        self, tmp_path: Path,
+    ) -> None:
+        # A locked or schema-drifted db must not abort --mint with a raw
+        # sqlite traceback; the stub is refused later, at the mint boundary,
+        # where the cause can be named.
+        broken = tmp_path / 'tasks.db'
+        broken.write_bytes(b'not a sqlite database at all')
+        cand = self._cand()
+        got = driver.enrich_from_task_db([cand], broken)
+        assert got == [cand]
+        assert cand.title == 'pre-existing title'
+
+    def test_a_blank_column_does_not_blank_an_existing_value(
+        self, tmp_path: Path,
+    ) -> None:
+        # `or cand.<field>` preservation, matching
+        # task_sampler.enrich_candidates_from_task_db: a NULL title in the db
+        # must not overwrite a title the caller already had with ''.
+        db = tmp_path / 'tasks.db'
+        conn = sqlite3.connect(db)
+        conn.execute(
+            'CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, '
+            'description TEXT, status TEXT, metadata TEXT)'
+        )
+        conn.execute(
+            'INSERT INTO tasks (id, title, description, status, metadata) '
+            'VALUES (?, ?, ?, ?, ?)', ('7', None, None, None, None),
+        )
+        conn.commit()
+        conn.close()
+        cand = self._cand()
+        driver.enrich_from_task_db([cand], db)
+        assert cand.title == 'pre-existing title'
+        assert cand.description == 'pre-existing brief'
+        assert cand.status == 'done'
