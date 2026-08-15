@@ -3584,3 +3584,540 @@ class TestRunInflightVerifyNeverOrphansVerifyTask:
         # What _finalize_inflight does next — exactly one episode, streak 1.
         worker._quarantine_unreachable_host('leo-laptop', _INCIDENT_RU_MSG, 1000.0)
         assert worker._runner_unavailable['leo-laptop'].streak == 1
+
+
+# ---------------------------------------------------------------------------
+# 3043/step-9 RED: a cancel_and_release that PARKs a remote slot must be
+# RECORDED, not silently stranded (the repro-#1 mechanism)
+# ---------------------------------------------------------------------------
+
+
+async def _noop_sleep(_delay):
+    """Injected sleep so the real probe loop runs synchronously."""
+    return None
+
+
+class _UnreachableRemoteRunner:
+    """Remote runner double whose reachability drives cancel/probe/health.
+
+    Down (``reachable=False``) reproduces the incident shape: ``cancel_verify``
+    returns rc != 0 and ``probe_clean`` never goes True, which is exactly what
+    makes ``HostAllocator.cancel_and_release`` leave the slot PARKED.
+    """
+
+    def __init__(self, name, *, reachable=False):
+        self.name = name
+        self.is_local = False
+        self.reachable = reachable
+        self.cancel_calls = 0
+
+    async def cancel_verify(self):
+        self.cancel_calls += 1
+        return 0 if self.reachable else 255
+
+    async def probe_clean(self):
+        return self.reachable
+
+    async def health(self):
+        return self.reachable
+
+
+class _ParkingAllocator(HostAllocator):
+    """A REAL HostAllocator that reaches the PARK path without real sleeps.
+
+    Two properties matter here:
+
+    - It is a genuine ``HostAllocator`` subclass, so the
+      ``isinstance(self._host_allocator, HostAllocator)`` gate the strand check
+      uses (task 3275's house pattern) is satisfied — a ``MagicMock`` would not
+      be, which is the point of case (e) below.
+    - ``cancel_and_release`` delegates to the REAL implementation, only
+      injecting a no-op ``sleep`` and ``max_attempts=1``.  Production call
+      sites pass neither, so an unmodified real allocator would burn
+      9 x ``asyncio.sleep(1.0)`` per parked release; the PARK logic exercised
+      is still the production one.
+    """
+
+    def __init__(self, runners, *, quarantine=None):
+        super().__init__(runners, quarantine=quarantine)
+        self.cancel_and_release_calls = []
+
+    async def cancel_and_release(self, lease, *, sleep=None, max_attempts=10):
+        self.cancel_and_release_calls.append(lease)
+        return await super().cancel_and_release(
+            lease, sleep=_noop_sleep, max_attempts=1,
+        )
+
+
+def _make_parking_worker(*, escalate_after_n=2, reachable=False, name='leo-laptop'):
+    """_make_ru_worker wired to a real (subclassed) HostAllocator + down remote."""
+    worker, eq, _fake = _make_ru_worker(escalate_after_n=escalate_after_n)
+    runner = _UnreachableRemoteRunner(name, reachable=reachable)
+    alloc = _ParkingAllocator([runner], quarantine=worker._runner_quarantine)
+    worker._host_allocator = alloc
+    return worker, eq, alloc, runner
+
+
+@pytest.mark.asyncio
+class TestParkedRemoteLeaseIsRecorded:
+    """_cancel_and_release_tracked: a PARKED remote slot is never left untracked.
+
+    Mechanism (task 3043, reify 2026-07-25): against an unreachable host
+    ``cancel_verify()`` returns rc != 0 and all ``max_attempts``
+    ``probe_clean()`` polls fail, so ``HostAllocator.cancel_and_release``
+    deliberately leaves the slot PARKED and non-acquirable — the correct
+    fail-closed state — but writes **only** ``_slots``.  The host is NOT added
+    to ``_quarantine``, so ``quarantined_remote_runners()`` cannot see it and
+    ``_reprobe_quarantined_hosts`` has no tracker entry to re-adopt.  That is
+    how the laptop went to "verifying 1/2 hosts" with ZERO dispatch attempts
+    for 3+ h and stayed there until a restart.
+
+    RED until 3043/step-10 adds the wrapper (AttributeError before that).
+    """
+
+    # -- (a) remote lease that ends PARKED is recorded -------------------------
+
+    async def test_parked_remote_lease_is_quarantined_and_tracked(self):
+        worker, _eq, alloc, _runner = _make_parking_worker()
+        lease = alloc.acquire_remote()
+        assert lease is not None
+
+        await worker._cancel_and_release_tracked(lease)
+
+        assert alloc.is_parked('leo-laptop') is True, 'precondition: slot PARKED'
+        assert 'leo-laptop' in worker._runner_unavailable
+        assert 'leo-laptop' in worker._runner_quarantine
+
+    async def test_parked_remote_lease_calls_cancel_and_release_once(self):
+        worker, _eq, alloc, runner = _make_parking_worker()
+        lease = alloc.acquire_remote()
+
+        await worker._cancel_and_release_tracked(lease)
+
+        assert alloc.cancel_and_release_calls == [lease]
+        assert runner.cancel_calls == 1
+
+    async def test_recorded_reason_names_the_parked_cause(self):
+        """The reason must say WHY, so a snapshot/log reader can act on it."""
+        worker, _eq, alloc, _runner = _make_parking_worker()
+        lease = alloc.acquire_remote()
+
+        await worker._cancel_and_release_tracked(lease)
+
+        reason = worker._runner_unavailable['leo-laptop'].reason.lower()
+        assert 'park' in reason
+        assert 'leo-laptop' in worker._runner_unavailable['leo-laptop'].reason
+
+    async def test_parked_strand_is_classified_ru_by_host_states_block(self):
+        """Task 3275's observable now shows the strand as an RU reprobe candidate."""
+        worker, _eq, alloc, _runner = _make_parking_worker()
+        lease = alloc.acquire_remote()
+
+        await worker._cancel_and_release_tracked(lease)
+
+        block = {h['name']: h for h in worker._host_states_block(1000.0)}
+        assert block['leo-laptop']['slot_state'] == 'parked'
+        assert block['leo-laptop']['quarantine_class'] == 'ru'
+
+    # -- (b) a clean cancel records nothing ------------------------------------
+
+    async def test_clean_cancel_records_nothing(self):
+        """rc == 0 → slot FREE, not parked: an ordinary release is unaffected."""
+        worker, _eq, alloc, _runner = _make_parking_worker(reachable=True)
+        lease = alloc.acquire_remote()
+
+        ok = await worker._cancel_and_release_tracked(lease)
+
+        assert ok is True
+        assert alloc.is_parked('leo-laptop') is False
+        assert worker._runner_unavailable == {}
+        assert worker._runner_quarantine == set()
+
+    async def test_cancel_fail_but_probe_clean_records_nothing(self):
+        """Cancel rc != 0 yet the probe comes back clean → slot FREE, no strand.
+
+        ``cancel_and_release`` returns False on the cancel-fail path REGARDLESS
+        of the probe outcome, so a `not ok`-only check would fabricate a
+        quarantine for a perfectly healthy host.  The PARKED state is the
+        discriminator, not the return value.
+        """
+        worker, _eq, alloc, runner = _make_parking_worker()
+        lease = alloc.acquire_remote()
+
+        async def _dirty_cancel():
+            runner.cancel_calls += 1
+            return 255
+
+        async def _clean_probe():
+            return True
+
+        runner.cancel_verify = _dirty_cancel
+        runner.probe_clean = _clean_probe
+
+        ok = await worker._cancel_and_release_tracked(lease)
+
+        assert ok is False              # cancel-fail path still reports False
+        assert alloc.is_parked('leo-laptop') is False
+        assert worker._runner_unavailable == {}
+        assert worker._runner_quarantine == set()
+
+    # -- (c) local lease never records -----------------------------------------
+
+    async def test_local_lease_never_records(self):
+        from orchestrator.verify_runner import HostLease
+
+        worker, _eq, alloc, _runner = _make_parking_worker()
+        local_lease = alloc.acquire_local(lambda: MagicMock())
+        assert local_lease is not None and local_lease.is_local
+
+        await worker._cancel_and_release_tracked(local_lease)
+
+        assert worker._runner_unavailable == {}
+        assert worker._runner_quarantine == set()
+
+        # ... and even if a caller hands in a local lease whose slot the
+        # allocator reports parked, local is the trust anchor: never recorded.
+        parked_local = HostLease(name=local_lease.name, runner=None, is_local=True)
+        with patch.object(_ParkingAllocator, 'is_parked', return_value=True):
+            await worker._cancel_and_release_tracked(parked_local)
+        assert worker._runner_unavailable == {}
+
+    # -- (d) return value passthrough + None-safety ----------------------------
+
+    async def test_returns_underlying_boolean_unchanged(self):
+        worker, _eq, alloc, _runner = _make_parking_worker()
+        parked = await worker._cancel_and_release_tracked(alloc.acquire_remote())
+        assert parked is False
+
+        worker2, _eq2, alloc2, _r2 = _make_parking_worker(reachable=True)
+        clean = await worker2._cancel_and_release_tracked(alloc2.acquire_remote())
+        assert clean is True
+
+    async def test_none_lease_is_safe(self):
+        worker, _eq, _alloc, _runner = _make_parking_worker()
+        assert await worker._cancel_and_release_tracked(None) is True
+        assert worker._runner_unavailable == {}
+
+    async def test_no_allocator_is_safe(self):
+        worker, _eq, alloc, _runner = _make_parking_worker()
+        lease = alloc.acquire_remote()
+        worker._host_allocator = None
+
+        assert await worker._cancel_and_release_tracked(lease) is True
+        assert worker._runner_unavailable == {}
+
+    # -- (e) a MagicMock allocator can never fabricate a quarantine ------------
+
+    async def test_magicmock_allocator_never_records(self):
+        """~79 MagicMock allocator sites must not start inventing quarantines.
+
+        A ``MagicMock`` answers every attribute, so duck-typing ``is_parked``
+        would make each of those doubles report a truthy PARKED slot and
+        fabricate a strand.  The isinstance gate task 3275 established for
+        exactly this reason keeps them inert.
+        """
+        from orchestrator.verify_runner import HostLease
+
+        worker, _eq, fake_alloc = _make_ru_worker()
+        fake_alloc.cancel_and_release = AsyncMock(return_value=False)
+        runner = MagicMock()
+        runner.name = 'leo-laptop'
+        lease = HostLease(name='leo-laptop', runner=runner, is_local=False)
+
+        ok = await worker._cancel_and_release_tracked(lease)
+
+        assert ok is False
+        fake_alloc.cancel_and_release.assert_awaited_once_with(lease)
+        assert worker._runner_unavailable == {}
+        assert worker._runner_quarantine == set()
+
+    async def test_recording_failure_never_breaks_the_release_path(self):
+        """A strand-detection bug must never propagate out of a release path."""
+        worker, _eq, alloc, _runner = _make_parking_worker()
+        lease = alloc.acquire_remote()
+        with patch.object(
+            type(worker), '_quarantine_unreachable_host',
+            side_effect=RuntimeError('boom'),
+        ):
+            assert await worker._cancel_and_release_tracked(lease) is False
+
+
+# ---------------------------------------------------------------------------
+# 3043/step-9 RED (wiring): every cancel_and_release call site routes through
+# the tracked wrapper
+# ---------------------------------------------------------------------------
+
+_MQ_CHOKEPOINT_CLASS = 'SpeculativeMergeWorker'
+_MQ_CANCEL_RELEASE_CHOKEPOINT = '_cancel_and_release_tracked'
+
+
+def _chokepoint_ranges(tree, cls_name: str, method_name: str) -> list[tuple[int, int]]:
+    """Line ranges of every *method_name* defined DIRECTLY on ``class cls_name``.
+
+    Copied from test_merge_queue_concurrent_verify.py:4767 per the per-file
+    duplication convention for orchestrator test helpers (this repo does not
+    cross-import between test modules).
+    """
+    import ast
+
+    ranges: list[tuple[int, int]] = []
+
+    def visit(node, enclosing_class):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                visit(child, child.name)
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if child.name == method_name and enclosing_class == cls_name:
+                    ranges.append((child.lineno, getattr(child, 'end_lineno', child.lineno)))
+                visit(child, None)
+            else:
+                visit(child, enclosing_class)
+
+    visit(tree, None)
+    return ranges
+
+
+def _cancel_release_offenders(source: str) -> list[str]:
+    """Every raw ``<allocator>.cancel_and_release(...)`` call outside the wrapper.
+
+    ``HostAllocator.cancel_and_release`` PARKs a remote slot when the cancel RPC
+    and every ``probe_clean()`` poll fail, leaving the host non-acquirable and
+    **absent from the quarantine set** — a strand ``_reprobe_quarantined_hosts``
+    can never re-adopt.  Detecting that requires reading the allocator's slot
+    state right after the release, so every call site must go through
+    :meth:`SpeculativeMergeWorker._cancel_and_release_tracked`.  A sixth inline
+    copy would silently reintroduce the defect class, hence this ratchet —
+    the same shape as ``_teardown_chokepoint_offenders``
+    (test_merge_queue_concurrent_verify.py:4828).
+
+    Receiver-anchored on an attribute named ``*allocator*`` so the scanner
+    cannot be satisfied by renaming a local, and ``ast.Call``-only so
+    ``HostAllocator``'s own definition is never reported.  Pure (takes source
+    text) so the self-tests below can drive it on synthetic modules.
+    """
+    import ast
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+
+    ranges = _chokepoint_ranges(
+        tree, _MQ_CHOKEPOINT_CLASS, _MQ_CANCEL_RELEASE_CHOKEPOINT,
+    )
+
+    parent: dict[int, object] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parent[id(child)] = node
+
+    def _enclosing_fn(node) -> str:
+        cur = node
+        while cur is not None and not isinstance(
+            cur, (ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            cur = parent.get(id(cur))
+        return getattr(cur, 'name', '<module>')
+
+    def _is_call(node) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == 'cancel_and_release'
+        )
+
+    calls = [node for node in ast.walk(tree) if _is_call(node)]
+    offenders = [
+        f'{_enclosing_fn(call)}:{call.lineno} {ast.unparse(call)}'
+        for call in calls
+        if not any(start <= call.lineno <= end for start, end in ranges)
+    ]
+    offenders.sort(key=lambda entry: int(entry.split(':', 1)[1].split(' ', 1)[0]))
+    return offenders
+
+
+class TestCancelAndReleaseChokepoint:
+    """``_cancel_and_release_tracked`` is the SOLE caller of ``cancel_and_release``.
+
+    Five production sites invoke it today — the finalize-head ``finally`` and
+    the ``_inflight`` drain in ``stop()``, the head-failure cascade's in-body
+    release, ``_resolve_and_release(cancel_lease=True)``, and
+    ``_finalize_inflight``'s ``_cancel_release`` path.  Each of them can PARK a
+    remote slot against a down host, so each must record; a ratchet is what
+    keeps site six from forgetting.  Two of the five live inside ``stop()`` and
+    one inside ``_verifier_loop``, which no state-level test drives cheaply —
+    the ratchet is what covers those, and the state tests below cover the rest.
+
+    Sync-only, and deliberately NOT ``@pytest.mark.asyncio``: this repo runs
+    pytest warnings-as-errors and pytest-asyncio raises on a sync test carrying
+    that mark.
+    """
+
+    # ── scanner self-tests: the ratchet must never pass vacuously ──────────
+
+    def test_scanner_accepts_a_compliant_chokepoint(self) -> None:
+        src = (
+            'class SpeculativeMergeWorker:\n'
+            '    async def _cancel_and_release_tracked(self, lease):\n'
+            '        return await self._host_allocator.cancel_and_release(lease)\n'
+        )
+        assert _cancel_release_offenders(src) == []
+
+    def test_scanner_flags_a_bypass_outside_the_helper(self) -> None:
+        src = (
+            'class SpeculativeMergeWorker:\n'
+            '    async def _cancel_and_release_tracked(self, lease):\n'
+            '        return await self._host_allocator.cancel_and_release(lease)\n'
+            '\n'
+            '    async def _sneaky(self, entry):\n'
+            '        await self._host_allocator.cancel_and_release(entry.lease)\n'
+            '        await _allocator.cancel_and_release(entry.lease)\n'
+        )
+        offenders = _cancel_release_offenders(src)
+        assert len(offenders) == 2, offenders
+        assert all(o.startswith('_sneaky:') for o in offenders), offenders
+
+    def test_scanner_ignores_the_allocators_own_definition(self) -> None:
+        """ANCHORING: ``ast.Call``-only — a def is not a call site."""
+        src = (
+            'class HostAllocator:\n'
+            '    async def cancel_and_release(self, lease, *, sleep=None):\n'
+            '        return True\n'
+        )
+        assert _cancel_release_offenders(src) == []
+
+    def test_scanner_does_not_sanction_a_same_named_method_on_another_class(self) -> None:
+        src = (
+            'class SomethingElse:\n'
+            '    async def _cancel_and_release_tracked(self, lease):\n'
+            '        await self._host_allocator.cancel_and_release(lease)\n'
+        )
+        offenders = _cancel_release_offenders(src)
+        assert len(offenders) == 1, offenders
+
+    # ── the live ratchet ───────────────────────────────────────────────────
+
+    def test_no_raw_cancel_and_release_call_sites_remain_in_merge_queue(self) -> None:
+        """All five production sites route through the tracked wrapper."""
+        from pathlib import Path
+
+        import orchestrator.merge_queue as mq
+
+        source = Path(mq.__file__).read_text()
+        offenders = _cancel_release_offenders(source)
+        assert offenders == [], (
+            'raw cancel_and_release call site(s) bypassing '
+            f'_cancel_and_release_tracked: {offenders}'
+        )
+
+
+@pytest.mark.asyncio
+class TestParkedStrandRecordedFromRealCallSites:
+    """Driving the real release methods leaves the strand TRACKED + QUARANTINED.
+
+    Asserted on ``_runner_unavailable`` / ``_runner_quarantine`` STATE rather
+    than on call counts, so these survive any refactor that reroutes the sites
+    through a different helper.
+    """
+
+    def _entry_with_parked_lease(self, worker, alloc):
+        """An InflightEntry holding a live remote lease on the down host."""
+        from orchestrator.merge_queue import InflightEntry
+
+        entry = _make_ru_entry(worker, 'leo-laptop')
+        lease = alloc.acquire_remote()
+        assert lease is not None
+        return InflightEntry(
+            item=entry.item,
+            lease=lease,
+            verify_task=entry.verify_task,
+            merge_wt=entry.merge_wt,
+            was_speculative=False,
+        )
+
+    async def test_resolve_and_release_cancel_lease_records_the_strand(self):
+        """Site: _resolve_and_release(cancel_lease=True) — the shared chokepoint."""
+        from orchestrator.merge_queue import MergeOutcome
+
+        worker, _eq, alloc, _runner = _make_parking_worker()
+        entry = self._entry_with_parked_lease(worker, alloc)
+
+        await worker._resolve_and_release(
+            entry,
+            MergeOutcome('blocked', reason='cascade'),
+            chain_failed=True,
+            cancel_lease=True,
+        )
+        await entry.verify_task
+
+        assert alloc.is_parked('leo-laptop') is True
+        assert 'leo-laptop' in worker._runner_unavailable
+        assert 'leo-laptop' in worker._runner_quarantine
+
+    async def test_resolve_and_release_plain_release_records_nothing(self):
+        """cancel_lease=False takes the plain (idempotent) release — no strand."""
+        from orchestrator.merge_queue import MergeOutcome
+
+        worker, _eq, alloc, _runner = _make_parking_worker()
+        entry = self._entry_with_parked_lease(worker, alloc)
+
+        await worker._resolve_and_release(
+            entry,
+            MergeOutcome('blocked', reason='dispatch error'),
+            chain_failed=True,
+        )
+        await entry.verify_task
+
+        assert worker._runner_unavailable == {}
+        assert worker._runner_quarantine == set()
+
+    async def test_stop_inflight_drain_records_the_strand(self):
+        """Site: stop()'s _inflight drain (the SIGTERM path)."""
+        worker, _eq, alloc, _runner = _make_parking_worker()
+        entry = self._entry_with_parked_lease(worker, alloc)
+        worker._inflight.append(entry)
+        worker._running = True
+
+        await worker.stop()
+
+        assert alloc.is_parked('leo-laptop') is True
+        assert 'leo-laptop' in worker._runner_unavailable
+        assert 'leo-laptop' in worker._runner_quarantine
+
+    async def test_finalize_inflight_cancel_release_records_the_strand(self):
+        """Site: _finalize_inflight's `finally` with _cancel_release=True (DROPPED)."""
+        import asyncio as _asyncio
+
+        from orchestrator.merge_queue import (
+            InflightEntry,
+            InflightStatus,
+            InflightVerifyResult,
+        )
+
+        worker, _eq, alloc, _runner = _make_parking_worker()
+        seed = _make_ru_entry(worker, 'leo-laptop')
+        await seed.verify_task            # retire the seeded RU task
+        lease = alloc.acquire_remote()
+        assert lease is not None
+
+        async def _dropped():
+            return InflightVerifyResult(
+                outcome=None,
+                merge_wt=seed.merge_wt,
+                status=InflightStatus.DROPPED,
+                reason='sole waiter abandoned',
+            )
+
+        entry = InflightEntry(
+            item=seed.item,
+            lease=lease,
+            verify_task=_asyncio.ensure_future(_dropped()),
+            merge_wt=seed.merge_wt,
+            was_speculative=False,
+        )
+
+        await worker._finalize_inflight(entry)
+
+        assert alloc.is_parked('leo-laptop') is True
+        assert 'leo-laptop' in worker._runner_unavailable
+        assert 'leo-laptop' in worker._runner_quarantine
