@@ -4875,16 +4875,10 @@ class TestLivenessSnapshotUnfieldedVerdictIsPerField:
 
         assert key_a == (True, None)
         assert key_b == (True, None)
-        assert key_a != (True, 'claimant_run_id=null|heartbeat_at=null'), (
-            'the exact measured false-grouping key must never come back'
-        )
 
         assert extract_liveness_snapshot_fact(
             _memory('a', _UNREADABLE_STATUS_IN_PROGRESS, category=_OS),
-        ) is None
-        assert extract_liveness_snapshot_fact(
-            _memory('b', _UNREADABLE_STATUS_DONE, category=_OS),
-        ) is None
+        ) is None, 'the extractor is a thin projection of the classifier'
 
     @pytest.mark.parametrize('value', [
         '"in progress',  # unterminated quote
@@ -4905,12 +4899,13 @@ class TestLivenessSnapshotUnfieldedVerdictIsPerField:
     def test_a_value_that_cleans_to_nothing_is_a_whole_record_loss(self):
         """A second, distinct route to the same defect -- survives step-2.
 
-        `.rstrip('./:+-')` can reduce a BARE value the strict alternative did
-        match (so no `unread` mention is ever produced) to the empty string,
-        and the `if cleaned:` guard then silently drops that field while a
-        readable sibling still contributes -- the same partial-key defect,
-        reached without ever taking the `unread` branch. A field the author
-        WROTE but whose value the reader cannot recover is exactly the case
+        `.rstrip('./:+-')` can reduce a BARE value the pattern DID read (so
+        `quoted`/`bare` are never both `None`, and no unreadable-value
+        verdict ever fires) to the empty string, and the `if cleaned:` guard
+        then silently drops that field while a readable sibling still
+        contributes -- the same partial-key defect, reached without the
+        value ever being unreadable. A field the author WROTE but whose
+        value the reader cannot recover is exactly the case
         `liveness_snapshot_unfielded` exists to make visible, not silently
         fold into a key built from the survivors.
         """
@@ -5337,31 +5332,20 @@ class TestLivenessPartialKeyFalseGroup:
             'liveness_snapshot_unfielded': 2,
         }
 
-    def test_a_readable_corpus_keeps_every_key_and_counts_no_loss(self):
-        """The recall guard that bounds the fix: the real motivating corpus."""
-        for record_id, content in [
-            ('6b245659', _LIVENESS_SNAPSHOT_94_JUL24),
-            ('08aa0017', _LIVENESS_SNAPSHOT_96_JUL24),
-            ('1eef7df7', _LIVENESS_REVERIFY_94_96_JUL26),
-        ]:
-            assert extract_liveness_snapshot_fact(
-                _memory(record_id, content, category=_OS),
-            ) == _CORE_FACT_STRANDED
-
-        groups, disclosure = find_liveness_snapshot_recurrences(_liveness_corpus())
-
-        assert [(g['subject_task_id'], g['member_ids']) for g in groups] == [
-            ('94', ['1eef7df7', '6b245659']),
-            ('96', ['08aa0017', '1eef7df7']),
-        ]
-        assert disclosure == dict.fromkeys(_LIVENESS_DISCLOSURE_KEYS, 0)
+    # Recall bound -- the real motivating corpus must keep every key and
+    # count no loss -- is already pinned in full and not re-asserted here:
+    # TestExtractLivenessSnapshotFact.test_all_three_real_snapshots_yield_the_same_key
+    # (the three keys collapse to `_CORE_FACT_STRANDED`),
+    # TestFindLivenessSnapshotRecurrences.test_exactly_the_two_real_groups
+    # (the exact two groups) and TestFindLivenessSnapshotRecurrencesDisclosure
+    # .test_clean_run_zero_fills_every_key (an all-zero disclosure).
 
     def test_a_quoted_value_containing_a_field_name_is_not_a_loss(self):
         """The precision guard a naive mention-count fix would fail.
 
-        The inner `claimant_run_id=` sits inside the span the strict
-        alternative already consumed as `status`'s quoted value, so it is a
-        readable value -- not a second, unread mention of a sibling field.
+        The inner `claimant_run_id=` sits inside the span already consumed
+        as `status`'s quoted value, so it is a readable value -- not a
+        second, unread mention of a sibling field.
         """
         content = (
             'Point-in-time liveness check performed 2026-07-24 on task 94: '
@@ -5371,6 +5355,49 @@ class TestLivenessPartialKeyFalseGroup:
         key = extract_liveness_snapshot_fact(_memory('x', content, category=_OS))
 
         assert key == 'status=foo claimant_run_id=bar'
+
+    def test_a_non_assignment_status_can_still_false_group(self):
+        """KNOWN LIMITATION, pinned not hidden -- the same discipline
+        `test_divergent_per_task_statuses_do_not_group` already uses.
+
+        This task's fix closes the ASSIGNMENT-form route to a survivors-only
+        key: a `<field>=` written but whose value could not be read. It does
+        not close every route to one. A status spelled `status:` (colon, not
+        `=`) carries no `<field>=` token at all, so `_LIVE_FIELD_SCAN_RE`
+        never matches it there -- it is invisible to the scan rather than an
+        unread mention of it, and the record still keys on whatever OTHER
+        fields parse. Two records asserting opposite statuses through this
+        spelling therefore still share one key and still form one group,
+        pre-existing and unchanged by this task.
+        """
+        done = (
+            'Liveness check performed 2026-08-11 on task 94: status: done, '
+            'claimant_run_id=null, heartbeat_at=null.'
+        )
+        in_progress = (
+            'Liveness check performed 2026-08-11 on task 94: status: '
+            'in-progress, claimant_run_id=null, heartbeat_at=null.'
+        )
+        done_key = _classify_liveness_snapshot(done)
+        in_progress_key = _classify_liveness_snapshot(in_progress)
+
+        assert done_key == in_progress_key, (
+            'the pre-existing gap this task does not close'
+        )
+        assert done_key != (True, None), 'both sides still classify -- no loss'
+
+        corpus = [
+            _dated('done', done, _TS_94_JUL24,
+                   category=_OS, metadata={'task_id': '94'}),
+            _dated('ip', in_progress, _TS_REVERIFY,
+                   category=_OS, metadata={'task_id': '94'}),
+        ]
+        groups, disclosure = find_liveness_snapshot_recurrences(corpus)
+
+        assert [(g['subject_task_id'], g['member_ids']) for g in groups] == [
+            ('94', ['done', 'ip']),
+        ], 'still forms a group -- closing it is out of scope for this task'
+        assert set(disclosure.values()) == {0}, 'and not a counted loss either'
 
 
 # The plan keys that existed before task 3098. Pinned so an additive change
@@ -5811,8 +5838,8 @@ class TestLivenessDetectorRegexBudget:
         """The load-bearing case for choosing the BROADER prefilter.
 
         This is the one record class that matches `LIVE_TASK_STATUS_RE` (via
-        the "actively driven by" paraphrase) but NOT either alternative of
-        `_LIVE_FIELD_SCAN_RE`. Prefiltering on the narrower scan pattern
+        the "actively driven by" paraphrase) but produces no match at all
+        against `_LIVE_FIELD_SCAN_RE`. Prefiltering on the narrower scan pattern
         would read as one consult here too, while silently driving
         `liveness_snapshot_unfielded` to a permanent zero — turning a counted
         loss back into an invisible one.
