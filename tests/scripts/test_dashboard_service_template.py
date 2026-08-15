@@ -1449,11 +1449,8 @@ def test_systemd_analyze_test_is_gated_on_the_runtime_dir_predicate() -> None:
 
 
 @pytest.mark.skipif(
-    shutil.which("systemd-analyze") is None,
-    reason=(
-        "systemd-analyze is not installed; the file-content invariants above are "
-        "the primary guard and this module requires no systemd runtime"
-    ),
+    _SYSTEMD_ANALYZE_SKIP_REASON is not None,
+    reason=_SYSTEMD_ANALYZE_SKIP_REASON or "",
 )
 def test_systemd_analyze_verify_reports_no_ignored_directives() -> None:
     """systemd itself must not report discarding any directive in the unit.
@@ -1462,8 +1459,8 @@ def test_systemd_analyze_verify_reports_no_ignored_directives() -> None:
     skippable so the module keeps the "no systemd runtime is required" contract
     stated in its docstring.
 
-    Five details here are load-bearing, each verified by measurement rather
-    than assumed (2026-08-01, systemd 255.4):
+    Six details here are load-bearing, each verified by measurement rather
+    than assumed (2026-08-01, systemd 255.4 unless noted):
 
     1. stderr is captured, not just stdout.  The warning goes to stderr while
        stdout is empty, so a stdout-only assertion would be a silent no-op that
