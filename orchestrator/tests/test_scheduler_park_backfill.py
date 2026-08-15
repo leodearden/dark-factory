@@ -28,6 +28,7 @@ plans/evidence/scheduler-scoring-2026-08-06/PARKING_MODEL_REPORT.md
 from __future__ import annotations
 
 import ast
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -1225,3 +1226,167 @@ def test_an_unreleased_grant_is_silently_lost_with_the_process_era():
     assert 'never-released' in scheduler._backfill_grants
     assert _events(store, 'park_backfill_overstay') == []
     assert scheduler._backfill_overstay_total == 0
+
+
+# ===========================================================================
+# INV-4: a rate-threshold escalation, not a per-event one
+# ===========================================================================
+#
+# The model measured 7-9% overstay at safety x2.5
+# (PARKING_MODEL_REPORT.md:254-255).  A single breach is that model working
+# as designed; a sustained rate several times higher means the predictor has
+# drifted or the factor is wrong.  So the signal is a RATE over a denominator
+# floor, filed once per episode — not one escalation per overstay, which is
+# the storm INV-4 exists to forbid.
+
+
+class _FakeEscalationQueue:
+    """Minimal queue exposing only what the filer touches."""
+
+    def __init__(self, *, open_l1: bool = False, submit_raises: bool = False) -> None:
+        self.submitted: list = []
+        self._open_l1 = open_l1
+        self._submit_raises = submit_raises
+        self.checked: list[str] = []
+
+    def has_open_l1(self, sentinel: str) -> bool:
+        self.checked.append(sentinel)
+        return self._open_l1
+
+    def make_id(self, sentinel: str) -> str:
+        return f'esc-{sentinel}'
+
+    def submit(self, escalation) -> None:
+        if self._submit_raises:
+            raise RuntimeError('escalation queue is down')
+        self.submitted.append(escalation)
+
+
+def _drive_grants(scheduler: Scheduler, clock: _Clock, *, grants: int, overstays: int):
+    """Record *grants* grants, then release *overstays* of them past the bound.
+
+    All grants are recorded BEFORE any release, so the denominator is already
+    at its final value when the first breach settles — otherwise the rate
+    would cross the threshold on an early partial denominator and the test
+    would be asserting an accident of ordering.
+    """
+    clock.now = FIXED_DT
+    for index in range(grants):
+        _record_grant(scheduler, f'c{index}')
+    for index in range(grants):
+        clock.now = FIXED_DT + timedelta(seconds=900.0 if index < overstays else 100.0)
+        scheduler.release(f'c{index}')
+
+
+def _escalating_scheduler(**queue_kwargs):
+    clock = _Clock()
+    scheduler = _make_scheduler(clock=clock, event_store=_RecordingEventStore())
+    queue = _FakeEscalationQueue(**queue_kwargs)
+    scheduler.escalation_queue = queue
+    return scheduler, clock, queue
+
+
+def test_the_escalation_policy_constants_are_what_the_model_supports():
+    """0.25 rate over a floor of 8 grants — pinned, with the reasoning.
+
+    The threshold is ~3x the measured 7-9%, and the floor is reachable within
+    days at the modelled 23-122 grants/30d.  Code constants rather than config
+    leaves: C7 mandates exactly three config literals, and escalation
+    thresholds are code properties here (the _FM_READ_FAILURE_ESCALATION
+    _THRESHOLD precedent).
+    """
+    assert pytest.approx(0.25) == scheduler_module._BACKFILL_OVERSTAY_RATE_THRESHOLD
+    assert scheduler_module._BACKFILL_OVERSTAY_MIN_GRANTS == 8
+    assert isinstance(scheduler_module._BACKFILL_OVERSTAY_SENTINEL, str)
+
+
+def test_a_perfect_overstay_rate_below_the_grant_floor_files_nothing():
+    """4 grants, 4 breaches — 100%, and still silent.
+
+    A 1-of-1 breach is noise, not a rate.  Without a denominator floor the
+    very first back-filled dispatch that ran long would file an L1 claiming
+    a 100% overstay rate.
+    """
+    scheduler, clock, queue = _escalating_scheduler()
+
+    _drive_grants(scheduler, clock, grants=4, overstays=4)
+
+    assert scheduler._backfill_overstay_total == 4
+    assert queue.submitted == []
+
+
+def test_a_sustained_overstay_rate_files_exactly_one_l1():
+    """8 grants, 2 breaches = 25% → one L1 naming rate, counts, factor, remedy."""
+    scheduler, clock, queue = _escalating_scheduler()
+
+    _drive_grants(scheduler, clock, grants=8, overstays=2)
+
+    assert len(queue.submitted) == 1, f'expected one L1, got {queue.submitted}'
+    esc = queue.submitted[0]
+    assert esc.agent_role == 'orchestrator-scheduler'
+    assert esc.severity == 'blocking'
+    assert esc.level == 1
+    assert esc.category == 'risk_identified'
+    detail = esc.detail
+    # The MEASURED rate and both counts, so the claim is checkable.
+    assert '25' in detail, 'the measured rate must appear'
+    assert '8' in detail and '2' in detail, 'both counts must appear'
+    # The configured factor and the concrete remedy.
+    assert 'backfill_safety_factor' in detail
+    assert '2.5' in detail
+    assert '2.9' in detail, (
+        'the remedy is to raise the factor toward the measured x2.9 upper '
+        'bracket — an escalation without a next action is just an alarm'
+    )
+
+
+def test_an_already_open_l1_suppresses_further_filings():
+    """One open escalation per episode, not one per release."""
+    scheduler, clock, queue = _escalating_scheduler(open_l1=True)
+
+    _drive_grants(scheduler, clock, grants=8, overstays=4)
+
+    assert queue.submitted == []
+    assert queue.checked, 'dedup must actually consult has_open_l1'
+
+
+def test_the_normal_measured_regime_stays_silent():
+    """1 breach in 20 grants (5%, near the modelled 7-9%) files nothing.
+
+    If the ordinary regime escalates, the escalation carries no information
+    and operators learn to close it unread.
+    """
+    scheduler, clock, queue = _escalating_scheduler()
+
+    _drive_grants(scheduler, clock, grants=20, overstays=1)
+
+    assert scheduler._backfill_overstay_total == 1
+    assert queue.submitted == []
+
+
+def test_no_escalation_queue_warns_and_does_not_raise(caplog):
+    """Bare-Scheduler unit tests stay green, and the gap is stated out loud."""
+    clock = _Clock()
+    scheduler = _make_scheduler(clock=clock, event_store=_RecordingEventStore())
+    assert scheduler.escalation_queue is None
+
+    with caplog.at_level(logging.WARNING):
+        _drive_grants(scheduler, clock, grants=8, overstays=4)
+
+    assert scheduler._backfill_overstay_total == 4
+    assert any(r.levelno >= logging.WARNING for r in caplog.records)
+
+
+def test_a_failing_submit_never_breaks_the_release():
+    """Filing is best-effort; settlement and release complete regardless.
+
+    A release that raised because escalation filing failed would strand the
+    task's locks — turning a reporting problem into a dispatch outage.
+    """
+    scheduler, clock, queue = _escalating_scheduler(submit_raises=True)
+
+    _drive_grants(scheduler, clock, grants=8, overstays=4)
+
+    assert scheduler._backfill_overstay_total == 4
+    assert queue.submitted == []
+    assert scheduler._backfill_grants == {}, 'every grant still settled'
