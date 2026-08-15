@@ -223,10 +223,12 @@ _LIMITS_PROVENANCE_KEYS = (
     'generator',
 )
 
-# A discarded queue record is arbitrary JSON off disk and may be arbitrarily
-# large.  The issue names WHAT was dropped and its type, so the body is capped:
-# an unbounded repr would put a multi-megabyte artifact into every poll's
-# payload, making the naming of the discard its own degradation.
+# A discarded queue record — or any single field read out of one before its
+# shape is known, such as a status or a fingerprint — is arbitrary JSON off
+# disk and may be arbitrarily large.  An issue detail names WHAT was read, so
+# the value is capped: an unbounded repr would put a multi-megabyte artifact
+# into every poll's payload, making the naming of the discard its own
+# degradation.
 _MAX_DISCARDED_VALUE_REPR = 120
 
 
@@ -253,7 +255,17 @@ def _issue(
 
 
 def _short_repr(value: Any) -> str:
-    """A length-capped ``repr`` for naming a discarded value in an issue detail."""
+    """A length-capped ``repr`` for naming a discarded or unvalidated value in an issue detail.
+
+    Builds the full ``repr`` before capping it, so the OUTPUT is bounded but
+    this transient string is not.  Accepted rather than a streaming bound
+    (e.g. ``reprlib.Repr``): ``json.loads`` already paid an O(n) cost to parse
+    *value* (or the record it came from) off disk into the object graph being
+    repr'd here, so this adds no new order of magnitude of work — just one
+    extra allocation, the same size as one already paid for, that is
+    discarded immediately.  Revisit if that extra allocation itself ever
+    becomes the bottleneck.
+    """
     text = repr(value)
     if len(text) <= _MAX_DISCARDED_VALUE_REPR:
         return text
@@ -826,8 +838,9 @@ def _index_escalations(
             _issue(
                 issues, 'unknown_escalation_status', path=escalations_dir,
                 detail=(
-                    f'escalation {record.get("id")!r} has unrecognised status {status!r}; '
-                    'not joined (only pending escalations are treated as open)'
+                    f'escalation {record.get("id")!r} has unrecognised status '
+                    f'{_short_repr(status)}; not joined (only pending escalations are '
+                    'treated as open)'
                 ),
             )
             continue
@@ -841,7 +854,8 @@ def _index_escalations(
                 issues, 'unfingerprinted_escalation', path=escalations_dir,
                 detail=(
                     f'escalation {record.get("id")!r} is open but carries no usable '
-                    f'dedupe_fingerprint ({fingerprint!r}); it can never join a metric row'
+                    f'dedupe_fingerprint ({_short_repr(fingerprint)}); it can never join '
+                    'a metric row'
                 ),
             )
             unfingerprinted.append(record)
@@ -851,7 +865,8 @@ def _index_escalations(
                 issues, 'duplicate_escalation_fingerprint', path=escalations_dir,
                 detail=(
                     f'escalation {record.get("id")!r} shares dedupe_fingerprint '
-                    f'{fingerprint!r} with {index[fingerprint].get("id")!r}; the first is used'
+                    f'{_short_repr(fingerprint)} with {index[fingerprint].get("id")!r}; '
+                    'the first is used'
                 ),
             )
             continue
