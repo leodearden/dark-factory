@@ -1543,6 +1543,43 @@ class TestEscalationJoin:
         assert 'esc-list' not in unmatched_ids
         assert 'esc-string' not in unmatched_ids
 
+    def test_a_malformed_record_cannot_blow_up_the_payload(self, tmp_path: Path) -> None:
+        """Naming a discard must not become its own degradation.
+
+        A discarded queue record is arbitrary JSON off disk and may be
+        arbitrarily large — ``load_queue_escalations`` globs ``*.json``, not
+        ``esc-*.json``, so a stray multi-megabyte array in the queue dir would
+        otherwise be ``repr``'d verbatim into the ``detail`` of every dashboard
+        poll's payload.  The reader names WHAT it dropped and its type, not the
+        whole body — and the bound must cap a long value without mangling an
+        ordinary one.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path)
+        _dump(esc_dir / 'esc-huge.json', ['x' * 100] * 1000)
+        _dump(esc_dir / 'esc-short.json', ['a'])
+
+        payload = build_memory_evals(root, esc_dir)
+
+        named = [i for i in payload['issues'] if i['kind'] == 'malformed_escalation_record']
+        assert len(named) == 2
+        assert payload['issue_count'] == len(payload['issues'])
+
+        truncated = [i for i in named if '…' in i['detail']]
+        not_truncated = [i for i in named if '…' not in i['detail']]
+        assert len(truncated) == 1
+        assert len(not_truncated) == 1
+
+        huge_detail = truncated[0]['detail']
+        assert len(huge_detail) < 500
+        assert 'list' in huge_detail
+
+        # A short body is untouched by the bound -- still a useful, complete detail.
+        short_detail = not_truncated[0]['detail']
+        assert 'list' in short_detail
+        assert "['a']" in short_detail
+
 
 # ---------------------------------------------------------------------------
 # a verdict value outside the closed M2 vocabulary
