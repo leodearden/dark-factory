@@ -940,7 +940,12 @@ async def test_curator_combine_target_done_aborts(
     taskmaster,
     audit_dir,
 ):
-    """Target with status=done → abort (would silently drop candidate work)."""
+    """Target with status=done → abort (would silently drop candidate work).
+
+    done is non-pending, so it is refused by the SAME widened eligibility
+    predicate as in-progress/blocked — and therefore, since task 4035, writes
+    a countable refusal record rather than refusing silently.
+    """
     taskmaster.get_task = AsyncMock(
         return_value={
             'id': '50',
@@ -968,7 +973,10 @@ async def test_curator_combine_target_done_aborts(
 
     assert result == {'id': '2', 'title': 'New Task'}
     taskmaster.update_task.assert_not_called()
-    assert _combine_audit_lines(audit_dir) == []
+    records = _combine_audit_lines(audit_dir)
+    assert len(records) == 1
+    assert records[0]['refused_reason'] == 'target_not_pending'
+    assert records[0]['old']['status'] == 'done'
 
 
 @pytest.mark.asyncio
@@ -977,7 +985,11 @@ async def test_curator_combine_target_cancelled_aborts(
     taskmaster,
     audit_dir,
 ):
-    """Target with status=cancelled → abort, same reasoning as done."""
+    """Target with status=cancelled → abort, same reasoning as done.
+
+    Like done, refused by the widened eligibility predicate and therefore
+    audited with a countable refusal record since task 4035.
+    """
     taskmaster.get_task = AsyncMock(
         return_value={
             'id': '50',
@@ -1005,7 +1017,10 @@ async def test_curator_combine_target_cancelled_aborts(
 
     assert result == {'id': '2', 'title': 'New Task'}
     taskmaster.update_task.assert_not_called()
-    assert _combine_audit_lines(audit_dir) == []
+    records = _combine_audit_lines(audit_dir)
+    assert len(records) == 1
+    assert records[0]['refused_reason'] == 'target_not_pending'
+    assert records[0]['old']['status'] == 'cancelled'
 
 
 @pytest.mark.asyncio
@@ -1262,6 +1277,132 @@ async def test_curator_combine_absent_claimant_key_proceeds(
 
     taskmaster.update_task.assert_called_once()
     assert result['action'] == 'combine'
+
+
+@pytest.mark.asyncio
+async def test_curator_combine_refusal_records_not_pending_reason(
+    curator_interceptor,
+    taskmaster,
+    audit_dir,
+):
+    """An eligibility refusal is COUNTABLE, not just logged (task 4035).
+
+    At a measured 20.2% refusal rate an operator cannot compute a rate from
+    success records alone. The coarse token plus the record's existing
+    old.status field is what makes a per-status breakdown computable without
+    log-scraping.
+    """
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '50',
+            'status': 'in-progress',
+            'title': 'Live Task',
+        }
+    )
+    rewritten = RewrittenTask(
+        title='x',
+        description='',
+        details='d',
+        files_to_modify=[],
+        priority='medium',
+    )
+    decision = CuratorDecision(
+        action='combine',
+        target_id='50',
+        target_fingerprint='Live Task',
+        rewritten_task=rewritten,
+        justification='...',
+    )
+    curator_interceptor._curator = _mock_curator(decision)
+
+    await _submit_and_resolve(curator_interceptor, '/project', title='Fix x')
+
+    records = _combine_audit_lines(audit_dir)
+    assert len(records) == 1
+    rec = records[0]
+    assert rec['refused_reason'] == 'target_not_pending'
+    assert rec['target_id'] == '50'
+    assert rec['old']['status'] == 'in-progress'
+
+
+@pytest.mark.asyncio
+async def test_curator_combine_refusal_records_claimed_reason(
+    curator_interceptor,
+    taskmaster,
+    audit_dir,
+):
+    """The two refusal causes are DISTINGUISHABLE in the audit (task 4035).
+
+    A claimed target is 'pending', so only a distinct token separates it from
+    the not-pending population — which is the explicit ask.
+    """
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '50',
+            'status': 'pending',
+            'title': 'Test Task',
+            'claimant_run_id': 'run-abc:sess-1:4242',
+        }
+    )
+    rewritten = RewrittenTask(
+        title='x',
+        description='',
+        details='d',
+        files_to_modify=[],
+        priority='medium',
+    )
+    decision = CuratorDecision(
+        action='combine',
+        target_id='50',
+        target_fingerprint='Test Task',
+        rewritten_task=rewritten,
+        justification='...',
+    )
+    curator_interceptor._curator = _mock_curator(decision)
+
+    await _submit_and_resolve(curator_interceptor, '/project', title='Fix x')
+
+    records = _combine_audit_lines(audit_dir)
+    assert len(records) == 1
+    rec = records[0]
+    assert rec['refused_reason'] == 'target_claimed'
+    assert rec['old']['status'] == 'pending'
+
+
+@pytest.mark.asyncio
+async def test_curator_combine_success_record_carries_no_refused_reason(
+    curator_interceptor,
+    taskmaster,
+    audit_dir,
+):
+    """A success record has NO refused_reason key (task 4035).
+
+    Keeps the change additive: the existing records stay parseable and
+    ``rec.get('refused_reason')`` cleanly partitions refusal from success
+    with no schema migration.
+    """
+    rewritten = RewrittenTask(
+        title='Unified parser work',
+        description='Combined',
+        details='d',
+        files_to_modify=[],
+        priority='high',
+    )
+    decision = CuratorDecision(
+        action='combine',
+        target_id='50',
+        target_fingerprint='Test Task',
+        rewritten_task=rewritten,
+        justification='same concern',
+    )
+    curator_interceptor._curator = _mock_curator(decision)
+
+    result = await _submit_and_resolve(curator_interceptor, '/project', title='candidate')
+
+    assert result['action'] == 'combine'
+    records = _combine_audit_lines(audit_dir)
+    assert len(records) == 1
+    assert 'refused_reason' not in records[0]
 
 
 @pytest.mark.asyncio
