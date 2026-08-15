@@ -1,5 +1,5 @@
 {
-  "swept_at": "2026-08-12T13:08:06.153106+00:00",
+  "swept_at": "2026-08-15T11:13:35.596476+00:00",
   "projects": [
     "dark_factory",
     "reify"
@@ -8,25 +8,26 @@
     "decisions_and_rationale",
     "temporal_facts"
   ],
-  "scanned": 7577,
-  "records_with_claims": 1647,
+  "scanned": 7595,
+  "records_with_claims": 1653,
   "summary": {
-    "mismatch": 166,
+    "mismatch": 167,
     "unverifiable": 30,
+    "edges_unqueried": 0,
     "by_category": {
       "decisions_and_rationale": 112,
-      "temporal_facts": 84
+      "temporal_facts": 85
     },
     "by_project": {
-      "dark_factory": 126,
+      "dark_factory": 125,
       "know_live": 10,
       "knowlive": 4,
-      "reify": 55,
+      "reify": 57,
       "solar_challenge_platform": 1
     },
     "by_subject": {
       "commit": 35,
-      "task": 161
+      "task": 162
     }
   },
   "truncated_by": null,
@@ -36,6 +37,8 @@
     "UNVERIFIABLE INDICTS NOBODY: a task deleted since, a garbage-collected commit, or an expired ticket all read as unverifiable through no fault of the writer. 'unverifiable' and 'mismatch' are different facts and are never summed in this report.",
     "COVERAGE, STORE: this sweep covers GRAPHITI EPISODES only. A MEM0-resident record is NOT covered, because the two categories in scope are Graphiti-primary and Mem0 is not read at all.",
     "COVERAGE, ORPHANED EDGES: a derived RELATES_TO edge whose source episode has been deleted is NOT covered, and neither is an episode ingested through add_episode with a caller-supplied description, which carries no category and so falls outside the category scope.",
+    "COVERAGE, CROSS-GRAPH EDGES: derived_edge_uuids is enumerated ONLY in the graph the episode was READ FROM (the finding's graph_name). An episode whose group_id differs from that graph \u2014 see any finding where those two fields disagree \u2014 may have its derived RELATES_TO edges in ANOTHER graph, where they are NOT counted here. Measured, not hypothetical: episode a887c958-0018-4715-8817-cf048c187e8d exists only in the reify graph with group_id dark_factory, and its 8 derived edges exist only in the dark_factory graph. An empty list therefore means \"none in THIS graph\", not \"none anywhere\".",
+    "EDGES NOT ENUMERATED: a finding whose derived_edge_uuids is null (and whose edges_unqueried is true) had its RELATES_TO edges NOT enumerated \u2014 no reader resolved for its graph, or the edge query failed. Its harm artefacts are UNKNOWN, not absent. An empty list means the opposite: the store WAS asked and returned nothing.",
     "DETECTION BOUND: claims are detected by the deterministic lexical vocabulary in fused_memory.services.completion_claim_gate, which requires completion PHRASING and a concrete NAMED REF (task id / commit sha / tkt_ id) to co-occur in one clause. A fabricated completion phrased without a named ref is invisible to this sweep by construction."
   ],
   "findings": [
@@ -44,6 +47,7 @@
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-04-17T02:40:09.491366+00:00",
       "claim_kind": "applied_work",
       "subject": "commit",
@@ -61,13 +65,15 @@
         "3a856f8e-2445-4832-8184-75c0b626bb88",
         "c036c055-72bf-46d5-9b2e-55c4d1fdb5dc",
         "db947844-29a4-4e5c-ac67-768fe2866834"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "af6c78cf-ff56-4cd8-bf85-7d04d32f87d4",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-04-22T11:51:26.163633+00:00",
       "claim_kind": "applied_work",
       "subject": "commit",
@@ -81,13 +87,15 @@
         "5ee12f9c-ef6d-4e2c-b03e-f297f6576569",
         "d3f441cf-7ecd-465f-91bf-508ce80c635d",
         "eb90b51d-b7b6-4598-8d49-6f0959b0851a"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "90c50c81-dc4b-4cc5-9d79-16e119450d2d",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-04-28T10:08:43.270359+00:00",
       "claim_kind": "applied_work",
       "subject": "commit",
@@ -103,13 +111,15 @@
         "601812e8-0206-4b86-8a4a-e00d963d9803",
         "5c1ef173-ec43-41bb-ae6d-8475d5af4345",
         "d9b91680-8918-4644-9c64-04b405671520"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "d4222ff5-1351-4299-b4f7-dfe1e085e448",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-15T14:15:09.124012+00:00",
       "claim_kind": "applied_work",
       "subject": "commit",
@@ -126,13 +136,15 @@
         "30f24ea8-8806-4242-b683-470b8a6be294",
         "9c42c483-d2af-4eaa-84e8-0945e580f4b4",
         "e2454ca6-0be5-4226-bae5-ea64612ffa9f"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "d4222ff5-1351-4299-b4f7-dfe1e085e448",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-15T14:15:09.124012+00:00",
       "claim_kind": "applied_work",
       "subject": "commit",
@@ -149,13 +161,15 @@
         "30f24ea8-8806-4242-b683-470b8a6be294",
         "9c42c483-d2af-4eaa-84e8-0945e580f4b4",
         "e2454ca6-0be5-4226-bae5-ea64612ffa9f"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "81c78b05-cad4-492a-8637-206d32751ae9",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-05-29T09:20:42.876198+00:00",
       "claim_kind": "applied_work",
       "subject": "commit",
@@ -177,13 +191,15 @@
         "38ba867d-1604-4c73-b605-b9b8d0581b49",
         "c8c07b31-4b63-4c79-827f-4759bcede3bf",
         "0d7b4f67-edc8-4f45-8826-189cecdd6259"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "1879d86f-6ec2-43d6-a5a8-88e6e445a068",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-06-01T07:25:58.407292+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -200,13 +216,15 @@
         "b6d09bef-a07d-42a4-86a0-c4ed5e2d26ba",
         "f8794bf7-b0af-42c1-abfd-f7f03da9e860",
         "fb9b4d87-da5c-4304-bd1d-c3a682578363"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "60f904c8-4354-453a-9313-9555bc77b33b",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-06-03T06:59:25.616004+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -220,13 +238,15 @@
         "5ae72db2-306c-46c2-9643-28092f248955",
         "53d6ffaa-3add-4fab-bd1e-cbf0c58d8fcf",
         "89057d4e-93c3-438c-9610-43435ba4a4f4"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "dd30b572-8a2d-4c1f-818d-8b31b30ee1ca",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-06-18T13:42:02.068859+00:00",
       "claim_kind": "applied_work",
       "subject": "commit",
@@ -245,13 +265,15 @@
         "828c4f29-3850-44bb-8ab3-a942af95795c",
         "b47cdcf7-b358-44cc-adde-48ec073ea9b9",
         "c3190f69-b550-498f-941f-964fdc552b58"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "994dec4c-5024-4afd-8afd-a8f66330e3ef",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-06-23T11:24:31.336303+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -265,13 +287,15 @@
         "f6c13f03-8bb1-4b90-ba90-b84cb31bd206",
         "0497359b-08bd-4110-9034-3e0be67dacd8",
         "e79f14fc-9dcf-4830-a191-a2ac2f8c107e"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "b6153503-d140-4b7c-be20-189531201d2e",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-06-24T14:28:38.696493+00:00",
       "claim_kind": "applied_work",
       "subject": "task",
@@ -286,13 +310,15 @@
         "f83ac018-ba20-4c0e-b4b2-2eb65a5b0e45",
         "06788017-c6aa-4a00-bae1-6b578d8f4474",
         "87afa65f-c7be-4aba-b796-395563606aca"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "3c5c45ce-378d-4a0d-889e-031c7c49d40c",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-06-24T17:46:31.166666+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -307,13 +333,15 @@
         "f80cf417-6c74-4008-aa56-2a23cc4b49ce",
         "60ce8f66-2251-4294-b9cc-2a34c29cbff2",
         "63e7e511-1a69-4e3d-a3a7-859e19d9b661"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "32b3234a-108b-440a-aadc-a6e9c5715576",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-06-28T12:08:14.576542+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -329,13 +357,15 @@
         "ced6d0b9-9fa5-4ebb-bee9-2c714af4225b",
         "14d05138-2b07-4633-b689-04e819bd94cb",
         "6cc26932-e760-4abd-901f-0ae8a7fe0c70"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "587c83f4-eeee-4d4a-9a51-2cf564fd0c7f",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-07-01T15:17:51.578365+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -353,13 +383,15 @@
         "015e6825-c46c-4164-8f04-6b92c4495fbf",
         "1afd7434-f551-4019-8ef9-be9569e5634d",
         "c5b86fdd-3b92-4f64-b6be-402bbd2934c6"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "9e0b94d6-7aad-4ccc-896e-3e744b94441f",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-07-04T03:30:39.094164+00:00",
       "claim_kind": "applied_work",
       "subject": "commit",
@@ -373,13 +405,15 @@
         "dec9d27a-5864-4b1e-b8cb-8f1718daf5ed",
         "ed82dd29-83ca-48ec-ac7f-ce3e59cd4e49",
         "6c799304-5e19-43eb-a30c-694e819570e7"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "5bcfcfbe-c93d-440c-a4ff-b061f4efc5a4",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-07-06T10:19:07.934175+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -394,13 +428,15 @@
         "9aa658a8-0567-44a8-8cc9-b1a53fb77df8",
         "9c10e7fa-26be-4414-a7da-731bfa5c47db",
         "368371ee-7081-4129-ba8f-0661e37930d8"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "8e79da4f-c86a-4d05-9a85-7229ad9282a8",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-07-06T12:06:36.491048+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -417,13 +453,15 @@
         "cb8f85aa-81f9-4ebd-a087-7b8c9a73cb1a",
         "033a1ecb-9ab4-439b-b2f7-d86f548f8b8f",
         "6bcd3051-7581-42b9-9284-13080a0ca39a"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "88ebb70c-cc17-48a1-83ce-41e7ce24e73d",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-07-09T11:17:31.531811+00:00",
       "claim_kind": "applied_work",
       "subject": "commit",
@@ -438,13 +476,15 @@
         "cc8be522-ea9c-4419-9fe7-140e79f2ba71",
         "f6fcb922-6bef-4db7-a621-bb80f855c128",
         "93233e4d-e6e4-4c0c-80a6-22d9b74839d1"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "2df7dda7-7677-462f-a335-f3be7662dedc",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-07-14T14:36:06.807940+00:00",
       "claim_kind": "applied_work",
       "subject": "task",
@@ -461,13 +501,15 @@
         "c16ddb24-3f4a-4387-ba9b-b2fae3a91daf",
         "8a916eb8-1ea8-4c43-9b85-4b25bbe01000",
         "124a6d36-7313-457c-80d3-5f95a300b704"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "2cd26afd-370c-4ee6-883c-914303aeeef9",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-07-15T10:05:08.451567+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -484,13 +526,15 @@
         "c3ce28ea-39f7-4d89-ab73-0fd9aca73332",
         "439b6b9a-0294-4592-a924-fe5c25b4ea75",
         "05873e81-6319-4941-9761-9cfc2deb3ced"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "f2778967-a696-4744-ad47-ad3848f566eb",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-07-17T11:05:57.046351+00:00",
       "claim_kind": "applied_work",
       "subject": "commit",
@@ -501,13 +545,15 @@
       "claimed_text": "lock, post reify-5223) is done, merged via commit a05549ab85973dd46c1ddbe147f1ccccba8b00e5",
       "derived_edge_uuids": [
         "00553dfc-6ef6-4781-858a-b7af635ef993"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "1c2a15fe-5f07-4a6d-a6dd-a9322f9f0cf1",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-07-17T20:41:39.414264+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -523,13 +569,15 @@
         "9919465e-04c8-4bc0-a93e-7626e2edbd9f",
         "823c5229-7b5f-47e4-b385-94995fbe689a",
         "312b3fa9-2cbb-460f-a39d-1b156ff58568"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "397e1276-6338-4fb3-b452-3c6543eabd99",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-07-18T13:48:52.842483+00:00",
       "claim_kind": "applied_work",
       "subject": "commit",
@@ -546,13 +594,15 @@
         "f7d84cd0-f901-44ff-adde-c561a2a945d2",
         "a2fdad47-c426-4fe7-89ef-fa6ebc21085c",
         "48fc0e1a-e275-40a0-b4ee-10e8abe6dff4"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "397f53fc-d27c-443a-b6dd-e27952ea762b",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-07-19T09:41:03.746950+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "commit",
@@ -567,13 +617,15 @@
         "e4374475-553a-4a40-8eda-3c4a650c77ed",
         "ef23a802-371b-4e14-86d0-06706d08a590",
         "dfb39f5e-22bd-42df-af77-aa962b0edbc6"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "3095e292-1b4d-4e3b-97e1-cc296f01610c",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-07-19T21:56:25.904325+00:00",
       "claim_kind": "applied_work",
       "subject": "commit",
@@ -590,13 +642,15 @@
         "d90b3f78-2046-4956-9c5e-a1731d003a00",
         "cb9a309d-ba45-4c85-a6c7-ffd6f300f231",
         "418aedbb-673f-4c4b-b365-05e9be8f81e2"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "de97634b-039d-49d8-a5e7-75c5371e416c",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-07-20T16:47:05.468134+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -618,13 +672,15 @@
         "3fc6d399-e528-418c-813f-3aa1c89cac93",
         "95dd43ea-cdae-42bd-a9a3-e39b20cef976",
         "e167f1f0-ebf1-41de-87d0-69b2d53874a3"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "de97634b-039d-49d8-a5e7-75c5371e416c",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-07-20T16:47:05.468134+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -646,13 +702,15 @@
         "3fc6d399-e528-418c-813f-3aa1c89cac93",
         "95dd43ea-cdae-42bd-a9a3-e39b20cef976",
         "e167f1f0-ebf1-41de-87d0-69b2d53874a3"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "c1e66055-ffa0-4878-af24-0a3dbfc07185",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-07-21T05:28:12.193899+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -668,13 +726,15 @@
         "4efd632d-4418-4e2d-ba28-d54a13a6fa18",
         "d21b9059-3935-425d-89c2-97087a38dfd2",
         "7bc6039b-026d-4c2e-8ded-cae37aa41581"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "c1e66055-ffa0-4878-af24-0a3dbfc07185",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-07-21T05:28:12.193899+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -690,13 +750,15 @@
         "4efd632d-4418-4e2d-ba28-d54a13a6fa18",
         "d21b9059-3935-425d-89c2-97087a38dfd2",
         "7bc6039b-026d-4c2e-8ded-cae37aa41581"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "1eefbd1e-0439-480a-a3cf-95cb6db7a830",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-07-21T17:18:35.360703+00:00",
       "claim_kind": "applied_work",
       "subject": "task",
@@ -714,13 +776,15 @@
         "802aea5d-7a77-415f-980a-262a519d7bda",
         "14f6631c-5ebf-4126-a07e-cf568e6e87cc",
         "a52b0a89-1db1-4c3b-ab15-f1d4a17a8be2"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "60d1f04d-5683-408c-996f-56f9db390122",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-07-22T11:31:05.806781+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -738,13 +802,15 @@
         "4dbe8061-e083-4c76-b6ca-4bb632d54acf",
         "69f3ac49-4e82-42b9-9c1d-99f0119f90f5",
         "2b590226-6c06-4b75-842d-51eea17dff7d"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "7ae03ac3-0044-497a-951e-b1834edc8070",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-07-22T11:39:32.582352+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -764,13 +830,15 @@
         "feb871d6-dab4-4ad6-bbad-a41434cf311e",
         "b5724d4c-8d4b-4ef6-9b32-39de1c9f6964",
         "9e7ee979-4e77-4974-9b22-67a86317dca3"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "270133d2-8a83-4d22-800f-c38bbc1a9856",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-07-25T06:32:38.819832+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -787,13 +855,15 @@
         "cb7c26d6-f41b-473f-9ff7-7f843bc55fc4",
         "ee897028-b842-491e-a884-33e3236b1aeb",
         "51005bae-9c12-4c3f-a2f9-1982c757cfb3"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "98cc0479-799a-4572-80d2-18c502aef6cd",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-07-27T10:09:38.246658+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -808,20 +878,22 @@
         "f62d3fde-221c-445e-beaf-a2dbe153bf30",
         "77da1dce-222f-4872-b214-b49e02d95e3f",
         "5cbd853f-0263-490b-93bb-6d649737b42a"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "97bb9efd-fbed-4884-b110-d34ad124d9b2",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-07-28T10:33:40.048635+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
       "ref": "5656",
       "claim_project_id": "reify",
       "status": "mismatch",
-      "observed": "in-progress",
+      "observed": "pending",
       "claimed_text": "During the /unblock of reify task 5656, the adjacent gap in run_orphan_audit (its empty-stdout branch erases WHY it skipped, leaving all 8 callers silently green on a wrong-tree audit) was filed as a SEPARATE task rather than folded into task 5605, which already holds the file lock on crates/reify-test-support/src/orphan_audit",
       "derived_edge_uuids": [
         "6f91c3de-067e-4e46-a18d-1490b353d205",
@@ -830,13 +902,15 @@
         "2144fcc5-c4cf-4db1-803a-762f40309f36",
         "f34b2c5d-da46-47da-975a-3fff120c808e",
         "7cccdbe9-1f86-490e-adad-d99cf882aa45"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "1554dafd-88d9-4c35-99c8-3e10e4dba805",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-07-28T14:45:02.603879+00:00",
       "claim_kind": "applied_work",
       "subject": "task",
@@ -851,13 +925,15 @@
         "2d805790-bf05-4107-8c15-faebc5e5caec",
         "8010e35c-8e10-42ed-b93e-19ec048a8e13",
         "dff0c9c7-90ae-40ee-a7a9-48e065400a00"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "68b73a58-1255-4e95-8e1f-62a142855967",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-07-28T16:28:34.685616+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -872,13 +948,15 @@
         "f78ad412-e178-432f-b7b0-e8b690ebf0c7",
         "a16ec048-8e6a-437b-9593-e5456f55f4b3",
         "3b7a674d-f555-42cf-9945-6276618a36af"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "a851f81f-e616-4d86-8703-a107d42bcb09",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-07-28T20:12:56.631832+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -893,13 +971,15 @@
         "e77f0b80-3667-4d75-bdaf-dbeee23f2014",
         "5fe3c7eb-c60a-476f-907a-8ecb23f891c2",
         "92eecfa9-bf52-4a6f-819b-41ca9e80b7a2"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "d64155f7-2547-40d7-92f3-9c1b49fcb566",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-07-28T20:46:17.864757+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -917,13 +997,15 @@
         "a856740d-b757-45cd-8b5f-65de409d353c",
         "ac996bbc-7f5a-4b57-ad0e-d6e23109db72",
         "0872e650-82ba-4bf2-8158-5f0f92aa67dd"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "e6af12c8-e6af-4d84-9f6e-2641594a358a",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-07-28T20:46:59.133490+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -936,13 +1018,15 @@
         "6c02a7c9-ca66-44bf-b3d3-1155bab5d10e",
         "34926866-3436-4f6e-ab8f-8ad01ddf3e6a",
         "f9d9c418-0b47-4692-918a-b59384d2f460"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "e0cbb867-4722-4a86-9dbb-13348682b734",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-07-28T20:50:30.173806+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -960,20 +1044,22 @@
         "ad2839c7-a14f-4504-b38b-0c8a02fe1dc1",
         "3fef90a5-01cc-49ba-b2ad-c1ce39775cf1",
         "75e9e429-f666-401c-aab5-0362fd856743"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "509e7cb5-498a-4609-9064-bcfe706f66bf",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-07-28T20:58:07.111962+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
       "ref": "5730",
       "claim_project_id": "reify",
       "status": "mismatch",
-      "observed": "in-progress",
+      "observed": "pending",
       "claimed_text": "sh, and filed the root fix separately as task 5730",
       "derived_edge_uuids": [
         "e935980a-89da-446c-872d-6a4a66c6de92",
@@ -983,31 +1069,35 @@
         "a0ff0d6c-767c-4fca-8d5e-130aaa027833",
         "5bdaaffe-ad07-4fa4-8b9d-e6e4fa454f89",
         "dfa7b2e8-9803-4596-b23c-42972dc16954"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "16e38e28-819d-4293-8656-ba5c1f5e81bd",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-07-29T07:12:19.876104+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
       "ref": "5667",
       "claim_project_id": "reify",
       "status": "mismatch",
-      "observed": "in-progress",
+      "observed": "pending",
       "claimed_text": "Rather than reword it away, a search found task #5667 (\"Hoist SKIP_SET dead-key existence check into reify-test-support\") \u2014 pending, and filed from task 5566's OWN reviewer duplication finding",
       "derived_edge_uuids": [
         "b06c1642-e402-409d-a441-03eaa96b8e09",
         "e4c2f7a0-c8d5-4e0d-bb9c-5921918875c8"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "9ce95f5b-20e6-4f0d-8495-0927634dbf1d",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-07-29T10:46:11.944200+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -1021,13 +1111,15 @@
         "a8e309db-99d5-41b6-929d-7aab9c1813da",
         "20f0538e-fa06-4305-8989-348fc11714f5",
         "566bf2c1-bc82-445c-927b-1238e14e038f"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "5dbe2243-40fa-44e9-94a6-e6137f83db32",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-07-30T13:48:06.870275+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -1047,13 +1139,15 @@
         "1472d623-9981-4842-ad68-6cb9dfd83823",
         "2cf147e6-2253-4fd3-b860-5e6a88264692",
         "355dcf0a-5e0c-4de4-9ef3-f8c5ad74bd9f"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "181595f7-05d5-4dad-8ab3-f9a8627e7d09",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-07-30T13:52:17.109611+00:00",
       "claim_kind": "applied_work",
       "subject": "task",
@@ -1070,13 +1164,15 @@
         "defccefd-62fb-4661-9776-b8d0255fb25f",
         "56d7c130-4f3b-4069-b538-b4562be5040d",
         "f698f8e2-4637-4d8c-89f9-d522fc92feac"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "3984d4ee-a17a-40b1-b023-b4f70abd5cda",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-08-02T13:24:30.020252+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -1094,13 +1190,15 @@
         "3ca59a04-7cdc-43ae-a70c-298bc3febf68",
         "e787f54f-32de-4cf8-a66f-da888dc789ba",
         "2026f0a4-8ff6-44f0-9510-34736202bdbc"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "b1f79017-5fd1-4577-880b-ce08df903542",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-03T07:39:22.843769+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -1119,13 +1217,15 @@
         "e1f6b065-1a6d-464e-bff0-17e7a0a25a95",
         "db76ef2d-2c69-4c90-9f8a-7b6bb3916f76",
         "720b1de2-b6aa-49d8-a603-ea05dc14bdc5"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "56052308-694f-4f79-a493-2479c6c525c7",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-03T10:37:12.990545+00:00",
       "claim_kind": "applied_work",
       "subject": "task",
@@ -1142,13 +1242,15 @@
         "1288b55a-fa72-49d9-bc3c-65d1f5c71c73",
         "55051570-4772-43c9-a36c-2ff2235423f7",
         "55b9c773-c917-4121-bcac-60b47214260f"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "e02ee5d5-7233-41f4-9411-e66d68ca90a8",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-03T10:39:25.750233+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -1165,13 +1267,15 @@
         "56669d3a-28bc-4a2d-8812-938532469eb9",
         "57102d18-346d-46cf-8b48-16466ba3cc3e",
         "0687fa97-2376-42ed-8e30-c0a5b47d91a6"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "7ee7bc0c-35fd-4400-b49e-c50e10ff51ad",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-03T10:58:54.627344+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -1186,36 +1290,15 @@
         "d1750b22-bba7-4d94-990b-8fc9eb498fe2",
         "560df288-eab6-4b50-ae0f-39fd1727e26a",
         "ddf8abe1-cfcc-41ed-b1fc-acc2f7ed76de"
-      ]
-    },
-    {
-      "record_uuid": "e64dbe6f-5df7-43a3-be1f-398ce55278cf",
-      "record_kind": "episode",
-      "category": "decisions_and_rationale",
-      "project_id": "dark_factory",
-      "created_at": "2026-08-03T11:29:51.510407+00:00",
-      "claim_kind": "applied_work",
-      "subject": "task",
-      "ref": "3584",
-      "claim_project_id": "dark_factory",
-      "status": "mismatch",
-      "observed": "pending",
-      "claimed_text": "The ruling had three parts: (1) record the disposition as D composite, since the work actually done was B (tasks 3582+3583) plus a narrowed A (task 3584) plus a classification split that A/B/C never contemplated (tasks 3585+3586) plus a docs fix already landed",
-      "derived_edge_uuids": [
-        "e755ddf9-805f-446d-860d-2045c2fd1131",
-        "8752bf50-a4c7-429d-bcaf-7ebc004b715a",
-        "7c3ca359-e5c2-459a-b5af-7ac038886a75",
-        "5d52bb80-ab32-42b9-bd5d-236fa4e93e54",
-        "181ae6cc-6b65-4b93-a35d-cd73f03b8f4b",
-        "7e9a73f9-3583-4693-a97c-3c8e03d32053",
-        "5c217e55-a4c8-46b3-a1a4-3b802db7a83d"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "53778c85-7424-4976-a9a8-679a1b6d63ce",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-08-03T16:50:06.024076+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -1230,13 +1313,15 @@
         "1399ab03-6760-4556-ae00-f3a0545ac5ce",
         "5f4b6adc-16be-4718-aab7-209c5d46c5b6",
         "9315160a-c9b0-42f6-b2a2-5009c9e6f9e1"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "4c59e0fd-db66-47f9-93af-8fe77a5b353f",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-04T07:05:14.527037+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -1251,13 +1336,15 @@
         "d0d6f103-3ff3-4524-ab74-282a0c1f9f86",
         "59589624-fbdc-4023-abf0-e1dea68011d4",
         "a804a5cf-5d64-42c6-876e-dbc533a1c119"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "7f7fb78c-f8a7-4c98-997b-c3fdbba9cc6d",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-04T12:33:45.263326+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -1272,13 +1359,15 @@
         "d9a3fb08-dc6d-47b5-b943-045db356a05c",
         "8cf00a73-025f-4b0e-ae20-cff36b0135f8",
         "02e82b70-a095-417d-9e31-3dcc7ae1c606"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "e7b607c8-e0bf-4da3-b33f-6d5c1c5aae98",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-04T16:59:09.606552+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -1293,13 +1382,15 @@
         "03e03467-b2a0-4131-b94a-460e374be97e",
         "58f4987b-5e96-4d55-ba29-c6325fff6856",
         "4c4359f2-8e8c-4554-9b99-ed3e32605d89"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "0079901d-c574-4765-85bc-07276ec7bf77",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-04T17:21:39.061633+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -1314,13 +1405,15 @@
         "67827385-fa76-4fc4-8a5d-c58a3615b122",
         "3fa679c2-e0a0-41d5-b5ef-093c027f522c",
         "7e66c9a2-0a75-464a-be66-871062c248b1"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "96a61ae6-b2df-4f13-947c-fbc539acd01e",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-04T19:01:55.498864+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -1335,13 +1428,15 @@
         "fece0d3f-09a2-4eb4-a31d-0e5fe1058b72",
         "1527b999-0ba9-48c9-9b4e-bfac73e05f4c",
         "2f01f1e4-b0f8-4300-890c-91233f336561"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "e2451d86-9e37-4dff-9351-d37416d8440b",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-08-05T11:28:18.043051+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -1359,13 +1454,15 @@
         "01e3ff5d-ef73-4f52-9914-95533fca5cf9",
         "993a9a7b-1fb3-4abb-bd88-5508fd17373f",
         "eaff98db-e824-494f-bf53-1ef2c415f8f1"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "9e3733b2-e1d7-4e9e-bf6f-1b71990f6bbb",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-05T19:20:06.783608+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -1380,13 +1477,15 @@
         "e1391679-3b4d-42ca-a17a-c774b0e71ac7",
         "c207a09c-b78f-42e9-9057-64852cde33d3",
         "350fcd16-6dbf-45d5-b612-cd4e76940415"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "91973f6d-aa3b-4ec9-8f15-5e0e5a14328f",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-05T20:16:15.349153+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -1400,13 +1499,15 @@
         "45a3b4b9-acdd-46d1-bdb4-3bbc942a13bb",
         "1e325e43-7862-4a9e-885f-12a138403777",
         "248772b9-2746-4fd6-9083-2b76c663b30a"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "baaebac9-005d-4d02-bb62-44d1c591679c",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-05T20:30:53.370748+00:00",
       "claim_kind": "applied_work",
       "subject": "task",
@@ -1422,13 +1523,15 @@
         "420d571d-b909-42d5-af03-1a065bd06a58",
         "0c4c0c19-91aa-4ab0-90f5-ec159e9a4e54",
         "408eb0a4-24eb-4877-bf98-04265517718e"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "80e25e64-cf1c-4ffb-ac58-f214bdddfd09",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-05T20:32:59.090136+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -1443,13 +1546,15 @@
         "a089fd77-a9f0-414b-8840-25a652ba4ac8",
         "4c355aaf-742c-4384-9db2-12381501790e",
         "c6486872-3ce0-493d-9153-285517ee6999"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "e20a43b3-6f7f-4c4e-8b4b-917a830d076c",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-05T22:21:04.368933+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -1461,13 +1566,15 @@
       "derived_edge_uuids": [
         "a089fd77-a9f0-414b-8840-25a652ba4ac8",
         "dc5cddae-7157-464b-af1f-f1c733a7d877"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "2d7a4fd9-a7a4-48cd-b3e6-4b1af5f40dca",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-06T10:31:43.584788+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -1480,13 +1587,15 @@
         "3c958943-9639-4d02-b0eb-7ded52209163",
         "c599ef9a-d768-4675-bbe9-99dca31d0884",
         "07d21811-fd35-4800-b6ae-d4724fa5588b"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "0beeb45b-5264-4042-b0e3-d14eeb252425",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-08-06T11:15:35.176981+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -1500,20 +1609,22 @@
         "2c149059-0d4c-4711-86b4-b162d4103560",
         "0216afcb-b4be-4b10-b696-d4b10177d9fe",
         "e3c8b1d8-9f8f-4a94-9113-d6d9fd917939"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "00957cfd-015f-4b3f-9ceb-8e404c4cd33e",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-06T13:45:16.629309+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
       "ref": "3779",
       "claim_project_id": "dark_factory",
       "status": "mismatch",
-      "observed": "pending",
+      "observed": "in-progress",
       "claimed_text": "DECISION (2026-08-06, session deb-df-4070020): proposed design invariant INV-8 `loop-thread-occupancy-bounded`, filed as task 3779",
       "derived_edge_uuids": [
         "033f556c-0699-427e-818a-37037a153289",
@@ -1523,13 +1634,15 @@
         "6a9626ba-f1b6-4d80-bcf9-c64d65dc9fb2",
         "dfeb9dac-2bc6-4fcf-b58c-fe494f81b42c",
         "387ca342-e259-4be0-8706-ec94a5a05003"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "3fb0ff5d-1c78-4d29-bd63-67357f039886",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-06T15:27:04.713544+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -1549,13 +1662,15 @@
         "b9881a95-308a-4bd1-916e-b11b640d3b90",
         "296992a3-0449-4306-971a-5d1a456fee9c",
         "ef5df56a-705e-4913-a599-c509dc6b8c2d"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "448d8400-2c46-44f6-9af2-f1007dc455cf",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-07T10:49:09.743734+00:00",
       "claim_kind": "applied_work",
       "subject": "task",
@@ -1572,13 +1687,15 @@
         "4c71501a-1305-42c5-b9fd-5a647f093f26",
         "2cbcec23-8db5-4889-9e5e-f03073c1b193",
         "87721fc8-2604-4860-a057-a8f741302778"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "448d8400-2c46-44f6-9af2-f1007dc455cf",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-07T10:49:09.743734+00:00",
       "claim_kind": "applied_work",
       "subject": "task",
@@ -1595,13 +1712,15 @@
         "4c71501a-1305-42c5-b9fd-5a647f093f26",
         "2cbcec23-8db5-4889-9e5e-f03073c1b193",
         "87721fc8-2604-4860-a057-a8f741302778"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "33fab234-e876-4c48-a12e-60437e9994da",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-09T10:11:50.034435+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -1615,13 +1734,15 @@
         "e71b8a14-5cd0-45c0-97d0-6df05760232f",
         "7df7c490-7f3b-468b-8e52-3572c1c4ff68",
         "4df0df20-f5d5-4966-998a-05a1eb3529d7"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "4e538397-fcff-4b01-993a-6da046604f07",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-08-10T11:26:53.594787+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -1637,13 +1758,15 @@
         "b85a4078-5f63-4fd8-b056-47f0eb93552a",
         "9510585d-969f-4ac6-b7e8-ec5d4fa96d12",
         "119fba9c-b1d4-4bdd-aeac-7e7acd4da0dd"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "893132a0-d020-47c3-a3a5-da9d3fad4f0a",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-10T11:50:23.824077+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -1666,13 +1789,15 @@
         "d2a10631-2de8-420e-8f6c-fb9ad9a7effb",
         "2373cdc1-fa43-40b8-b3d1-0f78b707d0cd",
         "2b6a4c80-24d3-41ae-9442-8a47b2d68241"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "3fde06f9-4187-4a45-b79e-a45f39aed66f",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-08-10T11:50:46.097795+00:00",
       "claim_kind": "applied_work",
       "subject": "task",
@@ -1686,13 +1811,15 @@
         "e21a7af9-eb1b-4169-86bb-1553e3e8cc36",
         "c752decb-539f-4a04-ae4d-3443fd250720",
         "a79916ca-e285-4824-9ac9-33136d77e592"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "78a9bf00-61fd-457a-a940-d52dfd8abae8",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-08-10T11:51:14.657908+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -1711,13 +1838,15 @@
         "4db2b1dc-d6c7-4a46-8ad3-5a74088d89b8",
         "b5efe890-dfe0-4c88-8696-c009c5d62073",
         "ea1c1f81-8e2d-459a-9df1-19eb42ae9ec7"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "681c6339-3af6-44fb-a4c1-6dce6fdceba2",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-10T15:32:14.797278+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -1734,13 +1863,15 @@
         "bd689be6-c014-48a6-90ef-fde54ba6b99c",
         "a231efcb-7123-4c4b-8409-941ca4d32e6a",
         "fdf01ca8-bb73-40d4-8575-2ea7a561fbba"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "a41a9ce9-9491-43ed-ba51-2363c05c7eec",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-10T17:08:02.090985+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -1758,13 +1889,15 @@
         "12d33f46-c32f-434c-9a69-6c1f37a25fe1",
         "c8a2ac4f-4096-40c4-b808-469ea16d2caa",
         "70d2a814-8d23-480c-b296-db200b75864f"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "5e09df74-e227-4e4c-820d-4e1c05fb2edc",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-10T17:19:58.082789+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -1780,13 +1913,15 @@
         "6b10468c-5401-4860-bd94-d2d26a913bb4",
         "b0edc899-3f8c-4aa7-aff4-f1dd6638cb9b",
         "d3246e9d-411e-4acf-82ae-d9aa69f6754b"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "16cc46d8-cf33-4557-93ce-f46ceb900487",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-10T20:50:38.781982+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -1801,13 +1936,15 @@
         "db7b7b56-5723-455b-b16b-3ade1eb068d9",
         "a4e5b519-d3fa-4dfe-bca6-e55de419fe47",
         "c799fd09-484c-4ade-8a1f-c1ea79cf7488"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "0719cdc3-2d9b-484b-a1be-e4842f42e4dc",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-11T11:35:42.021021+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -1829,13 +1966,15 @@
         "648f0ed4-2b76-410e-ad59-6a59133a2354",
         "d0e76c47-4762-4b41-9e0c-06d0f6916ae2",
         "db453fc1-65d6-4037-8a76-1d38a86b3cb3"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "0719cdc3-2d9b-484b-a1be-e4842f42e4dc",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-11T11:35:42.021021+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -1857,13 +1996,15 @@
         "648f0ed4-2b76-410e-ad59-6a59133a2354",
         "d0e76c47-4762-4b41-9e0c-06d0f6916ae2",
         "db453fc1-65d6-4037-8a76-1d38a86b3cb3"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "eee2ad1b-1ede-4ac9-b52d-6599d2b5e660",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-11T17:40:37.715672+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -1882,13 +2023,15 @@
         "9822f7fa-1cac-4f35-be35-78de6aa5074e",
         "8610b704-1df2-4a0a-8408-33835ddb5068",
         "eaaf4705-c127-49b5-b227-d02ab204eca9"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "664677b4-2a2b-43fe-9cb9-78f3fa6f8418",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-11T18:02:29.048603+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -1903,13 +2046,15 @@
         "e2cef6f2-5e7e-4730-81a7-f56c456e9a11",
         "e77f38b9-0afc-4e90-868b-aa502a6913ca",
         "cf4265bc-7489-494f-a002-2c1a856d0296"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "936ab76c-6465-4349-8b67-2908d79db269",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-12T11:27:02.086121+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -1922,13 +2067,15 @@
         "b6e68180-f7f5-42b6-ba9a-49a25fd89c4e",
         "9b1145cb-5636-4c37-a291-8b32ff182737",
         "07bc3b0b-d563-4c0d-aa61-de767af47373"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "91f463e9-cd53-465a-9458-5d92f5a353b9",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-12T11:27:16.243027+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -1941,13 +2088,15 @@
         "d8c2c883-3bbd-4936-b6a1-7151a6b846f2",
         "b93f332a-da27-4b42-a841-65674595f0bb",
         "0ff50947-53fa-4141-b179-4e7f8221172d"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "4491dd2b-52b7-4ee7-b535-a4be00902ab3",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-12T11:27:31.329820+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -1962,13 +2111,15 @@
         "41fd7ff2-0f14-4974-a5e3-35506c7e1c43",
         "3af8786e-ab74-44e2-8c5f-f12310d96390",
         "78050e5d-4f55-4be2-8fb6-d544f2d1ba8f"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "6abb9108-bd82-4cff-81ad-b855160059ec",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-12T11:27:48.039674+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -1983,13 +2134,15 @@
         "781ae2ba-bc50-4f78-b2a8-0517e1c37811",
         "16e25944-3531-433a-a0f9-8844b3587ae8",
         "50a2a714-92fd-47ec-8bb9-121d26c546e8"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "4306b168-86bb-4b36-b52f-ef836d079bbb",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-12T11:28:04.404060+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -2006,13 +2159,15 @@
         "755101df-6a11-4554-958a-01c41a3f265f",
         "8a78d61e-e83e-4e8c-9aa6-66f6f8e5f4cd",
         "d7f10d51-5e8a-4add-8dea-efc3ad61c3e1"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "5abd1b06-14a6-4127-a5fa-ac2c87c46e98",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-12T11:28:28.564939+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -2026,13 +2181,15 @@
         "baf9053a-3c5f-4324-abe9-6c98267dfe17",
         "f5a1479c-f2a5-44de-b80b-3d73e1fa706a",
         "1a5a9552-c0dd-4e3a-ba0e-028218a08539"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "36db1804-f9b7-42fa-8937-8f360603205f",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-12T11:28:48.683340+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -2049,13 +2206,15 @@
         "ce24c155-9179-44c6-b2af-073a03805dc7",
         "5630a9d3-892e-4fda-8a0f-26b2abec5356",
         "9f068a1f-fb4b-4769-8a1e-7cb8c2f9e8e2"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "3d7c6d40-22dd-4a8c-ac5c-1f9e6f636c17",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-12T11:29:06.216942+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -2068,13 +2227,15 @@
         "121fdcae-9897-4793-bc54-506d4323416b",
         "2d8aefcf-d897-4e1c-9841-55176f316827",
         "76d81738-b449-48bd-9ca7-8aa936d222de"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "ab6c89a5-67dd-4497-9d32-ac258efffc5b",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-12T11:29:26.398036+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -2097,13 +2258,15 @@
         "a9763fe0-1bad-4c3e-b44c-94147c448f2b",
         "c8b92d4f-9405-490f-a136-0f25aa218213",
         "cbaef501-bb32-420d-8b99-c807a0e3e1d0"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "838b1b28-cad0-4802-b07b-23b14bda507f",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-12T11:29:54.974618+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -2122,13 +2285,15 @@
         "8940de86-3da4-4286-9ece-4f338336c559",
         "fe41344a-61ea-4074-8b10-25e5e14b52c1",
         "1d3ce61d-5a79-4d10-b30d-fa42d4c94181"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "1a8ed615-5a85-42c2-8218-863b5b59a3ba",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-12T11:30:23.761729+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -2143,13 +2308,15 @@
         "2097b799-81f6-42a7-bb6c-72de69dc8aa1",
         "d3aa0d20-c5c0-48b3-ab86-81d4312e6b1d",
         "7eda4319-6de0-44d1-82a3-e0767a0e73f0"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "6c8c5725-749a-488b-9afb-c6927db5e782",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-12T11:30:45.785731+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -2165,13 +2332,15 @@
         "6ef39d58-86cf-4623-b886-a2b0c8e6518b",
         "84a43501-d9d8-46ef-81d6-68e110ff1a6c",
         "8af12aa8-4def-4763-bcdb-083ab6b67ec1"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "b0546ccc-c618-4523-aed1-cbf81d9957e7",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-12T11:50:38.436938+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -2185,13 +2354,15 @@
         "956d607a-c652-42a1-9c13-86cfb72a97c7",
         "edd4c44f-40f7-45f5-9384-3d89965f074b",
         "b554cfc1-5180-4eb3-9a0b-dd3687737557"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "53ddadb8-3ab1-4b05-9cd2-c48ad76ab630",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-12T12:11:53.470023+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -2205,13 +2376,40 @@
         "7c081bef-5e3e-466a-8206-1ee5788d73bb",
         "3470e48c-3525-45e6-a96d-b4e849ac9a04",
         "86d6440a-f56d-42bb-99ec-7a89051b53e1"
-      ]
+      ],
+      "edges_unqueried": false
+    },
+    {
+      "record_uuid": "4c7a7e58-858c-4447-acc1-7c9f24a220a1",
+      "record_kind": "episode",
+      "category": "decisions_and_rationale",
+      "project_id": "reify",
+      "graph_name": "reify",
+      "created_at": "2026-08-12T16:04:42.509919+00:00",
+      "claim_kind": "filing_dispatch",
+      "subject": "task",
+      "ref": "4213",
+      "claim_project_id": "dark_factory",
+      "status": "mismatch",
+      "observed": "pending",
+      "claimed_text": "Executed: 6141 done, esc-6141-1/6192-1/6193-1 closed, 6098 stranded-in-progress reset to pending (branch task/6098 inspected: 6 commits, all ratified shape, nothing reverted), live/merging 6093 untouched, tracking tasks 6192/6193 done, prevention (dispatch-time open-gate hold check \u2014 gate holds are prose-only and were violated 5x + live work) filed as dark_factory task 4213",
+      "derived_edge_uuids": [
+        "0094e5e8-38ee-4127-9a91-267934412a84",
+        "52f584b1-4bcf-4393-bf4c-c2bd3a81ef0b",
+        "00368e26-d5b0-496c-bafb-9c3003cab3fe",
+        "56ac0400-419c-403b-93b6-dbd6886442da",
+        "7cca0e70-3fe9-4f3f-877a-c7829b27d0fd",
+        "aa4b60c2-308f-4929-babc-5fab3b4c390a",
+        "64b92da2-fe00-4716-97b3-31a648770930"
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "a1bacf88-fbe9-466a-b9cf-f61ba054cf38",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-04-17T07:35:15.522378+00:00",
       "claim_kind": "applied_work",
       "subject": "commit",
@@ -2222,13 +2420,15 @@
       "claimed_text": "Stage 1 reconciliation (memory_consolidator) fix was deployed at commit ccd1ea24 but fused-memory service was NOT restarted \u2014 old code continues to run, Stage 1 still sees 0 active tasks",
       "derived_edge_uuids": [
         "1f5b1bf8-883e-485b-89f1-9c18b599ff0a"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "30adff14-4345-4174-a1eb-d9225cda3455",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-04-20T11:45:58.661604+00:00",
       "claim_kind": "applied_work",
       "subject": "commit",
@@ -2244,13 +2444,15 @@
         "ad037f18-c69a-46f4-bd4e-27e091e94e4e",
         "94219032-c7c8-47ff-a811-f0f7a1b9ffd1",
         "19480fd2-f584-4196-add9-605b8cc066c9"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "0e2a038c-1654-44a6-9fd8-dc982f167be5",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-04-22T10:43:16.360008+00:00",
       "claim_kind": "applied_work",
       "subject": "commit",
@@ -2263,13 +2465,15 @@
         "d9660a29-d52a-493a-94fa-fe8b74012969",
         "1177ab9e-7243-4df0-a96f-d2fbea1fcc5f",
         "f3689bc4-7408-422c-8d74-66db96db4934"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "5547a0b0-cd19-40e2-a11b-b3e71bdd175e",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-04-25T07:01:15.170841+00:00",
       "claim_kind": "applied_work",
       "subject": "commit",
@@ -2283,13 +2487,15 @@
         "d278e52a-ab7b-4645-ba0e-b68e1e214e79",
         "8ac6d68a-df2e-4c7c-a004-441a880de917",
         "288452e6-ea9d-416e-bdc6-192c3e3ac15d"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "78561382-ddaf-405e-bf67-255bf545d166",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-04-25T07:21:49.585860+00:00",
       "claim_kind": "applied_work",
       "subject": "commit",
@@ -2303,13 +2509,15 @@
         "65131cff-1286-48c8-9058-726166df4eba",
         "e07f548a-09ee-4a16-92bb-c5cb771dcb99",
         "8d4decae-d9e1-4edc-9316-3f5ab8a9accf"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "c9edd4ff-474b-4723-9d05-7bb293620535",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-04-25T08:50:36.434811+00:00",
       "claim_kind": "applied_work",
       "subject": "commit",
@@ -2322,13 +2530,15 @@
         "5379ea3a-2419-4995-ad95-e96ec9aa4d88",
         "379155ca-8408-4354-9d05-67d485dee9e5",
         "d2f2794d-66e5-42d6-96fb-3b01183fc1f6"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "8531dc68-f0fb-406e-a90c-dae06f6a594e",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-04-27T01:36:21.709887+00:00",
       "claim_kind": "applied_work",
       "subject": "commit",
@@ -2342,13 +2552,15 @@
         "176e2ec0-fb4b-42fc-a6b0-f610f9c4a164",
         "70281ec1-c141-4752-babd-1ab0272a6b61",
         "6a570794-d404-4211-8965-61720ff1f3c9"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "8531dc68-f0fb-406e-a90c-dae06f6a594e",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-04-27T01:36:21.709887+00:00",
       "claim_kind": "applied_work",
       "subject": "commit",
@@ -2362,13 +2574,15 @@
         "176e2ec0-fb4b-42fc-a6b0-f610f9c4a164",
         "70281ec1-c141-4752-babd-1ab0272a6b61",
         "6a570794-d404-4211-8965-61720ff1f3c9"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "8531dc68-f0fb-406e-a90c-dae06f6a594e",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-04-27T01:36:21.709887+00:00",
       "claim_kind": "applied_work",
       "subject": "commit",
@@ -2382,13 +2596,15 @@
         "176e2ec0-fb4b-42fc-a6b0-f610f9c4a164",
         "70281ec1-c141-4752-babd-1ab0272a6b61",
         "6a570794-d404-4211-8965-61720ff1f3c9"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "f76ba492-fd19-460b-8983-44d0ea0dd80c",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "reify",
       "created_at": "2026-05-07T14:07:25.201156+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -2397,23 +2613,15 @@
       "status": "mismatch",
       "observed": "deferred",
       "claimed_text": "8%), cancelled=87, active=20 (pending=17, in_progress=0, blocked=2: tasks 1137+1042, deferred=1: task 1147)",
-      "derived_edge_uuids": [
-        "8c9f260f-099b-4558-b6a0-89733e1dae7d",
-        "64472948-31f5-4f0b-b9b1-bccba34c2d7b",
-        "a4e3eaa8-cc60-4464-8639-e524b82931ce",
-        "9cf35dcf-ce38-4293-8653-a0e96cd84a98",
-        "788f3b8a-df5b-418d-a9b6-a548f77f2ce6",
-        "e06604c7-699f-4378-a3ba-a614efffbc05",
-        "bb3a8e54-6fb6-4ac6-b0ab-076555dd8959",
-        "7cc062e3-0c90-4b45-81af-475b6df0482a",
-        "d66a812a-116e-4114-abcb-552628beb43f"
-      ]
+      "derived_edge_uuids": [],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "6aca84aa-dd72-4456-81d9-bbd4dfdae497",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-07T19:42:03.862722+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -2434,13 +2642,15 @@
         "eaf822d6-70ff-42b1-b4d6-eb8bbcbd1171",
         "3d570a41-d283-477f-bff3-fa31de0a7c73",
         "91360b72-abf8-49b5-91d2-065af0ec051c"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "48d10784-3c96-498a-a027-14cb7ac28b95",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-05-08T02:26:15.625779+00:00",
       "claim_kind": "applied_work",
       "subject": "commit",
@@ -2454,13 +2664,15 @@
         "12decb6d-9894-4da4-b312-33d7747c28e4",
         "1378ae7e-0cc0-4c83-ae55-e1597adcf8d4",
         "2f4fa281-cc96-40f3-a223-0f3725b75c6e"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "0d2b8ace-1480-4e11-bb44-3bacd1abdb58",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-05-08T03:41:53.681360+00:00",
       "claim_kind": "applied_work",
       "subject": "commit",
@@ -2473,13 +2685,15 @@
         "9bc06e44-b4b1-483b-8748-2883f5f371b6",
         "769d9135-aad9-45e7-a4de-0ea924cf24a2",
         "320538ba-90e9-4ea5-86ff-7281894ce776"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "74b2e8df-c2dd-4db3-b992-76fbddba0b4b",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-10T08:03:33.043641+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -2494,13 +2708,15 @@
         "a4782550-cb16-4c2a-a991-caa5e3b41eee",
         "cc5e82b1-05e9-4c8e-b5b3-ad0de4418548",
         "4f508531-7234-436d-a62f-194d2a7bda6e"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "054c894b-e06c-4e42-a278-7418dd79f483",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-10T13:03:32.685586+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -2515,13 +2731,15 @@
         "eb4ea3ee-a0aa-4009-94f1-407a0be78040",
         "3f694770-b7e7-4784-8289-28603fe90bc1",
         "2f65981e-9e5c-4294-bf39-a87357b74a2e"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "6de24b41-e1d5-4658-ba79-b562515b6f86",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-10T14:03:55.677804+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -2537,13 +2755,15 @@
         "5b5b0776-8c08-447c-afaa-be3804e30e50",
         "bfe38bc0-eb1b-4328-aaac-10b3a76c7d4e",
         "7fe9c209-ac5a-49cf-abcd-f5ea37315791"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "b7a0fd49-24b9-4e57-8d3d-d31861b0c110",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-10T14:41:39.234909+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -2561,13 +2781,15 @@
         "2bc023f5-d54f-4a89-b4c3-ff68c9d5066d",
         "0a926722-47d7-49b5-81b3-0d7c3af732df",
         "f45bf0d7-bc00-429c-97c2-619a463ed3f6"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "c6849dd2-fd50-4653-ad77-70721b246b0c",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-10T18:42:41.383261+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -2585,13 +2807,15 @@
         "e9b9a453-ad41-4939-a56a-d4f865ddf758",
         "0def2efe-7a01-4768-8977-781941d0ca15",
         "d790aa14-eca3-4255-8592-6a51889f0ccc"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "8f2f5846-f6c1-468f-8b14-e1abb394d73e",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-10T19:20:25.587005+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -2608,13 +2832,15 @@
         "0def2efe-7a01-4768-8977-781941d0ca15",
         "d790aa14-eca3-4255-8592-6a51889f0ccc",
         "43fc25b3-c201-4fc6-b42c-ae349df8c188"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "5de36da5-96ca-452e-998f-06ab7b61ce40",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "reify",
       "created_at": "2026-05-10T23:06:00.073304+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -2623,13 +2849,15 @@
       "status": "mismatch",
       "observed": "deferred",
       "claimed_text": "As of 2026-05-11T23:01Z: dark_factory has total=1218 tasks: done=1122, cancelled=88, deferred=1 (task 1147), in-progress=1 (task 1184), pending=6 (tasks 1211, 1209, 1207, 1205, 1200, 1193)",
-      "derived_edge_uuids": []
+      "derived_edge_uuids": [],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "19925bae-1d91-4601-a92d-f066f868671b",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-10T23:49:44.885198+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -2643,13 +2871,15 @@
         "6dcd9af3-2374-4fd8-abf4-76a1fad12375",
         "dc19d6de-ecac-4f90-b79e-9da2f11a2cbd",
         "7e976d3a-1b90-48f8-b006-a189ab1c9f24"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "5237a116-4a61-491c-8e2e-3b799b35ce18",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-11T00:21:51.676704+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -2664,13 +2894,15 @@
         "065aec39-3c71-4179-8ac4-6e0ac560e47b",
         "674c159e-ffdc-4072-b7ba-2f65e9ad5189",
         "4bce9aaf-0648-4094-9eca-df0e5829c3e4"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "e8ad7ba5-c08d-4d1c-beb4-2f4c9a3c99eb",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-11T04:22:28.368859+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -2686,13 +2918,15 @@
         "6d2084a9-97f5-4129-84e9-14c7c0433a45",
         "77012bee-2c3e-4e36-936a-305a65c4c572",
         "afb4762b-4f60-4f71-a145-d6be51c499cb"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "55b37816-3a9b-48d7-a52a-47cee72ba6bd",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-11T04:36:16.658844+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -2708,13 +2942,15 @@
         "acdb4a22-52ba-45bb-b791-bf7cb209bc14",
         "30b50aa9-30a7-4e92-9426-a459a265b30b",
         "4b399a63-3863-41b3-8dfb-b5ab305f6df4"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "efe6ac77-a20d-45e0-9a35-1be3f753bfec",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-11T09:04:48.885750+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -2726,13 +2962,15 @@
       "derived_edge_uuids": [
         "8933a90c-3d61-45e0-9dae-738ce2056928",
         "3cfbb66b-2e24-487a-ba6c-16b102f916bd"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "ef5012a9-6f52-4897-a59b-dead05cca084",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-11T14:05:35.334709+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -2747,13 +2985,15 @@
         "02ffd6d0-994f-49d0-9878-e23adc1f9f91",
         "205a93bc-6b5a-4451-9c61-aae1353e2921",
         "9fb2cb3c-e91e-4da9-a904-0b55e84614b7"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "46d650e8-3d00-44f7-b9c6-07ea5cf64305",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-11T19:03:59.645982+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -2764,13 +3004,15 @@
       "claimed_text": "As of 2026-05-11T18:04Z (recon run 23fbf981): project dark_factory has total=1231 tasks: done=1132, cancelled=88, pending=10 (tasks 1218, 1219, 1220, 1221, 1222, 1223, 1224, 1225, 1226, 1227), deferred=1 (task 1147), in_progress=0",
       "derived_edge_uuids": [
         "8933a90c-3d61-45e0-9dae-738ce2056928"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "8e99cc27-22e4-455e-a415-4c115250a2ee",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-12T00:02:43.270258+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -2786,13 +3028,15 @@
         "6052e87b-83af-4fa8-ba47-6a14b324d799",
         "4b399a63-3863-41b3-8dfb-b5ab305f6df4",
         "bddbc543-27f7-4fdd-8146-4761b1ec5fad"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "4247c206-1890-482b-ae74-29b9a061ae64",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-12T00:24:31.148322+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -2803,13 +3047,15 @@
       "claimed_text": "As of 2026-05-12: Task 1147 deferral condition (Task 1149 investigation) is resolved \u2014 Task 1149 was cancelled 2026-05-09",
       "derived_edge_uuids": [
         "f06a7cc8-f519-4330-bbe1-5aea3983be87"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "3ec8a1df-783f-48f5-8c0d-67e8d7411c21",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-16T23:11:01.882223+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -2827,13 +3073,15 @@
         "a4afa282-1b27-4bcf-97f3-1b22e0e15dc4",
         "5c412b21-55fe-44ba-b43d-397a23c23b2c",
         "90d27389-e955-4f56-8b1e-aef79a0fb7a7"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "f83e4940-bf8e-4920-93b7-e83f6f714908",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-17T02:56:01.073836+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -2852,13 +3100,15 @@
         "776c22cf-fe99-468f-b79b-e7c7becb4b6a",
         "73a2fec9-0703-4664-8c17-7632f2e5beb2",
         "6ec71a9f-35a2-4d99-ada0-a9d48d79e5e1"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "f0068f11-f845-4c6c-a008-e793e1037189",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-17T06:58:10.730816+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -2877,13 +3127,15 @@
         "776c22cf-fe99-468f-b79b-e7c7becb4b6a",
         "0ab11d58-cc25-4764-b2d1-4649c6edbbfa",
         "6ec71a9f-35a2-4d99-ada0-a9d48d79e5e1"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "f6e89b01-30eb-45fa-b9bd-183e9313bf55",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-17T10:59:42.717059+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -2906,13 +3158,15 @@
         "d452d9f1-b0db-42e6-9ef1-a73f89e4a7aa",
         "2a9322e1-8f14-4e17-b07b-d5dcb57d6dcb",
         "4c4bc0dd-33de-4b01-b9e8-cccfe3f340f8"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "1d807554-a6f5-4274-bff9-43a6bf4d6211",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-17T15:02:08.536614+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -2932,13 +3186,15 @@
         "9e389220-1130-42de-8244-913e8d60a8cd",
         "c65e5197-fe8d-423b-ae55-32945d5ba5ec",
         "6ec71a9f-35a2-4d99-ada0-a9d48d79e5e1"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "9ae30557-1912-4eac-bbb1-2996a127bff1",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-17T19:03:08.605946+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -2960,13 +3216,15 @@
         "6ec71a9f-35a2-4d99-ada0-a9d48d79e5e1",
         "ff1ba1ee-ef05-414a-bfbb-727429365368",
         "c5a7d154-9138-4f4b-ad66-a2ca47d0a96f"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "eee03b59-1ef6-436e-9ca1-4626b2bd0d47",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-17T23:04:49.588888+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -2985,13 +3243,15 @@
         "24fc86eb-fc03-49d3-8e76-8c04b21406f4",
         "97720966-c9f7-404a-8800-86c768889bd5",
         "6bce3992-e734-449b-bb91-37e357b93bb3"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "2ff8a05b-9e2f-49c1-a0b2-6c320eade810",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-18T03:07:56.734929+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -3010,13 +3270,15 @@
         "7f11f04e-936b-4846-930b-692b890fbae9",
         "6bce3992-e734-449b-bb91-37e357b93bb3",
         "bf451fa2-2545-436e-ac1e-7c7787174d5d"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "e6d22063-92d8-4f43-8db6-c292cbe34f4b",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-18T07:11:19.876720+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -3037,13 +3299,15 @@
         "6999a488-c278-4b46-ade4-a4e968570642",
         "a9abfc2f-30b0-4764-88ba-b7b5f77c7c61",
         "a7cdb6d3-a7c3-4c0c-883e-66cb9ad8230d"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "8c68df3a-98c2-4095-95f6-48edb74128a4",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-18T11:11:17.264178+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -3064,13 +3328,15 @@
         "1c961cf2-1d2c-4122-9ee3-cb62f2fdb7af",
         "4780afd7-4865-42be-b4d2-8e1a070cb2c9",
         "6c0e0deb-30ed-4148-922e-196571578538"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "0c5b3f7b-38e1-4436-baa6-4d8419f88645",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "reify",
       "created_at": "2026-05-26T07:23:57.060997+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -3079,21 +3345,15 @@
       "status": "mismatch",
       "observed": "deferred",
       "claimed_text": "2%), cancelled=96, pending=3 (tasks 1471, 1472, 1473), deferred=1 (task 1147), in_progress=0, blocked=0",
-      "derived_edge_uuids": [
-        "a8bdc944-65e8-4867-a713-342fe615f317",
-        "a4e3eaa8-cc60-4464-8639-e524b82931ce",
-        "75b8ca6e-7571-42fa-ad4a-a03d33d7b071",
-        "fa9c4afc-bc5f-4835-9a47-9f7346fb1443",
-        "bee14aeb-6a8b-49b2-ab3c-8603f3d38f70",
-        "80b07140-952f-4877-8c83-2cfeb3b8315d",
-        "bde01db0-9a54-4d6b-a624-449ae419e683"
-      ]
+      "derived_edge_uuids": [],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "c31c3531-f6fd-49f8-9c04-527663343f92",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-26T12:03:24.573699+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -3112,13 +3372,15 @@
         "80f6c7a6-1f6c-4dfd-91c8-34be1269ee62",
         "7161c832-7766-4041-b47e-92d19e871298",
         "1e73b7f7-f396-4c55-a950-6aab9943ddf7"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "91b50a3a-635a-4cab-ba9b-a8a0652628cf",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-26T12:57:53.886257+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -3135,13 +3397,15 @@
         "5960c481-b85a-4b16-bff6-4ae0d5f314ba",
         "459e694c-b4cd-4909-af2f-2428e28afca7",
         "eb325528-dcbf-4f81-a5e4-d95194a55349"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "a48b72ee-a148-4cba-9beb-11e44c8a3a93",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-26T17:00:30.112459+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -3168,13 +3432,15 @@
         "622f51fa-3949-49a3-9b55-fb43bf6006ec",
         "52a14c65-55ef-4809-a426-3103f45779e1",
         "9191d655-be78-438f-89fb-0e36f8ddbcd2"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "977f0fb1-5898-4f62-8419-c5dcd08c6222",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-26T17:17:01.843754+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -3194,13 +3460,15 @@
         "5e35ff4b-5fdb-471a-a6f3-7e73bccc37a8",
         "58b5de89-bca5-495d-9fd4-50457319922c",
         "728972b7-e6f0-4a9a-af21-ed6948a129dc"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "7dc13b0e-8bc8-48f3-92ec-15596b21f7d0",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-26T17:17:42.317347+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -3212,13 +3480,15 @@
       "derived_edge_uuids": [
         "6510ad70-c031-461a-9062-d07b4c124d82",
         "3eb4c2f3-5378-474e-b753-f2f9827b23a1"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "25c82a9e-98c6-45e4-8999-0158e07ec461",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-26T21:04:24.330112+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -3232,13 +3502,15 @@
         "bf371a0d-17a5-4b38-8a8d-a05490578350",
         "6d0475a3-27ba-4e91-b69a-0f57a3373d10",
         "8b7ad2e8-d087-4fc3-808f-6b9050d4e4bf"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "8cf57f55-6a33-4500-b29c-2bed84855cbb",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-05-26T21:07:31.589103+00:00",
       "claim_kind": "applied_work",
       "subject": "commit",
@@ -3257,13 +3529,15 @@
         "8c272f55-9b08-4c9d-b8a2-1acc4f71d62f",
         "cc5e36d2-ed0d-4580-a760-3b56184290a0",
         "909cd6d0-6fa2-4d84-8638-0c1654785d15"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "50e22c6f-a11f-464a-8f92-f0f4de4366ec",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-27T01:06:10.826520+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -3275,13 +3549,15 @@
       "derived_edge_uuids": [
         "bf27c493-140e-43ac-8669-afb0c1d4b0ca",
         "4c2b3b7c-ed2a-4da5-ab77-9cdeeb89c159"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "bbcc9ba5-5f70-4f41-8167-571e6888b70c",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-27T05:08:32.062624+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -3298,13 +3574,15 @@
         "3abdcc94-0455-48d7-b89b-d94e25a8747d",
         "068ea245-28ac-49a8-9883-23dbda6302eb",
         "c00f701c-eed5-4248-a807-382e8096993c"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "154c68cb-ec7c-4c37-b466-bfa8796f0fc8",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-27T09:12:01.265083+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -3320,13 +3598,15 @@
         "ca96f9df-2b2e-4896-9cc4-5fb8fa2efcf8",
         "b92f204b-f987-4375-bb68-46d574924c96",
         "e3c0d2bb-5a99-4c5d-ab22-8d8f31cafd8a"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "d6ec4699-c775-4249-9ce5-858e02e18621",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "reify",
       "created_at": "2026-05-27T09:29:47.343872+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -3335,20 +3615,15 @@
       "status": "mismatch",
       "observed": "deferred",
       "claimed_text": "As of 2026-05-27 (run 59db9a95): dark_factory project task status snapshot \u2014 total=1491, done=1384, cancelled=96, pending=10 (tasks 1478, 1479, 1480, 1481, 1482, 1483, 1484, 1485, 1486, 1487), deferred=1 (task 1147), in_progress=0, blocked=0",
-      "derived_edge_uuids": [
-        "171135a7-f9e4-49d2-b39a-919fcc6b99d2",
-        "6f7df83d-3aab-4b0c-9fc8-810c458acdf5",
-        "94db3eb3-152c-4541-ae59-fd8e309c4b9a",
-        "30ebb2d4-230f-4146-a3a6-60e0bb9bc15c",
-        "9ffa11a8-c310-46a7-a332-e915aec56c50",
-        "912b756b-5d78-4c9d-abb8-a56295a8414c"
-      ]
+      "derived_edge_uuids": [],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "b860f884-a1c5-4156-8d4e-ac06663f7453",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-27T12:21:51.432730+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -3363,13 +3638,15 @@
         "c2c4272e-193f-4bdb-839f-0828966ed2d3",
         "2a713106-329e-489c-903d-c8d41f8a90a3",
         "e940dfc6-ae0b-457a-b68f-46dd33f4bf2d"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "126226cb-5ca7-497c-bb91-572caf4f6291",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-27T12:54:09.524012+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -3386,13 +3663,15 @@
         "7645fe12-491f-45a8-831b-f0da953e882f",
         "72c6ae4c-7b5b-4431-8d00-0fe1879b0028",
         "58b5de89-bca5-495d-9fd4-50457319922c"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "52a37f90-1f21-462f-96f6-9bf1774f3c32",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "reify",
       "created_at": "2026-05-27T13:23:39.625235+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -3401,25 +3680,15 @@
       "status": "mismatch",
       "observed": "deferred",
       "claimed_text": "As of 2026-05-27 (run d506d345): dark_factory project task status snapshot \u2014 total=1496, done=1395, cancelled=96, in_progress=3 (tasks 1491, 1485, 1484), pending=1 (task 1486), deferred=1 (task 1147), blocked=0",
-      "derived_edge_uuids": [
-        "67972980-6af2-4050-bf3b-be4fdb19ccbb",
-        "9db151c3-cb1a-4147-988c-801325757786",
-        "af0b3f30-18df-4d21-a201-bcf307f478ee",
-        "d97bf01c-826a-449a-a1a1-69d07647eb5e",
-        "ffbda515-6968-462f-84f1-b9b3a27f8374",
-        "6c18cdb9-2586-4e0e-baea-1649d5bc96f1",
-        "5cd49293-ced7-409a-a5bf-f07663521d45",
-        "b2907c8f-f252-45a7-81ca-a5e6d11f471a",
-        "65624165-357a-4076-8a0d-38fded9e6f06",
-        "f1d57221-8769-4739-a368-d1e530ef2dc2",
-        "3c299863-8fb9-4a5a-a17a-d2071b7ac77d"
-      ]
+      "derived_edge_uuids": [],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "483f875b-8388-4b0b-8160-6648834c8ff2",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-27T15:43:09.693097+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -3437,13 +3706,15 @@
         "4665158f-9c79-4a05-a1b7-44bf693ee31a",
         "cb1e5dda-4b8e-458c-94dc-17e1be88bc28",
         "aaddfe27-d35a-4cf7-8829-e5ea412f174d"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "49c41c6c-4a50-42c9-92ee-de316bcb4d06",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-27T17:13:39.335745+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -3463,13 +3734,15 @@
         "7fb1d720-98d0-4907-80e8-472cc2a69795",
         "3725d6f1-a608-4c4c-96c1-51ac72091a0c",
         "30301257-a757-4838-b346-88cb29064070"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "c4fdc6d1-1f2d-4fac-abda-79ddf2d8c053",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-27T17:39:54.888423+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -3487,13 +3760,15 @@
         "c2a9c369-682d-4aa4-a049-668a09b65d43",
         "4e0a091e-1119-4279-8782-4aa544f3e118",
         "fa514b97-2c6d-44fe-8ce4-cba4372e8f86"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "a887c958-0018-4715-8817-cf048c187e8d",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "reify",
       "created_at": "2026-05-27T18:07:35.809106+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -3502,22 +3777,15 @@
       "status": "mismatch",
       "observed": "deferred",
       "claimed_text": "As of 2026-05-27 (run 54d1c93e): dark_factory project task snapshot \u2014 total=1509, done=1402, cancelled=96, in_progress=3 (tasks 1496 Expose UsageGate paused_reason, 1497 L2 escalation level + consumer-per-level, 1498 Fix steward resurrection: archive-aware metadata patch), pending=7 (tasks 1499\u20131505: L2 escalation tiering batch), deferred=1 (task 1147 Architect plan-resume / skip-if-plan-complete)",
-      "derived_edge_uuids": [
-        "e37360ae-6f11-47b0-b3e8-06c50ad9ec3b",
-        "bee10839-5179-4725-a714-f3123e39ccc3",
-        "e8c992e0-ab45-4ea3-aec1-73e362997c9d",
-        "ca75601b-0669-400e-bd1d-ac194faa5c2e",
-        "6d8376e2-f780-4eaa-bdc2-3f86d8ef7226",
-        "b7bd8506-d9c2-406f-891c-8a9a1e3c418a",
-        "bca767ad-9348-46be-b13e-83777163fbb7",
-        "a46bc972-431f-4c07-a603-5204d597ad0b"
-      ]
+      "derived_edge_uuids": [],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "21160b36-025d-44d5-8ea6-334614a85b99",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-27T18:39:53.383273+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -3538,13 +3806,15 @@
         "1ddd9118-5ce5-49aa-95db-f480a1832c89",
         "ff4bac2a-e1c3-4bea-844c-c2dd36aed831",
         "e6ee60e6-1b68-4831-8421-e4a6218e2684"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "8b1898e7-1ded-4183-b311-bfe40232e580",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-27T19:10:58.855977+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -3561,13 +3831,15 @@
         "ad476606-9991-4f0b-97ed-09bfea39f3d2",
         "9e749734-2cc3-4d94-86c2-1388959181d3",
         "7f11f04e-936b-4846-930b-692b890fbae9"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "1b7d15ba-d15c-433b-a121-f7066e025800",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-27T23:02:22.738531+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -3584,13 +3856,15 @@
         "84426e3e-54e5-4d9f-8594-3a7383840d22",
         "afdb8ef1-1b16-4ce5-b52c-5b46bb199441",
         "a328dce6-9fdc-4929-a7be-888a03451adc"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "f2243d39-19e0-40ba-a2ce-2e5b65adf2ad",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-28T01:34:11.996130+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -3604,13 +3878,15 @@
         "963d291e-7720-428b-b669-8518a80e888a",
         "9f453ee2-78c3-45a7-ac70-6ddf8138c867",
         "3713eb9b-4026-417e-a1c7-14fa7bd36d5b"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "b3086175-b059-4296-8799-37600872bbc9",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-28T05:35:32.528917+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -3625,13 +3901,15 @@
         "7cfe7cf3-77c7-4cd4-9a1d-a05351776f80",
         "e3c0d2bb-5a99-4c5d-ab22-8d8f31cafd8a",
         "e858a63e-0553-4284-9f67-26a71f2b8ff2"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "d3cfec61-b560-4e30-8dce-582f5526dd64",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-05-31T03:21:04.080193+00:00",
       "claim_kind": "applied_work",
       "subject": "commit",
@@ -3648,13 +3926,15 @@
         "dbe74169-9550-4dde-892e-463af3e231da",
         "5320ef43-fea8-41e4-b6d0-094bc688da43",
         "6ed5b571-49e4-4b3a-9096-9a74bb77c226"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "1e957cdb-2f55-45fc-9610-0f80b66aea76",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-06-03T12:29:41.249808+00:00",
       "claim_kind": "applied_work",
       "subject": "commit",
@@ -3668,13 +3948,15 @@
         "88cd2f14-e2c3-4e3b-8e5c-3fcdc47db61c",
         "7fa785bb-0ad4-4b2d-9411-e5dd11666ba3",
         "a72fa3bb-f6c7-406a-8a13-14e504949c04"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "4780ea88-cf41-457b-857d-e3394517ee54",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-06-18T15:28:38.205003+00:00",
       "claim_kind": "applied_work",
       "subject": "commit",
@@ -3691,13 +3973,15 @@
         "cbaada2d-3028-471a-bf6d-b5db54f124b4",
         "a292e496-6940-43de-b369-0927c872a147",
         "6d11e30a-b108-4761-ae5b-d4fcc679bdd7"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "5c2aaa61-90e8-4d46-83e7-48ad01f37360",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-07-09T12:01:15.825472+00:00",
       "claim_kind": "applied_work",
       "subject": "commit",
@@ -3713,13 +3997,15 @@
         "78e76271-46a8-422b-9db5-5c6b6be9b385",
         "ce30a542-4688-493e-a15d-95997223ae36",
         "68cc4271-b81a-4e55-8b19-68b9fbe5bf7c"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "455b2aea-4313-4af7-9627-b68e56452590",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "reify",
+      "graph_name": "reify",
       "created_at": "2026-07-23T11:02:43.442039+00:00",
       "claim_kind": "applied_work",
       "subject": "commit",
@@ -3735,13 +4021,15 @@
         "4125ab00-0f8b-4e88-a192-4f4957d033fc",
         "aaba2b58-5806-47b7-b5ec-053dd473d9ee",
         "f47a16bf-3d4c-44f3-8f6f-4eb1c2756a92"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "eef1f855-6be9-4004-a55a-810b968f07ba",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-05T21:17:57.998352+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -3753,13 +4041,36 @@
       "derived_edge_uuids": [
         "a089fd77-a9f0-414b-8840-25a652ba4ac8",
         "dc5cddae-7157-464b-af1f-f1c733a7d877"
-      ]
+      ],
+      "edges_unqueried": false
+    },
+    {
+      "record_uuid": "5d84c539-74de-4eb3-b6dd-b53535199756",
+      "record_kind": "episode",
+      "category": "temporal_facts",
+      "project_id": "reify",
+      "graph_name": "reify",
+      "created_at": "2026-08-12T23:00:43.294768+00:00",
+      "claim_kind": "filing_dispatch",
+      "subject": "task",
+      "ref": "6098",
+      "claim_project_id": "reify",
+      "status": "mismatch",
+      "observed": "pending",
+      "claimed_text": "Task 6098 is dispatched consistent with gate-6141's ratified option (a) (ScalarForce",
+      "derived_edge_uuids": [
+        "81ef7da5-1609-4843-8546-80b5e9a9c651",
+        "38c3e7e5-0f5c-4c25-88d0-1e91797dd9fb",
+        "8a3f3976-5d13-4b14-b3e1-031cf2ce867d"
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "bc6f19e1-e9f4-4e3c-a6da-85c797913c54",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-04-07T07:01:07.637992+00:00",
       "claim_kind": "applied_work",
       "subject": "task",
@@ -3774,13 +4085,15 @@
         "b64e5e0b-f7dd-43e5-9340-000a723ee455",
         "64a329af-f43c-41e6-a011-335053a323fd",
         "0885fa94-185d-4eab-8fcf-c5dc67963778"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "3ffd3ac8-c0f9-4e04-8332-a8e3ea81ae19",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-04-07T08:31:44.918297+00:00",
       "claim_kind": "applied_work",
       "subject": "task",
@@ -3795,13 +4108,15 @@
         "b59b3bb4-e516-4826-b3d3-0de92522f410",
         "2c6d5f0c-00ea-49ac-98e7-976e44cde5db",
         "6b3d190a-85b8-4a6b-906b-15bba8549577"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "fb53bb1d-1ba9-464d-bc99-ecc056e49758",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-04-26T20:02:08.454800+00:00",
       "claim_kind": "applied_work",
       "subject": "task",
@@ -3816,13 +4131,15 @@
         "2b8b3b75-442d-44be-a2a5-7d3be32eecec",
         "480935aa-9520-4c3b-b360-a2e7c60ea9ea",
         "a4d8eb8d-0d74-4234-9c0b-f79644a63b6d"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "fb53bb1d-1ba9-464d-bc99-ecc056e49758",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-04-26T20:02:08.454800+00:00",
       "claim_kind": "applied_work",
       "subject": "task",
@@ -3837,13 +4154,15 @@
         "2b8b3b75-442d-44be-a2a5-7d3be32eecec",
         "480935aa-9520-4c3b-b360-a2e7c60ea9ea",
         "a4d8eb8d-0d74-4234-9c0b-f79644a63b6d"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "fb53bb1d-1ba9-464d-bc99-ecc056e49758",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-04-26T20:02:08.454800+00:00",
       "claim_kind": "applied_work",
       "subject": "task",
@@ -3858,13 +4177,15 @@
         "2b8b3b75-442d-44be-a2a5-7d3be32eecec",
         "480935aa-9520-4c3b-b360-a2e7c60ea9ea",
         "a4d8eb8d-0d74-4234-9c0b-f79644a63b6d"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "fb53bb1d-1ba9-464d-bc99-ecc056e49758",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-04-26T20:02:08.454800+00:00",
       "claim_kind": "applied_work",
       "subject": "task",
@@ -3879,13 +4200,15 @@
         "2b8b3b75-442d-44be-a2a5-7d3be32eecec",
         "480935aa-9520-4c3b-b360-a2e7c60ea9ea",
         "a4d8eb8d-0d74-4234-9c0b-f79644a63b6d"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "fb53bb1d-1ba9-464d-bc99-ecc056e49758",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-04-26T20:02:08.454800+00:00",
       "claim_kind": "applied_work",
       "subject": "task",
@@ -3900,13 +4223,15 @@
         "2b8b3b75-442d-44be-a2a5-7d3be32eecec",
         "480935aa-9520-4c3b-b360-a2e7c60ea9ea",
         "a4d8eb8d-0d74-4234-9c0b-f79644a63b6d"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "01ff8858-fd49-4472-92dc-f84a42556d31",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "know_live",
+      "graph_name": "reify",
       "created_at": "2026-05-08T16:40:19.717275+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -3915,13 +4240,15 @@
       "status": "unverifiable",
       "observed": "live status for task 515 could not be resolved (project='know_live')",
       "claimed_text": "Task 515 ('Migrate knowlive\u2192know_live project_id data in Graphiti and Qdrant') was cancelled on 2026-05-08",
-      "derived_edge_uuids": []
+      "derived_edge_uuids": [],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "6176a690-63ba-4f87-83d4-176dc03ab7fd",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-07-04T14:17:52.158455+00:00",
       "claim_kind": "applied_work",
       "subject": "task",
@@ -3942,13 +4269,15 @@
         "15be748a-1e9a-4268-8f3c-8b7b2bcc1409",
         "1825f1b1-1217-4540-a6b1-8b846fe616eb",
         "94150b6b-ad4e-49ca-90fc-2f0c8b41a0ff"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "6176a690-63ba-4f87-83d4-176dc03ab7fd",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-07-04T14:17:52.158455+00:00",
       "claim_kind": "applied_work",
       "subject": "task",
@@ -3969,13 +4298,15 @@
         "15be748a-1e9a-4268-8f3c-8b7b2bcc1409",
         "1825f1b1-1217-4540-a6b1-8b846fe616eb",
         "94150b6b-ad4e-49ca-90fc-2f0c8b41a0ff"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "543aaa7e-7767-44bc-9a4e-1c52c91661d1",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-07-11T09:03:31.952030+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -3990,13 +4321,15 @@
         "f7a8eaf4-8fc0-4e49-8da5-712005283d0d",
         "f3f44123-2eb6-4793-a8c1-cdbe3dd06113",
         "223452d0-2878-4830-abff-d0650ae275ec"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "8296f70b-1908-49eb-9f0f-03eeca44d0e9",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-07-29T18:43:33.338674+00:00",
       "claim_kind": "applied_work",
       "subject": "task",
@@ -4014,13 +4347,15 @@
         "04df3477-5944-4d49-9c10-daa84643884f",
         "b6455836-310c-4fb8-9336-45a74c949cbd",
         "c318fb9a-3f4e-4c55-b5e6-240cecc4b5f4"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "51497ba7-6dda-477d-b67c-f47e81bbf5c1",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-08T05:31:59.522808+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -4038,13 +4373,15 @@
         "d21a5dd7-f3ed-4df2-ae1b-4bf1b96ec316",
         "29404050-e431-4eae-b528-8f6e90bd83ca",
         "64375a2e-db3b-48a8-aca7-56c331182577"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "6299ae80-4d2c-4b7c-8c61-94bb7de49495",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-09T15:11:10.333919+00:00",
       "claim_kind": "applied_work",
       "subject": "task",
@@ -4059,13 +4396,15 @@
         "5ebb26d4-083a-401d-be13-af30a0b16e65",
         "03810104-10c4-47c7-846d-4e65c9868178",
         "9752bdb2-5fe8-4f18-ba83-ac9a35ff6d00"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "6299ae80-4d2c-4b7c-8c61-94bb7de49495",
       "record_kind": "episode",
       "category": "decisions_and_rationale",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-08-09T15:11:10.333919+00:00",
       "claim_kind": "applied_work",
       "subject": "task",
@@ -4080,13 +4419,15 @@
         "5ebb26d4-083a-401d-be13-af30a0b16e65",
         "03810104-10c4-47c7-846d-4e65c9868178",
         "9752bdb2-5fe8-4f18-ba83-ac9a35ff6d00"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "d600777f-4bd7-4472-b7cb-9b40fb7039d6",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "dark_factory",
+      "graph_name": "dark_factory",
       "created_at": "2026-04-07T19:11:54.173992+00:00",
       "claim_kind": "applied_work",
       "subject": "task",
@@ -4101,13 +4442,15 @@
         "c5b00bd5-2475-4385-b0ec-e85b16545076",
         "821e666c-7f56-4057-8ef6-12ab1be6160a",
         "5ca2e680-425f-4fa6-9acc-05d4332f4653"
-      ]
+      ],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "1712d94d-59eb-4ee1-8ae6-f38e096c78ff",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "know_live",
+      "graph_name": "reify",
       "created_at": "2026-05-01T18:30:20.405243+00:00",
       "claim_kind": "applied_work",
       "subject": "task",
@@ -4116,13 +4459,15 @@
       "status": "unverifiable",
       "observed": "live status for task 175 could not be resolved (project='know_live')",
       "claimed_text": "Task 175 shipped via src/knowlive/bundle/schema",
-      "derived_edge_uuids": []
+      "derived_edge_uuids": [],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "ade9717e-d6bc-4bdc-a481-0af922d8df4b",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "know_live",
+      "graph_name": "reify",
       "created_at": "2026-05-01T18:30:38.657241+00:00",
       "claim_kind": "applied_work",
       "subject": "task",
@@ -4131,13 +4476,15 @@
       "status": "unverifiable",
       "observed": "live status for task 171 could not be resolved (project='know_live')",
       "claimed_text": "Task 171 shipped via src/knowlive/bundle/schema",
-      "derived_edge_uuids": []
+      "derived_edge_uuids": [],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "c50f0224-7850-4800-bc23-61c7f39933d9",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "know_live",
+      "graph_name": "reify",
       "created_at": "2026-05-01T18:32:01.466172+00:00",
       "claim_kind": "applied_work",
       "subject": "task",
@@ -4146,13 +4493,15 @@
       "status": "unverifiable",
       "observed": "live status for task 170 could not be resolved (project='know_live')",
       "claimed_text": "Task 170 shipped via src/knowlive/geometry/hloc_match",
-      "derived_edge_uuids": []
+      "derived_edge_uuids": [],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "4d62e896-4e59-4fef-8081-b68aa51d6999",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "knowlive",
+      "graph_name": "reify",
       "created_at": "2026-05-07T06:26:20.055240+00:00",
       "claim_kind": "applied_work",
       "subject": "commit",
@@ -4161,13 +4510,15 @@
       "status": "unverifiable",
       "observed": "commit b2e13eaeab could not be checked in project 'knowlive'",
       "claimed_text": "Shipped via commit b2e13eaeab (feat(fused-memory): tear down Taskmaster MCP backend post-SQLite cutover)",
-      "derived_edge_uuids": []
+      "derived_edge_uuids": [],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "363d0a09-515e-4a38-a5e5-32497c4c6fc8",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "know_live",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-07T06:31:04.376661+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -4176,13 +4527,15 @@
       "status": "unverifiable",
       "observed": "live status for task 330 could not be resolved (project='know_live')",
       "claimed_text": "know_live task count snapshot as of 2026-05-07T06:24Z (recon run c3f2c8f0): total=472, done=448, in_progress=9 (tasks 471, 420, 356, 277, 178, 177, 159, 74, 12), pending=14 (tasks 472, 468, 402, 401, 347, 300, 182, 181, 172, 87, 85, 83, 78, 77), cancelled=1 (task 330)",
-      "derived_edge_uuids": []
+      "derived_edge_uuids": [],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "363d0a09-515e-4a38-a5e5-32497c4c6fc8",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "know_live",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-07T06:31:04.376661+00:00",
       "claim_kind": "applied_work",
       "subject": "task",
@@ -4191,13 +4544,15 @@
       "status": "unverifiable",
       "observed": "live status for task 472 could not be resolved (project='know_live')",
       "claimed_text": "Net change since prior snapshot (a63062d4, 02:16Z): +1 total (task 472 created), +6 done (408, 469, 465, 306, 413, 467 merged)",
-      "derived_edge_uuids": []
+      "derived_edge_uuids": [],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "fc33c4b6-4e96-4e3f-b864-27855510c25a",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "knowlive",
+      "graph_name": "reify",
       "created_at": "2026-05-07T06:36:20.955651+00:00",
       "claim_kind": "applied_work",
       "subject": "commit",
@@ -4206,13 +4561,15 @@
       "status": "unverifiable",
       "observed": "commit 3c9d33e1 could not be checked in project 'knowlive'",
       "claimed_text": "KnowLive task 306 (warp_timeline dead-code removal) is DONE as of 2026-05-07 (done_provenance kind=merged, commit 3c9d33e1)",
-      "derived_edge_uuids": []
+      "derived_edge_uuids": [],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "5dbaeb88-e4ab-4d57-bf1c-add24f76c82e",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "knowlive",
+      "graph_name": "reify",
       "created_at": "2026-05-07T06:37:11.830409+00:00",
       "claim_kind": "applied_work",
       "subject": "commit",
@@ -4221,13 +4578,15 @@
       "status": "unverifiable",
       "observed": "commit 69f83eee could not be checked in project 'knowlive'",
       "claimed_text": "KnowLive task 413 (cli/attack import boundary DRY) is DONE as of 2026-05-07 (done_provenance kind=merged, commit 69f83eee)",
-      "derived_edge_uuids": []
+      "derived_edge_uuids": [],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "ec336c02-0125-4231-a54e-adaf6e8bdef1",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "knowlive",
+      "graph_name": "reify",
       "created_at": "2026-05-07T06:37:37.231186+00:00",
       "claim_kind": "applied_work",
       "subject": "commit",
@@ -4236,13 +4595,15 @@
       "status": "unverifiable",
       "observed": "commit b2e13eaeab could not be checked in project 'knowlive'",
       "claimed_text": "KnowLive task 471 (rigid_reflector empty-samples short-circuit) is DONE as of 2026-05-07 (done_provenance kind=merged, commit b2e13eaeab)",
-      "derived_edge_uuids": []
+      "derived_edge_uuids": [],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "fd70bbbd-b330-467c-ad64-7fb4dcb8530a",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "know_live",
+      "graph_name": "reify",
       "created_at": "2026-05-07T06:57:19.781199+00:00",
       "claim_kind": "applied_work",
       "subject": "task",
@@ -4251,13 +4612,15 @@
       "status": "unverifiable",
       "observed": "live status for task 300 could not be resolved (project='know_live')",
       "claimed_text": "Task 300 completed as found_on_main (already merged, not newly merged)",
-      "derived_edge_uuids": []
+      "derived_edge_uuids": [],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "fd70bbbd-b330-467c-ad64-7fb4dcb8530a",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "know_live",
+      "graph_name": "reify",
       "created_at": "2026-05-07T06:57:19.781199+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -4266,13 +4629,15 @@
       "status": "unverifiable",
       "observed": "live status for task 330 could not be resolved (project='know_live')",
       "claimed_text": "know_live task count snapshot as of 2026-05-07T06:55Z (recon run ce8bac1a): total=478, done=455, in_progress=9 (tasks 475, 401, 356, 277, 178, 177, 159, 74, 12), pending=13 (tasks 478, 473, 468, 402, 347, 182, 181, 172, 87, 85, 83, 78, 77), cancelled=1 (task 330), blocked=0",
-      "derived_edge_uuids": []
+      "derived_edge_uuids": [],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "233abbde-4d33-4422-b7e2-5197522628a0",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "know_live",
+      "graph_name": "dark_factory",
       "created_at": "2026-05-07T10:49:03.645655+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -4281,13 +4646,15 @@
       "status": "unverifiable",
       "observed": "live status for task 330 could not be resolved (project='know_live')",
       "claimed_text": "know_live task count snapshot as of 2026-05-07T07:58Z (recon run ff112c2c): total=482, done=465, in_progress=8 (tasks 356,347,277,178,177,159,74,12), pending=8 (tasks 182,181,172,87,85,83,78,77), cancelled=1 (task 330)",
-      "derived_edge_uuids": []
+      "derived_edge_uuids": [],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "c823e444-3e1c-4e14-9d1e-ac76f1ee4e10",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "know_live",
+      "graph_name": "reify",
       "created_at": "2026-05-07T17:22:08.586985+00:00",
       "claim_kind": "filing_dispatch",
       "subject": "task",
@@ -4296,13 +4663,15 @@
       "status": "unverifiable",
       "observed": "live status for task 330 could not be resolved (project='know_live')",
       "claimed_text": "know_live task-count snapshot as of 2026-05-07T16:35Z (recon run 83b13561): total=500, done=486, in_progress=5 (tasks 83,182,488,492,495), pending=8 (tasks 74,77,78,85,87,181,347,500), cancelled=1 (task 330)",
-      "derived_edge_uuids": []
+      "derived_edge_uuids": [],
+      "edges_unqueried": false
     },
     {
       "record_uuid": "4964d1c6-f8fc-456b-aa12-0b0dd7e54a3c",
       "record_kind": "episode",
       "category": "temporal_facts",
       "project_id": "solar_challenge_platform",
+      "graph_name": "reify",
       "created_at": "2026-07-02T00:12:39.355753+00:00",
       "claim_kind": "applied_work",
       "subject": "commit",
@@ -4311,7 +4680,8 @@
       "status": "unverifiable",
       "observed": "commit 818d2ebf9629825a8a28e498bb33165857f2a065 could not be checked in project 'solar_challenge_platform'",
       "claimed_text": "As of 2026-07-01T23:30:14Z: Task 115 (Customer Portal\u00b7D: React frontend integration + StaticFiles serving + working-UI smoke, extends P11 infra) is done \u2014 merged via commit 818d2ebf9629825a8a28e498bb33165857f2a065",
-      "derived_edge_uuids": []
+      "derived_edge_uuids": [],
+      "edges_unqueried": false
     }
   ]
 }

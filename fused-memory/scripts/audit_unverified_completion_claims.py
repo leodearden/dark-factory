@@ -420,6 +420,15 @@ CAVEATS: tuple[str, ...] = (
     'has been deleted is NOT covered, and neither is an episode ingested '
     'through add_episode with a caller-supplied description, which carries no '
     'category and so falls outside the category scope.',
+    'COVERAGE, CROSS-GRAPH EDGES: derived_edge_uuids is enumerated ONLY in the '
+    'graph the episode was READ FROM (the finding\'s graph_name). An episode '
+    "whose group_id differs from that graph — see any finding where those two "
+    'fields disagree — may have its derived RELATES_TO edges in ANOTHER graph, '
+    'where they are NOT counted here. Measured, not hypothetical: episode '
+    'a887c958-0018-4715-8817-cf048c187e8d exists only in the reify graph with '
+    'group_id dark_factory, and its 8 derived edges exist only in the '
+    'dark_factory graph. An empty list therefore means "none in THIS graph", '
+    'not "none anywhere".',
     'EDGES NOT ENUMERATED: a finding whose derived_edge_uuids is null (and '
     'whose edges_unqueried is true) had its RELATES_TO edges NOT enumerated — '
     'no reader resolved for its graph, or the edge query failed. Its harm '

@@ -1,12 +1,17 @@
 {
   "task_id": "3381",
   "escalation": "esc-3085-1",
-  "git_sha": "a138751e80a95ad0d10d7cbf9b99bc70d246fdac",
+  "git_sha": "64a9de0655cb1db78666d59e9a8254101116efdb",
   "branch": "task/3381",
-  "swept_at": "2026-08-12T13:08:06.153106+00:00",
-  "started_at": "2026-08-12T13:07:41Z",
-  "finished_at": "2026-08-12T13:08:07Z",
+  "swept_at": "2026-08-15T11:13:35.596476+00:00",
+  "started_at": "2026-08-15T11:13:02Z",
+  "finished_at": "2026-08-15T11:13:36Z",
   "exit_code": 0,
+  "supersedes": {
+    "swept_at": "2026-08-12T13:08:06.153106+00:00",
+    "git_sha": "a138751e80a95ad0d10d7cbf9b99bc70d246fdac",
+    "reason": "The pre-fix run resolved its derived-edge reader by the record's Graphiti group_id (finding.project_id) against a reader dict keyed by the --project GRAPH NAMES. Any episode whose group_id differed from the graph it was read from therefore resolved to the wrong reader, or to no reader at all, and the miss serialized as `derived_edge_uuids: []` — indistinguishable from a measured zero. Fixed in steps 16-19 (commits b3b1ff99fb, dcfedcccd6, 041b6277f1, 994e6667f4): the lookup is now keyed on the new `graph_name` field (WHICH GRAPH WAS QUERIED), and a genuinely un-enumerated edge list serializes as JSON `null` with `edges_unqueried: true` rather than as an empty list."
+  },
   "cwd": "/home/leo/src/dark-factory/.worktrees/3381/fused-memory",
   "argv": [
     "uv", "run", "python", "scripts/audit_unverified_completion_claims.py",
@@ -21,18 +26,18 @@
   },
   "episodic_population": {
     "dark_factory": {
-      "count_at_run": 3030,
-      "count_measured_earlier": 2995,
-      "earlier_measured_at": "2026-08-12T10:39Z",
-      "measured_via": "GRAPH.RO_QUERY dark_factory \"MATCH (e:Episodic) RETURN count(e)\""
+      "count_at_run": 3042,
+      "count_at_previous_run": 3030,
+      "previous_run_at": "2026-08-12T13:08Z",
+      "measured_via": "the sweep's own stderr: 'dark_factory: read 3042 episode(s)'"
     },
     "reify": {
-      "count_at_run": 4547,
-      "count_measured_earlier": 4547,
-      "earlier_measured_at": "2026-08-12T10:39Z",
-      "measured_via": "GRAPH.RO_QUERY reify \"MATCH (e:Episodic) RETURN count(e)\""
+      "count_at_run": 4553,
+      "count_at_previous_run": 4547,
+      "previous_run_at": "2026-08-12T13:08Z",
+      "measured_via": "the sweep's own stderr: 'reify: read 4553 episode(s)'"
     },
-    "total_at_run": 7577
+    "total_at_run": 7595
   },
   "authorities_resolved": {
     "task_status": {
@@ -47,12 +52,17 @@
   },
   "notes": [
     "report.json is byte-for-byte the script's stdout. It was neither pretty-printed nor hand-edited. All logging went to stderr.",
-    "FIRST RUN DISCARDED. An initial run at 10:42Z from the same cwd WITHOUT the three env vars above resolved an empty project registry ('project dark_factory is not registered' / 'project reify is not registered', 1035 task claims) and found no tickets.db, so every task and ticket claim fell to 'unverifiable'. That run's output is NOT the committed artifact. The script warned loudly on stderr for each case rather than failing silently, which is how the mis-scoped run was caught. The registry is built by build_known_projects_map (models/scope.py:282), whose extra roots default to the DASHBOARD_KNOWN_PROJECT_ROOTS env var; a standalone CLI run does not inherit the server's environment, so it must be supplied. RECONCILIATION_DATA_DIR is needed because the configured default './data/reconciliation' is relative to the PROJECT ROOT, while the sweep runs from fused-memory/.",
-    "THE DENOMINATOR IS A MOVING TARGET. The dark_factory graph grew from 2995 to 3030 Episodic nodes over the ~2.5h between the two measurements above. The store is live and being written throughout; 7577 is a snapshot at run time, not a fixed population.",
-    "ZERO ticket-subject findings. summary.by_subject carries only commit (35) and task (161) — no ticket key at all. The ticket store WAS available and initialized for this run, so this is a real negative, not an unavailability artifact: esc-3085-1 instance (2)'s exact shape (a completion claim naming a tkt_ id that the registry does not hold) did not recur anywhere in the swept corpus.",
-    "esc-3085-1 INSTANCE (2) WAS SWEPT AND CAME BACK CLEAN. Episode 02090224-7bc9-4485-9291-6748e1042ac9 is still present in the REIFY graph with source_description 'add_memory:temporal_facts' (in scope, and with no [unverified_claim] prefix — it predates the gate), and it appears in none of the 196 findings. Ticket tkt_0RRRC5AASJ9Z630VP4PCN9H376 DOES exist in tickets.db (status='combined', task_id='5638', created 2026-07-27T08:30:56Z, resolved 08:31:29Z, reason beginning 'drop: Candidate is fully covered by pool Task 5638'), so _verify_ticket correctly returns verified. Measured directly against the graph and the ticket DB on 2026-08-12. See investigation.md for the hypothesis about what remains false in that record and why an existence-only ticket check cannot see it.",
-    "The 166 'mismatch' findings in report.json are the SCRIPT'S RAW VERDICTS, not adjudicated fabrications. Manual adjudication of every one of them is recorded in investigation.md, which identifies three systematic false-positive classes and concludes that 0 are confirmed new fabrications of the esc-3085-1 shape. report.json is committed unedited precisely so that adjudication can be re-checked against the raw output.",
-    "Cross-repo commit verification (investigation.md class C) was performed OUT OF BAND with `git cat-file -e <sha>^{commit}` run directly in /home/leo/src/dark-factory and /home/leo/src/reify at 2026-08-12T13:1xZ, at dark-factory HEAD a138751e80 and reify HEAD 3e39c86729. The script itself never performs that cross-repo check; it probes only the claimed project.",
-    "INVARIANT HELD: this sweep invalidated nothing and deleted nothing. Every episode and edge the report names is left exactly as it was, for human adjudication. The script has no --apply/--invalidate/--delete path, an absence pinned by TestReadOnlyByConstruction, and reads exclusively over GRAPH.RO_QUERY."
+    "THIS RUN SUPERSEDES THE 2026-08-12 ONE — see `supersedes` above for the defect and the fixing commits. The stale artifact was NOT left in place and was NOT hand-patched to look fixed; the whole sweep was re-run against the live store.",
+    "WHAT THE FIX ACTUALLY CHANGED, MEASURED. Comparing the two reports finding-by-finding on (record_uuid, claim_kind, subject, ref): 195 findings are common to both, 5 of which changed their derived_edge_uuids. All 5 went from a NON-EMPTY list (6-11 edges each) to an EMPTY one; NONE went the other way. The plan's expectation was that the pre-fix report 'understates the graph' — that is not what the measurement shows. The pre-fix error ran in BOTH directions: it left 15 findings un-enumerated (reported as [] having never been queried) AND it attributed another graph's edges to 5 findings.",
+    "WHY THOSE 5 LOST THEIR EDGES — and the cross-graph fact it exposes. All 5 are episodes READ FROM the reify graph whose own group_id is 'dark_factory'. The pre-fix lookup keyed on group_id, so it queried the DARK_FACTORY graph and found edges there. Measured directly over GRAPH.RO_QUERY on 2026-08-15 for 3 of the 5: episode a887c958-0018-4715-8817-cf048c187e8d exists as an Episodic node ONLY in reify (count 1 in reify, 0 in dark_factory) yet has 8 RELATES_TO edges ONLY in dark_factory (8 in dark_factory, 0 in reify); 52a37f90-1f21-462f-96f6-9bf1774f3c32 -> node reify only, 11 edges dark_factory only; 0c5b3f7b-38e1-4436-baa6-4d8419f88645 -> node reify only, 7 edges dark_factory only. So an episode's derived edges CAN live in a different graph from the episode node. The corrected sweep enumerates edges only in the graph the episode was read from, which is the correct and predictable rule, but it means an empty list means 'none in THIS graph', not 'none anywhere'. That bound is now shipped as a first-class CAVEATS entry naming this exact episode, and cross-graph enumeration is filed as follow-up work rather than built here (it is beyond this task's plan).",
+    "THE 15 PREVIOUSLY-UNQUERIED FINDINGS ARE NOW GENUINELY QUERIED. Every finding whose project_id is not a swept graph name (know_live 10, knowlive 4, solar_challenge_platform 1) still shows []. The VALUE is unchanged but its epistemic status is not: before the fix those were never asked, now they were asked and the answer is a measured zero. summary.edges_unqueried is 0 for this run and the sweep emitted no 'NOT enumerated' warning, which is the machine-checkable statement that nothing went un-enumerated.",
+    "21 findings in this report have graph_name != project_id (reify<-dark_factory 6, reify<-know_live 7, reify<-knowlive 4, dark_factory<-know_live 3, reify<-solar_challenge_platform 1). Both fields are reported on every finding precisely so this population is visible instead of being silently collapsed into one column.",
+    "THE DENOMINATOR IS A MOVING TARGET. The corpus grew from 7577 to 7595 Episodic nodes over the ~3 days between the two runs (dark_factory 3030->3042, reify 4547->4553). The store is live and being written throughout; 7595 is a snapshot at run time, not a fixed population. The finding delta below is partly this drift and partly the fix.",
+    "FINDING DELTA vs the 2026-08-12 run: 1 dropped, 2 added, 195 common. DROPPED: episode e64dbe6f-5df7-43a3-be1f-398ce55278cf / task 3584, which the earlier run observed 'pending'. dark_factory task 3584 is now 'cancelled' (read from tasks.db on 2026-08-15), and 'cancelled' is in shared.task_statuses.TERMINAL, so the claim now VERIFIES and the finding disappeared. That is CAVEAT 2 firing live and measured: work that was cancelled — i.e. never landed — reads as verified. ADDED: 4c7a7e58-858c-4447-acc1-7c9f24a220a1 (filing_dispatch, dark_factory task 4213, observed pending) and 5d84c539-74de-4eb3-b6dd-b53535199756 (filing_dispatch, reify task 6098, observed pending), both episodes written on 2026-08-12 AFTER the earlier run. Both are Class A false positives (a filing claim about a task that exists but is not terminal); neither is a fabrication.",
+    "ZERO ticket-subject findings, unchanged. summary.by_subject carries only commit (35) and task (162) — no ticket key at all. The ticket store WAS available and initialized for this run, so this is a real negative, not an unavailability artifact.",
+    "esc-3085-1 INSTANCE (2) WAS SWEPT AND CAME BACK CLEAN, unchanged from the earlier run. Episode 02090224-7bc9-4485-9291-6748e1042ac9 is still present in the REIFY graph with source_description 'add_memory:temporal_facts' (in scope, no [unverified_claim] prefix — it predates the gate), and it appears in none of the 197 findings. Ticket tkt_0RRRC5AASJ9Z630VP4PCN9H376 DOES exist in tickets.db (status='combined', task_id='5638'), so _verify_ticket correctly returns verified. See investigation.md for the hypothesis about what remains false in that record.",
+    "The 167 'mismatch' findings in report.json are the SCRIPT'S RAW VERDICTS, not adjudicated fabrications. The three systematic false-positive classes identified in investigation.md account for all 167 (Class A 127, Class B 10, Class C 30), and the conclusion is unchanged from the earlier run: 0 confirmed new fabrications of the esc-3085-1 shape. report.json is committed unedited precisely so that adjudication can be re-checked against the raw output.",
+    "Cross-repo commit verification (investigation.md class C) was performed OUT OF BAND for the earlier run with `git cat-file -e <sha>^{commit}` run directly in /home/leo/src/dark-factory and /home/leo/src/reify at 2026-08-12T13:1xZ. The commit-subject population is byte-identical between the two runs (35 findings, 30 mismatch), so that adjudication carries over unchanged and was NOT re-derived. The script itself never performs that cross-repo check; it probes only the claimed project.",
+    "INVARIANT HELD: this sweep invalidated nothing and deleted nothing. Every episode and edge the report names is left exactly as it was, for human adjudication. The script has no --apply/--invalidate/--delete path, an absence pinned by TestReadOnlyByConstruction, and reads exclusively over GRAPH.RO_QUERY. The three ad-hoc verification queries quoted in these notes were likewise issued as GRAPH.RO_QUERY, and the tasks.db reads used sqlite mode=ro."
   ]
 }
