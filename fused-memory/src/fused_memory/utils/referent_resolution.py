@@ -295,6 +295,22 @@ def _declared_referents(declared: list[dict], *, group_id: str) -> ReferentSet:
     this repo's loud-over-silent norm forbids. Reporting it as a conflict
     would tell the agent its declaration contradicts its prose and send it
     hunting a semantic disagreement that does not exist.
+
+    That contract is TOTAL, not best-effort: EVERY malformed entry — wrong
+    container, non-dict element, unknown key, bad ``id``, bad ``kind`` TYPE,
+    bad ``project_id`` TYPE, unregistered ``kind``, path-shaped ``project_id``
+    — leaves this function as exactly ``InputValidationError``, so δ's
+    ``except InputValidationError`` gate catches all of them. ``declared`` is
+    caller-supplied JSON off an MCP tool argument, so every shape is reachable.
+
+    The ``kind``/``project_id`` type checks are deliberately SEPARATE from the
+    ``except ValueError`` around the :class:`Referent` construction rather than
+    folded into it. ``__post_init__``'s ``self.kind not in _KIND_LABELS``
+    raises ``TypeError`` for an unhashable kind, and ``TypeError`` is not a
+    ``ValueError``, so that handler structurally cannot see it. The two-layer
+    defence is deliberate: a *str* kind still falls through to
+    ``__post_init__``, whose message names the registered kinds and where to
+    add one.
     """
     if not isinstance(declared, list):
         raise InputValidationError(
@@ -320,7 +336,34 @@ def _declared_referents(declared: list[dict], *, group_id: str) -> ReferentSet:
             )
         number = _declared_number(entry)
 
-        raw_project = entry.get('project_id') or ''
+        # Checked BEFORE the Referent(...) construction below, not folded into
+        # the `except ValueError` around it: __post_init__'s membership test
+        # `self.kind not in _KIND_LABELS` raises TypeError for an UNHASHABLE
+        # kind, and TypeError is not a ValueError, so that handler structurally
+        # cannot convert it. The two layers are deliberate, not redundant — and
+        # a str kind must still fall through to __post_init__ so the
+        # unregistered-kind message keeps naming _KIND_LABELS and where to add
+        # one. (bool needs no separate check: it is not a str.)
+        kind = entry.get('kind', 'task')
+        if not isinstance(kind, str):
+            raise InputValidationError(
+                f'declared referent {_safe_repr(entry)} has a non-string kind '
+                f'{_safe_repr(kind)}. {_DECLARED_REFERENT_HINT}'
+            )
+
+        # Read the RAW value and type-check it BEFORE the `or ''`
+        # normalization. Validating the post-`or` value would still let every
+        # FALSY non-str — 0, [], {}, False — through as an OWN-project
+        # referent: the identical silently-wrong-project outcome the unknown-key
+        # ('projectId') rejection above already guards against, arriving through
+        # a different door. None and '' stay accepted as legitimate absence.
+        raw_project = entry.get('project_id')
+        if raw_project is not None and not isinstance(raw_project, str):
+            raise InputValidationError(
+                f'declared referent {_safe_repr(entry)} has a non-string '
+                f'project_id {_safe_repr(raw_project)}. {_DECLARED_REFERENT_HINT}'
+            )
+        raw_project = raw_project or ''
         try:
             project_id = canonicalize_project_id(raw_project) if raw_project else ''
         except PathShapedProjectIdError as exc:
@@ -336,7 +379,7 @@ def _declared_referents(declared: list[dict], *, group_id: str) -> ReferentSet:
 
         try:
             referent = Referent(
-                kind=entry.get('kind', 'task'),
+                kind=kind,
                 number=number,
                 project_id=project_id,
             )
