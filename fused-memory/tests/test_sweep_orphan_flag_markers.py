@@ -102,6 +102,96 @@ def _bothmissing(id: str) -> dict:
     return _member(id, kind=None, task_id=None)
 
 
+# ---------------------------------------------------------------------------
+# count_memories_by_metadata mock, keyed by FILTER rather than call ORDER
+# (task 3897 amendment, reviewer_comprehensive #4)
+#
+# run() counts three distinct filters — the source filter, the source+kind
+# filter, and the flag_for_stage2 census probe — repeating the first two
+# after an --apply delete pass. A positional `side_effect=[...]` list binds
+# every test to run()'s exact call order, so moving a count (e.g. issuing the
+# census probe after the scroll instead of before it) would silently feed the
+# 'after' count into the probe slot and vice versa, with the mis-wiring
+# surfacing only in production. Binding each mocked count to the filter it
+# ANSWERS removes that coupling, and makes an unexpected filter a loud
+# AssertionError rather than a silent mis-binding.
+# ---------------------------------------------------------------------------
+
+_SOURCE_FILTER = {'source': 'stage1_flag_marker'}
+_KIND_FILTER = {'source': 'stage1_flag_marker', 'kind': 'stage1_flag_marker'}
+_FLAG_FOR_STAGE2_FILTER = {'flag_for_stage2': True}
+
+
+def _filter_key(filters: dict | None) -> frozenset:
+    """Hashable identity of a metadata filter dict (order-insensitive)."""
+    return frozenset((filters or {}).items())
+
+
+def _counts(*, source, kind, flag_for_stage2=0) -> AsyncMock:
+    """Build a count_memories_by_metadata mock answering per filter.
+
+    Args:
+        source: Answer(s) for ``{'source': MARKER_SOURCE}``.
+        kind: Answer(s) for ``{'source': MARKER_SOURCE, 'kind': MARKER_KIND}``.
+        flag_for_stage2: Answer(s) for the ``{'flag_for_stage2': True}``
+            census probe (default 0 — the adjacent pool is irrelevant to
+            most tests).
+
+    Each value is either a scalar, answering every call on that filter, or a
+    LIST consumed in order — the shape an ``--apply`` run needs, where the
+    source/kind filters are counted twice (``before`` then ``after``), e.g.
+    ``source=[3, 1]``. Exhausting a list is a loud AssertionError, so an
+    unexpected extra count cannot pass silently. A value that is an exception
+    instance is RAISED rather than returned, which is how a failing census
+    probe is expressed.
+    """
+    queues: dict[frozenset, tuple[list, bool]] = {
+        _filter_key(spec_filter): (
+            (list(value), False) if isinstance(value, list) else ([value], True)
+        )
+        for spec_filter, value in (
+            (_SOURCE_FILTER, source),
+            (_KIND_FILTER, kind),
+            (_FLAG_FOR_STAGE2_FILTER, flag_for_stage2),
+        )
+    }
+
+    async def _count(*, project_id, filters, **_kwargs):
+        entry = queues.get(_filter_key(filters))
+        assert entry is not None, (
+            'count_memories_by_metadata called with an unexpected filter: '
+            f'{filters!r} — this mock answers the source, source+kind and '
+            'flag_for_stage2 filters only.'
+        )
+        values, is_constant = entry
+        assert values, (
+            f'count_memories_by_metadata called more times than the test '
+            f'supplied answers for filter {filters!r}.'
+        )
+        value = values[0] if is_constant else values.pop(0)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    return AsyncMock(side_effect=_count)
+
+
+def _probe_call(count_mock: AsyncMock):
+    """Return the single census-probe call made against *count_mock*.
+
+    Looked up BY FILTER, never by position, for the same reason :func:`_counts`
+    exists: a positional index would keep passing if the probe moved.
+    """
+    probe_calls = [
+        call for call in count_mock.call_args_list
+        if call.kwargs.get('filters') == _FLAG_FOR_STAGE2_FILTER
+    ]
+    assert len(probe_calls) == 1, (
+        f'Expected exactly one flag_for_stage2 census probe, got: {probe_calls!r}'
+    )
+    return probe_calls[0]
+
+
 # ===========================================================================
 # Tests: find_orphan_markers
 # ===========================================================================
@@ -629,7 +719,7 @@ class TestRun:
         """
         memory_service = AsyncMock()
         # count_memories_by_metadata: total=3, total+kind=1  (so 2 orphans by count)
-        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[3, 1, 0])
+        memory_service.count_memories_by_metadata = _counts(source=3, kind=1)
         # get_memories_by_metadata returns 1 valid + 2 orphans
         memory_service.get_memories_by_metadata = AsyncMock(return_value=[
             _member('v1'),
@@ -657,9 +747,7 @@ class TestRun:
         memory_service = AsyncMock()
         # before: total=3, kind=1 → 2 orphans by count
         # after: total=1, kind=1 → 0 orphans
-        memory_service.count_memories_by_metadata = AsyncMock(
-            side_effect=[3, 1, 0, 1, 1]
-        )
+        memory_service.count_memories_by_metadata = _counts(source=[3, 1], kind=[1, 1])
         memory_service.get_memories_by_metadata = AsyncMock(return_value=[
             _member('v1'),
             _orphan('o1'),
@@ -684,9 +772,7 @@ class TestRun:
         """
         memory_service = AsyncMock()
         # before: total=3, kind=1 → 2 orphans by count; after: total=2, kind=1 → 1 residual
-        memory_service.count_memories_by_metadata = AsyncMock(
-            side_effect=[3, 1, 0, 2, 1]
-        )
+        memory_service.count_memories_by_metadata = _counts(source=[3, 2], kind=[1, 1])
         memory_service.get_memories_by_metadata = AsyncMock(return_value=[
             _member('v1'),
             _orphan('o1'),   # this delete will fail
@@ -720,7 +806,7 @@ class TestRun:
         semantic search (memory_service.search) is never called.
         """
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(return_value=0)
+        memory_service.count_memories_by_metadata = _counts(source=0, kind=0)
         memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
         memory_service.search = AsyncMock()
 
@@ -754,7 +840,7 @@ class TestRun:
 
         # --- Dry run: verify enumeration/report shape ---
         dry_service = AsyncMock()
-        dry_service.count_memories_by_metadata = AsyncMock(side_effect=[4, 2, 0])
+        dry_service.count_memories_by_metadata = _counts(source=4, kind=2)
         dry_service.get_memories_by_metadata = AsyncMock(return_value=members)
         dry_service.delete_memory = AsyncMock(return_value=None)
 
@@ -773,7 +859,7 @@ class TestRun:
 
         # --- Apply: verify delete fan-out is deduped by id ---
         apply_service = AsyncMock()
-        apply_service.count_memories_by_metadata = AsyncMock(side_effect=[4, 2, 0, 1, 1])
+        apply_service.count_memories_by_metadata = _counts(source=[4, 1], kind=[2, 1])
         apply_service.get_memories_by_metadata = AsyncMock(return_value=members)
         apply_service.delete_memory = AsyncMock(return_value=None)
 
@@ -819,7 +905,7 @@ class TestRun:
 
         # --- Dry run ---
         dry_service = AsyncMock()
-        dry_service.count_memories_by_metadata = AsyncMock(side_effect=[5, 3, 0])
+        dry_service.count_memories_by_metadata = _counts(source=5, kind=3)
         dry_service.get_memories_by_metadata = AsyncMock(return_value=members)
         dry_service.delete_memory = AsyncMock(return_value=None)
 
@@ -841,7 +927,7 @@ class TestRun:
 
         # --- Apply: overlap1 (stale AND terminal) deleted exactly once ---
         apply_service = AsyncMock()
-        apply_service.count_memories_by_metadata = AsyncMock(side_effect=[5, 3, 0, 1, 1])
+        apply_service.count_memories_by_metadata = _counts(source=[5, 1], kind=[3, 1])
         apply_service.get_memories_by_metadata = AsyncMock(return_value=members)
         apply_service.delete_memory = AsyncMock(return_value=None)
 
@@ -888,7 +974,7 @@ class TestRun:
         members = [dated_stale, undated_missing, undated_bad]
 
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[3, 3, 0])
+        memory_service.count_memories_by_metadata = _counts(source=3, kind=3)
         memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
         memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -917,7 +1003,7 @@ class TestRun:
         members = [valid_fresh]
 
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[1, 1, 0])
+        memory_service.count_memories_by_metadata = _counts(source=1, kind=1)
         memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
         memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -936,11 +1022,11 @@ class TestRun:
     # -----------------------------------------------------------------
     # cross_check census block (task 3897)
     #
-    # run() issues a THIRD count_memories_by_metadata call — the
-    # flag_for_stage2 census probe — between the two `before` counts and
-    # the scroll. Mock ordering for these tests is therefore:
-    #     [before_source, before_kind, flag_for_stage2_probe, (after_source,
-    #      after_kind on --apply)]
+    # run() issues an additional count_memories_by_metadata call — the
+    # flag_for_stage2 census probe. These tests answer it through _counts()'s
+    # `flag_for_stage2=` argument and look the call itself up via
+    # _probe_call(), both keyed by FILTER, so nothing here depends on where
+    # in run()'s sequence the probe is issued.
     # -----------------------------------------------------------------
 
     _BLIND_SPOT_MSG = 'flag_for_stage2'
@@ -964,7 +1050,7 @@ class TestRun:
         so without this block the run reads as a clean bill of health.
         """
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[0, 0, 61])
+        memory_service.count_memories_by_metadata = _counts(source=0, kind=0, flag_for_stage2=61)
         memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
         memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -982,8 +1068,9 @@ class TestRun:
 
         # The probe must use the boolean-typed adjacent filter and the same
         # project as the sweep — a probe against a different project would
-        # compare two unrelated populations.
-        probe_call = memory_service.count_memories_by_metadata.call_args_list[2]
+        # compare two unrelated populations. Located by filter, not by call
+        # index (see _probe_call).
+        probe_call = _probe_call(memory_service.count_memories_by_metadata)
         assert probe_call.kwargs['filters'] == {'flag_for_stage2': True}
         assert probe_call.kwargs['project_id'] == 'dark_factory'
 
@@ -993,9 +1080,27 @@ class TestRun:
             f'{[r.message for r in caplog.records]}'
         )
         # The warning must name BOTH counts, or an operator cannot tell how
-        # large the unseen population is.
+        # large the unseen population is. Asserted on the SUBSTITUTED values
+        # and on distinctive rendered fragments, not on `'0' in text` — the
+        # template hardcodes the literal '0 swept', so a bare substring check
+        # for '0' is self-satisfying and would stay green even if run()
+        # logged the wrong count in that slot. (One substitution stays
+        # inherently unfalsifiable here: in any GENUINE blind spot the
+        # source+kind count is necessarily 0 too, since it filters a strict
+        # subset of the source population. What these assertions do pin is
+        # the slot ORDER and the rendering — a swap of the two counts fails
+        # them.)
+        assert warnings[0].args[1:3] == (0, 61), (
+            'Expected the enumerated (0) and adjacent (61) counts as the '
+            f'logged args, got: {warnings[0].args!r}'
+        )
         text = warnings[0].getMessage()
-        assert '0' in text and '61' in text
+        assert 'matched 0 records' in text, (
+            f'Expected the rendered enumerated count, got: {text!r}'
+        )
+        assert 'population of 61 records' in text, (
+            f'Expected the rendered adjacent count, got: {text!r}'
+        )
 
     @pytest.mark.asyncio
     async def test_cross_check_no_blind_spot_when_enumeration_sees_its_pool(self, caplog):
@@ -1006,7 +1111,7 @@ class TestRun:
         would make the signal noise.
         """
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[3, 3, 61])
+        memory_service.count_memories_by_metadata = _counts(source=3, kind=3, flag_for_stage2=61)
         memory_service.get_memories_by_metadata = AsyncMock(return_value=[
             _member('v1'), _member('v2'), _member('v3'),
         ])
@@ -1033,7 +1138,7 @@ class TestRun:
         operators learn to ignore the warning.
         """
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[0, 0, 0])
+        memory_service.count_memories_by_metadata = _counts(source=0, kind=0, flag_for_stage2=0)
         memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
         memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -1072,8 +1177,8 @@ class TestRun:
         it fails is worse than one that stays silent.
         """
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(
-            side_effect=[3, 1, RuntimeError('qdrant down')]
+        memory_service.count_memories_by_metadata = _counts(
+            source=3, kind=1, flag_for_stage2=RuntimeError('qdrant down'),
         )
         memory_service.get_memories_by_metadata = AsyncMock(
             return_value=self._members_for_failsafe()
@@ -1113,8 +1218,8 @@ class TestRun:
         """
         async def _run(probe_outcome):
             memory_service = AsyncMock()
-            memory_service.count_memories_by_metadata = AsyncMock(
-                side_effect=[3, 1, probe_outcome]
+            memory_service.count_memories_by_metadata = _counts(
+                source=3, kind=1, flag_for_stage2=probe_outcome,
             )
             memory_service.get_memories_by_metadata = AsyncMock(
                 return_value=self._members_for_failsafe()
@@ -1145,8 +1250,8 @@ class TestRun:
         would either raise or silently misbehave under a naive comparison.
         """
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(
-            side_effect=[0, 0, bad_return]
+        memory_service.count_memories_by_metadata = _counts(
+            source=0, kind=0, flag_for_stage2=bad_return,
         )
         memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
         memory_service.delete_memory = AsyncMock(return_value=None)
@@ -1169,8 +1274,8 @@ class TestRun:
         flag_for_stage2_total: True — a nonsense census. Guard against it
         explicitly."""
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(
-            side_effect=[0, 0, True]
+        memory_service.count_memories_by_metadata = _counts(
+            source=0, kind=0, flag_for_stage2=True,
         )
         memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
         memory_service.delete_memory = AsyncMock(return_value=None)
@@ -1255,7 +1360,7 @@ class TestTargetedCorrection:
         members = [mistagged, composite]
 
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[2, 2, 0])
+        memory_service.count_memories_by_metadata = _counts(source=2, kind=2)
         memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
         memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -1281,7 +1386,7 @@ class TestTargetedCorrection:
         members = [mistagged, composite]
 
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[2, 2, 0, 0, 0])
+        memory_service.count_memories_by_metadata = _counts(source=[2, 0], kind=[2, 0])
         memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
         memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -1307,7 +1412,7 @@ class TestTargetedCorrection:
         members = [valid]
 
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[1, 1, 0])
+        memory_service.count_memories_by_metadata = _counts(source=1, kind=1)
         memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
         memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -1332,7 +1437,7 @@ class TestTargetedCorrection:
         members = [orphan]
 
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[1, 0, 0, 0, 0])
+        memory_service.count_memories_by_metadata = _counts(source=[1, 0], kind=[0, 0])
         memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
         memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -1353,7 +1458,7 @@ class TestTargetedCorrection:
         members = [valid]
 
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[1, 1, 0])
+        memory_service.count_memories_by_metadata = _counts(source=1, kind=1)
         memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
         memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -1419,9 +1524,9 @@ class TestFlagForStage2IsNeverDeleted:
         forbidden_ids = {'ffs2-a', 'ffs2-b', 'ffs2-c'}
 
         memory_service = AsyncMock()
-        # [before_source, before_kind, flag_for_stage2 probe, after_source, after_kind]
-        memory_service.count_memories_by_metadata = AsyncMock(
-            side_effect=[3, 3, 61, 1, 1]
+        # source/kind are counted twice on --apply (before, then after).
+        memory_service.count_memories_by_metadata = _counts(
+            source=[3, 1], kind=[3, 1], flag_for_stage2=61,
         )
         memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
         memory_service.delete_memory = AsyncMock(return_value=None)
@@ -1467,8 +1572,8 @@ class TestFlagForStage2IsNeverDeleted:
         get_memories_by_metadata scroll, which is the only way records could
         become delete-set candidates."""
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(
-            side_effect=[0, 0, 61, 0, 0]
+        memory_service.count_memories_by_metadata = _counts(
+            source=0, kind=0, flag_for_stage2=61,
         )
         memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
         memory_service.delete_memory = AsyncMock(return_value=None)
