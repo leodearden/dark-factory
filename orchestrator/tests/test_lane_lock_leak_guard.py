@@ -767,6 +767,300 @@ class TestRequireLaneLockHolders:
 
 
 # ---------------------------------------------------------------------------
+# `_settled_lane_lock_holder_pids` (task 3783) — the PRODUCTION-side settle,
+# and the third member of this family.
+#
+# `wait_for_lane_lock_holder` and `require_lane_lock_holders` above harden the
+# TEST side's positive and negative reads (tasks 3598/3604).  Neither reaches
+# the two PRODUCTION reads on the acquire-timeout path
+# (`reset_persistent_merge_worktree`, `merge_verify_lease`), which stayed
+# one-shot — so the same measured transient still lands there, and lands on
+# something worse than a test assertion: it drops the holder pid+pgid out of
+# the operator-facing message AND fails layer (1) of the self-owned-leak
+# predicate, degrading a loud B13 escalation into a quiet contended defer.
+#
+# Pinned here in isolation against an INJECTED reader — the same convention as
+# the two classes above — so every case is deterministic, touches no real lock
+# and no real /proc/locks, and asserts NO elapsed wall clock (this repo's
+# 1335/1836/2819/3451/3491 load-sensitive flake class).  The end-to-end
+# behaviour at both real call sites is pinned separately, further below, by
+# `TestContendedRaiseSurvivesALossyHolderRead`.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSettledLaneLockHolderRead:
+    """The contended-raise path must settle its kernel read, fail-safe."""
+
+    async def test_polls_past_a_lossy_empty_read(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """THE headline case: a lossy empty snapshot must not be the answer.
+
+        Mechanism absorbed, measured on this host and recorded in full at
+        ``test_live_in_process_span_is_not_a_leak`` below (:1723-1731):
+        ``/proc/locks`` is a seq_file the kernel serves one PAGE per read(2)
+        regardless of the caller's buffer (a 13062-byte table took 4 reads
+        even for a 1 MiB request), and each read restarts the per-CPU
+        lock-list walk from a POSITIONAL index — so a lock released at an
+        earlier position between chunks shifts every later record down and
+        ours is skipped outright.  Reproduced at 1.54% of reads (144/9337)
+        against a real held flock with 24 concurrent churners.
+
+        Why emptiness is the retry trigger: at the call sites this helper
+        exists for, the read happens IMMEDIATELY AFTER a bounded-wait acquire
+        TIMED OUT.  We waited the full wait and did not get the lock, so
+        somebody held it; "nobody holds it" contradicts the timeout that just
+        produced the question.  Not impossible — the holder may genuinely
+        have released in between, which is exactly what today's degraded
+        message says — so it is RE-READ, not disbelieved (see
+        ``test_a_permanently_empty_read_degrades_and_never_raises``).
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()  # stat-able: NOT the structural-empty short-circuit
+
+        scripted: list[list[int]] = [[], [], [4242]]
+        calls: list[Path] = []
+
+        def _lossy_reader(path: Path) -> list[int]:
+            calls.append(path)
+            return scripted.pop(0) if scripted else [4242]
+
+        monkeypatch.setattr(git_ops_mod, 'lane_lock_holder_pids', _lossy_reader)
+
+        result = await git_ops_mod._settled_lane_lock_holder_pids(lock_path)
+
+        assert result == [4242], (
+            f'a lossy empty read must be polled past, not returned as the '
+            f'holder set — returning it drops the holder pid+pgid from the '
+            f'operator message and fails layer (1) of the leak predicate; '
+            f'got {result!r} after {len(calls)} read(s)'
+        )
+
+    async def test_a_non_empty_first_read_is_returned_without_a_second_read(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """The ORDINARY contention path must not pay extra procfs I/O.
+
+        A non-empty first read is a real answer and agrees with the timeout
+        that produced it; re-reading it could only replace a good snapshot
+        with a later, possibly-lossier one.  Exactly-once is asserted rather
+        than "at most a few": this is the path every healthy contended raise
+        takes, and it is also what keeps the single-snapshot invariant
+        ``_lane_lock_holder_facts`` documents cheap to honour.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+
+        calls: list[Path] = []
+
+        def _reader(path: Path) -> list[int]:
+            calls.append(path)
+            return [4242]
+
+        monkeypatch.setattr(git_ops_mod, 'lane_lock_holder_pids', _reader)
+
+        result = await git_ops_mod._settled_lane_lock_holder_pids(lock_path)
+
+        assert result == [4242]
+        assert len(calls) == 1, (
+            f'the ordinary contention path must read the kernel lock table '
+            f'exactly once; the reader was called {len(calls)} time(s)'
+        )
+
+    async def test_a_permanently_empty_read_degrades_and_never_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """FAIL-SAFE: a still-unknown answer degrades, it never raises.
+
+        The holder may genuinely have released between the timeout and this
+        probe — today's message says so in as many words.  This helper
+        decorates a raise; it must never BE one, or a diagnostic degradation
+        would be promoted into a merge failure at the one site whose job is
+        to report why a merge is deferring.
+
+        The bound is narrowed through the module-global seam
+        (``_LANE_LOCK_HOLDER_SETTLE_SECS``), which also pins that the helper
+        resolves it at CALL time rather than freezing it into a def-time
+        default — the same seam requirement ``wait_for_lane_lock_holder``
+        documents for its reader.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+
+        calls: list[Path] = []
+
+        def _always_empty(path: Path) -> list[int]:
+            calls.append(path)
+            return []
+
+        monkeypatch.setattr(git_ops_mod, 'lane_lock_holder_pids', _always_empty)
+        monkeypatch.setattr(git_ops_mod, '_LANE_LOCK_HOLDER_SETTLE_SECS', 0.05)
+
+        result = await git_ops_mod._settled_lane_lock_holder_pids(lock_path)
+
+        assert result == [], (
+            f'an exhausted settle must return the empty snapshot unchanged so '
+            f'the call site degrades to exactly today behaviour; got {result!r}'
+        )
+        assert len(calls) > 1, (
+            f'the helper must actually have polled before degrading — a bound '
+            f'that never re-reads is the one-shot read this task removes; the '
+            f'reader was called {len(calls)} time(s)'
+        )
+
+    async def test_an_unstatable_lock_path_is_answered_in_one_read(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """A STRUCTURAL empty is answered immediately — no bound is paid.
+
+        ``lane_lock_holder_pids`` returns ``[]`` for an unstat-able path
+        because ``os.stat`` raised before a single ``/proc/locks`` row was
+        examined.  No amount of re-reading can change that (task 3604's
+        headline case — a held lane whose lock file was unlinked — keeps
+        failing the same stat), so polling it would spend the whole bound to
+        learn nothing.  This is also what keeps the existing stubbed-acquire
+        contended tests, which never create a lock file, from paying the
+        bound.
+
+        Contrast with ``test_polls_past_a_lossy_empty_read``: identical
+        return value, opposite cause, and the ``_lane_lock_identity``
+        short-circuit is what tells them apart.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+
+        lock_path = tmp_path / 'never-created.lock'
+        assert not lock_path.exists(), 'staging error: the path must be unstat-able'
+
+        calls: list[Path] = []
+
+        def _always_empty(path: Path) -> list[int]:
+            calls.append(path)
+            return []
+
+        monkeypatch.setattr(git_ops_mod, 'lane_lock_holder_pids', _always_empty)
+
+        result = await git_ops_mod._settled_lane_lock_holder_pids(lock_path)
+
+        assert result == []
+        assert len(calls) == 1, (
+            f'an unstat-able lock path is a STRUCTURAL empty no re-read can '
+            f'change; it must be answered after ONE read rather than spending '
+            f'the settle bound; the reader was called {len(calls)} time(s)'
+        )
+
+    async def test_settle_bound_stays_clear_of_the_foreign_holder_ceiling(
+        self, pytestconfig,
+    ):
+        """The settle bound must clear the global pytest-timeout ceiling too.
+
+        The CEILING half of this bound's two-sided derivation, in the same
+        style as ``test_foreign_holder_bounds_stay_clear_of_the_global_pytest_timeout``
+        below — and it is the half that forbids simply copying the test
+        side's ``_LANE_LOCK_STRICT_READ_SECS = 2.0``.
+
+        A contended raise driven INSIDE a ``with foreign_lane_lock_holder(...)``
+        block now pays this PRODUCTION bound on top of that helper's own
+        unconditional stack.  That is precisely the case task 3836's
+        amendment to the sibling invariant calls out as NOT covered by its
+        computation: "a further bounded wait a consumer pays inside the
+        ``with`` block".  Three tests do exactly this
+        (``test_foreign_holder_is_contention_not_a_leak``,
+        test_merge_verify_lease_guard.py's reset-lock case, and the new
+        ``TestContendedRaiseSurvivesALossyHolderRead`` cases below), so the
+        sum asserted here — 12.0 startup + 12.0 attribution + 5.0 teardown +
+        5.0 kill-wait + 1.0 monkeypatched acquire wait + the settle bound —
+        is their real worst case.
+
+        Breaching the ceiling would not merely slow a failure: no test in
+        this module or its sibling consumer opts out with
+        ``@pytest.mark.timeout`` (pinned by
+        ``test_no_foreign_holder_consumer_opts_out_of_the_global_timeout``),
+        so pytest-timeout fires first and, under ``timeout_method="thread"``
+        with ``--max-worker-restart=0``, os._exit()s the xdist worker rather
+        than failing cleanly — trading this flake class for a strictly worse
+        one that carries no diagnostics at all.
+
+        The FLOOR half needs no executable pin beyond the behavioural cases
+        above: against the measured 1.54%-per-read loss, the 0.5s/0.02s pair
+        gives ~25 reads (~1e-45 under independence, ~3e-8 even at a
+        deliberately pessimistic 50%-per-read correlated-burst rate), and a
+        re-read either succeeds in microseconds or is structurally broken —
+        the same reasoning that sized ``_LANE_LOCK_STRICT_READ_SECS``.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+
+        global_timeout = _effective_per_test_timeout(pytestconfig)
+        if global_timeout is None:
+            orchestrator_pyproject = (
+                Path(__file__).resolve().parents[1] / 'pyproject.toml'
+            )
+            governing_inifile = pytestconfig.inipath
+            if (
+                governing_inifile is not None
+                and governing_inifile.resolve() == orchestrator_pyproject
+            ):
+                pytest.fail(
+                    f'{governing_inifile} is the governing inifile for this run, '
+                    f'yet no per-test timeout is in effect (checked --timeout, '
+                    f'PYTEST_TIMEOUT, and [tool.pytest.ini_options].timeout) — '
+                    f'this is a genuine regression: the pytest-timeout / '
+                    f'os._exit() premise the settle bound is sized against no '
+                    f'longer holds. Either restore the timeout key or re-derive '
+                    f'the bound without it.'
+                )
+            pytest.skip(
+                f'no per-test timeout is in effect under the governing inifile '
+                f'{governing_inifile!r} — this is not {orchestrator_pyproject}, '
+                f'so this is an invocation artifact (e.g. a root-bound run), '
+                f'not drift; the pytest-timeout ceiling this invariant checks '
+                f'does not apply to this run'
+            )
+
+        settle = git_ops_mod._LANE_LOCK_HOLDER_SETTLE_SECS
+        # 5.0 = the _kill_group kill-wait (child.wait(timeout=5)); 1.0 = the
+        # monkeypatched _RESET_WARM_LANE_LOCK_WAIT_SECS /
+        # _MERGE_VERIFY_LEASE_WAIT_SECS every such consumer shortens the
+        # acquire to before driving the contended raise.
+        consumer_stack = (
+            _FOREIGN_HOLDER_STARTUP_SECS
+            + _FOREIGN_HOLDER_ATTRIBUTION_SECS
+            + _FOREIGN_HOLDER_TEARDOWN_SECS
+            + 5.0
+            + 1.0
+            + settle
+        )
+        ceiling = 0.6 * global_timeout
+        assert consumer_stack <= ceiling, (
+            f'a consumer driving a contended raise inside '
+            f'foreign_lane_lock_holder now pays the production settle bound '
+            f'({settle}s) on top of the helper\'s unconditional stack, for a '
+            f'worst case of {consumer_stack}s '
+            f'({_FOREIGN_HOLDER_STARTUP_SECS} startup + '
+            f'{_FOREIGN_HOLDER_ATTRIBUTION_SECS} attribution + '
+            f'{_FOREIGN_HOLDER_TEARDOWN_SECS} teardown + 5.0 kill-wait + 1.0 '
+            f'shortened acquire wait + {settle} settle), which exceeds 60% of '
+            f'the effective per-test timeout ({global_timeout}s, resolved from '
+            f'{pytestconfig.inipath}) — only {ceiling}s is allowed. Task 3836 '
+            f'documents that a bounded wait paid INSIDE the `with` block is '
+            f'not covered by the sibling invariant\'s computation, which is '
+            f'why this bound gets its own pin. Exceeding the effective timeout '
+            f'does not merely delay a failure: pytest-timeout fires first and, '
+            f'under timeout_method="thread" with --max-worker-restart=0, '
+            f'os._exit()s the xdist worker, discarding every bit of structured '
+            f'evidence the failure carried. This is a worst-case bound, not a '
+            f'typical cost: the settle returns the instant a non-empty '
+            f'snapshot lands, so a healthy contended raise pays one read.'
+        )
+
+
+# ---------------------------------------------------------------------------
 # `lane_is_free` must never pass on an UNKNOWN read (task 3604).
 #
 # Measured against the real kernel before this was written, with a leaked fd
