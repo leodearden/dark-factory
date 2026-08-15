@@ -1096,6 +1096,11 @@ class _DeployStateStub(BaseModel):
 # _assert_only_test_owned_registry_keys above and task 3352.
 _DEPLOY_STATE_STUB_KEY = 'deploy_state_stub'
 
+# A second test-owned key, for rows that need a `cardinality='list'`
+# registration alongside the dict-shaped _DEPLOY_STATE_STUB_KEY one (a single
+# key cannot hold both — cardinality is immutable per key, task 4142).
+_CHECKS_STUB_KEY = 'cardinality_checks_stub'
+
 
 class TestSubmodelRegistry:
     """The W10 extension point: register_metadata_submodel + _SUBMODEL_REGISTRY."""
@@ -1120,6 +1125,27 @@ class TestSubmodelRegistry:
         register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
         with pytest.raises(ValueError):
             register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _OtherDeployStateStub)
+
+    def test_register_without_cardinality_records_dict_default(self):
+        # 'dict' is the FAIL-CLOSED default: it restores the behavior that
+        # held before parse_metadata grew its list branch, so an existing or
+        # future dict-shaped registrant needs no change (task 4142).
+        register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
+        assert task_metadata_module._SUBMODEL_CARDINALITY[_DEPLOY_STATE_STUB_KEY] == 'dict'
+        # The registry's own value type is UNCHANGED — six `is`-identity
+        # assertions across four packages depend on it, which is why
+        # cardinality lives in a parallel dict rather than widening this one.
+        assert task_metadata_module._SUBMODEL_REGISTRY[_DEPLOY_STATE_STUB_KEY] is _DeployStateStub
+
+    def test_register_with_list_cardinality_records_list(self):
+        register_metadata_submodel(
+            _CHECKS_STUB_KEY, _DeployStateStub, cardinality='list'
+        )
+        assert task_metadata_module._SUBMODEL_CARDINALITY[_CHECKS_STUB_KEY] == 'list'
+        assert task_metadata_module._SUBMODEL_REGISTRY[_CHECKS_STUB_KEY] is _DeployStateStub
+
+    def test_submodel_cardinality_alias_is_exported(self):
+        assert 'SubmodelCardinality' in task_metadata_module.__all__
 
 
 class TestMilestoneRegistration:
