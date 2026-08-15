@@ -453,7 +453,7 @@ def _declared_referents(declared: list[dict], *, group_id: str) -> ReferentSet:
     return tuple(referents)
 
 
-def _metadata_referents(metadata: dict, *, group_id: str) -> ReferentSet:
+def _metadata_referents(metadata: dict | None, *, group_id: str) -> ReferentSet:
     """Bridge ambient ``metadata['task_id']`` into a referent set, or ``()``.
 
     A SELF-qualified value — one whose qualifier is the local project — is
@@ -472,7 +472,8 @@ def _metadata_referents(metadata: dict, *, group_id: str) -> ReferentSet:
     can conflict: this stays a bridge, not a claim about the prose, so the
     metadata path still never populates ``.conflicts``.
 
-    An unusable value is DROPPED, never raised on. This is asymmetric with the
+    An unusable value — or an unusable CONTAINER, ``None`` included — is
+    DROPPED, never raised on. This is asymmetric with the
     ``declared`` path (which raises — see :func:`_declared_referents`) and the
     asymmetry is deliberate: ``declared`` is an explicit caller assertion,
     while ``metadata`` is ambient harness state the writer may not control, and
@@ -487,6 +488,22 @@ def _metadata_referents(metadata: dict, *, group_id: str) -> ReferentSet:
     non-scalar is dropped here rather than coerced into a garbage referent
     like ``'[5040, 5149]'``.
     """
+    # The CONTAINER is dropped on the same terms as the VALUE, so this
+    # function has one degradation story rather than two. Not defensive
+    # ceremony: every metadata-bearing signature in server/tools.py is
+    # `metadata: dict | None = None` and tools.py guards it with
+    # isinstance(metadata, dict) at four sites, so non-dict metadata reaches
+    # that boundary in practice. `metadata.get` on None raises AttributeError,
+    # which is wrong twice over here — it escapes δ's `except
+    # InputValidationError` gate, and it contradicts this function's stated
+    # drop-never-raise contract, losing a memory over ambient harness state
+    # the writer may not even control.
+    #
+    # Tolerated HERE rather than at δ because the drop-not-raise asymmetry is
+    # this function's documented policy; a caller-side isinstance check would
+    # put a fifth copy of it at the boundary.
+    if not isinstance(metadata, dict):
+        return ()
     value = metadata.get('task_id')
     # bool FIRST: bool subclasses int, so {'task_id': True} would otherwise
     # become Task 1. The lesson is already encoded in validation._is_plain_int.
@@ -534,7 +551,7 @@ def _metadata_referents(metadata: dict, *, group_id: str) -> ReferentSet:
 def resolve_referents(
     *,
     declared: list[dict] | None,
-    metadata: dict,
+    metadata: dict | None,
     content: str,
     group_id: str,
 ) -> ReferentResolution:
@@ -556,6 +573,10 @@ def resolve_referents(
             None means "never considered" and falls through; ``[]`` means
             "considered, none apply" and is honoured as a declaration.
         metadata: The write's ambient metadata; ``task_id`` is bridged from it.
+            ``dict | None`` to match the shape δ actually holds — every
+            metadata-bearing signature in server/tools.py is
+            ``dict | None = None``. A non-dict is DROPPED, not raised on, like
+            any other unusable ambient value.
         content: The verbatim body to scan.
         group_id: The group the content belongs to (= the local project_id).
 
