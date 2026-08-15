@@ -970,9 +970,17 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
             # the INVARIANT SYMPTOM ('npx pyright', 'EACCES', '_cacache',
             # '/home/leo/.npm'), which catches both readings with one list.
             # 'sudo chown -R 1000:1000' is the single wrong-diagnosis phrase
-            # kept: it is the exact npm advice literal including the uid:gid,
-            # retained so a future write whose ONLY hook is the harmful remedy
-            # is still catchable.
+            # kept: it is the exact npm advice literal including the uid:gid.
+            # Note the MECHANISM, because it constrains what may be dropped
+            # later: min_phrase_hits is 2 and this phrase is NOT declared
+            # sufficient, so a write hooked on the remedy ALONE scores 1 and is
+            # NOT blocked (measured). It reaches 2 only because npm's advice
+            # literal is `sudo chown -R 1000:1000 /home/leo/.npm`, i.e. it
+            # carries the path phrase with it -- measured: the bare remedy
+            # sentence scores 1, the full npm literal scores 2. So chown-only
+            # catchability is a PAIRING with '/home/leo/.npm', not a property
+            # of this phrase; dropping the path phrase would silently take it
+            # away too.
             #
             # GENERIC-TOKEN EXCLUSIONS (the venv-shadowing over-match lesson
             # above): bare 'root-owned' and the verbatim npm string 'cache
@@ -1046,7 +1054,7 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
                 'uid 1000, and npm emits that text for any EACCES it cannot '
                 'explain. The verified cause is the landlock write set: '
                 "compute_write_set()'s ALLOW-LIST has no ~/.npm row "
-                '(orchestrator/src/orchestrator/agents/write_set.py:145-161), so '
+                '(orchestrator/src/orchestrator/agents/write_set.py), so '
                 'npm cannot write _cacache/_logs and aborts before exec\'ing '
                 'pyright. Task 3162 owns the fix. Do NOT add another entry -- '
                 'update/consolidate the existing entries, or add context to gate '

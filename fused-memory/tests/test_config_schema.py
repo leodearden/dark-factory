@@ -2243,10 +2243,20 @@ class TestNpxPyrightEaccesAgentSandboxCluster:
 
         The hint has to carry three things a routed writer needs, because
         the block is SOFT and the hint is the only thing they read: the gate
-        task to add context to (3417), the fact that the `sudo chown` remedy
-        several members prescribe is a CONFIRMED NO-OP -- so a writer cannot
+        task to add context to (3417), an explicit warning about the `sudo
+        chown` remedy several members prescribe -- so a writer cannot
         re-derive the harmful fix from the same symptom -- and the task that
         owns the real fix (3162).
+
+        Reviewer (test-quality, task 3862): the chown assertion names the
+        REMEDY LITERAL rather than a word from the surrounding prose. An
+        earlier version asserted ``'no-op' in hint.lower()``, which pinned
+        wording, not contract: it broke on any equivalent rephrasing ('a
+        confirmed non-fix', 'does nothing') despite identical behaviour, and
+        it did not even establish what it claimed -- a hint saying 'the
+        sandbox flag is a no-op' would have satisfied it while never
+        mentioning chown. 'sudo chown' is the string the writer must not
+        carry away, so it is both the stabler and the more specific pin.
 
         The phrase list is deliberately NOT asserted here; it is owned by
         ``test_cluster_present_with_expected_phrases`` below, so the list is
@@ -2256,7 +2266,7 @@ class TestNpxPyrightEaccesAgentSandboxCluster:
         assert cluster.min_phrase_hits == 2
         assert cluster.sufficient_phrases == []
         assert '3417' in cluster.hint
-        assert 'no-op' in cluster.hint.lower()
+        assert 'sudo chown' in cluster.hint
         assert '3162' in cluster.hint
 
     def test_cluster_present_with_expected_phrases(self):
