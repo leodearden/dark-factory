@@ -192,6 +192,35 @@ class Referent:
         return f'{_KIND_LABELS[self.kind]} {self.number}'
 
 
+def is_task_vocabulary_qualifier(project_id: str) -> bool:
+    """Is *project_id* a task-VOCABULARY word rather than a real project key?
+
+    ``'task'``, ``'tasks'``, ``'subtask'``, ``'sub_task'`` and their spellings
+    are local task vocabulary; none of them names a project. ``'taskmaster'``
+    — a real project that merely starts with 'task' — is not one, which is why
+    this is a ``fullmatch`` and not a prefix test.
+
+    THE single public predicate for that question, so the rule lives at exactly
+    one site (INV-5). Three callers now need it and they must agree: the two
+    inside this module (:func:`parse_node_name`, :func:`scan_content`), and
+    :func:`~fused_memory.utils.referent_resolution._declared_referents`, whose
+    ``project_id`` arrives as a STRUCTURED caller-supplied field rather than as
+    a spelling to be parsed. A second copy in the policy layer is the lockstep
+    duplication this module exists to prevent — and the declared path skipping
+    the rule outright is exactly how ``{'id': 2500, 'project_id': 'task'}``
+    came to mint a foreign ``'task:2500'`` node that cannot exist, while the
+    same spelling resolved to the LOCAL ``'Task 2500'`` through both other
+    paths.
+
+    Args:
+        project_id: A CANONICALIZED project id (``canonicalize_project_id``
+            output). Passing a raw qualifier is a caller bug: ``'Sub-Task'``
+            only collapses onto the pattern once canonicalized to
+            ``'sub_task'``.
+    """
+    return _TASK_VOCABULARY_QUALIFIER.fullmatch(project_id) is not None
+
+
 def parse_node_name(name: str) -> Referent | None:
     """Parse an entity *name* as a whole task label, or return None.
 
@@ -237,7 +266,7 @@ def parse_node_name(name: str) -> Referent | None:
         # is unreachable today. Kept so a future pattern relaxation refuses the
         # name instead of raising into a caller's write path.
         return None
-    if _TASK_VOCABULARY_QUALIFIER.fullmatch(project_id):
+    if is_task_vocabulary_qualifier(project_id):
         # 'subtask: 2500' / 'sub-task: 2500'. The local pattern already claimed
         # every spelling that IS a local label ('Task: 132'), so anything
         # reaching here is a word-glued lookalike, not a task label at all.
@@ -373,7 +402,7 @@ def scan_content(
             # this is unreachable today. Kept so a future pattern relaxation
             # skips the candidate instead of raising into the write path.
             continue
-        if _TASK_VOCABULARY_QUALIFIER.fullmatch(project_id):
+        if is_task_vocabulary_qualifier(project_id):
             # 'Task: 2500' / 'subtask: 2500'. The local pass above already
             # claimed every spelling that IS a local mention, so dropping this
             # candidate loses nothing and stops 'task' becoming a project id.

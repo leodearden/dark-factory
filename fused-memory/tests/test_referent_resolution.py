@@ -496,6 +496,43 @@ class TestSelfQualifiedReclassificationIsSourceInvariant:
             assert resolution.referents[0].project_id == '', source
             assert resolution.referents[0].node_name == 'Task 3127', source
 
+    def test_no_path_mints_a_foreign_node_for_the_task_2500_spelling(self):
+        """The SECOND source-invariance axis: a task-VOCABULARY qualifier.
+
+        ``'task'`` is task vocabulary, never a project key, so NO path may
+        yield a foreign ``'task:2500'`` node — a node that cannot exist, which
+        a consumer keying destructive edge surgery on ``node_name`` would hunt
+        anyway. The metadata and derived paths reach the LOCAL ``Task 2500``
+        (their parsers claim the local label first); the declared path REFUSES
+        outright, because there ``'task'`` arrives in a field explicitly named
+        ``project_id`` — a category error rather than an ambiguous spelling —
+        and this path's contract is to raise on a malformed entry rather than
+        silently rewrite the caller's own assertion.
+
+        The declared path was the one that skipped the rule, mirroring the
+        metadata bridge's break fixed in b2cfe5518f.
+        """
+        with pytest.raises(InputValidationError):
+            resolve_referents(
+                declared=[{'kind': 'task', 'id': 2500, 'project_id': 'task'}],
+                metadata={},
+                content='',
+                group_id=GROUP,
+            )
+
+        by_path = {
+            'metadata': resolve_referents(
+                declared=None, metadata={'task_id': 'task:2500'}, content='', group_id=GROUP
+            ),
+            'derived': resolve_referents(
+                declared=None, metadata={}, content='see task:2500', group_id=GROUP
+            ),
+        }
+        for source, resolution in by_path.items():
+            assert resolution.source == source, source
+            assert resolution.referents == (Referent(kind='task', number='2500'),), source
+            assert resolution.referents[0].node_name == 'Task 2500', source
+
     def test_a_non_canonical_self_qualified_task_id_is_canonicalized_first(self):
         """Case and hyphen/underscore spelling are rendering choices, not
         different projects, so canonicalization has to happen BEFORE the
@@ -874,6 +911,42 @@ class TestMalformedDeclarationIsRejectedLoudly:
                 group_id=GROUP,
             )
 
+    @pytest.mark.parametrize(
+        'project_id', ['task', 'Task', 'TASK', 'tasks', 'subtask', 'sub-task', 'Sub-Tasks']
+    )
+    def test_a_task_vocabulary_project_id_is_refused(self, project_id):
+        """A task-vocabulary word is not a project key.
+
+        canonical_labels refuses this qualifier in BOTH ``parse_node_name``
+        and ``scan_content``; the declared path was the one source that
+        accepted it, so ``{'id': 2500, 'project_id': 'task'}`` minted a
+        FOREIGN ``'task:2500'`` node that cannot exist while the identical
+        spelling resolved to the LOCAL ``'Task 2500'`` through both other
+        paths. Every spelling collapses onto the check because it is applied
+        to the CANONICALIZED value.
+        """
+        with pytest.raises(InputValidationError) as excinfo:
+            resolve_referents(
+                declared=[{'kind': 'task', 'id': 2500, 'project_id': project_id}],
+                metadata={},
+                content='',
+                group_id=GROUP,
+            )
+        assert 'project' in str(excinfo.value)
+
+    def test_a_real_project_that_merely_starts_with_task_is_accepted(self):
+        """The NEGATIVE half, and why the predicate is a ``fullmatch`` rather
+        than a prefix test: 'taskmaster' is a real project."""
+        resolution = resolve_referents(
+            declared=[{'kind': 'task', 'id': 2500, 'project_id': 'taskmaster'}],
+            metadata={},
+            content='',
+            group_id=GROUP,
+        )
+        assert resolution.referents == (
+            Referent(kind='task', project_id='taskmaster', number='2500'),
+        )
+
     def test_the_message_names_the_offending_entry_and_a_remediation_hint(self):
         """Follows ``require_full_uuid``'s shape: a single module-level hint
         constant folded into the raised message, so the remediation text has
@@ -924,6 +997,8 @@ class TestMalformedDeclarationIsRejectedLoudly:
             [{'id': 1, 'project_id': False}],
             [{'kind': 'escalation', 'id': 3127}],
             [{'kind': 'task', 'id': 132, 'project_id': '../etc'}],
+            [{'kind': 'task', 'id': 2500, 'project_id': 'task'}],
+            [{'kind': 'task', 'id': 2500, 'project_id': 'Sub-Tasks'}],
         ],
         ids=[
             'non-list',
@@ -940,6 +1015,8 @@ class TestMalformedDeclarationIsRejectedLoudly:
             'false-project-id',
             'unregistered-kind',
             'path-shaped-project-id',
+            'task-vocabulary-project-id',
+            'task-vocabulary-project-id-noncanonical',
         ],
     )
     def test_every_malformed_shape_leaks_exactly_one_exception_type(self, declared):

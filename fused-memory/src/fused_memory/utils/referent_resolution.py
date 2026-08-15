@@ -55,6 +55,7 @@ from typing import Literal, get_args
 from fused_memory.utils.canonical_labels import (
     LabelScan,
     Referent,
+    is_task_vocabulary_qualifier,
     parse_node_name,
     scan_content,
 )
@@ -298,7 +299,8 @@ def _declared_referents(declared: list[dict], *, group_id: str) -> ReferentSet:
 
     That contract is TOTAL, not best-effort: EVERY malformed entry — wrong
     container, non-dict element, unknown key, bad ``id``, bad ``kind`` TYPE,
-    bad ``project_id`` TYPE, unregistered ``kind``, path-shaped ``project_id``
+    bad ``project_id`` TYPE, unregistered ``kind``, path-shaped ``project_id``,
+    task-VOCABULARY ``project_id``
     — leaves this function as exactly ``InputValidationError``, so δ's
     ``except InputValidationError`` gate catches all of them. ``declared`` is
     caller-supplied JSON off an MCP tool argument, so every shape is reachable.
@@ -374,6 +376,33 @@ def _declared_referents(declared: list[dict], *, group_id: str) -> ReferentSet:
                 f'declared referent {_safe_repr(entry)} has a path-shaped '
                 f'project_id: {exc} {_DECLARED_REFERENT_HINT}'
             ) from exc
+        # A task-VOCABULARY qualifier is not a project id. canonical_labels
+        # refuses it in BOTH parse_node_name and scan_content, so without this
+        # the declared path was the ONE source that accepted it — and
+        # {'id': 2500, 'project_id': 'task'} minted a FOREIGN 'task:2500'
+        # node while the identical spelling resolved to the LOCAL 'Task 2500'
+        # through the other two paths. That is the source-invariance break
+        # this module's docstring forbids, arriving on the identity axis: a
+        # consumer keyed on node_name would perform edge surgery against a
+        # node that cannot exist. Same failure shape the metadata bridge was
+        # fixed for in b2cfe5518f, through the remaining path.
+        #
+        # REJECTED, not reclassified to the local project. On the other two
+        # paths the input is an ambiguous STRING a parser must disambiguate,
+        # and 'Task: 2500' is claimed as a local label BEFORE the qualified
+        # pattern ever sees it. Here 'task' arrives in a field explicitly
+        # named project_id — a category error, not a spelling — and this
+        # path's contract is TOTAL loudness on malformed entries. Silently
+        # rewriting the caller's own assertion is the silent degradation the
+        # rest of this function exists to avoid.
+        if project_id and is_task_vocabulary_qualifier(project_id):
+            raise InputValidationError(
+                f'declared referent {_safe_repr(entry)} has a task-vocabulary '
+                f'word as its project_id ({_safe_repr(raw_project)}); that is '
+                'task vocabulary, not a project key. Omit project_id for an '
+                f'own-project referent, or name a real project. '
+                f'{_DECLARED_REFERENT_HINT}'
+            )
         if project_id and local_project and project_id == local_project:
             project_id = ''
 
