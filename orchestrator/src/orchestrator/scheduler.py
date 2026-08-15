@@ -11,7 +11,7 @@ import re
 import time
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, overload, runtime_checkable
@@ -1679,6 +1679,14 @@ class Scheduler:
         # only the sample floor, and adding unrequested knobs widens the config
         # surface for no contract.
         self._hold_history = HoldHistory(min_samples=self.config.backfill_min_samples)
+        # EASY-backfill grant bookkeeping (task 3823 / PRD C7).  One entry per
+        # live back-filled dispatch, popped at release when the realized hold
+        # is judged against the bound admission promised.  The two totals are
+        # the numerator and denominator of the overstay RATE — the denominator
+        # is grants, not releases, so an unsettled grant never flatters it.
+        self._backfill_grants: dict[str, _BackfillGrant] = {}
+        self._backfill_grants_total = 0
+        self._backfill_overstay_total = 0
         self._mcp_session = mcp_session
         self._dispatched: set[str] = set()
         # Task 2408 mechanism 2: attribute-injected by the Harness right
@@ -6642,7 +6650,29 @@ class Scheduler:
                 self._note_heavy_deferral(ctx, task_id)
                 continue
             modules = self._get_modules(task)
-            if self.lock_table.try_acquire(task_id, modules):
+            acquired = self.lock_table.try_acquire(task_id, modules)
+            grant: _BackfillGrant | None = None
+            if not acquired:
+                # EASY-backfill (task 3823 / PRD C7): this candidate may be
+                # blocked only by another task's PARK, in front of a gap that
+                # park is provably still waiting on.  If so, retry ignoring
+                # exactly those owners' parks.
+                #
+                # The SECOND try_acquire — not the admission predicate — is the
+                # acting basis (INV-3).  ``admitted_parks`` is scoped to the
+                # park gate alone; the held-lock limit gate is untouched and is
+                # re-evaluated here on live state.  So admission being wrong
+                # costs one failed acquire, never a double-held module, and a
+                # grant that does not become a dispatch is discarded rather
+                # than recorded as a borrow that never happened.
+                grant = self._backfill_admission(task_id, task, modules)
+                if grant is not None:
+                    acquired = self.lock_table.try_acquire(
+                        task_id, modules, admitted_parks=frozenset(grant.park_owners)
+                    )
+                    if not acquired:
+                        grant = None
+            if acquired:
                 self._dispatched.add(task_id)
                 # Starvation-watchdog resolve (task 1880): if this scored task
                 # had an open INFO escalation, self-resolve it now that it is
@@ -6687,6 +6717,8 @@ class Scheduler:
                 else:
                     # A lower-ranked task won — top was passed over this tick.
                     self._bump_skip_and_maybe_park(top_id, top_modules, top_pri)
+                if grant is not None:
+                    self._record_backfill_grant(grant)
                 self._emit_lock_event(
                     EventType.lock_acquired,
                     task_id=task_id,
@@ -7684,6 +7716,36 @@ class Scheduler:
             # against.
             provable_assembly_delay=tightest_gap if tightest_gap is not None else 0.0,
         )
+
+    def _record_backfill_grant(self, grant: _BackfillGrant) -> None:
+        """Stamp, store and announce a grant that actually became a dispatch.
+
+        Called only after the second ``try_acquire`` has SUCCEEDED, which is
+        why ``granted_at`` is stamped here rather than in the predicate: the
+        realized hold must be measured from the moment the lock was taken, and
+        an admission that the lock layer refused has no realized hold at all.
+
+        Unlike a refusal — the ordinary per-tick outcome, logged at DEBUG and
+        never emitted — a grant is rare and gets an event, because the whole
+        point of C7 is that the modelled overstay rate becomes measurable
+        instead of assumed.
+        """
+        stamped = replace(grant, granted_at=self._wall_now().timestamp())
+        self._backfill_grants[stamped.task_id] = stamped
+        self._backfill_grants_total += 1
+        if self.event_store:
+            self.event_store.emit(
+                EventType.park_backfill_granted,
+                task_id=stamped.task_id,
+                data={
+                    'predicted_hold': stamped.predicted_hold,
+                    'safety_factor': stamped.safety_factor,
+                    'admission_bound': stamped.admission_bound,
+                    'provable_assembly_delay': stamped.provable_assembly_delay,
+                    'park_owners': list(stamped.park_owners),
+                    'modules': list(stamped.modules),
+                },
+            )
 
     def _emit_lock_event(
         self,
