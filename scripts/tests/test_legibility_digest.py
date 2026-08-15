@@ -1698,6 +1698,137 @@ class TestPerItemByteCap:
 
 
 # ---------------------------------------------------------------------------
+# Designed Outcomes section -- 07-31 census cluster 1.3 / R3. A declared
+# bounded-poll ceiling is reported, but in its OWN section: it must never
+# masquerade as an error neighborhood, and the error section must surface
+# exit codes so a bare 124 stays distinguishable to a human reader.
+# ---------------------------------------------------------------------------
+
+def _mixed_designed_and_genuine_records():
+    """3 declared CEILINGs plus 1 genuine exit-2 failure -- census :97."""
+    records = [_with_session_meta(_user_text('kick off the bounded poll'))]
+    for i in range(3):
+        records.append(_assistant(_tool_use('Bash', {'command': f'poll{i}'}, id=f'tu-c{i}')))
+        records.append(_tool_result(f'tu-c{i}', _CEILING_DECLARATION, is_error=True))
+    records.append(_assistant(_tool_use('Bash', {'command': 'real'}, id='tu-g')))
+    records.append(
+        _tool_result('tu-g', 'DARK_FACTORY_ROOT unset, exit code 2', is_error=True)
+    )
+    return records
+
+
+def _designed_outcomes_only_records():
+    """A session whose ONLY nonzero signal class is designed outcomes."""
+    records = []
+    for i in range(3):
+        records.append(_assistant(_tool_use('Bash', {'command': f'poll{i}'}, id=f'tu-{i}')))
+        records.append(_tool_result(f'tu-{i}', _CEILING_DECLARATION, is_error=True))
+    return records
+
+
+class TestDesignedOutcomesSection:
+    def test_registered_in_all_three_section_registries(self):
+        # All three or none: _SECTION_RENDERERS alone would leave
+        # _render_body/_truncate_sections unable to find the heading.
+        assert 'designed_outcomes' in mod.SECTION_HEADINGS
+        assert 'designed_outcomes' in mod.SECTION_PRIORITY
+        assert 'designed_outcomes' in mod._SECTION_RENDERERS
+
+    def test_ranks_lowest_in_section_priority(self):
+        # Index 0 == trimmed FIRST under the soft cap, below retry_loops:
+        # a designed outcome is explicitly NOT confusion.
+        assert mod.SECTION_PRIORITY[0] == 'designed_outcomes'
+
+    def test_genuine_error_alone_under_error_neighborhoods(self):
+        digest = mod.render_digest(
+            _mixed_designed_and_genuine_records(), agent_class='interactive',
+        )
+        _, body = _split_frontmatter(digest)
+
+        error_block = body.split('## Error Neighborhoods', 1)[1].split('\n##', 1)[0]
+
+        assert 'exit code 2' in error_block
+        assert 'CEILING' not in error_block
+
+    def test_designed_outcomes_render_under_their_own_heading(self):
+        digest = mod.render_digest(
+            _mixed_designed_and_genuine_records(), agent_class='interactive',
+        )
+        _, body = _split_frontmatter(digest)
+
+        assert '## Designed Outcomes' in body
+        designed_block = body.split('## Designed Outcomes', 1)[1].split('\n##', 1)[0]
+        assert designed_block.count('CEILING') == 3
+
+    def test_ceiling_text_is_never_rendered_in_both_sections(self):
+        digest = mod.render_digest(
+            _mixed_designed_and_genuine_records(), agent_class='interactive',
+        )
+        _, body = _split_frontmatter(digest)
+
+        # 3 ceilings, each rendered exactly once -- the partition is
+        # lossless, so the total must not double.
+        assert body.count(_CEILING_DECLARATION) == 3
+
+    def test_error_neighborhood_line_surfaces_the_exit_code(self):
+        # 07-31 R3's "record exit codes" ask: the code is promoted to a
+        # STRUCTURED marker on the line, not merely left buried in
+        # whatever prose the tool happened to echo -- and the error
+        # content can be byte-truncated away by the per-item cap.
+        records = [
+            _assistant(_tool_use('Bash', {'command': 'boom'}, id='tu-1')),
+            _tool_result('tu-1', 'fatal: bad thing, exit status 137', is_error=True),
+        ]
+
+        digest = mod.render_digest(records, agent_class='interactive')
+        _, body = _split_frontmatter(digest)
+
+        error_block = body.split('## Error Neighborhoods', 1)[1].split('\n##', 1)[0]
+        assert '[exit 137]' in error_block
+
+    def test_error_neighborhood_line_omits_the_marker_when_no_code(self):
+        records = [
+            _assistant(_tool_use('Bash', {'command': 'boom'}, id='tu-1')),
+            _tool_result('tu-1', 'something went wrong', is_error=True),
+        ]
+
+        digest = mod.render_digest(records, agent_class='interactive')
+        _, body = _split_frontmatter(digest)
+
+        error_block = body.split('## Error Neighborhoods', 1)[1].split('\n##', 1)[0]
+        assert '[exit' not in error_block
+
+    def test_designed_outcome_line_names_the_rule_that_fired(self):
+        # Distinct labels per rule keep which-rule-fired legible: a
+        # self-declared CEILING must not read the same as a bare 124.
+        declared = mod.classify_designed_outcome(_CEILING_DECLARATION, 124)
+        digest = mod.render_digest(
+            _designed_outcomes_only_records(), agent_class='interactive',
+        )
+        _, body = _split_frontmatter(digest)
+
+        designed_block = body.split('## Designed Outcomes', 1)[1].split('\n##', 1)[0]
+        assert declared in designed_block
+        assert '[exit 124]' in designed_block
+
+    def test_designed_outcome_only_session_renders_a_body_without_warning(self, caplog):
+        # The registration regression: signal_counts is now nonzero for a
+        # ceiling-only session, so an unregistered section would leave the
+        # body empty and trip _warn_if_body_evicted on EVERY such session.
+        caplog.set_level(logging.WARNING, logger='legibility.digest')
+        records = _designed_outcomes_only_records()
+
+        assert mod.signal_counts(records)['designed_outcome'] == 3
+
+        digest = mod.render_digest(records, agent_class='interactive')
+        _, body = _split_frontmatter(digest)
+
+        assert body.strip() != ''
+        assert '## Designed Outcomes' in body
+        assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+
+# ---------------------------------------------------------------------------
 # _warn_if_body_evicted / render_digest emit-time guard -- R2 part 2
 # (confusion census 2026-07-24 Sec 4): belt-and-braces backstop for the
 # invariant step-4's per-item cap makes structurally unreachable at any
