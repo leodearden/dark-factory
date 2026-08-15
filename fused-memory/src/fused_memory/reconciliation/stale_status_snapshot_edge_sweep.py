@@ -743,6 +743,45 @@ _ENUM_PREP_WORDS: tuple[str, ...] = (
 # longer clause gives the guard nothing to fire on.
 _CLAUSE_BREAK_CHARS = '.;!?'
 
+
+def _is_intra_token_dot(text: str, index: int) -> bool:
+    """Is the '.' at ``text[index]`` flanked by alphanumerics on both sides?
+
+    Unicode-aware by construction (``str.isalnum()``, the same predicate
+    ``is_searchable_term`` uses in falkor_fulltext.py), so 'café.py' or a
+    non-ASCII identifier is recognized as intra-token exactly like an ASCII
+    one. A flanked '.' is a filename extension, version string, dotted
+    module path or dotted section number — it ends no sentence, so it must
+    not count as a clause break. (task 4149)
+    """
+    return (
+        index > 0
+        and text[index - 1].isalnum()
+        and index + 1 < len(text)
+        and text[index + 1].isalnum()
+    )
+
+
+def _last_clause_break(prefix: str) -> int:
+    """Index of the last sentence-plausible clause break in *prefix*, or -1.
+
+    ';', '!' and '?' are unconditional breaks — none occurs token-internally
+    in this corpus. '.' additionally requires that the occurrence not be an
+    intra-token dot (see ``_is_intra_token_dot``); when it is, the walk
+    retries at the next '.' to its left, stopping once it reaches or passes
+    ``hard`` (the last unconditional break), since nothing further left
+    could still change the answer. ``dot`` strictly decreases and each
+    ``rfind`` resumes where the previous stopped, so the walk is
+    O(len(prefix)) overall — no slicing, matching the cost property
+    ``_enumeration_is_prepositional_complement`` documents. (task 4149)
+    """
+    hard = max((prefix.rfind(c) for c in _CLAUSE_BREAK_CHARS if c != '.'), default=-1)
+    dot = prefix.rfind('.')
+    while dot > hard and _is_intra_token_dot(prefix, dot):
+        dot = prefix.rfind('.', 0, dot)
+    return max(hard, dot)
+
+
 _ENUM_PREP_WORD_RE: re.Pattern[str] = re.compile(
     r'\b(?:' + '|'.join(_ENUM_PREP_WORDS) + r')\b',
     re.IGNORECASE,
@@ -767,8 +806,7 @@ def _enumeration_is_prepositional_complement(prefix: str) -> bool:
     # break char is non-word, so this is exactly equivalent to searching the
     # sliced clause. (amendment, reviewer_comprehensive efficiency finding,
     # task 3079)
-    cut = max(prefix.rfind(char) for char in _CLAUSE_BREAK_CHARS)
-    return _ENUM_PREP_WORD_RE.search(prefix, cut + 1) is not None
+    return _ENUM_PREP_WORD_RE.search(prefix, _last_clause_break(prefix) + 1) is not None
 
 # Plural multi-task enumeration: 'Tasks A, B and C are <marker>' (task
 # 3079). Before this, such an edge yielded NO ids at all — not merely the
