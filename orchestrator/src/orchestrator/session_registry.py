@@ -2142,22 +2142,36 @@ def claim_lease(
     )
 
 
-def heartbeat_lease(name: str, *, root: Path | str | None = None) -> bool:
-    """Bump the *name* lease file's mtime to now -- the reaper's heartbeat clock.
+def heartbeat_lease(
+    name: str, *, slug: str, force: bool = False, root: Path | str | None = None
+) -> LeaseMutation:
+    """Bump the *name* lease file's mtime -- but only if *slug* actually holds it.
 
-    Returns False (fail-soft, no raise) when the lease is absent or the
-    ``os.utime`` call itself faults; a lease-substrate error must never
-    interrupt a watcher's main loop.
+    The file mtime remains the SINGLE heartbeat clock (the one
+    ``claim_lease`` and ``reap_stale_leases`` both read); ``os.utime`` is
+    still the only mutation, and no timestamp is written into the lease body
+    where it could silently disagree with mtime.
+
+    A REFUSED result is a deliberate no-op, not a fault: before task 3994
+    any caller could refresh any lease, and because staleness requires BOTH
+    a dead holder pid AND an aged heartbeat, a stranger beating a dead
+    holder's lease kept the AND-guard from ever firing -- the lease became
+    structurally unreapable and outlived its holder indefinitely.
+
+    Fail-soft is unchanged: an absent lease is ABSENT and an OSError from
+    ``os.utime`` is FAULTED after a logger.error -- never a raise, so a
+    lease-substrate fault cannot interrupt a watcher's main loop.
     """
     path = lease_path_for_name(name, root=root)
-    if not path.exists():
-        return False
+    terminal, holder = _check_lease_ownership(path, slug=slug, force=force, verb='heartbeat_lease')
+    if terminal is not None:
+        return terminal
     try:
         os.utime(path, None)
     except OSError:
         logger.error('heartbeat_lease: failed to touch %s', path, exc_info=True)
-        return False
-    return True
+        return LeaseMutation.FAULTED
+    return LeaseMutation.APPLIED if _is_lease_owner(holder, slug) else LeaseMutation.FORCED
 
 
 def _is_lease_owner(holder: LeaseHolder | None, slug: str) -> bool:
