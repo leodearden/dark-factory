@@ -851,14 +851,21 @@ _SLOT_TIMEOUT_UNLIMITED_WAIT_OUTPUT = (
 # nothing, even though the anchoring is the heart of task 3679.
 _SLOT_TIMEOUT_INDENTED_OUTPUT = '    ' + _SLOT_TIMEOUT_TEST_SEMAPHORE_OUTPUT
 
-_GROUNDED_SLOT_TIMEOUT_OUTPUTS = [
-    _SLOT_TIMEOUT_TEST_SEMAPHORE_OUTPUT,
-    _SLOT_TIMEOUT_OCCT_OUTPUT,
-    _SLOT_TIMEOUT_LANE_X_OUTPUT,
-    _SLOT_TIMEOUT_SENTINEL_OUTPUT,
-    _SLOT_TIMEOUT_UNLIMITED_WAIT_OUTPUT,
-    _SLOT_TIMEOUT_INDENTED_OUTPUT,
+# Named (name, output) pairs — same shape as _ALL_COLLATERAL_SHAPES below —
+# so a cross-product against another axis (task 4126) gets legible pytest ids
+# instead of positional ones. _GROUNDED_SLOT_TIMEOUT_OUTPUTS is DERIVED from
+# this, not re-spelled, keeping exactly one literal per producer line (the
+# discipline stated above).
+_ANCHORED_SLOT_TIMEOUT_SHAPES: list[tuple[str, str]] = [
+    ('test_semaphore', _SLOT_TIMEOUT_TEST_SEMAPHORE_OUTPUT),
+    ('occt', _SLOT_TIMEOUT_OCCT_OUTPUT),
+    ('lane_x', _SLOT_TIMEOUT_LANE_X_OUTPUT),
+    ('sentinel', _SLOT_TIMEOUT_SENTINEL_OUTPUT),
+    ('unlimited_wait', _SLOT_TIMEOUT_UNLIMITED_WAIT_OUTPUT),
+    ('indented', _SLOT_TIMEOUT_INDENTED_OUTPUT),
 ]
+
+_GROUNDED_SLOT_TIMEOUT_OUTPUTS = [output for _, output in _ANCHORED_SLOT_TIMEOUT_SHAPES]
 
 
 class TestGroundedSlotTimeoutMarkersAreDetected:
