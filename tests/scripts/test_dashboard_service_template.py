@@ -759,6 +759,120 @@ def _slowest_client_poll_ms() -> int:
     return _slowest_client_poll()[0]
 
 
+# Matches a `//` line comment or a `/* ... */` block comment.  Block first, so a
+# `//` inside a block does not end the line-comment match early.
+_JS_COMMENT_RE = re.compile(r"/\*.*?\*/|//[^\n]*", re.DOTALL)
+
+
+def _strip_js_comments(source: str) -> str:
+    """Return *source* with comments blanked out, preserving line structure.
+
+    Comment bodies are replaced by their own newlines rather than deleted, so a
+    site's line number and the file's shape survive the strip.
+
+    Load-bearing, not cosmetic.  The live client mentions ``setInterval(...)``
+    inside a ``//`` comment in tab_tasks.jsx, so a raw-text scan would report a
+    call site that does not exist — training maintainers to allowlist fictions,
+    and (worse) letting an allowlist entry be "satisfied" by a commented-out
+    line.  This is the same hazard _uvicorn_int_flag already handles from the
+    other direction, by scoping its lookup to the logical ExecStart line rather
+    than the whole file, because both unit files discuss the very flags it reads
+    in prose above the command.  Scope to code, never to raw file text.
+
+    Deliberately naive about strings and regex literals: a ``//`` inside a JS
+    string would over-strip.  The redux sources carry no such case, and the
+    failure direction is safe — over-stripping can only HIDE a site, which the
+    stale-allowlist half then surfaces rather than passing silently.
+    """
+    return _JS_COMMENT_RE.sub(lambda m: "\n" * m.group(0).count("\n"), source)
+
+
+def _setinterval_period_args(source: str) -> list[str]:
+    """Return the period argument text of every ``setInterval(`` call in *source*.
+
+    Scans the argument list with a balanced-paren walk and takes the text after
+    the LAST top-level comma.  A naive ``setInterval\\([^)]*\\)`` regex stops at
+    the first ``)``, which both live non-polling timers contain in their
+    callbacks — ``setInterval(() => setNow(new Date()), 1000)`` and
+    ``setInterval(() => tick(n => n + 1), 2000)`` — so it would yield a garbled
+    period for exactly the sites this scanner exists to classify.
+    """
+    periods: list[str] = []
+    for match in re.finditer(r"\bsetInterval\s*\(", source):
+        depth = 1
+        last_comma = None
+        idx = match.end()
+        while idx < len(source) and depth:
+            char = source[idx]
+            if char in "([{":
+                depth += 1
+            elif char in ")]}":
+                depth -= 1
+                if not depth:
+                    break
+            elif char == "," and depth == 1:
+                last_comma = idx
+            idx += 1
+        if depth and idx >= len(source):
+            # Unbalanced call — report the whole tail rather than silently
+            # dropping a site the maintainer needs to see.
+            periods.append(source[match.end():].strip())
+            continue
+        arg_start = match.end() if last_comma is None else last_comma + 1
+        periods.append(source[arg_start:idx].strip())
+    return periods
+
+
+def _site_relpath(path: pathlib.Path) -> str:
+    """Return the short ``<dir>/<file>`` key a call site is reported under.
+
+    Two components, so the key is stable across checkouts and worktrees (an
+    absolute path would make every allowlist entry machine-specific) while still
+    being unambiguous and greppable within the client tree.
+    """
+    return f"{path.parent.name}/{path.name}"
+
+
+def _unclassified_setinterval_sites(
+    paths: typing.Iterable[pathlib.Path],
+    known_consts: typing.AbstractSet[str],
+    allowlist: typing.Mapping[tuple[str, str], str],
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """Sort every live ``setInterval`` under *paths* into known / allowed / new.
+
+    Returns ``(unclassified, stale)``:
+
+    * *unclassified* — ``(relpath, period_text)`` for each call site whose period
+      is neither one of *known_consts* (a registered poller's period constant)
+      nor an *allowlist* key.  These are the sites nothing has decided about, so
+      the keep-alive floor may not clear them.
+    * *stale* — *allowlist* keys matching no live call site.  An entry that
+      matches nothing checks nothing, and rots the gate into a green no-op —
+      the same staleness reasoning as
+      test_registry_keys_are_all_declared_in_the_committed_units in
+      tests/scripts/test_check_dashboard_unit_parity.py.  Reporting it also
+      keeps a commented-out site from satisfying its own allowlist entry.
+
+    Both lists are returned rather than asserted here so the caller can name the
+    concrete remedy for each; see _strip_js_comments and
+    _setinterval_period_args for why the scan is done over comment-stripped
+    source with a balanced-paren walk.
+    """
+    unclassified: list[tuple[str, str]] = []
+    live: set[tuple[str, str]] = set()
+    for path in paths:
+        relpath = _site_relpath(path)
+        code = _strip_js_comments(path.read_text(encoding="utf-8"))
+        for period in _setinterval_period_args(code):
+            site = (relpath, period)
+            live.add(site)
+            if period in known_consts or site in allowlist:
+                continue
+            unclassified.append(site)
+    stale = sorted(key for key in allowlist if key not in live)
+    return unclassified, stale
+
+
 def _logical_exec_start(path: pathlib.Path) -> str:
     """Return the ExecStart= command in *path* as a single logical line.
 
