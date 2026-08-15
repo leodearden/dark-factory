@@ -47,6 +47,7 @@ from shared.cli_invoke import (
 from shared.locking import files_to_modules
 from shared.neutral_cwd import neutral_cli_cwd
 from shared.prompt_artifact import PromptArtifactStore, PromptSpec, default_artifacts_root
+from shared.task_statuses import TaskStatus
 
 from fused_memory.backends.task_backend_errors import TaskNotFoundError
 from fused_memory.middleware.candidate_key import compute_candidate_key
@@ -2770,6 +2771,26 @@ def _task_metadata_spawned_from(task: dict) -> str | None:
     return None
 
 
+def is_combine_eligible_status(status: str) -> bool:
+    """Single source of truth for combine STATUS eligibility (task 4035).
+
+    Called from BOTH the curator's selection snapshot
+    (``_to_pool_entry.combine_eligible``) and the interceptor's
+    execution-time combine guard (``_execute_combine``). Keeping one
+    definition is the point: the two sites previously hand-copied
+    ``status == 'pending'`` and silently diverged, letting 20.2% of combines
+    land on non-pending targets mid-planning.
+
+    Status ONLY. Liveness (``claimant_run_id``) is execution-side and
+    deliberately NOT part of this predicate — the selection snapshot cannot
+    observe it (D11).
+
+    Fails closed: anything outside the canonical vocabulary (an unknown
+    status, a blank, a case variant) is not eligible.
+    """
+    return status == TaskStatus.PENDING.value
+
+
 def _to_pool_entry(
     task: dict | None, *, source: str, lock_depth: int,
 ) -> _PoolEntry | None:
@@ -2790,7 +2811,7 @@ def _to_pool_entry(
         status=status,
         priority=str(task.get('priority', DEFAULT_PRIORITY)),
         source=source,
-        combine_eligible=(status == 'pending'),
+        combine_eligible=is_combine_eligible_status(status),
     )
 
 
