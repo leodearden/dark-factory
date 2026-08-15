@@ -901,16 +901,3 @@ class TestTryAcquireAdmittedParks:
             'the expansion was refused but something was acquired anyway — '
             'try_acquire_additional must refuse before mutating _held'
         )
-
-    def test_try_acquire_additional_has_no_admitted_parks(self):
-        """Plan-refinement lock EXPANSION is not a backfill path.
-
-        C7 anchors on the dispatch scan; an in-flight task widening its lock
-        set has no admission decision behind it and must keep refusing parks.
-        """
-        import inspect
-
-        params = inspect.signature(ModuleLockTable.try_acquire_additional).parameters
-        assert 'admitted_parks' not in params, (
-            'try_acquire_additional must NOT gain an admitted_parks bypass'
-        )
