@@ -468,15 +468,13 @@ class TestExemplarFailAndTimeout:
     deterministic_runner.py's ``_RUN_TIMEOUT_GRACE_SECS`` comment).
 
     Task 4065 amendment: a real subprocess timing out therefore exercises B9
-    (infra_issue), NOT B8.  ``_default_run_script`` raises ``ScriptTimeout``
+    (infra_issue), NOT B8 — ``_default_run_script`` raises ``ScriptTimeout``
     on that inner timeout instead of returning an ``(rc=1, tail)``
-    indistinguishable from a genuine non-zero exit — the check produced no
-    exit code, so there is no verdict to report and no ``gate_escalated_at``
-    stamp is written.  (This docstring previously asserted the opposite, and
-    that prose is what 4065 falsified: the earlier reading treated the
-    inner-timeout rc=1 as the *intended* B8 outcome.)  The default runner's
-    inner-timeout case is unit-covered in test_deterministic_runner.py's
-    ``TestPredicateDefaultRunnerInnerTimeout``.
+    indistinguishable from a genuine non-zero exit (see that class's docstring
+    in deterministic_runner.py for the full rationale).  This docstring
+    previously asserted the opposite, and that prose is exactly what 4065
+    falsified.  The default runner's inner-timeout case is unit-covered in
+    test_deterministic_runner.py's ``TestPredicateDefaultRunnerInnerTimeout``.
 
     Reaching the OUTER guard instead needs a leaf that never returns at all,
     so the test below keeps exercising it with an injected hanging

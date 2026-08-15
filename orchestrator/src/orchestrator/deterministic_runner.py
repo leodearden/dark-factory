@@ -213,26 +213,20 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
      ``gate_escalated_at`` (reusing the gate resume machinery so a human
      resolving the escalation on the next dispatch routes through section 1's
      quiescence/resolve-to-done fork), and block.  A non-zero rc reaching this
-     branch is always a verdict: the default runner's own timeout no longer
-     arrives as one (next bullet), and an injected ``script_runner`` keeps the
-     plain ``(rc, tail)`` contract by definition.
-   - The DEFAULT runner's INNER per-script timeout (task 4065): the check
-     overran ``before_done['timeout_secs']`` and its process group was
-     SIGKILLed, so no exit code — and therefore no verdict — exists.
-     ``_default_run_script`` signals this by raising ``ScriptTimeout``, which
-     routes to ``infra_issue`` + blocked with NO ``gate_escalated_at`` stamp.
-     Before 4065 it returned an ordinary ``(1, tail)`` and was misclassified
-     as the VERDICT above, latching a task whose invariant was never
-     evaluated into the resolve-to-done path.
+     branch is always a verdict — the default runner's own timeout no longer
+     arrives as one (next bullet).
+   - ``ScriptTimeout`` — the DEFAULT runner's INNER per-script timeout (task
+     4065) — is an infra fault, NOT a verdict: ``infra_issue`` + blocked with
+     NO ``gate_escalated_at`` stamp.  See the ``ScriptTimeout`` class
+     docstring for the full rationale.
    - Outer-guard timeout or an unexpected ``run_fn`` error (likewise no
      verdict — an infra fault, not a check failure): file born-at-L2
      ``infra_issue`` and block — again NO ``gate_escalated_at`` stamp, so the
      check is simply re-attempted on the next dispatch.  The outer
-     ``asyncio.wait_for`` guard remains the backstop for a seam that never
-     returns AT ALL (a detached/unkillable child, or a hanging custom
-     runner), which is strictly later than — and distinct from — the inner
-     timeout above.  All three arms file the same category, so their
-     escalation wording is deliberately distinct.
+     ``asyncio.wait_for`` guard is the backstop for a seam that never returns
+     AT ALL (a detached/unkillable child, or a hanging custom runner).  All
+     three infra arms file the same category, so their escalation wording is
+     deliberately distinct.
    - Section-1 resume: when ``gate_escalated_at`` is set and the
      ``milestone_check_failed`` escalation is resolved, RE-RUNS the predicate
      check (delegating back to ``_run_predicate`` — read-only, so repeating it
@@ -381,11 +375,10 @@ _REAP_GRACE_SECS: float = 5.0
 # case, so 30s is deliberately generous (covers process-group teardown +
 # reap_grace_secs with room to spare) rather than tight.
 #
-# Task 4065: because this guard is a strict superset, the inner timeout is
-# what actually fires for any real, SIGKILL-able subprocess — so for the
-# DEFAULT runner that event is now a DISTINCT signal (`ScriptTimeout`, below)
-# rather than an rc=1 indistinguishable from a genuine non-zero exit.  This
-# guard's remaining job is the case it was always for: a seam that never
+# Task 4065: because this guard is a strict superset, the INNER timeout is
+# what actually fires for any real, SIGKILL-able subprocess — and for the
+# DEFAULT runner that event is now a distinct signal (`ScriptTimeout`, below).
+# This guard's remaining job is the case it was always for: a seam that never
 # returns at all (a detached/unkillable child, or a custom script_runner that
 # simply hangs).
 _RUN_TIMEOUT_GRACE_SECS: float = 30.0
@@ -396,6 +389,13 @@ class ScriptTimeout(Exception):
     ``asyncio.wait_for`` fires — i.e. the script itself overran
     ``before_done['timeout_secs']`` and its process group was SIGKILLed
     (task 4065).
+
+    THIS DOCSTRING IS THE CANONICAL EXPLANATION of the classification.  The
+    other 4065 sites (module docstring, ``_default_run_script``,
+    ``_run_predicate``, both seam wrappers, the ``script_runner`` ctor arg)
+    deliberately carry one-line pointers here rather than restating it, so
+    the next change to this rule has ONE place to update, not ten that can
+    independently rot.
 
     Why an exception rather than a ``(rc, tail)`` return: the previous
     ``return 1, '<script timed out after Ns>'`` was indistinguishable, at the
@@ -858,15 +858,13 @@ class DeterministicRunner:
             that runs the deploy script to completion.  Defaults to
             ``_default_run_script`` (awaited create_subprocess_exec).
             Injected in tests to avoid spawning real processes.
-            Full seam contract (task 4065): an injected runner returns a
-            plain ``(rc, tail)`` and NEVER raises ``ScriptTimeout`` — only
-            the default implementation does, on its own inner per-script
-            timeout.  Consequently, on the γ-predicate path an injected
-            runner's non-zero rc is always a milestone VERDICT ("the
-            invariant does not hold"), whatever its tail happens to say,
-            while the default runner's timeout is classified as an infra
-            fault.  A custom runner wanting the infra-fault classification
-            for its own timeout must raise ``ScriptTimeout`` explicitly.
+            Seam contract (task 4065): an injected runner returns a plain
+            ``(rc, tail)`` and never raises ``ScriptTimeout`` — only the
+            default implementation does — so on the γ-predicate path an
+            injected runner's non-zero rc is always a milestone VERDICT,
+            whatever its tail says.  A custom runner wanting the infra-fault
+            classification for its own timeout must raise ``ScriptTimeout``
+            explicitly; see that class's docstring.
         writeback_backoffs: Bound + pacing for the post-deploy verify+writeback
             retry loop (task 2066), as a list of between-attempt sleep
             seconds (``attempts = len(writeback_backoffs) + 1``).  Defaults
@@ -1133,14 +1131,11 @@ class DeterministicRunner:
         Raises:
             ScriptTimeout — the script overran ``before_done['timeout_secs']``
                 and its whole process group was SIGKILLed (task 2090 Layer A
-                runs FIRST, before the raise).  Deliberately not a ``(1,
-                tail)`` return: at the ``run_fn`` seam that was
-                indistinguishable from a predicate script genuinely exiting
-                non-zero, i.e. a milestone VERDICT rather than the infra fault
-                it actually is (task 4065).  The deploy seam wrapper
-                ``_invoke_run_fn_translating_timeout`` restores the legacy
-                pair from ``exc.rc``/``exc.tail``, so deploy callers are
-                unaffected.
+                runs FIRST, before the raise).  An infra fault, not a verdict;
+                see the ``ScriptTimeout`` docstring for why it is deliberately
+                not a ``(1, tail)`` return.  Deploy callers are unaffected —
+                ``_invoke_run_fn_translating_timeout`` restores the legacy pair
+                from ``exc.rc``/``exc.tail``.
         """
         script = before_done['script']
         args = before_done.get('args') or []
@@ -2180,21 +2175,18 @@ class DeterministicRunner:
           resume/quiescence machinery on the next dispatch).  Any non-zero rc
           returned by the seam is a verdict — including one from an injected
           ``script_runner``, whatever its tail text says.
-        - ``ScriptTimeout`` (task 4065) -> an INFRA fault: the DEFAULT
-          runner's own inner per-script timeout fired, i.e. the check overran
-          ``before_done['timeout_secs']`` and was SIGKILLed as a process
-          group, producing NO exit code and therefore no verdict.  born-at-L2
-          ``infra_issue`` + blocked, with NO ``gate_escalated_at`` stamp, so
-          the read-only check is re-attempted on the next dispatch instead of
-          being latched into the resolve-to-done path.  Before 4065 this
-          returned an ordinary ``(1, tail)`` and hit the VERDICT branch above.
+        - ``ScriptTimeout`` (task 4065) -> an INFRA fault, not a verdict: the
+          DEFAULT runner's own inner per-script timeout fired, so no exit code
+          exists.  born-at-L2 ``infra_issue`` + blocked, with NO
+          ``gate_escalated_at`` stamp, so the read-only check is re-attempted
+          on the next dispatch instead of being latched into the
+          resolve-to-done path.  See the ``ScriptTimeout`` docstring.
         - Outer-guard timeout / unexpected error -> likewise an INFRA fault
           (no verdict was produced): born-at-L2 ``infra_issue`` escalation +
           blocked (re-attempted on the next dispatch, no ``gate_escalated_at``
           stamp).  The outer ``asyncio.wait_for`` guard
           (``timeout_secs + run_timeout_grace_secs``) stays the backstop for a
-          seam that never returns at all — strictly later than, and distinct
-          from, the inner timeout above.  All three infra arms share one
+          seam that never returns at all.  All three infra arms share one
           category, so each carries deliberately distinct summary/detail
           wording — that text is the only thing telling a human which guard
           fired.
@@ -2211,11 +2203,8 @@ class DeterministicRunner:
             # TimeoutError` below can only ever mean "the outer wall-clock
             # guard itself fired" — never a misattributed application error.
             #
-            # Task 4065: do NOT broaden this except clause.  ScriptTimeout is
-            # deliberately not a TimeoutError subclass so it propagates
-            # UNTOUCHED to the dedicated `except ScriptTimeout` arm below;
-            # catching it here would re-raise it as a RuntimeError and land it
-            # in the generic "unexpected error" arm instead.
+            # Task 4065: do NOT broaden this except clause — ScriptTimeout must
+            # propagate UNTOUCHED to the dedicated arm below (see ScriptTimeout).
             try:
                 return await run_fn(before_done)
             except TimeoutError as exc:
@@ -2248,17 +2237,11 @@ class DeterministicRunner:
                 detail=timeout_detail,
             )
         except ScriptTimeout as exc:
-            # Task 4065: the DEFAULT runner's own per-script timeout fired —
-            # the check ran but overran its budget and was SIGKILLed as a
-            # process group, so it produced NO exit code and therefore NO
-            # verdict.  That makes it an INFRA fault, exactly like the outer
-            # guard above and deliberately NOT milestone_check_failed: a
-            # verdict would stamp gate_escalated_at and latch a task whose
-            # invariant was never evaluated into the resolve-to-done path.
-            #
-            # Distinct wording from the two sibling arms on purpose — all
-            # three file the same infra_issue category, so the text is the
-            # only thing telling a human WHICH guard fired.
+            # Task 4065: the DEFAULT runner's own per-script timeout fired — no
+            # exit code, so no verdict (see ScriptTimeout).  Wording is
+            # deliberately distinct from the two sibling arms: all three file
+            # the same infra_issue category, so the text is the only thing
+            # telling a human WHICH guard fired.
             inner_timeout_detail = '\n'.join([
                 description,
                 f'Predicate check script exceeded its own per-script timeout '
@@ -2299,12 +2282,10 @@ class DeterministicRunner:
             # the escalation drives the task to done on the next dispatch.
             #
             # Task 4065: the DEFAULT runner's inner per-script timeout can no
-            # longer reach this branch — it raises ScriptTimeout, handled
-            # above as an infra fault, rather than returning an
-            # indistinguishable (1, '<script timed out after Ns>').  A
-            # non-zero rc from an INJECTED script_runner IS still a verdict by
-            # contract, whatever its tail happens to say: classification keys
-            # on the exception type, never on sniffing the output text.
+            # longer reach this branch (it raises ScriptTimeout, handled above
+            # as an infra fault).  A non-zero rc from an INJECTED script_runner
+            # IS still a verdict by contract, whatever its tail says —
+            # classification keys on the exception type, never on the text.
             #
             # The RAW `out` below is deliberate and must stay raw (task 3286):
             # unlike done_provenance.note, an escalation detail is read by a
@@ -2386,13 +2367,13 @@ class DeterministicRunner:
         Task 4065: also converts the default runner's ``ScriptTimeout`` back
         into the legacy ``(1, '<script timed out after Ns>')`` pair, so the
         DEPLOY classifiers see byte-for-byte what they saw before that
-        exception existed.  Unlike the γ-predicate path, they have no
+        exception existed.  Unlike the γ-predicate path they have no
         milestone-verdict semantics to protect — every non-zero rc there
         already routes to ``_file_infra_issue_and_block`` (target_unit-less)
-        or ``RESTART_FAILED`` -> the same (named target) — so the
-        reclassification 4065 introduces is predicate-only.  Restoring the
-        pair HERE, once, rather than at each deploy call site, keeps the
-        anti-drift property this helper exists for.
+        or ``RESTART_FAILED`` -> the same (named target).  Restoring the pair
+        HERE, once, rather than at each deploy call site, keeps the anti-drift
+        property this helper exists for; both branches are pinned by
+        ``TestDefaultRunnerInnerTimeoutDeployParity``.
         """
         try:
             return await run_fn(before_done)

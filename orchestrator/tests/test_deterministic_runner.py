@@ -3571,11 +3571,10 @@ class TestBeforeDoneSubprocessTimeoutHardening:
     behavior) leaves the tree alive and the pipe open forever.
 
     Task 4065 amendment: the timeout branch now RAISES ``ScriptTimeout``
-    instead of returning ``(1, '<script timed out after Ns>')`` — the plain
-    tuple was indistinguishable from a predicate script's genuine non-zero
-    VERDICT, which is the misclassification 4065 fixes.  The Layer-A teardown
-    below is unchanged and must still happen BEFORE the raise, so the
-    grandchild-is-dead assertion stays exactly as it was.
+    instead of returning ``(1, '<script timed out after Ns>')`` — see that
+    class's docstring for why.  The Layer-A teardown below is unchanged and
+    must still happen BEFORE the raise, so the grandchild-is-dead assertion
+    stays exactly as it was.
     """
 
     async def test_timeout_kills_whole_process_group(self, tmp_path: Path):
