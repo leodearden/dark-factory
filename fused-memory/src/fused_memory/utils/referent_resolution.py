@@ -64,6 +64,7 @@ from fused_memory.utils.validation import (
     PathShapedProjectIdError,
     _safe_repr,
     canonicalize_project_id,
+    validate_project_id,
 )
 
 #: Remediation text for a rejected ``declared`` entry. Single-sourced here and
@@ -300,7 +301,7 @@ def _declared_referents(declared: list[dict], *, group_id: str) -> ReferentSet:
     That contract is TOTAL, not best-effort: EVERY malformed entry — wrong
     container, non-dict element, unknown key, bad ``id``, bad ``kind`` TYPE,
     bad ``project_id`` TYPE, unregistered ``kind``, path-shaped ``project_id``,
-    task-VOCABULARY ``project_id``
+    task-VOCABULARY ``project_id``, charset-invalid ``project_id``
     — leaves this function as exactly ``InputValidationError``, so δ's
     ``except InputValidationError`` gate catches all of them. ``declared`` is
     caller-supplied JSON off an MCP tool argument, so every shape is reachable.
@@ -376,6 +377,29 @@ def _declared_referents(declared: list[dict], *, group_id: str) -> ReferentSet:
                 f'declared referent {_safe_repr(entry)} has a path-shaped '
                 f'project_id: {exc} {_DECLARED_REFERENT_HINT}'
             ) from exc
+        # canonicalize_project_id is a NORMALIZER, not a validator — it says so
+        # itself and defers the charset allowlist to validate_project_id. Left
+        # at just the normalize, '   ', 'foo bar', '..' and 'x;y' all passed
+        # through verbatim and minted a FOREIGN referent naming a project that
+        # cannot exist ('   :132'), reaching a consumer that performs
+        # destructive edge surgery keyed on node_name.
+        #
+        # validate_project_id, not a fresh charset test here: it is already THE
+        # site for the allowlist (require_project_id is a thin raise-wrapper
+        # over it), and a second copy is the lockstep duplication INV-5 forbids.
+        # Its error is re-raised WRAPPED rather than propagated bare so this
+        # rejection names the offending entry and carries the remediation hint,
+        # exactly like every other rejection in this TOTAL contract.
+        #
+        # Deliberately NOT length-capped: validation.py enforces charset and
+        # non-emptiness only, and inventing a cap at this site would fork the
+        # rule. If a cap is ever wanted it belongs there.
+        if project_id and (err := validate_project_id(project_id)):
+            raise InputValidationError(
+                f'declared referent {_safe_repr(entry)} has an invalid '
+                f'project_id {_safe_repr(raw_project)}: {err["error"]} '
+                f'{_DECLARED_REFERENT_HINT}'
+            )
         # A task-VOCABULARY qualifier is not a project id. canonical_labels
         # refuses it in BOTH parse_node_name and scan_content, so without this
         # the declared path was the ONE source that accepted it — and
