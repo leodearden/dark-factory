@@ -730,3 +730,203 @@ class TestHostAllocatorCancelReleaseIdempotent:
         second = await alloc.cancel_and_release(local_lease)
         assert second is True
         assert alloc.is_busy('local') is False
+
+
+# ---------------------------------------------------------------------------
+# 3275/step-1 RED: host_states() + is_quarantined() read-only state accessors
+# ---------------------------------------------------------------------------
+
+
+_STATE_KEYS = {'name', 'is_local', 'slot_state', 'quarantined'}
+
+
+@pytest.mark.asyncio
+class TestHostAllocatorStateAccessors:
+    """host_states() / is_quarantined(): the sanctioned read path for snapshot().
+
+    Task 3275: SpeculativeMergeWorker.snapshot() must be able to report per-host
+    slot state and quarantine membership WITHOUT reaching into the allocator's
+    private ``_slots`` / ``_quarantine``.  Both accessors are pure reads.
+
+    RED until 3275/step-2 adds the two methods (AttributeError before that).
+    """
+
+    def _make_allocator(self, *, quarantine=None):
+        from orchestrator.verify_runner import HostAllocator
+
+        remote_a = _FakeRemoteRunner('remoteA')
+        remote_b = _FakeRemoteRunner('remoteB')
+        q = quarantine if quarantine is not None else set()
+        return HostAllocator([remote_a, remote_b], quarantine=q)
+
+    def _local_factory(self):
+        return _FakeLocalRunner()
+
+    def _by_name(self, alloc) -> dict:
+        return {h['name']: h for h in alloc.host_states()}
+
+    # -- shape / order / schema ------------------------------------------------
+
+    async def test_host_states_order_matches_host_names(self):
+        """One dict per managed host, local first then remotes in declaration order."""
+        alloc = self._make_allocator()
+        states = alloc.host_states()
+        assert [h['name'] for h in states] == ['local', 'remoteA', 'remoteB']
+        # Same ordering contract as the pre-existing host_names property.
+        assert [h['name'] for h in states] == alloc.host_names
+
+    async def test_host_states_uniform_schema(self):
+        """Every entry carries exactly {name, is_local, slot_state, quarantined}."""
+        alloc = self._make_allocator()
+        for entry in alloc.host_states():
+            assert set(entry) == _STATE_KEYS, (
+                f'Unexpected key set for {entry.get("name")!r}: {sorted(entry)}'
+            )
+
+    async def test_host_states_fresh_all_free_unquarantined(self):
+        """Fresh allocator: every slot free, nothing quarantined."""
+        alloc = self._make_allocator()
+        for entry in alloc.host_states():
+            assert entry['slot_state'] == 'free', entry
+            assert entry['quarantined'] is False, entry
+
+    async def test_host_states_is_local_only_for_local(self):
+        """is_local is True for 'local' and False for every remote."""
+        states = self._by_name(self._make_allocator())
+        assert states['local']['is_local'] is True
+        assert states['remoteA']['is_local'] is False
+        assert states['remoteB']['is_local'] is False
+
+    async def test_host_states_empty_remotes_single_local_entry(self):
+        """An allocator with no remotes reports exactly one 'local' entry."""
+        from orchestrator.verify_runner import HostAllocator
+
+        alloc = HostAllocator([], quarantine=set())
+        states = alloc.host_states()
+        assert len(states) == 1
+        assert states[0]['name'] == 'local'
+        assert states[0]['is_local'] is True
+        assert states[0]['slot_state'] == 'free'
+
+    # -- slot_state transitions ------------------------------------------------
+
+    async def test_slot_state_busy_after_acquire_remote(self):
+        """acquire_remote() flips that host's slot_state to 'busy' (others stay free)."""
+        alloc = self._make_allocator()
+        lease = alloc.acquire_remote()
+        assert lease is not None and lease.name == 'remoteA'
+
+        states = self._by_name(alloc)
+        assert states['remoteA']['slot_state'] == 'busy'
+        assert states['local']['slot_state'] == 'free'
+        assert states['remoteB']['slot_state'] == 'free'
+
+    async def test_slot_state_free_again_after_release(self):
+        """release(lease) returns the slot to 'free'."""
+        alloc = self._make_allocator()
+        lease = alloc.acquire_remote()
+        assert lease is not None
+        assert self._by_name(alloc)['remoteA']['slot_state'] == 'busy'
+
+        await alloc.release(lease)
+        assert self._by_name(alloc)['remoteA']['slot_state'] == 'free'
+
+    async def test_slot_state_busy_after_acquire_local(self):
+        """acquire_local(factory) flips 'local' to 'busy'."""
+        alloc = self._make_allocator()
+        lease = alloc.acquire_local(lambda: _FakeLocalRunner())
+        assert lease is not None and lease.is_local
+
+        assert self._by_name(alloc)['local']['slot_state'] == 'busy'
+
+    async def test_slot_state_parked_after_cancel_fail(self):
+        """A cancel-FAIL that never probes clean leaves the slot 'parked'.
+
+        Drives the same path as TestHostAllocatorCancelFail's bounded-attempts
+        case: cancel_verify() returns 1 and probe_clean() never returns True,
+        so with max_attempts=2 the slot stays PARKED (held, non-acquirable).
+        """
+        from orchestrator.verify_runner import HostAllocator
+
+        remote_a = _FakeRemoteRunnerCancellable(
+            'remoteA', cancel_rc=1, probe_sequence=[False] * 20,
+        )
+        alloc = HostAllocator([remote_a], quarantine=set())
+
+        lease = alloc.acquire_remote()
+        assert lease is not None and lease.name == 'remoteA'
+
+        async def noop_sleep(_: float) -> None:
+            pass
+
+        result = await alloc.cancel_and_release(lease, sleep=noop_sleep, max_attempts=2)
+        assert result is False
+        # Pre-existing introspection agrees the slot is still held...
+        assert alloc.is_busy('remoteA') is True
+        # ...and host_states() distinguishes PARKED from plain BUSY.
+        assert self._by_name(alloc)['remoteA']['slot_state'] == 'parked'
+
+    async def test_slot_state_uses_lowercase_wire_vocabulary(self):
+        """slot_state is the lowercase wire spelling, never the _SLOT_* constants."""
+        alloc = self._make_allocator()
+        alloc.acquire_remote()
+        values = {h['slot_state'] for h in alloc.host_states()}
+        assert values <= {'free', 'busy', 'parked'}, values
+        # Explicitly NOT the internal uppercase constants.
+        assert not any(v.isupper() for v in values), values
+
+    # -- is_quarantined --------------------------------------------------------
+
+    async def test_is_quarantined_false_on_fresh_allocator(self):
+        """Nothing is quarantined at construction."""
+        alloc = self._make_allocator()
+        for name in ['local', 'remoteA', 'remoteB']:
+            assert alloc.is_quarantined(name) is False
+
+    async def test_is_quarantined_true_after_quarantine_and_release(self):
+        """quarantine_and_release(remote_lease) flips is_quarantined + host_states."""
+        alloc = self._make_allocator()
+        lease = alloc.acquire_remote()
+        assert lease is not None and lease.name == 'remoteA'
+
+        await alloc.quarantine_and_release(lease)
+
+        assert alloc.is_quarantined('remoteA') is True
+        assert self._by_name(alloc)['remoteA']['quarantined'] is True
+        # The slot itself was freed by the same call.
+        assert self._by_name(alloc)['remoteA']['slot_state'] == 'free'
+        # Untouched hosts are unaffected.
+        assert alloc.is_quarantined('remoteB') is False
+
+    async def test_shared_quarantine_set_is_honoured_by_reference(self):
+        """Mutating the CALLER's set flips both accessors — no allocator call needed.
+
+        This is the DriftDetector / land-time-cross-check path: those writers add
+        to the worker's ``_runner_quarantine`` directly, never through the
+        allocator, so both read paths must see it.
+        """
+        q: set[str] = set()
+        alloc = self._make_allocator(quarantine=q)
+        assert alloc.is_quarantined('remoteB') is False
+
+        q.add('remoteB')
+
+        assert alloc.is_quarantined('remoteB') is True
+        assert self._by_name(alloc)['remoteB']['quarantined'] is True
+        assert self._by_name(alloc)['remoteA']['quarantined'] is False
+
+    async def test_clear_quarantine_flips_back_to_false(self):
+        """clear_quarantine(name) returns is_quarantined/host_states to False."""
+        q: set[str] = {'remoteA'}
+        alloc = self._make_allocator(quarantine=q)
+        assert alloc.is_quarantined('remoteA') is True
+
+        alloc.clear_quarantine('remoteA')
+
+        assert alloc.is_quarantined('remoteA') is False
+        assert self._by_name(alloc)['remoteA']['quarantined'] is False
+
+    async def test_is_quarantined_unmanaged_name_returns_false(self):
+        """An unmanaged host name returns False rather than raising."""
+        alloc = self._make_allocator()
+        assert alloc.is_quarantined('no-such-host') is False
