@@ -266,7 +266,8 @@ SKIP_LOCK_LEVEL_FIDELITY: str = "skip_lock_level_fidelity"  # constraint 1, drop
 SKIP_LOCK_CHARTER: str = "skip_lock_charter"     # the interceptor would reject the files
 SKIP_NOT_TERMINAL: str = "skip_not_terminal"     # live task is not done/cancelled
 SKIP_FILES_PRESENT: str = "skip_files_present"   # already has a scope; re-run safe
-SKIP_MISSING: str = "skip_missing"               # live re-read returned nothing usable
+SKIP_MISSING: str = "skip_missing"               # the server ANSWERED and said the task is not there / not usable
+FAILED_LIVE_READ: str = "failed_live_read"       # the live re-read never answered; candidate NEVER JUDGED
 FAILED: str = "failed"                           # the write was attempted and errored
 
 # Report order, and the exhaustive list the summary iterates. Printed in full
@@ -279,6 +280,7 @@ ALL_DISPOSITIONS: tuple[str, ...] = (
     SKIP_NOT_TERMINAL,
     SKIP_FILES_PRESENT,
     SKIP_MISSING,
+    FAILED_LIVE_READ,
     FAILED,
 )
 
@@ -286,6 +288,7 @@ ALL_DISPOSITIONS: tuple[str, ...] = (
 # aggregate "2 failed" tells an operator nothing they can act on.
 _ITEMISED_DISPOSITIONS: tuple[str, ...] = (
     FAILED,
+    FAILED_LIVE_READ,
     SKIP_LOCK_CHARTER,
     SKIP_CONTRADICTED,
     SKIP_LOCK_LEVEL_FIDELITY,
@@ -575,8 +578,12 @@ async def repair_project(
        rather than silently filtered away, so an exclusion is visible in the
        report as a decision rather than as an absence.
     3. ``plan_files_rejection_reason`` — the lock-charter pre-check.
-    4. A live ``get_task`` re-read per surviving candidate, then
-       ``classify_live_task``.
+    4. A live ``get_task`` re-read per surviving candidate, classified by
+       ``classify_reply`` and then, on an ``ok`` reply, ``classify_live_task``.
+       A candidate the server EXPLAINED — ``classify_reply(...).answered`` —
+       is a :data:`SKIP_MISSING`; a candidate the server never answered for
+       at all is a :data:`FAILED_LIVE_READ`, because the run cannot claim to
+       have examined it.
     5. On :data:`REPAIR` AND only when *apply* is true, ``repair_one``.
 
     Writes are SEQUENTIAL, not gathered. The interceptor serialises per-project
@@ -676,12 +683,24 @@ async def repair_project(
                     "project_root": project_root,
                 },
             )
-        except Exception as exc:  # noqa: BLE001 — one unreadable task, not a batch abort
+        except Exception as exc:  # noqa: BLE001 — transport-only, by construction; see below
+            # This arm can ONLY be client-side/transport. The fused-memory
+            # tool layer never raises across the wire — @mcp_tool_errors
+            # (fused-memory/src/fused_memory/server/tool_errors.py:44-59)
+            # converts every server-side exception into an ordinary reply
+            # dict — so every server-side reason (TaskNotFoundError and
+            # friends) arrives as a REPLY and is classified below, leaving
+            # nothing but a dead socket / refused connection / timeout to
+            # reach this `except`. The batch is still NOT aborted (`continue`
+            # stays); what changes is only that the candidate is now counted
+            # as UNJUDGED (FAILED_LIVE_READ) rather than as a benign skip —
+            # SKIP_MISSING would put it in the same bucket as a task the
+            # server told us is genuinely gone, and silently exit 0.
             outcomes.append(
                 RepairOutcome(
                     task_id=candidate.task_id,
                     tag=candidate.tag,
-                    disposition=SKIP_MISSING,
+                    disposition=FAILED_LIVE_READ,
                     files=candidate.plan_files,
                     detail=f"live re-read failed: {type(exc).__name__}: {exc}",
                 )
@@ -699,16 +718,21 @@ async def repair_project(
         # reason, as RepairOutcome.detail's docstring promises it does.
         verdict = classify_reply(live)
         if not verdict.ok:
-            # Both failure classes still land in SKIP_MISSING here — this
-            # step only replaces the classifier, not the disposition. A later
-            # step splits this on `verdict.answered` so an unanswered reply
-            # (indistinguishable from a dead transport) is reported as a
-            # candidate that was never judged, rather than as a benign skip.
+            # A candidate the server EXPLAINED (answered=True — an explicit
+            # error/success:False marker) is a SKIP: the server successfully
+            # told us the task is not there / not usable. A candidate the
+            # server never answered for at all (answered=False — {} or a
+            # non-dict reply, the same "wedged server ACKed with nothing
+            # usable" shape classify_reply's docstring describes) is a
+            # FAILURE, because the run cannot claim to have examined it — the
+            # one expression below is what keeps the two branches from
+            # drifting apart.
+            disposition = SKIP_MISSING if verdict.answered else FAILED_LIVE_READ
             outcomes.append(
                 RepairOutcome(
                     task_id=candidate.task_id,
                     tag=candidate.tag,
-                    disposition=SKIP_MISSING,
+                    disposition=disposition,
                     files=candidate.plan_files,
                     detail=f"live re-read: {verdict.detail}",
                 )
