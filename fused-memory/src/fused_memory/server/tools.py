@@ -4755,6 +4755,8 @@ def create_mcp_server(
         deleted: list[str] = []
         failed_deletes: list[dict[str, Any]] = []
         survivors: list[str] = []
+        reparented: list[dict[str, Any]] = []
+        reparent_failures: list[dict[str, Any]] = []
         for supersede_id in supersedes_ids:
             rejection = citation_blocked.get(supersede_id)
             if rejection:
@@ -4770,6 +4772,57 @@ def create_mcp_server(
                     'error_type': rejection.get('error_type'),
                 })
                 continue
+
+            # (5b) RE-HOME THIS SUPERSEDE'S CHILDREN, THEN delete it. The
+            # order is not a preference: a child re-pointed AFTER its parent
+            # died was an orphan for the interval between, and a crash inside
+            # that interval leaves it one permanently — the child still names
+            # the dead parent, and no read path reaches a deleted point to
+            # learn what it was. Moving the pointer while BOTH ends still
+            # exist is the only sequencing that cannot strand anything.
+            #
+            # DIRECT children only (`list_child_ids`, not
+            # `list_descendant_ids`): re-pointing the top layer preserves the
+            # deeper subtree's internal structure, whereas flattening every
+            # descendant onto the canonical would destroy the hierarchy the
+            # records themselves encode.
+            scan = await memory_service.list_child_ids(
+                supersede_id, project_id=project_id
+            )
+            moved_children: list[str] = []
+            stranded_children: list[str] = []
+            for child_id in scan.ids:
+                # `parent_id` ONLY, and no content: the child's own claim is
+                # not this op's to rewrite, so nothing is re-embedded and no
+                # other metadata is disturbed.
+                outcome = await memory_service.update_memory(
+                    memory_id=child_id,
+                    project_id=project_id,
+                    content=None,
+                    metadata_patch={'parent_id': canonical_id},
+                    metadata_mode='merge',
+                    agent_id=agent_id,
+                    session_id=session_id,
+                    causation_id=causation_id,
+                    _source=source,
+                )
+                if isinstance(outcome, dict) and outcome.get('error_type'):
+                    stranded_children.append(child_id)
+                    reparent_failures.append({
+                        'child_id': child_id,
+                        'from': supersede_id,
+                        'to': canonical_id,
+                        'error': outcome.get('error'),
+                        'error_type': outcome.get('error_type'),
+                    })
+                    continue
+                moved_children.append(child_id)
+                reparented.append({
+                    'child_id': child_id,
+                    'from': supersede_id,
+                    'to': canonical_id,
+                })
+
             try:
                 await memory_service.delete_memory(
                     memory_id=supersede_id,
@@ -4848,6 +4901,8 @@ def create_mcp_server(
             survivors=survivors,
             retained=retained,
             retain_failures=retain_failures,
+            reparented=reparented,
+            reparent_failures=reparent_failures,
             topic_members=topic_members,
             topic_members_total=total,
             topic_members_truncated=total > returned,
