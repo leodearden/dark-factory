@@ -81,6 +81,7 @@ from orchestrator.overrides import OverrideStore
 from orchestrator.park_eviction_requests import ParkEvictionRequestStore
 from orchestrator.proc_supervision import EscalationSpec
 from orchestrator.provenance_conflict import ProvenanceConflictSink
+from orchestrator.repo_paths import resolve_dark_factory_root
 from orchestrator.review_checkpoint import ReviewCheckpoint
 from orchestrator.routing import RoleDefaults
 from orchestrator.routing_dispatch import resolve_and_record_route
@@ -11282,6 +11283,10 @@ class Harness:
         """
 
         cfg = self.config
+        # Task 3605: the dark-factory TOOLING checkout, which for a cross-project
+        # target is a different repo from cfg.project_root.  Resolved ONCE so the
+        # injected env var and the banner below cannot disagree.
+        df_root = resolve_dark_factory_root()
         user_prompt = (
             f'You are running as an autonomous escalation watcher.\n'
             f'Rotation limits (injected by supervisor):\n'
@@ -11303,6 +11308,13 @@ class Harness:
         )
         timeout_secs = cfg.watcher_rotation_hours * 3600 + _WATCHER_TIMEOUT_GRACE_SECS
         bash_max_timeout_ms = str(int(timeout_secs * 1000))
+        env_overrides = {'BASH_MAX_TIMEOUT_MS': bash_max_timeout_ms}
+        if df_root is not None:
+            # Only when resolved: a set-but-EMPTY DARK_FACTORY_ROOT is strictly
+            # worse than unset — it expands the rotation's re-arm to `cd  &&
+            # scripts/...` / `/scripts/...` (the sighted failure) and defeats
+            # watcher-rearm.sh's own `[ -z ... ]` exit-2 diagnostic (task 3605).
+            env_overrides['DARK_FACTORY_ROOT'] = str(df_root)
         logger.info(
             'Escalation-watcher-auto rotation: injecting BASH_MAX_TIMEOUT_MS=%s (timeout_secs=%.0f)',
             bash_max_timeout_ms,
@@ -11328,7 +11340,7 @@ class Harness:
             backend=cfg.watcher_backend,
             mcp_config=mcp_config,
             timeout_seconds=timeout_secs,
-            env_overrides={'BASH_MAX_TIMEOUT_MS': bash_max_timeout_ms},
+            env_overrides=env_overrides,
             allowed_tools=_WATCHER_ALLOWED_TOOLS,
             disallowed_tools=_WATCHER_DISALLOWED_TOOLS,
             # Isolate this rotation's capped `escalation` connection: its server

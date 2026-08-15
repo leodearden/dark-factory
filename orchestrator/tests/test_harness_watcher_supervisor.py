@@ -479,30 +479,47 @@ class TestRunWatcherRotation:
 
     @pytest.mark.asyncio
     async def test_env_overrides_injects_bash_max_timeout_ms(self, tmp_path: Path) -> None:
-        """invoke_with_cap_retry receives env_overrides == {'BASH_MAX_TIMEOUT_MS': '<ms>'}.
+        """invoke_with_cap_retry receives BASH_MAX_TIMEOUT_MS='<ms>' in a CLOSED dict.
 
-        Exact-dict equality:
+        Both original intents are preserved:
           - pins the injected value against the known literal for the default config
-          - also asserts BASH_DEFAULT_TIMEOUT_MS is NOT injected (belt-only per D1)
+          - asserts BASH_DEFAULT_TIMEOUT_MS is NOT injected (belt-only per D1)
         Default: rotation_hours=4.0, grace=300.0 → 14700 s → '14700000' ms.
+
+        Task 3605 changed the form from exact-dict equality to a pinned key SET:
+        the rotation now also injects DARK_FACTORY_ROOT.  The resolver is patched
+        to a known path so the key set stays closed and deterministic — a loose
+        `'BASH_MAX_TIMEOUT_MS' in env_overrides` check would silently discard the
+        second intent and let any future key slip in untested.
         """
         from shared.cli_invoke import AgentResult
 
         h = _make_rotation_harness(tmp_path)
+        df_root = tmp_path / 'df-checkout'
         captured: dict = {}
 
         async def fake_invoke(usage_gate, label, *, invoke_fn, **kwargs):
             captured['env_overrides'] = kwargs.get('env_overrides')
             return AgentResult(success=True, output='')
 
-        with patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke):
+        with (
+            patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke),
+            patch('orchestrator.harness.resolve_dark_factory_root', return_value=df_root),
+        ):
             await h._run_watcher_rotation()
 
+        env_overrides = captured.get('env_overrides')
         # Assert against the known literal for the default config to catch formula drift.
         # Derivation: rotation_hours=4.0, grace=300.0 → 14700 s → 14700000 ms.
-        assert captured.get('env_overrides') == {'BASH_MAX_TIMEOUT_MS': '14700000'}, (
-            f'env_overrides must be exactly {{"BASH_MAX_TIMEOUT_MS": "14700000"}}; '
-            f'got {captured.get("env_overrides")!r}'
+        assert env_overrides['BASH_MAX_TIMEOUT_MS'] == '14700000', (
+            f'BASH_MAX_TIMEOUT_MS must be "14700000"; got {env_overrides!r}'
+        )
+        assert 'BASH_DEFAULT_TIMEOUT_MS' not in env_overrides, (
+            f'BASH_DEFAULT_TIMEOUT_MS must NOT be injected (belt-only per D1); '
+            f'got {env_overrides!r}'
+        )
+        assert set(env_overrides) == {'BASH_MAX_TIMEOUT_MS', 'DARK_FACTORY_ROOT'}, (
+            f'env_overrides must stay CLOSED to exactly these keys; got {env_overrides!r}'
         )
 
     @pytest.mark.asyncio
