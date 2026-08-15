@@ -4921,6 +4921,12 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: Session digest renders guard trip as bare template '(turn 3) blocked:' with no matched substring, detail, or explanation following
+  - date: '2026-08-14'
+    project: dark_factory
+    session: bd7c8b66-aae9-475d-8058-514c32844af2
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'Session digest renders guard-trip signals as bare templates: ''blocked:'' entries on turns 3 and 11 with no matched substring or detail text following. Digest generator drops content after the signal keyword.'
 - id: entry-cand-20260722-34
   title: Census-verifier agent doesn't know the transcript storage path convention, so it blind-searches the filesystem and repeatedly hits approval gates
   severity: medium
