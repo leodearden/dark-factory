@@ -1530,10 +1530,16 @@ class TestEscalationJoin:
         named = [i for i in payload['issues'] if i['kind'] == 'malformed_escalation_record']
         assert len(named) == 2
         assert all(i['path'] == str(esc_dir) for i in named)
-        details = ' '.join(i['detail'] for i in named)
-        assert 'list' in details
-        assert 'str' in details
-        assert payload['issue_count'] == len(payload['issues'])
+        # Per-issue, not a substring check on the concatenation -- pins that
+        # the list record was named `list` and the string record `str`,
+        # rather than merely that both words appear somewhere between them.
+        details = {i['detail'] for i in named}
+        assert any('record is list,' in detail for detail in details)
+        assert any('record is str,' in detail for detail in details)
+        # `_join_tree` is a zero-issue baseline (see `_healthy_tree`'s
+        # docstring for the sibling guarantee), so the total is pinned, not
+        # merely self-consistent with `len(payload['issues'])`.
+        assert payload['issue_count'] == 2
         assert set(payload) == _PAYLOAD_KEYS
         # The discard does not poison the rest of the join.
         assert _only(payload['evals'][0]['metrics'], 'alarmed-open')['escalation'] is not None
@@ -1564,7 +1570,9 @@ class TestEscalationJoin:
 
         named = [i for i in payload['issues'] if i['kind'] == 'malformed_escalation_record']
         assert len(named) == 2
-        assert payload['issue_count'] == len(payload['issues'])
+        # `_healthy_tree` is a zero-issue baseline by its own docstring, so
+        # the total is pinned, not merely self-consistent with the list.
+        assert payload['issue_count'] == 2
 
         truncated = [i for i in named if '…' in i['detail']]
         not_truncated = [i for i in named if '…' not in i['detail']]
