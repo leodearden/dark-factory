@@ -68,7 +68,12 @@ escalation with no usable ``dedupe_fingerprint`` is named
 and a live alarm must never be absent from both.  The openness test is positive
 (``status`` is ``pending``) rather than a blocklist of closed states, so a
 status vocabulary that grows a new terminal state fails toward "not shown as
-open" rather than toward a closed alarm rendered as live.
+open" rather than toward a closed alarm rendered as live.  A record that is not
+even an object — the parsed queue file's top level was a list, string, number
+or other non-dict JSON value — is neither classifiable nor keyable, so it takes
+neither filter path above; it is instead the ``malformed_*`` case from the
+three disposal paths described earlier (``malformed_escalation_record``), since
+the file parsed but not into the expected shape.
 
 The derived ``parity`` badge answers to the same rule.  A verdict outside the
 closed M2 set has no badge, so it is NAMED (``unknown_verdict``) instead of
@@ -677,6 +682,20 @@ def _index_escalations(
     The kind is singular to stay separable from ``unreadable_escalations``
     (plural), which means the whole join blew up.
 
+    A record that DOES parse but is not an object takes a related, narrower
+    path one frame down: ``load_queue_escalations`` validates only that a file
+    PARSES, not that its top level is a dict, so a queue file whose JSON is a
+    bare list, string or number arrives here as a non-dict entry in
+    ``records``.  It is named ``malformed_escalation_record`` with the queue
+    DIR as its path, like the other record-level issues below — by this point
+    the loop has only the parsed value, not the file it came from, so the dir
+    is the most specific location available.  It is named but, unlike
+    ``unfingerprinted_escalation`` below, it is NOT carried into
+    ``unmatched_escalations``: a non-dict value has no ``category`` or
+    ``status`` to read, so the reader never established it was an open
+    ``eval_regression`` escalation at all, and asserting it into that list
+    would claim a classification that was never made.
+
     Openness is filtered EXPLICITLY on ``status``, not inferred from the fact
     that ``load_queue_escalations`` skips the archive subtree.  That inference
     does not hold: ``escalation.queue._archive_resolved`` is best-effort — on
@@ -749,6 +768,15 @@ def _index_escalations(
             )
     for record in records:
         if not isinstance(record, dict):
+            _issue(
+                issues, 'malformed_escalation_record', path=escalations_dir,
+                detail=(
+                    f'escalation queue record is {type(record).__name__}, not an object '
+                    f'({record!r}); if it held an open eval_regression escalation it is '
+                    'missing from this payload, so unmatched_escalations cannot be read '
+                    'as exhaustive'
+                ),
+            )
             continue
         if record.get('category') != _EVAL_REGRESSION_CATEGORY:
             continue
