@@ -1228,8 +1228,26 @@ def test_registry_exec_start_flags_are_really_on_the_committed_command():
             )
 
 
-def test_registry_environment_sections_really_declare_environment():
-    """STALENESS GUARD, Environment edition."""
+def test_registry_environment_sections_name_a_section_the_committed_unit_has():
+    """STALENESS GUARD, Environment edition — re-aimed for injection-visibility registrations.
+
+    This guard used to require the committed unit to declare an actual
+    Environment= line in the registered section. That is now the WRONG
+    expectation: the watchdog service registers environment_section="Service"
+    while declaring no Environment= at all, ON PURPOSE — the same "present in
+    neither copy today" shape UnitSpec.override_directives already documents
+    (see that field's comment: "an override directive is expected to exist in
+    NEITHER copy ... Putting it on present_only would fail that staleness
+    test on arrival"). Requiring a declared Environment= here would fail that
+    registration on arrival for the identical reason.
+
+    What still needs guarding did not go away: a typo'd or nonexistent
+    section name — environment_section="Servcie" — would compare against a
+    section the parser never populates, so the branch would compare nothing,
+    forever, while reporting green. Asserting the section EXISTS in the
+    parsed committed unit (regardless of whether it declares Environment= yet)
+    keeps that protection without rejecting a deliberately-empty registration.
+    """
     mod = _load_checker()
 
     for name, spec in mod.UNITS.items():
@@ -1238,10 +1256,56 @@ def test_registry_environment_sections_really_declare_environment():
         parsed = mod.parse_unit_directives(
             (REPO_ROOT / spec.repo_relpath).read_text(encoding="utf-8")
         )
-        assert "Environment" in parsed.get(spec.environment_section, {}), (
+        assert spec.environment_section in parsed, (
             f"{name}: registry compares Environment= in "
-            f"[{spec.environment_section}], but the committed unit declares none."
+            f"[{spec.environment_section}], but the committed unit has no "
+            "such section at all — the entry checks nothing. Fix the "
+            "registry or the unit."
         )
+
+
+def test_committed_environment_declarations_are_all_registered():
+    """INVERTED staleness guard: every declared Environment= is registered.
+
+    The sibling guard above
+    (test_registry_environment_sections_name_a_section_the_committed_unit_has)
+    only checks one direction: registration implies the section exists. That
+    left the actual hazard task 4090 fixed completely unchecked — a committed
+    unit can declare Environment= in a section nobody registered, and every
+    directive still compares equal, forever, while the checker reports green.
+    This is the missing direction: for every section a committed unit
+    declares Environment= in, that section must be the spec's registered
+    environment_section — so a future watchdog knob promoted into the
+    committed unit while environment_section stayed None fails loudly here
+    instead of silently going uncompared. That is precisely task 4090's
+    defect, generalized to any unit in the registry, present or future.
+
+    Passes on arrival today: only dashboard.service declares Environment=,
+    and it registers "Service". This is a forward guard, not a second red.
+
+    UnitSpec carries exactly one environment_section, so a unit that ever
+    needs Environment= compared in more than one section cannot be expressed
+    yet; the assertion message says so explicitly rather than failing in a
+    way that reads like a simple typo.
+    """
+    mod = _load_checker()
+
+    for name, spec in mod.UNITS.items():
+        parsed = mod.parse_unit_directives(
+            (REPO_ROOT / spec.repo_relpath).read_text(encoding="utf-8")
+        )
+        for section, directives in parsed.items():
+            if "Environment" not in directives:
+                continue
+            assert spec.environment_section == section, (
+                f"{name}: the committed unit declares Environment= in "
+                f"[{section}], but environment_section is "
+                f"{spec.environment_section!r} — register "
+                f"environment_section={section!r} (UnitSpec holds only one "
+                "section; extend it if a unit ever needs more than one "
+                "registered) so this directive is actually compared instead "
+                "of silently skipped."
+            )
 
 
 def test_registry_env_matches_directive_entries_are_declared_in_the_committed_units():
