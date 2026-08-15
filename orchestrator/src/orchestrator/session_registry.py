@@ -1879,6 +1879,37 @@ class LeaseDecision(StrEnum):
     PROCEED = 'proceed'
 
 
+class LeaseMutation(StrEnum):
+    """The outcome of a heartbeat_lease / release_lease call (task 3994).
+
+    A lease is single-owner-per-role, so a MUTATION of one (refreshing its
+    heartbeat, or removing it) is only legitimate from its actual holder.
+    Before 3994 both verbs took only ``name`` and mutated unconditionally:
+    any caller could evict a live holder or keep a stranger's lease
+    structurally unreapable forever. These values report which of those an
+    attempted mutation turned out to be.
+
+    APPLIED: the caller IS the holder; the mutation was performed.
+    FORCED: the caller is NOT the holder (or the body was unreadable) but
+        passed ``force=True``; the mutation was performed anyway and logged
+        at WARNING naming BOTH parties (operator recovery, attributable).
+    ABSENT: there is no such lease. A no-op, and NOT a failure -- releasing
+        an already-released lease is idempotent by design, so this is quiet.
+    REFUSED: the caller is not the holder (or the body is unreadable, which
+        fails TOWARD held); nothing was touched, logged at ERROR naming both
+        parties.
+    FAULTED: the mutation itself faulted (an OSError from utime/unlink).
+        Logged at ERROR and returned, never raised -- a lease-substrate
+        fault must not interrupt a watcher's main loop.
+    """
+
+    APPLIED = 'applied'
+    FORCED = 'forced'
+    ABSENT = 'absent'
+    REFUSED = 'refused'
+    FAULTED = 'faulted'
+
+
 @dataclass(frozen=True)
 class LeaseHolder:
     """Serialized identity of a lease's current holder -- the exact ``.lease`` file body.
@@ -2129,21 +2160,122 @@ def heartbeat_lease(name: str, *, root: Path | str | None = None) -> bool:
     return True
 
 
-def release_lease(name: str, *, root: Path | str | None = None) -> bool:
-    """Remove the *name* lease file. Idempotent: a second call returns False.
+def _is_lease_owner(holder: LeaseHolder | None, slug: str) -> bool:
+    """Whether *slug* is the lease's holder.
 
-    Returns whether the lease existed before this call removed it; fail-soft
-    (logs loudly at ERROR, returns False) on an OSError from the removal
-    itself.
+    THE single ownership predicate -- ``_check_lease_ownership`` gates on it
+    and the mutating verbs re-use it to tell APPLIED (I am the owner) from
+    FORCED (I overrode someone else), so the two can never drift apart.
+
+    Compares ONLY ``session_slug``, never the pid: the slug is a session's
+    stable identity key (see build_session_slug), while the pid is the
+    INDEPENDENT liveness probe. Conflating them would make a legitimate
+    re-heartbeat fail whenever pid resolution differed between two
+    invocations of the same session. An unreadable body (*holder* is None)
+    is owned by nobody -- fail toward held.
+    """
+    return holder is not None and holder.session_slug == slug
+
+
+def _check_lease_ownership(
+    path: Path,
+    *,
+    slug: str,
+    force: bool,
+    verb: str,
+    now: datetime | None = None,
+) -> tuple[LeaseMutation | None, LeaseHolder | None]:
+    """Gate a lease mutation on ownership (task 3994).
+
+    Returns ``(None, holder)`` when the caller MAY proceed, and
+    ``(<terminal LeaseMutation>, holder)`` when it must not. Shared by
+    ``heartbeat_lease`` and ``release_lease`` so there is exactly ONE
+    ownership predicate for the two mutating verbs -- a second copy would
+    be free to drift, and "who may touch this lease" is precisely the
+    question that must have one answer.
+
+    The (holder, alive, age) read goes through ``_read_lease_holder_state``,
+    the same reader ``claim_lease`` decides on, so a refusal log carries the
+    identical fields a contention message does -- the holder a refused
+    caller is told about is the holder a contending claim would report.
+
+    - lease absent -> (ABSENT, None), and QUIET: an idempotent release is
+      not a failure and must not manufacture an ERROR.
+    - body unreadable/corrupt -> not owned by anybody, so REFUSED (fail
+      TOWARD held, mirroring _read_lease_holder_state's own documented rule
+      -- a corrupt lease is not stranded: reap_stale_leases still removes it
+      under the ``corrupt`` rule once past LEASE_HEARTBEAT_TTL, and --force
+      covers immediate operator recovery).
+    - slug matches -> proceed.
+    - slug mismatch -> REFUSED + logger.error naming the verb, the lease,
+      the REAL holder (slug + pid), the heartbeat age and the requester, so
+      the refusal is greppable and both parties are attributable (INV-2).
+    - *force* overrides either refusal, at WARNING, naming both parties.
+    """
+    if now is None:
+        now = datetime.now(UTC)
+    if not path.exists():
+        return LeaseMutation.ABSENT, None
+
+    holder, _holder_alive, age_secs = _read_lease_holder_state(path, now=now)
+    if _is_lease_owner(holder, slug):
+        return None, holder
+
+    holder_slug = holder.session_slug if holder is not None else '<unreadable lease body>'
+    holder_pid = holder.pid if holder is not None else -1
+    if force:
+        logger.warning(
+            '%s: FORCED on %s -- requester=%s is not the holder '
+            '(holder=%s pid=%s heartbeat_age=%.0fs); overriding on explicit --force',
+            verb,
+            path.stem,
+            slug,
+            holder_slug,
+            holder_pid,
+            age_secs,
+        )
+        return None, holder
+    logger.error(
+        '%s: REFUSED on %s -- requester=%s is not the holder '
+        '(holder=%s pid=%s heartbeat_age=%.0fs); nothing was touched '
+        '(inspect with lease-show, override with --force)',
+        verb,
+        path.stem,
+        slug,
+        holder_slug,
+        holder_pid,
+        age_secs,
+    )
+    return LeaseMutation.REFUSED, holder
+
+
+def release_lease(
+    name: str, *, slug: str, force: bool = False, root: Path | str | None = None
+) -> LeaseMutation:
+    """Remove the *name* lease -- but only if *slug* actually holds it.
+
+    *slug* is a REQUIRED keyword argument, not an optional check: an
+    opt-in ownership test would leave "evict a live holder's lease" reachable
+    from Python and would be the path of least resistance for any future
+    caller (task 3994). ``force=True`` is the single, loudly-logged bypass.
+
+    Idempotent and fail-soft, exactly as before: an absent lease is ABSENT
+    (quiet -- a second release is not a failure), and an OSError from the
+    unlink itself is FAULTED after a logger.error, never a raise.
+
+    Returns the LeaseMutation describing what actually happened; see that
+    enum for each value's meaning.
     """
     path = lease_path_for_name(name, root=root)
-    existed = path.exists()
+    terminal, holder = _check_lease_ownership(path, slug=slug, force=force, verb='release_lease')
+    if terminal is not None:
+        return terminal
     try:
         path.unlink(missing_ok=True)
     except OSError:
         logger.error('release_lease: failed to remove %s', path, exc_info=True)
-        return False
-    return existed
+        return LeaseMutation.FAULTED
+    return LeaseMutation.APPLIED if _is_lease_owner(holder, slug) else LeaseMutation.FORCED
 
 
 @dataclass(frozen=True)
