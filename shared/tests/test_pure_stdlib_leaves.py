@@ -13,11 +13,16 @@ submodule import, so while ``shared/__init__.py`` eagerly re-exported from
 ``config_models``/``usage_gate``/``cli_invoke``/``async_sqlite_base``, every
 one of these leaves dragged in pydantic, yaml, aiosqlite, dotenv and aiohttp —
 18 third-party top-level packages — no matter how pure the leaf itself was.
-``shared/__init__.py`` is now a PEP 562 lazy package; ``test_init_has_no_
-runtime_submodule_imports`` below is the guard against re-coupling it.
+``shared/__init__.py`` is now a PEP 562 lazy package, guarded against
+re-coupling from two directions: ``test_bare_package_import_binds_no_
+submodules`` measures the property in a fresh interpreter (unevadable, but
+names no line) and ``test_init_has_no_runtime_submodule_imports`` scans the
+AST (names the offending line, but only sees what it can parse).
 
 DESIGN.
   - Pure stdlib (``ast``, ``json``, ``subprocess``) — no third-party deps.
+  - ``run_python_child`` is the single home of the child-runner invariant;
+    ``test_lazy_public_api.py`` imports it rather than keeping a second copy.
   - The leakage check runs in a SUBPROCESS: ``sys.modules`` is process-global
     and pytest has already imported pydantic/aiosqlite/yaml/dotenv by
     collection time, so an in-process assertion is impossible. A before/after
@@ -43,6 +48,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -85,25 +91,56 @@ added = {name.split('.')[0] for name in set(sys.modules) - before}
 print(json.dumps(sorted(added - set(sys.stdlib_module_names) - {'shared'})))
 """
 
+# Child program: import `shared` and report which `shared.<submodule>` modules it
+# loaded as a side effect. This MEASURES the property the AST guard below can
+# only approximate syntactically, so it holds regardless of how an eager import
+# is spelled (nested in try/if/with, or triggered by a module-level call).
+_BOUND_SUBMODULES_CHILD_SRC = """
+import json
+import sys
 
-def _third_party_after_import(target: str) -> list[str]:
-    """Return the third-party top-level packages ``import <target>`` pulls in."""
+import shared  # the ONLY import: this measures its side effects
+
+print(json.dumps(sorted(n for n in sys.modules if n.startswith('shared.'))))
+"""
+
+
+def run_python_child(src: str, *argv: str) -> Any:
+    """Run ``src`` in a fresh interpreter against the LOCAL src tree; parse its JSON.
+
+    THE SINGLE HOME of the child-runner invariant. ``test_lazy_public_api.py``
+    imports this rather than keeping a second copy (bare-module import — the
+    tests dir is on ``sys.path`` via conftest, the same shape as
+    ``test_usage_gate.py``'s ``from test_config_dir import ...``). It lives in a
+    test module rather than a helper module of its own only because task 3896's
+    lock charter covers these test files and not a new one.
+
+    The PYTHONPATH prepend is load-bearing, not boilerplate: a bare
+    ``python -c 'import shared'`` inside a task worktree resolves to the MAIN
+    checkout's installed editable copy, so every assertion built on this runner
+    would silently measure the wrong tree.
+    """
     env = {
         **os.environ,
         'PYTHONPATH': f'{_SRC}{os.pathsep}' + os.environ.get('PYTHONPATH', ''),
     }
     proc = subprocess.run(
-        [sys.executable, '-c', _CHILD_SRC, target],
+        [sys.executable, '-c', src, *argv],
         capture_output=True,
         text=True,
         env=env,
         timeout=60,
     )
     assert proc.returncode == 0, (
-        f'child failed to import {target!r} (exit {proc.returncode})\n'
+        f'child exited {proc.returncode} (argv={list(argv)})\n'
         f'--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}'
     )
     return json.loads(proc.stdout)
+
+
+def _third_party_after_import(target: str) -> list[str]:
+    """Return the third-party top-level packages ``import <target>`` pulls in."""
+    return run_python_child(_CHILD_SRC, target)
 
 
 @pytest.mark.parametrize('leaf', PURE_STDLIB_LEAVES)
@@ -128,24 +165,92 @@ def test_bare_package_import_loads_no_third_party():
     )
 
 
-def test_init_has_no_runtime_submodule_imports():
-    """shared/__init__.py must import no `shared.*` submodule at runtime.
+def test_bare_package_import_binds_no_submodules():
+    """`import shared` must load no `shared.<submodule>` at all.
 
-    Walks only ``tree.body`` — module level — so the ``if TYPE_CHECKING:``
-    block's static-only re-exports are deliberately not descended into. This
-    catches a re-coupling regression (e.g. re-adding ``from shared.locking
-    import ...`` at module level) that the third-party check alone would miss,
-    because a pure leaf re-imported eagerly leaks nothing yet still rebuilds
-    the coupling this guard exists to prevent.
+    The behavioural half of the re-coupling guard, and the stronger half: it
+    measures the actual property rather than inspecting syntax, so it holds
+    however an eager import is spelled — nested in ``try:``/``if:``/``with:``,
+    or triggered indirectly by a module-level call the AST scan cannot follow.
+    Re-importing a *pure* leaf eagerly leaks no third-party package, so
+    ``test_bare_package_import_loads_no_third_party`` would stay green while
+    the coupling silently returned; this is what catches that.
+    """
+    bound = run_python_child(_BOUND_SUBMODULES_CHILD_SRC)
+    assert bound == [], (
+        f'`import shared` eagerly loaded {len(bound)} submodule(s): '
+        f'{", ".join(bound)}.\nshared/__init__.py must stay lazy (PEP 562) — '
+        'every one of these runs on EVERY `import shared.<anything>`. Resolve '
+        'them in __getattr__ instead.'
+    )
+
+
+def _is_type_checking_test(test: ast.expr) -> bool:
+    """True for `TYPE_CHECKING` / `typing.TYPE_CHECKING`, and nothing else.
+
+    `if not TYPE_CHECKING:` is an ``ast.UnaryOp`` and deliberately does NOT
+    match: its body executes at import time, which is exactly the evasion this
+    guard exists to catch.
+    """
+    if isinstance(test, ast.Name):
+        return test.id == 'TYPE_CHECKING'
+    if isinstance(test, ast.Attribute):
+        return test.attr == 'TYPE_CHECKING'
+    return False
+
+
+def _import_time_unreachable_ids(tree: ast.Module) -> set[int]:
+    """ids of the AST nodes that cannot execute when the module is imported.
+
+    Two families, and only these two:
+
+      - the ``body`` of an ``if TYPE_CHECKING:`` — False at runtime, so those
+        imports exist purely for pyright/ruff. The ``orelse`` is NOT excluded:
+        an ``else:`` branch does run.
+      - the body of a ``def``/``async def`` — a deferred import inside
+        ``__getattr__`` is the lazy pattern this guard exists to encourage.
+        Class bodies are deliberately NOT excluded: they execute at import time.
+
+    Everything else — including a ``try:``, ``if:``, or ``with:`` block at
+    module level — stays in scope, so one level of indentation no longer hides
+    a re-coupling regression.
+    """
+    unreachable: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) or (
+            isinstance(node, ast.If) and _is_type_checking_test(node.test)
+        ):
+            # `.body` only — never `.orelse`, and never the `if` test itself.
+            for statement in node.body:
+                unreachable.update(id(n) for n in ast.walk(statement))
+    return unreachable
+
+
+def test_init_has_no_runtime_submodule_imports():
+    """shared/__init__.py must import no `shared.*` submodule at import time.
+
+    Walks the WHOLE tree, excluding only what cannot run at import time (see
+    ``_import_time_unreachable_ids``). Scanning just ``tree.body`` would let any
+    nesting through — ``try: from shared.locking import ...``, ``if not
+    TYPE_CHECKING: ...``, ``if sys.version_info >= (3, 12): ...`` — since each
+    is an ``ast.Try``/``ast.If`` node that is itself neither ``ast.Import`` nor
+    ``ast.ImportFrom``.
+
+    This is the syntactic half of the guard; ``test_bare_package_import_binds_
+    no_submodules`` above is the behavioural half. Both are kept: the runtime
+    check is impossible to evade, this one names the offending line.
     """
     init_path = _SRC / 'shared' / '__init__.py'
     tree = ast.parse(init_path.read_text(), filename=str(init_path))
+    unreachable = _import_time_unreachable_ids(tree)
 
-    offenders: list[str] = []
-    for node in tree.body:
+    offenders: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if id(node) in unreachable:
+            continue
         if isinstance(node, ast.Import):
             offenders += [
-                f'line {node.lineno}: import {a.name}'
+                (node.lineno, f'line {node.lineno}: import {a.name}')
                 for a in node.names
                 if a.name.split('.')[0] == 'shared'
             ]
@@ -156,13 +261,18 @@ def test_init_has_no_runtime_submodule_imports():
         ):
             dots = '.' * node.level
             offenders.append(
-                f'line {node.lineno}: from {dots}{node.module or ""} import '
-                + ', '.join(a.name for a in node.names)
+                (
+                    node.lineno,
+                    f'line {node.lineno}: from {dots}{node.module or ""} import '
+                    + ', '.join(a.name for a in node.names),
+                )
             )
 
-    assert offenders == [], (
-        'shared/__init__.py imports shared.* submodule(s) at module level:\n  '
-        + '\n  '.join(offenders)
+    # ast.walk is breadth-first, so sort back into source order for the message.
+    rendered = [text for _, text in sorted(offenders)]
+    assert rendered == [], (
+        'shared/__init__.py imports shared.* submodule(s) at import time:\n  '
+        + '\n  '.join(rendered)
         + '\nThese run on EVERY `import shared.<anything>`. Move them under '
         '`if TYPE_CHECKING:` and resolve them lazily in __getattr__.'
     )

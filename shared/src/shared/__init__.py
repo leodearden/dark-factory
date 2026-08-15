@@ -73,9 +73,16 @@ if TYPE_CHECKING:
 __version__ = '0.1.0'
 
 #: Single source of truth for lazy resolution: public name -> owning submodule
-#: (without the `shared.` prefix). Derived one-for-one from the TYPE_CHECKING
-#: block above; the two must stay in step, which
-#: shared/tests/test_lazy_public_api.py asserts.
+#: (without the `shared.` prefix). Written one-for-one from the TYPE_CHECKING
+#: block above, and the two must stay in step — but note what actually enforces
+#: that, because no test parses the TYPE_CHECKING block itself. The chain runs
+#: through `__all__`: test_public_api.py::TestInitAllCompleteness pins __all__
+#: to the union of the submodule __all__s, and test_lazy_public_api.py::
+#: test_every_public_name_resolves_and_is_the_submodule_object pins that every
+#: __all__ name resolves through this map to its submodule's own object. So a
+#: name reaching __all__ without an entry here is caught. A name added ONLY to
+#: the TYPE_CHECKING block — in neither this map nor __all__ — type-checks
+#: cleanly and fails at the consumer's import site; add all three together.
 _SYMBOL_MODULE: dict[str, str] = {
     # shared.agent_result
     'AgentVerdict': 'agent_result',
