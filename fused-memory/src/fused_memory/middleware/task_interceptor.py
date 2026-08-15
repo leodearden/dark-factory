@@ -2157,6 +2157,26 @@ class TaskInterceptor:
             )
             return None
 
+        # ── Guard: a live claimant holds the target right now ──
+        # Status alone has the same TOCTOU shape one level down: a target can
+        # read 'pending' at the guard above and be dispatched a moment later.
+        # The claimant rides along on the dict already re-read above (the task
+        # backend serializes claimant_run_id into every get_task result), so
+        # this closes the inner window at no extra I/O.
+        #
+        # Present-and-non-blank, NOT `is not None`: a blank/whitespace
+        # claimant is this codebase's spelling for "unclaimed"
+        # (shared/task_claimant.py; live_task_write_guard.has_live_claimant),
+        # and .get() keeps it safe on a row with no such key at all.
+        target_claimant = target.get('claimant_run_id')
+        if isinstance(target_claimant, str) and target_claimant.strip() != '':
+            logger.warning(
+                'combine-guard: target %s is held by a live claimant — aborting '
+                'combine to avoid rewriting a task under a running agent',
+                decision.target_id,
+            )
+            return None
+
         target_title = str(target.get('title', '') or '')
         expected_fp = normalize_title(target_title)
         got_fp = normalize_title(decision.target_fingerprint or '')
