@@ -115,6 +115,11 @@ def make_service(
     stuck_children=(),
     delete_errors=None,
     update_errors=None,
+    pre_read_errors=None,
+    corroboration_errors=None,
+    scroll_error=None,
+    child_scan_errors=None,
+    recount_errors=None,
     events=None,
 ):
     """A MemoryService mock modelling one consolidation cluster.
@@ -136,6 +141,18 @@ def make_service(
     patch REPORTS success while the child stays put — the silent-fail-soft
     case that only a live re-count can catch.
 
+    The READ-FAILURE knobs model the one thing every Qdrant read here does
+    by documented contract: a timeout PROPAGATES rather than collapsing into
+    a `None`/empty answer, so the caller can tell "genuinely absent" from
+    "backend did not answer". They are split by PHASE because the op reads
+    each supersede twice and the two reads mean different things:
+    *pre_read_errors* fails the pre-delete victim capture (tombstone
+    ENRICHMENT), *corroboration_errors* fails the post-delete re-read
+    (closure PROOF). *scroll_error* fails the topic-closure listing,
+    *child_scan_errors* fails `list_child_ids` for a parent, and
+    *recount_errors* fails the live post-reparent `{'parent_id': ...}`
+    re-count for a parent.
+
     *events* is a shared ordered log — the only way to assert the ORDERING
     that is this op's whole contract, since the steps land on different
     mocks (the service, then the task interceptor, then the service again).
@@ -146,6 +163,10 @@ def make_service(
     stuck_children = set(stuck_children)
     delete_errors = delete_errors or {}
     update_errors = update_errors or {}
+    pre_read_errors = pre_read_errors or {}
+    corroboration_errors = corroboration_errors or {}
+    child_scan_errors = child_scan_errors or {}
+    recount_errors = recount_errors or {}
     members = SUPERSEDES if topic_members is None else topic_members
     log = events if events is not None else []
 
@@ -182,6 +203,12 @@ def make_service(
         log.append(('read', memory_id))
         seen = reads_seen.get(memory_id, 0)
         reads_seen[memory_id] = seen + 1
+        # A timeout PROPAGATES out of this primitive by documented contract,
+        # which is why the phase matters: the first read is enrichment, every
+        # later one is the closure proof.
+        phase_errors = corroboration_errors if seen else pre_read_errors
+        if memory_id in phase_errors:
+            raise phase_errors[memory_id]
         if seen and memory_id in gone:
             return None
         return _point_row(memory_id)
@@ -190,6 +217,8 @@ def make_service(
 
     async def _list_child_ids(memory_id, *, project_id):
         log.append(('list_children', memory_id))
+        if memory_id in child_scan_errors:
+            raise child_scan_errors[memory_id]
         return DescendantScan(
             ids=list(children.get(memory_id, ())),
             truncated=memory_id in truncated_scans,
@@ -222,16 +251,23 @@ def make_service(
         }
 
     svc.update_memory = AsyncMock(side_effect=_update)
-    svc.get_memories_by_metadata = AsyncMock(
-        return_value=[_scroll_row(m) for m in members]
-    )
+
+    async def _scroll(**kwargs):
+        if scroll_error is not None:
+            raise scroll_error
+        return [_scroll_row(m) for m in members]
+
+    svc.get_memories_by_metadata = AsyncMock(side_effect=_scroll)
 
     async def _count(project_id=None, filters=None, **_):
         filters = filters or {}
         if 'parent_id' in filters:
             # The live child re-count: how many of this parent's children
             # are STILL its children right now.
-            kids = children.get(filters['parent_id'], ())
+            parent = filters['parent_id']
+            if parent in recount_errors:
+                raise recount_errors[parent]
+            kids = children.get(parent, ())
             return len([k for k in kids if k not in moved])
         return len(members) if topic_total is None else topic_total
 
@@ -1499,3 +1535,172 @@ class TestATombstoneShortfallIsDisclosed:
         assert result['tombstones_written'] == 1
         assert writer.await_args is not None
         assert len(writer.await_args.args[2]) == 1
+
+
+class TestReadFailuresDoNotDestroyTheEnvelope:
+    """A READ that fails after deletes have landed must never flatten the
+    result.
+
+    Premise, verified on this tree: `get_memory_by_id`,
+    `get_memories_by_metadata`, `count_memories_by_metadata` and the
+    `list_child_ids` primitives all PROPAGATE `TimeoutError` by documented
+    contract — deliberately, so a caller can distinguish "genuinely absent"
+    from "the backend did not answer". An unguarded call site therefore lets
+    that exception escape the tool body, where `@mcp_tool_errors` flattens
+    the whole envelope to {'error', 'error_type': 'TimeoutError'} —
+    destroying `deleted`/`failed_deletes`/`survivors`/`reparented` for
+    records that are ALREADY irreversibly gone, and skipping the tombstone
+    step so nothing is attributable either. The reads are where this op
+    LEARNS things; a learning failure must degrade what it can claim, never
+    erase what it did.
+
+    The two halves are asymmetric on purpose:
+
+      an ENRICHMENT read (victim capture, closure listing) degrades — its
+          failure costs detail, and detail must never veto a fold
+      a PROOF read (child listing, post-reparent re-count) FAILS CLOSED —
+          an unreadable answer is not "no children", and reading it as one
+          would orphan exactly the records the op exists to preserve
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_failed_corroboration_read_is_named_not_swallowed(self):
+        """An id whose closure could not be CHECKED is neither a survivor
+        (never observed alive) nor confirmed gone (never proven dead). It
+        gets its own list, because collapsing it into either one asserts
+        something no read supports."""
+        svc = make_service(
+            corroboration_errors={S2: TimeoutError('qdrant read timed out')}
+        )
+
+        with patched_tombstone_writer() as writer:
+            result = await call_consolidate(svc)
+
+        assert result.get('error_type') != 'TimeoutError'
+        assert result['canonical_id'] == CANONICAL
+        assert result['deleted'] == SUPERSEDES
+        assert result['survivor_check_failed'] == [
+            {
+                'id': S2,
+                'error': 'qdrant read timed out',
+                'error_type': 'TimeoutError',
+            }
+        ]
+        assert S2 not in result['survivors']
+        # NOT tombstoned: a tombstone means CORROBORATED gone, and this id
+        # was never corroborated either way.
+        assert writer.await_args is not None
+        assert [v['id'] for v in writer.await_args.args[2]] == [S1, S3]
+        assert result['tombstones_expected'] == 2
+        # The op could not prove closure, which IS the deliverable — unlike a
+        # tombstone shortfall, that is genuinely open business.
+        assert result['status'] == 'partial'
+
+    @pytest.mark.asyncio
+    async def test_a_failed_closure_scroll_degrades_and_says_so(self):
+        """An empty `topic_members` on a scroll that never answered would
+        read as "this topic has no members" — the overclaim this op exists
+        to eliminate. The listing is disclosed as UNAVAILABLE instead."""
+        svc = make_service(scroll_error=TimeoutError('scroll timed out'))
+
+        with patched_tombstone_writer() as writer:
+            result = await call_consolidate(svc)
+
+        assert result.get('error_type') != 'TimeoutError'
+        assert result['canonical_id'] == CANONICAL
+        assert result['deleted'] == SUPERSEDES
+        assert result['topic_members'] == []
+        assert result['topic_members_available'] is False
+        assert result['topic_members_truncated'] is False
+        # The deletes and their audit trail are unaffected: the listing is a
+        # convenience, the closure is the contract.
+        writer.assert_awaited_once()
+        assert result['tombstones_written'] == 3
+
+    @pytest.mark.asyncio
+    async def test_a_failed_victim_read_still_folds_and_still_tombstones(self):
+        """Tombstone ENRICHMENT, not tombstone existence. Losing the
+        metadata/created_at of one victim costs those two fields; refusing
+        the delete over it would cost the consolidation, and refusing the
+        tombstone would leave the very dead id this change exists to make
+        answerable un-attributable."""
+        svc = make_service(
+            pre_read_errors={S2: TimeoutError('point read timed out')}
+        )
+
+        with patched_tombstone_writer() as writer:
+            result = await call_consolidate(svc)
+
+        assert result.get('error_type') != 'TimeoutError'
+        assert result['deleted'] == SUPERSEDES
+        assert result['status'] == 'consolidated'
+        assert writer.await_args is not None
+        victims = {v['id']: v for v in writer.await_args.args[2]}
+        # Degraded to exactly the shape a genuine not-found already yields.
+        assert victims[S2]['metadata'] is None
+        assert victims[S2]['created_at'] is None
+        # One miss costs one victim's detail, never the batch's.
+        assert victims[S1]['created_at'] == CREATED_AT
+        assert victims[S3]['metadata'] == {'topic': TOPIC, 'created_at': CREATED_AT}
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_child_listing_refuses_the_delete(self):
+        """FAIL CLOSED. A listing that did not answer is not a listing that
+        said "no children" — and deleting on that reading would orphan the
+        records the reparent pass exists to preserve, permanently, since no
+        read path reaches a deleted parent to learn what it was."""
+        svc = make_service(
+            child_scan_errors={S1: TimeoutError('child scan timed out')}
+        )
+
+        with patched_tombstone_writer():
+            result = await call_consolidate(svc)
+
+        assert result.get('error_type') != 'TimeoutError'
+        deleted_ids = [c.kwargs['memory_id'] for c in svc.delete_memory.await_args_list]
+        assert S1 not in deleted_ids
+        [failure] = [f for f in result['failed_deletes'] if f['id'] == S1]
+        assert failure['error_type'] == 'ChildScanFailed'
+        # One unreadable parent costs one fold: the rest of the cluster still
+        # closes, because re-running to catch them would re-write the
+        # canonical — the +1-per-pass ratchet.
+        assert result['deleted'] == [S2, S3]
+        assert result['status'] == 'partial'
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_recount_refuses_the_delete(self):
+        """The re-count is the CORROBORATION that every reparent patch
+        actually landed. A corroboration that could not be read is not a
+        corroboration, so the delete stays unearned — the same refusal a
+        non-zero count produces, distinguished only by its message."""
+        svc = make_service(
+            children={S1: [C1, C2]},
+            recount_errors={S1: TimeoutError('count timed out')},
+        )
+
+        with patched_tombstone_writer():
+            result = await call_consolidate(svc)
+
+        assert result.get('error_type') != 'TimeoutError'
+        deleted_ids = [c.kwargs['memory_id'] for c in svc.delete_memory.await_args_list]
+        assert S1 not in deleted_ids
+        [failure] = [f for f in result['failed_deletes'] if f['id'] == S1]
+        assert failure['error_type'] == 'ReparentIncomplete'
+        # The message must say the CHECK failed, not that children remain:
+        # an operator reading "N children still name it" would go looking for
+        # children that may not exist.
+        assert 'count timed out' in failure['error'] or 'could not' in failure['error']
+        assert result['deleted'] == [S2, S3]
+
+    @pytest.mark.asyncio
+    async def test_survivor_check_failed_is_always_present(self):
+        """Always-present-keys rule: a caller reads
+        `result['survivor_check_failed']` without a membership test, and a
+        later arm cannot quietly stop reporting by omitting its key."""
+        svc = make_service()
+
+        with patched_tombstone_writer():
+            result = await call_consolidate(svc)
+
+        assert result['survivor_check_failed'] == []
+        assert result['topic_members_available'] is True
