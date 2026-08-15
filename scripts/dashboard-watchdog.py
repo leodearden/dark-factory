@@ -206,6 +206,19 @@ def log(msg: str) -> None:
     entirely with no signal. That is precisely the silent degradation the
     storm escape exists to eliminate, arriving through the LOGGING path.
     ``TimeoutStartSec`` in the unit file is the belt-and-braces second bound.
+
+    NEVER raises from either journal route. A tooling failure in the logging
+    path must not become a control-flow event at a call site — dashboard-
+    watchdog has no per-unit loop, but every log() call inside tick() (lines
+    768, 778, 835) is ordered BEFORE the save_state() it narrates, so an
+    exception escaping here aborts tick() mid-branch and skips that write: a
+    stale streak survives a startup grace or a recovery (arming a restart of
+    a *healthy* dashboard on the next single missed probe), or the
+    ``ceiling_open`` write is lost. main()'s ``except Exception`` does NOT
+    cover this — it only keeps the process exit code at 0; the tick's state
+    write is already skipped by the time that handler runs. (An unrelated
+    non-tooling exception type is still deliberately propagated — see the
+    narrow except clause below.)
     """
     try:
         subprocess.run(
@@ -218,7 +231,18 @@ def log(msg: str) -> None:
     except (OSError, subprocess.SubprocessError) as exc:
         # systemd-cat missing/unexecutable (OSError) or wedged past the bound
         # (TimeoutExpired, a SubprocessError) — still emit, just via stderr.
-        print(f"{LOG_TAG}: {msg} [systemd-cat unusable: {exc!r}]", file=sys.stderr)
+        # The fallback is itself best-effort: writing to stderr raises on a
+        # broken pipe or a full/failing journal socket, and that OSError
+        # would otherwise escape log() and abort tick() mid-branch (see the
+        # never-raises contract above). Both journal routes are gone at this
+        # point, so there is nothing left to report WITH — dropping the
+        # message is the only remaining option, and it is strictly better
+        # than dropping the rest of the tick with it.
+        with contextlib.suppress(OSError):
+            print(
+                f"{LOG_TAG}: {msg} [systemd-cat unusable: {exc!r}]",
+                file=sys.stderr,
+            )
 
 
 class _JournalLog:
