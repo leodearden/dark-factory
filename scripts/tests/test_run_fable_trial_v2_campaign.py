@@ -1076,6 +1076,188 @@ def test_uniform_corpora_are_unchanged():
     }
 
 
+# ===== review round 1: ONE marker count, SURFACED — never a second derivation =====
+#
+# Reproduced first-hand on this branch before these tests existed.
+# ``summarize_candidates`` builds ``build_plan_quality_report(results)`` and then,
+# one line later, RE-DERIVES the same per-candidate marker count itself. The two
+# implementations aggregate over DIFFERENT populations: the report layer counts
+# only the ADMITTED pool (a cap-tainted cell never reaches the count — pinned by
+# ``orchestrator/tests/test_eval_architect.py``'s
+# ``test_a_keyless_cap_tainted_cell_does_not_poison_the_count``), while this
+# driver's ``_architect_cells`` yields EVERY architect cell, cap-tainted ones
+# included. Measured on ``_cap_tainted_keyless_corpus()`` below:
+#
+#     build_plan_quality_report(results)['configs'][A]
+#         -> judged_without_reference=1, judged_without_reference_unmeasured=0
+#     summarize_candidates(results)[A]
+#         -> judged_without_reference=None, ..._unmeasured_cells=1
+#
+# So ONE keyless (pre-σ) cap-tainted cell poisoned the driver's answer to
+# UNMEASURED while the report object the same function had just built printed a
+# real number. That corpus is the NORMAL transition state, not a corner: γ1's
+# recipe re-runs cap-tainted fixtures, so a post-σ re-run writes keyed cells
+# beside older keyless ones. Two operator-facing surfaces, built inside one
+# function from one input, contradicting each other about one quantity is exactly
+# what ``report.py``:334-340 and ``metrics.py`` assert three times over must not
+# happen — "two consumers of one field must not answer the same question
+# differently".
+
+
+def _report_entries(results):
+    """The report layer's per-config accumulator, keyed by ``config_name``."""
+    from orchestrator.evals.report import build_plan_quality_report
+
+    return {c['config_name']: c for c in build_plan_quality_report(results)['configs']}
+
+
+def _summary_rows(results):
+    """The driver's per-candidate summary rows, keyed by ``config_name``."""
+    return {r['config_name']: r for r in mod.summarize_candidates(results)}
+
+
+def _cap_tainted_keyless_corpus():
+    """Two admitted keyed cells (one judged blind) + one PRE-σ cap-tainted cell.
+
+    The minimal corpus on which the two surfaces diverged: everything in the
+    ADMITTED pool is measured, so the report layer answers ``1``; the only
+    keyless cell is the one that never entered that pool.
+    """
+    return [
+        _cell('f1', 'A', plan_quality=0.8, plan_steps=5,
+              extra_metrics={mod.MARKER_KEY: True}),
+        _cell('f2', 'A', plan_quality=0.6, plan_steps=5,
+              extra_metrics={mod.MARKER_KEY: False}),
+        _cell('f3', 'A', plan_steps=5, cap_tainted=True,
+              invocation_error='architect: cap_hit', drop_metrics=_PRE_SIGMA),
+    ]
+
+
+def test_a_keyless_cap_tainted_cell_does_not_poison_the_summary():
+    """THE reproduction, kept as the agreement pin between the two surfaces.
+
+    THE POPULATION RULE: a cap-tainted cell has NO ``plan_quality`` to bound, so
+    its keylessness cannot make the candidate's bound unknown. It never entered
+    the admitted pool the count describes, and it is already counted —
+    disjointly — by ``cap_excluded``. Nothing is hidden by declining to poison
+    here: :func:`band_for_cell` still bands that very cell ``unmeasured`` at rung
+    1, per cell, where the question asked is a different one.
+    """
+    results = _cap_tainted_keyless_corpus()
+    assert mod.MARKER_KEY not in results[2].metrics, (
+        'premise: this cell is keyless on purpose (drop_metrics=_PRE_SIGMA)'
+    )
+
+    entry = _report_entries(results)['A']
+    row = _summary_rows(results)['A']
+
+    assert row[mod.MARKER_KEY] == entry['judged_without_reference'] == 1
+    assert (
+        row[mod.UNMEASURED_CELLS_KEY]
+        == entry['judged_without_reference_unmeasured']
+        == 0
+    )
+
+
+def test_a_keyless_admitted_cell_still_reads_unmeasured_on_both_surfaces():
+    """ANTI-OVERCORRECTION: the ``None`` direction must survive the fix.
+
+    A keyless cell INSIDE the admitted pool did contribute a ``plan_quality`` to
+    the candidate's aggregate, and nothing measured whether a reference bounded
+    it — so the bound is genuinely unknown and both surfaces must say so. Without
+    this pin the fix could degenerate into "always report a number", which is the
+    fabricated ``0`` the whole marker exists to prevent.
+    """
+    results = _mixed_marker_results()
+
+    entry = _report_entries(results)['A']
+    row = _summary_rows(results)['A']
+
+    assert row[mod.MARKER_KEY] is entry['judged_without_reference'] is None
+    assert (
+        row[mod.UNMEASURED_CELLS_KEY]
+        == entry['judged_without_reference_unmeasured']
+        == 1
+    )
+
+
+@pytest.mark.parametrize('corpus', [_mixed_results, _mixed_marker_results],
+                         ids=['mixed_results', 'mixed_marker_results'])
+def test_both_marker_values_agree_with_the_report_layer(corpus):
+    """Field for field, over every corpus this module already builds.
+
+    THE pin that stops the two accumulators drifting again — and it is cheap to
+    extend when a future corpus is added, which is the point of parametrizing it
+    rather than asserting on one fixture.
+    """
+    results = corpus()
+
+    entries = _report_entries(results)
+    rows = _summary_rows(results)
+
+    assert set(rows) == set(entries)
+    for name, row in rows.items():
+        entry = entries[name]
+        assert row[mod.MARKER_KEY] == entry['judged_without_reference'], (
+            f'{name}: marker count drifted from the report layer'
+        )
+        assert (
+            row[mod.UNMEASURED_CELLS_KEY]
+            == entry['judged_without_reference_unmeasured']
+        ), f'{name}: unmeasured-cell count drifted from the report layer'
+
+
+def test_an_empty_admitted_pool_answers_zero_on_both_surfaces():
+    """A vacuous pool reports ``0``, identically, and visibly is not a quality claim.
+
+    The single cell is cap-tainted but KEYED, so keylessness is not the variable:
+    what is pinned is that "no admitted cell was judged blind" over an empty pool
+    is a deliberate ``0`` rather than an accident of which surface answered.
+    ``mean_plan_quality is None`` is asserted alongside so the ``0`` cannot be
+    read as a claim about quality — nothing scored at all.
+    """
+    results = [
+        _cell('f1', 'A', plan_steps=5, cap_tainted=True,
+              invocation_error='architect: cap_hit',
+              extra_metrics={mod.MARKER_KEY: False}),
+    ]
+
+    entry = _report_entries(results)['A']
+    row = _summary_rows(results)['A']
+
+    assert row[mod.MARKER_KEY] == entry['judged_without_reference'] == 0
+    assert (
+        row[mod.UNMEASURED_CELLS_KEY]
+        == entry['judged_without_reference_unmeasured']
+        == 0
+    )
+    assert row['mean_plan_quality'] is entry['mean_plan_quality'] is None
+
+
+def test_the_rendered_fraction_quotes_one_population():
+    """``unmeasured (N of M cells)`` must not mix an admitted N with an all-cells M.
+
+    ``architect-opus-max`` in :func:`_mixed_results` has 3 architect cells but
+    only 2 admitted ones, and every cell is keyless — so the numerator (keyless
+    ADMITTED cells) is 2 and the denominator must be ``n``, not ``total``.
+    Rendering ``3 of 3`` would quote a numerator from one population against a
+    denominator from another and overstate how much of the admitted pool went
+    unmeasured. Asserted on the NUMBERS in that candidate's own line, not on the
+    surrounding prose, and not on the whole report — ``architect-fable-high``
+    legitimately reads ``3 of 3`` (n == total == 3 there).
+    """
+    report = {'candidates': mod.summarize_candidates(_mixed_results())}
+
+    text = mod.format_campaign_report(report)
+
+    line = next(
+        line for line in text.splitlines()
+        if line.startswith('architect-opus-max')
+    )
+    assert '2 of 2' in line, line
+    assert '3 of 3' not in line, line
+
+
 # ===== step 17: --results-dir must not silently absorb out-of-campaign cells =====
 #
 # Not hypothetical. ``save_result`` (runner.py:1370) writes into the SHARED
