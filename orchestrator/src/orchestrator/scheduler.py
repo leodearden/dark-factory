@@ -1696,11 +1696,28 @@ class Scheduler:
         # config object and so carries only a module default (:591-593), which
         # makes this construction site the single seam where the
         # ``backfill_min_samples`` leaf becomes live — hard-coding it would
-        # leave an operator's edit silently inert.  ``window`` and
-        # ``stale_open_secs`` stay at their module defaults on purpose: C7 names
-        # only the sample floor, and adding unrequested knobs widens the config
-        # surface for no contract.
-        self._hold_history = HoldHistory(min_samples=self.config.backfill_min_samples)
+        # leave an operator's edit silently inert.
+        #
+        # It is passed as a PROVIDER, not a value, because the leaf is declared
+        # green-tier (config.py:5045): ``apply_reload`` writes the new floor
+        # into this same config object in place, and a value captured here
+        # would be frozen for the process era — reload_config would report the
+        # leaf applied while the predictor kept certifying from the old floor.
+        # A pull (resolved inside each ``predicted_hold``) matches the house
+        # contract every other reloadable consumer honours — ``_backfill_admission``
+        # reads ``self.config.X`` at call time — so no reload hook has to exist;
+        # a push would have to be re-issued at every entry point and
+        # ``HoldHistory.predicted_remaining`` calls ``predicted_hold``
+        # INTERNALLY, so a push discipline would silently miss that path.  The
+        # lambda closes over ``self``, not ``self.config``, so a wholesale
+        # config replacement is picked up too, not merely an in-place leaf write.
+        #
+        # ``window`` and ``stale_open_secs`` stay at their module defaults on
+        # purpose: C7 names only the sample floor, and adding unrequested knobs
+        # widens the config surface for no contract.
+        self._hold_history = HoldHistory(
+            min_samples=lambda: self.config.backfill_min_samples
+        )
         # EASY-backfill grant bookkeeping (task 3823 / PRD C7).  One entry per
         # live back-filled dispatch, popped at release when the realized hold
         # is judged against the bound admission promised.  The two totals are
