@@ -27,9 +27,13 @@ plans/evidence/scheduler-scoring-2026-08-06/PARKING_MODEL_REPORT.md
 
 from __future__ import annotations
 
+import ast
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
+from _recording_event_store import _RecordingEventStore
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.scheduler import Scheduler
@@ -57,7 +61,9 @@ class _Clock:
         return self.now
 
 
-def _make_scheduler(*, clock: _Clock | None = None, **config_overrides) -> Scheduler:
+def _make_scheduler(
+    *, clock: _Clock | None = None, event_store=None, **config_overrides
+) -> Scheduler:
     """A bare Scheduler on a frozen (or caller-driven) wall clock.
 
     ``max_per_module=1`` matches the shape the parking model measured (one
@@ -67,7 +73,11 @@ def _make_scheduler(*, clock: _Clock | None = None, **config_overrides) -> Sched
     all, and overriding it must not raise a duplicate-kwarg TypeError.
     """
     config = OrchestratorConfig(**{'max_per_module': 1, **config_overrides})
-    return Scheduler(config, wall_time_source=clock or (lambda: FIXED_DT))
+    return Scheduler(
+        config,
+        wall_time_source=clock or (lambda: FIXED_DT),
+        event_store=event_store,
+    )
 
 
 def _task(task_id: str, files: list[str]) -> dict:
@@ -657,3 +667,384 @@ def test_two_blocking_parks_refuse_when_only_one_of_them_qualifies():
     # conjunction talking, not a broken scenario.
     only_p1, task, modules = _build(with_second_park=False)
     assert only_p1._backfill_admission('c', task, modules) is not None
+
+
+# ===========================================================================
+# Boundary row 8: the whole predicate through the REAL dispatch scan
+# ===========================================================================
+#
+# Everything above tests the pieces in isolation.  These drive
+# ``acquire_next()`` on a scheduler with a real ModuleLockTable, a real
+# TickContext and a recording event store, so the wiring itself — the second
+# try_acquire, the grant emission, and everything the backfill must NOT
+# disturb — is what is under test.
+#
+# The world each case builds is C7's own scenario:
+#
+#   h  holds  GAP_MODULE, with 900s provably left
+#   p  a high-priority STARVER, parked on [c's module, GAP_MODULE] 60s ago,
+#      unable to assemble because h holds GAP_MODULE
+#   c  a low-priority narrow candidate wanting only its own module, blocked
+#      solely by p's park, predicted hold 100s -> bound 250s
+#
+# p must be a real task in the candidate list, not just a park owner: the
+# park-GC phase evicts any park whose owner is missing from tasks_by_id, so a
+# synthetic owner would be gone before the scored phase ever ran.
+
+PARK_OWNER_FILES = ['pkg_c/src/pkg_c/thing.py', 'gapmod/src/gapmod/held.py']
+# A SECOND candidate module that p is NOT parked on, used only by the INV-3
+# case.  It has to be outside p's park set: an occupier sitting on p's own
+# parked module would also shrink p's provable gap — correctly, and all the
+# way past the bound, since c's predicted hold is the median of that very
+# module and the safety factor then guarantees bound > gap.  Admission would
+# refuse on the arithmetic and never reach the lock gate the test is about.
+OCCUPIED_FILES = ['pkg_d/src/pkg_d/busy.py']
+
+
+def _scored_world(
+    scheduler: Scheduler,
+    clock: _Clock,
+    *,
+    candidate_spans: tuple[float, ...] = CANDIDATE_SPANS,
+    park_age: float = 60.0,
+    occupier: bool = False,
+) -> list[dict]:
+    """Build C7's dispatch scenario; return the candidate task list.
+
+    ``occupier=True`` widens the candidate to a SECOND module — one p is not
+    parked on — and puts a real foreign HOLDER there, so admission still
+    passes but ``try_acquire`` must refuse: the INV-3 case.
+    """
+    candidate_files = list(CANDIDATE_FILES) + (OCCUPIED_FILES if occupier else [])
+    candidate = _task('c', candidate_files)
+    candidate['priority'] = 'low'
+    starver = _task('p', PARK_OWNER_FILES)
+    starver['priority'] = 'high'
+    modules = scheduler._get_modules(candidate)
+
+    assert scheduler.lock_table.try_acquire('h', GAP_MODULES)
+    if occupier:
+        occupied = scheduler._get_modules(_task('occupier', OCCUPIED_FILES))
+        assert scheduler.lock_table.try_acquire('occupier', occupied)
+
+    clock.now = FIXED_DT - timedelta(seconds=park_age)
+    scheduler.lock_table.install_parks('p', scheduler._get_modules(starver), 'high')
+    clock.now = FIXED_DT
+
+    if candidate_spans:
+        _feed_spans(scheduler, modules, list(candidate_spans))
+    _feed_spans(scheduler, GAP_MODULES, list(GAP_SPANS))
+    scheduler._hold_history.observe_acquired(
+        'h', GAP_MODULES, at=FIXED_DT.timestamp() - 100.0
+    )
+    return [candidate, starver]
+
+
+def _events(store, name: str) -> list[dict]:
+    """Payloads of every recorded event whose type string ends in *name*."""
+    return [
+        payload
+        for event_type, payload in store.events
+        if event_type.split('.')[-1] == name or event_type == name
+    ]
+
+
+@pytest.mark.asyncio
+async def test_backfill_dispatches_the_candidate_and_emits_one_grant():
+    """The grant path end to end, through the real scored scan."""
+    clock = _Clock()
+    store = _RecordingEventStore()
+    scheduler = _make_scheduler(clock=clock, event_store=store)
+    scheduler.finish_startup()
+    tasks = _scored_world(scheduler, clock)
+    scheduler.get_tasks = AsyncMock(return_value=tasks)
+
+    assignment = await scheduler.acquire_next()
+
+    assert assignment is not None, 'the backfiller must actually dispatch'
+    assert assignment.task_id == 'c'
+
+    grants = _events(store, 'park_backfill_granted')
+    assert len(grants) == 1, f'expected exactly one grant event, got {grants}'
+    assert grants[0]['task_id'] == 'c'
+    data = grants[0]['data']
+    assert data['predicted_hold'] == pytest.approx(100.0)
+    assert data['safety_factor'] == pytest.approx(2.5)
+    assert data['admission_bound'] == pytest.approx(250.0)
+    assert data['provable_assembly_delay'] == pytest.approx(900.0)
+    assert data['park_owners'] == ['p']
+    assert data['modules'] == list(scheduler._get_modules(tasks[0]))
+
+
+@pytest.mark.asyncio
+async def test_a_backfilled_dispatch_still_routes_through_the_lock_chokepoint():
+    """lock_acquired fires and the predictor sees the acquire.
+
+    The backfill changes the try_acquire CALL, never the emit, so the
+    single-writer guard stays green and the grant's own hold is itself
+    measured — which is what makes the overstay rate observable at all.
+    """
+    clock = _Clock()
+    store = _RecordingEventStore()
+    scheduler = _make_scheduler(clock=clock, event_store=store)
+    scheduler.finish_startup()
+    tasks = _scored_world(scheduler, clock)
+    scheduler.get_tasks = AsyncMock(return_value=tasks)
+
+    assignment = await scheduler.acquire_next()
+    assert assignment is not None
+
+    acquired = [e for e in _events(store, 'lock_acquired') if e['task_id'] == 'c']
+    assert len(acquired) == 1, 'the backfilled dispatch must emit lock_acquired'
+    assert scheduler._hold_history.open_modules('c') == list(
+        scheduler._get_modules(tasks[0])
+    ), 'the predictor must see a backfilled acquire like any other'
+
+
+@pytest.mark.asyncio
+async def test_a_candidate_with_no_history_does_not_backfill():
+    """No samples → no dispatch, no grant.  An empty history refuses."""
+    clock = _Clock()
+    store = _RecordingEventStore()
+    scheduler = _make_scheduler(clock=clock, event_store=store)
+    scheduler.finish_startup()
+    tasks = _scored_world(scheduler, clock, candidate_spans=())
+    scheduler.get_tasks = AsyncMock(return_value=tasks)
+
+    assignment = await scheduler.acquire_next()
+
+    assert assignment is None
+    assert _events(store, 'park_backfill_granted') == []
+
+
+@pytest.mark.asyncio
+async def test_a_park_older_than_the_cutoff_does_not_admit_a_backfiller():
+    """The age clause holds through the real scan, not just in the predicate."""
+    clock = _Clock()
+    store = _RecordingEventStore()
+    scheduler = _make_scheduler(clock=clock, event_store=store)
+    scheduler.finish_startup()
+    tasks = _scored_world(scheduler, clock, park_age=3601.0)
+    scheduler.get_tasks = AsyncMock(return_value=tasks)
+
+    assignment = await scheduler.acquire_next()
+
+    assert assignment is None
+    assert _events(store, 'park_backfill_granted') == []
+
+
+@pytest.mark.asyncio
+async def test_try_acquire_not_admission_is_the_acting_basis():
+    """INV-3: admission passes, a real HOLDER occupies the module, no dispatch.
+
+    The scoring-time read is advisory — the lock layer decides.  Admission
+    deliberately does not precompute "c's modules are otherwise free"; it
+    lets the untouched limit gate on the second try_acquire answer that on
+    live state.  So an admitted-but-contended candidate costs one failed
+    acquire and emits NOTHING, rather than producing a grant record for a
+    borrow that never happened.
+    """
+    clock = _Clock()
+    store = _RecordingEventStore()
+    scheduler = _make_scheduler(clock=clock, event_store=store)
+    scheduler.finish_startup()
+    tasks = _scored_world(scheduler, clock, occupier=True)
+    scheduler.get_tasks = AsyncMock(return_value=tasks)
+    candidate, modules = tasks[0], scheduler._get_modules(tasks[0])
+
+    # The predicate itself is happy — it is the lock layer that refuses.
+    assert scheduler._backfill_admission('c', candidate, modules) is not None
+
+    assignment = await scheduler.acquire_next()
+
+    assert assignment is None
+    assert _events(store, 'park_backfill_granted') == []
+
+
+@pytest.mark.asyncio
+async def test_the_backfiller_borrows_the_park_it_does_not_consume_it():
+    """Backfill leaves p's park exactly as it found it.
+
+    Not a preemption and not a reservation use: p keeps its park, its
+    modules and its rank, and ``reservation_used`` stays reserved for an
+    owner consuming its OWN park.  The park-consumption branch in the scored
+    loop is by construction never reached by a backfiller.
+    """
+    clock = _Clock()
+    store = _RecordingEventStore()
+    scheduler = _make_scheduler(clock=clock, event_store=store)
+    scheduler.finish_startup()
+    tasks = _scored_world(scheduler, clock)
+    scheduler.get_tasks = AsyncMock(return_value=tasks)
+    stacks_before = scheduler.lock_table.snapshot_park_stacks()
+
+    assignment = await scheduler.acquire_next()
+    assert assignment is not None and assignment.task_id == 'c'
+
+    assert [e for e in _events(store, 'reservation_used') if e['task_id'] == 'p'] == []
+    parks = scheduler.lock_table.snapshot_parks()
+    assert 'p' in parks, 'the park must survive the backfill'
+    assert scheduler._get_modules(tasks[0])[0] in parks['p']['modules']
+    assert scheduler.lock_table.snapshot_park_stacks() == stacks_before, (
+        'ranks and stack order are untouched — backfill borrows, it never evicts'
+    )
+
+
+# ===========================================================================
+# PRD section 7 rejection guards — what this task deliberately did NOT build
+# ===========================================================================
+#
+# Two mechanisms were rejected on measured grounds and must STAY rejected.  A
+# later reader with the backfill machinery in front of them has every reason
+# to think "while we're here, park below rank 1" or "parks should expire" is
+# the natural next move; these make that drift loud instead of silent.
+#
+# AST, not text grep: a call can span lines, and the enclosing function is
+# exactly what each invariant is about.
+
+_SRC_DIR = Path(__file__).parent.parent / 'src'
+
+
+def _enclosing_function_ranges(tree: ast.Module) -> list[tuple[str, int, int]]:
+    """``(name, lineno, end_lineno)`` for every function/method in *tree*."""
+    return [
+        (node.name, node.lineno, node.end_lineno or node.lineno)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+
+
+def _call_sites(path: Path, method_name: str) -> list[tuple[str, int, str]]:
+    """``(file, line, enclosing function)`` for each ``….<method_name>(…)``."""
+    tree = ast.parse(path.read_text())
+    ranges = _enclosing_function_ranges(tree)
+    sites: list[tuple[str, int, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and func.attr == method_name):
+            continue
+        # A method DEFINITION is not a call site; only Call nodes reach here.
+        enclosing = [name for name, lo, hi in ranges if lo <= node.lineno <= hi]
+        sites.append((path.name, node.lineno, enclosing[-1] if enclosing else '<module>'))
+    return sites
+
+
+def _emit_sites(path: Path, event_name: str) -> list[tuple[str, int, str]]:
+    """``(file, line, enclosing function)`` for each ``…emit(EventType.<event>…)``."""
+    tree = ast.parse(path.read_text())
+    ranges = _enclosing_function_ranges(tree)
+    sites: list[tuple[str, int, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and func.attr == 'emit'):
+            continue
+        args = list(node.args) + [kw.value for kw in node.keywords if kw.arg == 'event_type']
+        for arg in args:
+            if (
+                isinstance(arg, ast.Attribute)
+                and arg.attr == event_name
+                and isinstance(arg.value, ast.Name)
+                and arg.value.id == 'EventType'
+            ):
+                enclosing = [name for name, lo, hi in ranges if lo <= node.lineno <= hi]
+                sites.append((path.name, node.lineno, enclosing[-1] if enclosing else '<module>'))
+    return sites
+
+
+def test_backfill_installs_no_park():
+    """``install_parks`` keeps exactly its two pre-existing callers.
+
+    Below-rank-1 park INSTALLATION is rejected by PRD section 7 on measured
+    grounds.  Backfill grants a candidate passage through an existing park;
+    it must never create one, or the park population — the thing the parking
+    model measured — changes shape underneath the evidence.
+    """
+    sites = [
+        site
+        for path in sorted(_SRC_DIR.rglob('*.py'))
+        for site in _call_sites(path, 'install_parks')
+    ]
+
+    assert sorted(fn for _f, _l, fn in sites) == [
+        '_bump_skip_and_maybe_park',
+        '_phase_reserve_now',
+    ], f'install_parks callers changed: {sites}'
+
+
+def test_backfill_adds_no_park_lease_or_expiry():
+    """``reservation_expired`` still has exactly one emit site, in park GC.
+
+    Park leases were removed deliberately (task 1228) and PRD section 7
+    rejects reintroducing them.  ``park_age_secs`` is a READ used to REFUSE
+    an admission — it must never become a reason to evict.  A second emit
+    site would mean wall-clock park death came back in through this door.
+    """
+    sites = [
+        site
+        for path in sorted(_SRC_DIR.rglob('*.py'))
+        for site in _emit_sites(path, 'reservation_expired')
+    ]
+
+    assert len(sites) == 1, f'expected one reservation_expired emit site, got {sites}'
+    assert sites[0][2] == '_phase_park_gc', (
+        f'reservation_expired emitted from {sites[0][2]}: park eviction stays '
+        f'owner-state-driven, never wall-clock-driven'
+    )
+
+
+def test_the_pin_loop_is_not_given_backfill():
+    """``_phase_select_pins`` still calls plain ``try_acquire``.
+
+    C7 anchors on the scored loop.  Pins already bypass fairness entirely, so
+    admitting them through parks as well would hand the one path with no
+    fairness accounting a second override — and the safety factor exists
+    precisely to bound what the scored loop borrows.
+    """
+    tree = ast.parse((_SRC_DIR / 'orchestrator' / 'scheduler.py').read_text())
+    pins = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == '_phase_select_pins'
+    ]
+    assert len(pins) == 1, 'expected exactly one _phase_select_pins definition'
+
+    acquires = [
+        node
+        for node in ast.walk(pins[0])
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr.startswith('try_acquire')
+    ]
+    assert acquires, 'meta: the pin loop must still take locks at all'
+    for call in acquires:
+        assert not [kw for kw in call.keywords if kw.arg == 'admitted_parks'], (
+            f'_phase_select_pins line {call.lineno} passes admitted_parks — '
+            f'backfill is scoped to the scored loop'
+        )
+
+
+def test_the_ast_scanners_can_actually_find_their_targets(tmp_path):
+    """Meta-test: a scanner that finds nothing would pass every guard above.
+
+    The probe goes in ``tmp_path``, never in the tests tree: this suite runs
+    under pytest-xdist, so a fixed shared path is a race, and a hard interrupt
+    mid-test would strand an untracked .py file where the guards' own rglob
+    would find it.
+    """
+    probe = tmp_path / '_backfill_guard_probe.py'
+    probe.write_text(
+        'from x import EventType\n'
+        'def f(self):\n'
+        '    self.lock_table.install_parks(\n'
+        '        "A", ["m"], "high")\n'
+        '    self.event_store.emit(\n'
+        '        EventType.reservation_expired, task_id="A", data={})\n'
+    )
+
+    assert [(line, fn) for _f, line, fn in _call_sites(probe, 'install_parks')] == [(3, 'f')]
+    assert [(line, fn) for _f, line, fn in _emit_sites(probe, 'reservation_expired')] == [(5, 'f')]
