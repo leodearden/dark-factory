@@ -3444,6 +3444,91 @@ def test_main_lease_release_removes_the_file(
     assert not lease_path.exists()
 
 
+# --- CLI holder_liveness orphan signal (task 3994 defect 4) ---------------
+
+
+def _contend_via_cli(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], *, holder_pid: int
+) -> list[str]:
+    """Seed a lease held by watcher-df-100/holder_pid, contend it, return stdout lines."""
+    sr.main(['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-100', '--pid', str(holder_pid)])
+    capsys.readouterr()
+    rc = sr.main(
+        ['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-200', '--pid', str(os.getpid())]
+    )
+    assert rc == 0
+    return capsys.readouterr().out.splitlines()
+
+
+def test_main_lease_claim_orphan_signal_is_additive_after_decision(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    lines = _contend_via_cli(tmp_path, capsys, holder_pid=os.getpid())
+
+    # `decision=` STAYS line 1 and the message line 2, so a skill parser that
+    # reads only the first two lines is provably unaffected by the addition.
+    assert lines[0] == 'decision=stand-down'
+    assert lines[1].startswith('lease held by watcher-df-100')
+    assert lines[2] == 'holder_liveness=held'
+
+
+def test_main_lease_claim_reports_orphaned_for_a_dead_pid_with_no_record(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    lines = _contend_via_cli(tmp_path, capsys, holder_pid=_DEAD_PID)
+
+    assert lines[0] == 'decision=stand-down'
+    assert lines[-1] == 'holder_liveness=orphaned'
+
+
+def test_main_lease_claim_reports_orphaned_for_a_dead_pid_with_an_exited_record(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    sr.write_record(
+        _make_record(session_slug='watcher-df-100', status=sr.Status.EXITED), root=tmp_path
+    )
+
+    lines = _contend_via_cli(tmp_path, capsys, holder_pid=_DEAD_PID)
+
+    assert lines[-1] == 'holder_liveness=orphaned'
+
+
+def test_main_lease_claim_reports_held_for_a_dead_pid_with_a_live_record(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    sr.write_record(
+        _make_record(session_slug='watcher-df-100', status=sr.Status.RUNNING), root=tmp_path
+    )
+
+    lines = _contend_via_cli(tmp_path, capsys, holder_pid=_DEAD_PID)
+
+    # The pid may be a stale write; with a live record, do NOT cry orphan.
+    assert lines[-1] == 'holder_liveness=held'
+
+
+def test_main_lease_claim_reports_held_for_an_unreadable_lease_body(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    lease_path.parent.mkdir(parents=True, exist_ok=True)
+    lease_path.write_text('{not valid json')
+
+    rc = sr.main(
+        ['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-200', '--pid', str(os.getpid())]
+    )
+
+    assert rc == 0
+    # 'unknown' must never be promoted to an orphan finding: fail toward held.
+    assert capsys.readouterr().out.splitlines()[-1] == 'holder_liveness=held'
+
+
 # --- resolve_session_pid (task 3994 defect 2) ------------------------------
 
 
