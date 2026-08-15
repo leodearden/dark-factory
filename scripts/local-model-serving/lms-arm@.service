@@ -1,0 +1,44 @@
+[Unit]
+# PRD-MARKER:local-memory-models-eval serving
+# Task 3713 (LME-alpha).  One instance per arm; %i is the arm_id as spelled in
+# scripts/local-model-serving/arms.yaml.  Copied VERBATIM by
+# install-lms-units.sh -- %i is expanded by systemd itself at instantiation,
+# so nothing here is ever per-arm customized.
+Description=Local model serving arm %i (LME-alpha)
+Documentation=file:///home/leo/src/dark-factory/plans/local-memory-models-eval-prd.md
+
+# Deliberately NO PartOf=graphical-session.target: an arm must survive a
+# desktop restart.  These units hold multi-GB model weights that take minutes
+# to load, and tying them to the session would drop a mid-eval arm silently.
+After=docker.service
+
+[Service]
+Type=exec
+WorkingDirectory=/home/leo/src/dark-factory
+ExecStart=/home/leo/.local/bin/uv run --project shared python scripts/local-model-serving/lms_serve.py %i
+
+# The launcher execs `docker run` in the FOREGROUND, so this is the container.
+# `docker stop` is still required: killing the client does not stop the
+# container, which would keep the GPU allocated with no unit to show for it.
+# The name must match lms_serve.ArmEntry.container_name.
+ExecStop=/usr/bin/docker stop lms-arm-%i
+
+# Restart=no is a deliberate safety property, not an oversight.  A restart
+# policy on a GPU-holding unit is actively harmful on a single shared 3090: an
+# arm that OOMs would thrash the card in a restart loop, starving
+# whisper-writer (Leo's binding coexistence requirement, PRD D10) and
+# corrupting any concurrent arm's latency measurements.  A dead arm should stay
+# dead and visible in `systemctl --user status`.
+Restart=no
+
+# Weight load from a cold page cache is minutes, not seconds: ~14 GB of AWQ
+# weights plus CUDA graph capture.  A short default would kill an arm that was
+# loading correctly and report it as a startup failure.
+TimeoutStartSec=900
+TimeoutStopSec=120
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

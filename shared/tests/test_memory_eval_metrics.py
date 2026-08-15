@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -30,6 +31,7 @@ from shared.memory_eval_metrics import (
     report_artifact_path,
     run_stamp,
     validate_metric_series,
+    validate_stamp,
     write_metric_series,
 )
 
@@ -641,6 +643,25 @@ class TestStampShapeIsEnforcedNotAssumed:
         with pytest.raises(MetricSchemaError):
             validate_metric_series(_make_series(run_stamp='٢٠٢٦٠٧٠٤T٠٣١٥٠٠Z'))
 
+    def test_the_public_checker_returns_the_stamp_it_accepted(self):
+        """Pinned directly, because it is exported and called cross-package.
+
+        Every other assertion here reaches ``validate_stamp`` through a caller
+        that discards its return value, so all of them would still pass if it
+        started returning ``None`` or a normalized copy — and a cross-package
+        caller that uses it as a pass-through (``path = validate_stamp(s, ...)``)
+        would break silently. The contract is: the input object, unchanged.
+        """
+        stamp = '20260704T031500Z'
+        assert validate_stamp(stamp, what='a stamp') == stamp
+
+    def test_the_what_label_reaches_the_message(self):
+        # The whole point of a caller-supplied `what=`: the raiser names WHICH
+        # stamp was bad, so an out-of-module caller's failure is actionable
+        # without a traceback into this module.
+        with pytest.raises(MetricSchemaError, match='my-label'):
+            validate_stamp('2026-07-04T03:15:00Z', what='my-label')
+
     def test_a_well_formed_stamp_still_passes_everywhere(self, tmp_path):
         # The guard must not be so tight that the real thing fails: one stamp
         # through all four boundaries.
@@ -654,3 +675,50 @@ class TestStampShapeIsEnforcedNotAssumed:
             )
             != []
         )
+
+
+class TestDelegatesToSharedAtomicWriter:
+    """``_atomic_write_text`` delegates to ``shared.safe_io.atomic_write_text``.
+
+    Task 3223 consolidated four byte-identical copies of the tmp+rename writer
+    into ``shared.safe_io``.  These pin that this module's helper is now a
+    delegation preserving the exact semantics it had when inlined: the
+    ``tempfile.mkstemp``-created 0600 mode, utf-8, no fsync and no mkdir.
+    """
+
+    def test_delegates_with_preserved_semantics(self, tmp_path, monkeypatch):
+        """One delegated call, carrying this site's exact per-axis semantics."""
+        import shared.safe_io as _safe_io
+        from shared.memory_eval_metrics import _atomic_write_text
+
+        calls = []
+
+        def recorder(path, text, **kwargs):
+            calls.append((path, text, kwargs))
+
+        monkeypatch.setattr(_safe_io, 'atomic_write_text', recorder)
+
+        target = tmp_path / 'artifact.json'
+        _atomic_write_text(target, '{"a": 1}')
+
+        assert len(calls) == 1, f'expected exactly one delegated call, got {calls}'
+        path, text, kwargs = calls[0]
+        assert Path(path) == target
+        assert text == '{"a": 1}'
+        assert kwargs.get('mode') == 0o600, 'mkstemp created 0600; must not widen'
+        assert kwargs.get('encoding') == 'utf-8'
+        assert not kwargs.get('fsync'), 'this site never fsynced'
+        assert not kwargs.get('mkdir'), 'this site never created its parent'
+
+    def test_real_write_lands_0600_utf8(self, tmp_path):
+        """End-to-end: the delegated write still produces a 0600 utf-8 file."""
+        from shared.memory_eval_metrics import _atomic_write_text
+
+        target = tmp_path / 'artifact.json'
+        payload = '{"note": "h\u00e9llo \u2014 w\u00f6rld"}'
+        _atomic_write_text(target, payload)
+
+        assert target.read_text(encoding='utf-8') == payload
+        assert target.read_bytes() == payload.encode('utf-8')
+        assert target.stat().st_mode & 0o777 == 0o600
+        assert sorted(q.name for q in tmp_path.iterdir()) == ['artifact.json']

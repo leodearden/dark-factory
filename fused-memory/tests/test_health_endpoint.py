@@ -294,7 +294,11 @@ async def test_delete_memory_valid_store_passes_through(mcp_server):
     for valid_store in ('graphiti', 'mem0'):
         result = await mcp_server._tool_manager.call_tool(
             'delete_memory',
-            {'memory_id': 'abc-123', 'store': valid_store, 'project_id': 'proj'},
+            {
+                'memory_id': '00000000-0000-4000-8000-00000000000c',
+                'store': valid_store,
+                'project_id': 'proj',
+            },
         )
         # Should NOT be a validation error
         if isinstance(result, dict) and 'error' in result:

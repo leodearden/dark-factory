@@ -560,7 +560,7 @@ def test_api_curator_runs_fanout_and_db_concurrently(tmp_path: Path):
         sparks_started.set()
         return _empty_sparks
 
-    async def _mock_mcp(http_client, url, tool, arguments):
+    async def _mock_mcp(http_client, url, tool, arguments, **kwargs):
         nonlocal mcp_timed_out
         try:
             await asyncio.wait_for(sparks_started.wait(), timeout=2.0)
@@ -607,7 +607,7 @@ def test_api_curator_uses_LIST_TICKETS_LIMIT_constant(tmp_path: Path, monkeypatc
 
     captured: dict = {}
 
-    async def _mock_mcp(client, base_url, tool_name, arguments):
+    async def _mock_mcp(client, base_url, tool_name, arguments, **kwargs):
         captured['limit'] = arguments.get('limit')
         return {'project_id': 'p', 'count': 0, 'tickets': []}
 

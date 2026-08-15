@@ -543,6 +543,12 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   per-queue id namespace instead of matching an unrelated same-named orchestrator escalation.
   Stored normalized, so any spelling of the same directory works. Omitting it files a queue-less
   record — see the hazard note below.
+  There is a third value the field can hold: `<unknown>` (`session_registry.UNKNOWN_QUEUE`) —
+  "this record's owning queue was investigated and could not be determined". You never write it;
+  task 3640's back-fill did, for legacy records whose escalation id resolved in several queues at
+  once. It is **not** a respelling of the queue-less `''` state: `''` means *nobody told us* and
+  falls back to project-only scoping, while `<unknown>` means *we looked and could not tell* and
+  the reaper refuses to close it at all.
 - The verb always files `state=open` and is fail-soft (a registry fault is logged and swallowed,
   never raised) — filing a decision can never crash the watch loop or block the "leave pending"
   action itself.
@@ -575,7 +581,25 @@ decision vanishes from the cockpit queue while its own escalation is still pendi
 Passing `--escalations-dir` on `write-decision` is what makes the reaper skip cross-queue records:
 it stamps the owning queue on the decision, and a reaper scanning a *different* queue leaves that
 decision alone. Keep the two dirs straight regardless — a queue-less legacy record (filed before
-that flag existed) falls back to project-only scoping and has no such protection.
+that flag existed) falls back to project-only scoping and has no such protection. Task 3640
+**back-filled** that pre-existing open population, so the unprotected set is now drained rather
+than merely shrinking — but only for records that existed at back-fill time. A decision you file
+today without the flag lands straight back in it.
+
+**This queue is FLEET-WIDE, and that widens the collision surface.**
+`data/reconciliation/escalations` holds reconciliation escalations for reify, autopilot_video,
+solar_challenge, know_live and pump_web_ui as well as dark_factory. So an `esc-<taskid>-<n>` filed
+here routinely collides with an id in one of *those* projects' own orchestrator queues — e.g.
+`esc-5773-1` exists in both this queue and `reify/data/escalations`. Such collisions are
+**expected, not anomalous**, and they are the reason passing `--escalations-dir` on every
+`write-decision` matters for non-dark_factory projects too: without it, a record filed here is
+false-closable by a reaper running in a project you have never touched.
+
+A decision stamped `<unknown>` is **refused**, not closed: no reaper may close it, and it stays a
+visible cockpit row until a human closes it. The reaper never defaults to closing on doubt — an
+over-held decision is a triageable row, a falsely-closed one is invisible. If unstamped open
+records ever reappear, the re-runnable remedy is `scripts/backfill_decision_queue_stamp.py`
+(dry-run by default; `--verify` exits non-zero while any open record still lacks a stamp).
 
 Two collision modes exist and must not be conflated:
 

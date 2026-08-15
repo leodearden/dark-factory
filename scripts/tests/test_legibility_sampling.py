@@ -785,12 +785,12 @@ class TestStratifiedSampleRealWorldSizes:
                 f'orchestrated task session {name}',
                 6_000_000,
             )
-            for name, score in zip(names, (40, 35, 30, 25, 20))
+            for name, score in zip(names, (40, 35, 30, 25, 20), strict=True)
         ]
 
     def _two_strata(self):
         records = self._single_stratum()[:4]
-        for name, score in zip(('one', 'two', 'three'), (18, 14, 11)):
+        for name, score in zip(('one', 'two', 'three'), (18, 14, 11), strict=True):
             records.append(
                 _scored(
                     f'recon-{name}', 'recon', mod.SignalCounts(not_found=score),
@@ -1195,7 +1195,7 @@ class TestDigestByteCostFn:
         renderer_default = (
             inspect.signature(digest_mod.build_digest).parameters['max_bytes'].default
         )
-        assert mod.DEFAULT_DIGEST_MAX_BYTES == renderer_default
+        assert renderer_default == mod.DEFAULT_DIGEST_MAX_BYTES
 
 
 class TestRenderManifest:

@@ -394,7 +394,7 @@ suffix), so the committed copy is uncompressed for two reasons. First,
 facts are *reviewable* must be readable in a diff, and the line-by-line
 table below is only auditable against a plain file. Second, the
 `gz` extension is absent from the α/γ lock-charter extension allowlist
-(`shared/src/shared/locking.py::CODE_EXTENSIONS`, mirrored in
+(`shared/src/shared/locking.py::FILE_EXTENSIONS`, mirrored in
 `fused_memory.middleware.lock_charter_guard` and reify's
 `scripts/lock-charter-guard.sh`), so committing a tracked `.gz` fails
 `fused-memory/tests/test_lock_charter_guard.py

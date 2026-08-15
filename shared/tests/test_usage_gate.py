@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _capacity_skip import looks_like_capacity_failure
+from _oauth_accounts import available_tokens
 from test_config_dir import PROBE_PREFIX, find_dead_pid, plant
 
 from shared.cli_invoke import AgentResult
@@ -1038,14 +1039,16 @@ class TestProbeConfigDirLeakSweep:
 # together, carrying the same blind spot into two live pytest.skip sites.
 # _capacity_skip is now the single source; see its contract tests in
 # test_capacity_skip.py.
+#
+# The account scan below is single-homed in _oauth_accounts for the same reason,
+# one task later (3700) — and this module is where the drift actually bit: it
+# held the `BCDEF` copy that could not reach CLAUDE_OAUTH_TOKEN_G. Taking the
+# FLEET default (no explicit letters) is the right choice HERE because this gate
+# spends real capacity. Full history, and why A is excluded, in
+# _oauth_accounts' module docstring; contract tests in test_oauth_accounts.py.
 # ---------------------------------------------------------------------------
 
-_TOKEN_ENV_VARS = [f'CLAUDE_OAUTH_TOKEN_{c}' for c in 'BCDEF']
-_AVAILABLE_TOKENS: list[tuple[str, str]] = [
-    (var, os.environ[var])
-    for var in _TOKEN_ENV_VARS
-    if os.environ.get(var)
-]
+_AVAILABLE_TOKENS: list[tuple[str, str]] = available_tokens(os.environ)
 
 _need_one_account = pytest.mark.skipif(
     len(_AVAILABLE_TOKENS) < 1,

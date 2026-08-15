@@ -78,6 +78,16 @@ BORN_AT_L2_SEVERITIES: frozenset[str] = frozenset({'critical', 'urgent'})
 # rather than silently misrouting escalations.
 KNOWN_SEVERITIES: frozenset[str] = frozenset({'info', 'blocking'}) | BORN_AT_L2_SEVERITIES
 
+# Ladder levels an AGENT-side MCP filing (escalate_blocker) may be born at.
+# 0 = agent→steward, 1 = steward re-escalation→escalation-watcher-auto.
+# Level 2 is deliberately excluded: agents must not self-mint an L2 that
+# bypasses the auto-watcher and pages a human.  The legitimate routes to L2
+# are a born-at-L2 *severity* filed by a harness sentinel role (see
+# BORN_AT_L2_SEVERITIES and the agent-role downgrade in server.py) or the
+# promote_to_l2 handler tool.  This mirrors the existing policy that
+# downgrades an agent-filed critical/urgent to 'blocking'.
+AGENT_FILABLE_LEVELS: frozenset[int] = frozenset({0, 1})
+
 # Legal values for Escalation.resolution_class (escalation-lifecycle-dashboard-prd.md
 # Seam 1).  Used to validate the resolve/dismiss chokepoint's optional
 # resolution_class param and return a clear error naming the legal

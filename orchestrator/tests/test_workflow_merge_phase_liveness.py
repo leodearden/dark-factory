@@ -538,7 +538,9 @@ class TestEntryReadCoalescing:
         f.scheduler.get_task.assert_not_awaited()
         # The prefetched blob really drove the comparison (divergent modules
         # at lock_depth=2 -> escalation filed with those metadata files).
-        spy.assert_called_once_with(['pkg/a.py'], ['other/b.py'])
+        # 'pkg/a.py' is not covered by metadata's 'other/b.py' (task 3429:
+        # third positional arg is the uncovered module list).
+        spy.assert_called_once_with(['pkg/a.py'], ['other/b.py'], ['pkg/a.py'])
 
     @pytest.mark.asyncio
     async def test_scope_check_falls_back_to_own_read_when_prefetch_unavailable(self):
@@ -556,7 +558,8 @@ class TestEntryReadCoalescing:
         await f.wf._check_scope_invariant(backend_metadata=None)
 
         f.scheduler.get_task.assert_awaited_once()
-        spy.assert_called_once_with(['pkg/a.py'], ['other/b.py'])
+        # task 3429: third positional arg is the uncovered module list.
+        spy.assert_called_once_with(['pkg/a.py'], ['other/b.py'], ['pkg/a.py'])
 
     @pytest.mark.asyncio
     async def test_scope_check_skips_when_own_read_returns_none(self):
@@ -626,7 +629,10 @@ class TestEntryReadCoalescing:
             f'{reads_at_scope_check}'
         )
         # The shared blob still drove a real comparison, not a skipped one.
-        escalate.assert_called_once_with(['pkg/a.py'], ['other/b.py'])
+        # task 3429: third positional arg is the uncovered module list.
+        escalate.assert_called_once_with(
+            ['pkg/a.py'], ['other/b.py'], ['pkg/a.py'],
+        )
 
 
 # ---------------------------------------------------------------------------

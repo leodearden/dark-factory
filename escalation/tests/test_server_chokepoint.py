@@ -276,11 +276,17 @@ class TestTerminalAutoResolve:
 
     @pytest.mark.asyncio
     async def test_blocker_response_has_only_minimal_keys(self, tmp_path: Path):
-        """escalate_blocker auto-resolve returns exactly {id,status,resolution,resolved_by,action}.
+        """escalate_blocker auto-resolve returns exactly {id,status,resolution,resolved_by,level,action}.
 
         RED on current code: the auto-resolve path returns (resolved or esc).to_dict()
         which is a 20-field Escalation dump. After step-2, the shape is normalized to
-        the minimal four-field contract plus 'action' from the blocker wrapper.
+        the minimal contract plus 'action' from the blocker wrapper.
+
+        Task 3236 adds exactly one field, 'level': the response contract
+        documents 'level' as the way a caller confirms its requested level
+        landed, so omitting it here would leave a caller written to that
+        contract with a KeyError on this branch.  The invariant this pin
+        actually guards — no full-record dump — is unchanged.
         """
         queue = EscalationQueue(tmp_path / 'esc')
         lookup = await _make_lookup('done')
@@ -288,18 +294,20 @@ class TestTerminalAutoResolve:
 
         result = await _blocker(server, **_COMMON_KWARGS)
 
-        expected_keys = {'id', 'status', 'resolution', 'resolved_by', 'action'}
+        expected_keys = {'id', 'status', 'resolution', 'resolved_by', 'level', 'action'}
         assert set(result.keys()) == expected_keys, (
             f"Expected minimal keys {expected_keys}, got: {set(result.keys())}"
         )
 
     @pytest.mark.asyncio
     async def test_info_response_has_only_minimal_keys(self, tmp_path: Path):
-        """escalate_info auto-resolve returns exactly {id,status,resolution,resolved_by} (no 'action').
+        """escalate_info auto-resolve returns exactly {id,status,resolution,resolved_by,level} (no 'action').
 
         RED on current code: the auto-resolve path returns (resolved or esc).to_dict()
         which is a 20-field dump. After step-2, the shape is normalized to the minimal
-        four-field contract — no 'action' key (that is blocker-only).
+        contract — no 'action' key (that is blocker-only).  Task 3236 adds
+        'level' (see the blocker-side sibling for why); the no-full-dump
+        invariant this pin guards is unchanged.
         """
         queue = EscalationQueue(tmp_path / 'esc')
         lookup = await _make_lookup('cancelled')
@@ -307,7 +315,7 @@ class TestTerminalAutoResolve:
 
         result = await _info(server, **_COMMON_KWARGS)
 
-        expected_keys = {'id', 'status', 'resolution', 'resolved_by'}
+        expected_keys = {'id', 'status', 'resolution', 'resolved_by', 'level'}
         assert set(result.keys()) == expected_keys, (
             f"Expected minimal keys {expected_keys} (no 'action'), got: {set(result.keys())}"
         )
@@ -4001,3 +4009,182 @@ class TestBoundary9CancelRetire:
         with contextlib.suppress(asyncio.QueueEmpty):
             while True:
                 mq.get_nowait().result.cancel()
+
+
+# ---------------------------------------------------------------------------
+# TestHonestResponseContract: the response reports OBSERVED state, not intent
+# (task 3236)
+# ---------------------------------------------------------------------------
+
+
+class _RaceQueue(EscalationQueue):
+    """An EscalationQueue where an external resolver wins the same-instant race.
+
+    ``submit()`` writes the record normally and then immediately dismisses it,
+    exactly as a concurrent level=0 dismissal sweep would.  The filing is
+    therefore already non-pending by the time the tool shapes its response —
+    the race the incident behind task 3236 exhibited.
+    """
+
+    def submit(self, escalation: Escalation) -> str:
+        esc_id = super().submit(escalation)
+        self.resolve(
+            esc_id,
+            'Auto-dismissed: stale L0 swept on requeue',
+            dismiss=True,
+            resolved_by='orchestrator-auto-dismiss',
+        )
+        return esc_id
+
+
+class TestHonestResponseContract:
+    """A filing that is not pending after the write must never report 'queued'.
+
+    ``dedupe.submit_or_dedupe`` returned a hardcoded ``{'status': 'queued'}``
+    with no re-read, so the response reported write INTENT rather than
+    observed post-write state.  When a concurrent sweep dismissed the record
+    in the same instant, the filer was told 'queued' for a record that was
+    already dismissed — it had no way to learn its escalation had been
+    swallowed.  The honest response is the shape ``escalate_blocker``'s own
+    docstring already promises: ``{id, status, resolution, resolved_by,
+    action}``.
+    """
+
+    # -- Vector (i): the existing terminal-task chokepoint -------------------
+
+    @pytest.mark.asyncio
+    async def test_terminal_task_reports_resolved_not_queued(self, tmp_path: Path):
+        """CONTROL: the already-honest terminal-task path keeps its shape."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        lookup = await _make_lookup('done')
+        server = create_server(queue, task_status_lookup=lookup)
+
+        result = await _blocker(server, **_COMMON_KWARGS)
+
+        assert result['status'] != 'queued', f'Reported write intent: {result}'
+        for key in ('id', 'status', 'resolution', 'resolved_by', 'action'):
+            assert key in result, f'Missing {key!r} in documented shape: {result}'
+
+    # -- Vector (ii): the same-instant sweep race ---------------------------
+
+    @pytest.mark.asyncio
+    async def test_swept_filing_reports_dismissed_not_queued(self, tmp_path: Path):
+        """A record dismissed in the same instant reports 'dismissed', not 'queued'."""
+        queue = _RaceQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _blocker(server, **_COMMON_KWARGS)
+
+        persisted = queue.get(result['id'])
+        assert persisted is not None
+        assert persisted.status == 'dismissed', 'test setup: record should be dismissed'
+        assert result['status'] == 'dismissed', (
+            f'Response reported write intent for a dismissed record: {result}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_swept_filing_returns_documented_shape(self, tmp_path: Path):
+        """The swept response carries the documented {id, status, resolution, resolved_by, action}."""
+        queue = _RaceQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _blocker(server, **_COMMON_KWARGS)
+
+        for key in ('id', 'status', 'resolution', 'resolved_by', 'action'):
+            assert key in result, f'Missing {key!r} in: {result}'
+        assert result['resolution'] == 'Auto-dismissed: stale L0 swept on requeue'
+        assert result['resolved_by'] == 'orchestrator-auto-dismiss'
+        assert result['action'] == 'terminate_cleanly'
+
+    @pytest.mark.asyncio
+    async def test_swept_info_filing_also_reports_dismissed(self, tmp_path: Path):
+        """escalate_info shares the same submit path and gets the same honesty."""
+        queue = _RaceQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _info(server, **_COMMON_KWARGS)
+
+        assert result['status'] == 'dismissed', f'Reported write intent: {result}'
+        assert result['resolved_by'] == 'orchestrator-auto-dismiss'
+
+    @pytest.mark.asyncio
+    async def test_swept_born_at_l2_filing_reports_dismissed(self, tmp_path: Path):
+        """The born-at-L2 bypass branch does not route through dedupe — fix it too."""
+        queue = _RaceQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _blocker(
+            server, severity='critical',
+            **{**_COMMON_KWARGS, 'agent_role': 'orchestrator-watcher-supervisor'},
+        )
+
+        assert result['status'] == 'dismissed', f'Reported write intent: {result}'
+        assert result['resolved_by'] == 'orchestrator-auto-dismiss'
+
+    # -- The response must echo the persisted level -------------------------
+
+    @pytest.mark.asyncio
+    async def test_queued_response_echoes_persisted_level0(self, tmp_path: Path):
+        """A normal queued filing echoes level=0 so the caller can verify it."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _blocker(server, **_COMMON_KWARGS)
+
+        assert result['status'] == 'queued'
+        assert result.get('level') == 0, f"No persisted level echoed: {result}"
+
+    @pytest.mark.asyncio
+    async def test_queued_response_echoes_persisted_level1(self, tmp_path: Path):
+        """A level=1 re-escalation echoes level=1 — the caller can confirm it landed."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _blocker(server, level=1, **_COMMON_KWARGS)
+
+        assert result.get('level') == 1, f"Requested level did not land: {result}"
+        esc = queue.get(result['id'])
+        assert esc is not None and esc.level == 1
+
+    @pytest.mark.asyncio
+    async def test_born_at_l2_response_echoes_persisted_level2(self, tmp_path: Path):
+        """The L2 bypass branch echoes the level actually stamped on disk."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        result = await _blocker(
+            server, severity='critical',
+            **{**_COMMON_KWARGS, 'agent_role': 'orchestrator-watcher-supervisor'},
+        )
+
+        assert result.get('level') == 2, f"No persisted level echoed: {result}"
+
+    # -- Fail-open: a bookkeeping read must never lose a filing -------------
+
+    @pytest.mark.asyncio
+    async def test_unreadable_reread_falls_back_to_queued(self, tmp_path: Path):
+        """A re-read returning None falls back to 'queued' rather than raising."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        queue.get = lambda escalation_id: None  # type: ignore[method-assign]
+
+        result = await _blocker(server, **_COMMON_KWARGS)
+
+        assert result['status'] == 'queued', f'Expected fail-open queued, got: {result}'
+        assert 'id' in result
+
+    @pytest.mark.asyncio
+    async def test_raising_reread_falls_back_to_queued(self, tmp_path: Path):
+        """A re-read that RAISES falls back to 'queued' and does not propagate."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+
+        def _boom(escalation_id: str):
+            raise OSError('simulated unreadable escalation file')
+
+        queue.get = _boom  # type: ignore[method-assign]
+
+        result = await _blocker(server, **_COMMON_KWARGS)
+
+        assert result['status'] == 'queued', f'Expected fail-open queued, got: {result}'
+        assert 'id' in result

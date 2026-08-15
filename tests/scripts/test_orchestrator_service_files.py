@@ -234,7 +234,7 @@ def test_reify_and_df_differ_only_in_config_and_description() -> None:
     )
 
     diff_lines: list[tuple[int, str, str]] = []
-    for i, (dl, rl) in enumerate(zip(df_lines, reify_lines)):
+    for i, (dl, rl) in enumerate(zip(df_lines, reify_lines, strict=True)):
         if dl != rl:
             diff_lines.append((i + 1, dl, rl))
 
@@ -352,7 +352,28 @@ def test_autopilot_video_start_limit_directives_under_unit_section() -> None:
 
 
 def test_watchdog_timer_structure() -> None:
-    """scripts/orchestrator-watchdog.timer must fire every 60s."""
+    """scripts/orchestrator-watchdog.timer must fire every 60s, tightly.
+
+    ``AccuracySec=5s`` is asserted here because this is the one place the
+    number is justified, and it is not cosmetic. systemd's DEFAULT
+    AccuracySec is 1min, so ``OnUnitActiveSec=60`` WITHOUT this directive
+    gives an elapse window of [60s, 120s] rather than [60s, 65s] — roughly
+    halving how fast the fleet watchdog notices a dead orchestrator, for a
+    probe whose entire job is noticing that quickly.
+
+    The value is not new policy. The live host has been running it since
+    2026-05-26 (``systemctl --user show orchestrator-watchdog.timer -p
+    AccuracyUSec`` => ``AccuracyUSec=5s``, measured 2026-08-02), and the
+    committed timer never carried it (``git log -S AccuracySec --
+    scripts/orchestrator-watchdog.timer`` is empty) — the installed copy is
+    the older hand-written original and the committed transcription (task
+    1368) dropped the directive.
+
+    That asymmetry is why this assertion exists: task 3424 installs the
+    committed timer onto the host, and without this line that install would
+    have been a supervision REGRESSION wearing the costume of a parity fix.
+    This test makes the committed copy the safe one to install.
+    """
     content = WATCHDOG_TIMER.read_text(encoding="utf-8")
 
     assert "[Unit]" in content
@@ -368,6 +389,12 @@ def test_watchdog_timer_structure() -> None:
 
     assert "OnBootSec=30" in content
     assert "OnUnitActiveSec=60" in content
+    assert "AccuracySec=5s" in content, (
+        "orchestrator-watchdog.timer must declare AccuracySec=5s. Without it "
+        "systemd's 1min default widens this 60s probe's elapse window from "
+        "[60s, 65s] to [60s, 120s], roughly halving fleet-watchdog "
+        "responsiveness. See this test's docstring."
+    )
     assert "WantedBy=timers.target" in content
 
 

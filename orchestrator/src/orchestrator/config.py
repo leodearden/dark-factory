@@ -1060,7 +1060,7 @@ class RetentionConfig(BaseModel):
 class TranscriptArchiveConfig(BaseModel):
     """Agent-transcript archival (task 2742, plans/agent-transcript-archival-prd.md α).
 
-    The producer hook in TaskWorkflow._invoke's finally gzips each finished
+    The producer hook in TaskWorkflow._invoke's finally archives each finished
     agent session's transcripts (see shared.transcript_archive) to
     ``<project_root>/<root>`` — a durable location OUTSIDE the per-task
     worktree so the archive survives worktree teardown.

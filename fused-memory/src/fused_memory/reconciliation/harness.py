@@ -10,7 +10,7 @@ import os
 import time
 import traceback
 from collections import deque
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -23,6 +23,7 @@ from shared.config_dir import TaskConfigDir
 from shared.usage_gate import UsageGate
 
 from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.mcp_tools.scheduler_state import read_scheduler_state
 from fused_memory.models.reconciliation import (
     AssembledPayload,
     ReconciliationEvent,
@@ -62,6 +63,7 @@ from fused_memory.reconciliation.stages.memory_consolidator import (
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
     IntegrityCheck,
     TaskKnowledgeSync,
+    write_stage2_cycle_summary,
 )
 from fused_memory.reconciliation.stats_verifier import verify_and_rewrite_stats
 from fused_memory.reconciliation.task_count_snapshot_cadence import (
@@ -79,8 +81,13 @@ from fused_memory.reconciliation.task_filter import (
     diff_status_correction,
     filter_task_tree,
 )
-from fused_memory.services.live_workflow_detector import is_workflow_live_for_task
+from fused_memory.services.live_workflow_detector import (
+    corroboration_for_task,
+    is_pure_gate_metadata,
+    is_workflow_live_for_task,
+)
 from fused_memory.services.memory_service import MemoryService
+from fused_memory.services.orchestrator_detector import orchestrator_started_at
 
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -375,6 +382,25 @@ def build_stale_run_diagnostics(
     }
 
 
+def _cycle_summary_ledger_write_missing(report: object, stage_prefix: str) -> bool:
+    """Shared core of :func:`_stage1_ledger_write_missing` and
+    :func:`_stage2_ledger_write_missing` — the two differ only in the
+    ``stage1``/``stage2`` stat prefix, so the predicate lives once (task 3732
+    amendment). Read either wrapper's docstring for the rationale behind each
+    clause; this body is deliberately mechanical.
+
+    *stage_prefix* is ``'stage1'`` or ``'stage2'``, selecting the
+    ``<prefix>_cycle_summary_ledger_written`` /
+    ``<prefix>_cycle_summary_degraded_backstop`` stat names.
+    """
+    stats = getattr(report, 'stats', None)
+    if not isinstance(stats, dict):
+        return False
+    if stats.get(f'{stage_prefix}_cycle_summary_degraded_backstop') is True:
+        return False
+    return stats.get(f'{stage_prefix}_cycle_summary_ledger_written') == 0
+
+
 def _stage1_ledger_write_missing(report: object) -> bool:
     """Return True iff *report* is a Stage 1 report whose own in-stage
     ``cycle_summary`` ledger upsert failed (task 2734).
@@ -405,12 +431,48 @@ def _stage1_ledger_write_missing(report: object) -> bool:
     ``run.stage_reports`` is typed ``dict[str, StageReport | dict]`` and
     this predicate must never raise when handed one of those.
     """
-    stats = getattr(report, 'stats', None)
-    if not isinstance(stats, dict):
-        return False
-    if stats.get('stage1_cycle_summary_degraded_backstop') is True:
-        return False
-    return stats.get('stage1_cycle_summary_ledger_written') == 0
+    return _cycle_summary_ledger_write_missing(report, 'stage1')
+
+
+def _stage2_ledger_write_missing(report: object) -> bool:
+    """Return True iff *report* is a Stage 2 report whose own in-stage
+    ``cycle_summary`` ledger upsert failed (task 3732).
+
+    Stage-2 mirror of :func:`_stage1_ledger_write_missing`, backing the
+    write-recovered arm of
+    :meth:`ReconciliationHarness._ensure_stage2_cycle_summary` — the
+    "Stage 2 completed but its own write failed" case.
+
+    Keys on the EXPLICIT failure value
+    ``stats['stage2_cycle_summary_ledger_written'] == 0``, deliberately
+    never ``!= 1``: a
+    :meth:`~fused_memory.reconciliation.stages.task_knowledge_sync.TaskKnowledgeSync.run`
+    that reached its own write always stamps this stat to 0 (upsert failed)
+    or 1 (succeeded), so ``== 0`` captures exactly the defect. An ABSENT
+    stat means the report never reached that write at all — which
+    :class:`~fused_memory.reconciliation.stages.base.BaseStage` can produce
+    for real, not just in test stubs: it returns a ``StageReport`` with
+    ``stats={}`` when the agent died before emitting ``recon_report.complete``
+    (base.py:216-224, crash path at :318-322). Synthesizing a summary for
+    such a run would fabricate numbers for a Stage 2 that demonstrably never
+    finished, so an absent stat is no-fire (``!= 1`` would wrongly fire on
+    it). It also keeps every stubbed-Stage-2 harness test inert, since the
+    shared ``_mock_stage_run`` helper builds reports with ``stats={}``.
+
+    Also excludes the degraded-synth arm's own harness-synthesized report
+    (stamped ``stats['stage2_cycle_summary_degraded_backstop'] = True``), so
+    the two arms of ``_ensure_stage2_cycle_summary`` can never double-process
+    the same run.
+
+    Returns False for anything whose ``.stats`` isn't a dict — including a
+    non-``StageReport`` object (e.g. a plain dict, the shape
+    ``run.stage_reports['_error']`` entries use, and the shape a
+    journal-round-tripped entry can keep — journal.py reconstructs
+    ``StageReport(**v)`` only when ``isinstance(v, dict) and 'stage' in v``)
+    — since ``run.stage_reports`` is typed ``dict[str, StageReport | dict]``
+    and this predicate must never raise when handed one of those.
+    """
+    return _cycle_summary_ledger_write_missing(report, 'stage2')
 
 
 class ReconciliationHarness:
@@ -1164,7 +1226,35 @@ class ReconciliationHarness:
             live = diff['live']
             corrected_metadata = {
                 'kind': 'project_status_correction',
-                'supersedes': latest['id'],
+                # PRD D2 (task 3196): `supersedes` is a LIST of full UUIDs.  The
+                # shape contract, the read tolerance for the legacy scalar, and
+                # the writer/reader map all live in ONE place —
+                # `memory_metadata.normalize_supersedes`'s docstring — rather
+                # than being restated here.  Written list-shaped at the source
+                # rather than leaning on the service-seam coercion in
+                # validate_memory_metadata().  Exactly one predecessor is
+                # recorded: `latest` is the single max()-by-created_at memory
+                # being superseded.  Do NOT widen to every deleted duplicate —
+                # the queried set is deleted for pool-capping (task 1938
+                # amendment), a different relation from supersession.
+                #
+                # EXPECTED-DANGLING POINTER (deliberate; pre-dates the list
+                # migration and is unchanged by it).  `latest` is a member of
+                # the `memories` set deleted below, so this id does NOT resolve
+                # via `get_memory_by_id` once this branch returns.  That is
+                # intended: the pool cap requires the corrected predecessor to
+                # go away, and `supersedes` is kept as an audit trace of WHICH
+                # record was corrected, not as a live pointer.  Consequence for
+                # the eval program's E4 dangling-pointer census
+                # (docs/prds/memory-eval-program.md §γ, which resolves
+                # `supersedes` targets via `get_memory_by_id`): 100% of this
+                # writer's edges are dangling BY DESIGN, so E4 must allowlist
+                # `kind=project_status_correction` rather than report a census
+                # spike.  Making the target resolvable would mean keeping
+                # `latest` alive, which reopens the unbounded-pool bug — i.e.
+                # not a documentation-only change, which is why this leaf
+                # records the invariant instead of "fixing" it.
+                'supersedes': [latest['id']],
                 'task_count_done': live['done'],
                 'task_count_total': live['total'],
                 'active_tasks': live['active_tasks'],
@@ -1177,7 +1267,7 @@ class ReconciliationHarness:
                 f"active={len(live['active_tasks'])}."
             )
             # Add-then-delete: guarantees at least one correct memory always exists
-            # even if a delete below fails — the fresh memory (supersedes=<old_id>)
+            # even if a delete below fails — the fresh memory (supersedes=[<old_id>])
             # is still the most-recent, so next cycle's max()-by-created_at selection
             # ignores any stale leftover and self-heals.  Once add_memory lands, the
             # supersede has effectively happened regardless of delete outcomes below
@@ -2980,6 +3070,14 @@ class ReconciliationHarness:
                 await self._ensure_stage1_cycle_summary(
                     run, run_id, project_id, current_stage_name, cycle_start_time,
                 )
+                # Strictly AFTER the Stage 1 arm (task 3732): that arm is
+                # pre-existing, load-bearing behaviour and a Stage 2 backstop
+                # fault must never be able to starve it. Both stay before
+                # update_run_stage_reports so the persisted stage_reports copy
+                # captures whatever markers either arm stamped.
+                await self._ensure_stage2_cycle_summary(
+                    run, run_id, project_id, cycle_start_time,
+                )
                 await self.journal.update_run_stage_reports(run_id, run.stage_reports)
                 # Task 2744/σ: GC this run's per-run recon CLI config dir on every
                 # exit path (success/failure) EXCEPT an interrupted (resumable) run —
@@ -2993,6 +3091,178 @@ class ReconciliationHarness:
                         logger.warning(
                             'gc_run_config_dir failed for run %s: %r', run_id, gc_err
                         )
+
+    # ── Shared cycle-summary backstop arms ────────────────────────────
+    #
+    # _ensure_stage1_cycle_summary and _ensure_stage2_cycle_summary keep their
+    # own (deliberately different) FIRE GATES, but their arm BODIES were
+    # near-verbatim clones; the bodies live here once (task 3732 amendment) so a
+    # fix to either arm cannot be applied to one stage and forgotten on the
+    # other. Each helper may raise — both callers wrap them in the
+    # ``except BaseException`` swallow their own docstrings promise.
+    #
+    # Concrete log events emitted here, kept greppable despite the f-strings:
+    #   reconciliation.stage1_cycle_summary_write_recovered
+    #   reconciliation.stage2_cycle_summary_write_recovered
+    #   reconciliation.stage1_cycle_summary_backstop_fired
+    #   reconciliation.stage2_cycle_summary_backstop_fired
+    #   reconciliation.stage2_cycle_summary_backstop_row_present
+
+    async def _reattempt_cycle_summary_write(
+        self,
+        report: StageReport,
+        writer: Callable[[StageReport], Awaitable[bool]],
+        *,
+        stage_prefix: str,
+        run_id: str,
+        project_id: str,
+    ) -> None:
+        """Write-recovered arm: re-attempt a stage's own failed in-stage
+        ``cycle_summary`` upsert using the REAL report.
+
+        Reusing the real report (not a zeroed synth) records honest
+        llm_calls/tokens/stats; the ledger upsert is idempotent on its 5-part
+        identity (``ON CONFLICT``), so a re-attempt after a transient failure
+        is safe and cannot duplicate.
+
+        *writer* is a stage-bound closure taking the report to serialize — it
+        resolves the module-level ``write_stage{1,2}_cycle_summary`` global at
+        call time, so tests patching that name still intercept the write.
+
+        Marker discipline (task 2734, corrected task 3732 amendment): the
+        writer serializes ``report.stats`` into the ledger row's
+        ``payload_json`` synchronously at call time (see ``write_cycle_summary``'s
+        docstring), so the ``<prefix>_cycle_summary_write_recovered_backstop``
+        marker has to already be on whatever report the writer sees. It is
+        handed a COPY stamped ``True`` rather than this method mutating the
+        live *report* across the ``asyncio.shield`` boundary. That distinction
+        is load-bearing on exactly the path the shield exists for: if the
+        harness task is ALREADY being cancelled when the ``finally`` runs, the
+        ``await`` below raises ``CancelledError`` before the shielded task has
+        taken its first step, and a post-hoc correction of the live report's
+        stats would then be picked up by the still-pending serialization —
+        landing a row stamped ``False`` even though that very write succeeded.
+
+        The live *report* — the copy ``update_run_stage_reports`` persists to
+        the journal moments later — is stamped only with the CONFIRMED outcome:
+        ``True`` only once the writer returned truthy, ``False`` if it returned
+        falsy or raised. So it never over-claims. Note the resulting asymmetry
+        on the cancellation path: the landed row reads ``True`` while the
+        journal copy reads ``False`` ("could not confirm"). The ledger row's
+        mere EXISTENCE is the authoritative presence signal
+        ``get_cycle_summary_presence`` reads — neither marker, and not
+        ``<prefix>_cycle_summary_ledger_written``, which is left at its
+        in-stage value of 0 either way.
+        """
+        marker = f'{stage_prefix}_cycle_summary_write_recovered_backstop'
+        stamped = report.model_copy(
+            update={'stats': {**report.stats, marker: True}}
+        )
+        try:
+            # Shielded against a second cancellation arriving mid-write; the
+            # write keeps running to completion in its own Task.
+            ledger_written = await asyncio.shield(writer(stamped))
+        except BaseException:
+            report.stats[marker] = False
+            raise
+        report.stats[marker] = bool(ledger_written)
+        logger.warning(
+            f'reconciliation.{stage_prefix}_cycle_summary_write_recovered',
+            extra={
+                'run_id': run_id,
+                'project_id': project_id,
+                'ledger_written': ledger_written,
+            },
+        )
+
+    async def _write_degraded_cycle_summary(
+        self,
+        run: ReconciliationRun,
+        writer: Callable[[StageReport], Awaitable[bool]],
+        *,
+        stage_id: StageId,
+        stage_prefix: str,
+        run_id: str,
+        project_id: str,
+        cycle_start_time: datetime,
+        skip_if_row_exists: bool = False,
+    ) -> None:
+        """Degraded-synth arm: write a zeroed, self-identifying
+        ``cycle_summary`` row for a stage that demonstrably ran but whose real
+        numbers are unrecoverable.
+
+        The synthesized report is honestly degraded, not fabricated:
+        ``llm_calls``/``tokens_used`` are 0 and ``started_at`` is the
+        whole-cycle anchor rather than the stage's real start — all
+        unrecoverable — so the implied duration is an upper bound, not a
+        measurement. Zeroed means "unrecoverable", NOT "no work happened": a
+        consumer summing llm_calls/tokens across cycles must filter
+        ``stats['<prefix>_cycle_summary_degraded_backstop']`` rows first or it
+        will silently undercount. That stat is the row's non-negotiable
+        self-identification.
+
+        *skip_if_row_exists* (task 3732 amendment) makes this a no-op when an
+        authoritative row for the identity already exists. The ledger upsert is
+        last-write-wins on the 5-part identity, so a zeroed synth would
+        otherwise CLOBBER a good row carrying real llm_calls/tokens — strictly
+        worse than doing nothing. Callers whose fire gate already proves no row
+        can exist (Stage 1's arm 1 fires only when the stage raised before its
+        own write) leave it off and skip the read; callers gated only on the
+        SHAPE of the ``stage_reports`` entry (Stage 2's degraded arm, which has
+        no evidence the stage's own write failed) must set it. A read that
+        raises propagates to the caller's swallow, so a ledger fault means no
+        degraded row rather than a possible clobber.
+
+        Finally, when the run already carries an ``_error`` record, the arm
+        stamps its outcome there as a breadcrumb rather than adding a new
+        top-level ``stage_reports`` key — the same place operators already look
+        for a failed cycle's diagnosis.
+        """
+        # The read-back is skipped when no ledger is wired: there is then no row
+        # to clobber (and the upsert itself is a no-op). Both callers that pass
+        # skip_if_row_exists already gate on the ledger being present, so this
+        # is a type-narrowing belt-and-braces, not a live path.
+        ledger = getattr(self.memory, 'recon_ledger', None)
+        if skip_if_row_exists and ledger is not None:
+            existing = await ledger.get_by_identity(
+                project_id,
+                'cycle_summary',
+                task_id='',
+                flag_type=stage_id.value,
+                run_id=run_id,
+            )
+            if existing is not None:
+                logger.info(
+                    f'reconciliation.{stage_prefix}_cycle_summary_backstop_row_present',
+                    extra={'run_id': run_id, 'project_id': project_id},
+                )
+                return
+
+        degraded_report = StageReport(
+            stage=stage_id,
+            # Whole-cycle anchor, not the stage's real start (see docstring).
+            started_at=cycle_start_time,
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={f'{stage_prefix}_cycle_summary_degraded_backstop': True},
+            # Zeroed means "unrecoverable", NOT "no work happened" (see docstring).
+            llm_calls=0,
+            tokens_used=0,
+        )
+        # Shielded against a second cancellation arriving mid-write; the write
+        # keeps running to completion in its own Task.
+        ledger_written = await asyncio.shield(writer(degraded_report))
+        logger.warning(
+            f'reconciliation.{stage_prefix}_cycle_summary_backstop_fired',
+            extra={
+                'run_id': run_id,
+                'project_id': project_id,
+                'ledger_written': ledger_written,
+            },
+        )
+        error_record = run.stage_reports.get('_error')
+        if isinstance(error_record, dict):
+            error_record[f'{stage_prefix}_cycle_summary_backstop_written'] = ledger_written
 
     async def _ensure_stage1_cycle_summary(
         self,
@@ -3068,22 +3338,16 @@ class ReconciliationHarness:
           with the REAL Stage 1 report (real llm_calls/tokens/stats), not a
           zeroed synth — the ledger upsert is idempotent (``ON CONFLICT`` on
           the 5-part identity), so a re-attempt after a transient failure is
-          safe and cannot duplicate. It stamps a distinct
-          ``stage1_cycle_summary_write_recovered_backstop`` marker on the
-          report — optimistically ``True`` *before* the call, since
-          ``write_stage1_cycle_summary`` serializes ``report.stats`` into
-          the ledger row's ``payload_json`` synchronously at call time (see
-          ``write_cycle_summary``'s docstring), so this is the only way a
-          successful re-attempt's OWN ledger row ends up carrying the
-          marker. It is corrected back to ``False`` immediately afterward
-          if the re-attempt did NOT actually land a row
-          (``ledger_written`` is falsy, or the call raised) — the
-          correction cannot rewrite a ledger row (none exists in either
-          failure case), but it DOES reach the run's own
-          journal-persisted ``stage_reports`` copy
-          (``update_run_stage_reports``, called right after this method
-          returns), so that copy never falsely claims recovery succeeded
-          (task 2734 amendment). ``stage1_cycle_summary_ledger_written``
+          safe and cannot duplicate. The body is
+          :meth:`_reattempt_cycle_summary_write` (shared with Stage 2's
+          write-recovered arm, task 3732 amendment); read its docstring for
+          the distinct ``stage1_cycle_summary_write_recovered_backstop``
+          marker discipline — in particular why the writer is handed a
+          marker-stamped COPY while the live report (the copy
+          ``update_run_stage_reports`` persists moments later) records only
+          the CONFIRMED outcome, so it never falsely claims recovery
+          succeeded (task 2734 amendment), and the cancellation-path
+          asymmetry that follows. ``stage1_cycle_summary_ledger_written``
           itself is left at its in-stage value of 0 either way — the
           ledger row's mere EXISTENCE is the authoritative presence signal
           that ``get_cycle_summary_presence`` reads, not either stat. Arm 2
@@ -3113,82 +3377,36 @@ class ReconciliationHarness:
         if not (raised_before_write or completed_but_write_failed):
             return
 
+        def writer(report: StageReport) -> Awaitable[bool]:
+            # Resolved at call time so a patched module global is honoured.
+            return write_stage1_cycle_summary(
+                self.memory, project_id, report, run_id,
+            )
+
         try:
             if completed_but_write_failed and isinstance(s1_report, StageReport):
-                # Arm 2 (task 2734): see docstring. Re-attempt with the REAL
-                # report — reusing it (not a zeroed synth) records honest
-                # llm_calls/tokens/stats; the upsert is idempotent so a
-                # re-attempt after a transient failure is safe.
-                #
-                # Stamped True *before* the call: write_stage1_cycle_summary
-                # serializes report.stats into the ledger row's payload_json
-                # synchronously, at call time (see write_cycle_summary's
-                # docstring) — a post-call mutation can never retroactively
-                # reach an already-persisted row, so this is the only way a
-                # successful re-attempt's OWN ledger row ends up carrying the
-                # marker. Corrected back to False below if the re-attempt did
-                # not actually land a row — that correction can't rewrite the
-                # (nonexistent, in the failure case) ledger row, but it DOES
-                # reach the run's own journal-persisted stage_reports copy
-                # (update_run_stage_reports, called right after this method
-                # returns), so that copy never falsely claims recovery
-                # succeeded (task 2734 amendment).
-                s1_report.stats['stage1_cycle_summary_write_recovered_backstop'] = True
-                try:
-                    ledger_written = await asyncio.shield(
-                        write_stage1_cycle_summary(
-                            self.memory, project_id, s1_report, run_id,
-                        )
-                    )
-                except BaseException:
-                    s1_report.stats['stage1_cycle_summary_write_recovered_backstop'] = False
-                    raise
-                if not ledger_written:
-                    s1_report.stats['stage1_cycle_summary_write_recovered_backstop'] = False
-                logger.warning(
-                    'reconciliation.stage1_cycle_summary_write_recovered',
-                    extra={
-                        'run_id': run_id,
-                        'project_id': project_id,
-                        'ledger_written': ledger_written,
-                    },
+                # Arm 2 (task 2734): see docstring, and
+                # _reattempt_cycle_summary_write for the marker discipline.
+                await self._reattempt_cycle_summary_write(
+                    s1_report,
+                    writer,
+                    stage_prefix='stage1',
+                    run_id=run_id,
+                    project_id=project_id,
                 )
             else:
-                degraded_report = StageReport(
-                    stage=StageId.memory_consolidator,
-                    # Whole-cycle anchor, not Stage 1's real start (see docstring).
-                    started_at=cycle_start_time,
-                    completed_at=datetime.now(UTC),
-                    items_flagged=[],
-                    stats={'stage1_cycle_summary_degraded_backstop': True},
-                    # Zeroed, not "no work happened" (see docstring). Dashboards summing
-                    # llm_calls/tokens across cycles should filter out
-                    # stats['stage1_cycle_summary_degraded_backstop'] rows first, or they
-                    # will silently undercount.
-                    llm_calls=0,
-                    tokens_used=0,
+                # Arm 1 (task 2440): see docstring. No skip_if_row_exists read —
+                # this arm fires only when Stage 1 raised BEFORE its own write,
+                # so no authoritative row can exist to clobber.
+                await self._write_degraded_cycle_summary(
+                    run,
+                    writer,
+                    stage_id=StageId.memory_consolidator,
+                    stage_prefix='stage1',
+                    run_id=run_id,
+                    project_id=project_id,
+                    cycle_start_time=cycle_start_time,
                 )
-                # Shielded against a second cancellation arriving mid-write (see
-                # docstring); the write keeps running to completion in its own Task.
-                ledger_written = await asyncio.shield(
-                    write_stage1_cycle_summary(
-                        self.memory, project_id, degraded_report, run_id,
-                    )
-                )
-                logger.warning(
-                    'reconciliation.stage1_cycle_summary_backstop_fired',
-                    extra={
-                        'run_id': run_id,
-                        'project_id': project_id,
-                        'ledger_written': ledger_written,
-                    },
-                )
-                # Breadcrumb on the existing _error record (when present) rather than
-                # a new top-level stage_reports key — keeps this observable from the
-                # same place operators already look for a failed cycle's diagnosis.
-                error_record = run.stage_reports.get('_error')
-                if isinstance(error_record, dict):
-                    error_record['stage1_cycle_summary_backstop_written'] = ledger_written
         except BaseException:
             # BaseException (not Exception): also catches a second cancellation
             # and, deliberately, SystemExit/KeyboardInterrupt — this is a single
@@ -3197,6 +3415,193 @@ class ReconciliationHarness:
             # call that follows (see docstring).
             logger.warning(
                 'reconciliation.stage1_cycle_summary_backstop_failed',
+                exc_info=True,
+                extra={'run_id': run_id, 'project_id': project_id},
+            )
+
+    async def _ensure_stage2_cycle_summary(
+        self,
+        run: ReconciliationRun,
+        run_id: str,
+        project_id: str,
+        cycle_start_time: datetime,
+    ) -> None:
+        """Recover a Stage 2 ``cycle_summary`` ledger row for *run_id* when
+        Stage 2 ran but its row did not land (task 3732).
+
+        Stage-2 counterpart of :meth:`_ensure_stage1_cycle_summary`, fired
+        from the same two S1→S2→S3 drivers' ``finally`` blocks
+        (:meth:`run_full_cycle` and :meth:`_run_remediation_pass`), and
+        deliberately NARROWER than the Stage 1 method in one decisive way:
+        it has no analogue of Stage 1's arm 1 (synthesize a row when the
+        stage produced no report at all). Fabricating a summary for a cycle
+        whose Stage 2 never ran is exactly what this backstop must not do,
+        so BOTH arms are hard-gated on the ``task_knowledge_sync`` key being
+        PRESENT in ``run.stage_reports``.
+
+        That presence gate is what makes fabrication structurally impossible,
+        and it is exact rather than heuristic: both drivers assign
+        ``run.stage_reports[key] = report`` strictly AFTER ``stage.run()``
+        RETURNS, and :meth:`~fused_memory.reconciliation.stages.base.BaseStage.run`
+        re-raises ``CancelledError`` without returning a partial report — so
+        an absent key is proof Stage 2 produced no report, never merely a
+        bookkeeping gap. (``_run_remediation_pass``'s scope-freshness
+        short-circuit returns before its ``try:`` block, so its ``finally``
+        is never reached on that path either.) A SECOND population the
+        presence gate alone would not exclude — a Stage 2 that started, was
+        recorded, but died before reaching its own write — is excluded by
+        :func:`_stage2_ledger_write_missing` treating an ABSENT
+        ``stage2_cycle_summary_ledger_written`` stat as no-fire.
+
+        - **Write-recovered arm** — Stage 2 completed and DID return a real
+          report, but its own in-stage ledger upsert failed transiently
+          (``write_cycle_summary``'s ``ledger.upsert`` caught the failure,
+          logged a WARNING and returned False), leaving the explicit failure
+          signal ``stats['stage2_cycle_summary_ledger_written'] == 0`` (see
+          :func:`_stage2_ledger_write_missing` for the stat/marker
+          predicate). Gated additionally on a ``ReconLedgerStore`` actually
+          being wired (``self.memory.recon_ledger is not None``) — otherwise
+          an intentionally ``recon_ledger_enabled=False`` deployment (whose
+          stat is always 0) would re-fire, and WARNING, every cycle for no
+          reason.
+
+          It RE-ATTEMPTS ``write_stage2_cycle_summary`` with the REAL Stage 2
+          report (real llm_calls/tokens/stats), not a zeroed synth — the
+          ledger upsert is idempotent (``ON CONFLICT`` on the 5-part
+          identity), so a re-attempt after a transient failure is safe and
+          cannot duplicate. The body is
+          :meth:`_reattempt_cycle_summary_write` (shared with Stage 1's arm 2);
+          read its docstring for the
+          ``stage2_cycle_summary_write_recovered_backstop`` marker discipline
+          — in particular why the writer is handed a marker-stamped COPY while
+          the live report records only the CONFIRMED outcome, and the
+          cancellation-path asymmetry that follows.
+          ``stage2_cycle_summary_ledger_written`` itself is left at its
+          in-stage value of 0 either way — the ledger row's mere EXISTENCE is
+          the authoritative presence signal ``get_cycle_summary_presence``
+          reads, not either stat.
+
+        - **Degraded-synth arm** — the ``task_knowledge_sync`` entry is
+          present but is NOT a ``StageReport``: the plain-dict shape
+          ``run.stage_reports`` (typed ``dict[str, StageReport | dict]``) is
+          allowed to hold. This is production-reachable, not defensive
+          fiction — ``journal`` reconstructs ``StageReport(**v)`` only when
+          the stored value ``isinstance(v, dict) and 'stage' in v``, and
+          otherwise keeps the raw dict, so an adopted/resumed run can carry
+          one. It is the only remaining shape where Stage 2 demonstrably
+          produced a report yet no faithful re-attempt is possible, so it is
+          the one place a synthesized row is honest rather than fabricated.
+
+          Unlike the write-recovered arm it has NO evidence that Stage 2's own
+          write failed — it fires on the SHAPE of the ``stage_reports`` entry
+          alone — and the ledger upsert is last-write-wins on the 5-part
+          identity, so a zeroed synth could otherwise CLOBBER an authoritative
+          row carrying real llm_calls/tokens. It therefore runs with
+          :meth:`_write_degraded_cycle_summary`'s ``skip_if_row_exists``
+          guard: the row is read back first and the write is skipped outright
+          when one already exists. (Stage 1's arm 1 needs no such guard — it
+          fires only when Stage 1 raised BEFORE its own write, so no row can
+          exist to clobber.) Read that method's docstring for the degraded
+          row's contents, the mandatory
+          ``stage2_cycle_summary_degraded_backstop`` self-identification, and
+          the ``_error`` breadcrumb.
+
+        The two arms are mutually exclusive by construction: the first
+        requires a real ``StageReport``, the second requires the entry NOT be
+        one. :func:`_stage2_ledger_write_missing` additionally excludes any
+        report stamped ``stage2_cycle_summary_degraded_backstop``, so even a
+        synthesized row round-tripping back through here cannot be
+        double-processed.
+
+        Unlike Stage 1's arm 2, this method applies NO ``RunType.remediation``
+        exclusion. Stage 1 excludes remediation because its own ``run()``
+        early-returns before its summary write on such a pass, so firing
+        there would fabricate a spurious row. Stage 2 is the exact opposite,
+        and its source says so explicitly (see the cross-reference comment
+        above ``TaskKnowledgeSync.run``'s write: the call "is unconditional —
+        it also fires on remediation passes, not just full cycles. That is
+        intentional, not a missed guard ... Do not 'fix' this to mirror Stage
+        1's full-cycle-only gating"). A lost Stage 2 ledger write on a
+        remediation pass is therefore a genuine gap this backstop must close,
+        so ``remediation`` is derived from the run and forwarded to the write
+        — keeping the recovered row's ``payload['remediation']`` identical to
+        what the in-stage write would have stamped, which
+        ``get_cycle_summary_presence`` reads to disambiguate expected-missing
+        rows. Note this does not weaken the never-fabricate guarantee on that
+        driver either: ``_run_remediation_pass``'s scope-freshness
+        short-circuit RETURNS before its ``try:`` block, so its ``finally``
+        — and therefore this method — is never reached on that never-ran-any-
+        stage path.
+
+        Must never raise: awaited unshielded in the ``finally``, immediately
+        before ``update_run_stage_reports``, and AFTER
+        :meth:`_ensure_stage1_cycle_summary` so a fault here can never starve
+        that pre-existing arm. An exception escaping would replace whatever
+        exception is already propagating and skip that persistence call, so
+        the body swallows ``BaseException`` and each write itself runs under
+        ``asyncio.shield`` to survive a second cancellation arriving
+        mid-write.
+        """
+        s2_key = StageId.task_knowledge_sync.value
+        s2_report = run.stage_reports.get(s2_key)
+        if s2_report is None:
+            # Never fabricate a cycle that did not happen.
+            return
+        if getattr(self.memory, 'recon_ledger', None) is None:
+            return
+
+        remediation = run.run_type == RunType.remediation
+        write_recovered = (
+            isinstance(s2_report, StageReport)
+            and _stage2_ledger_write_missing(s2_report)
+        )
+        # Report present but NOT a usable StageReport: Stage 2 demonstrably ran
+        # and produced something, so a row is honest — but its real numbers are
+        # unrecoverable, so the row is degraded rather than re-attempted.
+        degraded = not isinstance(s2_report, StageReport)
+        if not (write_recovered or degraded):
+            return
+
+        def writer(report: StageReport) -> Awaitable[bool]:
+            # Resolved at call time so a patched module global is honoured.
+            return write_stage2_cycle_summary(
+                self.memory, project_id, report, run_id,
+                remediation=remediation,
+            )
+
+        try:
+            if write_recovered and isinstance(s2_report, StageReport):
+                # See _reattempt_cycle_summary_write for the marker discipline.
+                await self._reattempt_cycle_summary_write(
+                    s2_report,
+                    writer,
+                    stage_prefix='stage2',
+                    run_id=run_id,
+                    project_id=project_id,
+                )
+            else:
+                # skip_if_row_exists, unlike Stage 1's arm 1: this arm fires on
+                # the SHAPE of the stage_reports entry alone, with no evidence
+                # Stage 2's own write failed, so a row may well already exist
+                # and a zeroed synth must never clobber it (see docstring).
+                await self._write_degraded_cycle_summary(
+                    run,
+                    writer,
+                    stage_id=StageId.task_knowledge_sync,
+                    stage_prefix='stage2',
+                    run_id=run_id,
+                    project_id=project_id,
+                    cycle_start_time=cycle_start_time,
+                    skip_if_row_exists=True,
+                )
+        except BaseException:
+            # BaseException (not Exception): also catches a second cancellation
+            # and, deliberately, SystemExit/KeyboardInterrupt — this is a single
+            # narrow, bounded best-effort upsert, and letting any of those
+            # interrupt the finally risks skipping the update_run_stage_reports
+            # call that follows (see docstring).
+            logger.warning(
+                'reconciliation.stage2_cycle_summary_backstop_failed',
                 exc_info=True,
                 extra={'run_id': run_id, 'project_id': project_id},
             )
@@ -3799,28 +4204,34 @@ class ReconciliationHarness:
             else await self._fetch_filtered_task_tree(project_root)
         )
 
-        # Task 2031/2067: {str(task_id): status} and {str(task_id): task_kind} maps
-        # derived from remediation_tree in a single pass, used by the live-workflow
-        # gate below so never-dispatched cited tasks (deferred/done/cancelled) drop
-        # the project-wide orchestrator_live signal instead of being suppressed by
-        # it, and so BLOCKED cited tasks that are deterministic (never acquire a
+        # Task 2031/2067: a {str(task_id): task dict} map derived from
+        # remediation_tree in a single pass, used by the live-workflow gate below
+        # so never-dispatched cited tasks (deferred/done/cancelled) drop the
+        # project-wide orchestrator_live signal instead of being suppressed by it,
+        # and so BLOCKED cited tasks that are deterministic (never acquire a
         # worktree/branch of their own — routed to DeterministicRunner) do too —
-        # which status_by_id alone cannot express since 'blocked' is deliberately
-        # not in ORCH_LIVE_INELIGIBLE_STATUSES (a normal blocked task may
-        # legitimately auto-unblock mid-pipeline). remediation_tree is always a
-        # valid FilteredTaskTree (degrades to empty on fetch failure), so this is
-        # safe. Built together (rather than as two separate comprehensions) so the
-        # two maps are guaranteed key-identical from one iteration of the source
-        # lists.
-        # Coverage caveat: active_tasks is uncapped (deferred/blocked — the cited
-        # cases — always resolve), but done_tasks/cancelled_tasks are capped at
-        # MAX_DONE_TASKS_RETAINED=30 / MAX_CANCELLED_TASKS_RETAINED=15
-        # (task_filter.py). A cited done/cancelled task outside those caps, or one
-        # with an untracked status, is simply absent here and status_by_id.get(tid)
-        # / task_kind_by_id.get(tid) fall back to None below — the pre-2031
-        # status-blind behavior for that one id, not a new failure mode.
-        status_by_id: dict[str, str | None] = {}
-        task_kind_by_id: dict[str, str | None] = {}
+        # which status alone cannot express since 'blocked' is deliberately not in
+        # ORCH_LIVE_INELIGIBLE_STATUSES (a normal blocked task may legitimately
+        # auto-unblock mid-pipeline). remediation_tree is always a valid
+        # FilteredTaskTree (degrades to empty on fetch failure), so this is safe.
+        #
+        # Task 2964 consolidated the former parallel status_by_id/task_kind_by_id
+        # scalar maps into this one: the gate now also needs `metadata` (for
+        # pure_gate) and the task's TOP-LEVEL claimant_run_id/heartbeat_at (for
+        # corroboration), which no scalar map can express. Keying the whole dict
+        # subsumes all of them from the same single pass at no extra cost, and
+        # keeps every derived value guaranteed to come from ONE task snapshot.
+        #
+        # Coverage caveat (unchanged, restated for the consolidated map): active_
+        # tasks is uncapped (deferred/blocked — the cited cases — always resolve),
+        # but done_tasks/cancelled_tasks are capped at MAX_DONE_TASKS_RETAINED=30
+        # / MAX_CANCELLED_TASKS_RETAINED=15 (task_filter.py). A cited
+        # done/cancelled task outside those caps, or one with an untracked status,
+        # is simply absent here and task_by_id.get(tid) falls back to None below —
+        # so status/task_kind/pure_gate/corroborated all degrade to the pre-2031
+        # status-blind, fail-safe-toward-live values for that one id, not a new
+        # failure mode.
+        task_by_id: dict[str, dict] = {}
         for t in (
             list(remediation_tree.active_tasks)
             + list(remediation_tree.done_tasks)
@@ -3828,10 +4239,22 @@ class ReconciliationHarness:
         ):
             if not isinstance(t, dict) or t.get('id') is None:
                 continue
-            tid = str(t.get('id'))
-            status_by_id[tid] = t.get('status')
-            _metadata = t.get('metadata')
-            task_kind_by_id[tid] = _metadata.get('task_kind') if isinstance(_metadata, dict) else None
+            task_by_id[str(t.get('id'))] = t
+
+        # Task 2964: the instant task_by_id (and therefore every heartbeat_at it
+        # carries) was read. `now` is threaded into corroboration_for_task ONLY to
+        # age-check that snapshot's own heartbeat_at against DEFAULT_HEARTBEAT_TTL,
+        # so it must be the snapshot's clock, not the clock at the moment the gate
+        # runs: the gate fires AFTER the focused S1→S2→S3 stages, i.e. after minutes
+        # of LLM work, and the TTL is 10 minutes — comparable to a whole pass. Using
+        # a fresh now() there would age a heartbeat that was fresh when read past the
+        # TTL purely because the pass was slow, reporting corroborated=False for a
+        # task that is in fact live and filing a spurious stranded-work escalation.
+        # Pinning the clock to the read makes the verdict "was there a fresh
+        # per-task signal in the snapshot we hold" — evaluable, and biased toward
+        # suppression (the fail-safe direction) rather than toward escalating.
+        # task_by_id's own staleness is pre-existing and orthogonal.
+        _tasks_snapshot_at: datetime = datetime.now(UTC)
 
         current_stage_name: str | None = None
 
@@ -4060,6 +4483,36 @@ class ReconciliationHarness:
                         )
                         # resolved_fps stays empty → no suppressions → fail-open
 
+                # Task 2964: read the two per-project corroboration inputs ONCE,
+                # HERE — immediately before the live-workflow gate that consumes
+                # them, not at the top of the pass. They are freshness signals, and
+                # the top of the pass is minutes of LLM stage work away from this
+                # point: a task the scheduler picked up (or parked) mid-pass would
+                # read as uncorroborated from a t0 snapshot and the gate would file
+                # a stranded-work escalation for a task that is in fact live. The
+                # renderer's identical hoist (_render_live_workflow_section in
+                # reconciliation/stages/task_knowledge_sync.py) is safe at the top of
+                # its call only because its read-to-use gap is microseconds; this
+                # one's is not, so the read moves to the use.
+                #
+                # Both are constant for this project_root over the gate loop below,
+                # and both are wrapped fail-safe → None: a None simply means that
+                # corroborating signal cannot fire (corroboration_for_task tolerates
+                # None inputs and never raises on them), which leaves the verdict
+                # biased toward "not corroborated" — the direction that lets a
+                # stranded escalation through only when nothing at all vouches for
+                # the task. read_scheduler_state already returns an empty skeleton
+                # for an absent/invalid file; orchestrator_started_at returns None
+                # for an absent or unparseable lock.
+                try:
+                    _sched_state: dict | None = read_scheduler_state(Path(project_root))
+                except Exception:
+                    _sched_state = None
+                try:
+                    _orch_started: datetime | None = orchestrator_started_at(project_root)
+                except Exception:
+                    _orch_started = None
+
                 for finding in actionable_remaining:
                     persistence = await self._finding_persistence_count(project_id, finding)
                     if persistence >= _INTEGRITY_FINDING_RECURRENCE_THRESHOLD:
@@ -4071,11 +4524,11 @@ class ReconciliationHarness:
                         # escalate.  Guard detector errors as not-live (fail toward escalating
                         # rather than toward silencing a genuine stranded-work escalation).
                         # Task 2031: cited tasks in a never-dispatched status
-                        # (deferred/done/cancelled, via status_by_id above) drop the
+                        # (deferred/done/cancelled, via task_by_id above) drop the
                         # project-wide orchestrator_live signal, so a deferred task stuck
                         # behind an unrelated live orchestrator still escalates.
                         # Task 2067: extends this to a BLOCKED cited task that is
-                        # deterministic (via task_kind_by_id above) — it never
+                        # deterministic (via task_by_id above) — it never
                         # acquires a worktree/branch of its own, so the bare
                         # orchestrator lock is not task-specific evidence for it
                         # either, and a stranded deterministic deploy still escalates.
@@ -4087,6 +4540,24 @@ class ReconciliationHarness:
                         # loop) still escalates instead of being suppressed
                         # indefinitely. A blocked normal task WITH genuine
                         # per-task evidence is unaffected and still suppresses.
+                        # Task 2964: forwards `corroborated` for IN-PROGRESS cited
+                        # tasks. This consumer previously diverged from the
+                        # render-time Live-Workflow Signals section for exactly the
+                        # killed-but-lingering in-progress shape: a fleet redeploy
+                        # kills the workflow, but the git worktree registration
+                        # lingers and the restarted orchestrator re-acquires the
+                        # project-wide lock, so both signals keep asserting liveness
+                        # with no recent commit. Post-2963 the renderer downgrades
+                        # that to indeterminate and drops the task, while this gate
+                        # still read it as live and silenced the stranded-work
+                        # escalation indefinitely. The fail-safe direction here is
+                        # UNCHANGED: any assembly error, a non-in-progress status,
+                        # or an absent task_by_id entry all leave corroborated=None,
+                        # the detector's gate stays inert, and the escalation is
+                        # still suppressed — this is never a new silencing path.
+                        # Only an explicit corroborated=False (nothing at all
+                        # vouches for the task) now lets a stranded escalation
+                        # through.
                         affected_ids = _derive_affected_ids(finding)
                         # For liveness, iterate only cited task ids.
                         # _derive_affected_ids mixes in entity canonical_names,
@@ -4101,11 +4572,53 @@ class ReconciliationHarness:
                         ]
                         any_live = False
                         for tid in cited_task_ids:
+                            _task = task_by_id.get(tid)
+                            _metadata = _task.get('metadata') if _task else None
+                            _status = _task.get('status') if _task else None
+                            # In-progress-only, mirroring the renderer's
+                            # `task.get('status') == 'in-progress'` guard so all
+                            # three consumers gate corroboration identically.
+                            corroborated: bool | None = None
+                            if _status == 'in-progress' and _task is not None:
+                                try:
+                                    corroborated = corroboration_for_task(
+                                        _task, tid,
+                                        # The snapshot's own clock, NOT now() — see
+                                        # the _tasks_snapshot_at comment above: the
+                                        # heartbeat being aged came from that same
+                                        # read, and the 10-minute TTL is comparable
+                                        # to a remediation pass.
+                                        now=_tasks_snapshot_at,
+                                        scheduler_state=_sched_state,
+                                        orchestrator_started_at=_orch_started,
+                                    )
+                                except Exception as _corr_exc:
+                                    logger.debug(
+                                        'corroboration_for_task error for task %s; '
+                                        'leaving the gate inert: %s',
+                                        tid, _corr_exc,
+                                    )
                             try:
                                 if is_workflow_live_for_task(
                                     tid, project_root,
-                                    status=status_by_id.get(tid),
-                                    task_kind=task_kind_by_id.get(tid),
+                                    status=_status,
+                                    task_kind=(
+                                        _metadata.get('task_kind')
+                                        if isinstance(_metadata, dict) else None
+                                    ),
+                                    # Task 3751 rule 5 (pending + deterministic +
+                                    # pure gate). is_pure_gate_metadata's own
+                                    # non-Mapping -> False contract is the guard,
+                                    # so an absent or malformed blob degrades
+                                    # toward live with no extra check here. This
+                                    # completes the input parity: this consumer,
+                                    # recon_write_policy Gate 2 and
+                                    # _render_live_workflow_section now all pass
+                                    # the identical status/task_kind/pure_gate/
+                                    # corroborated tuple — the invariant task 2964
+                                    # exists to establish.
+                                    pure_gate=is_pure_gate_metadata(_metadata),
+                                    corroborated=corroborated,
                                 ):
                                     any_live = True
                                     break
@@ -4193,6 +4706,18 @@ class ReconciliationHarness:
         finally:
             await self._ensure_stage1_cycle_summary(
                 run, run_id, project_id, current_stage_name, run.started_at,
+            )
+            # Task 3732: unlike the Stage 1 arm — which deliberately no-ops on a
+            # remediation pass, since Stage 1 skips its own summary write there —
+            # the Stage 2 backstop is wired into this driver with NO remediation
+            # exclusion: Stage 2's in-stage write is unconditional by explicit
+            # design, so a lost row here is a genuine gap. Anchored at
+            # run.started_at (this driver has no separate cycle_start_time local),
+            # exactly as the Stage 1 call above. Placed strictly after it so a
+            # Stage 2 fault can never starve that arm, and strictly before
+            # update_run_stage_reports so the persisted copy captures its markers.
+            await self._ensure_stage2_cycle_summary(
+                run, run_id, project_id, run.started_at,
             )
             await self.journal.update_run_stage_reports(run_id, run.stage_reports)
             # Task 2744: GC this remediation run's per-run recon CLI config dir on

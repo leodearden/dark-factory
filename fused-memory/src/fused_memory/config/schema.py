@@ -345,18 +345,13 @@ class QueueConfig(BaseModel):
     # test_config_schema.py::
     # TestQueueConfigTransientErrorFields::test_transient_error_names_matches_durable_queue_default.
     #
-    # 1936's original wording gave "graphiti_core's NodeNotFoundError — a
-    # graph-visibility race" as the example. That premise was refuted by the
-    # esc-3561-3 investigation (2026-08-03) and the example has been replaced
-    # here to stop propagating it. The authoritative caveat, including the
-    # topology assumption that would make it defensible again, lives beside
-    # DEFAULT_TRANSIENT_ERROR_NAMES in durable_queue.py; task 3585 owns the
-    # removal itself.
+    # Task 3585 removed the not-found family (NodeNotFoundError,
+    # EdgeNotFoundError, EdgesNotFoundError) from this default. The evidence
+    # and the reinstatement condition live in exactly one place — beside
+    # DEFAULT_TRANSIENT_ERROR_NAMES in durable_queue.py — so the two copies of
+    # the LIST never grow two divergent copies of the ARGUMENT.
     transient_max_attempts: int = Field(default=12)
     transient_error_names: list[str] = Field(default_factory=lambda: [
-        'NodeNotFoundError',
-        'EdgeNotFoundError',
-        'EdgesNotFoundError',
         'TimeoutError',
         'ConnectionError',
         'ConnectionResetError',
@@ -690,23 +685,54 @@ class ProceduralTopicCluster(BaseModel):
 def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
     """Seed the known-contradictory/recurring procedural_knowledge topic clusters.
 
-    The first three are recurring procedural_knowledge topics that grew
-    several contradictory or paraphrased entries each because every
-    restatement scored BELOW the cosine near-dup threshold. Seeding the two
-    eval-worktree clusters closes task 2845 (gate 2841) AND the sibling
-    venv-shadowing cluster (gate 2844); the pytest-xdist cluster closes task
-    2974 -- it is the topic that originally motivated the guard (9
-    duplicates consolidated into canonical memory 8bb3eb15) but was never
-    itself seeded. Two more clusters (task 3013) seed architect-related
-    families: report_task_already_done / main-reachable-commit, registered
+    These are recurring procedural_knowledge topics that grew several
+    contradictory or paraphrased entries each because every restatement
+    scored BELOW the cosine near-dup threshold. The pytest-xdist cluster
+    closes task 2974 -- it is the topic that originally motivated the guard
+    (9 duplicates consolidated into canonical memory 8bb3eb15) but was never
+    itself seeded. Two clusters (task 3013) seed architect-related families:
+    report_task_already_done / main-reachable-commit, registered
     prospectively ahead of still-open gate 3011; and plan-revalidation after
     requeue/lock, gated to already-adjudicated task 2973 (canonical Mem0
-    entries 6a96a020 / 974b0adb). The sixth (task 3435) seeds the
+    entries 6a96a020 / 974b0adb). The fourth (task 3435) seeds the
     "``ruff format`` is not an enforced gate; only ``ruff check`` / pyright
     gate commits" family, registered prospectively ahead of still-blocked
     gate 3342 -- the first cluster whose corpus spans BOTH
     ``procedural_knowledge`` and ``preferences_and_norms`` (11 + 3 of its 14
     entries), which is how it grew uncaught.
+
+    RETIRED -- the two eval-worktree clusters that this seed originally
+    opened with (``eval-worktree-plan-tools-missing``, gate task 2841, and
+    ``eval-worktree-venv-shadowing``, gate task 2844) are BOTH deleted. Do
+    not reinstate either without re-deciding the two points below; the
+    absence of both ids is pinned by
+    ``TestProceduralTopicGuardClustersDefault``.
+
+    1. BOTH GATES ARE CLOSED. Each cluster's hint routed a blocked writer to
+       a human gate task, and tasks 2841 and 2844 are both ``done``. A
+       cluster exists to stop accretion on a topic pending an OPEN human
+       review; once that review closes it is pure cost -- it soft-blocks
+       writes and then hands the writer a remediation instruction pointing
+       at a finished adjudication.
+    2. BOTH DOUBLE-COUNTED A SPELLING VARIANT. Each carried the concept
+       "the eval worktree" as TWO phrase strings (``eval-worktree`` and
+       ``eval worktree``) at ``min_phrase_hits=2``, so a note that merely
+       named the eval worktree in both spellings scored 2 and was blocked
+       with no plan-tools / venv / shadowing content in it at all. This is
+       the same defect class the no-nesting invariant test guards
+       (``test_no_seeded_phrase_nests_inside_another_in_the_same_cluster``)
+       but it slips past that test, because the two spellings are siblings
+       rather than one nesting inside the other. The matcher-level fix --
+       counting spelling variants of one concept once -- is task 4179 and
+       is deliberately NOT part of this seed.
+
+    The plan-tools cluster was retired first, on measured harm: over the
+    archived dispatched-agent corpus it fired 14 of the 30 topic-cluster
+    soft-blocks and 13 of those 14 were OFF-TOPIC false positives (its
+    phrase list was the ordinary vocabulary of the plan subsystem, with no
+    eval-worktree anchor required). The venv-shadowing sibling fired 0 times
+    over the same 24-day corpus, so its removal is cruft removal rather than
+    incident response -- but it carries both defects above, so it goes too.
 
     Task 3054 then made per-phrase distinctiveness expressible: the
     report_task_already_done cluster declares its two identifier-shaped
@@ -719,52 +745,6 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
     Operator-overridable / tunable via config (green-tier hot-reloadable).
     """
     return [
-        ProceduralTopicCluster(
-            topic_id='eval-worktree-plan-tools-missing',
-            phrases=[
-                'plan-tools',
-                'plan_tools',
-                'plan.json',
-                'eval-worktree',
-                'eval worktree',
-                'create_plan',
-                'add_plan_step',
-            ],
-            min_phrase_hits=2,
-            hint=(
-                'Known-contradictory topic (plan-tools MCP server missing in the '
-                'eval worktree) gated to human task 2841. Do NOT add another entry '
-                '-- update/consolidate the existing entries, or add context to gate '
-                'task 2841.'
-            ),
-        ),
-        ProceduralTopicCluster(
-            topic_id='eval-worktree-venv-shadowing',
-            # Reviewer (robustness): the earlier seed paired short, generic tokens
-            # ('shadow', 'pyright', 'conftest', 'site-packages', bare '.venv') that
-            # co-occur in unrelated Python-env notes, so a genuine pyright/conftest
-            # or a plain '.venv'/'site-packages' gotcha could reach min_phrase_hits
-            # on its own and be mis-routed to gate 2844. Narrowed to eval-worktree
-            # anchors plus distinctive multi-word phrases, so a match now requires
-            # the eval-worktree context or an unambiguous venv-shadowing phrase
-            # (mirrors the more distinctive plan-tools cluster above). 'shadow' as a
-            # bare 6-char substring (fires on 'shadowing'/'overshadow'/'shadow copy')
-            # is replaced by the longer 'venv shadowing' / '.venv shadow'.
-            phrases=[
-                'eval-worktree',  # anchor; also substring-matches '.eval-worktrees'
-                'eval worktree',  # anchor (space spelling)
-                'editable install',
-                'venv shadowing',
-                '.venv shadow',
-            ],
-            min_phrase_hits=2,
-            hint=(
-                'Known-contradictory topic (venv / editable-install shadowing in the '
-                'eval worktree) gated to human task 2844. Do NOT add another entry '
-                '-- update/consolidate the existing entries, or add context to gate '
-                'task 2844.'
-            ),
-        ),
         ProceduralTopicCluster(
             topic_id='pytest-xdist-serial-override',
             # This is the topic that ORIGINALLY MOTIVATED this guard (task 2845):
@@ -808,7 +788,10 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
             # git subcommand 'merge-base --is-ancestor', and the hyphenated
             # 'main-reachable' -- none of which is a short generic token that
             # could substring-match unrelated text, so no further narrowing
-            # (unlike venv-shadowing above) is needed. Registered prospectively:
+            # (unlike the now-retired venv-shadowing cluster, whose short
+            # generic tokens had to be narrowed twice before it was deleted
+            # outright -- see the module docstring) is needed. Registered
+            # prospectively:
             # gate task 3011's 12-entry cluster is still open awaiting a
             # consolidation ruling, but this guard is forward-looking (it only
             # blocks NEW near-dup writes), so seeding it now stops that cluster
@@ -858,12 +841,17 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
             # (subcase lost_plan_reconstruction). Standalone generic tokens
             # ('lock', 'requeue', 'plan', 'commit', 'main', 'revalidate') are
             # deliberately excluded -- each could substring-match unrelated
-            # notes on its own (the venv-shadowing over-match lesson above).
+            # notes on its own (the venv-shadowing over-match lesson -- see
+            # the retirement notes in this module's seed docstring).
             # Bare 'create_plan'/'plan.json' are also excluded even though
-            # they'd be on-topic: those already anchor the
-            # eval-worktree-plan-tools-missing cluster, and reusing them here
-            # would blur the two clusters and risk mis-routing a write to the
-            # wrong gate task.
+            # they'd be on-topic. They originally anchored the
+            # eval-worktree-plan-tools-missing cluster and were kept out to
+            # avoid blurring the two; that cluster is now RETIRED, but the
+            # exclusion stands on its own second reason -- bare 'plan.json'
+            # NESTS inside '.task/plan.json' below, so seeding it would let
+            # one occurrence score two hits (see NESTING EXCLUSION), and
+            # bare 'create_plan' is plan-subsystem vocabulary that says
+            # nothing about revalidation.
             #
             # THIRD SUB-CASE (task 3054): warm-lane RESEED. A task dispatched
             # into a recycled lane can find .task/plan.json a DANGLING symlink
@@ -953,7 +941,8 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
             # seeded clusters, not just this one.
             #
             # GENERIC-TOKEN EXCLUSIONS (the venv-shadowing over-match lesson
-            # above): 'lint_command', 'pre-existing' and 'quality gate' are
+            # -- see this module's seed docstring): 'lint_command',
+            # 'pre-existing' and 'quality gate' are
             # too short/generic and would substring-match unrelated config or
             # formatting notes. 'not a quality gate' is excluded for a
             # different, structural reason even though it is a verbatim
@@ -1536,8 +1525,8 @@ class ReconciliationConfig(BaseModel):
     # Write-time TOPIC-keyed cluster guard for procedural_knowledge add_memory writes
     # (task 2845). Complements the cosine near-dup guard above: paraphrased same-topic
     # entries score BELOW any cosine threshold that is also safe for unrelated writes,
-    # so a recurring known-contradictory topic (e.g. "plan-tools MCP server missing in
-    # the eval worktree") kept accumulating contradictory entries the cosine guard
+    # so a recurring known-contradictory topic (e.g. "pytest-xdist -n0 serial override")
+    # kept accumulating contradictory entries the cosine guard
     # never fired on. This deterministic substring matcher targets exactly those known
     # clusters. Same ownership note as the near-dup fields above: enforced in the
     # server layer (server/near_duplicate_guard.py::find_matching_topic_cluster /
@@ -1554,8 +1543,12 @@ class ReconciliationConfig(BaseModel):
             "phrases -- OR any single one of that cluster's sufficient_phrases, for "
             'phrases distinctive enough to qualify alone -- is soft-blocked '
             '(error_type=ProceduralKnowledgeKnownTopicClusterWriteRejected) BEFORE '
-            'the cosine near-dup search. Seeded with the two known eval-worktree '
-            'clusters (gates 2841/2844); an empty list disables the topic guard. '
+            'the cosine near-dup search. Seeded with four clusters (pytest-xdist, '
+            'the two architect families, and ruff-format); the two eval-worktree '
+            'clusters that were seeded originally are RETIRED -- both their human '
+            'gates (2841/2844) are done -- and must not be reinstated without '
+            'reading the retirement notes on _default_topic_guard_clusters. An '
+            'empty list disables the topic guard. '
             'A sufficient_phrases entry absent from that cluster\'s phrases is '
             'rejected at load/reload rather than silently matching nothing. Green-tier '
             'hot-reloadable via the reload_config MCP tool (read live per add_memory '
@@ -2013,29 +2006,40 @@ class Mem0UpdateConfig(BaseModel):
         ),
     )
     content_amend_allowed_agent_prefixes: list[str] = Field(
-        default_factory=lambda: ['recon-stage-'],
+        default_factory=lambda: ['recon-stage-', 'curator-'],
         description=(
-            'agent_id prefixes authorized to AMEND CONTENT in place. Defaults to '
-            'the narrow recon-stage- bar (the same literal prefix '
-            'add_system_record gates on) because a content amend is a silent '
-            'history-rewrite primitive. NOTE: agent_id is SELF-REPORTED, so this '
-            'is a misuse deterrent for cooperating callers, not cryptographic '
-            'authorization. Deliberately a separate list from '
-            'metadata_patch_allowed_agent_prefixes so the two bars move '
-            'independently. Green-tier hot-reloadable via reload_config.'
+            'agent_id prefixes authorized to AMEND CONTENT in place. Narrow by '
+            'design, because a content amend is a silent history-rewrite '
+            'primitive. recon-stage- (the same literal prefix add_system_record '
+            'gates on) admits every reconciliation stage agent; curator- is the '
+            'dedicated prefix an interactive memory-consolidation sitting opts '
+            'into while executing skills/curate-fused-memories (esc-3524-1 '
+            'ruling (b), 2026-08-11; made an all-deployments schema default '
+            'rather than a per-machine config.yaml override by ruling '
+            '2026-08-12 — the skill does not work without it). Deliberately NOT '
+            'the everyday claude-interactive, which would grant silent '
+            'history-rewrite authority to every interactive session. NOTE: '
+            'agent_id is SELF-REPORTED, so this is a misuse deterrent for '
+            'cooperating callers, not cryptographic authorization. Deliberately '
+            'a separate list from metadata_patch_allowed_agent_prefixes so the '
+            'two bars move independently. Green-tier hot-reloadable via '
+            'reload_config.'
         ),
     )
     metadata_patch_allowed_agent_prefixes: list[str] = Field(
-        default_factory=lambda: ['recon-stage-'],
+        default_factory=lambda: ['recon-stage-', 'curator-'],
         description=(
             'agent_id prefixes authorized to PATCH METADATA in place. Ships '
             'identical to the content-amend list but is independently '
-            'configurable, and that is the point: widening THIS list alone is the '
-            'supported way to admit an interactive curator-gate flow (tagging a '
-            'survivor with topic=) without granting content-amend authority. A '
-            'mistagged patch is cheap to notice and cheap to correct; a runaway '
-            'silent content rewrite is not. Green-tier hot-reloadable via '
-            'reload_config.'
+            'configurable, and that is the point: widening THIS list alone '
+            'remains the supported way to admit a new interactive tagging flow '
+            'without granting content-amend authority. A mistagged patch is '
+            'cheap to notice and cheap to correct; a runaway silent content '
+            'rewrite is not. curator- deliberately holds BOTH arms, not only '
+            'this one: gate 3200 ratified retain-and-tag, whose folded entries '
+            'are retained as topic-stamped peers via a metadata-only patch — '
+            'content_amend alone would be the destructive half without the '
+            'preserving half. Green-tier hot-reloadable via reload_config.'
         ),
     )
     storm_threshold: int = Field(

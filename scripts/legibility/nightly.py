@@ -25,7 +25,7 @@ import sys
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 # Self-bootstrap for standalone `python scripts/legibility/nightly.py` runs
@@ -38,9 +38,19 @@ if __name__ == '__main__':
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from legibility import (  # noqa: E402
-    census_trigger, codebook, coder, digest, inventory, sampling, trickle_state,
+    census_trigger,
+    codebook,
+    coder,
+    digest,
+    inventory,
+    sampling,
+    trickle_state,
 )
-from legibility.config import LegibilityConfig, configure_logging, load_config  # noqa: E402
+from legibility.config import (  # noqa: E402
+    LegibilityConfig,
+    configure_logging,
+    load_config,
+)
 
 logger = logging.getLogger('legibility.nightly')
 
@@ -440,30 +450,29 @@ def _build_escalation_arguments(cfg: LegibilityConfig, summary: str, detail: str
 
 
 def _default_poster(url: str, envelope: dict) -> None:
-    """Post *envelope* to *url* via a real (lazily-imported) httpx POST.
+    """Post *envelope* to *url* over the MCP streamable-HTTP transport.
 
-    ``httpx`` is imported lazily so that importing this module -- for its
-    unit-tested pure core -- never needs it, and so the tests can substitute
-    a stub for the real POST. It is NOT lazy for availability: httpx is a
-    direct dependency of ``shared`` (``shared/pyproject.toml``,
-    ``httpx>=0.27``, task 2965), and the systemd unit runs this script under
-    ``uv run --frozen --project shared``, so it is always importable in
-    production. Mirrors ``census_trigger.default_status_fetcher``. Raises on
-    any network/HTTP failure; :func:`post_escalation` wraps this
-    best-effort.
+    Delegates to ``census_trigger.post_mcp_envelope``, which single-sources
+    the whole transport contract for this subsystem: the required
+    Accept/Content-Type pair, the session handshake, and response-body
+    decoding. Raises on any network/HTTP failure; :func:`post_escalation`
+    wraps this best-effort.
+
+    Why this is not a bare POST any more (task 3644): the escalation server
+    is a STATEFUL streamable-HTTP server. A session-less ``tools/call`` is
+    rejected at the transport layer, before the tool ever runs, with
+    ``400 Bad Request`` / ``"Missing session ID"`` -- and with
+    :func:`post_escalation` swallowing that best-effort, EVERY trickle
+    fail-loud escalation (extractor crash, coder storm, commit failure) was
+    silently dropped. ``post_mcp_envelope`` performs the
+    ``initialize`` -> ``notifications/initialized`` handshake on that 400 and
+    retries once, and decodes the SSE-framed reply that server then sends.
+
+    Keeps returning None and discarding the decoded body: the caller only
+    needs "did it land", and preserving the ``(url, envelope) -> None`` seam
+    signature keeps every injected ``poster=`` in the test suite working.
     """
-    import httpx
-
-    response = httpx.post(
-        url,
-        json=envelope,
-        # Required by the streamable-HTTP MCP transport -- single-sourced
-        # in census_trigger (already imported here) so a transport change is
-        # a one-line edit, not four lockstep edits with a silent-406 risk.
-        headers=census_trigger.MCP_STREAMABLE_HTTP_HEADERS,
-        timeout=10.0,
-    )
-    response.raise_for_status()
+    census_trigger.post_mcp_envelope(url, envelope, timeout=10.0)
 
 
 def post_escalation(
@@ -805,7 +814,7 @@ def _record_trickle_progress(
     mode.
     """
     record = recorder if recorder is not None else trickle_state.record_run
-    recorded_at = now if now is not None else datetime.now(timezone.utc)
+    recorded_at = now if now is not None else datetime.now(UTC)
     try:
         doc = record(
             cfg.project_id,
@@ -974,7 +983,7 @@ def run_nightly(
     cfg = load_config(resolved_config_path)
 
     if target_date is None:
-        target_date = (datetime.now(timezone.utc) - timedelta(days=1)).date()
+        target_date = (datetime.now(UTC) - timedelta(days=1)).date()
     if projects_root is None:
         projects_root = DEFAULT_PROJECTS_ROOT
     commit_fn = committer if committer is not None else _git_commit_docs_only

@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "protocol": {
     "blind_authoring": "single-author-blind-to-metrics, mechanized by commit ordering: the arm decomposition and query set were committed before any metric function existed in the tree",
     "fixtures": [
@@ -13,15 +13,15 @@
       },
       {
         "path": "fused-memory/tests/fixtures/e2_arm_claims.jsonl",
-        "commit": "007b106e6d89dd2ac0ef07bbb73ad8a925a3b5f5"
+        "commit": "55a9218a4c5809cad828db65781b1bd7389dff94"
       },
       {
         "path": "fused-memory/tests/fixtures/e2_query_set.jsonl",
-        "commit": "686c5f99532735a354885f439032a8fb1f70a26a"
+        "commit": "8972e9b17c746b7ec7cc377971cbc41fc25ad3d1"
       },
       {
         "path": "fused-memory/tests/fixtures/e2_distractor_slab.jsonl",
-        "commit": "3cdd87119600d52565de5b94bbefeb9289c4b603"
+        "commit": "6b4809ec138e8ae04c810bffbab4728b6c1d395d"
       }
     ],
     "token_estimator": "char-proxy:4-chars-per-token",
@@ -52,11 +52,14 @@
         "at_10": 0.902542372881356
       },
       "discoverability": {
-        "canonical_in_top_5_rate": 0.5338983050847458,
+        "canonical_in_top_5_rate": 0.538135593220339,
         "median_canonical_rank": 3.0,
-        "canonical_found_count": 172,
+        "canonical_found_count": 171,
         "canonical_candidates": 236,
-        "canonical_rank_window": 10
+        "canonical_rank_window": 10,
+        "stored_canonical_in_top_5_rate": 0.538135593220339,
+        "stored_canonical_median_rank": 3.0,
+        "stored_canonical_found_count": 171
       },
       "by_query_kind": {
         "claim": {
@@ -66,11 +69,14 @@
             "at_10": 0.9034090909090909
           },
           "discoverability": {
-            "canonical_in_top_5_rate": 0.4659090909090909,
+            "canonical_in_top_5_rate": 0.4715909090909091,
             "median_canonical_rank": 3.0,
-            "canonical_found_count": 118,
+            "canonical_found_count": 117,
             "canonical_candidates": 176,
-            "canonical_rank_window": 10
+            "canonical_rank_window": 10,
+            "stored_canonical_in_top_5_rate": 0.4715909090909091,
+            "stored_canonical_median_rank": 3.0,
+            "stored_canonical_found_count": 117
           }
         },
         "topic_phrasing": {
@@ -84,7 +90,10 @@
             "median_canonical_rank": 3.0,
             "canonical_found_count": 54,
             "canonical_candidates": 60,
-            "canonical_rank_window": 10
+            "canonical_rank_window": 10,
+            "stored_canonical_in_top_5_rate": 0.7333333333333333,
+            "stored_canonical_median_rank": 3.0,
+            "stored_canonical_found_count": 54
           }
         },
         "held_out": {
@@ -98,12 +107,15 @@
             "median_canonical_rank": 4.0,
             "canonical_found_count": 17,
             "canonical_candidates": 20,
-            "canonical_rank_window": 10
+            "canonical_rank_window": 10,
+            "stored_canonical_in_top_5_rate": 0.65,
+            "stored_canonical_median_rank": 4.0,
+            "stored_canonical_found_count": 17
           }
         }
       },
       "tokens_per_query": {
-        "mean": 3830.7033898305085,
+        "mean": 3832.8050847457625,
         "estimator": "char-proxy:4-chars-per-token",
         "window": 10
       },
@@ -112,7 +124,7 @@
         "guard_matched_rate": 0.0,
         "threshold_replay": true,
         "threshold": 0.92,
-        "max_observed_score": 0.89912236,
+        "max_observed_score": 0.89916354,
         "probes": 15,
         "guard_covered_probes": 12,
         "guard_covered_category": "procedural_knowledge"
@@ -128,11 +140,14 @@
         "at_10": 0.902542372881356
       },
       "discoverability": {
-        "canonical_in_top_5_rate": 0.5338983050847458,
+        "canonical_in_top_5_rate": 0.538135593220339,
         "median_canonical_rank": 3.0,
-        "canonical_found_count": 172,
+        "canonical_found_count": 171,
         "canonical_candidates": 236,
-        "canonical_rank_window": 10
+        "canonical_rank_window": 10,
+        "stored_canonical_in_top_5_rate": 0.538135593220339,
+        "stored_canonical_median_rank": 3.0,
+        "stored_canonical_found_count": 171
       },
       "by_query_kind": {
         "claim": {
@@ -142,11 +157,14 @@
             "at_10": 0.9034090909090909
           },
           "discoverability": {
-            "canonical_in_top_5_rate": 0.4659090909090909,
+            "canonical_in_top_5_rate": 0.4715909090909091,
             "median_canonical_rank": 3.0,
-            "canonical_found_count": 118,
+            "canonical_found_count": 117,
             "canonical_candidates": 176,
-            "canonical_rank_window": 10
+            "canonical_rank_window": 10,
+            "stored_canonical_in_top_5_rate": 0.4715909090909091,
+            "stored_canonical_median_rank": 3.0,
+            "stored_canonical_found_count": 117
           }
         },
         "topic_phrasing": {
@@ -160,7 +178,10 @@
             "median_canonical_rank": 3.0,
             "canonical_found_count": 54,
             "canonical_candidates": 60,
-            "canonical_rank_window": 10
+            "canonical_rank_window": 10,
+            "stored_canonical_in_top_5_rate": 0.7333333333333333,
+            "stored_canonical_median_rank": 3.0,
+            "stored_canonical_found_count": 54
           }
         },
         "held_out": {
@@ -174,12 +195,15 @@
             "median_canonical_rank": 4.0,
             "canonical_found_count": 17,
             "canonical_candidates": 20,
-            "canonical_rank_window": 10
+            "canonical_rank_window": 10,
+            "stored_canonical_in_top_5_rate": 0.65,
+            "stored_canonical_median_rank": 4.0,
+            "stored_canonical_found_count": 17
           }
         }
       },
       "tokens_per_query": {
-        "mean": 3830.7033898305085,
+        "mean": 3832.8050847457625,
         "estimator": "char-proxy:4-chars-per-token",
         "window": 10
       },
@@ -188,7 +212,7 @@
         "guard_matched_rate": 0.0,
         "threshold_replay": true,
         "threshold": 0.92,
-        "max_observed_score": 0.89912236,
+        "max_observed_score": 0.89916354,
         "probes": 15,
         "guard_covered_probes": 12,
         "guard_covered_category": "procedural_knowledge"
@@ -208,7 +232,10 @@
         "median_canonical_rank": 3.0,
         "canonical_found_count": 154,
         "canonical_candidates": 236,
-        "canonical_rank_window": 10
+        "canonical_rank_window": 10,
+        "stored_canonical_in_top_5_rate": 0.5042372881355932,
+        "stored_canonical_median_rank": 3.0,
+        "stored_canonical_found_count": 154
       },
       "by_query_kind": {
         "claim": {
@@ -222,7 +249,10 @@
             "median_canonical_rank": 3.0,
             "canonical_found_count": 100,
             "canonical_candidates": 176,
-            "canonical_rank_window": 10
+            "canonical_rank_window": 10,
+            "stored_canonical_in_top_5_rate": 0.4147727272727273,
+            "stored_canonical_median_rank": 3.0,
+            "stored_canonical_found_count": 100
           }
         },
         "topic_phrasing": {
@@ -236,7 +266,10 @@
             "median_canonical_rank": 2.0,
             "canonical_found_count": 54,
             "canonical_candidates": 60,
-            "canonical_rank_window": 10
+            "canonical_rank_window": 10,
+            "stored_canonical_in_top_5_rate": 0.7666666666666667,
+            "stored_canonical_median_rank": 2.0,
+            "stored_canonical_found_count": 54
           }
         },
         "held_out": {
@@ -250,12 +283,15 @@
             "median_canonical_rank": 1.5,
             "canonical_found_count": 16,
             "canonical_candidates": 20,
-            "canonical_rank_window": 10
+            "canonical_rank_window": 10,
+            "stored_canonical_in_top_5_rate": 0.6,
+            "stored_canonical_median_rank": 1.5,
+            "stored_canonical_found_count": 16
           }
         }
       },
       "tokens_per_query": {
-        "mean": 1180.614406779661,
+        "mean": 1181.2881355932204,
         "estimator": "char-proxy:4-chars-per-token",
         "window": 10
       },
@@ -264,7 +300,7 @@
         "guard_matched_rate": 0.0,
         "threshold_replay": true,
         "threshold": 0.92,
-        "max_observed_score": 0.8662588,
+        "max_observed_score": 0.866318,
         "probes": 15,
         "guard_covered_probes": 12,
         "guard_covered_category": "procedural_knowledge"
@@ -284,7 +320,10 @@
         "median_canonical_rank": 3.0,
         "canonical_found_count": 154,
         "canonical_candidates": 236,
-        "canonical_rank_window": 10
+        "canonical_rank_window": 10,
+        "stored_canonical_in_top_5_rate": 0.5042372881355932,
+        "stored_canonical_median_rank": 3.0,
+        "stored_canonical_found_count": 154
       },
       "by_query_kind": {
         "claim": {
@@ -298,7 +337,10 @@
             "median_canonical_rank": 3.0,
             "canonical_found_count": 100,
             "canonical_candidates": 176,
-            "canonical_rank_window": 10
+            "canonical_rank_window": 10,
+            "stored_canonical_in_top_5_rate": 0.4147727272727273,
+            "stored_canonical_median_rank": 3.0,
+            "stored_canonical_found_count": 100
           }
         },
         "topic_phrasing": {
@@ -312,7 +354,10 @@
             "median_canonical_rank": 2.0,
             "canonical_found_count": 54,
             "canonical_candidates": 60,
-            "canonical_rank_window": 10
+            "canonical_rank_window": 10,
+            "stored_canonical_in_top_5_rate": 0.7666666666666667,
+            "stored_canonical_median_rank": 2.0,
+            "stored_canonical_found_count": 54
           }
         },
         "held_out": {
@@ -326,12 +371,15 @@
             "median_canonical_rank": 1.5,
             "canonical_found_count": 16,
             "canonical_candidates": 20,
-            "canonical_rank_window": 10
+            "canonical_rank_window": 10,
+            "stored_canonical_in_top_5_rate": 0.6,
+            "stored_canonical_median_rank": 1.5,
+            "stored_canonical_found_count": 16
           }
         }
       },
       "tokens_per_query": {
-        "mean": 1180.614406779661,
+        "mean": 1181.2881355932204,
         "estimator": "char-proxy:4-chars-per-token",
         "window": 10
       },
@@ -340,7 +388,7 @@
         "guard_matched_rate": 0.0,
         "threshold_replay": true,
         "threshold": 0.92,
-        "max_observed_score": 0.8662588,
+        "max_observed_score": 0.866318,
         "probes": 15,
         "guard_covered_probes": 12,
         "guard_covered_category": "procedural_knowledge"
@@ -360,7 +408,10 @@
         "median_canonical_rank": 1.0,
         "canonical_found_count": 232,
         "canonical_candidates": 236,
-        "canonical_rank_window": 10
+        "canonical_rank_window": 10,
+        "stored_canonical_in_top_5_rate": 0.5042372881355932,
+        "stored_canonical_median_rank": 3.0,
+        "stored_canonical_found_count": 154
       },
       "by_query_kind": {
         "claim": {
@@ -374,7 +425,10 @@
             "median_canonical_rank": 1.0,
             "canonical_found_count": 174,
             "canonical_candidates": 176,
-            "canonical_rank_window": 10
+            "canonical_rank_window": 10,
+            "stored_canonical_in_top_5_rate": 0.4147727272727273,
+            "stored_canonical_median_rank": 3.0,
+            "stored_canonical_found_count": 100
           }
         },
         "topic_phrasing": {
@@ -388,7 +442,10 @@
             "median_canonical_rank": 1.0,
             "canonical_found_count": 58,
             "canonical_candidates": 60,
-            "canonical_rank_window": 10
+            "canonical_rank_window": 10,
+            "stored_canonical_in_top_5_rate": 0.7666666666666667,
+            "stored_canonical_median_rank": 2.0,
+            "stored_canonical_found_count": 54
           }
         },
         "held_out": {
@@ -402,12 +459,15 @@
             "median_canonical_rank": 1.0,
             "canonical_found_count": 18,
             "canonical_candidates": 20,
-            "canonical_rank_window": 10
+            "canonical_rank_window": 10,
+            "stored_canonical_in_top_5_rate": 0.6,
+            "stored_canonical_median_rank": 1.5,
+            "stored_canonical_found_count": 16
           }
         }
       },
       "tokens_per_query": {
-        "mean": 1195.7415254237287,
+        "mean": 1196.7796610169491,
         "estimator": "char-proxy:4-chars-per-token",
         "window": 10
       },
@@ -425,7 +485,7 @@
     "b_grouped+pin": {
       "pin": {
         "enabled": true,
-        "window_changed_rate": 0.059548254620123205
+        "window_changed_rate": 0.061601642710472276
       },
       "claim_recall": {
         "at_5": 0.8601694915254238,
@@ -436,7 +496,10 @@
         "median_canonical_rank": 1.0,
         "canonical_found_count": 232,
         "canonical_candidates": 236,
-        "canonical_rank_window": 10
+        "canonical_rank_window": 10,
+        "stored_canonical_in_top_5_rate": 0.5042372881355932,
+        "stored_canonical_median_rank": 3.0,
+        "stored_canonical_found_count": 154
       },
       "by_query_kind": {
         "claim": {
@@ -450,7 +513,10 @@
             "median_canonical_rank": 1.0,
             "canonical_found_count": 174,
             "canonical_candidates": 176,
-            "canonical_rank_window": 10
+            "canonical_rank_window": 10,
+            "stored_canonical_in_top_5_rate": 0.4147727272727273,
+            "stored_canonical_median_rank": 3.0,
+            "stored_canonical_found_count": 100
           }
         },
         "topic_phrasing": {
@@ -464,7 +530,10 @@
             "median_canonical_rank": 1.0,
             "canonical_found_count": 58,
             "canonical_candidates": 60,
-            "canonical_rank_window": 10
+            "canonical_rank_window": 10,
+            "stored_canonical_in_top_5_rate": 0.7666666666666667,
+            "stored_canonical_median_rank": 2.0,
+            "stored_canonical_found_count": 54
           }
         },
         "held_out": {
@@ -478,12 +547,15 @@
             "median_canonical_rank": 1.0,
             "canonical_found_count": 18,
             "canonical_candidates": 20,
-            "canonical_rank_window": 10
+            "canonical_rank_window": 10,
+            "stored_canonical_in_top_5_rate": 0.6,
+            "stored_canonical_median_rank": 1.5,
+            "stored_canonical_found_count": 16
           }
         }
       },
       "tokens_per_query": {
-        "mean": 1202.0211864406779,
+        "mean": 1203.2966101694915,
         "estimator": "char-proxy:4-chars-per-token",
         "window": 10
       },

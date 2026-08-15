@@ -151,14 +151,22 @@ fi
 #     only the timer is enabled below. `systemctl enable` on it would error.
 #
 # Drift direction (task 3641): know-live and pump-web-ui were transcribed from
-# the running host into the repo, i.e. committed-follows-installed. Task 3642
-# (2026-08-06) reconciled know-live's host unit — reinstalled from the
-# committed template, daemon-reload + restart — so this installer run is now
-# a genuine no-op for know-live. pump-web-ui's RestartSteps=4 remains the one
-# line intentionally ahead of the host: a declared forward-fix (see that
-# template's own header, owned by task 3424) which this run still propagates
-# outward — without it systemd ignores that unit's RestartMaxDelaySec= cap and
-# its advertised 10s->60s backoff never engages.
+# the running host into the repo, i.e. committed-follows-installed. BOTH have
+# since been reconciled back in the installer's direction — know-live by task
+# 3642 (2026-08-06, reinstall + daemon-reload + restart) and pump-web-ui by
+# task 3763 (2026-08-08, reinstall from the committed template + daemon-reload;
+# no restart was needed, the reloaded config takes effect at the next restart
+# scheduling) — so this installer run is now a genuine no-op for BOTH
+# transcribed units, with no committed line left ahead of the host in either.
+# pump-web-ui's RestartSteps=4 was the last such line: without it systemd
+# ignores that unit's RestartMaxDelaySec= cap and its advertised 10s->60s
+# backoff never engages. It is now installed and live (`systemctl --user show
+# orchestrator-pump-web-ui.service -p RestartSteps` reports 4, and
+# `systemd-analyze --user verify` no longer warns for this unit). That
+# template's own header — the forward-fix note owned by task 3424 — is
+# deliberately retained as the standing instruction to any future parity pass
+# NOT to reconcile RestartSteps=4 back out, since a rebuilt host or a stale
+# re-install would reopen exactly the gap it warns about.
 #
 # The orchestrator units run `uv run --frozen ...`, so process start never
 # implicitly re-syncs the shared dark-factory/.venv. After any dependency change
@@ -176,41 +184,127 @@ info "Installing orchestrator units + watchdog"
 mkdir -p "$HOME/bin"
 install -m 0755 "$REPO_ROOT/scripts/wait-for-port.py" "$HOME/bin/wait-for-port.py"
 
-cp "$REPO_ROOT/scripts/orchestrator-dark-factory.service"   "$UNIT_DIR/"
-cp "$REPO_ROOT/scripts/orchestrator-reify.service"          "$UNIT_DIR/"
-cp "$REPO_ROOT/scripts/orchestrator-autopilot-video.service" "$UNIT_DIR/"
-cp "$REPO_ROOT/scripts/orchestrator-my-solar-challenge.service" "$UNIT_DIR/"
-cp "$REPO_ROOT/scripts/orchestrator-solar-challenge-platform.service" "$UNIT_DIR/"
-cp "$REPO_ROOT/scripts/orchestrator-know-live.service"      "$UNIT_DIR/"
-cp "$REPO_ROOT/scripts/orchestrator-pump-web-ui.service"    "$UNIT_DIR/"
-cp "$REPO_ROOT/scripts/orchestrator-watchdog.service"       "$UNIT_DIR/"
-cp "$REPO_ROOT/scripts/orchestrator-watchdog.timer"         "$UNIT_DIR/"
+# Pre-install parity gate. Runs BEFORE the cp block below, and that ordering
+# is the whole point: once these units have been overwritten there is no drift
+# left to observe, so a post-install-only check would report green on exactly
+# the divergence this exists to surface. (No post-install re-check either —
+# unlike the dashboard's template-rendered unit, these are plain cp targets, so
+# a second run would only restate what the copy just did.)
+#
+# NON-FATAL, but not merely advisory: drift never aborts this script (the
+# sections below still run, and five of the seven registered units are KNOWN
+# RED on this host until the follow-up task lands) — it makes the ORCHESTRATOR
+# UNIT INSTALL opt-in instead. A bare warning would not be an intervention
+# point in a non-interactive `set -e` script: it scrolls past and the next line
+# overwrites the units anyway, so the operator is told to check the direction
+# at the one moment they can no longer act on it.
+#
+# NOTE the report does not mean "the installed copy is stale". Measured
+# 2026-08-02, the direction varies per unit: the repo copy is correct for
+# RestartSteps=4, but the INSTALLED copy is correct for the ExecStart --config
+# path (two committed units name config files that do not exist). That is why
+# the skip is the default and DF_INSTALL_ORCH_UNITS=1 is the override, rather
+# than the reverse.
+# The exit code alone is NOT trusted, because 2 is overloaded three ways:
+# the checker's "not installed on this host" (benign), `python3` refusing to
+# open a missing script file, and argparse rejecting an unknown flag. Renaming
+# the checker or one of its flags would therefore make this block print a
+# reassuring "installing below" and copy the units anyway — a gate reporting
+# green because it never ran, which is exactly the silent-drift failure the
+# checker exists to catch, reproduced one level up in its own wiring. So the
+# invocation is guarded by an existence check, and NO exit code is believed
+# unless the checker's own [orchestrator_unit_parity] tag appears in the
+# output it produced.
+_orch_parity_script="$REPO_ROOT/scripts/check_orchestrator_unit_parity.py"
+# 1 => the units were NOT verified as safe to overwrite (drift, unverifiable
+# state, or the gate itself did not run). Consumed by the install block below.
+_orch_install_blocked=0
 
-systemctl --user daemon-reload
-# Watchdog timer always enabled — it's the safety net that revives a
-# dead-enabled orchestrator (e.g. after a boot-race dependency cancel).
-systemctl --user enable orchestrator-watchdog.timer
-# Both orchestrators enabled by default to match the running production stack
-# (they coexist on separate escalation ports: reify=8100, dark-factory=8102).
-# Disable selectively if a host should not be part of the unattended workload.
-systemctl --user enable orchestrator-reify.service
-systemctl --user enable orchestrator-dark-factory.service
-# autopilot-video joined the unattended workload 2026-05-29 (separate target,
-# selected purely via --config). Enabled by default like the other two.
-systemctl --user enable orchestrator-autopilot-video.service
-# my-solar-challenge joined 2026-05-31 (escalation port 8106). Enabled by default.
-systemctl --user enable orchestrator-my-solar-challenge.service
-# solar-challenge-platform joined 2026-06-21 (escalation port 8107). Enabled by default.
-systemctl --user enable orchestrator-solar-challenge-platform.service
-# know-live (escalation port 8105) has had a committed template since e5273d8623
-# and a running unit on the host, but was never wired in here — an omission, not
-# a policy: this script marks real exclusions with an explicit "Deliberately NOT
-# wired" note and carries none for know-live. Enabled by default like the rest.
-systemctl --user enable orchestrator-know-live.service
-# pump-web-ui joined 2026-07-17 (escalation port 8108) and likewise ran on the
-# host with no committed template until task 3641 transcribed it. Enabled by default.
-systemctl --user enable orchestrator-pump-web-ui.service
-ok "orchestrator units + watchdog installed and enabled"
+if [ ! -f "$_orch_parity_script" ]; then
+  fail "Orchestrator parity gate missing: $_orch_parity_script"
+  fail "  Not treating that as 'nothing to check' — it is 'nothing checked'."
+  _orch_install_blocked=1
+else
+  _orch_parity_out="$(python3 "$_orch_parity_script" \
+       --installed-dir "$UNIT_DIR" \
+       --repo-root     "$REPO_ROOT" 2>&1)" && _orch_parity_exit=0 || _orch_parity_exit=$?
+  printf '%s\n' "$_orch_parity_out"
+
+  if ! printf '%s\n' "$_orch_parity_out" | grep -q '\[orchestrator_unit_parity\]'; then
+    fail "Orchestrator parity gate produced no [orchestrator_unit_parity] report"
+    fail "  (status $_orch_parity_exit) — it did not run, so its status says"
+    fail "  nothing about this host. Check the script path and its flags."
+    _orch_install_blocked=1
+  elif [ "$_orch_parity_exit" -eq 0 ]; then
+    ok "Orchestrator units: parity with committed copies"
+  elif [ "$_orch_parity_exit" -eq 2 ]; then
+    info "Orchestrator units: not yet installed in $UNIT_DIR (installing below)"
+  else
+    # Status 1 is "drift OR unverifiable" — it also covers a vanished committed
+    # unit, an unreadable unit file and a drop-in override, which the checker
+    # words apart so the operator is not sent hunting for a directive diff that
+    # does not exist.
+    warn "Orchestrator units: drift or unverifiable state — see the"
+    warn "  [orchestrator_unit_parity] report above. Note a drop-in override"
+    warn "  needs manual removal."
+    _orch_install_blocked=1
+  fi
+fi
+
+# The install is SKIPPED on a blocked gate rather than warned about, because a
+# warning scrolling past in a non-interactive `set -e` script is not an
+# intervention point: the very next line would overwrite the installed units.
+# Drift does not mean the installed copy is the stale one — measured
+# 2026-08-02, two COMMITTED units name --config paths that do not exist on this
+# host, so copying them would break those orchestrators on their next restart.
+# The gate stays non-fatal (it never aborts the run; sections below still
+# execute), it just declines to act on an unverified diff without being told.
+if [ "$_orch_install_blocked" -eq 1 ] && [ "${DF_INSTALL_ORCH_UNITS:-0}" != "1" ]; then
+  warn "SKIPPING the orchestrator unit install — nothing copied, nothing"
+  warn "  enabled, the installed units are UNCHANGED. Read the report above and"
+  warn "  reconcile whichever side is wrong, then re-run. To install anyway:"
+  warn "    DF_INSTALL_ORCH_UNITS=1 bash scripts/setup-host.sh"
+else
+  if [ "$_orch_install_blocked" -eq 1 ]; then
+    warn "DF_INSTALL_ORCH_UNITS=1 — installing over the reported drift"
+  fi
+
+  cp "$REPO_ROOT/scripts/orchestrator-dark-factory.service"   "$UNIT_DIR/"
+  cp "$REPO_ROOT/scripts/orchestrator-reify.service"          "$UNIT_DIR/"
+  cp "$REPO_ROOT/scripts/orchestrator-autopilot-video.service" "$UNIT_DIR/"
+  cp "$REPO_ROOT/scripts/orchestrator-my-solar-challenge.service" "$UNIT_DIR/"
+  cp "$REPO_ROOT/scripts/orchestrator-solar-challenge-platform.service" "$UNIT_DIR/"
+  cp "$REPO_ROOT/scripts/orchestrator-know-live.service"      "$UNIT_DIR/"
+  cp "$REPO_ROOT/scripts/orchestrator-pump-web-ui.service"    "$UNIT_DIR/"
+  cp "$REPO_ROOT/scripts/orchestrator-watchdog.service"       "$UNIT_DIR/"
+  cp "$REPO_ROOT/scripts/orchestrator-watchdog.timer"         "$UNIT_DIR/"
+
+  systemctl --user daemon-reload
+  # Watchdog timer always enabled — it's the safety net that revives a
+  # dead-enabled orchestrator (e.g. after a boot-race dependency cancel).
+  systemctl --user enable orchestrator-watchdog.timer
+  # Both orchestrators enabled by default to match the running production stack
+  # (they coexist on separate escalation ports: reify=8100, dark-factory=8102).
+  # Disable selectively if a host should not be part of the unattended workload.
+  systemctl --user enable orchestrator-reify.service
+  systemctl --user enable orchestrator-dark-factory.service
+  # autopilot-video joined the unattended workload 2026-05-29 (separate target,
+  # selected purely via --config). Enabled by default like the other two.
+  systemctl --user enable orchestrator-autopilot-video.service
+  # my-solar-challenge joined 2026-05-31 (escalation port 8106). Enabled by default.
+  systemctl --user enable orchestrator-my-solar-challenge.service
+  # solar-challenge-platform joined 2026-06-21 (escalation port 8107). Enabled by default.
+  systemctl --user enable orchestrator-solar-challenge-platform.service
+  # know-live (escalation port 8105) has had a committed template since e5273d8623
+  # and a running unit on the host, but was never wired in here — an omission, not
+  # a policy: this script marks real exclusions with an explicit "Deliberately NOT
+  # wired" note and carries none for know-live. Enabled by default like the rest.
+  systemctl --user enable orchestrator-know-live.service
+  # pump-web-ui joined 2026-07-17 (escalation port 8108) and likewise ran on the
+  # host with no committed template until task 3641 transcribed it. Enabled by default.
+  systemctl --user enable orchestrator-pump-web-ui.service
+  ok "orchestrator units + watchdog installed and enabled"
+fi
 
 # ---------------------------------------------------------------------------
 # 6. jCodeMunch — structured code retrieval for coding agents

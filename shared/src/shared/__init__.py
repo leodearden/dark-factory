@@ -22,16 +22,19 @@ from shared.cli_invoke import (
     ended_awaiting_background_for_session,
     invoke_claude_agent,
     invoke_with_cap_retry,
+    is_cli_invocation_rejected,
     is_server_error_status,
     is_timed_out_with_progress,
     is_zero_output_timeout,
     read_transcript_records,
+    require_non_blank_prompt,
     transcript_exists,
 )
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.cost_store import CostStore
 from shared.locking import (
-    CODE_EXTENSIONS,
+    EXTENSIONLESS_FILENAMES,
+    FILE_EXTENSIONS,
     directory_locks,
     files_to_modules,
     is_file_path,
@@ -40,7 +43,7 @@ from shared.locking import (
     strip_directory_locks,
 )
 from shared.mcp_idempotency import MUTATING_TASK_TOOLS, maybe_inject_client_op_id
-from shared.safe_io import load_json_or_warn
+from shared.safe_io import atomic_write_text, load_json_or_warn
 from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
 from shared.usage_gate import (
     AccountPhase,
@@ -75,10 +78,12 @@ __all__ = [
     'ended_awaiting_background_for_session',
     'invoke_claude_agent',
     'invoke_with_cap_retry',
+    'is_cli_invocation_rejected',
     'is_server_error_status',
     'is_timed_out_with_progress',
     'is_zero_output_timeout',
     'read_transcript_records',
+    'require_non_blank_prompt',
     'transcript_exists',
     'AccountConfig',
     'UsageCapConfig',
@@ -92,11 +97,13 @@ __all__ = [
     'normalize_lock',
     'files_to_modules',
     'modules_conflict',
-    'CODE_EXTENSIONS',
+    'FILE_EXTENSIONS',
+    'EXTENSIONLESS_FILENAMES',
     'is_file_path',
     'directory_locks',
     'strip_directory_locks',
     'MUTATING_TASK_TOOLS',
     'maybe_inject_client_op_id',
     'load_json_or_warn',
+    'atomic_write_text',
 ]

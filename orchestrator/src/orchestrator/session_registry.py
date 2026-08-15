@@ -36,6 +36,13 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+# NOTE: no non-stdlib imports at module scope, deliberately — see the module
+# docstring's stdlib-only clause and _atomic_write_text below. This module is
+# executed by absolute path from skills/spawn/spawn-claude.sh with no venv,
+# install or workspace packages available, so a `from shared import ...` here
+# makes it unimportable there. Pinned by
+# test_session_registry.py::TestStdlibOnlySelfContainment.
+
 # ---------------------------------------------------------------------------
 # Schema / contract (PRD §6 G5): consumers import this; they never re-derive
 # the record shape. Bump SCHEMA_VERSION on any breaking field change.
@@ -357,15 +364,19 @@ class DecisionRecord:
 
     Concurrency: unlike SessionRecord (single-writer-per-slug -- only the
     spawning session ever mutates its own record), a single decision id's
-    file may be mutated by TWO different subsystems: a C8 watcher (via
-    update_decision_state) and the C5 cockpit (via set_manual_boost). Both
-    helpers now serialize their read-modify-write span per-decision-id via
+    file may be mutated by SEVERAL different subsystems: a C8 watcher (via
+    update_decision_state), the C5 cockpit (via set_manual_boost), and -- for
+    task 3640's back-fill, running against live records while the watchers
+    are up -- scripts/backfill_decision_queue_stamp.py (via
+    set_decision_escalations_dir). All three helpers serialize their
+    read-modify-write span per-decision-id via
     decision_id_lock (a stable ``<id>.json.lock`` sidecar, mirroring task
-    1609's escalation_id_lock), so a concurrent state-update and
-    boost-update racing on the same id no longer drops either mutation --
-    each write remains individually atomic AND the read+mutate+write span
-    is now serialized against other callers on the same id. See
-    update_decision_state/set_manual_boost for the caller-facing note.
+    1609's escalation_id_lock), so a concurrent state-update, boost-update
+    or queue-stamp racing on the same id no longer drops any of the
+    mutations -- each write remains individually atomic AND the
+    read+mutate+write span is serialized against other callers on the same
+    id. See update_decision_state/set_manual_boost/
+    set_decision_escalations_dir for the caller-facing note.
     """
 
     id: str
@@ -582,12 +593,36 @@ class CorruptSessionRecord(Exception):
 def _atomic_write_text(path: Path, text: str) -> None:
     """Atomically write *text* to *path* (tmp file in the same dir, then os.replace).
 
-    Mirrors ``LaneStore._write`` (lane_lifecycle.py:279-298): the tmp file is
-    created in the target's own parent dir so the replace stays within one
-    filesystem, and is cleaned up on any failure. Shared atomic-write core:
-    write_record calls this and lets a failure propagate (its sole caller,
-    the CLI main(), provides the outer fail-soft boundary); write_decision
-    calls this too but swallows a failure itself (it is called directly by
+    THIS IS THE DELIBERATE EXCEPTION to task 3223's consolidation, which moved
+    this repo's copies of the tmp+rename writer onto
+    :func:`shared.safe_io.atomic_write_text`. This module does NOT delegate,
+    and must not be "finished off" by a later cleanup.
+
+    Why: this module is invoked by absolute path from
+    ``skills/spawn/spawn-claude.sh`` under an interpreter with no venv, no
+    install and no workspace packages on ``sys.path`` (see the module
+    docstring's stdlib-only clause, which is a hard constraint, not a stylistic
+    preference). A module-scope ``from shared import safe_io`` makes the whole
+    module unimportable there — measured as ``ModuleNotFoundError: No module
+    named 'shared'`` — and the only visible symptom is a hook subprocess that
+    silently never writes ``record.json``. The contract is pinned directly by
+    ``test_session_registry.py::TestStdlibOnlySelfContainment``, and this
+    function is recorded in ``_ALLOWED_RENAMERS`` in
+    ``shared/tests/test_safe_io.py`` so the anti-regrowth guard reads it as the
+    documented exception it is rather than a fresh copy.
+
+    The cost is conscious: the repo keeps two hand-rolled copies of this
+    pattern instead of one. A documented, allowlisted, test-pinned second copy
+    is strictly better than a module that cannot be imported by its own
+    documented entrypoint.
+
+    ``os.fdopen(fd, 'w')`` is locale-dependent rather than utf-8. That is a
+    latent bug — JSON written under a non-UTF-8 locale — but it is the
+    behaviour this module has always had, and changing it is out of scope here.
+
+    Error policy stays with the callers: write_record lets a failure propagate
+    (its sole caller, the CLI main(), provides the outer fail-soft boundary);
+    write_decision swallows a failure itself (it is called directly by
     watchers/cockpit code with no such boundary).
     """
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -759,6 +794,50 @@ def list_decisions(root: Path | str | None = None) -> list[DecisionRecord]:
     return decisions
 
 
+def _mutate_decision(
+    decision_id: str,
+    mutate: Callable[[DecisionRecord], None],
+    *,
+    caller: str,
+    root: Path | str | None = None,
+) -> DecisionRecord | None:
+    """Lock-serialized, fail-soft read-modify-write of one decision record.
+
+    The single implementation of the field-setter body shared by
+    update_decision_state, set_manual_boost and set_decision_escalations_dir
+    (task 3640 amendment). Those three are the public, caller-facing names and
+    keep their own docstrings; this holds the parts that MUST NOT diverge
+    between them -- the lock placement, the read, the write, and the
+    fail-soft except-tuple.
+
+    That is not merely tidiness. The lock has to sit INSIDE the try/except for
+    a lock-acquisition fault to be absorbed rather than raised at a C8/cockpit
+    caller, and the except-tuple has to cover exactly the read/parse/write
+    fault set. Copied per-setter, a fix to either is a fix that has to be
+    remembered three times, and a missed copy fails silently in production
+    while every test stays green.
+
+    *mutate* is applied to the freshly-read record in-place; *caller* names the
+    public helper in the ERROR log so a fail-soft None is still attributable to
+    the API the caller actually invoked.
+
+    Returns the mutated record, or None on ANY fault (missing file, corrupt
+    body, lock-acquisition fault, write failure), never raising -- matching
+    write_decision's contract.
+    """
+    path = decision_path_for_id(decision_id, root=root)
+    try:
+        with decision_id_lock(decision_id, root=root):
+            record = DecisionRecord.from_json(path.read_text())
+            mutate(record)
+            if not write_decision(record, root=root):
+                return None
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        logger.error('%s: failed to read %s', caller, path, exc_info=True)
+        return None
+    return record
+
+
 def update_decision_state(
     decision_id: str,
     state: str,
@@ -777,17 +856,12 @@ def update_decision_state(
     a concurrent set_manual_boost (or a second update_decision_state) racing
     on the SAME decision id no longer drops either call's field mutation.
     """
-    path = decision_path_for_id(decision_id, root=root)
-    try:
-        with decision_id_lock(decision_id, root=root):
-            record = DecisionRecord.from_json(path.read_text())
-            record.state = state
-            if not write_decision(record, root=root):
-                return None
-    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
-        logger.error('update_decision_state: failed to read %s', path, exc_info=True)
-        return None
-    return record
+    def _set(record: DecisionRecord) -> None:
+        record.state = state
+
+    return _mutate_decision(
+        decision_id, _set, caller='update_decision_state', root=root
+    )
 
 
 def set_manual_boost(
@@ -808,17 +882,55 @@ def set_manual_boost(
     a concurrent update_decision_state (or a second set_manual_boost) racing
     on the SAME decision id no longer drops either call's field mutation.
     """
-    path = decision_path_for_id(decision_id, root=root)
-    try:
-        with decision_id_lock(decision_id, root=root):
-            record = DecisionRecord.from_json(path.read_text())
-            record.manual_boost = boost
-            if not write_decision(record, root=root):
-                return None
-    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
-        logger.error('set_manual_boost: failed to read %s', path, exc_info=True)
-        return None
-    return record
+    def _set(record: DecisionRecord) -> None:
+        record.manual_boost = boost
+
+    return _mutate_decision(decision_id, _set, caller='set_manual_boost', root=root)
+
+
+def set_decision_escalations_dir(
+    decision_id: str,
+    escalations_dir: str | Path,
+    root: Path | str | None = None,
+) -> DecisionRecord | None:
+    """Read-modify-write *decision_id*'s escalations_dir (queue stamp) field.
+
+    Added for task 3640's back-fill of the legacy open population, but written
+    as an ordinary field setter: any caller needing to (re)stamp a record's
+    owning queue should come through here rather than rewriting the JSON.
+
+    NORMALIZES ON THE WAY IN via normalize_escalations_dir, so every writer of
+    this field stores ONE canonical spelling and the reaper's axis-2 compare
+    stays honest -- a raw-stored dotted/trailing-slash spelling would compare
+    unequal to the very queue it names, and the record would silently never
+    close again (fail-open, so invisible). ``UNKNOWN_QUEUE`` passes through
+    verbatim by that same normalizer's sentinel case: it is a state, not a
+    path, and must not become cwd-dependent.
+
+    Self-guarding FAIL-SOFT: returns None (logs ERROR) on any fault -- a
+    missing file, a corrupt body, a lock-acquisition fault, or a write
+    failure -- rather than raising, matching write_decision's contract for
+    its direct C8/cockpit callers. That matters concretely for the back-fill,
+    which lists the whole decision population and then writes each id back: a
+    record closed or removed by a live watcher in between is expected, not
+    exceptional, and must not abort a migration mid-population.
+
+    Concurrency NOTE (see DecisionRecord's docstring): this read-modify-write
+    is serialized per-decision-id via decision_id_lock (a stable
+    ``<id>.json.lock`` sidecar, mirroring task 1609's escalation_id_lock).
+    Its two siblings already race each other; the back-fill is a THIRD writer,
+    running against live records while the C8 watchers and the cockpit are up,
+    which is exactly why it goes through this helper instead of rewriting
+    decision JSON itself -- doing that in a script would bypass both the lock
+    and the atomic tmp+os.replace writer and reintroduce the race 1609/3528
+    fixed.
+    """
+    def _set(record: DecisionRecord) -> None:
+        record.escalations_dir = normalize_escalations_dir(escalations_dir)
+
+    return _mutate_decision(
+        decision_id, _set, caller='set_decision_escalations_dir', root=root
+    )
 
 
 @contextlib.contextmanager
@@ -829,8 +941,9 @@ def decision_id_lock(decision_id: str, root: Path | str | None = None) -> Iterat
     task 1609) near-verbatim, retargeted to the decisions dir.
 
     WHY A SIDECAR (PRD-D3 rationale, same as 1609): write_decision's writer
-    is atomic tmp+os.replace (_atomic_write_text). After a replace, the data
-    file ``<decisions_dir>/<id>.json`` is a NEW inode. A second writer that
+    is atomic tmp+os.replace (``_atomic_write_text`` above). After a replace,
+    the data file
+    ``<decisions_dir>/<id>.json`` is a NEW inode. A second writer that
     flock()s the (new) data-file path binds to a different inode and races
     anyway -- the lock is defeated. The fix is a STABLE lock target:
     ``<decisions_dir>/<id>.json.lock``, created once via os.open(O_CREAT)
@@ -874,11 +987,44 @@ def decision_id_lock(decision_id: str, root: Path | str | None = None) -> Iterat
         os.close(fd)
 
 
-_ESCALATION_ARCHIVE_SUBDIR = 'archive'
+ESCALATION_ARCHIVE_SUBDIR = 'archive'
 """Mirrors escalation.archive.ARCHIVE_SUBDIR BY CONVENTION, not by import:
 this module is deliberately stdlib-only with no intra-orchestrator imports
 (see module docstring), so it cannot import escalation.archive directly.
-Kept in sync by hand with that constant."""
+Kept in sync by hand with that constant.
+
+PUBLIC (task 3640 amendment) because it defines half of what "this queue
+holds that escalation id" MEANS: read_escalation_status looks at the queue
+root and then under this subdir, and scripts/backfill_decision_queue_stamp.py
+must search exactly the same two tiers or it can stamp a record with a queue
+the reaper would never match against -- pinning that record OPEN forever.
+Out-of-module searchers reference this name rather than re-spelling 'archive',
+so the two notions cannot drift."""
+
+
+UNKNOWN_QUEUE = '<unknown>'
+"""The THIRD queue state for DecisionRecord.escalations_dir (task 3640).
+
+Distinct from BOTH a real queue path and the ``''`` unset/legacy sentinel:
+
+- ``''``          -- "nobody told us". A record filed before the field
+                     existed, or by a caller that omitted it. The reaper
+                     falls back to project-only scoping and MAY close it.
+- ``'<unknown>'`` -- "we investigated and could NOT determine the owning
+                     queue". The reaper REFUSES to close it; it stays a
+                     visible cockpit row for human closure.
+- ``'/abs/path'`` -- a normalized queue path. Reaped only by that queue.
+
+The two sentinels are deliberately NOT collapsed. 3528 defined ``''``'s
+meaning and an existing test asserts a ``''`` record still closes; redefining
+it would change behaviour for every future omitted-flag caller under the
+human. Separating them lets task 3640 back-fill the undeterminable records
+with an honest value instead of leaving them in the false-closable ``''``
+population.
+
+The angle brackets are load-bearing rather than decorative: a resolved queue
+path always begins with ``'/'``, so this sentinel can never collide with a
+real queue no matter what a project is named or where it is checked out."""
 
 
 def normalize_escalations_dir(value: str | Path) -> str:
@@ -897,10 +1043,11 @@ def normalize_escalations_dir(value: str | Path) -> str:
     Returns ``''`` -- the "unset/legacy queue" sentinel, never a path -- for
     an empty or whitespace-only *value*, mirroring the sibling
     ``DecisionRecord.severity`` convention; the reaper reads that sentinel as
-    "fall back to project-only scoping". Otherwise returns
-    ``str(Path(raw).expanduser().resolve())``. ``Path.resolve()`` is
-    non-strict on Python 3.11+, so a well-formed queue path that does not
-    exist yet still normalizes rather than faulting.
+    "fall back to project-only scoping". Returns ``UNKNOWN_QUEUE`` VERBATIM
+    for that sentinel (task 3640) -- the reaper reads it as "refuse to close".
+    Otherwise returns ``str(Path(raw).expanduser().resolve())``.
+    ``Path.resolve()`` is non-strict on Python 3.11+, so a well-formed queue
+    path that does not exist yet still normalizes rather than faulting.
 
     Stdlib-only and fail-soft: never raises. A value the OS cannot resolve
     (an embedded NUL, an unreadable cwd) degrades to the stripped raw string,
@@ -911,6 +1058,15 @@ def normalize_escalations_dir(value: str | Path) -> str:
     raw = str(value).strip()
     if not raw:
         return ''
+    # BEFORE the resolve(): UNKNOWN_QUEUE is a bare word, so Path.resolve()
+    # would treat it as a path RELATIVE TO THE CALLING PROCESS'S CWD and
+    # return '<cwd>/<unknown>' -- a different string in the back-fill script
+    # than in a watcher's reaper. The stamp would stop being deterministic
+    # across processes (the two sides of the join could never compare equal)
+    # and the stored value would be an outright lie about where the record's
+    # escalation lives. It is a sentinel, not a path: it round-trips verbatim.
+    if raw == UNKNOWN_QUEUE:
+        return UNKNOWN_QUEUE
     try:
         return str(Path(raw).expanduser().resolve())
     except (OSError, ValueError, RuntimeError):
@@ -953,7 +1109,7 @@ def read_escalation_status(escalations_dir: Path | str, escalation_id: str) -> s
     base = Path(escalations_dir)
     candidate = base / f'{escalation_id}.json'
     if not candidate.is_file():
-        matches = sorted((base / _ESCALATION_ARCHIVE_SUBDIR).rglob(f'{escalation_id}.json'))
+        matches = sorted((base / ESCALATION_ARCHIVE_SUBDIR).rglob(f'{escalation_id}.json'))
         candidate = matches[-1] if matches else None
     if candidate is None:
         return None
@@ -2391,9 +2547,25 @@ def _run_reap_decisions(project: str, escalations_dir: str) -> None:
     filed before that field existed) falls back to axis 1 alone, keeping
     today's exact behaviour for the existing population rather than changing
     it under the human; the two watchers stamp the queue on newly-filed
-    decisions, so the unprotected set only shrinks. Otherwise the closure
-    defers to read_escalation_status against *escalations_dir*. Root
-    resolves via $CLAUDE_FLEET_ROOT, same as every other verb.
+    decisions, so the unprotected set only shrinks. Task 3640 then BACK-FILLED
+    the pre-existing open population, so that fallback set is drained rather
+    than merely shrinking. Otherwise the closure defers to
+    read_escalation_status against *escalations_dir*. Root resolves via
+    $CLAUDE_FLEET_ROOT, same as every other verb.
+
+    UNKNOWN QUEUE (task 3640). A decision stamped ``UNKNOWN_QUEUE`` is
+    refused by name: its owning queue was investigated and could not be
+    determined, so NO reaper may close it and it stays a visible cockpit row
+    until a human closes it. Honestly: the axis-2 compare above would already
+    refuse it, since it refuses ANY truthy stamp that is not this reaper's
+    queue -- so the by-name guard changes no outcome today. It is here so the
+    policy is INTENTIONAL and named rather than an accident of string
+    inequality that a future refactor of that compare could silently remove,
+    and because it closes the one degenerate case the compare genuinely does
+    not cover: a reaper invoked with the sentinel as its OWN
+    ``--escalations-dir`` makes both sides compare EQUAL, and the record then
+    survives only because read_escalation_status happens to find no queue at
+    that bogus relative path.
 
     Both guards are fail-OPEN: on any doubt the decision stays OPEN and
     visible in the cockpit queue, matching reap_answered_decisions' contract
@@ -2426,6 +2598,11 @@ def _run_reap_decisions(project: str, escalations_dir: str) -> None:
         # between checkouts, or written by a future caller), and a false
         # NON-match is how silent divergence creeps back in.
         decision_dir = normalize_escalations_dir(decision.escalations_dir)
+        # Task 3640: refuse an undeterminable-queue record BY NAME, before the
+        # inequality compare below -- see the UNKNOWN QUEUE paragraph above
+        # for why this deliberately-redundant-today guard exists.
+        if decision_dir == UNKNOWN_QUEUE:
+            return None
         if decision_dir and decision_dir != reaper_dir:
             return None
         # RAW escalations_dir here, deliberately: only the comparison needs a

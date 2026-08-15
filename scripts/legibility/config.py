@@ -22,7 +22,7 @@ import sys
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 LOG_LEVEL_ENV_VAR = 'LEGIBILITY_LOG_LEVEL'
 LOG_FORMAT = '%(asctime)s %(levelname)s %(name)s: %(message)s'
@@ -114,6 +114,23 @@ class Timeouts(BaseModel):
     census_synthesis_secs: int = 1800
 
 
+def _require_absolute(value: str, *, field_name: str, detail: str) -> str:
+    """Raise ``ValueError`` naming *field_name* when *value* isn't absolute.
+
+    Shared by the ``project_root`` and ``cwd_prefixes`` validators below —
+    both fields are matched against a consuming process's own absolute cwd
+    (project_root: each consumer's process cwd; cwd_prefixes: a session's
+    absolute cwd), so a relative entry in either one silently resolves
+    against the wrong tree, or matches no real session at all, instead of
+    failing loudly here at config-load time. The word "absolute" is always
+    present in the message so callers can assert on the behavior rather
+    than the field name.
+    """
+    if not os.path.isabs(value):
+        raise ValueError(f'{field_name} must be an absolute path, got {value!r}. {detail}')
+    return value
+
+
 class LegibilityConfig(BaseModel):
     """The full ``docs/legibility/legibility.yaml`` schema (PRD §7.4).
 
@@ -140,6 +157,62 @@ class LegibilityConfig(BaseModel):
     census: Census = Field(default_factory=Census)
     models: Models = Field(default_factory=Models)
     timeouts: Timeouts = Field(default_factory=Timeouts)
+
+    @field_validator('project_root')
+    @classmethod
+    def _project_root_must_be_absolute(cls, value: str) -> str:
+        """Reject a relative ``project_root`` at config-load time.
+
+        Every consumer (sampling.py, census.py's ``default_batch_source``,
+        digest.py, ...) resolves ``cfg.project_root`` against its OWN
+        process cwd. ``scripts/legibility-trickle@.service`` pins
+        ``WorkingDirectory=/home/leo/src/dark-factory`` for every ``%i``
+        instance, so a relative root in any project's legibility.yaml would
+        silently resolve into the dark-factory checkout instead of that
+        project's own tree. Failing loudly here — at ``load_config``, whose
+        documented contract is to propagate ``ValidationError`` on malformed
+        input — is cheaper than letting each consumer guess.
+        """
+        return _require_absolute(
+            value,
+            field_name='project_root',
+            detail=(
+                'A relative project_root resolves against each consuming '
+                "process's own cwd (e.g. the trickle systemd unit's pinned "
+                'WorkingDirectory), not the config file location.'
+            ),
+        )
+
+    @field_validator('cwd_prefixes')
+    @classmethod
+    def _cwd_prefixes_must_be_absolute(cls, value: list[str]) -> list[str]:
+        """Reject any non-absolute ``cwd_prefixes`` entry at config-load time.
+
+        ``inventory.is_member()`` does
+        ``Path(cwd).is_relative_to(Path(prefix))`` and
+        ``iter_project_dirs()`` encodes each prefix against
+        ``~/.claude/projects``' absolute-cwd encoding, so a relative prefix
+        (e.g. ``.`` or ``src/foo``) never matches any real session cwd — the
+        sampler/census would silently enumerate an empty corpus and report a
+        legitimate-looking no-change night. That is the identical
+        silent-degradation failure mode the ``project_root`` check above
+        exists to prevent, so it gets the same loud-at-load-time treatment.
+        ``agent_transcript_roots`` is deliberately project_root-relative and
+        stays exempt from this check.
+        """
+        for entry in value:
+            _require_absolute(
+                entry,
+                field_name='cwd_prefixes',
+                detail=(
+                    'Every cwd_prefixes entry is matched against an '
+                    "absolute session cwd (inventory.is_member's "
+                    'Path(cwd).is_relative_to(Path(prefix)) and '
+                    "iter_project_dirs' ~/.claude/projects encoding), so a "
+                    'relative prefix would silently match nothing.'
+                ),
+            )
+        return value
 
 
 def load_config(path: Path | str) -> LegibilityConfig:

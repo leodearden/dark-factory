@@ -20,7 +20,6 @@ import pathlib
 import subprocess
 
 import pytest
-
 from systemd_unit_invariants import (
     assert_restart_backoff_effective,
     restart_directive,

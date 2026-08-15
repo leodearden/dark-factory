@@ -49,6 +49,7 @@ if __name__ == '__main__':
     sys.path.insert(0, str(_HERE.parents[2] / 'orchestrator' / 'src'))  # <repo>/orchestrator/src
 
 from legibility import census_trigger, config, inventory, sampling  # noqa: E402
+
 from orchestrator import session_registry  # noqa: E402
 
 logger = logging.getLogger('legibility.check_transcript_persistence')
@@ -495,29 +496,28 @@ def _build_escalation_arguments(
 
 
 def _default_poster(url: str, envelope: dict) -> None:
-    """Post *envelope* to *url* via a real (lazily-imported) httpx POST.
+    """Post *envelope* to *url* over the MCP streamable-HTTP transport.
 
-    ``httpx`` is imported lazily so that importing this module -- for its
-    unit-tested pure core -- never needs it, and so the tests can substitute
-    a stub for the real POST. It is NOT lazy for availability: httpx is a
-    direct dependency of ``shared`` (``shared/pyproject.toml``,
-    ``httpx>=0.27``, task 2965), and the systemd unit runs this script under
-    ``uv run --frozen --project shared``, so it is always importable in
-    production. Mirrors ``nightly._default_poster``. Raises on any
-    network/HTTP failure; :func:`post_findings` wraps this best-effort.
+    Delegates to ``census_trigger.post_mcp_envelope``, which single-sources
+    the whole transport contract for this subsystem: the required
+    Accept/Content-Type pair, the session handshake, and response-body
+    decoding. Raises on any network/HTTP failure; :func:`post_findings`
+    wraps this best-effort.
+
+    Why this is not a bare POST any more (task 3644): the escalation server
+    is a STATEFUL streamable-HTTP server. A session-less ``tools/call`` is
+    rejected at the transport layer, before the tool ever runs, with
+    ``400 Bad Request`` / ``"Missing session ID"`` -- and with
+    :func:`post_findings` swallowing that best-effort, the transcript-loss
+    alarm never reached anyone. ``post_mcp_envelope`` performs the
+    ``initialize`` -> ``notifications/initialized`` handshake on that 400 and
+    retries once, and decodes the SSE-framed reply that server then sends.
+
+    Keeps returning None and discarding the decoded body: the caller only
+    needs "did it land", and preserving the ``(url, envelope) -> None`` seam
+    signature keeps every injected ``poster=`` in the test suite working.
     """
-    import httpx
-
-    response = httpx.post(
-        url,
-        json=envelope,
-        # Required by the streamable-HTTP MCP transport -- single-sourced
-        # in census_trigger (already imported here) so a transport change is
-        # a one-line edit, not four lockstep edits with a silent-406 risk.
-        headers=census_trigger.MCP_STREAMABLE_HTTP_HEADERS,
-        timeout=10.0,
-    )
-    response.raise_for_status()
+    census_trigger.post_mcp_envelope(url, envelope, timeout=10.0)
 
 
 def post_findings(

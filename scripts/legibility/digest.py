@@ -21,7 +21,6 @@ are written fire-and-forget and can have a truncated/corrupt trailing line.
 from __future__ import annotations
 
 import argparse
-import gzip
 import json
 import logging
 import sys
@@ -53,14 +52,6 @@ logger = logging.getLogger('legibility.digest')
 def load_transcript(path: Any) -> list[dict[str, Any]]:
     """Parse a transcript JSONL file into an ordered list of record dicts.
 
-    Transparently reads gzip-compressed transcripts: a ``*.jsonl.gz`` path
-    (the archived fleet-transcript format written by
-    ``shared.transcript_archive``) is opened via ``gzip.open(..., 'rt')``,
-    while a plain path keeps the exact ``open(path, encoding='utf-8')`` call
-    for byte-parity. This lets census/nightly RENDER digests for archived gz
-    sessions rather than enumerate-then-drop them (the same gz idiom as
-    ``inventory.iter_json_lines``).
-
     Degradation splits at the file/line boundary, and that split is a
     contract rather than an implementation detail. A corrupt LINE degrades
     silently: blank lines and lines that fail to parse as JSON are skipped,
@@ -70,9 +61,9 @@ def load_transcript(path: Any) -> list[dict[str, Any]]:
     raises ``OSError``, so a caller reporting coverage counts it once
     instead of aborting its walk.
 
-    Making the ``OSError`` half true takes explicit normalization: an
-    unreadable file surfaces as four different exception types, only one of
-    which is already an ``OSError``. This reader does NOT answer that
+    Making the ``OSError`` half true takes explicit normalization: the
+    decode shape is a ``ValueError`` subclass, not an ``OSError``. This
+    reader does NOT answer that
     question itself — it funnels through
     ``inventory.as_unreadable_file_error``, the one place that enumerates the
     shapes and explains why each is expected, which is also what
@@ -83,15 +74,11 @@ def load_transcript(path: Any) -> list[dict[str, Any]]:
     agreement directly, including that they share the one implementation.
     """
     records: list[dict[str, Any]] = []
-    if str(path).endswith('.gz'):
-        f = gzip.open(path, 'rt', encoding='utf-8')
-    else:
-        f = open(path, encoding='utf-8')
-    with f:
-        # Wrap only the read/decompress iteration — decompression happens
-        # lazily HERE, per chunk, not at open() — leaving the JSONDecodeError
-        # skip inside the loop so the file-level vs line-level split above is
-        # preserved. Catch tuple and wrapping are BOTH the shared inventory
+    with open(path, encoding='utf-8') as f:
+        # Wrap only the read iteration — decoding happens lazily HERE, per
+        # chunk, not at open() — leaving the JSONDecodeError skip inside the
+        # loop so the file-level vs line-level split above is preserved.
+        # Catch tuple and wrapping are BOTH the shared inventory
         # helpers, not local copies: that is what makes this reader and
         # iter_json_lines agree structurally instead of by two edits landing
         # together.

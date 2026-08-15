@@ -47,12 +47,11 @@ import contextlib
 import json
 import sqlite3
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NamedTuple, Protocol
 
 from audit_wiped_metadata_files import (
-    discover_project_roots,
     CONTRADICTED_REAL_MERGE_SHA,
     FIDELITY_FILE_LEVEL,
     AuditCoverage,
@@ -60,6 +59,7 @@ from audit_wiped_metadata_files import (
     _coerce_file_list,
     _format_coverage,
     audit_project,
+    discover_project_roots,
 )
 
 # Bind `shared` to the SAME checkout as this script via a __file__-relative
@@ -151,7 +151,7 @@ def plan_files_rejection_reason(candidate: WipeCandidate) -> str | None:
     that a drifting copy undercounting the extension allowlist by 22 entries is
     exactly what incident #3117 was; ``fused_memory.middleware.lock_charter_guard``
     duplicates it verbatim for the same reason. Note this correctly accepts
-    systemd ``.timer``/``.service`` units, which are in ``CODE_EXTENSIONS``.
+    systemd ``.timer``/``.service`` units, which are in ``FILE_EXTENSIONS``.
 
     An EMPTY (or all-blank) plan_files is rejected separately and first: there
     is nothing to restore, and a write setting ``files`` to ``[]`` would
@@ -728,7 +728,7 @@ _DRY_RUN_BANNER = (
 )
 
 
-def _counts(result: "RepairResult") -> dict[str, int]:
+def _counts(result: RepairResult) -> dict[str, int]:
     """Count EVERY disposition, seeding the zero ones explicitly."""
     counts = dict.fromkeys(ALL_DISPOSITIONS, 0)
     for outcome in result.outcomes:
@@ -736,7 +736,7 @@ def _counts(result: "RepairResult") -> dict[str, int]:
     return counts
 
 
-def format_summary(result: "RepairResult") -> str:
+def format_summary(result: RepairResult) -> str:
     """Render one project's repair run as a human-readable summary.
 
     Three properties this owes its reader, each of them tested:
@@ -789,7 +789,7 @@ def format_summary(result: "RepairResult") -> str:
     return "\n".join(lines)
 
 
-def format_json_summary(results: list["RepairResult"]) -> str:
+def format_json_summary(results: list[RepairResult]) -> str:
     """Render *results* as a JSON OBJECT carrying dispositions AND coverage.
 
     An object rather than a bare array, mirroring
@@ -962,7 +962,7 @@ async def main_async(args: argparse.Namespace) -> int:
         )
         return EXIT_NO_ROOT
 
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now_iso = datetime.now(UTC).isoformat()
     results: list[RepairResult] = []
     unreadable: list[str] = []
 

@@ -3,8 +3,9 @@
 Stage 1 (``MemoryConsolidator``) has no deterministic sweep that keeps VALID
 (``invalid_at IS NULL``) task-status-snapshot Graphiti edges in sync with the
 tasks they describe. A status-snapshot edge asserts that some task_id is
-currently active/pending/in-progress; once that task reaches a terminal
-status (done/cancelled), the edge is stale but nothing retires it. The prior
+currently active/pending/blocked/stalled/in-progress; once that task reaches
+a terminal status (done/cancelled), the edge is stale but nothing retires
+it. The prior
 approach — a manual LLM `search` sweep — was unreliable (run b1408864 found
 only 17 of an estimated 23+ stale edges). This module replaces it with a
 deterministic direct-lookup sweep, mirroring the deterministic-lookup-over-
@@ -101,6 +102,144 @@ Design decisions (captured in plan.json):
   the deliberate fail-safe direction — under-selection self-heals or is
   caught by Stage 2, whereas over-selection would wrongly retire true
   facts.
+- The genitive/possessive form "Task N's status is <marker>"
+  (GENITIVE_STATUS_RE) is now extracted. It is the canonical shape
+  Graphiti writes for a per-task status snapshot, yet every prior path
+  missed it structurally while the gate fired — the "matched the gate yet
+  went undetected" symptom. It needs neither the trailing noun-phrase
+  lookahead SNAPSHOT_STATUS_PHRASE_RE carries (requiring 'status' to be
+  IMMEDIATELY followed by the copula already excludes the "status report
+  is pending review" modifier-head reading) nor a _GAP_EXCLUDED_ALT
+  equivalent (its connective is closed-class, so negation and past-exit
+  qualifiers are refused for free — the same asymmetry recorded for the
+  individual form). (amendment, task 3079)
+- The plural enumeration form "Tasks A, B and C are <marker>"
+  (PLURAL_ENUM_SNAPSHOT_RE) is now extracted. Previously it yielded NONE
+  of the ids — not merely the first: TASK_REF_RE anchors '\\btask\\b' and
+  so does not match the plural head, and the enumeration tail carries no
+  reference token of its own. Its copula is mandatory (refusing the
+  transitive-verb reading), its enumeration requires 2+ ids (a plural
+  head over a lone digit is more likely a count than an id), and its
+  separator must absorb the Oxford comma — a single-token separator
+  alternation silently misses the real-world fact shape. Unlike the
+  aggregate path it applies no COUNT_QUANTITY_RE strip: its enumeration
+  alphabet admits no count noun, so the strip could never fire usefully,
+  while it WOULD misfire on the reference-token separator and drop a
+  legitimate leading id (see PLURAL_ENUM_SNAPSHOT_RE). (amendment, task
+  3079)
+- 'stalled' is now a recognized non-terminal marker, and — like
+  'blocked' — goes in ``_TRANSITIVE_MARKER_ALT`` rather than
+  ``_ADJECTIVE_MARKER_ALT``, because it is also a common transitive verb
+  ('Task 5 stalled the merge queue' is a permanently-true historical
+  fact). Discharging the standing marker-addition rule above found the
+  non-obvious consumer: ``COUNT_QUANTITY_RE`` is the only one of the four
+  that is NOT safe by default, since a marker missing from its count-noun
+  alternation turns '3 stalled others' into a spurious task id. The other
+  three are safe by construction (gate-only widening; 'in stalled status'
+  and 'Stalled tasks:' are both genuine status assertions).
+  ``INACTIVE_TASK_STATUSES`` stays ``{done, cancelled}``. (amendment,
+  task 3079)
+- ``_COMPOUND_PREFIX`` admits ONE optional hyphenated modifier before the
+  marker in the adjacency-anchored arms, so 'pairwise-stalled' anchors to
+  its copula. The single-token bound ('\\w+' cannot cross whitespace)
+  bounds the gap's WIDTH only — NOT its lexical class. 'un-', 'non-',
+  'previously-', 'in-' are each one '\\w+-' token, so the unguarded prefix
+  re-admitted the negation / past-exit readings ('Task 5 is un-blocked'
+  -> {5}) that ``_ADVERB_ALT``'s closed-class discipline refuses for free
+  on the bare marker. What refuses them is a negative lookahead
+  subtracting a closed class of inverting prefixes, kept as a
+  SUBTRACTION from an open-class
+  prefix because the innocent modifier vocabulary ('pairwise-', 'merge-',
+  'self-', 'auto-') is not closed. The privative 'in-' needs a second,
+  narrower lookahead, since 'in[-\\s]?progress' is itself a marker.
+  (amendment, reviewer_comprehensive correctness-precision findings,
+  task 3079)
+- A plural enumeration REJECTED by the subjecthood guard also suppresses
+  every id inside its own span on the other anchored paths. Suppressing
+  only the plural match left the tail of a repeated-reference-token
+  enumeration — a shape this task newly supports as a positive — reaching
+  the individual arm on its own ('Reviews for tasks 1020, task 1030 and
+  task 1031 are pending' -> {1031}). Scoped to the span, not the fact, so
+  a genuine snapshot in a later clause survives. (amendment,
+  reviewer_comprehensive correctness-precision finding, task 3079)
+- Two hypotheses were investigated and RULED OUT; do not re-open them.
+  (1) Edge traversal/scope: ``GraphitiBackend.get_all_valid_edges`` runs
+  ``MATCH (n:Entity)-[e:RELATES_TO]-() WHERE e.invalid_at IS NULL`` with
+  no entity-type, label, or episode filter, so the sweep demonstrably
+  SCANNED the missed edges and dropped them at extraction — reproduced
+  end-to-end against the branch base, which reported scanned=3 with
+  candidate_edges=0. Every gap here was lexical. (2) A shared blind spot
+  with ``task_count_verification``: that is not an edge sweep at all, but
+  the ``cross_verify_task_counts(tree, statuses)`` census-vs-tree
+  consistency dict (``task_filter``), whose remit is aggregate counts and
+  never per-task status edges — its 'healthy' report was correct, not
+  blind. (amendment, task 3079)
+- Known residual (task 3079): the genitive path requires the literal noun
+  'status', so "Task N's state is pending" is still not extracted — the
+  same deliberate fail-safe under-selection direction as the task-3042
+  residual above.
+- The plural enumeration is required to be the copula's SUBJECT, via TWO
+  remedies that are BOTH necessary: plural agreement on the copula
+  (``_PLURAL_COPULA_ALT``) and a rejection of a preposition governing the
+  enumeration (``_ENUM_PREP_WORDS``). Adjacency of the marker to the
+  copula does NOT establish subjecthood — that was the defect: in "The
+  merge of tasks A and B is blocked" the plural NP is a preposition's
+  complement and the MERGE is what is blocked, yet the fact would be
+  retired the instant either id went terminal. Neither remedy suffices
+  alone: agreement kills the singular-outer-head shapes but not a plural
+  outer head ("Dependencies for tasks A and B are blocked" — the copula
+  agrees with 'Dependencies'), while the preposition check is a closed
+  word list. The preposition half was FIRST written as fixed-width
+  negative lookbehinds pinned immediately before '\\btasks\\b', which a
+  single intervening determiner defeated wholesale ("Reviews for the
+  tasks A and B are pending"); it now runs in Python against the
+  preceding text. The gap between the preposition and the list noun is
+  an OPEN class (quantifiers, adjectives, possessives — "Statuses of
+  quite a few tasks A and B are pending"), so it is neither enumerated
+  nor bounded: the guard rejects a listed preposition anywhere in the
+  enumeration's CLAUSE (``_enumeration_is_prepositional_complement``).
+  Only SENTENCE-FINAL punctuation ends that clause — a colon, comma,
+  bracket, quote or line wrap does not end prepositional government, and
+  admitting any of them as a break re-opens the over-selection outright
+  (see ``_CLAUSE_BREAK_CHARS``). Two residuals in OPPOSITE
+  directions, and the first is the forbidden
+  one: an unlisted preposition slips through and OVER-selects (the
+  vocabulary was widened once already, for exactly this reason — see
+  ``_ENUM_PREP_WORDS``), while a genuine subject-position enumeration
+  sharing a clause with a listed word is missed — chiefly behind a
+  sentence-initial adverbial preamble ("As of <date>, tasks A and B are
+  pending"), and pinned by a test so the recall cost stays visible —
+  which is the fail-safe direction. Note ``_COPULA_ALT`` is untouched and
+  still shared by the other paths; only this one narrows.
+  (amendment, reviewer_comprehensive
+  correctness-precision finding, task 3079)
+- ``_ENUM_SEP_ALT``/``_ENUM_IDS_ALT`` are written with POSSESSIVE
+  quantifiers. Greedily written, the separator's trailing '\\s*' overlaps
+  its own leading '\\s*,\\s*'/'\\s+', so a whitespace run between two ids
+  can be apportioned (w+1) ways and the '+' repetition has (w+1)**n
+  parses — all explored whenever the overall match FAILS, which is the
+  common case since most enumerations in prose are not followed by a
+  copula and a marker. The sharper finding is that the base scales with
+  whitespace-run WIDTH, not id count alone: ', ' is ~2**n, ',  ' ~3**n and
+  ',\\n    ' ~6**n, so a newline-indented list of only NINE ids already
+  cost 16.6s (measured 6.1s at n=20 for ', ' on this branch). That is a far
+  lower real-world trigger threshold than a flat 2**n reading suggests,
+  and is why the regression test sizes each whitespace shape separately.
+  Possessive-ness is language-preserving here because every possessive
+  element is followed by something that can never match whitespace, so no
+  quantifier can hold a character a later element needs; post-fix all
+  shapes parse in ~0.1ms and n=200 in 0.6ms. The 2+-ids requirement is
+  still carried by the separator's mandatory leading comma-or-whitespace,
+  now spelled possessively. Requires Python >= 3.11, exactly this
+  package's floor. (amendment, reviewer_comprehensive performance-redos
+  finding, task 3079)
+- Why a regex in this module gets a performance test at all:
+  ``sweep_stale_status_snapshot_edges`` calls
+  ``extract_snapshot_edge_task_ids`` once per valid edge from an UNGUARDED
+  dict comprehension with no per-edge timeout, over the whole group's edge
+  set (~5868 edges in the task-3042 record). Extractor cost is therefore a
+  whole-cycle LIVENESS property — one pathological fact stalls the entire
+  reconciliation cycle — not a micro-optimisation. (amendment, task 3079)
 """
 
 from __future__ import annotations
@@ -120,12 +259,12 @@ logger = logging.getLogger(__name__)
 
 # Status markers this sweep treats as non-terminal snapshot assertions,
 # split by part of speech. 'active'/'pending'/'in progress' are adjectives
-# only; 'blocked' is ALSO a common transitive verb and so is matched only in
-# copula/article form — see the transitive-verb caveat in the module
-# docstring (task 3042), which mirrors task 2824's on
+# only; 'blocked' and 'stalled' are ALSO common transitive verbs and so are
+# matched only in copula/article form — see the transitive-verb caveat in
+# the module docstring (tasks 3042, 3079), which mirrors task 2824's on
 # task_filter.PRESENT_TENSE_COMPLETION_RE.
 _ADJECTIVE_MARKER_ALT = r'(?:active|pending|in[-\s]?progress)'
-_TRANSITIVE_MARKER_ALT = r'(?:blocked)'
+_TRANSITIVE_MARKER_ALT = r'(?:blocked|stalled)'
 
 # Copula/linking verbs admitted as a closed-class connective. Shared by both
 # arms of INDIVIDUAL_SNAPSHOT_RE — optional for the adjective arm, mandatory
@@ -176,6 +315,60 @@ _GAP_EXCLUDED_ALT = (
 # reviewer_comprehensive correctness-precision finding, task 3042)
 _GAP_NO_TASK_REF = r'(?!(?:task|df|\d)\w*\b)'
 
+# An optional hyphenated-compound modifier immediately before the marker, so
+# 'pairwise-stalled' anchors to its copula exactly as bare 'stalled' does
+# ('Tasks A, B and C are pairwise-stalled' — the finding's verbatim fact).
+#
+# Bounded to a single hyphenated token: '\w+' cannot match whitespace or
+# punctuation, so this admits one compound modifier and nothing else. Were it
+# allowed to span whitespace it would additionally re-admit the multi-word
+# readings the mandatory-copula arms exist to exclude ('Tasks A and B are
+# awaiting a blocked merge' — the MERGE is blocked).
+#
+# That bound is on the gap's WIDTH, NOT on its lexical class: 'un-', 'non-',
+# 'not-', 'previously-' are each one '\w+-' token, so an unguarded prefix
+# re-admits the negation / past-exit readings _ADVERB_ALT's closed-class
+# discipline refuses for free on the bare marker:
+#
+#     'Task 5 is un-blocked.'                -> {5}
+#     'Task 5 is previously-blocked.'        -> {5}
+#     "Task 5's status is un-blocked."       -> {5}
+#     'Tasks 1020 and 1030 are un-blocked.'  -> {1020, 1030}
+#
+# Each is a permanently-true HISTORICAL/negated assertion, so the sweep would
+# call update_edge(invalid_at=...) and retire a still-true edge the moment any
+# referenced id went terminal — the over-selection direction the module
+# docstring forbids, and unrecoverable (an invalidated Graphiti edge is not
+# re-validated next cycle).
+#
+# The remedy mirrors _GAP_EXCLUDED_ALT exactly: keep the prefix open-class
+# (the observed modifier vocabulary — 'pairwise-', 'merge-', 'self-',
+# 'auto-' — is not closed, and an unlisted-but-innocent modifier should not
+# silently drop a genuine snapshot) but subtract the closed class of
+# inverting prefixes with a negative lookahead. The lookahead sits BEFORE the
+# optional group, so it is evaluated whether or not a prefix is present; no
+# marker begins with one of these tokens, so the prefix-less shape ('is
+# blocked') is unaffected.
+#
+# The privative 'in-' belongs to the same subtracted class but cannot be
+# spelled as a bare 'in' entry in the alternation above: the lookahead is
+# evaluated at the marker's own start position, and 'in[-\s]?progress' is
+# itself a MARKER, so 'in' in the main list would refuse 'Task 5 is
+# in-progress' along with 'Task 5 is in-active'. It gets a second, narrower
+# lookahead that fires only when 'in-' is NOT the head of 'in-progress'.
+# The spaced spelling ('is in progress') is untouched either way, since this
+# lookahead requires a literal hyphen. (amendment, reviewer_comprehensive
+# correctness-precision finding, task 3079)
+#
+# Used only in the adjacency-anchored arms (individual, genitive, plural
+# enumeration); the phrase form needs no equivalent, since its marker is
+# pinned on the far side by the literal noun 'status'. (task 3079)
+_COMPOUND_PREFIX = (
+    r'(?!(?:un|non|not|never|no|previously|formerly|once|briefly|de|dis)-)'
+    r'(?!in-(?!progress\b))'
+    r'(?:\w+-)?'
+)
+
 # The union of both marker classes. Derived from the two constants above
 # rather than hand-written, so the gate (SNAPSHOT_STATUS_RE) and the
 # anchored matchers can never drift apart again — before task 3042 they were
@@ -213,9 +406,22 @@ SNAPSHOT_STATUS_RE: re.Pattern[str] = re.compile(
 # from an aggregate list segment before bare-digit extraction, so an
 # embedded count phrase (e.g. '...tasks: 142, 148, and 200 total remain')
 # never contributes a spurious id.
+#
+# This alternation must be kept in step with _STATUS_MARKER_ALT. It is the
+# one _STATUS_MARKER_ALT consumer that is NOT safe by default under a marker
+# widening, and so the concrete reason the module's standing marker-addition
+# rule exists: the gate merely admits a fact for consideration, the phrase
+# form requires the literal noun 'status' after the marker, and the list
+# introducer requires adjacency to the list noun — but a marker missing HERE
+# silently turns a count phrase into a task id ('Stalled tasks: 1020, 1030,
+# and 3 stalled others' would yield a spurious 3). 'stalled' added for task
+# 3079. Deliberately a separate literal list rather than an interpolation of
+# _STATUS_MARKER_ALT: this one also carries non-marker count nouns
+# ('tasks', 'done', 'total', 'deferred'), so the two sets overlap without
+# either containing the other.
 COUNT_QUANTITY_RE: re.Pattern[str] = re.compile(
     r'\b\d+\s+(?:tasks?|active|pending|in[-\s]?progress|done|cancell?ed|'
-    r'blocked|deferred|review|total|merge[-\s]?deferred)\b',
+    r'blocked|stalled|deferred|review|total|merge[-\s]?deferred)\b',
     re.IGNORECASE,
 )
 
@@ -239,12 +445,50 @@ INDIVIDUAL_SNAPSHOT_RE: re.Pattern[str] = re.compile(
     + r'(?:'
     # adjective arm — optional copula (task 2613 behaviour, unchanged)
     + r'\s*' + _COPULA_ALT + r'?\s*' + _ADVERB_ALT + r'(?:an?\s+)?'
-    + _ADJECTIVE_MARKER_ALT
+    + _COMPOUND_PREFIX + _ADJECTIVE_MARKER_ALT
     + r'|'
     # transitive-capable arm — copula or article is MANDATORY
     + r'\s+(?:' + _COPULA_ALT + r'\s+' + _ADVERB_ALT + r'(?:an?\s+)?|an?\s+)'
-    + _TRANSITIVE_MARKER_ALT
+    + _COMPOUND_PREFIX + _TRANSITIVE_MARKER_ALT
     + r')\b',
+    re.IGNORECASE,
+)
+
+# Genitive/possessive form: "Task N's status is <marker>" (task 3079). This
+# is the canonical shape Graphiti writes for a per-task status snapshot, and
+# before task 3079 EVERY path missed it while the whole-fact gate fired —
+# the "matched the gate yet went undetected" symptom the finding reports:
+# INDIVIDUAL_SNAPSHOT_RE's '\s*' cannot cross the intervening "'s status ";
+# SNAPSHOT_STATUS_PHRASE_RE requires 'in <marker> status' (marker BEFORE the
+# noun) whereas here the order is inverted ('status is <marker>'); and
+# LIST_INTRODUCER_RE requires '<marker> tasks[:\[]'. So the miss rate was
+# structural, not incidental.
+#
+# Both apostrophes are admitted: ASCII U+0027 and the typographic U+2019
+# that most prose writers (and LLM writers) actually emit.
+#
+# Two properties worth stating because they are what keep this path cheap:
+#
+# - No trailing noun-phrase lookahead is needed, unlike
+#   SNAPSHOT_STATUS_PHRASE_RE. Requiring the literal noun 'status' to be
+#   IMMEDIATELY followed by the copula already excludes the modifier-head
+#   hazard that lookahead exists for: in "Task 5's status report is pending
+#   review", 'report' sits between 'status' and 'is', so nothing matches.
+# - No _GAP_EXCLUDED_ALT equivalent is needed either. Reusing the
+#   closed-class _ADVERB_ALT means negation and past-exit qualifiers ('is no
+#   longer', 'is not', 'was previously') are refused for free, because those
+#   tokens simply are not in the alternation — the same asymmetry the module
+#   docstring already documents for the individual form. Only the open-class
+#   gap of the phrase form has to buy that protection back explicitly.
+#
+# The copula is MANDATORY here, so _STATUS_MARKER_ALT (which includes the
+# transitive-capable 'blocked') is safe to use whole: there is no bare-verb
+# reading of "Task 5's status is blocked".
+GENITIVE_STATUS_RE: re.Pattern[str] = re.compile(
+    TASK_REF_RE.pattern
+    + r"(?:'|’)s\s+status\s+"
+    + _COPULA_ALT + r'\s+' + _ADVERB_ALT + r'(?:an?\s+)?'
+    + _COMPOUND_PREFIX + _STATUS_MARKER_ALT + r'\b',
     re.IGNORECASE,
 )
 
@@ -322,6 +566,266 @@ SNAPSHOT_STATUS_PHRASE_RE: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 
+# The enumeration tail of a plural multi-task snapshot: '1020, 1030, and
+# 1031', '1020 and 1030', '1020, task 1030 and task 1031' (task 3079).
+#
+# Requires TWO OR MORE ids by construction (the repeated group is '+', not
+# '*'), so a plural head over a single stray digit is never matched — after
+# a plural noun a lone number is more likely a count than an id, and the
+# well-formed singular shape already routes through INDIVIDUAL_SNAPSHOT_RE.
+#
+# The separator must absorb the OXFORD COMMA (', and'), not merely ',' or
+# 'and' individually: a single-token separator alternation silently misses
+# the finding's verbatim fact. Its alphabet is deliberately closed — digits,
+# whitespace, ',', 'and'/'&'/'/', an optional repeated 'task'/'#' reference
+# token — which is what lets the ids group be scanned for bare digits
+# directly (see PLURAL_ENUM_SNAPSHOT_RE).
+#
+# The separator's LEADING element (a comma or whitespace) is mandatory and
+# cannot match empty. That is what actually enforces the two-or-more-ids
+# requirement: with every element optional, the repeated group matched
+# between two adjacent digits of a SINGLE number, so '1020' parsed as
+# '102' + '0' and 'Tasks 1020 are pending' wrongly satisfied a rule meant
+# to need two ids.
+#
+# Every quantifier here is POSSESSIVE (task 3079, reviewer_comprehensive
+# performance-redos finding). Written greedily, the separator's TRAILING
+# '\s*' overlaps its own LEADING '\s*,\s*' / '\s+', so a whitespace run
+# between two ids can be apportioned between those elements in
+# (len(run) + 1) distinct ways. Under _ENUM_IDS_ALT's '+' repetition that
+# is (w + 1) ** n parses, and ALL of them get explored whenever the overall
+# match ultimately FAILS — the common case, since most enumerations in
+# prose are not followed by a copula and a status marker. Measured pre-fix
+# on a non-matching fact: 6.1s for 20 ids at ', ', and 16.6s for only NINE
+# ids at ',\n    ' (the base scales with whitespace-run WIDTH, so a
+# newline-indented list wedges the sweep at a much lower id count than a
+# flat 2**n reading suggests). Post-fix all shapes parse in ~0.1ms.
+#
+# Possessive-ness is safe here — it changes only HOW a span is parsed,
+# never WHETHER it matches — because every possessive element is followed
+# by something that can never match whitespace: each '\s*+'/'\s++' is
+# followed by ',', a letter, '#' or '\d++', and '\d++' is followed by
+# whitespace or ','. So no quantifier can ever be holding a character a
+# later element needs, and the accepted enumeration alphabet (including
+# '1020, # 1030' with an internal space after the reference token) is
+# unchanged. Possessive quantifiers require Python >= 3.11, which is
+# exactly this package's floor (pyproject.toml).
+_ENUM_SEP_ALT = r'(?:\s*+,\s*+|\s++)(?:(?:and|&|/)\s++)?(?:task\s*+)?#?\s*+'
+_ENUM_IDS_ALT = r'\d++(?:' + _ENUM_SEP_ALT + r'\d++)+'
+
+# Two independently-necessary constraints that together establish the
+# enumeration is the copula's SUBJECT rather than a preposition's
+# complement (amendment, reviewer_comprehensive correctness-precision
+# finding, task 3079). Adjacency to the copula does NOT establish
+# subjecthood — that was exactly the defect.
+#
+# (1) Plural agreement. If the enumeration really is the subject, the
+# copula must agree with it, so 'is'/'was'/'remains' can only belong to
+# some OTHER, singular subject ('The merge of tasks A and B is blocked' —
+# the MERGE is blocked). 'Tasks A and B is pending' is malformed English,
+# so nothing legitimate is lost. Note the shared _COPULA_ALT is
+# deliberately left untouched and still serves the other paths; only this
+# path narrows.
+_PLURAL_COPULA_ALT = r'(?:are|were|remain)'
+
+# (2) Preposition guard. Agreement alone is NOT sufficient:
+# when the outer head is itself PLURAL the plural copula agrees with THAT
+# head and the over-selection survives ('Dependencies for tasks A and B are
+# blocked', 'The merges of tasks A and B are blocked', 'Reviews of tasks A,
+# B, and C are pending' — all ordinary phrasings for this repo's memory
+# corpus, all verified still over-selecting under a copula-only fix). The
+# two remedies are complementary and ship together: agreement is a general
+# grammatical constraint with no vocabulary to maintain, and the preposition
+# check covers the plural-outer-head residue agreement cannot see.
+#
+# The check runs in PYTHON against the text preceding the match (see
+# extract_snapshot_edge_task_ids), and it scans the whole CLAUSE rather than a
+# fixed offset or a bounded slot: reject when a listed preposition appears
+# anywhere between the last clause break and the enumeration. Both properties
+# are load-bearing, because the gap between the preposition and the list noun
+# is an OPEN class — determiners, quantifiers, bare adjectives, possessives,
+# participles, and stacks of them — that neither a fixed offset nor any bound
+# can cover. Each of these over-selects under a narrower spelling (a
+# fixed-width lookbehind pinned before '\btasks\b'; a closed determiner slot;
+# the review's suggested bound of two arbitrary words), and every outer head
+# here is plural, so agreement does not save them either:
+#
+#     'Statuses of the tasks 1020 and 1030 are blocked.'         (1 word)
+#     "Reviews of Leo's tasks 1020 and 1030 are pending."        (1 word)
+#     'Notes about a few tasks 1020 and 1030 are pending.'       (2 words)
+#     'Statuses of quite a few tasks 1020 and 1030 are pending.' (3 words)
+#
+# Clause scoping closes that class outright rather than moving its boundary,
+# and it is the safe direction to err in: every case where it disagrees with a
+# bounded form is one the clause form REJECTS. Its own cost is the converse
+# residual below.
+#
+# '\b'-anchoring is retained, which is what keeps 'Migration tasks' /
+# 'Verification tasks' matching — the 'on' inside 'Migration' is not
+# '\b'-preceded. Matching runs over the fact's prefix from the last clause
+# break onward, located by a reverse character scan rather than by splitting
+# the prefix into clauses (see _enumeration_is_prepositional_complement), so
+# cost is one bounded scan of text the regex engine has already walked.
+#
+# ONE residual now, and it points the WRONG way: the preposition vocabulary is
+# still a closed list, so an UNLISTED preposition does not cause a miss — the
+# guard simply fails to fire, the plural path matches, and the ids are
+# selected. That is OVER-selection, the direction this module forbids, since
+# the sweep would then invalidate a still-true edge the moment any named id
+# goes terminal. (CORRECTION, amendment, task 3079: an earlier note called
+# this "fail-safe under-selection", which is what made the gap read as
+# acceptable.) So the list is a liability, not a safety margin, and it was
+# widened once already — from/by/under/within/around/through/via/during/
+# concerning — after the initial list was found to admit exactly the shapes it
+# exists to refuse ('Dependencies from tasks 1020 and 1030 are blocked.').
+#
+# The converse residual IS fail-safe: a genuine subject-position enumeration
+# sharing a clause with a listed preposition is missed. Its main real-world
+# class is the sentence-initial ADVERBIAL PREAMBLE, since a comma does not end
+# the clause:
+#
+#     'As of 2026-08-09, tasks 1020 and 1030 are pending.'      -> set()
+#     'In the merge queue, tasks 1020 and 1030 are pending.'    -> set()
+#
+# Date-stamped and scope-setting preambles are common in this corpus — the
+# finding's own motivating fact carries one ("... is pending as of
+# 2026-07-14...") — so this is a real recall cost on the plural path, not a
+# hypothetical one. It is pinned by
+# test_adverbial_preamble_is_a_documented_under_selection so the cost stays
+# visible and cannot widen unnoticed. Deliberately not tightened on
+# speculation: every candidate tightening (requiring a plural/capitalized head
+# before the preposition, or stopping the backward scan at a comma when no
+# preposition follows it) trades back toward the unrecoverable over-selection
+# direction, so it needs measurement against the real edge corpus first.
+# (amendment, reviewer_comprehensive correctness-recall finding, task 3079)
+#
+# Kept as a single flat tuple rather than inlined into the pattern so the
+# vocabulary has ONE source of truth: the regression test parametrizes
+# directly over it, so an entry added here without a plural-head case fails
+# immediately instead of shipping unexercised.
+_ENUM_PREP_WORDS: tuple[str, ...] = (
+    'of', 'in', 'on', 'to', 're', 'for', 'with', 'among', 'about', 'across',
+    'against', 'between', 'regarding', 'from', 'by', 'under', 'within',
+    'around', 'during', 'through', 'via', 'concerning',
+)
+
+# SENTENCE-FINAL punctuation ends the span a preposition can govern, so the
+# guard looks no further back than the last one. This is what keeps 'Reviews
+# for X. Tasks 1020 and 1030 are pending.' selected — the enumeration opens a
+# NEW sentence and really is its copula's subject.
+#
+# The class is deliberately minimal — '.', ';', '!', '?' and nothing else —
+# because the two directions are not symmetric. Omitting a character can only
+# LENGTHEN the scanned clause, so it can only ever cost under-selection (the
+# fail-safe direction); including one that does not actually end prepositional
+# government truncates the scan and re-opens the over-selection this guard
+# exists to close, which is unrecoverable. So a character earns a place here
+# only by ending a sentence.
+#
+# Excluded on that rule, each verified over-selecting when it was treated as a
+# break (amendment, reviewer_comprehensive correctness-precision finding, task
+# 3079):
+#
+#     ':'          'Statuses of the following: tasks 1020 and 1030 are pending.'
+#     '(' ')'      'Reviews of the following (still open): tasks 1020 and 1030
+#                   are pending.'
+#     '"' '“' '”'  'Statuses of the "next" tasks 1020 and 1030 are pending.'
+#     ','          'Statuses of the following, tasks 1020 and 1030, are pending.'
+#     newline      'Reviews for  the\n  tasks 1020 and 1030 are pending.'
+#
+# A colon after a governing preposition no more ends that preposition's
+# government than a comma does — it typically introduces the very complement
+# the preposition governs — and a parenthetical or quoted aside is an
+# interpolation INSIDE the clause, not a new one. The comma and newline
+# exclusions are load-bearing for the same reason and predate this narrowing.
+# Colon-preambled genuine snapshots are unaffected ('Note: tasks 1020 and 1030
+# are pending.' still extracts): they carry no listed preposition, so the
+# longer clause gives the guard nothing to fire on.
+_CLAUSE_BREAK_CHARS = '.;!?'
+
+_ENUM_PREP_WORD_RE: re.Pattern[str] = re.compile(
+    r'\b(?:' + '|'.join(_ENUM_PREP_WORDS) + r')\b',
+    re.IGNORECASE,
+)
+
+
+def _enumeration_is_prepositional_complement(prefix: str) -> bool:
+    """Does a listed preposition govern the enumeration at ``prefix``'s end?
+
+    ``prefix`` is the fact text preceding a ``PLURAL_ENUM_SNAPSHOT_RE`` match.
+    True means the enumeration is a preposition's complement, not the copula's
+    subject, and the match must be discarded. See ``_ENUM_PREP_WORDS`` for the
+    full argument and the residual. (task 3079)
+    """
+    # Scan backwards for the last clause break and search from there, rather
+    # than splitting the whole prefix into clauses and keeping only the last:
+    # this runs once per plural match, and the extractor itself runs once per
+    # valid edge over the whole group's edge set, so the module treats
+    # extractor cost as a liveness property (see the module docstring).
+    # ``rfind`` is a C-level reverse scan and ``search(..., pos)`` needs no
+    # slice; '\b' at ``pos`` still sees the preceding character, and every
+    # break char is non-word, so this is exactly equivalent to searching the
+    # sliced clause. (amendment, reviewer_comprehensive efficiency finding,
+    # task 3079)
+    cut = max(prefix.rfind(char) for char in _CLAUSE_BREAK_CHARS)
+    return _ENUM_PREP_WORD_RE.search(prefix, cut + 1) is not None
+
+# Plural multi-task enumeration: 'Tasks A, B and C are <marker>' (task
+# 3079). Before this, such an edge yielded NO ids at all — not merely the
+# first, which is the precise question the finding asks. TASK_REF_RE anchors
+# '\btask\b' and so does not match the plural head 'Tasks'; and even if it
+# did, the enumeration tail carries no reference token of its own.
+#
+# Four anchoring properties, mirroring the adjacency discipline every other
+# path in this module already follows:
+#
+# (a) The copula is MANDATORY — no optional-copula arm. This is the same
+#     remedy INDIVIDUAL_SNAPSHOT_RE's transitive arm uses, and it is what
+#     refuses the transitive-verb reading 'Tasks 1020, 1030, and 1031
+#     blocked task 5' (a permanently-true historical fact). Because the
+#     copula is mandatory, using _STATUS_MARKER_ALT whole — including the
+#     transitive-capable markers — is safe here.
+# (b) The enumeration must be the copula's SUBJECT, established jointly by
+#     plural agreement (_PLURAL_COPULA_ALT) and the absence of a governing
+#     preposition (_ENUM_PREP_WORDS, applied by
+#     _enumeration_is_prepositional_complement inside
+#     extract_snapshot_edge_task_ids). Adjacency does NOT establish this
+#     reading — in 'The merge of tasks 1020 and 1030 is blocked' the marker
+#     IS adjacent to the copula, but the copula's subject is the outer head
+#     noun and the MERGE is what is blocked. Adjacency is the separate,
+#     weaker property (c). Both remedies are needed: agreement alone still
+#     admits a plural outer head ('Dependencies for tasks A and B are
+#     blocked'), and the preposition check alone is a closed word list. See
+#     _PLURAL_COPULA_ALT and _ENUM_PREP_WORDS for the full argument and the
+#     residuals.
+# (c) The marker must sit immediately after the enumeration and its copula,
+#     with only closed-class function words (adverb, 'all', article) in
+#     between, so 'Tasks 1020 and 1030 were merged into the active branch'
+#     does not match — the BRANCH is active, not the tasks. This is a
+#     necessary but NOT sufficient condition for the (b) reading.
+# (d) Bare digits are collected from the 'ids' capture group ONLY, never
+#     from the whole fact, preserving the module invariant that a '\d+'
+#     contributes an id only from inside an already-detected,
+#     marker-anchored span (see _BARE_DIGIT_RE).
+#
+# On (d): the aggregate path additionally strips COUNT_QUANTITY_RE spans
+# from its segment before collecting digits, because a colon/bracket segment
+# is free text that really can contain '...and 3 pending others'. This path
+# needs no such strip and deliberately omits it: _ENUM_IDS_ALT's alphabet
+# admits no count noun in the first place, so the strip could never fire
+# usefully — while it WOULD misfire on the reference-token separator, where
+# '1020 task 1030' matches COUNT_QUANTITY_RE's '\d+\s+tasks?' and stripping
+# it would silently drop the legitimate leading id. A count phrase adjacent
+# to a real enumeration ('tasks 1020 and 1030 plus 3 pending others are
+# pending') instead breaks the copula adjacency and kills the match
+# outright — under-selection, the fail-safe direction, and pinned by a test.
+PLURAL_ENUM_SNAPSHOT_RE: re.Pattern[str] = re.compile(
+    r'\btasks\b\s*#?\s*(?P<ids>' + _ENUM_IDS_ALT + r')\s*,?\s*'
+    + _PLURAL_COPULA_ALT + r'\s+' + _ADVERB_ALT + r'(?:all\s+)?(?:an?\s+)?'
+    + _COMPOUND_PREFIX + _STATUS_MARKER_ALT + r'\b',
+    re.IGNORECASE,
+)
+
 # Detects the start of an aggregate list segment: '<marker> tasks [' or
 # '<marker> tasks are [' or '<marker> tasks:' or '<marker> tasks are:'. The
 # 'open' group records which delimiter opened the segment ('[' vs ':') so
@@ -369,9 +873,11 @@ LIST_INTRODUCER_RE: re.Pattern[str] = re.compile(
 # bracket segment. Mirrors task_filter._CLAUSE_SPLIT_RE.
 _CLAUSE_BOUNDARY_RE: re.Pattern[str] = re.compile(r'[.;\n!?]')
 
-# Bare digit token — used only within an already-detected list segment, so
-# a bare '\d+' never contributes a candidate id outside that scoped context
-# (dates/commit-hashes/ports in ordinary prose are never list segments).
+# Bare digit token — used only within an already-detected, marker-anchored
+# span: an aggregate list segment, or a plural enumeration's 'ids' capture
+# group (task 3079). A bare '\d+' therefore never contributes a candidate id
+# outside that scoped context (dates/commit-hashes/ports in ordinary prose
+# are neither).
 _BARE_DIGIT_RE: re.Pattern[str] = re.compile(r'\b\d+\b')
 
 
@@ -396,10 +902,10 @@ def _list_segment(text: str, start: int, open_char: str) -> str:
 
 
 def extract_snapshot_edge_task_ids(fact: str) -> set[int]:
-    """Return the task ids *fact* asserts as active/pending/blocked/in-progress.
+    """Return the task ids *fact* asserts as active/pending/blocked/stalled/in-progress.
 
     Returns the empty set (never a candidate for invalidation) when:
-    - *fact* contains no active/pending/blocked/in-progress status marker at
+    - *fact* contains no active/pending/blocked/stalled/in-progress status marker at
       all (e.g. 'Task 5 is done', 'Task 7 landed as merge commit'); or
     - *fact* is a pure count-only snapshot with no specific task-id
       reference (e.g. 'There are 8 tasks in progress', '1505 done / 148
@@ -417,13 +923,25 @@ def extract_snapshot_edge_task_ids(fact: str) -> set[int]:
          and/or article may sit in between — deliberately NOT the
          preposition 'in') — so an incidental status word elsewhere in
          the fact is never wrongly attributed to the reference.
-      3. Status-phrase form: extract ids via SNAPSHOT_STATUS_PHRASE_RE,
+      3. Genitive form: extract ids via GENITIVE_STATUS_RE, which reaches
+         the possessive shape "Task N's status is <marker>" (task 3079).
+         The literal noun 'status' must be immediately followed by a
+         copula, which is what keeps a following head noun ("Task N's
+         status REPORT is pending review") out without needing the
+         trailing lookahead SNAPSHOT_STATUS_PHRASE_RE carries.
+      4. Status-phrase form: extract ids via SNAPSHOT_STATUS_PHRASE_RE,
          which additionally admits a bounded open-class gap (e.g. 'is
          deliberately parked in ...') between the reference and the
          marker, but only when the marker is immediately followed by the
          literal noun 'status' — the token that makes the span an
          explicit status assertion rather than an incidental mention.
-      4. Aggregate form: for each detected list segment ('<marker> tasks
+      5. Plural enumeration form: extract ids via PLURAL_ENUM_SNAPSHOT_RE,
+         which reaches 'Tasks A, B and C are <marker>' — a shape carrying
+         no per-id reference token, so every id was previously
+         unreachable (task 3079). The copula is mandatory and the marker
+         must be adjacent to it; digits are collected from the match's
+         'ids' group only.
+      6. Aggregate form: for each detected list segment ('<marker> tasks
          are [...]' / '<marker> tasks: ...'), strip COUNT_QUANTITY_RE
          spans from that segment only (so an embedded count phrase doesn't
          contribute a spurious id) and collect its bare digit tokens. The
@@ -438,8 +956,46 @@ def extract_snapshot_edge_task_ids(fact: str) -> set[int]:
     if not SNAPSHOT_STATUS_RE.search(fact):
         return set()
 
-    ids: set[int] = {int(m.group(1)) for m in INDIVIDUAL_SNAPSHOT_RE.finditer(fact)}
-    ids |= {int(m.group(1)) for m in SNAPSHOT_STATUS_PHRASE_RE.finditer(fact)}
+    ids: set[int] = set()
+    rejected_spans: list[tuple[int, int]] = []
+
+    for enum in PLURAL_ENUM_SNAPSHOT_RE.finditer(fact):
+        # Subjecthood guard, second half: reject an enumeration that is a
+        # PREPOSITION'S COMPLEMENT rather than the copula's subject
+        # ('Reviews of the tasks A and B are pending' — the REVIEWS are
+        # pending). Lives here rather than as an in-pattern lookbehind
+        # because Python lookbehind is fixed-width, and a fixed offset is
+        # defeated by a single intervening determiner — while the words that
+        # may sit in that gap are an open class no bound can cover. See
+        # _ENUM_PREP_WORDS.
+        if _enumeration_is_prepositional_complement(fact[: enum.start()]):
+            rejected_spans.append(enum.span())
+            continue
+        ids.update(int(tok) for tok in _BARE_DIGIT_RE.findall(enum.group('ids')))
+
+    # Suppressing only the PLURAL match left the rejected enumeration's tail
+    # extractable by the other anchored paths, because an enumeration may
+    # REPEAT the reference token — a shape this module newly supports as a
+    # positive ('Tasks 1020, task 1030 and task 1031 are pending'). Its
+    # prepositional-complement counterpart therefore reached the individual
+    # arm on its own and over-selected the trailing id:
+    #
+    #     'Reviews for tasks 1020, task 1030 and task 1031 are pending.' -> {1031}
+    #     'Statuses of the tasks 1020 and task 1030 are blocked.'        -> {1030}
+    #
+    # A rejected span is, by construction, a region established to be a
+    # preposition's complement, so NO id inside it is the copula's subject
+    # whichever pattern found it — hence the drop is applied to every
+    # anchored path rather than to the individual arm alone. It is scoped to
+    # the span, not the fact, so a genuine snapshot in a later clause
+    # survives. (amendment, reviewer_comprehensive correctness-precision
+    # finding, task 3079)
+    for pattern in (INDIVIDUAL_SNAPSHOT_RE, GENITIVE_STATUS_RE, SNAPSHOT_STATUS_PHRASE_RE):
+        ids.update(
+            int(m.group(1))
+            for m in pattern.finditer(fact)
+            if not any(start <= m.start() < end for start, end in rejected_spans)
+        )
 
     for intro in LIST_INTRODUCER_RE.finditer(fact):
         segment = COUNT_QUANTITY_RE.sub(' ', _list_segment(fact, intro.end(), intro.group('open')))
@@ -554,7 +1110,7 @@ async def sweep_stale_status_snapshot_edges(
     Enumerates ALL currently-valid Graphiti edges for *project_id* via
     ``memory_service.graphiti.get_all_valid_edges`` (a deterministic bulk
     query — never the LLM's semantic search), extracts the specific task ids
-    each edge asserts as active/pending/blocked/in-progress, cross-references those
+    each edge asserts as active/pending/blocked/stalled/in-progress, cross-references those
     ids' CURRENT status via ``taskmaster.get_statuses`` (a direct status
     lookup, not semantic search), and invalidates
     (``memory_service.update_edge(..., invalid_at=...)``) every edge whose

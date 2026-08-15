@@ -179,8 +179,15 @@ exemptions exist:
   `TaskInterceptor._repair_done_provenance_same_status`. It writes
   `done_provenance` **only**, and validates it (`kind` enum + `git merge-base
   --is-ancestor`); it cannot touch any other field.
-- **`CLEARABLE_ANNOTATION_KEYS` clears** — a merge-mode clear of a
-  non-load-bearing advisory annotation (e.g. `possible_scope_mismatch`).
+- **`CLEARABLE_ANNOTATION_KEYS` clears** — a merge-mode clear of an advisory
+  annotation (e.g. `possible_scope_mismatch`). These stay clearable and stay
+  **advisory**: `possible_scope_mismatch` has no behavioural consumer that can
+  block anything, so clearing it costs no enforcement. The dispatch-time
+  cross-repo gate (§3.2.1) deliberately has **no leg** for it; its two blocking
+  legs read `metadata.cross_repo` and `metadata.files`, neither of which is
+  clearable. The stamp's one remaining effect there is cosmetic — its
+  `suggested_project` supplies the owner **name** in an escalation raised by one
+  of those other legs.
 - **`x_`-prefixed annotation adds** — a merge-mode add of forward-compat
   `x_`-namespaced annotation keys.
 
@@ -308,6 +315,50 @@ branch) rather than the false "implementation has not delivered". The
 orchestrator additionally honors an explicitly-set `metadata.cross_repo` for
 the absolute-path-foreign shape it can classify without the registry.
 
+**A marked task no longer reaches merge time at all.** As of task 3121 the
+orchestrator also runs a **dispatch-time cross-repo admission gate**
+(`orchestrator/src/orchestrator/cross_repo_gate.py`), in `Harness._run_slot`
+just ahead of the D4 substrate gate and **before any agent spins up**. A task
+is blocked there with `block_reason='cross_repo_misfile'` and an **L1
+`scope_violation`** when **either** of exactly two legs fires:
+
+- `metadata.cross_repo` is truthy — the **marker** leg. This is the submit
+  path's own assertion that the declared files are owned elsewhere, so the L1
+  states foreign ownership as fact and names the owner from
+  `metadata.cross_repo_project` (falling back to a project name embedded in the
+  marker string, then to `possible_scope_mismatch.suggested_project`).
+- every entry in `metadata.files` is an **absolute** path resolving outside the
+  orchestrator's `project_root` — the **containment** leg, which needs no
+  registry. Containment proves only "outside this `project_root`": with no
+  cross-project registry the gate cannot tell a sibling checkout from a path no
+  project owns, so when nothing names an owner the L1 says exactly that and
+  offers both remedies (refile under the owning project, **or** correct
+  `metadata.files` to in-tree paths).
+
+`metadata.possible_scope_mismatch` is **not** a third leg and cannot block a
+dispatch. It is an advisory prose stamp that over-fires by design, and the
+shape it actually carries — registry **prefixes** such as `orchestrator/`, not
+file paths — is not classifiable by path containment at all. It already fires
+its own advisory escalation at submit time; here it only supplies an owner
+**name** when one of the two real legs has fired.
+
+Metadata that is present but unreadable is a logged **SKIP** — dispatch
+proceeds (an unparseable blob is not evidence of a misfile) but the gate says
+loudly that it read nothing, so a skipped check never passes for a clean one.
+Absent metadata is the ordinary shape and is silent. The fix for a blocked task
+is to **refile it under the owning project** (or correct its `metadata.files`),
+not to unblock it in place.
+
+The merge-time `OutcomeKind.plan_files_cross_repo` route above is unchanged
+and still applies to a task that reaches merge by another path. It was
+previously the *only* consumer of the cross-repo signal, which is why a task
+whose branch never got built — the reify-5638 shape — used to reach the
+architect, burn an agent, and land an L2 anyway.
+
+The dispatch gate reads the task **as it stands at dispatch**, so a marker or
+a `metadata.files` list stamped **after** creation (the `files_tagged_at`
+shape) is honoured too — a submit-time gate structurally cannot see those.
+
 **Merely CITING another project's paths in prose is not a scope error.** A
 task whose description references `orchestrator/src/foo.py` as evidence, as
 a thing to mirror, or as prior art is created normally — the citation never
@@ -315,6 +366,16 @@ blocks anything. It can, however, attract the advisory annotation
 `metadata.possible_scope_mismatch` (plus a non-blocking `scope_violation`
 escalation an operator then has to read), because a prose scan cannot tell
 "modifies X" from "mentions X".
+
+The annotation stays advisory, and has **no** behavioural consumer: nothing
+reads it to block, reject, requeue, or gate anything. Its escalation is the
+whole of its effect. The dispatch-time gate above deliberately has no leg for
+it — turning a false-positive advisory into a stalled task plus a spurious L1
+would be strictly worse than leaving it advisory, and its `matched_paths` carry
+registry **prefixes** (`orchestrator/`, `fused_memory/`) rather than file paths,
+so there is no independent evidence available to confirm it against. The gate
+does read its `suggested_project` to *name* an owner in an L1 its own legs
+raised; that is cosmetic, not a trigger.
 
 A **declared deliverable** can, so it is what the advisory is attributed on.
 The annotation is suppressed when your declared deliverables attest local
@@ -484,14 +545,17 @@ action); task goes `blocked` until resolved.
 | `before_done` | `always_escalates` | Behaviour | Use for |
 |---|---|---|---|
 | present | `false` | run action; escalate only on failure; else `done` | **auto-deploy** |
-| present | `true` | run action; then escalate born-at-L2; `done` after `resume` | act-then-ask |
+| present | `true` | run action; then escalate born-at-L2; `done` after `resume` | act-then-ask (incompatible with `human_curator_gate`) |
 | absent | `true` | escalate born-at-L2 immediately; `done` after `resume` | **pure gate** |
 | absent | `false` | **rejected** at `submit_task` (ill-formed no-op) | — |
 
 **Validation (enforced at `submit_task`):** `task_kind='deterministic'`
 with `before_done=None` and `always_escalates=false` is **rejected**
 ("ill-formed no-op"). `before_done` set on a `normal` task is also
-**rejected** ("before_done is only valid on deterministic tasks").
+**rejected** ("before_done is only valid on deterministic tasks"). A truthy
+`human_curator_gate` together with a non-null `before_done` is likewise
+**rejected** ("human_curator_gate is only valid on a pure gate") — see
+[The human-curator-gate contract](#the-human-curator-gate-contract).
 
 **Born-at-L2 escalations:** all filed with `severity ∈ {critical, urgent}`
 and sentinel `agent_role='orchestrator-deterministic'`; the server retains
@@ -775,14 +839,15 @@ gate_escalated_at, before_done_ran_at, before_done_verified_at,
 before_done_verified_pid, files_tagged_at, origin_finding_id,
 spawned_from, program, program_stream, stream, cross_repo,
 cross_repo_project, human_curator_gate,
-human_curator_adjudicated_at
+human_curator_adjudicated_at, last_blocked_at
 ```
 
 `cross_repo` + `cross_repo_project` are the cross-repo deliverable marker
 (§3.2.1): auto-set by the fused-memory submit path when a task's
 `metadata.files` are all owned by one other registered project (and the
-filer is itself registered), and read by the orchestrator pre-merge
-narrowing gate.
+filer is itself registered), and read by **both** the orchestrator's
+dispatch-time cross-repo admission gate (which blocks the task before any
+agent spins up) and its pre-merge narrowing gate.
 
 Two unrelated curators appear in this list, and the prefixes keep them
 apart: `curator_action` / `curator_justification` / `combined_at` are
@@ -808,6 +873,32 @@ machine step that closes the task, which contradicts "only a human's content
 judgement closes this" — a task carrying both takes the act-then-ask path
 with the marker unread, and `DeterministicRunner` logs a warning naming the
 authoring defect on every dispatch. Do not combine them.
+
+The combination is **rejected at `submit_task`/`update_task`** by
+`shared.task_metadata`'s cross-field validator whenever `task_metadata.enforce`
+is true (its production setting), so the contradiction cannot land in the first
+place. In warn-mode it degrades to a single `task_metadata.schema_warning`
+census line (whole-blob field `<metadata>`, code `invalid_metadata`) and the
+write proceeds. Note the write boundary treats that whole-blob field as
+*always* fatal regardless of which keys the delta names — so an `update_task`
+supplying only `human_curator_gate` is rejected even when `before_done` is an
+untouched legacy field. The `DeterministicRunner` warning above is deliberately
+**retained** as a defence-in-depth backstop for records that did not pass
+through that boundary: `task_metadata.enforce` is a red-tier restart-only flag,
+records predate the validator, and not every writer goes through
+`SqliteTaskBackend`.
+
+**Repairing a row that already carries both.** That same always-fatal rule cuts
+the other way once a contradictory row exists — written in warn-mode, or by a
+writer that bypassed `SqliteTaskBackend`. Every later `metadata_mode='merge'`
+`update_task` on it is rejected, including writes with nothing to do with the
+contradiction (`retry_ledger` updates, `files` edits), because the merged whole
+is what gets validated. To unstick such a row, clear the contradiction *in the
+same write*: merge an explicitly falsy `human_curator_gate` (a cleared marker no
+longer contradicts `before_done`), or pass `metadata_mode='replace'` with a blob
+that omits one of the two keys. No task on the live store is in this state today
+— the four rows carrying the marker all have `before_done` absent — so this is a
+forward hazard of a warn→enforce flip, not a live cleanup.
 
 **`metadata.human_curator_adjudicated_at`** (ISO-8601 string) is the required
 content-adjudication signal, stamped via `update_task` (with
@@ -854,6 +945,68 @@ the `x_`-prefixed forward-compat namespace instead (e.g.
 `x_reconciliation_note`) — silently allowed, no warning — or fold the
 value into a single `annotations` field.
 
+### `allow_mcp_markup`: a write-time flag, not a metadata key
+
+`metadata={'allow_mcp_markup': True}` is the sanctioned move for a write
+that **deliberately quotes the MCP envelope literals** — documenting the
+leak, pasting a specimen, quoting a rejection's `matched_pattern`. It is
+honoured at all four guarded write boundaries: `submit_task`,
+`update_task`, `add_memory`, `add_episode`.
+
+**Why it belongs in this section.** The convention that grew up instead —
+paraphrase the literals, then park the evidence under a bespoke
+timestamped metadata key such as `markup_tripwire_rejections_<date>` —
+manufactures *both* failure classes at once: a `code=unknown_key` census
+line (Tier-C, above) for every such key, and a bounced write for every
+author who quotes the literals without the flag. It was self-perpetuating
+because it was documented inside task 3083's own `details`, so each reader
+learned the workaround rather than the flag. Task 3697 retires it.
+
+**Scope of the gate.** The guard reads only the caller's *text* arguments,
+never the metadata blob: `title` / `description` / `details` / `prompt` on
+`submit_task` and `update_task`, and `content` on `add_memory` and
+`add_episode`. Metadata is handed to the guard for exactly one purpose —
+reading this flag. So it is a description that trips the tripwire, not a
+metadata *value* that happens to contain the literals. `update_task`'s own
+docstring states the same contract
+(`fused-memory/src/fused_memory/server/tools.py`).
+
+**Fail-closed: only a literal boolean `True`.** `'yes'`, `1` and `'true'`
+do not enable it — `markup_override_requested` tests
+`parsed.get(...) is True` (`markup_tripwire.py`). That strictness is the
+containment argument, not pedantry: the failure being contained is an
+accidental harness serialization leak, and an accidental leak never sets
+an explicit flag. A deliberate author can.
+
+**Write-time-only — it never persists.** `strip_markup_override`
+(`markup_tripwire.py`) removes the key at every one of the four
+boundaries before the metadata reaches storage, so the flag never lands in
+stored metadata and never mints an `unknown_key` census line of its own.
+It is non-mutating (the caller's own dict is left intact) and honours both
+accepted metadata shapes — dict in / dict out, JSON string in / JSON
+string out. Pinned by
+`fused-memory/tests/server/test_markup_tripwire_gate.py::test_override_flag_is_stripped_before_persistence`
+and `::test_override_flag_is_not_persisted_into_task_metadata`.
+
+**This is routine, not exotic.** The 2026-08-05 decompose session that
+filed the toolcall-markup-containment batch had its *first* `submit_task`
+rejected by this tripwire for quoting the literals, and needed the flag on
+seven of the nine tasks it filed. The guard was working as designed; the
+missing piece was the convention around it.
+
+**What it is not: an escape hatch for an accidental leak.** If you did not
+mean to quote the markup, strip the fragment and resubmit — do not reword
+the payload to sneak it past the guard, and report a recurrence per the
+hint the rejection itself carries. Using the flag to push an accidental
+leak through the boundary defeats the containment it exists to provide.
+
+The authoritative enumeration of the literals lives in exactly one place,
+`fused-memory/src/fused_memory/server/markup_tripwire.py`, and is
+deliberately **not** repeated here: restating them in this file would
+oblige every future task write quoting this section to set the override,
+which is precisely the loop this section exists to break. For the full
+picture see `docs/mcp-toolcall-xml-leak.md` §4, "The boundary rejection".
+
 ### Promoting a convention
 
 A key only stops warning once it's added to the `_BLESSED_METADATA_KEYS`
@@ -863,6 +1016,52 @@ allowlist — an allowlist rather than typed optional fields, so
 there only for a genuinely load-bearing, stable convention; Tier-B/C drift
 should be fixed by renaming to the canonical key or moving under `x_`, not
 by blessing it.
+
+### Known gaps (measured 2026-08-06 — not fixed)
+
+Three `unknown_key` sources are known, measured, and deliberately left
+open. They are recorded here so the next reader does not re-measure them.
+All counts are a snapshot of a **growing** corpus (3553 tasks carried dict
+metadata at measurement), not an invariant.
+
+| Gap | Measured | Owner |
+|---|---|---|
+| `execution_class` is read by two live guards but is neither blessed nor typed | 272 tasks | `tkt_0RS4XDWJQ9PR8MFXY5DKW950WS` |
+| Ad-hoc reify/escalation keys unmigrated corpus-wide | `origin_escalation` 19, `related_reify_tasks` 8, `origin_reify_task` 4, `related_reify_memories` 1 | `tkt_0RS4XDWJQ9PR8MFXY5DKW950WS` |
+| Task 3083 still emits 6 `unknown_key` lines — the write path is blocked | 6 of an original 7 | `tkt_0RS4WVMH1RSTSY88N781E70F5S` |
+
+**`execution_class`** is not in `_BLESSED_METADATA_KEYS`, is not a typed
+`TaskMetadata` field and is not a registered submodel — yet
+`execution_class_guard` and `routing_intent_guard` both read it, so every
+one of those 272 tasks plausibly emits this same warning class. It was
+deliberately **not** blessed by task 3697: 272 tasks and two live guards
+make it a broader vocabulary decision (bless / promote to a typed field /
+retire) than a single-task cleanup should settle. Originally recorded as
+Finding 5 of the toolcall-markup-containment capability manifest. The
+count is still climbing — 253 at that PRD's decompose, 272 here.
+
+**The `x_` sweep** was scoped to task 3083 alone, not the corpus, because
+a ~30-task metadata rewrite has a very different blast radius from one
+reserved task. `x_`-prefixed precedents for these same spellings already
+exist (`x_origin_escalation` 1, `x_related_reify_tasks` 1,
+`x_related_df_tasks` 5), so the target spelling is not in doubt and the
+sweep is a mechanical per-task re-run of
+`fused-memory/scripts/migrate_task_metadata_to_x_namespace.py`. That
+script's "no reader anywhere" grep argument covers only its six built-in
+default keys, so when you re-run it with your own `--keys` it validates
+them first and refuses an already-`x_`-prefixed key, a typed
+`TaskMetadata` field or a Tier-A blessed key — its read-back proves the
+rename *landed*, never that the rename was *safe*.
+
+**The write-path blocker** is why the third row is still open, and it
+bounds both of the others: `update_task` rejects any metadata payload
+containing `done_provenance` — a presence-only write-authority floor
+evaluated *before* `metadata_mode` is resolved — and `'merge'` mode cannot
+retire a key at all, since `_merge_metadata` is a shallow `{**old, **new}`
+with no deletion sentinel. A whole-blob `'replace'` is therefore
+structurally impossible on any `done`/merged task, which is most of the
+corpus above. Check a target task's status before assuming its metadata is
+writable.
 
 ---
 

@@ -42,9 +42,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-import yaml
-
 import codebook as codebook_mod
+import yaml
 
 
 class CoderParseError(Exception):

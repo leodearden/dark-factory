@@ -1109,6 +1109,11 @@ async def test_call_claude_cli_delegates_to_invoke_with_cap_retry():
     assert call_kwargs['timeout_seconds'] == float(config.agent_cli_timeout_seconds)
     assert call_kwargs['resume_session_id'] is None  # first turn: no prior session
     assert call_kwargs['cwd'] == Path(config.explore_codebase_root)
+    # Passed unconditionally (including on this, the first turn) — cli_invoke
+    # only reads it inside `if invoke_kwargs.get('resume_session_id'):`, so it
+    # is already inert here; asserting it holds regardless keeps the two
+    # kwargs from silently becoming coupled at the call site.
+    assert call_kwargs['resume_delivers_prompt'] is True
 
     # usage_gate may be positional or keyword — accept either
     if 'usage_gate' in call_kwargs:
@@ -1273,17 +1278,23 @@ async def test_call_claude_cli_forwards_cwd_to_invoke_claude_agent(tmp_path):
     assert call_kwargs['cwd'] == Path(explore_root)
 
 
-@pytest.mark.asyncio
-async def test_run_threads_serialized_tool_results_into_claude_cli_prompt():
-    """Guards that run() routes tool_results through _serialize_tool_results on follow-up turns.
+# Shared by the two resume-prompt tests below: turn 1 calls `my_tool(x=7)`,
+# turn 2 (after that result is serialized into the resume prompt) calls
+# `stage_complete`. Kept in one place so the pinned serialization contract
+# doesn't live twice: once in the high-seam test below (mocks
+# `invoke_with_cap_retry` out entirely) and once in the low-seam test after
+# it (mocks only `invoke_claude_agent`, so the real `invoke_with_cap_retry`
+# body — including the resume_delivers_prompt swap — actually runs).
+_RESUME_TURN_EXPECTED_PROMPT = '[Tool Result: tc1] (OK)\n{"doubled": 14}'
 
-    Closes the coverage gap left by task 881 (deleted test_claude_cli_provider_first_call and
-    test_claude_cli_provider_resume) for the _call_llm claude_cli branch.
+
+def _two_turn_my_tool_fixture():
+    """Build (tools, first_result, second_result) for the my_tool -> stage_complete flow.
+
+    Turn 1: the agent calls `my_tool(x=7)`. Turn 2: after that result is
+    serialized into the prompt, the agent calls `stage_complete`. The
+    serialized turn-2 prompt this produces is `_RESUME_TURN_EXPECTED_PROMPT`.
     """
-    from shared.cli_invoke import AgentResult
-
-    fake_gate = make_gate_mock()
-    config = _make_cli_config()
 
     async def my_tool_fn(x: int = 0):
         return {'doubled': x * 2}
@@ -1313,7 +1324,7 @@ async def test_run_threads_serialized_tool_results_into_claude_cli_prompt():
             'tool_calls': [{'id': 'tc1', 'name': 'my_tool', 'input': {'x': 7}}],
         },
     )
-    # Turn 2: agent calls stage_complete with the result
+    # Turn 2: agent calls stage_complete with the (serialized) tool result
     second_result = AgentResult(
         success=True,
         output='',
@@ -1325,6 +1336,19 @@ async def test_run_threads_serialized_tool_results_into_claude_cli_prompt():
             ],
         },
     )
+    return tools, first_result, second_result
+
+
+@pytest.mark.asyncio
+async def test_run_threads_serialized_tool_results_into_claude_cli_prompt():
+    """Guards that run() routes tool_results through _serialize_tool_results on follow-up turns.
+
+    Closes the coverage gap left by task 881 (deleted test_claude_cli_provider_first_call and
+    test_claude_cli_provider_resume) for the _call_llm claude_cli branch.
+    """
+    fake_gate = make_gate_mock()
+    config = _make_cli_config()
+    tools, first_result, second_result = _two_turn_my_tool_fixture()
 
     with patch(
         'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
@@ -1357,7 +1381,74 @@ async def test_run_threads_serialized_tool_results_into_claude_cli_prompt():
     # Exact equality catches regressions that swap the \n separator, drop the
     # [Tool Result: ...] prefix, or subtly reorder fields.
     second_prompt = mock_invoke.call_args_list[1].kwargs['prompt']
-    assert second_prompt == '[Tool Result: tc1] (OK)\n{"doubled": 14}'
+    assert second_prompt == _RESUME_TURN_EXPECTED_PROMPT
+
+
+@pytest.mark.asyncio
+async def test_run_delivers_serialized_tool_results_on_resume_turn():
+    """Guards that the turn>=2 prompt reaches the CLI intact, not swapped for
+    CRASH_RECOVERY_RESUME_PROMPT.
+
+    This patches `shared.cli_invoke.invoke_claude_agent` — one level BELOW
+    `invoke_with_cap_retry` — instead of the file's usual
+    `patch('fused_memory.reconciliation.agent_loop.invoke_with_cap_retry')`
+    seam used by the sibling test above. That matters: the destruction this
+    test guards against (`cli_invoke.py:1369-1371` — ``if not
+    resume_delivers_prompt: invoke_kwargs['prompt'] =
+    CRASH_RECOVERY_RESUME_PROMPT``) lives INSIDE `invoke_with_cap_retry`'s
+    own body. Mocking that function out — as every existing turn>=2 test in
+    this file does — replaces the very code under test, so it cannot observe
+    the swap by construction; it passes whether or not `agent_loop.py`
+    passes `resume_delivers_prompt=True`. `usage_gate=None` selects the
+    gate-less fast path in `invoke_with_cap_retry` (cli_invoke.py:1507),
+    which still executes the prompt-swap guard above it (:1350-1371) — so
+    the behaviour under test is bit-identical to the gated path — while
+    guaranteeing exactly one `invoke_claude_agent` call per turn.
+    """
+    config = _make_cli_config()
+    tools, first_result, second_result = _two_turn_my_tool_fixture()
+
+    with patch(
+        'shared.cli_invoke.invoke_claude_agent',
+        new_callable=AsyncMock,
+    ) as mock_agent:
+        mock_agent.side_effect = [first_result, second_result]
+
+        agent = AgentLoop(
+            config=config,
+            system_prompt='You are a test agent.',
+            tools=tools,
+            terminal_tool='stage_complete',
+            usage_gate=None,  # fast path: real invoke_with_cap_retry, real forwarding
+        )
+
+        result, _journal = await agent.run('initial payload')
+
+    # Terminal tool input round-trips through run()
+    assert result == {'report': {'result': 14}}
+
+    # Both LLM turns must have fired against the real subprocess-invocation seam.
+    assert mock_agent.call_count == 2
+
+    first_kwargs = mock_agent.call_args_list[0].kwargs
+    second_kwargs = mock_agent.call_args_list[1].kwargs
+
+    # Turn 1 sanity: no prior session, initial payload passed straight through.
+    assert first_kwargs['prompt'] == 'initial payload'
+    assert first_kwargs['resume_session_id'] is None
+
+    # Non-vacuity guard, asserted FIRST: turn 2 really took the resume branch
+    # that performs the swap, so a future refactor that stops resuming fails
+    # loudly here instead of making the prompt assertion below pass trivially.
+    assert second_kwargs['resume_session_id'] == 'sess-1'
+
+    # Core contract: the serialized tool-result prompt reaches the CLI on the
+    # resume turn, byte for byte — the same _RESUME_TURN_EXPECTED_PROMPT
+    # constant the sibling test above asserts against, so both tests agree on
+    # the serialization contract. This equality already rules out the prompt
+    # having been swapped for CRASH_RECOVERY_RESUME_PROMPT, a different,
+    # fixed string.
+    assert second_kwargs['prompt'] == _RESUME_TURN_EXPECTED_PROMPT
 
 
 @pytest.mark.asyncio

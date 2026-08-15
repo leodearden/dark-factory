@@ -55,7 +55,6 @@ pure vocabulary rather than a running subsystem.
 
 from __future__ import annotations
 
-import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -75,6 +74,19 @@ from fused_memory.topic_slug import (
     is_valid_topic_slug,
 )
 
+# The canonical-full-UUID predicate that used to live here (task 3132, leaf η).
+# It moved to ``utils/validation.py`` so the delete_memory guards, recon_report's
+# citation gate and citation_verifier's forwarding-pointer guard all answer
+# "is this a canonical full UUID" from ONE definition (INV-5).
+from fused_memory.utils.validation import is_full_uuid
+
+#: Back-compat alias for the pre-move private spelling; import
+#: ``is_full_uuid`` from :mod:`fused_memory.utils.validation` instead.
+# TODO(task 3132 follow-up): drop once scripts/retro_stamp_topics.py and
+# tests/test_retro_stamp_topics.py import the predicate directly (both are
+# outside this task's locked file scope).
+_is_full_uuid = is_full_uuid
+
 __all__ = [
     'BLESSED_METADATA_KEYS',
     'KIND_REGISTRY',
@@ -82,6 +94,9 @@ __all__ = [
     'CanonicalUniquenessViolation',
     'MemoryMetadataValidationError',
     'MetadataViolation',
+    'PARENT_ID_DEAD_CODE',
+    'PARENT_ID_UNAVAILABLE_CODE',
+    'ParentHasChildrenError',
     'RESERVED_VOCABULARY_KEYS',
     'SERVER_STAMPED_KEYS',
     'TOPIC_SLUG_MAX_LEN',
@@ -89,6 +104,7 @@ __all__ = [
     'classify_unknown_keys',
     'is_valid_topic_slug',
     'normalize_supersedes',
+    'parent_liveness_violation',
     'validate_memory_metadata',
 ]
 
@@ -103,12 +119,25 @@ EXPERIMENTAL_KEY_PREFIX = 'x_'
 def normalize_supersedes(value: Any) -> list[Any]:
     """Normalize a ``supersedes`` metadata value to a list (PRD D2).
 
+    This docstring is the SINGLE HOME of the ``supersedes`` writer/reader
+    map; the other sites that touch the key point here instead of
+    re-deriving it, and name SYMBOLS rather than line numbers (a pinned
+    line number is falsified by the next edit made above it — the churn
+    that motivated this consolidation).
+
     ``supersedes`` is a list in V1, but the corpus carries 81 records with
-    a **scalar** value and 65 with a list.  The live scalar writer is
-    ``reconciliation/harness.py:1167``; the readers are
-    ``reconciliation/targeted.py:1464`` (truthiness discriminator) and
-    leaf 3112's closure predicate.  Both go through this helper so the
-    legacy scalar shape stays tolerated on read.
+    a **scalar** value and 65 with a list.  The writer —
+    ``ReconciliationHarness._reconcile_status_correction`` in
+    ``reconciliation/harness.py`` — emitted a scalar until task 3196
+    migrated it to the canonical list shape; the 81 measured records
+    predate that migration and are not rewritten by it (PRD D2 defers
+    retro normalization to leaf θ's stamping sweep), which is why read
+    tolerance for the legacy scalar stays.  The readers are
+    ``reconciliation.targeted._is_authoritative_resolution`` (truthiness
+    discriminator, which tests ``any()`` of the normalized members — see
+    ITS docstring for why member-level and not container truthiness) and
+    leaf 3112's closure predicate.  Both go through this helper — INV-5:
+    never a second ``supersedes`` parser.
 
     Accepts ``None`` (→ ``[]``), a scalar (→ single-element list), or any
     non-``str`` sequence (→ list copy).  The returned list is always a
@@ -501,7 +530,8 @@ KIND_REGISTRY: frozenset[str] = frozenset({
     # `enforce_kind_registry` flips.
     # ---------------------------------------------------------------
     'consolidated_scope_correction',  # reconciliation/scope_freshness.py:97 (declared), written :251, :495
-    'project_status_correction',      # reconciliation/harness.py:1166 (same dict as the scalar `supersedes` at :1167)
+    # ReconciliationHarness._reconcile_status_correction (same dict as `supersedes`)
+    'project_status_correction',
     'count_snapshot_cleanup_audit',   # scripts/cleanup_count_snapshots.py:210
     # No live Mem0 writer found — retained per esc-3194-1 pending the
     # PRD §10 open questions.  `entity_standing_decision` is a SQLite
@@ -689,6 +719,68 @@ class MemoryMetadataValidationError(Exception):
         )
 
 
+class ParentHasChildrenError(Exception):
+    """Raised by ``delete_memory`` when the target still has children.
+
+    PRD V3's lifecycle contract — "no operation may silently orphan a child
+    or dangle a pointer it could have seen" — has two halves.  The
+    *enforcement* half (the live child re-check, INV-3) belongs at the
+    delete seam in ``services/memory_service.py``, where the store lives.
+    The *contract-fixed* half is this error, and it belongs HERE for the
+    same reason :class:`MemoryMetadataValidationError` does: this module is
+    deliberately pure — no process-lifetime state, no queue writer, no
+    dependency on the optional ``escalation`` package — so an
+    out-of-process consumer, a lint sweep or a test can import the refusal
+    contract without pulling in a running ``MemoryService``.  Keeping both
+    contract-fixed errors side by side is also what makes them read
+    identically to a caller.
+
+    The message is the whole user-observable signal: at the MCP wire
+    ``@mcp_tool_errors`` renders the exception as
+    ``{'error': str(e), 'error_type': 'ParentHasChildrenError'}``, so an
+    agent that trips the refusal has ``str(err)`` and nothing else.  It
+    therefore names the parent, every listed child id, the count, the
+    ``cascade=true`` way out, and where the vocabulary lives.
+
+    :param parent_id:  the id whose deletion was refused.
+    :param child_ids:  ids of records whose ``metadata.parent_id`` points at
+                       *parent_id*.  Copied, never aliased, so a later
+                       mutation of the caller's scroll buffer cannot
+                       retroactively rewrite what the refusal claimed.
+    :param truncated:  True when the listing is known to be PARTIAL (the id
+                       scroll returned fewer rows than the live child count
+                       — a bounded scroll or a concurrent write).  The
+                       message then says "at least N", because a bounded
+                       listing that reads as exhaustive would understate
+                       what a subsequent ``cascade`` is about to delete.
+    """
+
+    def __init__(
+        self,
+        *,
+        parent_id: str,
+        child_ids: list[str],
+        truncated: bool = False,
+    ) -> None:
+        self.parent_id = parent_id
+        self.child_ids = list(child_ids)
+        self.truncated = truncated
+        count = (
+            f'at least {len(self.child_ids)}'
+            if truncated
+            else str(len(self.child_ids))
+        )
+        listed = ', '.join(self.child_ids)
+        super().__init__(
+            f'refusing to delete memory {parent_id}: it has {count} child '
+            f'record(s) whose metadata.parent_id points at it '
+            f'({listed}); deleting it would orphan them. Pass cascade=true '
+            f'to delete the children too, or reparent them first -- the '
+            f'metadata vocabulary is defined in '
+            f'{MemoryMetadataValidationError.REGISTRY_LOCATION}'
+        )
+
+
 class CanonicalUniquenessViolation(Exception):
     """A second ``canonical`` write for a ``(project, topic)`` already taken.
 
@@ -750,27 +842,69 @@ def _violation(key: str, code: str, rule: str, *, fatal: bool) -> MetadataViolat
     )
 
 
-def _is_full_uuid(value: Any) -> bool:
-    """True iff *value* is a canonical full-UUID string.
+#: Census code for a ``parent_id`` that shape-checks but resolves to
+#: nothing in the same project's Mem0 collection.
+PARENT_ID_DEAD_CODE = 'dead_parent_id'
 
-    Deliberately stricter than a bare ``uuid.UUID(value)`` call, which also
-    accepts the 32-char undashed form, braced forms and ``urn:uuid:``
-    prefixes.  Requiring the canonical 36-char dashed rendering is what
-    rejects the ``short_hex`` shape the census counted (3 live ``supersedes``
-    members) and truncated hex generally — a bare parse would let a
-    32-hex-digit string through as "well formed" while no store would
-    resolve it in that spelling.
+#: Census code for a ``parent_id`` whose liveness could NOT be determined
+#: because the backend lookup itself failed (a propagated Qdrant read
+#: timeout, a transport error).  Deliberately distinct from
+#: :data:`PARENT_ID_DEAD_CODE` — see :func:`parent_liveness_violation`.
+PARENT_ID_UNAVAILABLE_CODE = 'parent_id_liveness_unavailable'
 
-    Case is tolerated (``str(uuid.UUID(x))`` is lowercase) because casing is
-    a rendering choice, not a different identifier.
+_PARENT_LIVENESS_RULES = {
+    PARENT_ID_DEAD_CODE: (
+        'parent_id {parent_id!r} must resolve to a live same-project Mem0 '
+        'entry; the lookup returned no such record, so writing this would '
+        'dangle a pointer at a dead parent'
+    ),
+    PARENT_ID_UNAVAILABLE_CODE: (
+        'parent_id {parent_id!r} could not be checked: the same-project Mem0 '
+        'lookup failed, so liveness is UNKNOWN rather than refuted'
+    ),
+}
+
+
+def parent_liveness_violation(parent_id: Any, *, code: str) -> MetadataViolation:
+    """Build a ``parent_id`` LIVENESS violation (leaf δ, task 3197).
+
+    Liveness itself is resolved at the write SEAM
+    (``services/memory_service.py::_apply_memory_metadata_validation``),
+    which is the only layer that can reach a store —
+    :func:`validate_memory_metadata` is pure by construction and must stay
+    that way.  But the CODES and the message WORDING live here, behind this
+    factory, so the registry remains the single normative home for the rule
+    and the seam cannot grow a second copy of the text (INV-5).  Delegating
+    to ``_violation`` also means the registry-location hint is appended by
+    construction rather than by the seam remembering to add it.
+
+    Both codes are ``fatal=True``, which is what lets liveness ride the
+    existing uniform arms at the seam: warn mode censuses and proceeds,
+    ``memory_metadata.enforce`` rejects.  No new config leaf, no third
+    rejection path.
+
+    The two codes are kept DISTINCT on purpose.
+    ``Mem0Backend.get_point_by_id`` propagates a read timeout rather than
+    collapsing it into ``None``, precisely so a timed-out read is never
+    mistaken for a genuine not-found; folding both into
+    :data:`PARENT_ID_DEAD_CODE` would discard that at the seam and tell an
+    operator a live parent is dead.  Fatal-on-unavailable is INV-3 read
+    literally: an actor that cannot corroborate must not act.
+
+    :raises ValueError: on an unrecognised *code*.  Census codes are what
+        operators grep, so a typo must fail loudly rather than quietly mint
+        a new census axis.
     """
-    if not isinstance(value, str):
-        return False
     try:
-        parsed = uuid.UUID(value)
-    except (ValueError, AttributeError, TypeError):
-        return False
-    return str(parsed) == value.lower()
+        rule = _PARENT_LIVENESS_RULES[code]
+    except KeyError:
+        raise ValueError(
+            f'unrecognised parent liveness code {code!r}; expected one of '
+            f'{sorted(_PARENT_LIVENESS_RULES)}'
+        ) from None
+    return _violation(
+        'parent_id', code, rule.format(parent_id=parent_id), fatal=True
+    )
 
 
 def validate_memory_metadata(
@@ -794,8 +928,15 @@ def validate_memory_metadata(
     deliberate, not an oversight:
 
     * ``parent_id`` **liveness** (does the parent still exist?) is leaf δ's,
+      and leaf δ (task 3197) has LANDED it at the write seam,
+      ``services/memory_service.py::_apply_memory_metadata_validation``.
+      The codes and wording it emits are still defined here — see
+      :func:`parent_liveness_violation`,
+      :data:`PARENT_ID_DEAD_CODE` and :data:`PARENT_ID_UNAVAILABLE_CODE` —
+      so the rule has exactly one home even though its two halves run in
+      two layers;
     * ``canonical`` per-(project, topic) **uniqueness** is leaf ε's, and
-      lives at the async seam
+      lives at that same async seam
       (:func:`~fused_memory.services.memory_service._apply_memory_metadata_validation`)
       because it needs live store state.
 
@@ -806,9 +947,10 @@ def validate_memory_metadata(
     boundary moved no work into this function that a store lookup could
     have been needed for.
 
-    Making the boundary structural rather than a comment means a later leaf
-    must add liveness at the seam and cannot accidentally grow a second
-    implementation of it in here (INV-5).
+    Making the boundary structural rather than a comment is what forced
+    both later leaves to add their live-state checks at the seam, and kept
+    either from accidentally growing a second implementation in here
+    (INV-5).
 
     Ordering inside the function is load-bearing:
 
@@ -832,19 +974,28 @@ def validate_memory_metadata(
 
     # 1. supersedes — NORMALIZE, never reject the container shape.
     #
-    # The β-before-γ hazard: PRD §9 sequences γ after β, and
-    # `reconciliation/harness.py:1167` writes a SCALAR `supersedes` today
-    # (81 live records).  Rejecting the scalar form here would break the
-    # recon harness's own writes for the entire window until γ migrates it.
-    # Coercing at the write boundary mirrors `_normalize_task_id_metadata`,
-    # which already does exactly this for the same class of problem in the
-    # same two functions, and is compatible with V1's "legacy scalar
-    # tolerated on read".  Only malformed MEMBERS are rejected.
+    # The β-before-γ hazard: PRD §9 sequenced γ after β, and
+    # `reconciliation/harness.py` wrote a SCALAR `supersedes` (81 live
+    # records) for that whole window.  Rejecting the scalar form here would
+    # have broken the recon harness's own writes until γ migrated it.  That
+    # window is now CLOSED — task 3196 (γ) migrated that writer
+    # (`ReconciliationHarness._reconcile_status_correction`) to the canonical
+    # list shape.
+    #
+    # The in-place coercion below is nonetheless RETAINED as
+    # defense-in-depth, not left over: no corpus rewrite shipped with γ, so
+    # the 81 pre-migration records still carry scalars (PRD D2 defers retro
+    # normalization to leaf θ's stamping sweep), and out-of-repo writers are
+    # not bound by the in-repo migration.  Coercing at the write boundary
+    # mirrors `_normalize_task_id_metadata`, which already does exactly this
+    # for the same class of problem in the same two functions, and is
+    # compatible with V1's "legacy scalar tolerated on read".  Only malformed
+    # MEMBERS are rejected.
     if 'supersedes' in meta:
         members = normalize_supersedes(meta['supersedes'])
         meta['supersedes'] = members
         for member in members:
-            if not _is_full_uuid(member):
+            if not is_full_uuid(member):
                 violations.append(_violation(
                     'supersedes',
                     'invalid_supersedes_member',
@@ -940,15 +1091,22 @@ def validate_memory_metadata(
                 fatal=enforce_kind_registry,
             ))
 
-    # 2d. parent_id — SHAPE only; liveness is leaf δ's (see the docstring).
+    # 2d. parent_id — SHAPE only.
+    #
+    # LIVENESS is resolved one layer up, at the write seam
+    # (`_apply_memory_metadata_validation`), using
+    # `parent_liveness_violation()` above; it fires only when the shape
+    # check below has PASSED, so no store round-trip is ever spent on an id
+    # no store could resolve.  See the SCOPE section of the docstring.
     if 'parent_id' in meta:
         parent_id = meta['parent_id']
-        if not _is_full_uuid(parent_id):
+        if not is_full_uuid(parent_id):
             violations.append(_violation(
                 'parent_id',
                 'invalid_parent_id_shape',
                 f'parent_id {parent_id!r} must be a canonical full-UUID string '
-                f'(shape only — liveness resolution is leaf δ\'s)',
+                f'(shape only — liveness is resolved at the write seam, '
+                f'see parent_liveness_violation)',
                 fatal=True,
             ))
 

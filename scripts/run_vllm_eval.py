@@ -34,15 +34,15 @@ from uuid import uuid4
 
 sys.path.insert(0, "/home/leo/src/runpod-toolkit")
 sys.path.insert(0, "/home/leo/src/dark-factory/orchestrator/src")
-from runpod_toolkit.config import RunPodConfig  # type: ignore[import]
-from runpod_toolkit.compute import RunPodClient, PodStatus  # type: ignore[import]
 from orchestrator.evals.configs import (
-    get_config_by_name,
-    VLLM_EVAL_CONFIGS,
     FINAL_RUN_CONFIGS,
+    VLLM_EVAL_CONFIGS,
     EvalConfig,
+    get_config_by_name,
 )
 from orchestrator.evals.snapshots import eval_worktree_root
+from runpod_toolkit.compute import PodStatus, RunPodClient  # type: ignore[import]
+from runpod_toolkit.config import RunPodConfig  # type: ignore[import]
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -188,7 +188,7 @@ class EvalSummary:
     @classmethod
     def crashed(
         cls, task_id: str, config_name: str, exc: BaseException
-    ) -> "EvalSummary":
+    ) -> EvalSummary:
         return cls(
             task_id=task_id,
             config_name=config_name,
@@ -228,6 +228,7 @@ def _build_eval_accounts_file() -> Path:
     ``USAGE_ACCOUNTS_FILE`` so both dark-factory and reify configs pick it up.
     """
     import tempfile
+
     import yaml
 
     base_path = PROJECT_ROOT / "config" / "usage-accounts.yaml"
@@ -856,8 +857,8 @@ def _connect_workstation(cfg: EvalConfig, args: argparse.Namespace) -> PodHandle
     on a local or LAN machine (e.g. leo-workstation:8000). The returned
     PodHandle has pod=None and tunnel_proc=None so tear_down_pod is a no-op.
     """
-    import urllib.request
     import urllib.parse
+    import urllib.request
 
     vllm_url = args.vllm_url
     parsed = urllib.parse.urlparse(vllm_url)

@@ -11,12 +11,14 @@ tests/scripts/test_spawn_claude.py's bash-level harness.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import fcntl
 import json
 import logging
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -681,6 +683,134 @@ def test_set_manual_boost_persists(tmp_path: Path) -> None:
     assert reread.manual_boost == 3
 
 
+def test_set_decision_escalations_dir_persists_normalized(tmp_path: Path) -> None:
+    """The back-fill's writer (task 3640) normalizes ON THE WAY IN.
+
+    A non-canonical spelling passed by a caller must not be stored raw: the
+    reaper's axis-2 guard compares stored-value against reaper-value, and a
+    dotted/trailing-slash spelling stored verbatim would compare unequal to
+    the very queue it names -- the fail-open direction, so the record would
+    silently never close again. Normalizing here means every writer of this
+    field (write-decision, the back-fill) stores ONE spelling.
+    """
+    rec = _make_decision(id='dec-setescdir')
+    sr.write_decision(rec, root=tmp_path)
+    queue = tmp_path / 'escalations'
+    queue.mkdir()
+    (tmp_path / 'sub').mkdir()
+    dotted = str(tmp_path / 'sub' / '..' / 'escalations') + '/'
+    assert dotted != str(queue)
+
+    updated = sr.set_decision_escalations_dir(rec.id, dotted, root=tmp_path)
+
+    assert updated is not None
+    assert updated.escalations_dir == sr.normalize_escalations_dir(queue)
+    [reread] = [d for d in sr.list_decisions(root=tmp_path) if d.id == rec.id]
+    assert reread.escalations_dir == sr.normalize_escalations_dir(queue)
+
+
+def test_set_decision_escalations_dir_stores_the_unknown_sentinel_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The composition that matters: sentinel in, sentinel on disk.
+
+    This is the one path the back-fill uses for every record whose owning
+    queue it could not determine. If the writer's normalize step turned the
+    sentinel into a cwd-relative path (the bug fixed in step-2), the live
+    fleet would end up with hundreds of records stamped
+    '/home/leo/src/dark-factory/.worktrees/3640/<unknown>' -- a value that
+    both lies about the record and varies with whoever ran the migration.
+    Running under chdir pins that the stored value is cwd-INdependent.
+    """
+    monkeypatch.chdir(tmp_path)
+    rec = _make_decision(id='dec-setescdir-unknown')
+    sr.write_decision(rec, root=tmp_path)
+
+    updated = sr.set_decision_escalations_dir(rec.id, sr.UNKNOWN_QUEUE, root=tmp_path)
+
+    assert updated is not None
+    assert updated.escalations_dir == sr.UNKNOWN_QUEUE
+    [reread] = [d for d in sr.list_decisions(root=tmp_path) if d.id == rec.id]
+    assert reread.escalations_dir == sr.UNKNOWN_QUEUE
+
+
+def test_set_decision_escalations_dir_preserves_every_other_field(tmp_path: Path) -> None:
+    """A read-modify-write must modify exactly ONE field.
+
+    write_decision rewrites the whole file, so a dropped/defaulted field in
+    the round-trip is silent data loss -- and the back-fill runs this over the
+    entire open cockpit population at once, where losing e.g. `options` or
+    `manual_boost` would quietly degrade real human gates. _make_decision
+    gives every field a distinguishable value precisely so this can catch it.
+    """
+    rec = _make_decision(id='dec-setescdir-preserve', state=sr.DecisionState.OPEN)
+    sr.write_decision(rec, root=tmp_path)
+
+    updated = sr.set_decision_escalations_dir(rec.id, sr.UNKNOWN_QUEUE, root=tmp_path)
+
+    assert updated is not None
+    [reread] = [d for d in sr.list_decisions(root=tmp_path) if d.id == rec.id]
+    assert reread == dataclasses.replace(rec, escalations_dir=sr.UNKNOWN_QUEUE)
+    # Spelled out as well as compared wholesale, so a failure names the field.
+    assert reread.state == sr.DecisionState.OPEN
+    assert reread.manual_boost == rec.manual_boost
+    assert reread.severity == rec.severity
+    assert reread.escalation_id == rec.escalation_id
+    assert reread.session_id == rec.session_id
+    assert reread.task_id == rec.task_id
+    assert reread.options == rec.options
+    assert reread.text == rec.text
+    assert reread.filed_at == rec.filed_at
+    assert reread.project == rec.project
+
+
+def test_set_decision_escalations_dir_fail_soft_on_unknown_id(tmp_path: Path) -> None:
+    """Same fail-soft contract as its two siblings: None, never a raise.
+
+    The back-fill reads the whole decision list and then writes each id back;
+    a record closed or removed by a live watcher in between is expected, not
+    exceptional, and must not abort a migration mid-population.
+    """
+    assert sr.set_decision_escalations_dir('no-such-id', '/tmp/q', root=tmp_path) is None
+
+
+def test_set_decision_escalations_dir_fail_soft_on_corrupt_body(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A corrupt on-disk body returns None (logged at ERROR), not a traceback."""
+    corrupt_path = sr.decision_path_for_id('dec-setescdir-corrupt', root=tmp_path)
+    corrupt_path.parent.mkdir(parents=True, exist_ok=True)
+    corrupt_path.write_text('{not valid json')
+
+    with caplog.at_level(logging.ERROR):
+        result = sr.set_decision_escalations_dir('dec-setescdir-corrupt', '/tmp/q', root=tmp_path)
+
+    assert result is None
+    assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
+def test_set_decision_escalations_dir_is_repeatable(tmp_path: Path) -> None:
+    """Called twice on the same id it simply succeeds twice (last write wins).
+
+    The back-fill is re-runnable by design, and the lock is a stable sidecar
+    the first call creates -- so a second call must not trip over its own
+    lock file. The locking contract itself is covered by TestDecisionIdLock;
+    this only pins that repeated calls compose.
+    """
+    rec = _make_decision(id='dec-setescdir-twice')
+    sr.write_decision(rec, root=tmp_path)
+
+    first = sr.set_decision_escalations_dir(rec.id, sr.UNKNOWN_QUEUE, root=tmp_path)
+    second = sr.set_decision_escalations_dir(rec.id, tmp_path / 'q', root=tmp_path)
+
+    assert first is not None
+    assert second is not None
+    [reread] = [d for d in sr.list_decisions(root=tmp_path) if d.id == rec.id]
+    assert reread.escalations_dir == sr.normalize_escalations_dir(tmp_path / 'q')
+
+
 def test_decisions_are_per_file_isolated(tmp_path: Path) -> None:
     """Distinct <id>.json paths are the whole isolation guarantee: writing or
     updating one decision must never touch another's file (no global index,
@@ -747,7 +877,7 @@ def test_update_and_set_boost_fail_soft_when_absent(tmp_path: Path) -> None:
     assert sr.set_manual_boost('no-such-id', 5, root=tmp_path) is None
 
 
-def test_update_and_set_boost_fail_soft_when_lock_acquisition_raises(
+def test_all_decision_setters_fail_soft_when_lock_acquisition_raises(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -759,6 +889,11 @@ def test_update_and_set_boost_fail_soft_when_lock_acquisition_raises(
     Regression guard for the `with decision_id_lock(...)` placement: if it
     were ever moved outside (or above) the helpers' existing try/except, this
     would start raising instead of returning None.
+
+    Covers ALL THREE writers, including task 3640's set_decision_escalations_dir
+    -- the back-fill iterates the whole live decision population, so a single
+    unabsorbed lock fault there would abort a migration mid-way and leave it
+    half-stamped.
     """
     rec = _make_decision(id='dec-lockfault', state=sr.DecisionState.OPEN, manual_boost=0)
     sr.write_decision(rec, root=tmp_path)
@@ -773,9 +908,11 @@ def test_update_and_set_boost_fail_soft_when_lock_acquisition_raises(
     with caplog.at_level(logging.ERROR):
         state_result = sr.update_decision_state('dec-lockfault', sr.DecisionState.ANSWERED, root=tmp_path)
         boost_result = sr.set_manual_boost('dec-lockfault', 5, root=tmp_path)
+        stamp_result = sr.set_decision_escalations_dir('dec-lockfault', '/tmp/q', root=tmp_path)
 
     assert state_result is None
     assert boost_result is None
+    assert stamp_result is None
     assert any(r.levelno >= logging.ERROR for r in caplog.records)
 
 
@@ -846,8 +983,14 @@ class TestDecisionIdLock:
 
 class TestDecisionHelpersAdoptLock:
     """Spy tests (mirror TestSubmitResolveAdoptLock, test_queue.py:2913):
-    update_decision_state and set_manual_boost must each acquire
-    decision_id_lock for the correct decision id.
+    update_decision_state, set_manual_boost and set_decision_escalations_dir
+    must EACH acquire decision_id_lock for the correct decision id.
+
+    One case per public helper, deliberately, even though all three now share
+    _mutate_decision: the lock is a per-helper CONTRACT, and a future setter
+    that grows its own body (or a wrapper that mutates before delegating)
+    would slip past a single shared-implementation test. TestDecisionIdLock
+    covers the lock primitive itself; these cover its ADOPTION.
     """
 
     def test_update_decision_state_acquires_lock_for_decision_id(
@@ -891,6 +1034,36 @@ class TestDecisionHelpersAdoptLock:
         sr.set_manual_boost('dec-spy-2', 5, root=tmp_path)
 
         assert 'dec-spy-2' in acquired, f'Expected lock acquisition for dec-spy-2; got {acquired}'
+
+    def test_set_decision_escalations_dir_acquires_lock_for_decision_id(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The queue-stamp setter is the THIRD writer on a decision id.
+
+        Its docstring makes the lock the central claim -- the task-3640
+        back-fill runs against live records while the C8 watchers and the
+        cockpit are up, so an unserialized read-modify-write here would drop
+        a concurrent state transition. Without this spy, deleting the
+        `with decision_id_lock(...)` span would leave every other test in the
+        suite green.
+        """
+        rec = _make_decision(id='dec-spy-3', escalations_dir='')
+        sr.write_decision(rec, root=tmp_path)
+
+        real_lock = sr.decision_id_lock
+        acquired: list[str] = []
+
+        @contextlib.contextmanager
+        def recording_lock(decision_id: str, root: Path | str | None = None):
+            acquired.append(decision_id)
+            with real_lock(decision_id, root=root):
+                yield
+
+        monkeypatch.setattr(sr, 'decision_id_lock', recording_lock)
+
+        sr.set_decision_escalations_dir('dec-spy-3', '/tmp/some-queue', root=tmp_path)
+
+        assert 'dec-spy-3' in acquired, f'Expected lock acquisition for dec-spy-3; got {acquired}'
 
 
 @pytest.mark.timeout(30)
@@ -3124,6 +3297,58 @@ def test_normalize_escalations_dir_fail_soft_on_unresolvable_value() -> None:
     assert sr.normalize_escalations_dir('a\x00b') == 'a\x00b'
 
 
+def test_unknown_queue_sentinel_is_distinguishable_from_the_unset_sentinel() -> None:
+    """UNKNOWN_QUEUE is a THIRD queue state (task 3640), not a respelling of ''.
+
+    '' means "nobody told us" (legacy/unset -- the reaper falls back to
+    project-only scoping and MAY close the record). UNKNOWN_QUEUE means "we
+    investigated and could not determine the owning queue" -- the reaper must
+    refuse to close it. Collapsing the two would silently hand every
+    back-filled undeterminable record back to the false-closure hazard task
+    3528 exists to remove, so the values must never compare equal, and the
+    sentinel must be TRUTHY (the reaper's axis-2 guard is gated on
+    `if decision_dir and ...`).
+
+    The angle brackets are load-bearing, not decoration: a resolved queue path
+    always begins with '/', so a real queue and this sentinel can never
+    collide no matter what a project is named.
+    """
+    assert sr.UNKNOWN_QUEUE
+    assert sr.UNKNOWN_QUEUE != ''
+    assert not sr.UNKNOWN_QUEUE.startswith('/')
+
+
+def test_normalize_escalations_dir_preserves_the_unknown_sentinel_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """THE RED DRIVER (task 3640): the sentinel must round-trip unchanged.
+
+    Without a special case, `'<unknown>'` is a bare word and falls through to
+    `Path(raw).expanduser().resolve()`, which resolves it RELATIVE TO THE
+    CALLING PROCESS'S CWD -- so the same record normalizes to
+    `<cwd-A>/<unknown>` in the back-fill script and `<cwd-B>/<unknown>` in a
+    watcher's reaper. A stamp whose value depends on who reads it is not a
+    contract at all: the two would never compare equal, and worse, whichever
+    accidental absolute path got STORED would be an outright lie about where
+    the record's escalation lives.
+
+    Asserting under two different cwds is the point -- a single call would
+    pass against a buggy implementation that merely happened to be invoked
+    from the right directory.
+    """
+    (tmp_path / 'a').mkdir()
+    (tmp_path / 'b').mkdir()
+
+    monkeypatch.chdir(tmp_path / 'a')
+    from_a = sr.normalize_escalations_dir(sr.UNKNOWN_QUEUE)
+    monkeypatch.chdir(tmp_path / 'b')
+    from_b = sr.normalize_escalations_dir(sr.UNKNOWN_QUEUE)
+
+    assert from_a == sr.UNKNOWN_QUEUE
+    assert from_b == sr.UNKNOWN_QUEUE
+
+
 def test_read_escalation_status_reads_queue_root_file(tmp_path: Path) -> None:
     """A still-pending escalation lives directly under the queue root."""
     escalations_dir = tmp_path / 'escalations'
@@ -3727,3 +3952,281 @@ def test_main_reap_decisions_fail_soft_on_bad_escalations_dir(
     assert rc == 0
     listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
     assert listed['dec-cli-badescdir'] == sr.DecisionState.OPEN
+
+
+def test_main_reap_decisions_refuses_unknown_queue_but_still_closes_legacy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """REGRESSION GUARD, not a RED driver (task 3640) -- and deliberately so.
+
+    Probed against the merged 3528 code before this test was written: a
+    decision stamped with ANY truthy non-matching value already survives the
+    axis-2 `if decision_dir and decision_dir != reaper_dir` compare, so an
+    UNKNOWN_QUEUE stamp is ALREADY safe today. A test asserting "the reaper
+    closes unknown-stamped records" would therefore be doomed-green and could
+    never drive an implementation. What this pins instead is that the safety
+    SURVIVES: it is currently an accident of string inequality, and a future
+    simplification of that compare (or of the explicit by-name guard step-2
+    adds) would silently make every back-filled undeterminable record closable
+    again, restoring the exact ~7-day invisible-close failure 3528 removed.
+
+    Both arms run in ONE reaper invocation against a queue holding a RESOLVED
+    escalation with the shared id, so the ONLY thing distinguishing them is
+    the queue stamp:
+      - the UNKNOWN_QUEUE-stamped record stays OPEN (refuse, never default to
+        close -- it stays a visible cockpit row for human closure);
+      - the legacy `escalations_dir=''` record on the SAME id still closes to
+        ANSWERED. That second assertion is the load-bearing one: task 3640
+        must NOT redefine '' under the human. '' keeps its 3528 meaning
+        (fall back to project-only scoping); the back-fill DRAINS that
+        population instead of changing what it means.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+    sr.write_decision(
+        _make_decision(
+            id='dec-unknown-queue',
+            project='df',
+            escalation_id='esc-3036-1',
+            state=sr.DecisionState.OPEN,
+            escalations_dir=sr.UNKNOWN_QUEUE,
+        ),
+        root=tmp_path,
+    )
+    sr.write_decision(
+        _make_decision(
+            id='dec-legacy-unset',
+            project='df',
+            escalation_id='esc-3036-1',
+            state=sr.DecisionState.OPEN,
+            escalations_dir='',
+        ),
+        root=tmp_path,
+    )
+
+    rc = sr.main(['reap-decisions', '--project', 'df', '--escalations-dir', str(orch)])
+
+    assert rc == 0
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-unknown-queue'] == sr.DecisionState.OPEN
+    assert listed['dec-legacy-unset'] == sr.DecisionState.ANSWERED
+
+
+def test_main_reap_decisions_refuses_unknown_queue_even_when_reaper_passes_the_sentinel(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The degenerate case the string-inequality compare alone does NOT cover.
+
+    If a reaper is invoked with the sentinel as its own ``--escalations-dir``
+    (an operator copy-pasting a stamped value out of a record, or a wrapper
+    threading the field straight through), then `decision_dir == reaper_dir`
+    and the axis-2 guard does not fire at all. Today the record still survives
+    only because read_escalation_status finds no queue at that bogus path and
+    returns None -- safety by lucky accident, one directory named
+    ``<unknown>`` away from failing. Step-2's explicit by-name guard is what
+    makes the refusal intentional, and this pins it.
+
+    Note the sentinel must reach the record VERBATIM for this to be a real
+    test, which is exactly what step-2's normalize_escalations_dir case
+    guarantees.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+    # A real directory literally named '<unknown>', holding a RESOLVED
+    # escalation for the shared id -- so a reaper that resolved the sentinel
+    # as a relative path WOULD find a close-worthy status there.
+    monkeypatch.chdir(tmp_path)
+    bogus = tmp_path / sr.UNKNOWN_QUEUE
+    bogus.mkdir()
+    (bogus / 'esc-3036-1.json').write_text(json.dumps({'status': 'resolved'}))
+    assert (orch / 'archive' / '2026-07-26' / 'esc-3036-1.json').is_file()
+    sr.write_decision(
+        _make_decision(
+            id='dec-unknown-selfmatch',
+            project='df',
+            escalation_id='esc-3036-1',
+            state=sr.DecisionState.OPEN,
+            escalations_dir=sr.UNKNOWN_QUEUE,
+        ),
+        root=tmp_path,
+    )
+
+    rc = sr.main(['reap-decisions', '--project', 'df', '--escalations-dir', sr.UNKNOWN_QUEUE])
+
+    assert rc == 0
+    listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
+    assert listed['dec-unknown-selfmatch'] == sr.DecisionState.OPEN
+
+
+class TestAtomicWriteSemantics:
+    """``_atomic_write_text``'s on-disk semantics, pinned WITHOUT a delegation seam.
+
+    Task 3223 consolidated the repo's tmp+rename writers into
+    ``shared.safe_io.atomic_write_text``, but this module is the deliberate
+    exception: it is stdlib-only so ``skills/spawn/spawn-claude.sh`` can run it
+    with no venv (see ``TestStdlibOnlySelfContainment`` below and
+    ``_ALLOWED_RENAMERS`` in ``shared/tests/test_safe_io.py``).
+
+    So these assert the OBSERVABLE result on disk rather than that a particular
+    helper was called. That is the more durable pin anyway: it holds whether
+    the body is inlined or delegated, and it does not go stale the next time
+    the implementation choice is revisited.
+    """
+
+    def test_writes_0600_and_leaves_no_temp_residue(self, tmp_path):
+        """The record is created 0600 (mkstemp's mode), with no tmp left behind."""
+        target = tmp_path / 'record.json'
+
+        sr._atomic_write_text(target, '{"a": 1}')
+
+        assert target.read_text() == '{"a": 1}'
+        assert target.stat().st_mode & 0o777 == 0o600, (
+            'session records hold session state and must stay owner-only'
+        )
+        assert sorted(p.name for p in tmp_path.iterdir()) == ['record.json']
+
+    def test_creates_missing_parent_dirs(self, tmp_path):
+        """The parent chain is created rather than surfacing FileNotFoundError."""
+        target = tmp_path / 'nested' / 'deeper' / 'record.json'
+
+        sr._atomic_write_text(target, '{"a": 1}')
+
+        assert target.read_text() == '{"a": 1}'
+
+    def test_overwrites_atomically_leaving_no_residue(self, tmp_path):
+        """A rewrite replaces the contents wholesale and leaves no tmp file."""
+        target = tmp_path / 'record.json'
+
+        sr._atomic_write_text(target, '{"a": 1}')
+        sr._atomic_write_text(target, '{"b": 2}')
+
+        assert target.read_text() == '{"b": 2}'
+        assert sorted(p.name for p in tmp_path.iterdir()) == ['record.json']
+
+    def test_failed_write_leaves_original_intact_and_no_residue(
+        self, tmp_path, monkeypatch
+    ):
+        """On a mid-write failure the original survives and the tmp is cleaned up."""
+        target = tmp_path / 'record.json'
+        sr._atomic_write_text(target, '{"original": true}')
+
+        def _boom(*_args, **_kwargs):
+            raise OSError('disk full')
+
+        monkeypatch.setattr(sr.os, 'replace', _boom)
+
+        with pytest.raises(OSError, match='disk full'):
+            sr._atomic_write_text(target, '{"replacement": true}')
+
+        assert target.read_text() == '{"original": true}'
+        assert sorted(p.name for p in tmp_path.iterdir()) == ['record.json']
+
+    def test_write_record_creates_missing_nested_dir_and_round_trips(self, tmp_path):
+        """End-to-end: write_record into a non-existent nested root still works."""
+        root = tmp_path / 'does' / 'not' / 'exist'
+        assert not root.exists()
+
+        record = _make_record(session_slug='sess-3223', task_id='3223')
+        sr.write_record(record, root=root)
+
+        loaded = sr.read_record('sess-3223', root=root)
+        assert loaded is not None
+        assert loaded.session_slug == 'sess-3223'
+        assert loaded.task_id == '3223'
+
+
+#: Repo root of this worktree, resolved from THIS FILE so the subprocess
+#: contract test below is CWD-independent (the suite is run from
+#: ``<worktree>/orchestrator``, but a scratch-CWD run must behave identically).
+_SR_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _non_venv_interpreter() -> str | None:
+    """Return an interpreter that has no workspace packages installed, or None.
+
+    ``sys.executable`` is the venv interpreter, which HAS ``shared`` installed
+    and therefore cannot discriminate — the contract under test is precisely
+    "imports without a venv".  Prefer the system interpreter, then the base
+    interpreter this venv was built from.
+    """
+    candidates = ['/usr/bin/python3', str(Path(sys.base_prefix) / 'bin' / 'python3')]
+    for candidate in candidates:
+        if Path(candidate).is_file() and Path(candidate).resolve() != Path(
+            sys.executable
+        ).resolve():
+            return candidate
+    return None
+
+
+class TestStdlibOnlySelfContainment:
+    """``session_registry`` must import with NO venv, install or workspace deps.
+
+    This is an architectural contract, not a style preference.  The module
+    docstring (lines 5-12) states it is "deliberately stdlib-only and
+    self-contained (no intra-orchestrator imports)" so it can be "invoked
+    directly by ``skills/spawn/spawn-claude.sh`` via an absolute path (no
+    venv/PYTHONPATH/install required)".  That hook runs under an interpreter
+    with no workspace packages available, so ANY ``from shared import ...`` or
+    third-party import at module scope breaks the spawn path — and does so far
+    from here, as a hook subprocess that silently never writes ``record.json``.
+
+    Task 3223's consolidation added ``from shared import safe_io`` and broke
+    exactly this (escalation esc-3223-2); the only symptom in the suite was two
+    downstream ``test_session_hooks.py`` failures, which is why the contract is
+    now pinned directly.  A future migration that finds this test in its way
+    should read the module docstring before deleting it.
+    """
+
+    def test_imports_under_a_bare_interpreter_with_no_workspace_packages(self, tmp_path):
+        """`import orchestrator.session_registry` succeeds with only orchestrator/src."""
+        interpreter = _non_venv_interpreter()
+        if interpreter is None:
+            pytest.skip('no non-venv interpreter available on this host')
+
+        env = {
+            'PYTHONPATH': str(_SR_REPO_ROOT / 'orchestrator' / 'src'),
+            'PATH': '/usr/bin:/bin',
+            'HOME': os.environ.get('HOME', '/tmp'),
+            'PYTHONDONTWRITEBYTECODE': '1',
+        }
+
+        # ``cwd=tmp_path`` on both runs below is LOAD-BEARING, not tidiness.
+        # Python puts the process's own cwd on sys.path, so a run from the REPO
+        # ROOT resolves ``<repo>/shared`` — the wrapper directory, NOT the real
+        # ``shared/src/shared`` package — as an empty NAMESPACE package.  The
+        # probe's ``shared`` import then succeeds, this test skips, and the
+        # contract goes unpinned.  Measured: inert from the repo root, live from
+        # ``orchestrator/``.  The canonical test_command runs
+        # ``cd orchestrator && pytest tests/``, so it only bit an ad-hoc
+        # ``pytest orchestrator/tests/...`` from the root — which is exactly what
+        # someone checking this one file types.  A neutral cwd holds either way.
+        #
+        # Guard against a vacuous pass: on a host where ``shared`` really is
+        # installed into this interpreter, the assertion below would succeed even
+        # with the contract broken.  Probe the SAME import shape the contract
+        # forbids — a bare ``import shared`` is satisfied by a namespace dir that
+        # ``from shared import safe_io`` still fails on, so probing the bare form
+        # can only ever over-skip.
+        probe = subprocess.run(
+            [interpreter, '-c', 'from shared import safe_io'],
+            env=env, cwd=tmp_path, capture_output=True, text=True, timeout=60,
+        )
+        if probe.returncode == 0:
+            pytest.skip(
+                'this interpreter can already import `shared`; the test cannot '
+                'discriminate a stdlib-only module from one that imports it'
+            )
+
+        result = subprocess.run(
+            [interpreter, '-c', 'import orchestrator.session_registry'],
+            env=env, cwd=tmp_path, capture_output=True, text=True, timeout=60,
+        )
+
+        assert result.returncode == 0, (
+            'session_registry must import with no venv/install — it is executed '
+            'by absolute path from skills/spawn/spawn-claude.sh. Remove the '
+            'non-stdlib module-scope import.\n'
+            f'stderr:\n{result.stderr}'
+        )

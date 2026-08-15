@@ -115,7 +115,7 @@ does not).
 
 | Capability | Evidence | Verdict |
 |---|---|---|
-| All four arms servable | α upstream (endpoints); MoE via llama.cpp `json_object` + ε's validator | PASS |
+| All **three remaining** arms servable | α upstream (endpoints); MoE via llama.cpp `json_object` + ε's validator — the fourth (Mistral-Small-3.2-24B) was measured **UNSERVABLE** on this host and dropped 2026-08-06 (esc-3713-10); this row's original "All four arms servable … PASS" verdict was **falsified by α's own gate**, which is the gate working as intended | PASS (for the three) |
 | Phi-4 context-fit check is measurable | screening measures graphiti's longest real prompt vs 16K (Open Q2) — drop-with-margin rule pre-registered in ζ | PASS |
 | Survivor rule exists before selection | ζ upstream commits the funnel's survivor rule | PASS |
 

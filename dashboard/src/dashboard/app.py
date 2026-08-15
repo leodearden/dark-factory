@@ -330,6 +330,94 @@ async def _metrics_loop(
             logger.warning('Metrics snapshot error', exc_info=True)
 
 
+# ── shared httpx client pool bound (task 3871) ──────────────────────
+#
+# The dashboard shares ONE httpx.AsyncClient across every fan-out (merge_halt,
+# task_runtime, live merge queue, the metrics samplers). Constructed with no
+# `limits=` it inherited httpx's stock DEFAULT_LIMITS — max_connections=100,
+# max_keepalive_connections=20, keepalive_expiry=5.0 (httpx/_config.py).
+#
+# THIS IS A GUARD, NOT A LEAK FIX. It bounds idle-socket retention and stops
+# the client from racing the server's keep-alive close, while letting the
+# concurrency ceiling track the fleet (see the two-dimensions note below). It
+# does NOT fix the CLOSE-WAIT accumulation — that diagnosis is owned by the
+# task-3857 re-spec, and nothing here should be read as addressing it.
+#
+# keepalive_expiry is derived from the SMALLER of the two server populations
+# the dashboard talks to, because the smaller one binds:
+#   * escalation MCP servers (one per orchestrator, and the target of most of
+#     the fan-out) are served by uvicorn with NO timeout_keep_alive override
+#     — orchestrator/src/orchestrator/harness.py — and uvicorn's default is 5s.
+#   * fused-memory sets keepalive_timeout: 120 (fused-memory/config/config.yaml),
+#     far looser, so 4.0 clears it comfortably too.
+# httpx's own default is exactly 5.0 — a DEAD TIE with the escalation servers'
+# close, i.e. the client considers a connection reusable at precisely the
+# moment the server may close it. 4.0 buys 1s of margin under that close while
+# staying above the ~3s dashboard poll interval (merge_halt.py names a "3s
+# polling loop"), so a connection still survives one poll cycle rather than
+# reconnecting every time. Below ~3.5 destroys reuse; >= 5.0 keeps the race.
+_HTTP_KEEPALIVE_EXPIRY_SECONDS = 4.0
+
+# TWO DIMENSIONS, BOUNDED DIFFERENTLY — the distinction matters:
+#
+#   * CONCURRENCY (max_connections) SCALES UP with the fleet. The real peak is
+#     (viewers x concurrent endpoint families x projects). Roughly three
+#     families run concurrently per project — get_merge_halt_status and
+#     fetch_live_merge_queues are gathered over every escalation URL, plus the
+#     task_runtime fan-out — with the metrics samplers over fused_memory_urls
+#     on top; _HTTP_CONNS_PER_ENDPOINT rounds that up for headroom.
+#
+#     The multiplier that is easy to miss is the VIEWER count: every open
+#     browser tab drives its OWN 2s poll of all of the above, so in-flight
+#     demand is per-tab, not per-install. _HTTP_ASSUMED_CONCURRENT_VIEWERS
+#     names that assumption instead of leaving it implicit — raise it if the
+#     dashboard is ever put in front of a larger audience.
+#
+#     _HTTP_MIN_CONNECTIONS is deliberately httpx's own stock max_connections:
+#     for a small install the derived product lands below it, and this change
+#     must never make the pool TIGHTER than what already shipped. Sizing below
+#     stock would convert ordinary queueing into httpx.PoolTimeout — which,
+#     now that the per-call budget also bounds pool acquisition, would render
+#     as an "offline" pill on a perfectly healthy orchestrator. (When that
+#     does happen it is diagnosable: mcp_fanout.describe_exc names the
+#     exception type, so 'PoolTimeout' in the log distinguishes local
+#     saturation from a dead endpoint.)
+#
+#   * IDLE RETENTION (max_keepalive_connections) is held FLAT at httpx's stock
+#     20, NOT scaled as a fraction of the total. A `max_connections // 2` rule
+#     would hand a 40-project install 84 idle keepalive slots against httpx's
+#     stock 20 — i.e. this "guard" would LOOSEN retention for exactly the
+#     large fleets it is meant to bound, and retention is the dimension the
+#     deferred CLOSE-WAIT investigation (task 3857) cares about. The `// 2`
+#     term stays only as a sanity clamp for tiny pools.
+_HTTP_MIN_CONNECTIONS = 100
+_HTTP_CONNS_PER_ENDPOINT = 4
+_HTTP_ASSUMED_CONCURRENT_VIEWERS = 3
+_HTTP_MAX_KEEPALIVE_CONNECTIONS = 20
+
+
+def _build_http_limits(config: DashboardConfig) -> httpx.Limits:
+    """Derive the shared client's connection-pool bound from *config*.
+
+    Pure by design: ``httpx.AsyncClient`` exposes no public accessor for its
+    limits, so a helper is the only way to test the sizing without asserting
+    on private internals (``client._transport._pool._max_connections``), which
+    are brittle across httpx versions.
+    """
+    endpoints = len(config.escalation_urls) + len(config.fused_memory_urls)
+    max_connections = max(
+        _HTTP_MIN_CONNECTIONS,
+        _HTTP_CONNS_PER_ENDPOINT * _HTTP_ASSUMED_CONCURRENT_VIEWERS * endpoints,
+    )
+    return httpx.Limits(
+        max_connections=max_connections,
+        max_keepalive_connections=min(
+            max_connections // 2, _HTTP_MAX_KEEPALIVE_CONNECTIONS,
+        ),
+        keepalive_expiry=_HTTP_KEEPALIVE_EXPIRY_SECONDS,
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage shared resources: HTTP client, DB connection pool.
@@ -351,9 +439,15 @@ async def lifespan(app: FastAPI):
     ``app.state`` stays assigned for request handlers and for tests that swap
     ``app.state.config``; it is simply not the shutdown path's source of truth.
     """
-    http_client = httpx.AsyncClient(follow_redirects=True)
-    app.state.http_client = http_client
+    # Config first: the shared client's pool bound is DERIVED from it (see
+    # _build_http_limits above). DashboardConfig.from_env() has no dependency
+    # on the client, so evaluating it first is safe.
     app.state.config = DashboardConfig.from_env()
+    http_client = httpx.AsyncClient(
+        follow_redirects=True,
+        limits=_build_http_limits(app.state.config),
+    )
+    app.state.http_client = http_client
     pool = DbPool()
     app.state.db = pool
     app.state.start_time = time.monotonic()
@@ -704,6 +798,20 @@ async def api_tasks(request: Request) -> JSONResponse:
     )
 
 
+# Per-HTTP-request budget for /memory's three MCP legs (task 3871), matching
+# the metrics samplers' 5.0s. Without it each leg silently ran to
+# mcp_tool_call's 10s default — including pool acquisition — while its
+# sibling legs honoured a real budget.
+#
+# Deliberately NOT also wrapped in asyncio.wait_for, unlike the curator leg
+# below: this gather has no return_exceptions=True, so a TimeoutError raised
+# by a wrapper would escape as a 500 rather than degrading one leg. The three
+# callees swallow their own per-URL failures and return offline dicts, so
+# adding a whole-operation bound here means first giving each leg its own
+# exception containment — a shape change beyond this task.
+_MEMORY_ENDPOINT_TIMEOUT_SECONDS = 5.0
+
+
 @app.get('/api/v2/dashboard/memory')
 async def api_memory(request: Request) -> JSONResponse:
     """MEMORY_STATUS, including queue counts and per-project totals."""
@@ -712,12 +820,18 @@ async def api_memory(request: Request) -> JSONResponse:
     pool: DbPool = request.app.state.db
     metrics_db = await pool.get(config.metrics_db)
     status, queue, sparks, queue_spark, delta_24h, wal = await asyncio.gather(
-        memory_data.get_memory_status(http_client, config),
-        memory_data.get_queue_stats(http_client, config),
+        memory_data.get_memory_status(
+            http_client, config, timeout=_MEMORY_ENDPOINT_TIMEOUT_SECONDS,
+        ),
+        memory_data.get_queue_stats(
+            http_client, config, timeout=_MEMORY_ENDPOINT_TIMEOUT_SECONDS,
+        ),
         get_memory_sparks(metrics_db, days=1),
         get_queue_pending_series(metrics_db, days=1),
         get_memory_24h_ago(metrics_db),
-        memory_data.get_wal_status(http_client, config),
+        memory_data.get_wal_status(
+            http_client, config, timeout=_MEMORY_ENDPOINT_TIMEOUT_SECONDS,
+        ),
     )
     return JSONResponse(
         redux_api.shape_memory(
@@ -999,6 +1113,11 @@ async def api_curator_cancel(request: Request) -> JSONResponse:
         config.fused_memory_urls,
         _call,
         log_label='cancel_ticket',
+        # log_failures=False: _call above already emits a fully-detailed
+        # WARNING per failing URL (pinned by test_api_curator_cancel.py), so
+        # letting first_success report too would give one failure two
+        # identical-level lines. Reported exactly once, at the call site.
+        log_failures=False,
         offline_result=lambda errs: JSONResponse(
             {'error': 'fused_memory_unreachable', 'detail': '; '.join(errs)},
             status_code=502,
@@ -1050,7 +1169,19 @@ async def api_curator(request: Request) -> JSONResponse:
         ),
         _sparks_leg(),
         _intervals_leg(),
-        memory_data.get_curator_state(http_client, config),
+        # Bounded on BOTH layers, like every other probe in task 3871: the
+        # budget bounds each individual HTTP request (including pool
+        # acquisition), wait_for bounds the whole operation because a cold
+        # session is three posts across up to N urls. Previously this leg took
+        # neither, so /curator could block for roughly N x 3 x 10s during a
+        # fused-memory outage while its fan-out sibling honoured 5s.
+        # TimeoutError lands in safe_gather_result below as the offline state.
+        asyncio.wait_for(
+            memory_data.get_curator_state(
+                http_client, config, timeout=_CURATOR_ENDPOINT_TIMEOUT_SECONDS,
+            ),
+            timeout=_CURATOR_ENDPOINT_TIMEOUT_SECONDS,
+        ),
         return_exceptions=True,
     )
     # fan_out_list_tickets never raises a normal Exception (per-root failures are
@@ -1222,7 +1353,14 @@ async def _scheduler_proxy(
         return JSONResponse(result)
 
     return await first_success(
-        config.fused_memory_urls, _call, log_label=tool_name, offline_result=_sched_fan_out_error,
+        config.fused_memory_urls,
+        _call,
+        log_label=tool_name,
+        # See the cancel_ticket fan-out: _call already logs each failing URL at
+        # WARNING with the same content, so first_success stays quiet here and
+        # the failure is reported exactly once.
+        log_failures=False,
+        offline_result=_sched_fan_out_error,
     )
 
 

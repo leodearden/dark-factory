@@ -10,6 +10,90 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+#### `update_memory`'s default allowlists now admit `curator-` on both arms (esc-3524-1)
+
+**Behaviour change, operator-visible.** `Mem0UpdateConfig`'s
+`content_amend_allowed_agent_prefixes` and `metadata_patch_allowed_agent_prefixes`
+default to `['recon-stage-', 'curator-']` instead of `['recon-stage-']`. The
+`curator-` prefix is the dedicated opt-in identity for the interactive
+memory-consolidation sitting (`skills/curate-fused-memories`), granted both arms
+by Leo's ruling (b) on esc-3524-1 (2026-08-11) and promoted from a per-machine
+`config.yaml` override to an all-deployments schema default on 2026-08-12 — the
+sitting skill does not work without it. `config.yaml`'s `mem0_update:` block is
+fully commented out again; the premise tripwire in
+`test_recon_amend_tool_advertisement.py` (which fired on the 2026-08-11 override
+commit `65b011ed8c` and turned main red) is re-armed: it still fails on any
+active YAML override of these leaves. No recon-stage capability changed;
+`agent_id` remains self-reported (a misuse deterrent, not a security boundary).
+
+#### `delete_memory`'s citation gate now applies to EVERY caller (task 3624)
+
+**Behaviour change, operator-visible.** A `store='mem0'` `delete_memory` call
+that succeeded yesterday can now be REFUSED with
+`error_type='CitationRepointRequired'`. The pre-delete citation-repoint gate
+(task 3108) was scoped to `recon-stage-*` callers; it now keys on the RECORD —
+`store == 'mem0'` and a scannable registered project — because "will this delete
+dangle a live task pointer?" is a property of the entry and the task DB, not of
+who issued the delete. Under the old predicate the identical delete issued from
+an interactive session landed unguarded, and a caller with no `agent_id` at all
+was the *least* guarded one. This is what gates the 25-gate memory-consolidation
+batch tracked by task 3524 / esc-3524-1, which is driven from an interactive
+session rather than a recon-stage agent. An uncited entry is unaffected: the scan
+finds nothing live and the delete proceeds as before.
+
+**Migration note:** the remedy is unchanged — retry with
+`replacement_memory_id=<the surviving entry's full 36-char UUID>` and the live
+citers are repointed before the delete runs. For a delete with *no* surviving
+entry to repoint to — a plain drop rather than a consolidation, which
+`replacement_memory_id` cannot express — pass
+`metadata={'allow_dangling_citations': True}`. Only a literal boolean `True`
+counts, matching the `allow_mcp_markup` convention below; a truthy `'yes'` or `1`
+does not unlock an irreversible delete — and does not vanish either: a supplied
+value that is not a literal boolean comes back as `ignored_override` on the
+rejection, with a `hint` sentence saying why, rather than leaving the caller to
+retry the flag they believe they already passed. (A literal `False` is a
+deliberate "no" and is honoured without comment.)
+
+The `hint` names the escape, so it is discoverable from the rejection itself —
+but only on `CitationRepointRequired`. The `CitationReplacement*` refusals
+deliberately do **not** advertise it: those are reached by *naming* a survivor,
+so the caller demonstrably has one and their fix is to correct the UUID. A
+consolidation delete has a survivor by definition, which is exactly the case the
+escape is wrong for.
+
+Two deliberate differences from `allow_mcp_markup`. First, the override is not
+silent: it is recorded at `WARNING` naming the deleted id, the `agent_id` that
+asked, and every live citer it strands — an override that lands silently is the
+same class of defect as the gate that never ran. The same enumeration is
+returned to the caller (`dangled_citations`, `dangled_citation_count`), because
+an MCP caller never sees the server's log stream and a bare
+`{'status': 'deleted'}` would be silent from the only vantage point that matters
+to them. Supplying a `replacement_memory_id` *alongside* the flag is
+contradictory; the override wins, and the ignored value is named both in that
+log line and as `ignored_replacement_memory_id` on the response rather than
+dropped in silence.
+Second, `allow_mcp_markup` is "stripped before persistence" whereas this flag
+needs no strip at all: `delete_memory` discards `_extract_causation`'s cleaned
+dict and `memory_service.delete_memory(...)` takes no `metadata` parameter, so
+the flag structurally cannot reach the store.
+
+The escape is a property of stated intent, not of identity — it is available to
+recon-stage callers too, since a second caller-identity check would reintroduce
+exactly the scoping this task removed. It deliberately does **not** unlock the
+fail-closed path: an override plus an unreadable task DB is still
+`CitationScanFailed`, because the flag means "I accept dangling the citers you
+just showed me" and with nothing enumerated there is nothing to knowingly accept.
+
+**Cost.** Every `store='mem0'` delete now pays one `task_interceptor.get_tasks`
+read plus a whole-tree metadata walk, so a 25-delete batch pays it 25 times. The
+snapshot is deliberately *not* cached across calls: it is the last read before an
+irreversible delete, and a task that starts citing the doomed id after a cached
+snapshot was taken would be invisible to the gate — trading its fail-closed
+guarantee for a race, on the exact operation the gate exists to protect. The cost
+is made observable instead: each scan logs its task count and duration at `DEBUG`
+(`citation gate: scanned N task(s) ... in X ms`), so a project large enough for
+this to matter shows up as a measurement.
+
 #### Leaked tool-call XML: root cause, and the tooling to sweep the corpus (task 3083)
 
 **This task ships no write-time guard.** Live rejection at the MCP write
@@ -137,6 +221,71 @@ entry naming a task owner — and re-runs the detector over the recoverable payl
 to prove the documented recovery is still executable, so deleting the artifact
 holding the only surviving copy fails loudly instead of silently. Hermetic — no
 live store — so it stays green whether or not Qdrant is up.
+
+#### `allow_mcp_markup` documented; `last_blocked_at` blessed (task 3697)
+
+**`allow_mcp_markup` is now documented in `docs/task-authoring.md` §8** as the
+correct move for a write that deliberately quotes the MCP envelope literals. The
+guard (task 3141, below) has been live and working since it shipped; what was
+missing was the convention around it, so authors reached for a workaround
+instead — paraphrase the literals, then park the evidence under a bespoke
+timestamped metadata key. That workaround manufactures *both* failure classes at
+once: a `code=unknown_key` census line for every such key, and a bounced write
+for every author who quotes the literals without the flag. It was
+self-perpetuating because it was documented inside task 3083's own `details`.
+The new section records the scope of the gate (text arguments only — never the
+metadata blob), that only a literal boolean `True` enables it, and that it is
+write-time-only and stripped before the merge, so it never persists into stored
+metadata. It deliberately does not restate the literals: doing so would oblige
+every future task write quoting that section to set the override, which is the
+loop it exists to break.
+
+**`last_blocked_at` promoted to the Tier-A blessed-key allowlist**
+(`_BLESSED_METADATA_KEYS`, mirrored into the hand-maintained listing in
+`docs/task-authoring.md` §8 in the same commit — that listing is a manual copy
+with no drift test guarding it). It is written by the orchestrator on every
+block and read back by the briefing stale-check, and 78 tasks carry it, so every
+one of them was minting an `unknown_key` line. Promotion rather than an `x_`
+rename, because renaming a machine-written key on one task forks the vocabulary
+against its siblings and the orchestrator would re-add the canonical spelling on
+the next block anyway.
+
+**Added `fused-memory/scripts/migrate_task_metadata_to_x_namespace.py`** for
+retiring ad-hoc metadata keys into the `x_` namespace. The gotcha it exists for:
+**`metadata_mode='merge'` cannot retire a key.** `_merge_metadata` is a shallow
+`{**old, **new}` with no deletion sentinel, so merge can add the `x_` spelling
+but never remove the old one — both would coexist and the warnings would
+persist. The script is dry-run by default (`--apply` required), requires an
+explicit `--task-id`, refuses on a collision rather than clobbering, and runs a
+mandatory read-back proving the `x_` keys landed, the old spellings are gone,
+sibling keys are byte-identical, and `description`/`details` sha256 and `status`
+are unchanged. Two guards cover what the read-back structurally cannot, since
+it verifies *intent* (did the rename land) and not *safety* (should it have):
+`--keys` is validated up front and refuses an already-`x_`-prefixed, typed
+`TaskMetadata` or Tier-A blessed key (`--force` overrides), and `--apply`
+writes the full pre-write row — metadata *and* `description`/`details` — to
+`--backup-path` first, refusing to write at all if that snapshot cannot be
+saved. The read-back also discounts the backend's own reserved control keys
+(`append`, `metadata_mode`, stripped from every incoming payload in all modes),
+so migrating a task that carries a leaked control key reports the drop as
+information rather than raising a false corruption alarm after the write has
+already committed.
+
+**This task's stated signal — zero `unknown_key` lines on task 3083 — is
+PARTIALLY MET, and is recorded as such rather than claimed.** Blessing
+`last_blocked_at` took it from 7 to 6. The remaining 6 need a live metadata
+write that is currently impossible: `update_task` rejects any metadata payload
+containing `done_provenance` (a presence-only write-authority floor evaluated
+before `metadata_mode` is resolved), so a whole-blob `'replace'` cannot run
+against any `done`/merged task, and task 3083 is one. Task 3083 is unchanged and
+undamaged — metadata still 20124 bytes / 18 keys, `description` and `details`
+sha256 identical to the pre-migration snapshot, status still `done`. Ticket
+`tkt_0RS4WVMH1RSTSY88N781E70F5S` owns the write-path decision and the re-run.
+Two further pre-existing gaps are measured and recorded in the new "Known gaps"
+table in `docs/task-authoring.md` §8, owned by
+`tkt_0RS4XDWJQ9PR8MFXY5DKW950WS`: `execution_class` is read by two live guards
+but is neither blessed nor typed (272 tasks), and the `x_` sweep has not been
+run corpus-wide.
 
 ### Changed (BREAKING)
 

@@ -91,6 +91,48 @@ queue:
   backend_write_timeout_seconds: ${BACKEND_WRITE_TIMEOUT:120}
   search_timeout_seconds: ${SEARCH_TIMEOUT:30}
   data_dir: "${QUEUE_DATA_DIR:./data/queue}"
+  # Error-aware retry budget (task 1936, membership revised by task 3585).
+  # Errors whose class name matches any entry below — walked over the raised
+  # exception's __mro__, so subclasses match too — get transient_max_attempts
+  # instead of the plain max_attempts ceiling.
+  #
+  # The not-found family (NodeNotFoundError, EdgeNotFoundError,
+  # EdgesNotFoundError) is DELIBERATELY ABSENT: esc-3561-3 refuted the
+  # visibility-race premise it was added on. See
+  # DEFAULT_TRANSIENT_ERROR_NAMES in
+  # src/fused_memory/services/durable_queue.py for the evidence and for the
+  # clustered/read-routed-backend condition that would justify putting it back.
+  #
+  # RECORDED COST (task 3585). Spelling the list out here makes it a THIRD
+  # copy — schema.QueueConfig's default and durable_queue's frozenset are the
+  # other two — so a future membership change in code has to be made in three
+  # places, not two. That is accepted deliberately, for one reason: the policy
+  # is otherwise editable only by changing code, and an operator responding to
+  # an incident needs it visible and tunable in the DEPLOYED file. Retuning
+  # here is expected and supported; CI does not freeze this list to the code
+  # default. What it does enforce (test_config_schema.py::
+  # TestQueueConfigTransientErrorFields::
+  # test_deployed_config_transient_retry_policy) is the 3585 verdict plus the
+  # anti-drift floor: this list may ADD names, must contain every name in
+  # DEFAULT_TRANSIENT_ERROR_NAMES, and must not readmit the not-found family.
+  # Re-add one of those three only after re-deriving the argument from the
+  # durable_queue.py comment — the test will make you mean it.
+  #
+  # queue.* is NOT in reload.py's hot-reload allowlist, so mcp__fused-memory__
+  # reload_config reports a change here under restart_required rather than
+  # silently no-op'ing — the queue reads this config once, at construction.
+  # A change takes effect on restart.
+  #
+  # transient_error_names is spelled literally: _expand_env_vars substitutes
+  # per string and recurses INTO lists, so a whole-list ${VAR:default} would
+  # reach pydantic as one string and fail validation.
+  transient_max_attempts: ${QUEUE_TRANSIENT_MAX_ATTEMPTS:12}
+  transient_error_names:
+    - TimeoutError
+    - ConnectionError
+    - ConnectionResetError
+    - ServerDisconnectedError
+    - OperationalError
 
 # ── Project isolation (task 1143) ────────────────────────────────────────────
 # The reconciliation harness hard-binds project_root per project_id via a
@@ -267,8 +309,17 @@ summary_rebuild:
 #   # to notice and cheap to correct, a silent content rewrite is neither.
 #   # agent_id is self-reported, so this deters misuse by cooperating callers
 #   # rather than enforcing a security boundary.
-#   content_amend_allowed_agent_prefixes: ['recon-stage-']
-#   metadata_patch_allowed_agent_prefixes: ['recon-stage-']
+#   #
+#   # curator- is part of the SCHEMA DEFAULT (ruling 2026-08-12, promoting the
+#   # 2026-08-11 esc-3524-1 ruling (b) from a per-machine override here to an
+#   # all-deployments default): it admits the interactive memory-consolidation
+#   # sitting defined by skills/curate-fused-memories, which cannot work
+#   # without the grant. Both arms deliberately — gate 3200's retain-and-tag
+#   # stamps retained peers via metadata-only patches, so content_amend alone
+#   # would be the destructive half without the preserving half. Full
+#   # rationale: the Mem0UpdateConfig field descriptions in config/schema.py.
+#   content_amend_allowed_agent_prefixes: ['recon-stage-', 'curator-']
+#   metadata_patch_allowed_agent_prefixes: ['recon-stage-', 'curator-']
 #   # Content-amend burst alarm: escalates, never blocks (a hard block would
 #   # risk a legitimate large consolidation cycle failing mid-run over its own
 #   # success count). Metadata-only calls do not count toward it.

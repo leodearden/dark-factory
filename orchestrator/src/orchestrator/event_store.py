@@ -251,6 +251,23 @@ class EventType(StrEnum):
     # the numerator by json_extract(data, '$.reason') to separate expected
     # reseeds from genuine corroboration failures. (enabled=False emits nothing,
     # so a zero total means either no recovered sessions or the kill switch.)
+    #
+    # session_resume_fallback additionally carries `data.archive_available: bool`
+    # (task 3727) on BOTH reasons — reseeded and {stale, no_transcript} alike —
+    # answering "was this session actually RECOVERABLE from the durable
+    # transcript archive?", i.e. did its transcript survive outside the wiped
+    # worktree. Query it as json_extract(data, '$.archive_available') alongside
+    # the existing '$.reason' split, so the fallback population can be cut into
+    # recoverable vs genuinely lost.
+    #
+    # session_resume and session_resume_capped deliberately do NOT carry the
+    # field, so the ratio recipe's DENOMINATOR above is unchanged — the
+    # instrument was added to exactly one of the three outcome events.
+    #
+    # The rate this field exposes is a MEASUREMENT, not a target: it quantifies
+    # a recoverable population that nothing yet acts on (INV-3
+    # instrument-before-acting). Task 3619 will deliberately move it upward, so
+    # a rising archive_available rate is that work landing, not a regression.
     session_resume = 'session_resume'
     session_resume_fallback = 'session_resume_fallback'
     session_resume_capped = 'session_resume_capped'

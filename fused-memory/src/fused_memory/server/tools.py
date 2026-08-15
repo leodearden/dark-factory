@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import os
+import time
 import uuid as uuid_mod
 from datetime import UTC, datetime
 from pathlib import Path
@@ -98,11 +99,21 @@ from fused_memory.server.near_duplicate_guard import (
     resolve_topic_guard_clusters,
 )
 from fused_memory.server.tool_errors import mcp_tool_errors
+from fused_memory.services.completion_claim_gate import (
+    UNRESOLVABLE,
+    UNVERIFIED_CLAIM_TAG,
+    build_unverified_flag,
+    emit_unverified_claim_escalation,
+    extract_completion_claims,
+    make_commit_probe,
+    verify_claims,
+)
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.utils.validation import (
     PathShapedProjectIdError,
     _to_underscore_canonical,
     canonicalize_project_id,
+    validate_full_uuid,
     validate_int_ids,
     validate_known_project_id,
     validate_project_id,
@@ -432,6 +443,16 @@ Conventions:
   rewording around it. Override with metadata={'allow_mcp_markup': True} only when the markup
   is quoted deliberately (e.g. documenting the leak). The authoritative pattern list and
   rationale live in fused_memory/server/markup_tripwire.py.
+- A store='mem0' delete_memory is REFUSED (error_type=CitationRepointRequired) while a live
+  (non-terminal) task still cites the entry in its metadata — dispatch follows those pointers,
+  and the delete is irreversible. This is a property of the RECORD, not of who is deleting, so
+  it applies to every caller. The refusal names each citing task and path. Retry with
+  replacement_memory_id=<the surviving entry's full 36-char UUID> and the citers are repointed
+  before the delete runs; that is the answer for a consolidation, which has a survivor by
+  definition. Only for a plain drop with NO survivor to repoint to, pass
+  metadata={'allow_dangling_citations': True} — literal boolean True only, same as above. The
+  override is recorded at WARNING and the response names every citation it strands. An
+  unreadable task DB fails CLOSED (CitationScanFailed), override or not.
 - Tasks may carry memory_hints in metadata — structured pointers (search queries + entity names)
   that help future agents prefetch relevant context. Execute hint queries via search, look up
   hint entities via get_entity.
@@ -1358,6 +1379,39 @@ def create_mcp_server(
         'back to the superseded duplicates this consolidation is collapsing. '
         'Terminal (done/cancelled) citers are reported, never rewritten.'
     )
+    # (task 3624) The escape is advertised on the CitationRepointRequired
+    # refusal ONLY, which is why this is a separate constant rather than a
+    # sentence appended to the shared one. The CitationReplacement* refusals
+    # reuse _CITATION_REPOINT_HINT unchanged: a caller who typo'd, truncated or
+    # hallucinated a survivor UUID demonstrably HAS a survivor, so their fix is
+    # "copy the correct UUID" and offering a one-flag bypass there would invite
+    # exactly the stranded-pointer incident this gate closes. The same logic
+    # bounds who should take it at all — a consolidation delete has a survivor
+    # by definition, so the escape is never right for one, and the sentence
+    # says so rather than leaving the Stage-1 agent to infer it.
+    _CITATION_REPOINT_REQUIRED_HINT = (
+        _CITATION_REPOINT_HINT
+        + ' If there is no surviving entry to repoint to — a plain drop rather '
+          'than a consolidation, which replacement_memory_id cannot express — '
+          "pass metadata={'allow_dangling_citations': True} to accept dangling "
+          'these citations deliberately; the override is recorded at WARNING '
+          'and the response names every citer it strands. A consolidation '
+          'delete has a survivor by definition, so name it instead: taking the '
+          'escape there strands exactly the live pointers this gate exists to '
+          'protect.'
+    )
+    # (task 3624) Appended to whichever refusal a caller gets when they DID send
+    # allow_dangling_citations but not as a literal boolean True. Without it the
+    # strictness degrades silently into a dead end: the value is dropped, the
+    # ordinary refusal comes back, and its hint instructs them to pass the very
+    # flag they believe they just passed — a retry loop for an LLM caller.
+    _IGNORED_DANGLING_OVERRIDE_HINT = (
+        'NOTE: allow_dangling_citations was supplied but its value is not the '
+        'literal boolean True, so it was IGNORED and this refusal stands. Only '
+        'a literal True counts (the same rule as allow_near_duplicate and '
+        "allow_mcp_markup) — a truthy 'yes', 1 or 'true' must not unlock an "
+        'irreversible delete. Resend it as JSON true if you meant to override.'
+    )
     _CITATION_REPLACEMENT_NOT_FOUND_HINT = (
         'replacement_memory_id is well-formed but resolves to nothing, so '
         'repointing to it would rewrite every live citation to address a '
@@ -1381,6 +1435,44 @@ def create_mcp_server(
         'strand exactly the pointers this gate protects. Inspect unrepointed[] '
         'for each write rejection, then retry the delete; already-repointed '
         'tasks are idempotent on a second pass.'
+    )
+    # (task 3197) A cascade is one intent over a whole subtree, so its refusal
+    # names escapes that apply to the whole subtree — and one that does not
+    # require an escape at all. Same vocabulary as the _CITATION_*_HINT
+    # constants above, so a caller reading either refusal learns the same
+    # remedies by the same names.
+    _CASCADE_GATE_HINT = (
+        'nothing was deleted and nothing was repointed. Every record listed in '
+        'blocked[] carries its own error_type and citing_tasks, so fix them in '
+        'one pass rather than one refusal at a time: supply '
+        'replacement_memory_id (it is applied to the WHOLE cascade set, not '
+        'just the target), or pass '
+        "metadata={'allow_dangling_citations': True} to accept dangling every "
+        'listed citation deliberately. If neither fits, delete or reparent the '
+        'named descendants individually first — each then pays its own gate — '
+        'and retry the cascade once they are clear.'
+    )
+    # (task 3197) The scan-incomplete refusals need their OWN hint. Reusing
+    # _CASCADE_GATE_HINT above told the caller to read blocked[] — a key that
+    # envelope does not carry — and to retry with replacement_memory_id or
+    # allow_dangling_citations, neither of which unlocks anything here:
+    # _cascade_enumerate refuses BEFORE either escape is ever consulted. A
+    # hint that prescribes a retry into an identical refusal is worse than no
+    # hint, because it reads as a way out and is not one. Its closing advice
+    # ("delete the NAMED descendants individually") is likewise unusable on
+    # the truncated arm, where the whole point is that they were not all named.
+    _CASCADE_SCAN_INCOMPLETE_HINT = (
+        'nothing was deleted. This is a VISIBILITY failure, not a citation '
+        'failure: the cascade set could not be fully enumerated, so no claim '
+        'about its citations was ever made. replacement_memory_id and '
+        "metadata={'allow_dangling_citations': True} do NOT unlock this "
+        'refusal — both are consulted only once the set is known, so a retry '
+        'carrying either returns this same error. If scan_error is present '
+        'the enumeration RAISED: retry once the memory store is reachable. '
+        'If truncated is true the subtree is larger than one scroll page: '
+        'cascade it from the LEAVES up in smaller subtrees — each pays its '
+        'own gate — until what remains fits, or raise the descendant scan '
+        'limit.'
     )
     # Categories the premature-completion-claim guard (task 2824) covers — the
     # same four the live-task-status guard (task 2628) covers.
@@ -1451,12 +1543,272 @@ def create_mcp_server(
             'hint': _PREMATURE_COMPLETION_HINT,
         }
 
+    # ------------------------------------------------------------------ #
+    # Task 3142 / PRD leaf pi: completion-claim verification gate
+    # ------------------------------------------------------------------ #
+    #
+    # Verifies "the fix has been applied" / "re-filed as ticket tkt_..." claims
+    # against the live task, ticket-registry and git authorities, and TAGS the
+    # episode when a claim cannot be confirmed. Reify esc-5603-1 is the
+    # motivating incident (one unverified sentence fanned out by extraction into
+    # five false Graphiti edges); esc-3085-1 extended it to filing/dispatch
+    # claims and across projects.
+    #
+    # Deliberately unlike _premature_completion_block above in TWO ways:
+    #   * It LABELS instead of rejecting, so it runs for EVERY writer rather
+    #     than only recon-stage- agents — a false completion claim does the same
+    #     corpus damage whoever writes it, and the 2824 gate's blast radius (a
+    #     bounced write) is what confined it to recon agents in the first place.
+    #   * An unresolvable authority TAGS instead of failing open. See
+    #     completion_claim_gate.verify_claims for the full argument: this gate's
+    #     worst case on a false positive is one extra source_description prefix
+    #     on a kept episode, while its worst case on a false NEGATIVE is another
+    #     batch of false edges.
+
+    def _group_refs_by_project(
+        claims: list[Any], subject: str
+    ) -> dict[str | None, list[str]]:
+        """Group *subject* claims' refs by the project that ADJUDICATES them.
+
+        The grouping key is the claim's own resolved project, not the writer's:
+        esc-3085-1's whole point is that the two differ, and reading the
+        writer's tree for "dark_factory task 3142 has landed" answers a question
+        nobody asked — confidently, and with the wrong tree.
+        """
+        grouped: dict[str | None, list[str]] = {}
+        for claim in claims:
+            if claim.subject != subject:
+                continue
+            refs = grouped.setdefault(claim.project_id, [])
+            if claim.ref not in refs:
+                refs.append(claim.ref)
+        return grouped
+
+    async def _claim_task_statuses(
+        claims: list[Any], project_id: str
+    ) -> dict[tuple[str | None, str], str]:
+        """Live status for every task claim, keyed ``(project_id, ref)``.
+
+        One batched read per CLAIMED project — not per claim (which would
+        multiply authority traffic by the claim count for no gain) and not one
+        read scoped to the writer (which would consult the wrong tree for a
+        cross-project claim).
+
+        An ABSENT key is the unresolvable signal — the sync probe handed to
+        verify_claims returns None for it, which lands the claim on
+        'unverifiable' and therefore tagged. Every failure mode below (no
+        interceptor, unregistered project, a raising read) deliberately leaves
+        the key absent rather than fabricating a permissive answer.
+        """
+        grouped = _group_refs_by_project(claims, 'task')
+        if not grouped:
+            return {}
+        resolved: dict[tuple[str | None, str], str] = {}
+        for claimed_project, refs in grouped.items():
+            refs = sorted(refs)
+            root = _kp.get(claimed_project) if claimed_project is not None else None
+            if not _taskmaster_configured or root is None:
+                logger.warning(
+                    'completion_claim_gate: live status unresolvable for %d task claim(s) '
+                    '(taskmaster_configured=%s claimed_project=%r registered=%s '
+                    'writer_project=%r)',
+                    len(refs), _taskmaster_configured, claimed_project,
+                    root is not None, project_id,
+                )
+                continue
+            try:
+                statuses = await task_interceptor.get_statuses(  # type: ignore[union-attr]
+                    project_root=root,
+                    ids=refs,
+                )
+            except Exception:
+                logger.warning(
+                    'completion_claim_gate: get_statuses failed for claimed_project=%r; '
+                    'the %d task claim(s) are UNVERIFIABLE and will be tagged',
+                    claimed_project, len(refs), exc_info=True,
+                )
+                continue
+            for key, value in (statuses or {}).items():
+                if isinstance(value, str):
+                    resolved[(claimed_project, str(key))] = value
+        return resolved
+
+    async def _claim_ticket_rows(claims: list[Any]) -> dict[str, Any]:
+        """Registry row per ticket claim, keyed by ticket id.
+
+        A key mapped to None means the registry answered NO SUCH TICKET (a
+        mismatch — esc-3085-1 instance (2)); an ABSENT key means the registry
+        could not be consulted (unverifiable). Conflating the two would put a
+        false accusation in the flag, so they stay distinct (INV-2).
+        """
+        refs = [c.ref for c in claims if c.subject == 'ticket']
+        if not refs:
+            return {}
+        if not _taskmaster_configured:
+            logger.warning(
+                'completion_claim_gate: no task_interceptor; %d ticket claim(s) '
+                'are UNVERIFIABLE and will be tagged', len(refs),
+            )
+            return {}
+        rows: dict[str, Any] = {}
+        for ref in dict.fromkeys(refs):
+            try:
+                # A globally unique PK lookup over the one shared tickets.db —
+                # so it needs no project and answers a cross-project claim
+                # correctly (see TaskInterceptor.get_ticket_row).
+                rows[ref] = await task_interceptor.get_ticket_row(ref)  # type: ignore[union-attr]
+            except Exception:
+                logger.warning(
+                    'completion_claim_gate: get_ticket_row failed for %r; the claim '
+                    'is UNVERIFIABLE and will be tagged', ref, exc_info=True,
+                )
+        return rows
+
+    async def _claim_commit_presence(
+        claims: list[Any], project_id: str
+    ) -> dict[tuple[str | None, str], bool]:
+        """Commit existence per commit claim, keyed ``(project_id, sha)``.
+
+        An absent key is unresolvable (unregistered project, or the git probe
+        itself could not answer). The probe is a subprocess, so it runs under
+        asyncio.to_thread — a blocking git call on the event loop would stall
+        every other in-flight MCP request behind one episode's verification.
+        """
+        grouped = _group_refs_by_project(claims, 'commit')
+        if not grouped:
+            return {}
+        present: dict[tuple[str | None, str], bool] = {}
+        for claimed_project, refs in grouped.items():
+            # Rooted at the CLAIMED project's repository, same reason as the
+            # status read above: a sha claimed for dark_factory is not answered
+            # by reify's object store.
+            root = _kp.get(claimed_project) if claimed_project is not None else None
+            if root is None:
+                logger.warning(
+                    'completion_claim_gate: claimed_project=%r is not registered; %d '
+                    'commit claim(s) are UNVERIFIABLE and will be tagged '
+                    '(writer_project=%r)',
+                    claimed_project, len(refs), project_id,
+                )
+                continue
+            probe = make_commit_probe(root)
+            for ref in refs:
+                answer = await asyncio.to_thread(probe, ref)
+                if answer is not None:
+                    present[(claimed_project, ref)] = answer
+        return present
+
+    async def _completion_claim_gate(
+        content: str, agent_id: str | None, project_id: str
+    ) -> dict[str, Any] | None:
+        """Return the structured unverified-claim flag for *content*, or None.
+
+        None means "nothing to say": either the content carries no completion
+        claim naming a concrete ref (the overwhelmingly common case, in which no
+        authority is consulted at all and the write is exactly as it was before
+        this gate existed), or every claim it does carry was CONFIRMED.
+
+        Never rejects and never mutates the write — the caller only stamps the
+        tag and echoes the flag.
+
+        DELIBERATE INVERSION, do not "fix" it into a fail-open: every
+        unresolvable authority above is mapped onto a MISSING map key, which the
+        probes below turn into None, which verify_claims turns into
+        'unverifiable', which tags. The sibling gate two definitions up
+        (_premature_completion_block, task 2824) does the opposite and is right
+        to — it REJECTS, so a transient status-read failure bouncing a
+        legitimate write is worse than the stale claim it would have caught.
+        Here the costs run the other way: a spurious tag is one extra
+        source_description prefix on an episode that is kept regardless, while a
+        missed tag is another batch of false extracted edges (reify esc-5603-1:
+        five, from one sentence). The argument is written out in full in
+        completion_claim_gate.verify_claims' docstring.
+
+        Total containment: the gate is advisory machinery bolted onto the write
+        path, so no defect in it may ever cost the caller their ingestion. The
+        exception is logged at ERROR rather than swallowed quietly — a silent
+        except is how a gate stops gating without anyone noticing.
+        """
+        try:
+            claims = extract_completion_claims(
+                content,
+                default_project_id=project_id,
+                known_project_ids=set(_kp),
+            )
+            if not claims:
+                return None
+            statuses = await _claim_task_statuses(claims, project_id)
+            tickets = await _claim_ticket_rows(claims)
+            commits = await _claim_commit_presence(claims, project_id)
+            # The three probes are pure lookups over the maps resolved above:
+            # verify_claims is sync (so it stays unit-testable with no I/O), and
+            # the authorities are async, so the awaiting happens here and the
+            # adjudication there. A MISSING key is the unresolvable signal in
+            # every map.
+            verdicts = verify_claims(
+                claims,
+                task_status_probe=lambda ref, pid: statuses.get((pid, ref)),
+                ticket_probe=lambda ref: tickets.get(ref, UNRESOLVABLE),
+                commit_probe=lambda ref, pid: commits.get((pid, ref)),
+            )
+            return build_unverified_flag(verdicts, text=content)
+        except Exception:
+            logger.exception(
+                'completion_claim_gate: verification raised for agent_id=%r '
+                'project_id=%r — the episode is ingested UNTAGGED; the gate is '
+                'advisory and must never cost a caller their write',
+                agent_id, project_id,
+            )
+            return None
+
+    def _log_unverified_claims(flag: dict[str, Any], agent_id: str | None) -> None:
+        """Emit the grep-stable operator-facing line for a flagged episode.
+
+        One line per claim, each naming the ref, the authority consulted and
+        what was actually OBSERVED, so an operator reading logs can act without
+        re-deriving the verdict from the corpus (INV-2 / INV-4).
+        """
+        for entry in flag.get('claims') or []:
+            logger.warning(
+                'completion_claim_gate.unverified: %s claim about %s %r is %s '
+                '(agent_id=%r project_id=%r observed=%r) — episode INGESTED and '
+                'tagged %r, not rejected',
+                entry.get('kind'), entry.get('subject'), entry.get('ref'),
+                entry.get('status'), agent_id, entry.get('project_id'),
+                entry.get('observed'), UNVERIFIED_CLAIM_TAG,
+            )
+
+    def _citation_gate_applies(store: str, project_id: str) -> bool:
+        """Is the citation gate live for this (record, project)?
+
+        ONE home for the precondition (INV-5), called both by the gate's own
+        early-out and by the cascade pre-flight.  Two copies could drift, and
+        the drift has a shape: a pre-flight that enumerated a whole subtree
+        for a project the gate would then decline to check would pay for a
+        walk whose result it must discard — or worse, refuse a cascade on
+        behalf of a gate that is not even running.
+
+        ``store == 'mem0'``: the incident's citations were Mem0 entry UUIDs,
+        the same scoping ``verify_cited_memories`` uses, and the same one
+        ``metadata.parent_id`` (a Mem0 payload key) has.  A registered
+        project: without one there is no live task DB to scan, so the
+        pre-existing behaviour for unregistered projects is preserved
+        exactly.  Note what is NOT here — the caller's ``agent_id`` (task
+        3624): "will this delete dangle a live pointer?" is a property of the
+        record and the task DB, not of who asked.
+        """
+        return store == 'mem0' and _taskmaster_configured and project_id in _kp
+
     async def _citation_repoint_gate(
         memory_id: str,
         store: str,
         project_id: str,
         agent_id: str | None,
         replacement_memory_id: str | None,
+        allow_dangling_citations: bool = False,
+        *,
+        scan_only: bool = False,
+        replacement_cache: dict[tuple[str, str], Any] | None = None,
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         """Repoint live task-metadata citations BEFORE an irreversible delete.
 
@@ -1467,13 +1819,37 @@ def create_mcp_server(
         ``_taskmaster_configured and project_id in _kp`` precondition — but the
         opposite failure posture, deliberately (see below).
 
-        Scoped to consolidation deletes only: a ``recon-stage-*`` ``agent_id``
-        AND ``store == 'mem0'``. The recon-stage predicate mirrors the
-        ``recon_write_policy`` call-site idiom (``task_interceptor.py:893``,
-        :3953) and bounds the blast radius to the path the incident came from,
-        so an interactive delete pays no extra ``get_tasks`` read. The mem0
-        scoping mirrors ``verify_cited_memories``' own: the incident's
-        citations were Mem0 entry UUIDs.
+        Scoped to the RECORD, not to the caller (task 3624): ``store == 'mem0'``
+        and a scannable registered project. "Will this delete dangle a live
+        pointer?" is a property of the entry and the task DB, so an identical
+        delete is gated identically no matter who issues it — including a caller
+        with no ``agent_id`` at all. The original scoping added a
+        ``recon-stage-*`` ``agent_id`` predicate to bound the blast radius; that
+        left the interactive path — how the 25-gate consolidation batch of task
+        3524 is actually driven — landing unguarded, stranding exactly the
+        pointers this gate exists to protect, and it made an unidentified caller
+        the LEAST guarded one. The mem0 scoping mirrors
+        ``verify_cited_memories``' own: the incident's citations were Mem0 entry
+        UUIDs.
+
+        ``allow_dangling_citations`` is the deliberate escape, for a caller with
+        no surviving entry to repoint to — a plain drop rather than a
+        consolidation, which ``replacement_memory_id`` cannot express. It is a
+        property of stated intent, not of identity, so it is available to every
+        caller. It is checked AFTER the scan, not as an early-out, for two
+        reasons: it must be able to NAME what it dangles (the WARNING it emits
+        reuses ``citing_tasks``, and an override that lands silently is the same
+        class of defect as the gate that never ran), and that ordering keeps the
+        fail-closed posture below intact — an override plus an unreadable task
+        DB is still ``CitationScanFailed``, because the flag means "I accept
+        dangling the citers you just showed me" and with nothing enumerated
+        there is nothing to knowingly accept. Cost: an override pays the one
+        ``get_tasks`` read. The trace is the point — and it is returned to the
+        caller (``dangled_citations`` / ``dangled_citation_count``, plus
+        ``ignored_replacement_memory_id`` when one was supplied and dropped) as
+        well as logged, because an MCP caller never sees the server's log
+        stream and a bare ``{'status': 'deleted'}`` would be silent to the very
+        session this escape exists to serve.
 
         Why here and not in ``MemoryConsolidator.run()``: the consolidator
         never deletes from Python — the Stage-1 LLM agent calls this very tool
@@ -1508,14 +1884,42 @@ def create_mcp_server(
         inconclusive -> drop, to prevent irreversible delete_memory ops"). A
         refused delete is retried next cycle; a silently permitted one
         manufactures the L2.
+
+        ``scan_only`` is a DRY-RUN MODE, not a second scanner (task 3197).
+        The cascade pre-flight has to ask this same question of every record
+        a ``cascade=True`` delete would destroy, and it must ask it without
+        mutating anything — otherwise a set that turns out to be unfixable
+        would have left repoints behind on an operation that reported
+        failure. In this mode every rule above still runs (the scan, the
+        fail-closed-on-scan-error arm, the live-citer check, the
+        ``allow_dangling_citations`` arm and all three
+        ``replacement_memory_id`` preconditions) and every rejection is still
+        returned verbatim; only the terminal ``repoint_task_citations``
+        mutation and the override WARNING are skipped. The WARNING in
+        particular must fire exactly once per record — the real pass emits
+        it, so a dry run that also logged would double-count the one signal
+        an operator uses to audit the escape. Making this a mode rather than
+        a copy is what keeps every rule with exactly one home (INV-5); a
+        duplicated scanner would drift, and the drift would be silent
+        because both halves would still "work".
+
+        ``replacement_cache`` memoizes ONE thing — the
+        ``replacement_memory_id`` existence probe — for the duration of ONE
+        ``delete_memory`` invocation, and nothing outside it (there is no
+        module-level cache, no TTL, no reuse across calls). A cascade of K
+        cited records otherwise re-reads the same Qdrant point 2K times,
+        once per record per pass, for an answer that cannot differ between
+        them. Do NOT confuse this with the citation snapshot, which is
+        deliberately uncached and must stay so: that read is the fail-closed
+        guarantee itself, because a task can begin citing a doomed id at any
+        moment. The replacement's liveness is not that racy quantity —
+        ``_cascade_replacement_outside_set`` has already proved the
+        replacement is not one of the records this call destroys, so no
+        write by this operation can change the answer mid-invocation. A
+        RAISED lookup is not cached, so the fail-closed arm keeps re-probing
+        rather than remembering a failure.
         """
-        if not isinstance(agent_id, str) or not agent_id.startswith('recon-stage-'):
-            return None, None
-        if store != 'mem0':
-            return None, None
-        if not _taskmaster_configured or project_id not in _kp:
-            # No live task DB to scan — the pre-existing behaviour for
-            # unregistered projects is preserved exactly.
+        if not _citation_gate_applies(store, project_id):
             return None, None
 
         project_root = _kp[project_id]
@@ -1555,6 +1959,61 @@ def create_mcp_server(
             for c in live_citers
         ]
 
+        # The deliberate escape, placed HERE rather than as an early-out at the
+        # top of the gate on purpose: it must be able to name what it dangles.
+        # An early return before the scan would be cheaper but structurally
+        # unable to enumerate anything, which is the silent-override defect
+        # this whole gate argues against. The placement also preserves the
+        # fail-CLOSED posture for free — the scan-error return above precedes
+        # it, so an override plus an unreadable task DB is still
+        # CitationScanFailed. That is the right semantics: the flag means "I
+        # accept dangling the citers you just showed me", and with nothing
+        # enumerated there is nothing to knowingly accept.
+        if allow_dangling_citations:
+            if scan_only:
+                # The override covers this record, so the pre-flight has no
+                # blocker to report — and it stays silent: the real pass
+                # logs the WARNING, and one override must produce one
+                # WARNING per record, not two.
+                return None, None
+            # An override that lands SILENTLY is the same class of defect as the
+            # gate that never ran, so record what is being knowingly dangled —
+            # reusing the enumeration above so the trace and the rejection's
+            # citing_tasks name the same citers the same way. A replacement
+            # supplied alongside the flag is contradictory ("repoint them" vs
+            # "dangle them"); the override wins, and the dropped argument is
+            # named rather than discarded in silence.
+            ignored_replacement = (
+                '' if replacement_memory_id is None
+                else f'; replacement_memory_id {replacement_memory_id} was '
+                     'supplied but NOT used'
+            )
+            logger.warning(
+                'citation gate: allow_dangling_citations override by %s — deleting '
+                '%s, leaving %d live citation(s) dangling: %s%s',
+                agent_id,
+                memory_id,
+                len(citing_tasks),
+                citing_tasks,
+                ignored_replacement,
+            )
+            # ...and report the same enumeration to the CALLER, not just to the
+            # server log. The caller this escape exists to serve drives a
+            # consolidation batch over MCP and never sees the orchestrator's log
+            # stream, so a bare {'status': 'deleted'} would make the override
+            # silent from the only vantage point that matters to them. This
+            # rides the same (None, stats) success channel the repoint path uses
+            # — merged into the tool result by delete_memory — and names the
+            # citers with the same shape the refusal reports in citing_tasks, so
+            # "refused" and "overridden" are diffable rather than two vocabularies.
+            dangled: dict[str, Any] = {
+                'dangled_citations': citing_tasks,
+                'dangled_citation_count': len(citing_tasks),
+            }
+            if replacement_memory_id is not None:
+                dangled['ignored_replacement_memory_id'] = replacement_memory_id
+            return None, dangled
+
         if replacement_memory_id is None:
             return {
                 'error': (
@@ -1565,7 +2024,12 @@ def create_mcp_server(
                 'error_type': 'CitationRepointRequired',
                 'memory_id': memory_id,
                 'citing_tasks': citing_tasks,
-                'hint': _CITATION_REPOINT_HINT,
+                # The ONE refusal that advertises the escape: this caller has
+                # named no survivor and may genuinely have none. The
+                # CitationReplacement* refusals below keep the plain hint —
+                # they were reached BY naming a survivor, so the fix is to
+                # correct that value, not to bypass the gate.
+                'hint': _CITATION_REPOINT_REQUIRED_HINT,
             }, None
 
         # A forwarding pointer is only a pointer if it is a concrete id. This
@@ -1617,34 +2081,47 @@ def create_mcp_server(
         # THEN land the irreversible delete. get_memory_by_id is the same
         # Mem0/Qdrant point read verify_cited_memories uses, and the gate's
         # store == 'mem0' scoping already matches its Mem0-only contract.
-        try:
-            replacement_record = await memory_service.get_memory_by_id(
-                project_id, replacement_memory_id,
-            )
-        except (KeyboardInterrupt, SystemExit):
-            raise
-        except Exception as exc:
-            # Fail closed, exactly as the scan does: 'unknown' must not be read
-            # as 'resolves' immediately before an irreversible delete.
-            logger.warning(
-                'citation gate: replacement lookup failed for %s; failing closed',
-                replacement_memory_id,
-                exc_info=True,
-            )
-            return {
-                'error': (
-                    f'Could not determine whether replacement_memory_id '
-                    f'{replacement_memory_id} exists; refusing an irreversible '
-                    'delete rather than repointing to a possibly-absent entry.'
-                ),
-                'error_type': 'CitationReplacementCheckFailed',
-                'memory_id': memory_id,
-                'replacement_memory_id': replacement_memory_id,
-                'citing_tasks': citing_tasks,
-                'check_error': str(exc),
-                'check_error_type': type(exc).__name__,
-                'hint': _CITATION_REPLACEMENT_CHECK_FAILED_HINT,
-            }, None
+        #
+        # Memoized per delete_memory invocation (see `replacement_cache` in the
+        # docstring): every cited record in a cascade, on both passes, asks
+        # this same question of the same id. The citation scan above stays
+        # LIVE — that one is the fail-closed guarantee.
+        cache_key = (project_id, replacement_memory_id)
+        if replacement_cache is not None and cache_key in replacement_cache:
+            replacement_record = replacement_cache[cache_key]
+        else:
+            try:
+                replacement_record = await memory_service.get_memory_by_id(
+                    project_id, replacement_memory_id,
+                )
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as exc:
+                # Fail closed, exactly as the scan does: 'unknown' must not be
+                # read as 'resolves' immediately before an irreversible delete.
+                # NOT cached — a remembered failure would outlive its cause,
+                # and the next id in the set deserves its own live answer.
+                logger.warning(
+                    'citation gate: replacement lookup failed for %s; failing closed',
+                    replacement_memory_id,
+                    exc_info=True,
+                )
+                return {
+                    'error': (
+                        f'Could not determine whether replacement_memory_id '
+                        f'{replacement_memory_id} exists; refusing an irreversible '
+                        'delete rather than repointing to a possibly-absent entry.'
+                    ),
+                    'error_type': 'CitationReplacementCheckFailed',
+                    'memory_id': memory_id,
+                    'replacement_memory_id': replacement_memory_id,
+                    'citing_tasks': citing_tasks,
+                    'check_error': str(exc),
+                    'check_error_type': type(exc).__name__,
+                    'hint': _CITATION_REPLACEMENT_CHECK_FAILED_HINT,
+                }, None
+            if replacement_cache is not None:
+                replacement_cache[cache_key] = replacement_record
 
         if not replacement_record:
             # Distinct from ...Invalid on purpose: the caller must be able to
@@ -1662,6 +2139,14 @@ def create_mcp_server(
                 'citing_tasks': citing_tasks,
                 'hint': _CITATION_REPLACEMENT_NOT_FOUND_HINT,
             }, None
+
+        # Every rule has now been checked and none of them refused, which is
+        # the whole answer a dry run owes its caller. Stopping HERE — after
+        # the preconditions, before the only mutation — is what lets the
+        # cascade pre-flight prove a whole set is clearable without having
+        # rewritten a single citation on a set it may yet refuse.
+        if scan_only:
+            return None, None
 
         # Repoint BEFORE the delete. The caller falls through to
         # memory_service.delete_memory only after this returns, which is the
@@ -1717,6 +2202,350 @@ def create_mcp_server(
 
         return None, {'citation_repoint': stats}
 
+    async def _cascade_enumerate(
+        memory_id: str, project_id: str
+    ) -> tuple[dict[str, Any] | None, list[str]]:
+        """The cascade set the gate will reason over — or a REFUSAL.
+
+        Returns ``(None, [descendants..., memory_id])`` — deepest-first with
+        the target last, the order the cascade destroys in — or
+        ``(rejection, [])`` when the set could not be fully enumerated.
+
+        Both failure arms refuse rather than warn. A cascade the gate could
+        not fully SEE is exactly the case where a silent success manufactures
+        the dangling pointers this gate exists to prevent: it would destroy
+        records nobody checked while reporting them verified, which is worse
+        than the original defect because it would LOOK verified. This is the
+        same posture the gate already takes twice — ``CitationScanFailed`` on
+        an unreadable task DB, ``CitationReplacementCheckFailed`` on an
+        unresolvable replacement — applied to the one remaining unknown.
+
+        ``truncated`` is not a lesser case than a raised walk, which is why
+        both carry the same ``error_type``: partial visibility and no
+        visibility are the same claim ("I cannot prove this set is safe")
+        with different causes, and the causes are in the message.
+        """
+        try:
+            scan = await memory_service.list_descendant_ids(
+                memory_id, project_id=project_id
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            logger.warning(
+                'cascade gate: descendant enumeration failed for %s; failing closed',
+                memory_id,
+                exc_info=True,
+            )
+            return {
+                'error': (
+                    f'Could not enumerate what a cascade delete of {memory_id} '
+                    'would destroy, so its records cannot be checked for live '
+                    'citations. Nothing was deleted.'
+                ),
+                'error_type': 'CascadeCitationScanIncomplete',
+                'memory_id': memory_id,
+                'scan_error': str(exc),
+                'scan_error_type': type(exc).__name__,
+                'hint': _CASCADE_SCAN_INCOMPLETE_HINT,
+            }, []
+
+        if scan.truncated:
+            return {
+                'error': (
+                    f'A cascade delete of {memory_id} would destroy more '
+                    f'records than could be enumerated ({len(scan.ids)} seen), '
+                    'so the unseen ones cannot be checked for live citations. '
+                    'Nothing was deleted.'
+                ),
+                'error_type': 'CascadeCitationScanIncomplete',
+                'memory_id': memory_id,
+                'cascade_size': len(scan.ids) + 1,
+                'truncated': True,
+                'hint': _CASCADE_SCAN_INCOMPLETE_HINT,
+            }, []
+
+        return None, [*scan.ids, memory_id]
+
+    def _cascade_replacement_outside_set(
+        cascade_ids: list[str],
+        memory_id: str,
+        replacement_memory_id: str | None,
+    ) -> dict[str, Any] | None:
+        """Refuse naming a survivor that this same cascade destroys.
+
+        The single-record gate's self-repoint check
+        (``replacement_memory_id == memory_id``) is the degenerate case of
+        this one, but it cannot generalise to the cascade on its own for a
+        structural reason: the pre-flight applies that gate PER ID, and each
+        per-id run returns early at ``not live_citers`` — strictly before the
+        comparison. So an UNCITED descendant named as the replacement is never
+        compared to anything. The pre-flight clears it, the target's own
+        citers are then repointed TO it, and the service destroys it moments
+        later, with the tombstone ledger recording it as the survivor. That
+        reports success while manufacturing the dangling pointer the gate
+        exists to prevent.
+
+        Hence a set-membership test, not a per-id one, and placed BEFORE the
+        pre-flight: it is never coherent to forward a citation to a record
+        this call destroys, so the answer cannot depend on which members
+        happen to be cited today. It is also total and free — no I/O, and it
+        holds for an entirely uncited cascade, where every per-id path
+        short-circuits.
+
+        The refusal reuses ``_cascade_gate_rejection`` so the wire shape stays
+        uniform, carrying the single-record ``CitationReplacementInvalid``
+        error_type in ``blocked[0]`` exactly as the per-id refusals do.
+        """
+        if replacement_memory_id is None or replacement_memory_id not in cascade_ids:
+            return None
+
+        is_target = replacement_memory_id == memory_id
+        role = 'the id being deleted' if is_target else 'a descendant of it'
+        return _cascade_gate_rejection(
+            memory_id,
+            len(cascade_ids),
+            [{
+                'error': (
+                    f'replacement_memory_id {replacement_memory_id!r} is '
+                    f'{role}, so this cascade would destroy the very record '
+                    'the citations were forwarded to. Nothing was deleted.'
+                ),
+                'error_type': 'CitationReplacementInvalid',
+                'memory_id': memory_id,
+                'replacement_memory_id': replacement_memory_id,
+                'hint': _CITATION_REPOINT_HINT,
+            }],
+            error=(
+                f'replacement_memory_id {replacement_memory_id!r} is itself '
+                f'scheduled for destruction by this cascade delete of '
+                f'{memory_id}. Nothing was deleted.'
+            ),
+            replacement_memory_id=replacement_memory_id,
+        )
+
+    async def _cascade_citation_preflight(
+        cascade_ids: list[str],
+        memory_id: str,
+        store: str,
+        project_id: str,
+        agent_id: str | None,
+        replacement_memory_id: str | None,
+        allow_dangling_citations: bool = False,
+        *,
+        replacement_cache: dict[tuple[str, str], Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Refuse a cascade if ANY record it would destroy is still cited.
+
+        The defect this closes: the cascade recurses inside
+        ``MemoryService.delete_memory``, BELOW the tool layer this gate lives
+        at, so a ``cascade=True`` delete gated its target and destroyed every
+        descendant unchecked — one guarded record, N unguarded ones, reported
+        as a success.
+
+        Two properties a single fused pass cannot give, which is why this is
+        a separate NON-MUTATING pass over the set:
+
+        1. ATOMIC REFUSAL. With a ``replacement_memory_id`` supplied, a fused
+           pass would repoint ids 1..k-1 before discovering that id k is
+           unfixable — mutations left behind by an operation that reported
+           failure. A refused cascade must have changed nothing.
+        2. COMPLETE ENUMERATION. A fused pass refuses at the FIRST cited
+           descendant, so N cited children cost N refuse-fix-retry round
+           trips, each re-paying a full enumeration. Collecting every blocker
+           applies the gate's own stated principle one level up: "every
+           rejection names the citers, so the caller is never left to
+           re-derive the enumeration by hand — the step that found 3 of 8 in
+           the incident."
+
+        COST, stated honestly. Every record in the set is scanned against
+        the whole task tree TWICE — once here, once again in
+        ``_cascade_citation_repoint_pass`` — and each
+        ``_citation_repoint_gate`` call runs its own ``_scan_task_citations``,
+        which is one ``task_interceptor.get_tasks`` plus an
+        O(tasks x metadata-nodes) walk. So a cascade of N records costs 2N
+        full task-DB reads and 2N deep metadata walks, not the "one extra
+        read per id" an earlier revision of this docstring claimed.
+
+        That is accepted rather than optimised, and the two halves are
+        accepted for DIFFERENT reasons, so neither should be traded away on
+        the other's argument:
+
+        * The mutating pass's per-id re-read is the fail-closed guarantee
+          itself, for the reason ``_scan_task_citations`` already documents:
+          a snapshot cache trades that guarantee for a race on the one
+          operation whose harm motivated the gate. It must stay live.
+        * This pass's per-id read is NOT load-bearing for freshness — the
+          mutating pass re-reads anyway — so it could in principle collapse
+          to a single bucketing walk over the whole id set. It does not,
+          because that means a second implementation of "which tasks cite
+          this id", drifting from the gate's own (tombstone-excluding
+          ``find_live_citation_occurrences``, fail-closed-on-scan-error, and
+          all three ``replacement_memory_id`` preconditions). ``scan_only``
+          is a MODE on the one gate precisely so every rule keeps one home
+          (INV-5); N redundant reads is the price of that, and it is paid
+          only on the ``cascade=True`` path.
+        * The ``replacement_memory_id`` existence probe IS shared across
+          both passes (``replacement_cache``), and is the only read that
+          is. It asks the same question of the same id every time, and
+          unlike the citation scan its answer cannot be changed by anything
+          this call does: ``_cascade_replacement_outside_set`` has already
+          proved the replacement lies OUTSIDE the set this cascade
+          destroys. Re-reading it 2K times bought nothing.
+
+        *cascade_ids* is descendants-first with the target LAST, mirroring
+        the children-before-parent order the cascade actually deletes in.
+        """
+        blocked: list[dict[str, Any]] = []
+        for target in cascade_ids:
+            rejection, _ = await _citation_repoint_gate(
+                target,
+                store,
+                project_id,
+                agent_id,
+                replacement_memory_id,
+                allow_dangling_citations=allow_dangling_citations,
+                scan_only=True,
+                replacement_cache=replacement_cache,
+            )
+            if rejection:
+                # Verbatim: the per-id envelope already names the citers,
+                # their statuses and the exact metadata paths. Summarising it
+                # here would make the aggregate strictly less actionable than
+                # the single-record refusal it generalises.
+                blocked.append(rejection)
+
+        if not blocked:
+            return None
+        return _cascade_gate_rejection(
+            memory_id,
+            len(cascade_ids),
+            blocked,
+            error=(
+                f'{len(blocked)} of the {len(cascade_ids)} record(s) a cascade '
+                f'delete of {memory_id} would destroy still have live task '
+                'citations. Nothing was deleted.'
+            ),
+        )
+
+    def _cascade_gate_rejection(
+        memory_id: str,
+        cascade_size: int,
+        blocked: list[dict[str, Any]],
+        *,
+        error: str,
+        **extra: Any,
+    ) -> dict[str, Any]:
+        """ONE envelope shape for every cascade-gate refusal.
+
+        The error type keys on the FLAG the caller passed, not on corpus
+        state they cannot see: whether the tree happened to have children
+        this time is invisible to them, so branching the wire contract on it
+        would force every cascade error handler to handle both shapes
+        anyway. ``blocked[0]`` still carries the verbatim per-id rejection,
+        so nothing the single-record envelope reported is lost.
+        """
+        return {
+            'error': error,
+            'error_type': 'CascadeCitationGateRejected',
+            'memory_id': memory_id,
+            'cascade_size': cascade_size,
+            'blocked': blocked,
+            'hint': _CASCADE_GATE_HINT,
+            **extra,
+        }
+
+    async def _cascade_citation_repoint_pass(
+        cascade_ids: list[str],
+        store: str,
+        project_id: str,
+        agent_id: str | None,
+        replacement_memory_id: str | None,
+        allow_dangling_citations: bool = False,
+        *,
+        replacement_cache: dict[tuple[str, str], Any] | None = None,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """The MUTATING second pass, after the pre-flight cleared the set.
+
+        Runs the gate in normal mode over the same deepest-first sequence,
+        merging each record's stats under ITS OWN id: a cascade touches N
+        records, and one anonymous stats blob would leave the caller unable
+        to tell which descendant's citations were rewritten.
+
+        Each per-id entry carries an explicit ``outcome`` —
+        ``'repointed'`` or ``'dangled'`` — because the gate returns BOTH on
+        the same success channel and their payloads differ
+        (``citation_repoint`` stats vs ``dangled_citations``). Without it a
+        caller has to shape-sniff to tell a rewritten citation from one
+        knowingly stranded, which are opposite outcomes.
+
+        Two residuals this two-pass design does NOT close, stated rather than
+        left for a later reader to discover:
+
+        1. A rejection HERE (a repoint sweep that fails, or a citer written
+           between the two passes) still returns before the service call, so
+           nothing is deleted — but ids EARLIER in the sequence may already
+           have been repointed. That is not a dangling pointer: those
+           citations now address the verified-live ``replacement_memory_id``
+           while the original record still exists. A retry converges,
+           because a repointed id no longer has live citers. The already-
+           repointed ids are named on the refusal rather than left implicit
+           — and ONLY the genuinely repointed ones: a ``dangled`` record
+           rewrote nothing, so listing it would tell an operator citations
+           were rewritten when none were.
+        2. The service's cascade re-reads its children LIVE, so a child
+           written between this pass and the cascade is deleted without
+           having passed the gate. That is the same write-after-scan race the
+           single-record path already accepts — and accepts deliberately,
+           which is why ``_scan_task_citations`` refuses to cache its
+           snapshot: caching would trade the fail-closed guarantee for a race
+           on the one operation whose harm motivated the gate.
+        """
+        per_id: dict[str, Any] = {}
+        # Ids whose citations were actually REWRITTEN, in pass order. Kept
+        # separately from `per_id` because the gate returns dangles on the
+        # same success channel: under `allow_dangling_citations` every record
+        # yields stats while nothing is mutated at all, so `per_id`'s keys
+        # would report repoints that never happened.
+        repointed: list[str] = []
+        for target in cascade_ids:
+            rejection, stats = await _citation_repoint_gate(
+                target,
+                store,
+                project_id,
+                agent_id,
+                replacement_memory_id,
+                allow_dangling_citations=allow_dangling_citations,
+                replacement_cache=replacement_cache,
+            )
+            if rejection:
+                return _cascade_gate_rejection(
+                    cascade_ids[-1],
+                    len(cascade_ids),
+                    [rejection],
+                    error=(
+                        f'A record in the cascade of {cascade_ids[-1]} could not '
+                        'be cleared on the repoint pass, so the delete was '
+                        'refused. Nothing was deleted.'
+                    ),
+                    # Honest residual: these were rewritten before the
+                    # refusal. They point at the verified-live replacement,
+                    # not at a destroyed record, and a retry is idempotent.
+                    # Deepest-first, the order the rewrites happened in.
+                    repointed_before_refusal=list(repointed),
+                ), None
+            if stats:
+                # 'citation_repoint' is present iff the repoint sweep ran;
+                # the override arm returns 'dangled_citations' instead.
+                did_repoint = 'citation_repoint' in stats
+                per_id[target] = {
+                    **stats,
+                    'outcome': 'repointed' if did_repoint else 'dangled',
+                }
+                if did_repoint:
+                    repointed.append(target)
+        return None, ({'cascade_citation_repoint': per_id} if per_id else None)
+
     async def _scan_task_citations(
         project_root: str, memory_id: str
     ) -> list[dict[str, Any]]:
@@ -1736,7 +2565,21 @@ def create_mcp_server(
         ``repoint_task_citations`` MUST agree on this definition: they read the
         same snapshot, and a disagreement surfaces as a gate demanding a repoint
         that the sweep then reports zero work for.
+
+        COST, and why the snapshot is deliberately NOT cached (task 3624).
+        Broadening the gate to every caller means every mem0 delete pays one
+        full ``get_tasks`` read plus an O(tasks x metadata-nodes) walk, so a
+        25-delete consolidation batch pays it 25 times with no reuse. A
+        per-batch or short-TTL snapshot cache would collapse that and is
+        refused on purpose: this is the LAST read before an irreversible
+        delete, and a task that begins citing the doomed id after the snapshot
+        was taken would be invisible to it — trading the gate's fail-closed
+        guarantee for a race, on precisely the operation whose harm motivated
+        the gate. The cost is made OBSERVABLE instead: each scan reports its
+        task count and duration at DEBUG, so a project large enough for this to
+        matter surfaces as a measurement rather than as a hunch.
         """
+        started = time.perf_counter()
         tasks_data = await task_interceptor.get_tasks(project_root)  # type: ignore[union-attr]
         tasks = (tasks_data or {}).get('tasks') or []
         found: list[dict[str, Any]] = []
@@ -1755,6 +2598,17 @@ def create_mcp_server(
                 'paths': paths,
                 'terminal': status in INACTIVE_TASK_STATUSES,
             })
+        # DEBUG, not INFO: this now runs on EVERY mem0 delete, so it is the
+        # common path and must not be chatty by default. It is the only place
+        # the broadened gate's per-delete cost is measurable.
+        logger.debug(
+            'citation gate: scanned %d task(s) for citations of %s in %.1f ms '
+            '(%d citer(s) found)',
+            len(tasks),
+            memory_id,
+            (time.perf_counter() - started) * 1000,
+            len(found),
+        )
         return found
 
     @mcp.tool()
@@ -1783,8 +2637,23 @@ def create_mcp_server(
         Strip the fragment and resubmit, or set
         metadata={'allow_mcp_markup': True} if you are quoting the markup
         deliberately. :mod:`fused_memory.server.markup_tripwire` holds the
-        authoritative pattern list and the rationale — it is deliberately the
-        only place in the package that enumerates the literals.
+        write-time pattern list and the rationale; the literals themselves are
+        enumerated once, in :mod:`shared.toolcall_markup`, and nothing in this
+        package spells them.
+
+        Content asserting that concrete, NAMED work is complete ("task N's fix
+        has been applied", "re-filed as ticket tkt_...") is cross-checked
+        against the live task status / ticket registry / git, and TAGGED — not
+        rejected — when a claim is contradicted or cannot be confirmed. The
+        episode is always ingested; the tag rides through to the Graphiti
+        episodic ``source_description`` (prefixed ``'[unverified_claim] '``) and
+        to every derived Mem0 fact's metadata, and the structured flag is echoed
+        back under an ``unverified_claim`` response key naming what was claimed
+        and what was actually OBSERVED. Unlike the recon-stage-only
+        premature-completion gate, this applies to every writer, and an
+        authority that cannot be reached tags rather than passes — see
+        :mod:`fused_memory.services.completion_claim_gate` for why the fail
+        direction is inverted there.
 
         Args:
             content: Raw text, conversation, or JSON to ingest
@@ -1915,7 +2784,44 @@ def create_mcp_server(
             premature_block = await _premature_completion_block(content, agent_id, project_id)
             if premature_block is not None:
                 return premature_block
+        # task 3142 / PRD leaf pi: verify completion claims naming a concrete
+        # task / commit / ticket against the live authorities and TAG the
+        # episode when one cannot be confirmed. Deliberately NOT under a
+        # recon-stage- guard like the 2824 gate immediately above: this one only
+        # labels, so it costs a non-recon writer nothing, and a false completion
+        # claim damages the corpus identically whoever writes it.
+        unverified_flag = await _completion_claim_gate(content, agent_id, project_id)
         causation_id, op_source, _ = _extract_causation(metadata, agent_id)
+        extra: dict[str, Any] = {}
+        if unverified_flag is not None:
+            # Ride the same channel temporal_context does — a service parameter,
+            # then a durable-queue payload key, then the Graphiti
+            # source_description prefix and every derived Mem0 fact's metadata.
+            # A response-only flag would have labelled none of the artefacts that
+            # actually caused harm in esc-5603-1.
+            extra['unverified_claim'] = True
+            _log_unverified_claims(unverified_flag, agent_id)
+            # The tag labels the corpus; the escalation reaches an operator.
+            # Both, or the finding lives only in a WARNING nobody greps (INV-4).
+            # emit_unverified_claim_escalation is built never to raise, but a
+            # call site that RELIED on that promise would turn a future
+            # regression there into an outage on the write path — same reasoning
+            # as the markup gate's wrapping of its own emitter.
+            try:
+                esc_id = emit_unverified_claim_escalation(
+                    _kp.get(project_id), unverified_flag
+                )
+            except Exception:  # pragma: no cover — defensive only
+                logger.exception(
+                    'completion_claim_gate: emit_unverified_claim_escalation raised '
+                    'for project_id=%r; the episode is still ingested and tagged',
+                    project_id,
+                )
+                esc_id = None
+            if esc_id is not None:
+                # Echoed so the writer (or a reviewer reading the response) can
+                # find the filed record without grepping logs.
+                unverified_flag = {**unverified_flag, 'escalation_id': esc_id}
         result = await memory_service.add_episode(
             content=content,
             source=source,
@@ -1927,8 +2833,12 @@ def create_mcp_server(
             temporal_context=temporal_context,
             reference_time=parsed_reference_time,
             _source=op_source,
+            **extra,
         )
-        return result.model_dump()
+        payload = result.model_dump()
+        if unverified_flag is not None and isinstance(payload, dict):
+            payload[UNVERIFIED_CLAIM_TAG] = unverified_flag
+        return payload
 
     @mcp.tool()
     @mcp_tool_errors()
@@ -1973,9 +2883,10 @@ def create_mcp_server(
         each one that lands is a permanent corpus specimen. Strip the fragment
         and resubmit. If you are quoting such markup DELIBERATELY (documenting
         the leak itself), set metadata={'allow_mcp_markup': True}.
-        :mod:`fused_memory.server.markup_tripwire` holds the authoritative
-        pattern list and the rationale — it is deliberately the only place in
-        the package that enumerates the literals.
+        :mod:`fused_memory.server.markup_tripwire` holds the write-time
+        pattern list and the rationale; the literals themselves are enumerated
+        once, in :mod:`shared.toolcall_markup`, and nothing in this package
+        spells them.
 
         Args:
             content: The memory itself (a fact, preference, procedure, etc.)
@@ -2994,6 +3905,7 @@ def create_mcp_server(
         session_id: str | None = None,
         metadata: dict | None = None,
         replacement_memory_id: str | None = None,
+        cascade: bool = False,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Delete a specific memory from a store. IRREVERSIBLE.
@@ -3010,12 +3922,22 @@ def create_mcp_server(
         search results and this tool's own response return). Exactly one must
         be provided; supplying both with conflicting values is an error.
 
-        **Consolidation deletes** (a ``recon-stage-*`` caller deleting a
-        ``store='mem0'`` duplicate in favour of a survivor) additionally pass
-        through the citation-repoint gate: task metadata still citing the
+        **Every ``store='mem0'`` delete** passes through the citation-repoint
+        gate, whoever issues it (task 3624): task metadata still citing the
         doomed entry is repointed to *replacement_memory_id* BEFORE the delete
-        runs, and the delete is refused outright if that cannot be done. See
+        runs, and the delete is refused outright if that cannot be done. The
+        gate keys on the record, not the caller — "will this dangle a live
+        pointer?" does not depend on who asked. An uncited entry is unaffected:
+        the scan finds nothing live and the delete proceeds. A delete with no
+        surviving entry to repoint to needs
+        ``metadata={'allow_dangling_citations': True}``. See
         ``_citation_repoint_gate``.
+
+        **A ``cascade=True`` delete passes every record it would destroy**
+        through that same gate, not just the target (task 3197). The cascade
+        recurses inside the service, below this layer, so without the
+        pre-flight each descendant would be destroyed unchecked — one guarded
+        record and N unguarded ones, reported as a success.
 
         Args:
             store: "graphiti" or "mem0" (from search results)
@@ -3026,7 +3948,14 @@ def create_mcp_server(
                 memory_id is provided)
             agent_id: Which agent is deleting (optional, auto-derived from MCP context)
             session_id: Session context (optional, auto-derived from MCP context)
-            metadata: Optional key-value pairs (may contain _causation_id for recon)
+            metadata: Optional key-value pairs (may contain _causation_id for
+                recon). Set {'allow_dangling_citations': True} to accept
+                dangling live task citations deliberately, for a drop with no
+                surviving entry to repoint to; only a LITERAL ``True`` counts,
+                the override is recorded at WARNING with every citer it strands,
+                and it does not unlock the fail-closed ``CitationScanFailed``
+                path. The flag is write-time-only and is never forwarded to the
+                store.
             replacement_memory_id: The SURVIVING entry's full 36-char UUID, when
                 this delete supersedes one duplicate in favour of another.
                 Required for a consolidation delete whose id is still cited by a
@@ -3039,11 +3968,42 @@ def create_mcp_server(
                 id is refused (``CitationReplacementNotFound``) rather than
                 written into every citation, which would strand them exactly as
                 the delete itself would;
-                (3) it must not be the id being deleted
-                (``CitationReplacementInvalid``) — a self-repoint reports
-                success while every citation still addresses the destroyed
-                entry. Copy the value from the search/consolidation result
-                rather than reconstructing it.
+                (3) it must not be any record THIS call destroys
+                (``CitationReplacementInvalid``) — the id being deleted, or,
+                under ``cascade=True``, any descendant in the cascade set.
+                Forwarding citations to a record the same call destroys
+                reports success while every citation still addresses a
+                destroyed entry. Copy the value from the search/consolidation
+                result rather than reconstructing it.
+            cascade: Delete this record's CHILDREN too (default False).
+                ``store='mem0'`` only — ``metadata.parent_id`` is a Mem0
+                payload key, so a graphiti edge has no children and the
+                combination is REJECTED (``ValidationError``) rather than
+                silently downgraded to a plain delete. The
+                WHOLE cascade is refused — nothing deleted, nothing repointed
+                — if any record it would destroy still has live task citers
+                and neither escape was given
+                (``CascadeCitationGateRejected``, whose ``blocked[]`` names
+                every offending record with its own citers, so the set is
+                fixed in one pass rather than one refusal at a time). Both
+                escapes apply to the ENTIRE cascade set, not just the target:
+                ``replacement_memory_id`` repoints every cited record in it,
+                and ``allow_dangling_citations`` accepts dangling every one of
+                them. A cascade set that cannot be fully enumerated is also
+                refused (``CascadeCitationScanIncomplete``) — a set the gate
+                could not see is one it cannot prove safe, and destroying
+                unchecked records while reporting them verified is worse than
+                not checking at all.
+
+        Deleting a Mem0 entry that other records point at via
+        `metadata.parent_id` REFUSES with `ParentHasChildrenError`, listing
+        the child ids, rather than silently orphaning them. `cascade=true`
+        is the explicit opt-in: the children are deleted first, then this
+        record. The alternative is to reparent or delete the children
+        yourself first. That refusal is checked BEFORE the citation gate
+        repoints anything, so a delete refused for having children has not
+        rewritten any task's metadata either — nothing happened, in both
+        senses.
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         project_id, err = _canonicalize_project_id_arg(project_id)
@@ -3072,14 +4032,166 @@ def create_mcp_server(
                 'error': (f'Invalid store {store!r}. Must be one of {sorted(_VALID_STORES)}.'),
                 'error_type': 'ValidationError',
             }
+        # `cascade` is MEM0-ONLY, and an unhonourable request is REFUSED rather
+        # than tolerated as a no-op (task 3197 review). A graphiti edge has no
+        # `metadata.parent_id`, so nothing here or in the service could recurse:
+        # the caller got a bare {'status': 'deleted'} for a delete they asked to
+        # cascade, while the reconciliation event recorded `cascade: True` with
+        # an empty child list — an audit trail claiming a cascade was requested
+        # and satisfied when nothing recursive ran. Same posture as the
+        # ignored_override / ignored_replacement_memory_id reporting below:
+        # never drop a caller's instruction in silence.
+        #
+        # The service raises ValueError on the same combination; the check is
+        # repeated here — one rule, two enforcement points, exactly as the
+        # `validate_full_uuid` guard below — because `mcp_tool_errors` flattens
+        # an exception to {'error', 'error_type'} and this envelope names the
+        # remedy. Position mirrors the service's: after the store check, before
+        # the id-shape check, so both layers report a bad store first.
+        if cascade and store != 'mem0':
+            return {
+                'error': (
+                    f'cascade=True is not supported for store={store!r}: '
+                    'parent/child links are the Mem0 payload key '
+                    f'metadata.parent_id, so a {store} record has no children '
+                    'to cascade to. Retry without cascade if a plain delete of '
+                    'this record is what was meant.'
+                ),
+                'error_type': 'ValidationError',
+            }
+        # A truncated id (e.g. an 8-char hex prefix read out of a search-result
+        # snippet) used to produce a fully confirming {'status': 'deleted'},
+        # because both backends treat a miss as "already deleted".  The service
+        # now raises on it too; the check is repeated here — delegating to the
+        # same shared predicate, so there is no second copy of the rule — because
+        # ``mcp_tool_errors`` flattens an exception to {'error', 'error_type'}
+        # and would drop the ``hint`` that tells the caller how to obtain the
+        # real id.
+        #
+        # Position is load-bearing in three directions: AFTER the project_id
+        # prologue (canonicalization stays the first project_id operation),
+        # AFTER the conflict/presence checks (so the more specific "which arg"
+        # errors still win and ``resolved_id`` is non-None), and AFTER the
+        # store check but BEFORE ``_citation_repoint_gate`` — that gate mutates
+        # live task metadata ahead of an irreversible delete, so a malformed id
+        # must never get far enough to drive a repoint.
+        #
+        # Only ``resolved_id`` is validated here.  ``replacement_memory_id`` is
+        # the gate's own argument, answered by its distinct
+        # ``CitationReplacementInvalid``/``NotFound`` contract; the two share
+        # the shape predicate, not the error envelope.
+        #
+        # The label follows the argument the caller actually supplied: telling
+        # someone who passed the documented ``id`` alias that "memory_id must
+        # be a full 36-character UUID" names a parameter they never sent.
+        if err := validate_full_uuid(
+            resolved_id, field_name='memory_id' if memory_id is not None else 'id'
+        ):
+            return err
         causation_id, source, _ = _extract_causation(metadata, agent_id)
+        # Same write-time override idiom as add_memory's allow_near_duplicate
+        # (see below in this module): read off the RAW envelope, and only a
+        # LITERAL True counts — a truthy 'yes' must not unlock an irreversible
+        # delete.
+        override_supplied = (
+            isinstance(metadata, dict) and 'allow_dangling_citations' in metadata
+        )
+        raw_override = (
+            metadata.get('allow_dangling_citations') if isinstance(metadata, dict) else None
+        )
+        allow_dangling_citations = raw_override is True
         # Repoint live task-metadata citations BEFORE the irreversible delete.
         # Order is the whole point: a rejection here never reaches the service
         # call, so the dangling-pointer window is closed rather than moved.
-        rejection, repoint_stats = await _citation_repoint_gate(
-            resolved_id, store, project_id, agent_id, replacement_memory_id,
-        )
+        rejection: dict[str, Any] | None = None
+        repoint_stats: dict[str, Any] | None = None
+        cascade_ids: list[str] = []
+        # Scoped to THIS invocation and passed by reference, so the two
+        # cascade passes share one answer about the replacement's existence
+        # instead of re-reading the same Qdrant point once per cited record
+        # per pass. It dies with the call — no module state, no TTL. The
+        # citation scan is deliberately NOT memoized (see
+        # `_scan_task_citations`); this read is not the racy one.
+        replacement_cache: dict[tuple[str, str], Any] = {}
+        # A cascade destroys the whole subtree inside the SERVICE, below this
+        # gate, so the gate has to be applied to the set BEFORE the call —
+        # otherwise every descendant is deleted unchecked. The
+        # `_citation_gate_applies` short-circuit comes FIRST so an inactive
+        # gate pays for no enumeration at all: walking a tree whose result
+        # would be discarded is pure cost.
+        if cascade and _citation_gate_applies(store, project_id):
+            # Descendants first, target LAST — the order the cascade will
+            # destroy them in, so the set that is gated and the sequence that
+            # runs are read the same way. A set that cannot be fully
+            # enumerated refuses here and never reaches the pre-flight.
+            rejection, cascade_ids = await _cascade_enumerate(
+                resolved_id, project_id
+            )
+            if rejection is None:
+                rejection = _cascade_replacement_outside_set(
+                    cascade_ids, resolved_id, replacement_memory_id,
+                )
+            if rejection is None:
+                rejection = await _cascade_citation_preflight(
+                    cascade_ids, resolved_id, store, project_id, agent_id,
+                    replacement_memory_id,
+                    allow_dangling_citations=allow_dangling_citations,
+                    replacement_cache=replacement_cache,
+                )
+        if rejection is None and cascade_ids:
+            # The pre-flight proved the whole set is clearable; now clear it,
+            # in the same deepest-first order, before the delete runs.
+            rejection, repoint_stats = await _cascade_citation_repoint_pass(
+                cascade_ids, store, project_id, agent_id, replacement_memory_id,
+                allow_dangling_citations=allow_dangling_citations,
+                replacement_cache=replacement_cache,
+            )
+        elif rejection is None:
+            # CHILD PRE-FLIGHT for the single-record path (task 3197 review),
+            # the non-cascade counterpart of `_cascade_enumerate` running
+            # before `_cascade_citation_preflight`. The gate below mutates
+            # live task metadata; the service's child refusal fires AFTER it.
+            # So a delete of a cited PARENT used to repoint every citation to
+            # the replacement and only then be refused with
+            # ParentHasChildrenError — mutation left behind by an operation
+            # that reported failure, contradicting the service's own "a
+            # refused delete leaves nothing claiming a deletion happened".
+            # The raise propagates to `mcp_tool_errors`, which produces the
+            # identical wire envelope the service's own refusal does, because
+            # it IS the same refusal (one home for its construction, INV-5).
+            #
+            # Charged only where the gate has something to lose: the mutating
+            # arm needs a replacement_memory_id, and the override arm logs a
+            # WARNING naming citations it claims to have dangled on a delete
+            # that then never happened. A plain uncited delete — the common
+            # path, and every one of the six in-repo recon callers — pays
+            # nothing extra.
+            if _citation_gate_applies(store, project_id) and (
+                replacement_memory_id is not None or allow_dangling_citations
+            ):
+                await memory_service.refuse_if_children(
+                    resolved_id, project_id=project_id
+                )
+            rejection, repoint_stats = await _citation_repoint_gate(
+                resolved_id, store, project_id, agent_id, replacement_memory_id,
+                allow_dangling_citations=allow_dangling_citations,
+            )
         if rejection:
+            # The `is True` strictness above is right, but dropping a
+            # non-conforming value in SILENCE is not: the caller would get back
+            # a refusal whose hint tells them to pass the flag they believe they
+            # just passed, and would retry into the same wall. Name the value
+            # that was ignored instead (loud-over-silent-degradation). A literal
+            # False is a deliberate "no", not a malformed yes, so it is honoured
+            # without comment — this fires only for a non-boolean value.
+            if override_supplied and not isinstance(raw_override, bool):
+                rejection = {
+                    **rejection,
+                    'ignored_override': {'allow_dangling_citations': raw_override},
+                    'hint': ' '.join(
+                        p for p in (rejection.get('hint'), _IGNORED_DANGLING_OVERRIDE_HINT) if p
+                    ),
+                }
             return rejection
         result = await memory_service.delete_memory(
             memory_id=resolved_id,
@@ -3089,6 +4201,7 @@ def create_mcp_server(
             session_id=session_id,
             causation_id=causation_id,
             _source=source,
+            cascade=cascade,
         )
         if repoint_stats and isinstance(result, dict):
             result = {**result, **repoint_stats}
@@ -5373,9 +6486,10 @@ def create_mcp_server(
         stored as medium). Strip the fragment and resubmit, or set
         metadata={'allow_mcp_markup': True} if you are quoting the markup
         deliberately (e.g. filing a task ABOUT the leak).
-        :mod:`fused_memory.server.markup_tripwire` holds the authoritative
-        pattern list and the rationale — it is deliberately the only place in
-        the package that enumerates the literals.
+        :mod:`fused_memory.server.markup_tripwire` holds the write-time
+        pattern list and the rationale; the literals themselves are enumerated
+        once, in :mod:`shared.toolcall_markup`, and nothing in this package
+        spells them.
 
         Args:
             project_root: Absolute path to project root

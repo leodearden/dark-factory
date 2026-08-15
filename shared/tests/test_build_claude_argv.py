@@ -75,16 +75,27 @@ def test_build_claude_argv_fresh_full_options() -> None:
         _cleanup(temp_files)
 
 
-def test_build_claude_argv_resume_skips_system_prompt_file() -> None:
-    """RESUME case: --resume replaces --system-prompt-file/--session-id entirely.
+def test_build_claude_argv_resume_still_passes_system_prompt_file() -> None:
+    """RESUME case: --resume displaces ONLY --session-id, never the system prompt.
 
-    No sysprompt temp file is created (temp_files is empty) since the system
-    prompt was already set on the session being resumed.
+    The system prompt is a process-invocation parameter that the session does
+    not carry, so a resumed invocation that omits --system-prompt-file runs
+    under the stock Claude Code prompt with no role charter (task 3983).  The
+    sysprompt temp file is therefore created on the resume path too, and holds
+    the CURRENT ``system_prompt`` argument.
+
+    Scope: the resume-SPECIFIC facts only.  The full resumed argv — every flag,
+    in order, including where the ``['--resume', <id>]`` pair sits relative to
+    the ``--system-prompt-file <path>`` pair — is pinned once, as a delta against
+    the fresh argv, by
+    ``test_build_claude_argv_fresh_and_resume_carry_identical_system_prompt``
+    below.  Do not re-add a hard-coded expected list here: two copies of the
+    same argv shape drift, and every future flag would need editing in both.
     """
     cmd, temp_files = build_claude_argv(
         model='opus',
         max_budget_usd=5.0,
-        system_prompt='unused system prompt',
+        system_prompt='role charter text',
         max_turns=10,
         permission_mode='bypassPermissions',
         allowed_tools=None,
@@ -96,19 +107,70 @@ def test_build_claude_argv_resume_skips_system_prompt_file() -> None:
         session_id='sess-should-be-ignored',
     )
     try:
-        assert temp_files == [], f'resume path must create no sysprompt temp file; got {temp_files!r}'
-        assert '--system-prompt-file' not in cmd
+        assert len(temp_files) == 1, f'resume path must create a sysprompt temp file; got {temp_files!r}'
+        assert Path(temp_files[0]).read_text() == 'role charter text'
+        assert '--system-prompt-file' in cmd
+        assert cmd[cmd.index('--system-prompt-file') + 1] == temp_files[0]
+        # --session-id stays displaced by --resume: unlike --system-prompt-file,
+        # it IS genuinely exclusive with it.  Probed on CLI 2.1.226:
+        #   "Error: --session-id can only be used with --continue or --resume
+        #    if --fork-session is also specified."
+        # Do not "helpfully" hoist --session-id out of the branch too.
         assert '--session-id' not in cmd
-        assert cmd == [
-            'claude', '--print', '--output-format', 'json',
-            '--model', 'opus',
-            '--max-budget-usd', '5.0',
-            '--resume', 'resume-abc',
-            '--permission-mode', 'bypassPermissions',
-            '--max-turns', '10',
-        ], f'got {cmd!r}'
+
+        assert '--resume' in cmd
+        assert cmd[cmd.index('--resume') + 1] == 'resume-abc'
     finally:
         _cleanup(temp_files)
+
+
+def test_build_claude_argv_fresh_and_resume_carry_identical_system_prompt() -> None:
+    """A resumed invocation is byte-identical to a fresh one but for --resume.
+
+    Task 3983's central property, which no single-case test can express: the
+    ONE hoisted sysprompt write serves both arms, so replacing the prompt (not
+    appending it) makes the resumed argv the fresh argv with a single
+    ``['--resume', <id>]`` pair spliced in.  Both arms carry the same prompt
+    text to disk.
+
+    This is the SINGLE site pinning that delta — including where the resume pair
+    sits in the argv.  ``test_build_claude_argv_resume_still_passes_system_prompt_file``
+    deliberately asserts only the resume-specific facts and keeps no expected-argv
+    list of its own, so the shape never has to be edited in two places.
+    """
+    kwargs: dict = dict(
+        model='opus',
+        max_budget_usd=5.0,
+        system_prompt='shared role charter',
+        max_turns=10,
+        permission_mode='bypassPermissions',
+        allowed_tools=None,
+        disallowed_tools=None,
+        mcp_config=None,
+        output_schema=None,
+        effort=None,
+        session_id=None,
+    )
+    fresh_cmd, fresh_temps = build_claude_argv(resume_session_id=None, **kwargs)
+    resume_cmd, resume_temps = build_claude_argv(resume_session_id='r1', **kwargs)
+    try:
+        assert '--system-prompt-file' in fresh_cmd
+        assert '--system-prompt-file' in resume_cmd
+        assert len(fresh_temps) == 1 and len(resume_temps) == 1
+        assert Path(fresh_temps[0]).read_text() == Path(resume_temps[0]).read_text() == 'shared role charter'
+
+        # The resumed argv is the fresh argv with ['--resume', 'r1'] spliced in
+        # immediately after the --system-prompt-file <path> pair — nothing else
+        # differs once the nondeterministic temp paths are normalized.
+        fresh_norm = _normalize(fresh_cmd, fresh_temps)
+        resume_norm = _normalize(resume_cmd, resume_temps)
+        splice_at = fresh_norm.index('--system-prompt-file') + 2
+        assert fresh_norm[:splice_at] + ['--resume', 'r1'] + fresh_norm[splice_at:] == resume_norm, (
+            f'fresh={fresh_cmd!r} resume={resume_cmd!r}'
+        )
+    finally:
+        _cleanup(fresh_temps)
+        _cleanup(resume_temps)
 
 
 def test_build_claude_argv_expands_deny_list_when_schema_and_wildcard() -> None:
@@ -141,30 +203,37 @@ def test_build_claude_argv_expands_deny_list_when_schema_and_wildcard() -> None:
         _cleanup(temp_files)
 
 
-def test_build_claude_argv_resume_keeps_json_schema_and_denylist() -> None:
-    """RESUME + output_schema: the schema survives, the system prompt does not.
+def test_build_claude_argv_resume_keeps_system_prompt_schema_and_denylist() -> None:
+    """RESUME + output_schema: BOTH the system prompt and the schema survive.
 
-    This asymmetry is load-bearing for every caller that carries an output
-    contract across a cap-retry resume (cli_invoke.py:1270-1272 re-invokes with
-    resume_session_id set and all other kwargs intact):
+    HISTORY.  This test used to pin the OPPOSITE — an asymmetry where a
+    prose-carried contract silently evaporated on resume while a schema-carried
+    one was undroppable:
 
-      --system-prompt-file  DROPPED on resume  (:1501-1503, inside the branch)
-      --json-schema         ALWAYS emitted     (:1552-1553, outside the branch)
+      --system-prompt-file  DROPPED on resume  (inside the resume branch)
+      --json-schema         ALWAYS emitted     (outside the branch)
 
-    So a prose-carried contract silently evaporates on resume while a
-    schema-carried one is undroppable — which is why the reconciliation judge was
-    migrated onto output_schema (task 3067).  The existing resume test above
-    cannot pin this: it passes output_schema=None.  Also confirms the wildcard
-    deny-list expansion applies on the resume path too, so the synthetic
-    StructuredOutput tool the schema rides on is not blocked.
+    That asymmetry is GONE as of task 3983, which hoisted the sysprompt write
+    above the resume branch: --system-prompt-file is now emitted unconditionally
+    alongside --json-schema, so both survive a resume.  This test's old
+    "if this test fails, escalate rather than editing the assertions" tripwire
+    was retired deliberately by that task — it fired for the one reason it was
+    meant to allow, namely the underlying defect being FIXED rather than an
+    assertion being weakened to hide a regression.
 
-    If this test fails, the premise of the judge migration is broken — escalate
-    rather than editing the assertions.
+    The reconciliation judge's migration onto output_schema (task 3067) remains
+    correct on its own merits and is NOT invalidated by this: the
+    anthropic/openai provider branches never see --json-schema at all, and a
+    machine-validated contract beats a prose one regardless.  It simply is no
+    longer needed as a *resume* workaround.
+
+    Also confirms the wildcard deny-list expansion applies on the resume path,
+    so the synthetic StructuredOutput tool the schema rides on is not blocked.
     """
     cmd, temp_files = build_claude_argv(
         model='opus',
         max_budget_usd=5.0,
-        system_prompt='dropped on resume',
+        system_prompt='carried across resume',
         max_turns=10,
         permission_mode='bypassPermissions',
         allowed_tools=None,
@@ -176,9 +245,9 @@ def test_build_claude_argv_resume_keeps_json_schema_and_denylist() -> None:
         session_id='sess-ignored',
     )
     try:
-        # The system prompt (and its pre-allocated session id) are gone...
-        assert temp_files == [], f'resume path must create no sysprompt file; got {temp_files!r}'
-        assert '--system-prompt-file' not in cmd
+        # The system prompt survives; only its pre-allocated session id is gone...
+        assert len(temp_files) == 1, f'resume path must create a sysprompt file; got {temp_files!r}'
+        assert '--system-prompt-file' in cmd
         assert '--session-id' not in cmd
         assert '--resume' in cmd
         assert cmd[cmd.index('--resume') + 1] == 'resume-abc'

@@ -14,6 +14,7 @@ before the orchestrator burns another iteration's worth of budget.
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -24,6 +25,7 @@ from _workflow_helpers import (
     FakeScheduler,
     _make_resolving_steward,
     _make_status_setting_steward,
+    same_module_siblings,
 )
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
@@ -45,31 +47,6 @@ from orchestrator.workflow_types import StewardResolved
 # ---------------------------------------------------------------------------
 # Fixtures (kept local — these tests don't share runtime with test_workflow_e2e)
 # ---------------------------------------------------------------------------
-
-
-def _same_module_siblings(lock_depth: int) -> tuple[str, str]:
-    """Two DISTINCT file paths guaranteed to share a module at *lock_depth*.
-
-    ``shared.locking.normalize_lock`` truncates a path to its first ``depth``
-    components, so two files share a lock module iff those components agree.
-    A fixed literal like ``a/b/c/d/{e,f}.py`` satisfies that only while
-    ``lock_depth <= 4``: at a deeper setting the two paths normalize to
-    themselves and become DIFFERENT modules, making the "same-module widen"
-    premise unsatisfiable.
-
-    That is not hypothetical — it is why these tests went red on main when
-    ``dark-factory-orchestrator.yaml`` moved ``lock_depth`` 4 -> 12 (commit
-    094d634465, deliberately making module locks file-granular). The autouse
-    ``_isolate_orch_config`` fixture in conftest.py pins ``ORCH_CONFIG_PATH``
-    at the LIVE operational config, so ``config.lock_depth`` here is the real
-    deployed value by design, not a code default.
-
-    Deriving the package prefix FROM ``lock_depth`` keeps the premise true BY
-    CONSTRUCTION at any depth, so these stay tests of same-module widen
-    behaviour instead of silently becoming tests of the knob's current value.
-    """
-    package = '/'.join(f'p{i}' for i in range(lock_depth))
-    return f'{package}/e.py', f'{package}/f.py'
 
 
 @pytest.fixture
@@ -557,7 +534,7 @@ class TestStatusPreservationOnResume:
         module set is unchanged.
         """
         # Same-package siblings: identical module set at config.lock_depth.
-        f1, f2 = _same_module_siblings(config.lock_depth)
+        f1, f2 = same_module_siblings(config.lock_depth)
         assert files_to_modules([f1], config.lock_depth) == files_to_modules(
             [f1, f2], config.lock_depth,
         ), (
@@ -833,7 +810,7 @@ class TestSetTaskScope:
         # Two files co-located in the same package: at config.lock_depth the
         # module set is identical with or without F2 — a genuine same-module
         # widen (self-validating precondition asserted first).
-        f1, f2 = _same_module_siblings(config.lock_depth)
+        f1, f2 = same_module_siblings(config.lock_depth)
         assert files_to_modules([f1], config.lock_depth) == files_to_modules(
             [f1, f2], config.lock_depth,
         ), (
@@ -912,6 +889,35 @@ class TestCheckScopeInvariant:
         )
         return workflow, scheduler, queue
 
+    # Sentinel default for `_arrange`'s `metadata_files` param — distinct from
+    # `None`/`[]` (both legitimate file lists) — meaning "leave
+    # scheduler.task_data empty", i.e. the get_task()-returns-None shape.
+    _NO_TASK_DATA = object()
+
+    def _arrange(
+        self, config, git_ops, task_assignment, tmp_path, plan_files,
+        metadata_files=_NO_TASK_DATA,
+    ):
+        """``_build`` plus the ``workflow.plan`` / ``scheduler.task_data``
+        wiring every test in this class needs, so the task-dict shape
+        (``{'id': ..., 'metadata': {'files': ...}}``) that
+        ``_check_scope_invariant`` reads lives in exactly one place. Pass
+        ``metadata_files`` to populate ``scheduler.task_data`` normally;
+        omit it (the sentinel default) to leave ``scheduler.task_data``
+        empty, which is what the ``get_task``-returns-``None`` fail-safe
+        test needs.
+        """
+        workflow, scheduler, queue = self._build(
+            config, git_ops, task_assignment, tmp_path,
+        )
+        workflow.plan = {'files': plan_files}
+        if metadata_files is not self._NO_TASK_DATA:
+            scheduler.task_data[task_assignment.task_id] = {
+                'id': task_assignment.task_id,
+                'metadata': {'files': metadata_files},
+            }
+        return workflow, scheduler, queue
+
     async def test_divergent_plan_and_metadata_files_escalates(
         self, config, git_ops, task_assignment, tmp_path,
     ):
@@ -919,22 +925,26 @@ class TestCheckScopeInvariant:
         # top-level files 'a.py' and 'b.py' normalize to DISTINCT modules, so
         # {'a.py','b.py'} != {'a.py'} at module granularity too — the tripwire
         # (now module-granular, task 2505 reviewer amendment) still fires.
+        # PLAN-EXTRA / UNSAFE direction (task 3429): plan.files needs a lock
+        # module that metadata.files does not cover — this is the direction
+        # the narrowed containment check must still catch.
         plan_files = ['a.py', 'b.py']
         metadata_files = ['a.py']
-        assert files_to_modules(plan_files, config.lock_depth) != files_to_modules(
-            metadata_files, config.lock_depth,
-        ), (
+        plan_modules = set(files_to_modules(plan_files, config.lock_depth))
+        metadata_modules = set(files_to_modules(metadata_files, config.lock_depth))
+        assert plan_modules != metadata_modules, (
             'precondition: this test must exercise a genuine cross-MODULE '
             f'divergence at lock_depth={config.lock_depth}'
         )
-        workflow, scheduler, queue = self._build(
-            config, git_ops, task_assignment, tmp_path,
+        assert plan_modules - metadata_modules, (
+            'precondition: this must be a PLAN-EXTRA divergence — plan.files '
+            'needs a lock module metadata.files does not cover — at '
+            f'lock_depth={config.lock_depth}; plan_modules={plan_modules!r} '
+            f'metadata_modules={metadata_modules!r}'
         )
-        workflow.plan = {'files': plan_files}
-        scheduler.task_data[task_assignment.task_id] = {
-            'id': task_assignment.task_id,
-            'metadata': {'files': metadata_files},
-        }
+        workflow, scheduler, queue = self._arrange(
+            config, git_ops, task_assignment, tmp_path, plan_files, metadata_files,
+        )
 
         await workflow._check_scope_invariant()
 
@@ -961,7 +971,7 @@ class TestCheckScopeInvariant:
         old file-granularity comparison (which would escalate) and passes under
         the module-granularity comparison.
         """
-        _f1, _f2 = _same_module_siblings(config.lock_depth)
+        _f1, _f2 = same_module_siblings(config.lock_depth)
         plan_files = [_f1, _f2]
         metadata_files = [_f1]
         # Self-validating precondition: genuinely same-module but file-divergent.
@@ -975,14 +985,9 @@ class TestCheckScopeInvariant:
             'precondition: the file lists must genuinely differ (else this '
             'would collapse into the consistent-files case)'
         )
-        workflow, scheduler, queue = self._build(
-            config, git_ops, task_assignment, tmp_path,
+        workflow, scheduler, queue = self._arrange(
+            config, git_ops, task_assignment, tmp_path, plan_files, metadata_files,
         )
-        workflow.plan = {'files': plan_files}
-        scheduler.task_data[task_assignment.task_id] = {
-            'id': task_assignment.task_id,
-            'metadata': {'files': metadata_files},
-        }
 
         await workflow._check_scope_invariant()
 
@@ -995,14 +1000,10 @@ class TestCheckScopeInvariant:
     async def test_consistent_plan_and_metadata_files_no_escalation(
         self, config, git_ops, task_assignment, tmp_path,
     ):
-        workflow, scheduler, queue = self._build(
+        workflow, scheduler, queue = self._arrange(
             config, git_ops, task_assignment, tmp_path,
+            ['a.py', 'b.py'], ['a.py', 'b.py'],
         )
-        workflow.plan = {'files': ['a.py', 'b.py']}
-        scheduler.task_data[task_assignment.task_id] = {
-            'id': task_assignment.task_id,
-            'metadata': {'files': ['a.py', 'b.py']},
-        }
 
         await workflow._check_scope_invariant()
 
@@ -1014,17 +1015,241 @@ class TestCheckScopeInvariant:
     async def test_get_task_none_is_fail_safe_no_escalation_no_raise(
         self, config, git_ops, task_assignment, tmp_path,
     ):
-        workflow, scheduler, queue = self._build(
-            config, git_ops, task_assignment, tmp_path,
+        # metadata_files intentionally omitted -> scheduler.task_data left
+        # empty -> get_task() -> None.
+        workflow, scheduler, queue = self._arrange(
+            config, git_ops, task_assignment, tmp_path, ['a.py', 'b.py'],
         )
-        workflow.plan = {'files': ['a.py', 'b.py']}
-        # scheduler.task_data intentionally left empty -> get_task() -> None.
 
         await workflow._check_scope_invariant()  # must not raise
 
         assert queue.get_by_task(task_assignment.task_id, status='pending') == [], (
             'an unreadable task must be treated as "cannot check", not '
             '"divergent" — no escalation on a transient read failure'
+        )
+
+    async def test_metadata_module_superset_of_plan_no_escalation(
+        self, config, git_ops, task_assignment, tmp_path, caplog,
+    ):
+        """SAFE direction (task 3429): metadata.files a strict module
+        SUPERSET of plan.files must NOT escalate.
+
+        Mirrors the measured structural false-positive class (7 of the 9
+        PLAN-MISSING divergence strands on 2026-08-06): the extra file is the
+        task's OWN TEST FILE living in a sibling directory. metadata.files is
+        the sole input the scheduler derives this task's file locks from, so
+        a module SUPERSET means the held locks are wider than the plan
+        needs — that cannot let two tasks collide, it can only
+        over-serialise — so this must not fire the blocking L0 that gates
+        the merge. The safe direction must still stay observable, so it is
+        logged at INFO instead of vanishing silently.
+        """
+        plan_files = ['scripts/foo.sh']
+        metadata_files = ['scripts/foo.sh', 'scripts/tests/test_foo.py']
+        plan_modules = set(files_to_modules(plan_files, config.lock_depth))
+        metadata_modules = set(
+            files_to_modules(metadata_files, config.lock_depth)
+        )
+        assert plan_modules < metadata_modules, (
+            'precondition: metadata_modules must be a STRICT superset of '
+            f'plan_modules at lock_depth={config.lock_depth}; '
+            f'plan_modules={plan_modules!r} metadata_modules={metadata_modules!r}'
+        )
+        workflow, scheduler, queue = self._arrange(
+            config, git_ops, task_assignment, tmp_path, plan_files, metadata_files,
+        )
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.workflow'):
+            await workflow._check_scope_invariant()
+
+        assert queue.get_by_task(task_assignment.task_id, status='pending') == [], (
+            'a metadata.files module SUPERSET is a wider-than-needed lock '
+            'set — it cannot let two tasks collide, only over-serialise — '
+            'so it must NOT file the blocking L0 that gates the merge'
+        )
+        extra_modules = sorted(metadata_modules - plan_modules)
+        info_messages = [
+            r.getMessage() for r in caplog.records if r.levelno == logging.INFO
+        ]
+        matching = [
+            msg for msg in info_messages
+            if task_assignment.task_id in msg
+            and all(mod in msg for mod in extra_modules)
+        ]
+        assert matching, (
+            'expected an INFO log naming the task id and the extra metadata '
+            f'module(s) {extra_modules!r} so the benign-superset direction '
+            f'stays observable; INFO records: {info_messages!r}'
+        )
+
+    async def test_both_ways_divergence_escalates_and_detail_names_uncovered_modules(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """BOTH-WAYS divergence (the measured task-3105 shape): each side has
+        a module the other lacks. The narrowed containment predicate must
+        still catch this — plan_modules - metadata_modules is non-empty — and
+        the escalation detail must name exactly which modules the locks do
+        not cover, instead of the old false "these derive DIFFERENT
+        lock-module sets ... keep the module sets in lockstep" claim, which
+        is false for the benign-superset population this record class now
+        also has to describe accurately.
+        """
+        plan_files = ['scripts/foo.sh', 'pkg/impl.py']
+        metadata_files = ['scripts/foo.sh', 'scripts/tests/test_foo.py']
+        plan_modules = set(files_to_modules(plan_files, config.lock_depth))
+        metadata_modules = set(
+            files_to_modules(metadata_files, config.lock_depth)
+        )
+        uncovered = plan_modules - metadata_modules
+        assert uncovered, (
+            'precondition: plan.files must need a module metadata.files '
+            f'does not cover at lock_depth={config.lock_depth}; '
+            f'plan_modules={plan_modules!r} metadata_modules={metadata_modules!r}'
+        )
+        assert metadata_modules - plan_modules, (
+            'precondition: this must be a genuine BOTH-WAYS divergence, not '
+            f'a plain PLAN-EXTRA — metadata_modules={metadata_modules!r} '
+            f'must also hold a module plan_modules={plan_modules!r} lacks'
+        )
+        workflow, scheduler, queue = self._arrange(
+            config, git_ops, task_assignment, tmp_path, plan_files, metadata_files,
+        )
+
+        await workflow._check_scope_invariant()
+
+        pending = queue.get_by_task(task_assignment.task_id, status='pending')
+        infra_issues = [e for e in pending if e.category == 'infra_issue']
+        assert len(infra_issues) == 1, (
+            f'expected exactly one infra_issue escalation; pending={pending!r}'
+        )
+        esc = infra_issues[0]
+        for module in sorted(uncovered):
+            assert module in esc.detail, (
+                f'expected uncovered module {module!r} to be named in the '
+                f'escalation detail so triage knows exactly what is not '
+                f'covered; detail={esc.detail!r}'
+            )
+        assert esc.severity == 'blocking', 'PRD D11 keeps the gate'
+        assert esc.category == 'infra_issue', 'PRD D11 keeps the gate'
+
+    async def test_divergence_escalation_still_matches_orphan_reaper_predicate(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """Coupling pin (guards step-4's edit of the submission site): the
+        record filed by the unsafe-direction path must still match
+        ``harness._is_scope_divergence_orphan``, which discriminates the
+        whole plan.files/metadata.files divergence class on the summary
+        substring 'plan.files/metadata.files divergence detected'
+        (harness.py:696-722, documented there as the unique robust
+        discriminator). Without this pin a future summary re-word would
+        silently break the orphan-L0 reaper's handling of this class. This
+        test passes on the base branch by construction — a deliberate
+        characterization guard added while the submission site is in flux —
+        and must stay green through step-4.
+        """
+        from orchestrator.harness import _is_scope_divergence_orphan
+
+        plan_files = ['a.py', 'b.py']
+        metadata_files = ['a.py']
+        workflow, scheduler, queue = self._arrange(
+            config, git_ops, task_assignment, tmp_path, plan_files, metadata_files,
+        )
+
+        await workflow._check_scope_invariant()
+
+        pending = queue.get_by_task(task_assignment.task_id, status='pending')
+        infra_issues = [e for e in pending if e.category == 'infra_issue']
+        assert infra_issues, (
+            f'expected an infra_issue escalation; pending={pending!r}'
+        )
+        assert _is_scope_divergence_orphan(infra_issues[0]), (
+            'the escalation filed by the unsafe-direction path must still '
+            'match the orphan-L0 reaper predicate — a future summary '
+            're-word would silently break its divergence-class handling'
+        )
+
+    async def test_empty_plan_files_with_nonempty_metadata_escalates(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """Robustness (review amendment, task 3429): an EMPTY plan.files is
+        not evidence of a safe metadata.files superset — containment
+        (``uncovered = plan_modules - metadata_modules``) is vacuously empty
+        for an empty LHS regardless of what metadata_modules holds, so it
+        looks identical to a lost/never-populated plan.files. Must escalate
+        (loud-over-silent-degradation), not fall into the benign-superset
+        INFO path.
+        """
+        plan_files = []
+        metadata_files = ['a.py']
+        plan_modules = set(files_to_modules(plan_files, config.lock_depth))
+        metadata_modules = set(
+            files_to_modules(metadata_files, config.lock_depth)
+        )
+        assert not plan_modules and metadata_modules, (
+            'precondition: plan_modules must be empty and metadata_modules '
+            f'non-empty; plan_modules={plan_modules!r} '
+            f'metadata_modules={metadata_modules!r}'
+        )
+        workflow, scheduler, queue = self._arrange(
+            config, git_ops, task_assignment, tmp_path, plan_files, metadata_files,
+        )
+
+        await workflow._check_scope_invariant()
+
+        pending = queue.get_by_task(task_assignment.task_id, status='pending')
+        infra_issues = [e for e in pending if e.category == 'infra_issue']
+        assert infra_issues, (
+            'an empty plan.files next to non-empty metadata.files must '
+            f'escalate, not be treated as a benign superset; pending={pending!r}'
+        )
+        assert infra_issues[0].severity == 'blocking', 'PRD D11 keeps the gate'
+
+    async def test_all_directory_plan_files_with_nonempty_metadata_escalates(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """Same robustness gap, reached via the other route: every
+        plan.files entry is directory-shaped (no recognised file
+        extension), so ``sanitize_files_for_persist`` alpha-strips the list
+        to empty before ``_check_scope_invariant`` ever computes
+        ``plan_modules`` — structurally identical to a genuinely empty
+        plan.files from this method's point of view, and must escalate for
+        the same reason.
+        """
+        from shared.locking import is_file_path
+
+        from orchestrator.module_charter import sanitize_files_for_persist
+
+        plan_files = ['pkg']  # directory-shaped: no '.', stripped on sanitize
+        metadata_files = ['a.py']
+        assert not is_file_path(plan_files[0]), (
+            'precondition: the fixture file must be directory-shaped (no '
+            f'recognised extension); is_file_path({plan_files[0]!r}) says '
+            'otherwise'
+        )
+        sanitized_plan_files = sanitize_files_for_persist(plan_files)
+        plan_modules = set(
+            files_to_modules(sanitized_plan_files, config.lock_depth)
+        )
+        metadata_modules = set(
+            files_to_modules(metadata_files, config.lock_depth)
+        )
+        assert not plan_modules and metadata_modules, (
+            'precondition: an all-directory plan_files must derive NO lock '
+            f'modules once sanitized (mirroring _check_scope_invariant\'s '
+            f'own sanitize_files_for_persist call); '
+            f'sanitized={sanitized_plan_files!r} plan_modules={plan_modules!r}'
+        )
+        workflow, scheduler, queue = self._arrange(
+            config, git_ops, task_assignment, tmp_path, plan_files, metadata_files,
+        )
+
+        await workflow._check_scope_invariant()
+
+        pending = queue.get_by_task(task_assignment.task_id, status='pending')
+        infra_issues = [e for e in pending if e.category == 'infra_issue']
+        assert infra_issues, (
+            'an all-directory plan.files (alpha-stripped to empty) next to '
+            f'non-empty metadata.files must escalate; pending={pending!r}'
         )
 
 
@@ -1137,4 +1362,76 @@ class TestStartupGraceSecsReachesWatchdog:
             f'Expected startup_grace_secs=77.0 forwarded to invoke_with_cap_retry; '
             f'got {call_kwargs.get("startup_grace_secs")!r}. '
             'workflow._invoke must thread config.timeouts.startup_grace_secs end-to-end.'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Contract: the same-module-sibling constructor is depth-invariant (task 3866)
+# ---------------------------------------------------------------------------
+
+
+class TestSameModuleSiblings:
+    """Pin `same_module_siblings`'s contract across every plausible lock_depth.
+
+    See `same_module_siblings`' own docstring in `_workflow_helpers` for WHY
+    the pair is derived from the depth rather than written as a literal; that
+    rationale is kept in exactly one place so the copies cannot drift.
+
+    Depths cover the operational value (12), the package-bundled default
+    (`defaults.yaml:7` = 4), the pydantic Field default (2), the smallest
+    depth that can honour the contract (1), and a deeper future setting (20);
+    `test_rejects_depths_below_one` pins the boundary just under it.
+    """
+
+    @pytest.mark.parametrize('lock_depth', [1, 2, 3, 4, 12, 20])
+    def test_siblings_are_distinct_files_in_one_module_at_any_depth(self, lock_depth: int):
+        f1, f2 = same_module_siblings(lock_depth)
+
+        assert f1 != f2, (
+            f'same_module_siblings({lock_depth}) returned identical paths {f1!r}; '
+            '"same module, DIFFERENT file" is unconstructible if the two paths '
+            'are the same string.'
+        )
+
+        modules = files_to_modules([f1, f2], lock_depth)
+        assert len(modules) == 1, (
+            f'Expected {f1!r} and {f2!r} to collapse to ONE module at '
+            f'lock_depth={lock_depth}; got {sorted(modules)!r}.'
+        )
+
+        assert files_to_modules([f1], lock_depth) == modules, (
+            f'Adding sibling {f2!r} must not widen the module set of {f1!r} at '
+            f'lock_depth={lock_depth} — that equality is the exact precondition '
+            'the same-module-widen tests assert.'
+        )
+
+    @pytest.mark.parametrize('lock_depth', [0, -1])
+    def test_rejects_depths_below_one(self, lock_depth: int):
+        """Below depth 1 the guarantee is UNSATISFIABLE, so it must raise.
+
+        `OrchestratorConfig.lock_depth` carries no `ge=1` constraint, so a
+        caller forwarding `config.lock_depth` can genuinely reach this input.
+        """
+        with pytest.raises(ValueError, match='lock_depth >= 1'):
+            same_module_siblings(lock_depth)
+
+        # The boundary is real, not arbitrary — and the reason it must RAISE
+        # rather than return is that the unguarded construction fails
+        # SILENTLY.  Both paths truncate to '' (parts[:0]), files_to_modules
+        # DROPS them, and the same-module precondition the callers assert
+        # degenerates to [] == [] — passing VACUOUSLY while the workflow under
+        # test holds no module lock at all.
+        package = '/'.join(f'p{i}' for i in range(max(lock_depth, 0)))
+        f1, f2 = f'{package}/e.py', f'{package}/f.py'
+        assert files_to_modules([f1, f2], lock_depth) == [], (
+            f'expected the unguarded pair at lock_depth={lock_depth} to yield NO '
+            f'modules; got {files_to_modules([f1, f2], lock_depth)!r}. If this '
+            'changed, re-derive the guard\'s rationale from the new behaviour.'
+        )
+        assert files_to_modules([f1], lock_depth) == files_to_modules(
+            [f1, f2], lock_depth,
+        ), (
+            'the same-module precondition is expected to pass VACUOUSLY here — '
+            'that vacuity is precisely why same_module_siblings refuses this '
+            'depth instead of returning a pair'
         )

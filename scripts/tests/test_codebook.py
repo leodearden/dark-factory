@@ -17,9 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-
 from legibility import codebook as mod
-
 
 # ---------------------------------------------------------------------------
 # Fixtures

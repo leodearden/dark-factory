@@ -847,6 +847,131 @@ async def poll_until(
 
 
 # ---------------------------------------------------------------------------
+# Shared poll_until_stable() settle barrier (task 3697)
+# ---------------------------------------------------------------------------
+#
+# The companion to poll_until above, and deliberately placed beside it so the
+# two read as a matched PAIR of barrier primitives rather than two unrelated
+# utilities. poll_until is a LIVENESS barrier; this is a SETTLE barrier. Picking
+# the wrong one is the defect this exists to prevent -- see the docstring's
+# decision rule. Public (no leading underscore) for the reason this module
+# already documents for poll_until / ensure_fresh_collection: it is imported
+# cross-module.
+# ---------------------------------------------------------------------------
+
+#: Cap on the observed-value trail carried in the never-settled AssertionError.
+#: A pathological sampler must not be able to produce a multi-megabyte message.
+_STABLE_TRAIL_LIMIT = 10
+
+
+async def poll_until_stable(
+    sample: Callable[[], Any],
+    *,
+    settle: float = 0.2,
+    timeout: float = 10.0,
+    interval: float = 0.02,
+    message: str | None = None,
+) -> Any:
+    """Poll *sample* until its truthy value STOPS CHANGING, then return it verbatim.
+
+    Choosing between this and :func:`poll_until` — the whole point of having
+    both:
+
+    * ``poll_until`` is a **liveness** barrier. Correct when the assertion that
+      follows is "X happened".
+    * ``poll_until_stable`` is a **settle** barrier. **Required** when the
+      assertion that follows is an exact count or an "exactly once" claim,
+      because a liveness poll returns at the *first* occurrence and therefore
+      structurally cannot observe a duplicate that arrives after it.
+
+    The motivating call site is
+    ``test_ticket_worker.py::test_worker_created_path_emits_journal_event``,
+    whose ``assert len(task_created_events) == 1`` was gated on
+    ``poll_until(lambda: any(...))`` — so the assertion ran the instant the
+    first event landed. The duplicate that assertion exists to catch is
+    concrete, not hypothetical: ``task_created`` is emitted from two distinct
+    code paths (``task_interceptor.py`` lines 3786-3795 and 4164-4173), each
+    persisting the terminal ticket row *before* emitting — so no ticket-row
+    predicate closes the emission window either, and only a settle window does.
+
+    **The flake asymmetry**, which is what makes adding a settle window safe: a
+    too-short *settle* can only cause a false PASS (a missed duplicate), never
+    a false FAIL, because a stable value stays stable no matter how starved the
+    host is. The only false-FAIL surface is the outer *timeout*, which keeps
+    ``poll_until``'s already-proven 10s default. Raising *settle* is therefore
+    always safe, and is the correct response to a suspected missed duplicate.
+
+    *sample* may be a plain sync callable or an async/coroutine function —
+    either way it is called with no arguments each iteration and, if the result
+    is awaitable (``inspect.isawaitable``), awaited before use. A falsy result
+    means "not ready yet": polling continues and the settle window does not
+    start. Change detection uses ``!=``, and the deadline uses the asyncio
+    event-loop monotonic clock (same rationale as ``poll_until``), bounding
+    total time *including* settle restarts so a forever-changing value cannot
+    spin past *timeout*.
+
+    Args:
+        sample: Zero-arg sync or async callable evaluated each iteration.
+        settle: Seconds the value must be observed unchanged before it is
+            returned. Any change restarts this window. Defaults to 0.2s.
+        timeout: Total seconds to keep polling before giving up. Defaults to
+            10s, matching ``poll_until``.
+        interval: Seconds to sleep between polls. Defaults to 0.02s.
+        message: Custom AssertionError message used when the value never
+            became truthy at all.
+
+    Returns:
+        The settled truthy value, returned verbatim (not coerced to ``True``),
+        matching ``poll_until``.
+
+    Raises:
+        AssertionError: with two deliberately DISTINGUISHABLE messages, because
+            "it never happened" and "it kept changing" demand different
+            debugging and must not collapse into one string —
+
+            * never became truthy → the caller's *message* (or a default
+              naming *timeout*), matching ``poll_until``'s failure text so the
+              common case reads identically;
+            * became truthy but never settled → a message saying so and
+              naming the observed values (capped at the last
+              ``_STABLE_TRAIL_LIMIT`` distinct ones).
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    candidate: Any = None
+    have_candidate = False
+    stable_since = 0.0
+    trail: list[Any] = []
+    while True:
+        result = sample()
+        if inspect.isawaitable(result):
+            result = await result
+        if result:
+            now = loop.time()
+            if not have_candidate or result != candidate:
+                candidate = result
+                have_candidate = True
+                stable_since = now
+                trail.append(result)
+                del trail[:-_STABLE_TRAIL_LIMIT]
+            elif now - stable_since >= settle:
+                return candidate
+        else:
+            # Not ready yet — a falsy sample does not start the settle window.
+            have_candidate = False
+        if loop.time() >= deadline:
+            if trail:
+                raise AssertionError(
+                    f'poll_until_stable: value never settled for {settle}s within '
+                    f'{timeout}s; observed (last {len(trail)}): {trail!r}'
+                )
+            raise AssertionError(
+                message or f'poll_until_stable: condition not met within {timeout}s'
+            )
+        await asyncio.sleep(interval)
+
+
+# ---------------------------------------------------------------------------
 # Shared FalkorDB index-readiness barrier (task 3377; extracted from task 3334)
 # ---------------------------------------------------------------------------
 #
