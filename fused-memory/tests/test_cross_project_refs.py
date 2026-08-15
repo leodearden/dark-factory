@@ -346,6 +346,23 @@ class TestKnownProjectIdsAllowlist:
         )
         assert [r.entity_name for r in scan.refs] == ['dark_factory:2500']
 
+    def test_all_path_shaped_registry_is_permissive_not_fail_closed(self):
+        """The twin above only proves ONE bad entry is survivable. When EVERY
+        entry is path-shaped nothing survives canonicalization, and an empty
+        allowlist must NOT be read as "allow nothing" — that would silently
+        disable cross-project detection entirely on a registry misconfigured
+        with project ROOTS where project IDs were expected.
+
+        Enforces ``canonical_labels._canonical_allowlist``'s stated contract
+        ("one bad entry never disables the whole allowlist") at the public API,
+        and mirrors ``validate_known_project_id``'s permissive falsy-registry
+        mode.
+        """
+        scan = find_cross_project_task_refs(
+            'see dark_factory:2500', group_id='reify', known_project_ids={'-home-leo-bad'}
+        )
+        assert [(r.project_id, r.task_number) for r in scan.refs] == [('dark_factory', '2500')]
+
 
 class TestDigitsPreservedVerbatim:
     """Digits are never int-normalized, mirroring canonicalize_task_node_name —

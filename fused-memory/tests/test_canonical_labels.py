@@ -21,6 +21,7 @@ import pytest
 from fused_memory.utils.canonical_labels import (
     LabelScan,
     Referent,
+    _canonical_allowlist,
     parse_node_name,
     scan_content,
 )
@@ -483,6 +484,40 @@ class TestScanContentAllowlist:
             'task 7 and reify:8', group_id='reify', known_project_ids={'dark_factory'}
         )
         assert [r.node_name for r in scan.refs] == ['Task 7', 'Task 8']
+
+    def test_all_path_shaped_registry_is_permissive_not_fail_closed(self):
+        """A registry whose entries are ALL path-shaped degrades to PERMISSIVE.
+
+        The one-bad-entry case above is only half the contract
+        ``_canonical_allowlist`` states — "one bad entry never disables the
+        whole allowlist". When EVERY entry is skipped the surviving set is
+        empty, and an empty frozenset ``is not None``, so the qualified-ref
+        guard would read "allowlist of nothing" as "allow nothing" and drop
+        every foreign ref — silently disabling the detection this scanner
+        exists to provide. Mirrors ``validate_known_project_id``'s permissive
+        falsy-registry mode rather than inventing a fail-closed one.
+        """
+        scan = scan_content(
+            'see dark_factory:2500', group_id='reify', known_project_ids={'-home-leo-bad'}
+        )
+        assert [r.node_name for r in scan.refs] == ['dark_factory:2500']
+
+    def test_canonical_allowlist_returns_none_when_every_entry_is_path_shaped(self):
+        """``is None`` SPECIFICALLY, not merely falsy: an empty frozenset is
+        falsy too, and ``allowlist is not None`` is the exact property the
+        qualified-ref filter reads to decide whether to narrow at all."""
+        assert _canonical_allowlist({'-home-leo-bad', '-home-leo-other'}) is None
+
+    def test_mixed_registry_still_narrows_after_bad_entries_skipped(self):
+        """Regression guard, green before AND after the permissive fallback:
+        the fallback must fire only when NOTHING survived canonicalization, not
+        degenerate into disabling the allowlist whenever an entry is skipped."""
+        scan = scan_content(
+            'see dark_factory:2500 and evil_proj:9',
+            group_id='reify',
+            known_project_ids={'dark_factory', '-home-leo-bad'},
+        )
+        assert [r.node_name for r in scan.refs] == ['dark_factory:2500']
 
 
 class TestShapeValidProseMatchesByDesign:
