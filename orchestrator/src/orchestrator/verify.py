@@ -1312,6 +1312,33 @@ def _serial_pytest_str(cmd: str | None) -> str | None:
     a PYTEST ToolKind (e.g. a ``cargo test --workspace`` command — covers
     OPAQUE too, P1).
 
+    **Why the refusal branch logs (task 4121).** There is a third way to
+    reach ``rewritten is parsed``: ``verify_cmd``'s raw-chain appender
+    REFUSES outright when a pytest invocation's matched span ends inside an
+    unclosed quote — ``pytest -k 'a && b' tests/``, where the quote-blind
+    ``_PYTEST_INVOCATION_RE`` stops at the ``&&`` INSIDE the ``-k`` quotes
+    (see ``verify_cmd._has_unspliceable_pytest_invocation``). Refusing is
+    correct: appending there lands the flags inside a live quoted argument,
+    which still passes ``bash -n`` while running the wrong tests. But a
+    SILENT refusal is its own defect — the ENV_TRANSIENT retry re-runs the
+    ORIGINAL command and fails for its own reason, and an operator reading
+    that log cannot tell "recovery ran without its flags" from "recovery
+    ran". One WARNING makes the difference legible, the same reasoning
+    ``_with_junitxml_str`` records for its own suppressed injection (task
+    3218). This is the single string-level wrapper behind every
+    serial-recovery call site, so one record here covers them all.
+
+    The gate is STRUCTURAL (``parsed.tool is ToolKind.PYTEST and parsed.raw
+    is not None``) rather than "does the command contain an unspliceable
+    span", and that is exact: a structured PYTEST command always gains
+    ``base_flags``, so it never reaches ``rewritten is parsed`` at all — and
+    a command like ``pytest -k 'a && pytest b' tests/`` parses with ``raw is
+    None`` (measured) and IS successfully mutated, so a span-content gate
+    would warn about a command that lost nothing. A non-PYTEST or OPAQUE
+    command is an expected, benign no-op. That leaves exactly one thing a
+    raw-retained PYTEST chain returning unchanged can be: the appender's
+    refusal.
+
     Tradeoff: clearing ``addopts`` also drops any per-subproject marker
     filters baked into pyproject (e.g. ``-m 'not integration'``).  Accepted
     for a single bounded recovery run whose only purpose is a
@@ -1324,6 +1351,17 @@ def _serial_pytest_str(cmd: str | None) -> str | None:
     parsed = parse_config_command(cmd)
     rewritten = serial_pytest(parsed)
     if rewritten is parsed:
+        if parsed.tool is ToolKind.PYTEST and parsed.raw is not None:
+            logger.warning(
+                'serial recovery flags could not be applied to %s: a pytest '
+                "invocation's arguments contain an unbalanced quote around a shell "
+                "chain operator (e.g. -k 'a && b'), so there is no position where "
+                '-p no:xdist -o addopts= could be appended without landing inside '
+                'the quoted argument and silently running the wrong tests. The '
+                'ORIGINAL command is being re-run unchanged, so this retry will '
+                'fail for its own reason rather than recover',
+                cmd,
+            )
         return cmd
     return render(rewritten)
 
@@ -1370,13 +1408,20 @@ def _with_pytest_numprocesses_str(cmd: str | None, n: str) -> str | None:
     configures a numeric cap), and an already-serial-forced command (``-p
     no:xdist`` — injecting ``-n`` there would fail the run with
     ``unrecognized arguments: -n`` and defeat the serial-recovery safety
-    net).
+    net). Task 4121 adds a fourth: the raw-chain appender REFUSES on a pytest
+    invocation whose matched span ends inside an unclosed quote (``pytest -k
+    'a && b' tests/`` — see
+    ``verify_cmd._has_unspliceable_pytest_invocation``), returning the
+    command untouched rather than splicing ``-n`` into the quoted argument.
 
-    Unlike ``_with_junitxml_str`` this does NOT log its no-op. A suppressed
-    junit injection means an expected report will not be written, degrading
-    named downstream capabilities; a suppressed ``-n`` just leaves the
-    command at its configured worker count, which is the pre-cap status quo
-    and not a lost capability.
+    Unlike ``_with_junitxml_str`` — and unlike ``_serial_pytest_str``, which
+    task 4121 gave a WARNING for exactly that refusal — this does NOT log any
+    of its no-ops. A suppressed junit injection means an expected report will
+    not be written, and suppressed serial-recovery flags mean a recovery
+    attempt runs without the thing that makes it a recovery; both degrade
+    named capabilities. A suppressed ``-n`` just leaves the command at its
+    configured worker count, which is the pre-cap status quo and not a lost
+    capability — the refusal case included.
 
     Task 3478 extracted this so the cap has ONE rewrite site with two
     callers — ``_run_or_skip_timed``'s non-segmented branch and the
