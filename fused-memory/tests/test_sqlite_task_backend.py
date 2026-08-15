@@ -6,9 +6,11 @@ import asyncio
 import json
 import logging
 import re
+import sqlite3
 from pathlib import Path
 from typing import Any
 
+import aiosqlite
 import pytest
 import pytest_asyncio
 from pydantic import ValidationError
@@ -20,6 +22,7 @@ from fused_memory.backends.sqlite_task_backend import (
     _emit_schema_warning,
     _format_task_id,
     _merge_metadata,
+    _migrate_v3_to_v4,
     _parse_qualified_dep,
     _parse_task_id,
     _resolve_metadata_mode,
@@ -2958,6 +2961,41 @@ def _make_v3_db_with_dup_groups(
     conn.execute('PRAGMA user_version = 3')
     conn.commit()
     conn.close()
+
+
+class _FailingExecuteConn:
+    """Delegating proxy over an aiosqlite.Connection that raises from
+    `execute()` when `should_fail(sql, self)` returns True.
+
+    Used to inject a deterministic mid-migration failure into
+    `_migrate_v3_to_v4` without monkeypatching aiosqlite internals: every
+    other attribute (`commit`, `rollback`, `row_factory`, ...) is forwarded
+    verbatim via `__getattr__`, so the migration exercises the real
+    connection for everything except the one statement under test.
+    """
+
+    def __init__(self, inner, should_fail):
+        self._inner = inner
+        self._should_fail = should_fail
+        self.cancel_updates = 0          # counts `SET status = 'cancelled'` executes
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    async def execute(self, sql, *args, **kwargs):
+        if "SET status = 'cancelled'" in str(sql):
+            self.cancel_updates += 1
+        if self._should_fail(str(sql), self):
+            raise sqlite3.OperationalError('injected failure (test)')
+        return await self._inner.execute(sql, *args, **kwargs)
+
+
+async def _open_raw_v3_conn(db_path: Path) -> aiosqlite.Connection:
+    """Open a bare aiosqlite connection over a v3 DB — the minimal connection
+    shape `_migrate_v3_to_v4` needs (it indexes rows by column name)."""
+    conn = await aiosqlite.connect(str(db_path))
+    conn.row_factory = aiosqlite.Row
+    return conn
 
 
 @pytest.mark.asyncio
