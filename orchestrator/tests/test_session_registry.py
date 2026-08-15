@@ -3212,6 +3212,99 @@ def test_main_lease_release_removes_the_file(
     assert not lease_path.exists()
 
 
+# --- resolve_session_pid (task 3994 defect 2) ------------------------------
+
+
+def test_session_pid_env_names_claude_pid() -> None:
+    assert sr.SESSION_PID_ENV == 'CLAUDE_PID'
+
+
+def test_resolve_session_pid_prefers_claude_pid(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING):
+        pid = sr.resolve_session_pid({'CLAUDE_PID': '1348600'})
+
+    assert pid == 1348600
+    # The happy path is silent: a resolvable session pid is not a degradation.
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+@pytest.mark.parametrize(
+    'env',
+    [
+        {},
+        {'CLAUDE_PID': ''},
+        {'CLAUDE_PID': '   '},
+        {'CLAUDE_PID': 'not-a-pid'},
+        {'CLAUDE_PID': '0'},
+        {'CLAUDE_PID': '-1'},
+    ],
+    ids=['unset', 'empty', 'blank', 'non-numeric', 'zero', 'negative'],
+)
+def test_resolve_session_pid_falls_back_loudly(
+    env: dict[str, str], caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING):
+        pid = sr.resolve_session_pid(env)
+
+    # Fallback, never a raise -- and never a positive-looking lie.
+    assert isinstance(pid, int)
+    assert pid > 0
+    # LOUD, not silent: the repo's loud-over-silent-degradation norm (INV-2).
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings
+    blob = ' '.join(r.getMessage() for r in warnings).lower()
+    assert 'degraded' in blob
+
+
+def test_resolve_session_pid_defaults_to_os_environ(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv('CLAUDE_PID', '424242')
+    assert sr.resolve_session_pid() == 424242
+
+
+def test_resolve_session_pid_falls_back_to_getppid_when_getsid_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _boom_getsid(*_args: object) -> int:
+        raise OSError('no getsid on this platform')
+
+    monkeypatch.setattr(sr.os, 'getsid', _boom_getsid)
+
+    assert sr.resolve_session_pid({}) == os.getppid()
+
+
+def test_main_lease_claim_without_pid_writes_the_resolved_session_pid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    # Deliberately NOT this process's own pid: that is what the old
+    # `--pid` default was, so an env-blind implementation would still pass.
+    monkeypatch.setenv('CLAUDE_PID', str(_DEAD_PID))
+
+    rc = sr.main(['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-100'])
+
+    assert rc == 0
+    # The correct pid is STRUCTURAL: it no longer depends on every skill doc
+    # getting one shell token right (the `--pid $$` defect).
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    assert sr.LeaseHolder.from_json(lease_path.read_text()).pid == _DEAD_PID
+
+
+def test_main_lease_claim_explicit_pid_still_overrides_the_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setenv('CLAUDE_PID', str(os.getpid()))
+
+    rc = sr.main(
+        ['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-100', '--pid', str(_DEAD_PID)]
+    )
+
+    assert rc == 0
+    # The operator-override path operators already used by hand.
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    assert sr.LeaseHolder.from_json(lease_path.read_text()).pid == _DEAD_PID
+
+
 # --- CLI ownership on the mutating verbs (task 3994 defect 1) -------------
 
 
