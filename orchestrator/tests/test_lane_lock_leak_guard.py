@@ -2077,6 +2077,256 @@ class TestSelfOwnedLaneLockLeak:
 
 
 # ---------------------------------------------------------------------------
+# Task 3783: the PRODUCTION contended-raise path must survive a LOSSY read.
+#
+# `TestSettledLaneLockHolderRead` above pins the settle helper in isolation;
+# this class pins what it is FOR, end to end at the real call sites, with the
+# measured transient made deterministic by scripting the first read to `[]`.
+#
+# Both consequences of the one-shot read are pinned, because they are separate
+# defects that happen to share a cause:
+#   (1) DIAGNOSTIC LOSS — `_lane_lock_holder_facts` renders its degraded "no
+#       FLOCK holder" clause precisely when the lane IS contended, dropping the
+#       holder pid+pgid, which is the one datum DF 3003/3081 had to reconstruct
+#       by hand;
+#   (2) FALSE NEGATIVE ON A LOUD ESCALATION — an empty snapshot also fails
+#       layer (1) of `_lane_lock_self_owned_leak` (`self_pid not in []`), so a
+#       genuine self-owned leak is misreported as ordinary foreign contention
+#       and defers quietly.  That is the B13 detector failing OPEN under
+#       exactly the load where it matters, and it is the stronger reason this
+#       is a production defect rather than message polish.
+#
+# The scripted first-`[]` reader is installed INSIDE the staging block, after
+# the fixture has settled its own attribution, so the read it steals is
+# unambiguously the production one.  The fixture reads through THIS module's
+# `lane_lock_holder_pids` global, not `git_ops`', so the two never collide.
+# ---------------------------------------------------------------------------
+
+#: A pid the scripted readers below return on reads AFTER the one the
+#: production site is supposed to settle on.  Deliberately implausible (Linux
+#: pid_max is nowhere near this) so a rendered message naming it is
+#: unmistakably a LATER read leaking into the raise, and deliberately NOT
+#: `os.getpid()`: our own pid in the holder set trips layer (1) of the leak
+#: predicate and would change WHICH exception is raised.
+_BOGUS_LATER_PID = 2**31 - 2
+
+
+def _first_read_is_lossy(
+    real_reader: Callable[[Path], list[int]],
+) -> Callable[[Path], list[int]]:
+    """Wrap *real_reader* so its FIRST call returns ``[]``, then delegates.
+
+    Reproduces the measured seq_file transient exactly — a successful read
+    that simply missed our record — at the one read the production site takes,
+    with zero timing dependence.  Everything after it is the genuine kernel,
+    so the settled answer these tests assert on is a REAL attribution and not
+    a scripted one.
+    """
+    reads: list[int] = []
+
+    def _reader(path: Path) -> list[int]:
+        reads.append(1)
+        if len(reads) == 1:
+            return []
+        return real_reader(path)
+
+    return _reader
+
+
+@pytest.mark.asyncio
+class TestContendedRaiseSurvivesALossyHolderRead:
+    """A lossy /proc/locks read must not degrade the contended-raise path."""
+
+    async def test_a_lossy_first_read_still_names_the_foreign_holder(
+        self, real_git_ops, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """THE headline regression: esc-3060-4, reproduced deterministically.
+
+        `test_foreign_holder_is_contention_not_a_leak` above asserts the same
+        `str(child.pid) in str(excinfo.value)` and is the test that actually
+        flaked — but only when the kernel happened to serve a lossy chunk, so
+        it could neither be reproduced on demand nor pinned.  Scripting the
+        production site's FIRST read to `[]` makes that exact failure certain
+        instead of rare: the lane is genuinely contended by a genuinely
+        foreign process, and the only thing wrong is the snapshot.
+
+        RED before task 3783: the single lossy read degrades the message to
+        "the kernel reports no FLOCK holder of that lock", discarding the
+        holder pid+pgid — the one forensic datum the incident needed.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+
+        monkeypatch.setattr(git_ops_mod, '_RESET_WARM_LANE_LOCK_WAIT_SECS', 1)
+
+        commit_a = await _get_merge_commit(real_git_ops, 'lossy-a', 'lossy_a.py')
+        await real_git_ops.reset_persistent_merge_worktree(commit_a)  # create-once
+        commit_b = await _get_merge_commit(real_git_ops, 'lossy-b', 'lossy_b.py')
+
+        lock_path = lane_lock_path(real_git_ops.persistent_merge_worktree_path)
+
+        with foreign_lane_lock_holder(lock_path) as (child, holders):
+            assert child.pid in holders, (
+                f'staging error: the fixture must have settled a genuine '
+                f'foreign attribution before the lossy read is injected, or '
+                f'this test would be asserting about nothing; observed '
+                f'holders={holders!r}'
+            )
+            monkeypatch.setattr(
+                git_ops_mod,
+                'lane_lock_holder_pids',
+                _first_read_is_lossy(git_ops_mod.lane_lock_holder_pids),
+            )
+
+            with pytest.raises(MergeVerifyLeaseContended) as excinfo:
+                await real_git_ops.reset_persistent_merge_worktree(commit_b)
+
+            assert str(child.pid) in str(excinfo.value), (
+                f'a lossy first read must be settled past: the timeout must '
+                f'still name the kernel-reported holder, which is what the '
+                f'incident needed manual /proc/locks + stat forensics to '
+                f'learn; got {str(excinfo.value)!r}'
+            )
+
+    async def test_the_settled_snapshot_drives_both_the_predicate_and_the_message(
+        self, real_git_ops, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """ONE settled snapshot reaches BOTH consumers — no raise-time re-read.
+
+        The invariant `_lane_lock_holder_facts`' docstring documents (task
+        3081) must survive the settle: a second, independent read at render
+        time could observe a DIFFERENT holder set than the leak predicate
+        evaluated, quietly misdescribing the decision during exactly the
+        forensics the clause exists for.  Settling makes that failure more
+        likely, not less, if it were re-read — the whole point is that the
+        answer changes between reads.
+
+        Scripted `[]` -> `[child.pid]` -> `[_BOGUS_LATER_PID]` forever: the
+        message must name the SECOND read (the settled snapshot) and must not
+        contain the third.  Asserted on the rendered pids rather than on a
+        reader call count deliberately — a count would itself be racy if a
+        delegated real read were ever lossy.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+
+        monkeypatch.setattr(git_ops_mod, '_RESET_WARM_LANE_LOCK_WAIT_SECS', 1)
+
+        commit_a = await _get_merge_commit(real_git_ops, 'settle-a', 'settle_a.py')
+        await real_git_ops.reset_persistent_merge_worktree(commit_a)  # create-once
+        commit_b = await _get_merge_commit(real_git_ops, 'settle-b', 'settle_b.py')
+
+        lock_path = lane_lock_path(real_git_ops.persistent_merge_worktree_path)
+
+        with foreign_lane_lock_holder(lock_path) as (child, _holders):
+            scripted: list[list[int]] = [[], [child.pid]]
+
+            def _scripted_reader(path: Path) -> list[int]:
+                return scripted.pop(0) if scripted else [_BOGUS_LATER_PID]
+
+            monkeypatch.setattr(
+                git_ops_mod, 'lane_lock_holder_pids', _scripted_reader,
+            )
+
+            with pytest.raises(MergeVerifyLeaseContended) as excinfo:
+                await real_git_ops.reset_persistent_merge_worktree(commit_b)
+
+            msg = str(excinfo.value)
+            assert str(child.pid) in msg, (
+                f'the settled snapshot must be the one rendered; got {msg!r}'
+            )
+            assert str(_BOGUS_LATER_PID) not in msg, (
+                f'the raise must NOT take a second, independent read: the '
+                f'clause would then describe a holder set the leak predicate '
+                f'never evaluated (the task-3081 single-snapshot invariant); '
+                f'got {msg!r}'
+            )
+
+    async def test_a_lossy_first_read_does_not_mask_a_self_owned_leak(
+        self, real_git_ops, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """The FALSE-NEGATIVE half — a B13 leak must not defer quietly.
+
+        The stronger of the two defects.  Layer (1) of
+        `_lane_lock_self_owned_leak` asks whether OUR pid is among the kernel
+        holders; against a lossy `[]` it answers no, so a genuinely leaked
+        lane — an unregistered fd nothing will ever release, the state reify
+        esc-5548-5 found by hand — is misreported as ordinary foreign
+        contention and DEFERS.  The lane then stays locked until process exit
+        with nothing loud ever said about it: the detector failing OPEN under
+        exactly the load that produces the lossy read.
+
+        `type(...) is` is not needed here (the leak type IS the assertion),
+        but the contrast with the contended case above is the point: identical
+        kernel state, identical staging, and the only difference is whether
+        the read was settled.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+        from orchestrator.git_ops import LaneLockSelfOwnedLeak  # noqa: PLC0415
+
+        monkeypatch.setattr(git_ops_mod, '_RESET_WARM_LANE_LOCK_WAIT_SECS', 1)
+
+        commit_a = await _get_merge_commit(real_git_ops, 'lossyleak-a', 'll_a.py')
+        await real_git_ops.reset_persistent_merge_worktree(commit_a)  # create-once
+        commit_b = await _get_merge_commit(real_git_ops, 'lossyleak-b', 'll_b.py')
+
+        lock_path = lane_lock_path(real_git_ops.persistent_merge_worktree_path)
+
+        with leaked_lane_lock(lock_path):
+            monkeypatch.setattr(
+                git_ops_mod,
+                'lane_lock_holder_pids',
+                _first_read_is_lossy(git_ops_mod.lane_lock_holder_pids),
+            )
+
+            with pytest.raises(LaneLockSelfOwnedLeak):
+                await real_git_ops.reset_persistent_merge_worktree(commit_b)
+
+    async def test_a_permanently_unreadable_holder_set_still_raises_contended(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """FAIL-SAFE at the call site: a settle that learns nothing changes nothing.
+
+        Expected to hold both before and after task 3783 — that is what makes
+        it the regression guard.  The new poll must not be able to convert a
+        degraded read into a raise of a different type, a hang, or a leak
+        misreport: when the holder set stays unknown, the site degrades to
+        exactly today's `MergeVerifyLeaseContended` carrying today's "no FLOCK
+        holder" clause.
+
+        `type(...) is` and not `isinstance`: `LaneLockSelfOwnedLeak` IS-A
+        `MergeVerifyLeaseContended`, so an isinstance check would pass even if
+        an empty snapshot were misrouted into a loud leak escalation — the
+        precise false alarm this asymmetry exists to prevent.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+
+        git_ops = _git_ops(tmp_path)
+        # Simulate acquire_merge_verify_flock's bounded-wait TIMEOUT (-> None),
+        # the established stub for reaching a contended branch without staging
+        # a real holder (test_merge_verify_lease_guard.py:118-122).
+        monkeypatch.setattr(
+            git_ops_mod, 'acquire_merge_verify_flock', lambda *a, **k: None,
+        )
+        monkeypatch.setattr(
+            git_ops_mod, 'lane_lock_holder_pids', lambda path: [],
+        )
+        monkeypatch.setattr(git_ops_mod, '_LANE_LOCK_HOLDER_SETTLE_SECS', 0.05)
+
+        with pytest.raises(MergeVerifyLeaseContended) as excinfo:
+            await git_ops.reset_persistent_merge_worktree('HEAD')
+
+        assert type(excinfo.value) is MergeVerifyLeaseContended, (
+            f'an unknown holder set must stay ordinary contention, never a '
+            f'loud leak escalation; got {type(excinfo.value).__name__}'
+        )
+        assert 'no FLOCK holder' in str(excinfo.value), (
+            f'an exhausted settle must degrade to exactly today\'s clause — '
+            f'the holder may genuinely have released between the timeout and '
+            f'this probe, which is what that wording says; got '
+            f'{str(excinfo.value)!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # Step-7 (B12): a CANCELLED acquire must never orphan the lane lock.
 #
 # The fault is structural, not incidental: `asyncio.to_thread` cannot interrupt
