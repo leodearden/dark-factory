@@ -87,6 +87,12 @@ function StepSpark({ values, width = 100, height = 28, color = PALETTE.bad, stro
   );
 }
 
+// NOTE — this formatY default deliberately does NOT round, while
+// StackedAreaChart's below does; both hand formatY the RAW tick, only the
+// defaults differ. So an integer-count series renders `1.75` / `3.5` here but
+// `2` / `4` there. Aligning them means auditing every LineChart caller
+// (tabs.jsx:538, tabs.jsx:1109, tab_overview.jsx:231, the analytics tab) — out
+// of scope for task 4059, which only fixed the pre-rounding defect below.
 function LineChart({ series, labels, height = 220, yLabel, formatY = (v) => String(v), formatX = (v) => v }) {
   const ref = useRef(null);
   const [w, setW] = useState(600);
@@ -183,7 +189,8 @@ function StackedAreaChart({ stacks, labels, height = 220, formatY = v => String(
   // above, so the three callers that pass no formatter (tabs.jsx:1259,
   // tabs.jsx:1329, tab_escalation_analytics.jsx:244) keep byte-identical
   // integer count axes instead of gaining 2.5 / 7.5 labels. LineChart
-  // (line 118) already passed the raw tick and is deliberately left alone.
+  // already passed the raw tick and is deliberately left alone (see the note
+  // at its signature: only the two formatY DEFAULTS differ).
   const ticks = 4;
   const yTicks = Array.from({ length: ticks + 1 }, (_, i) => (maxV * i) / ticks);
 
