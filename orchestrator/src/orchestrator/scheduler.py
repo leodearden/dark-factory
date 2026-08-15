@@ -780,6 +780,34 @@ class TickOutcome:
     assignment: TaskAssignment | None
 
 
+@dataclass(frozen=True)
+class _BackfillGrant:
+    """The facts behind one EASY-backfill admission (task 3823 / PRD C7).
+
+    Carries the PREDICTION and the BOUND it was compared against, not just the
+    verdict.  Settlement at release re-reads both to decide whether a hold
+    overstayed, and the ``park_backfill_granted`` /``park_backfill_overstay``
+    payloads are built straight from these fields — so nobody has to
+    reconstruct the arithmetic from log lines to answer "why was this
+    admitted, and did it hold up?" (INV-2).
+
+    ``granted_at`` is wall POSIX seconds stamped at DISPATCH, not at
+    admission: :meth:`Scheduler._backfill_admission` is a pure decision that
+    ``try_acquire`` may still refuse (INV-3), and a grant that never became a
+    dispatch must not contribute a realized duration.  It is therefore ``0.0``
+    on a freshly-decided grant and filled in by ``_record_backfill_grant``.
+    """
+
+    task_id: str
+    modules: tuple[str, ...]
+    park_owners: tuple[str, ...]
+    predicted_hold: float
+    safety_factor: float
+    admission_bound: float
+    provable_assembly_delay: float
+    granted_at: float = 0.0
+
+
 def _resolve_time_source(ts: Callable[[], float] | None) -> Callable[[], float]:
     """Return *ts* if provided, else the stdlib ``time.monotonic`` callable.
 
@@ -7547,6 +7575,115 @@ class Scheduler:
             if gap is None or module_gap < gap:
                 gap = module_gap
         return 0.0 if gap is None else gap
+
+    def _backfill_admission(
+        self, task_id: str, task: dict, modules: list[str]
+    ) -> _BackfillGrant | None:
+        """C7's predicate: may *task_id* be admitted through the parks blocking it?
+
+        Returns a :class:`_BackfillGrant` on admit, ``None`` on refuse.  A PURE
+        DECISION — it mutates neither the lock table nor scheduler state, and
+        it takes no lock.  The caller must still call ``try_acquire`` with
+        ``admitted_parks=frozenset(grant.park_owners)``; that call, on live
+        state, is the ACTING BASIS (INV-3).  Nothing read here is authoritative
+        by the time the lock is taken, which is why a wrong admit costs a
+        failed acquire rather than a double-held module.
+
+        The clauses, in the order they are cheapest to refuse on::
+
+            backfill_enabled                                    (kill switch)
+            park_owners_blocking(c) is non-empty        (C7: c.modules ∩ M ≠ ∅)
+            predicted_hold(c) is not None            (an empty history REFUSES)
+            for every blocking owner p:
+                park_age(p) is known and <= backfill_max_park_age_secs
+                predicted_hold(c) * safety <= provable_assembly_delay(p)
+
+        The owner loop is a CONJUNCTION, deliberately: acquisition has to
+        bypass every blocking park to dispatch, so "find one willing lender"
+        would admit a candidate that then fails to acquire — churn with no
+        dispatch, and a grant event describing a borrow that never happened.
+
+        ``<=`` and ``age > cutoff`` are the operators C7 specifies; both
+        boundaries have their own test because an off-by-one in either would
+        show up in production only as slightly-different backfill volume.
+
+        Refusals are logged at DEBUG with a distinct reason, never emitted as
+        events: a refusal is the ordinary outcome for every parked module on
+        every tick, and per-refusal events would be exactly the storm INV-4
+        forbids.  Grants are rare and DO get an event.
+        """
+        if not self.config.backfill_enabled:
+            logger.debug('backfill refuse task=%s reason=disabled', task_id)
+            return None
+
+        owners = self.lock_table.park_owners_blocking(task_id, modules)
+        if not owners:
+            # Free, or blocked by a real HOLDER — either way there is no park
+            # to borrow a gap from and the ordinary try_acquire outcome stands.
+            logger.debug('backfill refuse task=%s reason=not_park_blocked', task_id)
+            return None
+
+        predicted = self.predicted_hold(task)
+        if predicted is None:
+            # REFUSE on no prediction, never substitute a default: an empty or
+            # thin history certifies structure, not capability.  See
+            # predicted_hold's own docstring — the producer mandates this.
+            logger.debug('backfill refuse task=%s reason=no_hold_samples', task_id)
+            return None
+
+        bound = predicted * self.config.backfill_safety_factor
+        now = self._wall_now()
+        tightest_gap: float | None = None
+        for owner in owners:
+            age = self.lock_table.park_age_secs(owner, now=now)
+            if age is None:
+                # Unknown age must refuse.  Reading it as "brand new" would
+                # make a corrupt stamp the most permissive state in the system.
+                logger.debug(
+                    'backfill refuse task=%s reason=park_age_unknown owner=%s',
+                    task_id, owner,
+                )
+                return None
+            if age > self.config.backfill_max_park_age_secs:
+                logger.debug(
+                    'backfill refuse task=%s reason=park_too_old owner=%s age=%.0fs '
+                    'cutoff=%.0fs',
+                    task_id, owner, age, self.config.backfill_max_park_age_secs,
+                )
+                return None
+            delay = self._provable_assembly_delay(owner)
+            if delay <= 0.0:
+                # The park is waiting on nothing — it assembles next tick, so
+                # any time borrowed here comes straight out of its own dispatch.
+                logger.debug(
+                    'backfill refuse task=%s reason=no_provable_gap owner=%s',
+                    task_id, owner,
+                )
+                return None
+            if bound > delay:
+                logger.debug(
+                    'backfill refuse task=%s reason=predicted_hold_exceeds_gap '
+                    'owner=%s predicted=%.1fs bound=%.1fs gap=%.1fs',
+                    task_id, owner, predicted, bound, delay,
+                )
+                return None
+            if tightest_gap is None or delay < tightest_gap:
+                tightest_gap = delay
+
+        depth = self.config.lock_depth
+        return _BackfillGrant(
+            task_id=task_id,
+            modules=tuple(normalize_lock(m, depth) for m in modules),
+            park_owners=tuple(owners),
+            predicted_hold=predicted,
+            safety_factor=float(self.config.backfill_safety_factor),
+            admission_bound=bound,
+            # The TIGHTEST gap actually borrowed, not the first or the widest:
+            # it is the one the candidate has to fit inside for every blocking
+            # park at once, so it is the number settlement should be judged
+            # against.
+            provable_assembly_delay=tightest_gap if tightest_gap is not None else 0.0,
+        )
 
     def _emit_lock_event(
         self,
