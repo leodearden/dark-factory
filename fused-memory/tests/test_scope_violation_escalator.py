@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -308,6 +309,88 @@ class TestAdvisoryVsRejectionWording:
         ):
             assert field in detail, f'advisory detail dropped {field!r}: {detail!r}'
         assert 'rejecting_project' not in detail, detail
+
+    def test_advisory_detail_does_not_assert_a_task_was_created(self, tmp_path):
+        """Task 4159: the advisory detail must not claim a task exists.
+
+        WHY the old wording was unverified: this record is filed from
+        ``_path_guard_or_skip``, which runs inside ``submit_task`` PHASE-1 —
+        the phase that persists a ticket and returns its id, explicitly
+        *before* ``tm.add_task`` is ever called.  The curator resolves that
+        ticket asynchronously and only ONE of its five actions (``create``)
+        yields a new task; ``drop``, ``combine`` and ``refuse`` yield none.
+        So at the moment this escalation is written, "the task WAS created"
+        is a claim the escalator cannot possibly have verified, and on a
+        drop/combine it is simply false — the operator (and any agent handed
+        this text by ``briefing.py``) is told to go review a task that does
+        not exist.
+
+        Pins the STABLE contracts, per this class's convention: the absence
+        of the two specific false clauses, the presence of the curator's
+        no-task outcome vocabulary, and — structurally — that every sentence
+        naming the stamp is CONDITIONAL rather than asserted.
+        """
+        esc = ScopeViolationEscalator()
+        esc_id = esc.report_rejection(
+            project_root=str(tmp_path),
+            project_id='reify',
+            candidate_title='Rework the gui panel',
+            matched_paths=('gui/',),
+            suggested_project='reify_gui',
+            advisory=True,
+        )
+        assert esc_id is not None
+        detail = self._one_payload(tmp_path)['detail']
+
+        # (a) The two clauses the bug shipped, named exactly.  Deliberately
+        # not a blanket 'created' ban: the corrected prose must still be free
+        # to describe the curator's create OUTCOME, conditionally.
+        assert 'the task WAS created' not in detail, (
+            f'advisory detail asserts an unverified creation: {detail!r}'
+        )
+        assert 'nothing was lost' not in detail, (
+            f'advisory detail claims an outcome it cannot know: {detail!r}'
+        )
+
+        # (b) The deferred disposition is actually stated — the reader is told
+        # the submission may yet be dropped or folded into an existing task,
+        # not just that it was created.
+        assert 'possible_scope_mismatch' in detail, detail
+        lowered = detail.lower()
+        assert 'drop' in lowered, (
+            f"advisory detail must name the curator's drop outcome: {detail!r}"
+        )
+        assert 'combine' in lowered or 'fold' in lowered, (
+            f"advisory detail must name the curator's combine outcome: {detail!r}"
+        )
+
+        # (c) EVERY sentence naming the stamp is conditional.  A single
+        # unconditional "the task carries metadata.possible_scope_mismatch"
+        # would re-introduce the same false claim in a new phrasing — and
+        # would be false twice over, since a combine target never receives
+        # the candidate's stamp at all.
+        sentences = [s for s in re.split(r'(?<=\.)\s+', detail) if s.strip()]
+        stamp_sentences = [s for s in sentences if 'possible_scope_mismatch' in s]
+        assert stamp_sentences, (
+            f'expected at least one sentence naming the stamp: {detail!r}'
+        )
+        for sentence in stamp_sentences:
+            assert any(m in sentence.lower() for m in ('if ', 'when ', 'only ')), (
+                'every sentence naming possible_scope_mismatch must be '
+                f'conditional on a task actually being created: {sentence!r}'
+            )
+
+        # Invariants the rest of the suite already relies on, re-asserted here
+        # so one careless rewrite is caught in one place.
+        assert 'was rejected' not in detail, detail
+        for field in (
+            'candidate_title=',
+            'filing_project_id=',
+            'filing_project_root=',
+            'matched_paths=',
+            'suggested_project=',
+        ):
+            assert field in detail, f'advisory detail dropped {field!r}: {detail!r}'
 
     def test_advisory_without_suggested_project_is_still_advisory_only(self, tmp_path):
         """advisory + no resolvable owner must not fall through to manual_route.
