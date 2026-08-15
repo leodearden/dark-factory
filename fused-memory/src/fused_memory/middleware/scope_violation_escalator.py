@@ -274,16 +274,31 @@ class ScopeViolationEscalator:
         # identical either way.
         detail_lines.append('')
         if advisory:
+            # Claims ONLY what is established at guard time (task 4159).  This
+            # fires from submit_task phase-1 — before tm.add_task, before the
+            # curator picks drop/combine/create/refuse — so any assertion that
+            # a task exists would be unverified here and false on a drop or a
+            # combine.  The stamp sentence is conditional on the CREATE outcome
+            # specifically: _execute_combine merges only curator_* keys onto
+            # the target, so a combine target never receives this candidate's
+            # possible_scope_mismatch.  Nor can this say "queued for curation"
+            # as an absolute — planning_mode bypasses the curator entirely, and
+            # that kwarg is not read until well after this guard runs.
             detail_lines.append(
                 'A task creation request cited paths that look like they belong '
                 'to another project, based on a heuristic scan of its prose '
                 '(title/description/details) only.  The submission was NOT '
-                'blocked: the task WAS created, and the match is recorded on it '
-                'as metadata.possible_scope_mismatch so async triage can see it '
-                'too.  suggested_project above is a POSSIBLE owner, not a '
-                'verdict — no resubmission is needed and nothing was lost.  '
-                'Review and reroute the created task ONLY if the attribution '
-                'above is actually correct and the task is in the wrong place.',
+                'blocked, and no resubmission is needed.  This record is filed '
+                'at the submission guard, BEFORE the submission has been '
+                'resolved, so it does not establish that a task exists: '
+                'resolution happens asynchronously and may create a new task, '
+                'combine this candidate into an existing one, or drop it.  '
+                'Only a task the curator CREATES carries the match as '
+                'metadata.possible_scope_mismatch — a candidate that is '
+                'dropped, or combined into an existing task, does not.  '
+                'suggested_project above is a POSSIBLE owner, not a verdict: '
+                'review and reroute ONLY if a task does result and the '
+                'attribution above is actually correct.',
             )
         else:
             detail_lines.append(
