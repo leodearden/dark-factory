@@ -2455,6 +2455,23 @@ def test_lease_decision_has_exactly_acquired_stand_down_proceed() -> None:
     assert sr.LeaseDecision.PROCEED.value == 'proceed'
 
 
+def test_lease_mutation_has_exactly_applied_forced_absent_refused_faulted() -> None:
+    values = {member.value for member in sr.LeaseMutation}
+    assert values == {'applied', 'forced', 'absent', 'refused', 'faulted'}
+    assert sr.LeaseMutation.APPLIED.value == 'applied'
+    assert sr.LeaseMutation.FORCED.value == 'forced'
+    assert sr.LeaseMutation.ABSENT.value == 'absent'
+    assert sr.LeaseMutation.REFUSED.value == 'refused'
+    assert sr.LeaseMutation.FAULTED.value == 'faulted'
+
+
+def test_lease_mutation_is_a_str_enum_like_its_siblings() -> None:
+    # Mirrors LeasePolicy/LeaseDecision: the CLI prints `.value` directly and
+    # a StrEnum member compares equal to its own string form.
+    assert issubclass(sr.LeaseMutation, str)
+    assert sr.LeaseMutation.REFUSED == 'refused'
+
+
 def test_lease_heartbeat_ttl_is_a_timedelta() -> None:
     assert isinstance(sr.LEASE_HEARTBEAT_TTL, timedelta)
 
@@ -2787,9 +2804,9 @@ def test_release_lease_removes_the_lease_file(tmp_path: Path) -> None:
     sr.claim_lease('watcher-df', holder=holder, root=tmp_path, now=_NOW)
     lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
 
-    result = sr.release_lease('watcher-df', root=tmp_path)
+    result = sr.release_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
 
-    assert result is True
+    assert result is sr.LeaseMutation.APPLIED
     assert not lease_path.exists()
 
 
@@ -2797,11 +2814,123 @@ def test_release_lease_is_idempotent_on_a_second_call(tmp_path: Path) -> None:
     holder = sr.LeaseHolder(session_slug='watcher-df-100', pid=os.getpid(), start_ts=_NOW.isoformat())
     sr.claim_lease('watcher-df', holder=holder, root=tmp_path, now=_NOW)
 
-    first = sr.release_lease('watcher-df', root=tmp_path)
-    second = sr.release_lease('watcher-df', root=tmp_path)
+    first = sr.release_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
+    second = sr.release_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
 
-    assert first is True
-    assert second is False
+    assert first is sr.LeaseMutation.APPLIED
+    assert second is sr.LeaseMutation.ABSENT
+
+
+# --- release_lease: ownership (task 3994 defect 1) -------------------------
+
+
+def _seed_lease(
+    tmp_path: Path, name: str = 'watcher-df', *, slug: str = 'watcher-df-100', pid: int | None = None
+) -> Path:
+    """Claim *name* for *slug* and return its on-disk lease path."""
+    holder = sr.LeaseHolder(
+        session_slug=slug, pid=os.getpid() if pid is None else pid, start_ts=_NOW.isoformat()
+    )
+    sr.claim_lease(name, holder=holder, root=tmp_path, now=_NOW)
+    return sr.lease_path_for_name(name, root=tmp_path)
+
+
+def test_release_lease_by_a_stranger_is_refused_and_the_lease_survives(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    lease_path = _seed_lease(tmp_path)
+    original_body = lease_path.read_text()
+
+    with caplog.at_level(logging.ERROR):
+        result = sr.release_lease('watcher-df', slug='watcher-df-STRANGER', root=tmp_path)
+
+    assert result is sr.LeaseMutation.REFUSED
+    assert lease_path.is_file()
+    # Byte-identical: a refused release must not touch the holder's body.
+    assert lease_path.read_text() == original_body
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors, 'a refused release must be loud (INV-2 structured-facts-at-failure)'
+    blob = ' '.join(r.getMessage() for r in errors)
+    # Both parties named: the real holder AND the would-be releaser.
+    assert 'watcher-df-100' in blob
+    assert 'watcher-df-STRANGER' in blob
+
+
+def test_release_lease_on_an_absent_lease_is_absent_and_quiet(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.ERROR):
+        result = sr.release_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
+
+    assert result is sr.LeaseMutation.ABSENT
+    # An idempotent release is not a failure -- it must not cry ERROR.
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+
+
+def test_release_lease_on_a_corrupt_body_is_refused_and_the_file_survives(
+    tmp_path: Path,
+) -> None:
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    lease_path.parent.mkdir(parents=True, exist_ok=True)
+    lease_path.write_text('{not valid json')
+
+    result = sr.release_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
+
+    # Fail TOWARD held, mirroring _read_lease_holder_state's documented rule.
+    assert result is sr.LeaseMutation.REFUSED
+    assert lease_path.read_text() == '{not valid json'
+
+
+def test_release_lease_with_force_overrides_a_stranger_refusal_loudly(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    lease_path = _seed_lease(tmp_path)
+
+    with caplog.at_level(logging.WARNING):
+        result = sr.release_lease(
+            'watcher-df', slug='watcher-df-STRANGER', force=True, root=tmp_path
+        )
+
+    assert result is sr.LeaseMutation.FORCED
+    assert not lease_path.exists()
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings, 'an operator force must be attributable'
+    blob = ' '.join(r.getMessage() for r in warnings)
+    assert 'watcher-df-100' in blob  # the displaced holder
+    assert 'watcher-df-STRANGER' in blob  # who forced it
+
+
+def test_release_lease_with_force_on_a_corrupt_body_removes_it(tmp_path: Path) -> None:
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    lease_path.parent.mkdir(parents=True, exist_ok=True)
+    lease_path.write_text('{not valid json')
+
+    result = sr.release_lease('watcher-df', slug='watcher-df-100', force=True, root=tmp_path)
+
+    assert result is sr.LeaseMutation.FORCED
+    assert not lease_path.exists()
+
+
+def test_release_lease_faults_soft_when_the_unlink_itself_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    lease_path = _seed_lease(tmp_path)
+    real_unlink = Path.unlink
+
+    def _flaky_unlink(self: Path, *args: Any, **kwargs: Any) -> None:
+        if self == lease_path:
+            raise OSError('simulated permission error')
+        real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'unlink', _flaky_unlink)
+
+    with caplog.at_level(logging.ERROR):
+        result = sr.release_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
+
+    # Fail-soft: a lease-substrate fault never raises into a watcher's loop.
+    assert result is sr.LeaseMutation.FAULTED
+    assert lease_path.is_file()
+    assert any(r.levelno >= logging.ERROR for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
