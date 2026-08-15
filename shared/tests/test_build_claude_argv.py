@@ -10,8 +10,8 @@ from pathlib import Path
 
 from shared.cli_invoke import (
     _REAL_BUILTIN_TOOLS_DENYLIST,
-    NO_MCP_SERVERS_CONFIG,
     build_claude_argv,
+    no_mcp_servers_config,
 )
 
 _TMP_PLACEHOLDER = '<TMP>'
@@ -368,7 +368,7 @@ def test_build_claude_argv_strict_mcp_config_noop_without_mcp_config() -> None:
 
 
 def test_no_mcp_servers_config_is_truthy_and_emits_strict_flag() -> None:
-    """NO_MCP_SERVERS_CONFIG is a TRUTHY zero-server scoping config, so a
+    """no_mcp_servers_config() is a TRUTHY zero-server scoping config, so a
     wildcard-deny caller under an output_schema still gets --strict-mcp-config.
 
     The wildcard expansion above (``output_schema and '*' in disallowed_tools``)
@@ -377,10 +377,13 @@ def test_no_mcp_servers_config_is_truthy_and_emits_strict_flag() -> None:
     tools reachable unless it ALSO strict-scopes its MCP servers — and the
     ``--strict-mcp-config`` emit is gated on ``if mcp_config:``, so a bare
     ``{}`` would silently no-op and reinstate the hole while looking correct.
-    Hence the truthiness assertion is load-bearing, not decorative.
+    The argv assertion below is what catches that: an empty config emits
+    NEITHER flag.
     """
-    assert NO_MCP_SERVERS_CONFIG, 'must stay TRUTHY — a bare {} silently no-ops the strict flag'
-    assert NO_MCP_SERVERS_CONFIG == {'mcpServers': {}}
+    assert no_mcp_servers_config() == {'mcpServers': {}}
+    # A fresh dict per call, so no caller can widen the server set for every
+    # other consumer by mutating shared module-level state in place.
+    assert no_mcp_servers_config() is not no_mcp_servers_config()
 
     cmd, temp_files = build_claude_argv(
         model='opus',
@@ -390,7 +393,7 @@ def test_no_mcp_servers_config_is_truthy_and_emits_strict_flag() -> None:
         permission_mode='bypassPermissions',
         allowed_tools=None,
         disallowed_tools=['*'],
-        mcp_config=NO_MCP_SERVERS_CONFIG,
+        mcp_config=no_mcp_servers_config(),
         output_schema={'type': 'object'},
         effort=None,
         resume_session_id=None,

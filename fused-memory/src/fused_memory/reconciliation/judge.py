@@ -9,12 +9,12 @@ from typing import Any, NoReturn
 
 from pydantic import ValidationError
 from shared.cli_invoke import (
-    NO_MCP_SERVERS_CONFIG,
     AgentFailureKind,
     AllAccountsCappedException,
     build_failure_message,
     classify_agent_failure,
     invoke_with_cap_retry,
+    no_mcp_servers_config,
 )
 
 from fused_memory.config.schema import ReconciliationConfig
@@ -615,7 +615,7 @@ Review this run and provide your verdict as JSON.
         to stay in sync with the CLI's built-ins and would skip future central
         fixes.
 
-        MCP tools are closed SEPARATELY, by ``mcp_config=NO_MCP_SERVERS_CONFIG``
+        MCP tools are closed SEPARATELY, by ``mcp_config=no_mcp_servers_config()``
         + ``strict_mcp_config=True``.  The wildcard expansion above covers
         built-ins ONLY — it carries no MCP tool pattern — so it does NOT deny MCP
         tools, and ``cwd`` here is the project root, which holds a live
@@ -643,7 +643,7 @@ Review this run and provide your verdict as JSON.
                 # Closes MCP separately from the wildcard deny above, which the
                 # schema expands into a BUILT-INS-ONLY list. See the docstring:
                 # must stay truthy, or --strict-mcp-config is never emitted.
-                mcp_config=NO_MCP_SERVERS_CONFIG,
+                mcp_config=no_mcp_servers_config(),
                 strict_mcp_config=True,
                 # See _JUDGE_CLI_MAX_TURNS: 1 is incompatible with --json-schema
                 # (the schema mechanism burns a tool-use turn — see
