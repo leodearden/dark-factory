@@ -1143,6 +1143,71 @@ def test_host_load_poller_declares_a_named_interval() -> None:
     )
 
 
+def test_slowest_client_poll_is_derived_from_every_registered_poller() -> None:
+    """The keep-alive floor must come from the SLOWEST poller, not from data.js.
+
+    CLIENT_POLLERS is the explicit statement of which recurring HTTP pollers the
+    keep-alive bound covers, and _slowest_client_poll_ms() reduces it with max()
+    — because each poller independently reuses its own connection at its own
+    interval, so a bound that clears only the fastest one still closes the
+    slower socket in the gap between its polls.
+
+    The registry gets the same staleness guard as
+    test_registry_keys_are_all_declared_in_the_committed_units in
+    tests/scripts/test_check_dashboard_unit_parity.py: every registered path must
+    exist and every registered constant must still parse, so a moved file or a
+    renamed constant fails loudly here instead of silently dropping a poller out
+    of the max and quietly lowering the floor.
+
+    The last assertion pins the defect this task exists to remove: the slowest
+    poller must be strictly slower than data.js's, proving the registry has not
+    collapsed back to a single entry.  It had exactly one for the whole life of
+    the keep-alive invariant, while a 5s /api/load poller sat unnoticed on the
+    boundary.
+    """
+    registered = {(entry.path, entry.const_name) for entry in CLIENT_POLLERS}
+    assert (POLL_JS, "POLL_INTERVAL_MS") in registered, (
+        "data.js's main data refresh is missing from CLIENT_POLLERS; the "
+        "keep-alive floor would stop covering it."
+    )
+    assert (LOAD_POLL_JSX, "LOAD_POLL_INTERVAL_MS") in registered, (
+        "tab_overview.jsx's /api/load host-load poll is missing from "
+        "CLIENT_POLLERS. It is an independent recurring HTTP poller and holds "
+        "its own keep-alive connection, so the floor must clear it too."
+    )
+
+    periods = []
+    for entry in CLIENT_POLLERS:
+        assert entry.path.is_file(), (
+            f"CLIENT_POLLERS registers {entry.path} ({entry.what}) but that file "
+            "does not exist. Update the registry entry rather than leaving a "
+            "poller silently uncovered by the keep-alive floor."
+        )
+        period = _parse_poll_interval_ms(
+            entry.path.read_text(encoding="utf-8"),
+            str(entry.path),
+            const_name=entry.const_name,
+        )
+        assert period > 0
+        periods.append(period)
+
+    assert _slowest_client_poll_ms() == max(periods), (
+        "_slowest_client_poll_ms() must be the max over every registered "
+        f"poller; got {_slowest_client_poll_ms()} against {periods}."
+    )
+
+    data_js_ms = _parse_poll_interval_ms(
+        POLL_JS.read_text(encoding="utf-8"), str(POLL_JS)
+    )
+    assert _slowest_client_poll_ms() > data_js_ms, (
+        f"The slowest registered poller ({_slowest_client_poll_ms()}ms) is not "
+        f"strictly slower than data.js's {data_js_ms}ms poll, so the registry "
+        "has effectively collapsed back to the single-poller derivation this "
+        "guard exists to prevent. tab_overview.jsx polls /api/load every 5000ms "
+        "and must be part of the max."
+    )
+
+
 def test_shutdown_drain_is_bounded_in_both_unit_files() -> None:
     """Both unit files must bound uvicorn's drain below systemd's SIGKILL deadline.
 
