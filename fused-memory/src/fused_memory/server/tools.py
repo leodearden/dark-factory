@@ -3656,11 +3656,16 @@ def create_mcp_server(
             ``{'found': True, 'memory_id', 'project_id', 'content', 'metadata'}``
             on a hit (``metadata`` is the full raw Qdrant payload); ``{'found':
             False, 'memory_id', 'project_id'}`` on a genuine miss — plus
-            ``'tombstone': {'deleter', 'deleting_run_id', 'deleted_at', victim
+            ``'tombstone': {'deleter', 'deleting_run_id', 'deleted_at',
+            'absorbed_by', victim
             'kind'/'record_type'/'source'/'recon_pool'/'run_id'/'created_at',
             'tombstone_created_at', 'tombstone_expires_at'}`` when the record
             was deliberately reaped; or ``{'error', 'error_type'}`` on a
-            backend failure.
+            backend failure. ``absorbed_by`` (task 3133) is the surviving
+            canonical id that folded this record in — the REVERSE pointer,
+            and the field that answers "where did its content go?" from the
+            dead id alone. It is ``None`` for a GC/trim sweep, which absorbs
+            nothing into anything.
         """
         project_id, err = _canonicalize_project_id_arg(project_id)
         if err:
