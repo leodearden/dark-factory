@@ -419,6 +419,51 @@ class TestScopedCapHitReleasesProbeSlot:
         assert acct.near_cap is True
         assert acct.phase == AccountPhase.AVAILABLE
 
+    # --- the same strand on the second entry point, detect_cap_hit ---------
+
+    async def test_scoped_detect_cap_hit_releases_probe_and_leaves_account_selectable(
+        self,
+    ):
+        gate = make_gate(['a'])
+        acct, slot = await _probe_in_flight_slot(gate, scope=SCOPE)
+
+        assert slot.detect_cap_hit(CAP_STDERR, '') is True
+
+        assert slot._settled is True
+        assert acct.scope_caps[SCOPE].capped is True  # S5 attribution preserved
+        assert acct.phase == AccountPhase.AVAILABLE
+        assert gate._open.is_set() is True
+
+        lease = await asyncio.wait_for(gate.before_invoke(), timeout=1.0)
+        assert lease is not None
+        assert lease.name == 'a'
+
+    async def test_unscoped_detect_cap_hit_still_caps_account(self):
+        gate = make_gate(['a'])
+        acct, slot = await _probe_in_flight_slot(gate, scope=None)
+
+        assert slot.detect_cap_hit(CAP_STDERR, '') is True
+
+        assert acct.phase == AccountPhase.CAPPED
+        assert acct.scope_caps == {}
+        assert gate._open.is_set() is False
+
+    async def test_near_cap_via_detect_cap_hit_releases_probe(self):
+        """``_handle_near_cap_warning`` never transitions phase in EITHER scope,
+        so this arm strands an UNSCOPED near-cap too — the same invariant."""
+        gate = make_gate(['a'])
+        acct, slot = await _probe_in_flight_slot(gate, scope=None)
+
+        assert slot.detect_cap_hit(NEAR_CAP_STDERR, '') is True
+
+        assert acct.near_cap is True  # annotation kept (clear_near_cap=False)
+        assert acct.phase == AccountPhase.AVAILABLE
+        assert gate._open.is_set() is True
+
+        lease = await asyncio.wait_for(gate.before_invoke(), timeout=1.0)
+        assert lease is not None
+        assert lease.name == 'a'
+
 
 # ===========================================================================
 # Step 7 — end-to-end β: invoke_with_cap_retry derives + threads scope
