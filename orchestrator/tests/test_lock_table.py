@@ -871,6 +871,37 @@ class TestTryAcquireAdmittedParks:
             'C', ['m1', 'm2'], admitted_parks=frozenset({'P'})
         ) is False
 
+    def test_lock_expansion_still_refuses_a_foreign_park(self):
+        """Plan-refinement lock EXPANSION is not a backfill path.
+
+        C7 anchors on the dispatch scan.  An in-flight task widening its lock
+        set has no admission decision behind it — no predicted-hold check, no
+        safety factor, no park-age cutoff — so it must keep refusing parks
+        unconditionally, with no bypass of any name available to it.
+
+        Stated behaviourally rather than by asserting on
+        ``try_acquire_additional``'s parameter names: renaming the kwarg would
+        leave a name assertion green with the bypass fully present, and a
+        harmless ``**kwargs`` refactor would fail it while nothing changed.
+        """
+        # Positive control FIRST, on its own table: with m2 free the expansion
+        # succeeds, so the refusal below is attributable to the park and not
+        # to a setup that could never have expanded at all.
+        control = _lt()
+        assert control.try_acquire('C', ['m1'])
+        assert control.try_acquire_additional('C', ['m2']) is True
+        assert control._held['C'] == {'m1', 'm2'}
+
+        lt = _lt()
+        assert lt.try_acquire('C', ['m1']), 'C must hold an adjacent module first'
+        lt.install_parks('P', ['m2'], priority='medium')
+
+        assert lt.try_acquire_additional('C', ['m2']) is False
+        assert lt._held['C'] == {'m1'}, (
+            'the expansion was refused but something was acquired anyway — '
+            'try_acquire_additional must refuse before mutating _held'
+        )
+
     def test_try_acquire_additional_has_no_admitted_parks(self):
         """Plan-refinement lock EXPANSION is not a backfill path.
 
