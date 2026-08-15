@@ -331,11 +331,13 @@ def _judged_without_reference(metrics: dict[str, Any]) -> bool | None:
 
     The rule is deliberately the SAME one
     ``scripts/run_fable_trial_v2_campaign.py`` (task 3632) states as its rule
-    3 and enforces with ``MARKER_KEY not in metrics`` — its
-    ``count_judged_without_reference`` returns ``None``, never ``0``, for a
-    candidate with even one keyless architect cell. Two consumers of one field
-    must not answer the same question differently, least of all with the report
-    — the surface an operator actually reads — giving the reassuring answer.
+    3 and enforces with ``MARKER_KEY not in metrics``. That script no longer
+    counts the marker itself — its per-candidate counter was retired in favour
+    of this module's architect-only aggregate (see :func:`_judged_blind_count`),
+    so the two surfaces now share ONE implementation of the rule rather than
+    two agreeing copies. Two readings of one field must not answer the same
+    question differently, least of all with the report — the surface an
+    operator actually reads — giving the reassuring answer.
     It is also the same discipline :func:`_plan_quality_score` applies at READ
     time for the no-plan floor, and for the same reason: the old corpus is
     already on disk.
@@ -349,10 +351,11 @@ def _judged_blind_count(counted: int, unmeasured: int) -> int | None:
     """Fold a per-config tally into a count, or ``None`` when ANY cell is keyless.
 
     The aggregate twin of :func:`_judged_without_reference`: one unmeasured
-    cell makes the whole config's count unknowable, exactly as task 3632's
-    ``count_judged_without_reference`` decides it per candidate. Reporting the
-    measured cells' count instead would understate the bound while looking like
-    a complete answer.
+    cell makes the whole config's count unknowable. This IS the count task
+    3632's campaign script consumes — its own per-candidate counter was retired
+    in favour of this one, so the rule has a single home. Reporting the measured
+    cells' count instead would understate the bound while looking like a
+    complete answer.
     """
     return None if unmeasured else counted
 

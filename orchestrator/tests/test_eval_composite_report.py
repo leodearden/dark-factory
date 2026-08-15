@@ -562,8 +562,9 @@ class TestBuildCompositeReport:
         The composite row is the surface ``select_survivors`` ranks on, so a
         fabricated 0 here reads as "this candidate's plan_quality was fully
         validity-bounded" for a corpus in which nothing bounded it — the same
-        inversion task 3632's ``count_judged_without_reference`` refuses per
-        candidate (reviewer: architecture-coherence).
+        inversion ``report._judged_blind_count`` refuses per config, and which
+        task 3632's campaign script inherits by consuming that count rather
+        than deriving its own (reviewer: architecture-coherence).
         """
         from orchestrator.evals.report import build_composite_report
 

@@ -185,8 +185,9 @@ class TestEvalMetricsInvocationErrorField:
         Load-bearing cross-consumer contract (task 3628 σ → task 3632):
         ``scripts/run_fable_trial_v2_campaign.py`` decides per-cell reference
         validity by KEY PRESENCE — its ``MARKER_KEY not in metrics`` means "not
-        known-good", never False, and ``count_judged_without_reference``
-        returns None for any candidate with even one keyless cell. If this key
+        known-good", never False, and the count it consumes from
+        ``report._judged_blind_count`` is None for any config with even one
+        keyless cell. If this key
         were emitted only when True (a conditional dict update, or filtering
         falsy fields out of the persisted dict), every HEALTHY cell would be
         indistinguishable from a pre-σ one and that consumer would report None
@@ -3388,9 +3389,9 @@ class TestPlanQualityReport:
         many of its scores were judged blind — it can only report that it does
         not know. Reporting the measured ones' count (here 1) would understate
         the bound while wearing the appearance of a complete answer. This is
-        ``count_judged_without_reference``'s per-candidate rule (task 3632)
-        applied per config, so the two consumers of one field answer the same
-        question identically.
+        ``report._judged_blind_count``'s rule, which task 3632's campaign
+        script consumes rather than re-deriving, so the two surfaces of one
+        field answer the same question identically.
         """
         from orchestrator.evals.report import build_plan_quality_report
 
