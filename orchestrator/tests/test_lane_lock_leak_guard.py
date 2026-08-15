@@ -2325,6 +2325,100 @@ class TestContendedRaiseSurvivesALossyHolderRead:
             f'{str(excinfo.value)!r}'
         )
 
+    # -- the LEASE site (task 3783 step-5) ---------------------------------
+    #
+    # `merge_verify_lease` is a SEPARATE raise site with its own bounded-wait
+    # constant and its own byte-identical one-shot read, so the reset-site fix
+    # above cannot vouch for it.  Both properties are re-pinned here rather
+    # than assumed: the two sites have drifted apart before (task 3003 gave
+    # the reset its own constant), and this pair is exactly the kind that
+    # silently diverges when only one of them has a test.
+
+    async def test_the_lease_contended_raise_also_names_the_foreign_holder(
+        self, real_git_ops, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """The lease's contended raise must survive the same lossy read.
+
+        Same defect, same staging, different call site — and the lease is the
+        one whose refusal DEFERS a 1--2h verify, so its message is what an
+        operator reads when the merge queue stalls.  The body must never run:
+        a lease that never took the lock cannot protect the window it exists
+        to protect (task 2828 limb 2).
+
+        RED before task 3783: the one-shot read at the lease site degrades the
+        clause to "no FLOCK holder" exactly as the reset site did.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+
+        monkeypatch.setattr(git_ops_mod, '_MERGE_VERIFY_LEASE_WAIT_SECS', 1)
+
+        lock_path = lane_lock_path(real_git_ops.persistent_merge_worktree_path)
+
+        with foreign_lane_lock_holder(lock_path) as (child, holders):
+            assert child.pid in holders, (
+                f'staging error: the fixture must have settled a genuine '
+                f'foreign attribution before the lossy read is injected; '
+                f'observed holders={holders!r}'
+            )
+            monkeypatch.setattr(
+                git_ops_mod,
+                'lane_lock_holder_pids',
+                _first_read_is_lossy(git_ops_mod.lane_lock_holder_pids),
+            )
+
+            with pytest.raises(MergeVerifyLeaseContended) as excinfo:
+                async with real_git_ops.merge_verify_lease():
+                    pytest.fail(
+                        'the lease body must never run while the lane lock is '
+                        'held by a foreign process — that is the unprotected '
+                        '1-2h verify window task 2828 closed'
+                    )
+
+            assert str(child.pid) in str(excinfo.value), (
+                f'the lease timeout must also name the kernel-reported '
+                f'holder; a lossy first read must not be what an operator '
+                f'sees when the merge queue stalls; got {str(excinfo.value)!r}'
+            )
+
+    async def test_the_lease_degrades_fail_safe_on_a_permanently_empty_read(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """FAIL-SAFE at the lease site: the refusal's SHAPE cannot change.
+
+        The lease-site counterpart of
+        `test_a_permanently_unreadable_holder_set_still_raises_contended`, and
+        green before and after.  It additionally guards the rendezvous: a
+        lease that never acquired must not record itself as the holder, or it
+        would corrupt the very liveness signal layer (3) of the leak predicate
+        reads.  The new await sits between the timed-out acquire and the
+        raise, so this pins that it can neither leave a rendezvous behind nor
+        let the body run.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+
+        git_ops = _git_ops(tmp_path)
+        monkeypatch.setattr(
+            git_ops_mod, 'acquire_merge_verify_flock', lambda *a, **k: None,
+        )
+        monkeypatch.setattr(
+            git_ops_mod, 'lane_lock_holder_pids', lambda path: [],
+        )
+        monkeypatch.setattr(git_ops_mod, '_LANE_LOCK_HOLDER_SETTLE_SECS', 0.05)
+
+        entered = False
+        with pytest.raises(MergeVerifyLeaseContended) as excinfo:
+            async with git_ops.merge_verify_lease():
+                entered = True
+
+        assert type(excinfo.value) is MergeVerifyLeaseContended, (
+            f'an unknown holder set must stay ordinary contention at the '
+            f'lease site too; got {type(excinfo.value).__name__}'
+        )
+        assert not entered, 'the lease body must NOT run on a contended flock'
+        assert read_lock_holder_pgid(git_ops.worktree_base) is None, (
+            'a lease that never acquired must not record itself as the holder'
+        )
+
 
 # ---------------------------------------------------------------------------
 # Step-7 (B12): a CANCELLED acquire must never orphan the lane lock.
