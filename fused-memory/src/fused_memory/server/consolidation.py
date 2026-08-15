@@ -231,6 +231,7 @@ def build_consolidation_result(
     reparented: list[dict[str, Any]] | None = None,
     reparent_failures: list[dict[str, Any]] | None = None,
     topic_members: list[Any] | None = None,
+    topic_members_total: int | None = None,
     topic_members_truncated: bool = False,
     citation_repoint: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -263,6 +264,7 @@ def build_consolidation_result(
     open_business = (
         failed_deletes or retain_failures or reparent_failures or survivors
     )
+    members = list(topic_members or [])
     result: dict[str, Any] = {
         'status': 'partial' if open_business else 'consolidated',
         'canonical_id': canonical_id,
@@ -274,7 +276,13 @@ def build_consolidation_result(
         'reparented': list(reparented or []),
         'reparent_failures': reparent_failures,
         'survivors': survivors,
-        'topic_members': list(topic_members or []),
+        'topic_members': members,
+        # Disclosed unconditionally, next to the listing it qualifies: a
+        # capped scroll that reported only its rows would read as the whole
+        # closure, which is the overclaim this op exists to eliminate.
+        'topic_members_total': (
+            len(members) if topic_members_total is None else topic_members_total
+        ),
         'topic_members_truncated': bool(topic_members_truncated),
     }
     if citation_repoint:

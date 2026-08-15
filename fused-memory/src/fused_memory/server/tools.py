@@ -4461,6 +4461,17 @@ def create_mcp_server(
         dangling-citation escape is offered; the reachable refusal is a scan
         that could not be completed, which fails closed.
 
+        Step (6) is deterministic Qdrant work ONLY: a ``get_memory_by_id``
+        point read per supersede for ``survivors``, and one
+        ``get_memories_by_metadata({'topic': T})`` scroll for the closure
+        listing. ``MemoryService.search`` is never called, and a test pins
+        that negative. A semantic top-k probe would re-assert the ranking
+        premise this whole campaign exists to fix — run live during the
+        original incident, the re-derive query returned only superseded
+        cluster members — and it could silently omit the canonical this call
+        just wrote. Retrievability monitoring is a separate job; a closure
+        proof must not be a ranking guess.
+
         Args:
             canonical_content: The consolidated record's text — the single
                 claim the surviving canonical will state.
@@ -4697,7 +4708,6 @@ def create_mcp_server(
                     'error': rejection.get('error'),
                     'error_type': rejection.get('error_type'),
                 })
-                survivors.append(supersede_id)
                 continue
             try:
                 await memory_service.delete_memory(
@@ -4725,9 +4735,29 @@ def create_mcp_server(
                     'error': str(exc),
                     'error_type': type(exc).__name__,
                 })
-                survivors.append(supersede_id)
                 continue
             deleted.append(supersede_id)
+
+        # (6) CORROBORATE. `survivors` is derived HERE and only here — from a
+        # live point read per supersede, never from what the deletes
+        # reported. Both asymmetric cases follow from that and neither is
+        # expressible any other way:
+        #
+        #   delete said 'deleted', id still resolves -> SURVIVOR. Nothing
+        #       refused, so there is no failure to count; this is the
+        #       silent-fail-soft the ratchet was made of.
+        #   delete RAISED, id no longer resolves     -> not a survivor. The
+        #       failure is real and reported, the survival is not, and
+        #       listing it would send an operator chasing nothing.
+        #
+        # Every supersede is re-read, including the ones whose delete was
+        # never attempted: "we did not try" is a claim about this call, not
+        # about the corpus.
+        for supersede_id in supersedes_ids:
+            if await memory_service.get_memory_by_id(
+                project_id=project_id, memory_id=supersede_id
+            ):
+                survivors.append(supersede_id)
 
         # (6) The closure listing comes from the deterministic scroll, NOT
         # `search`. A ranked top-N read can silently omit the canonical this
@@ -4756,6 +4786,7 @@ def create_mcp_server(
             failed_deletes=failed_deletes,
             survivors=survivors,
             topic_members=topic_members,
+            topic_members_total=total,
             topic_members_truncated=total > returned,
             citation_repoint=citation_repoint,
         )
