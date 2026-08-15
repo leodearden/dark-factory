@@ -759,6 +759,32 @@ def _slowest_client_poll_ms() -> int:
     return _slowest_client_poll()[0]
 
 
+# Recurring client timers that are deliberately NOT pollers, keyed on
+# (relpath, period-text) with the reason they are exempt.
+#
+# ENTRY CRITERION — the timer must open NO network connection.  If it fetches
+# anything it belongs in CLIENT_POLLERS instead, because it then independently
+# holds a keep-alive socket and reuses it at its own interval, which is exactly
+# what the --timeout-keep-alive floor has to clear.  Parking a real poller here
+# would silence the guard while re-creating the bug it exists to catch.
+#
+# Entries are checked for staleness too: one that matches no live call site is
+# reported by test_every_client_setinterval_is_registered_or_allowlisted, so the
+# allowlist cannot quietly rot into a no-op.
+NON_POLLING_TIMERS: dict[tuple[str, str], str] = {
+    ("redux/app.jsx", "1000"): (
+        "App-wide clock tick: setInterval(() => setNow(new Date()), 1000) only "
+        "advances React state so rendered times refresh. No fetch, no "
+        "connection."
+    ),
+    ("redux/shell.jsx", "2000"): (
+        "LiveFeed re-tick: setInterval(() => tick(n => n + 1), 2000) re-renders "
+        "the relative `timeago` strings from the already-fetched window.DF_DATA "
+        "even when it has not changed. Issues no request."
+    ),
+}
+
+
 # Matches a `//` line comment or a `/* ... */` block comment.  Block first, so a
 # `//` inside a block does not end the line-comment match early.
 _JS_COMMENT_RE = re.compile(r"/\*.*?\*/|//[^\n]*", re.DOTALL)
