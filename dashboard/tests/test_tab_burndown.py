@@ -30,6 +30,11 @@ def app_jsx_body(_client):
     return _client.get('/static/redux/app.jsx').text
 
 
+@pytest.fixture(scope='module')
+def charts_jsx_body(_client):
+    return _client.get('/static/redux/charts.jsx').text
+
+
 # ---------------------------------------------------------------------------
 # Chart labels/values pairing probe
 # ---------------------------------------------------------------------------
@@ -43,12 +48,25 @@ def app_jsx_body(_client):
 #
 # Matching is by EXPRESSION CONTENT, never by line number: these shift whenever
 # an unrelated tab earlier in the file is edited.
+#
+# The scan is INVERTED — it starts from every `labels={...}` prop in the file and
+# derives the component that prop sits on, rather than sweeping a hardcoded list
+# of chart tags.  So a chart added later with a component this file does not use
+# today is covered automatically, and a labels prop whose enclosing tag is not a
+# window.DF_CHARTS component fails the vacuity check rather than silently
+# dropping out of the sweep.
 
-_TAG_RE = re.compile(r'<(SA|LC|BC)\b')
+_LABELS_PROP_RE = re.compile(r'\blabels=\{')
 _LABELS_RE = re.compile(r'labels=\{([^{}]+)\}')
 _VALUES_RE = re.compile(r'values[:=]\s*\{?([^,}\n]+)')
+_TAG_START_RE = re.compile(r'<([A-Za-z_$][\w$]*)')
+# Any tag start or end inside an element's attribute list means the element is
+# not flat self-closing, so a regex chunk cannot be attributed to it safely.
+_TAG_BOUNDARY_RE = re.compile(r'</?[A-Za-z_$]')
 # A trailing call suffix such as `.map(String)` is presentation, not series identity.
 _CALL_SUFFIX_RE = re.compile(r'\.\w+\([^()]*\)$')
+_DF_CHARTS_DESTRUCTURE_RE = re.compile(r'const\s*\{([^{}]*)\}\s*=\s*window\.DF_CHARTS')
+_DF_CHARTS_EXPORT_RE = re.compile(r'window\.DF_CHARTS\s*=\s*\{([^{}]*)\}')
 
 
 def _series_root(expr):
@@ -65,23 +83,87 @@ def _series_root(expr):
     return expr.rsplit('.', 1)[0] if '.' in expr else expr
 
 
+def _chart_component_aliases(src):
+    """Map local JSX alias -> canonical name for everything pulled off DF_CHARTS.
+
+    Parsed out of tabs.jsx's own `const { StackedAreaChart: SA, ... } =
+    window.DF_CHARTS` line, so the known-component list is never a hardcoded
+    second copy that can drift from what the file actually renders.
+    """
+    m = _DF_CHARTS_DESTRUCTURE_RE.search(src)
+    if not m:
+        return {}
+    aliases = {}
+    for part in m.group(1).split(','):
+        part = part.strip()
+        if not part:
+            continue
+        canonical, _, alias = part.partition(':')
+        canonical = canonical.strip()
+        aliases[alias.strip() or canonical] = canonical
+    return aliases
+
+
+def _df_charts_exports(src):
+    """Names exported by charts.jsx's `window.DF_CHARTS = { ... }` line."""
+    m = _DF_CHARTS_EXPORT_RE.search(src)
+    if not m:
+        return set()
+    return {
+        part.split(':', 1)[0].strip()
+        for part in m.group(1).split(',')
+        if part.strip()
+    }
+
+
+def _element_at(src, pos):
+    """Return (tag, start) of the JSX element whose attribute list contains `pos`."""
+    cursor = pos
+    while True:
+        lt = src.rfind('<', 0, cursor)
+        if lt == -1:
+            raise AssertionError(
+                f'no enclosing JSX tag found for the prop at offset {pos} '
+                f'(line {src.count(chr(10), 0, pos) + 1})'
+            )
+        m = _TAG_START_RE.match(src, lt)
+        if m:
+            return m.group(1), lt
+        cursor = lt
+
+
 def _chart_sites(src):
-    """Return one record per chart element in the JSX source.
+    """Return one record per chart element — every element with a `labels` prop.
 
     Each record is a dict with `tag`, `labels_expr`, `labels_root`,
-    `values_exprs` and `values_roots`.  An element runs from its tag start to
-    the first `/>` after it — verified sufficient because no chart element body
-    in this file contains a nested self-closing tag.
+    `values_exprs` and `values_roots`.
+
+    An element runs from its tag start to the first `/>` after it.  That is only
+    a sound bound for a FLAT SELF-CLOSING element, so it is asserted rather than
+    assumed: if a chart is ever rewritten as `<LC ...>...</LC>` (say to nest a
+    legend), or a `<` otherwise appears in its attribute list, the chunk would
+    run past the element and silently attribute a DIFFERENT element's props to
+    it — a spurious failure, or worse a spurious pass.  Failing loudly on an
+    element this probe cannot parse is the safe direction.
     """
     sites = []
-    for m in _TAG_RE.finditer(src):
-        end = src.find('/>', m.start())
-        chunk = src[m.start():end + 2] if end != -1 else src[m.start():]
+    for lm in _LABELS_PROP_RE.finditer(src):
+        tag, start = _element_at(src, lm.start())
+        end = src.find('/>', start)
+        boundary = _TAG_BOUNDARY_RE.search(src, start + 1)
+        limit = boundary.start() if boundary else len(src)
+        assert end != -1 and end < limit, (
+            f'<{tag}> element at line {src.count(chr(10), 0, start) + 1} is not a '
+            'flat self-closing element, so this probe cannot attribute its props '
+            '(a following element\'s labels/values would be read as its own). '
+            'Teach _chart_sites to parse it rather than deleting the assertion.'
+        )
+        chunk = src[start:end + 2]
         labels_m = _LABELS_RE.search(chunk)
         labels_expr = labels_m.group(1).strip() if labels_m else None
         values_exprs = [v.strip() for v in _VALUES_RE.findall(chunk)]
         sites.append({
-            'tag': m.group(1),
+            'tag': tag,
             'labels_expr': labels_expr,
             'labels_root': _series_root(labels_expr) if labels_expr else None,
             'values_exprs': values_exprs,
@@ -134,7 +216,9 @@ class TestChartLabelValuePairing:
         """EVERY chart must read its labels and its values off the same object.
 
         This pins the defect CLASS, so the same mistake authored at a chart
-        added later to this file also fails.
+        added later to this file also fails — including one rendered with a
+        chart component this file does not use today, because the sweep starts
+        from labels props rather than from a fixed set of tags.
         """
         mismatched = [
             (s['tag'], s['labels_expr'], s['values_exprs'])
@@ -155,10 +239,45 @@ class TestChartLabelValuePairing:
         """
         sites = _chart_sites(tabs_jsx_body)
         assert len(sites) >= 8, f'expected >=8 chart sites, found {len(sites)}'
-        assert {s['tag'] for s in sites} == {'SA', 'LC', 'BC'}
+        # Only <SA> is asserted present — it is the chart type this module is
+        # about.  Pinning the exact tag SET would turn an unrelated, legitimate
+        # edit (dropping the last <BC> histogram, say) into a failure here that
+        # reads as a probe malfunction.
+        assert any(s['tag'] == 'SA' for s in sites), (
+            f'no <SA> site found — tags seen: {sorted({s["tag"] for s in sites})}'
+        )
         for s in sites:
             assert s['labels_expr'], f'no labels expression parsed for <{s["tag"]}> site'
             assert s['values_exprs'], f'no values expressions parsed for <{s["tag"]}> site'
+
+    def test_every_labels_prop_sits_on_a_chart_component(
+        self, tabs_jsx_body, charts_jsx_body
+    ):
+        """Every `labels={...}` prop must sit on a component from window.DF_CHARTS.
+
+        The pairing sweep above is only a class guarantee if the tag it derives
+        for each labels prop is really the chart component rendering it.  This
+        checks that derivation against tabs.jsx's own DF_CHARTS destructure,
+        cross-checked against what charts.jsx actually exports — so a labels
+        prop attributed to a `<div>` (the backwards walk mis-parsed) or to a
+        component that is not a chart fails here instead of passing quietly.
+        """
+        aliases = _chart_component_aliases(tabs_jsx_body)
+        assert aliases, (
+            'could not parse the `const { ... } = window.DF_CHARTS` destructure '
+            'in tabs.jsx — the probe has no known-component list to check against'
+        )
+        exported = _df_charts_exports(charts_jsx_body)
+        assert exported, 'could not parse `window.DF_CHARTS = { ... }` in charts.jsx'
+
+        unknown = sorted({
+            s['tag'] for s in _chart_sites(tabs_jsx_body)
+            if aliases.get(s['tag']) not in exported
+        })
+        assert not unknown, (
+            f'labels props found on non-chart components {unknown}; DF_CHARTS '
+            f'aliases in tabs.jsx: {sorted(aliases)}'
+        )
 
 
 # ---------------------------------------------------------------------------
