@@ -158,6 +158,39 @@ _FOREIGN_HOLDER_TEARDOWN_SECS = 5.0
 #: kernel attribution of the pid, not mere heldness of the lock.
 _FOREIGN_HOLDER_ATTRIBUTION_SECS = 12.0
 
+#: The ``child.wait(timeout=...)`` :func:`foreign_lane_lock_holder`'s
+#: ``_kill_group`` spends reaping the SIGKILLed child.  Unconditional on every
+#: exit path, so it is a term of both ceiling models below — named here rather
+#: than copied into them as a bare ``5.0`` so the fixture and the models cannot
+#: disagree about it (task 3783 review amendment).
+_FOREIGN_HOLDER_KILL_WAIT_SECS = 5.0
+
+#: The acquire wait a consumer shortens ``_RESET_WARM_LANE_LOCK_WAIT_SECS`` /
+#: ``_MERGE_VERIFY_LEASE_WAIT_SECS`` to before driving a contended raise INSIDE
+#: a ``with foreign_lane_lock_holder(...)`` block.  A term of the settle-bound
+#: ceiling model, and shared with those consumers so the model cannot silently
+#: stop describing them: shortening the acquire to, say, 5s in one test while
+#: the model still assumes 1s is exactly the drift task 3836 hit.
+#:
+#: NOT pinned by a regex scan of the two modules, deliberately: the two
+#: CANCELLATION consumers (``test_cancelled_merge_verify_lease_leaves_the_lane_free``,
+#: ``test_cancelled_reset_leaves_the_lane_free_and_the_tree_untouched``) set
+#: deliberately LONGER waits inside the same ``with`` block so the cancellation
+#: lands mid-acquire, and never reach the contended raise or its settle at all.
+#: A scan cannot tell those apart from a raise-driving consumer, so it would be
+#: red on correct code.
+_SHORTENED_ACQUIRE_WAIT_SECS = 1.0
+
+#: Fraction of the effective per-test timeout a wait stack may occupy.  SHARED
+#: by both ceiling invariants below, which bound different stacks against the
+#: same premise: no test in this module or its sibling consumer opts out with
+#: ``@pytest.mark.timeout``, so once a stack collides with the global timeout,
+#: pytest-timeout fires FIRST and — under ``timeout_method="thread"`` with
+#: ``--max-worker-restart=0`` — os._exit()s the xdist worker rather than
+#: failing cleanly.  The remaining 40% is headroom for the real-git fixture
+#: work sharing the same per-test budget.
+_CEILING_FRACTION = 0.6
+
 #: Bound on how long :func:`require_lane_lock_holders` retries an UNREADABLE
 #: kernel lock table before failing loudly.  Deliberately NOT the 30s
 #: spawn-latency class (_FOREIGN_HOLDER_*_SECS): this retries a procfs read,
@@ -246,7 +279,7 @@ def foreign_lane_lock_holder(
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(child.pid, signal.SIGKILL)
         with contextlib.suppress(subprocess.TimeoutExpired):
-            child.wait(timeout=5)
+            child.wait(timeout=_FOREIGN_HOLDER_KILL_WAIT_SECS)
 
     clean_exit = False
     try:
@@ -1071,47 +1104,27 @@ class TestSettledLaneLockHolderRead:
         """
         from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
 
-        global_timeout = _effective_per_test_timeout(pytestconfig)
-        if global_timeout is None:
-            orchestrator_pyproject = (
-                Path(__file__).resolve().parents[1] / 'pyproject.toml'
-            )
-            governing_inifile = pytestconfig.inipath
-            if (
-                governing_inifile is not None
-                and governing_inifile.resolve() == orchestrator_pyproject
-            ):
-                pytest.fail(
-                    f'{governing_inifile} is the governing inifile for this run, '
-                    f'yet no per-test timeout is in effect (checked --timeout, '
-                    f'PYTEST_TIMEOUT, and [tool.pytest.ini_options].timeout) — '
-                    f'this is a genuine regression: the pytest-timeout / '
-                    f'os._exit() premise the settle bound is sized against no '
-                    f'longer holds. Either restore the timeout key or re-derive '
-                    f'the bound without it.'
-                )
-            pytest.skip(
-                f'no per-test timeout is in effect under the governing inifile '
-                f'{governing_inifile!r} — this is not {orchestrator_pyproject}, '
-                f'so this is an invocation artifact (e.g. a root-bound run), '
-                f'not drift; the pytest-timeout ceiling this invariant checks '
-                f'does not apply to this run'
-            )
+        global_timeout = _require_effective_per_test_timeout(
+            pytestconfig, premise='the settle bound',
+        )
 
         settle = git_ops_mod._LANE_LOCK_HOLDER_SETTLE_SECS
-        # 5.0 = the _kill_group kill-wait (child.wait(timeout=5)); 1.0 = the
-        # monkeypatched _RESET_WARM_LANE_LOCK_WAIT_SECS /
-        # _MERGE_VERIFY_LEASE_WAIT_SECS every such consumer shortens the
-        # acquire to before driving the contended raise.
+        # Every term is the SAME symbol its owner uses (task 3783 review
+        # amendment): the kill-wait is what `_kill_group` passes to
+        # `child.wait`, and the shortened acquire is what the raise-driving
+        # consumers monkeypatch _RESET_WARM_LANE_LOCK_WAIT_SECS /
+        # _MERGE_VERIFY_LEASE_WAIT_SECS to — so a consumer that lengthens
+        # either one cannot leave this model silently describing something
+        # else.
         consumer_stack = (
             _FOREIGN_HOLDER_STARTUP_SECS
             + _FOREIGN_HOLDER_ATTRIBUTION_SECS
             + _FOREIGN_HOLDER_TEARDOWN_SECS
-            + 5.0
-            + 1.0
+            + _FOREIGN_HOLDER_KILL_WAIT_SECS
+            + _SHORTENED_ACQUIRE_WAIT_SECS
             + settle
         )
-        ceiling = 0.6 * global_timeout
+        ceiling = _CEILING_FRACTION * global_timeout
         assert consumer_stack <= ceiling, (
             f'a consumer driving a contended raise inside '
             f'foreign_lane_lock_holder now pays the production settle bound '
@@ -1119,8 +1132,11 @@ class TestSettledLaneLockHolderRead:
             f'worst case of {consumer_stack}s '
             f'({_FOREIGN_HOLDER_STARTUP_SECS} startup + '
             f'{_FOREIGN_HOLDER_ATTRIBUTION_SECS} attribution + '
-            f'{_FOREIGN_HOLDER_TEARDOWN_SECS} teardown + 5.0 kill-wait + 1.0 '
-            f'shortened acquire wait + {settle} settle), which exceeds 60% of '
+            f'{_FOREIGN_HOLDER_TEARDOWN_SECS} teardown + '
+            f'{_FOREIGN_HOLDER_KILL_WAIT_SECS} kill-wait + '
+            f'{_SHORTENED_ACQUIRE_WAIT_SECS} shortened acquire wait + '
+            f'{settle} settle), which exceeds '
+            f'{_CEILING_FRACTION:.0%} of '
             f'the effective per-test timeout ({global_timeout}s, resolved from '
             f'{pytestconfig.inipath}) — only {ceiling}s is allowed. Task 3836 '
             f'documents that a bounded wait paid INSIDE the `with` block is '
@@ -1483,6 +1499,52 @@ def _effective_per_test_timeout(config) -> float | None:
     return None
 
 
+def _require_effective_per_test_timeout(config, *, premise: str) -> float:
+    """:func:`_effective_per_test_timeout`, or fail/skip if none is in effect.
+
+    Extracted (task 3783 review amendment) from the two ceiling invariants
+    below, which had grown byte-identical copies of this resolution differing
+    only in one clause of prose — and the sibling copy already carries a
+    hand-applied task-3836 amendment, which is precisely how two copies drift.
+
+    The fail-vs-skip split is the load-bearing part, and is why this cannot
+    just be ``_effective_per_test_timeout(config) or pytest.skip(...)``. When
+    ``orchestrator/pyproject.toml`` IS the governing inifile, a missing
+    per-test timeout means the pytest-timeout / os._exit() premise these
+    bounds are sized against has genuinely been removed — a regression, so it
+    FAILS. Under any other governing inifile (e.g. a root-bound run whose
+    pyproject.toml declares no ``timeout`` key) it is an invocation artifact
+    with nothing to say about the bounds, so it SKIPS, naming the inifile.
+
+    *premise* names what is sized against the timeout, for both messages.
+    """
+    timeout = _effective_per_test_timeout(config)
+    if timeout is not None:
+        return timeout
+
+    orchestrator_pyproject = Path(__file__).resolve().parents[1] / 'pyproject.toml'
+    governing_inifile = config.inipath
+    if (
+        governing_inifile is not None
+        and governing_inifile.resolve() == orchestrator_pyproject
+    ):
+        pytest.fail(
+            f'{governing_inifile} is the governing inifile for this run, yet '
+            f'no per-test timeout is in effect (checked --timeout, '
+            f'PYTEST_TIMEOUT, and [tool.pytest.ini_options].timeout) — this is '
+            f'a genuine regression: the pytest-timeout / os._exit() premise '
+            f'behind {premise} no longer holds. Either restore the timeout key '
+            f'or re-derive {premise} without it.'
+        )
+    pytest.skip(
+        f'no per-test timeout is in effect under the governing inifile '
+        f'{governing_inifile!r} — this is not {orchestrator_pyproject}, so '
+        f'this is an invocation artifact (e.g. a root-bound run), not drift; '
+        f'the pytest-timeout ceiling this invariant checks does not apply to '
+        f'this run'
+    )
+
+
 def _stub_pytest_config(
     *,
     cli_timeout: float | None,
@@ -1710,45 +1772,28 @@ def test_foreign_holder_bounds_stay_clear_of_the_global_pytest_timeout(pytestcon
     (``git_repo``/``real_git_ops``, ``_get_merge_commit``,
     ``reset_persistent_merge_worktree``) sharing the same per-test budget.
     """
-    global_timeout = _effective_per_test_timeout(pytestconfig)
-    if global_timeout is None:
-        orchestrator_pyproject = Path(__file__).resolve().parents[1] / 'pyproject.toml'
-        governing_inifile = pytestconfig.inipath
-        if governing_inifile is not None and governing_inifile.resolve() == orchestrator_pyproject:
-            pytest.fail(
-                f'{governing_inifile} is the governing inifile for this run, '
-                f'yet no per-test timeout is in effect (checked --timeout, '
-                f'PYTEST_TIMEOUT, and [tool.pytest.ini_options].timeout) — '
-                f'this is a genuine regression: the pytest-timeout / '
-                f'os._exit() premise the foreign-holder bounds in this '
-                f'module are sized against no longer holds. Either restore '
-                f'the timeout key or re-derive these bounds without it.'
-            )
-        pytest.skip(
-            f'no per-test timeout is in effect under the governing inifile '
-            f'{governing_inifile!r} — this is not {orchestrator_pyproject}, '
-            f'so this is an invocation artifact (e.g. a root-bound run), '
-            f'not drift; the pytest-timeout ceiling this invariant checks '
-            f'does not apply to this run'
-        )
+    global_timeout = _require_effective_per_test_timeout(
+        pytestconfig, premise='the foreign-holder bounds in this module',
+    )
 
-    # The _kill_group kill-wait (child.wait(timeout=5)) runs unconditionally
-    # on every exit path, in addition to the three named _FOREIGN_HOLDER_*
-    # bounds.
+    # The _kill_group kill-wait runs unconditionally on every exit path, in
+    # addition to the three named _FOREIGN_HOLDER_* bounds.
     unconditional_stack = (
         _FOREIGN_HOLDER_STARTUP_SECS
         + _FOREIGN_HOLDER_ATTRIBUTION_SECS
         + _FOREIGN_HOLDER_TEARDOWN_SECS
-        + 5.0
+        + _FOREIGN_HOLDER_KILL_WAIT_SECS
     )
-    ceiling = 0.6 * global_timeout
+    ceiling = _CEILING_FRACTION * global_timeout
     assert unconditional_stack <= ceiling, (
         f'the WORST-CASE unconditional wait stack inside '
         f'foreign_lane_lock_holder is {unconditional_stack}s '
         f'({_FOREIGN_HOLDER_STARTUP_SECS} startup + '
         f'{_FOREIGN_HOLDER_ATTRIBUTION_SECS} attribution + '
-        f'{_FOREIGN_HOLDER_TEARDOWN_SECS} teardown + 5.0 kill-wait), which '
-        f'exceeds 60% of the effective per-test timeout ({global_timeout}s, '
+        f'{_FOREIGN_HOLDER_TEARDOWN_SECS} teardown + '
+        f'{_FOREIGN_HOLDER_KILL_WAIT_SECS} kill-wait), which '
+        f'exceeds {_CEILING_FRACTION:.0%} of '
+        f'the effective per-test timeout ({global_timeout}s, '
         f'resolved from {pytestconfig.inipath}) — only {ceiling}s of '
         f'headroom is allowed. No test in this module, nor in the sibling '
         f'consumer test_merge_verify_lease_guard.py, opts out with '
@@ -2022,7 +2067,11 @@ class TestSelfOwnedLaneLockLeak:
         from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
         from orchestrator.git_ops import LaneLockSelfOwnedLeak  # noqa: PLC0415
 
-        monkeypatch.setattr(git_ops_mod, '_RESET_WARM_LANE_LOCK_WAIT_SECS', 1)
+        monkeypatch.setattr(
+            git_ops_mod,
+            '_RESET_WARM_LANE_LOCK_WAIT_SECS',
+            _SHORTENED_ACQUIRE_WAIT_SECS,
+        )
 
         commit_a = await _get_merge_commit(real_git_ops, 'leak-f1', 'leak_f1.py')
         await real_git_ops.reset_persistent_merge_worktree(commit_a)
@@ -2231,7 +2280,11 @@ class TestContendedRaiseSurvivesALossyHolderRead:
         """
         from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
 
-        monkeypatch.setattr(git_ops_mod, '_RESET_WARM_LANE_LOCK_WAIT_SECS', 1)
+        monkeypatch.setattr(
+            git_ops_mod,
+            '_RESET_WARM_LANE_LOCK_WAIT_SECS',
+            _SHORTENED_ACQUIRE_WAIT_SECS,
+        )
 
         commit_a = await _get_merge_commit(real_git_ops, 'lossy-a', 'lossy_a.py')
         await real_git_ops.reset_persistent_merge_worktree(commit_a)  # create-once
@@ -2283,7 +2336,11 @@ class TestContendedRaiseSurvivesALossyHolderRead:
         """
         from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
 
-        monkeypatch.setattr(git_ops_mod, '_RESET_WARM_LANE_LOCK_WAIT_SECS', 1)
+        monkeypatch.setattr(
+            git_ops_mod,
+            '_RESET_WARM_LANE_LOCK_WAIT_SECS',
+            _SHORTENED_ACQUIRE_WAIT_SECS,
+        )
 
         commit_a = await _get_merge_commit(real_git_ops, 'settle-a', 'settle_a.py')
         await real_git_ops.reset_persistent_merge_worktree(commit_a)  # create-once
@@ -2570,7 +2627,11 @@ class TestContendedRaiseSurvivesALossyHolderRead:
         """
         from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
 
-        monkeypatch.setattr(git_ops_mod, '_MERGE_VERIFY_LEASE_WAIT_SECS', 1)
+        monkeypatch.setattr(
+            git_ops_mod,
+            '_MERGE_VERIFY_LEASE_WAIT_SECS',
+            _SHORTENED_ACQUIRE_WAIT_SECS,
+        )
 
         lock_path = lane_lock_path(real_git_ops.persistent_merge_worktree_path)
 
