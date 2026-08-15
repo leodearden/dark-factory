@@ -9113,6 +9113,106 @@ class TestWithJunitxmlStr:
         assert [r.message for r in caplog.records if r.name == 'orchestrator.verify'] == []
 
 
+class TestSerialPytestStrRefusedRewriteIsLogged:
+    """_serial_pytest_str must RECORD a refused serial rewrite, not swallow it.
+
+    Task 4121, the "louder failure" half. ``verify_cmd``'s raw-chain appender
+    refuses outright when a pytest invocation's matched span ends inside an
+    unclosed quote (``pytest -k 'a && b' tests/`` — the quote-blind
+    ``_PYTEST_INVOCATION_RE`` stops at the ``&&`` INSIDE the ``-k`` quotes),
+    because anything appended there would land inside a live quoted argument
+    and silently run the wrong tests while still passing ``bash -n``.
+
+    Refusing is right, but a SILENT refusal is its own defect: the
+    ENV_TRANSIENT retry then re-runs the ORIGINAL command and fails for its
+    own reason, and an operator reading that log cannot tell "recovery ran
+    without its flags" from "recovery ran". One WARNING here makes the
+    difference legible.
+
+    Modelled test-for-test on ``TestWithJunitxmlStr`` above — this file's
+    established template for a ``*_str`` wrapper's capability-loss record —
+    so the two such records in verify.py's ``*_str`` family are pinned the
+    same way rather than each inventing its own assertion style.
+    """
+
+    _REFUSED = "pytest -k 'a && b' tests/ && true"
+
+    def test_refused_rewrite_returns_the_callers_own_string_and_logs_once(
+        self, caplog: pytest.LogCaptureFixture,
+    ):
+        from orchestrator.verify import _serial_pytest_str
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            result = _serial_pytest_str(self._REFUSED)
+
+        assert result is self._REFUSED, "the no-op must return the caller's own string"
+        records = [r for r in caplog.records if r.name == 'orchestrator.verify']
+        assert len(records) == 1, f'expected exactly one record, got {[r.message for r in records]}'
+        assert records[0].levelno == logging.WARNING
+        # Asserted on substance, not prose: the command must be quotable from
+        # the record, and a stable keyword must identify WHICH recovery was
+        # lost. Anchoring on the full sentence would make this a spelling test.
+        assert self._REFUSED in records[0].getMessage()
+        assert 'serial' in records[0].getMessage().lower()
+
+    @pytest.mark.parametrize(
+        'cmd',
+        [
+            'cd a && uv run pytest t1 && cd b && uv run pytest t2',
+            'uv run pytest tests/',
+            "pytest -k 'a && pytest b' tests/",
+            'ruff check src/',
+            'true',
+            None,
+        ],
+        ids=[
+            'successful-raw-chain-rewrite',
+            'successful-structured-rewrite',
+            'structured-despite-an-unspliceable-looking-span',
+            'non-pytest-ruff',
+            'opaque-true',
+            'none',
+        ],
+    )
+    def test_silent_on_the_ordinary_paths(
+        self, cmd: str | None, caplog: pytest.LogCaptureFixture,
+    ):
+        """No record for anything that is not an actual refusal.
+
+        The third case is why the gate must be STRUCTURAL rather than "does
+        this string contain an unspliceable span": ``pytest -k 'a && pytest
+        b' tests/`` parses with ``raw is None`` (measured), so it takes the
+        STRUCTURED path, never reaches the appender, and IS successfully
+        mutated via ``base_flags`` — a span-content gate would warn about a
+        command that lost nothing. The non-pytest and OPAQUE cases are
+        expected, benign no-ops; logging those would fire on every lint and
+        type leg and train operators to ignore the record.
+        """
+        from orchestrator.verify import _serial_pytest_str
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            _serial_pytest_str(cmd)
+
+        assert [r.message for r in caplog.records if r.name == 'orchestrator.verify'] == []
+
+    def test_serial_recovery_still_works_on_the_live_fleet_test_command(self):
+        """Guard that this change did not disable serial recovery generally.
+
+        Reads the committed corpus rather than a hand-copied literal, so a
+        refusal that started over-firing on the fleet's real ``test_command``
+        fails here instead of silently costing every ENV_TRANSIENT retry its
+        flags.
+        """
+        from _verify_config_corpus import ROOT_TEST_COMMAND
+
+        from orchestrator.verify import _serial_pytest_str
+
+        result = _serial_pytest_str(ROOT_TEST_COMMAND)
+        assert result is not None
+        assert result is not ROOT_TEST_COMMAND
+        assert 'no:xdist' in result
+
+
 # ---------------------------------------------------------------------------
 # task 3173 step-7: the two paths that would otherwise ERASE the kill signal
 # after `_summarize_checks` (step-6) correctly recorded it.
