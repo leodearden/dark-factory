@@ -947,6 +947,68 @@ class TestMalformedDeclarationIsRejectedLoudly:
             Referent(kind='task', project_id='taskmaster', number='2500'),
         )
 
+    @pytest.mark.parametrize(
+        'project_id',
+        ['   ', 'foo bar', '..', 'x;y', 'a\nb', '`id`', "it's"],
+        ids=[
+            'whitespace-only',
+            'embedded-space',
+            'dot-dot',
+            'semicolon',
+            'newline',
+            'backtick',
+            'quote',
+        ],
+    )
+    def test_a_charset_invalid_project_id_is_refused(self, project_id):
+        """``canonicalize_project_id`` is a NORMALIZER, not a validator — it
+        says so itself and defers the charset allowlist to
+        ``validate_project_id``. Without that second call each of these minted
+        a foreign referent naming a project that cannot exist ('   ' ->
+        node_name '   :132', 'foo bar' -> 'foo bar:132'), which is the one hole
+        left in this path's otherwise TOTAL contract against caller-supplied
+        MCP JSON. The newline/backtick/quote rows are the prompt-injection
+        vectors the allowlist exists to block.
+        """
+        with pytest.raises(InputValidationError) as excinfo:
+            resolve_referents(
+                declared=[{'kind': 'task', 'id': 132, 'project_id': project_id}],
+                metadata={},
+                content='',
+                group_id=GROUP,
+            )
+        assert 'project_id' in str(excinfo.value)
+
+    def test_a_legitimate_hyphenated_project_id_is_still_accepted(self):
+        """The NEGATIVE half: validation runs on the CANONICALIZED value, so a
+        hyphenated spelling must survive it rather than being rejected for the
+        hyphen it no longer has. 'reify-mirror' is a well-formed project key."""
+        resolution = resolve_referents(
+            declared=[{'kind': 'task', 'id': 132, 'project_id': 'reify-mirror'}],
+            metadata={},
+            content='',
+            group_id=GROUP,
+        )
+        assert resolution.referents == (
+            Referent(kind='task', project_id='reify_mirror', number='132'),
+        )
+
+    def test_a_long_project_id_is_accepted_because_no_length_rule_exists(self):
+        """Pins the deliberate NON-rule. ``_validate_identifier`` enforces
+        charset and non-emptiness only, so a long-but-well-formed qualifier is
+        accepted here too. Inventing a length cap at THIS site would be exactly
+        the second copy of a validation rule INV-5 forbids — if a cap is ever
+        wanted it belongs in validation.py, and this test will fail loudly and
+        point at the right module when that happens.
+        """
+        resolution = resolve_referents(
+            declared=[{'kind': 'task', 'id': 132, 'project_id': 'a' * 300}],
+            metadata={},
+            content='',
+            group_id=GROUP,
+        )
+        assert resolution.referents[0].project_id == 'a' * 300
+
     def test_the_message_names_the_offending_entry_and_a_remediation_hint(self):
         """Follows ``require_full_uuid``'s shape: a single module-level hint
         constant folded into the raised message, so the remediation text has
@@ -999,6 +1061,8 @@ class TestMalformedDeclarationIsRejectedLoudly:
             [{'kind': 'task', 'id': 132, 'project_id': '../etc'}],
             [{'kind': 'task', 'id': 2500, 'project_id': 'task'}],
             [{'kind': 'task', 'id': 2500, 'project_id': 'Sub-Tasks'}],
+            [{'id': 1, 'project_id': '   '}],
+            [{'id': 1, 'project_id': 'foo bar'}],
         ],
         ids=[
             'non-list',
@@ -1017,6 +1081,8 @@ class TestMalformedDeclarationIsRejectedLoudly:
             'path-shaped-project-id',
             'task-vocabulary-project-id',
             'task-vocabulary-project-id-noncanonical',
+            'whitespace-only-project-id',
+            'charset-invalid-project-id',
         ],
     )
     def test_every_malformed_shape_leaks_exactly_one_exception_type(self, declared):
