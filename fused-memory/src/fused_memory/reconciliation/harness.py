@@ -3047,7 +3047,36 @@ class ReconciliationHarness:
         # detector.  Kept here, outside the _active_runs.track block below, so a
         # slow `CALL db.indexes()` read cannot be misattributed to a stage —
         # exactly where the sibling diagnostics reads sit.
-        index_health = await self._detect_index_drift(scope.project_id, run_id=run_id)
+        #
+        # WHY THE GUARD: `_check_index_health` deliberately lets α's fail-closed
+        # errors propagate rather than fabricate a health record —
+        # `IndexRecordShapeError` (a surprising `CALL db.indexes()` record) and
+        # `UnparsedIndexStatementError` (any graphiti-core statement-syntax
+        # change; graphiti-core is pinned open-ended `>=0.28.1`, so that is a
+        # live upgrade hazard, not a hypothetical).  Unguarded HERE, either one
+        # would escape `run_full_cycle` AFTER `journal.start_run` has persisted
+        # the run as `running` and the caller has drained the event buffer,
+        # wedging every full cycle for every project — permanently, in the
+        # graphiti-upgrade case — while the project loop's generic handler only
+        # logs and never calls `restore_drained`.  A read-only diagnostic must
+        # never be able to fail the cycle it diagnoses.  The fail-closed intent
+        # is preserved by logging loudly and yielding UNKNOWN (None), never a
+        # synthesised healthy record.  The guard belongs at THIS call site, not
+        # inside `_check_index_health` (normalisation must stay outside its try)
+        # and not inside `_detect_index_drift` (which would make the startup
+        # sweep's own per-project guard redundant and hide programming errors
+        # from the detector's unit tests).  `except Exception` lets
+        # `asyncio.CancelledError` — a `BaseException` since 3.8 — propagate on
+        # shutdown, exactly as the sibling guards rely on.
+        try:
+            index_health = await self._detect_index_drift(
+                scope.project_id, run_id=run_id
+            )
+        except Exception as e:
+            logger.warning(
+                f'_detect_index_drift failed for project_id={scope.project_id!r}: {e}'
+            )
+            index_health = None
 
         current_stage_name: str | None = None
         cycle_start_time = datetime.now(UTC)
