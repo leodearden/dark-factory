@@ -934,6 +934,22 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
 )
 
 
+def _cardinality_mismatch_message(
+    key: str, cardinality: SubmodelCardinality, raw: object
+) -> str:
+    """Describe a registered slice whose value is the wrong SHAPE (task 4142).
+
+    Built once and used for both the ``TypeError`` raised under
+    ``write``+``enforce`` and the ``wrong_cardinality`` :class:`SchemaWarning`
+    otherwise, so the two can never drift.
+    """
+    expected = 'a single JSON object' if cardinality == 'dict' else 'a list of JSON objects'
+    return (
+        f'metadata.{key} is registered with cardinality {cardinality!r}, so its '
+        f'value must be {expected}; got {type(raw).__name__}'
+    )
+
+
 def parse_metadata(
     blob: dict | str | None,
     *,
@@ -952,7 +968,13 @@ def parse_metadata(
     * ``blob`` is a dict -> migrated (:func:`apply_migrations`), any
       registered sub-model slice (:data:`_SUBMODEL_REGISTRY`) present in it
       is validated and swapped in as a typed instance, then the whole thing
-      is validated as :class:`TaskMetadata`.
+      is validated as :class:`TaskMetadata`. A slice's value must match the
+      shape its registration declared (``cardinality``, see
+      :func:`register_metadata_submodel`): a list for a ``'dict'`` slice, or
+      a non-list for a ``'list'`` slice, is a ``wrong_cardinality`` finding
+      rather than a validated value — reported under the same failure policy
+      as any other malformed slice, and distinct from ``invalid_submodel``
+      (which means the shape was right but an element/field failed).
 
     Failure policy (never the old silent-``{}`` discard — I4): ``write`` with
     ``enforce=True`` raises (``ValueError``/``ValidationError``) on malformed
@@ -1008,16 +1030,43 @@ def parse_metadata(
         if key not in parsed:
             continue
         raw = parsed[key]
+        # The slice's DECLARED shape, fail-closed for a key that never
+        # declared one (register_metadata_submodel's 'dict' default).
+        cardinality = _SUBMODEL_CARDINALITY.get(key, 'dict')
+        if cardinality == 'dict' and isinstance(raw, list):
+            # Task 4142: the list arm below used to run for EVERY registered
+            # key, so a list handed to a dict-only slice validated
+            # element-wise into a typed list and emitted NO warning — thus
+            # invisible to both the `task_metadata.schema_warning` census and
+            # the enforce=True write gate. The resulting non-dict
+            # metadata.milestone then made scheduler._milestone_time_gated
+            # fail-safe-withhold the task from dispatch indefinitely, with no
+            # escalation path. A shape violation is not an element failure,
+            # so it gets its own code rather than 'invalid_submodel'.
+            if direction == 'write' and enforce:
+                raise TypeError(_cardinality_mismatch_message(key, cardinality, raw))
+            warnings.append(
+                SchemaWarning(
+                    field=key,
+                    code='wrong_cardinality',
+                    message=_cardinality_mismatch_message(key, cardinality, raw),
+                )
+            )
+            # No reassignment of `parsed`: the raw value survives into
+            # model_extra so model_dump() re-emits it verbatim (I1) — the
+            # same retain-on-warn shape the invalid_submodel arm uses.
+            continue
         try:
             if isinstance(raw, list):
-                # A registered slice may itself be list-valued (e.g. a
-                # future metadata.delivered_checks) rather than a single
-                # mapping — validate each element independently and swap in
-                # the typed list. The comprehension raises on the first bad
-                # element (TypeError for a non-mapping item, ValidationError
-                # for a mapping that fails the model), which aborts before
-                # `parsed` is reassigned below, so a malformed list is
-                # retained wholesale — same as the dict path.
+                # A slice declared cardinality='list' (currently only
+                # capability_manifest's delivered_checks) is a list of
+                # mappings rather than a single mapping — validate each
+                # element independently and swap in the typed list. The
+                # comprehension raises on the first bad element (TypeError
+                # for a non-mapping item, ValidationError for a mapping that
+                # fails the model), which aborts before `parsed` is
+                # reassigned below, so a malformed list is retained
+                # wholesale — same as the dict path.
                 parsed = {**parsed, key: [submodel(**item) for item in raw]}
             else:
                 # `submodel(**raw)` raises TypeError (not ValidationError)

@@ -1710,13 +1710,27 @@ class TestParseMetadataFailurePolicy:
     # can't be splatted as `submodel(**value)` — that raises TypeError, not
     # ValidationError. parse_metadata must absorb this the same way as any
     # other malformed sub-model, never raising outside write+enforce=True.
-    def test_registered_submodel_slice_non_mapping_value_read_warns_never_raises(self):
+    #
+    # Since task 4142 the two non-mapping shapes are classified apart: a LIST
+    # for a dict-only slice is caught earlier as a declared-shape violation
+    # (`wrong_cardinality`), while every other non-mapping value (str, int, …)
+    # stays on the untouched splat -> TypeError -> `invalid_submodel` path.
+    # The warn-never-raise / retain-raw policy is identical for both.
+    def test_registered_submodel_slice_list_value_read_warns_never_raises(self):
         register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
         model, warnings = parse_metadata({_DEPLOY_STATE_STUB_KEY: [1, 2]}, direction='read')
         assert len(warnings) == 1
-        assert warnings[0].code == 'invalid_submodel'
+        assert warnings[0].code == 'wrong_cardinality'
         assert warnings[0].field == _DEPLOY_STATE_STUB_KEY
         assert model.model_dump()[_DEPLOY_STATE_STUB_KEY] == [1, 2]
+
+    def test_registered_submodel_slice_scalar_value_read_warns_never_raises(self):
+        register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
+        model, warnings = parse_metadata({_DEPLOY_STATE_STUB_KEY: 'x'}, direction='read')
+        assert len(warnings) == 1
+        assert warnings[0].code == 'invalid_submodel'
+        assert warnings[0].field == _DEPLOY_STATE_STUB_KEY
+        assert model.model_dump()[_DEPLOY_STATE_STUB_KEY] == 'x'
 
     def test_registered_submodel_slice_non_mapping_value_write_warn_mode_accepts(self):
         register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
@@ -2102,20 +2116,26 @@ class TestListForDictOnlySliceRejected:
 
 
 class TestListValuedSubmodelSlice:
-    """Generic list-valued registered slice support in parse_metadata.
+    """List-valued registered slice support in parse_metadata.
 
     Pins the behavior needed by capability_manifest.DeliveredCheckMeta
-    (plans/capability-delivered-checks-prd.md §Contract) before that real
-    model is wired in: metadata.delivered_checks is a LIST, but the existing
-    splat `submodel(**parsed[key])` only handles mapping slices (a list
-    raises TypeError). dict-valued slices (milestone, deploy_state) must
-    stay on the byte-identical unchanged path.
+    (plans/capability-delivered-checks-prd.md §Contract): metadata
+    .delivered_checks is a LIST, but the splat `submodel(**parsed[key])`
+    only handles mapping slices (a list raises TypeError). dict-valued
+    slices (milestone, deploy_state) must stay on the byte-identical
+    unchanged path.
+
+    The list arm is no longer generic across every registered key: since
+    task 4142 it runs only for a slice whose registration DECLARED
+    `cardinality='list'`, which is why every registration below passes it.
+    A list handed to a dict-only slice is a `wrong_cardinality` finding —
+    see TestListForDictOnlySliceRejected above.
     """
 
     _KEY = 'delivered_checks_stub'
 
     def test_valid_list_slice_validated_and_typed_no_warnings(self):
-        register_metadata_submodel(self._KEY, _CheckStub)
+        register_metadata_submodel(self._KEY, _CheckStub, cardinality='list')
         model, warnings = parse_metadata(
             {self._KEY: [{'name': 'a'}, {'name': 'b'}]}, direction='write'
         )
@@ -2126,7 +2146,7 @@ class TestListValuedSubmodelSlice:
         assert [item.name for item in slice_value] == ['a', 'b']
 
     def test_valid_list_slice_round_trips_as_plain_dicts(self):
-        register_metadata_submodel(self._KEY, _CheckStub)
+        register_metadata_submodel(self._KEY, _CheckStub, cardinality='list')
         model, warnings = parse_metadata(
             {self._KEY: [{'name': 'a'}, {'name': 'b'}]}, direction='write'
         )
@@ -2136,13 +2156,13 @@ class TestListValuedSubmodelSlice:
         assert all(not isinstance(item, BaseModel) for item in dumped)
 
     def test_empty_list_slice_validates_to_empty_list(self):
-        register_metadata_submodel(self._KEY, _CheckStub)
+        register_metadata_submodel(self._KEY, _CheckStub, cardinality='list')
         model, warnings = parse_metadata({self._KEY: []}, direction='write')
         assert warnings == []
         assert getattr(model, self._KEY) == []
 
     def test_malformed_element_read_warns_and_retains_raw_list(self):
-        register_metadata_submodel(self._KEY, _CheckStub)
+        register_metadata_submodel(self._KEY, _CheckStub, cardinality='list')
         model, warnings = parse_metadata({self._KEY: [{'name': 'a'}, {}]}, direction='read')
         assert len(warnings) == 1
         assert warnings[0].field == self._KEY
@@ -2150,26 +2170,26 @@ class TestListValuedSubmodelSlice:
         assert model.model_dump()[self._KEY] == [{'name': 'a'}, {}]
 
     def test_malformed_element_write_enforce_raises(self):
-        register_metadata_submodel(self._KEY, _CheckStub)
+        register_metadata_submodel(self._KEY, _CheckStub, cardinality='list')
         with pytest.raises(ValidationError):
             parse_metadata({self._KEY: [{'name': 'a'}, {}]}, direction='write', enforce=True)
 
     def test_malformed_element_write_warn_mode_accepts_raw_list(self):
-        register_metadata_submodel(self._KEY, _CheckStub)
+        register_metadata_submodel(self._KEY, _CheckStub, cardinality='list')
         model, warnings = parse_metadata({self._KEY: [{}]}, direction='write', enforce=False)
         assert len(warnings) == 1
         assert warnings[0].code == 'invalid_submodel'
         assert model.model_dump()[self._KEY] == [{}]
 
     def test_non_mapping_element_in_list_read_warns_never_raises(self):
-        register_metadata_submodel(self._KEY, _CheckStub)
+        register_metadata_submodel(self._KEY, _CheckStub, cardinality='list')
         model, warnings = parse_metadata({self._KEY: ['not-a-dict']}, direction='read')
         assert len(warnings) == 1
         assert warnings[0].code == 'invalid_submodel'
         assert model.model_dump()[self._KEY] == ['not-a-dict']
 
     def test_non_mapping_element_in_list_write_enforce_raises(self):
-        register_metadata_submodel(self._KEY, _CheckStub)
+        register_metadata_submodel(self._KEY, _CheckStub, cardinality='list')
         with pytest.raises((ValidationError, TypeError)):
             parse_metadata({self._KEY: ['not-a-dict']}, direction='write', enforce=True)
 
