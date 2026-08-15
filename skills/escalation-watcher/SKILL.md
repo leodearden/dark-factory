@@ -47,15 +47,67 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lea
 # Claim watcher-<project> (e.g. watcher-df) — STAND_DOWN policy: a live duplicate wins the lease
 # and this session must exit rather than run a second watch loop against the same project.
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-claim \
-  --name watcher-<project> --slug watcher-<project>-$$ --pid $$ --policy stand-down
+  --name watcher-<project> --slug "watcher-<project>-${CLAUDE_PID:-$PPID}" --policy stand-down
 ```
 
-Parse the two printed lines: `decision=<acquired|stand-down|proceed>` followed by a human-readable
-message.
-- **`decision=stand-down`**: print the message verbatim (`lease held by <session> (alive, heartbeat
-  Ns ago) — standing down`) and **exit immediately** — do not start the watcher, do not drain.
+**Never `$$` — it is both the wrong pid and an unusable slug.** Inside a Claude Code Bash tool call
+`$$` is the transient `/bin/bash -c` wrapper, dead the instant the call returns; the long-lived
+`claude` process is `$CLAUDE_PID` (fall back to `$PPID`). Verify with:
+
+```bash
+ps -o comm= -p "${CLAUDE_PID:-$PPID}"   # prints: claude
+```
+
+This bit twice over (task 3994). A `$$` **pid** made the lease's liveness guard inert — every holder
+read as dead, so the lease silently degraded to a bare heartbeat TTL. A `$$` **slug** is worse now
+that ownership is enforced: every Bash tool call gets a fresh `$$`, so the slug you claimed with
+would never match the one your own later `lease-heartbeat`/`lease-release` present, and every one of
+them would be refused. `${CLAUDE_PID:-$PPID}` is stable across tool calls — that is exactly why it
+works as the slug.
+
+`--pid` is now **optional**: omitted, the CLI resolves it from `$CLAUDE_PID` itself, so the correct
+pid no longer depends on this document getting one shell token right. Pass `--pid <n>` only as a
+deliberate operator override.
+
+Parse the printed lines: `decision=<acquired|stand-down|proceed>`, a human-readable message, then
+`holder_liveness=<held|orphaned>`.
 - **`decision=acquired` or `decision=proceed`**: continue into the Main Loop below. `proceed` is the
   fail-open outcome (see below) and is handled identically to `acquired`.
+- **`decision=stand-down` + `holder_liveness=held`**: print the message verbatim and **exit
+  immediately** — do not start the watcher, do not drain.
+- **`decision=stand-down` + `holder_liveness=orphaned`**: the holder's pid is not running **and** its
+  session record is absent/exited — it is provably gone, but its heartbeat is still within TTL so the
+  lease is not yet reclaimable. **Do not exit silently.** This skill is the only L2 consumer, so
+  standing down for a holder that no longer exists is how a queue sits unhandled for hours. Inspect,
+  file a DecisionRecord naming the orphan (the same `write-decision` verb used for parked decisions
+  below), print it, **then** exit:
+
+  ```bash
+  python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-show \
+    --name watcher-<project>     # holder_slug / holder_pid / heartbeat_age_secs / reclaimable
+
+  python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py write-decision \
+    --id watcher-lease-orphan-<project> --project <project> \
+    --text "watcher-<project> lease held by orphaned holder <holder_slug> (pid <holder_pid> not running, heartbeat <n>s ago); no live L2 consumer until it is reclaimed" \
+    --session-id "watcher-<project>-${CLAUDE_PID:-$PPID}"
+  ```
+
+  Do **not** force-release it on this evidence alone — `holder_liveness` is a diagnostic, and a
+  dead-*looking* holder that is merely quiet is the duplicate-spawn incident. Reclaiming is the
+  human's call, or the reaper's once the TTL expires.
+
+**Reading the contention message.** It reports two INDEPENDENT axes — whether the holder's *pid* is
+running, and how fresh its *heartbeat* is — and then states the decision they imply:
+
+```
+lease held by watcher-df-1348600 (pid 1348600 alive, heartbeat 42s ago) — standing down
+lease held by watcher-df-1348600 (pid 1348600 is not running, but its heartbeat is FRESH — 42s ago;
+the lease is still held and is NOT reclaimable for another 7158s) — standing down
+```
+
+A **fresh heartbeat means you stand down**, even when the pid reads as not running: staleness
+requires BOTH a dead pid AND a heartbeat past the TTL. Reading "dead" and concluding "therefore
+mine" is precisely what force-released a live holder's lease on 2026-08-08.
 
 **INTERACTIVE-ONLY.** This lease claim belongs to the interactive L2 watcher (this skill) only. The
 headless `escalation-watcher-auto` rotation (L1) never claims or contends this lease — it has no
@@ -69,11 +121,37 @@ logged loudly by `session_registry` and reported back as `decision=proceed` — 
 
 **Heartbeat + release.** Once claimed, touch the lease every Main Loop cycle (see "Starting the
 watcher" below) so it never appears stale to another session's claim attempt, and release it when
-the watch session ends (clean exit, or the human stops it):
+the watch session ends (clean exit, or the human stops it). Both verbs **require** the slug you
+claimed with — a mismatch is refused, so no other session can evict your lease, and no stranger can
+keep a dead holder's lease alive forever:
 
 ```bash
-python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-release --name watcher-<project>
+python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-release \
+  --name watcher-<project> --slug "watcher-<project>-${CLAUDE_PID:-$PPID}"
 ```
+
+Both print `result=<applied|forced|absent|refused|faulted>` as their first line:
+- **`applied`** — you are the holder and the mutation happened. **`absent`** — no such lease;
+  releasing an already-released lease is idempotent, not an error.
+- **`refused`** — you are **not** the holder; nothing was touched. Do not re-run with `--force`
+  reflexively: inspect first with `lease-show` (below). A refusal usually means your slug drifted
+  (see `$$` above) or another session legitimately holds it.
+- **`forced`** — `--force` overrode a refusal. Operator recovery only; logged loudly naming both the
+  forcing slug and the displaced holder.
+- **`faulted`** — the mutation itself failed (a substrate error). Logged, never raised; the exit
+  code stays 0 so a lease fault cannot break your loop.
+
+**Inspecting a lease — use `lease-show`, never `cat`.**
+
+```bash
+python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-show --name watcher-<project>
+```
+
+`cat` shows the holder's slug/pid and the immutable `start_ts` they claimed at — it **cannot** show
+freshness, because the heartbeat is the file's mtime. `lease-show` prints `state`, `holder_slug`,
+`holder_pid`, `holder_pid_alive`, `heartbeat_ts`, `heartbeat_age_secs`, `reclaimable` and
+`holder_session` as `key=value` lines, computed by the same reader `lease-claim` decides with. It is
+read-only: it never bumps the heartbeat.
 
 ## The Main Loop
 
@@ -190,11 +268,15 @@ and 7), also touch the `watcher-<project>` lease claimed at session startup (see
 Watcher Lease" above):
 
 ```bash
-python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-heartbeat --name watcher-<project>
+python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-heartbeat \
+  --name watcher-<project> --slug "watcher-<project>-${CLAUDE_PID:-$PPID}"
 ```
 
 This is what makes a second session's `lease-claim` observe this session as "alive" and stand down —
-there is no need to separately pgrep/ps-tree for other watcher processes.
+there is no need to separately pgrep/ps-tree for other watcher processes. `--slug` must be the exact
+slug you claimed with; `result=refused` means you are not the holder and your heartbeat did **not**
+land — investigate with `lease-show` (see "Claiming the Watcher Lease" above) rather than repeating
+the call with `--force`.
 
 ### When the watcher fires
 
@@ -260,7 +342,8 @@ already reads it breaks.
 ```bash
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py write-decision \
   --id <stable-id> --project <project> --text "<one-line question>" \
-  [--task-id <task_id>] [--escalation-id <escalation_id>] [--session-id watcher-<project>-$$] \
+  [--task-id <task_id>] [--escalation-id <escalation_id>] \
+  [--session-id "watcher-<project>-${CLAUDE_PID:-$PPID}"] \
   [--severity <esc.severity>] [--escalations-dir <project_root>/data/escalations]
 ```
 
