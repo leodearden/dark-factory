@@ -252,3 +252,74 @@ class TestValidationIsRefusedBeforeAnyWrite:
         assert result['error_type'] == 'ValidationError'
         assert 'run_id' in result['error']
         svc.add_memory.assert_not_awaited()
+
+
+class TestCanonicalFirstOrdering:
+    """A canonical that did not land is NEVER followed by deletions.
+
+    The ordering IS the anti-ratchet property. Deleting first and writing
+    after would net-LOSE content on a failed write — unrecoverably, since
+    there is no read path to a deleted point. Writing first and deleting
+    after can only ever net-ADD, which is reportable and re-runnable.
+    """
+
+    @pytest.mark.asyncio
+    async def test_canonical_uniqueness_violation_destroys_nothing(self):
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        svc = make_service()
+        svc.add_memory = AsyncMock(
+            side_effect=CanonicalUniquenessViolation(
+                project_id=PROJECT_ID, topic=TOPIC, incumbent_id=RETAIN_1
+            )
+        )
+
+        result = await call_consolidate(svc)
+
+        assert result['error_type'] == 'CanonicalUniquenessViolation'
+        assert RETAIN_1 in result['error']
+        svc.delete_memory.assert_not_called()
+        svc.update_memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_metadata_rejection_destroys_nothing(self):
+        from fused_memory.memory_metadata import (
+            MemoryMetadataValidationError,
+            MetadataViolation,
+        )
+
+        svc = make_service()
+        svc.add_memory = AsyncMock(
+            side_effect=MemoryMetadataValidationError([
+                MetadataViolation(
+                    key='topic',
+                    code='invalid_topic_slug',
+                    message='topic is malformed',
+                    fatal=True,
+                )
+            ])
+        )
+
+        result = await call_consolidate(svc)
+
+        assert result['error_type'] == 'MemoryMetadataValidationError'
+        svc.delete_memory.assert_not_called()
+        svc.update_memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_canonical_that_returned_no_id_refuses_the_whole_op(self):
+        """The silent-fail-soft case: the write did not raise, and landed nothing.
+
+        Proceeding here would delete a cluster in favour of a canonical that
+        does not exist — exactly the net-loss the ordering exists to make
+        impossible, arrived at by trusting a success that was not one.
+        """
+        svc = make_service()
+        svc.add_memory = AsyncMock(return_value=AddMemoryResponse(memory_ids=[]))
+
+        result = await call_consolidate(svc)
+
+        assert result['error_type'] == 'CanonicalWriteFailed'
+        assert 'canonical' in result['error'].lower()
+        svc.delete_memory.assert_not_called()
+        svc.update_memory.assert_not_called()
