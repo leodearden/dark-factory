@@ -271,14 +271,10 @@ Neither is redundant, and they must not be collapsed. A write-time false
 positive costs the caller one retry; a sweep-time false positive silently
 rewrites content a user wrote. That asymmetry is the whole justification for
 maintaining two detectors — but it justifies two *predicates*, not two
-*literal lists*. Both are now derived from a single literal vocabulary
-defined once in `shared.toolcall_markup` (§1, "The single literal source"),
-but the two tuples still differ in membership on purpose:
-`MCP_MARKUP_PATTERNS` carries one closing tag plus the opener prefix and the
-invoke closer, `PREFILTER_NEEDLES` carries the four parameter closers, and
-`ENVELOPE_LITERALS` is their union — neither named predicate alone covers
-it. What still differs, on purpose, is method and calibration, exactly as
-the table above states.
+*literal lists*. Both are now derived from the single literal vocabulary
+defined once in `shared.toolcall_markup` — see §1, "The single literal
+source" for the two tuples' exact membership. What still differs, on
+purpose, is method and calibration, exactly as the table above states.
 
 One diagnostic did not survive the withdrawal and is worth recovering later:
 the retired guard's message named the **sibling-argument risk** explicitly —
