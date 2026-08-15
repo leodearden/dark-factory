@@ -3317,3 +3317,270 @@ class TestQuarantineUnreachableHostChokepoint:
         assert entry['unavailable_since'] == 1000.0
         assert entry['unavailable_secs'] == 300.0
         assert entry['reason'] == 'ssh timeout'
+
+
+# ---------------------------------------------------------------------------
+# 3043/step-7 RED: _run_inflight_verify must never orphan its inner
+# _run_post_merge_verify task (INV-C)
+# ---------------------------------------------------------------------------
+
+
+_INCIDENT_RU_MSG = (
+    'git push leo-laptop 1a2b3c4d:refs/merge-verify/task-999 failed (rc=128): '
+    'ssh: connect to host leo-laptop port 22: Connection timed out'
+)
+
+
+@pytest.mark.asyncio
+class TestRunInflightVerifyNeverOrphansVerifyTask:
+    """The outer coroutine must never outlive its inner verify task (task 3043).
+
+    Incident (reify 2026-07-25, PID 3360397): ``Task-350`` logged
+    ``Task exception was never retrieved`` with a ``RunnerUnavailable`` from a
+    speculative remote verify.  Route: the head-failure cascade cancels the
+    OUTER ``_run_inflight_verify`` task; ``CancelledError`` is a
+    ``BaseException`` caught by NONE of the method's handlers
+    (``except RunnerUnavailable``, ``except (MergeVerifyLeaseContended,
+    MergeVerifyLeaseHeld)``, ``except Exception``), so the outer ends CANCELLED
+    while the INNER ``_run_post_merge_verify`` keeps running against the down
+    host.  When it finally raises, nobody retrieves the exception: no
+    VerifyResult, no quarantine, no tracker entry — the host is stranded out of
+    the pool with nothing for the reprobe sweep to re-adopt.
+
+    RED until 3043/step-8 wraps the verify_task lifetime in a try/finally.
+    """
+
+    def _make_worker_and_item(self, tmp_path):
+        from orchestrator.merge_queue import RealMergeItem, SpeculativeMergeWorker
+
+        git_ops = _make_git_ops_mock()
+        q: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q)
+        worker.VERIFY_ABANDON_POLL_SECS = 0.01
+
+        merge_result = MagicMock()
+        merge_result.merge_commit = 'abc123def456789abc1'
+        config = _make_config()
+        req = _make_merge_request(config, task_files=[], worktree=tmp_path)
+        item = RealMergeItem(
+            request=req,
+            merge_result=merge_result,
+            merge_wt=tmp_path / 'merge-wt',
+            base_sha='base123',
+            speculative=True,
+        )
+        return worker, item
+
+    def _remote_lease(self, name='leo-laptop'):
+        from orchestrator.verify_runner import HostLease
+
+        runner = MagicMock()
+        runner.name = name
+        runner.is_local = False
+        return HostLease(name=name, runner=runner, is_local=False)
+
+    def _pending_fake_verifies(self, fn_name: str) -> list:
+        """Pending tasks still running the patched _run_post_merge_verify stand-in."""
+        out = []
+        for t in asyncio.all_tasks():
+            if t.done() or t is asyncio.current_task():
+                continue
+            coro = getattr(t, 'get_coro', lambda: None)()
+            if fn_name in getattr(coro, '__qualname__', ''):
+                out.append(t)
+        return out
+
+    async def _cancel_midflight(self, worker, item, lease, fake_verify):
+        """Start the outer verify, let it reach the poll loop, then cancel it."""
+        import contextlib
+
+        with patch('orchestrator.merge_queue._run_post_merge_verify', new=fake_verify):
+            outer = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
+            for _ in range(50):
+                await asyncio.sleep(0.01)
+                if worker._runner_quarantine or self._pending_fake_verifies(
+                    fake_verify.__qualname__
+                ):
+                    break
+            outer.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await outer
+            # Let any cancellation the finally-guard issued settle.
+            for _ in range(10):
+                await asyncio.sleep(0)
+        return outer
+
+    # -- (a) the inner task is never left pending -------------------------------
+
+    async def test_inner_task_is_done_after_outer_is_cancelled(self, tmp_path):
+        """Cancelling the outer task must not leave the inner verify running."""
+        from orchestrator.verify_runner import RunnerUnavailable
+
+        captured: list = []
+
+        async def _fake_verify(*args, **kwargs):
+            captured.append(asyncio.current_task())
+            await asyncio.sleep(30)
+            raise RunnerUnavailable(_INCIDENT_RU_MSG)
+
+        worker, item = self._make_worker_and_item(tmp_path)
+        await self._cancel_midflight(worker, item, self._remote_lease(), _fake_verify)
+
+        assert captured, 'the patched verify never started'
+        assert captured[0].done(), (
+            'inner _run_post_merge_verify task outlived the cancelled outer '
+            'coroutine — this is the Task-350 orphan'
+        )
+        assert self._pending_fake_verifies('_fake_verify') == []
+
+    # -- (b) the inner exception is always RETRIEVED ----------------------------
+
+    async def test_inner_exception_is_retrieved_no_unhandled_warning(self, tmp_path):
+        """No 'Task exception was never retrieved' — the literal incident log line."""
+        import gc
+
+        from orchestrator.verify_runner import RunnerUnavailable
+
+        captured: list = []
+
+        async def _fake_verify(*args, **kwargs):
+            # Raises on its OWN timeline, shortly after the outer is cancelled —
+            # the incident's shape: the orphan keeps talking to the down host
+            # and surfaces the transport failure with nobody left listening.
+            captured.append(asyncio.current_task())
+            await asyncio.sleep(0.05)
+            raise RunnerUnavailable(_INCIDENT_RU_MSG)
+
+        loop = asyncio.get_running_loop()
+        unhandled: list = []
+        prior = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, ctx: unhandled.append(ctx))
+        try:
+            worker, item = self._make_worker_and_item(tmp_path)
+            await self._cancel_midflight(worker, item, self._remote_lease(), _fake_verify)
+
+            # Give an ORPHANED inner task time to reach its raise — that is the
+            # moment the unretrieved-exception warning becomes possible.  With
+            # the guard in place the inner is already cancelled by now, so this
+            # window simply passes quietly.
+            await asyncio.sleep(0.2)
+            captured.clear()          # drop our own reference to the task
+            gc.collect()
+            await asyncio.sleep(0)
+            gc.collect()
+        finally:
+            loop.set_exception_handler(prior)
+
+        never_retrieved = [
+            c for c in unhandled
+            if 'never retrieved' in str(c.get('message', ''))
+        ]
+        assert never_retrieved == [], (
+            f'unretrieved inner exception(s): {never_retrieved}'
+        )
+
+    # -- (c) the host is RECORDED on the cancellation-unwind path ---------------
+
+    async def test_remote_host_is_recorded_when_inner_raises_runner_unavailable(
+        self, tmp_path,
+    ):
+        """INV-A holds even though the outer never reached its RU handler.
+
+        The outer is cancelled, so ``except RunnerUnavailable`` (which converts
+        to the RUNNER_UNAVAILABLE sentinel) never runs.  Without the guard this
+        host is quarantined nowhere and tracked nowhere, so the reprobe sweep
+        can never re-adopt it.
+        """
+        from orchestrator.verify_runner import RunnerUnavailable
+
+        async def _fake_verify(*args, **kwargs):
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                raise RunnerUnavailable(_INCIDENT_RU_MSG) from None
+
+        worker, item = self._make_worker_and_item(tmp_path)
+        await self._cancel_midflight(worker, item, self._remote_lease(), _fake_verify)
+
+        assert 'leo-laptop' in worker._runner_unavailable, (
+            'stranded host has no tracker entry — reprobe cannot re-adopt it'
+        )
+        assert 'leo-laptop' in worker._runner_quarantine
+        entry = worker._runner_unavailable['leo-laptop']
+        assert 'Connection timed out' in entry.reason
+        assert entry.streak == 1
+
+    async def test_cleanly_cancelled_inner_records_nothing(self, tmp_path):
+        """An inner task that ends CANCELLED (not RunnerUnavailable) is not a strand."""
+
+        async def _fake_verify(*args, **kwargs):
+            await asyncio.sleep(30)
+
+        worker, item = self._make_worker_and_item(tmp_path)
+        await self._cancel_midflight(worker, item, self._remote_lease(), _fake_verify)
+
+        assert worker._runner_unavailable == {}
+        assert worker._runner_quarantine == set()
+
+    async def test_local_lease_guard_records_nothing(self, tmp_path):
+        """A LOCAL lease is never quarantined — local is the trust anchor."""
+        from orchestrator.verify_runner import HostLease, RunnerUnavailable
+
+        async def _fake_verify(*args, **kwargs):
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                raise RunnerUnavailable('local verify blew up') from None
+
+        worker, item = self._make_worker_and_item(tmp_path)
+        local_runner = MagicMock()
+        local_runner.name = 'local'
+        local_runner.is_local = True
+        lease = HostLease(name='local', runner=local_runner, is_local=True)
+
+        await self._cancel_midflight(worker, item, lease, _fake_verify)
+
+        assert worker._runner_unavailable == {}
+        assert worker._runner_quarantine == set()
+
+    # -- companion: the NORMAL (uncancelled) RU path is unchanged ---------------
+
+    async def test_normal_runner_unavailable_path_still_returns_sentinel(self, tmp_path):
+        """Uncancelled remote RU still converts to the RUNNER_UNAVAILABLE result."""
+        from orchestrator.verify_runner import RunnerUnavailable
+
+        async def _fake_verify(*args, **kwargs):
+            raise RunnerUnavailable(_INCIDENT_RU_MSG)
+
+        worker, item = self._make_worker_and_item(tmp_path)
+        with patch('orchestrator.merge_queue._run_post_merge_verify', new=_fake_verify):
+            result = await worker._run_inflight_verify(item, self._remote_lease())
+
+        assert result.status == 'RUNNER_UNAVAILABLE'
+        assert result.reason is not None and 'Connection timed out' in result.reason
+
+    async def test_normal_runner_unavailable_path_does_not_double_record(self, tmp_path):
+        """The guard must not duplicate the handler's work on the normal path.
+
+        On the normal path the ``except RunnerUnavailable`` handler OWNS the
+        failure: it returns the RUNNER_UNAVAILABLE sentinel and
+        ``_finalize_inflight`` does the recording via the chokepoint.  So
+        ``_run_inflight_verify`` itself must record NOTHING here — and the
+        downstream chokepoint call must then leave streak at 1, not 2.
+        """
+        from orchestrator.verify_runner import RunnerUnavailable
+
+        async def _fake_verify(*args, **kwargs):
+            raise RunnerUnavailable(_INCIDENT_RU_MSG)
+
+        worker, item = self._make_worker_and_item(tmp_path)
+        with patch('orchestrator.merge_queue._run_post_merge_verify', new=_fake_verify):
+            await worker._run_inflight_verify(item, self._remote_lease())
+
+        assert worker._runner_unavailable == {}, (
+            'the finally-guard recorded a failure the RU handler already owns'
+        )
+
+        # What _finalize_inflight does next — exactly one episode, streak 1.
+        worker._quarantine_unreachable_host('leo-laptop', _INCIDENT_RU_MSG, 1000.0)
+        assert worker._runner_unavailable['leo-laptop'].streak == 1
