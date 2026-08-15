@@ -113,6 +113,14 @@ _ADVISORY_FINGERPRINT_TOKEN: str = 'mode:advisory'
 # redo work that already landed (task 3119).
 _ADVISORY_SUGGESTED_ACTION: str = 'no_action_advisory_only'
 
+# Operator-facing outcome-mode labels for this module's log lines.  Named
+# constants rather than inline literals so the unavailable-package debug line
+# and the terminal queued warning are guaranteed to emit the SAME token — an
+# operator greps one mode across both, and the two lines used to be
+# indistinguishable by mode at all (task 4159).
+_ADVISORY_MODE_LABEL: str = 'advisory'
+_REJECTION_MODE_LABEL: str = 'rejection'
+
 # Budget-misconfig escalation constants — deliberately distinct from the
 # scope_violation family so operators can immediately tell these apart.
 _BUDGET_MISCONFIG_ANCHOR_TASK_ID: str = 'adjudicator-budget-defect'
@@ -235,13 +243,14 @@ class ScopeViolationEscalator:
                 Default ``False`` — the FILES-certain rejection wording,
                 byte-identical to the pre-task-3119 output.
         """
+        # One label for every operator-facing line this call emits.
+        mode = _ADVISORY_MODE_LABEL if advisory else _REJECTION_MODE_LABEL
         queue = self._queue_for(project_root)
         if queue is None:
             logger.debug(
                 'scope_violation_escalator: escalation package unavailable; '
                 '%s of %r in project %r will not be escalated',
-                'advisory' if advisory else 'rejection',
-                candidate_title[:80], project_id,
+                mode, candidate_title[:80], project_id,
             )
             return None
 
@@ -364,10 +373,14 @@ class ScopeViolationEscalator:
             )
             return None
 
+        # Mode is interpolated into the EXISTING single line, after the id:
+        # 'scope_violation_escalator: queued <id>' is the greppable anchor
+        # shared with the sibling escalators, so neither the prefix nor the
+        # one-line-per-submit shape may change (task 4159).
         logger.warning(
-            'scope_violation_escalator: queued %s for project %s '
+            'scope_violation_escalator: queued %s (%s) for project %s '
             '(candidate=%r, suggested=%s)',
-            esc_id, project_id, candidate_title[:80], target,
+            esc_id, mode, project_id, candidate_title[:80], target,
         )
         return esc_id
 
