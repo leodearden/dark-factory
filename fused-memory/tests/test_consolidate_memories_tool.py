@@ -68,11 +68,39 @@ def _parse_result(result):
     return result
 
 
-def _row(memory_id, **metadata):
+# The two reads this op issues return DIFFERENT shapes, and one mock helper
+# standing in for both is how a live bug stayed invisible. Verified on this
+# tree:
+#
+#   get_memory_by_id      -> {'id', 'content', 'metadata': <FULL raw payload>}
+#                            (memory_service.py: "metadata is the FULL
+#                            unprocessed Qdrant payload") — NO top-level
+#                            `created_at`; the timestamp is a payload key.
+#   get_memories_by_metadata -> {'id', 'created_at', 'metadata'} — because
+#                            `Mem0Backend.scroll_by_metadata` explicitly LIFTS
+#                            it (`'created_at': payload.get('created_at')`),
+#                            which `get_point_by_id` does not do.
+#
+# So they are kept as two helpers, deliberately named apart, so a later edit
+# cannot re-cross them and re-hide the same class of defect.
+CREATED_AT = '2026-01-01T00:00:00+00:00'
+
+
+def _point_row(memory_id, **metadata):
+    """What `get_memory_by_id` returns: `created_at` NESTED in the payload."""
     return {
         'id': memory_id,
         'content': f'record {memory_id}',
-        'created_at': '2026-01-01T00:00:00+00:00',
+        'metadata': {'topic': TOPIC, 'created_at': CREATED_AT, **metadata},
+    }
+
+
+def _scroll_row(memory_id, **metadata):
+    """What `get_memories_by_metadata` returns: `created_at` LIFTED flat."""
+    return {
+        'id': memory_id,
+        'content': f'record {memory_id}',
+        'created_at': CREATED_AT,
         'metadata': {'topic': TOPIC, **metadata},
     }
 
@@ -156,7 +184,7 @@ def make_service(
         reads_seen[memory_id] = seen + 1
         if seen and memory_id in gone:
             return None
-        return _row(memory_id)
+        return _point_row(memory_id)
 
     svc.get_memory_by_id = AsyncMock(side_effect=_get)
 
@@ -195,7 +223,7 @@ def make_service(
 
     svc.update_memory = AsyncMock(side_effect=_update)
     svc.get_memories_by_metadata = AsyncMock(
-        return_value=[_row(m) for m in members]
+        return_value=[_scroll_row(m) for m in members]
     )
 
     async def _count(project_id=None, filters=None, **_):
@@ -1289,8 +1317,14 @@ class TestTheDeleteArmStampsATombstone:
         assert kwargs['absorbed_by'] == CANONICAL
         assert [v['id'] for v in args[2]] == SUPERSEDES
         for victim in args[2]:
-            assert victim['metadata'] == {'topic': TOPIC}
-            assert victim['created_at'] == '2026-01-01T00:00:00+00:00'
+            # Pinned end-to-end against the REAL read shape: `metadata` is the
+            # full payload the point read returned, and `created_at` is the key
+            # nested INSIDE it — not a top-level field, which is what
+            # `get_memory_by_id` never returns. Recording `None` here would
+            # silently drop one of the three fields of the very audit row this
+            # change exists to make answerable.
+            assert victim['metadata'] == {'topic': TOPIC, 'created_at': CREATED_AT}
+            assert victim['created_at'] == CREATED_AT
 
     @pytest.mark.asyncio
     async def test_the_delete_is_attributed_to_the_same_source(self):
