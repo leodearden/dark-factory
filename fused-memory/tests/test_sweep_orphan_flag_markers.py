@@ -11,6 +11,7 @@ import sys
 import types
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -127,7 +128,7 @@ def _filter_key(filters: dict | None) -> frozenset:
     return frozenset((filters or {}).items())
 
 
-def _counts(*, source, kind, flag_for_stage2=0) -> AsyncMock:
+def _counts(*, source: Any, kind: Any, flag_for_stage2: Any = 0) -> AsyncMock:
     """Build a count_memories_by_metadata mock answering per filter.
 
     Args:
