@@ -746,45 +746,195 @@ async def test_handler_warns_on_orphan_halt_when_no_escalation_queue(
     )
 
 
-@pytest.mark.asyncio
-async def test_handle_stash_failed_submits_single_halt_owning_l1(
-    workflow: TaskWorkflow,
-    fake_worker: _FakeMergeWorker,
-) -> None:
-    """_handle_stash_failed submits exactly ONE level-1 escalation with
-    category=='stash_failed' naming the dirty file, and registers it as the
-    merge worker halt owner — the single loud signal that replaces N per-task
-    blocked finalizations (task 2758).
+# ---------------------------------------------------------------------------
+# Task 3537 / boundary #13: the merge-halt trio ESCALATES AND BLOCKS.
+#
+# Spec docs/task-escalation-state-spec.md §7.9 / §8-E3, INV-6
+# (status-matches-liveness) and INV-7 (holds-owned-and-bounded).
+#
+# The three BLOCKED-returning halt handlers used to file an L1 and then
+# `await self._submit_halt_escalation_and_wait(esc)` — an UNBOUNDED wait while
+# holding the slot, the locks, the lane and the merge queue (INV-7/S5), tailed
+# by a bare `return WorkflowOutcome.BLOCKED` that never wrote the task row
+# (INV-6/S1).  They now transplant `_escalate_train_halt`'s landed non-waiting
+# shape: defensive owner re-check -> `_submit_halt_owning_escalation` ->
+# `_mark_blocked(..., skip_escalation=True)`.
+#
+# The two SIBLING handlers keep waiting and are deliberately out of scope:
+# `_handle_wip_conflict` returns REQUEUED (the wait IS its retry mechanism) and
+# `_handle_wip_recovery` returns DONE (the merge landed).  Their
+# `*_releases_halt_on_cancel` tests above must stay untouched.
+# ---------------------------------------------------------------------------
 
-    RED: _handle_stash_failed does not exist yet.
-    """
-    # Merger pre-engaged the (ownerless) halt, mirroring _map_advance_failure.
-    fake_worker.halt_for_wip('stash_failed')
-    assert fake_worker.is_wip_halted
-    assert fake_worker.halt_owner_esc_id is None
-
-    task = asyncio.create_task(
-        workflow._handle_stash_failed(
+def _invoke_trio_handler(workflow: TaskWorkflow, handler_id: str):
+    """Return the un-awaited coroutine for one merge-halt trio handler."""
+    if handler_id == 'stash_failed':
+        return workflow._handle_stash_failed(
             MergeOutcome(status='stash_failed', dirty_files=['README.md']),
             'task/x',
         )
-    )
-    try:
-        # The handler submits + registers the owner, then awaits resolution.
-        await _poll_until(lambda: fake_worker.halt_owner_esc_id is not None)
-
-        assert workflow.escalation_queue is not None
-        pending = workflow.escalation_queue.get_pending()
-        assert len(pending) == 1, f'expected exactly one L1, got {pending!r}'
-        esc = pending[0]
-        assert esc.level == 1
-        assert esc.category == 'stash_failed'
-        assert 'README.md' in esc.summary
-        assert fake_worker.halt_owner_esc_id == esc.id, (
-            'halt owner must be registered to the filed escalation id'
+    if handler_id == 'unmerged_state':
+        return workflow._handle_unmerged_state(
+            MergeOutcome(status='unmerged_state'), 'task/1448',
         )
-    finally:
-        # The handler is parked on _escalation_event.wait(); cancel to clean up.
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+    if handler_id == 'wip_recovery_no_advance':
+        return workflow._handle_wip_recovery_no_advance(
+            MergeOutcome(
+                status='wip_recovery_no_advance', recovery_branch='wip/r2',
+            ),
+        )
+    raise AssertionError(f'unknown trio handler {handler_id!r}')
+
+
+#: ``(handler_id, expected escalation category, token required in the summary)``
+#:
+#: The category is NOT the handler name: ``_build_wip_halt_escalation_text``
+#: maps ``wip_recovery_no_advance`` to ``'wip_conflict'``.  Assert what the
+#: shared builder actually produces — the rehydration filter and
+#: ``_on_escalation_resolved`` both key on that category, not on the status.
+_TRIO = [
+    ('stash_failed', 'stash_failed', 'README.md'),
+]
+
+_TRIO_IDS = [row[0] for row in _TRIO]
+
+
+def _forbid_waiting_helper(workflow: TaskWorkflow) -> None:
+    """§7.9 constraint (a), enforced STRUCTURALLY.
+
+    ``_submit_halt_escalation_and_wait`` is the only thing on these paths that
+    owns an ``except BaseException -> unhalt_wip('workflow_cancelled')``
+    cleanup.  A rewrite that merely BOUNDED the wait would keep that cleanup one
+    stray cancellation away from un-halting the merge queue over a dirty tree.
+    Not calling the helper at all is what makes "never unhalts" a property of
+    the code's shape rather than of its timing — so pin the absence of the call,
+    not just the absence of its effect.
+    """
+    async def _never(*_args, **_kwargs):
+        raise AssertionError(
+            'merge-halt trio must NOT route through '
+            '_submit_halt_escalation_and_wait (spec §7.9 constraint (a)): its '
+            'except-BaseException cleanup unhalts the merge queue over a dirty '
+            'project_root'
+        )
+
+    workflow._submit_halt_escalation_and_wait = _never  # type: ignore[method-assign]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('handler_id,expected_category,summary_token', _TRIO, ids=_TRIO_IDS)
+async def test_trio_escalates_and_blocks_without_waiting(
+    handler_id: str,
+    expected_category: str,
+    summary_token: str,
+    workflow: TaskWorkflow,
+    fake_worker: _FakeMergeWorker,
+) -> None:
+    """Boundary #13, full contract, for each merge-halt trio handler.
+
+    RED today: the handler parks forever on ``_escalation_event.wait()``, so it
+    never returns and never writes the row.  ``asyncio.wait_for`` makes a
+    regression back to the unbounded wait fail loudly as a timeout rather than
+    hanging the suite.
+    """
+    # Merger pre-engaged the (ownerless) halt, mirroring _map_advance_failure.
+    fake_worker.halt_for_wip(handler_id)
+    assert fake_worker.is_wip_halted
+    assert fake_worker.halt_owner_esc_id is None
+    _forbid_waiting_helper(workflow)
+
+    # (a) bounded — returns BLOCKED without anything releasing an escalation event
+    outcome = await asyncio.wait_for(
+        _invoke_trio_handler(workflow, handler_id), timeout=2,
+    )
+    assert outcome == WorkflowOutcome.BLOCKED
+    assert workflow._escalation_event is not None
+    assert not workflow._escalation_event.is_set(), (
+        'the handler must return on its own, not because something released '
+        'the escalation event (INV-7: no unbounded hold of slot/lane/queue)'
+    )
+
+    # (b) exactly ONE human-facing L1, at the category the shared builder emits
+    assert workflow.escalation_queue is not None
+    pending = workflow.escalation_queue.get_pending()
+    assert len(pending) == 1, (
+        f'{handler_id}: expected exactly one escalation (the handler owns the '
+        f'human-facing record; _mark_blocked(skip_escalation=True) must not '
+        f'double-file), got {pending!r}'
+    )
+    esc = pending[0]
+    assert esc.level == 1
+    assert esc.category == expected_category
+    assert summary_token in esc.summary, (
+        f'{handler_id}: summary must name {summary_token!r}: {esc.summary!r}'
+    )
+
+    # (c) halt still asserted and owned by that escalation — the sole unhalt
+    #     edge is now the durable record's resolution (harness
+    #     _on_escalation_resolved -> is_halt_owner -> unhalt_wip).
+    assert fake_worker.is_wip_halted is True, (
+        f'{handler_id}: the halt must survive the handler returning — the tree '
+        f'is still dirty and only a human resolving the L1 may clear it'
+    )
+    assert fake_worker.halt_owner_esc_id == esc.id
+
+    # (d) INV-6: the slot is freed, so the row must say so
+    assert isinstance(workflow.scheduler, FakeScheduler)
+    assert 'blocked' in workflow.scheduler.statuses.get(workflow.task_id, []), (
+        f'{handler_id}: returning BLOCKED exits the slot, so the task row must '
+        f'be parked blocked; got '
+        f'{workflow.scheduler.statuses.get(workflow.task_id, [])!r}'
+    )
+
+    # (e) §7.9 constraint (a): nothing on this exit path unhalts
+    assert fake_worker.last_unhalt_reason is None, (
+        f'{handler_id}: the exit path must NEVER unhalt (got reason '
+        f'{fake_worker.last_unhalt_reason!r}) — the halt is released only by '
+        f'the durable record being resolved'
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('handler_id,expected_category,summary_token', _TRIO, ids=_TRIO_IDS)
+async def test_trio_never_refiles_sibling_halt_category(
+    handler_id: str,
+    expected_category: str,
+    summary_token: str,
+    workflow: TaskWorkflow,
+    fake_worker: _FakeMergeWorker,
+) -> None:
+    """§7.9 constraint (c): recovery never re-files a sibling halt-category
+    record.
+
+    Rehydration selects the halt owner most-recent-wins across the halt
+    categories, so a second record filed while a sibling already owns the halt
+    would make a restart re-own the WRONG escalation.  Mirrors the defensive
+    re-check ``_escalate_train_halt`` already carries.
+
+    RED today: the handler unconditionally submits and calls ``set_halt_owner``,
+    tripping ``_FakeMergeWorker``'s owner-collision assertion.
+    """
+    fake_worker.halt_for_wip(handler_id)
+    fake_worker._owner = 'esc-foreign-1'  # type: ignore[attr-defined]
+    _forbid_waiting_helper(workflow)
+
+    outcome = await asyncio.wait_for(
+        _invoke_trio_handler(workflow, handler_id), timeout=2,
+    )
+
+    # (a) still a truthful slot exit
+    assert outcome == WorkflowOutcome.BLOCKED
+    assert isinstance(workflow.scheduler, FakeScheduler)
+    assert 'blocked' in workflow.scheduler.statuses.get(workflow.task_id, [])
+
+    # (b) no duplicate filing
+    assert workflow.escalation_queue is not None
+    assert workflow.escalation_queue.get_pending() == [], (
+        f'{handler_id}: a sibling already owns the halt — filing a second '
+        f'halt-category record would make rehydration re-own the wrong one'
+    )
+
+    # (c) the foreign owner is untouched, and the halt is neither stolen nor released
+    assert fake_worker.halt_owner_esc_id == 'esc-foreign-1'
+    assert fake_worker.is_wip_halted is True
+    assert fake_worker.last_unhalt_reason is None
