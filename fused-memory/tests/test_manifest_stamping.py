@@ -9,6 +9,7 @@ commit_planning integration tests in test_task_tools.py).
 """
 
 import json
+import logging
 from unittest.mock import AsyncMock
 
 import pytest
@@ -93,6 +94,40 @@ tasks:
           kind: manual
           reason: 'no automated check available'
 """
+
+
+def _mechanical_sidecar_yaml(prd_stem: str, labels: list[str]) -> str:
+    """Render a valid capability-manifest sidecar YAML string for tests.
+
+    One task entry per label in ``labels``, in order, each with
+    ``task_id: null`` and a single MECHANICAL (``grep``) ``delivered_check``
+    — never ``manual`` — so every generated fixture both parses against
+    ``shared.capability_manifest.parse_capability_manifest`` and reaches the
+    step-5 ``update_task`` call for each label. An invalid fixture here
+    would silently divert a test that's supposed to exercise the
+    containment guard / multi-sidecar tie-break / rejected-write branch
+    into the already-covered malformed-sidecar branch instead — verified
+    ad-hoc against the real α-loader when this helper was authored (see
+    pre-1 in plan.json), not re-asserted as a standing test here.
+    """
+    task_blocks = []
+    for label in labels:
+        task_blocks.append(
+            f'  - label: {label}\n'
+            f'    task_id: null\n'
+            f'    title: Mechanical task {label}\n'
+            f'    capabilities:\n'
+            f'      - name: grep_check_{label}\n'
+            f"        binding: 'grep for the {label} marker'\n"
+            f'        verdict: PASS\n'
+            f'        delivered_check:\n'
+            f'          kind: grep\n'
+            f"          pattern: 'TODO({label})'\n"
+            f'          expect: absent\n'
+            f'          paths:\n'
+            f'            - src/{label}.py\n'
+        )
+    return f'prd: plans/{prd_stem}-prd.md\nschema_version: 1\ntasks:\n' + ''.join(task_blocks)
 
 
 @pytest.mark.asyncio
