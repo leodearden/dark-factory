@@ -10,18 +10,22 @@ cores -- a >=11x tail).
 
 The fix charges the budget in EVENT-LOOP-RESPONSIVE time instead: each polling
 slice contributes only ``min(observed, slice_s)``, so wall clock the worker
-never got is not billed to the awaited work. The four behaviours pinned here
-are the whole contract:
+never got is not billed to the awaited work. The behaviours pinned here are the
+whole contract:
 
   (a) a promptly-resolved awaitable returns its value unchanged, fast;
   (b) a REAL hang on a RESPONSIVE loop still reports red, loudly, by label --
       the fix must not be able to mask a genuine merge-pipeline deadlock;
-  (c) under simulated starvation the budget stretches automatically, so a wait
-      whose APPARENT wall clock far exceeds ``timeout`` still succeeds -- this
-      is load-independence BY CONSTRUCTION, not a wider deadline;
+  (c) under simulated starvation the budget is NOT charged in wall-clock terms,
+      so a wait whose APPARENT wall clock far exceeds ``timeout`` still
+      succeeds (the case below lifts ``max_wall_s`` to isolate the accounting;
+      in production that stretch is hard-bounded -- see (d));
   (d) the ``max_wall_s`` cap still terminates a permanently-starved wait, so a
       stretched wait can never outlive its class ``@pytest.mark.timeout`` and
-      let pytest-timeout's thread method ``os._exit()`` the xdist worker.
+      let pytest-timeout's thread method ``os._exit()`` the xdist worker;
+  (e) a failure of the awaited work propagates AS ITSELF, and a caller-owned
+      Future is left untouched on give-up -- both promised by the helper's
+      docstring and relied on by every late-arrival call site.
 
 Everything here is hermetic and sub-second: no git, no merge worker, tiny
 injected ``timeout``/``slice_s``/``max_wall_s`` values rather than the
@@ -122,12 +126,18 @@ class TestWaitResponsiveHappyPath:
         assert got == 'from-coro'
 
     async def test_defaults_derive_from_the_shared_merge_constant(self) -> None:
-        # Never a fresh literal: both bounds derive from MERGE_RESULT_TIMEOUT,
-        # and the cap's ratio of exactly 2 is what makes the worst stretched
-        # per-method budget in test_merge_speculation.py (125s x 2 = 250s)
-        # provably clear HEAVY_BARRIER_TEST_TIMEOUT (300s).
+        # Never a fresh literal: the cap derives from MERGE_RESULT_TIMEOUT, and
+        # the ratio of exactly 2 is what the paired @pytest.mark.timeout
+        # arithmetic in test_merge_speculation.py depends on -- this assertion
+        # goes red if RESPONSIVE_WAIT_STRETCH is ever moved off 2.0, which is
+        # precisely what would invalidate that arithmetic.
+        #
+        # A second assertion restating RESPONSIVE_WAIT_WALL_CAP's own
+        # definition (`int(RESPONSIVE_WAIT_STRETCH * MERGE_RESULT_TIMEOUT)`)
+        # used to sit here; it was deleted in the amendment pass because it
+        # could not fail for ANY values of the three constants -- the same
+        # vacuity class this task exists to eliminate.
         assert RESPONSIVE_WAIT_WALL_CAP == 2 * MERGE_RESULT_TIMEOUT
-        assert int(RESPONSIVE_WAIT_STRETCH * MERGE_RESULT_TIMEOUT) == RESPONSIVE_WAIT_WALL_CAP
 
 
 @pytest.mark.asyncio
@@ -284,6 +294,80 @@ class TestWaitResponsiveRealHangStillReportsRed:
             'wait_responsive leaked its wrapper task into pytest-asyncio '
             'teardown instead of cancelling it on give-up'
         )
+
+    async def test_give_up_leaves_a_caller_owned_future_untouched(self) -> None:
+        """The mirror image of the test above, and an equally load-bearing
+        promise: a Future the CALLER created must survive a give-up intact.
+
+        Every late-arrival call site passes ``req_a.result`` -- a Future owned
+        by the MergeRequest, not by this helper -- and several of them go on to
+        await it again or assert on it after an earlier wait. ``owned = task is
+        not aw`` is what keeps the cancel confined to wrapper tasks; without
+        this assertion a refactor of that line could start cancelling caller
+        futures and the suite would stay green (the existing hang test merely
+        calls ``fut.cancel()`` afterwards, which succeeds either way).
+        """
+        fut: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+
+        with pytest.raises(pytest.fail.Exception):
+            await wait_responsive(
+                fut,
+                timeout=BUDGET,
+                label='caller-owned',
+                slice_s=SLICE,
+                max_wall_s=WALL_CAP,
+            )
+
+        assert not fut.cancelled(), (
+            'wait_responsive cancelled a caller-owned Future on give-up; the '
+            'late-arrival tests re-await and assert on req.result after an '
+            'earlier wait, so cancelling it turns one red wait into a '
+            'cascade of unrelated CancelledErrors'
+        )
+        assert not fut.done(), 'caller-owned Future must be left pending'
+        fut.cancel()
+
+
+class _SentinelError(RuntimeError):
+    """Distinct type so the propagation assertions cannot pass by accident."""
+
+
+@pytest.mark.asyncio
+class TestWaitResponsiveExceptionPropagation:
+    """A failure of the awaited work must surface AS ITSELF, not as a give-up.
+
+    ``return task.result()`` re-raises whatever the awaitable failed with, and
+    every late-arrival call site depends on it: ``MergeRequest.result`` can be
+    resolved with an exception rather than a MergeOutcome, and a test that saw
+    ``pytest.fail('... wait_responsive gave up ...')`` instead of the real
+    exception would send a reader hunting a phantom timeout. Nothing pinned
+    this before the amendment pass.
+    """
+
+    async def test_future_resolved_with_an_exception_propagates_it(self) -> None:
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[Any] = loop.create_future()
+        loop.call_later(
+            SLICE * 2,
+            lambda: None if fut.done() else fut.set_exception(_SentinelError('boom')),
+        )
+
+        with pytest.raises(_SentinelError, match='boom'):
+            await wait_responsive(
+                fut, timeout=BUDGET, label='exc-future', slice_s=SLICE, max_wall_s=WALL_CAP
+            )
+
+    async def test_raising_coroutine_propagates_rather_than_failing_the_wait(
+        self,
+    ) -> None:
+        async def _boom() -> None:
+            await asyncio.sleep(SLICE)
+            raise _SentinelError('from-coro')
+
+        with pytest.raises(_SentinelError, match='from-coro'):
+            await wait_responsive(
+                _boom(), timeout=BUDGET, label='exc-coro', slice_s=SLICE, max_wall_s=WALL_CAP
+            )
 
 
 @pytest.mark.asyncio
