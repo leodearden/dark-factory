@@ -91,6 +91,7 @@ __all__ = [
     'ACTION_REPAIRED',
     'CANONICAL_OPENER_PREFIX',
     'EXIT_CLEAN',
+    'EXIT_DID_NOT_CONVERGE',
     'EXIT_REPAIRABLE_REMAINS',
     'EXIT_WRITE_FAILED',
     'INVOKE_CLOSER',
@@ -101,6 +102,7 @@ __all__ = [
     'REASON_CHANGED_UNDER_US',
     'REASON_DANGLING_SYMLINK',
     'REASON_FORMAT_NOT_REPRODUCIBLE',
+    'REASON_LIST_ELEMENT_NO_OBJECT',
     'REASON_LIVE_LANE_PRESENT',
     'REASON_NEVER_TOUCH',
     'REASON_NON_TERMINAL',
@@ -533,6 +535,17 @@ REASON_ROUND_BOUND_EXCEEDED = 'round-bound-exceeded'
 #: them would be silently dropped — so this refuses instead.
 REASON_SELF_NAMING_TAIL = 'self-naming-tail'
 
+#: A BARE STRING inside a list. It has no sibling keys, so there is no object to
+#: derive ``schema_params`` from and nowhere legal to restore a recovered value
+#: to; repairing it could only truncate, which design decision 2 forbids.
+#:
+#: Declining to repair it was always right. Emitting NO OUTCOME for it was not:
+#: the residue counts ARE the human-adjudication queue this sweep exists to
+#: produce, so a flagged string that never reaches them is unrepaired leak that
+#: silently never enters the queue — and ``strings_detected`` under-reports it.
+#: It is reported and counted here, and left byte-identical.
+REASON_LIST_ELEMENT_NO_OBJECT = 'list-element-no-object'
+
 
 class Outcome(NamedTuple):
     """What happened to one detect()-flagged string, and where."""
@@ -559,6 +572,20 @@ class Outcome(NamedTuple):
 def _join(path: str, key: str) -> str:
     """Extend a json path by one object key."""
     return f'{path}.{key}' if path else key
+
+
+def _last_key(path: str) -> str:
+    """The final OBJECT key in a json path, with any list index stripped.
+
+    Used as the ``field`` of a list-element outcome, which has no key of its
+    own: ``evidence[1].tags`` -> ``tags``, so the report groups the element
+    under the list that holds it. ``''`` for a document whose ROOT is a list —
+    there is no containing key to name, and the ``json_path`` (``[0]``) already
+    locates it unambiguously.
+    """
+    tail = path.rsplit('.', 1)[-1]
+    bracket = tail.find('[')
+    return tail if bracket < 0 else tail[:bracket]
 
 
 def _string_holes(node: dict) -> set[str]:
@@ -677,10 +704,30 @@ def _repair_list(node: list, path: str, outcomes: list[Outcome]) -> tuple[list, 
     has no sibling keys, so there is no object to derive schema_params from and
     nowhere legal to restore a recovered value to. Such a string would be
     truncate-only, which design decision 2 forbids.
+
+    A flagged one is nonetheless REPORTED, with
+    :data:`REASON_LIST_ELEMENT_NO_OBJECT` and the usual residue split. Skipping
+    it silently — the original behaviour — kept it out of the residue counters
+    entirely, which is the one thing this sweep must never do with unrepaired
+    leak: those counts are the human-adjudication queue, and a string that
+    reaches neither the repair nor the queue is simply lost.
     """
     working = node
     changed = False
     for index, item in enumerate(node):
+        if isinstance(item, str):
+            if detect(item) is not None:
+                outcomes.append(Outcome(
+                    json_path=f'{path}[{index}]',
+                    field=_last_key(path),
+                    action=ACTION_REFUSED,
+                    recovered_names=(),
+                    reason=REASON_LIST_ELEMENT_NO_OBJECT,
+                    residue=(
+                        RESIDUE_LEAK if has_leak_signature(item) else RESIDUE_QUOTED_ONLY
+                    ),
+                ))
+            continue
         if not isinstance(item, (dict, list)):
             continue
         new_item, item_changed = _repair_node(item, f'{path}[{index}]', outcomes)
@@ -748,6 +795,13 @@ def repair_document(obj: Any) -> tuple[Any, list[Outcome]]:
     half-converged document is still strictly better than a corrupted one —
     and silently returning it as if it were clean is the failure mode that
     would matter.
+
+    LOUDLY means all the way to the operator, not merely into this return
+    value: :func:`run_sweep` counts it into ``Summary.did_not_converge``,
+    :func:`main` prints it, and it forces :data:`EXIT_DID_NOT_CONVERGE`. The
+    outcome is unreachable with today's repair() (B5 refuses a nested parse),
+    which is precisely why the wiring has to exist BEFORE a future widening
+    makes it reachable — a tripwire connected to nothing is not a tripwire.
     """  # noqa: D205
     # The two outcome classes accumulate DIFFERENTLY across rounds, because
     # they mean different things:
@@ -1122,6 +1176,11 @@ EXIT_REPAIRABLE_REMAINS = 1
 #: A write or verification failed. Distinct from 1 because it needs an
 #: operator, not another run.
 EXIT_WRITE_FAILED = 2
+#: A document was still changing when the round bound ran out. Its own code
+#: rather than folding into 2, because it says something categorically
+#: different: 2 is one file's environment (EACCES, ENOSPC), 3 is repair()'s
+#: measured contract no longer holding for this corpus.
+EXIT_DID_NOT_CONVERGE = 3
 
 _LANE_CHOICES = (LANE_ESCALATIONS, LANE_PLANS, 'all')
 
@@ -1131,12 +1190,21 @@ class Summary(NamedTuple):
 
     files_scanned: int
     strings_detected: int
+    #: Repairs that are ON DISK — or, on a dry run, that WOULD be. A repair
+    #: belonging to a file whose write failed is counted in
+    #: :attr:`repaired_not_written` instead, never here.
     repaired: int
     leak_unrepaired: int
     quoted_only: int
     skipped: dict[str, int]
     failed: int
     pending: int
+    #: Repairs computed for a file whose ``--apply`` write then FAILED, so they
+    #: are not on disk. Defaulted so the counter is additive for any caller
+    #: constructing a Summary positionally.
+    repaired_not_written: int = 0
+    #: Documents that were still changing when the round bound ran out.
+    did_not_converge: int = 0
 
     def as_dict(self) -> dict:
         return dict(self._asdict())
@@ -1148,7 +1216,19 @@ class Summary(NamedTuple):
         still be there after ``--apply``. Keying the exit code on residue would
         make the second run red forever and destroy the very signal this task
         is measured by — the residue is not re-runnable work, it needs a human.
+
+        Non-convergence outranks a write failure. Both need an operator, but a
+        write failure is one file's environment and may well clear on a re-run,
+        whereas non-convergence means repair()'s measured behaviour no longer
+        holds — no re-run fixes that, and it is the tripwire the whole
+        ``ACTION_DID_NOT_CONVERGE`` outcome exists to be. It must never leave
+        the process at :data:`EXIT_CLEAN`: under ``--apply`` a non-converging
+        document is still WRITTEN, ``failed`` and ``pending`` both stay 0, and
+        exiting 0 there would be exactly the false "second run reports 0"
+        signal this task is measured by.
         """
+        if self.did_not_converge:
+            return EXIT_DID_NOT_CONVERGE
         if self.failed:
             return EXIT_WRITE_FAILED
         return EXIT_REPAIRABLE_REMAINS if self.pending else EXIT_CLEAN
@@ -1162,6 +1242,15 @@ def run_sweep(root: Path | str, lane: str = 'all', apply: bool = False):
     dangling link, committed evidence) is counted as ``skipped`` and never as
     pending work — otherwise a permanently-skipped file would keep the exit
     code at 1 forever and break the second-run-zero invariant.
+
+    ``repaired`` counts what is ON DISK. Under ``--apply`` a file's repairs are
+    added only AFTER its write returns success; a failed write puts them in
+    ``repaired_not_written`` instead. Counting them before the write made
+    ``repaired: 26 / write failures: 1`` unresolvable — an operator could not
+    tell which 26 landed — and made the number irreproducible on the next run,
+    which is the same run-to-run diff stability the residue counters are held
+    to. A dry run adds them to ``repaired`` because nothing failed: the run
+    wrote nothing BY DESIGN, and ``pending`` is what says so.
     """
     root_path = Path(root)
     targets = discover_targets(root_path)
@@ -1172,6 +1261,7 @@ def run_sweep(root: Path | str, lane: str = 'all', apply: bool = False):
     skipped: dict[str, int] = {}
     diffs: list[str] = []
     scanned = detected = repaired_count = leaks = quotes = failed = pending = 0
+    not_written = stalled = 0
 
     for target in targets:
         scanned += 1
@@ -1192,27 +1282,39 @@ def run_sweep(root: Path | str, lane: str = 'all', apply: bool = False):
             continue
 
         new_obj, outcomes = repair_document(loaded.obj)
+        file_repairs = 0
         for outcome in outcomes:
             if outcome.action == ACTION_REPAIRED:
                 detected += 1
-                repaired_count += 1
+                file_repairs += 1
             elif outcome.action == ACTION_REFUSED:
                 detected += 1
                 if outcome.residue == RESIDUE_LEAK:
                     leaks += 1
                 else:
                     quotes += 1
+            elif outcome.action == ACTION_DID_NOT_CONVERGE:
+                # Deliberately NOT counted into strings_detected: it is a
+                # loop-bound event, not a flagged string, and folding it in
+                # would corrupt the one-outcome-per-string arithmetic the
+                # residue counters rest on. It gets its own counter, its own
+                # report line, and its own exit code.
+                stalled += 1
 
-        if not any(o.action == ACTION_REPAIRED for o in outcomes):
+        if not file_repairs:
             continue
 
-        payload = serialize_like(loaded.raw, new_obj)
         if apply:
             failure = write_repaired(resolved, loaded.raw, new_obj)
             if failure is not None:
                 failed += 1
                 pending += 1
+                not_written += file_repairs
+            else:
+                repaired_count += file_repairs
         else:
+            repaired_count += file_repairs
+            payload = serialize_like(loaded.raw, new_obj)
             diffs.append(''.join(difflib.unified_diff(
                 loaded.raw.splitlines(keepends=True),
                 payload.splitlines(keepends=True),
@@ -1230,6 +1332,8 @@ def run_sweep(root: Path | str, lane: str = 'all', apply: bool = False):
         skipped=skipped,
         failed=failed,
         pending=pending,
+        repaired_not_written=not_written,
+        did_not_converge=stalled,
     ), diffs
 
 
@@ -1277,6 +1381,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f'leak (unrepaired)  : {summary.leak_unrepaired}')
     print(f'quoted only        : {summary.quoted_only}')
     print(f'write failures     : {summary.failed}')
+    print(f'repairs not written: {summary.repaired_not_written}')
+    print(f'did not converge   : {summary.did_not_converge}')
     for reason in sorted(summary.skipped):
         print(f'skipped/{reason:<10}: {summary.skipped[reason]}')
     return summary.exit_code()

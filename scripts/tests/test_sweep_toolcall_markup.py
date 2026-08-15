@@ -869,6 +869,57 @@ def test_repair_reaches_corruption_nested_in_a_list_of_objects():
     assert outcomes[0].recovered_names == (), 'B4 last-parameter: nothing dropped'
 
 
+def test_a_flagged_bare_string_in_a_list_is_reported_never_silently_skipped(tmp_path):
+    """A list element cannot be repaired — but it must still be COUNTED.
+
+    A bare string in a list has no sibling keys, so there is no object to derive
+    ``schema_params`` from and nowhere legal to restore a recovered value to;
+    repairing it could only truncate, which design decision 2 forbids. Declining
+    was always right. Emitting NO OUTCOME was not: the string is unrepaired leak
+    that never entered the human-adjudication queue the residue counts ARE, and
+    ``strings_detected`` under-reported it.
+
+    ``evidence`` entries are dicts across the live corpus (39 of the flagged
+    strings are ``evidence[].observation``), which is exactly why the bare-string
+    shape had no test: it is the shape with no object to repair into.
+    """
+    element = _swallowed('Do a thing.', 'detail', 'suggested_action', 'x')
+    record = make_escalation('esc-list-1', 'resolved', 'A clean detail.')
+    record['evidence'] = [element]
+
+    repaired, outcomes = sweep.repair_document(record)
+
+    assert repaired is record, 'nothing changed, so nothing was copied'
+    assert repaired['evidence'] == [element], 'left BYTE-IDENTICAL'
+    assert len(outcomes) == 1, f'exactly one outcome for the one flagged string: {outcomes}'
+    assert outcomes[0].action == sweep.ACTION_REFUSED
+    assert outcomes[0].reason == sweep.REASON_LIST_ELEMENT_NO_OBJECT
+    assert outcomes[0].json_path == 'evidence[0]', 'the report LOCATES it'
+    assert outcomes[0].field == 'evidence', 'grouped under the list that holds it'
+    assert outcomes[0].residue == sweep.RESIDUE_LEAK, 'and it is classified as leak'
+
+
+def test_a_flagged_list_element_reaches_the_residue_counters(tmp_path):
+    """End-to-end: it is counted once, and the file is not rewritten."""
+    path = write_escalation(
+        tmp_path / 'data' / 'escalations' / 'esc-list-2.json',
+        make_escalation(
+            'esc-list-2',
+            'resolved',
+            'A clean detail.',
+            evidence=[_swallowed('Do a thing.', 'detail', 'suggested_action', 'x')],
+        ),
+    )
+    before = path.read_bytes()
+
+    summary, _diffs = sweep.run_sweep(tmp_path, apply=True)
+
+    assert summary.strings_detected == 1, 'it is DETECTED, not invisible'
+    assert summary.leak_unrepaired == 1, 'and it enters the adjudication queue'
+    assert summary.repaired == 0
+    assert path.read_bytes() == before, 'a string with nowhere to restore to is untouched'
+
+
 def test_repair_of_a_clean_document_is_identity_with_no_outcomes():
     """Case (f): unchanged, zero outcomes, and the SAME object back.
 
@@ -1577,6 +1628,53 @@ def test_residue_never_sets_a_non_zero_exit(tmp_path, capsys):
     assert code == sweep.EXIT_CLEAN, 'unrepairable residue is reported, not failed'
 
 
+def test_non_convergence_is_counted_at_the_cli_and_forces_a_non_zero_exit(
+    tmp_path, capsys, monkeypatch
+):
+    """The tripwire has to reach the OPERATOR, not stop at a return value.
+
+    ``ACTION_DID_NOT_CONVERGE`` was produced by ``repair_document`` and then
+    discarded: ``run_sweep``'s outcome loop branched only on REPAIRED/REFUSED,
+    ``Summary`` had no field for it and ``main`` never printed it. Under
+    ``--apply`` the non-converging document is still WRITTEN, ``failed`` and
+    ``pending`` both stay 0, and the process exited EXIT_CLEAN with repairable
+    markup still in the tree — precisely the false "second run reports 0" signal
+    this task is measured by.
+
+    Stubbed like :func:`test_a_non_converging_document_reports_did_not_converge`,
+    and for the same reason: no real document can reach the bound today (B5
+    refuses a nested parse). That is what makes the wiring worth testing NOW —
+    the outcome exists to be the tripwire for a future widening of ``repair()``,
+    and a tripwire connected to nothing is not a tripwire.
+    """
+    def _never_converges(value, param, schema_params, supplied):
+        return sweep.Repair(
+            clean_value=value,
+            recovered={'root_cause': 'restored by the stub'},
+            pattern=INVOKE_CLOSER,
+            misclose=INVOKE_CLOSER,
+        )
+
+    monkeypatch.setattr(sweep, 'repair', _never_converges)
+    write_escalation(
+        tmp_path / 'data' / 'escalations' / 'esc-stall.json',
+        make_escalation('esc-stall', 'resolved', 'detail ' + INVOKE_CLOSER),
+    )
+
+    code, summary = _run_json(capsys, '--root', str(tmp_path), '--apply')
+
+    assert summary['did_not_converge'] == 1, 'counted at the CLI boundary'
+    assert summary['failed'] == 0 and summary['pending'] == 0, (
+        'neither existing counter notices it — which is why it needs its own'
+    )
+    assert code == sweep.EXIT_DID_NOT_CONVERGE
+    assert code != sweep.EXIT_CLEAN, 'never a green exit with the loop still spinning'
+
+    # ...and an operator reading the text report sees it too.
+    sweep.main(['--root', str(tmp_path)])
+    assert 'did not converge   : 1' in capsys.readouterr().out
+
+
 def test_the_lane_flag_narrows_the_sweep(sweep_root, capsys):
     """--lane lets an operator run one corpus at a time."""
     _c, plans_only = _run_json(capsys, '--root', str(sweep_root), '--lane', 'plans')
@@ -1693,6 +1791,56 @@ def test_a_write_failure_exits_2_names_the_path_and_does_not_abort(sweep_root, c
     # ...and the sweep carried on to the other lane.
     plan = json.loads(plan_path.read_text(encoding='utf-8'))
     assert detect(plan['design_decisions'][0]['rationale']) is None, 'others repaired'
+
+
+def test_a_failed_write_does_not_count_its_repairs_as_applied(
+    sweep_root, capsys, monkeypatch
+):
+    """``repaired`` counts what is ON DISK, so the report is reproducible.
+
+    The counters were incremented from the outcome list BEFORE the write was
+    attempted, so a file whose write failed still contributed its repairs. The
+    operator then read ``repaired: 26 / write failures: 1`` with no way to tell
+    which 26 actually landed — and the number did not reproduce on the next run,
+    undermining exactly the run-to-run diff stability the residue counters are
+    held to.
+
+    The split is conserving: every repair the run computed is in one bucket or
+    the other, and the two sum to what the dry run promised.
+    """
+    record_path = (
+        sweep_root / 'data' / 'escalations' / 'archive' / '2026-08-08' / 'esc-2-1.json'
+    )
+    _dry_code, dry = _run_json(capsys, '--root', str(sweep_root))
+
+    real_replace = os.replace
+
+    def _selective(src, dst):
+        if Path(dst) == record_path:
+            raise OSError(13, 'Permission denied')
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(sweep.os, 'replace', _selective)
+    code, summary = _run_json(capsys, '--root', str(sweep_root), '--apply')
+
+    assert code == sweep.EXIT_WRITE_FAILED
+    assert summary['failed'] == 1
+    assert summary['repaired_not_written'] == 1, "the failed file's repair is NOT on disk"
+    assert summary['repaired'] == dry['repaired'] - 1, 'and it is not in `repaired`'
+    assert summary['repaired'] + summary['repaired_not_written'] == dry['repaired'], (
+        'the split conserves: every computed repair is in exactly one bucket'
+    )
+
+    # The claim is checkable against the tree: the uncounted repair really did
+    # not land. With the same failure still in place, the next run reports the
+    # SAME numbers — the counters describe disk state, so they reproduce.
+    assert detect(
+        json.loads(record_path.read_text(encoding='utf-8'))['detail']
+    ) is not None, 'the failed target is still corrupt on disk'
+    _code2, second = _run_json(capsys, '--root', str(sweep_root), '--apply')
+    assert second['repaired'] == 0, 'the landed repairs are done and never re-counted'
+    assert second['repaired_not_written'] == 1, 'the one that never landed, reported again'
+    assert second['failed'] == 1
 
 
 # ---------------------------------------------------------------------------
