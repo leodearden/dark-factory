@@ -3132,12 +3132,33 @@ class GitOps:
             lock_path, _MERGE_VERIFY_LEASE_WAIT_SECS,
         )
         if fd is None:
-            # ONE kernel snapshot drives both the decision and the message
-            # (task 3081): a second, independent /proc/locks read for the
+            # ONE SETTLED kernel snapshot drives both the decision and the
+            # message (tasks 3081, 3783) — see reset_persistent_merge_worktree's
+            # identical read, which this must stay in step with.
+            #
+            # ONE, because a second, independent /proc/locks read for the
             # render could observe a different holder set than the predicate
             # evaluated, misdescribing the very decision an operator is trying
             # to reconstruct.
-            holder_pids = lane_lock_holder_pids(lock_path)
+            #
+            # SETTLED, because a single read can come back EMPTY through no
+            # fault of the lane: /proc/locks is a seq_file served one page per
+            # read(2) and each read restarts the walk from a positional index,
+            # so a release at an earlier position skips our record outright
+            # (1.54% of reads under load).  An empty snapshot HERE contradicts
+            # the acquire timeout that just produced it, and it used to cost
+            # both consumers at once — the message degraded to "no FLOCK
+            # holder" and layer (1) of the leak predicate below silently
+            # failed OPEN.  Bounded, fail-safe, and still empty afterwards
+            # means it degrades exactly as before.
+            #
+            # Safe to await here, and only here: the acquire has already
+            # returned None, so NO fd is in flight and a cancellation landing
+            # inside the poll cannot orphan the lane (B12 untouched).  The
+            # later snapshot is a safe asymmetry — layer (1) can only GAIN a
+            # true kernel attribution, while layers (2) and (3) are read
+            # afterwards and can only VETO.
+            holder_pids = await _settled_lane_lock_holder_pids(lock_path)
             # Is this OUR OWN leaked lock rather than somebody else's live
             # hold?  Asked first, because the answer changes the diagnosis
             # entirely (task 3081) — and only ever REPORTS: the refusal below

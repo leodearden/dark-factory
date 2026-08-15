@@ -191,11 +191,25 @@ def foreign_lane_lock_holder(
     ``/proc/locks`` NAMES ``child.pid`` as the FLOCK holder, within
     :data:`_FOREIGN_HOLDER_ATTRIBUTION_SECS`.  Until task 3598, only the first
     half was ever established, even though ``test_foreign_holder_is_contention_not_a_leak``'s
-    ``child.pid in holders`` assertion (and ``_lane_lock_holder_facts``'
-    raise-time re-read, at the point ``git_ops`` reports the timeout) both
-    depend on the second — so every "the foreign holder" assertion downstream
-    was racing ``/proc/locks`` settling under load rather than testing
-    genuine contention.
+    ``child.pid in holders`` assertion (and the PRODUCTION-side read, at the
+    point ``git_ops`` reports the timeout) both depend on the second — so
+    every "the foreign holder" assertion downstream was racing
+    ``/proc/locks`` settling under load rather than testing genuine
+    contention.
+
+    That second dependent is now hardened at its own end (task 3783): both
+    acquire-timeout sites read through
+    :func:`~orchestrator.git_ops._settled_lane_lock_holder_pids`, which
+    re-reads a bounded number of times when the kernel hands back an EMPTY
+    holder set — the measured seq_file chunked-read transient this fixture's
+    own gate absorbs on the staging side.  So a consumer's downstream "the
+    timeout must name the foreign holder" assertion no longer rides on this
+    gate alone: staging and production each settle their own read, and
+    neither one covers for the other.  Note the consequence for the ceiling
+    invariant below — a consumer that drives a contended raise INSIDE this
+    ``with`` block now pays that production bound on top of this helper's
+    unconditional stack (pinned by
+    ``test_settle_bound_stays_clear_of_the_foreign_holder_ceiling``).
 
     Yields ``(child, holders)``: *child* is the ``flock(1)`` subprocess, and
     *holders* is the SAME kernel-reported holder-pid snapshot fact (2) above
