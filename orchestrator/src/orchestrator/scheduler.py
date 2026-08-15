@@ -1451,7 +1451,17 @@ class Scheduler:
         # the store later (harness.py:1498-1514 -> :2121-2122), so the live
         # feed needs somewhere to go from the first tick.  The durable seed
         # happens in finish_startup(), by which time the store is attached.
-        self._hold_history = HoldHistory()
+        #
+        # The sample floor is read from config HERE AND NOWHERE ELSE (task 3823
+        # / PRD task η).  hold_history.py deliberately stands alone without the
+        # config object and so carries only a module default (:591-593), which
+        # makes this construction site the single seam where the
+        # ``backfill_min_samples`` leaf becomes live — hard-coding it would
+        # leave an operator's edit silently inert.  ``window`` and
+        # ``stale_open_secs`` stay at their module defaults on purpose: C7 names
+        # only the sample floor, and adding unrequested knobs widens the config
+        # surface for no contract.
+        self._hold_history = HoldHistory(min_samples=self.config.backfill_min_samples)
         self._mcp_session = mcp_session
         self._dispatched: set[str] = set()
         # Task 2408 mechanism 2: attribute-injected by the Harness right
