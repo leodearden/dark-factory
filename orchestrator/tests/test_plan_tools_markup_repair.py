@@ -276,6 +276,25 @@ _COLLECTION_SCHEMA_TOOL_NAME = {
 }
 
 
+def _seed_plan_through_real_writers(root) -> TaskArtifacts:
+    """Build a plan by calling the five REAL writer tools; return its artifacts.
+
+    The single source of the seeding shape. Both :func:`_observed_plan_keys`
+    and :func:`_alternate_writer_changed_the_cell` build their fixture plan
+    through this helper rather than each restating the same five calls, so
+    adding a sixth writer — or changing one of these five signatures — is one
+    edit instead of two silently-divergeable ones.
+    """
+    artifacts = TaskArtifacts(root)
+    artifacts.init('test-1', 'Test task', 'A test')
+    plan_tools._create_plan(artifacts, 'test-1', 'A title.', 'An analysis.', ['a.py'])
+    plan_tools._add_prerequisite(artifacts, 'pre-1', 'A prerequisite.')
+    plan_tools._add_plan_step(artifacts, 'step-1', 'test', 'A step.')
+    plan_tools._add_design_decision(artifacts, 'A decision.', 'A rationale.')
+    plan_tools._add_reuse_item(artifacts, 'A thing', 'somewhere.py', 'By importing it.')
+    return artifacts
+
+
 def _observed_plan_keys(root) -> dict[str | None, set[str]]:
     """Build a plan through the REAL writers; return the keys they actually wrote.
 
@@ -285,14 +304,7 @@ def _observed_plan_keys(root) -> dict[str | None, set[str]]:
     exactly as ``schema_params`` is derived from ``inspect.signature``, rather
     than restating them as a hardcoded literal a refactor could silently orphan.
     """
-    artifacts = TaskArtifacts(root)
-    artifacts.init('test-1', 'Test task', 'A test')
-    plan_tools._create_plan(artifacts, 'test-1', 'A title.', 'An analysis.', ['a.py'])
-    plan_tools._add_prerequisite(artifacts, 'pre-1', 'A prerequisite.')
-    plan_tools._add_plan_step(artifacts, 'step-1', 'test', 'A step.')
-    plan_tools._add_design_decision(artifacts, 'A decision.', 'A rationale.')
-    plan_tools._add_reuse_item(artifacts, 'A thing', 'somewhere.py', 'By importing it.')
-    plan = artifacts.read_plan()
+    plan = _seed_plan_through_real_writers(root).read_plan()
 
     observed: dict[str | None, set[str]] = {None: set(plan)}
     for collection in ('prerequisites', 'steps', 'design_decisions', 'reuse'):
@@ -304,9 +316,21 @@ def _observed_plan_keys(root) -> dict[str | None, set[str]]:
 
 def _alternate_writer_changed_the_cell(
     root, collection: str | None, field: str, tool_name: str
-) -> bool:
-    """True iff calling the DECLARED alternate *tool_name* actually rewrites the
-    (*collection*, *field*) cell of a plan seeded through the real writers.
+) -> tuple[bool, dict[str, object] | None]:
+    """(changed, refusal) for calling *tool_name* on a plan seeded through the
+    real writers, addressed at the (*collection*, *field*) cell.
+
+    ``changed`` is True iff the cell's value differs after the call AND its
+    item still exists. ``refusal`` is the tool's own status envelope when that
+    envelope indicates it declined the call (``None`` on a successful call,
+    whether or not the cell changed). Every plan-tools impl returns its
+    refusal envelope BEFORE calling
+    ``artifacts.write_plan``/``update_step_status``/``mark_step_committed`` on
+    every refusal path, so ``refusal is not None`` always implies
+    ``changed is False`` — never the reverse. Separating the two lets a caller
+    distinguish "genuinely does not write this field" from "the probe called
+    it wrong" (e.g. a stale id, an item already ``done``); collapsing both into
+    a bare bool made every refusal read as proof of the former.
 
     THE BEHAVIOURAL PROOF ``also_written_by`` NEEDS. A signature check
     (``field in _tool_params(impl)``) can only see a writer that takes the
@@ -315,41 +339,48 @@ def _alternate_writer_changed_the_cell(
     without ever taking a ``description`` argument at all. Proving the write
     behaviourally is the invariant the signature proxy was standing in for.
 
-    Builds the plan exactly as :func:`_observed_plan_keys` does (same five
-    real writers), snapshots the addressed cell, invokes *tool_name* with
-    arguments synthesized from ITS OWN live signature — never a hardcoded
-    call — and reports whether the cell changed while its item still exists.
-    A parameter name this synthesis does not recognise raises loudly rather
-    than being silently left unset, so a probe can never pass by having
-    quietly called the alternate with a hole in its arguments.
+    Seeds via :func:`_seed_plan_through_real_writers` (same five real writers
+    as :func:`_observed_plan_keys`), snapshots the addressed cell, invokes
+    *tool_name* with arguments synthesized from ITS OWN live signature — never
+    a hardcoded call. A parameter name this synthesis does not recognise
+    raises loudly rather than being silently left unset, so a probe can never
+    pass by having quietly called the alternate with a hole in its arguments.
+
+    A collection whose items carry no ``id`` (``design_decisions``, ``reuse``)
+    is addressed POSITIONALLY — the single seeded item at index 0 — rather
+    than by id, since there is no id to look up; probing one of their rows
+    used to raise a bare ``KeyError`` before this existed.
 
     An alternate whose guard depends on state this fixture cannot supply
     (currently only ``mark_step_committed``, via ``_sha_exists_on_branch`` —
     ``root`` here is not a git repository) is the CALLER's responsibility to
     satisfy first, e.g. via ``monkeypatch``.
     """
-    artifacts = TaskArtifacts(root)
-    artifacts.init('test-1', 'Test task', 'A test')
-    plan_tools._create_plan(artifacts, 'test-1', 'A title.', 'An analysis.', ['a.py'])
-    plan_tools._add_prerequisite(artifacts, 'pre-1', 'A prerequisite.')
-    plan_tools._add_plan_step(artifacts, 'step-1', 'test', 'A step.')
-    plan_tools._add_design_decision(artifacts, 'A decision.', 'A rationale.')
-    plan_tools._add_reuse_item(artifacts, 'A thing', 'somewhere.py', 'By importing it.')
+    artifacts = _seed_plan_through_real_writers(root)
 
     seeded_id = None
+    address_by_index = False
     if collection is not None:
         items = artifacts.read_plan()[collection]
         assert items and isinstance(items[0], dict), (
             f'the seeded plan has no item in {collection!r} to probe'
         )
-        seeded_id = items[0]['id']
+        if 'id' in items[0]:
+            seeded_id = items[0]['id']
+        else:
+            address_by_index = True
 
     def _cell() -> tuple[object, bool]:
         """(value, item still present) at the (collection, field) address."""
         plan = artifacts.read_plan()
         if collection is None:
             return plan.get(field), True
-        for item in plan.get(collection, []):
+        items = plan.get(collection, [])
+        if address_by_index:
+            if items and isinstance(items[0], dict):
+                return items[0].get(field), True
+            return None, False
+        for item in items:
             if isinstance(item, dict) and item.get('id') == seeded_id:
                 return item.get(field), True
         return None, False
@@ -365,7 +396,7 @@ def _alternate_writer_changed_the_cell(
             kwargs[name] = seeded_id
         elif name == 'step_type':
             kwargs[name] = 'test'
-        elif name == 'sha':
+        elif name in ('sha', 'commit_sha'):
             kwargs[name] = 'a' * 40
         elif name == 'files':
             kwargs[name] = ['a.py']
@@ -382,10 +413,13 @@ def _alternate_writer_changed_the_cell(
                 f'synthesize a value for {impl.__name__}({name!r}) — extend '
                 'the probe rather than silently probing nothing'
             )
-    impl(artifacts, **kwargs)
+    result = impl(artifacts, **kwargs)
+    refusal = None
+    if not (result.get('status') == 'ok' or result.get('ok') is True):
+        refusal = result
 
     after, still_exists = _cell()
-    return still_exists and after != before
+    return still_exists and after != before, refusal
 
 
 class TestRepairableFieldTable:
@@ -544,9 +578,13 @@ class TestRepairableFieldTable:
                     f'{name!r} is the schema owner, already reported as `tool`'
                 )
                 root = tmp_path / f'{record.collection}-{record.field}-{name}'
-                assert _alternate_writer_changed_the_cell(
+                changed, refusal = _alternate_writer_changed_the_cell(
                     root, record.collection, record.field, name
-                ), (
+                )
+                assert changed, (
+                    f'{name!r} refused the probe call: {refusal!r} — the probe '
+                    'called it wrong, it is not necessarily a non-writer'
+                    if refusal is not None else
                     f'{record.collection}.{record.field} names {name!r} as an '
                     'alternate writer, but the probe observed no change on '
                     'that cell — it cannot actually write that field'
@@ -580,9 +618,13 @@ class TestRepairableFieldTable:
         monkeypatch.setattr(plan_tools, '_sha_exists_on_branch', lambda *_a, **_k: True)
 
         for collection in ('steps', 'prerequisites'):
-            assert _alternate_writer_changed_the_cell(
+            changed, refusal = _alternate_writer_changed_the_cell(
                 tmp_path / collection, collection, 'description', 'mark_step_committed'
-            ), (
+            )
+            assert changed, (
+                f'mark_step_committed refused the probe call: {refusal!r} — the '
+                'probe called it wrong, it is not necessarily a non-writer'
+                if refusal is not None else
                 f'mark_step_committed is supposed to rewrite {collection}.description '
                 '(it prepends a [COMMITTED <sha>] tag) but the probe observed no change'
             )
