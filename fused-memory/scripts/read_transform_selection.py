@@ -982,7 +982,8 @@ def score_unlabeled_query(
 def __getattr__(name: str) -> Any:
     """Re-export the bake-off's helpers BY IDENTITY, lazily (INV-5).
 
-    ``_mean`` (:3286) and ``_rate`` (:1622) carry the no-measurement
+    ``_mean`` (:3286), ``_rate`` (:1622) and ``_cell`` (:1955) carry the
+    no-measurement
     discipline this module depends on — a ``None`` is a non-observation and
     must never average in as a zero.  A local wrapper would be a second
     implementation that could drift; a module-level import would force the
@@ -991,7 +992,7 @@ def __getattr__(name: str) -> Any:
     ``read_transform_selection._mean is bake_off._mean`` holds, and nothing
     loads until it is first asked for.
     """
-    if name in ('_mean', '_rate'):
+    if name in ('_mean', '_rate', '_cell'):
         return getattr(bake_off(), name)
     raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
 
@@ -1262,3 +1263,419 @@ def run_selection(
             for arm in ARM_KEYS
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# The artifact: plans/read-transform-selection-report.{json,md}
+# ---------------------------------------------------------------------------
+#
+# A SIBLING pair, deliberately not an extension of
+# `plans/e2-storage-shape-bakeoff-report.*`.  That artifact is the record of
+# a different experiment (which WRITE shape), its `_check_arms` asserts the
+# E2 arm set exactly, and task 3560 is concurrently landing the aliasing
+# disclosure into it.  Writing read-side arms there would break its guards
+# and collide with 3560.
+#
+# The E2 module's artifact discipline is reused wholesale, because every part
+# of it was paid for: render BEFORE writing (:2316) so a render failure
+# leaves both files untouched rather than a stale .md beside a fresh .json;
+# `_atomic_write_text` (:2322); `_cell`/`_NO_MEASUREMENT` (:1955/:1824) so a
+# None cannot print as 0.00; `fixture_provenance` (:1844) for the commit
+# stamps.
+
+from fused_memory.memory_metadata import (  # noqa: E402
+    RESERVED_VOCABULARY_KEYS as _LIVE_RESERVED_KEYS,
+)
+
+#: The live reserved set, IMPORTED rather than restated.  The V2 disclosure
+#: turns on `contested` not being in it; a hard-coded list here would go
+#: stale silently the day a sixth key is reserved, and the disclosure would
+#: keep asserting an impossibility that had quietly become possible.
+RESERVED_VOCABULARY_KEYS = _LIVE_RESERVED_KEYS
+
+#: Quoted verbatim from PRD V2 — the esc-5712 protection.
+V2_PROTECTION = 'contested children are never suppressed'
+
+#: Every metric an arm must carry before a row may be rendered.  A ``None``
+#: VALUE is a legitimate no-measurement; an ABSENT KEY is a broken run.
+REQUIRED_ARM_METRICS: tuple[str, ...] = (
+    'claim_recall',
+    'tokens_per_query',
+    'topic_diversity',
+    'baseline_retention_at_k',
+    'window_displacement',
+    'canonical_aliased_in_top_k',
+    'canonical_unaliased_in_top_k',
+)
+
+SELECTION_REPORT_SCHEMA = 'read-transform-selection/1'
+
+
+class IncompleteSelectionError(RuntimeError):
+    """A partial table must never render as a complete one.
+
+    Mirrors ``IncompleteReportError``/``_check_arms`` (:1887-1920), including
+    its reason for reporting a missing and an unknown arm TOGETHER: the
+    unknown name is the actionable half, and an error naming only the absence
+    sends a reader hunting for an arm that ran perfectly well.
+    """
+
+
+def _check_selection_arms(scored: dict[str, Any]) -> None:
+    for half in ('e2', 'production'):
+        arms = scored.get(half) or {}
+        missing = [arm for arm in ARM_KEYS if arm not in arms]
+        unknown = [arm for arm in arms if arm not in ARM_KEYS]
+        if missing or unknown:
+            problems = []
+            if missing:
+                problems.append(f'no measurement for {missing}')
+            if unknown:
+                problems.append(f'unknown arm(s) {unknown}')
+            raise IncompleteSelectionError(
+                f'{half}: {"; ".join(problems)}. Expected exactly '
+                f'{list(ARM_KEYS)}. Refusing to emit a decision table with a '
+                f'missing row: a reader cannot tell an absent arm from one '
+                f'that scored the same as its neighbour.'
+            )
+        for arm in ARM_KEYS:
+            means = arms[arm].get('means') or {}
+            for metric in REQUIRED_ARM_METRICS:
+                if metric not in means:
+                    raise IncompleteSelectionError(
+                        f"{half}: arm '{arm}' is missing metric '{metric}'. "
+                        'A None VALUE is a measured no-measurement and is '
+                        'fine; an absent KEY means the run did not produce '
+                        'it, which is not the same fact.'
+                    )
+
+
+def _rank_key(arm: str, e2: dict[str, Any]) -> tuple:
+    """Deterministic ordering over MEASURED columns only.
+
+    No threshold, no tuning knob: the rule is stated in the artifact and
+    applied as written (PRD gate G6/D10 — a column is never moved to make a
+    recommendation come out).  A ``None`` sorts LAST rather than as a zero.
+    """
+    def worst_first(value: Any, *, higher_is_better: bool) -> tuple[int, float]:
+        if value is None:
+            return (1, 0.0)
+        return (0, -float(value) if higher_is_better else float(value))
+
+    return (
+        worst_first(e2.get('canonical_unaliased_in_top_k'), higher_is_better=True),
+        worst_first(e2.get('claim_recall'), higher_is_better=True),
+        worst_first(e2.get('tokens_per_query'), higher_is_better=False),
+        worst_first(e2.get('window_displacement'), higher_is_better=False),
+        arm,
+    )
+
+
+def _recommend(arms: dict[str, Any]) -> dict[str, Any]:
+    """Which read transform should 3111 land?
+
+    LANDABILITY FIRST, then measurement.  An arm that would need the
+    ``contested`` key to satisfy PRD V2 cannot ship the esc-5712 protection
+    today at any score, because the key has no writer and no adjudication
+    surface — so it is excluded from the recommendation and the exclusion is
+    printed, rather than being silently outranked.
+    """
+    eligible = [
+        arm for arm in ARM_KEYS
+        if not arms[arm]['spec']['requires_contested_key_for_v2']
+    ]
+    excluded = [arm for arm in ARM_KEYS if arm not in eligible]
+    winner = min(eligible, key=lambda arm: _rank_key(arm, arms[arm]['e2']))
+    return {
+        'arm': winner,
+        'label': ARM_LABELS[winner],
+        'eligible': eligible,
+        'excluded_pending_contested_key': excluded,
+        'rule': (
+            'Landability first: any arm that would need a `contested` key to '
+            'satisfy PRD V2 is excluded outright, because that key does not '
+            'exist. Among the rest, rank by UNALIASED canonical '
+            'discoverability, then claim recall, then tokens/query (lower '
+            'better), then window displacement (lower better). A None sorts '
+            'last, never as a zero. The rule is fixed before the numbers are '
+            'read and is not re-tuned to move a column.'
+        ),
+        'rationale': (
+            f'{ARM_LABELS[winner]} is the highest-ranked arm that task 3111 '
+            f'can actually land today: it satisfies the ordering above while '
+            f'requiring no vocabulary key that has no writer. Arms excluded '
+            f'pending a `contested` key: '
+            f'{[ARM_LABELS[a] for a in excluded] or "none"}.'
+        ),
+    }
+
+
+def build_selection_report(scored: dict[str, Any]) -> dict[str, Any]:
+    """Assemble the decision record, or refuse.
+
+    Pure over *scored*; every disclosure is derived from the arm specs and
+    the live vocabulary set rather than restated as prose constants, so the
+    document cannot drift from the code it describes.
+    """
+    from dataclasses import asdict  # noqa: PLC0415
+
+    _check_selection_arms(scored)
+    arms = {
+        arm: {
+            'label': ARM_LABELS[arm],
+            'spec': (
+                asdict(ARM_SPECS[arm]) if arm in ARM_SPECS
+                else {
+                    'key': arm,
+                    'label': ARM_LABELS[arm],
+                    'drops_ranked_records': False,
+                    'requires_contested_key_for_v2': False,
+                    'displaces_at_window_edge': False,
+                }
+            ),
+            'e2': dict(scored['e2'][arm]['means']),
+            'production': dict(scored['production'][arm]['means']),
+            'e2_query_count': scored['e2'][arm].get('query_count'),
+            'production_query_count': scored['production'][arm].get('query_count'),
+        }
+        for arm in ARM_KEYS
+    }
+    return {
+        'schema': SELECTION_REPORT_SCHEMA,
+        'shape': scored.get('shape', SELECTION_SHAPE),
+        'sighting_crediting': scored.get('sighting_crediting', 'uncredited'),
+        'per_topic_cap': scored.get('per_topic_cap', 1),
+        'token_estimator': scored.get('token_estimator'),
+        'e2_k': scored['e2'][ARM_KEYS[0]].get('k'),
+        'production_k': scored['production'][ARM_KEYS[0]].get('k'),
+        'arms': arms,
+        'recommendation': _recommend(arms),
+        'reserved_vocabulary_keys': sorted(RESERVED_VOCABULARY_KEYS),
+        'v2_protection': V2_PROTECTION,
+        'contested_is_a_fixture_field': True,
+        'unlabeled_reason': _UNLABELED_REASON,
+    }
+
+
+def _pair_cell(aliased: Any, unaliased: Any) -> str:
+    """The canonical column, rendered so a number cannot be read bare.
+
+    The two rates are printed in ONE cell, each carrying its own word, so
+    that any line quoting a canonical rate necessarily also says which
+    semantics produced it.  Splitting them into two numeric columns would
+    let a rate be copied out of the table with the aliasing silently
+    stripped off — which is exactly how b_grouped's 0.97 came to be read as
+    a retrieval property.
+    """
+    cell = bake_off()._cell
+    return f'{cell(aliased)} (aliased) / {cell(unaliased)} (unaliased)'
+
+
+def render_selection_markdown(report: dict[str, Any]) -> str:
+    """Render the decision document for whoever lands task 3111.
+
+    ONE table, one row per arm, carrying both query sets — not one table per
+    set — so an arm cannot be read in isolation from its cost on real
+    traffic.
+    """
+    bake = bake_off()
+    cell = bake._cell
+    dash = bake._NO_MEASUREMENT
+    arms = report['arms']
+    rec = report['recommendation']
+    keys = ', '.join(f'`{k}`' for k in report['reserved_vocabulary_keys'])
+
+    lines: list[str] = []
+    add = lines.append
+
+    add('# Read-transform selection over the ratified C write shape')
+    add('')
+    add(f'**Write shape:** `{report["shape"]}` (ratified by E2 gate ζ). '
+        'This document does not re-litigate the write shape; it chooses the '
+        'READ transform layered on top of it.')
+    add(f'**Token estimator:** `{report["token_estimator"]}` — the same one '
+        'the committed E2 table resolved, so the token columns are directly '
+        'comparable across the two artifacts.')
+    add(f'**Windows:** authored set at k={report["e2_k"]}; production set at '
+        f'k={report["production_k"]}, because the briefing assembler fires at '
+        '`limit=5` (`orchestrator/src/orchestrator/agents/briefing.py`:1376) '
+        'and a wider window would measure a read no production caller gets.')
+    add('')
+    add('## The decision table')
+    add('')
+    add(f'A `{dash}` cell is **no measurement**, never a measured zero.')
+    add('')
+    add('| arm | claim recall | canonical in top-k | tokens/query | topic '
+        'diversity | baseline retention | displacement | prod tokens/query | '
+        'prod displacement | drops ranked records | needs `contested` for V2 |')
+    add('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |')
+    for arm in ARM_KEYS:
+        block = arms[arm]
+        e2, prod, spec = block['e2'], block['production'], block['spec']
+        add(
+            f'| {block["label"]} '
+            f'| {cell(e2.get("claim_recall"))} '
+            f'| {_pair_cell(e2.get("canonical_aliased_in_top_k"), e2.get("canonical_unaliased_in_top_k"))} '
+            f'| {cell(e2.get("tokens_per_query"))} '
+            f'| {cell(e2.get("topic_diversity"))} '
+            f'| {cell(e2.get("baseline_retention_at_k"))} '
+            f'| {cell(e2.get("window_displacement"))} '
+            f'| {cell(prod.get("tokens_per_query"))} '
+            f'| {cell(prod.get("window_displacement"))} '
+            f'| {"yes" if spec["drops_ranked_records"] else "no"} '
+            f'| {"yes" if spec["requires_contested_key_for_v2"] else "no"} |'
+        )
+    add('')
+    add(f'The production half carries no claim-recall or canonical column at '
+        f'all: those cells would be `{dash}` for every arm. '
+        f'{report["unlabeled_reason"]}')
+    add('')
+
+    # --- (a) ---------------------------------------------------------
+    add('## Disclosure (a): the `record_id` aliasing')
+    add('')
+    add('A grouped read emits its document under the **canonical\'s own** '
+        '`record_id` (`bake_off_storage_shape.py`:934-935). Any metric that '
+        'credits the canonical on `hit.record_id == canonical_record_id` '
+        'therefore scores a fold as "canonical found" — whether or not the '
+        'canonical\'s own stored record ever ranked. That is a property of '
+        'the TRANSFORM, not of retrieval.')
+    add('')
+    add('This is the mechanism behind the committed E2 table\'s '
+        '`b_grouped` canonical-in-top-5 of 0.97: it is an aliased rate, and '
+        'reading it as "retrieval finds the canonical 97% of the time" is '
+        'not what was measured. Both rates are printed above, in one cell '
+        'each, so neither can be quoted without its semantics.')
+    add('')
+    add('* **aliased** — the legacy `record_id`-match semantics, preserved '
+        'so this table stays comparable with the committed one.')
+    add('* **unaliased** — the canonical\'s OWN stored record actually '
+        'ranked, read from the transform\'s emitted provenance.')
+    add('')
+
+    # --- (b) ---------------------------------------------------------
+    add('## Disclosure (b): the sighting-crediting knob')
+    add('')
+    add(f'**Setting for this run: `{report["sighting_crediting"]}`.**')
+    add('')
+    add('In the landed grouped read this is not a knob at all but a '
+        'hard-coded policy (`bake_off_storage_shape.py`:927): a sighting is '
+        'collapsed to a bare count, its body is not rendered, and its claims '
+        'are not credited. Arm (2) exposes it as a dial.')
+    add('')
+    add('The consequence is arithmetic, not a verdict on any transform: with '
+        'sightings uncredited the claim-recall **ceiling** is exactly '
+        '`(claims - sightings + contested) / claims`. An arm cannot exceed '
+        'that ceiling however well it retrieves, so a recall column read '
+        'without the knob setting beside it is not interpretable.')
+    add('')
+
+    # --- (c) ---------------------------------------------------------
+    add('## Disclosure (c): which arms suppress')
+    add('')
+    add('"Suppressing read" is **two independent facts**, kept in two '
+        'columns above because collapsing them would mislead task 3111:')
+    add('')
+    for arm in ARM_KEYS:
+        spec = arms[arm]['spec']
+        bits = []
+        bits.append('drops ranked records from the window'
+                    if spec['drops_ranked_records']
+                    else 'drops no ranked record')
+        if spec['displaces_at_window_edge']:
+            bits.append('displaces the k-th record at an already-full window')
+        bits.append('would need a `contested` key for PRD V2'
+                    if spec['requires_contested_key_for_v2']
+                    else 'needs no `contested` key')
+        add(f'* **{arms[arm]["label"]}** — ' + '; '.join(bits) + '.')
+    add('')
+    add('An arm can suppress and still be landable today (the '
+        'topic-diversity cap drops records, yet computes its cap from '
+        '`metadata[\'topic\']` alone and never asks whether a record is '
+        'contested). Reporting one merged "suppressing" boolean would have '
+        'said the cap is blocked on a key that does not exist.')
+    add('')
+
+    # --- (d) ---------------------------------------------------------
+    add('## Disclosure (d): PRD V2\'s protection is unimplementable today')
+    add('')
+    add(f'PRD V2 requires that **{report["v2_protection"]}** — the esc-5712 '
+        'protection. That protection cannot be implemented at all right now, '
+        'for any arm, and this is a precondition on task 3111 rather than a '
+        'property of any transform measured here.')
+    add('')
+    add('`contested` is a hand-labelled **fixture** field of the bake-off '
+        '(`ArmClaim.contested`:196, `contested_record_ids`:2567, '
+        '`SeededArm.contested_ids`:2593). It never appears in any '
+        '`ArmRecord.metadata`, it has **no writer**, and it has no '
+        'adjudication surface anywhere in the running system.')
+    add('')
+    add('The live reserved vocabulary is '
+        '`RESERVED_VOCABULARY_KEYS` '
+        '(`fused-memory/src/fused_memory/memory_metadata.py`:601), and it is '
+        f'exactly {{{keys}}} — verified against the imported frozenset, not '
+        'transcribed. `contested` is not among them. Any arm that suppresses '
+        'records therefore ships without the esc-5712 protection until a '
+        '`contested` key is designed, reserved, written and adjudicated.')
+    add('')
+
+    # --- recommendation ----------------------------------------------
+    add('## Recommendation')
+    add('')
+    add(f'**Task 3111 should land: {rec["label"]}.**')
+    add('')
+    add(f'*Selection rule (fixed before the numbers were read):* {rec["rule"]}')
+    add('')
+    add(rec['rationale'])
+    add('')
+    if rec['excluded_pending_contested_key']:
+        excluded = ', '.join(
+            ARM_LABELS[a] for a in rec['excluded_pending_contested_key']
+        )
+        add(f'Excluded outright, at any score: **{excluded}** — see '
+            'disclosure (d). This is an exclusion on landability, not a '
+            'measurement verdict; the arm\'s row above is still reported in '
+            'full so a later reader with a `contested` key can re-decide.')
+        add('')
+
+    # --- the honest tail ---------------------------------------------
+    add('## Why the production columns carry no labels')
+    add('')
+    add('The production query set is sampled read-only from the '
+        'reconciliation write journal '
+        '(`fused-memory/scripts/harvest_production_queries.py`). It is '
+        '**unlabeled by construction**: the journal records which query was '
+        'issued, never which memory should have come back. Claim recall and '
+        'canonical discoverability are not computable over it, so they are '
+        'reported as no-measurement rather than as a zero, and no arm is '
+        'credited or penalised for them on this set. Inventing a label here '
+        'would fabricate the very ground truth the measurement exists to '
+        'establish.')
+    return '\n'.join(lines) + '\n'
+
+
+def write_artifacts(
+    report: dict[str, Any],
+    json_path: str | Path,
+    md_path: str | Path,
+    *,
+    fixture_paths: list[str | Path] | None = None,
+) -> tuple[Path, Path]:
+    """Render FIRST, then write both files atomically.
+
+    The order is the E2 module's (:2316) and is load-bearing: a renderer that
+    raises must leave a stale ``.md`` beside a stale ``.json``, not a fresh
+    JSON beside prose describing the previous run.
+    """
+    bake = bake_off()
+    stamped = dict(report)
+    if fixture_paths:
+        stamped['fixture_provenance'] = bake.fixture_provenance(list(fixture_paths))
+    markdown = render_selection_markdown(stamped)
+    import json  # noqa: PLC0415
+
+    body = json.dumps(stamped, indent=2, sort_keys=True, ensure_ascii=False) + '\n'
+    json_target, md_target = Path(json_path), Path(md_path)
+    bake._atomic_write_text(json_target, body)
+    bake._atomic_write_text(md_target, markdown)
+    return json_target, md_target
