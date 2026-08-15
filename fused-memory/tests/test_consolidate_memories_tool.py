@@ -254,6 +254,81 @@ class TestValidationIsRefusedBeforeAnyWrite:
         svc.add_memory.assert_not_awaited()
 
 
+class TestAuthorizationIsFailClosedAndPreWrite:
+    """The gate is unconditional and precedes every write.
+
+    Deliberately NOT conditioned on a non-empty `retain`: reparenting is
+    only discovered after the canonical exists, so a gate that waited for
+    the first metadata patch would deny mid-transaction — with a canonical
+    already written and a cluster half-folded.
+    """
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_agent_is_denied_before_the_canonical_write(self):
+        svc = make_service()
+
+        result = await call_consolidate(svc, agent_id='claude-interactive')
+
+        assert result['error_type'] == 'Mem0UpdateNotAuthorized'
+        assert result['agent_id'] == 'claude-interactive'
+        svc.add_memory.assert_not_called()
+        svc.delete_memory.assert_not_called()
+        svc.update_memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_denial_fires_for_a_supersedes_only_call(self):
+        """Proves the gate is unconditional, not keyed on the retain list."""
+        svc = make_service()
+
+        result = await call_consolidate(svc, agent_id='claude-interactive', retain=[])
+
+        assert result['error_type'] == 'Mem0UpdateNotAuthorized'
+        svc.add_memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_kill_switch_denies_every_agent(self):
+        svc = make_service()
+        svc.config.mem0_update = Mem0UpdateConfig(enabled=False)
+
+        result = await call_consolidate(svc)
+
+        assert result['error_type'] == 'Mem0UpdateToolDisabled'
+        svc.add_memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_content_amend_arm_is_never_requested(self):
+        """This op stamps metadata and writes new records — it amends nothing.
+
+        Widening ONLY the content-amend allowlist must therefore not
+        authorize the caller. Requesting an arm the op does not use would
+        make the wider metadata bar a back door into a silent-rewrite
+        primitive.
+        """
+        svc = make_service()
+        svc.config.mem0_update = Mem0UpdateConfig(
+            content_amend_allowed_agent_prefixes=['claude-interactive'],
+            metadata_patch_allowed_agent_prefixes=['recon-stage-'],
+        )
+
+        result = await call_consolidate(svc, agent_id='claude-interactive')
+
+        assert result['error_type'] == 'Mem0UpdateNotAuthorized'
+        assert 'metadata_patch' in result['error']
+        svc.add_memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_an_authorized_recon_agent_proceeds(self):
+        svc = make_service()
+        svc.config.mem0_update = Mem0UpdateConfig(
+            metadata_patch_allowed_agent_prefixes=['recon-stage-']
+        )
+
+        result = await call_consolidate(svc)
+
+        assert result['status'] == 'consolidated'
+        svc.add_memory.assert_awaited_once()
+
+
 class TestCanonicalFirstOrdering:
     """A canonical that did not land is NEVER followed by deletions.
 
