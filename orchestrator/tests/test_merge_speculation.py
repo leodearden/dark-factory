@@ -2222,23 +2222,37 @@ class TestLateArrivalAttaches:
             # ── Release A's gate → let A and B complete cleanly ───────────────
             gate_a_release.set()
 
-            with contextlib.suppress(TimeoutError):
+            # These two drains are LOAD-BEARING, exactly like every other
+            # migrated site in this file (cf. late3 below).  They previously
+            # carried `with contextlib.suppress(TimeoutError):` wrappers, which
+            # the task-3980 migration turned into provably dead code:
+            # `wait_responsive` never raises `TimeoutError` — on give-up it
+            # calls `pytest.fail(...)`, raising `_pytest.outcomes.Failed` (a
+            # BaseException subclass).  Rather than re-arm the tolerance with
+            # `suppress(pytest.fail.Exception)`, the suppression is dropped: on
+            # the green path both futures resolve (the LateArrival suite runs in
+            # ~5.5s), so a give-up here is a genuine merge-pipeline hang and must
+            # report red.  Teardown is now in `finally:` so it runs either way —
+            # a give-up can no longer skip `worker.stop()` and leak a live merge
+            # worker into pytest-asyncio teardown (esc-3980-4 reviewer finding).
+            try:
                 await wait_responsive(
                     req_a.result,
                     timeout=MERGE_RESULT_TIMEOUT,
                     label='late1-a: MergeOutcome',
                 )
-            with contextlib.suppress(TimeoutError):
                 await wait_responsive(
                     req_b.result,
                     timeout=MERGE_RESULT_TIMEOUT,
                     label='late1-b: MergeOutcome',
                 )
-
-            await worker.stop()
-
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(worker_task, timeout=5.0)
+            finally:
+                # Joined INSIDE the `with patch(...)` block on purpose: whatever
+                # the worker task still has to unwind should see the fakes, not
+                # real git ops.
+                await worker.stop()
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(worker_task, timeout=5.0)
 
 
 # ===========================================================================
