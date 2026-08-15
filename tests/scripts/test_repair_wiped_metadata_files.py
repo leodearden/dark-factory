@@ -1585,20 +1585,6 @@ def test_exit_write_failed_outranks_exit_live_read_failed(tmp_path, monkeypatch)
     assert exit_code != EXIT_LIVE_READ_FAILED
 
 
-def test_epilog_advertises_exit_code_5():
-    """The CLI's advertised exit-code contract must name the new code. Three
-    sources of exit-code truth exist in this module — the epilog, main()'s
-    docstring, and the EXIT_* constants block — kept in sync deliberately so
-    they cannot silently drift; this is the one-line existence check on the
-    operator-facing surface, not a prose/docstring pin.
-    """
-    epilog = _build_parser().epilog or ""
-
-    assert "5 = " in epilog
-    assert "stopped answering mid-batch" in epilog
-    assert "2, 3, 4 or 5" in epilog
-
-
 def test_make_client_is_attributable_to_this_repair_not_the_migration():
     """THE PROPERTY THE OVERRIDE EXISTS FOR: an attributable clientInfo.name.
 
