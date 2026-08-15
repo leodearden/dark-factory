@@ -208,3 +208,140 @@ class TestEncodedDomainParity:
         scf.assert_no_credential_material(
             json.dumps(result), source='synthetic:encoded-scalar'
         )
+
+
+#: The keys a poisoned row is allowed to carry.  Everything else of the input
+#: observation must be dropped: the row's whole claim is that it is clean BY
+#: CONSTRUCTION, which only holds if every field is a probe-owned literal or a
+#: non-string scalar.
+_POISONED_KEYS = frozenset(
+    {
+        'redaction_failed',
+        'redaction_failure_pattern',
+        'mode',
+        'sample_kind',
+        'sample_index',
+        'sample_offset_secs',
+        'substrate_returns',
+    }
+)
+
+
+class TestGateNeverRaisesOnGenericHit:
+    """The never-raise contract must hold STRUCTURALLY, not by proof.
+
+    Steps 2/4/6 make the scrub correct, but the guarantee would then rest on a
+    composition argument — and a composition argument is exactly what failed the
+    first time.  So the residual case is handled by construction: a still-dirty
+    observation degrades to a minimal ``redaction_failed`` row plus a stderr
+    WARNING, losing ONE sample, rather than raising and losing every sample of an
+    already-paid-for live run.
+
+    ``_scrub_value`` is monkeypatched to the identity here, standing in for any
+    FUTURE scrub gap of the same class as the two just closed.
+    """
+
+    @staticmethod
+    def _dirty_observation(**overrides: Any) -> dict[str, Any]:
+        return _minimal_observation(transcript_records=[{'text': _LONG_RUN}], **overrides)
+
+    def test_returns_a_poisoned_row_instead_of_raising(self, monkeypatch, capsys):
+        monkeypatch.setattr(probe, '_scrub_value', lambda value, patterns: value)
+        result = probe._gate(self._dirty_observation())
+
+        assert result['redaction_failed'] is True
+        assert result['redaction_failure_pattern'] == 'long-base64url-run'
+        scf.assert_no_credential_material(
+            json.dumps(result), source='synthetic:poisoned-row'
+        )
+        stderr = capsys.readouterr().err
+        assert 'redaction' in stderr.lower(), (
+            f'the degradation must be LOUD; stderr was: {stderr!r}'
+        )
+
+    def test_in_range_identity_fields_survive(self, monkeypatch):
+        monkeypatch.setattr(probe, '_scrub_value', lambda value, patterns: value)
+        result = probe._gate(
+            self._dirty_observation(
+                mode='healthy', sample_kind='scheduled', sample_index=3,
+                sample_offset_secs=1.5,
+            )
+        )
+        assert result['mode'] == 'healthy'
+        assert result['sample_kind'] == 'scheduled'
+        assert result['sample_index'] == 3
+        assert result['sample_offset_secs'] == 1.5
+
+    def test_out_of_range_identity_fields_degrade_to_none(self, monkeypatch):
+        monkeypatch.setattr(probe, '_scrub_value', lambda value, patterns: value)
+        # An arbitrary string in a closed-set field is the very thing that could
+        # smuggle credential material back into the "clean by construction" row.
+        result = probe._gate(
+            self._dirty_observation(
+                mode='not-a-mode', sample_kind='not-a-kind',
+                sample_index='not-an-int', sample_offset_secs='not-a-float',
+            )
+        )
+        assert result['mode'] is None
+        assert result['sample_kind'] is None
+        assert result['sample_index'] is None
+        assert result['sample_offset_secs'] is None
+
+    def test_every_declared_sample_kind_survives(self, monkeypatch):
+        monkeypatch.setattr(probe, '_scrub_value', lambda value, patterns: value)
+        for kind in probe.SAMPLE_KINDS:
+            result = probe._gate(self._dirty_observation(sample_kind=kind))
+            assert result['sample_kind'] == kind, (
+                f'{kind!r} is emitted by the samplers but not in SAMPLE_KINDS'
+            )
+
+    def test_substrate_returns_is_carried_and_scalar_filtered(self, monkeypatch):
+        monkeypatch.setattr(probe, '_scrub_value', lambda value, patterns: value)
+        # run_live_probe subscripts candidate['substrate_returns']
+        # ['count_transcript_turns'] on the pre-first-token path — a placeholder
+        # without it would trade the raise for a KeyError at the same blast radius.
+        result = probe._gate(
+            self._dirty_observation(
+                substrate_returns={
+                    'transcript_exists': True,
+                    'read_transcript_records_is_none': False,
+                    'record_count': 7,
+                    'count_transcript_turns': _LONG_RUN,  # non-scalar-shaped intruder
+                }
+            )
+        )
+        substrate = result['substrate_returns']
+        assert set(substrate) == {
+            'transcript_exists',
+            'read_transcript_records_is_none',
+            'record_count',
+            'count_transcript_turns',
+        }
+        assert substrate['transcript_exists'] is True
+        assert substrate['record_count'] == 7
+        assert substrate['count_transcript_turns'] is None, (
+            'a non-bool/int value must be filtered out, not carried through'
+        )
+
+    def test_substrate_returns_defaults_when_absent(self, monkeypatch):
+        monkeypatch.setattr(probe, '_scrub_value', lambda value, patterns: value)
+        observation = self._dirty_observation()
+        del observation['substrate_returns']
+        result = probe._gate(observation)
+        assert result['substrate_returns']['count_transcript_turns'] is None
+
+    def test_no_other_observation_key_is_carried_over(self, monkeypatch):
+        monkeypatch.setattr(probe, '_scrub_value', lambda value, patterns: value)
+        result = probe._gate(
+            self._dirty_observation(
+                config_dir_tree=[{'relpath': 'projects/x.jsonl'}],
+                run_exit={'stderr_tail': 'boom'},
+                session_id='abc',
+                spawn_argv=['claude', '--print'],
+            )
+        )
+        assert set(result) <= _POISONED_KEYS, (
+            f'the poisoned row carried unvetted input fields: {set(result) - _POISONED_KEYS}'
+        )
+        for leaked in ('transcript_records', 'config_dir_tree', 'run_exit', 'spawn_argv'):
+            assert leaked not in result
