@@ -542,6 +542,53 @@ def worktree_base_for(repo: Path) -> Path:
     return GitOps(config.git, repo).worktree_base
 
 
+# ---------------------------------------------------------------------------
+# Task 4025 (de-flake beta) -- pinned SS9 Row 1/2/3 watchdog window.
+#
+# ROW_WATCHDOG_ENV carries the SAME numbers as today's production constants
+# -- verify_cancel.WATCHDOG_HEARTBEAT_TIMEOUT_SECS (10.0) and
+# WATCHDOG_KILL_GRACE_SECS (5.0) -- but as PINNED LITERALS, deliberately NOT
+# imported from verify_cancel: task 4195 will retune those constants
+# (deriving the timeout from SSH_SERVER_ALIVE_INTERVAL *
+# SSH_SERVER_ALIVE_COUNT_MAX, toward ~60s+), and tracking them here would
+# silently multiply this module's runtime (Row 3 from ~17s to ~70s).
+#
+# This REPLACES a prior test-only 1.0s/0.5s tightening that bought speed and
+# no coverage, and was the measured cause of the "no descendant appeared
+# within 20.0s" flake on wait_subtree_live (6 failures / 490 legs on the
+# 1.0s arm vs 0 on both the 10s arm and the separate-process producer arm).
+#
+# HONEST CAVEAT: this MOVES the cliff from 1.0s to 10s, it does not remove
+# it.  The watchdog deadline is a wall-clock select() in
+# verify_cancel.run_stdin_watchdog -- LOAD-RIGID -- while the producer
+# (HeartbeatWriter._run) is an Event.wait(0.2) -- LOAD-ELASTIC.  Measured
+# producer inter-write gap at loadavg 113-178 was p999 0.386s / max 0.845s:
+# only ~1.2x real margin against a 1.0s deadline, but ~12x against 10.0s.
+# Do not try to buy margin by pre-buffering heartbeats -- run_stdin_watchdog
+# drains with a single read(4096) per select, so a burst resets exactly one
+# window, not N.
+ROW_WATCHDOG_ENV: dict[str, str] = {
+    'ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS': '10.0',
+    'ORCH_WATCHDOG_KILL_GRACE_SECS': '5.0',
+}
+
+#: Shared ceiling for the rows' child.wait()/wait_subtree_gone() polls -- 2x
+#: the pinned 15s (10.0+5.0) worst-case fire window.  A WEDGE-DETECTOR, not a
+#: speed assertion: the rows assert THAT the tree was killed, never how fast,
+#: so on the success path a wider ceiling costs zero wall-clock (the poll
+#: returns as soon as the condition holds) and is paid only when the test is
+#: already failing.
+ROW_TREE_KILL_CEILING_SECS: float = 30.0
+
+#: Per-test opt-out from this module's inherited ``timeout = 60``
+#: (orchestrator/pyproject.toml:103, thread-mode -- os._exit()s the xdist
+#: worker on expiry).  These rows' worst case is two
+#: ROW_TREE_KILL_CEILING_SECS-bounded waits plus one full watchdog window,
+#: which would otherwise risk that 60s ceiling under full-suite load.
+ROW_PER_TEST_TIMEOUT_SECS: int = 120
+# ---------------------------------------------------------------------------
+
+
 def test_row_watchdog_window_is_pinned_and_ceilings_clear_it():
     """ROW_WATCHDOG_ENV is pinned (not derived) and the row ceilings clear it.
 
