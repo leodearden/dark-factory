@@ -891,6 +891,15 @@ EXIT_NO_ACTIVE_ARMS = 5
 #: `--merge` refused to combine the inputs.  Distinct from an arm failure: the
 #: arms may all be fine and the ASSEMBLY wrong, which is a different fix.
 EXIT_MERGE_ERROR = 6
+#: Another process moved on the card, so `used - baseline` is not the arm's
+#: footprint and NOTHING was learned about the arm (task 3755).  Distinct from
+#: EXIT_VRAM_FAILED for the usual reason — they have opposite fixes.  3 says the
+#: arm is genuinely too big and something should be stopped; 7 says the
+#: measurement is void, and stopping an arm in response would be acting on a
+#: number nobody measured.  ONE code covers both pollution routes (a polluted
+#: recorded baseline and a probe-time intruder) because they carry one meaning:
+#: the VRAM numbers cannot be trusted.
+EXIT_VRAM_POLLUTED = 7
 
 
 class GpuBlock(BaseModel):
@@ -1252,10 +1261,24 @@ def merge_reports(
 
 
 def exit_code_for(report: HealthReport) -> int:
-    """An arm failure outranks a budget failure: it is the more actionable of
-    the two, and the budget block is right there in the artifact either way."""
+    """Arm failure > pollution > budget failure.
+
+    An arm failure outranks both: it is the most actionable of the three, and
+    the budget block is right there in the artifact either way.  Pollution
+    cannot explain a WRONG answer -- it only voids the VRAM arithmetic.
+
+    Pollution outranks a budget failure because a budget FAIL measured on a
+    contended card is not a budget failure at all.  Returning EXIT_VRAM_FAILED
+    there would send an operator to shrink an arm that may fit perfectly well
+    once the intruder releases the card.  And a POLLUTED block is never
+    EXIT_OK, however sound the arithmetic looks: `verdict` is computed from a
+    subtraction whose subject moved, so a PASS there is a pass for the wrong
+    reason, and the exit code is the only thing a CI caller reads.
+    """
     if any(row.verdict == 'FAIL' for row in report.arms):
         return EXIT_ARM_FAILED
+    if report.vram.pollution == lms_vram.PollutionState.POLLUTED:
+        return EXIT_VRAM_POLLUTED
     if report.vram.verdict == 'FAIL':
         return EXIT_VRAM_FAILED
     return EXIT_OK
@@ -1393,6 +1416,17 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         report = run_healthcheck(arms)
+    except lms_vram.PollutedBaselineError as exc:
+        # BEFORE the VramProbeError branch below, which it subclasses.  In the
+        # other order this refusal would be reported as "the GPU probe failed"
+        # and blame nvidia-smi for a perfectly healthy card.  Nothing is written
+        # on refusal, for the same reason as the merge and no-active-arms paths:
+        # a file on disk would later read as "the slate was checked".
+        print(
+            f'lms_healthcheck: no report was produced: {exc}',
+            file=sys.stderr,
+        )
+        return EXIT_VRAM_POLLUTED
     except lms_vram.VramProbeError as exc:
         print(
             f'lms_healthcheck: GPU probe failed, so no report was produced: {exc}',
