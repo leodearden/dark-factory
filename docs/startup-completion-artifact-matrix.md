@@ -117,11 +117,20 @@ already-paid-for live capture instead of one value. The degraded row is **shaped
 was gated**: an observation degrades to identity fields only, while the run's exit provenance
 keeps `exit_code` / `killed_by_probe` / `stderr_len` (scalar-filtered) and drops only the
 CLI-authored text — it is stamped onto every observation of the run, so an observation-shaped
-stand-in there would cost the whole capture its exit provenance. The config dir holding that token is
-reclaimed three ways: an exception-safe `finally` that wraps the credential write itself,
-`cleanup_at_exit` mirroring `--keep-config-dir` (so the flag that exists to preserve the dir is
-never silently overridden), and a once-per-process dead-PID sweep of
-`claude-config-startup-probe-*` for the SIGKILL case no teardown hook can cover.
+stand-in there would cost the whole capture its exit provenance. A degraded observation also
+carries `captured_at` and `session_id` when they match their probe-authored shapes, because
+`--out` is appended to and one JSONL file routinely holds several runs: without them a
+`redaction_failed` row cannot be traced back to the run that produced it.
+
+The config dir holding that token is reclaimed three ways: an exception-safe `finally` that wraps
+the credential write itself (every step of it independently failure-isolated, and a dir that
+survives removal is named on stderr — `TaskConfigDir.cleanup()` ignores errors, so the check is
+the only signal), `cleanup_at_exit` mirroring `--keep-config-dir`, and a once-per-process dead-PID
+sweep of `claude-config-startup-probe-*` for the SIGKILL case no teardown hook can cover. Both
+reclamation mechanisms honour `--keep-config-dir`, not just the first: a kept dir is named
+`…-<pid>-keep`, which has no parseable trailing `-<digits>`, so the sweep treats it as
+unattributable and never touches it. Otherwise the next probe run would delete the very artifact
+the flag exists to preserve — one that costs a real-money live run to retake.
 
 **No wall-clock assertions.** Every offset in this document is provenance. No test asserts a
 timing threshold — the observed ~5 s to transcript is a property of this machine and this CLI

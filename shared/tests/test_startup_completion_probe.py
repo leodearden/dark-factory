@@ -25,17 +25,23 @@ nothing spawns a CLI, nothing spends money and no real token is ever written.
 Sandboxed is the third leg and not automatic: ``run_live_probe`` opens with a
 dead-PID sweep that recursively deletes under the real system tempdir, so the
 autouse ``_confine_stale_dir_sweep`` fixture re-bases it under ``tmp_path``.  No
-test in this module may delete anything it did not itself create.  They are deliberately unmarked (no
-``@pytest.mark.integration``) so these fixes stay covered on every ordinary run.
+test in this module may delete anything it did not itself create — nor LEAVE
+anything it did: the probe's stub dirs are ``mkdtemp``'d in the SYSTEM tempdir,
+which pytest never reclaims, so ``probe_recorder`` rmtree's every one it saw
+(before this, each run of this module left two behind).  They are deliberately
+unmarked (no ``@pytest.mark.integration``) so these fixes stay covered on every
+ordinary run.
 """
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import json
 import os
 import shutil
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 from typing import IO, Any
 
@@ -387,6 +393,8 @@ _POISONED_KEYS = frozenset(
         'sample_kind',
         'sample_index',
         'sample_offset_secs',
+        'captured_at',
+        'session_id',
         'substrate_returns',
     }
 )
@@ -456,8 +464,14 @@ class TestGateNeverRaisesOnGenericHit:
         monkeypatch.setattr(probe, '_scrub_value', lambda value, patterns: value)
         for kind in probe.SAMPLE_KINDS:
             result = probe._gate(self._dirty_observation(sample_kind=kind))
+            # Deliberately NOT the drift check — iterating SAMPLE_KINDS to assert
+            # membership of SAMPLE_KINDS is a tautology over the constant.  What
+            # this pins is that the closed-set filter carries a MEMBER through
+            # rather than nulling it; the drift is pinned against the sampler
+            # call sites by test_sample_kinds_matches_the_sampler_call_sites.
             assert result['sample_kind'] == kind, (
-                f'{kind!r} is emitted by the samplers but not in SAMPLE_KINDS'
+                f'{kind!r} is a declared SAMPLE_KINDS member but the degraded row '
+                f'nulled it out'
             )
 
     def test_substrate_returns_is_carried_and_scalar_filtered(self, monkeypatch):
@@ -501,15 +515,262 @@ class TestGateNeverRaisesOnGenericHit:
             self._dirty_observation(
                 config_dir_tree=[{'relpath': 'projects/x.jsonl'}],
                 run_exit={'stderr_tail': 'boom'},
-                session_id='abc',
+                cli_version='2.1.220 (Claude Code)',
+                probe_run_id='healthy-deadbeef',
                 spawn_argv=['claude', '--print'],
             )
         )
         assert set(result) <= _POISONED_KEYS, (
             f'the poisoned row carried unvetted input fields: {set(result) - _POISONED_KEYS}'
         )
-        for leaked in ('transcript_records', 'config_dir_tree', 'run_exit', 'spawn_argv'):
+        for leaked in (
+            'transcript_records', 'config_dir_tree', 'run_exit', 'spawn_argv',
+            # Neither is probe-authored: cli_version is `claude --version` output
+            # and probe_run_id can come straight from --probe-run-id, so neither
+            # has a shape that could be validated the way captured_at/session_id are.
+            'cli_version', 'probe_run_id',
+        ):
             assert leaked not in result
+
+    def test_the_warning_echoes_no_unvetted_input(self, capsys):
+        """The stderr warning must not print the value it just matched.
+
+        Every field it interpolates has to be vetted, not just the closed-set
+        ones: this branch fires precisely BECAUSE the observation matched a
+        credential pattern, so an unfiltered ``sample_index`` would echo
+        attacker-shaped (or secret-shaped) input into the terminal and the logs —
+        the exact thing the "match text withheld" convention exists to prevent.
+        """
+        probe._gate(
+            _minimal_observation(
+                sample_index='untrusted-index-value',
+                sample_kind='untrusted-kind-value',
+                transcript_records=[{'text': _LONG_RUN}],
+            )
+        )
+        err = capsys.readouterr().err
+        assert 'untrusted-index-value' not in err, (
+            f'a non-int sample_index was echoed verbatim into the warning: {err!r}'
+        )
+        assert 'untrusted-kind-value' not in err
+        assert 'unknown index' in err and 'unknown kind' in err, (
+            f'the warning must still SAY which sample it could not identify: {err!r}'
+        )
+
+    def test_the_row_can_be_attributed_to_its_run(self, monkeypatch):
+        # main() APPENDS to --out, so one JSONL file routinely holds several runs
+        # and several modes: a degraded row carrying only mode/sample_index is
+        # ambiguous across them, and the warning's "re-run the probe" advice
+        # cannot be acted on.  Both fields are probe-authored (isoformat(), uuid4).
+        monkeypatch.setattr(probe, '_scrub_value', lambda value, patterns: value)
+        result = probe._gate(
+            self._dirty_observation(
+                captured_at='2026-08-15T14:17:06.019006+00:00',
+                session_id='3f1c9a6e-2b4d-4c8a-9f77-0a1b2c3d4e5f',
+            )
+        )
+        assert result['captured_at'] == '2026-08-15T14:17:06.019006+00:00'
+        assert result['session_id'] == '3f1c9a6e-2b4d-4c8a-9f77-0a1b2c3d4e5f'
+
+    @pytest.mark.parametrize(
+        'field,value',
+        [
+            # Anchored `fullmatch`, so a well-shaped prefix cannot tow arbitrary
+            # text along — which is how a "probe-authored" field would otherwise
+            # become the smuggling route back into a clean-by-construction row.
+            ('captured_at', f'2026-08-15T14:17:06.019006+00:00 {_LONG_RUN}'),
+            ('captured_at', 'yesterday'),
+            ('captured_at', 1755267426.0),
+            ('session_id', f'3f1c9a6e-2b4d-4c8a-9f77-0a1b2c3d4e5f{_LONG_RUN}'),
+            ('session_id', 'abc'),
+            ('session_id', None),
+        ],
+    )
+    def test_unshaped_attribution_fields_degrade_to_none(self, monkeypatch, field, value):
+        monkeypatch.setattr(probe, '_scrub_value', lambda value_, patterns: value_)
+        result = probe._gate(self._dirty_observation(**{field: value}))
+        assert result[field] is None, (
+            f'{field}={value!r} is not probe-authored, so carrying it would break '
+            f'the row\'s clean-by-construction claim'
+        )
+        scf.assert_no_credential_material(
+            json.dumps(result), source='synthetic:poisoned-row-attribution'
+        )
+
+    def test_a_real_observation_survives_both_shape_validators(self, monkeypatch, tmp_path):
+        """The validators must accept what :func:`probe.observe` actually stamps.
+
+        Pinned against a REAL assembled observation, not against a hand-written
+        literal: a validator too strict for the probe's own output would null both
+        fields on every degraded row, and no test written from the same
+        assumptions as the regex would ever notice.
+        """
+        monkeypatch.setattr(probe, '_scrub_value', lambda value, patterns: value)
+        session_id = str(probe.uuid.uuid4())
+        observation = probe.observe(
+            config_dir=tmp_path,
+            session_id=session_id,
+            probe_run_id='healthy-deadbeef',
+            mode='healthy',
+            sample_index=0,
+            sample_kind='scheduled',
+            sample_offset_secs=0.25,
+            cli_version='test-cli',
+            capture_method='live_spawn',
+            pid=None,
+            epoch=None,
+        )
+        # Same fields, now routed through the degradation path they must survive.
+        observation['transcript_records'] = [{'text': _LONG_RUN}]
+        result = probe._gate(observation)
+
+        assert result['redaction_failed'] is True, 'the degradation path never ran'
+        assert result['captured_at'] == observation['captured_at']
+        assert result['session_id'] == session_id
+
+
+def _sample_kind_literals_in_probe_source() -> set[str]:
+    """Every ``sample_kind`` string literal the probe's samplers actually emit.
+
+    Parsed from the SOURCE rather than read off ``SAMPLE_KINDS``, because that is
+    the only way round the tautology: the constant is what
+    :func:`probe._poisoned_observation` filters against, so any test that derives
+    its expectations from it agrees with a wrong constant by construction.
+
+    Three emission sites exist, and all three are covered:
+    ``_take('<kind>')`` calls, the ``x['sample_kind'] = '<kind>'`` relabels, and
+    the ``sample_kind='<kind>'`` keyword the replay probe passes to ``observe``.
+    """
+    tree = ast.parse(Path(probe.__file__).read_text(encoding='utf-8'))
+    kinds: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id == '_take'
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+            ):
+                kinds.add(node.args[0].value)
+            for keyword in node.keywords:
+                if (
+                    keyword.arg == 'sample_kind'
+                    and isinstance(keyword.value, ast.Constant)
+                    and isinstance(keyword.value.value, str)
+                ):
+                    kinds.add(keyword.value.value)
+        elif isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant):
+            for target in node.targets:
+                if (
+                    isinstance(target, ast.Subscript)
+                    and isinstance(target.slice, ast.Constant)
+                    and target.slice.value == 'sample_kind'
+                    and isinstance(node.value.value, str)
+                ):
+                    kinds.add(node.value.value)
+    return kinds
+
+
+class TestSampleKindsTracksTheSamplers:
+    """``SAMPLE_KINDS`` must be the set the samplers emit, not merely a plausible one.
+
+    It is a FILTER, not a label: :func:`probe._poisoned_observation` carries
+    ``sample_kind`` through only for members, so a kind the samplers emit but the
+    constant omits is silently nulled out of every degraded row — losing the one
+    field that says which sampler produced the poisoned sample.  Adding a
+    ``_take('foo')`` call site is exactly that regression, and it is invisible to
+    any assertion that iterates the constant.
+    """
+
+    def test_sample_kinds_matches_the_sampler_call_sites(self):
+        emitted = _sample_kind_literals_in_probe_source()
+        declared: set[str] = set(probe.SAMPLE_KINDS)
+        assert emitted, (
+            'the AST scan found no sample_kind literals at all — the samplers were '
+            'restructured and this check has gone vacuous; re-derive it'
+        )
+        assert emitted == declared, (
+            f'SAMPLE_KINDS and the samplers disagree. Emitted but not declared '
+            f'(nulled out of every degraded row): {sorted(emitted - declared)}. '
+            f'Declared but never emitted (dead entry): {sorted(declared - emitted)}.'
+        )
+
+    def test_sample_kinds_has_no_duplicates(self):
+        # A tuple, not a set, so a copy-paste duplicate is possible and would make
+        # the membership filter look wider than it is.
+        assert len(probe.SAMPLE_KINDS) == len(set(probe.SAMPLE_KINDS))
+
+
+class TestGateStillRaisesOnANamedHit:
+    """The NAMED branch must keep RAISING — it is the security-critical half.
+
+    ``_gate`` is now built around a ``try/except AssertionError`` that swallows
+    exactly the exception type a named hit raises.  That is deliberate for the
+    heuristic branch (whose blast radius is the whole capture) and would be
+    catastrophic for this one: a named hit is unambiguously a secret
+    (``sk-ant-``, ``accessToken``, ``claudeAiOauth``, ``Bearer eyJ``) and is
+    precisely what the path-aware generic pattern is written to miss.  Widening
+    that ``try``, or moving the named scan inside it, would silently convert a
+    real token into a ``redaction_failed`` row while all 60-odd other tests here
+    stayed green.  ``test_startup_completion_fixtures.py`` does not cover this:
+    it tests ``assert_no_credential_material`` in isolation, never ``_gate``'s
+    dispatch.
+    """
+
+    #: Synthetic, obviously not a real token, mirroring ``TestCorpusSecretHygiene``.
+    _NAMED_MARKER = 'sk-ant-oat01-FAKEFAKEFAKE'
+
+    def test_a_named_hit_raises_rather_than_degrading(self):
+        with pytest.raises(AssertionError, match='credential material'):
+            probe._gate(_minimal_observation(transcript_records=[{'t': self._NAMED_MARKER}]))
+
+    def test_a_named_hit_raises_even_when_the_scrub_is_a_no_op(self, monkeypatch):
+        # The degradation path only exists downstream of the scrub, so pinning
+        # this with the scrub neutered proves the named branch never reaches it.
+        monkeypatch.setattr(probe, '_scrub_value', lambda value, patterns: value)
+        with pytest.raises(AssertionError, match='credential material'):
+            probe._gate(_minimal_observation(transcript_records=[{'t': self._NAMED_MARKER}]))
+
+    @pytest.mark.parametrize(
+        'marker', ['sk-ant-oat01-FAKEFAKEFAKE', 'claudeAiOauth', 'accessToken']
+    )
+    def test_a_named_hit_in_run_exit_raises(self, marker):
+        # stderr_tail is the most reachable named-hit surface: arbitrary CLI
+        # stderr, gated on every run, and the one place a token echoed by a
+        # failing invocation would actually land.
+        with pytest.raises(AssertionError, match='credential material'):
+            probe._gate(
+                {'mode': 'healthy', 'exit_code': 1, 'stderr_tail': f'boom {marker}'},
+                kind='run_exit',
+            )
+
+    def test_the_named_branch_does_not_emit_a_degraded_row(self, monkeypatch, capsys):
+        # Belt and braces against the mutation that matters most: a `_gate` whose
+        # named scan moved inside the try would RETURN a clean-looking row here.
+        monkeypatch.setattr(probe, '_scrub_value', lambda value, patterns: value)
+        result: Any = None
+        with contextlib.suppress(AssertionError):
+            result = probe._gate(
+                _minimal_observation(transcript_records=[{'t': self._NAMED_MARKER}])
+            )
+        assert result is None, (
+            f'a NAMED credential hit returned instead of raising: {result!r}. A '
+            f'redaction_failed row here would mean a real secret was handled as a '
+            f'heuristic false positive.'
+        )
+        assert 'redaction FAILED' not in capsys.readouterr().err
+
+    def test_the_marker_is_invisible_to_the_generic_pattern(self):
+        # Guards the premise: if the marker also tripped the generic backstop,
+        # every test above could pass through the heuristic branch instead and
+        # say nothing about the named one.
+        assert (
+            probe.scan_for_credential_material(
+                json.dumps(self._NAMED_MARKER), probe._GENERIC_CREDENTIAL_PATTERNS
+            )
+            is None
+        )
 
 
 _EXIT_PROVENANCE_KEYS = frozenset(
@@ -611,9 +872,12 @@ class TestGateDegradesPerGatedShape:
 
     def test_an_unknown_kind_is_rejected_loudly(self):
         # Data-INDEPENDENT, so it fires on the first gated value rather than
-        # lurking until a heuristic happens to hit.
+        # lurking until a heuristic happens to hit.  The pyright suppression is
+        # the POINT, not a workaround: `kind` is a Literal, so a typed caller is
+        # caught statically and this runtime backstop only has to cover the
+        # untyped ones (a dict-splatted kwarg, a plain-script import).
         with pytest.raises(ValueError, match='unknown kind'):
-            probe._gate({'mode': 'healthy'}, kind='not-a-kind')
+            probe._gate({'mode': 'healthy'}, kind='not-a-kind')  # pyright: ignore[reportArgumentType]
 
 
 # ---------------------------------------------------------------------------
@@ -644,15 +908,25 @@ class _ProbeRecorder:
 
 
 @pytest.fixture
-def probe_recorder(monkeypatch, tmp_path) -> _ProbeRecorder:
+def probe_recorder(monkeypatch, tmp_path) -> Iterator[_ProbeRecorder]:
     """Make ``run_live_probe`` offline and record what it allocates.
 
     ``_cli_version`` and ``_oauth_token`` are stubbed so no ``claude --version``
     subprocess runs and no REAL token is ever written; ``TaskConfigDir`` is the
     genuine class, only re-based under ``tmp_path`` so the credential write and
     the cleanup being tested are the real ones.
+
+    Reclaims every stub dir it saw on the way out, so a test that deliberately
+    makes the probe's own stub-dir teardown fail cannot litter the system tempdir.
     """
     recorder = _ProbeRecorder()
+    # Captured BEFORE any test-local patch (fixtures tear down in reverse setup
+    # order, so a test's failing-rmtree injection is still installed when this
+    # fixture finalizes) and BEFORE the yield, so the finalizer can always reclaim
+    # a stub dir the probe deliberately failed to remove.  Stub dirs live in the
+    # SYSTEM tempdir, not tmp_path, so pytest never reclaims them: without this,
+    # every run of this module left dirs behind.
+    real_rmtree = shutil.rmtree
     monkeypatch.setattr(probe, '_cli_version', lambda: 'test-cli')
     monkeypatch.setattr(
         probe, '_oauth_token', lambda: (_FAKE_OAUTH_ENV_VAR, _FAKE_OAUTH_TOKEN)
@@ -677,7 +951,9 @@ def probe_recorder(monkeypatch, tmp_path) -> _ProbeRecorder:
         return path
 
     monkeypatch.setattr(probe.tempfile, 'mkdtemp', _recording_mkdtemp)
-    return recorder
+    yield recorder
+    for stub in recorder.stub_dirs:
+        real_rmtree(stub, ignore_errors=True)
 
 
 def _run_probe(tmp_path: Path, **overrides: Any) -> list[dict]:
@@ -878,6 +1154,57 @@ class TestConfigDirLifetime:
         config_path = probe_recorder.configs[-1].path
         assert config_path.exists(), (
             f'--keep-config-dir was ignored on the failure path: {config_path} is gone'
+        )
+
+    def test_a_kept_config_dir_is_outside_the_swept_namespace(
+        self, probe_recorder, monkeypatch, tmp_path, sweep_root
+    ):
+        """The DEAD-PID SWEEP must honour ``--keep-config-dir`` too, not just atexit.
+
+        The two halves of the flag's guarantee have to agree.  A kept dir named
+        ``...-<pid>`` is attributable, so once the keeping process exits its PID
+        is dead and the NEXT probe run (>``min_age_secs`` later) rmtree's the very
+        artifact the operator preserved — one that costs a real-money live run to
+        retake.  Run against the REAL ``sweep_stale_pid_dirs``, because the whole
+        mechanism is whether that function can attribute the name.
+        """
+        exc_type = _inject('build_argv', monkeypatch, probe_recorder)
+        with pytest.raises(exc_type, match='injected'):
+            _run_probe(tmp_path, keep_config_dir=True)
+        name = probe_recorder.configs[-1].path.name
+
+        assert name.startswith(probe._PROBE_DIR_PREFIX), (
+            f'{name!r} left the probe prefix entirely, which would also hide it '
+            f'from every legitimate reclamation path'
+        )
+        assert _PID_SUFFIX_RE.search(name) is None, (
+            f'{name!r} still ends in -<digits>, so the sweep can attribute it to a '
+            f'dead PID and will delete the dir --keep-config-dir preserved'
+        )
+
+        # End-to-end: plant that exact name next to an ordinary dead-PID dir, age
+        # both past the mtime floor, and run the REAL sweep over the probe prefix.
+        # The dead-PID dir is the anti-vacuity control — without it, a sweep that
+        # silently did nothing at all would look like a sweep that spared the
+        # kept dir on purpose.
+        kept = sweep_root / name
+        kept.mkdir()
+        (kept / '.credentials.json').write_text('{}')
+        stale = sweep_root / f'{probe._PROBE_DIR_PREFIX}healthy-{_DEAD_PID}'
+        stale.mkdir()
+        for planted in (kept, stale):
+            os.utime(planted, (0, 0))
+
+        # run_live_probe already consumed the once-per-process flag above.
+        monkeypatch.setattr(probe, '_probe_dir_sweep_done', False)
+        assert probe._sweep_stale_probe_dirs_once() == 1, (
+            'the control dir was not reclaimed — this sweep did nothing, so it '
+            'says nothing about the kept dir'
+        )
+        assert not stale.exists()
+        assert kept.exists(), (
+            'the sweep reclaimed a --keep-config-dir dir: the atexit half honours '
+            'the flag and the sweep half does not'
         )
 
 
@@ -1118,22 +1445,21 @@ def _inject_teardown_failure(
     ``Path.open`` / ``Path.unlink`` wrappers here wrap whatever that fixture has
     already installed, so the recorder keeps seeing everything the probe allocates.
     """
-    if kind == 'stub_subdir':
-        # The case the suppress comment in the `finally` claims to cover and does
-        # not: the suppress sits around `rmdir`, one statement AFTER the glob loop
-        # whose `unlink` is what actually raises on a subdirectory
-        # (IsADirectoryError, an OSError).
-        recording_mkdtemp = tempfile.mkdtemp
+    if kind == 'stub_rmtree':
+        # The stub dir is removed by ONE shutil.rmtree, so the failure has to come
+        # from the removal itself (EACCES on a child, EBUSY on a mount) rather
+        # than from an entry a per-entry loop could not unlink.  Scoped to the
+        # stub dir by path: `shutil` is one module object, so an unscoped patch
+        # would also break TaskConfigDir.cleanup() — the very step whose survival
+        # the parametrized tests assert.
+        real_rmtree = shutil.rmtree
 
-        def _planting_mkdtemp(*args: Any, **kwargs: Any) -> str:
-            path = recording_mkdtemp(*args, **kwargs)
-            # Sorted first, so the glob loop trips on it BEFORE the ordinary
-            # entry — otherwise a naive loop would look isolated by luck.
-            (Path(path) / '0-planted-subdir').mkdir()
-            (Path(path) / '1-planted-file').write_text('a file the child recreated')
-            return path
+        def _failing_rmtree(path: Any, *args: Any, **kwargs: Any):
+            if recorder.stub_dirs and Path(path) == recorder.stub_dirs[-1]:
+                raise OSError('injected: rmtree() failed')
+            return real_rmtree(path, *args, **kwargs)
 
-        monkeypatch.setattr(probe.tempfile, 'mkdtemp', _planting_mkdtemp)
+        monkeypatch.setattr(probe.shutil, 'rmtree', _failing_rmtree)
         _inject('spawn_env', monkeypatch, recorder)
         return _TeardownCase(kind=kind, in_flight='injected: _spawn_env')
 
@@ -1173,7 +1499,7 @@ def _inject_teardown_failure(
     raise AssertionError(f'unknown teardown-failure kind {kind!r}')
 
 
-@pytest.fixture(params=['stub_subdir', 'handle_close', 'temp_path_unlink'])
+@pytest.fixture(params=['stub_rmtree', 'handle_close', 'temp_path_unlink'])
 def teardown_failure(request, monkeypatch, probe_recorder) -> _TeardownCase:
     return _inject_teardown_failure(request.param, monkeypatch, probe_recorder)
 
@@ -1222,29 +1548,54 @@ class TestTeardownIsFailureIsolated:
     ):
         # Loud, not silent: a probe that quietly failed to tidy up leaves no
         # trace of what it left behind (no-silent-fail-soft).
-        case = _inject_teardown_failure('stub_subdir', monkeypatch, probe_recorder)
+        case = _inject_teardown_failure('stub_rmtree', monkeypatch, probe_recorder)
         with pytest.raises(RuntimeError, match=case.in_flight):
             _run_probe(tmp_path, **case.probe_kwargs)
-        shutil.rmtree(probe_recorder.stub_dirs[-1], ignore_errors=True)
         err = capsys.readouterr().err
         assert 'WARNING' in err and 'teardown' in err, (
             f'the swallowed teardown failure was never reported; stderr was {err!r}'
         )
+        assert str(probe_recorder.stub_dirs[-1]) in err, (
+            'the warning must name the dir that survived, or an operator cannot '
+            'reclaim it by hand'
+        )
 
-    def test_stub_entries_after_the_failing_one_are_still_unlinked(
-        self, probe_recorder, monkeypatch, tmp_path
+    def test_a_stub_dir_containing_a_subdirectory_is_reclaimed(
+        self, probe_recorder, monkeypatch, tmp_path, capsys
     ):
-        case = _inject_teardown_failure('stub_subdir', monkeypatch, probe_recorder)
-        with pytest.raises(RuntimeError, match=case.in_flight):
-            _run_probe(tmp_path, **case.probe_kwargs)
+        """A non-empty stub dir must be REMOVED, not merely reported.
+
+        The per-entry ``glob`` + ``unlink`` this replaced could not remove a
+        SUBDIRECTORY at all (``Path.unlink`` raises ``IsADirectoryError``), so
+        both it and the following ``rmdir`` failed, and the dir was abandoned in
+        the SYSTEM tempdir — where no sweep covers the ``startup_probe_stubs_``
+        prefix.  Measured, not theorised: every run of this module used to leave
+        two such dirs behind.  A wedge stub the CLI re-created a file inside, or
+        any subdir the child wrote, hits the same path in production.
+        """
+        real_mkdtemp = tempfile.mkdtemp
+
+        def _planting_mkdtemp(*args: Any, **kwargs: Any) -> str:
+            path = real_mkdtemp(*args, **kwargs)
+            # Sorted FIRST, so a per-entry loop would trip on it before the
+            # ordinary entry rather than looking isolated by luck.
+            (Path(path) / '0-planted-subdir').mkdir()
+            (Path(path) / '0-planted-subdir' / 'nested').write_text('child output')
+            (Path(path) / '1-planted-file').write_text('a file the child recreated')
+            return path
+
+        monkeypatch.setattr(probe.tempfile, 'mkdtemp', _planting_mkdtemp)
+        _inject('spawn_env', monkeypatch, probe_recorder)
+        with pytest.raises(RuntimeError, match='injected: _spawn_env'):
+            _run_probe(tmp_path)
+
         stub_dir = probe_recorder.stub_dirs[-1]
-        leftover = stub_dir / '1-planted-file'
-        survived = leftover.exists()
-        # The planted SUBDIR legitimately survives — nothing in the teardown
-        # removes a subtree — so reclaim it here rather than littering /tmp.
-        shutil.rmtree(stub_dir, ignore_errors=True)
-        assert not survived, (
-            'one unlinkable stub entry cancelled the rest of the glob loop'
+        assert not stub_dir.exists(), (
+            f'{stub_dir} was abandoned in the system tempdir: the teardown can '
+            f'only unlink FILES, so a stub dir holding a subdirectory leaks'
+        )
+        assert 'teardown' not in capsys.readouterr().err, (
+            'removing a non-empty stub dir is not a failure and must not warn'
         )
         assert not probe_recorder.configs[-1].path.exists()
 
@@ -1288,6 +1639,54 @@ class TestTeardownIsFailureIsolated:
         )
         assert not probe_recorder.stub_dirs[-1].exists()
         assert not probe_recorder.configs[-1].path.exists()
+
+    def test_a_config_dir_that_survives_cleanup_is_named_on_stderr(
+        self, probe_recorder, monkeypatch, tmp_path, capsys
+    ):
+        """A FAILED credential-dir removal must not be silent.
+
+        ``TaskConfigDir.cleanup()`` is ``rmtree(ignore_errors=True)``, so it
+        returns normally whatever happens — meaning the ``_teardown_step`` around
+        it can never report anything and a genuinely failed removal (EACCES on a
+        root-owned child, EBUSY, an immutable inode) would leave a 0600
+        ``.credentials.json`` holding a live OAuth access token in /tmp with zero
+        operator signal.  That is the silent fail-soft this repo rejects, in the
+        one teardown step with security consequences.
+        """
+        real_rmtree = shutil.rmtree
+        config_paths: list[Path] = []
+
+        def _ignoring_rmtree(path: Any, *args: Any, **kwargs: Any):
+            # Exactly what ignore_errors=True does when the removal fails:
+            # return normally and leave the tree in place.
+            if config_paths and Path(path) == config_paths[-1]:
+                return None
+            return real_rmtree(path, *args, **kwargs)
+
+        real_factory = probe.TaskConfigDir
+
+        def _uncleanable(*args: Any, **kwargs: Any):
+            config = real_factory(*args, **kwargs)
+            config_paths.append(config.path)
+            return config
+
+        monkeypatch.setattr(probe, 'TaskConfigDir', _uncleanable)
+        monkeypatch.setattr(probe.shutil, 'rmtree', _ignoring_rmtree)
+        _inject('build_argv', monkeypatch, probe_recorder)
+
+        with pytest.raises(RuntimeError, match='injected: _build_argv'):
+            _run_probe(tmp_path)
+
+        config_path = probe_recorder.configs[-1].path
+        assert (config_path / '.credentials.json').exists(), (
+            'the removal was not actually blocked — this test would pass vacuously'
+        )
+        err = capsys.readouterr().err
+        assert str(config_path) in err, (
+            f'the surviving OAuth-bearing dir was never named on stderr, so an '
+            f'operator has nothing to reclaim by hand; stderr was {err!r}'
+        )
+        assert 'WARNING' in err
 
     def test_a_failing_first_step_still_reaps_the_child(
         self, probe_recorder, monkeypatch, tmp_path

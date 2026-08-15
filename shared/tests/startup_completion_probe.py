@@ -48,7 +48,9 @@ raising: losing one value is bounded, whereas raising out of the sampling loop
 would discard an entire already-paid-for live capture.  The degraded row is
 shaped like whatever was gated — identity fields for an observation, the scalar
 exit fields for the run's exit provenance — because that provenance is stamped
-onto every observation of the run.
+onto every observation of the run.  A degraded observation also carries the
+probe-authored ``captured_at`` / ``session_id`` (shape-validated), so a row in an
+appended-to ``--out`` file can still be attributed to the run that emitted it.
 
 USAGE
 -----
@@ -66,15 +68,16 @@ import contextlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, Any, Literal, NamedTuple
 
 # Allow execution as a bare script (``python tests/startup_completion_probe.py``)
 # as well as import from a pytest run, mirroring shared/tests/conftest.py.
@@ -308,6 +311,54 @@ _SUBSTRATE_KEYS = (
 )
 
 
+def _int_or_none(value: Any) -> int | None:
+    """*value* if it is a genuine ``int``, else ``None``.
+
+    The ``not isinstance(value, bool)`` half is the whole reason this exists as a
+    helper: ``bool`` is a subclass of ``int``, so ``True`` would otherwise pass
+    through as the int ``1`` and make a nonsense ``sample_index`` (or a nonsense
+    ``exit_code``) read as a real one.  Stated once here rather than re-argued at
+    each of the call sites that need it.
+    """
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _number_or_none(value: Any) -> int | float | None:
+    """*value* if it is a genuine ``int``/``float``, else ``None``.
+
+    The :func:`_int_or_none` rationale, widened to the fields that are legitimately
+    fractional (``sample_offset_secs``).  ``bool`` is still excluded.
+    """
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def _bool_or_none(value: Any) -> bool | None:
+    """*value* if it is a genuine ``bool``, else ``None``.
+
+    The converse filter: here an int ``1`` must NOT read as ``True``, because a
+    degraded row's flags claim to be observations, not truthiness.
+    """
+    return value if isinstance(value, bool) else None
+
+
+#: Anchored, length-bounded shapes for the two PROBE-AUTHORED identity strings a
+#: degraded row is allowed to carry (see :func:`_poisoned_observation`).  Matching
+#: one is what makes the value clean BY CONSTRUCTION rather than by a scan: both
+#: alphabets exclude every named marker (``sk-ant-``, ``accessToken``, ...), and
+#: the longest ``[A-Za-z0-9_-]`` stretch either shape admits is 36 characters (a
+#: whole UUID), well under the 64-character generic run threshold.  ``fullmatch``
+#: is load-bearing — an unanchored match would let arbitrary text ride along.
+_ISO_TIMESTAMP_RE = re.compile(
+    r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:[+-]\d{2}:\d{2}|Z)'
+)
+_UUID_RE = re.compile(r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}')
+
+
+def _shaped_or_none(value: Any, shape: re.Pattern[str]) -> str | None:
+    """*value* if it is a string FULLY matching *shape*, else ``None``."""
+    return value if isinstance(value, str) and shape.fullmatch(value) else None
+
+
 def _poisoned_observation(
     observation: dict[str, Any], pattern_name: str
 ) -> dict[str, Any]:
@@ -328,35 +379,37 @@ def _poisoned_observation(
     pre-first-token path — a placeholder without it would merely trade the
     AssertionError for a KeyError at exactly the same blast radius.
 
+    ATTRIBUTION.  ``captured_at`` and ``session_id`` are carried too, because
+    ``main()`` APPENDS to ``--out``: one JSONL file routinely holds several runs
+    and several modes, and a row saying only ``mode='healthy', sample_index=2``
+    cannot be traced back to the run that produced it — which makes the stderr
+    warning's "fix ``_scrub_value``, then re-run the probe" advice unactionable.
+    Both are probe-authored (``datetime.now(UTC).isoformat()`` and a ``uuid4``)
+    and both are validated against an anchored shape before being carried, so
+    they keep the row's clean-by-construction property rather than trusting their
+    provenance: a value the probe did not author simply degrades to ``None``.
+
     Nothing else survives.  Dropping ``transcript_records`` / ``config_dir_tree``
     / ``run_exit`` / ``spawn_argv`` is what costs this ONE sample its analytical
-    value — the deliberate price of not losing the other N.
+    value — the deliberate price of not losing the other N.  ``cli_version`` and
+    ``probe_run_id`` are dropped with them: the first is ``claude --version``
+    output and the second can come straight from ``--probe-run-id``, so neither
+    is probe-authored and neither has a shape that could be validated.
     """
     substrate = observation.get('substrate_returns')
     if not isinstance(substrate, dict):
         substrate = {}
     mode = observation.get('mode')
     sample_kind = observation.get('sample_kind')
-    sample_index = observation.get('sample_index')
-    sample_offset_secs = observation.get('sample_offset_secs')
     return {
         'redaction_failed': True,
         'redaction_failure_pattern': pattern_name,
         'mode': mode if mode in MODES else None,
         'sample_kind': sample_kind if sample_kind in SAMPLE_KINDS else None,
-        # `not isinstance(x, bool)`: True would otherwise pass as the int 1 and
-        # make a nonsense index look like a real one.
-        'sample_index': (
-            sample_index
-            if isinstance(sample_index, int) and not isinstance(sample_index, bool)
-            else None
-        ),
-        'sample_offset_secs': (
-            sample_offset_secs
-            if isinstance(sample_offset_secs, (int, float))
-            and not isinstance(sample_offset_secs, bool)
-            else None
-        ),
+        'sample_index': _int_or_none(observation.get('sample_index')),
+        'sample_offset_secs': _number_or_none(observation.get('sample_offset_secs')),
+        'captured_at': _shaped_or_none(observation.get('captured_at'), _ISO_TIMESTAMP_RE),
+        'session_id': _shaped_or_none(observation.get('session_id'), _UUID_RE),
         'substrate_returns': {
             key: (substrate.get(key) if isinstance(substrate.get(key), int) else None)
             for key in _SUBSTRATE_KEYS
@@ -387,9 +440,6 @@ def _poisoned_exit_provenance(
     number, not text) are what survive.
     """
     mode = provenance.get('mode')
-    killed_by_probe = provenance.get('killed_by_probe')
-    exit_code = provenance.get('exit_code')
-    stderr_len = provenance.get('stderr_len')
     envelope = provenance.get('stdout_envelope')
     if not isinstance(envelope, dict):
         envelope = {}
@@ -397,41 +447,65 @@ def _poisoned_exit_provenance(
         'redaction_failed': True,
         'redaction_failure_pattern': pattern_name,
         'mode': mode if mode in MODES else None,
-        'killed_by_probe': (
-            killed_by_probe if isinstance(killed_by_probe, bool) else None
-        ),
-        # `not isinstance(x, bool)`: an exit code is an int, and True would
-        # otherwise read as a real exit status of 1.
-        'exit_code': (
-            exit_code
-            if isinstance(exit_code, int) and not isinstance(exit_code, bool)
-            else None
-        ),
+        'killed_by_probe': _bool_or_none(provenance.get('killed_by_probe')),
+        'exit_code': _int_or_none(provenance.get('exit_code')),
         # Numbers and flags only — `subtype` is CLI-authored text and is dropped.
         'stdout_envelope': {
             key: envelope[key]
             for key in _EXIT_ENVELOPE_SCALAR_KEYS
             if isinstance(envelope.get(key), (bool, int, float))
         },
-        'stderr_len': (
-            stderr_len
-            if isinstance(stderr_len, int) and not isinstance(stderr_len, bool)
-            else None
-        ),
+        'stderr_len': _int_or_none(provenance.get('stderr_len')),
         # The field the residual hit most plausibly lived in: arbitrary CLI stderr.
         'stderr_tail': None,
     }
 
 
-#: Degraded-row builder per gated shape.  Selected by :func:`_gate`'s ``kind``.
-_POISONED_BUILDERS = {
-    'observation': _poisoned_observation,
-    'run_exit': _poisoned_exit_provenance,
+def _observation_label(observation: dict[str, Any]) -> str:
+    """Name the gated SAMPLE for a stderr warning, echoing no input text.
+
+    A warning that quoted the value it just matched would print the very material
+    the gate exists to keep off the terminal, so the label is built only from
+    fields the probe can vouch for: an int index (:func:`_int_or_none` — an
+    arbitrary string in that field would otherwise be echoed verbatim, and this
+    branch fires precisely when the observation just matched a credential
+    pattern) and a ``sample_kind`` checked against the closed set the probe owns.
+    """
+    index = _int_or_none(observation.get('sample_index'))
+    kind = observation.get('sample_kind')
+    return (
+        f'sample {index if index is not None else "unknown index"} '
+        f'({kind if kind in SAMPLE_KINDS else "unknown kind"})'
+    )
+
+
+def _exit_label(provenance: dict[str, Any]) -> str:
+    """Name the gated EXIT PROVENANCE, under :func:`_observation_label`'s rule."""
+    mode = provenance.get('mode')
+    return f'run_exit ({mode if mode in MODES else "unknown mode"})'
+
+
+class _GatedShape(NamedTuple):
+    """How :func:`_gate` handles ONE gated shape: how to name it, how to degrade it."""
+
+    label: Callable[[dict[str, Any]], str]
+    degrade: Callable[[dict[str, Any], str], dict[str, Any]]
+
+
+#: ONE dispatch table per gated shape, selected by :func:`_gate`'s ``kind``.
+#: Labelling and degrading are kept together deliberately: they are two answers to
+#: the same question (what shape is this?), and splitting them across two
+#: independent branches is how a new shape gets one of them and not the other.
+_GATED_SHAPES: dict[str, _GatedShape] = {
+    'observation': _GatedShape(_observation_label, _poisoned_observation),
+    'run_exit': _GatedShape(_exit_label, _poisoned_exit_provenance),
 }
 
 
 def _gate(
-    observation: dict[str, Any], *, kind: str = 'observation'
+    observation: dict[str, Any],
+    *,
+    kind: Literal['observation', 'run_exit'] = 'observation',
 ) -> dict[str, Any]:
     """Refuse — or scrub — an assembled observation carrying credential material.
 
@@ -471,16 +545,18 @@ def _gate(
     degraded row must match the shape it stands in for; an observation-shaped
     fallback substituted for exit provenance would silently drop ``exit_code`` and
     friends from EVERY observation of the run, converting the bounded degradation
-    into the whole-capture loss this branch exists to prevent.
+    into the whole-capture loss this branch exists to prevent.  It is typed as a
+    ``Literal`` so pyright catches a wrong spelling at the call site (this repo
+    type-checks every staged Python change); the runtime ``ValueError`` below
+    stays as the backstop for an untyped caller.
     """
-    builder = _POISONED_BUILDERS.get(kind)
-    if builder is None:
+    shape = _GATED_SHAPES.get(kind)
+    if shape is None:
         # A wrong literal is a programming error, not a property of the captured
         # data: it is data-INDEPENDENT, so it fires on the first gated value of
         # the first run rather than lurking until a heuristic happens to hit.
         raise ValueError(
-            f'_gate: unknown kind {kind!r}; expected one of '
-            f'{tuple(_POISONED_BUILDERS)}'
+            f'_gate: unknown kind {kind!r}; expected one of {tuple(_GATED_SHAPES)}'
         )
 
     encoded = json.dumps(observation)
@@ -499,17 +575,10 @@ def _gate(
         return observation
 
     name, offset = generic
-    # Identify the gated value WITHOUT echoing input text to stderr: the index is
-    # an int and the two labels are checked against closed sets the probe owns.
-    if kind == 'run_exit':
-        gated_mode = observation.get('mode')
-        where = f'run_exit ({gated_mode if gated_mode in MODES else "unknown mode"})'
-    else:
-        gated_kind = observation.get('sample_kind')
-        where = (
-            f'sample {observation.get("sample_index")} '
-            f'({gated_kind if gated_kind in SAMPLE_KINDS else "unknown kind"})'
-        )
+    # Identify the gated value WITHOUT echoing input text to stderr — see
+    # _observation_label.  Built from the SAME dispatch entry that will build the
+    # degraded row, so a new gated shape cannot arrive with one and not the other.
+    where = shape.label(observation)
     print(
         f'startup_completion_probe: WARNING — heuristic pattern {name!r} matched at '
         f'offset {offset} in {where}. Scrubbing the matching run rather than '
@@ -539,7 +608,7 @@ def _gate(
             f'fix _scrub_value so it cleans this shape, then re-run the probe.',
             file=sys.stderr,
         )
-        return builder(observation, residual_name)
+        return shape.degrade(observation, residual_name)
     return scrubbed
 
 
@@ -896,6 +965,18 @@ def _spawn_env(config_dir: Path, oauth_token: str | None) -> dict[str, str]:
 _PROBE_TASK_ID_PREFIX = 'startup-probe-'
 _PROBE_DIR_PREFIX = CONFIG_DIR_PREFIX + _PROBE_TASK_ID_PREFIX
 
+#: Appended to the task-id stem under ``--keep-config-dir``, which makes the name
+#: end in ``-keep`` rather than ``-<pid>``.  That is the whole mechanism: the
+#: sweep only removes a dir it can ATTRIBUTE to a dead process via a parseable
+#: trailing ``-<digits>`` (``config_dir._PID_SUFFIX_RE``), and its third safety
+#: guard leaves an unattributable dir alone forever.  Without this the flag's two
+#: halves disagree — ``cleanup_at_exit`` honours ``--keep-config-dir`` while the
+#: next probe run (>``min_age_secs`` later) rmtree's the very dir the operator
+#: asked to keep, destroying an artifact that costs a real-money live run to
+#: retake.  It also means a kept dir is never auto-reclaimed: that IS the
+#: request, and the name says so out loud on an operator's `ls /tmp`.
+_PROBE_KEEP_SUFFIX = '-keep'
+
 #: Set once the stale-probe-dir sweep has run in this process.  The sweep
 #: reclaims OTHER (dead) processes' leftovers, so it is a process-wide one-shot:
 #: re-running it per probe re-scans /tmp for no benefit.
@@ -1058,17 +1139,23 @@ def run_live_probe(
     session_id = str(uuid.uuid4())
     cli_version = _cli_version()
     token_pair = _oauth_token()
-    # The negation is load-bearing, not cosmetic: TaskConfigDir.__init__
-    # registers atexit.register(shutil.rmtree, ...) when this is True, so an
-    # unconditional True would silently destroy at interpreter exit exactly the
-    # dir --keep-config-dir exists to preserve for post-run inspection.  This is
-    # only the CLEAN-EXIT half of reclamation — it covers a raise that escapes
-    # run_live_probe entirely (SystemExit, KeyboardInterrupt) but nothing
-    # survives SIGKILL; the dead-PID sweep below is the other half.
-    config = TaskConfigDir(
-        f'{_PROBE_TASK_ID_PREFIX}{mode}-{os.getpid()}',
-        cleanup_at_exit=not keep_config_dir,
-    )
+    # --keep-config-dir has to opt OUT of both reclamation mechanisms, not one.
+    # The `-keep` suffix takes the name out of the swept namespace (see
+    # _PROBE_KEEP_SUFFIX); the cleanup_at_exit negation is the other half and is
+    # equally load-bearing, not cosmetic: TaskConfigDir.__init__ registers
+    # atexit.register(shutil.rmtree, ...) when it is True, so an unconditional
+    # True would silently destroy at interpreter exit exactly the dir the flag
+    # exists to preserve for post-run inspection.  The DEFAULT name is unchanged
+    # byte for byte, so nothing that recorded provenance from an earlier run
+    # shifts; only the deliberately-kept dir is renamed.
+    #
+    # cleanup_at_exit covers a clean exit, including a raise that escapes
+    # run_live_probe entirely (SystemExit, KeyboardInterrupt).  Nothing survives
+    # SIGKILL, which is what the dead-PID sweep above is for.
+    task_id = f'{_PROBE_TASK_ID_PREFIX}{mode}-{os.getpid()}'
+    if keep_config_dir:
+        task_id += _PROBE_KEEP_SUFFIX
+    config = TaskConfigDir(task_id, cleanup_at_exit=not keep_config_dir)
     config_dir = config.path
 
     # Every resource the `finally` touches is initialized to a sentinel FIRST,
@@ -1248,10 +1335,11 @@ def run_live_probe(
         # the MECHANISM, stated rather than assumed — this block runs with an
         # exception potentially in flight, so an unguarded raise here would both
         # replace that exception with a misleading tidy-up error and skip
-        # everything after it.  (It did: a subdirectory in the stub dir made the
-        # glob loop's unlink raise IsADirectoryError, which masked the cause,
-        # orphaned the child and skipped config.cleanup() — while only the rmdir
-        # one statement later was guarded.)
+        # everything after it.  (It did, before this block was restructured: a
+        # subdirectory in the stub dir made the then-per-entry unlink raise
+        # IsADirectoryError, which masked the cause, orphaned the child and
+        # skipped config.cleanup() — while only the rmdir one statement later
+        # was guarded.)
         #
         # Still None-safe throughout: the try opens before these exist, so any of
         # them can still be its sentinel.  Still ordered least-to-most important,
@@ -1281,30 +1369,42 @@ def run_live_probe(
             with _teardown_step(f'unlink temp file {path}'):
                 path.unlink(missing_ok=True)
         if stub_dir is not None:
-            stub_entries: list[Path] = []
-            with _teardown_step(f'list stub dir {stub_dir}'):
-                stub_entries = sorted(stub_dir.glob('*'))
-            for stub in stub_entries:
-                with _teardown_step(f'unlink stub entry {stub}'):
-                    stub.unlink(missing_ok=True)
-            # Was a bare contextlib.suppress(OSError) — silent, and one statement
-            # too late: a stub dir left non-empty (a subdirectory the glob cannot
-            # unlink, a file the child recreated) raises in the LOOP above, not
-            # here.  Now every entry is isolated and every failure is loud.
+            # rmtree, not glob + unlink + rmdir.  Path.unlink cannot remove a
+            # SUBDIRECTORY (IsADirectoryError), so the per-entry loop this
+            # replaces could only ever REPORT a stub dir containing one and then
+            # abandon it in the system tempdir — where nothing reclaims it,
+            # because the dead-PID sweep is scoped to the config-dir prefix and
+            # never sees `startup_probe_stubs_*`.  One step, one warning, and a
+            # dir that is actually reclaimed whatever the child left inside it.
             with _teardown_step(f'remove stub dir {stub_dir}'):
-                stub_dir.rmdir()
+                shutil.rmtree(stub_dir)
         if not keep_config_dir:
-            # Isolated too, and the WARNING names the surviving PATH so an
-            # operator can reclaim it by hand.  This does not weaken the security
-            # guarantee: the guarantee is that cleanup is always ATTEMPTED, no
-            # code inside this finally could do better if the rmtree itself
-            # fails, and letting it raise here would only mask the in-flight
-            # exception.  The two remaining backstops — the
-            # cleanup_at_exit=not keep_config_dir atexit hook and the dead-PID
-            # sweep — do not make this optional: atexit is disabled under
-            # --keep-config-dir and does not run under SIGKILL.
+            # Isolated too.  This does not weaken the security guarantee: the
+            # guarantee is that cleanup is always ATTEMPTED, no code inside this
+            # finally could do better if the rmtree itself fails, and letting it
+            # raise here would only mask the in-flight exception.  The two
+            # remaining backstops — the cleanup_at_exit=not keep_config_dir
+            # atexit hook and the dead-PID sweep — do not make this optional:
+            # atexit is disabled under --keep-config-dir and does not run under
+            # SIGKILL.
             with _teardown_step(f'remove config dir {config_dir}'):
                 config.cleanup()
+                # TaskConfigDir.cleanup() is rmtree(ignore_errors=True), so it
+                # CANNOT raise and the step above can never report a failure of
+                # its own — which would make a genuinely failed removal (EACCES
+                # on a root-owned child, EBUSY, an immutable inode) completely
+                # silent, in the one teardown step with security consequences.
+                # So check, and be loud: what survives is a 0600
+                # .credentials.json holding a live OAuth access token, and this
+                # WARNING naming the path is the operator's only signal.
+                if config_dir.exists():
+                    print(
+                        f'startup_completion_probe: WARNING — the OAuth-bearing config '
+                        f'dir {config_dir} SURVIVED cleanup and still holds a 0600 '
+                        f'.credentials.json with a live access token. Remove it by hand: '
+                        f'nothing else will (atexit rmtree ignores errors too).',
+                        file=sys.stderr,
+                    )
     return observations
 
 

@@ -153,7 +153,10 @@ here. It is enforced twice:
   capture. The degraded row matches the shape it stands in for: an observation
   keeps identity fields, the run's exit provenance keeps its scalar fields
   (`exit_code`, `killed_by_probe`, `stderr_len`) and drops only the CLI-authored
-  text, since it is stamped onto every observation of the run;
+  text, since it is stamped onto every observation of the run. A degraded
+  observation also carries `captured_at` / `session_id` when they match their
+  probe-authored shapes, so a `redaction_failed` row in an appended-to `--out`
+  file can still be traced to the run that produced it;
 - **commit time** — `assert_no_credential_material()` is asserted over the full
   text of both corpus files and the raw capture by `TestCorpusSecretHygiene`,
   so a later hand-edit cannot reintroduce what the probe would have refused to
