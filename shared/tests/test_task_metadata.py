@@ -2115,6 +2115,64 @@ class TestListForDictOnlySliceRejected:
         assert isinstance(model.milestone, Milestone)  # type: ignore[attr-defined]
 
 
+class TestNonListForListSliceRejected:
+    """Task 4142, the mirror direction: a NON-LIST value for a 'list' slice.
+
+    The same silent-acceptance defect reflected. Today a bare mapping
+    supplied for the list-capable delivered_checks validates quietly into a
+    SINGLE DeliveredCheckMeta — and the consumer
+    (orchestrator/delivered_checks.py, verify_delivered_checks_on_main)
+    ITERATES that value, so a dict iterates its string KEYS and produces
+    garbage checks against a mark-done gate.
+    """
+
+    _KEY = 'mirror_checks_stub'
+
+    def _register(self):
+        register_metadata_submodel(self._KEY, _CheckStub, cardinality='list')
+
+    def test_bare_mapping_write_warn_mode_warns_and_retains_raw(self):
+        self._register()
+        model, warnings = parse_metadata(
+            {self._KEY: {'name': 'a'}}, direction='write', enforce=False
+        )
+        assert len(warnings) == 1
+        assert warnings[0].field == self._KEY
+        assert warnings[0].code == 'wrong_cardinality'
+        dumped = model.model_dump()[self._KEY]
+        assert dumped == {'name': 'a'}
+        assert not isinstance(dumped, BaseModel)
+
+    def test_bare_mapping_write_enforce_raises_type_error(self):
+        self._register()
+        with pytest.raises(TypeError):
+            parse_metadata({self._KEY: {'name': 'a'}}, direction='write', enforce=True)
+
+    def test_bare_mapping_read_warns_and_never_raises(self):
+        self._register()
+        model, warnings = parse_metadata({self._KEY: {'name': 'a'}}, direction='read')
+        assert len(warnings) == 1
+        assert warnings[0].code == 'wrong_cardinality'
+        assert model.model_dump()[self._KEY] == {'name': 'a'}
+
+    def test_scalar_value_write_warn_mode_warns(self):
+        self._register()
+        _model, warnings = parse_metadata(
+            {self._KEY: 'not-a-list'}, direction='write', enforce=False
+        )
+        assert len(warnings) == 1
+        assert warnings[0].code == 'wrong_cardinality'
+
+    def test_well_formed_list_still_validates_with_zero_warnings(self):
+        # Regression guard against over-tightening.
+        self._register()
+        model, warnings = parse_metadata(
+            {self._KEY: [{'name': 'a'}]}, direction='write', enforce=True
+        )
+        assert warnings == []
+        assert all(isinstance(item, _CheckStub) for item in getattr(model, self._KEY))
+
+
 class TestListValuedSubmodelSlice:
     """List-valued registered slice support in parse_metadata.
 

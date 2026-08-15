@@ -928,3 +928,35 @@ class TestMetadataRegistration:
                 direction='write',
                 enforce=True,
             )
+
+    def test_dict_shaped_slice_warns_wrong_cardinality(self):
+        # The mirror direction (task 4142): a bare mapping for the
+        # list-declared slice used to validate silently into a SINGLE
+        # DeliveredCheckMeta. verify_delivered_checks_on_main ITERATES this
+        # value, so a dict would iterate its string keys and yield garbage
+        # checks against a mark-done gate.
+        grep_entry = {'name': 'cap-one', 'kind': 'grep', 'pattern': 'foo', 'expect': 'present'}
+        model, warnings = parse_metadata(
+            {'delivered_checks': dict(grep_entry)}, direction='write', enforce=False
+        )
+        assert len(warnings) == 1
+        assert warnings[0].field == 'delivered_checks'
+        assert warnings[0].code == 'wrong_cardinality'
+        assert model.model_dump()['delivered_checks'] == grep_entry
+
+    def test_dict_shaped_slice_write_enforce_raises(self):
+        # A perfectly VALID single entry — the shape is the only defect, so
+        # this cannot pass for an element-validation reason.
+        with pytest.raises(TypeError):
+            parse_metadata(
+                {
+                    'delivered_checks': {
+                        'name': 'cap-one',
+                        'kind': 'grep',
+                        'pattern': 'foo',
+                        'expect': 'present',
+                    }
+                },
+                direction='write',
+                enforce=True,
+            )
