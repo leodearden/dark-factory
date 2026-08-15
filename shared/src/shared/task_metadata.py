@@ -640,10 +640,17 @@ def register_metadata_submodel(
     that desync degrades safely (parse_metadata iterates the registry, so a
     stale cardinality entry for an absent key is never read).
 
-    Idempotent when re-registering the *same* model object under the same
-    key (e.g. a module reloaded/imported twice). Raises ``ValueError`` when a
-    *different* model is registered for a key that already has one — this is
-    a loud, fail-fast conflict intended to surface at import time.
+    Idempotent when re-registering under the same key, provided the repeat
+    agrees on BOTH the model object and the cardinality (e.g. a module
+    reloaded/imported twice). Raises ``ValueError`` when a *different* model,
+    or a different cardinality, is registered for a key that already has one
+    — a loud, fail-fast conflict intended to surface at import time. Both
+    checks run BEFORE either dict is written, so a rejected call leaves the
+    registry and the cardinality map untouched (a partial write is the one
+    way the parallel-dict design could genuinely desync). Cardinality is
+    immutable for the same reason the model is: registration is a per-process,
+    import-order-driven side effect, so a silent last-writer-wins would make
+    the enforced shape depend on which module imported first.
 
     Registry keys are OWNED by the module that registers them. Tests must
     register test-only keys (``<name>_stub``) — never a key a production
@@ -654,9 +661,22 @@ def register_metadata_submodel(
     ``_stub``.
     """
 
+    # Read both dicts and run every check before either assignment: a raise
+    # partway through would leave the registry and the cardinality map
+    # desynced, which is precisely the failure the parallel-dict design has
+    # to avoid.
     existing = _SUBMODEL_REGISTRY.get(key)
+    existing_cardinality = _SUBMODEL_CARDINALITY.get(key)
     if existing is not None and existing is not model:
         raise ValueError(f'metadata sub-model already registered for {key!r}')
+    if existing is not None and existing_cardinality != cardinality:
+        raise ValueError(
+            f'metadata sub-model for {key!r} is already registered with '
+            f'cardinality {existing_cardinality!r}; cannot re-register it as '
+            f'{cardinality!r} (a key\'s declared shape is immutable — '
+            'registration is import-order-driven, so a silent overwrite would '
+            'make the enforced shape depend on which module imported first)'
+        )
     _SUBMODEL_REGISTRY[key] = model
     _SUBMODEL_CARDINALITY[key] = cardinality
 
