@@ -29,8 +29,15 @@ from fused_memory.reconciliation.index_drift_detector import (
 _LOGGER = 'fused_memory.reconciliation.index_drift_detector'
 
 
-def _unhealthy(group_id: str = 'dark_factory', missing=None) -> dict:
-    """A health record shaped exactly as summarize_index_health() returns one."""
+def _unhealthy(missing=None) -> dict:
+    """A health record shaped exactly as summarize_index_health() returns one.
+
+    Deliberately carries NO graph identity: `summarize_index_health()` does not
+    produce one, so the graph a filing is about comes from the `group_id`
+    argument to `escalate_missing_indices` and nowhere else.  A `group_id`
+    parameter here would read as if it varied the graph under test while
+    changing nothing — a fixture edit that leaves the test silently passing.
+    """
     if missing is None:
         missing = [
             ('Entity', 'NODE', 'name', 'RANGE'),
@@ -122,7 +129,7 @@ class TestEscalateMissingIndices:
     def test_structured_payload_is_readable_without_parsing_prose(self, tmp_path):
         """group_id and missing specs are first-class fields on the on-disk record."""
         queue, queue_dir = _make_queue(tmp_path)
-        health = _unhealthy(group_id='dark_factory')
+        health = _unhealthy()
 
         escalate_missing_indices(
             queue, 'dark_factory', health, project_id='dark_factory'
@@ -229,6 +236,59 @@ class TestEscalateMissingIndices:
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert warnings, 'A submit failure must be logged, not swallowed silently'
 
+    def test_dedup_read_failure_is_fail_soft(self, caplog):
+        """A failing has_open_l1 returns None and logs — it must never propagate.
+
+        `has_open_l1` → `get_by_task` globs the queue root and parses every
+        pending record, so an OSError (fd exhaustion, a permission flap, a disk
+        error) is a real failure mode there and not only on `submit`.  Escaping,
+        it would reach `_detect_index_drift`, whose caller's guard would discard
+        the health record the graph read had ALREADY produced — a queue-read
+        hiccup silently erasing a good read from the Stage 1 report.
+
+        It fails CLOSED (files nothing) rather than filing blind: with no dedup
+        answer, filing risks the once-per-cycle storm the dedup exists to
+        prevent, and the drift is re-observed next cycle anyway.
+        """
+        queue = MagicMock()
+        queue.has_open_l1.side_effect = OSError('too many open files')
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            result = escalate_missing_indices(
+                queue, 'dark_factory', _unhealthy(), project_id='dark_factory'
+            )
+
+        assert result is None
+        # With no dedup answer, filing blind would risk the storm the dedup
+        # exists to prevent.
+        queue.submit.assert_not_called()
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warnings, 'A dedup-read failure must be logged, not swallowed silently'
+        assert any('dark_factory' in r.getMessage() for r in warnings), (
+            'The WARNING must name the graph it failed for'
+        )
+
+    def test_malformed_health_record_is_fail_soft(self):
+        """Payload construction is inside the try too — nothing escapes.
+
+        `health['missing']` bound to something un-listable is not a shape this
+        module validates; it must degrade to "not filed", never to an exception
+        that costs the caller its health record.
+        """
+        queue = MagicMock()
+        queue.has_open_l1.return_value = False
+        queue.make_id.return_value = 'esc-graph:dark_factory-0001'
+        health = _unhealthy()
+        health['missing'] = 42  # not iterable — list() raises
+
+        assert (
+            escalate_missing_indices(
+                queue, 'dark_factory', health, project_id='dark_factory'
+            )
+            is None
+        )
+        queue.submit.assert_not_called()
+
     def test_make_id_failure_is_fail_soft(self):
         """id-generation failures are inside the try too — nothing escapes."""
         queue = MagicMock()
@@ -271,7 +331,7 @@ class TestEscalateMissingIndices:
             queue, 'dark_factory', _unhealthy(), project_id='dark_factory'
         )
         second = escalate_missing_indices(
-            queue, 'autotrade', _unhealthy(group_id='autotrade'), project_id='autotrade'
+            queue, 'autotrade', _unhealthy(), project_id='autotrade'
         )
 
         assert first is not None and second is not None

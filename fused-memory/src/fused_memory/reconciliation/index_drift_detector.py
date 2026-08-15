@@ -93,6 +93,13 @@ def escalate_missing_indices(
         unknown health, an already-open escalation, or a fail-soft error).
 
     Never raises: a diagnostics filer must not be able to break the caller.
+    That covers the DEDUP READ as well as the filing — `has_open_l1` fans out
+    to `get_by_task`, which globs the queue root and parses every pending
+    record, so an OSError (fd exhaustion, a permission flap, a disk error) is a
+    real failure mode there and not only on `submit`.  Unguarded it would
+    propagate into `_detect_index_drift` and cost the caller a health record it
+    had ALREADY computed successfully — a queue-read hiccup silently erasing a
+    good graph read from the Stage 1 report.
     """
     if health is None or health.get('healthy', False):
         return None
@@ -106,9 +113,27 @@ def escalate_missing_indices(
 
     dedup_key = f'graph:{group_id}'
 
-    if escalation_queue.has_open_l1(
-        dedup_key, category=_MISSING_INDEX_ESCALATION_CATEGORY
-    ):
+    # The dedup read is guarded on its own so its failure mode reads
+    # distinctly in the logs from a filing failure.  Failing CLOSED here (not
+    # filing) is the deliberate choice: filing blind with no dedup answer would
+    # risk exactly the once-per-cycle storm the dedup exists to prevent, and the
+    # drift is re-observed every cycle anyway, so a transient read error costs
+    # at most a delay — never a lost finding.
+    try:
+        already_open = escalation_queue.has_open_l1(
+            dedup_key, category=_MISSING_INDEX_ESCALATION_CATEGORY
+        )
+    except Exception as exc:
+        logger.warning(
+            'index_drift_detector: dedup read failed for group_id=%s; not filing '
+            'this cycle (the drift is re-observed next cycle): %s',
+            group_id,
+            exc,
+            extra={'project_id': project_id, 'group_id': group_id},
+        )
+        return None
+
+    if already_open:
         logger.info(
             'reconciliation.index_drift_escalation_suppressed: graph=%s already has '
             'an open level-1 index-drift escalation',
@@ -117,36 +142,37 @@ def escalate_missing_indices(
         )
         return None
 
-    missing = list(health.get('missing') or [])
-    unexpected = list(health.get('unexpected') or [])
-    expected_total = health.get('expected_total', 0)
-
-    summary = (
-        f'Graph {group_id} is missing {len(missing)} of {expected_total} expected '
-        f'FalkorDB indices'
-    )
-    detail = '\n'.join(
-        [
-            f'project_id: {project_id}',
-            f'run_id: {run_id}',
-            f'group_id: {group_id}',
-            f'expected_total: {expected_total}',
-            f'actual_total: {health.get("actual_total")}',
-            f'missing_count: {len(missing)}',
-            'missing:',
-            *(f'  - {spec}' for spec in missing),
-        ]
-    )
-    suggested_action = (
-        f'Provision the missing indices with ensure_indices(group_id={group_id!r}); '
-        f'{_EXIT_OWNER} owns closing this escalation once the graph reports healthy. '
-        'Unexpected (operator-added) indices are reported for context only and are '
-        'never acted on.'
-    )
-
     try:
-        # make_id() and Escalation() are inside the try so id-generation or
-        # constructor failures are caught and logged rather than escaping.
+        # Payload construction, make_id() and Escalation() are all inside the
+        # try so a surprising health record, an id-generation failure or a
+        # constructor failure is caught and logged rather than escaping.
+        missing = list(health.get('missing') or [])
+        unexpected = list(health.get('unexpected') or [])
+        expected_total = health.get('expected_total', 0)
+
+        summary = (
+            f'Graph {group_id} is missing {len(missing)} of {expected_total} expected '
+            f'FalkorDB indices'
+        )
+        detail = '\n'.join(
+            [
+                f'project_id: {project_id}',
+                f'run_id: {run_id}',
+                f'group_id: {group_id}',
+                f'expected_total: {expected_total}',
+                f'actual_total: {health.get("actual_total")}',
+                f'missing_count: {len(missing)}',
+                'missing:',
+                *(f'  - {spec}' for spec in missing),
+            ]
+        )
+        suggested_action = (
+            f'Provision the missing indices with ensure_indices(group_id={group_id!r}); '
+            f'{_EXIT_OWNER} owns closing this escalation once the graph reports healthy. '
+            'Unexpected (operator-added) indices are reported for context only and are '
+            'never acted on.'
+        )
+
         esc = Escalation(
             id=escalation_queue.make_id(dedup_key),
             task_id=dedup_key,
@@ -193,7 +219,7 @@ def escalate_missing_indices(
     except Exception as exc:
         logger.warning(
             'index_drift_detector: failed to escalate missing indices for group_id=%s '
-            '(id-gen, construction, or submit): %s',
+            '(payload, id-gen, construction, or submit): %s',
             group_id,
             exc,
             extra={'project_id': project_id, 'group_id': group_id},
