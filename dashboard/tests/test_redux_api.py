@@ -843,13 +843,21 @@ def test_shape_burndown_per_project_labels_are_that_projects_own_row():
 
 
 def test_shape_burndown_per_project_series_are_co_length_with_own_labels():
-    """Per-project series are co-length with that project's own labels.
+    """shape_burndown PRESERVES the co-length of each project's own row.
 
-    Passes against current server code — a regression pin.  This is the exact
-    invariant that makes `labels={pb.labels}` sound at the tabs.jsx consumer:
-    a per-project block is internally co-indexed, so it needs no hole
-    semantics.  Densifying these onto the union row would require making
-    deriveVelocitySeries, the summary-table last-value reads, and
+    Passes against current server code — a regression pin.  Note what it does
+    and does not say: co-length is established UPSTREAM by get_burndown_series,
+    which appends one value per key per snapshot row, and shape_burndown copies
+    each block verbatim rather than normalizing it.  So this pins that the copy
+    does not re-align or truncate anything, not that shape_burndown would
+    repair a ragged input — see
+    test_shape_burndown_ragged_input_is_passed_through_unnormalized for the
+    contract on that.
+
+    Given a co-length input, this is the invariant that makes `labels={pb.labels}`
+    sound at the tabs.jsx consumer: a per-project block is internally co-indexed,
+    so it needs no hole semantics.  Densifying these onto the union row would
+    require making deriveVelocitySeries, the summary-table last-value reads, and
     compute_window_completion hole-aware first.
     """
     body = redux_api.shape_burndown(_DIVERGENT_SERIES)
@@ -884,6 +892,59 @@ def test_shape_burndown_aggregate_series_are_co_length_with_union_labels():
     # Timestamps both projects reported sum across them.
     assert agg['done'][agg['labels'].index('2026-05-20T00:00:00')] == 103   # 3 + 100
     assert agg['done'][agg['labels'].index('2026-05-22T00:00:00')] == 307   # 7 + 300
+
+
+def test_shape_burndown_ragged_input_is_passed_through_unnormalized():
+    """A ragged upstream row survives into BURNDOWN_BY_PROJECT unchanged.
+
+    shape_burndown neither normalizes nor rejects a block whose series are not
+    co-length with its labels — it copies them verbatim.  Ragged input is
+    reachable in principle (compute_window_completion and
+    compute_forecast_confidence both treat a length mismatch as a bail-out
+    condition rather than an impossibility), so this pins what actually
+    happens today rather than leaving it to be rediscovered:
+
+      * the per-project block stays ragged (labels 3, done 2), so the co-length
+        property the tabs.jsx `labels={pb.labels}` pairing relies on comes from
+        get_burndown_series upstream, NOT from this function;
+      * completed / velocity / window_days are zeroed and the forecast is None,
+        because both helpers bail out on the mismatch;
+      * the aggregate densification, which zips labels against values with
+        strict=False, silently reads the missing tail as 0 — indistinguishable
+        from a genuine 0 measurement.
+
+    If a future change makes shape_burndown normalize (pad/truncate) or raise
+    on ragged input, that is a deliberate contract change and this test should
+    be updated to the new behaviour, not deleted.
+    """
+    body = redux_api.shape_burndown({
+        'p1': {
+            'labels': [
+                '2026-05-20T00:00:00', '2026-05-21T00:00:00', '2026-05-22T00:00:00',
+            ],
+            'done': [3, 7],  # ragged: one short of its own label row
+            'in_progress': [1, 2, 3], 'blocked': [0, 0, 0], 'pending': [10, 9, 8],
+        },
+    })
+
+    block = body['BURNDOWN_BY_PROJECT']['p1']
+    assert len(block['labels']) == 3
+    assert block['done'] == [3, 7]          # verbatim — not padded, not truncated
+    assert block['in_progress'] == [1, 2, 3]
+    assert block['completed'] == 0
+    assert block['velocity'] == 0.0
+    assert block['window_days'] == 0
+    assert block['forecast_low'] is None
+    assert block['forecast_high'] is None
+
+    agg = body['BURNDOWN']
+    assert agg['labels'] == [
+        '2026-05-20T00:00:00', '2026-05-21T00:00:00', '2026-05-22T00:00:00',
+    ]
+    # The unreported third slot reads as 0, not as a hole.
+    assert agg['done'] == [3, 7, 0]
+    assert agg['in_progress'] == [1, 2, 3]
+    assert agg['completed'] == 0            # sum of per-project completeds
 
 
 # ---------------------------------------------------------------------------
