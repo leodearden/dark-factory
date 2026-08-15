@@ -1137,6 +1137,134 @@ async def test_curator_combine_target_pending_unclaimed_proceeds(
 
 
 @pytest.mark.asyncio
+async def test_curator_combine_claimed_pending_target_aborts(
+    curator_interceptor,
+    taskmaster,
+    audit_dir,
+):
+    """Pending BUT held by a live claimant → abort (task 4035, D11).
+
+    The inner TOCTOU window: status alone has the same shape one level down,
+    because a target can read 'pending' at the guard and be dispatched a
+    moment later. The status here IS pending, so the step-4 predicate alone
+    would let this through — the claimant conjunct is the only thing that can
+    refuse it.
+    """
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '50',
+            'status': 'pending',
+            'title': 'Test Task',
+            'claimant_run_id': 'run-abc:sess-1:4242',
+        }
+    )
+    rewritten = RewrittenTask(
+        title='x',
+        description='',
+        details='d',
+        files_to_modify=[],
+        priority='medium',
+    )
+    decision = CuratorDecision(
+        action='combine',
+        target_id='50',
+        target_fingerprint='Test Task',
+        rewritten_task=rewritten,
+        justification='...',
+    )
+    curator_interceptor._curator = _mock_curator(decision)
+
+    result = await _submit_and_resolve(curator_interceptor, '/project', title='Fix x')
+
+    taskmaster.update_task.assert_not_called()
+    assert result == {'id': '2', 'title': 'New Task'}
+
+
+@pytest.mark.asyncio
+async def test_curator_combine_blank_claimant_is_unclaimed(
+    curator_interceptor,
+    taskmaster,
+    audit_dir,
+):
+    """A blank/whitespace claimant reads as UNCLAIMED, so the combine proceeds.
+
+    Present-and-non-blank is the codebase's established spelling for
+    "unclaimed" (shared/task_claimant.py:93; live_task_write_guard's
+    has_live_claimant). A bare ``is not None`` would read a cleared-to-blank
+    row as claimed and refuse a legitimate combine.
+    """
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '50',
+            'status': 'pending',
+            'title': 'Test Task',
+            'claimant_run_id': '   ',
+        }
+    )
+    rewritten = RewrittenTask(
+        title='Unified parser work',
+        description='Combined',
+        details='d',
+        files_to_modify=[],
+        priority='medium',
+    )
+    decision = CuratorDecision(
+        action='combine',
+        target_id='50',
+        target_fingerprint='Test Task',
+        rewritten_task=rewritten,
+        justification='same concern',
+    )
+    curator_interceptor._curator = _mock_curator(decision)
+
+    result = await _submit_and_resolve(curator_interceptor, '/project', title='candidate')
+
+    taskmaster.update_task.assert_called_once()
+    assert result['action'] == 'combine'
+
+
+@pytest.mark.asyncio
+async def test_curator_combine_absent_claimant_key_proceeds(
+    curator_interceptor,
+    taskmaster,
+    audit_dir,
+):
+    """A target dict with NO claimant_run_id key at all still combines.
+
+    The shape an older backend row (pre-v2, before the column existed)
+    yields. Pins that the conjunct reads via ``.get()`` — it must neither
+    raise KeyError nor fail closed on a missing column.
+    """
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '50',
+            'status': 'pending',
+            'title': 'Test Task',
+        }
+    )
+    rewritten = RewrittenTask(
+        title='Unified parser work',
+        description='Combined',
+        details='d',
+        files_to_modify=[],
+        priority='medium',
+    )
+    decision = CuratorDecision(
+        action='combine',
+        target_id='50',
+        target_fingerprint='Test Task',
+        rewritten_task=rewritten,
+        justification='same concern',
+    )
+    curator_interceptor._curator = _mock_curator(decision)
+
+    result = await _submit_and_resolve(curator_interceptor, '/project', title='candidate')
+
+    taskmaster.update_task.assert_called_once()
+    assert result['action'] == 'combine'
+
+
+@pytest.mark.asyncio
 async def test_curator_combine_fingerprint_normalization(
     curator_interceptor,
     taskmaster,
