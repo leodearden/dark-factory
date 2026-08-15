@@ -591,6 +591,56 @@ class TestRunWatcherRotation:
         )
 
     @pytest.mark.asyncio
+    async def test_banner_names_dark_factory_root_and_canonical_rearm_invocation(
+        self, tmp_path: Path
+    ) -> None:
+        """The injected banner carries the tooling root AND the canonical re-arm form.
+
+        Task 3605.  Setting the env var is only half the fix: the sighted sessions
+        also had no way to SEE where the rearm script lived, so they guessed
+        (reify/scripts/) or swept the filesystem (find dark-factory*).  The banner
+        must state the absolute path outright.
+
+        The canonical invocation is asserted as a literal substring copied from
+        skills/escalation-watcher-auto/SKILL.md and skills/escalation-watcher/SKILL.md,
+        so the injected instruction and the skill text cannot drift into two
+        different "canonical" forms.
+
+        _make_rotation_harness sets project_root=tmp_path, so the default fixture
+        state IS the cross-project case (project_root != resolved DF root).
+        """
+        from shared.cli_invoke import AgentResult
+
+        h = _make_rotation_harness(tmp_path)
+        df_root = tmp_path / 'df-tooling-checkout'
+        assert df_root != h.config.project_root, 'fixture must exercise cross-project'
+        captured: dict = {}
+
+        async def fake_invoke(usage_gate, label, *, invoke_fn, **kwargs):
+            captured['prompt'] = kwargs.get('prompt', '')
+            return AgentResult(success=True, output='')
+
+        with (
+            patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke),
+            patch('orchestrator.harness.resolve_dark_factory_root', return_value=df_root),
+        ):
+            await h._run_watcher_rotation()
+
+        prompt = captured['prompt']
+        assert 'DARK_FACTORY_ROOT' in prompt, 'banner must name the variable'
+        assert str(df_root) in prompt, (
+            'banner must state the resolved absolute path, so no filesystem sweep '
+            f'is ever needed; {df_root} not found in prompt'
+        )
+        assert 'cd $DARK_FACTORY_ROOT && scripts/watcher-rearm.sh' in prompt, (
+            'banner must restate the canonical invocation verbatim as it appears in '
+            'skills/escalation-watcher-auto/SKILL.md'
+        )
+        # No-regression: the pre-existing banner lines survive.
+        assert f'Project root: {h.config.project_root}' in prompt
+        assert 'Escalation queue:' in prompt
+
+    @pytest.mark.asyncio
     async def test_rotation_start_logs_bash_max_timeout_ms(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
