@@ -18,6 +18,7 @@ import dataclasses
 
 import pytest
 
+from fused_memory.utils import canonical_labels
 from fused_memory.utils.canonical_labels import (
     LabelScan,
     Referent,
@@ -518,6 +519,71 @@ class TestScanContentAllowlist:
             known_project_ids={'dark_factory', '-home-leo-bad'},
         )
         assert [r.node_name for r in scan.refs] == ['dark_factory:2500']
+
+
+class TestAllPathShapedRegistryIsLoud:
+    """The permissive fallback for an all-path-shaped registry is a fail-SOFT
+    path, so it must be audible — INV-4 ``storm-escape-required``
+    (docs/legibility/design-invariants.md): every degradation carries an
+    escalation, loud over silent.
+
+    Warn-ONCE per process, mirroring ``validate_known_project_id``'s
+    ``_empty_registry_warned`` 250 lines away in the same package; the tests
+    below follow tests/test_validation.py::test_warn_once_on_empty_registry,
+    including resetting the process-global flag, without which they would pass
+    or fail depending on test ordering.
+    """
+
+    def test_all_path_shaped_registry_logs_a_warning(self, monkeypatch, caplog):
+        """A registry that was deliberately supplied and turned out entirely
+        unusable is an operator MISCONFIGURATION, and its consequence — the
+        cross-project filter silently running unnarrowed — is invisible without
+        this line."""
+        monkeypatch.setattr(canonical_labels, '_all_path_shaped_warned', False)
+        with caplog.at_level('WARNING', logger='fused_memory.utils.canonical_labels'):
+            _canonical_allowlist({'-home-leo-bad'})
+        warnings = [r for r in caplog.records if r.levelname == 'WARNING']
+        assert len(warnings) == 1, (
+            f'Expected exactly 1 WARNING for an all-path-shaped registry; '
+            f'got {len(warnings)}: {[r.message for r in warnings]}'
+        )
+        # Assert MEANING, not wording: the message must name the consequence
+        # (the filter is now permissive), not merely complain about an input.
+        assert 'permissive' in warnings[0].getMessage().lower()
+
+    def test_warning_is_emitted_only_once_per_process(self, monkeypatch, caplog):
+        """Warn-once: a scanner on a write path must not turn one
+        misconfiguration into a per-call log storm."""
+        monkeypatch.setattr(canonical_labels, '_all_path_shaped_warned', False)
+        with caplog.at_level('WARNING', logger='fused_memory.utils.canonical_labels'):
+            _canonical_allowlist({'-home-leo-bad'})
+            _canonical_allowlist({'-home-leo-other'})
+        warnings = [r for r in caplog.records if r.levelname == 'WARNING']
+        assert len(warnings) == 1, (
+            f'Expected exactly 1 WARNING across two calls (warn-once); '
+            f'got {len(warnings)}: {[r.message for r in warnings]}'
+        )
+
+    @pytest.mark.parametrize('registry', [None, set(), frozenset(), []])
+    def test_empty_and_none_registry_stay_silent(self, monkeypatch, caplog, registry):
+        """The load-bearing half. A missing/empty registry is pre-existing,
+        documented, and expected on every deployment that never wires one — and
+        ``validate_known_project_id`` already owns the warning for it. Warning
+        here would add a new noise source on the COMMON path; only the
+        misconfigured path is loud."""
+        monkeypatch.setattr(canonical_labels, '_all_path_shaped_warned', False)
+        with caplog.at_level('WARNING', logger='fused_memory.utils.canonical_labels'):
+            _canonical_allowlist(registry)
+        warnings = [r for r in caplog.records if r.levelname == 'WARNING']
+        assert warnings == [], f'Empty/None registry must stay silent; got {[r.message for r in warnings]}'
+
+    def test_fully_usable_registry_stays_silent(self, monkeypatch, caplog):
+        """Only the DEGRADED path is loud — a working registry logs nothing."""
+        monkeypatch.setattr(canonical_labels, '_all_path_shaped_warned', False)
+        with caplog.at_level('WARNING', logger='fused_memory.utils.canonical_labels'):
+            _canonical_allowlist({'dark_factory'})
+        warnings = [r for r in caplog.records if r.levelname == 'WARNING']
+        assert warnings == [], f'A usable registry must stay silent; got {[r.message for r in warnings]}'
 
 
 class TestShapeValidProseMatchesByDesign:
