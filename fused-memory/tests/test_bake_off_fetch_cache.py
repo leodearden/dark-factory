@@ -1023,3 +1023,119 @@ class TestReplayFetchesFlag:
         )) != 0
         # And NO artifact was written from the refused run.
         assert not (tmp_path / 'replay.json').exists()
+
+
+# ===========================================================================
+# step-21 — the ONE live end-to-end pass
+# ===========================================================================
+#
+# Everything above is pure: the doubles prove the WIRING is right, but they
+# cannot prove the cache replays a ranking a real embedder and a real Qdrant
+# produced.  That is what this one test does, on a 2-cluster subset — the
+# same shape as the E2 module's single live test
+# (test_bake_off_storage_shape.py:5666).
+#
+# Markers PER-TEST, never a module `pytestmark`: `addopts = -m 'not
+# integration'` would otherwise deselect every pure test in this file from
+# the merge lane along with this one.
+
+import os  # noqa: E402
+
+from _fm_helpers import QDRANT_URL, qdrant_skipif  # noqa: E402
+
+
+class _RefusesToBeConstructed:
+    """A tripwire, not a double.
+
+    On the replay path a ``MemoryService`` must never come into existence:
+    constructing one recovers a durable write queue and resolves an embedder,
+    both of which a "pure computation over a committed file" does not do.  A
+    recording double would let that pass and be caught only if some later
+    assertion happened to look at its call list.
+    """
+
+    def __init__(self, *args, **kwargs):
+        raise AssertionError(
+            'the replay path constructed a MemoryService — a replay must '
+            'touch no backend at all, not merely make fewer calls'
+        )
+
+
+@pytest.mark.integration
+@pytest.mark.timeout(600)
+@qdrant_skipif()
+@pytest.mark.skipif(
+    not os.environ.get('OPENAI_API_KEY'),
+    reason='the seeding half of this round trip needs a real embedder',
+)
+def test_a_live_dump_replays_offline_and_agrees_cell_for_cell(
+    tmp_path, monkeypatch, worker_id,
+):
+    """Seed for real, dump, then replay with every backend seam booby-trapped.
+
+    The two reports must agree on every measured cell — that agreement is the
+    entire warrant for item (0): if a replayed table can differ from the live
+    one it was dumped from, then every read-side arm scored off the cache is
+    scored against a fiction.
+
+    Deliberately NOT asserting any metric VALUE (G6): what is pinned is that
+    live and replayed agree, and that the replay acquired nothing.
+    """
+    from qdrant_client import QdrantClient  # noqa: PLC0415
+
+    mod = _mod()
+    cache = tmp_path / 'live_cache.json'
+    suffix = f'fetchcache_{worker_id}'
+    collections = set(mod.ephemeral_collections(suffix=suffix).values())
+
+    live_argv = [
+        '--clusters', '2', '--distractors', '12',
+        '--project-suffix', suffix,
+        '--json-out', str(tmp_path / 'live.json'),
+        '--md-out', str(tmp_path / 'live.md'),
+        '--dump-fetches', str(cache),
+    ]
+    assert mod.main(live_argv) == 0
+    live = json.loads((tmp_path / 'live.json').read_text(encoding='utf-8'))
+    assert cache.exists()
+
+    # The teardown half: a live run that leaves collections behind would make
+    # the replay below read a corpus the next run also sees.
+    client = QdrantClient(url=QDRANT_URL, timeout=10)
+    try:
+        surviving = {col.name for col in client.get_collections().collections}
+    finally:
+        client.close()
+    assert surviving.isdisjoint(collections)
+
+    # Now booby-trap every seam the live path reached through, and replay.
+    import fused_memory.services.memory_service as service_mod  # noqa: PLC0415
+
+    monkeypatch.setattr(service_mod, 'MemoryService', _RefusesToBeConstructed)
+    dropped = _DropRecorder()
+    monkeypatch.setattr(mod, 'drop_collections', dropped)
+
+    replay_argv = [
+        '--clusters', '2', '--distractors', '12',
+        '--project-suffix', suffix,
+        '--json-out', str(tmp_path / 'replay.json'),
+        '--md-out', str(tmp_path / 'replay.md'),
+        '--replay-fetches', str(cache),
+    ]
+    assert mod.main(replay_argv) == 0
+    replayed = json.loads((tmp_path / 'replay.json').read_text(encoding='utf-8'))
+
+    # Nothing was created, and — the one that could damage a concurrent live
+    # run — nothing was dropped.
+    assert dropped.calls == []
+
+    assert replayed['arms'] == live['arms']
+    assert replayed['audit_recall'] == live['audit_recall']
+    for key in ('token_estimator', 'guard_threshold', 'embedder_model',
+                'search_limit', 'distractor_slab_size', 'clusters_measured',
+                'queries_measured', 'guard_probes_measured', 'fixtures'):
+        assert replayed['protocol'][key] == live['protocol'][key], key
+
+    # The one honest difference, live vs. replayed.
+    assert live['protocol']['replayed_from'] is None
+    assert replayed['protocol']['replayed_from'] == str(cache)

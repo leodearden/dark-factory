@@ -2171,3 +2171,388 @@ class TestTheNoMeasurementConvention:
         """INV-5: there is not a second `—` convention in this repo."""
         mod = _mod()
         assert mod._cell is _bake_off()._cell
+
+
+# ===========================================================================
+# step-21 — the COMMITTED artifact pair, asserted as DATA
+# ===========================================================================
+#
+# `plans/read-transform-selection-report.{json,md}` is this task's
+# user-observable signal — the document whoever lands task 3111 actually
+# reads — so it is guarded as data rather than described in prose.  Mirrors
+# `TestCommittedReportJson`/`TestCommittedReportMarkdown`
+# (test_bake_off_storage_shape.py:5736/5952): pure file reads, no network, no
+# Qdrant, no key, running in the merge lane on every commit.
+#
+# What these pin is COMPLETENESS and HONESTY, never a value (PRD gate
+# G6/D10 — no arm, knob or window is ever re-tuned to move a column):
+#
+#   * every cell is a real measurement or `—`, and the two are consistent
+#     with the JSON cell-for-cell, so a `None` can never have printed as
+#     `0.00` and a measured number can never have been blanked;
+#   * the production half's labeled columns are `None` — the honest
+#     no-measurement — WITH the reason printed, never a measured zero;
+#   * the markdown re-renders byte-identically from the committed JSON, so
+#     the two artifacts cannot drift apart unnoticed;
+#   * exactly one markdown row per arm named in the JSON;
+#   * the four briefing-template traffic shares carried by the report are the
+#     ones in the committed `production_query_sample.jsonl`, so the external
+#     validity claim is checkable rather than asserted.
+
+import json  # noqa: E402
+
+HARVEST_PATH = SCRIPTS_DIR / 'harvest_production_queries.py'
+PRODUCTION_SAMPLE = FIXTURES_DIR / 'production_query_sample.jsonl'
+
+#: `column header -> (half, metric)` for the measurement columns of the
+#: committed decision table.  Pinned HERE, as the contract the artifact
+#: publishes, so the None-vs-`—` cross-check below is exact rather than
+#: positional guesswork.  `None` marks a column that is not a single scalar
+#: measurement (the arm label, the two spec flags, and the canonical column,
+#: which deliberately prints its two rates in ONE cell so neither can be
+#: quoted without its semantics).
+SELECTION_TABLE_COLUMNS: tuple[tuple[str, tuple[str, str] | None], ...] = (
+    ('arm', None),
+    ('claim recall', ('e2', 'claim_recall')),
+    ('canonical in top-k', None),
+    ('tokens/query', ('e2', 'tokens_per_query')),
+    ('topic diversity', ('e2', 'topic_diversity')),
+    ('baseline retention', ('e2', 'baseline_retention_at_k')),
+    ('displacement', ('e2', 'window_displacement')),
+    ('prod tokens/query', ('production', 'tokens_per_query')),
+    ('prod displacement', ('production', 'window_displacement')),
+    ('drops ranked records', None),
+    ('needs `contested` for V2', None),
+)
+
+
+@functools.cache
+def _harvest_mod() -> types.ModuleType:
+    return _load_script(HARVEST_PATH, 'harvest_production_queries')
+
+
+@functools.cache
+def _committed_selection_json() -> dict:
+    path = _mod().DEFAULT_SELECTION_JSON
+    assert path.exists(), (
+        f'{path} is missing. It is the decision document task 3111 reads; '
+        f'regenerate it with `uv run python '
+        f'fused-memory/scripts/read_transform_selection.py`.'
+    )
+    return json.loads(path.read_text(encoding='utf-8'))
+
+
+@functools.cache
+def _committed_selection_markdown() -> str:
+    path = _mod().DEFAULT_SELECTION_MD
+    assert path.exists(), (
+        f'{path} is missing. It is the operator-facing half of the pair; '
+        f'regenerate it with `uv run python '
+        f'fused-memory/scripts/read_transform_selection.py`.'
+    )
+    return path.read_text(encoding='utf-8')
+
+
+def _selection_table_rows(markdown: str) -> list[str]:
+    """The decision-table body rows, located by the header the renderer emits."""
+    lines = markdown.splitlines()
+    start = next(
+        i for i, line in enumerate(lines) if line.startswith('| arm |')
+    )
+    rows = []
+    for line in lines[start + 2:]:            # +2 skips the `| --- |` rule
+        if not line.startswith('| '):
+            break
+        rows.append(line)
+    return rows
+
+
+def _cells(row: str) -> list[str]:
+    return [cell.strip() for cell in row.strip().strip('|').split('|')]
+
+
+class TestTheCommittedPairExists:
+    """The module names its own artifacts, and the pair is in the tree."""
+
+    def test_the_module_names_the_committed_artifact_pair(self):
+        mod = _mod()
+
+        assert mod.DEFAULT_SELECTION_JSON.name == 'read-transform-selection-report.json'
+        assert mod.DEFAULT_SELECTION_MD.name == 'read-transform-selection-report.md'
+        assert mod.DEFAULT_SELECTION_JSON.parent.name == 'plans'
+
+    def test_it_is_a_SIBLING_and_never_the_e2_artifact(self):
+        """In-progress task 3560 owns `plans/e2-storage-shape-bakeoff-report.*`
+        and is landing the aliasing disclosure into it.  Writing read-side
+        arms there would break its `_check_arms` guard and collide head-on."""
+        mod = _mod()
+        bake = _bake_off()
+
+        assert mod.DEFAULT_SELECTION_JSON != bake.DEFAULT_REPORT_JSON
+        assert mod.DEFAULT_SELECTION_MD != bake.DEFAULT_REPORT_MD
+
+
+class TestCommittedSelectionJson:
+    """The machine-readable half."""
+
+    def test_it_parses_and_declares_its_schema(self):
+        report = _committed_selection_json()
+
+        assert report['schema'] == _mod().SELECTION_REPORT_SCHEMA
+
+    def test_every_arm_has_a_row_in_both_halves(self):
+        mod = _mod()
+        report = _committed_selection_json()
+
+        assert list(report['arms']) == list(mod.ARM_KEYS)
+        for arm in mod.ARM_KEYS:
+            assert set(report['arms'][arm]) >= {'label', 'spec', 'e2', 'production'}
+
+    @pytest.mark.parametrize('metric', REQUIRED_SELECTION_METRICS)
+    @pytest.mark.parametrize('half', ['e2', 'production'])
+    def test_every_required_metric_key_is_present(self, half, metric):
+        """An ABSENT key is a broken run; a None VALUE is a measurement that
+        was honestly not made.  Only the first is a defect."""
+        report = _committed_selection_json()
+
+        for arm in _mod().ARM_KEYS:
+            assert metric in report['arms'][arm][half], arm
+
+    def test_the_e2_half_actually_measured_its_labeled_columns(self):
+        """The authored set IS labeled, so a `None` there is a half-failed run
+        — the "blank cells read as a tie" failure, in the half that has ground
+        truth."""
+        report = _committed_selection_json()
+
+        for arm in _mod().ARM_KEYS:
+            block = report['arms'][arm]['e2']
+            for metric in REQUIRED_SELECTION_METRICS:
+                assert block[metric] is not None, f'{arm}.{metric}'
+
+    @pytest.mark.parametrize('metric', [
+        'claim_recall', 'canonical_aliased_in_top_k',
+        'canonical_unaliased_in_top_k',
+    ])
+    def test_the_production_labeled_columns_are_None_and_NOT_zero(self, metric):
+        """The honesty guard, at the source.
+
+        Production queries carry no ground truth, so these are not computable.
+        A `0.0` here would say "measured, and the arm found nothing" — the
+        exact fabrication the `—` convention exists to prevent.
+        """
+        report = _committed_selection_json()
+
+        for arm in _mod().ARM_KEYS:
+            assert report['arms'][arm]['production'][metric] is None, arm
+
+    def test_the_production_columns_that_ARE_computable_were_computed(self):
+        """Otherwise the unlabeled half is decoration: the whole point is that
+        tokens and displacement ARE measurable without labels."""
+        report = _committed_selection_json()
+
+        for arm in _mod().ARM_KEYS:
+            block = report['arms'][arm]['production']
+            assert block['tokens_per_query'] is not None, arm
+            assert block['window_displacement'] is not None, arm
+
+    def test_the_two_windows_are_the_ones_the_design_names(self):
+        """E2 at its own default, production at the briefing assembler's real
+        `limit=5` (briefing.py:1376) — a wider production window would measure
+        a read no production caller ever gets."""
+        report = _committed_selection_json()
+
+        assert report['e2_k'] == 10
+        assert report['production_k'] == _mod().PRODUCTION_K == 5
+
+    def test_it_carries_the_fixture_provenance_stamp(self):
+        """The blind-authoring audit trail extends to this table too."""
+        report = _committed_selection_json()
+
+        assert report['fixture_provenance']
+
+    def test_the_recommendation_names_an_arm_this_run_actually_scored(self):
+        mod = _mod()
+        report = _committed_selection_json()
+        rec = report['recommendation']
+
+        assert rec['arm'] in report['arms']
+        assert rec['arm'] in mod.ARM_KEYS
+        assert rec['arm'] not in rec['excluded_pending_contested_key']
+
+
+class TestCommittedSelectionMarkdown:
+    """The operator-facing half, and its agreement with the JSON."""
+
+    def test_the_table_header_is_the_pinned_column_set(self):
+        markdown = _committed_selection_markdown()
+
+        header = next(
+            line for line in markdown.splitlines() if line.startswith('| arm |')
+        )
+
+        assert _cells(header) == [name for name, _ in SELECTION_TABLE_COLUMNS]
+
+    def test_every_arm_in_the_json_has_exactly_one_row(self):
+        mod = _mod()
+        rows = _selection_table_rows(_committed_selection_markdown())
+        arms = list(_committed_selection_json()['arms'])
+
+        assert len(rows) == len(arms)
+        for arm in arms:
+            label = mod.ARM_LABELS[arm]
+            assert sum(1 for row in rows if _cells(row)[0] == label) == 1, arm
+
+    def test_every_cell_is_a_real_measurement_or_the_em_dash(self):
+        """No blank, no `None`, no `nan` — the three ways a hole gets rendered
+        as though it were content."""
+        dash = _bake_off()._NO_MEASUREMENT
+
+        for row in _selection_table_rows(_committed_selection_markdown()):
+            for cell in _cells(row):
+                assert cell, row
+                assert 'None' not in cell, row
+                assert 'nan' not in cell.lower(), row
+                assert cell == dash or cell.strip(dash), row
+
+    def test_a_None_in_the_json_renders_as_the_dash_and_nothing_else(self):
+        """The cross-check that makes `0.00` impossible.
+
+        Read the other way it is just as load-bearing: a MEASURED value must
+        never render as `—`, or a completed run reads as a half-failed one.
+        """
+        mod = _mod()
+        dash = _bake_off()._NO_MEASUREMENT
+        report = _committed_selection_json()
+        by_label = {
+            _cells(row)[0]: _cells(row)
+            for row in _selection_table_rows(_committed_selection_markdown())
+        }
+
+        for arm in mod.ARM_KEYS:
+            cells = by_label[mod.ARM_LABELS[arm]]
+            for column, (name, source) in enumerate(SELECTION_TABLE_COLUMNS):
+                if source is None:
+                    continue
+                half, metric = source
+                value = report['arms'][arm][half][metric]
+                cell = cells[column]
+                assert (cell == dash) is (value is None), f'{arm}.{name}={value!r} -> {cell!r}'
+
+    def test_the_canonical_cell_prints_both_rates_with_their_semantics(self):
+        """One cell, two words: a rate cannot be copied out of this table with
+        the aliasing silently stripped off — which is exactly how b_grouped's
+        0.97 came to be read as a retrieval property."""
+        mod = _mod()
+        column = [name for name, _ in SELECTION_TABLE_COLUMNS].index(
+            'canonical in top-k',
+        )
+        by_label = {
+            _cells(row)[0]: _cells(row)
+            for row in _selection_table_rows(_committed_selection_markdown())
+        }
+
+        for arm in mod.ARM_KEYS:
+            cell = by_label[mod.ARM_LABELS[arm]][column]
+            assert 'aliased' in cell and 'unaliased' in cell, cell
+
+    def test_the_production_section_prints_the_reason_for_its_dashes(self):
+        """A `—` with no reason beside it is indistinguishable from a bug."""
+        markdown = _committed_selection_markdown().lower()
+
+        assert 'unlabeled' in markdown
+        assert 'ground truth' in markdown
+        assert 'claim recall' in markdown
+        assert 'not a measured zero' in markdown or 'never a measured zero' in markdown
+
+    def test_it_re_renders_byte_identically_from_the_committed_json(self):
+        """The two artifacts are written from ONE report dict; this is what
+        makes it impossible for them to disagree unnoticed — and it is what
+        proves no number was hand-edited into the markdown after the run."""
+        mod = _mod()
+
+        rendered = mod.render_selection_markdown(_committed_selection_json())
+
+        assert rendered == _committed_selection_markdown()
+
+    def test_it_carries_the_four_disclosures_and_the_recommendation(self):
+        markdown = _committed_selection_markdown()
+        lowered = markdown.lower()
+
+        assert 'aliasing' in lowered                       # (a)
+        assert 'sighting' in lowered                       # (b)
+        assert 'suppress' in lowered                       # (c)
+        assert 'contested children are never suppressed' in lowered   # (d)
+        assert 'esc-5712' in lowered
+        assert '## Recommendation' in markdown
+        assert '3111' in markdown
+
+    def test_it_does_not_cite_b_grouped_0_97_as_a_retrieval_property(self):
+        """Asserted over the COMMITTED file, because that is what is read."""
+        for line in _committed_selection_markdown().splitlines():
+            if '0.97' in line:
+                lowered = line.lower()
+                assert 'alias' in lowered or 'transform' in lowered
+
+
+class TestTheProductionTrafficSharesAreTheMeasuredOnes:
+    """The external-validity claim, made checkable.
+
+    The report says the production set is what live traffic actually looks
+    like.  That claim is only worth anything if the shares in the artifact
+    are the ones in the committed sample — otherwise the number is prose.
+    """
+
+    def _fixture_templates(self) -> dict[str, dict]:
+        rows = _harvest_mod().read_fixture(PRODUCTION_SAMPLE)
+        return {
+            row['template']: row
+            for row in rows if row.get('source') == 'briefing_template'
+        }
+
+    def test_the_report_carries_the_production_query_provenance(self):
+        report = _committed_selection_json()
+
+        assert report['production_queries']['templates']
+
+    def test_all_four_briefing_templates_are_carried(self):
+        harvest = _harvest_mod()
+        report = _committed_selection_json()
+
+        carried = {t['template'] for t in report['production_queries']['templates']}
+        assert carried == {*harvest.LITERAL_TEMPLATES, harvest.TASK_TEMPLATE}
+
+    def test_every_share_matches_the_committed_sample_exactly(self):
+        """Not "close to": the report copies the fixture, so any drift means
+        the table was rendered against a sample that is no longer in the
+        tree."""
+        report = _committed_selection_json()
+        fixture = self._fixture_templates()
+
+        for entry in report['production_queries']['templates']:
+            row = fixture[entry['template']]
+            assert entry['observed_count'] == row['observed_count'], entry
+            assert entry['traffic_share'] == row['traffic_share'], entry
+
+    def test_the_family_share_is_the_sum_of_its_members(self):
+        """The 64%-of-live-traffic figure, derived rather than asserted."""
+        report = _committed_selection_json()
+        block = report['production_queries']
+
+        assert block['family_share'] == pytest.approx(
+            sum(t['traffic_share'] for t in block['templates']), abs=1e-6,
+        )
+
+    def test_the_markdown_names_each_template_verbatim(self):
+        """A reader must be able to see WHICH queries this half was scored on
+        without opening the fixture."""
+        markdown = _committed_selection_markdown()
+
+        for template in self._fixture_templates():
+            assert template in markdown, template
+
+    def test_the_production_rows_carry_no_labels(self):
+        """Unlabeled BY CONSTRUCTION — the journal records what was asked,
+        never what should have come back.  If a label ever appeared here, the
+        `—` cells above would be a lie rather than an honest abstention."""
+        for row in _harvest_mod().read_fixture(PRODUCTION_SAMPLE):
+            assert 'expects_claim_ids' not in row
