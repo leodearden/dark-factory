@@ -13,13 +13,19 @@ whose environment is that of the ``shared`` project: ``shared`` does NOT depend
 on ``escalation``, so nothing here may import it.  Declared ``shared``
 dependencies ARE fair game — ``yaml`` (pyyaml>=6.0) is one, and is imported bare
 below rather than behind an importorskip that could only ever turn a broken
-environment into a silent SKIP.  The storm escape's literal acceptance signal
+environment into a silent SKIP.  ``orchestrator`` is reachable too: the root
+conftest puts ``orchestrator/src`` on sys.path and ``shared`` declares
+pydantic-settings for exactly this reason, which is how the sibling
+tests/scripts/test_orchestrator_restart_config_drift.py imports
+``orchestrator.config`` at module scope in this same lane.  The storm escape's
+literal acceptance signal
 ("exactly ONE born-at-L2 record on disk") is asserted against the REAL
 ``escalation.submit`` writer in
 dashboard/tests/test_dashboard_watchdog_storm_escape.py instead.
 """
 
 import importlib.util
+import inspect
 import os
 import pathlib
 import re
@@ -31,6 +37,7 @@ import urllib.parse
 
 import pytest  # pyright: ignore[reportMissingImports]
 import yaml
+from orchestrator.config import YamlSettingsSource, _deep_merge, _load_defaults
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 WATCHDOG_PATH = REPO_ROOT / "scripts" / "dashboard-watchdog.py"
@@ -1108,10 +1115,15 @@ def test_b6_probe_port_matches_the_dashboard_units_listen_port():
     )
 
 
-#: ``project_root: "${PROJECT_ROOT:/home/leo/src/dark-factory}"`` — the
-#: interpolation grammar of YamlSettingsSource._expand_env_vars in
-#: orchestrator/src/orchestrator/config.py, reused so the two cannot disagree
-#: about what the form means. The DEFAULT group is what this file takes.
+#: ``project_root: "${PROJECT_ROOT:/home/leo/src/dark-factory}"`` — a hand COPY
+#: of the interpolation grammar YamlSettingsSource._expand_env_vars compiles,
+#: differing only in that the colon here is non-capturing, so the DEFAULT is
+#: group 2 rather than the loader's group 3. A copy is not reuse: copying is
+#: exactly the mechanism by which the two can come to disagree, so
+#: test_env_default_grammar_matches_the_config_loader below checks them against
+#: each other. (The real fix is one shared constant in
+#: orchestrator/src/orchestrator/config.py, which is outside this change's
+#: scope.)
 _ENV_DEFAULT_RE = re.compile(r"\$\{([^:}]+)(?::([^}]*))?\}")
 
 
@@ -1122,6 +1134,10 @@ def _configured_escalation_queue_dir(cfg: object, config_path: pathlib.Path) -> 
     read, precisely so the error paths and the drift cases below can exercise it
     against a synthetic config without touching the real file — which is what
     gives the pin an honest failing state, since the shipped values agree today.
+    ``cfg`` is expected to be the EFFECTIVE config (the project yaml merged over
+    orchestrator's packaged defaults, as YamlSettingsSource.__call__ builds it);
+    the pin below does that merge, and the table cases pass bare dicts because
+    what they exercise is this function's own resolution, not the layering.
 
     Uses .get() chaining (no raw [] indexing) so a schema rename surfaces as an
     AssertionError naming the offending config file path, not a bare KeyError —
@@ -1145,7 +1161,10 @@ def _configured_escalation_queue_dir(cfg: object, config_path: pathlib.Path) -> 
 
     queue_dir = escalation.get("queue_dir")
     assert queue_dir is not None, (
-        f"{config_path}: missing 'escalation.queue_dir' (schema may have changed)"
+        f"{config_path}: missing 'escalation.queue_dir' — the key has been "
+        "renamed or removed, not merely tidied out of the project yaml, since "
+        "callers pass the config already merged over orchestrator's packaged "
+        "defaults (which ship a queue_dir of their own)"
     )
 
     project_root = cfg.get("project_root")
@@ -1219,7 +1238,18 @@ def test_b6_escalation_queue_dir_matches_the_configured_escalation_queue_dir(mon
     monkeypatch.delenv("DASHBOARD_WATCHDOG_QUEUE_DIR", raising=False)
     mod = _load_watchdog()
 
-    cfg = yaml.safe_load(ORCH_CONFIG_PATH.read_text(encoding="utf-8"))
+    # Resolve the EFFECTIVE config, not the project yaml alone: production layers
+    # the project file over orchestrator's packaged defaults
+    # (YamlSettingsSource.__call__ is _deep_merge(_load_defaults(), project_yaml),
+    # reused here rather than re-derived), and defaults.yaml already ships
+    # escalation.queue_dir. Reading the project yaml on its own would make
+    # dropping that now-redundant key — a tidy-up that changes nothing about the
+    # effective path — fail this pin with a schema-drift diagnostic that was
+    # simply wrong. A guard that cries wolf is the kind that gets deleted. The
+    # merge also widens the pin: a repoint of the PACKAGED default now fires it
+    # too, which reading only the project yaml would have missed entirely.
+    project_cfg = yaml.safe_load(ORCH_CONFIG_PATH.read_text(encoding="utf-8")) or {}
+    cfg = _deep_merge(_load_defaults(), project_cfg)
     configured = _configured_escalation_queue_dir(cfg, ORCH_CONFIG_PATH)
 
     assert pathlib.Path(mod.ESCALATION_QUEUE_DIR) == configured, (
@@ -1354,6 +1384,74 @@ def test_configured_escalation_queue_dir_expands_the_project_root_default(monkey
         {"project_root": "/some/root", "escalation": {"queue_dir": "/srv/escalations"}},
         config_path,
     ) == pathlib.Path("/srv/escalations")
+
+
+def _loader_env_interpolation_pattern() -> str:
+    """Return the ``${VAR:default}`` pattern literal the config loader compiles.
+
+    Read out of ``YamlSettingsSource._expand_env_vars`` (cited by symbol, via
+    inspect, so it survives that file moving) rather than copied — the copy is
+    _ENV_DEFAULT_RE, and checking the copy against the original is the whole
+    point of the guard below.
+    """
+    source = inspect.getsource(YamlSettingsSource._expand_env_vars)
+    literals = re.findall(r"pattern = r'([^']*)'", source)
+
+    assert len(literals) == 1, (
+        "YamlSettingsSource._expand_env_vars no longer compiles exactly one "
+        f"`pattern = r'...'` literal (found {literals!r}), so the grammar it "
+        "uses can no longer be read out of it; re-check _ENV_DEFAULT_RE against "
+        "that loader by hand and fix this reader"
+    )
+    return literals[0]
+
+
+def test_env_default_grammar_matches_the_config_loader():
+    """_ENV_DEFAULT_RE must agree with the loader about what ``${...}`` means.
+
+    _ENV_DEFAULT_RE is a hand copy, and copying is exactly how the two can come
+    to disagree. Move the loader to the shell-conventional ``${VAR:-default}``
+    form and this file's regex silently stops matching: ``project_root``
+    resolves to the raw ``${...}`` string and the queue-dir pin above fails with
+    a baffling path mismatch instead of saying the grammar drifted.
+
+    So check them against each other on both things the helper relies on —
+    WHETHER a form matches at all, and WHAT it reads as the default — across the
+    shapes ``project_root`` could plausibly take. The loader captures the
+    ``:default`` span as well, so its default is its LAST group; a regrouping
+    that breaks that assumption fails here too, which is the intended outcome.
+    """
+    loader = re.compile(_loader_env_interpolation_pattern())
+
+    for value in (
+        "${PROJECT_ROOT:/home/leo/src/dark-factory}",
+        "${PROJECT_ROOT}",
+        "${PROJECT_ROOT:}",
+        "${PROJECT_ROOT:-/home/leo/src/dark-factory}",
+        "/home/leo/src/dark-factory",
+        "",
+    ):
+        theirs = loader.fullmatch(value)
+        ours = _ENV_DEFAULT_RE.fullmatch(value)
+
+        assert (theirs is None) == (ours is None), (
+            f"{value!r}: the config loader "
+            f"{'matches' if theirs else 'does not match'} it but _ENV_DEFAULT_RE "
+            f"{'matches' if ours else 'does not match'} it — the ${{VAR:default}} "
+            "grammar has drifted, so _configured_escalation_queue_dir would "
+            "resolve project_root differently from the loader that actually "
+            "reads it; re-copy the pattern from "
+            "YamlSettingsSource._expand_env_vars"
+        )
+
+        if theirs is None or ours is None:
+            continue
+
+        assert theirs.groups()[-1] == ours.group(2), (
+            f"{value!r}: the config loader reads the default as "
+            f"{theirs.groups()[-1]!r} but _ENV_DEFAULT_RE reads "
+            f"{ours.group(2)!r} — the copy has drifted from the original"
+        )
 
 
 def test_b6_unit_is_oneshot_and_journal_logged():
