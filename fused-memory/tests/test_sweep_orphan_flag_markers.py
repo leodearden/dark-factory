@@ -1816,6 +1816,150 @@ class TestBuildParser:
 
 
 # ===========================================================================
+# Tests: _parse_args cross-flag validation (task 3897 amendment,
+# reviewer_comprehensive #1)
+# ===========================================================================
+
+class TestParseArgs:
+    """--fail-on-blind-spot without --check is rejected at parse time.
+
+    The flag reaches an exit code only through _resolve_check_exit_code,
+    which main() consults ONLY under --check. Accepted silently, it would
+    hand an operator wiring it as a before_done.script predicate a gate that
+    STRUCTURALLY CANNOT FAIL — the exact defect class task 3897 exists to
+    eliminate, and a silent degradation besides. So it errors out (argparse
+    exit code 2) instead of no-op'ing.
+    """
+
+    def test_opt_in_without_check_is_rejected_with_exit_2(self, capsys):
+        """The bare dry-run shape: `--fail-on-blind-spot` alone."""
+        with pytest.raises(SystemExit) as exc_info:
+            _mod._parse_args(['--fail-on-blind-spot'])
+        assert exc_info.value.code == 2
+        stderr = capsys.readouterr().err
+        assert '--fail-on-blind-spot requires --check' in stderr, (
+            f'Expected an actionable error naming both flags, got: {stderr!r}'
+        )
+
+    def test_apply_without_check_is_also_rejected(self, capsys):
+        """`--apply --fail-on-blind-spot` — the shape an operator would reach
+        for when adding the gate to the nightly sweep — exits 0 regardless of
+        cross_check.blind_spot, so it is rejected too."""
+        with pytest.raises(SystemExit) as exc_info:
+            _mod._parse_args(['--apply', '--fail-on-blind-spot'])
+        assert exc_info.value.code == 2
+        assert '--fail-on-blind-spot requires --check' in capsys.readouterr().err
+
+    def test_opt_in_with_check_parses(self):
+        """The supported wiring — and the one
+        scripts/fused-memory-flag-marker-check.sh produces, since its exec
+        line hardcodes --check."""
+        args = _mod._parse_args(['--check', '--fail-on-blind-spot'])
+        assert args.check is True
+        assert args.fail_on_blind_spot is True
+
+    def test_pre_existing_invocations_are_unaffected(self):
+        """Every shape that predates the flag still parses unchanged — the
+        validation must not narrow the existing CLI contract."""
+        assert _mod._parse_args([]).fail_on_blind_spot is False
+        assert _mod._parse_args(['--check']).check is True
+        assert _mod._parse_args(['--apply', '--terminal-drain']).apply is True
+        assert _mod._parse_args(['--check', '--max-backlog', '5']).max_backlog == 5
+
+    def test_help_text_names_the_check_dependency(self):
+        """The dependency must be discoverable from --help, not only from a
+        parse error, since that is where an operator looks before wiring a
+        predicate."""
+        parser = _mod._build_parser()
+        help_text = next(
+            action.help for action in parser._actions
+            if action.dest == 'fail_on_blind_spot'
+        )
+        assert 'REQUIRES --check' in (help_text or ''), (
+            f'Expected the --check dependency in the help string, got: {help_text!r}'
+        )
+
+
+# ===========================================================================
+# Tests: main() report -> exit-code wiring (task 3897 amendment,
+# reviewer_comprehensive #5)
+# ===========================================================================
+
+class TestMainExitCode:
+    """main() is the only place args.fail_on_blind_spot reaches
+    _resolve_check_exit_code.
+
+    A regression dropping that keyword would revert to the parameter default
+    (False) and leave every other test in this file green while the opt-in
+    gate silently stopped escalating — so the wiring is asserted end-to-end
+    here (argv -> parse -> exit code), with the live MemoryService
+    construction short-circuited at asyncio.run.
+    """
+
+    _BLIND_SPOT_REPORT = {
+        'dry_run': True,
+        'before': {'total_source': 0, 'total_with_kind': 0},
+        'orphan_count': 0,
+        'orphan_ids': [],
+        'cross_check': {
+            'source_total': 0,
+            'flag_for_stage2_total': 61,
+            'blind_spot': True,
+            'probe_failed': False,
+        },
+    }
+
+    def _run_main(self, monkeypatch, argv: list[str], report: dict) -> int:
+        """Run main() with *argv*, short-circuiting the live sweep to *report*."""
+        def _fake_asyncio_run(coro):
+            # main() has already built the _run_live() coroutine; close it so
+            # the stub does not leak a never-awaited coroutine warning.
+            coro.close()
+            return report
+
+        monkeypatch.setattr(sys, 'argv', ['sweep_orphan_flag_markers.py', *argv])
+        monkeypatch.setattr(_mod.asyncio, 'run', _fake_asyncio_run)
+        return _mod.main()
+
+    def test_opt_in_escalates_an_observed_blind_spot_to_exit_1(self, monkeypatch, capsys):
+        """--check --fail-on-blind-spot against a blind-spot report: exit 1."""
+        assert self._run_main(
+            monkeypatch, ['--check', '--fail-on-blind-spot'], self._BLIND_SPOT_REPORT,
+        ) == 1
+
+    def test_check_alone_still_holds_on_the_same_report(self, monkeypatch, capsys):
+        """The already-wired esc-2866-1 O2 watch task's contract: the same
+        report, without the opt-in, still resolves to 0 via backlog_verdict."""
+        assert self._run_main(
+            monkeypatch, ['--check'], self._BLIND_SPOT_REPORT,
+        ) == 0
+
+    def test_opt_in_without_check_never_reaches_the_sweep(self, monkeypatch, capsys):
+        """Rejection happens at parse time, before any live service is built
+        — so an operator's mis-wiring fails loudly and instantly rather than
+        running a full sweep and then exiting 0."""
+        def _must_not_run(coro):
+            coro.close()
+            raise AssertionError('the sweep must not run for a rejected arg combination')
+
+        monkeypatch.setattr(
+            sys, 'argv', ['sweep_orphan_flag_markers.py', '--fail-on-blind-spot'],
+        )
+        monkeypatch.setattr(_mod.asyncio, 'run', _must_not_run)
+
+        with pytest.raises(SystemExit) as exc_info:
+            _mod.main()
+        assert exc_info.value.code == 2
+
+    def test_no_check_returns_0_and_prints_the_report(self, monkeypatch, capsys):
+        """The default (non---check) path is unchanged: always exit 0, with
+        the JSON report — cross_check block included — on stdout."""
+        assert self._run_main(monkeypatch, [], self._BLIND_SPOT_REPORT) == 0
+        stdout = capsys.readouterr().out
+        assert '"cross_check"' in stdout and '"blind_spot": true' in stdout
+
+
+# ===========================================================================
 # Tests: _resolve_terminal_task_ids (task 2596 amendment, reviewer_comprehensive #3)
 # ===========================================================================
 

@@ -1071,20 +1071,67 @@ def _build_parser() -> argparse.ArgumentParser:
         '--fail-on-blind-spot', dest='fail_on_blind_spot',
         action='store_true', default=False,
         help=(
-            'Escalate a detected enumeration blind spot (this sweep matched '
-            "0 records while an adjacent {'flag_for_stage2': True} "
-            'population is non-empty) to exit 1, so a before_done predicate '
-            'can gate on it. OFF by default: that pool is a HEALTHY rolling '
-            '14-day window drained by the in-cycle collector '
-            '_sweep_stale_mem0_flag_for_stage2_markers (task 2966), so a '
-            'gate wired to fail on its mere non-emptiness would fail '
-            'forever — the same footgun documented above for --max-backlog 0 '
-            'against undated markers. Without this flag the blind spot is '
-            'still reported: loudly in the log and in the JSON report\'s '
-            'cross_check block.'
+            'REQUIRES --check (rejected at parse time without it). Escalate '
+            'an OBSERVED enumeration blind spot (this sweep matched 0 records '
+            "while an adjacent {'flag_for_stage2': True} population is "
+            'non-empty) to exit 1, so a before_done predicate can gate on '
+            'it. OFF by default because that pool is a healthy rolling '
+            '14-day window drained in-cycle by task 2966 — a gate keyed on '
+            'its mere non-emptiness would fail forever, the same footgun '
+            'documented above for --max-backlog 0 against undated markers. '
+            'Without this flag the blind spot is still reported: loudly in '
+            "the log and in the JSON report's cross_check block. Full "
+            'rationale and dated census: docs/flag-marker-sweep-recurring.md.'
         ),
     )
     return parser
+
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse CLI args, rejecting combinations that would silently no-op.
+
+    Thin wrapper over :func:`_build_parser` so the cross-flag validation is
+    testable without invoking :func:`main` (which builds a live
+    ``MemoryService``).
+
+    ``--fail-on-blind-spot`` reaches an exit code only through
+    :func:`_resolve_check_exit_code`, which :func:`main` consults ONLY under
+    ``--check``. Left un-validated, ``--apply --fail-on-blind-spot`` — or a
+    bare ``--fail-on-blind-spot`` dry run — would therefore exit 0 even on an
+    observed blind spot: an operator wiring it as a ``before_done.script``
+    predicate without ``--check`` would get a gate that STRUCTURALLY CANNOT
+    FAIL, which is the exact defect class task 3897 exists to eliminate.
+    Honouring the flag as a silent no-op would also violate the repo's
+    loud-over-silent-degradation norm, so the combination is rejected at
+    parse time (argparse exit code 2) instead.
+
+    ``scripts/fused-memory-flag-marker-check.sh`` already hardcodes
+    ``--check`` in its ``exec`` line, so passing ``--fail-on-blind-spot``
+    through that wrapper is unaffected.
+
+    Args:
+        argv: Argument list to parse; ``None`` reads ``sys.argv[1:]``.
+
+    Returns:
+        The parsed namespace.
+
+    Raises:
+        SystemExit: Code 2, via ``parser.error``, when
+            ``--fail-on-blind-spot`` is passed without ``--check``.
+    """
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    if args.fail_on_blind_spot and not args.check:
+        parser.error(
+            '--fail-on-blind-spot requires --check: it resolves an exit code '
+            'only through the --check verdict path, so on its own it would '
+            'silently exit 0 even on an observed blind spot — a gate that '
+            'cannot fail. Pass --check as well (the '
+            'scripts/fused-memory-flag-marker-check.sh wrapper already does), '
+            'or drop --fail-on-blind-spot: the blind spot is reported in the '
+            "log and in the JSON report's cross_check block either way."
+        )
+    return args
 
 
 async def _resolve_terminal_task_ids() -> set[str]:
@@ -1139,8 +1186,7 @@ def main() -> int:
         level=logging.INFO,
         format='%(asctime)s %(name)s %(levelname)s %(message)s',
     )
-    parser = _build_parser()
-    args = parser.parse_args()
+    args = _parse_args()
 
     async def _run_live() -> dict:
         from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
