@@ -2381,6 +2381,130 @@ class TestRecreateSubgraphRelationships:
         assert result.embedding_omitted == 1
 
     @pytest.mark.asyncio
+    async def test_merge_fold_censuses_dropped_mentions_on_wrong_copy(
+        self, mock_config, make_backend, make_graph_mock, monkeypatch,
+    ):
+        """A MERGE spec whose wrong copy carries incoming Episodic MENTIONS
+        links: the fold recreates RELATES_TO only, so Phase C's DETACH DELETE
+        of the wrong copy will destroy those links. They must be CENSUSED --
+        counted and uuid-listed on the result -- rather than silently lost
+        (task 4183, operator ruling 2026-08-12: visibility only, no
+        MENTIONS-recreation pass and no behaviour change to the fold).
+
+        The count counts LINKS; the uuid list holds the DISTINCT mentioning
+        Episodic uuids in first-seen order, so two links from two different
+        episodes read as 2 / two uuids.
+        """
+        backend = make_backend(mock_config)
+
+        wrong_mock = make_graph_mock()
+
+        async def _wrong_ro_query(cypher, params=None):
+            if 'RELATES_TO' in cypher:
+                return MagicMock(
+                    result_set=[SHARED_EDGE_ROW_FIXTURE, UNIQUE_WRONG_EDGE_ROW_FIXTURE]
+                )
+            if 'MENTIONS' in cypher:
+                # TWO incoming links, from two DISTINCT episodes.
+                return MagicMock(result_set=[
+                    [MENTION_UUID_FIXTURE, EPISODE_UUID_FIXTURE],
+                    ['mention-ffff-6666', 'episode-gggg-7777'],
+                ])
+            return MagicMock(result_set=[])
+
+        wrong_mock.ro_query = AsyncMock(side_effect=_wrong_ro_query)
+
+        home_mock = make_graph_mock()
+        # home's CURRENT incident edge-uuid set: only the shared edge.
+        home_mock.ro_query = AsyncMock(
+            return_value=MagicMock(result_set=[[SHARED_EDGE_UUID_FIXTURE]])
+        )
+        home_mock.query = AsyncMock(return_value=MagicMock(relationships_created=1))
+
+        backend._driver._get_graph = _route_graphs({
+            WRONG_GRAPH_FIXTURE: wrong_mock,
+            HOME_GRAPH_FIXTURE: home_mock,
+        })
+
+        fake_read_compact = AsyncMock(return_value=COMPACT_VECTOR_REPLY_FIXTURE)
+        monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
+
+        specs = [_merge_spec(NODE_UUID_FIXTURE, WRONG_GRAPH_FIXTURE, HOME_GRAPH_FIXTURE)]
+
+        result = await recreate_subgraph_relationships(backend, specs)
+
+        assert result.merge_mentions_dropped == 2
+        # an EXACT ordered list, not a set -- the first-seen ordering contract
+        # is what keeps two runs over identical data diffable.
+        assert result.merge_mentions_dropped_uuids == [
+            EPISODE_UUID_FIXTURE, 'episode-gggg-7777',
+        ]
+
+        # The census is READ-ONLY: nothing is mutated on the wrong copy in
+        # this phase (no DETACH DELETE -- that is Phase C's job) ...
+        wrong_mock.query.assert_not_awaited()
+        # ... and NO MENTIONS CREATE is issued anywhere: the fold stays
+        # RELATES_TO-only, so the sole home mutation is the unique wrong edge.
+        assert home_mock.query.await_count == 1
+        assert not [
+            call for call in home_mock.query.call_args_list
+            if 'MENTIONS' in extract_cypher(call)
+        ]
+
+        # the pre-existing fold tallies are unchanged by the census.
+        assert result.edges_recreated == 1
+        assert result.edges_skipped == 0
+        assert result.mentions_recreated == 0
+        assert result.mentions_skipped == 0
+        assert result.blocked == []
+        assert result.dropped_cross_target == []
+
+    @pytest.mark.asyncio
+    async def test_merge_fold_with_no_wrong_copy_mentions_reports_zero(
+        self, mock_config, make_backend, make_graph_mock, monkeypatch,
+    ):
+        """A MERGE spec whose wrong copy carries NO incoming MENTIONS: the
+        census reports a clean zero -- 0 and an empty list, never an omitted
+        key -- while the edge fold still recreates the unique wrong edge.
+        """
+        backend = make_backend(mock_config)
+
+        wrong_mock = make_graph_mock()
+
+        async def _wrong_ro_query(cypher, params=None):
+            if 'RELATES_TO' in cypher:
+                return MagicMock(
+                    result_set=[SHARED_EDGE_ROW_FIXTURE, UNIQUE_WRONG_EDGE_ROW_FIXTURE]
+                )
+            if 'MENTIONS' in cypher:
+                return MagicMock(result_set=[])
+            return MagicMock(result_set=[])
+
+        wrong_mock.ro_query = AsyncMock(side_effect=_wrong_ro_query)
+
+        home_mock = make_graph_mock()
+        home_mock.ro_query = AsyncMock(
+            return_value=MagicMock(result_set=[[SHARED_EDGE_UUID_FIXTURE]])
+        )
+        home_mock.query = AsyncMock(return_value=MagicMock(relationships_created=1))
+
+        backend._driver._get_graph = _route_graphs({
+            WRONG_GRAPH_FIXTURE: wrong_mock,
+            HOME_GRAPH_FIXTURE: home_mock,
+        })
+
+        fake_read_compact = AsyncMock(return_value=COMPACT_VECTOR_REPLY_FIXTURE)
+        monkeypatch.setattr(cross_graph_move, '_read_compact_vector', fake_read_compact)
+
+        specs = [_merge_spec(NODE_UUID_FIXTURE, WRONG_GRAPH_FIXTURE, HOME_GRAPH_FIXTURE)]
+
+        result = await recreate_subgraph_relationships(backend, specs)
+
+        assert result.merge_mentions_dropped == 0
+        assert result.merge_mentions_dropped_uuids == []
+        assert result.edges_recreated == 1
+
+    @pytest.mark.asyncio
     async def test_edge_already_present_in_target_is_idempotent_noop(
         self, mock_config, make_backend, make_graph_mock, monkeypatch,
     ):
