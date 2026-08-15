@@ -732,9 +732,26 @@ _ENUM_PREP_WORDS: tuple[str, ...] = (
 # sentence — not be an INTRA-TOKEN '.' flanked by alphanumerics on both
 # sides, e.g. a filename extension, version string, dotted module path or
 # dotted section number (see _is_intra_token_dot / _last_clause_break;
-# task 4149). Only '.' needs that second, occurrence-level test: ';', '!'
-# and '?' are unconditional breaks whenever they appear, because none of
-# them occurs token-internally in this corpus.
+# task 4149). Only '.' gets that second, occurrence-level test — because
+# that is where over-selection was MEASURED and closed, not because ';',
+# '!' and '?' are verified safe. They remain unconditional breaks
+# whenever they appear, and at least one of them has a KNOWN, still-OPEN
+# instance of the identical over-selection class: a '?' inside a URL
+# query string or a ';' inside a path/branch name truncates the backward
+# scan past the governing preposition exactly as an intra-token '.' did,
+# e.g. (measured on this branch; amendment, reviewer_comprehensive
+# correctness-precision finding, task 4149)
+#
+#     'Reviews for https://ci/build?ref=main tasks 1020 and 1030 are
+#      pending.' -> {1020, 1030}
+#     'Statuses of the branch;main tasks 1020 and 1030 are pending.'
+#     -> {1020, 1030}
+#
+# Left open rather than fixed here: extending _is_intra_token_dot's
+# flanking test to all four class members would be a strictly fail-safe
+# generalization (narrowing an occurrence can only cost under-selection,
+# per the asymmetry argument below) if the corpus supports it, but that
+# needs its own measurement pass and is a follow-up, not this task.
 #
 # The CLASS is deliberately minimal — '.', ';', '!', '?' and nothing else,
 # and membership is a verified precision requirement not reopened by this
@@ -813,8 +830,11 @@ def _is_intra_token_dot(text: str, index: int) -> bool:
 def _last_clause_break(prefix: str) -> int:
     """Index of the last sentence-plausible clause break in *prefix*, or -1.
 
-    ';', '!' and '?' are unconditional breaks — none occurs token-internally
-    in this corpus. '.' additionally requires that the occurrence not be an
+    ';', '!' and '?' are treated as unconditional breaks; only '.' gets
+    the occurrence-level flanking test below, because that is where
+    over-selection was measured and closed — see the _CLAUSE_BREAK_CHARS
+    comment block above for the known, still-open '?'/';' exception this
+    leaves. '.' additionally requires that the occurrence not be an
     intra-token dot (see ``_is_intra_token_dot``); when it is, the walk
     retries at the next '.' to its left, stopping once it reaches or passes
     ``hard`` (the last unconditional break), since nothing further left
