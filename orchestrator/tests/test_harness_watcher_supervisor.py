@@ -641,6 +641,117 @@ class TestRunWatcherRotation:
         assert 'Escalation queue:' in prompt
 
     @pytest.mark.asyncio
+    async def test_banner_flags_cross_project_tooling_root(self, tmp_path: Path) -> None:
+        """Cross-project: the banner says outright that the tooling root is another repo.
+
+        Task 3605.  This is the datum whose absence made sighted sessions guess
+        reify/scripts/ or run a filesystem-wide `find dark-factory*`: they could
+        not tell that the rearm script simply is not in the project they were
+        working on.
+        """
+        from shared.cli_invoke import AgentResult
+
+        h = _make_rotation_harness(tmp_path)
+        df_root = tmp_path / 'df-tooling-checkout'
+        assert df_root != h.config.project_root
+        captured: dict = {}
+
+        async def fake_invoke(usage_gate, label, *, invoke_fn, **kwargs):
+            captured['prompt'] = kwargs.get('prompt', '')
+            return AgentResult(success=True, output='')
+
+        with (
+            patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke),
+            patch('orchestrator.harness.resolve_dark_factory_root', return_value=df_root),
+        ):
+            await h._run_watcher_rotation()
+
+        prompt = captured['prompt']
+        assert str(df_root) in prompt, 'the tooling root must be named'
+        assert str(h.config.project_root) in prompt, 'the target project root must be named'
+        assert 'different repo' in prompt, (
+            'the banner must say IN WORDS that the tooling root is a different '
+            f'repository from the target project root; got:\n{prompt}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_banner_still_names_root_for_same_project_target(
+        self, tmp_path: Path
+    ) -> None:
+        """Same-project target: the root and canonical form are STILL emitted (task 3605).
+
+        The auto-watcher skill interpolates $DARK_FACTORY_ROOT unconditionally, so
+        gating the block on cross-project would leave a same-project rotation
+        running `cd  && scripts/watcher-rearm.sh`.  Only the cross-project NOTE is
+        conditional, and it must be absent here rather than making a false claim.
+        """
+        from shared.cli_invoke import AgentResult
+
+        h = _make_rotation_harness(tmp_path)
+        captured: dict = {}
+
+        async def fake_invoke(usage_gate, label, *, invoke_fn, **kwargs):
+            captured['prompt'] = kwargs.get('prompt', '')
+            return AgentResult(success=True, output='')
+
+        with (
+            patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke),
+            patch(
+                'orchestrator.harness.resolve_dark_factory_root',
+                return_value=h.config.project_root,
+            ),
+        ):
+            await h._run_watcher_rotation()
+
+        prompt = captured['prompt']
+        assert 'DARK_FACTORY_ROOT' in prompt
+        assert str(h.config.project_root) in prompt
+        assert 'cd $DARK_FACTORY_ROOT && scripts/watcher-rearm.sh' in prompt, (
+            'the canonical form is an UNCONDITIONAL guarantee, not a cross-project extra'
+        )
+        assert 'different repo' not in prompt, (
+            'the cross-project note must be absent when the tooling root IS the '
+            'target project root — the banner must not make a false claim'
+        )
+
+    @pytest.mark.asyncio
+    async def test_banner_degrades_loudly_when_root_unresolvable(
+        self, tmp_path: Path
+    ) -> None:
+        """Unresolvable: say so, and render NO empty interpolation (task 3605).
+
+        A bare `cd  && scripts/watcher-rearm.sh` (or a `root: ` line with nothing
+        after it) is the sighted failure rendered into the prompt itself.  The
+        degraded banner must be loud instead.
+        """
+        from shared.cli_invoke import AgentResult
+
+        h = _make_rotation_harness(tmp_path)
+        captured: dict = {}
+
+        async def fake_invoke(usage_gate, label, *, invoke_fn, **kwargs):
+            captured['prompt'] = kwargs.get('prompt', '')
+            return AgentResult(success=True, output='')
+
+        with (
+            patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke),
+            patch('orchestrator.harness.resolve_dark_factory_root', return_value=None),
+        ):
+            await h._run_watcher_rotation()
+
+        prompt = captured['prompt']
+        assert 'could not be auto-resolved' in prompt, (
+            f'the banner must state the degradation outright; got:\n{prompt}'
+        )
+        assert 'cd  &&' not in prompt, 'never render an empty $DARK_FACTORY_ROOT expansion'
+        assert ': None' not in prompt, 'never render the Python None literal as a path'
+        for line in prompt.splitlines():
+            stripped = line.rstrip()
+            assert not (stripped.endswith(':') and 'root' in stripped.lower()), (
+                f'banner renders a root label with nothing after it: {line!r}'
+            )
+
+    @pytest.mark.asyncio
     async def test_rotation_start_logs_bash_max_timeout_ms(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
