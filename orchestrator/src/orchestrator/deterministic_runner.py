@@ -2160,6 +2160,12 @@ class DeterministicRunner:
             # TimeoutError into a distinct exception type here so `except
             # TimeoutError` below can only ever mean "the outer wall-clock
             # guard itself fired" — never a misattributed application error.
+            #
+            # Task 4065: do NOT broaden this except clause.  ScriptTimeout is
+            # deliberately not a TimeoutError subclass so it propagates
+            # UNTOUCHED to the dedicated `except ScriptTimeout` arm below;
+            # catching it here would re-raise it as a RuntimeError and land it
+            # in the generic "unexpected error" arm instead.
             try:
                 return await run_fn(before_done)
             except TimeoutError as exc:
@@ -2191,6 +2197,38 @@ class DeterministicRunner:
                 summary='Predicate check timed out (subprocess hung)',
                 detail=timeout_detail,
             )
+        except ScriptTimeout as exc:
+            # Task 4065: the DEFAULT runner's own per-script timeout fired —
+            # the check ran but overran its budget and was SIGKILLed as a
+            # process group, so it produced NO exit code and therefore NO
+            # verdict.  That makes it an INFRA fault, exactly like the outer
+            # guard above and deliberately NOT milestone_check_failed: a
+            # verdict would stamp gate_escalated_at and latch a task whose
+            # invariant was never evaluated into the resolve-to-done path.
+            #
+            # Distinct wording from the two sibling arms on purpose — all
+            # three file the same infra_issue category, so the text is the
+            # only thing telling a human WHICH guard fired.
+            inner_timeout_detail = '\n'.join([
+                description,
+                f'Predicate check script exceeded its own per-script timeout '
+                f"({exc.timeout_secs}s = before_done['timeout_secs']) and its whole "
+                f'process group was SIGKILLed.',
+                'No exit code was produced, so there is NO verdict — this is an '
+                'INFRA fault, deliberately not milestone_check_failed ("the '
+                'invariant does not hold").',
+                'No gate_escalated_at stamp is written: this read-only check is '
+                'simply re-attempted on the next dispatch rather than latched '
+                'into the resolve-to-done path.',
+                "Either the check is genuinely too slow for its configured "
+                "before_done['timeout_secs'] budget (raise it), or whatever it "
+                'probes is itself wedged.',
+            ])
+            return await self._file_infra_issue_and_block(
+                task_id,
+                summary='Predicate check script timed out (no verdict produced)',
+                detail=inner_timeout_detail,
+            )
         except Exception as exc:
             # Likewise an infra fault, not a verdict — an unexpected error
             # means the check never ran to completion.
@@ -2209,6 +2247,14 @@ class DeterministicRunner:
             # hold"), not an infra fault — file milestone_check_failed (NOT
             # infra_issue) and stamp gate_escalated_at so a human resolving
             # the escalation drives the task to done on the next dispatch.
+            #
+            # Task 4065: the DEFAULT runner's inner per-script timeout can no
+            # longer reach this branch — it raises ScriptTimeout, handled
+            # above as an infra fault, rather than returning an
+            # indistinguishable (1, '<script timed out after Ns>').  A
+            # non-zero rc from an INJECTED script_runner IS still a verdict by
+            # contract, whatever its tail happens to say: classification keys
+            # on the exception type, never on sniffing the output text.
             #
             # The RAW `out` below is deliberate and must stay raw (task 3286):
             # unlike done_provenance.note, an escalation detail is read by a
