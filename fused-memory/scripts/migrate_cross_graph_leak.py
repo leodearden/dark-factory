@@ -859,6 +859,16 @@ async def run(args: Any, memory_service: Any) -> dict:
     # merged-away wrong copy is destroyed by that node's Phase-C DETACH
     # DELETE. This link count plus the distinct mentioning-episode uuids
     # convert that previously-silent loss into a reviewable report line.
+    # Read it as MENTIONS LINKS AT RISK IF PHASE C PROCEEDS -- an upper
+    # bound, not a confirmed loss. The census is taken in Phase B and cannot
+    # see the two paths above that withhold a source deletion: on
+    # phase_b_error every MERGE spec is skipped (yet the recovered
+    # exc.partial_result still carries its census), and a uuid in
+    # blocked_node_uuids keeps its source node. In both, the censused links
+    # SURVIVE. Attributing each link back to its spec to net those out would
+    # need a per-entity mapping on SubgraphEdgeResult; until then the
+    # per-spec logger.warning (which names entity + episode uuids) is what an
+    # operator cross-references against phase_b_blocked / the error field.
     # Like embedding_omitted directly above -- and deliberately UNLIKE
     # dropped_cross_target_edges/phase_b_blocked below -- it is informational
     # and is NOT folded into exit_code: the operator ruling is visibility

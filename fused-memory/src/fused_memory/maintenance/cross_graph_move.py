@@ -865,11 +865,19 @@ class SubgraphEdgeResult:
             is valid data, not a failure. Always 0 for a batch where every
             recreated edge carried a real embedding.
         merge_mentions_dropped: CENSUS (task 4183) of the incoming Episodic
-            ``MENTIONS`` LINKS onto a MERGE spec's wrong copy that the
-            caller's Phase-C ``DETACH DELETE`` of that wrong copy will
-            destroy. The MERGE fold recreates RELATES_TO edges only -- it
-            has no MENTIONS-fold analogue -- so these links are lost BY
-            DESIGN: a wrong-graph mentioning episode is classified
+            ``MENTIONS`` LINKS onto a MERGE spec's wrong copy that are AT
+            RISK from the caller's Phase C: deleting that wrong copy with
+            ``DETACH DELETE`` destroys them. AT RISK, not confirmed
+            destroyed -- this is a Phase-B census, taken before Phase C runs
+            and blind to whether it runs at all, so a link counted here
+            SURVIVES whenever the caller withholds that node's deletion
+            (e.g. ``migrate_cross_graph_leak.run()`` withholds every source
+            deletion on a Phase-B error, and any node named in ``blocked``).
+            Read the number as an upper bound on the loss if Phase C
+            proceeds for every censused node. The MERGE fold recreates
+            RELATES_TO edges only -- it has no MENTIONS-fold analogue -- so
+            such a link is not carried over BY DESIGN: a wrong-graph
+            mentioning episode is classified
             ``EPISODIC_SKIP`` (never actioned, see
             ``scripts/migrate_cross_graph_leak.py``), so recreating the link
             would nearly always be an undeliverable skip. Counted here so
@@ -1041,9 +1049,11 @@ async def recreate_subgraph_relationships(graphiti: Any, specs: list[dict]) -> S
     the wrong copy's INCOMING MENTIONS are censused into
     ``merge_mentions_dropped`` (link count) and
     ``merge_mentions_dropped_uuids`` (distinct mentioning-episode uuids),
-    with one ``logger.warning`` per spec, so their destruction by the
-    caller's Phase-C ``DETACH DELETE`` is counted, uuid-listed and reviewable
-    (task 4183). The census is read-only and informational -- it changes
+    with one ``logger.warning`` per spec, so the loss the caller's Phase-C
+    ``DETACH DELETE`` would inflict on them is counted, uuid-listed and
+    reviewable (task 4183). Being a Phase-B census it is an UPPER BOUND: a
+    censused link survives whenever the caller withholds that node's
+    deletion. The census is read-only and informational -- it changes
     neither this fold nor Phase C.
 
     Issues NO ``DETACH DELETE`` anywhere -- that is ``delete_source_node``'s
@@ -1335,6 +1345,12 @@ async def _recreate_subgraph_relationships_batch(
     # observes it in home_edge_uuids and classify_unique_wrong_edges
     # correctly excludes it here -- no double-create.
     merge_specs = [spec for spec in specs if spec.get('disposition') == 'MERGE']
+    # Batch-wide dedup set for the dropped-MENTIONS census below (task 4183).
+    # Hoisted OUT of the per-spec loop: it is only ever grown, never reset, so
+    # rebuilding it per spec would be O(specs x accumulated episodes) for an
+    # identical result. Seeded from the list (empty here -- nothing else
+    # writes it) so the two stay in lockstep if that ever stops holding.
+    seen_episodes: set = set(result.merge_mentions_dropped_uuids)
     for spec in merge_specs:
         uuid = spec['uuid']
         wrong_graph = spec['source_graph']
@@ -1346,9 +1362,11 @@ async def _recreate_subgraph_relationships_batch(
         # spec, deliberately ahead of the edge fold so a mid-batch systemic
         # raise still carries the already-censused specs out on
         # exc.partial_result. Read-only: this fold recreates RELATES_TO only,
-        # so every incoming MENTIONS link on the wrong copy is destroyed by
-        # the caller's Phase-C DETACH DELETE. Counting them here is what
-        # turns that loss from silent into reviewable. Reuses the MOVE pass's
+        # so every incoming MENTIONS link on the wrong copy is destroyed IF
+        # the caller's Phase C deletes that copy (an upper bound, not a
+        # confirmed loss -- see the SubgraphEdgeResult docstring). Counting
+        # them here is what turns that risk from silent into reviewable.
+        # Reuses the MOVE pass's
         # incoming-MENTIONS MATCH pattern with a narrowed projection.
         # NOT wrapped in a per-item try/except: like wrong_edges_result and
         # _read_relates_to_edge_uuids below, this is a per-spec gather read,
@@ -1365,27 +1383,44 @@ async def _recreate_subgraph_relationships_batch(
         census_rows = mentions_census.result_set or []
         if census_rows:
             result.merge_mentions_dropped += len(census_rows)
-            # Dedup across the WHOLE batch, preserving first-seen order (a
-            # bare set() would make the report and its tests order-flaky).
-            seen_episodes = set(result.merge_mentions_dropped_uuids)
+            # Dedup across the WHOLE batch (seen_episodes, hoisted above the
+            # loop), preserving first-seen order -- a bare set() for the
+            # reported list would make the report and its tests order-flaky.
+            # spec_episode_uuids is the per-spec ordered list for the warning
+            # below, with its own set for the membership test (a linear scan
+            # of the list would be O(k^2) for a heavily-mentioned entity).
             spec_episode_uuids = []
+            spec_seen: set = set()
             for row in census_rows:
-                episode_uuid = row[1]
+                # Null-tolerant: FalkorDB returns null for a missing property,
+                # and these maintenance scripts run against exactly the kind
+                # of damaged graph where an Episodic node has lost its uuid.
+                # Degrade to a visible placeholder rather than letting a
+                # read-only, purely informational census abort the whole
+                # Phase-B batch MID-MUTATION (this runs outside any per-item
+                # try/except, so a raise here would strand already-CREATEd
+                # edges and block every spec's Phase C).
+                episode_uuid = row[1] if row[1] else '<unknown>'
                 if episode_uuid not in seen_episodes:
                     seen_episodes.add(episode_uuid)
                     result.merge_mentions_dropped_uuids.append(episode_uuid)
-                if episode_uuid not in spec_episode_uuids:
+                if episode_uuid not in spec_seen:
+                    spec_seen.add(episode_uuid)
                     spec_episode_uuids.append(episode_uuid)
             # ONE warning per spec -- this is what preserves the
             # entity<->episode association the flat uuid list cannot carry.
+            # str() on the join for the same reason as the placeholder above:
+            # a logging-format detail must never be able to fail the fold.
             logger.warning(
                 'recreate_subgraph_relationships: MERGE fold -- %d incoming '
                 'MENTIONS link(s) onto wrong copy uuid=%s in wrong_graph=%s '
-                '(home_graph=%s) will be destroyed by Phase C\'s DETACH '
-                'DELETE -- MERGE recreates RELATES_TO only; reported, not '
-                'silently lost. Mentioning episode uuid(s): %s',
+                '(home_graph=%s) are AT RISK: Phase C\'s DETACH DELETE of '
+                'that wrong copy destroys them, since MERGE recreates '
+                'RELATES_TO only. Withhold this node\'s Phase-C deletion and '
+                'they survive; reported, not silently lost. Mentioning '
+                'episode uuid(s): %s',
                 len(census_rows), uuid, wrong_graph, home_graph,
-                ', '.join(spec_episode_uuids),
+                ', '.join(str(u) for u in spec_episode_uuids),
             )
 
         wrong_edges_result = await wrong.ro_query(

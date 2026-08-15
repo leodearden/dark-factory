@@ -435,8 +435,9 @@ async def merge_graph_family(
         ``blocked`` (both lists, passed through from the
         ``SubgraphEdgeResult`` verbatim -- never silently dropped), plus
         ``merge_mentions_dropped`` and ``merge_mentions_dropped_uuids``
-        (task 4183's census of the MENTIONS links destroyed when a MERGE
-        spec's wrong copy is deleted -- likewise passed through verbatim).
+        (task 4183's census of the MENTIONS links AT RISK -- destroyed if a
+        MERGE spec's wrong copy is deleted -- likewise passed through
+        verbatim).
         This script builds MOVE specs only (see the ``move_specs`` assembly
         below), so the census is structurally always 0/``[]`` here -- it
         fires only for MERGE specs -- but both keys are surfaced anyway
