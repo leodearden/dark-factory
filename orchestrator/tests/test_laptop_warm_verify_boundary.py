@@ -1361,6 +1361,7 @@ def test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.timeout(ROW_PER_TEST_TIMEOUT_SECS)  # task 4025: production 10s+5s watchdog window + real subprocesses under full-suite load
 def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
     """SS9 Row 3: heartbeat starved, stdin stays OPEN -> select-timeout tree-kill.
 
@@ -1373,9 +1374,11 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
     ready set) rather than seeing EOF, taking the branch that calls
     ``on_fire`` directly without ever attempting a read.
 
-    Uses the step-2 env seam directly on the spawned verify-merge for a
-    fast, deterministic assertion window bounded by
-    ``~(heartbeat_timeout + grace_secs)``.
+    Uses ROW_WATCHDOG_ENV -- the pinned production-equivalent window
+    (10.0s heartbeat timeout + 5.0s kill grace) -- directly on the spawned
+    verify-merge, so the assertion window here is ~15s, not fast; see
+    ROW_WATCHDOG_ENV's comment above for the pin rationale and the honest
+    cliff-moved caveat.
 
     Asserts the leader self-exits non-zero and, after reaping it (same
     zombie-avoidance ordering as Row 2 -- ``child`` is again a direct child
@@ -1408,17 +1411,18 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
         )
 
         try:
-            child.wait(timeout=10)
+            child.wait(timeout=ROW_TREE_KILL_CEILING_SECS)
         except subprocess.TimeoutExpired:
             pytest.fail(
-                'verify-merge did not self-exit within 10s of heartbeat '
-                'starvation (select-timeout branch did not fire)'
+                f'verify-merge did not self-exit within '
+                f'{ROW_TREE_KILL_CEILING_SECS}s of heartbeat starvation '
+                f'(select-timeout branch did not fire)'
             )
         assert child.returncode != 0, (
             f'expected non-zero exit (watchdog self-kill), got {child.returncode}'
         )
 
-        assert wait_subtree_gone(pgid_val, timeout=10.0), (
+        assert wait_subtree_gone(pgid_val, timeout=ROW_TREE_KILL_CEILING_SECS), (
             f'pgid {pgid_val}: subtree and/or leader still alive after '
             f'heartbeat starvation -- watchdog tree-kill did not fire'
         )
