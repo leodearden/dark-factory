@@ -26,6 +26,7 @@ intentionally excluded — see reconciliation/prompts/__init__.py.
 """
 from __future__ import annotations
 
+import inspect
 import logging
 import re
 
@@ -43,6 +44,7 @@ from fused_memory.reconciliation.prompts.stage2 import (
     build_stage2_system_prompt,
 )
 from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
+from fused_memory.server.recon_report import get_recon_report_tool_signatures
 
 # Agent-called report tools (excludes start_report — harness-called).
 _AGENT_CALLED_REPORT_TOOLS = (
@@ -303,3 +305,48 @@ class TestReconReportGuidanceFallback:
                     f'fallback: a `{tool_name}(...)` call example is missing '
                     f'`run_id` — got: {tool_name}({args_substr})'
                 )
+
+
+# Live signatures of every registered recon-report tool, introspected once at
+# import time (the existing suite already constructs the throwaway server via
+# get_recon_report_tool_signatures() — see TestReconReportGuidanceFallback).
+_LIVE_SIGNATURES = get_recon_report_tool_signatures()
+
+
+class TestFallbackCarriesEveryRequiredParamOfLiveSignatures:
+    """The hand-maintained fallback must carry every required param of the live signature.
+
+    This is NOT the same tautology TestReconReportGuidanceDrift's smoke test
+    deliberately avoids. The GENERATED guidance (render_recon_report_tool_guidance())
+    is produced by iterating these exact live signatures, so re-checking it against
+    them could never fail short of import already having fallen back.
+    _RECON_REPORT_TOOL_GUIDANCE_FALLBACK is different: it is HAND-MAINTAINED prose,
+    served exactly when live introspection breaks (see
+    TestReconReportGuidanceFallback), and nothing regenerates it automatically when
+    a tool's required parameters change. Comparing it against the live signatures
+    can therefore genuinely fail — that is the drift this class exists to catch.
+    """
+
+    @pytest.mark.parametrize('tool_name', _AGENT_CALLED_REPORT_TOOLS)
+    def test_fallback_carries_every_required_param(self, tool_name):
+        # Non-vacuity: a tool dropped from the fallback wholesale must fail
+        # loudly, not pass silently because the scan loop below never ran.
+        openers = list(_iter_call_openers(_RECON_REPORT_TOOL_GUIDANCE_FALLBACK, tool_name))
+        assert openers, (
+            f'fallback: no `{tool_name}(...)` call example found at all — '
+            'update the frozen fallback to match the live tool signature.'
+        )
+
+        required = [
+            name
+            for name, param in _LIVE_SIGNATURES[tool_name].parameters.items()
+            if param.default is inspect.Parameter.empty
+        ]
+        missing = _missing_required_kwargs(
+            _RECON_REPORT_TOOL_GUIDANCE_FALLBACK, tool_name, required
+        )
+        assert missing == [], (
+            f'fallback: `{tool_name}(...)` example is missing required kwarg(s) '
+            f'{missing} of the live signature — update the frozen fallback to '
+            'match the live tool signature.'
+        )
