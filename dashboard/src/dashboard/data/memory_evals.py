@@ -223,6 +223,12 @@ _LIMITS_PROVENANCE_KEYS = (
     'generator',
 )
 
+# A discarded queue record is arbitrary JSON off disk and may be arbitrarily
+# large.  The issue names WHAT was dropped and its type, so the body is capped:
+# an unbounded repr would put a multi-megabyte artifact into every poll's
+# payload, making the naming of the discard its own degradation.
+_MAX_DISCARDED_VALUE_REPR = 120
+
 
 def _load_json(path: Path) -> Any:
     """Parse *path*, or raise for the caller's narrow handler to record."""
@@ -244,6 +250,14 @@ def _issue(
         'path': str(path) if path is not None else None,
         'detail': detail,
     })
+
+
+def _short_repr(value: Any) -> str:
+    """A length-capped ``repr`` for naming a discarded value in an issue detail."""
+    text = repr(value)
+    if len(text) <= _MAX_DISCARDED_VALUE_REPR:
+        return text
+    return text[:_MAX_DISCARDED_VALUE_REPR] + '…'
 
 
 def _read_limits(
@@ -772,8 +786,8 @@ def _index_escalations(
                 issues, 'malformed_escalation_record', path=escalations_dir,
                 detail=(
                     f'escalation queue record is {type(record).__name__}, not an object '
-                    f'({record!r}); if it held an open eval_regression escalation it is '
-                    'missing from this payload, so unmatched_escalations cannot be read '
+                    f'({_short_repr(record)}); if it held an open eval_regression escalation '
+                    'it is missing from this payload, so unmatched_escalations cannot be read '
                     'as exhaustive'
                 ),
             )
