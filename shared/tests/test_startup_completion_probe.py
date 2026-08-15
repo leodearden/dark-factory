@@ -1241,3 +1241,59 @@ class TestTeardownIsFailureIsolated:
         )
         assert spawned[-1].wait_calls == 1
         assert not probe_recorder.configs[-1].path.exists()
+
+
+class TestRunExitGateIsWiredToTheExitShape:
+    """The exit-provenance call site must ASK for the exit-shaped degraded row.
+
+    ``TestGateDegradesPerGatedShape`` pins what ``_gate(..., kind='run_exit')``
+    BUILDS.  Nothing there pins that ``run_live_probe`` actually passes
+    ``kind='run_exit'`` — so dropping that keyword at the call site restores the
+    original defect in full while every other test in this module stays green
+    (verified by mutation: reverting the call site to ``kind='observation'``
+    fails only this test).  The blast radius is the whole capture, not one
+    sample: the gated value is stamped onto ``run_exit`` for EVERY observation,
+    so an observation-shaped row there costs every sample its exit provenance
+    and ``KeyError``s any consumer reading ``run_exit['exit_code']``.
+    """
+
+    def test_a_degraded_run_exit_row_keeps_its_exit_shape(
+        self, probe_recorder, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(probe.subprocess, 'Popen', lambda *a, **k: _FakePopen())
+        # Identity scrub: the same stand-in for a future scrub gap that
+        # TestGateDegradesPerGatedShape uses, but driven through the REAL call
+        # site rather than a direct _gate call.
+        monkeypatch.setattr(probe, '_scrub_value', lambda value, patterns: value)
+        monkeypatch.setattr(
+            probe,
+            '_drain_exit',
+            lambda *a, **k: {
+                'mode': 'healthy',
+                'killed_by_probe': True,
+                'exit_code': 143,
+                'stdout_envelope': {'subtype': 'success', 'is_error': False},
+                'stderr_len': 900,
+                'stderr_tail': f'mcp connect failed {_LONG_RUN}',
+            },
+        )
+
+        observations = _run_probe(tmp_path)
+
+        assert observations, 'the run produced no observation to stamp — bad injection'
+        for observation in observations:
+            run_exit = observation['run_exit']
+            assert run_exit['redaction_failed'] is True, (
+                'the residual hit never reached the degradation path'
+            )
+            assert run_exit['exit_code'] == 143, (
+                'the call site asked for an OBSERVATION-shaped degraded row: run_exit '
+                'lost exit_code, so every consumer reading it raises KeyError'
+            )
+            assert run_exit['killed_by_probe'] is True
+            assert run_exit['stderr_len'] == 900
+            assert run_exit['stderr_tail'] is None, 'the CLI-authored text must be dropped'
+            for wrong_shape in ('sample_index', 'sample_kind', 'substrate_returns'):
+                assert wrong_shape not in run_exit, (
+                    f'{wrong_shape!r} is an OBSERVATION field; exit provenance has none'
+                )
