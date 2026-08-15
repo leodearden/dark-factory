@@ -422,9 +422,11 @@ _LIVE_FIELD_NAMES: tuple[str, ...] = (
 # the delimiter into the key; the characters it does admit (`-`, `.`, `/`,
 # `:`, `+`) are the ones real values need — `in-progress`, a path, an ISO
 # timestamp.
-_LIVE_FIELD_ASSIGNMENT_RE = re.compile(
-    r'\b(' + '|'.join(_LIVE_FIELD_NAMES) + r')\s*=\s*'
-    r'(?:"([^"|\n]+)"|([A-Za-z0-9_./:+-]+))',
+_LIVE_FIELD_ALT = '|'.join(_LIVE_FIELD_NAMES)
+_LIVE_FIELD_SCAN_RE = re.compile(
+    r'\b(?P<field>' + _LIVE_FIELD_ALT + r')\s*=\s*'
+    r'(?:"(?P<quoted>[^"|\n]+)"|(?P<bare>[A-Za-z0-9_./:+-]+))'
+    r'|\b(?P<unread>' + _LIVE_FIELD_ALT + r')\s*=',
     re.IGNORECASE,
 )
 
@@ -477,13 +479,17 @@ def _classify_liveness_snapshot(content: str) -> tuple[bool, str | None]:
         return False, None
 
     pairs: set[str] = set()
-    for field, quoted, bare in _LIVE_FIELD_ASSIGNMENT_RE.findall(content):
-        # Exactly one branch ever participates; `' '.join(split())` normalises
-        # the whitespace a quoted value may now legitimately carry (and is a
-        # no-op on a bare token).
-        cleaned = ' '.join((quoted or bare).split()).rstrip('./:+-').lower()
+    for m in _LIVE_FIELD_SCAN_RE.finditer(content):
+        if m.group('unread'):
+            return True, None
+        # Exactly one of `quoted`/`bare` ever participates; `' '.join(split())`
+        # normalises the whitespace a quoted value may now legitimately carry
+        # (and is a no-op on a bare token).
+        cleaned = ' '.join(
+            (m.group('quoted') or m.group('bare')).split(),
+        ).rstrip('./:+-').lower()
         if cleaned:
-            pairs.add(f'{field.lower()}={cleaned}')
+            pairs.add(f"{m.group('field').lower()}={cleaned}")
     if not pairs:
         return True, None
     return True, '|'.join(sorted(pairs))
