@@ -1696,6 +1696,124 @@ def _lane_lock_held_in_process(lock_path: Path) -> bool:
     return target in held
 
 
+#: Bound on how long a contended-raise path RE-READS an EMPTY kernel holder
+#: set before degrading (task 3783).  Two-sided derivation, both halves load-
+#: bearing — see :func:`_settled_lane_lock_holder_pids` for the full statement.
+#: Deliberately NOT the test side's ``_LANE_LOCK_STRICT_READ_SECS = 2.0``
+#: despite retrying the same read class: 2.0 would breach the pytest-timeout
+#: ceiling for every consumer that drives a contended raise inside
+#: ``foreign_lane_lock_holder``.
+_LANE_LOCK_HOLDER_SETTLE_SECS: float = 0.5
+
+#: Gap between re-reads inside the settle bound.  A ``/proc/locks`` read is
+#: microsecond-scale, so this is chosen to give the bound ~25 attempts rather
+#: than to pace the kernel.
+_LANE_LOCK_HOLDER_SETTLE_INTERVAL_SECS: float = 0.02
+
+
+async def _settled_lane_lock_holder_pids(
+    lock_path: Path,
+    *,
+    timeout: float | None = None,
+    interval: float | None = None,
+) -> list[int]:
+    """Read *lock_path*'s kernel FLOCK holders, re-reading past a LOSSY empty.
+
+    For the two acquire-TIMEOUT sites only (:meth:`GitOps.merge_verify_lease`
+    and :meth:`GitOps.reset_persistent_merge_worktree`).  Both used to read the
+    kernel lock table exactly ONCE there and feed that snapshot to a predicate
+    and a message; this adds the missing read POLICY on top of the unchanged
+    reader, the way
+    :func:`~orchestrator.verify_cancel.lane_lock_holder_pids` is itself a thin
+    policy wrapper over ``lane_lock_holder_pids_strict``.
+
+    WHAT IT ABSORBS.  ``/proc/locks`` is a seq_file the kernel serves one PAGE
+    per ``read(2)`` regardless of the caller's buffer (a 13062-byte table took
+    4 reads even for a 1 MiB request), and each read restarts the per-CPU
+    lock-list walk from a POSITIONAL index — so a lock released at an earlier
+    position between chunks shifts every later record down and ours is skipped
+    outright.  Measured on this host at 1.54% of reads (144/9337) against a
+    real held flock with 24 concurrent churners.  Note that this is a
+    SUCCESSFUL but lossy read, not a failed one, which is why
+    ``lane_lock_holder_pids_strict`` (task 3604) buys nothing here: nothing
+    raises, so a strict reader would have no signal to propagate.
+
+    WHY EMPTINESS IS THE RETRY TRIGGER.  At these call sites the read happens
+    immediately after a bounded-wait acquire TIMED OUT: we waited the full wait
+    and did not get the lock, so somebody held it.  "Nobody holds it"
+    contradicts the very timeout that produced the question.  It is not
+    impossible — the holder may genuinely have released in between, which is
+    exactly what ``_lane_lock_holder_facts``' degraded clause says — so an
+    empty snapshot is RE-READ, not disbelieved.
+
+    FAIL-SAFE.  A still-empty result after the bound is returned unchanged and
+    the call site degrades to exactly today's behaviour.  This helper decorates
+    a raise; it can neither raise itself nor convert a diagnostic degradation
+    into a merge failure.
+
+    THE ``_lane_lock_identity`` SHORT-CIRCUIT.  An unstat-able *lock_path*
+    yields ``[]`` because ``os.stat`` raised inside ``lane_lock_holder_pids``
+    before a single row was examined — a STRUCTURAL empty no re-read can
+    change (task 3604's headline case, a held lane whose lock file was
+    unlinked, keeps failing the same stat).  Returning immediately there also
+    keeps the stubbed-acquire contended tests, which never create a lock file,
+    from paying the bound.
+
+    THE BOUND (``_LANE_LOCK_HOLDER_SETTLE_SECS`` / ``..._INTERVAL_SECS``),
+    derived from both sides:
+
+    * FLOOR — against the measured 1.54%-per-read loss, 0.5s at 0.02s gives
+      ~25 reads: ~1e-45 under independence, and ~3e-8 even at a deliberately
+      pessimistic 50%-per-read correlated-burst rate.  A re-read either
+      succeeds in microseconds or is structurally broken, so a wider bound
+      only delays a certain answer — the same reasoning that sized the test
+      side's ``_LANE_LOCK_STRICT_READ_SECS``.
+    * CEILING — this is what forbids simply copying that 2.0.  Every test that
+      drives a contended raise inside a ``with foreign_lane_lock_holder(...)``
+      block pays this bound ON TOP of that helper's 34.0s unconditional stack
+      (12 startup + 12 attribution + 5 teardown + 5 kill-wait) against a
+      ceiling of 0.6 x 60s = 36.0s — 2.0s of headroom total, and task 3836's
+      amendment states explicitly that a further bounded wait paid inside the
+      block is not covered by that computation.  0.5s leaves such a consumer
+      at 35.5s worst case; 2.0s would breach the ceiling, and breaching it
+      does not merely slow a failure — under ``timeout_method="thread"`` with
+      ``--max-worker-restart=0``, pytest-timeout ``os._exit()``\\ s the xdist
+      worker and destroys the diagnostics.  Made executable by
+      ``test_settle_bound_stays_clear_of_the_foreign_holder_ceiling``.
+
+    WHY ASYNC.  This module's standing rule — the stated reason
+    :meth:`GitOps._acquire_lane_flock_off_thread` exists at all — is that no
+    synchronous poll may run on the event loop, because a stalled loop freezes
+    the whole orchestrator.  Only the WAITING needs to leave the loop, so
+    :func:`asyncio.sleep` suffices; an :func:`asyncio.to_thread` hop per read
+    would cost more than the microsecond-scale procfs read it wrapped.  The
+    new await is a new cancellation point, which is safe here and only here:
+    it runs after the acquire already returned ``None``, so no fd is in flight
+    and a cancellation landing inside the poll cannot orphan the lane.
+
+    *timeout* / *interval* default to ``None`` and are resolved from the
+    module globals INSIDE the body, and ``lane_lock_holder_pids`` is likewise
+    called by bare module-global name — so a ``monkeypatch.setattr`` on either
+    is honoured, the same call-time-resolution seam
+    ``wait_for_lane_lock_holder`` documents on the test side.
+    """
+    pids = lane_lock_holder_pids(lock_path)
+    if pids or _lane_lock_identity(lock_path) is None:
+        # A real answer, or a STRUCTURAL empty no re-read can change.
+        return pids
+    settle = _LANE_LOCK_HOLDER_SETTLE_SECS if timeout is None else timeout
+    gap = (
+        _LANE_LOCK_HOLDER_SETTLE_INTERVAL_SECS if interval is None else interval
+    )
+    deadline = time.monotonic() + settle
+    while time.monotonic() < deadline:
+        await asyncio.sleep(gap)
+        pids = lane_lock_holder_pids(lock_path)
+        if pids:
+            return pids
+    return pids  # still empty: degrade exactly as a one-shot read would have
+
+
 def _lane_lock_holder_facts(
     lock_path: Path, holder_pids: list[int] | None = None,
 ) -> str:
