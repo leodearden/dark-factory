@@ -15948,6 +15948,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # PARTIAL narrowed-retry map never triggers a phantom only_cold divergence.
         _attempt0_shadow: dict[str, str] = {}
         _spec_warm: bool = False  # set when acquire_spec_lane returns warm=True
+        # task 3043 (INV-C, reify 2026-07-25 PID 3360397 `Task-350`): pre-declared
+        # so the orphan guard in the `finally` below can run on EVERY exit route,
+        # including the ones that leave before the task is created.
+        verify_task: asyncio.Task | None = None
+        _ru_owned_by_handler = False
 
         try:
             if lease.is_local:
@@ -16286,6 +16291,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # the flag (both normal returns at the bottom pass it), which pinned
             # vr.spec_warm False on every RU result regardless of how merge_wt
             # was acquired.
+            #
+            # task 3043: this handler OWNS the failure — the RUNNER_UNAVAILABLE
+            # sentinel it returns is what drives _finalize_inflight's
+            # _quarantine_unreachable_host call.  Flag it so the orphan guard in
+            # the `finally` below does not record the SAME failure a second
+            # time; that guard exists only for the routes this handler never
+            # sees (external cancellation of the outer task).
+            _ru_owned_by_handler = True
             return InflightVerifyResult(
                 outcome=None,
                 merge_wt=merge_wt,
@@ -16602,6 +16615,61 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             if not req.result.done():
                 req.result.set_result(err_outcome)
             return InflightVerifyResult(outcome=err_outcome, merge_wt=None)
+        finally:
+            # ── Orphan guard (task 3043, INV-C) ──────────────────────────────
+            # The inner _run_post_merge_verify task must NEVER outlive this
+            # coroutine, on any exit route.  Reify 2026-07-25 (PID 3360397)
+            # logged `Task-350: Task exception was never retrieved` carrying a
+            # RunnerUnavailable from a speculative remote verify: the
+            # head-failure cascade cancels this OUTER task, and CancelledError
+            # is a BaseException caught by NONE of the handlers above
+            # (RunnerUnavailable / MergeVerifyLease* / Exception).  So the outer
+            # ended CANCELLED while the inner kept pushing to the down host, and
+            # when it finally raised there was no VerifyResult, no quarantine
+            # and no tracker entry — the host was stranded out of the verify
+            # pool with nothing for _reprobe_quarantined_hosts to re-adopt.
+            #
+            # Provably additive: the three deliberate abort branches already do
+            # cancel() + suppress(BaseException): await, so clause 1 is a no-op
+            # for them, and the normal / DROPPED / REQUEUED paths reach here
+            # with the task already done.  The ONE newly-covered route is
+            # external cancellation — precisely the route that orphaned Task-350.
+            #
+            # This block must never return and never raise: a `return` here
+            # would swallow an in-flight CancelledError and break the cascade's
+            # `_entry.verify_task.cancelled()` checks that _head_was_requeued
+            # and the manual-requeue branch depend on.
+            if verify_task is not None:
+                if not verify_task.done():
+                    verify_task.cancel()
+                    with contextlib.suppress(BaseException):
+                        await verify_task
+                _orphan_exc: BaseException | None = None
+                if verify_task.done() and not verify_task.cancelled():
+                    # The retrieval that suppresses the
+                    # "Task exception was never retrieved" warning.
+                    _orphan_exc = verify_task.exception()
+                # INV-A on the cancellation-unwind path: a remote transport
+                # failure that never reached the RunnerUnavailable handler above
+                # still has to be quarantined AND recorded, or the host is
+                # stranded.  Strand detection can never break a verify exit
+                # path, hence the suppress + WARNING.
+                if (
+                    isinstance(_orphan_exc, RunnerUnavailable)
+                    and not lease.is_local
+                    and not _ru_owned_by_handler
+                ):
+                    with contextlib.suppress(Exception):
+                        logger.warning(
+                            'Task %s: in-flight verify unwound while its remote '
+                            'verify task failed with RunnerUnavailable on host '
+                            '%r — quarantining + recording the host so the '
+                            'reprobe sweep can re-adopt it: %s',
+                            req.task_id, lease.name, _orphan_exc,
+                        )
+                        self._quarantine_unreachable_host(
+                            lease.name, str(_orphan_exc), time.time(),
+                        )
 
         # task 2420 amend (reviewer finding #1): verify_task returned a
         # result HERE at all — pass, fail, or skipped — which proves this
