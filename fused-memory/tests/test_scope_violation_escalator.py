@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 
 import pytest
@@ -592,6 +593,76 @@ class TestAdvisoryVsRejectionWording:
         assert payload['id'] == first
         assert payload['dedupe_count'] == 1
         assert len(payload['dedupe_children']) == 1
+
+    def test_terminal_log_line_distinguishes_advisory_from_rejection(self, tmp_path, caplog):
+        """Task 4159: the queued-escalation log line must name the outcome mode.
+
+        The escalation payloads distinguish the two outcomes, but the terminal
+        ``logger.warning`` is byte-identical for both — an operator tailing
+        logs sees 'queued esc-... for project ...' and cannot tell a hard
+        reject (no task, caller got an error dict) from an advisory (nothing
+        blocked) without opening the queue file.  Adding the mode is strictly
+        additive: nothing pins this line today.
+        """
+        caplog.set_level(
+            logging.WARNING, logger='fused_memory.middleware.scope_violation_escalator',
+        )
+        # Separate roots so the two modes cannot fold into one submit — and
+        # therefore one log line (mirrors test_both_modes_are_severity_info).
+        rejection_root = tmp_path / 'rejection'
+        advisory_root = tmp_path / 'advisory'
+        esc = ScopeViolationEscalator()
+        rejection_id = esc.report_rejection(
+            project_root=str(rejection_root),
+            project_id='reify',
+            candidate_title='Edit fused-memory/X',
+            matched_paths=('fused-memory/',),
+            suggested_project='dark_factory',
+        )
+        advisory_id = esc.report_rejection(
+            project_root=str(advisory_root),
+            project_id='reify',
+            candidate_title='Rework the gui panel',
+            matched_paths=('gui/',),
+            suggested_project='reify_gui',
+            advisory=True,
+        )
+        assert rejection_id is not None
+        assert advisory_id is not None
+
+        queued = [
+            r.getMessage() for r in caplog.records
+            if 'scope_violation_escalator: queued' in r.getMessage()
+        ]
+        assert len(queued) == 2, f'expected one queued line per submit: {queued}'
+        assert queued[0] != queued[1], (
+            f'the two outcome modes log an identical line: {queued[0]!r}'
+        )
+
+        # Identify each line by its candidate title, then pin the mode token.
+        rejection_msgs = [m for m in queued if 'Edit fused-memory/X' in m]
+        advisory_msgs = [m for m in queued if 'Rework the gui panel' in m]
+        assert len(rejection_msgs) == 1, queued
+        assert len(advisory_msgs) == 1, queued
+        rejection_msg, advisory_msg = rejection_msgs[0], advisory_msgs[0]
+
+        assert 'advisory' in advisory_msg.lower(), (
+            f'advisory log line does not name its mode: {advisory_msg!r}'
+        )
+        assert 'rejection' in rejection_msg.lower(), (
+            f'rejection log line does not name its mode: {rejection_msg!r}'
+        )
+        # Unambiguous, not merely different: a line carrying BOTH tokens would
+        # leave the operator exactly where they started.
+        assert 'rejection' not in advisory_msg.lower(), advisory_msg
+        assert 'advisory' not in rejection_msg.lower(), rejection_msg
+
+        # The shared greppable anchor and the ids survive — this prefix is
+        # common to the sibling escalators, so operator greps depend on it.
+        for msg in (rejection_msg, advisory_msg):
+            assert msg.startswith('scope_violation_escalator: queued'), msg
+        assert rejection_id in rejection_msg, rejection_msg
+        assert advisory_id in advisory_msg, advisory_msg
 
     def test_rejection_fingerprint_is_byte_identical_to_legacy(self, tmp_path):
         """Load-bearing back-compat pin: the rejection digest must not change.
