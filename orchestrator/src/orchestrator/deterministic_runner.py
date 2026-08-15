@@ -366,6 +366,51 @@ _REAP_GRACE_SECS: float = 5.0
 # reap_grace_secs with room to spare) rather than tight.
 _RUN_TIMEOUT_GRACE_SECS: float = 30.0
 
+
+class ScriptTimeout(Exception):
+    """Raised by ``_default_run_script`` when its INNER per-subprocess
+    ``asyncio.wait_for`` fires — i.e. the script itself overran
+    ``before_done['timeout_secs']`` and its process group was SIGKILLed
+    (task 4065).
+
+    Why an exception rather than a ``(rc, tail)`` return: the previous
+    ``return 1, '<script timed out after Ns>'`` was indistinguishable, at the
+    ``run_fn`` seam, from a predicate check script genuinely EXITING non-zero
+    — which on the γ-predicate path is a milestone VERDICT ("the invariant
+    does not hold"), complete with a ``gate_escalated_at`` stamp latching the
+    task into the resolve-to-done path.  A timed-out script produced no exit
+    code and therefore no verdict; it is an INFRA fault.  A sentinel rc (e.g.
+    GNU ``timeout``'s 124) would merely move the collision — a script that
+    genuinely exits with the sentinel would be misclassified the other way —
+    whereas an exception type cannot collide with any exit code at all.
+
+    Deliberately NOT a ``TimeoutError`` subclass: both ``run_fn`` seam
+    wrappers (``_invoke_run_fn_translating_timeout`` and ``_run_predicate``'s
+    local ``_invoke_run_fn``) translate a seam-internal ``TimeoutError`` into
+    ``RuntimeError``, precisely so that an ``except TimeoutError`` around the
+    OUTER ``asyncio.wait_for`` can only ever mean "the outer wall-clock guard
+    itself fired".  A ``TimeoutError`` subclass would be swallowed by that
+    translation and re-reported as a generic "unexpected error" — trading one
+    misattribution for another, one layer down.
+
+    ONLY the default runner raises this.  An injected ``script_runner`` keeps
+    the plain ``(rc, tail)`` contract, so a custom runner's non-zero rc is
+    still an honest verdict on the predicate path.  Classification keys on
+    this exception TYPE — never on substring-matching the tail, which would
+    misclassify any check script that merely PRINTS "timed out".
+
+    ``rc``/``tail`` carry the legacy pair as structured data so the deploy
+    seam wrapper can restore the pre-4065 return value verbatim (the deploy
+    classifiers have no verdict semantics — every non-zero rc there already
+    routes to ``infra_issue``, so nothing there needed to change).
+    """
+
+    def __init__(self, timeout_secs: float) -> None:
+        self.timeout_secs = timeout_secs
+        self.rc = 1
+        self.tail = f'<script timed out after {timeout_secs}s>'
+        super().__init__(self.tail)
+
 # Task 2091 / 2119: bound `_default_inspect_unit`'s `systemctl --user show`
 # call — a parallel latent-hang gap to task 2090, which only wraps the
 # before_done run_fn subprocess and not this inspect call (esc-2090-11).
@@ -1049,7 +1094,20 @@ class DeterministicRunner:
 
         Returns:
             (rc, output_tail) — rc is the process return code; output_tail is
-            the last 2000 chars of combined stdout/stderr.
+            the last 2000 chars of combined stdout/stderr.  Returned ONLY when
+            the script ran to completion; a timeout raises instead (below).
+
+        Raises:
+            ScriptTimeout — the script overran ``before_done['timeout_secs']``
+                and its whole process group was SIGKILLed (task 2090 Layer A
+                runs FIRST, before the raise).  Deliberately not a ``(1,
+                tail)`` return: at the ``run_fn`` seam that was
+                indistinguishable from a predicate script genuinely exiting
+                non-zero, i.e. a milestone VERDICT rather than the infra fault
+                it actually is (task 4065).  The deploy seam wrapper
+                ``_invoke_run_fn_translating_timeout`` restores the legacy
+                pair from ``exc.rc``/``exc.tail``, so deploy callers are
+                unaffected.
         """
         script = before_done['script']
         args = before_done.get('args') or []
@@ -1080,8 +1138,16 @@ class DeterministicRunner:
             # running indefinitely.  start_new_session=True (above) makes this
             # process its own session/group leader so the WHOLE tree can be
             # torn down together instead of leaking orphaned processes.
+            #
+            # The teardown stays FIRST: task 4065 only changed how the timeout
+            # is REPORTED, not the Layer-A guarantee that the process group is
+            # dead before this frame unwinds.  `_terminate_process_tree` never
+            # raises (see its docstring), so the raise below is always reached.
             await self._terminate_process_tree(proc)
-            return 1, f'<script timed out after {timeout_secs}s>'
+            # `from None` suppresses the noisy asyncio.TimeoutError context —
+            # ScriptTimeout already carries the overrun budget as structured
+            # data (timeout_secs), so the chained cause adds nothing.
+            raise ScriptTimeout(timeout_secs) from None
 
     async def _terminate_process_tree(self, proc: asyncio.subprocess.Process) -> None:
         """Kill *proc*'s entire process group and bound the reap (task 2090).
@@ -2220,9 +2286,22 @@ class DeterministicRunner:
         named-target ``RestartPlan`` shim runner, and the target_unit-less
         direct invocation below) so the translation logic cannot drift
         between the two copies.
+
+        Task 4065: also converts the default runner's ``ScriptTimeout`` back
+        into the legacy ``(1, '<script timed out after Ns>')`` pair, so the
+        DEPLOY classifiers see byte-for-byte what they saw before that
+        exception existed.  Unlike the γ-predicate path, they have no
+        milestone-verdict semantics to protect — every non-zero rc there
+        already routes to ``_file_infra_issue_and_block`` (target_unit-less)
+        or ``RESTART_FAILED`` -> the same (named target) — so the
+        reclassification 4065 introduces is predicate-only.  Restoring the
+        pair HERE, once, rather than at each deploy call site, keeps the
+        anti-drift property this helper exists for.
         """
         try:
             return await run_fn(before_done)
+        except ScriptTimeout as exc:
+            return exc.rc, exc.tail
         except TimeoutError as exc:
             raise RuntimeError(
                 f'run_fn raised TimeoutError internally (not the '
