@@ -2269,11 +2269,19 @@ class TestRecreateSubgraphRelationships:
         backend = make_backend(mock_config)
 
         wrong_mock = make_graph_mock()
-        wrong_mock.ro_query = AsyncMock(
-            return_value=MagicMock(
-                result_set=[SHARED_EDGE_ROW_FIXTURE, UNIQUE_WRONG_EDGE_ROW_FIXTURE]
-            )
-        )
+
+        # Cypher-discriminating: the wrong copy holds the two RELATES_TO
+        # edges and NO incoming MENTIONS, so the task-4183 dropped-MENTIONS
+        # census correctly reads zero here instead of being answered with
+        # edge rows by a blanket return_value.
+        async def _wrong_ro_query(cypher, params=None):
+            if 'RELATES_TO' in cypher:
+                return MagicMock(
+                    result_set=[SHARED_EDGE_ROW_FIXTURE, UNIQUE_WRONG_EDGE_ROW_FIXTURE]
+                )
+            return MagicMock(result_set=[])
+
+        wrong_mock.ro_query = AsyncMock(side_effect=_wrong_ro_query)
 
         home_mock = make_graph_mock()
         # home's CURRENT incident edge-uuid set: only the shared edge -- the
@@ -2333,11 +2341,18 @@ class TestRecreateSubgraphRelationships:
         backend = make_backend(mock_config)
 
         wrong_mock = make_graph_mock()
-        wrong_mock.ro_query = AsyncMock(
-            return_value=MagicMock(
-                result_set=[SHARED_EDGE_ROW_FIXTURE, UNIQUE_WRONG_EDGE_ROW_FIXTURE]
-            )
-        )
+
+        # Cypher-discriminating for the same reason as the test above: no
+        # incoming MENTIONS on the wrong copy, so the task-4183 census reads
+        # zero rather than mis-parsing the RELATES_TO rows.
+        async def _wrong_ro_query(cypher, params=None):
+            if 'RELATES_TO' in cypher:
+                return MagicMock(
+                    result_set=[SHARED_EDGE_ROW_FIXTURE, UNIQUE_WRONG_EDGE_ROW_FIXTURE]
+                )
+            return MagicMock(result_set=[])
+
+        wrong_mock.ro_query = AsyncMock(side_effect=_wrong_ro_query)
 
         home_mock = make_graph_mock()
         # home's CURRENT incident edge-uuid set: only the shared edge -- the
