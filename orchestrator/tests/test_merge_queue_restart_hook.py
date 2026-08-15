@@ -858,6 +858,10 @@ async def test_verifying_merge_survives_graceful_restart_and_recovers(
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(180)  # task 3927: real (unmocked) CAS advance loop with
+# real git subprocesses under a gated Event -- widened from the 60s default
+# to tolerate host oversubscription, same convention as test_crash_recovery.py
+# (task 2376) and test_offline_lane_infra_integration.py (task 3832).
 async def test_stop_does_not_preempt_finalizing_head_mid_advance(
     git_ops: GitOps, config: OrchestratorConfig,
 ) -> None:
