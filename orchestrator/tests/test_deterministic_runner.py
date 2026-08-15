@@ -9299,6 +9299,181 @@ class TestPredicateModeTimeout:
 
 
 # ---------------------------------------------------------------------------
+# Task 4065 — RED: the REAL default runner's INNER per-script timeout on the
+# predicate path.
+#
+# The classes above all inject a hanging/erroring `script_runner`, so they
+# only ever exercise the OUTER wall-clock guard.  On the production path
+# (script_runner=None) `_default_run_script`'s OWN per-subprocess timeout
+# fires strictly first — it used to return an ordinary (1, tail), landing in
+# the `rc != 0` milestone-VERDICT branch and stamping gate_escalated_at for
+# what is actually an infra fault with no verdict at all.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestPredicateDefaultRunnerInnerTimeout:
+    """DeterministicRunner — a predicate script that overruns its own
+    ``timeout_secs`` under the REAL default runner is an INFRA fault, never a
+    milestone verdict (task 4065).
+
+    The harm being pinned: ``milestone_check_failed`` additionally stamps
+    ``gate_escalated_at``, which latches the task into section-1's
+    resolve-to-done path — so a human resolving the escalation drives a task
+    to done whose invariant was never actually evaluated.  ``infra_issue``
+    leaves the stamp unset and the read-only check is simply re-attempted.
+    """
+
+    async def test_default_runner_inner_timeout_files_infra_issue_not_milestone_check_failed(
+        self, tmp_path: Path,
+    ):
+        """A real predicate script that overruns ``before_done['timeout_secs']``
+        must file ``infra_issue`` (no ``gate_escalated_at`` stamp), with a
+        message naming the INNER per-script timeout.
+
+        ``timeout_secs=1`` against a 30s sleep leaves the outer guard at the
+        default ``1 + 30 = 31s``, so the INNER timeout provably wins.
+
+        RED today: the inner timeout returns ``(1, tail)``, so this lands in
+        the ``rc != 0`` VERDICT branch -> ``milestone_check_failed`` +
+        ``gate_escalated_at``.
+        """
+        import asyncio
+        import time
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        script = tmp_path / 'slow-predicate.sh'
+        script.write_text('#!/bin/sh\nsleep 30\n')
+        script.chmod(0o755)
+
+        task = _predicate_task(
+            task_id='704',
+            script=str(script),
+            cwd=str(tmp_path),
+            timeout_secs=1,
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        unit_inspector = AsyncMock()
+
+        # run_timeout_grace_secs left at its default so the outer guard
+        # (1 + 30 = 31s) provably CANNOT be what fires.
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=None,
+        )
+
+        started = time.monotonic()
+        # Hang tripwire: fail loudly instead of stalling the suite.
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=20)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 15, (
+            f'the INNER 1s timeout must be what fires, not the 31s outer '
+            f'guard — run took {elapsed:.1f}s'
+        )
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('704', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.agent_role == 'orchestrator-deterministic'
+        assert esc.category == 'infra_issue', (
+            f'a timed-out script produced NO exit code, so there is no verdict '
+            f'— must not be milestone_check_failed: {esc.category!r}'
+        )
+
+        # The message must identify WHICH guard fired: all three predicate
+        # infra_issue arms share one category, so the text is the only
+        # discriminator a human gets.
+        text = f'{esc.summary}\n{esc.detail}'
+        assert 'timed out' in text.lower(), (
+            f'the escalation must name the timeout: {text!r}'
+        )
+        assert "before_done['timeout_secs']" in text, (
+            f"the escalation must cite before_done['timeout_secs'] as the "
+            f'budget that was overrun: {text!r}'
+        )
+        assert '1s' in text, (
+            f'the escalation must cite the actual 1s budget: {text!r}'
+        )
+        assert 'unexpected error' not in text.lower(), (
+            f'a per-script timeout is a well-understood, expected event — it '
+            f"must not be reported through the generic unexpected-error arm's "
+            f'wording: {text!r}'
+        )
+        assert 'outer guard' not in text.lower(), (
+            f'the INNER per-script timeout must be distinguishable from the '
+            f'outer wall-clock backstop: {text!r}'
+        )
+
+        scheduler.update_task.assert_not_awaited()  # no gate_escalated_at stamp
+        scheduler.set_task_status.assert_awaited_once_with('704', 'blocked')
+        unit_inspector.assert_not_awaited()
+
+    async def test_custom_script_runner_nonzero_rc_is_still_a_verdict(self, tmp_path: Path):
+        """PIN: an INJECTED ``script_runner`` returning the literal legacy
+        ``(1, '<script timed out after 1s>')`` tuple must STILL file
+        ``milestone_check_failed`` and stamp ``gate_escalated_at``.
+
+        Green before and after task 4065.  It forbids implementing the fix by
+        substring-sniffing ``'timed out'`` out of the tail — which would
+        silently reclassify any predicate script that merely PRINTS that
+        phrase from an honest verdict into a re-attempted infra fault.
+        Classification must key on the exception TYPE, and only the default
+        runner raises it.
+        """
+        import asyncio
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _predicate_task(task_id='705', timeout_secs=1)
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        unit_inspector = AsyncMock()
+
+        script_runner = AsyncMock(return_value=(1, '<script timed out after 1s>'))
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=5)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('705', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.category == 'milestone_check_failed', (
+            f'an injected runner keeps the plain (rc, tail) contract — a '
+            f'non-zero rc is a VERDICT no matter what the tail says: '
+            f'{esc.category!r}'
+        )
+
+        stamp_calls = [
+            c for c in scheduler.update_task.call_args_list
+            if len(c.args) > 1 and c.args[1].get('gate_escalated_at')
+        ]
+        assert stamp_calls, (
+            'a verdict must still stamp gate_escalated_at (resolve-to-done path)'
+        )
+        scheduler.set_task_status.assert_awaited_once_with('705', 'blocked')
+        unit_inspector.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
 # Step-7: RED — B10 predicate resume: gate_escalated_at set + escalation
 # resolved -> done with deterministic-milestone provenance (NOT
 # deterministic-deploy). (RED until step-8 adds the predicate-aware resume
