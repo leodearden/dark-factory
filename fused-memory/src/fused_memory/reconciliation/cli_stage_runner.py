@@ -64,6 +64,13 @@ DISALLOW_MEMORY_WRITES = [
     'mcp__fused-memory__add_memory',
     'mcp__fused-memory__delete_memory',
     'mcp__fused-memory__update_memory',
+    # consolidate_memories (task 3133) is classified in the SAME change that
+    # adds the tool, deliberately: it writes a canonical, patches N retained
+    # peers, re-homes their children and DELETES its supersedes, so shipping
+    # it unlisted would repeat the update_memory incident above with a larger
+    # blast radius. Stage 1's ADVERTISEMENT of the op is task 3134's — this
+    # is the safety classification, which belongs with the tool.
+    'mcp__fused-memory__consolidate_memories',
     'mcp__fused-memory__delete_episode',
     'mcp__fused-memory__redact_episode_content',
     'mcp__fused-memory__replay_to_graphiti',

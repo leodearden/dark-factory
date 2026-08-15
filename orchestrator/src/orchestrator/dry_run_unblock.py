@@ -202,6 +202,12 @@ _DISALLOWED_TOOLS: list[str] = [
     'mcp__fused-memory__set_task_status',
     'mcp__fused-memory__update_task',
     'mcp__fused-memory__delete_memory',
+    # Strictly more destructive than delete_memory above (task 3133): one
+    # call deletes N records, patches M retained peers and re-homes their
+    # children. A dry run's whole premise is that it observes without
+    # mutating, so leaving this unlisted would not degrade a dry run — it
+    # would falsify it.
+    'mcp__fused-memory__consolidate_memories',
     'mcp__fused-memory__remove_task',
 ]
 
