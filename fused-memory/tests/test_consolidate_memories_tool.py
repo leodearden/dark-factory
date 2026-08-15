@@ -139,11 +139,10 @@ async def call_consolidate(svc, **overrides):
 
 
 class TestToolRegistration:
-    @pytest.mark.asyncio
-    async def test_tool_is_registered(self):
+    def test_tool_is_registered(self):
         server = create_mcp_server(make_service())
 
-        tools = await server._tool_manager.list_tools()
+        tools = server._tool_manager.list_tools()
 
         assert 'consolidate_memories' in {t.name for t in tools}
 

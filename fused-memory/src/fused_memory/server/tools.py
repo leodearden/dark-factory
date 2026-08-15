@@ -79,6 +79,7 @@ from fused_memory.reconciliation.task_filter import (
     is_mixed_temporal_framing,
     is_proposed_resolution_framing,
 )
+from fused_memory.server.consolidation import validate_consolidate_args
 from fused_memory.server.manifest_stamping import stamp_capability_manifests
 from fused_memory.server.markup_tripwire import (
     MarkupStormCounter,
@@ -528,6 +529,16 @@ def _canonicalize_project_id_arg(project_id: str) -> tuple[str, dict[str, str] |
 
 
 _UPDATE_MEMORY_MODES = ('merge', 'replace')
+
+#: How many topic members ``consolidate_memories`` lists back as the
+#: post-consolidation closure.
+#:
+#: A topic is a duplicate CLUSTER, so a conforming one is single digits and
+#: this bound is never reached; it exists so a topic that has become a
+#: dumping ground cannot return an unbounded payload. Reaching it is itself
+#: a finding, which is why the envelope discloses ``topic_members_truncated``
+#: rather than letting a capped listing read as the whole closure.
+_TOPIC_MEMBER_LIMIT = 200
 
 
 def _update_memory_arm_presence_error(
@@ -4359,6 +4370,164 @@ def create_mcp_server(
             causation_id=causation_id,
             _source=source,
         )
+
+    @mcp.tool()
+    @mcp_tool_errors()
+    async def consolidate_memories(
+        canonical_content: str,
+        topic: str,
+        project_id: str,
+        supersedes: list[str] | None = None,
+        retain: list[str] | None = None,
+        run_id: str | None = None,
+        category: str | None = None,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        metadata: dict | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Fold a duplicate cluster into ONE canonical entry. IRREVERSIBLE.
+
+        Replaces the hand-rolled write-then-delete choreography that made
+        consolidation a RATCHET: a canonical write plus unordered deletes
+        with no verification nets +1 entry per failed pass, which is how a
+        cluster ends up containing the consolidator's own prior canonicals.
+        The cure is the ORDERING below plus a closure that is corroborated
+        by a live re-read rather than inferred from "the delete returned ok".
+
+        Ordering is the contract — each step sits where it does because of
+        what its failure would cost:
+
+        (1) Validate every argument. Pure, zero writes: an argument set that
+            cannot be executed safely is refused while refusing is free.
+        (2) Authorize the metadata-patch arm.
+        (3) Pre-flight and repoint task-metadata citations across the whole
+            delete set. A refused op has mutated nothing.
+        (4) Write the canonical — BEFORE any destructive step, so a
+            uniqueness violation or a metadata rejection costs zero deletes.
+        (5) Per supersede: read it (for the tombstone), reparent its
+            children onto the canonical, corroborate that, then delete.
+        (6) Re-query deterministically — never `search`, whose top-N cutoff
+            can silently omit the record just written.
+        (7) Tombstone the confirmed-gone set.
+        (8) Report structurally: anything that did not happen is named.
+
+        Args:
+            canonical_content: The consolidated record's text — the single
+                claim the surviving canonical will state.
+            topic: The cluster's topic slug, validated against the ONE
+                namespace shared with ``ProceduralTopicCluster.topic_id``
+                (see ``fused_memory.topic_slug``).
+            project_id: Project scope (required).
+            supersedes: Ids to FOLD AND DELETE. Each is reparented, deleted
+                and then re-read to confirm it is actually gone.
+            retain: Ids to TAG IN PLACE — stamped with the cluster's topic
+                and never deleted. The ratified default arm.
+            run_id: The reconciliation run PERFORMING this consolidation.
+                Required whenever ``supersedes`` is non-empty: it is stamped
+                as each tombstone's ``deleting_run_id``. Deliberately
+                distinct from the victims' own ``metadata.run_id``, which
+                names the run that WROTE them — conflating the two is what
+                made the original finding unreadable, so a delete that
+                cannot be attributed is refused rather than guessed at.
+            category: Category for the canonical write (optional).
+            agent_id: Which agent is consolidating (optional, auto-derived
+                from MCP context).
+            session_id: Session context (optional, auto-derived).
+            metadata: Extra key-value pairs merged into the canonical's
+                metadata (may carry _causation_id for recon).
+
+        Returns:
+            ``{'status', 'canonical_id', 'topic', 'deleted', 'failed_deletes',
+            'retained', 'retain_failures', 'reparented', 'reparent_failures',
+            'survivors', 'topic_members', 'topic_members_truncated', ...}``.
+            ``survivors`` is the load-bearing one: ids whose delete reported
+            success but which STILL RESOLVE on the re-read.
+        """
+        agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
+        if err := validate_project_id(project_id):
+            return err
+        if err := _known_project_gate(project_id):
+            return err
+        # RETURNED, never raised: `mcp_tool_errors` flattens an exception to
+        # {'error', 'error_type'} and would drop the `hint` that tells the
+        # caller how to fix the arguments.
+        err, supersedes_ids, retain_ids = validate_consolidate_args(
+            canonical_content=canonical_content,
+            topic=topic,
+            supersedes=supersedes,
+            retain=retain,
+            run_id=run_id,
+        )
+        if err:
+            return err
+        causation_id, source, cleaned_meta = _extract_causation(metadata, agent_id)
+
+        # (4) The canonical FIRST. A uniqueness violation or a metadata
+        # rejection here must cost zero deletions — the alternative is a
+        # cluster whose members are gone and whose replacement was never
+        # written, which is the ratchet running backwards.
+        canonical_meta = dict(cleaned_meta or {})
+        canonical_meta.update({
+            'topic': topic,
+            'canonical': True,
+            'supersedes': list(supersedes_ids),
+        })
+        written = await memory_service.add_memory(
+            content=canonical_content,
+            category=category,
+            project_id=project_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            metadata=canonical_meta,
+            causation_id=causation_id,
+            _source=source,
+        )
+        canonical_id = written.memory_ids[0] if written.memory_ids else None
+
+        deleted: list[str] = []
+        for supersede_id in supersedes_ids:
+            await memory_service.delete_memory(
+                memory_id=supersede_id,
+                store='mem0',
+                project_id=project_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                causation_id=causation_id,
+                _source=source,
+            )
+            deleted.append(supersede_id)
+
+        # (6) The closure listing comes from the deterministic scroll, NOT
+        # `search`. A ranked top-N read can silently omit the canonical this
+        # call just wrote — the exact failure that made the original
+        # incident's "re-derive via search" correction route dispatch back
+        # into the superseded members it was collapsing.
+        topic_members = await memory_service.get_memories_by_metadata(
+            project_id=project_id,
+            filters={'topic': topic},
+            limit=_TOPIC_MEMBER_LIMIT,
+        )
+        returned = len(topic_members) if isinstance(topic_members, list) else 0
+        if returned >= _TOPIC_MEMBER_LIMIT:
+            total = await memory_service.count_memories_by_metadata(
+                project_id=project_id, filters={'topic': topic}
+            )
+        else:
+            total = returned
+        return {
+            'status': 'consolidated',
+            'canonical_id': canonical_id,
+            'topic': topic,
+            'deleted': deleted,
+            'failed_deletes': [],
+            'survivors': [],
+            'topic_members': topic_members,
+            'topic_members_truncated': total > returned,
+        }
 
     @mcp.tool()
     @mcp_tool_errors()
