@@ -287,12 +287,21 @@ _OUTCOME_ALLOWED: dict[str, frozenset[TaskStatus]] = {
     # merge-deferred) — an intentional steward terminal decision the
     # orchestrator must not overwrite. 'done' is excluded: that status is
     # handled by a dedicated branch that returns WorkflowOutcome.DONE, never
-    # BLOCKED. IN_PROGRESS is also included: the merge-halt escalation-wait
-    # paths (_handle_wip_recovery_no_advance / _handle_unmerged_state) submit
-    # an L1 and return BLOCKED directly (no _mark_blocked call) without ever
-    # rewriting task status, so the row stays at whatever it was mid-merge —
-    # the same "preserves in-progress" shape already noted below for
-    # 'escalated'.
+    # BLOCKED. IN_PROGRESS is also included, for the BLOCKED paths that
+    # deliberately PRESERVE the mid-flight row rather than parking it:
+    #   - spec §5's steward terminal-decision preserve carve-out — the steward
+    #     already adjudicated the row (e.g. 'deferred'), and _mark_blocked
+    #     returns BLOCKED without rewriting it;
+    #   - the merge-gating bail's documented in-progress-preserving shape (the
+    #     same shape already noted below for 'escalated').
+    # NOT the merge-halt trio: as of task 3537 _handle_stash_failed /
+    # _handle_unmerged_state / _handle_wip_recovery_no_advance all route their
+    # BLOCKED exit through _mark_blocked and DO write the row (spec §7.9 /
+    # §8-E3, INV-6) — that justification is retired, not the member.
+    # The frozenset is deliberately NOT narrowed here: removing IN_PROGRESS is
+    # divergence E10's scope, and doing it in isolation would turn every
+    # still-legitimate preserve path above into a hard AssertionError from
+    # run()'s SM-2 check.
     'blocked': frozenset(
         {
             TaskStatus.BLOCKED,
