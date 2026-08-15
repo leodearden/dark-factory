@@ -10065,8 +10065,31 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         The tracker is iterated as a **snapshot** because the sweep mutates it
         (``_record_runner_recovered``).  Per-host exceptions are caught so one
         host's failure cannot abort the sweep for the remaining hosts.
+
+        **Observability.** Every decision emits exactly one single-line record
+        naming the host — recovered, still-unreachable, park-safety skip,
+        unresolvable-runner (WARNING), and the allocator-missing early return
+        while hosts are tracked (WARNING) — so grepping the orchestrator log
+        for a host name answers "did the reprobe loop consider this host, and
+        what did it decide?".  That question was unanswerable during the reify
+        2026-07-25 incident, whose post-mortem had to argue from the *absence*
+        of dispatch attempts.  This complements task 3275's snapshot/heartbeat
+        observability, which reports per-host STATE but not this sweep's
+        decisions.  Deliberately **silent** when the tracker is empty: the
+        healthy steady state runs every ``verify_host_reprobe_interval_s``
+        (120 s) and must not become log noise.
         """
         if self._host_allocator is None:
+            # Silent when nothing is tracked (the common "no verify dispatched
+            # yet" case at a 120 s cadence); loud when hosts ARE tracked, since
+            # then this early return is the reason none of them can recover.
+            if self._runner_unavailable:
+                logger.warning(
+                    'reprobe: no host allocator built, but %d host(s) are tracked '
+                    'unavailable (%s) — none can be re-probed or re-admitted this sweep',
+                    len(self._runner_unavailable),
+                    ', '.join(sorted(self._runner_unavailable)),
+                )
             return
 
         for name, entry in list(self._runner_unavailable.items()):
@@ -10081,11 +10104,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     runner = dict(
                         self._host_allocator.quarantined_remote_runners()
                     ).get(name)
-                if runner is None:
-                    # Tracked but unresolvable: nothing to probe this sweep.
-                    continue
 
                 downtime_s = now - entry.first_unavailable_at
+
+                if runner is None:
+                    logger.warning(
+                        'reprobe: host %r is tracked unavailable (down %.0fs) but has '
+                        'no resolvable runner handle — it is stranded out of the verify '
+                        'pool and cannot be re-probed',
+                        name,
+                        downtime_s,
+                    )
+                    continue
 
                 # Probe health first so a host that recovers in the same cycle
                 # it would have tripped the time-based threshold goes directly
@@ -10097,9 +10127,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # before freeing it.  A runner that does not implement the
                     # optional probe is treated as clean.
                     _is_parked = getattr(self._host_allocator, 'is_parked', None)
-                    if _is_parked is not None and _is_parked(name):
+                    _was_parked = bool(_is_parked(name)) if _is_parked is not None else False
+                    if _was_parked:
                         _probe_clean = getattr(runner, 'probe_clean', None)
                         if _probe_clean is not None and not await _probe_clean():
+                            logger.info(
+                                'reprobe: host %r is reachable again after %.0fs but its '
+                                'slot stays PARKED pending a clean probe (a stale verify '
+                                'may still be running there); retrying next sweep',
+                                name,
+                                downtime_s,
+                            )
                             continue
 
                     _readmit = getattr(self._host_allocator, 'readmit', None)
@@ -10114,7 +10152,21 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         name,
                         downtime_s=downtime_s,
                     )
+                    logger.info(
+                        'reprobe: host %r recovered after %.0fs down — re-admitted to '
+                        'the verify pool (slot un-PARKed: %s)',
+                        name,
+                        downtime_s,
+                        _was_parked,
+                    )
                 else:
+                    logger.info(
+                        'reprobe: host %r still unreachable after %.0fs down '
+                        '(streak=%d) — staying out of the verify pool',
+                        name,
+                        downtime_s,
+                        entry.streak,
+                    )
                     # Host still unreachable: fire the time-based alarm path
                     # (dedup'd — no-op if already open).
                     # `> 0` guard: secs=0 disables the time-based trip
