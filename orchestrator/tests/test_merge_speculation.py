@@ -81,6 +81,10 @@ from orchestrator.git_ops import (  # noqa: F401
     _run,
 )
 from orchestrator.landed_outbox import LandedOutbox  # noqa: F401
+from orchestrator.merge_disposition import (  # noqa: F401
+    ClassificationResult,
+    classify_merge_failure_disposition,
+)
 from orchestrator.merge_queue import (  # noqa: F401
     InflightEntry,
     InflightVerifyResult,
@@ -104,6 +108,56 @@ from orchestrator.warm_lane_pool import LaneState, WarmLanePool  # noqa: F401
 # ---------------------------------------------------------------------------
 # Module-level helpers
 # ---------------------------------------------------------------------------
+
+
+# Task 3980 step-12/13: the merge-disposition classifier has TWO fail-open
+# sites, on two different loggers, and both emit this same substring:
+#
+#   1. merge_disposition.py:710-719 — the classifier's own internal fail-open,
+#      logger 'orchestrator.merge_disposition'.
+#   2. merge_queue.py:994-1001 — `_classify_disposition_for_outcome`'s
+#      belt-and-suspenders catch for anything the classifier's own fail-open
+#      re-raises past, logger 'orchestrator.merge_queue'.
+#
+# Keying one predicate on the shared substring catches both. Filtering by a
+# single logger name (as this file did before step-13) silently excludes site 2.
+_FAIL_OPEN_SUBSTRING = 'degrading to INDETERMINATE (fail-open, I3)'
+_FAIL_OPEN_LOGGERS = ('orchestrator.merge_disposition', 'orchestrator.merge_queue')
+
+
+def _fail_open_records(
+    records: list[logging.LogRecord],
+) -> list[logging.LogRecord]:
+    """Return the disposition fail-open WARNINGs among *records* (both sites).
+
+    NOT symmetric with "the classifier ran": a classifier that SUCCEEDS emits
+    NOTHING at WARNING (it logs only on the degrade paths,
+    merge_disposition.py:695 and :711), so an empty return here means "no
+    fail-open", never "the classifier was reached". Proving the classifier was
+    reached needs a delegating SPY on the callable — see
+    ``TestLateArrivalFailCascade`` for the live one and
+    ``TestDispositionDoubleFidelity`` for the isolated two-sided proof.
+    Reading log silence as non-execution is exactly the inference that produced
+    a wrong review finding against this file; do not repeat it.
+
+    Deliberately does NOT match merge_disposition.py:695's *other* degrade
+    ('degrading implicated landings to INDETERMINATE (...)'), which is a
+    legitimate evidence-absent verdict rather than a swallowed exception.
+    """
+    return [
+        r for r in records
+        if r.name in _FAIL_OPEN_LOGGERS and _FAIL_OPEN_SUBSTRING in r.getMessage()
+    ]
+
+
+def _format_fail_open_records(records: list[logging.LogRecord]) -> str:
+    """Render fail-open records for an assertion message, naming the underlying
+    exception (the actionable part — the WARNING text alone never says WHY)."""
+    return '\n'.join(
+        f'  - [{r.name}] {r.getMessage()}'
+        + (f'\n    underlying: {r.exc_info[1]!r}' if r.exc_info else '')
+        for r in records
+    )
 
 
 def _write_recording_script(lane: Path, name: str) -> Path:
@@ -3905,6 +3959,23 @@ class TestLateArrivalWaitsAreLoadIndependent:
 # ===========================================================================
 
 
+# Exactly ONE deliberate bare-MagicMock site is exempt (task 3980 step-12).
+# TestDispositionDoubleFidelity's NEGATIVE leg re-introduces the pre-step-8
+# defect ON PURPOSE and asserts that the classifier fails open on it — that
+# mutation is what makes the POSITIVE leg's "no fail-open" assertion provably
+# two-sided rather than trivially true. A guard that flagged it would force the
+# proof to be deleted to keep the guard green, which is backwards.
+#
+# The exemption is keyed on the enclosing scope, NOT on a line number (which
+# every edit above it invalidates) and NOT on a comment pragma (which is one
+# copy-paste away from exempting a real offender). Adding an entry here is a
+# design decision, not a cleanup: any NEW entry must, like this one, exist to
+# prove a guard can fail.
+_BARE_DOUBLE_EXEMPT_SCOPES = frozenset({
+    'TestDispositionDoubleFidelity::test_bare_double_makes_classifier_fail_open',
+})
+
+
 def _bare_verify_result_double_offenders(source: str) -> list[str]:
     """Statically scan *source* for unspecced VerifyResult-shaped MagicMocks.
 
@@ -3958,7 +4029,11 @@ def _bare_verify_result_double_offenders(source: str) -> list[str]:
                 continue
             if isinstance(child, ast.Call) and _is_magicmock(child.func):
                 kwargs = {kw.arg for kw in child.keywords}
-                if 'passed' in kwargs and not ({'spec', 'spec_set'} & kwargs):
+                if (
+                    'passed' in kwargs
+                    and not ({'spec', 'spec_set'} & kwargs)
+                    and scope not in _BARE_DOUBLE_EXEMPT_SCOPES
+                ):
                     offenders.append(
                         f'{name}:{child.lineno} — {scope or "<module>"} — '
                         f'MagicMock(passed=...) with no spec=.'
@@ -4006,5 +4081,155 @@ class TestNoBareVerifyResultDoubles:
             'verify_skipped= is rejected with TypeError instead of silently '
             'setattr-ing onto the mock. Drop lint_output/type_output/timed_out/'
             'category unless the test needs a non-default value — restating a '
-            'default inline is how these doubles drifted in the first place.'
+            'default inline is how these doubles drifted in the first place.\n'
+            'Exactly one site is exempt, by enclosing scope, in '
+            '_BARE_DOUBLE_EXEMPT_SCOPES: TestDispositionDoubleFidelity\'s '
+            'negative leg re-introduces the defect deliberately to prove the '
+            'positive leg can fail. Do not add an entry to silence a real '
+            'offender.'
+        )
+
+
+# ===========================================================================
+# Task 3980 step-12: two-sided fidelity proof for the verify-result double
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestDispositionDoubleFidelity:
+    """Isolated, two-sided proof that a bare verify-result double silently
+    disables merge-disposition classification — and that ``_fake_verify_result``
+    does not.
+
+    WHY THIS EXISTS SEPARATELY from the live guard inside
+    ``TestLateArrivalFailCascade``. That guard is real (it fails under the
+    bare-MagicMock mutation, measured), but its two-sidedness is an IMPLICIT
+    property of a ~4s integration test's code path: it holds only because the
+    classifier happens to sit on the head-failure cascade. A reader cannot check
+    that by reading it, and a reviewer trying to check it empirically got the
+    wrong answer — reading the ABSENCE of a WARNING as evidence the classifier
+    never ran, when a successful classification is precisely the silent case.
+    These two tests pin the mechanism directly, hermetically, in milliseconds:
+    no merge worker, no git repo, no event-loop barriers, no timing.
+
+    The legs are complementary and BOTH are required. The positive leg alone is
+    a test that cannot fail; the negative leg is what proves it can.
+    """
+
+    # Minimal surrounding args for a hermetic classifier call. repo_root,
+    # task_id and event_store are deliberately left at their None defaults: each
+    # degrades its own evidence source fail-safe, which is what keeps this test
+    # free of git and event-store setup. The SHAs are syntactically valid and
+    # never resolved, because control returns before any git plumbing runs.
+    _ARGS: dict[str, Any] = {
+        'branch': 'task/3980-fidelity',
+        'merge_base_sha': '0' * 40,
+        'main_sha': '1' * 40,
+        'preexisting': False,
+    }
+
+    async def test_fake_verify_result_double_lets_the_classifier_run(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """POSITIVE leg: a ``_fake_verify_result`` double classifies normally.
+
+        Asserts the ABSENCE of a fail-open and the PRESENCE of a real
+        ``ClassificationResult`` — deliberately NOT the disposition VALUE. The
+        verdict depends on git state this test does not set up (repo_root=None
+        short-circuits to INDETERMINATE at the ambiguity clause), so pinning it
+        would buy nothing and break on any future evidence-source change.
+        """
+        for logger_name in _FAIL_OPEN_LOGGERS:
+            caplog.set_level(logging.WARNING, logger=logger_name)
+
+        double = _fake_verify_result(
+            passed=False, summary='tests failed', test_output='FAIL',
+        )
+
+        result = await classify_merge_failure_disposition(
+            verify_result=cast(VerifyResult, double), **self._ARGS,
+        )
+
+        fail_open = _fail_open_records(caplog.records)
+        assert not fail_open, (
+            'A _fake_verify_result double must classify cleanly, but the '
+            'classifier FAILED OPEN:\n'
+            f'{_format_fail_open_records(fail_open)}\n'
+            'If this leg is red, the factory has drifted from VerifyResult '
+            '(a new field whose seeded default breaks '
+            '_extract_failing_tests_and_candidate_files, most likely), and '
+            'every disposition-sensitive assertion built on it is now vacuous.'
+        )
+        assert isinstance(result, ClassificationResult), (
+            f'classifier must return a ClassificationResult; got {result!r}'
+        )
+
+    async def test_bare_double_makes_classifier_fail_open(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """NEGATIVE leg: the pre-step-8 bare MagicMock DOES fail the classifier.
+
+        This is the mutation, kept permanently as a test. It reconstructs the
+        exact shape task 3980 removed from ten sites — note ``verify_skipped=``,
+        which is not a VerifyResult field at all (it lives on MergeOutcome,
+        merge_types.py:945) and which a bare MagicMock accepts without
+        objection, and note the ABSENT ``cause_hint``, which is the actual
+        defect: reading it auto-vivifies a truthy child Mock that survives
+        ``_extract_failing_tests_and_candidate_files``' ``if part`` filter and
+        then breaks ``str.join`` (merge_disposition.py:218).
+
+        Exempt from ``TestNoBareVerifyResultDoubles`` by enclosing scope via
+        ``_BARE_DOUBLE_EXEMPT_SCOPES`` — the one site in this module where a
+        bare double is the point.
+        """
+        for logger_name in _FAIL_OPEN_LOGGERS:
+            caplog.set_level(logging.WARNING, logger=logger_name)
+
+        bare = MagicMock(
+            passed=False, summary='tests failed', test_output='FAIL',
+            lint_output='', type_output='', category='', timed_out=False,
+            verify_skipped=False,
+        )
+
+        result = await classify_merge_failure_disposition(
+            verify_result=cast(VerifyResult, bare), **self._ARGS,
+        )
+
+        # The classifier swallows the fault and returns a verdict that is
+        # INDISTINGUISHABLE downstream from a genuine one. That is the whole
+        # hazard: without the WARNING there is no signal at all.
+        assert isinstance(result, ClassificationResult), (
+            f'even on fail-open the classifier returns a result; got {result!r}'
+        )
+
+        fail_open = _fail_open_records(caplog.records)
+        assert fail_open, (
+            'MUTATION LEG IS DEAD: a bare MagicMock verify-result double no '
+            'longer makes the classifier fail open, so the positive leg above '
+            '(and the live guard in TestLateArrivalFailCascade) may now be '
+            'asserting something that cannot fail.\n'
+            'Either merge_disposition.py stopped consuming cause_hint through '
+            'str.join, or the fail-open WARNING text/logger changed. Re-derive '
+            'a mutation that DOES break classification and pin that instead — '
+            'do NOT delete this leg, and do NOT relax it to a no-op.\n'
+            f'WARNINGs captured on {_FAIL_OPEN_LOGGERS}: '
+            f'{[(r.name, r.getMessage()) for r in caplog.records]!r}'
+        )
+
+        # Match the underlying fault by TYPE plus a LOOSE substring. The full
+        # CPython message ('sequence item 0: expected str instance, MagicMock
+        # found') is an implementation detail a future interpreter may reword;
+        # binding to it would turn a green test red on an unrelated upgrade.
+        exc_infos = [r.exc_info for r in fail_open if r.exc_info]
+        assert exc_infos, (
+            'the fail-open WARNING must carry exc_info so an operator can see '
+            f'WHY it degraded; got records={_format_fail_open_records(fail_open)}'
+        )
+        excs = [info[1] for info in exc_infos]
+        assert any(isinstance(exc, TypeError) for exc in excs), (
+            f'expected a TypeError from the str.join; got {excs!r}'
+        )
+        assert any('expected str instance' in str(exc) for exc in excs), (
+            'expected the str.join type complaint naming a non-str item; got '
+            f'{[str(exc) for exc in excs]!r}'
         )
