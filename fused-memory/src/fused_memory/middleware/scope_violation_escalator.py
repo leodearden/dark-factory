@@ -318,8 +318,14 @@ class ScopeViolationEscalator:
                 severity='info',
                 category=_CATEGORY,
                 summary=(
-                    f'Path-scope ADVISORY: task CREATED and stamped, '
-                    f'cites {paths_str} (possible owner: {target})'
+                    # No creation claim: this is written in submit_task
+                    # phase-1, before the curator resolves the submission
+                    # (task 4159).  briefing.py renders summary verbatim into
+                    # an agent briefing, so an unverified claim here misleads
+                    # exactly as the detail's did.
+                    f'Path-scope ADVISORY: submission not blocked, outcome '
+                    f'not yet resolved, cites {paths_str} '
+                    f'(possible owner: {target})'
                     if advisory else
                     f'Misrouted task rejected: cites {paths_str} '
                     f'(suggested target: {target})'

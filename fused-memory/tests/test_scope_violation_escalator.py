@@ -556,7 +556,15 @@ class TestAdvisoryVsRejectionWording:
         assert any(s.startswith('Misrouted task rejected: cites ') for s in summaries), (
             summaries
         )
-        assert any('ADVISORY' in s and 'CREATED' in s for s in summaries), summaries
+        # 'ADVISORY' is the discriminator, not any particular outcome word:
+        # since task 4159 the advisory summary deliberately makes no creation
+        # claim (it fires before the curator resolves the submission).  The
+        # rejection summary carries no 'ADVISORY' marker and the advisory
+        # carries no 'reject', so this still fails if the fold collapsed both
+        # records onto one wording.
+        assert any('ADVISORY' in s and 'reject' not in s.lower() for s in summaries), (
+            summaries
+        )
 
     def test_two_identical_advisories_still_fold(self, tmp_path):
         """Advisories keep the anti-flood property that motivated task 2946.
