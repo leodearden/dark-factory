@@ -972,6 +972,7 @@ SECTION_HEADINGS: dict[str, str] = {
     'not_found': 'Not Found',
     'df_guard': 'Guard Trips',
     'interrupt': 'Interrupts',
+    'designed_outcomes': 'Designed Outcomes',
 }
 """Markdown '## ' heading text per digest section. The first four are the
 PRD Sec 7.2 primary sections (verbatim prose order: user turns, error
@@ -980,6 +981,7 @@ secondary scalar signals, included only when present (PRD decomposition
 Sec 11 alpha observable: "frontmatter + the four signal-class sections")."""
 
 SECTION_PRIORITY: tuple[str, ...] = (
+    'designed_outcomes',
     'retry_loops', 'not_found', 'error_neighborhoods', 'df_guard', 'interrupt',
     'self_corrections', 'user_corrections',
 )
@@ -989,12 +991,27 @@ is trimmed LAST (PRD Sec 7.2: "truncate lowest-signal sections last"; PRD
 Sec 5: user corrections are gold). Digest bodies render in the REVERSE of
 this order (gold first). Ranking mirrors SIGNAL_WEIGHTS magnitude
 (self_correct 3.0 > df_guard/interrupt 2.0 > tool_error/not_found 1.0),
-with retry_loops lowest since it carries no SIGNAL_WEIGHTS entry at all
-(it is a structural section, not one of the 5 scored signal classes)."""
+with retry_loops below those since it carries no SIGNAL_WEIGHTS entry at
+all (it is a structural section, not one of the 5 scored signal classes).
+
+'designed_outcomes' sits at index 0 -- trimmed FIRST, below even
+retry_loops -- because it is explicitly NOT confusion: a declared
+bounded-poll ceiling is a designed loop-continuation (task 3610, 07-31
+census cluster 1.3), reported for visibility and deliberately unweighted
+in SIGNAL_WEIGHTS. When a digest must shed bytes, that is the first
+thing a reader can afford to lose."""
 
 
 def _render_user_corrections(items: list[dict[str, Any]]) -> list[str]:
     return [f"- (turn {item['index']}) {item['text']}" for item in items]
+
+
+def _exit_marker(exit_code: int | None) -> str:
+    """Render the structured '[exit N] ' prefix, or '' when no code was
+    extracted. Promoting the code out of the raw error prose is 07-31
+    census R3's "record exit codes" ask: it keeps a bare 124 legible even
+    when :func:`_cap_item` byte-truncates the content away."""
+    return '' if exit_code is None else f'[exit {exit_code}] '
 
 
 def _render_error_neighborhoods(items: list[dict[str, Any]]) -> list[str]:
@@ -1002,8 +1019,26 @@ def _render_error_neighborhoods(items: list[dict[str, Any]]) -> list[str]:
     for item in items:
         tool = item['attempt_tool'] or 'unknown'
         summary = item['attempt_input_summary'] or ''
+        marker = _exit_marker(item['exit_code'])
         lines.append(
-            f"- (turn {item['index']}) {tool}({summary}) -> {item['error_content']}"
+            f"- (turn {item['index']}) {tool}({summary}) -> "
+            f"{marker}{item['error_content']}"
+        )
+    return lines
+
+
+def _render_designed_outcomes(items: list[dict[str, Any]]) -> list[str]:
+    """Name the rule that fired plus the exit code, so a reader can tell a
+    self-declared WATCHER_REARM_OUTCOME apart from a bare bounded-wait
+    124 without re-deriving the classification."""
+    lines = []
+    for item in items:
+        tool = item['attempt_tool'] or 'unknown'
+        summary = item['attempt_input_summary'] or ''
+        marker = _exit_marker(item['exit_code'])
+        lines.append(
+            f"- (turn {item['index']}) {tool}({summary}) -> "
+            f"{marker}[{item['designed_outcome']}] {item['error_content']}"
         )
     return lines
 
@@ -1027,15 +1062,21 @@ def _render_scalar_signal(items: list[dict[str, Any]]) -> list[str]:
 
 _SECTION_RENDERERS: dict[str, Any] = {
     'user_corrections': (iter_user_turns, _render_user_corrections),
-    'error_neighborhoods': (iter_error_neighborhoods, _render_error_neighborhoods),
+    'error_neighborhoods': (iter_genuine_errors, _render_error_neighborhoods),
     'self_corrections': (iter_self_corrections, _render_self_corrections),
     'retry_loops': (find_retry_loops, _render_retry_loops),
     'not_found': (iter_not_found, _render_scalar_signal),
     'df_guard': (iter_df_guards, _render_scalar_signal),
     'interrupt': (iter_interrupts, _render_scalar_signal),
+    'designed_outcomes': (iter_designed_outcomes, _render_designed_outcomes),
 }
 """(detector, item-renderer) pair per section key, keyed identically to
-SECTION_HEADINGS/SECTION_PRIORITY."""
+SECTION_HEADINGS/SECTION_PRIORITY.
+
+'error_neighborhoods' detects via :func:`iter_genuine_errors`, NOT
+:func:`iter_error_neighborhoods` -- the two halves of that partition
+render in separate sections, so each neighborhood appears exactly once
+in the body (task 3610)."""
 
 ITEM_TRUNCATION_MARKER = '... [item truncated]'
 """Appended to a per-item line that exceeded its byte cap. Explicit and
