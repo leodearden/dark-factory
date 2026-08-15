@@ -1051,6 +1051,39 @@ class TestMergeGraphFamily:
         assert summary['blocked'] == []
 
     @pytest.mark.asyncio
+    async def test_summary_surfaces_merge_mentions_dropped_census(self, monkeypatch):
+        """Phase B's dropped-MENTIONS census (task 4183) is passed through to
+        the summary VERBATIM, under the same "never silently dropped"
+        convention as dropped_cross_target/blocked -- and, being purely
+        informational, must NOT by itself downgrade the family's disposition
+        (run()'s MERGE->UNRESOLVED predicate keys on real loss signals, not
+        on this census).
+        """
+        recreate_result = SubgraphEdgeResult(
+            merge_mentions_dropped=2,
+            merge_mentions_dropped_uuids=['episode-1', 'episode-2'],
+        )
+        self._patch_primitives(monkeypatch, recreate_result=recreate_result)
+        entity_rows = [{'uuid': 'entity-1', 'name': 'Alice'}]
+        episode_rows = [{'uuid': 'episode-1'}]
+
+        summary = await _mod.merge_graph_family(
+            MagicMock(), 'know-live', 'know_live', entity_rows, episode_rows,
+        )
+
+        assert summary['merge_mentions_dropped'] == 2
+        assert summary['merge_mentions_dropped_uuids'] == ['episode-1', 'episode-2']
+
+        # the census carries no loss signal of its own, so every input to
+        # run()'s MERGE->UNRESOLVED downgrade predicate stays clean.
+        assert summary['edges_skipped'] == 0
+        assert summary['mentions_skipped'] == 0
+        assert summary['dropped_cross_target'] == []
+        assert summary['blocked'] == []
+        assert summary['nodes_blocked'] == 0
+        assert summary['episodes_blocked'] == 0
+
+    @pytest.mark.asyncio
     async def test_empty_family_makes_no_primitive_calls_and_zeroed_summary(self, monkeypatch):
         """No entity rows and no episode rows -> none of the three-phase
         primitives are called, and the summary is all-zero/empty."""
@@ -1070,6 +1103,7 @@ class TestMergeGraphFamily:
             'edges_recreated': 0, 'edges_skipped': 0,
             'mentions_recreated': 0, 'mentions_skipped': 0,
             'dropped_cross_target': [], 'blocked': [],
+            'merge_mentions_dropped': 0, 'merge_mentions_dropped_uuids': [],
         }
 
 
