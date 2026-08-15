@@ -31,7 +31,12 @@ import json
 import pytest
 
 from orchestrator import verify_classify
-from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES, FailureCategory
+from orchestrator.verify_categories import (
+    CATEGORY_POLICY,
+    INFRA_TRANSIENT_CATEGORIES,
+    FailureCategory,
+    RetryKind,
+)
 from orchestrator.verify_cmd import ToolKind
 
 # Every recognised tool identity, including OPAQUE — the guards in step-1
@@ -1526,6 +1531,96 @@ class TestBrokenWorktreeOrderingNegatives:
             _classify(ToolKind.OPAQUE, _SEMAPHORE_TIMEOUT_SLOT_OUTPUT, 1, False)
             == FailureCategory.SEMAPHORE_TIMEOUT
         )
+
+
+# ---------------------------------------------------------------------------
+# task 4126, recovered from the task-3679 review: verify_classify.py:421 has
+# cited a class named ``TestAnchoredSlotTimeoutWithCollateralIsEnvTransient``
+# since task 3679 landed, but no such class existed anywhere in the repo —
+# the ORDERING note's co-occurrence tie (an anchored slot-timeout marker and
+# a merge-verify restart-collateral shape in ONE aggregated output) was
+# documented but never pinned.
+#
+# GREEN today (measured against the live module on this branch, not
+# assumed): all 420 tool x shape x order combinations below already classify
+# ENV_TRANSIENT — the arm order in ``_classify_environmental`` already
+# resolves the tie correctly. The defect is missing PROTECTION of that
+# ordering, not wrong behaviour, so this class is green on arrival by
+# design; see its docstring for the mutation-kill that supplies the RED half.
+# ---------------------------------------------------------------------------
+
+_SLOT_TIMEOUT_WITH_COLLATERAL_CASES: list[tuple[str, str]] = [
+    (f'{slot_name}+{shape_name}:{order_name}', combined)
+    for slot_name, slot in _ANCHORED_SLOT_TIMEOUT_SHAPES
+    for shape_name, collateral in _ALL_COLLATERAL_SHAPES
+    for order_name, combined in (
+        ('slot_first', slot + collateral),
+        ('collateral_first', collateral + slot),
+    )
+]
+
+
+class TestAnchoredSlotTimeoutWithCollateralIsEnvTransient:
+    """task 4126 (recovered from the task-3679 review): pins the
+    co-occurrence tie the ORDERING note in ``_classify_environmental``'s
+    docstring documents — an anchored slot-timeout marker (the
+    ``_ANCHORED_SLOT_TIMEOUT_SHAPES`` corpus above) co-occurring, in ONE
+    aggregated output, with a merge-verify restart-collateral shape (the
+    ``_ALL_COLLATERAL_SHAPES`` corpus above) — which resolves ENV_TRANSIENT,
+    not SEMAPHORE_TIMEOUT, because the removed worktree is the more specific
+    root cause and the only one of the two with a recovery path.
+
+    GREEN ON ARRIVAL, by design: every combination below already classifies
+    ENV_TRANSIENT on this branch (measured before this class was written),
+    because the three ENV_TRANSIENT branches in ``_classify_environmental``
+    are all evaluated before the SEMAPHORE_TIMEOUT arm. The defect this
+    class fixes is that nothing PINNED that ordering, not that the ordering
+    was wrong — so there is no failing assertion to author.
+
+    The RED half is instead a recorded mutation-kill: hoisting the
+    SEMAPHORE_TIMEOUT arm (``_SLOT_TIMEOUT_SENTINEL_RE`` /
+    ``_SLOT_ACQUIRE_DEADLINE_RE``, verify_classify.py:571-572) to sit
+    immediately after the two DISK_FULL checks and before
+    ``_VERIFY_ENV_BROKEN_RE`` flips every one of this class's 480 cases to
+    SEMAPHORE_TIMEOUT (measured), while
+    ``TestReplayedMergeVerifyCollateralWinsOverSemaphore``,
+    ``TestMergeVerifyCollateralEnvGuard``,
+    ``TestGroundedSlotTimeoutMarkersAreDetected`` and
+    ``TestBrokenWorktreeOrderingNegatives`` all stay green under that same
+    mutation (also measured) — demonstrating, not merely asserting, the
+    ORDERING note's claim that the replayed 5164/5071 fixtures "pin nothing
+    about this tie". See the task-4126 commit message for both recorded
+    runs.
+
+    The narrowness side — an anchored slot timeout with NO collateral still
+    classifies SEMAPHORE_TIMEOUT — is deliberately NOT re-asserted here: it
+    is already pinned once, by ``TestBrokenWorktreeOrderingNegatives.
+    test_genuine_slot_timeout_without_collateral_stays_semaphore_timeout``
+    and by ``TestGroundedSlotTimeoutMarkersAreDetected`` above."""
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    @pytest.mark.parametrize(('case_id', 'output'), _SLOT_TIMEOUT_WITH_COLLATERAL_CASES)
+    def test_anchored_slot_timeout_with_collateral_is_env_transient(self, tool, case_id, output):
+        result = _classify(tool, output, 1, False)
+        assert result == FailureCategory.ENV_TRANSIENT, (
+            f'case {case_id!r} must classify ENV_TRANSIENT under {tool!r}, got {result!r}'
+        )
+        assert result != FailureCategory.SEMAPHORE_TIMEOUT, (
+            f'case {case_id!r} must not classify SEMAPHORE_TIMEOUT under {tool!r}'
+        )
+
+    @pytest.mark.parametrize(('case_id', 'output'), _SLOT_TIMEOUT_WITH_COLLATERAL_CASES)
+    def test_anchored_slot_timeout_with_collateral_keeps_recovery_path(self, case_id, output):
+        """Pins the CONSEQUENCE the ORDERING note names, not just the label:
+        ENV_TRANSIENT carries a bounded self-recovery
+        (``RetryKind.ENV_SERIAL``), where SEMAPHORE_TIMEOUT's
+        ``RetryKind.NONE`` would instead surface to a human."""
+        result = _classify(ToolKind.OPAQUE, output, 1, False)
+        assert CATEGORY_POLICY[result].retry_kind is RetryKind.ENV_SERIAL, (
+            f'case {case_id!r} must keep the ENV_SERIAL recovery path, got {result!r}'
+        )
+        assert CATEGORY_POLICY[result].retry_kind is not RetryKind.NONE
+        assert result in INFRA_TRANSIENT_CATEGORIES
 
 
 # step-9: verify._summarize_checks must thread the per-check config command
