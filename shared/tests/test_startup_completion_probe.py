@@ -18,10 +18,14 @@ every test in ``TestScrubValueScrubsDictKeys``, ``TestScrubbedKeysDoNotCollide``
 and ``TestEncodedDomainParity`` must fail.  Before this was enforced, only 3 of
 them did.
 
-Every test here is fast and OFFLINE: the ``run_live_probe`` tests inject their
-failure before ``subprocess.Popen``, monkeypatch ``_cli_version``/``_oauth_token``
-and pin ``TaskConfigDir`` at ``tmp_path``, so nothing spawns a CLI, nothing spends
-money and no real token is ever written.  They are deliberately unmarked (no
+Every test here is fast, OFFLINE and SANDBOXED: the ``run_live_probe`` tests
+inject their failure before ``subprocess.Popen``, monkeypatch
+``_cli_version``/``_oauth_token`` and pin ``TaskConfigDir`` at ``tmp_path``, so
+nothing spawns a CLI, nothing spends money and no real token is ever written.
+Sandboxed is the third leg and not automatic: ``run_live_probe`` opens with a
+dead-PID sweep that recursively deletes under the real system tempdir, so the
+autouse ``_confine_stale_dir_sweep`` fixture re-bases it under ``tmp_path``.  No
+test in this module may delete anything it did not itself create.  They are deliberately unmarked (no
 ``@pytest.mark.integration``) so these fixes stay covered on every ordinary run.
 """
 
@@ -44,6 +48,11 @@ from shared.config_dir import _PID_SUFFIX_RE, CONFIG_DIR_PREFIX
 #: A long base64url run: 70 chars, no ``/`` neighbours, so it trips
 #: ``GENERIC_CREDENTIAL_PATTERNS`` exactly as a raw pasted token would.
 _LONG_RUN = 'A' * 70
+
+#: One above the kernel's maximum ``pid_max`` (2**22), so no process can ever
+#: hold it and the sweep's PID-liveness guard is guaranteed to read it as dead.
+#: A merely "probably free" PID would make the sweep tests flaky by reuse.
+_DEAD_PID = 4194305
 
 
 def _minimal_observation(**overrides: Any) -> dict[str, Any]:
@@ -68,6 +77,54 @@ def _minimal_observation(**overrides: Any) -> dict[str, Any]:
     }
     observation.update(overrides)
     return observation
+
+
+@pytest.fixture
+def sweep_root(tmp_path) -> Path:
+    """The directory the dead-PID sweep is confined to for the duration of a test."""
+    root = tmp_path / 'sweep-root'
+    root.mkdir()
+    return root
+
+
+@pytest.fixture(autouse=True)
+def _confine_stale_dir_sweep(monkeypatch, sweep_root) -> None:
+    """Re-base the dead-PID sweep under ``tmp_path`` for EVERY test in this module.
+
+    ``run_live_probe``'s first statement is ``_sweep_stale_probe_dirs_once()``,
+    which recursively deletes ``claude-config-startup-probe-*`` dirs under the
+    real system tempdir.  Nothing in the fixtures used to stop it, so every test
+    reaching ``run_live_probe`` destroyed files OUTSIDE the pytest sandbox —
+    measured, not theorised: a planted ``/tmp/claude-config-startup-probe-healthy
+    -999999`` was gone after one ``pytest`` run of this module.  The plausible
+    victim is a dir an operator deliberately kept with ``--keep-config-dir``, and
+    it also falsified this module's "fast and OFFLINE" claim.
+
+    AUTOUSE and module-wide rather than folded into ``probe_recorder``, because
+    the hazard belongs to the module, not to one fixture: a future test that
+    calls ``_sweep_stale_probe_dirs_once`` directly would otherwise re-open it.
+
+    Confined rather than stubbed out, mirroring how ``probe_recorder`` keeps the
+    REAL ``TaskConfigDir`` and only re-bases it: the production sweep still runs,
+    so its prefix/PID-suffix wiring stays genuinely exercised (see
+    ``test_a_dead_pid_probe_dir_is_really_reclaimed``), it just cannot reach
+    anything it did not create.  ``sweep_calls`` layers its recording stub on top
+    for the tests that assert on call counts.
+
+    The ``_probe_dir_sweep_done`` reset keeps the once-per-process flag from
+    making a test's behaviour depend on which test ran first.
+    """
+    real_sweep = probe.sweep_stale_pid_dirs
+
+    def _confined_sweep(prefix: str, **kwargs: Any) -> int:
+        # A DEDICATED root, not tmp_path itself: the probe's own live config dir
+        # is created under tmp_path, and a sweep that could see it would be one
+        # PID-liveness guard away from deleting the very dir under test.
+        kwargs.setdefault('base_dir', sweep_root)
+        return real_sweep(prefix, **kwargs)
+
+    monkeypatch.setattr(probe, 'sweep_stale_pid_dirs', _confined_sweep, raising=False)
+    monkeypatch.setattr(probe, '_probe_dir_sweep_done', False, raising=False)
 
 
 def _encoded_is_clean(value: Any) -> bool:
@@ -879,6 +936,35 @@ class TestStaleProbeDirSweep:
             'unattributable and deliberately leaves it alone'
         )
         assert match.group(1) == str(os.getpid())
+
+    def test_a_dead_pid_probe_dir_is_really_reclaimed(self, sweep_root):
+        # The end-to-end complement to the string-equality test above, and the
+        # only test that runs the REAL sweep: every other one stubs it, so a
+        # prefix that matched by string but not by what sweep_stale_pid_dirs
+        # actually globs would go unnoticed.  Confined to sweep_root by the
+        # autouse _confine_stale_dir_sweep fixture.
+        stale = sweep_root / f'{probe._PROBE_DIR_PREFIX}healthy-{_DEAD_PID}'
+        stale.mkdir()
+        (stale / '.credentials.json').write_text('{}')
+        # Clear the mtime floor: the sweep deliberately ignores anything younger
+        # than min_age_secs.
+        os.utime(stale, (0, 0))
+
+        assert probe._sweep_stale_probe_dirs_once() == 1, (
+            f'{stale.name!r} was not reclaimed — the probe creates dirs the sweep '
+            f'it calls cannot actually see'
+        )
+        assert not stale.exists()
+
+    def test_a_live_pid_probe_dir_is_left_alone(self, sweep_root):
+        # The other half of the contract: reclaiming a LIVE process's dir would
+        # pull the config dir out from under a concurrent probe.
+        live = sweep_root / f'{probe._PROBE_DIR_PREFIX}healthy-{os.getpid()}'
+        live.mkdir()
+        os.utime(live, (0, 0))
+
+        assert probe._sweep_stale_probe_dirs_once() == 0
+        assert live.exists(), 'a live-PID dir must never be reclaimed'
 
     def test_run_live_probe_sweeps_once_with_the_probe_prefix(
         self, probe_recorder, sweep_calls, monkeypatch, tmp_path
