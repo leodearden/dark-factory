@@ -946,12 +946,32 @@ MEASURED_USED_MIB = 7362
 MEASURED_FREE_MIB = 16761
 
 
+#: The arm's OWN container, as nvidia-smi sees it: arms run as docker
+#: containers and nvidia-smi reports HOST pids, so a containerised vLLM appears
+#: as an ordinary `python` compute app indistinguishable from any other.  That
+#: is why probe-time pollution cannot be judged by the baseline's allowlist.
+ARM_CONSUMER = lms_vram.GpuConsumer(
+    pid=910001, process_name='python', used_mib=MEASURED_USED_MIB - 3312,
+)
+
+#: ollama as measured on this host 2026-08-06, qwen3:14b resident on
+#: keep_alive.  The reading that motivated the pollution guard.
+OLLAMA_CONSUMER = lms_vram.GpuConsumer(
+    pid=905936, process_name='/usr/local/lib/ollama/llama-server', used_mib=10314,
+)
+
+
 def _snapshot(
     used_mib=MEASURED_USED_MIB,
     total_mib=MEASURED_TOTAL_MIB,
     free_mib=MEASURED_FREE_MIB,
+    consumers=None,
 ) -> lms_vram.GpuSnapshot:
-    """The measured host reading, as one injected GPU snapshot."""
+    """The measured host reading, as one injected GPU snapshot.
+
+    The default inventory is the arm's own container and nothing else: the
+    clean case, and the one every pre-existing test in this file assumes.
+    """
     return lms_vram.GpuSnapshot(
         identity=lms_vram.GpuIdentity(
             name='NVIDIA GeForce RTX 3090', driver_version='580.159.04',
@@ -959,6 +979,7 @@ def _snapshot(
         reading=lms_vram.GpuReading(
             total_mib=total_mib, used_mib=used_mib, free_mib=free_mib,
         ),
+        consumers=[ARM_CONSUMER] if consumers is None else consumers,
     )
 
 
@@ -1535,6 +1556,7 @@ def test_merging_refuses_reports_from_different_gpus():
     other_card = lms_vram.GpuSnapshot(
         identity=lms_vram.GpuIdentity(name='NVIDIA A100', driver_version='999'),
         reading=_snapshot().reading,
+        consumers=_snapshot().consumers,
     )
     second = _single(_arm(arm_id='phi-4-14b', served_model_name='phi-4-14b',
                           port=8412), snapshot=other_card)

@@ -318,12 +318,19 @@ class GpuBaseline(BaseModel):
 
 
 class GpuSnapshot(BaseModel):
-    """One atomic "what the GPU is and what it currently holds"."""
+    """One atomic "what the GPU is, what it holds, and who is holding it".
+
+    *consumers* is REQUIRED, not optional.  An optional inventory would let a
+    call site build a snapshot carrying no evidence about who else held the
+    card at the moment of the reading, and downstream that absence reads as
+    "nobody else was there".
+    """
 
     model_config = ConfigDict(frozen=True)
 
     identity: GpuIdentity
     reading: GpuReading
+    consumers: list[GpuConsumer]
 
 
 class BudgetVerdict(BaseModel):
@@ -683,13 +690,17 @@ def classify_pollution(
 
 
 def probe_gpu_snapshot(runner: GpuRunner | None = None) -> GpuSnapshot:
-    """Identity plus a live memory reading, as one value.
+    """Identity, a live memory reading, and who is holding it, as one value.
 
-    Two nvidia-smi calls rather than one wide query, so the strict three-field
+    Three nvidia-smi calls rather than one wide query, so the strict three-field
     memory parser -- the one whose failure would misreport the budget -- keeps
     its exact shape and its existing coverage.
     """
-    return GpuSnapshot(identity=probe_gpu_identity(runner), reading=probe_gpu(runner))
+    return GpuSnapshot(
+        identity=probe_gpu_identity(runner),
+        reading=probe_gpu(runner),
+        consumers=probe_gpu_consumers(runner),
+    )
 
 
 def gpu_memory_utilization_for(budget_gib: float, total_gib: float) -> float:
