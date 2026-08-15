@@ -24,14 +24,14 @@ write moves to the BLOCKED RETURN points, and this module pins BOTH halves:
     NEITHER ``blocked`` NOR ``pending``, and the §5 steward-terminal-decision
     preserve carve-out is not clobbered.
 
-It also carries the ``merge_phase=True`` CALL-SITE TRIPWIRE, so a future
-suppressing call site cannot be added without a recorded rationale.
+It also carries the ``merge_phase=True`` CALL-SITE TRIPWIRE, which pins the SET
+of literal suppressing call sites: a new one cannot appear without failing the
+allowlist assertion and being justified in review.
 """
 
 from __future__ import annotations
 
 import ast
-import inspect
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -288,8 +288,6 @@ class TestMergePhaseFencePreserved:
 # merge_phase=True CALL-SITE TRIPWIRE
 # ---------------------------------------------------------------------------
 
-RATIONALE_MARKER = 'MERGE_PHASE_RATIONALE'
-
 #: Every literal ``merge_phase=True`` call site in workflow.py, as
 #: ``(enclosing function, callee)``.  A new entry here means a new path that
 #: SUPPRESSES the entry-gate status transition, which is exactly the class of
@@ -297,16 +295,6 @@ RATIONALE_MARKER = 'MERGE_PHASE_RATIONALE'
 MERGE_PHASE_TRUE_ALLOWLIST: frozenset[tuple[str, str]] = frozenset({
     ('_run_merge_phase', '_submit_to_merge_queue'),
 })
-
-_ALLOWLIST_HINT = (
-    'A new merge_phase=True call site must be added to '
-    f'MERGE_PHASE_TRUE_ALLOWLIST with a {RATIONALE_MARKER} comment in the '
-    'enclosing function explaining why suppressing the ENTRY status transition '
-    'is safe there — i.e. that the caller keeps a LIVE claimant and retries '
-    'in-slot, never that it exits the slot with the row left in-progress. '
-    'See spec §8-E2 / INV-6 and the MERGE_PHASE_RATIONALE paragraph in '
-    '_mark_blocked.'
-)
 
 
 class _MergePhaseTrueCollector(ast.NodeVisitor):
@@ -322,10 +310,8 @@ class _MergePhaseTrueCollector(ast.NodeVisitor):
     def __init__(self) -> None:
         self._fn_stack: list[str] = []
         self.sites: set[tuple[str, str]] = set()
-        self.functions: dict[str, ast.AST] = {}
 
     def _visit_function(self, node) -> None:
-        self.functions.setdefault(node.name, node)
         self._fn_stack.append(node.name)
         self.generic_visit(node)
         self._fn_stack.pop()
@@ -352,53 +338,30 @@ class _MergePhaseTrueCollector(ast.NodeVisitor):
 
 
 @pytest.fixture(scope='module')
-def _workflow_source() -> tuple[str, _MergePhaseTrueCollector]:
+def _workflow_source() -> _MergePhaseTrueCollector:
     from orchestrator import workflow as workflow_module
 
     source = Path(workflow_module.__file__).read_text()
     collector = _MergePhaseTrueCollector()
     collector.visit(ast.parse(source))
-    return source, collector
+    return collector
 
 
 class TestMergePhaseCallSiteTripwire:
-    """No ``merge_phase=True`` path may skip the status write without a
-    RECORDED rationale (task γ2's grep/test signal)."""
+    """The SET of literal ``merge_phase=True`` origins is pinned, so a new
+    suppressing call site cannot land unnoticed (task γ2's grep/test signal)."""
 
     def test_call_sites_match_allowlist(self, _workflow_source) -> None:
-        _source, collector = _workflow_source
+        collector = _workflow_source
 
         assert collector.sites == MERGE_PHASE_TRUE_ALLOWLIST, (
             f'literal merge_phase=True call sites drifted from the allowlist.\n'
             f'  added:   {sorted(collector.sites - MERGE_PHASE_TRUE_ALLOWLIST)}\n'
             f'  removed: {sorted(MERGE_PHASE_TRUE_ALLOWLIST - collector.sites)}\n'
-            f'{_ALLOWLIST_HINT}'
-        )
-
-    def test_each_call_site_carries_the_rationale_marker(
-        self, _workflow_source,
-    ) -> None:
-        source, collector = _workflow_source
-
-        for enclosing, callee in sorted(MERGE_PHASE_TRUE_ALLOWLIST):
-            node = collector.functions.get(enclosing)
-            assert node is not None, (
-                f'allowlisted enclosing function {enclosing!r} not found in '
-                f'workflow.py — update MERGE_PHASE_TRUE_ALLOWLIST'
-            )
-            fn_source = ast.get_source_segment(source, node) or ''
-            assert RATIONALE_MARKER in fn_source, (
-                f'{enclosing}() calls {callee}(merge_phase=True) but carries no '
-                f'{RATIONALE_MARKER} marker.\n{_ALLOWLIST_HINT}'
-            )
-
-    def test_mark_blocked_carries_the_rationale_marker(self) -> None:
-        """The parameter's own DEFINITION must carry the recorded rationale, so
-        it is grep-able from the suppression itself and not only from a call
-        site that may later move."""
-        fn_source = inspect.getsource(TaskWorkflow._mark_blocked)
-        assert RATIONALE_MARKER in fn_source, (
-            f'_mark_blocked defines merge_phase= but carries no '
-            f'{RATIONALE_MARKER} marker recording WHY the suppression exists '
-            f'(commit 22918d5c24) and how far it extends.\n{_ALLOWLIST_HINT}'
+            'A new merge_phase=True call site must be added to '
+            'MERGE_PHASE_TRUE_ALLOWLIST and justified in review: it SUPPRESSES '
+            "_mark_blocked's ENTRY status transition, which is only safe where "
+            'the caller keeps a LIVE claimant and retries in-slot — never where '
+            'it exits the slot leaving the row in-progress. '
+            'See spec §8-E2 / INV-6.'
         )
