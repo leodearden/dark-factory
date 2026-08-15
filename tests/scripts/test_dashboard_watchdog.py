@@ -1736,5 +1736,65 @@ def test_i5_main_exits_zero_on_a_normal_tick(monkeypatch, state_env, queue_env):
     assert mod.main() == 0
 
 
+# ---------------------------------------------------------------------------
+# log() — the never-raises contract (task 4106, parity with task 3392's
+# orchestrator-watchdog fix)
+# ---------------------------------------------------------------------------
+
+
+def test_log_never_raises_when_the_stderr_fallback_itself_fails(monkeypatch):
+    """The stderr fallback is best-effort too: it must not raise even when
+    stderr itself is a broken pipe or a full/failing journal socket.
+
+    dashboard-watchdog has no per-unit loop (unlike orchestrator-watchdog,
+    whose main() calls log() from inside a per-unit ``except Exception``).
+    The real damage here is that an escaping OSError aborts tick() MID-BRANCH:
+    every log() call site in tick() (lines 768, 778, 835) is ordered BEFORE
+    the save_state() it narrates, so a streak reset or the ``ceiling_open``
+    write would be silently skipped. A skipped streak reset arms a restart of
+    a *healthy* dashboard on the very next missed probe — and this all lands
+    on a 30s timer, twice as tight as orchestrator-watchdog's 60s.
+    """
+    wdog = _load_watchdog()
+
+    def fake_run(argv, *args, **kwargs):
+        raise FileNotFoundError("systemd-cat not found")
+
+    class _BrokenStderr:
+        def write(self, _s: str) -> int:
+            raise BrokenPipeError("stderr is gone too")
+
+        def flush(self) -> None:
+            raise BrokenPipeError("stderr is gone too")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog.sys, "stderr", _BrokenStderr())
+
+    wdog.log("hello")  # must not raise — both journal routes are gone
+
+
+def test_log_stderr_fallback_still_emits_when_stderr_is_healthy(monkeypatch, capsys):
+    """The stderr fallback must still emit the message when stderr is healthy.
+
+    Pins the PLACEMENT of the coming OSError-suppress guard: it has to wrap
+    only the fallback print, not the whole try/except (which would also
+    swallow the original systemd-cat OSError before ever trying stderr) and
+    not simply delete the print. Green today and must stay green — this test
+    is what stops the companion never-raises test above from being satisfied
+    by the wrong fix.
+    """
+    wdog = _load_watchdog()
+
+    def fake_run(argv, *args, **kwargs):
+        raise FileNotFoundError("systemd-cat not found")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    wdog.log("hello")
+
+    captured = capsys.readouterr()
+    assert "hello" in captured.err, f"expected the message on stderr, got: {captured!r}"
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))
