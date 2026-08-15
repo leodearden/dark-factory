@@ -1713,9 +1713,38 @@ class TestSelfOwnedLaneLockLeak:
         fd = await GitOps._acquire_lane_flock_off_thread(lock_path, 1.0)
         assert fd is not None
         try:
-            assert os.getpid() in lane_lock_holder_pids(lock_path), (
-                'staging error: the kernel must see us as a holder, or layer '
-                '(1) would be what returns None here'
+            # Bounded poll, NOT a one-shot `lane_lock_holder_pids` read: this
+            # staging assertion was observed failing `assert 1986528 in []`
+            # under 24-worker xdist load — the same transient
+            # `wait_for_lane_lock_holder` was introduced to absorb (see its
+            # docstring's `assert 658016 in []`), just at a call site that was
+            # never migrated onto it.
+            #
+            # Mechanism, measured on this host: `/proc/locks` is a seq_file the
+            # kernel serves one PAGE per read(2) regardless of the caller's
+            # buffer (a 13062-byte table took 4 reads even for a 1 MiB
+            # request), and each read restarts the per-CPU lock-list walk from
+            # a POSITIONAL index — so a lock released at an earlier position
+            # between chunks shifts every later record down and ours is skipped
+            # outright.  Reproduced at 1.54% of reads (144/9337) against a real
+            # held flock with 24 concurrent churners, which is exactly why this
+            # is green in isolation and red only in a full parallel suite.
+            #
+            # Nothing is being waited FOR here: we already hold the fd, so the
+            # kernel fact is settled the instant `_acquire_lane_flock_off_thread`
+            # returns.  Only a lossy READ of that settled fact is being retried
+            # past — hence the procfs-read-class bound
+            # (:data:`_LANE_LOCK_STRICT_READ_SECS`) rather than the helper's
+            # default 12.0s spawn-latency class: no process is spawned here, and
+            # a re-read either succeeds in microseconds or is structurally
+            # broken, so a wider bound would only delay a certain failure.
+            holders = wait_for_lane_lock_holder(
+                lock_path, os.getpid(), timeout=_LANE_LOCK_STRICT_READ_SECS,
+            )
+            assert os.getpid() in holders, (
+                f'staging error: the kernel must see us as a holder, or layer '
+                f'(1) would be what returns None here; observed '
+                f'holders={holders!r}'
             )
             assert real_git_ops._lane_lock_self_owned_leak(lock_path, 1.0) is None, (
                 'an fd taken through the registered acquire seam is a LIVE '
