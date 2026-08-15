@@ -98,6 +98,7 @@ __all__ = [
     'LANE_PLANS',
     'NEVER_TOUCH',
     'PREFILTER_NEEDLES',
+    'REASON_CHANGED_UNDER_US',
     'REASON_DANGLING_SYMLINK',
     'REASON_FORMAT_NOT_REPRODUCIBLE',
     'REASON_LIVE_LANE_PRESENT',
@@ -109,6 +110,7 @@ __all__ = [
     'REASON_SELF_NAMING_TAIL',
     'REASON_UNPARSEABLE',
     'REASON_UNREPAIRABLE',
+    'REASON_UNSANCTIONED_ESCALATION_LOCATION',
     'REASON_UNSANCTIONED_PLAN_LOCATION',
     'REASON_VERIFY_FAILED',
     'REASON_WRITE_FAILED',
@@ -266,6 +268,16 @@ NEVER_TOUCH: frozenset[str] = frozenset({
 #: renderer, the tests and the operator all key on ONE spelling.
 REASON_NEVER_TOUCH = 'never-touch'
 REASON_UNSANCTIONED_PLAN_LOCATION = 'unsanctioned-plan-location'
+#: The escalations-lane counterpart of the plans-lane location gate. The
+#: asymmetry it removes was accidental rather than argued: ``discover_targets``
+#: walks with ``rglob('*.json')`` and ``is_file()``, and BOTH follow symlinked
+#: FILES, so a link at ``data/escalations/x.json`` pointing at a
+#: terminal-record-shaped file anywhere on the filesystem would be
+#: realpath-resolved by :func:`resolve_write_target` and then rewritten
+#: entirely outside the repo. The plans lane already refuses exactly that shape
+#: (:func:`_is_sanctioned_plan_location`); this makes the escalations lane
+#: refuse it too, with its own spelling so the report names the lane.
+REASON_UNSANCTIONED_ESCALATION_LOCATION = 'unsanctioned-escalation-location'
 #: The orphaned plan's symlink target no longer exists. Refused rather than
 #: followed, because os.replace onto a dangling link CREATES a regular file —
 #: inventing a plan for a lane whose meta-root was already reclaimed.
@@ -351,7 +363,16 @@ def resolve_write_target(target: Target, root: Path | str) -> ResolvedTarget | R
     plan is a symlink — so a link pointing at committed evidence has to be
     caught by its target, not its name.
 
-    :data:`NEVER_TOUCH` is checked BEFORE the plan-location gate so the refusal
+    BOTH lanes are containment-gated, symmetrically: a resolved escalation must
+    still be under ``data/escalations`` and a resolved plan must still be one of
+    the two sanctioned plan shapes. Neither lane's discovery excludes symlinked
+    files, so without the containment check the realpath resolution that makes
+    the write land on the right FILE would equally happily land it outside the
+    repo. The lane roots are themselves realpath-resolved before the comparison,
+    so a checkout reached through a symlinked parent is contained rather than
+    refused wholesale.
+
+    :data:`NEVER_TOUCH` is checked BEFORE either location gate so the refusal
     names the real hazard rather than a generic location miss.
 
     This function performs no I/O beyond path resolution and never writes.
@@ -361,6 +382,15 @@ def resolve_write_target(target: Target, root: Path | str) -> ResolvedTarget | R
 
     if _matches_never_touch(target.path) or _matches_never_touch(resolved):
         return Refusal(path=target.path, lane=target.lane, reason=REASON_NEVER_TOUCH)
+
+    if target.lane == LANE_ESCALATIONS:
+        lane_root = Path(os.path.realpath(root_real.joinpath(*_ESCALATIONS_DIR)))
+        if not resolved.is_relative_to(lane_root):
+            return Refusal(
+                path=target.path,
+                lane=target.lane,
+                reason=REASON_UNSANCTIONED_ESCALATION_LOCATION,
+            )
 
     if target.lane == LANE_PLANS:
         if not _is_sanctioned_plan_location(resolved, root_real):
@@ -919,6 +949,17 @@ def round_trips(raw: str, obj: Any) -> bool:
 REASON_WRITE_FAILED = 'write-failed'
 #: The temp file did not re-parse as JSON, so it was never swapped in.
 REASON_VERIFY_FAILED = 'verify-failed'
+#: The target's bytes changed between the read the repair was computed from and
+#: the swap, so the swap was SKIPPED.
+#:
+#: :data:`TERMINAL_STATUSES` makes a concurrent write unlikely, not impossible
+#: — the queue's ``{escalation_id}.json.lock`` sidecar is deliberately not
+#: taken, and a terminal record is not strictly immutable (triage stamping and
+#: archive moves both rewrite one). Without this check the swap would silently
+#: REVERT that concurrent update, because the payload is a full
+#: re-serialization of a parse taken before it. One extra read per repaired
+#: file (26 live) buys a lost update becoming a reported, re-runnable failure.
+REASON_CHANGED_UNDER_US = 'changed-under-us'
 
 #: Prefix for this sweep's temp files. Dot-prefixed so a crashed run's debris
 #: is excluded by the same dot rule discovery uses, and named so an operator
@@ -970,9 +1011,15 @@ def write_repaired(
     3. restore the target's permission bits BEFORE the swap, so the file is
        never briefly 0600 and never left that way.
     4. verify the temp RE-PARSES as JSON.
-    5. ``os.replace``.
+    5. re-read the target and confirm it is still *raw* — the bytes this
+       repair was computed from. See :data:`REASON_CHANGED_UNDER_US`: the
+       payload is a full re-serialization of a parse taken before the read, so
+       swapping it over someone else's concurrent write would silently REVERT
+       that write. Checked as late as possible, immediately before the swap, so
+       the window it leaves is a single ``os.replace``.
+    6. ``os.replace``.
 
-    Verifying before replacing is what makes step 5 safe to be the only
+    Verifying before replacing is what makes step 6 safe to be the only
     destructive operation: whatever lands is already known to parse.
 
     ``target.write_path`` is the realpath-resolved file, so the swap lands on
@@ -1006,6 +1053,18 @@ def write_repaired(
         reason = REASON_VERIFY_FAILED
         with open(tmp_path, encoding='utf-8') as verify_handle:
             json.load(verify_handle)
+
+        # The last-moment lost-update check. A raise from this read (the file
+        # was deleted or replaced by something unreadable) is ALSO a
+        # changed-under-us, which is why `reason` is set before it runs.
+        reason = REASON_CHANGED_UNDER_US
+        if write_path.read_text(encoding='utf-8') != raw:
+            return WriteFailure(
+                path=write_path,
+                lane=target.lane,
+                reason=REASON_CHANGED_UNDER_US,
+                error='the target changed between the read and the swap',
+            )
 
         reason = REASON_WRITE_FAILED
         os.replace(tmp_path, write_path)

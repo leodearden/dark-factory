@@ -607,6 +607,55 @@ def test_plan_symlink_outside_the_sanctioned_locations_is_refused(sweep_root, tm
     assert outside.read_bytes() == before
 
 
+def test_escalation_symlink_resolving_outside_the_lane_is_refused(sweep_root, tmp_path):
+    """The escalations lane's containment gate — the plans lane's counterpart.
+
+    ``discover_targets`` walks with ``rglob('*.json')`` and ``is_file()``, and
+    BOTH follow symlinked FILES. Without this gate the realpath resolution that
+    makes the swap land on the right file would just as happily land it outside
+    the repo entirely: a link under ``data/escalations`` pointing at any
+    terminal-record-shaped file anywhere on the filesystem would be rewritten.
+
+    The decoy below is deliberately ``resolved`` AND repairable, so no other
+    gate can be what stops it — the terminal-status gate passes it, and only the
+    location check refuses.
+    """
+    outside = tmp_path / 'elsewhere' / 'esc-out.json'
+    write_escalation(
+        outside,
+        make_escalation(
+            'esc-out-1',
+            'resolved',
+            _swallowed('Outside the repo.', 'detail', 'suggested_action', 'x'),
+        ),
+    )
+    before = outside.read_bytes()
+
+    link = sweep_root / 'data' / 'escalations' / 'esc-link.json'
+    os.symlink(str(outside), str(link))
+
+    refusal = sweep.resolve_write_target(
+        sweep.Target(path=link, lane=sweep.LANE_ESCALATIONS), sweep_root
+    )
+    assert isinstance(refusal, sweep.Refusal)
+    assert refusal.reason == sweep.REASON_UNSANCTIONED_ESCALATION_LOCATION
+
+    # ...and the whole pipeline honours it, under --apply, on the real tree.
+    summary, _diffs = sweep.run_sweep(sweep_root, apply=True)
+    assert summary.skipped.get(sweep.REASON_UNSANCTIONED_ESCALATION_LOCATION) == 1
+    assert outside.read_bytes() == before, 'nothing outside the repo was rewritten'
+
+    # The gate must not cost the lane its legitimate targets.
+    in_lane = sweep.resolve_write_target(
+        sweep.Target(
+            path=sweep_root / 'data/escalations/archive/2026-08-08/esc-2-1.json',
+            lane=sweep.LANE_ESCALATIONS,
+        ),
+        sweep_root,
+    )
+    assert isinstance(in_lane, sweep.ResolvedTarget)
+
+
 def test_sanctioned_plan_targets_resolve(sweep_root):
     """Both sanctioned shapes resolve, and the meta-root link resolves THROUGH.
 
@@ -1330,8 +1379,9 @@ def test_the_temp_file_is_created_in_the_resolved_targets_own_directory(sweep_ro
 
     monkeypatch.setattr(sweep.tempfile, 'mkstemp', _spy)
     resolved = _resolved(sweep_root, 'data/escalations/archive/2026-08-08/esc-3-1.json')
+    raw = resolved.write_path.read_text(encoding='utf-8')
 
-    assert sweep.write_repaired(resolved, '{}', {'a': 1}) is None
+    assert sweep.write_repaired(resolved, raw, {'a': 1}) is None
     assert Path(seen['dir']) == resolved.write_path.parent
 
 
@@ -1339,8 +1389,9 @@ def test_a_successful_write_preserves_the_targets_permission_bits(sweep_root):
     """A 0600 mkstemp artifact must not become the record's new mode."""
     resolved = _resolved(sweep_root, 'data/escalations/archive/2026-08-08/esc-3-1.json')
     os.chmod(resolved.write_path, 0o640)
+    raw = resolved.write_path.read_text(encoding='utf-8')
 
-    assert sweep.write_repaired(resolved, '{}', {'a': 1}) is None
+    assert sweep.write_repaired(resolved, raw, {'a': 1}) is None
     assert oct(resolved.write_path.stat().st_mode & 0o777) == oct(0o640)
 
 
@@ -1381,6 +1432,36 @@ def test_a_failed_verify_leaves_the_target_byte_identical(sweep_root, monkeypatc
     assert resolved.write_path.read_bytes() == before
     assert json.loads(resolved.write_path.read_text(encoding='utf-8'))
     assert _tmp_leftovers(resolved.write_path.parent) == []
+
+
+def test_a_target_that_changed_under_us_is_refused_and_never_reverted(sweep_root):
+    """The lost-update guard, checked immediately before the swap.
+
+    ``TERMINAL_STATUSES`` makes a concurrent write unlikely, not impossible: the
+    queue's ``{escalation_id}.json.lock`` sidecar is deliberately not taken, and
+    a terminal record is not strictly immutable — triage stamping and archive
+    moves both rewrite a resolved one. The payload is a FULL re-serialization of
+    a parse taken before the read, so without this check the swap would silently
+    revert the concurrent writer's update with no diagnostic at all. Here it
+    becomes a reported, re-runnable failure instead.
+    """
+    resolved = _resolved(sweep_root, 'data/escalations/archive/2026-08-08/esc-2-1.json')
+    stale_raw = resolved.write_path.read_text(encoding='utf-8')
+
+    # A concurrent writer lands between the read and the swap.
+    concurrent = json.loads(stale_raw)
+    concurrent['triage_note'] = 'stamped by the watcher'
+    write_escalation(resolved.write_path, concurrent)
+    concurrent_bytes = resolved.write_path.read_bytes()
+
+    failure = sweep.write_repaired(resolved, stale_raw, {'swapped': True})
+
+    assert isinstance(failure, sweep.WriteFailure)
+    assert failure.reason == sweep.REASON_CHANGED_UNDER_US
+    assert resolved.write_path.read_bytes() == concurrent_bytes, (
+        "the concurrent writer's update survives — it is never silently reverted"
+    )
+    assert _tmp_leftovers(resolved.write_path.parent) == [], 'no .sweep. debris'
 
 
 def test_the_swap_lands_on_the_meta_root_file_never_on_the_link(sweep_root):
