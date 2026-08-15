@@ -3167,7 +3167,7 @@ class TestQuarantineUnreachableHostChokepoint:
         """
         worker, eq, _fake = _make_ru_worker(escalate_after_n=escalate_after_n)
         runners = [MagicMock(name=n, is_local=False) for n in remotes]
-        for r, n in zip(runners, remotes):
+        for r, n in zip(runners, remotes, strict=True):
             r.name = n
         worker._host_allocator = HostAllocator(
             runners, quarantine=worker._runner_quarantine,

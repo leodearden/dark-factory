@@ -13091,7 +13091,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     await self._cleanup_owned_merge_worktree(_fh_entry.merge_wt)
             if _fh_entry.lease is not None and self._host_allocator is not None:
                 with contextlib.suppress(BaseException):
-                    await self._host_allocator.cancel_and_release(_fh_entry.lease)
+                    await self._cancel_and_release_tracked(_fh_entry.lease)
             if _fh_entry.permit is not None:
                 self._speculation_ledger.release(_fh_entry.permit)
 
@@ -13207,7 +13207,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     await self._cleanup_owned_merge_worktree(_ie.merge_wt)
             if _ie.lease is not None and self._host_allocator is not None:
                 with contextlib.suppress(BaseException):
-                    await self._host_allocator.cancel_and_release(_ie.lease)
+                    await self._cancel_and_release_tracked(_ie.lease)
             # η: release THROUGH the ledger (idempotent + discards the token
             # from ledger.live), guarded by the threaded token rather than
             # was_speculative — ledger.release(None) would AttributeError.
@@ -14921,7 +14921,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                     except BaseException:
                                         pass
                             if _entry.lease is not None and _allocator is not None:
-                                await _allocator.cancel_and_release(_entry.lease)
+                                await self._cancel_and_release_tracked(_entry.lease)
                                 # Successful in-body cancel: clear the lease
                                 # so the except handler's chokepoint call
                                 # below (cancel_lease=True) does not re-issue
@@ -15533,7 +15533,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         if lease is not None and self._host_allocator is not None:
             with contextlib.suppress(BaseException):
                 if cancel_lease:
-                    await self._host_allocator.cancel_and_release(lease)
+                    await self._cancel_and_release_tracked(lease)
                 else:
                     await self._host_allocator.release(lease)
         if merge_wt is not None:
@@ -15544,6 +15544,83 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         if chain_failed:
             self._n_failed = True
+
+    async def _cancel_and_release_tracked(self, lease: Any | None) -> bool:
+        """THE cancel-release chokepoint: release the lease, RECORD a strand.
+
+        Sole caller of ``HostAllocator.cancel_and_release`` — enforced by
+        :class:`TestCancelAndReleaseChokepoint`'s AST ratchet.  Its five call
+        sites are the two ``stop()`` drains (finalizing head and ``_inflight``),
+        the head-failure cascade's in-body release,
+        :meth:`_resolve_and_release` with ``cancel_lease=True``, and
+        :meth:`_finalize_inflight`'s ``_cancel_release`` path.
+
+        MECHANISM (task 3043, reify 2026-07-25).  Against an unreachable host
+        ``cancel_verify()`` returns rc != 0 and all ``max_attempts``
+        ``probe_clean()`` polls fail, so
+        :meth:`~orchestrator.verify_runner.HostAllocator.cancel_and_release`
+        leaves the slot **PARKED** and non-acquirable (verify_runner.py:3202,
+        3211).  That is the correct fail-closed state — the cancel RPC failed,
+        so a stale verify process may still be running there — but it writes
+        **only** ``_slots``: the host is NOT added to ``_quarantine``, so
+        ``quarantined_remote_runners()`` never yields it and
+        :meth:`_reprobe_quarantined_hosts` has no tracker entry to re-adopt.
+        The host is then silently non-acquirable forever.  That is how the
+        laptop went to "verifying 1/2 hosts" with ZERO dispatch attempts for
+        3+ h and stayed there until an orchestrator restart rebuilt the
+        allocator.
+
+        So: detect the PARK and route it through
+        :meth:`_quarantine_unreachable_host`, which upholds INV-A (quarantine
+        implies tracked) and thereby hands recovery to the reprobe sweep.
+        ``cancel_and_release``'s own PARK-on-exhaustion semantics are
+        deliberately UNTOUCHED — pinned by
+        ``test_cancel_fail_bounded_max_attempts_stays_parked`` — so strand
+        detection lives here, at the call sites, rather than in the allocator.
+
+        PARKED, not ``not ok``, is the discriminator: the cancel-fail path
+        returns False *regardless* of the probe outcome, so a host whose probe
+        came back clean (slot FREE, perfectly healthy) would otherwise be
+        quarantined on a false positive.
+
+        The PARKED read is gated on ``isinstance(..., HostAllocator)`` — the
+        house pattern task 3275 established at :meth:`_host_states_block`,
+        because ``_host_allocator`` carries a ``MagicMock`` at ~79 assignment
+        sites across 15 test files and a duck-typed ``is_parked`` would let
+        every one of those doubles fabricate a quarantine.  Local leases are
+        never recorded (the trust anchor is never quarantined), and the
+        recording is suppressed-and-logged so a strand-detection bug can never
+        break a release path.
+
+        Returns the underlying ``cancel_and_release`` boolean unchanged; a
+        ``None`` lease or a missing allocator is a no-op returning True.
+        """
+        if lease is None or self._host_allocator is None:
+            return True
+
+        ok = await self._host_allocator.cancel_and_release(lease)
+
+        if not ok and not getattr(lease, 'is_local', False):
+            try:
+                _parked = (
+                    isinstance(self._host_allocator, HostAllocator)
+                    and self._host_allocator.is_parked(lease.name)
+                )
+                if _parked:
+                    self._quarantine_unreachable_host(
+                        lease.name,
+                        f'verify cancel/probe failed against {lease.name!r} — '
+                        'host slot PARKED (presumed unreachable)',
+                        time.time(),
+                    )
+            except Exception:
+                logger.warning(
+                    f'strand check after cancel_and_release({lease.name!r}) '
+                    'failed; host may be PARKED without a tracker entry',
+                    exc_info=True,
+                )
+
+        return ok
 
     async def _teardown_verify_task(
         self,
@@ -16639,11 +16716,36 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # would swallow an in-flight CancelledError and break the cascade's
             # `_entry.verify_task.cancelled()` checks that _head_was_requeued
             # and the manual-requeue branch depend on.
+            #
+            # Clause 1 routes through _teardown_verify_task rather than typing
+            # a raw cancel() here: that helper is the SOLE sanctioned caller of
+            # both teardown steps (task 3204, pinned by
+            # TestVerifyTeardownChokepoint), and the abort branches above
+            # already hand it this same inner `verify_task`.
+            #
+            # lease=None DELIBERATELY — the abort half is not ours to fire.
+            # Every route that reaches this guard with the inner task still
+            # live has already aborted the remote for this lease through the
+            # same chokepoint: the three deliberate abort branches above do it
+            # before they return, and every external canceller does it before
+            # cancelling us (the head-failure cascade, and both stop() drains).
+            # Re-aborting would issue a SECOND cancel_verify() on a lease whose
+            # remote verify is already signalled — which
+            # TestCascadeFiresRemoteCancel and TestB4CancelBehavior observe
+            # directly. Passing None no-ops the abort half and keeps the
+            # sanctioned cancel-and-reap, which is all this guard owes.
+            #
+            # shutdown_defensive=True because this is a cancellation-unwind
+            # path: nothing here may skip the reap and re-orphan the very task
+            # the guard exists to collect.  The `not done()` guard stays at the
+            # call site — the success / DROPPED / REQUEUED paths arrive here
+            # with the task already finished and must not be touched.
             if verify_task is not None:
                 if not verify_task.done():
-                    verify_task.cancel()
-                    with contextlib.suppress(BaseException):
-                        await verify_task
+                    await self._teardown_verify_task(
+                        None, verify_task, req.task_id,
+                        shutdown_defensive=True,
+                    )
                 _orphan_exc: BaseException | None = None
                 if verify_task.done() and not verify_task.cancelled():
                     # The retrieval that suppresses the
@@ -17581,7 +17683,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # _n_failed.
             if not _skip_release and entry.lease is not None and self._host_allocator is not None:
                 if _cancel_release:
-                    await self._host_allocator.cancel_and_release(entry.lease)
+                    await self._cancel_and_release_tracked(entry.lease)
                 else:
                     await self._host_allocator.release(entry.lease)
             # η: release THROUGH the ledger, guarded by the threaded token
