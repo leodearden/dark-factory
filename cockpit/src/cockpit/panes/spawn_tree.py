@@ -31,10 +31,16 @@ def is_outstanding(record: SessionRecord) -> bool:
     """Whether *record* counts as an "outstanding child" (Fleet Cockpit C9a).
 
     Reuses count_outstanding_children's exact "non-terminal" semantics
-    (session_table.py) so the tree's highlight agrees with the session
-    table's outstanding-children column. Fail-soft (PRD §2), mirroring
-    state_glyph: a foreign/unrecognized status degrades to False rather
-    than raising.
+    (session_table.py) for any RECOGNIZED status, so the tree's highlight
+    agrees with the session table's outstanding-children column there.
+    That parity does NOT extend to a foreign/unrecognized status: this
+    function is fail-soft (PRD §2) in the opposite direction from
+    count_outstanding_children, mirroring state_glyph instead -- a foreign
+    status degrades to False (not outstanding) here, while
+    count_outstanding_children's own fail-soft treats the same status as
+    non-terminal (counted). A session with a foreign status is therefore
+    counted in its parent's session-table children column but left
+    unmarked in this tree.
     """
     try:
         resolved = Status(record.status)
