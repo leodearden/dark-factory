@@ -401,8 +401,13 @@ _LIVE_FIELD_NAMES: tuple[str, ...] = (
     'pid',
 )
 
-# ``<field> = <value>``, as EITHER a fully-quoted value or a bare token — never
-# a half-read mixture of the two.
+# ``<field>=<value>``, as EITHER a fully-quoted value or a bare token — never
+# a half-read mixture of the two, and never fabricated from thin air: the
+# value group is OPTIONAL, so a recognised field written in assignment form
+# with no value this pattern can read still matches the field alone, with
+# `quoted` AND `bare` both `None`. One pattern with an optional value group
+# is what lets "read whole" and "seen but unreadable" stay one shape instead
+# of two kept in sync by hand.
 #
 # The quoted branch is deliberately all-or-nothing. An earlier single-branch
 # form (``"?([A-Za-z0-9_./:+-]+)"?``) let the value class terminate INSIDE a
@@ -424,24 +429,19 @@ _LIVE_FIELD_NAMES: tuple[str, ...] = (
 # `:`, `+`) are the ones real values need — `in-progress`, a path, an ISO
 # timestamp.
 #
-# A second alternative catches what the first cannot read: a bare
-# `<field>=` mention with no value the first alternative could consume.
-# Ordered, non-overlapping alternation is what makes this precise rather
-# than merely conservative. Python prefers the leftmost alternative and
-# `finditer` never revisits consumed characters, so at any position where
-# the strict alternative succeeds its ENTIRE match — quoted value included —
-# is consumed before scanning resumes; a sibling field name nested inside
-# that quoted value (`status="foo claimant_run_id=bar"`) is never
-# re-examined as a match of its own. The second alternative can therefore
-# only fire where the first alternative already failed at that position,
-# which is exactly "a recognised field was written in assignment form but
-# its value could not be read whole" — never a false hit on a value that
-# merely happens to contain another field's name.
+# The value must directly ABUT `=` — there is no ``\s*`` between them, unlike
+# the gap before it. A gap there would let the bare branch silently absorb
+# the next word of ordinary prose as though it had been assigned: measured
+# live, ``The pid= field is unset`` would otherwise read as the fabricated
+# pair `pid=field` rather than the unreadable mention it actually is.
+# Requiring the value to start immediately at `=` makes a whitespace-
+# separated following token fail the value group instead of being misread
+# as it, so it falls through to the same unreadable case an absent value
+# produces.
 _LIVE_FIELD_ALT = '|'.join(_LIVE_FIELD_NAMES)
 _LIVE_FIELD_SCAN_RE = re.compile(
-    r'\b(?P<field>' + _LIVE_FIELD_ALT + r')\s*=\s*'
-    r'(?:"(?P<quoted>[^"|\n]+)"|(?P<bare>[A-Za-z0-9_./:+-]+))'
-    r'|\b(?P<unread>' + _LIVE_FIELD_ALT + r')\s*=',
+    r'\b(?P<field>' + _LIVE_FIELD_ALT + r')\s*='
+    r'(?:"(?P<quoted>[^"|\n]+)"|(?P<bare>[A-Za-z0-9_./:+-]+))?',
     re.IGNORECASE,
 )
 
@@ -468,10 +468,19 @@ def _classify_liveness_snapshot(content: str) -> tuple[bool, str | None]:
           where NO assignment was readable, OR where ANY ONE recognised
           field's value could not be read whole even though others did. THE
           counted ``liveness_snapshot_unfielded`` loss; the caller owns that
-          counter, so this function stays a pure classifier. Never a partial
-          key: a key built from only the readable survivors would group
-          records that assert DIFFERENT facts, and under ``--apply`` a false
-          cluster like that is an irreversible delete.
+          counter, so this function stays a pure classifier. Never a key
+          built from only the readable survivors of the ASSIGNMENT-form
+          fields ``_LIVE_FIELD_SCAN_RE`` recognises, since under ``--apply``
+          a false cluster like that is an irreversible delete. That
+          guarantee is scoped to the assignment form specifically: a status
+          spelled a way the scan does not recognise at all — a ``status:``
+          colon, or a bare ``LIVE_TASK_STATUS_RE`` paraphrase such as
+          "currently running" — is invisible to the scan rather than an
+          unread mention of one, so it can still combine with readable
+          sibling assignments into a survivors-only key. Pre-existing and
+          narrower than the defect this function fixes; pinned as a known
+          limitation, not closed here, by
+          ``test_a_non_assignment_status_can_still_false_group``.
         * ``(True, key)`` — a snapshot, with its canonical key.
 
         ``POINT_IN_TIME_CHECK_RE`` is consulted AT MOST ONCE per call, and not
@@ -485,11 +494,12 @@ def _classify_liveness_snapshot(content: str) -> tuple[bool, str | None]:
     # ``LIVE_TASK_STATUS_RE`` — and a non-match is the overwhelmingly common
     # case: this detector always runs, with no flag to disable it, over a
     # default 5000-records-per-category scan of mostly ordinary prose.
-    # The gate is SOUND because both ``_LIVE_FIELD_SCAN_RE`` alternatives
-    # require ``LIVE_TASK_STATUS_RE``'s first alternative (a bare
-    # ``<field>=``) as a prefix, so a scan hit — readable OR unread — implies
-    # a live-status hit: a record failing this check could never have
-    # yielded a key, nor an unfielded loss, anyway. A record it rejects
+    # The gate is SOUND because every ``_LIVE_FIELD_SCAN_RE`` match requires
+    # ``LIVE_TASK_STATUS_RE``'s first alternative (a bare ``<field>=``) as a
+    # prefix, whether or not the optional value group goes on to match, so a
+    # scan hit — read OR unreadable — implies a live-status hit: a record
+    # failing this check could never have yielded a key, nor an unfielded
+    # loss, anyway. A record it rejects
     # reports ``framed=False`` even if the point-in-time framing would have
     # matched — which is the intended contract, since such a record is out
     # of scope rather than a loss.
@@ -500,7 +510,7 @@ def _classify_liveness_snapshot(content: str) -> tuple[bool, str | None]:
 
     pairs: set[str] = set()
     for m in _LIVE_FIELD_SCAN_RE.finditer(content):
-        if m.group('unread'):
+        if m.group('quoted') is None and m.group('bare') is None:
             return True, None
         # Exactly one of `quoted`/`bare` ever participates; `' '.join(split())`
         # normalises the whitespace a quoted value may now legitimately carry
