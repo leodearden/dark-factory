@@ -467,7 +467,13 @@ class TestReifyCheckoutAdapter:
         Covers the skip reason too: it must be the SHARED builder's output
         for this module's own resolution, not a hand-rolled string that can
         drift from the wording the γ suite or orchestrator's verify gate use
-        for the same condition.
+        for the same condition.  Checked two ways: an INDEPENDENT invariant
+        first — read straight off the filesystem, mirroring
+        ``reify_skip_reason``'s own documented contract — and only then the
+        recomputed-call equality.  The recomputation alone would catch the
+        constants re-diverging from a fresh call but would credit a
+        hand-rolled string that happened to match it; the independent half
+        below cannot be fooled that way.
 
         RED today (before the constants are rewired): ``_REIFY_SKIP_REASON``
         does not exist yet in this module, so referencing it below raises
@@ -479,6 +485,27 @@ class TestReifyCheckoutAdapter:
         assert checkout.root == _REIFY_REPO_ROOT
         if _REIFY_REPO_ROOT is not None:
             assert _REIFY_GUARD_SCRIPT == _REIFY_REPO_ROOT / _REIFY_GUARD_RELPATH
+            assert _REIFY_GUARD_SCRIPT is not None  # narrows for .is_file() below
+            if _REIFY_GUARD_SCRIPT.is_file():
+                assert _REIFY_SKIP_REASON is None, (
+                    f'the guard script is present at {_REIFY_GUARD_SCRIPT}, so '
+                    f'the gate must ADMIT the run: {_REIFY_SKIP_REASON!r}'
+                )
+            else:
+                assert _REIFY_SKIP_REASON is not None
+                assert str(_REIFY_REPO_ROOT) in _REIFY_SKIP_REASON, (
+                    f'the reason must name the resolved root: '
+                    f'{_REIFY_SKIP_REASON!r}'
+                )
+        else:
+            assert _REIFY_SKIP_REASON is not None
+            assert 'REIFY_ROOT' in _REIFY_SKIP_REASON, (
+                f'the reason must name the override: {_REIFY_SKIP_REASON!r}'
+            )
+            assert 'scripts/lock-charter-guard.sh' in _REIFY_SKIP_REASON, (
+                f'the reason must name the marker: {_REIFY_SKIP_REASON!r}'
+            )
+
         shared_reason = reify_checkout.reify_skip_reason(
             _REIFY_GUARD_RELPATH, checkout.root, named_by_env=checkout.named_by_env
         )
@@ -641,9 +668,32 @@ class TestReifyCheckoutPlantedLayout:
             return marks[0].args[0]
 
         def _parametrize_reify_argvalue(func):
-            marks = [m for m in func.pytestmark if m.name == 'parametrize']
-            assert marks, f'{func.__name__} must carry a parametrize mark'
-            return dict(marks[0].args[1])['reify']
+            # Select by argnames rather than blindly taking marks[0]: a
+            # stacked second parametrize (e.g. a flag axis) would otherwise
+            # let this silently pick an arbitrary mark.
+            marks = [
+                m
+                for m in func.pytestmark
+                if m.name == 'parametrize' and 'repo_root' in m.args[0]
+            ]
+            assert len(marks) == 1, (
+                f"{func.__name__} must carry exactly one parametrize mark "
+                f"whose argnames include 'repo_root' (found {len(marks)}) — "
+                f'a restructure of this sweep must fail here with a message '
+                f'naming what changed, not with an opaque error from '
+                f'indexing marks[0]'
+            )
+            # Tolerate rows wrapped in pytest.param(...): dict(argvalues)
+            # would raise ValueError the moment any row carries marks/id
+            # instead of being a bare 2-tuple.
+            rows = [getattr(argvalue, 'values', argvalue) for argvalue in marks[0].args[1]]
+            reify_rows = [row for row in rows if row[0] == 'reify']
+            assert len(reify_rows) == 1, (
+                f"{func.__name__} parametrize must carry exactly one row "
+                f"whose first element is 'reify' (found {len(reify_rows)} "
+                f'in {rows!r})'
+            )
+            return reify_rows[0][1]
 
         assert (
             _skipif_condition(
@@ -685,8 +735,34 @@ class TestReifyCheckoutPlantedLayout:
         ``parents[N] / 'reify'`` expression that is never None regardless of
         whether anything exists on disk at that path, and
         ``_REIFY_SKIP_REASON`` does not exist yet.
+
+        This case's RED depends on an environmental precondition: no ancestor
+        of the copied module may carry ``reify/scripts/lock-charter-guard.sh``.
+        That holds for the default ``/tmp/pytest-of-<user>/...`` basetemp, but
+        not for every possible ``--basetemp`` (e.g. one placed inside the repo
+        tree) or an ambient ``/tmp/reify`` checkout — so it is asserted
+        explicitly below, via the identical predicate
+        ``resolve_reify_checkout`` itself walks, before the behavioural
+        assertion.  Without it, an unusual environment would fail the
+        behavioural assertion with a confusing message that blames the
+        resolver instead of naming the real cause.
         """
         mod = _load_module_copy(tmp_path, _BARE_LAYOUT, plant_guard=False)
+
+        mod_file = mod.__file__
+        assert mod_file is not None, f'{mod!r} was loaded from a file and must have one'
+        contaminated = [
+            ancestor
+            for ancestor in Path(mod_file).resolve().parents
+            if (ancestor / 'reify' / _REIFY_GUARD_RELPATH).is_file()
+        ]
+        assert not contaminated, (
+            f'a real reify checkout exists in the ancestry of {mod_file!r} '
+            f'{contaminated!r} — likely an unusual --basetemp or an ambient '
+            f'checkout — so this environment cannot express a genuine '
+            f'discovery MISS here; this is an environment problem, not a '
+            f'resolver regression'
+        )
 
         assert mod._REIFY_REPO_ROOT is None, (
             f'no reify checkout exists in the planted ancestry, but the '
@@ -697,6 +773,48 @@ class TestReifyCheckoutPlantedLayout:
         assert 'REIFY_ROOT' in reason, f'the skip must name the override: {reason!r}'
         assert 'scripts/lock-charter-guard.sh' in reason, (
             f'the skip must name the marker: {reason!r}'
+        )
+
+    def test_env_override_wins_over_the_planted_checkout_and_names_the_bad_path(
+        self, tmp_path, planted_env
+    ):
+        """REIFY_ROOT must WIN over a discoverable planted sibling, verbatim.
+
+        Ported from orchestrator/tests/test_verify_role_integration.py's
+        ``test_env_override_is_honored_verbatim_and_names_the_bad_path`` (task
+        3978).  Closes the one arm the ``planted_env`` fixture's docstring has
+        always promised ("a case can set REIFY_ROOT back to a value it chose
+        itself") but that no case here previously exercised: every other case
+        in this class only relies on the fixture's ``delenv``.  Without this,
+        ``_REIFY_REPO_ROOT`` / ``_REIFY_GUARD_SCRIPT`` / ``_REIFY_SKIP_REASON``
+        had no end-to-end coverage of the override arm at all — only
+        transitively, via the delegation pin in TestReifyCheckoutAdapter and
+        shared/tests/test_reify_checkout.py.  A future edit that pre-resolved
+        the root by discovery and only consulted REIFY_ROOT as a fallback
+        would leave every other test in this file green.
+
+        A typo'd REIFY_ROOT that silently fell back to a discoverable sibling
+        would answer for a DIFFERENT repo than the operator named; honoring it
+        verbatim instead makes the typo self-evident in ``pytest -rs`` output.
+        """
+        bad_root = tmp_path / 'does-not-exist' / 'reify-typo'
+        planted_env.setenv('REIFY_ROOT', str(bad_root))
+
+        mod = _load_module_copy(tmp_path, _BARE_LAYOUT)
+
+        assert bad_root.resolve() == mod._REIFY_REPO_ROOT, (
+            f'REIFY_ROOT must win over the discoverable planted sibling, not '
+            f'be shadowed by it (got {mod._REIFY_REPO_ROOT!r})'
+        )
+        assert (tmp_path / 'src' / 'reify') != mod._REIFY_REPO_ROOT, (
+            "a typo'd REIFY_ROOT silently falling back to a discovered "
+            'checkout would answer for a DIFFERENT repo than the operator named'
+        )
+        reason = mod._REIFY_SKIP_REASON
+        assert isinstance(reason, str) and reason
+        assert str(bad_root) in reason, (
+            f'the skip reason must name the bad path verbatim so a REIFY_ROOT '
+            f'typo is self-evident in `pytest -rs` output (got {reason!r})'
         )
 
 
@@ -726,6 +844,14 @@ class TestSkipUnlessCheckout:
         is pytest's own public handle for the outcome ``pytest.skip`` raises
         (documented on ``pytest.skip`` itself), so capturing it here needs no
         dependency on the private ``_pytest.outcomes`` import path.
+
+        Checked two ways: an INDEPENDENT invariant first — the reason must
+        name the override var and the marker, the same fact
+        TestReifyCheckoutPlantedLayout's
+        ``test_discovery_miss_skips_instead_of_answering_from_this_machine``
+        pins on a planted copy — and only then the recomputed-call equality,
+        which is what actually proves the wording is DELEGATED rather than
+        merely similar-looking.
         """
         with pytest.raises(pytest.skip.Exception) as excinfo:
             _skip_unless_checkout('reify', None)
@@ -735,6 +861,10 @@ class TestSkipUnlessCheckout:
             f'a None root is the discovery-miss arm, which always yields a '
             f'reason from the shared builder — a falsy one here would turn '
             f'this skip into a phantom pass, got {reason!r}'
+        )
+        assert 'REIFY_ROOT' in reason, f'the skip must name the override: {reason!r}'
+        assert 'scripts/lock-charter-guard.sh' in reason, (
+            f'the skip must name the marker: {reason!r}'
         )
         assert reason == reify_checkout.reify_skip_reason(
             _REIFY_GUARD_RELPATH, None, named_by_env=False
