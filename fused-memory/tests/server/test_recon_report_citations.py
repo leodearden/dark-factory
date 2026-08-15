@@ -12,6 +12,8 @@ Covers:
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 from mcp.server.fastmcp.exceptions import ToolError
 
@@ -1351,6 +1353,133 @@ class TestCiteTaskEntityScopedFold:
         assert report is not None
         ids = [item['finding_id'] for item in report['flagged_items']]
         assert ids == [fid3]
+
+
+# ---------------------------------------------------------------------------
+# task-4184 step-1/step-3: TestCiteTaskFoldPurgeLogging — RED until step-2/4
+# make both cite_task fold branches log the purged finding's content before
+# _purge_finding discards it wholesale.
+# ---------------------------------------------------------------------------
+
+_FOLD_PURGE_MARKER = 'cite_task fold purged finding'
+
+
+def _fold_purge_warnings(caplog) -> list[str]:
+    """The rendered fold-purge WARNING messages captured so far.
+
+    Filtered on the stable message marker rather than on the payload, so the
+    negative control can assert ``== []`` without accidentally matching an
+    unrelated warning from the same module.
+    """
+    return [r.getMessage() for r in caplog.records if _FOLD_PURGE_MARKER in r.getMessage()]
+
+
+class TestCiteTaskFoldPurgeLogging:
+    """Both cite_task in-run folds (task-2425 project-scoped, task-2432
+    entity-scoped) purge the losing finding WHOLESALE — its description,
+    suggested_action and any citations already attached to it are dropped
+    with no trace (see _purge_finding's docstring). A WARNING carrying that
+    content is the sole recovery channel, so it must be emitted before the
+    purge, on BOTH branches, and never on a non-folding cite_task.
+    """
+
+    def _fake_ti(self):
+        """Fake task interceptor covering the external task ids these tests cite."""
+        known_roots = {'/home/leo/src/dark-factory'}
+        results = {}
+        for pr in known_roots:
+            for tid in ['2405', '2406', '9999']:
+                results[(tid, pr)] = {'id': tid, 'title': f'T-{tid}'}
+        return _FakeTaskInterceptor(results=results)
+
+    def _make_state(self, fake_ti=None, memory_service=None):
+        from fused_memory.server.recon_report import ReconReportState
+
+        if fake_ti is None:
+            fake_ti = self._fake_ti()
+        t = [0.0]
+        state = ReconReportState(
+            ttl_seconds=300,
+            clock=lambda: t[0],
+            task_interceptor=fake_ti,
+            memory_service=memory_service,
+        )
+        state.known_projects = dict(_KNOWN_PROJECTS)
+        return state, t
+
+    @pytest.mark.asyncio
+    async def test_project_scoped_fold_logs_purged_finding_content(self, caplog):
+        """Project-scoped fold (task-2425): the second null-task_id citer of
+        the same external task is purged. The WARNING must carry the purged
+        finding's id, owning stage, description and suggested_action, plus
+        the surviving anchor's id — everything needed to reconstruct what
+        was discarded.
+        """
+        memory_service = _FakeMemoryService(
+            entity_nodes=[{'uuid': 'e' * 32, 'name': 'Widget Service'}]
+        )
+        state, _ = self._make_state(memory_service=memory_service)
+        # NOT memory_consolidator — fold 1 exempts that stage.
+        state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
+
+        first = state.add_finding(
+            run_id='run-1',
+            severity='moderate',
+            category='cross_project',
+            description='dark_factory:2405 still pending, unchanged',
+            suggested_action='wait for upstream',
+            actionable=True,
+            task_id=None,
+            flag_type=None,
+        )
+        assert 'finding_id' in first, f'add_finding failed: {first}'
+        finding_id_1 = first['finding_id']
+
+        second = state.add_finding(
+            run_id='run-1',
+            severity='moderate',
+            category='cross_project_routing',
+            description='blocked pending dark_factory task 2405 per routing check',
+            suggested_action='reroute once unblocked',
+            actionable=True,
+            task_id=None,
+            flag_type='cross_project_routing_stale',
+        )
+        assert 'finding_id' in second, f'add_finding failed: {second}'
+        finding_id_2 = second['finding_id']
+        assert finding_id_2 != finding_id_1
+
+        cite_1 = await state.cite_task('run-1', finding_id_1, 'dark_factory', '2405')
+        assert 'error' not in cite_1, cite_1
+
+        # Pre-attach a citation to the finding that is about to be purged, so
+        # the discarded-context path _purge_finding warns about is exercised.
+        cited = await state.cite_entity('run-1', finding_id_2, 'Widget Service')
+        assert 'error' not in cited, cited
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.server.recon_report'):
+            cite_2 = await state.cite_task('run-1', finding_id_2, 'dark_factory', '2405')
+
+        # Return contract is UNCHANGED — the log cannot be bought by altering
+        # the fold's behaviour.
+        assert cite_2.get('error') == 'duplicate_finding'
+        assert cite_2.get('error_type') == 'ReconReportDuplicateFinding'
+        assert cite_2.get('existing_finding_id') == finding_id_1
+        assert state._resolve_finding('run-1', finding_id_2) is None
+
+        matching = _fold_purge_warnings(caplog)
+        assert len(matching) == 1, [r.getMessage() for r in caplog.records]
+        message = matching[0]
+
+        # The five MANDATED items.
+        assert finding_id_2 in message, message  # purged finding_id
+        assert 'reconciler' in message, message  # purged finding's owning stage
+        assert 'blocked pending dark_factory task 2405 per routing check' in message, message
+        assert 'reroute once unblocked' in message, message
+        assert finding_id_1 in message, message  # surviving anchor
+
+        # Discriminates this fold from the entity-scoped one.
+        assert 'project_scoped' in message, message
 
 
 # ---------------------------------------------------------------------------
