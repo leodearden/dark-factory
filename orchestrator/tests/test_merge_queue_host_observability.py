@@ -37,6 +37,7 @@ from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_queue import (
     DecidedItem,
     InflightEntry,
+    ItemLifecycleState,
     MergeOutcome,
     MergeRequest,
     SpeculativeMergeWorker,
@@ -412,3 +413,132 @@ class TestSnapshotHostsBlock:
         assert after['streak'] is None
         assert after['reason'] is None
         assert after['slot_state'] == 'free'
+
+
+# ── 3275/step-5 RED: occupancy must not silently drop a co-located occupant ────
+
+
+@pytest.mark.asyncio
+class TestSnapshotOccupancyLossless:
+    """occupancy.inflight_by_host / inflight_total: lossless per-host occupants.
+
+    The historical by_host is a {host: task_id} dict built by comprehension, so
+    two entries leased to ONE host collapse last-writer-wins, and the
+    finalize-head prepend splat drops the head's task_id when it shares a host
+    with an in-flight entry.  Both losses are silent.
+
+    RED until 3275/step-6 adds the keys (KeyError before that).
+    """
+
+    def _leases(self):
+        return (
+            HostLease(name='local', runner=MagicMock(), is_local=True),
+            HostLease(name='laptop', runner=MagicMock(), is_local=False),
+        )
+
+    def _assert_derivation_invariant(self, occ: dict) -> None:
+        """hosts_busy is re-sourced from the lossless map, same value as before.
+
+        len(inflight_by_host) == len(by_host) holds by construction (identical
+        key sets), so re-sourcing is a no-op value change.
+        """
+        assert occ['hosts_busy'] == len(occ['inflight_by_host']) == len(occ['by_host']), (
+            f'hosts_busy={occ["hosts_busy"]}, '
+            f'len(inflight_by_host)={len(occ["inflight_by_host"])}, '
+            f'len(by_host)={len(occ["by_host"])}'
+        )
+
+    async def test_two_inflight_on_one_host_keeps_both(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """The headline loss: two in-flight entries on ONE host — neither dropped."""
+        worker, _alloc, _ = _real_worker(git_ops)
+        _local, laptop_lease = self._leases()
+
+        for tid in ('occ-a', 'occ-b'):
+            req = _make_req(tid, f'task/{tid}', config, git_repo)
+            worker._inflight.append(_make_entry(req, laptop_lease))
+
+        occ = worker.snapshot()['occupancy']
+
+        assert occ['inflight_by_host'] == {'laptop': ['occ-a', 'occ-b']}, (
+            f'both occupants must survive in _inflight order; got '
+            f'{occ["inflight_by_host"]}'
+        )
+        assert occ['inflight_total'] == 2
+        # hosts_busy counts distinct busy HOSTS, not verifies in flight.
+        assert occ['hosts_busy'] == 1
+        # Backward compat: the lossy historical map is unchanged (task 3044 owns it).
+        assert occ['by_host'] == {'laptop': 'occ-b'}
+        self._assert_derivation_invariant(occ)
+
+    async def test_finalize_head_colocated_with_inflight_keeps_both(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """The second loss path: the finalize-head prepend splat drops the head.
+
+        `_by_host = {_fh_name: _fh_tid, **_by_host}` — when the head shares a
+        host with an in-flight entry, the splat overwrites the head's task_id.
+        """
+        worker, _alloc, _ = _real_worker(git_ops)
+        _local, laptop_lease = self._leases()
+
+        req_tail = _make_req('occ-tail', 'task/occ-tail', config, git_repo)
+        worker._inflight.append(_make_entry(req_tail, laptop_lease))
+
+        req_head = _make_req('occ-head', 'task/occ-head', config, git_repo)
+        head = _make_entry(req_head, laptop_lease)
+        worker._register_item(head, initial=ItemLifecycleState.VERIFYING)
+
+        occ = worker.snapshot()['occupancy']
+
+        assert occ['inflight_by_host'] == {'laptop': ['occ-head', 'occ-tail']}, (
+            f'finalize head must lead, and must not be overwritten; got '
+            f'{occ["inflight_by_host"]}'
+        )
+        assert occ['inflight_total'] == 2
+        assert occ['hosts_busy'] == 1
+        self._assert_derivation_invariant(occ)
+
+    async def test_distinct_hosts_unchanged(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """Multi-host, one occupant each — the non-colliding case is unaffected."""
+        worker, _alloc, _ = _real_worker(git_ops)
+        local_lease, laptop_lease = self._leases()
+
+        req_local = _make_req('occ-local', 'task/occ-local', config, git_repo)
+        req_laptop = _make_req('occ-laptop', 'task/occ-laptop', config, git_repo)
+        worker._inflight.append(_make_entry(req_local, local_lease))
+        worker._inflight.append(_make_entry(req_laptop, laptop_lease))
+
+        occ = worker.snapshot()['occupancy']
+
+        assert occ['inflight_by_host'] == {
+            'local': ['occ-local'], 'laptop': ['occ-laptop'],
+        }
+        assert occ['inflight_total'] == 2
+        assert occ['hosts_busy'] == 2
+        self._assert_derivation_invariant(occ)
+
+    async def test_empty_and_leaseless_are_excluded(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """Nothing in flight → empty; a lease=None entry is excluded from both."""
+        worker, _alloc, _ = _real_worker(git_ops)
+
+        occ = worker.snapshot()['occupancy']
+        assert occ['inflight_by_host'] == {}
+        assert occ['inflight_total'] == 0
+        assert occ['hosts_busy'] == 0
+        self._assert_derivation_invariant(occ)
+
+        # A leaseless in-flight entry (awaiting host acquisition) is not an occupant.
+        req = _make_req('occ-leaseless', 'task/occ-leaseless', config, git_repo)
+        worker._inflight.append(_make_entry(req, None))
+
+        occ = worker.snapshot()['occupancy']
+        assert occ['inflight_by_host'] == {}
+        assert occ['inflight_total'] == 0
+        assert occ['hosts_busy'] == 0
+        self._assert_derivation_invariant(occ)
