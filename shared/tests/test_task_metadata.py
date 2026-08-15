@@ -2016,6 +2016,91 @@ class _CheckStub(BaseModel):
     name: str
 
 
+class TestListForDictOnlySliceRejected:
+    """Task 4142: a LIST value for a dict-only slice is no longer silent.
+
+    Before this gate, parse_metadata's registry loop branched purely on
+    `isinstance(raw, list)`, so `{'milestone': [{...}]}` validated
+    element-wise into a typed LIST of Milestones and returned ZERO warnings —
+    invisible to both the `task_metadata.schema_warning` census and the
+    `enforce=True` write gate. The resulting non-dict metadata.milestone then
+    made scheduler._milestone_time_gated fail-safe-withhold the task from
+    dispatch indefinitely, with no escalation path.
+    """
+
+    # The verbatim repro blob from the task's premise.
+    _LIST_MILESTONE = {'milestone': [{'mode': 'delayed', 'after_secs': 604800}]}
+
+    def test_write_warn_mode_emits_exactly_one_wrong_cardinality_warning(self):
+        model, warnings = parse_metadata(
+            copy.deepcopy(self._LIST_MILESTONE), direction='write', enforce=False
+        )
+        # Length pinned at 1 so a stray unknown_key/invalid_field would fail:
+        # 'milestone' is in known_fields (no unknown_key) and is not a
+        # declared TaskMetadata field, so the raw list lands in model_extra
+        # under extra='allow' (no invalid_field).
+        assert len(warnings) == 1
+        assert warnings[0].field == 'milestone'
+        assert warnings[0].code == 'wrong_cardinality'
+        assert model is not None
+
+    def test_raw_list_retained_byte_for_byte(self):
+        model, _warnings = parse_metadata(
+            copy.deepcopy(self._LIST_MILESTONE), direction='write', enforce=False
+        )
+        dumped = model.model_dump()['milestone']
+        # I1: the offending value round-trips unswapped, NOT as [Milestone(...)].
+        assert dumped == [{'mode': 'delayed', 'after_secs': 604800}]
+        assert all(not isinstance(item, BaseModel) for item in dumped)
+
+    def test_write_enforce_raises_type_error(self):
+        with pytest.raises(TypeError):
+            parse_metadata(
+                copy.deepcopy(self._LIST_MILESTONE), direction='write', enforce=True
+            )
+
+    def test_read_warns_and_never_raises(self):
+        model, warnings = parse_metadata(
+            copy.deepcopy(self._LIST_MILESTONE), direction='read'
+        )
+        assert len(warnings) == 1
+        assert warnings[0].field == 'milestone'
+        assert warnings[0].code == 'wrong_cardinality'
+        assert model.model_dump()['milestone'] == [{'mode': 'delayed', 'after_secs': 604800}]
+
+    def test_gate_is_generic_not_milestone_special_cased_warn(self):
+        # A test-owned key registered WITHOUT a cardinality gets the
+        # fail-closed 'dict' default and is gated identically.
+        register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
+        model, warnings = parse_metadata(
+            {_DEPLOY_STATE_STUB_KEY: [{'phase': 'a'}]}, direction='write', enforce=False
+        )
+        assert len(warnings) == 1
+        assert warnings[0].field == _DEPLOY_STATE_STUB_KEY
+        assert warnings[0].code == 'wrong_cardinality'
+        assert model.model_dump()[_DEPLOY_STATE_STUB_KEY] == [{'phase': 'a'}]
+
+    def test_gate_is_generic_not_milestone_special_cased_enforce(self):
+        register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
+        with pytest.raises(TypeError):
+            parse_metadata(
+                {_DEPLOY_STATE_STUB_KEY: [{'phase': 'a'}]}, direction='write', enforce=True
+            )
+
+    def test_well_shaped_dict_milestone_still_parses_clean(self):
+        # The happy path is untouched — the gate only fires on a shape
+        # mismatch. (Mirrors TestListValuedSubmodelSlice's
+        # test_existing_dict_slice_milestone_unaffected, kept here so this
+        # class states both sides of its own contract.)
+        model, warnings = parse_metadata(
+            {'milestone': {'mode': 'delayed', 'after_secs': 604800}},
+            direction='write',
+            enforce=True,
+        )
+        assert warnings == []
+        assert isinstance(model.milestone, Milestone)  # type: ignore[attr-defined]
+
+
 class TestListValuedSubmodelSlice:
     """Generic list-valued registered slice support in parse_metadata.
 
