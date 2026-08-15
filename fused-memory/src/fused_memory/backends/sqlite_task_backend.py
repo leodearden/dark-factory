@@ -615,15 +615,26 @@ async def _migrate_v3_to_v4(
     v0->v1->v2->v3->v4 chain, where this audit is trivially clean.
 
     Returns a result dict ``{'index_built': bool, 'healed': [...],
-    'flagged': [...]}`` at every exit -- ``healed``/``flagged`` are lists of
-    per-group descriptor dicts (``flagged`` entries are the same shape fed to
+    'flagged': [...]}`` at every exit, INCLUDING the unexpected-failure path
+    -- ``healed``/``flagged`` are lists of per-group descriptor dicts
+    (``flagged`` entries are the same shape fed to
     ``residual_dup_escalation_cb``; ``healed`` entries carry ``tag``/
-    ``candidate_key``/``canonical_id``/``cancelled_ids``). The connection-open
-    call site (``_migrate``) ignores this return value -- it exists so
+    ``candidate_key``/``canonical_id``/``cancelled_ids``). On the
+    unexpected-failure path, ``healed`` names exactly the groups whose
+    cancels were durably committed before the failure -- the group that was
+    still in flight when the failure hit is rolled back and, never having
+    been appended, can never appear here -- and ``flagged`` names the
+    ambiguous groups classified so far (a pure observation; nothing is
+    mutated for a flagged group either way). The connection-open call site
+    (``_migrate``) ignores this return value -- it exists so
     ``SqliteTaskBackend.reaudit_candidate_key_index`` (the live, on-demand
     re-run) can share this single implementation and report an accurate
     status without a server restart.
     """
+    # Hoisted above the try/except so the failure path below can report the
+    # groups this pass actually healed/flagged instead of hard-coding [].
+    healed_groups: list[dict[str, Any]] = []
+    flagged_groups: list[dict[str, Any]] = []
     try:
         dup_cursor = await conn.execute(
             """
@@ -639,8 +650,6 @@ async def _migrate_v3_to_v4(
         # to a list so len() below type-checks (it's already a list at runtime).
         residual_rows = list(await dup_cursor.fetchall())
 
-        healed_groups: list[dict[str, Any]] = []
-        flagged_groups: list[dict[str, Any]] = []
         for group in residual_rows:
             rows_cursor = await conn.execute(
                 "SELECT id, title, status, metadata, candidate_key FROM tasks "
@@ -785,7 +794,15 @@ async def _migrate_v3_to_v4(
             'sqlite_task_backend: schema v3->v4 migration failed unexpectedly; '
             'skipping (user_version stays below 4, retried on next open)',
         )
-        return {'index_built': False, 'healed': [], 'flagged': []}
+        # Report what this pass actually did, not a hard-coded empty result:
+        # healed_groups names only durably-committed heals (the rollback
+        # above can only discard the still in-flight group, which by
+        # construction was never appended here -- see the per-group commit
+        # below), and flagged_groups is a pure observation either way.
+        # residual_dup_escalation_cb is deliberately NOT invoked here -- see
+        # the completed-audit path above; a half-finished pass must never
+        # fire a partial/misleading escalation.
+        return {'index_built': False, 'healed': healed_groups, 'flagged': flagged_groups}
 
 
 async def _claimant_columns_present(conn: aiosqlite.Connection) -> bool:
