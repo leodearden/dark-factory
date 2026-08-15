@@ -654,6 +654,7 @@ def canonical_discoverability(
     canonical_record_id: str,
     k: int,
     *,
+    retrieved: list[Any],
     provenance: dict[str, DocumentProvenance] | None = None,
 ) -> dict[str, Any]:
     """Was the topic's canonical found — aliased, and for real?
@@ -678,79 +679,109 @@ def canonical_discoverability(
     correct rather than a bug.  So both are reported and the reader is told
     which is which:
 
-      * ``aliased_*`` — the legacy ``record_id``-match semantics, preserved
-        exactly so the column stays comparable across tables.
-      * ``unaliased_*`` — the canonical's OWN stored record actually
-        ranked.
+      * ``aliased_*`` — the legacy ``record_id``-match semantics over the
+        DELIVERED window, preserved exactly so the column stays comparable
+        across tables.  It is a PLACEMENT property: it answers "what did
+        the reader get, under the canonical's id?".
+      * ``unaliased_*`` — a RETRIEVAL property: did the canonical's own
+        stored record rank, and where?  Read from *retrieved* — the
+        untransformed, untruncated hit list — so no transform can reach
+        it.
 
     The GAP between them IS the aliasing, quantified per arm.
 
-    EVIDENCE, NOT INFERENCE
-    -----------------------
-    A synthesized document is indistinguishable from a stored record at the
-    ``record_id`` level — that is the entire problem — so the honest rate
-    cannot be computed from *hits* alone.  It is read from the transform's
-    own *provenance*, emitted by the transform that did the folding.  With
-    no provenance the unaliased verdict is ``None``: **no measurement, not
-    a measured zero**, and never a quiet fallback to crediting.  A flat arm
-    synthesizes nothing, so passing ``{}`` (rather than ``None``) correctly
-    reports the two as equal.
+    WHY *retrieved* IS REQUIRED, NOT DERIVED
+    ---------------------------------------
+    An earlier version seeded ``unaliased_rank`` from ``aliased_rank`` —
+    the POST-transform rank — and revised it downward only when a
+    disclosure said the canonical had not itself ranked.  That made the
+    "honest" column a function of the transform: every arm that placed a
+    canonical (or a document under its id) first reported
+    ``unaliased_rank=1``, and the committed artifact recorded ~1.05 across
+    the transform arms against flat_read's 3.49.  Measuring retrieval from
+    the transform's output cannot be patched — it is the same conflation
+    this function exists to eliminate — so the pre-transform list is now an
+    argument, and the verdict is computed from it ALONE.  Consequently
+    ``unaliased_*`` is **arm-invariant by construction**: if it can be made
+    to vary across arms over one hit list, the metric is reading the
+    transform again.
 
-    Ranks are **1-based**, and ``None`` when the canonical is absent
-    entirely — inherited from ``topic_discoverability``, where ``0`` would
-    collide with a real rank under a 0-based reading and would average as
-    "very good" in a mean-rank summary.  A canonical ranked OUTSIDE the
-    window still reports its rank: "absent from top-5" and "absent
-    entirely" are different findings.
+    It is deliberately NOT defaulted: a caller that forgets it must get a
+    ``TypeError``, never a quietly re-conflated number.
+
+    Pass the UNTRUNCATED fetch.  ``baseline`` (``apply_arm('flat_read',
+    ...).records``) is already sliced to *k* and structurally cannot
+    express a canonical that ranked below the window — which
+    ``topic_discoverability``'s own docstring calls out as the conflation
+    the rank exists to avoid.
+
+    THE ARM-DEPENDENT FACT KEEPS ITS OWN COLUMN
+    -------------------------------------------
+    ``aliased_credit_is_synthesized`` reports what the old code folded into
+    the rank: the record delivered under the canonical's id is a document
+    the transform MINTED after folding in a canonical the store never
+    returned, rather than the canonical's own stored record.  It is read
+    from the transform's emitted *provenance*.  A synthesized document is
+    indistinguishable from a stored record at the ``record_id`` level —
+    that is the entire problem — so with no disclosure it is ``None``:
+    **no measurement, not a measured zero**, and never a quiet credit.  A
+    stored record carrying the canonical's id simply IS the canonical, so a
+    flat arm needs no disclosure to answer ``False``.
+
+    Ranks are **1-based**, and ``None`` when the canonical is absent from
+    *retrieved* entirely — inherited from ``topic_discoverability``, where
+    ``0`` would collide with a real rank under a 0-based reading and would
+    average as "very good" in a mean-rank summary.  A canonical ranked
+    OUTSIDE the window still reports its rank: "absent from top-5" and
+    "absent entirely" are different findings.  ``retrieval_depth`` rides
+    along so that a ``None`` is never readable as "absent from the corpus":
+    it means "absent from a fetch this deep".
 
     Rank/set-based only: no score is read.  Pure.
     """
+    bake = bake_off()
     # The aliased half is DELEGATED, not restated, so it cannot drift from
     # the semantics the committed E2 table was measured under (INV-5).
-    landed = bake_off().topic_discoverability(
-        hits, topic, canonical_record_id, k,
-    )
-    aliased_rank = landed['canonical_rank']
+    landed = bake.topic_discoverability(hits, topic, canonical_record_id, k)
+
+    # ONE call, over the untransformed hits — the identical pattern
+    # `measure_arm` uses for `stored_canonical_rank`
+    # (bake_off_storage_shape.py:3670-3674), whose in-code comment states
+    # exactly why: nothing can materialise a record the store did not
+    # return.  `topic_discoverability` already scans the full list for the
+    # rank and derives `canonical_in_top_k` against the k it is passed, so
+    # a second windowed call would be redundant.
+    stored = bake.topic_discoverability(retrieved, topic, canonical_record_id, k)
 
     matched = next(
         (hit for hit in hits if hit.record_id == canonical_record_id), None,
     )
     #: Only a SYNTHESIZED document can alias.  A stored record carrying the
-    #: canonical's id simply IS the canonical, so a flat arm needs no
-    #: disclosure to be scored honestly — which is why a missing
+    #: canonical's id simply IS the canonical, which is why a missing
     #: *provenance* is not automatically an unknown.
-    synthesized = matched is not None and matched.role == bake_off().GROUPED_ROLE
-
-    unaliased_rank: int | None = aliased_rank
-    unaliased_in_top_k: bool | None
+    synthesized = matched is not None and matched.role == bake.GROUPED_ROLE
     disclosure = None if provenance is None else provenance.get(canonical_record_id)
 
+    credit_is_synthesized: bool | None
     if disclosure is not None:
-        if not disclosure.canonical_was_itself_ranked:
-            # A document minted under the canonical's id, and the canonical
-            # itself never ranked.  The reader DID receive its body — which
-            # is why the aliased column is not "wrong" — but retrieval did
-            # not find it.
-            unaliased_rank = None
+        # EVIDENCE: the transform that did the folding says whether the
+        # canonical it folded had itself ranked.  This beats the role
+        # fallback below, which is only a discriminator.
+        credit_is_synthesized = not disclosure.canonical_was_itself_ranked
     elif synthesized:
-        # A synthesized document with no disclosure.  Aliasing is invisible
-        # in the record alone — that is the entire problem — so this is
-        # unknowable, and an unknown is not a zero.
-        return {
-            'aliased_in_top_k': landed['canonical_in_top_k'],
-            'aliased_rank': aliased_rank,
-            'unaliased_in_top_k': None,
-            'unaliased_rank': None,
-            'topic_member_count': landed['topic_member_count'],
-        }
-
-    unaliased_in_top_k = unaliased_rank is not None and unaliased_rank <= k
+        # A synthesized document with no disclosure: unknowable from the
+        # record alone, and an unknown is not a zero.
+        credit_is_synthesized = None
+    else:
+        credit_is_synthesized = False
 
     return {
         'aliased_in_top_k': landed['canonical_in_top_k'],
-        'aliased_rank': aliased_rank,
-        'unaliased_in_top_k': unaliased_in_top_k,
-        'unaliased_rank': unaliased_rank,
+        'aliased_rank': landed['canonical_rank'],
+        'aliased_credit_is_synthesized': credit_is_synthesized,
+        'unaliased_in_top_k': stored['canonical_in_top_k'],
+        'unaliased_rank': stored['canonical_rank'],
+        'retrieval_depth': len(retrieved),
         'topic_member_count': landed['topic_member_count'],
     }
 
@@ -1131,6 +1162,7 @@ def score_labeled_query(
     k: int,
     *,
     baseline: list[Any],
+    retrieved: list[Any],
     estimator: tuple[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Score one E2 (labeled) query, with the unlabeled columns filled in too.
@@ -1139,6 +1171,12 @@ def score_labeled_query(
     only columns that appear in both halves of the artifact, so a reader can
     see whether an arm's token and displacement behaviour on authored queries
     survives contact with real traffic.
+
+    *baseline* and *retrieved* are two different lists and are deliberately
+    not collapsed into one: *baseline* is the flat read's WINDOW (already
+    ``[:k]``), against which retention and displacement are deltas;
+    *retrieved* is the untruncated pre-transform fetch, the only list that
+    can answer where retrieval actually put the canonical.
     """
     bake = bake_off()
     window = transform.records[:k]
@@ -1160,6 +1198,7 @@ def score_labeled_query(
         scored['canonical_unaliased_in_top_k'] = None
         scored['canonical_aliased_rank'] = None
         scored['canonical_unaliased_rank'] = None
+        scored['canonical_aliased_credit_is_synthesized'] = None
         return scored
     verdict = canonical_discoverability(
         # The WINDOW ITSELF, not a `ScoredHit` re-wrap.  `topic_discoverability`
@@ -1172,12 +1211,19 @@ def score_labeled_query(
         query.topic,
         canonical.record_id,
         k,
+        # The UNTRUNCATED pre-transform fetch, NOT `baseline`: the honest
+        # column measures retrieval, and retrieval does not stop at k.
+        retrieved=retrieved,
         provenance=transform.provenance,
     )
     scored['canonical_aliased_in_top_k'] = verdict['aliased_in_top_k']
     scored['canonical_unaliased_in_top_k'] = verdict['unaliased_in_top_k']
     scored['canonical_aliased_rank'] = verdict['aliased_rank']
     scored['canonical_unaliased_rank'] = verdict['unaliased_rank']
+    scored['canonical_aliased_credit_is_synthesized'] = (
+        verdict['aliased_credit_is_synthesized']
+    )
+    scored['canonical_retrieval_depth'] = verdict['retrieval_depth']
     return scored
 
 
@@ -1214,7 +1260,11 @@ def score_arm(
         )
         if labeled:
             row = score_labeled_query(
-                transform, query, seeded, k, baseline=baseline, estimator=estimator,
+                transform, query, seeded, k, baseline=baseline,
+                # UNTRUNCATED and pre-transform: `hits` is the full cached
+                # fetch, and `apply_arm` slices to k before transforming.
+                retrieved=[hit.record for hit in hits],
+                estimator=estimator,
             )
         else:
             row = score_unlabeled_query(
@@ -1376,11 +1426,28 @@ def _check_selection_arms(scored: dict[str, Any]) -> None:
 
 
 def _rank_key(arm: str, e2: dict[str, Any]) -> tuple:
-    """Deterministic ordering over MEASURED columns only.
+    """Deterministic ordering over columns an arm can actually MOVE.
 
     No threshold, no tuning knob: the rule is stated in the artifact and
     applied as written (PRD gate G6/D10 — a column is never moved to make a
     recommendation come out).  A ``None`` sorts LAST rather than as a zero.
+
+    NEITHER CANONICAL COLUMN IS A SORT KEY, for two different reasons:
+
+      * ``canonical_unaliased_*`` is **arm-invariant by construction** — it
+        is computed from the pre-transform fetch, so every arm scores
+        identically on it over the same cache.  Leading with it (which this
+        rule previously did) sorts on a constant, leaving the decision to
+        whatever came next while reading as though it had been measured.
+      * ``canonical_aliased_*`` is a PLACEMENT property, and ranking on it
+        would reward an arm for minting a document under the canonical's
+        id — i.e. it would select for the aliasing the artifact exists to
+        disclose.
+
+    Both are still reported in full, one cell each; they simply do not
+    decide.  What remains are the columns a read transform genuinely
+    changes: how much of the expected ground truth reaches the window, what
+    it costs, and what it evicts.
     """
     def worst_first(value: Any, *, higher_is_better: bool) -> tuple[int, float]:
         if value is None:
@@ -1388,7 +1455,6 @@ def _rank_key(arm: str, e2: dict[str, Any]) -> tuple:
         return (0, -float(value) if higher_is_better else float(value))
 
     return (
-        worst_first(e2.get('canonical_unaliased_in_top_k'), higher_is_better=True),
         worst_first(e2.get('claim_recall'), higher_is_better=True),
         worst_first(e2.get('tokens_per_query'), higher_is_better=False),
         worst_first(e2.get('window_displacement'), higher_is_better=False),
@@ -1419,11 +1485,17 @@ def _recommend(arms: dict[str, Any]) -> dict[str, Any]:
         'rule': (
             'Landability first: any arm that would need a `contested` key to '
             'satisfy PRD V2 is excluded outright, because that key does not '
-            'exist. Among the rest, rank by UNALIASED canonical '
-            'discoverability, then claim recall, then tokens/query (lower '
-            'better), then window displacement (lower better). A None sorts '
-            'last, never as a zero. The rule is fixed before the numbers are '
-            'read and is not re-tuned to move a column.'
+            'exist. Among the rest, rank by claim recall, then tokens/query '
+            '(lower better), then window displacement (lower better). '
+            'NEITHER canonical column is a sort key: the UNALIASED one is '
+            'arm-invariant by construction — it is read from the '
+            'pre-transform fetch, so no read transform can move it, and '
+            'ranking on it would sort every arm on the same constant — while '
+            'the ALIASED one is a placement property, so ranking on it would '
+            'reward minting a document under the canonical id. Both are '
+            'reported in full and neither decides. A None sorts last, never '
+            'as a zero. The rule is fixed before the numbers are read and is '
+            'not re-tuned to move a column.'
         ),
         'rationale': (
             f'{ARM_LABELS[winner]} is the highest-ranked arm that task 3111 '
@@ -1573,10 +1645,23 @@ def render_selection_markdown(report: dict[str, Any]) -> str:
         'not what was measured. Both rates are printed above, in one cell '
         'each, so neither can be quoted without its semantics.')
     add('')
-    add('* **aliased** — the legacy `record_id`-match semantics, preserved '
-        'so this table stays comparable with the committed one.')
-    add('* **unaliased** — the canonical\'s OWN stored record actually '
-        'ranked, read from the transform\'s emitted provenance.')
+    add('* **aliased** — the legacy `record_id`-match semantics over the '
+        'DELIVERED window, preserved so this table stays comparable with '
+        'the committed one. A PLACEMENT property: what the reader got '
+        'under the canonical\'s id.')
+    add('* **unaliased** — a RETRIEVAL property: the canonical\'s OWN '
+        'stored record ranked, and where. Computed from the untransformed, '
+        'untruncated hit list, so no read transform can touch it — which '
+        'makes it **identical across every arm in the table by '
+        'construction**, and that identity is the finding, not an error. '
+        'A column that varied by arm here would be measuring the transform '
+        'again.')
+    add('')
+    add('Because it is arm-invariant, the unaliased column cannot '
+        'discriminate between arms and is therefore **not** a sort key in '
+        'the selection rule below; neither is the aliased one, which would '
+        'reward minting a document under the canonical\'s id. See the '
+        'Recommendation.')
     add('')
 
     # --- (b) ---------------------------------------------------------
