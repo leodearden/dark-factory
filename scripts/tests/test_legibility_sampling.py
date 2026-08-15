@@ -13,6 +13,7 @@ from datetime import date as dt_date
 from pathlib import Path
 
 from legibility import config as config_mod
+from legibility import digest
 from legibility import inventory
 from legibility import sampling as mod
 
@@ -141,6 +142,109 @@ class TestScoreSignalsAllClasses:
             + counts.interrupt
         )
         assert counts.total_signal == 5
+
+
+_CEILING_DECLARATION = 'WATCHER_REARM_OUTCOME: CEILING exit=124'
+
+
+def _designed_outcome_record(i: int = 0) -> dict:
+    """An is_error tool_result carrying a DECLARED bounded-poll ceiling."""
+    return {
+        'type': 'user',
+        'timestamp': '2026-07-13T10:00:00.000Z',
+        'message': {
+            'content': [
+                {
+                    'type': 'tool_result',
+                    'tool_use_id': f'tu-c{i}',
+                    'is_error': True,
+                    'content': _CEILING_DECLARATION,
+                },
+            ]
+        },
+    }
+
+
+def _genuine_error_record() -> dict:
+    """An is_error tool_result that is a REAL failure (bare exit 2)."""
+    return {
+        'type': 'user',
+        'timestamp': '2026-07-13T10:05:00.000Z',
+        'message': {
+            'content': [
+                {
+                    'type': 'tool_result',
+                    'tool_use_id': 'tu-g',
+                    'is_error': True,
+                    'content': 'DARK_FACTORY_ROOT unset, exit code 2',
+                },
+            ]
+        },
+    }
+
+
+class TestSamplerDesignedOutcomeParity:
+    """The sampler must not over-rank a session on designed-outcome noise
+    any more than the digest does. sampling.py holds a SECOND, independent
+    five-class definition used for ranking; before task 3610 a ceiling-only
+    session digested as tool_error 0 but still RANKED as 13 errors, a silent
+    divergence between two things both documented as "PRD §7.2
+    signal_counts". Both now share digest's one classifier.
+    """
+
+    def test_ceiling_only_session_scores_zero_tool_errors(self, tmp_path):
+        path = _write_transcript(
+            tmp_path / 'ceilings.jsonl',
+            [_designed_outcome_record(i) for i in range(13)],
+        )
+
+        counts = mod.score_signals(path)
+
+        assert counts.tool_error == 0
+        assert counts.designed_outcome == 13
+
+    def test_genuine_failure_still_increments_tool_error(self, tmp_path):
+        path = _write_transcript(
+            tmp_path / 'mixed.jsonl',
+            [_designed_outcome_record(i) for i in range(3)] + [_genuine_error_record()],
+        )
+
+        counts = mod.score_signals(path)
+
+        assert counts.tool_error == 1
+        assert counts.designed_outcome == 3
+
+    def test_total_signal_excludes_designed_outcome(self, tmp_path):
+        # total_signal is the sampler's RANKING scale over the five scored
+        # confusion classes; adding designed outcomes must not move it.
+        base = _write_transcript(tmp_path / 'base.jsonl', [_genuine_error_record()])
+        noisy = _write_transcript(
+            tmp_path / 'noisy.jsonl',
+            [_genuine_error_record()] + [_designed_outcome_record(i) for i in range(9)],
+        )
+
+        base_counts = mod.score_signals(base)
+        noisy_counts = mod.score_signals(noisy)
+
+        assert noisy_counts.designed_outcome == 9
+        assert base_counts.designed_outcome == 0
+        assert noisy_counts.total_signal == base_counts.total_signal == 1
+
+    def test_sampler_and_digest_agree_on_the_same_records(self, tmp_path):
+        # The anti-drift pin: one fixture, two independent scanners, same
+        # tool_error. This is the assertion that fails the moment either
+        # definition is changed without the other.
+        records = (
+            [_designed_outcome_record(i) for i in range(3)]
+            + [_genuine_error_record()]
+        )
+        path = _write_transcript(tmp_path / 'parity.jsonl', records)
+
+        sampled = mod.score_signals(path)
+        digested = digest.signal_counts(records)
+
+        assert sampled.tool_error == digested['tool_error'] == 1
+        assert sampled.designed_outcome == digested['designed_outcome'] == 3
 
 
 class TestScoreSignalsClean:
