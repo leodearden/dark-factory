@@ -2092,10 +2092,9 @@ async def test_call_judge_cli_scopes_mcp_to_no_servers(mock_journal):
     call_kwargs = mock_invoke.call_args.kwargs
 
     assert call_kwargs['strict_mcp_config'] is True
+    # A zero-server config, but a TRUTHY one — the --strict-mcp-config emit is
+    # gated on `if mcp_config:`, so an inline `{}` regression fails here.
     assert call_kwargs['mcp_config'] == {'mcpServers': {}}
-    # Restated at the call site so an inline `{}` regression fails HERE too:
-    # the --strict-mcp-config emit is gated on `if mcp_config:`.
-    assert call_kwargs['mcp_config'], 'mcp_config must be TRUTHY or the strict flag is never emitted'
 
     # Unregressed pre-existing guarantees.
     assert call_kwargs['disallowed_tools'] == ['*']
@@ -2110,18 +2109,23 @@ async def test_call_judge_cli_forwards_mcp_scoping_to_invoke_claude_agent(mock_j
 
     ``invoke_with_cap_retry`` takes ``**invoke_kwargs`` and forwards them blind,
     so the kwargs-level test above proves only that the judge NAMES these
-    kwargs — a misspelled or unsupported one would sail past that mock and
-    surface as a TypeError only in production.  Patching one level lower with
-    ``usage_gate=None`` (the single-invocation fast path) runs the real
-    forwarding code, closing that gap — same rationale as
+    kwargs.  Patching one level lower with ``usage_gate=None`` (the
+    single-invocation fast path) runs the real forwarding code, proving the
+    keys are not dropped en route — same rationale as
     test_call_judge_cli_forwards_cwd_to_invoke_claude_agent above.
+
+    ``autospec=True`` is load-bearing, not incidental: a bare ``AsyncMock`` is
+    signature-less and swallows arbitrary keywords, so a misspelled
+    ``strict_mcp_configs=True`` would be forwarded and asserted-on happily here
+    and surface as a TypeError only in production.  The autospec'd mock is
+    built from the real ``invoke_claude_agent`` signature and raises TypeError
+    on a kwarg it does not accept, so this test also pins that both names are
+    genuinely supported parameters.
 
     Deliberately NOT asserted: that the ambient .mcp.json is actually
     suppressed.  That is the external CLI's own documented
     ``--strict-mcp-config`` contract, not hermetically testable here.
     """
-    from unittest.mock import AsyncMock
-
     from shared.cli_invoke import AgentResult
 
     # Use tmp_path so the cwd Path actually exists on disk.
@@ -2138,9 +2142,12 @@ async def test_call_judge_cli_forwards_mcp_scoping_to_invoke_claude_agent(mock_j
         session_id='jsess-mcp-deep',
     )
 
+    # autospec (not a bare AsyncMock): validates every kwarg against the real
+    # invoke_claude_agent signature, so an unsupported/misspelled one raises
+    # TypeError here instead of only in production. See the docstring.
     with patch(
         'shared.cli_invoke.invoke_claude_agent',
-        new_callable=AsyncMock,
+        autospec=True,
     ) as mock_agent:
         mock_agent.return_value = fake_result
 
