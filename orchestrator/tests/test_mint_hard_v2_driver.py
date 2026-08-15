@@ -16,6 +16,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import pytest
 
@@ -480,7 +481,11 @@ class TestCeilingsEvidenceGuard:
 # ---------------------------------------------------------------------------
 
 class TestEnrichFromTaskDb:
-    def _cand(self) -> object:
+    # `Any`, not `object`: the driver is loaded by path (see _load_driver), so
+    # `driver.Candidate` is only ever `Any` to a type checker. Narrowing the
+    # return to `object` throws that away and makes every field read below a
+    # reportAttributeAccessIssue.
+    def _cand(self) -> Any:
         return driver.Candidate(
             task_id='7', project='reify', project_root='/home/leo/src/reify',
             title='pre-existing title', description='pre-existing brief',
