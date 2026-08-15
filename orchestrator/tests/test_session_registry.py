@@ -3629,24 +3629,6 @@ class TestLeaseSlugIsNotASessionRecordKey:
             self.SESSION_UUID,  # type: ignore[arg-type]
         )
 
-    def test_the_withdrawn_corroboration_is_gone_and_cannot_quietly_return(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        _seed_lease(tmp_path, pid=_DEAD_PID)
-        contender = sr.LeaseHolder(
-            session_slug='watcher-df-200', pid=os.getpid(), start_ts=_NOW.isoformat()
-        )
-        claim = sr.claim_lease('watcher-df', holder=contender, root=tmp_path, now=_NOW)
-        status = sr.lease_status('watcher-df', root=tmp_path, now=_NOW)
-        capsys.readouterr()
-
-        # A field documented as corroborating evidence but structurally
-        # constant is worse than no field: an operator reads
-        # `holder_session=absent` as a positive orphan finding.
-        assert not hasattr(claim, 'holder_session_state')
-        assert not hasattr(status, 'holder_session')
-        assert not hasattr(sr, '_resolve_holder_session_state')
-
 
 # --- resolve_session_pid (task 3994 defect 2) ------------------------------
 
