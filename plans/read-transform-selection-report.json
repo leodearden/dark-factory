@@ -1,0 +1,287 @@
+{
+  "arms": {
+    "flat_read": {
+      "e2": {
+        "baseline_retention_at_k": 1.0,
+        "canonical_aliased_in_top_k": 0.652542372881356,
+        "canonical_aliased_rank": 3.4935064935064934,
+        "canonical_unaliased_in_top_k": 0.652542372881356,
+        "canonical_unaliased_rank": 3.4935064935064934,
+        "claim_recall": 0.9745762711864406,
+        "k": 10.0,
+        "tokens_per_query": 1181.2881355932204,
+        "topic_diversity": 2.7161016949152543,
+        "unlabeled": 0.0,
+        "unlabeled_reason": null,
+        "untopiced_in_window": 2.5635593220338984,
+        "window_displacement": 0.0,
+        "window_reordered": 0.0,
+        "window_size": 10.0
+      },
+      "e2_query_count": 236,
+      "label": "flat read (baseline)",
+      "production": {
+        "baseline_retention_at_k": 1.0,
+        "canonical_aliased_in_top_k": null,
+        "canonical_unaliased_in_top_k": null,
+        "claim_recall": null,
+        "k": 5.0,
+        "tokens_per_query": 1240.4772727272727,
+        "topic_diversity": 0.38636363636363635,
+        "unlabeled": 1.0,
+        "untopiced_in_window": 4.545454545454546,
+        "window_displacement": 0.0,
+        "window_reordered": 0.0,
+        "window_size": 5.0
+      },
+      "production_query_count": 44,
+      "spec": {
+        "displaces_at_window_edge": false,
+        "drops_ranked_records": false,
+        "key": "flat_read",
+        "label": "flat read (baseline)",
+        "requires_contested_key_for_v2": false
+      }
+    },
+    "promoting_pin": {
+      "e2": {
+        "baseline_retention_at_k": 0.8292372881355932,
+        "canonical_aliased_in_top_k": 0.9957627118644068,
+        "canonical_aliased_rank": 1.0595744680851065,
+        "canonical_unaliased_in_top_k": 0.9957627118644068,
+        "canonical_unaliased_rank": 1.0595744680851065,
+        "claim_recall": 0.9957627118644068,
+        "k": 10.0,
+        "tokens_per_query": 1070.2711864406779,
+        "topic_diversity": 2.7161016949152543,
+        "unlabeled": 0.0,
+        "unlabeled_reason": null,
+        "untopiced_in_window": 1.9703389830508475,
+        "window_displacement": 1.7076271186440677,
+        "window_reordered": 0.940677966101695,
+        "window_size": 10.0
+      },
+      "e2_query_count": 236,
+      "label": "promoting topic pin",
+      "production": {
+        "baseline_retention_at_k": 0.9363636363636364,
+        "canonical_aliased_in_top_k": null,
+        "canonical_unaliased_in_top_k": null,
+        "claim_recall": null,
+        "k": 5.0,
+        "tokens_per_query": 1203.840909090909,
+        "topic_diversity": 0.38636363636363635,
+        "unlabeled": 1.0,
+        "untopiced_in_window": 4.363636363636363,
+        "window_displacement": 0.3181818181818182,
+        "window_reordered": 0.2727272727272727,
+        "window_size": 5.0
+      },
+      "production_query_count": 44,
+      "spec": {
+        "displaces_at_window_edge": true,
+        "drops_ranked_records": false,
+        "key": "promoting_pin",
+        "label": "promoting topic pin",
+        "requires_contested_key_for_v2": false
+      }
+    },
+    "topic_diversity_cap": {
+      "e2": {
+        "baseline_retention_at_k": 0.5279661016949152,
+        "canonical_aliased_in_top_k": 0.652542372881356,
+        "canonical_aliased_rank": 1.0454545454545454,
+        "canonical_unaliased_in_top_k": 0.652542372881356,
+        "canonical_unaliased_rank": 1.0454545454545454,
+        "claim_recall": 0.6271186440677966,
+        "k": 10.0,
+        "tokens_per_query": 790.228813559322,
+        "topic_diversity": 2.7161016949152543,
+        "unlabeled": 0.0,
+        "unlabeled_reason": null,
+        "untopiced_in_window": 2.5635593220338984,
+        "window_displacement": 4.720338983050848,
+        "window_reordered": 0.9576271186440678,
+        "window_size": 5.279661016949152
+      },
+      "e2_query_count": 236,
+      "label": "topic-diversity cap",
+      "production": {
+        "baseline_retention_at_k": 0.9863636363636363,
+        "canonical_aliased_in_top_k": null,
+        "canonical_unaliased_in_top_k": null,
+        "claim_recall": null,
+        "k": 5.0,
+        "tokens_per_query": 1234.7727272727273,
+        "topic_diversity": 0.38636363636363635,
+        "unlabeled": 1.0,
+        "untopiced_in_window": 4.545454545454546,
+        "window_displacement": 0.06818181818181818,
+        "window_reordered": 0.06818181818181818,
+        "window_size": 4.931818181818182
+      },
+      "production_query_count": 44,
+      "spec": {
+        "displaces_at_window_edge": false,
+        "drops_ranked_records": true,
+        "key": "topic_diversity_cap",
+        "label": "topic-diversity cap",
+        "requires_contested_key_for_v2": false
+      }
+    },
+    "topic_keyed_grouped": {
+      "e2": {
+        "baseline_retention_at_k": 1.0,
+        "canonical_aliased_in_top_k": 0.9957627118644068,
+        "canonical_aliased_rank": 1.1063829787234043,
+        "canonical_unaliased_in_top_k": 0.652542372881356,
+        "canonical_unaliased_rank": 1.0454545454545454,
+        "claim_recall": 0.9957627118644068,
+        "k": 10.0,
+        "tokens_per_query": 1308.3728813559321,
+        "topic_diversity": 2.7161016949152543,
+        "unlabeled": 0.0,
+        "unlabeled_reason": null,
+        "untopiced_in_window": 2.5635593220338984,
+        "window_displacement": 6.427966101694915,
+        "window_reordered": 0.9957627118644068,
+        "window_size": 5.279661016949152
+      },
+      "e2_query_count": 236,
+      "label": "topic-keyed grouped read",
+      "production": {
+        "baseline_retention_at_k": 1.0,
+        "canonical_aliased_in_top_k": null,
+        "canonical_unaliased_in_top_k": null,
+        "claim_recall": null,
+        "k": 5.0,
+        "tokens_per_query": 1261.4318181818182,
+        "topic_diversity": 0.38636363636363635,
+        "unlabeled": 1.0,
+        "untopiced_in_window": 4.545454545454546,
+        "window_displacement": 0.38636363636363635,
+        "window_reordered": 0.22727272727272727,
+        "window_size": 4.931818181818182
+      },
+      "production_query_count": 44,
+      "spec": {
+        "displaces_at_window_edge": false,
+        "drops_ranked_records": true,
+        "key": "topic_keyed_grouped",
+        "label": "topic-keyed grouped read",
+        "requires_contested_key_for_v2": true
+      }
+    }
+  },
+  "contested_is_a_fixture_field": true,
+  "e2_k": 10,
+  "fixture_provenance": [
+    {
+      "commit": "55e242a2c8681fb8a60fdb34e3d5194109781e87",
+      "path": "fused-memory/tests/fixtures/write_triage_calibration.jsonl"
+    },
+    {
+      "commit": "02886ef290cde99ce88426cd1d3b5565a551e293",
+      "path": "fused-memory/tests/fixtures/memory_eval_topic_registry.json"
+    },
+    {
+      "commit": "55a9218a4c5809cad828db65781b1bd7389dff94",
+      "path": "fused-memory/tests/fixtures/e2_arm_claims.jsonl"
+    },
+    {
+      "commit": "8972e9b17c746b7ec7cc377971cbc41fc25ad3d1",
+      "path": "fused-memory/tests/fixtures/e2_query_set.jsonl"
+    },
+    {
+      "commit": "6b4809ec138e8ae04c810bffbab4728b6c1d395d",
+      "path": "fused-memory/tests/fixtures/e2_distractor_slab.jsonl"
+    },
+    {
+      "commit": "f51013f7f543b91783270ebbba24aa6c05d4edf8",
+      "path": "fused-memory/tests/fixtures/production_query_sample.jsonl"
+    },
+    {
+      "commit": null,
+      "path": "fused-memory/tests/fixtures/e2_fetch_cache.json"
+    }
+  ],
+  "per_topic_cap": 1,
+  "production_k": 5,
+  "production_queries": {
+    "family_share": 0.645068,
+    "harvest": {
+      "family_share": 0.645068,
+      "harvested_at": "2026-08-12T18:13:02.261832+00:00",
+      "journal_path": "/home/leo/src/dark-factory/data/reconciliation/write_journal.db",
+      "literal_share": 0.519665,
+      "search_limit": 5,
+      "seed": 4004,
+      "tail_count": 152127,
+      "tail_distinct": 133283,
+      "tail_share": 0.354932,
+      "total_search_ops": 428609
+    },
+    "observed_limit": 5,
+    "sampled_query_count": 44,
+    "tail_query_count": 40,
+    "templates": [
+      {
+        "match": "literal",
+        "observed_count": 74103,
+        "template": "project overview architecture goals",
+        "text": "project overview architecture goals",
+        "traffic_share": 0.172892
+      },
+      {
+        "match": "literal",
+        "observed_count": 74346,
+        "template": "coding conventions and project norms",
+        "text": "coding conventions and project norms",
+        "traffic_share": 0.173459
+      },
+      {
+        "match": "literal",
+        "observed_count": 74284,
+        "template": "recent decisions and rationale",
+        "text": "recent decisions and rationale",
+        "traffic_share": 0.173314
+      },
+      {
+        "match": "parameterized",
+        "observed_count": 53749,
+        "template": "task {task_id} context and related decisions",
+        "text": "task reify_task_12 context and related decisions",
+        "traffic_share": 0.125403
+      }
+    ],
+    "unlabeled": true,
+    "unlabeled_reason": "Production queries carry no ground truth: the reconciliation write journal records which query was issued, never which memory should have been returned. Claim recall and canonical discoverability are therefore not computable over this set and render as no-measurement, not as a measured zero."
+  },
+  "recommendation": {
+    "arm": "promoting_pin",
+    "eligible": [
+      "flat_read",
+      "promoting_pin",
+      "topic_diversity_cap"
+    ],
+    "excluded_pending_contested_key": [
+      "topic_keyed_grouped"
+    ],
+    "label": "promoting topic pin",
+    "rationale": "promoting topic pin is the highest-ranked arm that task 3111 can actually land today: it satisfies the ordering above while requiring no vocabulary key that has no writer. Arms excluded pending a `contested` key: ['topic-keyed grouped read'].",
+    "rule": "Landability first: any arm that would need a `contested` key to satisfy PRD V2 is excluded outright, because that key does not exist. Among the rest, rank by UNALIASED canonical discoverability, then claim recall, then tokens/query (lower better), then window displacement (lower better). A None sorts last, never as a zero. The rule is fixed before the numbers are read and is not re-tuned to move a column."
+  },
+  "reserved_vocabulary_keys": [
+    "canonical",
+    "kind",
+    "parent_id",
+    "supersedes",
+    "topic"
+  ],
+  "schema": "read-transform-selection/1",
+  "shape": "c_peers",
+  "sighting_crediting": "uncredited",
+  "token_estimator": "char-proxy:4-chars-per-token",
+  "unlabeled_reason": "Production queries carry no ground truth: the reconciliation write journal records which query was issued, never which memory should have been returned. Claim recall and canonical discoverability are therefore not computable over this set and render as no-measurement, not as a measured zero.",
+  "v2_protection": "contested children are never suppressed"
+}

@@ -2301,10 +2301,14 @@ class TestCommittedSelectionJson:
         assert report['schema'] == _mod().SELECTION_REPORT_SCHEMA
 
     def test_every_arm_has_a_row_in_both_halves(self):
+        """As a SET: the JSON is written `sort_keys=True` so the committed
+        file diffs cleanly, which makes its key order alphabetical by
+        construction and not a statement about arm ordering.  Order IS
+        asserted — on the markdown, where it is what a reader sees."""
         mod = _mod()
         report = _committed_selection_json()
 
-        assert list(report['arms']) == list(mod.ARM_KEYS)
+        assert set(report['arms']) == set(mod.ARM_KEYS)
         for arm in mod.ARM_KEYS:
             assert set(report['arms'][arm]) >= {'label', 'spec', 'e2', 'production'}
 
@@ -2401,6 +2405,18 @@ class TestCommittedSelectionMarkdown:
         for arm in arms:
             label = mod.ARM_LABELS[arm]
             assert sum(1 for row in rows if _cells(row)[0] == label) == 1, arm
+
+    def test_the_rows_are_in_arm_order_with_the_baseline_first(self):
+        """Every column is read as a delta against the flat read, so the
+        baseline is the first row a reader meets — not wherever an alphabetical
+        sort happened to put it."""
+        mod = _mod()
+        rows = _selection_table_rows(_committed_selection_markdown())
+
+        assert [_cells(row)[0] for row in rows] == [
+            mod.ARM_LABELS[arm] for arm in mod.ARM_KEYS
+        ]
+        assert _cells(rows[0])[0] == mod.ARM_LABELS['flat_read']
 
     def test_every_cell_is_a_real_measurement_or_the_em_dash(self):
         """No blank, no `None`, no `nan` — the three ways a hole gets rendered

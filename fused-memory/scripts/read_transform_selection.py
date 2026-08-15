@@ -1108,8 +1108,17 @@ def apply_arm(
             render_sightings=render_sightings,
         )
     else: # topic_diversity_cap
-        result = apply_topic_diversity_cap(
-            records, seeded.canonical_by_topic, per_topic=per_topic,
+        # Wrapped, not returned bare: the cap SYNTHESIZES NOTHING (it is the
+        # cheapest family member — no document, no crediting semantics), so
+        # it returns a plain list and its provenance is legitimately empty.
+        # An empty dict rather than None is the load-bearing distinction:
+        # `canonical_discoverability` reads None as "no measurement" and {} as
+        # "this arm folded nothing", which is the true fact here.
+        result = TransformResult(
+            records=apply_topic_diversity_cap(
+                records, seeded.canonical_by_topic, per_topic=per_topic,
+            ),
+            provenance={},
         )
 
     return TransformResult(records=result.records[:k], provenance=result.provenance)
@@ -1153,7 +1162,13 @@ def score_labeled_query(
         scored['canonical_unaliased_rank'] = None
         return scored
     verdict = canonical_discoverability(
-        [bake.ScoredHit(record=r, score=0.0) for r in window],
+        # The WINDOW ITSELF, not a `ScoredHit` re-wrap.  `topic_discoverability`
+        # — which `canonical_discoverability` delegates the aliased half to —
+        # reads `.record_id` off each element, i.e. it consumes `ArmRecord`s.
+        # Wrapping them would also have smuggled a score into a rank-based
+        # metric, which `ScoredHit` exists to make structurally impossible
+        # (bake_off:1346-1355).
+        window,
         query.topic,
         canonical.record_id,
         k,
@@ -1310,6 +1325,15 @@ REQUIRED_ARM_METRICS: tuple[str, ...] = (
 
 SELECTION_REPORT_SCHEMA = 'read-transform-selection/1'
 
+_PLANS_DIR = _SCRIPTS_DIR.parent.parent / 'plans'
+
+#: The SIBLING pair.  Deliberately not `e2-storage-shape-bakeoff-report.*`:
+#: that artifact records a different experiment (which WRITE shape), its
+#: `_check_arms` asserts the E2 arm set exactly, and task 3560 is
+#: concurrently landing the aliasing disclosure into it.
+DEFAULT_SELECTION_JSON = _PLANS_DIR / 'read-transform-selection-report.json'
+DEFAULT_SELECTION_MD = _PLANS_DIR / 'read-transform-selection-report.md'
+
 
 class IncompleteSelectionError(RuntimeError):
     """A partial table must never render as a complete one.
@@ -1448,6 +1472,7 @@ def build_selection_report(scored: dict[str, Any]) -> dict[str, Any]:
         'token_estimator': scored.get('token_estimator'),
         'e2_k': scored['e2'][ARM_KEYS[0]].get('k'),
         'production_k': scored['production'][ARM_KEYS[0]].get('k'),
+        'production_queries': scored.get('production_queries') or {},
         'arms': arms,
         'recommendation': _recommend(arms),
         'reserved_vocabulary_keys': sorted(RESERVED_VOCABULARY_KEYS),
@@ -1638,6 +1663,39 @@ def render_selection_markdown(report: dict[str, Any]) -> str:
             'full so a later reader with a `contested` key can re-decide.')
         add('')
 
+    # --- the production set ------------------------------------------
+    production = report.get('production_queries') or {}
+    if production.get('templates'):
+        add('## The production query set')
+        add('')
+        add('Sampled READ-ONLY from the reconciliation write journal '
+            '(`fused-memory/scripts/harvest_production_queries.py`, '
+            '`mode=ro` + `PRAGMA query_only`). The four briefing-assembler '
+            'templates below are the high-volume core; the shares are '
+            'measured counts over that journal, not estimates.')
+        add('')
+        add('| query template | match | observed | share of all search traffic |')
+        add('| --- | --- | --- | --- |')
+        for entry in production['templates']:
+            share = entry.get('traffic_share')
+            add(f'| `{entry["template"]}` '
+                f'| {entry.get("match") or dash} '
+                f'| {entry.get("observed_count", dash):,} '
+                f'| {dash if share is None else f"{share * 100:.2f}%"} |')
+        add('')
+        family = production.get('family_share')
+        if family is not None:
+            add(f'Together the four templates are **{family * 100:.2f}%** of '
+                'all search traffic in the journal, so an arm\'s cost on them '
+                'is not a corner case — it is the modal read. The rest of '
+                'the sample is a bounded deterministic tail draw from the '
+                'long tail of one-off queries.')
+            add('')
+        add('These queries fire at `limit=5` in production '
+            '(`briefing.py`:1376), which is the window the production half '
+            'of the table above is scored at.')
+        add('')
+
     # --- the honest tail ---------------------------------------------
     add('## Why the production columns carry no labels')
     add('')
@@ -1679,3 +1737,412 @@ def write_artifacts(
     bake._atomic_write_text(json_target, body)
     bake._atomic_write_text(md_target, markdown)
     return json_target, md_target
+
+
+# ---------------------------------------------------------------------------
+# The driver: materialize offline, replay the cache, score, emit
+# ---------------------------------------------------------------------------
+#
+# Everything below the fetch is pure, which is the whole point of the cache:
+# the ONLY step that needs Qdrant or an embedder is
+# `fetch_production_rankings`, run once to extend the committed cache with
+# the production query text.  Re-deriving this table afterwards — by task
+# 3111, or by anyone re-checking it — needs neither.
+
+
+PRODUCTION_CACHE_KEY = 'production'
+DEFAULT_FETCH_CACHE = (
+    _SCRIPTS_DIR.parent / 'tests' / 'fixtures' / 'e2_fetch_cache.json'
+)
+DEFAULT_PRODUCTION_QUERIES = (
+    _SCRIPTS_DIR.parent / 'tests' / 'fixtures' / 'production_query_sample.jsonl'
+)
+
+
+class ProductionFetchError(RuntimeError):
+    """The production half of the cache is absent, stale or truncated."""
+
+
+def production_query_provenance(
+    queries: list[ProductionQuery],
+    *,
+    harvest_sidecar: str | Path | None = None,
+) -> dict[str, Any]:
+    """The traffic shares this table's external-validity claim rests on.
+
+    Copied FROM the committed sample rather than recomputed, so the artifact
+    and the fixture cannot disagree: if the sample is re-harvested and the
+    report is not regenerated, the committed-artifact test says so instead of
+    the table quietly describing a corpus that is no longer in the tree.
+    """
+    import json  # noqa: PLC0415
+
+    templates = [
+        {
+            'template': query.template,
+            'text': query.text,
+            'match': query.match,
+            'observed_count': query.observed_count,
+            'traffic_share': query.traffic_share,
+        }
+        for query in queries
+        if query.source == 'briefing_template' and query.template
+    ]
+    block: dict[str, Any] = {
+        'templates': templates,
+        'family_share': round(
+            sum(entry['traffic_share'] for entry in templates), 6,
+        ) if templates else None,
+        'sampled_query_count': len(queries),
+        'tail_query_count': len(queries) - len(templates),
+        'observed_limit': queries[0].observed_limit if queries else None,
+        'unlabeled': True,
+        'unlabeled_reason': _UNLABELED_REASON,
+    }
+    if harvest_sidecar is not None and Path(harvest_sidecar).exists():
+        sidecar = json.loads(Path(harvest_sidecar).read_text(encoding='utf-8'))
+        block['harvest'] = {
+            key: sidecar[key]
+            for key in (
+                'harvested_at', 'journal_path', 'total_search_ops',
+                'literal_share', 'family_share', 'tail_share', 'tail_count',
+                'tail_distinct', 'search_limit', 'seed',
+            )
+            if key in sidecar
+        }
+    return block
+
+
+def materialize_selection_arm(
+    *,
+    shape: str = SELECTION_SHAPE,
+    alpha_fixture: str | Path | None = None,
+    registry: str | Path | None = None,
+    arm_claims: str | Path | None = None,
+    distractor_slab: str | Path | None = None,
+    project_suffix: str | None = None,
+) -> tuple[Any, list[Any]]:
+    """Rebuild the seeded arm OFFLINE, plus the E2 query set.
+
+    Deterministic over the committed fixtures — that determinism is exactly
+    what lets the fetch cache store record ids and nothing else.
+    """
+    bake = bake_off()
+    clusters = bake.load_calibration_clusters(
+        alpha_fixture or bake.DEFAULT_ALPHA_FIXTURE_PATH,
+    )
+    topics = bake.load_registry_topics(registry or bake.DEFAULT_REGISTRY_PATH)
+    claims = bake.load_arm_claims(arm_claims or bake.DEFAULT_ARM_CLAIMS_PATH)
+    queries = bake.load_query_set(bake.DEFAULT_QUERY_SET_PATH)
+    distractors = bake.load_distractor_slab(
+        distractor_slab or bake.DEFAULT_DISTRACTOR_SLAB_PATH,
+    )
+    bake.cross_validate_fixtures(
+        clusters=clusters, topics=topics, claims=claims, queries=queries,
+    )
+    records = bake.materialize_arm(shape, clusters, claims, topics, distractors)
+    seeded = bake._index_arm(
+        shape,
+        bake.arm_project_id(shape, suffix=project_suffix),
+        bake.ephemeral_collections(suffix=project_suffix)[shape],
+        records,
+        claims,
+    )
+    return seeded, queries
+
+
+def load_production_fetches(
+    path: str | Path, seeded: Any, *, expect_query_ids: list[str] | None = None,
+) -> dict[str, list[Any]]:
+    """Rehydrate the production rankings, or refuse by name.
+
+    The refusals are the bake-off's own — a cached record this run did not
+    materialize raises through ``_rehydrate_ranking``, and the corpus
+    fingerprint is checked here — because a production half replayed against
+    a drifted corpus is exactly as unpublishable as an E2 half.
+    """
+    import json  # noqa: PLC0415
+
+    bake = bake_off()
+    target = Path(path)
+    try:
+        doc = json.loads(target.read_text(encoding='utf-8'))
+    except FileNotFoundError as exc:
+        raise ProductionFetchError(
+            f'no fetch cache at {target}. Produce it with --dump-fetches on a '
+            f'live bake-off run, then extend it with --extend-cache-live.'
+        ) from exc
+    block = doc.get(PRODUCTION_CACHE_KEY)
+    if not isinstance(block, dict) or seeded.shape not in block:
+        raise ProductionFetchError(
+            f'fetch cache at {target} carries no production rankings for shape '
+            f'{seeded.shape!r}. The E2 cache cannot cover them: production '
+            f'queries are new text and need their own embed+ANN pass. Run '
+            f'`--extend-cache-live` once.'
+        )
+    shape_block = block[seeded.shape]
+    fingerprint = bake.corpus_fingerprint(seeded.records)
+    cached_fingerprint = shape_block.get('corpus_fingerprint')
+    if cached_fingerprint != fingerprint:
+        raise ProductionFetchError(
+            f'fetch cache at {target}: the production rankings for '
+            f'{seeded.shape!r} were fetched against corpus '
+            f'{cached_fingerprint!r}, but this run materialized '
+            f'{fingerprint!r}. The cache and the fixtures describe different '
+            f'corpora; re-fetch rather than publishing a stale ranking as a '
+            f'fresh measurement.'
+        )
+    cached = shape_block.get('queries') or {}
+    if expect_query_ids is not None:
+        missing = [q for q in expect_query_ids if q not in cached]
+        if missing:
+            raise ProductionFetchError(
+                f'fetch cache at {target} is TRUNCATED for the production set: '
+                f'{len(missing)} of {len(expect_query_ids)} queries have no '
+                f'cached ranking, e.g. {missing[:5]}. Scoring the arm anyway '
+                f'would measure a subset while the report claimed the whole '
+                f'set.'
+            )
+    return {
+        query_id: bake._rehydrate_ranking(
+            seeded, entries, shape=seeded.shape, kind='production', key=query_id,
+        )
+        for query_id, entries in sorted(cached.items())
+    }
+
+
+async def fetch_production_rankings(
+    production_queries: list[ProductionQuery],
+    *,
+    shape: str = SELECTION_SHAPE,
+    limit: int | None = None,
+    project_suffix: str | None = None,
+    seed_concurrency: int | None = None,
+) -> dict[str, Any]:
+    """The ONE live pass this script makes: seed the arm, search, tear down.
+
+    A deliberately narrow sibling of ``run_bake_off``'s driver — one shape,
+    no probes, no measurement — carrying the same three non-negotiables,
+    each of which exists because of a specific way this can go wrong:
+
+    * the durable write queue is repointed at a per-run temp dir, so this
+      never recovers the live server's in-flight rows into a collection it is
+      about to destroy (``run_bake_off``:3934-3954 states that failure in
+      full);
+    * the pinned embedder key is cleared so mem0 falls back to the real
+      ``OPENAI_API_KEY`` — a stub constant vector would make every ranking
+      here meaningless;
+    * teardown runs in a ``finally``, because the leak that matters is the
+      mid-run one.
+    """
+    import shutil  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+
+    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+
+    bake = bake_off()
+    limit = bake.DEFAULT_SEARCH_LIMIT if limit is None else limit
+    seed_concurrency = (
+        bake.SEED_CONCURRENCY if seed_concurrency is None else seed_concurrency
+    )
+    seeded, _ = materialize_selection_arm(
+        shape=shape, project_suffix=project_suffix,
+    )
+    collections = bake.ephemeral_collections(suffix=project_suffix)
+    collection = collections[shape]
+
+    config = FusedMemoryConfig().model_copy(deep=True)
+    config.mem0.collection_prefix = bake.ephemeral_collection_prefix()
+    openai_provider = getattr(config.embedder.providers, 'openai', None)
+    if openai_provider is not None:
+        openai_provider.api_key = None
+    qdrant_url = config.mem0.qdrant_url
+    queue_dir = tempfile.mkdtemp(prefix='read-transform-queue-')
+    config.queue.data_dir = queue_dir
+
+    memory = MemoryService(config)
+    try:
+        bake.drop_collections([collection], qdrant_url=qdrant_url)
+        await memory.initialize()
+        await bake.seed_arm(memory.mem0, seeded, concurrency=seed_concurrency)
+        fetched = await bake.fetch_arm(
+            memory.mem0, seeded, list(production_queries), [], limit=limit,
+        )
+    finally:
+        await memory.close()
+        bake.drop_collections([collection], qdrant_url=qdrant_url)
+        shutil.rmtree(queue_dir, ignore_errors=True)
+
+    return {
+        'shape': shape,
+        'corpus_fingerprint': bake.corpus_fingerprint(seeded.records),
+        'search_limit': int(limit),
+        'embedder_model': config.embedder.model,
+        'queries': {
+            query_id: bake._serialize_ranking(hits)
+            for query_id, hits in sorted(fetched['queries'].items())
+        },
+    }
+
+
+def extend_fetch_cache(path: str | Path, fetched: dict[str, Any]) -> Path:
+    """Merge the production rankings into the committed cache, byte-stably.
+
+    A SEPARATE top-level key rather than more entries under ``arms``:
+    ``load_fetches`` enforces that every E2 query has a ranking, and folding
+    unlabeled production queries in beside them would make that guard pass
+    for the wrong reason — and would put label-free rows into the block the
+    E2 replay treats as its labeled query set.
+    """
+    import json  # noqa: PLC0415
+
+    bake = bake_off()
+    target = Path(path)
+    doc = json.loads(target.read_text(encoding='utf-8'))
+    block = doc.setdefault(PRODUCTION_CACHE_KEY, {})
+    block[fetched['shape']] = {
+        'corpus_fingerprint': fetched['corpus_fingerprint'],
+        'search_limit': fetched['search_limit'],
+        'embedder_model': fetched['embedder_model'],
+        'queries': fetched['queries'],
+    }
+    bake._atomic_write_text(
+        target, json.dumps(doc, indent=2, sort_keys=True) + '\n',
+    )
+    return target
+
+
+def score_from_cache(
+    *,
+    fetch_cache: str | Path = DEFAULT_FETCH_CACHE,
+    production_queries: str | Path = DEFAULT_PRODUCTION_QUERIES,
+    e2_k: int = 10,
+    production_k: int = PRODUCTION_K,
+    render_sightings: bool = False,
+    per_topic: int = 1,
+) -> dict[str, Any]:
+    """Score all four arms over both query sets, entirely offline."""
+    bake = bake_off()
+    seeded, e2_queries = materialize_selection_arm()
+    replayed = bake.load_fetches(
+        fetch_cache,
+        {seeded.shape: seeded},
+        expect_query_ids=[query.query_id for query in e2_queries],
+        expect_limit=e2_k,
+    )
+    prod_queries = load_production_queries(production_queries)
+    prod_hits = load_production_fetches(
+        fetch_cache, seeded,
+        expect_query_ids=[query.query_id for query in prod_queries],
+    )
+    scored = run_selection(
+        seeded,
+        replayed[seeded.shape]['queries'],
+        e2_queries,
+        prod_queries,
+        prod_hits,
+        e2_k=e2_k,
+        production_k=production_k,
+        render_sightings=render_sightings,
+        per_topic=per_topic,
+    )
+    scored['production_queries'] = production_query_provenance(
+        prod_queries,
+        harvest_sidecar=Path(production_queries).with_suffix(
+            '.provenance.json',
+        ),
+    )
+    return scored
+
+
+def build_parser() -> Any:
+    import argparse  # noqa: PLC0415
+
+    parser = argparse.ArgumentParser(
+        description=(
+            'Read-transform selection over the ratified C write shape: score '
+            'three candidate read transforms against the flat-read baseline '
+            'and emit the decision table task 3111 reads.'
+        ),
+    )
+    parser.add_argument('--fetch-cache', default=str(DEFAULT_FETCH_CACHE),
+                        help='replayed ranking cache (from --dump-fetches)')
+    parser.add_argument('--production-queries',
+                        default=str(DEFAULT_PRODUCTION_QUERIES),
+                        help='harvested production query sample (JSONL)')
+    parser.add_argument('--json-out', default=str(DEFAULT_SELECTION_JSON),
+                        help='where to write the machine-readable report')
+    parser.add_argument('--md-out', default=str(DEFAULT_SELECTION_MD),
+                        help='where to write the operator-facing report')
+    parser.add_argument('--k', type=int, default=10,
+                        help='reader window for the authored E2 query set')
+    parser.add_argument('--production-k', type=int, default=PRODUCTION_K,
+                        help="reader window for the production set "
+                             "(production's own limit is 5)")
+    parser.add_argument('--render-sightings', action='store_true',
+                        help='credit sightings by rendering their bodies')
+    parser.add_argument('--per-topic', type=int, default=1,
+                        help='records per topic the diversity cap keeps')
+    parser.add_argument('--extend-cache-live', action='store_true',
+                        help='ONE live pass: seed the arm and fetch the '
+                             'production queries into the cache, then exit')
+    parser.add_argument('--project-suffix', default=None,
+                        help='override the ephemeral project id suffix')
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    import asyncio  # noqa: PLC0415
+    import sys  # noqa: PLC0415
+
+    args = build_parser().parse_args(argv)
+
+    if args.extend_cache_live:
+        queries = load_production_queries(args.production_queries)
+        fetched = asyncio.run(fetch_production_rankings(
+            queries, project_suffix=args.project_suffix, limit=args.k,
+        ))
+        target = extend_fetch_cache(args.fetch_cache, fetched)
+        print(f'extended {target} with {len(fetched["queries"])} production '
+              f'rankings at limit {fetched["search_limit"]}')
+        return 0
+
+    try:
+        scored = score_from_cache(
+            fetch_cache=args.fetch_cache,
+            production_queries=args.production_queries,
+            e2_k=args.k,
+            production_k=args.production_k,
+            render_sightings=args.render_sightings,
+            per_topic=args.per_topic,
+        )
+        report = build_selection_report(scored)
+        json_path, md_path = write_artifacts(
+            report, args.json_out, args.md_out,
+            fixture_paths=[
+                bake_off().DEFAULT_ALPHA_FIXTURE_PATH,
+                bake_off().DEFAULT_REGISTRY_PATH,
+                bake_off().DEFAULT_ARM_CLAIMS_PATH,
+                bake_off().DEFAULT_QUERY_SET_PATH,
+                bake_off().DEFAULT_DISTRACTOR_SLAB_PATH,
+                Path(args.production_queries),
+                Path(args.fetch_cache),
+            ],
+        )
+    except (
+        ProductionFetchError, ProductionQuerySetError,
+        IncompleteSelectionError, bake_off().FetchCacheError,
+        bake_off().FixtureError,
+    ) as exc:
+        print(f'{type(exc).__name__}: {exc}', file=sys.stderr)
+        return 1
+
+    print(f'wrote {json_path}')
+    print(f'wrote {md_path}')
+    print(f'recommendation: {report["recommendation"]["label"]}')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
