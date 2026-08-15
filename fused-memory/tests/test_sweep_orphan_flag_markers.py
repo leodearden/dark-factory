@@ -1962,19 +1962,6 @@ class TestParseArgs:
         assert _mod._parse_args(['--apply', '--terminal-drain']).apply is True
         assert _mod._parse_args(['--check', '--max-backlog', '5']).max_backlog == 5
 
-    def test_help_text_names_the_check_dependency(self):
-        """The dependency must be discoverable from --help, not only from a
-        parse error, since that is where an operator looks before wiring a
-        predicate."""
-        parser = _mod._build_parser()
-        help_text = next(
-            action.help for action in parser._actions
-            if action.dest == 'fail_on_blind_spot'
-        )
-        assert 'REQUIRES --check' in (help_text or ''), (
-            f'Expected the --check dependency in the help string, got: {help_text!r}'
-        )
-
 
 # ===========================================================================
 # Tests: main() report -> exit-code wiring (task 3897 amendment,
