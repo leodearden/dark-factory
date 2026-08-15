@@ -39,9 +39,10 @@ REIFY_ROOT
 
     When the integration test is skipped — reify undiscoverable, REIFY_ROOT
     naming a path without the script, or nice/ionice unavailable — a
-    ``UserWarning`` carrying the specific reason is emitted in CI runs (``CI``
-    env-var set) so the silent no-op is visible in the CI log rather than
-    silently providing no cross-repo coverage.
+    ``UserWarning`` carrying EVERY live cause (they are composed, not
+    short-circuited, so a two-cause host is not fixed one re-run at a time) is
+    emitted in CI runs (``CI`` env-var set) so the silent no-op is visible in
+    the CI log rather than silently providing no cross-repo coverage.
 """
 from __future__ import annotations
 
@@ -51,6 +52,7 @@ import re
 import shutil
 import subprocess
 import sys
+import warnings
 from pathlib import Path
 from typing import Literal
 
@@ -81,34 +83,58 @@ REIFY_VERIFY_SH: Path | None = (
     REIFY_ROOT / _REIFY_VERIFY_RELPATH if REIFY_ROOT is not None else None
 )
 
-# The skip decision is kept in TWO parts on purpose.  _REIFY_SKIP_REASON is the
+def _tool_skip_reason(missing: list[str]) -> str | None:
+    """Why this host cannot exercise reify's CARGO_PRIO plan, or None if it can."""
+    if not missing:
+        return None
+    return (
+        f"{'/'.join(missing)} unavailable — reify verify.sh degrades its "
+        f"CARGO_PRIO without nice/ionice"
+    )
+
+
+def _compose_skip_reason(*reasons: str | None) -> str | None:
+    """Join EVERY live cause into one reason, or None when nothing blocks the run.
+
+    Composed rather than short-circuited on purpose.  In the realistic
+    minimal-container case reify is undiscoverable AND nice/ionice are missing;
+    a first-cause-wins reason makes the operator fix the reify half, re-run, and
+    only then learn about the tools — the same one-cause-at-a-time conflation
+    this split exists to remove.
+
+    Returns None (never "") for an all-empty input: a falsy-but-not-None reason
+    would still flip `_SKIP_REASON is not None` and produce a skip with a blank
+    explanation.
+    """
+    return "; ".join(r for r in reasons if r) or None
+
+
+# The skip decision is kept in PARTS on purpose.  _REIFY_SKIP_REASON is the
 # reify half alone: it is host-independent, so the planted-layout tests at the
 # bottom of this file can assert on the gate's ADMISSION DECISION from a module
 # copy loaded out of a synthetic tree without also requiring the host to have
 # nice/ionice.  Splitting also names WHICH of the three causes fired — the old
 # single reason string conflated reify-absent, nice-absent and ionice-absent, so
-# an operator reading `pytest -rs` could not tell them apart.
+# an operator reading `pytest -rs` could not tell them apart — and composing
+# (rather than short-circuiting) the halves back together names ALL of them at
+# once, so a two-cause host is not fixed one re-run at a time.
 _REIFY_SKIP_REASON: str | None = reify_skip_reason(
     _REIFY_VERIFY_RELPATH, REIFY_ROOT, named_by_env=_REIFY_CHECKOUT.named_by_env
 )
 _MISSING_TOOLS = [t for t in ("nice", "ionice") if shutil.which(t) is None]
-_TOOL_SKIP_REASON: str | None = (
-    f"{'/'.join(_MISSING_TOOLS)} unavailable — reify verify.sh degrades its "
-    f"CARGO_PRIO without nice/ionice"
-    if _MISSING_TOOLS
-    else None
-)
-_SKIP_REASON: str | None = _REIFY_SKIP_REASON or _TOOL_SKIP_REASON
+_TOOL_SKIP_REASON: str | None = _tool_skip_reason(_MISSING_TOOLS)
+_SKIP_REASON: str | None = _compose_skip_reason(_REIFY_SKIP_REASON, _TOOL_SKIP_REASON)
 
 _INTEGRATION_SKIP = pytest.mark.skipif(_SKIP_REASON is not None, reason=_SKIP_REASON or "")
 
 # Emit a visible warning when the integration gate is silently skipped in CI so
 # the coverage gap is not hidden.  Fires at collection time (module import), and
-# carries the resolved reason VERBATIM so the CI log names the actual cause (and
-# the resolved path, when one was named) rather than a generic three-way string.
+# carries the resolved reason VERBATIM so the CI log names every actual cause
+# (and the resolved path, when one was named) rather than a generic three-way
+# string.  Covered by test_ci_skip_emits_a_warning_naming_the_reason below —
+# this block is the mechanism that keeps a silent CI coverage gap visible, so it
+# is precisely the code that must not be allowed to break unnoticed.
 if os.environ.get("CI") and _SKIP_REASON is not None:
-    import warnings
-
     warnings.warn(
         f"Integration gate test_role_env_propagates_to_reify_verify_plan will be "
         f"SKIPPED in this CI run: {_SKIP_REASON}. "
@@ -339,6 +365,44 @@ def test_command_lines_excludes_env_comment_substrings() -> None:
     )
 
 
+def test_tool_skip_reason_names_every_missing_tool() -> None:
+    """The tool half of the skip decision, exercised on synthetic tool lists.
+
+    Host-independent: the module constant built from ``shutil.which`` says
+    nothing on a machine that has both tools, which is exactly the machine this
+    suite normally runs on.
+    """
+    assert _tool_skip_reason([]) is None, "a fully-equipped host must not skip"
+
+    both = _tool_skip_reason(["nice", "ionice"])
+    assert both is not None and both.startswith("nice/ionice unavailable"), both
+
+    # A single missing tool must name only that one — not the pair, which would
+    # send an operator hunting for a tool they already have.
+    only_ionice = _tool_skip_reason(["ionice"])
+    assert only_ionice is not None and only_ionice.startswith("ionice unavailable"), (
+        only_ionice
+    )
+
+
+def test_skip_reasons_compose_instead_of_short_circuiting() -> None:
+    """Every live cause is reported at once, not one per re-run."""
+    assert _compose_skip_reason(None, None) is None
+
+    assert _compose_skip_reason("reify absent", None) == "reify absent"
+    assert _compose_skip_reason(None, "nice absent") == "nice absent"
+    assert _compose_skip_reason("reify absent", "nice absent") == (
+        "reify absent; nice absent"
+    ), (
+        "a two-cause host must learn both causes from one run — a first-cause-wins "
+        "reason is the conflation the reify/tool split exists to remove"
+    )
+
+    # Anti-vacuity: an all-empty compose is None, never "" — a blank-but-truthy
+    # reason would still trip `_SKIP_REASON is not None` and skip with no message.
+    assert _compose_skip_reason("", None) is None
+
+
 # ---------------------------------------------------------------------------
 # Off-machine gate resolution — the layout-independence demonstration
 #
@@ -503,3 +567,47 @@ def test_verify_sh_constant_tracks_the_resolved_root(tmp_path, planted_env):
 
     assert mod.REIFY_ROOT is not None
     assert mod.REIFY_VERIFY_SH == mod.REIFY_ROOT / mod._REIFY_VERIFY_RELPATH
+
+
+def test_ci_skip_emits_a_warning_naming_the_reason(tmp_path, planted_env):
+    """The CI warning block is what keeps a silent coverage gap visible.
+
+    So it must not be allowed to break unnoticed: a typo'd f-string or an
+    inverted condition there would ship green, and every other planted-layout
+    case deliberately delenvs CI to suppress it.  Loaded from a tree with no
+    reify in its ancestry, so the gate genuinely would skip.
+    """
+    planted_env.setenv("CI", "1")
+
+    with pytest.warns(UserWarning) as record:
+        mod = _load_module_copy(tmp_path, _BARE_LAYOUT, plant_verify_sh=False)
+
+    assert mod._SKIP_REASON is not None, "precondition: this tree must skip"
+    messages = [str(w.message) for w in record]
+    assert any(mod._SKIP_REASON in m for m in messages), (
+        f"the CI warning must carry the resolved reason VERBATIM so the log "
+        f"names the actual cause; reason={mod._SKIP_REASON!r} warnings={messages!r}"
+    )
+    assert any(mod.REIFY_ROOT_ENV in m for m in messages), (
+        f"the CI warning must name the env var that enables the coverage: "
+        f"{messages!r}"
+    )
+
+
+def test_no_ci_warning_when_ci_is_unset(tmp_path, planted_env):
+    """The warning is gated on CI — a local run must not be noised up.
+
+    Complements the case above: together they pin both arms of the condition,
+    so an inverted gate cannot pass.
+    """
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        mod = _load_module_copy(tmp_path, _BARE_LAYOUT, plant_verify_sh=False)
+
+    assert mod._SKIP_REASON is not None, "precondition: this tree must skip"
+    gate_warnings = [
+        str(w.message) for w in record if "Integration gate" in str(w.message)
+    ]
+    assert gate_warnings == [], (
+        f"the skip warning must fire only in CI runs, got {gate_warnings!r}"
+    )
