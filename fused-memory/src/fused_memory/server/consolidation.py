@@ -235,6 +235,7 @@ def build_consolidation_result(
     topic_members_truncated: bool = False,
     citation_repoint: dict[str, Any] | None = None,
     tombstones_written: int = 0,
+    tombstones_expected: int = 0,
 ) -> dict[str, Any]:
     """The op's response envelope, and the ONE home of its status rule.
 
@@ -250,6 +251,19 @@ def build_consolidation_result(
     silent-fail-soft this op exists to surface.  ``'partial'`` is not a
     softer success: it says this cluster is still open, and the lists say
     which ids keep it open.
+
+    WHAT THE STATUS RULE DELIBERATELY IGNORES: a tombstone shortfall
+    (``tombstones_written < tombstones_expected``).  The memory operation
+    genuinely completed — the cluster is folded and closed — and only its
+    AUDIT TRAIL did not land, e.g. on a deployment running
+    ``recon_ledger_enabled=False`` where the fail-safe writer returns 0.
+    Reporting the two counts satisfies structured-facts and
+    no-silent-fail-soft without conflating the two failures, which matters
+    because ``'partial'`` is an invitation to RETRY: a caller that re-ran a
+    COMPLETED consolidation would re-write a canonical whose supersedes are
+    already gone, which is precisely the net-+1 ratchet this op exists to
+    end.  An audit gap is fixed by looking at the logs, never by repeating
+    the delete.
 
     Every disposition key is ALWAYS present, empty lists included, so a
     caller can read ``result['survivors']`` without a membership test and a
@@ -285,7 +299,11 @@ def build_consolidation_result(
             len(members) if topic_members_total is None else topic_members_total
         ),
         'topic_members_truncated': bool(topic_members_truncated),
+        # Reported as a PAIR, always. A bare "written" count says nothing
+        # about whether it was enough, and the shortfall is only legible
+        # against what was owed.
         'tombstones_written': int(tombstones_written),
+        'tombstones_expected': int(tombstones_expected),
     }
     if citation_repoint:
         result['citation_repoint'] = citation_repoint

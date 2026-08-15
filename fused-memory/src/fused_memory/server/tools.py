@@ -4524,9 +4524,17 @@ def create_mcp_server(
         Returns:
             ``{'status', 'canonical_id', 'topic', 'deleted', 'failed_deletes',
             'retained', 'retain_failures', 'reparented', 'reparent_failures',
-            'survivors', 'topic_members', 'topic_members_truncated', ...}``.
+            'survivors', 'topic_members', 'topic_members_truncated',
+            'tombstones_written', 'tombstones_expected', ...}``.
             ``survivors`` is the load-bearing one: ids whose delete reported
             success but which STILL RESOLVE on the re-read.
+
+            The tombstone counts are reported as a PAIR and deliberately do
+            NOT affect ``status``: a shortfall means the consolidation
+            completed but its audit trail did not land, and ``'partial'``
+            would invite a retry of a COMPLETED merge — re-writing a
+            canonical whose supersedes are already gone, the exact ratchet
+            this op ends.
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         # (2) AUTHORIZE before any other work, mirroring `update_memory`'s
@@ -5079,6 +5087,10 @@ def create_mcp_server(
             topic_members_truncated=total > returned,
             citation_repoint=citation_repoint,
             tombstones_written=tombstones_written,
+            # What was OWED — the confirmed-gone set, not every supersede.
+            # An id whose delete failed was never owed a tombstone, so
+            # counting it would report a phantom shortfall on a correct run.
+            tombstones_expected=len(confirmed_gone),
         )
 
     @mcp.tool()
