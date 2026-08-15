@@ -3046,3 +3046,241 @@ class TestTheProductionTrafficSharesAreTheMeasuredOnes:
         `—` cells above would be a lie rather than an honest abstention."""
         for row in _harvest_mod().read_fixture(PRODUCTION_SAMPLE):
             assert 'expects_claim_ids' not in row
+
+
+# ---------------------------------------------------------------------------
+# The production half of the fetch cache needs the SAME depth guard as the E2
+# half
+# ---------------------------------------------------------------------------
+#
+# `score_from_cache` already passes `expect_limit=e2_k` to the bake-off's
+# `load_fetches`, and `load_fetches` refuses a cache shallower than the depth
+# the report will claim.  Its production sibling, in the SAME function, passed
+# no such guard — so a cache fetched at a shallower depth scored CLEAN and the
+# markdown printed `k=5` over a 3-deep window.  Nothing downstream can notice:
+# the window is a plain `records[:k]` slice and the recorded `'k'` is the
+# REQUESTED k, never the realized depth.
+#
+# The compounding half is at the writing end: `--extend-cache-live` fetched at
+# `args.k` — the E2 window flag — rather than at a depth that respects
+# `production_k`, so `--k 3` wrote exactly the shallow cache the reader had no
+# guard against.
+
+COMMITTED_FETCH_CACHE = FIXTURES_DIR / 'e2_fetch_cache.json'
+
+#: Depth of the committed production rankings.  Pinned, not read, because
+#: (e) below asserts that a stock `--extend-cache-live` still reproduces it:
+#: resolving the live fetch depth to `production_k` would silently SHALLOW
+#: the next re-harvest from 10 to 5 and change every backfilled
+#: `topic_diversity_cap` window.
+COMMITTED_PRODUCTION_DEPTH = 10
+
+
+@functools.cache
+def _selection_seeded():
+    """The materialized arm `load_production_fetches` joins a cache against.
+
+    Offline and deterministic over the committed fixtures (~0.3s), and cached
+    because every test below wants the same one.
+    """
+    seeded, _ = _mod().materialize_selection_arm()
+    return seeded
+
+
+def _cache_at_production_depth(tmp_path, limit: int | None, *, drop_key=False):
+    """The committed cache, rewritten to a shallower production depth.
+
+    Truncates the rankings as well as the recorded limit, so the file is
+    exactly what a `--extend-cache-live --k <limit>` run would have written —
+    the point being that such a file is INDISTINGUISHABLE from a full one to
+    every reader downstream of the load.
+    """
+    mod = _mod()
+    doc = json.loads(COMMITTED_FETCH_CACHE.read_text(encoding='utf-8'))
+    block = doc[mod.PRODUCTION_CACHE_KEY][mod.SELECTION_SHAPE]
+    if drop_key:
+        block.pop('search_limit', None)
+    else:
+        block['search_limit'] = limit
+    if limit is not None:
+        block['queries'] = {
+            query_id: ranking[:limit]
+            for query_id, ranking in block['queries'].items()
+        }
+    target = tmp_path / 'e2_fetch_cache.json'
+    target.write_text(
+        json.dumps(doc, indent=2, sort_keys=True) + '\n', encoding='utf-8',
+    )
+    return target
+
+
+class TestTheProductionCacheRefusesAShallowerWindow:
+    """(a)/(b) — the reader half of the guard, mirroring `load_fetches`."""
+
+    def test_a_shallower_cache_is_refused_by_name(self, tmp_path):
+        mod = _mod()
+        shallow = _cache_at_production_depth(tmp_path, 3)
+
+        with pytest.raises(mod.ProductionFetchError) as excinfo:
+            mod.load_production_fetches(
+                shallow, _selection_seeded(), expect_limit=5,
+            )
+
+        message = str(excinfo.value)
+        assert '3' in message and '5' in message, message
+        # The E2 guard's own words: the danger is not a SMALLER measurement.
+        assert 'different experiment' in message.lower(), message
+
+    def test_an_absent_search_limit_is_its_own_refusal(self, tmp_path):
+        """A cache written before the guard must not pass by omission.
+
+        The same missing-key/mismatch split `_check_corpus_fingerprint` makes:
+        "the depth was never recorded" and "the depth is too shallow" are
+        different operator actions, so they are different messages.
+        """
+        mod = _mod()
+        undated = _cache_at_production_depth(tmp_path, None, drop_key=True)
+
+        with pytest.raises(mod.ProductionFetchError) as excinfo:
+            mod.load_production_fetches(
+                undated, _selection_seeded(), expect_limit=5,
+            )
+
+        message = str(excinfo.value)
+        assert 'different experiment' not in message.lower(), message
+        assert 'search limit' in message.lower() or 'depth' in message.lower()
+
+    def test_a_deeper_cache_loads(self, tmp_path):
+        """(c) Truncation to the reader budget is the INTENDED behaviour."""
+        mod = _mod()
+
+        replayed = mod.load_production_fetches(
+            COMMITTED_FETCH_CACHE, _selection_seeded(), expect_limit=5,
+        )
+
+        assert len(replayed) == 44
+        assert all(len(hits) == COMMITTED_PRODUCTION_DEPTH
+                   for hits in replayed.values())
+
+    def test_the_guard_is_opt_in(self, tmp_path):
+        """(f-adjacent) Defaulted to None so a pure round-trip test can
+        exercise the join without declaring a depth — the same rationale
+        `load_fetches`' docstring already gives for its two guards."""
+        mod = _mod()
+        shallow = _cache_at_production_depth(tmp_path, 3)
+
+        replayed = mod.load_production_fetches(shallow, _selection_seeded())
+
+        assert all(len(hits) == 3 for hits in replayed.values())
+
+
+class TestTheGuardIsWiredNotMerelyAvailable:
+    """(d) — the asymmetry was WITHIN one function, so fix it there."""
+
+    def test_score_from_cache_refuses_a_shallow_production_half(self, tmp_path):
+        mod = _mod()
+        shallow = _cache_at_production_depth(tmp_path, 3)
+
+        with pytest.raises(mod.ProductionFetchError):
+            mod.score_from_cache(fetch_cache=shallow, production_k=5)
+
+    def test_the_committed_cache_still_scores(self):
+        """The guard must not make today's artifact unbuildable."""
+        scored = _mod().score_from_cache()
+
+        assert set(scored['e2']) == set(_mod().ARM_KEYS)
+
+    def test_main_reports_the_refusal_without_a_traceback(
+        self, tmp_path, capsys,
+    ):
+        """`ProductionFetchError` is already in main's handler tuple, so the
+        wiring must surface as exit 1 plus a named error, not a crash."""
+        mod = _mod()
+        shallow = _cache_at_production_depth(tmp_path, 3)
+
+        code = mod.main([
+            '--fetch-cache', str(shallow),
+            '--json-out', str(tmp_path / 'out.json'),
+            '--md-out', str(tmp_path / 'out.md'),
+        ])
+
+        assert code == 1
+        assert 'ProductionFetchError' in capsys.readouterr().err
+
+
+class TestTheLiveExtendNeverWritesBelowProductionK:
+    """(e)/(f) — the writing end of the same asymmetry.
+
+    The live branch fetched at `args.k`, the E2 window flag: `--k 3` wrote a
+    3-deep production cache that a later default run scored at
+    `production_k=5`.  The resolved depth is asserted directly rather than
+    inferred from the file, because it is the quantity the operator sets and
+    the one the printed message must name.
+    """
+
+    def _resolved_limit(self, monkeypatch, argv):
+        mod = _mod()
+        seen: dict = {}
+
+        async def _stub(queries, *, limit=None, **kwargs):
+            seen['limit'] = limit
+            seen['queries'] = len(list(queries))
+            return {
+                'shape': mod.SELECTION_SHAPE,
+                'corpus_fingerprint': 'stub',
+                'search_limit': limit,
+                'embedder_model': 'stub',
+                'queries': {},
+            }
+
+        def _no_write(path, fetched):
+            seen['written'] = fetched
+            return Path(path)
+
+        monkeypatch.setattr(mod, 'fetch_production_rankings', _stub)
+        monkeypatch.setattr(mod, 'extend_fetch_cache', _no_write)
+        assert mod.main(['--extend-cache-live', *argv]) == 0
+        return seen
+
+    def test_stock_flags_reproduce_the_committed_depth(self, monkeypatch):
+        seen = self._resolved_limit(monkeypatch, [])
+
+        assert seen['limit'] == COMMITTED_PRODUCTION_DEPTH
+
+    def test_a_shallow_e2_window_cannot_shallow_the_production_cache(
+        self, monkeypatch,
+    ):
+        mod = _mod()
+        seen = self._resolved_limit(monkeypatch, ['--k', '3'])
+
+        assert seen['limit'] >= mod.PRODUCTION_K
+
+    def test_a_deeper_e2_window_still_deepens_the_fetch(self, monkeypatch):
+        """A cache is allowed to be deeper than either budget — the reader
+        truncates.  What it may never be is shallower than the depth it will
+        be scored at."""
+        seen = self._resolved_limit(monkeypatch, ['--k', '25'])
+
+        assert seen['limit'] >= 25
+
+    def test_the_resolved_depth_is_printed(self, monkeypatch, capsys):
+        """An operator must see what was actually fetched, not what was
+        asked for."""
+        self._resolved_limit(monkeypatch, ['--k', '3'])
+
+        assert f'at limit {_mod().PRODUCTION_K}' in capsys.readouterr().out
+
+    def test_what_the_live_branch_writes_now_scores_clean(
+        self, monkeypatch, tmp_path,
+    ):
+        """(f) closes the loop: build a cache at the depth `--k 3` now
+        resolves to, and assert the scorer accepts it."""
+        mod = _mod()
+        seen = self._resolved_limit(monkeypatch, ['--k', '3'])
+        written = _cache_at_production_depth(tmp_path, seen['limit'])
+
+        replayed = mod.load_production_fetches(
+            written, _selection_seeded(), expect_limit=mod.PRODUCTION_K,
+        )
+
+        assert replayed
