@@ -8,7 +8,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from shared.cli_invoke import _REAL_BUILTIN_TOOLS_DENYLIST, build_claude_argv
+from shared.cli_invoke import (
+    _REAL_BUILTIN_TOOLS_DENYLIST,
+    NO_MCP_SERVERS_CONFIG,
+    build_claude_argv,
+)
 
 _TMP_PLACEHOLDER = '<TMP>'
 
@@ -359,5 +363,48 @@ def test_build_claude_argv_strict_mcp_config_noop_without_mcp_config() -> None:
     try:
         assert '--mcp-config' not in cmd
         assert '--strict-mcp-config' not in cmd
+    finally:
+        _cleanup(temp_files)
+
+
+def test_no_mcp_servers_config_is_truthy_and_emits_strict_flag() -> None:
+    """NO_MCP_SERVERS_CONFIG is a TRUTHY zero-server scoping config, so a
+    wildcard-deny caller under an output_schema still gets --strict-mcp-config.
+
+    The wildcard expansion above (``output_schema and '*' in disallowed_tools``)
+    substitutes a BUILT-INS-ONLY deny-list, which contains no MCP tool pattern.
+    A caller whose cwd carries an ambient ``.mcp.json`` therefore keeps MCP
+    tools reachable unless it ALSO strict-scopes its MCP servers — and the
+    ``--strict-mcp-config`` emit is gated on ``if mcp_config:``, so a bare
+    ``{}`` would silently no-op and reinstate the hole while looking correct.
+    Hence the truthiness assertion is load-bearing, not decorative.
+    """
+    assert NO_MCP_SERVERS_CONFIG, 'must stay TRUTHY — a bare {} silently no-ops the strict flag'
+    assert NO_MCP_SERVERS_CONFIG == {'mcpServers': {}}
+
+    cmd, temp_files = build_claude_argv(
+        model='opus',
+        max_budget_usd=5.0,
+        system_prompt='sys prompt text',
+        max_turns=50,
+        permission_mode='bypassPermissions',
+        allowed_tools=None,
+        disallowed_tools=['*'],
+        mcp_config=NO_MCP_SERVERS_CONFIG,
+        output_schema={'type': 'object'},
+        effort=None,
+        resume_session_id=None,
+        session_id='sess-123',
+        strict_mcp_config=True,
+    )
+    try:
+        assert '--mcp-config' in cmd
+        assert '--strict-mcp-config' in cmd
+
+        # The on-disk artifact really scopes the run to zero MCP servers.
+        assert len(temp_files) == 2, f'expected sysprompt + mcp temp files; got {temp_files!r}'
+        _sysprompt_path, mcp_path = temp_files
+        with open(mcp_path) as f:
+            assert json.load(f) == {'mcpServers': {}}
     finally:
         _cleanup(temp_files)
