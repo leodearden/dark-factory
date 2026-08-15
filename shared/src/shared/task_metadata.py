@@ -666,7 +666,12 @@ def register_metadata_submodel(
     # desynced, which is precisely the failure the parallel-dict design has
     # to avoid.
     existing = _SUBMODEL_REGISTRY.get(key)
-    existing_cardinality = _SUBMODEL_CARDINALITY.get(key)
+    # Same fail-closed default the READ path uses (parse_metadata's
+    # `.get(key, 'dict')`), so this check agrees with the docstring's
+    # "missing from _SUBMODEL_CARDINALITY reads as 'dict'" invariant: were the
+    # two dicts ever to desync, a re-registration that AGREES with the
+    # documented default stays idempotent instead of raising over a `None`.
+    existing_cardinality = _SUBMODEL_CARDINALITY.get(key, 'dict')
     if existing is not None and existing is not model:
         raise ValueError(f'metadata sub-model already registered for {key!r}')
     if existing is not None and existing_cardinality != cardinality:
