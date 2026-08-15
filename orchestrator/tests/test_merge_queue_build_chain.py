@@ -12,6 +12,9 @@ Covers:
                  (conflict / train / merge_error reasons, empty-prefix edge)
   step-17 RED  — "Already up to date." is a FAILURE, not a phantom link
                  (primitive: already_up_to_date; chain: 'already_merged')
+  amend cy3    — an unreadable `git rev-parse HEAD` is a loud merge_error,
+                 not a phantom EMPTY-STRING link (the same hazard as step-17
+                 reached via an unchecked rc)
 
 Reference: ``plans/deep-merge-ahead-prd.md``.
 
@@ -693,14 +696,24 @@ class TestChainBuildLane:
 
         monkeypatch.setattr(git_ops, 'acquire_spec_lane', _fake_acquire)
 
+        # NOTE — the logger name is 'orchestrator.merge_queue' even though the
+        # emitting code lives in orchestrator/merge_liveness.py: that module is
+        # a split-out of merge_queue and deliberately keeps the parent's logger
+        # name (`merge_liveness.py`: `logger = getLogger('orchestrator.merge_queue')`),
+        # so the whole merge subsystem stays one configurable channel.  Do NOT
+        # "correct" this to 'orchestrator.merge_liveness' — no logger by that
+        # name is ever used, so the level would be raised on the wrong object
+        # and the emitter assertion below would fail.
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
             lane, warm = await acquire_chain_build_lane(git_ops, config, head_sha)
 
         assert lane is None
         assert warm is False
-        # Loud refusal, not a silent None.
+        # Loud refusal, not a silent None — and pin the EMITTER, so this cannot
+        # start passing on some unrelated WARNING that happens to name the lane.
         assert any(
             PERSISTENT_MERGE_WORKTREE_NAME in r.getMessage()
+            and r.name == 'orchestrator.merge_queue'
             for r in caplog.records
             if r.levelno >= logging.WARNING
         )
@@ -1796,3 +1809,142 @@ class TestBuildChainTruncation:
         # was emitted for either item, including the one that DID chain.
         assert not snap[0].result.done()
         assert not snap[1].result.done()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# amendment (review cycle 3): both `git rev-parse HEAD` reads are rc-checked
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _fail_rev_parse_head(monkeypatch, *, after_merge: bool) -> dict[str, int]:
+    """Make the next in-worktree ``git rev-parse HEAD`` report rc 1 with no stdout.
+
+    Targets ``merge_branch_into_worktree``'s pre-merge read (*after_merge*
+    False) or its post-merge read (*after_merge* True), leaving every other
+    subprocess — including the ``git merge`` itself and the best-effort reset
+    — running for real.  The post-merge read is identified as "the first
+    ``rev-parse HEAD`` that follows a ``git merge``" rather than by call
+    index, so an extra read inside ``acquire_spec_lane`` cannot shift it.
+
+    ``_run`` reports a non-zero exit as a VALUE rather than raising, which is
+    exactly why an unchecked read yields ``''`` — so the fake must return
+    ``(1, '', ...)``, not raise.
+    """
+    from orchestrator import git_ops as _go
+
+    real = _go._run
+    state = {'merged': 0, 'failed': 0}
+
+    async def _fake(cmd, cwd=None, *, input_text=None):
+        if cmd[:3] == ['git', 'merge', '--no-ff']:
+            state['merged'] += 1
+            return await real(cmd, cwd, input_text=input_text)
+        is_head_read = cmd == ['git', 'rev-parse', 'HEAD']
+        armed = (state['merged'] > 0) if after_merge else (state['merged'] == 0)
+        if is_head_read and armed and not state['failed']:
+            state['failed'] += 1
+            return 1, '', 'fatal: not a git repository (simulated)\n'
+        return await real(cmd, cwd, input_text=input_text)
+
+    monkeypatch.setattr(_go, '_run', _fake)
+    return state
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(180)
+class TestMergeBranchIntoWorktreeRevParseGuard:
+    """An unreadable HEAD must be a loud failure, never a phantom empty sha.
+
+    ``_run`` reports a non-zero exit as a value rather than raising, so an
+    unchecked ``git rev-parse HEAD`` yields ``''``.  ``'' != pre_merge_sha``,
+    so an unguarded post-merge read would fall through to the SUCCESS arm and
+    return ``merge_commit=''`` — and ``build_chain``'s ``merge_commit is
+    None`` guard does not catch an empty STRING, so the empty sha would be
+    appended to ``ChainResult.links`` and become the chain ``tip``.  That is
+    the same phantom-sha class divergence 5 (already-up-to-date) exists to
+    prevent, reached by a different route.
+    """
+
+    async def test_post_merge_rev_parse_failure_is_not_success(
+        self, git_repo: Path, monkeypatch,
+    ):
+        git_ops = _make_git_ops(git_repo)
+        await _create_branch_editing(git_repo, 'task/101', 'disjoint.txt', 'edit-101\n')
+        main_sha = await _rev_parse(git_repo)
+        wt = await git_ops.create_throwaway_verify_worktree(main_sha)
+        pre_head = await _rev_parse(wt)
+
+        state = _fail_rev_parse_head(monkeypatch, after_merge=True)
+        res = await git_ops.merge_branch_into_worktree(wt, '101')
+
+        assert state['failed'] == 1          # the guard was actually exercised
+        assert res.success is False
+        assert res.merge_commit is None      # NOT '' — no phantom sha
+        # The merge_error fault bucket, not a conflict and not the benign
+        # already-up-to-date cap.
+        assert res.conflicts is False
+        assert res.already_up_to_date is False
+        assert 'post-merge rev-parse failed' in res.details
+        assert res.pre_merge_sha == pre_head
+        assert res.merge_worktree == wt
+        # Best-effort reset: the lane is left at the last known-good tip, which
+        # is the tip build_chain reports when it truncates here.
+        assert await _rev_parse(wt) == pre_head
+
+    async def test_pre_merge_rev_parse_failure_never_merges(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """A base sha we cannot trust must stop the merge BEFORE it runs."""
+        git_ops = _make_git_ops(git_repo)
+        await _create_branch_editing(git_repo, 'task/101', 'disjoint.txt', 'edit-101\n')
+        main_sha = await _rev_parse(git_repo)
+        wt = await git_ops.create_throwaway_verify_worktree(main_sha)
+        pre_head = await _rev_parse(wt)
+
+        state = _fail_rev_parse_head(monkeypatch, after_merge=False)
+        res = await git_ops.merge_branch_into_worktree(wt, '101')
+
+        assert state['failed'] == 1
+        assert state['merged'] == 0          # no merge was even attempted
+        assert res.success is False
+        assert res.merge_commit is None
+        assert res.conflicts is False
+        assert res.already_up_to_date is False
+        assert 'pre-merge rev-parse failed' in res.details
+        assert res.merge_worktree == wt
+        assert await _rev_parse(wt) == pre_head
+
+    async def test_build_chain_records_no_link_for_an_unreadable_head(
+        self, git_repo: Path, monkeypatch,
+    ):
+        """The chain truncates into merge_error rather than linking an empty sha."""
+        from orchestrator.merge_liveness import release_chain_build_lane
+        from orchestrator.merge_queue import build_chain
+
+        git_ops = _make_git_ops(git_repo)
+        config = _make_config(git_repo)
+        await _create_branch_editing(git_repo, 'task/101', 'a.txt', 'edit-101\n')
+        await _create_branch_editing(git_repo, 'task/102', 'b.txt', 'edit-102\n')
+        head = await _rev_parse(git_repo)
+        snap = (
+            _make_req('101', '101', config, git_repo),
+            _make_req('102', '102', config, git_repo),
+        )
+
+        state = _fail_rev_parse_head(monkeypatch, after_merge=True)
+        res = await build_chain(git_ops, snap, head, cap=6, target_depth=2)
+
+        assert state['failed'] == 1
+        # No link at all — and emphatically no ('101', '') phantom.
+        assert res.links == []
+        assert res.depth == 0
+        assert res.tip == head
+        assert res.truncated_at == '101'
+        assert res.truncated_reason == 'merge_error'
+        # An empty result never holds a lane.
+        assert res.lane is None
+        assert res.lane_warm is False
+        # Purity holds on this arm too (PRD decision #4).
+        assert not snap[0].result.done()
+        assert not snap[1].result.done()
+        await release_chain_build_lane(git_ops, res.lane, warm=res.lane_warm)

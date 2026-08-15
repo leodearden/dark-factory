@@ -9219,6 +9219,59 @@ class GitOps:
             return [], subprocess.CalledProcessError(rc, cmd, output=output, stderr=stderr)
         return [f for f in output.strip().splitlines() if f.strip()], None
 
+    async def _resolve_merge_branch_names(self, branch: str) -> tuple[str | None, str]:
+        """Resolve a queued task branch to ``(resolved_ref, full_branch)``.
+
+        Shared by :meth:`merge_to_main` and :meth:`merge_branch_into_worktree`
+        so the two merge primitives derive the merge-SOURCE candidate and the
+        canonical prefixed name identically.  *full_branch* is what
+        :func:`_merge_subject` renders into the commit message, so a drift
+        between the two callers would break ``find_merge_marker``
+        already_merged idempotency for one of them only.
+
+        The callers' handling of a ``None`` *resolved_ref* deliberately
+        DIVERGES (``merge_to_main`` falls back to the task worktree's HEAD;
+        ``merge_branch_into_worktree`` does not — see divergence 4 there), so
+        that decision stays in the callers rather than being folded in here.
+        """
+        resolved = await self.resolve_queued_branch_ref(branch)
+        return resolved, resolved or f'{self.config.branch_prefix}{branch}'
+
+    async def _run_no_ff_merge(
+        self,
+        worktree: Path,
+        merge_source: str,
+        full_branch: str,
+    ) -> tuple[int, str, str, bool]:
+        """Run the shared ``git merge --no-ff`` invocation in *worktree*.
+
+        The single definition of HOW this repo merges a queued branch: the
+        argv, the ``-m`` subject (:func:`_merge_subject` over *full_branch*,
+        load-bearing for ``find_merge_marker`` idempotency), and the textual
+        conflict detection.  Both :meth:`merge_to_main` and
+        :meth:`merge_branch_into_worktree` call it so the chain builder can
+        never silently diverge from the sequential path it mirrors.
+
+        *merge_source* is what git is asked to merge (a resolved ref, or a
+        caller-chosen fallback); *full_branch* is the canonical prefixed name
+        used ONLY for the subject line — they differ on the absent-ref path.
+
+        Everything else — worktree provisioning, abort-vs-retain, sha
+        stripping, the absent-ref fallback, already-up-to-date detection —
+        stays in the callers, which is where the two primitives are meant to
+        differ.
+
+        Returns:
+            ``(rc, stdout, stderr, conflicts)``, where ``conflicts`` is the
+            textual-conflict verdict and is only meaningful when ``rc != 0``.
+        """
+        rc, out, err = await _run(
+            ['git', 'merge', '--no-ff', merge_source,
+             '-m', _merge_subject(full_branch, self.config.main_branch)],
+            cwd=worktree,
+        )
+        return rc, out, err, ('CONFLICT' in out or 'CONFLICT' in err)
+
     async def merge_to_main(
         self,
         worktree: Path,
@@ -9255,8 +9308,7 @@ class GitOps:
         Callers invoking ``merge_to_main`` directly are responsible for
         ensuring the worktree belongs to the intended task.
         """
-        resolved = await self.resolve_queued_branch_ref(branch)
-        full_branch = resolved or f'{self.config.branch_prefix}{branch}'
+        resolved, full_branch = await self._resolve_merge_branch_names(branch)
 
         # Derive the merge source: prefer the named ref; when absent, fall back
         # to the worktree HEAD SHA via the shared helper so the proceed-decision
@@ -9291,14 +9343,12 @@ class GitOps:
             # HEAD SHA as an absent-ref fallback.  full_branch is always the
             # canonical prefixed name for _merge_subject so the commit message
             # stays 'Merge task/<id> into main' for find_merge_marker.
-            rc, out, err = await _run(
-                ['git', 'merge', '--no-ff', merge_source,
-                 '-m', _merge_subject(full_branch, self.config.main_branch)],
-                cwd=merge_wt,
+            rc, out, err, conflicts = await self._run_no_ff_merge(
+                merge_wt, merge_source, full_branch,
             )
 
             if rc != 0:
-                if 'CONFLICT' in out or 'CONFLICT' in err:
+                if conflicts:
                     conflict_details = await self.get_conflict_details(merge_wt)
                     return MergeResult(
                         success=False, conflicts=True,
@@ -9340,7 +9390,13 @@ class GitOps:
         caller.  Used by :func:`orchestrator.merge_queue.build_chain` to merge
         k queued items sequentially into ONE scratch lane.
 
-        Five deliberate divergences from :meth:`merge_to_main`:
+        The shared core — branch-name resolution
+        (:meth:`_resolve_merge_branch_names`) and the ``git merge --no-ff``
+        invocation plus conflict detection (:meth:`_run_no_ff_merge`) — is
+        single-sourced with ``merge_to_main`` so the chain builder cannot
+        silently drift from the sequential path it mirrors.
+
+        Six deliberate divergences from :meth:`merge_to_main`:
 
         1. **Never provisions or removes a worktree.**  No
            :meth:`_create_merge_worktree`, no :meth:`cleanup_merge_worktree` —
@@ -9400,6 +9456,21 @@ class GitOps:
            for such an item is rendered by the sequential path's
            ``merge_queue._is_genuinely_merged`` guard, which this method must
            not pre-empt.
+        6. **Both ``git rev-parse HEAD`` reads are rc-checked.**
+           ``merge_to_main`` discards the return code of its single read;
+           :func:`_run` reports a non-zero exit as a VALUE rather than
+           raising, so a failed read there yields an empty ``merge_commit``.
+           That is harmless for ``merge_to_main`` (its result does not feed a
+           CAS-advance chain) but not here: ``''`` is not equal to
+           *pre_merge_sha*, so it would fall through to the success arm, and
+           ``build_chain``'s ``merge_commit is None`` guard does not catch an
+           empty STRING — the phantom sha would be appended to
+           ``ChainResult.links`` and become the chain ``tip``.  Both reads
+           therefore require ``rc == 0`` and a 40-char sha, and a failure
+           returns the ``merge_error`` fault bucket (``success=False``,
+           ``conflicts=False``, ``already_up_to_date=False``).  This is what
+           makes ``merge_commit``'s "stripped 40-char merge sha" contract
+           below true on EVERY success return.
 
         ``merge_worktree`` is populated on EVERY return path (including the
         non-conflict failure arm, where ``merge_to_main`` omits it because it
@@ -9426,8 +9497,7 @@ class GitOps:
             merge sha; on failure the merge has been aborted and the worktree
             is back at ``pre_merge_sha`` with no unmerged paths.
         """
-        resolved = await self.resolve_queued_branch_ref(branch)
-        full_branch = resolved or f'{self.config.branch_prefix}{branch}'
+        resolved, full_branch = await self._resolve_merge_branch_names(branch)
 
         # NO absent-ref fallback here — see divergence 4 in the docstring.
         # An unresolvable ref falls through to full_branch so git fails
@@ -9435,17 +9505,36 @@ class GitOps:
         # classifies as truncated_reason='merge_error'.
         merge_source: str = resolved or full_branch
 
-        _, pre, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
+        # Both rev-parse reads are rc-CHECKED (divergence 6).  `_run` reports a
+        # non-zero exit as a VALUE rather than raising, so an unchecked read
+        # yields '' — and '' would sail through both the sha-equality
+        # already-up-to-date check below and build_chain's
+        # `merge_commit is None` guard, landing an empty-string "sha" in
+        # ChainResult.links and .tip.  That is the same phantom-sha class
+        # divergence 5 exists to prevent, reached by a different route, so both
+        # reads fail loudly instead.
+        rc_pre, pre, pre_err = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
         pre_merge_sha = pre.strip()
+        if rc_pre != 0 or len(pre_merge_sha) != 40:
+            # Fail BEFORE merging: without a trustworthy base sha the
+            # already-up-to-date equality check below is unreliable, and the
+            # caller could not tell what the lane was reset back to.
+            return MergeResult(
+                success=False,
+                conflicts=False,
+                details=(
+                    f'pre-merge rev-parse failed in {worktree}: '
+                    f'rc={rc_pre} out={pre_merge_sha!r} err={pre_err.strip()!r}'
+                ),
+                pre_merge_sha=pre_merge_sha or None,
+                merge_worktree=worktree,
+            )
 
-        rc, out, err = await _run(
-            ['git', 'merge', '--no-ff', merge_source,
-             '-m', _merge_subject(full_branch, self.config.main_branch)],
-            cwd=worktree,
+        rc, out, err, conflicts = await self._run_no_ff_merge(
+            worktree, merge_source, full_branch,
         )
 
         if rc != 0:
-            conflicts = 'CONFLICT' in out or 'CONFLICT' in err
             # Capture BEFORE the abort — abort_merge clears the unmerged index.
             details = (
                 await self.get_conflict_details(worktree) if conflicts
@@ -9468,8 +9557,30 @@ class GitOps:
                 merge_worktree=worktree,
             )
 
-        _, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
+        rc_post, sha, post_err = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
         post_merge_sha = sha.strip()
+        if rc_post != 0 or len(post_merge_sha) != 40:
+            # The merge itself succeeded (rc 0) but its commit cannot be NAMED,
+            # so there is no sha to report.  Reporting success with
+            # merge_commit='' would put a phantom link in ChainResult.links and
+            # make it the chain tip; build_chain must see the merge_error fault
+            # bucket instead.  Best-effort reset back to the last known-good
+            # tip so the lane stays consistent with the tip build_chain returns
+            # (it truncates here, keeping `tip` == this item's pre_merge_sha)
+            # and stays reusable; rc is discarded because the worktree is
+            # already in a state we could not read, and a failed reset must not
+            # mask the diagnosis below.
+            await _run(['git', 'reset', '--hard', pre_merge_sha], cwd=worktree)
+            return MergeResult(
+                success=False,
+                conflicts=False,
+                details=(
+                    f'post-merge rev-parse failed in {worktree}: '
+                    f'rc={rc_post} out={post_merge_sha!r} err={post_err.strip()!r}'
+                ),
+                pre_merge_sha=pre_merge_sha,
+                merge_worktree=worktree,
+            )
         if post_merge_sha == pre_merge_sha:
             # rc==0 but NO commit: `merge_source` is already an ancestor of the
             # lane HEAD, so `git merge --no-ff` was a no-op ("Already up to

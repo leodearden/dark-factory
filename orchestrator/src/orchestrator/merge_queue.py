@@ -5957,6 +5957,21 @@ async def build_chain(
     See the module section comment above for the two invariants (purity and
     one-worktree) this function exists to uphold.
 
+    **Caller cost — γ must bound this.**  One call blocks on one lane
+    acquisition (``acquire_spec_lane``: ``git reset --hard``, ``git clean
+    -xfd``, a CoW seed) plus up to *depth* sequential real ``git merge``
+    subprocesses, plus one ``git diff`` per conflicted file on the conflict
+    arm — i.e. ~O(seconds) at ``chain_cap > 0``, with no internal deadline.
+    There is deliberately none here: an internal timeout would abandon a
+    half-built lane mid-``git merge``, and the honest bound belongs to the
+    policy layer.  So when γ (task 3185) wires this in, it must EITHER run
+    the build off the critical dispatch path (a background task whose result
+    is consumed on a later round) OR wrap the call in an
+    :func:`asyncio.timeout` — the ``except BaseException`` arm below already
+    releases the lane on cancellation, so a deadline is safe to impose from
+    outside.  Until then the cost is at least observable: every build that
+    reaches the merge loop logs ``elapsed_ms`` on its one-line summary.
+
     Args:
         git_ops: Live :class:`~orchestrator.git_ops.GitOps` instance.
         queue_snapshot: The unfrozen suffix in pick order, from
@@ -5980,6 +5995,14 @@ async def build_chain(
         # Kill switch / nothing to do: return BEFORE touching git — no lane
         # acquisition, no subprocess.
         return ChainResult(links=[], tip=head_merge_commit)
+
+    # Wall-clock for the whole build, reported on the summary line below.  The
+    # cost is real and invisible from the signature: one lane acquisition
+    # (`git reset --hard` + `git clean -xfd` + a CoW seed) plus up to `depth`
+    # sequential `git merge` subprocesses, plus — on the conflict arm — a
+    # `get_conflict_details` that spawns one `git diff` per conflicted file.
+    # Measured from before the acquisition so the lane reset is included.
+    started = time.monotonic()
 
     # Exactly one lane for the whole chain (invariant 2 above).  `config` is
     # read off the snapshot rather than taken as a parameter: every
@@ -6069,10 +6092,16 @@ async def build_chain(
     # telemetry reader does not exist yet, so it escalates to WARNING — a
     # silent fault here is exactly the shape the no-silent-fail-soft design
     # invariant exists to prevent.
+    #
+    # `elapsed_ms` is on the line for the reason in the Caller-cost note of the
+    # docstring: the blocking cost of a round is otherwise invisible from the
+    # interface, and it must be observable BEFORE the cap is raised above 0.
     logger.log(
         logging.WARNING if truncated_reason == 'merge_error' else logging.INFO,
-        'build_chain: depth=%d built=%d tip=%s truncated_at=%s reason=%s lane=%s',
+        'build_chain: depth=%d built=%d tip=%s truncated_at=%s reason=%s '
+        'lane=%s elapsed_ms=%d',
         depth, len(links), tip[:8], truncated_at, truncated_reason, lane.name,
+        (time.monotonic() - started) * 1000,
     )
 
     if not links:
