@@ -11287,6 +11287,18 @@ class Harness:
         # target is a different repo from cfg.project_root.  Resolved ONCE so the
         # injected env var and the banner below cannot disagree.
         df_root = resolve_dark_factory_root()
+        # One queue string for both the 'Escalation queue:' line and the re-arm
+        # command below, so the two can never disagree (task 3605).
+        queue_dir = f'{cfg.project_root}/{cfg.escalation.queue_dir}'
+        tooling_root_block = (
+            f'\n'
+            f'Dark-factory tooling root (DARK_FACTORY_ROOT, set in your environment): '
+            f'{df_root}\n'
+            f'scripts/watcher-rearm.sh lives in THAT repo -- it is the canonical '
+            f'bounded-wait re-arm wrapper. Re-arm with, verbatim:\n'
+            f'  cd $DARK_FACTORY_ROOT && scripts/watcher-rearm.sh '
+            f'--queue-dir {queue_dir} --level 1 --timeout <min(3600, remaining)>\n'
+        )
         user_prompt = (
             f'You are running as an autonomous escalation watcher.\n'
             f'Rotation limits (injected by supervisor):\n'
@@ -11298,7 +11310,8 @@ class Harness:
             f'emit your digest as the final message and exit cleanly.\n'
             f'\n'
             f'Project root: {cfg.project_root}\n'
-            f'Escalation queue: {cfg.project_root}/{cfg.escalation.queue_dir}\n'
+            f'Escalation queue: {queue_dir}\n'
+            f'{tooling_root_block}'
         )
         system_prompt = load_skill_system_prompt('escalation-watcher-auto')
         escalation_url = f'http://{cfg.escalation.host}:{cfg.escalation.port}/mcp'
