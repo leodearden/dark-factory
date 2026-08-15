@@ -189,13 +189,14 @@ class TestOutstandingFlag:
 
     @pytest.mark.timeout(5)
     def test_cycle_promoted_root_is_outstanding_when_non_terminal(self):
-        """A 2-cycle member promoted to root (spawn_tree.py:119-124) is
-        still someone's child -- its named parent just isn't reachable from
-        a genuine root -- so it and the rest of the cycle stay outstanding
-        when non-terminal. Asserts on the promoted root AND every flattened
-        member (not a single slug) since only the promoted member is
-        suppressed by today's bug; the other cycle member is already built
-        as a non-root descendant and is already outstanding."""
+        """A 2-cycle member promoted to root (see build_spawn_forest's
+        orphaned_cycle_members promotion pass) is still someone's child --
+        its named parent just isn't reachable from a genuine root -- so it
+        and the rest of the cycle stay outstanding when non-terminal.
+        Asserts on the promoted root AND every flattened member (not a
+        single slug) since only the promoted member is suppressed by
+        today's bug; the other cycle member is already built as a non-root
+        descendant and is already outstanding."""
         from cockpit.panes.spawn_tree import build_spawn_forest
 
         a = _make_record(session_slug='cycle-a', parent_session_id='cycle-b')
@@ -205,6 +206,29 @@ class TestOutstandingFlag:
 
         assert forest[0].outstanding is True
         assert all(node.outstanding for node in _flatten(forest))
+
+    @pytest.mark.timeout(5)
+    def test_self_parented_record_is_outstanding_when_non_terminal(self):
+        """A self-parented record (parent_session_id == its own slug) is
+        the degenerate 1-cycle, promoted to a root through the same
+        orphaned_cycle_members pass as a genuine cycle (see
+        test_cycle_promoted_root_is_outstanding_when_non_terminal). It is
+        still someone's child under the parentage rule, so it stays
+        outstanding when non-terminal -- pinned explicitly (status passed
+        rather than relied on as _make_record's default) so a future
+        refactor can't special-case self-parentage as a natural root
+        without a test catching the rendered-output change (see
+        test_self_parented_record_does_not_vanish_or_hang in
+        TestForestTotality for this same case's totality guarantee)."""
+        from cockpit.panes.spawn_tree import build_spawn_forest
+
+        selfie = _make_record(
+            session_slug='selfie-1', parent_session_id='selfie-1', status=sr.Status.RUNNING
+        )
+
+        forest = build_spawn_forest([selfie])
+
+        assert forest[0].outstanding is True
 
     def test_foreign_child_status_is_fail_soft_not_outstanding(self):
         from cockpit.panes.spawn_tree import build_spawn_forest
