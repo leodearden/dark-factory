@@ -503,3 +503,61 @@ async def test_containment_refusal_is_reported_when_a_safe_sidecar_also_exists(t
     # entirely, not merely skipped at write time.
     task_interceptor.update_task.assert_called_once()
     assert task_interceptor.update_task.call_args.args[0] == '2'
+
+
+@pytest.mark.asyncio
+async def test_multiple_sidecars_processes_lexicographically_first(tmp_path):
+    """An unexpected second distinct sidecar in the same batch (lines 186,
+    193-198) is processed deterministically: the lexicographically-first
+    rel path wins, not the batch-first one. The batch here deliberately
+    lists the lexicographically-LAST sidecar first — if it listed them in
+    lexicographic order, the test would pass on insertion order alone and
+    would not pin existing_rel_paths.sort() at all."""
+    plans_dir = tmp_path / 'plans'
+    plans_dir.mkdir()
+    alpha_path = plans_dir / 'alpha-prd.capability-manifest.yaml'
+    alpha_text = _mechanical_sidecar_yaml('alpha', ['alabel'])
+    alpha_path.write_text(alpha_text, encoding='utf-8')
+    zeta_path = plans_dir / 'zeta-prd.capability-manifest.yaml'
+    zeta_text = _mechanical_sidecar_yaml('zeta', ['zlabel'])
+    zeta_path.write_text(zeta_text, encoding='utf-8')
+
+    task_interceptor = AsyncMock()
+    task_interceptor.update_task = AsyncMock(return_value={'success': True})
+    # Batch order is REVERSED vs lexicographic order: zeta first, alpha second.
+    ids = ['9', '8']
+    tasks_data = [
+        {
+            'id': '9',
+            'metadata': {'prd_path': 'plans/zeta-prd.md', 'prd_task_label': 'zlabel'},
+        },
+        {
+            'id': '8',
+            'metadata': {'prd_path': 'plans/alpha-prd.md', 'prd_task_label': 'alabel'},
+        },
+    ]
+
+    report = await stamp_capability_manifests(
+        project_root=str(tmp_path),
+        ids=ids,
+        tasks_data=tasks_data,
+        task_interceptor=task_interceptor,
+    )
+
+    assert report['path'] == 'plans/alpha-prd.capability-manifest.yaml'
+    assert report['stamped'] == ['alabel']
+    assert report['missing_labels'] == []
+
+    assert len(report['errors']) == 1
+    error_entry = report['errors'][0]
+    assert 'multiple capability-manifest sidecars matched this batch' in error_entry
+    assert 'plans/zeta-prd.capability-manifest.yaml' in error_entry
+
+    reloaded = yaml.safe_load(alpha_path.read_text(encoding='utf-8'))
+    assert reloaded['tasks'][0]['task_id'] == 8
+
+    # The ignored sidecar is never mutated.
+    assert zeta_path.read_text(encoding='utf-8') == zeta_text
+
+    task_interceptor.update_task.assert_called_once()
+    assert task_interceptor.update_task.call_args.args[0] == '8'
