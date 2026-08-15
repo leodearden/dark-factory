@@ -596,10 +596,11 @@ Within the same iteration, append one action record to `stats['flag_deleted_reco
 in your structured output:
   `{{"action": "flag_deleted", "flag_id": "<mem0_uuid>", "reason": "processed"}}`
 
-The Python framework counts entries in `flag_deleted_records` and cross-checks them \
-against `stage1_mem0_flags_processed` — a mismatch triggers a WARNING and clamps the \
-counter to the record count, so every successful FIX C deletion must have a matching \
-`flag_deleted` record.
+The framework joins `flag_deleted_records` against this run's rendered flags (on \
+`flag_id`) to acknowledge the originating Stage 1 flag marker (see \
+`_acknowledge_resolved_stage1_markers`) — so every successful FIX C deletion must \
+have a matching `flag_deleted` record, or that marker is left un-acknowledged and \
+resurfaces for manual disambiguation.
 
 After each successful `flag_deleted` action, increment your stats counter: \
 `stage1_mem0_flags_processed += 1`. This counter reflects the number of Mem0 \
