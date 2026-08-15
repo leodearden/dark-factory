@@ -28,11 +28,14 @@
 # before treating an rc=0 here as a clean bill of health. Pass
 # --fail-on-blind-spot (opt-in, default off) to turn an OBSERVED blind spot
 # into rc=1; a failed census probe never trips it, so a transient Qdrant
-# blip cannot flap the predicate. Do NOT wire --fail-on-blind-spot expecting
-# the adjacent flag_for_stage2 pool to reach zero: it is a healthy rolling
-# 14-day window drained in-cycle by task 2966's collector, so a gate keyed
+# blip cannot flap the predicate. It only takes effect alongside --check,
+# which this script's exec line already supplies -- the sweep rejects the
+# flag without it. Do NOT wire it expecting the adjacent flag_for_stage2
+# pool to reach zero: that pool is a healthy rolling window, so a gate keyed
 # on its emptiness fails forever -- the same footgun as --max-backlog 0
-# against undated markers, below.
+# against undated markers, below. Dated census and full rationale live in
+# docs/flag-marker-sweep-recurring.md (the single copy -- don't restate the
+# numbers here).
 #
 # Unlike the nightly sweep wrapper this performs NO deletions (--check
 # without --apply is a dry-run census + verdict), so resolve/resume re-runs

@@ -56,14 +56,13 @@ Original background (task-1659/2108)
 -------------------------------------
 MEASURED-ZERO, RETAINED (task 3897, work item (c)). Both predicates below —
 :func:`find_orphan_markers` (missing ``kind``) and :func:`find_taskless_markers`
-(missing ``task_id``) — operate on a population that counts 0 in both projects
-probed. They are deliberately KEPT rather than retired: they remain this
-script's actual delete-set contract, they stay reachable through the
-``--delete-ids`` targeted-correction path, they are the only collector for the
-legacy pool of any project not yet probed, and the blind-spot cross-check is
-DEFINED as the comparison between this ``source`` enumeration and the adjacent
-population — retiring the source side would leave nothing to compare against
-and would delete the very signal that makes the defect observable.
+(missing ``task_id``) — operate on a population that measures 0 in every project
+probed, and are deliberately KEPT rather than retired: they remain this script's
+delete-set contract, stay reachable through ``--delete-ids``, are the only
+collector for any not-yet-probed project's legacy pool, and the blind-spot
+cross-check is DEFINED as the comparison between this ``source`` enumeration and
+the adjacent population. Full rationale and the dated census:
+``docs/flag-marker-sweep-recurring.md``.
 
 Prior to task-1659, ``flag_dedup._write_and_confirm_marker`` wrote markers with
 ``metadata.source='stage1_flag_marker'`` but omitted ``metadata.kind``.  Dual-filter
@@ -122,21 +121,11 @@ which performs a deterministic Qdrant payload-filter scroll — NOT semantic sea
 Semantic top-N silently drops low-similarity markers (the documented failure mode in
 ``_query_stage2_flags``), making it unsuitable for exhaustive enumeration.
 
-READ THE ``cross_check`` BLOCK, NOT JUST ``orphan_count`` (task 3897). Measured
-live on 2026-08-09 via ``count_memories_by_metadata``:
-
-===========================================  ============  =======
-filter                                        dark_factory  reify
-===========================================  ============  =======
-``{'source': 'stage1_flag_marker'}``                     0        0
-``{'kind':   'stage1_flag_marker'}``                     0        —
-``{'flag_for_stage2': True}``                           61       80
-``{'flag_for_stage2': 'true'}`` (str drift)              0        —
-===========================================  ============  =======
-
-So this script's enumeration is STRUCTURALLY EMPTY today: it scrolls a filter that
-matches nothing, in both projects probed. Two consequences an operator must not
-misread:
+READ THE ``cross_check`` BLOCK, NOT JUST ``orphan_count`` (task 3897). In every
+project probed so far this ``source`` filter — and the ``kind`` one — matches ZERO
+records, while the adjacent ``{'flag_for_stage2': True}`` relay pool is non-empty,
+so this script's enumeration is STRUCTURALLY EMPTY: it scrolls a filter that
+matches nothing. Two consequences an operator must not misread:
 
 1. ``before.total_source`` is always 0, so ``backlog_verdict(0, N)`` holds
    unconditionally and forever — a ``--check`` gate wired on it structurally
@@ -147,34 +136,21 @@ misread:
 :func:`run` therefore issues a count-only census probe on
 ``FLAG_FOR_STAGE2_FILTERS`` and emits a ``cross_check`` report block plus a
 WARNING when :func:`enumeration_blind_spot` fires. Use ``--fail-on-blind-spot``
-to escalate that divergence to a non-zero ``--check`` exit code.
+(with ``--check``) to escalate that divergence to a non-zero exit code.
 
-Why the flag_for_stage2 pool is censused, never deleted here
--------------------------------------------------------------
-The cross-check counts the adjacent pool and stops there. It never enumerates it,
-never runs a predicate over it, and never adds it to the delete set — enforced by
-``TestFlagForStage2IsNeverDeleted``. Three reasons, two of them measured:
+The adjacent pool is CENSUSED, NEVER DELETED here: the probe counts it and stops,
+never enumerating it, never running a predicate over it, never adding it to the
+delete set — a boundary enforced by ``TestFlagForStage2IsNeverDeleted``. In short:
+live relay markers would be caught by this script's own predicates, it has neither
+the ``is_protected_mirror_record`` guard nor the tombstone write that the in-cycle
+``_sweep_stale_mem0_pool`` applies, and task 2966's collector already drains that
+pool correctly.
 
-1. 23 of the 61 live records carry NO usable ``task_id``, so
-   :func:`find_taskless_markers` would delete all 23 on the very next nightly
-   ``--apply`` run. They are LIVE Stage-1 -> Stage-2 relay markers, not dead
-   weight, and the nightly timer's ``--terminal-drain`` would additionally reap
-   markers citing already-done tasks.
-2. :func:`delete_orphan_markers` has NEITHER the ``is_protected_mirror_record``
-   guard NOR the ``record_mem0_deletion_tombstones`` write that the shared
-   in-cycle ``_sweep_stale_mem0_pool`` applies. ``flag_for_stage2`` is an
-   LLM-supplied key any writer can stamp on any record — ``mem0_tombstone.py``'s
-   module docstring names this exact filter as its motivating over-breadth case.
-   (Measured: 0 cycle_summary/ledger_stamp records in the pool today, so the risk
-   is latent rather than active — but this script is the wrong place to take it.)
-3. The pool is already drained correctly, on a rolling 14-day window, by
-   ``_sweep_stale_mem0_flag_for_stage2_markers`` (task 2966). Adding a second
-   collector here would race a correct one, producing duplicate deletes and
-   duplicate tombstones for the same records.
-
-Whether the 61 should ultimately be deleted is a separate question, to be
-adjudicated now that the sweep can see them. Making them visible is this
-script's job; deleting them is not.
+SINGLE SOURCE OF TRUTH for the dated census (which filter matched how many
+records, in which project, when) and for the full censused-never-deleted
+rationale: ``docs/flag-marker-sweep-recurring.md``. Those are point-in-time
+measurements of live data; they are deliberately NOT restated here, so there is
+only one copy to keep current.
 
 Usage
 -----
@@ -225,8 +201,8 @@ MARKER_KIND: str = 'stage1_flag_marker'
 # decoupled from the heavier reconciliation-stage module.
 #
 # The boolean ``True`` is load-bearing. Qdrant payload filters are
-# type-sensitive: the string variant ``{'flag_for_stage2': 'true'}`` matches 0
-# records against live dark_factory (the same drift
+# type-sensitive: the string variant ``{'flag_for_stage2': 'true'}`` matches
+# nothing (the same drift
 # ``task_knowledge_sync._FLAG_FOR_STAGE2_STRING_VARIANT_FILTERS`` exists to
 # detect). A str/bool slip here would silently reintroduce the very
 # zero-matching blind spot the cross-check exists to detect.
@@ -333,9 +309,10 @@ def enumeration_blind_spot(enumerated_count: int, adjacent_count: int) -> bool:
 
     Task 3897 exists because this script cannot currently tell them apart.
     It enumerates on ``{'source': MARKER_SOURCE}``, which matches 0 records
-    in both ``dark_factory`` and ``reify`` (measured 2026-08-09), while the
-    adjacent ``FLAG_FOR_STAGE2_FILTERS`` relay pool holds 61 and 80 records
-    respectively. Because ``before.total_source`` is therefore always 0,
+    in every project probed, while the adjacent ``FLAG_FOR_STAGE2_FILTERS``
+    relay pool is non-empty (dated census:
+    ``docs/flag-marker-sweep-recurring.md``, the single home for those
+    measurements). Because ``before.total_source`` is therefore always 0,
     :func:`backlog_verdict` holds unconditionally and forever — a
     ``task_kind='deterministic'`` gate that structurally cannot fail — and
     the nightly timer prints ``orphan_count: 0`` as a clean bill of health

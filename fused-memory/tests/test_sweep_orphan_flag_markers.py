@@ -1479,25 +1479,15 @@ class TestFlagForStage2IsNeverDeleted:
     """The cross-check must never widen the delete set. Guard against a
     future well-meaning edit that turns the census into a deletion.
 
-    Why this boundary is load-bearing, from live measurement (2026-08-09):
-
-    1. 23 of the 61 live flag_for_stage2 records carry NO usable task_id, so
-       this script's existing find_taskless_markers predicate would delete
-       all 23 on the very next nightly --apply run. Those are LIVE Stage-1 ->
-       Stage-2 relay markers, not dead weight. The nightly timer runs
-       --apply --terminal-drain, which would additionally reap markers citing
-       already-done tasks.
-    2. This script's delete_orphan_markers has NEITHER the
-       is_protected_mirror_record guard NOR the record_mem0_deletion_tombstones
-       write that the shared in-cycle _sweep_stale_mem0_pool applies.
-       flag_for_stage2 is an LLM-supplied key any writer can stamp on any
-       record — mem0_tombstone.py's module docstring names this exact filter
-       as its motivating over-breadth case.
-    3. The pool is already drained correctly, on a rolling 14-day window, by
-       the in-cycle _sweep_stale_mem0_flag_for_stage2_markers (task 2966).
-
-    So the probe is count-only by design, and this class is what stops that
-    from silently regressing.
+    The census probe is count-only BY DESIGN: live relay markers in that pool
+    would be caught by this script's own predicates, the script has neither
+    the protected-mirror guard nor the tombstone write the in-cycle
+    _sweep_stale_mem0_pool applies, and task 2966's collector already drains
+    the pool correctly. Full rationale and the dated measurements that back
+    each of those: docs/flag-marker-sweep-recurring.md ("Why the relay pool
+    is censused, never deleted") — deliberately not restated here, so there
+    is one copy to keep current. This class is what stops the design from
+    silently regressing.
     """
 
     _NEUTRAL_NOW = datetime(2026, 1, 1, tzinfo=UTC)
@@ -1606,12 +1596,12 @@ class TestEnumerationBlindSpot:
     """Tests for the pure predicate enumeration_blind_spot(enumerated, adjacent).
 
     Task 3897: this script enumerates on {'source': 'stage1_flag_marker'},
-    which measures 0 records in BOTH dark_factory and reify as of
-    2026-08-09, while the adjacent {'flag_for_stage2': True} relay pool
-    measures 61 and 80 respectively. The consequence is a structural false
-    all-clear: `before.total_source` is always 0, so backlog_verdict(0, N)
-    holds unconditionally and forever, and the nightly sweep prints
-    `orphan_count: 0` every night against a pool it cannot see.
+    which measures 0 records in every project probed, while the adjacent
+    {'flag_for_stage2': True} relay pool is non-empty (dated census:
+    docs/flag-marker-sweep-recurring.md). The consequence is a structural
+    false all-clear: `before.total_source` is always 0, so
+    backlog_verdict(0, N) holds unconditionally and forever, and the nightly
+    sweep prints `orphan_count: 0` every night against a pool it cannot see.
 
     This predicate is what makes that divergence nameable. It distinguishes
     "swept nothing because there was nothing" (a true no-op) from "swept
@@ -1620,8 +1610,8 @@ class TestEnumerationBlindSpot:
     """
 
     @pytest.mark.parametrize('enumerated,adjacent,expected', [
-        # The live dark_factory shape as measured 2026-08-09: the source
-        # filter sees nothing while 61 flag_for_stage2 records exist.
+        # The live dark_factory shape: the source filter sees nothing while
+        # a flag_for_stage2 population exists.
         (0, 61, True),
         # The live reify shape, same defect, different magnitude.
         (0, 80, True),
