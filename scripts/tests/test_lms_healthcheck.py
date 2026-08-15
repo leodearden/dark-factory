@@ -1260,6 +1260,70 @@ def test_an_arm_failure_dominates_a_simultaneous_vram_failure():
     assert lms_healthcheck.exit_code_for(report) == lms_healthcheck.EXIT_ARM_FAILED
 
 
+def _polluted_report(probe=_passing_probe, used_mib=MEASURED_USED_MIB,
+                     free_mib=MEASURED_FREE_MIB):
+    """A run ollama gatecrashed: the numbers exist but mean nothing."""
+    return _report(
+        probe=probe,
+        baseline=_baseline(consumers=[WHISPER_CONSUMER]),
+        snapshot=_snapshot(used_mib=used_mib, free_mib=free_mib,
+                           consumers=[WHISPER_CONSUMER, ARM_CONSUMER,
+                                      OLLAMA_CONSUMER]),
+    )
+
+
+def test_a_polluted_measurement_has_its_own_exit_code():
+    """"Over budget" and "unmeasurable" send an operator in opposite directions.
+
+    EXIT_VRAM_FAILED means the arm is genuinely too big and something should be
+    stopped. A polluted run says nothing about the arm at all -- stopping an arm
+    in response would be acting on a number nobody measured.
+    """
+    report = _polluted_report()
+
+    code = lms_healthcheck.exit_code_for(report)
+
+    assert code == lms_healthcheck.EXIT_VRAM_POLLUTED
+    assert code != lms_healthcheck.EXIT_VRAM_FAILED
+    assert code != lms_healthcheck.EXIT_ARM_FAILED
+    assert code != lms_healthcheck.EXIT_OK
+
+
+def test_a_polluted_measurement_is_never_a_pass():
+    """The block's own verdict may well say PASS -- computed from arithmetic
+    that is void.  The exit code is the only thing a CI caller reads."""
+    report = _polluted_report()
+
+    assert report.vram.verdict == 'PASS'
+    assert lms_healthcheck.exit_code_for(report) != lms_healthcheck.EXIT_OK
+
+
+def test_pollution_outranks_a_plain_budget_failure():
+    """A budget FAIL measured on a contended card is not a budget FAIL.
+
+    Reporting code 3 here would send an operator to shrink an arm that may fit
+    perfectly well once ollama releases the card.
+    """
+    report = _polluted_report(used_mib=24400,
+                              free_mib=MEASURED_TOTAL_MIB - 24400)
+
+    assert report.vram.verdict == 'FAIL'
+    assert lms_healthcheck.exit_code_for(report) == (
+        lms_healthcheck.EXIT_VRAM_POLLUTED
+    )
+
+
+def test_an_arm_failure_still_dominates_a_polluted_measurement():
+    """Unchanged precedence, for the reason already documented: an arm that
+    answered WRONGLY is the more actionable finding, and pollution cannot
+    explain a wrong answer -- it only voids the VRAM arithmetic, which is right
+    there in the artifact either way."""
+    report = _polluted_report(probe=_failing_probe)
+
+    assert report.vram.pollution == lms_vram.PollutionState.POLLUTED
+    assert lms_healthcheck.exit_code_for(report) == lms_healthcheck.EXIT_ARM_FAILED
+
+
 # ---------------------------------------------------------------------------
 # Table rendering
 # ---------------------------------------------------------------------------
@@ -1472,6 +1536,60 @@ def test_cli_reports_a_broken_gpu_probe_and_writes_no_artifact(cli_env, monkeypa
     assert not out_path.exists()
 
 
+def test_cli_refuses_a_polluted_baseline_and_writes_no_artifact(
+    cli_env, tmp_path, capsys,
+):
+    """The baseline on disk was taken while ollama held 10314 MiB.
+
+    `lms_ctl.start` refuses to write such a file, so this one predates the
+    guard or was written by hand -- and either way its number is what every
+    footprint gets subtracted from. No artifact is written even though
+    `--output` was passed: a file on disk would later read as "the slate was
+    checked", which is the same reasoning as the merge and no-active-arms paths.
+    """
+    path = lms_vram.baseline_path('qwen3.5-9b')
+    payload = json.loads(path.read_text())
+    payload['consumers'] = [OLLAMA_CONSUMER.model_dump(mode='json')]
+    path.write_text(json.dumps(payload))
+    out_path = tmp_path / 'health-report.json'
+
+    code = lms_healthcheck.main(['--arm', 'qwen3.5-9b', '--output', str(out_path)])
+
+    assert code == lms_healthcheck.EXIT_VRAM_POLLUTED
+    # PollutedBaselineError SUBCLASSES VramProbeError, so a handler written in
+    # the obvious order would swallow it into EXIT_PROBE_ERROR and report
+    # "nvidia-smi is broken" for a perfectly healthy GPU.
+    assert code != lms_healthcheck.EXIT_PROBE_ERROR
+    err = capsys.readouterr().err
+    assert str(OLLAMA_CONSUMER.pid) in err
+    assert OLLAMA_CONSUMER.process_name in err
+    assert not out_path.exists()
+
+
+def test_cli_reports_probe_time_pollution_but_still_writes_the_artifact(
+    cli_env, monkeypatch, tmp_path,
+):
+    """The other pollution route, and it is NOT a refusal.
+
+    A baseline that was clean when taken and a card that got crowded afterwards
+    still produced an honest record of what was seen -- so the artifact is
+    written, carrying the POLLUTED state, and the refusal is in the exit code.
+    Suppressing it would destroy the only evidence that ollama was there.
+    """
+    monkeypatch.setattr(
+        lms_vram, 'probe_gpu_snapshot',
+        lambda *a, **k: _snapshot(consumers=[ARM_CONSUMER, OLLAMA_CONSUMER]),
+    )
+    out_path = tmp_path / 'health-report.json'
+
+    code = lms_healthcheck.main(['--arm', 'qwen3.5-9b', '--output', str(out_path)])
+
+    assert code == lms_healthcheck.EXIT_VRAM_POLLUTED
+    written = json.loads(out_path.read_text())
+    assert written['vram']['pollution'] == 'POLLUTED'
+    assert str(OLLAMA_CONSUMER.pid) in written['vram']['pollution_reason']
+
+
 def test_every_cli_exit_code_is_distinct():
     codes = [
         lms_healthcheck.EXIT_OK,
@@ -1480,6 +1598,8 @@ def test_every_cli_exit_code_is_distinct():
         lms_healthcheck.EXIT_VRAM_FAILED,
         lms_healthcheck.EXIT_PROBE_ERROR,
         lms_healthcheck.EXIT_NO_ACTIVE_ARMS,
+        lms_healthcheck.EXIT_MERGE_ERROR,
+        lms_healthcheck.EXIT_VRAM_POLLUTED,
     ]
 
     assert len(set(codes)) == len(codes)
