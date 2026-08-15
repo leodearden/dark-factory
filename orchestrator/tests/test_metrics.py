@@ -708,8 +708,11 @@ class TestCostPrimitivesSingleHome:
 # "did this architect actually produce a plan?" question downstream was answered
 # from plan_quality instead — a number the LLM judge can return NONZERO for a
 # stepless artifact that score_plan_structure floors to 0.0 (Graphiti episode
-# e2066ec6). These pin the predicate and its equivalence with the artifact-level
-# twin judge.is_scorable_plan.
+# e2066ec6). These pin the predicate itself; the equivalence with the
+# artifact-level twin judge.is_scorable_plan is pinned end-to-end through the
+# real runner by
+# test_eval_architect.py::TestSteplessPlanIsNeverJudged.test_persisted_metrics_agree_with_the_artifact_level_twin,
+# not by the tests below (which re-derive their own plan_steps locally).
 # ---------------------------------------------------------------------------
 
 class TestProducedAPlan:
@@ -759,14 +762,21 @@ class TestProducedAPlan:
         {'task_id': 't', 'title': 'x', 'analysis': 'a', 'files': [], 'steps': []},
         {'task_id': 't', 'title': 'x', 'steps': [{'id': 'step-1'}, {'id': 'step-2'}]},
     ])
-    def test_equivalent_to_the_artifact_level_twin(self, plan):
-        """produced_a_plan(metrics) == is_scorable_plan(plan), by construction.
+    def test_agrees_with_the_artifact_level_twin_given_the_same_step_count(self, plan):
+        """Given the SAME step count, produced_a_plan and is_scorable_plan agree.
 
-        The report layer only ever sees a persisted metrics dict and cannot call
-        is_scorable_plan, which reads the plan ARTIFACT. run_architect_eval
-        derives plan_steps from the identical `len(plan.get('steps') or [])`, so
-        the two ask the same question — PINNED here rather than left to
-        coincidence (the drift hazard _has_plan_quality_score was written for).
+        What this DOES pin: neither predicate carries a condition beyond
+        "step count > 0", checked across five artifact shapes — including the
+        header-only `create_plan` stub (TRUTHY, but not a plan).
+
+        What this does NOT pin: it re-derives its own `plan_steps` locally
+        (`len((plan or {}).get('steps') or [])`) rather than driving
+        `run_architect_eval`, so it cannot catch drift in the runner's actual
+        derivation — a change there could break the equivalence while this
+        test stays green.
+
+        The real end-to-end guarantee — driven through the real runner —
+        lives in `test_eval_architect.py::TestSteplessPlanIsNeverJudged.test_persisted_metrics_agree_with_the_artifact_level_twin`.
         """
         from orchestrator.evals.judge import is_scorable_plan
         from orchestrator.evals.metrics import produced_a_plan
