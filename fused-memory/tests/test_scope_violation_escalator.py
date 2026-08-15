@@ -241,12 +241,19 @@ class TestAdvisoryVsRejectionWording:
 
     The path guard has two outcomes since task 2206: a FILES-certain hard
     reject (no task created, error dict returned) and a PROSE-only advisory
-    (task CREATED and stamped with ``metadata.possible_scope_mismatch``,
-    nothing blocked).  Both funnel through ``report_rejection``, which used to
-    hardcode rejection wording — so every advisory told the operator (and the
-    agent reading it in a briefing) that a task had been rejected when it had
-    not.  These tests pin the PAIR: advisory wording says CREATED, rejection
-    wording is unchanged.
+    (nothing blocked; the submission carries
+    ``metadata.possible_scope_mismatch``).  Both funnel through
+    ``report_rejection``, which used to hardcode rejection wording — so every
+    advisory told the operator (and the agent reading it in a briefing) that a
+    task had been rejected when nothing had been blocked.  These tests pin the
+    PAIR: the advisory says nothing was blocked, the rejection wording is
+    unchanged.
+
+    Task 4159 pins the other half of the same honesty property: the advisory
+    fires from the ``submit_task`` PHASE-1 guard, before ``tm.add_task`` and
+    before the curator picks drop/combine/create/refuse, so it may not claim
+    a task EXISTS either.  Overcorrecting from 'rejected' to 'created' just
+    moved the false claim.
     """
 
     @staticmethod

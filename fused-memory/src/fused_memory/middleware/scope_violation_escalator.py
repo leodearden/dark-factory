@@ -16,14 +16,19 @@ Since task 2206 (commit 0204e25fa5) the guard produces TWO outcomes, and
   structured ``DarkFactoryPathScopeViolation`` error dict is returned to the
   caller.
 * **PROSE-only advisory** (``advisory=True``) — a regex-over-prose heuristic
-  hit with no files-level mismatch.  Nothing is blocked: the task IS created
-  and stamped with ``metadata.possible_scope_mismatch``.
+  hit with no files-level mismatch.  Nothing is blocked: the submission
+  proceeds, carrying ``metadata.possible_scope_mismatch``.
 
 The distinction is load-bearing rather than cosmetic (task 3119): this
 escalation is read by operators and rendered into agent briefings, so an
-advisory described in rejection wording reports that a task was rejected when
-it in fact exists — and tells the reader to resubmit work that already
-landed.  Both outcomes are severity ``info`` — the FLOOR of the
+advisory described in rejection wording reports a rejection that never
+happened — and tells the reader to resubmit work that was never blocked.
+The advisory wording may not over-claim in the other direction either
+(task 4159): ``report_rejection`` is called from the ``submit_task``
+PHASE-1 guard, before ``tm.add_task`` and before the curator chooses
+drop/combine/create/refuse, so it cannot state that a task exists.  The
+stamp above reaches a task only on the ``create`` outcome.
+Both outcomes are severity ``info`` — the FLOOR of the
 ``blocking|info|critical|urgent`` vocabulary in ``escalation.models``, so the
 wording is what distinguishes them, not the severity.
 
@@ -33,8 +38,8 @@ Design mirrors :class:`fused_memory.middleware.curator_escalator.CuratorEscalato
   the package is missing (minimal envs, tests without escalation infra),
   ``report_rejection`` becomes a logged no-op — the guard's own outcome is
   unaffected (on the FILES-certain path the error dict is still returned;
-  on the advisory path the task is still created and stamped), so
-  escalation is purely additive.
+  on the advisory path the submission still proceeds and still carries the
+  stamp), so escalation is purely additive.
 * Per-project ``EscalationQueue`` cache keyed by ``project_root``.
 * Escalations land in ``{project_root}/data/escalations`` — the *filing*
   project's queue (the place the agent was operating against), regardless
@@ -205,9 +210,18 @@ class ScopeViolationEscalator:
         Despite the name (kept for call-site/test-double back-compat), this
         method covers BOTH outcomes described in the module docstring, selected
         by *advisory*: a FILES-certain hard rejection (default — wording tells
-        the operator to resubmit to the owner) or a PROSE-only advisory (the
-        task WAS created and stamped, so the wording says so and
+        the operator to resubmit to the owner) or a PROSE-only advisory
+        (nothing was blocked, so the wording says only that, and
         ``suggested_action`` is ``no_action_advisory_only``).
+
+        The advisory wording deliberately does NOT say a task exists
+        (task 4159).  This method is reached from the ``submit_task``
+        PHASE-1 path guard, which returns before ``tm.add_task`` is called
+        and before the curator picks drop/combine/create/refuse — so at the
+        moment this record is written the outcome is genuinely unknown, and
+        the ``metadata.possible_scope_mismatch`` stamp reaches a task only
+        on ``create`` (``_execute_combine`` does not propagate it to a
+        combine target).
 
         Returns the escalation id when one was filed, ``None`` otherwise
         (escalation package missing, queue write failed, etc.).  Never
