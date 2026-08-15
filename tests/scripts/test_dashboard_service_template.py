@@ -11,6 +11,7 @@ See also:
   - dashboard/src/dashboard/config.py — DashboardConfig.from_env handling of DASHBOARD_KNOWN_PROJECT_ROOTS (COMMA-separated split)
 """
 
+import functools
 import pathlib
 import re
 import shutil
@@ -624,35 +625,56 @@ POLL_JS = REPO_ROOT / "dashboard" / "src" / "dashboard" / "static" / "redux" / "
 # poller was refactored to pass a named constant (and gained unrelated
 # setTimeout-based fetch deadlines), because the literal no longer appeared at
 # the call site.  Binding to the declaration is both stabler and more precise.
-_POLL_INTERVAL_DECL_RE = re.compile(
-    r"^\s*(?:const|let|var)\s+POLL_INTERVAL_MS\s*=\s*(\d+)\s*;", re.MULTILINE
-)
-_POLL_INTERVAL_USE_RE = re.compile(r"setInterval\([^;]*?,\s*POLL_INTERVAL_MS\s*\)")
+#
+# The name is a PARAMETER rather than a module constant because more than one
+# client poller declares a period (see CLIENT_POLLERS below).  The patterns are
+# otherwise byte-identical per name; in particular the ``^\s*(?:const|let|var)
+# \s+`` anchor is what makes LOAD_POLL_INTERVAL_MS and POLL_INTERVAL_MS
+# mutually non-matching, so one poller can never answer a lookup for another.
+@functools.cache
+def _poll_interval_patterns(const_name: str) -> tuple[re.Pattern[str], re.Pattern[str]]:
+    """Return the (declaration, use) regex pair for *const_name*, compiled once."""
+    name = re.escape(const_name)
+    return (
+        re.compile(rf"^\s*(?:const|let|var)\s+{name}\s*=\s*(\d+)\s*;", re.MULTILINE),
+        re.compile(rf"setInterval\([^;]*?,\s*{name}\s*\)"),
+    )
 
 
-def _parse_poll_interval_ms(source: str, origin: str) -> int:
-    """Return the browser's data-refresh period in *source*, in milliseconds.
+def _parse_poll_interval_ms(
+    source: str, origin: str, const_name: str = "POLL_INTERVAL_MS"
+) -> int:
+    """Return the period named *const_name* in *source*, in milliseconds.
 
-    Reads the ``POLL_INTERVAL_MS`` declaration, and separately asserts that the
+    Reads the ``<const_name>`` declaration, and separately asserts that the
     constant is what actually drives a ``setInterval``.  Both halves must hold:
     a declaration nobody schedules on would let this module measure a dead
     constant, and a scheduler whose period we cannot read would let the
     keep-alive bound be checked against nothing.  Exactly one declaration is
     required so the period can never be ambiguous.
+
+    *const_name* defaults to data.js's ``POLL_INTERVAL_MS``, but is a parameter
+    because the browser runs more than one recurring HTTP poller and each names
+    its own period — tab_overview.jsx's host-load card declares
+    ``LOAD_POLL_INTERVAL_MS``.  Parameterizing the existing parser rather than
+    writing a second one carries both halves of the contract above to every
+    poller for free.  Every message names the REQUESTED constant, so a miss on
+    one poller cannot report itself as a problem with another.
     """
-    decls = _POLL_INTERVAL_DECL_RE.findall(source)
+    decl_re, use_re = _poll_interval_patterns(const_name)
+    decls = decl_re.findall(source)
     assert len(decls) == 1, (
-        f"Expected exactly one POLL_INTERVAL_MS = <literal> declaration in "
+        f"Expected exactly one {const_name} = <literal> declaration in "
         f"{origin}, found {len(decls)}: {decls}. The keep-alive bound in this "
         "module is derived from that period; if the poller was renamed, moved, "
         "or its period made non-literal, update _parse_poll_interval_ms to "
-        "identify the data-refresh interval explicitly rather than dropping "
+        "identify the poll interval explicitly rather than dropping "
         "the check."
     )
-    assert _POLL_INTERVAL_USE_RE.search(source), (
-        f"POLL_INTERVAL_MS is declared in {origin} but never passed as a "
-        "setInterval(...) period, so it may no longer be the browser's actual "
-        "data-refresh interval. Update _parse_poll_interval_ms to read "
+    assert use_re.search(source), (
+        f"{const_name} is declared in {origin} but never passed as a "
+        "setInterval(...) period, so it may no longer be that poller's actual "
+        "interval. Update _parse_poll_interval_ms to read "
         "whatever now schedules the poll."
     )
     return int(decls[0])
