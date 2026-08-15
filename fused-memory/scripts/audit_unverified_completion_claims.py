@@ -507,6 +507,7 @@ def build_report(
     projects: list[str],
     categories: list[str],
     include_unverifiable: bool,
+    unrecognized_categories: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Build the machine-readable report.
 
@@ -552,6 +553,12 @@ def build_report(
         'swept_at': swept_at,
         'projects': list(projects),
         'categories': list(categories),
+        # Always present, [] when clean. A requested category that names no
+        # real MemoryCategory matches no record, so the scope was empty by
+        # MIS-SPELLING rather than by measurement — and `scanned: 7595,
+        # mismatch: 0` reads identically either way unless the artifact itself
+        # says so.
+        'unrecognized_categories': sorted(set(unrecognized_categories)),
         'scanned': scanned_count,
         'records_with_claims': records_with_claims,
         'summary': {
@@ -860,7 +867,9 @@ def _build_parser() -> argparse.ArgumentParser:
         default=','.join(sorted(IN_SCOPE_CATEGORIES)),
         help=(
             'Comma-separated categories to sweep. Default: the two this task '
-            'scopes to.'
+            'scopes to. Labels that name no MemoryCategory match nothing; they '
+            'are warned about and recorded in the report rather than silently '
+            'emptying the scan.'
         ),
     )
     parser.add_argument(
@@ -1256,6 +1265,22 @@ async def _run(
     categories = frozenset(
         c.strip() for c in str(args.categories).split(',') if c.strip()
     )
+    # A category is only ever recovered from source_description when it names a
+    # real MemoryCategory (parse_category), so an unrecognized label matches
+    # NOTHING: `--categories temporal_fact` would print a clean-looking report
+    # over a corpus that was never scanned. Named loudly here and recorded in
+    # the report, the same no-silent-fail-soft discipline as truncated_by and
+    # edges_unqueried.
+    unrecognized_categories = sorted(
+        c for c in categories if c not in tuple(MemoryCategory)
+    )
+    if unrecognized_categories:
+        logger.warning(
+            'unrecognized --categories %s: no record can carry these labels, so '
+            'they contribute NOTHING to the scan. Known categories: %s',
+            ', '.join(unrecognized_categories),
+            ', '.join(sorted(str(c) for c in MemoryCategory)),
+        )
     known_project_ids = frozenset(projects)
 
     # ---- read (may fail; nothing is printed if it does) -------------------- #
@@ -1399,6 +1424,7 @@ async def _run(
         projects=projects,
         categories=sorted(categories),
         include_unverifiable=bool(args.include_unverifiable),
+        unrecognized_categories=unrecognized_categories,
     )
     if args.limit is not None:
         report['limit'] = args.limit

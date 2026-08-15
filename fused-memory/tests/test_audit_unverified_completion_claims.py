@@ -575,24 +575,44 @@ class TestReadOnlyByConstruction:
                     offenders.append(name)
         assert offenders == [], f'mutation affordance(s) present: {offenders}'
 
+    #: Callee names that would mutate a store. ``query`` is FalkorDB's
+    #: writable command (the sweep issues ``ro_query``); the rest are the
+    #: memory-service mutators.
+    FORBIDDEN_CALLS = frozenset({
+        'query',
+        'update_edge',
+        'delete_episode',
+        'bulk_remove_edges',
+        'remove_edge',
+        'delete_entity',
+        'add_memory',
+        'add_episode',
+    })
+
     def test_ro_command_is_the_only_falkordb_command(self) -> None:
         assert RO_COMMAND == 'GRAPH.RO_QUERY'
-        source = SCRIPT_PATH.read_text()
-        assert 'GRAPH.QUERY' not in source
-        assert source.count("'GRAPH.RO_QUERY'") == 1
 
-    def test_source_contains_no_mutation_call(self) -> None:
-        source = SCRIPT_PATH.read_text()
-        for symbol in (
-            'update_edge',
-            'delete_episode',
-            'bulk_remove_edges',
-            'remove_edge',
-            'delete_entity',
-            'add_memory(',
-            'add_episode(',
-        ):
-            assert symbol not in source, f'mutation call present: {symbol}'
+    def test_no_mutation_call_in_the_source_ast(self) -> None:
+        """Asserted over the AST, not as a substring scan.
+
+        A substring test cannot tell a CALL from a docstring that names the
+        hazard to warn against it — the same reason
+        test_reader_constructs_no_graphiti_driver went AST-based. Pinning
+        source text also punished a second legitimate mention of a constant.
+        The behavioural guarantee lives in _FakeGraph (which raises if the
+        writable ``query`` is ever issued) and in assert_read_only_command;
+        this test is the structural backstop for a mutator that never runs
+        under test.
+        """
+        tree = ast.parse(SCRIPT_PATH.read_text())
+        offenders = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = getattr(node.func, 'id', None) or getattr(node.func, 'attr', None)
+            if name in self.FORBIDDEN_CALLS:
+                offenders.append(f'{name} (line {node.lineno})')
+        assert offenders == [], f'mutation call(s) present: {offenders}'
 
     def test_no_cypher_write_keyword_in_any_query_constant(self) -> None:
         cypher_constants = [
@@ -988,6 +1008,40 @@ class TestRunEndToEnd:
         assert report['summary']['mismatch'] == 0
         assert report['summary']['unverifiable'] == 5
         assert all(f['status'] == 'unverifiable' for f in report['findings'])
+
+    async def test_mistyped_category_is_named_not_silently_empty(
+        self, capsys, caplog
+    ) -> None:
+        """`--categories temporal_fact` scans a corpus and matches nothing.
+
+        Without this, the artifact reads `scanned: 7595, mismatch: 0` — exactly
+        what a genuinely clean corpus looks like — because no record can carry
+        a label that names no MemoryCategory. The scope was empty by
+        MIS-SPELLING, and the report has to say so itself.
+        """
+        reader = _FakeReader([_record(uuid='ep-1', text=ESC_3085_1_INSTANCE_2)])
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            _code, report, _ = await self._run_capture(
+                capsys, reader, _probes(ticket=None),
+                categories='temporal_fact,decisions_and_rationale',
+            )
+        assert report is not None
+        assert report['unrecognized_categories'] == ['temporal_fact']
+        assert report['scanned'] == 1
+        assert report['records_with_claims'] == 0
+        assert report['summary']['mismatch'] == 0
+        assert 'temporal_fact' in caplog.text
+
+    async def test_recognized_categories_leave_the_key_empty(self, capsys) -> None:
+        """Always present, [] when clean — an absent key would read as absent
+        rather than as none."""
+        reader = _FakeReader([_record(uuid='ep-1', text=ESC_3085_1_INSTANCE_2)])
+        _code, report, _ = await self._run_capture(
+            capsys, reader, _probes(ticket=None)
+        )
+        assert report is not None
+        assert report['unrecognized_categories'] == []
+        assert report['summary']['mismatch'] == 1
 
     async def test_infra_failure_returns_one_and_prints_nothing(self, capsys) -> None:
         """A truncated report that looks complete is worse than none."""
