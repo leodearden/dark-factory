@@ -671,6 +671,18 @@ class ReconciliationHarness:
         # reported it.  Keyed by group_id so one graph cannot suppress another.
         self._last_unexpected_indices: dict[str, tuple] = {}
 
+        # Same change-memo, applied to the MISSING set for the drift WARNING
+        # (task 3709).  Until γ (provisioning) lands every registered graph is
+        # unprovisioned, so an unconditional WARNING would emit identical facts
+        # once per project per cycle forever — the same noise failure the memo
+        # above exists to prevent, and INV-4 already designates the OPEN
+        # escalation, not the log line, as the standing loud signal.  Gates ONLY
+        # the log line: filing stays unconditional (the queue's own has_open_l1
+        # dedup owns that), so an escalation closed while the drift persists can
+        # still be re-filed.  Cleared when a graph recovers, so a later re-drift
+        # is loud again.
+        self._last_missing_indices: dict[str, tuple] = {}
+
     async def _notify_judge_halt(self, project_id: str, reason: str) -> None:
         """WP-D: forward judge halts to the backlog policy exactly once.
 
@@ -1224,20 +1236,16 @@ class ReconciliationHarness:
             )
             return None
 
-        health = summarize_index_health(
+        # Classify and return — the DRIFT verdict is deliberately not logged
+        # here.  `_detect_index_drift` logs it one layer up with the same facts
+        # plus run_id, and it is the only caller, so warning in both places
+        # would emit two identical records per project per cycle forever (the
+        # third being the stage report's).  Read failures above ARE logged here:
+        # those facts exist nowhere else, since this method degrades them to a
+        # None the caller cannot distinguish from "no graphiti backend".
+        return summarize_index_health(
             normalize_index_records(records), expected_index_set()
         )
-        if not health['healthy']:
-            logger.warning(
-                'reconciliation.index_health_unhealthy',
-                extra={
-                    'group_id': group_id,
-                    'missing_count': len(health['missing']),
-                    'expected_total': health['expected_total'],
-                    'actual_total': health['actual_total'],
-                },
-            )
-        return health
 
     async def _detect_index_drift(
         self, group_id: str, *, run_id: str | None = None
@@ -1265,15 +1273,43 @@ class ReconciliationHarness:
             return None
 
         if not health['healthy']:
-            logger.warning(
-                'reconciliation.index_drift_detected',
-                extra={
-                    'group_id': group_id,
-                    'run_id': run_id,
-                    'missing_count': len(health['missing']),
-                    'expected_total': health['expected_total'],
-                },
-            )
+            # Log the drift on CHANGE only, the same memo Q4 applies to the
+            # unexpected set below.  Until γ lands every registered graph is
+            # unprovisioned, so an unconditional WARNING here would repeat
+            # identical facts once per project per cycle forever and train
+            # readers to skip the field; INV-4 makes the OPEN escalation, not
+            # the log line, the standing loud signal.  What survives is the
+            # TRANSITIONS: the first observation in a fresh process (the startup
+            # sweep always logs, since the memo is in-process) and any change in
+            # the missing set.  The per-run record is unaffected — Stage 1
+            # carries `report.stats['index_health']` and its own WARNING every
+            # cycle.
+            missing_now = tuple(health['missing'])
+            if self._last_missing_indices.get(group_id) != missing_now:
+                logger.warning(
+                    'reconciliation.index_drift_detected',
+                    extra={
+                        'group_id': group_id,
+                        'run_id': run_id,
+                        'missing_count': len(missing_now),
+                        'expected_total': health['expected_total'],
+                        'actual_total': health['actual_total'],
+                    },
+                )
+            self._last_missing_indices[group_id] = missing_now
+            # Filing is deliberately NOT memo-gated: the queue's own
+            # category-scoped has_open_l1 dedup owns suppression, so an
+            # escalation closed while the drift persists is re-filed rather
+            # than silently dropped by an in-process memo.
+            #
+            # NOTE (blocking I/O): has_open_l1 globs and parses the pending
+            # queue and submit() writes fsync-durably, both synchronously on the
+            # event loop — the `stage1_stall_detector` precedent this module
+            # follows does the same. Cost scales with pending-queue size; if
+            # that ever becomes measurable, offload this call with
+            # `await asyncio.to_thread(escalate_missing_indices, ...)` here
+            # rather than making the filer itself async (its other caller shape
+            # is synchronous).
             if HAS_ESCALATION and self._escalation_queue is not None:
                 escalate_missing_indices(
                     self._escalation_queue,
@@ -1282,6 +1318,10 @@ class ReconciliationHarness:
                     project_id=group_id,
                     run_id=run_id,
                 )
+        else:
+            # A recovered graph re-arms the memo so a later re-drift is loud
+            # again rather than being suppressed by the stale pre-repair set.
+            self._last_missing_indices.pop(group_id, None)
 
         # Q4: report operator-added indices at INFO on CHANGE only, never
         # escalate them (D8 — an operator-added index is not drift to repair, so

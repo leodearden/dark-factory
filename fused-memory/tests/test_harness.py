@@ -13824,10 +13824,17 @@ class TestHarnessCheckIndexHealth:
         )
 
     @pytest.mark.asyncio
-    async def test_absent_index_reports_drift_with_warning(
+    async def test_absent_index_reports_drift_at_one_altitude(
         self, journal, event_buffer, mock_memory_service, caplog
     ):
-        """One expected-but-absent index yields healthy=False, names it, and warns."""
+        """One expected-but-absent index yields healthy=False and names it.
+
+        The drift WARNING itself belongs to `_detect_index_drift` (its only
+        caller), NOT here: warning in both places emitted two records carrying
+        the same facts, per project, per cycle, forever — noise that trains
+        readers to skip the field.  A read FAILURE is still logged here, because
+        those facts exist nowhere else; a successful classification is not.
+        """
         import logging
 
         from fused_memory.backends.falkor_indices import expected_index_set
@@ -13847,7 +13854,10 @@ class TestHarnessCheckIndexHealth:
         assert result['healthy'] is False
         assert result['missing'] == [dropped]
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
-        assert warnings, 'A drifted graph must emit a WARNING — that is the signal'
+        assert warnings == [], (
+            'A successful classification must not warn at this altitude — '
+            f'_detect_index_drift owns the drift WARNING; got {warnings}'
+        )
 
     @pytest.mark.asyncio
     async def test_returns_none_when_graphiti_is_none(
@@ -14073,6 +14083,99 @@ class TestHarnessDetectIndexDrift:
         harness.memory.graphiti = None  # type: ignore[assignment]
 
         assert await harness._detect_index_drift('dark_factory') is None
+
+    # --- (d2) the drift WARNING lives here, and logs on CHANGE only ---
+
+    @pytest.mark.asyncio
+    async def test_drift_warns_once_per_unchanged_missing_set(
+        self, journal, event_buffer, mock_memory_service, tmp_path, caplog
+    ):
+        """An unchanged drift set warns ONCE, and the record carries every fact.
+
+        Until γ (provisioning) lands every registered graph is unprovisioned, so
+        an unconditional WARNING would repeat identical facts once per project
+        per cycle forever.  INV-4 makes the OPEN escalation — not the log line —
+        the standing loud signal, so the log records TRANSITIONS only.  The
+        record must still carry `actual_total`, the one fact the dropped
+        `_check_index_health` WARNING carried and this one did not.
+        """
+        import logging
+
+        from fused_memory.backends.falkor_indices import expected_index_set
+
+        expected = expected_index_set()
+        dropped = sorted(expected)[0]
+        harness, _ = self._harness_with_queue(
+            journal, event_buffer, mock_memory_service, tmp_path, expected - {dropped}
+        )
+
+        with caplog.at_level(logging.WARNING):
+            await harness._detect_index_drift('dark_factory')
+            await harness._detect_index_drift('dark_factory')
+
+        drift_logs = [
+            r for r in caplog.records if 'index_drift_detected' in r.getMessage()
+        ]
+        assert len(drift_logs) == 1, (
+            'An unchanged drift set must warn exactly once across two cycles, '
+            f'got {len(drift_logs)}'
+        )
+        assert drift_logs[0].missing_count == 1
+        assert drift_logs[0].expected_total == len(expected)
+        assert drift_logs[0].actual_total == len(expected) - 1, (
+            'actual_total must survive the drop of the inner WARNING — no fact '
+            'may be lost by collapsing the two records into one'
+        )
+
+    @pytest.mark.asyncio
+    async def test_changed_and_recovered_drift_sets_warn_again(
+        self, journal, event_buffer, mock_memory_service, tmp_path, caplog
+    ):
+        """A CHANGED missing set re-warns, and recovery re-arms the memo.
+
+        Recovery clearing the memo is what keeps a later re-drift loud: were the
+        pre-repair set left behind, a graph that lost the SAME index again would
+        be silently suppressed forever.
+        """
+        import logging
+
+        from fused_memory.backends.falkor_indices import expected_index_set
+
+        expected = expected_index_set()
+        first_dropped, second_dropped = sorted(expected)[:2]
+        harness, _ = self._harness_with_queue(
+            journal,
+            event_buffer,
+            mock_memory_service,
+            tmp_path,
+            expected - {first_dropped},
+        )
+
+        with caplog.at_level(logging.WARNING):
+            await harness._detect_index_drift('dark_factory')  # warns (new)
+            harness.memory.graphiti.list_indices = AsyncMock(
+                return_value=_index_records_for(
+                    expected - {first_dropped, second_dropped}
+                )
+            )
+            await harness._detect_index_drift('dark_factory')  # warns (changed)
+            harness.memory.graphiti.list_indices = AsyncMock(
+                return_value=_index_records_for(expected)
+            )
+            await harness._detect_index_drift('dark_factory')  # healthy: re-arms
+            harness.memory.graphiti.list_indices = AsyncMock(
+                return_value=_index_records_for(expected - {first_dropped})
+            )
+            await harness._detect_index_drift('dark_factory')  # warns (re-drift)
+
+        drift_logs = [
+            r for r in caplog.records if 'index_drift_detected' in r.getMessage()
+        ]
+        assert len(drift_logs) == 3, (
+            'Expected a WARNING for the first drift, the changed set and the '
+            f'post-recovery re-drift; got {len(drift_logs)}'
+        )
+        assert [r.missing_count for r in drift_logs] == [1, 2, 1]
 
     # --- (e) Q4: unexpected indices log at INFO on CHANGE only ---
 
@@ -14311,6 +14414,73 @@ class TestHarnessIndexHealthStartupSweep:
         )
 
         await harness._check_index_health_at_startup()
+
+    @pytest.mark.asyncio
+    async def test_run_loop_sweeps_index_health_at_startup(
+        self, journal, event_buffer, mock_memory_service, monkeypatch
+    ):
+        """run_loop() must actually REACH the sweep — once, before the reaper ticks.
+
+        Without this the startup half of Q3 has no wiring test: every assertion
+        above drives `_check_index_health_at_startup` directly, so deleting its
+        call from run_loop would leave the whole suite green while the sweep
+        silently stopped running — the exact 'regression to invisible' the
+        cadence-half wiring test (TestFullCycleWiringIndexHealth) exists to
+        prevent.  Mirrors the sibling one-shot startup contract test
+        (test_run_loop_resumes_interrupted_runs_at_startup_before_reaper),
+        including its raise, which also pins that the startup guard around the
+        sweep cannot crash run_loop.
+        """
+        real_sleep = asyncio.sleep
+
+        async def fast_sleep(seconds: float) -> None:
+            await real_sleep(0)
+
+        monkeypatch.setattr('fused_memory.reconciliation.harness._sleep', fast_sleep)
+
+        harness = self._sweep_harness(journal, event_buffer, mock_memory_service)
+
+        call_order: list[str] = []
+        sweep_event = asyncio.Event()
+        stale_event = asyncio.Event()
+
+        async def sweep_side_effect():
+            call_order.append('sweep')
+            sweep_event.set()
+            raise RuntimeError('boom — simulated index-health failure')
+
+        async def stale_runs_side_effect():
+            call_order.append('stale')
+            if call_order.count('stale') >= 2:
+                stale_event.set()
+
+        harness._check_index_health_at_startup = AsyncMock(
+            side_effect=sweep_side_effect
+        )
+        harness._recover_predecessor_runs = AsyncMock(return_value=None)
+        harness._resume_interrupted_runs = AsyncMock(return_value=None)
+        harness._recover_stale_runs = AsyncMock(side_effect=stale_runs_side_effect)
+        harness._start_escalation_server = AsyncMock()
+        harness._stop_escalation_server = AsyncMock()
+        harness.buffer.get_active_projects = AsyncMock(return_value=[])
+        if harness.judge is not None:
+            harness.judge.initialize = AsyncMock()
+
+        await _drive_run_loop_until(harness, sweep_event, stale_event)
+
+        # Ran exactly once at startup despite raising — not once per iteration.
+        assert harness._check_index_health_at_startup.call_count == 1, (
+            'The index-health sweep must run exactly once at startup; called '
+            f'{harness._check_index_health_at_startup.call_count} times'
+        )
+        # The loop kept iterating (the startup try/except guard did not crash it).
+        assert harness._recover_stale_runs.call_count >= 2
+        # Ordering: the sweep precedes any reaper tick.
+        assert call_order[0] == 'sweep', (
+            '_check_index_health_at_startup must run before the first '
+            f'_recover_stale_runs tick; call order was: {call_order!r}'
+        )
+        assert 'stale' in call_order[1:]
 
 
 # ── Tests for task 1938: harness._reconcile_status_correction ──────────────────
