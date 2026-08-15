@@ -628,7 +628,7 @@ def test_row_watchdog_window_is_pinned_and_ceilings_clear_it():
         float(ROW_WATCHDOG_ENV['ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS'])
         + float(ROW_WATCHDOG_ENV['ORCH_WATCHDOG_KILL_GRACE_SECS'])
     )
-    assert ROW_TREE_KILL_CEILING_SECS >= window + 10.0, (
+    assert window + 10.0 <= ROW_TREE_KILL_CEILING_SECS, (
         f'ROW_TREE_KILL_CEILING_SECS ({ROW_TREE_KILL_CEILING_SECS}) must '
         f'clear the worst-case watchdog fire window ({window}s, Row 3\'s '
         f'select-timeout branch) with at least 10s of load headroom, or the '
@@ -637,7 +637,7 @@ def test_row_watchdog_window_is_pinned_and_ceilings_clear_it():
         f'per row on a full verify leg'
     )
 
-    assert ROW_PER_TEST_TIMEOUT_SECS >= 2 * ROW_TREE_KILL_CEILING_SECS + window, (
+    assert 2 * ROW_TREE_KILL_CEILING_SECS + window <= ROW_PER_TEST_TIMEOUT_SECS, (
         f'ROW_PER_TEST_TIMEOUT_SECS ({ROW_PER_TEST_TIMEOUT_SECS}) must clear '
         f'two ceiling-bounded waits (child.wait then wait_subtree_gone, '
         f'{ROW_TREE_KILL_CEILING_SECS}s each) plus one full watchdog window '
