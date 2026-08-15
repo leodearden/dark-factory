@@ -605,3 +605,128 @@ async def test_healthz_reports_error_not_timeout_when_probe_raises(
             'the payload carries only the status string "error", so the '
             'exception TYPE must survive in the logs'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-13 / step-14: caller/handler cancellation must not strand an
+# untracked probe task (task 4089 — reopens the task-leak class task 3466
+# already closed once, this time via CALLER cancellation rather than budget
+# expiry)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+async def _drained_probe_registry():
+    """Yield ``_ABANDONED_PROBES``; on teardown, cancel + drain whatever remains.
+
+    Teardown-ONLY: deliberately does not ``.clear()`` the registry at setup.
+    Clearing would drop the strong reference to a task left in-flight by an
+    earlier test, which would GC it mid-flight — exactly the hazard this
+    registry exists to prevent (see the module comment at app.py:540-543).
+    Same hygiene rationale as the ``finally: await pool.close_all()`` blocks
+    above (lines 298-303 / 509-514): a RED assertion failure here must fail
+    loudly, not leak a pending task into the rest of the suite.
+    """
+    registry = app_module._ABANDONED_PROBES
+    yield registry
+    pending = set(registry)
+    if pending:
+        for task in pending:
+            task.cancel()
+        await asyncio.wait(pending, timeout=5.0)
+
+
+@pytest.mark.parametrize('trigger', ['budget_expiry', 'caller_cancelled'])
+async def test_probe_db_abandons_and_tracks_on_every_exit_path(
+    dashboard_config, _drained_probe_registry, trigger
+):
+    """No exit path out of ``_probe_db`` may leave its inner task untracked.
+
+    ``budget_expiry`` (budget=0.05) characterizes the pre-existing task-3466
+    fix: the inner task blocks past the budget, so ``_probe_db`` abandons +
+    tracks it on the ``if task not in done`` branch. This must stay green
+    through this change.
+
+    ``caller_cancelled`` uses budget=60.0 — chosen STRUCTURALLY, not tuned.
+    60.0s is far beyond any wall-clock this test can reach (and beyond the
+    60s pytest-timeout), so the outer ``probe`` task's own ``.cancel()`` is
+    provably the ONLY thing that can end the probe; the budget itself cannot
+    have expired. Before this change, cancelling the caller propagates
+    ``CancelledError`` straight out of ``_probe_db``'s ``asyncio.wait``,
+    jumping over the abandon+track call entirely — the inner task is then
+    referenced only by the event loop's WEAK set, the exact GC hazard
+    ``_ABANDONED_PROBES`` exists to prevent.
+
+    The inner task is identified by diffing ``asyncio.all_tasks()`` across
+    task creation, not by reading ``_ABANDONED_PROBES`` membership — the
+    registry is a module-level global that other tests in this module also
+    populate, so counting its members would be order- and timing-dependent.
+    """
+    config = dashboard_config
+    registry = _drained_probe_registry
+    pool = _BlockingPool({config.reconciliation_db: _BlockingConn(block_on='execute')})
+    budget = 0.05 if trigger == 'budget_expiry' else 60.0
+
+    before = asyncio.all_tasks()
+    probe = asyncio.create_task(app_module._probe_db(pool, config.reconciliation_db, budget))
+    await asyncio.sleep(0.01)
+    new_tasks = (asyncio.all_tasks() - before) - {probe}
+    assert len(new_tasks) == 1, f'expected exactly one new inner task, got {new_tasks}'
+    inner = next(iter(new_tasks))
+
+    if trigger == 'budget_expiry':
+        assert await probe == 'timeout'
+    else:
+        probe.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await probe
+
+    assert inner in registry, 'inner probe task was not tracked in _ABANDONED_PROBES'
+    await asyncio.wait({inner}, timeout=5.0)
+    assert inner.cancelled(), 'inner probe task was tracked but never actually cancelled'
+    assert inner not in registry, (
+        'inner probe task leaked: still in _ABANDONED_PROBES after it finished'
+    )
+
+
+async def test_healthz_handler_cancellation_strands_no_probe_task(
+    dashboard_config, _drained_probe_registry
+):
+    """Cancelling the whole ``/healthz`` handler must not strand a probe task.
+
+    The production trigger: uvicorn's ``--timeout-graceful-shutdown`` force-
+    cancels remaining request tasks at every restart (the dashboard watchdog
+    restarts this unit routinely), and a client disconnect reaches the same
+    path. All three DB targets block in ``execute()`` so the handler is
+    guaranteed to still be parked inside ``_probe_db``'s ``asyncio.wait``
+    (on the FIRST target) when cancellation lands — only one inner task is
+    ever in flight at a time because ``healthz`` awaits ``_probe_db``
+    sequentially per DB target.
+    """
+    config = dashboard_config
+    registry = _drained_probe_registry
+    pool = _BlockingPool(
+        {
+            config.reconciliation_db: _BlockingConn(block_on='execute'),
+            config.write_journal_db: _BlockingConn(block_on='execute'),
+            config.runs_db: _BlockingConn(block_on='execute'),
+        }
+    )
+    request = _make_healthz_request(config, pool)
+
+    before = asyncio.all_tasks()
+    handler = asyncio.create_task(healthz(request))
+    await asyncio.sleep(0.01)
+    new_tasks = (asyncio.all_tasks() - before) - {handler}
+    assert len(new_tasks) == 1, (
+        f'expected exactly one in-flight inner probe task, got {new_tasks}'
+    )
+    inner = next(iter(new_tasks))
+
+    handler.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await handler
+
+    assert inner in registry, 'handler cancellation stranded an untracked probe task'
+    await asyncio.wait({inner}, timeout=5.0)
+    assert inner.cancelled(), 'stranded probe task was tracked but never actually cancelled'
