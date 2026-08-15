@@ -1270,12 +1270,29 @@ class TaskArtifacts:
         _validate_verdict_role(role)
         self._clear_path(f'verdicts/{role}.json')
 
-    def lock_plan(self, session_id: str) -> bool:
+    def lock_plan(self, session_id: str, *, run_id: str | None = None) -> bool:
         """Atomically acquire the plan lock.
 
         Uses O_CREAT|O_EXCL for atomic exclusive creation (POSIX).
         Returns True if the lock was acquired, False if already locked.
         Raises ValueError if os.getpid() returns a non-int (unexpected env).
+
+        *run_id* is the PROCESS-level run id (``Harness._run_id``, threaded
+        through as ``TaskWorkflow._process_run_id``).  Recording it lets
+        ``TaskGroundTruth._resolve_live_claimant`` compose a full
+        ``shared.task_claimant.compose_claimant_run_id`` identity from the
+        lock — byte-identical to the DB claimant stamp that this same
+        incarnation writes, since ``owner_pid`` below is this same process's
+        pid and the caller passes this same ``session_id`` (task 3563).
+
+        The ``run_id`` key is written ONLY when it is known and non-blank, so
+        its ABSENCE unambiguously means "unknown" — the state of every legacy
+        lock already on disk and of harness-less (test/eval) workflows, whose
+        ``_process_run_id`` is None.  TaskGroundTruth reads that as an unknown
+        claimant identity (``Claimant.run_id is None``) rather than composing
+        a partial one: a well-shaped-but-wrong identity would string-mismatch
+        the DB-composed filing identity and be read downstream as "a DIFFERENT
+        incarnation is live", which is the unsafe direction.
         """
         lock_path = self.root / 'plan.lock'
         try:
@@ -1288,11 +1305,15 @@ class TaskArtifacts:
                 raise ValueError(
                     f'plan.lock owner_pid must be a non-null int, got {owner_pid!r}'
                 )
-            data = json.dumps({
+            payload = {
                 'session_id': session_id,
                 'locked_at': datetime.now(UTC).isoformat(),
                 'owner_pid': owner_pid,
-            })
+            }
+            # Omit entirely when unknown — never write '' (see docstring).
+            if isinstance(run_id, str) and run_id.strip():
+                payload['run_id'] = run_id
+            data = json.dumps(payload)
             os.write(fd, data.encode())
         except Exception:
             # Clean up the empty file created by O_CREAT|O_EXCL so a subsequent
