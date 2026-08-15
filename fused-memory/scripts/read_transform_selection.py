@@ -851,6 +851,61 @@ class ProductionQuery:
     match: str | None = None
 
 
+def _check_production_types(row: dict[str, Any], *, where: str) -> None:
+    """Validate the two NUMERIC fields, by type and not merely by presence.
+
+    The field check above is key-presence only, so ``"traffic_share": null``
+    passes it and rides raw into ``production_query_provenance``'s sum,
+    where it raises ``TypeError`` — a type ``main``'s handler tuple does
+    not catch, i.e. a raw traceback instead of a named ``return 1``.  The
+    fix belongs HERE, at the loader: widening that tuple to swallow bare
+    ``TypeError``/``ValueError`` would convert unrelated programming errors
+    into a quiet exit 1.  ``ProductionQuerySetError`` is already in the
+    tuple and its docstring already covers "malformed", so no new error
+    class is introduced.
+
+    ``bool`` is rejected explicitly because ``isinstance(True, int)`` is
+    ``True`` in Python, so a bare numeric check admits it.
+
+    WHY ``None`` IS LEGAL ON A TAIL ROW AND NOT ON A TEMPLATE ROW
+    ------------------------------------------------------------
+    ``harvest_production_queries._share`` genuinely returns ``None`` when
+    there is no traffic to take a share of, and a tail row's share is never
+    summed — refusing it would make a real harvest unloadable over a
+    journal this loader has no business judging.  A ``briefing_template``
+    row's share IS the artifact's headline claim ("the four templates are
+    N% of all search traffic", built from exactly these rows), so a
+    ``None`` there means that claim is unbuildable and the fixture is
+    malformed.
+    """
+    query_id = row.get('query_id')
+    share = row.get('traffic_share')
+    share_is_number = isinstance(share, (int, float)) and not isinstance(share, bool)
+    if share is None:
+        if row.get('source') == 'briefing_template':
+            raise ProductionQuerySetError(
+                f'{where}: query {query_id!r} is a briefing_template row with '
+                "a null 'traffic_share'. The family-share claim in the report "
+                'is built from exactly these rows, so a null share makes it '
+                'unbuildable. A null share is legal on a production_tail row, '
+                'where nothing sums it.'
+            )
+    elif not share_is_number:
+        raise ProductionQuerySetError(
+            f'{where}: query {query_id!r} has a non-numeric '
+            f"'traffic_share' ({share!r}). It must be a number, or null on a "
+            'production_tail row.'
+        )
+
+    count = row.get('observed_count')
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        raise ProductionQuerySetError(
+            f'{where}: query {query_id!r} has a non-integer or negative '
+            f"'observed_count' ({count!r}). It is a measured count of search "
+            'ops in the journal and must be a non-negative int.'
+        )
+
+
 def load_production_queries(path: str | Path) -> list[ProductionQuery]:
     """Read the harvested production sample (unlabeled by construction).
 
@@ -892,6 +947,7 @@ def load_production_queries(path: str | Path) -> list[ProductionQuery]:
                 f'{target}:{lineno}: duplicate query_id {query_id!r}'
             )
         seen.add(query_id)
+        _check_production_types(row, where=f'{target}:{lineno}')
         queries.append(ProductionQuery(
             query_id=query_id,
             text=row['text'],
@@ -1764,9 +1820,14 @@ def render_selection_markdown(report: dict[str, Any]) -> str:
         add('| --- | --- | --- | --- |')
         for entry in production['templates']:
             share = entry.get('traffic_share')
+            count = entry.get('observed_count')
+            # Formatted only after the None/absent check: `f'{"—":,}'`
+            # raises `ValueError: Cannot specify ',' with 's'`, so a
+            # hand-edited or older artifact would crash the renderer here
+            # instead of printing a dash.
             add(f'| `{entry["template"]}` '
                 f'| {entry.get("match") or dash} '
-                f'| {entry.get("observed_count", dash):,} '
+                f'| {dash if count is None else f"{count:,}"} '
                 f'| {dash if share is None else f"{share * 100:.2f}%"} |')
         add('')
         family = production.get('family_share')
@@ -1874,11 +1935,20 @@ def production_query_provenance(
         for query in queries
         if query.source == 'briefing_template' and query.template
     ]
+    # Only the MEASURED shares are summed.  A null share reaches this
+    # function only from a hand-built or older row list — the loader refuses
+    # one on a briefing_template row — but crashing on it would leave the
+    # two halves of this module disagreeing about whether None is legal,
+    # since the renderer below already handles `share is None`.  No template
+    # carrying a share at all reports `None`: no measurement, never a
+    # measured zero.
+    measured = [
+        entry['traffic_share'] for entry in templates
+        if entry.get('traffic_share') is not None
+    ]
     block: dict[str, Any] = {
         'templates': templates,
-        'family_share': round(
-            sum(entry['traffic_share'] for entry in templates), 6,
-        ) if templates else None,
+        'family_share': round(sum(measured), 6) if measured else None,
         'sampled_query_count': len(queries),
         'tail_query_count': len(queries) - len(templates),
         'observed_limit': queries[0].observed_limit if queries else None,
