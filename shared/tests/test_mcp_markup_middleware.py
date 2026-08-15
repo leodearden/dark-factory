@@ -254,6 +254,46 @@ def build_harness(
         return 'mem_1'
 
     @mcp.tool
+    def add_memory_strict(
+        content: str,
+        project_id: str,
+        category: str | None = None,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+    ) -> str:
+        """``add_memory`` with ``project_id`` REQUIRED, as the real one declares it.
+
+        PRD boundary row B14. The real tool
+        (``fused-memory/src/fused_memory/server/tools.py:2845``) declares
+        ``content: str, project_id: str`` — BOTH required — while the legacy toy
+        above declares ``project_id: str | None = None``. That divergence is
+        precisely why the required-parameter shape had never been exercised:
+        every recovery target asserted anywhere in this file (B1 ``priority``,
+        B2 ``priority``/``agent_id``/``metadata``, B3 ``suggested_action``, B9
+        ``agent_id``) is a DEFAULTED parameter.
+
+        This is ADDITIVE rather than a correction to the legacy toy: roughly
+        fourteen existing call sites (B4, the INV-2 rows, the storm rows) call
+        ``add_memory`` with only ``{'content': ...}``, so tightening
+        ``project_id`` there would break every one of them for no gain.
+
+        The optional tail is kept so this stays an honest mirror rather than a
+        two-parameter reduction that would make any recovery trivially
+        unambiguous. ``metadata`` and ``dual_write`` are deliberately left off —
+        ``metadata`` would collide with the B6 override path, which this row is
+        not about — and ``ctx`` is FastMCP-injected.
+        """
+        rec.record(
+            'add_memory_strict',
+            content=content,
+            project_id=project_id,
+            category=category,
+            agent_id=agent_id,
+            session_id=session_id,
+        )
+        return 'mem_strict_1'
+
+    @mcp.tool
     def add_reuse_item(what: str, how: str, where: str) -> str:
         """PRD boundary row B5's named specimen is an ``add_reuse_item.how``."""
         rec.record('add_reuse_item', what=what, how=how, where=where)
