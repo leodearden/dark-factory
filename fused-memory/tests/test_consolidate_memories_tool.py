@@ -20,7 +20,7 @@ failure mode is recorded in `tests/test_update_memory_tool.py`.
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -47,6 +47,11 @@ CANONICAL = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
 RETAIN_1 = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
 RETAIN_2 = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
 
+# The citation gate only runs for a mem0 record in a REGISTERED project with a
+# task DB to scan (`_citation_gate_applies`), so these two are what switch it on.
+PROJECT_ROOT = '/tmp/root'
+KNOWN_PROJECTS = {PROJECT_ID: PROJECT_ROOT}
+
 
 def _parse_result(result):
     """Parse a FastMCP call_tool result (list of TextContent) into a dict."""
@@ -71,6 +76,7 @@ def make_service(
     topic_members=None,
     children=None,
     delete_errors=None,
+    events=None,
 ):
     """A MemoryService mock modelling one consolidation cluster.
 
@@ -80,21 +86,29 @@ def make_service(
 
     *children* maps a supersede id to its direct children; *delete_errors*
     maps a supersede id to an exception `delete_memory` raises for it.
+
+    *events* is a shared ordered log — the only way to assert the ORDERING
+    that is this op's whole contract, since the steps land on different
+    mocks (the service, then the task interceptor, then the service again).
     """
     gone = set(gone)
     children = children or {}
     delete_errors = delete_errors or {}
     members = SUPERSEDES if topic_members is None else topic_members
+    log = events if events is not None else []
 
     svc = AsyncMock()
     svc.config.mem0_update = Mem0UpdateConfig()
 
-    svc.add_memory = AsyncMock(
-        return_value=AddMemoryResponse(memory_ids=[CANONICAL], message='ok')
-    )
+    async def _add(**kwargs):
+        log.append(('add_memory', None))
+        return AddMemoryResponse(memory_ids=[CANONICAL], message='ok')
+
+    svc.add_memory = AsyncMock(side_effect=_add)
 
     async def _delete(**kwargs):
         mid = kwargs.get('memory_id')
+        log.append(('delete_memory', mid))
         if mid in delete_errors:
             raise delete_errors[mid]
         return {'status': 'deleted', 'store': 'mem0', 'id': mid}
@@ -122,8 +136,54 @@ def make_service(
     return svc
 
 
-async def call_consolidate(svc, **overrides):
-    server = create_mcp_server(svc)
+def _task(task_id, status, metadata):
+    return {
+        'id': task_id,
+        'status': status,
+        'title': f'task {task_id}',
+        'metadata': metadata,
+    }
+
+
+def make_interceptor(tasks, *, scan_error=None, failing_task_ids=(), events=None):
+    """A TaskInterceptor mock for the citation gate (per the 3108 harness).
+
+    *scan_error* makes the task-DB read raise, which the gate must fail
+    CLOSED on. *failing_task_ids* makes the repoint WRITE be refused for
+    those tasks — interceptor gates refuse by RETURNING
+    ``{'success': False}``, never by raising, so a truthy-dict check would
+    let a failed repoint through.
+    """
+    failing = set(failing_task_ids)
+    log = events if events is not None else []
+
+    async def _get_tasks(project_root):
+        if scan_error is not None:
+            raise scan_error
+        return {'tasks': list(tasks)}
+
+    async def _update_task(task_id=None, **kwargs):
+        log.append(('repoint', task_id))
+        if task_id in failing:
+            return {
+                'success': False,
+                'error': 'write refused',
+                'error_type': 'ReconTerminalWriteRejected',
+            }
+        return {'success': True}
+
+    interceptor = MagicMock()
+    interceptor.get_tasks = AsyncMock(side_effect=_get_tasks)
+    interceptor.update_task = AsyncMock(side_effect=_update_task)
+    return interceptor
+
+
+async def call_consolidate(
+    svc, *, task_interceptor=None, known_projects=None, **overrides
+):
+    server = create_mcp_server(
+        svc, task_interceptor=task_interceptor, known_projects=known_projects
+    )
     args = {
         'canonical_content': CONTENT,
         'topic': TOPIC,
@@ -398,3 +458,173 @@ class TestCanonicalFirstOrdering:
         assert 'canonical' in result['error'].lower()
         svc.delete_memory.assert_not_called()
         svc.update_memory.assert_not_called()
+
+
+class TestTheDeleteSetGoesThroughTheCitationGate:
+    """The supersedes go THROUGH the existing gate, never under it.
+
+    A consolidate op that called `MemoryService.delete_memory` directly
+    would gate nothing and destroy N cited records while reporting success
+    — the one-guarded-record-and-N-unguarded-ones failure task 3197
+    documents. The gate lives at the tool layer because it needs the task
+    interceptor and the known-projects registry, so this op reuses the
+    same closures rather than growing a second scanner (INV-5).
+
+    A load-bearing asymmetry versus `delete_memory`: this op ALWAYS has a
+    concrete surviving replacement — the canonical it is about to write —
+    so the gate's "you named no survivor" refusal is structurally
+    unreachable here. What IS reachable is a scan the op could not
+    complete, and an unknown citation state immediately before an
+    irreversible delete must fail closed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_task_db_refuses_the_whole_op(self):
+        """(a) FAIL CLOSED, and before the canonical exists.
+
+        `assert_not_called` on all three write paths is the proof that the
+        pre-flight is genuinely non-mutating AND that it precedes the
+        canonical write: a refused consolidation must leave the corpus
+        byte-identical, not stranded with a canonical over an unfolded
+        cluster.
+        """
+        svc = make_service()
+        interceptor = make_interceptor([], scan_error=RuntimeError('task DB unreadable'))
+
+        result = await call_consolidate(
+            svc, task_interceptor=interceptor, known_projects=KNOWN_PROJECTS
+        )
+
+        assert result['error_type'] == 'ConsolidationCitationGateRejected'
+        assert [b['error_type'] for b in result['blocked']] == ['CitationScanFailed'] * 3
+        svc.add_memory.assert_not_called()
+        svc.delete_memory.assert_not_called()
+        svc.update_memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_every_blocker_is_collected_into_one_refusal(self):
+        """N unclearable ids cost ONE refusal, not N refuse-fix-retry trips.
+
+        A consolidation set is a cluster by construction, so refusing at
+        the first blocker would leave the caller to re-derive the rest by
+        hand — the step that found 3 of 8 in the original incident.
+        """
+        svc = make_service()
+        interceptor = make_interceptor([], scan_error=RuntimeError('task DB unreadable'))
+
+        result = await call_consolidate(
+            svc, task_interceptor=interceptor, known_projects=KNOWN_PROJECTS
+        )
+
+        assert [b['memory_id'] for b in result['blocked']] == SUPERSEDES
+
+    @pytest.mark.asyncio
+    async def test_live_citers_are_repointed_at_the_new_canonical(self):
+        """(b) The canonical is written FIRST and is the repoint target.
+
+        It satisfies the gate's "the replacement must not be a record this
+        call destroys" rule by construction: it is the one record the op
+        creates.
+        """
+        svc = make_service()
+        interceptor = make_interceptor([
+            _task('501', 'pending', {'mem0_canonical_entry': S1}),
+            _task('502', 'pending', {'mem0_canonical_entry': S2}),
+        ])
+
+        result = await call_consolidate(
+            svc, task_interceptor=interceptor, known_projects=KNOWN_PROJECTS
+        )
+
+        assert result['status'] == 'consolidated'
+        patched = [
+            json.loads(c.kwargs['metadata'])['mem0_canonical_entry']
+            for c in interceptor.update_task.await_args_list
+        ]
+        assert patched == [CANONICAL, CANONICAL]
+
+    @pytest.mark.asyncio
+    async def test_the_repoint_stats_reach_the_caller_per_id(self):
+        svc = make_service()
+        interceptor = make_interceptor([
+            _task('501', 'pending', {'mem0_canonical_entry': S1}),
+        ])
+
+        result = await call_consolidate(
+            svc, task_interceptor=interceptor, known_projects=KNOWN_PROJECTS
+        )
+
+        entry = result['citation_repoint'][S1]
+        assert entry['outcome'] == 'repointed'
+        assert entry['citation_repoint']['stage1_citation_tasks_repointed'] == 1
+        assert entry['citation_repoint']['stage1_citation_repoint_failures'] == 0
+
+    @pytest.mark.asyncio
+    async def test_citations_are_repointed_before_any_delete_lands(self):
+        """No window exists in which the entry is gone but a task still cites it."""
+        events: list[tuple[str, str | None]] = []
+        svc = make_service(events=events)
+        interceptor = make_interceptor(
+            [_task('501', 'pending', {'mem0_canonical_entry': S3})], events=events
+        )
+
+        await call_consolidate(
+            svc, task_interceptor=interceptor, known_projects=KNOWN_PROJECTS
+        )
+
+        kinds = [kind for kind, _ in events]
+        assert kinds.index('add_memory') < kinds.index('repoint')
+        assert kinds.index('repoint') < kinds.index('delete_memory')
+
+    @pytest.mark.asyncio
+    async def test_a_failed_repoint_suppresses_only_its_own_delete(self):
+        """(c) One unrepointable citer costs ONE supersede, not the cluster.
+
+        Deleting S2 now would strand exactly the pointer the gate exists to
+        protect, so its delete is refused — while S1 and S3, whose citers
+        were rewritten, still fold. The refused id is reported twice on
+        purpose: in `failed_deletes` (what did not happen, and why) and in
+        `survivors` (what is still in the corpus).
+        """
+        svc = make_service(gone=[S1, S3])
+        interceptor = make_interceptor(
+            [
+                _task('501', 'pending', {'mem0_canonical_entry': S1}),
+                _task('502', 'pending', {'mem0_canonical_entry': S2}),
+                _task('503', 'pending', {'mem0_canonical_entry': S3}),
+            ],
+            failing_task_ids={'502'},
+        )
+
+        result = await call_consolidate(
+            svc, task_interceptor=interceptor, known_projects=KNOWN_PROJECTS
+        )
+
+        assert result['status'] == 'partial'
+        assert [f['id'] for f in result['failed_deletes']] == [S2]
+        assert result['failed_deletes'][0]['error_type'] == 'CitationRepointFailed'
+        assert result['deleted'] == [S1, S3]
+        assert S2 in result['survivors']
+        attempted = [c.kwargs['memory_id'] for c in svc.delete_memory.await_args_list]
+        assert attempted == [S1, S3]
+
+    @pytest.mark.asyncio
+    async def test_an_unscannable_project_is_never_enumerated(self):
+        """(d) The gate's own precondition short-circuits first.
+
+        With no registered project there is no task DB to scan, so the op
+        must not pay for an enumeration it would have to discard — and must
+        not refuse on behalf of a gate that is not running.
+        """
+        svc = make_service()
+        interceptor = make_interceptor([
+            _task('501', 'pending', {'mem0_canonical_entry': S1}),
+        ])
+
+        result = await call_consolidate(
+            svc, task_interceptor=interceptor, known_projects={}
+        )
+
+        assert result['status'] == 'consolidated'
+        assert result['deleted'] == SUPERSEDES
+        interceptor.get_tasks.assert_not_called()
