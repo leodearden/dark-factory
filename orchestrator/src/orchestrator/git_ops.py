@@ -1751,6 +1751,20 @@ async def _settled_lane_lock_holder_pids(
     a raise; it can neither raise itself nor convert a diagnostic degradation
     into a merge failure.
 
+    WHAT SAMPLING REPEATEDLY COSTS (task 3783 review amendment).  Polling turns
+    one glimpse of the kernel table into ~25, which also means ~25 chances to
+    catch an IN-PROCESS SIBLING mid-acquire — and precisely in the case an
+    empty first read describes, where the lane has just been released and a
+    waiter is most likely to win it.  A sibling's healthy hold looks, at
+    layer (1) of :meth:`GitOps._lane_lock_self_owned_leak`, exactly like our own
+    leak; only layer (2)'s registry tells them apart.  That is why
+    :meth:`GitOps._acquire_lane_flock_off_thread` registers a won fd on its own
+    worker thread rather than after the awaiting coroutine resumes: were the
+    registry allowed to lag the kernel by an event-loop scheduling hop, this
+    poll would convert that lag into a LOUD B13 false alarm against a perfectly
+    healthy hold.  Widening the bound beyond the FLOOR below therefore buys
+    nothing and samples that window more.
+
     THE ``_lane_lock_identity`` SHORT-CIRCUIT.  An unstat-able *lock_path*
     yields ``[]`` because ``os.stat`` raised inside ``lane_lock_holder_pids``
     before a single row was examined — a STRUCTURAL empty no re-read can
@@ -2946,10 +2960,32 @@ class GitOps:
         :meth:`merge_verify_lease` RAISES :class:`MergeVerifyLeaseContended`;
         :meth:`task_verify_lease` fails OPEN (WARNING + proceed).
 
-        A won fd is registered as a LIVE in-process hold (task 3081) before it
-        is returned, so :meth:`GitOps._lane_lock_self_owned_leak` can tell this
-        legitimate hold from a leaked one — at kernel level the two are
-        identical, both being flocks attributed to our pid.
+        A won fd is registered as a LIVE in-process hold (task 3081), so
+        :meth:`GitOps._lane_lock_self_owned_leak` can tell this legitimate hold
+        from a leaked one — at kernel level the two are identical, both being
+        flocks attributed to our pid.
+
+        REGISTRATION ORDERING (task 3783 review amendment) — that register runs
+        INSIDE the worker-thread callable, immediately after the acquire
+        returns, and NOT on the event loop once ``await asyncio.shield(inner)``
+        resumes.  The two are separated by an event-loop scheduling hop, which
+        is unbounded precisely under load, and across it the kernel already
+        attributes the flock to our pid (leak layer 1 TRUE) while
+        :data:`_HELD_LANE_LOCK_FDS` is still empty (layer 2 answers False, and
+        an EMPTY registry is the one case that function calls unambiguous).
+        A SIBLING coroutine whose own bounded wait has just expired reads the
+        kernel table exactly there — and now re-reads it up to ~25 times across
+        :data:`_LANE_LOCK_HOLDER_SETTLE_SECS` (:func:`_settled_lane_lock_holder_pids`),
+        so the gap is SAMPLED REPEATEDLY rather than glimpsed once.  Layer 3
+        cannot rescue it either: :func:`write_lock_holder_pgid` likewise runs
+        only after the acquire returns.  The outcome would be a LOUD,
+        human-escalating B13 leak report against a perfectly healthy hold —
+        the same false accusation :func:`_release_and_forget_held_lane_lock`
+        closes on the release side, and the reason this module registers when
+        in doubt.  On the worker thread the window shrinks to the two syscalls
+        between the flock and the registry insert, which no scheduling delay
+        can stretch.  Pinned by
+        ``test_a_won_fd_is_registered_on_the_acquires_own_thread_not_on_the_loop``.
 
         CANCELLATION (task 3081, D8/B12) — a cancelled acquire can NEVER orphan
         the fd. The worker thread is uninterruptible BY DESIGN: cancelling the
@@ -2968,15 +3004,26 @@ class GitOps:
         ``/proc/locks``). Shielded, the inner future stays uncancelled and still
         delivers the fd to the done-callback, which releases it.
 
-        The module-global :func:`acquire_merge_verify_flock` is deliberately
-        resolved at CALL time (inside the :func:`asyncio.to_thread` argument
-        list) rather than bound earlier, keeping the suite's
+        Both module globals — :func:`acquire_merge_verify_flock` and
+        :func:`_register_held_lane_lock` — are deliberately called by BARE NAME
+        from inside the worker-thread callable, i.e. resolved at CALL time
+        rather than bound earlier, keeping the suite's
         ``monkeypatch.setattr('orchestrator.git_ops.acquire_merge_verify_flock',
         ...)`` seam — and its off-the-event-loop-thread pin — intact.
         """
-        inner = asyncio.ensure_future(
-            asyncio.to_thread(acquire_merge_verify_flock, lock_path, wait_secs)
-        )
+        def _acquire_and_register() -> int | None:
+            """The whole acquire, ON the worker thread: win, then register.
+
+            One callable rather than two statements either side of the await,
+            so the kernel fact and the registry fact cannot be separated by an
+            event-loop scheduling hop — see REGISTRATION ORDERING above.
+            """
+            fd = acquire_merge_verify_flock(lock_path, wait_secs)
+            if fd is not None:
+                _register_held_lane_lock(fd, lock_path)
+            return fd
+
+        inner = asyncio.ensure_future(asyncio.to_thread(_acquire_and_register))
         try:
             fd = await asyncio.shield(inner)
         except asyncio.CancelledError:
@@ -2986,8 +3033,6 @@ class GitOps:
                 functools.partial(GitOps._release_orphaned_lane_flock, lock_path)
             )
             raise
-        if fd is not None:
-            _register_held_lane_lock(fd, lock_path)
         return fd
 
     @staticmethod
@@ -3012,9 +3057,16 @@ class GitOps:
         the record even though it is now handled: it means a verify/reset was
         cancelled mid-acquire, and the frequency of that is a real signal.
         Released through :meth:`_release_lane_flock` so the in-process held-fd
-        registry stays consistent — the fd was never registered (registration
-        happens only on the success path above), and the registry pop is a
-        harmless no-op that keeps the one release path single.
+        registry stays consistent.  Since task 3783 that pop is LOAD-BEARING
+        rather than the harmless no-op it once was: registration now happens on
+        the acquire's own worker thread, so a late win IS registered even
+        though its awaiter is long gone.  That is the wanted ordering — between
+        the late win and this callback the kernel attributes the lane to our
+        pid, and a registry that did not say so would leave a sibling's leak
+        probe looking at layer 1 TRUE / layer 2 FALSE, i.e. a false B13 report
+        against an fd that is about to be released cleanly.  Popping here keeps
+        the registry symmetric so the entry cannot outlive the fd and mask a
+        LATER, genuine leak on the same inode.
         """
         if fut.cancelled():
             return
@@ -3156,8 +3208,14 @@ class GitOps:
             # returned None, so NO fd is in flight and a cancellation landing
             # inside the poll cannot orphan the lane (B12 untouched).  The
             # later snapshot is a safe asymmetry — layer (1) can only GAIN a
-            # true kernel attribution, while layers (2) and (3) are read
-            # afterwards and can only VETO.
+            # kernel attribution that is TRUE OF THE KERNEL, while layers (2)
+            # and (3) are read afterwards and can only VETO.  "True of the
+            # kernel" is not by itself "our leak", so that asymmetry rests on
+            # layer (2) never LAGGING the kernel: an in-process sibling can win
+            # this very lane mid-poll, and it is _acquire_lane_flock_off_thread
+            # registering the won fd on its own worker thread — not after an
+            # event-loop hop — that keeps its healthy hold from reading as a
+            # leak here.  See that method's REGISTRATION ORDERING note.
             holder_pids = await _settled_lane_lock_holder_pids(lock_path)
             # Is this OUR OWN leaked lock rather than somebody else's live
             # hold?  Asked first, because the answer changes the diagnosis
@@ -10425,10 +10483,16 @@ class GitOps:
             # inside the poll cannot orphan the lane (the B12 guarantee is
             # untouched).  The snapshot is therefore taken up to the settle
             # bound LATER than the timeout — a safe asymmetry, because layer
-            # (1) can only GAIN a true kernel attribution, while layers (2)
-            # (_lane_lock_held_in_process) and (3) (_merge_verify_lease_active)
-            # are read afterwards and can only VETO, per this module's
-            # register-when-in-doubt asymmetry.
+            # (1) can only GAIN a kernel attribution that is TRUE OF THE
+            # KERNEL, while layers (2) (_lane_lock_held_in_process) and (3)
+            # (_merge_verify_lease_active) are read afterwards and can only
+            # VETO, per this module's register-when-in-doubt asymmetry.  That
+            # holds only while layer (2) cannot LAG the kernel: an in-process
+            # sibling may win this lane during the poll, so the won fd is
+            # registered on the acquire's own worker thread rather than after
+            # an event-loop hop (_acquire_lane_flock_off_thread, REGISTRATION
+            # ORDERING) — otherwise a healthy sibling hold would read here as
+            # our own leak.
             holder_pids = await _settled_lane_lock_holder_pids(lock_path)
             # Is this OUR OWN leaked lock rather than a live foreign hold?
             # Asked FIRST (task 3081): the incident's symptom was exactly this

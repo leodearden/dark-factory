@@ -2339,6 +2339,151 @@ class TestContendedRaiseSurvivesALossyHolderRead:
             f'{str(excinfo.value)!r}'
         )
 
+    # -- the window the settle WIDENS (task 3783 review amendment) ---------
+    #
+    # Polling turns ONE glimpse of the kernel table into ~25, so anything that
+    # was momentarily true between reads is now sampled repeatedly.  The one
+    # such thing that matters is an IN-PROCESS SIBLING winning this same lane
+    # mid-poll: at layer (1) its healthy hold is indistinguishable from our own
+    # leak (both are flocks attributed to our pid), and layer (3) cannot help
+    # because `write_lock_holder_pgid` runs only after the acquire returns.
+    # ONLY layer (2)'s registry separates them — so the registry must not lag
+    # the kernel, which is what the first case below pins and the second one
+    # spends.  The empty-first-read case is exactly when a waiter is MOST
+    # likely to win, so this is not a theoretical pairing.
+
+    async def test_a_won_fd_is_registered_on_the_acquires_own_thread_not_on_the_loop(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Registration must be atomic with the acquire, not deferred to the loop.
+
+        `_acquire_lane_flock_off_thread` used to call
+        `_register_held_lane_lock` on the EVENT LOOP, after `await
+        asyncio.shield(inner)` resumed.  Between the flock and that resume sits
+        a scheduling hop whose length is unbounded exactly under load — and
+        across it the kernel already names our pid (layer 1 TRUE) while
+        `_HELD_LANE_LOCK_FDS` is still empty (layer 2 False, and an EMPTY
+        registry is the one case `_lane_lock_held_in_process` calls
+        unambiguous).  A sibling probing there raises a LOUD, human-escalating
+        B13 leak against a perfectly healthy hold.
+
+        Asserted on the THREAD rather than on an ordering of events, because
+        the thread is what actually discriminates: on the worker thread the
+        window is the two syscalls between the flock and the registry insert;
+        on the loop it is however long the loop takes to get back to us.
+        Fully deterministic — the acquire is stubbed, so no real lock, no
+        `/proc/locks` read and no wall clock is involved.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+
+        real_register = git_ops_mod._register_held_lane_lock
+        observed: dict[str, int | None] = {'acquire': None, 'register': None}
+
+        def _acquire(*_a, **_k) -> int:
+            observed['acquire'] = threading.get_ident()
+            return _SENTINEL_FD
+
+        def _register(fd: int, path: Path) -> None:
+            observed['register'] = threading.get_ident()
+            real_register(fd, path)
+
+        released: list[int] = []
+        monkeypatch.setattr(git_ops_mod, 'acquire_merge_verify_flock', _acquire)
+        monkeypatch.setattr(git_ops_mod, '_register_held_lane_lock', _register)
+        monkeypatch.setattr(
+            git_ops_mod, 'release_merge_verify_flock', released.append,
+        )
+
+        lock_path = lane_lock_path(tmp_path / 'lane')
+        fd = await GitOps._acquire_lane_flock_off_thread(lock_path, 5.0)
+        try:
+            assert fd == _SENTINEL_FD, 'the won fd must still reach its caller'
+            assert observed['acquire'] is not None, (
+                'the acquire never ran — this case would prove nothing'
+            )
+            assert observed['register'] == observed['acquire'], (
+                f'the won fd must be registered ON the acquire\'s own worker '
+                f'thread, so the registry cannot lag the kernel across an '
+                f'event-loop scheduling hop — a sibling probing inside that '
+                f'gap reads layer (1) TRUE / layer (2) FALSE and reports a '
+                f'healthy hold as a self-owned leak, and the settle now '
+                f'samples that gap ~25 times per contended raise; acquire ran '
+                f'on {observed["acquire"]!r}, register on '
+                f'{observed["register"]!r}'
+            )
+            assert observed['register'] != threading.get_ident(), (
+                'registration ran on the EVENT LOOP thread — that is the '
+                'deferred ordering this pins against'
+            )
+        finally:
+            # Pops the registration too: a surviving {fd: None} entry would
+            # make _lane_lock_held_in_process answer True for every path and
+            # mask real leaks in every test after this one.
+            GitOps._release_lane_flock(fd)
+
+    async def test_a_sibling_hold_won_during_the_settle_is_contention_not_a_leak(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """A sibling winning the lane mid-poll is CONTENTION, never a B13 leak.
+
+        The consequence of the ordering pinned above, spent at the raise site.
+        Staged in the production order: the kernel starts attributing the lane
+        to our pid on the SAME read at which the sibling's registration lands,
+        because `_acquire_lane_flock_off_thread` does both on one worker
+        thread.  Layer (1) therefore passes and layer (2) vetoes, which is the
+        whole point — the settle may promote a snapshot naming our pid, but it
+        must never promote it past the registry.
+
+        `type(...) is` and not `isinstance`: `LaneLockSelfOwnedLeak` IS-A
+        `MergeVerifyLeaseContended`, so an isinstance check would pass on
+        exactly the false alarm this excludes.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+
+        git_ops = _git_ops(tmp_path)
+        lock_path = lane_lock_path(git_ops.persistent_merge_worktree_path)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.touch()  # stat-able: the settle must actually poll here
+
+        # Our own acquire times out (the established stub, cf.
+        # test_merge_verify_lease_guard.py:118-122) — the sibling's is the one
+        # that wins, and is simulated by the reader below.
+        monkeypatch.setattr(
+            git_ops_mod, 'acquire_merge_verify_flock', lambda *a, **k: None,
+        )
+
+        sibling_fd = os.open(lock_path, os.O_RDWR)
+        reads: list[int] = []
+
+        def _sibling_wins_mid_settle(path: Path) -> list[int]:
+            reads.append(1)
+            if len(reads) == 1:
+                return []  # the empty read that starts the settle
+            if len(reads) == 2:
+                # The sibling's acquire wins HERE, registering on its own
+                # worker thread in the same breath as the kernel flock.
+                git_ops_mod._register_held_lane_lock(sibling_fd, path)
+            return [os.getpid()]
+
+        monkeypatch.setattr(
+            git_ops_mod, 'lane_lock_holder_pids', _sibling_wins_mid_settle,
+        )
+
+        try:
+            with pytest.raises(MergeVerifyLeaseContended) as excinfo:
+                await git_ops.reset_persistent_merge_worktree('HEAD')
+        finally:
+            GitOps._release_lane_flock(sibling_fd)
+
+        assert type(excinfo.value) is MergeVerifyLeaseContended, (
+            f'a sibling\'s registered, healthy hold observed during the settle '
+            f'must stay ordinary contention: layer (1) sees our pid because '
+            f'the kernel truthfully reports it, and layer (2) is what says it '
+            f'is not a leak. Raising here is the loud human-escalating false '
+            f'alarm the register-when-in-doubt asymmetry exists to prevent; '
+            f'got {type(excinfo.value).__name__}'
+        )
+
     # -- the LEASE site (task 3783 step-5) ---------------------------------
     #
     # `merge_verify_lease` is a SEPARATE raise site with its own bounded-wait
