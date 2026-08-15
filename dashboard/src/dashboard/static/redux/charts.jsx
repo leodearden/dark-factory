@@ -147,7 +147,7 @@ function LineChart({ series, labels, height = 220, yLabel, formatY = (v) => Stri
   );
 }
 
-function StackedAreaChart({ stacks, labels, height = 220, formatY = v => String(v), formatX = v => v }) {
+function StackedAreaChart({ stacks, labels, height = 220, formatY = v => String(Math.round(v)), formatX = v => v }) {
   // stacks: [{ key, color, values }]
   const ref = useRef(null);
   const [w, setW] = useState(600);
@@ -174,6 +174,16 @@ function StackedAreaChart({ stacks, labels, height = 220, formatY = v => String(
 
   const yToPx = v => padT + chartH - (v / maxV) * chartH;
 
+  // Each tick is handed to formatY RAW (fractional), because a caller's own
+  // formatter is the only thing that knows the axis UNITS. The Workflow panel
+  // (tab_escalation_analytics.jsx:494) plots a 100%-normalized stack and
+  // multiplies by 100, so pre-rounding the tick to an integer collapsed
+  // 0/0.25/0.5/0.75/1.0 to 0/0/1/1/1 and rendered "0% / 0% / 100% / 100% /
+  // 100%". The rounding is NOT deleted — it moved into the formatY default
+  // above, so the three callers that pass no formatter (tabs.jsx:1259,
+  // tabs.jsx:1329, tab_escalation_analytics.jsx:244) keep byte-identical
+  // integer count axes instead of gaining 2.5 / 7.5 labels. LineChart
+  // (line 118) already passed the raw tick and is deliberately left alone.
   const ticks = 4;
   const yTicks = Array.from({ length: ticks + 1 }, (_, i) => (maxV * i) / ticks);
 
@@ -183,7 +193,7 @@ function StackedAreaChart({ stacks, labels, height = 220, formatY = v => String(
         {yTicks.map((t, i) => (
           <g key={i}>
             <line x1={padL} y1={yToPx(t)} x2={padL + chartW} y2={yToPx(t)} stroke={PALETTE.line} strokeWidth={0.5} strokeDasharray={i === 0 ? '0' : '2 3'} />
-            <text x={padL - 6} y={yToPx(t) + 3} fontSize="9" fill={PALETTE.fg3} textAnchor="end" fontFamily="JetBrains Mono">{formatY(Math.round(t))}</text>
+            <text x={padL - 6} y={yToPx(t) + 3} fontSize="9" fill={PALETTE.fg3} textAnchor="end" fontFamily="JetBrains Mono">{formatY(t)}</text>
           </g>
         ))}
         {labels.map((lab, i) => {
