@@ -1549,3 +1549,139 @@ def test_a_failing_submit_never_breaks_the_release():
     assert _breaches(scheduler) == 4
     assert queue.submitted == []
     assert scheduler._backfill_grants == {}, 'every grant still settled'
+
+
+# ===========================================================================
+# Per-scan memoization of admission's read-only inputs
+# ===========================================================================
+#
+# `_backfill_admission` runs for every scored candidate whose first
+# `try_acquire` fails, on every tick, and `_provable_assembly_delay` rebuilds
+# the whole park map and re-medians every blocking holder's remaining time
+# each time it is called.  Nothing it reads is mutated inside the candidate
+# loop — `clear_parks_for` and `_bump_skip_and_maybe_park` are on the dispatch
+# path, which returns immediately, or run after the loop — so without a memo
+# every candidate in a tick re-derives an identical answer.
+#
+# The memo is scoped to ONE scan rather than kept on the Scheduler, because
+# park and hold state genuinely does move between ticks.  Both halves are
+# asserted: that it is used inside a scan, and that it does not survive one.
+
+
+def test_the_assembly_delay_is_computed_once_per_scan():
+    """Repeated asks inside one scan hit the memo; outside a scan they do not."""
+    clock = _Clock()
+    scheduler = _make_scheduler(clock=clock)
+    _park_blocked_candidate(scheduler, clock)
+
+    calls: list[str] = []
+    real = scheduler._compute_provable_assembly_delay
+
+    def counting(owner: str) -> float:
+        calls.append(owner)
+        return real(owner)
+
+    scheduler._compute_provable_assembly_delay = counting  # type: ignore[method-assign]
+
+    # No scan in progress → computed exactly, every time.  A caller outside the
+    # dispatch loop must never be served a memo it cannot see or invalidate.
+    assert scheduler._provable_assembly_delay('p') == pytest.approx(900.0)
+    assert scheduler._provable_assembly_delay('p') == pytest.approx(900.0)
+    assert calls == ['p', 'p']
+
+    # Inside a scan → computed once, and every repeat ask is served from it.
+    calls.clear()
+    scheduler._backfill_scan_cache = scheduler_module._BackfillScanCache()
+    try:
+        answers = [scheduler._provable_assembly_delay('p') for _ in range(3)]
+    finally:
+        scheduler._backfill_scan_cache = None
+
+    assert answers == [pytest.approx(900.0)] * 3
+    assert calls == ['p'], 'every repeat ask within one scan must hit the memo'
+
+
+def test_the_park_map_is_snapshotted_once_per_scan():
+    """``snapshot_parks()`` rebuilds from every stack — once per scan is enough."""
+    clock = _Clock()
+    scheduler = _make_scheduler(clock=clock)
+    _park_blocked_candidate(scheduler, clock)
+
+    calls: list[int] = []
+    real = scheduler.lock_table.snapshot_parks
+
+    def counting() -> dict:
+        calls.append(1)
+        return real()
+
+    scheduler.lock_table.snapshot_parks = counting  # type: ignore[method-assign]
+
+    scheduler._backfill_scan_cache = scheduler_module._BackfillScanCache()
+    try:
+        scheduler._provable_assembly_delay('p')
+        scheduler._provable_assembly_delay('other-owner')
+    finally:
+        scheduler._backfill_scan_cache = None
+
+    assert len(calls) == 1, 'two owners in one scan must share one park snapshot'
+
+
+@pytest.mark.asyncio
+async def test_the_scan_memo_never_outlives_its_scan():
+    """A dispatch returns from INSIDE the loop — the memo must still be dropped.
+
+    Park and hold state genuinely moves between ticks, so a memo that survived
+    a scan would hand the next tick a gap computed from a world that no longer
+    exists.  The dispatch path is the one that has to be checked: it leaves the
+    loop by ``return``, which only a ``finally`` catches.
+    """
+    clock = _Clock()
+    scheduler = _make_scheduler(clock=clock, event_store=_RecordingEventStore())
+    scheduler.finish_startup()
+    tasks = _scored_world(scheduler, clock)
+    scheduler.get_tasks = AsyncMock(return_value=tasks)
+
+    assignment = await scheduler.acquire_next()
+
+    assert assignment is not None, 'setup: the scan must reach the dispatch return'
+    assert scheduler._backfill_scan_cache is None, (
+        'the memo outlived its scan — the next tick would read a stale gap'
+    )
+    # And an ask made after the scan is computed against live state again.
+    # The scan memoized 900.0 (h's remaining on the gap module).  The dispatch
+    # then gave c a lock on one of p's OTHER parked modules, so p's provable
+    # gap is now the minimum of that and c's own remaining — 100.0.  Getting
+    # 900.0 back here would be the memo answering for a world that has moved.
+    assert scheduler._provable_assembly_delay('p') == pytest.approx(100.0)
+
+
+def test_predicted_hold_accepts_the_callers_module_list():
+    """The override is a pure caching parameter: same answer, no re-derivation.
+
+    ``_backfill_admission`` already holds the scored loop's
+    ``_get_modules(task)`` output when it asks for a prediction, so handing it
+    back avoids re-deriving the same list per candidate per tick.  It must
+    change nothing else — the task-taking signature is what guarantees the
+    history is keyed on the strings the lock layer actually uses.
+    """
+    scheduler = _make_scheduler()
+    task = _task('1', ['orchestrator/src/orchestrator/scheduler.py'])
+    modules = scheduler._get_modules(task)
+    _feed_spans(scheduler, modules, [100.0, 200.0, 300.0])
+
+    assert scheduler.predicted_hold(task) == pytest.approx(200.0)
+    assert scheduler.predicted_hold(task, modules=modules) == pytest.approx(200.0)
+
+    calls: list[dict] = []
+    real = scheduler._get_modules
+
+    def counting(t: dict) -> list[str]:
+        calls.append(t)
+        return real(t)
+
+    scheduler._get_modules = counting  # type: ignore[method-assign]
+
+    assert scheduler.predicted_hold(task, modules=modules) == pytest.approx(200.0)
+    assert calls == [], 'the caller already had the list — it must not be re-derived'
+    assert scheduler.predicted_hold(task) == pytest.approx(200.0)
+    assert calls == [task], 'and omitting it must still derive from the task'

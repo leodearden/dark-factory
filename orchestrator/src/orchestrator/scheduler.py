@@ -842,6 +842,29 @@ class _BackfillGrant:
     granted_at: float = 0.0
 
 
+@dataclass
+class _BackfillScanCache:
+    """Per-scan memo for backfill admission's READ-ONLY inputs (task 3823).
+
+    ``_backfill_admission`` runs for every scored candidate whose first
+    ``try_acquire`` fails, on every tick, and ``_provable_assembly_delay``
+    rebuilds the whole park map and re-medians every blocking holder's
+    remaining time each time it is called.  Nothing it reads is mutated inside
+    the candidate loop — ``clear_parks_for`` and ``_bump_skip_and_maybe_park``
+    are on the dispatch path, which returns immediately, or run after the loop
+    — so every candidate re-derives an identical answer.
+
+    Scoped to ONE scan and nulled in a ``finally``, not kept on the Scheduler:
+    park and hold state genuinely does move between ticks, and a memo that
+    outlived its scan would hand a later tick a stale gap.  Existence of the
+    cache is what enables memoization at all, so a call made outside a scan
+    (a direct unit-test call, a future caller) is computed exactly.
+    """
+
+    parks: dict[str, dict] | None = None
+    delays: dict[str, float] = field(default_factory=dict)
+
+
 def _resolve_time_source(ts: Callable[[], float] | None) -> Callable[[], float]:
     """Return *ts* if provided, else the stdlib ``time.monotonic`` callable.
 
@@ -1788,6 +1811,9 @@ class Scheduler:
         # new policy era, so the sample from the old one is discarded rather
         # than left to keep the rate above threshold after the fix.
         self._backfill_outcomes_factor = float(config.backfill_safety_factor)
+        # Set for the duration of ONE scored dispatch scan and nulled after —
+        # None means "not in a scan, compute exactly".  See _BackfillScanCache.
+        self._backfill_scan_cache: _BackfillScanCache | None = None
         self._mcp_session = mcp_session
         self._dispatched: set[str] = set()
         # Task 2408 mechanism 2: attribute-injected by the Harness right
@@ -6742,92 +6768,102 @@ class Scheduler:
         top_modules = self._get_modules(top_task)
         top_had_parks = self.lock_table.has_parks(top_id)
 
-        for _score, task_id, task, pri in scored:
-            if ctx.psi_hold and not self.is_deterministic(task):
-                # Dispatch-admission gate (DA3): defer this HEAVY candidate —
-                # deterministic candidates are exempt (DA-D4) and lower-
-                # ranked exempt/light candidates behind it still get a turn
-                # (per-candidate `continue`, not a top-level `return None`).
-                self._note_heavy_deferral(ctx, task_id)
-                continue
-            modules = self._get_modules(task)
-            acquired = self.lock_table.try_acquire(task_id, modules)
-            grant: _BackfillGrant | None = None
-            if not acquired:
-                # EASY-backfill (task 3823 / PRD C7): this candidate may be
-                # blocked only by another task's PARK, in front of a gap that
-                # park is provably still waiting on.  If so, retry ignoring
-                # exactly those owners' parks.
-                #
-                # The SECOND try_acquire — not the admission predicate — is the
-                # acting basis (INV-3).  ``admitted_parks`` is scoped to the
-                # park gate alone; the held-lock limit gate is untouched and is
-                # re-evaluated here on live state.  So admission being wrong
-                # costs one failed acquire, never a double-held module, and a
-                # grant that does not become a dispatch is discarded rather
-                # than recorded as a borrow that never happened.
-                grant = self._backfill_admission(task_id, task, modules)
-                if grant is not None:
-                    acquired = self.lock_table.try_acquire(
-                        task_id, modules, admitted_parks=frozenset(grant.park_owners)
-                    )
-                    if not acquired:
-                        grant = None
-            if acquired:
-                self._dispatched.add(task_id)
-                # Starvation-watchdog resolve (task 1880): if this scored task
-                # had an open INFO escalation, self-resolve it now that it is
-                # dispatching.  Wrapped in try/except so a resolve failure can
-                # NEVER abort a successful dispatch (PROPERTY 1).
-                try:
-                    await self._resolve_starvation_escalation(task_id)
-                except Exception:
-                    logger.warning(
-                        'Starvation watchdog resolve for task_id=%s raised — '
-                        'dispatch continues normally',
-                        task_id,
-                        exc_info=True,
-                    )
-                # arm cooldown gate — only for signal-bearing dispatches.
-                # Steward signals that arrive *after* a signal-free dispatch
-                # will not retroactively suppress re-dispatch; the gate is
-                # intentionally scoped to tasks that were already flagged
-                # when first picked up (bounded _last_dispatch_at size).
-                if ctx.candidate_signals.get(task_id) is not None:
-                    self._last_dispatch_at[task_id] = self._time_source()
-                self._dispatched_priority[task_id] = pri
-                if task_id == top_id:
-                    self._skip_count.pop(task_id, None)
-                    if top_had_parks:
-                        restored_pairs = self.lock_table.clear_parks_for(task_id)
-                        if self.event_store:
-                            self.event_store.emit(
-                                EventType.reservation_used,
-                                task_id=task_id,
-                                data={'modules': modules, 'priority': pri},
-                            )
-                            for restored_owner, restored_modules in restored_pairs:
+        # One scan, one memo for admission's read-only inputs (task 3823 /
+        # PRD C7).  Park and hold state does not move inside this loop, so
+        # every candidate would otherwise re-derive an identical park map and
+        # identical per-owner assembly delays.  Nulled in the ``finally`` so a
+        # dispatch ``return`` from inside the loop cannot leak a stale gap into
+        # the next tick — the memo must never outlive the state it read.
+        self._backfill_scan_cache = _BackfillScanCache()
+        try:
+            for _score, task_id, task, pri in scored:
+                if ctx.psi_hold and not self.is_deterministic(task):
+                    # Dispatch-admission gate (DA3): defer this HEAVY candidate —
+                    # deterministic candidates are exempt (DA-D4) and lower-
+                    # ranked exempt/light candidates behind it still get a turn
+                    # (per-candidate `continue`, not a top-level `return None`).
+                    self._note_heavy_deferral(ctx, task_id)
+                    continue
+                modules = self._get_modules(task)
+                acquired = self.lock_table.try_acquire(task_id, modules)
+                grant: _BackfillGrant | None = None
+                if not acquired:
+                    # EASY-backfill (task 3823 / PRD C7): this candidate may be
+                    # blocked only by another task's PARK, in front of a gap that
+                    # park is provably still waiting on.  If so, retry ignoring
+                    # exactly those owners' parks.
+                    #
+                    # The SECOND try_acquire — not the admission predicate — is the
+                    # acting basis (INV-3).  ``admitted_parks`` is scoped to the
+                    # park gate alone; the held-lock limit gate is untouched and is
+                    # re-evaluated here on live state.  So admission being wrong
+                    # costs one failed acquire, never a double-held module, and a
+                    # grant that does not become a dispatch is discarded rather
+                    # than recorded as a borrow that never happened.
+                    grant = self._backfill_admission(task_id, task, modules)
+                    if grant is not None:
+                        acquired = self.lock_table.try_acquire(
+                            task_id, modules, admitted_parks=frozenset(grant.park_owners)
+                        )
+                        if not acquired:
+                            grant = None
+                if acquired:
+                    self._dispatched.add(task_id)
+                    # Starvation-watchdog resolve (task 1880): if this scored task
+                    # had an open INFO escalation, self-resolve it now that it is
+                    # dispatching.  Wrapped in try/except so a resolve failure can
+                    # NEVER abort a successful dispatch (PROPERTY 1).
+                    try:
+                        await self._resolve_starvation_escalation(task_id)
+                    except Exception:
+                        logger.warning(
+                            'Starvation watchdog resolve for task_id=%s raised — '
+                            'dispatch continues normally',
+                            task_id,
+                            exc_info=True,
+                        )
+                    # arm cooldown gate — only for signal-bearing dispatches.
+                    # Steward signals that arrive *after* a signal-free dispatch
+                    # will not retroactively suppress re-dispatch; the gate is
+                    # intentionally scoped to tasks that were already flagged
+                    # when first picked up (bounded _last_dispatch_at size).
+                    if ctx.candidate_signals.get(task_id) is not None:
+                        self._last_dispatch_at[task_id] = self._time_source()
+                    self._dispatched_priority[task_id] = pri
+                    if task_id == top_id:
+                        self._skip_count.pop(task_id, None)
+                        if top_had_parks:
+                            restored_pairs = self.lock_table.clear_parks_for(task_id)
+                            if self.event_store:
                                 self.event_store.emit(
-                                    EventType.reservation_restored,
-                                    task_id=restored_owner,
-                                    data={
-                                        'restored_owner': restored_owner,
-                                        'modules': restored_modules,
-                                    },
+                                    EventType.reservation_used,
+                                    task_id=task_id,
+                                    data={'modules': modules, 'priority': pri},
                                 )
-                else:
-                    # A lower-ranked task won — top was passed over this tick.
-                    self._bump_skip_and_maybe_park(top_id, top_modules, top_pri)
-                if grant is not None:
-                    self._record_backfill_grant(grant)
-                self._emit_lock_event(
-                    EventType.lock_acquired,
-                    task_id=task_id,
-                    modules=modules,
-                    priority=pri,
-                )
-                await self._write_snapshot_best_effort()
-                return TickOutcome(TaskAssignment(task_id=task_id, task=task, modules=modules))
+                                for restored_owner, restored_modules in restored_pairs:
+                                    self.event_store.emit(
+                                        EventType.reservation_restored,
+                                        task_id=restored_owner,
+                                        data={
+                                            'restored_owner': restored_owner,
+                                            'modules': restored_modules,
+                                        },
+                                    )
+                    else:
+                        # A lower-ranked task won — top was passed over this tick.
+                        self._bump_skip_and_maybe_park(top_id, top_modules, top_pri)
+                    if grant is not None:
+                        self._record_backfill_grant(grant)
+                    self._emit_lock_event(
+                        EventType.lock_acquired,
+                        task_id=task_id,
+                        modules=modules,
+                        priority=pri,
+                    )
+                    await self._write_snapshot_best_effort()
+                    return TickOutcome(TaskAssignment(task_id=task_id, task=task, modules=modules))
+        finally:
+            self._backfill_scan_cache = None
 
         # Loop exhausted with no acquire — top candidate was also skipped.
         self._bump_skip_and_maybe_park(top_id, top_modules, top_pri)
@@ -7608,7 +7644,9 @@ class Scheduler:
 
     # --- Hold-duration prediction (task 3822 / PRD task ζ, consumed by η) ---
 
-    def predicted_hold(self, task: dict) -> float | None:
+    def predicted_hold(
+        self, task: dict, *, modules: list[str] | None = None
+    ) -> float | None:
         """Predicted lock-hold duration (seconds) for *task*, or None.
 
         Takes the TASK, not a module list, on purpose: ``_get_modules`` applies
@@ -7627,8 +7665,18 @@ class Scheduler:
         plans/evidence/scheduler-scoring-2026-08-06/PARKING_MODEL_REPORT.md:116-126
         — every static-attribute predictor scored WORSE than the test-set mean
         (R² -0.22 to -0.82); only module hold history scored positive.
+
+        *modules* lets a caller that has ALREADY computed ``_get_modules(task)``
+        hand the result back instead of having it re-derived — the scored
+        dispatch loop has it in hand before it asks.  It must be exactly that
+        output: a hand-split path list would key the history on strings that
+        never appear in a lock event, which is the failure the task-taking
+        signature exists to prevent, so this is a caching parameter and not an
+        invitation to supply a different module set.
         """
-        return self._hold_history.predicted_hold(self._get_modules(task))
+        return self._hold_history.predicted_hold(
+            self._get_modules(task) if modules is None else modules
+        )
 
     def predicted_remaining(self, holder: str) -> float | None:
         """Predicted seconds *holder* will keep its locks, or None.
@@ -7686,8 +7734,37 @@ class Scheduler:
         plans/evidence/scheduler-scoring-2026-08-06/PARKING_MODEL_REPORT.md:116-126
         — module hold history is the only predictor with positive R², so it is
         the only thing this arithmetic is allowed to rest on.
+
+        MEMOIZED for the duration of one scored scan (see
+        :class:`_BackfillScanCache`), because every candidate in a tick asks
+        the same question of the same unchanged state.  Outside a scan the
+        answer is computed exactly, so the memo can never be the reason two
+        callers disagree.
         """
-        park_modules = self.lock_table.snapshot_parks().get(owner, {}).get('modules', [])
+        cache = self._backfill_scan_cache
+        if cache is None:
+            return self._compute_provable_assembly_delay(owner)
+        if owner not in cache.delays:
+            cache.delays[owner] = self._compute_provable_assembly_delay(owner)
+        return cache.delays[owner]
+
+    def _snapshot_parks_for_backfill(self) -> dict[str, dict]:
+        """``lock_table.snapshot_parks()``, read at most once per scored scan.
+
+        The map is rebuilt from every park stack on each call, and admission
+        asks for it once per blocking owner per candidate.  Uncached outside a
+        scan, for the same reason the delay memo is.
+        """
+        cache = self._backfill_scan_cache
+        if cache is None:
+            return self.lock_table.snapshot_parks()
+        if cache.parks is None:
+            cache.parks = self.lock_table.snapshot_parks()
+        return cache.parks
+
+    def _compute_provable_assembly_delay(self, owner: str) -> float:
+        """The uncached arithmetic behind :meth:`_provable_assembly_delay`."""
+        park_modules = self._snapshot_parks_for_backfill().get(owner, {}).get('modules', [])
         if not park_modules:
             return 0.0
         blocked = self.lock_table.blocking_holders(park_modules, exclude_task=owner)
@@ -7760,7 +7837,10 @@ class Scheduler:
             logger.debug('backfill refuse task=%s reason=not_park_blocked', task_id)
             return None
 
-        predicted = self.predicted_hold(task)
+        # ``modules`` is the caller's ``_get_modules(task)`` output — the same
+        # list this method normalizes below — so it is handed through rather
+        # than re-derived per candidate per tick.
+        predicted = self.predicted_hold(task, modules=modules)
         if predicted is None:
             # REFUSE on no prediction, never substitute a default: an empty or
             # thin history certifies structure, not capability.  See
