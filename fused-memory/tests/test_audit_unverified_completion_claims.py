@@ -84,8 +84,14 @@ def _record(
     created_at: str = '2026-07-26T00:00:00Z',
     source_description: str = 'add_memory:temporal_facts',
     name: str = 'episode',
+    graph_name: str | None = None,
 ) -> object:
-    """Build a CorpusRecord without touching a store."""
+    """Build a CorpusRecord without touching a store.
+
+    ``graph_name`` defaults to ``project_id`` — the common case where the graph
+    swept and the record's own group_id coincide. Pass it explicitly to build
+    the divergent case.
+    """
     return CorpusRecord(
         uuid=uuid,
         kind='episode',
@@ -93,6 +99,7 @@ def _record(
         source_description=source_description,
         category=category,
         project_id=project_id,
+        graph_name=project_id if graph_name is None else graph_name,
         created_at=created_at,
         name=name,
     )
@@ -420,12 +427,14 @@ def _finding(
     subject: str = 'ticket',
     ref: str = 'tkt_X',
     created_at: str = '2026-07-26T00:00:00Z',
+    graph_name: str | None = None,
 ) -> object:
     return Finding(
         record_uuid=uuid,
         record_kind='episode',
         category=category,
         project_id=project_id,
+        graph_name=project_id if graph_name is None else graph_name,
         created_at=created_at,
         claim_kind='filing_dispatch',
         subject=subject,

@@ -178,7 +178,16 @@ class CorpusRecord:
         source_description: The raw description, kept verbatim so a reader can
             re-derive ``category`` without re-running the sweep.
         category: The recovered category, or ``None`` when uncategorized.
-        project_id: The graph the record was read from (Graphiti ``group_id``).
+        project_id: The record's OWN Graphiti ``group_id`` — what the record
+            claims about itself.
+        graph_name: WHICH GRAPH WAS QUERIED to read this record (the
+            ``--project`` value / :attr:`EpisodeReader.graph_name`). Distinct
+            from ``project_id``: they coincide for most rows, and a graph
+            legitimately holds episodes whose ``group_id`` differs. Only
+            ``graph_name`` can address the store again, so every follow-up read
+            (the derived-edge enumeration in ``_run``) must key on THIS field —
+            keying on ``project_id`` silently resolves to no reader and the miss
+            then serializes as a measured zero.
         created_at: Write timestamp, as the store reports it.
         name: The episode name.
     """
@@ -189,6 +198,7 @@ class CorpusRecord:
     source_description: str
     category: str | None
     project_id: str
+    graph_name: str
     created_at: str
     name: str
 
@@ -273,6 +283,7 @@ class Finding:
     record_kind: str
     category: str | None
     project_id: str
+    graph_name: str
     created_at: str
     claim_kind: str
     subject: str
@@ -290,6 +301,7 @@ class Finding:
             'record_kind': self.record_kind,
             'category': self.category,
             'project_id': self.project_id,
+            'graph_name': self.graph_name,
             'created_at': self.created_at,
             'claim_kind': self.claim_kind,
             'subject': self.subject,
@@ -346,6 +358,7 @@ def adjudicate(
                     record_kind=item.record.kind,
                     category=item.record.category,
                     project_id=item.record.project_id,
+                    graph_name=item.record.graph_name,
                     created_at=item.record.created_at,
                     claim_kind=verdict.claim.kind,
                     subject=verdict.claim.subject,
@@ -653,6 +666,7 @@ class EpisodeReader:
                     source_description=source_description,
                     category=parse_category(source_description),
                     project_id=self._cell(row, 2) or self.graph_name,
+                    graph_name=self.graph_name,
                     created_at=self._cell(row, 4),
                     name=self._cell(row, 1),
                 )
@@ -1068,9 +1082,13 @@ async def _run(
     edge_cache: dict[tuple[str, str], tuple[str, ...]] = {}
     enriched: list[Finding] = []
     for finding in findings:
-        key = (finding.project_id, finding.record_uuid)
+        # Keyed on graph_name, NOT project_id: `readers` is keyed by --project
+        # graph name, and a graph legitimately holds episodes whose group_id
+        # differs. The uuid alone is not a safe key either — two graphs may hold
+        # the same uuid, so the pair is what makes the cache correct.
+        key = (finding.graph_name, finding.record_uuid)
         if key not in edge_cache:
-            reader = readers.get(finding.project_id)
+            reader = readers.get(finding.graph_name)
             try:
                 edge_cache[key] = (
                     await reader.fetch_derived_edges(finding.record_uuid)
