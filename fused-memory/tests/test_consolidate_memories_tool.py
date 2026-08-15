@@ -74,6 +74,7 @@ def make_service(
     *,
     gone=SUPERSEDES,
     topic_members=None,
+    topic_total=None,
     children=None,
     delete_errors=None,
     events=None,
@@ -116,6 +117,7 @@ def make_service(
     svc.delete_memory = AsyncMock(side_effect=_delete)
 
     async def _get(project_id=None, memory_id=None, **_):
+        log.append(('read', memory_id))
         if memory_id in gone:
             return None
         return _row(memory_id)
@@ -132,7 +134,9 @@ def make_service(
     svc.get_memories_by_metadata = AsyncMock(
         return_value=[_row(m) for m in members]
     )
-    svc.count_memories_by_metadata = AsyncMock(return_value=len(members))
+    svc.count_memories_by_metadata = AsyncMock(
+        return_value=len(members) if topic_total is None else topic_total
+    )
     return svc
 
 
@@ -705,3 +709,86 @@ class TestPartialFailureIsTwoWay:
         # Not the flattened {'error', 'error_type'} shape a raise would give.
         assert 'error' not in result
         assert result['canonical_id'] == CANONICAL
+
+
+class TestClosureIsCorroboratedNeverClaimed:
+    """`survivors` comes from the WORLD, not from what the deletes said.
+
+    Both asymmetric cases are the point. A delete that reports
+    {'status': 'deleted'} over an id that still resolves IS a survivor —
+    that silent-fail-soft is what the ratchet was made of. An id whose
+    delete raised but which no longer resolves is NOT one: reporting it as
+    a leftover would send an operator chasing a record that is gone.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_claimed_delete_that_did_not_take_is_a_survivor(self):
+        """(a) The call succeeded and the world disagrees. The world wins."""
+        svc = make_service(gone=[S1, S3])
+
+        result = await call_consolidate(svc)
+
+        assert result['survivors'] == [S2]
+        assert result['status'] == 'partial'
+        # NOT a failure: nothing refused, so there is nothing to report as
+        # one. The disagreement is what `survivors` is for.
+        assert result['failed_deletes'] == []
+
+    @pytest.mark.asyncio
+    async def test_a_raised_delete_over_an_absent_id_is_not_a_survivor(self):
+        """(b) It refused, but the record is gone anyway.
+
+        Listing it as a leftover would send an operator chasing nothing —
+        the failure is real and reported, the survival is not.
+        """
+        svc = make_service(gone=SUPERSEDES, delete_errors={S2: RuntimeError('boom')})
+
+        result = await call_consolidate(svc)
+
+        assert [f['id'] for f in result['failed_deletes']] == [S2]
+        assert result['survivors'] == []
+
+    @pytest.mark.asyncio
+    async def test_every_supersede_is_re_read_once_after_the_last_delete(self):
+        """(c) The re-read is what produces `survivors` — nothing else can.
+
+        Sliced at the LAST delete: a read taken before then answers a
+        question about a record the op had not finished acting on.
+        """
+        events: list[tuple[str, str | None]] = []
+        svc = make_service(events=events)
+
+        await call_consolidate(svc)
+
+        last_delete = max(
+            i for i, (kind, _) in enumerate(events) if kind == 'delete_memory'
+        )
+        after = [mid for kind, mid in events[last_delete + 1:] if kind == 'read']
+        assert sorted(after) == sorted(SUPERSEDES)
+
+    @pytest.mark.asyncio
+    async def test_a_truncated_closure_listing_says_so(self):
+        """(d) A capped listing must never read as the whole closure."""
+        from fused_memory.server.tools import _TOPIC_MEMBER_LIMIT
+
+        svc = make_service(
+            topic_members=[f'member-{i}' for i in range(_TOPIC_MEMBER_LIMIT)],
+            topic_total=512,
+        )
+
+        result = await call_consolidate(svc)
+
+        assert result['topic_members_truncated'] is True
+        assert result['topic_members_total'] == 512
+        assert len(result['topic_members']) == _TOPIC_MEMBER_LIMIT
+
+    @pytest.mark.asyncio
+    async def test_the_common_path_pays_for_no_count(self):
+        """The extra round-trip is owed only when the cap was actually hit."""
+        svc = make_service(topic_members=[CANONICAL, RETAIN_1])
+
+        result = await call_consolidate(svc)
+
+        assert result['topic_members_truncated'] is False
+        assert result['topic_members_total'] == 2
+        svc.count_memories_by_metadata.assert_not_called()
