@@ -291,6 +291,11 @@ The `snapshot()` call exposes these additive, backward-compatible keys:
 | `frozen_prefix` | `{request_ids, tip_merge_commit, verify_depth}` |
 | `metrics` | `{retries_per_landing, drift_at_detection, landings_total}` |
 | `two_layer_invariants` | `[]` when healthy; list of violation strings otherwise |
+| `hosts` | Per-verify-host `{name, is_local, slot_state, quarantined, quarantine_class, unavailable_since, streak, reason}` — tells RU-quarantine (`ru`) from divergence-quarantine (`divergence`) from a leaked slot (busy/parked, no occupant) from free-and-never-asked-for |
+
+When any host is quarantined the heartbeat line also carries an inline
+` | DEGRADED <n>/<m> hosts quarantined: <name>=<class>` segment, and the
+`merge_heartbeat` event carries the same `hosts` block structurally.
 
 For the full architectural companion, see [references/two-layer-model.md](references/two-layer-model.md).
 
