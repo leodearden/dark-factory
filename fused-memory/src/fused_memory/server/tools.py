@@ -4443,8 +4443,9 @@ def create_mcp_server(
             delete set. A refused op has mutated nothing.
         (4) Write the canonical — BEFORE any destructive step, so a
             uniqueness violation or a metadata rejection costs zero deletes.
-        (5) Per supersede: read it (for the tombstone), reparent its
-            children onto the canonical, corroborate that, then delete.
+        (5) Tag the retained peers in place, then, per supersede: read it
+            (for the tombstone), reparent its children onto the canonical,
+            corroborate that, then delete.
         (6) Re-query deterministically — never `search`, whose top-N cutoff
             can silently omit the record just written.
         (7) Tombstone the confirmed-gone set.
@@ -4482,7 +4483,15 @@ def create_mcp_server(
             supersedes: Ids to FOLD AND DELETE. Each is reparented, deleted
                 and then re-read to confirm it is actually gone.
             retain: Ids to TAG IN PLACE — stamped with the cluster's topic
-                and never deleted. The ratified default arm.
+                and never deleted. The ratified default arm (gate 3200).
+                They become PEERS of the canonical, not children: they get
+                `topic` only, never `canonical` and never `parent_id`.
+                Tagging preserves the Qdrant point id, so every reference
+                already aimed at a peer stays valid; that id stability is
+                the whole reason to retain rather than fold. Retained ids
+                never appear in the canonical's `metadata.supersedes` —
+                they were not replaced, and saying they were would point
+                readers away from records that are still live and correct.
             run_id: The reconciliation run PERFORMING this consolidation.
                 Required whenever ``supersedes`` is non-empty: it is stamped
                 as each tombstone's ``deleting_run_id``. Deliberately
@@ -4691,6 +4700,58 @@ def create_mcp_server(
                 # dangling override — it always has a replacement.
                 citation_repoint[supersede_id] = {**stats, 'outcome': 'repointed'}
 
+        # (5a) THE RETAIN ARM — the ratified default (gate 3200). Each peer
+        # is TAGGED IN PLACE: it keeps its Qdrant point id, so every citation,
+        # parent pointer and supersedes edge already aimed at it stays valid.
+        # That id stability is the entire reason the arm exists; a
+        # delete-and-rewrite peer would drop every inbound reference and
+        # could not be restored, since no write path reaches a deleted point.
+        #
+        # `content=None` is the same property one level down: a peer whose
+        # claim did not change must not be re-embedded, so its vector does
+        # not move either. Metadata is MERGED and nothing is deleted — the
+        # peer's own source/run_id/parent are not this op's to discard.
+        #
+        # `topic` ONLY. Never `canonical` (exactly one per (project, topic) —
+        # a second claimant would make the next consolidation of this topic
+        # refuse outright) and never `parent_id` (these are PEERS of the
+        # canonical, not children of it).
+        #
+        # Task 3523 is the live seam here: `update_memory` does not run
+        # `_apply_memory_metadata_validation`, so this slug is not
+        # re-validated at the patch seam. It is validated at op entry
+        # instead, which bounds the hole for this caller without closing it.
+        retained: list[str] = []
+        retain_failures: list[dict[str, Any]] = []
+        for retain_id in retain_ids:
+            # A REJECTION HERE IS A RETURN VALUE, NOT A RAISE: `update_memory`
+            # reports MemoryNotFound and its authorization refusals by
+            # returning {'error_type': ...}. Code that only guarded against
+            # exceptions would append the id to `retained` and report a peer
+            # as tagged when it was refused.
+            outcome = await memory_service.update_memory(
+                memory_id=retain_id,
+                project_id=project_id,
+                content=None,
+                metadata_patch={'topic': topic},
+                metadata_mode='merge',
+                agent_id=agent_id,
+                session_id=session_id,
+                causation_id=causation_id,
+                _source=source,
+            )
+            if isinstance(outcome, dict) and outcome.get('error_type'):
+                # One refusal costs one peer, never the arm: the peers that
+                # CAN be tagged are, and re-running to catch the rest would
+                # re-write the canonical — the +1-per-pass ratchet.
+                retain_failures.append({
+                    'id': retain_id,
+                    'error': outcome.get('error'),
+                    'error_type': outcome.get('error_type'),
+                })
+                continue
+            retained.append(retain_id)
+
         deleted: list[str] = []
         failed_deletes: list[dict[str, Any]] = []
         survivors: list[str] = []
@@ -4785,6 +4846,8 @@ def create_mcp_server(
             deleted=deleted,
             failed_deletes=failed_deletes,
             survivors=survivors,
+            retained=retained,
+            retain_failures=retain_failures,
             topic_members=topic_members,
             topic_members_total=total,
             topic_members_truncated=total > returned,
