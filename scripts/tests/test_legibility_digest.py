@@ -1157,6 +1157,7 @@ def _frontmatter_meta():
             'interrupt': 5,
             'designed_outcome': 6,
         },
+        'instrument_version': 2,
     }
 
 
@@ -1179,7 +1180,7 @@ class TestRenderFrontmatter:
 
         assert top_level_keys == [
             'session', 'cwd', 'encoded_dir', 'agent_class', 'date',
-            'size_bytes', 'score', 'signal_counts',
+            'size_bytes', 'score', 'instrument_version', 'signal_counts',
         ]
 
     def test_signal_counts_nested_in_contract_order(self):
@@ -1203,6 +1204,54 @@ class TestRenderFrontmatter:
         loaded = yaml.safe_load(inner)
 
         assert loaded == meta
+
+    def test_instrument_version_constant_is_an_int_at_or_past_two(self):
+        # 1 is the implicit pre-3610 baseline (never emitted); this change
+        # is generation 2.
+        assert isinstance(mod.DIGEST_INSTRUMENT_VERSION, int)
+        assert mod.DIGEST_INSTRUMENT_VERSION >= 2
+
+    def test_instrument_version_is_appended_last_to_the_key_tuple(self):
+        # Appended, never inserted: the PRD Sec 7.2 prefix must stay
+        # byte-identical so downstream frontmatter diffs stay stable.
+        assert mod.FRONTMATTER_KEYS[-1] == 'instrument_version'
+        assert mod.FRONTMATTER_KEYS[:-1] == (
+            'session', 'cwd', 'encoded_dir', 'agent_class', 'date',
+            'size_bytes', 'score',
+        )
+
+    def test_instrument_version_emits_as_a_bare_numeric_scalar(self):
+        block = mod.render_frontmatter(_frontmatter_meta())
+
+        assert 'instrument_version: 2' in block
+        assert 'instrument_version: "2"' not in block
+
+    def test_instrument_version_round_trips_as_an_int(self):
+        block = mod.render_frontmatter(_frontmatter_meta())
+
+        inner = '\n'.join(block.splitlines()[1:-1])
+        loaded = yaml.safe_load(inner)
+
+        assert loaded['instrument_version'] == 2
+        assert isinstance(loaded['instrument_version'], int)
+
+    def test_absent_key_is_the_documented_pre_fix_marker(self):
+        # The census discriminator (07-31 :151, Sec 6): digests are rendered
+        # on demand and cached only in-process, so there is no corpus to
+        # migrate -- every already-emitted digest simply LACKS the key, and
+        # that absence is what means "predates task 3610's filter change".
+        # No sentinel value, no backfill.
+        legacy = (
+            'session: "sess-legacy"\n'
+            'agent_class: "interactive"\n'
+            'signal_counts:\n'
+            '  tool_error: 13\n'
+        )
+
+        loaded = yaml.safe_load(legacy)
+
+        assert loaded.get('instrument_version') is None
+        assert loaded.get('instrument_version', 1) < mod.DIGEST_INSTRUMENT_VERSION
 
     def test_date_round_trips_as_string_not_a_yaml_date_object(self):
         # A bare unquoted 2026-07-14 is resolved by PyYAML's implicit
@@ -1948,6 +1997,9 @@ class TestEmitConsistencyGuard:
         parsed = yaml.safe_load(frontmatter_yaml)
         assert set(parsed) == set(mod.FRONTMATTER_KEYS) | {'signal_counts'}
         assert set(parsed['signal_counts']) == set(mod.SIGNAL_COUNT_KEYS)
+        # Per-digest provenance travels with every rendered digest, so a
+        # census can tell which generation of the instrument produced it.
+        assert parsed['instrument_version'] == mod.DIGEST_INSTRUMENT_VERSION
 
         lines = frontmatter_yaml.splitlines()
         top_level_keys = [line.split(':', 1)[0] for line in lines if not line.startswith(' ')]
