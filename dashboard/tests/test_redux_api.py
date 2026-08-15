@@ -798,6 +798,94 @@ def test_shape_burndown_completed_ignores_snapshot_frequency():
     assert body['BURNDOWN']['velocity'] == 0.0
 
 
+# --- divergent per-project label rows -------------------------------------
+#
+# The three tests above all give every project an IDENTICAL label row (or use a
+# single project), which is exactly why the tabs.jsx mispairing of the aggregate
+# union row with per-project values was invisible to the suite.  These pin the
+# shape contract the consumer-side fix rests on, using divergent rows.
+
+_DIVERGENT_SERIES = {
+    'p1': {
+        'labels': ['2026-05-20T00:00:00', '2026-05-22T00:00:00'],
+        'done': [3, 7], 'in_progress': [1, 2], 'blocked': [0, 1], 'pending': [10, 6],
+    },
+    'p2': {
+        'labels': ['2026-05-20T00:00:00', '2026-05-21T00:00:00', '2026-05-22T00:00:00'],
+        'done': [100, 200, 300], 'in_progress': [10, 20, 30],
+        'blocked': [1, 2, 3], 'pending': [50, 40, 30],
+    },
+}
+
+_BURNDOWN_SERIES_KEYS = ('done', 'in_progress', 'blocked', 'pending')
+
+
+def test_shape_burndown_per_project_labels_are_that_projects_own_row():
+    """Each per-project block keeps its OWN snapshot row, not the union.
+
+    Passes against current server code — this is a regression pin, not a RED
+    step.  It fires if a future change densifies per-project rows onto the
+    union row, which would silently re-break the tabs.jsx consumer.
+    """
+    body = redux_api.shape_burndown(_DIVERGENT_SERIES)
+
+    assert body['BURNDOWN_BY_PROJECT']['p1']['labels'] == [
+        '2026-05-20T00:00:00', '2026-05-22T00:00:00',
+    ]
+    assert body['BURNDOWN_BY_PROJECT']['p2']['labels'] == [
+        '2026-05-20T00:00:00', '2026-05-21T00:00:00', '2026-05-22T00:00:00',
+    ]
+    # The aggregate carries the sorted union — strictly longer than p1's row.
+    assert body['BURNDOWN']['labels'] == [
+        '2026-05-20T00:00:00', '2026-05-21T00:00:00', '2026-05-22T00:00:00',
+    ]
+    assert len(body['BURNDOWN']['labels']) > len(body['BURNDOWN_BY_PROJECT']['p1']['labels'])
+
+
+def test_shape_burndown_per_project_series_are_co_length_with_own_labels():
+    """Per-project series are co-length with that project's own labels.
+
+    Passes against current server code — a regression pin.  This is the exact
+    invariant that makes `labels={pb.labels}` sound at the tabs.jsx consumer:
+    a per-project block is internally co-indexed, so it needs no hole
+    semantics.  Densifying these onto the union row would require making
+    deriveVelocitySeries, the summary-table last-value reads, and
+    compute_window_completion hole-aware first.
+    """
+    body = redux_api.shape_burndown(_DIVERGENT_SERIES)
+
+    for pid, block in body['BURNDOWN_BY_PROJECT'].items():
+        for key in _BURNDOWN_SERIES_KEYS:
+            assert len(block[key]) == len(block['labels']), (
+                f'{pid}.{key} has {len(block[key])} values for '
+                f'{len(block["labels"])} labels'
+            )
+
+
+def test_shape_burndown_aggregate_series_are_co_length_with_union_labels():
+    """Aggregate series are densified onto the union row by label, not position.
+
+    Passes against current server code — a regression pin.  The spot-check on
+    2026-05-21 (reported only by p2) is what distinguishes label-indexed
+    densification from a positional sum, which would fold p1's 05-22 values
+    into the 05-21 slot.
+    """
+    body = redux_api.shape_burndown(_DIVERGENT_SERIES)
+    agg = body['BURNDOWN']
+    n = len(agg['labels'])
+
+    for key in _BURNDOWN_SERIES_KEYS:
+        assert len(agg[key]) == n, f'aggregate {key} has {len(agg[key])} values for {n} labels'
+
+    mid = agg['labels'].index('2026-05-21T00:00:00')
+    # Only p2 reported this timestamp, so the aggregate is p2's value alone.
+    assert agg['done'][mid] == 200
+    assert agg['pending'][mid] == 40
+    # Timestamps both projects reported sum across them.
+    assert agg['done'][agg['labels'].index('2026-05-20T00:00:00')] == 103   # 3 + 100
+    assert agg['done'][agg['labels'].index('2026-05-22T00:00:00')] == 307   # 7 + 300
+
+
 # ---------------------------------------------------------------------------
 # shape_escalations
 # ---------------------------------------------------------------------------
