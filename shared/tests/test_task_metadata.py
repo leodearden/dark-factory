@@ -57,14 +57,21 @@ def _assert_only_test_owned_registry_keys(added: set[str]) -> None:
 
 @pytest.fixture(autouse=True)
 def _reset_metadata_registry_state():
-    """Snapshot/restore task_metadata's module-global registry/migrations.
+    """Snapshot/restore task_metadata's module-global registry/cardinality/migrations.
 
     register_metadata_submodel and the migration registry mutate module-global
     dicts; without this, TestSubmodelRegistry / TestMigrations / the registry
     portion of the parse_metadata tests would leak registrations into later
-    tests. Uses getattr/hasattr defensively since _SUBMODEL_REGISTRY and
-    _MIGRATIONS are added incrementally by later steps in this file's own
-    TDD sequence.
+    tests. Three dicts are covered: `_SUBMODEL_REGISTRY` (key -> model),
+    `_SUBMODEL_CARDINALITY` (key -> 'dict'|'list', task 4142) and
+    `_MIGRATIONS`. Uses getattr/hasattr defensively since all three are added
+    incrementally by later steps in this file's own TDD sequence.
+
+    The cardinality dict needs the same treatment as the registry: a test that
+    registers a stub with `cardinality='list'` would otherwise leak that entry
+    past teardown, and a later same-key registration with a different
+    cardinality raises spuriously — the same class of cross-test leak task 3352
+    fixed for the registry itself.
 
     Teardown does two things: it restores the snapshot, AND it enforces key
     ownership (task 3352) — every key a test ADDED to the registry must be a
@@ -73,18 +80,23 @@ def _reset_metadata_registry_state():
     """
     had_registry = hasattr(task_metadata_module, '_SUBMODEL_REGISTRY')
     registry_snapshot = dict(getattr(task_metadata_module, '_SUBMODEL_REGISTRY', {}))
+    had_cardinality = hasattr(task_metadata_module, '_SUBMODEL_CARDINALITY')
+    cardinality_snapshot = dict(getattr(task_metadata_module, '_SUBMODEL_CARDINALITY', {}))
     had_migrations = hasattr(task_metadata_module, '_MIGRATIONS')
     migrations_snapshot = dict(getattr(task_metadata_module, '_MIGRATIONS', {}))
     yield
     # Ordering is load-bearing in BOTH directions: `added` must be diffed
     # BEFORE any restore (a post-restore diff is always empty, i.e. a silently
-    # vacuous guard), and the assertion must fire AFTER both restores (an
-    # assertion raised before the _MIGRATIONS restore would skip it and leak
-    # migrations into later tests).
+    # vacuous guard), and the assertion must fire AFTER all three restores (an
+    # assertion raised before the _SUBMODEL_CARDINALITY / _MIGRATIONS restores
+    # would skip them and leak state into later tests).
     added = set(getattr(task_metadata_module, '_SUBMODEL_REGISTRY', {})) - set(registry_snapshot)
     if had_registry:
         task_metadata_module._SUBMODEL_REGISTRY.clear()
         task_metadata_module._SUBMODEL_REGISTRY.update(registry_snapshot)
+    if had_cardinality:
+        task_metadata_module._SUBMODEL_CARDINALITY.clear()
+        task_metadata_module._SUBMODEL_CARDINALITY.update(cardinality_snapshot)
     if had_migrations:
         task_metadata_module._MIGRATIONS.clear()
         task_metadata_module._MIGRATIONS.update(migrations_snapshot)
