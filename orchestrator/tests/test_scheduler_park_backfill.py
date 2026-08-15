@@ -27,10 +27,8 @@ plans/evidence/scheduler-scoring-2026-08-06/PARKING_MODEL_REPORT.md
 
 from __future__ import annotations
 
-import ast
 import logging
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock
 
@@ -977,13 +975,21 @@ async def test_the_backfiller_borrows_the_park_it_does_not_consume_it():
 # PRD section 7 rejection guards — what this task deliberately did NOT build
 # ===========================================================================
 #
-# Two mechanisms were rejected on measured grounds and must STAY rejected.  A
-# later reader with the backfill machinery in front of them has every reason
-# to think "while we're here, park below rank 1" or "parks should expire" is
-# the natural next move; these make that drift loud instead of silent.
+# Two mechanisms were rejected on measured grounds and must STAY rejected:
+# below-rank-1 park INSTALLATION, and park leases / wall-clock expiry (removed
+# deliberately by task 1228).  A later reader with the backfill machinery in
+# front of them has every reason to think "while we're here, park below rank
+# 1" or "parks should expire" is the natural next move; these make that drift
+# loud instead of silent.
 #
-# AST, not text grep: a call can span lines, and the enclosing function is
-# exactly what each invariant is about.
+# Guarded BEHAVIOURALLY — run the backfill world, then look at the park stacks
+# and the event log — rather than by scanning the source for the enclosing
+# function names of ``install_parks`` call sites.  A name scan asserts code
+# SHAPE: renaming ``_phase_reserve_now`` or extracting a helper breaks it while
+# the invariant holds, and a refactor that keeps the names while changing the
+# semantics passes it.  Both guards were confirmed able to fail by hand
+# (install a park for the backfiller; pass ``admitted_parks`` in the pin loop)
+# — a guard that cannot fail is worse than no guard.
 
 
 @pytest.mark.asyncio
@@ -1094,154 +1100,6 @@ async def test_a_pin_blocked_by_a_foreign_park_does_not_dispatch(tmp_path):
         'calling try_acquire with no admitted_parks'
     )
     assert _events(store, 'park_backfill_granted') == []
-
-
-_SRC_DIR = Path(__file__).parent.parent / 'src'
-
-
-def _enclosing_function_ranges(tree: ast.Module) -> list[tuple[str, int, int]]:
-    """``(name, lineno, end_lineno)`` for every function/method in *tree*."""
-    return [
-        (node.name, node.lineno, node.end_lineno or node.lineno)
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    ]
-
-
-def _call_sites(path: Path, method_name: str) -> list[tuple[str, int, str]]:
-    """``(file, line, enclosing function)`` for each ``….<method_name>(…)``."""
-    tree = ast.parse(path.read_text())
-    ranges = _enclosing_function_ranges(tree)
-    sites: list[tuple[str, int, str]] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        if not (isinstance(func, ast.Attribute) and func.attr == method_name):
-            continue
-        # A method DEFINITION is not a call site; only Call nodes reach here.
-        enclosing = [name for name, lo, hi in ranges if lo <= node.lineno <= hi]
-        sites.append((path.name, node.lineno, enclosing[-1] if enclosing else '<module>'))
-    return sites
-
-
-def _emit_sites(path: Path, event_name: str) -> list[tuple[str, int, str]]:
-    """``(file, line, enclosing function)`` for each ``…emit(EventType.<event>…)``."""
-    tree = ast.parse(path.read_text())
-    ranges = _enclosing_function_ranges(tree)
-    sites: list[tuple[str, int, str]] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        if not (isinstance(func, ast.Attribute) and func.attr == 'emit'):
-            continue
-        args = list(node.args) + [kw.value for kw in node.keywords if kw.arg == 'event_type']
-        for arg in args:
-            if (
-                isinstance(arg, ast.Attribute)
-                and arg.attr == event_name
-                and isinstance(arg.value, ast.Name)
-                and arg.value.id == 'EventType'
-            ):
-                enclosing = [name for name, lo, hi in ranges if lo <= node.lineno <= hi]
-                sites.append((path.name, node.lineno, enclosing[-1] if enclosing else '<module>'))
-    return sites
-
-
-def test_backfill_installs_no_park():
-    """``install_parks`` keeps exactly its two pre-existing callers.
-
-    Below-rank-1 park INSTALLATION is rejected by PRD section 7 on measured
-    grounds.  Backfill grants a candidate passage through an existing park;
-    it must never create one, or the park population — the thing the parking
-    model measured — changes shape underneath the evidence.
-    """
-    sites = [
-        site
-        for path in sorted(_SRC_DIR.rglob('*.py'))
-        for site in _call_sites(path, 'install_parks')
-    ]
-
-    assert sorted(fn for _f, _l, fn in sites) == [
-        '_bump_skip_and_maybe_park',
-        '_phase_reserve_now',
-    ], f'install_parks callers changed: {sites}'
-
-
-def test_backfill_adds_no_park_lease_or_expiry():
-    """``reservation_expired`` still has exactly one emit site, in park GC.
-
-    Park leases were removed deliberately (task 1228) and PRD section 7
-    rejects reintroducing them.  ``park_age_secs`` is a READ used to REFUSE
-    an admission — it must never become a reason to evict.  A second emit
-    site would mean wall-clock park death came back in through this door.
-    """
-    sites = [
-        site
-        for path in sorted(_SRC_DIR.rglob('*.py'))
-        for site in _emit_sites(path, 'reservation_expired')
-    ]
-
-    assert len(sites) == 1, f'expected one reservation_expired emit site, got {sites}'
-    assert sites[0][2] == '_phase_park_gc', (
-        f'reservation_expired emitted from {sites[0][2]}: park eviction stays '
-        f'owner-state-driven, never wall-clock-driven'
-    )
-
-
-def test_the_pin_loop_is_not_given_backfill():
-    """``_phase_select_pins`` still calls plain ``try_acquire``.
-
-    C7 anchors on the scored loop.  Pins already bypass fairness entirely, so
-    admitting them through parks as well would hand the one path with no
-    fairness accounting a second override — and the safety factor exists
-    precisely to bound what the scored loop borrows.
-    """
-    tree = ast.parse((_SRC_DIR / 'orchestrator' / 'scheduler.py').read_text())
-    pins = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name == '_phase_select_pins'
-    ]
-    assert len(pins) == 1, 'expected exactly one _phase_select_pins definition'
-
-    acquires = [
-        node
-        for node in ast.walk(pins[0])
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr.startswith('try_acquire')
-    ]
-    assert acquires, 'meta: the pin loop must still take locks at all'
-    for call in acquires:
-        assert not [kw for kw in call.keywords if kw.arg == 'admitted_parks'], (
-            f'_phase_select_pins line {call.lineno} passes admitted_parks — '
-            f'backfill is scoped to the scored loop'
-        )
-
-
-def test_the_ast_scanners_can_actually_find_their_targets(tmp_path):
-    """Meta-test: a scanner that finds nothing would pass every guard above.
-
-    The probe goes in ``tmp_path``, never in the tests tree: this suite runs
-    under pytest-xdist, so a fixed shared path is a race, and a hard interrupt
-    mid-test would strand an untracked .py file where the guards' own rglob
-    would find it.
-    """
-    probe = tmp_path / '_backfill_guard_probe.py'
-    probe.write_text(
-        'from x import EventType\n'
-        'def f(self):\n'
-        '    self.lock_table.install_parks(\n'
-        '        "A", ["m"], "high")\n'
-        '    self.event_store.emit(\n'
-        '        EventType.reservation_expired, task_id="A", data={})\n'
-    )
-
-    assert [(line, fn) for _f, line, fn in _call_sites(probe, 'install_parks')] == [(3, 'f')]
-    assert [(line, fn) for _f, line, fn in _emit_sites(probe, 'reservation_expired')] == [(5, 'f')]
 
 
 # ===========================================================================
