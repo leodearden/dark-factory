@@ -957,6 +957,24 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
             # dropping either sinks them, and dropping any of the other five
             # sinks nobody.
             #
+            # RE-MEASURED 2026-08-15 (amendment pass), because the corpus was
+            # expected to keep growing and a stale coverage claim is worse than
+            # none. A fresh top-25 search on the same query returns 25 distinct
+            # members -- overlapping but NOT identical to the 21 above, since
+            # the search is semantic and limit-bounded: 9 members are new to
+            # the ranking (c368d0f5, 70c6f185, 4ec6d976, 4a4daa2d, 0298502f,
+            # 323055ca, fb415f6b, 33635a94, 6fba3176), 4 of them written that
+            # same day, and 5 of the original 21 fell below the cut. Result on
+            # the enlarged set: min 2 distinct hits, max 7, 16 profiles, and
+            # ZERO members below threshold -- so the seven phrases still cover
+            # the cluster unchanged and no phrase needed adding. 'npx pyright'
+            # is now 25/25, 'EACCES' 19/25, '/home/leo/.npm' 17/25,
+            # '.venv/bin/pyright' 13/25, '_cacache' and 'npm_config_cache'
+            # 12/25, 'sudo chown -R 1000:1000' 9/25. That four of the nine new
+            # members were written on a single day is also the live evidence
+            # for the prospective-registration argument at the end of this
+            # comment.
+            #
             # SYMPTOM-KEYED RATIONALE -- the reason this seed does not look
             # like the six above. This cluster's members CONTRADICT EACH OTHER
             # on causation rather than merely paraphrasing: a0c39676, 92ff6daa
@@ -986,14 +1004,21 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
             # above): bare 'root-owned' and the verbatim npm string 'cache
             # folder contains root-owned files' are omitted although both are
             # among the most literally common strings in the corpus. Measured,
-            # not assumed -- with either seeded, a generic docker/CI note
-            # ("mounted cache folder contains root-owned files ... EACCES ...
-            # chown the mount") reaches 2 hits and would be soft-blocked and
-            # mis-routed here. Memory f9c9ea2a makes the hazard concrete by
-            # explicitly distinguishing the recorded pump-web-ui / know-live
-            # "architect-level toolchain-cache redirect" EACCES entries as a
-            # DIFFERENT failure class -- exactly what those phrases would
-            # falsely capture. Coverage loses nothing: all 21 members still
+            # not assumed -- with either seeded, an OFF-HOST generic docker/CI
+            # note ("mounted cache folder contains root-owned files ... EACCES
+            # ... chown the mount") reaches 2 hits and would be soft-blocked
+            # and mis-routed here. That off-host shape, and only that shape, is
+            # what dropping them buys.
+            #
+            # SCOPE CORRECTION (reviewer, task 3862): an earlier revision of
+            # this paragraph also claimed these exclusions were what protected
+            # the pump-web-ui / know-live "architect-level toolchain-cache
+            # redirect" entries that memory f9c9ea2a rules a DIFFERENT failure
+            # class. That was WRONG and is retracted. Those entries run on THIS
+            # host, so they name /home/leo/.npm and _cacache themselves and are
+            # captured by the anchors that were KEPT, not by the ones dropped.
+            # The exposure is real and now recorded honestly as residual (3)
+            # below. Coverage loses nothing: all members still
             # clear the 2-hit bar without them. 'type_check_command' is
             # omitted as a config-key name that appears in any module-config
             # discussion and was measured to cost ZERO coverage when dropped.
@@ -1005,7 +1030,7 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
             # above; asserted over ALL clusters by
             # test_no_seeded_phrase_nests_inside_another_in_the_same_cluster.
             #
-            # TWO ACCEPTED RESIDUALS, both PINNED by positive tests so a
+            # THREE ACCEPTED RESIDUALS, all PINNED by positive tests so a
             # future tuner can tell them from a regression:
             # (1) entry 37743789, which gate 3417 EXPLICITLY EXCLUDES as a
             #     distinct root cause (a sandboxed network-fetch hang, fixed
@@ -1025,6 +1050,54 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
             #     folded into the canonical entry, since it CORRECTS member
             #     1db61279's "(same version)" claim.
             #     (test_known_residual_pyright_version_pin_note_matches)
+            # (3) CROSS-PROJECT over-match, the widest residual of the three
+            #     and the one to read before re-tuning anything. This guard
+            #     runs in add_memory BEFORE the cosine guard and, unlike it, is
+            #     NOT project-scoped: find_matching_topic_cluster() takes only
+            #     (content, clusters), while the cosine path below it passes
+            #     project_id. So the seed fires for EVERY project this server
+            #     serves, and '/home/leo/.npm', '_cacache' and 'EACCES' are
+            #     HOST-wide npm vocabulary -- every sandbox-enabled project on
+            #     this host shares /home/leo. Measured against the live seed: a
+            #     pump-web-ui `npm ci` note (3 hits), a know-live toolchain
+            #     note (3 hits) and an autopilot-video `npx tsc` note (2 hits,
+            #     no pyright at all) are all BLOCKED and routed to dark-factory
+            #     gate 3417, whose "consolidate into the pyright entries"
+            #     instruction is wrong for that writer. Per task 3162's
+            #     2026-08-10 audit these are precisely the gap projects
+            #     (know-live, autopilot-video, pump-web-ui,
+            #     solar-challenge-platform).
+            #     ACCEPTED because no narrowing expressible here fixes it, all
+            #     four candidates measured over the corpus and over the hazard
+            #     notes:
+            #       - min_phrase_hits=3: sinks 4 members AND still blocks the
+            #         pump-web-ui and know-live notes. Strictly worse.
+            #       - drop 'EACCES' + '_cacache' (the reviewer's first
+            #         suggestion): sinks member 3df6017f and STILL blocks the
+            #         know-live note.
+            #       - drop '_cacache' alone: free on today's corpus but closes
+            #         only the `npx tsc` shape; pump-web-ui and know-live still
+            #         block. Buys nothing for the class it targets.
+            #       - drop 'EACCES' + '/home/leo/.npm': closes all three
+            #         measured notes at zero cost ON TODAY'S CORPUS, and is the
+            #         tempting one -- but it guts the guard's PURPOSE. Existing
+            #         members survive only because they happen to spell literal
+            #         paths and commands; three plausible future PARAPHRASES
+            #         ("`npx pyright` aborts with npm EACCES on /home/leo/.npm;
+            #         the cause is the agent sandbox write set") drop from 3
+            #         hits to 1 and would be missed. Paraphrases are exactly
+            #         what this guard exists to catch, so that trade is a loss.
+            #         It also does not close the class: harder cross-project
+            #         shapes still reach 2 via '_cacache' + 'npm_config_cache'.
+            #     The real fix is structural and lives OUTSIDE this file --
+            #     either project-scoping the topic guard (pass project_id, as
+            #     the cosine path does) or giving ProceduralTopicCluster a
+            #     required-anchor arm so 'npx pyright' must be present for the
+            #     host-wide npm phrases to count. Until one of those lands the
+            #     block is SOFT, and the hint below now tells a non-dark-factory
+            #     writer explicitly that this is a known false positive and how
+            #     to proceed.
+            #     (test_known_residual_cross_project_npm_eacces_note_matches)
             #
             # Registered PROSPECTIVELY while gate 3417 is still blocked behind
             # 3524, following the task-3013 and task-3435 precedents: the
@@ -1046,7 +1119,7 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
             hint=(
                 'Known-contradictory topic (`npx pyright` aborting with npm '
                 'EACCES on /home/leo/.npm/_cacache) gated to human task 3417, '
-                'whose 21-entry cluster is still awaiting a consolidation '
+                'whose still-growing cluster is awaiting a consolidation '
                 'ruling. The cluster DISAGREES WITH ITSELF, so read this before '
                 'writing: the `sudo chown -R 1000:1000 /home/leo/.npm` remedy '
                 'several existing entries prescribe is a CONFIRMED NO-OP -- the '
@@ -1058,7 +1131,18 @@ def _default_topic_guard_clusters() -> list[ProceduralTopicCluster]:
                 'npm cannot write _cacache/_logs and aborts before exec\'ing '
                 'pyright. Task 3162 owns the fix. Do NOT add another entry -- '
                 'update/consolidate the existing entries, or add context to gate '
-                'task 3417.'
+                'task 3417. '
+                'CROSS-PROJECT WRITERS: if your note is NOT about dark-factory '
+                "`npx pyright` -- e.g. it is npm EACCES in pump-web-ui, "
+                'know-live, autopilot-video or solar-challenge-platform -- then '
+                'this is a KNOWN FALSE POSITIVE, not a duplicate. This guard is '
+                'not yet project-scoped and /home/leo/.npm, _cacache and EACCES '
+                'are host-wide npm vocabulary shared by every project on this '
+                'host. Do NOT consolidate into gate 3417 and do NOT drop your '
+                "write: re-submit it unchanged with metadata={'allow_near_"
+                "duplicate': True}. Those per-project toolchain-cache-redirect "
+                'gaps are a DIFFERENT failure class (see memory f9c9ea2a) and '
+                'belong to task 3162, not 3417.'
             ),
         ),
     ]

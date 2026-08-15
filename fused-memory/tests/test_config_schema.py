@@ -2241,12 +2241,25 @@ class TestNpxPyrightEaccesAgentSandboxCluster:
     def test_cluster_present_and_routes_to_gate_3417(self):
         """The registration + hint contract.
 
-        The hint has to carry three things a routed writer needs, because
-        the block is SOFT and the hint is the only thing they read: the gate
+        The hint has to carry four things a routed writer needs, because the
+        block is SOFT and the hint is genuinely the only thing they read --
+        ``build_topic_cluster_block`` puts the cluster's ``hint`` in the
+        response and adds no generic remediation text of its own: the gate
         task to add context to (3417), an explicit warning about the `sudo
         chown` remedy several members prescribe -- so a writer cannot
-        re-derive the harmful fix from the same symptom -- and the task that
-        owns the real fix (3162).
+        re-derive the harmful fix from the same symptom -- the task that
+        owns the real fix (3162), and the cross-project escape hatch.
+
+        That last one is pinned because of accepted residual (3): this guard
+        is not project-scoped, so it also blocks other projects' npm-EACCES
+        notes (see ``test_known_residual_cross_project_npm_eacces_note_
+        matches``). For those writers the hint's main instruction --
+        consolidate into the pyright entries -- is actively wrong, so the
+        hint must name the override that lets them through.
+        ``allow_near_duplicate`` is asserted rather than any surrounding
+        prose for the same reason 'sudo chown' is: it is the literal the
+        writer must act on, so it is the stable, behavioural half of the
+        wording.
 
         Reviewer (test-quality, task 3862): the chown assertion names the
         REMEDY LITERAL rather than a word from the surrounding prose. An
@@ -2268,6 +2281,7 @@ class TestNpxPyrightEaccesAgentSandboxCluster:
         assert '3417' in cluster.hint
         assert 'sudo chown' in cluster.hint
         assert '3162' in cluster.hint
+        assert 'allow_near_duplicate' in cluster.hint
 
     def test_cluster_present_with_expected_phrases(self):
         cluster = self._cluster()
@@ -2444,11 +2458,19 @@ class TestNpxPyrightEaccesAgentSandboxCluster:
         root-owned files' were both rejected as phrases. Measured -- adding
         either raises this note to 2 hits, soft-blocking a generic
         toolchain-cache EACCES observation and mis-routing it to gate 3417.
-        Memory f9c9ea2a makes the hazard concrete by explicitly distinguishing
-        the pump-web-ui / know-live toolchain-cache EACCES entries as a
-        DIFFERENT failure class; this note stands in for them. Pinning it here
-        means a future tuner who re-adds those phrases gets a red test rather
-        than a silent widening.
+        Pinning it here means a future tuner who re-adds those phrases gets a
+        red test rather than a silent widening.
+
+        SCOPE CORRECTION (reviewer, task 3862): this docstring used to claim
+        the docker/CI note "stands in for" the pump-web-ui / know-live entries
+        that memory f9c9ea2a rules a different failure class. It does not, and
+        the claim is retracted. The docker note is OFF-HOST -- it names
+        neither '/home/leo/.npm' nor '_cacache' -- which is exactly why it
+        stays clean here. The real same-class entries run on THIS host and DO
+        name those anchors, so they are blocked today. That exposure is a
+        known accepted residual with its own pinned test, not a negative
+        control: see ``test_known_residual_cross_project_npm_eacces_note_
+        matches`` below and residual (3) on the seed in schema.py.
         """
         assert find_matching_topic_cluster(note, [self._cluster()]) is None
 
@@ -2492,6 +2514,75 @@ class TestNpxPyrightEaccesAgentSandboxCluster:
             'residual documented in schema.py no longer holds for the 37743789 '
             'offline-hang entry -- if this was deliberate, update the ACCEPTED '
             'RESIDUAL comment on the seed too'
+        )
+        assert result[0].topic_id == self.TOPIC_ID
+
+    @pytest.mark.parametrize(
+        'note',
+        [
+            pytest.param(
+                'In pump-web-ui, `npm ci` under the sandboxed implementer aborts '
+                'with npm error code EACCES on /home/leo/.npm/_cacache/tmp. The '
+                'fix is the per-project root .npmrc '
+                'cache=/tmp/npm-cache-pump-web-ui redirect.',
+                id='pump-web-ui-npm-ci-3-hits',
+            ),
+            pytest.param(
+                'know-live: the sandboxed agent hits EACCES writing '
+                '/home/leo/.npm during the toolchain install; export '
+                'npm_config_cache=/tmp/npm-cache-know-live before any npm '
+                'invocation.',
+                id='know-live-toolchain-redirect-3-hits',
+            ),
+            pytest.param(
+                '`npx tsc` in autopilot-video fails with EACCES on _cacache '
+                'under the sandbox.',
+                id='autopilot-video-npx-tsc-no-pyright-2-hits',
+            ),
+        ],
+    )
+    def test_known_residual_cross_project_npm_eacces_note_matches(self, note):
+        """Other projects' npm-EACCES notes match too. Accepted, not a control.
+
+        This is the WIDEST of the three accepted residuals and the one to read
+        before re-tuning the phrase list. The topic guard runs in add_memory
+        BEFORE the cosine guard and, unlike it, is NOT project-scoped --
+        ``find_matching_topic_cluster(content, clusters)`` takes no project_id
+        while the cosine call below it passes one. So this seed fires for every
+        project the server serves, and '/home/leo/.npm', '_cacache' and
+        'EACCES' are HOST-wide npm vocabulary: every sandbox-enabled project
+        shares /home/leo. The third case carries no pyright involvement at all
+        and still reaches 2 hits.
+
+        Accepted because no narrowing expressible in this schema fixes it --
+        all four candidates were measured over the corpus AND these notes:
+        min_phrase_hits=3 sinks 4 members and still blocks two of these;
+        dropping 'EACCES'+'_cacache' sinks member 3df6017f and still blocks the
+        know-live note; dropping '_cacache' alone closes only the `npx tsc`
+        shape; and dropping 'EACCES'+'/home/leo/.npm' closes all three at zero
+        cost on today's corpus but drops plausible future PARAPHRASES from 3
+        hits to 1 -- gutting the very thing the guard exists to catch -- while
+        still not closing the class (harder shapes reach 2 via
+        '_cacache'+'npm_config_cache'). The real fix is structural and lives
+        outside this file: project-scope the topic guard, or give
+        ProceduralTopicCluster a required-anchor arm.
+
+        Pinned as MATCHING, deliberately, rather than aspirationally asserted
+        clean: the behaviour is live today, and a test asserting the fix we did
+        not make would be a lie that goes red for the wrong reason. If a future
+        change narrows this away, that is a genuine improvement -- update
+        residual (3) on the seed and move these cases into the negative-control
+        test above. The cost is bounded meanwhile: the block is SOFT, and the
+        hint now tells a non-dark-factory writer this is a known false
+        positive, to re-submit with allow_near_duplicate, and that their case
+        belongs to task 3162 rather than gate 3417.
+        """
+        result = find_matching_topic_cluster(note, [self._cluster()])
+        assert result is not None, (
+            'residual (3) documented in schema.py no longer holds for this '
+            'cross-project npm-EACCES note -- if this was deliberate, update '
+            'the ACCEPTED RESIDUAL comment on the seed and move this case to '
+            'test_does_not_match_unrelated_npm_cache_or_pyright_notes'
         )
         assert result[0].topic_id == self.TOPIC_ID
 
