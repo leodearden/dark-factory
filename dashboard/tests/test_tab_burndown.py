@@ -31,6 +31,137 @@ def app_jsx_body(_client):
 
 
 # ---------------------------------------------------------------------------
+# Chart labels/values pairing probe
+# ---------------------------------------------------------------------------
+#
+# The defect class this guards against is "the labels prop and the values come
+# from DIFFERENT series objects".  A chart's x-axis row and its y-value arrays
+# are co-indexed by construction only when they are read off the same block, so
+# pairing one block's labels with another's values both overruns the values
+# (undefined past their length) and index-shifts every earlier point onto the
+# wrong label.
+#
+# Matching is by EXPRESSION CONTENT, never by line number: these shift whenever
+# an unrelated tab earlier in the file is edited.
+
+_TAG_RE = re.compile(r'<(SA|LC|BC)\b')
+_LABELS_RE = re.compile(r'labels=\{([^{}]+)\}')
+_VALUES_RE = re.compile(r'values[:=]\s*\{?([^,}\n]+)')
+# A trailing call suffix such as `.map(String)` is presentation, not series identity.
+_CALL_SUFFIX_RE = re.compile(r'\.\w+\([^()]*\)$')
+
+
+def _series_root(expr):
+    """Normalize a chart expression to the series object it reads from.
+
+    `b.labels` -> `b`, `pb.done` -> `pb`, `p.hist_outer.values` -> `p.hist_outer`,
+    `d.depth.labels.map(String)` -> `d.depth`.
+    """
+    expr = expr.strip()
+    prev = None
+    while prev != expr:
+        prev = expr
+        expr = _CALL_SUFFIX_RE.sub('', expr).strip()
+    return expr.rsplit('.', 1)[0] if '.' in expr else expr
+
+
+def _chart_sites(src):
+    """Return one record per chart element in the JSX source.
+
+    Each record is a dict with `tag`, `labels_expr`, `labels_root`,
+    `values_exprs` and `values_roots`.  An element runs from its tag start to
+    the first `/>` after it — verified sufficient because no chart element body
+    in this file contains a nested self-closing tag.
+    """
+    sites = []
+    for m in _TAG_RE.finditer(src):
+        end = src.find('/>', m.start())
+        chunk = src[m.start():end + 2] if end != -1 else src[m.start():]
+        labels_m = _LABELS_RE.search(chunk)
+        labels_expr = labels_m.group(1).strip() if labels_m else None
+        values_exprs = [v.strip() for v in _VALUES_RE.findall(chunk)]
+        sites.append({
+            'tag': m.group(1),
+            'labels_expr': labels_expr,
+            'labels_root': _series_root(labels_expr) if labels_expr else None,
+            'values_exprs': values_exprs,
+            'values_roots': [_series_root(v) for v in values_exprs],
+        })
+    return sites
+
+
+class TestChartLabelValuePairing:
+    def test_per_project_status_mix_uses_own_label_row(self, tabs_jsx_body):
+        """The per-project status-mix chart must use that project's OWN label row.
+
+        `b.labels` (DF.BURNDOWN) is the sorted UNION of every project's snapshot
+        timestamps (redux_api.py:878), while `pb.*` are one project's own series.
+        Pairing them overruns the values and index-shifts them.
+        """
+        sites = [
+            s for s in _chart_sites(tabs_jsx_body)
+            if s['tag'] == 'SA' and s['values_roots'] and set(s['values_roots']) == {'pb'}
+        ]
+        assert len(sites) == 1, (
+            f'expected exactly one per-project <SA> site, found {len(sites)}'
+        )
+        site = sites[0]
+        assert site['labels_expr'] != 'b.labels', (
+            'per-project status-mix chart pairs the aggregate union label row '
+            '`b.labels` with per-project values — must be `pb.labels`'
+        )
+        assert site['labels_root'] == 'pb', (
+            f"expected labels root 'pb', got {site['labels_root']!r} "
+            f"(labels={site['labels_expr']!r})"
+        )
+
+    def test_aggregate_status_mix_uses_aggregate_label_row(self, tabs_jsx_body):
+        """The aggregate status-mix chart must keep the union label row.
+
+        Present so the per-project fix cannot be "achieved" by mutating this
+        site instead — the aggregate series ARE densified onto `b.labels`.
+        """
+        sites = [
+            s for s in _chart_sites(tabs_jsx_body)
+            if s['tag'] == 'SA' and s['values_roots'] and set(s['values_roots']) == {'b'}
+        ]
+        assert len(sites) == 1, (
+            f'expected exactly one aggregate <SA> site, found {len(sites)}'
+        )
+        assert sites[0]['labels_root'] == 'b'
+
+    def test_every_chart_pairs_labels_and_values_from_one_series(self, tabs_jsx_body):
+        """EVERY chart must read its labels and its values off the same object.
+
+        This pins the defect CLASS, so the same mistake authored at a chart
+        added later to this file also fails.
+        """
+        mismatched = [
+            (s['tag'], s['labels_expr'], s['values_exprs'])
+            for s in _chart_sites(tabs_jsx_body)
+            if s['labels_root'] is not None
+            and any(r != s['labels_root'] for r in s['values_roots'])
+        ]
+        assert not mismatched, (
+            'chart sites pair labels and values from different series objects: '
+            f'{mismatched}'
+        )
+
+    def test_chart_pairing_probe_is_not_vacuous(self, tabs_jsx_body):
+        """The probe must actually match the charts it claims to guard.
+
+        A structural probe that silently matches nothing reports green forever,
+        which is strictly worse than no test at all.
+        """
+        sites = _chart_sites(tabs_jsx_body)
+        assert len(sites) >= 8, f'expected >=8 chart sites, found {len(sites)}'
+        assert {s['tag'] for s in sites} == {'SA', 'LC', 'BC'}
+        for s in sites:
+            assert s['labels_expr'], f'no labels expression parsed for <{s["tag"]}> site'
+            assert s['values_exprs'], f'no values expressions parsed for <{s["tag"]}> site'
+
+
+# ---------------------------------------------------------------------------
 # app.jsx — passes displayWindow (not `window`) into BurnTab
 # ---------------------------------------------------------------------------
 
