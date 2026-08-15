@@ -627,3 +627,64 @@ async def test_rejected_update_task_write_is_recorded_not_silently_dropped(
 
     warning_records = [r for r in caplog.records if r.levelname == 'WARNING']
     assert any('rejected delivered_checks write' in r.getMessage() for r in warning_records)
+
+
+@pytest.mark.asyncio
+async def test_rejected_write_does_not_block_sibling_labels(tmp_path):
+    """A rejection is per-label and must not abort the remaining
+    `for task in doc.tasks` iterations. The rejection branch is the last
+    statement in the loop body, so continuation holds by construction today
+    — which is exactly why an accidental `return report` / `break` added
+    there would go unnoticed without this test. Complements step-4 (which
+    pins that a rejection is *recorded*) by pinning that it is
+    *contained*."""
+    plans_dir = tmp_path / 'plans'
+    plans_dir.mkdir()
+    sidecar_path = plans_dir / 'multi-prd.capability-manifest.yaml'
+    sidecar_path.write_text(
+        _mechanical_sidecar_yaml('multi', ['first', 'second']), encoding='utf-8'
+    )
+
+    task_interceptor = AsyncMock()
+    task_interceptor.update_task = AsyncMock(
+        side_effect=[
+            {'success': False, 'error': 'status_via_update_task', 'task_id': '11'},
+            {'success': True},
+        ]
+    )
+    ids = ['11', '12']
+    tasks_data = [
+        {
+            'id': '11',
+            'metadata': {'prd_path': 'plans/multi-prd.md', 'prd_task_label': 'first'},
+        },
+        {
+            'id': '12',
+            'metadata': {'prd_path': 'plans/multi-prd.md', 'prd_task_label': 'second'},
+        },
+    ]
+
+    report = await stamp_capability_manifests(
+        project_root=str(tmp_path),
+        ids=ids,
+        tasks_data=tasks_data,
+        task_interceptor=task_interceptor,
+    )
+
+    # The second label was still attempted after the first was rejected.
+    assert task_interceptor.update_task.call_count == 2
+    assert [
+        c.args[0] for c in task_interceptor.update_task.call_args_list
+    ] == ['11', '12']
+
+    assert report['stamped'] == ['first', 'second']
+    assert report['missing_labels'] == []
+
+    reloaded = yaml.safe_load(sidecar_path.read_text(encoding='utf-8'))
+    by_label = {t['label']: t['task_id'] for t in reloaded['tasks']}
+    assert by_label == {'first': 11, 'second': 12}
+
+    # The successful sibling must not be tarred by its neighbour's failure.
+    assert len(report['errors']) == 1
+    assert 'first' in report['errors'][0]
+    assert 'second' not in report['errors'][0]
