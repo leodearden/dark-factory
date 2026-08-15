@@ -820,6 +820,7 @@ class ModuleLockTable:
         config: OrchestratorConfig,
         *,
         time_source: Callable[[], float] | None = None,
+        wall_time_source: Callable[[], datetime] | None = None,
     ):
         self._limits: dict[str, int] = {}
         self._held: dict[str, set[str]] = {}  # task_id -> set of held modules
@@ -834,6 +835,15 @@ class ModuleLockTable:
         self._park_install_at: dict[str, str] = {}
         self._config = config
         self._time_source: Callable[[], float] = _resolve_time_source(time_source)
+        # WALL clock for park install stamps (task 3823 / PRD task η).  Distinct
+        # from _time_source (monotonic, no epoch relation): _park_install_at
+        # holds ISO-8601 strings that must be comparable with the Scheduler's
+        # own _wall_now() when park_age_secs() computes an age, and with the
+        # timestamps in the event log.  Resolved through the shared helper so
+        # there is exactly one None-fallback rule for wall clocks.
+        self._wall_time_source: Callable[[], datetime] = _resolve_wall_time_source(
+            wall_time_source
+        )
 
     # --- Hierarchy helpers ---
 
@@ -995,7 +1005,13 @@ class ModuleLockTable:
             for owner in shadow_order
         ]
         if installed:
-            self._park_install_at.setdefault(task_id, datetime.now(UTC).isoformat())
+            # ``setdefault``, not assignment: C7's ``park_age(p)`` is the owner's
+            # TOTAL wait, so a re-install must not reset the clock — a refreshed
+            # stamp would make an indefinitely-starving park read as permanently
+            # fresh and keep admitting backfillers through it.
+            self._park_install_at.setdefault(
+                task_id, self._wall_time_source().isoformat()
+            )
         return installed, shadowed
 
     def _remove_owner(self, task_id: str) -> list[tuple[str, list[str]]]:
@@ -1149,6 +1165,56 @@ class ModuleLockTable:
         return modules, restored
 
     # --- Snapshot helpers (public accessors for observability) ---
+
+    def park_age_secs(self, owner: str, *, now: datetime) -> float | None:
+        """Seconds since *owner* FIRST installed a park, or ``None`` if unknown.
+
+        **``None`` means "age unknown ⇒ the caller must REFUSE".**  This is
+        deliberately the OPPOSITE of the dashboard's ``_park_age_seconds``
+        (dashboard/src/dashboard/data/scheduler.py), which fails soft to ``0``
+        because it is rendering a number for a human and a wrong zero there is
+        a harmless display artefact.  Here the age GATES AN ADMISSION (task
+        3823 / PRD C7 refuses backfill through a park older than
+        ``backfill_max_park_age_secs``), so a soft zero would make an
+        unreadable park look brand new and ADMIT a backfiller through it —
+        fail-soft in the unsafe direction.  The two contracts must disagree;
+        do not "fix" the divergence by consolidating them.
+
+        Reads ``_park_install_at``, which is written once per owner via
+        ``setdefault`` — so this is the owner's TOTAL wait, which is what C7's
+        ``park_age(p)`` means, not the time since its most recent re-park.
+
+        A stamp in the FUTURE clamps to ``0.0`` rather than going negative:
+        a negative age would sail under every ``age > cutoff`` test, so an NTP
+        step backwards would silently re-open admission through arbitrarily
+        old parks.
+
+        This is a READ.  It never evicts a park — task 1228 removed park
+        leases deliberately and nothing here reintroduces wall-clock park
+        death.
+        """
+        raw = self._park_install_at.get(owner)
+        if not raw:
+            return None
+        try:
+            installed_at = datetime.fromisoformat(str(raw).replace('Z', '+00:00'))
+        except (ValueError, TypeError):
+            logger.warning(
+                'park_age_secs: unparseable install stamp %r for park owner %s — '
+                'returning None (age unknown; callers must refuse)',
+                raw, owner,
+            )
+            return None
+        try:
+            return max(0.0, (now - installed_at).total_seconds())
+        except TypeError:
+            # Naive/aware mismatch — same "unknown, refuse" answer as a bad parse.
+            logger.warning(
+                'park_age_secs: cannot compare install stamp %r for park owner %s '
+                'against now=%r — returning None (age unknown)',
+                raw, owner, now,
+            )
+            return None
 
     def snapshot_parks(self) -> dict[str, dict]:
         """Return a snapshot of current parks: ``{task_id: {modules, installed_at}}``.
@@ -1443,7 +1509,16 @@ class Scheduler:
         self._park_stop_clock: Callable[[], float] = (
             monotonic_clock_source if monotonic_clock_source is not None else time.monotonic
         )
-        self.lock_table = ModuleLockTable(config, time_source=self._time_source)
+        # Both clocks are passed down (task 3823 / PRD task η): the monotonic
+        # _time_source as before, and the injectable WALL clock so park install
+        # stamps share one epoch with _emit_lock_event's timestamps and with
+        # the ISO strings in the event log.  Without it, park_age_secs() would
+        # be measuring `Scheduler._wall_now() - <some other clock>`.
+        self.lock_table = ModuleLockTable(
+            config,
+            time_source=self._time_source,
+            wall_time_source=self._wall_now,
+        )
         self.event_store = event_store
         # Module hold-duration predictor (task 3822 / PRD task ζ).  Built
         # unconditionally, BEFORE any event store exists: the Harness
