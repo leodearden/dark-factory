@@ -69,8 +69,10 @@ execution itself (owned by reify H9), and the flip to always-on
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
+import inspect
 import logging
 from pathlib import Path
 from typing import Any, cast
@@ -127,6 +129,15 @@ _MEASURED_SPAWN_LATENCY_SECS = 4.71
 # repo). See `test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling`
 # for the full derivation.
 _MARKERLESS_CEILING_FRACTION = 0.6
+
+# The measured worst-case count of subprocess spawns inside a single
+# `_run_lane` window -- the multiplier `_LANE_PASS_BOUND_SECS`'s floor check
+# is sized against. Measured IN THIS MODULE's
+# `test_ib6_real_infra_runner_over_stub_classified_set_files_fix_task`: 3 git
+# spawns from `_run_once` plus 2 real infra `run_all.sh` spawns. See
+# `test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling` for the
+# full derivation.
+_SPAWNS_PER_LANE_PASS_WORST_CASE = 5
 
 # Default git_overrides for _build_infra_worker — declared with an explicit
 # dict[str, Any] value type (rather than left as an inline dict literal,
@@ -419,18 +430,11 @@ async def _run_lane(
     ``test_every_composing_caller_carries_a_timeout_override`` now enforces
     rather than merely describes.
 
-    WORK-2 VERDICT (task 4030): the six 30.0 defaults derived from this
-    function were re-verified and STAND — they rest on task 3451's 4.71s
-    measurement above, not on the retracted 3491 claim; narrowing them would
-    re-introduce the flake commits 289ae708bb / 80ae271a34 fixed. What the
-    re-verification DID find uncovered was the COMPOSITION: the
-    ``_drive_infra_reds`` chainers were already covered by the task 3832
-    review's markers (commit d34260aef9), but
-    ``test_ib2_infra_run_in_flight_never_gates_merge`` composed this
-    function's 30s bound (raced concurrently by ``wait_entered``, so max not
-    sum) with :func:`_assert_infra_never_a_gate`'s 0.5 + 15.0 SEQUENTIALLY
-    after it — 45.5s — plus unbounded real-git spawns, and carried no
-    override. It does now.
+    The six 30.0 defaults rest on task 3451's measurement above, not on the
+    retracted task 3491 claim — narrowing them would re-introduce the flake
+    commits 289ae708bb / 80ae271a34 fixed. The gap this task (4030) closed
+    was composition coverage (the override rule the preceding paragraph
+    describes), not the bound value itself.
     """
     inner_run_once = worker._run_once
     done = asyncio.Event()
@@ -601,6 +605,39 @@ async def _drive_infra_reds(
 # Timeout-bound invariants (task 4030)
 # ---------------------------------------------------------------------------
 
+# This module's own copy of `test_offline_lane_integration.py`'s helper-name
+# set (see that module for the full rationale). `_drive_infra_reds` replaces
+# `_drive_reds` — this module's own multi-pass chaining helper.
+_LANE_PASS_COMPOSING_HELPER_NAMES = frozenset(
+    {'_run_lane', '_run_one_lane_pass', '_drive_infra_reds'},
+)
+
+
+def _lane_pass_composing_callers(module_globals: dict) -> set[str]:
+    """Names of module-level `test_*` functions whose OWN source calls one of
+    `_LANE_PASS_COMPOSING_HELPER_NAMES` at least once.
+
+    This module's own copy of ``test_offline_lane_integration.py``'s helper
+    of the same name — see that sibling module for the full rationale on why
+    this is AST-based (avoids the false-positive risk of a text/regex scan
+    matching a prose mention) and why it deliberately does not resolve call
+    arguments (a coverage NET, not a worst-case calculator).
+    """
+    callers: set[str] = set()
+    for name, obj in module_globals.items():
+        if not name.startswith('test_') or not inspect.isfunction(obj):
+            continue
+        tree = ast.parse(inspect.getsource(obj))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in _LANE_PASS_COMPOSING_HELPER_NAMES
+            ):
+                callers.add(name)
+                break
+    return callers
+
 
 def test_every_composing_caller_carries_a_timeout_override() -> None:
     """Every test that composes bounded waits PAST a single `_run_lane` pass
@@ -612,15 +649,18 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
     invariant of the same name (these two modules are deliberate lock-step
     siblings — this module's own `_run_lane` docstring says it was "Adapted
     verbatim from test_offline_lane_integration.py"). See that sibling test
-    for the full rationale on why correlation is done via `fn.pytestmark`
-    introspection (pytest's own applied-marker list for a given test
-    function) rather than the coarse `_TIMEOUT_MARKER_RE` file-wide regex
-    scan `test_lane_lock_leak_guard.py`'s sibling invariant uses: that check
-    only needs to know whether ANY `@pytest.mark.timeout` appears ANYWHERE
-    in a file, while this one must correlate a marker to a SPECIFIC test and
-    compare its VALUE against that test's own computed worst case.
+    for the full rationale on: why coverage is DISCOVERED via
+    `_lane_pass_composing_callers` rather than relying solely on a
+    hand-maintained table (a test added tomorrow that calls
+    `_drive_infra_reds(..., 3)` without a marker must fail this test, not
+    pass it silently); why correlation between a marker and a SPECIFIC
+    test's value is done via `fn.pytestmark` introspection rather than the
+    coarse `_TIMEOUT_MARKER_RE` file-wide regex scan
+    `test_lane_lock_leak_guard.py`'s sibling invariant uses; and why a
+    stacked-marker tie-break uses `markers[0]`, matching pytest's own
+    `get_closest_marker` resolution, not `markers[-1]`.
 
-    The table below maps each composing test FUNCTION OBJECT — never a
+    `worst_case_secs` maps each composing test FUNCTION OBJECT — never a
     string, so a rename breaks this test loudly instead of silently dropping
     a row — to its worst-case bounded-wait sum, expressed in terms of this
     module's named timeout constants (never bare literals).
@@ -629,6 +669,11 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
     races a 30s `_run_lane` bound concurrently against `wait_entered` (max,
     not sum), then runs `_assert_infra_never_a_gate`'s 0.5 + 15.0 bounds
     SEQUENTIALLY after it.
+
+    `single_pass_exempt` holds the remaining composing tests (ib1/ib3/ib5/
+    ib6) — each drives exactly one `_run_one_lane_pass` call, so its worst
+    case is a single `_LANE_PASS_BOUND_SECS`, the marker-less budget
+    `test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling` pins.
     """
     worst_case_secs = {
         test_ib4_same_infra_set_recurrence_updates_not_duplicates: 2 * _LANE_PASS_BOUND_SECS,
@@ -638,8 +683,31 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
             + _NOTE_MERGE_ALL_BOUND_SECS
         ),
     }
+    single_pass_exempt = {
+        test_ib1_advance_triggers_from_head_infra_sub_run,
+        test_ib3_confirmed_infra_red_files_normal_fix_task_and_info_escalation,
+        test_ib5_infra_flake_filtered_by_confirmation_rerun,
+        test_ib6_real_infra_runner_over_stub_classified_set_files_fix_task,
+    }
+
+    discovered = _lane_pass_composing_callers(globals())
+    classified = {fn.__name__ for fn in worst_case_secs} | {
+        fn.__name__ for fn in single_pass_exempt
+    }
+    undeclared = discovered - classified
+    assert not undeclared, (
+        f'{sorted(undeclared)} call a pass-composing helper (_run_lane / '
+        f'_run_one_lane_pass / _drive_infra_reds) but are classified in '
+        f'neither worst_case_secs (composes past a single pass; needs its '
+        f'own @pytest.mark.timeout override) nor single_pass_exempt (proven '
+        f'to never exceed one bounded pass), in '
+        f'test_every_composing_caller_carries_a_timeout_override. This is '
+        f'exactly the drift this test exists to catch — classify it as one '
+        f'or the other.'
+    )
+
     for fn, worst_case in worst_case_secs.items():
-        markers = [m for m in fn.pytestmark if m.name == 'timeout']
+        markers = [m for m in getattr(fn, 'pytestmark', []) if m.name == 'timeout']
         assert markers, (
             f'{fn.__name__} composes bounded waits to a worst case of '
             f'{worst_case}s but carries no @pytest.mark.timeout override. '
@@ -650,8 +718,12 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
             f"failing cleanly, discarding _run_lane's own well-located "
             f'TimeoutError. Add @pytest.mark.timeout(N) with N > {worst_case}.'
         )
-        value = markers[0].args[0] if markers[0].args else markers[0].kwargs.get(
-            'timeout', markers[0].kwargs.get('seconds'),
+        value = markers[0].args[0] if markers[0].args else markers[0].kwargs.get('timeout')
+        assert value is not None, (
+            f'{fn.__name__} carries @pytest.mark.timeout(...) but no timeout '
+            f'value could be extracted from it (args={markers[0].args!r}, '
+            f'kwargs={markers[0].kwargs!r}) — cannot verify it clears the '
+            f'{worst_case}s worst case.'
         )
         assert value > worst_case, (
             f'{fn.__name__} carries @pytest.mark.timeout({value}) but its '
@@ -677,11 +749,11 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
     copy of ``test_offline_lane_integration.py``'s invariant of the same
     name (these two modules are deliberate lock-step siblings).
 
-    FLOOR — `_LANE_PASS_BOUND_SECS` must be at least 5x
-    `_MEASURED_SPAWN_LATENCY_SECS` (task 3451's measured worst-case
-    happy-path subprocess spawn latency: n=3, 2.13/3.10/4.71s,
-    load-per-core 6.6). The multiplier of 5 is DERIVED, not guessed, and the
-    measurement lives IN THIS MODULE:
+    FLOOR — `_LANE_PASS_BOUND_SECS` must be at least
+    `_SPAWNS_PER_LANE_PASS_WORST_CASE`x `_MEASURED_SPAWN_LATENCY_SECS` (task
+    3451's measured worst-case happy-path subprocess spawn latency: n=3,
+    2.13/3.10/4.71s, load-per-core 6.6). The multiplier is DERIVED, not
+    guessed, and the measurement lives IN THIS MODULE:
     `test_ib6_real_infra_runner_over_stub_classified_set_files_fix_task`
     below is the measured worst-case count of subprocess spawns inside a
     single `_run_lane` window — `_run_once`'s 3 git spawns (`get_main_sha`,
@@ -689,10 +761,12 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
     `run_all.sh` twice (the initial run and the isolated confirmation
     re-run). Later passes swap `worktree add` for `reset --hard` + `clean
     -xfd` — 4 spawns, still under 5. The sibling numeric module
-    (``test_offline_lane_integration.py``) asserts this SAME relation and
-    cites this module's IB6 test as the shared floor authority, so the two
-    modules' `_LANE_PASS_BOUND_SECS` copies cannot drift from each other
-    without either invariant catching it.
+    (``test_offline_lane_integration.py``) asserts this SAME relation AND
+    additionally imports this module's `_LANE_PASS_BOUND_SECS` to assert
+    equality against its own copy — see that module's version of this test
+    for the check itself — so the two modules' `_LANE_PASS_BOUND_SECS`
+    copies cannot silently drift apart: the floor/ceiling relation alone
+    cannot catch that, since both independently permit the same range.
 
     CEILING — the marker-less worst case (one `_LANE_PASS_BOUND_SECS`, since
     steps 2/4 of task 4030 covered every test that composes past a single
@@ -724,13 +798,14 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
     """
     from test_lane_lock_leak_guard import _effective_per_test_timeout  # noqa: PLC0415
 
-    floor = 5 * _MEASURED_SPAWN_LATENCY_SECS
+    floor = _SPAWNS_PER_LANE_PASS_WORST_CASE * _MEASURED_SPAWN_LATENCY_SECS
     assert floor <= _LANE_PASS_BOUND_SECS, (
-        f'_LANE_PASS_BOUND_SECS ({_LANE_PASS_BOUND_SECS}) must clear 5x the measured '
-        f'worst-case happy-path subprocess spawn latency ({_MEASURED_SPAWN_LATENCY_SECS}s, '
-        f'task 3451: n=3 2.13/3.10/4.71, load-per-core 6.6) = {floor}s. The 5-spawn '
-        f'multiplier is the measured worst-case count of subprocess spawns inside a '
-        f'single _run_lane window (see '
+        f'_LANE_PASS_BOUND_SECS ({_LANE_PASS_BOUND_SECS}) must clear '
+        f'{_SPAWNS_PER_LANE_PASS_WORST_CASE}x the measured worst-case happy-path '
+        f'subprocess spawn latency ({_MEASURED_SPAWN_LATENCY_SECS}s, task 3451: n=3 '
+        f'2.13/3.10/4.71, load-per-core 6.6) = {floor}s. The '
+        f'{_SPAWNS_PER_LANE_PASS_WORST_CASE}-spawn multiplier is the measured worst-case '
+        f'count of subprocess spawns inside a single _run_lane window (see '
         f'test_ib6_real_infra_runner_over_stub_classified_set_files_fix_task below: 3 '
         f'git spawns from _run_once plus 2 real infra run_all.sh spawns).'
     )
