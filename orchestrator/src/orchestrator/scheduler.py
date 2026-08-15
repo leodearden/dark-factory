@@ -88,6 +88,14 @@ _DELIVERED_CHECK_ERROR_LOG_THRESHOLD: int = 20
 # tuned here without a schema migration.
 _FM_READ_FAILURE_ESCALATION_THRESHOLD: int = 12
 
+# EASY-backfill (task 3823 / PRD C7) live-grant map ceiling.  A LEAK
+# BACKSTOP, not a policy limit: one entry per back-filled dispatch that has
+# not yet released, and max_concurrent_tasks keeps the real population orders
+# of magnitude below this.  It exists because a grant whose owner never
+# releases in this process era (crash, lost release) would otherwise pin an
+# entry forever.  Same discipline as the predictor's bounded live-open map.
+_BACKFILL_GRANTS_MAX: int = 512
+
 # Sentinel distinguishing "caller omitted this claimant kwarg" (default,
 # leave the wire argument absent) from "caller explicitly passed None"
 # (clear) on Scheduler.set_task_claimant (task 2188, PRD
@@ -7393,6 +7401,10 @@ class Scheduler:
         # released hours ago.  The whole contract turns on callers telling 0.0
         # from None, so a permanent 0.0 is the worst output this API can give.
         self._hold_history.forget(task_id)
+        # Settle any EASY-backfill grant (task 3823 / PRD C7) AFTER the release
+        # has been recorded above, so the hold this judges is the one the
+        # predictor just closed.
+        self._settle_backfill_grant(task_id)
         if self.event_store:
             for restored_owner, restored_modules in restored_pairs:
                 self.event_store.emit(
@@ -7731,6 +7743,12 @@ class Scheduler:
         instead of assumed.
         """
         stamped = replace(grant, granted_at=self._wall_now().timestamp())
+        if (
+            len(self._backfill_grants) >= _BACKFILL_GRANTS_MAX
+            and stamped.task_id not in self._backfill_grants
+        ):
+            # dict preserves insertion order, so the first key is the oldest.
+            self._backfill_grants.pop(next(iter(self._backfill_grants)), None)
         self._backfill_grants[stamped.task_id] = stamped
         self._backfill_grants_total += 1
         if self.event_store:
@@ -7744,6 +7762,56 @@ class Scheduler:
                     'provable_assembly_delay': stamped.provable_assembly_delay,
                     'park_owners': list(stamped.park_owners),
                     'modules': list(stamped.modules),
+                },
+            )
+
+    def _settle_backfill_grant(self, task_id: str) -> None:
+        """Judge a back-filled hold against the bound its admission promised.
+
+        POPS the grant, so a release called twice (it is, defensively, on some
+        cleanup paths) cannot count one breach twice and quietly inflate the
+        rate that drives the escalation.  A task that never back-filled has no
+        grant and settles to nothing.
+
+        ``realized > admission_bound`` is the breach test: the bound is the
+        promise, and landing exactly on it is the best outcome a prediction
+        can have — counting that as a breach would inflate the very rate the
+        safety factor is meant to be retuned from.
+
+        Emitted directly rather than through ``_emit_lock_event``: that
+        chokepoint is contractually the single writer for ``lock_acquired`` /
+        ``lock_released`` and rejects any other event type.
+
+        Not hooked into ``release_subset``.  A partial release does not end the
+        hold, so settling there would report a realized duration that has not
+        finished happening.
+        """
+        grant = self._backfill_grants.pop(task_id, None)
+        if grant is None:
+            return
+        realized = self._wall_now().timestamp() - grant.granted_at
+        if realized <= grant.admission_bound:
+            return
+        self._backfill_overstay_total += 1
+        overstay = realized - grant.admission_bound
+        logger.info(
+            'backfill overstay task=%s realized=%.1fs bound=%.1fs over=%.1fs '
+            '(predicted=%.1fs x%.2f)',
+            task_id, realized, grant.admission_bound, overstay,
+            grant.predicted_hold, grant.safety_factor,
+        )
+        if self.event_store:
+            self.event_store.emit(
+                EventType.park_backfill_overstay,
+                task_id=task_id,
+                data={
+                    'predicted_hold': grant.predicted_hold,
+                    'safety_factor': grant.safety_factor,
+                    'admission_bound': grant.admission_bound,
+                    'realized_hold': realized,
+                    'overstay_secs': overstay,
+                    'park_owners': list(grant.park_owners),
+                    'modules': list(grant.modules),
                 },
             )
 
