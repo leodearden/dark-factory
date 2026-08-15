@@ -442,3 +442,64 @@ async def test_containment_refuses_traversal_prd_path(tmp_path, caplog, traversa
     message = warning_records[0].getMessage()
     assert 'resolve outside project_root' in message
     assert 'evil-prd.capability-manifest.yaml' in message
+
+
+@pytest.mark.asyncio
+async def test_containment_refusal_is_reported_when_a_safe_sidecar_also_exists(tmp_path):
+    """The *other* half of the containment guard (lines 199-203): when at
+    least one in-root sidecar survives, there IS a report to attach the
+    refusal to, so it surfaces as a report['errors'] entry instead of only
+    a log line. Neither this test nor test_containment_refuses_traversal_
+    prd_path substitutes for the other — they exercise the guard's two
+    structurally distinct exits."""
+    project_root = tmp_path / 'proj'
+    (project_root / 'plans').mkdir(parents=True)
+    outside_dir = tmp_path / 'outside'
+    outside_dir.mkdir()
+    evil_path = outside_dir / 'evil-prd.capability-manifest.yaml'
+    evil_text = _mechanical_sidecar_yaml('evil', ['alpha'])
+    evil_path.write_text(evil_text, encoding='utf-8')
+
+    good_path = project_root / 'plans' / 'good-prd.capability-manifest.yaml'
+    good_path.write_text(_mechanical_sidecar_yaml('good', ['beta']), encoding='utf-8')
+
+    task_interceptor = AsyncMock()
+    task_interceptor.update_task = AsyncMock(return_value={'success': True})
+    ids = ['1', '2']
+    tasks_data = [
+        {
+            'id': '1',
+            'metadata': {'prd_path': '../outside/evil-prd.md', 'prd_task_label': 'alpha'},
+        },
+        {
+            'id': '2',
+            'metadata': {'prd_path': 'plans/good-prd.md', 'prd_task_label': 'beta'},
+        },
+    ]
+
+    report = await stamp_capability_manifests(
+        project_root=str(project_root),
+        ids=ids,
+        tasks_data=tasks_data,
+        task_interceptor=task_interceptor,
+    )
+
+    assert report['path'] == 'plans/good-prd.capability-manifest.yaml'
+    assert report['stamped'] == ['beta']
+    assert report['missing_labels'] == []
+
+    assert len(report['errors']) == 1
+    error_entry = report['errors'][0]
+    assert 'resolved outside project_root, refused' in error_entry
+    assert '../outside/evil-prd.capability-manifest.yaml' in error_entry
+
+    # The escaping file was never read or written back...
+    assert evil_path.read_text(encoding='utf-8') == evil_text
+    # ...while the safe sidecar was stamped.
+    reloaded = yaml.safe_load(good_path.read_text(encoding='utf-8'))
+    assert reloaded['tasks'][0]['task_id'] == 2
+
+    # The escaping task's label was excluded from label_to_task_id
+    # entirely, not merely skipped at write time.
+    task_interceptor.update_task.assert_called_once()
+    assert task_interceptor.update_task.call_args.args[0] == '2'
