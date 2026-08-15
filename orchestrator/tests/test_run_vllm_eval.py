@@ -930,8 +930,8 @@ class TestPerTaskLogFiles:
 # ---------------------------------------------------------------------------
 
 # Bind real time.sleep BEFORE _patch_pod_infra monkeypatches launcher.time.sleep,
-# so helpers that call _REAL_SLEEP directly (test_concurrent_no_result_collision,
-# test_concurrent_stop_on_first_failure_drains, etc.) actually block.
+# so helpers that call _REAL_SLEEP directly (test_concurrent_no_result_collision
+# and other concurrency tests below) actually block.
 _REAL_SLEEP = time.sleep
 
 
@@ -1010,14 +1010,15 @@ def _release_on_summary(monkeypatch, task_id: str) -> threading.Event:
     """Return an Event set once the main loop has processed ``task_id``'s
     summary — a genuine happens-before, not a timing margin.
 
-    ``launcher.log_one_summary`` is called at scripts/run_vllm_eval.py:1591,
-    immediately before the --stop-on-first-failure drain (``remaining = []``)
-    at :1603, in the same ``for fut in done`` iteration. The window can only
-    refill at the top of the NEXT ``while`` iteration (:1570), which cannot
-    run until this iteration — including the drain — has finished on the
-    main thread. So a worker thread that blocks on the returned Event, and
-    only proceeds once it fires, can never be scheduled ahead of the drain,
-    no matter how CPU scheduling delays thread start.
+    ``launcher.log_one_summary`` is called from the refill-at-top /
+    drain-in-body ``while`` loop in the concurrent branch of ``main()``
+    (scripts/run_vllm_eval.py), immediately before the --stop-on-first-failure
+    drain (``remaining = []``), in the same ``for fut in done`` iteration.
+    The submission window can only refill at the top of the NEXT ``while``
+    iteration, which cannot run until this iteration — including the drain —
+    has finished on the main thread. So a worker thread that blocks on the
+    returned Event, and only proceeds once it fires, can never be scheduled
+    ahead of the drain, no matter how CPU scheduling delays thread start.
 
     Do NOT replace this with a sleep: two prior fixes (b94ae82154,
     ca05d20ffa) tuned a duration margin against unbounded thread-start
@@ -1048,6 +1049,105 @@ def _write_n_task_specs(fake_tasks: Path, task_ids: list[str]) -> None:
                 }
             )
         )
+
+
+def _setup_concurrent_fixture(
+    monkeypatch, tmp_path: Path, task_ids: list[str]
+) -> tuple[Path, object]:
+    """Shared RESULTS_DIR / EVAL_LOG_DIR / TASKS_DIR / pod-infra wiring for
+    the ordering-sensitive TestConcurrentLoop tests below.
+
+    Returns ``(results_dir, fake_client)``.
+    """
+    results = tmp_path / "results"
+    monkeypatch.setattr(launcher, "RESULTS_DIR", results)
+    monkeypatch.setattr(launcher, "EVAL_LOG_DIR", tmp_path / "logs")
+
+    fake_tasks = tmp_path / "tasks"
+    _write_n_task_specs(fake_tasks, task_ids)
+    monkeypatch.setattr(launcher, "TASKS_DIR", fake_tasks)
+
+    fake_client = _patch_pod_infra(monkeypatch)
+    return results, fake_client
+
+
+def _capture_summaries(monkeypatch) -> dict:
+    """Patch launcher.print_summary_table to record the final summaries
+    list under ``captured["summaries"]`` while still calling through."""
+    captured: dict = {}
+    real_print = launcher.print_summary_table
+
+    def capture_print(summaries):
+        captured["summaries"] = summaries
+        return real_print(summaries)
+
+    monkeypatch.setattr(launcher, "print_summary_table", capture_print)
+    return captured
+
+
+def _patch_subprocess_gated(
+    monkeypatch,
+    results: Path,
+    *,
+    fail_task: str,
+    gates: dict,
+) -> tuple[list, list]:
+    """Patch launcher.subprocess.run for the ordering-sensitive drain tests
+    below. Returns ``(attempted, gate_timeouts)``.
+
+    Every fake eval invocation appends its task_id to ``attempted``. If
+    ``task_id`` has an entry in ``gates`` (a ``{task_id: threading.Event}``
+    map, typically built with ``_release_on_summary``), the invocation
+    blocks on that Event before completing — this is how the tests below
+    pin adverse completion order deterministically instead of sleeping.
+    The task matching ``fail_task`` completes as a "blocked" outcome with
+    rc=1; every other task completes as a normal "done" outcome with rc=0.
+
+    Gate waits use a 10 s deadlock backstop, but a failed wait is
+    deliberately NOT asserted here. This closure runs on a
+    ThreadPoolExecutor worker thread, and the production loop wraps
+    ``fut.result()`` in ``except Exception``, converting a raised
+    AssertionError into an ``EvalSummary.crashed(...)`` instead of letting
+    it fail the test — so an assert here would be silently swallowed.
+    Instead, a timed-out task_id is appended to the returned
+    ``gate_timeouts`` list; callers MUST assert ``gate_timeouts == []`` on
+    the main thread, after ``launcher.main(...)`` returns, to actually
+    observe a stuck gate.
+    """
+    attempted: list = []
+    gate_timeouts: list = []
+
+    def fake_run(cmd, *args, **kwargs):
+        if (
+            isinstance(cmd, list)
+            and cmd[:4] == ["uv", "run", "orchestrator", "eval"]
+        ):
+            task_arg = cmd[cmd.index("--task") + 1]
+            config_name = cmd[cmd.index("--config-name") + 1]
+            task_id = Path(task_arg).stem
+            attempted.append(task_id)
+
+            gate = gates.get(task_id)
+            if gate is not None and not gate.wait(timeout=10.0):
+                gate_timeouts.append(task_id)
+
+            results.mkdir(parents=True, exist_ok=True)
+            if task_id == fail_task:
+                _write_result(
+                    results,
+                    task_id,
+                    config_name,
+                    "fail00001",
+                    outcome="blocked",
+                    metrics={"cost_usd": 5.0},
+                )
+                return SimpleNamespace(returncode=1)
+            _write_result(results, task_id, config_name, f"r{len(attempted):08d}")
+            return SimpleNamespace(returncode=0)
+        return subprocess.run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(launcher.subprocess, "run", fake_run)
+    return attempted, gate_timeouts
 
 
 class TestConcurrentLoop:
@@ -1220,53 +1320,20 @@ class TestConcurrentLoop:
         the drain tests actually come from the drain, not from some
         incidental effect of the ordering fixture itself.
         """
-        results = tmp_path / "results"
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
-        monkeypatch.setattr(launcher, "EVAL_LOG_DIR", tmp_path / "logs")
-
         task_ids = ["df_task_10", "df_task_11", "df_task_12", "df_task_13", "df_task_14"]
-        fake_tasks = tmp_path / "tasks"
-        _write_n_task_specs(fake_tasks, task_ids)
-        monkeypatch.setattr(launcher, "TASKS_DIR", fake_tasks)
-
-        fake_client = _patch_pod_infra(monkeypatch)
+        results, fake_client = _setup_concurrent_fixture(monkeypatch, tmp_path, task_ids)
+        captured = _capture_summaries(monkeypatch)
 
         # Force the adverse order: df_task_11 cannot even start its body
         # until the main loop has processed df_task_10's summary. No sleeps
         # anywhere below — ordering is pinned by the Event, not by duration.
         released = _release_on_summary(monkeypatch, "df_task_10")
-
-        attempted: list[str] = []
-
-        def fake_run(cmd, *args, **kwargs):
-            if (
-                isinstance(cmd, list)
-                and cmd[:4] == ["uv", "run", "orchestrator", "eval"]
-            ):
-                task_arg = cmd[cmd.index("--task") + 1]
-                config_name = cmd[cmd.index("--config-name") + 1]
-                task_id = Path(task_arg).stem
-                attempted.append(task_id)
-                if task_id == "df_task_11":
-                    assert released.wait(timeout=10.0), (
-                        "df_task_10 summary never observed by the main loop"
-                    )
-                    results.mkdir(parents=True, exist_ok=True)
-                    _write_result(
-                        results,
-                        task_id,
-                        config_name,
-                        "fail00001",
-                        outcome="blocked",
-                        metrics={"cost_usd": 5.0},
-                    )
-                    return SimpleNamespace(returncode=1)
-                results.mkdir(parents=True, exist_ok=True)
-                _write_result(results, task_id, config_name, f"r{len(attempted):08d}")
-                return SimpleNamespace(returncode=0)
-            return subprocess.run(cmd, *args, **kwargs)
-
-        monkeypatch.setattr(launcher.subprocess, "run", fake_run)
+        attempted, gate_timeouts = _patch_subprocess_gated(
+            monkeypatch,
+            results,
+            fail_task="df_task_11",
+            gates={"df_task_11": released},
+        )
 
         rc = launcher.main(
             [
@@ -1281,6 +1348,14 @@ class TestConcurrentLoop:
             ]
         )
 
+        # A stuck gate raises on a worker thread, where the production
+        # loop's `except Exception` around fut.result() would swallow it
+        # into a "crashed" summary instead of failing this test outright
+        # (see _patch_subprocess_gated's docstring) — so both the gate
+        # outcome and the absence of any crashed summary are checked
+        # explicitly here, on the main thread.
+        assert gate_timeouts == [], f"gate(s) never fired: {gate_timeouts}"
+        assert {s.status for s in captured["summaries"]} <= {"done", "blocked"}
         assert rc == 1  # df_task_11 blocked → non-zero exit
         assert fake_client.terminate_calls == ["pod-fake-1"]
         assert set(attempted) == set(task_ids)
@@ -1295,26 +1370,21 @@ class TestConcurrentLoop:
         before it observes the failure and drains.
 
         Contrast with test_concurrent_no_stop_flag_attempts_all_tasks_under_adverse_order
-        above is the point: identical fixture and forced ordering, only the
-        --stop-on-first-failure flag and the attempted set differ. No
-        bound-style assertion (<=3, <=4, "the tail is never attempted")
-        could distinguish this outcome from a regression that deleted the
-        drain entirely — see the baseline above, which shows the undrained
-        trace under the identical ordering is the full {10..14}. This test
-        is green on arrival: it characterizes already-correct production
-        code (scripts/run_vllm_eval.py's refill-at-top / drain-in-body
-        loop), it does not fix a bug.
+        above is the point: it shares this test's df_task_10-before-df_task_11
+        ordering gate and the rest of the fixture, and differs only in the
+        --stop-on-first-failure flag plus the absence of this test's second,
+        drain-specific gate (see ``released_11`` below). No bound-style
+        assertion (<=3, <=4, "the tail is never attempted") could
+        distinguish this outcome from a regression that deleted the drain
+        entirely — see the baseline above, which shows the undrained trace
+        under the shared ordering gate is the full {10..14}. This test is
+        green on arrival: it characterizes already-correct production code
+        (main()'s refill-at-top / drain-in-body loop), it does not fix a
+        bug.
         """
-        results = tmp_path / "results"
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
-        monkeypatch.setattr(launcher, "EVAL_LOG_DIR", tmp_path / "logs")
-
         task_ids = ["df_task_10", "df_task_11", "df_task_12", "df_task_13", "df_task_14"]
-        fake_tasks = tmp_path / "tasks"
-        _write_n_task_specs(fake_tasks, task_ids)
-        monkeypatch.setattr(launcher, "TASKS_DIR", fake_tasks)
-
-        fake_client = _patch_pod_infra(monkeypatch)
+        results, fake_client = _setup_concurrent_fixture(monkeypatch, tmp_path, task_ids)
+        captured = _capture_summaries(monkeypatch)
 
         # Two chained gates, not one. df_task_11 waits for df_task_10's
         # summary (forces the one-sibling-first order). That alone is NOT
@@ -1323,57 +1393,20 @@ class TestConcurrentLoop:
         # df_task_11's failure and trigger a SECOND cascading refill
         # (df_task_13) — this was caught empirically (an earlier version of
         # this test flaked exactly that way under xdist scheduling delay).
-        # So df_task_12 additionally waits for df_task_11's summary before
-        # it is allowed to *complete* (it can still be *submitted* earlier —
-        # only its completion is gated), which pins the drain to have
-        # already run before df_task_12 finishes, closing that window.
+        # So df_task_12 (and any further refill) additionally waits for
+        # df_task_11's summary before it is allowed to *complete* (it can
+        # still be *submitted* earlier — only its completion is gated),
+        # which pins the drain to have already run before df_task_12
+        # finishes, closing that window.
         released_10 = _release_on_summary(monkeypatch, "df_task_10")
         released_11 = _release_on_summary(monkeypatch, "df_task_11")
-
-        attempted: list[str] = []
-
-        def fake_run(cmd, *args, **kwargs):
-            if (
-                isinstance(cmd, list)
-                and cmd[:4] == ["uv", "run", "orchestrator", "eval"]
-            ):
-                task_arg = cmd[cmd.index("--task") + 1]
-                config_name = cmd[cmd.index("--config-name") + 1]
-                task_id = Path(task_arg).stem
-                attempted.append(task_id)
-                if task_id == "df_task_11":
-                    assert released_10.wait(timeout=10.0), (
-                        "df_task_10 summary never observed by the main loop"
-                    )
-                    results.mkdir(parents=True, exist_ok=True)
-                    _write_result(
-                        results,
-                        task_id,
-                        config_name,
-                        "fail00001",
-                        outcome="blocked",
-                        metrics={"cost_usd": 5.0},
-                    )
-                    return SimpleNamespace(returncode=1)
-                if task_id != "df_task_10":
-                    assert released_11.wait(timeout=10.0), (
-                        "df_task_11 summary never observed by the main loop"
-                    )
-                results.mkdir(parents=True, exist_ok=True)
-                _write_result(results, task_id, config_name, f"r{len(attempted):08d}")
-                return SimpleNamespace(returncode=0)
-            return subprocess.run(cmd, *args, **kwargs)
-
-        monkeypatch.setattr(launcher.subprocess, "run", fake_run)
-
-        captured: dict = {}
-        real_print = launcher.print_summary_table
-
-        def capture_print(summaries):
-            captured["summaries"] = summaries
-            return real_print(summaries)
-
-        monkeypatch.setattr(launcher, "print_summary_table", capture_print)
+        gates = {"df_task_11": released_10}
+        gates.update(
+            {tid: released_11 for tid in ("df_task_12", "df_task_13", "df_task_14")}
+        )
+        attempted, gate_timeouts = _patch_subprocess_gated(
+            monkeypatch, results, fail_task="df_task_11", gates=gates
+        )
 
         rc = launcher.main(
             [
@@ -1389,11 +1422,13 @@ class TestConcurrentLoop:
             ]
         )
 
+        assert gate_timeouts == [], f"gate(s) never fired: {gate_timeouts}"
+        assert {s.status for s in captured["summaries"]} <= {"done", "blocked"}
         assert rc == 1
         assert fake_client.terminate_calls == ["pod-fake-1"]
         # One initial wave of 2 (df_task_10, df_task_11) plus exactly one
         # refill (df_task_12) — derived from the loop's refill-at-top /
-        # drain-in-body structure at scripts/run_vllm_eval.py:1567-1602, not
+        # drain-in-body structure (see _release_on_summary's docstring), not
         # fitted to observed output. This is the set a bound-style assertion
         # cannot tell apart from a no-drain regression.
         assert set(attempted) == {"df_task_10", "df_task_11", "df_task_12"}
@@ -1404,82 +1439,19 @@ class TestConcurrentLoop:
 
     def test_concurrent_stop_on_first_failure_drains(self, monkeypatch, tmp_path):
         """Failing task stops the queue but in-flight tasks finish."""
-        results = tmp_path / "results"
-        monkeypatch.setattr(launcher, "RESULTS_DIR", results)
-        monkeypatch.setattr(launcher, "EVAL_LOG_DIR", tmp_path / "logs")
-
         task_ids = ["df_task_10", "df_task_11", "df_task_12", "df_task_13", "df_task_14"]
-        fake_tasks = tmp_path / "tasks"
-        _write_n_task_specs(fake_tasks, task_ids)
-        monkeypatch.setattr(launcher, "TASKS_DIR", fake_tasks)
+        results, fake_client = _setup_concurrent_fixture(monkeypatch, tmp_path, task_ids)
+        captured = _capture_summaries(monkeypatch)
 
-        fake_client = _patch_pod_infra(monkeypatch)
-
-        attempted: list[str] = []
-
-        # Load-bearing happens-before (task 3805): released only once the
-        # main loop has processed df_task_11's (the failure's) summary. In
-        # the production loop, log_one_summary(summary) runs immediately
-        # before the --stop-on-first-failure drain (`remaining = []`) in the
-        # same `for fut in done` iteration (scripts/run_vllm_eval.py:
-        # 1591-1603), and the window can only refill at the top of the NEXT
-        # `while` iteration (:1570). So a sibling that blocks on this Event
-        # cannot complete — and therefore cannot trigger a refill — until
-        # AFTER the drain has already run, deterministically, regardless of
-        # CPU scheduling. The 10s timeout below is only a deadlock backstop,
-        # not the ordering mechanism: the guarantee comes from the Event,
-        # not from timing, so it cannot be "tuned" like a sleep margin. See
-        # _release_on_summary's docstring. Do NOT replace this Event with a
-        # sleep: two prior fixes (b94ae82154, ca05d20ffa) tuned a duration
-        # margin against unbounded thread-start latency and both re-flaked.
+        # Load-bearing happens-before (task 3805): see _release_on_summary's
+        # docstring for why this is a genuine happens-before rather than a
+        # timing margin, and why it must not be replaced with a sleep — two
+        # prior fixes (b94ae82154, ca05d20ffa) tried that and both re-flaked.
         released = _release_on_summary(monkeypatch, "df_task_11")
-
-        def fake_run(cmd, *args, **kwargs):
-            if (
-                isinstance(cmd, list)
-                and cmd[:4] == ["uv", "run", "orchestrator", "eval"]
-            ):
-                task_arg = cmd[cmd.index("--task") + 1]
-                config_name = cmd[cmd.index("--config-name") + 1]
-                task_id = Path(task_arg).stem
-                attempted.append(task_id)
-                if task_id == "df_task_11":
-                    # Simulate failure: write a "blocked" outcome immediately.
-                    # (This comment previously argued that skipping a shared
-                    # sleep made this future "deterministically" win the
-                    # FIRST_COMPLETED race against df_task_10 — that duration
-                    # comparison was falsified in the field twice; see the
-                    # ordering-guarantee comment above `released =
-                    # _release_on_summary(...)` and the falsification note
-                    # near the final assertion below for the full story.)
-                    results.mkdir(parents=True, exist_ok=True)
-                    _write_result(
-                        results,
-                        task_id,
-                        config_name,
-                        "fail00001",
-                        outcome="blocked",
-                        metrics={"cost_usd": 5.0},
-                    )
-                    return SimpleNamespace(returncode=1)
-                assert released.wait(timeout=10.0), (
-                    "drain never observed df_task_11's failure"
-                )
-                results.mkdir(parents=True, exist_ok=True)
-                _write_result(results, task_id, config_name, f"r{len(attempted):08d}")
-                return SimpleNamespace(returncode=0)
-            return subprocess.run(cmd, *args, **kwargs)
-
-        monkeypatch.setattr(launcher.subprocess, "run", fake_run)
-
-        captured: dict = {}
-        real_print = launcher.print_summary_table
-
-        def capture_print(summaries):
-            captured["summaries"] = summaries
-            return real_print(summaries)
-
-        monkeypatch.setattr(launcher, "print_summary_table", capture_print)
+        gates = {tid: released for tid in task_ids if tid != "df_task_11"}
+        attempted, gate_timeouts = _patch_subprocess_gated(
+            monkeypatch, results, fail_task="df_task_11", gates=gates
+        )
 
         rc = launcher.main(
             [
@@ -1495,22 +1467,19 @@ class TestConcurrentLoop:
             ]
         )
 
+        assert gate_timeouts == [], f"gate(s) never fired: {gate_timeouts}"
+        assert {s.status for s in captured["summaries"]} <= {"done", "blocked"}
         assert rc == 1  # one task blocked → non-zero exit
         assert fake_client.terminate_calls == ["pod-fake-1"]
         # Still holds: the loop drains `remaining` on the first observed
         # failure while in-flight work finishes naturally, so the attempted
         # set is exactly the initial wave.
-        # Falsified: the old wording here claimed df_task_11 "always wins
-        # the FIRST_COMPLETED race against df_task_10 by a wide margin ...
-        # deterministic, with no race window left to tolerate" (ca05d20ffa).
-        # That duration-margin claim was disproven in the field on
-        # 2026-08-06 and again on 2026-08-07 under ~24-way xdist load:
-        # completion order is governed by thread START latency, not body
-        # duration, so a duration margin is compared against unbounded
-        # scheduling latency and can always be inverted.
-        # Replaced by: the threading.Event happens-before from task 3805
-        # (`released = _release_on_summary(...)` above), which makes zero
-        # refills the only reachable outcome regardless of scheduling. See
+        # Falsified (ca05d20ffa): the old wording here claimed df_task_11
+        # "always wins the FIRST_COMPLETED race against df_task_10 by a wide
+        # margin ... deterministic, with no race window left to tolerate" —
+        # disproven in the field on 2026-08-06 and again on 2026-08-07 under
+        # ~24-way xdist load. See _release_on_summary's docstring for why a
+        # duration margin can't fix this and what replaces it here; see
         # test_concurrent_stop_on_first_failure_drains_after_sibling_completion
         # for the deterministic reproduction of the inverted order this test
         # used to be vulnerable to.
