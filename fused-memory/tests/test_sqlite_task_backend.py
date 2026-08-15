@@ -3486,6 +3486,87 @@ async def test_v3_to_v4_mixed_db_heals_genuine_while_flagging_ambiguous(tmp_path
     ], residual_groups
 
 
+@pytest.mark.asyncio
+async def test_v3_to_v4_midloop_heal_failure_leaves_no_partial_heal_on_cached_connection(
+    tmp_path,
+):
+    """A heal-loop failure partway through a group (id=3's metadata blob is
+    corrupt, so `_merge_metadata` raises `TaskmasterError` while cancelling
+    it) must not leave id=2's already-executed cancel UPDATE sitting
+    uncommitted on the cached write connection. Without a rollback on the
+    failure path, the very next unrelated successful write -- `_txn` commits
+    with no BEGIN/rollback preamble -- silently flushes that partial heal to
+    disk. This reproduces the reported bug end-to-end through the real
+    backend rather than by calling `_migrate_v3_to_v4` directly.
+    """
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v3_db_with_dup_groups(db_path, [
+        (1, 'Dup task', 'pending', []),   # canonical (lowest id)
+        (2, 'Dup task', 'pending', []),   # cancel target #1 -- metadata None, UPDATE succeeds
+        (3, 'Dup task', 'pending', []),   # cancel target #2 -- corrupted below, raises
+    ])
+    # Corrupt id=3's blob directly rather than widening the shared seeding
+    # helper. Files must stay empty on every row (see module docstring on
+    # _make_v3_db_with_dup_groups / plan rationale): _files_for_key falls
+    # back to [] on a malformed blob, so the corrupt row only recomputes to
+    # the group's stored candidate_key -- and stays classified `heal` rather
+    # than `title_divergent` -- when that key was itself computed from an
+    # empty files list.
+    corrupt_conn = sqlite3.connect(str(db_path))
+    corrupt_conn.execute("UPDATE tasks SET metadata = '{not json' WHERE tag='master' AND id=3")
+    corrupt_conn.commit()
+    corrupt_conn.close()
+
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    b = SqliteTaskBackend(cfg)
+    await b.start()
+    try:
+        # Drives connection-open (_migrate); must NOT raise (never-raise
+        # contract) even though the heal loop below raises mid-group.
+        await b.get_tasks(project_root=project_root)
+
+        # The very next unrelated successful write -- exactly the "later
+        # flushed" scenario from the bug report. A title distinct from
+        # 'Dup task' so the write-path dedup guard doesn't reject it.
+        add_result = await b.add_task(project_root=project_root, title='unrelated follow-up')
+
+        # Read through an INDEPENDENT connection while the backend is still
+        # open, so only durably committed rows are visible -- uncommitted
+        # writes on the backend's own cached connection are invisible here
+        # by construction.
+        check_conn = sqlite3.connect(str(db_path))
+        try:
+            statuses = dict(
+                check_conn.execute(
+                    "SELECT id, status FROM tasks WHERE tag='master' AND id IN (1,2,3)",
+                ),
+            )
+            unrelated_status = check_conn.execute(
+                "SELECT status FROM tasks WHERE tag='master' AND id=?",
+                (int(add_result['id']),),
+            ).fetchone()
+            user_version = check_conn.execute('PRAGMA user_version').fetchone()[0]
+            indexes = {row[1] for row in check_conn.execute('PRAGMA index_list(tasks)')}
+        finally:
+            check_conn.close()
+    finally:
+        await b.close()
+
+    # RED today: id=2's cancel rides in on the unrelated write's commit, so
+    # this comes back {1: 'pending', 2: 'cancelled', 3: 'pending'}.
+    assert statuses == {1: 'pending', 2: 'pending', 3: 'pending'}, (
+        f'a later unrelated write flushed a partial self-heal onto disk: {statuses}'
+    )
+    # The rollback must scope itself to the failed migration only -- it must
+    # not eat the caller's own unrelated write.
+    assert unrelated_status is not None and unrelated_status[0] == 'pending', unrelated_status
+    # Unchanged pre-existing behaviour on a failed migration pass -- guards
+    # against over-correcting.
+    assert user_version == 3, user_version
+    assert not any('candidate_key' in idx for idx in indexes), indexes
+
+
 # ── rebuild-without-restart: live re-audit (task 2402) ──────────────────
 
 
