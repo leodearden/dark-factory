@@ -561,3 +561,69 @@ async def test_multiple_sidecars_processes_lexicographically_first(tmp_path):
 
     task_interceptor.update_task.assert_called_once()
     assert task_interceptor.update_task.call_args.args[0] == '8'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'rejection_resp',
+    [
+        {'success': False, 'error': 'status_via_update_task', 'task_id': '2'},
+        {'error': 'backlog exceeded', 'error_type': 'ReconciliationBacklogExceeded'},
+        {},
+    ],
+    ids=['write_authority', 'backlog_no_success_key', 'bare_empty_dict'],
+)
+async def test_rejected_update_task_write_is_recorded_not_silently_dropped(
+    tmp_path, caplog, rejection_resp
+):
+    """The interceptor_write_succeeded(resp) rejection branch (lines
+    353-364), parametrized over the three rejection shapes that helper's
+    own docstring documents (task_interceptor.py:5840-5861) — each defeats
+    a different clause of its boolean expression: the write-authority
+    shape defeats `resp.get('success', True)`, the no-success-key backlog
+    shape defeats `not resp.get('error')`, and the bare {} defeats
+    `bool(resp)`. A rejected write must be recorded loudly, not silently
+    dropped — but it must NOT roll back the sidecar stamp already
+    committed to disk (that asymmetry is itself worth pinning: the two
+    writes — sidecar stamp, task metadata — can diverge)."""
+    plans_dir = tmp_path / 'plans'
+    plans_dir.mkdir()
+    sidecar_path = plans_dir / 'good-prd.capability-manifest.yaml'
+    sidecar_path.write_text(_mechanical_sidecar_yaml('good', ['beta']), encoding='utf-8')
+
+    task_interceptor = AsyncMock()
+    task_interceptor.update_task = AsyncMock(return_value=rejection_resp)
+    ids = ['2']
+    tasks_data = [
+        {
+            'id': '2',
+            'metadata': {'prd_path': 'plans/good-prd.md', 'prd_task_label': 'beta'},
+        },
+    ]
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.server.manifest_stamping'):
+        report = await stamp_capability_manifests(
+            project_root=str(tmp_path),
+            ids=ids,
+            tasks_data=tasks_data,
+            task_interceptor=task_interceptor,
+        )
+
+    assert report['path'] == 'plans/good-prd.capability-manifest.yaml'
+    # The rejection must NOT retroactively empty stamped.
+    assert report['stamped'] == ['beta']
+    assert report['missing_labels'] == []
+
+    # A rejected metadata write does NOT roll back the already-committed
+    # sidecar stamp.
+    reloaded = yaml.safe_load(sidecar_path.read_text(encoding='utf-8'))
+    assert reloaded['tasks'][0]['task_id'] == 2
+
+    assert len(report['errors']) == 1
+    error_entry = report['errors'][0]
+    assert 'update_task rejected delivered_checks write' in error_entry
+    assert "'beta'" in error_entry
+    assert 'task 2' in error_entry
+
+    warning_records = [r for r in caplog.records if r.levelname == 'WARNING']
+    assert any('rejected delivered_checks write' in r.getMessage() for r in warning_records)
