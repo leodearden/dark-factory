@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import shared.reify_checkout as reify_checkout
 from shared.locking import (
     EXTENSIONLESS_FILENAMES,
     FILE_EXTENSIONS,
@@ -305,6 +306,46 @@ def _tracked_file_paths(repo_root: Path) -> list[str] | None:
     """Tracked NON-GITLINK paths under *repo_root*, or None if not a checkout."""
     entries = _tracked_entries(repo_root)
     return None if entries is None else entries[0]
+
+
+class TestReifyCheckoutAdapter:
+    """`_resolve_reify_checkout` — this module's binding to the shared resolver."""
+
+    def test_resolver_delegates_to_the_shared_single_source(self, tmp_path, monkeypatch):
+        """The ancestor walk must live in ONE place — shared.reify_checkout.
+
+        Deliberately white-box, and deliberately the only genuinely-RED
+        assertion available for what is otherwise a behaviour-preserving
+        refactor: in the ``.worktrees/<id>`` layout this suite normally runs
+        in, ``parents[5]`` already resolves correctly, so every BLACK-BOX
+        assertion in this file stays green both before and after this module
+        grows its own copy of the ancestor walk — a faithful local duplicate
+        would satisfy them all while defeating the single-sourcing this task
+        exists to establish (the task's "do not each grow a private copy of
+        the resolver" directive). What this pin buys is that a SECOND copy of
+        the walk cannot quietly reappear in this file.
+        """
+        sentinel = tmp_path / 'sentinel-reify'
+        start = tmp_path / 'dark-factory' / 'shared' / 'tests' / 'test_x.py'
+        seen = {}
+
+        def _stub(marker, start=None):
+            seen['marker'] = Path(marker)
+            seen['start'] = start
+            return reify_checkout.ReifyCheckout(sentinel, False)
+
+        monkeypatch.setattr(reify_checkout, 'resolve_reify_checkout', _stub)
+
+        assert _resolve_reify_checkout(start).root == sentinel, (
+            'this module must DELEGATE to '
+            'shared.reify_checkout.resolve_reify_checkout rather than keep a '
+            'private copy of the ancestor walk'
+        )
+        assert seen['marker'] == _REIFY_GUARD_RELPATH, (
+            'the shared resolver must be bound to THIS call site marker '
+            f'(expected {_REIFY_GUARD_RELPATH}, got {seen.get("marker")})'
+        )
+        assert seen['start'] == start
 
 
 class TestNormalizeLock:
