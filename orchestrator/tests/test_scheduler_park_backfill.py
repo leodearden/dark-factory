@@ -31,6 +31,7 @@ import ast
 import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -39,6 +40,9 @@ from _recording_event_store import _RecordingEventStore
 from orchestrator import scheduler as scheduler_module
 from orchestrator.config import OrchestratorConfig
 from orchestrator.scheduler import Scheduler, _BackfillGrant
+
+if TYPE_CHECKING:  # the fake below is duck-typed; the real class is only a type
+    from escalation.queue import EscalationQueue
 
 FIXED_DT = datetime(2026, 8, 1, 0, 0, 0, tzinfo=UTC)
 
@@ -1282,7 +1286,10 @@ def _escalating_scheduler(**queue_kwargs):
     clock = _Clock()
     scheduler = _make_scheduler(clock=clock, event_store=_RecordingEventStore())
     queue = _FakeEscalationQueue(**queue_kwargs)
-    scheduler.escalation_queue = queue
+    # The fake implements exactly the three members the filer touches
+    # (has_open_l1 / make_id / submit); the cast is the stand-in, not a claim
+    # that it is a full EscalationQueue.
+    scheduler.escalation_queue = cast('EscalationQueue', queue)
     return scheduler, clock, queue
 
 
