@@ -305,8 +305,19 @@ async def _run_lane(
     measured worst-case single subprocess spawn latency at 4.71s on this
     host under load; a caller can easily need several spawns inside this
     window. Same load-sensitive full-suite-flake class as
-    1335/1836/2819/3451/3491 (task 3832); 30s is the ceiling task 3491
-    settled on for it. Widening THIS bound alone can never make a broken
+    1335/1836/2819/3451/3491 (task 3832). FLOOR (task 3451): worst-case
+    happy-path subprocess spawn latency measured at 4.71s (n=3:
+    2.13/3.10/4.71, load-per-core 6.6) — this, not task 3491, is the genuine
+    precedent for ``_LANE_PASS_BOUND_SECS``. CEILING: the 60s global
+    pytest-timeout (``orchestrator/pyproject.toml``, ``timeout_method =
+    "thread"``, ``--max-worker-restart=0``). Task 3491 is precedent AGAINST
+    a bound near that ceiling, not for one: it REJECTED a 30s ceiling for
+    this exact collision and landed ``asyncio.wait_for(..., timeout=5)``
+    instead (``test_usage_gate.py``:328,790) — its scope was exclusively
+    ``test_usage_gate.py``; it never touched any offline-lane module. Both
+    halves are pinned executably by
+    ``test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling``
+    below. Widening THIS bound alone can never make a broken
     staging pass — it only lengthens how long a genuinely broken SINGLE pass
     takes to fail. That safety property does not compose for free: callers
     chaining N passes (:func:`_drive_reds`) sum this bound N times, so a
@@ -317,8 +328,22 @@ async def _run_lane(
     ``orchestrator/pyproject.toml``'s ``timeout``/``timeout_method``
     comment). Multi-pass callers whose worst-case sum is at or above that
     ceiling carry their own ``@pytest.mark.timeout`` override — see
-    ``test_b5_same_set_recurrence_updates_not_duplicates`` and
-    ``test_b7_stall_promotes_to_blocker`` below.
+    ``test_b5_same_set_recurrence_updates_not_duplicates``,
+    ``test_b7_stall_promotes_to_blocker``, and ``test_b3_never_a_gate``
+    below — a rule ``test_every_composing_caller_carries_a_timeout_override``
+    now enforces rather than merely describes.
+
+    WORK-2 VERDICT (task 4030): the six 30.0 defaults derived from this
+    function were re-verified and STAND — they rest on task 3451's 4.71s
+    measurement above, not on the retracted 3491 claim; narrowing them would
+    re-introduce the flake commits 289ae708bb / 80ae271a34 fixed. What the
+    re-verification DID find uncovered was the COMPOSITION: the
+    ``_drive_reds`` chainers were already covered by the task 3832 review's
+    markers (commit d34260aef9), but ``test_b3_never_a_gate`` composed this
+    function's 30s bound (raced concurrently by ``wait_entered``, so max not
+    sum) with :func:`_assert_never_a_gate`'s 0.5 + 15.0 SEQUENTIALLY after it
+    — 45.5s — plus unbounded real-git spawns, and carried no override. It
+    does now.
     """
     inner_run_once = worker._run_once
     done = asyncio.Event()
