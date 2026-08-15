@@ -13,12 +13,30 @@ Design decisions:
 - Each test reaps any residual leaked connection from a *prior* test before
   measuring, matching test_async_mock_coroutine_isolation.py's own
   flush-before-measure pattern for drain_async_mock_coroutines().
+
+Task 4075 adds the "PytestUnhandledThreadExceptionWarning promotion" section
+at the bottom of this module. The reaper above is only the FIRST line of
+defence; the promotion is the backstop that makes a *degraded* reaper loud
+instead of silent (see reap_leaked_aiosqlite_connections()'s MAINTENANCE
+NOTE). The backstop contract lives here, next to the reaper it backs, so a
+future reader auditing the leak defence sees both halves at once.
 """
 from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import warnings
+from pathlib import Path
 
 import aiosqlite
 import pytest
 from _orch_helpers import reap_leaked_aiosqlite_connections
+
+try:  # pragma: no cover - the ImportError branch is a pytest-rename tripwire
+    from _pytest.config import apply_warning_filters
+except ImportError:  # pragma: no cover
+    apply_warning_filters = None
 
 
 @pytest.mark.asyncio
@@ -97,4 +115,316 @@ def test_autouse_reap_fixture_is_active(request):
         '_reap_leaked_aiosqlite_connections must be registered as an autouse '
         'fixture in conftest.py so it runs after every test and closes any '
         'leaked aiosqlite connection before the per-test event loop closes.'
+    )
+
+
+# ---------------------------------------------------------------------------
+# PytestUnhandledThreadExceptionWarning promotion (task 4075)
+#
+# The reaper above prevents the leak; this section pins the backstop for when
+# the reaper itself stops working. reap_leaked_aiosqlite_connections()'s
+# MAINTENANCE NOTE documents that the helper degrades to a silent no-op
+# (returns 0) if aiosqlite renames ``_running`` / ``_thread`` /
+# ``core._connection_worker_thread``. In that degraded state the leak still
+# happens: a leaked worker thread raises ``RuntimeError: Event loop is
+# closed`` and pytest's threadexception plugin attributes it to whatever
+# innocent test is running at the time. Unless that warning is an ERROR, the
+# suite stays green and nobody finds out. Both
+# ``_orch_helpers.reap_leaked_aiosqlite_connections`` and
+# ``conftest._reap_leaked_aiosqlite_connections`` promise in prose that
+# orchestrator/pyproject.toml makes it an error — these three guards are what
+# keep that promise checkable instead of aspirational.
+# ---------------------------------------------------------------------------
+
+#: Resolved from THIS FILE, never from the process CWD: the merge-verify
+#: harness runs pytest from the ``orchestrator/`` cwd
+#: (dark-factory-orchestrator.yaml:142) while a plain ``pytest
+#: orchestrator/tests`` runs from the repo root, and this contract must hold
+#: identically under both. Same idiom as
+#: test_warm_lane_bash_bucket_placement.py:58-61.
+ORCH_DIR = Path(__file__).resolve().parents[1]
+ORCH_PYPROJECT = ORCH_DIR / 'pyproject.toml'
+
+#: The exact ``filterwarnings`` entry these guards pin. Anchored on the
+#: CATEGORY alone (empty message field) because the thread-exception message
+#: is a formatted traceback with no stable substring to anchor on — and
+#: because this is already the spelling shipped at
+#: shared/tests/test_async_sqlite_base.py:596.
+PROMOTION_ENTRY = 'error::pytest.PytestUnhandledThreadExceptionWarning'
+
+#: Environment keys stripped from the subprocess probes below. ``GIT_*``
+#: follows test_warm_lane_bash_bucket_placement.py:74-86's ``_sanitized_env``
+#: discipline (an inherited git pointer would aim the child at the wrong
+#: tree). ``PYTEST_ADDOPTS`` is load-bearing for a different reason: an
+#: inherited value carrying its own flags would override the child's
+#: ``-o addopts=`` and re-introduce ``-n auto``, making the probe slow and its
+#: exit code ambiguous.
+_HOSTILE_ENV_KEYS = frozenset({
+    'GIT_DIR',
+    'GIT_WORK_TREE',
+    'GIT_INDEX_FILE',
+    'PYTEST_ADDOPTS',
+    'PYTEST_CURRENT_TEST',
+})
+
+#: A test whose only sin is letting a thread die with an exception — exactly
+#: the shape a degraded reaper leaves behind, minus the aiosqlite machinery.
+_PROBE_TEST_SOURCE = '''\
+import threading
+
+
+def _boom():
+    raise RuntimeError('df-4075 probe')
+
+
+def test_thread_raises():
+    t = threading.Thread(target=_boom, name='df-4075-probe-thread')
+    t.start()
+    t.join()
+'''
+
+#: The CONTROL arm's inifile: structurally identical, deliberately declaring
+#: no ``filterwarnings``. It is what attributes the treatment arm's failure to
+#: the promotion entry rather than to anything ambient in the environment.
+_CONTROL_INIFILE_SOURCE = '''\
+[tool.pytest.ini_options]
+addopts = ""
+'''
+
+
+def _sanitized_env() -> dict[str, str]:
+    """``os.environ`` minus the keys that would contaminate a probe."""
+    return {k: v for k, v in os.environ.items() if k not in _HOSTILE_ENV_KEYS}
+
+
+def _require_orchestrator_inifile(pytestconfig) -> None:
+    """Skip unless orchestrator/pyproject.toml governs this run.
+
+    MANDATORY for every pin in this section. pytest reads exactly ONE
+    ``[tool.pytest.ini_options]`` — the rootdir's inifile — and never merges
+    across workspace members (the repo-root pyproject.toml documents this at
+    its own lines 50-56). The root inifile declares no ``filterwarnings`` at
+    all, so under a root-bound run (``pytest orchestrator/tests`` from the
+    repo root, ``-c pyproject.toml``, or an arg set spanning two subprojects)
+    ``getini('filterwarnings')`` is empty and an unguarded pin would
+    FALSE-FAIL on an invocation artifact rather than on drift.
+
+    The merge-verify command is ``cd orchestrator && uv run pytest tests/``
+    (dark-factory-orchestrator.yaml:142), which IS orchestrator-bound, so this
+    guard never weakens the hot path. Skip-vs-fail split and message shape
+    copied from test_lane_lock_leak_guard.py:1346-1365, which solved the
+    identical problem for the ``timeout`` ini key.
+    """
+    governing_inifile = pytestconfig.inipath
+    if governing_inifile is not None and governing_inifile.resolve() == ORCH_PYPROJECT:
+        return
+    pytest.skip(
+        f'the governing inifile for this run is {governing_inifile!r}, not '
+        f'{ORCH_PYPROJECT} — the {PROMOTION_ENTRY!r} promotion lives in the '
+        f'latter and pytest reads exactly one inifile (never merging across '
+        f'workspace members), so this is an invocation artifact (e.g. a '
+        f'root-bound run), not drift'
+    )
+
+
+def _require_apply_warning_filters():
+    """Return ``_pytest.config.apply_warning_filters``, or fail LOUDLY.
+
+    Deliberately NOT ``pytest.skip``. This task exists because a documented
+    safety net was absent and nothing said so; a guard that skips itself away
+    on a private-API rename would reproduce that failure mode one level up —
+    the pin would go quietly green-by-absence exactly when pytest internals
+    moved, which is precisely when the promotion most needs re-verification.
+    Same loud-on-rename idiom as
+    shared/tests/test_async_sqlite_base.py::_ensure_real_conn_closed_at_exit.
+    """
+    if apply_warning_filters is None:
+        raise AssertionError(
+            '_pytest.config.apply_warning_filters no longer imports — pytest '
+            'has renamed or moved its warning-filter parser. This is NOT a '
+            'reason to skip: the promotion pinned by this module can only be '
+            "checked through pytest's own parser, and a pytest internals "
+            'change is exactly when it most needs re-checking. Update the '
+            f'guarded import at the top of {Path(__file__).name} to the new '
+            'API (task 4075).'
+        )
+    return apply_warning_filters
+
+
+def test_pyprojects_filterwarnings_promotes_unhandled_thread_exceptions(pytestconfig):
+    """orchestrator/pyproject.toml's ``filterwarnings`` promotes the warning to an error.
+
+    The SOURCE pin: it reads the EFFECTIVE ``getini('filterwarnings')`` list
+    and runs it through pytest's own parser, rather than doing a ``tomllib``
+    string match on the file. This repo has already ruled twice that
+    "configured" means the effective ``getini(...)`` value and not file text —
+    test_marker_registration_drift.py::test_conftest_registered_markers_count_as_registered
+    and test_lane_lock_leak_guard.py::_effective_per_test_timeout (task 3836
+    review amendment) — and using ``apply_warning_filters`` also avoids
+    re-implementing the ``action:message:category:module:lineno`` grammar,
+    whose ``:`` field separator is already a documented footgun in
+    pyproject.toml's own comment block.
+    """
+    _require_orchestrator_inifile(pytestconfig)
+    apply = _require_apply_warning_filters()
+
+    ini_filters = list(pytestconfig.getini('filterwarnings'))
+
+    with warnings.catch_warnings():
+        warnings.resetwarnings()
+        warnings.simplefilter('always')
+        # Passing [] for cmdline_filters is LOAD-BEARING, not laziness: a
+        # stray ``-W error::pytest.PytestUnhandledThreadExceptionWarning`` on
+        # the command line must NOT satisfy this pin, because the claim being
+        # checked is that *orchestrator/pyproject.toml* does the promoting —
+        # that is what _orch_helpers.py and conftest.py tell their readers.
+        apply(ini_filters, [])
+        # stacklevel is immaterial to the outcome (the pinned entry anchors on
+        # the CATEGORY with an empty module field, so it matches regardless of
+        # the attributed frame); it is set only to satisfy ruff's B028.
+        try:
+            warnings.warn(
+                pytest.PytestUnhandledThreadExceptionWarning('df-4075 probe'), stacklevel=2
+            )
+        except pytest.PytestUnhandledThreadExceptionWarning:
+            promoted = True
+        else:
+            promoted = False
+
+    # pytest.fail rather than pytest.raises: DID NOT RAISE carries none of the
+    # diagnostic below, and this failure needs to tell its reader exactly what
+    # to restore (same register as test_lane_lock_leak_guard.py's drift fail).
+    if not promoted:
+        pytest.fail(
+            f'{ORCH_PYPROJECT} does not promote '
+            f'pytest.PytestUnhandledThreadExceptionWarning to an error. '
+            f'Effective [tool.pytest.ini_options] filterwarnings for this run: '
+            f'{ini_filters!r}. Add the entry {PROMOTION_ENTRY!r} to that list. '
+            f'Without it a leaked aiosqlite worker thread raising '
+            f'"RuntimeError: Event loop is closed" is a mere warning attributed '
+            f'to an innocent test, so a degraded '
+            f'reap_leaked_aiosqlite_connections() (see its MAINTENANCE NOTE) '
+            f'leaks silently and the suite stays green. Both that helper and '
+            f'conftest._reap_leaked_aiosqlite_connections document this '
+            f'promotion as fact — restore the entry, or correct both '
+            f'docstrings. Task 4075.'
+        )
+
+
+def test_the_promotion_is_in_effect_for_this_run(pytestconfig):
+    """The promotion is live in the run actually happening, not just in the file.
+
+    The IN-EFFECT pin. No filter manipulation at all: pytest's own
+    ``catch_warnings_for_item`` context is active during a test body and has
+    already applied the ini filters, so warning here exercises the real
+    configuration. This catches an invocation that silences the promotion for
+    this run (``-W ignore::pytest.PytestUnhandledThreadExceptionWarning``,
+    ``-p no:warnings``) even though the ini text is still correct — a state
+    the source pin above cannot see.
+    """
+    _require_orchestrator_inifile(pytestconfig)
+
+    # stacklevel only satisfies ruff's B028 — see the note in the source pin.
+    try:
+        warnings.warn(
+            pytest.PytestUnhandledThreadExceptionWarning('df-4075 probe'), stacklevel=2
+        )
+    except pytest.PytestUnhandledThreadExceptionWarning:
+        return
+
+    pytest.fail(
+        f'pytest.PytestUnhandledThreadExceptionWarning is NOT an error in this '
+        f'run, even though {ORCH_PYPROJECT} is the governing inifile. Either '
+        f'the {PROMOTION_ENTRY!r} entry is missing from '
+        f'[tool.pytest.ini_options] filterwarnings, or this invocation '
+        f'disabled it (-W ignore::..., -p no:warnings, an outer PYTEST_ADDOPTS). '
+        f'Either way the backstop documented by '
+        f'reap_leaked_aiosqlite_connections() is not protecting this run. '
+        f'Task 4075.'
+    )
+
+
+@pytest.mark.timeout(120)
+def test_a_thread_exception_actually_fails_a_test_under_this_projects_inifile(
+    tmp_path, pytestconfig
+):
+    """A real thread exception really does fail a real test under our inifile.
+
+    The END-TO-END non-vacuity pin. The two pins above prove a filter is
+    registered and active; neither can see whether pytest still routes thread
+    exceptions through ``warnings.warn`` at all. On pytest 9.0.3 it does —
+    ``_pytest/threadexception.py::collect_thread_exception`` calls
+    ``warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))`` inside
+    a ``try/except PytestUnhandledThreadExceptionWarning`` and re-raises out of
+    the ``trylast`` ``pytest_runtest_setup``/``call``/``teardown`` hooks — but a
+    future pytest that changed that would leave the ini entry INERT and the two
+    docstrings false again, which is the exact failure class task 4075 exists
+    to close.
+
+    Two arms over the same probe file: the TREATMENT run under
+    orchestrator/pyproject.toml must FAIL, and the CONTROL run under a
+    ``filterwarnings``-free inifile must PASS. The control is what attributes
+    the treatment failure to the promotion entry rather than to anything
+    ambient. Precedent for a live subprocess non-vacuity probe:
+    test_warm_lane_bash_bucket_placement.py's ``--collect-only`` probe, cited
+    approvingly by test_marker_registration_drift.py::test_the_sweep_is_not_vacuous.
+    """
+    _require_orchestrator_inifile(pytestconfig)
+
+    probe = tmp_path / 'test_df4075_thread_probe.py'
+    probe.write_text(_PROBE_TEST_SOURCE)
+    control_inifile = tmp_path / 'pyproject.toml'
+    control_inifile.write_text(_CONTROL_INIFILE_SOURCE)
+
+    def _run(inifile: Path) -> subprocess.CompletedProcess:
+        # ``-o addopts=`` clears the inifile's own addopts so the probe does
+        # not drag in ``-n auto --dist loadgroup -m 'not warm_lane_bash'``;
+        # ``-p no:cacheprovider`` keeps the child from writing a .pytest_cache.
+        return subprocess.run(
+            [
+                sys.executable, '-m', 'pytest', str(probe),
+                '-c', str(inifile),
+                '-o', 'addopts=',
+                '-p', 'no:cacheprovider',
+                '-q',
+            ],
+            capture_output=True,
+            text=True,
+            cwd=str(tmp_path),
+            env=_sanitized_env(),
+        )
+
+    control = _run(control_inifile)
+    assert control.returncode == 0, (
+        f'CONTROL ARM BROKEN — the probe was expected to PASS under a '
+        f'filterwarnings-free inifile, but exited {control.returncode}. The '
+        f'probe or its harness is at fault, not the promotion; this run cannot '
+        f'attribute anything. stdout:\n{control.stdout}\nstderr:\n{control.stderr}'
+    )
+
+    treatment = _run(ORCH_PYPROJECT)
+    combined = treatment.stdout + treatment.stderr
+    assert treatment.returncode != 0, (
+        f'a test whose thread died with an unhandled RuntimeError PASSED under '
+        f'{ORCH_PYPROJECT} (exit 0). The same probe also passes under a '
+        f'filterwarnings-free control inifile, so the {PROMOTION_ENTRY!r} entry '
+        f'is either missing or has gone INERT (e.g. a pytest release that no '
+        f'longer routes thread exceptions through warnings.warn — see '
+        f'_pytest/threadexception.py::collect_thread_exception). This is the '
+        f'backstop reap_leaked_aiosqlite_connections() documents; without it a '
+        f'leaked aiosqlite worker thread is a warning nobody reads. '
+        f'Task 4075.\noutput:\n{combined}'
+    )
+    assert 'PytestUnhandledThreadExceptionWarning' in combined, (
+        f'the probe failed under {ORCH_PYPROJECT}, but not for the reason this '
+        f'pin claims — the output never mentions '
+        f'PytestUnhandledThreadExceptionWarning, so the failure is incidental '
+        f'and the pin is not measuring the promotion.\noutput:\n{combined}'
+    )
+    assert 'df-4075-probe-thread' in combined, (
+        f'the probe failed under {ORCH_PYPROJECT} with a '
+        f'PytestUnhandledThreadExceptionWarning, but the output does not name '
+        f'the probe thread (df-4075-probe-thread), so the failure may come '
+        f'from some other thread rather than the one this test '
+        f'started.\noutput:\n{combined}'
     )
