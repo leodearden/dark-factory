@@ -1162,7 +1162,11 @@ def test_a_snapshot_cannot_be_built_without_an_inventory():
     about who else held the card at the moment the reading was taken.  An
     optional inventory would read downstream as "nobody else was there"."""
     with pytest.raises(ValidationError):
-        lms_vram.GpuSnapshot(
+        # The omission is the assertion: `consumers` is deliberately absent so
+        # pydantic rejects the construction at runtime.  pyright sees the same
+        # missing required argument statically, which is the very thing under
+        # test, so the diagnostic is suppressed here rather than satisfied.
+        lms_vram.GpuSnapshot(  # pyright: ignore[reportCallIssue]
             identity=lms_vram.GpuIdentity(
                 name='NVIDIA GeForce RTX 3090', driver_version='580.95.05',
             ),
