@@ -931,9 +931,13 @@ class ReconReportState:
         post-:meth:`complete` mutation guard.
 
         If the incoming ``project_id`` differs from the retained entry's,
-        the ORIGINAL is kept (mirrors :meth:`complete`'s different-summary
-        handling) and the divergence is surfaced in both the response
-        ``warning`` and the logged message.
+        the ORIGINAL is kept and the divergence is surfaced in the response
+        ``warning`` and the logged message — AND, fully mirroring
+        :meth:`complete`'s different-summary handling, appended to
+        ``entry.summary_warnings`` and persisted, so a genuine cross-project
+        run_id collision is visible to every ``get_assembled_report`` reader,
+        not only the process log. A pure repeat with no divergence stays a
+        zero-store-write no-op.
 
         One deliberate exception to "mutate nothing": if ``self._active``
         has NO entry for ``run_id`` at all, the repeat call REPAIRS
@@ -950,19 +954,29 @@ class ReconReportState:
         set is overwritten) and restores usability.
 
         The pointer is NEVER stolen from a different, currently-active
-        stage of the same run — i.e. the repair only fires when
-        ``self._active.get(run_id) is None``, never when it already names
-        a different stage. Re-pointing at an earlier stage would itself be
-        a corruption channel: a confused agent naming stage 1 while stage
-        2 is live would silently redirect stage 2's findings into stage
-        1's entry and close the wrong stage — the exact cross-stage
-        corruption this guard closes elsewhere.
+        stage of the same run BY THIS REPEAT-CALL BRANCH — i.e. for as long
+        as the earlier stage's entry is still resident in ``self._state``,
+        the repair only fires when ``self._active.get(run_id) is None``,
+        never when it already names a different stage. Re-pointing at an
+        earlier stage would itself be a corruption channel: a confused agent
+        naming stage 1 while stage 2 is live would silently redirect stage
+        2's findings into stage 1's entry and close the wrong stage — the
+        exact cross-stage corruption this guard closes elsewhere.
 
         This guard is keyed solely on ``(run_id, stage)`` PRESENCE in
         ``self._state`` — it deliberately does not (and cannot, without a
         known-stage vocabulary) police a stage name that does not yet exist
         for this run; that remains a legal fresh-create, matching a normal
-        stage transition within a run.
+        stage transition within a run. Consequently the never-stolen
+        guarantee above LAPSES once the earlier stage's entry evicts from
+        ``self._state`` (TTL past :meth:`complete`, via :meth:`tick`): a
+        call naming that now-absent ``(run_id, stage)`` no longer matches
+        ``existing is not None`` below, so it takes the fresh-create path,
+        which unconditionally sets ``self._active[run_id] = stage`` — still
+        capable of stealing the pointer from a different, live stage of the
+        same run. Closing that residual needs the same known-stage
+        vocabulary this docstring already disclaims; it is an explicit scope
+        boundary of this guard (task 3988), not a guarantee made here.
         """
         existing = self._state.get((run_id, stage))
         if existing is not None:
@@ -972,11 +986,19 @@ class ReconReportState:
                 f'existing report ({len(existing.findings)} finding(s), '
                 f'completed={existing.completed_at is not None}) — call ignored.'
             )
+            needs_persist = False
             if project_id != existing.project_id:
                 warning += (
                     f' project_id mismatch: incoming {project_id!r} != '
                     f'retained {existing.project_id!r}; retained project_id kept.'
                 )
+                # Fully mirror complete()'s different-summary handling: record
+                # the divergence ON THE ENTRY (not just this transient
+                # response), so get_assembled_report's summary_warnings
+                # surfaces a genuine cross-project run_id collision to every
+                # downstream reader, not only the process log.
+                existing.summary_warnings.append(warning)
+                needs_persist = True
             logger.warning(
                 'recon_report: start_report called again for an existing entry '
                 'run_id=%r stage=%r (findings=%d completed=%s incoming_project_id=%r '
@@ -990,11 +1012,14 @@ class ReconReportState:
             )
             # Repair-only exception (see docstring): adopt the pointer ONLY
             # when the run has no active stage at all; never steal it from a
-            # different, currently-active stage. Persist ONLY on this
-            # repair, so a pure no-op repeat still performs zero store
-            # writes.
+            # different, currently-active stage. Persist ONLY on this repair
+            # or the project_id-divergence branch above, so a pure no-op
+            # repeat (no divergence, pointer intact) still performs zero
+            # store writes.
             if self._active.get(run_id) is None:
                 self._active[run_id] = stage
+                needs_persist = True
+            if needs_persist:
                 self._persist_run(run_id)
             return {
                 'run_id': run_id,
