@@ -2695,6 +2695,100 @@ def test_claim_lease_held_by_live_holder_warn_and_proceed_policy(tmp_path: Path)
     assert sr.LeaseHolder.from_json(lease_path.read_text()) == original
 
 
+# --- LeaseClaim.holder_session_state (task 3994 defect 4) -----------------
+#
+# The escape hatch's evidence. A lease whose holder pid is dead AND whose
+# session record is absent/exited is very probably ORPHANED — and a
+# stand-down that silently honours it is exactly the "23 pending L2 items,
+# no consumer for hours" failure. This field is DIAGNOSTIC ONLY: the lease
+# file stays authoritative, because auto-stealing on a dead-looking holder
+# is the duplicate-spawn incident path.
+
+
+def _contend(tmp_path: Path, *, holder_slug: str, holder_pid: int) -> sr.LeaseClaim:
+    """Seed a lease for (holder_slug, holder_pid) and return a contender's claim."""
+    held = sr.LeaseHolder(session_slug=holder_slug, pid=holder_pid, start_ts=_NOW.isoformat())
+    sr.claim_lease('watcher-df', holder=held, root=tmp_path, now=_NOW)
+    _set_mtime(sr.lease_path_for_name('watcher-df', root=tmp_path), _NOW, timedelta(seconds=42))
+    contender = sr.LeaseHolder(session_slug='watcher-df-200', pid=os.getpid(), start_ts=_NOW.isoformat())
+    return sr.claim_lease('watcher-df', holder=contender, root=tmp_path, now=_NOW)
+
+
+def test_holder_session_state_is_absent_when_the_holder_has_no_record(tmp_path: Path) -> None:
+    claim = _contend(tmp_path, holder_slug='watcher-df-100', holder_pid=_DEAD_PID)
+    assert claim.holder_session_state == 'absent'
+
+
+@pytest.mark.parametrize('status', [sr.Status.EXITED, sr.Status.FAILED_TO_START])
+def test_holder_session_state_is_exited_for_a_terminal_record(
+    tmp_path: Path, status: sr.Status
+) -> None:
+    sr.write_record(_make_record(session_slug='watcher-df-100', status=status), root=tmp_path)
+
+    claim = _contend(tmp_path, holder_slug='watcher-df-100', holder_pid=_DEAD_PID)
+
+    assert status in sr.TERMINAL_STATUSES
+    assert claim.holder_session_state == 'exited'
+
+
+def test_holder_session_state_is_live_for_a_non_terminal_record(tmp_path: Path) -> None:
+    sr.write_record(
+        _make_record(session_slug='watcher-df-100', status=sr.Status.RUNNING), root=tmp_path
+    )
+
+    claim = _contend(tmp_path, holder_slug='watcher-df-100', holder_pid=_DEAD_PID)
+
+    assert claim.holder_session_state == 'live'
+
+
+def test_holder_session_state_is_unknown_for_an_unparseable_record(tmp_path: Path) -> None:
+    record_path = sr.record_path_for_slug('watcher-df-100', root=tmp_path)
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    record_path.write_text('{not valid json')
+
+    claim = _contend(tmp_path, holder_slug='watcher-df-100', holder_pid=_DEAD_PID)
+
+    assert claim.holder_session_state == 'unknown'
+
+
+def test_holder_session_state_is_unknown_for_a_corrupt_lease_body(tmp_path: Path) -> None:
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    lease_path.parent.mkdir(parents=True, exist_ok=True)
+    lease_path.write_text('{not valid json')
+    _set_mtime(lease_path, _NOW, timedelta(seconds=42))
+
+    contender = sr.LeaseHolder(session_slug='watcher-df-200', pid=os.getpid(), start_ts=_NOW.isoformat())
+    claim = sr.claim_lease('watcher-df', holder=contender, root=tmp_path, now=_NOW)
+
+    assert claim.holder is None
+    assert claim.holder_session_state == 'unknown'
+
+
+def test_holder_session_state_resolution_is_fail_soft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _boom(*_args: object, **_kwargs: object) -> sr.SessionRecord:
+        raise OSError('session registry substrate on fire')
+
+    monkeypatch.setattr(sr, 'read_record', _boom)
+
+    # A session-registry read fault must never break a lease claim.
+    claim = _contend(tmp_path, holder_slug='watcher-df-100', holder_pid=_DEAD_PID)
+
+    assert claim.decision == sr.LeaseDecision.STAND_DOWN
+    assert claim.holder_session_state == 'unknown'
+
+
+def test_holder_session_state_of_a_freshly_acquired_lease_is_live(tmp_path: Path) -> None:
+    holder = sr.LeaseHolder(session_slug='watcher-df-100', pid=os.getpid(), start_ts=_NOW.isoformat())
+
+    claim = sr.claim_lease('watcher-df', holder=holder, root=tmp_path, now=_NOW)
+
+    # The acquirer is itself, and it is by construction running.
+    assert claim.acquired is True
+    assert claim.holder_session_state == 'live'
+
+
 # --- claim_lease: stale-lease reap-and-reclaim + the AND boundary --------
 
 
