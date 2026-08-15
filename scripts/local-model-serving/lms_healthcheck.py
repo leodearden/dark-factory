@@ -851,7 +851,24 @@ def probe_arm(arm: ArmEntry) -> ProbeResult:
 #: floor was widened to count attribute values: the widening is right for
 #: alpha's question but discards a real signal, and eta needs to see whether an
 #: arm promoted entities to nodes or buried them in attributes.
-REPORT_SCHEMA_VERSION = 4
+#: v5 (2026-08-15, task 3755): the vram block carries WHO ELSE held the card at
+#: each reading, and whether the arithmetic can be attributed to the arm at all.
+#: `used - baseline` is the arm's footprint only if nothing else moved between
+#: the two readings; up to v4 nothing recorded whether that held, so a slate run
+#: with ollama resident (measured 2026-08-06: 10314 MiB on keep_alive) produced
+#: an artifact indistinguishable from a clean one.
+REPORT_SCHEMA_VERSION = 5
+
+#: Appended to a POLLUTED block's reason.  The observation alone is not enough:
+#: `arm_footprint_mib` is the headline number of this very block, and a reader
+#: who took it at face value would attribute another process's memory to the
+#: arm.  Spelling the field name means a grep for it finds this caveat too.
+POLLUTED_FOOTPRINT_NOTE = (
+    'arm_footprint_mib in this block is therefore NOT attributable to the arm '
+    'and neither is the verdict computed from it: the measurement is void, not '
+    'merely unflattering, and nothing was learned about this arm. Free the card '
+    'and measure again'
+)
 
 #: The delivered-check literal for task 3713.  Spelled once, here, and carried
 #: into the JSON artifact as a field.
@@ -957,6 +974,34 @@ class VramBlock(BaseModel):
     verdict: Verdict
     reason: str
 
+    # -- v5 (task 3755): who else held the card, and is the arithmetic sound? --
+    #
+    # EVERY field below carries a default, and the defaults exist for exactly
+    # ONE reason: the committed v4 artifact is evidence of a real past run and
+    # must keep validating through this model.  They are NOT a fallback for a
+    # live run -- `run_healthcheck` populates all five on every path, and
+    # `test_this_producer_never_emits_the_unmeasured_sentinel` holds it to that.
+    #
+    # The sentinels are chosen so an unmeasured artifact reads as unmeasured
+    # rather than as clean.  `pollution` is the load-bearing one: an empty
+    # consumer list is genuinely AMBIGUOUS (this host's baseline really does
+    # hold 3312 MiB with zero CUDA compute apps, because graphics contexts are
+    # invisible to `--query-compute-apps`), so "was anyone looked for?" is
+    # answered by UNMEASURED and never by list emptiness.
+
+    #: Compute apps holding the card at the pre-start baseline reading.
+    baseline_consumers: list[lms_vram.GpuConsumer] = []
+    #: Compute apps holding it at the probe reading, the arm's own container
+    #: included -- it is indistinguishable from any other `python` here.
+    probe_consumers: list[lms_vram.GpuConsumer] = []
+    #: What those two lists are and are not.  Carried as a FIELD because JSON
+    #: has no comments and the lists do not sum to `used_mib`.
+    consumer_inventory_note: str = ''
+    #: Whether the delta between the two readings can be attributed to the arm.
+    pollution: lms_vram.PollutionState = lms_vram.PollutionState.UNMEASURED
+    #: Empty when CLEAN.  Names the offending process and the consequence.
+    pollution_reason: str = ''
+
 
 class HealthReport(BaseModel):
     model_config = ConfigDict(frozen=True)
@@ -984,7 +1029,7 @@ def run_healthcheck(
     arms: Sequence[ArmEntry],
     gpu_probe: Callable[[], lms_vram.GpuSnapshot] | None = None,
     probe: Callable[[ArmEntry], ProbeResult] | None = None,
-    baseline: lms_vram.GpuReading | None = None,
+    baseline: lms_vram.GpuBaseline | None = None,
 ) -> HealthReport:
     """Probe every arm and assemble the report.
 
@@ -993,6 +1038,17 @@ def run_healthcheck(
     reads `used 0 MiB, headroom 19.5 GiB` -- a passing budget with maximal
     headroom off a dead probe, which is the most trustworthy-looking wrong
     answer this rig can emit.  No report at all is strictly better.
+
+    A POLLUTED BASELINE propagates for the same reason (task 3755).  If a
+    foreign process held the card when the baseline was taken, its memory is
+    built into the number every footprint is subtracted from, and no arithmetic
+    downstream can undo that.  ``lms_ctl.start`` already refuses to record such
+    a baseline; this catches one that predates that guard or was written by
+    hand, because the resulting report would be shaped exactly like a good one.
+
+    Probe-time pollution is different and is NOT fatal: the report is still the
+    honest record of what was seen, so it is emitted with `pollution` POLLUTED
+    and a reason, and the exit code carries the refusal.
 
     Individual arm failures, by contrast, are recorded and the sweep continues:
     aborting on the first dead arm would drop verdicts already measured for the
@@ -1007,15 +1063,29 @@ def run_healthcheck(
     # the same reason a dead GPU probe does: without the reading taken before
     # these arms started, the report cannot say what the arms took, only what
     # the card holds -- and that was the miscalibrated subject esc-3713-6 fixed.
-    base = baseline if baseline is not None else lms_vram.read_baselines(
+    base = baseline if baseline is not None else lms_vram.read_baseline_records(
         [arm.arm_id for arm in arms]
     )
+    polluted_baseline = lms_vram.unexpected_baseline_consumers(base.consumers)
+    if polluted_baseline:
+        raise lms_vram.PollutedBaselineError(
+            polluted_baseline,
+            context=(
+                'refusing to report against a polluted baseline recorded at '
+                f'{base.measured_at.isoformat()}'
+            ),
+        )
     budget = lms_vram.evaluate_budget(
         reading.used_mib,
         reading.total_mib,
-        baseline_mib=base.used_mib,
-        baseline_free_mib=base.free_mib,
+        baseline_mib=base.reading.used_mib,
+        baseline_free_mib=base.reading.free_mib,
     )
+    pollution, pollution_reason = lms_vram.classify_pollution(
+        base.consumers, snapshot.consumers
+    )
+    if pollution is lms_vram.PollutionState.POLLUTED:
+        pollution_reason = f'{pollution_reason}. {POLLUTED_FOOTPRINT_NOTE}'
 
     measured_at = _now_iso()
     rows: list[ArmRow] = []
@@ -1056,6 +1126,11 @@ def run_healthcheck(
         headroom_gib=budget.headroom_gib,
         verdict=budget.verdict,
         reason=budget.reason,
+        baseline_consumers=base.consumers,
+        probe_consumers=snapshot.consumers,
+        consumer_inventory_note=lms_vram.CONSUMER_INVENTORY_NOTE,
+        pollution=pollution,
+        pollution_reason=pollution_reason,
     )
 
     everything_passed = (
