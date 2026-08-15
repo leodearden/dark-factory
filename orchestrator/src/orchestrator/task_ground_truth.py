@@ -25,6 +25,16 @@ That task deliberately rewires NO veto site: ``_shape``'s
 ``has_open_escalation = bool(report.open_escalations)``, ``classify_recovery``
 and the ``_RECOVERY`` table are unchanged, and making that boolean
 pin-class-aware is task eta (3541).
+
+Task 3563 normalised the OTHER side of that comparison: :class:`Claimant`'s
+``run_id`` is now homogeneous across all three liveness sources — a full
+``shared.task_claimant.compose_claimant_run_id`` identity or ``None``
+(unknown), never a bare ``session_id``. See the :class:`Claimant` docstring
+for the normative contract. This is disposition-neutral by construction: no
+production consumer reads ``Claimant.run_id`` at all (every read is a
+presence check or a ``.source`` check), so it changes no recovery outcome —
+it only makes the field COMPARABLE by ``escalation.pins``, which is what
+makes live-vs-dead filer discrimination reachable at all.
 """
 
 from __future__ import annotations
@@ -38,7 +48,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import ValidationError
 from shared.deploy_state import DeployPhase, DeployState
-from shared.task_claimant import is_stranded
+from shared.task_claimant import compose_claimant_run_id, is_stranded
 from shared.task_statuses import TaskStatus
 
 from orchestrator.artifacts import TaskArtifacts
@@ -112,11 +122,46 @@ class BranchState:
 
 @dataclass(frozen=True)
 class Claimant:
-    """A live claimant identity, folded from one of three liveness signals."""
+    """A live claimant identity, folded from one of three liveness signals.
+
+    ``run_id`` CONTRACT (task 3563) — normative, all three sources:
+    it is either a FULL ``shared.task_claimant.compose_claimant_run_id``
+    identity (``'{run_id}/{session_id}/pid={owner_pid}'``) or ``None``,
+    meaning UNKNOWN.  It is never a bare ``session_id`` and never partially
+    composed.  Per source:
+
+    * DB — the ``claimant_run_id`` column, already composed at dispatch, kept
+      VERBATIM.
+    * PLAN_LOCK — composed here from the lock's ``run_id``/``session_id``/
+      ``owner_pid``, which ``TaskArtifacts.lock_plan`` records in the same
+      process that stamps the DB claimant, making the two byte-identical for
+      one incarnation.  ``None`` when any component is missing or malformed:
+      legacy locks written before 3563 carry no ``run_id``, and harness-less
+      workflows have none to record.
+    * IN_MEMORY — always ``None``; the scheduler's held-set carries no
+      identity.
+
+    Composing PARTIALLY would be worse than the bare session id this replaced:
+    ``'/{session_id}/pid={pid}'`` carries the ``/pid=`` marker, so it PASSES
+    ``escalation.pins._norm_id``'s shape guard and then string-mismatches every
+    DB-composed filing identity — which ``classify_pins`` reads as "a DIFFERENT
+    incarnation is live", converting a genuinely LIVE filer's L0 to DEAD_L0.
+    A format mismatch is not proof the filer is dead; ``None`` (unknown) fails
+    safe to pinning, a wrong-but-well-shaped identity does not.
+
+    ``session_id`` carries the RAW id only when the source knows it directly —
+    i.e. PLAN_LOCK.  It stays ``None`` for DB on purpose: ``shared.task_claimant``
+    ships a composer and DELIBERATELY no parser (the identity is compared whole,
+    never decomposed), so this resolver must not split a composed identity to
+    back-fill it.  Defaulted so every existing construction site keeps working —
+    the same additive-widening pattern task 3533 used on :class:`EscalationRef`.
+    It MUST stay last: ``run_id``/``heartbeat_at``/``source`` have no defaults.
+    """
 
     run_id: str | None
     heartbeat_at: str | None
     source: ClaimantSource
+    session_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -208,6 +253,22 @@ def _pid_alive(pid: int) -> bool:
         return True
     except OSError:
         return False
+
+
+def _known_str(value: object) -> str | None:
+    """Return *value* VERBATIM if it is a non-blank ``str``, else ``None``.
+
+    The "is this component KNOWN?" test for the plan.lock claimant identity
+    (task 3563).  A plan.lock is untrusted input — it can be hand-edited, or
+    written by an older orchestrator — so a component may be absent, blank, or
+    not a string at all; every one of those is UNKNOWN, and an identity with an
+    unknown component must not be composed (see :class:`Claimant`).
+
+    Returns the value UNSTRIPPED so a composed identity embeds exactly the
+    bytes the writer recorded, keeping it byte-identical to the DB claimant
+    stamp built from those same components.
+    """
+    return value if isinstance(value, str) and value.strip() else None
 
 
 def _lock_fresh(locked_at: object, now: datetime, ttl: timedelta) -> bool:
@@ -422,7 +483,11 @@ class TaskGroundTruth:
            staleness cross-check guards against a PID-reuse false-live read,
            review finding) — consulted ONLY when the db claimant is
            genuinely absent (pre-2182 rows predating the claimant_run_id/
-           heartbeat_at columns).
+           heartbeat_at columns).  Its ``run_id`` is COMPOSED here from the
+           lock's own run_id/session_id/owner_pid, or left ``None`` when any
+           component is missing or malformed — see the :class:`Claimant`
+           docstring for why a partial composition is never acceptable
+           (task 3563).
 
         A present-but-stale db claimant (``is_stranded`` True) collapses
         straight to ``None`` — it deliberately does NOT fall through to the
@@ -488,16 +553,37 @@ class TaskGroundTruth:
         # test_reconcile_lock_format_variants[non-dict-json]).
         if isinstance(lock_data, dict):
             owner_pid = lock_data.get('owner_pid')
+            # Retain the PARSED pid: the composed identity below must embed the
+            # same int this liveness check validated, not a re-parse of the raw
+            # value (which could be e.g. the string '123', composing a
+            # different byte sequence than the DB stamp's int).
+            parsed_pid: int | None = None
             try:
-                owner_alive = owner_pid is not None and _pid_alive(int(owner_pid))
+                parsed_pid = None if owner_pid is None else int(owner_pid)
+                owner_alive = parsed_pid is not None and _pid_alive(parsed_pid)
             except (TypeError, ValueError):
+                parsed_pid = None
                 owner_alive = False
             lock_fresh = _lock_fresh(lock_data.get('locked_at'), self.now_fn(), self.heartbeat_ttl)
             if owner_alive and lock_fresh:
+                # Compose ONLY when every component is known and well-formed;
+                # otherwise the identity is UNKNOWN (None). A partial
+                # composition would be well-shaped but WRONG — see the
+                # Claimant docstring (task 3563).
+                lock_run_id = _known_str(lock_data.get('run_id'))
+                lock_session_id = _known_str(lock_data.get('session_id'))
+                composed = (
+                    compose_claimant_run_id(lock_run_id, lock_session_id, parsed_pid)
+                    if lock_run_id is not None
+                    and lock_session_id is not None
+                    and parsed_pid is not None
+                    else None
+                )
                 return Claimant(
-                    run_id=lock_data.get('session_id'),
+                    run_id=composed,
                     heartbeat_at=lock_data.get('locked_at'),
                     source=ClaimantSource.PLAN_LOCK,
+                    session_id=lock_session_id,
                 )
         return None
 
