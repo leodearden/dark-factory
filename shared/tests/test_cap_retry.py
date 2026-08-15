@@ -97,6 +97,9 @@ def _mock_gate(**overrides) -> MagicMock:
     ``detect_cap_hit`` / ``confirm`` / ``settle`` / ``report`` methods proxy
     to the corresponding gate attributes — so tests can still assert on
     ``gate.detect_cap_hit.call_args``, ``gate.confirm_account_ok``, etc.
+    ``detect_cap_hit(...)`` mirrors production
+    :meth:`InvokeSlot.detect_cap_hit`: on a truthy hit it calls
+    ``release_probe_slot`` and then settles (task 4096).
     ``report(outcome)`` (task W4-ε, PRD §7.4) mirrors the production
     dispatch-then-settle contract of :meth:`InvokeSlot.report`.
 
@@ -148,6 +151,11 @@ def _mock_gate(**overrides) -> MagicMock:
                     stderr, output, backend, oauth_token=slot.token,
                 )
                 if hit:
+                    # Mirrors production InvokeSlot.detect_cap_hit (task 4096):
+                    # settling suppresses the __aexit__ safety net, so the probe
+                    # claim is released here. Real gate makes this a guarded
+                    # no-op once the account is already CAPPED.
+                    gate.release_probe_slot(slot.token)
                     slot._settled = True
                 return hit
 
@@ -224,27 +232,90 @@ def test_mock_gate_defaults_include_release_probe_slot():
     )
 
 
-async def test_mock_gate_report_cap_hit_releases_probe_slot():
-    """_mock_gate's report(CapHit) must call release_probe_slot, mirroring
-    production InvokeSlot.report (task 4096).
+# ---------------------------------------------------------------------------
+# Probe-release fidelity: production InvokeSlot vs. both MagicMock doubles
+# ---------------------------------------------------------------------------
+#
+# ``_mock_gate`` above and the shipped ``shared.testing.make_gate_mock`` each
+# hand-reimplement ``InvokeSlot``'s dispatch, so both can silently drift from
+# production — exactly what task 4096 found (both modelled the pre-fix CapHit
+# arm, which stranded the PROBE_IN_FLIGHT claim on a scoped cap). A test that
+# restates a double's body can only fail when someone edits that double, i.e.
+# at the moment they'd edit the test too. So instead: drive a REAL
+# ``UsageGate``-backed ``InvokeSlot`` and each double through the SAME outcome
+# script and assert their ``release_probe_slot`` call counts agree. A
+# production-side change that no one mirrors into the doubles fails this.
 
-    assert_called_once_with (not just assert_called) also proves __aexit__ did
-    NOT double-release: the double settles in its ``finally``, so exactly one
-    call is correct.
+_FIDELITY_CAP_STDERR = "You've hit your usage limit resets in 3h"
+
+# (id, drive(slot), expected release_probe_slot calls) — one entry per arm
+# that InvokeSlot dispatches, covering BOTH entry points (report /
+# detect_cap_hit). Counts are whole-``async with`` totals, so they also pin
+# that the ``__aexit__`` safety net does not double-release a settled slot.
+_PROBE_RELEASE_SCRIPT = [
+    ('report_ok', lambda slot: slot.report(OK()), 0),
+    ('report_cap_hit', lambda slot: slot.report(CapHit(resets_at=None, reason='cap')), 1),
+    ('report_near_cap', lambda slot: slot.report(NearCap(reason='close to limit')), 1),
+    ('report_auth_failed', lambda slot: slot.report(AuthFailed(status=401)), 0),
+    ('report_failure', lambda slot: slot.report(Failure(kind='boom')), 1),
+    ('detect_cap_hit', lambda slot: slot.detect_cap_hit(_FIDELITY_CAP_STDERR, ''), 1),
+]
+
+
+def _release_calls(mock, token) -> tuple[int, bool]:
+    """(call count, every call passed *token*) for a release_probe_slot mock."""
+    calls = mock.call_args_list
+    return len(calls), all(c == call(token) for c in calls)
+
+
+async def _production_releases(drive) -> tuple[int, bool]:
+    """Run *drive* against a production InvokeSlot over a real UsageGate."""
+    # wait_for_reset=False so the CAPPED arm does not spawn a resume-probe
+    # background task; shutdown() below drains the auth-reprobe one anyway.
+    gate = make_gate(['a'], wait_for_reset=False)
+    try:
+        with patch.object(
+            gate, 'release_probe_slot', wraps=gate.release_probe_slot,
+        ) as spy:
+            async with gate.invoke_slot() as slot:
+                token = slot.token
+                drive(slot)
+        return _release_calls(spy, token)
+    finally:
+        await gate.shutdown()
+
+
+async def _double_releases(factory, drive) -> tuple[int, bool]:
+    """Run *drive* against one of the MagicMock gate doubles.
+
+    ``detect_cap_hit=True`` makes the double return the same verdict the real
+    classifier returns for ``_FIDELITY_CAP_STDERR``, so both parties run the
+    same script; it is inert for the ``report`` steps.
     """
-    gate = _mock_gate()
+    gate = factory(detect_cap_hit=MagicMock(return_value=True))
     async with gate.invoke_slot() as slot:
-        slot.report(CapHit(resets_at=None, reason='cap'))
-    gate._handle_cap_detected.assert_called_once()
-    gate.release_probe_slot.assert_called_once_with('tok')
+        drive(slot)
+    return _release_calls(gate.release_probe_slot, 'tok')
 
 
-async def test_make_gate_mock_report_cap_hit_releases_probe_slot():
-    """Same contract for the shipped shared.testing.make_gate_mock double."""
-    gate = make_gate_mock()
-    async with gate.invoke_slot() as slot:
-        slot.report(CapHit(resets_at=None, reason='cap'))
-    gate.release_probe_slot.assert_called_once_with('tok')
+@pytest.mark.parametrize(
+    ('drive', 'expected'),
+    [(drive, expected) for _id, drive, expected in _PROBE_RELEASE_SCRIPT],
+    ids=[_id for _id, _drive, _expected in _PROBE_RELEASE_SCRIPT],
+)
+async def test_gate_doubles_match_production_probe_release(drive, expected):
+    """Both doubles must release the probe claim exactly when production does.
+
+    Comparing against a real gate (not against the doubles' own source) is what
+    makes this detect drift rather than restate it. The bool in each tuple
+    asserts every release carried that party's own slot token.
+    """
+    parties = {
+        'production': await _production_releases(drive),
+        '_mock_gate': await _double_releases(_mock_gate, drive),
+        'make_gate_mock': await _double_releases(make_gate_mock, drive),
+    }
+    assert parties == dict.fromkeys(parties, (expected, True))
 
 
 # Shared patch targets

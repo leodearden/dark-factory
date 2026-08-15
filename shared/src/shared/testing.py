@@ -49,7 +49,10 @@ def make_gate_mock(**overrides) -> MagicMock:
     async-context-manager per call. ``__aenter__`` yields a slot whose
     ``detect_cap_hit``, ``confirm``, ``settle``, ``report`` methods proxy back
     to the gate — so tests can still assert on ``gate.detect_cap_hit.call_args``,
-    ``gate.confirm_account_ok.assert_called_with(...)``, etc. ``report(outcome)``
+    ``gate.confirm_account_ok.assert_called_with(...)``, etc.
+    ``detect_cap_hit(...)`` mirrors production :meth:`InvokeSlot.detect_cap_hit`:
+    on a truthy hit it calls ``release_probe_slot`` and then settles
+    (task 4096). ``report(outcome)``
     (task W4-ε, PRD §7.4) mirrors production :meth:`InvokeSlot.report`'s
     dispatch-then-settle contract: OK→``confirm_account_ok``,
     CapHit→``_handle_cap_detected``+``release_probe_slot`` (task 4096),
@@ -98,6 +101,11 @@ def make_gate_mock(**overrides) -> MagicMock:
                     oauth_token=slot.token,
                 )
                 if hit:
+                    # Mirrors production InvokeSlot.detect_cap_hit (task 4096):
+                    # settling suppresses the __aexit__ safety net, so the probe
+                    # claim is released here. Real gate makes this a guarded
+                    # no-op once the account is already CAPPED.
+                    gate.release_probe_slot(slot.token)
                     slot._settled = True
                 return hit
 
