@@ -102,8 +102,21 @@ class TestSharedRegistryRegistration:
         assert isinstance(model.deploy_state, DeployState)  # type: ignore[attr-defined]
         assert model.deploy_state.phase == DeployPhase.SCHEDULED  # type: ignore[attr-defined]
 
-    def test_parse_metadata_invalid_deploy_state_slice_yields_one_warning(self) -> None:
+    # Since task 4142 the two malformed shapes are classified apart. This key
+    # registers with no explicit cardinality (shared/src/shared/deploy_state.py),
+    # so it takes the fail-closed 'dict' default: a LIST value is a
+    # declared-shape violation caught before dispatch (`wrong_cardinality`),
+    # while every other non-mapping value (str, int, …) stays on the untouched
+    # splat -> TypeError -> `invalid_submodel` path. Both keep the same
+    # warn-never-raise-under-read / retain-raw policy.
+    def test_parse_metadata_list_deploy_state_slice_yields_one_warning(self) -> None:
         _model, warnings = parse_metadata({'deploy_state': [1, 2]}, direction='read')
+        assert len(warnings) == 1
+        assert warnings[0].field == 'deploy_state'
+        assert warnings[0].code == 'wrong_cardinality'
+
+    def test_parse_metadata_scalar_deploy_state_slice_yields_one_warning(self) -> None:
+        _model, warnings = parse_metadata({'deploy_state': 'x'}, direction='read')
         assert len(warnings) == 1
         assert warnings[0].field == 'deploy_state'
         assert warnings[0].code == 'invalid_submodel'
