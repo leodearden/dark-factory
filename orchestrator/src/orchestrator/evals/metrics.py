@@ -247,9 +247,12 @@ def produced_a_plan(metrics: dict[str, Any]) -> bool:
     asks the same question of the plan ARTIFACT — the form the report layer can
     never use, because by report time it holds only a persisted metrics dict.
     ``run_architect_eval`` derives ``plan_steps`` from the identical
-    ``len(plan.get('steps') or [])``, so the two are equivalent BY CONSTRUCTION
-    (pinned by ``TestProducedAPlan.test_equivalent_to_the_artifact_level_twin``
-    rather than left to coincidence — the drift hazard
+    ``len(plan.get('steps') or [])``, so the two derivations are INTENDED to
+    be identical, and
+    ``test_eval_architect.py::TestSteplessPlanIsNeverJudged.test_persisted_metrics_agree_with_the_artifact_level_twin``
+    pins that end-to-end through the real runner — so this claim is
+    falsifiable if ``run_architect_eval``'s derivation ever changes, rather
+    than left to coincidence (the drift hazard
     ``report._has_plan_quality_score`` was written to close).
 
     **Why not ``plan_quality > 0``** (the rule this replaces everywhere, task
