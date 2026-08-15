@@ -444,7 +444,12 @@ class TestIterErrorNeighborhoods:
             _tool_result('tu-2', _CEILING_DECLARATION, is_error=True),
         ]
 
-        for n in mod.iter_error_neighborhoods(records):
+        neighborhoods = mod.iter_error_neighborhoods(records)
+
+        # Asserted BEFORE the loop: an empty return would otherwise skip
+        # the body and pass, which is the very regression this guards.
+        assert len(neighborhoods) == 2
+        for n in neighborhoods:
             assert set(n) == {
                 'index', 'attempt_tool', 'attempt_input_summary',
                 'error_content', 'exit_code', 'designed_outcome',
@@ -510,15 +515,14 @@ class TestErrorNeighborhoodPartition:
     def test_partition_is_disjoint(self):
         records = _mixed_error_records()
 
-        genuine_ids = {id(n) for n in mod.iter_genuine_errors(records)}
-        designed_ids = {id(n) for n in mod.iter_designed_outcomes(records)}
+        genuine = mod.iter_genuine_errors(records)
+        designed = mod.iter_designed_outcomes(records)
 
-        # Compare by index -- the two calls build separate dicts.
-        assert not (
-            {n['index'] for n in mod.iter_genuine_errors(records)}
-            & {n['index'] for n in mod.iter_designed_outcomes(records)}
-        )
-        assert genuine_ids and designed_ids
+        # By record index, not object identity: separate calls build
+        # separate dicts, so an id()-based check can never intersect and
+        # would pass regardless of correctness.
+        assert genuine and designed
+        assert not ({n['index'] for n in genuine} & {n['index'] for n in designed})
 
     def test_partition_accepts_a_precomputed_scan(self):
         # The efficiency contract: a caller holding a scan partitions it
@@ -1392,23 +1396,13 @@ class TestRenderFrontmatter:
         assert loaded['instrument_version'] == 2
         assert isinstance(loaded['instrument_version'], int)
 
-    def test_absent_key_is_the_documented_pre_fix_marker(self):
-        # The census discriminator (07-31 :151, Sec 6): digests are rendered
-        # on demand and cached only in-process, so there is no corpus to
-        # migrate -- every already-emitted digest simply LACKS the key, and
-        # that absence is what means "predates task 3610's filter change".
-        # No sentinel value, no backfill.
-        legacy = (
-            'session: "sess-legacy"\n'
-            'agent_class: "interactive"\n'
-            'signal_counts:\n'
-            '  tool_error: 13\n'
-        )
-
-        loaded = yaml.safe_load(legacy)
-
-        assert loaded.get('instrument_version') is None
-        assert loaded.get('instrument_version', 1) < mod.DIGEST_INSTRUMENT_VERSION
+    # The "absent key == predates task 3610" discriminator (07-31 :151, §6)
+    # is documented in PRD §7.2.2 and has no consumer-side code in this
+    # repo to exercise: a test of it could only hand-write a YAML literal
+    # the renderer never touches and assert PyYAML omits a key the input
+    # omitted. That test existed here and was deleted in the 3610 amendment
+    # pass; what the renderer actually guarantees is pinned above and
+    # end-to-end by TestEmitConsistencyGuard.
 
     def test_date_round_trips_as_string_not_a_yaml_date_object(self):
         # A bare unquoted 2026-07-14 is resolved by PyYAML's implicit
