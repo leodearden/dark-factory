@@ -506,6 +506,74 @@ class TestRunWatcherRotation:
         )
 
     @pytest.mark.asyncio
+    async def test_env_overrides_injects_dark_factory_root(self, tmp_path: Path) -> None:
+        """DARK_FACTORY_ROOT is injected into the spawned rotation's environment.
+
+        Task 3605 (census 2026-08-02 §1.3).  The rotation's own re-arm instruction
+        (skills/escalation-watcher-auto/SKILL.md) interpolates $DARK_FACTORY_ROOT;
+        with the var unset in the spawned process that expanded to `/scripts/...`
+        and sighted sessions guessed a path instead.  The value must be a str,
+        since cli_invoke does `env.update(env_overrides)` into a dict[str, str].
+        """
+        from shared.cli_invoke import AgentResult
+
+        h = _make_rotation_harness(tmp_path)
+        df_root = tmp_path / 'df-checkout'
+        captured: dict = {}
+
+        async def fake_invoke(usage_gate, label, *, invoke_fn, **kwargs):
+            captured['env_overrides'] = kwargs.get('env_overrides')
+            return AgentResult(success=True, output='')
+
+        with (
+            patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke),
+            patch('orchestrator.harness.resolve_dark_factory_root', return_value=df_root),
+        ):
+            await h._run_watcher_rotation()
+
+        env_overrides = captured['env_overrides']
+        assert env_overrides['DARK_FACTORY_ROOT'] == str(df_root), (
+            f'DARK_FACTORY_ROOT must be the resolved root as a str; got '
+            f'{env_overrides.get("DARK_FACTORY_ROOT")!r}'
+        )
+        assert env_overrides['BASH_MAX_TIMEOUT_MS'] == '14700000', (
+            'the pre-existing BASH_MAX_TIMEOUT_MS injection must survive'
+        )
+
+    @pytest.mark.asyncio
+    async def test_env_overrides_omits_dark_factory_root_when_unresolvable(
+        self, tmp_path: Path
+    ) -> None:
+        """An unresolvable root OMITS the key — never present-and-empty (task 3605).
+
+        DARK_FACTORY_ROOT='' is strictly worse than unset: it re-creates the
+        sighted `cd  && scripts/...` / `/scripts/...` expansion AND defeats the
+        receiving watcher-rearm.sh `[ -z ... ]` guard's own exit-2 diagnostic.
+        """
+        from shared.cli_invoke import AgentResult
+
+        h = _make_rotation_harness(tmp_path)
+        captured: dict = {}
+
+        async def fake_invoke(usage_gate, label, *, invoke_fn, **kwargs):
+            captured['env_overrides'] = kwargs.get('env_overrides')
+            return AgentResult(success=True, output='')
+
+        with (
+            patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke),
+            patch('orchestrator.harness.resolve_dark_factory_root', return_value=None),
+        ):
+            await h._run_watcher_rotation()
+
+        env_overrides = captured['env_overrides']
+        assert 'DARK_FACTORY_ROOT' not in env_overrides, (
+            f'the key must be ABSENT, never present-and-empty; got {env_overrides!r}'
+        )
+        assert env_overrides['BASH_MAX_TIMEOUT_MS'] == '14700000', (
+            'an unresolvable DF root must not disturb the BASH_MAX_TIMEOUT_MS injection'
+        )
+
+    @pytest.mark.asyncio
     async def test_rotation_start_logs_bash_max_timeout_ms(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
