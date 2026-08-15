@@ -11,6 +11,7 @@ import sys
 import types
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -100,6 +101,96 @@ def _bothmissing(id: str) -> dict:
     but deleted exactly once when run() unions the two by id.
     """
     return _member(id, kind=None, task_id=None)
+
+
+# ---------------------------------------------------------------------------
+# count_memories_by_metadata mock, keyed by FILTER rather than call ORDER
+# (task 3897 amendment, reviewer_comprehensive #4)
+#
+# run() counts three distinct filters — the source filter, the source+kind
+# filter, and the flag_for_stage2 census probe — repeating the first two
+# after an --apply delete pass. A positional `side_effect=[...]` list binds
+# every test to run()'s exact call order, so moving a count (e.g. issuing the
+# census probe after the scroll instead of before it) would silently feed the
+# 'after' count into the probe slot and vice versa, with the mis-wiring
+# surfacing only in production. Binding each mocked count to the filter it
+# ANSWERS removes that coupling, and makes an unexpected filter a loud
+# AssertionError rather than a silent mis-binding.
+# ---------------------------------------------------------------------------
+
+_SOURCE_FILTER = {'source': 'stage1_flag_marker'}
+_KIND_FILTER = {'source': 'stage1_flag_marker', 'kind': 'stage1_flag_marker'}
+_FLAG_FOR_STAGE2_FILTER = {'flag_for_stage2': True}
+
+
+def _filter_key(filters: dict | None) -> frozenset:
+    """Hashable identity of a metadata filter dict (order-insensitive)."""
+    return frozenset((filters or {}).items())
+
+
+def _counts(*, source: Any, kind: Any, flag_for_stage2: Any = 0) -> AsyncMock:
+    """Build a count_memories_by_metadata mock answering per filter.
+
+    Args:
+        source: Answer(s) for ``{'source': MARKER_SOURCE}``.
+        kind: Answer(s) for ``{'source': MARKER_SOURCE, 'kind': MARKER_KIND}``.
+        flag_for_stage2: Answer(s) for the ``{'flag_for_stage2': True}``
+            census probe (default 0 — the adjacent pool is irrelevant to
+            most tests).
+
+    Each value is either a scalar, answering every call on that filter, or a
+    LIST consumed in order — the shape an ``--apply`` run needs, where the
+    source/kind filters are counted twice (``before`` then ``after``), e.g.
+    ``source=[3, 1]``. Exhausting a list is a loud AssertionError, so an
+    unexpected extra count cannot pass silently. A value that is an exception
+    instance is RAISED rather than returned, which is how a failing census
+    probe is expressed.
+    """
+    queues: dict[frozenset, tuple[list, bool]] = {
+        _filter_key(spec_filter): (
+            (list(value), False) if isinstance(value, list) else ([value], True)
+        )
+        for spec_filter, value in (
+            (_SOURCE_FILTER, source),
+            (_KIND_FILTER, kind),
+            (_FLAG_FOR_STAGE2_FILTER, flag_for_stage2),
+        )
+    }
+
+    async def _count(*, project_id, filters, **_kwargs):
+        entry = queues.get(_filter_key(filters))
+        assert entry is not None, (
+            'count_memories_by_metadata called with an unexpected filter: '
+            f'{filters!r} — this mock answers the source, source+kind and '
+            'flag_for_stage2 filters only.'
+        )
+        values, is_constant = entry
+        assert values, (
+            f'count_memories_by_metadata called more times than the test '
+            f'supplied answers for filter {filters!r}.'
+        )
+        value = values[0] if is_constant else values.pop(0)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    return AsyncMock(side_effect=_count)
+
+
+def _probe_call(count_mock: AsyncMock):
+    """Return the single census-probe call made against *count_mock*.
+
+    Looked up BY FILTER, never by position, for the same reason :func:`_counts`
+    exists: a positional index would keep passing if the probe moved.
+    """
+    probe_calls = [
+        call for call in count_mock.call_args_list
+        if call.kwargs.get('filters') == _FLAG_FOR_STAGE2_FILTER
+    ]
+    assert len(probe_calls) == 1, (
+        f'Expected exactly one flag_for_stage2 census probe, got: {probe_calls!r}'
+    )
+    return probe_calls[0]
 
 
 # ===========================================================================
@@ -629,7 +720,7 @@ class TestRun:
         """
         memory_service = AsyncMock()
         # count_memories_by_metadata: total=3, total+kind=1  (so 2 orphans by count)
-        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[3, 1])
+        memory_service.count_memories_by_metadata = _counts(source=3, kind=1)
         # get_memories_by_metadata returns 1 valid + 2 orphans
         memory_service.get_memories_by_metadata = AsyncMock(return_value=[
             _member('v1'),
@@ -657,9 +748,7 @@ class TestRun:
         memory_service = AsyncMock()
         # before: total=3, kind=1 → 2 orphans by count
         # after: total=1, kind=1 → 0 orphans
-        memory_service.count_memories_by_metadata = AsyncMock(
-            side_effect=[3, 1, 1, 1]
-        )
+        memory_service.count_memories_by_metadata = _counts(source=[3, 1], kind=[1, 1])
         memory_service.get_memories_by_metadata = AsyncMock(return_value=[
             _member('v1'),
             _orphan('o1'),
@@ -684,9 +773,7 @@ class TestRun:
         """
         memory_service = AsyncMock()
         # before: total=3, kind=1 → 2 orphans by count; after: total=2, kind=1 → 1 residual
-        memory_service.count_memories_by_metadata = AsyncMock(
-            side_effect=[3, 1, 2, 1]
-        )
+        memory_service.count_memories_by_metadata = _counts(source=[3, 2], kind=[1, 1])
         memory_service.get_memories_by_metadata = AsyncMock(return_value=[
             _member('v1'),
             _orphan('o1'),   # this delete will fail
@@ -720,7 +807,7 @@ class TestRun:
         semantic search (memory_service.search) is never called.
         """
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(return_value=0)
+        memory_service.count_memories_by_metadata = _counts(source=0, kind=0)
         memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
         memory_service.search = AsyncMock()
 
@@ -754,7 +841,7 @@ class TestRun:
 
         # --- Dry run: verify enumeration/report shape ---
         dry_service = AsyncMock()
-        dry_service.count_memories_by_metadata = AsyncMock(side_effect=[4, 2])
+        dry_service.count_memories_by_metadata = _counts(source=4, kind=2)
         dry_service.get_memories_by_metadata = AsyncMock(return_value=members)
         dry_service.delete_memory = AsyncMock(return_value=None)
 
@@ -773,7 +860,7 @@ class TestRun:
 
         # --- Apply: verify delete fan-out is deduped by id ---
         apply_service = AsyncMock()
-        apply_service.count_memories_by_metadata = AsyncMock(side_effect=[4, 2, 1, 1])
+        apply_service.count_memories_by_metadata = _counts(source=[4, 1], kind=[2, 1])
         apply_service.get_memories_by_metadata = AsyncMock(return_value=members)
         apply_service.delete_memory = AsyncMock(return_value=None)
 
@@ -819,7 +906,7 @@ class TestRun:
 
         # --- Dry run ---
         dry_service = AsyncMock()
-        dry_service.count_memories_by_metadata = AsyncMock(side_effect=[5, 3])
+        dry_service.count_memories_by_metadata = _counts(source=5, kind=3)
         dry_service.get_memories_by_metadata = AsyncMock(return_value=members)
         dry_service.delete_memory = AsyncMock(return_value=None)
 
@@ -841,7 +928,7 @@ class TestRun:
 
         # --- Apply: overlap1 (stale AND terminal) deleted exactly once ---
         apply_service = AsyncMock()
-        apply_service.count_memories_by_metadata = AsyncMock(side_effect=[5, 3, 1, 1])
+        apply_service.count_memories_by_metadata = _counts(source=[5, 1], kind=[3, 1])
         apply_service.get_memories_by_metadata = AsyncMock(return_value=members)
         apply_service.delete_memory = AsyncMock(return_value=None)
 
@@ -888,7 +975,7 @@ class TestRun:
         members = [dated_stale, undated_missing, undated_bad]
 
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[3, 3])
+        memory_service.count_memories_by_metadata = _counts(source=3, kind=3)
         memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
         memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -917,7 +1004,7 @@ class TestRun:
         members = [valid_fresh]
 
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[1, 1])
+        memory_service.count_memories_by_metadata = _counts(source=1, kind=1)
         memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
         memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -932,6 +1019,275 @@ class TestRun:
         assert not any(
             'missing/unparseable created_at' in record.message for record in caplog.records
         )
+
+    # -----------------------------------------------------------------
+    # cross_check census block (task 3897)
+    #
+    # run() issues an additional count_memories_by_metadata call — the
+    # flag_for_stage2 census probe. These tests answer it through _counts()'s
+    # `flag_for_stage2=` argument and look the call itself up via
+    # _probe_call(), both keyed by FILTER, so nothing here depends on where
+    # in run()'s sequence the probe is issued.
+    # -----------------------------------------------------------------
+
+    _BLIND_SPOT_MSG = 'flag_for_stage2'
+
+    def _blind_spot_warnings(self, caplog) -> list:
+        """Return the WARNING records that are the blind-spot warning."""
+        return [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and r.name == 'sweep_orphan_flag_markers'
+            and self._BLIND_SPOT_MSG in r.message
+        ]
+
+    @pytest.mark.asyncio
+    async def test_cross_check_reports_blind_spot_on_live_dark_factory_shape(self, caplog):
+        """The live 2026-08-09 dark_factory shape: the source enumeration
+        matches 0 while 61 flag_for_stage2 records exist -> blind_spot True.
+
+        This is the exact false all-clear task 3897 exists to make loud:
+        before.total_source == 0 makes backlog_verdict hold unconditionally,
+        so without this block the run reads as a clean bill of health.
+        """
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = _counts(source=0, kind=0, flag_for_stage2=61)
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        assert report['cross_check'] == {
+            'source_total': 0,
+            'flag_for_stage2_total': 61,
+            'blind_spot': True,
+            'probe_failed': False,
+        }
+
+        # The probe must use the boolean-typed adjacent filter and the same
+        # project as the sweep — a probe against a different project would
+        # compare two unrelated populations. Located by filter, not by call
+        # index (see _probe_call).
+        probe_call = _probe_call(memory_service.count_memories_by_metadata)
+        assert probe_call.kwargs['filters'] == {'flag_for_stage2': True}
+        assert probe_call.kwargs['project_id'] == 'dark_factory'
+
+        warnings = self._blind_spot_warnings(caplog)
+        assert warnings, (
+            'Expected a blind-spot WARNING, got: '
+            f'{[r.message for r in caplog.records]}'
+        )
+        # The warning must name BOTH counts, or an operator cannot tell how
+        # large the unseen population is. Asserted on the SUBSTITUTED values
+        # and on distinctive rendered fragments, not on `'0' in text` — the
+        # template hardcodes the literal '0 swept', so a bare substring check
+        # for '0' is self-satisfying and would stay green even if run()
+        # logged the wrong count in that slot. (One substitution stays
+        # inherently unfalsifiable here: in any GENUINE blind spot the
+        # source+kind count is necessarily 0 too, since it filters a strict
+        # subset of the source population. What these assertions do pin is
+        # the slot ORDER and the rendering — a swap of the two counts fails
+        # them.)
+        assert warnings[0].args[1:3] == (0, 61), (
+            'Expected the enumerated (0) and adjacent (61) counts as the '
+            f'logged args, got: {warnings[0].args!r}'
+        )
+        text = warnings[0].getMessage()
+        assert 'matched 0 records' in text, (
+            f'Expected the rendered enumerated count, got: {text!r}'
+        )
+        assert 'population of 61 records' in text, (
+            f'Expected the rendered adjacent count, got: {text!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_cross_check_no_blind_spot_when_enumeration_sees_its_pool(self, caplog):
+        """A non-zero source enumeration is not a blind spot, even when an
+        adjacent flag_for_stage2 population also exists.
+
+        Both pools being non-empty is the healthy steady state; warning here
+        would make the signal noise.
+        """
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = _counts(source=3, kind=3, flag_for_stage2=61)
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[
+            _member('v1'), _member('v2'), _member('v3'),
+        ])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        assert report['cross_check'] == {
+            'source_total': 3,
+            'flag_for_stage2_total': 61,
+            'blind_spot': False,
+            'probe_failed': False,
+        }
+        assert not self._blind_spot_warnings(caplog)
+
+    @pytest.mark.asyncio
+    async def test_cross_check_true_no_op_is_not_a_blind_spot(self, caplog):
+        """Nothing enumerated AND nothing adjacent is a genuine no-op.
+
+        This is the case that must stay silent, or every clean run warns and
+        operators learn to ignore the warning.
+        """
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = _counts(source=0, kind=0, flag_for_stage2=0)
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        assert report['cross_check'] == {
+            'source_total': 0,
+            'flag_for_stage2_total': 0,
+            'blind_spot': False,
+            'probe_failed': False,
+        }
+        assert not self._blind_spot_warnings(caplog)
+
+    # -----------------------------------------------------------------
+    # cross_check probe is fail-safe (task 3897)
+    #
+    # The census probe is a DIAGNOSTIC. It must never abort the sweep, never
+    # alter the delete set, and never assert a blind spot it did not
+    # actually observe. Mirrors the posture of
+    # task_knowledge_sync._warn_on_flag_for_stage2_type_drift.
+    # -----------------------------------------------------------------
+
+    def _members_for_failsafe(self) -> list[dict]:
+        """Two orphans + one valid member — a delete set the probe must not perturb."""
+        return [_member('v1'), _orphan('o1'), _orphan('o2')]
+
+    @pytest.mark.asyncio
+    async def test_probe_failure_does_not_raise_and_marks_probe_failed(self, caplog):
+        """A raising census probe degrades to 'unknown', never a crash.
+
+        blind_spot must be False, not True: an unobserved population is not
+        an observed blind spot, and a diagnostic that invents findings when
+        it fails is worse than one that stays silent.
+        """
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = _counts(
+            source=3, kind=1, flag_for_stage2=RuntimeError('qdrant down'),
+        )
+        memory_service.get_memories_by_metadata = AsyncMock(
+            return_value=self._members_for_failsafe()
+        )
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        assert report['cross_check'] == {
+            'source_total': 3,
+            'flag_for_stage2_total': None,
+            'blind_spot': False,
+            'probe_failed': True,
+        }
+
+        # A failed probe must carry a stack trace, or a genuine wiring bug is
+        # indistinguishable in the journal from a transient backend blip.
+        failed_probe_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and r.exc_info is not None
+        ]
+        assert failed_probe_records, (
+            'Expected a WARNING with exc_info for the failed probe, got: '
+            f'{[(r.message, r.exc_info) for r in caplog.records]}'
+        )
+        assert 'RuntimeError' in caplog.text and 'qdrant down' in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_probe_failure_leaves_delete_set_identical(self):
+        """The delete set is byte-identical with and without a probe failure.
+
+        This is the contract that makes the probe safe to add to a script
+        whose --apply path performs irreversible deletes.
+        """
+        async def _run(probe_outcome):
+            memory_service = AsyncMock()
+            memory_service.count_memories_by_metadata = _counts(
+                source=3, kind=1, flag_for_stage2=probe_outcome,
+            )
+            memory_service.get_memories_by_metadata = AsyncMock(
+                return_value=self._members_for_failsafe()
+            )
+            memory_service.delete_memory = AsyncMock(return_value=None)
+            return await _mod.run(
+                self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        healthy = await _run(61)
+        broken = await _run(RuntimeError('qdrant down'))
+
+        assert healthy['orphan_ids'] == broken['orphan_ids'] == ['o1', 'o2']
+        assert healthy['orphan_count'] == broken['orphan_count'] == 2
+        # Everything except the cross_check block itself is untouched.
+        assert (
+            {k: v for k, v in healthy.items() if k != 'cross_check'}
+            == {k: v for k, v in broken.items() if k != 'cross_check'}
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('bad_return', [None, object(), '61', 3.5])
+    async def test_non_int_probe_return_is_treated_as_a_failed_probe(self, bad_return):
+        """An unexpected return shape degrades to 'unknown' rather than
+        crashing on the `> 0` comparison inside enumeration_blind_spot.
+
+        Note '61' (a str) and 3.5 (a float) are included deliberately: both
+        would either raise or silently misbehave under a naive comparison.
+        """
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = _counts(
+            source=0, kind=0, flag_for_stage2=bad_return,
+        )
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['cross_check'] == {
+            'source_total': 0,
+            'flag_for_stage2_total': None,
+            'blind_spot': False,
+            'probe_failed': True,
+        }
+
+    @pytest.mark.asyncio
+    async def test_bool_probe_return_is_treated_as_a_failed_probe(self):
+        """`True` is an int subclass in Python, so an isinstance(x, int)
+        guard alone would let a boolean through and report
+        flag_for_stage2_total: True — a nonsense census. Guard against it
+        explicitly."""
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = _counts(
+            source=0, kind=0, flag_for_stage2=True,
+        )
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['cross_check']['probe_failed'] is True
+        assert report['cross_check']['flag_for_stage2_total'] is None
+        assert report['cross_check']['blind_spot'] is False
 
 
 # ===========================================================================
@@ -949,6 +1305,11 @@ class TestTargetedCorrection:
     record (task_id='1944,2408', kept because not ALL components are
     terminal). Delete (not delete+recreate) is the honest correction — see
     design_decisions.
+
+    count_memories_by_metadata mock ordering (task 3897): the THIRD call is
+    run()'s flag_for_stage2 census probe, sitting between the two 'before'
+    counts and any 'after' counts. These fixtures pass 0 for it (no adjacent
+    population), which keeps blind_spot False and their semantics unchanged.
     """
 
     _NOW = datetime(2026, 7, 14, tzinfo=UTC)
@@ -1000,7 +1361,7 @@ class TestTargetedCorrection:
         members = [mistagged, composite]
 
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[2, 2])
+        memory_service.count_memories_by_metadata = _counts(source=2, kind=2)
         memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
         memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -1026,7 +1387,7 @@ class TestTargetedCorrection:
         members = [mistagged, composite]
 
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[2, 2, 0, 0])
+        memory_service.count_memories_by_metadata = _counts(source=[2, 0], kind=[2, 0])
         memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
         memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -1052,7 +1413,7 @@ class TestTargetedCorrection:
         members = [valid]
 
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[1, 1])
+        memory_service.count_memories_by_metadata = _counts(source=1, kind=1)
         memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
         memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -1077,7 +1438,7 @@ class TestTargetedCorrection:
         members = [orphan]
 
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[1, 0, 0, 0])
+        memory_service.count_memories_by_metadata = _counts(source=[1, 0], kind=[0, 0])
         memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
         memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -1098,7 +1459,7 @@ class TestTargetedCorrection:
         members = [valid]
 
         memory_service = AsyncMock()
-        memory_service.count_memories_by_metadata = AsyncMock(side_effect=[1, 1])
+        memory_service.count_memories_by_metadata = _counts(source=1, kind=1)
         memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
         memory_service.delete_memory = AsyncMock(return_value=None)
 
@@ -1109,6 +1470,183 @@ class TestTargetedCorrection:
         )
 
         assert report['targeted_correction_ids'] == []
+
+
+# ===========================================================================
+# Tests: the flag_for_stage2 pool is CENSUSED, never deleted (task 3897)
+# ===========================================================================
+
+class TestFlagForStage2IsNeverDeleted:
+    """The cross-check must never widen the delete set. Guard against a
+    future well-meaning edit that turns the census into a deletion.
+
+    The census probe is count-only BY DESIGN: live relay markers in that pool
+    would be caught by this script's own predicates, the script has neither
+    the protected-mirror guard nor the tombstone write the in-cycle
+    _sweep_stale_mem0_pool applies, and task 2966's collector already drains
+    the pool correctly. Full rationale and the dated measurements that back
+    each of those: docs/flag-marker-sweep-recurring.md ("Why the relay pool
+    is censused, never deleted") — deliberately not restated here, so there
+    is one copy to keep current. This class is what stops the design from
+    silently regressing.
+    """
+
+    _NEUTRAL_NOW = datetime(2026, 1, 1, tzinfo=UTC)
+
+    def _args(self):
+        import types as _types
+        return _types.SimpleNamespace(
+            apply=True, project_id='dark_factory', max_age_days=14,
+        )
+
+    @pytest.mark.asyncio
+    async def test_census_never_widens_the_delete_set(self):
+        """--apply + --terminal-drain + a 61-record adjacent population:
+        only scrolled, source-filtered members are ever deleted."""
+        # The scroll returns the source-filtered population only. 'keep1' is
+        # dated, non-terminal and has a task_id, so no predicate catches it.
+        members = [
+            _member('keep1', task_id='1970'),
+            _member('term1', task_id='2440'),   # terminal -> deleted
+            _taskless('taskless1'),             # no task_id -> deleted
+        ]
+        # Ids that live in the adjacent flag_for_stage2 pool. They are never
+        # scrolled, so they can only reach the delete set via a regression.
+        forbidden_ids = {'ffs2-a', 'ffs2-b', 'ffs2-c'}
+
+        memory_service = AsyncMock()
+        # source/kind are counted twice on --apply (before, then after).
+        memory_service.count_memories_by_metadata = _counts(
+            source=[3, 1], kind=[3, 1], flag_for_stage2=61,
+        )
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        report = await _mod.run(
+            self._args(),
+            memory_service,
+            now=self._NEUTRAL_NOW,
+            terminal_task_ids={'2440'},
+        )
+
+        # The blind spot IS reported — the census did its job.
+        assert report['cross_check']['flag_for_stage2_total'] == 61
+        assert report['cross_check']['blind_spot'] is False  # source_total is 3
+
+        # (a) Every delete targets an id drawn from the scrolled members.
+        scrolled_ids = {m['id'] for m in members}
+        deleted_ids = {
+            call.kwargs['memory_id']
+            for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'term1', 'taskless1'}
+        assert deleted_ids <= scrolled_ids
+
+        # (b) Nothing from the adjacent pool is touched, by id or by filter.
+        assert not (deleted_ids & forbidden_ids)
+        for call in memory_service.delete_memory.call_args_list:
+            assert 'filters' not in call.kwargs, (
+                'delete_memory must be called per-id, never with a bulk '
+                f'filter: {call.kwargs}'
+            )
+            assert 'flag_for_stage2' not in repr(call.kwargs)
+
+        # (c) The enumeration was NOT widened: exactly one scroll, on source.
+        memory_service.get_memories_by_metadata.assert_called_once()
+        scroll_kwargs = memory_service.get_memories_by_metadata.call_args.kwargs
+        assert scroll_kwargs['filters'] == {'source': _mod.MARKER_SOURCE}
+        assert 'flag_for_stage2' not in scroll_kwargs['filters']
+
+    @pytest.mark.asyncio
+    async def test_probe_only_ever_counts_never_scrolls(self):
+        """The adjacent filter appears in count calls only — never in a
+        get_memories_by_metadata scroll, which is the only way records could
+        become delete-set candidates."""
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = _counts(
+            source=0, kind=0, flag_for_stage2=61,
+        )
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        await _mod.run(
+            self._args(), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        scroll_filters = [
+            call.kwargs.get('filters')
+            for call in memory_service.get_memories_by_metadata.call_args_list
+        ]
+        assert all(
+            'flag_for_stage2' not in (f or {}) for f in scroll_filters
+        ), f'Adjacent filter leaked into a scroll: {scroll_filters}'
+
+        count_filters = [
+            call.kwargs.get('filters')
+            for call in memory_service.count_memories_by_metadata.call_args_list
+        ]
+        assert {'flag_for_stage2': True} in count_filters
+        memory_service.delete_memory.assert_not_called()
+
+
+# ===========================================================================
+# Tests: enumeration_blind_spot (task 3897)
+# ===========================================================================
+
+class TestEnumerationBlindSpot:
+    """Tests for the pure predicate enumeration_blind_spot(enumerated, adjacent).
+
+    Task 3897: this script enumerates on {'source': 'stage1_flag_marker'},
+    which measures 0 records in every project probed, while the adjacent
+    {'flag_for_stage2': True} relay pool is non-empty (dated census:
+    docs/flag-marker-sweep-recurring.md). The consequence is a structural
+    false all-clear: `before.total_source` is always 0, so
+    backlog_verdict(0, N) holds unconditionally and forever, and the nightly
+    sweep prints `orphan_count: 0` every night against a pool it cannot see.
+
+    This predicate is what makes that divergence nameable. It distinguishes
+    "swept nothing because there was nothing" (a true no-op) from "swept
+    nothing because the enumeration filter cannot see the population" (a
+    blind spot).
+    """
+
+    @pytest.mark.parametrize('enumerated,adjacent,expected', [
+        # The live dark_factory shape: the source filter sees nothing while
+        # a flag_for_stage2 population exists.
+        (0, 61, True),
+        # The live reify shape, same defect, different magnitude.
+        (0, 80, True),
+        # Genuinely nothing anywhere — a true no-op, NOT a blind spot. This
+        # is the case that must not warn, or the warning becomes noise on
+        # every clean run.
+        (0, 0, False),
+        # The sweep can see its own pool. An adjacent population merely
+        # existing is not a blind spot — the two pools are distinct
+        # populations and both being non-empty is the healthy steady state.
+        (3, 61, False),
+        (3, 0, False),
+    ])
+    def test_blind_spot_predicate(self, enumerated, adjacent, expected):
+        """Blind spot iff the enumeration saw nothing AND an adjacent
+        population is non-empty."""
+        assert _mod.enumeration_blind_spot(enumerated, adjacent) is expected
+
+    def test_flag_for_stage2_filters_constant_shape(self):
+        """The census filter mirrors task_knowledge_sync._FLAG_FOR_STAGE2_ENUM_FILTERS."""
+        assert _mod.FLAG_FOR_STAGE2_FILTERS == {'flag_for_stage2': True}
+
+    def test_flag_for_stage2_filter_value_is_boolean_not_string(self):
+        """The boolean True is load-bearing: Qdrant payload filters are
+        type-sensitive, and the string variant {'flag_for_stage2': 'true'}
+        measures 0 against live dark_factory (independently re-confirmed
+        2026-08-09). A silent str/bool drift here would reintroduce exactly
+        the zero-matching blind spot this cross-check exists to detect —
+        `== {'flag_for_stage2': True}` alone would NOT catch it, since
+        `True == 1` and Python's dict equality would also accept 1.
+        """
+        value = _mod.FLAG_FOR_STAGE2_FILTERS['flag_for_stage2']
+        assert isinstance(value, bool)
+        assert value is True
 
 
 # ===========================================================================
@@ -1193,6 +1731,82 @@ class TestResolveCheckExitCode:
         }
         assert _mod._resolve_check_exit_code(report, max_backlog=0) == 1
 
+    # -----------------------------------------------------------------
+    # --fail-on-blind-spot escalation (task 3897)
+    # -----------------------------------------------------------------
+
+    @staticmethod
+    def _blind_spot_report(blind_spot=True, probe_failed=False, total_source=0):
+        return {
+            'before': {'total_source': total_source, 'total_with_kind': total_source},
+            'cross_check': {
+                'source_total': total_source,
+                'flag_for_stage2_total': None if probe_failed else 61,
+                'blind_spot': blind_spot,
+                'probe_failed': probe_failed,
+            },
+        }
+
+    def test_blind_spot_does_not_change_exit_code_by_default(self):
+        """BACKWARD COMPATIBILITY, the load-bearing case.
+
+        scripts/fused-memory-flag-marker-check.sh is ALREADY wired as a
+        before_done.script predicate for a deterministic watch task. A blind
+        spot must not silently start failing that gate: without the opt-in
+        flag, a report with blind_spot=True and total_source=0 still holds.
+        """
+        report = self._blind_spot_report(blind_spot=True)
+        assert _mod._resolve_check_exit_code(report, max_backlog=0) == 0
+        assert _mod._resolve_check_exit_code(
+            report, max_backlog=0, fail_on_blind_spot=False,
+        ) == 0
+
+    def test_blind_spot_fails_when_opted_in(self):
+        """With --fail-on-blind-spot, an observed blind spot is exit 1 even
+        though the backlog itself trivially 'holds' at 0."""
+        report = self._blind_spot_report(blind_spot=True)
+        assert _mod._resolve_check_exit_code(
+            report, max_backlog=0, fail_on_blind_spot=True,
+        ) == 1
+
+    def test_opted_in_without_blind_spot_falls_through_to_backlog_verdict(self):
+        """--fail-on-blind-spot only adds a failure mode; it never masks the
+        existing backlog verdict."""
+        holds = self._blind_spot_report(blind_spot=False, total_source=0)
+        assert _mod._resolve_check_exit_code(
+            holds, max_backlog=0, fail_on_blind_spot=True,
+        ) == 0
+
+        violated = self._blind_spot_report(blind_spot=False, total_source=7)
+        assert _mod._resolve_check_exit_code(
+            violated, max_backlog=0, fail_on_blind_spot=True,
+        ) == 1
+
+    def test_failed_probe_never_fails_the_gate_even_when_opted_in(self):
+        """An UNOBSERVABLE population must not fail the gate.
+
+        A transient Qdrant blip would otherwise flap a deterministic
+        before_done predicate — the gate escalates on observed divergence
+        only, never on missing evidence.
+        """
+        report = self._blind_spot_report(blind_spot=False, probe_failed=True)
+        assert _mod._resolve_check_exit_code(
+            report, max_backlog=0, fail_on_blind_spot=True,
+        ) == 0
+
+    def test_report_without_cross_check_block_does_not_raise(self):
+        """Defensive: an older/cached report shape with no cross_check key
+        resolves through the pre-existing backlog path rather than raising."""
+        report = {'before': {'total_source': 0, 'total_with_kind': 0}}
+        assert _mod._resolve_check_exit_code(
+            report, max_backlog=0, fail_on_blind_spot=True,
+        ) == 0
+
+        report_violated = {'before': {'total_source': 9, 'total_with_kind': 9}}
+        assert _mod._resolve_check_exit_code(
+            report_violated, max_backlog=0, fail_on_blind_spot=True,
+        ) == 1
+
 
 # ===========================================================================
 # Tests: _build_parser (task 2596 CLI surface)
@@ -1219,6 +1833,17 @@ class TestBuildParser:
         assert args.check is False
         assert args.max_backlog == 0
         assert args.terminal_drain is False
+        # task 3897: OFF by default. The flag_for_stage2 pool is a healthy
+        # rolling 14-day window, so a gate keyed on its non-emptiness would
+        # fail forever — the same footgun already documented for
+        # --max-backlog 0 against undated markers.
+        assert args.fail_on_blind_spot is False
+
+    def test_fail_on_blind_spot_opt_in(self):
+        """--fail-on-blind-spot is a store_true opt-in (task 3897)."""
+        parser = _mod._build_parser()
+        args = parser.parse_args(['--fail-on-blind-spot'])
+        assert args.fail_on_blind_spot is True
 
     def test_max_age_days_override(self):
         """--max-age-days accepts an int override."""
@@ -1284,6 +1909,137 @@ class TestBuildParser:
         parser = _mod._build_parser()
         args = parser.parse_args(['--terminal-drain'])
         assert args.terminal_drain is True
+
+
+# ===========================================================================
+# Tests: _parse_args cross-flag validation (task 3897 amendment,
+# reviewer_comprehensive #1)
+# ===========================================================================
+
+class TestParseArgs:
+    """--fail-on-blind-spot without --check is rejected at parse time.
+
+    The flag reaches an exit code only through _resolve_check_exit_code,
+    which main() consults ONLY under --check. Accepted silently, it would
+    hand an operator wiring it as a before_done.script predicate a gate that
+    STRUCTURALLY CANNOT FAIL — the exact defect class task 3897 exists to
+    eliminate, and a silent degradation besides. So it errors out (argparse
+    exit code 2) instead of no-op'ing.
+    """
+
+    def test_opt_in_without_check_is_rejected_with_exit_2(self, capsys):
+        """The bare dry-run shape: `--fail-on-blind-spot` alone."""
+        with pytest.raises(SystemExit) as exc_info:
+            _mod._parse_args(['--fail-on-blind-spot'])
+        assert exc_info.value.code == 2
+        stderr = capsys.readouterr().err
+        assert '--fail-on-blind-spot requires --check' in stderr, (
+            f'Expected an actionable error naming both flags, got: {stderr!r}'
+        )
+
+    def test_apply_without_check_is_also_rejected(self, capsys):
+        """`--apply --fail-on-blind-spot` — the shape an operator would reach
+        for when adding the gate to the nightly sweep — exits 0 regardless of
+        cross_check.blind_spot, so it is rejected too."""
+        with pytest.raises(SystemExit) as exc_info:
+            _mod._parse_args(['--apply', '--fail-on-blind-spot'])
+        assert exc_info.value.code == 2
+        assert '--fail-on-blind-spot requires --check' in capsys.readouterr().err
+
+    def test_opt_in_with_check_parses(self):
+        """The supported wiring — and the one
+        scripts/fused-memory-flag-marker-check.sh produces, since its exec
+        line hardcodes --check."""
+        args = _mod._parse_args(['--check', '--fail-on-blind-spot'])
+        assert args.check is True
+        assert args.fail_on_blind_spot is True
+
+    def test_pre_existing_invocations_are_unaffected(self):
+        """Every shape that predates the flag still parses unchanged — the
+        validation must not narrow the existing CLI contract."""
+        assert _mod._parse_args([]).fail_on_blind_spot is False
+        assert _mod._parse_args(['--check']).check is True
+        assert _mod._parse_args(['--apply', '--terminal-drain']).apply is True
+        assert _mod._parse_args(['--check', '--max-backlog', '5']).max_backlog == 5
+
+
+# ===========================================================================
+# Tests: main() report -> exit-code wiring (task 3897 amendment,
+# reviewer_comprehensive #5)
+# ===========================================================================
+
+class TestMainExitCode:
+    """main() is the only place args.fail_on_blind_spot reaches
+    _resolve_check_exit_code.
+
+    A regression dropping that keyword would revert to the parameter default
+    (False) and leave every other test in this file green while the opt-in
+    gate silently stopped escalating — so the wiring is asserted end-to-end
+    here (argv -> parse -> exit code), with the live MemoryService
+    construction short-circuited at asyncio.run.
+    """
+
+    _BLIND_SPOT_REPORT = {
+        'dry_run': True,
+        'before': {'total_source': 0, 'total_with_kind': 0},
+        'orphan_count': 0,
+        'orphan_ids': [],
+        'cross_check': {
+            'source_total': 0,
+            'flag_for_stage2_total': 61,
+            'blind_spot': True,
+            'probe_failed': False,
+        },
+    }
+
+    def _run_main(self, monkeypatch, argv: list[str], report: dict) -> int:
+        """Run main() with *argv*, short-circuiting the live sweep to *report*."""
+        def _fake_asyncio_run(coro):
+            # main() has already built the _run_live() coroutine; close it so
+            # the stub does not leak a never-awaited coroutine warning.
+            coro.close()
+            return report
+
+        monkeypatch.setattr(sys, 'argv', ['sweep_orphan_flag_markers.py', *argv])
+        monkeypatch.setattr(_mod.asyncio, 'run', _fake_asyncio_run)
+        return _mod.main()
+
+    def test_opt_in_escalates_an_observed_blind_spot_to_exit_1(self, monkeypatch, capsys):
+        """--check --fail-on-blind-spot against a blind-spot report: exit 1."""
+        assert self._run_main(
+            monkeypatch, ['--check', '--fail-on-blind-spot'], self._BLIND_SPOT_REPORT,
+        ) == 1
+
+    def test_check_alone_still_holds_on_the_same_report(self, monkeypatch, capsys):
+        """The already-wired esc-2866-1 O2 watch task's contract: the same
+        report, without the opt-in, still resolves to 0 via backlog_verdict."""
+        assert self._run_main(
+            monkeypatch, ['--check'], self._BLIND_SPOT_REPORT,
+        ) == 0
+
+    def test_opt_in_without_check_never_reaches_the_sweep(self, monkeypatch, capsys):
+        """Rejection happens at parse time, before any live service is built
+        — so an operator's mis-wiring fails loudly and instantly rather than
+        running a full sweep and then exiting 0."""
+        def _must_not_run(coro):
+            coro.close()
+            raise AssertionError('the sweep must not run for a rejected arg combination')
+
+        monkeypatch.setattr(
+            sys, 'argv', ['sweep_orphan_flag_markers.py', '--fail-on-blind-spot'],
+        )
+        monkeypatch.setattr(_mod.asyncio, 'run', _must_not_run)
+
+        with pytest.raises(SystemExit) as exc_info:
+            _mod.main()
+        assert exc_info.value.code == 2
+
+    def test_no_check_returns_0_and_prints_the_report(self, monkeypatch, capsys):
+        """The default (non---check) path is unchanged: always exit 0, with
+        the JSON report — cross_check block included — on stdout."""
+        assert self._run_main(monkeypatch, [], self._BLIND_SPOT_REPORT) == 0
+        stdout = capsys.readouterr().out
+        assert '"cross_check"' in stdout and '"blind_spot": true' in stdout
 
 
 # ===========================================================================
