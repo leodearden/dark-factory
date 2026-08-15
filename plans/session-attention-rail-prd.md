@@ -242,9 +242,15 @@ serialized by dependency, so no task starves on a lock). **T3 is the spine root.
   `result=<applied|forced|absent|refused|faulted>`; `--force` is the single, loudly-logged operator
   override. The contention signal also names its two axes separately (pid liveness vs heartbeat
   freshness) rather than the collapsed `(alive|dead, heartbeat Ns ago)` above, `lease-claim` appends
-  `holder_liveness=<held|orphaned>` so a stand-down for a provably-gone holder is surfaced rather
-  than honoured silently, and the read-only `lease-show` verb prints holder/liveness/freshness/
-  reclaimability instead of `cat` + `stat -c %y`.
+  `holder_liveness=<held|orphaned>` — a **pid-liveness signal only**: the pid recorded in the lease
+  body is not running — so a stand-down for a holder that is gone *at the pid level* is surfaced
+  rather than honoured silently, and the read-only `lease-show` verb prints holder/liveness/
+  freshness/reclaimability instead of `cat` + `stat -c %y`. A second corroborating signal (the
+  holder's own session-registry record) was designed, then measured **structurally impossible** —
+  the skill-prescribed lease slug `<role>-<project>-<pid>` is a claimant-chosen ownership token, not
+  a session-registry record key, so the lookup always missed and the field was a constant — and was
+  deliberately **withdrawn** under 3994. It is not an unimplemented gap: do not re-propose it
+  without first making the two namespaces meet.
 
 **DAG:** `T1, T2, T3` have no deps. `T4 → {T3, T2}`. `T5 → {T4, T1}`. `T6 → {T3}`. `T7 → {T3, T5}`.
 Critical path: `T3 → T4 → T5 → T7` (T2 feeds T4, T1 feeds T5, T6 parallel off T3).

@@ -240,11 +240,17 @@ python3 orchestrator/src/orchestrator/session_registry.py lease-show --name watc
 ```
 
 It prints `key=value` lines — `state`, `holder_slug`, `holder_pid`,
-`holder_pid_alive`, `heartbeat_ts`, `heartbeat_age_secs`, `reclaimable`,
-`holder_session` — computed by the same reader `lease-claim` decides with, and
-never touches the lease. A lease is stale only when the holder pid is dead
-**and** the heartbeat is past `LEASE_HEARTBEAT_TTL` (2h); a live holder is
-never reclaimable however quiet it has been.
+`holder_pid_alive`, `heartbeat_ts`, `heartbeat_age_secs`, `reclaimable` —
+computed by the same reader `lease-claim` decides with, and never touches the
+lease. A lease is stale only when the holder pid is dead **and** the heartbeat
+is past `LEASE_HEARTBEAT_TTL` (2h); a live holder is never reclaimable however
+quiet it has been.
+
+`lease-claim`'s `holder_liveness=<held|orphaned>` line is a **pid check only**
+— `orphaned` means the pid recorded in the lease body is not running, nothing
+more. Treat it as one diagnostic, never as grounds to force-release on its
+own: a quiet-but-live holder that reads as dead is the duplicate-spawn
+incident.
 
 `lease-heartbeat` and `lease-release` require the `--slug` the lease was
 claimed with and **refuse** on a mismatch (`result=refused`, nothing touched),

@@ -69,10 +69,10 @@ operator override.
   ```
 
   A fresh heartbeat means the holder is still held even when its pid reads as not running; a lease is
-  only stale with BOTH a dead pid and a heartbeat past the TTL. `holder_liveness=orphaned` adds that
-  the holder's session record is also absent/exited — worth mentioning to the user, but it changes
-  nothing here: `warn-and-proceed` continues either way, and you never force-release someone else's
-  lease to "clean up".
+  only stale with BOTH a dead pid and a heartbeat past the TTL. `holder_liveness=orphaned` restates
+  the pid half on its own — the pid in the lease body is not running, and that is the whole signal —
+  worth mentioning to the user, but it changes nothing here: `warn-and-proceed` continues either
+  way, and you never force-release someone else's lease to "clean up".
 - **`decision=acquired`**: no prior holder; continue normally.
 
 To inspect a lease, use `lease-show --name "unblock-<project>#<TASK_ID>"` — never `cat`, which shows

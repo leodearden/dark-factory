@@ -113,9 +113,10 @@ Parse the printed lines: `decision=<acquired|stand-down|proceed>`, a human-reada
   false `stand-down`, so a lease fault can never block the only consumer of this queue.
 - **`decision=stand-down` + `holder_liveness=held`**: another recon watcher is live. Print the
   message verbatim and **exit immediately** — do not drain, do not start the watcher.
-- **`decision=stand-down` + `holder_liveness=orphaned`**: the holder's pid is not running **and**
-  its session record is absent/exited, but its heartbeat is still within TTL so the lease is not yet
-  reclaimable. **Do not exit silently** — this skill is the queue's only closer, so a silent
+- **`decision=stand-down` + `holder_liveness=orphaned`**: the pid recorded in the lease body is not
+  running — that is the whole signal, a pid probe and nothing more — but its heartbeat is still
+  within TTL so the lease is not yet reclaimable. **Do not exit silently** — this skill is the
+  queue's only closer, so a silent
   stand-down for a holder that no longer exists means nothing closes 8103 at all. Inspect, file a
   DecisionRecord naming the orphan (the `write-decision` verb this skill already uses for parked
   decisions), print it, **then** exit:
@@ -130,8 +131,13 @@ Parse the printed lines: `decision=<acquired|stand-down|proceed>`, a human-reada
     --session-id "recon-watcher-<project>-${CLAUDE_PID:-$PPID}"
   ```
 
-  Never force-release on this evidence alone: a dead-*looking* holder that is merely quiet is the
-  duplicate-spawn incident. Reclaiming is the human's call, or the reaper's once the TTL expires.
+  Never force-release on this evidence alone: `holder_liveness` is a single-signal pid probe, and a
+  dead-*looking* holder that is merely quiet is the duplicate-spawn incident. This guard carries the
+  whole weight — a pid probe is the *only* corroboration there is. (Task 3994 designed a second
+  signal, cross-checking the holder's own session-registry record, then measured it structurally
+  impossible — a lease slug is a claimant-chosen ownership token, not a record key — and withdrew it
+  rather than ship a check that never fires.) Reclaiming is the human's call, or the reaper's once
+  the TTL expires.
 
 **Reading the contention message.** It names two INDEPENDENT axes — whether the holder's *pid* is
 running, and how fresh its *heartbeat* is:

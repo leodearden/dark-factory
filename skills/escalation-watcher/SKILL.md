@@ -75,9 +75,10 @@ Parse the printed lines: `decision=<acquired|stand-down|proceed>`, a human-reada
   fail-open outcome (see below) and is handled identically to `acquired`.
 - **`decision=stand-down` + `holder_liveness=held`**: print the message verbatim and **exit
   immediately** — do not start the watcher, do not drain.
-- **`decision=stand-down` + `holder_liveness=orphaned`**: the holder's pid is not running **and** its
-  session record is absent/exited — it is provably gone, but its heartbeat is still within TTL so the
-  lease is not yet reclaimable. **Do not exit silently.** This skill is the only L2 consumer, so
+- **`decision=stand-down` + `holder_liveness=orphaned`**: the pid recorded in the lease body is not
+  running — that is the whole signal, a pid probe and nothing more. It is provably gone *at the pid
+  level*, but its heartbeat is still within TTL so the lease is not yet reclaimable. **Do not exit
+  silently.** This skill is the only L2 consumer, so
   standing down for a holder that no longer exists is how a queue sits unhandled for hours. Inspect,
   file a DecisionRecord naming the orphan (the same `write-decision` verb used for parked decisions
   below), print it, **then** exit:
@@ -92,9 +93,13 @@ Parse the printed lines: `decision=<acquired|stand-down|proceed>`, a human-reada
     --session-id "watcher-<project>-${CLAUDE_PID:-$PPID}"
   ```
 
-  Do **not** force-release it on this evidence alone — `holder_liveness` is a diagnostic, and a
-  dead-*looking* holder that is merely quiet is the duplicate-spawn incident. Reclaiming is the
-  human's call, or the reaper's once the TTL expires.
+  Do **not** force-release it on this evidence alone — `holder_liveness` is a single-signal
+  diagnostic, and a dead-*looking* holder that is merely quiet is the duplicate-spawn incident. This
+  guard carries the whole weight here: a pid probe is the *only* corroboration there is. (Task 3994
+  designed a second signal — cross-checking the holder's own session-registry record — then measured
+  it structurally impossible, because a lease slug is a claimant-chosen ownership token and not a
+  record key, and withdrew it rather than ship a check that never fires.) Reclaiming is the human's
+  call, or the reaper's once the TTL expires.
 
 **Reading the contention message.** It reports two INDEPENDENT axes — whether the holder's *pid* is
 running, and how fresh its *heartbeat* is — and then states the decision they imply:
@@ -156,9 +161,9 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lea
 
 `cat` shows the holder's slug/pid and the immutable `start_ts` they claimed at — it **cannot** show
 freshness, because the heartbeat is the file's mtime. `lease-show` prints `state`, `holder_slug`,
-`holder_pid`, `holder_pid_alive`, `heartbeat_ts`, `heartbeat_age_secs`, `reclaimable` and
-`holder_session` as `key=value` lines, computed by the same reader `lease-claim` decides with. It is
-read-only: it never bumps the heartbeat.
+`holder_pid`, `holder_pid_alive`, `heartbeat_ts`, `heartbeat_age_secs` and `reclaimable` as
+`key=value` lines, computed by the same reader `lease-claim` decides with. It is read-only: it never
+bumps the heartbeat.
 
 ## The Main Loop
 
