@@ -229,6 +229,32 @@ class TestSamplerDesignedOutcomeParity:
         assert base_counts.designed_outcome == 0
         assert noisy_counts.total_signal == base_counts.total_signal == 1
 
+    def test_ceiling_only_session_is_dropped_before_digest_time(self):
+        # The bound on "counted for visibility" (PRD §7.2.1): the
+        # zero-signal gate is score > 0 over the SCORED classes, so a
+        # session carrying nothing but designed outcomes never reaches the
+        # digest stage and its designed_outcome count is never observable.
+        # Pinned rather than left to the docstring, because the honest
+        # scope of the claim is exactly what a reader would otherwise
+        # over-read.
+        records = [
+            _scored('ceilings-only', 'watcher', mod.SignalCounts(designed_outcome=13), 'poll'),
+            _scored('real-signal', 'watcher', mod.SignalCounts(tool_error=1), 'boom'),
+        ]
+        config = config_mod.LegibilityConfig(
+            project_id='dark_factory',
+            project_root='/home/leo/src/dark-factory',
+            escalation_port=8103,
+            cwd_prefixes=['/home/leo/src/dark-factory'],
+            budgets=config_mod.Budgets(max_daily_digest_bytes=405_000),
+            sampling=config_mod.Sampling(top_fraction=0.12, per_stratum_min=2),
+        )
+
+        result = mod.stratified_sample(records, config)
+
+        assert result.zero_signal_dropped == 1
+        assert {r.path.stem for r in result.selected} == {'real-signal'}
+
     def test_co_mingled_ceiling_and_failure_ranks_as_a_genuine_error(self, tmp_path):
         # A result carrying BOTH a designed CEILING and a real ERROR marker
         # is a genuine failure at BOTH layers -- the shared classifier is

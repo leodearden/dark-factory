@@ -792,7 +792,13 @@ bounded-poll ceiling is a designed loop-continuation, not agent
 confusion, so no session's rank may shift merely because its noise got
 reclassified. Adding a 0.0 entry instead would break the
 strictly-positive invariant above; leaving the key out keeps
-score_signals monotonic over exactly the scored classes."""
+score_signals monotonic over exactly the scored classes.
+
+*Reported* is bounded by where a report exists: the sampler drops a
+session scoring zero before any digest is rendered, so a session whose
+only structured errors are designed outcomes is never digested and its
+count never seen. The key disambiguates a MIXED session's errors; it is
+not a corpus-wide ceiling census (PRD Sec 7.2.1)."""
 
 
 def score_signals(counts: dict[str, int], n_user_turns: int) -> float:

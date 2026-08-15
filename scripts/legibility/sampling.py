@@ -250,6 +250,15 @@ class SignalCounts:
         confusion, so it is counted for visibility but must not lift a
         session's rank; this mirrors digest.py leaving it out of
         SIGNAL_WEIGHTS (task 3610, 07-31 census cluster 1.3).
+
+        Excluded from the scale means excluded from the zero-signal gate
+        too, since that gate is ``score > 0`` over this value: a session
+        whose ONLY structured errors are designed outcomes totals 0, is
+        counted into ``zero_signal_dropped``, and never reaches the digest
+        stage — so its ``designed_outcome`` count is never observable
+        downstream. That is intended (such a session carries no confusion
+        signal to read), but it bounds the "counted for visibility" claim
+        to MIXED sessions; see PRD §7.2.1.
         """
         return (
             self.tool_error + self.not_found + self.self_correct
@@ -873,6 +882,11 @@ def stratified_sample(
     for stratum_records in by_stratum.values():
         stratum_size = len(stratum_records)
 
+        # The gate is the SCORED classes only (SignalCounts.total_signal),
+        # so a session carrying nothing but designed outcomes drops here
+        # and is never digested -- deliberate, and the reason
+        # signal_counts.designed_outcome only ever surfaces on a session
+        # that also has real signal (PRD §7.2.1).
         nonzero = [r for r in stratum_records if r.score > 0]
         zero_signal_dropped += stratum_size - len(nonzero)
 
