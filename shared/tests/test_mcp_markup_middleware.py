@@ -2389,12 +2389,39 @@ class TestB14RequiredParameterAbsorptionFromCorpus:
     #: new scaffolding — only a call that omits ``where``.
     ADD_REUSE_ITEM_ID = 'toolu_01TD9YYAfShehSFKtS5aa3yj'
 
+    #: The EXACT values those two specimens must recover. Both rows are pinned
+    #: by ``tool_use_id`` against a committed file, so the recovered values are
+    #: fully deterministic and there is no reason to settle for a shape check:
+    #: ``isinstance(v, str) and v`` would wave through a regression that
+    #: recovered a wrong-but-non-empty slice — the wrong tail segment, or
+    #: envelope residue. Note that ``detect()`` would NOT catch that either;
+    #: measured on the residue this most plausibly produces, a value carrying a
+    #: trailing closer alone returns ``None`` from ``detect``, because a bare
+    #: closer is not one of the guarded patterns. Exact equality is therefore
+    #: the residue guard here, and the hand-authored sibling class above already
+    #: holds itself to it (``args['project_id'] == 'dark_factory'``).
+    ADD_MEMORY_PROJECT_ID = 'dark_factory'
+    ADD_REUSE_ITEM_WHERE = 'shared/src/shared/usage_gate.py'
+
     @staticmethod
-    def _record(tool_use_id: str, recovered: str) -> dict[str, Any]:
+    def _record(tool_use_id: str, *, absorbing: str, recovered: str) -> dict[str, Any]:
+        """The pinned corpus record, with every premise this row rests on guarded.
+
+        All three checks live here rather than at the call sites so both tiers
+        of a row get the same guard: duplicating a premise into the FORWARD test
+        and dropping it from the REJECT twin lets a corpus refresh fail one
+        loudly and pass the other for the wrong reason.
+        """
         record = specimen(tool_use_id)
         assert record['expected_outcome'] == 'repaired', (
             'this row is only meaningful while the corpus still classifies the '
             'specimen as repairable'
+        )
+        assert record['param'] == absorbing, (
+            f'this row drives the call with {absorbing!r} as the ABSORBING '
+            'parameter; a corpus refresh that repointed the id at a record '
+            'whose leak began elsewhere must fail here, not quietly assert '
+            'something else'
         )
         assert record['expected_recovered'] == [recovered], (
             f'this row asserts the recovery of {recovered!r}; a corpus refresh '
@@ -2410,21 +2437,25 @@ class TestB14RequiredParameterAbsorptionFromCorpus:
     # unexpected-argument error for reasons that have nothing to do with B14.
 
     async def test_a_real_add_memory_leak_forwards_bound_to_the_required_project_id(self):
-        record = self._record(self.ADD_MEMORY_ID, 'project_id')
+        record = self._record(
+            self.ADD_MEMORY_ID, absorbing='content', recovered='project_id'
+        )
         h = build_harness(RepairPolicy.FORWARD_REPAIR)
 
         await h.call('add_memory_strict', {'content': record['value']})
 
         assert len(h.recorder.calls) == 1
-        assert isinstance(h.recorder.args['project_id'], str)
-        assert h.recorder.args['project_id'], (
+        assert h.recorder.args['project_id'] == self.ADD_MEMORY_PROJECT_ID, (
             'the tool ran bound to a required argument that was never on the '
-            'wire — which is only possible if the guard preceded validation'
+            'wire — which is only possible if the guard preceded validation — '
+            'and it must be bound to the value the leak actually carried'
         )
         assert detect(h.recorder.args['content']) is None
 
     async def test_a_real_add_memory_leak_is_bounced_with_the_required_project_id(self):
-        record = self._record(self.ADD_MEMORY_ID, 'project_id')
+        record = self._record(
+            self.ADD_MEMORY_ID, absorbing='content', recovered='project_id'
+        )
         h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
 
         with pytest.raises(ToolError) as excinfo:
@@ -2432,8 +2463,7 @@ class TestB14RequiredParameterAbsorptionFromCorpus:
 
         payload = _reject_payload(excinfo)
         assert payload['error_type'] == 'mcp_markup_detected'
-        assert isinstance(payload['repaired_call']['project_id'], str)
-        assert payload['repaired_call']['project_id']
+        assert payload['repaired_call']['project_id'] == self.ADD_MEMORY_PROJECT_ID
         assert h.recorder.calls == []
 
     # -- (b) the plan-tools shape ------------------------------------------
@@ -2446,8 +2476,9 @@ class TestB14RequiredParameterAbsorptionFromCorpus:
     FILLER_HOW = 'reused verbatim'
 
     async def test_a_real_add_reuse_item_leak_forwards_bound_to_the_required_where(self):
-        record = self._record(self.ADD_REUSE_ITEM_ID, 'where')
-        assert record['param'] == 'what'
+        record = self._record(
+            self.ADD_REUSE_ITEM_ID, absorbing='what', recovered='where'
+        )
         h = build_harness(RepairPolicy.FORWARD_REPAIR)
 
         await h.call(
@@ -2455,13 +2486,14 @@ class TestB14RequiredParameterAbsorptionFromCorpus:
         )
 
         assert len(h.recorder.calls) == 1
-        assert isinstance(h.recorder.args['where'], str)
-        assert h.recorder.args['where']
+        assert h.recorder.args['where'] == self.ADD_REUSE_ITEM_WHERE
         assert h.recorder.args['how'] == self.FILLER_HOW
         assert detect(h.recorder.args['what']) is None
 
     async def test_a_real_add_reuse_item_leak_is_bounced_with_the_required_where(self):
-        record = self._record(self.ADD_REUSE_ITEM_ID, 'where')
+        record = self._record(
+            self.ADD_REUSE_ITEM_ID, absorbing='what', recovered='where'
+        )
         h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
 
         with pytest.raises(ToolError) as excinfo:
@@ -2472,8 +2504,7 @@ class TestB14RequiredParameterAbsorptionFromCorpus:
         payload = _reject_payload(excinfo)
         assert payload['error_type'] == 'mcp_markup_detected'
         assert payload['tool'] == 'add_reuse_item'
-        assert isinstance(payload['repaired_call']['where'], str)
-        assert payload['repaired_call']['where']
+        assert payload['repaired_call']['where'] == self.ADD_REUSE_ITEM_WHERE
         assert h.recorder.calls == []
 
 
