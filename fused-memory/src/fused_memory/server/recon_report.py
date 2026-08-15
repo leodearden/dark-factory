@@ -1923,6 +1923,17 @@ class ReconReportState:
            index add_finding already consults from every stage, so
            exempting one stage from registering it would just let that
            stage's findings silently evade the whole-run fold.
+
+        BOTH folds emit a WARNING carrying the losing finding's full content
+        (:meth:`_log_cite_task_fold_purge`) immediately BEFORE purging it.
+        The purge is wholesale and the returned ``duplicate_finding`` error
+        names only the SURVIVOR, so that line is the only recovery channel
+        for the discarded ``description`` / ``suggested_action`` and for any
+        cite_entity / cite_edge / cite_memory / cite_run citations already
+        attached to the folded finding. Keep the log ahead of the purge, and
+        keep it on both branches: a fold that purges silently is
+        unrecoverable, and the entity-scoped one has no stage carve-out so
+        it can fire from any stage.
         """
         entry = self._resolve_entry(run_id)
         if entry is None:
@@ -2007,6 +2018,15 @@ class ReconReportState:
             self._persist_run(run_id)
             return _duplicate_finding_error(project_existing_id)
         if entity_existing_id is not None and entity_existing_id != finding.finding_id:
+            self._log_cite_task_fold_purge(
+                run_id,
+                'entity_scoped',
+                finding_entry,
+                finding,
+                entity_existing_id,
+                project_id,
+                task_id,
+            )
             self._purge_finding(run_id, finding_entry, finding)
             self._persist_run(run_id)
             return _duplicate_finding_error(entity_existing_id)
