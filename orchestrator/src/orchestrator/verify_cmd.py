@@ -1542,13 +1542,25 @@ def serial_pytest(cmd: VerifyCmd) -> VerifyCmd:
     ``_force_serial_pytest``), so each chained invocation recovers
     independently. No-ops unless ``cmd.tool is ToolKind.PYTEST`` (covers
     OPAQUE and every other tool — P1).
+
+    Also a no-op on the raw path when the appender REFUSES — a pytest
+    invocation whose matched span ends inside an unclosed quote, e.g.
+    ``pytest -k 'a && b' tests/`` (see
+    ``_has_unspliceable_pytest_invocation``). Returning *cmd* ITSELF rather
+    than an equal ``replace`` copy is deliberate: it is what lets the
+    caller's ``is`` identity guard (``verify._serial_pytest_str``'s ``if
+    rewritten is parsed: return cmd``) hand back the operator's own command
+    string BYTE-identically. A re-render through ``render()`` would only be
+    argv-equivalent — the rationale ``_with_pytest_numprocesses_str`` already
+    records for its own guard.
     """
     if cmd.tool is not ToolKind.PYTEST:
         return cmd
     if cmd.raw is not None:
-        return replace(
-            cmd, raw=_append_to_raw_pytest_invocations(cmd.raw, " -p no:xdist -o addopts=''")
-        )
+        rewritten = _append_to_raw_pytest_invocations(cmd.raw, " -p no:xdist -o addopts=''")
+        if rewritten == cmd.raw:
+            return cmd
+        return replace(cmd, raw=rewritten)
     return replace(cmd, base_flags=(*cmd.base_flags, '-p', 'no:xdist', '-o', 'addopts='))
 
 
@@ -1598,11 +1610,23 @@ def apply_pytest_numprocesses(cmd: VerifyCmd, n: str) -> VerifyCmd:
     re-run) build their command via ``serial_pytest`` and then pass it back
     through the same injection site, so this guard is what keeps the ``-n``
     knob from breaking those recovery paths.
+
+    One further no-op on the raw path: the appender REFUSES on a pytest
+    invocation whose matched span ends inside an unclosed quote, e.g.
+    ``pytest -k 'a && b' tests/`` (see
+    ``_has_unspliceable_pytest_invocation``). As in ``serial_pytest``,
+    returning *cmd* ITSELF rather than an equal ``replace`` copy is what lets
+    the caller's ``is`` identity guard
+    (``verify._with_pytest_numprocesses_str``) keep the command
+    BYTE-identical instead of argv-equivalent.
     """
     if cmd.tool is not ToolKind.PYTEST or n in {'', 'auto'} or _is_serial_forced(cmd):
         return cmd
     if cmd.raw is not None:
-        return replace(cmd, raw=_append_to_raw_pytest_invocations(cmd.raw, f' -n {n}'))
+        rewritten = _append_to_raw_pytest_invocations(cmd.raw, f' -n {n}')
+        if rewritten == cmd.raw:
+            return cmd
+        return replace(cmd, raw=rewritten)
     return replace(cmd, base_flags=(*cmd.base_flags, '-n', n))
 
 
