@@ -1147,6 +1147,49 @@ class TestSubmodelRegistry:
     def test_submodel_cardinality_alias_is_exported(self):
         assert 'SubmodelCardinality' in task_metadata_module.__all__
 
+    def test_reregistering_same_model_same_cardinality_is_idempotent(self):
+        register_metadata_submodel(_CHECKS_STUB_KEY, _DeployStateStub, cardinality='list')
+        register_metadata_submodel(_CHECKS_STUB_KEY, _DeployStateStub, cardinality='list')
+        assert task_metadata_module._SUBMODEL_CARDINALITY[_CHECKS_STUB_KEY] == 'list'
+        assert task_metadata_module._SUBMODEL_REGISTRY[_CHECKS_STUB_KEY] is _DeployStateStub
+
+    def test_reregistering_same_model_different_cardinality_raises(self):
+        # A key's cardinality is as immutable as its model: registration is a
+        # per-process, import-order-driven side effect, so last-writer-wins
+        # would make the ENFORCED shape depend on which module imported first.
+        register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
+        with pytest.raises(ValueError) as exc_info:
+            register_metadata_submodel(
+                _DEPLOY_STATE_STUB_KEY, _DeployStateStub, cardinality='list'
+            )
+        message = str(exc_info.value)
+        assert _DEPLOY_STATE_STUB_KEY in message
+        assert 'dict' in message  # the recorded cardinality
+        assert 'list' in message  # the requested one
+
+    def test_cardinality_conflict_leaves_both_dicts_unmutated(self):
+        register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
+        with pytest.raises(ValueError):
+            register_metadata_submodel(
+                _DEPLOY_STATE_STUB_KEY, _DeployStateStub, cardinality='list'
+            )
+        # No partial write: the two dicts are parallel, so a raise AFTER
+        # mutating one is the one way this design could genuinely desync.
+        assert task_metadata_module._SUBMODEL_CARDINALITY[_DEPLOY_STATE_STUB_KEY] == 'dict'
+        assert task_metadata_module._SUBMODEL_REGISTRY[_DEPLOY_STATE_STUB_KEY] is _DeployStateStub
+
+    def test_model_conflict_leaves_both_dicts_unmutated(self):
+        class _OtherDeployStateStub(BaseModel):
+            phase: str
+
+        register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
+        with pytest.raises(ValueError):
+            register_metadata_submodel(
+                _DEPLOY_STATE_STUB_KEY, _OtherDeployStateStub, cardinality='list'
+            )
+        assert task_metadata_module._SUBMODEL_REGISTRY[_DEPLOY_STATE_STUB_KEY] is _DeployStateStub
+        assert task_metadata_module._SUBMODEL_CARDINALITY[_DEPLOY_STATE_STUB_KEY] == 'dict'
+
 
 class TestMilestoneRegistration:
     """Milestone's registration with the W10 extension point + parse_metadata integration."""
