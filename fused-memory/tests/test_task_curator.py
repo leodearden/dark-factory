@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
 from shared.neutral_cwd import neutral_cli_cwd
+from shared.task_statuses import TaskStatus
 from shared.prompt_artifact import (
     ArtifactProvenance,
     PromptArtifactStore,
@@ -42,6 +43,7 @@ from fused_memory.middleware.task_curator import (
     _to_pool_entry,
     _trim_pool,
     flatten_task_tree,
+    is_combine_eligible_status,
     normalize_title,
 )
 
@@ -117,6 +119,63 @@ class TestToPoolEntry:
 
     def test_none_returns_none(self):
         assert _to_pool_entry(None, source='module', lock_depth=2) is None
+
+
+class TestIsCombineEligibleStatus:
+    """The ONE shared combine STATUS predicate (task 4035).
+
+    Selection (``_to_pool_entry.combine_eligible``) and execution
+    (``task_interceptor._execute_combine``) previously hand-copied
+    ``status == 'pending'`` and silently diverged, letting combines land on
+    non-pending targets mid-planning. These tests pin the single definition
+    and — in ``TestCombineEligibilityNoDivergence`` below — that both call
+    sites still agree.
+    """
+
+    @pytest.mark.parametrize('status', list(TaskStatus))
+    def test_pending_only_over_full_vocabulary(self, status: TaskStatus):
+        expected = status is TaskStatus.PENDING
+        assert is_combine_eligible_status(status.value) is expected
+
+    def test_in_progress_is_not_eligible(self):
+        """THE BUG: an in-progress target sailed through the old execution guard."""
+        assert is_combine_eligible_status('in-progress') is False
+
+    @pytest.mark.parametrize(
+        'status',
+        [
+            'unknown',
+            '',
+            'PENDING',  # wrong case is not the canonical spelling
+            'Pending',
+            ' pending ',
+            'pending-review',
+        ],
+    )
+    def test_unrecognised_status_fails_closed(self, status: str):
+        assert is_combine_eligible_status(status) is False
+
+
+class TestCombineEligibilityNoDivergence:
+    """INV-5 anti-divergence pin — selection MUST agree with the predicate.
+
+    Any future edit that re-forks the two sites fails here loudly instead of
+    silently re-opening the 20.2% race.
+    """
+
+    @pytest.mark.parametrize('status', list(TaskStatus))
+    def test_pool_entry_agrees_with_shared_predicate(self, status: TaskStatus):
+        task = {'id': '42', 'title': 'Fix parser', 'status': status.value}
+        entry = _to_pool_entry(task, source='module', lock_depth=2)
+        assert entry is not None
+        assert entry.combine_eligible is is_combine_eligible_status(status.value)
+
+    def test_pool_entry_agrees_on_unknown_status(self):
+        """A task dict with no status reads as 'unknown' — both sides refuse it."""
+        entry = _to_pool_entry({'id': '42', 'title': 'x'}, source='module', lock_depth=2)
+        assert entry is not None
+        assert entry.combine_eligible is is_combine_eligible_status('unknown')
+        assert entry.combine_eligible is False
 
 
 class TestFlattenTaskTree:
