@@ -40,6 +40,7 @@ import pytest
 
 from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
     _ENUM_PREP_WORDS,
+    _last_clause_break,
     extract_snapshot_edge_task_ids,
     flatten_dedup_edges,
     select_stale_status_snapshot_edges,
@@ -1307,6 +1308,46 @@ class TestExtractSnapshotEdgeTaskIds:
 # --------------------------------------------------------------------------- #
 
 
+class CountingStr(str):
+    """``str`` subclass that tallies characters TOUCHED by ``rfind``/indexing.
+
+    ``_last_clause_break``'s documented cost property is "no slicing,
+    O(len(prefix)) total scan work" (see its docstring) — a claim about how
+    many characters the walk examines, not about wall-clock time. A prior
+    version of this test asserted the property via ``time.perf_counter()``
+    instead, and a re-measurement showed that assertion could not actually
+    detect a quadratic regression at the input size it shipped with (the
+    regression's extra cost is C-level slice memcpy, cheap enough to stay
+    under budget until the input is enormous — see
+    ``test_intra_token_dot_walk_touches_linearly_many_characters`` below for
+    the numbers). Counting ``rfind``'s backward-scan distance (``stop -
+    result``, or ``stop - start`` when not found) and every single-character
+    ``__getitem__`` read observes the cost property directly, so a future
+    edit that reintroduces slicing or a non-resuming ``rfind`` is caught by
+    the touched-character count regardless of how fast the underlying C call
+    happens to run on the machine executing the test. (task 4149)
+    """
+
+    def __new__(cls, value):
+        self = super().__new__(cls, value)
+        self.touched = 0
+        return self
+
+    def rfind(self, sub, start=0, end=None):
+        stop = len(self) if end is None else end
+        result = str.rfind(self, sub, start, stop)
+        self.touched += stop - (result if result >= 0 else start)
+        return result
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            out = str.__getitem__(self, key)
+            self.touched += len(out)
+            return out
+        self.touched += 1
+        return str.__getitem__(self, key)
+
+
 class TestPluralEnumerationPerformance:
     """The plural enumeration separator must parse in linear, not exponential, time.
 
@@ -1389,44 +1430,76 @@ class TestPluralEnumerationPerformance:
             f'enumeration separator is backtracking exponentially'
         )
 
-    def test_intra_token_dot_walk_parses_in_linear_time(self):
+    def test_intra_token_dot_walk_touches_linearly_many_characters(self):
         """The intra-token-dot backward walk must not degrade to quadratic. (task 4149)
 
-        ``_last_clause_break`` walks past each intra-token '.' via
-        ``prefix.rfind('.', 0, dot)``, resuming from where the previous
-        ``rfind`` stopped rather than re-scanning from the full prefix each
-        time. A prefix of many consecutive dotted tokens ('ab.ab.ab...')
-        forces the walk through every one of them (none is a real break, and
-        there is no ';!?' to stop it early), so this is the worst case for
-        the walk: if a future edit made each step re-scan from the start
-        instead of resuming, this same input would degrade from O(n) to
-        O(n**2) — here that is 20,000 dots against a 60,000-char prefix, so
-        a quadratic implementation would be many orders of magnitude over
-        budget rather than a marginal miss.
+        Supersedes an earlier wall-clock version of this test
+        (reviewer_comprehensive test-quality finding): a wall-clock budget
+        could not actually detect the regression it was meant to catch,
+        because the regression's extra cost is cheap C-level slice-memcpy
+        that stays under any reasonable budget until the input is enormous,
+        while the regex work already inside
+        ``extract_snapshot_edge_task_ids`` dominates the wall clock at any
+        size this suite can afford to run. This test instead counts
+        characters TOUCHED (``CountingStr``, above) and calls
+        ``_last_clause_break`` directly, observing the walk's documented
+        cost property itself rather than inferring it from a clock:
 
-        Reuses BUDGET_SECONDS rather than inventing a second, independently
-        guessed threshold: measured well under 20ms on this input, a >50x
-        margin, nowhere near the CI-flake boundary.
+          - resuming walk (real code): a FLAT ~4.67x of prefix length at
+            every size measured (200 / 1,000 / 2,000 / 20,000 dots) — size
+            independence IS the linearity claim.
+          - non-resuming walk (``dot = prefix[:dot].rfind('.')`` in place of
+            ``prefix.rfind('.', 0, dot)`` — the one realistic non-resuming
+            spelling, since re-calling ``prefix.rfind('.')`` with no
+            end-bound would infinite-loop rather than run slowly): 103.5x /
+            503.5x / 1,003.5x at 200 / 1,000 / 2,000 dots — the ratio
+            GROWING with n is the quadratic signature, and it already blows
+            the bound below at every size tested.
+
+        The bound is derived, not guessed: 3 unconditional full backward
+        scans (';', '!', '?' are each absent from this input, so each scans
+        the whole prefix once) + 1 telescoped '.' walk covering the prefix
+        once + 2 single-character reads per dot (~0.67 dots per 3-char
+        'ab.' token) ~= 4.7x prefix length. 8x leaves headroom for an
+        innocuous refactor while still failing any superlinear form
+        decisively.
         """
         dotted_tokens = 'ab.' * 20_000 + 'ab'
+        prefix = CountingStr(dotted_tokens)
+
+        result = _last_clause_break(prefix)
+
+        # Correctness alongside cost: every dot is intra-token and no
+        # ';!?' precedes, so the budget can't be met by the walk answering
+        # wrongly but cheaply.
+        assert result == -1
+        assert prefix.touched <= 8 * len(dotted_tokens), (
+            f'_last_clause_break touched {prefix.touched} characters for a '
+            f'{len(dotted_tokens)}-char dot-dense prefix (budget '
+            f'{8 * len(dotted_tokens)} = 8x length) — the intra-token-dot '
+            f'walk is no longer linear'
+        )
+
+    def test_intra_token_dot_prefix_still_extracts_correctly_end_to_end(self):
+        """A long dotted run still round-trips to set() through the real extractor. (task 4149)
+
+        Companion to the cost test above, kept end-to-end (through
+        ``extract_snapshot_edge_task_ids``, not the bare helper) so the
+        integration path — the extractor's own prefix slicing,
+        ``_enumeration_is_prepositional_complement``, the guard's regex
+        search — stays covered. No wall-clock assertion: without a timing
+        claim to justify a large adversarial input, this is sized small
+        (~2,000 dots, ~6KB) and runs in well under a millisecond regardless;
+        the suite-wide 60s xdist timeout still backstops a catastrophic
+        regression at any size.
+        """
+        dotted_tokens = 'ab.' * 2_000 + 'ab'
         fact = f'Reviews for {dotted_tokens} tasks 1020 and 1030 are pending.'
 
-        start = time.perf_counter()
-        extracted = extract_snapshot_edge_task_ids(fact)
-        elapsed = time.perf_counter() - start
-
-        # Correctness alongside cost: the dotted prefix still carries the
-        # governing preposition 'for' (none of the dots end a sentence), so
-        # the enumeration is still correctly read as its complement and
-        # suppressed — the budget can't be satisfied by the walk quietly
-        # giving a wrong answer fast.
-        assert extracted == set()
-        assert elapsed < self.BUDGET_SECONDS, (
-            f'extract_snapshot_edge_task_ids took {elapsed:.3f}s for a '
-            f'{len(dotted_tokens)}-char dot-dense prefix (budget '
-            f'{self.BUDGET_SECONDS}s) — the intra-token-dot walk is no '
-            f'longer linear'
-        )
+        # The dotted prefix still carries the governing preposition 'for'
+        # (none of the dots end a sentence), so the enumeration is still
+        # correctly read as its complement and suppressed.
+        assert extract_snapshot_edge_task_ids(fact) == set()
 
 
 # --------------------------------------------------------------------------- #
