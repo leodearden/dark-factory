@@ -2047,6 +2047,7 @@ def _render_contention_message(
     holder_alive: bool,
     age_secs: float,
     policy: LeasePolicy,
+    ttl: timedelta = LEASE_HEARTBEAT_TTL,
 ) -> str:
     """Build the exact user-observable contention line callers print verbatim.
 
@@ -2054,11 +2055,55 @@ def _render_contention_message(
     string is identical everywhere it appears and is unit-testable with an
     injected clock. *holder* may be None (an unreadable/corrupt lease body);
     that is rendered as an explicit placeholder rather than raising.
+
+    WHY THE OLD FORM WAS WITHDRAWN (task 3994, defect 3). This used to render
+    ``lease held by {slug} ({alive|dead}, heartbeat {n}s ago)``, collapsing
+    two INDEPENDENT axes -- whether the holder's PID is running, and how
+    fresh its HEARTBEAT is -- into one parenthetical. On the branch that
+    matters most that reads as a flat contradiction: "dead, heartbeat 42s
+    ago" invites the reader to conclude the holder is gone and the lease is
+    therefore reclaimable, when a fresh heartbeat means precisely the
+    opposite (staleness requires BOTH a dead pid AND an aged heartbeat, see
+    LEASE_HEARTBEAT_TTL). That exact string misled the 2026-08-08 rotation
+    into force-releasing a live holder's lease.
+
+    So each axis now names itself and the DECISION explains itself:
+    - live holder -> ``(pid {n} alive, heartbeat {n}s ago)``;
+    - dead pid, heartbeat within *ttl* -> states the pid is not running AND
+      that the heartbeat is fresh AND that the lease is still held and NOT
+      reclaimable, with the remaining TTL in seconds, so a contender cannot
+      read "dead" and conclude "mine";
+    - dead pid past *ttl* -> phrased as reclaim-eligible with the reclaim
+      race lost (we are only here because someone else won it), never as a
+      healthy holder;
+    - unreadable body -> says so, rather than asserting a fake holder.
+
+    *ttl* is a parameter rather than a module-global read so the
+    remaining-TTL arithmetic is pinnable in a unit test. Always exactly ONE
+    line, so the signal stays greppable in a transcript.
     """
-    slug = holder.session_slug if holder is not None else '<unknown>'
-    alive_word = 'alive' if holder_alive else 'dead'
     action = 'standing down' if policy is LeasePolicy.STAND_DOWN else 'proceeding anyway'
-    return f'lease held by {slug} ({alive_word}, heartbeat {int(age_secs)}s ago) — {action}'
+    if holder is None:
+        return (
+            f'lease held by <unknown> (lease body unreadable, '
+            f'heartbeat {int(age_secs)}s ago) — {action}'
+        )
+    if holder_alive:
+        state = f'pid {holder.pid} alive, heartbeat {int(age_secs)}s ago'
+    elif age_secs <= ttl.total_seconds():
+        remaining = int(ttl.total_seconds() - age_secs)
+        state = (
+            f'pid {holder.pid} is not running, but its heartbeat is FRESH — '
+            f'{int(age_secs)}s ago; the lease is still held and is NOT reclaimable '
+            f'for another {remaining}s'
+        )
+    else:
+        state = (
+            f'pid {holder.pid} is not running and its heartbeat is STALE — '
+            f'{int(age_secs)}s ago, past the {int(ttl.total_seconds())}s TTL; the lease was '
+            f'reclaim-eligible and someone else won the reclaim race'
+        )
+    return f'lease held by {holder.session_slug} ({state}) — {action}'
 
 
 def _create_and_write_lease(path: Path, holder: LeaseHolder) -> None:
