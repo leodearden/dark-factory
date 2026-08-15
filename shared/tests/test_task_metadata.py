@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import copy
 import json
+from typing import get_args
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -30,6 +31,7 @@ from shared.task_metadata import (
     RetryLedger,
     RoutingDecisionMirror,
     RoutingState,
+    SubmodelCardinality,
     TaskMetadata,
     apply_migrations,
     parse_metadata,
@@ -1144,7 +1146,12 @@ class TestSubmodelRegistry:
         assert task_metadata_module._SUBMODEL_CARDINALITY[_CHECKS_STUB_KEY] == 'list'
         assert task_metadata_module._SUBMODEL_REGISTRY[_CHECKS_STUB_KEY] is _DeployStateStub
 
-    def test_submodel_cardinality_alias_is_exported(self):
+    def test_submodel_cardinality_alias_is_importable_and_exported(self):
+        # Grounded in the alias RESOLVING (it is imported at module scope
+        # above, so a broken name fails collection) and in what it actually
+        # admits — a bare `'SubmodelCardinality' in __all__` string check
+        # would pass even if the name did not exist.
+        assert set(get_args(SubmodelCardinality)) == {'dict', 'list'}
         assert 'SubmodelCardinality' in task_metadata_module.__all__
 
     def test_reregistering_same_model_same_cardinality_is_idempotent(self):
@@ -1164,8 +1171,12 @@ class TestSubmodelRegistry:
             )
         message = str(exc_info.value)
         assert _DEPLOY_STATE_STUB_KEY in message
-        assert 'dict' in message  # the recorded cardinality
-        assert 'list' in message  # the requested one
+        # DIRECTION-sensitive fragments, not bare `'dict' in message` /
+        # `'list' in message` substring checks: those would still pass if the
+        # message swapped the recorded and the requested cardinality, which is
+        # the single distinction this message exists to draw.
+        assert "cardinality 'dict'" in message  # the RECORDED one
+        assert "as 'list'" in message  # the REQUESTED one
 
     def test_cardinality_conflict_leaves_both_dicts_unmutated(self):
         register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
@@ -1275,23 +1286,21 @@ class TestRoutingRegistration:
 class TestProductionRegistrationCardinality:
     """The declared shape of every production registrant this module can see.
 
-    milestone and routing are pinned inside their own classes above; this
-    covers the remaining two shared/ registrants. delivered_checks — the ONE
-    genuinely list-valued slice — is pinned in
-    shared/tests/test_capability_manifest.py, next to its registration.
+    Deliberately scoped to registrants THIS module imports. milestone and
+    routing are pinned inside their own classes above, leaving
+    merge_retry_pending here. The other two are pinned next to their own
+    registration, in the suite that actually imports the registering module —
+    otherwise the row asserts the fail-closed default against itself and can
+    never go red:
+      - delivered_checks (the ONE genuinely list-valued slice) —
+        shared/tests/test_capability_manifest.py;
+      - deploy_state (DELIBERATELY left undeclared, so it resolves through the
+        fail-closed 'dict' default) — orchestrator/tests/test_deploy_state.py,
+        which imports shared.deploy_state at module scope.
     """
 
     def test_merge_retry_pending_registered_as_dict(self):
         assert task_metadata_module._SUBMODEL_CARDINALITY['merge_retry_pending'] == 'dict'
-
-    def test_deploy_state_resolves_to_dict_via_the_fail_closed_default(self):
-        # deploy_state is DELIBERATELY left undeclared (shared/deploy_state.py
-        # is not edited by task 4142): it is dict-shaped, the default is
-        # already correct for it, and this row pins that as an intentional
-        # property of the fail-closed default rather than an oversight.
-        # Expressed via .get so it holds whether or not shared.deploy_state
-        # happened to be imported in this pytest co-run.
-        assert task_metadata_module._SUBMODEL_CARDINALITY.get('deploy_state', 'dict') == 'dict'
 
 
 class TestMigrations:

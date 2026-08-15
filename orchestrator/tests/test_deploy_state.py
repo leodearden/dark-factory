@@ -94,6 +94,24 @@ class TestSharedRegistryRegistration:
     def test_deploy_state_registered_under_its_key(self) -> None:
         assert task_metadata_module._SUBMODEL_REGISTRY.get('deploy_state') is DeployState
 
+    def test_deploy_state_resolves_to_dict_cardinality(self) -> None:
+        """deploy_state takes the fail-closed 'dict' default, intentionally.
+
+        shared/src/shared/deploy_state.py registers with no explicit
+        ``cardinality`` (task 4142 deliberately does not edit it): the slice is
+        dict-shaped — ``DeployState.from_metadata`` gates on
+        ``isinstance(slice_, dict)`` — so the default is already correct, and
+        this row pins that as an intended property rather than an oversight.
+
+        It lives HERE, not in shared/tests/test_task_metadata.py, because this
+        module imports ``shared.deploy_state`` at module scope, so the real
+        registration has run. Indexing directly (rather than
+        ``.get('deploy_state', 'dict')``) is the point: a ``.get`` with the
+        same default asserts the literal default against itself and would stay
+        green if the registration were changed to ``cardinality='list'``.
+        """
+        assert task_metadata_module._SUBMODEL_CARDINALITY['deploy_state'] == 'dict'
+
     def test_parse_metadata_write_emits_no_warnings_for_deploy_state_slice(self) -> None:
         model, warnings = parse_metadata(
             {'deploy_state': {'phase': 'scheduled'}}, direction='write'
