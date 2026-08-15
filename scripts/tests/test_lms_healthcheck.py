@@ -1384,6 +1384,96 @@ def test_the_table_shows_both_vram_figures():
     assert str(lms_vram.MEASURED_OPERATING_BUDGET_GIB) in table
 
 
+def test_the_table_lists_who_else_held_the_card_at_each_reading():
+    """The operator reading the terminal must see what the JSON carries.
+
+    Otherwise the inventory is present in the artifact and absent from the only
+    output a human actually looks at, and "check nvidia-smi first" stays an
+    unwritten discipline that eta/theta/iota have no way to inherit.
+    """
+    table = lms_healthcheck.render_table(_report(
+        baseline=_baseline(consumers=[WHISPER_CONSUMER]),
+        snapshot=_snapshot(consumers=[WHISPER_CONSUMER, ARM_CONSUMER]),
+    ))
+
+    assert 'baseline' in table.lower()
+    for consumer in (WHISPER_CONSUMER, ARM_CONSUMER):
+        assert consumer.process_name in table
+        assert str(consumer.pid) in table
+        assert str(consumer.used_mib) in table
+
+
+def test_the_table_says_the_inventory_is_not_an_accounting():
+    """The entries do not sum to `used`, and a reader who adds them up and
+    finds a shortfall would conclude the reading was wrong.  The caveat travels
+    with the numbers, in the terminal as well as in the JSON."""
+    table = lms_healthcheck.render_table(_report())
+
+    assert 'not an accounting' in table
+
+
+def test_the_table_shows_an_empty_inventory_as_a_measured_fact():
+    """`(none)` and not a blank line.
+
+    A silently absent section is indistinguishable from a section this build
+    does not render -- and an empty compute-app list beside a 3312 MiB baseline
+    is a real, explainable reading, not a missing one.
+    """
+    table = lms_healthcheck.render_table(_report(
+        baseline=_baseline(consumers=[]),
+        snapshot=_snapshot(consumers=[ARM_CONSUMER]),
+    ))
+
+    assert 'none' in table.lower()
+
+
+def test_the_table_banners_a_polluted_run_and_names_the_intruder():
+    """The loudest thing in the output, because it is the only thing that
+    matters: every VRAM number above it is void."""
+    table = lms_healthcheck.render_table(_polluted_report())
+
+    assert 'POLLUTED' in table
+    assert OLLAMA_CONSUMER.process_name in table
+    assert str(OLLAMA_CONSUMER.pid) in table
+    assert 'not attributable' in table.lower()
+
+
+def test_a_clean_run_shows_no_pollution_banner():
+    """The banner must mean something.  Printed on every run it would be
+    ignored on the one run it matters."""
+    table = lms_healthcheck.render_table(_report())
+
+    assert 'POLLUTED' not in table
+
+
+def test_the_table_follows_the_report_when_the_pollution_state_changes():
+    """The anti-drift property, extended to the new field.
+
+    `render_table` takes the report and nothing else, so editing the STRUCTURE
+    must move the text -- proving the banner is rendered from the block and not
+    recomputed from the consumer lists beside it.
+    """
+    report = _report()
+    assert 'POLLUTED' not in lms_healthcheck.render_table(report)
+
+    flipped = report.model_copy(
+        update={
+            'vram': report.vram.model_copy(
+                update={
+                    'pollution': lms_vram.PollutionState.POLLUTED,
+                    'pollution_reason': 'pid 4242 /usr/local/lib/ollama/'
+                                        'llama-server arrived mid-run',
+                }
+            )
+        }
+    )
+
+    table = lms_healthcheck.render_table(flipped)
+
+    assert 'POLLUTED' in table
+    assert '4242' in table
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
