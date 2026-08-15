@@ -1197,6 +1197,9 @@ class TestMilestoneRegistration:
     def test_registered_at_import(self):
         assert task_metadata_module._SUBMODEL_REGISTRY['milestone'] is Milestone
 
+    def test_registered_as_dict_cardinality(self):
+        assert task_metadata_module._SUBMODEL_CARDINALITY['milestone'] == 'dict'
+
     def test_round_trip_no_warnings(self):
         model, warnings = parse_metadata(
             {
@@ -1248,6 +1251,9 @@ class TestRoutingRegistration:
     def test_registered_at_import(self):
         assert task_metadata_module._SUBMODEL_REGISTRY['routing'] is RoutingState
 
+    def test_registered_as_dict_cardinality(self):
+        assert task_metadata_module._SUBMODEL_CARDINALITY['routing'] == 'dict'
+
     def test_round_trip_no_warnings(self):
         model, warnings = parse_metadata({'routing': self._VALID_ROUTING}, direction='write')
         assert warnings == []
@@ -1264,6 +1270,28 @@ class TestRoutingRegistration:
         assert warnings[0].field == 'routing'
         assert warnings[0].code == 'invalid_submodel'
         assert model.model_dump()['routing'] == {'history': 'bad'}
+
+
+class TestProductionRegistrationCardinality:
+    """The declared shape of every production registrant this module can see.
+
+    milestone and routing are pinned inside their own classes above; this
+    covers the remaining two shared/ registrants. delivered_checks — the ONE
+    genuinely list-valued slice — is pinned in
+    shared/tests/test_capability_manifest.py, next to its registration.
+    """
+
+    def test_merge_retry_pending_registered_as_dict(self):
+        assert task_metadata_module._SUBMODEL_CARDINALITY['merge_retry_pending'] == 'dict'
+
+    def test_deploy_state_resolves_to_dict_via_the_fail_closed_default(self):
+        # deploy_state is DELIBERATELY left undeclared (shared/deploy_state.py
+        # is not edited by task 4142): it is dict-shaped, the default is
+        # already correct for it, and this row pins that as an intentional
+        # property of the fail-closed default rather than an oversight.
+        # Expressed via .get so it holds whether or not shared.deploy_state
+        # happened to be imported in this pytest co-run.
+        assert task_metadata_module._SUBMODEL_CARDINALITY.get('deploy_state', 'dict') == 'dict'
 
 
 class TestMigrations:
