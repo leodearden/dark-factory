@@ -13,6 +13,15 @@ Precedence, strictly, one authoritative source per resolution::
 chain, not a union. A caller that declared its referents is believed over
 ambient harness metadata, which is believed over what the prose happens to say.
 
+Precedence selects the AUTHORITY, never the IDENTITY. The self-qualified
+reclassification — a reference qualified with the LOCAL project is an
+own-project referent, not a foreign one — is SOURCE-INVARIANT: all three paths
+apply it, through the one :func:`_local_project` helper, so a given spelling
+denotes the same node whichever source happens to win. A path that skipped it
+would hand a consumer a ``node_name`` for a foreign node that does not exist
+inside the local graph, which is the same misattribution failure arriving
+through the identity axis instead of the attribution one.
+
 This module compiles NO regex of its own and must never grow one. The derived
 path IS :func:`~fused_memory.utils.canonical_labels.scan_content`, the declared
 path builds :class:`~fused_memory.utils.canonical_labels.Referent` objects, and
@@ -160,6 +169,29 @@ class ReferentResolution:
     ambiguous: ReferentSet = ()
 
 
+def _local_project(group_id: str) -> str:
+    """The canonical project id *group_id* names, or ``''`` if it names none.
+
+    The single site for "is this qualifier actually US?", shared by
+    :func:`_declared_referents` and :func:`_metadata_referents` so the
+    self-qualified reclassification cannot drift between them. Two copies of
+    the rule is the lockstep duplication this module's docstring forbids under
+    INV-5 — and is demonstrably how the metadata path came to skip it.
+
+    ``scan_content`` answers an EMPTY scan for a path-shaped *group_id*; here
+    there is still a declaration or an explicit metadata value to honour, so
+    only the self-qualified RECLASSIFICATION is unavailable. The ``''`` return
+    is a sentinel no canonical project id can equal, and both call sites guard
+    on it (``referent.project_id and local``) so an untrustworthy local project
+    id keeps a FOREIGN referent foreign rather than silently collapsing it onto
+    the local project — strictly worse than the reclassification being missing.
+    """
+    try:
+        return canonicalize_project_id(group_id)
+    except PathShapedProjectIdError:
+        return ''
+
+
 def _conflicting_referents(declared: ReferentSet, scan: LabelScan) -> ReferentSet:
     """The declared referents the scanned content CONTRADICTS.
 
@@ -269,15 +301,7 @@ def _declared_referents(declared: list[dict], *, group_id: str) -> ReferentSet:
             f'declared referents must be a list, got {_safe_repr(declared)}. '
             f'{_DECLARED_REFERENT_HINT}'
         )
-    try:
-        local_project = canonicalize_project_id(group_id)
-    except PathShapedProjectIdError:
-        # scan_content answers an empty scan for a path-shaped group_id; here
-        # there is still a declaration to honour, so only the self-qualified
-        # RECLASSIFICATION is unavailable. Comparing against a sentinel no
-        # canonical project id can equal keeps a foreign declaration foreign
-        # rather than silently collapsing it onto the local project.
-        local_project = ''
+    local_project = _local_project(group_id)
 
     referents: list[Referent] = []
     seen: set[tuple[str, str, str]] = set()
@@ -333,8 +357,24 @@ def _declared_referents(declared: list[dict], *, group_id: str) -> ReferentSet:
     return tuple(referents)
 
 
-def _metadata_referents(metadata: dict) -> ReferentSet:
+def _metadata_referents(metadata: dict, *, group_id: str) -> ReferentSet:
     """Bridge ambient ``metadata['task_id']`` into a referent set, or ``()``.
+
+    A SELF-qualified value — one whose qualifier is the local project — is
+    RECLASSIFIED to an own-project referent, exactly as ``scan_content`` and
+    :func:`_declared_referents` do. All THREE paths now apply the same rule
+    through the same :func:`_local_project` helper, and that is load-bearing:
+    a spelling must denote the SAME node whichever source wins, so ``.source``
+    selects the AUTHORITY, never the IDENTITY. Without it a downstream verifier
+    or edge-surgery consumer keyed on ``node_name`` would hunt a foreign node
+    ``'dark_factory:3127'`` that does not exist inside the dark_factory graph
+    instead of the local ``'Task 3127'``, and conclude the fact is
+    unattributable — the exact misattribution this PRD exists to prevent,
+    reintroduced by the one path that skipped the rule.
+
+    Reclassification changes WHICH node the metadata names, never whether it
+    can conflict: this stays a bridge, not a claim about the prose, so the
+    metadata path still never populates ``.conflicts``.
 
     An unusable value is DROPPED, never raised on. This is asymmetric with the
     ``declared`` path (which raises — see :func:`_declared_referents`) and the
@@ -366,6 +406,22 @@ def _metadata_referents(metadata: dict) -> ReferentSet:
     # vocabulary at one site.
     referent = parse_node_name(text)
     if referent is not None:
+        # parse_node_name already CANONICALIZES the qualifier it parsed
+        # ('Dark-Factory:3127' -> project_id='dark_factory'), so only group_id
+        # needs canonicalizing here — do not add a second canonicalize of the
+        # parsed side.
+        #
+        # The `referent.project_id and local` guard is what keeps a foreign
+        # referent foreign when group_id is path-shaped: _local_project returns
+        # the '' sentinel there, which would otherwise compare equal to an
+        # own-project referent's empty project_id and fire the branch
+        # spuriously. Same guard, same reason, as on the declared path.
+        local = _local_project(group_id)
+        if referent.project_id and local and referent.project_id == local:
+            # Rebuilt through the constructor rather than dataclasses.replace,
+            # so the frozen vocabulary type's __post_init__ validation runs on
+            # the reclassified value too.
+            referent = Referent(kind=referent.kind, number=referent.number)
         return (referent,)
 
     # Exactly ONE shape of our own: the bare digit run that metadata.task_id
@@ -464,7 +520,7 @@ def resolve_referents(
     # about the content. An agent working on task 3668 legitimately writes
     # memories about Task 2500, so reconciling the two would reject a large
     # fraction of correct writes.
-    bridged = _metadata_referents(metadata)
+    bridged = _metadata_referents(metadata, group_id=group_id)
     if bridged:
         return ReferentResolution(source='metadata', referents=bridged, ambiguous=ambiguous)
 
