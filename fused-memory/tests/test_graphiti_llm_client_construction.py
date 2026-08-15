@@ -655,12 +655,14 @@ class TestStructuredOutputModeSelection:
         mock_config.llm.providers.anthropic = AnthropicProviderConfig(api_key='k')
         mock_config.llm.structured_output_mode = 'json_object'
 
-        with caplog.at_level(logging.WARNING, logger=graphiti_client_module.__name__):
-            with patch(
+        with (
+            caplog.at_level(logging.WARNING, logger=graphiti_client_module.__name__),
+            patch(
                 'graphiti_core.llm_client.anthropic_client.AnthropicClient',
                 MagicMock(name='AnthropicClient'),
-            ):
-                build_llm_client(mock_config)
+            ),
+        ):
+            build_llm_client(mock_config)
 
         assert any('structured_output_mode' in r.message for r in caplog.records)
 
