@@ -108,6 +108,17 @@ is re-applied as a commit-time assertion over the committed artifacts
 safe under later hand-editing. This is load-bearing: the healthy observations come from a config
 dir that really does hold a live OAuth access token.
 
+The scrub rewrites dict **keys** as well as values and guarantees cleanliness of the
+**JSON-encoded** form rather than the raw one — the encoding is what the gate scans, and JSON
+escaping can manufacture a credential-shaped run that raw scrubbing never sees. A sample that
+still fails verification degrades to a minimal `redaction_failed` row (identity fields only) plus
+a stderr warning rather than raising, because raising out of the sampling loop would discard an
+entire already-paid-for live capture instead of one sample. The config dir holding that token is
+reclaimed three ways: an exception-safe `finally` that wraps the credential write itself,
+`cleanup_at_exit` mirroring `--keep-config-dir` (so the flag that exists to preserve the dir is
+never silently overridden), and a once-per-process dead-PID sweep of
+`claude-config-startup-probe-*` for the SIGKILL case no teardown hook can cover.
+
 **No wall-clock assertions.** Every offset in this document is provenance. No test asserts a
 timing threshold — the observed ~5 s to transcript is a property of this machine and this CLI
 build, not a bound anyone can guarantee.

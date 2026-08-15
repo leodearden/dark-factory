@@ -144,7 +144,13 @@ access token (`TaskConfigDir.write_credentials`), so redaction is not optional
 here. It is enforced twice:
 
 - **capture time** — `startup_completion_probe.py` scans every assembled
-  observation before emitting it, and never inlines file contents;
+  observation before emitting it, and never inlines file contents. The scrub
+  rewrites dict **keys** as well as values and guarantees cleanliness of the
+  **JSON-encoded** form (what the gate actually scans), because JSON escaping
+  can manufacture a credential-shaped run that raw scrubbing never sees. A
+  sample that still fails verification degrades to a minimal `redaction_failed`
+  row plus a stderr warning rather than raising — one sample lost, not the whole
+  paid-for capture;
 - **commit time** — `assert_no_credential_material()` is asserted over the full
   text of both corpus files and the raw capture by `TestCorpusSecretHygiene`,
   so a later hand-edit cannot reintroduce what the probe would have refused to

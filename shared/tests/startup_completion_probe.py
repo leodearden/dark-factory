@@ -39,6 +39,14 @@ to a fixed safe field projection that excludes all prompt/response text.  The
 healthy observation is taken from a config dir that really does hold a live OAuth
 token in ``.credentials.json``, so this is load-bearing, not hygiene theatre.
 
+The scrub rewrites dict KEYS as well as values, and guarantees cleanliness of the
+JSON-ENCODED form rather than the raw one — the encoding is what the gate scans,
+and JSON escaping can manufacture a credential-shaped run that raw scrubbing
+never sees.  If a sample still fails verification after scrubbing, it degrades to
+a minimal ``redaction_failed`` row (identity fields only) plus a stderr WARNING
+rather than raising: losing one sample is bounded, whereas raising out of the
+sampling loop would discard an entire already-paid-for live capture.
+
 USAGE
 -----
     uv run --project shared python tests/startup_completion_probe.py \
