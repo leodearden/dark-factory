@@ -1498,6 +1498,25 @@ def test_systemd_analyze_verify_reports_no_ignored_directives() -> None:
        (which genuinely lack RestartSteps=) and zero for the dashboard unit.
        Both prefix forms above are covered — bare unit name for a semantic
        warning, full path plus line number for a parse warning.
+    6. The test needs a user RUNTIME DIR, not just the binary on PATH.
+       Measured 2026-08-12 in this worktree (systemd 255.4): with
+       XDG_RUNTIME_DIR unset or empty, ``systemd-analyze verify --user``
+       prints only "Failed to lookup RuntimeDirectory path: No such device or
+       address" / "Failed to initialize manager: No such device or address"
+       and emits ZERO per-unit diagnostic lines — the same silent-no-op class
+       point 1 guards against for stdout-only capture, reached here through a
+       different missing precondition — so ``_ignored_directive_lines``
+       returns ``[]`` and ``assert not ignored`` below passes having checked
+       nothing.  This bites in cron, ssh host-cmd, and any other headless
+       invocation with no pam_systemd session: contexts where
+       ``shutil.which()`` still succeeds, so the old gate (a bare
+       binary-on-PATH check) never fired.  DBUS_SESSION_BUS_ADDRESS was also
+       measured and is deliberately NOT part of the discriminator (unsetting
+       it alone still yields real per-unit diagnostics at exit 0), and a
+       nonexistent-but-declared XDG_RUNTIME_DIR path still works too — both
+       are recorded here so a future edit does not widen the gate into
+       over-skipping.  See ``_systemd_analyze_verify_skip_reason`` above for
+       the gate itself.
 
     Scoping is what makes ``--user`` safe to pass, and passing it is the point:
     this is a --user unit (WantedBy=default.target, installed under
