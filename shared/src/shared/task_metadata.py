@@ -36,6 +36,7 @@ __all__ = [
     'RoutingDecisionMirror',
     'RoutingState',
     'SchemaWarning',
+    'SubmodelCardinality',
     'TaskMetadata',
     'apply_migrations',
     'parse_metadata',
@@ -596,9 +597,48 @@ class TaskMetadata(BaseModel):
 # to know about it in advance. Keyed by the top-level metadata field name.
 _SUBMODEL_REGISTRY: dict[str, type[BaseModel]] = {}
 
+# The declared SHAPE of a registered slice's value: a single mapping
+# (``'dict'``) or a list of mappings (``'list'``).
+SubmodelCardinality = Literal['dict', 'list']
 
-def register_metadata_submodel(key: str, model: type[BaseModel]) -> None:
+# Cardinality lives in a PARALLEL dict rather than widening
+# _SUBMODEL_REGISTRY's value to a (model, cardinality) pair: six assertions
+# across four packages do `_SUBMODEL_REGISTRY[key] is SomeModel` identity
+# checks, and widening the value type would break all of them for zero
+# functional gain. The two dicts have exactly ONE writer
+# (register_metadata_submodel) so they cannot drift in normal use, and they
+# degrade in the SAFE direction if they ever do — see the read note in
+# register_metadata_submodel's docstring.
+_SUBMODEL_CARDINALITY: dict[str, SubmodelCardinality] = {}
+
+
+def register_metadata_submodel(
+    key: str,
+    model: type[BaseModel],
+    *,
+    cardinality: SubmodelCardinality = 'dict',
+) -> None:
     """Register ``model`` as the typed shape for ``metadata[key]``.
+
+    ``cardinality`` declares the shape of the slice's VALUE: ``'dict'`` means
+    it must be a single mapping, ``'list'`` a list of mappings. It is enforced
+    by :func:`parse_metadata`, which emits a ``wrong_cardinality``
+    :class:`SchemaWarning` (fatal under ``write``+``enforce``) for a value of
+    the other shape.
+
+    ``'dict'`` is the DEFAULT because it is fail-closed: it restores the
+    behavior that held before parse_metadata grew its list branch, so an
+    existing or future dict-shaped registrant needs no change and only a
+    genuinely list-valued slice (currently just ``delivered_checks``) opts in.
+    An undeclared key therefore gets the STRICT shape, whose failure mode is a
+    spurious warning on a genuinely list-valued slice — loud and immediately
+    fixed — rather than a silently-accepted malformed one (task 4142).
+
+    A key present in ``_SUBMODEL_REGISTRY`` but missing from
+    ``_SUBMODEL_CARDINALITY`` reads as ``'dict'``: the two dicts have one
+    writer, so they only desync if something reaches past this function, and
+    that desync degrades safely (parse_metadata iterates the registry, so a
+    stale cardinality entry for an absent key is never read).
 
     Idempotent when re-registering the *same* model object under the same
     key (e.g. a module reloaded/imported twice). Raises ``ValueError`` when a
@@ -618,6 +658,7 @@ def register_metadata_submodel(key: str, model: type[BaseModel]) -> None:
     if existing is not None and existing is not model:
         raise ValueError(f'metadata sub-model already registered for {key!r}')
     _SUBMODEL_REGISTRY[key] = model
+    _SUBMODEL_CARDINALITY[key] = cardinality
 
 
 # Milestone is the first real W10 registrant: registering at module-import
