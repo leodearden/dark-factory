@@ -9806,6 +9806,70 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         """
         self._runner_unavailable.pop(host, None)
 
+    def _local_host_name(self) -> str:
+        """Name of the local (trust-anchor) host, per the allocator when present."""
+        if isinstance(self._host_allocator, HostAllocator):
+            for _st in self._host_allocator.host_states():
+                if _st['is_local']:
+                    return _st['name']
+        return 'local'
+
+    def _quarantine_unreachable_host(self, host: str, reason: str, now: float) -> None:
+        """Quarantine *host* for an unreachability reason AND record it (task 3043).
+
+        INV-A — **a host is never removed from the acquirable pool for an
+        unreachability reason without a ``_runner_unavailable`` entry.**
+        :meth:`_reprobe_quarantined_hosts` can only re-adopt hosts it can see in
+        that tracker, so a quarantine without a record is a permanent strand:
+        the host stops being dispatched to and nothing can ever re-probe it,
+        until an orchestrator restart rebuilds the allocator.
+
+        Recovery from task 1795 was gated on a fragile *conjunction* — a host
+        was re-adoptable only if it was in BOTH the shared quarantine set and
+        the tracker — which three real paths violate: an orphaned verify task
+        whose ``RunnerUnavailable`` escapes after the outer coroutine was
+        cancelled, a ``cancel_and_release`` that leaves the slot PARKED against
+        a down host, and any future quarantine site that forgets to record.
+        Funnelling every RU-class quarantine through this ONE method makes the
+        invariant checkable by reading a single function instead of auditing N
+        call sites for a two-piece state update.
+
+        Order: quarantine first (so ``acquire_remote`` stops handing the host
+        out immediately — ``_runner_quarantine`` is shared BY REFERENCE with the
+        allocator, so this needs no allocator rebuild and no restart), then
+        record, then alarm.  Streak / ``first_unavailable_at`` / reason
+        semantics are DELEGATED to :meth:`_record_runner_unavailable` so they
+        are identical across this path and the existing RUNNER_UNAVAILABLE
+        finalize path, and the L1 alarm keeps the existing
+        ``has_open_l1`` dedup (exactly one open alarm per host per downtime
+        episode).
+
+        Local is a no-op: it is the trust anchor, is never quarantined, and has
+        no remote to probe for recovery.  None-safe throughout — with no
+        allocator the tracker entry is still written, so recovery remains
+        possible once one exists.
+        """
+        if host == self._local_host_name():
+            return
+
+        self._runner_quarantine.add(host)
+
+        _should_escalate = self._record_runner_unavailable(host, reason, now)
+        if not _should_escalate:
+            return
+
+        _entry = self._runner_unavailable.get(host)
+        _alarm_verify_host_unreachable(
+            self._escalation_queue,
+            host,
+            reason,
+            streak=_entry.streak if _entry is not None else 1,
+            duration_s=(
+                now - _entry.first_unavailable_at if _entry is not None else 0.0
+            ),
+            event_store=self._event_store,
+        )
+
     def _host_states_block(self, now: float) -> list[dict]:
         """Per-host slot state + quarantine classification for :meth:`snapshot`.
 
@@ -16906,7 +16970,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 _n_failed_val = False  # not a chain failure
                 if entry.lease is not None and self._host_allocator is not None:
                     await self._host_allocator.quarantine_and_release(entry.lease)
-                # ── Unavailability tracker + alarm (task 1795) ──────────────
+                # ── Unavailability tracker + alarm (tasks 1795, 3043) ──────
                 # Record the failure in the per-host streak tracker.  If the
                 # streak reaches the configured threshold (or the time-based
                 # threshold is exceeded via the reprobe loop) fire a dedup'd
@@ -16914,26 +16978,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # notified.  The dedup guard (has_open_l1) ensures exactly one
                 # open alarm per host per downtime episode regardless of how
                 # many RU events accumulate.
+                #
+                # Routed through the _quarantine_unreachable_host chokepoint
+                # (task 3043) so this path and the two strand paths (orphaned
+                # verify task, PARKED-slot release) share ONE implementation of
+                # "quarantine implies tracked".  quarantine_and_release above
+                # still owns the LEASE/slot; the chokepoint owns the shared
+                # quarantine set + tracker + alarm, and adding an
+                # already-quarantined name to that set is a no-op.
                 if entry.lease is not None:
-                    _ru_host = entry.lease.name
-                    _ru_reason = vr.reason or '<unknown>'
-                    _ru_now = time.time()  # capture once for consistent timestamps
-                    _should_escalate = self._record_runner_unavailable(
-                        _ru_host, _ru_reason, _ru_now
+                    self._quarantine_unreachable_host(
+                        entry.lease.name,
+                        vr.reason or '<unknown>',
+                        time.time(),
                     )
-                    if _should_escalate:
-                        _ru_entry = self._runner_unavailable.get(_ru_host)
-                        _alarm_verify_host_unreachable(
-                            self._escalation_queue,
-                            _ru_host,
-                            _ru_reason,
-                            streak=_ru_entry.streak if _ru_entry is not None else 1,
-                            duration_s=(
-                                _ru_now - _ru_entry.first_unavailable_at
-                                if _ru_entry is not None else 0.0
-                            ),
-                            event_store=self._event_store,
-                        )
                 # ── Dispose of the RU'd merge worktree (task 3251) ──────────
                 # _run_inflight_verify returns merge_wt UN-cleaned precisely so
                 # this chokepoint can dispose of it here, adjacent to the
