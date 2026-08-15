@@ -94,8 +94,9 @@ per-category ``scan_truncated``, ``ann_disabled_uncalibrated``, and
 how many categories ran on a cutoff measured on a different population). The
 liveness path adds ``liveness_snapshot_untasked`` (a recognised snapshot that
 resolves to no subject task, so no group can hold it) and
-``liveness_snapshot_unfielded`` (point-in-time framing whose live fields could
-not be read).
+``liveness_snapshot_unfielded`` (point-in-time framing over a live-status
+marker whose fields could not ALL be read — none parsed at all, or one
+recognised field's value could not be read while a sibling's did).
 
 Only chain-free evidence may DELETE
 -----------------------------------
@@ -422,6 +423,20 @@ _LIVE_FIELD_NAMES: tuple[str, ...] = (
 # the delimiter into the key; the characters it does admit (`-`, `.`, `/`,
 # `:`, `+`) are the ones real values need — `in-progress`, a path, an ISO
 # timestamp.
+#
+# A second alternative catches what the first cannot read: a bare
+# `<field>=` mention with no value the first alternative could consume.
+# Ordered, non-overlapping alternation is what makes this precise rather
+# than merely conservative. Python prefers the leftmost alternative and
+# `finditer` never revisits consumed characters, so at any position where
+# the strict alternative succeeds its ENTIRE match — quoted value included —
+# is consumed before scanning resumes; a sibling field name nested inside
+# that quoted value (`status="foo claimant_run_id=bar"`) is never
+# re-examined as a match of its own. The second alternative can therefore
+# only fire where the first alternative already failed at that position,
+# which is exactly "a recognised field was written in assignment form but
+# its value could not be read whole" — never a false hit on a value that
+# merely happens to contain another field's name.
 _LIVE_FIELD_ALT = '|'.join(_LIVE_FIELD_NAMES)
 _LIVE_FIELD_SCAN_RE = re.compile(
     r'\b(?P<field>' + _LIVE_FIELD_ALT + r')\s*=\s*'
@@ -450,9 +465,13 @@ def _classify_liveness_snapshot(content: str) -> tuple[bool, str | None]:
         * ``(False, None)`` — not a liveness snapshot, and not a loss either:
           the content never entered this detector's scope.
         * ``(True, None)`` — point-in-time framing over a live-status marker
-          whose fields could not be read whole. THE counted
-          ``liveness_snapshot_unfielded`` loss; the caller owns that counter,
-          so this function stays a pure classifier.
+          where NO assignment was readable, OR where ANY ONE recognised
+          field's value could not be read whole even though others did. THE
+          counted ``liveness_snapshot_unfielded`` loss; the caller owns that
+          counter, so this function stays a pure classifier. Never a partial
+          key: a key built from only the readable survivors would group
+          records that assert DIFFERENT facts, and under ``--apply`` a false
+          cluster like that is an irreversible delete.
         * ``(True, key)`` — a snapshot, with its canonical key.
 
         ``POINT_IN_TIME_CHECK_RE`` is consulted AT MOST ONCE per call, and not
@@ -466,13 +485,14 @@ def _classify_liveness_snapshot(content: str) -> tuple[bool, str | None]:
     # ``LIVE_TASK_STATUS_RE`` — and a non-match is the overwhelmingly common
     # case: this detector always runs, with no flag to disable it, over a
     # default 5000-records-per-category scan of mostly ordinary prose.
-    # The gate is SOUND because ``_LIVE_FIELD_ASSIGNMENT_RE`` is
-    # ``LIVE_TASK_STATUS_RE``'s first alternative plus extra obligations, so
-    # an assignment hit implies a live-status hit: a record failing this check
-    # could never have yielded a key anyway. A record it rejects reports
-    # ``framed=False`` even if the point-in-time framing would have matched —
-    # which is the intended contract, since such a record is out of scope
-    # rather than a loss.
+    # The gate is SOUND because both ``_LIVE_FIELD_SCAN_RE`` alternatives
+    # require ``LIVE_TASK_STATUS_RE``'s first alternative (a bare
+    # ``<field>=``) as a prefix, so a scan hit — readable OR unread — implies
+    # a live-status hit: a record failing this check could never have
+    # yielded a key, nor an unfielded loss, anyway. A record it rejects
+    # reports ``framed=False`` even if the point-in-time framing would have
+    # matched — which is the intended contract, since such a record is out
+    # of scope rather than a loss.
     if not LIVE_TASK_STATUS_RE.search(content):
         return False, None
     if not POINT_IN_TIME_CHECK_RE.search(content):
@@ -697,9 +717,13 @@ def find_liveness_snapshot_recurrences(
         ``liveness_snapshot_untasked`` (a recognised snapshot that resolves to
         no subject, so no bucket can hold it) and
         ``liveness_snapshot_unfielded`` (point-in-time framing over a
-        ``LIVE_TASK_STATUS_RE`` marker whose fields could not be read — a
-        paraphrase naming no fields, or a value ``_LIVE_FIELD_ASSIGNMENT_RE``
-        declines to read half-way, such as an unterminated quote).
+        ``LIVE_TASK_STATUS_RE`` marker whose fields could not ALL be read —
+        a paraphrase naming no fields, a value ``_LIVE_FIELD_SCAN_RE``
+        declines to read half-way (such as an unterminated quote), OR a
+        record where ONE recognised field's value could not be read whole
+        while a sibling's did. The verdict is per-field: any one of these
+        makes the WHOLE record a loss rather than a key built from the
+        survivors).
         Both are always present, always ints, always 0 on a clean run.
     """
     swept = set(categories)
