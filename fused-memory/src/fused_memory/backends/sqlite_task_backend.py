@@ -619,21 +619,30 @@ async def _migrate_v3_to_v4(
     v0->v1->v2->v3->v4 chain, where this audit is trivially clean.
 
     Returns a result dict ``{'index_built': bool, 'healed': [...],
-    'flagged': [...]}`` at every exit, INCLUDING the unexpected-failure path
-    -- ``healed``/``flagged`` are lists of per-group descriptor dicts
-    (``flagged`` entries are the same shape fed to
+    'flagged': [...], 'audit_complete': bool}`` at every exit, INCLUDING the
+    unexpected-failure path -- ``healed``/``flagged`` are lists of per-group
+    descriptor dicts (``flagged`` entries are the same shape fed to
     ``residual_dup_escalation_cb``; ``healed`` entries carry ``tag``/
-    ``candidate_key``/``canonical_id``/``cancelled_ids``). On the
-    unexpected-failure path, ``healed`` names exactly the groups whose
-    cancels were durably committed before the failure -- the group that was
-    still in flight when the failure hit is rolled back and, never having
-    been appended, can never appear here -- and ``flagged`` names the
-    ambiguous groups classified so far (a pure observation; nothing is
-    mutated for a flagged group either way). The connection-open call site
-    (``_migrate``) ignores this return value -- it exists so
-    ``SqliteTaskBackend.reaudit_candidate_key_index`` (the live, on-demand
-    re-run) can share this single implementation and report an accurate
-    status without a server restart.
+    ``candidate_key``/``canonical_id``/``cancelled_ids``).
+
+    ``audit_complete`` discriminates a full pass from a truncated one:
+    ``True`` on both normal exits (clean build, and self-gated-on-flagged --
+    the residual audit ran to completion either way, so ``flagged`` is the
+    EXHAUSTIVE set of ambiguous groups); ``False`` only on the
+    unexpected-failure path below, which additionally carries
+    ``'error': 'migration_failed'``. There, ``healed`` names exactly the
+    groups whose cancels were durably committed before the failure -- the
+    group that was still in flight when the failure hit is rolled back and,
+    never having been appended, can never appear here -- and ``flagged``
+    names only the ambiguous groups classified SO FAR (a pure observation;
+    nothing is mutated for a flagged group either way): callers must treat
+    it as a partial snapshot, not the full residual set, whenever
+    ``audit_complete`` is ``False``.
+
+    The connection-open call site (``_migrate``) ignores this return value
+    -- it exists so ``SqliteTaskBackend.reaudit_candidate_key_index`` (the
+    live, on-demand re-run) can share this single implementation and report
+    an accurate status without a server restart.
     """
     # Hoisted above the try/except so the failure path below can report the
     # groups this pass actually healed/flagged instead of hard-coding [].
@@ -697,14 +706,11 @@ async def _migrate_v3_to_v4(
                 )
             # Commit per group, BEFORE recording it in `healed_groups`, so the
             # list names exactly the groups whose cancels are durably on
-            # disk. That is what lets the outer `except` both roll back the
-            # in-flight group and report an accurate `healed` list: a group
-            # that raised partway through is rolled back and, never having
-            # been appended, is never claimed as healed. If this commit
-            # itself raises, the group is correctly absent from
-            # `healed_groups` and the except handler's rollback runs.
-            # (Also preserves the original reason this commit was not
-            # deferred to the clean-build commit below: a still-flagged
+            # disk -- see this function's docstring (Returns) for the full
+            # failure-path contract this establishes. If this commit itself
+            # raises, the group is correctly absent from `healed_groups` and
+            # the except handler's rollback (below) takes over.
+            # (Not deferred to the clean-build commit below: a still-flagged
             # group causes an early `return`, and healed cancels must
             # survive that skip rather than riding on a commit that may
             # never happen.)
@@ -758,7 +764,10 @@ async def _migrate_v3_to_v4(
                         'candidate_key group(s) for project_root=%r',
                         len(flagged_groups), project_root,
                     )
-            return {'index_built': False, 'healed': healed_groups, 'flagged': flagged_groups}
+            return {
+                'index_built': False, 'healed': healed_groups,
+                'flagged': flagged_groups, 'audit_complete': True,
+            }
 
         try:
             await conn.execute(
@@ -773,7 +782,10 @@ async def _migrate_v3_to_v4(
                 'clean audit (race?); skipping index build, user_version '
                 'stays at 3.',
             )
-            return {'index_built': False, 'healed': healed_groups, 'flagged': []}
+            return {
+                'index_built': False, 'healed': healed_groups,
+                'flagged': [], 'audit_complete': True,
+            }
 
         await conn.execute('PRAGMA user_version = 4')
         await conn.commit()
@@ -783,7 +795,10 @@ async def _migrate_v3_to_v4(
             '(tag, candidate_key) and advanced user_version to 4 '
             '(fm-task-dedup task A2).',
         )
-        return {'index_built': True, 'healed': healed_groups, 'flagged': []}
+        return {
+            'index_built': True, 'healed': healed_groups,
+            'flagged': [], 'audit_complete': True,
+        }
     except Exception:
         # Discard whatever this pass left pending. The migration runs on
         # `_get_connection`'s cached WRITE connection, opened via
@@ -795,25 +810,43 @@ async def _migrate_v3_to_v4(
         # connection that `_get_connection` then caches, and the very next
         # unrelated successful write -- `_txn` commits with no BEGIN/rollback
         # preamble -- silently flushes that partial heal to disk.
-        # Suppressed: this step must NEVER raise at connection-open (see
-        # docstring), so a failing rollback must not displace the real error.
-        with contextlib.suppress(Exception):
+        # The rollback itself must never displace the real error (this step
+        # must NEVER raise at connection-open, see docstring) -- but a
+        # failing rollback must not go silent either (no-silent-fail-soft):
+        # it means a partial heal may still be pending on the connection
+        # `_get_connection` is about to cache, i.e. the original bug,
+        # re-armed, so it's logged loudly rather than bare-suppressed.
+        try:
             await conn.rollback()
+        except Exception:
+            logger.exception(
+                'sqlite_task_backend: v3->v4 rollback failed after migration '
+                'error; a partial self-heal may still be pending on the '
+                'cached write connection for project_root=%r',
+                project_root,
+            )
         # Defensive backstop -- this step must NEVER raise at connection-open
         # (see docstring): a raising migration would crash-loop fused-memory.
         logger.exception(
             'sqlite_task_backend: schema v3->v4 migration failed unexpectedly; '
             'skipping (user_version stays below 4, retried on next open)',
         )
-        # Report what this pass actually did, not a hard-coded empty result:
-        # healed_groups names only durably-committed heals (the rollback
-        # above can only discard the still in-flight group, which by
-        # construction was never appended here -- see the per-group commit
-        # below), and flagged_groups is a pure observation either way.
-        # residual_dup_escalation_cb is deliberately NOT invoked here -- see
-        # the completed-audit path above; a half-finished pass must never
-        # fire a partial/misleading escalation.
-        return {'index_built': False, 'healed': healed_groups, 'flagged': flagged_groups}
+        # `healed`/`flagged` name exactly what this pass actually committed/
+        # classified before the failure hit -- see this function's docstring
+        # (Returns) for the full contract, and the per-group commit in the
+        # heal loop above for how `healed_groups` stays accurate. Marked
+        # `audit_complete=False` so callers know `flagged` is a partial
+        # snapshot here, not the exhaustive residual set. Deliberately does
+        # NOT invoke `residual_dup_escalation_cb` -- escalation stays on the
+        # completed-audit path above; a half-finished pass must never fire a
+        # partial/misleading escalation.
+        return {
+            'index_built': False,
+            'healed': healed_groups,
+            'flagged': flagged_groups,
+            'audit_complete': False,
+            'error': 'migration_failed',
+        }
 
 
 async def _claimant_columns_present(conn: aiosqlite.Connection) -> bool:
