@@ -799,6 +799,16 @@ class TestSliceCardinalityAtWriteBoundary:
     ``scheduler._milestone_time_gated`` fail-safe-withhold the task from
     dispatch indefinitely, with no escalation path.
 
+    Rows (d)-(e) cover the case the live store actually cares about: a row that
+    ALREADY carries the bad shape, written before the gate existed (see
+    :meth:`_land_a_list_milestone_row`). They pin the mirror image of
+    :class:`TestCuratorGateContradictionAtWriteBoundary`'s (d)-(f): this
+    finding is field-scoped, not the whole-blob sentinel, so an existing bad
+    row is NOT locked out of unrelated merge-mode writes — which is what makes
+    flipping this code fatal safe for the 378 live rows carrying the slice.
+    (e) is the repair, and asserts the row is genuinely CLEAN afterwards rather
+    than merely tolerated.
+
     Per this module's docstring these rows are an INTEGRATION gate, not a
     synthetic-input unit test: they are expected to be GREEN the moment the
     shared change lands, because the generic fatal-code policy already routes
@@ -905,3 +915,106 @@ class TestSliceCardinalityAtWriteBoundary:
 
         task = await backend.get_task(dto['id'], project_root=project_root)
         assert task['metadata'] == self._DICT_MILESTONE
+
+    async def _land_a_list_milestone_row(self, make_backend, project_root: str) -> str:
+        """Write a row carrying the bad shape the only way that is still possible.
+
+        Rows (a)/(b1) prove enforce-mode rejects this blob, so such a row can
+        only exist because it was written while ``task_metadata.enforce`` was
+        false — a RED-TIER restart-only flag — or by a writer that never went
+        through :class:`SqliteTaskBackend`. A live-store census for task 4142
+        found ZERO mismatched rows among the 378 carrying ``milestone`` or
+        ``delivered_checks``, so rows (d)-(e) pin FORWARD risk, not a current
+        breakage. Returns the task id.
+        """
+        warn_backend = await make_backend(enforce=False)
+        dto = await warn_backend.add_task(
+            project_root=project_root, title='t',
+            metadata=json.dumps(self._LIST_MILESTONE),
+        )
+        # The warn-mode write really did land the bad shape (I1: the raw list
+        # is retained unswapped) — otherwise (d)/(e) would prove nothing.
+        landed = await warn_backend.get_task(dto['id'], project_root=project_root)
+        assert landed['metadata'] == self._LIST_MILESTONE
+        return dto['id']
+
+    @pytest.mark.asyncio
+    async def test_unrelated_merge_on_a_list_milestone_row_succeeds(
+        self, make_backend, tmp_path, caplog,
+    ):
+        """(d) an already-bad row is NOT stranded — the fatal code is field-scoped.
+
+        This is the assertion that makes flipping ``wrong_cardinality`` fatal
+        safe under the already-live ``task_metadata.enforce: true``: the
+        warning's ``field`` is ``milestone``, not the whole-blob sentinel, so
+        the ``w.field in incoming_keys`` gate leaves a ``files`` edit alone.
+        Deliberately the OPPOSITE outcome from
+        ``TestCuratorGateContradictionAtWriteBoundary`` row (d), where a
+        whole-model invariant DOES lock the row out — recorded here so the
+        difference reads as designed rather than accidental.
+
+        Non-fatal is not silent, though: the census line still fires on every
+        write that touches the row, which is the operator's signal to repair it.
+        """
+        project_root = str(tmp_path / 'legacy')
+        task_id = await self._land_a_list_milestone_row(make_backend, project_root)
+
+        enforce_backend = await make_backend(enforce=True)
+        with caplog.at_level(
+            logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'
+        ):
+            caplog.clear()
+            await enforce_backend.update_task(
+                task_id, project_root=project_root,
+                metadata=json.dumps({'files': ['orchestrator/src/orchestrator/thing.py']}),
+                metadata_mode='merge',
+            )
+
+        census = _schema_warning_messages(caplog)
+        assert len(census) == 1, f'Expected exactly one census line; got {census}'
+        assert 'code=wrong_cardinality' in census[0]
+
+        # The unrelated edit landed, and the untouched bad slice is retained
+        # verbatim rather than being coerced or dropped behind the operator.
+        task = await enforce_backend.get_task(task_id, project_root=project_root)
+        assert task['metadata']['files'] == ['orchestrator/src/orchestrator/thing.py']
+        assert task['metadata']['milestone'] == self._LIST_MILESTONE['milestone']
+
+    @pytest.mark.asyncio
+    async def test_list_milestone_row_repaired_by_merging_a_dict_milestone(
+        self, make_backend, tmp_path, caplog,
+    ):
+        """(e) the repair path: a merge supplying the correct dict fixes the row.
+
+        The merged whole validates clean, so ``milestone`` being in
+        ``incoming_keys`` costs nothing — the write a human or a fixer script
+        would make is exactly the write that is accepted. The follow-on
+        unrelated merge is the point: it now emits ZERO census lines, proving
+        the row is genuinely repaired rather than merely tolerated the way (d)
+        tolerates it.
+        """
+        project_root = str(tmp_path / 'legacy')
+        task_id = await self._land_a_list_milestone_row(make_backend, project_root)
+        enforce_backend = await make_backend(enforce=True)
+
+        await enforce_backend.update_task(
+            task_id, project_root=project_root,
+            metadata=json.dumps(self._DICT_MILESTONE),
+            metadata_mode='merge',
+        )
+        task = await enforce_backend.get_task(task_id, project_root=project_root)
+        assert task['metadata']['milestone'] == self._DICT_MILESTONE['milestone']
+
+        with caplog.at_level(
+            logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'
+        ):
+            caplog.clear()
+            await enforce_backend.update_task(
+                task_id, project_root=project_root,
+                metadata=json.dumps({'files': ['orchestrator/src/orchestrator/thing.py']}),
+                metadata_mode='merge',
+            )
+
+        assert _schema_warning_messages(caplog) == []
+        task = await enforce_backend.get_task(task_id, project_root=project_root)
+        assert task['metadata']['files'] == ['orchestrator/src/orchestrator/thing.py']
