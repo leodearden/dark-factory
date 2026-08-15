@@ -385,3 +385,60 @@ async def test_write_failure_mid_stamp_leaves_original_sidecar_intact(tmp_path, 
     assert leftovers == []
 
     task_interceptor.update_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('traversal_style', ['relative_dotdot', 'absolute'])
+async def test_containment_refuses_traversal_prd_path(tmp_path, caplog, traversal_style):
+    """A derived sidecar path that resolves outside project_root must be
+    refused by the containment guard — both a relative '../' escape and an
+    absolute prd_path reach the guard (via different pathlib routes) and
+    must both be blocked. With no safe candidate surviving, the call
+    returns None (the documented no-sidecar no-op contract), the escaping
+    file is never read or written, and the ONLY observable is a server-side
+    WARNING log — there is no report to attach the refusal to."""
+    project_root = tmp_path / 'proj'
+    (project_root / 'plans').mkdir(parents=True)
+    outside_dir = tmp_path / 'outside'
+    outside_dir.mkdir()
+    evil_path = outside_dir / 'evil-prd.capability-manifest.yaml'
+    evil_text = _mechanical_sidecar_yaml('evil', ['alpha'])
+    evil_path.write_text(evil_text, encoding='utf-8')
+
+    if traversal_style == 'relative_dotdot':
+        prd_path = '../outside/evil-prd.md'
+    else:
+        prd_path = str(outside_dir / 'evil-prd.md')
+
+    task_interceptor = AsyncMock()
+    ids = ['1']
+    tasks_data = [
+        {
+            'id': '1',
+            'metadata': {'prd_path': prd_path, 'prd_task_label': 'alpha'},
+        },
+    ]
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.server.manifest_stamping'):
+        result = await stamp_capability_manifests(
+            project_root=str(project_root),
+            ids=ids,
+            tasks_data=tasks_data,
+            task_interceptor=task_interceptor,
+        )
+
+    assert result is None
+    task_interceptor.update_task.assert_not_called()
+
+    # Load-bearing security assertion: the escaping file was never read or
+    # written back.
+    assert evil_path.read_text(encoding='utf-8') == evil_text
+
+    warning_records = [r for r in caplog.records if r.levelname == 'WARNING']
+    assert len(warning_records) == 1, (
+        f'Expected exactly 1 WARNING; got {len(warning_records)}: '
+        f'{[r.getMessage() for r in warning_records]}'
+    )
+    message = warning_records[0].getMessage()
+    assert 'resolve outside project_root' in message
+    assert 'evil-prd.capability-manifest.yaml' in message
