@@ -338,19 +338,23 @@ def classify_error_content(content: Any) -> tuple[int | None, str | None]:
         matches = list(pattern.finditer(text))
         if not matches:
             continue
-        dissenting = [
+        designed = [
             match for match in matches
-            if match.group('outcome').lower() not in designed_tokens
+            if match.group('outcome').lower() in designed_tokens
         ]
-        if dissenting:
-            return _declared_exit_code(dissenting[0], text), None
+        dissenting = [match for match in matches if match not in designed]
+        # A code a DESIGNED declaration carries is explained by it; any
+        # other code in the blob is unexplained evidence of a failure.
         unaccounted = [
             code
-            for code in _exit_codes(text, ignoring=tuple(m.span() for m in matches))
+            for code in _exit_codes(text, ignoring=tuple(m.span() for m in designed))
             if code != BOUNDED_WAIT_EXIT_CODE
         ]
-        if unaccounted:
-            return unaccounted[0], None
+        if dissenting or unaccounted:
+            declared = dissenting[0].groupdict().get('code') if dissenting else None
+            if declared is not None:
+                return int(declared), None
+            return (unaccounted[0] if unaccounted else _extract_exit_code(text)), None
         return _declared_exit_code(matches[-1], text), label
 
     codes = _exit_codes(text)
