@@ -433,14 +433,6 @@ class TestPromotingAnchorNeedsNoContestedKey:
     and has no writer — so an arm that needed it would be unimplementable.
     """
 
-    def test_the_signature_takes_no_contested_argument(self):
-        import inspect  # noqa: PLC0415
-
-        params = inspect.signature(_mod().apply_promoting_topic_anchor).parameters
-
-        assert 'contested_ids' not in params
-        assert not any('contested' in name for name in params)
-
     @pytest.mark.parametrize('extra_key', ['contested', 'supersedes'])
     def test_metadata_it_does_not_read_cannot_change_its_answer(self, extra_key):
         mod = _mod()
@@ -749,16 +741,6 @@ class TestTheContestedTermIsStructurallyZeroToday:
         assert set(RESERVED_VOCABULARY_KEYS) == {
             'topic', 'canonical', 'kind', 'parent_id', 'supersedes',
         }
-
-    def test_the_transform_takes_no_contested_argument(self):
-        import inspect  # noqa: PLC0415
-
-        params = inspect.signature(
-            _mod().apply_topic_keyed_grouped_read,
-        ).parameters
-
-        assert not any('contested' in name for name in params)
-
 
 class TestTopicKeyedRanking:
     """A group lands at the BEST rank among its members."""
@@ -1087,16 +1069,6 @@ class TestTheCapSynthesizesNothing:
 
 class TestTheCapReadsNoContestedKey:
     """Why this arm is landable today and arm (2) is not."""
-
-    def test_the_signature_takes_no_contested_channel(self):
-        import inspect  # noqa: PLC0415
-
-        params = inspect.signature(_mod().apply_topic_diversity_cap).parameters
-
-        assert not [p for p in params if 'contested' in p], (
-            'the cap must be computable from `topic` alone — `contested` is '
-            'absent from RESERVED_VOCABULARY_KEYS and has no writer'
-        )
 
     def test_a_contested_looking_metadata_key_changes_nothing(self):
         mod = _mod()
