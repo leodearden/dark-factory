@@ -12,7 +12,9 @@ this repo now does about them.
 > literal into a source, test, or doc file forces the authoring agent to emit
 > that literal inside its own tool call — reproducing the exact bug this
 > document describes and corrupting the file being written. The same rule is
-> enforced in code with the `\x3c` escape; see the comment at the top of
+> enforced in code with the `\x3c` escape; see the "Sentinel-literal hazard"
+> section at the top of `shared/src/shared/toolcall_markup.py` — the owner of
+> the rule — and, secondarily, the matching comment in
 > `fused-memory/src/fused_memory/utils/toolcall_xml_leak.py`.
 
 ---
@@ -23,10 +25,73 @@ Two failure shapes were reported separately and looked like two problems. They
 are **one defect with two manifestations**, and it lives at the harness's
 tool-call XML serialization boundary, **upstream of this repository**.
 
-The mechanism: the harness's tool-call parser terminates a string **argument**
-early when a literal closing tag appears inside that argument's *value*. An
-agent writing a task description that quotes `&#60;/description>` therefore
-ends the `description` argument at that point, mid-value.
+The mechanism: the model emits a parameter's **closing** tag in the wrong
+dialect — echoing the parameter *name* (`&#60;/description>`, `&#60;/content>`,
+`&#60;/rationale>`) instead of the canonical `&#60;/parameter>` — and frequently
+continues the remaining parameters in that same wrong dialect. The harness's
+tool-call parser does not find the closer it expects. It **over-consumes**: it
+runs forward to the next available terminator — a later well-formed
+`&#60;/parameter>`, else `&#60;/invoke>` — dumps everything it swallowed along
+the way into the *current* parameter's value, and **silently drops every
+parameter in between**.
+
+That direction, not early termination, is what the evidence requires. The
+observed signature is a fragment **inside** the stored value *and* sibling
+parameters **missing**. Early termination is inconsistent with both halves at
+once: it would end the argument *at* the tag, so the fragment would be
+**absent** from the stored text rather than embedded in it, and the parser
+would resume normally at the next parameter, so the siblings would be
+**intact** rather than missing. Only over-consumption produces both halves
+together — a fragment landing inside the value *and* everything between it
+and the fallback terminator disappearing.
+
+### The four specimen shapes
+
+Four measured specimens (`plans/toolcall-markup-containment-prd.md` §2.1) show
+the mechanism end to end — what the model emitted, what the parser actually
+kept, and what silently never arrived:
+
+| Call | Value tail (as parsed) | Keys received | Dropped |
+|---|---|---|---|
+| `submit_task` 07-30T16:47Z | `…direction.&#60;/description>\n&#60;priority>medium&#60;/priority>\n&#60;agent_id>…&#60;/agent_id>\n&#60;metadata">{…}&#60;/metadata">\n&#60;/invoke>` | `project_root, title, description` | **priority, agent_id, metadata** |
+| `submit_task` 08-04T12:13Z | `…automatically).&#60;/description>\n&#60;parameter name="priority">low` | no `priority` | **priority** (intended `low`) |
+| `add_memory` 08-04T16:58Z | `…by design.&#60;/content>\n&#60;/invoke>` | all | none — `content` was the **last** parameter, so over-consumption ran straight to the invoke closer with nothing in between |
+| `update_memory` 08-02T21:26Z | `…scoped).&#60;/parameter>\n&#60;parameter name="agent_id">escalation-watcher-l2` | no `agent_id` | **agent_id** — that boundary is **ungated**, so the corrupted value landed |
+
+Specimen 1's metadata tags are a literal blend of the two dialects — a stray
+double quote before the angle bracket, the model interpolating between the
+canonical `&#60;parameter name="X">` opener and the name-echoing `&#60;X>`
+form. `shared.toolcall_markup`'s repairer carries a one-character blend
+tolerance (the trailing `"?` in its closer/opener regexes) for exactly this
+specimen — without it, the blended item is leftover text and the repair is
+rejected.
+
+### Blast radius
+
+334 corrupted calls out of 128,066 tool calls measured = **0.26%**
+(`plans/toolcall-markup-containment-prd.md` §2.3; measured from the archived
+agent transcripts against the collection predicate stated in PRD §2 — the
+tree grows live, so a later re-run will find a larger denominator). Per
+server:
+
+| Server | Corrupted calls | Guarded at measurement (2026-08-05) |
+|---|---|---|
+| orchestrator/plan-tools | 198 (59.3%) | **no** |
+| fused-memory | 96 (28.7%) | 4 of 6 write tools |
+| orchestrator/verdict-tools | 19 (5.7%) | **no** |
+| escalation | 18 (5.4%) | **no** |
+| Claude Code builtins (`Agent`, `Edit`) | 3 (0.9%) | out of scope — not our servers |
+
+Top victims: `add_design_decision.rationale` (109), `add_memory.content` (90),
+`add_design_decision.decision` (33), `add_reuse_item.how` (33),
+`submit_review_verdict.summary` (19), `escalate_info.detail` (17).
+
+The "no" rows are not permanent. Closing that coverage gap is owned by the
+containment PRD's middleware-registration task (task 3690, registering
+`MarkupGuardMiddleware` on all four servers) — once that lands, three of the
+rows above go stale. The column is dated for exactly that reason: it
+describes coverage **at measurement**, not coverage today, so this table
+cannot silently rot into a false present-tense claim.
 
 ### The negative evidence that settles it
 
@@ -36,7 +101,7 @@ That parser does not exist. Measured on the base branch:
 | Probe | Result |
 |---|---|
 | `ElementTree` / `xml.etree` / `lxml` / `BeautifulSoup` / `html.parser` in `fused-memory/src/` | **zero hits** — there is no XML parser in fused-memory at all |
-| Serialized tool-call literals in any production write path across `fused-memory/src/`, `orchestrator/src/`, `shared/src/`, `escalation/src/` | **zero hits** — nothing in this repo ever emits one |
+| Serialized tool-call literals in any production write path across `fused-memory/src/`, `orchestrator/src/`, `shared/src/`, `escalation/src/` | **zero hits that emit envelope markup** — the only literal-grep hits are prose mentions inside guard-module docstrings (`markup_tripwire.py`'s own hazard description); no production code path in this repo emits one |
 | `submit_task` / `update_task` priority parameter | `priority: str \| None = None` — no enum, no `Literal[...]`, no pydantic `Field` |
 
 Since nothing here parses or emits tool-call XML, a fragment appearing in
@@ -54,17 +119,54 @@ in this repo, though:
 
 Both catch `None`. Neither logs anything.
 
+### The single literal source (INV-5)
+
+`shared/src/shared/toolcall_markup.py` (task 3688) is now the **one** place
+the envelope literals are enumerated.
+`fused_memory.server.markup_tripwire.MCP_MARKUP_PATTERNS`
+(`markup_tripwire.py:68`) and
+`fused_memory.utils.toolcall_xml_leak.PREFILTER_NEEDLES`
+(`toolcall_xml_leak.py:124`) are both now **re-exports** of names defined
+there — two named predicates over one literal set, not two literal sets —
+and no third site enumerates them.
+
+That arrangement preserves the write-time recall-first vs. read-time
+precision calibration split: `MCP_MARKUP_PATTERNS` still over-reports on
+purpose at the write boundary, where a false positive costs only a retry,
+and `PREFILTER_NEEDLES` still under-reports on purpose over already-stored
+content, where a false positive would silently rewrite a user's memory.
+Be precise about what the consolidation does and does not remove. It
+removes the **independent spelling**: the two lists are no longer typed out
+at two sites, so they can no longer drift apart by accident. It does *not*
+collapse their membership, which still differs by calibration —
+`MCP_MARKUP_PATTERNS` carries one closing tag (plus the opener prefix and
+the invoke closer) while `PREFILTER_NEEDLES` carries the four parameter
+closers, and `ENVELOPE_LITERALS` is their union.
+
+So the write-time **diagnostic gap is still open today**.
+`markup_tripwire.find_markup_pattern` (`markup_tripwire.py:170`) still
+scans `MCP_MARKUP_PATTERNS` only, so a mis-closed `description` at the
+fused-memory write boundary still cannot report its own tag and still
+blames whatever happens to follow it. What closes that gap is `detect()`
+over `ENVELOPE_LITERALS` — the earliest literal by position over the full
+union — reaching the write boundary when `MarkupGuardMiddleware` is
+registered on the four servers (task 3690, the same task the coverage
+table above is dated against). Until then, read a write-time `matched_pattern`
+as "an envelope literal was seen here", not as "this is the tag that was
+mis-closed".
+
 ---
 
 ## 2. The two manifestations
 
 ### Vector 1 — sibling-argument loss (silent, and the dangerous one)
 
-Early termination swallows not just the rest of the offending argument but
-**every argument that followed it**. `priority` never reaches the MCP
-boundary, arrives as `None`, and `priority or 'medium'` substitutes a
-plausible wrong value. The intended priority survives only as *text inside the
-description*, where nothing reads it.
+Over-consumption swallows every parameter between the mis-closed tag and the
+terminator it falls back to, so those parameters silently never reach the MCP
+boundary. `priority` never reaches the MCP boundary, arrives as `None`, and
+`priority or 'medium'` substitutes a plausible wrong value. The intended
+priority survives only as *text inside the description*, where nothing reads
+it.
 
 Nothing is logged. Nothing looks broken. The task simply runs at the wrong
 priority forever.
@@ -80,16 +182,19 @@ vector.
 
 ### Vector 2 — content self-duplication (visible)
 
-The truncated argument's remainder is re-appended into the same field,
-yielding a visible tail plus a verbatim self-duplicate of the body text.
+The text over-consumption dumped into the surviving value leaves a visible
+tail plus a verbatim duplicate of the body text — the same shape the sweep
+classifies as `repairable_duplicate` (§5).
 
 Evidence: Mem0 records **9f2d2ae6** and **c759c53b** (both 2026-07-27).
 
-These are the same defect seen from two sides: vector 1 is what happens to the
-arguments *after* the truncation point, vector 2 is what happens to the text
-*at* it. Treating them as one is not a rhetorical claim — it is enforced in
-code by a single shared detector,
-`fused_memory.utils.toolcall_xml_leak`, which all three consumers import.
+These are the same defect seen from two sides: vector 1 is what happens to
+the parameters over-consumption swallowed, vector 2 is what happens to the
+text it dumped into the surviving value. Treating them as one is not a
+rhetorical claim — it is enforced in code by a single shared detector,
+`fused_memory.utils.toolcall_xml_leak` (whose literals are now
+`shared.toolcall_markup` re-exports; see §1), which all three consumers
+import.
 
 ---
 
@@ -126,7 +231,7 @@ failure class this whole task exists to kill.
 
 | Change | What it does |
 |---|---|
-| `fused_memory/utils/toolcall_xml_leak.py` | The single shared detector. Promoted from `scripts/scan_task_toolcall_leaks.py` (task 2939) and generalized for the Mem0 specimens. |
+| `fused_memory/utils/toolcall_xml_leak.py` | The single shared detector. Promoted from `scripts/scan_task_toolcall_leaks.py` (task 2939) and generalized for the Mem0 specimens; its envelope literals are now `shared.toolcall_markup` re-exports (task 3688, §1). |
 | `fused_memory/server/markup_tripwire.py` (task 3141 — NOT this task) | Live rejection at the MCP write boundary. Listed here only so the picture is complete; see "The boundary rejection" below for why this task ships no guard of its own. |
 | `Mem0Backend.scan_payload_text` → `MemoryService.scan_memory_content` → `scan_memory_content` MCP tool | The missing read capability (§3). |
 | `fused-memory/scripts/sweep_toolcall_xml_leak.py` | The corpus sweep (§5). |
@@ -145,10 +250,12 @@ That guard is `fused_memory/server/markup_tripwire.py`, delivered by task 3141.
 **This task deliberately ships no write-boundary guard of its own.** An earlier
 revision of this branch did, and it had to be withdrawn: it would have been a
 second enumeration of the envelope literals at the same four call sites, which
-directly contradicts the invariant 3141 states in `markup_tripwire.py` and in
-the `add_memory` docstring — that module is *"deliberately the only place in the
-package that enumerates the literals."* Two rival guards at one boundary is
-precisely the drift this task exists to close, not to reproduce.
+directly contradicts the invariant `shared/src/shared/toolcall_markup.py` now
+states — that it, not `markup_tripwire.py`, is the **one** owner of the
+envelope-literal enumeration (INV-5), and `markup_tripwire.MCP_MARKUP_PATTERNS`
+is merely a re-export from it (§1, "The single literal source"). Two rival
+guards at one boundary is precisely the drift this task exists to close, not
+to reproduce.
 
 The division of labour that survives is real and worth stating, because the two
 detectors are calibrated in **opposite** directions on purpose:
@@ -163,8 +270,11 @@ detectors are calibrated in **opposite** directions on purpose:
 Neither is redundant, and they must not be collapsed. A write-time false
 positive costs the caller one retry; a sweep-time false positive silently
 rewrites content a user wrote. That asymmetry is the whole justification for
-maintaining two detectors, and it is why the sweep does not simply reuse the
-tripwire's pattern list.
+maintaining two detectors — but it justifies two *predicates*, not two
+*literal lists*. Both are now derived from the single literal vocabulary
+defined once in `shared.toolcall_markup` — see §1, "The single literal
+source" for the two tuples' exact membership. What still differs, on
+purpose, is method and calibration, exactly as the table above states.
 
 One diagnostic did not survive the withdrawal and is worth recovering later:
 the retired guard's message named the **sibling-argument risk** explicitly —
@@ -408,6 +518,10 @@ Not addressed here.
 - `fused-memory/tests/test_toolcall_xml_leak_sweep_artifacts.py` — validates any
   committed sweep artifact by re-running `classify_record` over each record's own
   stored content; hermetic, so it does not need Qdrant up
+- `shared/src/shared/toolcall_markup.py` (task 3688) — the owner of the
+  envelope-literal enumeration (INV-5); `markup_tripwire` and
+  `toolcall_xml_leak` both re-export from it (§1, "The single literal
+  source")
 - `fused-memory/src/fused_memory/utils/toolcall_xml_leak.py` — the detector,
   and the rationale for its deliberately conservative real-whitespace
   discriminator (which excludes the tasks 2938/2939 false-positive shape)
