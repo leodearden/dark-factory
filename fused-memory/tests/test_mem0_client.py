@@ -1556,10 +1556,26 @@ class TestAmbientBaseUrlPrecedenceIsReported:
     announced (docs/legibility/design-invariants.md, no-silent-fail-soft).
     """
 
+    #: Every ambient var ``warn_if_ambient_base_url_is_overridden`` inspects.
+    #: Both are live in the wild (mem0 still honours the deprecated
+    #: ``OPENAI_API_BASE`` spelling), so a test that sets only one is at the
+    #: mercy of whatever the host/CI runner exports for the other.
+    AMBIENT_VARS = ('OPENAI_BASE_URL', 'OPENAI_API_BASE')
+
     @pytest.fixture(autouse=True)
-    def _clear_warn_cache(self):
+    def _clear_warn_cache(self, monkeypatch):
+        """Reset the once-per-process warn cache AND the ambient environment.
+
+        Clearing both vars here (rather than per-test) means every test in
+        this class starts from a known-empty ambient environment and then
+        sets only the var it means to exercise — otherwise an inherited
+        ``OPENAI_API_BASE`` on the runner adds a second pair of warnings and
+        flips the count assertions red.
+        """
         from fused_memory.config.env_precedence import reset_warning_cache
 
+        for var in self.AMBIENT_VARS:
+            monkeypatch.delenv(var, raising=False)
         reset_warning_cache()
         yield
         reset_warning_cache()
@@ -1586,10 +1602,8 @@ class TestAmbientBaseUrlPrecedenceIsReported:
 
         assert not [r for r in caplog.records if 'OPENAI_BASE_URL' in r.message]
 
-    def test_unset_env_is_silent(self, mock_config, monkeypatch, caplog):
-        for var in ('OPENAI_BASE_URL', 'OPENAI_API_BASE'):
-            monkeypatch.delenv(var, raising=False)
-
+    def test_unset_env_is_silent(self, mock_config, caplog):
+        # Both ambient vars are already cleared by the autouse fixture.
         with caplog.at_level(logging.WARNING):
             Mem0Backend(mock_config)._build_config_dict('c')
 
