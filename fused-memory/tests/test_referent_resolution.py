@@ -445,6 +445,112 @@ class TestMetadataBridgeDropsUnusableValues:
         assert resolution.source == 'derived'
 
 
+class TestSelfQualifiedReclassificationIsSourceInvariant:
+    """One spelling denotes ONE node, whichever source wins.
+
+    ``scan_content`` reclassifies a SELF-qualified reference — one whose
+    qualifier is the local project — back to an own-project referent, and the
+    declared path mirrors it (see
+    :meth:`TestDeclaredPath.test_a_self_qualified_project_id_is_reclassified_as_own_project`).
+    The metadata bridge was the one path that skipped the rule, so
+    ``metadata={'task_id': 'dark_factory:3127'}`` in group ``dark_factory``
+    produced a FOREIGN referent whose ``node_name`` is ``'dark_factory:3127'``
+    while the other two paths produced ``'Task 3127'``.
+
+    That is the exact failure class this PRD exists to prevent, arriving
+    through the identity axis rather than the attribution one: a downstream
+    verifier or edge-surgery consumer keyed on ``node_name`` would hunt a
+    foreign node that does not exist inside the dark_factory graph and conclude
+    the fact is unattributable — a wrong answer produced by the mechanism meant
+    to prevent wrong answers, varying with which source happened to win.
+    ``.source`` must select the AUTHORITY, never the IDENTITY.
+    """
+
+    def test_all_three_paths_agree_on_a_self_qualified_spelling(self):
+        """The load-bearing assertion. A future divergence in ANY path fails
+        here, which is why this is one test over three inputs rather than three
+        unrelated per-path tests."""
+        by_path = {
+            'declared': resolve_referents(
+                declared=[{'kind': 'task', 'id': 3127, 'project_id': 'dark_factory'}],
+                metadata={},
+                content='',
+                group_id=GROUP,
+            ),
+            'metadata': resolve_referents(
+                declared=None,
+                metadata={'task_id': 'dark_factory:3127'},
+                content='',
+                group_id=GROUP,
+            ),
+            'derived': resolve_referents(
+                declared=None,
+                metadata={},
+                content='see dark_factory:3127',
+                group_id=GROUP,
+            ),
+        }
+        for source, resolution in by_path.items():
+            assert resolution.source == source
+            assert resolution.referents == (Referent(kind='task', number='3127'),), source
+            assert resolution.referents[0].project_id == '', source
+            assert resolution.referents[0].node_name == 'Task 3127', source
+
+    def test_a_non_canonical_self_qualified_task_id_is_canonicalized_first(self):
+        """Case and hyphen/underscore spelling are rendering choices, not
+        different projects, so canonicalization has to happen BEFORE the
+        is-this-us comparison — mirroring the declared path's
+        ``test_a_non_canonical_project_id_is_canonicalized``."""
+        resolution = resolve_referents(
+            declared=None,
+            metadata={'task_id': 'Dark-Factory:3127'},
+            content='',
+            group_id=GROUP,
+        )
+        assert resolution.referents == (Referent(kind='task', number='3127'),)
+        assert resolution.referents[0].node_name == 'Task 3127'
+        assert resolution.source == 'metadata'
+
+    def test_a_genuinely_foreign_qualifier_is_not_reclassified(self):
+        """REGRESSION GUARD: the fix must not over-reach and collapse FOREIGN
+        referents onto the local project. Re-pins
+        ``test_a_qualified_task_id_bridges_to_a_foreign_referent`` under the
+        reclassifying code path."""
+        resolution = resolve_referents(
+            declared=None, metadata={'task_id': 'reify:3127'}, content='', group_id=GROUP
+        )
+        assert resolution.referents == (
+            Referent(kind='task', project_id='reify', number='3127'),
+        )
+        assert resolution.source == 'metadata'
+
+    def test_a_path_shaped_group_id_neither_raises_nor_reclassifies(self):
+        """Mirrors ``_declared_referents``'s ``''``-sentinel fallback: the scan
+        is empty for a path-shaped group, but an explicit metadata value is
+        still bridged, and the sentinel must never compare equal to a real
+        canonical project id — otherwise an untrustworthy local project id
+        would start silently collapsing foreign referents onto it, strictly
+        worse than the bug being fixed."""
+        resolution = resolve_referents(
+            declared=None, metadata={'task_id': 'reify:3127'}, content='', group_id='../etc'
+        )
+        assert resolution.referents == (
+            Referent(kind='task', project_id='reify', number='3127'),
+        )
+        assert resolution.source == 'metadata'
+
+    def test_a_path_shaped_qualifier_is_still_dropped_rather_than_raised(self):
+        """Pre-existing behaviour (``parse_node_name`` answers None for these),
+        pinned here so the reclassification edit cannot turn a DROP into a RAISE
+        on the ambient-metadata path — which is documented as never failing a
+        write."""
+        resolution = resolve_referents(
+            declared=None, metadata={'task_id': '../etc:3127'}, content='', group_id=GROUP
+        )
+        assert resolution.referents == ()
+        assert resolution.source == 'none'
+
+
 class TestDeclaredPath:
     """An explicit declaration is the strongest source and is honoured verbatim.
 
