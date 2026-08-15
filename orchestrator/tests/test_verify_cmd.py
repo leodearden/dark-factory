@@ -1173,6 +1173,57 @@ class TestUnterminatedQuoteRefusesFlagSplicing:
             is False
         )
 
+    @pytest.mark.parametrize(
+        ('mutate', 'raw'),
+        [
+            pytest.param(mutate, raw, id=f'{mutator_label}-{case_label}')
+            for mutator_label, mutate, _suffix in _SUBSHELL_MUTATORS
+            for case_label, raw, _corrupt_prefix in _UNTERMINATED_SPAN_CASES
+        ],
+    )
+    def test_a_refused_rewrite_returns_the_callers_own_command(self, mutate, raw):
+        """IDENTITY, not equality — and why equality cannot pin this.
+
+        The mutators still reach ``replace(cmd, raw=...)`` on the raw branch,
+        and ``_append_to_raw_pytest_invocations`` returns *raw* unchanged on
+        refusal, so an ``==`` version of this assertion passes with the
+        identity guard entirely absent: ``replace`` yields an
+        equal-but-DISTINCT object.
+
+        Identity is what makes verify.py's existing ``if rewritten is parsed:
+        return cmd`` guard fire — ``_serial_pytest_str`` and
+        ``_with_pytest_numprocesses_str`` both hold one — and that guard is
+        the only thing keeping the returned command BYTE-identical rather
+        than a from-scratch ``render()`` re-render, which is merely
+        argv-equivalent. Same rationale ``_with_junitxml_str``'s
+        ``test_noop_is_byte_identical`` records for its own ``is`` assertion.
+        """
+        cmd = parse_config_command(raw)
+        assert cmd.raw is not None
+        assert mutate(cmd) is cmd
+
+    @pytest.mark.parametrize(
+        ('mutate', 'suffix'),
+        [
+            pytest.param(mutate, suffix, id=label)
+            for label, mutate, suffix in _SUBSHELL_MUTATORS
+        ],
+    )
+    def test_the_identity_noop_does_not_over_fire(self, mutate, suffix):
+        """A lazy ``return cmd`` in every raw branch must NOT pass.
+
+        ``_PAREN_PRESERVING_CASES``' keyword-expression row is a raw-retained
+        chain measured to produce ZERO unterminated spans, so it must still
+        be rewritten — a new object, with the flags actually present.
+        """
+        raw = 'pytest -k "not (slow or integration)" tests/ && true'
+        cmd = parse_config_command(raw)
+        assert cmd.raw is not None
+
+        result = mutate(cmd)
+        assert result is not cmd
+        assert render(result) == f'pytest -k "not (slow or integration)" tests/{suffix} && true'
+
 
 class TestSeparateTokenValueFlagBinding:
     """A pytest separate-token value flag (-k/-m/-p/-o/-n/...) must bind to its
