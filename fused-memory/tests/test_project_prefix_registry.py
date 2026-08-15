@@ -348,7 +348,14 @@ class TestProjectForPathAbsolute:
         assert registry.project_for_path('/anything/x.py') is None
 
     def test_relative_path_behaviour_unchanged(self, registry):
-        """Explicit regression block: the RELATIVE regime is byte-identical."""
+        """Regression block: task 3109's ABSOLUTE work left these unchanged.
+
+        Scoped to 3109 on purpose — it does NOT claim the relative regime is
+        untouched in general. Task 4156 added lexical normalisation there, and
+        every assertion below survives it unchanged (none of these spellings
+        carries a '..' segment or a redundant separator). See
+        TestRelativePathNormalisation for what 4156 did change.
+        """
         assert registry.project_for_path('orchestrator/foo.py') == 'dark_factory'
         assert registry.project_for_path('crates') == 'reify'
         assert registry.project_for_path('./orchestrator/x') == 'dark_factory'

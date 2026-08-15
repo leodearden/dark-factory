@@ -330,9 +330,11 @@ class ProjectPrefixRegistry:
             # regimes are disjoint by construction — a registered prefix is
             # always a top-level dir name, so it can never lead an absolute
             # path, and roots are always absolute, so they can never match a
-            # relative candidate. This early return is therefore a
-            # short-circuit, not a semantic change for relative input, which
-            # keeps the prefix scan below byte-identical.
+            # relative candidate. That disjointness is what made ADDING this
+            # early return in 3109 a pure short-circuit, leaving the relative
+            # verdicts of the day untouched — a fact about that change, not a
+            # standing claim about the scan below, which has since grown its
+            # own normalisation (task 4156). This is a regime selector.
             return self._owner_for_absolute_path(path)
 
         path = os.path.normpath(path)
