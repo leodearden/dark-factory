@@ -1809,7 +1809,14 @@ async def _settled_lane_lock_holder_pids(
     module globals INSIDE the body, and ``lane_lock_holder_pids`` is likewise
     called by bare module-global name — so a ``monkeypatch.setattr`` on either
     is honoured, the same call-time-resolution seam
-    ``wait_for_lane_lock_holder`` documents on the test side.
+    ``wait_for_lane_lock_holder`` documents on the test side.  Passing them
+    EXPLICITLY is the second, independent knob, and not dead surface: it is
+    how ``test_a_permanently_empty_read_degrades_and_never_raises`` bounds the
+    poll without a wall clock at all (``interval=0``), where narrowing the
+    global instead would leave its read count riding on two ``asyncio.sleep``
+    calls landing inside a 50ms budget.  BOTH production sites deliberately
+    pass neither, so the two raise sites cannot drift apart on the bound — a
+    per-site override is exactly the divergence the shared constant prevents.
     """
     pids = lane_lock_holder_pids(lock_path)
     if pids or _lane_lock_identity(lock_path) is None:

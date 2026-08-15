@@ -794,11 +794,15 @@ class TestRequireLaneLockHolders:
 # predicate, degrading a loud B13 escalation into a quiet contended defer.
 #
 # Pinned here in isolation against an INJECTED reader — the same convention as
-# the two classes above — so every case is deterministic, touches no real lock
-# and no real /proc/locks, and asserts NO elapsed wall clock (this repo's
-# 1335/1836/2819/3451/3491 load-sensitive flake class).  The end-to-end
-# behaviour at both real call sites is pinned separately, further below, by
-# `TestContendedRaiseSurvivesALossyHolderRead`.
+# the two classes above — so every case is deterministic, and touches no real
+# lock and no real /proc/locks.  No case asserts on ELAPSED wall clock (this
+# repo's 1335/1836/2819/3451/3491 load-sensitive flake class); the one case
+# that must observe the helper polling at all bounds the loop through the
+# explicit `timeout=`/`interval=0` parameters instead of shrinking the module
+# global, which leaves its read count robust by orders of magnitude rather than
+# by two sleeps (task 3783 review amendment — see that case's docstring).  The
+# end-to-end behaviour at both real call sites is pinned separately, further
+# below, by `TestContendedRaiseSurvivesALossyHolderRead`.
 # ---------------------------------------------------------------------------
 
 
@@ -897,11 +901,23 @@ class TestSettledLaneLockHolderRead:
         would be promoted into a merge failure at the one site whose job is
         to report why a merge is deferring.
 
-        The bound is narrowed through the module-global seam
-        (``_LANE_LOCK_HOLDER_SETTLE_SECS``), which also pins that the helper
-        resolves it at CALL time rather than freezing it into a def-time
-        default — the same seam requirement ``wait_for_lane_lock_holder``
-        documents for its reader.
+        The bound is narrowed through the ``timeout``/``interval`` PARAMETERS
+        rather than the module globals, for two reasons (task 3783 review
+        amendment).  They are the only caller-facing knobs the helper exposes,
+        so leaving them unexercised would make them dead surface; and
+        ``interval=0`` removes the wall clock from the poll-count assertion
+        below.  With the shipped 0.02s gap, a ``0.05s`` bound leaves room for
+        barely two sleeps, so a scheduling hiccup could legitimately produce a
+        SINGLE read and turn this case into one more member of the repo's
+        1335/1836/2819/3451/3491 load-sensitive flake class — precisely the
+        class this whole task exists to shrink.  At ``interval=0`` each
+        iteration is a bare loop yield, so "more than one read in 10ms" holds
+        by three or four orders of magnitude rather than by two sleeps.
+        Call-time resolution of the module globals is pinned separately and
+        deterministically by
+        ``test_the_settle_bound_is_read_from_the_module_globals_at_call_time``;
+        the shipped default pair is exercised by
+        ``test_polls_past_a_lossy_empty_read`` above.
         """
         from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
 
@@ -915,9 +931,10 @@ class TestSettledLaneLockHolderRead:
             return []
 
         monkeypatch.setattr(git_ops_mod, 'lane_lock_holder_pids', _always_empty)
-        monkeypatch.setattr(git_ops_mod, '_LANE_LOCK_HOLDER_SETTLE_SECS', 0.05)
 
-        result = await git_ops_mod._settled_lane_lock_holder_pids(lock_path)
+        result = await git_ops_mod._settled_lane_lock_holder_pids(
+            lock_path, timeout=0.01, interval=0,
+        )
 
         assert result == [], (
             f'an exhausted settle must return the empty snapshot unchanged so '
@@ -927,6 +944,50 @@ class TestSettledLaneLockHolderRead:
             f'the helper must actually have polled before degrading — a bound '
             f'that never re-reads is the one-shot read this task removes; the '
             f'reader was called {len(calls)} time(s)'
+        )
+
+    async def test_the_settle_bound_is_read_from_the_module_globals_at_call_time(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """An omitted bound resolves from the GLOBAL, not a def-time default.
+
+        The seam every end-to-end case in this suite narrows the bound
+        through (``monkeypatch.setattr(git_ops_mod,
+        '_LANE_LOCK_HOLDER_SETTLE_SECS', ...)``), and the same call-time
+        resolution requirement ``wait_for_lane_lock_holder`` documents for its
+        reader: a default frozen into the signature at def time would be
+        immune to that patch, and every consumer narrowing the bound would
+        silently pay the full 0.5s instead.
+
+        Deterministic with NO wall-clock dependence at all: a bound of ``0``
+        makes ``time.monotonic() < deadline`` false on its first evaluation
+        (monotonic never goes backwards), so the poll body cannot run even
+        once and the read count is exactly one.  Were the 0.5s default frozen
+        instead, the same reader would be called ~25 times.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()  # stat-able: NOT the structural-empty short-circuit
+
+        calls: list[Path] = []
+
+        def _always_empty(path: Path) -> list[int]:
+            calls.append(path)
+            return []
+
+        monkeypatch.setattr(git_ops_mod, 'lane_lock_holder_pids', _always_empty)
+        monkeypatch.setattr(git_ops_mod, '_LANE_LOCK_HOLDER_SETTLE_SECS', 0)
+
+        result = await git_ops_mod._settled_lane_lock_holder_pids(lock_path)
+
+        assert result == []
+        assert len(calls) == 1, (
+            f'a zeroed _LANE_LOCK_HOLDER_SETTLE_SECS must be honoured, which '
+            f'it can only be if the helper reads the module global INSIDE its '
+            f'body; a def-time default would poll ~25 times regardless of the '
+            f'patch, and every test that narrows the bound would quietly pay '
+            f'the full 0.5s; the reader was called {len(calls)} time(s)'
         )
 
     async def test_an_unstatable_lock_path_is_answered_in_one_read(
