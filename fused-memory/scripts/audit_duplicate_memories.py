@@ -488,8 +488,9 @@ def _classify_liveness_snapshot(content: str) -> tuple[bool, str | None]:
         cleaned = ' '.join(
             (m.group('quoted') or m.group('bare')).split(),
         ).rstrip('./:+-').lower()
-        if cleaned:
-            pairs.add(f"{m.group('field').lower()}={cleaned}")
+        if not cleaned:
+            return True, None
+        pairs.add(f"{m.group('field').lower()}={cleaned}")
     if not pairs:
         return True, None
     return True, '|'.join(sorted(pairs))
