@@ -15,6 +15,7 @@ Covers:
 """
 
 import asyncio
+import logging
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -3430,6 +3431,231 @@ class TestReprobeIsTrackerDriven:
         )
         assert alloc.readmitted == []
         assert 'down-host' in worker._runner_unavailable
+
+
+# ---------------------------------------------------------------------------
+# 3043/step-13 RED: the reprobe DECISION must be observable
+# ---------------------------------------------------------------------------
+
+
+def _mq_records_naming(caplog, host: str) -> list:
+    """merge_queue records whose rendered message names *host*.
+
+    Filtered to the ``orchestrator.merge_queue`` logger so records emitted by
+    the recovery helpers (``orchestrator.merge_liveness``) cannot inflate the
+    per-host decision count.
+    """
+    return [
+        r for r in caplog.records
+        if r.name == 'orchestrator.merge_queue' and host in r.getMessage()
+    ]
+
+
+@pytest.mark.asyncio
+class TestReprobeObservability:
+    """Every reprobe sweep DECISION is greppable by host name (task 3043).
+
+    Task 3275 made per-host *state* observable in ``snapshot()['hosts']`` and
+    the heartbeat; it did NOT make this sweep's *decisions* observable.  The
+    sweep emits nothing on a skip, nothing on a failed probe and nothing on the
+    ``_host_allocator is None`` early return, so "did the loop run, and what did
+    it decide for this host?" is unanswerable from the orchestrator log — which
+    is why the reify 2026-07-25 post-mortem had to argue from the ABSENCE of
+    dispatch attempts.  That is the silent degradation the project's
+    loud-over-silent norm prohibits.
+
+    Assertions are on the presence/count of records naming the host, never on
+    exact prose, so these pin observability rather than wording.
+
+    RED until step-14 adds the decision logging.
+    """
+
+    _make_worker_with_reprobe = TestReprobeQuarantinedHosts._make_worker_with_reprobe
+    _seed_ru_tracker = TestReprobeQuarantinedHosts._seed_ru_tracker
+
+    # ── (a) one decision record per probed host ─────────────────────────────
+
+    async def test_recovery_emits_one_decision_record(self, caplog):
+        """health()=True → exactly one merge_queue record naming the host."""
+        worker, eq = self._make_worker_with_reprobe()
+
+        runner = MagicMock()
+        runner.health = AsyncMock(return_value=True)
+        alloc = _FakeAllocatorForReprobe({}, unquarantined={'up-host': runner})
+        worker._host_allocator = alloc  # type: ignore[assignment]
+
+        now = 1000.0
+        self._seed_ru_tracker(worker, 'up-host', first_unavailable_at=now - 300.0)
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+            await worker._reprobe_quarantined_hosts(now)
+
+        recs = _mq_records_naming(caplog, 'up-host')
+        assert len(recs) == 1, f'expected exactly one decision record; got {[r.getMessage() for r in recs]}'
+        assert '300' in recs[0].getMessage(), (
+            f'the recovery decision must report downtime; got {recs[0].getMessage()!r}'
+        )
+
+    async def test_still_unreachable_emits_one_decision_record(self, caplog):
+        """health()=False → exactly one merge_queue record naming the host + downtime."""
+        worker, eq = self._make_worker_with_reprobe(escalate_after_secs=0.0)
+
+        runner = MagicMock()
+        runner.health = AsyncMock(return_value=False)
+        alloc = _FakeAllocatorForReprobe({}, unquarantined={'down-host': runner})
+        worker._host_allocator = alloc  # type: ignore[assignment]
+
+        now = 1000.0
+        self._seed_ru_tracker(worker, 'down-host', first_unavailable_at=now - 450.0)
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+            await worker._reprobe_quarantined_hosts(now)
+
+        recs = _mq_records_naming(caplog, 'down-host')
+        assert len(recs) == 1, f'expected exactly one decision record; got {[r.getMessage() for r in recs]}'
+        assert '450' in recs[0].getMessage(), (
+            f'the still-unreachable decision must report downtime; got {recs[0].getMessage()!r}'
+        )
+
+    async def test_each_host_in_a_multi_host_sweep_is_named(self, caplog):
+        """A mixed sweep emits one record per host — no host is silently skipped."""
+        worker, eq = self._make_worker_with_reprobe(escalate_after_secs=0.0)
+
+        up = MagicMock()
+        up.health = AsyncMock(return_value=True)
+        down = MagicMock()
+        down.health = AsyncMock(return_value=False)
+        alloc = _FakeAllocatorForReprobe({}, unquarantined={'up-host': up, 'down-host': down})
+        worker._host_allocator = alloc  # type: ignore[assignment]
+
+        now = 1000.0
+        self._seed_ru_tracker(worker, 'up-host', first_unavailable_at=now - 10.0)
+        self._seed_ru_tracker(worker, 'down-host', first_unavailable_at=now - 10.0)
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+            await worker._reprobe_quarantined_hosts(now)
+
+        assert len(_mq_records_naming(caplog, 'up-host')) == 1
+        assert len(_mq_records_naming(caplog, 'down-host')) == 1
+
+    # ── (b) unresolvable runner → WARNING, sweep continues ──────────────────
+
+    async def test_unresolvable_runner_warns_and_sweep_continues(self, caplog):
+        """A tracked host with no runner handle is a strand — say so, loudly.
+
+        It must also not cost the rest of the sweep: a second, resolvable
+        tracked host is still probed and still recovered.
+        """
+        worker, eq = self._make_worker_with_reprobe()
+
+        good = MagicMock()
+        good.health = AsyncMock(return_value=True)
+        alloc = _FakeAllocatorForReprobe({}, unquarantined={'ok-host': good})
+        worker._host_allocator = alloc  # type: ignore[assignment]
+        assert alloc.remote_runner('ghost-host') is None, 'fixture precondition'
+
+        now = 1000.0
+        self._seed_ru_tracker(worker, 'ghost-host', first_unavailable_at=now - 60.0)
+        self._seed_ru_tracker(worker, 'ok-host', first_unavailable_at=now - 60.0)
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+            await worker._reprobe_quarantined_hosts(now)
+
+        ghost_warnings = [
+            r for r in _mq_records_naming(caplog, 'ghost-host')
+            if r.levelno >= logging.WARNING
+        ]
+        assert len(ghost_warnings) == 1, (
+            'an unresolvable tracked host must produce exactly one WARNING; got '
+            f'{[(r.levelname, r.getMessage()) for r in _mq_records_naming(caplog, "ghost-host")]}'
+        )
+        # The sweep is not aborted by the strand.
+        assert alloc.readmitted == ['ok-host']
+        assert len(_mq_records_naming(caplog, 'ok-host')) == 1
+
+    # ── (c) allocator missing while the tracker is non-empty ────────────────
+
+    async def test_missing_allocator_with_tracked_hosts_warns(self, caplog):
+        """_host_allocator is None + non-empty tracker → WARNING naming the count."""
+        worker, eq = self._make_worker_with_reprobe()
+        worker._host_allocator = None
+
+        self._seed_ru_tracker(worker, 'host-a', first_unavailable_at=900.0)
+        self._seed_ru_tracker(worker, 'host-b', first_unavailable_at=900.0)
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+            await worker._reprobe_quarantined_hosts(1000.0)  # must not raise
+
+        warns = [
+            r for r in caplog.records
+            if r.name == 'orchestrator.merge_queue' and r.levelno >= logging.WARNING
+        ]
+        assert len(warns) == 1, (
+            f'expected one WARNING for an absent allocator with tracked hosts; got {warns}'
+        )
+        assert '2' in warns[0].getMessage(), (
+            f'the WARNING must name the tracked-host count; got {warns[0].getMessage()!r}'
+        )
+        # No recovery happened — the tracker is untouched.
+        assert set(worker._runner_unavailable) == {'host-a', 'host-b'}
+
+    async def test_missing_allocator_with_empty_tracker_is_silent(self, caplog):
+        """The common no-verify-yet case must not log every interval."""
+        worker, eq = self._make_worker_with_reprobe()
+        worker._host_allocator = None
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+            await worker._reprobe_quarantined_hosts(1000.0)
+
+        assert [r for r in caplog.records if r.name == 'orchestrator.merge_queue'] == []
+
+    # ── (d) healthy steady state is silent ──────────────────────────────────
+
+    async def test_empty_tracker_emits_nothing(self, caplog):
+        """No tracked hosts → no records at all (no per-interval log noise)."""
+        worker, eq = self._make_worker_with_reprobe()
+
+        runner = MagicMock()
+        runner.health = AsyncMock(return_value=True)
+        alloc = _FakeAllocatorForReprobe({}, unquarantined={'idle-host': runner})
+        worker._host_allocator = alloc  # type: ignore[assignment]
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+            await worker._reprobe_quarantined_hosts(1000.0)
+
+        assert [r for r in caplog.records if r.name == 'orchestrator.merge_queue'] == [], (
+            'the sweep runs every verify_host_reprobe_interval_s (120 s) — the '
+            'healthy steady state must be completely silent'
+        )
+
+    # ── (e) PARK-safety skip is a decision too ──────────────────────────────
+
+    async def test_park_safety_skip_emits_one_record(self, caplog):
+        """health green but probe_clean() False → one record naming the host."""
+        worker, eq = self._make_worker_with_reprobe()
+
+        runner = MagicMock()
+        runner.health = AsyncMock(return_value=True)
+        runner.probe_clean = AsyncMock(return_value=False)
+        alloc = _FakeAllocatorForReprobe(
+            {}, unquarantined={'parked-host': runner}, parked={'parked-host'}
+        )
+        worker._host_allocator = alloc  # type: ignore[assignment]
+
+        now = 1000.0
+        self._seed_ru_tracker(worker, 'parked-host', first_unavailable_at=now - 60.0)
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+            await worker._reprobe_quarantined_hosts(now)
+
+        recs = _mq_records_naming(caplog, 'parked-host')
+        assert len(recs) == 1, (
+            'a park-safety skip is a decision and must be greppable; got '
+            f'{[r.getMessage() for r in recs]}'
+        )
+        assert 'park' in recs[0].getMessage().lower(), (
+            f'the skip record must state the host stayed parked; got {recs[0].getMessage()!r}'
+        )
 
 
 # ---------------------------------------------------------------------------
