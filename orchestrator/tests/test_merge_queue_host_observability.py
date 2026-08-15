@@ -27,12 +27,17 @@ Steps covered:
 from __future__ import annotations
 
 import asyncio
+import json as _json
+import logging
+import sqlite3
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_queue import (
     DecidedItem,
@@ -542,3 +547,208 @@ class TestSnapshotOccupancyLossless:
         assert occ['inflight_total'] == 0
         assert occ['hosts_busy'] == 0
         self._assert_derivation_invariant(occ)
+
+
+# ── 3275/step-7 RED: heartbeat names a quarantined host inline ────────────────
+
+
+def _read_heartbeat_hosts(db_path: Path):
+    """Read the persisted merge_heartbeat event's `hosts` key back out of sqlite."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        rows = conn.execute(
+            "SELECT json_extract(data, '$.hosts') "
+            "FROM events WHERE event_type = 'merge_heartbeat' ORDER BY rowid"
+        ).fetchall()
+    finally:
+        conn.close()
+    return rows
+
+
+def _hb_message(caplog) -> str:
+    records = [r for r in caplog.records if 'heartbeat' in r.message.lower()]
+    assert records, f'Expected a heartbeat log; got: {[r.message for r in caplog.records]}'
+    return records[-1].message
+
+
+@pytest.mark.asyncio
+class TestHeartbeatDegradation:
+    """The heartbeat line must say a host is quarantined, inline.
+
+    Three 2026-07 incidents were diagnosed only by hand-correlating a
+    `verifying 1/2 hosts` line against allocator internals.  The DEGRADED
+    segment makes the degradation readable from the log with no MCP round
+    trip, and the merge_heartbeat event carries the same facts structurally.
+
+    RED until 3275/step-8 adds the segment.
+    """
+
+    def _worker_with_events(self, git_ops: GitOps, tmp_path: Path, name: str = 'deg'):
+        event_store = EventStore(db_path=tmp_path / f'{name}.db', run_id=f'{name}-test')
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q, event_store=event_store)
+        worker._heartbeat_interval_s = 1.0
+        runners = [_FakeRemoteRunner('laptop')]
+        alloc = HostAllocator(runners, quarantine=worker._runner_quarantine)
+        worker._host_allocator = alloc
+        return worker, alloc, runners[0], tmp_path / f'{name}.db'
+
+    def _add_local_inflight(
+        self, worker, config: OrchestratorConfig, git_repo: Path, task_id: str = 'hb-local',
+    ) -> None:
+        req = _make_req(task_id, f'task/{task_id}', config, git_repo)
+        lease = HostLease(name='local', runner=MagicMock(), is_local=True)
+        worker._inflight.append(_make_entry(req, lease, started_at=time.time() - 10.0))
+
+    async def test_quarantined_host_named_inline_with_class(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path, caplog,
+    ) -> None:
+        """A DEGRADED segment names the host and its quarantine class."""
+        worker, _alloc, _runner, _db = self._worker_with_events(git_ops, tmp_path)
+        self._add_local_inflight(worker, config, git_repo)
+        worker._runner_quarantine.add('laptop')
+        _seed_ru(worker, 'laptop')
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+            assert worker._maybe_log_queue_heartbeat(time.time()) is True
+
+        msg = _hb_message(caplog)
+        assert 'DEGRADED' in msg, f'no degradation segment; got: {msg!r}'
+        assert 'laptop' in msg, msg
+        assert 'ru' in msg, msg
+        assert '1/2' in msg, f'must report <quarantined>/<total> hosts; got: {msg!r}'
+
+    async def test_occupancy_segment_is_untouched(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path, caplog,
+    ) -> None:
+        """The degradation segment is APPENDED, not a replacement."""
+        worker, _alloc, _runner, _db = self._worker_with_events(git_ops, tmp_path, 'deg2')
+        self._add_local_inflight(worker, config, git_repo)
+        worker._runner_quarantine.add('laptop')
+        _seed_ru(worker, 'laptop')
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+            assert worker._maybe_log_queue_heartbeat(time.time()) is True
+
+        msg = _hb_message(caplog)
+        assert 'verifying' in msg, msg
+        assert 'local' in msg, msg
+        assert 'hb-local' in msg, msg
+        assert 'DEGRADED' in msg, msg
+        # Order: occupancy suffix first, then degradation.
+        assert msg.index('verifying') < msg.index('DEGRADED'), msg
+
+    async def test_divergence_class_is_distinguishable(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path, caplog,
+    ) -> None:
+        """No RU tracker entry → the line says 'divergence', not 'ru'."""
+        worker, _alloc, _runner, _db = self._worker_with_events(git_ops, tmp_path, 'deg3')
+        self._add_local_inflight(worker, config, git_repo)
+        worker._runner_quarantine.add('laptop')
+        assert 'laptop' not in worker._runner_unavailable
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+            assert worker._maybe_log_queue_heartbeat(time.time()) is True
+
+        msg = _hb_message(caplog)
+        assert 'DEGRADED' in msg, msg
+        assert 'laptop=divergence' in msg, f"expected 'laptop=divergence'; got: {msg!r}"
+
+    async def test_no_degraded_noise_when_healthy(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path, caplog,
+    ) -> None:
+        """Regression guard: nothing quarantined → no DEGRADED substring at all."""
+        worker, _alloc, _runner, _db = self._worker_with_events(git_ops, tmp_path, 'deg4')
+        self._add_local_inflight(worker, config, git_repo)
+        assert not worker._runner_quarantine
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+            assert worker._maybe_log_queue_heartbeat(time.time()) is True
+
+        msg = _hb_message(caplog)
+        assert 'DEGRADED' not in msg, f'no host quarantined, yet: {msg!r}'
+        # The occupancy segment is byte-identical to today's.
+        assert ' | verifying 1/2 hosts: local=hb-local' in msg, msg
+        assert msg.endswith('local=hb-local'), f'nothing may follow it; got: {msg!r}'
+
+    async def test_degraded_reported_with_nothing_in_flight(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path, caplog,
+    ) -> None:
+        """The case the `if occ['by_host']:` gate makes invisible.
+
+        depth > 0 from a QUEUED (leaseless) entry while _inflight is empty:
+        occupancy has nothing to say, but the pool IS degraded.  The
+        degradation segment must be built independently of that gate.
+        """
+        worker, _alloc, _runner, _db = self._worker_with_events(git_ops, tmp_path, 'deg5')
+        req = _make_req('hb-queued', 'task/hb-queued', config, git_repo)
+        worker._register_item(req)
+        worker._runner_quarantine.add('laptop')
+        _seed_ru(worker, 'laptop')
+
+        snap = worker.snapshot()
+        assert snap['depth'] > 0
+        assert snap['occupancy']['by_host'] == {}, 'precondition: occupancy is silent here'
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+            assert worker._maybe_log_queue_heartbeat(time.time()) is True
+
+        msg = _hb_message(caplog)
+        assert 'verifying' not in msg, f'occupancy segment must stay gated; got: {msg!r}'
+        assert 'DEGRADED' in msg, f'degradation must NOT be gated on by_host; got: {msg!r}'
+        assert 'laptop=ru' in msg, msg
+
+    async def test_structured_event_carries_hosts(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path,
+    ) -> None:
+        """The log line must not be the only carrier (structured-facts-at-failure)."""
+        worker, _alloc, _runner, db_path = self._worker_with_events(git_ops, tmp_path, 'deg6')
+        self._add_local_inflight(worker, config, git_repo)
+        worker._runner_quarantine.add('laptop')
+        _seed_ru(worker, 'laptop')
+
+        assert worker._maybe_log_queue_heartbeat(time.time()) is True
+
+        rows = _read_heartbeat_hosts(db_path)
+        assert rows and rows[0][0] is not None, (
+            f'merge_heartbeat event must carry a hosts field; rows={rows}'
+        )
+        hosts = {h['name']: h for h in _json.loads(rows[0][0])}
+        assert hosts['laptop']['quarantined'] is True
+        assert hosts['laptop']['quarantine_class'] == 'ru'
+        assert hosts['local']['quarantined'] is False
+
+    async def test_recovery_clears_the_segment(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path, caplog,
+    ) -> None:
+        """After the host recovers, the next heartbeat is clean again."""
+        worker, alloc, runner, db_path = self._worker_with_events(git_ops, tmp_path, 'deg7')
+        worker._escalation_queue = _FakeEscalationQueue()
+        worker._unreachable_escalate_after_secs = 5.0
+        worker._unreachable_escalate_after_n = 3
+        self._add_local_inflight(worker, config, git_repo)
+
+        now = 3000.0
+        lease = alloc.acquire_remote()
+        assert lease is not None and lease.name == 'laptop'
+        await alloc.quarantine_and_release(lease)
+        _seed_ru(worker, 'laptop', first_unavailable_at=now - 60.0)
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+            assert worker._maybe_log_queue_heartbeat(time.time()) is True
+        assert 'DEGRADED' in _hb_message(caplog)
+
+        runner.health = AsyncMock(return_value=True)
+        await worker._reprobe_quarantined_hosts(now)
+
+        caplog.clear()
+        worker._last_heartbeat_at = 0.0
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+            assert worker._maybe_log_queue_heartbeat(time.time()) is True
+
+        assert 'DEGRADED' not in _hb_message(caplog), _hb_message(caplog)
+        rows = _read_heartbeat_hosts(db_path)
+        assert len(rows) >= 2, f'expected two heartbeats; got {len(rows)}'
+        hosts = {h['name']: h for h in _json.loads(rows[-1][0])}
+        assert hosts['laptop']['quarantined'] is False
+        assert hosts['laptop']['quarantine_class'] is None
