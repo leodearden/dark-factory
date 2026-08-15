@@ -553,3 +553,53 @@ class TestRunLiveProbeCleanup:
             assert handle.closed, (
                 'a capture file handle was left to the GC rather than closed by teardown'
             )
+
+
+class TestConfigDirLifetime:
+    """``cleanup_at_exit`` must MIRROR ``--keep-config-dir``, not be hardcoded.
+
+    The ``finally`` fixed above covers a raise INSIDE ``run_live_probe``.  It
+    cannot cover one that escapes it — a ``SystemExit`` from ``main``, a
+    ``KeyboardInterrupt`` on a 30-second live run, a raise in the caller between
+    probe and write — and ``TaskConfigDir`` defaults to ``cleanup_at_exit=False``,
+    so today nothing reclaims the token dir in those cases either.
+
+    The negation is load-bearing rather than cosmetic: ``TaskConfigDir.__init__``
+    registers ``atexit.register(shutil.rmtree, ...)``, so an unconditional
+    ``True`` would silently destroy at interpreter exit exactly the dir
+    ``--keep-config-dir`` exists to preserve for post-run inspection.
+    """
+
+    def test_default_run_registers_the_atexit_teardown(
+        self, probe_recorder, monkeypatch, tmp_path
+    ):
+        exc_type = _inject('build_argv', monkeypatch, probe_recorder)
+        with pytest.raises(exc_type, match='injected'):
+            _run_probe(tmp_path, keep_config_dir=False)
+        assert probe_recorder.config_kwargs[-1].get('cleanup_at_exit') is True, (
+            'without cleanup_at_exit the token dir survives any exit that escapes '
+            f'run_live_probe; kwargs were {probe_recorder.config_kwargs[-1]!r}'
+        )
+
+    def test_keep_config_dir_suppresses_the_atexit_teardown(
+        self, probe_recorder, monkeypatch, tmp_path
+    ):
+        exc_type = _inject('build_argv', monkeypatch, probe_recorder)
+        with pytest.raises(exc_type, match='injected'):
+            _run_probe(tmp_path, keep_config_dir=True)
+        assert probe_recorder.config_kwargs[-1].get('cleanup_at_exit') is False, (
+            'an unconditional atexit rmtree would silently defeat --keep-config-dir'
+        )
+
+    def test_keep_config_dir_survives_a_pre_spawn_failure(
+        self, probe_recorder, monkeypatch, tmp_path
+    ):
+        # The step-10 finally must not override the operator's inspect flag: a
+        # failed run is precisely when the dir is worth looking at.
+        exc_type = _inject('build_argv', monkeypatch, probe_recorder)
+        with pytest.raises(exc_type, match='injected'):
+            _run_probe(tmp_path, keep_config_dir=True)
+        config_path = probe_recorder.configs[-1].path
+        assert config_path.exists(), (
+            f'--keep-config-dir was ignored on the failure path: {config_path} is gone'
+        )
