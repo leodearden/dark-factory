@@ -1830,6 +1830,64 @@ def build_lease_name(role: str, project: str, task_id: str | None = None) -> str
     return name
 
 
+SESSION_PID_ENV = 'CLAUDE_PID'
+"""Env var naming the long-lived ``claude`` process's pid (see resolve_session_pid)."""
+
+
+def resolve_session_pid(env: Mapping[str, str] | None = None) -> int:
+    """Resolve THIS Claude Code session's long-lived pid -- the lease's liveness anchor.
+
+    WHY THIS EXISTS (task 3994, defect 2). ``$$`` inside a Claude Code Bash
+    tool call is NOT the session: each tool call is a fresh ``/bin/bash -c``
+    wrapper whose pid is dead the instant the call returns. Measured:
+    ``$$``=2487079 (transient wrapper) vs ``$PPID``==``$CLAUDE_PID``=2345789,
+    with ``ps -o comm=`` confirming the latter is the long-lived ``claude``
+    process. Both watcher SKILLs nonetheless prescribed ``--pid $$`` for a
+    year, so ``_pid_alive`` was ~always False for a watcher lease and the
+    (dead pid AND aged heartbeat) staleness AND-guard collapsed to a pure
+    heartbeat check.
+
+    Resolving it HERE rather than only documenting it in each SKILL.md is
+    deliberate: documentation alone re-creates the failure mode it fixes,
+    because the pid was wrong for that whole year precisely because it
+    depended on every skill doc getting one shell token right.
+
+    Chain, in order: ``CLAUDE_PID`` (parsed, must be > 0) -> ``os.getsid(0)``
+    -> ``os.getppid()``. The getsid tier is the SAME durable-pid idiom
+    session_hooks._hand_launched_liveness_pid documents and uses for T6's
+    hand-launched records (the POSIX session leader outlives any hook
+    subprocess), so the lease path and the session-hook path answer "which
+    pid is actually long-lived" the same way instead of inventing a second
+    answer.
+
+    Degradation is LOUD, never silent: an unresolvable ``CLAUDE_PID`` emits a
+    WARNING stating that the lease's pid/liveness guard is degraded to
+    heartbeat-only before falling back. Never raises -- a pid we cannot
+    resolve must not break a lease claim.
+    """
+    if env is None:
+        env = os.environ
+    raw = env.get(SESSION_PID_ENV, '')
+    try:
+        pid = int(raw.strip())
+    except (AttributeError, TypeError, ValueError):
+        pid = 0
+    if pid > 0:
+        return pid
+    logger.warning(
+        'resolve_session_pid: %s is unset or unusable (%r); the lease pid/liveness '
+        'guard is DEGRADED to heartbeat-only staleness. Falling back to the POSIX '
+        'session leader. Note: `$$` in a Claude Code Bash tool call is the transient '
+        '/bin/bash -c wrapper, not the session -- use ${CLAUDE_PID:-$PPID}.',
+        SESSION_PID_ENV,
+        raw,
+    )
+    try:
+        return os.getsid(0)
+    except OSError:
+        return os.getppid()
+
+
 LEASE_HEARTBEAT_TTL = timedelta(hours=2)
 """How long a lease survives with a dead holder pid and no fresh heartbeat
 (mtime touch) before it is stale-reapable. Mirrors NON_TERMINAL_HEARTBEAT_TTL's
@@ -1837,26 +1895,42 @@ role for session records: staleness requires BOTH a dead holder pid AND an
 aged heartbeat (see claim_lease/reap_stale_leases) -- a live holder is never
 reaped regardless of heartbeat age.
 
-VALUE DERIVATION (task 2796, THREAD 1): watcher leases are effectively
-HEARTBEAT-ONLY, not pid-guarded. The interactive escalation-watcher SKILL
-claims with ``--pid $$`` -- the EPHEMERAL Bash-tool shell pid, dead within
-milliseconds of the lease-claim -- so ``_pid_alive`` is ~always False for a
-watcher lease and the (dead-pid AND aged-heartbeat) staleness AND-guard
-collapses to a pure heartbeat-TTL check. That watcher heartbeats only ONCE
-per Main Loop cycle, and each cycle's blocking wait is one watcher-rearm.sh
-``--timeout`` slice (canonical 3600s). So the staleness TTL MUST exceed that
-heartbeat cadence, or a live-but-quiet holder's lease goes
-stale->reap-eligible during any single quiet slice and a duplicate
-reaps-and-reclaims it (the duplicate-spawn incident). 7200s = 2x the 3600s
-slice gives a full quiet slice plus a full slice of margin -- a
-cadence-derived bound, not an arbitrary bump.
+VALUE DERIVATION (task 2796 THREAD 1, RE-DERIVED by task 3994). The value is
+unchanged at 7200s; its BASIS is not, because task 2796's basis is now false
+and a false derivation is exactly what a later rotation reads and
+mis-diagnoses itself with.
 
-TRADE-OFF: a GENUINELY-crashed holder's lease now survives up to 2h before
-it is stale-reapable, versus 5min before. This is loud and recoverable, not
-silent: a contender STANDS DOWN with an explicit "dead, heartbeat Ns ago"
-message, an operator can force-reclaim immediately via ``lease-release``, and
-any reap-and-reclaim of a supposedly-live holder now emits a structured
-WARNING (see claim_lease)."""
+WITHDRAWN BASIS (2796): "watcher leases are effectively HEARTBEAT-ONLY, not
+pid-guarded" -- true only because both watcher SKILLs claimed with
+``--pid $$``, the ephemeral Bash-tool wrapper pid, so ``_pid_alive`` was
+~always False and the staleness AND-guard collapsed to a pure heartbeat-TTL
+check. Task 3994's ``resolve_session_pid`` restores a real, long-lived
+session pid, so that premise no longer holds.
+
+CURRENT BASIS (3994): with the pid guard actually live, a LIVE holder is
+never reaped regardless of heartbeat age, so this TTL now bounds only ONE
+thing -- crash recovery for a genuinely-dead holder. It nonetheless stays at
+2h rather than dropping back toward the old 5min, for two reasons:
+(a) resolve_session_pid's fallback chain can still degrade to a non-session
+pid (an unset CLAUDE_PID on some launch path), and that degradation is
+logged but not fatal, so heartbeat-only behaviour must remain SURVIVABLE:
+7200s = 2x the canonical 3600s watcher-rearm.sh ``--timeout`` slice, giving
+a full quiet slice plus a full slice of margin, so a live-but-quiet holder
+is never reaped-and-reclaimed by a duplicate (the duplicate-spawn incident);
+(b) a crashed holder no longer COSTS 2h of silence -- ``lease-claim`` now
+prints ``holder_liveness=orphaned`` as soon as the holder's pid is dead and
+its session record is absent/exited, so the contender surfaces the crash on
+the very next claim instead of waiting out the TTL. Lowering it would
+re-introduce live-holder-eviction risk to buy recovery latency that the
+orphan signal already provides.
+
+TRADE-OFF: a genuinely-crashed holder's lease still SURVIVES up to 2h before
+it is stale-reapable. That is loud and recoverable, not silent: a contender
+stands down with an explicit "pid <n> is not running, but its heartbeat is
+FRESH ... NOT reclaimable for another <r>s" message plus the orphan signal,
+an operator can reclaim immediately via ``lease-release --force``, and any
+reap-and-reclaim of a supposedly-live holder emits a structured WARNING
+(see claim_lease)."""
 
 
 class LeasePolicy(StrEnum):
@@ -2565,8 +2639,15 @@ def _run_reap() -> list[ReapedSessionRecord]:
     return reap_stale_records()
 
 
-def _run_lease_claim(name: str, slug: str, pid: int, policy_value: str) -> None:
+def _run_lease_claim(name: str, slug: str, pid: int | None, policy_value: str) -> None:
     """Run the ``lease-claim`` verb: ALWAYS prints a ``decision=<value>`` line + message.
+
+    *pid* is None unless the operator explicitly passed ``--pid``, in which
+    case it wins; otherwise ``resolve_session_pid()`` supplies the real
+    long-lived session pid. Resolving it here rather than in the SKILL.md
+    makes the correct pid STRUCTURAL: the ``--pid $$`` defect (task 3994)
+    existed because it depended on every skill doc getting one shell token
+    right.
 
     This carries its OWN fail-open guard, independent of main()'s outer
     try/except: a fault raised by claim_lease itself (a corrupt lease body,
@@ -2577,6 +2658,8 @@ def _run_lease_claim(name: str, slug: str, pid: int, policy_value: str) -> None:
     /unblock session.
     """
     try:
+        if pid is None:
+            pid = resolve_session_pid()
         holder = LeaseHolder(session_slug=slug, pid=pid, start_ts=datetime.now(UTC).isoformat())
         claim = claim_lease(name, holder=holder, policy=LeasePolicy(policy_value))
     except Exception:
@@ -2841,7 +2924,12 @@ def _build_parser() -> argparse.ArgumentParser:
     lease_claim_p.add_argument('--name', required=True, help='lease name, see build_lease_name')
     lease_claim_p.add_argument('--slug', required=True, help="this claimant's own session_slug")
     lease_claim_p.add_argument(
-        '--pid', type=int, default=os.getpid(), help="this claimant's own pid"
+        '--pid',
+        type=int,
+        default=None,
+        help="this claimant's own long-lived session pid; defaults to "
+        'resolve_session_pid() ($CLAUDE_PID). Only pass this as an explicit '
+        'operator override -- never `$$`, which is the transient Bash-tool shell',
     )
     lease_claim_p.add_argument(
         '--policy',
