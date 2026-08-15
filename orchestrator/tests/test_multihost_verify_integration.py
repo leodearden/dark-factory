@@ -1394,6 +1394,14 @@ class TestUnreachableHostCapstone:
             return_value=[('good-host', recovering_runner)]
         )
         fake_alloc.clear_quarantine = MagicMock()
+        # task 3043: reprobe is tracker-driven and re-engages via readmit(), so
+        # the double must answer the new allocator API honestly — a bare
+        # MagicMock would hand back a MagicMock "runner" for every name.
+        fake_alloc.remote_runner = MagicMock(
+            side_effect=lambda n: recovering_runner if n == 'good-host' else None
+        )
+        fake_alloc.is_parked = MagicMock(return_value=False)
+        fake_alloc.readmit = MagicMock()
         worker._host_allocator = fake_alloc
 
         now = 1000.0
@@ -1406,7 +1414,9 @@ class TestUnreachableHostCapstone:
 
         await worker._reprobe_quarantined_hosts(now)
 
-        fake_alloc.clear_quarantine.assert_called_once_with('good-host')
+        # readmit(), not clear_quarantine(): recovery must also un-PARK the slot
+        # (task 3043) — clear_quarantine alone leaves a PARKED host unusable.
+        fake_alloc.readmit.assert_called_once_with('good-host')
         assert 'good-host' not in worker._runner_unavailable
 
         recovered_events = es.events_of(EventType.verify_host_recovered)
@@ -1439,6 +1449,12 @@ class TestUnreachableHostCapstone:
             return_value=[('loop-host', remote_runner)]
         )
         fake_alloc.clear_quarantine = MagicMock()
+        # task 3043: tracker-driven candidacy + readmit()-based re-engagement.
+        fake_alloc.remote_runner = MagicMock(
+            side_effect=lambda n: remote_runner if n == 'loop-host' else None
+        )
+        fake_alloc.is_parked = MagicMock(return_value=False)
+        fake_alloc.readmit = MagicMock()
         worker._host_allocator = fake_alloc
 
         now_base = 1000.0
@@ -1471,8 +1487,9 @@ class TestUnreachableHostCapstone:
         assert hasattr(worker, '_reprobe_task') and worker._reprobe_task is not None, (
             '_reprobe_task must be created by run() (step-16)'
         )
-        assert fake_alloc.clear_quarantine.called, (
-            'reprobe loop must have called clear_quarantine on recovery'
+        assert fake_alloc.readmit.called, (
+            'reprobe loop must have called readmit on recovery (task 3043: '
+            'clear_quarantine alone cannot un-PARK a stranded slot)'
         )
         recovered = es.events_of(EventType.verify_host_recovered)
         assert recovered, 'reprobe loop must have emitted verify_host_recovered'
