@@ -1009,6 +1009,134 @@ async def test_curator_combine_target_cancelled_aborts(
 
 
 @pytest.mark.asyncio
+async def test_curator_combine_target_in_progress_aborts(
+    curator_interceptor,
+    taskmaster,
+    audit_dir,
+):
+    """Target mid-flight (in-progress) → abort (task 4035; the 2951 replay).
+
+    The fingerprint MATCHES here, so the fingerprint guard cannot be what
+    refuses — the status predicate must be. This is the 20.2% race: the old
+    execution guard only checked ``in {'done', 'cancelled'}``, so a target an
+    agent was actively working got its description rewritten underneath it.
+    """
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '50',
+            'status': 'in-progress',
+            'title': 'Live Task',
+        }
+    )
+    rewritten = RewrittenTask(
+        title='x',
+        description='',
+        details='d',
+        files_to_modify=[],
+        priority='medium',
+    )
+    decision = CuratorDecision(
+        action='combine',
+        target_id='50',
+        target_fingerprint='Live Task',  # fingerprint matches
+        rewritten_task=rewritten,
+        justification='...',
+    )
+    curator_interceptor._curator = _mock_curator(decision)
+
+    result = await _submit_and_resolve(curator_interceptor, '/project', title='Fix x')
+
+    # The live task's description was NOT rewritten...
+    taskmaster.update_task.assert_not_called()
+    # ...and the candidate was not lost — it became its own task.
+    taskmaster.add_task.assert_called_once()
+    assert result == {'id': '2', 'title': 'New Task'}
+
+
+@pytest.mark.asyncio
+async def test_curator_combine_target_blocked_aborts(
+    curator_interceptor,
+    taskmaster,
+    audit_dir,
+):
+    """Target blocked → abort. The fix generalises past in-progress (task 4035).
+
+    Proves the widened predicate covers the whole non-pending vocabulary
+    rather than special-casing the one status that produced the incident.
+    """
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '50',
+            'status': 'blocked',
+            'title': 'Blocked Task',
+        }
+    )
+    rewritten = RewrittenTask(
+        title='x',
+        description='',
+        details='d',
+        files_to_modify=[],
+        priority='medium',
+    )
+    decision = CuratorDecision(
+        action='combine',
+        target_id='50',
+        target_fingerprint='Blocked Task',
+        rewritten_task=rewritten,
+        justification='...',
+    )
+    curator_interceptor._curator = _mock_curator(decision)
+
+    result = await _submit_and_resolve(curator_interceptor, '/project', title='Fix x')
+
+    taskmaster.update_task.assert_not_called()
+    taskmaster.add_task.assert_called_once()
+    assert result == {'id': '2', 'title': 'New Task'}
+
+
+@pytest.mark.asyncio
+async def test_curator_combine_target_pending_unclaimed_proceeds(
+    curator_interceptor,
+    taskmaster,
+    audit_dir,
+):
+    """THE POSITIVE DIRECTION — a pending, unclaimed target still combines.
+
+    Without this, a regression could hide by refusing everything and the
+    whole combine path would silently degrade to create (task 4035).
+    """
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '50',
+            'status': 'pending',
+            'title': 'Test Task',
+            'claimant_run_id': None,
+        }
+    )
+    rewritten = RewrittenTask(
+        title='Unified parser work',
+        description='Combined',
+        details='d',
+        files_to_modify=[],
+        priority='medium',
+    )
+    decision = CuratorDecision(
+        action='combine',
+        target_id='50',
+        target_fingerprint='Test Task',
+        rewritten_task=rewritten,
+        justification='same concern',
+    )
+    curator_interceptor._curator = _mock_curator(decision)
+
+    result = await _submit_and_resolve(curator_interceptor, '/project', title='candidate')
+
+    taskmaster.update_task.assert_called_once()
+    assert result['action'] == 'combine'
+    assert result['id'] == '50'
+
+
+@pytest.mark.asyncio
 async def test_curator_combine_fingerprint_normalization(
     curator_interceptor,
     taskmaster,
