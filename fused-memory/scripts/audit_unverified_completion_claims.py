@@ -24,14 +24,30 @@ have caught.
 Safety
 ------
 This script has NO mutation path at all. There is no ``--apply``, no
-``--invalidate``, no ``--delete``, no ``--repair``. It reads over
-``GRAPH.RO_QUERY``, where read-only is SERVER-enforced rather than
-client-promised, and it imports nothing that can write. Anything the report
-indicts is left exactly as it is, for human adjudication — that is the task's
-scope note ("read-only report first; do NOT auto-delete or auto-invalidate
-edges on a regex verdict") and ``TestReadOnlyByConstruction`` in
+``--invalidate``, no ``--delete``, no ``--repair``. Anything the report indicts
+is left exactly as it is, for human adjudication — that is the task's scope
+note ("read-only report first; do NOT auto-delete or auto-invalidate edges on a
+regex verdict") and ``TestReadOnlyByConstruction`` in
 ``tests/test_audit_unverified_completion_claims.py`` enforces it mechanically
 so a later editor cannot quietly relax it.
+
+Read-only holds for EVERY store this sweep touches, not only the graph — a
+sweep is run against LIVE, FOREIGN checkouts whose own orchestrators are up, so
+each authority names how it is read:
+
+* **Graph** — ``GRAPH.RO_QUERY``, where read-only is SERVER-enforced rather
+  than client-promised. Never ``MemoryService`` / ``GraphitiBackend``, whose
+  handles can write.
+* **tasks.db** — an explicitly read-only ``file:...?mode=ro`` sqlite URI
+  (:func:`_read_task_statuses_readonly`). NOT ``SqliteTaskBackend``: its read
+  path opens a READ/WRITE connection and applies WAL pragmas plus a schema
+  migration to whatever tasks.db it is pointed at, which for a cross-project
+  claim is another project's live database.
+* **tickets.db** — likewise ``mode=ro`` (:func:`_read_ticket_rows_readonly`).
+  NOT ``TicketStore``: ``TicketStore.initialize()`` mkdirs the parent, runs
+  ``CREATE TABLE``/``ALTER TABLE``/``CREATE INDEX`` and commits.
+* **git** — the imported ``make_commit_probe``, which shells
+  ``git cat-file -e`` (read-only) and never raises.
 
 Usage
 -----
@@ -861,6 +877,125 @@ def _resolve_uri(args: argparse.Namespace) -> str | None:
         return None
 
 
+#: Where a project keeps its task database, relative to its root — the path
+#: ``SqliteTaskBackend._db_path`` builds (backends/sqlite_task_backend.py:1137).
+TASKS_DB_RELPATH: tuple[str, ...] = ('.taskmaster', 'tasks', 'tasks.db')
+
+#: The tag context every in-tree caller reads under
+#: (``sqlite_task_backend.DEFAULT_TAG``, :127).
+TASKS_DEFAULT_TAG = 'master'
+
+#: sqlite's default SQLITE_MAX_VARIABLE_NUMBER on older builds is 999, so the
+#: batched ``IN`` clauses are chunked well under it rather than assuming the
+#: 32766 of newer ones.
+_SQL_CHUNK = 500
+
+
+def _readonly_connect(db_path: Path) -> Any:
+    """Open *db_path* over an explicitly READ-ONLY sqlite URI.
+
+    ``mode=ro`` is enforced by sqlite itself: the connection cannot create the
+    file, cannot migrate it, and cannot write a byte. That matters because this
+    sweep answers cross-project claims and therefore opens OTHER projects'
+    live databases while their orchestrators are running — the in-tree helpers
+    (``SqliteTaskBackend``, ``TicketStore``) would each open a read/write
+    connection and apply schema work as a side effect of merely reading.
+
+    Raises on a missing/unopenable file; every caller maps that to
+    UNVERIFIABLE rather than to an accusation.
+    """
+    import sqlite3  # noqa: PLC0415
+
+    if not db_path.exists():
+        raise FileNotFoundError(str(db_path))
+    conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _chunked(values: list[str], size: int = _SQL_CHUNK) -> Iterable[list[str]]:
+    """Yield *values* in ``size``-sized chunks (empty input yields nothing)."""
+    for start in range(0, len(values), size):
+        yield values[start:start + size]
+
+
+def _read_task_statuses_readonly(
+    project_root: str, ids: Iterable[str]
+) -> dict[str, str]:
+    """Return ``{id: status}`` from *project_root*'s tasks.db, READ-ONLY.
+
+    Mirrors ``SqliteTaskBackend._statuses_from_conn``'s SQL and coercions
+    (backends/sqlite_task_backend.py:1576-1594) — same table, same ``tag``
+    filter, same int cast of the ids, same ``NULL`` -> ``'unknown'`` rule — but
+    over a connection that CANNOT write. Non-numeric ids are dropped exactly as
+    that helper drops them, and an id with no row is simply absent from the
+    result, which the probe reports as unresolvable.
+
+    Raises on any sqlite failure; the caller maps that to UNVERIFIABLE for the
+    whole project rather than to a false accusation against its writers.
+    """
+    int_ids: list[str] = []
+    for raw in ids:
+        try:
+            int_ids.append(str(int(str(raw))))
+        except (TypeError, ValueError):
+            continue
+    if not int_ids:
+        return {}
+
+    conn = _readonly_connect(Path(project_root).joinpath(*TASKS_DB_RELPATH))
+    statuses: dict[str, str] = {}
+    try:
+        for chunk in _chunked(int_ids):
+            placeholders = ','.join('?' * len(chunk))
+            rows = conn.execute(
+                f'SELECT id, status FROM tasks WHERE tag = ? AND id IN ({placeholders})',
+                (TASKS_DEFAULT_TAG, *chunk),
+            ).fetchall()
+            for row in rows:
+                statuses[str(row['id'])] = (
+                    row['status'] if row['status'] is not None else 'unknown'
+                )
+    finally:
+        conn.close()
+    return statuses
+
+
+def _read_ticket_rows_readonly(
+    db_path: Path, refs: Iterable[str]
+) -> dict[str, dict[str, Any] | None]:
+    """Return ``{ref: row_or_None}`` from tickets.db, READ-ONLY.
+
+    Every requested ref appears in the result: a present row is the ticket, and
+    ``None`` is the genuine "no such ticket" that
+    ``completion_claim_gate._verify_ticket`` reads as a mismatch. That
+    distinction is only sound because this function RAISES rather than degrades
+    when the store itself cannot be read — see :func:`_build_ticket_probe`.
+
+    ``ticket_id`` is the table's primary key and is globally unique across
+    projects, so the lookup needs no project scope and answers a cross-project
+    claim correctly.
+    """
+    wanted = list(dict.fromkeys(str(ref) for ref in refs))
+    if not wanted:
+        return {}
+
+    conn = _readonly_connect(db_path)
+    found: dict[str, dict[str, Any]] = {}
+    try:
+        for chunk in _chunked(wanted):
+            placeholders = ','.join('?' * len(chunk))
+            rows = conn.execute(
+                f'SELECT * FROM tickets WHERE ticket_id IN ({placeholders})',
+                tuple(chunk),
+            ).fetchall()
+            for row in rows:
+                found[str(row['ticket_id'])] = dict(row)
+    finally:
+        conn.close()
+    return {ref: found.get(ref) for ref in wanted}
+
+
 async def _build_ticket_probe(
     db_path: Path, refs: Iterable[str]
 ) -> Callable[[str], dict[str, Any] | None | Any]:
@@ -882,44 +1017,34 @@ async def _build_ticket_probe(
     makes this distinction load-bearing at the sentinel level (:123-127,
     INV-2), so honouring it here follows its stated intent rather than
     departing from it.
+
+    The read runs over :func:`_read_ticket_rows_readonly` rather than
+    ``TicketStore``, whose ``initialize()`` mkdirs the parent and applies
+    ``CREATE TABLE``/``ALTER TABLE``/``CREATE INDEX`` to the live shared
+    registry as a side effect of opening it — a write, in a script whose whole
+    premise is that it performs none.
     """
-    rows: dict[str, Any] = {}
+    rows: dict[str, dict[str, Any] | None] = {}
     available = False
-    if not db_path.exists():
+    try:
+        rows = await asyncio.to_thread(_read_ticket_rows_readonly, db_path, refs)
+        available = True
+    except FileNotFoundError:
         logger.warning(
             'no ticket store at %s; every ticket claim is UNVERIFIABLE '
             '(never a mismatch)', db_path,
         )
-    else:
-        try:
-            from fused_memory.middleware.ticket_store import TicketStore  # noqa: PLC0415
-
-            store = TicketStore(db_path)
-            await store.initialize()
-            available = True
-            for ref in dict.fromkeys(refs):
-                try:
-                    # A globally unique PK lookup over the one shared
-                    # tickets.db, so it needs no project and answers a
-                    # cross-project claim correctly. A key present-but-None is
-                    # the genuine "no such ticket" (a mismatch); an ABSENT key
-                    # stays unresolvable.
-                    rows[ref] = await store.get(ref)
-                except Exception:
-                    logger.warning(
-                        'ticket lookup failed for %r; UNVERIFIABLE', ref,
-                        exc_info=True,
-                    )
-        except Exception:
-            logger.warning(
-                'ticket store at %s could not be opened; every ticket claim is '
-                'UNVERIFIABLE (never a mismatch)', db_path, exc_info=True,
-            )
-            available = False
+    except Exception:
+        logger.warning(
+            'ticket store at %s could not be read; every ticket claim is '
+            'UNVERIFIABLE (never a mismatch)', db_path, exc_info=True,
+        )
 
     def probe(ref: str) -> dict[str, Any] | None | Any:
         if not available:
             return UNRESOLVABLE
+        # A key present-but-None is the genuine "no such ticket" (a mismatch);
+        # an ABSENT key was never asked about, and stays unresolvable.
         if ref in rows:
             return rows[ref]
         return UNRESOLVABLE
@@ -936,6 +1061,15 @@ async def _build_task_status_probe(
     traffic by the claim count for no gain), and scoped to the CLAIMED project
     rather than the writer's (a sha or task id claimed for dark_factory is not
     answered by reify's tree). An absent key is the unresolvable signal.
+
+    The read runs over :func:`_read_task_statuses_readonly` rather than
+    ``SqliteTaskBackend.get_statuses``. The backend's read path opens a
+    READ/WRITE connection first (``_get_connection``: WAL pragmas + schema
+    migration) and is never closed, leaking its aiosqlite worker threads — and
+    a sweep answering cross-project claims points it at OTHER projects' live
+    databases while their orchestrators are running. ``mode=ro`` makes the
+    read-only claim in this module's docstring true of the task authority too,
+    not just of the graph.
     """
     resolved: dict[tuple[str | None, str], str] = {}
     for project, refs in refs_by_project.items():
@@ -947,18 +1081,13 @@ async def _build_task_status_probe(
             )
             continue
         try:
-            from fused_memory.backends.sqlite_task_backend import (  # noqa: PLC0415
-                SqliteTaskBackend,
+            statuses = await asyncio.to_thread(
+                _read_task_statuses_readonly, root, sorted(refs)
             )
-
-            # project_root is a METHOD argument, not a constructor kwarg, and
-            # get_statuses is a coroutine (backends/sqlite_task_backend.py:1662).
-            backend = SqliteTaskBackend()
-            statuses = await backend.get_statuses(root, ids=sorted(refs))
         except Exception:
             logger.warning(
-                'get_statuses failed for project %r; %d task claim(s) are '
-                'UNVERIFIABLE', project, len(refs), exc_info=True,
+                'read-only status read failed for project %r; %d task claim(s) '
+                'are UNVERIFIABLE', project, len(refs), exc_info=True,
             )
             continue
         for key, value in (statuses or {}).items():
@@ -1106,7 +1235,7 @@ async def _run(
                 project_roots, refs_by_project
             ),
             ticket_probe=await _build_ticket_probe(
-                Path(_default_ticket_db_path()), ticket_refs
+                Path(_default_ticket_db_path(args.config)), ticket_refs
             ),
             commit_probe=_build_commit_probe(project_roots),
         )
@@ -1187,14 +1316,21 @@ def vars_of(finding: Finding) -> dict[str, Any]:
     }
 
 
-def _default_ticket_db_path() -> str:
+def _default_ticket_db_path(config_path: str | None = None) -> str:
     """The shared tickets.db path, best effort.
 
     Missing is a NORMAL outcome here, not an error: it lands every ticket claim
     on UNVERIFIABLE via :func:`_build_ticket_probe`.
+
+    *config_path* is threaded EXPLICITLY rather than inherited from the
+    ``CONFIG_PATH`` env var :func:`_load_config` sets: that side effect only
+    happens when :func:`_resolve_uri` falls through to the config, so a run
+    given both ``--uri`` and ``--config`` used to resolve the ticket db from
+    the packaged default and report every ticket claim against the wrong data
+    dir.
     """
     try:
-        config = _load_config()
+        config = _load_config(config_path)
         recon = getattr(config, 'reconciliation', None)
         data_dir = getattr(recon, 'data_dir', None) if recon else None
         # tickets.db is a sibling of reconciliation.db inside the recon data

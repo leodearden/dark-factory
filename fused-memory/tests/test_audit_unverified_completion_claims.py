@@ -1135,3 +1135,149 @@ class TestDerivedEdgeLookupKeying:
         assert report is not None
         assert report['summary']['edges_unqueried'] == 1
         assert report['summary']['mismatch'] == 2
+
+
+@pytest.mark.asyncio
+class TestProbeBuilders:
+    """The three probe builders, tested DIRECTLY against real stores.
+
+    Every other test in this file injects a hand-written probe, so the builders
+    themselves were unexercised: someone "simplifying" ``_build_ticket_probe``
+    to return ``None`` when tickets.db is absent — the exact regression its
+    docstring warns about, which would print a fabrication accusation against
+    every ticket-claiming writer in the corpus — would leave the whole suite
+    green. These tests close that gap, and also pin the READ-ONLY contract: a
+    sweep opens other projects' LIVE databases, so it must never create,
+    migrate, or otherwise touch one.
+    """
+
+    async def test_ticket_probe_missing_db_is_unresolvable_and_creates_nothing(
+        self, tmp_path
+    ) -> None:
+        """Absent registry -> UNRESOLVABLE for every ref, never None."""
+        db_path = tmp_path / 'tickets.db'
+        probe = await _mod._build_ticket_probe(db_path, ['tkt_ANY'])
+        assert probe('tkt_ANY') is UNRESOLVABLE
+        assert probe('tkt_OTHER') is UNRESOLVABLE
+        # TicketStore.initialize() would have mkdir'd and CREATE TABLE'd here.
+        assert not db_path.exists()
+
+    async def test_ticket_probe_unopenable_db_is_unresolvable(self, tmp_path) -> None:
+        """A corrupt/foreign file is an unreadable registry, not a fabrication."""
+        db_path = tmp_path / 'tickets.db'
+        db_path.write_bytes(b'this is not a sqlite database')
+        probe = await _mod._build_ticket_probe(db_path, ['tkt_ANY'])
+        assert probe('tkt_ANY') is UNRESOLVABLE
+
+    async def test_ticket_probe_present_row_absent_ref_and_unrequested_ref(
+        self, tmp_path
+    ) -> None:
+        """The three outcomes, against a REAL TicketStore-written database.
+
+        Built by the store itself rather than by hand so the SELECT in
+        ``_read_ticket_rows_readonly`` is pinned to the live schema — the read
+        no longer goes through TicketStore, so schema agreement is exactly what
+        could silently drift.
+        """
+        from fused_memory.middleware.ticket_store import TicketStore  # noqa: PLC0415
+
+        db_path = tmp_path / 'tickets.db'
+        store = TicketStore(db_path)
+        await store.initialize()
+        ticket_id = await store.submit('dark_factory', '{"title": "a candidate"}')
+        await store.close()
+
+        probe = await _mod._build_ticket_probe(
+            db_path, [ticket_id, 'tkt_0RRRC5AASJ9Z630VP4PCN9H376']
+        )
+        row = probe(ticket_id)
+        assert isinstance(row, dict)
+        # The two keys completion_claim_gate._verify_ticket reads (:578-581).
+        assert row['project_id'] == 'dark_factory'
+        assert row['status'] == 'pending'
+        # Asked about, and genuinely not there: the mismatch signal.
+        assert probe('tkt_0RRRC5AASJ9Z630VP4PCN9H376') is None
+        # Never asked about: unresolvable, not an accusation.
+        assert probe('tkt_NEVER_REQUESTED') is UNRESOLVABLE
+
+    async def test_task_status_probe_unregistered_project_is_unresolvable(
+        self, caplog
+    ) -> None:
+        """The path that produced the shipped report's know_live unverifiables."""
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            probe = await _mod._build_task_status_probe({}, {'know_live': {'5422'}})
+        assert probe('5422', 'know_live') is None
+        assert 'know_live' in caplog.text
+
+    async def test_task_status_probe_reads_the_real_schema(self, tmp_path) -> None:
+        """Statuses come back per (project, id), scoped to the master tag.
+
+        The fixture database is created from the BACKEND's own ``_SCHEMA_SQL``,
+        so this test fails if the read's SQL ever drifts from the schema the
+        backend writes — the silent-all-unverifiable regression.
+        """
+        import sqlite3  # noqa: PLC0415
+
+        from fused_memory.backends.sqlite_task_backend import (  # noqa: PLC0415
+            _SCHEMA_SQL,
+        )
+
+        root = tmp_path / 'proj'
+        db_path = root / '.taskmaster' / 'tasks' / 'tasks.db'
+        db_path.parent.mkdir(parents=True)
+        conn = sqlite3.connect(db_path)
+        conn.executescript(_SCHEMA_SQL)
+        conn.executemany(
+            'INSERT INTO tasks (tag, id, title, status, updated_at) '
+            'VALUES (?, ?, ?, ?, ?)',
+            [
+                ('master', 5422, 'a task', 'in-progress', '2026-07-26T00:00:00Z'),
+                ('master', 5638, 'another', 'done', '2026-07-26T00:00:00Z'),
+                ('other-tag', 5999, 'off-tag', 'done', '2026-07-26T00:00:00Z'),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        probe = await _mod._build_task_status_probe(
+            {'reify': str(root)}, {'reify': {'5422', '5638', '5999', '4040'}}
+        )
+        assert probe('5422', 'reify') == 'in-progress'
+        assert probe('5638', 'reify') == 'done'
+        assert probe('5999', 'reify') is None  # another tag is not this tree
+        assert probe('4040', 'reify') is None  # no such task -> unresolvable
+        assert probe('5422', 'dark_factory') is None  # wrong project's tree
+
+    async def test_task_status_probe_missing_db_creates_nothing(
+        self, tmp_path
+    ) -> None:
+        """SqliteTaskBackend would mkdir the parents and apply the schema here.
+
+        A sweep must never bring a .taskmaster tree into existence in a
+        checkout that has none, so the absence of the directory afterwards is
+        the assertion that matters.
+        """
+        root = tmp_path / 'empty-checkout'
+        root.mkdir()
+        probe = await _mod._build_task_status_probe(
+            {'reify': str(root)}, {'reify': {'5422'}}
+        )
+        assert probe('5422', 'reify') is None
+        assert not (root / '.taskmaster').exists()
+
+    async def test_commit_probe_unregistered_project_is_unresolvable(self) -> None:
+        """Searching the WRONG repo would be a false 'no such commit'."""
+        probe = _mod._build_commit_probe({})
+        assert probe('deadbeef', 'know_live') is None
+        assert probe('deadbeef', None) is None
+
+    async def test_commit_probe_answers_against_a_real_repo(self) -> None:
+        """Wired to a real git tree: a bogus sha is a MISS (False), not None.
+
+        False and None are different verdicts downstream — mismatch versus
+        unverifiable — so a probe that answered None for everything would look
+        harmless while quietly emptying the mismatch bucket.
+        """
+        repo_root = SCRIPT_PATH.parents[2]
+        probe = _mod._build_commit_probe({'dark_factory': str(repo_root)})
+        assert probe('0' * 40, 'dark_factory') is False
