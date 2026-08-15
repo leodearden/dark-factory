@@ -924,9 +924,13 @@ class TestMalformedDeclarationIsRejectedLoudly:
                 content='',
                 group_id=GROUP,
             )
-        # __post_init__'s message already names the registered kinds and where
-        # to add one; re-raising must preserve that remediation, not replace it.
-        assert '_KIND_LABELS' in str(excinfo.value)
+        # Asserted STRUCTURALLY, on the preserved cause, rather than by
+        # substring-matching the message. What the re-raise actually promises
+        # is that __post_init__'s ValueError is chained rather than swallowed —
+        # pinning the spelling of a PRIVATE constant in a module this file does
+        # not own would break on a purely cosmetic reword there, with no
+        # behavioural regression to show for it.
+        assert isinstance(excinfo.value.__cause__, ValueError)
 
     def test_a_path_shaped_project_id_is_refused_not_canonicalized(self):
         """Normalizing a mangled path would mint a NEW, wrong canonical key
@@ -1340,6 +1344,49 @@ class TestConflictsAreReportedNotEnforced:
             group_id=GROUP,
         )
         assert resolution.conflicts == (Referent(kind='task', number='3129'),)
+
+    def test_a_self_qualified_declaration_agreeing_with_bare_prose_is_not_a_conflict(self):
+        """THE POINT of the declared path's self-qualified reclassification,
+        finally exercised against a NON-EMPTY scan.
+
+        ``_declared_referents``' docstring justifies that reclassification with
+        "without that, a self-qualified declaration could never compare equal to
+        the scanned form and the conflict check would fire on a caller who was
+        right" — but every other self-qualified declared test passes
+        ``content=''``, so the scan is empty and no conflict is possible BY
+        CONSTRUCTION. This is the interaction that would actually reject an
+        honest caller if the reclassification regressed: the declaration says
+        'dark_factory:3127', the prose says 'Task 3127', and they are the same
+        node.
+        """
+        resolution = resolve_referents(
+            declared=[{'kind': 'task', 'id': 3127, 'project_id': GROUP}],
+            metadata={},
+            content='Fixed the bug in Task 3127.',
+            group_id=GROUP,
+        )
+        assert resolution.conflicts == ()
+        assert resolution.referents == (Referent(kind='task', number='3127'),)
+
+    def test_a_declared_foreign_referent_agreeing_with_foreign_prose_is_not_a_conflict(self):
+        """The POSITIVE twin of ``test_the_project_axis_conflicts``: the project
+        axis must discriminate in BOTH directions.
+
+        That test proves a declaration of local 3129 conflicts with prose naming
+        'reify:3129'. This one proves the same machinery does NOT fire when the
+        declaration names the foreign task the prose actually named — otherwise
+        the project axis would just be a blanket rejection of qualified prose.
+        """
+        resolution = resolve_referents(
+            declared=[{'kind': 'task', 'id': 132, 'project_id': 'reify'}],
+            metadata={},
+            content='mirrors reify:132',
+            group_id=GROUP,
+        )
+        assert resolution.conflicts == ()
+        assert resolution.referents == (
+            Referent(kind='task', project_id='reify', number='132'),
+        )
 
     def test_a_declaration_resolves_an_ambiguity_rather_than_contradicting_it(self):
         """Membership is tested against ``refs | ambiguous``, so naming an
