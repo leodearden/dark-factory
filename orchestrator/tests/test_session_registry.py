@@ -2788,15 +2788,15 @@ def test_heartbeat_lease_advances_mtime(tmp_path: Path) -> None:
     _set_mtime(lease_path, _NOW, timedelta(hours=1))
     old_mtime = lease_path.stat().st_mtime
 
-    result = sr.heartbeat_lease('watcher-df', root=tmp_path)
+    result = sr.heartbeat_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
 
-    assert result is True
+    assert result is sr.LeaseMutation.APPLIED
     assert lease_path.stat().st_mtime > old_mtime
 
 
 def test_heartbeat_lease_on_absent_lease_returns_false_without_raising(tmp_path: Path) -> None:
-    result = sr.heartbeat_lease('watcher-df', root=tmp_path)
-    assert result is False
+    result = sr.heartbeat_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
+    assert result is sr.LeaseMutation.ABSENT
 
 
 def test_release_lease_removes_the_lease_file(tmp_path: Path) -> None:
@@ -2819,6 +2819,114 @@ def test_release_lease_is_idempotent_on_a_second_call(tmp_path: Path) -> None:
 
     assert first is sr.LeaseMutation.APPLIED
     assert second is sr.LeaseMutation.ABSENT
+
+
+# --- heartbeat_lease: ownership (task 3994 defect 1) -----------------------
+
+
+def test_heartbeat_lease_by_a_stranger_is_refused_and_the_mtime_is_untouched(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    lease_path = _seed_lease(tmp_path)
+    _set_mtime(lease_path, _NOW, timedelta(hours=1))
+    backdated_mtime = lease_path.stat().st_mtime
+
+    with caplog.at_level(logging.ERROR):
+        result = sr.heartbeat_lease('watcher-df', slug='watcher-df-STRANGER', root=tmp_path)
+
+    assert result is sr.LeaseMutation.REFUSED
+    # THE assertion: an unrelated caller can no longer keep someone else's
+    # lease structurally unreapable by refreshing its heartbeat clock.
+    assert lease_path.stat().st_mtime == backdated_mtime
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors
+    blob = ' '.join(r.getMessage() for r in errors)
+    assert 'watcher-df-100' in blob
+    assert 'watcher-df-STRANGER' in blob
+
+
+def test_heartbeat_lease_on_an_absent_lease_is_absent_and_quiet(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.ERROR):
+        result = sr.heartbeat_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
+
+    assert result is sr.LeaseMutation.ABSENT
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+
+
+def test_heartbeat_lease_on_a_corrupt_body_is_refused_with_mtime_untouched(
+    tmp_path: Path,
+) -> None:
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    lease_path.parent.mkdir(parents=True, exist_ok=True)
+    lease_path.write_text('{not valid json')
+    _set_mtime(lease_path, _NOW, timedelta(hours=1))
+    backdated_mtime = lease_path.stat().st_mtime
+
+    result = sr.heartbeat_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
+
+    assert result is sr.LeaseMutation.REFUSED
+    assert lease_path.stat().st_mtime == backdated_mtime
+
+
+def test_heartbeat_lease_with_force_overrides_a_stranger_refusal_loudly(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    lease_path = _seed_lease(tmp_path)
+    _set_mtime(lease_path, _NOW, timedelta(hours=1))
+    backdated_mtime = lease_path.stat().st_mtime
+
+    with caplog.at_level(logging.WARNING):
+        result = sr.heartbeat_lease(
+            'watcher-df', slug='watcher-df-STRANGER', force=True, root=tmp_path
+        )
+
+    assert result is sr.LeaseMutation.FORCED
+    assert lease_path.stat().st_mtime > backdated_mtime
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings
+    blob = ' '.join(r.getMessage() for r in warnings)
+    assert 'watcher-df-100' in blob
+    assert 'watcher-df-STRANGER' in blob
+
+
+def test_heartbeat_lease_faults_soft_when_utime_itself_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _seed_lease(tmp_path)
+
+    def _boom_utime(*_args: object, **_kwargs: object) -> None:
+        raise OSError('simulated permission error')
+
+    monkeypatch.setattr(sr.os, 'utime', _boom_utime)
+
+    with caplog.at_level(logging.ERROR):
+        result = sr.heartbeat_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
+
+    # Fail-soft: a lease-substrate fault never raises into a watcher's loop.
+    assert result is sr.LeaseMutation.FAULTED
+    assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
+def test_a_strangers_refused_heartbeat_leaves_a_dead_holders_lease_reapable(
+    tmp_path: Path,
+) -> None:
+    # The structural-unreapability defect, pinned end to end: before task 3994
+    # any caller could bump a dead holder's lease mtime forever, so the
+    # (dead pid AND aged heartbeat) staleness AND-guard could never fire and
+    # the lease outlived its holder indefinitely.
+    lease_path = _seed_lease(tmp_path, slug='watcher-df-dead', pid=_DEAD_PID)
+    _set_mtime(lease_path, _NOW, sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1))
+
+    assert sr.heartbeat_lease('watcher-df', slug='watcher-df-STRANGER', root=tmp_path) is (
+        sr.LeaseMutation.REFUSED
+    )
+
+    reaped = sr.reap_stale_leases(root=tmp_path, now=_NOW)
+
+    assert {r.lease_name: r.reason for r in reaped} == {'watcher-df': 'stale_pid'}
+    assert not lease_path.exists()
 
 
 # --- release_lease: ownership (task 3994 defect 1) -------------------------
