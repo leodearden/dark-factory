@@ -4525,10 +4525,20 @@ def create_mcp_server(
         Returns:
             ``{'status', 'canonical_id', 'topic', 'deleted', 'failed_deletes',
             'retained', 'retain_failures', 'reparented', 'reparent_failures',
-            'survivors', 'topic_members', 'topic_members_truncated',
+            'survivors', 'survivor_check_failed', 'topic_members',
+            'topic_members_truncated', 'topic_members_available',
             'tombstones_written', 'tombstones_expected', ...}``.
             ``survivors`` is the load-bearing one: ids whose delete reported
             success but which STILL RESOLVE on the re-read.
+
+            ``survivor_check_failed`` is its third sibling: an id whose
+            corroborating read did not answer was neither observed alive nor
+            proven gone, so it is claimed as neither — it is not tombstoned,
+            and it makes the op ``'partial'``, because corroborated closure
+            is the deliverable. ``topic_members_available`` is ``False``
+            when the closure scroll itself could not be read, which is what
+            keeps an empty listing from being misread as "this topic has no
+            members".
 
             The tombstone counts are reported as a PAIR and deliberately do
             NOT affect ``status``: a shortfall means the consolidation
@@ -4809,9 +4819,27 @@ def create_mcp_server(
             # A supersede that does not resolve here still gets a victim dict
             # with `metadata=None`: the writer tolerates that, and the id
             # itself is the field an auditor actually queries by.
-            victim_record = await memory_service.get_memory_by_id(
-                project_id=project_id, memory_id=supersede_id
-            )
+            #
+            # A read that FAILS degrades to the same shape and the delete
+            # still proceeds: this read is tombstone ENRICHMENT, and letting
+            # an enrichment miss veto a fold would trade two audit fields for
+            # the consolidation itself. Unguarded, the propagated TimeoutError
+            # would escape to `@mcp_tool_errors` and flatten the whole
+            # envelope — losing every other id's disposition too.
+            try:
+                victim_record = await memory_service.get_memory_by_id(
+                    project_id=project_id, memory_id=supersede_id
+                )
+            except Exception:
+                logger.warning(
+                    'consolidate_memories: could not read %s before deleting it; '
+                    'its tombstone will carry the id alone, without metadata or '
+                    'created_at',
+                    supersede_id,
+                    exc_info=True,
+                    extra={'project_id': project_id, 'run_id': run_id},
+                )
+                victim_record = None
             # `created_at` comes out of the PAYLOAD, not off the top level, and
             # the two are not interchangeable: `get_memory_by_id` returns
             # {'id', 'content', 'metadata'} where metadata is the FULL
@@ -4846,9 +4874,29 @@ def create_mcp_server(
             # deeper subtree's internal structure, whereas flattening every
             # descendant onto the canonical would destroy the hierarchy the
             # records themselves encode.
-            scan = await memory_service.list_child_ids(
-                supersede_id, project_id=project_id
-            )
+            #
+            # THIS READ FAILS CLOSED, unlike the victim capture above. A
+            # listing that did not ANSWER is not a listing that said "no
+            # children": treating a propagated timeout as an empty scan would
+            # delete the parent and orphan whatever it had, permanently, since
+            # no read path reaches a deleted point to learn what the child
+            # named. The refusal keeps the supersede alive and NAMED, which a
+            # caller can retry; the alternative cannot be undone by anyone.
+            try:
+                scan = await memory_service.list_child_ids(
+                    supersede_id, project_id=project_id
+                )
+            except Exception as exc:
+                failed_deletes.append({
+                    'id': supersede_id,
+                    'error': (
+                        f'refused to delete {supersede_id}: its child listing '
+                        f'could not be read ({exc}), so it cannot be shown to be '
+                        'childless'
+                    ),
+                    'error_type': 'ChildScanFailed',
+                })
+                continue
             moved_children: list[str] = []
             stranded_children: list[str] = []
             for child_id in scan.ids:
@@ -4923,9 +4971,22 @@ def create_mcp_server(
                     'child(ren) in, so the full set could not be seen'
                 )
             elif moved_children:
-                still_here = await memory_service.count_memories_by_metadata(
-                    project_id=project_id, filters={'parent_id': supersede_id}
-                )
+                # FAILS CLOSED for the same reason, and it is the same
+                # refusal: a corroboration that could not be READ is not a
+                # corroboration. The message says the CHECK failed rather than
+                # naming a child count, because an operator told "N children
+                # still name it" would go looking for children that may not
+                # exist.
+                try:
+                    still_here = await memory_service.count_memories_by_metadata(
+                        project_id=project_id, filters={'parent_id': supersede_id}
+                    )
+                except Exception as exc:
+                    still_here = 0
+                    blockers.append(
+                        'the live re-count that would corroborate the re-homing '
+                        f'could not be read ({exc}), so the move is unproven'
+                    )
                 if still_here:
                     blockers.append(
                         f'{still_here} child(ren) still name it as parent after '
@@ -4993,10 +5054,27 @@ def create_mcp_server(
         # Every supersede is re-read, including the ones whose delete was
         # never attempted: "we did not try" is a claim about this call, not
         # about the corpus.
+        #
+        # A read that FAILS is a THIRD outcome, and it gets its own list:
+        # the id was neither observed alive nor proven gone, so putting it in
+        # `survivors` would claim a record is still here on no evidence, and
+        # omitting it entirely would let it read as confirmed gone — which is
+        # the silent-fail-soft in a new costume, since the tombstone set is
+        # derived from exactly that gap.
+        survivor_check_failed: list[dict[str, Any]] = []
         for supersede_id in supersedes_ids:
-            if await memory_service.get_memory_by_id(
-                project_id=project_id, memory_id=supersede_id
-            ):
+            try:
+                still_there = await memory_service.get_memory_by_id(
+                    project_id=project_id, memory_id=supersede_id
+                )
+            except Exception as exc:
+                survivor_check_failed.append({
+                    'id': supersede_id,
+                    'error': str(exc),
+                    'error_type': type(exc).__name__,
+                })
+                continue
+            if still_there:
                 survivors.append(supersede_id)
 
 
@@ -5005,18 +5083,41 @@ def create_mcp_server(
         # call just wrote — the exact failure that made the original
         # incident's "re-derive via search" correction route dispatch back
         # into the superseded members it was collapsing.
-        topic_members = await memory_service.get_memories_by_metadata(
-            project_id=project_id,
-            filters={'topic': topic},
-            limit=_TOPIC_MEMBER_LIMIT,
-        )
-        returned = len(topic_members) if isinstance(topic_members, list) else 0
-        if returned >= _TOPIC_MEMBER_LIMIT:
-            total = await memory_service.count_memories_by_metadata(
-                project_id=project_id, filters={'topic': topic}
+        #
+        # A scroll that could not be read degrades to NOT AVAILABLE rather
+        # than to an empty list, because `[]` alone reads as "this topic has
+        # no members" — the overclaim this op exists to eliminate, and
+        # doubly wrong on a call that just wrote a canonical into that very
+        # topic. The count is inside the same guard: it only runs when the
+        # listing was already capped, so losing it leaves rows that cannot be
+        # qualified, and publishing them with `truncated=False` would assert
+        # completeness this call cannot support.
+        topic_members_available = True
+        try:
+            topic_members = await memory_service.get_memories_by_metadata(
+                project_id=project_id,
+                filters={'topic': topic},
+                limit=_TOPIC_MEMBER_LIMIT,
             )
-        else:
-            total = returned
+            returned = len(topic_members) if isinstance(topic_members, list) else 0
+            if returned >= _TOPIC_MEMBER_LIMIT:
+                total = await memory_service.count_memories_by_metadata(
+                    project_id=project_id, filters={'topic': topic}
+                )
+            else:
+                total = returned
+        except Exception:
+            logger.warning(
+                'consolidate_memories: the topic-closure listing for %r could '
+                'not be read; the fold itself stands and is reported in full',
+                topic,
+                exc_info=True,
+                extra={'project_id': project_id, 'run_id': run_id},
+            )
+            topic_members = []
+            returned = 0
+            total = 0
+            topic_members_available = False
         # (7) TOMBSTONE THE CONFIRMED-GONE SET — `deleted` MINUS `survivors`,
         # stamped HERE rather than from each delete's success branch as the
         # two recon sweeps do. Those sweeps satisfy the writer's "only after
@@ -5037,7 +5138,14 @@ def create_mcp_server(
         # different object in a different store (task metadata
         # `x_memory_citation_tombstones`, task 3893), keyed to CITING TASKS
         # rather than to the deleted memory id, and it does not close this gap.
-        confirmed_gone = [i for i in deleted if i not in set(survivors)]
+        #
+        # MINUS the ids whose corroborating read failed, too: "we could not
+        # check" is not evidence of closure, and a tombstone must mean
+        # CORROBORATED GONE or it means nothing. `tombstones_expected` is
+        # derived from this same set below, so an unverifiable id is never
+        # counted as an owed-but-missing audit row either.
+        unproven = set(survivors) | {f['id'] for f in survivor_check_failed}
+        confirmed_gone = [i for i in deleted if i not in unproven]
         tombstones_written = 0
         # `run_id` is a non-blank str whenever `supersedes` was non-empty —
         # `validate_consolidate_args` refuses the whole op otherwise — and
@@ -5116,6 +5224,7 @@ def create_mcp_server(
             deleted=deleted,
             failed_deletes=failed_deletes,
             survivors=survivors,
+            survivor_check_failed=survivor_check_failed,
             retained=retained,
             retain_failures=retain_failures,
             reparented=reparented,
@@ -5123,6 +5232,7 @@ def create_mcp_server(
             topic_members=topic_members,
             topic_members_total=total,
             topic_members_truncated=total > returned,
+            topic_members_available=topic_members_available,
             citation_repoint=citation_repoint,
             tombstones_written=tombstones_written,
             # What was OWED — the confirmed-gone set, not every supersede.

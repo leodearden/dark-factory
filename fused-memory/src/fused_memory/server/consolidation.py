@@ -226,6 +226,7 @@ def build_consolidation_result(
     deleted: list[str],
     failed_deletes: list[dict[str, Any]],
     survivors: list[str],
+    survivor_check_failed: list[dict[str, Any]] | None = None,
     retained: list[str] | None = None,
     retain_failures: list[dict[str, Any]] | None = None,
     reparented: list[dict[str, Any]] | None = None,
@@ -233,6 +234,7 @@ def build_consolidation_result(
     topic_members: list[Any] | None = None,
     topic_members_total: int | None = None,
     topic_members_truncated: bool = False,
+    topic_members_available: bool = True,
     citation_repoint: dict[str, Any] | None = None,
     tombstones_written: int = 0,
     tombstones_expected: int = 0,
@@ -244,13 +246,25 @@ def build_consolidation_result(
     here.
 
     THE STATUS RULE.  ``'partial'`` whenever any disposition list is
-    non-empty: a failed delete, a failed retain tag, a failed reparent, or a
-    SURVIVOR.  The last one is the load-bearing case and the reason the rule
-    cannot key on failures alone — an id whose delete reported success but
-    which still resolves produced no failure to count, and it is exactly the
-    silent-fail-soft this op exists to surface.  ``'partial'`` is not a
-    softer success: it says this cluster is still open, and the lists say
-    which ids keep it open.
+    non-empty: a failed delete, a failed retain tag, a failed reparent, a
+    SURVIVOR, or an id whose closure could not be CHECKED
+    (``survivor_check_failed``).  The last two are the load-bearing cases
+    and the reason the rule cannot key on failures alone — an id whose
+    delete reported success but which still resolves produced no failure to
+    count, and it is exactly the silent-fail-soft this op exists to
+    surface.  ``'partial'`` is not a softer success: it says this cluster is
+    still open, and the lists say which ids keep it open.
+
+    ``survivor_check_failed`` is a THIRD outcome, not a variant of the other
+    two: the id was neither observed alive (so it is not a survivor) nor
+    proven gone (so it is not closed), because the corroborating read did
+    not answer.  Folding it into either list would assert something no read
+    supports, and it counts as open business for the plainest possible
+    reason — corroborated closure IS this op's deliverable, so an id whose
+    closure is unknown means the op did not deliver it.  That is the exact
+    CONTRAST with the tombstone shortfall below: there the work completed
+    and only its audit trail did not land; here the work's own proof is
+    missing.
 
     WHAT THE STATUS RULE DELIBERATELY IGNORES: a tombstone shortfall
     (``tombstones_written < tombstones_expected``).  The memory operation
@@ -274,10 +288,15 @@ def build_consolidation_result(
     """
     failed_deletes = list(failed_deletes)
     survivors = list(survivors)
+    survivor_check_failed = list(survivor_check_failed or [])
     retain_failures = list(retain_failures or [])
     reparent_failures = list(reparent_failures or [])
     open_business = (
-        failed_deletes or retain_failures or reparent_failures or survivors
+        failed_deletes
+        or retain_failures
+        or reparent_failures
+        or survivors
+        or survivor_check_failed
     )
     members = list(topic_members or [])
     result: dict[str, Any] = {
@@ -291,6 +310,7 @@ def build_consolidation_result(
         'reparented': list(reparented or []),
         'reparent_failures': reparent_failures,
         'survivors': survivors,
+        'survivor_check_failed': survivor_check_failed,
         'topic_members': members,
         # Disclosed unconditionally, next to the listing it qualifies: a
         # capped scroll that reported only its rows would read as the whole
@@ -299,6 +319,11 @@ def build_consolidation_result(
             len(members) if topic_members_total is None else topic_members_total
         ),
         'topic_members_truncated': bool(topic_members_truncated),
+        # The same disclosure one step further out: an empty listing from a
+        # scroll that never ANSWERED is indistinguishable, in the payload
+        # alone, from a topic that genuinely has no members. This flag is
+        # what separates them, so `[]` is never read as a finding.
+        'topic_members_available': bool(topic_members_available),
         # Reported as a PAIR, always. A bare "written" count says nothing
         # about whether it was enough, and the shortfall is only legible
         # against what was owed.

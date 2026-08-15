@@ -57,6 +57,19 @@ retained peers tagged, then per supersede read → re-home children → corrobor
   `get_memories_by_metadata({'topic': T})`); `MemoryService.search` is never called and a
   test pins that negative. Registered in `DISALLOW_MEMORY_WRITES` (hence Stage 3) and in
   the orchestrator's dry-run `_DISALLOWED_TOOLS` in the same change that adds it.
+- **A failed READ degrades the claim, never the envelope.** Every Qdrant read here
+  propagates `TimeoutError` by contract, so each is guarded — otherwise one timeout would
+  flatten the whole result to `{'error', 'error_type'}` and destroy the per-id
+  dispositions for records already irreversibly gone. Enrichment reads degrade (a
+  victim capture that fails still deletes and still tombstones, with `metadata`/
+  `created_at` null; a closure scroll that fails reports `topic_members: []` with
+  `topic_members_available: false`, so an empty listing is never misread as "this topic
+  has no members"). Proof reads FAIL CLOSED (an unreadable child listing or post-reparent
+  re-count refuses that delete with `ChildScanFailed` / `ReparentIncomplete` rather than
+  reading silence as "no children"). A corroborating read that fails is a third outcome
+  in its own `survivor_check_failed` list: the id is claimed neither alive nor gone, it
+  is NOT tombstoned, and it makes the op `partial` — unlike a tombstone shortfall, an
+  unprovable closure means the deliverable itself is missing.
 
 Explicitly NOT claimed here: topic-cluster auto-seed (task 3135), the Stage-1 rewire and
 `recon-stage-*` guard-exemption retirement (task 3134), `update_memory`'s
