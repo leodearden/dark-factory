@@ -1363,3 +1363,89 @@ class TestTheDeleteArmStampsATombstone:
 
         writer.assert_not_called()
         assert result['retained'] == [RETAIN_1, RETAIN_2]
+
+
+class TestATombstoneShortfallIsDisclosed:
+    """The audit trail can fail without the consolidation having failed.
+
+    Both are true at once and the envelope must say both: the records ARE
+    gone (structured-facts), and the rows explaining why they are gone did
+    NOT land (no-silent-fail-soft). Inferring the second from the first is
+    exactly what a caller would do if the counts were absent.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_writer_that_wrote_nothing_is_visible_in_the_envelope(self):
+        """The fail-safe no-`recon_ledger` path — a real deployment running
+        `recon_ledger_enabled=False`. It returns 0 without raising, so
+        without the counters a caller would read a clean consolidation
+        envelope and conclude the audit trail exists."""
+        svc = make_service()
+
+        with patched_tombstone_writer(returns=0):
+            result = await call_consolidate(svc)
+
+        assert result['tombstones_written'] == 0
+        assert result['tombstones_expected'] == 3
+
+    @pytest.mark.asyncio
+    async def test_a_raising_writer_never_costs_the_envelope(self):
+        """The writer is fail-safe by contract, so this should be
+        unreachable — and is guarded anyway, because `@mcp_tool_errors`
+        would flatten the result to {'error', 'error_type'} and destroy the
+        per-id dispositions that ARE the deliverable. Losing the survivor
+        list to a failed audit write would be a strictly worse trade than
+        the gap it is reporting."""
+        svc = make_service()
+        writer = AsyncMock(side_effect=RuntimeError('ledger disk full'))
+
+        with patch.object(tools_module, 'record_mem0_deletion_tombstones', writer):
+            result = await call_consolidate(svc)
+
+        assert result['canonical_id'] == CANONICAL
+        assert result['deleted'] == SUPERSEDES
+        assert result['survivors'] == []
+        assert result['tombstones_written'] == 0
+        assert result['tombstones_expected'] == 3
+
+    @pytest.mark.asyncio
+    async def test_a_shortfall_alone_does_not_make_the_op_partial(self):
+        """`status` answers "is this cluster still open?", and it is not.
+        Conflating an audit-trail gap with a consolidation failure would
+        invite a caller to RETRY a completed merge — re-writing a canonical
+        whose supersedes are already gone, which is precisely the
+        +1-per-pass ratchet this op exists to end."""
+        svc = make_service()
+
+        with patched_tombstone_writer(returns=0):
+            result = await call_consolidate(svc)
+
+        assert result['status'] == 'consolidated'
+        assert result['failed_deletes'] == []
+        assert result['survivors'] == []
+
+    @pytest.mark.asyncio
+    async def test_the_happy_path_reports_a_complete_trail(self):
+        svc = make_service()
+
+        with patched_tombstone_writer():
+            result = await call_consolidate(svc)
+
+        assert result['tombstones_written'] == result['tombstones_expected'] == 3
+
+    @pytest.mark.asyncio
+    async def test_expected_counts_only_the_confirmed_gone(self):
+        """`tombstones_expected` is a claim about what SHOULD have been
+        stamped, so it must exclude the ids no tombstone was ever owed
+        for — otherwise a correct run over a partial cluster would report a
+        phantom shortfall."""
+        svc = make_service(
+            gone=[S1], delete_errors={S2: RuntimeError('backend unreachable')}
+        )
+
+        with patched_tombstone_writer() as writer:
+            result = await call_consolidate(svc)
+
+        assert result['tombstones_expected'] == 1
+        assert result['tombstones_written'] == 1
+        assert len(writer.await_args.args[2]) == 1
