@@ -1303,87 +1303,81 @@ def test_b6_escalation_queue_dir_pin_is_not_vacuous(monkeypatch):
     )
 
 
-def test_configured_escalation_queue_dir_error_paths() -> None:
-    """The helper raises AssertionError NAMING the config file on a bad schema.
+#: Table sentinel: the helper must REJECT this config with an AssertionError
+#: naming the config file, rather than raising a bare KeyError from a raw [].
+_REJECTED = object()
 
-    Mirrors test_extract_escalation_port_error_paths in
-    tests/scripts/test_orchestrator_watchdog.py: the behavioural contract is
-    that a schema rename (e.g. ``escalation`` -> ``escalation_mcp``) surfaces as
-    a named-file diagnostic instead of a bare KeyError. Verified by matching
-    only on re.escape(str(config_path)).
+_DF_ROOT = "/home/leo/src/dark-factory"
+
+
+@pytest.mark.parametrize(
+    ("cfg", "expected"),
+    [
+        # --- schema drift: rejected, and the diagnostic names the file ---
+        (None, _REJECTED),
+        ({"project_root": _DF_ROOT, "other_key": 5}, _REJECTED),
+        ({"project_root": _DF_ROOT, "escalation": {"port": 8102}}, _REJECTED),
+        ({"escalation": {"queue_dir": "data/escalations"}}, _REJECTED),
+        # --- resolution semantics ---
+        (
+            {
+                "project_root": "${PROJECT_ROOT:" + _DF_ROOT + "}",
+                "escalation": {"queue_dir": "data/escalations"},
+            },
+            _DF_ROOT + "/data/escalations",
+        ),
+        (
+            {"project_root": "/some/root", "escalation": {"queue_dir": "data/escalations"}},
+            "/some/root/data/escalations",
+        ),
+        (
+            {"project_root": "/some/root", "escalation": {"queue_dir": "/srv/escalations"}},
+            "/srv/escalations",
+        ),
+    ],
+    ids=[
+        "not-a-mapping",
+        "no-escalation-section",
+        "no-queue_dir",
+        "no-project_root",
+        "env-form-takes-the-literal-default",
+        "plain-project_root-verbatim",
+        "absolute-queue_dir-wins",
+    ],
+)
+def test_configured_escalation_queue_dir_resolution(cfg, expected, monkeypatch):
+    """The helper's own contract: named-file rejection, and how it resolves.
+
+    REJECTION. A schema rename (e.g. ``escalation`` -> ``escalation_mcp``) must
+    surface as an AssertionError naming the offending config file, not a bare
+    KeyError — mirroring test_extract_escalation_port_error_paths in
+    tests/scripts/test_orchestrator_watchdog.py for the sibling
+    ``escalation.port`` coupling. Asserted by matching only on
+    re.escape(str(config_path)), so the prose is free to change.
+
+    RESOLUTION. ``${VAR:default}`` takes the LITERAL default, never the
+    environment: the watchdog's REPO_DIR is a hardcoded constant on purpose ("so
+    a stray copy of this script cannot silently supervise a different tree"), so
+    its correct counterpart is the yaml's hardcoded default, and resolving
+    through os.environ would make the pin's verdict depend on whether
+    PROJECT_ROOT happens to be exported in the verify lane, the merge worktree
+    or a developer's shell. PROJECT_ROOT is therefore set to a wrong value for
+    EVERY case here — no case may notice. An absolute ``queue_dir`` likewise
+    wins over ``project_root``, exactly as production's pathlib join does;
+    os.path.join(root, *value.split("/")) would instead report a false PASS on
+    precisely the repoint the pin exists to catch.
     """
-    config_path = pathlib.Path("/fake/dark-factory-orchestrator.yaml")
-    path_pattern = re.escape(str(config_path))
-
-    # Non-dict cfg (e.g. an empty YAML file parsed to None)
-    with pytest.raises(AssertionError, match=path_pattern):
-        _configured_escalation_queue_dir(None, config_path)
-
-    # Missing 'escalation' key at top level
-    with pytest.raises(AssertionError, match=path_pattern):
-        _configured_escalation_queue_dir(
-            {"project_root": "/home/leo/src/dark-factory", "other_key": 5}, config_path
-        )
-
-    # 'escalation' present but missing 'queue_dir'
-    with pytest.raises(AssertionError, match=path_pattern):
-        _configured_escalation_queue_dir(
-            {"project_root": "/home/leo/src/dark-factory", "escalation": {"port": 8102}},
-            config_path,
-        )
-
-    # Missing 'project_root' — the value the relative queue_dir resolves against
-    with pytest.raises(AssertionError, match=path_pattern):
-        _configured_escalation_queue_dir(
-            {"escalation": {"queue_dir": "data/escalations"}}, config_path
-        )
-
-
-def test_configured_escalation_queue_dir_expands_the_project_root_default(monkeypatch):
-    """``${VAR:default}`` resolves to the LITERAL default, never the environment.
-
-    The watchdog's REPO_DIR is a hardcoded constant on purpose ("so a stray copy
-    of this script cannot silently supervise a different tree"), so its correct
-    counterpart is the yaml's hardcoded default. Resolving through os.environ
-    would make the pin's verdict depend on whether PROJECT_ROOT happens to be
-    exported in the verify lane, the merge worktree or a developer's shell — a
-    guard that cries wolf gets deleted.
-    """
-    config_path = pathlib.Path("/fake/dark-factory-orchestrator.yaml")
-
-    # The shipped form: the literal default is taken.
-    assert _configured_escalation_queue_dir(
-        {
-            "project_root": "${PROJECT_ROOT:/home/leo/src/dark-factory}",
-            "escalation": {"queue_dir": "data/escalations"},
-        },
-        config_path,
-    ) == pathlib.Path("/home/leo/src/dark-factory/data/escalations")
-
-    # A set PROJECT_ROOT must NOT change the result — the helper reads the
-    # yaml's literal default and never consults the ambient environment.
     monkeypatch.setenv("PROJECT_ROOT", "/some/other/root")
-    assert _configured_escalation_queue_dir(
-        {
-            "project_root": "${PROJECT_ROOT:/home/leo/src/dark-factory}",
-            "escalation": {"queue_dir": "data/escalations"},
-        },
-        config_path,
-    ) == pathlib.Path("/home/leo/src/dark-factory/data/escalations")
+    config_path = pathlib.Path("/fake/dark-factory-orchestrator.yaml")
 
-    # A plain unwrapped value is used verbatim.
-    assert _configured_escalation_queue_dir(
-        {"project_root": "/some/root", "escalation": {"queue_dir": "data/escalations"}},
-        config_path,
-    ) == pathlib.Path("/some/root/data/escalations")
+    if expected is _REJECTED:
+        with pytest.raises(AssertionError, match=re.escape(str(config_path))):
+            _configured_escalation_queue_dir(cfg, config_path)
+        return
 
-    # An ABSOLUTE queue_dir wins over project_root, exactly as production's
-    # pathlib join does — os.path.join(root, *value.split("/")) would instead
-    # report a false PASS on precisely the repoint this guard exists to catch.
-    assert _configured_escalation_queue_dir(
-        {"project_root": "/some/root", "escalation": {"queue_dir": "/srv/escalations"}},
-        config_path,
-    ) == pathlib.Path("/srv/escalations")
+    assert _configured_escalation_queue_dir(cfg, config_path) == pathlib.Path(
+        str(expected)
+    )
 
 
 def _loader_env_interpolation_pattern() -> str:
