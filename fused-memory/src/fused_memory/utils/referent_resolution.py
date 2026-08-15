@@ -38,7 +38,11 @@ or codename aliases ('Task θ2=2184') are all invisible to the DERIVED path by
 design. Precision over recall — consumers perform destructive edge surgery, so
 a false positive misattributes a fact. The load-bearing consequence is in
 :func:`resolve_referents`: an empty scan is UNINFORMATIVE, never contradictory,
-so it can never produce a conflict and can never reject an honest write.
+so it can never produce a conflict and can never reject an honest write. The
+same reasoning scopes a FOREIGN declaration's conflict test to the project it
+names: the scan reaches a foreign task ONLY through an explicit qualifier, so
+its silence about that project is silence rather than disagreement
+(:func:`_conflicting_referents`, choice 2).
 
 This module is a dependency-free leaf — stdlib plus utils/canonical_labels and
 utils/validation, both themselves leaves — so leaf δ (``server/tools.py``) and
@@ -216,10 +220,11 @@ def _conflicting_referents(declared: ReferentSet, scan: LabelScan) -> ReferentSe
     """The declared referents the scanned content CONTRADICTS.
 
     A declared referent ``d`` conflicts iff the scan found at least one
-    referent of ``d.kind`` and ``d`` is not among them. Declared order is
-    preserved; the result is de-duplicated.
+    referent that COULD have corroborated it — same kind, and for a FOREIGN
+    declaration the same project — and ``d`` is not among them. Declared order
+    is preserved; the result is de-duplicated.
 
-    Three load-bearing choices, each invisible from the code alone:
+    Four load-bearing choices, each invisible from the code alone:
 
     1. KIND-SCOPED, not global. ``_KIND_LABELS`` holds one entry today, so the
        scoping is a no-op and NO test can construct a second kind — the guard
@@ -227,11 +232,32 @@ def _conflicting_referents(declared: ReferentSet, scan: LabelScan) -> ReferentSe
        partition is. The moment 'escalation' joins the registry, a global rule
        would let a bare 'escalation 2500' mention corroborate (or contradict)
        an unrelated TASK referent.
-    2. Membership is tested against ``refs | ambiguous``, so a declaration that
+    2. PROJECT-SCOPED for a FOREIGN declaration, and ONLY for a foreign one.
+       The scan can name a foreign task ONLY through an explicit qualifier
+       ('reify:132'), so for a foreign project the blind list of resolved
+       decision 8 is total: a title-only reference, an alias, a bare-digit node
+       name — and even a perfectly honest bare 'task 132' — all land somewhere
+       other than that project's bucket. Its silence is therefore uninformative
+       in exactly the sense decision 8 means. Read as contradiction, it made a
+       declared foreign referent conflict whenever ANY local task number
+       happened to appear in the prose (verified before the fix: declared
+       reify:132 against 'Fixed the bug in Task 3127.' reported a conflict),
+       which is δ rejecting an honest write over prose that never mentioned
+       that project at all.
+
+       An OWN-project declaration keeps the whole-kind bucket. The local
+       project is the DEFAULT namespace of the prose — a bare mention IS an
+       own-project referent — so a foreign-qualified reference carrying the
+       declared number is not silence, it is the cross-project collapse this
+       PRD exists to detect (``test_the_project_axis_conflicts``). Narrowing
+       that side to the own-project bucket too would silently retire that
+       detection, which is why the asymmetry is deliberate rather than an
+       unfinished generalization.
+    3. Membership is tested against ``refs | ambiguous``, so a declaration that
        names an AMBIGUOUS referent counts as RESOLVING the ambiguity rather
        than contradicting it — the single most useful thing a declaration can
        do.
-    3. An EMPTY per-kind scan never conflicts. This is the load-bearing
+    4. An EMPTY per-kind scan never conflicts. This is the load-bearing
        consequence of resolved decision 8: the scanner cannot see bare-digit
        node names, title-only references or Greek-letter aliases, so its
        SILENCE is uninformative and must not reject an honest write.
@@ -242,6 +268,17 @@ def _conflicting_referents(declared: ReferentSet, scan: LabelScan) -> ReferentSe
     misattribution this PRD exists to prevent. A per-ref list is also strictly
     more informative: δ can derive the disjoint verdict from it, not the
     reverse.
+
+    The result is de-duplicated HERE as a function-LOCAL guarantee, not a
+    caller-dependency. Through :func:`resolve_referents` the branch cannot fire
+    today: the only caller passes ``_declared_referents``' output, already
+    collapsed on ``(kind, project_id, number)`` — the same tuple
+    :class:`Referent` equality is built from. It is kept, and covered by
+    calling this helper DIRECTLY with a duplicated tuple, because that
+    alignment is a coincidence of two independently maintained sites: nothing
+    structurally binds the upstream key to equality, and a second caller or a
+    relaxed upstream key would silently start reporting the same referent twice
+    in evidence δ hands back to an agent.
     """
     scan_by_kind: dict[str, set[Referent]] = {}
     for referent in scan.refs + scan.ambiguous:
@@ -250,7 +287,12 @@ def _conflicting_referents(declared: ReferentSet, scan: LabelScan) -> ReferentSe
     conflicts: list[Referent] = []
     seen: set[Referent] = set()
     for referent in declared:
-        scanned = scan_by_kind.get(referent.kind)
+        scanned = scan_by_kind.get(referent.kind, set())
+        if referent.project_id:
+            # Choice 2 above: for a FOREIGN declaration, only references naming
+            # THAT project are evidence about it. An own-project declaration
+            # (project_id == '') deliberately keeps the whole-kind bucket.
+            scanned = {ref for ref in scanned if ref.project_id == referent.project_id}
         if not scanned or referent in scanned:
             continue
         if referent in seen:
@@ -559,7 +601,7 @@ def resolve_referents(
     *,
     declared: list[dict] | None,
     metadata: dict | None,
-    content: str,
+    content: str | None,
     group_id: str,
 ) -> ReferentResolution:
     """Resolve which referents one write is about, and from which source.
@@ -584,8 +626,18 @@ def resolve_referents(
             metadata-bearing signature in server/tools.py is
             ``dict | None = None``. A non-dict is DROPPED, not raised on, like
             any other unusable ambient value.
-        content: The verbatim body to scan.
+        content: The verbatim body to scan. ``None`` is tolerated as "no body"
+            and scans EMPTY — the same shape ``update_memory``'s metadata-only
+            arm holds (``content: str | None``, server/tools.py). Any OTHER
+            non-str is a wiring bug and RAISES.
         group_id: The group the content belongs to (= the local project_id).
+            Must be a str; there is no "no group" for a write. A non-str
+            RAISES.
+
+    Raises:
+        InputValidationError: On a malformed ``declared`` entry (see
+            :func:`_declared_referents`), or on a non-str ``group_id`` /
+            ``content``.
 
     These are the PRD's exact four parameters and no more. In particular there
     is deliberately no ``known_project_ids``: ``scan_content`` is called in its
@@ -594,6 +646,38 @@ def resolve_referents(
     unspecified fifth parameter here would fork, mid-batch, the signature those
     siblings are being written against.
     """
+    # group_id and content are STRUCTURAL inputs the caller resolves for itself
+    # (models.scope.resolve_project_id for the group, the write body for the
+    # content) — not ambient state like `metadata`, which is why these RAISE
+    # where the metadata container is dropped. Same loud-over-silent split the
+    # declared-vs-metadata asymmetry already draws: an explicit caller-supplied
+    # structure is refused loudly, ambient harness state is degraded quietly.
+    #
+    # Type-checked HERE rather than left to the callees, because the callees
+    # raise the WRONG type: a non-str group_id surfaces as AttributeError out of
+    # is_path_shaped_name ("'int' object has no attribute 'startswith'") and a
+    # truthy non-str content as TypeError out of the scanner's regex. Both
+    # escape δ's `except InputValidationError` gate, so the write fails with an
+    # unhandled exception instead of a structured rejection — the same hole the
+    # metadata CONTAINER guard closed, on the two parameters that had no guard.
+    if not isinstance(group_id, str):
+        raise InputValidationError(
+            f'group_id must be a string naming the local project, got '
+            f'{_safe_repr(group_id)}. Resolve it with models.scope.resolve_project_id '
+            'before calling; raw MCP input is not a group id.'
+        )
+    # None is TOLERATED, every other non-str is not: a metadata-only
+    # update_memory legitimately carries no body, and an absent body scans
+    # empty — which this module already treats as uninformative rather than
+    # contradictory, so it can never manufacture a conflict. Rejecting it would
+    # fail an honest write; accepting bytes or a list would silently resolve
+    # 'none' for a body that plainly names a task.
+    if content is not None and not isinstance(content, str):
+        raise InputValidationError(
+            f'content must be a string (or None for no body), got '
+            f'{_safe_repr(content)}.'
+        )
+
     # ALWAYS scan, unconditionally, BEFORE any precedence branching.
     #
     # Do not "optimize" this into the derived branch. Two consumer-visible
@@ -606,7 +690,11 @@ def resolve_referents(
     #
     # The cost is two regex passes over already-in-memory content, negligible
     # against the LLM-composed Graphiti write this precedes.
-    scan = scan_content(content, group_id=group_id)
+    #
+    # `content or ''` only narrows the tolerated None to the empty body
+    # scan_content is typed for; that call already short-circuits falsy content
+    # to an empty scan, so this changes no behaviour for '' either.
+    scan = scan_content(content or '', group_id=group_id)
 
     # `.ambiguous` is the scan's verbatim answer on every path. Ambiguous
     # referents are recorded, never guessed, and never promoted into

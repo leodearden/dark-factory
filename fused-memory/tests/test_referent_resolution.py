@@ -25,10 +25,11 @@ import dataclasses
 
 import pytest
 
-from fused_memory.utils.canonical_labels import Referent
+from fused_memory.utils.canonical_labels import LabelScan, Referent
 from fused_memory.utils.referent_resolution import (
     REFERENT_SOURCES,
     ReferentResolution,
+    _conflicting_referents,
     resolve_referents,
 )
 from fused_memory.utils.validation import InputValidationError
@@ -1388,6 +1389,81 @@ class TestConflictsAreReportedNotEnforced:
             Referent(kind='task', project_id='reify', number='132'),
         )
 
+    @pytest.mark.parametrize(
+        'content',
+        [
+            'Fixed the bug in Task 3127.',
+            'Mirrors the reify mirror work; context in Task 3127.',
+            'Mirrors reify work; fixed in task 132.',
+        ],
+        ids=['unrelated-local-task', 'foreign-project-named-in-prose-only', 'bare-mention'],
+    )
+    def test_a_declared_foreign_referent_is_not_contradicted_by_purely_local_prose(
+        self, content
+    ):
+        """SILENCE ABOUT A PROJECT IS NOT DISAGREEMENT ABOUT IT.
+
+        The scan can name a foreign task ONLY through an explicit qualifier, so
+        for project 'reify' resolved decision 8's blind list is total: a
+        title-only reference ('the reify mirror work'), an alias, and even a
+        perfectly honest BARE 'task 132' all land somewhere other than reify's
+        bucket. Before the project scoping, a kind-only membership test read
+        the appearance of ANY local task number as contradicting the
+        declaration — so declaring reify:132 and then mentioning Task 3127
+        produced a conflict, and δ's gate is specified to REJECT on conflict.
+        That is the honest write this module's whole blind-list argument exists
+        to protect.
+        """
+        resolution = resolve_referents(
+            declared=[{'kind': 'task', 'id': 132, 'project_id': 'reify'}],
+            metadata={},
+            content=content,
+            group_id=GROUP,
+        )
+        assert resolution.conflicts == ()
+        assert resolution.referents == (
+            Referent(kind='task', project_id='reify', number='132'),
+        )
+
+    def test_the_foreign_axis_still_catches_an_adjacent_number_typo(self):
+        """The scoping narrows WHICH references are evidence, never whether the
+        foreign axis discriminates at all.
+
+        The prose DOES name the declared project, and names a different task
+        inside it — so the scan is no longer silent about 'reify' and the
+        adjacent-number misattribution is still caught, exactly as it is on the
+        local axis in ``test_the_prd_headline_row_names_the_declared_referent``.
+        """
+        resolution = resolve_referents(
+            declared=[{'kind': 'task', 'id': 132, 'project_id': 'reify'}],
+            metadata={},
+            content='mirrors reify:3129',
+            group_id=GROUP,
+        )
+        assert resolution.conflicts == (
+            Referent(kind='task', project_id='reify', number='132'),
+        )
+
+    def test_an_own_project_declaration_keeps_the_whole_kind_bucket(self):
+        """THE DELIBERATE ASYMMETRY, pinned so a future "generalize it" edit is
+        a decision rather than an accident.
+
+        An own-project declaration is NOT narrowed to own-project scan hits.
+        The local project is the DEFAULT namespace of the prose, so a
+        foreign-qualified reference is not silence — it is a positive statement
+        that the write is about another project's task, which is the
+        cross-project collapse this PRD exists to detect. Narrowing this side
+        too would make ``test_the_project_axis_conflicts`` unreachable and
+        silently retire that detection.
+        """
+        resolution = resolve_referents(
+            declared=[{'kind': 'task', 'id': 3129}],
+            metadata={},
+            content='mirrors reify:5000',
+            group_id=GROUP,
+        )
+        assert resolution.conflicts == (Referent(kind='task', number='3129'),)
+
     def test_a_declaration_resolves_an_ambiguity_rather_than_contradicting_it(self):
         """Membership is tested against ``refs | ambiguous``, so naming an
         ambiguous referent SETTLES the contest the prose left open — the single
@@ -1415,6 +1491,17 @@ class TestConflictsAreReportedNotEnforced:
         assert resolution.conflicts == ()
 
     def test_conflicts_are_deduped_and_in_declared_order(self):
+        """END-TO-END order and collapse, through the public entry point.
+
+        Where the collapse HAPPENS matters for reading this test: the repeated
+        3129 is already gone by the time ``_conflicting_referents`` sees it,
+        collapsed upstream by ``_declared_referents`` on the same
+        ``(kind, project_id, number)`` key. So what this pins publicly is the
+        ORDER, plus the fact that a caller repeating an entry cannot make δ
+        name it twice. The helper's OWN dedup branch is unreachable from here
+        and is covered directly in
+        :class:`TestConflictingReferentsHelperDirectly`.
+        """
         resolution = resolve_referents(
             declared=[
                 {'kind': 'task', 'id': 3129},
@@ -1445,3 +1532,177 @@ class TestConflictsAreReportedNotEnforced:
             group_id=GROUP,
         )
         assert resolution.conflicts == ()
+
+
+class TestConflictingReferentsHelperDirectly:
+    """``_conflicting_referents`` promises a de-duplicated result on ITS OWN
+    terms, not on its caller's.
+
+    Through :func:`resolve_referents` the helper's dedup branch cannot fire:
+    the only caller passes ``_declared_referents``' output, already collapsed
+    on ``(kind, project_id, number)`` — the same tuple ``Referent`` equality is
+    built from. So the public-path test named "..._are_deduped_..." would pass
+    with the whole branch deleted, and the branch itself sat uncovered.
+
+    These call the helper DIRECTLY, which is the only way to reach it. That is
+    the point rather than a workaround: nothing structurally binds the upstream
+    key to ``Referent`` equality, so a second caller or a relaxed upstream key
+    would silently start reporting the same referent twice in the evidence δ
+    hands back to an agent.
+    """
+
+    #: One scanned local task, so any declaration NOT naming 3127 conflicts.
+    SCAN = LabelScan(refs=(Referent(kind='task', number='3127'),))
+
+    def test_a_duplicated_declared_tuple_collapses(self):
+        duplicated = (
+            Referent(kind='task', number='3129'),
+            Referent(kind='task', number='3129'),
+        )
+        assert _conflicting_referents(duplicated, self.SCAN) == (
+            Referent(kind='task', number='3129'),
+        )
+
+    def test_dedup_preserves_first_seen_order_across_the_repeat(self):
+        """The repeat collapses onto its FIRST position, so δ reports the
+        conflicts in the order the caller declared them rather than in the
+        order the duplicate happened to close."""
+        duplicated = (
+            Referent(kind='task', number='3129'),
+            Referent(kind='task', number='2500'),
+            Referent(kind='task', number='3129'),
+        )
+        assert _conflicting_referents(duplicated, self.SCAN) == (
+            Referent(kind='task', number='3129'),
+            Referent(kind='task', number='2500'),
+        )
+
+    def test_an_empty_scan_still_never_conflicts_at_the_helper_boundary(self):
+        """Resolved decision 8's guarantee re-pinned where the rule actually
+        lives, so it cannot be lost to a refactor of the public wrapper."""
+        duplicated = (
+            Referent(kind='task', number='3129'),
+            Referent(kind='task', number='3129'),
+        )
+        assert _conflicting_referents(duplicated, LabelScan()) == ()
+
+
+class TestStructuralInputsAreRejectedLoudly:
+    """``group_id`` and ``content`` are STRUCTURAL inputs, not ambient state.
+
+    The caller resolves both for itself (``models.scope.resolve_project_id``
+    for the group, the write body for the content), so a non-str is a WIRING
+    BUG — and unguarded it left this module as the WRONG exception type:
+    ``AttributeError`` from ``is_path_shaped_name`` for the group,
+    ``TypeError`` from the scanner's regex for a truthy non-str body. Neither
+    is caught by δ's ``except InputValidationError`` gate, so the write would
+    fail unhandled instead of being rejected structurally — the same hole the
+    metadata CONTAINER guard closed, on the two parameters that had no guard.
+
+    Asymmetric with ``metadata`` (dropped, never raised on) ON PURPOSE:
+    metadata is ambient harness state the writer may not control, while these
+    two are the caller's own structure.
+    """
+
+    @pytest.mark.parametrize(
+        'group_id',
+        [5, None, ['dark_factory'], {'id': 'dark_factory'}, True, b'dark_factory'],
+        ids=['int', 'none', 'list', 'dict', 'bool', 'bytes'],
+    )
+    def test_a_non_string_group_id_is_rejected(self, group_id):
+        with pytest.raises(InputValidationError):
+            resolve_referents(
+                declared=None, metadata={}, content='Task 3127', group_id=group_id
+            )
+
+    @pytest.mark.parametrize(
+        'content',
+        [5, b'Task 3127', ['Task 3127'], {'body': 'Task 3127'}, True],
+        ids=['int', 'bytes', 'list', 'dict', 'bool'],
+    )
+    def test_a_non_string_content_is_rejected(self, content):
+        with pytest.raises(InputValidationError):
+            resolve_referents(declared=None, metadata={}, content=content, group_id=GROUP)
+
+    @pytest.mark.parametrize(
+        'kwargs',
+        [
+            {'content': 'Task 3127', 'group_id': 5},
+            {'content': 5, 'group_id': GROUP},
+            {'content': b'Task 3127', 'group_id': GROUP},
+        ],
+        ids=['non-str-group-id', 'non-str-content', 'bytes-content'],
+    )
+    def test_every_structural_violation_leaks_exactly_one_exception_type(self, kwargs):
+        """The same CONTRACT check the declared path carries, extended to the
+        two parameters that previously leaked ``AttributeError``/``TypeError``.
+
+        Caught as bare ``Exception`` and re-asserted, so a leak reports as a
+        readable "left as TypeError" failure rather than as an error δ's gate
+        would silently take unhandled in production.
+        """
+        try:
+            resolve_referents(declared=None, metadata={}, **kwargs)
+        except Exception as exc:  # noqa: BLE001 — the assertion IS the type check
+            assert isinstance(exc, InputValidationError), (
+                f'{kwargs!r} left resolve_referents as {type(exc).__name__}, which '
+                f"δ's `except InputValidationError` gate does not catch: {exc}"
+            )
+        else:
+            pytest.fail(f'{kwargs!r} was accepted rather than rejected')
+
+    def test_a_none_content_is_tolerated_as_no_body(self):
+        """``update_memory``'s metadata-only arm is typed ``content: str | None``
+        (server/tools.py), so a bodiless write is a real shape at δ's boundary.
+        An absent body scans EMPTY, which this module already treats as
+        uninformative rather than contradictory — so tolerating it can never
+        manufacture a conflict, while rejecting it would fail an honest write.
+        """
+        resolution = resolve_referents(
+            declared=[{'kind': 'task', 'id': 3127}],
+            metadata={},
+            content=None,
+            group_id=GROUP,
+        )
+        assert resolution.source == 'declared'
+        assert resolution.referents == (Referent(kind='task', number='3127'),)
+        assert resolution.conflicts == ()
+        assert resolution.ambiguous == ()
+
+    def test_a_none_content_still_falls_through_the_precedence_chain(self):
+        """Tolerated, not special-cased: with nothing declared and nothing
+        bridgeable, a bodiless write lands on the COUNTED ``'none'`` row rather
+        than short-circuiting anywhere new."""
+        assert (
+            resolve_referents(
+                declared=None, metadata={}, content=None, group_id=GROUP
+            ).source
+            == 'none'
+        )
+        assert (
+            resolve_referents(
+                declared=None, metadata={'task_id': 3668}, content=None, group_id=GROUP
+            ).source
+            == 'metadata'
+        )
+
+    def test_the_type_guard_did_not_leak_into_the_value_axis(self):
+        """A path-shaped group_id is a STRING — an untrustworthy VALUE, not a
+        wiring bug — and must keep degrading to an empty scan rather than
+        raising. Re-pinned here because the new type check sits directly
+        upstream of that behaviour.
+        """
+        resolution = resolve_referents(
+            declared=None, metadata={}, content='Fixed Task 3127.', group_id='../etc'
+        )
+        assert resolution.source == 'none'
+        assert resolution.referents == ()
+
+    def test_an_empty_group_id_is_a_value_not_a_type_violation(self):
+        """``''`` is a str, so the type guard must not claim it: it flows on to
+        the same value-level handling every other untrustworthy group id gets.
+        """
+        resolution = resolve_referents(
+            declared=None, metadata={}, content='Fixed Task 3127.', group_id=''
+        )
+        assert resolution.source in REFERENT_SOURCES
