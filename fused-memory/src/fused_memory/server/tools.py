@@ -4445,6 +4445,35 @@ def create_mcp_server(
             success but which STILL RESOLVE on the re-read.
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        # (2) AUTHORIZE before any other work, mirroring `update_memory`'s
+        # ordering and for its stated reason: an unauthorized caller is
+        # turned away before anything is done on its behalf and before it
+        # learns anything about the system.
+        #
+        # UNCONDITIONAL, deliberately — not conditioned on a non-empty
+        # `retain`. The retain arm is not the only metadata patch this op
+        # performs: reparenting stamps `parent_id` on children that are only
+        # DISCOVERED after the canonical exists. A gate that waited for the
+        # first patch would therefore deny mid-transaction, with a canonical
+        # already written and a cluster half-folded.
+        #
+        # `content_amend=False` is load-bearing. This op writes new records
+        # and stamps metadata; it never rewrites an existing record's text.
+        # Requesting an arm it does not use would make the deliberately wider
+        # metadata bar a back door into a silent-rewrite primitive — the one
+        # thing the resolver's two-arm split exists to prevent.
+        decision = resolve_mem0_update_authorization(
+            memory_service,
+            agent_id=agent_id,
+            content_amend=False,
+            metadata_patch=True,
+        )
+        if not decision.allowed:
+            return {
+                'error': decision.error,
+                'error_type': decision.error_type,
+                'agent_id': agent_id,
+            }
         project_id, err = _canonicalize_project_id_arg(project_id)
         if err:
             return err
