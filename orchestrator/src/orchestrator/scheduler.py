@@ -918,20 +918,29 @@ class ModuleLockTable:
 
     # --- Park (reservation) helpers ---
 
-    def _blocking_park_owner(
+    def _iter_blocking_park_owners(
         self,
         module: str,
         task_id: str,
         *,
         ignore_owners: frozenset[str] = frozenset(),
-    ) -> str | None:
-        """The owner of the ACTIVE park that blocks *task_id* on *module*, or None.
+    ) -> Iterator[str]:
+        """EVERY owner of an ACTIVE park that blocks *task_id* on *module*.
 
-        THE single rank-aware park-blocking rule.  ``_is_parked_blocks`` is a
-        one-line delegate over it and ``park_owners_blocking`` is the naming
-        view of it — one rule, two views (INV-5).  Forking the rank logic is
-        what would let admission believe it can borrow through a park that
-        ``try_acquire`` then refuses: churn with no dispatch.
+        THE single rank-aware park-blocking rule.  ``_blocking_park_owner`` is
+        the first-match view over it, ``_is_parked_blocks`` the bool view, and
+        ``park_owners_blocking`` the naming view — one rule, three views
+        (INV-5).  Forking the rank logic is what would let admission believe it
+        can borrow through a park that ``try_acquire`` then refuses: churn with
+        no dispatch.
+
+        A GENERATOR on purpose, so the first-match view stays short-circuiting
+        (``next()`` stops the scan at the first yield, exactly as the old
+        early-``return`` did) while the naming view can drain it.  More than
+        one owner can block a single requested module — two owners parked on
+        different children of the same requested parent both conflict with it —
+        and admission needs ALL of them, because ``try_acquire`` re-checks
+        every park and admits only the owners it was handed.
 
         A buried (shadowed) reservation never blocks — only the active top of
         each stack is consulted.
@@ -976,8 +985,29 @@ class ModuleLockTable:
             if own_dominant_rank is not None and own_dominant_rank < rank:
                 # task_id preempts this foreign top — not blocked by it.
                 continue
-            return owner
-        return None
+            yield owner
+
+    def _blocking_park_owner(
+        self,
+        module: str,
+        task_id: str,
+        *,
+        ignore_owners: frozenset[str] = frozenset(),
+    ) -> str | None:
+        """The FIRST active park owner blocking *task_id* on *module*, or None.
+
+        The first-match view of :meth:`_iter_blocking_park_owners`.  Enough for
+        the gate (``_is_parked_blocks`` only needs to know THAT something
+        blocks) and it stops scanning at the first hit, which is why the hot
+        ``try_acquire`` path keeps its original cost.  Callers that must reason
+        about every blocking owner — admission — drain the generator instead.
+        """
+        return next(
+            self._iter_blocking_park_owners(
+                module, task_id, ignore_owners=ignore_owners
+            ),
+            None,
+        )
 
     def park_owners_blocking(self, task_id: str, modules: list[str]) -> list[str]:
         """Distinct active-top park owners that would make ``try_acquire`` refuse.
@@ -990,15 +1020,22 @@ class ModuleLockTable:
         ``_conflicts`` rule already IS the intersection test, so an empty list
         means there is nothing to backfill through and admission must refuse.
 
+        UNIONS every blocking owner per module, not the first one found: two
+        owners parked on different children of one requested parent both
+        conflict with it, and a set missing the second would be handed to
+        ``try_acquire`` as ``admitted_parks`` — which re-checks every park and
+        would refuse on the owner nobody named.  That failure mode is silent
+        (admission pays for the full prediction pipeline every tick and the
+        acquire always fails), so it has to be excluded here rather than
+        detected downstream.
+
         A READ — it mutates nothing and evicts nothing.
         """
         depth = self._config.lock_depth
         normalized = {normalize_lock(m, depth) for m in modules}
-        owners = {
-            owner
-            for module in normalized
-            if (owner := self._blocking_park_owner(module, task_id)) is not None
-        }
+        owners: set[str] = set()
+        for module in normalized:
+            owners.update(self._iter_blocking_park_owners(module, task_id))
         return sorted(owners)
 
     def blocking_holders(

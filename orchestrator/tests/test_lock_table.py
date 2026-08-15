@@ -767,6 +767,37 @@ class TestParkOwnersBlocking:
 
         assert lt.park_owners_blocking('C', ['m1', 'm2']) == ['P1', 'P2']
 
+    def test_two_owners_blocking_ONE_requested_module_are_both_returned(self):
+        """Two parks on sibling CHILDREN of one requested parent.
+
+        The per-module answer is not one owner: ``a/b/x`` and ``a/b/y`` each
+        conflict with a request for ``a/b``, so both owners block it.  A
+        first-match rule would name only one, and the ``admitted_parks`` set
+        built from that name is then handed to ``try_acquire`` — which
+        re-checks EVERY park and refuses on the owner nobody named.
+
+        That failure is silent: admission certifies, pays for the whole
+        prediction pipeline, and the second acquire fails every tick, so
+        backfill is simply impossible in this topology with no signal saying
+        so.  Hence both halves are asserted here — the naming AND the acquire
+        it is supposed to enable.
+        """
+        lt = _lt(lock_depth=3)
+        lt.install_parks('o1', ['a/b/x'], priority='medium')
+        lt.install_parks('o2', ['a/b/y'], priority='medium')
+
+        assert lt.park_owners_blocking('c', ['a/b']) == ['o1', 'o2']
+
+        # Naming one is not enough — the other still refuses (this is the
+        # observable consequence a first-match rule would produce).
+        assert lt.try_acquire('c', ['a/b'], admitted_parks=frozenset({'o1'})) is False
+        assert 'c' not in lt._held
+        # Naming both is what the accessor now makes possible.
+        assert lt.try_acquire(
+            'c', ['a/b'], admitted_parks=frozenset({'o1', 'o2'})
+        ) is True
+        assert lt._held['c'] == {'a/b'}
+
 
 class TestBlockingHolders:
     """``blocking_holders(modules, *, exclude_task)`` — which modules are still
