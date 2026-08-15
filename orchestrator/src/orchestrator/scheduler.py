@@ -7484,6 +7484,70 @@ class Scheduler:
             holder, now=self._wall_now().timestamp()
         )
 
+    # --- EASY-backfill admission through parks (task 3823 / PRD task η, C7) ---
+
+    def _provable_assembly_delay(self, owner: str) -> float:
+        """Seconds *owner*'s park is PROVABLY still waiting to assemble.
+
+        C7's right-hand side: ``min`` over *owner*'s still-blocked park modules
+        of ``max(0, predicted_hold(holder) - elapsed_hold)``.  This is the gap a
+        park has to lend a backfiller, so every ambiguity here resolves toward
+        the SMALLER number — the one that admits fewer candidates.
+
+        Three deliberate choices, each in the safe direction:
+
+        * **MIN over modules, not max.**  *owner* cannot assemble until EVERY
+          parked module frees, so the max is its TRUE wait.  But the true wait
+          is not a *provable* wait: only the soonest-freeing module is
+          guaranteed still to be blocked for that long, and the number is spent
+          admitting somebody else through.  The min is a provable lower bound;
+          lending the max would lend time no single observation supports.
+        * **An empty blocked set is 0.0.**  Nothing is holding *owner* back —
+          it can assemble on the next tick — so there is no gap at all, and
+          admission must refuse rather than treat "not waiting" as "patient".
+        * **A holder with no prediction contributes 0.0**, which drives the
+          whole result to 0.0.  "Provable" is in the name.  Skipping the
+          unpredictable module instead would let the one well-evidenced module
+          certify the entire park — the empty-history-certifies-structure
+          failure the PRD forbids by name, and the reason
+          :meth:`predicted_remaining` returns None instead of a default.
+
+        ``0.0`` from an OVERDUE holder (predicted to have finished and hasn't)
+        and ``0.0`` from an unpredictable one are the same answer here — both
+        refuse — but they reach it by different branches on purpose, so ζ's
+        ``0.0 != None`` distinction survives in the layer that owns it.
+
+        A READ: mutates neither the lock table nor scheduler state.  Basis:
+        plans/evidence/scheduler-scoring-2026-08-06/PARKING_MODEL_REPORT.md:116-126
+        — module hold history is the only predictor with positive R², so it is
+        the only thing this arithmetic is allowed to rest on.
+        """
+        park_modules = self.lock_table.snapshot_parks().get(owner, {}).get('modules', [])
+        if not park_modules:
+            return 0.0
+        blocked = self.lock_table.blocking_holders(park_modules, exclude_task=owner)
+        if not blocked:
+            # Every parked module is free — owner can assemble now.
+            return 0.0
+        gap: float | None = None
+        for holders in blocked.values():
+            # The module regains headroom when its SOONEST holder releases.
+            module_gap: float | None = None
+            for holder in holders:
+                remaining = self.predicted_remaining(holder)
+                if remaining is None:
+                    # Explicit branch, never ``or``: ``0.0 or x`` would silently
+                    # discard a legitimate overdue-holder zero and read as the
+                    # unpredictable case, collapsing two different facts.
+                    return 0.0
+                if module_gap is None or remaining < module_gap:
+                    module_gap = remaining
+            if module_gap is None:
+                return 0.0
+            if gap is None or module_gap < gap:
+                gap = module_gap
+        return 0.0 if gap is None else gap
+
     def _emit_lock_event(
         self,
         event_type: EventType,
