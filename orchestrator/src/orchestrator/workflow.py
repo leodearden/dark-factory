@@ -11969,6 +11969,22 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         Unlike ``_handle_wip_recovery`` (which returns DONE because the merge
         landed), this returns BLOCKED because main was NOT advanced.
+
+        ESCALATE-AND-BLOCK (task 3537, spec §7.9 / §8-E3, INV-6 + INV-7) — see
+        :meth:`_handle_stash_failed` for the full rationale.  In short: this
+        handler does NOT await resolution, so the slot/locks/lane/merge queue
+        are freed immediately and the task row is parked ``blocked`` instead of
+        being left ``in-progress`` with no claimant.  The SOLE unhalt edge is
+        the durable record's resolution (harness ``_on_escalation_resolved`` →
+        ``is_halt_owner`` → ``unhalt_wip``), which is why
+        :meth:`_submit_halt_escalation_and_wait` — and its
+        ``except BaseException`` → ``unhalt_wip('workflow_cancelled')`` cleanup
+        — is deliberately not on this path.
+
+        Note the escalation CATEGORY is ``'wip_conflict'``, not the status
+        string: ``_build_wip_halt_escalation_text`` shares one category across
+        the stash-pop-conflict statuses, and both ``_rehydrate_merge_halt`` and
+        ``_on_escalation_resolved`` key on that category.
         """
         recovery_branch = result.recovery_branch or '(unknown)'
         category, summary, detail = self._build_wip_halt_escalation_text(
@@ -11980,27 +11996,17 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         )
 
         if self.escalation_queue:
-            from escalation.models import Escalation
-
-            esc = Escalation(
-                id=self.escalation_queue.make_id(self.task_id),
-                task_id=self.task_id,
-                agent_role='orchestrator',
-                severity='blocking',
-                category=category,
-                summary=summary,
-                detail=detail,
-                suggested_action='manual_intervention',
-                level=1,
-                worktree=str(self.worktree) if self.worktree else None,
-                workflow_state=self.state.value,
-            )
-            await self._submit_halt_escalation_and_wait(esc)
-            logger.info(f'Task {self.task_id}: wip_recovery_no_advance escalation resolved')
+            self._file_halt_owning_l1(category, summary, detail)
         else:
             self._warn_orphan_halt_no_queue(result.status, recovery_branch=recovery_branch)
 
-        return WorkflowOutcome.BLOCKED
+        return await self._mark_blocked(
+            f'Merge halted ({result.status}): stash pop conflicted and main '
+            f'did not advance for task {self.task_id}; WIP preserved on '
+            f'{recovery_branch}',
+            detail=detail,
+            skip_escalation=True,
+        )
 
     async def _handle_unmerged_state(
         self, result, branch_name: str,
@@ -12012,6 +12018,17 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         already in an inconsistent state. Halt stays in effect until a human
         inspects, cleans up project_root (``git mergetool`` / manual
         resolution / ``git reset``), and resolves the escalation.
+
+        ESCALATE-AND-BLOCK (task 3537, spec §7.9 / §8-E3, INV-6 + INV-7) — see
+        :meth:`_handle_stash_failed` for the full rationale.  In short: this
+        handler does NOT await resolution, so the slot/locks/lane/merge queue
+        are freed immediately and the task row is parked ``blocked`` instead of
+        being left ``in-progress`` with no claimant.  The SOLE unhalt edge is
+        the durable record's resolution (harness ``_on_escalation_resolved`` →
+        ``is_halt_owner`` → ``unhalt_wip``), which is why
+        :meth:`_submit_halt_escalation_and_wait` — and its
+        ``except BaseException`` → ``unhalt_wip('workflow_cancelled')`` cleanup
+        — is deliberately not on this path.
         """
         category, summary, detail = self._build_wip_halt_escalation_text(
             result.status, result, branch_name=branch_name,
@@ -12022,29 +12039,16 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         )
 
         if self.escalation_queue:
-            from escalation.models import Escalation
-
-            esc = Escalation(
-                id=self.escalation_queue.make_id(self.task_id),
-                task_id=self.task_id,
-                agent_role='orchestrator',
-                severity='blocking',
-                category=category,
-                summary=summary,
-                detail=detail,
-                suggested_action='manual_intervention',
-                level=1,
-                worktree=str(self.worktree) if self.worktree else None,
-                workflow_state=self.state.value,
-            )
-            await self._submit_halt_escalation_and_wait(esc)
-            logger.info(
-                f'Task {self.task_id}: unmerged_state escalation resolved'
-            )
+            self._file_halt_owning_l1(category, summary, detail)
         else:
             self._warn_orphan_halt_no_queue(result.status)
 
-        return WorkflowOutcome.BLOCKED
+        return await self._mark_blocked(
+            f'Merge halted ({result.status}): project_root has unresolved '
+            f'merge markers, merge for task {self.task_id} did not land',
+            detail=detail,
+            skip_escalation=True,
+        )
 
     async def _handle_stash_failed(
         self, result, branch_name: str,
