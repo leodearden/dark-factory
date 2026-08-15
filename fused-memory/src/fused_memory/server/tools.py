@@ -540,6 +540,22 @@ _UPDATE_MEMORY_MODES = ('merge', 'replace')
 #: rather than letting a capped listing read as the whole closure.
 _TOPIC_MEMBER_LIMIT = 200
 
+#: The ONE citation-gate refusal ``consolidate_memories``' pre-flight does
+#: not treat as a blocker.
+#:
+#: ``CitationRepointRequired`` means "live tasks cite this id and you named
+#: no replacement". The pre-flight runs BEFORE the canonical write — that
+#: ordering is what makes a refused consolidation leave the corpus
+#: byte-identical — so at that point the replacement genuinely does not
+#: exist yet, and the complaint is about an argument this op has not
+#: computed rather than about the corpus. It is answered a few lines later
+#: by writing the canonical, and the MUTATING pass then re-asks the same
+#: question of every id with that concrete replacement in hand, refusing
+#: any delete it still cannot clear. Every OTHER refusal — the scan
+#: failures, and anything a future revision adds — stays a blocker, so the
+#: default remains fail-closed.
+_PREFLIGHT_DEFERRED_CITATION_REFUSAL = 'CitationRepointRequired'
+
 
 def _update_memory_arm_presence_error(
     *,
@@ -1484,6 +1500,25 @@ def create_mcp_server(
         'cascade it from the LEAVES up in smaller subtrees — each pays its '
         'own gate — until what remains fits, or raise the descendant scan '
         'limit.'
+    )
+    # (task 3133) `consolidate_memories` runs the same gate over its
+    # supersedes set but exposes NEITHER escape the two hints above
+    # advertise: its replacement is always the canonical it writes, and it
+    # takes no allow_dangling_citations argument. Pointing a consolidating
+    # caller at two knobs their tool does not have is the same defect
+    # _CASCADE_SCAN_INCOMPLETE_HINT was split off to avoid — a hint that
+    # reads as a way out and is not one.
+    _CONSOLIDATE_GATE_HINT = (
+        'nothing was written and nothing was deleted, so the corpus is '
+        'byte-identical to before this call — the pre-flight runs before '
+        'the canonical is created precisely so a refusal costs nothing. '
+        'Every id in blocked[] carries its own error_type and, where the '
+        'scan got that far, its citing_tasks. A CitationScanFailed entry '
+        'means the task DB was unreadable and an unknown citation state '
+        'must not be read as "no citations" before an irreversible delete: '
+        'retry once the task backend is reachable. There is deliberately no '
+        'dangling-citation escape here — a consolidation always has a '
+        'concrete survivor to repoint at, so it never needs one.'
     )
     # Categories the premature-completion-claim guard (task 2824) covers — the
     # same four the live-task-status guard (task 2628) covers.
@@ -4412,6 +4447,17 @@ def create_mcp_server(
         (7) Tombstone the confirmed-gone set.
         (8) Report structurally: anything that did not happen is named.
 
+        Step (3) is the same tool-layer gate ``delete_memory`` runs, in two
+        passes over the supersedes: the non-mutating ``scan_only`` pre-flight
+        above the canonical write, then the real repoint below it. The split
+        is what lets the canonical be the repoint target: a consolidation
+        ALWAYS has a concrete survivor, and the canonical satisfies the
+        gate's "the replacement must not be a record this call destroys" rule
+        by construction, being the one record this op creates. So the "you
+        named no survivor" refusal is unreachable here and no
+        dangling-citation escape is offered; the reachable refusal is a scan
+        that could not be completed, which fails closed.
+
         Args:
             canonical_content: The consolidated record's text — the single
                 claim the surviving canonical will state.
@@ -4495,6 +4541,55 @@ def create_mcp_server(
             return err
         causation_id, source, cleaned_meta = _extract_causation(metadata, agent_id)
 
+        # (3) CITATION PRE-FLIGHT over the whole delete set — the same gate
+        # `delete_memory` runs, in its non-mutating `scan_only` mode, reached
+        # through the same closure (INV-5: a second scanner would drift, and
+        # the drift would be silent because both halves would still "work").
+        #
+        # It runs HERE, above the canonical write, so a set that cannot be
+        # cleared costs nothing at all: no canonical, no repoint, no delete.
+        # Going under the gate instead — calling `MemoryService.delete_memory`
+        # directly — is the failure task 3197 documents: one guarded record
+        # and N unguarded ones, reported as a success.
+        #
+        # `replacement_cache` memoizes only the replacement-existence probe,
+        # and only for this invocation. The citation scan itself stays LIVE
+        # per id on both passes; that read IS the fail-closed guarantee.
+        replacement_cache: dict[tuple[str, str], Any] = {}
+        blocked: list[dict[str, Any]] = []
+        for supersede_id in supersedes_ids:
+            rejection, _ = await _citation_repoint_gate(
+                supersede_id,
+                'mem0',
+                project_id,
+                agent_id,
+                None,
+                scan_only=True,
+                replacement_cache=replacement_cache,
+            )
+            # Collect EVERY blocker rather than refusing at the first. A
+            # consolidation set is a cluster by construction, so refusing one
+            # id at a time would cost N refuse-fix-retry round trips and leave
+            # the caller to re-derive the rest by hand.
+            if (
+                rejection
+                and rejection.get('error_type')
+                != _PREFLIGHT_DEFERRED_CITATION_REFUSAL
+            ):
+                blocked.append(rejection)
+        if blocked:
+            return {
+                'error': (
+                    f'{len(blocked)} of the {len(supersedes_ids)} record(s) this '
+                    'consolidation would delete could not be cleared for live '
+                    'task citations. Nothing was written and nothing was deleted.'
+                ),
+                'error_type': 'ConsolidationCitationGateRejected',
+                'topic': topic,
+                'blocked': blocked,
+                'hint': _CONSOLIDATE_GATE_HINT,
+            }
+
         # (4) The canonical FIRST, and NO delete or metadata patch may appear
         # above this point in the body. The ordering IS the anti-ratchet
         # property, and it is asymmetric on purpose:
@@ -4547,8 +4642,60 @@ def create_mcp_server(
                 'supersedes': list(supersedes_ids),
             }
 
-        deleted: list[str] = []
+        # (3b) The MUTATING repoint pass, now that the replacement EXISTS.
+        # The canonical satisfies the gate's "the replacement must not be a
+        # record this call destroys" rule by construction: it is the one
+        # record this op creates, and it is not in the supersedes set.
+        #
+        # Per id rather than through `_cascade_citation_repoint_pass`, which
+        # is deliberately all-or-nothing: a cascade is ONE intent over a
+        # subtree, so a single unclearable record refuses the whole thing. A
+        # consolidation is N independent folds, and refusing all of them
+        # because one citer could not be rewritten would discard the folds
+        # that are already safe — and re-running to recover them would
+        # re-write the canonical, which is the +1-per-pass ratchet this op
+        # exists to end.
+        citation_repoint: dict[str, Any] = {}
+        citation_blocked: dict[str, dict[str, Any]] = {}
         for supersede_id in supersedes_ids:
+            rejection, stats = await _citation_repoint_gate(
+                supersede_id,
+                'mem0',
+                project_id,
+                agent_id,
+                canonical_id,
+                replacement_cache=replacement_cache,
+            )
+            if rejection:
+                citation_blocked[supersede_id] = rejection
+                continue
+            if stats:
+                # Same per-id shape as `cascade_citation_repoint`, so a caller
+                # reads one vocabulary across both tools. `outcome` is always
+                # 'repointed' here: it distinguishes a rewrite from a
+                # knowingly-dangled citation, and this op never passes the
+                # dangling override — it always has a replacement.
+                citation_repoint[supersede_id] = {**stats, 'outcome': 'repointed'}
+
+        deleted: list[str] = []
+        failed_deletes: list[dict[str, Any]] = []
+        survivors: list[str] = []
+        for supersede_id in supersedes_ids:
+            rejection = citation_blocked.get(supersede_id)
+            if rejection:
+                # Its citers could not be rewritten, so deleting it would
+                # strand exactly the pointers the gate protects. ONLY this
+                # id's delete is suppressed — the rest of the cluster still
+                # folds — and it is reported twice on purpose: in
+                # `failed_deletes` (what did not happen, and why) and in
+                # `survivors` (what is still in the corpus).
+                failed_deletes.append({
+                    'id': supersede_id,
+                    'error': rejection.get('error'),
+                    'error_type': rejection.get('error_type'),
+                })
+                survivors.append(supersede_id)
+                continue
             await memory_service.delete_memory(
                 memory_id=supersede_id,
                 store='mem0',
@@ -4577,16 +4724,25 @@ def create_mcp_server(
             )
         else:
             total = returned
-        return {
-            'status': 'consolidated',
+        result: dict[str, Any] = {
+            # (8) Anything that did not happen is NAMED. `partial` is not a
+            # softer success: it says this cluster is still open, and which
+            # ids keep it open.
+            'status': 'partial' if (failed_deletes or survivors) else 'consolidated',
             'canonical_id': canonical_id,
             'topic': topic,
             'deleted': deleted,
-            'failed_deletes': [],
-            'survivors': [],
+            'failed_deletes': failed_deletes,
+            'survivors': survivors,
             'topic_members': topic_members,
             'topic_members_truncated': total > returned,
         }
+        if citation_repoint:
+            # Present iff citations were actually rewritten, mirroring
+            # `delete_memory`: an empty dict would read as "the gate ran and
+            # found nothing" on a call where it never ran at all.
+            result['citation_repoint'] = citation_repoint
+        return result
 
     @mcp.tool()
     @mcp_tool_errors()
