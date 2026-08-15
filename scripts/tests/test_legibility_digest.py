@@ -520,6 +520,46 @@ class TestErrorNeighborhoodPartition:
         )
         assert genuine_ids and designed_ids
 
+    def test_partition_accepts_a_precomputed_scan(self):
+        # The efficiency contract: a caller holding a scan partitions it
+        # in place instead of paying for a fresh one per half.
+        records = _mixed_error_records()
+        neighborhoods = mod.iter_error_neighborhoods(records)
+
+        genuine = mod.iter_genuine_errors(neighborhoods=neighborhoods)
+        designed = mod.iter_designed_outcomes(neighborhoods=neighborhoods)
+
+        assert genuine == mod.iter_genuine_errors(records)
+        assert designed == mod.iter_designed_outcomes(records)
+
+    def test_partition_without_records_or_neighborhoods_raises(self):
+        # Loud over silently returning an empty partition, which would read
+        # downstream as "this session had no errors".
+        with pytest.raises(TypeError):
+            mod.iter_genuine_errors()
+        with pytest.raises(TypeError):
+            mod.iter_designed_outcomes()
+
+    def test_render_digest_scans_error_neighborhoods_at_most_twice(
+        self, monkeypatch,
+    ):
+        # iter_error_neighborhoods rebuilds the tool_use index over every
+        # record and re-runs the classifier over every error body, so each
+        # extra call is a full rescan. signal_counts and _build_sections
+        # each need BOTH halves of the partition; feeding them one shared
+        # scan is what keeps a digest at the pre-3610 cost of two.
+        calls = []
+        original = mod.iter_error_neighborhoods
+
+        def counting(records):
+            calls.append(len(records))
+            return original(records)
+
+        monkeypatch.setattr(mod, 'iter_error_neighborhoods', counting)
+        mod.render_digest(_mixed_error_records(), agent_class='interactive')
+
+        assert len(calls) <= 2
+
     def test_partition_is_total_and_lossless(self):
         records = _mixed_error_records()
 

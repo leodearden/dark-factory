@@ -180,10 +180,12 @@ def _classify_tool_errors(record: dict[str, Any]) -> tuple[bool, bool]:
     is its already-extracted content passed to the classifier, so no
     substring hunt can resurrect a decoy.
 
-    Splitting genuine from designed reuses digest's SINGLE definition
-    (:func:`digest._extract_exit_code` +
-    :func:`digest.classify_designed_outcome`) rather than growing a
-    second one here. Before task 3610 this module's parallel five-class
+    Splitting genuine from designed reuses digest's SINGLE definition --
+    the one PUBLIC entry point :func:`digest.classify_error_content`,
+    which takes a raw tool_result ``content`` field and returns
+    ``(exit_code, designed_label)`` -- rather than growing a second one
+    here or reaching across the module boundary into digest's private
+    helpers. Before task 3610 this module's parallel five-class
     tally ranked a ceiling-only session as 13 tool_errors while the
     digest reported 0 — a silent divergence between two things both
     documented as "PRD §7.2 signal_counts" (07-31 census cluster 1.3).
@@ -206,8 +208,7 @@ def _classify_tool_errors(record: dict[str, Any]) -> tuple[bool, bool]:
             continue
         if not block.get('is_error'):
             continue
-        text = digest._content_to_text(block.get('content'))
-        label = digest.classify_designed_outcome(text, digest._extract_exit_code(text))
+        _, label = digest.classify_error_content(block.get('content'))
         if label is None:
             genuine = True
         else:

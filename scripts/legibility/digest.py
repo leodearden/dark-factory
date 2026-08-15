@@ -213,37 +213,64 @@ own status). In this repo a 124 is overwhelmingly produced by a deliberately
 bounded poll or wait, not by a broken command."""
 
 
+def _exit_codes(
+    text: str, *, ignoring: tuple[tuple[int, int], ...] = (),
+) -> list[int]:
+    """Every exit code mentioned in *text*, in order of appearance.
+
+    Spans in *ignoring* are skipped, which is how
+    :func:`classify_error_content` tells a code a declaration already
+    accounts for (the ``exit=124`` inside ``WATCHER_REARM_OUTCOME:
+    CEILING exit=124``) from an UNACCOUNTED one appearing elsewhere in
+    the same blob.
+    """
+    return [
+        int(next(g for g in match.groups() if g is not None))
+        for match in EXIT_CODE_PATTERN.finditer(text)
+        if not any(start <= match.start() < end for start, end in ignoring)
+    ]
+
+
 def _extract_exit_code(text: str) -> int | None:
     """Return the FIRST exit code mentioned in *text*, or None.
 
-    First-match-wins is deliberate: a tool_result that reports several codes
-    leads with the outcome of the invocation being reported (the watcher's
-    own ``exit=<rc>`` marker precedes any retry chatter), so the leading code
-    is the one that classifies the result.
+    The positional fallback for content that carries no self-declaration
+    to key off. :func:`classify_error_content` prefers the code attached
+    to the DECIDING declaration and only falls back here when a
+    declaration names none.
     """
-    match = EXIT_CODE_PATTERN.search(text)
-    if match is None:
-        return None
-    return int(next(g for g in match.groups() if g is not None))
+    codes = _exit_codes(text)
+    return codes[0] if codes else None
 
 
-DESIGNED_OUTCOME_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+DESIGNED_OUTCOME_PATTERNS: tuple[tuple[re.Pattern[str], frozenset[str], str], ...] = (
     (
-        re.compile(r'WATCHER_REARM_OUTCOME:\s*(CEILING|FIRED)\b', re.IGNORECASE),
+        re.compile(
+            r'WATCHER_REARM_OUTCOME:\s*(?P<outcome>[A-Za-z_]+)'
+            r'(?:\s+exit\s*=\s*(?P<code>\d+))?',
+            re.IGNORECASE,
+        ),
+        frozenset({'ceiling', 'fired'}),
         'watcher-rearm-declared',
     ),
 )
-"""Table of (compiled regex, label) pairs recognising a self-DECLARED
-designed outcome, so a future contract is a one-line addition.
+"""Table of (compiled regex, designed tokens, label) triples recognising a
+self-DECLARED outcome, so a future contract is a one-line addition. The
+regex matches EVERY outcome of its family -- designed and undesigned
+alike -- and names two groups: ``outcome`` (the declared token, compared
+case-insensitively against the designed set) and the optional ``code``
+the declaration carries. Matching the whole family, not just the designed
+tokens, is what lets :func:`classify_error_content` see a dissenting
+declaration instead of stopping at the first agreeable one.
 
 Seeded with scripts/watcher-rearm.sh's marker (:228-237), which emits four
 outcomes and means different things by them: FIRED (exit=0, :228) and
 CEILING (exit=124, :231) are designed loop-continuation outcomes, while
 KILLED (137|143|144, :234) and ERROR (the catch-all, :237) are REAL
-failures. Only the first two are matched here -- deliberately. Suppressing
-all four because they share a marker token would trade one over-count for
-an under-count and hide genuine watcher breakage, the opposite of the
-07-31 census cluster 1.3 finding's intent.
+failures. Only the first two are in the designed set -- deliberately.
+Suppressing all four because they share a marker token would trade one
+over-count for an under-count and hide genuine watcher breakage, the
+opposite of the 07-31 census cluster 1.3 finding's intent.
 
 Two traps documented in that script's header (:52-73) bound what this
 table can be relied on to mean:
@@ -259,13 +286,44 @@ table can be relied on to mean:
 """
 
 
-def classify_designed_outcome(content: str, exit_code: int | None) -> str | None:
-    """Return a label when a structured error is a DESIGNED outcome, else None.
+def _declared_exit_code(match: re.Match[str], text: str) -> int | None:
+    """The code a declaration *match* carries, else the first in *text*."""
+    declared = match.groupdict().get('code')
+    if declared is not None:
+        return int(declared)
+    return _extract_exit_code(text)
+
+
+def classify_error_content(content: Any) -> tuple[int | None, str | None]:
+    """Classify one structured error's content as (exit_code, designed label).
+
+    THE public entry point for the genuine/designed split -- used by
+    :func:`iter_error_neighborhoods` here and by ``sampling.py``'s
+    parallel scan, so the two never drift (task 3610). *content* is a raw
+    tool_result ``content`` field: a string or a list of blocks, flattened
+    the same way for both callers. ``label`` is None for a genuine
+    failure; ``exit_code`` is the code of whatever DECIDED that verdict,
+    so the digest renders the code that explains the line it is on.
 
     Two tiers, most authoritative first:
       1. a machine-readable self-declaration matching DESIGNED_OUTCOME_PATTERNS;
       2. a bare BOUNDED_WAIT_EXIT_CODE with no declaration at all.
     The label differs per tier so a digest reader can tell which rule fired.
+
+    A designed verdict must hold for the WHOLE content, never just its
+    first agreeable marker: one tool_result routinely carries several
+    outcomes (a Bash call looping scripts/watcher-rearm.sh, or tailing its
+    stderr log beside a failing command). So a tier-1 declaration
+    classifies as designed only when every declaration of its family is a
+    designed token AND every exit code the content mentions is one a
+    declaration accounts for (or is itself the bounded-wait ceiling); a
+    dissenting declaration or an unaccounted code decides genuine and
+    supplies the reported code. Tier 2 applies the same rule one level
+    down: a bare 124 classifies only when it is the ONLY code present.
+    Every ambiguity therefore fails toward GENUINE -- the over-count
+    direction, which costs one weight-1.0 noise signal, rather than the
+    under-count that would hide a real failure (see
+    DESIGNED_OUTCOME_PATTERNS).
 
     Tier 2 is a deliberate precision/recall tradeoff, and a deliberately
     cheap one to be wrong about: misclassifying a genuine un-designed
@@ -275,12 +333,33 @@ def classify_designed_outcome(content: str, exit_code: int | None) -> str | None
     suppressions, is deleting the tier-2 branch -- the table above is what
     keeps the decision reversible rather than diffuse.
     """
-    for pattern, label in DESIGNED_OUTCOME_PATTERNS:
-        if pattern.search(content):
-            return label
-    if exit_code == BOUNDED_WAIT_EXIT_CODE:
-        return 'bounded-wait-ceiling'
-    return None
+    text = _content_to_text(content)
+    for pattern, designed_tokens, label in DESIGNED_OUTCOME_PATTERNS:
+        matches = list(pattern.finditer(text))
+        if not matches:
+            continue
+        dissenting = [
+            match for match in matches
+            if match.group('outcome').lower() not in designed_tokens
+        ]
+        if dissenting:
+            return _declared_exit_code(dissenting[0], text), None
+        unaccounted = [
+            code
+            for code in _exit_codes(text, ignoring=tuple(m.span() for m in matches))
+            if code != BOUNDED_WAIT_EXIT_CODE
+        ]
+        if unaccounted:
+            return unaccounted[0], None
+        return _declared_exit_code(matches[-1], text), label
+
+    codes = _exit_codes(text)
+    if codes and all(code == BOUNDED_WAIT_EXIT_CODE for code in codes):
+        return BOUNDED_WAIT_EXIT_CODE, 'bounded-wait-ceiling'
+    undesigned = [code for code in codes if code != BOUNDED_WAIT_EXIT_CODE]
+    if undesigned:
+        return undesigned[0], None
+    return None, None
 
 
 def iter_error_neighborhoods(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -295,11 +374,13 @@ def iter_error_neighborhoods(records: list[dict[str, Any]]) -> list[dict[str, An
 
     Returns EVERY structured error -- this is the single scan and the single
     source of truth. Each neighborhood is enriched with ``exit_code`` and
-    ``designed_outcome`` (see :func:`classify_designed_outcome`) so callers
+    ``designed_outcome`` (see :func:`classify_error_content`) so callers
     can partition without rescanning; :func:`iter_genuine_errors` and
-    :func:`iter_designed_outcomes` are those partitions. Classification
-    reads only the structured ``is_error`` flag plus the already-extracted
-    content, never a fresh substring hunt that could resurrect a decoy.
+    :func:`iter_designed_outcomes` are those partitions, and both accept
+    an already-computed list via ``neighborhoods=`` so one digest costs
+    one scan rather than one per partition. Classification reads only the
+    structured ``is_error`` flag plus the already-extracted content, never
+    a fresh substring hunt that could resurrect a decoy.
     """
     attempts_by_id = {
         block.get('id'): block
@@ -312,7 +393,7 @@ def iter_error_neighborhoods(records: list[dict[str, Any]]) -> list[dict[str, An
             continue
         attempt = attempts_by_id.get(block.get('tool_use_id'))
         error_content = _content_to_text(block.get('content'))
-        exit_code = _extract_exit_code(error_content)
+        exit_code, designed_outcome = classify_error_content(error_content)
         neighborhoods.append({
             'index': index,
             'attempt_tool': attempt.get('name') if attempt else None,
@@ -321,38 +402,82 @@ def iter_error_neighborhoods(records: list[dict[str, Any]]) -> list[dict[str, An
             ),
             'error_content': error_content,
             'exit_code': exit_code,
-            'designed_outcome': classify_designed_outcome(error_content, exit_code),
+            'designed_outcome': designed_outcome,
         })
     return neighborhoods
 
 
-def iter_genuine_errors(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _neighborhoods_to_partition(
+    records: list[dict[str, Any]] | None,
+    neighborhoods: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Resolve what a partition helper should filter: an already-computed
+    ``neighborhoods`` list when the caller has one, else a fresh scan of
+    ``records``. Exactly one is required -- passing neither is a caller
+    bug, raised rather than silently returning an empty partition."""
+    if neighborhoods is not None:
+        return neighborhoods
+    if records is None:
+        raise TypeError('pass either records or neighborhoods=')
+    return iter_error_neighborhoods(records)
+
+
+def iter_genuine_errors(
+    records: list[dict[str, Any]] | None = None,
+    *,
+    neighborhoods: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     """The neighborhoods that are REAL failures (``designed_outcome`` None).
 
     One half of a total, lossless partition of
     :func:`iter_error_neighborhoods`; the other half is
     :func:`iter_designed_outcomes`. This is what ``signal_counts``
     tallies as ``tool_error``.
+
+    Pass ``neighborhoods=`` to partition a scan the caller already has:
+    :func:`signal_counts` and :func:`_build_sections` each need BOTH
+    halves, so rescanning per half would run the (attempts index +
+    per-error regex) scan four times per digest instead of twice.
     """
     return [
-        n for n in iter_error_neighborhoods(records)
+        n for n in _neighborhoods_to_partition(records, neighborhoods)
         if n['designed_outcome'] is None
     ]
 
 
-def iter_designed_outcomes(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def iter_designed_outcomes(
+    records: list[dict[str, Any]] | None = None,
+    *,
+    neighborhoods: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     """The neighborhoods that are DESIGNED outcomes, not failures.
 
     The complement of :func:`iter_genuine_errors` over
     :func:`iter_error_neighborhoods` -- together the two are total and
-    lossless. Reported under its own ``designed_outcome`` count and its own
-    digest section rather than discarded: the 07-31 census still needs to
-    see that 13 bounded-wait ceilings occurred, just not as errors.
+    lossless, and ``neighborhoods=`` partitions a caller's existing scan
+    exactly as it does there. Reported under its own ``designed_outcome``
+    count and its own digest section rather than discarded, so a reader of
+    a digest can see that N of its structured errors were bounded-wait
+    ceilings rather than failures.
+
+    Reported, but only where a digest exists to report it: a session whose
+    ONLY structured errors are designed outcomes scores zero on the
+    sampler's ranking scale (``sampling.SignalCounts.total_signal``
+    excludes this class by design) and is dropped at the zero-signal gate
+    before digest time. The count disambiguates a MIXED session's errors;
+    it is not a corpus-wide census of ceilings (PRD Sec 7.2.1).
     """
     return [
-        n for n in iter_error_neighborhoods(records)
+        n for n in _neighborhoods_to_partition(records, neighborhoods)
         if n['designed_outcome'] is not None
     ]
+
+
+_NEIGHBORHOOD_PARTITIONS = (iter_genuine_errors, iter_designed_outcomes)
+"""The detectors in _SECTION_RENDERERS that partition an existing
+neighborhood scan rather than scanning *records* themselves -- see
+:func:`_build_sections`, which is what keeps _SECTION_RENDERERS the single
+declaration of WHICH detector feeds which section."""
 
 
 SELF_CORRECTION_PATTERNS: tuple[str, ...] = (
@@ -629,15 +754,17 @@ def signal_counts(records: list[dict[str, Any]]) -> dict[str, int]:
     genuine exit-2 failure. Splitting the tally is what makes that one
     real error visible again. The partition is total and lossless, so
     ``tool_error + designed_outcome`` still equals the number of
-    ``is_error`` neighborhoods.
+    ``is_error`` neighborhoods -- and both halves come from ONE
+    :func:`iter_error_neighborhoods` scan, not one per half.
     """
+    neighborhoods = iter_error_neighborhoods(records)
     return {
-        'tool_error': len(iter_genuine_errors(records)),
+        'tool_error': len(iter_genuine_errors(neighborhoods=neighborhoods)),
         'self_correct': len(iter_self_corrections(records)),
         'not_found': len(iter_not_found(records)),
         'df_guard': len(iter_df_guards(records)),
         'interrupt': len(iter_interrupts(records)),
-        'designed_outcome': len(iter_designed_outcomes(records)),
+        'designed_outcome': len(iter_designed_outcomes(neighborhoods=neighborhoods)),
     }
 
 
@@ -1184,12 +1311,21 @@ def _build_sections(
     (e.g. a multi-KB pasted user turn, or a huge echoed tool_result) can
     never evict every sibling section during :func:`_truncate_sections`'
     trim loop. A section with zero hits maps to an empty list --
-    render_digest skips emitting a heading for it."""
+    render_digest skips emitting a heading for it.
+
+    The two neighborhood partitions (_NEIGHBORHOOD_PARTITIONS) are fed one
+    shared scan instead of scanning *records* once each: which detector
+    serves which section still comes from _SECTION_RENDERERS alone, only
+    HOW it is invoked differs."""
+    neighborhoods = iter_error_neighborhoods(records)
     sections = {}
     for key, (detector, renderer) in _SECTION_RENDERERS.items():
-        sections[key] = [
-            _cap_item(line, item_max_bytes) for line in renderer(detector(records))
-        ]
+        items = (
+            detector(neighborhoods=neighborhoods)
+            if detector in _NEIGHBORHOOD_PARTITIONS
+            else detector(records)
+        )
+        sections[key] = [_cap_item(line, item_max_bytes) for line in renderer(items)]
     return sections
 
 
