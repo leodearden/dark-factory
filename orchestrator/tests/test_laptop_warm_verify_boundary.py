@@ -542,6 +542,64 @@ def worktree_base_for(repo: Path) -> Path:
     return GitOps(config.git, repo).worktree_base
 
 
+def test_row_watchdog_window_is_pinned_and_ceilings_clear_it():
+    """ROW_WATCHDOG_ENV is pinned (not derived) and the row ceilings clear it.
+
+    Three assertions, all pure arithmetic on the module constants that the
+    SS9 Row 1/2/3 tests below consume -- no subprocess, no sleep, no wall
+    clock, so a future edit that raises the window without widening the
+    ceilings (or vice versa) is caught in microseconds rather than only
+    after ~30s of real subprocess work per row on a full verify leg:
+
+    1. ROW_WATCHDOG_ENV is an exact-equality pin on the literals '10.0'/
+       '5.0' -- these must NEVER be derived from
+       ``verify_cancel.WATCHDOG_HEARTBEAT_TIMEOUT_SECS`` /
+       ``WATCHDOG_KILL_GRACE_SECS``, because task 4195 is filed to raise the
+       production timeout toward ~60s+ and tracking it here would silently
+       multiply this module's runtime (Row 3 from ~17s to ~70s).
+    2. ROW_TREE_KILL_CEILING_SECS clears the worst-case watchdog fire window
+       (Row 3's select-timeout branch: heartbeat_timeout + grace_secs) with
+       at least 10s of load headroom.
+    3. ROW_PER_TEST_TIMEOUT_SECS clears two ceiling-bounded waits
+       (``child.wait`` then ``wait_subtree_gone``) plus one full watchdog
+       window -- the module inherits ``timeout = 60`` from
+       ``orchestrator/pyproject.toml``, whose thread-mode expiry
+       ``os._exit()``s the xdist worker rather than just failing this test.
+    """
+    assert ROW_WATCHDOG_ENV == {
+        'ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS': '10.0',
+        'ORCH_WATCHDOG_KILL_GRACE_SECS': '5.0',
+    }, (
+        'ROW_WATCHDOG_ENV must be pinned to the literals 10.0/5.0, not '
+        'derived from verify_cancel.WATCHDOG_HEARTBEAT_TIMEOUT_SECS / '
+        'WATCHDOG_KILL_GRACE_SECS -- task 4195 will raise the production '
+        "timeout toward ~60s+ and tracking it here would silently multiply "
+        "this module's runtime (Row 3 from ~17s to ~70s)"
+    )
+
+    window = (
+        float(ROW_WATCHDOG_ENV['ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS'])
+        + float(ROW_WATCHDOG_ENV['ORCH_WATCHDOG_KILL_GRACE_SECS'])
+    )
+    assert ROW_TREE_KILL_CEILING_SECS >= window + 10.0, (
+        f'ROW_TREE_KILL_CEILING_SECS ({ROW_TREE_KILL_CEILING_SECS}) must '
+        f'clear the worst-case watchdog fire window ({window}s, Row 3\'s '
+        f'select-timeout branch) with at least 10s of load headroom, or the '
+        f"rows' child.wait()/wait_subtree_gone() ceilings fail "
+        f'DETERMINISTICALLY -- but only after ~30s of real subprocess work '
+        f'per row on a full verify leg'
+    )
+
+    assert ROW_PER_TEST_TIMEOUT_SECS >= 2 * ROW_TREE_KILL_CEILING_SECS + window, (
+        f'ROW_PER_TEST_TIMEOUT_SECS ({ROW_PER_TEST_TIMEOUT_SECS}) must clear '
+        f'two ceiling-bounded waits (child.wait then wait_subtree_gone, '
+        f'{ROW_TREE_KILL_CEILING_SECS}s each) plus one full watchdog window '
+        f'({window}s) -- the module inherits timeout = 60 from '
+        f'orchestrator/pyproject.toml, whose thread-mode expiry os._exit()s '
+        f'the xdist worker rather than just failing this one test'
+    )
+
+
 # ---------------------------------------------------------------------------
 # Task 2819 -- deterministic unit coverage for wait_for_marker_stable, the
 # create+utimensat settle helper that de-flakes the Row 5 marker-retention
