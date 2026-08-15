@@ -3681,6 +3681,112 @@ async def test_v3_to_v4_commits_each_healed_group_so_a_later_failure_cannot_unwi
         await conn.close()
 
 
+@pytest.mark.asyncio
+async def test_v3_to_v4_reports_flagged_groups_and_skips_escalation_on_the_failure_path(
+    tmp_path,
+):
+    """The except-path result dict must report BOTH halves of a mixed pass --
+    a genuinely healed group AND an already-classified ambiguous (flagged)
+    group -- when a LATER group's cancel raises, and must NEVER invoke
+    `residual_dup_escalation_cb` from that path. Neither behaviour was
+    previously exercised: the other two failure-path tests both assert
+    `flagged == []`, so `flagged_groups` being hoisted/reported on this path
+    was unpinned, and nothing asserted the (documented, but untested)
+    decision not to escalate a partial pass.
+
+    Three residual duplicate groups:
+
+    * a title-divergent (flagged) group, given an EXPLICIT stored
+      candidate_key starting with `!` (0x21) -- every REAL
+      `compute_candidate_key` output is a 16-char lowercase sha256-hex
+      string (`[0-9a-f]`, see its docstring), all of which sort AFTER `!` in
+      SQLite's default BINARY collation. `_migrate_v3_to_v4`'s audit query
+      has no ORDER BY and SQLite implements this GROUP BY via a temp B-tree
+      (empirically confirmed: `EXPLAIN QUERY PLAN` on this exact query
+      shows `USE TEMP B-TREE FOR GROUP BY`), which visits groups in
+      ascending (tag, candidate_key) order -- so this group is GUARANTEED
+      to be classified (and appended to `flagged_groups`) before either
+      heal-eligible group below, regardless of their real candidate_key
+      values.
+    * two genuine duplicate groups, each with exactly one cancel target and
+      a REAL (non-overridden) candidate_key -- title_divergent's "verified
+      same" check applies to heal groups too, so (unlike the flagged group
+      above) neither can use an arbitrary override to pin its position. Their
+      relative order is unspecified (same caveat as
+      `..._later_failure_cannot_unwind_it` above), so the fail predicate
+      targets the 2nd-ever cancel UPDATE ordinally: whichever of the two is
+      visited first fully heals and commits, and the other raises before
+      writing anything -- exactly one heals, exactly one fails, regardless
+      of which is which.
+    """
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v3_db_with_dup_groups(db_path, [
+        # Flagged (title_divergent) -- always classified first, see docstring.
+        (30, 'Ambiguous task', 'pending', ['x.py'], '!flagged_group_key'),
+        (31, 'Ambiguous task', 'pending', ['x.py'], '!flagged_group_key'),
+        # Two heal-eligible groups, real candidate_keys, one cancel target
+        # each -- see docstring for why the fail predicate is ordinal.
+        (10, 'Alpha task', 'pending', ['a.py']),
+        (11, 'Alpha task', 'pending', ['a.py']),
+        (20, 'Zeta task', 'pending', ['z.py']),
+        (21, 'Zeta task', 'pending', ['z.py']),
+    ])
+
+    recorded: list[tuple[str, list[dict]]] = []
+
+    def recording_stub(project_root_arg, residual_groups):
+        recorded.append((project_root_arg, residual_groups))
+
+    conn = await _open_raw_v3_conn(db_path)
+    try:
+        proxy = _FailingExecuteConn(
+            conn,
+            lambda sql, p: "SET status = 'cancelled'" in sql and p.cancel_updates == 2,
+        )
+        result = await _migrate_v3_to_v4(
+            cast(aiosqlite.Connection, proxy),
+            project_root=project_root,
+            residual_dup_escalation_cb=recording_stub,
+        )
+
+        assert result['index_built'] is False, result
+        assert result['audit_complete'] is False, result
+        # Deterministic (see docstring): the flagged group always sorts --
+        # and is therefore classified -- first. RED without the hoisted
+        # `flagged_groups` reporting: today this comes back `[]`.
+        assert result['flagged'] == [
+            {
+                'tag': 'master', 'candidate_key': '!flagged_group_key',
+                'task_ids': ['30', '31'], 'count': 2, 'reason': 'title_divergent',
+            },
+        ], f'flagged reporting on the failure path must not be hard-coded []; got {result["flagged"]}'
+        assert len(result['healed']) == 1, (
+            f'exactly one of the two heal-eligible groups must be reported; got {result["healed"]}'
+        )
+
+        # Confirm the reported heal is durable and matches on-disk state --
+        # same invariant as `..._later_failure_cannot_unwind_it` above.
+        await conn.rollback()
+        status_cursor = await conn.execute("SELECT id, status FROM tasks WHERE tag='master'")
+        statuses = {row['id']: row['status'] for row in await status_cursor.fetchall()}
+        cancelled_on_disk = {tid for tid, status in statuses.items() if status == 'cancelled'}
+        assert cancelled_on_disk == set(result['healed'][0]['cancelled_ids']), (
+            f"reported healed group {result['healed'][0]} does not match what is "
+            f'durably on disk: cancelled_on_disk={cancelled_on_disk}'
+        )
+        # The ambiguous group is untouched either way.
+        assert statuses[30] == 'pending' and statuses[31] == 'pending', statuses
+    finally:
+        await conn.close()
+
+    # Escalation is reserved for the completed-audit path -- a half-finished
+    # pass must never fire it, partial or otherwise.
+    assert recorded == [], (
+        f'residual_dup_escalation_cb must not be invoked on the failure path; got {recorded}'
+    )
+
+
 # ── rebuild-without-restart: live re-audit (task 2402) ──────────────────
 
 
