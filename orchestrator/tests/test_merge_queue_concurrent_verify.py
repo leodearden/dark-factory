@@ -219,20 +219,19 @@ _KNOWN_WAIT_CONSTANTS: dict[str, float] = {
 # `timeout` stretched by RESPONSIVE_WAIT_STRETCH and hard-bounded by
 # RESPONSIVE_WAIT_WALL_CAP.  IMPORTED, not re-derived: the helper computes its
 # own per-call default cap from the very same constant, so the RATIO cannot
-# drift and this bill is an exact upper bound for any site that leaves
-# `max_wall_s` at its default.  (An earlier revision re-derived the ratio here
-# while the helper used a flat 90s default; that under-counted every
-# small-nominal site — the reviewer finding on esc-3980-3.)  The exactness is
-# NOT unconditional: an explicit `max_wall_s=` wins over the scaled default
-# inside the helper and the branch below does not scan for it, so such a site
-# would be under-billed.  No scanned late-arrival site passes `max_wall_s`
+# drift and this bill is an EXACT upper bound for any site that leaves
+# `max_wall_s` at its default.
+#
+# The exactness is NOT unconditional: an explicit `max_wall_s=` wins over the
+# scaled default inside the helper and the branch below does not scan for it,
+# so such a site would be under-billed.  No scanned site passes `max_wall_s`
 # (only the hermetic unit tests do, and they carry no mark obligation), so the
-# claim holds over the audited corpus today — closing that gap structurally is
-# tracked as follow-up.  Fixing the ratio at 2 is what lets a reviewer check
-# the paired-mark arithmetic instead of trusting a number: the worst
-# per-method budget in test_merge_speculation.py is 125s nominal
-# (TestLateArrivalCleanCAS / TestLateArrivalSubmissionOrderCAS /
-# TestLateArrivalFailCascade), and 125 x 2 = 250s still clears
+# claim holds over the audited corpus today; closing that gap structurally is
+# tracked as follow-up.
+#
+# Fixing the ratio at 2 is what lets a reviewer check the paired-mark
+# arithmetic instead of trusting a number: the worst per-method budget this
+# scan computes for test_merge_speculation.py is 240s, clearing
 # HEAVY_BARRIER_TEST_TIMEOUT (300s).
 _RESPONSIVE_WAIT_STRETCH = RESPONSIVE_WAIT_STRETCH
 
@@ -579,8 +578,8 @@ def _fail_open_records(
     reached needs a delegating SPY on the callable — see
     test_merge_speculation.py's ``TestLateArrivalFailCascade`` for the live one
     and ``TestDispositionDoubleFidelity`` for the isolated two-sided proof.
-    Reading log silence as non-execution is exactly the inference that produced
-    a wrong review finding against that file; do not repeat it.
+    Do not read log silence here as evidence the classifier never ran: a
+    successful classification is precisely the silent case.
 
     Deliberately does NOT match merge_disposition.py:695's *other* degrade
     ('degrading implicated landings to INDETERMINATE (...)'), which is a

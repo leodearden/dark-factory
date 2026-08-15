@@ -2012,7 +2012,7 @@ async def _stop_worker(
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: worst per-method wait budget 110s, x2 stretched
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: _worst_per_method_wait_budget computes 210s here
 class TestLateArrivalAttaches:
     """Step-1 RED — late arrival B attaches to in-flight predecessor A's merge commit.
 
@@ -2238,7 +2238,7 @@ class TestLateArrivalAttaches:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: worst per-method wait budget 125s, x2 stretched
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: _worst_per_method_wait_budget computes 240s here
 class TestLateArrivalCleanCAS:
     """Step-3 RED→GREEN — after A lands, B advances via clean CAS (DONE-WHEN 3).
 
@@ -2454,7 +2454,7 @@ class TestLateArrivalCleanCAS:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: worst per-method wait budget 125s, x2 stretched
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: _worst_per_method_wait_budget computes 240s here
 class TestLateArrivalFailCascade:
     """Step-5 RED→GREEN — predecessor failing invalidates the late arrival (DONE-WHEN 4).
 
@@ -2655,14 +2655,12 @@ class TestLateArrivalFailCascade:
         # WHAT THIS IS: a fidelity guard on the verify-result double this test
         # feeds the merge pipeline, anchored at the one late-arrival site where
         # the disposition classifier is reachable at all.  It is NOT a
-        # precondition on the DONE-WHEN 4 assertions below.  MEASURED: running
-        # the bare-MagicMock mutation with the fail-open assertion neutralized
-        # leaves this test PASSING — DONE-WHEN 4(a)-(d) assert on
-        # speculative_merge events, cancel_verify liveness, outcome status and
-        # `git ls-tree` contents, none of which is disposition-sensitive.  The
-        # earlier "PRECONDITION on the assertions below" framing overstated what
-        # this protects; the real and sufficient reason it exists is that nothing
-        # ELSE in the suite runs the classifier against these doubles.
+        # precondition on the DONE-WHEN 4 assertions below — MEASURED: the
+        # bare-MagicMock mutation with this assertion neutralized leaves the test
+        # PASSING, because 4(a)-(d) assert on speculative_merge events,
+        # cancel_verify liveness, outcome status and `git ls-tree` contents, none
+        # of which is disposition-sensitive.  It exists because nothing ELSE in
+        # the suite runs the classifier against these doubles.
         #
         # THE MECHANISM IT CATCHES: classify_merge_failure_disposition calls
         # _extract_failing_tests_and_candidate_files, which joins
@@ -2784,7 +2782,7 @@ class TestLateArrivalFailCascade:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: worst per-method wait budget 110s, x2 stretched
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: _worst_per_method_wait_budget computes 210s here
 class TestLateArrivalGuards:
     """Step-7 guards — fallback + permit accounting + depth-K + skip_verify + K=1 sanity.
 
@@ -3370,7 +3368,7 @@ class TestLateArrivalGuards:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: worst per-method wait budget 125s, x2 stretched
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: _worst_per_method_wait_budget computes 240s here
 class TestLateArrivalSubmissionOrderCAS:
     """Step-8 guard — main advances in strict submission order on the late-arrival path.
 
@@ -3766,12 +3764,9 @@ class TestTimeoutMarkCoverage:
 
     Task 3492 built this guard and applied it to
     test_merge_queue_concurrent_verify.py, but hard-scoped it to that file's
-    own ``Path(__file__)`` -- so THIS module, which carries the merge-spec
-    late-arrival block, was never covered despite having five classes whose
-    worst-case per-method budget was then 105s-125s nominal against a 60s
-    pyproject default and ZERO ``@pytest.mark.timeout`` marks anywhere in the
-    file.  (Those are the step-3 figures; step-6's migration raised the
-    nominal range to 110s-125s, i.e. 215s-245s as the auditor now bills it.)
+    own ``Path(__file__)`` -- so THIS module was never covered, despite
+    carrying five classes over the 60s pyproject default with ZERO
+    ``@pytest.mark.timeout`` marks anywhere in the file.
 
     The helpers are IMPORTED from test_merge_queue_concurrent_verify rather
     than reimplemented: they are deliberately pure (source text in, offender
@@ -3779,38 +3774,27 @@ class TestTimeoutMarkCoverage:
     can be driven with foreign input, and a second copy would be free to
     drift from the marks it audits.
 
-    Task 3980 extended ``_call_wait_budget`` there to recognise
-    ``wait_responsive(...)``, whose budget is charged in loop-responsive time
-    and can therefore consume up to ``min(RESPONSIVE_WAIT_STRETCH * timeout,
-    RESPONSIVE_WAIT_WALL_CAP)`` of real wall clock -- i.e. the scanned budget
-    for those call sites is stretched by exactly 2, bounded by the absolute
-    ceiling. The helper computes its own default cap from that SAME formula
-    (esc-3980-3 reviewer finding: a flat default made this bill an
-    under-count for every small-nominal site), so the scan is an exact upper
-    bound on real wall clock for every site that leaves ``max_wall_s`` at its
-    default -- which is every scanned site in this file. That stretch is why this guard has to exist BEFORE any wait in
-    this file is migrated: a stretched wait under an inadequate mark is
-    strictly worse than the flake it fixes.
+    ``_call_wait_budget`` bills a ``wait_responsive(...)`` site its stretched
+    worst case, ``min(RESPONSIVE_WAIT_STRETCH * timeout,
+    RESPONSIVE_WAIT_WALL_CAP)``.  The helper computes its own default cap from
+    that SAME formula, which is what makes the bill an EXACT upper bound on
+    real wall clock rather than an under-count -- for any site leaving
+    ``max_wall_s`` at its default, which is every scanned site here.  That
+    stretch is why this guard must exist BEFORE any wait in this file is
+    migrated: a stretched wait under an inadequate mark is strictly worse than
+    the flake it fixes.
     """
 
     def test_heavy_wait_classes_carry_adequate_timeout_mark(self) -> None:
         """Every Test* class computing >= PYPROJECT_DEFAULT_TIMEOUT must
         carry a ``timeout`` mark whose value clears its own computed budget.
 
-        RED when first written (task 3980 step-3, before step-4 added the
-        marks): five late-arrival classes computed >= 60s with no timeout
-        mark at all -- TestLateArrivalCleanCAS 125s,
-        TestLateArrivalSubmissionOrderCAS 125s, TestLateArrivalAttaches 110s,
-        TestLateArrivalGuards 110s, TestLateArrivalFailCascade 105s.
-
-        Those are the NOMINAL step-3 figures, kept as the historical record of
-        what made this guard go red; do not read them as current.  Step-6's
-        migration to ``wait_responsive`` raised FailCascade to 125s nominal
-        (it replaced that method's ``timeout=25.0`` with
-        MERGE_RESULT_TIMEOUT), and ``_call_wait_budget`` now bills every
-        ``wait_responsive`` site stretched, so recomputing today yields
-        215/245/245/215/245 against the 300s marks.  The assertion below
-        recomputes from source rather than from any number written here.
+        Recomputes from source; no figure written anywhere in this file is
+        load-bearing for the assertion.  (For orientation only, current at the
+        time of writing: 210/240/240/210/240 for the five late-arrival classes
+        against their 300s marks.  The per-class ``@pytest.mark.timeout``
+        comments carry the same numbers -- if they disagree with this guard,
+        the guard is right.)
         """
         source = Path(__file__).read_text()
         budgets = _worst_per_method_wait_budget(source)
@@ -4209,11 +4193,11 @@ class TestDispositionDoubleFidelity:
     bare-MagicMock mutation, measured), but its two-sidedness is an IMPLICIT
     property of a ~4s integration test's code path: it holds only because the
     classifier happens to sit on the head-failure cascade. A reader cannot check
-    that by reading it, and a reviewer trying to check it empirically got the
-    wrong answer — reading the ABSENCE of a WARNING as evidence the classifier
-    never ran, when a successful classification is precisely the silent case.
-    These two tests pin the mechanism directly, hermetically, in milliseconds:
-    no merge worker, no git repo, no event-loop barriers, no timing.
+    that by reading it, and checking it empirically invites a specific wrong
+    answer — reading the ABSENCE of a WARNING as evidence the classifier never
+    ran, when a successful classification is precisely the silent case. These
+    two tests pin the mechanism directly, hermetically, in milliseconds: no
+    merge worker, no git repo, no event-loop barriers, no timing.
 
     The legs are complementary and BOTH are required. The positive leg alone is
     a test that cannot fail; the negative leg is what proves it can.

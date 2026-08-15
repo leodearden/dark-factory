@@ -104,52 +104,54 @@ def wire_scheduler_liveness_mock(scheduler_mock: MagicMock) -> None:
 MERGE_RESULT_TIMEOUT = 45
 
 # task 3980: how far `wait_responsive` below may stretch a wait's REAL wall
-# clock past its nominal, loop-responsive budget.  This is the single source
-# of the ratio: the helper's per-call default cap is
+# clock past its nominal, loop-responsive budget.  SINGLE SOURCE of the ratio:
+# the helper's per-call default cap is
 # `min(RESPONSIVE_WAIT_STRETCH * timeout, RESPONSIVE_WAIT_WALL_CAP)`, and
 # test_merge_queue_concurrent_verify.py's AST wait-budget auditor
 # (`_call_wait_budget`) bills a `wait_responsive` site by IMPORTING this same
-# constant.  Keeping one definition is what makes the auditor's number an
-# exact upper bound on the helper's behaviour rather than an estimate that
-# can silently drift below it (reviewer finding on esc-3980-3: a flat
-# per-call cap let a `timeout=MERGE_GATE_BARRIER_TIMEOUT` site the auditor
-# billed at 30s actually consume 90s).
+# constant.  One definition is what makes the auditor's number an exact upper
+# bound on the helper rather than an estimate free to drift below it.
 RESPONSIVE_WAIT_STRETCH = 2.0
 
 # task 3980: ABSOLUTE hard wall-clock backstop for `wait_responsive` below,
 # DERIVED from MERGE_RESULT_TIMEOUT rather than written as a literal so a
 # reviewer can check the arithmetic instead of trusting a number.  It bounds
-# the scaled per-call cap above from ever exceeding twice a full merge
-# round-trip budget, whatever nominal a call site passes.  That ceiling is
-# what makes the stretched budget provably safe: the worst per-method wait
-# budget in test_merge_speculation.py is 125s (TestLateArrivalCleanCAS /
-# TestLateArrivalSubmissionOrderCAS / TestLateArrivalFailCascade — the last
-# reached 125s when step-6 replaced its `timeout=25.0` with
-# MERGE_RESULT_TIMEOUT), so 125 x 2 = 250s still clears
-# HEAVY_BARRIER_TEST_TIMEOUT (300s, itself derived as
-# `5 * MERGE_RESULT_TIMEOUT + 75` in test_merge_queue_concurrent_verify.py)
-# with room for fixture setup.  Never-narrow.
+# the scaled per-call cap above whatever nominal a call site passes.  Sizing
+# check: the worst per-method budget the auditor computes for
+# test_merge_speculation.py is 240s (TestLateArrivalCleanCAS /
+# TestLateArrivalFailCascade / TestLateArrivalSubmissionOrderCAS: 2 gate
+# barriers x 30 + 2 result waits x 90), under HEAVY_BARRIER_TEST_TIMEOUT
+# (300s, itself `5 * MERGE_RESULT_TIMEOUT + 75` in
+# test_merge_queue_concurrent_verify.py).  Never-narrow.
 RESPONSIVE_WAIT_WALL_CAP = int(RESPONSIVE_WAIT_STRETCH * MERGE_RESULT_TIMEOUT)  # 90s
 
 # task 3980: nominal budget for the merge-pipeline `asyncio.Event` GATE
 # barriers (`gate_a_entered.wait()` and friends in the late-arrival block of
 # test_merge_speculation.py), as distinct from the result-future waits above.
 # DERIVED rather than literal, and deliberately equal to the 15.0 those sites
-# already used: a gate barrier waits only for the fake verify runner to reach
-# a known point, not for a full merge round-trip, so borrowing the
-# result-sized budget would buy nothing green-path while tripling the scanned
-# per-method wait budget that the paired @pytest.mark.timeout must clear.
-# Keeping the nominal here is what makes the arithmetic work: the worst
-# per-method budget stays 245s stretched (2 gates x 30 + 2 results x 90 + a 5s
-# teardown), still under HEAVY_BARRIER_TEST_TIMEOUT (300s).  Never-narrow.
-# NOTE: this bounds the NOMINAL, loop-responsive budget; `wait_responsive`
-# stretches the real wall clock it may consume to
-# `RESPONSIVE_WAIT_STRETCH * MERGE_GATE_BARRIER_TIMEOUT` = 30s, which is what
-# removes these barriers' wall-clock dependence.  The "2 gates x 30" term above
-# is exactly that product — it holds BECAUSE the per-call cap scales with the
-# nominal instead of defaulting to the flat RESPONSIVE_WAIT_WALL_CAP (90s);
-# with a flat cap the true worst case would be 365s and would blow the paired
-# @pytest.mark.timeout.
+# already used.  `wait_responsive` grants such a site at most
+# `RESPONSIVE_WAIT_STRETCH * 15` = 30s of real wall clock.
+#
+# DECISION — keep 15s; do NOT raise it to MERGE_RESULT_TIMEOUT.  Recorded
+# because the amendment pass asked the question directly: in the regime where
+# THIS process is scheduled normally but its child `git`/verify subprocesses
+# are starved, the stretch buys a gate barrier nothing at all (see the helper's
+# "Limitation" section), so is 15 still right?  Yes, on three grounds:
+#   1. No gate-barrier failure has ever been MEASURED.  All three archived
+#      failures were result-future waits (45s, 45s, 25s).  Raising a nominal
+#      that has not been observed to fail is a plain widening, which this repo
+#      forbids as a flake fix (plans/flake-ledger-prd.md:216-223).
+#   2. It would be actively harmful.  Gates at a 45s nominal are billed 90s
+#      each, taking the worst per-method budget from 240s to 360s and blowing
+#      the paired @pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT) (300s) —
+#      under `timeout_method = "thread"` plus `--max-worker-restart=0` that is
+#      an os._exit() of the xdist worker, i.e. a worker death instead of a
+#      clean failure.
+#   3. It is not tight.  Every barrier in the LateArrival suite resolves inside
+#      a test that completes in ~5s end to end, against a 15s nominal and a 30s
+#      ceiling.
+# If a gate-barrier flake is ever measured, the fix is to make child-process
+# progress observable to the accounting, not to grow this number.  Never-narrow.
 MERGE_GATE_BARRIER_TIMEOUT = MERGE_RESULT_TIMEOUT // 3  # 15s
 
 # task 3307: generous synchronization-barrier ceiling for the workflow
@@ -223,38 +225,62 @@ async def wait_responsive(
     at comparable load, so the flake is probabilistic rather than a fixed
     threshold.
 
-    How it removes the wall-clock dependence
-    ----------------------------------------
+    What the accounting actually does — and its exact bound
+    ------------------------------------------------------
     Each polling slice contributes only ``min(observed, slice_s)`` to the
-    budget.  A slice that consumed 3.0s of wall clock for a 0.25s nominal
-    sleep is direct evidence the xdist worker was descheduled, so the awaited
-    work is handed back the time it was denied: under 7.7x oversubscription
-    the effective deadline stretches ~7.7x automatically, with no operator
-    knob and no magic number.
+    budget, so ``charged`` tracks EVENT-LOOP-RESPONSIVE time: a slice that
+    consumed 3.0s of wall clock for a 0.25s nominal sleep is evidence this
+    process was descheduled, and the awaited work is handed back the time it
+    was denied rather than billed for it.
 
-    Crucially this PRESERVES the red signal.  When the loop is RESPONSIVE and
-    the awaitable never resolves — a genuine merge-pipeline hang or deadlock —
-    every slice is charged in full and the guard still trips at ~*timeout*
-    seconds.  Load-independence here is a property of the accounting, not a
-    bigger number.
+    The wait ends when ``charged >= timeout`` OR ``wall >= cap``, where the
+    default ``cap`` is ``min(RESPONSIVE_WAIT_STRETCH * timeout,
+    RESPONSIVE_WAIT_WALL_CAP)``.  Read that second clause carefully, because
+    it bounds everything below: THE MAXIMUM REAL WALL CLOCK IS 2x THE NOMINAL
+    (hard-ceilinged at 90s), never the observed oversubscription ratio.  The
+    accounting on its own would stretch without limit; the cap exists because
+    a paired ``@pytest.mark.timeout`` must be a finite number.  So this helper
+    is NOT "the deadline stretches as far as the host is loaded" — an earlier
+    revision of this docstring claimed that and it was wrong.
 
-    Limitation (do not over-read the guarantee)
-    -------------------------------------------
+    What it buys over simply widening the deadline to 2x, which is the fair
+    comparison:
+      * A real hang on a RESPONSIVE loop still reports at ~*timeout* (45s),
+        not at 90s.  Charging in responsive time is what lets the ceiling rise
+        without the hang-detection deadline rising with it.
+      * The give-up message states WHICH regime ended the wait — the charged
+        total, the true wall clock and the implied starvation ratio — so a
+        starved run is self-diagnosing instead of an opaque timeout.
+      * Sizing, against measurement: the green path is ~4s and the archived
+        failures came at 45s (a >=11x tail).  A 90s ceiling covers a ~22x tail
+        on that green path.
+
+    Limitation — child-process starvation gets NO stretch
+    ----------------------------------------------------
     The accounting observes ONE thing: whether *this* process's event loop is
-    being descheduled, inferred from ``asyncio.wait(timeout=slice_s)``
-    overrunning ``slice_s`` in ``_monotonic`` terms.  That is a PROXY for host
-    scheduling pressure, not a measurement of it.  The merge round-trip these
-    tests await is dominated by child ``git`` subprocesses and verify runners,
-    so the proxy has a real blind spot: if the test process is scheduled
-    normally while its CHILDREN are starved, every slice is charged in full
-    and the wait still trips at the nominal budget — reproducing the original
-    flake, now behind a 300s class mark instead of the 60s default, so the
-    failure takes longer to surface.  What covers that residual case is not
-    the accounting but the ``RESPONSIVE_WAIT_STRETCH`` headroom (and, on the
-    green path, the ~4s measured round-trip against a 45s nominal).  Load
-    independence is therefore strong for whole-host oversubscription — the
-    shape actually observed at load avg 246 — and only partial for starvation
-    confined to child processes.
+    descheduled, inferred from ``asyncio.wait(timeout=slice_s)`` overrunning
+    ``slice_s``.  That is a PROXY for host scheduling pressure, not a
+    measurement of it, and the merge round-trip these tests await is dominated
+    by child ``git`` subprocesses and verify runners.
+
+    In the regime where this process is scheduled normally while its CHILDREN
+    are starved, the loop IS responsive, so every slice is charged in full,
+    ``charged >= timeout`` trips first, and the cap is never reached: the wait
+    gives up at the SAME nominal wall clock as the old ``asyncio.wait_for``,
+    with zero added headroom.  ``RESPONSIVE_WAIT_STRETCH`` does not cover that
+    case — do not read it as though it did.  For the gate barriers
+    (``timeout=MERGE_GATE_BARRIER_TIMEOUT``) that regime makes the migration
+    behaviourally identical to the old ``timeout=15.0``; the one site that
+    genuinely gained wall clock is
+    ``test_predecessor_fail_cascades_to_late_arrival``, whose raw
+    ``timeout=25.0`` became ``MERGE_RESULT_TIMEOUT`` — an ordinary widening,
+    named as such.
+
+    The regime actually MEASURED (load avg 246.59 on 32 cores) starves parent
+    and children alike, so the proxy does fire there.  Load-independence is
+    therefore real for whole-host oversubscription and absent for starvation
+    confined to child processes.  Closing the latter needs child-progress
+    observability, not a bigger number.
 
     COUPLED OBLIGATION
     ------------------
@@ -265,33 +291,25 @@ async def wait_responsive(
     the per-test timeout does not fail the test, it ``os._exit()``s the xdist
     worker, degrading a clean per-test failure into a worker death.  A
     stretched wait without a paired mark is therefore strictly worse than the
-    flake it fixes.  ``max_wall_s`` is the backstop that bounds how far the
-    stretch can go, so the paired mark can be sized with arithmetic rather
-    than hope.  When left at ``None`` it is ``min(RESPONSIVE_WAIT_STRETCH *
-    timeout, RESPONSIVE_WAIT_WALL_CAP)`` — it SCALES WITH THE NOMINAL rather
-    than defaulting flat to the 90s ceiling, so a small-nominal site (e.g.
-    ``timeout=MERGE_GATE_BARRIER_TIMEOUT``, 15s → 30s cap) cannot quietly
-    consume six times the wall clock the AST auditor bills it for.  That
-    equality is the whole point: ``_call_wait_budget``'s
-    ``min(nominal * RESPONSIVE_WAIT_STRETCH, RESPONSIVE_WAIT_WALL_CAP)`` is
-    then an exact upper bound on this helper FOR A SITE THAT LEAVES
-    ``max_wall_s`` AT ITS DEFAULT, not an under-count, and the paired
-    ``@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)`` marks are sound.
-    That qualifier is load-bearing and is currently a CONVENTION, not a
-    structural guarantee: an explicit ``max_wall_s`` wins over the scaled
-    default (see the ``cap = ...`` expression below), and the auditor does
-    not scan for it, so a hypothetical ``wait_responsive(f, timeout=1.0,
-    max_wall_s=1000.0)`` would be billed 2.0s while being allowed 1000s.  No
-    scanned late-arrival site passes ``max_wall_s`` — only the hermetic unit
-    tests in test_orch_helpers_wait_responsive.py do, and they carry no
-    ``@pytest.mark.timeout`` obligation — so the marks hold today.  Teaching
-    the auditor to resolve ``max_wall_s`` (or to reject any scanned site that
-    passes it) is tracked as follow-up, not assumed here.
-    (Reviewer finding on esc-3980-3: with a flat 90s default,
-    ``TestLateArrivalCleanCAS::test_late_arrival_advances_via_clean_cas``
-    had a true worst case of 2x90 + 2x90 + 5 = 365s against a 300s mark —
-    an ``os._exit()`` of the xdist worker under ``timeout_method="thread"``
-    plus ``--max-worker-restart=0``.)
+    flake it fixes.
+
+    The default ``cap`` SCALES WITH THE NOMINAL rather than defaulting flat to
+    the 90s ceiling, and that is what makes the paired marks checkable:
+    ``_call_wait_budget``'s ``min(nominal * RESPONSIVE_WAIT_STRETCH,
+    RESPONSIVE_WAIT_WALL_CAP)`` is then an EXACT upper bound on this helper,
+    not an under-count.  With a flat default a ``timeout=15`` site the auditor
+    billed at 30s could consume 90s, and TestLateArrivalCleanCAS's true worst
+    case would be 360s against a 300s mark.
+
+    That exactness carries ONE qualifier, load-bearing and currently a
+    CONVENTION rather than a structural guarantee: an explicit ``max_wall_s``
+    wins over the scaled default and the auditor does not scan for it, so a
+    hypothetical ``wait_responsive(f, timeout=1.0, max_wall_s=1000.0)`` would
+    be billed 2.0s while being allowed 1000s.  No scanned site passes
+    ``max_wall_s`` — only the hermetic unit tests in
+    test_orch_helpers_wait_responsive.py do, and they carry no mark obligation
+    — so the marks hold today.  Teaching the auditor to resolve ``max_wall_s``
+    (or to reject any scanned site passing it) is tracked as follow-up.
 
     The kwarg is named literally ``timeout`` so task 3492's AST wait-budget
     scanner (``_call_wait_budget`` in test_merge_queue_concurrent_verify.py)
