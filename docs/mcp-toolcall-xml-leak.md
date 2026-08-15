@@ -250,10 +250,12 @@ That guard is `fused_memory/server/markup_tripwire.py`, delivered by task 3141.
 **This task deliberately ships no write-boundary guard of its own.** An earlier
 revision of this branch did, and it had to be withdrawn: it would have been a
 second enumeration of the envelope literals at the same four call sites, which
-directly contradicts the invariant 3141 states in `markup_tripwire.py` and in
-the `add_memory` docstring — that module is *"deliberately the only place in the
-package that enumerates the literals."* Two rival guards at one boundary is
-precisely the drift this task exists to close, not to reproduce.
+directly contradicts the invariant `shared/src/shared/toolcall_markup.py` now
+states — that it, not `markup_tripwire.py`, is the **one** owner of the
+envelope-literal enumeration (INV-5), and `markup_tripwire.MCP_MARKUP_PATTERNS`
+is merely a re-export from it (§1, "The single literal source"). Two rival
+guards at one boundary is precisely the drift this task exists to close, not
+to reproduce.
 
 The division of labour that survives is real and worth stating, because the two
 detectors are calibrated in **opposite** directions on purpose:
