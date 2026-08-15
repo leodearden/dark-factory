@@ -212,11 +212,27 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
      born-at-L2 ``milestone_check_failed`` escalation, stamp
      ``gate_escalated_at`` (reusing the gate resume machinery so a human
      resolving the escalation on the next dispatch routes through section 1's
-     quiescence/resolve-to-done fork), and block.
-   - Timeout or an unexpected ``run_fn`` error (no verdict was produced — an
-     infra fault, not a check failure): file born-at-L2 ``infra_issue`` (the
-     existing timeout→escalate path) and block — NO ``gate_escalated_at``
-     stamp, so the check is simply re-attempted on the next dispatch.
+     quiescence/resolve-to-done fork), and block.  A non-zero rc reaching this
+     branch is always a verdict: the default runner's own timeout no longer
+     arrives as one (next bullet), and an injected ``script_runner`` keeps the
+     plain ``(rc, tail)`` contract by definition.
+   - The DEFAULT runner's INNER per-script timeout (task 4065): the check
+     overran ``before_done['timeout_secs']`` and its process group was
+     SIGKILLed, so no exit code — and therefore no verdict — exists.
+     ``_default_run_script`` signals this by raising ``ScriptTimeout``, which
+     routes to ``infra_issue`` + blocked with NO ``gate_escalated_at`` stamp.
+     Before 4065 it returned an ordinary ``(1, tail)`` and was misclassified
+     as the VERDICT above, latching a task whose invariant was never
+     evaluated into the resolve-to-done path.
+   - Outer-guard timeout or an unexpected ``run_fn`` error (likewise no
+     verdict — an infra fault, not a check failure): file born-at-L2
+     ``infra_issue`` and block — again NO ``gate_escalated_at`` stamp, so the
+     check is simply re-attempted on the next dispatch.  The outer
+     ``asyncio.wait_for`` guard remains the backstop for a seam that never
+     returns AT ALL (a detached/unkillable child, or a hanging custom
+     runner), which is strictly later than — and distinct from — the inner
+     timeout above.  All three arms file the same category, so their
+     escalation wording is deliberately distinct.
    - Section-1 resume: when ``gate_escalated_at`` is set and the
      ``milestone_check_failed`` escalation is resolved, RE-RUNS the predicate
      check (delegating back to ``_run_predicate`` — read-only, so repeating it
@@ -364,6 +380,14 @@ _REAP_GRACE_SECS: float = 5.0
 # it must never fire before the inner script-runner timeout in the normal
 # case, so 30s is deliberately generous (covers process-group teardown +
 # reap_grace_secs with room to spare) rather than tight.
+#
+# Task 4065: because this guard is a strict superset, the inner timeout is
+# what actually fires for any real, SIGKILL-able subprocess — so for the
+# DEFAULT runner that event is now a DISTINCT signal (`ScriptTimeout`, below)
+# rather than an rc=1 indistinguishable from a genuine non-zero exit.  This
+# guard's remaining job is the case it was always for: a seam that never
+# returns at all (a detached/unkillable child, or a custom script_runner that
+# simply hangs).
 _RUN_TIMEOUT_GRACE_SECS: float = 30.0
 
 
@@ -834,6 +858,15 @@ class DeterministicRunner:
             that runs the deploy script to completion.  Defaults to
             ``_default_run_script`` (awaited create_subprocess_exec).
             Injected in tests to avoid spawning real processes.
+            Full seam contract (task 4065): an injected runner returns a
+            plain ``(rc, tail)`` and NEVER raises ``ScriptTimeout`` — only
+            the default implementation does, on its own inner per-script
+            timeout.  Consequently, on the γ-predicate path an injected
+            runner's non-zero rc is always a milestone VERDICT ("the
+            invariant does not hold"), whatever its tail happens to say,
+            while the default runner's timeout is classified as an infra
+            fault.  A custom runner wanting the infra-fault classification
+            for its own timeout must raise ``ScriptTimeout`` explicitly.
         writeback_backoffs: Bound + pacing for the post-deploy verify+writeback
             retry loop (task 2066), as a list of between-attempt sleep
             seconds (``attempts = len(writeback_backoffs) + 1``).  Defaults
@@ -2141,13 +2174,30 @@ class DeterministicRunner:
           a Mem0 completion-summary write, so raw subprocess output landing
           there is ingested into memory.  The full raw output is logged at
           INFO immediately before summarizing, so nothing is silently lost.
-        - ``rc != 0`` -> a milestone VERDICT failure: born-at-L2
-          ``milestone_check_failed`` escalation + ``gate_escalated_at`` stamp
-          + blocked (routes through section-1's resume/quiescence machinery
-          on the next dispatch).
-        - Timeout / unexpected error -> an INFRA fault (no verdict was
-          produced): born-at-L2 ``infra_issue`` escalation + blocked
-          (re-attempted on the next dispatch, no ``gate_escalated_at`` stamp).
+        - ``rc != 0`` -> a milestone VERDICT failure ("the invariant does not
+          hold"): born-at-L2 ``milestone_check_failed`` escalation +
+          ``gate_escalated_at`` stamp + blocked (routes through section-1's
+          resume/quiescence machinery on the next dispatch).  Any non-zero rc
+          returned by the seam is a verdict — including one from an injected
+          ``script_runner``, whatever its tail text says.
+        - ``ScriptTimeout`` (task 4065) -> an INFRA fault: the DEFAULT
+          runner's own inner per-script timeout fired, i.e. the check overran
+          ``before_done['timeout_secs']`` and was SIGKILLed as a process
+          group, producing NO exit code and therefore no verdict.  born-at-L2
+          ``infra_issue`` + blocked, with NO ``gate_escalated_at`` stamp, so
+          the read-only check is re-attempted on the next dispatch instead of
+          being latched into the resolve-to-done path.  Before 4065 this
+          returned an ordinary ``(1, tail)`` and hit the VERDICT branch above.
+        - Outer-guard timeout / unexpected error -> likewise an INFRA fault
+          (no verdict was produced): born-at-L2 ``infra_issue`` escalation +
+          blocked (re-attempted on the next dispatch, no ``gate_escalated_at``
+          stamp).  The outer ``asyncio.wait_for`` guard
+          (``timeout_secs + run_timeout_grace_secs``) stays the backstop for a
+          seam that never returns at all — strictly later than, and distinct
+          from, the inner timeout above.  All three infra arms share one
+          category, so each carries deliberately distinct summary/detail
+          wording — that text is the only thing telling a human which guard
+          fired.
 
         Returns:
             WorkflowOutcome.DONE or WorkflowOutcome.BLOCKED.
