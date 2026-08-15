@@ -1,24 +1,40 @@
-"""Regression tests for task 1448: merge-queue halt owner released on workflow cancellation.
+"""Halt-owner contracts for the single-task ``_handle_*`` merge-halt handlers.
 
-Tests that each of the four _handle_* workflow methods releases the MergeWorker
-halt-owner registration when the workflow task is cancelled mid-await, preventing
-a deadlock where the merger loop blocks forever on _wip_halt.wait() with no
-escalation owner to trigger _on_escalation_resolved → unhalt_wip().
+The handlers split into TWO shapes, and this module pins both.
 
-Each handler follows the pattern:
+WAITING shape — ``_handle_wip_conflict`` (REQUEUED: the wait IS its retry
+mechanism) and ``_handle_wip_recovery`` (DONE: the merge landed).  These follow::
+
     escalation_queue.submit(esc)
     merge_worker.set_halt_owner(esc.id)
     await self._escalation_event.wait()
 
-Without a try/except around the await, a CancelledError leaves halt_owner_esc_id
-set with no live workflow to clear it, blocking the merge queue permanently.
+Without a try/except around that await, a CancelledError leaves
+halt_owner_esc_id set with no live workflow to clear it, blocking the merge
+queue permanently — so task 1448 hardened them to release the halt on
+cancellation, and ``*_releases_halt_on_cancel`` pins that.
 
-See: task 1448 (Protect merge-queue halt owner registration from workflow cancellation)
+ESCALATE-AND-BLOCK shape — the merge-halt TRIO ``_handle_stash_failed`` /
+``_handle_unmerged_state`` / ``_handle_wip_recovery_no_advance``, i.e. exactly
+the handlers that return BLOCKED.  Task 3537 (spec
+``docs/task-escalation-state-spec.md`` §7.9 / §8-E3, INV-6 + INV-7) rewrote them
+to file the halt-owning L1 and return immediately, so the slot/lane/queue are
+never held on an unbounded wait and the task row is parked ``blocked`` rather
+than left ``in-progress`` with no claimant.  For these the cancellation contract
+is INVERTED: there is no in-handler await to interrupt and no cleanup to run, so
+an exit must NEVER unhalt — the sole unhalt edge is the durable record's
+resolution.  See the tombstone comment mid-module and
+``test_trio_cancellation_never_unhalts``.
+
+See: task 1448 (Protect merge-queue halt owner registration from workflow
+cancellation), task 1765 (orphan-halt guards), task 2758 (stash_failed),
+task 3537 (merge-halt trio escalates-and-blocks).
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -321,89 +337,26 @@ async def test_handle_wip_recovery_releases_halt_on_cancel(
 
 
 # ---------------------------------------------------------------------------
-# Step 5: _handle_wip_recovery_no_advance
+# Task 3537: the INVERSE of the two deleted `*_releases_halt_on_cancel` tests.
+#
+# `test_handle_wip_recovery_no_advance_releases_halt_on_cancel` and
+# `test_handle_unmerged_state_releases_halt_on_cancel` used to live here.  They
+# cancelled the handler mid-await and asserted
+# `last_unhalt_reason == 'workflow_cancelled'` with the owner cleared — task
+# 1448's cancellation-orphan hardening of the WAITING shape, and the precise
+# OPPOSITE of spec §7.9, which requires the rewritten handlers to exit WITHOUT
+# ever running that cleanup.  Once these two handlers no longer wait there is no
+# in-handler await to interrupt and no cleanup path to run, so keeping them
+# would force the very unhalt edge the spec forbids.
+#
+# The two SIBLING cancel tests above (`_handle_wip_conflict`,
+# `_handle_wip_recovery`) are deliberately left in place: those handlers still
+# wait and still need the 1448 cleanup, which is what keeps this from being a
+# blanket weakening of cancellation coverage.
+#
+# Their replacement — the INVERSE pin, `test_trio_cancellation_never_unhalts` —
+# lives with the other boundary-#13 trio tests at the bottom of this module.
 # ---------------------------------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_handle_wip_recovery_no_advance_releases_halt_on_cancel(
-    workflow: TaskWorkflow,
-    fake_worker: _FakeMergeWorker,
-) -> None:
-    """Cancel mid-await in _handle_wip_recovery_no_advance releases halt owner.
-
-    This handler fires on the CAS-failure path where main was NOT advanced.
-    Same escalation-submit + await pattern, same cancellation risk.
-
-    Must fail today (pre-fix): the handler has no try/except around the await.
-    """
-    fake_worker.halt_for_wip('wip_recovery_no_advance')
-
-    task = asyncio.create_task(
-        workflow._handle_wip_recovery_no_advance(
-            MergeOutcome(
-                status='wip_recovery_no_advance',
-                recovery_branch='wip/r2',
-            ),
-        )
-    )
-
-    await _poll_until(lambda: fake_worker.halt_owner_esc_id is not None)
-
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    assert fake_worker.halt_owner_esc_id is None, (
-        'halt_owner_esc_id must be cleared after workflow cancellation'
-    )
-    assert fake_worker.is_wip_halted is False, (
-        'is_wip_halted must be False after workflow cancellation'
-    )
-    assert fake_worker.last_unhalt_reason == 'workflow_cancelled', (
-        f'expected reason="workflow_cancelled", got {fake_worker.last_unhalt_reason!r}'
-    )
-
-
-# ---------------------------------------------------------------------------
-# Step 7: _handle_unmerged_state
-# ---------------------------------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_handle_unmerged_state_releases_halt_on_cancel(
-    workflow: TaskWorkflow,
-    fake_worker: _FakeMergeWorker,
-) -> None:
-    """Cancel mid-await in _handle_unmerged_state releases halt owner.
-
-    _handle_unmerged_state fires when project_root already had pre-existing
-    UU/AA/DD markers before the merge attempt.  Same pattern, same risk.
-
-    Must fail today (pre-fix): the handler has no try/except around the await.
-    """
-    fake_worker.halt_for_wip('unmerged_state')
-
-    task = asyncio.create_task(
-        workflow._handle_unmerged_state(
-            MergeOutcome(status='unmerged_state'),
-            'task/1448',
-        )
-    )
-
-    await _poll_until(lambda: fake_worker.halt_owner_esc_id is not None)
-
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    assert fake_worker.halt_owner_esc_id is None, (
-        'step-7: halt_owner_esc_id must be cleared after workflow cancellation'
-    )
-    assert fake_worker.is_wip_halted is False, (
-        'step-7: is_wip_halted must be False after workflow cancellation'
-    )
-    assert fake_worker.last_unhalt_reason == 'workflow_cancelled', (
-        f'step-7: expected reason="workflow_cancelled", got {fake_worker.last_unhalt_reason!r}'
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -794,6 +747,8 @@ def _invoke_trio_handler(workflow: TaskWorkflow, handler_id: str):
 #: ``_on_escalation_resolved`` both key on that category, not on the status.
 _TRIO = [
     ('stash_failed', 'stash_failed', 'README.md'),
+    ('unmerged_state', 'unmerged_state', 'UU/AA/DD'),
+    ('wip_recovery_no_advance', 'wip_conflict', 'wip/r2'),
 ]
 
 _TRIO_IDS = [row[0] for row in _TRIO]
@@ -938,3 +893,50 @@ async def test_trio_never_refiles_sibling_halt_category(
     assert fake_worker.halt_owner_esc_id == 'esc-foreign-1'
     assert fake_worker.is_wip_halted is True
     assert fake_worker.last_unhalt_reason is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('handler_id,expected_category,summary_token', _TRIO, ids=_TRIO_IDS)
+async def test_trio_cancellation_never_unhalts(
+    handler_id: str,
+    expected_category: str,
+    summary_token: str,
+    workflow: TaskWorkflow,
+    fake_worker: _FakeMergeWorker,
+) -> None:
+    """Cancelling AROUND a rewritten trio handler can never un-halt the queue.
+
+    The INVERSE of the two deleted ``*_releases_halt_on_cancel`` tests (see the
+    tombstone comment above ``test_submit_failure_does_not_register_halt_owner``).
+    The halt is engaged because project_root is dirty / unmergeable, so
+    releasing it on a teardown would let the whole fleet merge over that tree.
+    Whether the handler completed first or was interrupted, the halt must stay
+    engaged and ``unhalt_wip`` must never have been called.
+
+    RED today: the handler parks on ``_escalation_event.wait()``, so the cancel
+    lands mid-await and ``_submit_halt_escalation_and_wait``'s
+    ``except BaseException`` cleanup fires ``unhalt_wip('workflow_cancelled')``.
+    """
+    fake_worker.halt_for_wip(handler_id)
+
+    task = asyncio.create_task(_invoke_trio_handler(workflow, handler_id))
+    # Let the handler get as far as owning the halt, so the cancel lands at or
+    # after the point where the OLD shape would have been parked on its wait.
+    await _poll_until(lambda: fake_worker.halt_owner_esc_id is not None)
+
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    assert fake_worker.last_unhalt_reason is None, (
+        f'{handler_id}: cancellation must NEVER unhalt the merge queue over a '
+        f'dirty project_root (got reason {fake_worker.last_unhalt_reason!r}) — '
+        f'the only unhalt edge is the durable L1 being resolved (spec §7.9)'
+    )
+    assert fake_worker.is_wip_halted is True, (
+        f'{handler_id}: the halt must remain engaged after cancellation'
+    )
+    assert fake_worker.halt_owner_esc_id is not None, (
+        f'{handler_id}: the halt owner registration must survive cancellation — '
+        f'clearing it would strand the halt with nothing to resolve it'
+    )
