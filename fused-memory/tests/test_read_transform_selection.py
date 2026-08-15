@@ -2028,6 +2028,198 @@ class TestTheTwoQuerySetsDoNotSilentlyMerge:
         assert 'traffic_share' in str(exc.value)
 
 
+# ---------------------------------------------------------------------------
+# A malformed share is a NAMED refusal, not a raw traceback
+# ---------------------------------------------------------------------------
+#
+# The loader's field check is key-PRESENCE only, so `"traffic_share": null`
+# passes it and flows straight through to
+# `production_query_provenance`'s `sum(entry['traffic_share'] ...)`, which
+# raises `TypeError` — a type NOT in `main`'s handler tuple, so the observed
+# result is a traceback rather than the named `return 1`.
+#
+# This is reachable, not hypothetical: `harvest_production_queries._share`
+# returns None whenever `total <= 0` and feeds it to the briefing-template
+# rows, so a harvest over a journal with zero parseable search ops emits
+# exactly this fixture.  The committed sample happens to be clean (44 rows,
+# 0 null shares), which is why the guard has to be provoked here.
+#
+# The refusal is scoped to the rows the claim rests on.  A `null` share is a
+# legal MEASUREMENT for a tail row — it is never summed — but on a
+# `briefing_template` row it is the artifact's headline "the four templates
+# are N% of all search traffic" being unbuildable, and the fixture is
+# malformed.
+
+class TestAMalformedShareIsRefusedByName:
+    """Refuse at the loader, so `main`'s existing handler can name it."""
+
+    def test_a_null_share_on_a_template_row_is_refused(self, tmp_path):
+        mod = _mod()
+        path = _prod_rows(tmp_path, [_prod_row(traffic_share=None)])
+
+        with pytest.raises(mod.ProductionQuerySetError) as exc:
+            mod.load_production_queries(path)
+
+        message = str(exc.value)
+        assert 'prod-brief-abc' in message
+        assert 'traffic_share' in message
+
+    def test_a_string_share_is_refused_by_type_not_by_presence(self, tmp_path):
+        mod = _mod()
+        path = _prod_rows(tmp_path, [_prod_row(traffic_share='0.17')])
+
+        with pytest.raises(mod.ProductionQuerySetError) as exc:
+            mod.load_production_queries(path)
+
+        assert 'traffic_share' in str(exc.value)
+
+    def test_a_bool_share_is_refused(self, tmp_path):
+        """`isinstance(True, int)` is True — a bare numeric check lets it in."""
+        mod = _mod()
+        path = _prod_rows(tmp_path, [_prod_row(traffic_share=True)])
+
+        with pytest.raises(mod.ProductionQuerySetError) as exc:
+            mod.load_production_queries(path)
+
+        assert 'traffic_share' in str(exc.value)
+
+    @pytest.mark.parametrize('bad', ['74103', None, -1, 3.5, True])
+    def test_a_non_integer_observed_count_is_refused(self, tmp_path, bad):
+        mod = _mod()
+        path = _prod_rows(tmp_path, [_prod_row(observed_count=bad)])
+
+        with pytest.raises(mod.ProductionQuerySetError) as exc:
+            mod.load_production_queries(path)
+
+        assert 'observed_count' in str(exc.value)
+        assert 'prod-brief-abc' in str(exc.value)
+
+    def test_a_tail_rows_null_share_is_a_measurement_not_a_defect(self, tmp_path):
+        """The harvester emits it legitimately, and nothing sums it.
+
+        Refusing it here would make a real harvest unloadable over a journal
+        the loader has no business judging.
+        """
+        mod = _mod()
+        path = _prod_rows(tmp_path, [
+            _prod_row(),
+            _prod_row(query_id='prod-tail-1', text='an unrepeated question',
+                      source='production_tail', traffic_share=None,
+                      observed_count=1),
+        ])
+
+        queries = mod.load_production_queries(path)
+
+        assert [q.traffic_share for q in queries] == [0.172892, None]
+
+    def test_main_returns_1_with_the_named_error_and_no_traceback(
+        self, tmp_path, capsys,
+    ):
+        """The exit path, not just the exception type.
+
+        `ProductionQuerySetError` is already in `main`'s handler tuple; the
+        point of refusing at the loader is that the tuple does not have to
+        be widened to swallow bare `TypeError`, which would turn unrelated
+        programming errors into a quiet exit 1.
+        """
+        mod = _mod()
+        path = _prod_rows(tmp_path, [_prod_row(traffic_share=None)])
+
+        code = mod.main([
+            '--production-queries', str(path),
+            '--json-out', str(tmp_path / 'out.json'),
+            '--md-out', str(tmp_path / 'out.md'),
+        ])
+
+        assert code == 1
+        stderr = capsys.readouterr().err
+        assert stderr.startswith('ProductionQuerySetError: ')
+        assert 'Traceback' not in stderr
+
+
+class TestTheProvenanceBlockToleratesAnAbsentShare:
+    """The two halves of the module must agree that `None` is legal.
+
+    The renderer already handles `share is None`; the provenance builder
+    crashed on it.  A pure function over a hand-built or older row list
+    must not be the thing that decides — the loader is.
+    """
+
+    def _query(self, mod, **kwargs):
+        fields = {
+            'query_id': 'prod-brief-abc',
+            'text': 'project overview architecture goals',
+            'source': 'briefing_template',
+            'observed_count': 74103,
+            'traffic_share': 0.172892,
+            'observed_limit': 5,
+            'template': 'project overview architecture goals',
+            'match': 'literal',
+        }
+        fields.update(kwargs)
+        return mod.ProductionQuery(**fields)
+
+    def test_a_none_share_never_raises(self, ):
+        mod = _mod()
+
+        block = mod.production_query_provenance([
+            self._query(mod, traffic_share=None),
+        ])
+
+        assert block['family_share'] is None
+
+    def test_the_sum_skips_the_none_and_keeps_the_measured_ones(self):
+        mod = _mod()
+
+        block = mod.production_query_provenance([
+            self._query(mod, traffic_share=0.25),
+            self._query(mod, query_id='b', template='b', traffic_share=None),
+            self._query(mod, query_id='c', template='c', traffic_share=0.1),
+        ])
+
+        assert block['family_share'] == 0.35
+
+    def test_no_template_carries_a_share_reports_no_measurement(self):
+        """`None`, never a measured 0.0 — the discipline the artifact states."""
+        mod = _mod()
+
+        block = mod.production_query_provenance([
+            self._query(mod, traffic_share=None),
+            self._query(mod, query_id='b', template='b', traffic_share=None),
+        ])
+
+        assert block['family_share'] is None
+
+    def test_the_renderer_prints_a_dash_for_an_absent_observed_count(self):
+        """`f'{"—":,}'` raises `ValueError: Cannot specify ',' with 's'`.
+
+        The key is always written today, so this guards a hand-edited or
+        older artifact against crashing the renderer instead of printing a
+        dash.
+        """
+        mod = _mod()
+        report = mod.build_selection_report(_scored())
+        report['production_queries'] = {
+            'templates': [
+                {'template': 'a template', 'match': 'literal',
+                 'traffic_share': None},
+            ],
+            'family_share': None,
+            'sampled_query_count': 1,
+            'tail_query_count': 0,
+            'observed_limit': 5,
+            'unlabeled': True,
+            'unlabeled_reason': mod._UNLABELED_REASON,
+        }
+
+        markdown = mod.render_selection_markdown(report)
+
+        row = next(
+            line for line in markdown.splitlines() if '`a template`' in line
+        )
+        assert row.count(_bake_off()._NO_MEASUREMENT) == 2
+
+
 class TestProductionIsScoredAtProductionsOwnK:
     """briefing.py fires at limit=5 (:1376), not the E2 default of 10."""
 
