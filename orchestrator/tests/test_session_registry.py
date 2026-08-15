@@ -3190,7 +3190,7 @@ def test_main_lease_heartbeat_bumps_mtime(
     _set_mtime(lease_path, _NOW, timedelta(hours=1))
     backdated_mtime = lease_path.stat().st_mtime
 
-    rc = sr.main(['lease-heartbeat', '--name', 'watcher-df'])
+    rc = sr.main(['lease-heartbeat', '--name', 'watcher-df', '--slug', 'watcher-df-100'])
 
     assert rc == 0
     assert lease_path.stat().st_mtime > backdated_mtime
@@ -3206,10 +3206,120 @@ def test_main_lease_release_removes_the_file(
     lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
     assert lease_path.is_file()
 
-    rc = sr.main(['lease-release', '--name', 'watcher-df'])
+    rc = sr.main(['lease-release', '--name', 'watcher-df', '--slug', 'watcher-df-100'])
 
     assert rc == 0
     assert not lease_path.exists()
+
+
+# --- CLI ownership on the mutating verbs (task 3994 defect 1) -------------
+
+
+def _claim_via_cli(slug: str = 'watcher-df-100', pid: int | None = None) -> None:
+    sr.main(
+        [
+            'lease-claim',
+            '--name',
+            'watcher-df',
+            '--slug',
+            slug,
+            '--pid',
+            str(os.getpid() if pid is None else pid),
+        ]
+    )
+
+
+@pytest.mark.parametrize('verb', ['lease-heartbeat', 'lease-release'])
+def test_main_lease_mutating_verbs_require_slug(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, verb: str
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _claim_via_cli()
+
+    # A pre-3994 invocation must now FAIL LOUDLY rather than silently
+    # evicting/refreshing a lease it may not hold. argparse exits 2.
+    with pytest.raises(SystemExit) as excinfo:
+        sr.main([verb, '--name', 'watcher-df'])
+
+    assert excinfo.value.code == 2
+
+
+@pytest.mark.parametrize('verb', ['lease-heartbeat', 'lease-release'])
+def test_main_lease_mutating_verbs_print_result_applied_for_the_owner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    verb: str,
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _claim_via_cli()
+    capsys.readouterr()
+
+    rc = sr.main([verb, '--name', 'watcher-df', '--slug', 'watcher-df-100'])
+
+    assert rc == 0
+    # Mirrors lease-claim's `decision=` convention: one parse rule for all
+    # four lease verbs.
+    assert capsys.readouterr().out.splitlines()[0] == 'result=applied'
+
+
+@pytest.mark.parametrize('verb', ['lease-heartbeat', 'lease-release'])
+def test_main_lease_mutating_verbs_refuse_a_stranger_without_changing_rc(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    verb: str,
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _claim_via_cli()
+    capsys.readouterr()
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    original_body = lease_path.read_text()
+
+    rc = sr.main([verb, '--name', 'watcher-df', '--slug', 'watcher-df-STRANGER'])
+
+    # Fail-soft: a refusal is an OUTCOME, not an exit-code change.
+    assert rc == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == 'result=refused'
+    # The human line must name the REAL holder, so an agent reading stdout
+    # learns who owns it rather than only that it was told no.
+    assert 'watcher-df-100' in lines[1]
+    assert lease_path.read_text() == original_body
+
+
+@pytest.mark.parametrize('verb', ['lease-heartbeat', 'lease-release'])
+def test_main_lease_mutating_verbs_force_overrides_a_stranger_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    verb: str,
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _claim_via_cli()
+    capsys.readouterr()
+
+    rc = sr.main([verb, '--name', 'watcher-df', '--slug', 'watcher-df-STRANGER', '--force'])
+
+    assert rc == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == 'result=forced'
+    assert 'watcher-df-100' in lines[1]
+
+
+@pytest.mark.parametrize('verb', ['lease-heartbeat', 'lease-release'])
+def test_main_lease_mutating_verbs_report_absent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    verb: str,
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    rc = sr.main([verb, '--name', 'watcher-df', '--slug', 'watcher-df-100'])
+
+    assert rc == 0
+    assert capsys.readouterr().out.splitlines()[0] == 'result=absent'
 
 
 def test_main_lease_reap_removes_a_stale_lease(
