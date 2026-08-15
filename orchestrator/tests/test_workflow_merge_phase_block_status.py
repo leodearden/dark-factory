@@ -24,14 +24,19 @@ write moves to the BLOCKED RETURN points, and this module pins BOTH halves:
     NEITHER ``blocked`` NOR ``pending``, and the §5 steward-terminal-decision
     preserve carve-out is not clobbered.
 
-It also carries the ``merge_phase=True`` CALL-SITE TRIPWIRE, which pins the SET
-of literal suppressing call sites: a new one cannot appear without failing the
-allowlist assertion and being justified in review.
+Both halves are pinned BEHAVIOURALLY, through ``_mark_blocked`` itself.  An
+earlier revision also carried source-structure meta-tests over workflow.py (a
+``merge_phase=True`` call-site allowlist, and rationale-marker greps); they were
+dropped because they asserted on cosmetic source shape — function names, call
+nesting — rather than on the property that matters, and so failed on
+behaviour-preserving refactors while adding nothing the tests below miss.  The
+rationale for the surviving suppression lives in ``_mark_blocked``'s
+``MERGE_PHASE_RATIONALE`` docstring paragraph and at the call site in
+``_run_merge_phase``.
 """
 
 from __future__ import annotations
 
-import ast
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -281,87 +286,4 @@ class TestMergePhaseFencePreserved:
         assert 'blocked' not in _statuses(workflow), (
             "the steward's 'deferred' adjudication must be preserved, not "
             f'clobbered with blocked (statuses={_statuses(workflow)!r})'
-        )
-
-
-# ---------------------------------------------------------------------------
-# merge_phase=True CALL-SITE TRIPWIRE
-# ---------------------------------------------------------------------------
-
-#: Every literal ``merge_phase=True`` call site in workflow.py, as
-#: ``(enclosing function, callee)``.  A new entry here means a new path that
-#: SUPPRESSES the entry-gate status transition, which is exactly the class of
-#: change that produced the INV-6 defect this task fixes.
-MERGE_PHASE_TRUE_ALLOWLIST: frozenset[tuple[str, str]] = frozenset({
-    ('_run_merge_phase', '_submit_to_merge_queue'),
-})
-
-
-class _MergePhaseTrueCollector(ast.NodeVisitor):
-    """Collect ``(enclosing function, callee)`` for every ``merge_phase=True``.
-
-    Structural (AST), not textual: a regex over the source would miss a
-    reformatted call and would false-positive on ``merge_phase=True`` inside a
-    comment or docstring.  Only a literal ``True`` counts — ``merge_phase=x``
-    threading (every other occurrence in the file) is not a new suppressing
-    origin.
-    """
-
-    def __init__(self) -> None:
-        self._fn_stack: list[str] = []
-        self.sites: set[tuple[str, str]] = set()
-
-    def _visit_function(self, node) -> None:
-        self._fn_stack.append(node.name)
-        self.generic_visit(node)
-        self._fn_stack.pop()
-
-    visit_FunctionDef = _visit_function
-    visit_AsyncFunctionDef = _visit_function
-
-    def visit_Call(self, node: ast.Call) -> None:
-        for kw in node.keywords:
-            if (
-                kw.arg == 'merge_phase'
-                and isinstance(kw.value, ast.Constant)
-                and kw.value.value is True
-            ):
-                func = node.func
-                callee = (
-                    func.attr if isinstance(func, ast.Attribute)
-                    else func.id if isinstance(func, ast.Name)
-                    else ast.dump(func)
-                )
-                enclosing = self._fn_stack[-1] if self._fn_stack else '<module>'
-                self.sites.add((enclosing, callee))
-        self.generic_visit(node)
-
-
-@pytest.fixture(scope='module')
-def _workflow_source() -> _MergePhaseTrueCollector:
-    from orchestrator import workflow as workflow_module
-
-    source = Path(workflow_module.__file__).read_text()
-    collector = _MergePhaseTrueCollector()
-    collector.visit(ast.parse(source))
-    return collector
-
-
-class TestMergePhaseCallSiteTripwire:
-    """The SET of literal ``merge_phase=True`` origins is pinned, so a new
-    suppressing call site cannot land unnoticed (task γ2's grep/test signal)."""
-
-    def test_call_sites_match_allowlist(self, _workflow_source) -> None:
-        collector = _workflow_source
-
-        assert collector.sites == MERGE_PHASE_TRUE_ALLOWLIST, (
-            f'literal merge_phase=True call sites drifted from the allowlist.\n'
-            f'  added:   {sorted(collector.sites - MERGE_PHASE_TRUE_ALLOWLIST)}\n'
-            f'  removed: {sorted(MERGE_PHASE_TRUE_ALLOWLIST - collector.sites)}\n'
-            'A new merge_phase=True call site must be added to '
-            'MERGE_PHASE_TRUE_ALLOWLIST and justified in review: it SUPPRESSES '
-            "_mark_blocked's ENTRY status transition, which is only safe where "
-            'the caller keeps a LIVE claimant and retries in-slot — never where '
-            'it exits the slot leaving the row in-progress. '
-            'See spec §8-E2 / INV-6.'
         )

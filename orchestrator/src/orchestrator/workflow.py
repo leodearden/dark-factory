@@ -3678,9 +3678,10 @@ class TaskWorkflow:
             # mid-retry.  The suppression extends no further than that: the
             # non-DONE/non-REQUEUED arm a few lines below is a SLOT EXIT, and
             # its park status is written by _mark_blocked's merge-aware
-            # _park_merge_phase_row target.  Adding another merge_phase=True
-            # call site requires an entry in
-            # test_workflow_merge_phase_block_status.MERGE_PHASE_TRUE_ALLOWLIST.
+            # _park_merge_phase_row target.  Any NEW literal merge_phase=True
+            # call site is only safe under the same condition: the caller keeps
+            # a LIVE claimant and retries in-slot.  Never add one on a path that
+            # EXITS the slot — that leaves an unclaimed in-progress row.
             merge_outcome = await self._submit_to_merge_queue(
                 branch_name, pre_rebased=pre_rebased,
                 merge_phase=True,
