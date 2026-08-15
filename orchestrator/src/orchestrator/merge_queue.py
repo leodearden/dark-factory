@@ -9896,13 +9896,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         -----
         - ``quarantine_class`` is derived with the SAME predicate
           :meth:`_reprobe_quarantined_hosts` uses to tell the two quarantine
-          origins apart — ``name in self._runner_unavailable``, i.e. its
-          ``entry = self._runner_unavailable.get(name); if entry is None:
-          continue`` skip under the comment "Skip divergence-quarantined hosts
-          — not tracked as RunnerUnavailable".  Sharing the predicate means
-          this snapshot and the reprobe path can never disagree about whether
-          a quarantined host is RU-recoverable (``'ru'``) or held for verdict
-          divergence (``'divergence'``, cleared only by an operator).
+          origins apart — ``name in self._runner_unavailable``.  Since task
+          3043 that reprobe sweep is *tracker-driven*: it iterates
+          ``self._runner_unavailable`` directly (``for name, entry in
+          list(self._runner_unavailable.items())``) instead of iterating the
+          quarantine set and skipping untracked names, so the predicate is the
+          loop itself rather than a skip inside it.  Semantically unchanged —
+          and now stronger: ``quarantine_class == 'ru'`` means exactly "is a
+          reprobe candidate".  Sharing the predicate means this snapshot and
+          the reprobe path can never disagree about whether a quarantined host
+          is RU-recoverable (``'ru'``) or held for verdict divergence
+          (``'divergence'``, cleared only by an operator).
         - ``unavailable_since`` / ``unavailable_secs`` / ``streak`` / ``reason``
           are populated whenever the host is RU-tracked, **independent of
           quarantine**, so a host accumulating failures below the quarantine
@@ -9989,16 +9993,47 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         return out
 
     async def _reprobe_quarantined_hosts(self, now: float) -> None:
-        """Probe each RU-quarantined remote host and clear on recovery.
+        """Probe each RU-**tracked** remote host and re-engage it on recovery.
 
-        Called periodically by :meth:`_reprobe_loop`.  For each host that is
-        **both** in the allocator's quarantine set **and** tracked as
-        RunnerUnavailable (``self._runner_unavailable``):
+        Called periodically by :meth:`_reprobe_loop`.  Candidacy is **tracker-
+        driven** (task 3043): the sweep iterates ``self._runner_unavailable``
+        and resolves a runner for each tracked host, rather than iterating the
+        allocator's quarantine set and then requiring a tracker entry.
 
-        1. Probes the host via ``runner.health()`` (cheap SSH reachability check).
-        2. **On success** (host recovered): clears quarantine, resets the tracker,
-           and calls :func:`_clear_verify_host_unreachable` to resolve the open
-           L1 and emit a recovery event.
+        Why the inversion.  The old conjunction ("in the quarantine set AND in
+        the tracker") made recovery reachable only when two pieces of state
+        happened to agree, and three real paths violate that agreement, each
+        stranding a host permanently — non-acquirable, yet structurally
+        invisible to this sweep:
+
+        - an orphaned inner verify task whose ``RunnerUnavailable`` escapes
+          after the outer coroutine was cancelled (in neither);
+        - a ``cancel_and_release`` against a down host, which leaves the slot
+          PARKED and non-acquirable *without* adding the host to the quarantine
+          set (in neither, yet out of the pool);
+        - any future quarantine site that forgets to record.
+
+        A single positive condition ("the tracker says this host is
+        unavailable, so probe it") covers **both** the RUNNER_UNAVAILABLE
+        VerifyResult path and those escaping-exception / PARKED-strand paths.
+        The INV-A chokepoint :meth:`_quarantine_unreachable_host` guarantees
+        the tracker entry exists for every RU-class removal from the pool.
+
+        Per host:
+
+        1. Probes via ``runner.health()`` (cheap SSH reachability check).
+        2. **On success** (host recovered): if the slot is PARKED and the runner
+           exposes ``probe_clean``, re-admission additionally requires a clean
+           probe — PARK means "the cancel RPC failed, so a stale verify may
+           still be running there", and freeing the slot on mere reachability
+           could double-dispatch onto a host still churning on the previous
+           merge.  A dirty host stays tracked and parked so the NEXT sweep
+           retries it.  Otherwise the host is **re-admitted** via
+           ``allocator.readmit`` — which un-quarantines *and* un-PARKs; plain
+           ``clear_quarantine`` cannot recover a PARKED slot, since
+           ``acquire_remote`` additionally requires ``_SLOT_FREE`` — then the
+           tracker is reset and :func:`_clear_verify_host_unreachable` resolves
+           the open L1 and emits a recovery event.
         3. **On failure** (host still unreachable): if
            ``self._unreachable_escalate_after_secs > 0`` **and**
            ``now - entry.first_unavailable_at >= self._unreachable_escalate_after_secs``
@@ -10010,29 +10045,46 @@ class SpeculativeMergeWorker(_WipHaltMixin):
            churn for a host that recovers in the same cycle it would have tripped
            the time-based threshold.
 
-        **Correctness invariant**: hosts quarantined for verdict divergence —
-        by :class:`DriftDetector`'s sampled parity check OR by the land-time
-        per-land cross-check in :func:`_run_post_merge_verify` (task 2822 fix
-        b, which adds ``runner.name`` to the same worker-owned
-        ``_runner_quarantine`` set) — are intentionally skipped: they are in
-        the allocator quarantine but absent from ``self._runner_unavailable``.
-        Clearing either on mere SSH reachability would bypass the verdict
-        parity gate (Invariant 5); both stay quarantined until an operator
-        re-proves the host and clears it explicitly.
+        **Correctness invariant (Invariant 5)**: hosts quarantined for verdict
+        divergence — by :class:`DriftDetector`'s sampled parity check OR by the
+        land-time per-land cross-check in :func:`_run_post_merge_verify` (task
+        2822 fix b, which adds ``runner.name`` to the same worker-owned
+        ``_runner_quarantine`` set) — are never in ``self._runner_unavailable``,
+        so tracker-driven candidacy excludes them **by construction** rather
+        than by an explicit skip.  Clearing either on mere SSH reachability
+        would bypass the verdict parity gate; both stay quarantined until an
+        operator re-proves the host and clears it explicitly.
 
-        Per-host exceptions are caught so one host's failure cannot abort the
-        sweep for the remaining hosts.
+        Runner resolution deliberately uses ``getattr`` + a
+        ``quarantined_remote_runners()`` fallback rather than the
+        ``isinstance(_host_allocator, HostAllocator)`` gate used elsewhere in
+        this class: the reprobe suites drive this method through lightweight
+        allocator doubles that are not ``HostAllocator`` instances, and an
+        isinstance gate would make the sweep a silent no-op for them.
+
+        The tracker is iterated as a **snapshot** because the sweep mutates it
+        (``_record_runner_recovered``).  Per-host exceptions are caught so one
+        host's failure cannot abort the sweep for the remaining hosts.
         """
         if self._host_allocator is None:
             return
 
-        for name, runner in self._host_allocator.quarantined_remote_runners():
-            # Skip divergence-quarantined hosts — not tracked as RunnerUnavailable.
-            entry = self._runner_unavailable.get(name)
-            if entry is None:
-                continue
-
+        for name, entry in list(self._runner_unavailable.items()):
             try:
+                # Resolve a runner for a host that may NOT be in the quarantine
+                # set — the strand shape `quarantined_remote_runners()`
+                # structurally cannot report.  Fallback keeps pre-existing
+                # allocator doubles (which predate `remote_runner`) working.
+                _resolve = getattr(self._host_allocator, 'remote_runner', None)
+                runner = _resolve(name) if _resolve is not None else None
+                if runner is None:
+                    runner = dict(
+                        self._host_allocator.quarantined_remote_runners()
+                    ).get(name)
+                if runner is None:
+                    # Tracked but unresolvable: nothing to probe this sweep.
+                    continue
+
                 downtime_s = now - entry.first_unavailable_at
 
                 # Probe health first so a host that recovers in the same cycle
@@ -10040,7 +10092,21 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # to the recovery path, avoiding a spurious open→immediate-
                 # resolve L1 notification.
                 if await runner.health():
-                    self._host_allocator.clear_quarantine(name)
+                    # PARK safety: a PARKED slot may still be running a stale
+                    # verify (its cancel RPC failed), so require a clean probe
+                    # before freeing it.  A runner that does not implement the
+                    # optional probe is treated as clean.
+                    _is_parked = getattr(self._host_allocator, 'is_parked', None)
+                    if _is_parked is not None and _is_parked(name):
+                        _probe_clean = getattr(runner, 'probe_clean', None)
+                        if _probe_clean is not None and not await _probe_clean():
+                            continue
+
+                    _readmit = getattr(self._host_allocator, 'readmit', None)
+                    if _readmit is not None:
+                        _readmit(name)
+                    else:
+                        self._host_allocator.clear_quarantine(name)
                     self._record_runner_recovered(name)
                     _clear_verify_host_unreachable(
                         self._escalation_queue,
