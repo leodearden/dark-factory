@@ -3054,6 +3054,19 @@ def test_release_lease_is_idempotent_on_a_second_call(tmp_path: Path) -> None:
 # --- heartbeat_lease: ownership (task 3994 defect 1) -----------------------
 
 
+def _seed_lease(tmp_path: Path, *, slug: str = 'watcher-df-100', pid: int | None = None) -> Path:
+    """Claim `watcher-df` for *slug*/*pid* under tmp_path; return its lease path.
+
+    Shared by the three task-3994 sections below (heartbeat ownership, release
+    ownership, lease_status) -- defined once, here, at its first use.
+    """
+    holder = sr.LeaseHolder(
+        session_slug=slug, pid=os.getpid() if pid is None else pid, start_ts=_NOW.isoformat()
+    )
+    sr.claim_lease('watcher-df', holder=holder, root=tmp_path, now=_NOW)
+    return sr.lease_path_for_name('watcher-df', root=tmp_path)
+
+
 def test_heartbeat_lease_by_a_stranger_is_refused_and_the_mtime_is_untouched(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -3160,17 +3173,6 @@ def test_a_strangers_refused_heartbeat_leaves_a_dead_holders_lease_reapable(
 
 
 # --- release_lease: ownership (task 3994 defect 1) -------------------------
-
-
-def _seed_lease(
-    tmp_path: Path, name: str = 'watcher-df', *, slug: str = 'watcher-df-100', pid: int | None = None
-) -> Path:
-    """Claim *name* for *slug* and return its on-disk lease path."""
-    holder = sr.LeaseHolder(
-        session_slug=slug, pid=os.getpid() if pid is None else pid, start_ts=_NOW.isoformat()
-    )
-    sr.claim_lease(name, holder=holder, root=tmp_path, now=_NOW)
-    return sr.lease_path_for_name(name, root=tmp_path)
 
 
 def test_release_lease_by_a_stranger_is_refused_and_the_lease_survives(
@@ -3363,15 +3365,6 @@ def test_reap_stale_leases_continues_sweep_when_one_removal_fails(
 # ---------------------------------------------------------------------------
 
 
-def _seed_lease(tmp_path: Path, *, slug: str = 'watcher-df-100', pid: int | None = None) -> Path:
-    """Claim `watcher-df` for *slug*/*pid* under tmp_path; return its lease path."""
-    holder = sr.LeaseHolder(
-        session_slug=slug, pid=os.getpid() if pid is None else pid, start_ts=_NOW.isoformat()
-    )
-    sr.claim_lease('watcher-df', holder=holder, root=tmp_path, now=_NOW)
-    return sr.lease_path_for_name('watcher-df', root=tmp_path)
-
-
 def test_lease_status_reports_the_holder_and_the_heartbeat_clock(tmp_path: Path) -> None:
     path = _seed_lease(tmp_path)
     _set_mtime(path, _NOW, timedelta(minutes=30))
@@ -3385,6 +3378,8 @@ def test_lease_status_reports_the_holder_and_the_heartbeat_clock(tmp_path: Path)
     assert status.holder_pid_alive is True
     # Freshness is derived from the MTIME, the axis `cat` cannot show.
     assert int(status.heartbeat_age_secs) == 1800
+    # heartbeat_ts is None only for an absent lease; a held one always has one.
+    assert status.heartbeat_ts is not None
     assert datetime.fromisoformat(status.heartbeat_ts).replace(microsecond=0) == _NOW - timedelta(
         minutes=30
     )
