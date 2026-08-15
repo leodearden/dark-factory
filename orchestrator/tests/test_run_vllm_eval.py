@@ -1053,7 +1053,7 @@ def _write_n_task_specs(fake_tasks: Path, task_ids: list[str]) -> None:
 
 def _setup_concurrent_fixture(
     monkeypatch, tmp_path: Path, task_ids: list[str]
-) -> tuple[Path, object]:
+) -> tuple[Path, _FakeClient]:
     """Shared RESULTS_DIR / EVAL_LOG_DIR / TASKS_DIR / pod-infra wiring for
     the ordering-sensitive TestConcurrentLoop tests below.
 
