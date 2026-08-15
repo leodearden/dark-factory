@@ -144,10 +144,32 @@ _LOCAL_MENTION_PATTERN = re.compile(
 # - The qualifier must start with a letter, so clock times ('12:30') never
 #   match, and must be at least 3 characters, so short non-project tokens
 #   ('w6:2', 'py:3', 'a:1') never match.
-# - '\s*' around the colon tolerates the spacing humans actually write.
+# - The colon is padded with '[ \t]', NOT '\s', on BOTH sides. It still
+#   tolerates the spaces and tabs humans actually write around a colon
+#   ('dark_factory: 2500', 'dark_factory\t:\t2500'), but it can never span a
+#   line break. This is measured, not stylistic: '\s' matches '\n', so
+#   '\s*:\s*' read a 'key:' line lead-in followed by a number on the NEXT line
+#   as a project-qualified reference — 'Notes:\n2500 items' yielded notes:2500,
+#   and 'Notes\n: 2500' likewise, since the padding BEFORE the colon spans a
+#   newline just as the trailing one does. Episode bodies routinely carry
+#   YAML/'key: value' blocks and hard-wrapped prose, and no real
+#   project-qualified reference is written across a line break.
+#   Direction of safety: this narrowing REMOVES foreign refs, and the consumer
+#   performs destructive edge surgery where a false positive MISATTRIBUTES
+#   facts — so narrowing is the safe direction here, unlike the
+#   _LOCAL_MENTION_PATTERN whitespace branch two blocks above, deliberately
+#   left as '\s+' because narrowing THERE removes bare mentions and so removes
+#   contests, which is the dangerous direction.
+#   This also brings the last '\s'-padded colon in the module into line with
+#   _TASK_NODE_NAME_PATTERN and _LOCAL_MENTION_PATTERN, which already pad
+#   '#'/':' with '[ \t]' for exactly this reason. _QUALIFIED_NODE_NAME_PATTERN
+#   above is deliberately NOT changed here: it is out of this task's scope and
+#   tracked as a follow-up.
 # - '(?!\d)' anchors the number's right edge so a truncated prefix is never
 #   captured.
-_QUALIFIED_REF_PATTERN = re.compile(r'(?<![\w:/.-])([A-Za-z][A-Za-z0-9_-]{2,})\s*:\s*(\d+)(?!\d)')
+_QUALIFIED_REF_PATTERN = re.compile(
+    r'(?<![\w:/.-])([A-Za-z][A-Za-z0-9_-]{2,})[ \t]*:[ \t]*(\d+)(?!\d)'
+)
 
 
 @dataclass(frozen=True, kw_only=True)
