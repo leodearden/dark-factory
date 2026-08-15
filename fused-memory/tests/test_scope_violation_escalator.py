@@ -392,6 +392,50 @@ class TestAdvisoryVsRejectionWording:
         ):
             assert field in detail, f'advisory detail dropped {field!r}: {detail!r}'
 
+    def test_advisory_summary_does_not_assert_a_task_was_created(self, tmp_path):
+        """Task 4159: the SUMMARY carries the same unverified claim as the detail.
+
+        The summary is not a lesser field:
+        ``orchestrator/src/orchestrator/agents/briefing.py::_format_escalation``
+        renders ``summary`` AND ``detail`` verbatim into an agent's briefing,
+        and the summary is the line an operator reads first in the queue.
+        Correcting only the detail would leave 'task CREATED and stamped' —
+        the identical phase-1 claim the detail test rejects — sitting in the
+        more prominent of the two rendered fields.
+
+        Both fields are dedup-neutral (``compute_content_fingerprint`` takes
+        only category/kind/affected_ids), so correcting both is equally safe.
+        """
+        esc = ScopeViolationEscalator()
+        esc_id = esc.report_rejection(
+            project_root=str(tmp_path),
+            project_id='reify',
+            candidate_title='Rework the gui panel',
+            matched_paths=('gui/',),
+            suggested_project='reify_gui',
+            advisory=True,
+        )
+        assert esc_id is not None
+        summary = self._one_payload(tmp_path)['summary']
+
+        # The shipped token, then the general ban: unlike the detail (which
+        # must describe the curator's create OUTCOME to be useful), the
+        # summary has no room to qualify a creation claim, so it makes none.
+        assert 'CREATED' not in summary, (
+            f'advisory summary asserts an unverified creation: {summary!r}'
+        )
+        assert 'created' not in summary.lower(), (
+            f'advisory summary asserts an unverified creation: {summary!r}'
+        )
+
+        # The contracts that must survive the rewording.
+        assert 'ADVISORY' in summary, summary
+        assert 'reject' not in summary.lower(), (
+            f'advisory summary must not claim a rejection: {summary!r}'
+        )
+        assert 'gui/' in summary, summary
+        assert 'reify_gui' in summary, summary
+
     def test_advisory_without_suggested_project_is_still_advisory_only(self, tmp_path):
         """advisory + no resolvable owner must not fall through to manual_route.
 
