@@ -554,7 +554,9 @@ async def _probe_db(pool: DbPool, db_path: Path, budget: float) -> str:
     """Probe one database under a single deadline covering acquire + execute + fetch.
 
     Returns 'ok' | 'failed' | 'timeout' | 'error' | 'unavailable'. Never
-    raises: a /healthz probe must always yield a verdict for its DB.
+    raises for any DB-level failure — every probe outcome is a status
+    string. The single exception is caller cancellation, which is
+    propagated deliberately (see below).
 
     'timeout' means the probe did not finish inside *budget*. 'error' means
     it finished fast by RAISING (corrupt DB, connection closed under us,
@@ -612,16 +614,9 @@ async def _probe_db(pool: DbPool, db_path: Path, budget: float) -> str:
     try:
         done, _pending = await asyncio.wait({task}, timeout=budget)
     except BaseException:
-        # The CALLER was cancelled (uvicorn --timeout-graceful-shutdown
-        # force-cancelling request tasks at restart; a client disconnect)
-        # while we were suspended here. asyncio.wait does NOT cancel what it
-        # waits on, so without this the inner task survives referenced only
-        # by the event loop's WEAK set — the exact GC hazard _ABANDONED_PROBES
-        # exists to prevent, and the stranded-aiosqlite-worker leak class of
-        # task 3466. Catch BaseException, not just CancelledError: the
-        # invariant is that NO exceptional exit from this await leaves the
-        # task untracked. Re-raise — a cancelled request must stay cancelled,
-        # never be laundered into a 'timeout' verdict.
+        # asyncio.wait() does not cancel what it waits on, and we catch
+        # BaseException (not just CancelledError) so no exceptional exit
+        # from this await leaves the task untracked — rationale above.
         _abandon_probe(task)
         raise
     if task not in done:
