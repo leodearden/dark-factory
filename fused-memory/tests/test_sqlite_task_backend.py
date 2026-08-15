@@ -3567,6 +3567,51 @@ async def test_v3_to_v4_midloop_heal_failure_leaves_no_partial_heal_on_cached_co
     assert not any('candidate_key' in idx for idx in indexes), indexes
 
 
+@pytest.mark.asyncio
+async def test_v3_to_v4_reports_healed_groups_when_the_index_build_step_raises(tmp_path):
+    """When a LATER step (the index build / user_version stamp) raises after
+    a genuine duplicate group has already been healed and committed, the
+    result dict must report that heal -- not hard-code `healed: []` -- since
+    the cancel is durably on disk and callers (`reaudit_candidate_key_index`,
+    the `rebuild_candidate_key_index` MCP tool) surface this dict verbatim.
+    """
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v3_db_with_dup_groups(db_path, [
+        (1, 'Alpha task', 'pending', ['a.py']),   # canonical
+        (2, 'Alpha task', 'pending', ['a.py']),   # cancelled by the self-heal
+    ])
+
+    conn = await _open_raw_v3_conn(db_path)
+    try:
+        # Fails at 'PRAGMA user_version = 4' -- AFTER the heal loop's cancel
+        # UPDATE(s) and their commit have already happened.
+        proxy = _FailingExecuteConn(conn, lambda sql, _p: 'user_version = 4' in sql)
+        result = await _migrate_v3_to_v4(proxy, project_root=project_root)
+
+        assert result['index_built'] is False, result
+        assert result['flagged'] == [], result
+        assert result['healed'] == [
+            {
+                'tag': 'master',
+                'candidate_key': compute_candidate_key('Alpha task', ['a.py']),
+                'canonical_id': 1,
+                'cancelled_ids': [2],
+            },
+        ], f'the failure path must report the heal it already committed; got {result}'
+
+        # Confirm the report is not merely optimistic -- the heal really WAS
+        # durable. rollback() discards anything still pending (the failed
+        # index-build's own transaction); whatever survives was committed
+        # before the failure.
+        await conn.rollback()
+        status_cursor = await conn.execute("SELECT id, status FROM tasks WHERE tag='master'")
+        statuses = {row['id']: row['status'] for row in await status_cursor.fetchall()}
+        assert statuses == {1: 'pending', 2: 'cancelled'}, statuses
+    finally:
+        await conn.close()
+
+
 # ── rebuild-without-restart: live re-audit (task 2402) ──────────────────
 
 
