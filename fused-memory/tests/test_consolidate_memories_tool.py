@@ -1088,7 +1088,7 @@ class TestChildrenAreReHomedBeforeTheirParentDies:
         assert result['reparented'] == []
         assert result['reparent_failures'] == []
         svc.update_memory.assert_not_awaited()
-        svc.count_memories_by_metadata.assert_not_called()
+        svc.count_memories_by_metadata.assert_not_awaited()
 
 
 class TestAnIncompleteReparentRefusesTheDelete:

@@ -8,7 +8,75 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+#### `consolidate_memories` — one transactional op for folding a duplicate cluster (task 3133)
+
+Replaces the hand-rolled write-then-delete choreography that made consolidation a
+**ratchet**: a canonical write plus unordered deletes with no verification nets +1
+entry per failed pass, which is how a cluster ends up containing the consolidator's
+own prior canonicals. The cure is ordering plus a closure that is CORROBORATED by a
+live re-read, never inferred from "the delete call returned ok".
+
+Ordering is the contract, and each step sits where it does because of what its
+failure would cost: (1) argument validation, pure and free to refuse; (2) fail-closed
+`metadata_patch` authorization, inherited from task 3088's resolver and run
+unconditionally — reparenting is only discovered after the canonical exists, so a late
+denial would abort mid-transaction; (3) the same tool-layer citation gate `delete_memory`
+runs, in its non-mutating `scan_only` pre-flight, so a set that cannot be cleared leaves
+the corpus byte-identical; (4) the canonical write, before anything destructive; (5)
+retained peers tagged, then per supersede read → re-home children → corroborate → delete;
+(6) deterministic re-query; (7) tombstone; (8) structured report.
+
+- **Retain-and-tag is the default arm**, ratified at gate 3200. Peers are stamped with
+  the cluster's `topic` IN PLACE — never `canonical` (exactly one per project+topic) and
+  never `parent_id` — so they keep their Qdrant point ids and every citation, parent
+  pointer and supersedes edge already aimed at them stays valid. Retained ids never
+  appear in the canonical's `metadata.supersedes`: they were not replaced.
+- **`survivors` is the deliverable.** Computed only from a post-delete `get_memory_by_id`
+  per id, so an id whose delete reported success but which still resolves is reported as
+  a survivor, and an id whose delete raised but which is genuinely gone is not. Partial
+  failure is a RETURNED envelope (`status='partial'` plus `failed_deletes`,
+  `retain_failures`, `reparent_failures`), never a raise — `@mcp_tool_errors` would
+  flatten an exception and destroy exactly those per-id dispositions.
+- **Children are re-homed before their parent dies**, and a re-homing this call cannot
+  PROVE complete refuses that delete instead of orphaning. The proof fails on a refused
+  patch, on a truncated child listing (its count reads as a floor, "at least N"), or on a
+  live post-reparent re-count that is still non-zero. The delete is never forced with
+  `cascade=True`, which would destroy the children the re-homing exists to preserve.
+- **The delete arm stamps a task-3041 tombstone** per reaped supersede, carrying the new
+  `absorbed_by` reverse pointer and the caller-supplied `run_id` as `deleting_run_id`
+  (required whenever `supersedes` is non-empty; a delete that cannot be attributed is
+  refused before anything is written). Tombstones are stamped ONLY for CONFIRMED-GONE
+  victims — `deleted` minus `survivors` — because a tombstone over a record that still
+  resolves would mint a durable audit row asserting a record is gone while it is alive.
+  A shortfall is reported via `tombstones_written` / `tombstones_expected` and a WARNING;
+  it deliberately does NOT flip `status`, since retrying a completed merge is the very
+  ratchet this op ends.
+- Closure reads are deterministic Qdrant work only (`get_memory_by_id`,
+  `get_memories_by_metadata({'topic': T})`); `MemoryService.search` is never called and a
+  test pins that negative. Registered in `DISALLOW_MEMORY_WRITES` (hence Stage 3) and in
+  the orchestrator's dry-run `_DISALLOWED_TOOLS` in the same change that adds it.
+
+Explicitly NOT claimed here: topic-cluster auto-seed (task 3135), the Stage-1 rewire and
+`recon-stage-*` guard-exemption retirement (task 3134), `update_memory`'s
+`_apply_memory_metadata_validation` bypass (task 3523 — this op validates the slug at
+entry, bounding but not closing it), and `x_memory_citation_tombstones` on citing tasks
+(task 3893 — a different object in a different store).
+
 ### Changed
+
+#### `record_mem0_deletion_tombstone(s)` gained an optional `absorbed_by` keyword (task 3133)
+
+Additive and keyword-only, defaulting to `None`. It records the surviving canonical id
+that absorbed a victim — the REVERSE pointer, which is what makes "where did its content
+go?" answerable from the DEAD id alone (the recon-gate-165 audit dead-end: the survivor
+carried a forward `consolidated_from`, but probing the victim returned `{'found': false}`
+with no tombstone at all). Written as a top-level payload field rather than through
+`victim_metadata`, whose `_VICTIM_IDENTITY_KEYS` projection is deliberately what the
+VICTIM recorded about itself. The two existing GC/trim sweeps absorb nothing, need no
+edit, and now write `absorbed_by: None` — present, not omitted, so absence reads as
+"nothing absorbed it" rather than "this row predates the field".
 
 #### `update_memory`'s default allowlists now admit `curator-` on both arms (esc-3524-1)
 

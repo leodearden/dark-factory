@@ -408,6 +408,7 @@ Task operations (when Taskmaster is connected):
 - add_dependency / remove_dependency: Dependency management
 Management:
 - delete_memory: Remove a specific memory (edges for Graphiti, vector entries for Mem0)
+- consolidate_memories: The SANCTIONED path for folding a duplicate Mem0 cluster into one canonical entry — use it instead of hand-rolling add_memory + N delete_memory calls, which nets +1 entry per failed pass. Writes the canonical first, tags retained peers in place (the ratified default: peers keep their point ids), re-homes children before deleting their parent, and returns a `survivors` list CORROBORATED by a live re-read rather than inferred from the delete calls' return values. Requires run_id whenever supersedes is non-empty (it attributes the deletion).
 - delete_episode: Remove a Graphiti episode (with optional cascade)
 - redact_episode_content: Replace a Graphiti episode's raw content in place (non-destructive; PREFER over delete_episode(cascade=True) for corrupted text — preserves the extracted entities/edges a cascade would destroy)
 - update_edge: Update an existing Graphiti edge's fact text directly (no LLM pipeline)
@@ -4943,11 +4944,11 @@ def create_mcp_server(
                     causation_id=run_id or causation_id,
                     _source=_CONSOLIDATE_SOURCE,
                 )
-            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-                # Never captured as a per-id disposition: these mean the
-                # process is going away, not that this record refused.
-                raise
             except Exception as exc:
+                # `Exception`, deliberately: CancelledError/KeyboardInterrupt/
+                # SystemExit are BaseException subclasses, so a process going
+                # away is never captured here as a per-id disposition. No
+                # hand-copied re-raise tail — @mcp_tool_errors owns that.
                 # CAPTURED, not raised — `@mcp_tool_errors` would flatten the
                 # whole envelope to {'error', 'error_type'} and destroy every
                 # other id's disposition, which is the entire deliverable. One
@@ -5043,10 +5044,9 @@ def create_mcp_server(
                     # content go?" answerable from the DEAD id alone.
                     absorbed_by=canonical_id,
                 )
-            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-                raise
             except Exception:
-                # Belt and braces, matching both prod call sites. The writer
+                # Belt and braces, matching both prod call sites. `Exception`
+                # only: a cancellation is a BaseException and must propagate. The writer
                 # is fail-safe by contract, but the audit trail must never be
                 # able to alter — or abort — the consolidation it describes.
                 logger.warning(
