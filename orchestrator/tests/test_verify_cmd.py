@@ -33,6 +33,9 @@ from orchestrator.verify_cmd import (
     ChainSegment,
     ToolKind,
     VerifyCmd,
+    _has_unspliceable_pytest_invocation,
+    _is_serial_forced,
+    _split_at_unbalanced_close,
     apply_pytest_numprocesses,
     cargo_scope,
     describe_dropped_clauses,
@@ -857,6 +860,39 @@ _PAREN_PRESERVING_PARAMS = [
     for case_label, raw, template in _PAREN_PRESERVING_CASES
 ]
 
+# (case_label, raw, corrupt_prefix) — task 4121. Every `raw` here is a
+# raw-retained pytest chain (`cmd.raw is not None`, asserted per case rather
+# than assumed) whose `_PYTEST_INVOCATION_RE` span ends INSIDE an unclosed
+# quote, because the regex is quote-blind and stops at the first `&&`/`|`/`;`
+# it sees — even one that lives inside a quoted `-k`/`--deselect` argument.
+#
+# `corrupt_prefix` is the MEASURED truncated span (rstripped), i.e. the text
+# the appender splices onto today. `corrupt_prefix + suffix` therefore
+# reconstructs the exact corrupt substring each mutator produces at baseline
+# (measured: `pytest -k 'a -p no:xdist -o addopts=''` /  `pytest -k 'a -n 4`),
+# which is what makes the negative assertion below name the real defect
+# instead of a generic "flags appeared somewhere".
+_UNTERMINATED_SPAN_CASES = [
+    ('quoted-and-single', "pytest -k 'a && b' tests/ && true", "pytest -k 'a"),
+    ('quoted-and-double', 'pytest -k "a && b" tests/ && true', 'pytest -k "a'),
+    ('quoted-pipe', "pytest -k 'a | b' tests/ && true", "pytest -k 'a"),
+    ('quoted-semicolon', "pytest --deselect 'x;y' tests/ && true", "pytest --deselect 'x"),
+    ('uv-run-prefix', "uv run pytest -k 'a && b' tests/ && true", "pytest -k 'a"),
+    ('inside-subshell', "( cd x && pytest -k 'a && b' tests/ )", "pytest -k 'a"),
+    ('two-invocations', "pytest -k 'a && b' t1/ && pytest t2/", "pytest -k 'a"),
+]
+
+_UNTERMINATED_SPAN_PARAMS = [
+    pytest.param(
+        mutate,
+        raw,
+        f'{corrupt_prefix}{suffix}',
+        id=f'{mutator_label}-{case_label}',
+    )
+    for mutator_label, mutate, suffix in _SUBSHELL_MUTATORS
+    for case_label, raw, corrupt_prefix in _UNTERMINATED_SPAN_CASES
+]
+
 
 class TestSubshellClauseIntegrity:
     """A mutator that appends flags to a raw-retained pytest chain must place
@@ -987,6 +1023,155 @@ class TestSubshellClauseIntegrity:
         result = render(mutate(cmd))
         _assert_bash_parses(result, what=raw)
         assert result == expected
+
+
+class TestUnterminatedQuoteRefusesFlagSplicing:
+    """A raw-chain mutator must REFUSE outright when a matched pytest span ends
+
+    inside an unclosed quote — never splice the recovery flags in there.
+    Task 4121, recovered from task 3650's review (see task 4023).
+
+    Reproduction, measured at main tip ``eec91ee995``::
+
+        parse_config_command("pytest -k 'a && b' tests/ && true")  # raw retained
+        render(serial_pytest(...))
+          == "pytest -k 'a -p no:xdist -o addopts='' && b' tests/ && true"
+        render(apply_pytest_numprocesses(..., '4'))
+          == "pytest -k 'a -n 4 && b' tests/ && true"
+
+    Cause: ``_PYTEST_INVOCATION_RE`` (``\\bpytest\\b[^&|;]*``) is quote-BLIND,
+    so it stops at the ``&&`` that lives INSIDE the ``-k`` quotes and the
+    matched span ends mid-quote. ``_split_at_unbalanced_close`` is handed that
+    span and DISCARDS the ``unterminated`` flag ``_unquoted_chars`` returns
+    (``chars, _unterminated = ...``), so it reports ``(segment, '')`` and the
+    suffix is appended at the end of ``body`` — which is inside the live
+    quote. The sibling consumer of the very same flag,
+    ``_scan_and_chain(strict=True)``, already refuses on it
+    (``if strict and (unterminated or depth != 0): return None``); this one
+    did not.
+
+    The corrupted command still passes ``bash -n`` (bash re-tokenises it into
+    a single ``-k`` word ``a -p no:xdist -o addopts= && b``), so this is a
+    SILENT wrong-tests-run: the recovery flags never reach pytest as flags at
+    all, and ``_is_serial_forced`` — a plain ``'no:xdist' in cmd.raw``
+    substring test — additionally reports the command as serial because the
+    substring IS present, inside the quotes. Exactly the failure class
+    ``_PYTEST_INVOCATION_RE``'s own comment and
+    ``_split_at_unbalanced_close``'s docstring already reject for the
+    parenthesised cases.
+    """
+
+    @pytest.mark.parametrize(('mutate', 'raw', 'corrupt_marker'), _UNTERMINATED_SPAN_PARAMS)
+    def test_no_flags_are_spliced_into_an_unterminated_quote(self, mutate, raw, corrupt_marker):
+        cmd = parse_config_command(raw)
+        assert cmd.tool is ToolKind.PYTEST
+        # Else the regex/raw-chain appender this task changes isn't exercised.
+        assert cmd.raw is not None
+
+        result = render(mutate(cmd))
+        # Named first so a regression reports the actual corrupt shape rather
+        # than a whole-string diff, and so a future fix that merely RELOCATES
+        # the splice (rather than refusing) still fails loudly here.
+        assert corrupt_marker not in result, (
+            f'recovery flags spliced into an unterminated quote: {result!r}'
+        )
+        # Byte-identical refusal: the original command is re-run unchanged.
+        assert result == raw
+        _assert_bash_parses(result, what=raw)
+
+    @pytest.mark.parametrize(
+        ('label', 'mutate'),
+        [(label, mutate) for label, mutate, _suffix in _SUBSHELL_MUTATORS],
+        ids=[label for label, _mutate, _suffix in _SUBSHELL_MUTATORS],
+    )
+    def test_a_refused_chain_leaves_every_invocation_alone(self, label, mutate):
+        """Refusal is WHOLE-STRING, not per-span.
+
+        On ``pytest -k 'a && b' t1/ && pytest t2/`` the regex yields two spans
+        with unterminated flags ``[True, False]``: the corrupt
+        ``"pytest -k 'a "`` and a perfectly clean ``'pytest t2/'``. Refusing
+        only the offending span would flag invocation 2 and not invocation 1 —
+        a half-serial chain that ``_is_serial_forced`` still reports as fully
+        serial, which then suppresses a later ``-n`` injection on a command
+        that is not actually serial. So the clean invocation must be left
+        alone too.
+        """
+        raw = "pytest -k 'a && b' t1/ && pytest t2/"
+        cmd = parse_config_command(raw)
+        assert cmd.raw is not None
+
+        result = render(mutate(cmd))
+        assert result == raw, f'{label}: the well-formed `pytest t2/` was rewritten: {result!r}'
+
+    @pytest.mark.parametrize(
+        'raw', [case[1] for case in _UNTERMINATED_SPAN_CASES], ids=[c[0] for c in _UNTERMINATED_SPAN_CASES]
+    )
+    def test_a_refused_serial_rewrite_is_not_reported_as_serial(self, raw):
+        """The second-order hazard: a refused command must not LOOK serial.
+
+        ``_is_serial_forced`` tests ``'no:xdist' in cmd.raw``. At baseline the
+        corrupt rewrite puts that substring inside the ``-k`` quotes, where
+        pytest never sees it as a flag — measured True for all seven cases.
+        ``apply_pytest_numprocesses`` consults exactly this predicate to stay
+        a no-op on already-serial commands, so a falsely-serial command also
+        silently loses its ``-n`` cap.
+        """
+        cmd = parse_config_command(raw)
+        assert cmd.raw is not None
+        assert _is_serial_forced(serial_pytest(cmd)) is False
+
+    def test_split_refuses_a_span_that_ends_mid_quote(self):
+        """The unit-level pin on the discarded flag itself.
+
+        ``None`` means refuse — the convention ``_scan_and_chain(strict=True)``
+        already uses for this same ``unterminated`` flag.
+        """
+        assert _split_at_unbalanced_close("pytest -k 'a ") is None
+
+    @pytest.mark.parametrize(
+        ('segment', 'expected'),
+        [
+            ('pytest -k "a)" tests/ ', ('pytest -k "a)" tests/ ', '')),
+            ('pytest tests/ )', ('pytest tests/ ', ')')),
+        ],
+        ids=['quoted-close-paren', 'subshell-closer'],
+    )
+    def test_split_still_returns_two_tuples_for_balanced_spans(self, segment, expected):
+        """The refusal must not swallow the existing split contract."""
+        assert _split_at_unbalanced_close(segment) == expected
+
+    @pytest.mark.parametrize(
+        'raw',
+        [
+            ROOT_TEST_COMMAND,
+            *[case[1] for case in _PAREN_PRESERVING_CASES],
+        ],
+        ids=['ROOT_TEST_COMMAND', *[case[0] for case in _PAREN_PRESERVING_CASES]],
+    )
+    def test_the_green_corpus_is_not_newly_refused(self, raw):
+        """The over-refusal guard, and the reason it reads the live YAML below.
+
+        A refusal that fires too widely silently disables serial recovery
+        fleet-wide — the same class of silent capability loss this task is
+        fixing, just in the other direction. Every command here was measured
+        to produce ZERO unterminated spans, so none of them may change
+        behaviour: notably ``-k "a)"`` and ``-k "foo("`` from
+        ``_PAREN_PRESERVING_CASES``, whose quotes ARE closed.
+        """
+        assert _has_unspliceable_pytest_invocation(raw) is False
+
+    def test_the_live_fleet_test_command_is_not_newly_refused(self):
+        """Read from the committed YAML, not a hand-copied literal.
+
+        A future config edit that would newly trip the refusal (and so
+        silently disable serial recovery for the whole fleet) must fail this
+        suite rather than drift past it — the same drift-gate rationale
+        ``_verify_config_corpus`` exists for.
+        """
+        assert (
+            _has_unspliceable_pytest_invocation(load_config_scalar(DF_CONFIG_PATH, 'test_command'))
+            is False
+        )
 
 
 class TestSeparateTokenValueFlagBinding:
