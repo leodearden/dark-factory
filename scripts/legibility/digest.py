@@ -865,16 +865,30 @@ costs genuine gold turns for zero recall."""
 
 HARNESS_BRIEFING_SUBHEADINGS: tuple[str, ...] = (
     '## project context', '## conventions', '## recent decisions',
-    '## task context', '# action',
+    '## task context',
 )
 """CORROBORATING heading literals -- the structural sub-blocks a real
 briefing carries alongside an anchor
 (orchestrator/src/orchestrator/agents/briefing.py: '## Project Context'
 :1270, '## Conventions' :1277, '## Recent Decisions' :1284, '## Task
-Context' :1294 inside ``_get_memory_context``'s recalled_sections list;
-'# Action' in the role prompt templates at
-:367/:670/:827/:927/:968/:1007/:1095/:1120/:1212). Never sufficient alone:
-a human turn headed '## Conventions' carries no anchor and stays gold."""
+Context' :1294 inside ``_get_memory_context``'s recalled_sections list).
+Never sufficient alone: a human turn headed '## Conventions' carries no
+anchor and stays gold.
+
+Every corroborator is a '##'-level SUB-block, and that is a rule, not an
+accident -- a '# '-level entry would pair with the '# task' anchor to
+clear the >=2 threshold by itself. '# Action' is emitted by every role
+prompt template (:367/:670/:827/:927/:968/:1007/:1095/:1120/:1212) and was
+listed here until the task 3610 amendment pass, but '# Task' + '# Action'
+is also an ordinary human spec-writing shape, and losing a genuine gold
+turn is a SILENT error where an admitted briefing turn is a visible one.
+It costs almost no recall: every one of those templates begins with
+``{context}``, so a real briefing always carries the '# Context' anchor
+and, whenever memory context is available, its '##' sub-blocks too. The
+corner this declines is the memory-UNAVAILABLE variant of the two
+identity-less templates (build_reviewer_prompt :998, build_merger_prompt
+:1109), which then shows only '# Context' + '# Action' -- a shape the
+pre-3610 all-of-three rule did not catch either, so nothing regresses."""
 
 HARNESS_PROMPT_MARKERS: tuple[str, ...] = (
     'you are the trickle coder for the dark-factory agent-confusion codebook',
