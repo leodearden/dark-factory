@@ -63,6 +63,7 @@ __all__ = [
     'materialize_reference_diff',
     'pin_eval_branch',
     'repo_of',
+    'repo_of_project',
     'resolve_task_commits_from_merge',
     'sample_stratified',
     'stratification_counts',
@@ -80,7 +81,13 @@ Cell = tuple[str, str, str]
 # The full axis product — every possible (repo, kind, path) cell. Used to
 # surface EMPTY cells loudly (a cell the corpus offers nothing for) rather
 # than letting thin coverage pass silently.
-_REPOS = ('df', 'reify')
+#
+# `_REPOS` must list EVERY stratum `repo_of` can return. `_ALL_CELLS` is what
+# `format_stratification_table` and `_coverage_notes` iterate, so a stratum
+# missing here is silently dropped from the table (its fixtures vanish from the
+# rows while still counting in TOTAL) and can never be reported as an empty
+# cell — the exact silent under-report the loud-over-silent norm forbids.
+_REPOS = ('df', 'reify', 'kl')
 _KINDS = ('bugfix', 'feature', 'refactor')
 _PATHS = ('simple', 'full')
 _ALL_CELLS: tuple[Cell, ...] = tuple(
@@ -117,6 +124,31 @@ class CompletedTaskCandidate:
 # repo_of — the repo axis (df / reify)
 # ---------------------------------------------------------------------------
 
+def repo_of_project(project: str) -> str:
+    """Return the repo stratum (``'df'``, ``'reify'`` or ``'kl'``) for a raw
+    *project* string.
+
+    The project → stratum mapping itself, exposed separately from
+    :func:`repo_of` so a caller holding only a project string (the β1 minting
+    driver and its tests, which build fixture ids as ``<repo>_task_<id>``)
+    reuses THIS table instead of re-declaring a literal copy that can silently
+    drift from it.
+
+    Raises ``ValueError`` on an unrecognised project — see :func:`repo_of`.
+    """
+    normalised = (project or '').strip().lower()
+    if 'reify' in normalised:
+        return 'reify'
+    if 'dark' in normalised and 'factory' in normalised:
+        return 'df'
+    if 'know' in normalised and 'live' in normalised:
+        return 'kl'
+    raise ValueError(
+        f'repo_of_project: unrecognised project {project!r} (expected a '
+        f'dark_factory/dark-factory, reify or know_live/know-live project)'
+    )
+
+
 def repo_of(candidate: CompletedTaskCandidate) -> str:
     """Return the repo stratum (``'df'``, ``'reify'`` or ``'kl'``) for *candidate*.
 
@@ -131,20 +163,18 @@ def repo_of(candidate: CompletedTaskCandidate) -> str:
 
     Raises ``ValueError`` on an unrecognised project — repo is a hard
     stratification axis, so an unknown value is a loud error rather than a
-    silent default (honours the loud-over-silent-degradation norm).
+    silent default (honours the loud-over-silent-degradation norm). The
+    mapping lives in :func:`repo_of_project`; this wrapper only names the
+    offending task in the error.
     """
-    project = (candidate.project or '').strip().lower()
-    if 'reify' in project:
-        return 'reify'
-    if 'dark' in project and 'factory' in project:
-        return 'df'
-    if 'know' in project and 'live' in project:
-        return 'kl'
-    raise ValueError(
-        f'repo_of: unrecognised project {candidate.project!r} for task '
-        f'{candidate.task_id!r} (expected a dark_factory/dark-factory, reify '
-        f'or know_live/know-live project)'
-    )
+    try:
+        return repo_of_project(candidate.project)
+    except ValueError:
+        raise ValueError(
+            f'repo_of: unrecognised project {candidate.project!r} for task '
+            f'{candidate.task_id!r} (expected a dark_factory/dark-factory, '
+            f'reify or know_live/know-live project)'
+        ) from None
 
 
 # ---------------------------------------------------------------------------
