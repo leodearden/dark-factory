@@ -148,10 +148,19 @@ async def _reap_leaked_aiosqlite_connections():
     future via ``future.get_loop().call_soon_threadsafe(...)`` it raises
     ``RuntimeError: Event loop is closed`` from inside the thread. pytest's
     threadexception plugin surfaces this as a
-    ``PytestUnhandledThreadExceptionWarning`` (promoted to a hard error by this
-    project's ``filterwarnings``) and attributes it to whatever unrelated test
-    happens to be running when the thread fires — under ``-n auto`` on an
-    oversubscribed host that is reliably a *different*, innocent test.
+    ``PytestUnhandledThreadExceptionWarning`` and attributes it to whatever
+    unrelated test happens to be running when the thread fires — under
+    ``-n auto`` on an oversubscribed host that is reliably a *different*,
+    innocent test. That warning is promoted to a hard error by the
+    ``error::pytest.PytestUnhandledThreadExceptionWarning`` entry in
+    orchestrator/pyproject.toml's ``[tool.pytest.ini_options] filterwarnings``
+    (task 4075), which governs the ORCHESTRATOR-BOUND invocation the
+    merge-verify harness uses (``cd orchestrator && uv run pytest tests/``,
+    dark-factory-orchestrator.yaml:142); a root-bound run resolves the
+    repo-root inifile instead — pytest reads exactly one, never merging across
+    workspace members — and does NOT promote. Pinned by
+    tests/test_aiosqlite_leak_isolation.py's
+    "PytestUnhandledThreadExceptionWarning promotion" section.
 
     Reaping here — in the test's own loop, before it is closed — closes and
     joins any live aiosqlite connection so its worker thread is guaranteed

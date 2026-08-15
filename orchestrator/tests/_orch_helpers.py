@@ -373,9 +373,19 @@ async def reap_leaked_aiosqlite_connections() -> int:
     dies loudly and pytest's threadexception plugin attributes the failure to
     whatever unrelated test happens to be executing when the thread fires —
     under CPU starvation (``pytest -n auto`` on an oversubscribed host) that
-    is reliably a *different*, innocent test. orchestrator/pyproject.toml
-    promotes the resulting ``PytestUnhandledThreadExceptionWarning`` to a
-    hard error.
+    is reliably a *different*, innocent test. The resulting
+    ``PytestUnhandledThreadExceptionWarning`` is promoted to a hard error by
+    the ``error::pytest.PytestUnhandledThreadExceptionWarning`` entry in
+    orchestrator/pyproject.toml's ``[tool.pytest.ini_options] filterwarnings``
+    (task 4075). That entry governs the ORCHESTRATOR-BOUND invocation the
+    merge-verify harness uses (``cd orchestrator && uv run pytest tests/``,
+    dark-factory-orchestrator.yaml:142); a root-bound run resolves the
+    repo-root inifile instead — pytest reads exactly one, never merging across
+    workspace members — and does NOT promote. All three claims here are pinned
+    by tests/test_aiosqlite_leak_isolation.py's
+    "PytestUnhandledThreadExceptionWarning promotion" section, which skips
+    (naming the governing inifile) rather than false-failing on a root-bound
+    run.
 
     FIX: at every test's teardown boundary — while that test's own event loop
     is STILL OPEN — find any live aiosqlite worker thread and gracefully
@@ -391,9 +401,14 @@ async def reap_leaked_aiosqlite_connections() -> int:
     ``_thread`` attribute, and ``aiosqlite.core._connection_worker_thread`` as
     the pre-check thread target. If a future aiosqlite release renames or
     removes any of these, the guarded import below makes this helper a no-op
-    (returns 0) rather than raising — but the leak protection this provides
-    would then be silently lost, so re-verify this helper against aiosqlite's
-    source whenever the pinned version changes.
+    (returns 0) rather than raising — the leak protection this provides is
+    then lost, so re-verify this helper against aiosqlite's source whenever
+    the pinned version changes. That loss is no longer SILENT, which is the
+    whole point of the promotion described above: a leaked worker thread's
+    ``RuntimeError: Event loop is closed`` becomes a hard failure attributed
+    to some innocent test rather than a warning nobody reads. The promotion
+    makes the degradation loud; it does not restore the reaping, so the
+    re-verification instruction stands.
 
     PERFORMANCE NOTE: mirrors ``drain_async_mock_coroutines``'s gc-walk
     shape, but gates the (relatively expensive) ``gc.get_objects()`` walk
