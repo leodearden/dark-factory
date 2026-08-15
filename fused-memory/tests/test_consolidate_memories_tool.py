@@ -20,10 +20,12 @@ failure mode is recorded in `tests/test_update_memory_tool.py`.
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock, MagicMock
+from contextlib import contextmanager
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import fused_memory.server.tools as tools_module
 from fused_memory.config.schema import Mem0UpdateConfig
 from fused_memory.models.memory import AddMemoryResponse
 from fused_memory.server.tools import create_mcp_server
@@ -137,9 +139,18 @@ def make_service(
 
     svc.delete_memory = AsyncMock(side_effect=_delete)
 
+    # The op reads each supersede TWICE: once before its delete, to capture
+    # the metadata/created_at a tombstone needs while they still exist, and
+    # once after the delete loop to corroborate closure. `gone` describes
+    # the SECOND answer — the record was there, then it was not — so a
+    # first read always resolves and later reads apply `gone`.
+    reads_seen: dict[str, int] = {}
+
     async def _get(project_id=None, memory_id=None, **_):
         log.append(('read', memory_id))
-        if memory_id in gone:
+        seen = reads_seen.get(memory_id, 0)
+        reads_seen[memory_id] = seen + 1
+        if seen and memory_id in gone:
             return None
         return _row(memory_id)
 
@@ -1200,3 +1211,155 @@ class TestAnIncompleteReparentRefusesTheDelete:
 
         for call in svc.delete_memory.await_args_list:
             assert call.kwargs.get('cascade') in (None, False)
+
+
+@contextmanager
+def patched_tombstone_writer(returns=None):
+    """Patch the batch tombstone writer where `server/tools.py` imported it."""
+    writer = AsyncMock(
+        side_effect=(lambda *a, **k: len(a[2])) if returns is None
+        else (lambda *a, **k: returns)
+    )
+    with patch.object(tools_module, 'record_mem0_deletion_tombstones', writer):
+        yield writer
+
+
+class TestTheDeleteArmStampsATombstone:
+    """Every reaped supersede gets a task-3041 tombstone. IRREVERSIBLE means
+    ATTRIBUTABLE.
+
+    The motivating evidence is concrete: a consolidation survivor carried
+    the forward pointer (`consolidated_from=<victim>`), but probing the
+    DEAD id returned `{'found': false}` with the `tombstone` key ABSENT.
+    Per `get_memory_by_id`'s own omitted-not-null contract, that absence is
+    what proves a deletion was NOT deliberate — so from the victim id
+    alone, which is all an auditor chasing a broken reference holds, that
+    deletion was indistinguishable from silent data loss. The victim is
+    permanently unfixable (no write path reaches a deleted point id), so
+    the gap is only preventable going forward, which is why it belongs in
+    this op's contract.
+    """
+
+    @pytest.mark.asyncio
+    async def test_each_victim_is_read_before_its_delete(self):
+        """There is no read path to a deleted point id, so the tombstone's
+        metadata and created_at must be captured while the record still
+        exists — the same reason `_sweep_stale_mem0_pool` keeps full member
+        dicts rather than bare ids."""
+        events: list[tuple[str, str | None]] = []
+        svc = make_service(events=events)
+
+        with patched_tombstone_writer():
+            await call_consolidate(svc)
+
+        for sid in SUPERSEDES:
+            assert events.index(('read', sid)) < events.index(('delete_memory', sid))
+
+    @pytest.mark.asyncio
+    async def test_one_batch_call_carries_the_whole_cluster(self):
+        """The BATCH form, as both prod sweeps use: one upsert_many, one
+        commit, one fsync, all-or-nothing. A consolidation set is a cluster
+        by construction, so it is exactly what the batch form is for."""
+        svc = make_service()
+
+        with patched_tombstone_writer() as writer:
+            await call_consolidate(svc)
+
+        writer.assert_awaited_once()
+        args, kwargs = writer.await_args
+        assert args[1] == PROJECT_ID
+        assert kwargs['deleter'] == 'consolidate_memories'
+        # The run that KILLED these records, not the run that wrote them.
+        assert kwargs['deleting_run_id'] == RUN_ID
+        # The REVERSE pointer: where the content went.
+        assert kwargs['absorbed_by'] == CANONICAL
+        assert [v['id'] for v in args[2]] == SUPERSEDES
+        for victim in args[2]:
+            assert victim['metadata'] == {'topic': TOPIC}
+            assert victim['created_at'] == '2026-01-01T00:00:00+00:00'
+
+    @pytest.mark.asyncio
+    async def test_the_delete_is_attributed_to_the_same_source(self):
+        """`_source` and `deleter` are the same string — the idiom both
+        sweeps follow, so the write journal and the tombstone name the same
+        actor and an auditor can join them."""
+        svc = make_service()
+
+        with patched_tombstone_writer():
+            await call_consolidate(svc)
+
+        for call in svc.delete_memory.await_args_list:
+            assert call.kwargs['_source'] == 'consolidate_memories'
+            assert call.kwargs['causation_id'] == RUN_ID
+
+    @pytest.mark.asyncio
+    async def test_only_confirmed_gone_ids_are_tombstoned(self):
+        """THE property. A tombstone must never claim a record that is
+        still alive: it is a durable 30-day audit row asserting the record
+        is gone, so minting one over a live record manufactures exactly the
+        false attribution the mechanism exists to prevent.
+
+        S1 is confirmed gone. S2's delete RAISED. S3's delete reported
+        success and S3 still resolves. Only S1 is a victim.
+        """
+        svc = make_service(
+            gone=[S1], delete_errors={S2: RuntimeError('backend unreachable')}
+        )
+
+        with patched_tombstone_writer() as writer:
+            result = await call_consolidate(svc)
+
+        [victim] = writer.await_args.args[2]
+        assert victim['id'] == S1
+        assert [f['id'] for f in result['failed_deletes']] == [S2]
+        assert sorted(result['survivors']) == sorted([S2, S3])
+
+    @pytest.mark.asyncio
+    async def test_the_stamp_follows_the_corroborating_re_read(self):
+        """Stamped from the world's answer, not the call's. This op holds
+        strictly better evidence than the two sweeps — a deterministic
+        post-delete re-read is already mandatory here — so "a tombstone
+        exists" means "corroborated gone" rather than "the backend did not
+        raise"."""
+        events: list[tuple[str, str | None]] = []
+        svc = make_service(events=events)
+
+        async def _record(*args, **kwargs):
+            events.append(('tombstone', None))
+            return len(args[2])
+
+        with patch.object(
+            tools_module,
+            'record_mem0_deletion_tombstones',
+            AsyncMock(side_effect=_record),
+        ):
+            await call_consolidate(svc)
+
+        stamped = events.index(('tombstone', None))
+        last_read = max(i for i, (kind, _) in enumerate(events) if kind == 'read')
+        assert stamped > last_read
+
+    @pytest.mark.asyncio
+    async def test_the_written_count_reaches_the_caller(self):
+        svc = make_service()
+
+        with patched_tombstone_writer():
+            result = await call_consolidate(svc)
+
+        assert result['tombstones_written'] == 3
+
+    @pytest.mark.asyncio
+    async def test_the_retain_arm_never_tombstones(self):
+        """SCOPE BOUNDARY, pinned as a negative. Retained peers are never
+        deleted, so nothing about them becomes un-attributable and there is
+        no dead id to probe. A later refactor must not quietly add deletion
+        bookkeeping to a path that deletes nothing."""
+        svc = make_service()
+
+        with patched_tombstone_writer() as writer:
+            result = await call_consolidate(
+                svc, supersedes=[], run_id=None, retain=[RETAIN_1, RETAIN_2]
+            )
+
+        writer.assert_not_called()
+        assert result['retained'] == [RETAIN_1, RETAIN_2]
