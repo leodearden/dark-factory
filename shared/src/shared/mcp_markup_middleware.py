@@ -54,6 +54,28 @@ instead of by filesystem archaeology.
    in-process idioms. Only a ``Client``-driven call exercises this module, so a
    test written either of the established ways would pass while running none of
    the code below.
+4. ``on_call_tool`` runs STRICTLY BEFORE the tool's pydantic argument
+   validation, so a repair can recover an absorbed parameter the tool declares
+   as REQUIRED — this guard's whole benefit for the loudest leak shape, which
+   the write-time tripwire cannot see at all. Chain: ``server.py:1112-1132``
+   runs ``_run_middleware`` FIRST and its ``call_next`` re-reads the arguments
+   back off the context at ``server.py:1127`` (which is why ``_forward``'s
+   in-place mutation lands at all); execution follows at ``server.py:1162`` ->
+   ``tools/base.py:373``; validation is ``type_adapter.validate_python(
+   arguments)`` at ``tools/function_tool.py:249/253/273/276``, which is where
+   ``Missing required argument`` comes from. Pinned by PRD boundary row B14 in
+   ``shared/tests/test_mcp_markup_middleware.py``.
+5. That ordering holds ONLY while ``strict_input_validation`` is off. With it
+   on, ``mixins/mcp_operations.py:77`` registers the SDK handler with
+   ``validate_input=True`` and ``mcp/server/lowlevel/server.py:528-532``
+   jsonschema-validates against ``tool.inputSchema`` and returns an error
+   result BEFORE FastMCP's handler runs — the middleware chain is never
+   entered, no ``markup_detected`` fact is emitted, no storm is counted, and
+   every required-parameter leak becomes silently unrepairable. It is off by
+   default (``fastmcp/settings.py:297-311``) and no site in this repo sets it,
+   but it is settable by constructor kwarg, by the global setting, and by
+   ``FASTMCP_STRICT_INPUT_VALIDATION`` — so the registration sites must not
+   turn it on. The negative half of B14 pins it.
 
 Both test modules therefore drive a Client over a toy server:
 ``test_mcp_markup_middleware.py`` pins the hand-authored boundary rows B1-B10

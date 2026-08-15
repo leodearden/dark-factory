@@ -196,6 +196,54 @@ rhetorical claim — it is enforced in code by a single shared detector,
 `shared.toolcall_markup` re-exports; see §1), which all three consumers
 import.
 
+### The three observable surfaces — why the recorded rate is a lower bound
+
+The two vectors above are what the corruption *does*. This is what it *looks
+like from outside*, which is a different axis and the one that governs how much
+of it ever gets counted.
+
+There is **one mechanism** — parameter-boundary swallowing: parameter N's value
+absorbs parameter N+1's entire serialization, and N+1 is then absent from the
+call. But it surfaces **three different ways**, depending on what was swallowed:
+
+| # | What was absorbed | What the caller observes | Who sees it |
+|---|---|---|---|
+| 1 | An **optional** parameter, and the value carries guarded markup | The write-time tripwire rejects the write | **The tripwire — and only here** |
+| 2 | A **required** parameter | A pydantic missing-required-field error | Nobody; the tripwire is never consulted |
+| 3 | An **optional** parameter, and the value carries no guarded markup | **Nothing raises.** The call succeeds and the dropped parameter silently takes its **default** | Nobody, by construction |
+
+Surface 1 is the only row the tripwire can see, and every prior entry in task
+3083's log is one of them.
+
+Surface 2 was observed first-hand on 2026-08-11 (task 3083, burst8 and its
+addendum): an `add_memory` call whose `content` swallowed the required
+`project_id`. The write never reached the tripwire — argument validation
+rejected it first — so it was recorded by hand rather than by the guard. This is
+the shape PRD boundary row B14 now pins.
+
+Surface 3 is the incident recorded in `submit_task`'s own docstring
+(`fused-memory/src/fused_memory/server/tools.py`): a reify task was filed
+`priority=high` and stored as `medium`. Nothing was logged, nothing looked
+broken, and the task simply ran at the wrong priority.
+
+**The consequence, stated plainly:** because the tripwire samples only surface
+1, task 3083's recorded leak rate systematically **under-counts** the true rate.
+It must be read as a **lower bound**, not as a measurement.
+
+**The containment answer.** A blanket boundary middleware is the right shape
+precisely *because* it is not restricted to tripwire-guarded fields — it
+inspects every argument of every guarded call, so surfaces 2 and 3 stop being
+invisible. That it can reach surface 2 at all is a measured property of the
+substrate, not an assumption: on fastmcp 3.2.2 the middleware's `on_call_tool`
+runs **strictly before** pydantic argument validation, so a required absorbed
+parameter is still recoverable. It has exactly **one precondition** — FastMCP's
+`strict_input_validation` must stay **off**, since with it on the SDK validates
+against the tool's input schema and returns an error before the middleware chain
+is ever entered, emitting no fact and counting no storm. Both halves are pinned
+executably: PRD boundary rows B14/B15 in
+`plans/toolcall-markup-containment-prd.md` §10, asserted in
+`shared/tests/test_mcp_markup_middleware.py`.
+
 ---
 
 ## 3. Why `search` could never find these

@@ -189,10 +189,27 @@ def build_harness(
     policy: RepairPolicy,
     *,
     exempt_tools: frozenset[str] = frozenset(),
+    strict_input_validation: bool = False,
     **guard_kwargs: Any,
 ) -> Harness:
-    """Build a server whose tools mirror the real victim signatures."""
-    mcp = FastMCP('markup-guard-harness')
+    """Build a server whose tools mirror the real victim signatures.
+
+    ``strict_input_validation`` is not a knob any caller of this harness is
+    expected to turn — it is the NEGATIVE half of PRD boundary row B14: the one
+    configuration under which ``on_call_tool`` never runs at all, because
+    ``fastmcp/server/mixins/mcp_operations.py:77`` registers the SDK handler
+    with ``validate_input=self.strict_input_validation`` and
+    ``mcp/server/lowlevel/server.py:528-532`` then returns an error result
+    before FastMCP's handler is ever invoked. Its default preserves today's
+    behaviour, and it is declared EXPLICITLY (and ahead of ``**guard_kwargs``)
+    so it is not swallowed and forwarded to the middleware constructor, which
+    would raise an unexpected-keyword TypeError.
+    """
+    # Verified against fastmcp 3.2.2 (fastmcp/server/server.py:371-374): this is
+    # the real constructor kwarg, and it resolves to an instance attribute.
+    mcp = FastMCP(
+        'markup-guard-harness', strict_input_validation=strict_input_validation
+    )
     rec = _Recorder()
     facts: list[Any] = []
     escalations: list[Any] = []
@@ -252,6 +269,46 @@ def build_harness(
             agent_id=agent_id,
         )
         return 'mem_1'
+
+    @mcp.tool
+    def add_memory_strict(
+        content: str,
+        project_id: str,
+        category: str | None = None,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+    ) -> str:
+        """``add_memory`` with ``project_id`` REQUIRED, as the real one declares it.
+
+        PRD boundary row B14. The real tool
+        (``fused-memory/src/fused_memory/server/tools.py:2845``) declares
+        ``content: str, project_id: str`` — BOTH required — while the legacy toy
+        above declares ``project_id: str | None = None``. That divergence is
+        precisely why the required-parameter shape had never been exercised:
+        every recovery target asserted anywhere in this file (B1 ``priority``,
+        B2 ``priority``/``agent_id``/``metadata``, B3 ``suggested_action``, B9
+        ``agent_id``) is a DEFAULTED parameter.
+
+        This is ADDITIVE rather than a correction to the legacy toy: roughly
+        fourteen existing call sites (B4, the INV-2 rows, the storm rows) call
+        ``add_memory`` with only ``{'content': ...}``, so tightening
+        ``project_id`` there would break every one of them for no gain.
+
+        The optional tail is kept so this stays an honest mirror rather than a
+        two-parameter reduction that would make any recovery trivially
+        unambiguous. ``metadata`` and ``dual_write`` are deliberately left off —
+        ``metadata`` would collide with the B6 override path, which this row is
+        not about — and ``ctx`` is FastMCP-injected.
+        """
+        rec.record(
+            'add_memory_strict',
+            content=content,
+            project_id=project_id,
+            category=category,
+            agent_id=agent_id,
+            session_id=session_id,
+        )
+        return 'mem_strict_1'
 
     @mcp.tool
     def add_reuse_item(what: str, how: str, where: str) -> str:
@@ -2137,3 +2194,378 @@ class TestB10StormEscape:
 
         assert self._storms(first) == []
         assert self._storms(second) == []
+
+
+# ---------------------------------------------------------------------------
+# B14 — a REQUIRED absorbed parameter is recoverable.
+# ---------------------------------------------------------------------------
+
+
+class TestB14RequiredParameterAbsorption:
+    """``on_call_tool`` runs BEFORE pydantic argument validation, so a REQUIRED
+    absorbed parameter is still recoverable — PRD boundary row B14, the one leak
+    shape the write-time tripwire cannot see at all.
+
+    Measured against fastmcp 3.2.2 rather than inferred from framework docs:
+    ``server.py:1112-1132`` runs ``_run_middleware`` FIRST and its ``call_next``
+    re-reads the arguments back off the context at ``server.py:1127`` (which is
+    why an in-place mutation lands); validation is
+    ``type_adapter.validate_python(arguments)`` down at
+    ``tools/function_tool.py:249/253/273/276``, which is where
+    ``Missing required argument`` comes from. Middleware strictly precedes it.
+
+    Why this row had to exist. Every recovery target asserted anywhere else in
+    this file is a DEFAULTED parameter — B1 ``priority``, B2
+    ``priority``/``agent_id``/``metadata``, B3 ``suggested_action``, B9
+    ``agent_id`` — because the legacy toy ``add_memory`` declares
+    ``project_id: str | None = None`` while the real one
+    (``fused_memory/server/tools.py:2845``) declares ``project_id: str``. The
+    toy under-modelled the real signature at exactly the point in question, so
+    the loudest observed leak shape was structurally inexpressible here.
+    ``add_memory_strict`` closes that gap; the negative control below proves the
+    parameter really is required, so none of the positive rows can pass
+    vacuously.
+    """
+
+    #: ``content`` absorbed the REQUIRED ``project_id``, which is then absent
+    #: from the argument map entirely — the shape observed first-hand on
+    #: 2026-08-11 (task 3083, burst8), where the caller got a pydantic
+    #: missing-required-field error and the write-time tripwire stayed silent.
+    CONTENT = (
+        'A fact worth keeping.'
+        + _closer('content')
+        + '\n'
+        + _opener('project_id')
+        + 'dark_factory'
+        + _closer('project_id')
+        + INVOKE_CLOSER
+    )
+
+    #: What ``content`` should be left holding once the absorbed tail is peeled.
+    CLEAN = 'A fact worth keeping.'
+
+    # -- the premise: project_id really is required ------------------------
+
+    @BOTH_POLICIES
+    async def test_negative_control_the_parameter_is_genuinely_required(self, policy):
+        """A CLEAN value with ``project_id`` simply omitted must fail.
+
+        Without this, a toy whose parameter was not really required would make
+        every positive assertion below pass vacuously — which is precisely the
+        failure mode that let this shape go uncovered across 504 corpus records.
+        """
+        assert detect(self.CLEAN) is None, (
+            'the control value must carry no markup at all, or it would prove '
+            'something about the repair path rather than about required-ness'
+        )
+        h = build_harness(policy)
+
+        with pytest.raises(ToolError) as excinfo:
+            await h.call('add_memory_strict', {'content': self.CLEAN})
+
+        text = str(excinfo.value)
+        assert 'project_id' in text, text
+        assert 'missing' in text.lower() and 'required' in text.lower(), text
+        assert h.facts == [], 'a clean value must not enter the fact stream'
+        assert h.recorder.calls == []
+
+    # -- FORWARD_REPAIR: the ordering proof --------------------------------
+
+    async def _forward(self):
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+        result = await h.call('add_memory_strict', {'content': self.CONTENT})
+        return h, result
+
+    async def test_the_tool_runs_bound_to_a_required_argument_never_on_the_wire(self):
+        """The strongest form of the ordering proof.
+
+        ``project_id`` was never supplied by the caller — it existed only inside
+        ``content``'s leaked tail. The tool body nonetheless executed bound to
+        it, which is only possible if the guard ran before validation.
+        """
+        h, _ = await self._forward()
+
+        assert len(h.recorder.calls) == 1
+        assert h.recorder.args['project_id'] == 'dark_factory'
+
+    async def test_the_repaired_content_is_the_prefix_only(self):
+        h, _ = await self._forward()
+
+        assert h.recorder.args['content'] == self.CLEAN
+        assert detect(h.recorder.args['content']) is None
+
+    async def test_meta_names_the_recovered_required_parameter(self):
+        _, result = await self._forward()
+
+        warning = meta_of(result)['markup_repair']
+        assert warning['field'] == 'content'
+        assert warning['recovered_params'] == ['project_id']
+        assert warning['outcome'] == 'repaired'
+
+    # -- REJECT_WITH_REPAIR ------------------------------------------------
+
+    async def _reject(self):
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+        with pytest.raises(ToolError) as excinfo:
+            await h.call('add_memory_strict', {'content': self.CONTENT})
+        return h, _reject_payload(excinfo)
+
+    async def test_the_caller_is_bounced_with_a_markup_error_not_a_pydantic_one(self):
+        """The distinction B14 exists to pin.
+
+        A guard that ran AFTER validation could only ever produce the pydantic
+        missing-required-field error the caller already gets today — useless,
+        because it names the absent parameter and not the leak that ate it.
+        """
+        _, payload = await self._reject()
+
+        assert payload['error_type'] == 'mcp_markup_detected'
+        assert payload['tool'] == 'add_memory_strict'
+        assert payload['field'] == 'content'
+
+    async def test_the_repaired_call_carries_the_recovered_required_argument(self):
+        _, payload = await self._reject()
+
+        assert payload['repaired_call']['project_id'] == 'dark_factory'
+        assert payload['repaired_call']['content'] == self.CLEAN
+        assert payload['recovered_params'] == ['project_id']
+
+    async def test_nothing_is_written(self):
+        h, _ = await self._reject()
+
+        assert h.recorder.calls == []
+
+    # -- the fact, under both tiers ----------------------------------------
+
+    @BOTH_POLICIES
+    async def test_the_fact_names_the_recovered_required_parameter(self, policy):
+        """Tier-independent: the recovery is a property of the ordering."""
+        h = build_harness(policy)
+
+        with contextlib.suppress(ToolError):
+            await h.call('add_memory_strict', {'content': self.CONTENT})
+
+        assert len(h.facts) == 1
+        assert h.facts[0]['fact'] == 'markup_detected'
+        assert h.facts[0]['param'] == 'content'
+        assert h.facts[0]['recovered_params'] == ['project_id']
+
+
+class TestB14RequiredParameterAbsorptionFromCorpus:
+    """B14 again, on REAL committed payloads rather than a hand-authored one.
+
+    B14 is a POSITIVE claim — the repair LANDS — which is the kind an invented
+    specimen can flatter: a payload shaped to succeed proves only that its
+    author could shape one. So the row above is corroborated here against
+    payloads the harness really produced, the same split TestB5 makes for the
+    one claim that genuinely needs real input. No corpus record is added: the
+    committed corpus already carries this specimen class (44 records recover
+    ``project_id``, 5 recover ``where``), and its README's rule 1 is that the
+    corpus is only ever produced by running the generator.
+
+    The measured coverage fact this closes. All of those real recoveries DO get
+    replayed today — by ``test_mcp_markup_middleware_corpus.py`` — but its
+    ``_synthetic_tool`` emits ``f'{p}: str | None = None'`` for EVERY parameter
+    by deliberate design ("so a record's ``supplied`` subset is a legal call"),
+    so every one of them replays against an all-optional tool and is
+    structurally blind to required-ness. That module is deliberately NOT changed
+    here: its all-optional synthesis is correct for a replay whose
+    ``schema_params`` column is an observed-name union carrying no
+    required/optional information at all, and tightening it would fail records
+    whose genuinely-optional arguments are simply absent. Required-ness is a
+    claim only a hand-built harness can make, because only there does a human
+    declare which parameters are required.
+    """
+
+    #: One of the 19 corpus records whose ``add_memory.content`` absorbed the
+    #: REQUIRED ``project_id``. Pinned by id, and guarded below the way TestB5
+    #: guards its own, so a corpus refresh that reclassifies the row fails
+    #: loudly instead of silently weakening the claim.
+    ADD_MEMORY_ID = 'toolu_0121q4KJKWNyQU4N7VMAJHxJ'
+
+    #: One of the 5 records whose ``add_reuse_item.what`` absorbed the REQUIRED
+    #: ``where``. The existing toy ``add_reuse_item(what, how, where)`` already
+    #: mirrors plan_tools.py:1583's all-required signature, so this row needs no
+    #: new scaffolding — only a call that omits ``where``.
+    ADD_REUSE_ITEM_ID = 'toolu_01TD9YYAfShehSFKtS5aa3yj'
+
+    #: The EXACT values those two specimens must recover. Both rows are pinned
+    #: by ``tool_use_id`` against a committed file, so the recovered values are
+    #: fully deterministic and there is no reason to settle for a shape check:
+    #: ``isinstance(v, str) and v`` would wave through a regression that
+    #: recovered a wrong-but-non-empty slice — the wrong tail segment, or
+    #: envelope residue. Note that ``detect()`` would NOT catch that either;
+    #: measured on the residue this most plausibly produces, a value carrying a
+    #: trailing closer alone returns ``None`` from ``detect``, because a bare
+    #: closer is not one of the guarded patterns. Exact equality is therefore
+    #: the residue guard here, and the hand-authored sibling class above already
+    #: holds itself to it (``args['project_id'] == 'dark_factory'``).
+    ADD_MEMORY_PROJECT_ID = 'dark_factory'
+    ADD_REUSE_ITEM_WHERE = 'shared/src/shared/usage_gate.py'
+
+    @staticmethod
+    def _record(tool_use_id: str, *, absorbing: str, recovered: str) -> dict[str, Any]:
+        """The pinned corpus record, with every premise this row rests on guarded.
+
+        All three checks live here rather than at the call sites so both tiers
+        of a row get the same guard: duplicating a premise into the FORWARD test
+        and dropping it from the REJECT twin lets a corpus refresh fail one
+        loudly and pass the other for the wrong reason.
+        """
+        record = specimen(tool_use_id)
+        assert record['expected_outcome'] == 'repaired', (
+            'this row is only meaningful while the corpus still classifies the '
+            'specimen as repairable'
+        )
+        assert record['param'] == absorbing, (
+            f'this row drives the call with {absorbing!r} as the ABSORBING '
+            'parameter; a corpus refresh that repointed the id at a record '
+            'whose leak began elsewhere must fail here, not quietly assert '
+            'something else'
+        )
+        assert record['expected_recovered'] == [recovered], (
+            f'this row asserts the recovery of {recovered!r}; a corpus refresh '
+            'that repointed it elsewhere must fail here, not silently pass'
+        )
+        return record
+
+    # -- (a) the fused-memory shape ----------------------------------------
+    #
+    # Driven with ONLY ``content``. The record's ``supplied`` list is the
+    # OBSERVED argument union and carries names (project_root, limit, offset)
+    # the strict toy does not declare, so replaying it would fail with an
+    # unexpected-argument error for reasons that have nothing to do with B14.
+
+    async def test_a_real_add_memory_leak_forwards_bound_to_the_required_project_id(self):
+        record = self._record(
+            self.ADD_MEMORY_ID, absorbing='content', recovered='project_id'
+        )
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+
+        await h.call('add_memory_strict', {'content': record['value']})
+
+        assert len(h.recorder.calls) == 1
+        assert h.recorder.args['project_id'] == self.ADD_MEMORY_PROJECT_ID, (
+            'the tool ran bound to a required argument that was never on the '
+            'wire — which is only possible if the guard preceded validation — '
+            'and it must be bound to the value the leak actually carried'
+        )
+        assert detect(h.recorder.args['content']) is None
+
+    async def test_a_real_add_memory_leak_is_bounced_with_the_required_project_id(self):
+        record = self._record(
+            self.ADD_MEMORY_ID, absorbing='content', recovered='project_id'
+        )
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        with pytest.raises(ToolError) as excinfo:
+            await h.call('add_memory_strict', {'content': record['value']})
+
+        payload = _reject_payload(excinfo)
+        assert payload['error_type'] == 'mcp_markup_detected'
+        assert payload['repaired_call']['project_id'] == self.ADD_MEMORY_PROJECT_ID
+        assert h.recorder.calls == []
+
+    # -- (b) the plan-tools shape ------------------------------------------
+    #
+    # plan-tools shares RepairPolicy.REJECT_WITH_REPAIR with fused-memory, and
+    # all three of add_reuse_item's parameters are required as it stands. Today
+    # all nine of its call sites pass all three arguments and every one expects
+    # ``unrepairable``, so the tool was present but this shape unexercised.
+
+    FILLER_HOW = 'reused verbatim'
+
+    async def test_a_real_add_reuse_item_leak_forwards_bound_to_the_required_where(self):
+        record = self._record(
+            self.ADD_REUSE_ITEM_ID, absorbing='what', recovered='where'
+        )
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+
+        await h.call(
+            'add_reuse_item', {'what': record['value'], 'how': self.FILLER_HOW}
+        )
+
+        assert len(h.recorder.calls) == 1
+        assert h.recorder.args['where'] == self.ADD_REUSE_ITEM_WHERE
+        assert h.recorder.args['how'] == self.FILLER_HOW
+        assert detect(h.recorder.args['what']) is None
+
+    async def test_a_real_add_reuse_item_leak_is_bounced_with_the_required_where(self):
+        record = self._record(
+            self.ADD_REUSE_ITEM_ID, absorbing='what', recovered='where'
+        )
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        with pytest.raises(ToolError) as excinfo:
+            await h.call(
+                'add_reuse_item', {'what': record['value'], 'how': self.FILLER_HOW}
+            )
+
+        payload = _reject_payload(excinfo)
+        assert payload['error_type'] == 'mcp_markup_detected'
+        assert payload['tool'] == 'add_reuse_item'
+        assert payload['repaired_call']['where'] == self.ADD_REUSE_ITEM_WHERE
+        assert h.recorder.calls == []
+
+
+class TestB14OrderingDependsOnStrictInputValidationBeingOff:
+    """The one configuration that INVERTS the ordering, pinned as code.
+
+    B14's negative half. With ``strict_input_validation`` on,
+    ``mixins/mcp_operations.py:77`` registers the SDK handler with
+    ``validate_input=True``, and ``mcp/server/lowlevel/server.py:528-532`` then
+    jsonschema-validates against ``tool.inputSchema`` and returns an error
+    result BEFORE FastMCP's handler is ever invoked — so the middleware chain is
+    never entered at all.
+
+    Same input, both halves: the specimen the class above repairs is here
+    SILENTLY UNREPAIRABLE. No ``markup_detected`` fact is emitted, no storm is
+    counted, and the leak becomes invisible to every consumer downstream — the
+    exact silent fail-soft this guard exists to end.
+
+    Not hypothetical. The flag is settable three ways — the ``FastMCP(...)``
+    constructor kwarg, the global settings object, and the
+    ``FASTMCP_STRICT_INPUT_VALIDATION`` environment variable — so one variable
+    would disable required-parameter repair across all four of task 3690's
+    registration sites at once. A dependency that load-bearing and that easy to
+    flip has to fail a test, not merely contradict a docstring.
+    """
+
+    def test_the_default_is_off(self):
+        """Fails loudly if a future fastmcp upgrade flips the default.
+
+        Measured on fastmcp 3.2.2: the constructor resolves the flag to an
+        INSTANCE attribute (``server.py:371-374``), falling back to
+        ``fastmcp.settings.strict_input_validation``, whose default is False
+        (``settings.py:297-311``). Asserted on the instance because that is what
+        a registration site actually gets.
+        """
+        assert not FastMCP('probe').strict_input_validation
+
+    @BOTH_POLICIES
+    async def test_turning_it_on_bypasses_the_guard_entirely(self, policy):
+        """Tier-independent — the bypass is a property of the framework.
+
+        Showing it under both tiers is what makes this a containment statement
+        rather than a quirk of one path.
+        """
+        h = build_harness(policy, strict_input_validation=True)
+
+        with pytest.raises(ToolError) as excinfo:
+            await h.call(
+                'add_memory_strict',
+                {'content': TestB14RequiredParameterAbsorption.CONTENT},
+            )
+
+        text = str(excinfo.value)
+        assert 'project_id' in text, text
+        assert 'validation' in text.lower(), (
+            'the caller must be getting an INPUT-VALIDATION rejection, not the '
+            f'guard\'s own markup error: {text}'
+        )
+        assert h.recorder.calls == []
+        assert h.facts == [], (
+            'the middleware never ran, so nothing observed the leak — this '
+            'empty list IS the finding, not an incidental assertion'
+        )
+        assert h.escalations == []
