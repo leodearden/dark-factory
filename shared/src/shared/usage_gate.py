@@ -422,6 +422,10 @@ class InvokeSlot:
 
         Forwards ``self.scope`` (PRD task β) so a scoped cap detected here
         attributes to only this account's model-scope.
+
+        Settling suppresses ``invoke_slot()``'s ``__aexit__`` safety net, so
+        settling here also releases the PROBE_IN_FLIGHT claim explicitly
+        (task 4096) — see the comment below for why it is unconditional.
         """
         hit = self._gate.detect_cap_hit(
             stderr,
@@ -431,6 +435,15 @@ class InvokeSlot:
             scope=self.scope,
         )
         if hit:
+            # Settling below suppresses invoke_slot()'s __aexit__ safety net, so
+            # the PROBE_IN_FLIGHT claim must be released here (task 4096) —
+            # mirroring report()'s arms. A guarded no-op whenever the gate
+            # handler already moved the account off PROBE_IN_FLIGHT (the
+            # unscoped CapHit -> CAPPED case), so the general path is unchanged.
+            # It is load-bearing for the two handlers that take no phase
+            # transition at all: the SCOPED _handle_cap_detected branch
+            # (invariant S5) and _handle_near_cap_warning in EITHER scope.
+            self._gate.release_probe_slot(self.token)
             self._settled = True
         return hit
 
