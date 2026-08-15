@@ -1135,6 +1135,16 @@ def _record_grant(
     )
 
 
+def _breaches(scheduler: Scheduler) -> int:
+    """Breaches currently in the bounded overstay-rate window."""
+    return sum(scheduler._backfill_outcomes)
+
+
+def _settled(scheduler: Scheduler) -> int:
+    """Settlements currently in the bounded overstay-rate window."""
+    return len(scheduler._backfill_outcomes)
+
+
 def _settled_after(seconds: float, **grant_kwargs):
     """Grant at T, release at T + *seconds*; return ``(scheduler, store)``."""
     clock = _Clock()
@@ -1152,7 +1162,8 @@ def test_a_hold_inside_the_bound_is_not_an_overstay():
     scheduler, store = _settled_after(400.0)
 
     assert _events(store, 'park_backfill_overstay') == []
-    assert scheduler._backfill_overstay_total == 0
+    assert _breaches(scheduler) == 0
+    assert _settled(scheduler) == 1, 'a clean hold is still SAMPLED — it is the denominator'
 
 
 def test_a_hold_exactly_at_the_bound_is_not_an_overstay():
@@ -1166,7 +1177,8 @@ def test_a_hold_exactly_at_the_bound_is_not_an_overstay():
     scheduler, store = _settled_after(500.0)
 
     assert _events(store, 'park_backfill_overstay') == []
-    assert scheduler._backfill_overstay_total == 0
+    assert _breaches(scheduler) == 0
+    assert _settled(scheduler) == 1
 
 
 def test_a_hold_past_the_bound_emits_one_overstay_with_predicted_and_realized():
@@ -1183,7 +1195,7 @@ def test_a_hold_past_the_bound_emits_one_overstay_with_predicted_and_realized():
     assert data['realized_hold'] == pytest.approx(900.0)
     assert data['overstay_secs'] == pytest.approx(400.0)
     assert data['park_owners'] == ['p']
-    assert scheduler._backfill_overstay_total == 1
+    assert _breaches(scheduler) == 1
 
 
 def test_releasing_a_task_that_never_backfilled_settles_nothing():
@@ -1197,8 +1209,9 @@ def test_releasing_a_task_that_never_backfilled_settles_nothing():
     scheduler.release('ordinary')
 
     assert _events(store, 'park_backfill_overstay') == []
-    assert scheduler._backfill_grants_total == 0
-    assert scheduler._backfill_overstay_total == 0
+    assert list(scheduler._backfill_outcomes) == [], (
+        'no grant means no settlement, so nothing is sampled in either direction'
+    )
 
 
 def test_the_grant_is_popped_so_a_second_release_double_counts_nothing():
@@ -1209,17 +1222,26 @@ def test_the_grant_is_popped_so_a_second_release_double_counts_nothing():
     and quietly inflate the rate that drives the escalation.
     """
     scheduler, store = _settled_after(900.0)
-    assert scheduler._backfill_overstay_total == 1
+    assert list(scheduler._backfill_outcomes) == [True]
 
     scheduler.release('c')
 
     assert len(_events(store, 'park_backfill_overstay')) == 1
-    assert scheduler._backfill_overstay_total == 1
+    assert list(scheduler._backfill_outcomes) == [True], (
+        'the second release must not re-sample the same hold into the window'
+    )
     assert 'c' not in scheduler._backfill_grants
 
 
-def test_the_rate_denominator_is_grants_not_releases():
-    """Three grants, one breach → 3 and 1."""
+def test_the_rate_denominator_is_settlements_and_a_live_grant_is_not_sampled():
+    """Three settlements, one breach → window ``[False, True, False]``.
+
+    Only a SETTLED grant has a realized hold to judge, so a live one is not
+    sampled in either direction.  A grants denominator would count it while it
+    could not yet contribute a breach — understating the rate — and a grant
+    evicted by the ``_BACKFILL_GRANTS_MAX`` backstop would sit in that
+    denominator forever, unable ever to settle.
+    """
     clock = _Clock()
     store = _RecordingEventStore()
     scheduler = _make_scheduler(clock=clock, event_store=store)
@@ -1231,8 +1253,17 @@ def test_the_rate_denominator_is_grants_not_releases():
         clock.now = FIXED_DT + timedelta(seconds=realized)
         scheduler.release(task_id)
 
-    assert scheduler._backfill_grants_total == 3
-    assert scheduler._backfill_overstay_total == 1
+    assert list(scheduler._backfill_outcomes) == [False, True, False]
+
+    # A fourth grant that is still LIVE moves neither number.
+    clock.now = FIXED_DT
+    _record_grant(scheduler, 'still-running')
+    clock.now = FIXED_DT + timedelta(seconds=99999.0)
+
+    assert list(scheduler._backfill_outcomes) == [False, True, False], (
+        'an unsettled grant has no realized hold, so it belongs in neither '
+        'the numerator nor the denominator'
+    )
 
 
 def test_the_live_grant_map_is_bounded():
@@ -1275,7 +1306,7 @@ def test_an_unreleased_grant_is_silently_lost_with_the_process_era():
 
     assert 'never-released' in scheduler._backfill_grants
     assert _events(store, 'park_backfill_overstay') == []
-    assert scheduler._backfill_overstay_total == 0
+    assert list(scheduler._backfill_outcomes) == []
 
 
 # ===========================================================================
@@ -1315,10 +1346,10 @@ class _FakeEscalationQueue:
 def _drive_grants(scheduler: Scheduler, clock: _Clock, *, grants: int, overstays: int):
     """Record *grants* grants, then release *overstays* of them past the bound.
 
-    All grants are recorded BEFORE any release, so the denominator is already
-    at its final value when the first breach settles — otherwise the rate
-    would cross the threshold on an early partial denominator and the test
-    would be asserting an accident of ordering.
+    The breaches settle FIRST, so the rate is at its worst while the window is
+    still filling and the floor is the only thing holding the escalation back.
+    That ordering is deliberate: it puts the floor under test on every call
+    rather than letting a lucky interleaving keep the rate below threshold.
     """
     clock.now = FIXED_DT
     for index in range(grants):
@@ -1351,6 +1382,13 @@ def test_the_escalation_policy_constants_are_what_the_model_supports():
     assert pytest.approx(0.25) == scheduler_module._BACKFILL_OVERSTAY_RATE_THRESHOLD
     assert scheduler_module._BACKFILL_OVERSTAY_MIN_GRANTS == 8
     assert isinstance(scheduler_module._BACKFILL_OVERSTAY_SENTINEL, str)
+    # The window is ~8x the floor, so the floor still gates a genuinely
+    # partial sample and one settled era is fully flushed within one window.
+    assert scheduler_module._BACKFILL_OUTCOME_WINDOW == 64
+    assert (
+        scheduler_module._BACKFILL_OUTCOME_WINDOW
+        > scheduler_module._BACKFILL_OVERSTAY_MIN_GRANTS
+    ), 'a window at or below the floor could never reach the floor after a wrap'
 
 
 def test_a_perfect_overstay_rate_below_the_grant_floor_files_nothing():
@@ -1364,7 +1402,7 @@ def test_a_perfect_overstay_rate_below_the_grant_floor_files_nothing():
 
     _drive_grants(scheduler, clock, grants=4, overstays=4)
 
-    assert scheduler._backfill_overstay_total == 4
+    assert _breaches(scheduler) == 4
     assert queue.submitted == []
 
 
@@ -1413,7 +1451,7 @@ def test_the_normal_measured_regime_stays_silent():
 
     _drive_grants(scheduler, clock, grants=20, overstays=1)
 
-    assert scheduler._backfill_overstay_total == 1
+    assert _breaches(scheduler) == 1
     assert queue.submitted == []
 
 
@@ -1426,8 +1464,76 @@ def test_no_escalation_queue_warns_and_does_not_raise(caplog):
     with caplog.at_level(logging.WARNING):
         _drive_grants(scheduler, clock, grants=8, overstays=4)
 
-    assert scheduler._backfill_overstay_total == 4
+    assert _breaches(scheduler) == 4
     assert any(r.levelno >= logging.WARNING for r in caplog.records)
+
+
+def test_a_retune_discards_the_sample_so_the_stale_rate_stops_refiling():
+    """The operator acts on the L1 — and the signal actually clears.
+
+    A lifetime ratio never decays.  After an operator raises
+    ``backfill_safety_factor`` and resolves the escalation, ``has_open_l1``
+    stops deduping, and the very next overstay re-files an L1 blaming a rate
+    the retune has already fixed — repeat churn on a signal the operator has
+    no way to clear (recovery would need roughly 3x more clean grants than the
+    accumulated breaches).
+
+    Every outcome in the window was measured against bounds computed from the
+    OLD factor, so a retune is a new policy era and the old sample is dropped.
+    """
+    scheduler, clock, queue = _escalating_scheduler()
+
+    _drive_grants(scheduler, clock, grants=8, overstays=4)
+    assert len(queue.submitted) == 1, 'setup: the mis-tune must actually escalate'
+
+    # The operator does exactly what the escalation's REMEDY says, through the
+    # real reload path, and resolves the L1 (queue reports nothing open again).
+    result = apply_reload(
+        scheduler.config,
+        OrchestratorConfig(max_per_module=1, backfill_safety_factor=2.9),
+    )
+    assert result['reloaded'] is True, result
+    assert 'backfill_safety_factor' in result['applied'], result
+    queue.submitted.clear()
+
+    # One more breach under the NEW factor: 1 of 1 is below the window floor,
+    # so nothing is claimed — where a lifetime ratio would still read 5/9.
+    _drive_grants(scheduler, clock, grants=1, overstays=1)
+
+    assert list(scheduler._backfill_outcomes) == [True], (
+        'the pre-retune sample must be discarded, not carried forward'
+    )
+    assert queue.submitted == [], (
+        're-filing here would blame a mis-tune the operator has already fixed'
+    )
+
+    # And a clean run under the new factor stays silent all the way past the
+    # floor, which the un-decayed lifetime rate never would.
+    _drive_grants(scheduler, clock, grants=8, overstays=0)
+
+    assert _settled(scheduler) == 9
+    assert _breaches(scheduler) == 1
+    assert queue.submitted == []
+
+
+def test_the_outcome_window_is_bounded_so_an_old_era_ages_out():
+    """Breaches older than the window stop counting, even without a retune.
+
+    The window is the general staleness bound: a burst of breaches followed by
+    a full window of clean settlements leaves nothing to escalate on, so the
+    escalation means "currently mis-tuned" rather than "was mis-tuned at some
+    point in this process era".
+    """
+    scheduler, clock, queue = _escalating_scheduler(open_l1=True)  # suppress filing
+    window = scheduler_module._BACKFILL_OUTCOME_WINDOW
+
+    _drive_grants(scheduler, clock, grants=8, overstays=8)
+    assert _breaches(scheduler) == 8
+
+    _drive_grants(scheduler, clock, grants=window, overstays=0)
+
+    assert _settled(scheduler) == window, 'the window never grows past its bound'
+    assert _breaches(scheduler) == 0, 'the old era has aged out entirely'
 
 
 def test_a_failing_submit_never_breaks_the_release():
@@ -1440,6 +1546,6 @@ def test_a_failing_submit_never_breaks_the_release():
 
     _drive_grants(scheduler, clock, grants=8, overstays=4)
 
-    assert scheduler._backfill_overstay_total == 4
+    assert _breaches(scheduler) == 4
     assert queue.submitted == []
     assert scheduler._backfill_grants == {}, 'every grant still settled'

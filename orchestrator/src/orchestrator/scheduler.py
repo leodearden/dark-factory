@@ -104,9 +104,21 @@ _BACKFILL_GRANTS_MAX: int = 512
 # individual overstays are the model working as designed, and one event each
 # is exactly the storm INV-4 forbids.
 _BACKFILL_OVERSTAY_RATE_THRESHOLD: float = 0.25
-# Denominator floor.  A 1-of-1 breach is noise, not a rate; 8 is reachable
-# within days at the modelled 23-122 grants/30d.
+# Denominator floor — the minimum WINDOW FILL below which no rate is claimed.
+# A 1-of-1 breach is noise, not a rate; 8 is reachable within days at the
+# modelled 23-122 grants/30d.
 _BACKFILL_OVERSTAY_MIN_GRANTS: int = 8
+# The rate is measured over a bounded window of the most recent SETTLEMENTS,
+# not over lifetime totals.  A lifetime ratio never decays: after an operator
+# raises backfill_safety_factor and resolves the L1, a lifetime rate stays
+# above the threshold for roughly 3x more clean grants than the breaches it
+# accumulated, so the next single overstay re-files an L1 blaming a mis-tune
+# the retune already fixed — repeat churn on a signal the operator cannot
+# clear.  A window also lets the escalation mean "currently mis-tuned" rather
+# than "was mis-tuned at some point in this process era".  64 is ~8x the floor,
+# so the floor still gates a genuinely partial sample and a settled era is
+# fully flushed within one window.
+_BACKFILL_OUTCOME_WINDOW: int = 64
 # Dedup key, mirroring _FM_READ_STORM_SENTINEL: one open L1 per episode.
 _BACKFILL_OVERSTAY_SENTINEL: str = '__backfill_overstay_rate__'
 
@@ -1757,12 +1769,25 @@ class Scheduler:
         )
         # EASY-backfill grant bookkeeping (task 3823 / PRD C7).  One entry per
         # live back-filled dispatch, popped at release when the realized hold
-        # is judged against the bound admission promised.  The two totals are
-        # the numerator and denominator of the overstay RATE — the denominator
-        # is grants, not releases, so an unsettled grant never flatters it.
+        # is judged against the bound admission promised.
         self._backfill_grants: dict[str, _BackfillGrant] = {}
-        self._backfill_grants_total = 0
-        self._backfill_overstay_total = 0
+        # The overstay RATE is measured over a bounded window of the most
+        # recent SETTLEMENTS — one bool appended per settled grant, True on a
+        # breach.  Deliberately not lifetime totals: see
+        # _BACKFILL_OUTCOME_WINDOW for why a never-decaying ratio re-files an
+        # L1 the operator has already acted on.
+        #
+        # Settlements, not grants, are the denominator: only a settled grant
+        # has a realized hold to judge, so a live one contributes nothing in
+        # either direction (a grants denominator would count it while it could
+        # not yet contribute a breach, understating the rate), and a grant
+        # evicted by the _BACKFILL_GRANTS_MAX backstop — which can never settle
+        # — is simply never sampled instead of sitting in a denominator forever.
+        self._backfill_outcomes: deque[bool] = deque(maxlen=_BACKFILL_OUTCOME_WINDOW)
+        # The factor the current window was accumulated under.  A retune is a
+        # new policy era, so the sample from the old one is discarded rather
+        # than left to keep the rate above threshold after the fix.
+        self._backfill_outcomes_factor = float(config.backfill_safety_factor)
         self._mcp_session = mcp_session
         self._dispatched: set[str] = set()
         # Task 2408 mechanism 2: attribute-injected by the Harness right
@@ -7818,7 +7843,6 @@ class Scheduler:
             # dict preserves insertion order, so the first key is the oldest.
             self._backfill_grants.pop(next(iter(self._backfill_grants)), None)
         self._backfill_grants[stamped.task_id] = stamped
-        self._backfill_grants_total += 1
         if self.event_store:
             self.event_store.emit(
                 EventType.park_backfill_granted,
@@ -7853,14 +7877,24 @@ class Scheduler:
         Not hooked into ``release_subset``.  A partial release does not end the
         hold, so settling there would report a realized duration that has not
         finished happening.
+
+        EVERY settlement is sampled into the rate window and re-checks the
+        escalation, not just the breaches: a clean settlement is what fills the
+        window past ``_BACKFILL_OVERSTAY_MIN_GRANTS`` in a burst that started
+        with breaches, and checking only on breaches would leave an
+        already-over-threshold sample unreported until the next one.  It also
+        means a clean run can carry the rate back DOWN through the threshold,
+        which a breach-only sampler could never observe.
         """
         grant = self._backfill_grants.pop(task_id, None)
         if grant is None:
             return
         realized = self._wall_now().timestamp() - grant.granted_at
-        if realized <= grant.admission_bound:
+        breached = realized > grant.admission_bound
+        self._record_backfill_outcome(breached)
+        if not breached:
+            self._maybe_escalate_backfill_overstay_rate()
             return
-        self._backfill_overstay_total += 1
         overstay = realized - grant.admission_bound
         logger.info(
             'backfill overstay task=%s realized=%.1fs bound=%.1fs over=%.1fs '
@@ -7884,6 +7918,30 @@ class Scheduler:
             )
         self._maybe_escalate_backfill_overstay_rate()
 
+    def _record_backfill_outcome(self, breached: bool) -> None:
+        """Sample one settled grant into the bounded overstay-rate window.
+
+        Drops the whole sample when ``backfill_safety_factor`` has moved since
+        it started accumulating.  The factor is a green-tier reloadable leaf,
+        so an operator acting on the L1 retunes it live — and every outcome in
+        the window was produced under the OLD factor, against bounds that no
+        longer exist.  Keeping them would re-file an L1 blaming a mis-tune the
+        operator already fixed, on a rate they have no way to clear.  Read from
+        ``self.config`` at settlement time (a pull), matching the house
+        contract for every reloadable consumer here, so no reload hook has to
+        exist for this to work.
+        """
+        factor = float(self.config.backfill_safety_factor)
+        if factor != self._backfill_outcomes_factor:
+            logger.info(
+                'backfill_safety_factor changed %s -> %s — discarding the %d '
+                'outcome(s) sampled under the old factor',
+                self._backfill_outcomes_factor, factor, len(self._backfill_outcomes),
+            )
+            self._backfill_outcomes.clear()
+            self._backfill_outcomes_factor = factor
+        self._backfill_outcomes.append(breached)
+
     def _maybe_escalate_backfill_overstay_rate(self) -> None:
         """File one L1 when the overstay RATE stays well above the modelled one.
 
@@ -7893,9 +7951,10 @@ class Scheduler:
         What is actionable is a SUSTAINED rate several times the measured
         7-9%: that means the predictor has drifted or the factor is wrong.
 
-        The denominator floor matters as much as the threshold: without it the
-        first back-filled dispatch that ran long would file an L1 claiming a
-        100% overstay rate.
+        Measured over the BOUNDED settlement window, so the claim is about the
+        current regime.  The window floor matters as much as the threshold:
+        without it the first back-filled dispatch that ran long would file an
+        L1 claiming a 100% overstay rate.
 
         Deduped on ``has_open_l1`` so a sustained mis-tune produces one open
         escalation per episode rather than one per release, and best-effort
@@ -7904,17 +7963,19 @@ class Scheduler:
         failed would strand the task's locks and turn a reporting problem into
         a dispatch outage.
         """
-        grants = self._backfill_grants_total
-        if grants < _BACKFILL_OVERSTAY_MIN_GRANTS:
+        settled = len(self._backfill_outcomes)
+        if settled < _BACKFILL_OVERSTAY_MIN_GRANTS:
             return
-        rate = self._backfill_overstay_total / grants
+        breaches = sum(self._backfill_outcomes)
+        rate = breaches / settled
         if rate < _BACKFILL_OVERSTAY_RATE_THRESHOLD:
             return
         if self.escalation_queue is None:  # bare-Scheduler unit tests stay green
             logger.warning(
-                'backfill overstay rate is %.0f%% (%d of %d grants) but no '
-                'escalation_queue is wired — skipping rate escalation',
-                rate * 100, self._backfill_overstay_total, grants,
+                'backfill overstay rate is %.0f%% (%d of the last %d settled '
+                'grants) but no escalation_queue is wired — skipping rate '
+                'escalation',
+                rate * 100, breaches, settled,
             )
             return
         try:
@@ -7931,15 +7992,21 @@ class Scheduler:
                 category='risk_identified',
                 summary=(
                     f'EASY-backfill overstay rate {rate * 100:.0f}% '
-                    f'({self._backfill_overstay_total} of {grants} grants) — '
+                    f'({breaches} of the last {settled} settled grants) — '
                     f'well above the modelled 7-9% at safety x2.5'
                 )[:200],
                 detail=(
-                    f'{self._backfill_overstay_total} of {grants} backfill '
+                    f'{breaches} of the last {settled} settled backfill '
                     f'grants held their locks LONGER than the bound their '
                     f'admission promised — a measured overstay rate of '
                     f'{rate * 100:.0f}%, against a threshold of '
                     f'{_BACKFILL_OVERSTAY_RATE_THRESHOLD * 100:.0f}%.\n\n'
+                    f'The rate is measured over a rolling window of the last '
+                    f'{_BACKFILL_OUTCOME_WINDOW} settled grants, and the window '
+                    f'is DISCARDED when backfill_safety_factor changes — so '
+                    f'this figure describes the current tuning, and retuning '
+                    f'below starts a fresh sample rather than leaving a stale '
+                    f'rate to re-file this escalation.\n\n'
                     f'The parking model measured 7-9% overstay at '
                     f'backfill_safety_factor x2.5 '
                     f'(plans/evidence/scheduler-scoring-2026-08-06/'
