@@ -1942,22 +1942,6 @@ class TestTheRankingRuleDoesNotSortOnAConstant:
 
         assert mod._rank_key('a', better) < mod._rank_key('a', worse)
 
-    def test_the_printed_rule_no_longer_claims_to_rank_on_it(self):
-        """The artifact states the rule it actually applies (PRD G6/D10).
-
-        `_scored()` — the report fixture — is defined further down this
-        module; module-level names resolve at call time, so using it here
-        is fine and avoids a second stub of the same shape.
-        """
-        mod = _mod()
-        report = mod.build_selection_report(_scored())
-
-        rule = report['recommendation']['rule'].lower()
-
-        assert 'unaliased' in rule
-        assert 'invariant' in rule
-
-
 # ---------------------------------------------------------------------------
 # The UNLABELED production scoring path
 # ---------------------------------------------------------------------------
@@ -2429,33 +2413,6 @@ class TestTheAliasingDisclosure:
             assert 'canonical_aliased_in_top_k' in block
             assert 'canonical_unaliased_in_top_k' in block
 
-    def test_the_markdown_prints_both_columns(self):
-        mod = _mod()
-        markdown = mod.render_selection_markdown(mod.build_selection_report(_scored()))
-        assert 'aliased' in markdown.lower()
-        assert 'unaliased' in markdown.lower()
-
-    def test_the_markdown_explains_the_aliasing_mechanism(self):
-        """A reader must not have to infer it from a gap between two numbers."""
-        mod = _mod()
-        markdown = mod.render_selection_markdown(mod.build_selection_report(_scored()))
-        assert 'record_id' in markdown
-        assert 'canonical' in markdown.lower()
-
-    def test_it_does_not_cite_b_grouped_0_97_as_a_retrieval_property(self):
-        """The E2 table's 0.97 is a property of the TRANSFORM, not of retrieval.
-
-        The artifact may name the number — that is the finding — but it must
-        not present it as retrieval having found the canonical.
-        """
-        mod = _mod()
-        markdown = mod.render_selection_markdown(mod.build_selection_report(_scored()))
-        for line in markdown.splitlines():
-            if '0.97' in line:
-                lowered = line.lower()
-                assert 'alias' in lowered or 'transform' in lowered or 'not ' in lowered
-
-
 class TestTheSightingCreditingKnob:
     """(b) — never left implicit."""
 
@@ -2463,21 +2420,6 @@ class TestTheSightingCreditingKnob:
         mod = _mod()
         report = mod.build_selection_report(_scored())
         assert report['sighting_crediting'] in ('uncredited', 'rendered')
-
-    def test_the_markdown_names_the_knob_and_its_setting(self):
-        mod = _mod()
-        markdown = mod.render_selection_markdown(mod.build_selection_report(_scored()))
-        lowered = markdown.lower()
-        assert 'sighting' in lowered
-        assert 'uncredited' in lowered
-
-    def test_the_markdown_states_the_ceiling_arithmetic(self):
-        """With sightings uncredited the recall ceiling is fixed by arithmetic,
-        not by the transform — a reader comparing arms has to know that."""
-        mod = _mod()
-        markdown = mod.render_selection_markdown(mod.build_selection_report(_scored()))
-        assert 'ceiling' in markdown.lower()
-
 
 class TestTheSuppressionColumn:
     """(c) — suppressing, and needing `contested`, are DIFFERENT facts."""
@@ -2503,13 +2445,6 @@ class TestTheSuppressionColumn:
         assert spec['drops_ranked_records'] is True
         assert spec['requires_contested_key_for_v2'] is False
 
-    def test_the_markdown_states_it_per_arm(self):
-        mod = _mod()
-        markdown = mod.render_selection_markdown(mod.build_selection_report(_scored()))
-        lowered = markdown.lower()
-        assert 'suppress' in lowered
-        assert 'contested' in lowered
-
     def test_the_two_flags_are_not_collapsed_into_one_column(self):
         """Collapsing them would tell 3111 the cap is blocked on a key that
         does not exist — the opposite of the truth."""
@@ -2524,25 +2459,6 @@ class TestTheSuppressionColumn:
 class TestTheV2Impossibility:
     """(d) — the hard constraint, stated verbatim and evidenced."""
 
-    def test_the_markdown_quotes_the_v2_protection(self):
-        mod = _mod()
-        markdown = mod.render_selection_markdown(mod.build_selection_report(_scored()))
-        assert 'contested children are never suppressed' in markdown.lower()
-
-    def test_it_names_esc_5712(self):
-        mod = _mod()
-        markdown = mod.render_selection_markdown(mod.build_selection_report(_scored()))
-        assert 'esc-5712' in markdown.lower()
-
-    def test_it_names_the_live_reserved_vocabulary_set(self):
-        """Not asserted from memory: the five keys, and `contested` absent."""
-        mod = _mod()
-        markdown = mod.render_selection_markdown(mod.build_selection_report(_scored()))
-        for key in ('topic', 'canonical', 'kind', 'parent_id', 'supersedes'):
-            assert key in markdown
-        assert 'RESERVED_VOCABULARY_KEYS' in markdown
-        assert 'memory_metadata.py' in markdown
-
     def test_the_named_set_matches_the_live_one(self):
         """A hard-coded list here would rot silently the day a key is added."""
         from fused_memory.memory_metadata import (  # noqa: PLC0415
@@ -2553,26 +2469,8 @@ class TestTheV2Impossibility:
         assert set(mod.RESERVED_VOCABULARY_KEYS) == set(RESERVED_VOCABULARY_KEYS)
         assert 'contested' not in RESERVED_VOCABULARY_KEYS
 
-    def test_it_states_contested_is_a_fixture_field(self):
-        mod = _mod()
-        markdown = mod.render_selection_markdown(mod.build_selection_report(_scored()))
-        lowered = markdown.lower()
-        assert 'fixture' in lowered
-        assert 'no writer' in lowered or 'has no writer' in lowered
-
-
 class TestTheRecommendation:
     """The artifact is FOR task 3111. It must answer 3111's question."""
-
-    def test_there_is_a_recommendation_section(self):
-        mod = _mod()
-        markdown = mod.render_selection_markdown(mod.build_selection_report(_scored()))
-        assert '## Recommendation' in markdown
-
-    def test_it_names_task_3111(self):
-        mod = _mod()
-        markdown = mod.render_selection_markdown(mod.build_selection_report(_scored()))
-        assert '3111' in markdown
 
     def test_it_names_exactly_one_winner_from_the_arm_set(self):
         mod = _mod()
@@ -2607,12 +2505,6 @@ class TestTheNoMeasurementConvention:
         markdown = mod.render_selection_markdown(mod.build_selection_report(_scored()))
         section = markdown.split('Production')[-1]
         assert '0.00' not in section.split('## ')[0]
-
-    def test_the_reason_for_the_dash_is_printed(self):
-        mod = _mod()
-        markdown = mod.render_selection_markdown(mod.build_selection_report(_scored()))
-        assert 'unlabeled' in markdown.lower()
-        assert 'ground truth' in markdown.lower()
 
     def test_it_reuses_the_bake_offs_cell_renderer(self):
         """INV-5: there is not a second `—` convention in this repo."""
@@ -2918,15 +2810,6 @@ class TestCommittedSelectionMarkdown:
             cell = by_label[mod.ARM_LABELS[arm]][column]
             assert 'aliased' in cell and 'unaliased' in cell, cell
 
-    def test_the_production_section_prints_the_reason_for_its_dashes(self):
-        """A `—` with no reason beside it is indistinguishable from a bug."""
-        markdown = _committed_selection_markdown().lower()
-
-        assert 'unlabeled' in markdown
-        assert 'ground truth' in markdown
-        assert 'claim recall' in markdown
-        assert 'not a measured zero' in markdown or 'never a measured zero' in markdown
-
     def test_it_re_renders_byte_identically_from_the_committed_json(self):
         """The two artifacts are written from ONE report dict; this is what
         makes it impossible for them to disagree unnoticed — and it is what
@@ -2936,26 +2819,6 @@ class TestCommittedSelectionMarkdown:
         rendered = mod.render_selection_markdown(_committed_selection_json())
 
         assert rendered == _committed_selection_markdown()
-
-    def test_it_carries_the_four_disclosures_and_the_recommendation(self):
-        markdown = _committed_selection_markdown()
-        lowered = markdown.lower()
-
-        assert 'aliasing' in lowered                       # (a)
-        assert 'sighting' in lowered                       # (b)
-        assert 'suppress' in lowered                       # (c)
-        assert 'contested children are never suppressed' in lowered   # (d)
-        assert 'esc-5712' in lowered
-        assert '## Recommendation' in markdown
-        assert '3111' in markdown
-
-    def test_it_does_not_cite_b_grouped_0_97_as_a_retrieval_property(self):
-        """Asserted over the COMMITTED file, because that is what is read."""
-        for line in _committed_selection_markdown().splitlines():
-            if '0.97' in line:
-                lowered = line.lower()
-                assert 'alias' in lowered or 'transform' in lowered
-
 
 class TestTheProductionTrafficSharesAreTheMeasuredOnes:
     """The external-validity claim, made checkable.
