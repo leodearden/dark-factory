@@ -37,6 +37,7 @@ from __future__ import annotations
 
 from orchestrator.agents.roles import (
     _ESCALATION_INSTRUCTIONS,
+    _ESCALATION_TOOLS,
     ESCALATION_LADDER_CORE,
     NON_STEWARD_LEVEL_GATE,
     ROLES,
@@ -149,4 +150,68 @@ def test_non_steward_escalating_roles_carry_both_halves() -> None:
         f'{offenders}. These roles must never file at level=1, so they need '
         'both ESCALATION_LADDER_CORE (the mechanics) and NON_STEWARD_LEVEL_GATE '
         '(the "level=1 is not yours" framing).'
+    )
+
+
+def test_escalation_tool_grant_matches_hand_classification() -> None:
+    """Derive "which roles can escalate" from `ROLES`' actual tool grants and
+    require it to match the hand-maintained tuples above.
+
+    `_L1_FILER_ROLES` / `_NON_STEWARD_ESCALATING_ROLES` are hand-maintained,
+    so a future role wired with an escalation tool (anything in
+    `_ESCALATION_TOOLS`, i.e. `escalate_info` and/or `escalate_blocker`) but
+    never added to either tuple would otherwise be invisible: every other
+    assertion in this module iterates the tuples, not `ROLES`, so it would
+    silently pass regardless of what that role's system_prompt says. This
+    computes the "escalating" set independently, from `allowed_tools`, and
+    requires it to equal the tuples' union -- so adding a new escalating role
+    forces a deliberate classification here.
+
+    Deliberately checks membership in `_ESCALATION_TOOLS` as a whole, not
+    just `escalate_blocker`: DEEP_REVIEWER is granted `escalate_info` only --
+    no `escalate_blocker` string appears anywhere in its `allowed_tools` --
+    yet it still carries the full escalation-ladder text and belongs in
+    `_NON_STEWARD_ESCALATING_ROLES`. That tool/prompt asymmetry predates and
+    is unrelated to task 4169; checking only `escalate_blocker` would fail
+    this assertion on that pre-existing asymmetry instead of on an actual
+    classification gap, which is not what this test is for.
+    """
+    classified = set(_L1_FILER_ROLES) | set(_NON_STEWARD_ESCALATING_ROLES)
+    escalating_by_tools = {
+        name for name, role in ROLES.items()
+        if any(tool in _ESCALATION_TOOLS for tool in role.allowed_tools)
+    }
+    assert escalating_by_tools == classified, (
+        f'Roles granted an escalation tool {sorted(escalating_by_tools)} do not '
+        f'match the hand-classified tuples {sorted(classified)}. A role was '
+        'added to ROLES (or had its tool grants changed) without updating '
+        '_L1_FILER_ROLES / _NON_STEWARD_ESCALATING_ROLES above.'
+    )
+
+
+def test_unclassified_roles_carry_neither_escalation_half() -> None:
+    """Every role NOT in either tuple above carries neither escalation half.
+
+    Makes the comment claim above `_NON_STEWARD_ESCALATING_ROLES` --
+    "judge and reviewer_comprehensive carry neither half" -- an actual
+    assertion instead of an unverified comment. Also independently catches
+    a role whose system_prompt gets `ESCALATION_LADDER_CORE` or
+    `NON_STEWARD_LEVEL_GATE` spliced in (e.g. by copy-pasting another role's
+    prompt tail) without a matching tool grant or tuple entry -- the
+    tool-grant check above would not see this, since it never inspects
+    system_prompt content.
+    """
+    classified = set(_L1_FILER_ROLES) | set(_NON_STEWARD_ESCALATING_ROLES)
+    offenders = sorted(
+        name for name in ROLES
+        if name not in classified
+        and (
+            ESCALATION_LADDER_CORE in ROLES[name].system_prompt
+            or NON_STEWARD_LEVEL_GATE in ROLES[name].system_prompt
+        )
+    )
+    assert offenders == [], (
+        f'Role(s) not listed in _L1_FILER_ROLES or _NON_STEWARD_ESCALATING_ROLES '
+        f'but whose system_prompt carries escalation-ladder text: {offenders}. '
+        'Classify them into the appropriate tuple above.'
     )
