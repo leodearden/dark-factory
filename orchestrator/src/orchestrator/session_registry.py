@@ -2588,12 +2588,64 @@ def _run_lease_claim(name: str, slug: str, pid: int, policy_value: str) -> None:
     print(claim.message)
 
 
-def _run_lease_heartbeat(name: str) -> None:
-    heartbeat_lease(name)
+def _run_lease_mutation(
+    verb: str,
+    name: str,
+    slug: str,
+    force: bool,
+    mutate: Callable[[], LeaseMutation],
+) -> None:
+    """Drive a mutating lease verb and print ``result=<value>`` + a human line.
+
+    The machine-readable token is ALWAYS the first line, mirroring
+    ``lease-claim``'s ``decision=`` so an agent parses all four lease verbs
+    with one rule. On REFUSED/FORCED a second line names the lease's actual
+    holder, so a caller told "no" also learns WHO owns it and can act
+    (inspect with ``lease-show``) rather than guess.
+
+    The holder is read BEFORE *mutate* runs: a FORCED ``lease-release``
+    deletes the very file the holder's identity lives in, so reading after
+    the fact would report ``<unreadable lease body>`` for exactly the case
+    where naming the displaced holder matters most.
+    """
+    holder, holder_alive, age_secs = _read_lease_holder_state(
+        lease_path_for_name(name), now=datetime.now(UTC)
+    )
+    result = mutate()
+    print(f'result={result.value}')
+    if result not in (LeaseMutation.REFUSED, LeaseMutation.FORCED):
+        return
+    holder_slug = holder.session_slug if holder is not None else '<unreadable lease body>'
+    holder_pid = holder.pid if holder is not None else -1
+    alive_word = 'alive' if holder_alive else 'not running'
+    holder_facts = f'{holder_slug} (pid {holder_pid} {alive_word}, heartbeat {int(age_secs)}s ago)'
+    if result is LeaseMutation.REFUSED:
+        print(
+            f'{verb} {name} refused: held by {holder_facts}, not by {slug} '
+            f'— inspect with `lease-show --name {name}`'
+        )
+    else:
+        print(f'{verb} {name} FORCED by {slug} over holder {holder_facts}')
 
 
-def _run_lease_release(name: str) -> None:
-    release_lease(name)
+def _run_lease_heartbeat(name: str, slug: str, force: bool = False) -> None:
+    _run_lease_mutation(
+        'lease-heartbeat',
+        name,
+        slug,
+        force,
+        lambda: heartbeat_lease(name, slug=slug, force=force),
+    )
+
+
+def _run_lease_release(name: str, slug: str, force: bool = False) -> None:
+    _run_lease_mutation(
+        'lease-release',
+        name,
+        slug,
+        force,
+        lambda: release_lease(name, slug=slug, force=force),
+    )
 
 
 def _run_lease_reap() -> list[ReapedLease]:
@@ -2804,6 +2856,23 @@ def _build_parser() -> argparse.ArgumentParser:
     lease_release_p = sub.add_parser('lease-release', help='release a held lease')
     lease_release_p.add_argument('--name', required=True)
 
+    # Ownership (task 3994): both MUTATING verbs require the claiming slug.
+    # required=True is deliberate -- a silent no-slug fallback would preserve
+    # the "any caller may evict/refresh any lease" defect indefinitely, since
+    # nothing would ever force the call sites to change. A stale invocation
+    # now fails to ACT rather than succeeding at evicting a live holder.
+    for _lease_mutation_p in (lease_heartbeat_p, lease_release_p):
+        _lease_mutation_p.add_argument(
+            '--slug',
+            required=True,
+            help='the slug you claimed this lease with; a mismatch is refused',
+        )
+        _lease_mutation_p.add_argument(
+            '--force',
+            action='store_true',
+            help='operator recovery: act even when you are not the holder; logged loudly',
+        )
+
     sub.add_parser('lease-reap', help='sweep and remove stale leases')
 
     write_decision_p = sub.add_parser(
@@ -2865,9 +2934,9 @@ def main(argv: list[str] | None = None) -> int:
         elif args.verb == 'lease-claim':
             _run_lease_claim(args.name, args.slug, args.pid, args.policy)
         elif args.verb == 'lease-heartbeat':
-            _run_lease_heartbeat(args.name)
+            _run_lease_heartbeat(args.name, args.slug, args.force)
         elif args.verb == 'lease-release':
-            _run_lease_release(args.name)
+            _run_lease_release(args.name, args.slug, args.force)
         elif args.verb == 'lease-reap':
             _run_lease_reap()
         elif args.verb == 'write-decision':
