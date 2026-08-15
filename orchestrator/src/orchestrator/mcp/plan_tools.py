@@ -693,7 +693,7 @@ def _target_file_mode(target: Path) -> int:
     """
     try:
         return stat.S_IMODE(target.stat().st_mode)
-    except FileNotFoundError:
+    except OSError:
         current = os.umask(0)
         os.umask(current)
         return 0o666 & ~current

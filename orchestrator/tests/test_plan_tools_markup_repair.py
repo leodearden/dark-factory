@@ -1731,28 +1731,24 @@ class TestAtomicWritePlan:
         other test in this file green — this is the test that catches it.
         """
         target = plan_dir / 'plan.json'
+        real_stat = Path.stat
 
-        def boom(self):
-            raise OSError(errno.EACCES, 'Permission denied')
+        # Scoped to *target* — falling back to the REAL stat() for every other
+        # path — rather than raising unconditionally, mirroring the same
+        # Path.stat patch idiom already used in test_session_registry.py and
+        # test_crash_recovery.py. A blanket raise would also break this
+        # module's autouse _no_mock_derived_stray_dirs conftest fixture, whose
+        # teardown itself calls Path.stat() (via Path.exists()) on an
+        # unrelated path.
+        def boom(self, *args, **kwargs):
+            if self == target:
+                raise OSError(errno.EACCES, 'Permission denied')
+            return real_stat(self, *args, **kwargs)
 
         monkeypatch.setattr(Path, 'stat', boom)
-        try:
-            with pytest.raises(OSError) as excinfo:
-                plan_tools._target_file_mode(target)
-        finally:
-            # Undo the class-wide patch explicitly, BEFORE returning, rather
-            # than leaving it to monkeypatch's own automatic teardown: this
-            # module's autouse _no_mock_derived_stray_dirs fixture
-            # (conftest.py) also calls Path.stat() (via Path.exists()) in ITS
-            # teardown, which this file's fixture ordering runs BEFORE
-            # monkeypatch's — so an undo left to the automatic teardown would
-            # still be patched when that fixture's teardown runs, and it does
-            # not expect stat()'s real signature. In a `finally` so a raising
-            # `pytest.raises` (e.g. this test itself failing) still restores
-            # the real `stat` rather than taking pytest's own traceback
-            # machinery down with it — `boom`'s signature doesn't accept the
-            # `follow_symlinks` kwarg real callers pass.
-            monkeypatch.undo()
+
+        with pytest.raises(OSError) as excinfo:
+            plan_tools._target_file_mode(target)
 
         assert excinfo.value.errno == errno.EACCES, (
             '_target_file_mode must swallow ONLY FileNotFoundError; any other '
