@@ -104,13 +104,18 @@ a supervised, always-on rotation rather than a single-owner actor. The lease nam
 `ps -o comm= -p "${CLAUDE_PID:-$PPID}"`, which prints `claude`. A `$$` pid makes the liveness guard
 inert, and a `$$` slug differs on every tool call, so your own later heartbeat/release would be
 refused. `--pid` is optional (the CLI resolves it from `$CLAUDE_PID`) and is an operator override
-only.
+only. With `$CLAUDE_PID` unset the CLI records **pid 0**, a never-alive sentinel that degrades the
+lease to heartbeat-only staleness (loudly logged) rather than recording an unrelated durable pid that
+would make the lease unreapable forever; pass `--pid "$PPID"` if you want the body's pid to match the
+one in your slug.
 
 Parse the printed lines: `decision=<acquired|stand-down|proceed>`, a human-readable message, then
-`holder_liveness=<held|orphaned>`.
+`holder_liveness=<none|held|orphaned>`.
 - **`decision=acquired` or `decision=proceed`**: continue into the Main Loop. `proceed` is the
   fail-open outcome — a lease-substrate fault is logged loudly and reported as `proceed`, never a
-  false `stand-down`, so a lease fault can never block the only consumer of this queue.
+  false `stand-down`, so a lease fault can never block the only consumer of this queue. An acquired
+  claim prints `holder_liveness=none` (no contending holder — it is yours); a faulted `proceed`
+  prints no `holder_liveness` line at all, because nothing is known about a holder.
 - **`decision=stand-down` + `holder_liveness=held`**: another recon watcher is live. Print the
   message verbatim and **exit immediately** — do not drain, do not start the watcher.
 - **`decision=stand-down` + `holder_liveness=orphaned`**: the pid recorded in the lease body is not
@@ -161,7 +166,8 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lea
 ```
 
 Both print `result=<applied|forced|absent|refused|faulted>` first: `applied` = done; `absent` = no
-such lease (idempotent); `refused` = you are not the holder and **nothing happened** — inspect with
+such lease — plain idempotence on a *release*, but a real condition on a *heartbeat* (see "Lease
+heartbeat (each cycle)" below); `refused` = you are not the holder and **nothing happened** — inspect with
 `lease-show --name recon-watcher-<project>` rather than reflexively re-running with `--force`
 (operator recovery only, logged loudly naming both parties); `faulted` = a substrate error, logged
 and swallowed. Use `lease-show`, never `cat`: the body carries an immutable `start_ts` and cannot
@@ -241,6 +247,13 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lea
 
 `result=refused` means your heartbeat did **not** land (you are not the holder) — investigate with
 `lease-show`, don't re-run with `--force`.
+
+**`result=absent` on a heartbeat means your lease is GONE**, not that the call was a harmless no-op:
+it was reaped after a TTL lapse or force-released by an operator, and you are now draining the 8103
+queue **un-leased**, so a duplicate can claim `recon-watcher-<project>` freely. Re-run the
+`lease-claim` from "Claiming the Recon Watcher Lease" and obey its decision — `acquired` = carry on,
+`stand-down` = a live duplicate holds it now, so print the message and exit rather than continuing as
+a second closer of the same queue.
 
 Run as a **background task** (`run_in_background`). `scripts/watcher-rearm.sh` is
 the canonical bounded-wait + re-arm wrapper around `escalation.watcher`, shared

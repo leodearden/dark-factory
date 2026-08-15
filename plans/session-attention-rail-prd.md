@@ -242,10 +242,14 @@ serialized by dependency, so no task starves on a lock). **T3 is the spine root.
   `result=<applied|forced|absent|refused|faulted>`; `--force` is the single, loudly-logged operator
   override. The contention signal also names its two axes separately (pid liveness vs heartbeat
   freshness) rather than the collapsed `(alive|dead, heartbeat Ns ago)` above, `lease-claim` appends
-  `holder_liveness=<held|orphaned>` — a **pid-liveness signal only**: the pid recorded in the lease
-  body is not running — so a stand-down for a holder that is gone *at the pid level* is surfaced
+  `holder_liveness=<none|held|orphaned>` — a **pid-liveness signal only**: `orphaned` = the pid
+  recorded in the lease body is not running, `none` = the claim was acquired and there is no
+  contending holder — so a stand-down for a holder that is gone *at the pid level* is surfaced
   rather than honoured silently, and the read-only `lease-show` verb prints holder/liveness/
-  freshness/reclaimability instead of `cat` + `stat -c %y`. A second corroborating signal (the
+  freshness/reclaimability instead of `cat` + `stat -c %y`. The pid the guard reads is resolved by
+  `resolve_session_pid` (`$CLAUDE_PID`, never `$$`), whose degraded fallback is **0** — never-alive
+  by construction — so an unresolvable session pid degrades the lease to heartbeat-only staleness
+  rather than to a lease no reaper can ever collect. A second corroborating signal (the
   holder's own session-registry record) was designed, then measured **structurally impossible** —
   the skill-prescribed lease slug `<role>-<project>-<pid>` is a claimant-chosen ownership token, not
   a session-registry record key, so the lookup always missed and the field was a constant — and was

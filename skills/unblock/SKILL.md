@@ -51,11 +51,13 @@ guard inert (every holder reads as dead), and a `$$` slug is unusable as an iden
 Bash tool call gets a fresh one — so the release below would present a slug that never matches what
 you claimed with, and be refused. `${CLAUDE_PID:-$PPID}` is stable across tool calls (task 3994).
 `--pid` is now optional and resolves from `$CLAUDE_PID` inside the CLI; pass it only as an explicit
-operator override.
+operator override. With `$CLAUDE_PID` unset the CLI records **pid 0**, a never-alive sentinel that
+degrades the lease to heartbeat-only staleness (loudly logged) instead of recording an unrelated
+durable pid that would leave the lease unreapable forever.
 
 (`<project>` is the same short project token used elsewhere for this task, e.g. the basename of
 `PROJECT_ROOT`.) Parse the printed lines (`decision=<acquired|proceed>`, message, then
-`holder_liveness=<held|orphaned>`):
+`holder_liveness=<none|held|orphaned>`):
 
 - **`decision=proceed` with a holder reported in the message**: surface that line verbatim to the
   user — this is exactly the near-duplicate second-`/unblock`-on-the-same-task case (reify 06-28) —
@@ -73,7 +75,8 @@ operator override.
   the pid half on its own — the pid in the lease body is not running, and that is the whole signal —
   worth mentioning to the user, but it changes nothing here: `warn-and-proceed` continues either
   way, and you never force-release someone else's lease to "clean up".
-- **`decision=acquired`**: no prior holder; continue normally.
+- **`decision=acquired`**: no prior holder; continue normally. It prints `holder_liveness=none` —
+  there is no contending holder to report, the lease is yours.
 
 To inspect a lease, use `lease-show --name "unblock-<project>#<TASK_ID>"` — never `cat`, which shows
 the holder's immutable `start_ts` but cannot show freshness (the heartbeat is the file's mtime).

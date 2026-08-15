@@ -67,12 +67,18 @@ works as the slug.
 
 `--pid` is now **optional**: omitted, the CLI resolves it from `$CLAUDE_PID` itself, so the correct
 pid no longer depends on this document getting one shell token right. Pass `--pid <n>` only as a
-deliberate operator override.
+deliberate operator override. If `$CLAUDE_PID` is unset the CLI records **pid 0** — a sentinel that
+reads as never-alive, so the lease degrades to heartbeat-only staleness (loudly logged) rather than
+recording some other durable-but-unrelated pid that would make the lease unreapable forever. On that
+path the body's pid won't match the `$PPID` in your slug; pass `--pid "$PPID"` explicitly if you want
+the two to agree.
 
 Parse the printed lines: `decision=<acquired|stand-down|proceed>`, a human-readable message, then
-`holder_liveness=<held|orphaned>`.
+`holder_liveness=<none|held|orphaned>`.
 - **`decision=acquired` or `decision=proceed`**: continue into the Main Loop below. `proceed` is the
-  fail-open outcome (see below) and is handled identically to `acquired`.
+  fail-open outcome (see below) and is handled identically to `acquired`. An acquired claim prints
+  `holder_liveness=none` — there is no contending holder, the lease is yours; a faulted (`proceed`)
+  claim prints no `holder_liveness` line at all, because nothing is known about a holder.
 - **`decision=stand-down` + `holder_liveness=held`**: print the message verbatim and **exit
   immediately** — do not start the watcher, do not drain.
 - **`decision=stand-down` + `holder_liveness=orphaned`**: the pid recorded in the lease body is not
@@ -143,8 +149,10 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lea
 ```
 
 Both print `result=<applied|forced|absent|refused|faulted>` as their first line:
-- **`applied`** — you are the holder and the mutation happened. **`absent`** — no such lease;
-  releasing an already-released lease is idempotent, not an error.
+- **`applied`** — you are the holder and the mutation happened.
+- **`absent`** — no such lease. On a **release** that is plain idempotence, not an error. On a
+  **heartbeat** it is a real condition and must not be ignored — see "Lease heartbeat (each cycle)"
+  below.
 - **`refused`** — you are **not** the holder; nothing was touched. Do not re-run with `--force`
   reflexively: inspect first with `lease-show` (below). A refusal usually means your slug drifted
   (see `$$` above) or another session legitimately holds it.
@@ -289,6 +297,13 @@ there is no need to separately pgrep/ps-tree for other watcher processes. `--slu
 slug you claimed with; `result=refused` means you are not the holder and your heartbeat did **not**
 land — investigate with `lease-show` (see "Claiming the Watcher Lease" above) rather than repeating
 the call with `--force`.
+
+**`result=absent` on a heartbeat is not idempotence — it means your lease is GONE** (reaped after a
+TTL lapse, or force-released by an operator). You are now running **un-leased**: a duplicate watcher
+can claim `watcher-<project>` freely, which is the exact condition this lease exists to prevent. Do
+not keep beating into the void — re-run the `lease-claim` from "Claiming the Watcher Lease" above and
+follow its decision: `acquired` (you have it back, carry on) or `stand-down` (a live duplicate now
+holds it — print the message and exit, do not run a second watch loop against the same project).
 
 ### When the watcher fires
 

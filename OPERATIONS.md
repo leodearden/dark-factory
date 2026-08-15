@@ -246,17 +246,31 @@ lease. A lease is stale only when the holder pid is dead **and** the heartbeat
 is past `LEASE_HEARTBEAT_TTL` (2h); a live holder is never reclaimable however
 quiet it has been.
 
-`lease-claim`'s `holder_liveness=<held|orphaned>` line is a **pid check only**
-— `orphaned` means the pid recorded in the lease body is not running, nothing
-more. Treat it as one diagnostic, never as grounds to force-release on its
-own: a quiet-but-live holder that reads as dead is the duplicate-spawn
-incident.
+`lease-claim`'s `holder_liveness=<none|held|orphaned>` line is a **pid check
+only** — `orphaned` means the pid recorded in the lease body is not running,
+nothing more; `none` means the claim was acquired and there is no contending
+holder at all. Treat `orphaned` as one diagnostic, never as grounds to
+force-release on its own: a quiet-but-live holder that reads as dead is the
+duplicate-spawn incident.
+
+A holder whose lease body says `holder_pid=0` claimed it on the **degraded**
+pid path (`$CLAUDE_PID` unset — the CLI records 0, a never-alive sentinel, and
+logs a WARNING). Such a lease is protected only by its heartbeat and always
+reads `orphaned`; that is deliberate, because recording some other durable pid
+(the shell) instead would make it unreapable forever.
 
 `lease-heartbeat` and `lease-release` require the `--slug` the lease was
 claimed with and **refuse** on a mismatch (`result=refused`, nothing touched),
 so no session can evict another's lease or keep a stranger's alive. `--force`
 is the deliberate operator-recovery override: it acts anyway and logs at
 WARNING naming both the forcing slug and the displaced holder.
+
+`result=absent` differs by verb: on a **release** it is plain idempotence, but
+on a **heartbeat** it means that session's lease is gone (reaped, or
+force-released by you) and the session is now running un-leased — a duplicate
+can claim the name freely. Both watcher skills tell a heartbeating session to
+re-claim on `absent` rather than continue; if you force-release a live
+watcher's lease, expect it to re-claim on its next cycle.
 
 **Rollout note (task 3994).** Any watcher session already running on the
 pre-3994 prescription must be **restarted** so it re-reads its skill: its
