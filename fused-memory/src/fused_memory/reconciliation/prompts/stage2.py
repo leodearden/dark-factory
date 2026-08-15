@@ -318,17 +318,18 @@ structured `stats` output (omitting them causes Stage 3's flag-accounting audit 
 report ambiguous or missing data):
 - `flag_deleted_records`: list of `{{"action": "flag_deleted", "flag_id": ..., \
   "reason": "processed"}}` dicts, one per successful FIX C deletion. The framework \
-  counts this list as the ground-truth source for `stage1_mem0_flags_processed` and \
-  clamps the counter when the two disagree.
+  joins this list against this run's rendered flags (on `flag_id`) to acknowledge \
+  the originating Stage 1 flag marker — a deletion with no matching record leaves \
+  that marker un-acknowledged (see `_acknowledge_resolved_stage1_markers`).
 - `stage1_mem0_flags_processed`: count of Mem0 `flag_for_stage2=true` markers that \
   you processed and deleted via FIX C during this cycle. Must equal \
   `len(flag_deleted_records)`. Set to 0 if no Mem0 markers were present this cycle.
 - `stage1_analytical_findings_processed`: count of Stage 1's structured \
   `flagged_items` (analytical findings) that you reviewed this cycle. This equals \
   the number of items from the "Stage 1 Flagged Items" section that you acted on \
-  (including no-action notes). The framework clamps this value against \
-  `len(prior_reports[0].items_flagged)` to catch under-counting. Set to 0 if \
-  Stage 1 emitted no flagged_items.
+  (including no-action notes). This value is purely self-reported — the framework \
+  applies no cross-check or correction to it, so its accuracy is on you. Set to 0 \
+  if Stage 1 emitted no flagged_items.
 - `task_created_records`: list of `{{"action": "task_created", "task_id": ..., \
   "status": "created"|"combined", "project_id": ..., "source_path": ...}}` dicts, \
   one per confirmed task creation (see `## Task-Creation Accounting` below). The \
