@@ -300,13 +300,13 @@ MERGE_PHASE_TRUE_ALLOWLIST: frozenset[tuple[str, str]] = frozenset({
 
 _ALLOWLIST_HINT = (
     'A new merge_phase=True call site must be added to '
-    'MERGE_PHASE_TRUE_ALLOWLIST with a {marker} comment in the enclosing '
-    'function explaining why suppressing the ENTRY status transition is safe '
-    'there — i.e. that the caller keeps a LIVE claimant and retries in-slot, '
-    'never that it exits the slot with the row left in-progress. '
+    f'MERGE_PHASE_TRUE_ALLOWLIST with a {RATIONALE_MARKER} comment in the '
+    'enclosing function explaining why suppressing the ENTRY status transition '
+    'is safe there — i.e. that the caller keeps a LIVE claimant and retries '
+    'in-slot, never that it exits the slot with the row left in-progress. '
     'See spec §8-E2 / INV-6 and the MERGE_PHASE_RATIONALE paragraph in '
     '_mark_blocked.'
-).format(marker=RATIONALE_MARKER)
+)
 
 
 class _MergePhaseTrueCollector(ast.NodeVisitor):

@@ -2419,9 +2419,9 @@ class TestWipRecoveryNoAdvance:
 
         # INV-6 (status-matches-liveness): the slot is freed, so the row must
         # be parked rather than left in-progress with no claimant.
-        assert 'blocked' in workflow.scheduler.statuses.get('42', []), (
+        assert 'blocked' in scheduler.statuses.get('42', []), (
             'the BLOCKED exit must write the task row: got '
-            f'{workflow.scheduler.statuses.get("42", [])!r}'
+            f'{scheduler.statuses.get("42", [])!r}'
         )
 
         wip_escs = [e for e in queue.get_by_task('42') if e.category == 'wip_conflict']
