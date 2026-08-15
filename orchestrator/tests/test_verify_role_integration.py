@@ -55,7 +55,7 @@ from pathlib import Path
 from typing import Literal
 
 import pytest
-from shared.reify_checkout import REIFY_ROOT_ENV, reify_skip_reason, resolve_reify_root
+from shared.reify_checkout import REIFY_ROOT_ENV, reify_skip_reason, resolve_reify_checkout
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.verify import _resolve_verify_env
@@ -72,7 +72,11 @@ from orchestrator.verify import _resolve_verify_env
 # ---------------------------------------------------------------------------
 
 _REIFY_VERIFY_RELPATH = Path("scripts") / "verify.sh"
-REIFY_ROOT: Path | None = resolve_reify_root(_REIFY_VERIFY_RELPATH, start=Path(__file__))
+# One resolution, carrying both the root and WHERE it came from — the skip
+# reason below is formatted from this same result, so it can never blame
+# REIFY_ROOT for a path that was actually discovered.
+_REIFY_CHECKOUT = resolve_reify_checkout(_REIFY_VERIFY_RELPATH, start=Path(__file__))
+REIFY_ROOT: Path | None = _REIFY_CHECKOUT.root
 REIFY_VERIFY_SH: Path | None = (
     REIFY_ROOT / _REIFY_VERIFY_RELPATH if REIFY_ROOT is not None else None
 )
@@ -84,7 +88,9 @@ REIFY_VERIFY_SH: Path | None = (
 # nice/ionice.  Splitting also names WHICH of the three causes fired — the old
 # single reason string conflated reify-absent, nice-absent and ionice-absent, so
 # an operator reading `pytest -rs` could not tell them apart.
-_REIFY_SKIP_REASON: str | None = reify_skip_reason(_REIFY_VERIFY_RELPATH, REIFY_ROOT)
+_REIFY_SKIP_REASON: str | None = reify_skip_reason(
+    _REIFY_VERIFY_RELPATH, REIFY_ROOT, named_by_env=_REIFY_CHECKOUT.named_by_env
+)
 _MISSING_TOOLS = [t for t in ("nice", "ionice") if shutil.which(t) is None]
 _TOOL_SKIP_REASON: str | None = (
     f"{'/'.join(_MISSING_TOOLS)} unavailable — reify verify.sh degrades its "

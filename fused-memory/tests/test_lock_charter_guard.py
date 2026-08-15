@@ -43,7 +43,7 @@ def _resolve_reify_root(start: Path | None = None) -> Path | None:
     discovery order, REIFY_ROOT precedence, the measured worktree-vs-bare-
     checkout evidence table (and why "change parents[5] to parents[3]" is a
     REGRESSION rather than a fix), and why an override absent on disk is
-    honored VERBATIM — lives in `shared.reify_checkout.resolve_reify_root`.
+    honored VERBATIM — lives in `shared.reify_checkout.resolve_reify_checkout`.
     Do not restate or re-derive them here, and do not reintroduce a local copy
     of the ancestor walk.
 
@@ -58,11 +58,12 @@ def _resolve_reify_root(start: Path | None = None) -> Path | None:
     TestResolveReifyRoot cases below do; they never touch the constants).
     """
     # Called through the module attribute on purpose: the delegation pin in
-    # TestResolveReifyRoot patches `reify_checkout.resolve_reify_root`, which a
-    # `from ... import resolve_reify_root` binding would put out of its reach.
-    return reify_checkout.resolve_reify_root(
+    # TestResolveReifyRoot patches `reify_checkout.resolve_reify_checkout`,
+    # which a `from ... import resolve_reify_checkout` binding would put out of
+    # its reach.
+    return reify_checkout.resolve_reify_checkout(
         _REIFY_GUARD_RELPATH, start=start or Path(__file__)
-    )
+    ).root
 
 
 _LCG_LOGGER = 'fused_memory.middleware.lock_charter_guard'
@@ -370,13 +371,14 @@ class TestResolveReifyRoot:
         def _stub(marker, start=None):
             seen['marker'] = Path(marker)
             seen['start'] = start
-            return sentinel
+            return reify_checkout.ReifyCheckout(sentinel, False)
 
-        monkeypatch.setattr(reify_checkout, 'resolve_reify_root', _stub)
+        monkeypatch.setattr(reify_checkout, 'resolve_reify_checkout', _stub)
 
         assert _resolve_reify_root(start) == sentinel, (
-            'this module must DELEGATE to shared.reify_checkout.resolve_reify_root '
-            'rather than keep a private copy of the ancestor walk'
+            'this module must DELEGATE to '
+            'shared.reify_checkout.resolve_reify_checkout rather than keep a '
+            'private copy of the ancestor walk'
         )
         assert seen['marker'] == _REIFY_GUARD_RELPATH, (
             'the shared resolver must be bound to THIS call site marker '
