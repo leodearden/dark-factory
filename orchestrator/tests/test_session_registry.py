@@ -3352,6 +3352,154 @@ def test_reap_stale_leases_continues_sweep_when_one_removal_fails(
 
 
 # ---------------------------------------------------------------------------
+# lease_status / lease-show (task 3994 defect 3)
+#
+# `cat <lease>` CANNOT show freshness: the body carries an immutable
+# `start_ts` and the heartbeat lives only in the file mtime, so the archaeology
+# a human actually needs is `cat` + `stat -c %y` + a TTL comparison done by
+# hand. That is what misled the 2026-08-08 rotation. lease_status computes all
+# of it through the same _read_lease_holder_state claim_lease decides on --
+# one reader, one clock -- and lease-show prints it.
+# ---------------------------------------------------------------------------
+
+
+def _seed_lease(tmp_path: Path, *, slug: str = 'watcher-df-100', pid: int | None = None) -> Path:
+    """Claim `watcher-df` for *slug*/*pid* under tmp_path; return its lease path."""
+    holder = sr.LeaseHolder(
+        session_slug=slug, pid=os.getpid() if pid is None else pid, start_ts=_NOW.isoformat()
+    )
+    sr.claim_lease('watcher-df', holder=holder, root=tmp_path, now=_NOW)
+    return sr.lease_path_for_name('watcher-df', root=tmp_path)
+
+
+def test_lease_status_reports_the_holder_and_the_heartbeat_clock(tmp_path: Path) -> None:
+    path = _seed_lease(tmp_path)
+    _set_mtime(path, _NOW, timedelta(minutes=30))
+
+    status = sr.lease_status('watcher-df', root=tmp_path, now=_NOW)
+
+    assert status.name == 'watcher-df'
+    assert status.state == 'held'
+    assert status.holder_slug == 'watcher-df-100'
+    assert status.holder_pid == os.getpid()
+    assert status.holder_pid_alive is True
+    # Freshness is derived from the MTIME, the axis `cat` cannot show.
+    assert int(status.heartbeat_age_secs) == 1800
+    assert datetime.fromisoformat(status.heartbeat_ts).replace(microsecond=0) == _NOW - timedelta(
+        minutes=30
+    )
+    assert status.reclaimable is False
+    assert status.holder_session == 'absent'  # no session record was written
+
+
+def test_lease_status_heartbeat_age_tracks_the_mtime(tmp_path: Path) -> None:
+    path = _seed_lease(tmp_path)
+
+    for age in (timedelta(seconds=5), timedelta(minutes=17), timedelta(hours=3)):
+        _set_mtime(path, _NOW, age)
+        status = sr.lease_status('watcher-df', root=tmp_path, now=_NOW)
+        assert int(status.heartbeat_age_secs) == int(age.total_seconds())
+
+
+@pytest.mark.parametrize(
+    ('age', 'expected'),
+    [
+        (sr.LEASE_HEARTBEAT_TTL - timedelta(seconds=1), False),
+        (sr.LEASE_HEARTBEAT_TTL, False),
+        (sr.LEASE_HEARTBEAT_TTL + timedelta(seconds=1), True),
+    ],
+)
+def test_lease_status_reclaimable_flips_exactly_at_the_ttl_for_a_dead_pid(
+    tmp_path: Path, age: timedelta, expected: bool
+) -> None:
+    path = _seed_lease(tmp_path, pid=_DEAD_PID)
+    _set_mtime(path, _NOW, age)
+
+    status = sr.lease_status('watcher-df', root=tmp_path, now=_NOW)
+
+    assert status.holder_pid_alive is False
+    # Exactly claim_lease/reap_stale_leases' own predicate: staleness needs
+    # BOTH a dead pid AND a heartbeat STRICTLY past the TTL. The display and
+    # the decision cannot disagree, because they are the same computation.
+    assert status.reclaimable is expected
+
+
+def test_lease_status_never_reports_a_live_holder_reclaimable_at_any_age(tmp_path: Path) -> None:
+    path = _seed_lease(tmp_path)  # our own, provably-live, pid
+    _set_mtime(path, _NOW, timedelta(days=30))
+
+    status = sr.lease_status('watcher-df', root=tmp_path, now=_NOW)
+
+    assert status.holder_pid_alive is True
+    assert int(status.heartbeat_age_secs) == 30 * 24 * 3600
+    # A live holder is never reclaimable however quiet it has been -- the
+    # inverse reading is the duplicate-spawn incident.
+    assert status.reclaimable is False
+
+
+@pytest.mark.parametrize(
+    ('record_status', 'expected'),
+    [(sr.Status.RUNNING, 'live'), (sr.Status.EXITED, 'exited')],
+)
+def test_lease_status_reports_the_holders_own_session_state(
+    tmp_path: Path, record_status: sr.Status, expected: str
+) -> None:
+    _seed_lease(tmp_path, pid=_DEAD_PID)
+    sr.write_record(
+        _make_record(session_slug='watcher-df-100', status=record_status), root=tmp_path
+    )
+
+    status = sr.lease_status('watcher-df', root=tmp_path, now=_NOW)
+
+    assert status.holder_session == expected
+
+
+def test_lease_status_on_an_absent_lease_reports_state_absent(tmp_path: Path) -> None:
+    status = sr.lease_status('watcher-df', root=tmp_path, now=_NOW)
+
+    assert status.name == 'watcher-df'
+    assert status.state == 'absent'
+    assert status.holder_slug is None
+    assert status.holder_pid is None
+    assert status.holder_pid_alive is False
+    assert status.reclaimable is False
+
+
+def test_lease_status_on_a_corrupt_body_is_unreadable_but_still_dates_the_heartbeat(
+    tmp_path: Path,
+) -> None:
+    path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{not valid json')
+    _set_mtime(path, _NOW, timedelta(minutes=42))
+
+    status = sr.lease_status('watcher-df', root=tmp_path, now=_NOW)
+
+    # Fail-soft: an unreadable body is REPORTED, never raised, and never
+    # rendered as a fake holder -- but its freshness is still real, which is
+    # exactly what decides whether it is reapable.
+    assert status.state == 'unreadable'
+    assert status.holder_slug is None
+    assert status.holder_pid is None
+    assert int(status.heartbeat_age_secs) == 2520
+    assert status.holder_session == 'unknown'
+
+
+def test_lease_status_is_read_only(tmp_path: Path) -> None:
+    path = _seed_lease(tmp_path)
+    _set_mtime(path, _NOW, timedelta(hours=1))
+    mtime_before = path.stat().st_mtime
+    body_before = path.read_text()
+
+    sr.lease_status('watcher-df', root=tmp_path, now=_NOW)
+
+    # Inspecting a lease must never be a heartbeat: an operator running
+    # lease-show cannot be allowed to keep a dead holder's lease unreapable.
+    assert path.stat().st_mtime == mtime_before
+    assert path.read_text() == body_before
+
+
+# ---------------------------------------------------------------------------
 # CLI lease-* verbs + fail-open fail-soft
 # ---------------------------------------------------------------------------
 
@@ -3730,6 +3878,96 @@ def test_main_lease_mutating_verbs_report_absent(
 
     assert rc == 0
     assert capsys.readouterr().out.splitlines()[0] == 'result=absent'
+
+
+# --- CLI lease-show (task 3994 defect 3) ----------------------------------
+
+
+def _parse_kv(out: str) -> dict[str, str]:
+    """Parse lease-show's `key=value` lines -- the whole point of the verb."""
+    return dict(line.split('=', 1) for line in out.splitlines() if '=' in line)
+
+
+def test_main_lease_show_prints_machine_readable_fields_for_a_held_lease(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _claim_via_cli()
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    _set_mtime(lease_path, datetime.now(UTC), timedelta(hours=1))
+    capsys.readouterr()
+
+    rc = sr.main(['lease-show', '--name', 'watcher-df'])
+
+    assert rc == 0
+    fields = _parse_kv(capsys.readouterr().out)
+    assert fields['name'] == 'watcher-df'
+    assert fields['state'] == 'held'
+    assert fields['holder_slug'] == 'watcher-df-100'
+    assert fields['holder_pid'] == str(os.getpid())
+    assert fields['holder_pid_alive'] == 'true'
+    assert fields['reclaimable'] == 'false'
+    assert fields['holder_session'] == 'absent'
+    # The freshness clock `cat <lease>` cannot show, replacing `stat -c %y`.
+    assert abs(int(fields['heartbeat_age_secs']) - 3600) <= 5
+    assert datetime.fromisoformat(fields['heartbeat_ts']).tzinfo is not None
+
+
+def test_main_lease_show_reports_a_dead_and_expired_holder_reclaimable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _claim_via_cli(pid=_DEAD_PID)
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    _set_mtime(lease_path, datetime.now(UTC), sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1))
+    capsys.readouterr()
+
+    rc = sr.main(['lease-show', '--name', 'watcher-df'])
+
+    assert rc == 0
+    fields = _parse_kv(capsys.readouterr().out)
+    assert fields['holder_pid_alive'] == 'false'
+    assert fields['reclaimable'] == 'true'
+    assert fields['holder_session'] == 'absent'
+
+
+def test_main_lease_show_on_an_absent_lease_reports_state_absent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    rc = sr.main(['lease-show', '--name', 'watcher-df'])
+
+    assert rc == 0
+    assert 'state=absent' in capsys.readouterr().out.splitlines()
+
+
+def test_main_lease_show_on_a_corrupt_body_is_fail_soft(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    lease_path.parent.mkdir(parents=True, exist_ok=True)
+    lease_path.write_text('{not valid json')
+    _set_mtime(lease_path, datetime.now(UTC), timedelta(hours=1))
+
+    rc = sr.main(['lease-show', '--name', 'watcher-df'])
+
+    assert rc == 0
+    fields = _parse_kv(capsys.readouterr().out)
+    # Marks the body unreadable rather than asserting a fake holder -- and
+    # still reports a REAL heartbeat age, the axis that decides reapability.
+    assert fields['state'] == 'unreadable'
+    assert abs(int(fields['heartbeat_age_secs']) - 3600) <= 5
+    assert lease_path.is_file()  # read-only: inspection never reaps
 
 
 def test_main_lease_reap_removes_a_stale_lease(
