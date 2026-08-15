@@ -65,9 +65,23 @@ for _p in (str(_REPO_ROOT / 'scripts'), str(_REPO_ROOT / 'scripts' / 'legibility
     if _p not in sys.path:
         sys.path.append(_p)
 
-import census  # noqa: E402  — needs the sys.path setup above
-import check_transcript_persistence  # noqa: E402
-import nightly  # noqa: E402
+# The `# type: ignore[reportMissingImports]` is not a defect being papered over:
+# these resolve at RUNTIME via the `sys.path.append` above, but pyright is
+# invoked from escalation/ (`uv run --project escalation --directory escalation
+# pyright src/ tests/`), whose `[tool.pyright] extraPaths` cannot see repo-root
+# scripts/. The idiom is the repo's established one for a cross-package consumer
+# of legibility scripts -- see shared/tests/toolcall_markup_corpus_extract.py and
+# fused-memory/scripts/memory_eval_transcript_corpus.py, which carry it verbatim.
+#
+# Deliberately NOT fixed by adding scripts/ + scripts/legibility to escalation's
+# extraPaths: that resolves these four names by putting the flat, very generic
+# legibility module names (`config`, `inventory`, `sampling`, `digest`, `coder`,
+# `codebook`) on pyright's search path for ALL ~1080 tests in this suite -- the
+# same suite-wide shadowing hazard the module docstring above rejects for the
+# runtime path, merely moved from import time to type-check time.
+import census  # type: ignore[reportMissingImports]  # noqa: E402  — needs the sys.path setup above
+import check_transcript_persistence  # type: ignore[reportMissingImports]  # noqa: E402
+import nightly  # type: ignore[reportMissingImports]  # noqa: E402
 import pytest  # noqa: E402
 
 _RAISED_MESSAGE = 'codebook merge produced an invalid codebook'
@@ -320,7 +334,7 @@ def test_the_transport_releases_its_session_on_the_real_server(
     require the server to reject it as unknown.
     """
     import httpx
-    from legibility import census_trigger
+    from legibility import census_trigger  # type: ignore[reportMissingImports]
 
     base_url, port, _queue = serve_escalation_mcp(tmp_path / 'queue')
     cfg = _live_cfg(tmp_path, port)
