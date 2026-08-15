@@ -5024,7 +5024,19 @@ def create_mcp_server(
         # rather than to the deleted memory id, and it does not close this gap.
         confirmed_gone = [i for i in deleted if i not in set(survivors)]
         tombstones_written = 0
-        if confirmed_gone:
+        # `run_id` is a non-blank str whenever `supersedes` was non-empty —
+        # `validate_consolidate_args` refuses the whole op otherwise — and
+        # `confirmed_gone` is a subset of `deleted`, itself a subset of
+        # `supersedes`. So this can only be None if that entry gate is ever
+        # removed. It is restated for the writer (which requires a `str`)
+        # rather than papered over with `run_id or ''`: an empty
+        # `deleting_run_id` would mint tombstones answering "who deleted
+        # this?" with silence, which is the conflation the gate exists to
+        # prevent. A violation therefore SKIPS the write and is disclosed as
+        # a shortfall below — never guessed at, and never able to fail a
+        # consolidation that already completed.
+        deleting_run_id = run_id if isinstance(run_id, str) and run_id.strip() else None
+        if confirmed_gone and deleting_run_id is not None:
             try:
                 # BATCH form, as both prod sweeps use: one upsert_many, one
                 # commit, one fsync, all-or-nothing. A consolidation set is a
@@ -5038,7 +5050,7 @@ def create_mcp_server(
                     # from each victim's own `metadata.run_id` naming the run
                     # that WROTE it. Required at validation time precisely so
                     # this call can never be made without it.
-                    deleting_run_id=run_id,
+                    deleting_run_id=deleting_run_id,
                     # The REVERSE pointer (task 3133): the survivor id that
                     # absorbed them, which is what makes "where did its
                     # content go?" answerable from the DEAD id alone.
@@ -5057,6 +5069,17 @@ def create_mcp_server(
                     exc_info=True,
                     extra={'project_id': project_id, 'run_id': run_id},
                 )
+        elif confirmed_gone:
+            # Unreachable while the entry gate stands; loud rather than silent
+            # if it ever does not, because the alternative is a durable audit
+            # row that cannot say which run did the killing.
+            logger.error(
+                'consolidate_memories: %d record(s) confirmed gone but no '
+                'auditable run_id reached the tombstone writer; refusing to '
+                'stamp an empty `deleting_run_id` (reported as a shortfall)',
+                len(confirmed_gone),
+                extra={'project_id': project_id, 'run_id': run_id},
+            )
         if tombstones_written < len(confirmed_gone):
             # Visible in the logs as well as in the envelope, matching the
             # sweeps' degradation style.

@@ -147,6 +147,10 @@ def make_service(
     reads_seen: dict[str, int] = {}
 
     async def _get(project_id=None, memory_id=None, **_):
+        # The double asserts its own contract: every read the op issues names
+        # a concrete id. A read with no id would otherwise key this ledger on
+        # `None` and quietly answer a question about the wrong record.
+        assert isinstance(memory_id, str), 'the op must name the id it reads'
         log.append(('read', memory_id))
         seen = reads_seen.get(memory_id, 0)
         reads_seen[memory_id] = seen + 1
@@ -172,6 +176,9 @@ def make_service(
     moved: set[str] = set()
 
     async def _update(memory_id=None, **kwargs):
+        # Same contract as `_get`: a patch with no id must fail loudly here
+        # rather than register an un-named record as successfully re-homed.
+        assert isinstance(memory_id, str), 'the op must name the id it patches'
         log.append(('update_memory', memory_id))
         if memory_id in update_errors:
             return update_errors[memory_id]
@@ -827,7 +834,13 @@ class TestClosureIsCorroboratedNeverClaimed:
         last_delete = max(
             i for i, (kind, _) in enumerate(events) if kind == 'delete_memory'
         )
-        after = [mid for kind, mid in events[last_delete + 1:] if kind == 'read']
+        # An un-named read is dropped rather than compared, and the equality
+        # below is what makes that loud: a missing id shortens the list.
+        after = [
+            mid
+            for kind, mid in events[last_delete + 1:]
+            if kind == 'read' and mid is not None
+        ]
         assert sorted(after) == sorted(SUPERSEDES)
 
     @pytest.mark.asyncio
@@ -1266,6 +1279,7 @@ class TestTheDeleteArmStampsATombstone:
             await call_consolidate(svc)
 
         writer.assert_awaited_once()
+        assert writer.await_args is not None
         args, kwargs = writer.await_args
         assert args[1] == PROJECT_ID
         assert kwargs['deleter'] == 'consolidate_memories'
@@ -1309,6 +1323,7 @@ class TestTheDeleteArmStampsATombstone:
         with patched_tombstone_writer() as writer:
             result = await call_consolidate(svc)
 
+        assert writer.await_args is not None
         [victim] = writer.await_args.args[2]
         assert victim['id'] == S1
         assert [f['id'] for f in result['failed_deletes']] == [S2]
@@ -1448,4 +1463,5 @@ class TestATombstoneShortfallIsDisclosed:
 
         assert result['tombstones_expected'] == 1
         assert result['tombstones_written'] == 1
+        assert writer.await_args is not None
         assert len(writer.await_args.args[2]) == 1

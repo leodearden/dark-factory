@@ -129,6 +129,7 @@ class TestTopic:
         re-derive a regex that already has a single home.
         """
         err, _, _ = _call(topic='memory_consolidation')
+        assert err is not None
 
         text = err['error'] + err.get('hint', '')
         assert 'fused_memory.topic_slug' in text
@@ -167,6 +168,7 @@ class TestIdShapes:
 
     def test_id_error_carries_the_resolve_the_full_uuid_hint(self):
         err, _, _ = _call(supersedes=['873889a1'])
+        assert err is not None
 
         assert 'get_memory_by_id' in err.get('hint', '')
 
@@ -207,6 +209,7 @@ class TestArmOverlap:
 
     def test_every_overlapping_id_is_named(self):
         err, _, _ = _call(supersedes=[_A, _B], retain=[_A, _B])
+        assert err is not None
 
         assert _A in err['error']
         assert _B in err['error']
@@ -233,6 +236,7 @@ class TestDeleteArmRequiresRunId:
 
     def test_the_refusal_explains_that_the_delete_would_be_unattributable(self):
         err, _, _ = _call(run_id=None)
+        assert err is not None
 
         text = err['error'] + err.get('hint', '')
         assert 'deleting_run_id' in text
@@ -249,6 +253,7 @@ class TestDeleteArmRequiresRunId:
     def test_the_run_id_check_is_refused_alongside_other_offenders(self):
         """It is a collected violation, not a separate early gate."""
         err, _, _ = _call(supersedes=['873889a1'], run_id=None)
+        assert err is not None
 
         assert '873889a1' in err['error']
         assert 'run_id' in err['error']
