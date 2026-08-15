@@ -16,6 +16,7 @@ money and no real token is ever written.  They are deliberately unmarked (no
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 from pathlib import Path
 from typing import IO, Any
@@ -23,6 +24,8 @@ from typing import IO, Any
 import pytest
 import startup_completion_fixtures as scf
 import startup_completion_probe as probe
+
+from shared.config_dir import _PID_SUFFIX_RE, CONFIG_DIR_PREFIX
 
 #: A long base64url run: 70 chars, no ``/`` neighbours, so it trips
 #: ``GENERIC_CREDENTIAL_PATTERNS`` exactly as a raw pasted token would.
@@ -602,4 +605,99 @@ class TestConfigDirLifetime:
         config_path = probe_recorder.configs[-1].path
         assert config_path.exists(), (
             f'--keep-config-dir was ignored on the failure path: {config_path} is gone'
+        )
+
+
+@pytest.fixture
+def sweep_calls(monkeypatch, probe_recorder) -> list[str]:
+    """Record ``sweep_stale_pid_dirs`` calls and reset the once-per-process flag.
+
+    The reset matters: without it the flag's value would depend on whether an
+    earlier test in this process already consumed it, and these tests would pass
+    or fail by ordering rather than by behaviour.
+    """
+    calls: list[str] = []
+
+    def _recording_sweep(prefix: str) -> int:
+        calls.append(prefix)
+        return 0
+
+    monkeypatch.setattr(probe, '_probe_dir_sweep_done', False, raising=False)
+    monkeypatch.setattr(probe, 'sweep_stale_pid_dirs', _recording_sweep, raising=False)
+    return calls
+
+
+class TestStaleProbeDirSweep:
+    """Nothing reclaims a ``startup-probe-`` dir left behind by a SIGKILLed run.
+
+    ``atexit`` covers a clean exit and the ``finally`` covers a raise, but no
+    hook survives SIGKILL — and a killed probe leaves a 0600 ``.credentials.json``
+    holding a live OAuth token in /tmp forever.  ``sweep_stale_pid_dirs`` exists
+    for exactly this and is called in production, but it is PREFIX-SCOPED by
+    contract and its only caller (``usage_gate``) sweeps ``usage-gate-probe-``,
+    so it never touches this probe's dirs.
+
+    Mirrors ``usage_gate._sweep_stale_probe_dirs_once``'s shape rather than
+    inventing one: same constant pair, same once-per-process flag set BEFORE the
+    call, same never-raise contract.
+    """
+
+    def test_swept_prefix_and_created_names_are_the_same_string(self):
+        # Not a tautology: it pins that the sweep key is DERIVED from the task-id
+        # stem rather than retyped, which is how the two silently drift apart.
+        assert probe._PROBE_DIR_PREFIX == CONFIG_DIR_PREFIX + probe._PROBE_TASK_ID_PREFIX
+
+    def test_created_dir_name_is_attributable_to_this_pid(
+        self, probe_recorder, monkeypatch, tmp_path
+    ):
+        exc_type = _inject('build_argv', monkeypatch, probe_recorder)
+        with pytest.raises(exc_type, match='injected'):
+            _run_probe(tmp_path)
+        name = probe_recorder.configs[-1].path.name
+        assert name.startswith(probe._PROBE_DIR_PREFIX), (
+            f'{name!r} is outside the swept prefix, so the sweep can never reclaim it'
+        )
+        match = _PID_SUFFIX_RE.search(name)
+        assert match is not None, (
+            f'{name!r} has no -<pid> suffix, so sweep_stale_pid_dirs treats it as '
+            'unattributable and deliberately leaves it alone'
+        )
+        assert match.group(1) == str(os.getpid())
+
+    def test_run_live_probe_sweeps_once_with_the_probe_prefix(
+        self, probe_recorder, sweep_calls, monkeypatch, tmp_path
+    ):
+        exc_type = _inject('build_argv', monkeypatch, probe_recorder)
+        with pytest.raises(exc_type, match='injected'):
+            _run_probe(tmp_path)
+        assert sweep_calls == [probe._PROBE_DIR_PREFIX]
+
+    def test_the_sweep_is_once_per_process(
+        self, probe_recorder, sweep_calls, monkeypatch, tmp_path
+    ):
+        exc_type = _inject('build_argv', monkeypatch, probe_recorder)
+        for _ in range(2):
+            with pytest.raises(exc_type, match='injected'):
+                _run_probe(tmp_path)
+        # The sweep reclaims OTHER (dead) processes' leftovers, so re-running it
+        # per probe re-scans /tmp for no benefit.
+        assert sweep_calls == [probe._PROBE_DIR_PREFIX]
+
+    def test_a_raising_sweep_does_not_fail_the_probe(
+        self, probe_recorder, sweep_calls, monkeypatch, tmp_path
+    ):
+        def _exploding_sweep(prefix: str) -> int:
+            sweep_calls.append(prefix)
+            raise RuntimeError('sweep exploded')
+
+        monkeypatch.setattr(probe, 'sweep_stale_pid_dirs', _exploding_sweep, raising=False)
+        _inject('build_argv', monkeypatch, probe_recorder)
+        # The INJECTED failure must surface, not the sweep's: tmp hygiene must
+        # never be able to fail a capture that has already been paid for.
+        with pytest.raises(RuntimeError, match='injected: _build_argv'):
+            _run_probe(tmp_path)
+        assert sweep_calls == [probe._PROBE_DIR_PREFIX]
+        assert probe._probe_dir_sweep_done is True, (
+            'the flag must be set BEFORE the call, or a raising sweep re-runs on '
+            'every subsequent probe'
         )
