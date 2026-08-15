@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mint the fable-architect-trial-v2 curated hard fixture pool (β1, task 3631).
 
-Two modes:
+Four modes:
 
 ``--census``
     Re-run the architect-exhaustion census across the three source checkouts'
