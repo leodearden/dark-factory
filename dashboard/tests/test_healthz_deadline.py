@@ -668,7 +668,9 @@ async def test_probe_db_abandons_and_tracks_on_every_exit_path(
     budget = 0.05 if trigger == 'budget_expiry' else 60.0
 
     before = asyncio.all_tasks()
-    probe = asyncio.create_task(app_module._probe_db(pool, config.reconciliation_db, budget))
+    probe = asyncio.create_task(
+        app_module._probe_db(cast(DbPool, pool), config.reconciliation_db, budget)
+    )
     await asyncio.sleep(0.01)
     new_tasks = (asyncio.all_tasks() - before) - {probe}
     assert len(new_tasks) == 1, f'expected exactly one new inner task, got {new_tasks}'
