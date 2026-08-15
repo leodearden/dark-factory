@@ -1137,12 +1137,39 @@ class TestParentSegmentFiles:
     as the absolute verdict, so the two spellings of one logical file can never
     diverge again — the property TestAbsoluteForeignPaths pins for the absolute
     regime.
+
+    BOTH DIRECTIONS are pinned here, because normalisation is symmetric and the
+    consumer level is where the user-visible change lands:
+
+      - it REMOVES a verdict that used to fire — the first three tests, where
+        the escaped spelling falsely read as dark_factory's;
+      - it CREATES a verdict that used not to fire — the last two, where the
+        escaped spelling matched no prefix at all and so classified as unowned.
+
+    The second direction is the one with no natural alarm: an unowned file is
+    silently neutral everywhere (a hard reject that never fires, a cross-repo
+    tag written against the wrong owner), so without these two tests a
+    regression restoring the un-normalised scan would leave the whole
+    consumer-level suite green.
     """
 
     # Lexically 'crates/foo.rs': a REIFY-owned file, reached via a segment
     # whose leading component belongs to dark_factory.
     _ESCAPED = ['orchestrator/../crates/foo.rs']
     _NORMALISED = ['crates/foo.rs']
+
+    # Lexically 'orchestrator/x.py': a DARK_FACTORY-owned file re-entered
+    # through a leading segment ('foo/') that belongs to no project at all.
+    # Before the fix this matched no prefix and was unowned, which silently
+    # DISARMED the task-2206 guard for the escaped spelling.
+    _REENTRANT = ['foo/../orchestrator/x.py']
+    _REENTRANT_NORMALISED = ['orchestrator/x.py']
+
+    # Lexically 'crates/x.rs': reify's OWN file, spelled through a
+    # dark_factory-owned leading segment. Before the fix this read as
+    # 'dark_factory' and was therefore MIS-TAGGED as a cross-repo deliverable.
+    _LOCAL_ESCAPED = ['fused-memory/../crates/x.rs']
+    _LOCAL_NORMALISED = ['crates/x.rs']
 
     def test_check_files_for_scope_does_not_falsely_reject_filing_project(
         self, tmp_path,
@@ -1195,6 +1222,57 @@ class TestParentSegmentFiles:
             self._ESCAPED, 'reify', registry) == self._ESCAPED
         assert local_attesting_signals(
             self._NORMALISED, 'reify', registry) == self._NORMALISED
+
+    # -- the mirrored direction: normalisation CREATES a verdict -------------
+
+    def test_check_files_for_scope_rejects_a_reentrant_parent_segment(
+        self, tmp_path,
+    ):
+        """A '..' that re-enters a FOREIGN prefix must still hard-reject.
+
+        Measured before the fix: outcome='ok' — 'foo/../orchestrator/x.py'
+        matched no prefix by bare startswith (its leading segment 'foo/' is
+        registered to nobody), so the file classified as unowned and task
+        2206's FILES-certain guard silently did not fire. Any '..' prefix was
+        therefore a bypass of the hard reject.
+        """
+        registry = _two_project_registry(tmp_path)
+
+        verdict = check_files_for_scope(self._REENTRANT, 'reify', registry)
+        assert verdict.outcome == 'rejection', (
+            f'foreign file reached via a parent segment escaped the '
+            f'FILES-certain guard, got: {verdict!r}'
+        )
+        assert verdict.suggested_project == 'dark_factory'
+        assert verdict.matched_paths == tuple(self._REENTRANT)
+
+        norm_verdict = check_files_for_scope(
+            self._REENTRANT_NORMALISED, 'reify', registry)
+        assert verdict.outcome == norm_verdict.outcome
+        assert verdict.suggested_project == norm_verdict.suggested_project
+
+    def test_all_files_foreign_owner_does_not_tag_a_locally_resolving_path(
+        self, tmp_path,
+    ):
+        """A file that normalises back to the FILER's own repo is not foreign.
+
+        Measured before the fix: 'dark_factory' — 'fused-memory/../crates/x.rs'
+        IS reify's own crates/x.rs, but the un-normalised scan matched the
+        'fused-memory/' prefix, so the submission was tagged a cross-repo
+        deliverable against a project that owns none of its files. This is a
+        tag that used to be WRITTEN and now correctly is not.
+        """
+        from fused_memory.middleware.path_scope_guard import all_files_foreign_owner
+
+        registry = _two_project_registry(tmp_path)
+
+        assert all_files_foreign_owner(
+            self._LOCAL_ESCAPED, 'reify', registry) is None, (
+            "reify's own file mis-tagged as a cross-repo deliverable"
+        )
+        assert all_files_foreign_owner(self._LOCAL_ESCAPED, 'reify', registry) == (
+            all_files_foreign_owner(self._LOCAL_NORMALISED, 'reify', registry)
+        )
 
 
 # ---------------------------------------------------------------------------
