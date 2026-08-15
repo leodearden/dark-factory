@@ -11290,15 +11290,43 @@ class Harness:
         # One queue string for both the 'Escalation queue:' line and the re-arm
         # command below, so the two can never disagree (task 3605).
         queue_dir = f'{cfg.project_root}/{cfg.escalation.queue_dir}'
-        tooling_root_block = (
-            f'\n'
-            f'Dark-factory tooling root (DARK_FACTORY_ROOT, set in your environment): '
-            f'{df_root}\n'
-            f'scripts/watcher-rearm.sh lives in THAT repo -- it is the canonical '
-            f'bounded-wait re-arm wrapper. Re-arm with, verbatim:\n'
-            f'  cd $DARK_FACTORY_ROOT && scripts/watcher-rearm.sh '
-            f'--queue-dir {queue_dir} --level 1 --timeout <min(3600, remaining)>\n'
-        )
+        if df_root is None:
+            # Loud at the spawn site too: the degradation must be visible in the
+            # orchestrator log, not only inside an agent prompt nobody reads.
+            logger.warning(
+                'Escalation-watcher-auto rotation: DARK_FACTORY_ROOT could not be '
+                'auto-resolved, so it is NOT set in this rotation environment -- the '
+                'agent cannot run scripts/watcher-rearm.sh until an operator exports it'
+            )
+            # Degraded but LOUD: never render `cd  && ...` or an empty path, which
+            # is the census-sighted failure written into the prompt itself.
+            tooling_root_block = (
+                f'\n'
+                f'Dark-factory tooling root: could not be auto-resolved, so '
+                f'DARK_FACTORY_ROOT is NOT set in this environment.\n'
+                f'scripts/watcher-rearm.sh lives in the dark-factory repo, which is '
+                f'not the project root above. Do NOT guess its path and do NOT search '
+                f'the filesystem for it -- ask the operator where the dark-factory '
+                f'checkout is, then re-arm from there against --queue-dir '
+                f'{queue_dir}.\n'
+            )
+        else:
+            cross_project_note = (
+                'That is a DIFFERENT repository from the project root above; '
+                'scripts/watcher-rearm.sh is not present in the target project.\n'
+                if Path(df_root).resolve() != Path(cfg.project_root).resolve()
+                else ''
+            )
+            tooling_root_block = (
+                f'\n'
+                f'Dark-factory tooling root (DARK_FACTORY_ROOT, set in your '
+                f'environment): {df_root}\n'
+                f'{cross_project_note}'
+                f'scripts/watcher-rearm.sh lives in THAT repo -- it is the canonical '
+                f'bounded-wait re-arm wrapper. Re-arm with, verbatim:\n'
+                f'  cd $DARK_FACTORY_ROOT && scripts/watcher-rearm.sh '
+                f'--queue-dir {queue_dir} --level 1 --timeout <min(3600, remaining)>\n'
+            )
         user_prompt = (
             f'You are running as an autonomous escalation watcher.\n'
             f'Rotation limits (injected by supervisor):\n'

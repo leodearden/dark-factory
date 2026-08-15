@@ -669,7 +669,10 @@ class TestRunWatcherRotation:
         prompt = captured['prompt']
         assert str(df_root) in prompt, 'the tooling root must be named'
         assert str(h.config.project_root) in prompt, 'the target project root must be named'
-        assert 'different repo' in prompt, (
+        # Case-insensitive: the banner capitalises for emphasis (DIFFERENT), and the
+        # matching absence assertion in the same-project test must not be able to
+        # pass vacuously just because the impl shouted the word.
+        assert 'different repo' in prompt.lower(), (
             'the banner must say IN WORDS that the tooling root is a different '
             f'repository from the target project root; got:\n{prompt}'
         )
@@ -709,7 +712,7 @@ class TestRunWatcherRotation:
         assert 'cd $DARK_FACTORY_ROOT && scripts/watcher-rearm.sh' in prompt, (
             'the canonical form is an UNCONDITIONAL guarantee, not a cross-project extra'
         )
-        assert 'different repo' not in prompt, (
+        assert 'different repo' not in prompt.lower(), (
             'the cross-project note must be absent when the tooling root IS the '
             'target project root — the banner must not make a false claim'
         )
