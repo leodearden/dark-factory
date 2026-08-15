@@ -57,10 +57,17 @@ retained peers tagged, then per supersede read → re-home children → corrobor
   `get_memories_by_metadata({'topic': T})`); `MemoryService.search` is never called and a
   test pins that negative. Registered in `DISALLOW_MEMORY_WRITES` (hence Stage 3) and in
   the orchestrator's dry-run `_DISALLOWED_TOOLS` in the same change that adds it.
-- **A failed READ degrades the claim, never the envelope.** Every Qdrant read here
-  propagates `TimeoutError` by contract, so each is guarded — otherwise one timeout would
-  flatten the whole result to `{'error', 'error_type'}` and destroy the per-id
-  dispositions for records already irreversibly gone. Enrichment reads degrade (a
+- **No unguarded await after the canonical write.** Every Qdrant call here can propagate
+  `TimeoutError` by contract, so each is guarded — otherwise one timeout would flatten the
+  whole result to `{'error', 'error_type'}` and destroy the per-id dispositions for
+  records already irreversibly gone. That covers the WRITE seams too: `update_memory`
+  returns a structured rejection only for `MemoryNotFound` and re-raises every backend
+  failure, so both the retain-arm tag and the reparent patch record a raise in the same
+  per-id shape as a returned refusal (`retain_failures` / `reparent_failures`). The
+  reparent patch matters most: it runs INTERLEAVED with the deletes, so a propagating
+  raise would abandon already-deleted supersedes with neither a disposition nor a
+  tombstone — un-attributable, i.e. indistinguishable from silent data loss.
+- **A failed READ degrades the claim, never the envelope.** Enrichment reads degrade (a
   victim capture that fails still deletes and still tombstones, with `metadata`/
   `created_at` null; a closure scroll that fails reports `topic_members: []` with
   `topic_members_available: false`, so an empty listing is never misread as "this topic

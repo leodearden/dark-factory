@@ -115,6 +115,7 @@ def make_service(
     stuck_children=(),
     delete_errors=None,
     update_errors=None,
+    update_raises=None,
     pre_read_errors=None,
     corroboration_errors=None,
     scroll_error=None,
@@ -134,6 +135,12 @@ def make_service(
     `update_memory` RETURNS for it — that primitive reports
     `MemoryNotFound` as a return value rather than a raise, so a caller
     that only guarded against exceptions would read a refusal as a success.
+    *update_raises* is the OTHER half of that primitive's contract and maps
+    a memory id to an exception `update_memory` RAISES for it: only
+    `MemoryNotFound` comes back structured, while every backend failure goes
+    through `_journaled_backend_call`, which logs and re-raises. A caller
+    that only handled the returned shape would let one timeout escape and
+    flatten the whole envelope.
 
     *truncated_scans* is the set of parents whose child listing comes back
     `truncated=True`: a listing the op could not fully SEE is a set it
@@ -163,6 +170,7 @@ def make_service(
     stuck_children = set(stuck_children)
     delete_errors = delete_errors or {}
     update_errors = update_errors or {}
+    update_raises = update_raises or {}
     pre_read_errors = pre_read_errors or {}
     corroboration_errors = corroboration_errors or {}
     child_scan_errors = child_scan_errors or {}
@@ -237,6 +245,8 @@ def make_service(
         # rather than register an un-named record as successfully re-homed.
         assert isinstance(memory_id, str), 'the op must name the id it patches'
         log.append(('update_memory', memory_id))
+        if memory_id in update_raises:
+            raise update_raises[memory_id]
         if memory_id in update_errors:
             return update_errors[memory_id]
         if (kwargs.get('metadata_patch') or {}).get('parent_id') and (
@@ -1072,6 +1082,37 @@ class TestRetainAndTagArm:
         tagged = {c.kwargs['memory_id'] for c in svc.update_memory.await_args_list}
         assert RETAIN_1 in tagged
 
+    @pytest.mark.asyncio
+    async def test_a_raising_tag_is_captured_and_does_not_flatten_the_envelope(self):
+        """The OTHER half of `update_memory`'s contract. Only
+        `MemoryNotFound` comes back as a structured return; every backend
+        failure goes through `_journaled_backend_call`, which logs and
+        RE-RAISES. An unguarded await would let one Qdrant timeout escape to
+        `@mcp_tool_errors`, which flattens the whole result to
+        {'error', 'error_type'} — destroying the per-id dispositions this op
+        exists to produce, and skipping the delete arm entirely."""
+        svc = make_service(
+            update_raises={RETAIN_2: TimeoutError('qdrant set_payload timed out')}
+        )
+
+        result = await call_consolidate(svc, retain=[RETAIN_1, RETAIN_2])
+
+        # The envelope SURVIVES: a raise is one peer's disposition, in the
+        # same shape as a returned rejection, not the end of the call.
+        assert result['retain_failures'] == [
+            {
+                'id': RETAIN_2,
+                'error': 'qdrant set_payload timed out',
+                'error_type': 'TimeoutError',
+            }
+        ]
+        assert result['retained'] == [RETAIN_1]
+        assert result['status'] == 'partial'
+        # The delete arm still ran to completion — the whole reason the raise
+        # must not propagate.
+        assert result['deleted'] == list(SUPERSEDES)
+        assert result['survivors'] == []
+
 
 class TestChildrenAreReHomedBeforeTheirParentDies:
     """The orphan rule (PRD V3): reparent, THEN delete — never the reverse.
@@ -1226,6 +1267,57 @@ class TestAnIncompleteReparentRefusesTheDelete:
             {'child_id': C1, 'from': S1, 'to': CANONICAL}
         ]
         assert [f['child_id'] for f in result['reparent_failures']] == [C2]
+
+    @pytest.mark.asyncio
+    async def test_a_raising_child_patch_refuses_only_that_parent(self):
+        """A RAISE IS THE SAME EVENT AS A RETURNED REJECTION: either way the
+        child was not re-homed, so it strands and saves its parent.
+
+        Letting it propagate would be strictly worse than any per-id failure
+        — this loop runs INTERLEAVED with the deletes, so the raise would
+        flatten the envelope and destroy the dispositions of supersedes
+        ALREADY IRREVERSIBLY DELETED, and skip their tombstone write. Those
+        records would be gone with neither a disposition nor a tombstone:
+        indistinguishable from silent data loss, which is the exact hole the
+        delete arm's tombstone contract exists to close.
+        """
+        svc = make_service(
+            gone=[S2, S3],
+            children={S1: [C1, C2]},
+            update_raises={C2: TimeoutError('qdrant set_payload timed out')},
+        )
+
+        with patched_tombstone_writer() as writer:
+            result = await call_consolidate(svc)
+
+        # Only S1 is refused, and it is refused for the RIGHT reason: the
+        # blocker is its stranded child, not the raw timeout.
+        [failure] = result['failed_deletes']
+        assert failure['id'] == S1
+        assert failure['error_type'] == 'ReparentIncomplete'
+        assert C2 in failure['error']
+        assert result['survivors'] == [S1]
+        # The raise is recorded in the same per-child shape as a rejection.
+        assert result['reparent_failures'] == [
+            {
+                'child_id': C2,
+                'from': S1,
+                'to': CANONICAL,
+                'error': 'qdrant set_payload timed out',
+                'error_type': 'TimeoutError',
+            }
+        ]
+        # The rest of the cluster still folds...
+        assert result['deleted'] == [S2, S3]
+        assert result['reparented'] == [
+            {'child_id': C1, 'from': S1, 'to': CANONICAL}
+        ]
+        # ...and is still TOMBSTONED. This is the assertion the propagating
+        # version could not satisfy: a flattened envelope never reaches the
+        # tombstone step, leaving confirmed-gone records un-attributable.
+        assert writer.await_args is not None
+        assert sorted(v['id'] for v in writer.await_args.args[2]) == sorted([S2, S3])
+        assert result['tombstones_written'] == 2
 
     @pytest.mark.asyncio
     async def test_a_truncated_child_listing_refuses_the_delete(self):

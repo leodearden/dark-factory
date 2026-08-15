@@ -4763,17 +4763,38 @@ def create_mcp_server(
             # returning {'error_type': ...}. Code that only guarded against
             # exceptions would append the id to `retained` and report a peer
             # as tagged when it was refused.
-            outcome = await memory_service.update_memory(
-                memory_id=retain_id,
-                project_id=project_id,
-                content=None,
-                metadata_patch={'topic': topic},
-                metadata_mode='merge',
-                agent_id=agent_id,
-                session_id=session_id,
-                causation_id=causation_id,
-                _source=source,
-            )
+            #
+            # BUT A BACKEND FAILURE *IS* A RAISE, so both shapes must be
+            # handled: only MemoryNotFound comes back structured, while every
+            # other failure goes through `_journaled_backend_call`, which logs
+            # and RE-RAISES. An unguarded await here would let one Qdrant
+            # timeout escape to `@mcp_tool_errors` and flatten the whole
+            # envelope to {'error', 'error_type'} — destroying the per-id
+            # dispositions for every peer already tagged and skipping the
+            # delete arm entirely. One failure costs one peer, either way.
+            try:
+                outcome = await memory_service.update_memory(
+                    memory_id=retain_id,
+                    project_id=project_id,
+                    content=None,
+                    metadata_patch={'topic': topic},
+                    metadata_mode='merge',
+                    agent_id=agent_id,
+                    session_id=session_id,
+                    causation_id=causation_id,
+                    _source=source,
+                )
+            except Exception as exc:
+                # `Exception`, not `BaseException`: same rationale as the
+                # delete guard below — a process going away
+                # (CancelledError/KeyboardInterrupt/SystemExit) must never be
+                # recorded as this peer's per-id disposition.
+                retain_failures.append({
+                    'id': retain_id,
+                    'error': str(exc),
+                    'error_type': type(exc).__name__,
+                })
+                continue
             if isinstance(outcome, dict) and outcome.get('error_type'):
                 # One refusal costs one peer, never the arm: the peers that
                 # CAN be tagged are, and re-running to catch the rest would
@@ -4903,17 +4924,41 @@ def create_mcp_server(
                 # `parent_id` ONLY, and no content: the child's own claim is
                 # not this op's to rewrite, so nothing is re-embedded and no
                 # other metadata is disturbed.
-                outcome = await memory_service.update_memory(
-                    memory_id=child_id,
-                    project_id=project_id,
-                    content=None,
-                    metadata_patch={'parent_id': canonical_id},
-                    metadata_mode='merge',
-                    agent_id=agent_id,
-                    session_id=session_id,
-                    causation_id=causation_id,
-                    _source=source,
-                )
+                #
+                # A RAISE IS THE SAME EVENT AS A RETURNED REJECTION, and is
+                # recorded identically: either way this child was NOT re-homed,
+                # so it strands and refuses ITS PARENT'S delete below. Letting a
+                # backend timeout propagate instead would be strictly worse than
+                # any per-id failure — this loop runs INTERLEAVED with the
+                # deletes, so the raise would escape to `@mcp_tool_errors` and
+                # flatten the envelope, destroying the dispositions of
+                # supersedes that are ALREADY IRREVERSIBLY DELETED and skipping
+                # their tombstone write entirely. Those records would then be
+                # gone with no forward pointer and no tombstone: exactly the
+                # indistinguishable-from-silent-data-loss hole the delete arm's
+                # tombstone contract exists to close.
+                try:
+                    outcome = await memory_service.update_memory(
+                        memory_id=child_id,
+                        project_id=project_id,
+                        content=None,
+                        metadata_patch={'parent_id': canonical_id},
+                        metadata_mode='merge',
+                        agent_id=agent_id,
+                        session_id=session_id,
+                        causation_id=causation_id,
+                        _source=source,
+                    )
+                except Exception as exc:
+                    stranded_children.append(child_id)
+                    reparent_failures.append({
+                        'child_id': child_id,
+                        'from': supersede_id,
+                        'to': canonical_id,
+                        'error': str(exc),
+                        'error_type': type(exc).__name__,
+                    })
+                    continue
                 if isinstance(outcome, dict) and outcome.get('error_type'):
                     stranded_children.append(child_id)
                     reparent_failures.append({
