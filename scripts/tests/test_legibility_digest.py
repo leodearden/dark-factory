@@ -945,7 +945,7 @@ class TestDecoyFailSuppressionContract:
 # ---------------------------------------------------------------------------
 
 class TestSignalCountsAndScore:
-    def test_signal_counts_returns_exact_five_key_dict_for_mixed_fixture(self):
+    def test_signal_counts_returns_exact_key_dict_for_mixed_fixture(self):
         records = [
             _assistant(_tool_use('Bash', {'command': 'false'}, id='tu-1')),
             _tool_result('tu-1', 'Exit code 1', is_error=True),
@@ -963,6 +963,7 @@ class TestSignalCountsAndScore:
             'not_found': 1,
             'df_guard': 1,
             'interrupt': 1,
+            'designed_outcome': 0,
         }
 
     def test_signal_counts_reports_zero_for_absent_classes(self):
@@ -976,7 +977,56 @@ class TestSignalCountsAndScore:
             'not_found': 0,
             'df_guard': 0,
             'interrupt': 0,
+            'designed_outcome': 0,
         }
+
+    def test_ceiling_only_session_reports_zero_tool_errors(self):
+        # The 07-31 census cluster 1.3 headline: session a189558e's watcher
+        # ceilings were each counted as a tool_error. A session whose ONLY
+        # structured errors are declared CEILINGs has no errors at all.
+        records = []
+        for i in range(13):
+            records.append(
+                _assistant(_tool_use('Bash', {'command': f'w{i}'}, id=f'tu-{i}'))
+            )
+            records.append(_tool_result(f'tu-{i}', _CEILING_DECLARATION, is_error=True))
+
+        counts = mod.signal_counts(records)
+
+        assert counts['tool_error'] == 0
+        assert counts['designed_outcome'] == 13
+
+    def test_mixed_session_surfaces_the_one_genuine_failure(self):
+        # census :97 verbatim: 3 benign ceilings burying 1 real exit-2 bug.
+        records = []
+        for i in range(3):
+            records.append(
+                _assistant(_tool_use('Bash', {'command': f'w{i}'}, id=f'tu-c{i}'))
+            )
+            records.append(_tool_result(f'tu-c{i}', _CEILING_DECLARATION, is_error=True))
+        records.append(_assistant(_tool_use('Bash', {'command': 'real'}, id='tu-g')))
+        records.append(
+            _tool_result('tu-g', 'DARK_FACTORY_ROOT unset, exit code 2', is_error=True)
+        )
+
+        counts = mod.signal_counts(records)
+
+        assert counts['tool_error'] == 1
+        assert counts['designed_outcome'] == 3
+
+    def test_designed_outcome_has_no_signal_weight(self):
+        # Deliberate: score_signals iterates SIGNAL_WEIGHTS, so omitting the
+        # entry reports the count without perturbing the sampler's ranking.
+        assert 'designed_outcome' not in mod.SIGNAL_WEIGHTS
+
+    def test_score_is_bit_identical_across_designed_outcome_counts(self):
+        base = {
+            'tool_error': 2, 'self_correct': 1, 'not_found': 0,
+            'df_guard': 1, 'interrupt': 0, 'designed_outcome': 0,
+        }
+        noisy = dict(base, designed_outcome=13)
+
+        assert mod.score_signals(noisy, 3) == mod.score_signals(base, 3)
 
     def test_score_signals_is_monotonic_when_adding_a_signal(self):
         zero = {
@@ -1141,6 +1191,7 @@ class TestRenderFrontmatter:
 
         assert nested_keys == [
             'tool_error', 'self_correct', 'not_found', 'df_guard', 'interrupt',
+            'designed_outcome',
         ]
 
     def test_round_trips_via_yaml_safe_load(self):
