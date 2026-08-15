@@ -39,6 +39,7 @@ from shared.invocation_outcome import (
     NearCap,
     ZeroOutputWedge,
 )
+from shared.testing import make_gate_mock
 from shared.usage_gate import (
     AccountLease,
     AccountPhase,
@@ -217,6 +218,29 @@ def test_mock_gate_defaults_include_release_probe_slot():
         "_mock_gate() must explicitly set release_probe_slot so the "
         "exception-cleanup contract is self-documented in the helper."
     )
+
+
+async def test_mock_gate_report_cap_hit_releases_probe_slot():
+    """_mock_gate's report(CapHit) must call release_probe_slot, mirroring
+    production InvokeSlot.report (task 4096).
+
+    assert_called_once_with (not just assert_called) also proves __aexit__ did
+    NOT double-release: the double settles in its ``finally``, so exactly one
+    call is correct.
+    """
+    gate = _mock_gate()
+    async with gate.invoke_slot() as slot:
+        slot.report(CapHit(resets_at=None, reason='cap'))
+    gate._handle_cap_detected.assert_called_once()
+    gate.release_probe_slot.assert_called_once_with('tok')
+
+
+async def test_make_gate_mock_report_cap_hit_releases_probe_slot():
+    """Same contract for the shipped shared.testing.make_gate_mock double."""
+    gate = make_gate_mock()
+    async with gate.invoke_slot() as slot:
+        slot.report(CapHit(resets_at=None, reason='cap'))
+    gate.release_probe_slot.assert_called_once_with('tok')
 
 
 # Shared patch targets
