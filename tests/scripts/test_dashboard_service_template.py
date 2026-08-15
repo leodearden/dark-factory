@@ -991,6 +991,82 @@ def test_poll_interval_parser_requires_exactly_one_interval() -> None:
         )
 
 
+def test_poll_interval_parser_reads_an_arbitrary_constant_name() -> None:
+    """_parse_poll_interval_ms must parse ANY named period, not just POLL_INTERVAL_MS.
+
+    More than one client poller declares a period — data.js's POLL_INTERVAL_MS
+    (the main data refresh) and tab_overview.jsx's LOAD_POLL_INTERVAL_MS (the
+    host-load card's /api/load poll) — and the keep-alive lower bound is derived
+    from the SLOWEST of them.  Rather than growing a second bespoke parser, the
+    existing declaration-anchored one takes the constant name as a parameter, so
+    both halves of its contract (exactly-one-declaration, and the declared
+    constant actually schedules a setInterval) carry over to every poller for
+    free instead of being re-derived per poller.
+
+    Two properties beyond "it parses" are pinned here.  The failure messages must
+    name the REQUESTED constant: a LOAD_POLL_INTERVAL_MS miss that reported
+    itself as a POLL_INTERVAL_MS problem would send the fixer to the wrong file.
+    And the two names must not cross-match, or a max over the poller registry
+    could be computed twice from the same source with the other poller silently
+    dropping out — the exact silent-coverage failure this registry exists to
+    remove.
+    """
+    assert (
+        _parse_poll_interval_ms(
+            "const LOAD_POLL_INTERVAL_MS = 5000;\n"
+            "const id = setInterval(fetchLoad, LOAD_POLL_INTERVAL_MS);\n",
+            "synthetic",
+            const_name="LOAD_POLL_INTERVAL_MS",
+        )
+        == 5000
+    )
+
+    # Both halves of the contract still hold for the requested name, and each
+    # failure names the constant it was actually looking for.
+    with pytest.raises(AssertionError, match="found 0") as absent:
+        _parse_poll_interval_ms(
+            "fetchLoad();\n", "synthetic", const_name="LOAD_POLL_INTERVAL_MS"
+        )
+    assert "LOAD_POLL_INTERVAL_MS" in str(absent.value)
+
+    with pytest.raises(AssertionError, match="found 2") as ambiguous:
+        _parse_poll_interval_ms(
+            "const LOAD_POLL_INTERVAL_MS = 5000;\n"
+            "const LOAD_POLL_INTERVAL_MS = 9000;\n"
+            "setInterval(fetchLoad, LOAD_POLL_INTERVAL_MS);\n",
+            "synthetic",
+            const_name="LOAD_POLL_INTERVAL_MS",
+        )
+    assert "LOAD_POLL_INTERVAL_MS" in str(ambiguous.value)
+
+    with pytest.raises(AssertionError, match="never passed as a setInterval") as dead:
+        _parse_poll_interval_ms(
+            "const LOAD_POLL_INTERVAL_MS = 5000;\nsetInterval(fetchLoad, 250);\n",
+            "synthetic",
+            const_name="LOAD_POLL_INTERVAL_MS",
+        )
+    assert "LOAD_POLL_INTERVAL_MS" in str(dead.value)
+
+    # The two live names must not cross-match in EITHER direction. The
+    # ``^\s*(?:const|let|var)\s+`` anchor is what keeps LOAD_POLL_INTERVAL_MS
+    # from satisfying a POLL_INTERVAL_MS lookup by suffix; a substring match
+    # would let one poller answer for both.
+    with pytest.raises(AssertionError, match="found 0"):
+        _parse_poll_interval_ms(
+            "const POLL_INTERVAL_MS = 3000;\n"
+            "setInterval(() => pollTick(opts), POLL_INTERVAL_MS);\n",
+            "synthetic",
+            const_name="LOAD_POLL_INTERVAL_MS",
+        )
+
+    with pytest.raises(AssertionError, match="found 0"):
+        _parse_poll_interval_ms(
+            "const LOAD_POLL_INTERVAL_MS = 5000;\n"
+            "setInterval(fetchLoad, LOAD_POLL_INTERVAL_MS);\n",
+            "synthetic",
+        )
+
+
 def test_client_poll_interval_is_readable_from_the_shipped_client() -> None:
     """The live client source must still yield a poll interval to compare against.
 
