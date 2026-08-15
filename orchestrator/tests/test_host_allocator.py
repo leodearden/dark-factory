@@ -1133,12 +1133,16 @@ class TestHostAllocatorReadmit:
     def _by_name(self, alloc) -> dict:
         return {h['name']: h for h in alloc.host_states()}
 
-    async def _make_parked_allocator(self, *, quarantine=None, extra_remote=False):
+    async def _make_parked_allocator(self, *, also_quarantine=False, extra_remote=False):
         """Return (alloc, quarantine_set) with remoteA's slot left PARKED.
 
         Same construction as ``TestHostAllocatorCancelFail`` /
         ``test_cancel_fail_bounded_max_attempts_stays_parked``: cancel rc != 0
         and probe_clean() never clean with bounded max_attempts.
+
+        ``also_quarantine`` adds remoteA to the shared set AFTER parking — the
+        host must be acquirable to reach the cancel path in the first place, so
+        seeding the quarantine up front would make acquire_remote() refuse it.
         """
         from orchestrator.verify_runner import HostAllocator
 
@@ -1146,7 +1150,7 @@ class TestHostAllocatorReadmit:
             'remoteA', cancel_rc=1, probe_sequence=[False] * 20,
         )
         remotes = [remote_a] + ([_FakeRemoteRunner('remoteB')] if extra_remote else [])
-        q = quarantine if quarantine is not None else set()
+        q: set[str] = set()
         alloc = HostAllocator(remotes, quarantine=q)
 
         lease = alloc.acquire_remote()
@@ -1157,6 +1161,8 @@ class TestHostAllocatorReadmit:
 
         assert await alloc.cancel_and_release(lease, sleep=noop_sleep, max_attempts=2) is False
         assert alloc.is_parked('remoteA') is True
+        if also_quarantine:
+            q.add('remoteA')
         return alloc, q
 
     # -- (a) discards from the shared set --------------------------------------
@@ -1193,7 +1199,7 @@ class TestHostAllocatorReadmit:
 
     async def test_readmit_clears_quarantine_and_unparks_together(self):
         """Both halves in one call — the state a recovered host actually needs."""
-        alloc, shared_q = await self._make_parked_allocator(quarantine={'remoteA'})
+        alloc, shared_q = await self._make_parked_allocator(also_quarantine=True)
         assert alloc.is_parked('remoteA') is True
         assert alloc.is_quarantined('remoteA') is True
 
@@ -1274,7 +1280,7 @@ class TestHostAllocatorReadmit:
         is precisely why the reprobe recovery path must call readmit instead.
         """
         alloc, shared_q = await self._make_parked_allocator(
-            quarantine={'remoteA'}, extra_remote=True,
+            also_quarantine=True, extra_remote=True,
         )
 
         alloc.clear_quarantine('remoteA')

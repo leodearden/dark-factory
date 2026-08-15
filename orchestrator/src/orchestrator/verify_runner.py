@@ -2960,6 +2960,39 @@ class HostAllocator:
         """
         self._quarantine.discard(name)
 
+    def readmit(self, name: str) -> None:
+        """Fully re-engage host *name* in the pool: un-quarantine AND un-PARK.
+
+        This is the auto-reprobe re-engagement primitive (task 1795 recovery,
+        task 3043 strand fix).  :meth:`clear_quarantine` alone cannot recover a
+        host whose slot the cancel-fail path PARKed, because
+        :meth:`acquire_remote` additionally requires ``_SLOT_FREE`` — so a
+        recovery that only discards the quarantine can resolve the host's L1 and
+        pop its unavailability-tracker entry while leaving it non-acquirable:
+        unquarantined, untracked AND unusable, invisible to every recovery
+        mechanism until an orchestrator restart.  That is how a host that was
+        down at orchestrator start stays out of the pool indefinitely.
+
+        BUSY carve-out: only a PARKED slot is reset.  A BUSY slot is left BUSY,
+        so re-admission can never steal a verify that is genuinely in flight
+        (cf. the "Known limitation (ABA)" note on :meth:`cancel_and_release`).
+        An unknown name never fabricates a slot entry — the lookup uses
+        ``.get``, never ``[]``/``setdefault`` — and the local host is unaffected
+        because local is never PARKED by the remote cancel-fail path.
+
+        Caller obligation: PARK means "the cancel RPC failed, so a stale verify
+        process may still be running on that host".  Callers must therefore have
+        probed the host clean first — the reprobe sweep gates re-admission on
+        ``health()`` AND ``probe_clean()`` — so that freeing the slot cannot
+        double-dispatch onto a host still churning on a previous merge.
+
+        Idempotent: a repeat call on an already-FREE, unquarantined host is a
+        safe no-op.
+        """
+        self._quarantine.discard(name)
+        if self._slots.get(name) == _SLOT_PARKED:
+            self._slots[name] = _SLOT_FREE
+
     def is_quarantined(self, name: str) -> bool:
         """Return True if host *name* is currently quarantined.
 
