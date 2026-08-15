@@ -694,3 +694,192 @@ class TestParkAgeSecs:
         assert age == pytest.approx(900.0), (
             'age must run from the FIRST install (total wait), not the latest'
         )
+
+
+# ===========================================================================
+# The two primitives backfill admission needs (task 3823 / PRD task η, C7)
+# ===========================================================================
+
+
+class TestParkOwnersBlocking:
+    """``park_owners_blocking(task_id, modules)`` — WHO would refuse this request.
+
+    ``_is_parked_blocks`` answers only bool, one module at a time, and names
+    nobody; admission has to know which park owners it would be borrowing
+    from.  The accessor must reuse the SAME rank-aware rule ``try_acquire``
+    enforces (INV-5) — a second, subtly different rule would admit through
+    parks the lock layer then refuses, producing churn with no dispatch.
+    """
+
+    def test_conflicting_park_names_its_owner(self):
+        lt = _lt()
+        lt.install_parks('P', ['m1'], priority='medium')
+
+        assert lt.park_owners_blocking('C', ['m1']) == ['P']
+
+    def test_non_conflicting_park_is_not_a_backfill_target(self):
+        """C7's ``c.modules ∩ M ≠ ∅`` clause: no intersection, no target."""
+        lt = _lt()
+        lt.install_parks('P', ['other'], priority='medium')
+
+        assert lt.park_owners_blocking('C', ['m1']) == []
+
+    def test_buried_park_never_appears(self):
+        """Only active tops block, so only active tops can be lent (INV-2)."""
+        lt = _lt()
+        lt.install_parks('L', ['m1'], priority='low')
+        lt.install_parks('T', ['m1'], priority='high')  # shadows L
+
+        assert lt.park_owners_blocking('C', ['m1']) == ['T']
+
+    def test_requesters_own_park_never_appears(self):
+        lt = _lt()
+        lt.install_parks('P', ['m1'], priority='medium')
+
+        assert lt.park_owners_blocking('P', ['m1']) == []
+
+    def test_preemptable_foreign_top_never_appears(self):
+        """A foreign top the requester outranks does not block, so is no target.
+
+        R holds a high-priority park on a/b/c while F holds a low-priority park
+        on the parent a/b.  ``_is_parked_blocks`` lets R through (its own
+        dominant conflicting rank is strictly lower), so the accessor must
+        agree — otherwise admission would invent a lender for a request that
+        was never blocked.
+        """
+        lt = _lt(lock_depth=3)
+        lt.install_parks('F', ['a/b'], priority='low')
+        lt.install_parks('R', ['a/b/c'], priority='high')
+
+        assert lt.park_owners_blocking('R', ['a/b/c']) == []
+
+    def test_hierarchical_conflict_is_detected(self):
+        lt = _lt(lock_depth=3)
+        lt.install_parks('P', ['a/b'], priority='medium')
+
+        assert lt.park_owners_blocking('C', ['a/b/c']) == ['P']
+
+    def test_two_blocking_owners_both_returned_sorted(self):
+        """Admission is a conjunction over ALL of them, so it must see all."""
+        lt = _lt()
+        lt.install_parks('P2', ['m2'], priority='medium')
+        lt.install_parks('P1', ['m1'], priority='medium')
+
+        assert lt.park_owners_blocking('C', ['m1', 'm2']) == ['P1', 'P2']
+
+
+class TestBlockingHolders:
+    """``blocking_holders(modules, *, exclude_task)`` — which modules are still
+    held, and by whom.  Feeds ``_provable_assembly_delay``: a parked owner's
+    wait is only provable through the holders that are actually blocking it.
+    """
+
+    def test_all_free_is_an_empty_mapping(self):
+        lt = _lt()
+
+        assert lt.blocking_holders(['m1', 'm2'], exclude_task='P') == {}
+
+    def test_held_module_maps_to_its_holder(self):
+        lt = _lt()
+        lt.try_acquire('H', ['m1'])
+
+        assert lt.blocking_holders(['m1'], exclude_task='P') == {'m1': ['H']}
+
+    def test_excluded_task_is_not_its_own_blocker(self):
+        lt = _lt()
+        lt.try_acquire('P', ['m1'])
+
+        assert lt.blocking_holders(['m1'], exclude_task='P') == {}
+
+    def test_limit_is_honoured_not_just_presence(self):
+        """``max_per_module=2`` with ONE holder is not blocked.
+
+        Reusing ``_limit_for`` rather than "is anyone holding it" matters:
+        a module with headroom is free for the parked owner to take, so it
+        contributes no delay to lend.
+        """
+        lt = ModuleLockTable(OrchestratorConfig(max_per_module=2, lock_depth=2))
+        lt.try_acquire('H1', ['m1'])
+
+        assert lt.blocking_holders(['m1'], exclude_task='P') == {}
+
+        lt.try_acquire('H2', ['m1'])
+        assert lt.blocking_holders(['m1'], exclude_task='P') == {'m1': ['H1', 'H2']}
+
+    def test_hierarchical_hold_blocks_the_child_request(self):
+        lt = _lt(lock_depth=3)
+        lt.try_acquire('H', ['a/b'])
+
+        assert lt.blocking_holders(['a/b/c'], exclude_task='P') == {'a/b/c': ['H']}
+
+
+class TestTryAcquireAdmittedParks:
+    """``try_acquire(..., admitted_parks=...)`` bypasses the PARK gate only.
+
+    The held-lock ``_count_conflicts >= _limit_for`` gate is untouched and
+    evaluated on live state at call time.  That is the whole safety property
+    of C7 (INV-3): the scoring-time view is advisory, and ``try_acquire``
+    under the lock remains the acting basis.
+    """
+
+    def test_default_behaviour_is_unchanged(self):
+        lt = _lt()
+        lt.install_parks('P', ['m1'], priority='medium')
+
+        assert lt.try_acquire('C', ['m1']) is False
+
+    def test_admitted_park_lets_the_request_through(self):
+        lt = _lt()
+        lt.install_parks('P', ['m1'], priority='medium')
+
+        assert lt.try_acquire('C', ['m1'], admitted_parks=frozenset({'P'})) is True
+        assert lt._held['C'] == {'m1'}
+
+    def test_admitted_acquire_does_not_disturb_the_park(self):
+        """Backfill BORROWS a gap; it does not evict.
+
+        PRD §7 rejects preemption of a held lock, and this is the mirror-image
+        discipline for parks: after an admitted acquire the park must be
+        present, un-shadowed and at its original rank, so the owner's claim is
+        exactly as strong as before.
+        """
+        lt = _lt()
+        lt.install_parks('P', ['m1'], priority='medium')
+        before = lt.snapshot_park_stacks()
+
+        lt.try_acquire('C', ['m1'], admitted_parks=frozenset({'P'}))
+
+        assert lt.snapshot_park_stacks() == before
+        assert lt.snapshot_parks()['P']['modules'] == ['m1']
+
+    def test_a_real_holder_still_refuses(self):
+        """INV-3: the limit gate is untouched and remains the acting basis."""
+        lt = _lt()
+        lt.install_parks('P', ['m1'], priority='medium')
+        lt.try_acquire('H', ['m1'], admitted_parks=frozenset({'P'}))
+
+        assert lt.try_acquire('C', ['m1'], admitted_parks=frozenset({'P'})) is False
+        assert 'C' not in lt._held
+
+    def test_admitting_one_owner_does_not_admit_another(self):
+        """Admission is per-owner; a second blocking park still refuses."""
+        lt = _lt()
+        lt.install_parks('P', ['m1'], priority='medium')
+        lt.install_parks('Q', ['m2'], priority='medium')
+
+        assert lt.try_acquire(
+            'C', ['m1', 'm2'], admitted_parks=frozenset({'P'})
+        ) is False
+
+    def test_try_acquire_additional_has_no_admitted_parks(self):
+        """Plan-refinement lock EXPANSION is not a backfill path.
+
+        C7 anchors on the dispatch scan; an in-flight task widening its lock
+        set has no admission decision behind it and must keep refusing parks.
+        """
+        import inspect
+
+        params = inspect.signature(ModuleLockTable.try_acquire_additional).parameters
+        assert 'admitted_parks' not in params, (
+            'try_acquire_additional must NOT gain an admitted_parks bypass'
+        )
