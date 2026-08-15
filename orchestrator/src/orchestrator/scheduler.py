@@ -96,6 +96,20 @@ _FM_READ_FAILURE_ESCALATION_THRESHOLD: int = 12
 # entry forever.  Same discipline as the predictor's bounded live-open map.
 _BACKFILL_GRANTS_MAX: int = 512
 
+# EASY-backfill overstay-rate escalation (task 3823 / PRD C7, INV-4).  The
+# model measured a 7-9% overstay rate at safety x2.5
+# (plans/evidence/scheduler-scoring-2026-08-06/PARKING_MODEL_REPORT.md:254-255),
+# so a SUSTAINED rate ~3x that means the predictor has drifted or the factor
+# is wrong — a finding, not an incident.  A rate, not a per-breach alarm:
+# individual overstays are the model working as designed, and one event each
+# is exactly the storm INV-4 forbids.
+_BACKFILL_OVERSTAY_RATE_THRESHOLD: float = 0.25
+# Denominator floor.  A 1-of-1 breach is noise, not a rate; 8 is reachable
+# within days at the modelled 23-122 grants/30d.
+_BACKFILL_OVERSTAY_MIN_GRANTS: int = 8
+# Dedup key, mirroring _FM_READ_STORM_SENTINEL: one open L1 per episode.
+_BACKFILL_OVERSTAY_SENTINEL: str = '__backfill_overstay_rate__'
+
 # Sentinel distinguishing "caller omitted this claimant kwarg" (default,
 # leave the wire argument absent) from "caller explicitly passed None"
 # (clear) on Scheduler.set_task_claimant (task 2188, PRD
@@ -7813,6 +7827,92 @@ class Scheduler:
                     'park_owners': list(grant.park_owners),
                     'modules': list(grant.modules),
                 },
+            )
+        self._maybe_escalate_backfill_overstay_rate()
+
+    def _maybe_escalate_backfill_overstay_rate(self) -> None:
+        """File one L1 when the overstay RATE stays well above the modelled one.
+
+        A rate, not a per-breach alarm.  Individual overstays are the model
+        working as designed — it was fitted to cover 80% of realized durations,
+        not all of them — so an event each would be the storm INV-4 forbids.
+        What is actionable is a SUSTAINED rate several times the measured
+        7-9%: that means the predictor has drifted or the factor is wrong.
+
+        The denominator floor matters as much as the threshold: without it the
+        first back-filled dispatch that ran long would file an L1 claiming a
+        100% overstay rate.
+
+        Deduped on ``has_open_l1`` so a sustained mis-tune produces one open
+        escalation per episode rather than one per release, and best-effort
+        throughout — a missing queue is a warning, and any failure is
+        swallowed, because a release that raised because escalation filing
+        failed would strand the task's locks and turn a reporting problem into
+        a dispatch outage.
+        """
+        grants = self._backfill_grants_total
+        if grants < _BACKFILL_OVERSTAY_MIN_GRANTS:
+            return
+        rate = self._backfill_overstay_total / grants
+        if rate < _BACKFILL_OVERSTAY_RATE_THRESHOLD:
+            return
+        if self.escalation_queue is None:  # bare-Scheduler unit tests stay green
+            logger.warning(
+                'backfill overstay rate is %.0f%% (%d of %d grants) but no '
+                'escalation_queue is wired — skipping rate escalation',
+                rate * 100, self._backfill_overstay_total, grants,
+            )
+            return
+        try:
+            if self.escalation_queue.has_open_l1(_BACKFILL_OVERSTAY_SENTINEL):
+                return  # dedup: one open L1 per episode
+            from escalation.models import Escalation
+
+            factor = self.config.backfill_safety_factor
+            esc = Escalation(
+                id=self.escalation_queue.make_id(_BACKFILL_OVERSTAY_SENTINEL),
+                task_id=_BACKFILL_OVERSTAY_SENTINEL,
+                agent_role='orchestrator-scheduler',
+                severity='blocking',
+                category='risk_identified',
+                summary=(
+                    f'EASY-backfill overstay rate {rate * 100:.0f}% '
+                    f'({self._backfill_overstay_total} of {grants} grants) — '
+                    f'well above the modelled 7-9% at safety x2.5'
+                )[:200],
+                detail=(
+                    f'{self._backfill_overstay_total} of {grants} backfill '
+                    f'grants held their locks LONGER than the bound their '
+                    f'admission promised — a measured overstay rate of '
+                    f'{rate * 100:.0f}%, against a threshold of '
+                    f'{_BACKFILL_OVERSTAY_RATE_THRESHOLD * 100:.0f}%.\n\n'
+                    f'The parking model measured 7-9% overstay at '
+                    f'backfill_safety_factor x2.5 '
+                    f'(plans/evidence/scheduler-scoring-2026-08-06/'
+                    f'PARKING_MODEL_REPORT.md:254-255).  The factor is '
+                    f'currently {factor}.  A sustained rate several times the '
+                    f'modelled one means either the hold-duration predictor '
+                    f'has drifted from the workload it was fitted to, or the '
+                    f'factor is too low for this workload.\n\n'
+                    f'REMEDY: raise backfill_safety_factor toward the measured '
+                    f'x2.9 upper bracket (the multiplier that covered 80% of '
+                    f'realized durations in the dark-factory sample; reify '
+                    f'measured x2.0).  It is a green-tier reloadable leaf, so '
+                    f'this is a live retune via reload_config — no restart.  '
+                    f'backfill_enabled=false is the kill switch if backfill '
+                    f'needs to stop entirely while this is investigated.\n\n'
+                    f'Per-grant evidence is in the park_backfill_granted and '
+                    f'park_backfill_overstay events, which carry predicted and '
+                    f'realized hold side by side.'
+                ),
+                suggested_action='retune_backfill_safety_factor',
+                level=1,
+            )
+            self.escalation_queue.submit(esc)
+            logger.warning('Filed L1 backfill-overstay-rate escalation %s', esc.id)
+        except Exception:
+            logger.warning(
+                'Failed to file backfill-overstay-rate escalation', exc_info=True
             )
 
     def _emit_lock_event(
