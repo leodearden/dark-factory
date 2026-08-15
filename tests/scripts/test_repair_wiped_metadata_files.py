@@ -50,6 +50,7 @@ from audit_wiped_metadata_files import (
     WipeCandidate,
 )
 from repair_wiped_metadata_files import (
+    _ITEMISED_DISPOSITIONS,
     ALL_DISPOSITIONS,
     CLIENT_NAME,
     EXIT_NO_ROOT,
@@ -57,6 +58,7 @@ from repair_wiped_metadata_files import (
     EXIT_OK,
     EXIT_SERVER_UNREACHABLE,
     FAILED,
+    FAILED_LIVE_READ,
     PROVENANCE_KEY,
     REPAIR,
     REPAIR_TASK_ID,
@@ -572,6 +574,20 @@ class _DuplicateCandidateKeyError(RuntimeError):
     stays a pure unit test of repair_one's error handling."""
 
 
+class _ConnectError(OSError):
+    """Shape-alike for httpx.ConnectError — a dead socket mid-batch.
+
+    Not httpx.ConnectError itself, and not imported: a pure unit test of
+    repair_project's live re-read must not depend on a transport library, and
+    the `except Exception` arm it exercises (scripts/repair_wiped_metadata_files.py)
+    catches ANY exception type by construction — the fused-memory tool layer
+    never raises across the wire (`@mcp_tool_errors` converts every
+    server-side exception into an ordinary reply dict), so an exception
+    reaching that arm can only ever be client-side/transport, and no
+    sub-classification by exception type is needed or wanted there. A plain
+    OSError subclass is a faithful enough stand-in for that purpose."""
+
+
 def test_repair_one_issues_exactly_one_merge_mode_update_task():
     """(a) one update_task carrying id/project_root/metadata/metadata_mode."""
     client = _FakeClient()
@@ -812,6 +828,37 @@ def test_format_summary_lists_each_lock_charter_skip_individually():
 
     assert "77" in summary
     assert "orchestrator/src/orchestrator" in summary
+
+
+def test_format_summary_lists_each_failed_live_read_individually():
+    """(b) same again for FAILED_LIVE_READ — an aggregate count alone tells an
+    operator nothing they can act on; the task id and the reason must both
+    appear under a dedicated heading."""
+    summary = format_summary(
+        _result(
+            [
+                _outcome(
+                    2464,
+                    FAILED_LIVE_READ,
+                    detail="live re-read: server reply was empty ({}) "
+                    "— it carries no positive write signal",
+                )
+            ]
+        )
+    )
+
+    assert "-- failed_live_read" in summary
+    assert "2464" in summary
+    assert "no positive write signal" in summary
+
+
+def test_failed_live_read_is_a_registered_disposition():
+    """The wiring itself, pinned directly rather than only implied by the
+    zero-count test above and the JSON `set(counts) == set(ALL_DISPOSITIONS)`
+    assertion later in this file — both cover FAILED_LIVE_READ for free once
+    it is in these two tuples, but only if it actually is."""
+    assert FAILED_LIVE_READ in ALL_DISPOSITIONS
+    assert FAILED_LIVE_READ in _ITEMISED_DISPOSITIONS
 
 
 def test_format_summary_echoes_the_audit_coverage_block():
@@ -1116,6 +1163,70 @@ def test_repair_project_short_circuits_a_lock_charter_reject_before_any_mcp_call
     assert [o.disposition for o in result.outcomes] == [SKIP_LOCK_CHARTER]
     assert client.calls == [], f"the pre-check dialled the server: {client.calls}"
     assert "orchestrator/src/orchestrator" in (result.outcomes[0].detail or "")
+
+
+def test_repair_project_reports_a_mid_batch_transport_death_as_failed_live_read(tmp_path):
+    """A DEAD SOCKET MID-BATCH IS NOT A MISSING TASK. Today this exception is
+    caught and filed as SKIP_MISSING — the SAME disposition as a genuinely
+    absent task — so a server that dies partway through a batch reports every
+    remaining candidate as a benign skip and the run exits 0. The `except`
+    arm is transport-only BY CONSTRUCTION: ``@mcp_tool_errors``
+    (fused-memory/src/fused_memory/server/tool_errors.py:44-59) converts
+    every server-side exception into an ordinary reply dict, so nothing but a
+    client-side/transport failure can ever reach it — hence no
+    sub-classification by exception type here.
+    """
+    root = _wiped_project(tmp_path)
+    client = _FakeClient(raises=_ConnectError("Connection refused"))
+
+    result = asyncio.run(repair_project(client, str(root), apply=True, now_iso=_NOW))
+
+    assert [o.disposition for o in result.outcomes] == [FAILED_LIVE_READ]
+    detail = result.outcomes[0].detail or ""
+    assert "_ConnectError" in detail
+    assert "Connection refused" in detail
+    assert "update_task" not in [name for name, _ in client.calls]
+
+
+def test_repair_project_reports_an_unanswered_live_reread_as_failed_live_read(tmp_path):
+    """AN UNANSWERED REPLY IS THE SAME UNJUDGED STATE AS A DEAD SOCKET. A
+    wedged server that ACKs with a 202 or an empty body reaches this script
+    as literally ``{}`` (``FusedMemoryClient._post``,
+    scripts/migrate_metadata_modules_to_files.py:89-90) — genuinely reachable
+    through this script's own transport, not a hypothetical. Filing it as a
+    benign SKIP_MISSING would be the empty-reply fix (classify_reply) leaking
+    straight back out here: the run would still exit 0 having left this
+    candidate unexamined.
+    """
+    root = _wiped_project(tmp_path)
+    client = _FakeClient(returns={})
+
+    result = asyncio.run(repair_project(client, str(root), apply=True, now_iso=_NOW))
+
+    assert [o.disposition for o in result.outcomes] == [FAILED_LIVE_READ]
+    assert [name for name, _ in client.calls] == ["get_task"]
+
+
+def test_repair_project_still_skips_a_genuinely_missing_task_as_skip_missing(tmp_path):
+    """REGRESSION GUARD, not a new behaviour. Reuses the exact payload from
+    test_repair_project_reports_the_servers_own_reason_for_a_missing_task
+    below: the server ANSWERED — it just said the task is gone — so this must
+    stay a benign SKIP_MISSING. Without this guard, splitting the live
+    re-read on ``answered`` could silently reclassify a genuinely-absent task
+    as a transport failure, which would make exit 5 fire on a healthy run.
+    """
+    root = _wiped_project(tmp_path)
+    client = _FakeClient(
+        returns={
+            "error": "No tasks found for ID(s): 2464",
+            "error_type": "TaskNotFoundError",
+        }
+    )
+
+    result = asyncio.run(repair_project(client, str(root), apply=True, now_iso=_NOW))
+
+    assert [o.disposition for o in result.outcomes] == [SKIP_MISSING]
+    assert "TaskNotFoundError" in (result.outcomes[0].detail or "")
 
 
 def test_repair_project_reports_the_servers_own_reason_for_a_missing_task(tmp_path):
