@@ -2635,7 +2635,16 @@ class TaskWorkflow:
             elif self.initial_plan:
                 self.artifacts.write_plan(self.initial_plan)
                 self.artifacts.stamp_plan_provenance(self.session_id)
-                self.artifacts.lock_plan(self.session_id)
+                # run_id lets TaskGroundTruth compose a full
+                # shared.task_claimant.compose_claimant_run_id identity from
+                # this lock (task 3563).  lock_plan records os.getpid() in
+                # THIS process and we pass THIS session_id, so the resulting
+                # identity is byte-identical to the DB claimant stamp built
+                # from the same three components above.  Passed RAW, not
+                # `or ''` as the DB stamp does: a harness-less workflow must
+                # write no run_id key and degrade to a fail-safe unknown
+                # rather than to a well-shaped-but-wrong identity.
+                self.artifacts.lock_plan(self.session_id, run_id=self._process_run_id)
                 self.plan = self.artifacts.read_plan()
                 logger.info(
                     f'Task {self.task_id}: using provided plan '
@@ -4701,9 +4710,9 @@ class TaskWorkflow:
         if outcome := await self._validate_prerequisites_or_block('initial plan'):
             return outcome
 
-        # Stamp provenance and acquire lock
+        # Stamp provenance and acquire lock (run_id — task 3563; see _drive)
         self.artifacts.stamp_plan_provenance(self.session_id)
-        self.artifacts.lock_plan(self.session_id)
+        self.artifacts.lock_plan(self.session_id, run_id=self._process_run_id)
         self.plan = self.artifacts.read_plan()
 
         if revalidation and self.event_store:
@@ -4873,7 +4882,7 @@ class TaskWorkflow:
         # Acquire plan lock (the architect path also does this; the eval
         # path skips it entirely).  If another session holds the lock,
         # fall through to the architect path which has its own retry logic.
-        if not self.artifacts.lock_plan(self.session_id):
+        if not self.artifacts.lock_plan(self.session_id, run_id=self._process_run_id):
             logger.info(
                 'Task %s: revalidation skip declined — plan.lock contended',
                 self.task_id,
@@ -5035,7 +5044,7 @@ class TaskWorkflow:
                 self.task_id, exc,
             )
             return WorkflowOutcome.REQUEUED
-        self.artifacts.lock_plan(self.session_id)
+        self.artifacts.lock_plan(self.session_id, run_id=self._process_run_id)
         self.plan = self.artifacts.read_plan()
 
         # Refresh module assignments from the plan's files (handles the
