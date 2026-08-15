@@ -402,7 +402,7 @@ def _pool_with_ids(*pairs: tuple[str, str]) -> list[_PoolEntry]:
             status=status,
             priority='medium',
             source='module',
-            combine_eligible=(status == 'pending'),
+            combine_eligible=is_combine_eligible_status(status),
         )
         for tid, status in pairs
     ]
