@@ -983,7 +983,8 @@ def test_uvicorn_flag_lookup_is_scoped_to_exec_start(tmp_path: pathlib.Path) -> 
 
     Both real unit files carry an explanatory comment block above ExecStart that
     names these flags verbatim — dark-factory-dashboard.service literally
-    contains the string "--timeout-keep-alive 5" in a comment.  So a future
+    contains "--timeout-keep-alive" followed by its value in a comment (quoted
+    without the number here so this claim cannot rot on a retune).  So a future
     refactor of _uvicorn_int_flag to a whole-file regex would keep every test in
     this module green while the flag had actually been deleted from the command
     systemd runs, which is the exact regression these tests exist to catch.
