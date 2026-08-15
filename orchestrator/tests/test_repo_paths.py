@@ -8,12 +8,14 @@ path (or expanding an unset var to `/scripts/...`).
 Steps covered by this file:
   step-1: TestResolveDarkFactoryRoot — the __file__-anchored ascent
   step-3: TestDarkFactoryRootEnvOverride — DARK_FACTORY_ROOT precedence + validation
+  step-5: TestDarkFactoryRootUnresolvable — the terminal None branch degrades loudly
 """
 
 from __future__ import annotations
 
 import logging
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -162,3 +164,57 @@ class TestDarkFactoryRootEnvOverride:
         assert any(str(not_df) in m for m in warnings), (
             f'the warning must name the discarded value {not_df}; got {warnings!r}'
         )
+
+
+def _assert_unresolvable(root: object) -> None:
+    """The terminal miss must be `None` — never an empty or root-ish path.
+
+    Anti-regression for the census-sighted expansion: a falsy-but-present value
+    would let the caller inject DARK_FACTORY_ROOT='' and turn the rotation's
+    `cd $DARK_FACTORY_ROOT && scripts/watcher-rearm.sh` into `cd  && ...` /
+    `/scripts/...` — strictly worse than unset, because it also defeats the
+    rearm script's own `[ -z ... ]` guard diagnostic at the receiving end.
+    """
+    assert root is None, f'unresolvable must be None, got {root!r}'
+    assert not isinstance(root, str), 'must never return a str'
+    assert root != Path(''), "must never return Path('')"
+    assert root != Path('.'), "must never return Path('.')"
+    assert root != Path('/'), "must never return Path('/')"
+
+
+class TestDarkFactoryRootUnresolvable:
+    """The terminal branch: no override, no validating ascent (task 3605)."""
+
+    def test_returns_none_and_warns_when_ascent_finds_nothing(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """resolve_local_df_checkout() -> None: degrade to None, loudly."""
+        monkeypatch.delenv(DARK_FACTORY_ROOT_ENV, raising=False)
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            with patch(
+                'orchestrator.repo_paths.resolve_local_df_checkout', return_value=None
+            ):
+                root = resolve_dark_factory_root()
+
+        _assert_unresolvable(root)
+        assert _repo_paths_warnings(caplog), (
+            'an unresolvable root must be visible in the orchestrator log — the '
+            'caller must be able to tell "unresolvable" from "resolved to nothing"'
+        )
+
+    def test_returns_none_and_warns_when_ascent_lacks_the_marker(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """An ascent landing on a non-DF repo is a miss, not a usable root."""
+        monkeypatch.delenv(DARK_FACTORY_ROOT_ENV, raising=False)
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            with patch(
+                'orchestrator.repo_paths.resolve_local_df_checkout', return_value=tmp_path
+            ):
+                root = resolve_dark_factory_root()
+
+        _assert_unresolvable(root)
+        assert _repo_paths_warnings(caplog)
