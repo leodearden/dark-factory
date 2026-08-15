@@ -669,8 +669,10 @@ def test_repair_one_treats_an_empty_reply_as_failed():
 
 def test_repair_one_accepts_a_plain_success_shape():
     """The complement of the above: an ordinary success must not be misread as
-    a failure just because it carries no explicit success flag."""
-    for payload in ({}, {"success": True}, {"id": "2464", "status": "done"}):
+    a failure just because it carries no explicit success flag. `{}` is NOT
+    among these any more — an empty reply carries no positive write signal
+    and is now covered by test_repair_one_treats_an_empty_reply_as_failed."""
+    for payload in ({"success": True}, {"id": "2464", "status": "done"}):
         client = _FakeClient(returns=payload)
 
         result = asyncio.run(repair_one(client, _ROOT, _candidate(4), now_iso=_NOW))

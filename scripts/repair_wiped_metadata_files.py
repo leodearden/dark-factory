@@ -361,33 +361,98 @@ class RepairOutcome(NamedTuple):
     detail: str | None = None
 
 
-def _error_detail(result: object) -> str | None:
-    """Return an error description if *result* is an error-shaped reply, else None.
+class ReplyVerdict(NamedTuple):
+    """The result of classifying one MCP server reply.
+
+    ``ok`` mirrors ``fused_memory.middleware.task_interceptor.
+    interceptor_write_succeeded`` (fused-memory/src/fused_memory/middleware/
+    task_interceptor.py:5829-5868) verbatim in semantics — its four-clause
+    rule, ``isinstance(resp, dict) and bool(resp) and
+    bool(resp.get('success', True)) and not resp.get('error')`` — because
+    that predicate is this repo's canonical write-success contract, and a
+    reply this script cannot confirm succeeded IS a failure. That docstring's
+    own words: "An empty dict {} carries no positive write signal and is
+    therefore treated as **failure**"; "Non-dict responses (None, strings,
+    lists) are always treated as failures." This is a TRANSCRIBED MIRROR, not
+    an import — see :func:`classify_reply` for why importing the canonical
+    predicate is infeasible under this suite's verify gate.
+
+    ``answered`` is the axis ``interceptor_write_succeeded`` has no need of:
+    whether the server explained ITSELF (an explicit ``error`` /
+    ``success: False`` marker) or said nothing usable at all (``{}``, or any
+    non-dict reply). :func:`repair_project`'s live re-read uses it to tell
+    "the server told us this task is gone" (a benign, named skip) apart from
+    "the server never answered usefully" (indistinguishable from a dead
+    transport, and therefore a candidate that was never judged).
+
+    ``detail`` is the operator-actionable reason for a non-``ok`` verdict,
+    and is ``None`` iff ``ok`` is ``True``.
+    """
+
+    ok: bool
+    answered: bool
+    detail: str | None
+
+
+def classify_reply(result: object) -> ReplyVerdict:
+    """Classify one MCP server reply: did it succeed, did the server answer, why not.
 
     The server ALWAYS reports a rejection by ANSWERING rather than raising:
     ``@mcp_tool_errors`` (fused-memory/src/fused_memory/server/tool_errors.py:44-59)
-    converts every exception into an ordinary reply dict, so nothing ever
-    crosses the wire as an exception. A bare truthiness check on the reply
-    would count an ``{"error": ...}`` body or a ``{"success": False}`` flag as a
-    repair that never happened, which is the silent fail-soft this script
-    exists to avoid. Anything else (including an empty dict, or a plain echoed
-    task) is a success: the ABSENCE of an error marker is not itself an error
-    marker.
+    converts every exception into an ordinary reply dict, so nothing
+    server-side ever crosses the wire as an exception. But the converse — a
+    reply this script cannot read as a positive success signal — is not
+    innocent either. This repo's canonical write-success contract,
+    ``interceptor_write_succeeded`` (fused-memory/src/fused_memory/middleware/
+    task_interceptor.py:5829-5868), treats an empty dict and any non-dict
+    response as **failure**. THIS REPLACES THIS FUNCTION'S OWN FORMER STANCE
+    — "the ABSENCE of an error marker is not itself an error marker" — which
+    was the bug: a wedged server that ACKs with a 202 or an empty body
+    reaches this script as literally ``{}``. See ``FusedMemoryClient._post``
+    (scripts/migrate_metadata_modules_to_files.py:89-90), which returns
+    ``{}`` for a 202 or an empty body, and ``call_tool`` (:126), which falls
+    through to ``result.get('result', {})`` when the reply carries neither
+    ``structuredContent`` nor text content — so ``{}`` is a genuinely
+    reachable shape through this script's own transport, not a hypothetical.
+    The old rule reported that reply, indistinguishable from a dead
+    transport, as a REPAIR that never happened.
 
-    ``error_type`` is included when present — it is the machine-readable half
-    of the reply (``TaskNotFoundError``, ``DuplicateCandidateKeyError``) and is
-    what an operator greps for.
+    ``answered`` exists for :func:`repair_project`'s live re-read, which must
+    tell a benign "the server explained itself" skip apart from "the server
+    never answered usefully at all" — see that function's docstring.
+
+    THE CHECK ORDER IS LOAD-BEARING: not-a-dict first (nothing else can call
+    ``.get`` on it), then emptiness (a ``{}`` has neither an ``error`` nor a
+    ``success`` key and would otherwise fall through to the ok branch), and
+    only then the error/success probes.
+
+    ``error_type`` is included in the detail when present — it is the
+    machine-readable half of the reply (``TaskNotFoundError``,
+    ``DuplicateCandidateKeyError``) and is what an operator greps for.
     """
     if not isinstance(result, dict):
-        return None
+        raw = repr(result)
+        if len(raw) > 200:
+            raw = raw[:200] + "…"
+        return ReplyVerdict(
+            False, False, f"server reply was not a dict: {type(result).__name__}: {raw}"
+        )
+    if not result:
+        return ReplyVerdict(
+            False,
+            False,
+            "server reply was empty ({}) — it carries no positive write signal",
+        )
     if result.get("error"):
         error_type = result.get("error_type")
         named = f"{error_type}: " if error_type else ""
-        return f"server returned an error: {named}{result['error']}"
+        return ReplyVerdict(
+            False, True, f"server returned an error: {named}{result['error']}"
+        )
     if result.get("success") is False:
         detail = result.get("error_type") or result.get("message") or result
-        return f"server reported failure: {detail}"
-    return None
+        return ReplyVerdict(False, True, f"server reported failure: {detail}")
+    return ReplyVerdict(True, True, None)
 
 
 async def repair_one(
@@ -451,14 +516,19 @@ async def repair_one(
             detail=f"{type(exc).__name__}: {exc}",
         )
 
-    detail = _error_detail(result)
-    if detail is not None:
+    verdict = classify_reply(result)
+    if not verdict.ok:
+        # BOTH failure classes land here: an explicit error/success:False
+        # payload, AND an empty/unanswered reply. A write this script cannot
+        # confirm succeeded IS a failed write — that is the whole of the
+        # empty-reply fix, and it is why repair_one has no `answered` branch
+        # the way repair_project's live re-read does.
         return RepairOutcome(
             task_id=candidate.task_id,
             tag=candidate.tag,
             disposition=FAILED,
             files=writable_plan_files(candidate),
-            detail=detail,
+            detail=verdict.detail,
         )
     # `files` is what was WRITTEN, not what was recovered — the summary prints
     # its length, and reporting a count the payload did not carry would be the
@@ -627,15 +697,20 @@ async def repair_project(
         # lands in SKIP_MISSING with a detail that explains nothing. Read the
         # reply's own explanation FIRST so the disposition carries the server's
         # reason, as RepairOutcome.detail's docstring promises it does.
-        live_error = _error_detail(live)
-        if live_error is not None:
+        verdict = classify_reply(live)
+        if not verdict.ok:
+            # Both failure classes still land in SKIP_MISSING here — this
+            # step only replaces the classifier, not the disposition. A later
+            # step splits this on `verdict.answered` so an unanswered reply
+            # (indistinguishable from a dead transport) is reported as a
+            # candidate that was never judged, rather than as a benign skip.
             outcomes.append(
                 RepairOutcome(
                     task_id=candidate.task_id,
                     tag=candidate.tag,
                     disposition=SKIP_MISSING,
                     files=candidate.plan_files,
-                    detail=f"live re-read: {live_error}",
+                    detail=f"live re-read: {verdict.detail}",
                 )
             )
             continue
