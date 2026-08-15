@@ -42,6 +42,7 @@ import argparse
 import json
 import math
 import sys
+import textwrap
 import time
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
@@ -1284,12 +1285,47 @@ def exit_code_for(report: HealthReport) -> int:
     return EXIT_OK
 
 
+def _wrapped(text: str) -> list[str]:
+    """Wrap a report string for the terminal without ever splitting a token.
+
+    `break_long_words` and `break_on_hyphens` are both OFF on purpose.  These
+    strings carry process names and paths -- `/usr/local/lib/ollama/llama-server`
+    is one hyphenated 38-character token -- and the operator's next move is to
+    search for that exact string. A wrap that split it at the hyphen would leave
+    a name in the output that matches nothing on the machine. An over-long line
+    is a far smaller cost than an unsearchable one.
+    """
+    return textwrap.wrap(
+        text, width=88, initial_indent='  ', subsequent_indent='  ',
+        break_long_words=False, break_on_hyphens=False,
+    )
+
+
+def _consumer_lines(label: str, consumers: Sequence[lms_vram.GpuConsumer]) -> list[str]:
+    """One inventory, as terminal lines.
+
+    An empty list renders as an explicit `(none)` rather than nothing at all:
+    a silently absent section is indistinguishable from a section this build
+    does not render, and "no CUDA compute apps beside a 3312 MiB baseline" is a
+    real, explainable reading on this host -- the graphics contexts holding it
+    are invisible to `--query-compute-apps`.
+    """
+    if not consumers:
+        return [f'  {label}: (none)']
+    return [f'  {label}:'] + [
+        f'    pid {c.pid} {c.process_name} — {c.used_mib} MiB ({c.used_gib} GiB)'
+        for c in consumers
+    ]
+
+
 def render_table(report: HealthReport) -> str:
     """Render the report for a human.
 
     Takes the report and NOTHING else -- no arms, no manifest, no GPU -- so
     there is nothing left for it to recompute and the text can never contradict
-    the JSON beside it.
+    the JSON beside it.  That extends to the pollution banner: it is printed on
+    the block's own `pollution` field, never re-derived from the consumer lists
+    printed beside it, so the two cannot drift apart.
     """
     headers = ('ARM', 'AXIS', 'STACK', 'ENDPOINT', 'VERDICT', 'REASON', 'MS')
     rows = [
@@ -1334,13 +1370,47 @@ def render_table(report: HealthReport) -> str:
             f'{report.vram.nominal_ceiling_gib} GiB, measured operating budget '
             f'on this host {report.vram.operating_budget_gib} GiB',
             f'  {report.vram.reason}',
-            '',
-            f'OVERALL: {report.overall}',
         ]
     )
+
+    # Who else held the card.  Printed under the VRAM lines because it is what
+    # decides whether those lines mean anything at all.
+    out.append('')
+    out.append('non-arm GPU consumers')
+    out.extend(_consumer_lines('at baseline, before the arm started',
+                               report.vram.baseline_consumers))
+    out.extend(_consumer_lines('at the probe reading (the arm included)',
+                               report.vram.probe_consumers))
+    if report.vram.consumer_inventory_note:
+        out.extend(_wrapped(report.vram.consumer_inventory_note))
+
+    out.extend(['', f'OVERALL: {report.overall}'])
     for row in report.arms:
         if row.verdict == 'FAIL':
             out.append(f'  {row.arm_id}: {row.reason} — {row.detail}')
+
+    # LAST, so it is the final thing on the screen -- and deliberately BELOW the
+    # OVERALL line rather than above it.  `overall` is computed from the row
+    # verdicts and the vram verdict (which render_table must not recompute), so
+    # a polluted run can and does print `OVERALL: PASS`.  Left unqualified above
+    # the banner that is a flat contradiction; underneath it, the banner is the
+    # last word and says exactly which verdicts it voids.
+    #
+    # Printed from the block's own `pollution` field, NOT re-derived from the
+    # consumer lists above, so the banner and the JSON cannot drift apart.
+    if report.vram.pollution == lms_vram.PollutionState.POLLUTED:
+        out.extend([
+            '',
+            '*** VRAM MEASUREMENT POLLUTED ***',
+            '  Another process moved on the card between the two readings, so '
+            'every VRAM',
+            '  figure above — and the OVERALL verdict, which is computed partly '
+            'from them —',
+            '  is void. This says NOTHING about whether the arm fits; measure '
+            'again on a',
+            '  quiet card.',
+        ])
+        out.extend(_wrapped(report.vram.pollution_reason))
     return '\n'.join(out)
 
 
