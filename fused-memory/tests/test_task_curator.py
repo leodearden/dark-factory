@@ -12,13 +12,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
 from shared.neutral_cwd import neutral_cli_cwd
-from shared.task_statuses import TaskStatus
 from shared.prompt_artifact import (
     ArtifactProvenance,
     PromptArtifactStore,
     PromptSpec,
     compose_prompt,
 )
+from shared.task_statuses import TaskStatus
 
 from fused_memory.backends.task_backend_errors import TaskmasterError, TaskNotFoundError
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig

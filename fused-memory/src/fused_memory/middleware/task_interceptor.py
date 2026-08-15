@@ -2096,11 +2096,17 @@ class TaskInterceptor:
         metadata blob (``metadata_mode='merge'``) — it does not replace that
         blob. See the comment at the write for why (task 3446).
 
-        Before writing, verifies the target's fingerprint and status. A
-        mismatched fingerprint (curator targeted the wrong task) or terminal
-        status (done/cancelled) aborts the write and returns None so the
-        caller degrades to ``create`` instead of silently clobbering an
-        unrelated task.
+        Before writing, verifies the target is still combine-ELIGIBLE and that
+        its fingerprint matches. Eligibility is the shared
+        ``is_combine_eligible_status`` (task_curator) — the same predicate the
+        curator's selection snapshot uses, so the two cannot drift apart —
+        conjoined with an execution-only liveness check: a target held by a
+        live ``claimant_run_id`` is refused even when its status is pending
+        (task 4035). A mismatched fingerprint (curator targeted the wrong
+        task) aborts likewise. Every abort returns None so the caller degrades
+        to ``create`` instead of clobbering a task that has moved on since
+        selection. Eligibility refusals are recorded in the combine audit with
+        a ``refused_reason`` token so the refusal rate is countable.
 
         A third abort condition joins those two: *candidate_metadata*
         declaring an escalation gate while the live target does not. The
@@ -2148,36 +2154,54 @@ class TaskInterceptor:
         # `in {'done','cancelled'}` let 20.2% of combines rewrite targets
         # that had moved on since selection (task 4035).
         target_status = str(target.get('status', '') or '')
+        # Present-and-non-blank, NOT `is not None`: a blank/whitespace
+        # claimant is this codebase's spelling for "unclaimed"
+        # (shared/task_claimant.py; live_task_write_guard.has_live_claimant),
+        # and .get() keeps it safe on a row with no such key at all.
+        target_claimant = target.get('claimant_run_id')
+        target_is_claimed = isinstance(target_claimant, str) and target_claimant.strip() != ''
+
         if not is_combine_eligible_status(target_status):
+            refused_reason = COMBINE_REFUSED_NOT_PENDING
             logger.warning(
                 'combine-guard: target %s is not combine-eligible (status=%r) — '
                 'aborting combine to avoid silently losing candidate work',
                 decision.target_id,
                 target_status,
             )
-            return None
-
-        # ── Guard: a live claimant holds the target right now ──
-        # Status alone has the same TOCTOU shape one level down: a target can
-        # read 'pending' at the guard above and be dispatched a moment later.
-        # The claimant rides along on the dict already re-read above (the task
-        # backend serializes claimant_run_id into every get_task result), so
-        # this closes the inner window at no extra I/O.
-        #
-        # Present-and-non-blank, NOT `is not None`: a blank/whitespace
-        # claimant is this codebase's spelling for "unclaimed"
-        # (shared/task_claimant.py; live_task_write_guard.has_live_claimant),
-        # and .get() keeps it safe on a row with no such key at all.
-        target_claimant = target.get('claimant_run_id')
-        if isinstance(target_claimant, str) and target_claimant.strip() != '':
+        elif target_is_claimed:
+            # Status alone has the same TOCTOU shape one level down: a target
+            # can read 'pending' at the check above and be dispatched a moment
+            # later. The claimant rides along on the dict already re-read
+            # above, so this closes the inner window at no extra I/O.
+            refused_reason = COMBINE_REFUSED_CLAIMED
             logger.warning(
                 'combine-guard: target %s is held by a live claimant — aborting '
                 'combine to avoid rewriting a task under a running agent',
                 decision.target_id,
             )
-            return None
+        else:
+            refused_reason = None
 
         target_title = str(target.get('title', '') or '')
+
+        if refused_reason is not None:
+            # Audit the refusal so it is COUNTABLE, not merely logged: a
+            # refusal rate cannot be computed from success records alone. The
+            # old.* fields come from the live re-read above, and the new.*
+            # fields record the rewrite that was averted.
+            _append_combine_audit(
+                project_id=project_id,
+                target_id=decision.target_id,
+                old_title=target_title,
+                old_description=str(target.get('description', '') or ''),
+                old_status=target_status,
+                new_title=rt.title,
+                new_description=rt.description,
+                justification=decision.justification,
+                refused_reason=refused_reason,
+            )
+            return None
         expected_fp = normalize_title(target_title)
         got_fp = normalize_title(decision.target_fingerprint or '')
         if not got_fp or expected_fp != got_fp:
@@ -2205,8 +2229,13 @@ class TaskInterceptor:
         # Degrading to create files the gate as its own task, which is the
         # right conservative outcome for a duplicate human gate.
         #
-        # Placed before _append_combine_audit so a refusal writes no audit
-        # record, matching the fingerprint and terminal-status guards above.
+        # Placed before the success-path _append_combine_audit so this refusal
+        # writes no audit record, matching the fingerprint guard above. Only
+        # the ELIGIBILITY guard is audited (task 4035): its refusal rate is
+        # the operational signal being measured, whereas a gate-metadata or
+        # fingerprint refusal means the curator targeted the wrong task —
+        # a decision-quality problem the audit's old-vs-new record does not
+        # help diagnose.
         if self._is_gate_metadata(candidate_metadata) and not self._is_gate_metadata(
             target.get('metadata')
         ):
@@ -5941,6 +5970,16 @@ def _combine_audit_path() -> Path:
     return Path(os.getenv('DARK_FACTORY_DATA_DIR', 'data')) / 'combine_audit.jsonl'
 
 
+# Refusal-reason vocabulary for the combine audit (task 4035). Two stable
+# coarse tokens, deliberately NOT one per status: an operator greps these to
+# compute the refusal rate, while the record's own old.status field supplies
+# the per-status breakdown for free. A token per status would make this
+# vocabulary track the status enum and force a consumer update every time a
+# status is added.
+COMBINE_REFUSED_NOT_PENDING = 'target_not_pending'
+COMBINE_REFUSED_CLAIMED = 'target_claimed'
+
+
 def _append_combine_audit(
     *,
     project_id: str,
@@ -5951,8 +5990,19 @@ def _append_combine_audit(
     new_title: str,
     new_description: str,
     justification: str,
+    refused_reason: str | None = None,
 ) -> None:
-    """Append a one-line JSON record documenting an about-to-happen combine.
+    """Append a one-line JSON record documenting a combine.
+
+    Records both about-to-happen combines (``refused_reason=None``) and
+    REFUSED ones (task 4035) — an operator cannot compute a refusal rate from
+    success records alone. When *refused_reason* is None the emitted record is
+    byte-for-byte the historical shape, so existing records stay parseable and
+    ``rec.get('refused_reason')`` cleanly partitions refusal from success.
+
+    The ``new`` block is populated on a refusal too: it records the title and
+    description that would have overwritten the target, which is precisely the
+    work that was almost lost.
 
     Append-only, best-effort. Failures log WARN but never propagate —
     a flaky audit write should not block task-merge progress.
@@ -5973,6 +6023,8 @@ def _append_combine_audit(
         },
         'justification_truncated': justification[:500],
     }
+    if refused_reason is not None:
+        record['refused_reason'] = refused_reason
     path = _combine_audit_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
