@@ -2768,6 +2768,21 @@ def _run_lease_claim(name: str, slug: str, pid: int | None, policy_value: str) -
         return
     print(f'decision={claim.decision.value}')
     print(claim.message)
+    # ADDITIVE and LAST (task 3994 defect 4): `decision=` stays line 1 and the
+    # message line 2, so a skill parser that reads only the first two lines is
+    # unaffected -- which is why this is an appended line rather than a fourth
+    # LeaseDecision token a not-yet-reloaded skill would face as an
+    # unrecognised value. Lease SEMANTICS are unchanged: we never auto-steal.
+    # This only lets a stand-down name a machine-readable owner, so a watcher
+    # can file a DecisionRecord for a provably-gone holder instead of exiting
+    # silently (INV-6/INV-7). 'unknown' is deliberately NOT an orphan --
+    # fail toward held, never invent one.
+    orphaned = (
+        not claim.acquired
+        and not claim.holder_alive
+        and claim.holder_session_state in ('absent', 'exited')
+    )
+    print(f'holder_liveness={"orphaned" if orphaned else "held"}')
 
 
 def _run_lease_mutation(
