@@ -36,6 +36,7 @@ from orchestrator.verify_cmd import (
     _has_unspliceable_pytest_invocation,
     _is_serial_forced,
     _split_at_unbalanced_close,
+    _unspliceable_pytest_spans,
     apply_pytest_numprocesses,
     cargo_scope,
     describe_dropped_clauses,
@@ -893,6 +894,50 @@ _UNTERMINATED_SPAN_PARAMS = [
     for case_label, raw, corrupt_prefix in _UNTERMINATED_SPAN_CASES
 ]
 
+# (case_label, raw, expected_template) — task 4121 amendment, the OTHER
+# direction of the same quote-blindness. `_PYTEST_INVOCATION_RE` also matches
+# the word `pytest` sitting inside ANOTHER command's quoted argument, and such
+# a match is "unterminated" purely because it began mid-string. Measured spans:
+#
+#   'pytest tests/ && echo "pytest done"'
+#     -> ['pytest tests/ ', 'pytest done"']     (2nd starts INSIDE echo's quotes)
+#
+# These chains' REAL invocation is a perfectly clean, spliceable span, so
+# refusing here would disable serial recovery (and the `-n` cap, which refuses
+# identically) for a command that never had the defect. `{suffix}` is
+# substituted per mutator, exactly as `_PAREN_PRESERVING_CASES` does; the
+# quoted `pytest` word must come back BYTE-identical, which also pins that the
+# appender no longer appends junk args to the unrelated `echo` (the pre-4121
+# collateral damage).
+_FALSE_MATCH_CASES = [
+    (
+        'quoted-pytest-word-after',
+        'pytest tests/ && echo "pytest done"',
+        'pytest tests/{suffix} && echo "pytest done"',
+    ),
+    (
+        'quoted-pytest-word-before',
+        'echo "running pytest" && pytest tests/',
+        'echo "running pytest" && pytest tests/{suffix}',
+    ),
+    (
+        'quoted-pytest-word-mid-chain',
+        'pytest tests/ && echo "all pytest suites ok" && ruff check src/',
+        'pytest tests/{suffix} && echo "all pytest suites ok" && ruff check src/',
+    ),
+]
+
+_FALSE_MATCH_PARAMS = [
+    pytest.param(
+        mutate,
+        raw,
+        template.format(suffix=suffix),
+        id=f'{mutator_label}-{case_label}',
+    )
+    for mutator_label, mutate, suffix in _SUBSHELL_MUTATORS
+    for case_label, raw, template in _FALSE_MATCH_CASES
+]
+
 
 class TestSubshellClauseIntegrity:
     """A mutator that appends flags to a raw-retained pytest chain must place
@@ -1039,26 +1084,14 @@ class TestUnterminatedQuoteRefusesFlagSplicing:
         render(apply_pytest_numprocesses(..., '4'))
           == "pytest -k 'a -n 4 && b' tests/ && true"
 
-    Cause: ``_PYTEST_INVOCATION_RE`` (``\\bpytest\\b[^&|;]*``) is quote-BLIND,
-    so it stops at the ``&&`` that lives INSIDE the ``-k`` quotes and the
-    matched span ends mid-quote. ``_split_at_unbalanced_close`` is handed that
-    span and DISCARDS the ``unterminated`` flag ``_unquoted_chars`` returns
-    (``chars, _unterminated = ...``), so it reports ``(segment, '')`` and the
-    suffix is appended at the end of ``body`` — which is inside the live
-    quote. The sibling consumer of the very same flag,
-    ``_scan_and_chain(strict=True)``, already refuses on it
-    (``if strict and (unterminated or depth != 0): return None``); this one
-    did not.
-
-    The corrupted command still passes ``bash -n`` (bash re-tokenises it into
-    a single ``-k`` word ``a -p no:xdist -o addopts= && b``), so this is a
-    SILENT wrong-tests-run: the recovery flags never reach pytest as flags at
-    all, and ``_is_serial_forced`` — a plain ``'no:xdist' in cmd.raw``
-    substring test — additionally reports the command as serial because the
-    substring IS present, inside the quotes. Exactly the failure class
-    ``_PYTEST_INVOCATION_RE``'s own comment and
-    ``_split_at_unbalanced_close``'s docstring already reject for the
-    parenthesised cases.
+    Cause: ``_PYTEST_INVOCATION_RE`` is quote-BLIND, so it stops at the ``&&``
+    that lives INSIDE the ``-k`` quotes and the matched span ends mid-quote;
+    ``_split_at_unbalanced_close`` was handed that span and DISCARDED the
+    ``unterminated`` flag (``chars, _unterminated = ...``), so the suffix went
+    on the end of ``body`` — inside the live quote. The corrupted command
+    still passes ``bash -n``, i.e. a SILENT wrong-tests-run. The full rule and
+    its measurements live in ``verify_cmd._unspliceable_pytest_spans``; this
+    class is the executable pin on it, and deliberately does not restate it.
     """
 
     @pytest.mark.parametrize(('mutate', 'raw', 'corrupt_marker'), _UNTERMINATED_SPAN_PARAMS)
@@ -1160,6 +1193,34 @@ class TestUnterminatedQuoteRefusesFlagSplicing:
         """
         assert _has_unspliceable_pytest_invocation(raw) is False
 
+    @pytest.mark.parametrize(('mutate', 'raw', 'expected'), _FALSE_MATCH_PARAMS)
+    def test_a_quoted_pytest_word_elsewhere_does_not_refuse_the_real_invocation(
+        self, mutate, raw, expected
+    ):
+        """The other direction of the same quote-blindness — the over-refusal guard.
+
+        ``_PYTEST_INVOCATION_RE`` matches the word ``pytest`` inside another
+        command's quoted argument too, and such a span is "unterminated" only
+        because the match began mid-string. Treating it as an unspliceable
+        INVOCATION would refuse a chain whose real invocation is a clean,
+        spliceable span — silently disabling serial recovery and the ``-n``
+        cap for a command that never had the defect (the first cut of this
+        task did exactly that; see ``_pytest_invocation_spans``).
+
+        Asserts both halves: the real invocation DOES get its flags, and the
+        quoted ``pytest`` word comes back BYTE-identical — which also pins
+        that the appender no longer appends junk arguments to the unrelated
+        ``echo``, the collateral damage of the pre-refusal behaviour.
+        """
+        cmd = parse_config_command(raw)
+        assert cmd.tool is ToolKind.PYTEST
+        assert cmd.raw is not None
+        assert _unspliceable_pytest_spans(raw) == []
+
+        result = render(mutate(cmd))
+        assert result == expected
+        _assert_bash_parses(result, what=raw)
+
     def test_the_live_fleet_test_command_is_not_newly_refused(self):
         """Read from the committed YAML, not a hand-copied literal.
 
@@ -1173,15 +1234,8 @@ class TestUnterminatedQuoteRefusesFlagSplicing:
             is False
         )
 
-    @pytest.mark.parametrize(
-        ('mutate', 'raw'),
-        [
-            pytest.param(mutate, raw, id=f'{mutator_label}-{case_label}')
-            for mutator_label, mutate, _suffix in _SUBSHELL_MUTATORS
-            for case_label, raw, _corrupt_prefix in _UNTERMINATED_SPAN_CASES
-        ],
-    )
-    def test_a_refused_rewrite_returns_the_callers_own_command(self, mutate, raw):
+    @pytest.mark.parametrize(('mutate', 'raw', '_corrupt_marker'), _UNTERMINATED_SPAN_PARAMS)
+    def test_a_refused_rewrite_returns_the_callers_own_command(self, mutate, raw, _corrupt_marker):
         """IDENTITY, not equality — and why equality cannot pin this.
 
         The mutators still reach ``replace(cmd, raw=...)`` on the raw branch,
@@ -1197,6 +1251,12 @@ class TestUnterminatedQuoteRefusesFlagSplicing:
         than a from-scratch ``render()`` re-render, which is merely
         argv-equivalent. Same rationale ``_with_junitxml_str``'s
         ``test_noop_is_byte_identical`` records for its own ``is`` assertion.
+
+        Parametrized off ``_UNTERMINATED_SPAN_PARAMS`` — the SAME list the
+        splice test above uses, ignoring only its ``corrupt_marker`` column —
+        rather than re-deriving the mutator x case cross-product inline: two
+        hand-built lists over one corpus are free to drift in ids or filtering
+        while both still look exhaustive.
         """
         cmd = parse_config_command(raw)
         assert cmd.raw is not None

@@ -61,6 +61,7 @@ from orchestrator.verify_cmd import (
     ChainSegment,
     ToolKind,
     VerifyCmd,
+    _unspliceable_pytest_spans,
     apply_pytest_numprocesses,
     cargo_scope,
     govern_cpu,
@@ -1314,19 +1315,20 @@ def _serial_pytest_str(cmd: str | None) -> str | None:
 
     **Why the refusal branch logs (task 4121).** There is a third way to
     reach ``rewritten is parsed``: ``verify_cmd``'s raw-chain appender
-    REFUSES outright when a pytest invocation's matched span ends inside an
-    unclosed quote — ``pytest -k 'a && b' tests/``, where the quote-blind
-    ``_PYTEST_INVOCATION_RE`` stops at the ``&&`` INSIDE the ``-k`` quotes
-    (see ``verify_cmd._has_unspliceable_pytest_invocation``). Refusing is
-    correct: appending there lands the flags inside a live quoted argument,
-    which still passes ``bash -n`` while running the wrong tests. But a
+    REFUSES outright rather than splice the flags into an unclosed quote
+    (the rule and its measurements live in
+    ``verify_cmd._unspliceable_pytest_spans``). Refusing is correct, but a
     SILENT refusal is its own defect — the ENV_TRANSIENT retry re-runs the
     ORIGINAL command and fails for its own reason, and an operator reading
     that log cannot tell "recovery ran without its flags" from "recovery
     ran". One WARNING makes the difference legible, the same reasoning
     ``_with_junitxml_str`` records for its own suppressed injection (task
     3218). This is the single string-level wrapper behind every
-    serial-recovery call site, so one record here covers them all.
+    serial-recovery call site, so one record here covers them all. The
+    record names the OFFENDING SPAN — ``_unspliceable_pytest_spans`` returns
+    the spans, not a bare bool — so a long multi-segment ``test_command``
+    does not leave the operator re-deriving the segmentation by hand, and so
+    the message states what was measured instead of asserting a cause.
 
     The gate is STRUCTURAL (``parsed.tool is ToolKind.PYTEST and parsed.raw
     is not None``) rather than "does the command contain an unspliceable
@@ -1352,15 +1354,23 @@ def _serial_pytest_str(cmd: str | None) -> str | None:
     rewritten = serial_pytest(parsed)
     if rewritten is parsed:
         if parsed.tool is ToolKind.PYTEST and parsed.raw is not None:
+            refused = _unspliceable_pytest_spans(parsed.raw)
+            reason = (
+                f'the matched pytest span {refused[0]!r} ends inside an unclosed '
+                "quote (commonly a -k 'a && b' expression, where the quote-blind "
+                'span scanner stops at the && INSIDE the quotes), so nowhere in it '
+                'could take -p no:xdist -o addopts= without landing inside a live '
+                'quoted argument and silently running the wrong tests'
+                if refused
+                else 'no pytest invocation could be located outside a quoted '
+                'argument, so there was nowhere to put -p no:xdist -o addopts='
+            )
             logger.warning(
-                'serial recovery flags could not be applied to %s: a pytest '
-                "invocation's arguments contain an unbalanced quote around a shell "
-                "chain operator (e.g. -k 'a && b'), so there is no position where "
-                '-p no:xdist -o addopts= could be appended without landing inside '
-                'the quoted argument and silently running the wrong tests. The '
-                'ORIGINAL command is being re-run unchanged, so this retry will '
-                'fail for its own reason rather than recover',
+                'serial recovery flags could not be applied to %s: %s. The ORIGINAL '
+                'command is being re-run unchanged, so this retry will fail for its '
+                'own reason rather than recover',
                 cmd,
+                reason,
             )
         return cmd
     return render(rewritten)
@@ -1408,11 +1418,9 @@ def _with_pytest_numprocesses_str(cmd: str | None, n: str) -> str | None:
     configures a numeric cap), and an already-serial-forced command (``-p
     no:xdist`` — injecting ``-n`` there would fail the run with
     ``unrecognized arguments: -n`` and defeat the serial-recovery safety
-    net). Task 4121 adds a fourth: the raw-chain appender REFUSES on a pytest
-    invocation whose matched span ends inside an unclosed quote (``pytest -k
-    'a && b' tests/`` — see
-    ``verify_cmd._has_unspliceable_pytest_invocation``), returning the
-    command untouched rather than splicing ``-n`` into the quoted argument.
+    net). Task 4121 adds a fourth: the raw-chain appender REFUSES rather than
+    splice ``-n`` into an unclosed quote, returning the command untouched
+    (see ``verify_cmd._unspliceable_pytest_spans``).
 
     Unlike ``_with_junitxml_str`` — and unlike ``_serial_pytest_str``, which
     task 4121 gave a WARNING for exactly that refusal — this does NOT log any

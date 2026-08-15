@@ -9117,11 +9117,10 @@ class TestSerialPytestStrRefusedRewriteIsLogged:
     """_serial_pytest_str must RECORD a refused serial rewrite, not swallow it.
 
     Task 4121, the "louder failure" half. ``verify_cmd``'s raw-chain appender
-    refuses outright when a pytest invocation's matched span ends inside an
-    unclosed quote (``pytest -k 'a && b' tests/`` — the quote-blind
-    ``_PYTEST_INVOCATION_RE`` stops at the ``&&`` INSIDE the ``-k`` quotes),
-    because anything appended there would land inside a live quoted argument
-    and silently run the wrong tests while still passing ``bash -n``.
+    refuses outright rather than splice the flags into an unclosed quote —
+    the rule, and the measurements behind it, live in
+    ``verify_cmd._unspliceable_pytest_spans`` and are deliberately not
+    restated here.
 
     Refusing is right, but a SILENT refusal is its own defect: the
     ENV_TRANSIENT retry then re-runs the ORIGINAL command and fails for its
@@ -9154,6 +9153,58 @@ class TestSerialPytestStrRefusedRewriteIsLogged:
         # lost. Anchoring on the full sentence would make this a spelling test.
         assert self._REFUSED in records[0].getMessage()
         assert 'serial' in records[0].getMessage().lower()
+        # The OFFENDING SPAN, not just the whole command: on a long
+        # multi-segment test_command the operator would otherwise have to
+        # re-derive the regex segmentation by hand to find it.
+        assert "pytest -k 'a " in records[0].getMessage()
+
+    def test_the_message_does_not_assert_a_cause_it_has_not_measured(
+        self, caplog: pytest.LogCaptureFixture,
+    ):
+        """A no-op with NO unspliceable span must not be blamed on one.
+
+        ``echo "pytest" && true`` classifies as PYTEST with ``raw`` retained
+        (measured), so it reaches the same structural gate — but its only
+        ``pytest`` token sits inside ``echo``'s quotes, so
+        ``_unspliceable_pytest_spans`` is empty and there is no ``-k``
+        expression to inspect. The record must say what was actually
+        measured (nothing to append to) rather than name an unbalanced quote
+        in an invocation's arguments and send the operator hunting for a
+        ``-k`` that does not exist.
+        """
+        from orchestrator.verify import _serial_pytest_str
+
+        cmd = 'echo "pytest" && true'
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            assert _serial_pytest_str(cmd) is cmd
+
+        records = [r for r in caplog.records if r.name == 'orchestrator.verify']
+        assert len(records) == 1
+        message = records[0].getMessage()
+        assert cmd in message
+        assert 'unclosed quote' not in message
+
+    def test_the_numprocesses_sibling_refuses_the_same_way_but_stays_silent(
+        self, caplog: pytest.LogCaptureFixture,
+    ):
+        """The asymmetry ``_with_pytest_numprocesses_str``'s docstring claims.
+
+        Both wrappers refuse identically (one appender), but only the serial
+        one logs: a suppressed ``-n`` leaves the command at its configured
+        worker count, which is the pre-cap status quo and not a lost
+        capability, whereas suppressed serial-recovery flags mean a recovery
+        attempt ran without the thing that makes it a recovery. That claim is
+        pinned here rather than left to the docstring, since the serial twin
+        got a whole class for exactly this and the asymmetry was otherwise
+        unguarded.
+        """
+        from orchestrator.verify import _with_pytest_numprocesses_str
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            result = _with_pytest_numprocesses_str(self._REFUSED, '4')
+
+        assert result is self._REFUSED, "the no-op must return the caller's own string"
+        assert [r.message for r in caplog.records if r.name == 'orchestrator.verify'] == []
 
     @pytest.mark.parametrize(
         'cmd',
@@ -9161,6 +9212,7 @@ class TestSerialPytestStrRefusedRewriteIsLogged:
             'cd a && uv run pytest t1 && cd b && uv run pytest t2',
             'uv run pytest tests/',
             "pytest -k 'a && pytest b' tests/",
+            'pytest tests/ && echo "pytest done"',
             'ruff check src/',
             'true',
             None,
@@ -9169,6 +9221,7 @@ class TestSerialPytestStrRefusedRewriteIsLogged:
             'successful-raw-chain-rewrite',
             'successful-structured-rewrite',
             'structured-despite-an-unspliceable-looking-span',
+            'quoted-pytest-word-in-another-command',
             'non-pytest-ruff',
             'opaque-true',
             'none',
@@ -9184,9 +9237,13 @@ class TestSerialPytestStrRefusedRewriteIsLogged:
         b' tests/`` parses with ``raw is None`` (measured), so it takes the
         STRUCTURED path, never reaches the appender, and IS successfully
         mutated via ``base_flags`` — a span-content gate would warn about a
-        command that lost nothing. The non-pytest and OPAQUE cases are
-        expected, benign no-ops; logging those would fire on every lint and
-        type leg and train operators to ignore the record.
+        command that lost nothing. The fourth is the over-refusal guard at
+        the log level: ``pytest tests/ && echo "pytest done"`` has an
+        unterminated SPAN (``'pytest done"'``, the word inside ``echo``'s
+        argument) but no unterminated INVOCATION, so its real invocation is
+        rewritten normally and there is nothing to report. The non-pytest and
+        OPAQUE cases are expected, benign no-ops; logging those would fire on
+        every lint and type leg and train operators to ignore the record.
         """
         from orchestrator.verify import _serial_pytest_str
 
