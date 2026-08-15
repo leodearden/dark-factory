@@ -2490,6 +2490,139 @@ def test_lease_holder_dict_round_trip_is_lossless() -> None:
     assert sr.LeaseHolder.from_dict(holder.to_dict()) == holder
 
 
+# --- _render_contention_message (task 3994 defect 3) ----------------------
+#
+# The old form was `lease held by <slug> ({alive|dead}, heartbeat <n>s ago)`,
+# which reads as SELF-CONTRADICTORY on its most important branch: "dead,
+# heartbeat 42s ago" invites the reader to conclude the holder is gone and
+# the lease is reclaimable, when a fresh heartbeat means precisely the
+# opposite. That exact string misled the 2026-08-08 rotation into
+# force-releasing a live holder's lease. Liveness and freshness are two
+# INDEPENDENT axes and each must now name itself.
+
+_LIVE_HOLDER = sr.LeaseHolder(
+    session_slug='watcher-df-100', pid=4242, start_ts='2026-07-07T12:00:00+00:00'
+)
+
+
+def test_contention_message_live_holder_names_the_slug_and_the_pid() -> None:
+    msg = sr._render_contention_message(
+        _LIVE_HOLDER, holder_alive=True, age_secs=42.0, policy=sr.LeasePolicy.STAND_DOWN
+    )
+
+    assert 'watcher-df-100' in msg
+    assert '4242' in msg
+    assert 'pid 4242 alive' in msg
+    assert msg.endswith('— standing down')
+
+
+def test_contention_message_dead_pid_but_fresh_heartbeat_says_not_reclaimable() -> None:
+    ttl = timedelta(seconds=7200)
+    msg = sr._render_contention_message(
+        _LIVE_HOLDER,
+        holder_alive=False,
+        age_secs=1200.0,
+        policy=sr.LeasePolicy.STAND_DOWN,
+        ttl=ttl,
+    )
+
+    # The withdrawn string, pinned as an ANTI-assertion.
+    assert '(dead, heartbeat' not in msg
+    lowered = msg.lower()
+    assert 'not running' in lowered  # the pid axis, named
+    assert 'fresh' in lowered  # the heartbeat axis, named
+    assert 'not reclaimable' in lowered  # the decision, explained
+    assert '6000' in msg  # the remaining TTL, in seconds
+
+
+def test_contention_message_remaining_ttl_tracks_the_injected_ttl() -> None:
+    msg = sr._render_contention_message(
+        _LIVE_HOLDER,
+        holder_alive=False,
+        age_secs=100.0,
+        policy=sr.LeasePolicy.STAND_DOWN,
+        ttl=timedelta(seconds=900),
+    )
+    assert '800' in msg
+
+
+def test_contention_message_dead_pid_past_ttl_is_phrased_as_reclaim_eligible() -> None:
+    msg = sr._render_contention_message(
+        _LIVE_HOLDER,
+        holder_alive=False,
+        age_secs=9000.0,
+        policy=sr.LeasePolicy.STAND_DOWN,
+        ttl=timedelta(seconds=7200),
+    )
+
+    assert '(dead, heartbeat' not in msg
+    lowered = msg.lower()
+    assert 'not running' in lowered
+    # Past the TTL the lease WAS reclaim-eligible; we are here only because
+    # the reclaim race was lost to someone else, and the message must say so
+    # rather than implying the holder is still healthy.
+    assert 'reclaim' in lowered
+    assert 'not reclaimable' not in lowered
+
+
+def test_contention_message_corrupt_body_does_not_invent_a_holder() -> None:
+    msg = sr._render_contention_message(
+        None, holder_alive=False, age_secs=42.0, policy=sr.LeasePolicy.STAND_DOWN
+    )
+
+    assert 'unreadable' in msg.lower()
+    assert '42s ago' in msg  # freshness is still reported
+    assert msg.endswith('— standing down')
+
+
+@pytest.mark.parametrize(
+    ('policy', 'suffix'),
+    [
+        (sr.LeasePolicy.STAND_DOWN, '— standing down'),
+        (sr.LeasePolicy.WARN_AND_PROCEED, '— proceeding anyway'),
+    ],
+)
+@pytest.mark.parametrize(
+    ('holder', 'alive', 'age'),
+    [
+        (_LIVE_HOLDER, True, 42.0),
+        (_LIVE_HOLDER, False, 1200.0),
+        (_LIVE_HOLDER, False, 9000.0),
+        (None, False, 42.0),
+    ],
+    ids=['live', 'dead-fresh', 'dead-expired', 'corrupt'],
+)
+def test_contention_message_is_always_one_greppable_line(
+    policy: sr.LeasePolicy,
+    suffix: str,
+    holder: sr.LeaseHolder | None,
+    alive: bool,
+    age: float,
+) -> None:
+    msg = sr._render_contention_message(holder, holder_alive=alive, age_secs=age, policy=policy)
+
+    assert '\n' not in msg
+    assert msg.endswith(suffix)
+
+
+def test_claim_lease_dead_holder_within_ttl_reports_the_non_contradictory_message(
+    tmp_path: Path,
+) -> None:
+    # End-to-end: the branch the 2026-08-08 rotation actually hit.
+    dead = sr.LeaseHolder(session_slug='watcher-df-dead', pid=_DEAD_PID, start_ts=_NOW.isoformat())
+    sr.claim_lease('watcher-df', holder=dead, root=tmp_path, now=_NOW)
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    _set_mtime(lease_path, _NOW, sr.LEASE_HEARTBEAT_TTL - timedelta(minutes=10))
+
+    contender = sr.LeaseHolder(session_slug='watcher-df-200', pid=os.getpid(), start_ts=_NOW.isoformat())
+    claim = sr.claim_lease('watcher-df', holder=contender, root=tmp_path, now=_NOW)
+
+    assert claim.decision == sr.LeaseDecision.STAND_DOWN
+    assert '(dead, heartbeat' not in claim.message
+    assert 'not reclaimable' in claim.message.lower()
+    assert str(_DEAD_PID) in claim.message
+
+
 # --- claim_lease: free lease --------------------------------------------
 
 
@@ -2529,7 +2662,10 @@ def test_claim_lease_held_by_live_holder_stand_down_policy(tmp_path: Path) -> No
     assert claim.holder.session_slug == 'watcher-df-100'
     assert claim.holder_alive is True
     assert claim.heartbeat_age_secs == 42
-    assert claim.message == 'lease held by watcher-df-100 (alive, heartbeat 42s ago) — standing down'
+    assert claim.message == (
+        f'lease held by watcher-df-100 (pid {os.getpid()} alive, heartbeat 42s ago) '
+        '— standing down'
+    )
     # No clobber: the on-disk body still names the ORIGINAL holder.
     assert sr.LeaseHolder.from_json(lease_path.read_text()) == original
 
@@ -3172,7 +3308,9 @@ def test_main_lease_claim_when_held_by_live_holder_stands_down(
     out = capsys.readouterr().out
     lines = out.splitlines()
     assert lines[0] == 'decision=stand-down'
-    assert re.search(r'lease held by \S+ \(alive, heartbeat \d+s ago\) — standing down', lines[1])
+    assert re.search(
+        r'lease held by \S+ \(pid \d+ alive, heartbeat \d+s ago\) — standing down', lines[1]
+    )
     # the on-disk holder must still be the ORIGINAL claimant (no clobber).
     body = sr.lease_path_for_name('watcher-df', root=tmp_path).read_text()
     assert 'watcher-df-100' in body
