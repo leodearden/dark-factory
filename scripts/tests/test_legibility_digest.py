@@ -1851,6 +1851,8 @@ class TestDesignedOutcomesSection:
         # Distinct labels per rule keep which-rule-fired legible: a
         # self-declared CEILING must not read the same as a bare 124.
         declared = mod.classify_designed_outcome(_CEILING_DECLARATION, 124)
+        assert declared is not None
+
         digest = mod.render_digest(
             _designed_outcomes_only_records(), agent_class='interactive',
         )
