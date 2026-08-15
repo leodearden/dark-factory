@@ -272,15 +272,34 @@ def _resolve_reify_checkout(start: Path | None = None) -> reify_checkout.ReifyCh
     )
 
 
-# Repo roots for the tracked-corpus self-audit sweep.  dark-factory is resolved
-# from this file (works in a worktree too: <root>/shared/tests/ -> parents[2]);
-# reify is a sibling under the same src/ directory.  Same resolution the γ suite
-# uses for _DF_REPO_ROOT / _REIFY_REPO_ROOT.
+# Repo roots for the tracked-corpus self-audit sweep.  dark-factory is
+# resolved from this file (works in a worktree too: <root>/shared/tests/ ->
+# parents[2] — deliberately UNCHANGED here, since parents[2] is correct in
+# BOTH a bare checkout and a worktree: it names the checkout THIS test is
+# running inside, main root or worktree root, either of which is a valid
+# `git ls-files` target).  reify is a sibling checkout, resolved
+# layout-independently via `shared.reify_checkout` (through the
+# `_resolve_reify_checkout` adapter above) rather than a fixed parents[N]
+# index — see that module's docstring for the measured worktree-vs-bare
+# evidence table.  These constants are evaluated at IMPORT time, so
+# REIFY_ROOT must be exported BEFORE pytest starts to steer them; a
+# mid-session `monkeypatch.setenv` only affects direct
+# `_resolve_reify_checkout()` calls (exactly what TestReifyCheckoutAdapter
+# does above; it never touches these constants).
 _DF_REPO_ROOT = Path(__file__).parents[2]
-_REIFY_REPO_ROOT = Path(__file__).parents[5] / 'reify'
-
-# The bash third copy of the predicate.  Same resolution the γ suite uses.
-_REIFY_GUARD_SCRIPT = _REIFY_REPO_ROOT / 'scripts' / 'lock-charter-guard.sh'
+_REIFY_CHECKOUT = _resolve_reify_checkout()
+_REIFY_REPO_ROOT: Path | None = _REIFY_CHECKOUT.root
+_REIFY_GUARD_SCRIPT: Path | None = (
+    _REIFY_REPO_ROOT / _REIFY_GUARD_RELPATH if _REIFY_REPO_ROOT is not None else None
+)
+# The skip wording comes from the shared builder too, not a hand-rolled
+# string: it separates a discovery MISS (nobody has reify checked out here —
+# benign) from a REIFY_ROOT naming a path that is not there (an operator
+# typo, which must NAME the bad path).  Matches the wording the γ suite and
+# orchestrator's verify gate emit for the same condition.
+_REIFY_SKIP_REASON: str | None = reify_checkout.reify_skip_reason(
+    _REIFY_GUARD_RELPATH, _REIFY_REPO_ROOT, named_by_env=_REIFY_CHECKOUT.named_by_env
+)
 
 
 def _reify_guard_vector(flag: str) -> list[str]:
@@ -864,10 +883,7 @@ class TestExtensionlessFilenamesDriftGuard:
     def test_matches_canonical_vector(self):
         assert sorted(EXTENSIONLESS_FILENAMES) == _CANONICAL_EXTENSIONLESS
 
-    @pytest.mark.skipif(
-        not _REIFY_GUARD_SCRIPT.is_file(),
-        reason='reify script not present (standalone checkout; cross-repo drift check skipped)',
-    )
+    @pytest.mark.skipif(_REIFY_SKIP_REASON is not None, reason=_REIFY_SKIP_REASON or '')
     def test_extensionless_drift_guard_vs_reify_script(self):
         """Tier-2 (cross-source): this α copy must match reify --list-extensionless.
 
@@ -1174,10 +1190,7 @@ class TestFileExtensionsDriftGuard:
             f'lock_charter_guard.py.'
         )
 
-    @pytest.mark.skipif(
-        not _REIFY_GUARD_SCRIPT.is_file(),
-        reason='reify script not present (standalone checkout; cross-repo drift check skipped)',
-    )
+    @pytest.mark.skipif(_REIFY_SKIP_REASON is not None, reason=_REIFY_SKIP_REASON or '')
     def test_extension_drift_guard_vs_reify_script(self):
         """Tier-2 (cross-source): this α copy must match reify --list-extensions.
 
