@@ -147,10 +147,13 @@ here. It is enforced twice:
   observation before emitting it, and never inlines file contents. The scrub
   rewrites dict **keys** as well as values and guarantees cleanliness of the
   **JSON-encoded** form (what the gate actually scans), because JSON escaping
-  can manufacture a credential-shaped run that raw scrubbing never sees. A
-  sample that still fails verification degrades to a minimal `redaction_failed`
-  row plus a stderr warning rather than raising — one sample lost, not the whole
-  paid-for capture;
+  can manufacture a credential-shaped run that raw scrubbing never sees. A value
+  that still fails verification degrades to a minimal `redaction_failed` row plus
+  a stderr warning rather than raising — one value lost, not the whole paid-for
+  capture. The degraded row matches the shape it stands in for: an observation
+  keeps identity fields, the run's exit provenance keeps its scalar fields
+  (`exit_code`, `killed_by_probe`, `stderr_len`) and drops only the CLI-authored
+  text, since it is stamped onto every observation of the run;
 - **commit time** — `assert_no_credential_material()` is asserted over the full
   text of both corpus files and the raw capture by `TestCorpusSecretHygiene`,
   so a later hand-edit cannot reintroduce what the probe would have refused to

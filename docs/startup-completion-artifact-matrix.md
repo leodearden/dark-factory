@@ -110,10 +110,14 @@ dir that really does hold a live OAuth access token.
 
 The scrub rewrites dict **keys** as well as values and guarantees cleanliness of the
 **JSON-encoded** form rather than the raw one — the encoding is what the gate scans, and JSON
-escaping can manufacture a credential-shaped run that raw scrubbing never sees. A sample that
-still fails verification degrades to a minimal `redaction_failed` row (identity fields only) plus
-a stderr warning rather than raising, because raising out of the sampling loop would discard an
-entire already-paid-for live capture instead of one sample. The config dir holding that token is
+escaping can manufacture a credential-shaped run that raw scrubbing never sees. A value that
+still fails verification degrades to a minimal `redaction_failed` row plus a stderr warning
+rather than raising, because raising out of the sampling loop would discard an entire
+already-paid-for live capture instead of one value. The degraded row is **shaped like whatever
+was gated**: an observation degrades to identity fields only, while the run's exit provenance
+keeps `exit_code` / `killed_by_probe` / `stderr_len` (scalar-filtered) and drops only the
+CLI-authored text — it is stamped onto every observation of the run, so an observation-shaped
+stand-in there would cost the whole capture its exit provenance. The config dir holding that token is
 reclaimed three ways: an exception-safe `finally` that wraps the credential write itself,
 `cleanup_at_exit` mirroring `--keep-config-dir` (so the flag that exists to preserve the dir is
 never silently overridden), and a once-per-process dead-PID sweep of

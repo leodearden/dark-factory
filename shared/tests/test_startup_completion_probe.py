@@ -355,6 +355,110 @@ class TestGateNeverRaisesOnGenericHit:
             assert leaked not in result
 
 
+_EXIT_PROVENANCE_KEYS = frozenset(
+    {
+        'mode',
+        'killed_by_probe',
+        'exit_code',
+        'stdout_envelope',
+        'stderr_len',
+        'stderr_tail',
+    }
+)
+
+
+class TestGateDegradesPerGatedShape:
+    """The degraded row must match the shape it stands in for.
+
+    ``_gate`` has TWO call sites gating TWO shapes: an observation, and
+    ``_drain_exit`` exit provenance (``mode`` / ``killed_by_probe`` / ``exit_code``
+    / ``stdout_envelope`` / ``stderr_len`` / ``stderr_tail``).  A single
+    observation-shaped fallback applied to the latter deletes every
+    exit-provenance field and substitutes observation identity fields — and since
+    the gated value is stamped onto ``run_exit`` for EVERY observation of the run,
+    that is the whole-capture loss the heuristic branch exists to prevent, plus a
+    ``KeyError`` for any consumer reading ``run_exit['exit_code']``.
+
+    This is also the MOST reachable path of the two: ``stderr_tail`` is arbitrary
+    CLI stderr.  ``_scrub_value`` is monkeypatched to the identity, standing in for
+    any future scrub gap.
+    """
+
+    @staticmethod
+    def _dirty_exit(**overrides: Any) -> dict[str, Any]:
+        provenance = {
+            'mode': 'healthy',
+            'killed_by_probe': True,
+            'exit_code': 143,
+            'stdout_envelope': {'subtype': 'success', 'is_error': False, 'num_turns': 2},
+            'stderr_len': 900,
+            'stderr_tail': f'mcp connect failed {_LONG_RUN}',
+        }
+        provenance.update(overrides)
+        return provenance
+
+    def test_exit_provenance_fields_survive_the_degradation(self, monkeypatch):
+        monkeypatch.setattr(probe, '_scrub_value', lambda value, patterns: value)
+        result = probe._gate(self._dirty_exit(), kind='run_exit')
+
+        assert result['redaction_failed'] is True
+        assert result['exit_code'] == 143, 'a consumer reading run_exit[exit_code] must not KeyError'
+        assert result['killed_by_probe'] is True
+        assert result['mode'] == 'healthy'
+        assert result['stderr_len'] == 900
+        assert result['stderr_tail'] is None, 'the CLI-authored text must be dropped'
+
+    def test_no_observation_identity_fields_are_substituted(self, monkeypatch):
+        monkeypatch.setattr(probe, '_scrub_value', lambda value, patterns: value)
+        result = probe._gate(self._dirty_exit(), kind='run_exit')
+
+        for wrong_shape in ('sample_kind', 'sample_index', 'sample_offset_secs', 'substrate_returns'):
+            assert wrong_shape not in result, (
+                f'{wrong_shape!r} is an OBSERVATION field; exit provenance has no such field'
+            )
+        assert set(result) >= _EXIT_PROVENANCE_KEYS, (
+            f'missing exit-provenance fields: {_EXIT_PROVENANCE_KEYS - set(result)}'
+        )
+
+    def test_the_degraded_exit_row_is_clean_by_construction(self, monkeypatch):
+        monkeypatch.setattr(probe, '_scrub_value', lambda value, patterns: value)
+        result = probe._gate(
+            self._dirty_exit(
+                mode='not-a-mode',
+                killed_by_probe='not-a-bool',
+                exit_code='not-an-int',
+                stderr_len=_LONG_RUN,
+                stdout_envelope={'subtype': _LONG_RUN, 'is_error': False},
+            ),
+            kind='run_exit',
+        )
+        scf.assert_no_credential_material(
+            json.dumps(result), source='synthetic:poisoned-exit-row'
+        )
+        assert result['mode'] is None
+        assert result['killed_by_probe'] is None
+        assert result['exit_code'] is None
+        assert result['stderr_len'] is None
+        assert 'subtype' not in result['stdout_envelope'], (
+            'subtype is CLI-authored text and cannot survive into a clean-by-construction row'
+        )
+        assert result['stdout_envelope']['is_error'] is False
+
+    def test_a_clean_exit_provenance_passes_through_unchanged(self):
+        provenance = {
+            'mode': 'healthy', 'killed_by_probe': False, 'exit_code': 0,
+            'stdout_envelope': {'subtype': 'success'}, 'stderr_len': 4,
+            'stderr_tail': 'fine',
+        }
+        assert probe._gate(dict(provenance), kind='run_exit') == provenance
+
+    def test_an_unknown_kind_is_rejected_loudly(self):
+        # Data-INDEPENDENT, so it fires on the first gated value rather than
+        # lurking until a heuristic happens to hit.
+        with pytest.raises(ValueError, match='unknown kind'):
+            probe._gate({'mode': 'healthy'}, kind='not-a-kind')
+
+
 # ---------------------------------------------------------------------------
 # run_live_probe: lifecycle of the OAuth-bearing config dir
 # ---------------------------------------------------------------------------

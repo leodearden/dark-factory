@@ -42,10 +42,13 @@ token in ``.credentials.json``, so this is load-bearing, not hygiene theatre.
 The scrub rewrites dict KEYS as well as values, and guarantees cleanliness of the
 JSON-ENCODED form rather than the raw one — the encoding is what the gate scans,
 and JSON escaping can manufacture a credential-shaped run that raw scrubbing
-never sees.  If a sample still fails verification after scrubbing, it degrades to
-a minimal ``redaction_failed`` row (identity fields only) plus a stderr WARNING
-rather than raising: losing one sample is bounded, whereas raising out of the
-sampling loop would discard an entire already-paid-for live capture.
+never sees.  If a gated value still fails verification after scrubbing, it
+degrades to a minimal ``redaction_failed`` row plus a stderr WARNING rather than
+raising: losing one value is bounded, whereas raising out of the sampling loop
+would discard an entire already-paid-for live capture.  The degraded row is
+shaped like whatever was gated — identity fields for an observation, the scalar
+exit fields for the run's exit provenance — because that provenance is stamped
+onto every observation of the run.
 
 USAGE
 -----
@@ -286,6 +289,14 @@ def _scrub_value(value: Any, patterns: tuple[tuple[str, str], ...]) -> Any:
     return value if _encodes_clean(value, patterns) else '<redacted>'
 
 
+#: Scalar-only projection of the CLI's ``--output-format json`` envelope that
+#: :func:`_drain_exit` records and :func:`_poisoned_exit_provenance` may carry.
+#: ``subtype`` is the one arbitrary STRING among them, so it is listed separately:
+#: the degraded row drops it (a clean-by-construction row cannot carry a string
+#: the probe did not author), while the healthy path keeps it.
+_EXIT_ENVELOPE_SCALAR_KEYS = ('is_error', 'num_turns', 'duration_ms', 'duration_api_ms')
+_EXIT_ENVELOPE_KEYS = ('subtype', *_EXIT_ENVELOPE_SCALAR_KEYS)
+
 #: ``substrate_returns`` keys a poisoned row must carry, with the scalar types
 #: each is allowed to keep.  ``bool`` is a subclass of ``int``, so ``int`` covers
 #: both flags and counts; anything else degrades to ``None``.
@@ -301,6 +312,9 @@ def _poisoned_observation(
     observation: dict[str, Any], pattern_name: str
 ) -> dict[str, Any]:
     """Return a minimal row standing in for an observation redaction could not clean.
+
+    Observation-shaped ONLY — :func:`_gate` selects it via ``kind='observation'``.
+    Exit provenance degrades through :func:`_poisoned_exit_provenance` instead.
 
     Every value here is either a probe-owned literal, a member of a closed set
     the probe itself defines, or a non-string scalar — so the row cannot itself
@@ -350,7 +364,75 @@ def _poisoned_observation(
     }
 
 
-def _gate(observation: dict[str, Any]) -> dict[str, Any]:
+def _poisoned_exit_provenance(
+    provenance: dict[str, Any], pattern_name: str
+) -> dict[str, Any]:
+    """Return a minimal row standing in for exit provenance redaction could not clean.
+
+    The :func:`_drain_exit`-shaped sibling of :func:`_poisoned_observation`, and it
+    exists because the two :func:`_gate` call sites gate DIFFERENT shapes.  A
+    single observation-shaped fallback applied to exit provenance would delete
+    ``exit_code`` / ``killed_by_probe`` / ``stdout_envelope`` / ``stderr_len`` and
+    substitute observation identity fields that mean nothing here — and because
+    the gated value is stamped onto ``run_exit`` for EVERY observation of the run
+    (not one sample), that is precisely the whole-capture blast radius the
+    heuristic branch exists to avoid, plus a ``KeyError`` for any consumer reading
+    ``run_exit['exit_code']``.
+
+    So the degraded shape matches the gated shape: every ``_drain_exit`` key is
+    present, ``mode`` is MODES-checked, the flags/counts are scalar-filtered, and
+    the two fields that carry CLI-authored text — ``stderr_tail`` and the
+    envelope's ``subtype`` — are dropped.  That is what costs this row its
+    analytical value; the exit code, the kill flag and the stderr LENGTH (a
+    number, not text) are what survive.
+    """
+    mode = provenance.get('mode')
+    killed_by_probe = provenance.get('killed_by_probe')
+    exit_code = provenance.get('exit_code')
+    stderr_len = provenance.get('stderr_len')
+    envelope = provenance.get('stdout_envelope')
+    if not isinstance(envelope, dict):
+        envelope = {}
+    return {
+        'redaction_failed': True,
+        'redaction_failure_pattern': pattern_name,
+        'mode': mode if mode in MODES else None,
+        'killed_by_probe': (
+            killed_by_probe if isinstance(killed_by_probe, bool) else None
+        ),
+        # `not isinstance(x, bool)`: an exit code is an int, and True would
+        # otherwise read as a real exit status of 1.
+        'exit_code': (
+            exit_code
+            if isinstance(exit_code, int) and not isinstance(exit_code, bool)
+            else None
+        ),
+        # Numbers and flags only — `subtype` is CLI-authored text and is dropped.
+        'stdout_envelope': {
+            key: envelope[key]
+            for key in _EXIT_ENVELOPE_SCALAR_KEYS
+            if isinstance(envelope.get(key), (bool, int, float))
+        },
+        'stderr_len': (
+            stderr_len
+            if isinstance(stderr_len, int) and not isinstance(stderr_len, bool)
+            else None
+        ),
+        # The field the residual hit most plausibly lived in: arbitrary CLI stderr.
+        'stderr_tail': None,
+    }
+
+
+#: Degraded-row builder per gated shape.  Selected by :func:`_gate`'s ``kind``.
+_POISONED_BUILDERS = {
+    'observation': _poisoned_observation,
+    'run_exit': _poisoned_exit_provenance,
+}
+
+
+def _gate(
+    observation: dict[str, Any], *, kind: str = 'observation'
+) -> dict[str, Any]:
     """Refuse — or scrub — an assembled observation carrying credential material.
 
     The capture-time half of the two-sided guard: unredacted material never
@@ -375,13 +457,32 @@ def _gate(observation: dict[str, Any]) -> dict[str, Any]:
     already been found and fixed (a credential-shaped dict KEY; a run that only
     exists in the JSON-ENCODED form), and both times the guarantee rested on a
     composition argument that turned out to be false.  So a still-dirty scrub is
-    now handled rather than asserted away: the sample degrades to a minimal
-    :func:`_poisoned_observation` row flagged ``redaction_failed`` and a stderr
-    WARNING.  That is loud and bounded — ONE sample reduced to identity fields,
-    against a raise's cost of every sample of an already-paid-for live run — and
-    the unclean material still never reaches disk, because the dirty object is
-    dropped entirely rather than written.
+    now handled rather than asserted away: the value degrades to a minimal row
+    flagged ``redaction_failed`` plus a stderr WARNING.  That is loud and bounded
+    — one value reduced to its identity/scalar fields, against a raise's cost of
+    every sample of an already-paid-for live run — and the unclean material still
+    never reaches disk, because the dirty object is dropped entirely rather than
+    written.
+
+    *kind* selects WHICH degraded row, and it is not cosmetic.  ``_gate`` has two
+    call sites gating two different shapes: an assembled observation
+    (``kind='observation'``, :func:`_poisoned_observation`) and ``_drain_exit``
+    provenance (``kind='run_exit'``, :func:`_poisoned_exit_provenance`).  The
+    degraded row must match the shape it stands in for; an observation-shaped
+    fallback substituted for exit provenance would silently drop ``exit_code`` and
+    friends from EVERY observation of the run, converting the bounded degradation
+    into the whole-capture loss this branch exists to prevent.
     """
+    builder = _POISONED_BUILDERS.get(kind)
+    if builder is None:
+        # A wrong literal is a programming error, not a property of the captured
+        # data: it is data-INDEPENDENT, so it fires on the first gated value of
+        # the first run rather than lurking until a heuristic happens to hit.
+        raise ValueError(
+            f'_gate: unknown kind {kind!r}; expected one of '
+            f'{tuple(_POISONED_BUILDERS)}'
+        )
+
     encoded = json.dumps(observation)
 
     named = scan_for_credential_material(encoded, _NAMED_CREDENTIAL_PATTERNS)
@@ -398,10 +499,20 @@ def _gate(observation: dict[str, Any]) -> dict[str, Any]:
         return observation
 
     name, offset = generic
+    # Identify the gated value WITHOUT echoing input text to stderr: the index is
+    # an int and the two labels are checked against closed sets the probe owns.
+    if kind == 'run_exit':
+        gated_mode = observation.get('mode')
+        where = f'run_exit ({gated_mode if gated_mode in MODES else "unknown mode"})'
+    else:
+        gated_kind = observation.get('sample_kind')
+        where = (
+            f'sample {observation.get("sample_index")} '
+            f'({gated_kind if gated_kind in SAMPLE_KINDS else "unknown kind"})'
+        )
     print(
         f'startup_completion_probe: WARNING — heuristic pattern {name!r} matched at '
-        f'offset {offset} in sample {observation.get("sample_index")} '
-        f'({observation.get("sample_kind")}). Scrubbing the matching run rather than '
+        f'offset {offset} in {where}. Scrubbing the matching run rather than '
         f'discarding the capture. Check the emitted observation: if this was a long '
         f'identifier rather than a secret, widen the lookarounds in '
         f'startup_completion_fixtures.GENERIC_CREDENTIAL_PATTERNS.',
@@ -423,14 +534,12 @@ def _gate(observation: dict[str, Any]) -> dict[str, Any]:
         residual_name = residual[0] if residual is not None else name
         print(
             f'startup_completion_probe: WARNING — redaction FAILED for pattern '
-            f'{residual_name!r} in sample {observation.get("sample_index")} '
-            f'({observation.get("sample_kind")}); emitting a minimal '
-            f'redaction_failed row instead of the observation. This sample is lost '
-            f'for analysis but the run is not: fix _scrub_value so it cleans this '
-            f'shape, then re-run the probe.',
+            f'{residual_name!r} in {where}; emitting a minimal redaction_failed '
+            f'row instead. This value is lost for analysis but the run is not: '
+            f'fix _scrub_value so it cleans this shape, then re-run the probe.',
             file=sys.stderr,
         )
-        return _poisoned_observation(observation, residual_name)
+        return builder(observation, residual_name)
     return scrubbed
 
 
@@ -884,7 +993,7 @@ def _drain_exit(
         if isinstance(parsed, dict):
             envelope = {
                 k: parsed[k]
-                for k in ('subtype', 'is_error', 'num_turns', 'duration_ms', 'duration_api_ms')
+                for k in _EXIT_ENVELOPE_KEYS
                 if k in parsed and isinstance(parsed[k], (str, bool, int, float))
             }
     return {
@@ -1124,8 +1233,12 @@ def run_live_probe(
 
         # Reap the child, read its capture files, and stamp exit provenance onto
         # every observation of this run.
+        # kind='run_exit': this value is NOT observation-shaped, and it is stamped
+        # onto every observation below — a mismatched degraded row here would cost
+        # the whole capture its exit provenance, not one sample's.
         exit_provenance = _gate(
-            _drain_exit(proc, mode=mode, stdout_path=stdout_path, stderr_path=stderr_path)
+            _drain_exit(proc, mode=mode, stdout_path=stdout_path, stderr_path=stderr_path),
+            kind='run_exit',
         )
         for observation in observations:
             observation['run_exit'] = exit_provenance
