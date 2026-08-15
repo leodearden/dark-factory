@@ -9,6 +9,7 @@ from typing import Any, NoReturn
 
 from pydantic import ValidationError
 from shared.cli_invoke import (
+    NO_MCP_SERVERS_CONFIG,
     AgentFailureKind,
     AllAccountsCappedException,
     build_failure_message,
@@ -608,11 +609,25 @@ Review this run and provide your verdict as JSON.
         ``disallowed_tools=['*']`` is still passed VERBATIM.  cli_invoke expands
         the wildcard into ``_REAL_BUILTIN_TOOLS_DENYLIST`` when a schema is
         present (:1533-1536) — a list that omits the synthetic
-        ``StructuredOutput`` tool the schema is delivered through — so "no real
-        file/bash/web/MCP tool access" is preserved while the schema tool gets
+        ``StructuredOutput`` tool the schema is delivered through — so no real
+        file/bash/web tool access is preserved while the schema tool gets
         through.  Pre-expanding here would duplicate a list documented as needing
         to stay in sync with the CLI's built-ins and would skip future central
         fixes.
+
+        MCP tools are closed SEPARATELY, by ``mcp_config=NO_MCP_SERVERS_CONFIG``
+        + ``strict_mcp_config=True``.  The wildcard expansion above covers
+        built-ins ONLY — it carries no MCP tool pattern — so it does NOT deny MCP
+        tools, and ``cwd`` here is the project root, which holds a live
+        ``.mcp.json`` (servers ``escalation``, ``fused-memory``) that the CLI
+        would otherwise ambient-merge and expose under ``bypassPermissions``.
+        These two kwargs emit ``--strict-mcp-config`` and scope the run to zero
+        MCP servers instead.  The emit requires a TRUTHY ``mcp_config`` — it
+        lives inside ``build_claude_argv``'s ``if mcp_config:`` block, so a bare
+        ``{}`` here would silently no-op and reopen the hole.  Both kwargs
+        survive every cap-retry resume: ``_reset_for_fresh_retry`` touches only
+        ``resume_session_id``/``prompt``/``session_id``, and the ``if
+        mcp_config:`` argv block sits outside the resume conditional.
 
         InvokeSlot owns probe-slot release and terminate_process_group on timeout.
         """
@@ -625,6 +640,11 @@ Review this run and provide your verdict as JSON.
                 model=self.config.judge_llm_model,
                 disallowed_tools=['*'],
                 output_schema=JUDGE_VERDICT_SCHEMA,
+                # Closes MCP separately from the wildcard deny above, which the
+                # schema expands into a BUILT-INS-ONLY list. See the docstring:
+                # must stay truthy, or --strict-mcp-config is never emitted.
+                mcp_config=NO_MCP_SERVERS_CONFIG,
+                strict_mcp_config=True,
                 # See _JUDGE_CLI_MAX_TURNS: 1 is incompatible with --json-schema
                 # (the schema mechanism burns a tool-use turn — see
                 # task_curator.py:2366-2372).
