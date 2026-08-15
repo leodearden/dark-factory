@@ -1116,6 +1116,88 @@ class TestAbsoluteForeignPaths:
 
 
 # ---------------------------------------------------------------------------
+# Task 4156: a metadata.files entry containing a '..' segment is classified
+# identically to its normalised spelling.
+#
+# The relative twin of TestAbsoluteForeignPaths above. project_for_path's
+# relative branch compared without normalising, so 'orchestrator/../crates/
+# foo.rs' — which IS the reify-owned crates/foo.rs — matched the prefix
+# 'orchestrator/' by bare startswith and came back 'dark_factory'. That is a
+# FALSE ownership, and it corrupted all three consumers in the same stroke:
+# the FILES-certain hard reject (task 2206) falsely REJECTED the filing
+# project, the cross-repo tagger (task 3004) missed the tag, and the
+# attestation witness (task 3106) refused a project's own file.
+# ---------------------------------------------------------------------------
+
+
+class TestParentSegmentFiles:
+    """A '..' spelling must produce the same verdict as its normalised form.
+
+    Every test asserts the equivalence against the normalised spelling as well
+    as the absolute verdict, so the two spellings of one logical file can never
+    diverge again — the property TestAbsoluteForeignPaths pins for the absolute
+    regime.
+    """
+
+    # Lexically 'crates/foo.rs': a REIFY-owned file, reached via a segment
+    # whose leading component belongs to dark_factory.
+    _ESCAPED = ['orchestrator/../crates/foo.rs']
+    _NORMALISED = ['crates/foo.rs']
+
+    def test_check_files_for_scope_does_not_falsely_reject_filing_project(
+        self, tmp_path,
+    ):
+        """The headline harm: reify's own file hard-rejected as dark_factory's.
+
+        Measured before the fix: outcome='rejection',
+        matched_paths=('orchestrator/../crates/foo.rs',),
+        suggested_project='dark_factory'.
+        """
+        registry = _two_project_registry(tmp_path)
+
+        verdict = check_files_for_scope(self._ESCAPED, 'reify', registry)
+        assert verdict.outcome == 'ok', (
+            f'own file falsely rejected via a parent segment, got: {verdict!r}'
+        )
+        assert verdict.matched_paths == ()
+
+        norm_verdict = check_files_for_scope(self._NORMALISED, 'reify', registry)
+        assert verdict.outcome == norm_verdict.outcome
+        assert verdict.suggested_project == norm_verdict.suggested_project
+
+    def test_all_files_foreign_owner_tags_the_normalised_owner(self, tmp_path):
+        """Task-3004's allow-and-tag path must fire on the escaped spelling.
+
+        Measured before the fix: None — the file read as locally-owned by the
+        filing project, so the cross-repo tag was silently missed.
+        """
+        from fused_memory.middleware.path_scope_guard import all_files_foreign_owner
+
+        registry = _two_project_registry(tmp_path)
+
+        assert all_files_foreign_owner(
+            self._ESCAPED, 'dark_factory', registry) == 'reify'
+        assert all_files_foreign_owner(self._ESCAPED, 'dark_factory', registry) == (
+            all_files_foreign_owner(self._NORMALISED, 'dark_factory', registry)
+        )
+
+    def test_local_attesting_signals_accepts_own_file(self, tmp_path):
+        """Task-3106's witness must accept a project's own file, however spelled.
+
+        Measured before the fix: [] — the signal was classified foreign, so a
+        genuine local deliverable failed to attest.
+        """
+        from fused_memory.middleware.path_scope_guard import local_attesting_signals
+
+        registry = _two_project_registry(tmp_path)
+
+        assert local_attesting_signals(
+            self._ESCAPED, 'reify', registry) == self._ESCAPED
+        assert local_attesting_signals(
+            self._NORMALISED, 'reify', registry) == self._NORMALISED
+
+
+# ---------------------------------------------------------------------------
 # Verdict.to_error_dict
 # ---------------------------------------------------------------------------
 
