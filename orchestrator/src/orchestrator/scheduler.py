@@ -868,9 +868,20 @@ class ModuleLockTable:
 
     # --- Park (reservation) helpers ---
 
-    def _is_parked_blocks(self, module: str, task_id: str) -> bool:
-        """Return True iff any ACTIVE (top-of-stack) park conflicts with *module*
-        and is owned by a different task that task_id cannot preempt (INV-2).
+    def _blocking_park_owner(
+        self,
+        module: str,
+        task_id: str,
+        *,
+        ignore_owners: frozenset[str] = frozenset(),
+    ) -> str | None:
+        """The owner of the ACTIVE park that blocks *task_id* on *module*, or None.
+
+        THE single rank-aware park-blocking rule.  ``_is_parked_blocks`` is a
+        one-line delegate over it and ``park_owners_blocking`` is the naming
+        view of it — one rule, two views (INV-5).  Forking the rank logic is
+        what would let admission believe it can borrow through a park that
+        ``try_acquire`` then refuses: churn with no dispatch.
 
         A buried (shadowed) reservation never blocks — only the active top of
         each stack is consulted.
@@ -884,6 +895,11 @@ class ModuleLockTable:
         preemptor acquire its own module even when hierarchical victim parks
         are kept under their original keys (their active tops are no longer
         moved to the preemptor's key by a re-key step).
+
+        *ignore_owners* (task 3823 / PRD C7) names park owners whose parks are
+        treated as absent for this request — the EASY-backfill admission
+        bypass.  It is scoped to the park rule alone and has no bearing on the
+        held-lock limit gate.
         """
         # Step 1: compute task_id's own dominant rank among conflicting active tops.
         own_dominant_rank: int | None = None
@@ -901,7 +917,7 @@ class ModuleLockTable:
             if not stack:
                 continue
             owner, rank = stack[-1]  # active TOP only (INV-2)
-            if owner == task_id:
+            if owner == task_id or owner in ignore_owners:
                 continue
             if not self._conflicts(parked_module, module):
                 continue
@@ -910,8 +926,80 @@ class ModuleLockTable:
             if own_dominant_rank is not None and own_dominant_rank < rank:
                 # task_id preempts this foreign top — not blocked by it.
                 continue
-            return True
-        return False
+            return owner
+        return None
+
+    def park_owners_blocking(self, task_id: str, modules: list[str]) -> list[str]:
+        """Distinct active-top park owners that would make ``try_acquire`` refuse.
+
+        Sorted for determinism.  Normalizes *modules* exactly as
+        ``try_acquire`` does, so the answer is about the same keys the gate
+        will actually test.
+
+        This is C7's ``c.modules ∩ M ≠ ∅`` clause: the hierarchical
+        ``_conflicts`` rule already IS the intersection test, so an empty list
+        means there is nothing to backfill through and admission must refuse.
+
+        A READ — it mutates nothing and evicts nothing.
+        """
+        depth = self._config.lock_depth
+        normalized = {normalize_lock(m, depth) for m in modules}
+        owners = {
+            owner
+            for module in normalized
+            if (owner := self._blocking_park_owner(module, task_id)) is not None
+        }
+        return sorted(owners)
+
+    def blocking_holders(
+        self, modules: list[str], *, exclude_task: str
+    ) -> dict[str, list[str]]:
+        """``{requested_module: [foreign holders]}`` for modules at/over their limit.
+
+        Only modules that are ACTUALLY blocked appear; everything free is
+        omitted, so an empty mapping means the requester could take all of
+        *modules* right now.  Keys are the requested modules in normalized
+        form (not the holders' own keys), because the caller asked about those.
+
+        Honours ``_limit_for`` rather than mere presence: a module with
+        headroom (``max_per_module`` > current holders) is free to take, so it
+        contributes no wait.  Built from the existing ``_conflicts`` /
+        ``_count_conflicts`` / ``_limit_for`` trio — no third conflict rule.
+        """
+        depth = self._config.lock_depth
+        result: dict[str, list[str]] = {}
+        for module in {normalize_lock(m, depth) for m in modules}:
+            if self._count_conflicts(module, exclude_task=exclude_task) < self._limit_for(module):
+                continue
+            holders = sorted(
+                task_id
+                for task_id, held in self._held.items()
+                if task_id != exclude_task
+                and any(self._conflicts(h, module) for h in held)
+            )
+            if holders:
+                result[module] = holders
+        return result
+
+    def _is_parked_blocks(
+        self,
+        module: str,
+        task_id: str,
+        *,
+        ignore_owners: frozenset[str] = frozenset(),
+    ) -> bool:
+        """Return True iff any ACTIVE (top-of-stack) park conflicts with *module*
+        and is owned by a different task that task_id cannot preempt (INV-2).
+
+        The bool view of :meth:`_blocking_park_owner`, which carries the rank
+        logic.  Kept as a delegate rather than inlined so ``try_acquire`` /
+        ``try_acquire_additional`` and every existing test keep their call
+        shape, and so the naming view (``park_owners_blocking``) and this
+        gating view can never disagree (INV-5).
+        """
+        return self._blocking_park_owner(
+            module, task_id, ignore_owners=ignore_owners
+        ) is not None
 
     def has_parks(self, task_id: str) -> bool:
         """Return True if *task_id* owns any reservation at ANY stack level (INV-5).
@@ -1312,7 +1400,13 @@ class ModuleLockTable:
         """Return True if task_id currently holds any module locks."""
         return task_id in self._held
 
-    def try_acquire(self, task_id: str, modules: list[str]) -> bool:
+    def try_acquire(
+        self,
+        task_id: str,
+        modules: list[str],
+        *,
+        admitted_parks: frozenset[str] = frozenset(),
+    ) -> bool:
         """Non-blocking attempt to acquire all module locks.
 
         Uses hierarchical conflict detection: a lock on ``A/B`` conflicts with
@@ -1321,6 +1415,25 @@ class ModuleLockTable:
         owned by a different task (see ``install_parks``).
 
         Returns True if all acquired, False if any unavailable.
+
+        *admitted_parks* (task 3823 / PRD task η, C7) names park owners whose
+        reservations this request has been ADMITTED THROUGH by EASY-backfill:
+        their parks are ignored by the park gate below, and by nothing else.
+
+        **The held-lock gate is deliberately untouched, and this is the whole
+        safety property of C7 (INV-3).**  The limit check below is evaluated on
+        LIVE state at call time, inside this method, on every call — admitted
+        or not.  Admission never pre-computes a "c's modules are otherwise
+        free" set and then acquires on that basis, because a stale scoring-time
+        snapshot used as the ACTING basis is precisely the failure class INV-3
+        exists to prevent.  So an admitted candidate whose modules turn out to
+        be genuinely contended simply fails here and does not dispatch; the
+        bypass can only ever waive a PARK, never a real holder.
+
+        Admission also does not disturb the parks it borrows through: nothing
+        here removes, shadows or re-ranks them.  Backfill borrows a gap the
+        owner was going to wait anyway — PRD §7 rejects preemption of a held
+        lock, and this is the mirror-image discipline for parks.
         """
         depth = self._config.lock_depth
         normalized = list({normalize_lock(m, depth) for m in modules})
@@ -1328,9 +1441,10 @@ class ModuleLockTable:
         # Check every requested module against all other tasks' held locks and
         # active reservations owned by other tasks.
         for module in normalized:
+            # INV-3: live held-lock state, never bypassed by admitted_parks.
             if self._count_conflicts(module, exclude_task=task_id) >= self._limit_for(module):
                 return False
-            if self._is_parked_blocks(module, task_id):
+            if self._is_parked_blocks(module, task_id, ignore_owners=admitted_parks):
                 return False
 
         self._held[task_id] = set(normalized)
