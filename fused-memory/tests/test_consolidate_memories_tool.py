@@ -47,6 +47,11 @@ CANONICAL = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
 RETAIN_1 = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
 RETAIN_2 = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
 
+# Two direct children of S1. The orphan rule (PRD V3): they are re-homed
+# onto the canonical BEFORE their parent is deleted, never after.
+C1 = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+C2 = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'
+
 # The citation gate only runs for a mem0 record in a REGISTERED project with a
 # task DB to scan (`_citation_gate_applies`), so these two are what switch it on.
 PROJECT_ROOT = '/tmp/root'
@@ -76,6 +81,8 @@ def make_service(
     topic_members=None,
     topic_total=None,
     children=None,
+    truncated_scans=(),
+    stuck_children=(),
     delete_errors=None,
     update_errors=None,
     events=None,
@@ -93,12 +100,20 @@ def make_service(
     `MemoryNotFound` as a return value rather than a raise, so a caller
     that only guarded against exceptions would read a refusal as a success.
 
+    *truncated_scans* is the set of parents whose child listing comes back
+    `truncated=True`: a listing the op could not fully SEE is a set it
+    cannot prove it moved. *stuck_children* are children whose reparent
+    patch REPORTS success while the child stays put — the silent-fail-soft
+    case that only a live re-count can catch.
+
     *events* is a shared ordered log — the only way to assert the ORDERING
     that is this op's whole contract, since the steps land on different
     mocks (the service, then the task interceptor, then the service again).
     """
     gone = set(gone)
     children = children or {}
+    truncated_scans = set(truncated_scans)
+    stuck_children = set(stuck_children)
     delete_errors = delete_errors or {}
     update_errors = update_errors or {}
     members = SUPERSEDES if topic_members is None else topic_members
@@ -131,14 +146,28 @@ def make_service(
     svc.get_memory_by_id = AsyncMock(side_effect=_get)
 
     async def _list_child_ids(memory_id, *, project_id):
-        return DescendantScan(ids=list(children.get(memory_id, ())), truncated=False)
+        log.append(('list_children', memory_id))
+        return DescendantScan(
+            ids=list(children.get(memory_id, ())),
+            truncated=memory_id in truncated_scans,
+        )
 
     svc.list_child_ids = AsyncMock(side_effect=_list_child_ids)
+
+    # Children that have actually been re-homed onto the canonical. The
+    # live post-reparent re-count reads THIS, not the patch return values —
+    # modelling the world's answer separately from the call's is what lets
+    # a test express "every patch reported success and a child stayed put".
+    moved: set[str] = set()
 
     async def _update(memory_id=None, **kwargs):
         log.append(('update_memory', memory_id))
         if memory_id in update_errors:
             return update_errors[memory_id]
+        if (kwargs.get('metadata_patch') or {}).get('parent_id') and (
+            memory_id not in stuck_children
+        ):
+            moved.add(memory_id)
         return {
             'status': 'updated',
             'store': 'mem0',
@@ -150,9 +179,17 @@ def make_service(
     svc.get_memories_by_metadata = AsyncMock(
         return_value=[_row(m) for m in members]
     )
-    svc.count_memories_by_metadata = AsyncMock(
-        return_value=len(members) if topic_total is None else topic_total
-    )
+
+    async def _count(project_id=None, filters=None, **_):
+        filters = filters or {}
+        if 'parent_id' in filters:
+            # The live child re-count: how many of this parent's children
+            # are STILL its children right now.
+            kids = children.get(filters['parent_id'], ())
+            return len([k for k in kids if k not in moved])
+        return len(members) if topic_total is None else topic_total
+
+    svc.count_memories_by_metadata = AsyncMock(side_effect=_count)
     return svc
 
 
@@ -946,3 +983,98 @@ class TestRetainAndTagArm:
         # one peer, not the arm.
         tagged = {c.kwargs['memory_id'] for c in svc.update_memory.await_args_list}
         assert RETAIN_1 in tagged
+
+
+class TestChildrenAreReHomedBeforeTheirParentDies:
+    """The orphan rule (PRD V3): reparent, THEN delete — never the reverse.
+
+    A supersede's children encode a hierarchy the records themselves
+    assert. Deleting the parent first would strand them pointing at an id
+    that no longer resolves, and nothing could repair that afterwards: the
+    children still name the dead parent, and there is no read path to a
+    deleted point to learn what it was. So the pointer moves while both
+    ends still exist.
+
+    DIRECT children only. Re-pointing the top layer preserves the deeper
+    subtree's internal structure, whereas flattening every descendant onto
+    the canonical would destroy the hierarchy the records encode.
+    """
+
+    @pytest.mark.asyncio
+    async def test_each_supersede_is_scanned_for_direct_children(self):
+        svc = make_service(children={S1: [C1, C2]})
+
+        await call_consolidate(svc)
+
+        scanned = [c.args[0] for c in svc.list_child_ids.await_args_list]
+        assert scanned == SUPERSEDES
+        for call in svc.list_child_ids.await_args_list:
+            assert call.kwargs['project_id'] == PROJECT_ID
+
+    @pytest.mark.asyncio
+    async def test_children_are_re_pointed_at_the_new_canonical(self):
+        svc = make_service(children={S1: [C1, C2]})
+
+        await call_consolidate(svc)
+
+        patched = {
+            c.kwargs['memory_id']: c.kwargs for c in svc.update_memory.await_args_list
+        }
+        assert set(patched) == {C1, C2}
+        for kwargs in patched.values():
+            assert kwargs['metadata_patch'] == {'parent_id': CANONICAL}
+            # The child's own claim is untouched — only its parent pointer
+            # moves, so no re-embed and no other metadata is disturbed.
+            assert kwargs.get('content') is None
+            assert kwargs.get('metadata_mode') == 'merge'
+
+    @pytest.mark.asyncio
+    async def test_every_patch_lands_before_the_parent_is_deleted(self):
+        """THE ordering pin. A child re-pointed after its parent died was
+        an orphan for the interval in between, and a crash inside that
+        interval leaves it one permanently."""
+        events = []
+        svc = make_service(children={S1: [C1, C2]}, events=events)
+
+        await call_consolidate(svc)
+
+        assert ('update_memory', C1) in events
+        assert ('update_memory', C2) in events
+        parent_died = events.index(('delete_memory', S1))
+        assert events.index(('update_memory', C1)) < parent_died
+        assert events.index(('update_memory', C2)) < parent_died
+        # ...and the scan that found them came before the patches.
+        assert events.index(('list_children', S1)) < events.index(
+            ('update_memory', C1)
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_reparenting_is_reported_per_child(self):
+        svc = make_service(children={S1: [C1, C2]})
+
+        result = await call_consolidate(svc)
+
+        assert result['reparented'] == [
+            {'child_id': C1, 'from': S1, 'to': CANONICAL},
+            {'child_id': C2, 'from': S1, 'to': CANONICAL},
+        ]
+        assert result['reparent_failures'] == []
+        # The re-homing did not cost the fold: S1 still died.
+        assert result['status'] == 'consolidated'
+        assert result['deleted'] == SUPERSEDES
+
+    @pytest.mark.asyncio
+    async def test_a_childless_supersede_costs_no_patch_and_no_recount(self):
+        """The common path stays cheap. `list_child_ids` short-circuits on
+        its own cheap count (pinned in `test_memory_service.py`), and a
+        parent the scan found childless has nothing that could have failed
+        to move — so re-counting would re-ask the same question in the same
+        instant."""
+        svc = make_service()
+
+        result = await call_consolidate(svc)
+
+        assert result['reparented'] == []
+        assert result['reparent_failures'] == []
+        svc.update_memory.assert_not_awaited()
+        svc.count_memories_by_metadata.assert_not_called()
