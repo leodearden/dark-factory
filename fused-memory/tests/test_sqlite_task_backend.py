@@ -8,7 +8,7 @@ import logging
 import re
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import aiosqlite
 import pytest
@@ -3587,7 +3587,9 @@ async def test_v3_to_v4_reports_healed_groups_when_the_index_build_step_raises(t
         # Fails at 'PRAGMA user_version = 4' -- AFTER the heal loop's cancel
         # UPDATE(s) and their commit have already happened.
         proxy = _FailingExecuteConn(conn, lambda sql, _p: 'user_version = 4' in sql)
-        result = await _migrate_v3_to_v4(proxy, project_root=project_root)
+        result = await _migrate_v3_to_v4(
+            cast(aiosqlite.Connection, proxy), project_root=project_root,
+        )
 
         assert result['index_built'] is False, result
         assert result['flagged'] == [], result
@@ -3649,7 +3651,9 @@ async def test_v3_to_v4_commits_each_healed_group_so_a_later_failure_cannot_unwi
             conn,
             lambda sql, p: "SET status = 'cancelled'" in sql and p.cancel_updates == 2,
         )
-        result = await _migrate_v3_to_v4(proxy, project_root=project_root)
+        result = await _migrate_v3_to_v4(
+            cast(aiosqlite.Connection, proxy), project_root=project_root,
+        )
 
         assert result['index_built'] is False, result
         assert result['flagged'] == [], result

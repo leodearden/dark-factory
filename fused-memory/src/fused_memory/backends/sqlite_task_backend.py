@@ -572,9 +572,13 @@ async def _migrate_v3_to_v4(
       rows are cancelled directly (``UPDATE ... SET status = 'cancelled'``),
       each stamped with a durable ``auto_cancelled_by_self_heal`` metadata
       provenance marker (canonical id + candidate_key) merged onto its
-      existing metadata, plus a loud per-group WARNING log. Fixes reify
-      incident esc-candidate-key-migration-2 (37 dup groups / 58 rows that
-      previously required a manual ``set_task_status`` cancel per row).
+      existing metadata, plus a loud per-group WARNING log. Each healed
+      group's cancels are committed as soon as that group completes, so a
+      failure on a LATER group cannot unwind an earlier group's heal, and
+      ``healed`` in the result dict names exactly the durably-committed
+      groups. Fixes reify incident esc-candidate-key-migration-2 (37 dup
+      groups / 58 rows that previously required a manual
+      ``set_task_status`` cancel per row).
     * **Flag** — ambiguous (``reason`` is ``'mixed_status'`` or
       ``'title_divergent'``): left untouched and collected — with its
       ``reason`` — into ``flagged_groups`` for escalation below.
@@ -691,6 +695,20 @@ async def _migrate_v3_to_v4(
                     "metadata = ? WHERE tag = ? AND id = ?",
                     (now, new_metadata, group['tag'], cancel_id),
                 )
+            # Commit per group, BEFORE recording it in `healed_groups`, so the
+            # list names exactly the groups whose cancels are durably on
+            # disk. That is what lets the outer `except` both roll back the
+            # in-flight group and report an accurate `healed` list: a group
+            # that raised partway through is rolled back and, never having
+            # been appended, is never claimed as healed. If this commit
+            # itself raises, the group is correctly absent from
+            # `healed_groups` and the except handler's rollback runs.
+            # (Also preserves the original reason this commit was not
+            # deferred to the clean-build commit below: a still-flagged
+            # group causes an early `return`, and healed cancels must
+            # survive that skip rather than riding on a commit that may
+            # never happen.)
+            await conn.commit()
             healed_groups.append({
                 'tag': group['tag'],
                 'candidate_key': group['candidate_key'],
@@ -708,13 +726,6 @@ async def _migrate_v3_to_v4(
                 len(cancel_ids), group['tag'], group['candidate_key'],
                 canonical_id, cancel_ids,
             )
-
-        if healed_groups:
-            # Commit unconditionally here (not deferred to the clean-build
-            # commit below): a still-flagged group below causes an early
-            # `return`, and healed cancels must survive that skip rather
-            # than riding on a commit that may never happen.
-            await conn.commit()
 
         if flagged_groups:
             groups_desc = '; '.join(
