@@ -143,7 +143,16 @@ class TestWaitResponsiveDefaultCapScalesWithNominal:
     case for TestLateArrivalCleanCAS 365s against a 300s
     ``@pytest.mark.timeout`` -- an ``os._exit()`` of the xdist worker.
 
-    These tests are discriminating: each fails against the old flat default.
+    Of the three, exactly ONE is discriminating against the old flat default:
+    ``test_small_nominal_gives_up_at_the_scaled_cap_not_the_flat_one``, verified
+    by mutation (restore `cap = RESPONSIVE_WAIT_WALL_CAP` and it fails
+    `assert 90.0 == 2.0 +- 2.0e-06`).  The other two CANNOT discriminate, by
+    construction, and are here as regression guards on the paths the scaling
+    default must not break: the ceiling test asserts `cap ==
+    RESPONSIVE_WAIT_WALL_CAP`, which the flat default trivially satisfied, and
+    the explicit-`max_wall_s` test exercises an override the flat default also
+    honoured.  Stated precisely rather than claiming all three discriminate --
+    an overclaimed guard is the same vacuity defect this task exists to remove.
     """
 
     async def test_small_nominal_gives_up_at_the_scaled_cap_not_the_flat_one(
