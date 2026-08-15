@@ -1617,12 +1617,31 @@ class TestHarnessInjectedTurnFilter:
         assert mod.is_harness_injected_turn(text) is False
         assert len(mod.iter_user_turns([_user_text(text)])) == 1
 
-    def test_task_plus_action_is_excluded(self):
-        # The role prompt templates emit '# Task' and '# Action'
-        # (briefing.py:193/496/1038) as the two headings of one preamble.
-        records = [_user_text('# Task\n\ndo the thing\n\n# Action\n\ngo\n')]
+    def test_human_task_plus_action_prose_turn_is_retained(self):
+        # Two SINGLE-hash top-level headings is a human spec-writing shape,
+        # not a briefing shape. Every role prompt template composes
+        # '{context}\n\n{identity}\n\n# Task ... # Action ...'
+        # (briefing.py:357-367/430-435/501-506/584-589/661-670/1193-1212),
+        # so a real briefing always carries the '# Context' anchor and
+        # almost always '## Agent Identity' too -- it is never just these
+        # two. Corroborators are therefore '##'-level sub-blocks only; see
+        # HARNESS_BRIEFING_SUBHEADINGS for the recall corner this declines.
+        text = (
+            '# Task\n\nRewrite the retry loop so it backs off.\n\n'
+            '# Action\n\nStart with the tests, then the loop itself.\n'
+        )
 
-        assert mod.iter_user_turns(records) == []
+        assert mod.is_harness_injected_turn(text) is False
+        assert len(mod.iter_user_turns([_user_text(text)])) == 1
+
+    def test_every_corroborator_is_a_double_hash_subblock(self):
+        # Structural guard, so a future agent does not re-add a top-level
+        # heading to the corroborator tuple: a '# '-level corroborator pairs
+        # with the '# task' anchor to clear the >=2 threshold on its own,
+        # which is exactly the human shape above.
+        assert all(
+            heading.startswith('## ') for heading in mod.HARNESS_BRIEFING_SUBHEADINGS
+        )
 
     def test_lone_context_anchor_with_prose_is_retained(self):
         # The relaxation's boundary: ONE anchor and NO corroborating
