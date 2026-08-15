@@ -53,7 +53,7 @@ from fused_memory.topic_slug import TOPIC_SLUG_MAX_LEN, is_valid_topic_slug
 # truncate differently from every other validator's.
 from fused_memory.utils.validation import _safe_repr, is_full_uuid
 
-__all__ = ['validate_consolidate_args']
+__all__ = ['build_consolidation_result', 'validate_consolidate_args']
 
 #: Pointer to the ONE topic-slug namespace (PRD D4), quoted at the wire so a
 #: caller can find the rule rather than re-derive a regex that already has a
@@ -217,3 +217,66 @@ def validate_consolidate_args(
         supersedes_ids,
         retain_ids,
     )
+
+
+def build_consolidation_result(
+    *,
+    canonical_id: str,
+    topic: str,
+    deleted: list[str],
+    failed_deletes: list[dict[str, Any]],
+    survivors: list[str],
+    retained: list[str] | None = None,
+    retain_failures: list[dict[str, Any]] | None = None,
+    reparented: list[dict[str, Any]] | None = None,
+    reparent_failures: list[dict[str, Any]] | None = None,
+    topic_members: list[Any] | None = None,
+    topic_members_truncated: bool = False,
+    citation_repoint: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The op's response envelope, and the ONE home of its status rule.
+
+    Pure and importable so the rule can be reasoned about without a server,
+    a service or an event loop — the same reason the validator above lives
+    here.
+
+    THE STATUS RULE.  ``'partial'`` whenever any disposition list is
+    non-empty: a failed delete, a failed retain tag, a failed reparent, or a
+    SURVIVOR.  The last one is the load-bearing case and the reason the rule
+    cannot key on failures alone — an id whose delete reported success but
+    which still resolves produced no failure to count, and it is exactly the
+    silent-fail-soft this op exists to surface.  ``'partial'`` is not a
+    softer success: it says this cluster is still open, and the lists say
+    which ids keep it open.
+
+    Every disposition key is ALWAYS present, empty lists included, so a
+    caller can read ``result['survivors']`` without a membership test and a
+    later arm cannot quietly stop reporting by omitting its key.
+    ``citation_repoint`` is the one exception: it is present iff citations
+    were actually rewritten, because an empty map would read as "the gate
+    ran and found nothing" on a call where the gate never ran at all.
+    """
+    failed_deletes = list(failed_deletes)
+    survivors = list(survivors)
+    retain_failures = list(retain_failures or [])
+    reparent_failures = list(reparent_failures or [])
+    open_business = (
+        failed_deletes or retain_failures or reparent_failures or survivors
+    )
+    result: dict[str, Any] = {
+        'status': 'partial' if open_business else 'consolidated',
+        'canonical_id': canonical_id,
+        'topic': topic,
+        'deleted': list(deleted),
+        'failed_deletes': failed_deletes,
+        'retained': list(retained or []),
+        'retain_failures': retain_failures,
+        'reparented': list(reparented or []),
+        'reparent_failures': reparent_failures,
+        'survivors': survivors,
+        'topic_members': list(topic_members or []),
+        'topic_members_truncated': bool(topic_members_truncated),
+    }
+    if citation_repoint:
+        result['citation_repoint'] = citation_repoint
+    return result

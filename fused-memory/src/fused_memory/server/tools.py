@@ -79,7 +79,10 @@ from fused_memory.reconciliation.task_filter import (
     is_mixed_temporal_framing,
     is_proposed_resolution_framing,
 )
-from fused_memory.server.consolidation import validate_consolidate_args
+from fused_memory.server.consolidation import (
+    build_consolidation_result,
+    validate_consolidate_args,
+)
 from fused_memory.server.manifest_stamping import stamp_capability_manifests
 from fused_memory.server.markup_tripwire import (
     MarkupStormCounter,
@@ -4696,15 +4699,34 @@ def create_mcp_server(
                 })
                 survivors.append(supersede_id)
                 continue
-            await memory_service.delete_memory(
-                memory_id=supersede_id,
-                store='mem0',
-                project_id=project_id,
-                agent_id=agent_id,
-                session_id=session_id,
-                causation_id=causation_id,
-                _source=source,
-            )
+            try:
+                await memory_service.delete_memory(
+                    memory_id=supersede_id,
+                    store='mem0',
+                    project_id=project_id,
+                    agent_id=agent_id,
+                    session_id=session_id,
+                    causation_id=causation_id,
+                    _source=source,
+                )
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                # Never captured as a per-id disposition: these mean the
+                # process is going away, not that this record refused.
+                raise
+            except Exception as exc:
+                # CAPTURED, not raised — `@mcp_tool_errors` would flatten the
+                # whole envelope to {'error', 'error_type'} and destroy every
+                # other id's disposition, which is the entire deliverable. One
+                # refusal costs one id: the loop runs on, because the ids that
+                # CAN fold should, and re-running to fold them later would
+                # re-write the canonical — the +1-per-pass ratchet.
+                failed_deletes.append({
+                    'id': supersede_id,
+                    'error': str(exc),
+                    'error_type': type(exc).__name__,
+                })
+                survivors.append(supersede_id)
+                continue
             deleted.append(supersede_id)
 
         # (6) The closure listing comes from the deterministic scroll, NOT
@@ -4724,25 +4746,19 @@ def create_mcp_server(
             )
         else:
             total = returned
-        result: dict[str, Any] = {
-            # (8) Anything that did not happen is NAMED. `partial` is not a
-            # softer success: it says this cluster is still open, and which
-            # ids keep it open.
-            'status': 'partial' if (failed_deletes or survivors) else 'consolidated',
-            'canonical_id': canonical_id,
-            'topic': topic,
-            'deleted': deleted,
-            'failed_deletes': failed_deletes,
-            'survivors': survivors,
-            'topic_members': topic_members,
-            'topic_members_truncated': total > returned,
-        }
-        if citation_repoint:
-            # Present iff citations were actually rewritten, mirroring
-            # `delete_memory`: an empty dict would read as "the gate ran and
-            # found nothing" on a call where it never ran at all.
-            result['citation_repoint'] = citation_repoint
-        return result
+        # (8) Anything that did not happen is NAMED, and the status rule that
+        # decides `consolidated` vs `partial` lives in ONE pure place rather
+        # than being re-expressed at each return.
+        return build_consolidation_result(
+            canonical_id=canonical_id,
+            topic=topic,
+            deleted=deleted,
+            failed_deletes=failed_deletes,
+            survivors=survivors,
+            topic_members=topic_members,
+            topic_members_truncated=total > returned,
+            citation_repoint=citation_repoint,
+        )
 
     @mcp.tool()
     @mcp_tool_errors()
