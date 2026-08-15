@@ -234,6 +234,7 @@ def build_consolidation_result(
     topic_members_total: int | None = None,
     topic_members_truncated: bool = False,
     citation_repoint: dict[str, Any] | None = None,
+    tombstones_written: int = 0,
 ) -> dict[str, Any]:
     """The op's response envelope, and the ONE home of its status rule.
 
@@ -284,6 +285,7 @@ def build_consolidation_result(
             len(members) if topic_members_total is None else topic_members_total
         ),
         'topic_members_truncated': bool(topic_members_truncated),
+        'tombstones_written': int(tombstones_written),
     }
     if citation_repoint:
         result['citation_repoint'] = citation_repoint

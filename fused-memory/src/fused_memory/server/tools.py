@@ -68,6 +68,9 @@ from fused_memory.reconciliation.citation_verifier import (
     is_concrete_memory_id,
     repoint_task_citations,
 )
+from fused_memory.reconciliation.mem0_tombstone import (
+    record_mem0_deletion_tombstones,
+)
 from fused_memory.reconciliation.task_filter import (
     ACTIVE_TASK_STATUSES,
     INACTIVE_TASK_STATUSES,
@@ -542,6 +545,13 @@ _UPDATE_MEMORY_MODES = ('merge', 'replace')
 #: a finding, which is why the envelope discloses ``topic_members_truncated``
 #: rather than letting a capped listing read as the whole closure.
 _TOPIC_MEMBER_LIMIT = 200
+
+#: ``consolidate_memories``' audit tag, used as BOTH the delete's ``_source``
+#: and the tombstone's ``deleter`` — the idiom the two recon sweeps follow
+#: with their own ``trim_source``/``gc_sweep_source`` constants. One string
+#: for both is what lets an auditor join a ``WriteJournal`` row to the
+#: tombstone that explains it.
+_CONSOLIDATE_SOURCE = 'consolidate_memories'
 
 #: The ONE citation-gate refusal ``consolidate_memories``' pre-flight does
 #: not treat as a blocker.
@@ -4762,6 +4772,9 @@ def create_mcp_server(
         survivors: list[str] = []
         reparented: list[dict[str, Any]] = []
         reparent_failures: list[dict[str, Any]] = []
+        # Pre-delete snapshots, keyed by id. Populated BEFORE each delete and
+        # consumed only for the ids the re-read confirms gone.
+        victims_by_id: dict[str, dict[str, Any]] = {}
         for supersede_id in supersedes_ids:
             rejection = citation_blocked.get(supersede_id)
             if rejection:
@@ -4778,7 +4791,25 @@ def create_mcp_server(
                 })
                 continue
 
-            # (5b) RE-HOME THIS SUPERSEDE'S CHILDREN, THEN delete it. The
+            # (5b) READ THE VICTIM WHILE IT STILL EXISTS. A tombstone needs
+            # the record's metadata and created_at, and there is NO read path
+            # to a deleted point id — so this capture cannot be deferred to
+            # the delete's success branch. Same reason `_sweep_stale_mem0_pool`
+            # keeps full member dicts rather than bare ids.
+            #
+            # A supersede that does not resolve here still gets a victim dict
+            # with `metadata=None`: the writer tolerates that, and the id
+            # itself is the field an auditor actually queries by.
+            victim_record = await memory_service.get_memory_by_id(
+                project_id=project_id, memory_id=supersede_id
+            )
+            victims_by_id[supersede_id] = {
+                'id': supersede_id,
+                'metadata': (victim_record or {}).get('metadata'),
+                'created_at': (victim_record or {}).get('created_at'),
+            }
+
+            # (5c) RE-HOME THIS SUPERSEDE'S CHILDREN, THEN delete it. The
             # order is not a preference: a child re-pointed AFTER its parent
             # died was an orphan for the interval between, and a crash inside
             # that interval leaves it one permanently — the child still names
@@ -4828,7 +4859,7 @@ def create_mcp_server(
                     'to': canonical_id,
                 })
 
-            # (5c) THE DELETE IS EARNED, NOT ASSUMED. Three distinct ways the
+            # (5d) THE DELETE IS EARNED, NOT ASSUMED. Three distinct ways the
             # re-homing can fail to be PROVEN complete, and any one of them
             # refuses this id's delete:
             #
@@ -4897,8 +4928,12 @@ def create_mcp_server(
                     project_id=project_id,
                     agent_id=agent_id,
                     session_id=session_id,
-                    causation_id=causation_id,
-                    _source=source,
+                    # `causation_id` is the RUN that killed it and `_source`
+                    # matches the tombstone's `deleter` verbatim, so the write
+                    # journal row and the tombstone name the same actor and an
+                    # auditor can join them.
+                    causation_id=run_id or causation_id,
+                    _source=_CONSOLIDATE_SOURCE,
                 )
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 # Never captured as a per-id disposition: these mean the
@@ -4940,6 +4975,7 @@ def create_mcp_server(
             ):
                 survivors.append(supersede_id)
 
+
         # (6) The closure listing comes from the deterministic scroll, NOT
         # `search`. A ranked top-N read can silently omit the canonical this
         # call just wrote — the exact failure that made the original
@@ -4957,6 +4993,74 @@ def create_mcp_server(
             )
         else:
             total = returned
+        # (7) TOMBSTONE THE CONFIRMED-GONE SET — `deleted` MINUS `survivors`,
+        # stamped HERE rather than from each delete's success branch as the
+        # two recon sweeps do. Those sweeps satisfy the writer's "only after
+        # the delete is confirmed successful" contract with the best evidence
+        # they hold: the call did not raise. This op holds strictly better
+        # evidence, because the re-read above is already mandatory — so a
+        # tombstone here means CORROBORATED GONE, not "the backend did not
+        # raise".
+        #
+        # That distinction IS the defect this task closes. An id whose delete
+        # reported success but which still resolves is the silent-fail-soft
+        # the ratchet was made of, and tombstoning it would mint a durable
+        # 30-day audit row asserting a record is gone while it is still in
+        # the corpus — manufacturing the exact false attribution the
+        # mechanism exists to prevent.
+        #
+        # NOT `citation_verifier.build_citation_tombstone`: that is a
+        # different object in a different store (task metadata
+        # `x_memory_citation_tombstones`, task 3893), keyed to CITING TASKS
+        # rather than to the deleted memory id, and it does not close this gap.
+        confirmed_gone = [i for i in deleted if i not in set(survivors)]
+        tombstones_written = 0
+        if confirmed_gone:
+            try:
+                # BATCH form, as both prod sweeps use: one upsert_many, one
+                # commit, one fsync, all-or-nothing. A consolidation set is a
+                # cluster by construction, so it is exactly what that is for.
+                tombstones_written = await record_mem0_deletion_tombstones(
+                    memory_service,
+                    project_id,
+                    [victims_by_id[i] for i in confirmed_gone],
+                    deleter=_CONSOLIDATE_SOURCE,
+                    # The run that KILLED these records, deliberately distinct
+                    # from each victim's own `metadata.run_id` naming the run
+                    # that WROTE it. Required at validation time precisely so
+                    # this call can never be made without it.
+                    deleting_run_id=run_id,
+                    # The REVERSE pointer (task 3133): the survivor id that
+                    # absorbed them, which is what makes "where did its
+                    # content go?" answerable from the DEAD id alone.
+                    absorbed_by=canonical_id,
+                )
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                # Belt and braces, matching both prod call sites. The writer
+                # is fail-safe by contract, but the audit trail must never be
+                # able to alter — or abort — the consolidation it describes.
+                logger.warning(
+                    'consolidate_memories: tombstone write failed for %d '
+                    'confirmed-gone record(s); the deletes themselves stand '
+                    'and remain journaled',
+                    len(confirmed_gone),
+                    exc_info=True,
+                    extra={'project_id': project_id, 'run_id': run_id},
+                )
+        if tombstones_written < len(confirmed_gone):
+            # Visible in the logs as well as in the envelope, matching the
+            # sweeps' degradation style.
+            logger.warning(
+                'consolidate_memories: %d of %d confirmed-gone record(s) were '
+                'tombstoned; the rest are deleted but unattributable from '
+                'their own ids',
+                tombstones_written,
+                len(confirmed_gone),
+                extra={'project_id': project_id, 'run_id': run_id},
+            )
+
         # (8) Anything that did not happen is NAMED, and the status rule that
         # decides `consolidated` vs `partial` lives in ONE pure place rather
         # than being re-expressed at each return.
@@ -4974,6 +5078,7 @@ def create_mcp_server(
             topic_members_total=total,
             topic_members_truncated=total > returned,
             citation_repoint=citation_repoint,
+            tombstones_written=tombstones_written,
         )
 
     @mcp.tool()
