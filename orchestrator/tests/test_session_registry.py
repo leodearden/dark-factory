@@ -2695,100 +2695,6 @@ def test_claim_lease_held_by_live_holder_warn_and_proceed_policy(tmp_path: Path)
     assert sr.LeaseHolder.from_json(lease_path.read_text()) == original
 
 
-# --- LeaseClaim.holder_session_state (task 3994 defect 4) -----------------
-#
-# The escape hatch's evidence. A lease whose holder pid is dead AND whose
-# session record is absent/exited is very probably ORPHANED — and a
-# stand-down that silently honours it is exactly the "23 pending L2 items,
-# no consumer for hours" failure. This field is DIAGNOSTIC ONLY: the lease
-# file stays authoritative, because auto-stealing on a dead-looking holder
-# is the duplicate-spawn incident path.
-
-
-def _contend(tmp_path: Path, *, holder_slug: str, holder_pid: int) -> sr.LeaseClaim:
-    """Seed a lease for (holder_slug, holder_pid) and return a contender's claim."""
-    held = sr.LeaseHolder(session_slug=holder_slug, pid=holder_pid, start_ts=_NOW.isoformat())
-    sr.claim_lease('watcher-df', holder=held, root=tmp_path, now=_NOW)
-    _set_mtime(sr.lease_path_for_name('watcher-df', root=tmp_path), _NOW, timedelta(seconds=42))
-    contender = sr.LeaseHolder(session_slug='watcher-df-200', pid=os.getpid(), start_ts=_NOW.isoformat())
-    return sr.claim_lease('watcher-df', holder=contender, root=tmp_path, now=_NOW)
-
-
-def test_holder_session_state_is_absent_when_the_holder_has_no_record(tmp_path: Path) -> None:
-    claim = _contend(tmp_path, holder_slug='watcher-df-100', holder_pid=_DEAD_PID)
-    assert claim.holder_session_state == 'absent'
-
-
-@pytest.mark.parametrize('status', [sr.Status.EXITED, sr.Status.FAILED_TO_START])
-def test_holder_session_state_is_exited_for_a_terminal_record(
-    tmp_path: Path, status: sr.Status
-) -> None:
-    sr.write_record(_make_record(session_slug='watcher-df-100', status=status), root=tmp_path)
-
-    claim = _contend(tmp_path, holder_slug='watcher-df-100', holder_pid=_DEAD_PID)
-
-    assert status in sr.TERMINAL_STATUSES
-    assert claim.holder_session_state == 'exited'
-
-
-def test_holder_session_state_is_live_for_a_non_terminal_record(tmp_path: Path) -> None:
-    sr.write_record(
-        _make_record(session_slug='watcher-df-100', status=sr.Status.RUNNING), root=tmp_path
-    )
-
-    claim = _contend(tmp_path, holder_slug='watcher-df-100', holder_pid=_DEAD_PID)
-
-    assert claim.holder_session_state == 'live'
-
-
-def test_holder_session_state_is_unknown_for_an_unparseable_record(tmp_path: Path) -> None:
-    record_path = sr.record_path_for_slug('watcher-df-100', root=tmp_path)
-    record_path.parent.mkdir(parents=True, exist_ok=True)
-    record_path.write_text('{not valid json')
-
-    claim = _contend(tmp_path, holder_slug='watcher-df-100', holder_pid=_DEAD_PID)
-
-    assert claim.holder_session_state == 'unknown'
-
-
-def test_holder_session_state_is_unknown_for_a_corrupt_lease_body(tmp_path: Path) -> None:
-    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
-    lease_path.parent.mkdir(parents=True, exist_ok=True)
-    lease_path.write_text('{not valid json')
-    _set_mtime(lease_path, _NOW, timedelta(seconds=42))
-
-    contender = sr.LeaseHolder(session_slug='watcher-df-200', pid=os.getpid(), start_ts=_NOW.isoformat())
-    claim = sr.claim_lease('watcher-df', holder=contender, root=tmp_path, now=_NOW)
-
-    assert claim.holder is None
-    assert claim.holder_session_state == 'unknown'
-
-
-def test_holder_session_state_resolution_is_fail_soft(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    def _boom(*_args: object, **_kwargs: object) -> sr.SessionRecord:
-        raise OSError('session registry substrate on fire')
-
-    monkeypatch.setattr(sr, 'read_record', _boom)
-
-    # A session-registry read fault must never break a lease claim.
-    claim = _contend(tmp_path, holder_slug='watcher-df-100', holder_pid=_DEAD_PID)
-
-    assert claim.decision == sr.LeaseDecision.STAND_DOWN
-    assert claim.holder_session_state == 'unknown'
-
-
-def test_holder_session_state_of_a_freshly_acquired_lease_is_live(tmp_path: Path) -> None:
-    holder = sr.LeaseHolder(session_slug='watcher-df-100', pid=os.getpid(), start_ts=_NOW.isoformat())
-
-    claim = sr.claim_lease('watcher-df', holder=holder, root=tmp_path, now=_NOW)
-
-    # The acquirer is itself, and it is by construction running.
-    assert claim.acquired is True
-    assert claim.holder_session_state == 'live'
-
-
 # --- claim_lease: stale-lease reap-and-reclaim + the AND boundary --------
 
 
@@ -3384,7 +3290,6 @@ def test_lease_status_reports_the_holder_and_the_heartbeat_clock(tmp_path: Path)
         minutes=30
     )
     assert status.reclaimable is False
-    assert status.holder_session == 'absent'  # no session record was written
 
 
 def test_lease_status_heartbeat_age_tracks_the_mtime(tmp_path: Path) -> None:
@@ -3432,23 +3337,6 @@ def test_lease_status_never_reports_a_live_holder_reclaimable_at_any_age(tmp_pat
     assert status.reclaimable is False
 
 
-@pytest.mark.parametrize(
-    ('record_status', 'expected'),
-    [(sr.Status.RUNNING, 'live'), (sr.Status.EXITED, 'exited')],
-)
-def test_lease_status_reports_the_holders_own_session_state(
-    tmp_path: Path, record_status: sr.Status, expected: str
-) -> None:
-    _seed_lease(tmp_path, pid=_DEAD_PID)
-    sr.write_record(
-        _make_record(session_slug='watcher-df-100', status=record_status), root=tmp_path
-    )
-
-    status = sr.lease_status('watcher-df', root=tmp_path, now=_NOW)
-
-    assert status.holder_session == expected
-
-
 def test_lease_status_on_an_absent_lease_reports_state_absent(tmp_path: Path) -> None:
     status = sr.lease_status('watcher-df', root=tmp_path, now=_NOW)
 
@@ -3477,7 +3365,6 @@ def test_lease_status_on_a_corrupt_body_is_unreadable_but_still_dates_the_heartb
     assert status.holder_slug is None
     assert status.holder_pid is None
     assert int(status.heartbeat_age_secs) == 2520
-    assert status.holder_session == 'unknown'
 
 
 def test_lease_status_is_read_only(tmp_path: Path) -> None:
@@ -3588,6 +3475,16 @@ def test_main_lease_release_removes_the_file(
 
 
 # --- CLI holder_liveness orphan signal (task 3994 defect 4) ---------------
+#
+# SINGLE-SIGNAL by construction: `holder_liveness=orphaned` means exactly
+# "the pid recorded in the lease body is not running". These tests run under
+# PRODUCTION-REALISTIC conditions -- no session record is written anywhere,
+# because a lease's `session_slug` is a claimant-chosen ownership token
+# (`watcher-<project>-<pid>`) and NOT a session-registry record key, so no
+# production path can ever put a record there (see
+# TestLeaseSlugIsNotASessionRecordKey below). The originally-designed
+# session-record corroboration was withdrawn for exactly that reason; the
+# emitted values are byte-identical either way.
 
 
 def _contend_via_cli(
@@ -3617,42 +3514,17 @@ def test_main_lease_claim_orphan_signal_is_additive_after_decision(
     assert lines[2] == 'holder_liveness=held'
 
 
-def test_main_lease_claim_reports_orphaned_for_a_dead_pid_with_no_record(
+def test_main_lease_claim_reports_orphaned_for_a_dead_holder_pid(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
 
+    # No session record is written -- that is the production shape, and the
+    # dead pid is the whole of the evidence.
     lines = _contend_via_cli(tmp_path, capsys, holder_pid=_DEAD_PID)
 
     assert lines[0] == 'decision=stand-down'
     assert lines[-1] == 'holder_liveness=orphaned'
-
-
-def test_main_lease_claim_reports_orphaned_for_a_dead_pid_with_an_exited_record(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
-    sr.write_record(
-        _make_record(session_slug='watcher-df-100', status=sr.Status.EXITED), root=tmp_path
-    )
-
-    lines = _contend_via_cli(tmp_path, capsys, holder_pid=_DEAD_PID)
-
-    assert lines[-1] == 'holder_liveness=orphaned'
-
-
-def test_main_lease_claim_reports_held_for_a_dead_pid_with_a_live_record(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
-    sr.write_record(
-        _make_record(session_slug='watcher-df-100', status=sr.Status.RUNNING), root=tmp_path
-    )
-
-    lines = _contend_via_cli(tmp_path, capsys, holder_pid=_DEAD_PID)
-
-    # The pid may be a stale write; with a live record, do NOT cry orphan.
-    assert lines[-1] == 'holder_liveness=held'
 
 
 def test_main_lease_claim_reports_held_for_an_unreadable_lease_body(
@@ -3670,6 +3542,110 @@ def test_main_lease_claim_reports_held_for_an_unreadable_lease_body(
     assert rc == 0
     # 'unknown' must never be promoted to an orphan finding: fail toward held.
     assert capsys.readouterr().out.splitlines()[-1] == 'holder_liveness=held'
+
+
+class TestLeaseSlugIsNotASessionRecordKey:
+    """The two slug namespaces are DISJOINT — pinned so the withdrawn corroboration cannot return.
+
+    Task 3994 originally corroborated the orphan signal with the holder's own
+    session_registry record, via ``read_record(holder.session_slug)``. That
+    lookup is STRUCTURALLY IMPOSSIBLE, and the tests that appeared to exercise
+    its branches only did so by hand-writing a record under a lease-shaped
+    slug — a state no production path can produce. They were deleted; this
+    class replaces them with the reason.
+
+    MEASURED EVIDENCE (2026-08-15, live fleet root): the real
+    ``~/.claude/fleet/leases/watcher-df.lease`` holds
+    ``session_slug=watcher-df-1894895``, while 0 of the 46,624
+    ``~/.claude/fleet/sessions/`` record dirs begin with ``watcher-``. Real
+    record slugs look like ``architect-dark_factory-3133-25737ee4-...``.
+
+    The namespaces differ in all three segments, and every builder here is the
+    REAL one — no slug is hand-written:
+    - the LEASE slug is claimant-chosen, prescribed by the skills as
+      ``<lease-role>-<project>-<session pid>``
+      (skills/escalation-watcher/SKILL.md:50);
+    - the RECORD slug comes from ``build_session_slug(role, project, task,
+      <uniqueness token>)``, where the token is a session UUID for a
+      hand-launched session (``session_hooks.hook_session_slug``) and the
+      project token is the registry's project id (``dark_factory``), not the
+      lease's short name (``df``).
+    """
+
+    # A hand-launched session's uniqueness token: hook_session_slug passes the
+    # hook's `session_id` (a UUID string) into build_session_slug's
+    # launcher_pid slot. Kept literal so the test is deterministic.
+    SESSION_UUID = '25737ee4-3b1e-4a7f-9f0e-6a1c2d3e4f50'
+
+    def _lease_slug(self, project: str = 'df', pid: int = 1894895) -> str:
+        """The lease slug exactly as skills/escalation-watcher/SKILL.md:50 builds it."""
+        return f'watcher-{project}-{sr.resolve_session_pid({sr.SESSION_PID_ENV: str(pid)})}'
+
+    def _record_slug(self, project: str = 'dark_factory') -> str:
+        """The record slug exactly as session_hooks.hook_session_slug builds it."""
+        return sr.build_session_slug(
+            'session',
+            project,
+            None,
+            self.SESSION_UUID,  # type: ignore[arg-type]
+        )
+
+    def test_the_two_slugs_for_one_notional_session_differ(self) -> None:
+        assert self._lease_slug() != self._record_slug()
+
+    def test_a_real_record_provably_does_not_live_under_its_lease_slug(
+        self, tmp_path: Path
+    ) -> None:
+        # A well-formed record IS written for this notional session, under the
+        # slug the registry actually keys on...
+        record_slug = self._record_slug()
+        sr.write_record(_make_record(session_slug=record_slug), root=tmp_path)
+        assert sr.read_record(record_slug, root=tmp_path).session_slug == record_slug
+
+        # ...and read_record(<lease slug>) STILL raises FileNotFoundError. That
+        # is why holder_session_state was a constant 'absent' in production.
+        with pytest.raises(FileNotFoundError):
+            sr.read_record(self._lease_slug(), root=tmp_path)
+
+    @pytest.mark.parametrize(
+        ('role', 'project', 'task_id'),
+        [
+            ('watcher', 'df', None),
+            ('session', 'df', None),
+            ('session', 'dark_factory', None),
+            ('unblock', 'df', '2085'),
+            ('recon-watcher', 'df', None),
+        ],
+    )
+    def test_a_lease_slug_is_not_a_build_session_slug_output(
+        self, role: str, project: str, task_id: str | None
+    ) -> None:
+        # Not for any (role, project, task) triple the skills use: the
+        # uniqueness token is a session UUID, never the session pid.
+        assert self._lease_slug() != sr.build_session_slug(
+            role,
+            project,
+            task_id,
+            self.SESSION_UUID,  # type: ignore[arg-type]
+        )
+
+    def test_the_withdrawn_corroboration_is_gone_and_cannot_quietly_return(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _seed_lease(tmp_path, pid=_DEAD_PID)
+        contender = sr.LeaseHolder(
+            session_slug='watcher-df-200', pid=os.getpid(), start_ts=_NOW.isoformat()
+        )
+        claim = sr.claim_lease('watcher-df', holder=contender, root=tmp_path, now=_NOW)
+        status = sr.lease_status('watcher-df', root=tmp_path, now=_NOW)
+        capsys.readouterr()
+
+        # A field documented as corroborating evidence but structurally
+        # constant is worse than no field: an operator reads
+        # `holder_session=absent` as a positive orphan finding.
+        assert not hasattr(claim, 'holder_session_state')
+        assert not hasattr(status, 'holder_session')
+        assert not hasattr(sr, '_resolve_holder_session_state')
 
 
 # --- resolve_session_pid (task 3994 defect 2) ------------------------------
@@ -3904,7 +3880,6 @@ def test_main_lease_show_prints_machine_readable_fields_for_a_held_lease(
     assert fields['holder_pid'] == str(os.getpid())
     assert fields['holder_pid_alive'] == 'true'
     assert fields['reclaimable'] == 'false'
-    assert fields['holder_session'] == 'absent'
     # The freshness clock `cat <lease>` cannot show, replacing `stat -c %y`.
     assert abs(int(fields['heartbeat_age_secs']) - 3600) <= 5
     assert datetime.fromisoformat(fields['heartbeat_ts']).tzinfo is not None
@@ -3927,7 +3902,6 @@ def test_main_lease_show_reports_a_dead_and_expired_holder_reclaimable(
     fields = _parse_kv(capsys.readouterr().out)
     assert fields['holder_pid_alive'] == 'false'
     assert fields['reclaimable'] == 'true'
-    assert fields['holder_session'] == 'absent'
 
 
 def test_main_lease_show_on_an_absent_lease_reports_state_absent(
