@@ -277,6 +277,14 @@ class Finding:
     source episode would understate what is actually in the graph. It defaults
     to ``()`` because the pure layer cannot reach the store; ``_run`` attaches
     the real uuids for flagged episodes.
+
+    ``None`` is a THIRD state, distinct from ``()``: NOT ENUMERATED. It
+    serializes to JSON ``null``, which no consumer can misread as a measured
+    zero, and it is what ``_run`` records when no reader resolved for the
+    finding's graph or the edge query raised. ``()`` keeps its one meaning —
+    queried, and no edges found. ``edges_unqueried`` carries the same fact as a
+    boolean so the condition is greppable in the committed artifact without
+    inferring it from a null.
     """
 
     record_uuid: str
@@ -292,7 +300,8 @@ class Finding:
     status: str
     observed: str
     claimed_text: str
-    derived_edge_uuids: tuple[str, ...] = ()
+    derived_edge_uuids: tuple[str, ...] | None = ()
+    edges_unqueried: bool = False
 
     def to_json(self) -> dict[str, Any]:
         """Render as a plain JSON-serializable dict."""
@@ -310,7 +319,12 @@ class Finding:
             'status': self.status,
             'observed': self.observed,
             'claimed_text': self.claimed_text,
-            'derived_edge_uuids': list(self.derived_edge_uuids),
+            # None stays None — it renders as JSON `null`, the whole point.
+            'derived_edge_uuids': (
+                None if self.derived_edge_uuids is None
+                else list(self.derived_edge_uuids)
+            ),
+            'edges_unqueried': self.edges_unqueried,
         }
 
 
@@ -406,6 +420,11 @@ CAVEATS: tuple[str, ...] = (
     'has been deleted is NOT covered, and neither is an episode ingested '
     'through add_episode with a caller-supplied description, which carries no '
     'category and so falls outside the category scope.',
+    'EDGES NOT ENUMERATED: a finding whose derived_edge_uuids is null (and '
+    'whose edges_unqueried is true) had its RELATES_TO edges NOT enumerated — '
+    'no reader resolved for its graph, or the edge query failed. Its harm '
+    'artefacts are UNKNOWN, not absent. An empty list means the opposite: the '
+    'store WAS asked and returned nothing.',
     'DETECTION BOUND: claims are detected by the deterministic lexical '
     'vocabulary in fused_memory.services.completion_claim_gate, which requires '
     'completion PHRASING and a concrete NAMED REF (task id / commit sha / tkt_ '
@@ -492,6 +511,11 @@ def build_report(
         'summary': {
             'mismatch': len(mismatches),
             'unverifiable': len(unverifiables),
+            # Always present, 0 when none: a key that appeared only when
+            # nonzero would read as absent rather than as zero. Same
+            # no-silent-caps discipline as `truncated_by` — a reader sees the
+            # denominator of un-enumerated findings without diffing the list.
+            'edges_unqueried': sum(1 for f in findings if f.edges_unqueried),
             'by_category': _tally(findings, lambda f: f.category or '(uncategorized)'),
             'by_project': _tally(findings, lambda f: f.project_id),
             'by_subject': _tally(findings, lambda f: f.subject),
@@ -1079,7 +1103,11 @@ async def _run(
     )
 
     # ---- attach the harm artefacts to each flagged episode ----------------- #
-    edge_cache: dict[tuple[str, str], tuple[str, ...]] = {}
+    # None in this cache means NOT ENUMERATED, and is carried through to JSON
+    # `null`. () means queried-and-empty. Collapsing the two would make an
+    # un-run query indistinguishable from a measured zero on the report's
+    # central harm-artefact column.
+    edge_cache: dict[tuple[str, str], tuple[str, ...] | None] = {}
     enriched: list[Finding] = []
     for finding in findings:
         # Keyed on graph_name, NOT project_id: `readers` is keyed by --project
@@ -1089,20 +1117,31 @@ async def _run(
         key = (finding.graph_name, finding.record_uuid)
         if key not in edge_cache:
             reader = readers.get(finding.graph_name)
-            try:
-                edge_cache[key] = (
-                    await reader.fetch_derived_edges(finding.record_uuid)
-                    if reader is not None
-                    else ()
-                )
-            except Exception:
+            if reader is None:
                 logger.warning(
-                    'could not enumerate derived edges for episode %s',
-                    finding.record_uuid, exc_info=True,
+                    'no reader for graph %s — derived edges NOT enumerated for '
+                    'episode %s; its harm artefacts are UNKNOWN, not absent',
+                    finding.graph_name, finding.record_uuid,
                 )
-                edge_cache[key] = ()
+                edge_cache[key] = None
+            else:
+                try:
+                    edge_cache[key] = await reader.fetch_derived_edges(
+                        finding.record_uuid
+                    )
+                except Exception:
+                    logger.warning(
+                        'could not enumerate derived edges for episode %s',
+                        finding.record_uuid, exc_info=True,
+                    )
+                    edge_cache[key] = None
+        edges = edge_cache[key]
         enriched.append(
-            Finding(**{**vars_of(finding), 'derived_edge_uuids': edge_cache[key]})
+            Finding(**{
+                **vars_of(finding),
+                'derived_edge_uuids': edges,
+                'edges_unqueried': edges is None,
+            })
         )
 
     report = build_report(
