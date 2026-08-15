@@ -1945,8 +1945,18 @@ def _prod_rows(tmp_path, rows):
 
 
 def _prod_row(query_id='prod-brief-abc', text='project overview architecture goals',
-              source='briefing_template', observed_count=74103,
-              traffic_share=0.172892, observed_limit=5):
+              source='briefing_template', observed_count: object = 74103,
+              traffic_share: object = 0.172892, observed_limit=5):
+    """Build one production-shaped JSONL row.
+
+    `observed_count` and `traffic_share` are annotated `object`, not narrowed
+    to their well-formed types, because this helper's job includes building
+    the MALFORMED rows the loader's type refusals are pinned against
+    (`traffic_share=None` / `'0.17'` / `True`, `observed_count='74103'`).
+    The row is raw JSON on its way to `json.dumps`; the types are the
+    loader's to enforce at parse time, which is precisely what those tests
+    assert it does.
+    """
     return {
         'query_id': query_id,
         'text': text,
