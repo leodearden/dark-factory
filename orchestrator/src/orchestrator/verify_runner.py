@@ -3016,6 +3016,48 @@ class HostAllocator:
             for name, state in self._slots.items()
         ]
 
+    def is_parked(self, name: str) -> bool:
+        """Return True if host *name*'s slot is PARKED (held + non-acquirable).
+
+        Exists because PARKED is a *strand* state no other accessor can cheaply
+        answer for (task 3043).  When :meth:`cancel_and_release` runs against an
+        unreachable host the cancel RPC returns rc != 0 and every
+        ``probe_clean()`` poll fails, so on exhaustion the slot is deliberately
+        left PARKED — the correct fail-closed state, since a stale verify
+        process may still be running there.  But that path writes **only**
+        ``_slots``: the host is NOT added to ``_quarantine``, so
+        :meth:`quarantined_remote_runners` never yields it and the auto-reprobe
+        path cannot even consider it.  ``SpeculativeMergeWorker`` uses this
+        predicate on its release paths to detect exactly that strand and record
+        the host in its unavailability tracker.
+
+        Deliberately consistent with :meth:`host_states`'s
+        ``slot_state == 'parked'`` — both read ``_slots``, and ``_SLOT_WIRE`` is
+        just the wire spelling of the same state.  This is the cheap per-host
+        boolean for the hot path; ``host_states()`` remains the sanctioned
+        list-shaped read for snapshot consumers.
+
+        A name this allocator does not manage returns False rather than raising.
+        """
+        return self._slots.get(name) == _SLOT_PARKED
+
+    def remote_runner(self, name: str) -> Any | None:
+        """Return the runner object declared for remote host *name*, else None.
+
+        Exists because reprobe candidacy is TRACKER-driven (task 3043): the
+        sweep iterates the worker's ``_runner_unavailable`` tracker and must
+        resolve a runner for hosts that are unavailable but **not** in the
+        quarantine set — the escaping-exception and PARKED-strand shapes.
+        :meth:`quarantined_remote_runners` structurally cannot supply those; it
+        filters on quarantine membership by construction.
+
+        Resolution is independent of slot state and of quarantine membership —
+        it is a pure declaration lookup.  Returns None for the local host name
+        (``_remote_runners`` holds only remotes; local is the trust anchor and
+        is never probed for re-admission) and None for an unknown name.
+        """
+        return self._remote_runners.get(name)
+
     def quarantined_remote_runners(self) -> list[tuple[str, Any]]:
         """Return (name, runner) pairs for remote runners currently in quarantine.
 
