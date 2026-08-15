@@ -1394,10 +1394,7 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
         spec=sleeper_spec(300.0),
         cfg_file=cfg_file,
         request_id=REQUEST_ID,
-        extra_env={
-            'ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS': '1.0',
-            'ORCH_WATCHDOG_KILL_GRACE_SECS': '0.5',
-        },
+        extra_env=ROW_WATCHDOG_ENV,
     )
     heartbeat = HeartbeatWriter(child, interval=0.2).start()
     try:
