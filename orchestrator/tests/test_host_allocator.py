@@ -930,3 +930,180 @@ class TestHostAllocatorStateAccessors:
         """An unmanaged host name returns False rather than raising."""
         alloc = self._make_allocator()
         assert alloc.is_quarantined('no-such-host') is False
+
+
+# ---------------------------------------------------------------------------
+# 3043/step-1 RED: is_parked() + remote_runner() strand-introspection accessors
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestHostAllocatorStrandAccessors:
+    """is_parked() / remote_runner(): the primitives strand detection needs.
+
+    Task 3043.  Two states the existing accessors structurally cannot answer:
+
+    - A ``cancel_and_release`` against an unreachable host leaves the slot
+      PARKED and non-acquirable, yet does NOT add the host to ``_quarantine``
+      — so ``quarantined_remote_runners()`` never yields it and the auto-reprobe
+      path cannot even consider it.  ``is_parked`` is the cheap per-host
+      predicate the merge_queue strand check needs on the release hot path.
+    - Reprobe candidacy becomes TRACKER-driven, so it must resolve a runner
+      object for a host that is tracked but NOT quarantined —
+      ``quarantined_remote_runners()`` structurally cannot supply that.
+
+    RED until 3043/step-2 adds the two methods (AttributeError before that).
+    """
+
+    def _make_allocator(self, *, quarantine=None):
+        from orchestrator.verify_runner import HostAllocator
+
+        remote_a = _FakeRemoteRunner('remoteA')
+        remote_b = _FakeRemoteRunner('remoteB')
+        q = quarantine if quarantine is not None else set()
+        return HostAllocator([remote_a, remote_b], quarantine=q)
+
+    def _local_factory(self):
+        return _FakeLocalRunner()
+
+    def _by_name(self, alloc) -> dict:
+        return {h['name']: h for h in alloc.host_states()}
+
+    async def _make_parked_allocator(self):
+        """Return (alloc, remote_a) with remoteA's slot left PARKED.
+
+        Same construction as ``test_cancel_fail_bounded_max_attempts_stays_parked``
+        (test_host_allocator.py:485): cancel_verify() returns rc != 0 and
+        probe_clean() never returns True, so with bounded max_attempts the slot
+        stays PARKED — held, non-acquirable, and NOT in the quarantine set.
+        """
+        from orchestrator.verify_runner import HostAllocator
+
+        remote_a = _FakeRemoteRunnerCancellable(
+            'remoteA', cancel_rc=1, probe_sequence=[False] * 20,
+        )
+        remote_b = _FakeRemoteRunner('remoteB')
+        alloc = HostAllocator([remote_a, remote_b], quarantine=set())
+
+        lease = alloc.acquire_remote()
+        assert lease is not None and lease.name == 'remoteA'
+
+        async def noop_sleep(_: float) -> None:
+            pass
+
+        result = await alloc.cancel_and_release(lease, sleep=noop_sleep, max_attempts=2)
+        assert result is False
+        return alloc, remote_a
+
+    # -- is_parked -------------------------------------------------------------
+
+    async def test_is_parked_true_for_cancel_fail_parked_slot(self):
+        """A slot left PARKED by the bounded cancel-fail path reports is_parked True."""
+        alloc, _remote_a = await self._make_parked_allocator()
+        assert alloc.is_parked('remoteA') is True
+
+    async def test_is_parked_false_for_free_slot(self):
+        """A fresh FREE slot is not parked."""
+        alloc = self._make_allocator()
+        assert alloc.is_parked('remoteA') is False
+        assert alloc.is_parked('remoteB') is False
+
+    async def test_is_parked_false_for_busy_slot(self):
+        """A BUSY slot (acquired, still verifying) is not parked."""
+        alloc = self._make_allocator()
+        lease = alloc.acquire_remote()
+        assert lease is not None and lease.name == 'remoteA'
+        assert alloc.is_parked('remoteA') is False
+
+    async def test_is_parked_false_for_local_host(self):
+        """The local slot is never parked — local is the trust anchor."""
+        alloc = self._make_allocator()
+        assert alloc.is_parked('local') is False
+        alloc.acquire_local(self._local_factory)
+        assert alloc.is_parked('local') is False
+
+    async def test_is_parked_unknown_name_returns_false_not_keyerror(self):
+        """An unmanaged host name returns False rather than raising KeyError."""
+        alloc = self._make_allocator()
+        assert alloc.is_parked('no-such-host') is False
+
+    async def test_is_parked_agrees_with_host_states_slot_state(self):
+        """is_parked(n) can never drift from host_states()'s 'parked' wire spelling.
+
+        Checked over BOTH fixtures — one with a PARKED slot and one with none —
+        so the two readers of ``_slots`` are pinned to agree for every host.
+        """
+        parked_alloc, _ = await self._make_parked_allocator()
+        plain_alloc = self._make_allocator()
+        plain_alloc.acquire_remote()                       # remoteA busy
+        plain_alloc.acquire_local(self._local_factory)     # local busy
+
+        for alloc in (parked_alloc, plain_alloc):
+            states = self._by_name(alloc)
+            assert 'parked' in {h['slot_state'] for h in states.values()} or alloc is plain_alloc
+            for name, entry in states.items():
+                assert alloc.is_parked(name) is (entry['slot_state'] == 'parked'), (
+                    f'{name}: is_parked={alloc.is_parked(name)} vs '
+                    f'slot_state={entry["slot_state"]!r}'
+                )
+
+    async def test_parked_host_is_not_quarantined(self):
+        """The strand shape: PARKED yet absent from the quarantine set.
+
+        This is why ``quarantined_remote_runners()`` cannot see a stranded host
+        and why ``is_parked`` is needed at all.
+        """
+        alloc, _ = await self._make_parked_allocator()
+        assert alloc.is_parked('remoteA') is True
+        assert alloc.is_quarantined('remoteA') is False
+        assert alloc.quarantined_remote_runners() == []
+
+    # -- remote_runner ---------------------------------------------------------
+
+    async def test_remote_runner_returns_identical_object_when_free(self):
+        """A declared, FREE, unquarantined remote resolves to the same runner object.
+
+        This is the case ``quarantined_remote_runners()`` structurally cannot
+        answer — and precisely what a tracker-driven reprobe needs.
+        """
+        from orchestrator.verify_runner import HostAllocator
+
+        remote_a = _FakeRemoteRunner('remoteA')
+        alloc = HostAllocator([remote_a], quarantine=set())
+        assert alloc.is_quarantined('remoteA') is False
+        assert alloc.remote_runner('remoteA') is remote_a
+
+    async def test_remote_runner_returns_identical_object_when_busy(self):
+        """Slot state does not affect resolution — BUSY still resolves."""
+        from orchestrator.verify_runner import HostAllocator
+
+        remote_a = _FakeRemoteRunner('remoteA')
+        alloc = HostAllocator([remote_a], quarantine=set())
+        lease = alloc.acquire_remote()
+        assert lease is not None
+        assert alloc.remote_runner('remoteA') is remote_a
+
+    async def test_remote_runner_returns_identical_object_when_parked(self):
+        """A PARKED (stranded) host still resolves to its runner — the recovery handle."""
+        alloc, remote_a = await self._make_parked_allocator()
+        assert alloc.is_parked('remoteA') is True
+        assert alloc.remote_runner('remoteA') is remote_a
+
+    async def test_remote_runner_returns_identical_object_when_quarantined(self):
+        """Quarantine membership does not affect resolution either."""
+        from orchestrator.verify_runner import HostAllocator
+
+        remote_a = _FakeRemoteRunner('remoteA')
+        alloc = HostAllocator([remote_a], quarantine={'remoteA'})
+        assert alloc.is_quarantined('remoteA') is True
+        assert alloc.remote_runner('remoteA') is remote_a
+
+    async def test_remote_runner_returns_none_for_local(self):
+        """Local is not a remote — _remote_runners holds only remotes."""
+        alloc = self._make_allocator()
+        assert alloc.remote_runner('local') is None
+
+    async def test_remote_runner_returns_none_for_unknown_name(self):
+        """An unmanaged host name returns None rather than raising."""
+        alloc = self._make_allocator()
+        assert alloc.remote_runner('no-such-host') is None
