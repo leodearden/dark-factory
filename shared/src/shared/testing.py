@@ -52,7 +52,8 @@ def make_gate_mock(**overrides) -> MagicMock:
     ``gate.confirm_account_ok.assert_called_with(...)``, etc. ``report(outcome)``
     (task W4-ε, PRD §7.4) mirrors production :meth:`InvokeSlot.report`'s
     dispatch-then-settle contract: OK→``confirm_account_ok``,
-    CapHit→``_handle_cap_detected``, AuthFailed→``_handle_auth_failure``,
+    CapHit→``_handle_cap_detected``+``release_probe_slot`` (task 4096),
+    AuthFailed→``_handle_auth_failure``,
     NearCap→``_handle_near_cap_warning``+``release_probe_slot``, everything
     else→``release_probe_slot``; always settling in a ``finally``. Kept in step
     with the sister proxy in ``tests/test_cap_retry.py::_mock_gate``.
@@ -121,6 +122,7 @@ def make_gate_mock(**overrides) -> MagicMock:
                         gate.confirm_account_ok(token)
                     elif isinstance(outcome, CapHit):
                         gate._handle_cap_detected(outcome.reason, outcome.resets_at, token)
+                        gate.release_probe_slot(token)
                     elif isinstance(outcome, AuthFailed):
                         gate._handle_auth_failure(f'HTTP {outcome.status}', token)
                     elif isinstance(outcome, NearCap):

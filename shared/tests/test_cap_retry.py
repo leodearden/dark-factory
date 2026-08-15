@@ -163,13 +163,17 @@ def _mock_gate(**overrides) -> MagicMock:
                 """Mirrors production InvokeSlot.report(outcome) (task W4-ε,
                 PRD §7.4): dispatches to the gate's existing handlers by
                 outcome variant, then settles in a ``finally`` so every path
-                leaves the slot settled exactly once."""
+                leaves the slot settled exactly once. CapHit dispatches to
+                ``_handle_cap_detected``+``release_probe_slot`` (task 4096).
+                Kept byte-for-byte in step with the sister proxy in
+                ``shared.testing.make_gate_mock``."""
                 token = slot.token
                 try:
                     if isinstance(outcome, OK):
                         gate.confirm_account_ok(token)
                     elif isinstance(outcome, CapHit):
                         gate._handle_cap_detected(outcome.reason, outcome.resets_at, token)
+                        gate.release_probe_slot(token)
                     elif isinstance(outcome, AuthFailed):
                         gate._handle_auth_failure(f'HTTP {outcome.status}', token)
                     elif isinstance(outcome, NearCap):
