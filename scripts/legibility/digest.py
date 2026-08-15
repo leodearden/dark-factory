@@ -712,16 +712,29 @@ CURATOR_CLASSIFIER_MARKERS: tuple[str, ...] = (
 code-module classifier (orchestrator/src/orchestrator/harness.py)."""
 
 HARNESS_BRIEFING_HEADINGS: tuple[str, ...] = (
-    '# context', '## context', '## agent identity', '# task',
+    '# context', '## agent identity', '# task',
 )
 """ANCHOR heading literals for an injected orchestrator briefing
 (orchestrator/src/orchestrator/agents/briefing.py): ``_get_memory_context``
-emits '# Context' (:1118) and, on its memory-unavailable exception path, a
-'## Context' sub-block (:1113); ``_agent_identity`` emits '## Agent
-Identity' (:98); the role prompt templates emit '# Task' (:188/261/1024).
-At least one anchor must be present as a line-anchored heading for a turn
-to classify as briefing-injected -- see :func:`is_harness_injected_turn`
-for the corroboration rule that goes with it."""
+emits '# Context' on its normal path (:1350) and on every early return --
+memory-unavailable (:1325, :1328) and no-context (:1330, :1331), all with a
+SINGLE hash; ``_agent_identity`` emits '## Agent Identity' (:272); the role
+prompt templates emit '# Task' (:362/:435/:506/:589/:666/:1198). At least
+one anchor must be present as a line-anchored heading for a turn to
+classify as briefing-injected -- see :func:`is_harness_injected_turn` for
+the corroboration rule that goes with it.
+
+'## Context' (DOUBLE hash) is deliberately NOT an anchor, and must not be
+re-added. briefing.py emits no such heading on any path. The literal does
+occur elsewhere in the repo -- orchestrator/src/orchestrator/agents/roles.py
+(:826 DEBUGGER, :1034 JUDGE, :1100 MERGER, :1378 STEWARD) and
+orchestrator/src/orchestrator/evals/reviewer_trial/mining.py:359 -- but
+those are agent system-prompt and eval-prompt body text, which never appear
+as a user-turn record and so are never seen by this filter. Meanwhile
+'## Context' followed by '## Conventions' is a common human-authored
+markdown shape in this repo's own plans/ and docs/ prose, and since one
+anchor plus one corroborator already meets the >=2 threshold, anchoring it
+costs genuine gold turns for zero recall."""
 
 HARNESS_BRIEFING_SUBHEADINGS: tuple[str, ...] = (
     '## project context', '## conventions', '## recent decisions',
@@ -730,9 +743,10 @@ HARNESS_BRIEFING_SUBHEADINGS: tuple[str, ...] = (
 """CORROBORATING heading literals -- the structural sub-blocks a real
 briefing carries alongside an anchor
 (orchestrator/src/orchestrator/agents/briefing.py: '## Project Context'
-:1091, '## Conventions' :1096, '## Recent Decisions' :1101, '## Task
-Context' :1109 inside ``_get_memory_context``'s sections list; '# Action'
-in the role prompt templates at :193/:496/:1038). Never sufficient alone:
+:1270, '## Conventions' :1277, '## Recent Decisions' :1284, '## Task
+Context' :1294 inside ``_get_memory_context``'s recalled_sections list;
+'# Action' in the role prompt templates at
+:367/:670/:827/:927/:968/:1007/:1095/:1120/:1212). Never sufficient alone:
 a human turn headed '## Conventions' carries no anchor and stays gold."""
 
 HARNESS_PROMPT_MARKERS: tuple[str, ...] = (
