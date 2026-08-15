@@ -3476,21 +3476,28 @@ class TestBeforeDoneSubprocessTimeoutHardening:
     curl, journalctl, sleep, the restarted daemon) that inherit the write end
     of the merged stdout pipe.  Killing only the direct child (pre-2090
     behavior) leaves the tree alive and the pipe open forever.
+
+    Task 4065 amendment: the timeout branch now RAISES ``ScriptTimeout``
+    instead of returning ``(1, '<script timed out after Ns>')`` — the plain
+    tuple was indistinguishable from a predicate script's genuine non-zero
+    VERDICT, which is the misclassification 4065 fixes.  The Layer-A teardown
+    below is unchanged and must still happen BEFORE the raise, so the
+    grandchild-is-dead assertion stays exactly as it was.
     """
 
     async def test_timeout_kills_whole_process_group(self, tmp_path: Path):
         """On timeout, a backgrounded grandchild must be killed too, not just
-        the direct child.
+        the direct child — and the timeout must surface as ``ScriptTimeout``.
 
-        RED today: current code calls ``proc.kill()`` on the direct child only
-        (no ``start_new_session``, no process-group kill) — the orphaned
-        grandchild survives the timeout branch.
+        The raise carries the legacy ``rc``/``tail`` pair as structured data
+        so ``_invoke_run_fn_translating_timeout`` can hand the deploy
+        classifiers exactly what they saw before (task 4065).
         """
         import asyncio
         import os
         import time
 
-        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.deterministic_runner import DeterministicRunner, ScriptTimeout
 
         script = tmp_path / 'hang.sh'
         pidfile = tmp_path / 'grandchild.pid'
@@ -3515,12 +3522,19 @@ class TestBeforeDoneSubprocessTimeoutHardening:
 
         # Hang tripwire: if the fix regresses into a real hang, fail loudly
         # instead of stalling the suite.
-        rc, tail = await asyncio.wait_for(
-            runner._default_run_script(before_done), timeout=10,
-        )
+        with pytest.raises(ScriptTimeout) as excinfo:
+            await asyncio.wait_for(
+                runner._default_run_script(before_done), timeout=10,
+            )
 
-        assert rc == 1, f'expected rc=1 on timeout, got {rc}'
-        assert 'timed out' in tail, f'expected a timed-out marker in tail, got {tail!r}'
+        exc = excinfo.value
+        assert exc.timeout_secs == 1, (
+            f'ScriptTimeout must carry the budget it overran, got {exc.timeout_secs!r}'
+        )
+        assert exc.rc == 1, f'expected the legacy rc=1 on the exception, got {exc.rc}'
+        assert '<script timed out after 1s>' in exc.tail, (
+            f'expected the legacy timed-out marker on the exception, got {exc.tail!r}'
+        )
 
         grandchild_pid = int(pidfile.read_text().strip())
         deadline = time.monotonic() + 3.0
