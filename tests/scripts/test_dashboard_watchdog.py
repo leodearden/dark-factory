@@ -1742,6 +1742,23 @@ def test_i5_main_exits_zero_on_a_normal_tick(monkeypatch, state_env, queue_env):
 # ---------------------------------------------------------------------------
 
 
+def test_log_swallows_only_os_and_subprocess_errors(monkeypatch):
+    """log() must not widen its except clause into a bare `except Exception`:
+    an unrelated bug (e.g. a TypeError from a bad call site) must still
+    surface rather than being silently swallowed alongside the two
+    tooling-failure cases it is meant to catch.
+    """
+    wdog = _load_watchdog()
+
+    def fake_run(argv, *args, **kwargs):
+        raise ValueError("not a systemd-cat failure at all")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(ValueError):
+        wdog.log("hello")
+
+
 def test_log_never_raises_when_the_stderr_fallback_itself_fails(monkeypatch):
     """The stderr fallback is best-effort too: it must not raise even when
     stderr itself is a broken pipe or a full/failing journal socket.
