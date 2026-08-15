@@ -11080,15 +11080,31 @@ class Harness:
 
         On restart, SpeculativeMergeWorker is constructed fresh (un-halted,
         no owner).  _dismiss_stale_escalations intentionally preserves pending
-        level-1 wip_conflict/unmerged_state/stash_failed escalations — but
+        level-≥1 wip_conflict/unmerged_state/stash_failed escalations — but
         NOTHING re-asserts the corresponding halt or re-registers the halt
         owner.  (stash_failed is the main-checkout-hygiene halt category from
         task 2758: a park of project_root's dirty tracked tree failed.)
 
-        This method scans the settled post-dismissal queue for preserved L1s
-        of the relevant categories and restores the (halted, owner-registered)
-        state, so the existing _on_escalation_resolved -> unhalt_wip path
-        cleanly releases the halt when the operator resolves the L1.
+        This method scans the settled post-dismissal queue for preserved
+        level-≥1 records of the relevant categories and restores the (halted,
+        owner-registered) state, so the existing _on_escalation_resolved ->
+        unhalt_wip path cleanly releases the halt when the operator resolves
+        the record.
+
+        LEVEL PREDICATE IS ``>= 1``, NOT ``== 1`` (task 3537, spec §7.9: "halt
+        rehydration matches on category at level >= 1 — promotion must not
+        change rehydration identity").  ``EscalationQueue.park()`` promotes a
+        halt-owner record IN PLACE: level becomes 2, ``status`` STAYS
+        ``'pending'``, the category is preserved and the record is rewritten
+        rather than archived.  ``_dismiss_stale_escalations`` only dismisses
+        ``level == 0``, so a PARKED halt owner survives the restart as a
+        pending L2 still carrying its halt category and must still re-assert
+        the halt.  A ``== 1`` filter silently dropped it and brought the merge
+        queue back UN-HALTED over a dirty project_root.
+
+        The lower bound stays at 1 deliberately: a level-0 record is
+        auto-dismissed at startup by ``dismiss_all_pending``, so honouring one
+        would resurrect a halt from a record nothing will ever resolve.
 
         Returns the escalation id that now owns the halt, or None if no action
         was taken.
@@ -11098,7 +11114,7 @@ class Harness:
 
         candidates = [
             esc for esc in self._escalation_queue.get_pending()
-            if esc.level == 1
+            if esc.level >= 1
             and esc.category in {'wip_conflict', 'unmerged_state', 'stash_failed'}
         ]
         if not candidates:
@@ -11106,17 +11122,17 @@ class Harness:
 
         if len(candidates) > 1:
             logger.warning(
-                '_rehydrate_merge_halt: %d qualifying L1s found; registering '
-                'only the most recent as halt owner.  The merge queue will '
-                'resume as soon as that owner L1 is resolved — even though '
-                '%d older L1(s) remain pending.  Resolve the most-recent L1 '
-                'last to avoid premature queue resumption.',
+                '_rehydrate_merge_halt: %d qualifying level-≥1 record(s) '
+                'found; registering only the most recent as halt owner.  The '
+                'merge queue will resume as soon as that owner is resolved — '
+                'even though %d older record(s) remain pending.  Resolve the '
+                'most-recent one last to avoid premature queue resumption.',
                 len(candidates),
                 len(candidates) - 1,
             )
         esc = max(candidates, key=lambda e: datetime.fromisoformat(e.timestamp))
         reason = (
-            f'Rehydrated merge halt from preserved L1 {esc.id} '
+            f'Rehydrated merge halt from preserved L{esc.level} {esc.id} '
             f'(category={esc.category}) after restart'
         )
         self._merge_worker.halt_for_wip(reason)

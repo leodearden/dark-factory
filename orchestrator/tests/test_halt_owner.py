@@ -327,7 +327,9 @@ class TestRehydrateMergeHalt:
         # The multi-L1 advisory warning must appear in the log output
         advisory_msgs = [
             r for r in caplog.records
-            if 'qualifying L1s found' in r.message
+            # Task 3537 widened the candidate predicate to level >= 1, so the
+            # advisory no longer says "L1s" — match the level-agnostic prose.
+            if 'qualifying level-≥1 record(s) found' in r.message
         ]
         assert advisory_msgs, (
             'Expected a warning about multiple qualifying L1s; got none. '
