@@ -628,3 +628,80 @@ class TestTheDeleteSetGoesThroughTheCitationGate:
         assert result['status'] == 'consolidated'
         assert result['deleted'] == SUPERSEDES
         interceptor.get_tasks.assert_not_called()
+
+
+def _delete_failures():
+    """The realistic ways `delete_memory` refuses, as (label, exception).
+
+    All three are RETURNED to the caller as data, not raised: the caller
+    needs to know which ids are still in the corpus, and `@mcp_tool_errors`
+    would flatten the whole envelope to {'error', 'error_type'} and destroy
+    exactly that.
+    """
+    from fused_memory.memory_metadata import ParentHasChildrenError
+    from fused_memory.utils.validation import InputValidationError
+
+    return [
+        pytest.param(RuntimeError('mem0 backend unreachable'), 'RuntimeError',
+                     id='backend-error'),
+        pytest.param(InputValidationError('memory_id is not a UUID'),
+                     'InputValidationError', id='validation-error'),
+        pytest.param(
+            ParentHasChildrenError(parent_id=S2, child_ids=[RETAIN_1]),
+            'ParentHasChildrenError', id='parent-has-children',
+        ),
+    ]
+
+
+class TestPartialFailureIsTwoWay:
+    """One failed delete costs one id, and is reported from BOTH sides.
+
+    The signal this op exists to produce: `failed_deletes` says what the
+    call could not do, `survivors` says what is still in the corpus, and
+    the same id appearing in both is what tells a caller the cluster is
+    still open. A raise would collapse all of it — `@mcp_tool_errors`
+    flattens an exception to {'error', 'error_type'}, so the per-id
+    dispositions, and with them the whole deliverable, would be gone.
+    """
+
+    @pytest.mark.parametrize('exc,error_type', _delete_failures())
+    @pytest.mark.asyncio
+    async def test_a_failed_delete_is_captured_structurally(self, exc, error_type):
+        svc = make_service(gone=[S1, S3], delete_errors={S2: exc})
+
+        result = await call_consolidate(svc)
+
+        assert result['status'] == 'partial'
+        assert result['failed_deletes'] == [
+            {'id': S2, 'error': str(exc), 'error_type': error_type}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_the_same_id_is_named_on_both_sides(self):
+        svc = make_service(gone=[S1, S3], delete_errors={S2: RuntimeError('boom')})
+
+        result = await call_consolidate(svc)
+
+        assert [f['id'] for f in result['failed_deletes']] == [S2]
+        assert result['survivors'] == [S2]
+        assert result['deleted'] == [S1, S3]
+
+    @pytest.mark.asyncio
+    async def test_one_failure_does_not_abort_the_rest_of_the_cluster(self):
+        """S3 comes AFTER the failing id, so reaching it proves the loop ran on."""
+        svc = make_service(gone=[S1, S3], delete_errors={S2: RuntimeError('boom')})
+
+        await call_consolidate(svc)
+
+        attempted = [c.kwargs['memory_id'] for c in svc.delete_memory.await_args_list]
+        assert attempted == SUPERSEDES
+
+    @pytest.mark.asyncio
+    async def test_the_exception_never_propagates_out_of_the_tool(self):
+        svc = make_service(gone=[S1, S3], delete_errors={S2: RuntimeError('boom')})
+
+        result = await call_consolidate(svc)
+
+        # Not the flattened {'error', 'error_type'} shape a raise would give.
+        assert 'error' not in result
+        assert result['canonical_id'] == CANONICAL
