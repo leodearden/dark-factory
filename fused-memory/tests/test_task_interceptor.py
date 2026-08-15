@@ -12,12 +12,18 @@ import pytest
 import pytest_asyncio
 from _fm_helpers import _init_git_repo, make_8df8_scenario
 from _fm_helpers import submit_and_resolve as _submit_and_resolve
+from shared.task_statuses import TaskStatus
 
 from fused_memory.backends.sqlite_task_backend import _merge_metadata, _resolve_metadata_mode
 from fused_memory.backends.task_backend_errors import TaskmasterError
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
 from fused_memory.middleware import scope_violation_escalator as sve_mod
-from fused_memory.middleware.task_curator import CandidateTask, CuratorDecision, RewrittenTask
+from fused_memory.middleware.task_curator import (
+    CandidateTask,
+    CuratorDecision,
+    RewrittenTask,
+    is_combine_eligible_status,
+)
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.models.scope import resolve_project_id
 from fused_memory.reconciliation.event_buffer import EventBuffer
@@ -1035,6 +1041,12 @@ async def test_curator_combine_target_in_progress_aborts(
     refuses — the status predicate must be. This is the 20.2% race: the old
     execution guard only checked ``in {'done', 'cancelled'}``, so a target an
     agent was actively working got its description rewritten underneath it.
+
+    ``audit_dir`` is requested for WRITE ISOLATION, not assertion: this
+    refusal now writes an audit record, which without the fixture's
+    DARK_FACTORY_DATA_DIR redirect would land in the real data dir. The
+    record's contents are asserted by
+    test_curator_combine_refusal_records_not_pending_reason.
     """
     taskmaster.get_task = AsyncMock(
         return_value={
@@ -1077,7 +1089,10 @@ async def test_curator_combine_target_blocked_aborts(
     """Target blocked → abort. The fix generalises past in-progress (task 4035).
 
     Proves the widened predicate covers the whole non-pending vocabulary
-    rather than special-casing the one status that produced the incident.
+    rather than special-casing the one status that produced the incident —
+    and that the SECOND status is audited the same way the first is, so the
+    countable population really is "every eligibility refusal" and not just
+    the one status a dedicated refusal test happens to stage.
     """
     taskmaster.get_task = AsyncMock(
         return_value={
@@ -1107,6 +1122,116 @@ async def test_curator_combine_target_blocked_aborts(
     taskmaster.update_task.assert_not_called()
     taskmaster.add_task.assert_called_once()
     assert result == {'id': '2', 'title': 'New Task'}
+    records = _combine_audit_lines(audit_dir)
+    assert len(records) == 1
+    assert records[0]['refused_reason'] == 'target_not_pending'
+    assert records[0]['old']['status'] == 'blocked'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status', list(TaskStatus))
+async def test_curator_combine_execution_matches_shared_predicate(
+    curator_interceptor,
+    taskmaster,
+    audit_dir,
+    status: TaskStatus,
+):
+    """INV-5 anti-divergence pin for the EXECUTION site (task 4035).
+
+    The selection-side pin lives in test_task_curator.py, but it can only
+    catch a re-fork of ``_to_pool_entry`` — the half that actually diverged
+    and caused the incident is THIS one. So drive the real combine path over
+    the full status vocabulary and assert the write happens iff the shared
+    predicate says the status is eligible. A future edit that hard-codes a
+    second status set into ``_execute_combine`` fails here, whatever set it
+    picks.
+
+    Fingerprint matches and no claimant is staged, so the eligibility
+    predicate is the only thing that can decide the outcome.
+    """
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '50',
+            'status': status.value,
+            'title': 'Test Task',
+            'claimant_run_id': None,
+        }
+    )
+    rewritten = RewrittenTask(
+        title='Unified parser work',
+        description='Combined',
+        details='d',
+        files_to_modify=[],
+        priority='medium',
+    )
+    decision = CuratorDecision(
+        action='combine',
+        target_id='50',
+        target_fingerprint='Test Task',
+        rewritten_task=rewritten,
+        justification='same concern',
+    )
+    curator_interceptor._curator = _mock_curator(decision)
+
+    await _submit_and_resolve(curator_interceptor, '/project', title='candidate')
+
+    should_combine = is_combine_eligible_status(status.value)
+    assert taskmaster.update_task.called is should_combine
+    # Exactly one audit record either way — a success record when the combine
+    # lands, a refusal record when it does not. That is what makes the rate
+    # computable: the denominator never silently loses rows.
+    records = _combine_audit_lines(audit_dir)
+    assert len(records) == 1
+    assert records[0].get('refused_reason') == (None if should_combine else 'target_not_pending')
+
+
+@pytest.mark.asyncio
+async def test_curator_combine_not_pending_wins_over_claimed(
+    curator_interceptor,
+    taskmaster,
+    audit_dir,
+):
+    """A target that is BOTH non-pending and claimed records target_not_pending.
+
+    The two refusal causes overlap in the common case — a dispatched task is
+    in-progress AND carries a claimant stamp — so the branch order decides
+    which token a whole population lands under. Pin it: status is checked
+    first, so status wins. Without this, reordering the if/elif would silently
+    reclassify most refusals from target_not_pending to target_claimed and
+    quietly break every rate an operator had computed.
+    """
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '50',
+            'status': 'in-progress',
+            'title': 'Live Task',
+            'claimant_run_id': 'run-abc:sess-1:4242',
+        }
+    )
+    rewritten = RewrittenTask(
+        title='x',
+        description='',
+        details='d',
+        files_to_modify=[],
+        priority='medium',
+    )
+    decision = CuratorDecision(
+        action='combine',
+        target_id='50',
+        target_fingerprint='Live Task',
+        rewritten_task=rewritten,
+        justification='...',
+    )
+    curator_interceptor._curator = _mock_curator(decision)
+
+    result = await _submit_and_resolve(curator_interceptor, '/project', title='Fix x')
+
+    taskmaster.update_task.assert_not_called()
+    assert result == {'id': '2', 'title': 'New Task'}
+    records = _combine_audit_lines(audit_dir)
+    assert len(records) == 1
+    assert records[0]['refused_reason'] == 'target_not_pending'
+    assert records[0]['old']['status'] == 'in-progress'
 
 
 @pytest.mark.asyncio
