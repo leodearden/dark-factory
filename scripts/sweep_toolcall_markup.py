@@ -719,30 +719,69 @@ def repair_document(obj: Any) -> tuple[Any, list[Outcome]]:
     and silently returning it as if it were clean is the failure mode that
     would matter.
     """  # noqa: D205
-    outcomes: list[Outcome] = []
+    # The two outcome classes accumulate DIFFERENTLY across rounds, because
+    # they mean different things:
+    #
+    #   REPAIRED is work APPLIED in that round — cumulative. A round-2 repair
+    #     is a distinct event from a round-1 repair, so these EXTEND.
+    #   REFUSED is a pure function of the CURRENT document state, re-derived
+    #     from scratch on every pass: a string that refuses in round 1 is still
+    #     present and still refuses in round 2. So only the TERMINAL pass's
+    #     refusals describe the true residue, and these are REPLACED.
+    #
+    # Extending both (the original blanket `outcomes.extend`) emitted every
+    # refusal once per round. That is a corrupted report rather than a cosmetic
+    # defect: the residue counts ARE the human-adjudication queue this sweep
+    # exists to produce. It also broke the diff-stability run_sweep's docstring
+    # claims — a document mixing repairs with refusals loops twice on run 1 and
+    # once on run 2, so an operator diffing the runs saw residue DROP with no
+    # repair to explain it, reading as if unrepairable residue had been
+    # silently fixed.
+    #
+    # REPLACEMENT was chosen over deduping by (json_path, action, reason):
+    # dedupe is merely approximate — it would silently MERGE two genuinely
+    # DISTINCT refusals that happen to collide on a path across rounds —
+    # whereas replacement is exact. Replacement also preserves the case that
+    # motivates the loop existing at all: a refusal that only becomes VISIBLE
+    # in a later round (the nested double-leak residue, refusable only once
+    # round 1 has landed it in its hole) is reported, where a naive "keep only
+    # round 1" correction would drop it.
+    #
+    # The partition is exhaustive: the walk emits ONLY ACTION_REPAIRED and
+    # ACTION_REFUSED — ACTION_DID_NOT_CONVERGE is appended after the loop and
+    # never appears in `round_outcomes` — so `!= ACTION_REPAIRED` cleanly
+    # selects refusals.
+    repaired_outcomes: list[Outcome] = []
+    refusals: list[Outcome] = []
     current = obj
 
     for _round in range(_MAX_REPAIR_ROUNDS):
         round_outcomes: list[Outcome] = []
         current, changed = _repair_node(current, '', round_outcomes)
-        outcomes.extend(round_outcomes)
+        repaired_outcomes.extend(
+            o for o in round_outcomes if o.action == ACTION_REPAIRED
+        )
+        refusals = [o for o in round_outcomes if o.action != ACTION_REPAIRED]
         if not changed:
-            return current, outcomes
+            return current, repaired_outcomes + refusals
         last_changed = round_outcomes
     else:
         # The bound was reached with the last pass STILL changing something.
+        # This branch composes from the SAME partition as the in-loop return:
+        # appending to a separately-accumulated list here is how the
+        # duplicate-refusal bug survives a fix applied only to the loop.
         stalled = next(
             (o for o in last_changed if o.action == ACTION_REPAIRED), None
         )
-        outcomes.append(Outcome(
+        refusals = refusals + [Outcome(
             json_path=stalled.json_path if stalled is not None else '',
             field=stalled.field if stalled is not None else '',
             action=ACTION_DID_NOT_CONVERGE,
             recovered_names=(),
             reason=REASON_ROUND_BOUND_EXCEEDED,
-        ))
+        )]
 
-    return current, outcomes
+    return current, repaired_outcomes + refusals
 
 
 # ---------------------------------------------------------------------------
