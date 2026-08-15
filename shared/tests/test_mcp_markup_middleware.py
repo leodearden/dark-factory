@@ -2332,3 +2332,129 @@ class TestB14RequiredParameterAbsorption:
         assert h.facts[0]['fact'] == 'markup_detected'
         assert h.facts[0]['param'] == 'content'
         assert h.facts[0]['recovered_params'] == ['project_id']
+
+
+class TestB14RequiredParameterAbsorptionFromCorpus:
+    """B14 again, on REAL committed payloads rather than a hand-authored one.
+
+    B14 is a POSITIVE claim — the repair LANDS — which is the kind an invented
+    specimen can flatter: a payload shaped to succeed proves only that its
+    author could shape one. So the row above is corroborated here against
+    payloads the harness really produced, the same split TestB5 makes for the
+    one claim that genuinely needs real input. No corpus record is added: the
+    committed corpus already carries this specimen class (44 records recover
+    ``project_id``, 5 recover ``where``), and its README's rule 1 is that the
+    corpus is only ever produced by running the generator.
+
+    The measured coverage fact this closes. All of those real recoveries DO get
+    replayed today — by ``test_mcp_markup_middleware_corpus.py`` — but its
+    ``_synthetic_tool`` emits ``f'{p}: str | None = None'`` for EVERY parameter
+    by deliberate design ("so a record's ``supplied`` subset is a legal call"),
+    so every one of them replays against an all-optional tool and is
+    structurally blind to required-ness. That module is deliberately NOT changed
+    here: its all-optional synthesis is correct for a replay whose
+    ``schema_params`` column is an observed-name union carrying no
+    required/optional information at all, and tightening it would fail records
+    whose genuinely-optional arguments are simply absent. Required-ness is a
+    claim only a hand-built harness can make, because only there does a human
+    declare which parameters are required.
+    """
+
+    #: One of the 19 corpus records whose ``add_memory.content`` absorbed the
+    #: REQUIRED ``project_id``. Pinned by id, and guarded below the way TestB5
+    #: guards its own, so a corpus refresh that reclassifies the row fails
+    #: loudly instead of silently weakening the claim.
+    ADD_MEMORY_ID = 'toolu_0121q4KJKWNyQU4N7VMAJHxJ'
+
+    #: One of the 5 records whose ``add_reuse_item.what`` absorbed the REQUIRED
+    #: ``where``. The existing toy ``add_reuse_item(what, how, where)`` already
+    #: mirrors plan_tools.py:1583's all-required signature, so this row needs no
+    #: new scaffolding — only a call that omits ``where``.
+    ADD_REUSE_ITEM_ID = 'toolu_01TD9YYAfShehSFKtS5aa3yj'
+
+    @staticmethod
+    def _record(tool_use_id: str, recovered: str) -> dict[str, Any]:
+        record = specimen(tool_use_id)
+        assert record['expected_outcome'] == 'repaired', (
+            'this row is only meaningful while the corpus still classifies the '
+            'specimen as repairable'
+        )
+        assert record['expected_recovered'] == [recovered], (
+            f'this row asserts the recovery of {recovered!r}; a corpus refresh '
+            'that repointed it elsewhere must fail here, not silently pass'
+        )
+        return record
+
+    # -- (a) the fused-memory shape ----------------------------------------
+    #
+    # Driven with ONLY ``content``. The record's ``supplied`` list is the
+    # OBSERVED argument union and carries names (project_root, limit, offset)
+    # the strict toy does not declare, so replaying it would fail with an
+    # unexpected-argument error for reasons that have nothing to do with B14.
+
+    async def test_a_real_add_memory_leak_forwards_bound_to_the_required_project_id(self):
+        record = self._record(self.ADD_MEMORY_ID, 'project_id')
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+
+        await h.call('add_memory_strict', {'content': record['value']})
+
+        assert len(h.recorder.calls) == 1
+        assert isinstance(h.recorder.args['project_id'], str)
+        assert h.recorder.args['project_id'], (
+            'the tool ran bound to a required argument that was never on the '
+            'wire — which is only possible if the guard preceded validation'
+        )
+        assert detect(h.recorder.args['content']) is None
+
+    async def test_a_real_add_memory_leak_is_bounced_with_the_required_project_id(self):
+        record = self._record(self.ADD_MEMORY_ID, 'project_id')
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        with pytest.raises(ToolError) as excinfo:
+            await h.call('add_memory_strict', {'content': record['value']})
+
+        payload = _reject_payload(excinfo)
+        assert payload['error_type'] == 'mcp_markup_detected'
+        assert isinstance(payload['repaired_call']['project_id'], str)
+        assert payload['repaired_call']['project_id']
+        assert h.recorder.calls == []
+
+    # -- (b) the plan-tools shape ------------------------------------------
+    #
+    # plan-tools shares RepairPolicy.REJECT_WITH_REPAIR with fused-memory, and
+    # all three of add_reuse_item's parameters are required as it stands. Today
+    # all nine of its call sites pass all three arguments and every one expects
+    # ``unrepairable``, so the tool was present but this shape unexercised.
+
+    FILLER_HOW = 'reused verbatim'
+
+    async def test_a_real_add_reuse_item_leak_forwards_bound_to_the_required_where(self):
+        record = self._record(self.ADD_REUSE_ITEM_ID, 'where')
+        assert record['param'] == 'what'
+        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+
+        await h.call(
+            'add_reuse_item', {'what': record['value'], 'how': self.FILLER_HOW}
+        )
+
+        assert len(h.recorder.calls) == 1
+        assert isinstance(h.recorder.args['where'], str)
+        assert h.recorder.args['where']
+        assert h.recorder.args['how'] == self.FILLER_HOW
+        assert detect(h.recorder.args['what']) is None
+
+    async def test_a_real_add_reuse_item_leak_is_bounced_with_the_required_where(self):
+        record = self._record(self.ADD_REUSE_ITEM_ID, 'where')
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+
+        with pytest.raises(ToolError) as excinfo:
+            await h.call(
+                'add_reuse_item', {'what': record['value'], 'how': self.FILLER_HOW}
+            )
+
+        payload = _reject_payload(excinfo)
+        assert payload['error_type'] == 'mcp_markup_detected'
+        assert payload['tool'] == 'add_reuse_item'
+        assert isinstance(payload['repaired_call']['where'], str)
+        assert payload['repaired_call']['where']
+        assert h.recorder.calls == []
