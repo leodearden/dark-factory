@@ -6727,8 +6727,8 @@ class TaskWorkflow:
         self._enter_phase(WorkflowState.BLOCKED)
         return WorkflowOutcome.BLOCKED
 
-    async def _persist_blocked_row(self, *, why: str) -> None:
-        """Durably write ``status='blocked'`` for a non-escalating terminal exit.
+    async def _persist_blocked_row(self, *, why: str, status: str = 'blocked') -> None:
+        """Durably write the park *status* for a non-escalating terminal exit.
 
         ``_handle_ready_to_merge_report``'s two success-shaped exits (merge
         enqueued / duplicate skipped) deliberately do NOT route through
@@ -6738,6 +6738,14 @@ class TaskWorkflow:
         merely waiting on its own queued merge.  They still owe the durable row
         write that ``_mark_blocked`` would otherwise have done — see the
         REVERT_TO_PENDING note at the enqueue exit.
+
+        Task 3537 (spec §8-E2 / INV-6) reuses this as ``_mark_blocked``'s
+        MERGE-AWARE park-write target: the ``merge_phase=True`` BLOCKED returns
+        exit the slot and therefore owe the row write, but must not re-enter the
+        plain entry path (whose ``_spawn_dry_run_unblock`` / ``last_blocked_at``
+        side effects belong to the non-merge shape).  *status* defaults to
+        ``'blocked'`` for the original callers and carries ``block_status``
+        through for the new ones (e.g. ``'infra-hold'``).
 
         Fail-safe in both directions, because the merge is ALREADY enqueued by
         the time this runs and must never be undone by a bookkeeping failure:
@@ -6751,19 +6759,19 @@ class TaskWorkflow:
           found_on_main reconciler remains the durable backstop.
         """
         try:
-            await self.scheduler.set_task_status(self.task_id, 'blocked')
+            await self.scheduler.set_task_status(self.task_id, status)
         except TerminalExitRejection as exc:
             logger.info(
-                'Task %s: blocked-row write skipped, row is already terminal '
+                'Task %s: %s-row write skipped, row is already terminal '
                 '(%s) — the merge callback or found_on_main got there first; '
                 'leaving it (%s)',
-                self.task_id, exc.old_status, why,
+                self.task_id, status, exc.old_status, why,
             )
         except Exception as exc:
             logger.warning(
-                'Task %s: blocked-row write failed (%s): %s — continuing; the '
+                'Task %s: %s-row write failed (%s): %s — continuing; the '
                 'found_on_main reconciler is the durable backstop',
-                self.task_id, why, exc,
+                self.task_id, status, why, exc,
             )
 
     def _schedule_architect_merge_done(
@@ -14800,9 +14808,30 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         unaffected by this choice.
         *skip_escalation* suppresses escalation creation when a level-1
         escalation already exists (e.g. steward re-escalated to human).
-        *merge_phase* suppresses task-status transitions (blocked/pending)
-        when the caller will retry the merge in-place rather than requeueing
-        through the scheduler.
+        *merge_phase* suppresses the ENTRY task-status transition
+        (blocked/pending) so the caller can retry the merge in-place rather
+        than requeueing through the scheduler.  It does NOT suppress the park
+        write on the BLOCKED returns that EXIT THE SLOT — those go through the
+        merge-aware :meth:`_persist_blocked_row` target below (task 3537, spec
+        §8-E2, INV-6 status-matches-liveness).
+
+        MERGE_PHASE_RATIONALE (Chesterton's-fence investigation, task 3537):
+        ``git log -S"merge_phase: bool = False"`` yields exactly ONE commit —
+        22918d5c24 "fix(orchestrator): break merge-phase escalation loop"
+        (2026-04-09).  The parameter exists for :meth:`_run_merge_phase`'s
+        in-place merge-retry loop: before it, the merge phase fire-and-forgot
+        to the scheduler via REQUEUED and raced the async merge queue.  The
+        loop's REQUEUED arm genuinely depends on the suppression — it keeps
+        retrying IN-SLOT with a LIVE claimant, so the row must stay
+        ``in-progress`` with the durable obligation carried by
+        ``metadata.merge_retry_pending`` (see ``_requeue`` below).  That is the
+        whole of the dependency; it is NOT a licence for a slot-exiting BLOCKED
+        return to leave the row ``in-progress`` with no claimant.  Deleting
+        this gate outright (writing at ENTRY) would break the fence in the
+        other direction, and SM-2 would not catch it because
+        ``outcome_allows_status('requeued', BLOCKED)`` is True.  The
+        ``StewardTerminalDecision`` non-DONE return is likewise excluded — see
+        the §5 preserve carve-out comment at that return.
         *escalate_to_human* (Fix C) skips the steward entirely and submits
         an L1 escalation immediately.  Use when the caller has determined
         a confirmed loop / unresolvable failure that the steward cannot
@@ -14975,6 +15004,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     reason, detail or reason, category=category,
                     root_cause=root_cause,
                 )
+                await self._park_merge_phase_row(
+                    merge_phase, block_status,
+                    why=f'escalate_to_human short-circuit: {reason[:80]}',
+                )
                 return _record(WorkflowOutcome.BLOCKED)
 
             # Don't create a duplicate if level-1 already pending — but only a
@@ -15090,6 +15123,14 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                         return _record(WorkflowOutcome.DONE)
                     # 'cancelled'/'deferred' are steward-driven terminal or
                     # preserved decisions — no L1 needed, do not requeue.
+                    #
+                    # DELIBERATELY NO park write here (task 3537, spec §5
+                    # preserve carve-out), unlike the two slot-exiting BLOCKED
+                    # returns above/below.  The steward has ALREADY adjudicated
+                    # this row, and the hazard is silent: shared.task_statuses
+                    # .TERMINAL is only {DONE, CANCELLED}, so a 'deferred' row
+                    # would NOT raise TerminalExitRejection and a blanket write
+                    # would clobber a human-visible adjudication with 'blocked'.
                     logger.info(
                         'Task %s: steward-driven status is %s — preserving, '
                         'not re-queueing', self.task_id, outcome.new_status.value,
@@ -15259,7 +15300,44 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     '(steward consumer dead; L1 already filed)',
                     self.task_id, len(orphan_l0),
                 )
+        await self._park_merge_phase_row(
+            merge_phase, block_status,
+            why=f'BLOCKED fall-through: {reason[:80]}',
+        )
         return _record(WorkflowOutcome.BLOCKED)
+
+    async def _park_merge_phase_row(
+        self, merge_phase: bool, block_status: str, *, why: str,
+    ) -> None:
+        """Write the park status for a ``merge_phase=True`` BLOCKED slot exit.
+
+        No-op when *merge_phase* is False: that call already wrote
+        ``block_status`` at :meth:`_mark_blocked`'s entry gate, and re-writing
+        it here would double-stamp the row (and, on the ``escalate_to_human``
+        short-circuit, could resurrect a row the entry write's
+        ``TerminalExitRejection`` handler deliberately left terminal).
+
+        When *merge_phase* is True the entry gate suppressed the write, but a
+        BLOCKED return EXITS THE SLOT with no live claimant — so INV-6
+        (status-matches-liveness) obliges the write here instead.  Routed
+        through :meth:`_persist_blocked_row` rather than a bare
+        ``set_task_status`` so this inherits its fail-safe contract: a
+        ``TerminalExitRejection`` is the benign already-terminal race (leave it
+        terminal, never reopen) and any other failure is logged and swallowed
+        with the found_on_main reconciler as the durable backstop.  Byte-for-
+        byte the ``_persist_blocked_row`` + ``_enter_phase(BLOCKED)`` pairing
+        already proven at ``_handle_ready_to_merge_report``, which also runs
+        from the merge region.  ``_record`` reads ``self.machine.state`` at call
+        time, so entering BLOCKED here keeps SM-2's ``report.phase ==
+        machine.state`` assertion satisfied.
+
+        See spec §8-E2 and the MERGE_PHASE_RATIONALE paragraph in
+        :meth:`_mark_blocked`'s docstring for why the entry gate stays.
+        """
+        if not merge_phase:
+            return
+        await self._persist_blocked_row(why=why, status=block_status)
+        self._enter_phase(WorkflowState.BLOCKED)
 
     def _durable_ref_suffix(self) -> str:
         """Durable git identifiers to append to an L1 escalation's detail.
