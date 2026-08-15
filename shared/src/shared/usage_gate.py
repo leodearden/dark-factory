@@ -456,10 +456,14 @@ class InvokeSlot:
         caller discipline (PRD §7.4, task W4-ε): ``_settled`` is set in a
         ``finally`` so every variant leaves the slot settled exactly once.
         The PROBE_IN_FLIGHT claim taken by ``before_invoke()`` is released on
-        every path — OK/CapHit/AuthFailed release it as a side effect of
-        their phase transition; NearCap and the no-phase-change variants
-        (ZeroOutputWedge/CliLocalError/Failure) release it explicitly via
-        ``release_probe_slot`` since they don't otherwise touch phase.
+        every path — OK/AuthFailed and an UNSCOPED CapHit release it as a side
+        effect of their phase transition; a SCOPED CapHit (which takes no phase
+        transition at all — see below), NearCap, and the no-phase-change
+        variants (ZeroOutputWedge/CliLocalError/Failure) release it explicitly
+        via ``release_probe_slot`` since they don't otherwise touch phase. The
+        CapHit arm calls ``release_probe_slot`` unconditionally: it is a
+        guarded no-op once the account is already CAPPED, so one call covers
+        both scopes (task 4096).
 
         Dispatches to the gate's existing handlers — this method owns no
         transition logic of its own:
@@ -468,8 +472,11 @@ class InvokeSlot:
           ``near_cap``). Does not accumulate cost — ``OK`` carries none; cost
           stays a caller concern (``confirm()`` / ``on_agent_complete``).
         - CapHit -> ``_handle_cap_detected`` (-> CAPPED), forwarding
-          ``self.scope`` (PRD task β): a scoped cap attributes to only this
-          account's model-scope and leaves the account phase AVAILABLE.
+          ``self.scope`` (PRD task β), then ``release_probe_slot``: a scoped
+          cap attributes to only this account's model-scope and takes no phase
+          transition, so the probe claim is released explicitly there (a no-op
+          on the unscoped path, where the CAPPED transition already released
+          it) and the account is left AVAILABLE.
         - AuthFailed -> ``_handle_auth_failure`` (-> AUTH_FAILED; a no-op if
           already CAPPED — CAPPED takes precedence, per that handler's own
           guard). Scope-blind.
@@ -510,6 +517,21 @@ class InvokeSlot:
                     token,
                     scope=self.scope,
                 )
+                # Unconditional, mirroring the NearCap arm (task 4096). The
+                # general (scope=None) path is unaffected: _handle_cap_detected
+                # has already transitioned the account to CAPPED, and
+                # release_probe_slot is guarded on `phase == PROBE_IN_FLIGHT`,
+                # so this is a no-op there — the exact idempotency pinned by
+                # test_usage_gate_exhaustive.py::TestReleaseProbeSlot::
+                # test_noop_after_handle_cap_detected_already_cleared. The
+                # SCOPED path needs it: _handle_cap_detected's `scope is not
+                # None` branch deliberately bypasses _transition (invariant S5)
+                # and returns before any phase write, so without this the
+                # PROBE_IN_FLIGHT claim taken by before_invoke() is never
+                # released, and `finally: _settled = True` below also suppresses
+                # invoke_slot()'s __aexit__ safety net — the account is skipped
+                # by before_invoke's predicate forever.
+                self._gate.release_probe_slot(token)
             elif isinstance(outcome, AuthFailed):
                 self._gate._handle_auth_failure(f'HTTP {outcome.status}', token)
             elif isinstance(outcome, NearCap):
@@ -1310,6 +1332,10 @@ class UsageGate:
             # account-level cap_hit event site, so the scoped path deliberately
             # bypasses it and fires its own cap_hit event (scope detail added)
             # to preserve observability without transitioning the account.
+            # Consequence (task 4096): because this branch takes NO phase
+            # transition, a caller holding a PROBE_IN_FLIGHT claim owns
+            # releasing it — this handler will not do it for them (see
+            # InvokeSlot.report / InvokeSlot.detect_cap_hit).
             # resets_at is the value the generic classifier already parsed
             # (decision 2); an unknown (None) is stored verbatim — the
             # None-backoff policy is γ's (task 2857).
