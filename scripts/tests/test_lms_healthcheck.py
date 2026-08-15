@@ -960,6 +960,12 @@ OLLAMA_CONSUMER = lms_vram.GpuConsumer(
     pid=905936, process_name='/usr/local/lib/ollama/llama-server', used_mib=10314,
 )
 
+#: whisper-writer, as measured on this host: the ONE compute app PRD D10
+#: requires resident before an arm starts, and the whole of EXPECTED_CONSUMERS.
+WHISPER_CONSUMER = lms_vram.GpuConsumer(
+    pid=7575, process_name='python', used_mib=4050,
+)
+
 
 def _snapshot(
     used_mib=MEASURED_USED_MIB,
@@ -991,9 +997,31 @@ BASELINE_FREE_MIB = 20811
 MEASURED_FOOTPRINT_MIB = MEASURED_USED_MIB - BASELINE_USED_MIB
 
 
-def _baseline(used_mib=BASELINE_USED_MIB, free_mib=BASELINE_FREE_MIB):
-    return lms_vram.GpuReading(
-        total_mib=MEASURED_TOTAL_MIB, used_mib=used_mib, free_mib=free_mib,
+#: A fixed stamp, so the fixture describes one specific past moment rather than
+#: drifting with the clock.  Aware UTC for the same reason `measured_at` is.
+BASELINE_MEASURED_AT = _datetime.datetime(
+    2026, 8, 6, 9, 30, tzinfo=_datetime.UTC,
+)
+
+
+def _baseline(
+    used_mib=BASELINE_USED_MIB, free_mib=BASELINE_FREE_MIB, consumers=None,
+) -> lms_vram.GpuBaseline:
+    """The pre-start card, as one RECORD: the reading and the inventory.
+
+    The default inventory is EMPTY, and that is the measured truth rather than
+    a convenience: 3312 MiB of KDE/X11 graphics contexts hold this card at
+    baseline and NONE of them are CUDA compute applications, so
+    `--query-compute-apps` lists nothing at all.  The default fixture is
+    therefore itself an instance of CONSUMER_INVENTORY_NOTE's point -- a
+    non-zero reading beside an empty inventory.
+    """
+    return lms_vram.GpuBaseline(
+        reading=lms_vram.GpuReading(
+            total_mib=MEASURED_TOTAL_MIB, used_mib=used_mib, free_mib=free_mib,
+        ),
+        consumers=[] if consumers is None else consumers,
+        measured_at=BASELINE_MEASURED_AT,
     )
 
 
@@ -1313,7 +1341,10 @@ def cli_env(monkeypatch, tmp_path):
 
     monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path / 'baselines'))
     for arm_id in lms_manifest.load_arms().arm_ids():
-        lms_vram.record_baseline(arm_id, _baseline(), consumers=[])
+        record = _baseline()
+        lms_vram.record_baseline(
+            arm_id, record.reading, consumers=record.consumers,
+        )
     monkeypatch.setattr(lms_vram, 'probe_gpu_snapshot', lambda *a, **k: _snapshot())
     monkeypatch.setattr(lms_healthcheck, 'probe_arm', probe)
     monkeypatch.setattr(lms_ctl, 'active_arms', lambda: set())
@@ -1520,6 +1551,171 @@ def test_the_table_shows_the_arm_footprint_and_the_budget_it_was_judged_against(
 
     assert str(MEASURED_FOOTPRINT_MIB) in table
     assert 'baseline' in table.lower()
+
+
+# ---------------------------------------------------------------------------
+# Who ELSE held the card (task 3755)
+#
+# `used - baseline` is only the arm's footprint if nothing else moved on the
+# card between the two readings.  Nothing in the v4 artifact recorded whether
+# that held, so a run with ollama resident produced numbers indistinguishable
+# from a clean one.  These tests pin the evidence into the block.
+# ---------------------------------------------------------------------------
+
+
+def test_the_vram_block_lists_the_consumers_seen_at_each_reading():
+    """Both inventories, not just one.
+
+    A single "who is on the card now" list cannot answer the question that
+    matters -- whether the SAME processes were there before -- and the drift
+    between the two readings is the whole pollution signal.
+    """
+    report = _report(
+        baseline=_baseline(consumers=[WHISPER_CONSUMER]),
+        snapshot=_snapshot(consumers=[WHISPER_CONSUMER, ARM_CONSUMER]),
+    )
+
+    assert report.vram.baseline_consumers == [WHISPER_CONSUMER]
+    assert report.vram.probe_consumers == [WHISPER_CONSUMER, ARM_CONSUMER]
+
+
+def test_the_vram_block_labels_the_inventory_as_not_an_accounting():
+    """The list does NOT sum to memory.used, and the artifact has to say so.
+
+    `--query-compute-apps` omits every graphics context, which is exactly why
+    this host's operating budget is ~16.4 GiB and not 19.5.  A reader who added
+    the entries up and found a shortfall would conclude the reading was wrong.
+    """
+    note = _report().vram.consumer_inventory_note
+
+    assert note == lms_vram.CONSUMER_INVENTORY_NOTE
+    assert 'INVENTORY' in note
+    assert 'not an accounting' in note
+    assert 'do not sum to memory.used' in note
+
+
+def test_the_default_fixture_shows_why_the_inventory_is_not_an_accounting():
+    """The clean baseline holds 3312 MiB with ZERO compute apps listed.
+
+    Not an artefact of the fixture: those are KDE/X11 graphics contexts, which
+    `--query-compute-apps` cannot see.  If an empty inventory were ever read as
+    "the card was empty", this is the reading that would prove it wrong.
+    """
+    vram = _report().vram
+
+    assert vram.baseline_consumers == []
+    assert vram.baseline_mib == BASELINE_USED_MIB > 0
+
+
+def test_a_clean_run_is_recorded_as_clean_with_no_reason():
+    """The arm's own container is a NEW consumer at probe time and that is
+    normal: arms are docker containers and nvidia-smi reports host pids, so a
+    containerised vLLM is just another `python`.  Marking that POLLUTED would
+    fail every healthy run."""
+    report = _report(
+        baseline=_baseline(consumers=[WHISPER_CONSUMER]),
+        snapshot=_snapshot(consumers=[WHISPER_CONSUMER, ARM_CONSUMER]),
+    )
+
+    assert report.vram.pollution == lms_vram.PollutionState.CLEAN
+    assert report.vram.pollution_reason == ''
+    assert report.vram.verdict == 'PASS'
+
+
+def test_an_ollama_newcomer_at_probe_time_marks_the_block_polluted():
+    """The exact measured hazard: ollama holding qwen3:14b on keep_alive.
+
+    Its 10314 MiB lands inside the probe reading and is charged straight to the
+    arm by `used - baseline`.  The block has to say so, and has to name the
+    process an operator would have to deal with.
+    """
+    report = _report(
+        baseline=_baseline(consumers=[WHISPER_CONSUMER]),
+        snapshot=_snapshot(consumers=[WHISPER_CONSUMER, ARM_CONSUMER,
+                                      OLLAMA_CONSUMER]),
+    )
+
+    assert report.vram.pollution == lms_vram.PollutionState.POLLUTED
+    reason = report.vram.pollution_reason
+    assert str(OLLAMA_CONSUMER.pid) in reason
+    assert OLLAMA_CONSUMER.process_name in reason
+    assert str(OLLAMA_CONSUMER.used_mib) in reason
+    # The consequence, not just the observation: the headline number in this
+    # very block is void, and a reader who took it at face value would
+    # attribute another process's memory to the arm.
+    assert 'arm_footprint_mib' in reason
+    assert 'not attributable' in reason.lower()
+    # And the evidence is still in the block, not only in the prose.
+    assert OLLAMA_CONSUMER in report.vram.probe_consumers
+    assert OLLAMA_CONSUMER not in report.vram.baseline_consumers
+
+
+def test_a_baseline_consumer_that_shrank_is_polluted_in_the_report_too():
+    """The FLATTERING direction, end to end.
+
+    whisper-writer releasing the card mid-run leaves `used - baseline` smaller
+    than the arm truly took.  That is the direction a fabricated artifact wants,
+    so it must not reach the report as a clean PASS.
+    """
+    shrunk = lms_vram.GpuConsumer(
+        pid=WHISPER_CONSUMER.pid, process_name=WHISPER_CONSUMER.process_name,
+        used_mib=100,
+    )
+    report = _report(
+        baseline=_baseline(consumers=[WHISPER_CONSUMER]),
+        snapshot=_snapshot(consumers=[shrunk, ARM_CONSUMER]),
+    )
+
+    assert report.vram.pollution == lms_vram.PollutionState.POLLUTED
+    assert 'SHRANK' in report.vram.pollution_reason
+
+
+def test_this_producer_never_emits_the_unmeasured_sentinel():
+    """The defaults exist ONLY so a pre-v5 artifact still parses.
+
+    A report this code writes always looked, so it must never carry the value
+    that means "nobody looked" -- otherwise UNMEASURED becomes indistinguishable
+    from a real measurement and the sentinel is worthless.
+    """
+    clean = _report(baseline=_baseline(consumers=[WHISPER_CONSUMER]),
+                    snapshot=_snapshot(consumers=[WHISPER_CONSUMER,
+                                                  ARM_CONSUMER]))
+    polluted = _report(baseline=_baseline(consumers=[WHISPER_CONSUMER]),
+                       snapshot=_snapshot(consumers=[WHISPER_CONSUMER,
+                                                     OLLAMA_CONSUMER]))
+
+    for report in (clean, polluted):
+        assert report.vram.pollution != lms_vram.PollutionState.UNMEASURED
+        assert report.vram.consumer_inventory_note != ''
+
+    # The sentinel does exist, though -- that is what lets a v4 artifact parse.
+    assert lms_vram.PollutionState.UNMEASURED == 'UNMEASURED'
+
+
+def test_the_report_schema_version_records_the_added_evidence():
+    """v5.  A v4 file read by a v5-aware consumer would show a `pollution` it
+    never measured, which is precisely the misreading this constant exists to
+    prevent."""
+    assert lms_healthcheck.REPORT_SCHEMA_VERSION == 5
+    assert _report().schema_version == 5
+
+
+def test_a_polluted_recorded_baseline_produces_no_report_at_all():
+    """Same stance as a dead GPU probe and a missing baseline.
+
+    A baseline taken while ollama held 10314 MiB has that memory built into the
+    number every footprint is measured against.  Swallowing it would emit a
+    report whose arithmetic is void but whose shape is indistinguishable from a
+    good one -- so it propagates instead.
+    """
+    with pytest.raises(lms_vram.PollutedBaselineError,
+                       match=str(OLLAMA_CONSUMER.pid)):
+        lms_healthcheck.run_healthcheck(
+            [_arm()],
+            gpu_probe=lambda: _snapshot(),
+            probe=_passing_probe,
+            baseline=_baseline(consumers=[WHISPER_CONSUMER, OLLAMA_CONSUMER]),
+        )
 
 
 # ---------------------------------------------------------------------------
