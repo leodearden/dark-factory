@@ -859,11 +859,39 @@ def _yaml_dquote(value: Any) -> str:
     return f'"{escaped}"'
 
 
+DIGEST_INSTRUMENT_VERSION: int = 2
+"""Which generation of this instrument produced a given digest.
+
+BUMP POLICY: increment whenever a signal detector or the gold-turn
+filter changes SEMANTICS -- i.e. whenever the same transcript would now
+yield different signal_counts, a different gold section, or a different
+section partition. Pure refactors, renderer cosmetics and new frontmatter
+keys do NOT bump it.
+
+  1 -- the implicit pre-3610 baseline. NEVER emitted: digests rendered
+       before task 3610 landed carry no ``instrument_version`` key at
+       all, and that ABSENCE is the "predates the filter change" signal a
+       census reads. Digests are rendered on demand and cached only
+       in-process (sampling.py, nightly.py), so there is no persisted
+       corpus to migrate and absence is a free, unambiguous discriminator.
+  2 -- the relaxed anchor+corroborator briefing filter
+       (:func:`is_harness_injected_turn`) plus the genuine/designed error
+       split (:func:`iter_genuine_errors`).
+
+This answers ``plans/confusion-census-2026-07-31.md:151`` (Sec 6): the
+next census must be able to tell a pre-fix trace from a live regression.
+"""
+
 FRONTMATTER_KEYS: tuple[str, ...] = (
     'session', 'cwd', 'encoded_dir', 'agent_class', 'date', 'size_bytes', 'score',
+    'instrument_version',
 )
 """Top-level frontmatter keys in the exact PRD Sec 7.2 order (everything
-before ``signal_counts``, which is rendered as its own nested block)."""
+before ``signal_counts``, which is rendered as its own nested block).
+
+``instrument_version`` is APPENDED last (task 3610) rather than inserted,
+so the pre-existing prefix stays byte-identical and downstream
+frontmatter diffs remain stable."""
 
 SIGNAL_COUNT_KEYS: tuple[str, ...] = (
     'tool_error', 'self_correct', 'not_found', 'df_guard', 'interrupt',
@@ -889,7 +917,7 @@ def render_frontmatter(meta: dict[str, Any]) -> str:
     lines = ['---']
     for key in FRONTMATTER_KEYS:
         value = meta[key]
-        if key in ('size_bytes', 'score'):
+        if key in ('size_bytes', 'score', 'instrument_version'):
             lines.append(f'{key}: {value}')
         else:
             lines.append(f'{key}: {_yaml_dquote(value)}')
@@ -1095,7 +1123,10 @@ unreadable noise."""
 FRONTMATTER_RESERVE_BYTES = 512
 """Bytes reserved for the frontmatter block plus a '## ' section heading
 when deriving the per-item cap from *max_bytes* (see
-:func:`_item_byte_cap`). Measured frontmatter is ~276-310 bytes;
+:func:`_item_byte_cap`). Measured frontmatter is ~318 bytes typical and
+~397 with a long session/cwd/encoded_dir and 2-digit counts (task 3610
+added ``instrument_version`` and ``designed_outcome``, ~30 bytes, to a
+previously-measured ~276-310);
 reserving 512 leaves headroom for a heading line too, so "frontmatter +
 heading + one capped item" always fits under any realistic max_bytes --
 this is what makes the R2 empty-body pathology structurally unreachable
@@ -1277,6 +1308,7 @@ def render_digest(
         'agent_class': agent_class,
         'date': _derive_date(records),
         'score': score_signals(counts, len(iter_user_turns(records))),
+        'instrument_version': DIGEST_INSTRUMENT_VERSION,
         'signal_counts': counts,
     }
 
