@@ -6,6 +6,18 @@ itself — the capture-time redaction gate (:func:`startup_completion_probe._gat
 / ``_scrub_value``) and the lifecycle of the OAuth-bearing ``TaskConfigDir`` that
 ``run_live_probe`` writes a live access token into.
 
+MUTATION-CHECKED, because this module has a specific way of going vacuous: the
+probe's own degradation handler returns a ``redaction_failed`` row that is clean
+BY CONSTRUCTION, so any test asserting only "``_gate`` did not raise" + "the
+result carries no credential material" passes whether the scrub worked or did
+nothing at all.  The scrub tests therefore also assert they took the SUCCESSFUL
+path (:func:`_assert_scrubbed_not_degraded`) and pin ``_scrub_value``'s output
+directly.  To re-verify after editing them, monkeypatch ``_scrub_value`` back to
+raw string-leaf substitution (no key recursion, no ``_encodes_clean``) and re-run:
+every test in ``TestScrubValueScrubsDictKeys``, ``TestScrubbedKeysDoNotCollide``
+and ``TestEncodedDomainParity`` must fail.  Before this was enforced, only 3 of
+them did.
+
 Every test here is fast and OFFLINE: the ``run_live_probe`` tests inject their
 failure before ``subprocess.Popen``, monkeypatch ``_cli_version``/``_oauth_token``
 and pin ``TaskConfigDir`` at ``tmp_path``, so nothing spawns a CLI, nothing spends
@@ -68,6 +80,39 @@ def _encoded_is_clean(value: Any) -> bool:
     )
 
 
+def _assert_scrubbed_not_degraded(result: dict[str, Any], *, payload_key: str) -> None:
+    """Assert ``_gate`` returned the SCRUBBED observation, not the degraded row.
+
+    Load-bearing against VACUOUS PASSES, and the reason every ``_gate``-based
+    scrub test calls it.  ``_gate`` has two ways to return something clean: scrub
+    the observation (what those tests are about), or catch the post-scrub
+    ``AssertionError`` and substitute a ``redaction_failed`` row that is clean BY
+    CONSTRUCTION.  A test asserting only "did not raise" + "carries no credential
+    material" is satisfied by BOTH — so ``_gate``'s degradation handler masks
+    ``_scrub_value``'s correctness, and a regression removing key scrubbing or
+    :func:`_encodes_clean` entirely would ship green.  (Measured, not theorised:
+    against the pre-fix ``_scrub_value``, 48 of this module's 51 tests still
+    passed, including every encoded-domain one.)
+
+    So each such test pins the SUCCESSFUL path explicitly: no ``redaction_failed``
+    flag, and the payload field that carried the hit still present — the degraded
+    row drops every non-identity field, so that field's survival is what "the
+    scrub actually worked" looks like.
+    """
+    assert 'redaction_failed' not in result, (
+        f'_gate DEGRADED rather than scrubbing: {json.dumps(result)[:200]}. '
+        f'_scrub_value left the observation dirty; without this assertion the '
+        f'test would pass vacuously against a scrub that does nothing.'
+    )
+    assert payload_key in result, (
+        f'{payload_key!r} must survive a SUCCESSFUL scrub — the degraded row '
+        f'drops it, so its absence means the degradation path ran'
+    )
+    assert result['sample_kind'] == 'scheduled', (
+        'a scrubbed observation keeps its own identity fields verbatim'
+    )
+
+
 class TestScrubValueScrubsDictKeys:
     """``_scrub_value`` must scrub string dict KEYS, not just string leaves.
 
@@ -109,6 +154,12 @@ class TestScrubValueScrubsDictKeys:
         scf.assert_no_credential_material(
             json.dumps(result), source='synthetic:key-side-hit'
         )
+        # ...but returning is not the WHOLE contract: it must return the scrubbed
+        # observation, not the degraded stand-in that no-key-scrubbing produces.
+        _assert_scrubbed_not_degraded(result, payload_key='transcript_records')
+        assert list(result['transcript_records'][0]) == ['<redacted>'], (
+            'the credential-shaped key must be rewritten in the gated output'
+        )
 
     def test_non_string_keys_round_trip_untouched(self):
         result = probe._scrub_value({1: 'x'}, probe._GENERIC_CREDENTIAL_PATTERNS)
@@ -125,25 +176,38 @@ class TestScrubbedKeysDoNotCollide:
     what it was asked to redact.
     """
 
+    # Each test asserts the EXACT scrubbed key set, not merely `len(result) == 2`.
+    # A count-only assertion is satisfied by a `_scrub_value` that never touches
+    # keys at all — no rewriting means no collision means nothing dropped — so it
+    # would pass against the very defect the collision handling exists to survive.
+
     def test_two_credential_shaped_keys_both_survive(self):
         value = {_LONG_RUN: 1, 'B' * 70: 2}
         result = probe._scrub_value(value, probe._GENERIC_CREDENTIAL_PATTERNS)
-        assert len(result) == 2, f'a scrubbed key collision dropped an entry: {result!r}'
+        assert list(result) == ['<redacted>', '<redacted>#2'], (
+            f'both keys must be REWRITTEN and disambiguated, not dropped or left '
+            f'unscrubbed: {result!r}'
+        )
         assert list(result.values()) == [1, 2], 'values must survive in insertion order'
-        assert len(set(result)) == 2, 'the two scrubbed keys must stay distinct'
 
     def test_scrubbed_key_colliding_with_a_literal_key_survives(self):
         # '<redacted>' can already be present as a literal key — a previous scrub
         # pass, or a value the CLI itself emitted.
         value = {'<redacted>': 0, _LONG_RUN: 1}
         result = probe._scrub_value(value, probe._GENERIC_CREDENTIAL_PATTERNS)
-        assert len(result) == 2, f'a scrubbed key collided with a literal key: {result!r}'
-        assert sorted(result.values()) == [0, 1]
+        assert list(result) == ['<redacted>', '<redacted>#2'], (
+            f'the scrubbed key must be disambiguated against the literal one, and '
+            f'neither dropped: {result!r}'
+        )
+        assert list(result.values()) == [0, 1]
 
     def test_collision_disambiguation_is_deterministic(self):
         value = {_LONG_RUN: 1, 'B' * 70: 2, 'C' * 70: 3}
         first = probe._scrub_value(value, probe._GENERIC_CREDENTIAL_PATTERNS)
         second = probe._scrub_value(dict(value), probe._GENERIC_CREDENTIAL_PATTERNS)
+        # Pin the suffixes themselves: `first == second` alone is trivially true
+        # for a scrub that leaves all three keys untouched.
+        assert list(first) == ['<redacted>', '<redacted>#2', '<redacted>#3']
         # A re-run of the probe over equal input must not produce a differently
         # keyed row, or two captures of the same shape would not compare equal.
         assert first == second
@@ -190,6 +254,20 @@ class TestEncodedDomainParity:
         assert raw_hit is None, 'the raw leaf must be BELOW the run threshold'
         assert encoded_hit is not None, 'the encoded leaf must be AT the run threshold'
 
+    # Each case is pinned TWICE: once directly on `_scrub_value` (the unit that
+    # this class is actually about, where a no-op scrub cannot hide) and once
+    # through `_gate` with `_assert_scrubbed_not_degraded` (the integration, where
+    # the degradation handler must not be what makes the assertion pass).
+
+    def test_scrub_value_cleans_an_encoding_extended_leaf(self):
+        scrubbed = probe._scrub_value(
+            {'stderr_tail': _ENCODING_EXTENDED_LEAF}, probe._GENERIC_CREDENTIAL_PATTERNS
+        )
+        assert _encoded_is_clean(scrubbed), (
+            f'the leaf is clean RAW but not ENCODED, so raw-only substitution '
+            f'leaves it dirty: {json.dumps(scrubbed)[:120]}'
+        )
+
     def test_gate_does_not_raise_on_an_encoding_extended_stderr_tail(self):
         observation = _minimal_observation(
             run_exit={'stderr_tail': _ENCODING_EXTENDED_LEAF}
@@ -198,6 +276,17 @@ class TestEncodedDomainParity:
         scf.assert_no_credential_material(
             json.dumps(result), source='synthetic:encoded-stderr-tail'
         )
+        _assert_scrubbed_not_degraded(result, payload_key='run_exit')
+
+    def test_scrub_value_cleans_an_encoding_extended_key(self):
+        scrubbed = probe._scrub_value(
+            {_ENCODING_EXTENDED_LEAF: 1}, probe._GENERIC_CREDENTIAL_PATTERNS
+        )
+        assert _encoded_is_clean(scrubbed), (
+            f'an encoding-extended KEY needs both fixes at once — key recursion '
+            f'AND the encoded-form check: {json.dumps(scrubbed)[:120]}'
+        )
+        assert list(scrubbed.values()) == [1], 'scrubbing a key must not disturb its value'
 
     def test_gate_does_not_raise_on_an_encoding_extended_key(self):
         observation = _minimal_observation(
@@ -206,6 +295,16 @@ class TestEncodedDomainParity:
         result = probe._gate(observation)
         scf.assert_no_credential_material(
             json.dumps(result), source='synthetic:encoded-key'
+        )
+        _assert_scrubbed_not_degraded(result, payload_key='transcript_records')
+
+    def test_scrub_value_cleans_a_non_string_scalar_whose_encoding_trips(self):
+        scrubbed = probe._scrub_value(
+            {'size': int('9' * 70)}, probe._GENERIC_CREDENTIAL_PATTERNS
+        )
+        assert _encoded_is_clean(scrubbed), (
+            f'no substitution branch sees a non-str scalar, so only the encoded '
+            f'check can catch it: {json.dumps(scrubbed)[:120]}'
         )
 
     def test_gate_does_not_raise_on_a_non_string_scalar_whose_encoding_trips(self):
@@ -216,6 +315,7 @@ class TestEncodedDomainParity:
         scf.assert_no_credential_material(
             json.dumps(result), source='synthetic:encoded-scalar'
         )
+        _assert_scrubbed_not_degraded(result, payload_key='config_dir_tree')
 
 
 #: The keys a poisoned row is allowed to carry.  Everything else of the input
