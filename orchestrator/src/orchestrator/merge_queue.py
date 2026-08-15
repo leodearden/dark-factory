@@ -9806,6 +9806,124 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         """
         self._runner_unavailable.pop(host, None)
 
+    def _host_states_block(self, now: float) -> list[dict]:
+        """Per-host slot state + quarantine classification for :meth:`snapshot`.
+
+        One dict per host the allocator manages, in allocator order (local
+        first), then one per **orphan** RU-tracked host (see below), each with
+        a **uniform schema** — every key always present, ``None`` where not
+        applicable::
+
+            {name, is_local, slot_state, quarantined, quarantine_class,
+             unavailable_since, unavailable_secs, streak, reason}
+
+        *now* is the snapshot's own clock (``time.time()``), passed in so
+        ``unavailable_secs`` is measured against the same instant as every
+        other relative age in the snapshot (``entries[].age_secs``,
+        ``verify_in_progress.age_secs``) rather than against a second,
+        slightly-later read of the wall clock.
+
+        The allocator owns slot state and quarantine membership
+        (:meth:`~orchestrator.verify_runner.HostAllocator.host_states`); the
+        RunnerUnavailable streak tracker is worker-owned, so the RU enrichment
+        is applied here rather than pushed down into the allocator.
+
+        Notes
+        -----
+        - ``quarantine_class`` is derived with the SAME predicate
+          :meth:`_reprobe_quarantined_hosts` uses to tell the two quarantine
+          origins apart — ``name in self._runner_unavailable``, i.e. its
+          ``entry = self._runner_unavailable.get(name); if entry is None:
+          continue`` skip under the comment "Skip divergence-quarantined hosts
+          — not tracked as RunnerUnavailable".  Sharing the predicate means
+          this snapshot and the reprobe path can never disagree about whether
+          a quarantined host is RU-recoverable (``'ru'``) or held for verdict
+          divergence (``'divergence'``, cleared only by an operator).
+        - ``unavailable_since`` / ``unavailable_secs`` / ``streak`` / ``reason``
+          are populated whenever the host is RU-tracked, **independent of
+          quarantine**, so a host accumulating failures below the quarantine
+          threshold is visible too.  ``unavailable_since`` is the absolute
+          epoch (for cross-log correlation); ``unavailable_secs`` is the
+          derived *relative* downtime — ``max(0.0, now - first_unavailable_at)``
+          — which is the operationally interesting form ("how long has this
+          host been down") and matches how every other time-valued field in
+          the snapshot is expressed.  Clamped at 0 so a clock step backwards
+          cannot surface a negative duration.
+        - **Orphan RU entries.** ``_runner_unavailable`` is only pruned on
+          recovery (:meth:`_record_runner_recovered`), while the allocator is
+          built once and cached for the worker's lifetime, so a host that
+          leaves the managed set (renamed/removed remote) can keep a live RU
+          streak that no allocator slot corresponds to.  Those names are
+          appended after the managed hosts with ``slot_state=None``
+          (``None`` = "not allocator-managed", keeping the non-null slot
+          vocabulary exactly :data:`~orchestrator.verify_runner._SLOT_WIRE`)
+          and ``is_local=False``, so an orphaned streak is never invisible —
+          that blind spot is the same class of gap this block exists to close.
+          Quarantine membership for them is read via
+          :meth:`~orchestrator.verify_runner.HostAllocator.is_quarantined`,
+          which answers from the shared-by-reference quarantine set and so
+          works for names the allocator does not manage —
+          :meth:`~orchestrator.verify_runner.HostAllocator.host_states` cannot
+          answer it, since an orphan has no slot to report.  Consequence:
+          ``len(hosts)`` equals ``occupancy.hosts_total`` **plus** the number
+          of orphan entries; with no orphans (the steady state) the two agree.
+        - The ``isinstance`` gate is a TYPE check, not a defensive fail-soft:
+          :meth:`_ensure_host_allocator` always constructs a real
+          :class:`~orchestrator.verify_runner.HostAllocator` and nothing else is
+          ever assigned in production, so the ``[]`` branch is unreachable
+          there.  It exists solely because ``_host_allocator`` carries a
+          ``MagicMock`` double at 79 assignment sites across 15 test files;
+          those doubles answer every attribute, so ``hasattr``/duck-typing
+          would let them crash or inject garbage into this read-only path.
+        - ``[]`` therefore also means "allocator not built yet (no verify
+          dispatched)".  Deliberately NOT a fabricated ``local`` entry — an
+          absent allocator is a distinct fact from an idle one.
+        """
+        if not isinstance(self._host_allocator, HostAllocator):
+            return []
+
+        def _entry(name: str, *, is_local: bool, slot_state: str | None,
+                   quarantined: bool) -> dict:
+            ru = self._runner_unavailable.get(name)
+            return {
+                'name': name,
+                'is_local': is_local,
+                'slot_state': slot_state,
+                'quarantined': quarantined,
+                'quarantine_class': (
+                    ('ru' if ru is not None else 'divergence') if quarantined else None
+                ),
+                'unavailable_since': ru.first_unavailable_at if ru is not None else None,
+                'unavailable_secs': (
+                    max(0.0, now - ru.first_unavailable_at) if ru is not None else None
+                ),
+                'streak': ru.streak if ru is not None else None,
+                'reason': ru.reason if ru is not None else None,
+            }
+
+        out: list[dict] = [
+            _entry(
+                st['name'],
+                is_local=st['is_local'],
+                slot_state=st['slot_state'],
+                quarantined=bool(st['quarantined']),
+            )
+            for st in self._host_allocator.host_states()
+        ]
+        # Orphan RU entries: RU-tracked hosts with no allocator slot. Appended
+        # after the managed hosts so the allocator's own ordering (local first,
+        # then remotes in declaration order) is untouched; sorted for a stable
+        # snapshot across calls.
+        _managed = {h['name'] for h in out}
+        for _orphan in sorted(set(self._runner_unavailable) - _managed):
+            out.append(_entry(
+                _orphan,
+                is_local=False,
+                slot_state=None,
+                quarantined=self._host_allocator.is_quarantined(_orphan),
+            ))
+        return out
+
     async def _reprobe_quarantined_hosts(self, now: float) -> None:
         """Probe each RU-quarantined remote host and clear on recovery.
 
@@ -11777,7 +11895,44 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             else None.  Passthrough entries (no verify task) produce None.
             verify_age_secs measures time since dispatch, which includes host-acquisition
             latency — it is NOT pure verify time.
-          occupancy: {hosts_total, hosts_busy, by_host} — per-host in-flight count.
+          occupancy: per-host in-flight breakdown —
+            hosts_total: number of hosts the allocator manages (1 when no
+              allocator has been built yet).
+            hosts_busy: count of DISTINCT hosts holding at least one leased
+              in-flight entry.  This is NOT the number of verifies in flight —
+              two entries sharing a host count once.  Consumers wanting the
+              in-flight count must read inflight_total (task 3275).
+            by_host: {host: task_id}, retained at its historical shape for
+              backward compatibility.  LOSSY: when two entries share a host it
+              keeps only the last (and the finalize-head prepend drops the
+              head's task_id in that case).  Preserved verbatim for existing
+              consumers and task 3044's in-flight rework; inflight_by_host is
+              the authoritative view.
+            inflight_by_host: {host: [task_id, ...]} — lossless, every leased
+              occupant present.  Ordered finalize head first, then _inflight
+              order, mirroring `entries`.
+            inflight_total: total leased in-flight entries across all hosts.
+          hosts: list of per-host state dicts (task 3275), one per host the
+            allocator manages, in allocator order (local first), each
+            {name, is_local, slot_state, quarantined, quarantine_class,
+            unavailable_since, unavailable_secs, streak, reason} — uniform
+            schema, None where N/A.  unavailable_since is an absolute epoch
+            (log correlation); unavailable_secs is the derived downtime
+            relative to this snapshot's `now`, matching every other age field
+            here.  [] when no allocator has been built yet (no verify
+            dispatched).  Any RU-tracked host with no allocator slot (an
+            orphan — e.g. a remote removed from the pool while its streak was
+            live) is appended after the managed hosts with slot_state=None, so
+            len(hosts) == occupancy.hosts_total + <orphan count> (equal in the
+            steady state).  This is what makes an under-full `verifying N/M
+            hosts` line diagnosable; the four causes and their discriminators:
+              - RU-quarantined         : quarantine_class == 'ru' (auto-recovers
+                                         via _reprobe_quarantined_hosts)
+              - divergence-quarantined : quarantine_class == 'divergence'
+                                         (operator-cleared only)
+              - leaked slot            : slot_state busy|parked with no matching
+                                         occupancy.inflight_by_host occupant
+              - free, never asked for  : slot_state == 'free', quarantined False
           is_wip_halted: bool.
           halt_owner_esc_id: str or None.
           owned_merge_worktrees: sorted resolved absolute path strings for this
@@ -12044,14 +12199,35 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             _fh_name = _fh_entry.lease.name
             _fh_tid = _fh_entry.item.request.task_id
             _by_host = {_fh_name: _fh_tid, **_by_host}
+        # 3275 additive: lossless per-host occupant lists, built in the SAME
+        # order (finalize head first, then _inflight order) as _by_host above.
+        # _by_host is left byte-for-byte unchanged — it is lossy by two paths
+        # (the dict comprehension collapses two entries sharing a host
+        # last-writer-wins, and the prepend splat above drops the head's
+        # task_id when the head shares a host with an in-flight entry) and it
+        # is the field task 3044 is reworking, so it is preserved verbatim
+        # rather than widened.
+        _inflight_by_host: dict[str, list[str]] = {}
+        if _fh_entry is not None and _fh_entry.lease is not None:
+            _inflight_by_host[_fh_entry.lease.name] = [_fh_entry.item.request.task_id]
+        for _infl in self._inflight:
+            if _infl.lease is not None:
+                _inflight_by_host.setdefault(_infl.lease.name, []).append(
+                    _infl.item.request.task_id
+                )
         _hosts_total = (
             len(self._host_allocator.host_names)
             if self._host_allocator is not None else 1
         )
         occupancy = {
             'hosts_total': _hosts_total,
-            'hosts_busy': len(_by_host),
+            # Identical value to len(_by_host) (same key set by construction),
+            # but sourced from the lossless map so a future edit to _by_host
+            # cannot silently perturb this count.
+            'hosts_busy': len(_inflight_by_host),
             'by_host': _by_host,
+            'inflight_by_host': _inflight_by_host,
+            'inflight_total': sum(len(v) for v in _inflight_by_host.values()),
         }
 
         return {
@@ -12062,6 +12238,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             'is_wip_halted': self.is_wip_halted,
             'halt_owner_esc_id': self.halt_owner_esc_id,
             'occupancy': occupancy,
+            # 3275 additive key: per-host slot state + quarantine class.
+            # Backward-compatible (no collision with the existing key set);
+            # pure synchronous read via HostAllocator.host_states() — no await,
+            # no I/O.  [] when the allocator has not been built yet.
+            'hosts': self._host_states_block(now),
             # δ/1889 additive key: per-suffix conflict relation (backward-compatible).
             # Populated by recompute_suffix_conflict_graph() after each drain.
             # Read here synchronously — no await; the expensive async build is
@@ -12290,6 +12471,24 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         side-check never affects this method's own return value, which still
         means exactly "a depth heartbeat was emitted".
 
+        Degradation segment (task 3275): when any host is quarantined the line
+        gains ``| DEGRADED <n>/<m> hosts quarantined: <name>=<class>``, and the
+        emitted ``merge_heartbeat`` event's ``data`` gains a ``hosts`` key
+        carrying the same facts structurally (repo structured-facts-at-failure
+        invariant — the log line must not be the only carrier).  It is built
+        from ``snapshot()['hosts']`` rather than from ``occupancy`` **on
+        purpose**: the occupancy suffix is gated on a non-empty ``by_host``, so
+        a pool that is quarantined but idle would report no degradation at all
+        — one of the three 2026-07 incidents where a stuck merge queue was
+        diagnosed only by hand-correlating a ``verifying N/M hosts`` line
+        against allocator internals.  ``<class>`` is ``ru`` (auto-recovers via
+        :meth:`_reprobe_quarantined_hosts`) or ``divergence``
+        (operator-cleared only).
+
+        The ``depth == 0`` no-op gate above is UNCHANGED: a fully idle pipeline
+        still logs nothing even when degraded, so an idle journal is not
+        spammed.  A degraded idle pool stays reachable via ``get_merge_queue``.
+
         MQ-invariants iota (task 1994): immediately after, UNCONDITIONALLY
         and for the same reason, runs the clock-injectable
         :meth:`_check_resource_audit` sweep — a leaked speculation permit/
@@ -12336,12 +12535,34 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 f'{_host_parts}'
             )
 
+        # 3275: degradation segment, built from snap['hosts'] and deliberately
+        # INDEPENDENT of the `if occ['by_host']:` gate above — a quarantined
+        # pool with nothing in flight has an empty by_host and would otherwise
+        # report no degradation at all.
+        _deg = [h for h in snap['hosts'] if h['quarantined']]
+        _deg_suffix = ''
+        if _deg:
+            # No `or <fallback>` on quarantine_class: _host_states_block sets it
+            # to exactly 'ru' or 'divergence' whenever quarantined is True (and
+            # _deg filters on that), so a fallback would be unreachable dead code
+            # that quietly papered over an invariant break. If the invariant ever
+            # does break, the anomalous None renders as-is — visible, not cosmetic
+            # (repo no-silent-fail-soft norm).
+            _deg_parts = ' '.join(
+                f'{h["name"]}={h["quarantine_class"]}' for h in _deg
+            )
+            _deg_suffix = (
+                f' | DEGRADED {len(_deg)}/{len(snap["hosts"])} hosts quarantined: '
+                f'{_deg_parts}'
+            )
+
         logger.info(
             'merge queue heartbeat: %d in pipeline, oldest age=%.0fs, '
-            'head=task %s (state=%s, age=%.0fs)%s',
+            'head=task %s (state=%s, age=%.0fs)%s%s',
             snap['depth'], oldest_age,
             head['task_id'], head['state'], head['age_secs'],
             _occ_suffix,
+            _deg_suffix,
         )
 
         if self._event_store is not None:
@@ -12355,6 +12576,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     'head_of_line': head_of_line,
                     'verify_in_progress': snap['verify_in_progress'],
                     'occupancy': occ,
+                    # 3275: same facts as the DEGRADED log segment, structured —
+                    # a consumer must not have to scrape the line.
+                    'hosts': snap['hosts'],
                 },
             )
 
