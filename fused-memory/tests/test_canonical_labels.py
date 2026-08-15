@@ -404,6 +404,52 @@ class TestScanContentPrecision:
             ], content
 
 
+class TestQualifiedRefNeverSpansALineBreak:
+    """The PROJECT-QUALIFIED pattern's colon is padded with '[ \\t]', not '\\s',
+    for the same measured reason as the mention pattern's above: '\\s' matches
+    '\\n', and no real project-qualified reference is written across a line
+    break — while episode bodies routinely carry YAML/'key: value' blocks and
+    hard-wrapped prose, which the '\\s' spelling read as qualified refs.
+
+    Direction of safety: this narrowing REMOVES foreign refs, and for a
+    consumer performing destructive edge surgery a false positive
+    MISATTRIBUTES facts — so narrowing is the safe direction here, unlike the
+    _LOCAL_MENTION_PATTERN whitespace branch, deliberately left as '\\s+'
+    because narrowing THERE removes contests.
+    """
+
+    def test_colon_followed_by_newline_is_not_a_qualified_ref(self):
+        """A 'key:' line lead-in followed by a number on the next line — the
+        shape a YAML block or a hard-wrapped note produces — read as
+        'notes:2500', a foreign project that does not exist."""
+        assert scan_content('Notes:\n2500 items', group_id='reify').refs == ()
+
+    def test_newline_before_the_colon_is_not_a_qualified_ref(self):
+        """BOTH halves are narrowed: the '\\s*' preceding the colon spans a
+        newline exactly as the trailing one does, so fixing only the trailing
+        half would leave the stated invariant half-true."""
+        assert scan_content('Notes\n: 2500', group_id='reify').refs == ()
+
+    def test_blank_line_between_qualifier_and_number_is_not_a_qualified_ref(self):
+        content = 'See the section on graphiti:\n\n2500 rows were affected'
+        assert scan_content(content, group_id='reify').refs == ()
+
+    def test_same_line_spellings_are_unaffected(self):
+        """Regression guard, green before AND after: the padding still tolerates
+        the spaces and tabs humans actually write around a colon. This is what
+        proves the change narrows ONLY across line breaks and is not an
+        undeclared tightening of human spacing."""
+        for content in (
+            'dark_factory:2500',
+            'dark_factory: 2500',
+            'dark_factory :2500',
+            'dark_factory\t:\t2500',
+        ):
+            assert [r.node_name for r in scan_content(content, group_id='reify').refs] == [
+                'dark_factory:2500'
+            ], content
+
+
 class TestScanContentOrderingAndDedup:
     """Positional first-seen order, de-duplicated on (kind, project_id, number)
     — so the result is deterministic and a consumer can rely on it."""

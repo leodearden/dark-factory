@@ -299,6 +299,24 @@ class TestShapeValidProseMatchesRelyOnDownstreamGuards:
         assert scan.refs == []
 
 
+class TestQualifiedRefNeverSpansALineBreak:
+    """Whitespace-tolerant does NOT extend across a line break. The class above
+    accepts the '<word>: <number>' shape on ONE line because that is how humans
+    write a qualified reference; a qualifier and a number separated by a
+    newline is not that shape at all — it is a YAML/'key: value' block or
+    hard-wrapped prose, both routine in episode bodies."""
+
+    def test_colon_followed_by_newline_is_not_a_ref(self):
+        scan = find_cross_project_task_refs('Notes:\n2500 items', group_id='reify')
+        assert scan.refs == []
+
+    def test_the_same_line_spelling_is_unaffected(self):
+        """Guard: the narrowing is across newlines ONLY, not a tightening of the
+        spacing humans write."""
+        scan = find_cross_project_task_refs('Notes: 2500 items', group_id='reify')
+        assert [r.entity_name for r in scan.refs] == ['notes:2500']
+
+
 class TestKnownProjectIdsAllowlist:
     """An optional fourth narrowing: when a registry of known project ids is
     supplied, shape-valid qualifiers naming an unknown project are dropped."""
