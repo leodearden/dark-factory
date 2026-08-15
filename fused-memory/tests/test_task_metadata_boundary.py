@@ -778,3 +778,130 @@ class TestCuratorGateContradictionAtWriteBoundary:
 
         task = await enforce_backend.get_task(task_id, project_root=project_root)
         assert task['metadata'] == self._VALID_DEPLOY
+
+
+class TestSliceCardinalityAtWriteBoundary:
+    """A list-shaped ``milestone`` is censused and rejected at the REAL boundary (task 4142).
+
+    ``shared/tests/test_task_metadata.py`` proves ``parse_metadata`` emits the
+    new ``wrong_cardinality`` finding; neither that nor
+    ``test_capability_manifest.py`` proves the fused-memory write boundary
+    ROUTES it to a census line and a raise. That routing is what the task's
+    "why it matters" claim rests on, and it is entirely generic: the new code
+    is fatal only because ``_NON_FATAL_WRITE_WARNING_CODES`` is
+    ``frozenset({'unknown_key'})`` and ``milestone`` is in ``incoming_keys``.
+    No ``sqlite_task_backend.py`` change was made — these rows are what
+    verifies that, rather than assuming it.
+
+    Before the fix, the blob in ``_LIST_MILESTONE`` produced ZERO warnings, so
+    it was invisible to BOTH the census and the enforce gate and landed in the
+    row; the resulting non-dict ``metadata.milestone`` then made
+    ``scheduler._milestone_time_gated`` fail-safe-withhold the task from
+    dispatch indefinitely, with no escalation path.
+
+    Per this module's docstring these rows are an INTEGRATION gate, not a
+    synthetic-input unit test: they are expected to be GREEN the moment the
+    shared change lands, because the generic fatal-code policy already routes
+    any new code correctly. That is the desired outcome — a RED here would
+    mean a genuine integration gap.
+    """
+
+    # The verbatim repro blob: a list where a single mapping is declared.
+    _LIST_MILESTONE = {'milestone': [{'mode': 'delayed', 'after_secs': 604800}]}
+
+    # The same slice, correctly shaped.
+    _DICT_MILESTONE = {'milestone': {'mode': 'delayed', 'after_secs': 604800}}
+
+    @pytest.mark.asyncio
+    async def test_list_milestone_censused_with_wrong_cardinality_code(
+        self, make_backend, tmp_path, caplog,
+    ):
+        """(a) exactly one census line, carrying the code and the field.
+
+        The census line is emitted BEFORE the enforce-mode re-raise
+        (``_validate_metadata_on_write`` censuses every warning, then decides
+        whether to raise), so an enforce-mode backend surfaces the finding to
+        an operator as well as rejecting it.
+        """
+        backend = await make_backend(enforce=True)
+        project_root = str(tmp_path / 'enforce')
+
+        with caplog.at_level(
+            logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'
+        ):
+            # Scope the census to exactly this write.
+            caplog.clear()
+            with pytest.raises(TypeError):
+                await backend.add_task(
+                    project_root=project_root, title='t',
+                    metadata=json.dumps(self._LIST_MILESTONE),
+                )
+
+        census = _schema_warning_messages(caplog)
+        assert len(census) == 1, f'Expected exactly one census line; got {census}'
+        assert 'code=wrong_cardinality' in census[0]
+        assert 'milestone' in census[0]
+
+    @pytest.mark.asyncio
+    async def test_list_milestone_add_rejected_and_rolled_back(self, make_backend, tmp_path):
+        """(b1) the defect can no longer LAND: add_task raises, no row behind."""
+        backend = await make_backend(enforce=True)
+        project_root = str(tmp_path / 'enforce')
+
+        with pytest.raises(TypeError):
+            await backend.add_task(
+                project_root=project_root, title='t',
+                metadata=json.dumps(self._LIST_MILESTONE),
+            )
+
+        tasks = (await backend.get_tasks(project_root=project_root))['tasks']
+        assert tasks == []
+
+    @pytest.mark.asyncio
+    async def test_list_milestone_update_rejected_row_unchanged(self, make_backend, tmp_path):
+        """(b2) a later writer cannot corrupt a good row's milestone either.
+
+        The realistic shape of the defect: a well-formed row already exists
+        and a subsequent writer supplies the list. ``milestone`` is in
+        ``incoming_keys``, so the generic re-raise gate fires and ``_txn``
+        rolls back — a follow-up ``get_task`` shows the dict value intact.
+        """
+        backend = await make_backend(enforce=True)
+        project_root = str(tmp_path / 'enforce')
+
+        dto = await backend.add_task(
+            project_root=project_root, title='t',
+            metadata=json.dumps(self._DICT_MILESTONE),
+        )
+
+        with pytest.raises(TypeError):
+            await backend.update_task(
+                dto['id'], project_root=project_root,
+                metadata=json.dumps(self._LIST_MILESTONE),
+                metadata_mode='merge',
+            )
+
+        task = await backend.get_task(dto['id'], project_root=project_root)
+        assert task['metadata'] == self._DICT_MILESTONE
+
+    @pytest.mark.asyncio
+    async def test_well_shaped_dict_milestone_writes_clean(
+        self, make_backend, tmp_path, caplog,
+    ):
+        """(c) the happy path is untouched: no census, no raise, I1 holds."""
+        backend = await make_backend(enforce=True)
+        project_root = str(tmp_path / 'enforce')
+
+        with caplog.at_level(
+            logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'
+        ):
+            caplog.clear()
+            dto = await backend.add_task(
+                project_root=project_root, title='t',
+                metadata=json.dumps(self._DICT_MILESTONE),
+            )
+
+        assert _schema_warning_messages(caplog) == []
+
+        task = await backend.get_task(dto['id'], project_root=project_root)
+        assert task['metadata'] == self._DICT_MILESTONE
