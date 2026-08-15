@@ -124,7 +124,7 @@ Both catch `None`. Neither logs anything.
 `shared/src/shared/toolcall_markup.py` (task 3688) is now the **one** place
 the envelope literals are enumerated.
 `fused_memory.server.markup_tripwire.MCP_MARKUP_PATTERNS`
-(`markup_tripwire.py:63`) and
+(`markup_tripwire.py:68`) and
 `fused_memory.utils.toolcall_xml_leak.PREFILTER_NEEDLES`
 (`toolcall_xml_leak.py:124`) are both now **re-exports** of names defined
 there — two named predicates over one literal set, not two literal sets —
@@ -144,7 +144,7 @@ the invoke closer) while `PREFILTER_NEEDLES` carries the four parameter
 closers, and `ENVELOPE_LITERALS` is their union.
 
 So the write-time **diagnostic gap is still open today**.
-`markup_tripwire.find_markup_pattern` (`markup_tripwire.py:189`) still
+`markup_tripwire.find_markup_pattern` (`markup_tripwire.py:170`) still
 scans `MCP_MARKUP_PATTERNS` only, so a mis-closed `description` at the
 fused-memory write boundary still cannot report its own tag and still
 blames whatever happens to follow it. What closes that gap is `detect()`
