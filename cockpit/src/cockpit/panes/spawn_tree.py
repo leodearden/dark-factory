@@ -50,9 +50,15 @@ class SpawnTreeNode:
     slug: this node's session_slug (SpawnTreeNode.record.session_slug,
         pulled out as its own field for cheap identity comparisons/lookups).
     record: the backing SessionRecord.
-    outstanding: whether this node counts as an "outstanding child" (a
-        non-terminal child -- see is_outstanding). Always False for a root
-        -- a root is a human-launched session, not anyone's child.
+    outstanding: whether this node counts as an "outstanding child" -- it
+        HAS a parent_session_id AND its record is non-terminal (see
+        is_outstanding). Keyed on parentage rather than root-ness: a
+        NATURAL root (parent_session_id is None) is a human-launched
+        session, not anyone's child, and is never outstanding -- but a
+        STRUCTURALLY-PROMOTED root (an orphan whose named parent is absent
+        from the record set, see build_spawn_forest; or a cycle member
+        promoted the same way) IS someone's child whose parent record is
+        gone, and stays highlighted when non-terminal.
     children: this node's direct children, already ordered (see
         build_spawn_forest).
     """
@@ -96,7 +102,7 @@ def build_spawn_forest(records: list[SessionRecord]) -> list[SpawnTreeNode]:
 
     visited: set[str] = set()
 
-    def _build_node(record: SessionRecord, *, is_root: bool) -> SpawnTreeNode:
+    def _build_node(record: SessionRecord) -> SpawnTreeNode:
         visited.add(record.session_slug)
         candidates = children_by_parent.get(record.session_slug, [])
         child_records = order_sessions(
@@ -105,11 +111,11 @@ def build_spawn_forest(records: list[SessionRecord]) -> list[SpawnTreeNode]:
         return SpawnTreeNode(
             slug=record.session_slug,
             record=record,
-            outstanding=False if is_root else is_outstanding(record),
-            children=tuple(_build_node(child, is_root=False) for child in child_records),
+            outstanding=record.parent_session_id is not None and is_outstanding(record),
+            children=tuple(_build_node(child) for child in child_records),
         )
 
-    forest = [_build_node(record, is_root=True) for record in order_sessions(roots)]
+    forest = [_build_node(record) for record in order_sessions(roots)]
 
     # Snapshot BEFORE the loop, but re-check `not in visited` INSIDE it too:
     # building one pure-cycle member (e.g. cycle-a) also visits the rest of
@@ -118,7 +124,7 @@ def build_spawn_forest(records: list[SessionRecord]) -> list[SpawnTreeNode]:
     # own extra root.
     orphaned_cycle_members = [record for record in records if record.session_slug not in visited]
     forest.extend(
-        _build_node(record, is_root=True)
+        _build_node(record)
         for record in order_sessions(orphaned_cycle_members)
         if record.session_slug not in visited
     )
