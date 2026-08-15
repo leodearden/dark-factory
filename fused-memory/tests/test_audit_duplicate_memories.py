@@ -5304,6 +5304,75 @@ class TestFindLivenessSnapshotRecurrencesDisclosure:
         assert set(disclosure.values()) == {0}
 
 
+class TestLivenessPartialKeyFalseGroup:
+    """The actual harm, pinned at the level `--apply` acts on.
+
+    `TestLivenessSnapshotUnfieldedVerdictIsPerField` is a unit-level guard on
+    the classifier; this class exercises `find_liveness_snapshot_recurrences`
+    instead, because the concrete damage this task exists to prevent is a
+    false RECURRENCE GROUP over two records asserting different facts -- and
+    a group is exactly what `--apply` would delete.
+    """
+
+    def test_two_records_with_different_unreadable_statuses_form_no_group(self):
+        """On the base commit these two records DO group -- an in-progress
+        snapshot merged with a done one, sharing the survivors-only key
+        `claimant_run_id=null|heartbeat_at=null`. The loss is now visible on
+        a counter instead of forming a silent, irreversible-under-`--apply`
+        false cluster.
+        """
+        corpus = [
+            _dated('ip', _UNREADABLE_STATUS_IN_PROGRESS, _TS_94_JUL24,
+                   category=_OS, metadata={'task_id': '94'}),
+            _dated('done', _UNREADABLE_STATUS_DONE, _TS_REVERIFY,
+                   category=_OS, metadata={'task_id': '94'}),
+        ]
+
+        groups, disclosure = find_liveness_snapshot_recurrences(corpus)
+
+        assert groups == [], (
+            'an in-progress snapshot and a done one must never group'
+        )
+        assert disclosure == dict.fromkeys(_LIVENESS_DISCLOSURE_KEYS, 0) | {
+            'liveness_snapshot_unfielded': 2,
+        }
+
+    def test_a_readable_corpus_keeps_every_key_and_counts_no_loss(self):
+        """The recall guard that bounds the fix: the real motivating corpus."""
+        for record_id, content in [
+            ('6b245659', _LIVENESS_SNAPSHOT_94_JUL24),
+            ('08aa0017', _LIVENESS_SNAPSHOT_96_JUL24),
+            ('1eef7df7', _LIVENESS_REVERIFY_94_96_JUL26),
+        ]:
+            assert extract_liveness_snapshot_fact(
+                _memory(record_id, content, category=_OS),
+            ) == _CORE_FACT_STRANDED
+
+        groups, disclosure = find_liveness_snapshot_recurrences(_liveness_corpus())
+
+        assert [(g['subject_task_id'], g['member_ids']) for g in groups] == [
+            ('94', ['1eef7df7', '6b245659']),
+            ('96', ['08aa0017', '1eef7df7']),
+        ]
+        assert disclosure == dict.fromkeys(_LIVENESS_DISCLOSURE_KEYS, 0)
+
+    def test_a_quoted_value_containing_a_field_name_is_not_a_loss(self):
+        """The precision guard a naive mention-count fix would fail.
+
+        The inner `claimant_run_id=` sits inside the span the strict
+        alternative already consumed as `status`'s quoted value, so it is a
+        readable value -- not a second, unread mention of a sibling field.
+        """
+        content = (
+            'Point-in-time liveness check performed 2026-07-24 on task 94: '
+            'status="foo claimant_run_id=bar"'
+        )
+
+        key = extract_liveness_snapshot_fact(_memory('x', content, category=_OS))
+
+        assert key == 'status=foo claimant_run_id=bar'
+
+
 # The plan keys that existed before task 3098. Pinned so an additive change
 # stays additive: no pre-existing key may be dropped or renamed.
 _PRE_3098_PLAN_KEYS = frozenset({
