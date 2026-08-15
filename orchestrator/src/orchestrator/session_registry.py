@@ -2030,6 +2030,22 @@ class LeaseClaim:
         freshly-acquired lease.
     message: fully-formatted, user-observable line -- callers print this
         verbatim rather than re-deriving it from the other fields.
+    holder_session_state: 'live' | 'exited' | 'absent' | 'unknown' -- the
+        state of the HOLDER's own session_registry record (task 3994
+        defect 4). Together with `holder_alive` this distinguishes a holder
+        that is merely quiet from one that is provably gone, so a
+        stand-down can name a machine-readable owner instead of being
+        honoured silently (INV-6/INV-7).
+
+        DIAGNOSTIC ONLY -- it never changes the claim decision. The lease
+        FILE remains authoritative: auto-stealing on a dead-LOOKING holder
+        is precisely the reap-and-reclaim path that once let a duplicate
+        steal a live-but-quiet watcher's lease (task 2796 THREAD 1). The
+        behavioural response belongs in the caller's skill contract (file a
+        DecisionRecord naming the orphan, then exit), not in lease
+        semantics. Defaults to 'unknown' so existing keyword constructions
+        keep working and an unresolved state can never masquerade as a
+        positive orphan finding.
     """
 
     name: str
@@ -2039,6 +2055,7 @@ class LeaseClaim:
     holder_alive: bool
     heartbeat_age_secs: float
     message: str
+    holder_session_state: str = 'unknown'
 
 
 def _render_contention_message(
@@ -2133,7 +2150,43 @@ def _acquired_claim(name: str, holder: LeaseHolder) -> LeaseClaim:
         holder_alive=True,
         heartbeat_age_secs=0.0,
         message=f'lease {name} acquired by {holder.session_slug}',
+        # The acquirer is ITSELF, and it is by construction running.
+        holder_session_state='live',
     )
+
+
+def _resolve_holder_session_state(
+    holder: LeaseHolder | None, *, root: Path | str | None = None
+) -> str:
+    """Resolve the LEASE HOLDER's own session state: live/exited/absent/unknown.
+
+    Built entirely on records the registry already writes -- ``read_record``'s
+    documented FileNotFoundError-vs-CorruptSessionRecord split maps directly
+    onto 'absent' vs 'unknown', and ``TERMINAL_STATUSES`` onto 'exited' -- so
+    the defect-4 orphan signal introduces no new persistence or lookup path.
+
+    Fail-soft by construction: ANY unexpected exception degrades to 'unknown'
+    rather than propagating, because a session-registry read fault must never
+    break a lease claim. 'unknown' is also the safe value -- callers treat it
+    as "fail toward held" and never as evidence of an orphan.
+    """
+    if holder is None:
+        return 'unknown'
+    try:
+        record = read_record(holder.session_slug, root=root)
+    except FileNotFoundError:
+        return 'absent'
+    except CorruptSessionRecord:
+        return 'unknown'
+    except Exception:
+        logger.warning(
+            '_resolve_holder_session_state: could not read the record for %s; '
+            'reporting unknown (fail toward held)',
+            holder.session_slug,
+            exc_info=True,
+        )
+        return 'unknown'
+    return 'exited' if record.status in TERMINAL_STATUSES else 'live'
 
 
 def _read_lease_holder_state(
@@ -2258,6 +2311,7 @@ def claim_lease(
         message=_render_contention_message(
             existing_holder, holder_alive=holder_alive, age_secs=age_secs, policy=policy
         ),
+        holder_session_state=_resolve_holder_session_state(existing_holder, root=root),
     )
 
 
