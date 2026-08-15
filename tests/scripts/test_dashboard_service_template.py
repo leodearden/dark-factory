@@ -16,6 +16,7 @@ import pathlib
 import re
 import shutil
 import subprocess
+import typing
 
 import pytest
 from systemd_unit_invariants import (
@@ -617,6 +618,18 @@ MIN_SHUTDOWN_MARGIN_SECONDS = 5
 # the real invariant (5 > 6) is violated.  Parsing the live value instead makes
 # that bump fail loudly, the same way test_template_renders_to_hardcoded_file
 # renders the template rather than restating its contents.
+#
+# CORRECTION (task 4087): deriving that value from data.js ALONE was the same
+# class of rot one level up.  The browser runs more than one recurring HTTP
+# poller, and each holds its own keep-alive connection and reuses it at its own
+# interval — so the bound must clear the SLOWEST of them, not whichever one this
+# module happened to know about.  tab_overview.jsx has polled /api/load every
+# 5000ms for the entire life of this invariant while the derivation saw only
+# data.js's 3000ms, leaving keep-alive=5 sitting exactly ON the boundary
+# (5000 > 5000 is false) with the suite green.  CLIENT_POLLERS below makes the
+# covered set explicit and _slowest_client_poll_ms() makes the bound relational
+# against all of it; test_every_client_setinterval_is_registered_or_allowlisted
+# makes an UNcovered new poller a loud failure rather than a silent one.
 REDUX_DIR = REPO_ROOT / "dashboard" / "src" / "dashboard" / "static" / "redux"
 POLL_JS = REDUX_DIR / "data.js"
 
@@ -689,6 +702,61 @@ def _parse_poll_interval_ms(
 def _client_poll_interval_ms() -> int:
     """Return the browser's data-refresh poll interval, in milliseconds."""
     return _parse_poll_interval_ms(POLL_JS.read_text(encoding="utf-8"), str(POLL_JS))
+
+
+class ClientPoller(typing.NamedTuple):
+    """One recurring HTTP poller the browser runs, for keep-alive purposes.
+
+    *what* is prose naming the poller, so a failure can say WHICH one set the
+    keep-alive floor instead of just printing a number.
+    """
+
+    path: pathlib.Path
+    const_name: str
+    what: str
+
+
+# Every recurring HTTP poller in the shipped client.  Membership is the property
+# that matters: an unregistered poller is one the keep-alive floor does not
+# clear, which is exactly how tab_overview.jsx's 5s /api/load poll went
+# unnoticed.  Periods are read from the live sources at run time (never restated
+# here), so there is no third copy to go stale.
+#
+# A new recurring poller MUST be added here.  The completeness guard
+# (test_every_client_setinterval_is_registered_or_allowlisted) fails on any
+# setInterval under redux/ that is neither registered here nor in
+# NON_POLLING_TIMERS, so forgetting is loud rather than silent.
+CLIENT_POLLERS: tuple[ClientPoller, ...] = (
+    ClientPoller(POLL_JS, "POLL_INTERVAL_MS", "main data refresh"),
+    ClientPoller(
+        LOAD_POLL_JSX, "LOAD_POLL_INTERVAL_MS", "host-load card, /api/load"
+    ),
+)
+
+
+def _slowest_client_poll() -> tuple[int, ClientPoller]:
+    """Return (period_ms, poller) for the SLOWEST registered client poller.
+
+    Returns the entry alongside the period so callers can name which poller set
+    the keep-alive floor; a bare number leaves the reader to go find it.
+    """
+    measured = [
+        (
+            _parse_poll_interval_ms(
+                entry.path.read_text(encoding="utf-8"),
+                str(entry.path),
+                const_name=entry.const_name,
+            ),
+            entry,
+        )
+        for entry in CLIENT_POLLERS
+    ]
+    return max(measured, key=lambda pair: pair[0])
+
+
+def _slowest_client_poll_ms() -> int:
+    """Return the slowest registered client poll interval, in milliseconds."""
+    return _slowest_client_poll()[0]
 
 
 def _logical_exec_start(path: pathlib.Path) -> str:
