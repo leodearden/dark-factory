@@ -15205,6 +15205,10 @@ class TestFullCycleWiringIndexHealth:
         default None survives to run() time.
     step-16 (GREEN): call _detect_index_drift in run_full_cycle and thread it
         through _configure_consolidator.
+    step-17 (RED): a record shape α fails closed on escapes run_full_cycle and
+        wedges the cycle for every project.
+    step-18 (GREEN): guard the cadence call site so the diagnostic degrades to
+        UNKNOWN instead of failing the cycle it diagnoses.
     """
 
     @pytest.mark.asyncio
@@ -15295,6 +15299,87 @@ class TestFullCycleWiringIndexHealth:
 
         ih = captured.get('index_health')
         assert ih is not None and ih['healthy'] is True
+
+    @pytest.mark.asyncio
+    async def test_malformed_index_record_does_not_abort_the_cycle(
+        self, journal, event_buffer, mock_memory_service, caplog
+    ):
+        """A surprising `CALL db.indexes()` record must not wedge the whole cycle.
+
+        A read-only diagnostic must never be able to fail the thing it is
+        diagnosing.  TODAY `IndexRecordShapeError` escapes `run_full_cycle`
+        straight out of the coroutine, and by that point `journal.start_run(run)`
+        has already persisted the run as `running` and the caller's
+        `buffer.drain()` has already marked the cycle's events drained — while
+        the project loop's generic `except Exception` only logs `Project loop
+        error` and `restore_drained` runs ONLY on the TimeoutError branch.  So
+        one surprising record wedges every full cycle for every project, leaves
+        dangling `running` runs and DROPS the drained event batch.
+
+        α's fail-closed intent is preserved, not discarded: the read still
+        yields UNKNOWN (never a synthesised healthy record) and still goes loud.
+        """
+        from fused_memory.backends.falkor_indices import expected_index_set
+        from fused_memory.reconciliation.stages.memory_consolidator import (
+            MemoryConsolidator,
+        )
+
+        # Derive the shape, then mis-bind exactly ONE column: `entity_type`
+        # carrying the options dict is the real mis-binding α fails closed on
+        # (falkor_indices.normalize_index_record rejects a non-str entity_type).
+        # Everything else about the record stays DERIVED, never hand-rolled.
+        malformed = dict(_index_records_for(expected_index_set())[0])
+        malformed['entity_type'] = {'some': 'option'}
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.memory.graphiti = MagicMock()
+        harness.memory.graphiti.list_indices = AsyncMock(return_value=[malformed])
+
+        captured: dict = {}
+
+        async def capture_diags(stage):
+            captured['index_health'] = stage.index_health
+
+        for stage in harness.stages:
+            if isinstance(stage, MemoryConsolidator):
+                _mock_stage_run(stage, before_return=capture_diags)
+            else:
+                _mock_stage_run(stage)
+
+        with caplog.at_level(logging.WARNING):
+            # (a) THE REGRESSION: this must COMPLETE, not raise.
+            await harness.run_full_cycle(
+                'test-project',
+                'index-health-malformed-record',
+                events=[_make_event()],
+            )
+
+        # (b) The cycle carried on and Stage 1 still ran — with UNKNOWN health,
+        # never a fabricated healthy record.  (Per step-14 a None record leaves
+        # the 'index_health' key ABSENT from report.stats, so no consumer can
+        # read it as "checked and fine".)
+        assert captured, (
+            'MemoryConsolidator.run() was never reached — the malformed index '
+            'record aborted the cycle instead of degrading to unknown health'
+        )
+        assert captured['index_health'] is None, (
+            'A failed diagnostics read must degrade to UNKNOWN (None), never to '
+            f'a health record: {captured["index_health"]!r}'
+        )
+
+        # (c) LOUD, not silent: α's fail-closed intent survives the guard.
+        warnings = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno >= logging.WARNING
+            and 'test-project' in r.getMessage()
+            and 'index' in r.getMessage().lower()
+        ]
+        assert warnings, (
+            'The surprising index record was swallowed silently. Expected a '
+            'WARNING naming the group_id; got: '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )
 
 
 # ---------------------------------------------------------------------------
