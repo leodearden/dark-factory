@@ -1542,11 +1542,16 @@ class TestBrokenWorktreeOrderingNegatives:
 # documented but never pinned.
 #
 # GREEN today (measured against the live module on this branch, not
-# assumed): all 420 tool x shape x order combinations below already classify
-# ENV_TRANSIENT — the arm order in ``_classify_environmental`` already
-# resolves the tie correctly. The defect is missing PROTECTION of that
-# ordering, not wrong behaviour, so this class is green on arrival by
-# design; see its docstring for the mutation-kill that supplies the RED half.
+# assumed): every slot-shape x collateral-shape x order x ToolKind
+# combination already classifies ENV_TRANSIENT — the arm order in
+# ``_classify_environmental`` already resolves the tie correctly. The corpus
+# below samples that full cross-product at ``ToolKind.OPAQUE`` plus one
+# representative non-opaque tool rather than re-crossing every ``ToolKind``,
+# because guard 3 runs before any per-tool dispatch and its tool-blindness is
+# already pinned, tool-by-tool, by ``TestMergeVerifyCollateralEnvGuard``
+# above. The defect is missing PROTECTION of the ordering, not wrong
+# behaviour, so this class is green on arrival by design; see its docstring
+# for the mutation-kill that supplies the RED half.
 # ---------------------------------------------------------------------------
 
 _SLOT_TIMEOUT_WITH_COLLATERAL_CASES: list[tuple[str, str]] = [
@@ -1559,6 +1564,30 @@ _SLOT_TIMEOUT_WITH_COLLATERAL_CASES: list[tuple[str, str]] = [
     )
 ]
 
+# `pytest.param(..., id=case_id)` so pytest node ids surface the compact
+# combination name (e.g. `sentinel+getcwd:collateral_first`) instead of
+# embedding the raw fixture text positionally.
+_SLOT_TIMEOUT_WITH_COLLATERAL_PARAMS = [
+    pytest.param(case_id, output, id=case_id)
+    for case_id, output in _SLOT_TIMEOUT_WITH_COLLATERAL_CASES
+]
+
+# Guard 3 (`_classify_environmental`) runs BEFORE any per-tool dispatch and
+# is tool-blind by construction (it never even receives `tool`); that
+# tool-blindness is already pinned, cross-producted over every ToolKind, by
+# `TestMergeVerifyCollateralEnvGuard` and `TestGroundedSlotTimeoutMarkersAreDetected`
+# above. Re-crossing ALL_TOOL_KINDS here would multiply the same 60 real
+# cases by 7 identical code paths for no added detection power — confirmed
+# by mutation-kill: hoisting the SEMAPHORE_TIMEOUT arm
+# (verify_classify.py:571-572) above the ENV_TRANSIENT branches flips every
+# case in this corpus regardless of which ToolKind carries it, so any single
+# tool already kills the mutant. OPAQUE (the generic fallback) plus PYTEST
+# (the one ToolKind with its own, unrelated ENV_TRANSIENT path —
+# `_ENV_TRANSIENT_PATTERNS` above — so this also shows guard 3's tie-break
+# winning even for a tool with an overlapping category of its own) is enough
+# to demonstrate the tool-blindness locally without re-paying that cost.
+_REPRESENTATIVE_TOOL_KINDS = (ToolKind.OPAQUE, ToolKind.PYTEST)
+
 
 class TestAnchoredSlotTimeoutWithCollateralIsEnvTransient:
     """task 4126 (recovered from the task-3679 review): pins the
@@ -1569,6 +1598,17 @@ class TestAnchoredSlotTimeoutWithCollateralIsEnvTransient:
     ``_ALL_COLLATERAL_SHAPES`` corpus above) — which resolves ENV_TRANSIENT,
     not SEMAPHORE_TIMEOUT, because the removed worktree is the more specific
     root cause and the only one of the two with a recovery path.
+
+    The category-pin method below,
+    ``test_anchored_slot_timeout_with_collateral_is_env_transient``,
+    parametrizes the full slot-shape x collateral-shape x order
+    cross-product at ``ToolKind.OPAQUE`` and one representative non-opaque
+    tool (``_REPRESENTATIVE_TOOL_KINDS`` above), not the full
+    ``ALL_TOOL_KINDS`` axis: guard 3 runs before any per-tool dispatch and is
+    tool-blind by construction, and that tool-blindness is already
+    cross-producted over every ``ToolKind`` by
+    ``TestMergeVerifyCollateralEnvGuard`` above, so re-crossing it here
+    would add cases with no added detection power.
 
     GREEN ON ARRIVAL, by design: every combination below already classifies
     ENV_TRANSIENT on this branch (measured before this class was written),
@@ -1581,7 +1621,7 @@ class TestAnchoredSlotTimeoutWithCollateralIsEnvTransient:
     SEMAPHORE_TIMEOUT arm (``_SLOT_TIMEOUT_SENTINEL_RE`` /
     ``_SLOT_ACQUIRE_DEADLINE_RE``, verify_classify.py:571-572) to sit
     immediately after the two DISK_FULL checks and before
-    ``_VERIFY_ENV_BROKEN_RE`` flips every one of this class's 480 cases to
+    ``_VERIFY_ENV_BROKEN_RE`` flips every one of this class's cases to
     SEMAPHORE_TIMEOUT (measured), while
     ``TestReplayedMergeVerifyCollateralWinsOverSemaphore``,
     ``TestMergeVerifyCollateralEnvGuard``,
@@ -1598,18 +1638,16 @@ class TestAnchoredSlotTimeoutWithCollateralIsEnvTransient:
     test_genuine_slot_timeout_without_collateral_stays_semaphore_timeout``
     and by ``TestGroundedSlotTimeoutMarkersAreDetected`` above."""
 
-    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
-    @pytest.mark.parametrize(('case_id', 'output'), _SLOT_TIMEOUT_WITH_COLLATERAL_CASES)
+    @pytest.mark.parametrize('tool', _REPRESENTATIVE_TOOL_KINDS)
+    @pytest.mark.parametrize(('case_id', 'output'), _SLOT_TIMEOUT_WITH_COLLATERAL_PARAMS)
     def test_anchored_slot_timeout_with_collateral_is_env_transient(self, tool, case_id, output):
         result = _classify(tool, output, 1, False)
         assert result == FailureCategory.ENV_TRANSIENT, (
-            f'case {case_id!r} must classify ENV_TRANSIENT under {tool!r}, got {result!r}'
-        )
-        assert result != FailureCategory.SEMAPHORE_TIMEOUT, (
-            f'case {case_id!r} must not classify SEMAPHORE_TIMEOUT under {tool!r}'
+            f'case {case_id!r} must classify ENV_TRANSIENT (not SEMAPHORE_TIMEOUT) '
+            f'under {tool!r}, got {result!r}'
         )
 
-    @pytest.mark.parametrize(('case_id', 'output'), _SLOT_TIMEOUT_WITH_COLLATERAL_CASES)
+    @pytest.mark.parametrize(('case_id', 'output'), _SLOT_TIMEOUT_WITH_COLLATERAL_PARAMS)
     def test_anchored_slot_timeout_with_collateral_keeps_recovery_path(self, case_id, output):
         """Pins the CONSEQUENCE the ORDERING note names, not just the label:
         ENV_TRANSIENT carries a bounded self-recovery
@@ -1617,9 +1655,9 @@ class TestAnchoredSlotTimeoutWithCollateralIsEnvTransient:
         ``RetryKind.NONE`` would instead surface to a human."""
         result = _classify(ToolKind.OPAQUE, output, 1, False)
         assert CATEGORY_POLICY[result].retry_kind is RetryKind.ENV_SERIAL, (
-            f'case {case_id!r} must keep the ENV_SERIAL recovery path, got {result!r}'
+            f'case {case_id!r} must keep the ENV_SERIAL recovery path (not '
+            f"SEMAPHORE_TIMEOUT's blocking RetryKind.NONE), got {result!r}"
         )
-        assert CATEGORY_POLICY[result].retry_kind is not RetryKind.NONE
         assert result in INFRA_TRANSIENT_CATEGORIES
 
 
