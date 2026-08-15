@@ -15,6 +15,16 @@ house route-test pattern (the synchronous ``TestClient`` fixture in
 conftest.py) cannot be wrapped in ``asyncio.wait_for``, so a RED test against
 a hanging handler would wedge the whole suite instead of failing fast.
 
+The step-13/14 cancellation tests at the end of this module are a deliberate
+exception to that convention: they call ``asyncio.create_task(healthz(...))``
+directly and ``await`` the task themselves instead of going through
+:func:`_call_healthz`, because they must own the task object to ``.cancel()``
+it — ``_call_healthz`` does not expose the task it awaits. This is still
+bounded: every DB target in those tests blocks for at most the probe budget
+before yielding, and the module-wide ``pytest-timeout`` (60s, see
+``pyproject.toml``) kills the process outright if that assumption is ever
+wrong, so a hang there still fails the suite rather than wedging it silently.
+
 The fakes below (``_BlockingConn``, ``_BlockingCursorCtx``, ``_BlockingPool``)
 model aiosqlite 0.22.1's actual shape, verified via ``inspect``:
 ``Connection.execute`` is a *synchronous* method (wrapped in aiosqlite's own
@@ -732,3 +742,6 @@ async def test_healthz_handler_cancellation_strands_no_probe_task(
     assert inner in registry, 'handler cancellation stranded an untracked probe task'
     await asyncio.wait({inner}, timeout=5.0)
     assert inner.cancelled(), 'stranded probe task was tracked but never actually cancelled'
+    assert inner not in registry, (
+        'inner probe task leaked: still in _ABANDONED_PROBES after it finished'
+    )
