@@ -35,6 +35,17 @@ dials the server. Four gates stand between a candidate and a write:
 4. ``update_task(metadata_mode='merge')`` — shallow merge, never ``replace``.
    Replace is the wiper's own primitive and a repair must not use it.
 
+Gate 3's live re-read now fails LOUDLY. A re-read the server never usefully
+answered — a dead transport, or an empty/unreadable reply, both classified by
+``classify_reply`` — is reported as :data:`FAILED_LIVE_READ` and drives a
+non-zero exit (:data:`EXIT_LIVE_READ_FAILED`), instead of being filed as a
+benign :data:`SKIP_MISSING` indistinguishable from a task the server
+genuinely said is gone. This closes the "report a repair that never
+happened" gap for the READ path — the same gap ``classify_reply`` already
+closes for the WRITE path in ``repair_one``, where a write this script cannot
+confirm succeeded is reported as :data:`FAILED` rather than as a silent
+:data:`REPAIR`.
+
 Usage:
     python scripts/repair_wiped_metadata_files.py --project-root <root>          # dry run
     python scripts/repair_wiped_metadata_files.py --project-root <root> --apply  # write
@@ -941,6 +952,7 @@ EXIT_WRITE_FAILED = 1          # at least one candidate FAILED to write
 EXIT_NO_ROOT = 2               # no project root resolved to a readable tasks.db
 EXIT_NOTHING_SCANNED = 3       # roots resolved but EVERY one was unreadable
 EXIT_SERVER_UNREACHABLE = 4    # --apply, but the MCP server never handshook
+EXIT_LIVE_READ_FAILED = 5      # the live re-read died mid-batch; candidates were left UNEXAMINED
 
 
 def _transport_error_types() -> tuple[type[BaseException], ...]:
@@ -1006,9 +1018,11 @@ def _build_parser() -> argparse.ArgumentParser:
             "FAILED to write; 2 = no project root resolved to a readable "
             "tasks.db; 3 = roots resolved but EVERY one was unreadable, so "
             "nothing was examined; 4 = --apply, but the fused-memory MCP "
-            "server could not be reached (nothing was written). Never read 2, "
-            "3 or 4 as a clean run -- and note that only 1 ever means a write "
-            "was attempted and failed."
+            "server could not be reached (nothing was written); 5 = the "
+            "fused-memory server stopped answering mid-batch, so one or more "
+            "candidates were never examined (some writes may already have "
+            "landed). Never read 2, 3, 4 or 5 as a clean run -- and note that "
+            "only 1 ever means a write was attempted and failed."
         ),
     )
     parser.add_argument(
@@ -1135,7 +1149,23 @@ async def main_async(args: argparse.Namespace) -> int:
         for outcome in result.outcomes
         if outcome.disposition == FAILED
     )
-    return EXIT_WRITE_FAILED if failed else EXIT_OK
+    unread = sum(
+        1
+        for result in results
+        for outcome in result.outcomes
+        if outcome.disposition == FAILED_LIVE_READ
+    )
+    # Both counts are already fully summarised above (format_summary /
+    # format_json_summary print every failed_live_read task id regardless of
+    # which exit code wins) -- this precedence only decides what the ONE exit
+    # code reports. A rejected write outranks an unread candidate: 1 is the
+    # more actionable signal, and 5's own meaning -- "candidates were left
+    # unexamined" -- does not describe a failed write.
+    if failed:
+        return EXIT_WRITE_FAILED
+    if unread:
+        return EXIT_LIVE_READ_FAILED
+    return EXIT_OK
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1144,7 +1174,8 @@ def main(argv: list[str] | None = None) -> int:
     Exit codes: 0 = ran, nothing failed; 1 = at least one candidate FAILED to
     write; 2 = no project root resolved to a readable tasks.db; 3 = roots
     resolved but every one was unreadable; 4 = ``--apply`` could not reach the
-    MCP server.
+    MCP server; 5 = the MCP server stopped answering mid-batch, after the
+    handshake had already succeeded.
 
     EACH CODE DENOTES EXACTLY ONE OUTCOME. 2, 3 and 4 are distinct from 0 for
     the reason the audit distinguishes them: 0 would otherwise cover both
@@ -1153,7 +1184,12 @@ def main(argv: list[str] | None = None) -> int:
     run. They are distinct from 1 for the mirror-image reason — 1 is the
     operator's signal that a WRITE was attempted and rejected, and folding an
     unreadable database or a down server into it would send them hunting for a
-    failed write that never happened.
+    failed write that never happened. 5 is distinct from 4 by the same
+    reasoning, applied to the read path, and the asymmetry between the two is
+    the operator's whole re-run decision procedure: 4 means the handshake
+    never happened, so NOTHING was written; 5 means the handshake succeeded
+    and the server then stopped answering, so writes may ALREADY HAVE LANDED
+    and the remaining candidates are unknown.
     """
     args = _build_parser().parse_args(argv)
     try:
