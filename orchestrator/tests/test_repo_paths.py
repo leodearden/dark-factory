@@ -191,11 +191,11 @@ class TestDarkFactoryRootUnresolvable:
         """resolve_local_df_checkout() -> None: degrade to None, loudly."""
         monkeypatch.delenv(DARK_FACTORY_ROOT_ENV, raising=False)
 
-        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
-            with patch(
-                'orchestrator.repo_paths.resolve_local_df_checkout', return_value=None
-            ):
-                root = resolve_dark_factory_root()
+        with (
+            caplog.at_level(logging.WARNING, logger=_LOGGER_NAME),
+            patch('orchestrator.repo_paths.resolve_local_df_checkout', return_value=None),
+        ):
+            root = resolve_dark_factory_root()
 
         _assert_unresolvable(root)
         assert _repo_paths_warnings(caplog), (
@@ -210,11 +210,13 @@ class TestDarkFactoryRootUnresolvable:
         """An ascent landing on a non-DF repo is a miss, not a usable root."""
         monkeypatch.delenv(DARK_FACTORY_ROOT_ENV, raising=False)
 
-        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
-            with patch(
+        with (
+            caplog.at_level(logging.WARNING, logger=_LOGGER_NAME),
+            patch(
                 'orchestrator.repo_paths.resolve_local_df_checkout', return_value=tmp_path
-            ):
-                root = resolve_dark_factory_root()
+            ),
+        ):
+            root = resolve_dark_factory_root()
 
         _assert_unresolvable(root)
         assert _repo_paths_warnings(caplog)

@@ -122,4 +122,16 @@ def resolve_dark_factory_root() -> Path | None:
     root = resolve_local_df_checkout()
     if root is not None and _validates(root):
         return root
+
+    logger.warning(
+        'Could not resolve the dark-factory tooling root: %s=%s, ancestor walk=%s '
+        '(no ancestor carries %s). Spawned watcher rotations will NOT carry %s, so '
+        'their `cd $%s && scripts/watcher-rearm.sh` re-arm cannot run.',
+        DARK_FACTORY_ROOT_ENV,
+        repr(raw) if raw else '<unset>',
+        root if root is not None else '<none>',
+        '/'.join(_REARM_MARKER),
+        DARK_FACTORY_ROOT_ENV,
+        DARK_FACTORY_ROOT_ENV,
+    )
     return None
