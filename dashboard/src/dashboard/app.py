@@ -544,6 +544,12 @@ def _healthz_db_targets(config: DashboardConfig) -> list[tuple[str, Path]]:
 _ABANDONED_PROBES: set[asyncio.Task] = set()
 
 
+def _abandon_probe(task: asyncio.Task) -> None:
+    """Cancel *task* fire-and-forget and hold a strong reference until it ends."""
+    task.cancel()  # fire-and-forget — do NOT await the unwinding
+    track_task(task, _ABANDONED_PROBES)
+
+
 async def _probe_db(pool: DbPool, db_path: Path, budget: float) -> str:
     """Probe one database under a single deadline covering acquire + execute + fetch.
 
@@ -558,8 +564,10 @@ async def _probe_db(pool: DbPool, db_path: Path, budget: float) -> str:
     reaches the payload, so the exception itself is logged at WARNING with
     exc_info; without that it would be unrecoverable anywhere.
 
-    Runs the probe in its own task and, on expiry, ABANDONS it rather than
-    awaiting its cancellation. A deadline wrapped around `async with
+    Runs the probe in its own task and ABANDONS it — rather than awaiting
+    its cancellation — on EVERY exceptional exit from the `asyncio.wait`
+    below: budget expiry, or the caller (this coroutine's own task) being
+    cancelled out from under it. A deadline wrapped around `async with
     conn.execute(...)` is not actually hang-free: when it fires mid-fetch,
     the cancellation is consumed unwinding into the cursor's `__aexit__`,
     which issues a NEW `await cursor.close()` that nothing will cancel a
@@ -573,14 +581,20 @@ async def _probe_db(pool: DbPool, db_path: Path, budget: float) -> str:
     intended: /healthz reports, it does not repair, and per-DB caps mean a
     poisoned connection costs one _DB_PROBE_TIMEOUT, never the whole handler.
 
-    It does not LEAK one either, though it once did (task 3466). When the
-    abandoned task is cancelled inside `pool.get()`, DbPool keeps the
+    It does not LEAK one either, though it once did (task 3466, and again —
+    via caller cancellation rather than budget expiry — as task 4089). When
+    the abandoned task is cancelled inside `pool.get()`, DbPool keeps the
     in-flight `aiosqlite.connect()` alive under `asyncio.shield` and adopts
     the connection when it lands, so a slow open becomes a warm cached
     connection for the next probe rather than a stranded (non-daemon)
     aiosqlite worker thread. That matters here specifically: the
     `_THREAD_LIMIT` check above exists to detect exactly such leaks, so
-    /healthz must not manufacture them itself.
+    /healthz must not manufacture them itself. Caller cancellation (uvicorn
+    `--timeout-graceful-shutdown` force-cancelling request tasks at
+    restart; a client disconnect) reaches this same await, which is why the
+    `except BaseException` below re-raises rather than swallowing it — a
+    cancelled request must stay cancelled, never be laundered into a
+    'timeout' verdict.
     """
 
     async def _inner() -> str:
@@ -595,10 +609,23 @@ async def _probe_db(pool: DbPool, db_path: Path, budget: float) -> str:
         return 'ok' if row is not None else 'failed'
 
     task = asyncio.create_task(_inner())
-    done, _pending = await asyncio.wait({task}, timeout=budget)
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=budget)
+    except BaseException:
+        # The CALLER was cancelled (uvicorn --timeout-graceful-shutdown
+        # force-cancelling request tasks at restart; a client disconnect)
+        # while we were suspended here. asyncio.wait does NOT cancel what it
+        # waits on, so without this the inner task survives referenced only
+        # by the event loop's WEAK set — the exact GC hazard _ABANDONED_PROBES
+        # exists to prevent, and the stranded-aiosqlite-worker leak class of
+        # task 3466. Catch BaseException, not just CancelledError: the
+        # invariant is that NO exceptional exit from this await leaves the
+        # task untracked. Re-raise — a cancelled request must stay cancelled,
+        # never be laundered into a 'timeout' verdict.
+        _abandon_probe(task)
+        raise
     if task not in done:
-        task.cancel()  # fire-and-forget — do NOT await the unwinding
-        track_task(task, _ABANDONED_PROBES)
+        _abandon_probe(task)
         return 'timeout'  # ONLY a real budget expiry is a 'timeout'
     try:
         return task.result()
