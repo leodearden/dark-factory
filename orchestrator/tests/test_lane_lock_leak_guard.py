@@ -2229,9 +2229,16 @@ class TestSelfOwnedLaneLockLeak:
 #: A pid the scripted readers below return on reads AFTER the one the
 #: production site is supposed to settle on.  Deliberately implausible (Linux
 #: pid_max is nowhere near this) so a rendered message naming it is
-#: unmistakably a LATER read leaking into the raise, and deliberately NOT
-#: `os.getpid()`: our own pid in the holder set trips layer (1) of the leak
-#: predicate and would change WHICH exception is raised.
+#: unmistakably a LATER read leaking into the raise.
+#:
+#: Returned ALONGSIDE `os.getpid()` (task 3783 review amendment), because the
+#: two consumers of the settled snapshot fail visibly in different ways and one
+#: scripted value cannot catch both: a later read reaching the MESSAGE shows up
+#: as this pid in the rendered clause, while a later read reaching the
+#: PREDICATE shows up only as a changed exception TYPE — our own pid passes
+#: layer (1), and with an empty registry and no rendezvous neither layer (2)
+#: nor layer (3) vetoes, so the raise becomes `LaneLockSelfOwnedLeak`.  Pairing
+#: them makes the same scripted read fatal to either consumer independently.
 _BOGUS_LATER_PID = 2**31 - 2
 
 
@@ -2328,11 +2335,28 @@ class TestContendedRaiseSurvivesALossyHolderRead:
         likely, not less, if it were re-read — the whole point is that the
         answer changes between reads.
 
-        Scripted `[]` -> `[child.pid]` -> `[_BOGUS_LATER_PID]` forever: the
-        message must name the SECOND read (the settled snapshot) and must not
-        contain the third.  Asserted on the rendered pids rather than on a
-        reader call count deliberately — a count would itself be racy if a
-        delegated real read were ever lossy.
+        Scripted `[]` -> `[child.pid]` -> `[os.getpid(), _BOGUS_LATER_PID]`
+        forever: the raise must be driven ENTIRELY by the second read.  Both
+        consumers are covered, and each by an assertion the other cannot make
+        (task 3783 review amendment — this case previously asserted only on
+        the rendered message, so an independent re-read inside
+        `_lane_lock_self_owned_leak` would have gone unnoticed: it would have
+        received `[_BOGUS_LATER_PID]`, still failed `self_pid not in`, still
+        raised the same type with the same message, and this test would have
+        stayed green):
+
+        * MESSAGE — `_BOGUS_LATER_PID` must not appear in the rendered clause.
+          `_lane_lock_holder_facts` re-reads only when `holder_pids is None`,
+          so this fails the moment the call site stops passing the snapshot.
+        * PREDICATE — the type must be exactly `MergeVerifyLeaseContended`.
+          A re-read inside the predicate would see OUR pid, pass layer (1),
+          and — the registry being empty and no rendezvous written — raise
+          `LaneLockSelfOwnedLeak` against an entirely foreign hold.  That is
+          an IS-A of the caught type, so only `type(...) is` catches it.
+
+        Asserted on the raise rather than on a reader call count deliberately
+        — a count would itself be racy if a delegated real read were ever
+        lossy.
         """
         from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
 
@@ -2350,9 +2374,10 @@ class TestContendedRaiseSurvivesALossyHolderRead:
 
         with foreign_lane_lock_holder(lock_path) as (child, _holders):
             scripted: list[list[int]] = [[], [child.pid]]
+            later = [os.getpid(), _BOGUS_LATER_PID]
 
             def _scripted_reader(path: Path) -> list[int]:
-                return scripted.pop(0) if scripted else [_BOGUS_LATER_PID]
+                return scripted.pop(0) if scripted else later
 
             monkeypatch.setattr(
                 git_ops_mod, 'lane_lock_holder_pids', _scripted_reader,
@@ -2361,12 +2386,19 @@ class TestContendedRaiseSurvivesALossyHolderRead:
             with pytest.raises(MergeVerifyLeaseContended) as excinfo:
                 await real_git_ops.reset_persistent_merge_worktree(commit_b)
 
+            assert type(excinfo.value) is MergeVerifyLeaseContended, (
+                f'the leak PREDICATE must evaluate the settled snapshot it was '
+                f'handed, not take a read of its own: a later read names our '
+                f'pid, passes layer (1), and turns an entirely foreign hold '
+                f'into a loud human-escalating B13 leak report; got '
+                f'{type(excinfo.value).__name__}'
+            )
             msg = str(excinfo.value)
             assert str(child.pid) in msg, (
                 f'the settled snapshot must be the one rendered; got {msg!r}'
             )
             assert str(_BOGUS_LATER_PID) not in msg, (
-                f'the raise must NOT take a second, independent read: the '
+                f'the MESSAGE must NOT take a second, independent read: the '
                 f'clause would then describe a holder set the leak predicate '
                 f'never evaluated (the task-3081 single-snapshot invariant); '
                 f'got {msg!r}'
