@@ -793,6 +793,24 @@ class TestExtractSnapshotEdgeTaskIds:
             'Reviews of the following (still open): tasks 1020 and 1030 are pending.',
             'Statuses of the "next" tasks 1020 and 1030 are pending.',
             'Blockers for the merge lane [df] tasks 1020 and 1030 are pending.',
+            # INTRA-TOKEN '.' is not sentence-final punctuation, so it must
+            # not count as a clause break either: a '.' flanked by
+            # alphanumerics on both sides (filename extension, version
+            # string, dotted module path, dotted section number) ends no
+            # sentence, so treating it as a break truncates the backward
+            # scan short of the governing preposition — the same
+            # over-selection the punctuation-family exclusions above guard,
+            # just for a '.' occurrence rather than a different character.
+            # (amendment, reviewer_comprehensive correctness-precision
+            # finding, task 4149)
+            'Reviews for verify_cmd.py tasks 1020 and 1030 are pending.',
+            # CONTROL: identical but for the extension; already passed before
+            # this amendment and must keep passing.
+            'Reviews for verify_cmd tasks 1020 and 1030 are pending.',
+            'Blockers on scheduler.py tasks 1020 and 1030 are in progress.',
+            'Statuses of the v1.2 tasks 1020 and 1030 are pending.',
+            'Reviews for section 4.2.1 tasks 1020 and 1030 are pending.',
+            'Statuses of tasks in df.core tasks 1020 and 1030 are pending.',
         ],
     )
     def test_plural_enumeration_precision_guards(self, fact):
