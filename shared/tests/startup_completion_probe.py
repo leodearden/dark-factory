@@ -87,6 +87,22 @@ from shared.config_dir import TaskConfigDir  # noqa: E402
 
 MODES = ('healthy', 'build_wedge', 'uv_wedge', 'mcp_wedge', 'replay')
 
+#: The closed set of ``sample_kind`` values the samplers actually emit — the
+#: four ``_take`` call sites in :func:`run_live_probe`, the two
+#: ``pre_first_token`` relabels, and :func:`run_replay_probe`.  Closed because
+#: :func:`_poisoned_observation` carries ``sample_kind`` through ONLY when it is
+#: a member: a row whose whole claim is "clean by construction" cannot carry an
+#: arbitrary string out of an observation that just failed redaction.
+SAMPLE_KINDS = (
+    'scheduled',
+    'first_token',
+    'pre_first_token',
+    'pre_first_token_candidate',
+    'after_exit',
+    'deadline',
+    'replay',
+)
+
 #: Wedge-shape slug recorded on each observation, keyed by probe mode.  ``None``
 #: for the healthy/replay regimes.  These slugs are the PRD's names and are the
 #: same closed set the corpus rows use.
@@ -257,6 +273,70 @@ def _scrub_value(value: Any, patterns: tuple[tuple[str, str], ...]) -> Any:
     return value if _encodes_clean(value, patterns) else '<redacted>'
 
 
+#: ``substrate_returns`` keys a poisoned row must carry, with the scalar types
+#: each is allowed to keep.  ``bool`` is a subclass of ``int``, so ``int`` covers
+#: both flags and counts; anything else degrades to ``None``.
+_SUBSTRATE_KEYS = (
+    'transcript_exists',
+    'read_transcript_records_is_none',
+    'record_count',
+    'count_transcript_turns',
+)
+
+
+def _poisoned_observation(
+    observation: dict[str, Any], pattern_name: str
+) -> dict[str, Any]:
+    """Return a minimal row standing in for an observation redaction could not clean.
+
+    Every value here is either a probe-owned literal, a member of a closed set
+    the probe itself defines, or a non-string scalar — so the row cannot itself
+    carry credential material, whatever was in *observation*.  That is the whole
+    point: it is clean BY CONSTRUCTION rather than by a scan, which is what lets
+    :func:`_gate` promise never to raise on the heuristic branch.
+
+    ``substrate_returns`` is carried (scalar-filtered, all four keys always
+    present) because ``run_live_probe`` subscripts
+    ``candidate['substrate_returns']['count_transcript_turns']`` on the
+    pre-first-token path — a placeholder without it would merely trade the
+    AssertionError for a KeyError at exactly the same blast radius.
+
+    Nothing else survives.  Dropping ``transcript_records`` / ``config_dir_tree``
+    / ``run_exit`` / ``spawn_argv`` is what costs this ONE sample its analytical
+    value — the deliberate price of not losing the other N.
+    """
+    substrate = observation.get('substrate_returns')
+    if not isinstance(substrate, dict):
+        substrate = {}
+    mode = observation.get('mode')
+    sample_kind = observation.get('sample_kind')
+    sample_index = observation.get('sample_index')
+    sample_offset_secs = observation.get('sample_offset_secs')
+    return {
+        'redaction_failed': True,
+        'redaction_failure_pattern': pattern_name,
+        'mode': mode if mode in MODES else None,
+        'sample_kind': sample_kind if sample_kind in SAMPLE_KINDS else None,
+        # `not isinstance(x, bool)`: True would otherwise pass as the int 1 and
+        # make a nonsense index look like a real one.
+        'sample_index': (
+            sample_index
+            if isinstance(sample_index, int) and not isinstance(sample_index, bool)
+            else None
+        ),
+        'sample_offset_secs': (
+            sample_offset_secs
+            if isinstance(sample_offset_secs, (int, float))
+            and not isinstance(sample_offset_secs, bool)
+            else None
+        ),
+        'substrate_returns': {
+            key: (substrate.get(key) if isinstance(substrate.get(key), int) else None)
+            for key in _SUBSTRATE_KEYS
+        },
+    }
+
+
 def _gate(observation: dict[str, Any]) -> dict[str, Any]:
     """Refuse — or scrub — an assembled observation carrying credential material.
 
@@ -276,6 +356,18 @@ def _gate(observation: dict[str, Any]) -> dict[str, Any]:
       real-money ``healthy`` / ``mcp_wedge`` runs — for a harness whose whole
       purpose is to be re-run after a CLI bump.  Either way the matched run
       never reaches disk; only the blast radius differs.
+
+    The generic branch's never-raise guarantee is enforced BY CONSTRUCTION, not
+    by trusting :func:`_scrub_value` to be exhaustive.  Two ways it was not have
+    already been found and fixed (a credential-shaped dict KEY; a run that only
+    exists in the JSON-ENCODED form), and both times the guarantee rested on a
+    composition argument that turned out to be false.  So a still-dirty scrub is
+    now handled rather than asserted away: the sample degrades to a minimal
+    :func:`_poisoned_observation` row flagged ``redaction_failed`` and a stderr
+    WARNING.  That is loud and bounded — ONE sample reduced to identity fields,
+    against a raise's cost of every sample of an already-paid-for live run — and
+    the unclean material still never reaches disk, because the dirty object is
+    dropped entirely rather than written.
     """
     encoded = json.dumps(observation)
 
@@ -303,9 +395,29 @@ def _gate(observation: dict[str, Any]) -> dict[str, Any]:
         file=sys.stderr,
     )
     scrubbed = _scrub_value(observation, _GENERIC_CREDENTIAL_PATTERNS)
-    _scf.assert_no_credential_material(
-        json.dumps(scrubbed), source='startup_completion_probe:observation(scrubbed)'
-    )
+    encoded_scrubbed = json.dumps(scrubbed)
+    try:
+        _scf.assert_no_credential_material(
+            encoded_scrubbed, source='startup_completion_probe:observation(scrubbed)'
+        )
+    except AssertionError:
+        # The scrub did not fully clean the sample.  Do NOT re-raise: this is the
+        # heuristic branch, and its blast radius is the whole capture.  Re-scan to
+        # name the RESIDUAL pattern (which need not be the one that opened this
+        # branch) so the warning points at what actually survived, falling back to
+        # the triggering name if the scan and the assertion ever disagree.
+        residual = scan_for_credential_material(encoded_scrubbed, _CREDENTIAL_PATTERNS)
+        residual_name = residual[0] if residual is not None else name
+        print(
+            f'startup_completion_probe: WARNING — redaction FAILED for pattern '
+            f'{residual_name!r} in sample {observation.get("sample_index")} '
+            f'({observation.get("sample_kind")}); emitting a minimal '
+            f'redaction_failed row instead of the observation. This sample is lost '
+            f'for analysis but the run is not: fix _scrub_value so it cleans this '
+            f'shape, then re-run the probe.',
+            file=sys.stderr,
+        )
+        return _poisoned_observation(observation, residual_name)
     return scrubbed
 
 
