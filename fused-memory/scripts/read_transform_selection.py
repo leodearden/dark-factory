@@ -1254,18 +1254,19 @@ def run_selection(
     which is the window production's briefing assembler actually asks for
     (briefing.py:1376).
     """
-    if estimator is None:
-        estimator = bake_off().resolve_token_estimator()
+    resolved: tuple[str, Any] = (
+        bake_off().resolve_token_estimator() if estimator is None else estimator
+    )
     return {
         'shape': SELECTION_SHAPE,
         'sighting_crediting': 'rendered' if render_sightings else 'uncredited',
         'per_topic_cap': per_topic,
-        'token_estimator': estimator[0],
+        'token_estimator': resolved[0],
         'e2': {
             arm: score_arm(
                 arm, e2_queries, hits_by_query, seeded,
                 k=e2_k, labeled=True, render_sightings=render_sightings,
-                per_topic=per_topic, estimator=estimator,
+                per_topic=per_topic, estimator=resolved,
             )
             for arm in ARM_KEYS
         },
@@ -1273,7 +1274,7 @@ def run_selection(
             arm: score_arm(
                 arm, production_queries, production_hits_by_query, seeded,
                 k=production_k, labeled=False, render_sightings=render_sightings,
-                per_topic=per_topic, estimator=estimator,
+                per_topic=per_topic, estimator=resolved,
             )
             for arm in ARM_KEYS
         },
@@ -1942,7 +1943,7 @@ async def fetch_production_rankings(
     from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
 
     bake = bake_off()
-    limit = bake.DEFAULT_SEARCH_LIMIT if limit is None else limit
+    search_limit: int = int(bake.DEFAULT_SEARCH_LIMIT if limit is None else limit)
     seed_concurrency = (
         bake.SEED_CONCURRENCY if seed_concurrency is None else seed_concurrency
     )
@@ -1967,7 +1968,7 @@ async def fetch_production_rankings(
         await memory.initialize()
         await bake.seed_arm(memory.mem0, seeded, concurrency=seed_concurrency)
         fetched = await bake.fetch_arm(
-            memory.mem0, seeded, list(production_queries), [], limit=limit,
+            memory.mem0, seeded, list(production_queries), [], limit=search_limit,
         )
     finally:
         await memory.close()
@@ -1977,7 +1978,7 @@ async def fetch_production_rankings(
     return {
         'shape': shape,
         'corpus_fingerprint': bake.corpus_fingerprint(seeded.records),
-        'search_limit': int(limit),
+        'search_limit': search_limit,
         'embedder_model': config.embedder.model,
         'queries': {
             query_id: bake._serialize_ranking(hits)

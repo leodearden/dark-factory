@@ -37,6 +37,7 @@ import functools
 import importlib.util
 import types
 from pathlib import Path
+from typing import Any
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'bake_off_storage_shape.py'
 
@@ -177,8 +178,13 @@ _POINT_IDS = ('mem0-point-aaaa', 'mem0-point-bbbb', 'mem0-point-cccc')
 
 
 def _record(record_id: str, *, content: str = 'body', topic: str = 't',
-            claim_ids: tuple[str, ...] = ()) -> object:
-    """One arm record, in the shape `materialize_arm` would emit it."""
+            claim_ids: tuple[str, ...] = ()) -> Any:
+    """One arm record, in the shape `materialize_arm` would emit it.
+
+    `Any`, not `object`: the class comes from a module loaded by path, so it
+    has no static identity here, and tests legitimately read `.record_id` off
+    what this returns.
+    """
     return _mod().ArmRecord(
         record_id=record_id,
         content=content,
@@ -189,7 +195,7 @@ def _record(record_id: str, *, content: str = 'body', topic: str = 't',
     )
 
 
-def _seeded(shape: str, records: list) -> object:
+def _seeded(shape: str, records: list) -> Any:
     """A `SeededArm` with `by_stored_id` populated the way `seed_arm` would.
 
     The fake point ids are deliberately UNRELATED to the record ids: that is

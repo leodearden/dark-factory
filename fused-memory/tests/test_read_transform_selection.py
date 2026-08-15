@@ -90,9 +90,15 @@ import copy  # noqa: E402
 import pytest  # noqa: E402
 
 
-def _rec(record_id, *, topic='t', canonical=False, kind=None,
+def _rec(record_id, *, topic: str | None = 't', canonical=False, kind=None,
          content='body', claim_ids=(), parent_id=None, cluster_id='c1'):
-    """One stored record, in the shape the read transforms consume."""
+    """One stored record, in the shape the read transforms consume.
+
+    ``topic=None`` is a first-class case, not a degenerate one: a topic-less
+    slab is exactly what an un-migrated write leaves behind, and every
+    transform has to survive one.  Hence the explicit optional annotation —
+    inferring `str` from the default would make those call sites a type error.
+    """
     metadata: dict = {'category': 'procedural_knowledge'}
     if topic is not None:
         metadata['topic'] = topic
