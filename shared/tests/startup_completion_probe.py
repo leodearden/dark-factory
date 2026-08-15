@@ -836,7 +836,16 @@ def run_live_probe(
     session_id = str(uuid.uuid4())
     cli_version = _cli_version()
     token_pair = _oauth_token()
-    config = TaskConfigDir(f'startup-probe-{mode}-{os.getpid()}')
+    # The negation is load-bearing, not cosmetic: TaskConfigDir.__init__
+    # registers atexit.register(shutil.rmtree, ...) when this is True, so an
+    # unconditional True would silently destroy at interpreter exit exactly the
+    # dir --keep-config-dir exists to preserve for post-run inspection.  This is
+    # only the CLEAN-EXIT half of reclamation — it covers a raise that escapes
+    # run_live_probe entirely (SystemExit, KeyboardInterrupt) but nothing
+    # survives SIGKILL; the dead-PID sweep below is the other half.
+    config = TaskConfigDir(
+        f'startup-probe-{mode}-{os.getpid()}', cleanup_at_exit=not keep_config_dir
+    )
     config_dir = config.path
 
     # Every resource the `finally` touches is initialized to a sentinel FIRST,
