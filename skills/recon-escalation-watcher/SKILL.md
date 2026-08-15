@@ -72,6 +72,95 @@ no worktree).
 }
 ```
 
+## Claiming the Recon Watcher Lease (single-owner-per-role)
+
+**Before entering the Main Loop for the first time**, claim the `recon-watcher-<project>` lease
+(Attention Rail T7, `orchestrator/src/orchestrator/session_registry.py`) — a deterministic
+single-owner-per-role check that replaces any pgrep/ps-tree archaeology for a duplicate recon
+watcher. Run once, at session startup, not per cycle:
+
+```bash
+# Reap anything stale first so a genuinely-dead prior holder never blocks this claim.
+python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-reap
+
+python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-claim \
+  --name recon-watcher-<project> --slug "recon-watcher-<project>-${CLAUDE_PID:-$PPID}" \
+  --policy stand-down
+```
+
+**Why this watcher takes a lease (task 3994).** `recon-watch/run.sh` `exec`s a hand-launched
+`claude` session with no supervisor and nothing preventing a second invocation, and this skill is
+**the SOLE closer** of the 8103 queue (recon never resolves its own findings) — so two of these
+running at once is actively harmful: both would triage and close the same findings. That is the
+interactive single-owner-per-session shape, exactly like `escalation-watcher`. It is *unlike*
+`escalation-watcher-auto`, whose no-lease status is justified (see
+`skills/escalation-watcher/SKILL.md` §"Claiming the Watcher Lease", INTERACTIVE-ONLY) by its being
+a supervised, always-on rotation rather than a single-owner actor. The lease name is the one task
+2289 specified and that `build_lease_name('recon-watcher', '<project>')` already produces.
+
+**Never `$$` — it is both the wrong pid and an unusable slug.** Inside a Claude Code Bash tool call
+`$$` is the transient `/bin/bash -c` wrapper, dead the instant the call returns; the long-lived
+`claude` process is `$CLAUDE_PID` (fall back to `$PPID`) — verify with
+`ps -o comm= -p "${CLAUDE_PID:-$PPID}"`, which prints `claude`. A `$$` pid makes the liveness guard
+inert, and a `$$` slug differs on every tool call, so your own later heartbeat/release would be
+refused. `--pid` is optional (the CLI resolves it from `$CLAUDE_PID`) and is an operator override
+only.
+
+Parse the printed lines: `decision=<acquired|stand-down|proceed>`, a human-readable message, then
+`holder_liveness=<held|orphaned>`.
+- **`decision=acquired` or `decision=proceed`**: continue into the Main Loop. `proceed` is the
+  fail-open outcome — a lease-substrate fault is logged loudly and reported as `proceed`, never a
+  false `stand-down`, so a lease fault can never block the only consumer of this queue.
+- **`decision=stand-down` + `holder_liveness=held`**: another recon watcher is live. Print the
+  message verbatim and **exit immediately** — do not drain, do not start the watcher.
+- **`decision=stand-down` + `holder_liveness=orphaned`**: the holder's pid is not running **and**
+  its session record is absent/exited, but its heartbeat is still within TTL so the lease is not yet
+  reclaimable. **Do not exit silently** — this skill is the queue's only closer, so a silent
+  stand-down for a holder that no longer exists means nothing closes 8103 at all. Inspect, file a
+  DecisionRecord naming the orphan (the `write-decision` verb this skill already uses for parked
+  decisions), print it, **then** exit:
+
+  ```bash
+  python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-show \
+    --name recon-watcher-<project>
+
+  python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py write-decision \
+    --id recon-watcher-lease-orphan-<project> --project <project> \
+    --text "recon-watcher-<project> lease held by orphaned holder <holder_slug> (pid <holder_pid> not running, heartbeat <n>s ago); the 8103 queue has no live closer until it is reclaimed" \
+    --session-id "recon-watcher-<project>-${CLAUDE_PID:-$PPID}"
+  ```
+
+  Never force-release on this evidence alone: a dead-*looking* holder that is merely quiet is the
+  duplicate-spawn incident. Reclaiming is the human's call, or the reaper's once the TTL expires.
+
+**Reading the contention message.** It names two INDEPENDENT axes — whether the holder's *pid* is
+running, and how fresh its *heartbeat* is:
+
+```
+lease held by recon-watcher-df-1348600 (pid 1348600 alive, heartbeat 42s ago) — standing down
+lease held by recon-watcher-df-1348600 (pid 1348600 is not running, but its heartbeat is FRESH —
+42s ago; the lease is still held and is NOT reclaimable for another 7158s) — standing down
+```
+
+A fresh heartbeat means you **stand down** even when the pid reads as not running: staleness needs
+BOTH a dead pid AND a heartbeat past the TTL.
+
+**Heartbeat + release.** Touch the lease every Main Loop cycle (see "Starting the watcher" below),
+and release it when the session ends. Both verbs **require** the slug you claimed with — a mismatch
+is refused, so no other session can evict your lease or keep a dead one alive:
+
+```bash
+python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-release \
+  --name recon-watcher-<project> --slug "recon-watcher-<project>-${CLAUDE_PID:-$PPID}"
+```
+
+Both print `result=<applied|forced|absent|refused|faulted>` first: `applied` = done; `absent` = no
+such lease (idempotent); `refused` = you are not the holder and **nothing happened** — inspect with
+`lease-show --name recon-watcher-<project>` rather than reflexively re-running with `--force`
+(operator recovery only, logged loudly naming both parties); `faulted` = a substrate error, logged
+and swallowed. Use `lease-show`, never `cat`: the body carries an immutable `start_ts` and cannot
+show freshness, because the heartbeat is the file's mtime.
+
 ## The Main Loop
 
 ```
@@ -134,6 +223,18 @@ a severity, highest **`dedupe_count`** first (recurrence = persistence = signal)
 cd $DARK_FACTORY_ROOT && scripts/watcher-rearm.sh \
   --queue-dir $DARK_FACTORY_ROOT/data/reconciliation/escalations --timeout 3600
 ```
+
+**Lease heartbeat (each cycle):** each time you (re)start this watcher subprocess, also touch the
+`recon-watcher-<project>` lease claimed at session startup, so a second session's `lease-claim`
+observes this one as alive and stands down:
+
+```bash
+python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-heartbeat \
+  --name recon-watcher-<project> --slug "recon-watcher-<project>-${CLAUDE_PID:-$PPID}"
+```
+
+`result=refused` means your heartbeat did **not** land (you are not the holder) — investigate with
+`lease-show`, don't re-run with `--force`.
 
 Run as a **background task** (`run_in_background`). `scripts/watcher-rearm.sh` is
 the canonical bounded-wait + re-arm wrapper around `escalation.watcher`, shared

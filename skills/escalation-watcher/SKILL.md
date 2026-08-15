@@ -115,6 +115,13 @@ headless `escalation-watcher-auto` rotation (L1) never claims or contends this l
 single-owner-per-session actor). If you are running as `escalation-watcher-auto`, skip this section
 entirely.
 
+The split is by SHAPE, not by queue: an interactive, hand-launched, single-owner-per-session watcher
+claims a lease; a supervised always-on rotation does not. So `recon-escalation-watcher` — likewise
+hand-launched, unsupervised, and the sole closer of the 8103 queue — claims its own
+`recon-watcher-<project>` lease under the same contract (task 3994; see
+`skills/recon-escalation-watcher/SKILL.md` §"Claiming the Recon Watcher Lease"). Separate lease
+names, so the two watchers never contend with each other.
+
 **Fail-soft (fail-open).** A lease-substrate fault (disk error, unwritable `~/.claude/fleet/`, …) is
 logged loudly by `session_registry` and reported back as `decision=proceed` — never a false
 `stand-down`. A lease fault must never block a watch session from starting.
