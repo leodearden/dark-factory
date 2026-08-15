@@ -1425,13 +1425,40 @@ class TestHarnessInjectedTurnFilter:
         assert mod.iter_user_turns(records) == []
 
     def test_memory_unavailable_context_variant_is_excluded(self):
-        # briefing.py:1113's exception path emits a '## Context' sub-block;
-        # '## Context' is therefore an ANCHOR too, not just '# Context'.
+        # The REAL memory-unavailable shape, as it actually reaches a user
+        # turn. ``_get_memory_context``'s exception and no-context early
+        # returns emit '# Context' with a SINGLE hash (briefing.py:1325,
+        # :1328, :1330, :1331) -- the literal '## Context' is emitted
+        # nowhere in briefing.py. build_architect_prompt (:355-375) then
+        # composes that block as
+        # '{context}\n\n{identity}\n\n# Task\n\n...\n\n# Action\n\n...',
+        # so the injected turn carries 3 anchors plus 1 corroborator.
         records = [_user_text(
-            '## Context\n\n_Memory unavailable._\n\n## Project Context\n\nx\n'
+            '# Context\n\n_Memory unavailable — proceed with codebase '
+            'exploration._\n\n'
+            '## Agent Identity\n\n'
+            '- **agent_id:** `claude-task-3610-implementer`\n\n'
+            '# Task\n\ndo the thing\n\n'
+            '# Action\n\ngo\n'
         )]
 
         assert mod.iter_user_turns(records) == []
+
+    def test_human_double_hash_context_plus_conventions_is_retained(self):
+        # '## Context' is NOT a briefing anchor: briefing.py emits only the
+        # single-hash '# Context' (:1325/:1328/:1330/:1331/:1350), while
+        # '## Context' + '## Conventions' is a common human-authored
+        # markdown shape in this repo's own plans/ and docs/ prose. Treating
+        # it as an anchor silently drops a genuine human correction from the
+        # gold user_corrections section -- the exact pathology the
+        # instrument exists to prevent.
+        text = (
+            '## Context\n\nWe are debugging the merge worker.\n\n'
+            '## Conventions\n\nplease stop using tabs, this is wrong'
+        )
+
+        assert mod.is_harness_injected_turn(text) is False
+        assert len(mod.iter_user_turns([_user_text(text)])) == 1
 
     def test_task_plus_action_is_excluded(self):
         # The role prompt templates emit '# Task' and '# Action'
