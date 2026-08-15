@@ -35,8 +35,9 @@ from unittest.mock import AsyncMock
 import pytest
 from _recording_event_store import _RecordingEventStore
 
+from orchestrator import scheduler as scheduler_module
 from orchestrator.config import OrchestratorConfig
-from orchestrator.scheduler import Scheduler
+from orchestrator.scheduler import Scheduler, _BackfillGrant
 
 FIXED_DT = datetime(2026, 8, 1, 0, 0, 0, tzinfo=UTC)
 
@@ -1048,3 +1049,179 @@ def test_the_ast_scanners_can_actually_find_their_targets(tmp_path):
 
     assert [(line, fn) for _f, line, fn in _call_sites(probe, 'install_parks')] == [(3, 'f')]
     assert [(line, fn) for _f, line, fn in _emit_sites(probe, 'reservation_expired')] == [(5, 'f')]
+
+
+# ===========================================================================
+# Overstay settlement at release
+# ===========================================================================
+#
+# Admission promised a bound; release is where that promise is judged.  The
+# comparison is realized-vs-bound, and BOTH numbers ride on the event, so no
+# operator has to reconstruct the arithmetic from log lines to see why a hold
+# counted as a breach (INV-2).
+#
+# The clock is settable, so every realized duration below is exact.
+
+
+def _record_grant(
+    scheduler: Scheduler,
+    task_id: str = 'c',
+    *,
+    predicted_hold: float = 200.0,
+    admission_bound: float = 500.0,
+) -> None:
+    """Record one grant as a dispatch would, at the clock's current instant."""
+    scheduler._record_backfill_grant(
+        _BackfillGrant(
+            task_id=task_id,
+            modules=('mod-c',),
+            park_owners=('p',),
+            predicted_hold=predicted_hold,
+            safety_factor=2.5,
+            admission_bound=admission_bound,
+            provable_assembly_delay=900.0,
+        )
+    )
+
+
+def _settled_after(seconds: float, **grant_kwargs):
+    """Grant at T, release at T + *seconds*; return ``(scheduler, store)``."""
+    clock = _Clock()
+    store = _RecordingEventStore()
+    scheduler = _make_scheduler(clock=clock, event_store=store)
+    assert scheduler.lock_table.try_acquire('c', ['mod-c'])
+    _record_grant(scheduler, **grant_kwargs)
+    clock.now = FIXED_DT + timedelta(seconds=seconds)
+    scheduler.release('c')
+    return scheduler, store
+
+
+def test_a_hold_inside_the_bound_is_not_an_overstay():
+    """400s realized against a 500s bound → nothing fired."""
+    scheduler, store = _settled_after(400.0)
+
+    assert _events(store, 'park_backfill_overstay') == []
+    assert scheduler._backfill_overstay_total == 0
+
+
+def test_a_hold_exactly_at_the_bound_is_not_an_overstay():
+    """Meeting the bound is not breaching it.
+
+    The bound is what admission PROMISED, so ``realized > bound`` is the
+    breach test.  Landing exactly on it is the best possible outcome for a
+    prediction, and counting it as a breach would inflate the measured rate
+    the safety factor is meant to be tuned from.
+    """
+    scheduler, store = _settled_after(500.0)
+
+    assert _events(store, 'park_backfill_overstay') == []
+    assert scheduler._backfill_overstay_total == 0
+
+
+def test_a_hold_past_the_bound_emits_one_overstay_with_predicted_and_realized():
+    """900s realized against a 500s bound → one event, 400s over."""
+    scheduler, store = _settled_after(900.0)
+
+    overstays = _events(store, 'park_backfill_overstay')
+    assert len(overstays) == 1
+    assert overstays[0]['task_id'] == 'c'
+    data = overstays[0]['data']
+    assert data['predicted_hold'] == pytest.approx(200.0)
+    assert data['safety_factor'] == pytest.approx(2.5)
+    assert data['admission_bound'] == pytest.approx(500.0)
+    assert data['realized_hold'] == pytest.approx(900.0)
+    assert data['overstay_secs'] == pytest.approx(400.0)
+    assert data['park_owners'] == ['p']
+    assert scheduler._backfill_overstay_total == 1
+
+
+def test_releasing_a_task_that_never_backfilled_settles_nothing():
+    """No grant, no event, no counter movement."""
+    clock = _Clock()
+    store = _RecordingEventStore()
+    scheduler = _make_scheduler(clock=clock, event_store=store)
+    assert scheduler.lock_table.try_acquire('ordinary', ['mod-x'])
+
+    clock.now = FIXED_DT + timedelta(seconds=99999.0)
+    scheduler.release('ordinary')
+
+    assert _events(store, 'park_backfill_overstay') == []
+    assert scheduler._backfill_grants_total == 0
+    assert scheduler._backfill_overstay_total == 0
+
+
+def test_the_grant_is_popped_so_a_second_release_double_counts_nothing():
+    """Settlement consumes the grant.
+
+    Release is called from more than one path (and defensively re-called on
+    cleanup), so a grant left in place would let one breach be counted twice
+    and quietly inflate the rate that drives the escalation.
+    """
+    scheduler, store = _settled_after(900.0)
+    assert scheduler._backfill_overstay_total == 1
+
+    scheduler.release('c')
+
+    assert len(_events(store, 'park_backfill_overstay')) == 1
+    assert scheduler._backfill_overstay_total == 1
+    assert 'c' not in scheduler._backfill_grants
+
+
+def test_the_rate_denominator_is_grants_not_releases():
+    """Three grants, one breach → 3 and 1."""
+    clock = _Clock()
+    store = _RecordingEventStore()
+    scheduler = _make_scheduler(clock=clock, event_store=store)
+    for index, realized in enumerate((100.0, 900.0, 200.0)):
+        task_id = f'c{index}'
+        assert scheduler.lock_table.try_acquire(task_id, [f'mod-{index}'])
+        clock.now = FIXED_DT
+        _record_grant(scheduler, task_id)
+        clock.now = FIXED_DT + timedelta(seconds=realized)
+        scheduler.release(task_id)
+
+    assert scheduler._backfill_grants_total == 3
+    assert scheduler._backfill_overstay_total == 1
+
+
+def test_the_live_grant_map_is_bounded():
+    """One more grant than the cap evicts the OLDEST, never grows past it.
+
+    A grant whose owner never releases in this process era (crash, lost
+    release) would otherwise leak an entry forever.  Same discipline as the
+    bounded live-open map in the predictor: a leak backstop, not a policy
+    limit — max_concurrent_tasks keeps the real population orders of
+    magnitude below the cap.
+    """
+    clock = _Clock()
+    scheduler = _make_scheduler(clock=clock)
+    cap = scheduler_module._BACKFILL_GRANTS_MAX
+    for index in range(cap):
+        _record_grant(scheduler, f'c{index}')
+    assert len(scheduler._backfill_grants) == cap
+    assert 'c0' in scheduler._backfill_grants
+
+    _record_grant(scheduler, 'one-too-many')
+
+    assert len(scheduler._backfill_grants) == cap
+    assert 'c0' not in scheduler._backfill_grants, 'the OLDEST entry is the one evicted'
+    assert 'one-too-many' in scheduler._backfill_grants
+
+
+def test_an_unreleased_grant_is_silently_lost_with_the_process_era():
+    """No release, no settlement — and no exception either.
+
+    In-memory grants share the fate of in-memory hold spans: a process era
+    ends and they go with it.  That is a deliberate non-event, not an error
+    condition to raise on.
+    """
+    clock = _Clock()
+    store = _RecordingEventStore()
+    scheduler = _make_scheduler(clock=clock, event_store=store)
+    _record_grant(scheduler, 'never-released')
+
+    clock.now = FIXED_DT + timedelta(seconds=99999.0)
+
+    assert 'never-released' in scheduler._backfill_grants
+    assert _events(store, 'park_backfill_overstay') == []
+    assert scheduler._backfill_overstay_total == 0
