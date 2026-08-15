@@ -9806,6 +9806,69 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         """
         self._runner_unavailable.pop(host, None)
 
+    def _host_states_block(self) -> list[dict]:
+        """Per-host slot state + quarantine classification for :meth:`snapshot`.
+
+        One dict per host the allocator manages, in allocator order (local
+        first), each with a **uniform schema** — every key always present,
+        ``None`` where not applicable::
+
+            {name, is_local, slot_state, quarantined,
+             quarantine_class, unavailable_since, streak, reason}
+
+        The allocator owns slot state and quarantine membership
+        (:meth:`~orchestrator.verify_runner.HostAllocator.host_states`); the
+        RunnerUnavailable streak tracker is worker-owned, so the RU enrichment
+        is applied here rather than pushed down into the allocator.
+
+        Notes
+        -----
+        - ``quarantine_class`` is derived with the SAME predicate
+          :meth:`_reprobe_quarantined_hosts` uses to tell the two quarantine
+          origins apart — ``name in self._runner_unavailable``, i.e. its
+          ``entry = self._runner_unavailable.get(name); if entry is None:
+          continue`` skip under the comment "Skip divergence-quarantined hosts
+          — not tracked as RunnerUnavailable".  Sharing the predicate means
+          this snapshot and the reprobe path can never disagree about whether
+          a quarantined host is RU-recoverable (``'ru'``) or held for verdict
+          divergence (``'divergence'``, cleared only by an operator).
+        - ``unavailable_since`` / ``streak`` / ``reason`` are populated whenever
+          the host is RU-tracked, **independent of quarantine**, so a host
+          accumulating failures below the quarantine threshold is visible too.
+        - The ``isinstance`` gate is a TYPE check, not a defensive fail-soft:
+          :meth:`_ensure_host_allocator` always constructs a real
+          :class:`~orchestrator.verify_runner.HostAllocator` and nothing else is
+          ever assigned in production, so the ``[]`` branch is unreachable
+          there.  It exists solely because ``_host_allocator`` carries a
+          ``MagicMock`` double at 79 assignment sites across 15 test files;
+          those doubles answer every attribute, so ``hasattr``/duck-typing
+          would let them crash or inject garbage into this read-only path.
+        - ``[]`` therefore also means "allocator not built yet (no verify
+          dispatched)".  Deliberately NOT a fabricated ``local`` entry — an
+          absent allocator is a distinct fact from an idle one.
+        """
+        if not isinstance(self._host_allocator, HostAllocator):
+            return []
+
+        out: list[dict] = []
+        for st in self._host_allocator.host_states():
+            name = st['name']
+            ru = self._runner_unavailable.get(name)
+            quarantined = bool(st['quarantined'])
+            out.append({
+                'name': name,
+                'is_local': st['is_local'],
+                'slot_state': st['slot_state'],
+                'quarantined': quarantined,
+                'quarantine_class': (
+                    ('ru' if ru is not None else 'divergence') if quarantined else None
+                ),
+                'unavailable_since': ru.first_unavailable_at if ru is not None else None,
+                'streak': ru.streak if ru is not None else None,
+                'reason': ru.reason if ru is not None else None,
+            })
+        return out
+
     async def _reprobe_quarantined_hosts(self, now: float) -> None:
         """Probe each RU-quarantined remote host and clear on recovery.
 
@@ -11778,6 +11841,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             verify_age_secs measures time since dispatch, which includes host-acquisition
             latency — it is NOT pure verify time.
           occupancy: {hosts_total, hosts_busy, by_host} — per-host in-flight count.
+          hosts: list of per-host state dicts (task 3275), one per host the
+            allocator manages, in allocator order (local first), each
+            {name, is_local, slot_state, quarantined, quarantine_class,
+            unavailable_since, streak, reason} — uniform schema, None where
+            N/A.  [] when no allocator has been built yet (no verify
+            dispatched).  This is what makes an under-full `verifying N/M
+            hosts` line diagnosable; the four causes and their discriminators:
+              - RU-quarantined         : quarantine_class == 'ru' (auto-recovers
+                                         via _reprobe_quarantined_hosts)
+              - divergence-quarantined : quarantine_class == 'divergence'
+                                         (operator-cleared only)
+              - leaked slot            : slot_state busy|parked with no matching
+                                         occupancy.inflight_by_host occupant
+              - free, never asked for  : slot_state == 'free', quarantined False
           is_wip_halted: bool.
           halt_owner_esc_id: str or None.
           owned_merge_worktrees: sorted resolved absolute path strings for this
@@ -12062,6 +12139,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             'is_wip_halted': self.is_wip_halted,
             'halt_owner_esc_id': self.halt_owner_esc_id,
             'occupancy': occupancy,
+            # 3275 additive key: per-host slot state + quarantine class.
+            # Backward-compatible (no collision with the existing key set);
+            # pure synchronous read via HostAllocator.host_states() — no await,
+            # no I/O.  [] when the allocator has not been built yet.
+            'hosts': self._host_states_block(),
             # δ/1889 additive key: per-suffix conflict relation (backward-compatible).
             # Populated by recompute_suffix_conflict_graph() after each drain.
             # Read here synchronously — no await; the expensive async build is

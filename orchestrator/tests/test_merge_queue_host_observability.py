@@ -27,7 +27,6 @@ Steps covered:
 from __future__ import annotations
 
 import asyncio
-import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -38,7 +37,6 @@ from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_queue import (
     DecidedItem,
     InflightEntry,
-    ItemLifecycleState,
     MergeOutcome,
     MergeRequest,
     SpeculativeMergeWorker,
