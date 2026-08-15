@@ -7,10 +7,13 @@ block's own final paragraph is the non-steward level gate: "``level=1`` is the
 STEWARD's route, not yours ... Filing at level 1 to jump the queue buys no
 faster resolution, only an audit trail showing you bypassed your handler." So
 the LAST thing the steward read about escalation levels reframed the very
-recourse its own body mandates four times — roles.py :1456-1461 (Rule 2,
-be-conservative), :1472-1475 (Rule 6, wip_conflict/unmerged_state, the
-never-auto-resolve class), :1505 (MAX_TURNS), :1522-1524 (CLI_INPUT_REJECTED)
-— as a queue-jumping bypass rather than the mandated recourse it actually is.
+recourse its own body mandates four times — in STEWARD's own prompt body, at
+Rule 2 (be conservative), Rule 6 (wip_conflict/unmerged_state, the
+never-auto-resolve class), and the MAX_TURNS and CLI_INPUT_REJECTED
+classification entries — as a queue-jumping bypass rather than the mandated
+recourse it actually is. (Cite these sites by name, not line number: roles.py
+churns and a hand-copied offset goes stale silently -- see
+test_roles_wait_pattern.py's module docstring for the prior incident.)
 
 The fix splits the literal at its existing blank line into
 ``ESCALATION_LADDER_CORE`` (the mechanics: what ``escalate_info`` /
@@ -40,10 +43,12 @@ from orchestrator.agents.roles import (
 )
 
 # The one role whose own prompt body mandates `escalate_blocker(..., level=1)`
-# re-escalation -- roles.py :1456-1461, :1472-1475, :1505, :1522-1524. This is
-# the role the fix is FOR: it must keep reading the ladder mechanics
-# (ESCALATION_LADDER_CORE) but must stop reading the non-steward gate telling
-# it that its own mandated recourse is a queue-jumping bypass.
+# re-escalation -- at Rule 2 (be conservative), Rule 6
+# (wip_conflict/unmerged_state), and the MAX_TURNS and CLI_INPUT_REJECTED
+# classification entries. This is the role the fix is FOR: it must keep
+# reading the ladder mechanics (ESCALATION_LADDER_CORE) but must stop reading
+# the non-steward gate telling it that its own mandated recourse is a
+# queue-jumping bypass.
 _L1_FILER_ROLES = ('steward',)
 
 # The six roles that carry the full pre-split block today (grep-verified against
@@ -96,9 +101,9 @@ def test_l1_filer_roles_carry_the_ladder_core() -> None:
     assert offenders == [], (
         f'Role(s) missing ESCALATION_LADDER_CORE from system_prompt: {offenders}. '
         'These roles mandate `escalate_blocker(..., level=1)` re-escalation in '
-        'their own body (roles.py :1456-1461, :1472-1475, :1505, :1522-1524) and '
-        'need the ladder mechanics to know what level=1 does and that only 0 and '
-        '1 are accepted.'
+        'their own body (Rule 2 be-conservative, Rule 6 wip_conflict/unmerged_state, '
+        'MAX_TURNS, CLI_INPUT_REJECTED) and need the ladder mechanics to know what '
+        'level=1 does and that only 0 and 1 are accepted.'
     )
 
 
@@ -108,11 +113,11 @@ def test_l1_filer_roles_omit_the_non_steward_gate() -> None:
     Before this task, STEWARD's system_prompt ended with the full
     `_ESCALATION_INSTRUCTIONS` block, so the LAST thing it read about escalation
     levels was `NON_STEWARD_LEVEL_GATE` telling it that `level=1` -- the exact
-    call its own body mandates at roles.py :1456-1461 (Rule 2), :1472-1475
-    (Rule 6, wip_conflict/unmerged_state), :1505 (MAX_TURNS), and :1522-1524
-    (CLI_INPUT_REJECTED) -- is "not yours" and "buys no faster resolution, only
-    an audit trail showing you bypassed your handler". This is both the fix and
-    the regression guard: a future refactor that re-splices the full
+    call its own body mandates at Rule 2 (be conservative), Rule 6
+    (wip_conflict/unmerged_state), and the MAX_TURNS and CLI_INPUT_REJECTED
+    classification entries -- is "not yours" and "buys no faster resolution,
+    only an audit trail showing you bypassed your handler". This is both the
+    fix and the regression guard: a future refactor that re-splices the full
     `_ESCALATION_INSTRUCTIONS` block onto the steward fails here again.
     """
     offenders = sorted(
