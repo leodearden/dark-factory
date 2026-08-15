@@ -86,9 +86,8 @@ _DECLARED_REFERENT_HINT = (
 _DECLARED_ENTRY_KEYS = frozenset({'kind', 'id', 'project_id'})
 
 #: The CLOSED vocabulary of resolution sources, in precedence order (strongest
-#: first). Exported as one tuple so task ι's declaration-rate telemetry
-#: iterates a single site rather than re-spelling four string literals; a
-#: second copy would drift the same way two copies of the label vocabulary do.
+#: first). :data:`REFERENT_SOURCES` below is its runtime form, and states why
+#: the tuple is derived from this Literal rather than re-spelled beside it.
 #:
 #: - ``'declared'``  — the caller stated its referents explicitly, INCLUDING
 #:   the empty declaration ``[]`` ("considered, none apply").
@@ -98,8 +97,8 @@ _DECLARED_ENTRY_KEYS = frozenset({'kind', 'id', 'project_id'})
 #:   outcome, not a missing value.
 ReferentSource = Literal['declared', 'metadata', 'derived', 'none']
 
-#: The CLOSED vocabulary of resolution sources, in precedence order (strongest
-#: first) — see :data:`ReferentSource` above for what each one means.
+#: The runtime form of :data:`ReferentSource` above, which names what each
+#: source means.
 #:
 #: DERIVED from the Literal rather than re-spelled beside it, so the runtime
 #: constant and the static type cannot drift apart: adding a fifth source means
@@ -323,12 +322,8 @@ def _declared_referents(declared: list[dict], *, group_id: str) -> ReferentSet:
 
     The ``kind``/``project_id`` type checks are deliberately SEPARATE from the
     ``except ValueError`` around the :class:`Referent` construction rather than
-    folded into it. ``__post_init__``'s ``self.kind not in _KIND_LABELS``
-    raises ``TypeError`` for an unhashable kind, and ``TypeError`` is not a
-    ``ValueError``, so that handler structurally cannot see it. The two-layer
-    defence is deliberate: a *str* kind still falls through to
-    ``__post_init__``, whose message names the registered kinds and where to
-    add one.
+    folded into it; the inline comment at the ``kind`` check states why that
+    two-layer defence is load-bearing rather than redundant.
     """
     if not isinstance(declared, list):
         raise InputValidationError(
@@ -540,10 +535,9 @@ def _metadata_referents(metadata: dict | None, *, group_id: str) -> ReferentSet:
         # parsed side.
         #
         # The `referent.project_id and local` guard is what keeps a foreign
-        # referent foreign when group_id is path-shaped: _local_project returns
-        # the '' sentinel there, which would otherwise compare equal to an
-        # own-project referent's empty project_id and fire the branch
-        # spuriously. Same guard, same reason, as on the declared path.
+        # referent foreign when group_id is path-shaped; :func:`_local_project`
+        # explains the '' sentinel it guards against. Same guard, same reason,
+        # as on the declared path.
         local = _local_project(group_id)
         if referent.project_id and local and referent.project_id == local:
             # Rebuilt through the constructor rather than dataclasses.replace,
