@@ -551,7 +551,12 @@ def worktree_base_for(repo: Path) -> Path:
 # imported from verify_cancel: task 4195 will retune those constants
 # (deriving the timeout from SSH_SERVER_ALIVE_INTERVAL *
 # SSH_SERVER_ALIVE_COUNT_MAX, toward ~60s+), and tracking them here would
-# silently multiply this module's runtime (Row 3 from ~17s to ~70s).
+# silently multiply this module's runtime (Row 3 from ~17s to ~70s).  The
+# pin is now STRUCTURAL, not just asserted: the literals live on
+# ROW_WATCHDOG_HEARTBEAT_TIMEOUT_SECS / ROW_WATCHDOG_KILL_GRACE_SECS below,
+# nothing here imports verify_cancel, and ROW_TREE_KILL_CEILING_SECS /
+# ROW_PER_TEST_TIMEOUT_SECS are computed from those two floats, so they can
+# no longer drift out of step with the window.
 #
 # This REPLACES a prior test-only 1.0s/0.5s tightening that bought speed and
 # no coverage, and was the measured cause of the "no descendant appeared
@@ -567,84 +572,41 @@ def worktree_base_for(repo: Path) -> Path:
 # Do not try to buy margin by pre-buffering heartbeats -- run_stdin_watchdog
 # drains with a single read(4096) per select, so a burst resets exactly one
 # window, not N.
+ROW_WATCHDOG_HEARTBEAT_TIMEOUT_SECS: float = 10.0
+ROW_WATCHDOG_KILL_GRACE_SECS: float = 5.0
+
+#: Worst-case time to fire and finish killing the tree.  Row 3 takes
+#: run_stdin_watchdog's select-TIMEOUT branch and pays the full sum; Rows
+#: 1/2 take the EOF branch and pay only the grace.
+ROW_WATCHDOG_WINDOW_SECS: float = (
+    ROW_WATCHDOG_HEARTBEAT_TIMEOUT_SECS + ROW_WATCHDOG_KILL_GRACE_SECS
+)  # 15.0
+
 ROW_WATCHDOG_ENV: dict[str, str] = {
-    'ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS': '10.0',
-    'ORCH_WATCHDOG_KILL_GRACE_SECS': '5.0',
+    'ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS': str(ROW_WATCHDOG_HEARTBEAT_TIMEOUT_SECS),
+    'ORCH_WATCHDOG_KILL_GRACE_SECS': str(ROW_WATCHDOG_KILL_GRACE_SECS),
 }
 
-#: Shared ceiling for the rows' child.wait()/wait_subtree_gone() polls -- 2x
-#: the pinned 15s (10.0+5.0) worst-case fire window.  A WEDGE-DETECTOR, not a
-#: speed assertion: the rows assert THAT the tree was killed, never how fast,
-#: so on the success path a wider ceiling costs zero wall-clock (the poll
-#: returns as soon as the condition holds) and is paid only when the test is
-#: already failing.
-ROW_TREE_KILL_CEILING_SECS: float = 30.0
+#: Ceiling for the rows' child.wait()/wait_subtree_gone() polls: the full
+#: window plus load headroom.  A WEDGE-DETECTOR, not a speed assertion (the
+#: rows assert THAT the tree was killed, never how fast), so on the success
+#: path a wider ceiling costs zero wall-clock and is paid only when the test
+#: is already failing.
+ROW_TREE_KILL_CEILING_SECS: float = ROW_WATCHDOG_WINDOW_SECS + 15.0  # 30.0
 
-#: Per-test opt-out from this module's inherited ``timeout = 60``
+#: Worst-case BOUNDED work in a row on the failure path: both
+#: ceiling-bounded waits run to full ceiling on top of one complete window.
+_ROW_WORST_CASE_BOUNDED_SECS: float = (
+    2 * ROW_TREE_KILL_CEILING_SECS + ROW_WATCHDOG_WINDOW_SECS
+)  # 75.0
+
+#: Per-test opt-out from this module's inherited `timeout = 60`
 #: (orchestrator/pyproject.toml:103, thread-mode -- os._exit()s the xdist
-#: worker on expiry).  These rows' worst case is two
-#: ROW_TREE_KILL_CEILING_SECS-bounded waits plus one full watchdog window,
-#: which would otherwise risk that 60s ceiling under full-suite load.
-ROW_PER_TEST_TIMEOUT_SECS: int = 120
+#: worker on expiry).  2x the bounded worst case, because this module's own
+#: comment (~:870-879) records ~15x elasticity on `from orchestrator.cli
+#: import main` under a full-suite storm.
+ROW_PER_TEST_TIMEOUT_SECS: int = int(2 * _ROW_WORST_CASE_BOUNDED_SECS)  # 150
 # ---------------------------------------------------------------------------
-
-
-def test_row_watchdog_window_is_pinned_and_ceilings_clear_it():
-    """ROW_WATCHDOG_ENV is pinned (not derived) and the row ceilings clear it.
-
-    Three assertions, all pure arithmetic on the module constants that the
-    SS9 Row 1/2/3 tests below consume -- no subprocess, no sleep, no wall
-    clock, so a future edit that raises the window without widening the
-    ceilings (or vice versa) is caught in microseconds rather than only
-    after ~30s of real subprocess work per row on a full verify leg:
-
-    1. ROW_WATCHDOG_ENV is an exact-equality pin on the literals '10.0'/
-       '5.0' -- these must NEVER be derived from
-       ``verify_cancel.WATCHDOG_HEARTBEAT_TIMEOUT_SECS`` /
-       ``WATCHDOG_KILL_GRACE_SECS``, because task 4195 is filed to raise the
-       production timeout toward ~60s+ and tracking it here would silently
-       multiply this module's runtime (Row 3 from ~17s to ~70s).
-    2. ROW_TREE_KILL_CEILING_SECS clears the worst-case watchdog fire window
-       (Row 3's select-timeout branch: heartbeat_timeout + grace_secs) with
-       at least 10s of load headroom.
-    3. ROW_PER_TEST_TIMEOUT_SECS clears two ceiling-bounded waits
-       (``child.wait`` then ``wait_subtree_gone``) plus one full watchdog
-       window -- the module inherits ``timeout = 60`` from
-       ``orchestrator/pyproject.toml``, whose thread-mode expiry
-       ``os._exit()``s the xdist worker rather than just failing this test.
-    """
-    assert ROW_WATCHDOG_ENV == {
-        'ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS': '10.0',
-        'ORCH_WATCHDOG_KILL_GRACE_SECS': '5.0',
-    }, (
-        'ROW_WATCHDOG_ENV must be pinned to the literals 10.0/5.0, not '
-        'derived from verify_cancel.WATCHDOG_HEARTBEAT_TIMEOUT_SECS / '
-        'WATCHDOG_KILL_GRACE_SECS -- task 4195 will raise the production '
-        "timeout toward ~60s+ and tracking it here would silently multiply "
-        "this module's runtime (Row 3 from ~17s to ~70s)"
-    )
-
-    window = (
-        float(ROW_WATCHDOG_ENV['ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS'])
-        + float(ROW_WATCHDOG_ENV['ORCH_WATCHDOG_KILL_GRACE_SECS'])
-    )
-    assert window + 10.0 <= ROW_TREE_KILL_CEILING_SECS, (
-        f'ROW_TREE_KILL_CEILING_SECS ({ROW_TREE_KILL_CEILING_SECS}) must '
-        f'clear the worst-case watchdog fire window ({window}s, Row 3\'s '
-        f'select-timeout branch) with at least 10s of load headroom, or the '
-        f"rows' child.wait()/wait_subtree_gone() ceilings fail "
-        f'DETERMINISTICALLY -- but only after ~30s of real subprocess work '
-        f'per row on a full verify leg'
-    )
-
-    assert 2 * ROW_TREE_KILL_CEILING_SECS + window <= ROW_PER_TEST_TIMEOUT_SECS, (
-        f'ROW_PER_TEST_TIMEOUT_SECS ({ROW_PER_TEST_TIMEOUT_SECS}) must clear '
-        f'two ceiling-bounded waits (child.wait then wait_subtree_gone, '
-        f'{ROW_TREE_KILL_CEILING_SECS}s each) plus one full watchdog window '
-        f'({window}s) -- the module inherits timeout = 60 from '
-        f'orchestrator/pyproject.toml, whose thread-mode expiry os._exit()s '
-        f'the xdist worker rather than just failing this one test'
-    )
 
 
 # ---------------------------------------------------------------------------
