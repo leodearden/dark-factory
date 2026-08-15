@@ -189,10 +189,27 @@ def build_harness(
     policy: RepairPolicy,
     *,
     exempt_tools: frozenset[str] = frozenset(),
+    strict_input_validation: bool = False,
     **guard_kwargs: Any,
 ) -> Harness:
-    """Build a server whose tools mirror the real victim signatures."""
-    mcp = FastMCP('markup-guard-harness')
+    """Build a server whose tools mirror the real victim signatures.
+
+    ``strict_input_validation`` is not a knob any caller of this harness is
+    expected to turn — it is the NEGATIVE half of PRD boundary row B14: the one
+    configuration under which ``on_call_tool`` never runs at all, because
+    ``fastmcp/server/mixins/mcp_operations.py:77`` registers the SDK handler
+    with ``validate_input=self.strict_input_validation`` and
+    ``mcp/server/lowlevel/server.py:528-532`` then returns an error result
+    before FastMCP's handler is ever invoked. Its default preserves today's
+    behaviour, and it is declared EXPLICITLY (and ahead of ``**guard_kwargs``)
+    so it is not swallowed and forwarded to the middleware constructor, which
+    would raise an unexpected-keyword TypeError.
+    """
+    # Verified against fastmcp 3.2.2 (fastmcp/server/server.py:371-374): this is
+    # the real constructor kwarg, and it resolves to an instance attribute.
+    mcp = FastMCP(
+        'markup-guard-harness', strict_input_validation=strict_input_validation
+    )
     rec = _Recorder()
     facts: list[Any] = []
     escalations: list[Any] = []
