@@ -37,7 +37,12 @@ from typing import Any
 
 import _orch_helpers
 import pytest
-from _orch_helpers import MERGE_RESULT_TIMEOUT, RESPONSIVE_WAIT_WALL_CAP, wait_responsive
+from _orch_helpers import (
+    MERGE_RESULT_TIMEOUT,
+    RESPONSIVE_WAIT_STRETCH,
+    RESPONSIVE_WAIT_WALL_CAP,
+    wait_responsive,
+)
 
 # Tiny injected bounds: this whole module must run in ~a second.
 SLICE = 0.02
@@ -122,6 +127,91 @@ class TestWaitResponsiveHappyPath:
         # per-method budget in test_merge_speculation.py (125s x 2 = 250s)
         # provably clear HEAVY_BARRIER_TEST_TIMEOUT (300s).
         assert RESPONSIVE_WAIT_WALL_CAP == 2 * MERGE_RESULT_TIMEOUT
+        assert int(RESPONSIVE_WAIT_STRETCH * MERGE_RESULT_TIMEOUT) == RESPONSIVE_WAIT_WALL_CAP
+
+
+@pytest.mark.asyncio
+class TestWaitResponsiveDefaultCapScalesWithNominal:
+    """The default ``max_wall_s`` must SCALE with the caller's ``timeout``.
+
+    Reviewer finding on esc-3980-3: while the default was the flat
+    ``RESPONSIVE_WAIT_WALL_CAP`` (90s), a site passing
+    ``timeout=MERGE_GATE_BARRIER_TIMEOUT`` (15s) could consume 90s of wall
+    clock while ``_call_wait_budget`` in test_merge_queue_concurrent_verify.py
+    billed it ``min(15 * RESPONSIVE_WAIT_STRETCH, 90)`` = 30s.  That made the
+    AST auditor an UNDER-count rather than an upper bound, and the true worst
+    case for TestLateArrivalCleanCAS 365s against a 300s
+    ``@pytest.mark.timeout`` -- an ``os._exit()`` of the xdist worker.
+
+    These tests are discriminating: each fails against the old flat default.
+    """
+
+    async def test_small_nominal_gives_up_at_the_scaled_cap_not_the_flat_one(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        clock = _StarvationClock(STARVE)
+        monkeypatch.setattr(_orch_helpers, '_monotonic', clock)
+
+        fut: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+        nominal = 1.0  # far below RESPONSIVE_WAIT_WALL_CAP / RESPONSIVE_WAIT_STRETCH
+
+        with pytest.raises(pytest.fail.Exception) as excinfo:
+            await wait_responsive(
+                fut,
+                timeout=nominal,
+                label='scaled-cap',
+                slice_s=SLICE,
+                # max_wall_s deliberately NOT passed: the default is under test.
+            )
+        fut.cancel()
+
+        message = str(excinfo.value)
+        expected_cap = RESPONSIVE_WAIT_STRETCH * nominal
+        assert _reported(message, 'cap') == pytest.approx(expected_cap)
+        # The wait ended at the SCALED cap, nowhere near the flat 90s ceiling.
+        assert _reported(message, 'wall') < float(RESPONSIVE_WAIT_WALL_CAP)
+
+    async def test_large_nominal_is_still_bounded_by_the_absolute_ceiling(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        clock = _StarvationClock(STARVE)
+        monkeypatch.setattr(_orch_helpers, '_monotonic', clock)
+
+        fut: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+
+        with pytest.raises(pytest.fail.Exception) as excinfo:
+            await wait_responsive(
+                fut,
+                # A nominal whose stretch would blow past the absolute ceiling.
+                timeout=10.0 * RESPONSIVE_WAIT_WALL_CAP,
+                label='ceiling-bounded',
+                slice_s=SLICE,
+            )
+        fut.cancel()
+
+        message = str(excinfo.value)
+        assert _reported(message, 'cap') == pytest.approx(float(RESPONSIVE_WAIT_WALL_CAP))
+
+    async def test_explicit_max_wall_s_still_wins_over_the_scaled_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        clock = _StarvationClock(STARVE)
+        monkeypatch.setattr(_orch_helpers, '_monotonic', clock)
+
+        fut: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+        explicit = 7.5
+
+        with pytest.raises(pytest.fail.Exception) as excinfo:
+            await wait_responsive(
+                fut,
+                timeout=1000.0,
+                label='explicit-cap',
+                slice_s=SLICE,
+                max_wall_s=explicit,
+            )
+        fut.cancel()
+
+        assert _reported(str(excinfo.value), 'cap') == pytest.approx(explicit)
 
 
 @pytest.mark.asyncio

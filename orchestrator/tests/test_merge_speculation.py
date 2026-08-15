@@ -3808,9 +3808,13 @@ class TestTimeoutMarkCoverage:
 
     Task 3980 extended ``_call_wait_budget`` there to recognise
     ``wait_responsive(...)``, whose budget is charged in loop-responsive time
-    and can therefore consume up to ``RESPONSIVE_WAIT_WALL_CAP`` of real wall
-    clock -- i.e. the scanned budget for those call sites is stretched by
-    exactly 2. That stretch is why this guard has to exist BEFORE any wait in
+    and can therefore consume up to ``min(RESPONSIVE_WAIT_STRETCH * timeout,
+    RESPONSIVE_WAIT_WALL_CAP)`` of real wall clock -- i.e. the scanned budget
+    for those call sites is stretched by exactly 2, bounded by the absolute
+    ceiling. The helper computes its own default cap from that SAME formula
+    (esc-3980-3 reviewer finding: a flat default made this bill an
+    under-count for every small-nominal site), so the scan is an exact upper
+    bound on real wall clock. That stretch is why this guard has to exist BEFORE any wait in
     this file is migrated: a stretched wait under an inadequate mark is
     strictly worse than the flake it fixes.
     """

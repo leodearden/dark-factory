@@ -40,6 +40,7 @@ import pytest
 from _orch_helpers import (
     MERGE_GATE_BARRIER_TIMEOUT,
     MERGE_RESULT_TIMEOUT,
+    RESPONSIVE_WAIT_STRETCH,
     RESPONSIVE_WAIT_WALL_CAP,
 )
 
@@ -215,13 +216,17 @@ _KNOWN_WAIT_CONSTANTS: dict[str, float] = {
 
 # task 3980: a wait routed through `_orch_helpers.wait_responsive` charges its
 # budget in loop-responsive time, so its worst-case WALL clock is the nominal
-# `timeout` stretched by the ratio between the wall cap and the nominal merge
-# ceiling — exactly 2 by construction (RESPONSIVE_WAIT_WALL_CAP =
-# 2 * MERGE_RESULT_TIMEOUT).  Fixing the ratio at 2 is what lets a reviewer
-# check the paired-mark arithmetic instead of trusting a number: the worst
-# per-method budget in test_merge_speculation.py is 125s, and 125 x 2 = 250s
-# still clears HEAVY_BARRIER_TEST_TIMEOUT (300s).
-_RESPONSIVE_WAIT_STRETCH = float(RESPONSIVE_WAIT_WALL_CAP) / float(MERGE_RESULT_TIMEOUT)
+# `timeout` stretched by RESPONSIVE_WAIT_STRETCH and hard-bounded by
+# RESPONSIVE_WAIT_WALL_CAP.  IMPORTED, not re-derived: the helper computes its
+# own per-call default cap from the very same constant, so this bill is an
+# EXACT upper bound on the helper's behaviour and the two cannot drift.  (An
+# earlier revision re-derived the ratio here while the helper used a flat 90s
+# default; that under-counted every small-nominal site — the reviewer finding
+# on esc-3980-3.)  Fixing the ratio at 2 is what lets a reviewer check the
+# paired-mark arithmetic instead of trusting a number: the worst per-method
+# budget in test_merge_speculation.py is 125s, and 125 x 2 = 250s still clears
+# HEAVY_BARRIER_TEST_TIMEOUT (300s).
+_RESPONSIVE_WAIT_STRETCH = RESPONSIVE_WAIT_STRETCH
 
 
 def _resolve_wait_value(node: ast.expr | None) -> float:
