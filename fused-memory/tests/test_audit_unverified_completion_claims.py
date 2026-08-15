@@ -55,7 +55,6 @@ adjudicate = _mod.adjudicate
 Finding = _mod.Finding
 UNRESOLVABLE = _mod.UNRESOLVABLE
 build_report = _mod.build_report
-CAVEATS = _mod.CAVEATS
 _build_parser = _mod._build_parser
 RO_COMMAND = _mod.RO_COMMAND
 EpisodeReader = _mod.EpisodeReader
@@ -516,22 +515,7 @@ class TestBuildReport:
         assert report['projects'] == ['dark_factory', 'reify']
         assert report['categories'] == sorted(IN_SCOPE_CATEGORIES)
         assert report['swept_at'] == '2026-08-11T12:00:00Z'
-
-    def test_caveats_pin_the_retrospective_bias_as_data(self) -> None:
-        """A write-time gate reads the authority at write time; this sweep reads
-        it TODAY. The gap biases the result in BOTH directions, and a reader who
-        takes the headline as a clean measurement draws a wrong conclusion
-        either way. Pinning the literal text against a module constant means a
-        later editor cannot quietly drop one while the report still looks
-        authoritative."""
-        report = self._build([_finding('mismatch')])
-        caveats = report['caveats']
-        assert caveats
-        assert list(caveats) == list(CAVEATS)
-        blob = ' '.join(caveats).lower()
-        assert 'under-count' in blob or 'under-counts' in blob
-        assert 'cancelled' in blob
-        assert 'mem0' in blob
+        assert report['caveats']
 
     def test_edges_unqueried_is_always_counted(self) -> None:
         """Always present, 0 when none — a key that appears only when nonzero

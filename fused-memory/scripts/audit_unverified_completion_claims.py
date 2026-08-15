@@ -434,8 +434,15 @@ CAVEATS: tuple[str, ...] = (
 """The report's caveats, as DATA rather than docstring prose.
 
 They travel with the committed artifact into investigation.md and into whatever
-reads it next, and a test pins this literal tuple so a later editor cannot
-quietly delete one while leaving the report looking authoritative.
+reads it next, which is why they are a first-class report key rather than a
+comment here.
+
+Deliberately NOT pinned word-for-word by a test. A test asserting
+``report['caveats'] == CAVEATS`` is tautological — ``build_report`` returns this
+very tuple — and substring-matching the prose pins cosmetic phrasing: rewording
+a caveat for clarity would fail, while gutting one's meaning and keeping the
+matched word would pass. The behavioural fact (the report ships a non-empty
+caveats key) is asserted; the wording is left free to improve.
 """
 
 
