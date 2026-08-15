@@ -68,7 +68,11 @@ class _Clock:
 
 
 def _make_scheduler(
-    *, clock: _Clock | None = None, event_store=None, **config_overrides
+    *,
+    clock: _Clock | None = None,
+    event_store=None,
+    override_store=None,
+    **config_overrides,
 ) -> Scheduler:
     """A bare Scheduler on a frozen (or caller-driven) wall clock.
 
@@ -83,6 +87,7 @@ def _make_scheduler(
         config,
         wall_time_source=clock or (lambda: FIXED_DT),
         event_store=event_store,
+        override_store=override_store,
     )
 
 
@@ -979,6 +984,117 @@ async def test_the_backfiller_borrows_the_park_it_does_not_consume_it():
 #
 # AST, not text grep: a call can span lines, and the enclosing function is
 # exactly what each invariant is about.
+
+
+@pytest.mark.asyncio
+async def test_a_backfilled_dispatch_installs_no_park_and_expires_none():
+    """A backfilled dispatch creates no park and kills none.
+
+    Both PRD section 7 rejections stated as one observation of the running
+    system.  Below-rank-1 park INSTALLATION would show up as a changed park
+    stack — a new stack for the backfiller, or a new entry pushed onto p's —
+    so byte-identical stacks across the dispatch is the behavioural form of
+    "no new park was created for anyone".  A park LEASE would show up as a
+    ``reservation_expired``: ``park_age_secs`` is read here to REFUSE an
+    admission and must never become a reason to evict, so the age cutoff
+    firing (or not) can never cost p its park.
+
+    The whole reason to guard this is that a later reader holding the backfill
+    machinery has every reason to think "while we're here, park below rank 1"
+    or "parks should expire" is the natural next move.
+    """
+    clock = _Clock()
+    store = _RecordingEventStore()
+    scheduler = _make_scheduler(clock=clock, event_store=store)
+    scheduler.finish_startup()
+    tasks = _scored_world(scheduler, clock)
+    scheduler.get_tasks = AsyncMock(return_value=tasks)
+    stacks_before = scheduler.lock_table.snapshot_park_stacks()
+
+    assignment = await scheduler.acquire_next()
+    assert assignment is not None and assignment.task_id == 'c'
+
+    assert scheduler.lock_table.snapshot_park_stacks() == stacks_before, (
+        'the backfilled dispatch changed the park stacks — backfill grants '
+        'passage through an existing park, it must never install one'
+    )
+    assert 'c' not in scheduler.lock_table.snapshot_parks(), (
+        'the backfiller itself acquired a park: below-rank-1 park installation '
+        'is rejected by PRD section 7 on measured grounds'
+    )
+    assert _events(store, 'reservation_expired') == [], (
+        'a park was expired during a backfill tick — park eviction stays '
+        'owner-state-driven (task 1228), never wall-clock-driven'
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_pin_blocked_by_a_foreign_park_does_not_dispatch(tmp_path):
+    """The pin loop gets no backfill, even when admission would certify it.
+
+    C7 anchors on the scored loop.  Pins already bypass fairness entirely, so
+    admitting them through parks as well would hand the one path with no
+    fairness accounting a second override — and the safety factor exists
+    precisely to bound what the scored loop borrows.
+
+    A park-blocked pin simply falling through is not assertable on its own:
+    the SCORED loop would then pick the same task up and back-fill it there,
+    which is correct and would look identical.  So a second, free pin is
+    dispatched instead — B coming back means the pin loop fell through and
+    returned before the scored phase ever ran, which is the only way to see
+    the pin loop's own decision in isolation.
+    """
+    from orchestrator.overrides import OverrideStore
+
+    clock = _Clock()
+    store = _RecordingEventStore()
+    overrides = OverrideStore(tmp_path / 'o.db')
+    overrides.set_override('/proj', 'A', pinned=True)   # pin_order 1
+    overrides.set_override('/proj', 'B', pinned=True)   # pin_order 2
+
+    scheduler = _make_scheduler(clock=clock, event_store=store, override_store=overrides)
+    scheduler.finish_startup()
+    scheduler._project_root = '/proj'
+
+    pinned_blocked = _task('A', CANDIDATE_FILES)
+    pinned_blocked['priority'] = 'low'
+    pinned_free = _task('B', ['pkg_b/src/pkg_b/free.py'])
+    pinned_free['priority'] = 'low'
+    starver = _task('P', PARK_OWNER_FILES)
+    starver['priority'] = 'high'
+    modules_a = scheduler._get_modules(pinned_blocked)
+
+    # C7's world, built in production's order: the gap holder takes its lock
+    # before any park exists, then P parks 60s ago and cannot assemble.
+    assert scheduler.lock_table.try_acquire('h', GAP_MODULES)
+    clock.now = FIXED_DT - timedelta(seconds=60.0)
+    scheduler.lock_table.install_parks('P', scheduler._get_modules(starver), 'high')
+    clock.now = FIXED_DT
+    _feed_spans(scheduler, modules_a, list(CANDIDATE_SPANS))
+    _feed_spans(scheduler, GAP_MODULES, list(GAP_SPANS))
+    scheduler._hold_history.observe_acquired(
+        'h', GAP_MODULES, at=FIXED_DT.timestamp() - 100.0
+    )
+    # P must be a real task: park GC evicts any park whose owner is missing.
+    scheduler.get_tasks = AsyncMock(return_value=[pinned_blocked, pinned_free, starver])
+
+    # NON-VACUITY.  A behavioural probe of the predicate — not introspection —
+    # so A's absence below is provably the pin loop's scoping and not a
+    # predicate that happened to refuse for some unrelated reason.
+    assert scheduler._backfill_admission('A', pinned_blocked, modules_a) is not None, (
+        'meta: admission must certify A, or this test proves nothing about '
+        'where backfill is wired'
+    )
+
+    result = await scheduler.acquire_next()
+
+    assert result is not None
+    assert result.task_id == 'B', (
+        'the park-blocked pin dispatched anyway — the pin loop must keep '
+        'calling try_acquire with no admitted_parks'
+    )
+    assert _events(store, 'park_backfill_granted') == []
+
 
 _SRC_DIR = Path(__file__).parent.parent / 'src'
 
