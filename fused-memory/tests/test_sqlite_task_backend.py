@@ -3612,6 +3612,71 @@ async def test_v3_to_v4_reports_healed_groups_when_the_index_build_step_raises(t
         await conn.close()
 
 
+@pytest.mark.asyncio
+async def test_v3_to_v4_commits_each_healed_group_so_a_later_failure_cannot_unwind_it(
+    tmp_path,
+):
+    """A group that fully healed must be COMMITTED -- not merely reported --
+    before a later group in the same loop raises. Without a per-group
+    commit, the except handler's rollback (added so a partial heal can't
+    ride on the NEXT unrelated write) would also unwind an EARLIER
+    already-completed group's cancel from the SAME pass, while the hoisted
+    accumulator still reports it as healed -- trading the original
+    under-claim bug for an over-claim. This pins the invariant that keeps
+    the report and on-disk state in agreement: `healed` must name exactly
+    the groups whose cancels are durably committed.
+    """
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v3_db_with_dup_groups(db_path, [
+        (1, 'Alpha task', 'pending', ['a.py']),
+        (2, 'Alpha task', 'pending', ['a.py']),
+        (3, 'Beta task', 'pending', ['b.py']),
+        (4, 'Beta task', 'pending', ['b.py']),
+    ])
+
+    conn = await _open_raw_v3_conn(db_path)
+    try:
+        # One cancel target per group -- this makes the test order-
+        # independent. The audit query has no ORDER BY and SQLite does not
+        # specify GROUP BY result order (a probe against this worktree
+        # showed it iterating the 'Beta' group before 'Alpha', not the
+        # lowest-id one), but with a single cancel target per group,
+        # cancel-UPDATE #1 always belongs to whichever group is iterated
+        # first (heals fully) and #2 always belongs to the second (raises
+        # before writing anything) -- regardless of which named group that is.
+        proxy = _FailingExecuteConn(
+            conn,
+            lambda sql, p: "SET status = 'cancelled'" in sql and p.cancel_updates == 2,
+        )
+        result = await _migrate_v3_to_v4(proxy, project_root=project_root)
+
+        assert result['index_built'] is False, result
+        assert result['flagged'] == [], result
+        assert len(result['healed']) == 1, (
+            f'exactly the one fully-healed group must be reported; got {result["healed"]}'
+        )
+
+        # rollback() discards anything still pending (the second group's
+        # failed attempt); whatever survives was committed before it raised.
+        await conn.rollback()
+        status_cursor = await conn.execute("SELECT id, status FROM tasks WHERE tag='master'")
+        statuses = {row['id']: row['status'] for row in await status_cursor.fetchall()}
+        cancelled_on_disk = {tid for tid, status in statuses.items() if status == 'cancelled'}
+
+        # Catches BOTH directions at once: under-claiming (a cancel on disk
+        # that isn't reported) and over-claiming (a reported cancel that the
+        # rollback actually unwound).
+        assert cancelled_on_disk == set(result['healed'][0]['cancelled_ids']), (
+            f"reported healed group {result['healed'][0]} does not match what is "
+            f'durably on disk: cancelled_on_disk={cancelled_on_disk}'
+        )
+        # The survivor survived.
+        assert result['healed'][0]['canonical_id'] not in cancelled_on_disk, result['healed'][0]
+    finally:
+        await conn.close()
+
+
 # ── rebuild-without-restart: live re-audit (task 2402) ──────────────────
 
 
