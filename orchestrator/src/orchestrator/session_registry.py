@@ -1918,9 +1918,10 @@ logged but not fatal, so heartbeat-only behaviour must remain SURVIVABLE:
 a full quiet slice plus a full slice of margin, so a live-but-quiet holder
 is never reaped-and-reclaimed by a duplicate (the duplicate-spawn incident);
 (b) a crashed holder no longer COSTS 2h of silence -- ``lease-claim`` now
-prints ``holder_liveness=orphaned`` as soon as the holder's pid is dead and
-its session record is absent/exited, so the contender surfaces the crash on
-the very next claim instead of waiting out the TTL. Lowering it would
+prints ``holder_liveness=orphaned`` as soon as the holder's pid is not
+running (a SINGLE-signal pid probe; see _run_lease_claim), so the contender
+surfaces the crash on the very next claim instead of waiting out the TTL.
+Lowering it would
 re-introduce live-holder-eviction risk to buy recovery latency that the
 orphan signal already provides.
 
@@ -1988,9 +1989,32 @@ class LeaseMutation(StrEnum):
 class LeaseHolder:
     """Serialized identity of a lease's current holder -- the exact ``.lease`` file body.
 
-    session_slug: the holder's own session-registry slug (see
-        build_session_slug), letting a contended claim point back at the
-        current owner's session_registry record.
+    session_slug: a CLAIMANT-CHOSEN ownership token, NOT a session-registry
+        record key. The skills prescribe ``<lease-role>-<project>-<pid>``
+        (skills/escalation-watcher/SKILL.md:50,
+        skills/recon-escalation-watcher/SKILL.md:87,
+        skills/unblock/SKILL.md:42). Do NOT pass it to ``read_record``.
+
+        THIS DOCSTRING USED TO CLAIM THE OPPOSITE -- that it was "the
+        holder's own session-registry slug (see build_session_slug), letting
+        a contended claim point back at the current owner's
+        session_registry record". It cannot be, and task 3994 built (then
+        withdrew) a whole orphan-corroboration path on that false premise.
+        The two namespaces differ in all three segments: a record slug is
+        ``<role>-<project>[-<task>]-<uniqueness>`` where the uniqueness
+        token is a session UUID for hand-launched sessions
+        (``session_hooks.hook_session_slug``) rather than a pid, and the
+        project token is the registry's project id (``dark_factory``) not
+        the lease's short name (``df``). Measured on the live fleet root:
+        ``watcher-df.lease`` holds ``session_slug=watcher-df-1894895``,
+        while 0 of 46,624 session record dirs begin with ``watcher-``. So
+        ``read_record(session_slug)`` ALWAYS raises FileNotFoundError.
+        Pinned by tests/test_session_registry.py's
+        TestLeaseSlugIsNotASessionRecordKey.
+
+        Its ONLY two roles are (i) the ownership comparison in
+        ``_check_lease_ownership`` and (ii) naming the holder in a
+        human-readable contention/refusal message.
     pid: the holder process's pid; liveness is checked via _pid_alive.
     start_ts: ISO-8601 timestamp of when this holder claimed the lease.
     """
@@ -2030,22 +2054,20 @@ class LeaseClaim:
         freshly-acquired lease.
     message: fully-formatted, user-observable line -- callers print this
         verbatim rather than re-deriving it from the other fields.
-    holder_session_state: 'live' | 'exited' | 'absent' | 'unknown' -- the
-        state of the HOLDER's own session_registry record (task 3994
-        defect 4). Together with `holder_alive` this distinguishes a holder
-        that is merely quiet from one that is provably gone, so a
-        stand-down can name a machine-readable owner instead of being
-        honoured silently (INV-6/INV-7).
 
-        DIAGNOSTIC ONLY -- it never changes the claim decision. The lease
-        FILE remains authoritative: auto-stealing on a dead-LOOKING holder
-        is precisely the reap-and-reclaim path that once let a duplicate
-        steal a live-but-quiet watcher's lease (task 2796 THREAD 1). The
-        behavioural response belongs in the caller's skill contract (file a
-        DecisionRecord naming the orphan, then exit), not in lease
-        semantics. Defaults to 'unknown' so existing keyword constructions
-        keep working and an unresolved state can never masquerade as a
-        positive orphan finding.
+    There is deliberately NO holder_session_state field. Task 3994 added one
+    ('live'/'exited'/'absent'/'unknown', read via
+    ``read_record(holder.session_slug)``) to corroborate the defect-4 orphan
+    signal, and withdrew it on measurement: a lease slug is not a
+    session-registry record key (see LeaseHolder.session_slug), so the field
+    was a CONSTANT 'absent' in production and the orphan predicate
+    ``not holder_alive and state in ('absent', 'exited')`` already
+    degenerated to ``not holder_alive``. A field documented as corroborating
+    evidence that never actually corroborates is worse than no field: it is
+    the false-derivation-left-in-place failure this task exists to break.
+    ``holder_alive`` alone is now the orphan signal, and it is sound because
+    resolve_session_pid records the long-lived ``claude`` pid rather than the
+    old always-dead ``$$``.
     """
 
     name: str
@@ -2055,7 +2077,6 @@ class LeaseClaim:
     holder_alive: bool
     heartbeat_age_secs: float
     message: str
-    holder_session_state: str = 'unknown'
 
 
 def _render_contention_message(
@@ -2150,43 +2171,7 @@ def _acquired_claim(name: str, holder: LeaseHolder) -> LeaseClaim:
         holder_alive=True,
         heartbeat_age_secs=0.0,
         message=f'lease {name} acquired by {holder.session_slug}',
-        # The acquirer is ITSELF, and it is by construction running.
-        holder_session_state='live',
     )
-
-
-def _resolve_holder_session_state(
-    holder: LeaseHolder | None, *, root: Path | str | None = None
-) -> str:
-    """Resolve the LEASE HOLDER's own session state: live/exited/absent/unknown.
-
-    Built entirely on records the registry already writes -- ``read_record``'s
-    documented FileNotFoundError-vs-CorruptSessionRecord split maps directly
-    onto 'absent' vs 'unknown', and ``TERMINAL_STATUSES`` onto 'exited' -- so
-    the defect-4 orphan signal introduces no new persistence or lookup path.
-
-    Fail-soft by construction: ANY unexpected exception degrades to 'unknown'
-    rather than propagating, because a session-registry read fault must never
-    break a lease claim. 'unknown' is also the safe value -- callers treat it
-    as "fail toward held" and never as evidence of an orphan.
-    """
-    if holder is None:
-        return 'unknown'
-    try:
-        record = read_record(holder.session_slug, root=root)
-    except FileNotFoundError:
-        return 'absent'
-    except CorruptSessionRecord:
-        return 'unknown'
-    except Exception:
-        logger.warning(
-            '_resolve_holder_session_state: could not read the record for %s; '
-            'reporting unknown (fail toward held)',
-            holder.session_slug,
-            exc_info=True,
-        )
-        return 'unknown'
-    return 'exited' if record.status in TERMINAL_STATUSES else 'live'
 
 
 def _read_lease_holder_state(
@@ -2311,7 +2296,6 @@ def claim_lease(
         message=_render_contention_message(
             existing_holder, holder_alive=holder_alive, age_secs=age_secs, policy=policy
         ),
-        holder_session_state=_resolve_holder_session_state(existing_holder, root=root),
     )
 
 
@@ -2484,8 +2468,13 @@ class LeaseStatus:
         i.e. exactly claim_lease/reap_stale_leases' own staleness predicate
         (a dead holder pid AND a heartbeat strictly past LEASE_HEARTBEAT_TTL).
         A live holder is never reclaimable, however quiet it has been.
-    holder_session: the holder's own session-registry state, as resolved by
-        _resolve_holder_session_state ('live'/'exited'/'absent'/'unknown').
+
+    There is deliberately NO holder_session field. It briefly reported the
+    holder's own session-registry state, but a lease slug is not a record key
+    (see LeaseHolder.session_slug), so it printed a constant
+    ``holder_session=absent`` that an operator could read as a positive
+    orphan finding. Withdrawn under task 3994 rather than left as a
+    plausible-looking constant.
     """
 
     name: str
@@ -2496,7 +2485,6 @@ class LeaseStatus:
     heartbeat_ts: str | None
     heartbeat_age_secs: float
     reclaimable: bool
-    holder_session: str
 
 
 def lease_status(
@@ -2538,7 +2526,6 @@ def lease_status(
             heartbeat_ts=None,
             heartbeat_age_secs=0.0,
             reclaimable=False,
-            holder_session='unknown',
         )
     holder, holder_alive, age_secs = _read_lease_holder_state(path, now=now)
     return LeaseStatus(
@@ -2553,7 +2540,6 @@ def lease_status(
         # BOTH a dead pid AND an aged heartbeat. Restating it any other way
         # would re-create the two-clocks-disagreeing failure this fixes.
         reclaimable=(not holder_alive) and age_secs > LEASE_HEARTBEAT_TTL.total_seconds(),
-        holder_session=_resolve_holder_session_state(holder, root=root),
     )
 
 
@@ -2867,13 +2853,30 @@ def _run_lease_claim(name: str, slug: str, pid: int | None, policy_value: str) -
     # unrecognised value. Lease SEMANTICS are unchanged: we never auto-steal.
     # This only lets a stand-down name a machine-readable owner, so a watcher
     # can file a DecisionRecord for a provably-gone holder instead of exiting
-    # silently (INV-6/INV-7). 'unknown' is deliberately NOT an orphan --
-    # fail toward held, never invent one.
-    orphaned = (
-        not claim.acquired
-        and not claim.holder_alive
-        and claim.holder_session_state in ('absent', 'exited')
-    )
+    # silently (INV-6/INV-7).
+    #
+    # A SINGLE signal, deliberately: `orphaned` means exactly "the pid
+    # recorded in the lease body is not running". This predicate used to
+    # AND in `claim.holder_session_state in ('absent', 'exited')`, which
+    # WHENEVER THERE WAS A HOLDER measured as a structural constant 'absent'
+    # -- a lease slug is not a session-registry record key (see
+    # LeaseHolder.session_slug) -- so dropping it is an honesty fix, not a
+    # behaviour change. The one case where that conjunct was NOT constant is
+    # an unreadable body, whose holder is None and which therefore resolved
+    # 'unknown' -> held; `claim.holder is not None` reproduces that
+    # explicitly, on its real reason (no holder means no pid to probe, so
+    # there is nothing to call orphaned) rather than as a side effect of a
+    # withdrawn lookup. The emitted values are byte-identical before and
+    # after, in every branch.
+    #
+    # It is sound only because resolve_session_pid now records the
+    # long-lived `claude` pid; the old `--pid $$` was the transient Bash-tool
+    # wrapper, always dead, which would have made this a tautology. Both
+    # error directions are safe: pid REUSE yields a false `held` (silence,
+    # the status quo, never a steal), and a false `orphaned` still triggers
+    # only a NON-destructive response (file a DecisionRecord, then exit --
+    # never auto-steal, which is the duplicate-spawn incident path).
+    orphaned = not claim.acquired and claim.holder is not None and not claim.holder_alive
     print(f'holder_liveness={"orphaned" if orphaned else "held"}')
 
 
@@ -2964,7 +2967,6 @@ def _run_lease_show(name: str) -> None:
     print(f'heartbeat_ts={status.heartbeat_ts}')
     print(f'heartbeat_age_secs={int(status.heartbeat_age_secs)}')
     print(f'reclaimable={str(status.reclaimable).lower()}')
-    print(f'holder_session={status.holder_session}')
 
 
 def _run_lease_reap() -> list[ReapedLease]:
