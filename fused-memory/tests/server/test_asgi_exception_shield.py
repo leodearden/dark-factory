@@ -24,6 +24,10 @@ Covers:
 - Interpreter exit: KeyboardInterrupt/SystemExit still propagate out of the
   shield uncontained, with nothing sent before the re-raise. [task 4067,
   see task 4023]
+- Non-HTTP scopes: lifespan (and websocket) scopes bypass containment
+  entirely — an exception raised while the wrapped app runs under a
+  non-http scope propagates uncontained, with no fallback HTTP response
+  fabricated. [task 4067, see task 4023]
 """
 
 import asyncio
@@ -35,19 +39,27 @@ import fused_memory.server.main as main_module
 from fused_memory.server.main import _ASGIExceptionShield
 
 
-class _RaisingApp:
-    """Minimal ASGI app that raises before sending any response."""
+class _BaseExceptionApp:
+    """Minimal ASGI app that raises a given BaseException before sending anything."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
 
     async def __call__(self, scope, receive, send):
-        raise RuntimeError('boom')
+        raise self._exc
 
 
-def _make_shield_call(shield: _ASGIExceptionShield) -> tuple[list[dict], Callable]:
+def _make_shield_call(
+    shield: _ASGIExceptionShield, scope: dict | None = None
+) -> tuple[list[dict], Callable]:
     """Build a `sent` sink plus an `invoke()` coroutine for driving `shield`.
 
     Unlike `_collect`, this hands back `sent` before the call happens, so a
     caller whose shielded call RAISES (e.g. KeyboardInterrupt/SystemExit
     propagation) can still inspect whatever was sent up to that point.
+    `scope` defaults to a representative POST /mcp/ HTTP scope; pass an
+    explicit non-http scope (e.g. `{'type': 'lifespan'}`) to exercise the
+    passthrough branch instead.
     """
     sent: list[dict] = []
 
@@ -57,7 +69,8 @@ def _make_shield_call(shield: _ASGIExceptionShield) -> tuple[list[dict], Callabl
     async def receive() -> dict:
         return {'type': 'http.request'}
 
-    scope = {'type': 'http', 'method': 'POST', 'path': '/mcp/'}
+    if scope is None:
+        scope = {'type': 'http', 'method': 'POST', 'path': '/mcp/'}
 
     async def invoke() -> None:
         await shield(scope, receive, send)
@@ -75,7 +88,7 @@ class TestASGIExceptionShieldNormalOperation:
     @pytest.mark.asyncio
     async def test_exception_yields_bare_500(self, monkeypatch):
         monkeypatch.setattr(main_module, '_operator_stop_received', False)
-        shield = _ASGIExceptionShield(_RaisingApp())
+        shield = _ASGIExceptionShield(_BaseExceptionApp(RuntimeError('boom')))
 
         sent = await _collect(shield)
 
@@ -89,7 +102,7 @@ class TestASGIExceptionShieldDuringShutdown:
     @pytest.mark.asyncio
     async def test_exception_yields_503_with_retry_after(self, monkeypatch):
         monkeypatch.setattr(main_module, '_operator_stop_received', True)
-        shield = _ASGIExceptionShield(_RaisingApp())
+        shield = _ASGIExceptionShield(_BaseExceptionApp(RuntimeError('boom')))
 
         sent = await _collect(shield)
 
@@ -104,13 +117,6 @@ class TestASGIExceptionShieldDuringShutdown:
 
         monkeypatch.setattr(main_module, '_operator_stop_received', True)
         assert main_module._is_shutdown_initiated() is True
-
-
-class _CancelledApp:
-    """Minimal ASGI app that raises asyncio.CancelledError before sending anything."""
-
-    async def __call__(self, scope, receive, send):
-        raise asyncio.CancelledError()
 
 
 class TestASGIExceptionShieldCancelledError:
@@ -129,7 +135,7 @@ class TestASGIExceptionShieldCancelledError:
     @pytest.mark.parametrize(('stop_received', 'expected_status'), [(False, 500), (True, 503)])
     async def test_cancelled_error_is_swallowed(self, monkeypatch, stop_received, expected_status):
         monkeypatch.setattr(main_module, '_operator_stop_received', stop_received)
-        shield = _ASGIExceptionShield(_CancelledApp())
+        shield = _ASGIExceptionShield(_BaseExceptionApp(asyncio.CancelledError()))
 
         # Reaching this line at all proves the CancelledError was swallowed
         # by the shield rather than propagating out of `await shield(...)`.
@@ -183,16 +189,6 @@ class TestASGIExceptionShieldResponseStarted:
         assert not any(m['type'] == 'http.response.body' for m in sent)
 
 
-class _BaseExceptionApp:
-    """Minimal ASGI app that raises a given BaseException before sending anything."""
-
-    def __init__(self, exc: BaseException) -> None:
-        self._exc = exc
-
-    async def __call__(self, scope, receive, send):
-        raise self._exc
-
-
 class TestASGIExceptionShieldInterpreterExit:
     """Pins the `except (KeyboardInterrupt, SystemExit): raise` clause.
 
@@ -216,4 +212,29 @@ class TestASGIExceptionShieldInterpreterExit:
 
         # Nothing at all emitted before the re-raise — the shield does not
         # fabricate a 500 on the way out of a legitimate interpreter exit.
+        assert sent == []
+
+
+class TestASGIExceptionShieldNonHttpScope:
+    """Pins the `scope.get('type') != 'http'` early-return passthrough.
+
+    lifespan (and websocket) scopes must bypass the shield's exception
+    containment entirely: an exception raised while the wrapped app runs
+    under a non-http scope must propagate uncontained. If a regression
+    removed this early return, a lifespan startup/shutdown failure would
+    instead be swallowed and converted into a fabricated HTTP-shaped
+    fallback response on a non-HTTP scope, wedging server startup with no
+    test failing.
+    """
+
+    @pytest.mark.asyncio
+    async def test_lifespan_scope_exception_propagates_uncontained(self, monkeypatch):
+        monkeypatch.setattr(main_module, '_operator_stop_received', False)
+        shield = _ASGIExceptionShield(_BaseExceptionApp(RuntimeError('boom during lifespan')))
+        sent, invoke = _make_shield_call(shield, scope={'type': 'lifespan'})
+
+        with pytest.raises(RuntimeError, match='boom during lifespan'):
+            await invoke()
+
+        # No fallback HTTP response fabricated on a non-HTTP scope.
         assert sent == []
