@@ -684,12 +684,17 @@ def register_metadata_submodel(
 # Milestone is the first real W10 registrant: registering at module-import
 # time (rather than lazily) guarantees the 'milestone' slice is validated
 # and typed before any of parse_metadata's many callers across packages run.
-register_metadata_submodel('milestone', Milestone)
+#
+# cardinality='dict' is stated explicitly on all three registrations below
+# even though it is the default: these are the load-bearing declarations the
+# task-4142 shape gate exists to make legible, and an explicit call site is
+# immune to a future flip of the default.
+register_metadata_submodel('milestone', Milestone, cardinality='dict')
 
 # routing (PRD γ, task 2533): registered the same way so 'routing' lands in
 # known_fields (no unknown_key census warning) and every parse_metadata
 # caller gets a validated, typed RoutingState slice.
-register_metadata_submodel('routing', RoutingState)
+register_metadata_submodel('routing', RoutingState, cardinality='dict')
 
 # merge_retry_pending (task 2795): registered like milestone/routing so the
 # orchestrator's durable merge-phase-resume stamp lands in known_fields (no
@@ -697,7 +702,7 @@ register_metadata_submodel('routing', RoutingState)
 # write boundary — while, as a registered sub-model rather than an optional
 # `| None = None` field, staying absent from model_dump() when unset (no
 # None-noise on every task).
-register_metadata_submodel('merge_retry_pending', MergeRetryPending)
+register_metadata_submodel('merge_retry_pending', MergeRetryPending, cardinality='dict')
 
 
 def _normalize_legacy_memory_hints(value: object) -> object:
