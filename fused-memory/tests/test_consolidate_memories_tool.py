@@ -1078,3 +1078,125 @@ class TestChildrenAreReHomedBeforeTheirParentDies:
         assert result['reparent_failures'] == []
         svc.update_memory.assert_not_awaited()
         svc.count_memories_by_metadata.assert_not_called()
+
+
+class TestAnIncompleteReparentRefusesTheDelete:
+    """The op must not become the caller that routes around the orphan gate.
+
+    `ParentHasChildrenError` only means something while every caller
+    respects it. This op could trivially have forced its way past — it
+    holds `cascade=True` — and deliberately does not: cascading would
+    DESTROY the children the re-homing exists to preserve, turning a
+    refusal into permanent data loss.
+
+    So a delete happens only over a re-homing this call can PROVE
+    complete. Failing that proof leaves the supersede alive and named,
+    which is a recoverable outcome; deleting on an unproven re-homing is
+    not recoverable at all.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_child_that_did_not_move_saves_its_parent(self):
+        svc = make_service(
+            gone=[S2, S3],
+            children={S1: [C1, C2]},
+            update_errors={
+                C2: {'error': 'memory not found', 'error_type': 'MemoryNotFound'}
+            },
+        )
+
+        result = await call_consolidate(svc)
+
+        attempted = [c.kwargs['memory_id'] for c in svc.delete_memory.await_args_list]
+        assert S1 not in attempted
+        [failure] = result['failed_deletes']
+        assert failure['id'] == S1
+        assert failure['error_type'] == 'ReparentIncomplete'
+        # The stranded child is NAMED: an operator needs to know which
+        # pointer to fix, not merely that one exists.
+        assert C2 in failure['error']
+        assert result['survivors'] == [S1]
+        assert result['status'] == 'partial'
+
+    @pytest.mark.asyncio
+    async def test_the_rest_of_the_cluster_still_folds(self):
+        """One unprovable re-homing costs one supersede, not the cluster."""
+        svc = make_service(
+            gone=[S2, S3],
+            children={S1: [C1, C2]},
+            update_errors={
+                C2: {'error': 'memory not found', 'error_type': 'MemoryNotFound'}
+            },
+        )
+
+        result = await call_consolidate(svc)
+
+        assert result['deleted'] == [S2, S3]
+        # C1 moved and stays reported as moved — a refusal to delete the
+        # parent does not un-say the re-homing that did land.
+        assert result['reparented'] == [
+            {'child_id': C1, 'from': S1, 'to': CANONICAL}
+        ]
+        assert [f['child_id'] for f in result['reparent_failures']] == [C2]
+
+    @pytest.mark.asyncio
+    async def test_a_truncated_child_listing_refuses_the_delete(self):
+        """A listing the op could not fully SEE is a set it cannot prove it
+        moved. The count it reports must read as a FLOOR, not as the whole
+        set — an exhaustive-sounding number over a truncated scan is the
+        overclaim this op exists to eliminate."""
+        svc = make_service(
+            gone=[S2, S3], children={S1: [C1]}, truncated_scans={S1}
+        )
+
+        result = await call_consolidate(svc)
+
+        attempted = [c.kwargs['memory_id'] for c in svc.delete_memory.await_args_list]
+        assert S1 not in attempted
+        [failure] = result['failed_deletes']
+        assert failure['id'] == S1
+        assert failure['error_type'] == 'ReparentIncomplete'
+        assert 'at least' in failure['error']
+        assert result['survivors'] == [S1]
+
+    @pytest.mark.asyncio
+    async def test_a_patch_that_reported_success_is_still_corroborated(self):
+        """CORROBORATE AFTER ACTING, the same discipline 3197's cascade
+        applies to its own child deletes. Every patch here returns
+        `{'status': 'updated'}` and one child stays put anyway — trusting
+        the return value would delete a parent that still has one."""
+        svc = make_service(
+            gone=[S2, S3], children={S1: [C1, C2]}, stuck_children={C2}
+        )
+
+        result = await call_consolidate(svc)
+
+        attempted = [c.kwargs['memory_id'] for c in svc.delete_memory.await_args_list]
+        assert S1 not in attempted
+        [failure] = result['failed_deletes']
+        assert failure['id'] == S1
+        assert failure['error_type'] == 'ReparentIncomplete'
+        assert result['survivors'] == [S1]
+        assert result['status'] == 'partial'
+        # Every patch reported success, so nothing lands in
+        # `reparent_failures` — the refusal comes from the WORLD's answer.
+        assert result['reparent_failures'] == []
+        recounted = [
+            c.kwargs['filters']
+            for c in svc.count_memories_by_metadata.await_args_list
+            if 'parent_id' in (c.kwargs.get('filters') or {})
+        ]
+        assert {'parent_id': S1} in recounted
+
+    @pytest.mark.asyncio
+    async def test_the_delete_is_never_forced_with_cascade(self):
+        """THE pinned negative. `cascade=True` would delete the children
+        instead of the refusal — converting a reported, recoverable refusal
+        into exactly the silent orphaning (here: silent destruction) that
+        PRD V3 forbids."""
+        svc = make_service(gone=[S2, S3], children={S1: [C1, C2]})
+
+        await call_consolidate(svc)
+
+        for call in svc.delete_memory.await_args_list:
+            assert call.kwargs.get('cascade') in (None, False)
