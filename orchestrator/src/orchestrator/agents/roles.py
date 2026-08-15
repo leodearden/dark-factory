@@ -186,12 +186,12 @@ If an agent files `critical` or `urgent`, the escalation server **downgrades it 
 `[downgraded:critical]` / `[downgraded:urgent]` suffix).  Self-assigning a higher
 severity buys no faster human attention — only noise.
 
-To reach a human, use the existing ladder: file with `escalate_blocker` (L0 →
-steward); if the steward cannot resolve it, re-escalate by passing `level=1` to
-`escalate_blocker` (steward → auto-watcher; auto-watcher promotes to L2 if a
-human is needed).  `escalate_blocker` accepts only `level=0` (the default) or
-`level=1` — anything else is rejected with an `{'error': ...}` response and
-nothing is filed.
+To reach a human, use the existing ladder: agents file with `escalate_blocker`
+at L0 → steward; the steward re-escalates unresolved issues by passing
+`level=1` to `escalate_blocker` (steward → auto-watcher; auto-watcher promotes
+to L2 if a human is needed).  `escalate_blocker` accepts only `level=0` (the
+default) or `level=1` — anything else is rejected with an `{'error': ...}`
+response and nothing is filed.
 """
 
 # The "level=1 is not yours" framing. Correct for every escalating role
