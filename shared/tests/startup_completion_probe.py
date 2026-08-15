@@ -68,6 +68,7 @@ import sys
 import tempfile
 import time
 import uuid
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, Any
@@ -896,6 +897,40 @@ def _drain_exit(
     }
 
 
+@contextlib.contextmanager
+def _teardown_step(label: str) -> Iterator[None]:
+    """Run ONE teardown step, reporting rather than propagating its failure.
+
+    ``run_live_probe``'s ``finally`` runs while an exception may already be in
+    flight, so an unguarded raise from any step there does two harms at once: it
+    REPLACES the exception being unwound (the caller is then told about tidy-up
+    instead of the actual cause) and it SKIPS every remaining step — including
+    ``config.cleanup()``, the only thing that removes a 0600
+    ``.credentials.json`` holding a live OAuth access token, and ``proc.kill()``,
+    the only reaper left once the ``try`` body has raised.  Isolating each step
+    individually buys both back, and is why the ordering comment in that
+    ``finally`` can now describe a mechanism rather than an intention.
+
+    LOUD, not silent.  ``contextlib.suppress`` would leave a probe that failed to
+    tidy up indistinguishable from one that succeeded — the silent fail-soft this
+    repo rejects — and it is also too narrow (closing a detached buffer raises
+    ``ValueError``, not ``OSError``).  The failure is printed to stderr, naming
+    the step, matching :func:`_gate` and :func:`_sweep_stale_probe_dirs_once`;
+    the module has no logger.
+
+    ``Exception``, deliberately NOT ``BaseException``: a ``KeyboardInterrupt`` or
+    ``SystemExit`` arriving during teardown must still propagate.
+    """
+    try:
+        yield
+    except Exception as exc:  # noqa: BLE001  (deliberately broad — see docstring)
+        print(
+            f'startup_completion_probe: WARNING — teardown step {label!r} failed '
+            f'({exc!r}); continuing with the remaining teardown.',
+            file=sys.stderr,
+        )
+
+
 def run_live_probe(
     *,
     mode: str,
@@ -1095,32 +1130,68 @@ def run_live_probe(
         for observation in observations:
             observation['run_exit'] = exit_provenance
     finally:
-        # None-safe throughout: the try now opens before these exist, so any of
-        # them can still be its sentinel here.  And ordered least-to-most
-        # important, with the credential dir LAST but unconditionally reached —
-        # a failure while tidying a stub dir must not be able to skip the one
-        # piece of teardown that has security consequences.
+        # Every step below is INDEPENDENTLY failure-isolated by _teardown_step:
+        # one that raises is reported to stderr and the rest still run.  That is
+        # the MECHANISM, stated rather than assumed — this block runs with an
+        # exception potentially in flight, so an unguarded raise here would both
+        # replace that exception with a misleading tidy-up error and skip
+        # everything after it.  (It did: a subdirectory in the stub dir made the
+        # glob loop's unlink raise IsADirectoryError, which masked the cause,
+        # orphaned the child and skipped config.cleanup() — while only the rmdir
+        # one statement later was guarded.)
+        #
+        # Still None-safe throughout: the try opens before these exist, so any of
+        # them can still be its sentinel.  Still ordered least-to-most important,
+        # with the credential dir LAST — now genuinely unconditionally reached,
+        # because no earlier step can abort the block.
         if stdout_fh is not None:
-            stdout_fh.close()
+            with _teardown_step('close stdout capture'):
+                stdout_fh.close()
         if stderr_fh is not None:
-            stderr_fh.close()
-        if proc is not None and proc.poll() is None:
-            proc.kill()
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.wait(timeout=10)
+            # Isolated SEPARATELY from the stdout close: a failing flush on one
+            # capture file (a full /tmp surfaces as ENOSPC at close, not at
+            # write) must not leave the other handle to the GC.
+            with _teardown_step('close stderr capture'):
+                stderr_fh.close()
+        if proc is not None:
+            # The only reaper left when the try body raised before _drain_exit:
+            # skipping this orphans a live CLI child holding the OAuth token in
+            # its environment.
+            with _teardown_step('kill child process'):
+                if proc.poll() is None:
+                    proc.kill()
+                    with contextlib.suppress(subprocess.TimeoutExpired):
+                        proc.wait(timeout=10)
         for path in temp_paths:
-            path.unlink(missing_ok=True)
+            # Per PATH, not per loop: one unlinkable temp file must not strand
+            # the others.
+            with _teardown_step(f'unlink temp file {path}'):
+                path.unlink(missing_ok=True)
         if stub_dir is not None:
-            for stub in sorted(stub_dir.glob('*')):
-                stub.unlink(missing_ok=True)
-            # Suppressed: a stub dir left non-empty (a subdirectory the glob
-            # cannot unlink, a file the child recreated) would otherwise raise
-            # OUT of the finally, replacing the original exception with a
-            # misleading OSError and skipping config.cleanup() below.
-            with contextlib.suppress(OSError):
+            stub_entries: list[Path] = []
+            with _teardown_step(f'list stub dir {stub_dir}'):
+                stub_entries = sorted(stub_dir.glob('*'))
+            for stub in stub_entries:
+                with _teardown_step(f'unlink stub entry {stub}'):
+                    stub.unlink(missing_ok=True)
+            # Was a bare contextlib.suppress(OSError) — silent, and one statement
+            # too late: a stub dir left non-empty (a subdirectory the glob cannot
+            # unlink, a file the child recreated) raises in the LOOP above, not
+            # here.  Now every entry is isolated and every failure is loud.
+            with _teardown_step(f'remove stub dir {stub_dir}'):
                 stub_dir.rmdir()
         if not keep_config_dir:
-            config.cleanup()
+            # Isolated too, and the WARNING names the surviving PATH so an
+            # operator can reclaim it by hand.  This does not weaken the security
+            # guarantee: the guarantee is that cleanup is always ATTEMPTED, no
+            # code inside this finally could do better if the rmtree itself
+            # fails, and letting it raise here would only mask the in-flight
+            # exception.  The two remaining backstops — the
+            # cleanup_at_exit=not keep_config_dir atexit hook and the dead-PID
+            # sweep — do not make this optional: atexit is disabled under
+            # --keep-config-dir and does not run under SIGKILL.
+            with _teardown_step(f'remove config dir {config_dir}'):
+                config.cleanup()
     return observations
 
 
