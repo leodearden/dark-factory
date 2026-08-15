@@ -5811,9 +5811,9 @@ class TestLivenessDetectorRegexBudget:
         """The load-bearing case for choosing the BROADER prefilter.
 
         This is the one record class that matches `LIVE_TASK_STATUS_RE` (via
-        the "actively driven by" paraphrase) but NOT
-        `_LIVE_FIELD_ASSIGNMENT_RE`. Prefiltering on the narrower assignment
-        pattern would read as one consult here too, while silently driving
+        the "actively driven by" paraphrase) but NOT either alternative of
+        `_LIVE_FIELD_SCAN_RE`. Prefiltering on the narrower scan pattern
+        would read as one consult here too, while silently driving
         `liveness_snapshot_unfielded` to a permanent zero — turning a counted
         loss back into an invisible one.
         """
