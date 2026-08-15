@@ -1718,6 +1718,48 @@ class TestAtomicWritePlan:
         assert target.read_bytes() == before_bytes
         assert set(plan_dir.iterdir()) == before_entries
 
+    def test_target_file_mode_propagates_a_non_missing_file_os_error(
+        self, plan_dir, monkeypatch
+    ):
+        """Direct coverage of the premise the two tests below are built on.
+
+        Both monkeypatch ``_target_file_mode`` WHOLESALE, which proves
+        ``_atomic_write_plan`` correctly WRAPS whatever the lookup raises, but
+        never exercises what ``_target_file_mode`` itself actually swallows.
+        Mutation-verified in this worktree: widening its
+        ``except FileNotFoundError:`` to a bare ``except OSError:`` left every
+        other test in this file green — this is the test that catches it.
+        """
+        target = plan_dir / 'plan.json'
+
+        def boom(self):
+            raise OSError(errno.EACCES, 'Permission denied')
+
+        monkeypatch.setattr(Path, 'stat', boom)
+        try:
+            with pytest.raises(OSError) as excinfo:
+                plan_tools._target_file_mode(target)
+        finally:
+            # Undo the class-wide patch explicitly, BEFORE returning, rather
+            # than leaving it to monkeypatch's own automatic teardown: this
+            # module's autouse _no_mock_derived_stray_dirs fixture
+            # (conftest.py) also calls Path.stat() (via Path.exists()) in ITS
+            # teardown, which this file's fixture ordering runs BEFORE
+            # monkeypatch's — so an undo left to the automatic teardown would
+            # still be patched when that fixture's teardown runs, and it does
+            # not expect stat()'s real signature. In a `finally` so a raising
+            # `pytest.raises` (e.g. this test itself failing) still restores
+            # the real `stat` rather than taking pytest's own traceback
+            # machinery down with it — `boom`'s signature doesn't accept the
+            # `follow_symlinks` kwarg real callers pass.
+            monkeypatch.undo()
+
+        assert excinfo.value.errno == errno.EACCES, (
+            '_target_file_mode must swallow ONLY FileNotFoundError; any other '
+            'OSError from target.stat() (EACCES, ELOOP, ENAMETOOLONG) must '
+            'propagate so _atomic_write_plan can turn it into PlanWriteError'
+        )
+
     def test_a_mode_lookup_failure_surfaces_as_PlanWriteError(self, plan_dir, monkeypatch):
         """``_target_file_mode`` deliberately swallows only ``FileNotFoundError``.
 
