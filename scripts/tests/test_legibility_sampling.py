@@ -13,8 +13,7 @@ from datetime import date as dt_date
 from pathlib import Path
 
 from legibility import config as config_mod
-from legibility import digest
-from legibility import inventory
+from legibility import digest, inventory
 from legibility import sampling as mod
 
 MAIN_CWD = '/home/leo/src/dark-factory'
