@@ -38,7 +38,7 @@ import pytest
 from _recording_event_store import _RecordingEventStore
 
 from orchestrator import scheduler as scheduler_module
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import OrchestratorConfig, apply_reload
 from orchestrator.scheduler import Scheduler, _BackfillGrant
 
 if TYPE_CHECKING:  # the fake below is duck-typed; the real class is only a type
@@ -199,6 +199,78 @@ def test_configured_floor_below_the_module_default_is_honoured():
     _feed_spans(scheduler, modules, [42.0])
 
     assert scheduler.predicted_hold(task) == pytest.approx(42.0)
+
+
+# --- ... and it is GREEN-TIER, so a reload has to actually move it ---------
+#
+# All four backfill leaves are declared hot-reloadable (config.py:5043-5046,
+# pinned by test_config.py::test_backfill_leaves_are_green_tier_reloadable) so
+# production overstay data can settle PRD Open Q3 without a restart.  Three of
+# them are read through ``self.config.X`` at call time and genuinely retune
+# live.  The floor is the odd one out: its only consumer is the predictor,
+# built ONCE in ``Scheduler.__init__``, so a value captured there would be
+# frozen for the process era — ``reload_config`` would report the leaf under
+# ``applied`` with ``reloaded: true`` and the predictor would keep certifying
+# from the old floor until restart.  That is a silent fail-soft on a config
+# contract, and it is what these two tests exist to forbid.
+#
+# Driven through the REAL ``apply_reload`` (the same call the reload MCP tool
+# makes) rather than a hand-written ``object.__setattr__``, so the tier
+# declaration and the observable behaviour are tied together end to end.
+
+
+def _reload_floor(scheduler: Scheduler, floor: int) -> dict:
+    """Hot-apply a new ``backfill_min_samples`` to a LIVE scheduler's config."""
+    result = apply_reload(
+        scheduler.config,
+        OrchestratorConfig(max_per_module=1, backfill_min_samples=floor),
+    )
+    assert result['reloaded'] is True, result
+    assert 'backfill_min_samples' in result['applied'], (
+        f'the leaf is declared green-tier but was not applied: {result}'
+    )
+    return result
+
+
+def test_hot_reloading_the_floor_down_makes_the_predictor_answer():
+    """10 -> 3, same Scheduler object, no reconstruction."""
+    scheduler = _make_scheduler(backfill_min_samples=10)
+    task = _task('1', ['orchestrator/src/orchestrator/scheduler.py'])
+    modules = scheduler._get_modules(task)
+
+    _feed_spans(scheduler, modules, [100.0, 200.0, 300.0])
+    assert scheduler.predicted_hold(task) is None, (
+        'three samples is below the configured floor of ten'
+    )
+
+    _reload_floor(scheduler, 3)
+
+    assert scheduler.predicted_hold(task) == pytest.approx(200.0), (
+        'the operator loosened a green-tier leaf and reload_config reported it '
+        'applied — the predictor must honour it without a restart'
+    )
+
+
+def test_hot_reloading_the_floor_up_makes_the_predictor_refuse_again():
+    """3 -> 10, the tighten direction: the one that matters for safety.
+
+    An operator raising the floor is withdrawing certification authority from
+    thin histories.  If that edit is inert, backfills keep being admitted on
+    evidence the operator has just declared insufficient.
+    """
+    scheduler = _make_scheduler(backfill_min_samples=3)
+    task = _task('1', ['orchestrator/src/orchestrator/scheduler.py'])
+    modules = scheduler._get_modules(task)
+
+    _feed_spans(scheduler, modules, [100.0, 200.0, 300.0])
+    assert scheduler.predicted_hold(task) == pytest.approx(200.0)
+
+    _reload_floor(scheduler, 10)
+
+    assert scheduler.predicted_hold(task) is None, (
+        'the floor was raised past the available evidence — the predictor must '
+        'stop answering, not keep certifying from the captured old floor'
+    )
 
 
 # ===========================================================================
