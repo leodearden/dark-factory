@@ -1293,45 +1293,54 @@ def test_keep_alive_timeout_is_pinned_above_poll_interval() -> None:
     """--timeout-keep-alive must be pinned explicitly, and pinned ABOVE the poll interval.
 
     The lower bound is the non-obvious half of this test.  The tempting move —
-    dropping keep-alive below the client's 3s poll so idle connections close on
-    their own — is wrong here: it would make the server close the polling socket
-    in the gap between polls, exposing the classic
+    dropping keep-alive below the slowest client poll so idle connections close
+    on their own — is wrong here: it would make the server close that polling
+    socket in the gap between its polls, exposing the classic
     server-closes-while-client-writes race, i.e. trading a shutdown-time stall
     for request-time failures on a change whose whole purpose is availability.
     The hard drain guarantee already comes from --timeout-graceful-shutdown, so
     keep-alive is not being asked to do that job.
 
-    Pinning it explicitly (at uvicorn's own default) is still worth doing: it
-    surfaces the interaction that caused the incident — the 5s default exceeds
-    the 3s poll, which is precisely why the connection never idles out — makes
-    it greppable, and gives the unit-file parity check a concrete directive to
-    diff.
+    The bound must clear EVERY recurring HTTP poller, not just the busiest one.
+    Each poller holds its own keep-alive connection and reuses it at its OWN
+    interval, so a keep-alive above data.js's 3s data refresh but at-or-below
+    tab_overview.jsx's 5s /api/load poll still exposes that race on the slower
+    socket — which is precisely the state this test used to certify as green
+    (see the CORRECTION note above CLIENT_POLLERS).  Hence the comparison is
+    against _slowest_client_poll_ms().
 
-    The poll interval is read out of the client source (POLL_JS) rather than
-    restated, so raising the poller past the pinned keep-alive fails here
-    instead of passing against a stale copy of the number.  The comparison is
-    done in milliseconds to keep a non-whole-second poll (e.g. 3500ms) from
-    being floored into a looser bound than the client actually uses.
+    Pinning it explicitly is still worth doing beyond the bound itself: it
+    surfaces the interaction that caused the incident — keep-alive exceeds the
+    poll interval, which is precisely why the connection never idles out —
+    makes it greppable, and gives the unit-file parity check a concrete
+    directive to diff.
+
+    Every period is read out of the live client sources rather than restated,
+    so raising a poller past the pinned keep-alive fails here instead of passing
+    against a stale copy of the number.  The comparison is done in milliseconds
+    to keep a non-whole-second poll (e.g. 3500ms) from being floored into a
+    looser bound than the client actually uses.
     """
-    poll_ms = _client_poll_interval_ms()
+    poll_ms, slowest = _slowest_client_poll()
     for path in (TEMPLATE, HARDCODED):
         keep_alive = _uvicorn_int_flag(path, "timeout-keep-alive")
         assert keep_alive is not None, (
             f"No --timeout-keep-alive flag in the ExecStart of {path}. "
             "Leaving it implicit hides the interaction that caused the incident: "
-            "uvicorn's 5s default exceeds the client's "
-            f"{poll_ms / 1000:g}s poll ({POLL_JS}), which is why the polling "
-            "connection never idles out."
+            "keep-alive exceeds the slowest client poll — "
+            f"{poll_ms / 1000:g}s, from {slowest.what} ({slowest.path}) — which "
+            "is why the polling connection never idles out."
         )
         assert keep_alive * 1000 > poll_ms, (
-            f"--timeout-keep-alive {keep_alive}s is not above the client's "
-            f"{poll_ms / 1000:g}s poll interval ({POLL_JS}) in {path}. "
-            "Below the poll interval the server closes the polling socket in the "
+            f"--timeout-keep-alive {keep_alive}s is not above the slowest client "
+            f"poll interval of {poll_ms / 1000:g}s — {slowest.what}, "
+            f"{slowest.const_name} in {slowest.path} — in {path}. "
+            "Below that poller's interval the server closes its socket in the "
             "gap between polls, exposing the server-closes-while-client-writes "
             "race and turning a shutdown fix into a source of failed polls. The "
             "drain is already bounded by --timeout-graceful-shutdown; do not "
             "retune keep-alive to compensate for it — raise keep-alive above the "
-            "new poll interval, or lower the poll interval."
+            "new poll interval (in BOTH unit files), or lower the poll interval."
         )
         stop = _timeout_stop_sec(path)
         assert keep_alive < stop, (
