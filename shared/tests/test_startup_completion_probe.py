@@ -15,8 +15,10 @@ money and no real token is ever written.  They are deliberately unmarked (no
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import shutil
 import tempfile
 from pathlib import Path
 from typing import IO, Any
@@ -435,6 +437,22 @@ def _run_probe(tmp_path: Path, **overrides: Any) -> list[dict]:
     return probe.run_live_probe(**kwargs)
 
 
+def _record_argv_temp_paths(monkeypatch, recorder: _ProbeRecorder) -> None:
+    """Wrap ``_build_argv`` so the temp files it creates are recorded, not replaced.
+
+    The REAL ``_build_argv`` still runs, so its sysprompt (and, for ``mcp_wedge``,
+    its MCP-config) tempfiles genuinely exist and genuinely have to be reclaimed.
+    """
+    real_build_argv = probe._build_argv
+
+    def _recording_build_argv(*args: Any, **kwargs: Any):
+        argv, temp_paths = real_build_argv(*args, **kwargs)
+        recorder.temp_paths.extend(temp_paths)
+        return (argv, temp_paths)
+
+    monkeypatch.setattr(probe, '_build_argv', _recording_build_argv)
+
+
 def _inject(kind: str, monkeypatch, recorder: _ProbeRecorder) -> type[Exception]:
     """Install a failure at *kind*, all BEFORE ``subprocess.Popen``.
 
@@ -459,17 +477,11 @@ def _inject(kind: str, monkeypatch, recorder: _ProbeRecorder) -> type[Exception]
     if kind == 'spawn_env':
         # The REAL _build_argv runs first, so by now its sysprompt tempfile
         # exists and must also be reclaimed.
-        real_build_argv = probe._build_argv
-
-        def _recording_build_argv(*args: Any, **kwargs: Any):
-            argv, temp_paths = real_build_argv(*args, **kwargs)
-            recorder.temp_paths.extend(temp_paths)
-            return (argv, temp_paths)
+        _record_argv_temp_paths(monkeypatch, recorder)
 
         def _boom_spawn_env(*args: Any, **kwargs: Any):
             raise RuntimeError('injected: _spawn_env')
 
-        monkeypatch.setattr(probe, '_build_argv', _recording_build_argv)
         monkeypatch.setattr(probe, '_spawn_env', _boom_spawn_env)
         return RuntimeError
 
@@ -701,3 +713,327 @@ class TestStaleProbeDirSweep:
             'the flag must be set BEFORE the call, or a raising sweep re-runs on '
             'every subsequent probe'
         )
+
+
+# ---------------------------------------------------------------------------
+# Teardown that itself fails
+# ---------------------------------------------------------------------------
+
+
+class _ExplodingCloseHandle:
+    """A capture-file handle whose FIRST ``close()`` raises, then behaves.
+
+    Models the shape the capture files are most likely to hit in the field: a
+    buffered writer flushes on close, so a full ``/tmp`` surfaces as ENOSPC
+    *there* rather than at write time — the very scenario ``run_live_probe``'s
+    own comment names as motivating the capture-file design.  Everything else
+    proxies to the real handle, so the probe's use of it is unchanged.
+    """
+
+    def __init__(self, handle: IO[bytes]) -> None:
+        self._handle = handle
+        self.close_attempts = 0
+
+    def close(self) -> None:
+        self.close_attempts += 1
+        if self.close_attempts == 1:
+            raise OSError('injected: close() failed (ENOSPC on flush)')
+        self._handle.close()
+
+    @property
+    def closed(self) -> bool:
+        return self._handle.closed
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._handle, name)
+
+
+class _FakePopen:
+    """A spawned child that never exits, recording whether teardown reaped it.
+
+    ``pid`` is ``-1`` so ``sample_proc`` finds no ``/proc`` entry and stays cheap;
+    ``poll()`` never reports an exit, so the sampling loop leaves through its
+    ``deadline`` branch with the child still "running" — the state in which the
+    ``finally``'s ``kill()`` is the only thing standing between a raise and an
+    orphaned process.
+    """
+
+    def __init__(self) -> None:
+        self.pid = -1
+        self.returncode: int | None = None
+        self.kill_calls = 0
+        self.wait_calls = 0
+
+    def poll(self) -> int | None:
+        return None
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+        self.returncode = -9
+
+    def wait(self, timeout: float | None = None) -> int | None:
+        self.wait_calls += 1
+        return self.returncode
+
+
+def _explode_first_capture_close(monkeypatch, sink: list[Any]) -> None:
+    """Make the FIRST capture handle's ``close()`` raise; collect both handles.
+
+    The first close is the FIRST statement of the teardown, so this is the
+    injection that proves the whole block is reachable past a broken step rather
+    than just its tail.
+    """
+    real_path_open = Path.open
+
+    def _recording_open(self: Path, *args: Any, **kwargs: Any):
+        mode = args[0] if args else kwargs.get('mode', 'r')
+        if mode != 'wb':
+            return real_path_open(self, *args, **kwargs)
+        handle = real_path_open(self, *args, **kwargs)
+        wrapped = _ExplodingCloseHandle(handle) if not sink else handle
+        sink.append(wrapped)
+        return wrapped
+
+    monkeypatch.setattr(Path, 'open', _recording_open)
+
+
+class _TeardownCase:
+    """One (in-flight failure, teardown-step failure) pair under test.
+
+    ``in_flight`` is the message of the exception ``run_live_probe`` is already
+    unwinding when the teardown breaks — the one that must reach the caller
+    unmasked, because it names the actual cause and the teardown OSError does not.
+    """
+
+    def __init__(
+        self,
+        *,
+        kind: str,
+        in_flight: str,
+        probe_kwargs: dict[str, Any] | None = None,
+        handles: list[Any] | None = None,
+    ) -> None:
+        self.kind = kind
+        self.in_flight = in_flight
+        self.probe_kwargs = probe_kwargs or {}
+        self.handles = handles if handles is not None else []
+
+
+def _inject_teardown_failure(
+    kind: str, monkeypatch, recorder: _ProbeRecorder
+) -> _TeardownCase:
+    """Install an in-flight failure AND a failure inside the teardown itself.
+
+    Layers on top of the ``probe_recorder`` fixture: the ``mkdtemp`` /
+    ``Path.open`` / ``Path.unlink`` wrappers here wrap whatever that fixture has
+    already installed, so the recorder keeps seeing everything the probe allocates.
+    """
+    if kind == 'stub_subdir':
+        # The case the suppress comment in the `finally` claims to cover and does
+        # not: the suppress sits around `rmdir`, one statement AFTER the glob loop
+        # whose `unlink` is what actually raises on a subdirectory
+        # (IsADirectoryError, an OSError).
+        recording_mkdtemp = tempfile.mkdtemp
+
+        def _planting_mkdtemp(*args: Any, **kwargs: Any) -> str:
+            path = recording_mkdtemp(*args, **kwargs)
+            # Sorted first, so the glob loop trips on it BEFORE the ordinary
+            # entry — otherwise a naive loop would look isolated by luck.
+            (Path(path) / '0-planted-subdir').mkdir()
+            (Path(path) / '1-planted-file').write_text('a file the child recreated')
+            return path
+
+        monkeypatch.setattr(probe.tempfile, 'mkdtemp', _planting_mkdtemp)
+        _inject('spawn_env', monkeypatch, recorder)
+        return _TeardownCase(kind=kind, in_flight='injected: _spawn_env')
+
+    if kind == 'handle_close':
+        # The in-flight failure has to land AFTER the capture files are open, so
+        # `Popen` itself is replaced by a raise — nothing is ever spawned, which
+        # is the point.  RuntimeError (not the FileNotFoundError a missing binary
+        # would really give) keeps the not-masked assertion crisp against the
+        # teardown's OSError.
+        def _boom_popen(*args: Any, **kwargs: Any):
+            raise RuntimeError('injected: subprocess.Popen')
+
+        monkeypatch.setattr(probe.subprocess, 'Popen', _boom_popen)
+        _record_argv_temp_paths(monkeypatch, recorder)
+        handles: list[Any] = []
+        _explode_first_capture_close(monkeypatch, handles)
+        return _TeardownCase(
+            kind=kind, in_flight='injected: subprocess.Popen', handles=handles
+        )
+
+    if kind == 'temp_path_unlink':
+        real_unlink = Path.unlink
+
+        def _failing_unlink(self: Path, *args: Any, **kwargs: Any):
+            if recorder.temp_paths and self == recorder.temp_paths[0]:
+                raise OSError('injected: unlink() failed')
+            return real_unlink(self, *args, **kwargs)
+
+        _inject('spawn_env', monkeypatch, recorder)
+        monkeypatch.setattr(Path, 'unlink', _failing_unlink)
+        # mcp_wedge is the mode whose _build_argv produces TWO temp files, so a
+        # failure on the first has a real second to skip — no fake path needed.
+        return _TeardownCase(
+            kind=kind, in_flight='injected: _spawn_env', probe_kwargs={'mode': 'mcp_wedge'}
+        )
+
+    raise AssertionError(f'unknown teardown-failure kind {kind!r}')
+
+
+@pytest.fixture(params=['stub_subdir', 'handle_close', 'temp_path_unlink'])
+def teardown_failure(request, monkeypatch, probe_recorder) -> _TeardownCase:
+    return _inject_teardown_failure(request.param, monkeypatch, probe_recorder)
+
+
+class TestTeardownIsFailureIsolated:
+    """A raise INSIDE the teardown must not cancel the rest of the teardown.
+
+    Every injection above fires while the ``try`` body is still running, so
+    nothing yet exercises the ``finally`` when the ``finally`` is what breaks.
+    And it can break: only ``stub_dir.rmdir()`` sits inside a
+    ``contextlib.suppress(OSError)`` — the handle closes, the ``proc.kill()``,
+    the ``temp_paths`` loop and the stub-dir glob ahead of it are unguarded.  A
+    subdirectory in the stub dir is enough (``Path.unlink`` on a directory raises
+    IsADirectoryError), and the consequences are exactly the ones the block's own
+    comment says are impossible: the original exception is REPLACED by a
+    misleading OSError from tidy-up, the child is never reaped, and
+    ``config.cleanup()`` is skipped — leaving a 0600 ``.credentials.json``
+    holding a live OAuth token on disk.
+    """
+
+    def test_the_original_exception_is_not_masked(
+        self, probe_recorder, teardown_failure, tmp_path
+    ):
+        with pytest.raises(RuntimeError) as excinfo:
+            _run_probe(tmp_path, **teardown_failure.probe_kwargs)
+        assert str(excinfo.value) == teardown_failure.in_flight, (
+            'the teardown failure replaced the exception it was unwinding, so the '
+            'caller is told about tidy-up instead of the actual cause'
+        )
+
+    def test_the_credential_dir_is_still_reclaimed(
+        self, probe_recorder, teardown_failure, tmp_path
+    ):
+        # Whatever surfaced, the one piece of teardown with security consequences
+        # must have run.
+        with pytest.raises((RuntimeError, OSError)):
+            _run_probe(tmp_path, **teardown_failure.probe_kwargs)
+        config_path = probe_recorder.configs[-1].path
+        assert not config_path.exists(), (
+            f'a failure while tidying up skipped config.cleanup(): {config_path} '
+            'still holds a 0600 .credentials.json'
+        )
+
+    def test_the_failing_step_is_reported_to_stderr(
+        self, probe_recorder, monkeypatch, tmp_path, capsys
+    ):
+        # Loud, not silent: a probe that quietly failed to tidy up leaves no
+        # trace of what it left behind (no-silent-fail-soft).
+        case = _inject_teardown_failure('stub_subdir', monkeypatch, probe_recorder)
+        with pytest.raises(RuntimeError, match=case.in_flight):
+            _run_probe(tmp_path, **case.probe_kwargs)
+        shutil.rmtree(probe_recorder.stub_dirs[-1], ignore_errors=True)
+        err = capsys.readouterr().err
+        assert 'WARNING' in err and 'teardown' in err, (
+            f'the swallowed teardown failure was never reported; stderr was {err!r}'
+        )
+
+    def test_stub_entries_after_the_failing_one_are_still_unlinked(
+        self, probe_recorder, monkeypatch, tmp_path
+    ):
+        case = _inject_teardown_failure('stub_subdir', monkeypatch, probe_recorder)
+        with pytest.raises(RuntimeError, match=case.in_flight):
+            _run_probe(tmp_path, **case.probe_kwargs)
+        stub_dir = probe_recorder.stub_dirs[-1]
+        leftover = stub_dir / '1-planted-file'
+        survived = leftover.exists()
+        # The planted SUBDIR legitimately survives — nothing in the teardown
+        # removes a subtree — so reclaim it here rather than littering /tmp.
+        shutil.rmtree(stub_dir, ignore_errors=True)
+        assert not survived, (
+            'one unlinkable stub entry cancelled the rest of the glob loop'
+        )
+        assert not probe_recorder.configs[-1].path.exists()
+
+    def test_the_other_capture_handle_is_still_closed(
+        self, probe_recorder, monkeypatch, tmp_path
+    ):
+        case = _inject_teardown_failure('handle_close', monkeypatch, probe_recorder)
+        with pytest.raises(RuntimeError, match=case.in_flight):
+            _run_probe(tmp_path, **case.probe_kwargs)
+        assert len(case.handles) == 2, 'both capture files should have been opened'
+        assert case.handles[0].close_attempts == 1, 'the injected close failure never fired'
+        assert case.handles[1].closed, (
+            'a failing stdout close skipped the stderr close — the second handle '
+            'was left to the GC'
+        )
+        for path in probe_recorder.temp_paths:
+            assert not path.exists(), f'an argv temp file survived: {path}'
+        assert not probe_recorder.stub_dirs[-1].exists()
+        assert not probe_recorder.configs[-1].path.exists()
+
+    def test_temp_paths_after_the_failing_one_are_still_unlinked(
+        self, probe_recorder, monkeypatch, tmp_path
+    ):
+        case = _inject_teardown_failure('temp_path_unlink', monkeypatch, probe_recorder)
+        with pytest.raises(RuntimeError, match=case.in_flight):
+            _run_probe(tmp_path, **case.probe_kwargs)
+        assert len(probe_recorder.temp_paths) == 2, (
+            'mcp_wedge should build two temp files; without a second one this '
+            'test could not tell a skipped loop from a finished one'
+        )
+        blocked, following = probe_recorder.temp_paths
+        blocked_survived = blocked.exists()
+        following_survived = following.exists()
+        # os.unlink, not Path.unlink: the failing wrapper is still installed.
+        for path in (blocked, following):
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+        assert blocked_survived, 'the injected unlink failure never fired'
+        assert not following_survived, (
+            'one unlinkable temp path cancelled the rest of the loop'
+        )
+        assert not probe_recorder.stub_dirs[-1].exists()
+        assert not probe_recorder.configs[-1].path.exists()
+
+    def test_a_failing_first_step_still_reaps_the_child(
+        self, probe_recorder, monkeypatch, tmp_path
+    ):
+        """The orphaned-child half, which no config-dir assertion reaches.
+
+        ``_drain_exit`` normally reaps the child — but it is exactly what does
+        NOT run when the ``try`` body raises, which is when the ``finally``'s
+        ``kill()`` is the only reaper left.  Put a raise in the FIRST teardown
+        step and that reaper is skipped, leaking a live CLI process (with the
+        OAuth token in its environment) for the life of the machine.
+        """
+        spawned: list[_FakePopen] = []
+
+        def _fake_popen(*args: Any, **kwargs: Any) -> _FakePopen:
+            proc = _FakePopen()
+            spawned.append(proc)
+            return proc
+
+        monkeypatch.setattr(probe.subprocess, 'Popen', _fake_popen)
+
+        def _boom_drain_exit(*args: Any, **kwargs: Any) -> dict:
+            raise RuntimeError('injected: _drain_exit')
+
+        monkeypatch.setattr(probe, '_drain_exit', _boom_drain_exit)
+        handles: list[Any] = []
+        _explode_first_capture_close(monkeypatch, handles)
+
+        with pytest.raises(RuntimeError, match='injected: _drain_exit'):
+            _run_probe(tmp_path)
+
+        assert spawned, 'the run never reached the spawn — bad injection'
+        assert handles and handles[0].close_attempts == 1, 'the close failure never fired'
+        assert spawned[-1].kill_calls == 1, (
+            'a raise in the first teardown step orphaned the child: nothing else '
+            'in this process will ever reap it'
+        )
+        assert spawned[-1].wait_calls == 1
+        assert not probe_recorder.configs[-1].path.exists()
