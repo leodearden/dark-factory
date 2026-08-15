@@ -2096,17 +2096,23 @@ class TaskInterceptor:
         metadata blob (``metadata_mode='merge'``) — it does not replace that
         blob. See the comment at the write for why (task 3446).
 
-        Before writing, verifies the target is still combine-ELIGIBLE and that
-        its fingerprint matches. Eligibility is the shared
+        Before writing, verifies the decision found its target and that the
+        target is still combine-ELIGIBLE, IN THAT ORDER. A mismatched
+        fingerprint (curator targeted the wrong task) aborts first, so a
+        misdirected decision can never be recorded as an eligibility refusal
+        against a row it never meant. Eligibility is then the shared
         ``is_combine_eligible_status`` (task_curator) — the same predicate the
         curator's selection snapshot uses, so the two cannot drift apart —
-        conjoined with an execution-only liveness check: a target held by a
-        live ``claimant_run_id`` is refused even when its status is pending
-        (task 4035). A mismatched fingerprint (curator targeted the wrong
-        task) aborts likewise. Every abort returns None so the caller degrades
-        to ``create`` instead of clobbering a task that has moved on since
-        selection. Eligibility refusals are recorded in the combine audit with
-        a ``refused_reason`` token so the refusal rate is countable.
+        conjoined with an execution-only check the snapshot cannot make: a
+        target carrying a ``claimant_run_id`` stamp is refused even when its
+        status is pending (task 4035). That conjunct tests only for a present,
+        non-blank stamp; unlike ``shared.task_claimant.has_live_claimant`` it
+        does NOT check heartbeat freshness, so a stale stamp refuses too —
+        conservative by design, since refusing only degrades to ``create``.
+        Every abort returns None so the caller degrades to ``create`` instead
+        of clobbering a task that has moved on since selection. Eligibility
+        refusals are recorded in the combine audit with a ``refused_reason``
+        token so the refusal rate is countable.
 
         A third abort condition joins those two: *candidate_metadata*
         declaring an escalation gate while the live target does not. The
@@ -2147,6 +2153,30 @@ class TaskInterceptor:
             )
             return None
 
+        target_title = str(target.get('title', '') or '')
+
+        # ── Guard: the decision must be aimed at the task it named ──
+        # Ordered FIRST, ahead of the eligibility check, precisely because the
+        # eligibility refusal is AUDITED. A mismatched fingerprint means the
+        # curator targeted the wrong row, so this row's status/title/
+        # description describe a task that was never the intended target;
+        # auditing it as an eligibility refusal would write an actively
+        # misleading old.* record AND contaminate the refusal-rate metric
+        # with a separate population (mis-targeting, not raced-target).
+        # Refusing here keeps the audited population exactly "decisions that
+        # found their target but arrived too late" (task 4035).
+        expected_fp = normalize_title(target_title)
+        got_fp = normalize_title(decision.target_fingerprint or '')
+        if not got_fp or expected_fp != got_fp:
+            logger.warning(
+                'combine-guard: fingerprint mismatch for target=%s: '
+                'expected=%r got=%r — aborting combine',
+                decision.target_id,
+                target_title[:80],
+                (decision.target_fingerprint or '')[:80],
+            )
+            return None
+
         # ── Guard: the target must still be combine-ELIGIBLE right now ──
         # Shared with the curator's selection snapshot (task_curator's
         # is_combine_eligible_status) so the two cannot drift apart again —
@@ -2158,6 +2188,15 @@ class TaskInterceptor:
         # claimant is this codebase's spelling for "unclaimed"
         # (shared/task_claimant.py; live_task_write_guard.has_live_claimant),
         # and .get() keeps it safe on a row with no such key at all.
+        #
+        # Deliberately WEAKER than shared.task_claimant.has_live_claimant:
+        # this checks only that a claimant STAMP is present, not that its
+        # heartbeat is fresh, so a stale stamp left by a hard-crashed run
+        # also refuses. That is the conservative direction (refusing degrades
+        # to create, which loses no work), and reading heartbeat_at against a
+        # configured TTL here would put a liveness policy in the combine path
+        # that the selection snapshot cannot mirror. Do not describe this as
+        # a "live" claimant — it is not that check.
         target_claimant = target.get('claimant_run_id')
         target_is_claimed = isinstance(target_claimant, str) and target_claimant.strip() != ''
 
@@ -2176,20 +2215,21 @@ class TaskInterceptor:
             # above, so this closes the inner window at no extra I/O.
             refused_reason = COMBINE_REFUSED_CLAIMED
             logger.warning(
-                'combine-guard: target %s is held by a live claimant — aborting '
-                'combine to avoid rewriting a task under a running agent',
+                'combine-guard: target %s carries a claimant stamp — aborting '
+                'combine to avoid rewriting a task under an agent that may '
+                'still be running',
                 decision.target_id,
             )
         else:
             refused_reason = None
 
-        target_title = str(target.get('title', '') or '')
-
         if refused_reason is not None:
             # Audit the refusal so it is COUNTABLE, not merely logged: a
             # refusal rate cannot be computed from success records alone. The
-            # old.* fields come from the live re-read above, and the new.*
-            # fields record the rewrite that was averted.
+            # old.* fields come from the live re-read above — and, thanks to
+            # the fingerprint guard ABOVE, they always describe the task the
+            # curator actually meant to combine into. The new.* fields record
+            # the rewrite that was averted.
             _append_combine_audit(
                 project_id=project_id,
                 target_id=decision.target_id,
@@ -2200,17 +2240,6 @@ class TaskInterceptor:
                 new_description=rt.description,
                 justification=decision.justification,
                 refused_reason=refused_reason,
-            )
-            return None
-        expected_fp = normalize_title(target_title)
-        got_fp = normalize_title(decision.target_fingerprint or '')
-        if not got_fp or expected_fp != got_fp:
-            logger.warning(
-                'combine-guard: fingerprint mismatch for target=%s: '
-                'expected=%r got=%r — aborting combine',
-                decision.target_id,
-                target_title[:80],
-                (decision.target_fingerprint or '')[:80],
             )
             return None
 
@@ -2235,7 +2264,9 @@ class TaskInterceptor:
         # the operational signal being measured, whereas a gate-metadata or
         # fingerprint refusal means the curator targeted the wrong task —
         # a decision-quality problem the audit's old-vs-new record does not
-        # help diagnose.
+        # help diagnose. Guard ORDER is what keeps those populations apart:
+        # fingerprint runs before eligibility, so a mis-targeted decision
+        # exits above and never lands in the audited count.
         if self._is_gate_metadata(candidate_metadata) and not self._is_gate_metadata(
             target.get('metadata')
         ):
