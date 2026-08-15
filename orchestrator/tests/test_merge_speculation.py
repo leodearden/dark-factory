@@ -59,9 +59,12 @@ from _orch_helpers import (  # noqa: F401
     wait_responsive,
 )
 from test_merge_queue_concurrent_verify import (  # noqa: F401
+    _FAIL_OPEN_LOGGERS,
     HEAVY_BARRIER_TEST_TIMEOUT,
     PYPROJECT_DEFAULT_TIMEOUT,
+    _fail_open_records,
     _fake_verify_result,
+    _format_fail_open_records,
     _gated_runner,
     _id_liveness_fake_runner,
     _inject_two_host_allocator,
@@ -108,56 +111,6 @@ from orchestrator.warm_lane_pool import LaneState, WarmLanePool  # noqa: F401
 # ---------------------------------------------------------------------------
 # Module-level helpers
 # ---------------------------------------------------------------------------
-
-
-# Task 3980 step-12/13: the merge-disposition classifier has TWO fail-open
-# sites, on two different loggers, and both emit this same substring:
-#
-#   1. merge_disposition.py:710-719 — the classifier's own internal fail-open,
-#      logger 'orchestrator.merge_disposition'.
-#   2. merge_queue.py:994-1001 — `_classify_disposition_for_outcome`'s
-#      belt-and-suspenders catch for anything the classifier's own fail-open
-#      re-raises past, logger 'orchestrator.merge_queue'.
-#
-# Keying one predicate on the shared substring catches both. Filtering by a
-# single logger name (as this file did before step-13) silently excludes site 2.
-_FAIL_OPEN_SUBSTRING = 'degrading to INDETERMINATE (fail-open, I3)'
-_FAIL_OPEN_LOGGERS = ('orchestrator.merge_disposition', 'orchestrator.merge_queue')
-
-
-def _fail_open_records(
-    records: list[logging.LogRecord],
-) -> list[logging.LogRecord]:
-    """Return the disposition fail-open WARNINGs among *records* (both sites).
-
-    NOT symmetric with "the classifier ran": a classifier that SUCCEEDS emits
-    NOTHING at WARNING (it logs only on the degrade paths,
-    merge_disposition.py:695 and :711), so an empty return here means "no
-    fail-open", never "the classifier was reached". Proving the classifier was
-    reached needs a delegating SPY on the callable — see
-    ``TestLateArrivalFailCascade`` for the live one and
-    ``TestDispositionDoubleFidelity`` for the isolated two-sided proof.
-    Reading log silence as non-execution is exactly the inference that produced
-    a wrong review finding against this file; do not repeat it.
-
-    Deliberately does NOT match merge_disposition.py:695's *other* degrade
-    ('degrading implicated landings to INDETERMINATE (...)'), which is a
-    legitimate evidence-absent verdict rather than a swallowed exception.
-    """
-    return [
-        r for r in records
-        if r.name in _FAIL_OPEN_LOGGERS and _FAIL_OPEN_SUBSTRING in r.getMessage()
-    ]
-
-
-def _format_fail_open_records(records: list[logging.LogRecord]) -> str:
-    """Render fail-open records for an assertion message, naming the underlying
-    exception (the actionable part — the WARNING text alone never says WHY)."""
-    return '\n'.join(
-        f'  - [{r.name}] {r.getMessage()}'
-        + (f'\n    underlying: {r.exc_info[1]!r}' if r.exc_info else '')
-        for r in records
-    )
 
 
 def _write_recording_script(lane: Path, name: str) -> Path:

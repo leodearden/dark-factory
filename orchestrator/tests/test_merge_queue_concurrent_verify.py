@@ -544,6 +544,69 @@ def _fake_verify_result(*, passed: bool, **overrides: Any) -> MagicMock:
     return fake
 
 
+# ---------------------------------------------------------------------------
+# Disposition fail-open predicate (task 3980 amendment) — the companion guard
+# to _fake_verify_result above, and deliberately colocated with it.
+#
+# The classifier has TWO fail-open sites, on two different loggers, both
+# emitting the same substring:
+#   1. merge_disposition.py:710-719 — the classifier's own internal fail-open,
+#      logger 'orchestrator.merge_disposition'.
+#   2. merge_queue.py:994-1001 — `_classify_disposition_for_outcome`'s
+#      belt-and-suspenders catch for anything site 1 re-raises past, logger
+#      'orchestrator.merge_queue'.
+# Keying on the shared substring catches both; filtering by a single logger
+# name silently excludes site 2.
+#
+# Lives HERE rather than in test_merge_speculation.py so there is exactly one
+# predicate for one production invariant. Task 3980 first wrote a second copy
+# over there, and the two had already diverged before the amendment pass: this
+# file's older inline version keyed on a longer substring that matched only
+# site 1. Two copies of a drift-detector is how the drift gets back in.
+_FAIL_OPEN_SUBSTRING = 'degrading to INDETERMINATE (fail-open, I3)'
+_FAIL_OPEN_LOGGERS = ('orchestrator.merge_disposition', 'orchestrator.merge_queue')
+
+
+def _fail_open_records(
+    records: list[logging.LogRecord],
+) -> list[logging.LogRecord]:
+    """Return the disposition fail-open WARNINGs among *records* (both sites).
+
+    NOT symmetric with "the classifier ran": a classifier that SUCCEEDS emits
+    NOTHING at WARNING (it logs only on the degrade paths,
+    merge_disposition.py:695 and :711), so an empty return here means "no
+    fail-open", never "the classifier was reached". Proving the classifier was
+    reached needs a delegating SPY on the callable — see
+    test_merge_speculation.py's ``TestLateArrivalFailCascade`` for the live one
+    and ``TestDispositionDoubleFidelity`` for the isolated two-sided proof.
+    Reading log silence as non-execution is exactly the inference that produced
+    a wrong review finding against that file; do not repeat it.
+
+    Deliberately does NOT match merge_disposition.py:695's *other* degrade
+    ('degrading implicated landings to INDETERMINATE (...)'), which is a
+    legitimate evidence-absent verdict rather than a swallowed exception.
+    """
+    return [
+        r for r in records
+        if r.name in _FAIL_OPEN_LOGGERS and _FAIL_OPEN_SUBSTRING in r.getMessage()
+    ]
+
+
+def _format_fail_open_records(records: list[logging.LogRecord]) -> str:
+    """Render fail-open records for an assertion message, naming the underlying
+    exception (the actionable part — the WARNING text alone never says WHY)."""
+    return '\n'.join(
+        f'  - [{r.name}] {r.getMessage()}'
+        + (
+            f'\n    underlying: {r.exc_info[1]!r}\n'
+            + ''.join(traceback.format_exception(*r.exc_info))
+            if r.exc_info
+            else ''
+        )
+        for r in records
+    )
+
+
 def _mock_verify_pass() -> AsyncMock:
     """Return a mock that makes run_scoped_verification always pass."""
     return AsyncMock(return_value=_fake_verify_result(passed=True, summary=''))
@@ -5518,25 +5581,25 @@ class TestRedispatchSpeculativeConservation:
         # task 3477: A's VerifyResult double (passed=False) reaches
         # classify_merge_failure_disposition via the real post-merge-verify
         # path. That classifier must complete honestly, not silently degrade
-        # to its fail-open path (merge_disposition.py:710-719) because the
-        # double's cause_hint/test_output shape confused
-        # _extract_failing_tests_and_candidate_files. This guard is what
-        # proves the (b) fidelity fix actually reached this call site — any
-        # future double built without a real cause_hint re-trips it.
-        fail_open_records = [
-            r for r in caplog.records
-            if 'internal error; degrading to INDETERMINATE (fail-open, I3)' in r.message
-        ]
+        # to its fail-open path because the double's cause_hint/test_output
+        # shape confused _extract_failing_tests_and_candidate_files. This guard
+        # is what proves the (b) fidelity fix actually reached this call site —
+        # any future double built without a real cause_hint re-trips it.
+        #
+        # task 3980 amendment: routed through the shared `_fail_open_records`
+        # predicate above. The inline version this replaces keyed on a longer
+        # substring ('internal error; degrading to ...') that matched only
+        # merge_disposition.py:711, so the second fail-open site
+        # (merge_queue.py:1000, logger 'orchestrator.merge_queue') could swallow
+        # the same defect here undetected.
+        fail_open_records = _fail_open_records(caplog.records)
         assert fail_open_records == [], (
             'classify_merge_failure_disposition degraded to the silent '
             'fail-open path while classifying A\'s failing verify — the '
             'VerifyResult double reached _extract_failing_tests_and_'
             'candidate_files and raised instead of returning a real '
-            'disposition. Offending record(s):\n' + '\n'.join(
-                ''.join(traceback.format_exception(*r.exc_info))
-                if r.exc_info else r.message
-                for r in fail_open_records
-            )
+            'disposition. Offending record(s):\n'
+            + _format_fail_open_records(fail_open_records)
         )
 
 
