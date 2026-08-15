@@ -87,6 +87,30 @@ def _extract_call_args_at(text: str, paren_idx: int) -> str:
     raise AssertionError(f'Unbalanced parens scanning from index {paren_idx}')
 
 
+def _missing_required_kwargs(text: str, tool_name: str, required) -> list[str]:
+    """Required kwarg names not passed in any `tool_name(...)` example in *text*.
+
+    Matches `name=` only with a leading non-identifier boundary, so
+    `cited_run_id=` does NOT satisfy a requirement for `run_id` — bare
+    substring containment (the style of this module's older run_id scans)
+    would silently pass a `cite_run` example that had dropped `run_id=`.
+
+    Returns [] when *text* contains no call example for *tool_name* at all;
+    callers that care about a wholesale-dropped tool must assert on
+    `_iter_call_openers` separately.
+    """
+    missing: list[str] = []
+    for paren_idx in _iter_call_openers(text, tool_name):
+        args = _extract_call_args_at(text, paren_idx)
+        for name in required:
+            if (
+                not re.search(r'(?<![A-Za-z0-9_])' + re.escape(name) + r'\s*=', args)
+                and name not in missing
+            ):
+                missing.append(name)
+    return missing
+
+
 class TestMissingRequiredKwargDetection:
     """Negative control for the (not-yet-existing) `_missing_required_kwargs` helper.
 
