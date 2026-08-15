@@ -229,6 +229,23 @@ class TestSamplerDesignedOutcomeParity:
         assert base_counts.designed_outcome == 0
         assert noisy_counts.total_signal == base_counts.total_signal == 1
 
+    def test_co_mingled_ceiling_and_failure_ranks_as_a_genuine_error(self, tmp_path):
+        # A result carrying BOTH a designed CEILING and a real ERROR marker
+        # is a genuine failure at BOTH layers -- the shared classifier is
+        # what makes that true here without a second rule.
+        record = _designed_outcome_record(0)
+        record['message']['content'][0]['content'] = (
+            'WATCHER_REARM_OUTCOME: CEILING exit=124\n'
+            'WATCHER_REARM_OUTCOME: ERROR exit=2'
+        )
+        path = _write_transcript(tmp_path / 'comingled.jsonl', [record])
+
+        counts = mod.score_signals(path)
+
+        assert counts.tool_error == 1
+        assert counts.designed_outcome == 0
+        assert counts.total_signal == 1
+
     def test_sampler_and_digest_agree_on_the_same_records(self, tmp_path):
         # The anti-drift pin: one fixture, two independent scanners, same
         # tool_error. This is the assertion that fails the moment either

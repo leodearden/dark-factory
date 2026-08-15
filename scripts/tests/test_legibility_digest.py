@@ -567,48 +567,165 @@ class TestDesignedOutcomeRecognition:
         assert mod._extract_exit_code(text) == 124
 
     def test_declared_ceiling_is_designed(self):
-        assert mod.classify_designed_outcome(_CEILING_DECLARATION, 124) is not None
+        exit_code, label = mod.classify_error_content(_CEILING_DECLARATION)
+
+        assert exit_code == 124
+        assert label is not None
 
     def test_declared_fired_is_designed(self):
-        label = mod.classify_designed_outcome(
-            'WATCHER_REARM_OUTCOME: FIRED exit=0', 0,
-        )
+        _, label = mod.classify_error_content('WATCHER_REARM_OUTCOME: FIRED exit=0')
 
         assert label is not None
+
+    def test_declared_fired_reports_its_own_zero_exit_code(self):
+        # exit=0 is falsy: the deciding-marker code must be selected with an
+        # explicit None check, never a truthiness fallback.
+        exit_code, _ = mod.classify_error_content('WATCHER_REARM_OUTCOME: FIRED exit=0')
+
+        assert exit_code == 0
 
     def test_declared_killed_is_a_genuine_failure(self):
         # scripts/watcher-rearm.sh:234 classes 137|143|144 as KILLED -- a
         # REAL failure the census should still see, not a designed outcome.
-        assert mod.classify_designed_outcome(
-            'WATCHER_REARM_OUTCOME: KILLED exit=137', 137,
-        ) is None
+        assert mod.classify_error_content(
+            'WATCHER_REARM_OUTCOME: KILLED exit=137',
+        ) == (137, None)
 
     def test_declared_error_is_a_genuine_failure(self):
         # scripts/watcher-rearm.sh:237's catch-all ERROR branch.
-        assert mod.classify_designed_outcome(
-            'WATCHER_REARM_OUTCOME: ERROR exit=2', 2,
-        ) is None
+        assert mod.classify_error_content(
+            'WATCHER_REARM_OUTCOME: ERROR exit=2',
+        ) == (2, None)
 
     def test_bare_exit_124_is_a_designed_bounded_wait(self):
-        assert mod.classify_designed_outcome(
-            'command timed out after 600s', 124,
-        ) is not None
+        _, label = mod.classify_error_content('command timed out after 600s, exit=124')
+
+        assert label is not None
 
     def test_ordinary_failure_is_not_designed(self):
-        assert mod.classify_designed_outcome('boom, exit code 2', 2) is None
+        assert mod.classify_error_content('boom, exit code 2') == (2, None)
 
     def test_empty_content_with_no_exit_code_is_not_designed(self):
-        assert mod.classify_designed_outcome('', None) is None
+        assert mod.classify_error_content('') == (None, None)
 
     def test_declaration_and_bare_124_labels_are_distinct(self):
         # Which rule fired must stay legible to a digest reader.
-        declared = mod.classify_designed_outcome(_CEILING_DECLARATION, 124)
-        bare = mod.classify_designed_outcome('timed out', 124)
+        _, declared = mod.classify_error_content(_CEILING_DECLARATION)
+        _, bare = mod.classify_error_content('timed out, exit=124')
 
         assert declared != bare
 
+    def test_accepts_a_raw_block_list_content_field(self):
+        # The public entry point takes a tool_result 'content' field as-is
+        # (str OR list of blocks), so no caller -- in this module or in
+        # sampling.py -- needs digest's private text flattener.
+        blocks = [{'type': 'text', 'text': _CEILING_DECLARATION}]
+
+        assert (
+            mod.classify_error_content(blocks)
+            == mod.classify_error_content(_CEILING_DECLARATION)
+        )
+
     def test_bounded_wait_exit_code_constant_is_timeout_ceiling(self):
         assert mod.BOUNDED_WAIT_EXIT_CODE == 124
+
+
+class TestCoMingledDesignedAndGenuineContent:
+    """A designed classification must hold for the WHOLE content.
+
+    One tool_result can carry both a designed declaration and a real
+    failure: a Bash call that loops scripts/watcher-rearm.sh, or that
+    tails its log beside a failing command. The script writes its marker
+    to STDERR (:228-237), so it co-mingles with any other stderr in the
+    same result. Classifying on the first designed marker alone deletes
+    the genuine failure from BOTH ``signal_counts['tool_error']`` and the
+    Error Neighborhoods section, and renders it under Designed Outcomes
+    with the wrong exit code -- exactly the under-count that
+    DESIGNED_OUTCOME_PATTERNS' own docstring refuses to trade for.
+    """
+
+    def test_ceiling_followed_by_an_error_marker_is_genuine(self):
+        text = (
+            'WATCHER_REARM_OUTCOME: CEILING exit=124\n'
+            'WATCHER_REARM_OUTCOME: ERROR exit=2'
+        )
+
+        assert mod.classify_error_content(text) == (2, None)
+
+    def test_fired_followed_by_a_killed_marker_is_genuine(self):
+        text = (
+            'WATCHER_REARM_OUTCOME: FIRED exit=0\n'
+            'WATCHER_REARM_OUTCOME: KILLED exit=137'
+        )
+
+        assert mod.classify_error_content(text) == (137, None)
+
+    def test_a_dissenting_marker_decides_even_when_it_comes_first(self):
+        text = (
+            'WATCHER_REARM_OUTCOME: ERROR exit=2\n'
+            'WATCHER_REARM_OUTCOME: CEILING exit=124'
+        )
+
+        assert mod.classify_error_content(text) == (2, None)
+
+    def test_repeated_designed_markers_stay_designed(self):
+        text = _CEILING_DECLARATION + '\nWATCHER_REARM_OUTCOME: CEILING exit=124'
+
+        exit_code, label = mod.classify_error_content(text)
+
+        assert exit_code == 124
+        assert label is not None
+
+    def test_unaccounted_failure_code_beside_a_ceiling_is_genuine(self):
+        # A declaration speaks only for its OWN invocation: a fatal code
+        # that no declaration accounts for outvotes it.
+        text = (
+            'tail of watcher.log: WATCHER_REARM_OUTCOME: CEILING exit=124\n'
+            'fatal: repo corrupt, exit code 128'
+        )
+
+        assert mod.classify_error_content(text) == (128, None)
+
+    def test_bare_ceiling_code_beside_a_failure_code_is_genuine(self):
+        # The same rule one tier down: a bare 124 classifies only when it
+        # is the ONLY outcome code in the content.
+        text = 'poll timed out, exit=124\nthe retry then died, exit code 2'
+
+        assert mod.classify_error_content(text) == (2, None)
+
+    def test_co_mingled_result_counts_as_a_tool_error(self):
+        records = [
+            _assistant(_tool_use('Bash', {'command': 'rearm-loop'}, id='tu-m')),
+            _tool_result(
+                'tu-m',
+                'WATCHER_REARM_OUTCOME: CEILING exit=124\n'
+                'WATCHER_REARM_OUTCOME: ERROR exit=2',
+                is_error=True,
+            ),
+        ]
+
+        counts = mod.signal_counts(records)
+
+        assert counts['tool_error'] == 1
+        assert counts['designed_outcome'] == 0
+
+    def test_co_mingled_result_renders_with_the_deciding_exit_code(self):
+        records = [
+            _assistant(_tool_use('Bash', {'command': 'rearm-loop'}, id='tu-m')),
+            _tool_result(
+                'tu-m',
+                'WATCHER_REARM_OUTCOME: CEILING exit=124\n'
+                'WATCHER_REARM_OUTCOME: ERROR exit=2',
+                is_error=True,
+            ),
+        ]
+
+        digest = mod.render_digest(records, agent_class='interactive')
+        _, body = _split_frontmatter(digest)
+
+        assert '## Designed Outcomes' not in body
+        error_block = body.split('## Error Neighborhoods', 1)[1].split('\n##', 1)[0]
+        assert '[exit 2]' in error_block
 
 
 # ---------------------------------------------------------------------------
@@ -1877,7 +1994,7 @@ class TestDesignedOutcomesSection:
     def test_designed_outcome_line_names_the_rule_that_fired(self):
         # Distinct labels per rule keep which-rule-fired legible: a
         # self-declared CEILING must not read the same as a bare 124.
-        declared = mod.classify_designed_outcome(_CEILING_DECLARATION, 124)
+        _, declared = mod.classify_error_content(_CEILING_DECLARATION)
         assert declared is not None
 
         digest = mod.render_digest(
