@@ -617,7 +617,13 @@ MIN_SHUTDOWN_MARGIN_SECONDS = 5
 # the real invariant (5 > 6) is violated.  Parsing the live value instead makes
 # that bump fail loudly, the same way test_template_renders_to_hardcoded_file
 # renders the template rather than restating its contents.
-POLL_JS = REPO_ROOT / "dashboard" / "src" / "dashboard" / "static" / "redux" / "data.js"
+REDUX_DIR = REPO_ROOT / "dashboard" / "src" / "dashboard" / "static" / "redux"
+POLL_JS = REDUX_DIR / "data.js"
+
+# The SECOND recurring HTTP poller: HostLoadCard's /api/load poll.  It is fully
+# independent of data.js's refresh — its own setInterval, its own connection,
+# its own reuse interval — so the keep-alive bound has to clear it too.
+LOAD_POLL_JSX = REDUX_DIR / "tab_overview.jsx"
 
 # The poller names its period explicitly, so anchor on that name rather than on
 # whichever call site happens to consume it.  An earlier revision scraped the
@@ -1101,6 +1107,40 @@ def test_client_poll_interval_is_readable_from_the_shipped_client() -> None:
         "is derived from it; update POLL_JS if the client moved."
     )
     assert _client_poll_interval_ms() > 0
+
+
+def test_host_load_poller_declares_a_named_interval() -> None:
+    """The host-load card's /api/load poller must expose a parseable period too.
+
+    HostLoadCard in tab_overview.jsx runs an INDEPENDENT second HTTP poller: it
+    fetches /api/load on its own setInterval, entirely separate from data.js's
+    data refresh.  It therefore holds its own keep-alive connection and reuses
+    it at its own interval, so its period is a load-bearing input to the
+    keep-alive lower bound and must be derivable — a poller whose period cannot
+    be read is a poller the bound cannot clear.
+
+    Naming the period rather than leaving a bare ``setInterval(fetchLoad, 5000)``
+    literal is what makes that derivation stable.  This module already learned
+    and recorded that lesson for data.js (see the comment above
+    _poll_interval_patterns): scraping the literal at the call site broke the
+    moment the poller was refactored to pass a named constant, and binding to
+    the declaration is both stabler and more precise.  The same reasoning
+    applies here, and the declaration additionally gives the JSX a place to
+    carry the "this feeds the systemd keep-alive bound" warning.
+    """
+    assert LOAD_POLL_JSX.is_file(), (
+        f"Host-load poll source not found at {LOAD_POLL_JSX}. The keep-alive "
+        "lower bound is derived from it; update LOAD_POLL_JSX if the host-load "
+        "card moved."
+    )
+    assert (
+        _parse_poll_interval_ms(
+            LOAD_POLL_JSX.read_text(encoding="utf-8"),
+            str(LOAD_POLL_JSX),
+            const_name="LOAD_POLL_INTERVAL_MS",
+        )
+        > 0
+    )
 
 
 def test_shutdown_drain_is_bounded_in_both_unit_files() -> None:
