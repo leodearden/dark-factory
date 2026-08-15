@@ -2008,7 +2008,11 @@ def materialize_selection_arm(
 
 
 def load_production_fetches(
-    path: str | Path, seeded: Any, *, expect_query_ids: list[str] | None = None,
+    path: str | Path,
+    seeded: Any,
+    *,
+    expect_query_ids: list[str] | None = None,
+    expect_limit: int | None = None,
 ) -> dict[str, list[Any]]:
     """Rehydrate the production rankings, or refuse by name.
 
@@ -2016,6 +2020,18 @@ def load_production_fetches(
     materialize raises through ``_rehydrate_ranking``, and the corpus
     fingerprint is checked here — because a production half replayed against
     a drifted corpus is exactly as unpublishable as an E2 half.
+
+    *expect_limit* is the depth guard, ported from ``load_fetches``
+    (bake_off_storage_shape.py:3378-3395) with one structural difference: the
+    E2 half records ``search_limit`` once in the TOP-LEVEL provenance block,
+    whereas the production half records it PER SHAPE (written by
+    :func:`extend_fetch_cache`), so it is read off ``shape_block`` and checked
+    beside the fingerprint.  Opt-in for the same reason as its E2 sibling —
+    a pure round-trip test exercises the join without declaring a depth — but
+    supplied by every driver, because a shallower cache is not a smaller
+    measurement: ``read_path`` truncates with a plain ``records[:k]`` slice
+    and the recorded ``'k'`` is the REQUESTED k, so a 3-deep window scored at
+    ``k=5`` is indistinguishable from a full one downstream.
     """
     import json  # noqa: PLC0415
 
@@ -2048,6 +2064,26 @@ def load_production_fetches(
             f'corpora; re-fetch rather than publishing a stale ranking as a '
             f'fresh measurement.'
         )
+    if expect_limit is not None:
+        cached_limit = shape_block.get('search_limit')
+        if cached_limit is None:
+            raise ProductionFetchError(
+                f'fetch cache at {target} does not record the search limit its '
+                f'production rankings for {seeded.shape!r} were fetched at, so '
+                f'the depth cannot be checked against the requested '
+                f'{int(expect_limit)}. Re-fetch with --extend-cache-live.'
+            )
+        if int(cached_limit) < int(expect_limit):
+            raise ProductionFetchError(
+                f'fetch cache at {target}: the production rankings for '
+                f'{seeded.shape!r} were fetched at limit {int(cached_limit)}, '
+                f'shallower than the requested limit {int(expect_limit)}. '
+                f'Replaying them would measure every arm over a '
+                f'{int(cached_limit)}-deep window while the report claimed '
+                f'{int(expect_limit)} — a silently DIFFERENT experiment, not a '
+                f'smaller one. (A deeper cache is fine: the reader truncates '
+                f'to its own budget anyway.)'
+            )
     cached = shape_block.get('queries') or {}
     if expect_query_ids is not None:
         missing = [q for q in expect_query_ids if q not in cached]
@@ -2191,6 +2227,7 @@ def score_from_cache(
     prod_hits = load_production_fetches(
         fetch_cache, seeded,
         expect_query_ids=[query.query_id for query in prod_queries],
+        expect_limit=production_k,
     )
     scored = run_selection(
         seeded,
@@ -2256,12 +2293,23 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.extend_cache_live:
         queries = load_production_queries(args.production_queries)
+        # The fetch depth is resolved as its OWN quantity rather than taken
+        # from either window flag.  `--k` alone wrote a cache that
+        # `load_production_fetches` now refuses (`--k 3` is shallower than
+        # `production_k`), and `--production-k` alone would shallow the next
+        # re-harvest from the committed 10 to 5, silently changing every
+        # backfilled `topic_diversity_cap` window.  The max of the two is the
+        # only resolution that can serve both readers: a cache may be deeper
+        # than the budget it is scored at, never shallower.
+        fetch_limit = max(int(args.k), int(args.production_k))
         fetched = asyncio.run(fetch_production_rankings(
-            queries, project_suffix=args.project_suffix, limit=args.k,
+            queries, project_suffix=args.project_suffix, limit=fetch_limit,
         ))
         target = extend_fetch_cache(args.fetch_cache, fetched)
         print(f'extended {target} with {len(fetched["queries"])} production '
-              f'rankings at limit {fetched["search_limit"]}')
+              f'rankings at limit {fetched["search_limit"]} '
+              f'(resolved from --k {args.k} / --production-k '
+              f'{args.production_k})')
         return 0
 
     try:
