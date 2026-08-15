@@ -2930,11 +2930,6 @@ def test_heartbeat_lease_advances_mtime(tmp_path: Path) -> None:
     assert lease_path.stat().st_mtime > old_mtime
 
 
-def test_heartbeat_lease_on_absent_lease_returns_false_without_raising(tmp_path: Path) -> None:
-    result = sr.heartbeat_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
-    assert result is sr.LeaseMutation.ABSENT
-
-
 def test_release_lease_removes_the_lease_file(tmp_path: Path) -> None:
     holder = sr.LeaseHolder(session_slug='watcher-df-100', pid=os.getpid(), start_ts=_NOW.isoformat())
     sr.claim_lease('watcher-df', holder=holder, root=tmp_path, now=_NOW)
@@ -3002,6 +2997,41 @@ def test_heartbeat_lease_on_an_absent_lease_is_absent_and_quiet(
 
     assert result is sr.LeaseMutation.ABSENT
     assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+
+
+def test_heartbeat_lease_on_a_reaped_lease_is_absent_and_the_owner_can_re_claim(
+    tmp_path: Path,
+) -> None:
+    """ABSENT on a HEARTBEAT is not the harmless idempotence it is on a release.
+
+    Code backing for the skill contract: the holder's own per-cycle heartbeat
+    reporting ABSENT means its lease is GONE (reaped here; an operator
+    `--force` release does the same), so the session is now running un-leased
+    and any duplicate can take the name freely. The prescribed response is to
+    re-claim, which must actually work — a watcher that kept beating into the
+    void would sit at `result=absent` forever, which is the duplicate-watcher
+    condition the lease exists to prevent.
+    """
+    lease_path = _seed_lease(tmp_path, pid=_DEAD_PID)
+    _set_mtime(lease_path, _NOW, sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1))
+    assert [r.reason for r in sr.reap_stale_leases(root=tmp_path, now=_NOW)] == ['stale_pid']
+
+    result = sr.heartbeat_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
+
+    assert result is sr.LeaseMutation.ABSENT
+    # ...and re-claiming is the documented recovery, so it must succeed.
+    reclaim = sr.claim_lease(
+        'watcher-df',
+        holder=sr.LeaseHolder(
+            session_slug='watcher-df-100', pid=os.getpid(), start_ts=_NOW.isoformat()
+        ),
+        root=tmp_path,
+        now=_NOW,
+    )
+    assert reclaim.acquired
+    assert sr.heartbeat_lease('watcher-df', slug='watcher-df-100', root=tmp_path) is (
+        sr.LeaseMutation.APPLIED
+    )
 
 
 def test_heartbeat_lease_on_a_corrupt_body_is_refused_with_mtime_untouched(
@@ -3398,8 +3428,14 @@ def test_main_lease_claim_on_free_name_acquires_and_prints_decision_token(
     )
 
     assert rc == 0
-    out = capsys.readouterr().out
-    assert out.splitlines()[0] == 'decision=acquired'
+    lines = capsys.readouterr().out.splitlines()
+    # The WHOLE acquired-path contract, not just line 1: a successful claim has
+    # no contending holder, so it must not print `holder_liveness=held` (which
+    # reads as "someone else has it"). `none` is the third token in the
+    # vocabulary, and it is pinned here because nothing else exercises it.
+    assert lines[0] == 'decision=acquired'
+    assert lines[-1] == 'holder_liveness=none'
+    assert len(lines) == 3
     assert sr.lease_path_for_name('watcher-df', root=tmp_path).is_file()
 
 
@@ -3545,7 +3581,7 @@ def test_main_lease_claim_reports_held_for_an_unreadable_lease_body(
 
 
 class TestLeaseSlugIsNotASessionRecordKey:
-    """The two slug namespaces are DISJOINT — pinned so the withdrawn corroboration cannot return.
+    """`read_record(<a lease slug>)` raises — pinned so the withdrawn corroboration cannot return.
 
     Task 3994 originally corroborated the orphan signal with the holder's own
     session_registry record, via ``read_record(holder.session_slug)``. That
@@ -3560,16 +3596,24 @@ class TestLeaseSlugIsNotASessionRecordKey:
     ``~/.claude/fleet/sessions/`` record dirs begin with ``watcher-``. Real
     record slugs look like ``architect-dark_factory-3133-25737ee4-...``.
 
-    The namespaces differ in all three segments, and every builder here is the
-    REAL one — no slug is hand-written:
+    The namespaces differ in all three segments:
     - the LEASE slug is claimant-chosen, prescribed by the skills as
       ``<lease-role>-<project>-<session pid>``
-      (skills/escalation-watcher/SKILL.md:50);
+      (skills/escalation-watcher/SKILL.md:50) — there is no production
+      *builder* for it, only shell in a SKILL.md, so it is spelled out here;
     - the RECORD slug comes from ``build_session_slug(role, project, task,
       <uniqueness token>)``, where the token is a session UUID for a
       hand-launched session (``session_hooks.hook_session_slug``) and the
       project token is the registry's project id (``dark_factory``), not the
       lease's short name (``df``).
+
+    Only ONE test lives here, on purpose: the disjointness RATIONALE belongs to
+    (and is recorded in) ``LeaseHolder.session_slug``'s docstring, and a test
+    that merely compares a literal this file wrote against
+    ``build_session_slug``'s output cannot fail as a result of any production
+    change. The single assertion below has real coupling — it would break if
+    ``read_record`` ever started resolving a lease slug, which is exactly the
+    reintroduction worth catching.
     """
 
     # A hand-launched session's uniqueness token: hook_session_slug passes the
@@ -3590,9 +3634,6 @@ class TestLeaseSlugIsNotASessionRecordKey:
             self.SESSION_UUID,  # type: ignore[arg-type]
         )
 
-    def test_the_two_slugs_for_one_notional_session_differ(self) -> None:
-        assert self._lease_slug() != self._record_slug()
-
     def test_a_real_record_provably_does_not_live_under_its_lease_slug(
         self, tmp_path: Path
     ) -> None:
@@ -3606,28 +3647,6 @@ class TestLeaseSlugIsNotASessionRecordKey:
         # is why holder_session_state was a constant 'absent' in production.
         with pytest.raises(FileNotFoundError):
             sr.read_record(self._lease_slug(), root=tmp_path)
-
-    @pytest.mark.parametrize(
-        ('role', 'project', 'task_id'),
-        [
-            ('watcher', 'df', None),
-            ('session', 'df', None),
-            ('session', 'dark_factory', None),
-            ('unblock', 'df', '2085'),
-            ('recon-watcher', 'df', None),
-        ],
-    )
-    def test_a_lease_slug_is_not_a_build_session_slug_output(
-        self, role: str, project: str, task_id: str | None
-    ) -> None:
-        # Not for any (role, project, task) triple the skills use: the
-        # uniqueness token is a session UUID, never the session pid.
-        assert self._lease_slug() != sr.build_session_slug(
-            role,
-            project,
-            task_id,
-            self.SESSION_UUID,  # type: ignore[arg-type]
-        )
 
 
 # --- resolve_session_pid (task 3994 defect 2) ------------------------------
@@ -3658,15 +3677,20 @@ def test_resolve_session_pid_prefers_claude_pid(caplog: pytest.LogCaptureFixture
     ],
     ids=['unset', 'empty', 'blank', 'non-numeric', 'zero', 'negative'],
 )
-def test_resolve_session_pid_falls_back_loudly(
+def test_resolve_session_pid_falls_back_loudly_to_a_provably_dead_pid(
     env: dict[str, str], caplog: pytest.LogCaptureFixture
 ) -> None:
     with caplog.at_level(logging.WARNING):
         pid = sr.resolve_session_pid(env)
 
-    # Fallback, never a raise -- and never a positive-looking lie.
-    assert isinstance(pid, int)
-    assert pid > 0
+    # Fallback, never a raise -- and never a pid that merely LOOKS resolved.
+    # THE assertion: the degraded pid must be one `_pid_alive` reports dead,
+    # so the lease's staleness AND-guard collapses to its heartbeat half (the
+    # documented degradation) rather than to a never-reapable lease. The
+    # earlier `os.getsid(0)` fallback failed this: the POSIX session leader is
+    # the interactive shell, which outlives a crashed `claude`.
+    assert pid == 0
+    assert sr._pid_alive(pid) is False
     # LOUD, not silent: the repo's loud-over-silent-degradation norm (INV-2).
     warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
     assert warnings
@@ -3679,15 +3703,34 @@ def test_resolve_session_pid_defaults_to_os_environ(monkeypatch: pytest.MonkeyPa
     assert sr.resolve_session_pid() == 424242
 
 
-def test_resolve_session_pid_falls_back_to_getppid_when_getsid_raises(
-    monkeypatch: pytest.MonkeyPatch,
+def test_a_degraded_pid_lease_still_ages_out_and_is_reaped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    def _boom_getsid(*_args: object) -> int:
-        raise OSError('no getsid on this platform')
+    """End-to-end: an unresolvable CLAUDE_PID must not make a lease immortal.
 
-    monkeypatch.setattr(sr.os, 'getsid', _boom_getsid)
+    The whole point of returning 0 rather than a durable-but-unrelated pid:
+    both staleness rules need a DEAD pid AND an aged heartbeat, so a fallback
+    pid that stays alive (the interactive shell) would make a crashed holder's
+    lease permanently unreapable — recoverable only by a human `--force`.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.delenv('CLAUDE_PID', raising=False)
 
-    assert sr.resolve_session_pid({}) == os.getppid()
+    sr.main(['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-degraded'])
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    assert json.loads(lease_path.read_text())['pid'] == 0
+
+    # Fresh: NOT reaped — the heartbeat half of the guard still protects it.
+    _set_mtime(lease_path, _NOW, timedelta(seconds=60))
+    assert sr.reap_stale_leases(root=tmp_path, now=_NOW) == []
+    assert lease_path.is_file()
+
+    # Aged past the TTL: reaped, exactly as pre-3994 heartbeat-only behaviour.
+    _set_mtime(lease_path, _NOW, sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1))
+    reaped = sr.reap_stale_leases(root=tmp_path, now=_NOW)
+
+    assert [r.reason for r in reaped] == ['stale_pid']
+    assert not lease_path.exists()
 
 
 def test_main_lease_claim_without_pid_writes_the_resolved_session_pid(

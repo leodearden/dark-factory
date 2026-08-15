@@ -1852,13 +1852,33 @@ def resolve_session_pid(env: Mapping[str, str] | None = None) -> int:
     because the pid was wrong for that whole year precisely because it
     depended on every skill doc getting one shell token right.
 
-    Chain, in order: ``CLAUDE_PID`` (parsed, must be > 0) -> ``os.getsid(0)``
-    -> ``os.getppid()``. The getsid tier is the SAME durable-pid idiom
-    session_hooks._hand_launched_liveness_pid documents and uses for T6's
-    hand-launched records (the POSIX session leader outlives any hook
-    subprocess), so the lease path and the session-hook path answer "which
-    pid is actually long-lived" the same way instead of inventing a second
-    answer.
+    Chain, in order: ``CLAUDE_PID`` (parsed, must be > 0) -> ``0``.
+
+    THE FALLBACK IS 0 DELIBERATELY, and specifically NOT ``os.getsid(0)`` ->
+    ``os.getppid()`` (which this returned before review). Those are the
+    durable-pid idiom ``session_hooks._hand_launched_liveness_pid`` uses for
+    T6's hand-launched RECORDS, and they are wrong HERE, because a lease pid
+    is consumed by a REAPER rather than merely displayed: the POSIX session
+    leader is ordinarily the interactive shell, which session_hooks itself
+    documents as living "for the terminal's whole lifetime" -- so it stays
+    alive after the ``claude`` process it stood in for has crashed.
+    ``_pid_alive`` would then answer True forever, and because BOTH staleness
+    rules (claim_lease's ``is_stale`` and reap_stale_leases' ``stale_pid``)
+    require a DEAD pid AND an aged heartbeat, a crashed holder's lease would
+    become PERMANENTLY unreapable -- recoverable only by a human
+    ``lease-release --force``. That is a strictly worse failure than the
+    ``--pid $$`` defect this function exists to fix, and the exact opposite of
+    the heartbeat-only degradation documented here and in LEASE_HEARTBEAT_TTL.
+
+    0 makes that documented degradation literally true: ``_pid_alive`` returns
+    False for every pid <= 0, so an unresolvable session pid collapses the
+    AND-guard to its heartbeat half -- precisely the pre-3994 behaviour, which
+    LEASE_HEARTBEAT_TTL's 7200s is still sized to survive -- instead of to a
+    never-reapable lease. The cost is bounded and non-destructive: a contender
+    reads ``holder_liveness=orphaned`` for a degraded holder that may well be
+    alive, but a FRESH heartbeat still forces that contender to stand down,
+    and the prescribed response to ``orphaned`` is to file a DecisionRecord
+    and exit -- never to steal.
 
     Degradation is LOUD, never silent: an unresolvable ``CLAUDE_PID`` emits a
     WARNING stating that the lease's pid/liveness guard is degraded to
@@ -1876,16 +1896,14 @@ def resolve_session_pid(env: Mapping[str, str] | None = None) -> int:
         return pid
     logger.warning(
         'resolve_session_pid: %s is unset or unusable (%r); the lease pid/liveness '
-        'guard is DEGRADED to heartbeat-only staleness. Falling back to the POSIX '
-        'session leader. Note: `$$` in a Claude Code Bash tool call is the transient '
-        '/bin/bash -c wrapper, not the session -- use ${CLAUDE_PID:-$PPID}.',
+        'guard is DEGRADED to heartbeat-only staleness. Recording pid 0, which is '
+        'never alive, so a crashed holder still ages out and is reaped normally. '
+        'Note: `$$` in a Claude Code Bash tool call is the transient /bin/bash -c '
+        'wrapper, not the session -- use ${CLAUDE_PID:-$PPID}.',
         SESSION_PID_ENV,
         raw,
     )
-    try:
-        return os.getsid(0)
-    except OSError:
-        return os.getppid()
+    return 0
 
 
 LEASE_HEARTBEAT_TTL = timedelta(hours=2)
@@ -1911,9 +1929,11 @@ CURRENT BASIS (3994): with the pid guard actually live, a LIVE holder is
 never reaped regardless of heartbeat age, so this TTL now bounds only ONE
 thing -- crash recovery for a genuinely-dead holder. It nonetheless stays at
 2h rather than dropping back toward the old 5min, for two reasons:
-(a) resolve_session_pid's fallback chain can still degrade to a non-session
-pid (an unset CLAUDE_PID on some launch path), and that degradation is
-logged but not fatal, so heartbeat-only behaviour must remain SURVIVABLE:
+(a) resolve_session_pid still degrades -- to pid 0, which `_pid_alive`
+reports dead by construction -- whenever CLAUDE_PID is unresolvable on some
+launch path, and that degradation is logged but not fatal. On that path the
+AND-guard collapses to its heartbeat half exactly as it did pre-3994, so
+heartbeat-only behaviour must remain SURVIVABLE:
 7200s = 2x the canonical 3600s watcher-rearm.sh ``--timeout`` slice, giving
 a full quiet slice plus a full slice of margin, so a live-but-quiet holder
 is never reaped-and-reclaimed by a duplicate (the duplicate-spawn incident);
@@ -2855,6 +2875,18 @@ def _run_lease_claim(name: str, slug: str, pid: int | None, policy_value: str) -
     # can file a DecisionRecord for a provably-gone holder instead of exiting
     # silently (INV-6/INV-7).
     #
+    # THREE values, not two: an ACQUIRED claim has no contending holder at all
+    # -- the holder is this caller -- so it prints `none`. This first shipped
+    # emitting `held` on a successful claim, which reads as "someone else has
+    # it": an ambiguous machine-readable token in a change whose entire purpose
+    # is removing ambiguous lease signals. The skills only branch on this line
+    # under `decision=stand-down`, so `none` narrows the vocabulary rather than
+    # breaking a reader. The line is absent only on the fail-open path above,
+    # where a substrate fault means we genuinely know nothing about a holder
+    # and must not assert one either way.
+    if claim.acquired:
+        print('holder_liveness=none')
+        return
     # A SINGLE signal, deliberately: `orphaned` means exactly "the pid
     # recorded in the lease body is not running". This predicate used to
     # AND in `claim.holder_session_state in ('absent', 'exited')`, which
@@ -2867,7 +2899,7 @@ def _run_lease_claim(name: str, slug: str, pid: int | None, policy_value: str) -
     # explicitly, on its real reason (no holder means no pid to probe, so
     # there is nothing to call orphaned) rather than as a side effect of a
     # withdrawn lookup. The emitted values are byte-identical before and
-    # after, in every branch.
+    # after, in every branch that HAS a contending holder.
     #
     # It is sound only because resolve_session_pid now records the
     # long-lived `claude` pid; the old `--pid $$` was the transient Bash-tool
@@ -2875,8 +2907,11 @@ def _run_lease_claim(name: str, slug: str, pid: int | None, policy_value: str) -
     # error directions are safe: pid REUSE yields a false `held` (silence,
     # the status quo, never a steal), and a false `orphaned` still triggers
     # only a NON-destructive response (file a DecisionRecord, then exit --
-    # never auto-steal, which is the duplicate-spawn incident path).
-    orphaned = not claim.acquired and claim.holder is not None and not claim.holder_alive
+    # never auto-steal, which is the duplicate-spawn incident path). A holder
+    # claimed on resolve_session_pid's DEGRADED path (pid 0, unresolvable
+    # CLAUDE_PID) therefore reads `orphaned` while possibly alive -- the
+    # deliberate, bounded cost of keeping such a lease reapable at all.
+    orphaned = claim.holder is not None and not claim.holder_alive
     print(f'holder_liveness={"orphaned" if orphaned else "held"}')
 
 
@@ -2884,7 +2919,6 @@ def _run_lease_mutation(
     verb: str,
     name: str,
     slug: str,
-    force: bool,
     mutate: Callable[[], LeaseMutation],
 ) -> None:
     """Drive a mutating lease verb and print ``result=<value>`` + a human line.
@@ -2899,6 +2933,12 @@ def _run_lease_mutation(
     deletes the very file the holder's identity lives in, so reading after
     the fact would report ``<unreadable lease body>`` for exactly the case
     where naming the displaced holder matters most.
+
+    ``--force`` reaches the mutation through *mutate*'s closure and nowhere
+    else -- this helper takes no ``force`` parameter, deliberately. It had one
+    briefly, unread by any line of the body, which invites the next reader to
+    assume the wording below branches on it; the RESULT (FORCED vs REFUSED) is
+    the only thing that decides what is printed.
     """
     holder, holder_alive, age_secs = _read_lease_holder_state(
         lease_path_for_name(name), now=datetime.now(UTC)
@@ -2925,7 +2965,6 @@ def _run_lease_heartbeat(name: str, slug: str, force: bool = False) -> None:
         'lease-heartbeat',
         name,
         slug,
-        force,
         lambda: heartbeat_lease(name, slug=slug, force=force),
     )
 
@@ -2935,7 +2974,6 @@ def _run_lease_release(name: str, slug: str, force: bool = False) -> None:
         'lease-release',
         name,
         slug,
-        force,
         lambda: release_lease(name, slug=slug, force=force),
     )
 
