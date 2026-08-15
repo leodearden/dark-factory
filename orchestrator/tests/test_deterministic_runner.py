@@ -2315,6 +2315,108 @@ class TestBeforeDoneTargetUnitlessDeploy:
 
 
 # ---------------------------------------------------------------------------
+# Task 4065 — DEPLOY-path parity pin for the default runner's INNER timeout.
+#
+# `_default_run_script`'s own per-subprocess `asyncio.wait_for` fires strictly
+# BEFORE the outer wall-clock guard (`timeout_secs + run_timeout_grace_secs`),
+# so on the production path (script_runner=None) the inner timeout is what the
+# deploy classifier actually sees.  Task 4065 changes how the PREDICATE path
+# classifies that event; the deploy path's handling must not move.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestDefaultRunnerInnerTimeoutDeployParity:
+    """DeterministicRunner — the REAL default runner's inner timeout on the
+    deploy path stays classified exactly as it is today (task 4065).
+
+    Deliberate CHARACTERIZATION PIN, not a RED test: it is GREEN on arrival
+    and must stay green across task 4065's refactor.  Unlike the predicate
+    path — where a non-zero rc is a milestone VERDICT and the inner timeout
+    was therefore misclassified — the deploy classifiers have no verdict
+    semantics at all: every non-zero rc there already routes to
+    ``_file_infra_issue_and_block``.  So the legacy ``(1, '<script timed out
+    after Ns>')`` pair must still reach the deploy classifier byte-for-byte
+    after the fix, and this test is what proves the refactor did not disturb
+    it.
+
+    Drives the REAL ``_default_run_script`` (``script_runner=None``) — the
+    existing hung-seam coverage all injects a custom ``script_runner`` and so
+    only ever exercises the OUTER guard.
+    """
+
+    async def test_targetless_deploy_default_runner_inner_timeout_files_infra_issue(
+        self, tmp_path: Path,
+    ):
+        """A real deploy script that overruns ``before_done['timeout_secs']``
+        under the default runner must file exactly one born-at-L2
+        ``infra_issue`` whose detail still carries the legacy ``rc=1`` +
+        ``<script timed out after 1s>`` pair.
+
+        ``timeout_secs=1`` against a 30s sleep leaves the outer guard at
+        ``1 + 30 = 31s``, so the INNER timeout provably wins (the 20s
+        tripwire below would fire first if it did not).
+        """
+        import asyncio
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        script = tmp_path / 'slow-deploy.sh'
+        script.write_text('#!/bin/sh\nsleep 30\n')
+        script.chmod(0o755)
+
+        task = _deploy_task(
+            task_id='4065',
+            target_unit=None,
+            script=str(script),
+            cwd=str(tmp_path),
+            timeout_secs=1,
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=None,
+        )
+
+        # Hang tripwire: also proves the INNER timeout (1s) beat the outer
+        # guard (31s) rather than the other way round.
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=20)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('4065', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.agent_role == 'orchestrator-deterministic'
+        assert esc.category == 'infra_issue', (
+            f'the deploy path classifies a timed-out script as an infra fault; '
+            f'task 4065 must not change that: {esc.category!r}'
+        )
+        assert 'rc=1' in esc.detail, (
+            f'the legacy rc=1 must still reach the deploy classifier: {esc.detail!r}'
+        )
+        assert '<script timed out after 1s>' in esc.detail, (
+            f'the legacy timed-out tail marker must still reach the deploy '
+            f'classifier verbatim: {esc.detail!r}'
+        )
+
+        done_calls = [
+            c for c in scheduler.set_task_status.call_args_list
+            if c.args[1] == 'done'
+        ]
+        assert done_calls == [], 'set_task_status must NOT be called with done on timeout'
+        unit_inspector.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
 # ζ D2 boundary: an illegal deploy-phase transition files a REAL born-at-L2
 # escalation before raising — never a silent write.
 # ---------------------------------------------------------------------------
