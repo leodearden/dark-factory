@@ -87,140 +87,36 @@ def make_result(
 
 
 def _mock_gate(**overrides) -> MagicMock:
-    """Build a MagicMock UsageGate with sensible defaults.
+    """Build a mock ``UsageGate`` wired for ``invoke_slot()`` — see
+    :func:`shared.testing.make_gate_mock`, which this now simply delegates to.
 
-    Since commit 065e95a4c9 the cap-retry path in ``invoke_with_cap_retry``
-    goes through ``async with usage_gate.invoke_slot() as slot:``, where
-    ``slot`` is an :class:`~shared.usage_gate.InvokeSlot` instance that
-    proxies to the gate.  This helper wires ``gate.invoke_slot()`` to an
-    async-context-manager mock whose ``__aenter__`` yields a slot whose
-    ``detect_cap_hit`` / ``confirm`` / ``settle`` / ``report`` methods proxy
-    to the corresponding gate attributes — so tests can still assert on
-    ``gate.detect_cap_hit.call_args``, ``gate.confirm_account_ok``, etc.
-    ``detect_cap_hit(...)`` mirrors production
-    :meth:`InvokeSlot.detect_cap_hit`: on a truthy hit it calls
-    ``release_probe_slot`` and then settles (task 4096).
-    ``report(outcome)`` (task W4-ε, PRD §7.4) mirrors the production
-    dispatch-then-settle contract of :meth:`InvokeSlot.report`.
+    Was a ~110-line near-verbatim copy of that shipped helper: same defaults,
+    same ``invoke_slot()`` async-CM wiring, same ``detect_cap_hit`` / ``confirm``
+    / ``settle`` / ``report`` proxies. Keeping two copies in step by hand failed
+    three times in the task-4096 series alone (both copies modelled the pre-fix
+    CapHit and detect_cap_hit arms), so the copy is retired and only the name
+    survives — the ~90 call sites below read better as ``_mock_gate(...)`` and
+    an alias keeps this file's diff honest about what changed.
 
-    ``__aexit__`` calls ``gate.release_probe_slot(slot.token)`` unless the
-    slot was settled by ``detect_cap_hit(...)==True``, ``confirm(...)``,
-    or ``settle()``.  This matches the production ``UsageGate.invoke_slot``
-    asynccontextmanager behaviour and keeps the ``release_probe_slot``
-    assertions in ``TestReleaseProbeSlotOnException`` /
-    ``TestCancelledErrorReleaseProbeSlot`` meaningful.
+    ``make_gate_mock`` differs from the retired copy in two deliberate ways,
+    both strictly better: the outer mock carries ``spec=UsageGate`` (so
+    attribute-name drift such as ``gate.active_account`` for
+    ``active_account_name`` raises instead of silently auto-creating), and the
+    yielded slot coerces ``account_name`` ``None`` -> ``''`` exactly as
+    production ``InvokeSlot`` does.
 
     Sister helper: ``orchestrator/tests/_orch_helpers.py::make_mock_gate`` —
     same shape but without the ``invoke_slot()`` async-CM wiring (orchestrator
-    tests use ``_attach_invoke_slot`` separately for that layer).  Cannot be
-    unified here: ``shared`` cannot import from ``orchestrator/tests``
+    tests use ``_attach_invoke_slot`` separately for that layer). Cannot be
+    unified with this one: ``shared`` cannot import from ``orchestrator/tests``
     (that would invert the package layering direction).
     """
-    gate = MagicMock()
-    gate.account_count = overrides.pop('account_count', 1)
-    gate.before_invoke = overrides.pop('before_invoke', AsyncMock(return_value='tok'))
-    gate.detect_cap_hit = overrides.pop('detect_cap_hit', MagicMock(return_value=False))
-    gate.active_account_name = overrides.pop('active_account_name', 'acct')
-    gate.on_agent_complete = overrides.pop('on_agent_complete', MagicMock())
-    gate.confirm_account_ok = overrides.pop('confirm_account_ok', MagicMock())
-    gate.release_probe_slot = overrides.pop('release_probe_slot', MagicMock())
-    gate.soonest_resets_at = overrides.pop('soonest_resets_at', None)
-    for k, v in overrides.items():
-        setattr(gate, k, v)
-
-    # Wire gate.invoke_slot() to yield an InvokeSlot-shaped proxy.
-    # A fresh slot is built on each call to invoke_slot() so that
-    # per-iteration side_effects on before_invoke / detect_cap_hit /
-    # active_account_name PropertyMock fire in the expected order.
-    def _make_invoke_slot_cm(*_a, **_kw):
-        holder: dict = {'slot': None}
-        # Prod now calls invoke_slot(scope=...) (PRD task β); accept and ignore
-        # the kwarg — additive, behavior unchanged.
-        _scope = _kw.get('scope')
-
-        async def _aenter_impl(*_args, **_akw):
-            token = await gate.before_invoke()
-            slot = MagicMock()
-            slot.token = token
-            slot.account_name = gate.active_account_name
-            slot.scope = _scope
-            slot._settled = False
-
-            def _slot_detect_cap_hit(stderr, output, backend='claude'):
-                hit = gate.detect_cap_hit(
-                    stderr, output, backend, oauth_token=slot.token,
-                )
-                if hit:
-                    # Mirrors production InvokeSlot.detect_cap_hit (task 4096):
-                    # settling suppresses the __aexit__ safety net, so the probe
-                    # claim is released here. Real gate makes this a guarded
-                    # no-op once the account is already CAPPED.
-                    gate.release_probe_slot(slot.token)
-                    slot._settled = True
-                return hit
-
-            def _slot_confirm(cost_usd=0.0):
-                gate.confirm_account_ok(slot.token)
-                gate.on_agent_complete(cost_usd)
-                slot._settled = True
-
-            def _slot_settle():
-                slot._settled = True
-
-            def _slot_report(outcome):
-                """Mirrors production InvokeSlot.report(outcome) (task W4-ε,
-                PRD §7.4): dispatches to the gate's existing handlers by
-                outcome variant, then settles in a ``finally`` so every path
-                leaves the slot settled exactly once. CapHit dispatches to
-                ``_handle_cap_detected``+``release_probe_slot`` (task 4096).
-                Kept byte-for-byte in step with the sister proxy in
-                ``shared.testing.make_gate_mock``."""
-                token = slot.token
-                try:
-                    if isinstance(outcome, OK):
-                        gate.confirm_account_ok(token)
-                    elif isinstance(outcome, CapHit):
-                        gate._handle_cap_detected(outcome.reason, outcome.resets_at, token)
-                        gate.release_probe_slot(token)
-                    elif isinstance(outcome, AuthFailed):
-                        gate._handle_auth_failure(f'HTTP {outcome.status}', token)
-                    elif isinstance(outcome, NearCap):
-                        gate._handle_near_cap_warning(outcome.reason, token)
-                        gate.release_probe_slot(token)
-                    else:
-                        gate.release_probe_slot(token)
-                finally:
-                    slot._settled = True
-
-            # Plain synchronous MagicMocks — InvokeSlot.detect_cap_hit /
-            # confirm / settle / report are plain methods, not coroutines.
-            # Using MagicMock (not AsyncMock) is load-bearing: prod does
-            # ``if slot.detect_cap_hit(...):`` / ``slot.report(outcome)``
-            # without ``await``.
-            slot.detect_cap_hit = MagicMock(side_effect=_slot_detect_cap_hit)
-            slot.confirm = MagicMock(side_effect=_slot_confirm)
-            slot.settle = MagicMock(side_effect=_slot_settle)
-            slot.report = MagicMock(side_effect=_slot_report)
-            holder['slot'] = slot
-            return slot
-
-        async def _aexit_impl(*_args, **_kw):
-            slot = holder['slot']
-            if slot is not None and not slot._settled:
-                gate.release_probe_slot(slot.token)
-            return None
-
-        cm = MagicMock()
-        cm.__aenter__ = AsyncMock(side_effect=_aenter_impl)
-        cm.__aexit__ = AsyncMock(side_effect=_aexit_impl)
-        return cm
-
-    gate.invoke_slot = MagicMock(side_effect=_make_invoke_slot_cm)
-    return gate
+    return make_gate_mock(**overrides)
 
 
 def test_mock_gate_defaults_include_release_probe_slot():
-    """_mock_gate() should explicitly set release_probe_slot in its defaults.
+    """_mock_gate() (now make_gate_mock) must explicitly set
+    release_probe_slot in its defaults.
 
     Checks vars(gate) rather than hasattr(gate, ...) so that MagicMock's
     silent auto-attribute creation doesn't produce a false positive.
@@ -228,23 +124,23 @@ def test_mock_gate_defaults_include_release_probe_slot():
     gate = _mock_gate()
     assert 'release_probe_slot' in vars(gate), (
         "_mock_gate() must explicitly set release_probe_slot so the "
-        "exception-cleanup contract is self-documented in the helper."
+        "probe-release contract is self-documented in the helper."
     )
 
 
 # ---------------------------------------------------------------------------
-# Probe-release fidelity: production InvokeSlot vs. both MagicMock doubles
+# Probe-release fidelity: production InvokeSlot vs. the MagicMock double
 # ---------------------------------------------------------------------------
 #
-# ``_mock_gate`` above and the shipped ``shared.testing.make_gate_mock`` each
-# hand-reimplement ``InvokeSlot``'s dispatch, so both can silently drift from
-# production — exactly what task 4096 found (both modelled the pre-fix CapHit
-# arm, which stranded the PROBE_IN_FLIGHT claim on a scoped cap). A test that
-# restates a double's body can only fail when someone edits that double, i.e.
-# at the moment they'd edit the test too. So instead: drive a REAL
-# ``UsageGate``-backed ``InvokeSlot`` and each double through the SAME outcome
-# script and assert their ``release_probe_slot`` call counts agree. A
-# production-side change that no one mirrors into the doubles fails this.
+# ``shared.testing.make_gate_mock`` hand-reimplements ``InvokeSlot``'s
+# dispatch, so it can silently drift from production — exactly what task 4096
+# found (it modelled the pre-fix CapHit and detect_cap_hit arms, which stranded
+# the PROBE_IN_FLIGHT claim on a scoped cap). A test that restates the double's
+# body can only fail when someone edits the double, i.e. at the moment they'd
+# edit the test too. So instead: drive a REAL ``UsageGate``-backed
+# ``InvokeSlot`` and the double through the SAME outcome script and assert
+# their ``release_probe_slot`` call counts agree. A production-side change that
+# no one mirrors into the double fails this.
 
 _FIDELITY_CAP_STDERR = "You've hit your usage limit resets in 3h"
 
@@ -285,14 +181,14 @@ async def _production_releases(drive) -> tuple[int, bool]:
         await gate.shutdown()
 
 
-async def _double_releases(factory, drive) -> tuple[int, bool]:
-    """Run *drive* against one of the MagicMock gate doubles.
+async def _double_releases(drive) -> tuple[int, bool]:
+    """Run *drive* against the MagicMock gate double.
 
     ``detect_cap_hit=True`` makes the double return the same verdict the real
     classifier returns for ``_FIDELITY_CAP_STDERR``, so both parties run the
     same script; it is inert for the ``report`` steps.
     """
-    gate = factory(detect_cap_hit=MagicMock(return_value=True))
+    gate = make_gate_mock(detect_cap_hit=MagicMock(return_value=True))
     async with gate.invoke_slot() as slot:
         drive(slot)
     return _release_calls(gate.release_probe_slot, 'tok')
@@ -303,17 +199,16 @@ async def _double_releases(factory, drive) -> tuple[int, bool]:
     [(drive, expected) for _id, drive, expected in _PROBE_RELEASE_SCRIPT],
     ids=[_id for _id, _drive, _expected in _PROBE_RELEASE_SCRIPT],
 )
-async def test_gate_doubles_match_production_probe_release(drive, expected):
-    """Both doubles must release the probe claim exactly when production does.
+async def test_gate_double_matches_production_probe_release(drive, expected):
+    """The double must release the probe claim exactly when production does.
 
-    Comparing against a real gate (not against the doubles' own source) is what
+    Comparing against a real gate (not against the double's own source) is what
     makes this detect drift rather than restate it. The bool in each tuple
     asserts every release carried that party's own slot token.
     """
     parties = {
         'production': await _production_releases(drive),
-        '_mock_gate': await _double_releases(_mock_gate, drive),
-        'make_gate_mock': await _double_releases(make_gate_mock, drive),
+        'make_gate_mock': await _double_releases(drive),
     }
     assert parties == dict.fromkeys(parties, (expected, True))
 
