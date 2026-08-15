@@ -214,6 +214,67 @@ class LLMConfig(BaseModel):
     max_tokens: int = Field(default=4096)
     providers: LLMProvidersConfig = Field(default_factory=LLMProvidersConfig)
 
+    # Which graphiti-core LLM client to construct on the `provider='openai'`
+    # branch (it does NOT affect the anthropic branch).
+    #   'openai'         — graphiti's OpenAIClient, which drives the Responses
+    #                      API (client.responses.create). The shipped default;
+    #                      unchanged behaviour.
+    #   'openai_generic' — graphiti's OpenAIGenericClient, which drives
+    #                      chat.completions. Required for OpenAI-compatible
+    #                      local endpoints (llama.cpp, vLLM, LM Studio, …),
+    #                      which serve chat.completions but not the Responses
+    #                      API. Selecting it also skips the
+    #                      check_openai_responses_api() preflight, which guards
+    #                      a surface this client never touches.
+    client_class: Literal['openai', 'openai_generic'] = Field(default='openai')
+
+    # Structured-output request mode. Applies ONLY when
+    # client_class='openai_generic'; ignored on the 'openai' and anthropic arms.
+    #   'auto'        — graphiti-core 0.28.2's stock, response_model-driven
+    #                   selection: response_format is {'type': 'json_schema'}
+    #                   when a response_model is passed, {'type': 'json_object'}
+    #                   otherwise.
+    #   'json_object' — force {'type': 'json_object'} unconditionally. Needed
+    #                   for the llama.cpp MoE arm, which SILENTLY ignores
+    #                   $ref/$defs in a json_schema response_format
+    #                   (llama.cpp#21228) and so returns off-schema JSON with no
+    #                   error. graphiti-core 0.28.2 ships no upstream knob for
+    #                   this — mode is purely response_model-driven — which is
+    #                   why we own the forcing wrapper
+    #                   (backends/llm_clients.ForceJsonObjectOpenAIGenericClient).
+    structured_output_mode: Literal['auto', 'json_object'] = Field(default='auto')
+
+    @model_validator(mode='after')
+    def _structured_output_mode_requires_the_generic_client(self):
+        """Reject a structured_output_mode that no client would ever honour.
+
+        ``structured_output_mode`` is read on exactly one arm of
+        ``build_llm_client`` — the ``client_class='openai_generic'`` one. An
+        operator who uncomments ``structured_output_mode: "json_object"`` in
+        config.yaml but forgets ``client_class: "openai_generic"`` would
+        otherwise get stock Responses-API behaviour with no warning, no log
+        line and no error, and then debug the very llama.cpp $ref failure the
+        knob was supposed to have fixed. Silent inertness is exactly what
+        docs/legibility/design-invariants.md's no-silent-fail-soft forbids, so
+        the mismatch is a hard config error.
+
+        Note this only fires at CONSTRUCTION. pydantic does not re-run
+        model validators on attribute assignment (``validate_assignment`` is
+        off), so a config mutated after the fact — which is how tests and
+        per-arm harnesses build variants — slips past. ``build_llm_client``
+        carries the matching runtime warning for that path.
+        """
+        if self.structured_output_mode != 'auto' and self.client_class != 'openai_generic':
+            raise ValueError(
+                f"llm.structured_output_mode={self.structured_output_mode!r} requires "
+                f"llm.client_class='openai_generic', but client_class is "
+                f'{self.client_class!r}. The mode is read only when building '
+                'graphiti-core\'s OpenAIGenericClient; on any other arm it would be '
+                "silently ignored. Set client_class: 'openai_generic' alongside it, or "
+                "leave structured_output_mode at its 'auto' default."
+            )
+        return self
+
 
 # --- Embedder ---
 
