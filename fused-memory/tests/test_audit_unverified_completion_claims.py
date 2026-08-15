@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 import importlib.util
 import json
+import logging
 import re
 import types
 from pathlib import Path
@@ -62,6 +63,7 @@ EPISODE_CYPHER = _mod.EPISODE_CYPHER
 PROJECTED_FIELDS = _mod.PROJECTED_FIELDS
 _run = _mod._run
 Probes = _mod.Probes
+_LOGGER_NAME = _mod.logger.name
 
 KNOWN_PROJECTS = frozenset({'dark_factory', 'reify'})
 
@@ -428,6 +430,7 @@ def _finding(
     ref: str = 'tkt_X',
     created_at: str = '2026-07-26T00:00:00Z',
     graph_name: str | None = None,
+    edges_unqueried: bool = False,
 ) -> object:
     return Finding(
         record_uuid=uuid,
@@ -443,6 +446,8 @@ def _finding(
         status=status,
         observed=f'observed for {ref}',
         claimed_text='some claiming clause',
+        derived_edge_uuids=None if edges_unqueried else (),
+        edges_unqueried=edges_unqueried,
     )
 
 
@@ -528,15 +533,30 @@ class TestBuildReport:
         assert 'cancelled' in blob
         assert 'mem0' in blob
 
+    def test_edges_unqueried_is_always_counted(self) -> None:
+        """Always present, 0 when none — a key that appears only when nonzero
+        reads as absent rather than as zero."""
+        assert self._build([_finding('mismatch')])['summary']['edges_unqueried'] == 0
+        report = self._build([
+            _finding('mismatch', uuid='ep-a', edges_unqueried=True),
+            _finding('mismatch', uuid='ep-b', edges_unqueried=True),
+            _finding('mismatch', uuid='ep-c'),
+        ])
+        assert report['summary']['edges_unqueried'] == 2
+
     def test_report_is_json_serializable_and_byte_stable(self) -> None:
         findings = [
             _finding('unverifiable', uuid='ep-b', category='decisions_and_rationale'),
             _finding('mismatch', uuid='ep-a'),
+            _finding('mismatch', uuid='ep-c', edges_unqueried=True),
         ]
         first = json.dumps(self._build(findings, True), indent=2, default=str)
         second = json.dumps(self._build(findings, True), indent=2, default=str)
         assert first == second
-        assert json.loads(first)['summary']['mismatch'] == 1
+        loaded = json.loads(first)
+        assert loaded['summary']['mismatch'] == 2
+        unqueried = [f for f in loaded['findings'] if f['edges_unqueried']]
+        assert [f['derived_edge_uuids'] for f in unqueried] == [None]
 
     def test_empty_corpus_reports_zero_without_truncation(self) -> None:
         report = self._build([])
@@ -802,6 +822,19 @@ class _FakeReader:
         return self.edges.get(episode_uuid, ())
 
 
+class _ExplodingEdgeReader(_FakeReader):
+    """Reads its population fine, then fails on the edge query.
+
+    The live shape of a graph that errors mid-run: the population is already in
+    hand, so the sweep proceeds — but the edge enumeration for that episode
+    produced NO answer and must not be recorded as one.
+    """
+
+    async def fetch_derived_edges(self, episode_uuid: str) -> tuple[str, ...]:
+        self.edge_lookups.append(episode_uuid)
+        raise RuntimeError(f'edge query blew up for {episode_uuid}')
+
+
 def _args(**overrides: object) -> object:
     parser = _build_parser()
     args = parser.parse_args([])
@@ -1029,3 +1062,92 @@ class TestDerivedEdgeLookupKeying:
         assert finding['project_id'] == 'know_live'
         assert finding['graph_name'] == 'dark_factory'
         assert report['summary']['by_project'] == {'know_live': 1}
+
+    async def test_unresolved_reader_is_null_not_an_empty_list(
+        self, capsys, caplog
+    ) -> None:
+        """NOT ENUMERATED and NO EDGES FOUND are different facts.
+
+        A --project dropped from the argv leaves a finding whose graph has no
+        reader. Serializing that as ``[]`` makes it indistinguishable in the
+        committed artifact from an episode genuinely free of derived edges —
+        a silent fail-soft, on the report's central harm-artefact column.
+        """
+        reader = _FakeReader(
+            [
+                _record(
+                    uuid='ep-orphan',
+                    text=ESC_3085_1_INSTANCE_1,
+                    project_id='reify',
+                    graph_name='reify',  # not among --project, so no reader
+                )
+            ],
+        )
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            _code, report = await self._run_capture(
+                capsys, reader, _probes(task_status='in-progress')
+            )
+        assert report is not None
+        finding = report['findings'][0]
+        assert finding['derived_edge_uuids'] is None
+        assert finding['edges_unqueried'] is True
+        assert reader.edge_lookups == []
+        # Every other degradation path in this module warns; this one must too.
+        assert 'ep-orphan' in caplog.text
+        assert 'reify' in caplog.text
+
+    async def test_reader_that_raises_is_null_not_an_empty_list(
+        self, capsys, caplog
+    ) -> None:
+        """A query that blew up is also not a measured zero."""
+        reader = _ExplodingEdgeReader(
+            [_record(uuid='ep-1', text=ESC_3085_1_INSTANCE_1,
+                     project_id='know_live', graph_name='dark_factory')]
+        )
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            _code, report = await self._run_capture(
+                capsys, reader, _probes(task_status='in-progress')
+            )
+        assert report is not None
+        finding = report['findings'][0]
+        assert finding['derived_edge_uuids'] is None
+        assert finding['edges_unqueried'] is True
+        assert 'ep-1' in caplog.text
+
+    async def test_answered_but_edge_free_episode_stays_an_empty_list(
+        self, capsys
+    ) -> None:
+        """The two cases must stay distinguishable in the artifact."""
+        reader = _FakeReader(
+            [_record(uuid='ep-1', text=ESC_3085_1_INSTANCE_1,
+                     project_id='know_live', graph_name='dark_factory')],
+            edges={},  # the reader answers, with nothing
+        )
+        _code, report = await self._run_capture(
+            capsys, reader, _probes(task_status='in-progress')
+        )
+        assert report is not None
+        finding = report['findings'][0]
+        assert finding['derived_edge_uuids'] == []
+        assert finding['edges_unqueried'] is False
+        assert reader.edge_lookups == ['ep-1']
+
+    async def test_summary_counts_unqueried_findings(self, capsys) -> None:
+        """The denominator of un-enumerated findings is visible without
+        diffing the list — the same no-silent-caps discipline as
+        ``truncated_by``."""
+        reader = _FakeReader(
+            [
+                _record(uuid='ep-seen', text=ESC_3085_1_INSTANCE_1,
+                        project_id='know_live', graph_name='dark_factory'),
+                _record(uuid='ep-orphan', text=ESC_3085_1_INSTANCE_1,
+                        project_id='reify', graph_name='reify'),
+            ],
+            edges={'ep-seen': ('edge-1',)},
+        )
+        _code, report = await self._run_capture(
+            capsys, reader, _probes(task_status='in-progress')
+        )
+        assert report is not None
+        assert report['summary']['edges_unqueried'] == 1
+        assert report['summary']['mismatch'] == 2
