@@ -1033,16 +1033,26 @@ def parse_metadata(
         # The slice's DECLARED shape, fail-closed for a key that never
         # declared one (register_metadata_submodel's 'dict' default).
         cardinality = _SUBMODEL_CARDINALITY.get(key, 'dict')
-        if cardinality == 'dict' and isinstance(raw, list):
-            # Task 4142: the list arm below used to run for EVERY registered
-            # key, so a list handed to a dict-only slice validated
-            # element-wise into a typed list and emitted NO warning — thus
-            # invisible to both the `task_metadata.schema_warning` census and
-            # the enforce=True write gate. The resulting non-dict
-            # metadata.milestone then made scheduler._milestone_time_gated
-            # fail-safe-withhold the task from dispatch indefinitely, with no
-            # escalation path. A shape violation is not an element failure,
-            # so it gets its own code rather than 'invalid_submodel'.
+        if isinstance(raw, list) != (cardinality == 'list'):
+            # Task 4142: the slice's value is the wrong SHAPE for what its
+            # registration declared. Deliberately SYMMETRIC — both directions
+            # are the same silent-acceptance defect:
+            #
+            #  * a LIST for a 'dict' slice: the list arm below used to run for
+            #    EVERY registered key, so it validated element-wise into a
+            #    typed list and emitted NO warning — invisible to both the
+            #    `task_metadata.schema_warning` census and the enforce=True
+            #    write gate. The resulting non-dict metadata.milestone then
+            #    made scheduler._milestone_time_gated fail-safe-withhold the
+            #    task from dispatch indefinitely, with no escalation path.
+            #  * a NON-LIST for a 'list' slice: it validated quietly into a
+            #    SINGLE model instance, and delivered_checks' consumer
+            #    (verify_delivered_checks_on_main) ITERATES the value — so an
+            #    accepted dict iterates its string KEYS and yields garbage
+            #    checks against a mark-done gate.
+            #
+            # A shape violation is not an element failure, so it gets its own
+            # code rather than 'invalid_submodel'.
             if direction == 'write' and enforce:
                 raise TypeError(_cardinality_mismatch_message(key, cardinality, raw))
             warnings.append(
