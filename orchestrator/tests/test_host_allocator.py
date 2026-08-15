@@ -1107,3 +1107,188 @@ class TestHostAllocatorStrandAccessors:
         """An unmanaged host name returns None rather than raising."""
         alloc = self._make_allocator()
         assert alloc.remote_runner('no-such-host') is None
+
+
+# ---------------------------------------------------------------------------
+# 3043/step-3 RED: readmit() — the full re-engagement primitive
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestHostAllocatorReadmit:
+    """readmit(name): clear quarantine AND un-PARK, so a recovered host is usable.
+
+    Task 3043.  ``clear_quarantine`` only does ``_quarantine.discard(name)``, but
+    ``acquire_remote`` additionally requires ``_SLOT_FREE`` — so the auto-reprobe
+    recovery path can resolve the L1, pop the tracker and clear the quarantine
+    while the slot stays PARKED, leaving a host that is unquarantined, untracked
+    AND unusable: invisible to every recovery mechanism until a restart.
+
+    RED until 3043/step-4 adds the method (AttributeError before that).
+    """
+
+    def _local_factory(self):
+        return _FakeLocalRunner()
+
+    def _by_name(self, alloc) -> dict:
+        return {h['name']: h for h in alloc.host_states()}
+
+    async def _make_parked_allocator(self, *, quarantine=None, extra_remote=False):
+        """Return (alloc, quarantine_set) with remoteA's slot left PARKED.
+
+        Same construction as ``TestHostAllocatorCancelFail`` /
+        ``test_cancel_fail_bounded_max_attempts_stays_parked``: cancel rc != 0
+        and probe_clean() never clean with bounded max_attempts.
+        """
+        from orchestrator.verify_runner import HostAllocator
+
+        remote_a = _FakeRemoteRunnerCancellable(
+            'remoteA', cancel_rc=1, probe_sequence=[False] * 20,
+        )
+        remotes = [remote_a] + ([_FakeRemoteRunner('remoteB')] if extra_remote else [])
+        q = quarantine if quarantine is not None else set()
+        alloc = HostAllocator(remotes, quarantine=q)
+
+        lease = alloc.acquire_remote()
+        assert lease is not None and lease.name == 'remoteA'
+
+        async def noop_sleep(_: float) -> None:
+            pass
+
+        assert await alloc.cancel_and_release(lease, sleep=noop_sleep, max_attempts=2) is False
+        assert alloc.is_parked('remoteA') is True
+        return alloc, q
+
+    # -- (a) discards from the shared set --------------------------------------
+
+    async def test_readmit_removes_name_from_shared_set(self):
+        """readmit discards from the set passed BY REFERENCE at construction.
+
+        Same assertion shape as test_clear_quarantine_removes_name_from_shared_set:
+        the caller's own set must see the removal, since that is the worker's
+        ``_runner_quarantine`` and is what makes re-engagement restart-free.
+        """
+        from orchestrator.verify_runner import HostAllocator
+
+        shared_q: set[str] = {'remoteA'}
+        alloc = HostAllocator([_FakeRemoteRunner('remoteA')], quarantine=shared_q)
+
+        alloc.readmit('remoteA')
+
+        assert 'remoteA' not in shared_q
+        assert alloc.is_quarantined('remoteA') is False
+
+    # -- (b) un-PARKs so the host is acquirable again ---------------------------
+
+    async def test_readmit_unparks_slot_and_host_becomes_acquirable(self):
+        """A PARKED slot is reset to FREE, so acquire_remote() hands the host out."""
+        alloc, _q = await self._make_parked_allocator()
+
+        alloc.readmit('remoteA')
+
+        assert alloc.is_parked('remoteA') is False
+        assert self._by_name(alloc)['remoteA']['slot_state'] == 'free'
+        lease = alloc.acquire_remote()
+        assert lease is not None and lease.name == 'remoteA'
+
+    async def test_readmit_clears_quarantine_and_unparks_together(self):
+        """Both halves in one call — the state a recovered host actually needs."""
+        alloc, shared_q = await self._make_parked_allocator(quarantine={'remoteA'})
+        assert alloc.is_parked('remoteA') is True
+        assert alloc.is_quarantined('remoteA') is True
+
+        alloc.readmit('remoteA')
+
+        assert 'remoteA' not in shared_q
+        assert alloc.is_parked('remoteA') is False
+        lease = alloc.acquire_remote()
+        assert lease is not None and lease.name == 'remoteA'
+
+    # -- (c) never steals a live verify ----------------------------------------
+
+    async def test_readmit_leaves_busy_slot_busy(self):
+        """A BUSY slot is never stolen — only the quarantine is cleared."""
+        from orchestrator.verify_runner import HostAllocator
+
+        shared_q: set[str] = set()
+        alloc = HostAllocator([_FakeRemoteRunner('remoteA')], quarantine=shared_q)
+        lease = alloc.acquire_remote()          # remoteA BUSY (verify in flight)
+        assert lease is not None and lease.name == 'remoteA'
+        # A drift-detector-style writer adds to the shared set directly while
+        # the verify is still running — BUSY + quarantined is a reachable state.
+        shared_q.add('remoteA')
+
+        alloc.readmit('remoteA')
+
+        assert 'remoteA' not in shared_q
+        assert self._by_name(alloc)['remoteA']['slot_state'] == 'busy'
+        assert alloc.acquire_remote() is None
+
+    # -- (d) idempotent and safe ------------------------------------------------
+
+    async def test_readmit_is_idempotent_on_already_free_host(self):
+        """A second readmit on an already-FREE, unquarantined host is a no-op."""
+        alloc, _q = await self._make_parked_allocator()
+        alloc.readmit('remoteA')
+        alloc.readmit('remoteA')
+
+        assert alloc.is_parked('remoteA') is False
+        assert alloc.is_quarantined('remoteA') is False
+        lease = alloc.acquire_remote()
+        assert lease is not None and lease.name == 'remoteA'
+
+    async def test_readmit_local_host_is_safe_noop(self):
+        """readmit('local') does not raise and does not disturb the local slot."""
+        from orchestrator.verify_runner import HostAllocator
+
+        alloc = HostAllocator([_FakeRemoteRunner('remoteA')], quarantine=set())
+        local_lease = alloc.acquire_local(self._local_factory)
+        assert local_lease is not None
+
+        alloc.readmit('local')
+
+        # BUSY local is not stolen; a second acquire_local still refuses.
+        assert self._by_name(alloc)['local']['slot_state'] == 'busy'
+        assert alloc.acquire_local(self._local_factory) is None
+
+    async def test_readmit_unknown_name_does_not_create_a_slot(self):
+        """An unmanaged name is a no-op — no raise, and no slot is fabricated."""
+        from orchestrator.verify_runner import HostAllocator
+
+        alloc = HostAllocator([_FakeRemoteRunner('remoteA')], quarantine=set())
+        before = [h['name'] for h in alloc.host_states()]
+
+        alloc.readmit('no-such-host')
+
+        assert [h['name'] for h in alloc.host_states()] == before
+        assert 'no-such-host' not in {h['name'] for h in alloc.host_states()}
+
+    # -- (e) REGRESSION PIN: why clear_quarantine alone is not enough -----------
+
+    async def test_clear_quarantine_alone_leaves_parked_host_unusable(self):
+        """The strand this task fixes, stated executably.
+
+        After the identical PARKED setup, clear_quarantine(name) ONLY leaves the
+        host non-acquirable: unquarantined, (once the tracker entry is popped)
+        untracked, AND unusable — invisible to every recovery mechanism.  This
+        is precisely why the reprobe recovery path must call readmit instead.
+        """
+        alloc, shared_q = await self._make_parked_allocator(
+            quarantine={'remoteA'}, extra_remote=True,
+        )
+
+        alloc.clear_quarantine('remoteA')
+
+        assert 'remoteA' not in shared_q
+        assert alloc.is_parked('remoteA') is True
+        entry = self._by_name(alloc)['remoteA']
+        assert entry['slot_state'] == 'parked'
+        assert entry['quarantined'] is False
+        # Still non-acquirable: acquire_remote skips it and falls through to remoteB.
+        lease = alloc.acquire_remote()
+        assert lease is not None and lease.name == 'remoteB'
+
+        # readmit, by contrast, actually re-engages the host.
+        alloc.readmit('remoteA')
+        recovered = alloc.acquire_remote()
+        assert recovered is not None and recovered.name == 'remoteA'
