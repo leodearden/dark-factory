@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Collection
+from collections.abc import Collection, Iterable
 from dataclasses import dataclass
 
 from fused_memory.utils.validation import (
@@ -356,7 +356,7 @@ class LabelScan:
     ambiguous: tuple[Referent, ...] = ()
 
 
-def _canonical_allowlist(known_project_ids: Collection[str] | None) -> frozenset[str] | None:
+def _canonical_allowlist(known_project_ids: Iterable[str] | None) -> frozenset[str] | None:
     """Canonicalize *known_project_ids*, or return None for permissive mode.
 
     Returns None — PERMISSIVE — in THREE cases: a missing registry, an empty
@@ -401,11 +401,14 @@ def _canonical_allowlist(known_project_ids: Collection[str] | None) -> frozenset
     global _all_path_shaped_warned
     if not known_project_ids:
         return None
-    # Counted DURING iteration rather than with len() afterwards. The parameter
-    # is advertised to callers as "any collection", which invites a generator —
-    # and a generator is truthy (so it passes the guard above) but not Sized, so
-    # a trailing len() would raise TypeError on a memory write path, in the one
-    # branch whose entire purpose is to degrade gracefully.
+    # Counted DURING iteration rather than with len() afterwards, which is why
+    # this parameter is typed Iterable and not Collection like the public
+    # callers' is: the public docstrings advertise "any collection", and a
+    # caller reading that loosely may well hand a generator to a helper that
+    # only ever iterates it once. A generator is truthy (so it passes the guard
+    # above) but not Sized, so a trailing len() would raise TypeError on a
+    # memory write path — in the one branch whose entire purpose is to degrade
+    # gracefully. Iterable also states the real contract: consumed ONCE, here.
     supplied = 0
     canonical = set()
     for raw in known_project_ids:
