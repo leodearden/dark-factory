@@ -16,8 +16,11 @@ money and no real token is ever written.  They are deliberately unmarked (no
 from __future__ import annotations
 
 import json
-from typing import Any
+import tempfile
+from pathlib import Path
+from typing import IO, Any
 
+import pytest
 import startup_completion_fixtures as scf
 import startup_completion_probe as probe
 
@@ -345,3 +348,208 @@ class TestGateNeverRaisesOnGenericHit:
         )
         for leaked in ('transcript_records', 'config_dir_tree', 'run_exit', 'spawn_argv'):
             assert leaked not in result
+
+
+# ---------------------------------------------------------------------------
+# run_live_probe: lifecycle of the OAuth-bearing config dir
+# ---------------------------------------------------------------------------
+
+#: Obviously fake, mirroring ``TestCorpusSecretHygiene``'s synthetic payload
+#: convention: a grep of the tree for credential-shaped strings must stay clean,
+#: and no test may ever put a real token on disk.
+_FAKE_OAUTH_ENV_VAR = 'CLAUDE_CODE_OAUTH_TOKEN_A'
+_FAKE_OAUTH_TOKEN = 'FAKE-not-a-real-token'
+
+
+class _ProbeRecorder:
+    """What a monkeypatched :func:`run_live_probe` run allocated.
+
+    Holds the resources whose reclamation is under test, so an assertion can
+    name the exact object the probe created rather than re-deriving its path.
+    """
+
+    def __init__(self) -> None:
+        self.configs: list[Any] = []
+        self.config_task_ids: list[str] = []
+        self.config_kwargs: list[dict[str, Any]] = []
+        self.stub_dirs: list[Path] = []
+        self.temp_paths: list[Path] = []
+        self.handles: list[IO[bytes]] = []
+
+
+@pytest.fixture
+def probe_recorder(monkeypatch, tmp_path) -> _ProbeRecorder:
+    """Make ``run_live_probe`` offline and record what it allocates.
+
+    ``_cli_version`` and ``_oauth_token`` are stubbed so no ``claude --version``
+    subprocess runs and no REAL token is ever written; ``TaskConfigDir`` is the
+    genuine class, only re-based under ``tmp_path`` so the credential write and
+    the cleanup being tested are the real ones.
+    """
+    recorder = _ProbeRecorder()
+    monkeypatch.setattr(probe, '_cli_version', lambda: 'test-cli')
+    monkeypatch.setattr(
+        probe, '_oauth_token', lambda: (_FAKE_OAUTH_ENV_VAR, _FAKE_OAUTH_TOKEN)
+    )
+
+    real_config_cls = probe.TaskConfigDir
+
+    def _recording_config_dir(task_id: str, base_dir: Path | None = None, **kwargs: Any):
+        config = real_config_cls(task_id, base_dir=tmp_path, **kwargs)
+        recorder.configs.append(config)
+        recorder.config_task_ids.append(task_id)
+        recorder.config_kwargs.append(dict(kwargs))
+        return config
+
+    monkeypatch.setattr(probe, 'TaskConfigDir', _recording_config_dir)
+
+    real_mkdtemp = tempfile.mkdtemp
+
+    def _recording_mkdtemp(*args: Any, **kwargs: Any) -> str:
+        path = real_mkdtemp(*args, **kwargs)
+        recorder.stub_dirs.append(Path(path))
+        return path
+
+    monkeypatch.setattr(probe.tempfile, 'mkdtemp', _recording_mkdtemp)
+    return recorder
+
+
+def _run_probe(tmp_path: Path, **overrides: Any) -> list[dict]:
+    """Call ``run_live_probe`` with harmless defaults; never reaches ``Popen``."""
+    kwargs: dict[str, Any] = {
+        'mode': 'healthy',
+        'probe_run_id': 'test-run',
+        'cwd': tmp_path,
+        'prompt': 'probe',
+        'model': 'test-model',
+        'permission_mode': 'default',
+        'offsets': (0.0,),
+        'max_secs': 0.0,
+        'hold_secs': 0,
+        'keep_config_dir': False,
+    }
+    kwargs.update(overrides)
+    return probe.run_live_probe(**kwargs)
+
+
+def _inject(kind: str, monkeypatch, recorder: _ProbeRecorder) -> type[Exception]:
+    """Install a failure at *kind*, all BEFORE ``subprocess.Popen``.
+
+    Nothing spawns, so these tests are free and instant.  Returns the exception
+    class the injected failure raises.
+    """
+    if kind == 'build_argv':
+        def _boom_build_argv(*args: Any, **kwargs: Any):
+            # Assert the credential-bearing window is REAL before failing in it,
+            # so this test cannot pass vacuously against a probe that (say)
+            # stopped writing credentials at all.
+            config = recorder.configs[-1]
+            assert (config.path / '.credentials.json').exists(), (
+                'the OAuth token must already be on disk at this injection point, '
+                'or the leak this test defends against would not exist'
+            )
+            raise RuntimeError('injected: _build_argv')
+
+        monkeypatch.setattr(probe, '_build_argv', _boom_build_argv)
+        return RuntimeError
+
+    if kind == 'spawn_env':
+        # The REAL _build_argv runs first, so by now its sysprompt tempfile
+        # exists and must also be reclaimed.
+        real_build_argv = probe._build_argv
+
+        def _recording_build_argv(*args: Any, **kwargs: Any):
+            argv, temp_paths = real_build_argv(*args, **kwargs)
+            recorder.temp_paths.extend(temp_paths)
+            return (argv, temp_paths)
+
+        def _boom_spawn_env(*args: Any, **kwargs: Any):
+            raise RuntimeError('injected: _spawn_env')
+
+        monkeypatch.setattr(probe, '_build_argv', _recording_build_argv)
+        monkeypatch.setattr(probe, '_spawn_env', _boom_spawn_env)
+        return RuntimeError
+
+    if kind == 'capture_open':
+        # The SECOND 'wb' open fails, so the first handle is already open and
+        # must be closed by the teardown rather than left to the GC.
+        real_path_open = Path.open
+        state = {'wb_opens': 0}
+
+        def _recording_open(self: Path, *args: Any, **kwargs: Any):
+            mode = args[0] if args else kwargs.get('mode', 'r')
+            if mode != 'wb':
+                return real_path_open(self, *args, **kwargs)
+            state['wb_opens'] += 1
+            if state['wb_opens'] == 2:
+                raise OSError('injected: second capture file')
+            handle = real_path_open(self, *args, **kwargs)
+            recorder.handles.append(handle)  # pyright: ignore[reportArgumentType]
+            return handle
+
+        monkeypatch.setattr(Path, 'open', _recording_open)
+        return OSError
+
+    raise AssertionError(f'unknown injection kind {kind!r}')
+
+
+@pytest.fixture(params=['build_argv', 'spawn_env', 'capture_open'])
+def injected_failure(request, monkeypatch, probe_recorder) -> type[Exception]:
+    return _inject(request.param, monkeypatch, probe_recorder)
+
+
+class TestRunLiveProbeCleanup:
+    """An exception before the spawn must not leak the OAuth-bearing config dir.
+
+    ``run_live_probe`` writes a LIVE OAuth access token to
+    ``<tmp>/claude-config-startup-probe-<mode>-<pid>/.credentials.json`` (mode
+    0600) and only ``config.cleanup()`` — reached solely through the ``finally``
+    of a ``try`` that opens several statements LATER — ever removes it.  Any
+    raise in between (a missing ``claude`` binary, a full /tmp, an
+    interpreter-level error in argv/env construction) strands a real token on
+    disk indefinitely: ``TaskConfigDir`` is constructed with the default
+    ``cleanup_at_exit=False``, and no sweep covers this prefix.
+
+    Every injection point here is BEFORE ``subprocess.Popen``, so these tests
+    spawn nothing, spend nothing and write only an obviously-fake token.
+    """
+
+    def test_config_dir_does_not_survive_the_exception(
+        self, probe_recorder, injected_failure, tmp_path
+    ):
+        with pytest.raises(injected_failure, match='injected'):
+            _run_probe(tmp_path)
+        assert probe_recorder.configs, 'the probe never built a config dir — bad injection'
+        config_path = probe_recorder.configs[-1].path
+        assert not config_path.exists(), (
+            f'the OAuth-bearing config dir survived the exception: {config_path}'
+        )
+
+    def test_stub_dir_does_not_survive_the_exception(
+        self, probe_recorder, injected_failure, tmp_path
+    ):
+        with pytest.raises(injected_failure, match='injected'):
+            _run_probe(tmp_path)
+        assert probe_recorder.stub_dirs, 'the probe never built a stub dir — bad injection'
+        stub_dir = probe_recorder.stub_dirs[-1]
+        assert not stub_dir.exists(), f'the stub dir survived the exception: {stub_dir}'
+
+    def test_argv_temp_files_do_not_survive_the_exception(
+        self, probe_recorder, monkeypatch, tmp_path
+    ):
+        exc_type = _inject('spawn_env', monkeypatch, probe_recorder)
+        with pytest.raises(exc_type, match='injected'):
+            _run_probe(tmp_path)
+        assert probe_recorder.temp_paths, '_build_argv produced no temp file to reclaim'
+        for path in probe_recorder.temp_paths:
+            assert not path.exists(), f'an argv temp file survived the exception: {path}'
+
+    def test_open_capture_handles_are_closed(self, probe_recorder, monkeypatch, tmp_path):
+        exc_type = _inject('capture_open', monkeypatch, probe_recorder)
+        with pytest.raises(exc_type, match='injected'):
+            _run_probe(tmp_path)
+        assert probe_recorder.handles, 'no capture handle was opened — bad injection'
+        for handle in probe_recorder.handles:
+            assert handle.closed, (
+                'a capture file handle was left to the GC rather than closed by teardown'
+            )
