@@ -2466,6 +2466,98 @@ def release_lease(
 
 
 @dataclass(frozen=True)
+class LeaseStatus:
+    """A read-only snapshot of one lease -- what ``lease-show`` prints (task 3994).
+
+    name: the lease name inspected (see build_lease_name).
+    state: 'held' (a parseable body), 'unreadable' (the file exists but its
+        body is missing/corrupt -- reported, never rendered as a fake
+        holder) or 'absent' (no such lease). The discriminator: the holder_*
+        identity fields are populated only for 'held'.
+    holder_slug / holder_pid: the holder's identity from the body, or None.
+    holder_pid_alive: whether that pid is currently running (_pid_alive) --
+        the LIVENESS axis, independent of freshness.
+    heartbeat_ts: ISO-8601 timestamp of the last heartbeat, derived from the
+        lease file's mtime (None when absent) -- the FRESHNESS axis.
+    heartbeat_age_secs: seconds since that heartbeat.
+    reclaimable: True iff a contender could legitimately reap this lease --
+        i.e. exactly claim_lease/reap_stale_leases' own staleness predicate
+        (a dead holder pid AND a heartbeat strictly past LEASE_HEARTBEAT_TTL).
+        A live holder is never reclaimable, however quiet it has been.
+    holder_session: the holder's own session-registry state, as resolved by
+        _resolve_holder_session_state ('live'/'exited'/'absent'/'unknown').
+    """
+
+    name: str
+    state: str
+    holder_slug: str | None
+    holder_pid: int | None
+    holder_pid_alive: bool
+    heartbeat_ts: str | None
+    heartbeat_age_secs: float
+    reclaimable: bool
+    holder_session: str
+
+
+def lease_status(
+    name: str, *, root: Path | str | None = None, now: datetime | None = None
+) -> LeaseStatus:
+    """Inspect the *name* lease without touching it (backs the ``lease-show`` verb).
+
+    WHY THIS EXISTS (task 3994, defect 3). A lease's heartbeat lives ONLY in
+    the file's mtime -- the body carries an immutable ``start_ts`` -- so
+    ``cat <lease>`` shows you WHO holds it and WHEN THEY STARTED but not
+    whether they are still beating. Diagnosing a contended lease therefore
+    meant ``cat`` + ``stat -c %y`` + a TTL comparison done by hand, and
+    getting that arithmetic wrong is what let the 2026-08-08 rotation
+    conclude a live holder's lease was reclaimable. This replaces the
+    archaeology with one command.
+
+    Freshness and liveness are computed by ``_read_lease_holder_state`` --
+    the SAME reader claim_lease decides on -- and ``heartbeat_ts`` is derived
+    from the age that reader returns rather than from a second stat(), so
+    there is exactly one clock and the display cannot disagree with the
+    decision. Likewise *reclaimable* restates claim_lease's own staleness
+    predicate rather than paraphrasing it.
+
+    READ-ONLY and fail-soft: never mutates the lease (an inspection that
+    bumped the mtime would keep a dead holder's lease unreapable), never
+    raises -- an unreadable body is a reported *state*, not an exception.
+    *now* is injectable for deterministic tests.
+    """
+    if now is None:
+        now = datetime.now(UTC)
+    path = lease_path_for_name(name, root=root)
+    if not path.is_file():
+        return LeaseStatus(
+            name=name,
+            state='absent',
+            holder_slug=None,
+            holder_pid=None,
+            holder_pid_alive=False,
+            heartbeat_ts=None,
+            heartbeat_age_secs=0.0,
+            reclaimable=False,
+            holder_session='unknown',
+        )
+    holder, holder_alive, age_secs = _read_lease_holder_state(path, now=now)
+    return LeaseStatus(
+        name=name,
+        state='held' if holder is not None else 'unreadable',
+        holder_slug=holder.session_slug if holder is not None else None,
+        holder_pid=holder.pid if holder is not None else None,
+        holder_pid_alive=holder_alive,
+        heartbeat_ts=(now - timedelta(seconds=age_secs)).isoformat(),
+        heartbeat_age_secs=age_secs,
+        # Deliberately claim_lease's `is_stale`, verbatim: staleness needs
+        # BOTH a dead pid AND an aged heartbeat. Restating it any other way
+        # would re-create the two-clocks-disagreeing failure this fixes.
+        reclaimable=(not holder_alive) and age_secs > LEASE_HEARTBEAT_TTL.total_seconds(),
+        holder_session=_resolve_holder_session_state(holder, root=root),
+    )
+
+
+@dataclass(frozen=True)
 class ReapedLease:
     """One ``.lease`` file removed by reap_stale_leases.
 
@@ -2845,6 +2937,36 @@ def _run_lease_release(name: str, slug: str, force: bool = False) -> None:
     )
 
 
+def _run_lease_show(name: str) -> None:
+    """Run the ``lease-show`` verb: print one lease's full state as key=value lines.
+
+    The replacement for ``cat <lease>`` + ``stat -c %y`` archaeology (task
+    3994 defect 3), in the same machine-readable ``<key>=<value>`` form as
+    ``decision=``/``result=`` so an agent parses every lease verb with one
+    rule. ``state=`` is the discriminator: the holder_* identity lines are
+    printed only when the body actually parsed, so an unreadable body reads
+    as unreadable rather than as a holder named ``<unknown>``. Booleans are
+    rendered lowercase (``true``/``false``) so a shell test is trivial.
+
+    Read-only and fail-soft, like lease_status itself: it never mutates the
+    lease and never raises.
+    """
+    status = lease_status(name)
+    print(f'name={status.name}')
+    print(f'state={status.state}')
+    if status.state == 'absent':
+        return
+    if status.holder_slug is not None:
+        print(f'holder_slug={status.holder_slug}')
+    if status.holder_pid is not None:
+        print(f'holder_pid={status.holder_pid}')
+    print(f'holder_pid_alive={str(status.holder_pid_alive).lower()}')
+    print(f'heartbeat_ts={status.heartbeat_ts}')
+    print(f'heartbeat_age_secs={int(status.heartbeat_age_secs)}')
+    print(f'reclaimable={str(status.reclaimable).lower()}')
+    print(f'holder_session={status.holder_session}')
+
+
 def _run_lease_reap() -> list[ReapedLease]:
     return reap_stale_leases()
 
@@ -3075,6 +3197,13 @@ def _build_parser() -> argparse.ArgumentParser:
             help='operator recovery: act even when you are not the holder; logged loudly',
         )
 
+    lease_show_p = sub.add_parser(
+        'lease-show',
+        help="inspect a lease (holder, pid liveness, heartbeat freshness); "
+        'read-only. Use this instead of `cat`, which cannot show freshness',
+    )
+    lease_show_p.add_argument('--name', required=True, help='lease name, see build_lease_name')
+
     sub.add_parser('lease-reap', help='sweep and remove stale leases')
 
     write_decision_p = sub.add_parser(
@@ -3139,6 +3268,8 @@ def main(argv: list[str] | None = None) -> int:
             _run_lease_heartbeat(args.name, args.slug, args.force)
         elif args.verb == 'lease-release':
             _run_lease_release(args.name, args.slug, args.force)
+        elif args.verb == 'lease-show':
+            _run_lease_show(args.name)
         elif args.verb == 'lease-reap':
             _run_lease_reap()
         elif args.verb == 'write-decision':
