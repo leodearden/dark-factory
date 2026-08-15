@@ -18,11 +18,11 @@ strict ``__all__`` union assertion untouched.
 
 A pinned artifact is only ever trusted when both its heuristics block and a
 schema-valid provenance sidecar are present; anything else (nothing pinned,
-an orphan heuristics file, or a corrupt/incomplete provenance sidecar)
-fails safe to the in-code constant. :func:`default_artifacts_root` gives
-every consumer (the T6 optimization loop, T2/T3 call sites, T8 tooling) one
-agreed on-disk root, so they never each invent a divergent location for the
-same on-disk state.
+an orphan heuristics file, a corrupt/incomplete provenance sidecar, or a
+sidecar that exists but cannot be read) fails safe to the in-code constant.
+:func:`default_artifacts_root` gives every consumer (the T6 optimization
+loop, T2/T3 call sites, T8 tooling) one agreed on-disk root, so they never
+each invent a divergent location for the same on-disk state.
 """
 
 from __future__ import annotations
@@ -272,9 +272,13 @@ class PromptArtifactStore:
         in-code constant — nothing pinned, an orphan heuristics file, a
         corrupt/incomplete provenance sidecar, a provenance sidecar recorded
         for a different ``harness_version`` than this key (e.g. a manually
-        relocated/tampered sidecar), or a heuristics.txt that vanishes
-        between the provenance check below and the read (e.g. a concurrent
-        :meth:`unpin` racing this call).
+        relocated/tampered sidecar), a provenance sidecar that exists but
+        cannot be read (a permission flip mid-operation, or the path replaced
+        by a directory — logged once per path per process so a
+        wholesale-unreadable root stays diagnosable rather than looking like
+        "nothing pinned"), or a heuristics.txt that vanishes between the
+        provenance check below and the read (e.g. a concurrent :meth:`unpin`
+        racing this call).
 
         Performance note: this does disk I/O — an ``exists()`` check, a JSON
         load + schema validation, and a text read — on every call, with no
@@ -362,6 +366,18 @@ class PromptArtifactStore:
     def read_provenance(
         self, prompt_id: str, executor_model: str, harness_version: str
     ) -> ArtifactProvenance | None:
+        """The schema-valid provenance pinned for this key, or ``None``.
+
+        Never raises — the second public entry point onto the same fail-safe
+        load :meth:`resolve` uses. Returns ``None`` when nothing is pinned or
+        when the sidecar is absent, corrupt, incomplete, recorded for a
+        different ``harness_version`` than this key, or present but unreadable
+        (a permission flip mid-operation, or the path replaced by a
+        directory). Note this reads *only* the sidecar: a ``None`` here means
+        "no verifiable provenance", and a non-None does not by itself
+        guarantee ``heuristics.txt`` is still present — call :meth:`resolve`
+        for the composed prompt.
+        """
         key_dir = self._key_dir(prompt_id, executor_model, harness_version)
         return _load_valid_provenance(
             key_dir / _PROVENANCE_FILENAME, expected_harness_version=harness_version
