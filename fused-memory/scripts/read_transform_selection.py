@@ -1611,6 +1611,53 @@ def build_selection_report(scored: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _retrieval_finding(arms: dict[str, Any]) -> str:
+    """The one sentence task 3111 most needs, DERIVED from the measured rows.
+
+    Not a prose constant: the claim "no transform improves the canonical's
+    retrieval rank" is only true while the unaliased column really is
+    identical across the arms, so it is read off the table rather than
+    asserted beside it.  If that ever stops holding, the paragraph says THAT
+    instead — a renderer that kept printing the invariance would be
+    describing a table it is no longer looking at.
+    """
+    cell = bake_off()._cell
+    ranks = {arm: arms[arm]['e2'].get('canonical_unaliased_rank')
+             for arm in ARM_KEYS}
+    distinct = {value for value in ranks.values() if value is not None}
+    aliased = ', '.join(
+        f'{arms[arm]["label"]} {cell(arms[arm]["e2"].get("canonical_aliased_rank"))}'
+        for arm in ARM_KEYS
+    )
+    if len(distinct) != 1 or any(value is None for value in ranks.values()):
+        by_arm = ', '.join(
+            f'{arms[arm]["label"]} {cell(ranks[arm])}' for arm in ARM_KEYS
+        )
+        return (
+            '**The unaliased canonical rank is NOT identical across the '
+            f'arms** ({by_arm}). It is computed from the pre-transform fetch, '
+            'so no read transform can move it and every arm should score the '
+            'same number over one cache. A spread here means the column is '
+            'reading the transform again — the exact conflation this table '
+            'was corrected to remove — and no arm should be landed off it '
+            'until that is resolved.'
+        )
+    shared = distinct.pop()
+    return (
+        '**No arm improves the canonical\'s retrieval rank.** Every arm in '
+        f'the table scores an unaliased rank of {cell(shared)} — the flat '
+        'read\'s own value — because that column is read from the '
+        'untransformed, untruncated fetch, which no read transform touches. '
+        f'What the three transforms move is PRESENTATION: the aliased rank '
+        f'goes to {aliased}, i.e. what the reader gets under the canonical\'s '
+        'id, while the canonical\'s own stored record still ranks exactly '
+        'where the store put it. Task 3111 is therefore choosing how the '
+        'window is ARRANGED, not how well it is retrieved; a change that '
+        'needs the canonical to be retrieved better cannot be made at this '
+        'layer at all.'
+    )
+
+
 def _pair_cell(aliased: Any, unaliased: Any) -> str:
     """The canonical column, rendered so a number cannot be read bare.
 
@@ -1794,6 +1841,8 @@ def render_selection_markdown(report: dict[str, Any]) -> str:
     add(f'*Selection rule (fixed before the numbers were read):* {rec["rule"]}')
     add('')
     add(rec['rationale'])
+    add('')
+    add(_retrieval_finding(arms))
     add('')
     if rec['excluded_pending_contested_key']:
         excluded = ', '.join(

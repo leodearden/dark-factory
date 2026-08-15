@@ -2656,6 +2656,72 @@ class TestTheRecommendation:
             assert len(rows) == 1, f'{arm}: {len(rows)} rows'
 
 
+def _ranks(unaliased_by_arm: dict[str, float], aliased: float = 1.1) -> dict:
+    """A scoring whose canonical RANK columns are set per arm."""
+    return _scored(means_by_arm={
+        arm: {'canonical_unaliased_rank': value,
+              'canonical_aliased_rank': aliased}
+        for arm, value in unaliased_by_arm.items()
+    })
+
+
+class TestTheRetrievalFindingTracksTheTable:
+    """The one sentence 3111 needs, DERIVED rather than asserted.
+
+    "No transform improves the canonical's retrieval rank" is true only while
+    the unaliased column really is arm-invariant.  A prose constant saying so
+    would survive the column going wrong; this paragraph is read off the rows,
+    so it changes when they do.
+    """
+
+    def test_it_reports_the_shared_rank_when_the_column_is_arm_invariant(self):
+        mod = _mod()
+        report = mod.build_selection_report(
+            _ranks(dict.fromkeys(mod.ARM_KEYS, 3.49)),
+        )
+
+        finding = mod._retrieval_finding(report['arms'])
+
+        assert 'No arm improves' in finding
+        assert _bake_off()._cell(3.49) in finding
+
+    def test_it_refuses_the_invariance_claim_when_the_ranks_disagree(self):
+        """A spread means the column is reading the transform again — the
+        exact conflation this table was corrected to remove.  The paragraph
+        has to say so instead of restating an invariance that has stopped
+        holding."""
+        mod = _mod()
+        ranks = dict.fromkeys(mod.ARM_KEYS, 3.49)
+        ranks['promoting_pin'] = 1.06
+        report = mod.build_selection_report(_ranks(ranks))
+
+        finding = mod._retrieval_finding(report['arms'])
+
+        assert 'No arm improves' not in finding
+        assert 'NOT identical' in finding
+        assert _bake_off()._cell(1.06) in finding
+
+    def test_an_unmeasured_rank_is_not_read_as_agreement(self):
+        """A missing column is no measurement, never a silent match."""
+        mod = _mod()
+        report = mod.build_selection_report(_scored())  # no rank keys at all
+
+        assert 'No arm improves' not in mod._retrieval_finding(report['arms'])
+
+    def test_the_committed_report_carries_the_measured_finding(self):
+        """Over the artifact itself: the shared rank in the JSON is the one
+        the Recommendation section prints."""
+        report = _committed_selection_json()
+        shared = {
+            report['arms'][arm]['e2']['canonical_unaliased_rank']
+            for arm in _mod().ARM_KEYS
+        }
+        assert len(shared) == 1, shared
+
+        section = _committed_selection_markdown().split('## Recommendation')[1]
+        assert _bake_off()._cell(shared.pop()) in section
+
+
 class TestTheNoMeasurementConvention:
     """A None must never print as 0.00 — reuses `_cell` / `_NO_MEASUREMENT`."""
 

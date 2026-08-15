@@ -11,7 +11,7 @@ A `—` cell is **no measurement**, never a measured zero.
 | arm | claim recall | canonical in top-k | tokens/query | topic diversity | baseline retention | displacement | prod tokens/query | prod displacement | drops ranked records | needs `contested` for V2 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | flat read (baseline) | 0.97 | 0.65 (aliased) / 0.65 (unaliased) | 1181.29 | 2.72 | 1.00 | 0.00 | 1240.48 | 0.00 | no | no |
-| promoting topic pin | 1.00 | 1.00 (aliased) / 1.00 (unaliased) | 1070.27 | 2.72 | 0.83 | 1.71 | 1203.84 | 0.32 | no | no |
+| promoting topic pin | 1.00 | 1.00 (aliased) / 0.65 (unaliased) | 1070.27 | 2.72 | 0.83 | 1.71 | 1203.84 | 0.32 | no | no |
 | topic-keyed grouped read | 1.00 | 1.00 (aliased) / 0.65 (unaliased) | 1308.37 | 2.72 | 1.00 | 6.43 | 1261.43 | 0.39 | yes | yes |
 | topic-diversity cap | 0.63 | 0.65 (aliased) / 0.65 (unaliased) | 790.23 | 2.72 | 0.53 | 4.72 | 1234.77 | 0.07 | yes | no |
 
@@ -23,8 +23,10 @@ A grouped read emits its document under the **canonical's own** `record_id` (`ba
 
 This is the mechanism behind the committed E2 table's `b_grouped` canonical-in-top-5 of 0.97: it is an aliased rate, and reading it as "retrieval finds the canonical 97% of the time" is not what was measured. Both rates are printed above, in one cell each, so neither can be quoted without its semantics.
 
-* **aliased** — the legacy `record_id`-match semantics, preserved so this table stays comparable with the committed one.
-* **unaliased** — the canonical's OWN stored record actually ranked, read from the transform's emitted provenance.
+* **aliased** — the legacy `record_id`-match semantics over the DELIVERED window, preserved so this table stays comparable with the committed one. A PLACEMENT property: what the reader got under the canonical's id.
+* **unaliased** — a RETRIEVAL property: the canonical's OWN stored record ranked, and where. Computed from the untransformed, untruncated hit list, so no read transform can touch it — which makes it **identical across every arm in the table by construction**, and that identity is the finding, not an error. A column that varied by arm here would be measuring the transform again.
+
+Because it is arm-invariant, the unaliased column cannot discriminate between arms and is therefore **not** a sort key in the selection rule below; neither is the aliased one, which would reward minting a document under the canonical's id. See the Recommendation.
 
 ## Disclosure (b): the sighting-crediting knob
 
@@ -57,9 +59,11 @@ The live reserved vocabulary is `RESERVED_VOCABULARY_KEYS` (`fused-memory/src/fu
 
 **Task 3111 should land: promoting topic pin.**
 
-*Selection rule (fixed before the numbers were read):* Landability first: any arm that would need a `contested` key to satisfy PRD V2 is excluded outright, because that key does not exist. Among the rest, rank by UNALIASED canonical discoverability, then claim recall, then tokens/query (lower better), then window displacement (lower better). A None sorts last, never as a zero. The rule is fixed before the numbers are read and is not re-tuned to move a column.
+*Selection rule (fixed before the numbers were read):* Landability first: any arm that would need a `contested` key to satisfy PRD V2 is excluded outright, because that key does not exist. Among the rest, rank by claim recall, then tokens/query (lower better), then window displacement (lower better). NEITHER canonical column is a sort key: the UNALIASED one is arm-invariant by construction — it is read from the pre-transform fetch, so no read transform can move it, and ranking on it would sort every arm on the same constant — while the ALIASED one is a placement property, so ranking on it would reward minting a document under the canonical id. Both are reported in full and neither decides. A None sorts last, never as a zero. The rule is fixed before the numbers are read and is not re-tuned to move a column.
 
 promoting topic pin is the highest-ranked arm that task 3111 can actually land today: it satisfies the ordering above while requiring no vocabulary key that has no writer. Arms excluded pending a `contested` key: ['topic-keyed grouped read'].
+
+**No arm improves the canonical's retrieval rank.** Every arm in the table scores an unaliased rank of 3.49 — the flat read's own value — because that column is read from the untransformed, untruncated fetch, which no read transform touches. What the three transforms move is PRESENTATION: the aliased rank goes to flat read (baseline) 3.49, promoting topic pin 1.06, topic-keyed grouped read 1.11, topic-diversity cap 1.05, i.e. what the reader gets under the canonical's id, while the canonical's own stored record still ranks exactly where the store put it. Task 3111 is therefore choosing how the window is ARRANGED, not how well it is retrieved; a change that needs the canonical to be retrieved better cannot be made at this layer at all.
 
 Excluded outright, at any score: **topic-keyed grouped read** — see disclosure (d). This is an exclusion on landability, not a measurement verdict; the arm's row above is still reported in full so a later reader with a `contested` key can re-decide.
 

@@ -3,8 +3,10 @@
     "flat_read": {
       "e2": {
         "baseline_retention_at_k": 1.0,
+        "canonical_aliased_credit_is_synthesized": 0.0,
         "canonical_aliased_in_top_k": 0.652542372881356,
         "canonical_aliased_rank": 3.4935064935064934,
+        "canonical_retrieval_depth": 10.0,
         "canonical_unaliased_in_top_k": 0.652542372881356,
         "canonical_unaliased_rank": 3.4935064935064934,
         "claim_recall": 0.9745762711864406,
@@ -46,10 +48,12 @@
     "promoting_pin": {
       "e2": {
         "baseline_retention_at_k": 0.8292372881355932,
+        "canonical_aliased_credit_is_synthesized": 0.0,
         "canonical_aliased_in_top_k": 0.9957627118644068,
         "canonical_aliased_rank": 1.0595744680851065,
-        "canonical_unaliased_in_top_k": 0.9957627118644068,
-        "canonical_unaliased_rank": 1.0595744680851065,
+        "canonical_retrieval_depth": 10.0,
+        "canonical_unaliased_in_top_k": 0.652542372881356,
+        "canonical_unaliased_rank": 3.4935064935064934,
         "claim_recall": 0.9957627118644068,
         "k": 10.0,
         "tokens_per_query": 1070.2711864406779,
@@ -89,10 +93,12 @@
     "topic_diversity_cap": {
       "e2": {
         "baseline_retention_at_k": 0.5279661016949152,
+        "canonical_aliased_credit_is_synthesized": 0.0,
         "canonical_aliased_in_top_k": 0.652542372881356,
         "canonical_aliased_rank": 1.0454545454545454,
+        "canonical_retrieval_depth": 10.0,
         "canonical_unaliased_in_top_k": 0.652542372881356,
-        "canonical_unaliased_rank": 1.0454545454545454,
+        "canonical_unaliased_rank": 3.4935064935064934,
         "claim_recall": 0.6271186440677966,
         "k": 10.0,
         "tokens_per_query": 790.228813559322,
@@ -132,10 +138,12 @@
     "topic_keyed_grouped": {
       "e2": {
         "baseline_retention_at_k": 1.0,
+        "canonical_aliased_credit_is_synthesized": 0.3432203389830508,
         "canonical_aliased_in_top_k": 0.9957627118644068,
         "canonical_aliased_rank": 1.1063829787234043,
+        "canonical_retrieval_depth": 10.0,
         "canonical_unaliased_in_top_k": 0.652542372881356,
-        "canonical_unaliased_rank": 1.0454545454545454,
+        "canonical_unaliased_rank": 3.4935064935064934,
         "claim_recall": 0.9957627118644068,
         "k": 10.0,
         "tokens_per_query": 1308.3728813559321,
@@ -197,11 +205,11 @@
       "path": "fused-memory/tests/fixtures/e2_distractor_slab.jsonl"
     },
     {
-      "commit": "f51013f7f543b91783270ebbba24aa6c05d4edf8",
+      "commit": "ef7d7bee0e54ff7247a320fad0353792945b94ae",
       "path": "fused-memory/tests/fixtures/production_query_sample.jsonl"
     },
     {
-      "commit": null,
+      "commit": "7b62fe7e0d2f9a30c458e2eb8ad3066ef9c8dc02",
       "path": "fused-memory/tests/fixtures/e2_fetch_cache.json"
     }
   ],
@@ -269,7 +277,7 @@
     ],
     "label": "promoting topic pin",
     "rationale": "promoting topic pin is the highest-ranked arm that task 3111 can actually land today: it satisfies the ordering above while requiring no vocabulary key that has no writer. Arms excluded pending a `contested` key: ['topic-keyed grouped read'].",
-    "rule": "Landability first: any arm that would need a `contested` key to satisfy PRD V2 is excluded outright, because that key does not exist. Among the rest, rank by UNALIASED canonical discoverability, then claim recall, then tokens/query (lower better), then window displacement (lower better). A None sorts last, never as a zero. The rule is fixed before the numbers are read and is not re-tuned to move a column."
+    "rule": "Landability first: any arm that would need a `contested` key to satisfy PRD V2 is excluded outright, because that key does not exist. Among the rest, rank by claim recall, then tokens/query (lower better), then window displacement (lower better). NEITHER canonical column is a sort key: the UNALIASED one is arm-invariant by construction — it is read from the pre-transform fetch, so no read transform can move it, and ranking on it would sort every arm on the same constant — while the ALIASED one is a placement property, so ranking on it would reward minting a document under the canonical id. Both are reported in full and neither decides. A None sorts last, never as a zero. The rule is fixed before the numbers are read and is not re-tuned to move a column."
   },
   "reserved_vocabulary_keys": [
     "canonical",
