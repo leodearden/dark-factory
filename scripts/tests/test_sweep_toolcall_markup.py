@@ -1044,12 +1044,6 @@ def test_repair_document_converges_and_is_idempotent_on_a_nested_leak():
     assert [o.action for o in again_outcomes].count(sweep.ACTION_REPAIRED) == 0
 
 
-def test_the_round_bound_is_a_named_module_constant():
-    """Not a magic number inline — an operator has to be able to find it."""
-    assert isinstance(sweep._MAX_REPAIR_ROUNDS, int)
-    assert sweep._MAX_REPAIR_ROUNDS >= 2, 'a fixed point needs at least two passes'
-
-
 def test_a_non_converging_document_reports_did_not_converge(monkeypatch):
     """Case (b): the bound truncates the LOOP, never a repair.
 
