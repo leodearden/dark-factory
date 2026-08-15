@@ -650,6 +650,97 @@ class TestReifyCheckoutPlantedLayout:
         )
 
 
+class TestSkipUnlessCheckout:
+    """`_skip_unless_checkout` — the reachability precondition step-6 wires
+    both reify-parametrized sweeps through, so a None or set-but-absent reify
+    root SKIPS honestly instead of raising ``AttributeError`` at the sweeps'
+    inline ``repo_root.is_dir()``.
+
+    RED today: `_skip_unless_checkout` does not exist in this module, so
+    every case below fails with ``NameError``.  Ported in shape from
+    fused-memory/tests/test_lock_charter_guard.py:721-762's helper of the
+    same name, but pinned MORE thoroughly than that suite pins its own copy:
+    the γ suite only exercises the helper indirectly through its own
+    parametrized sweeps, which never observe the ``None`` arm on a host where
+    reify IS discoverable.  These cases call the helper directly, so the
+    ``None`` arm is pinned host-independently regardless of what any given
+    machine has checked out.
+    """
+
+    def test_discovery_miss_skips_with_the_shared_wording(self):
+        """A None root is the discovery-miss arm — nobody has a reify sibling.
+
+        The wording must come from the shared builder, not a local string, so
+        it cannot drift from what the Tier-2 skipifs above and orchestrator's
+        verify gate say about the same condition.  ``pytest.skip.Exception``
+        is pytest's own public handle for the outcome ``pytest.skip`` raises
+        (documented on ``pytest.skip`` itself), so capturing it here needs no
+        dependency on the private ``_pytest.outcomes`` import path.
+        """
+        with pytest.raises(pytest.skip.Exception) as excinfo:
+            _skip_unless_checkout('reify', None)
+
+        reason = str(excinfo.value)
+        assert isinstance(reason, str) and reason, (
+            f'a None root is the discovery-miss arm, which always yields a '
+            f'reason from the shared builder — a falsy one here would turn '
+            f'this skip into a phantom pass, got {reason!r}'
+        )
+        assert reason == reify_checkout.reify_skip_reason(
+            _REIFY_GUARD_RELPATH, None, named_by_env=False
+        ), 'the discovery-miss wording must come from the shared builder, not a local string'
+
+    def test_set_but_absent_root_skips_naming_the_path(self, tmp_path):
+        """A REIFY_ROOT-shaped path that is not on disk must be NAMED in the
+        skip reason, so an operator's typo is self-evident in `pytest -rs`
+        output instead of silently falling back to discovery.
+        """
+        missing = tmp_path / 'no-such-reify-checkout'
+
+        with pytest.raises(pytest.skip.Exception) as excinfo:
+            _skip_unless_checkout('reify', missing)
+
+        reason = str(excinfo.value)
+        assert str(missing) in reason, (
+            f'the skip reason must name the bad path so a REIFY_ROOT typo is '
+            f'self-evident: {reason!r}'
+        )
+
+    def test_present_directory_is_returned_unchanged(self, tmp_path):
+        """A real directory must be RETURNED, not skipped.
+
+        Otherwise the helper could skip everything vacuously and the sweeps
+        it guards would never run against a real checkout.
+        """
+        assert _skip_unless_checkout('reify', tmp_path) == tmp_path
+
+
+class TestReifyGuardVectorNoneGuard:
+    """`_reify_guard_vector` must fail LOUDLY on a None guard script.
+
+    Its docstring already commits the helper to LOUD-on-failure for a script
+    that exists and then fails; this pins the same commitment for the
+    ``None`` arm the step-4 Optional widening opened up (project
+    no-silent-fail-soft invariant), so a caller that lost its skipif guard
+    fails with a clear AssertionError instead of shelling out to `bash None`.
+    """
+
+    def test_fails_loudly_when_guard_script_is_none(self, monkeypatch):
+        """A None `_REIFY_GUARD_SCRIPT` must raise an AssertionError naming
+        the constant, never shell out to `bash None` and let bash's resulting
+        non-zero exit read as a real cross-source drift failure.
+
+        RED today: calling this with `_REIFY_GUARD_SCRIPT` patched to None
+        instead raises `AttributeError` (`None.name` inside the message that
+        formats the non-zero-exit assertion) — confusing rather than loud,
+        and not the AssertionError this case pins.
+        """
+        monkeypatch.setattr(sys.modules[__name__], '_REIFY_GUARD_SCRIPT', None)
+
+        with pytest.raises(AssertionError, match='_REIFY_GUARD_SCRIPT'):
+            _reify_guard_vector('--list-extensions')
+
+
 class TestNormalizeLock:
     def test_default_depth_is_two(self):
         assert normalize_lock('crates/reify-types/src/persistent.rs') == 'crates/reify-types'
