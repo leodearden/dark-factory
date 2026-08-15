@@ -171,6 +171,25 @@ class ReferentResolution:
     ambiguous: ReferentSet = ()
 
 
+def _is_task_number(text: str) -> bool:
+    """Whether *text* is a bare run of ASCII digits — i.e. a task number.
+
+    The single site for "what IS a task number", shared by
+    :func:`_declared_number` and :func:`_metadata_referents`. Two copies is the
+    lockstep duplication this module's docstring forbids under INV-5, one level
+    down from the label vocabulary: a later tightening (rejecting a leading
+    '+', capping the length) applied to one site and not the other would
+    silently make the declared and metadata paths disagree about what a task
+    number is, and no test would catch the disagreement.
+
+    String predicates rather than a compiled ``'^\\d+$'``, because INV-5 forbids
+    a second copy of the label pattern in this module. The ``isascii()`` half
+    is precision, not ceremony: :meth:`str.isdigit` accepts Arabic-Indic and
+    superscript digits, and a Unicode digit is not a task id.
+    """
+    return bool(text) and text.isascii() and text.isdigit()
+
+
 def _local_project(group_id: str) -> str:
     """The canonical project id *group_id* names, or ``''`` if it names none.
 
@@ -262,11 +281,7 @@ def _declared_number(entry: dict) -> str:
             f'{_safe_repr(value)}. {_DECLARED_REFERENT_HINT}'
         )
     number = str(value).strip()
-    # String predicates rather than a compiled '^\\d+$': INV-5 forbids a second
-    # copy of the label vocabulary in this module. The isascii() half is
-    # precision, not ceremony — str.isdigit() accepts Arabic-Indic and
-    # superscript digits, and a Unicode digit is not a task id.
-    if not number or not (number.isascii() and number.isdigit()):
+    if not _is_task_number(number):
         raise InputValidationError(
             f'declared referent {_safe_repr(entry)} has an id that is not a '
             f'run of ASCII digits: {_safe_repr(value)}. {_DECLARED_REFERENT_HINT}'
@@ -539,11 +554,9 @@ def _metadata_referents(metadata: dict | None, *, group_id: str) -> ReferentSet:
 
     # Exactly ONE shape of our own: the bare digit run that metadata.task_id
     # actually carries, and the one parse_node_name is anchored to refuse.
-    # String predicates rather than a compiled '^\d+$' because INV-5 forbids a
-    # second copy of the label vocabulary in this module. The isascii() half is
-    # precision, not ceremony: str.isdigit() accepts Arabic-Indic and
-    # superscript digits, and a Unicode digit is not a task id.
-    if text.isascii() and text.isdigit():
+    # Through :func:`_is_task_number`, the same site the declared path uses, so
+    # the two paths cannot drift about what a task number is.
+    if _is_task_number(text):
         return (Referent(kind='task', number=text),)
     return ()
 
