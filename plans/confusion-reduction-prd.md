@@ -131,7 +131,7 @@ Motivation: `plans/confusion-census-2026-07-31.md:97` (cluster 1.3) found sessio
 
 This is the pre-fix-trace vs live-regression discriminator that `plans/confusion-census-2026-07-31.md:151` (§6) asked the next census for.
 
-**07-31 census R1–R3 (`plans/confusion-census-2026-07-31.md:129-135`)**: R3 (exit-code / designed-outcome awareness) is discharged here, together with the R6 gold-turn filter relaxation. **R1** (pasted-report-content and mid-field truncation marking) and **R2** (`n_user_turns` frontmatter itemization) remain **open** and are tracked under a separate low-priority follow-up — they are named in task 3610's title but absent from its FIX list, so they were deliberately not folded in here.
+**07-31 census R1–R3 (`plans/confusion-census-2026-07-31.md:129-135`)**: R3 (exit-code / designed-outcome awareness) is discharged here, together with the R6 gold-turn filter relaxation. **R1** (pasted-report-content and mid-field truncation marking) and **R2** (`n_user_turns` frontmatter itemization) remain **open**, tracked under **task 3614** — they are named in task 3610's title but absent from its FIX list, so they were deliberately not folded in here.
 
 ### 7.3 Coding record (coder output → merger input)
 
