@@ -2802,6 +2802,16 @@ _SLOT_FREE = 'FREE'
 _SLOT_BUSY = 'BUSY'
 _SLOT_PARKED = 'PARKED'   # cancel-fail path: held + non-acquirable, pending pgrep probe
 
+# Wire vocabulary for the slot constants above (task 3275).  Derived from the
+# constants rather than re-spelled so the two can never drift apart.  Consumers
+# of HostAllocator.host_states() see ONLY these lowercase strings, never the
+# internal _SLOT_* spelling — see host_states() for the rationale.
+_SLOT_WIRE = {
+    _SLOT_FREE: 'free',
+    _SLOT_BUSY: 'busy',
+    _SLOT_PARKED: 'parked',
+}
+
 
 @dataclass(frozen=True)
 class HostLease:
@@ -2949,6 +2959,55 @@ class HostAllocator:
         were never quarantined) is a safe no-op.
         """
         self._quarantine.discard(name)
+
+    def is_quarantined(self, name: str) -> bool:
+        """Return True if host *name* is currently quarantined.
+
+        Mirrors :meth:`VerifyRunnerPool.is_quarantined`.  Because the
+        quarantine set is shared **by reference** with the worker's
+        ``_runner_quarantine``, this reflects every writer of that set — not
+        just :meth:`quarantine_and_release`, but also the DriftDetector-driven
+        verdict-divergence quarantines and the land-time per-land cross-check,
+        which add names to the worker's set directly without going through the
+        allocator.
+
+        A name this allocator does not manage returns False rather than
+        raising (the read is pure set membership, not a slot lookup).
+        """
+        return name in self._quarantine
+
+    def host_states(self) -> list[dict]:
+        """Return per-host slot state + quarantine membership, one dict per host.
+
+        Ordering matches the :attr:`host_names` property: ``_slots`` insertion
+        order, i.e. local first, then remotes in declaration order.
+
+        Each dict is ``{'name', 'is_local', 'slot_state', 'quarantined'}`` —
+        a uniform schema, every key always present.
+
+        Notes
+        -----
+        - The returned dicts are **plain data, not live views**: mutating them
+          cannot affect allocator state, and they do not update as slots change.
+        - ``slot_state`` is the lowercase wire vocabulary (``free`` / ``busy`` /
+          ``parked``) from :data:`_SLOT_WIRE`, deliberately distinct from the
+          internal ``_SLOT_*`` constants so a consumer can never come to depend
+          on the internal spelling.
+        - This is the sanctioned read path for
+          :meth:`~orchestrator.merge_queue.SpeculativeMergeWorker.snapshot`
+          (task 3275), which must NOT reach into ``_slots`` / ``_quarantine``
+          directly.  Pure read — no mutation, no I/O, no await — so it is safe
+          to call from that synchronous method.
+        """
+        return [
+            {
+                'name': name,
+                'is_local': name == self._local_name,
+                'slot_state': _SLOT_WIRE[state],
+                'quarantined': name in self._quarantine,
+            }
+            for name, state in self._slots.items()
+        ]
 
     def quarantined_remote_runners(self) -> list[tuple[str, Any]]:
         """Return (name, runner) pairs for remote runners currently in quarantine.
