@@ -1164,6 +1164,103 @@ def test_poll_interval_parser_reads_an_arbitrary_constant_name() -> None:
         )
 
 
+def _write_synthetic_client(path: pathlib.Path, source: str) -> pathlib.Path:
+    """Write a synthetic client-side source file for scanner-verification tests.
+
+    The sibling of _write_synthetic_unit for the JS side: the scanner's own
+    behaviour is pinned against sources this module controls, so the live-tree
+    guard is the only test coupled to the real dashboard client.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(source, encoding="utf-8")
+    return path
+
+
+def test_setinterval_scanner_classifies_every_call_site(
+    tmp_path: pathlib.Path,
+) -> None:
+    """_unclassified_setinterval_sites must sort live timers into known/allowed/new.
+
+    This is the guard-the-guard test for the completeness check: a scanner that
+    silently reported nothing would turn
+    test_every_client_setinterval_is_registered_or_allowlisted into a green
+    no-op, which is the exact failure mode that let a second poller go
+    unnoticed in the first place.
+
+    Two hazards get their own cases.  Comment immunity: the live tree mentions
+    ``setInterval(...)`` inside a ``//`` comment at tab_tasks.jsx, so a raw-text
+    scan would report a phantom site and train maintainers to allowlist
+    fictions.  That is the same trap _uvicorn_int_flag already handles from the
+    other direction by scoping to the logical ExecStart line rather than the
+    whole file (see test_uvicorn_flag_lookup_is_scoped_to_exec_start).  And
+    nested calls: a naive ``setInterval\\([^)]*\\)`` match stops at the FIRST
+    ``)``, so ``setInterval(() => tick(n => n + 1), 2000)`` would yield a
+    garbled period — both live non-polling timers have exactly this shape.
+    """
+    redux = tmp_path / "redux"
+
+    # Registered: driven by a known poller constant, so already covered.
+    registered = _write_synthetic_client(
+        redux / "data.js",
+        "const POLL_INTERVAL_MS = 3000;\n"
+        "setInterval(() => pollTick(opts), POLL_INTERVAL_MS);\n",
+    )
+    # Allowlisted: a pure UI tick, and a NESTED call in the callback.
+    allowlisted = _write_synthetic_client(
+        redux / "app.jsx",
+        "setInterval(() => setNow(new Date()), 1000);\n",
+    )
+    # Unregistered and unallowlisted — must be reported.
+    unknown = _write_synthetic_client(
+        redux / "tab_thing.jsx",
+        "setInterval(fetchThing, 4000);\n",
+    )
+    # Also unclassified, and nested two deep: pins the balanced-paren scan.
+    nested = _write_synthetic_client(
+        redux / "shell.jsx",
+        "setInterval(() => tick(n => n + 1), 2000);\n",
+    )
+    # Comments only: a `//` mention and a `/* */` block. Neither is live code.
+    commented = _write_synthetic_client(
+        redux / "tab_tasks.jsx",
+        "// ...`setInterval(() => setNow(...), 1000)`, unrelated\n"
+        "/* legacy, removed:\n"
+        "setInterval(fetchOld, 7000);\n"
+        "*/\n",
+    )
+
+    allowlist = {
+        ("redux/app.jsx", "1000"): "clock tick — opens no connection",
+        # Points at a call site that now exists only inside a comment.
+        ("redux/tab_tasks.jsx", "1000"): "checks nothing anymore",
+    }
+    unclassified, stale = _unclassified_setinterval_sites(
+        [registered, allowlisted, unknown, nested, commented],
+        known_consts={"POLL_INTERVAL_MS"},
+        allowlist=allowlist,
+    )
+
+    # (a) known constant, (b) allowlisted, (d) comment-only: none reported.
+    # (c) the two genuinely new timers are, each named with its file and period.
+    assert sorted(unclassified) == [
+        ("redux/shell.jsx", "2000"),
+        ("redux/tab_thing.jsx", "4000"),
+    ], (
+        "Scanner must report exactly the unregistered, unallowlisted call sites "
+        f"— with their periods — and nothing else; got {sorted(unclassified)}. "
+        "A phantom from a commented-out site would train maintainers to "
+        "allowlist fictions; a missed real site is a poller the keep-alive "
+        "floor does not clear."
+    )
+
+    # (e) an allowlist entry whose site is now only a comment is STALE, not
+    # silently satisfied — otherwise the allowlist rots into a no-op gate.
+    assert stale == [("redux/tab_tasks.jsx", "1000")], (
+        "An allowlist entry matching no live call site must be reported stale; "
+        f"got {stale}."
+    )
+
+
 def test_client_poll_interval_is_readable_from_the_shipped_client() -> None:
     """The live client source must still yield a poll interval to compare against.
 
