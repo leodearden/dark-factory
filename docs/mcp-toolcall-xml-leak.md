@@ -101,7 +101,7 @@ That parser does not exist. Measured on the base branch:
 | Probe | Result |
 |---|---|
 | `ElementTree` / `xml.etree` / `lxml` / `BeautifulSoup` / `html.parser` in `fused-memory/src/` | **zero hits** — there is no XML parser in fused-memory at all |
-| Serialized tool-call literals in any production write path across `fused-memory/src/`, `orchestrator/src/`, `shared/src/`, `escalation/src/` | **zero hits** — nothing in this repo ever emits one |
+| Serialized tool-call literals in any production write path across `fused-memory/src/`, `orchestrator/src/`, `shared/src/`, `escalation/src/` | **zero hits that emit envelope markup** — the only literal-grep hits are prose mentions inside guard-module docstrings (`markup_tripwire.py`'s own hazard description); no production code path in this repo emits one |
 | `submit_task` / `update_task` priority parameter | `priority: str \| None = None` — no enum, no `Literal[...]`, no pydantic `Field` |
 
 Since nothing here parses or emits tool-call XML, a fragment appearing in
