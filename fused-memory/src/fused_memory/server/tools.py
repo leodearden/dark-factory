@@ -4466,10 +4466,23 @@ def create_mcp_server(
             return err
         causation_id, source, cleaned_meta = _extract_causation(metadata, agent_id)
 
-        # (4) The canonical FIRST. A uniqueness violation or a metadata
-        # rejection here must cost zero deletions — the alternative is a
-        # cluster whose members are gone and whose replacement was never
-        # written, which is the ratchet running backwards.
+        # (4) The canonical FIRST, and NO delete or metadata patch may appear
+        # above this point in the body. The ordering IS the anti-ratchet
+        # property, and it is asymmetric on purpose:
+        #
+        #   delete-then-write, on a failed write  -> net LOSS, unrecoverable
+        #                                            (no write path reaches a
+        #                                            deleted point id)
+        #   write-then-delete, on a failed delete -> net ADD, reportable in
+        #                                            `failed_deletes` and
+        #                                            re-runnable
+        #
+        # This order makes the first outcome impossible and the second
+        # visible. `CanonicalUniquenessViolation` and
+        # `MemoryMetadataValidationError` are left to propagate to
+        # `@mcp_tool_errors`: the op refused before touching anything, so
+        # there is no partial state to describe and the flattened
+        # {'error', 'error_type'} envelope is the whole truth.
         canonical_meta = dict(cleaned_meta or {})
         canonical_meta.update({
             'topic': topic,
@@ -4486,7 +4499,24 @@ def create_mcp_server(
             causation_id=causation_id,
             _source=source,
         )
+        # `AddMemoryResponse` is a pydantic model whose `memory_ids` can come
+        # back EMPTY without raising — a write that landed nothing while
+        # reporting no failure. Indexing it blindly would either raise an
+        # IndexError flattened into an unreadable error, or (worse, had this
+        # been a dict lookup) carry a None canonical id into the delete loop
+        # and reap a live cluster in favour of a record that does not exist.
         canonical_id = written.memory_ids[0] if written.memory_ids else None
+        if not canonical_id:
+            return {
+                'error': (
+                    'consolidate_memories: the canonical write returned no memory '
+                    'id, so nothing was deleted. The supersedes are untouched — '
+                    're-run once the write path is healthy.'
+                ),
+                'error_type': 'CanonicalWriteFailed',
+                'topic': topic,
+                'supersedes': list(supersedes_ids),
+            }
 
         deleted: list[str] = []
         for supersede_id in supersedes_ids:
