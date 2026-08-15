@@ -305,15 +305,24 @@ class LabelScan:
 def _canonical_allowlist(known_project_ids: Collection[str] | None) -> frozenset[str] | None:
     """Canonicalize *known_project_ids*, or return None for permissive mode.
 
-    Returns None when the registry is missing or empty. That is PERMISSIVE by
-    design and mirrors ``validate_known_project_id``'s documented
-    empty-registry mode: failing closed would silently disable this protection
-    entirely on any deployment that never wires the registry, which is the
-    exact silent-degradation failure mode this scanner exists to eliminate.
+    Returns None — PERMISSIVE — in THREE cases: a missing registry, an empty
+    registry, and a non-empty registry in which EVERY entry was path-shaped and
+    therefore skipped. The first two mirror ``validate_known_project_id``'s
+    documented empty-registry mode: failing closed would silently disable this
+    protection entirely on any deployment that never wires the registry, which
+    is the exact silent-degradation failure mode this scanner exists to
+    eliminate.
 
     A path-shaped registry key is skipped rather than normalized (normalizing a
     mangled path would mint a new, wrong canonical key — RCA §4) and rather
     than raised, so one bad entry never disables the whole allowlist.
+
+    The third case is why the return is ``or None`` rather than the surviving
+    frozenset: an EMPTY frozenset ``is not None``, so the caller's
+    ``allowlist is not None`` guard in :func:`scan_content` would read "an
+    allowlist of nothing" as "allow nothing" and drop every foreign ref — the
+    whole-allowlist disablement the paragraph above forbids, arrived at by
+    skipping every entry instead of one.
     """
     if not known_project_ids:
         return None
@@ -323,7 +332,7 @@ def _canonical_allowlist(known_project_ids: Collection[str] | None) -> frozenset
             canonical.add(canonicalize_project_id(raw))
         except PathShapedProjectIdError:
             continue
-    return frozenset(canonical)
+    return frozenset(canonical) or None
 
 
 def scan_content(
@@ -362,8 +371,9 @@ def scan_content(
             collection; a ``{project_id: project_root}`` mapping works, since
             iterating it yields its keys). When non-empty, FOREIGN referents
             naming a project outside it are dropped — own-project referents
-            are never dropped by it. When None or empty the filter is
-            PERMISSIVE — see :func:`_canonical_allowlist`.
+            are never dropped by it. When None, empty, or entirely
+            path-shaped (so that nothing survives canonicalization) the filter
+            is PERMISSIVE — see :func:`_canonical_allowlist`.
 
     Returns:
         A :class:`LabelScan`. ``refs`` is safe to act on; ``ambiguous`` must
