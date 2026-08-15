@@ -443,14 +443,10 @@ def test_marker_absent_everywhere_reports_none_not_zero():
     """
     results = _mixed_results()
 
-    counts = mod.count_judged_without_reference(results)
+    rows = {r['config_name']: r for r in mod.summarize_candidates(results)}
 
-    assert set(counts) == {'architect-opus-max', 'architect-fable-high'}
-    assert all(v is None for v in counts.values())
-    assert all(
-        row['judged_without_reference'] is None
-        for row in mod.summarize_candidates(results)
-    )
+    assert set(rows) == {'architect-opus-max', 'architect-fable-high'}
+    assert all(row[mod.MARKER_KEY] is None for row in rows.values())
 
 
 def test_marker_present_counts_per_candidate():
@@ -470,10 +466,10 @@ def test_marker_present_counts_per_candidate():
               extra_metrics={'judged_without_reference': False}),
     ]
 
-    counts = mod.count_judged_without_reference(results)
+    rows = {r['config_name']: r for r in mod.summarize_candidates(results)}
 
     # B's 0 is a REAL measurement here, precisely because the key IS present.
-    assert counts == {'A': 2, 'B': 0}
+    assert {name: row[mod.MARKER_KEY] for name, row in rows.items()} == {'A': 2, 'B': 0}
 
 
 def test_only_architect_cells_are_counted():
@@ -492,7 +488,9 @@ def test_only_architect_cells_are_counted():
               extra_metrics={'judged_without_reference': True}),
     ]
 
-    assert mod.count_judged_without_reference(results) == {'A': 0}
+    rows = {r['config_name']: r for r in mod.summarize_candidates(results)}
+
+    assert {name: row[mod.MARKER_KEY] for name, row in rows.items()} == {'A': 0}
 
 
 def test_rendered_table_marks_unmeasured_loudly():
@@ -996,19 +994,28 @@ def test_mixed_corpus_count_reads_unmeasured_not_zero():
     validity-bounded when one of the two cells was never bounded at all.
     Verified first-hand that the pre-fix code returned ``{'A': 0}`` here.
     """
-    counts = mod.count_judged_without_reference(_mixed_marker_results())
+    rows = {r['config_name']: r for r in mod.summarize_candidates(_mixed_marker_results())}
 
-    assert counts['A'] is None
-    assert counts['A'] != 0
+    assert rows['A'][mod.MARKER_KEY] is None
+    assert rows['A'][mod.MARKER_KEY] != 0
 
 
 def test_unmeasured_marker_cells_are_counted_per_candidate():
     """``None`` alone cannot distinguish 1-of-50 unmeasured from 50-of-50.
 
-    So the driver also reports HOW MANY architect cells lacked the key, which
-    makes a partially-instrumented corpus legible rather than merely unknown.
+    So the row also reports HOW MANY scored cells lacked the key, which makes a
+    partially-instrumented corpus legible rather than merely unknown. Every cell
+    below is in the admitted pool, so the count is the same one an all-architect
+    -cells scan would give — the two populations diverge only on a cap-tainted
+    cell, which is pinned separately.
     """
-    assert mod.count_unmeasured_marker_cells(_mixed_marker_results()) == {'A': 1}
+    def _unmeasured(results):
+        return {
+            r['config_name']: r[mod.UNMEASURED_CELLS_KEY]
+            for r in mod.summarize_candidates(results)
+        }
+
+    assert _unmeasured(_mixed_marker_results()) == {'A': 1}
 
     fully_keyed = [
         _cell('f1', 'A', plan_steps=5, plan_quality=0.9,
@@ -1016,14 +1023,14 @@ def test_unmeasured_marker_cells_are_counted_per_candidate():
         _cell('f2', 'A', plan_steps=5, plan_quality=0.9,
               extra_metrics={'judged_without_reference': True}),
     ]
-    assert mod.count_unmeasured_marker_cells(fully_keyed) == {'A': 0}
+    assert _unmeasured(fully_keyed) == {'A': 0}
 
     fully_keyless = [
         _cell('f1', 'A', plan_steps=5, plan_quality=0.9, drop_metrics=_PRE_SIGMA),
         _cell('f2', 'A', plan_steps=5, plan_quality=0.9, drop_metrics=_PRE_SIGMA),
         _cell('f3', 'A', plan_steps=5, plan_quality=0.9, drop_metrics=_PRE_SIGMA),
     ]
-    assert mod.count_unmeasured_marker_cells(fully_keyless) == {'A': 3}
+    assert _unmeasured(fully_keyless) == {'A': 3}
 
 
 def test_implementer_cell_missing_the_key_does_not_poison_the_count():
@@ -1043,8 +1050,10 @@ def test_implementer_cell_missing_the_key_does_not_poison_the_count():
         _cell('f3', 'A', role_under_test='implementer', drop_metrics=_PRE_SIGMA),
     ]
 
-    assert mod.count_judged_without_reference(results) == {'A': 1}
-    assert mod.count_unmeasured_marker_cells(results) == {'A': 0}
+    row = {r['config_name']: r for r in mod.summarize_candidates(results)}['A']
+
+    assert row[mod.MARKER_KEY] == 1
+    assert row[mod.UNMEASURED_CELLS_KEY] == 0
 
 
 def test_uniform_corpora_are_unchanged():
@@ -1054,9 +1063,11 @@ def test_uniform_corpora_are_unchanged():
     corpus still reports every count ``None`` and discards nothing, and an
     all-keyed corpus still counts and bands exactly as it did.
     """
-    # All keyless (today's instrument): unmeasured everywhere, nothing discarded.
+    # All keyless (a pre-σ artifact replay): unmeasured everywhere, nothing discarded.
     keyless = _mixed_results()
-    assert all(v is None for v in mod.count_judged_without_reference(keyless).values())
+    assert all(
+        row[mod.MARKER_KEY] is None for row in mod.summarize_candidates(keyless)
+    )
     assert mod.partition_bands(keyless, 0.80)['discarded'] == []
 
     # All keyed (post-σ): real counts, and the ceiling band is reachable again.
@@ -1068,7 +1079,9 @@ def test_uniform_corpora_are_unchanged():
         _cell('f3', 'A', plan_steps=5, plan_quality=0.99,
               extra_metrics={'judged_without_reference': True}),
     ]
-    assert mod.count_judged_without_reference(keyed) == {'A': 1}
+    assert {
+        r['config_name']: r[mod.MARKER_KEY] for r in mod.summarize_candidates(keyed)
+    } == {'A': 1}
     part = mod.partition_bands(keyed, 0.80)
     assert part['discarded'] == ['f1']
     assert part['by_fixture'] == {
@@ -1833,12 +1846,14 @@ def test_missing_config_exits_naming_the_flag(tmp_path, monkeypatch):
 
 
 def test_architect_cells_is_the_single_source_of_the_role_filter():
-    """Both the counting and the banding paths consume ONE role filter.
+    """The banding path consumes THE role filter rather than an inline copy.
 
-    The filter's docstring argues at length that it must run first everywhere;
-    keeping a second inline copy in ``partition_bands`` would mean a change to
-    what counts as an architect cell had to be made twice, with only one site
-    carrying the argument for why it matters.
+    The filter's docstring argues at length that it must run first; keeping a
+    second inline copy in ``partition_bands`` would mean a change to what counts
+    as an architect cell had to be made twice, with only one site carrying the
+    argument for why it matters. (``partition_bands`` is now its ONLY consumer —
+    the per-candidate marker counts that also read it were retired in favour of
+    ``build_plan_quality_report``'s own architect-only aggregate.)
     """
     architect = _cell('f1', 'A', plan_steps=5, plan_quality=0.95,
                       extra_metrics={'judged_without_reference': False})
@@ -1853,13 +1868,3 @@ def test_architect_cells_is_the_single_source_of_the_role_filter():
     assert mod.partition_bands([architect, implementer], 0.80)['by_fixture'] == {
         'f1': 'ceiling',
     }
-
-
-def test_count_judged_without_reference_accepts_a_precomputed_map():
-    """Passing the map is an optimisation, never a behaviour change."""
-    results = _mixed_marker_results()
-
-    unmeasured = mod.count_unmeasured_marker_cells(results)
-
-    assert mod.count_judged_without_reference(results, unmeasured) == \
-        mod.count_judged_without_reference(results)
