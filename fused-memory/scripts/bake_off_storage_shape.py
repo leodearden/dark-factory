@@ -3395,12 +3395,63 @@ def _check_corpus_fingerprint(
         )
 
 
+def _check_fixture_digests(
+    target: Path, provenance: dict[str, Any], expect_fixtures: list[str | Path],
+) -> None:
+    """Refuse a cache whose fixtures are not the ones being replayed.
+
+    The corpus fingerprint does NOT cover this: :func:`materialize_arm` takes
+    no queries, so the fingerprint is structurally blind to the query set.
+    Edit a query's ``text`` while keeping its ``query_id`` and every
+    fingerprint still matches, while the cached rankings — fetched against the
+    old text — become a measurement of a question nobody asked.
+
+    Compared as a ``path -> sha256`` MAPPING, never positionally:
+    :func:`fixture_digests` emits in the caller's argument order, so a caller
+    that merely reordered its list would otherwise be told the fixtures moved.
+    """
+    cached = provenance.get('fixtures')
+    if not isinstance(cached, list):
+        raise FetchCacheError(
+            f'fetch cache at {target} records no fixture digests, so the '
+            f'fixtures it was fetched over cannot be compared with the ones in '
+            f'this tree. The per-shape corpus fingerprint does not cover this: '
+            f'`materialize_arm` takes no queries, so a query-set edit leaves '
+            f'every fingerprint intact. Re-dump the cache with --dump-fetches.'
+        )
+    cached_by_path = {
+        str(row.get('path')): str(row.get('sha256'))
+        for row in cached if isinstance(row, dict)
+    }
+    for row in fixture_digests(list(expect_fixtures)):
+        was = cached_by_path.get(row['path'])
+        if was is None:
+            raise FetchCacheError(
+                f'fetch cache at {target} was dumped over a different fixture '
+                f'set: it carries no digest for {row["path"]} (it carries '
+                f'{sorted(cached_by_path)}). A cache that never saw a fixture '
+                f'cannot answer for it.'
+            )
+        if was != row['sha256']:
+            raise FetchCacheError(
+                f'fetch cache at {target} was dumped against a different '
+                f'{row["path"]}: cached sha256 {was}, but the file in this '
+                f'tree hashes to {row["sha256"]}. THE FIXTURES MOVED — the '
+                f'cached rankings answer the OLD file, and replaying them '
+                f'would publish them as a fresh measurement. (The corpus '
+                f'fingerprint cannot catch a query-set edit: `materialize_arm` '
+                f'takes no queries.) Re-run the seeding pass with '
+                f'--dump-fetches.'
+            )
+
+
 def load_fetches(
     path: str | Path,
     seeded_by_shape: dict[str, SeededArm],
     *,
     expect_query_ids: list[str] | None = None,
     expect_limit: int | None = None,
+    expect_fixtures: list[str | Path] | None = None,
 ) -> dict[str, dict[str, dict[str, list[ScoredHit]]]]:
     """Replay a dumped run's rankings against locally materialized arms.
 
@@ -3414,9 +3465,10 @@ def load_fetches(
     shapes is merely wider than this run needs, but a requested shape it does
     not carry would otherwise be measured as an arm with no queries.
 
-    *expect_query_ids* and *expect_limit* are the truncation and depth guards.
-    Both are opt-in so the pure round-trip tests can exercise the join without
-    a full query set, and both are supplied by the live driver.
+    *expect_query_ids*, *expect_limit* and *expect_fixtures* are the
+    truncation, depth and fixture-drift guards.  All three are opt-in so the
+    pure round-trip tests can exercise the join without a full query set, and
+    all three are supplied by the live driver.
     """
     target, doc = _read_fetch_cache(path)
     provenance = load_fetch_provenance(path)
@@ -3444,6 +3496,9 @@ def load_fetches(
                 f'experiment, not a smaller one. (A deeper cache is fine: '
                 f'`read_path` truncates to the reader budget anyway.)'
             )
+
+    if expect_fixtures is not None:
+        _check_fixture_digests(target, provenance, expect_fixtures)
 
     replayed: dict[str, dict[str, dict[str, list[ScoredHit]]]] = {}
     for shape, seeded in seeded_by_shape.items():
@@ -4168,6 +4223,11 @@ async def _replay_bake_off(
         cache_path, seeded_by_shape,
         expect_query_ids=[query.query_id for query in queries],
         expect_limit=limit,
+        # The same five paths, in the same order, that the protocol block
+        # stamps below (:4197-4199) and that the live dump records.
+        expect_fixtures=[
+            alpha_fixture, registry, arm_claims, query_set, distractor_slab,
+        ],
     )
 
     guard_threshold = float(provenance['guard_threshold'])

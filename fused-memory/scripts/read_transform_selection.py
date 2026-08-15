@@ -2222,6 +2222,21 @@ def score_from_cache(
         {seeded.shape: seeded},
         expect_query_ids=[query.query_id for query in e2_queries],
         expect_limit=e2_k,
+        # Sound ONLY because `materialize_selection_arm` is invoked with all
+        # defaults just above and hardcodes `DEFAULT_QUERY_SET_PATH`; if that
+        # ever takes an override, this list must follow it.
+        #
+        # The guard covers the E2 half alone.  The production block stores no
+        # fixture digests at all (`extend_fetch_cache` writes only the corpus
+        # fingerprint, limit, embedder and rankings), so adding them there is
+        # a separate change — this is not coverage of that half.
+        expect_fixtures=[
+            bake.DEFAULT_ALPHA_FIXTURE_PATH,
+            bake.DEFAULT_REGISTRY_PATH,
+            bake.DEFAULT_ARM_CLAIMS_PATH,
+            bake.DEFAULT_QUERY_SET_PATH,
+            bake.DEFAULT_DISTRACTOR_SLAB_PATH,
+        ],
     )
     prod_queries = load_production_queries(production_queries)
     prod_hits = load_production_fetches(
