@@ -4902,6 +4902,33 @@ class TestLivenessSnapshotUnfieldedVerdictIsPerField:
 
         assert _classify_liveness_snapshot(content) == (True, None)
 
+    def test_a_value_that_cleans_to_nothing_is_a_whole_record_loss(self):
+        """A second, distinct route to the same defect -- survives step-2.
+
+        `.rstrip('./:+-')` can reduce a BARE value the strict alternative did
+        match (so no `unread` mention is ever produced) to the empty string,
+        and the `if cleaned:` guard then silently drops that field while a
+        readable sibling still contributes -- the same partial-key defect,
+        reached without ever taking the `unread` branch. A field the author
+        WROTE but whose value the reader cannot recover is exactly the case
+        `liveness_snapshot_unfielded` exists to make visible, not silently
+        fold into a key built from the survivors.
+        """
+        content = (
+            'Point-in-time liveness check performed 2026-07-24 on task 94: '
+            'status=--- claimant_run_id=null'
+        )
+        assert _classify_liveness_snapshot(content) == (True, None)
+
+        other = (
+            'Point-in-time liveness check performed 2026-07-24 on task 94: '
+            'status=... claimant_run_id=null'
+        )
+        assert _classify_liveness_snapshot(other) == (True, None), (
+            'a second value that also rstrips to empty must not fabricate '
+            'the same survivors-only key as the one above'
+        )
+
 
 class TestLivenessClassifierIsSingleCopy:
     """One classifier, two callers -- so the extractor's tests test production.
