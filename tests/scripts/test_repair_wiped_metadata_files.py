@@ -71,6 +71,7 @@ from repair_wiped_metadata_files import (
     _make_client,
     build_repair_payload,
     classify_live_task,
+    classify_reply,
     format_summary,
     plan_files_rejection_reason,
     repair_one,
@@ -457,6 +458,87 @@ def test_classify_live_task_agrees_with_the_audit_on_a_whitespace_only_entry():
 
 
 # ---------------------------------------------------------------------------
+# classify_reply — the server-reply classifier shared by repair_one's write
+# and repair_project's live re-read.
+#
+# Mirrors fused_memory.middleware.task_interceptor.interceptor_write_succeeded
+# (fused-memory/src/fused_memory/middleware/task_interceptor.py:5829-5868):
+# `isinstance(resp, dict) and bool(resp) and bool(resp.get('success', True))
+# and not resp.get('error')`. That predicate's own docstring states an empty
+# dict "carries no positive write signal and is therefore treated as
+# **failure**", and that "Non-dict responses (None, strings, lists) are
+# always treated as failures" — the OPPOSITE of this module's old
+# `_error_detail`, which read an empty dict (and any non-dict reply) as
+# success. This is a transcribed mirror, not an import:
+# `from fused_memory.middleware.task_interceptor import
+# interceptor_write_succeeded` is measured to die with
+# `ModuleNotFoundError: No module named 'graphiti_core'` under this suite's
+# actual gate (`uv run --project shared pytest tests/scripts/ scripts/tests/`).
+# The canonical predicate's own contract is independently pinned at
+# fused-memory/tests/test_task_interceptor.py:10863+ ("task-1184:
+# interceptor_write_succeeded helper contract") — auditing one copy for drift
+# means reading both, since neither can change silently without its OWN table
+# going red.
+#
+# `answered` is the second axis `interceptor_write_succeeded` has no need of:
+# whether the server explained ITSELF (an explicit error/success:False
+# marker -> a benign, NAMED skip on the live re-read path) or said nothing
+# usable at all (`{}`, non-dict -> indistinguishable from a dead transport).
+# ---------------------------------------------------------------------------
+
+
+def test_classify_reply_truth_table():
+    """One table, both axes, so `ok` and `answered` are read off one place."""
+    # Not a dict at all -> unanswered, non-empty detail. Today's
+    # `_error_detail` reads every one of these as success (None) via the
+    # `if not isinstance(result, dict): return None` guard.
+    for reply in (None, "ok", []):
+        verdict = classify_reply(reply)
+        assert verdict.ok is False, reply
+        assert verdict.answered is False, reply
+        assert verdict.detail, reply
+
+    # Empty dict -> unanswered, non-empty detail naming the emptiness. THE BUG
+    # BEING CLOSED: today's `_error_detail({})` also returns None (success).
+    verdict = classify_reply({})
+    assert verdict.ok is False
+    assert verdict.answered is False
+    assert verdict.detail
+    assert "empty" in verdict.detail.lower()
+
+    # An explicit error marker -> the server ANSWERED, and the detail carries
+    # BOTH the error_type and the message — the wording
+    # test_repair_project_reports_the_servers_own_reason_for_a_missing_task
+    # (below) already depends on; must not be weakened.
+    verdict = classify_reply(
+        {"error": "No tasks found for ID(s): 2464", "error_type": "TaskNotFoundError"}
+    )
+    assert verdict.ok is False
+    assert verdict.answered is True
+    assert "TaskNotFoundError" in (verdict.detail or "")
+    assert "No tasks found for ID(s): 2464" in (verdict.detail or "")
+
+    # success: False -> answered, non-empty detail.
+    verdict = classify_reply(
+        {"success": False, "error_type": "DuplicateCandidateKeyError"}
+    )
+    assert verdict.ok is False
+    assert verdict.answered is True
+    assert verdict.detail
+
+    # Ordinary success shapes -> ok, answered, no detail.
+    for reply in (
+        {"success": True},
+        {"id": "2464", "status": "done"},
+        {"id": "77", "status": "done", "metadata": {"files": []}},
+    ):
+        verdict = classify_reply(reply)
+        assert verdict.ok is True, reply
+        assert verdict.answered is True, reply
+        assert verdict.detail is None, reply
+
+
+# ---------------------------------------------------------------------------
 # repair_one — the write itself, against a FAKE client. No network, no MCP
 # server, no live database.
 # ---------------------------------------------------------------------------
@@ -566,6 +648,23 @@ def test_repair_one_treats_an_error_shaped_result_as_failed():
 
         assert result.disposition == FAILED, payload
         assert result.detail, payload
+
+
+def test_repair_one_treats_an_empty_reply_as_failed():
+    """THE DIRECT INVERSION OF THE BUG. A `{}` reply carries no positive write
+    signal — indistinguishable from a wedged server that ACKed without
+    writing — and must not be read as success. Today's `_error_detail({})`
+    returns None (== success); `classify_reply({}).ok` must be False, so this
+    now lands in FAILED alongside the explicit-error-payload cases above.
+    test_repair_one_accepts_a_plain_success_shape (below) still asserts the
+    opposite for `{}` until step 2 removes that case together with the
+    behaviour it encoded — this test is RED until then."""
+    client = _FakeClient(returns={})
+
+    result = asyncio.run(repair_one(client, _ROOT, _candidate(4), now_iso=_NOW))
+
+    assert result.disposition == FAILED
+    assert result.detail
 
 
 def test_repair_one_accepts_a_plain_success_shape():
