@@ -434,6 +434,24 @@ class TestQualifiedRefNeverSpansALineBreak:
         content = 'See the section on graphiti:\n\n2500 rows were affected'
         assert scan_content(content, group_id='reify').refs == ()
 
+    def test_a_hard_wrapped_genuine_ref_is_a_DELIBERATE_miss(self):
+        """The price of the narrowing, measured and accepted — not overlooked.
+
+        The three cases above are all TRUE negatives ('Notes:', 'graphiti:' are
+        not projects). This one is a FALSE negative: a real qualified ref that
+        hard wrapping split, since wrapping breaks at the space after the colon
+        (``textwrap.fill(..., 40)`` produces exactly this string). It is the
+        same '\\s'-vs-'[ \\t]' decision seen from the losing side, and it is
+        pinned here — and listed in scan_content's KNOWN BLIND SPOTS — so a
+        future reader sees the recall loss was weighed rather than missed. It
+        is accepted for the reason stated on the pattern: for a consumer doing
+        destructive edge surgery a missed ref is recoverable and a
+        misattributed one is not. Changing this to a match is a real design
+        decision, not a bug fix.
+        """
+        content = 'please see the reference dark_factory:\n2500 for more detail'
+        assert scan_content(content, group_id='reify').refs == ()
+
     def test_same_line_spellings_are_unaffected(self):
         """Regression guard, green before AND after: the padding still tolerates
         the spaces and tabs humans actually write around a colon. This is what
@@ -554,6 +572,49 @@ class TestScanContentAllowlist:
         falsy too, and ``allowlist is not None`` is the exact property the
         qualified-ref filter reads to decide whether to narrow at all."""
         assert _canonical_allowlist({'-home-leo-bad', '-home-leo-other'}) is None
+
+    def test_a_blank_registry_key_also_yields_the_permissive_fallback(self):
+        """The path-shaped case is only one of TWO ways the surviving allowlist
+        becomes useless. ``canonicalize_project_id('')`` does NOT raise
+        PathShapedProjectIdError — it returns '' — so a blank key survives into
+        the set and makes it non-empty, reaching the caller as an "allowlist of
+        nothing" and dropping every foreign ref. '' can never match a foreign
+        referent anyway (the qualified-ref pattern requires a >=3-character
+        qualifier), so it is skipped like a path-shaped key and feeds the same
+        permissive fallback.
+        """
+        assert _canonical_allowlist({'', '-home-leo-bad'}) is None
+
+    def test_blank_registry_key_does_not_drop_foreign_refs_at_the_scan_boundary(self):
+        """The same contract at the boundary a caller actually uses."""
+        scan = scan_content(
+            'see dark_factory:2500', group_id='reify', known_project_ids={'', '-home-leo-bad'}
+        )
+        assert [r.node_name for r in scan.refs] == ['dark_factory:2500']
+
+    def test_a_blank_key_beside_a_usable_one_still_narrows(self):
+        """Regression guard for the blank-key skip, the twin of the mixed
+        path-shaped case below: dropping '' must not degenerate into disabling
+        an allowlist that still has a usable entry in it."""
+        scan = scan_content(
+            'see dark_factory:2500 and evil_proj:9',
+            group_id='reify',
+            known_project_ids={'dark_factory', ''},
+        )
+        assert [r.node_name for r in scan.refs] == ['dark_factory:2500']
+
+    def test_a_non_sized_registry_does_not_crash_on_the_degraded_path(self):
+        """The parameter is advertised as "any collection", which invites a
+        generator. A generator is truthy (so it passes the empty-registry
+        guard) but NOT Sized, so counting the entries with a trailing ``len()``
+        would raise TypeError from a memory write path — on the one branch
+        whose whole purpose is to degrade gracefully."""
+
+        def registry():
+            yield '-home-leo-bad'
+            yield ''
+
+        assert _canonical_allowlist(registry()) is None
 
     def test_mixed_registry_still_narrows_after_bad_entries_skipped(self):
         """Regression guard, green before AND after the permissive fallback:
