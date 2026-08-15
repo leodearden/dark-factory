@@ -2488,7 +2488,10 @@ class TestLateArrivalFailCascade:
     """
 
     async def test_predecessor_fail_cascades_to_late_arrival(
-        self, spec_git_repo: Path, caplog: pytest.LogCaptureFixture,
+        self,
+        spec_git_repo: Path,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """A fails; cascade cancels B's remote verify, remerges B, B lands as 'done'.
 
@@ -2498,10 +2501,21 @@ class TestLateArrivalFailCascade:
         # task 3980: this is the ONLY late-arrival test that reaches the merge
         # disposition classifier -- classify_merge_failure_disposition runs only
         # on a FAILING verify, and every other late-arrival test is an all-pass
-        # path (measured: 0 occurrences of the record below in the other two
-        # named offenders). So it is the correct and only anchor for proving the
-        # DONE-WHEN 4 assertions below are not silently riding a fail-open.
-        caplog.set_level(logging.WARNING, logger='orchestrator.merge_disposition')
+        # path.  MEASURED with a delegating spy on the callable, deliberately NOT
+        # with log-record counts (a record count cannot tell "classifier ran and
+        # succeeded" from "classifier never ran", and reasoning from that gap is
+        # what produced a wrong review finding against this block): exactly 1
+        # entry here, 0 across all eight sibling late-arrival integration tests.
+        # So it is the correct and only anchor for the verify-result double's
+        # fidelity guard below.
+        #
+        # Capture BOTH fail-open loggers: merge_disposition.py:711 (the
+        # classifier's own internal fail-open) and merge_queue.py:995-1001
+        # (_classify_disposition_for_outcome's catch for anything that re-raises
+        # past it).  Filtering to merge_disposition alone let the second site
+        # through silently.
+        for _fail_open_logger in _FAIL_OPEN_LOGGERS:
+            caplog.set_level(logging.WARNING, logger=_fail_open_logger)
 
         git_config = _make_late_arrival_git_config()
         git_ops = GitOps(git_config, spec_git_repo)
@@ -2566,6 +2580,37 @@ class TestLateArrivalFailCascade:
         req_a = _make_request('late5-a', 'task/late5-a', wt_a, config)
         req_b = _make_request('late5-b', 'task/late5-b', wt_b, config)
 
+        # ── POSITIVE LEG of the fidelity guard (task 3980 step-13) ────────────
+        # A delegating SPY, deliberately not a caplog assertion.  The fidelity
+        # guard further down asserts the classifier did not FAIL OPEN, which is
+        # an assertion about ABSENCE — meaningless unless the classifier is
+        # actually on this code path.  Nothing else in this test pins that.
+        #
+        # WHY A SPY AND NOT A LOG RECORD (read this before "simplifying" it):
+        # a SUCCEEDING classifier emits NOTHING at WARNING — it logs only on the
+        # degrade paths (merge_disposition.py:695 and :711).  So "no record" is
+        # exactly what success looks like, and cannot be distinguished from "never
+        # ran" by any caplog predicate.  A reviewer who tried inferring execution
+        # from log records concluded this whole block was dead code; the spy is
+        # what settles it, because it measures the callable itself.
+        #
+        # Patch the binding in MERGE_QUEUE's module globals: merge_queue.py:54
+        # does `from orchestrator.merge_disposition import
+        # classify_merge_failure_disposition`, so the call site at merge_queue.py:973
+        # resolves through merge_queue's namespace and a patch on merge_disposition
+        # alone would not be seen.  The delegate awaits the module-level import,
+        # which stays bound to the real callable.
+        classifier_calls: list[int] = [0]
+
+        async def _counting_classify(*args: Any, **kwargs: Any) -> Any:
+            classifier_calls[0] += 1
+            return await classify_merge_failure_disposition(*args, **kwargs)
+
+        monkeypatch.setattr(
+            'orchestrator.merge_queue.classify_merge_failure_disposition',
+            _counting_classify,
+        )
+
         with patch('orchestrator.merge_queue.run_scoped_verification', _gated_failing_local):
             worker_task = asyncio.create_task(worker.run())
 
@@ -2621,12 +2666,20 @@ class TestLateArrivalFailCascade:
         with contextlib.suppress(Exception):
             await asyncio.wait_for(worker_task, timeout=5.0)
 
-        # ── NON-VACUITY PRECONDITION (task 3980) ──────────────────────────────
-        # This is a PRECONDITION on the DONE-WHEN 4 assertions below, not an
-        # extra behaviour check: those assertions only carry signal if the merge
-        # disposition classifier actually RAN on A's failing verify.
+        # ── VERIFY-RESULT DOUBLE FIDELITY GUARD (task 3980) ───────────────────
+        # WHAT THIS IS: a fidelity guard on the verify-result double this test
+        # feeds the merge pipeline, anchored at the one late-arrival site where
+        # the disposition classifier is reachable at all.  It is NOT a
+        # precondition on the DONE-WHEN 4 assertions below.  MEASURED: running
+        # the bare-MagicMock mutation with the fail-open assertion neutralized
+        # leaves this test PASSING — DONE-WHEN 4(a)-(d) assert on
+        # speculative_merge events, cancel_verify liveness, outcome status and
+        # `git ls-tree` contents, none of which is disposition-sensitive.  The
+        # earlier "PRECONDITION on the assertions below" framing overstated what
+        # this protects; the real and sufficient reason it exists is that nothing
+        # ELSE in the suite runs the classifier against these doubles.
         #
-        # classify_merge_failure_disposition calls
+        # THE MECHANISM IT CATCHES: classify_merge_failure_disposition calls
         # _extract_failing_tests_and_candidate_files, which joins
         # `verify_result.cause_hint` with `verify_result.test_output`
         # (merge_disposition.py:218-221) under an `if part` filter.  An unspecced
@@ -2634,28 +2687,36 @@ class TestLateArrivalFailCascade:
         # auto-vivifies a TRUTHY child Mock that survives that filter and then
         # raises `TypeError: sequence item 0: expected str instance, MagicMock
         # found` out of str.join.  The classifier catches it and degrades to
-        # INDETERMINATE (fail-open, I3) at merge_disposition.py:710-719.
+        # INDETERMINATE (fail-open, I3) at merge_disposition.py:710-719 — a
+        # verdict indistinguishable from a genuine one downstream, which is why
+        # the degrade has to be asserted against rather than tolerated.
         #
-        # A fail-open is indistinguishable from a genuine INDETERMINATE verdict
-        # downstream, so every disposition-sensitive assertion silently rides the
-        # degraded branch and can never go red.  Assert the OUTCOME (the
-        # classifier ran and did not fail open) rather than the wording of any
-        # source comment.
-        fail_open = [
-            r for r in caplog.records
-            if r.name == 'orchestrator.merge_disposition'
-            and 'degrading to INDETERMINATE (fail-open, I3)' in r.getMessage()
-        ]
-        fail_open_detail = '\n'.join(
-            f'  - {r.getMessage()}'
-            + (f'\n    underlying: {r.exc_info[1]!r}' if r.exc_info else '')
-            for r in fail_open
+        # TestDispositionDoubleFidelity pins that same mechanism hermetically and
+        # two-sidedly (positive + mutation leg, no merge worker, milliseconds).
+        # This block is the LIVE counterpart: it proves the doubles this
+        # integration test actually feeds the pipeline stay classifier-consumable.
+        assert classifier_calls[0] >= 1, (
+            'the merge disposition classifier was never reached, so the '
+            'fail-open assertion below is a permanent no-op.\n'
+            f'spy count = {classifier_calls[0]}; expected >= 1 (measured: '
+            'exactly 1 on this path today).\n'
+            'This is not a flake and not a doubles problem: it means '
+            'classification has moved OFF the head-failure cascade path. '
+            'Relocate this guard to wherever the classifier now consumes a '
+            'verify-result double, or delete it deliberately — do NOT leave it '
+            'here to rot into an assertion that cannot fail. '
+            'TestDispositionDoubleFidelity keeps the hermetic proof either way.'
         )
+
+        # Both fail-open sites, one predicate — see _fail_open_records.
+        fail_open = _fail_open_records(caplog.records)
         assert not fail_open, (
-            'merge disposition classifier FAILED OPEN — every disposition-'
-            'sensitive assertion in this test is therefore VACUOUS.\n'
+            'merge disposition classifier FAILED OPEN — it ran on this test\'s '
+            'verify-result double and could not consume it, so any '
+            'disposition-sensitive assertion built on these doubles (here or in '
+            'a future test reusing them) is VACUOUS.\n'
             f'{len(fail_open)} fail-open WARNING(s) captured:\n'
-            f'{fail_open_detail}\n'
+            f'{_format_fail_open_records(fail_open)}\n'
             'Remedy: the verify-result double returned by this test\'s patched '
             'run_scoped_verification must be built with _fake_verify_result(...) '
             '(a MagicMock(spec=VerifyResult) seeded from the real dataclass '
