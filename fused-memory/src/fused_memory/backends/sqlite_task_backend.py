@@ -605,6 +605,8 @@ async def _migrate_v3_to_v4(
     additionally guarded against ``sqlite3.IntegrityError`` (a residual
     duplicate slipping past the audit, e.g. a race) -- skip, don't raise --
     and the whole step is wrapped so nothing unexpected propagates either.
+    The failure path additionally rolls the connection back, so a
+    partially-applied heal can never survive on the cached connection.
 
     Deliberately NOT added to ``_SCHEMA_SQL``: a fresh-schema ``executescript``
     run at every connection-open would raise ``IntegrityError`` building the
@@ -763,6 +765,20 @@ async def _migrate_v3_to_v4(
         )
         return {'index_built': True, 'healed': healed_groups, 'flagged': []}
     except Exception:
+        # Discard whatever this pass left pending. The migration runs on
+        # `_get_connection`'s cached WRITE connection, opened via
+        # `connect_daemon(str(db_path))` WITHOUT `isolation_level=None` --
+        # i.e. Python sqlite3's legacy deferred-transaction mode (see
+        # `_get_read_connection`'s docstring). Without this rollback a raise
+        # partway through the heal loop leaves the already-executed
+        # `UPDATE ... SET status='cancelled'` statements uncommitted on a
+        # connection that `_get_connection` then caches, and the very next
+        # unrelated successful write -- `_txn` commits with no BEGIN/rollback
+        # preamble -- silently flushes that partial heal to disk.
+        # Suppressed: this step must NEVER raise at connection-open (see
+        # docstring), so a failing rollback must not displace the real error.
+        with contextlib.suppress(Exception):
+            await conn.rollback()
         # Defensive backstop -- this step must NEVER raise at connection-open
         # (see docstring): a raising migration would crash-loop fused-memory.
         logger.exception(
