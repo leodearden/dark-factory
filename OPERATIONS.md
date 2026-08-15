@@ -230,6 +230,34 @@ For any project running unattended, keep one long-running
 4. Waits for the next escalation to fire (or for a spawned sub-agent to
    finish), heartbeats its lease, and repeats.
 
+**Inspecting and repairing a watcher lease.** Use the `lease-show` verb, not
+`cat` — the lease body carries the holder's slug/pid and an immutable
+`start_ts`, but the heartbeat is the file's **mtime**, so `cat` alone cannot
+tell you whether a holder is still beating:
+
+```bash
+python3 orchestrator/src/orchestrator/session_registry.py lease-show --name watcher-df
+```
+
+It prints `key=value` lines — `state`, `holder_slug`, `holder_pid`,
+`holder_pid_alive`, `heartbeat_ts`, `heartbeat_age_secs`, `reclaimable`,
+`holder_session` — computed by the same reader `lease-claim` decides with, and
+never touches the lease. A lease is stale only when the holder pid is dead
+**and** the heartbeat is past `LEASE_HEARTBEAT_TTL` (2h); a live holder is
+never reclaimable however quiet it has been.
+
+`lease-heartbeat` and `lease-release` require the `--slug` the lease was
+claimed with and **refuse** on a mismatch (`result=refused`, nothing touched),
+so no session can evict another's lease or keep a stranger's alive. `--force`
+is the deliberate operator-recovery override: it acts anyway and logs at
+WARNING naming both the forcing slug and the displaced holder.
+
+**Rollout note (task 3994).** Any watcher session already running on the
+pre-3994 prescription must be **restarted** so it re-reads its skill: its
+`lease-heartbeat`/`lease-release` calls pass no `--slug` and now exit 2
+(argparse) instead of mutating. Nothing is stranded — such a lease stops being
+heartbeated and ages out normally within `LEASE_HEARTBEAT_TTL`, then is reaped.
+
 Its priority order when triaging is: infra stability first, software
 quality second, task progress third. Clear-cut issues get acted on
 immediately; ambiguous-but-consequential ones are left pending with a

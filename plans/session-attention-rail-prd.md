@@ -22,7 +22,7 @@ motivate seven mechanisms, each with a named consumer and a user-observable comp
 | Verify-spawn-started | calling background task / escalation-watcher; spawn-claude.sh | A spawn that never starts Claude surfaces a **loud** caller-visible line + registry `failed-to-start` + a distinct exit code, within the grace window |
 | Result-handback protocol | parent spawner sessions (fan-out/join) | `result.md` appears next to the record; the parent quotes it instead of exploring |
 | Hooks trio (SessionStart/Notification/Stop) | Leo-on-return (tab titles); registry (captures hand-launched sessions) | Tab retitles to `⏸ AWAITING …` when blocked; hand-launched sessions also get records |
-| Role leases | escalation-watcher startup; `/unblock` startup | A duplicate watcher prints `lease held by <session> (alive, heartbeat 42s ago) — standing down` and exits |
+| Role leases | escalation-watcher startup; `/unblock` startup | A duplicate watcher prints `lease held by <session> (pid <n> alive, heartbeat 42s ago) — standing down` and exits |
 
 **Named future consumer (out of scope):** the **attention manifest / dashboard renderer**
 (Leo is writing the UX notes). The registry record schema is designed here so that a manifest
@@ -111,6 +111,11 @@ are additive.
    interactive lease** — the lease API is invoked only from interactive skills, so auto rotations
    simply never call it. The lease namespace (`watcher-<project>`, `recon-watcher-<project>`,
    `unblock-<project>#<task>`) is for interactive owners only.
+   **Update (task 3994):** `recon-watcher-<project>` was specified here but never claimed by
+   anything — `skills/recon-escalation-watcher/SKILL.md` had no lease at all. It now claims it
+   (§"Claiming the Recon Watcher Lease"), closing the specified-but-never-claimed gap: that watcher
+   is hand-launched, unsupervised and the sole closer of the 8103 queue, i.e. the same interactive
+   single-owner shape as `watcher-<project>`, not the supervised-rotation shape.
 
 8. **Reaper TTLs (defaults, hot-tunable later):** session records reaped when status is terminal
    (`exited`/`failed-to-start`) and age > 24h, **or** non-terminal but pid dead and heartbeat
@@ -227,9 +232,19 @@ serialized by dependency, so no task starves on a lock). **T3 is the spine root.
   on clean exit; reap stale) and `/unblock` startup (claim `unblock-<proj>#<task>`; second `/unblock`
   on the same task is the reify 06-28 near-dup class). Auto-watcher rotations never claim interactive
   leases. *(Dep T5 serializes escalation-watcher/SKILL.md; dep T3 for the helper + substrate dir.)*
-  **Signal:** a second watcher for a held role prints `lease held by <session> (alive, heartbeat Ns
-  ago) — standing down` and exits; a second `/unblock <same task>` reports the holder; a stale lease
-  (dead holder) is reaped and re-claimable.
+  **Signal:** a second watcher for a held role prints `lease held by <session> (pid <n> alive,
+  heartbeat Ns ago) — standing down` and exits; a second `/unblock <same task>` reports the holder; a
+  stale lease (dead holder) is reaped and re-claimable.
+  **Amended by task 3994 (leases were advisory, not locks).** As shipped, T7 checked ownership only
+  on *claim*: `lease-heartbeat`/`lease-release` took a name and mutated unconditionally, so any
+  caller could evict a live holder's lease or keep a stranger's fresh forever. Ownership is now
+  enforced on mutation — both verbs require the claiming `--slug`, refuse on mismatch, and print
+  `result=<applied|forced|absent|refused|faulted>`; `--force` is the single, loudly-logged operator
+  override. The contention signal also names its two axes separately (pid liveness vs heartbeat
+  freshness) rather than the collapsed `(alive|dead, heartbeat Ns ago)` above, `lease-claim` appends
+  `holder_liveness=<held|orphaned>` so a stand-down for a provably-gone holder is surfaced rather
+  than honoured silently, and the read-only `lease-show` verb prints holder/liveness/freshness/
+  reclaimability instead of `cat` + `stat -c %y`.
 
 **DAG:** `T1, T2, T3` have no deps. `T4 → {T3, T2}`. `T5 → {T4, T1}`. `T6 → {T3}`. `T7 → {T3, T5}`.
 Critical path: `T3 → T4 → T5 → T7` (T2 feeds T4, T1 feeds T5, T6 parallel off T3).
