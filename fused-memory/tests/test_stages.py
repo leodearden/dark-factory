@@ -230,6 +230,52 @@ class TestDisallowedToolLists:
         assert set(DISALLOW_MEMORY_WRITES).issubset(set(STAGE3_DISALLOWED))
         assert set(DISALLOW_BUILTIN).issubset(set(STAGE3_DISALLOWED))
 
+    def test_consolidate_memories_is_classified_as_a_memory_write(self):
+        """`consolidate_memories` (task 3133) must ship CLASSIFIED.
+
+        Recon gating is DENY-LIST ONLY: a tool named in no list is silently
+        callable in Stage 3's read-only integrity mode. That is not a
+        hypothetical — it is the documented `update_memory` incident recorded
+        in the comment block above `DISALLOW_MEMORY_WRITES`
+        (cli_stage_runner.py), where an in-place silent-rewrite primitive
+        shipped in NO list and was denied by neither this gate nor the
+        mem0_update authz gate, whose default allowlist admits every recon
+        stage's own `recon-stage-{id}` agent_id.
+
+        `consolidate_memories` is strictly more destructive than the tool
+        that incident was about: one call writes a canonical, patches N
+        retained peers, re-homes their children and DELETES its supersedes.
+        Shipping it unclassified would repeat the incident verbatim, with a
+        larger blast radius.
+        """
+        assert 'mcp__fused-memory__consolidate_memories' in DISALLOW_MEMORY_WRITES
+        # ...which is what carries it into Stage 3, the read-only stage.
+        assert 'mcp__fused-memory__consolidate_memories' in STAGE3_DISALLOWED
+
+    def test_consolidate_memories_is_denied_to_the_dry_run_unblocker(self):
+        """The other deny-list-only gate, in the orchestrator.
+
+        `_DISALLOWED_TOOLS` already names `delete_memory`; a dry run must not
+        be able to reach a tool that deletes N records and patches M more.
+        The whole premise of a dry run is that it observes without mutating,
+        so an unclassified destructive tool there does not degrade the run —
+        it falsifies it.
+
+        Asserted from here, beside the Stage-3 half, because both answer ONE
+        question — is this tool classified everywhere gating is deny-list
+        only — and a future destructive memory tool needs to meet both
+        reminders together. Cross-package import guarded per the
+        `orchestrator.agents.landlock` precedent in
+        `tests/reconciliation/test_recon_sandbox_guard.py`: fused-memory must
+        stay installable without the orchestrator.
+        """
+        dry_run_unblock = pytest.importorskip('orchestrator.dry_run_unblock')
+
+        assert (
+            'mcp__fused-memory__consolidate_memories'
+            in dry_run_unblock._DISALLOWED_TOOLS
+        )
+
     def test_all_disallowed_have_mcp_prefix(self):
         """All MCP tools in disallowed lists should use the mcp__ naming convention."""
         for tool in DISALLOW_TASK_WRITES + DISALLOW_MEMORY_WRITES:
