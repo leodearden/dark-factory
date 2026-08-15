@@ -201,18 +201,31 @@ Design decisions (captured in plan.json):
   Only SENTENCE-FINAL punctuation ends that clause — a colon, comma,
   bracket, quote or line wrap does not end prepositional government, and
   admitting any of them as a break re-opens the over-selection outright
-  (see ``_CLAUSE_BREAK_CHARS``). Two residuals in OPPOSITE
-  directions, and the first is the forbidden
+  (see ``_CLAUSE_BREAK_CHARS``). A '.' INSIDE a token — a filename
+  extension, version string, dotted module path or dotted section
+  number — is likewise not sentence-final punctuation, so that
+  occurrence is disqualified as a break too; this narrows WHICH
+  OCCURRENCES of '.' count rather than the break character class itself
+  (task 4149). That narrowing is strictly FAIL-SAFE: dropping a break
+  can only LENGTHEN the scanned clause, never shorten it, so it can only
+  ever cost under-selection — the same asymmetry argument
+  ``_CLAUSE_BREAK_CHARS`` itself is built on — and can never re-open the
+  over-selection this guard exists to close. Three residuals result, in
+  OPPOSITE directions, and the first is the forbidden
   one: an unlisted preposition slips through and OVER-selects (the
   vocabulary was widened once already, for exactly this reason — see
   ``_ENUM_PREP_WORDS``), while a genuine subject-position enumeration
   sharing a clause with a listed word is missed — chiefly behind a
   sentence-initial adverbial preamble ("As of <date>, tasks A and B are
-  pending"), and pinned by a test so the recall cost stays visible —
-  which is the fail-safe direction. Note ``_COPULA_ALT`` is untouched and
+  pending"), or behind a genuine sentence period with no following space
+  and a following alphanumeric ("...are done.Then tasks A and B are
+  pending" reads the period as intra-token — task 4149) — both pinned by
+  a test so the recall cost stays visible — which is the fail-safe
+  direction. Note ``_COPULA_ALT`` is untouched and
   still shared by the other paths; only this one narrows.
   (amendment, reviewer_comprehensive
-  correctness-precision finding, task 3079)
+  correctness-precision finding, task 3079; '.'-occurrence narrowing,
+  task 4149)
 - ``_ENUM_SEP_ALT``/``_ENUM_IDS_ALT`` are written with POSSESSIVE
   quantifiers. Greedily written, the separator's trailing '\\s*' overlaps
   its own leading '\\s*,\\s*'/'\\s+', so a whitespace run between two ids
@@ -714,17 +727,31 @@ _ENUM_PREP_WORDS: tuple[str, ...] = (
 # for X. Tasks 1020 and 1030 are pending.' selected — the enumeration opens a
 # NEW sentence and really is its copula's subject.
 #
-# The class is deliberately minimal — '.', ';', '!', '?' and nothing else —
-# because the two directions are not symmetric. Omitting a character can only
-# LENGTHEN the scanned clause, so it can only ever cost under-selection (the
-# fail-safe direction); including one that does not actually end prepositional
-# government truncates the scan and re-opens the over-selection this guard
-# exists to close, which is unrecoverable. So a character earns a place here
-# only by ending a sentence.
+# A break requires TWO things together, not one: the character must be a
+# member of this class (below), AND the occurrence must plausibly END a
+# sentence — not be an INTRA-TOKEN '.' flanked by alphanumerics on both
+# sides, e.g. a filename extension, version string, dotted module path or
+# dotted section number (see _is_intra_token_dot / _last_clause_break;
+# task 4149). Only '.' needs that second, occurrence-level test: ';', '!'
+# and '?' are unconditional breaks whenever they appear, because none of
+# them occurs token-internally in this corpus.
 #
-# Excluded on that rule, each verified over-selecting when it was treated as a
-# break (amendment, reviewer_comprehensive correctness-precision finding, task
-# 3079):
+# The CLASS is deliberately minimal — '.', ';', '!', '?' and nothing else,
+# and membership is a verified precision requirement not reopened by this
+# narrowing (task 3949 embargo) — because the two directions are not
+# symmetric at either level, class or occurrence. Omitting a character from
+# the class, or disqualifying an occurrence via the flanking test, can only
+# LENGTHEN the scanned clause, so either can only ever cost under-selection
+# (the fail-safe direction); admitting a character or occurrence that does
+# not actually end a sentence truncates the scan and re-opens the
+# over-selection this guard exists to close, which is unrecoverable. So a
+# character earns a place in the class only by being able to end a
+# sentence, and an occurrence of '.' is treated as a break only by
+# plausibly ending one.
+#
+# Excluded from the CLASS on that rule, each verified over-selecting when it
+# was treated as a break (amendment, reviewer_comprehensive
+# correctness-precision finding, task 3079):
 #
 #     ':'          'Statuses of the following: tasks 1020 and 1030 are pending.'
 #     '(' ')'      'Reviews of the following (still open): tasks 1020 and 1030
@@ -741,6 +768,27 @@ _ENUM_PREP_WORDS: tuple[str, ...] = (
 # Colon-preambled genuine snapshots are unaffected ('Note: tasks 1020 and 1030
 # are pending.' still extracts): they carry no listed preposition, so the
 # longer clause gives the guard nothing to fire on.
+#
+# Excluded from OCCURRENCE by the flanking test — an intra-token '.' ends no
+# sentence — each measured over-selecting before this narrowing (amendment,
+# reviewer_comprehensive correctness-precision finding, task 4149):
+#
+#     filename extension     'Reviews for verify_cmd.py tasks 1020 and 1030
+#                             are pending.' -> {1020, 1030}; the
+#                             extension-free control 'Reviews for verify_cmd
+#                             tasks 1020 and 1030 are pending.' -> set() is
+#                             the measured minimal difference.
+#     version string         'Statuses of the v1.2 tasks 1020 and 1030 are
+#                             pending.'
+#     dotted module path     'Statuses of tasks in df.core tasks 1020 and
+#                             1030 are pending.'
+#     dotted section number  'Reviews for section 4.2.1 tasks 1020 and 1030
+#                             are pending.'
+#
+# A prefix-FINAL '.' (nothing to its right within prefix, e.g. prefix cut at
+# '\\btasks\\b' immediately after the period) has no right flank and so is
+# never intra-token — it stays a break regardless of this narrowing, which
+# keeps the common 'X.Tasks 1020 and 1030 are pending.' shape selected.
 _CLAUSE_BREAK_CHARS = '.;!?'
 
 
