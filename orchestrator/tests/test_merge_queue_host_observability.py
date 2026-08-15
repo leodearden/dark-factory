@@ -157,8 +157,8 @@ def _make_mock_allocator(host_names: list[str]) -> MagicMock:
 
 
 _HOST_KEYS = {
-    'name', 'is_local', 'slot_state', 'quarantined',
-    'quarantine_class', 'unavailable_since', 'streak', 'reason',
+    'name', 'is_local', 'slot_state', 'quarantined', 'quarantine_class',
+    'unavailable_since', 'unavailable_secs', 'streak', 'reason',
 }
 
 
@@ -170,6 +170,22 @@ class _FakeRemoteRunner:
     def __init__(self, name: str, *, healthy: bool = True) -> None:
         self.name = name
         self.health = AsyncMock(return_value=healthy)
+
+
+class _FakeRemoteRunnerCancelFails(_FakeRemoteRunner):
+    """Fake remote whose cancel never confirms → HostAllocator PARKs the slot.
+
+    Mirrors _FakeRemoteRunnerCancellable(cancel_rc=1) in test_host_allocator.py,
+    trimmed to the one shape needed here: cancel_verify() non-zero and
+    probe_clean() always dirty, so the slot stays PARKED after
+    cancel_and_release().
+    """
+
+    async def cancel_verify(self) -> int:
+        return 1
+
+    async def probe_clean(self) -> bool:
+        return False
 
 
 class _FakeEscalationQueue:
@@ -344,11 +360,12 @@ class TestSnapshotHostsBlock:
         assert laptop['slot_state'] == 'busy'
         assert laptop['quarantined'] is False
         assert laptop['quarantine_class'] is None
-        # Half 2: ...while occupancy has no occupant for it. Asserted against the
-        # lossless map once step-6 lands, and against the historical map always;
-        # both must agree that nothing is in flight on 'laptop'.
-        assert 'laptop' not in occ.get('inflight_by_host', {}), (
-            f"leaked slot must have no in-flight occupant; got {occ.get('inflight_by_host')}"
+        # Half 2: ...while occupancy has no occupant for it. Both the lossless
+        # map and the historical map must agree nothing is in flight on 'laptop'.
+        # Indexed, not .get(): inflight_by_host is unconditionally present, so a
+        # future drop/rename of the key must fail here rather than vacuously pass.
+        assert 'laptop' not in occ['inflight_by_host'], (
+            f"leaked slot must have no in-flight occupant; got {occ['inflight_by_host']}"
         )
         assert 'laptop' not in occ['by_host'], (
             f"leaked slot must have no in-flight occupant; got {occ['by_host']}"
@@ -418,6 +435,105 @@ class TestSnapshotHostsBlock:
         assert after['streak'] is None
         assert after['reason'] is None
         assert after['slot_state'] == 'free'
+
+    async def test_hosts_count_matches_occupancy_hosts_total(self, git_ops: GitOps) -> None:
+        """len(hosts) == occupancy.hosts_total for a real allocator, >=2 remotes.
+
+        The two are computed through different gates (`isinstance` for hosts,
+        `is not None` for hosts_total) and the heartbeat line prints BOTH
+        denominators (`verifying X/hosts_total` and `DEGRADED n/len(hosts)`).
+        Pin the equality so a future divergence between the gates cannot ship a
+        heartbeat carrying two inconsistent host counts.  Also the only
+        assertion of "local first, then remotes in DECLARATION order" with more
+        than one remote — with a single remote the ordering claim is untestable.
+        """
+        worker, _alloc, _ = _real_worker(git_ops, remotes=['remoteA', 'remoteB'])
+
+        snap = worker.snapshot()
+
+        assert [h['name'] for h in snap['hosts']] == ['local', 'remoteA', 'remoteB']
+        assert len(snap['hosts']) == snap['occupancy']['hosts_total'] == 3, (
+            f"host counts disagree: len(hosts)={len(snap['hosts'])} "
+            f"hosts_total={snap['occupancy']['hosts_total']}"
+        )
+
+    async def test_parked_slot_state_is_visible(self, git_ops: GitOps) -> None:
+        """A PARKED slot (cancel-fail path) surfaces as slot_state == 'parked'.
+
+        The leaked-slot case (c) covers busy; parked is the other non-free
+        state, and it is the more alarming one — the slot is held AND
+        non-acquirable pending a clean probe.  Exercised end-to-end through
+        cancel_and_release rather than by poking _slots.
+        """
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        runner = _FakeRemoteRunnerCancelFails('laptop')
+        alloc = HostAllocator([runner], quarantine=worker._runner_quarantine)
+        worker._host_allocator = alloc
+
+        lease = alloc.acquire_remote()
+        assert lease is not None and lease.name == 'laptop'
+        # cancel_verify() != 0 and probe_clean() False → slot stays PARKED.
+        assert await alloc.cancel_and_release(lease, max_attempts=1) is False
+
+        laptop = _by_name(worker.snapshot())['laptop']
+        assert laptop['slot_state'] == 'parked'
+        assert laptop['quarantined'] is False, 'parked is a slot state, not a quarantine'
+
+    async def test_orphan_ru_entry_is_reported(self, git_ops: GitOps) -> None:
+        """An RU-tracked host with no allocator slot is still reported.
+
+        _runner_unavailable is pruned only on recovery while the allocator is
+        built once and cached for the worker's lifetime, so a removed/renamed
+        remote can keep a live streak with no slot behind it.  Enumerating only
+        allocator hosts would make exactly that host invisible — the same blind
+        spot this block exists to close.
+        """
+        worker, _alloc, _ = _real_worker(git_ops)
+        _seed_ru(worker, 'departed-host', streak=7, first_unavailable_at=500.0,
+                 reason='host removed from pool')
+        worker._runner_quarantine.add('departed-host')
+
+        snap = worker.snapshot()
+        by_name = _by_name(snap)
+
+        assert [h['name'] for h in snap['hosts']] == ['local', 'laptop', 'departed-host'], (
+            'orphans are appended AFTER the managed hosts, leaving allocator order intact'
+        )
+        orphan = by_name['departed-host']
+        assert set(orphan) == _HOST_KEYS, 'orphans share the uniform schema'
+        assert orphan['slot_state'] is None, 'None = not allocator-managed'
+        assert orphan['is_local'] is False
+        assert orphan['streak'] == 7
+        assert orphan['reason'] == 'host removed from pool'
+        # Quarantine membership is read from the shared set (HostAllocator.
+        # is_quarantined), which answers for names with no slot.
+        assert orphan['quarantined'] is True
+        assert orphan['quarantine_class'] == 'ru'
+        # The orphan does NOT inflate the allocator's own count.
+        assert snap['occupancy']['hosts_total'] == 2
+        assert len(snap['hosts']) == snap['occupancy']['hosts_total'] + 1
+
+    async def test_unavailable_secs_is_relative_to_snapshot_now(self, git_ops: GitOps) -> None:
+        """unavailable_secs is downtime vs the snapshot's own clock, clamped at 0.
+
+        Every other time-valued field snapshot() exposes is a relative age;
+        unavailable_since alone is an absolute epoch (kept for log
+        correlation).  unavailable_secs answers the operationally interesting
+        question — "how long has this host been down" — without making the
+        consumer reconcile clocks itself.
+        """
+        worker, _alloc, _ = _real_worker(git_ops)
+        _seed_ru(worker, 'laptop', streak=2, first_unavailable_at=time.time() - 90.0)
+
+        laptop = _by_name(worker.snapshot())['laptop']
+        assert laptop['unavailable_secs'] == pytest.approx(90.0, abs=5.0)
+        assert laptop['unavailable_since'] == pytest.approx(time.time() - 90.0, abs=5.0)
+        assert _by_name(worker.snapshot())['local']['unavailable_secs'] is None
+
+        # Clock stepped backwards (or a future-stamped entry): clamped, never negative.
+        _seed_ru(worker, 'laptop', streak=2, first_unavailable_at=time.time() + 3600.0)
+        assert _by_name(worker.snapshot())['laptop']['unavailable_secs'] == 0.0
 
 
 # ── 3275/step-5 RED: occupancy must not silently drop a co-located occupant ────

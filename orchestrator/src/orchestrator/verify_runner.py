@@ -2971,8 +2971,15 @@ class HostAllocator:
         which add names to the worker's set directly without going through the
         allocator.
 
-        A name this allocator does not manage returns False rather than
-        raising (the read is pure set membership, not a slot lookup).
+        A name this allocator does not manage returns its membership in the
+        shared set rather than raising — the read is pure set membership, not
+        a slot lookup, so it answers for unmanaged names too (False for one
+        that was never quarantined).  That is precisely why it exists
+        alongside :meth:`host_states`: its production caller is
+        ``SpeculativeMergeWorker._host_states_block``'s **orphan** arm (task
+        3275), which classifies RU-tracked hosts that have no slot in this
+        allocator.  :meth:`host_states` structurally cannot answer for those —
+        it enumerates ``_slots`` — so the two are complementary, not redundant.
         """
         return name in self._quarantine
 
