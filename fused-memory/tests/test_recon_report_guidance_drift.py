@@ -87,6 +87,52 @@ def _extract_call_args_at(text: str, paren_idx: int) -> str:
     raise AssertionError(f'Unbalanced parens scanning from index {paren_idx}')
 
 
+class TestMissingRequiredKwargDetection:
+    """Negative control for the (not-yet-existing) `_missing_required_kwargs` helper.
+
+    Pins the helper's contract on short, hand-built fallback-shaped snippets
+    defined inline here — never against the real fallback string.
+    """
+
+    def test_intact_call_reports_nothing_missing(self):
+        snippet = (
+            '- `mcp__recon-report__cite_task(run_id=<x>, finding_id=<y>,'
+            ' project_id=<p>, task_id=<t>)` — prose'
+        )
+        assert (
+            _missing_required_kwargs(
+                snippet, 'cite_task', ('run_id', 'finding_id', 'project_id', 'task_id')
+            )
+            == []
+        )
+
+    def test_dropped_kwarg_is_reported(self):
+        snippet = (
+            '- `mcp__recon-report__cite_task(run_id=<x>, finding_id=<y>,'
+            ' task_id=<t>)` — prose'
+        )
+        assert _missing_required_kwargs(
+            snippet, 'cite_task', ('run_id', 'finding_id', 'project_id', 'task_id')
+        ) == ['project_id']
+
+    def test_substring_shadowing_does_not_mask_a_dropped_kwarg(self):
+        """`cited_run_id` must not satisfy a requirement for `run_id`.
+
+        The literal substring `run_id` still occurs inside `cited_run_id`, so a
+        naive `'run_id' in args` check (the style used by this module's existing
+        run_id scans, e.g. `test_fallback_call_examples_all_carry_run_id`) would
+        wrongly report nothing missing here even though `run_id=` itself was
+        dropped. This pins word-boundary kwarg matching.
+        """
+        snippet = (
+            '- `mcp__recon-report__cite_run(finding_id=<y>,'
+            ' cited_run_id=<full 36-char run UUID>)`'
+        )
+        assert _missing_required_kwargs(
+            snippet, 'cite_run', ('run_id', 'finding_id', 'cited_run_id')
+        ) == ['run_id']
+
+
 class TestReconReportGuidanceDrift:
     """render_recon_report_tool_guidance() runs cleanly and produces real guidance."""
 
