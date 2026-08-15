@@ -26,6 +26,7 @@ shape it copies.
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Collection
 from dataclasses import dataclass
@@ -34,6 +35,14 @@ from fused_memory.utils.validation import (
     PathShapedProjectIdError,
     canonicalize_project_id,
 )
+
+logger = logging.getLogger(__name__)
+
+# Module-level flag for warn-once behaviour when a SUPPLIED registry
+# canonicalizes to nothing — see _canonical_allowlist. Copies the shape of
+# utils/validation.py's _empty_registry_warned rather than inventing a variant,
+# which keeps this module a stdlib-plus-utils/validation leaf.
+_all_path_shaped_warned: bool = False
 
 #: The registry of referent kinds and the bare node-name label each renders.
 #: Deliberately holds only 'task' today; 'escalation' is the PRD's next entry
@@ -317,13 +326,23 @@ def _canonical_allowlist(known_project_ids: Collection[str] | None) -> frozenset
     mangled path would mint a new, wrong canonical key — RCA §4) and rather
     than raised, so one bad entry never disables the whole allowlist.
 
-    The third case is why the return is ``or None`` rather than the surviving
-    frozenset: an EMPTY frozenset ``is not None``, so the caller's
+    The third case returns None rather than the (empty) surviving frozenset
+    because an EMPTY frozenset ``is not None``, so the caller's
     ``allowlist is not None`` guard in :func:`scan_content` would read "an
     allowlist of nothing" as "allow nothing" and drop every foreign ref — the
     whole-allowlist disablement the paragraph above forbids, arrived at by
     skipping every entry instead of one.
+
+    That third case is LOUD: unlike the first two it is an operator
+    misconfiguration (a registry was deliberately supplied and none of it was
+    usable), so it logs a WARNING — warn-once per process, using the
+    module-level ``_all_path_shaped_warned`` flag, so a scanner on a write path
+    cannot turn one misconfiguration into a per-call log storm. The
+    missing/empty cases stay SILENT deliberately: they are expected on every
+    deployment that never wires a registry, and ``validate_known_project_id``
+    already owns the warning for them.
     """
+    global _all_path_shaped_warned
     if not known_project_ids:
         return None
     canonical = set()
@@ -332,7 +351,21 @@ def _canonical_allowlist(known_project_ids: Collection[str] | None) -> frozenset
             canonical.add(canonicalize_project_id(raw))
         except PathShapedProjectIdError:
             continue
-    return frozenset(canonical) or None
+    if not canonical:
+        if not _all_path_shaped_warned:
+            _all_path_shaped_warned = True
+            # Deliberately NOT interpolating the entries themselves: they are
+            # filesystem paths. The count is the actionable part.
+            logger.warning(
+                'cross-project ref allowlist disabled: all %d supplied known_project_ids '
+                'were path-shaped and were skipped, so no usable project id survived. '
+                'The cross-project reference filter is running in PERMISSIVE mode — '
+                'foreign refs are no longer narrowed by the registry. Likely cause: the '
+                'registry was wired with project ROOTS where project IDs were expected.',
+                len(known_project_ids),
+            )
+        return None
+    return frozenset(canonical)
 
 
 def scan_content(
