@@ -612,17 +612,32 @@ def find_retry_loops(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def signal_counts(records: list[dict[str, Any]]) -> dict[str, int]:
-    """Assemble the 5-key signal tally required by the frontmatter contract
+    """Assemble the signal tally required by the frontmatter contract
     (PRD Sec 7.2): ``{tool_error, self_correct, not_found, df_guard,
-    interrupt}``. Each value is the hit count from the corresponding
-    detector; an absent signal class reports 0 rather than being omitted.
+    interrupt, designed_outcome}``. Each value is the hit count from the
+    corresponding detector; an absent signal class reports 0 rather than
+    being omitted.
+
+    ``tool_error`` counts only GENUINE failures
+    (:func:`iter_genuine_errors`); declared-designed outcomes are tallied
+    separately under ``designed_outcome``
+    (:func:`iter_designed_outcomes`). The two were one key until task 3610:
+    the 07-31 census cluster 1.3 sighting
+    (``plans/confusion-census-2026-07-31.md:97``) found session a189558e
+    reporting 4 tool_errors of which 3 were benign
+    ``WATCHER_REARM_OUTCOME: CEILING exit=124`` lines, burying the single
+    genuine exit-2 failure. Splitting the tally is what makes that one
+    real error visible again. The partition is total and lossless, so
+    ``tool_error + designed_outcome`` still equals the number of
+    ``is_error`` neighborhoods.
     """
     return {
-        'tool_error': len(iter_error_neighborhoods(records)),
+        'tool_error': len(iter_genuine_errors(records)),
         'self_correct': len(iter_self_corrections(records)),
         'not_found': len(iter_not_found(records)),
         'df_guard': len(iter_df_guards(records)),
         'interrupt': len(iter_interrupts(records)),
+        'designed_outcome': len(iter_designed_outcomes(records)),
     }
 
 
@@ -640,7 +655,17 @@ individual signal class. Self-corrections (an explicit "I was wrong"
 moment) are the strongest non-gold signal; df_guard/interrupt are
 mid-weight structural signals; tool_error/not_found are the lowest-weight,
 highest-frequency noise signals. Every weight is strictly positive, which
-is what makes score_signals monotonic."""
+is what makes score_signals monotonic.
+
+``designed_outcome`` is DELIBERATELY absent from this table. Because
+:func:`score_signals` iterates SIGNAL_WEIGHTS, omitting the entry means a
+declared-designed outcome is *reported* in ``signal_counts`` but
+contributes exactly zero to the confusion score — which is the point: a
+bounded-poll ceiling is a designed loop-continuation, not agent
+confusion, so no session's rank may shift merely because its noise got
+reclassified. Adding a 0.0 entry instead would break the
+strictly-positive invariant above; leaving the key out keeps
+score_signals monotonic over exactly the scored classes."""
 
 
 def score_signals(counts: dict[str, int], n_user_turns: int) -> float:
@@ -842,8 +867,13 @@ before ``signal_counts``, which is rendered as its own nested block)."""
 
 SIGNAL_COUNT_KEYS: tuple[str, ...] = (
     'tool_error', 'self_correct', 'not_found', 'df_guard', 'interrupt',
+    'designed_outcome',
 )
-"""``signal_counts`` nested keys in the exact PRD Sec 7.2 order."""
+"""``signal_counts`` nested keys in the exact PRD Sec 7.2 order.
+
+``designed_outcome`` is APPENDED last (task 3610) so the pre-existing
+five-key prefix stays byte-stable for anything diffing rendered
+frontmatter."""
 
 
 def render_frontmatter(meta: dict[str, Any]) -> str:

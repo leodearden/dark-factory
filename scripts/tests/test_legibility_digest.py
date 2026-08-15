@@ -1155,6 +1155,7 @@ def _frontmatter_meta():
             'not_found': 3,
             'df_guard': 4,
             'interrupt': 5,
+            'designed_outcome': 6,
         },
     }
 
