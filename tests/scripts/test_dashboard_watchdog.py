@@ -1749,11 +1749,13 @@ def test_log_never_raises_when_the_stderr_fallback_itself_fails(monkeypatch):
     dashboard-watchdog has no per-unit loop (unlike orchestrator-watchdog,
     whose main() calls log() from inside a per-unit ``except Exception``).
     The real damage here is that an escaping OSError aborts tick() MID-BRANCH:
-    every log() call site in tick() (lines 768, 778, 835) is ordered BEFORE
-    the save_state() it narrates, so a streak reset or the ``ceiling_open``
-    write would be silently skipped. A skipped streak reset arms a restart of
-    a *healthy* dashboard on the very next missed probe — and this all lands
-    on a 30s timer, twice as tight as orchestrator-watchdog's 60s.
+    every log() call site in tick() — the startup-grace streak reset, the
+    healthy-again streak reset, and the ceiling re-trip log that precedes the
+    ceiling_open write — is ordered BEFORE the save_state() it narrates, so a
+    streak reset or the ``ceiling_open`` write would be silently skipped. A
+    skipped streak reset arms a restart of a *healthy* dashboard on the very
+    next missed probe — and this all lands on a 30s timer, twice as tight as
+    orchestrator-watchdog's 60s.
     """
     wdog = _load_watchdog()
 
@@ -1776,12 +1778,11 @@ def test_log_never_raises_when_the_stderr_fallback_itself_fails(monkeypatch):
 def test_log_stderr_fallback_still_emits_when_stderr_is_healthy(monkeypatch, capsys):
     """The stderr fallback must still emit the message when stderr is healthy.
 
-    Pins the PLACEMENT of the coming OSError-suppress guard: it has to wrap
-    only the fallback print, not the whole try/except (which would also
-    swallow the original systemd-cat OSError before ever trying stderr) and
-    not simply delete the print. Green today and must stay green — this test
-    is what stops the companion never-raises test above from being satisfied
-    by the wrong fix.
+    Pins the placement of the OSError-suppress guard: it has to wrap only
+    the fallback print, not the whole try/except (which would also swallow
+    the original systemd-cat OSError before ever trying stderr) and not
+    simply delete the print. This test is what stops the companion
+    never-raises test above from being satisfied by the wrong fix.
     """
     wdog = _load_watchdog()
 

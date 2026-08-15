@@ -209,16 +209,17 @@ def log(msg: str) -> None:
 
     NEVER raises from either journal route. A tooling failure in the logging
     path must not become a control-flow event at a call site — dashboard-
-    watchdog has no per-unit loop, but every log() call inside tick() (lines
-    768, 778, 835) is ordered BEFORE the save_state() it narrates, so an
-    exception escaping here aborts tick() mid-branch and skips that write: a
-    stale streak survives a startup grace or a recovery (arming a restart of
-    a *healthy* dashboard on the next single missed probe), or the
-    ``ceiling_open`` write is lost. main()'s ``except Exception`` does NOT
-    cover this — it only keeps the process exit code at 0; the tick's state
-    write is already skipped by the time that handler runs. (An unrelated
-    non-tooling exception type is still deliberately propagated — see the
-    narrow except clause below.)
+    watchdog has no per-unit loop, but every log() call inside tick() — the
+    startup-grace streak reset, the healthy-again streak reset, and the
+    ceiling re-trip log that precedes the ceiling_open write — is ordered
+    BEFORE the save_state() it narrates, so an exception escaping here
+    aborts tick() mid-branch and skips that write: a stale streak survives a
+    startup grace or a recovery (arming a restart of a *healthy* dashboard
+    on the next single missed probe), or the ``ceiling_open`` write is lost.
+    main()'s ``except Exception`` does NOT cover this — it only keeps the
+    process exit code at 0; the tick's state write is already skipped by the
+    time that handler runs. (An unrelated non-tooling exception type is
+    still deliberately propagated — see the narrow except clause below.)
     """
     try:
         subprocess.run(
