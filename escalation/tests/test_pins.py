@@ -418,13 +418,21 @@ class TestLiveClaimantIdShapeGuard:
     """``live_claimant_id`` must be a full ``compose_claimant_run_id`` string.
 
     The only in-repo producer of a live identity
-    (``TaskGroundTruth._resolve_live_claimant``) is heterogeneous: its DB
-    source yields the composed identity, its plan.lock source yields a BARE
-    ``session_id``, and its in-memory source yields ``None``. Comparing a bare
-    session_id against a composed filing identity would always mismatch and so
-    would convert a genuinely LIVE filer's L0 to ``dead_l0`` — the unsafe
-    direction. A format mismatch is not PROOF that the filer is dead, so a
-    non-composed identity on EITHER side is treated as unknown.
+    (``TaskGroundTruth._resolve_live_claimant``) was normalised by task 3563
+    and now emits only composed identities or ``None``: its DB source yields
+    the composed identity, its plan.lock source yields a composed identity
+    when the lock records a run_id and ``None`` (unknown) otherwise, and its
+    in-memory source yields ``None``. Comparing a bare session_id against a
+    composed filing identity would always mismatch and so would convert a
+    genuinely LIVE filer's L0 to ``dead_l0`` — the unsafe direction. A format
+    mismatch is not PROOF that the filer is dead, so a non-composed identity
+    on EITHER side is treated as unknown.
+
+    The cases below are UNCHANGED and stay load-bearing: a bare session_id is
+    still a shape this guard must reject, merely no longer one the in-repo
+    resolver produces. Legacy plan.lock files already on disk, harness-less
+    workflows, and any future producer can still supply one — defence in
+    depth, not a substitute for the producer-side normalisation.
     """
 
     @pytest.mark.parametrize(

@@ -198,10 +198,15 @@ def _norm_id(value: str | None) -> str | None:
       would ALWAYS mismatch, converting a genuinely LIVE filer's L0 to
       ``DEAD_L0`` — the unsafe direction.  The in-repo liveness resolver
       (``orchestrator.task_ground_truth.TaskGroundTruth._resolve_live_claimant``)
-      is heterogeneous today: its DB source yields the composed identity, its
-      plan.lock source yields a bare ``session_id``, and its in-memory source
-      yields ``None``.  A format mismatch is not PROOF that the filer is dead,
-      and this module may only convert on proof.
+      was normalised by task 3563 and now emits only composed identities or
+      ``None``: its DB source yields the composed identity, its plan.lock
+      source yields a composed identity when the lock records a run_id and
+      ``None`` (unknown) otherwise, and its in-memory source yields ``None``.
+      This guard nonetheless stays load-bearing DEFENCE IN DEPTH — legacy
+      plan.lock files already on disk, harness-less workflows, and any future
+      producer can still hand this module a non-composed identity.  A format
+      mismatch is not PROOF that the filer is dead, and this module may only
+      convert on proof.
 
     A SHAPE check, never a parse: the value is compared WHOLE and never
     decomposed (a differing ``pid=`` suffix is a different incarnation).
