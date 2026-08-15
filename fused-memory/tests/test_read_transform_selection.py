@@ -1294,7 +1294,7 @@ class TestCanonicalDiscoverabilityReportsBothRates:
         hits, _, canonical = _aliasing_corpus(canonical_ranked=True)
 
         measured = mod.canonical_discoverability(
-            hits, 't-a', canonical.record_id, k=5,
+            hits, 't-a', canonical.record_id, k=5, retrieved=hits,
         )
 
         assert set(measured) >= {
@@ -1313,7 +1313,7 @@ class TestCanonicalDiscoverabilityReportsBothRates:
         hits, _, canonical = _aliasing_corpus(canonical_ranked=True)
 
         measured = mod.canonical_discoverability(
-            hits, 't-a', canonical.record_id, k=5,
+            hits, 't-a', canonical.record_id, k=5, retrieved=hits,
         )
 
         assert measured['aliased_in_top_k'] == measured['unaliased_in_top_k']
@@ -1331,7 +1331,7 @@ class TestCanonicalDiscoverabilityReportsBothRates:
         hits, _, canonical = _aliasing_corpus(canonical_ranked=True)
 
         measured = mod.canonical_discoverability(
-            hits, 't-a', canonical.record_id, k=5,
+            hits, 't-a', canonical.record_id, k=5, retrieved=hits,
         )
         landed = bake_off.topic_discoverability(hits, 't-a', canonical.record_id, 5)
 
@@ -1342,7 +1342,9 @@ class TestCanonicalDiscoverabilityReportsBothRates:
         mod = _mod()
         hits = [_rec('unrelated', topic='t-z')]
 
-        measured = mod.canonical_discoverability(hits, 't-a', 'anchor', k=5)
+        measured = mod.canonical_discoverability(
+            hits, 't-a', 'anchor', k=5, retrieved=hits,
+        )
 
         assert measured['aliased_in_top_k'] is False
         assert measured['unaliased_in_top_k'] is False
@@ -1357,7 +1359,9 @@ class TestCanonicalDiscoverabilityReportsBothRates:
         canonical = _rec('anchor', topic='t-a', canonical=True)
         hits = [_rec(f'slab-{i}', topic=None) for i in range(5)] + [canonical]
 
-        measured = mod.canonical_discoverability(hits, 't-a', 'anchor', k=5)
+        measured = mod.canonical_discoverability(
+            hits, 't-a', 'anchor', k=5, retrieved=hits,
+        )
 
         assert measured['unaliased_in_top_k'] is False
         assert measured['unaliased_rank'] == 6
@@ -1379,7 +1383,7 @@ class TestTheTwoRatesDiverge:
         )
         measured = mod.canonical_discoverability(
             result.records, 't-a', canonical.record_id, k=5,
-            provenance=result.provenance,
+            retrieved=hits, provenance=result.provenance,
         )
 
         # The store never returned the canonical...
@@ -1408,21 +1412,24 @@ class TestTheTwoRatesDiverge:
         )
         measured = mod.canonical_discoverability(
             result.records, 't-a', canonical.record_id, k=5,
-            provenance=result.provenance,
+            retrieved=hits, provenance=result.provenance,
         )
 
         assert result.provenance[canonical.record_id].canonical_was_itself_ranked
         assert measured['aliased_in_top_k'] is True
         assert measured['unaliased_in_top_k'] is True
 
-    def test_without_the_provenance_the_metric_cannot_tell_and_says_so(self):
+    def test_without_the_provenance_the_synthesis_fact_cannot_be_told(self):
         """Aliasing is invisible in the record alone.
 
         A synthesized document is byte-indistinguishable from a stored one
         at the `record_id` level — that is the entire problem.  So passing
-        no provenance must NOT quietly fall back to crediting: it reports
-        the aliased rate and `None` for the unaliased one, which the report
-        renders as no-measurement rather than as a measured zero.
+        no provenance must NOT quietly report the credit as genuine: the
+        SYNTHESIS fact reports `None`, which the report renders as
+        no-measurement rather than as a measured zero.
+
+        The unaliased RANK is unaffected either way: it is read from
+        *retrieved*, which no transform and no disclosure can touch.
         """
         mod = _mod()
         hits, index, canonical = _aliasing_corpus(canonical_ranked=False)
@@ -1431,11 +1438,14 @@ class TestTheTwoRatesDiverge:
             hits, index, render_sightings=False,
         )
         measured = mod.canonical_discoverability(
-            result.records, 't-a', canonical.record_id, k=5,
+            result.records, 't-a', canonical.record_id, k=5, retrieved=hits,
         )
 
         assert measured['aliased_in_top_k'] is True
-        assert measured['unaliased_in_top_k'] is None
+        assert measured['aliased_credit_is_synthesized'] is None
+        # Retrieval never returned it, so the honest column says so — from
+        # `retrieved`, not from the absent disclosure.
+        assert measured['unaliased_in_top_k'] is False
         assert measured['unaliased_rank'] is None
 
 
@@ -1448,24 +1458,32 @@ class TestTheMetricIsPure:
         )
         records_before = _ids(result.records)
         provenance_before = dict(result.provenance)
+        retrieved_before = _ids(hits)
 
         mod.canonical_discoverability(
             result.records, 't-a', canonical.record_id, k=5,
-            provenance=result.provenance,
+            retrieved=hits, provenance=result.provenance,
         )
 
         assert _ids(result.records) == records_before
         assert result.provenance == provenance_before
+        assert _ids(hits) == retrieved_before
 
 
 class TestOnlyASynthesizedRecordCanAlias:
-    """The discriminator that lets a flat arm be scored with no disclosure.
+    """The discriminator behind the SYNTHESIS field, not behind the rank.
 
     A missing `provenance` must not mean "unknown" unconditionally: a
     STORED record carrying the canonical's id simply IS the canonical, and
-    reporting `None` for every flat arm would render the honest column as
-    no-measurement across most of the table.  Only a SYNTHESIZED document
-    can alias, and a synthesized document is self-identifying by `role`.
+    reporting `None` for every flat arm would render the synthesis column
+    as no-measurement across most of the table.  Only a SYNTHESIZED
+    document can alias, and a synthesized document is self-identifying by
+    `role`.
+
+    Note what this class no longer governs: the unaliased RANK.  That is
+    read from *retrieved* and is therefore knowable for every arm whether
+    or not anything disclosed anything — which is the whole point of
+    step-23.
     """
 
     def test_a_stored_canonical_needs_no_disclosure_to_be_credited(self):
@@ -1473,11 +1491,14 @@ class TestOnlyASynthesizedRecordCanAlias:
         hits, _, canonical = _aliasing_corpus(canonical_ranked=True)
 
         measured = mod.canonical_discoverability(
-            hits, 't-a', canonical.record_id, k=5,
+            hits, 't-a', canonical.record_id, k=5, retrieved=hits,
         )
 
         assert measured['unaliased_in_top_k'] is True
         assert measured['unaliased_rank'] == 2
+        # Nothing was minted, so the credit is not a synthesis — and that
+        # is knowable without a disclosure.
+        assert measured['aliased_credit_is_synthesized'] is False
 
     def test_a_synthesized_document_without_disclosure_is_unknown_not_credited(
         self,
@@ -1495,14 +1516,15 @@ class TestOnlyASynthesizedRecordCanAlias:
         # Self-identifying: the role is what the metric reads, so pin it.
         assert document.role == bake_off.GROUPED_ROLE
         assert mod.canonical_discoverability(
-            result.records, 't-a', canonical.record_id, k=5,
-        )['unaliased_in_top_k'] is None
+            result.records, 't-a', canonical.record_id, k=5, retrieved=hits,
+        )['aliased_credit_is_synthesized'] is None
 
     def test_disclosure_beats_the_role_fallback_when_both_are_present(self):
         """Provenance is EVIDENCE; the role is only a discriminator.
 
-        A grouped document whose canonical really did rank is credited —
-        the role alone would have refused it, so the disclosure must win.
+        A grouped document whose canonical really did rank is not a
+        synthetic credit — the role alone would have called it one, so the
+        disclosure must win.
         """
         mod = _mod()
         hits, index, canonical = _aliasing_corpus(canonical_ranked=True)
@@ -1513,8 +1535,427 @@ class TestOnlyASynthesizedRecordCanAlias:
 
         assert mod.canonical_discoverability(
             result.records, 't-a', canonical.record_id, k=5,
-            provenance=result.provenance,
-        )['unaliased_in_top_k'] is True
+            retrieved=hits, provenance=result.provenance,
+        )['aliased_credit_is_synthesized'] is False
+
+
+# ---------------------------------------------------------------------------
+# The unaliased column measures RETRIEVAL, not the transform's placement
+# ---------------------------------------------------------------------------
+#
+# The whole reason `canonical_discoverability` exists is to separate "the
+# store found the canonical" from "the transform put something carrying its
+# id at the top".  Seeding the unaliased verdict from `aliased_rank` — the
+# POST-transform rank — and only ever revising it downward on a disclosure
+# reintroduced exactly that conflation: measured on this branch, all three
+# transform arms reported `unaliased_rank=1` for a canonical retrieval had
+# left at rank 5, and the committed artifact carries the damage
+# (`canonical_unaliased_rank` 1.0596 / 1.0455 / 1.0455 against flat_read's
+# 3.4935).  It was load-bearing, not cosmetic: `_rank_key` sorted on
+# `canonical_unaliased_in_top_k` FIRST, so the corrupted column picked the
+# recommended arm.
+#
+# The fix is structural rather than a correction factor: the unaliased half
+# is computed from the PRE-transform hit list alone, so no transform can
+# reach it.  Its arm-invariance is now the DEFINITION — a test that can make
+# it vary proves the metric is reading the transform again.
+
+def _retrieval_corpus():
+    """Four children ranked above the canonical they belong to.
+
+    Retrieval put the canonical at rank 5.  Every transform in the arm set
+    puts it — or a document minted under its id — at aliased rank 1.  The
+    distance between those two facts is precisely what the two columns
+    exist to keep apart.
+    """
+    children = [
+        _rec(f'child-{i}', topic='t-a', kind='amendment', content=f'body {i}')
+        for i in range(1, 5)
+    ]
+    canonical = _rec('anchor', topic='t-a', canonical=True, content='the anchor')
+    return [*children, canonical], canonical
+
+
+def _ranked_hits(records):
+    """Wrap stored records as the `ScoredHit`s the arm driver consumes.
+
+    Scores descend with rank and are never read by any metric here
+    (`ScoredHit` exists to quarantine them, bake_off:1346-1355); they exist
+    only because the fetch cache's element type carries one.
+    """
+    return [
+        _bake_off().ScoredHit(record=record, relevance_score=1.0 - index / 100)
+        for index, record in enumerate(records)
+    ]
+
+
+def _seeded(records):
+    """The two attributes `apply_arm` reads off a `SeededArm`.
+
+    A stand-in rather than a real `SeededArm`: that class carries eight
+    more fields describing a LIVE mem0 collection, none of which any read
+    transform touches, and constructing one here would imply this test
+    needs a store.
+    """
+    return types.SimpleNamespace(
+        canonical_by_topic=_canonical_index(*records),
+        records=list(records),
+    )
+
+
+class TestTheUnaliasedColumnIsReadFromRetrieval:
+    """It cannot be computed from the delivered window at all."""
+
+    def test_the_pre_transform_hits_are_a_required_argument(self):
+        """Not defaulted: a caller that forgets them must not get a number.
+
+        Defaulting to the window would silently restore the conflation for
+        every call site that had not been updated — which is how the bug
+        reached a committed artifact in the first place.
+        """
+        mod = _mod()
+        hits, _, canonical = _aliasing_corpus(canonical_ranked=True)
+
+        with pytest.raises(TypeError):
+            mod.canonical_discoverability(hits, 't-a', canonical.record_id, k=5)
+
+    def test_the_verdict_follows_retrieval_while_the_window_stays_fixed(self):
+        """The decisive shape: one window, two retrievals, two answers."""
+        mod = _mod()
+        canonical = _rec('anchor', topic='t-a', canonical=True)
+        window = [canonical]
+        shallow = [canonical]
+        deep = [_rec('slab-1', topic=None), _rec('slab-2', topic=None), canonical]
+
+        near = mod.canonical_discoverability(
+            window, 't-a', 'anchor', k=5, retrieved=shallow,
+        )
+        far = mod.canonical_discoverability(
+            window, 't-a', 'anchor', k=5, retrieved=deep,
+        )
+
+        assert near['unaliased_rank'] == 1
+        assert far['unaliased_rank'] == 3
+        # ...while the window never moved, so the aliased half is identical.
+        assert near['aliased_rank'] == far['aliased_rank'] == 1
+
+
+class TestUnaliasedIsArmInvariantByConstruction:
+    """Four arms, one retrieval, one honest rank."""
+
+    def test_every_arm_reports_the_canonicals_real_retrieval_rank(self):
+        mod = _mod()
+        records, canonical = _retrieval_corpus()
+        hits, seeded = _ranked_hits(records), _seeded(records)
+
+        measured = {}
+        for arm in mod.ARM_KEYS:
+            transform = mod.apply_arm(arm, hits, seeded, 5)
+            measured[arm] = mod.canonical_discoverability(
+                transform.records[:5], 't-a', canonical.record_id, k=5,
+                retrieved=records, provenance=transform.provenance,
+            )
+
+        assert {arm: row['unaliased_rank'] for arm, row in measured.items()} == {
+            'flat_read': 5,
+            'promoting_pin': 5,
+            'topic_keyed_grouped': 5,
+            'topic_diversity_cap': 5,
+        }
+        # ...and the aliased column still discriminates, which is why both
+        # are printed.  Placement is a real, reportable difference; it is
+        # simply not a retrieval one.
+        assert {arm: row['aliased_rank'] for arm, row in measured.items()} == {
+            'flat_read': 5,
+            'promoting_pin': 1,
+            'topic_keyed_grouped': 1,
+            'topic_diversity_cap': 1,
+        }
+
+    def test_no_arm_pulls_the_canonical_into_a_window_retrieval_left_it_out_of(
+        self,
+    ):
+        """The `in_top_k` half of the same fact.
+
+        Asserted at k=4 rather than at the k=5 of the test above because
+        `canonical_in_top_k` is `rank <= k` (bake_off:1178): with the
+        canonical AT rank 5 and k=5 a `False` is arithmetically impossible,
+        so the honest scenario is a window strictly narrower than its
+        retrieval rank.
+        """
+        mod = _mod()
+        records, canonical = _retrieval_corpus()
+        hits, seeded = _ranked_hits(records), _seeded(records)
+
+        measured = {}
+        for arm in mod.ARM_KEYS:
+            transform = mod.apply_arm(arm, hits, seeded, 4)
+            measured[arm] = mod.canonical_discoverability(
+                transform.records[:4], 't-a', canonical.record_id, k=4,
+                retrieved=records, provenance=transform.provenance,
+            )
+
+        assert [row['unaliased_in_top_k'] for row in measured.values()] == [
+            False, False, False, False,
+        ]
+        # The pin and the grouped read both DELIVER it inside a four-record
+        # window retrieval had excluded — a real reader benefit, credited in
+        # the aliased column and nowhere else.
+        assert measured['promoting_pin']['aliased_in_top_k'] is True
+        assert measured['topic_keyed_grouped']['aliased_in_top_k'] is True
+        assert measured['flat_read']['aliased_in_top_k'] is False
+
+    def test_the_two_columns_are_not_the_same_number(self):
+        """If they never diverged, one of them would be decoration."""
+        mod = _mod()
+        records, canonical = _retrieval_corpus()
+        hits, seeded = _ranked_hits(records), _seeded(records)
+
+        transform = mod.apply_arm('promoting_pin', hits, seeded, 5)
+        row = mod.canonical_discoverability(
+            transform.records[:5], 't-a', canonical.record_id, k=5,
+            retrieved=records, provenance=transform.provenance,
+        )
+
+        assert row['aliased_rank'] != row['unaliased_rank']
+
+
+class TestUnaliasedReadsTheUntruncatedFetch:
+    """A canonical below the window is a rank, not an absence."""
+
+    def test_a_canonical_at_retrieval_rank_k_plus_two_reports_that_rank(self):
+        mod = _mod()
+        canonical = _rec('anchor', topic='t-a', canonical=True)
+        records = [_rec(f'slab-{i}', topic=None) for i in range(6)] + [canonical]
+
+        row = mod.canonical_discoverability(
+            records[:5], 't-a', 'anchor', k=5, retrieved=records,
+        )
+
+        assert row['unaliased_rank'] == 7
+
+    def test_the_flat_baseline_could_not_have_expressed_that_rank(self):
+        """Why `baseline` is NOT reused as the pre-transform list.
+
+        `baseline` is `apply_arm('flat_read', ...).records`, already sliced
+        to k, so a canonical below the window is indistinguishable there
+        from one absent from the corpus — the exact conflation
+        `topic_discoverability`'s docstring says the rank exists to avoid.
+        """
+        mod = _mod()
+        bake_off = _bake_off()
+        canonical = _rec('anchor', topic='t-a', canonical=True)
+        records = [_rec(f'slab-{i}', topic=None) for i in range(6)] + [canonical]
+        hits, seeded = _ranked_hits(records), _seeded(records)
+
+        baseline = mod.apply_arm('flat_read', hits, seeded, 5).records
+
+        assert bake_off.topic_discoverability(
+            baseline, 't-a', 'anchor', 5,
+        )['canonical_rank'] is None
+        assert mod.canonical_discoverability(
+            records[:5], 't-a', 'anchor', k=5, retrieved=records,
+        )['unaliased_rank'] == 7
+
+    def test_a_none_rank_carries_the_depth_it_was_looked_for_in(self):
+        """`None` must never be readable as "absent from the corpus".
+
+        It means "absent from the cached fetch", and a fetch has a depth.
+        Without it a reader cannot tell a canonical that lost from one that
+        was never fetched deeply enough to win.
+        """
+        mod = _mod()
+        records = [_rec(f'slab-{i}', topic=None) for i in range(3)]
+
+        row = mod.canonical_discoverability(
+            records, 't-a', 'anchor', k=5, retrieved=records,
+        )
+
+        assert row['unaliased_rank'] is None
+        assert row['unaliased_in_top_k'] is False
+        assert row['retrieval_depth'] == 3
+
+    def test_the_depth_is_reported_even_when_the_canonical_was_found(self):
+        mod = _mod()
+        records, canonical = _retrieval_corpus()
+
+        row = mod.canonical_discoverability(
+            records, 't-a', canonical.record_id, k=5, retrieved=records,
+        )
+
+        assert row['retrieval_depth'] == 5
+
+
+class TestTheSynthesisFactKeepsItsOwnColumn:
+    """The arm-dependent half is not deleted — it is renamed and isolated.
+
+    "The record delivered under the canonical's id is a document the
+    transform minted, not the stored record" is a true and reportable fact
+    about an arm.  It was doing the wrong job as a rank; it keeps doing the
+    right one beside it.
+    """
+
+    def test_a_fold_over_an_unretrieved_canonical_is_flagged_as_synthesized(self):
+        mod = _mod()
+        hits, index, canonical = _aliasing_corpus(canonical_ranked=False)
+
+        result = mod.apply_topic_keyed_grouped_read(
+            hits, index, render_sightings=False,
+        )
+        row = mod.canonical_discoverability(
+            result.records, 't-a', canonical.record_id, k=5,
+            retrieved=hits, provenance=result.provenance,
+        )
+
+        assert row['aliased_credit_is_synthesized'] is True
+        # ...and the rank column is untouched by that fact.
+        assert row['unaliased_rank'] is None
+
+    def test_a_flat_arm_synthesizes_nothing(self):
+        mod = _mod()
+        records, canonical = _retrieval_corpus()
+        hits, seeded = _ranked_hits(records), _seeded(records)
+
+        transform = mod.apply_arm('flat_read', hits, seeded, 5)
+        row = mod.canonical_discoverability(
+            transform.records[:5], 't-a', canonical.record_id, k=5,
+            retrieved=records, provenance=transform.provenance,
+        )
+
+        assert row['aliased_credit_is_synthesized'] is False
+
+    def test_it_is_the_column_that_varies_by_arm_now(self):
+        """The two columns swap roles, and neither is redundant.
+
+        `unaliased_*` is constant across arms and `aliased_credit_is_
+        synthesized` varies — the reverse of the pre-fix state, where the
+        rank varied by arm and the synthesis fact was folded into it.
+        """
+        mod = _mod()
+        hits, index, canonical = _aliasing_corpus(canonical_ranked=False)
+        seeded = _seeded([*hits, canonical])
+        scored = _ranked_hits(hits)
+
+        grouped = mod.apply_topic_keyed_grouped_read(
+            hits, index, render_sightings=False,
+        )
+        flat = mod.apply_arm('flat_read', scored, seeded, 5)
+
+        folded = mod.canonical_discoverability(
+            grouped.records, 't-a', canonical.record_id, k=5,
+            retrieved=hits, provenance=grouped.provenance,
+        )
+        plain = mod.canonical_discoverability(
+            flat.records, 't-a', canonical.record_id, k=5,
+            retrieved=hits, provenance=flat.provenance,
+        )
+
+        assert folded['aliased_credit_is_synthesized'] is True
+        assert plain['aliased_credit_is_synthesized'] is False
+        assert folded['unaliased_rank'] == plain['unaliased_rank'] is None
+
+
+class TestTheScorerThreadsTheUntruncatedFetch:
+    """The guard is wired, not merely available.
+
+    `score_arm` holds the full cached hit list; `apply_arm` slices it to k
+    before transforming.  If the scorer passed the sliced list — or reused
+    `baseline`, which is already sliced — the metric would be correct and
+    the report still wrong.
+    """
+
+    def _query(self, topic='t-a', query_id='q-1'):
+        return types.SimpleNamespace(
+            query_id=query_id, topic=topic, expects_claim_ids=['claim-1'],
+        )
+
+    def test_every_arm_scores_the_canonical_at_its_full_fetch_rank(self):
+        mod = _mod()
+        canonical = _rec('anchor', topic='t-a', canonical=True,
+                         claim_ids=['claim-1'])
+        records = [
+            _rec(f'child-{i}', topic='t-a', kind='amendment') for i in range(1, 7)
+        ] + [canonical]
+        hits, seeded = _ranked_hits(records), _seeded(records)
+        query = self._query()
+
+        ranks = {}
+        for arm in mod.ARM_KEYS:
+            scored = mod.score_arm(
+                arm, [query], {'q-1': hits}, seeded, k=5, labeled=True,
+            )
+            ranks[arm] = scored['rows'][0]['canonical_unaliased_rank']
+
+        # Rank 7 in a 7-deep fetch, scored at k=5: only the untruncated list
+        # can say 7, and every arm must say it.
+        assert set(ranks.values()) == {7}
+
+    def test_the_row_still_reports_the_arms_own_placement(self):
+        mod = _mod()
+        records, canonical = _retrieval_corpus()
+        hits, seeded = _ranked_hits(records), _seeded(records)
+        query = self._query()
+
+        flat = mod.score_arm(
+            'flat_read', [query], {'q-1': hits}, seeded, k=5, labeled=True,
+        )['rows'][0]
+        pinned = mod.score_arm(
+            'promoting_pin', [query], {'q-1': hits}, seeded, k=5, labeled=True,
+        )['rows'][0]
+
+        assert flat['canonical_aliased_rank'] == 5
+        assert pinned['canonical_aliased_rank'] == 1
+        assert flat['canonical_unaliased_rank'] == 5
+        assert pinned['canonical_unaliased_rank'] == 5
+
+
+class TestTheRankingRuleDoesNotSortOnAConstant:
+    """A primary sort key that cannot vary across arms decides nothing.
+
+    With the unaliased column now arm-invariant BY CONSTRUCTION, leading
+    `_rank_key` with it would leave the recommendation to be settled by
+    whatever happened to come next — a rule that reads as measured but is
+    not.  It is dropped from the ordering and reported beside it.
+    """
+
+    def test_the_ranking_ignores_the_arm_invariant_canonical_columns(self):
+        mod = _mod()
+        left = {
+            'canonical_unaliased_in_top_k': 1.0,
+            'canonical_aliased_in_top_k': 1.0,
+            'claim_recall': 0.5,
+            'tokens_per_query': 100.0,
+            'window_displacement': 0.0,
+        }
+        right = dict(left)
+        right['canonical_unaliased_in_top_k'] = 0.0
+        right['canonical_aliased_in_top_k'] = 0.0
+
+        assert mod._rank_key('a', left)[:-1] == mod._rank_key('a', right)[:-1]
+
+    def test_claim_recall_leads_the_ordering(self):
+        mod = _mod()
+        better = {'claim_recall': 0.9, 'tokens_per_query': 900.0,
+                  'window_displacement': 9.0}
+        worse = {'claim_recall': 0.4, 'tokens_per_query': 1.0,
+                 'window_displacement': 0.0}
+
+        assert mod._rank_key('a', better) < mod._rank_key('a', worse)
+
+    def test_the_printed_rule_no_longer_claims_to_rank_on_it(self):
+        """The artifact states the rule it actually applies (PRD G6/D10).
+
+        `_scored()` — the report fixture — is defined further down this
+        module; module-level names resolve at call time, so using it here
+        is fine and avoids a second stub of the same shape.
+        """
+        mod = _mod()
+        report = mod.build_selection_report(_scored())
+
+        rule = report['recommendation']['rule'].lower()
+
+        assert 'unaliased' in rule
+        assert 'invariant' in rule
 
 
 # ---------------------------------------------------------------------------
