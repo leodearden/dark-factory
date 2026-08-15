@@ -280,6 +280,48 @@ class TestStartReportResultIsUnambiguous:
         ]
         assert divergence_warnings, [r.getMessage() for r in caplog.records]
 
+        # Fully mirrors complete()'s different-summary handling: the
+        # divergence is recorded ON THE ENTRY, not just the transient
+        # response/log, so get_assembled_report's summary_warnings surfaces
+        # it to every downstream reader.
+        assert len(entry.summary_warnings) == 1
+        assert 'other_project' in entry.summary_warnings[0]
+        assembled = state.get_assembled_report('r1', 'memory_consolidator')
+        assert assembled is not None
+        assert assembled['summary_warnings'] == entry.summary_warnings
+
+    def test_divergent_project_id_persists_warning_on_entry(self, tmp_path):
+        """The project_id-divergence branch is the one exception to the
+        pure no-op repeat: it must persist (unlike a same-project_id
+        no-op repeat, which stays a zero-store-write no-op — see
+        TestStartReportActivePointerAndPersistence.test_pure_noop_repeat_triggers_zero_store_writes).
+        """
+        from fused_memory.server.recon_report import ReconReportState, _deserialize_entry
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        store = ReconReportStore(tmp_path / 'recon_report_state.db')
+        store.open()
+        try:
+            t = [0.0]
+            state = ReconReportState(ttl_seconds=300, clock=lambda: t[0], store=store)
+            state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+
+            state.start_report(
+                run_id='r1', stage='memory_consolidator', project_id='other_project',
+            )
+
+            rows = [
+                r for r in store.load_all()
+                if r['run_id'] == 'r1' and r['stage'] == 'memory_consolidator'
+            ]
+            assert len(rows) == 1
+            persisted_entry = _deserialize_entry(rows[0]['entry_json'])
+            assert persisted_entry.project_id == 'dark_factory'  # retained
+            assert len(persisted_entry.summary_warnings) == 1
+            assert 'other_project' in persisted_entry.summary_warnings[0]
+        finally:
+            store.close()
+
     @pytest.mark.asyncio
     async def test_fastmcp_surface_reports_same_shapes(self):
         from fused_memory.server.recon_report import ReconReportState, create_recon_report_server
@@ -487,3 +529,136 @@ class TestStartReportActivePointerAndPersistence:
             assert rows[0]['is_active'] is True
         finally:
             real_store.close()
+
+    def test_repeat_call_repairs_pointer_dropped_by_tick_eviction(self):
+        """Organic producer #1 of the missing-pointer state (the tests above
+        manufacture it via `del state._active[...]`): `tick()` itself drops
+        the pointer when the run's ACTIVE stage is the one that evicts,
+        while an in-progress SIBLING entry of the same run survives — the
+        scenario the docstring's repair-rationale paragraph cites.
+        """
+        state, t = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+        finding = state.add_finding(
+            run_id='r1', severity='low', category='cat', description='d',
+            suggested_action='a', task_id='1', flag_type='f',
+        )
+        assert 'finding_id' in finding, finding
+        finding_id = finding['finding_id']
+
+        # s2 becomes active; s1 stays resident and in-progress (immortal).
+        state.start_report(run_id='r1', stage='s2', project_id='dark_factory')
+        assert state._active['r1'] == 's2'
+
+        # complete() resolves via _active — completes s2, not s1.
+        state.complete('r1', 's2 summary')
+        assert state._active['r1'] == 's2'
+
+        t[0] = 301.0  # past TTL for s2's completed_at (0.0)
+        evicted = state.tick()
+        assert evicted == 1  # only s2 (completed); s1 is immortal in-progress
+        assert ('r1', 's2') not in state._state
+        assert ('r1', 's1') in state._state  # sibling survives
+        assert 'r1' not in state._active  # tick() cleared the pointer it owned
+
+        blocked = state.add_finding(
+            run_id='r1', severity='low', category='cat', description='d2',
+            suggested_action='a', task_id='2', flag_type='f',
+        )
+        assert blocked == {'error': 'run_id_unknown', 'error_type': 'ReconReportRunUnknown'}
+
+        result = state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+        assert result['already_started'] is True
+        assert state._active['r1'] == 's1'  # pointer restored onto the surviving sibling
+
+        resumed = state.add_finding(
+            run_id='r1', severity='low', category='cat', description='d3',
+            suggested_action='a', task_id='3', flag_type='f',
+        )
+        assert 'finding_id' in resumed, resumed
+        entry = state._state[('r1', 's1')]
+        assert {f.finding_id for f in entry.findings} == {finding_id, resumed['finding_id']}
+
+    def test_repeat_call_repairs_pointer_missing_after_hydrate_with_no_active_row(self, tmp_path):
+        """Organic producer #2: `hydrate_from_store()` only sets `_active`
+        for a row persisted with `is_active=True`. A run whose persisted
+        rows carry no such row (e.g. because the pointer was already
+        missing at the last `_persist_run` for that run) hydrates with
+        `_state` populated but `_active` unset for that run_id — a second,
+        independent real-world path into the same repair branch as the
+        tick()-eviction producer above.
+        """
+        from fused_memory.server.recon_report import ReconReportState
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        store = ReconReportStore(tmp_path / 'recon_report_state.db')
+        store.open()
+        try:
+            t = [0.0]
+            state = ReconReportState(ttl_seconds=300, clock=lambda: t[0], store=store)
+            state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+            finding = state.add_finding(
+                run_id='r1', severity='low', category='cat', description='d',
+                suggested_action='a', task_id='1', flag_type='f',
+            )
+            assert 'finding_id' in finding, finding
+            finding_id = finding['finding_id']
+
+            # Drop the pointer and persist through it, so the STORE row
+            # itself carries is_active=False for every (r1, *) row.
+            del state._active['r1']
+            state._persist_run('r1')
+
+            rows = [r for r in store.load_all() if r['run_id'] == 'r1']
+            assert rows and all(not r['is_active'] for r in rows)
+
+            # A FRESH state hydrating from that store never sets _active['r1'].
+            t2 = [0.0]
+            fresh_state = ReconReportState(ttl_seconds=300, clock=lambda: t2[0], store=store)
+            fresh_state.hydrate_from_store()
+            assert ('r1', 's1') in fresh_state._state
+            assert 'r1' not in fresh_state._active
+
+            blocked = fresh_state.add_finding(
+                run_id='r1', severity='low', category='cat', description='d2',
+                suggested_action='a', task_id='2', flag_type='f',
+            )
+            assert blocked == {'error': 'run_id_unknown', 'error_type': 'ReconReportRunUnknown'}
+
+            result = fresh_state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+            assert result['already_started'] is True
+            assert fresh_state._active['r1'] == 's1'
+
+            resumed = fresh_state.add_finding(
+                run_id='r1', severity='low', category='cat', description='d3',
+                suggested_action='a', task_id='3', flag_type='f',
+            )
+            assert 'finding_id' in resumed, resumed
+            entry = fresh_state._state[('r1', 's1')]
+            assert {f.finding_id for f in entry.findings} == {finding_id, resumed['finding_id']}
+        finally:
+            store.close()
+
+    def test_ttl_evicted_entry_takes_fresh_create_path_not_already_started(self):
+        """Boundary pin for the guard's documented scope edge: once an entry
+        has aged out of `_state` via `tick()`, a call naming that same
+        (run_id, stage) no longer matches the repeat branch at all — it is
+        a legal fresh create and reports `already_started: False`, not
+        True. This is the guard's explicit scope boundary (see
+        start_report's docstring), not a regression: closing it needs a
+        known-stage vocabulary the guard deliberately does not have, and is
+        also where a stray call naming an evicted-but-still-active-pointer
+        stage could steal `_active` from a live sibling stage (out of scope
+        here; tracked in the docstring).
+        """
+        state, t = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+        state.complete('r1', 'done')
+        t[0] = 301.0
+        evicted = state.tick()
+        assert evicted == 1
+        assert ('r1', 's1') not in state._state
+        assert 'r1' not in state._active
+
+        result = state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+        assert result['already_started'] is False
