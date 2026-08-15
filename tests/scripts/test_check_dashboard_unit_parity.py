@@ -1547,6 +1547,80 @@ def test_registry_registers_environment_file_on_both_service_units():
         )
 
 
+def test_watchdog_environment_injected_on_the_installed_copy_is_drift():
+    """The measured hole: an inline Environment= on the installed copy alone.
+
+    scripts/dashboard-watchdog.py reads nine env knobs — PROBE_URL,
+    PROBE_TIMEOUT, GRACE_SECS, FAIL_STREAK, MAX_RESTARTS, RATE_WINDOW_SECS,
+    STATE_PATH, ESCALATION_QUEUE_DIR, UV_BIN — and those knobs ARE the
+    hysteresis/grace/rate-ceiling supervision policy. An installed copy that
+    picked up ``Environment=DASHBOARD_WATCHDOG_FAIL_STREAK=99`` outside the
+    repo (``systemctl --user edit`` writing a bare Environment= line, or a
+    hand-edit of the installed file) means ~99 consecutive failed probes
+    before any restart — supervision effectively off. Measured: with
+    ``environment_section`` unset on the watchdog spec, this exact input
+    produces zero drift lines — ``compare_unit`` returns ``[]``, a clean
+    "[ok] parity" over a unit whose effective failure tolerance was silently
+    disabled.
+
+    Uses the REAL registry spec and the REAL committed unit, not a fixture
+    UnitSpec — a fixture-only test would pass while the registry left the hole
+    open, the same reason
+    test_registry_registers_environment_file_on_both_service_units states in
+    its own docstring. The installed text is the repo text plus one injected
+    line, so this is a REPO-side-only read and stays green on CI and on a host
+    whose installed units are drifted.
+    """
+    mod = _load_checker()
+    spec = mod.UNITS[_WATCHDOG_SERVICE]
+    repo_text = (REPO_ROOT / spec.repo_relpath).read_text(encoding="utf-8")
+    installed_text = repo_text + "Environment=DASHBOARD_WATCHDOG_FAIL_STREAK=99\n"
+
+    drifts = mod.compare_unit(spec, repo_text, installed_text)
+
+    assert [d.key for d in drifts] == ["Environment=DASHBOARD_WATCHDOG_FAIL_STREAK"], drifts
+    assert drifts[0].section == "Service"
+    assert drifts[0].installed_value == "99"
+    assert drifts[0].repo_value == mod._ABSENT
+    assert "installed copy" in drifts[0].reason
+
+
+def test_registry_environment_section_registered_on_both_service_units():
+    """Registry pin mirroring the EnvironmentFile one, so a revert is loud.
+
+    Without this, an edit that removes ``environment_section`` from the
+    watchdog spec would silently reopen the hole
+    test_watchdog_environment_injected_on_the_installed_copy_is_drift
+    measures, with no assertion naming the registry entry itself — the same
+    "helper passes, registry regresses" failure mode
+    test_registry_registers_environment_file_on_both_service_units guards
+    against for override_directives.
+
+    The timer is pinned the OTHER way, and the message states why: the
+    committed dark-factory-dashboard-watchdog.timer parses to sections Unit /
+    Timer / Install — there is no [Service] section, and Environment= is not a
+    valid directive in a timer unit. Registering a section there would compare
+    absent-to-absent forever, which is exactly the rot the staleness guards
+    elsewhere in this module exist to prevent.
+    """
+    mod = _load_checker()
+
+    for name in (_DASHBOARD_SERVICE, _WATCHDOG_SERVICE):
+        assert mod.UNITS[name].environment_section == "Service", (
+            f"{name} does not register environment_section='Service', so an "
+            "Environment= line added to the installed copy alone would leave "
+            "the checker reporting parity over an unknown effective "
+            "configuration."
+        )
+
+    assert mod.UNITS[_WATCHDOG_TIMER].environment_section is None, (
+        f"{_WATCHDOG_TIMER} has no [Service] section (it parses to Unit / "
+        "Timer / Install) and Environment= is not valid in a timer unit — "
+        "registering environment_section here would compare absent-to-absent "
+        "forever."
+    )
+
+
 def test_find_dropins_returns_nothing_when_no_dropin_dir_exists(tmp_path: pathlib.Path):
     """The overwhelmingly common case must be silent."""
     mod = _load_checker()
