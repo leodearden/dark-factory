@@ -10390,9 +10390,25 @@ class GitOps:
             lock_path, _RESET_WARM_LANE_LOCK_WAIT_SECS,
         )
         if fd is None:
-            # ONE kernel snapshot for both the decision and the message
-            # (task 3081) — see merge_verify_lease's identical read.
-            holder_pids = lane_lock_holder_pids(lock_path)
+            # ONE SETTLED kernel snapshot for both the decision and the
+            # message (tasks 3081, 3783) — see merge_verify_lease's identical
+            # read.  Settled = re-read, bounded, only when the snapshot comes
+            # back EMPTY, which at this site contradicts the acquire timeout
+            # that just produced it (we waited the full wait and did not get
+            # the lock).  A lossy empty here used to cost both consumers at
+            # once: the message degraded to "no FLOCK holder" and layer (1) of
+            # the leak predicate below silently failed OPEN.
+            #
+            # Safe to await here, and only here: the acquire has already
+            # returned None, so NO fd is in flight and a cancellation landing
+            # inside the poll cannot orphan the lane (the B12 guarantee is
+            # untouched).  The snapshot is therefore taken up to the settle
+            # bound LATER than the timeout — a safe asymmetry, because layer
+            # (1) can only GAIN a true kernel attribution, while layers (2)
+            # (_lane_lock_held_in_process) and (3) (_merge_verify_lease_active)
+            # are read afterwards and can only VETO, per this module's
+            # register-when-in-doubt asymmetry.
+            holder_pids = await _settled_lane_lock_holder_pids(lock_path)
             # Is this OUR OWN leaked lock rather than a live foreign hold?
             # Asked FIRST (task 3081): the incident's symptom was exactly this
             # timeout, and the leak is invisible unless something asks.  It
