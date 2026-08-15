@@ -62,7 +62,7 @@ import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 # Allow execution as a bare script (``python tests/startup_completion_probe.py``)
 # as well as import from a pytest run, mirroring shared/tests/conftest.py.
@@ -838,34 +838,55 @@ def run_live_probe(
     token_pair = _oauth_token()
     config = TaskConfigDir(f'startup-probe-{mode}-{os.getpid()}')
     config_dir = config.path
-    if token_pair is not None:
-        config.write_credentials(token_pair[1])
 
-    stub_dir = Path(tempfile.mkdtemp(prefix='startup_probe_stubs_'))
-    argv, temp_paths = _build_argv(
-        mode,
-        session_id=session_id,
-        prompt=prompt,
-        model=model,
-        permission_mode=permission_mode,
-        stub_dir=stub_dir,
-        hold_secs=hold_secs,
-    )
-    env = _spawn_env(config_dir, token_pair[1] if token_pair else None)
-
-    # Capture files, NOT pipes — see _drain_exit: an undrained PIPE blocks the
-    # child once ~64 KB of startup chatter fills it, and this parent does not
-    # drain until the sampling window closes.
-    stdout_path = stub_dir / 'probe-stdout.bin'
-    stderr_path = stub_dir / 'probe-stderr.bin'
-    stdout_fh = stdout_path.open('wb')
-    stderr_fh = stderr_path.open('wb')
-
+    # Every resource the `finally` touches is initialized to a sentinel FIRST,
+    # because the `try` below now opens before any of them exists and the
+    # teardown must be reachable from every point inside it.
+    stub_dir: Path | None = None
+    temp_paths: list[Path] = []
+    stdout_fh: IO[bytes] | None = None
+    stderr_fh: IO[bytes] | None = None
     observations: list[dict] = []
     proc: subprocess.Popen | None = None
-    epoch = time.time()
-    start = time.monotonic()
+
+    # The `try` deliberately starts at the FIRST credential-bearing operation.
+    # write_credentials puts a live OAuth access token in
+    # <tmp>/claude-config-startup-probe-<mode>-<pid>/.credentials.json (0600),
+    # and config.cleanup() in the `finally` is the only thing that removes it —
+    # so a raise anywhere after the write and before the try (a missing binary,
+    # a full /tmp, an error building argv or env) used to strand a real token on
+    # disk indefinitely.  TaskConfigDir CONSTRUCTION stays outside: no token
+    # exists until write_credentials, and `config` must be bound before the
+    # `finally` that cleans it can refer to it.
     try:
+        if token_pair is not None:
+            config.write_credentials(token_pair[1])
+
+        stub_dir = Path(tempfile.mkdtemp(prefix='startup_probe_stubs_'))
+        argv, temp_paths = _build_argv(
+            mode,
+            session_id=session_id,
+            prompt=prompt,
+            model=model,
+            permission_mode=permission_mode,
+            stub_dir=stub_dir,
+            hold_secs=hold_secs,
+        )
+        env = _spawn_env(config_dir, token_pair[1] if token_pair else None)
+
+        # Capture files, NOT pipes — see _drain_exit: an undrained PIPE blocks
+        # the child once ~64 KB of startup chatter fills it, and this parent
+        # does not drain until the sampling window closes.
+        stdout_path = stub_dir / 'probe-stdout.bin'
+        stderr_path = stub_dir / 'probe-stderr.bin'
+        stdout_fh = stdout_path.open('wb')
+        stderr_fh = stderr_path.open('wb')
+
+        # Stamped last, immediately before the spawn, so every sample offset
+        # still measures from the spawn rather than from setup.
+        epoch = time.time()
+        start = time.monotonic()
+
         # start_new_session=True mirrors cli_invoke._run_subprocess's spawn shape,
         # so the observed process-group / children topology is production's.
         proc = subprocess.Popen(  # noqa: S603
@@ -986,17 +1007,30 @@ def run_live_probe(
         for observation in observations:
             observation['run_exit'] = exit_provenance
     finally:
-        stdout_fh.close()
-        stderr_fh.close()
+        # None-safe throughout: the try now opens before these exist, so any of
+        # them can still be its sentinel here.  And ordered least-to-most
+        # important, with the credential dir LAST but unconditionally reached —
+        # a failure while tidying a stub dir must not be able to skip the one
+        # piece of teardown that has security consequences.
+        if stdout_fh is not None:
+            stdout_fh.close()
+        if stderr_fh is not None:
+            stderr_fh.close()
         if proc is not None and proc.poll() is None:
             proc.kill()
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=10)
         for path in temp_paths:
             path.unlink(missing_ok=True)
-        for stub in sorted(stub_dir.glob('*')):
-            stub.unlink(missing_ok=True)
-        stub_dir.rmdir()
+        if stub_dir is not None:
+            for stub in sorted(stub_dir.glob('*')):
+                stub.unlink(missing_ok=True)
+            # Suppressed: a stub dir left non-empty (a subdirectory the glob
+            # cannot unlink, a file the child recreated) would otherwise raise
+            # OUT of the finally, replacing the original exception with a
+            # misleading OSError and skipping config.cleanup() below.
+            with contextlib.suppress(OSError):
+                stub_dir.rmdir()
         if not keep_config_dir:
             config.cleanup()
     return observations
