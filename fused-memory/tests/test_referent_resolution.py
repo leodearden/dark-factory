@@ -753,6 +753,87 @@ class TestMalformedDeclarationIsRejectedLoudly:
         with pytest.raises(InputValidationError):
             resolve_referents(declared=[entry], metadata={}, content='', group_id=GROUP)
 
+    @pytest.mark.parametrize(
+        'entry',
+        [
+            {'kind': ['task'], 'id': 1},
+            {'kind': {'a': 1}, 'id': 1},
+            {'kind': 3, 'id': 1},
+            {'kind': None, 'id': 1},
+            {'kind': True, 'id': 1},
+        ],
+        ids=['list', 'dict', 'int', 'none', 'bool'],
+    )
+    def test_a_non_string_kind_is_rejected(self, entry):
+        """``declared`` is caller-supplied JSON off an MCP tool argument, so a
+        confused agent can reach every one of these. An UNHASHABLE kind is the
+        sharp case: ``Referent.__post_init__``'s ``self.kind not in
+        _KIND_LABELS`` membership test raises ``TypeError``, which is not a
+        ``ValueError``, so the existing ``except ValueError`` around the
+        construction structurally cannot convert it — and δ's ``except
+        InputValidationError`` gate would take an unhandled exception instead of
+        emitting a remediation message."""
+        with pytest.raises(InputValidationError):
+            resolve_referents(declared=[entry], metadata={}, content='', group_id=GROUP)
+
+    @pytest.mark.parametrize(
+        'entry',
+        [
+            {'id': 1, 'project_id': 5},
+            {'id': 1, 'project_id': ['reify']},
+            {'id': 1, 'project_id': {'a': 1}},
+            {'id': 1, 'project_id': True},
+        ],
+        ids=['int', 'list', 'dict', 'bool'],
+    )
+    def test_a_truthy_non_string_project_id_is_rejected(self, entry):
+        """These leak ``AttributeError: ... has no attribute 'startswith'``
+        from inside ``is_path_shaped_name`` — again a type δ's gate does not
+        catch."""
+        with pytest.raises(InputValidationError):
+            resolve_referents(declared=[entry], metadata={}, content='', group_id=GROUP)
+
+    @pytest.mark.parametrize(
+        'entry',
+        [
+            {'id': 1, 'project_id': 0},
+            {'id': 1, 'project_id': []},
+            {'id': 1, 'project_id': {}},
+            {'id': 1, 'project_id': False},
+        ],
+        ids=['zero', 'empty-list', 'empty-dict', 'false'],
+    )
+    def test_a_falsy_non_string_project_id_is_rejected(self, entry):
+        """The sharper half, and the one a naive fix misses: ``entry.get(
+        'project_id') or ''`` swallows every FALSY value, so a ``[]``/``0``
+        typo SILENTLY mints an OWN-project referent — the identical
+        confidently-wrong-about-which-project outcome the unknown-key
+        ('projectId') rejection already guards against, arriving through a
+        different door. Validating AFTER the ``or ''`` would still let these
+        through, which is why the check must read the RAW value."""
+        with pytest.raises(InputValidationError):
+            resolve_referents(declared=[entry], metadata={}, content='', group_id=GROUP)
+
+    @pytest.mark.parametrize(
+        'entry',
+        [
+            {'id': 1},
+            {'kind': 'task', 'id': 1},
+            {'id': 1, 'project_id': None},
+            {'id': 1, 'project_id': ''},
+        ],
+        ids=['bare', 'explicit-kind', 'none-project-id', 'empty-project-id'],
+    )
+    def test_legitimate_absence_is_still_accepted(self, entry):
+        """POSITIVE non-regression, so the type checks harden types without
+        over-reaching into rejecting a caller who simply omitted the key.
+        ``None`` and ``''`` are legitimate absence, not a typo."""
+        resolution = resolve_referents(
+            declared=[entry], metadata={}, content='', group_id=GROUP
+        )
+        assert resolution.referents == (Referent(kind='task', number='1'),)
+        assert resolution.source == 'declared'
+
     def test_an_unknown_key_is_rejected_rather_than_ignored(self):
         """A camelCase typo would otherwise SILENTLY resolve to an
         OWN-project referent — a confidently wrong answer about which project
@@ -825,6 +906,62 @@ class TestMalformedDeclarationIsRejectedLoudly:
                 content='Fixed the bug in Task 3127.',
                 group_id=GROUP,
             )
+
+    @pytest.mark.parametrize(
+        'declared',
+        [
+            'task:3127',
+            [3127],
+            [{'kind': 'task', 'id': 3127, 'projectId': 'reify'}],
+            [{'kind': 'task'}],
+            [{'id': '3127a'}],
+            [{'id': True}],
+            [{'kind': ['task'], 'id': 1}],
+            [{'kind': {'a': 1}, 'id': 1}],
+            [{'kind': 3, 'id': 1}],
+            [{'id': 1, 'project_id': 5}],
+            [{'id': 1, 'project_id': []}],
+            [{'id': 1, 'project_id': False}],
+            [{'kind': 'escalation', 'id': 3127}],
+            [{'kind': 'task', 'id': 132, 'project_id': '../etc'}],
+        ],
+        ids=[
+            'non-list',
+            'non-dict-entry',
+            'unknown-key',
+            'missing-id',
+            'bad-id',
+            'bool-id',
+            'unhashable-kind-list',
+            'unhashable-kind-dict',
+            'non-str-kind',
+            'truthy-non-str-project-id',
+            'falsy-non-str-project-id',
+            'false-project-id',
+            'unregistered-kind',
+            'path-shaped-project-id',
+        ],
+    )
+    def test_every_malformed_shape_leaks_exactly_one_exception_type(self, declared):
+        """THE CONTRACT ITSELF. ``_declared_referents``'s docstring promises
+        "δ's boundary sees ONE exception type"; this is what makes the promise
+        CHECKABLE rather than aspirational, and it is what the previously
+        all-passing suite lacked.
+
+        Caught as bare ``Exception`` and re-asserted, so a leak reports as a
+        readable "left as TypeError" failure rather than as an error δ's gate
+        would silently take unhandled in production.
+        """
+        try:
+            resolve_referents(declared=declared, metadata={}, content='', group_id=GROUP)
+        except Exception as exc:  # noqa: BLE001 — the assertion IS the type check
+            assert isinstance(exc, InputValidationError), (
+                f'{declared!r} left _declared_referents as '
+                f'{type(exc).__name__}, which δ\'s `except InputValidationError` '
+                f'gate does not catch: {exc}'
+            )
+        else:
+            pytest.fail(f'{declared!r} was accepted rather than rejected')
 
 
 class TestDeclaredTriState:
