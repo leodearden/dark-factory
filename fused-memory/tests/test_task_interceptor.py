@@ -1256,10 +1256,13 @@ async def test_curator_combine_preserves_target_gate_markers(
     the three combine markers.
     """
     existing_raw = json.dumps(_GATE_TARGET_METADATA)
+    # status must be 'pending' for the combine to be eligible at all
+    # (task 4035); this test is about metadata merge semantics, and the
+    # status it stages is incidental.
     taskmaster.get_task = AsyncMock(
         return_value={
             'id': '50',
-            'status': 'blocked',
+            'status': 'pending',
             'title': 'Test Task',
             'metadata': existing_raw,
         }
@@ -1467,7 +1470,9 @@ async def test_curator_combine_allows_ungated_candidate_into_gated_target(
     Guards against an over-broad refusal in the exact direction the fix is
     meant to preserve — and re-checks that the target's gate survives.
     """
-    existing_raw = _set_target(taskmaster, _GATE_TARGET_METADATA, status='blocked')
+    # Default status='pending' — required for combine eligibility (task 4035);
+    # the gate semantics under test here are independent of status.
+    existing_raw = _set_target(taskmaster, _GATE_TARGET_METADATA)
     recorded = _record_merged_metadata(taskmaster, existing_raw)
     curator_interceptor._curator = _mock_curator(_combine_decision('folds into the gate'))
 

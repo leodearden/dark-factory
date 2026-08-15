@@ -76,6 +76,7 @@ from fused_memory.middleware.task_curator import (
     PreparedCandidate,
     TaskCurator,
     flatten_task_tree,
+    is_combine_eligible_status,
     normalize_title,
 )
 from fused_memory.models.reconciliation import (
@@ -2140,11 +2141,17 @@ class TaskInterceptor:
             )
             return None
 
+        # ── Guard: the target must still be combine-ELIGIBLE right now ──
+        # Shared with the curator's selection snapshot (task_curator's
+        # is_combine_eligible_status) so the two cannot drift apart again —
+        # the hand-copied `status == 'pending'` that used to live here as
+        # `in {'done','cancelled'}` let 20.2% of combines rewrite targets
+        # that had moved on since selection (task 4035).
         target_status = str(target.get('status', '') or '')
-        if target_status in {'done', 'cancelled'}:
+        if not is_combine_eligible_status(target_status):
             logger.warning(
-                'combine-guard: target %s has terminal status %r — aborting '
-                'combine to avoid silently losing candidate work',
+                'combine-guard: target %s is not combine-eligible (status=%r) — '
+                'aborting combine to avoid silently losing candidate work',
                 decision.target_id,
                 target_status,
             )
