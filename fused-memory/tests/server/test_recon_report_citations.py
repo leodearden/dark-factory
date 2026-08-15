@@ -1481,6 +1481,100 @@ class TestCiteTaskFoldPurgeLogging:
         # Discriminates this fold from the entity-scoped one.
         assert 'project_scoped' in message, message
 
+    @pytest.mark.asyncio
+    async def test_entity_scoped_fold_logs_purged_finding_content(self, caplog):
+        """Entity-scoped fold (task-2432): the null-task_id finding whose
+        citation derives a signature already held by a top-level task_id
+        finding is purged BY cite_task. Same five mandated fields, and the
+        message must name a different fold than the project-scoped one.
+
+        Uses the reverse-order shape (top-level task_id filed FIRST, null
+        one cites second) because that is the only ordering whose fold runs
+        inside cite_task: in the other ordering add_finding's own signature
+        lookup collapses the duplicate before cite_task is ever reached, so
+        it never exercises this purge site.
+        """
+        state, _ = self._make_state()
+        state.start_report(
+            run_id='run-1', stage='task_knowledge_sync', project_id='dark_factory'
+        )
+
+        occ2 = state.add_finding(
+            run_id='run-1', severity='low', category='memory_stale',
+            description='occ2 desc', suggested_action='a',
+            task_id='2405', flag_type='cross_project',
+        )
+        assert 'finding_id' in occ2, occ2
+        fid2 = occ2['finding_id']
+
+        occ1 = state.add_finding(
+            run_id='run-1', severity='high', category='memory_stale',
+            description='occ1 desc, worded differently and lost on fold',
+            suggested_action='reconcile the stale memory by hand',
+            task_id=None, flag_type='cross_project',
+        )
+        assert 'finding_id' in occ1, occ1
+        fid1 = occ1['finding_id']
+        assert fid1 != fid2
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.server.recon_report'):
+            cite1 = await state.cite_task('run-1', fid1, 'dark_factory', '2405')
+
+        # Return contract unchanged.
+        assert cite1.get('error') == 'duplicate_finding'
+        assert cite1.get('existing_finding_id') == fid2
+        assert state._resolve_finding('run-1', fid1) is None
+
+        matching = _fold_purge_warnings(caplog)
+        assert len(matching) == 1, [r.getMessage() for r in caplog.records]
+        message = matching[0]
+
+        # The five MANDATED items.
+        assert fid1 in message, message  # purged finding_id
+        assert 'task_knowledge_sync' in message, message  # purged finding's stage
+        assert 'occ1 desc, worded differently and lost on fold' in message, message
+        assert 'reconcile the stale memory by hand' in message, message
+        assert fid2 in message, message  # surviving anchor
+
+        # Discriminates this fold from the project-scoped one.
+        assert 'entity_scoped' in message, message
+        assert 'project_scoped' not in message, message
+
+    @pytest.mark.asyncio
+    async def test_non_folding_cite_task_emits_no_purge_warning(self, caplog):
+        """Negative control: an ordinary cite_task, and a second finding
+        citing a DIFFERENT external task, must both succeed silently. A
+        purge WARNING here would mean the log fires on the success path.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='run-1', stage='reconciler', project_id='dark_factory')
+
+        f1 = state.add_finding(
+            run_id='run-1', severity='low', category='cross_project',
+            description='desc A', suggested_action='a',
+            task_id=None, flag_type=None,
+        )
+        f2 = state.add_finding(
+            run_id='run-1', severity='low', category='cross_project',
+            description='desc B', suggested_action='a',
+            task_id=None, flag_type='other_flag',
+        )
+        fid1, fid2 = f1['finding_id'], f2['finding_id']
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.server.recon_report'):
+            cite1 = await state.cite_task('run-1', fid1, 'dark_factory', '2405')
+            cite2 = await state.cite_task('run-1', fid2, 'dark_factory', '2406')
+
+        assert 'error' not in cite1, cite1
+        assert 'error' not in cite2, cite2
+
+        assert _fold_purge_warnings(caplog) == [], [r.getMessage() for r in caplog.records]
+
+        report = state.get_assembled_report('run-1', 'reconciler')
+        assert report is not None
+        ids = [item['finding_id'] for item in report['flagged_items']]
+        assert ids == [fid1, fid2]
+
 
 # ---------------------------------------------------------------------------
 # task-2425 step-3: TestCiteTaskFoldKeyClearedOnDelete — RED until step-4
