@@ -626,6 +626,37 @@ class TestBlendComposite:
             0.95, 1.0, 1.0, tests_pass=None, plan_only=True, no_plan=True,
         ) == 0.0
 
+    def test_the_no_plan_gate_is_unconditional_not_scoped_to_plan_only(self):
+        """Pins metrics.py:480-483's design claim: the gate is UNCONDITIONAL,
+        not ``if plan_only and no_plan``, so a caller cannot silently bypass it
+        by forgetting the *plan_only* flag — a defence-in-depth contract of
+        this PURE function, deliberately exercised here at a shape
+        report.py:752 never itself builds (it always passes ``plan_only``
+        alongside ``no_plan``).
+
+        Both pre-existing no_plan tests above also pass ``plan_only=True``, so
+        before this test the source could be relaxed to
+        ``if plan_only and no_plan:`` with the whole suite still green
+        (MEASURED: 428 passed across the eval sweep with that mutant in
+        place). ``plan_only`` is therefore OMITTED here — not passed as
+        ``False`` — to exercise the exact "forgot the flag" hazard the
+        docstring cites, the same omit-the-flag idiom the default-behaviour
+        tests above use.
+
+        ``tests_pass=True`` is deliberate, not incidental: under ``None`` or
+        ``False`` the FIRST gate would already return ``0.0``, and the
+        assertion would pass under the mutant too, proving nothing about the
+        second gate.
+        """
+        from orchestrator.evals.metrics import blend_composite
+
+        assert blend_composite(
+            0.9, 1.0, 1.0, tests_pass=True, no_plan=True,
+        ) == 0.0
+        assert blend_composite(
+            1.0, 0.5, 0.5, tests_pass=True, no_plan=True,
+        ) == 0.0
+
     def test_no_plan_defaults_false_so_every_existing_blend_is_identical(self):
         """Additive: the default leaves the plan-only path byte-identical."""
         from orchestrator.evals.metrics import blend_composite
