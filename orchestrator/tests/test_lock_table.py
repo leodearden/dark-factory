@@ -12,10 +12,16 @@ test_scheduler.py alongside TestModuleLockTable / TestHierarchicalLocking.
 
 from __future__ import annotations
 
+import logging
+from datetime import UTC, datetime, timedelta
+
 import pytest
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.scheduler import ModuleLockTable
+
+#: Fixed park-install instant for the park-age tests (task 3823 / PRD task η).
+PARK_T0 = datetime(2026, 8, 1, 0, 0, 0, tzinfo=UTC)
 
 
 def _lt(lock_depth: int = 2) -> ModuleLockTable:
@@ -535,3 +541,156 @@ class TestForceClear:
         modules, restored = lt.force_clear('nobody')
         assert modules == []
         assert restored == []
+
+
+# ===========================================================================
+# Park age: injectable wall clock + the age reader (task 3823 / PRD task η)
+# ===========================================================================
+#
+# C7 refuses backfill through a park older than backfill_max_park_age_secs.
+# Today `_park_install_at` is stamped with a bare `datetime.now(UTC)`
+# (scheduler.py:998) — uninjected, so no test can drive a park to a chosen
+# age without poking a private dict.  These tests assert the seam.
+
+
+class TestParkInstallClock:
+    """``ModuleLockTable`` stamps park installs from an injectable wall clock."""
+
+    def test_injected_wall_clock_stamps_installed_at(self):
+        lt = ModuleLockTable(
+            OrchestratorConfig(max_per_module=1),
+            wall_time_source=lambda: PARK_T0,
+        )
+
+        lt.install_parks('P', ['m1'], priority='medium')
+
+        assert lt.snapshot_parks()['P']['installed_at'] == PARK_T0.isoformat()
+
+    def test_default_wall_clock_still_stamps_a_parseable_iso_utc_string(self):
+        """No injection -> the real clock, and the stamp stays round-trippable."""
+        lt = _lt()
+
+        lt.install_parks('P', ['m1'], priority='medium')
+
+        stamp = lt.snapshot_parks()['P']['installed_at']
+        parsed = datetime.fromisoformat(stamp)
+        assert parsed.tzinfo is not None, f'stamp must be tz-aware; got {stamp!r}'
+        assert parsed.utcoffset() == timedelta(0), (
+            f'stamp must be UTC; got {stamp!r}'
+        )
+
+    def test_scheduler_passes_its_own_wall_clock_down_to_the_lock_table(self):
+        """Scheduler-level tests must be able to control park age end-to-end.
+
+        The Scheduler already injects its wall clock into ``_emit_lock_event``;
+        park stamps must share that same epoch, or an age computed against
+        ``Scheduler._wall_now()`` would be measured across two unrelated clocks.
+        """
+        from orchestrator.scheduler import Scheduler
+
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            wall_time_source=lambda: PARK_T0,
+        )
+
+        scheduler.lock_table.install_parks('P', ['m1'], priority='medium')
+
+        assert scheduler.lock_table.snapshot_parks()['P']['installed_at'] == (
+            PARK_T0.isoformat()
+        )
+
+    def test_second_install_does_not_refresh_the_stamp(self):
+        """``setdefault`` semantics are load-bearing, not incidental.
+
+        C7's ``park_age(p)`` means the owner's TOTAL wait.  A stamp refreshed
+        on every re-install would reset the age each time the owner re-parked,
+        so an indefinitely-starving park would read as permanently fresh and
+        keep admitting backfillers through it — the precise failure the age
+        cutoff exists to stop.
+        """
+        clock = {'now': PARK_T0}
+        lt = ModuleLockTable(
+            OrchestratorConfig(max_per_module=1),
+            wall_time_source=lambda: clock['now'],
+        )
+        lt.install_parks('P', ['m1'], priority='medium')
+
+        clock['now'] = PARK_T0 + timedelta(seconds=900)
+        lt.install_parks('P', ['m2'], priority='medium')
+
+        assert lt.snapshot_parks()['P']['installed_at'] == PARK_T0.isoformat()
+
+
+class TestParkAgeSecs:
+    """``park_age_secs(owner, *, now)`` — the READ that gates admission.
+
+    ``None`` means "age unknown => the caller must REFUSE".  This is
+    deliberately the OPPOSITE of the dashboard's ``_park_age_seconds``
+    (dashboard/src/dashboard/data/scheduler.py:297-328), which fails soft to
+    0 for display.  A soft 0 here would make an unreadable park look brand
+    new and ADMIT a backfill through it — fail-soft in the unsafe direction.
+    """
+
+    def test_age_is_now_minus_install(self):
+        lt = ModuleLockTable(
+            OrchestratorConfig(max_per_module=1),
+            wall_time_source=lambda: PARK_T0,
+        )
+        lt.install_parks('P', ['m1'], priority='medium')
+
+        age = lt.park_age_secs('P', now=PARK_T0 + timedelta(seconds=900))
+
+        assert age == pytest.approx(900.0)
+
+    def test_unknown_owner_is_none_not_zero(self):
+        lt = _lt()
+
+        assert lt.park_age_secs('never-parked', now=PARK_T0) is None
+
+    def test_unparseable_stamp_is_none_and_warns(self, caplog):
+        lt = _lt()
+        lt.install_parks('P', ['m1'], priority='medium')
+        lt._park_install_at['P'] = 'not-a-timestamp'
+
+        with caplog.at_level(logging.WARNING):
+            age = lt.park_age_secs('P', now=PARK_T0)
+
+        assert age is None, (
+            'an unreadable stamp must refuse, not read as a fresh park'
+        )
+        assert any('P' in record.getMessage() for record in caplog.records), (
+            'the warning must name the owner whose stamp could not be parsed; '
+            f'got {[r.getMessage() for r in caplog.records]}'
+        )
+
+    def test_future_stamp_clamps_to_zero(self):
+        """Clock skew must not read as a NEGATIVE age.
+
+        A negative age would sail under any ``age > max_park_age_secs`` cutoff,
+        so an NTP step backwards would silently re-open admission through
+        arbitrarily old parks.
+        """
+        lt = ModuleLockTable(
+            OrchestratorConfig(max_per_module=1),
+            wall_time_source=lambda: PARK_T0 + timedelta(seconds=600),
+        )
+        lt.install_parks('P', ['m1'], priority='medium')
+
+        assert lt.park_age_secs('P', now=PARK_T0) == 0.0
+
+    def test_age_measures_total_wait_across_reinstalls(self):
+        """The age tracks the FIRST install, matching ``setdefault``."""
+        clock = {'now': PARK_T0}
+        lt = ModuleLockTable(
+            OrchestratorConfig(max_per_module=1),
+            wall_time_source=lambda: clock['now'],
+        )
+        lt.install_parks('P', ['m1'], priority='medium')
+        clock['now'] = PARK_T0 + timedelta(seconds=300)
+        lt.install_parks('P', ['m2'], priority='medium')
+
+        age = lt.park_age_secs('P', now=PARK_T0 + timedelta(seconds=900))
+
+        assert age == pytest.approx(900.0), (
+            'age must run from the FIRST install (total wait), not the latest'
+        )
