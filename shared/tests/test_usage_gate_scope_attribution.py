@@ -464,6 +464,68 @@ class TestScopedCapHitReleasesProbeSlot:
         assert lease is not None
         assert lease.name == 'a'
 
+    # --- through the real invoke_slot() CM, not a hand-built InvokeSlot ----
+    #
+    # Every comment justifying this fix reasons about the interaction between
+    # ``_settled`` and ``invoke_slot()``'s ``__aexit__`` safety net, so at
+    # least one test per entry point must actually drive that CM. The
+    # discriminating assertion is the phase check INSIDE the block: the safety
+    # net has not run yet there, so an AVAILABLE phase can only have come from
+    # report()/detect_cap_hit() itself. Without it, a regression that stopped
+    # setting ``_settled`` would re-arm the net, mask the bug, and leave every
+    # hand-built-slot test above still green.
+
+    async def _capped_via_cm(self, gate, drive):
+        """Enter the real CM at PROBE_IN_FLIGHT, run *drive*, assert in-block.
+
+        ``acct.probing = True`` is the same legacy-shim precondition
+        ``_probe_in_flight_slot`` uses; here ``invoke_slot()``'s own
+        ``before_invoke(scope=...)`` takes the real claim.
+        """
+        acct = gate._accounts[0]
+        acct.probing = True
+        async with gate.invoke_slot(scope=SCOPE) as slot:
+            assert acct.phase == AccountPhase.PROBE_IN_FLIGHT
+            assert gate._open.is_set() is False
+            gen_at_claim = acct.generation
+            drive(slot)
+            # __aexit__ has NOT run — this release is the slot method's own.
+            assert slot._settled is True
+            assert acct.phase == AccountPhase.AVAILABLE
+        # One transition across the whole block: the claim was released
+        # exactly once and the safety net added no second edge.
+        assert acct.generation == gen_at_claim + 1
+        return acct
+
+    async def test_scoped_cap_hit_through_real_cm_releases_probe(self):
+        gate = make_gate(['a'])
+        target = datetime(2026, 5, 1, 18, 0, tzinfo=UTC)
+
+        acct = await self._capped_via_cm(
+            gate, lambda slot: slot.report(CapHit(resets_at=target, reason='x')),
+        )
+
+        assert acct.scope_caps[SCOPE].capped is True  # S5 attribution preserved
+        assert acct.phase == AccountPhase.AVAILABLE
+        assert gate._open.is_set() is True
+        lease = await asyncio.wait_for(gate.before_invoke(), timeout=1.0)
+        assert lease is not None
+        assert lease.name == 'a'
+
+    async def test_scoped_detect_cap_hit_through_real_cm_releases_probe(self):
+        gate = make_gate(['a'])
+
+        acct = await self._capped_via_cm(
+            gate, lambda slot: slot.detect_cap_hit(CAP_STDERR, ''),
+        )
+
+        assert acct.scope_caps[SCOPE].capped is True
+        assert acct.phase == AccountPhase.AVAILABLE
+        assert gate._open.is_set() is True
+        lease = await asyncio.wait_for(gate.before_invoke(), timeout=1.0)
+        assert lease is not None
+        assert lease.name == 'a'
+
 
 # ===========================================================================
 # Step 7 — end-to-end β: invoke_with_cap_retry derives + threads scope
