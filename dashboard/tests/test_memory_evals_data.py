@@ -1508,6 +1508,41 @@ class TestEscalationJoin:
         assert _only(payload['evals'][0]['metrics'], 'alarmed-open')['escalation'] is not None
         assert unmatched['esc-unmatched']['reason'] == 'no_matching_verdict'
 
+    def test_a_queue_record_that_is_not_an_object_is_named(self, tmp_path: Path) -> None:
+        """A queue file that parses but is not a JSON object is a genuine discard.
+
+        ``load_queue_escalations`` validates only that a file PARSES, not that
+        its top level is an object, so a stray list or string at the top of a
+        queue file arrives here as a non-dict entry in ``records`` and would
+        otherwise hit a bare ``continue``.  That is exactly the third disposal
+        path the module docstring declares ("parses but is not the expected
+        type"), so it is named ``malformed_escalation_record`` rather than
+        dropped silently.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _join_tree(tmp_path)
+        _dump(esc_dir / 'esc-list.json', ['not', 'an', 'object'])
+        _dump(esc_dir / 'esc-string.json', 'a bare string')
+
+        payload = build_memory_evals(root, esc_dir)
+
+        named = [i for i in payload['issues'] if i['kind'] == 'malformed_escalation_record']
+        assert len(named) == 2
+        assert all(i['path'] == str(esc_dir) for i in named)
+        details = ' '.join(i['detail'] for i in named)
+        assert 'list' in details
+        assert 'str' in details
+        assert payload['issue_count'] == len(payload['issues'])
+        assert set(payload) == _PAYLOAD_KEYS
+        # The discard does not poison the rest of the join.
+        assert _only(payload['evals'][0]['metrics'], 'alarmed-open')['escalation'] is not None
+        assert 'esc-unmatched' in [e['id'] for e in payload['unmatched_escalations']]
+        # Never read as escalations at all -- not merely unlinked from a row.
+        unmatched_ids = [e['id'] for e in payload['unmatched_escalations']]
+        assert 'esc-list' not in unmatched_ids
+        assert 'esc-string' not in unmatched_ids
+
 
 # ---------------------------------------------------------------------------
 # a verdict value outside the closed M2 vocabulary
