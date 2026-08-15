@@ -344,3 +344,73 @@ class TestFindMergeSha:
         _git(['checkout', '-q', 'main'], repo)
         _git(['merge', '--no-ff', 'task/8030', '-m', 'Merge task/8030 into main'], repo)
         assert driver.find_merge_sha(repo, '803') is None
+
+
+# ---------------------------------------------------------------------------
+# _mint_one — a planRate-only fixture must not claim a landed verify outcome
+# ---------------------------------------------------------------------------
+
+def _planrate_row(**over: object) -> dict:
+    row = {
+        'task_id': '3586',
+        'project': 'reify',
+        'project_root': '/home/leo/src/reify',
+        'title': 'PNv2 vertex-side attribute widening',
+        'description': 'Widen BRepKind with Vertex and seed per-op attributes.',
+        'complexity': 'complex',
+        'modules': ['kernel'],
+        'status': 'cancelled',
+        'merge_sha': None,
+        'baseline_sha': 'a' * 40,
+        'baseline_source': 'timestamp_walk',
+        'mint_mode': 'planrate_only',
+    }
+    row.update(over)
+    return row
+
+
+def _mint(row: dict) -> dict:
+    """Mint one record. The planRate-only branch touches no git and no db."""
+    import asyncio
+    sampler = driver._import_sampler()
+    return asyncio.run(driver._mint_one(
+        sampler, row, sampled_at='2026-08-04T00:00:00+00:00', seed=3631,
+        ceilings={'max_architect_turns': 120, 'timeout_minutes': 180},
+    ))
+
+
+class TestPlanRateOnlyVerifyOutcome:
+    def test_does_not_claim_the_landed_source(self) -> None:
+        # build_fixture_record stamps `{source:'landed', passed:True}`
+        # unconditionally, on the premise that the task merged to main. A
+        # planRate-only fixture has no landed post-commit at all, so that
+        # premise — and the gate result it implies — is fabricated.
+        rec = _mint(_planrate_row())
+        assert rec['verify_outcome']['source'] == 'unavailable'
+        assert rec['verify_outcome']['passed'] is None
+
+    def test_records_why_the_outcome_is_unavailable(self) -> None:
+        rec = _mint(_planrate_row())
+        reason = rec['verify_outcome']['reason']
+        assert reason.strip()
+        # Self-describing: a reader of the JSON alone learns the terminal
+        # status that makes the landed claim impossible.
+        assert 'cancelled' in reason
+
+    def test_carries_the_verify_commands_for_provenance(self) -> None:
+        rec = _mint(_planrate_row())
+        sampler = driver._import_sampler()
+        assert rec['verify_outcome']['commands'] == \
+            sampler.default_verify_commands('reify')
+
+    def test_carries_the_terminal_task_status(self) -> None:
+        for status in ('cancelled', 'done'):
+            rec = _mint(_planrate_row(status=status))
+            assert rec['provenance']['task_status'] == status
+
+    def test_a_done_planrate_candidate_is_still_unavailable(self) -> None:
+        # `done` does not rescue the claim: the gates passed at SOME commit,
+        # but this fixture cannot name it, so it cannot assert one.
+        rec = _mint(_planrate_row(status='done'))
+        assert rec['verify_outcome']['source'] == 'unavailable'
+        assert "'done'" in rec['verify_outcome']['reason']

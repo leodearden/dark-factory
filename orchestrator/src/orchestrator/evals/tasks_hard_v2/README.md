@@ -66,3 +66,12 @@ of `timeout_minutes` and its headroom multiples are recorded in `CURATION.md`.
   naming the cause, plus `provenance.baseline_source` naming which rung of the
   baseline ladder produced their `pre_task_commit`. The omission is a positive
   recorded fact, not a silent empty block.
+
+  For the same reason they also carry **no landed `verify_outcome`**. The
+  `{source: 'landed', passed: true}` shape asserts "the task merged to `main`
+  ⇒ its gates passed at the post commit"; with no post commit that premise
+  does not hold, and for the one cancelled include (`reify_task_3586`) the
+  task never landed at all. These fixtures instead carry
+  `{source: 'unavailable', passed: null, commands: …, reason: …}`, with the
+  candidate's adjudicated terminal status mirrored into
+  `provenance.task_status` so the JSON is self-describing.

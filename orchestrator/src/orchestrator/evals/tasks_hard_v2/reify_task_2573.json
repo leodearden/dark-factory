@@ -37,16 +37,18 @@
     "seed": 3631,
     "plan_source": "unavailable",
     "baseline_source": "status_autocommit",
+    "task_status": "done",
     "reference_unavailable": "No single \"Merge task/2573 into main\" commit exists in /home/leo/src/reify (SPLIT / direct-landed, or several merges carry this id), so no landed post-commit is available to diff against. This fixture is planRate-only: it is scored on plan production, never on reference-diff similarity. Its pre_task_commit came from baseline rung 'status_autocommit'."
   },
   "verify_outcome": {
-    "source": "landed",
-    "passed": true,
+    "source": "unavailable",
+    "passed": null,
     "commands": {
       "test": "cargo test --workspace",
       "lint": "cargo clippy --workspace",
       "typecheck": ""
-    }
+    },
+    "reason": "No landed post-commit is available for task 2573 (terminal status 'done'), so there is no commit at which these gates can be claimed to have passed. This fixture is planRate-only and is never scored against a landed verify outcome; the commands are carried for provenance only."
   },
   "plan": null,
   "max_architect_turns": 120,

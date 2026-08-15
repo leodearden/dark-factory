@@ -373,6 +373,51 @@ class TestMintedPool:
             assert 'reference' not in f, f['id']
             assert f['provenance']['reference_unavailable'].strip(), f['id']
 
+    def test_planrate_only_fixtures_claim_no_landed_verify_outcome(
+        self, pool: list[dict], manifest: dict,
+    ) -> None:
+        # The same reasoning as the popped `reference`, applied to the gate
+        # result. `{source:'landed', passed:True}` asserts "the task merged to
+        # main ⇒ its gates passed at the post commit" — but a planRate-only
+        # fixture HAS no post commit (and reify_task_3586 was cancelled and
+        # never landed at all), so that claim would be a fabricated ground
+        # truth shipped on a majority of the pool.
+        by_id = _mint_modes(manifest)
+        for f in pool:
+            if by_id.get(f['id']) != 'planrate_only':
+                continue
+            outcome = f['verify_outcome']
+            assert outcome['source'] == 'unavailable', f['id']
+            assert outcome['passed'] is None, f['id']
+            assert outcome['reason'].strip(), f['id']
+            assert outcome['commands'] == f['verify_commands'], f['id']
+
+    def test_census_fixtures_carry_their_terminal_task_status(
+        self, pool: list[dict], manifest: dict,
+    ) -> None:
+        # The curation's adjudicated status travels WITH the fixture, so the
+        # cancelled case is self-describing from the JSON alone.
+        by_id = {}
+        repo_of_project = {'reify': 'reify', 'dark_factory': 'df',
+                           'know_live': 'kl'}
+        for c in manifest['candidates']:
+            if c['decision'] == 'include':
+                fid = f'{repo_of_project[c["project"]]}_task_{c["task_id"]}'
+                by_id[fid] = c['status']
+        for f in pool:
+            if f['id'] not in by_id:
+                continue  # continuity fixtures are not census candidates
+            assert f['provenance']['task_status'] == by_id[f['id']], f['id']
+
+    def test_the_cancelled_include_asserts_no_passing_gates(
+        self, pool: list[dict],
+    ) -> None:
+        # Named explicitly: reify_task_3586 is `status: cancelled` with an
+        # empty post_task_commit. A `passed: true` here would be flatly false.
+        rec = next(f for f in pool if f['id'] == 'reify_task_3586')
+        assert rec['provenance']['task_status'] == 'cancelled'
+        assert rec['verify_outcome']['passed'] is not True
+
 
 def _mint_modes(manifest: dict) -> dict[str, str]:
     repo_of_project = {'reify': 'reify', 'dark_factory': 'df', 'know_live': 'kl'}

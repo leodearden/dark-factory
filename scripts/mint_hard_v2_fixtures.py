@@ -1173,6 +1173,10 @@ async def _mint_one(sampler, row: dict, sampled_at: str, seed: int,
         cohort='fable-trial-v2-hard', sampled_at=sampled_at, seed=seed,
     )
     record['provenance']['baseline_source'] = row['baseline_source']
+    # The curation's terminal adjudication travels WITH the fixture. Without
+    # it a reader of the JSON alone cannot tell a landed task from a cancelled
+    # one, and the verify_outcome below would be an unattributable claim.
+    record['provenance']['task_status'] = row['status']
 
     if row['mint_mode'] == 'referenced':
         await _pin_or_record_failure(
@@ -1192,6 +1196,26 @@ async def _mint_one(sampler, row: dict, sampled_at: str, seed: int,
             f'pre_task_commit came from baseline rung '
             f'{row["baseline_source"]!r}.'
         )
+        # build_fixture_record stamps landed_verify_outcome unconditionally,
+        # and its contract is "the task merged to main => its gates passed at
+        # the post commit". That premise is exactly what fails here: there is
+        # no post commit (and for a cancelled candidate the task never landed
+        # at all), so `source: 'landed', passed: True` would be a fabricated
+        # ground truth. Same reasoning as the popped `reference` above —
+        # applied to the gate result instead of the diff.
+        record['verify_outcome'] = {
+            'source': 'unavailable',
+            'passed': None,
+            'commands': sampler.default_verify_commands(repo),
+            'reason': (
+                f'No landed post-commit is available for task '
+                f'{row["task_id"]} (terminal status {row["status"]!r}), so '
+                f'there is no commit at which these gates can be claimed to '
+                f'have passed. This fixture is planRate-only and is never '
+                f'scored against a landed verify outcome; the commands are '
+                f'carried for provenance only.'
+            ),
+        }
 
     # runner.py reads both straight off the task record (task.get with 50 / 60
     # defaults), so a fixture missing them silently runs at the wrong ceiling.
