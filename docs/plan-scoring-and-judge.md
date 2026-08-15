@@ -783,10 +783,65 @@ closing the cross-group route.
 | The **writer** | `run_architect_eval` gates the judge call site on `is_scorable_plan`, so no new incoherent cell is written | 3302 |
 | The **reader** | `report._plan_quality_score` floors a no-plan cell at read time, because the 2026-07-27 / 07-29 corpus is already on disk carrying the old shape | 3302 |
 
+### The validity bound: judged without a reference (task 3628)
+
+The two counts above are *failure* counts: something went wrong, and the
+treatment was to exclude or to floor. This third one is neither. It is not a
+failure cause, it changes no treatment, and it is **not** a third row of that
+table. What it records is that a cell's `plan_quality` is *real but unbounded* —
+the LLM judge produced it from an **empty `reference_diff`**, so it grades the
+plan on plausibility rather than on fidelity to the diff that actually landed.
+
+**Why a bound and not an exclusion or a floor.** The score is a genuine
+measurement: the architect ran, produced a scorable plan, and the judge scored
+it. Averaging those cells out would discard real data; flooring them would
+assert a failure nobody observed. So they stay — in `n`, in
+`mean_plan_quality`, in `plan_quality`, in `composite`, in `cost_usd` — at
+their real values. What is reduced is the *confidence* in the number, not the
+number. That is also what makes this count disjoint from both counts above: a
+`cap_tainted` cell has no `plan_quality` to bound at all, and a no-plan cell's
+score comes from the structural floor, which never consults a reference and is
+therefore valid ground-truth-independently.
+
+| Surface | Key | Rendered |
+|---|---|---|
+| Cell metrics | `judged_without_reference` | — |
+| Composite row | `plan_quality_judged_without_reference` | `pq_no_ref` on `format_composite_table`, beside `pq_excluded` / `pq_no_plan` |
+| θ table | `judged_without_reference`, per-config **and** report-level | `judged_without_reference` in the `plan_quality by config:` block, plus a trailer line stating the total against the scored pool (suppressed only when the bound is *measured* and zero) |
+
+**Absence is not `False`.** The marker is three-valued everywhere it is read.
+`EvalMetrics.to_dict` writes the key on *every* architect cell, so a healthy
+cell says `False` explicitly; a cell whose metrics predate task 3628 carries no
+key at all, and its validity was therefore never measured. The report layer
+keeps those apart (`report._judged_without_reference`): one keyless cell in a
+config's admitted pool makes that config's count — and the report-level total —
+`None`, rendered `-`, with `judged_without_reference_unmeasured` carrying how
+many cells drove it and the trailer printing `UNMEASURED` rather than being
+suppressed. Reporting `0` there would let a rebuild over the 2026-07-27 / 07-29
+corpus — the campaign this doc's provenance note says was judged blind on half
+the hard subset — render byte-identically to a campaign graded entirely against
+landed diffs, which is the very degradation σ exists to remove, reintroduced at
+the reader. It is the same read-time discipline `report._plan_quality_score`
+applies to the no-plan floor, and the same rule
+`scripts/run_fable_trial_v2_campaign.py` (task 3632) states as its rule 3 and
+enforces per cell with `MARKER_KEY not in metrics`; the two consumers of this
+one field must not answer the same question differently.
+
+**Provenance — this doc was already half-telling the story.** The
+`reify_task_12` cell cited above carried no `reference` block, and neither did
+`reify_task_27` or `df_task_18`: all three shipped with a top-level
+`post_task_commit` but nothing for `run_architect_eval` to read, so it built an
+empty diff and the judge scored plausibility. The 2026-07-29 v1 campaign graded
+half the hard subset that way — including `reify_task_12`, the fixture carrying
+the entire v1 result — and it was discoverable only by archaeology. Task 3628
+back-filled the three `reference` blocks *and* added the marker, so the next
+referenceless fixture is loud at run time — a `logger.warning` naming the task,
+and a count on both tables — instead of being found in the corpus months later.
+
 ### The derived reliability surface (task 3379)
 
-Those two counts are collected, but the figure an operator actually compares
-candidates on is the *ratio* over them. Task 3379 derives it — no new
+Those two *failure* counts are collected, but the figure an operator actually
+compares candidates on is the *ratio* over them. Task 3379 derives it — no new
 collection, no new predicate:
 
 ```

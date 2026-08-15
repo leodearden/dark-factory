@@ -306,6 +306,60 @@ def _is_unmeasurable(metrics: dict[str, Any]) -> bool:
     return _is_plan_only(metrics) and not _has_plan_quality_score(metrics)
 
 
+# The σ validity marker's key, spelled ONCE (task 3628). The sibling
+# definition is ``scripts/run_fable_trial_v2_campaign.py``'s ``MARKER_KEY``;
+# the two are kept in agreement by :func:`_judged_without_reference` below,
+# which implements that module's rule 3 verbatim.
+_JUDGED_WITHOUT_REFERENCE_KEY = 'judged_without_reference'
+
+
+def _judged_without_reference(metrics: dict[str, Any]) -> bool | None:
+    """Was this cell's ``plan_quality`` judged with NO reference diff?
+
+    THE ONE per-cell reading of the σ validity marker (task 3628), called by
+    both report surfaces so they cannot drift on the one rule that makes the
+    marker mean anything: **absence is not False**.
+
+    * ``True`` / ``False`` — the instrument measured this cell's validity.
+    * ``None`` — the metrics dict predates σ, so the cell's validity was NEVER
+      measured. Reading that back as ``False`` would let a rebuild over the
+      2026-07-27 / 07-29 corpus — which this doc's own provenance section says
+      was judged blind on half the hard subset — render ``0`` on every surface
+      and suppress the trailer entirely, byte-identically to a campaign whose
+      every score was graded against a real landed diff. That is precisely the
+      silent degradation σ exists to remove, re-introduced at the reader.
+
+    The rule is deliberately the SAME one
+    ``scripts/run_fable_trial_v2_campaign.py`` (task 3632) states as its rule
+    3 and enforces with ``MARKER_KEY not in metrics``. That script no longer
+    counts the marker itself — its per-candidate counter was retired in favour
+    of this module's architect-only aggregate (see :func:`_judged_blind_count`),
+    so the two surfaces now share ONE implementation of the rule rather than
+    two agreeing copies. Two readings of one field must not answer the same
+    question differently, least of all with the report — the surface an
+    operator actually reads — giving the reassuring answer.
+    It is also the same discipline :func:`_plan_quality_score` applies at READ
+    time for the no-plan floor, and for the same reason: the old corpus is
+    already on disk.
+    """
+    if _JUDGED_WITHOUT_REFERENCE_KEY not in (metrics or {}):
+        return None
+    return bool(metrics.get(_JUDGED_WITHOUT_REFERENCE_KEY))
+
+
+def _judged_blind_count(counted: int, unmeasured: int) -> int | None:
+    """Fold a per-config tally into a count, or ``None`` when ANY cell is keyless.
+
+    The aggregate twin of :func:`_judged_without_reference`: one unmeasured
+    cell makes the whole config's count unknowable. This IS the count task
+    3632's campaign script consumes — its own per-candidate counter was retired
+    in favour of this one, so the rule has a single home. Reporting the measured
+    cells' count instead would understate the bound while looking like a
+    complete answer.
+    """
+    return None if unmeasured else counted
+
+
 def _mean_plan_quality(scores: list[float]) -> float | None:
     """Reduce a pool of θ-rubric plan-quality scores to its mean (4 dp).
 
@@ -647,6 +701,11 @@ def build_composite_report(
             'plan_quality_scores': [],
             'plan_quality_cap_excluded': 0,
             'plan_quality_no_plan': 0,
+            'plan_quality_judged_without_reference': 0,
+            # …and how many admitted cells carry NO marker at all, which is a
+            # different fact from "marker False" and makes the count above
+            # unknowable rather than zero (task 3628 amendment).
+            'plan_quality_judged_without_reference_unmeasured': 0,
             # The $/usable-plan NUMERATOR (task 3379): spend over admitted
             # plan-only cells, summed under the SAME condition that fills
             # plan_quality_scores — see the accumulation site.
@@ -742,6 +801,23 @@ def build_composite_report(
             # discount. A no-plan cell's spend DOES land here — that is what
             # makes the figure $/usable plan rather than $/cell.
             acc['plan_cost_usd'] += cost
+            # …and the σ VALIDITY bound (task 3628) is counted under that SAME
+            # one admission decision, which is what makes it a strict subset of
+            # plan_quality_n and keeps it in lockstep with the θ surface's pool.
+            # Alone among the three counts this one changes NO number: the cell
+            # contributes its real score to the quality axis, the composite and
+            # the cost pools exactly as a healthy cell does. It neither excludes
+            # (cap_excluded) nor floors (no_plan) — it reports that the score,
+            # while real, was produced without ground truth to grade against, so
+            # only the CONFIDENCE attached to it is reduced.
+            # Read through THE shared accessor, so a cell written before σ
+            # landed lands in the UNMEASURED tally rather than being silently
+            # counted as validity-bounded=False.
+            marker = _judged_without_reference(m)
+            if marker is None:
+                acc['plan_quality_judged_without_reference_unmeasured'] += 1
+            elif marker:
+                acc['plan_quality_judged_without_reference'] += 1
         # Counted over ARCHITECT trials only, matching
         # build_plan_quality_report's architect-scoped cap_excluded — the two
         # exclusion surfaces describe the same cells and must not disagree. (A
@@ -819,6 +895,23 @@ def build_composite_report(
             # and were scored 0.0 — the content-failure counterpart of the
             # transport-failure count above.
             'plan_quality_no_plan': acc['plan_quality_no_plan'],
+            # …and how many of that same admitted pool were judged WITHOUT a
+            # reference diff (task 3628) — a validity bound on the
+            # plan_quality above, not a third way of removing cells from it.
+            # ``None`` (rendered '-') when ANY admitted cell predates the
+            # marker: the bound is then UNKNOWN, and a 0 there would read as
+            # "every score was graded against a landed diff" when in fact
+            # nothing measured whether any of them was.
+            'plan_quality_judged_without_reference': _judged_blind_count(
+                acc['plan_quality_judged_without_reference'],
+                acc['plan_quality_judged_without_reference_unmeasured'],
+            ),
+            # How many admitted cells drove that None — 1-of-50 unmeasured and
+            # 50-of-50 are very different situations to an operator, and the
+            # None alone cannot tell them apart.
+            'plan_quality_judged_without_reference_unmeasured': acc[
+                'plan_quality_judged_without_reference_unmeasured'
+            ],
             # The ADMITTED θ pool's size — the denominator both derived figures
             # below are taken over, carried on the row so each is verifiable
             # from the row ALONE rather than by re-deriving it from the θ
@@ -1343,8 +1436,8 @@ _PLAN_QUALITY_COLUMNS = (
     'invocation_error',
 )
 _PLAN_QUALITY_MEAN_COLUMNS = (
-    'config_name', 'n', 'cap_excluded', 'no_plan', 'plan_rate',
-    'mean_plan_quality',
+    'config_name', 'n', 'cap_excluded', 'no_plan', 'judged_without_reference',
+    'plan_rate', 'mean_plan_quality',
 )
 # The plan_quality cell of a cap-tainted row. Deliberately NOT a number and NOT
 # the bare '-' null sentinel (which already means "not an architect run"): a
@@ -1437,6 +1530,24 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
     or auth failure is a PERMANENT, candidate-specific configuration error. A
     single "cap-excluded" total would let the latter masquerade as the former
     and hide a config that can never run behind ``n=0, mean=None``.
+
+    A THIRD treatment, disjoint from both (eval-revival σ, task 3628):
+    ``judged_without_reference`` counts the admitted cells whose score is the
+    LLM judge's own number produced from an EMPTY reference diff — graded on
+    plausibility, never against the landed change. Unlike the other two this
+    changes NO number: the cell is KEPT AND SCORED, stays in ``n``, and its
+    score stays in ``mean_plan_quality``. It is a VALIDITY bound, not an
+    exclusion. Averaging these cells out would discard real measurements, while
+    reporting them silently is the defect σ exists to remove — the v1 campaign
+    judged half its hard subset this way and it was findable only by
+    archaeology. So: transport refusal → EXCLUDED + ``cap_excluded``; content
+    failure → FLOORED + ``no_plan``; judged blind → KEPT, SCORED, and FLAGGED.
+
+    That third count is ``None``, never ``0``, whenever any admitted cell
+    predates the marker (:func:`_judged_without_reference`), with
+    ``judged_without_reference_unmeasured`` carrying how many did — an
+    unmeasured bound and a measured-clean one are opposite findings and must
+    not render alike.
     """
     rows: list[dict[str, Any]] = []
     for result in results:
@@ -1451,6 +1562,16 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
             'plan_steps': result.metrics.get('plan_steps'),
             'cap_tainted': bool(result.metrics.get('cap_tainted')),
             'invocation_error': result.metrics.get('invocation_error'),
+            # The σ validity marker (task 3628) — read through THE shared
+            # accessor, NOT like cap_tainted above. cap_tainted's absence
+            # genuinely means "no infra failure was recorded"; this field's
+            # absence means the cell's validity was never measured at all, and
+            # collapsing that to False is the one mistake that would make the
+            # count reassuring instead of true. ``None`` is therefore a third
+            # value here and travels all the way to the rendered '-'.
+            'judged_without_reference': _judged_without_reference(
+                result.metrics
+            ),
             # The θ score this cell contributes to the aggregate, through THE
             # shared accessor (task 3302): the persisted float for a real plan,
             # a floored 0.0 for a cell that produced none, None when the cell is
@@ -1481,6 +1602,8 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
     scored: dict[str, list[float]] = defaultdict(list)
     excluded: dict[str, int] = defaultdict(int)
     no_plan: dict[str, int] = defaultdict(int)
+    judged_blind: dict[str, int] = defaultdict(int)
+    judged_blind_unmeasured: dict[str, int] = defaultdict(int)
     totals: dict[str, int] = defaultdict(int)
     by_cause: dict[str, int] = defaultdict(int)
     for row in rows:
@@ -1499,6 +1622,16 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
                 # DISJOINT from the exclusion above: this cell was measured and
                 # kept, at the 0.0 the accessor floored it to (task 3302).
                 no_plan[cfg] += 1
+            # Counted inside THIS branch on purpose (task 3628): the count is a
+            # strict subset of the admitted pool ``n`` reports, never of the
+            # excluded cells — a cap-tainted cell has no plan_quality to bound,
+            # so it belongs to cap_excluded alone. The keyless case is tallied
+            # separately rather than falling into the False arm: it is the pool
+            # membership that is measured here, not the validity.
+            if row['judged_without_reference'] is None:
+                judged_blind_unmeasured[cfg] += 1
+            elif row['judged_without_reference']:
+                judged_blind[cfg] += 1
             # THE shared accessor's answer (task 3302), not the raw persisted
             # score: a cell whose architect produced no plan lands here as a
             # floored 0.0, identically to build_composite_report's pool, so
@@ -1514,6 +1647,18 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
             # floored to 0.0 (task 3302). Disjoint from ``cap_excluded``: those
             # cells are not in ``n`` at all.
             'no_plan': no_plan[cfg],
+            # How many of those same ``n`` scored cells were judged WITHOUT a
+            # reference diff (task 3628). Unlike the two counts above this one
+            # subtracts nothing and floors nothing — the cells are in ``n`` and
+            # in the mean at their real scores; only the confidence is bounded.
+            # ``None`` when ANY of those cells predates the marker: the bound
+            # is then unknown, and 0 would assert a validity nobody measured.
+            'judged_without_reference': _judged_blind_count(
+                judged_blind[cfg], judged_blind_unmeasured[cfg],
+            ),
+            # …with the size of the unmeasured population beside it, so the
+            # None above is diagnosable from the row alone.
+            'judged_without_reference_unmeasured': judged_blind_unmeasured[cfg],
             'total': totals[cfg],
             # The RELIABILITY figure over the very same admitted pool ``n``
             # counts and ``mean_plan_quality`` averages (task 3379), through THE
@@ -1531,6 +1676,16 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
         'configs': configs,
         'cap_excluded': sum(excluded.values()),
         'cap_excluded_by_cause': {c: by_cause[c] for c in sorted(by_cause)},
+        # Report-level total, with the same absence rule as the per-config
+        # counts (task 3628): one keyless admitted cell ANYWHERE makes the
+        # campaign-wide bound unknown, so the total is None rather than a
+        # partial sum wearing the appearance of a complete one.
+        'judged_without_reference': _judged_blind_count(
+            sum(judged_blind.values()), sum(judged_blind_unmeasured.values()),
+        ),
+        'judged_without_reference_unmeasured': sum(
+            judged_blind_unmeasured.values()
+        ),
     }
 
 
@@ -1543,6 +1698,11 @@ def _format_plan_quality_mean_section(report: dict[str, Any]) -> list[str]:
     four of which produced no plan at all — reads as exactly that instead of
     looking like a mean over 22 comparable plans. A config with nothing scored
     renders ``-``, never ``0.0000``.
+
+    ``judged_without_reference`` (task 3628) is the same discipline applied to
+    VALIDITY rather than to membership: a mean reported without saying how many
+    of its cells were graded with no landed diff to grade against is the same
+    silent degradation one layer up. Those cells ARE in ``n`` and in the mean.
     """
     configs = report.get('configs', [])
     rendered = [
@@ -1551,6 +1711,17 @@ def _format_plan_quality_mean_section(report: dict[str, Any]) -> list[str]:
             'n': str(c['n']),
             'cap_excluded': str(c['cap_excluded']),
             'no_plan': str(c['no_plan']),
+            # How many of those n cells the judge scored with NO reference diff
+            # (task 3628). Rendered here rather than only in JSON because a
+            # mean reported without saying how many of its cells were judged
+            # blind is the same silent degradation one layer up. ``-`` — the
+            # same sentinel the mean beside it uses — when the count is None
+            # because some cell predates the marker; printing 0 there would be
+            # the reassuring answer to a question nobody asked the instrument.
+            'judged_without_reference': (
+                '-' if c.get('judged_without_reference') is None
+                else str(c['judged_without_reference'])
+            ),
             # The same '-'-when-None rule the mean beside it uses: a config
             # whose every cell was refused has no rate, and a fabricated 0.0
             # would assert a reliability failure we never observed (task 3379).
@@ -1625,6 +1796,30 @@ def format_plan_quality_table(report: dict[str, Any]) -> str:
         f'{architect_cells} architect cell(s)'
         + (f' ({causes})' if causes else '')
     )
+    # The σ validity bound beside the exclusion count (task 3628), stated
+    # against ITS OWN pool: the SCORED cells, not every architect cell, because
+    # that is the population whose plan_quality it bounds. Suppressed only when
+    # the bound is MEASURED and zero — a clean campaign must not grow a scary
+    # line — which is also what keeps this byte-deterministic.
+    #
+    # An UNMEASURED bound is emphatically not that case and must print (task
+    # 3628 amendment): a rebuild over the pre-σ corpus has no measured cell at
+    # all, and suppressing the line there would make "nothing bounded these
+    # scores" look exactly like "everything was graded against a landed diff".
+    judged_blind = report.get('judged_without_reference', 0)
+    unmeasured = report.get('judged_without_reference_unmeasured', 0) or 0
+    scored_cells = sum(c['n'] for c in report.get('configs', []))
+    if judged_blind is None or unmeasured:
+        lines.append(
+            f'judged without reference: UNMEASURED — {unmeasured} of '
+            f'{scored_cells} scored cell(s) predate the marker, so their '
+            f'plan_quality validity is UNKNOWN (not bounded, not clean)'
+        )
+    elif judged_blind:
+        lines.append(
+            f'judged without reference: {judged_blind} of {scored_cells} '
+            f'scored cell(s) (plan_quality bounded)'
+        )
     lines.append('')
     lines.extend(_format_plan_quality_mean_section(report))
     return '\n'.join(lines)
@@ -1655,6 +1850,19 @@ def format_plan_quality_table(report: dict[str, Any]) -> str:
 # ``plan_quality 0.0000`` would read as "these candidates all planned badly"
 # when it means "these candidates produced no plan at all".
 #
+# ``pq_no_ref`` (task 3628) is the THIRD count, and differs from both above in
+# that it changes no number on this row: the flagged cells are in
+# ``plan_quality``, in ``composite`` and in ``cost_usd`` at their real values.
+# It bounds the CONFIDENCE in ``plan_quality`` — those cells were graded by the
+# judge on plausibility, with no landed diff to grade against — so a reader
+# ranking on this table can see that a high plan_quality rests partly on scores
+# with no ground truth behind them. Beside its two siblings deliberately: the
+# three describe one pool and are only interpretable together. It is also the
+# one of the three that renders ``-``: unlike an exclusion or a floor, whose
+# absence from a cell's metrics really is zero of them, a MISSING validity
+# marker means the question was never asked of that cell, and rendering the
+# answer 0 there would be a fabrication (task 3628 amendment).
+#
 # ``plan_rate`` / ``cost_per_plan`` (task 3379) are the DERIVED pair over those
 # counts, and belong here for the same reason. ``plan_rate`` is the RELIABILITY
 # discriminator: the 2026-07-27 verdict found that what actually separates the
@@ -1670,8 +1878,8 @@ def format_plan_quality_table(report: dict[str, Any]) -> str:
 
 _COMPOSITE_COLUMNS = (
     'config', 'composite', 'quality', 'plan_quality', 'pq_excluded',
-    'pq_no_plan', 'plan_rate', 'cost_usd', 'cost_per_plan', 'cost_source',
-    'latency_secs', 'ci95_composite', 'trials', 'fixtures',
+    'pq_no_plan', 'pq_no_ref', 'plan_rate', 'cost_usd', 'cost_per_plan',
+    'cost_source', 'latency_secs', 'ci95_composite', 'trials', 'fixtures',
 )
 _PRICE_TABLE_COLUMNS = ('config', 'role', 'input_per_1m', 'output_per_1m')
 
@@ -1783,6 +1991,16 @@ def format_composite_table(report: dict[str, Any]) -> str:
             'plan_quality': _optional_float_cell(r.get('plan_quality')),
             'pq_excluded': str(int(r.get('plan_quality_cap_excluded', 0) or 0)),
             'pq_no_plan': str(int(r.get('plan_quality_no_plan', 0) or 0)),
+            # NOT the .get-with-0-default its siblings use (task 3628
+            # amendment): a row whose count is None — because some admitted
+            # cell predates the marker — renders the '-' this table already
+            # spells "unmeasured" for every optional float, and a row from a
+            # report dict built before the field existed takes the same path.
+            # 0 is reserved for a bound that was actually measured at zero.
+            'pq_no_ref': (
+                '-' if r.get('plan_quality_judged_without_reference') is None
+                else str(int(r['plan_quality_judged_without_reference']))
+            ),
             'plan_rate': _optional_float_cell(r.get('plan_rate')),
             'cost_usd': _optional_float_cell(r.get('cost_usd', 0.0)),
             'cost_per_plan': _optional_float_cell(r.get('cost_per_plan')),
