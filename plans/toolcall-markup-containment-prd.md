@@ -104,7 +104,7 @@ shared/src/shared/toolcall_markup.py
   ├─ detect(value)            -> MarkupHit | None       (single pattern source, INV-5)
   ├─ repair(value, param, schema_params, supplied)
   │                           -> Repair(clean_value, recovered:{name:value}) | Unrepairable
-  └─ FIXTURES: 334 real specimens committed as the regression pin
+  └─ FIXTURES: 504 real specimens committed as the regression pin
 
 shared/src/shared/mcp_markup_middleware.py
   MarkupGuardMiddleware(policy: RepairPolicy, exempt_tools: frozenset)
@@ -332,13 +332,16 @@ No waivers required.
 | B10 | Storm escape fires | 3 repairs within the window on one project | Storm escalation filed once, naming outcome `repaired` |
 | B11 | Sweep atomicity | δ interrupted between temp-write and replace | Target file unchanged and still parses; no partial JSON |
 | B12 | Lazy write-back under concurrency | ε repairs a live plan while a task reads it | Reader observes either the old or the repaired file, never a partial one |
-| B13 | Corpus determinism | replay all 334 specimens twice | Byte-identical results both runs; every outcome matches the committed per-specimen expectation (reference: 308 repaired / 26 unrepairable) |
+| B13 | Corpus determinism | replay all 504 specimens twice | Byte-identical results both runs; every outcome matches the committed per-specimen expectation (reference: 443 repaired / 61 unrepairable) |
+| B14 | REQUIRED absorbed parameter is recoverable | `add_memory.content` absorbs the REQUIRED `project_id`, which is then absent from the call; both tiers | `on_call_tool` runs before pydantic validation, so the repair is reached: `REJECT_WITH_REPAIR` bounces with `repaired_call.project_id` and `error_type=mcp_markup_detected` (NOT a missing-required-field error) and nothing is written; `FORWARD_REPAIR` executes the tool bound to a required argument that was never on the wire |
+| B15 | The ordering's one precondition | the same call with `strict_input_validation=True` | Middleware never runs; caller gets `Input validation error`; NO `markup_detected` fact and NO storm count — every required-parameter leak is silently unrepairable. Registration (γ) must not enable it |
 
 ---
 
 ## 11. Open questions (tactical, implementation-time)
 
 1. **Middleware ordering.** If a server later adds a second middleware, does the markup guard run first? **Suggested resolution:** register it first and assert its position in a test. Decide during γ.
+   *Partly settled (task 4022, empirically, fastmcp 3.2.2).* The FRAMEWORK-ordering half is no longer open: `on_call_tool` runs strictly BEFORE pydantic argument validation, so a REQUIRED absorbed parameter is recoverable — boundary rows B14/B15, with the one precondition that `strict_input_validation` stays off. This item's actual question — ordering relative to a SECOND middleware, if one is ever added — is untouched by that and remains for γ.
 2. **`add_system_record` / `update_memory` policy tier.** Both are fused-memory writes, so they inherit `REJECT_WITH_REPAIR`; `add_system_record` is recon-stage-only and may not retry. **Suggested resolution:** start with the server default, revisit if the storm counter shows rejections there. Decide during γ.
 3. **Fixture corpus size in-repo.** 334 raw values include long text; the committed corpus may be large. **Suggested resolution:** store truncated-but-sufficient values (tail + 200 chars of lead-in) if size is a problem, keeping the 26 unrepairable cases verbatim. Decide during α.
 4. **Retention of the archived transcripts.** The corpus is extracted from `agent-transcripts/`, which is retention-bounded. **Suggested resolution:** the committed corpus is the durable artifact; no dependency on the archive after α.
