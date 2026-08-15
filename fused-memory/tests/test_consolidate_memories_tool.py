@@ -77,6 +77,7 @@ def make_service(
     topic_total=None,
     children=None,
     delete_errors=None,
+    update_errors=None,
     events=None,
 ):
     """A MemoryService mock modelling one consolidation cluster.
@@ -87,6 +88,10 @@ def make_service(
 
     *children* maps a supersede id to its direct children; *delete_errors*
     maps a supersede id to an exception `delete_memory` raises for it.
+    *update_errors* maps a memory id to the structured rejection
+    `update_memory` RETURNS for it — that primitive reports
+    `MemoryNotFound` as a return value rather than a raise, so a caller
+    that only guarded against exceptions would read a refusal as a success.
 
     *events* is a shared ordered log — the only way to assert the ORDERING
     that is this op's whole contract, since the steps land on different
@@ -95,6 +100,7 @@ def make_service(
     gone = set(gone)
     children = children or {}
     delete_errors = delete_errors or {}
+    update_errors = update_errors or {}
     members = SUPERSEDES if topic_members is None else topic_members
     log = events if events is not None else []
 
@@ -128,9 +134,19 @@ def make_service(
         return DescendantScan(ids=list(children.get(memory_id, ())), truncated=False)
 
     svc.list_child_ids = AsyncMock(side_effect=_list_child_ids)
-    svc.update_memory = AsyncMock(
-        return_value={'status': 'updated', 'store': 'mem0', 'metadata_patched': True}
-    )
+
+    async def _update(memory_id=None, **kwargs):
+        log.append(('update_memory', memory_id))
+        if memory_id in update_errors:
+            return update_errors[memory_id]
+        return {
+            'status': 'updated',
+            'store': 'mem0',
+            'id': memory_id,
+            'metadata_patched': True,
+        }
+
+    svc.update_memory = AsyncMock(side_effect=_update)
     svc.get_memories_by_metadata = AsyncMock(
         return_value=[_row(m) for m in members]
     )
@@ -792,3 +808,141 @@ class TestClosureIsCorroboratedNeverClaimed:
         assert result['topic_members_truncated'] is False
         assert result['topic_members_total'] == 2
         svc.count_memories_by_metadata.assert_not_called()
+
+
+class TestRetainAndTagArm:
+    """The RATIFIED default arm (gate 3200): peers are TAGGED, not deleted.
+
+    Option C's write shape is short retained single-claim peers sharing
+    `metadata.topic` with exactly one `canonical: true` per (project,
+    topic). Retaining is what preserves the Qdrant POINT ID, so every
+    citation, parent pointer and supersedes edge already aimed at a peer
+    stays valid across the consolidation. Deleting-and-rewriting peers is
+    what made the previous choreography lose content it had no path to
+    restore — there is no write path to a deleted point id.
+    """
+
+    @pytest.mark.asyncio
+    async def test_each_retained_peer_is_tagged_in_place(self):
+        svc = make_service()
+
+        await call_consolidate(svc, retain=[RETAIN_1, RETAIN_2])
+
+        patched = {
+            c.kwargs['memory_id']: c.kwargs for c in svc.update_memory.await_args_list
+        }
+        assert set(patched) == {RETAIN_1, RETAIN_2}
+        for kwargs in patched.values():
+            assert kwargs['metadata_patch'] == {'topic': TOPIC}
+            # `content=None` is load-bearing, not incidental: passing the
+            # text back would re-embed a record whose claim did not change,
+            # moving its vector for no reason. A retained peer keeps its
+            # text, its vector AND its id.
+            assert kwargs.get('content') is None
+            # Merge, and nothing deleted — the peer's own metadata (its
+            # source, its run_id, its parent) is not this op's to discard.
+            assert kwargs.get('metadata_mode') == 'merge'
+            assert kwargs.get('metadata_delete_keys') is None
+
+    @pytest.mark.asyncio
+    async def test_no_retained_peer_is_stamped_canonical(self):
+        """Exactly ONE `canonical: true` per (project, topic) — the invariant
+        `CanonicalUniquenessViolation` exists to defend. A retained peer that
+        also claimed canonical would make the cluster unresolvable and would
+        make the NEXT consolidation of this topic refuse outright."""
+        svc = make_service()
+
+        await call_consolidate(svc, retain=[RETAIN_1, RETAIN_2])
+
+        for call in svc.update_memory.await_args_list:
+            assert 'canonical' not in (call.kwargs['metadata_patch'] or {})
+            # Peers, not children: the retain arm never re-homes anything.
+            assert 'parent_id' not in (call.kwargs['metadata_patch'] or {})
+
+    @pytest.mark.asyncio
+    async def test_retained_ids_are_echoed_unchanged(self):
+        """Echoing the ids back UNCHANGED is the point-id-preservation proof:
+        a caller can compare them to what it sent and see that tagging moved
+        no record."""
+        svc = make_service()
+
+        result = await call_consolidate(svc, retain=[RETAIN_1, RETAIN_2])
+
+        assert result['retained'] == [RETAIN_1, RETAIN_2]
+        assert result['retain_failures'] == []
+        assert result['status'] == 'consolidated'
+
+    @pytest.mark.asyncio
+    async def test_a_retained_peer_is_never_deleted(self):
+        svc = make_service()
+
+        await call_consolidate(svc, retain=[RETAIN_1, RETAIN_2])
+
+        deleted = {c.kwargs['memory_id'] for c in svc.delete_memory.await_args_list}
+        assert deleted == set(SUPERSEDES)
+        assert RETAIN_1 not in deleted
+        assert RETAIN_2 not in deleted
+
+    @pytest.mark.asyncio
+    async def test_the_canonical_supersedes_only_the_deleted_ids(self):
+        """`metadata.supersedes` is a claim about what this canonical
+        REPLACED. A retained peer was not replaced — it is still in the
+        corpus stating its own claim — so listing it there would tell every
+        future reader to prefer the canonical over a record that is still
+        live and still correct."""
+        svc = make_service()
+
+        await call_consolidate(svc, retain=[RETAIN_1, RETAIN_2])
+
+        meta = svc.add_memory.await_args.kwargs['metadata']
+        assert list(meta['supersedes']) == SUPERSEDES
+        assert RETAIN_1 not in meta['supersedes']
+        assert RETAIN_2 not in meta['supersedes']
+
+    @pytest.mark.asyncio
+    async def test_a_retain_only_call_deletes_nothing(self):
+        """The ratified DEFAULT shape: tag the cluster, delete none of it.
+        It needs no `run_id` because it never deletes and so never has a
+        deletion to attribute."""
+        svc = make_service()
+
+        result = await call_consolidate(
+            svc, supersedes=[], run_id=None, retain=[RETAIN_1, RETAIN_2]
+        )
+
+        assert result['status'] == 'consolidated'
+        assert result['deleted'] == []
+        assert result['survivors'] == []
+        assert result['retained'] == [RETAIN_1, RETAIN_2]
+        svc.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_tag_is_captured_and_does_not_abort_the_arm(self):
+        """`update_memory` reports `MemoryNotFound` by RETURNING a structured
+        rejection, never by raising — so a caller checking only for
+        exceptions would record a peer as tagged when it was refused."""
+        svc = make_service(
+            update_errors={
+                RETAIN_2: {
+                    'error': f'memory {RETAIN_2} not found in project {PROJECT_ID}',
+                    'error_type': 'MemoryNotFound',
+                }
+            }
+        )
+
+        result = await call_consolidate(svc, retain=[RETAIN_1, RETAIN_2])
+
+        assert result['retain_failures'] == [
+            {
+                'id': RETAIN_2,
+                'error': f'memory {RETAIN_2} not found in project {PROJECT_ID}',
+                'error_type': 'MemoryNotFound',
+            }
+        ]
+        # Only the peer that actually took is claimed as retained.
+        assert result['retained'] == [RETAIN_1]
+        assert result['status'] == 'partial'
+        # ...and the peer that COULD be tagged still was: one refusal costs
+        # one peer, not the arm.
+        tagged = {c.kwargs['memory_id'] for c in svc.update_memory.await_args_list}
+        assert RETAIN_1 in tagged
