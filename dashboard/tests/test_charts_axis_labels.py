@@ -78,6 +78,11 @@ def analytics_jsx(_client) -> str:
     return _client.get('/static/redux/tab_escalation_analytics.jsx').text
 
 
+@pytest.fixture(scope='module')
+def index_html_body(_client) -> str:
+    return _client.get('/static/redux/index.html').text
+
+
 def _extract_function_body(src: str, fn_name: str) -> str:
     """Return the body block of a ``function <fn_name>(`` declaration, braces included.
 
@@ -434,6 +439,44 @@ def test_line_chart_still_passes_the_raw_tick_to_format_y(charts_jsx: str) -> No
     assert 'formatY(Math.round(' not in body, (
         "LineChart's body calls `formatY(Math.round(...))` — the defect this "
         'task removed from StackedAreaChart has been copied into LineChart.'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cache-buster floor.
+# ---------------------------------------------------------------------------
+
+
+def test_index_html_cache_buster_not_reverted_below_charts_axis_floor(
+    index_html_body: str,
+) -> None:
+    """Every /static/redux/* asset must stay at or past the floor this fix landed at.
+
+    This is a user-visible RENDERING fix inside a browser-cached static asset:
+    an already-open dashboard holds a cached copy of the BROKEN charts.jsx and
+    would keep reading a mislabelled "0% / 0% / 100% / 100% / 100%" axis
+    indefinitely without a new ``?v=``. That is the exact rationale
+    test_index_html.py:691-717 documents for its own floor.
+
+    Deliberately asserts only this module's own floor, NOT uniformity:
+    ``test_index_html.py::test_redux_cache_buster_bumped`` is the single home
+    of the uniformity check and of the shared floor, and per its own docstring
+    "every other module asserts only its own ``min(versions) >= N`` floor,
+    which needs no uniformity precondition to be sound (the OLDEST asset is the
+    one that would still serve stale code)". Precedents:
+    test_esc_flow_diagram.py:324 (>= 33), test_scheduler_page.py:1931 (>= 10).
+    """
+    versions = {int(v) for v in re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body)}
+
+    assert versions, (
+        'index.html carries no /static/redux/*?v=<n> asset tags at all — the '
+        'cache-buster convention has been dropped or the URLs were rewritten.'
+    )
+    assert min(versions) >= 44, (
+        f'the oldest index.html cache-buster version is {min(versions)}, '
+        'expected >= 44 (the floor the StackedAreaChart y-axis label fix '
+        'landed at). Below that, an already-open dashboard keeps serving the '
+        'cached charts.jsx whose Workflow axis reads 0%/0%/100%/100%/100%.'
     )
 
 
