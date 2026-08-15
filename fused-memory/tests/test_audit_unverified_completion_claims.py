@@ -712,18 +712,56 @@ class TestEpisodeReader:
             assert write_re.search(query) is None
 
     async def test_fetch_derived_edges_returns_edge_uuids(self) -> None:
+        episode = '02090224-7bc9-4485-9291-6748e1042ac9'
         graph = _FakeGraph(edge_rows=[
-            ['7dbf12cf-9251-4674-b396-8eefdf651d1c', 'a fact', None, None],
-            ['edge-2', 'another fact', None, None],
+            ['7dbf12cf-9251-4674-b396-8eefdf651d1c', [episode]],
+            ['edge-2', [episode, 'some-other-episode']],
         ])
-        uuids = await EpisodeReader(graph=graph).fetch_derived_edges(
-            '02090224-7bc9-4485-9291-6748e1042ac9'
-        )
+        uuids = await EpisodeReader(graph=graph).fetch_derived_edges(episode)
         assert uuids == ('7dbf12cf-9251-4674-b396-8eefdf651d1c', 'edge-2')
 
     async def test_fetch_derived_edges_empty_result(self) -> None:
         graph = _FakeGraph(edge_rows=[])
         assert await EpisodeReader(graph=graph).fetch_derived_edges('ep-x') == ()
+
+    async def test_batch_scans_once_and_fans_out_per_episode(self) -> None:
+        """ONE graph scan for the whole batch, split by each edge's r.episodes.
+
+        The predicate is a full relationship scan however it is written, so
+        issuing it per flagged episode multiplied a whole-population scan by
+        the mismatch count. The fan-out is what makes one scan sufficient.
+        """
+        graph = _FakeGraph(edge_rows=[
+            ['edge-a', ['ep-1']],
+            ['edge-b', ['ep-2', 'ep-1']],
+            ['edge-c', ['ep-unrelated']],
+        ])
+        batch = await EpisodeReader(graph=graph).fetch_derived_edges_batch(
+            ['ep-1', 'ep-2', 'ep-3']
+        )
+        assert len(graph.queries) == 1
+        assert batch == {
+            'ep-1': ('edge-a', 'edge-b'),  # sorted, so the report is byte-stable
+            'ep-2': ('edge-b',),
+            # Total over the request: an absent key would be indistinguishable
+            # from "not enumerated" once it reaches the report.
+            'ep-3': (),
+        }
+
+    async def test_batch_survives_an_odd_episodes_column(self) -> None:
+        """A NULL/scalar r.episodes must not abort a sweep OF odd rows."""
+        graph = _FakeGraph(edge_rows=[
+            ['edge-null', None],
+            ['edge-scalar', 'ep-1'],
+            ['edge-short'],
+        ])
+        batch = await EpisodeReader(graph=graph).fetch_derived_edges_batch(['ep-1'])
+        assert batch == {'ep-1': ('edge-scalar',)}
+
+    async def test_empty_batch_issues_no_query(self) -> None:
+        graph = _FakeGraph()
+        assert await EpisodeReader(graph=graph).fetch_derived_edges_batch([]) == {}
+        assert graph.queries == []
 
     async def test_limit_is_applied(self) -> None:
         graph = _FakeGraph(rows=[_episode_row(uuid=f'ep-{i}') for i in range(3)])
@@ -787,7 +825,12 @@ class TestEpisodeReader:
 
 
 class _FakeReader:
-    """A reader double: a fixed corpus plus a fixed episode->edges map."""
+    """A reader double: a fixed corpus plus a fixed episode->edges map.
+
+    ``edge_lookups`` records every uuid the sweep ASKED this reader about — the
+    batched call appends each member of the batch, so an assertion on it reads
+    the same whether the production path issues one query or many.
+    """
 
     def __init__(
         self,
@@ -797,26 +840,36 @@ class _FakeReader:
         self.records = records
         self.edges = edges or {}
         self.edge_lookups: list[str] = []
+        self.batch_calls: int = 0
 
     async def fetch_population(self, *, limit: int | None = None) -> list[object]:
         return self.records if limit is None else self.records[:limit]
 
-    async def fetch_derived_edges(self, episode_uuid: str) -> tuple[str, ...]:
-        self.edge_lookups.append(episode_uuid)
-        return self.edges.get(episode_uuid, ())
+    async def fetch_derived_edges_batch(
+        self, episode_uuids: object
+    ) -> dict[str, tuple[str, ...]]:
+        wanted = list(episode_uuids)  # type: ignore[call-overload]
+        self.batch_calls += 1
+        self.edge_lookups.extend(wanted)
+        # Total over the request, exactly as EpisodeReader is: a missing key
+        # would be indistinguishable from "not enumerated".
+        return {uuid: self.edges.get(uuid, ()) for uuid in wanted}
 
 
 class _ExplodingEdgeReader(_FakeReader):
     """Reads its population fine, then fails on the edge query.
 
     The live shape of a graph that errors mid-run: the population is already in
-    hand, so the sweep proceeds — but the edge enumeration for that episode
+    hand, so the sweep proceeds — but the edge enumeration for those episodes
     produced NO answer and must not be recorded as one.
     """
 
-    async def fetch_derived_edges(self, episode_uuid: str) -> tuple[str, ...]:
-        self.edge_lookups.append(episode_uuid)
-        raise RuntimeError(f'edge query blew up for {episode_uuid}')
+    async def fetch_derived_edges_batch(
+        self, episode_uuids: object
+    ) -> dict[str, tuple[str, ...]]:
+        wanted = list(episode_uuids)  # type: ignore[call-overload]
+        self.edge_lookups.extend(wanted)
+        raise RuntimeError(f'edge scan blew up for {wanted}')
 
 
 def _args(**overrides: object) -> object:
@@ -1115,6 +1168,101 @@ class TestDerivedEdgeLookupKeying:
         assert finding['derived_edge_uuids'] == []
         assert finding['edges_unqueried'] is False
         assert reader.edge_lookups == ['ep-1']
+
+    async def test_each_graph_is_asked_through_its_OWN_reader(
+        self, capsys
+    ) -> None:
+        """The other half of the defect: the WRONG graph's reader answering.
+
+        Every other _run test shares one reader across all graphs, so it cannot
+        tell "queried graph A's reader" from "queried graph B's". Here the
+        record is READ FROM reify while claiming group_id dark_factory — the
+        shape that lost 6-11 edges each on five findings in the first live run.
+        Keying the lookup back on project_id would still pass those tests; it
+        fails this one, because reify's reader would never be asked.
+        """
+        episode = 'ep-cross'
+        reify_reader = _FakeReader(
+            [
+                _record(
+                    uuid=episode,
+                    text=ESC_3085_1_INSTANCE_1,
+                    project_id='dark_factory',
+                    graph_name='reify',
+                )
+            ],
+            edges={episode: ('edge-in-reify',)},
+        )
+        dark_reader = _FakeReader([], edges={episode: ('edge-in-dark-factory',)})
+        readers = {'reify': reify_reader, 'dark_factory': dark_reader}
+
+        code = await _run(
+            _args(project=['reify', 'dark_factory']),
+            reader_factory=lambda project: readers[project],
+            probes=_probes(task_status='in-progress'),
+        )
+        out = capsys.readouterr().out
+        report = json.loads(out)
+        assert code == 0
+        # Read from reify: reify's OWN reader is the one that must be asked.
+        assert reify_reader.edge_lookups == [episode]
+        # And its group_id graph too, since dark_factory was also swept — those
+        # edges are real and were previously dropped on the floor.
+        assert dark_reader.edge_lookups == [episode]
+        finding = report['findings'][0]
+        assert finding['derived_edge_uuids'] == [
+            'edge-in-dark-factory', 'edge-in-reify',
+        ]
+        assert finding['edges_enumerated_in'] == ['reify', 'dark_factory']
+        assert finding['cross_graph'] is True
+        assert report['summary']['by_graph'] == {'reify': 1}
+        assert report['summary']['by_project'] == {'dark_factory': 1}
+
+    async def test_group_id_graph_not_swept_is_enumerated_where_it_can_be(
+        self, capsys
+    ) -> None:
+        """A group_id naming an UNSWEPT graph is still enumerated where read.
+
+        edges_enumerated_in names the one graph that answered, so an empty
+        result is readable as "asked here, found nothing" rather than as
+        coverage of a graph this run never opened.
+        """
+        reader = _FakeReader(
+            [
+                _record(
+                    uuid='ep-1',
+                    text=ESC_3085_1_INSTANCE_1,
+                    project_id='know_live',
+                    graph_name='dark_factory',
+                )
+            ],
+            edges={'ep-1': ('edge-1',)},
+        )
+        _code, report = await self._run_capture(
+            capsys, reader, _probes(task_status='in-progress')
+        )
+        assert report is not None
+        finding = report['findings'][0]
+        assert finding['derived_edge_uuids'] == ['edge-1']
+        assert finding['edges_enumerated_in'] == ['dark_factory']
+        assert finding['cross_graph'] is True
+
+    async def test_one_scan_per_graph_not_one_per_episode(self, capsys) -> None:
+        """Batched: the graph is scanned once however many episodes flagged."""
+        reader = _FakeReader(
+            [
+                _record(uuid=f'ep-{i}', text=ESC_3085_1_INSTANCE_1,
+                        project_id='dark_factory', graph_name='dark_factory')
+                for i in range(4)
+            ],
+        )
+        _code, report = await self._run_capture(
+            capsys, reader, _probes(task_status='in-progress')
+        )
+        assert report is not None
+        assert report['summary']['mismatch'] == 4
+        assert reader.batch_calls == 1
+        assert sorted(reader.edge_lookups) == ['ep-0', 'ep-1', 'ep-2', 'ep-3']
 
     async def test_summary_counts_unqueried_findings(self, capsys) -> None:
         """The denominator of un-enumerated findings is visible without

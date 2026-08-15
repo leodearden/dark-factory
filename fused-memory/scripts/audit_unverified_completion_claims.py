@@ -301,6 +301,14 @@ class Finding:
     queried, and no edges found. ``edges_unqueried`` carries the same fact as a
     boolean so the condition is greppable in the committed artifact without
     inferring it from a null.
+
+    ``edges_enumerated_in`` names the graphs that actually ANSWERED for this
+    finding, so an empty list is readable as "asked here, found nothing" rather
+    than having to be inferred from the report's projects list.
+    ``to_json`` also derives ``cross_graph`` (``graph_name != project_id``):
+    the cross-graph population is exactly the one whose edges can live in a
+    graph this sweep may not have read, so a consumer filtering on the edge
+    column needs that marked on the ROW, not only explained in the caveats.
     """
 
     record_uuid: str
@@ -318,6 +326,7 @@ class Finding:
     claimed_text: str
     derived_edge_uuids: tuple[str, ...] | None = ()
     edges_unqueried: bool = False
+    edges_enumerated_in: tuple[str, ...] = ()
 
     def to_json(self) -> dict[str, Any]:
         """Render as a plain JSON-serializable dict."""
@@ -327,6 +336,9 @@ class Finding:
             'category': self.category,
             'project_id': self.project_id,
             'graph_name': self.graph_name,
+            # Derived, never stored: it is a restatement of two fields already
+            # on the row, and a stored copy could disagree with them.
+            'cross_graph': self.graph_name != self.project_id,
             'created_at': self.created_at,
             'claim_kind': self.claim_kind,
             'subject': self.subject,
@@ -341,6 +353,7 @@ class Finding:
                 else list(self.derived_edge_uuids)
             ),
             'edges_unqueried': self.edges_unqueried,
+            'edges_enumerated_in': list(self.edges_enumerated_in),
         }
 
 
@@ -436,15 +449,16 @@ CAVEATS: tuple[str, ...] = (
     'has been deleted is NOT covered, and neither is an episode ingested '
     'through add_episode with a caller-supplied description, which carries no '
     'category and so falls outside the category scope.',
-    'COVERAGE, CROSS-GRAPH EDGES: derived_edge_uuids is enumerated ONLY in the '
-    'graph the episode was READ FROM (the finding\'s graph_name). An episode '
-    "whose group_id differs from that graph — see any finding where those two "
-    'fields disagree — may have its derived RELATES_TO edges in ANOTHER graph, '
-    'where they are NOT counted here. Measured, not hypothetical: episode '
-    'a887c958-0018-4715-8817-cf048c187e8d exists only in the reify graph with '
-    'group_id dark_factory, and its 8 derived edges exist only in the '
-    'dark_factory graph. An empty list therefore means "none in THIS graph", '
-    'not "none anywhere".',
+    'COVERAGE, CROSS-GRAPH EDGES: a cross_graph finding (graph_name != '
+    'project_id) has its edges enumerated in BOTH the graph it was read from '
+    'and its own group_id graph, but only when that second graph was among the '
+    'swept --project graphs; edges_enumerated_in on each finding names exactly '
+    'which graphs answered. Edges living in a graph that was NOT swept are not '
+    'counted at all. Why this matters, measured rather than hypothetical: '
+    'episode a887c958-0018-4715-8817-cf048c187e8d exists only in the reify '
+    'graph with group_id dark_factory, and all 8 of its derived edges exist '
+    'only in the dark_factory graph. So an empty list means "none in the '
+    'graph(s) named by edges_enumerated_in", not "none anywhere".',
     'EDGES NOT ENUMERATED: a finding whose derived_edge_uuids is null (and '
     'whose edges_unqueried is true) had its RELATES_TO edges NOT enumerated — '
     'no reader resolved for its graph, or the edge query failed. Its harm '
@@ -549,7 +563,12 @@ def build_report(
             # denominator of un-enumerated findings without diffing the list.
             'edges_unqueried': sum(1 for f in findings if f.edges_unqueried),
             'by_category': _tally(findings, lambda f: f.category or '(uncategorized)'),
+            # by_project tallies the record's OWN group_id; by_graph tallies the
+            # graph actually swept. They differ for exactly the cross-graph
+            # population, and a reader of report.json alone should not have to
+            # recompute that split by hand from the findings list.
             'by_project': _tally(findings, lambda f: f.project_id),
+            'by_graph': _tally(findings, lambda f: f.graph_name),
             'by_subject': _tally(findings, lambda f: f.subject),
         },
         'truncated_by': truncated_by,
@@ -613,10 +632,10 @@ every denominator in the report wrong.
 """
 
 DERIVED_EDGE_CYPHER = (
-    'MATCH ()-[r:RELATES_TO]->() WHERE $episode_uuid IN r.episodes '
-    'RETURN r.uuid, r.fact, r.valid_at, r.invalid_at'
+    'MATCH ()-[r:RELATES_TO]->() WHERE any(u IN $uuids WHERE u IN r.episodes) '
+    'RETURN r.uuid, r.episodes'
 )
-"""The RELATES_TO edges extracted FROM a given episode — the harm artefacts.
+"""The RELATES_TO edges extracted FROM a BATCH of episodes — the harm artefacts.
 
 ``r.episodes`` is a real persisted uuid list, not merely a declared one: the
 projection at ``fused_memory/maintenance/cross_graph_move.py:672`` is the
@@ -624,6 +643,13 @@ in-tree precedent, and it was confirmed populated in both live graphs before
 this script was written. This is the join that yields the esc-3085-1
 instance-(2) shape — episode ``02090224-7bc9-4485-9291-6748e1042ac9`` ->
 edge ``7dbf12cf-9251-4674-b396-8eefdf651d1c``.
+
+BATCHED deliberately. There is no index on ``r.episodes``, so this predicate is
+a full relationship scan of the graph however it is written — one scan for one
+episode, one scan for a thousand. Issuing it per flagged episode multiplied
+that whole-population scan by the mismatch count (~190 scans in the first live
+run, and it would grow with a dirtier corpus). ``r.episodes`` comes back with
+each edge so one scan can be fanned out to every episode that asked.
 """
 
 
@@ -729,20 +755,67 @@ class EpisodeReader:
             )
         return population
 
+    @staticmethod
+    def _list_cell(row: list[Any], index: int) -> tuple[str, ...]:
+        """Read a LIST column *index* defensively.
+
+        ``r.episodes`` is an array property, so it arrives as a list — but a
+        historical edge may carry a NULL, a scalar, or nothing at all there,
+        and a sweep of odd historical rows must not abort on one.
+        """
+        if index >= len(row):
+            return ()
+        value = row[index]
+        if value is None:
+            return ()
+        if isinstance(value, (list, tuple)):
+            return tuple(str(item) for item in value if item is not None)
+        return (str(value),)
+
+    async def fetch_derived_edges_batch(
+        self, episode_uuids: Iterable[str]
+    ) -> dict[str, tuple[str, ...]]:
+        """Return ``{episode_uuid: edge_uuids}`` for EVERY requested episode.
+
+        One graph scan for the whole batch (see :data:`DERIVED_EDGE_CYPHER`),
+        fanned out in Python over each edge's own ``r.episodes`` list.
+
+        Every requested uuid is a key in the result, with ``()`` when the scan
+        found no edges for it. That total-ness is what lets ``_run`` treat a
+        missing answer as NOT ENUMERATED without conflating it with a measured
+        zero: an absent key here would be ambiguous, so there are none.
+
+        Edge uuids are sorted, so two runs over an unchanged graph produce
+        byte-identical output no matter what order the scan returned rows in.
+        """
+        self.assert_read_only_command(RO_COMMAND)
+        wanted = list(dict.fromkeys(episode_uuids))
+        if not wanted:
+            return {}
+        graph = self._resolve_graph()
+        response = await graph.ro_query(DERIVED_EDGE_CYPHER, {'uuids': wanted})
+        rows = getattr(response, 'result_set', response) or []
+        wanted_set = set(wanted)
+        found: dict[str, set[str]] = {}
+        for row in rows:
+            edge_uuid = self._cell(row, 0)
+            for episode_uuid in self._list_cell(row, 1):
+                if episode_uuid in wanted_set:
+                    found.setdefault(episode_uuid, set()).add(edge_uuid)
+        return {uuid: tuple(sorted(found.get(uuid, ()))) for uuid in wanted}
+
     async def fetch_derived_edges(self, episode_uuid: str) -> tuple[str, ...]:
         """Return the uuids of RELATES_TO edges extracted FROM *episode_uuid*.
 
         These are the actual harm artefacts: in esc-5603-1 one false sentence
         fanned out into five false edges, so naming only the source episode
         would understate what is in the graph.
+
+        A one-element :meth:`fetch_derived_edges_batch`, so there is a single
+        query path to keep correct.
         """
-        self.assert_read_only_command(RO_COMMAND)
-        graph = self._resolve_graph()
-        response = await graph.ro_query(
-            DERIVED_EDGE_CYPHER, {'episode_uuid': episode_uuid}
-        )
-        rows = getattr(response, 'result_set', response) or []
-        return tuple(self._cell(row, 0) for row in rows)
+        batch = await self.fetch_derived_edges_batch([episode_uuid])
+        return batch.get(episode_uuid, ())
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1247,45 +1320,74 @@ async def _run(
         commit_probe=probes.commit_probe,
     )
 
-    # ---- attach the harm artefacts to each flagged episode ----------------- #
-    # None in this cache means NOT ENUMERATED, and is carried through to JSON
-    # `null`. () means queried-and-empty. Collapsing the two would make an
+    # ---- attach the harm artefacts: ONE batched scan per graph ------------- #
+    # Which graphs to ask for each finding. The read-from graph always (keyed
+    # on graph_name, NOT project_id: `readers` is keyed by --project graph
+    # name, and a graph legitimately holds episodes whose group_id differs).
+    # AND the record's own group_id graph when that graph was also swept:
+    # Graphiti writes an episode's derived edges into the graph its ingest ran
+    # against, which for a cross-graph record is not necessarily the graph the
+    # episode itself landed in — measured, not hypothetical: episode
+    # a887c958-0018-4715-8817-cf048c187e8d sits in the reify graph with
+    # group_id dark_factory and all 8 of its edges are in dark_factory. Asking
+    # only the read-from graph left the ENTIRE cross-graph population showing
+    # an empty harm-artefact column.
+    targets_by_finding: list[tuple[Finding, tuple[str, ...]]] = []
+    wanted_by_graph: dict[str, set[str]] = {}
+    for finding in findings:
+        candidates = [finding.graph_name]
+        if finding.project_id != finding.graph_name:
+            candidates.append(finding.project_id)
+        targets = tuple(
+            dict.fromkeys(name for name in candidates if name in readers)
+        )
+        for name in targets:
+            wanted_by_graph.setdefault(name, set()).add(finding.record_uuid)
+        targets_by_finding.append((finding, targets))
+
+    # None for a graph means its scan did NOT answer; every uuid it was asked
+    # about is then NOT ENUMERATED, which is carried through to JSON `null`.
+    # () on a finding means queried-and-empty. Collapsing the two would make an
     # un-run query indistinguishable from a measured zero on the report's
     # central harm-artefact column.
-    edge_cache: dict[tuple[str, str], tuple[str, ...] | None] = {}
+    edges_by_graph: dict[str, dict[str, tuple[str, ...]] | None] = {}
+    for graph_name, uuids in sorted(wanted_by_graph.items()):
+        try:
+            edges_by_graph[graph_name] = await readers[
+                graph_name
+            ].fetch_derived_edges_batch(sorted(uuids))
+        except Exception:
+            logger.warning(
+                'derived-edge scan failed in graph %s; %d episode(s) are NOT '
+                'enumerated there', graph_name, len(uuids), exc_info=True,
+            )
+            edges_by_graph[graph_name] = None
+
     enriched: list[Finding] = []
-    for finding in findings:
-        # Keyed on graph_name, NOT project_id: `readers` is keyed by --project
-        # graph name, and a graph legitimately holds episodes whose group_id
-        # differs. The uuid alone is not a safe key either — two graphs may hold
-        # the same uuid, so the pair is what makes the cache correct.
-        key = (finding.graph_name, finding.record_uuid)
-        if key not in edge_cache:
-            reader = readers.get(finding.graph_name)
-            if reader is None:
-                logger.warning(
-                    'no reader for graph %s — derived edges NOT enumerated for '
-                    'episode %s; its harm artefacts are UNKNOWN, not absent',
-                    finding.graph_name, finding.record_uuid,
-                )
-                edge_cache[key] = None
-            else:
-                try:
-                    edge_cache[key] = await reader.fetch_derived_edges(
-                        finding.record_uuid
-                    )
-                except Exception:
-                    logger.warning(
-                        'could not enumerate derived edges for episode %s',
-                        finding.record_uuid, exc_info=True,
-                    )
-                    edge_cache[key] = None
-        edges = edge_cache[key]
+    for finding, targets in targets_by_finding:
+        answered = tuple(
+            name for name in targets if edges_by_graph.get(name) is not None
+        )
+        edges: tuple[str, ...] | None
+        if not answered:
+            logger.warning(
+                'derived edges NOT enumerated for episode %s (graph %s, '
+                'group_id %s) — its harm artefacts are UNKNOWN, not absent',
+                finding.record_uuid, finding.graph_name, finding.project_id,
+            )
+            edges = None
+        else:
+            merged: set[str] = set()
+            for name in answered:
+                answer = edges_by_graph[name] or {}
+                merged.update(answer.get(finding.record_uuid, ()))
+            edges = tuple(sorted(merged))
         enriched.append(
             Finding(**{
                 **vars_of(finding),
                 'derived_edge_uuids': edges,
                 'edges_unqueried': edges is None,
+                'edges_enumerated_in': answered,
             })
         )
 
