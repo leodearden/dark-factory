@@ -812,6 +812,13 @@ class TestExtractSnapshotEdgeTaskIds:
             'Statuses of the v1.2 tasks 1020 and 1030 are pending.',
             'Reviews for section 4.2.1 tasks 1020 and 1030 are pending.',
             'Statuses of tasks in df.core tasks 1020 and 1030 are pending.',
+            # UNICODE flanking: _is_intra_token_dot's docstring claims
+            # str.isalnum() makes the test unicode-aware by construction,
+            # so a non-ASCII filename must be recognized as intra-token
+            # exactly like an ASCII one — pin that claim by behaviour
+            # rather than by prose. (amendment, reviewer_comprehensive
+            # test-coverage finding, task 4149)
+            'Reviews for café.py tasks 1020 and 1030 are pending.',
         ],
     )
     def test_plural_enumeration_precision_guards(self, fact):
@@ -987,6 +994,22 @@ class TestExtractSnapshotEdgeTaskIds:
             ('Reviews for verify_cmd.py are done. Tasks 1020 and 1030 are pending.',
              {1020, 1030}),
             ('Blockers on scheduler.py are resolved! Tasks 1020 and 1030 are pending.',
+             {1020, 1030}),
+            # ...and specifically the WALK'S RETRY behaviour: the loop must
+            # continue past an intra-token '.' to an EARLIER genuine
+            # sentence break, not give up at the first intra-token '.' it
+            # meets. Every other intra-token case above either never enters
+            # the loop (the break is already non-intra-token) or enters it
+            # and exhausts to -1 (no real break precedes); only this one has
+            # an earlier break to retry TO. Verified this pins the retry:
+            # replacing the `while` with a single
+            # `if dot > hard and _is_intra_token_dot(...): dot = -1` (give
+            # up instead of retrying) still passes every other case here,
+            # but turns this one from {1020, 1030} into set() — the scan
+            # runs back over 'for' in the PREVIOUS sentence instead of
+            # stopping at the '.' after 'branch'. (amendment,
+            # reviewer_comprehensive test-coverage finding, task 4149)
+            ('Notes v1.2 for the branch. Statuses v3.4 tasks 1020 and 1030 are pending.',
              {1020, 1030}),
         ],
     )
