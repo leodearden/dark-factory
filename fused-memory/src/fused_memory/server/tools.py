@@ -4812,10 +4812,25 @@ def create_mcp_server(
             victim_record = await memory_service.get_memory_by_id(
                 project_id=project_id, memory_id=supersede_id
             )
+            # `created_at` comes out of the PAYLOAD, not off the top level, and
+            # the two are not interchangeable: `get_memory_by_id` returns
+            # {'id', 'content', 'metadata'} where metadata is the FULL
+            # unprocessed Qdrant payload, whereas `get_memories_by_metadata`
+            # returns a flat `created_at` because `scroll_by_metadata` LIFTS
+            # the field and `get_point_by_id` does not. Reading a top-level key
+            # here records None and silently drops one of the tombstone's three
+            # fields — in the very change whose purpose is making a dead id
+            # answerable. Do NOT "simplify" this back to a top-level `.get()`,
+            # and do NOT widen `get_memory_by_id` to lift the field: its return
+            # contract is documented verbatim and depended on elsewhere, so
+            # fixing one caller there would put the change in the wrong layer.
+            # The two recon sweeps are unaffected — they source victims from
+            # the scroll, which lifts it.
+            victim_payload = (victim_record or {}).get('metadata')
             victims_by_id[supersede_id] = {
                 'id': supersede_id,
-                'metadata': (victim_record or {}).get('metadata'),
-                'created_at': (victim_record or {}).get('created_at'),
+                'metadata': victim_payload,
+                'created_at': (victim_payload or {}).get('created_at'),
             }
 
             # (5c) RE-HOME THIS SUPERSEDE'S CHILDREN, THEN delete it. The
