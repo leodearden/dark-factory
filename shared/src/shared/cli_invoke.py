@@ -210,9 +210,17 @@ class AllAccountsCappedException(Exception):
 #
 # KEEP IN SYNC with the CLI's built-in tool names: a *future new* built-in tool
 # would not be auto-denied by this list.  Accepted because (a) these prompts forbid
-# tool use, (b) no ``mcp_config`` is wired for these callers (MCP tools absent), and
-# (c) a future change to the CLI's tool-exclusion semantics is caught loudly by the
-# ``schema_tool_denied`` detection below rather than degrading silently.
+# tool use, and (b) a future change to the CLI's tool-exclusion semantics is caught
+# loudly by the ``schema_tool_denied`` detection below rather than degrading silently.
+#
+# SCOPE — BUILT-INS ONLY: this list contains no MCP tool pattern, so expanding the
+# ``'*'`` narrows the deny to built-ins and leaves every MCP tool REACHABLE.  That
+# is invisible only while no MCP server is in play; the CLI ambient-merges the
+# project-scoped ``.mcp.json`` found at ``cwd``, so a wildcard-deny caller running
+# at a cwd that carries one (e.g. the project root) silently regains MCP tools —
+# under ``bypassPermissions``, that is unreviewed write access.  Such a caller MUST
+# ALSO pass ``mcp_config=NO_MCP_SERVERS_CONFIG`` with ``strict_mcp_config=True`` to
+# keep MCP tools out of reach; denying built-ins alone does not do it.
 _SCHEMA_OUTPUT_TOOL = 'StructuredOutput'
 _REAL_BUILTIN_TOOLS_DENYLIST = [
     'Bash',
@@ -234,6 +242,22 @@ _REAL_BUILTIN_TOOLS_DENYLIST = [
     'ExitPlanMode',
     'SlashCommand',
 ]
+
+# A scoping ``mcp_config`` carrying ZERO MCP servers, for callers that pass
+# ``disallowed_tools=['*']`` and must keep MCP tools unreachable even when an
+# ``output_schema`` forces the wildcard expansion above (which denies built-ins
+# only).  Paired with ``strict_mcp_config=True`` it emits ``--mcp-config <file>
+# --strict-mcp-config``, scoping the invocation to this file's server set — i.e.
+# nothing — instead of ambient-merging the ``.mcp.json`` at the caller's ``cwd``.
+#
+# MUST STAY TRUTHY.  ``--strict-mcp-config`` is emitted only inside the
+# ``if mcp_config:`` block of ``build_claude_argv``, so "simplifying" this to a
+# bare ``{}`` would skip both flags and silently reinstate ambient MCP access
+# while still reading as correct at every call site.
+#
+# TREAT AS IMMUTABLE: module-level shared state, never mutated in place by a
+# caller (same convention as ``_REAL_BUILTIN_TOOLS_DENYLIST`` above).
+NO_MCP_SERVERS_CONFIG = {'mcpServers': {}}
 
 
 @dataclass
