@@ -731,6 +731,186 @@ class TestFetchCacheRefusesAStaleCorpus:
 
 
 # ===========================================================================
+# step-31 — the fixture digests are WRITTEN but never VERIFIED
+# ===========================================================================
+#
+# `fetch_cache_provenance` stores `fixture_digests(...)`, and `fixture_digests`
+# exists — in its own docstring — to catch "the drift that silently
+# invalidates a dumped cache".  But every read of the provenance dict is
+# `corpus_fingerprints`, `search_limit`, or the two live-only protocol values.
+# Nothing compared `fixtures`, so the digests were an unread receipt.
+#
+# The corpus fingerprint does not cover the hole: `materialize_arm` takes no
+# queries, so `corpus_fingerprint` is STRUCTURALLY blind to the query set.
+# Edit a query's `text` while keeping its `query_id` and the cached rankings —
+# fetched against the OLD text — load clean, and `_replay_bake_off` stamps
+# `replayed_from` and publishes them as a fresh measurement of a question
+# nobody asked.
+#
+# Partial pre-existing mitigation, stated here so it is not mistaken for
+# coverage: `cross_validate_fixtures` catches an `expects_claim_ids` edit that
+# points at a nonexistent or foreign claim.  An edit to `text`, `topic`,
+# `held_out`, or a retarget to another VALID in-cluster claim id passes it
+# silently.
+
+
+def _fixture_copy(tmp_path, name: str) -> Path:
+    """A writable copy of a committed fixture.
+
+    Copied rather than edited in place because these are the real committed
+    fixtures the anchor above pins — a test that mutated one would fail every
+    other test in this file, and would leave the tree dirty besides.
+    """
+    target = tmp_path / name
+    target.write_bytes((FIXTURES_DIR / name).read_bytes())
+    return target
+
+
+def _retext_one_query(path: Path) -> str:
+    """Edit one query's `text`, KEEPING its `query_id`.
+
+    Precisely the drift nothing else in the module can see: the record corpus
+    is untouched (so the fingerprint matches), the claim ids are untouched (so
+    `cross_validate_fixtures` passes), and the cached rankings were fetched
+    against the old text.
+    """
+    rows = [
+        json.loads(line)
+        for line in path.read_text(encoding='utf-8').splitlines() if line.strip()
+    ]
+    rows[0]['text'] = rows[0]['text'] + ' and something else entirely'
+    path.write_text(
+        '\n'.join(json.dumps(row) for row in rows) + '\n', encoding='utf-8',
+    )
+    return rows[0]['query_id']
+
+
+class TestTheFixtureDigestsAreVerifiedNotMerelyRecorded:
+    """The guard that makes the recorded digests load-bearing."""
+
+    def _dump_over(self, mod, tmp_path, fixtures):
+        records = [_record('rec-1'), _record('rec-2')]
+        path = tmp_path / 'cache.json'
+        mod.dump_fetches(
+            path,
+            {'c_peers': _fetched(
+                {'q1': [(records[0], 0.9), (records[1], 0.4)]}, {},
+            )},
+            provenance=mod.fetch_cache_provenance(
+                records_by_shape={'c_peers': records},
+                fixtures=list(fixtures),
+                search_limit=10,
+                guard_threshold=0.85,
+                embedder_model='text-embedding-3-small',
+            ),
+        )
+        return path, _seeded('c_peers', records)
+
+    def test_an_edited_query_text_is_refused(self, tmp_path):
+        """The concrete scenario, with today's behaviour asserted beside it."""
+        mod = _mod()
+        fixture = _fixture_copy(tmp_path, 'e2_query_set.jsonl')
+        path, seeded = self._dump_over(mod, tmp_path, [fixture])
+        cached_sha = json.loads(path.read_text(encoding='utf-8'))[
+            'provenance']['fixtures'][0]['sha256']
+        query_id = _retext_one_query(fixture)
+        local_sha = hashlib.sha256(fixture.read_bytes()).hexdigest()
+
+        # The premise: the query really did keep its id, the corpus really is
+        # unchanged, and the stale cache therefore loads CLEAN without the
+        # guard.  That is the bug, asserted rather than described.
+        assert query_id
+        assert mod.load_fetches(path, {'c_peers': seeded})
+
+        with pytest.raises(mod.FetchCacheError) as excinfo:
+            mod.load_fetches(path, {'c_peers': seeded}, expect_fixtures=[fixture])
+        message = str(excinfo.value)
+        assert 'e2_query_set.jsonl' in message
+        # BOTH digests, so "the fixtures moved" is distinguishable from "the
+        # cache is truncated" without reading code — the rule the corpus
+        # fingerprint refusal already follows.
+        assert cached_sha[:16] in message
+        assert local_sha[:16] in message
+
+    def test_a_cache_with_no_fixture_digests_is_its_own_refusal(self, tmp_path):
+        """A cache written before the guard must not pass by omission.
+
+        The same missing-key/mismatch split `_check_corpus_fingerprint` makes:
+        "never recorded" and "moved" are different operator actions.
+        """
+        mod = _mod()
+        fixture = _fixture_copy(tmp_path, 'e2_query_set.jsonl')
+        path, seeded = self._dump_over(mod, tmp_path, [fixture])
+        doc = json.loads(path.read_text(encoding='utf-8'))
+        del doc['provenance']['fixtures']
+        path.write_text(json.dumps(doc), encoding='utf-8')
+
+        with pytest.raises(mod.FetchCacheError) as excinfo:
+            mod.load_fetches(path, {'c_peers': seeded}, expect_fixtures=[fixture])
+        message = str(excinfo.value)
+        assert 'fixture' in message.lower()
+        # Not a digest disagreement: there is no cached digest to disagree
+        # with, and claiming one would send the operator hunting a drift that
+        # did not happen.
+        assert hashlib.sha256(fixture.read_bytes()).hexdigest()[:16] not in message
+
+    def test_a_fixture_the_cache_never_carried_is_refused(self, tmp_path):
+        """The same drift seen from the other side: the cache was dumped over
+        a DIFFERENT fixture set, so it cannot answer for this one."""
+        mod = _mod()
+        fixtures = [_fixture_copy(tmp_path, 'e2_query_set.jsonl')]
+        path, seeded = self._dump_over(mod, tmp_path, fixtures)
+        extra = _fixture_copy(tmp_path, 'e2_arm_claims.jsonl')
+
+        with pytest.raises(mod.FetchCacheError) as excinfo:
+            mod.load_fetches(
+                path, {'c_peers': seeded}, expect_fixtures=[*fixtures, extra],
+            )
+        assert 'e2_arm_claims.jsonl' in str(excinfo.value)
+
+    def test_an_unmutated_fixture_set_loads(self, tmp_path):
+        """The converse, so the refusals above are not vacuously always-on."""
+        mod = _mod()
+        fixtures = [
+            _fixture_copy(tmp_path, name) for name in sorted(ANCHOR_FIXTURE_SHA256)
+        ]
+        path, seeded = self._dump_over(mod, tmp_path, fixtures)
+
+        loaded = mod.load_fetches(
+            path, {'c_peers': seeded}, expect_fixtures=fixtures,
+        )
+
+        assert list(loaded['c_peers']['queries']) == ['q1']
+
+    def test_reordering_the_fixture_list_is_not_a_false_alarm(self, tmp_path):
+        """`fixture_digests` emits in the CALLER's argument order, not sorted,
+        so a positional comparison would fire on a caller that merely
+        reordered its list — a refusal naming a drift that did not happen."""
+        mod = _mod()
+        fixtures = [
+            _fixture_copy(tmp_path, name) for name in sorted(ANCHOR_FIXTURE_SHA256)
+        ]
+        path, seeded = self._dump_over(mod, tmp_path, fixtures)
+
+        loaded = mod.load_fetches(
+            path, {'c_peers': seeded}, expect_fixtures=list(reversed(fixtures)),
+        )
+
+        assert list(loaded['c_peers']['queries']) == ['q1']
+
+    def test_the_guard_defaults_to_off(self, tmp_path):
+        """Opt-in for the reason `load_fetches`' docstring already gives for
+        its two other guards: the pure round-trip tests exercise the join
+        without a fixture set at all, and must keep passing untouched."""
+        mod = _mod()
+        fixture = _fixture_copy(tmp_path, 'e2_query_set.jsonl')
+        path, seeded = self._dump_over(mod, tmp_path, [fixture])
+        fixture.unlink()  # gone entirely: recomputing a digest would raise
+
+        assert mod.load_fetches(path, {'c_peers': seeded})
+
+
+# ===========================================================================
 # step-5 — the CLI wiring, exercised WITHOUT a network
 # ===========================================================================
 #
@@ -1028,6 +1208,35 @@ class TestReplayFetchesFlag:
             tmp_path, 'replay', '--replay-fetches', str(cache),
         )) != 0
         # And NO artifact was written from the refused run.
+        assert not (tmp_path / 'replay.json').exists()
+
+    def test_a_replay_against_an_edited_query_set_exits_nonzero(
+        self, tmp_path, monkeypatch,
+    ):
+        """The digest guard, wired rather than merely available.
+
+        The corpus fingerprint cannot catch this one: `materialize_arm` takes
+        no queries, so a query-set edit leaves every fingerprint intact and
+        the replay would publish rankings fetched against text that is no
+        longer in the tree.
+        """
+        mod = _mod()
+        cache = tmp_path / 'cache.json'
+        _install_driver_doubles(monkeypatch)
+        assert mod.main(_argv(tmp_path, 'live', '--dump-fetches', str(cache))) == 0
+
+        doc = json.loads(cache.read_text(encoding='utf-8'))
+        row = next(
+            r for r in doc['provenance']['fixtures']
+            if r['path'].endswith('e2_query_set.jsonl')
+        )
+        row['sha256'] = 'deadbeef' * 8
+        cache.write_text(json.dumps(doc), encoding='utf-8')
+
+        _install_driver_doubles(monkeypatch)
+        assert mod.main(_argv(
+            tmp_path, 'replay', '--replay-fetches', str(cache),
+        )) != 0
         assert not (tmp_path / 'replay.json').exists()
 
 

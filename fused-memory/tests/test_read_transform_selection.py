@@ -3190,6 +3190,31 @@ class TestTheGuardIsWiredNotMerelyAvailable:
 
         assert set(scored['e2']) == set(_mod().ARM_KEYS)
 
+    def test_score_from_cache_refuses_a_drifted_query_set_digest(self, tmp_path):
+        """`score_from_cache` inherits the E2 half's fixture-digest hole
+        identically, so it must inherit the guard too.
+
+        Asserted by tampering with the CACHE rather than a committed fixture:
+        the recomputed digest of the real `e2_query_set.jsonl` then disagrees
+        with the one the cache claims, which is exactly the disagreement a
+        working-tree fixture edit produces — without leaving the tree dirty.
+        """
+        mod = _mod()
+        doc = json.loads(COMMITTED_FETCH_CACHE.read_text(encoding='utf-8'))
+        row = next(
+            r for r in doc['provenance']['fixtures']
+            if r['path'].endswith('e2_query_set.jsonl')
+        )
+        row['sha256'] = 'deadbeef' * 8
+        target = tmp_path / 'e2_fetch_cache.json'
+        target.write_text(json.dumps(doc, indent=2, sort_keys=True) + '\n',
+                          encoding='utf-8')
+
+        with pytest.raises(_bake_off().FetchCacheError) as excinfo:
+            mod.score_from_cache(fetch_cache=target)
+
+        assert 'e2_query_set.jsonl' in str(excinfo.value)
+
     def test_main_reports_the_refusal_without_a_traceback(
         self, tmp_path, capsys,
     ):
