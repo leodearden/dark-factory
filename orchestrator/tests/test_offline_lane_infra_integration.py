@@ -390,8 +390,19 @@ async def _run_lane(
     measured worst-case single subprocess spawn latency at 4.71s on this
     host under load; a caller can easily need several spawns inside this
     window. Same load-sensitive full-suite-flake class as
-    1335/1836/2819/3451/3491 (task 3832); 30s is the ceiling task 3491
-    settled on for it. Widening THIS bound alone can never make a broken
+    1335/1836/2819/3451/3491 (task 3832). FLOOR (task 3451): worst-case
+    happy-path subprocess spawn latency measured at 4.71s (n=3:
+    2.13/3.10/4.71, load-per-core 6.6) — this, not task 3491, is the genuine
+    precedent for ``_LANE_PASS_BOUND_SECS``. CEILING: the 60s global
+    pytest-timeout (``orchestrator/pyproject.toml``, ``timeout_method =
+    "thread"``, ``--max-worker-restart=0``). Task 3491 is precedent AGAINST
+    a bound near that ceiling, not for one: it REJECTED a 30s ceiling for
+    this exact collision and landed ``asyncio.wait_for(..., timeout=5)``
+    instead (``test_usage_gate.py``:328,790) — its scope was exclusively
+    ``test_usage_gate.py``; it never touched any offline-lane module. Both
+    halves are pinned executably by
+    ``test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling``
+    below. Widening THIS bound alone can never make a broken
     staging pass — it only lengthens how long a genuinely broken SINGLE pass
     takes to fail. That safety property does not compose for free: callers
     chaining N passes (:func:`_drive_infra_reds`) sum this bound N times, so
@@ -403,7 +414,23 @@ async def _run_lane(
     ``timeout_method`` comment). Multi-pass callers whose worst-case sum is
     at or above that ceiling carry their own ``@pytest.mark.timeout``
     override — see
-    ``test_ib4_same_infra_set_recurrence_updates_not_duplicates`` below.
+    ``test_ib4_same_infra_set_recurrence_updates_not_duplicates`` and
+    ``test_ib2_infra_run_in_flight_never_gates_merge`` below — a rule
+    ``test_every_composing_caller_carries_a_timeout_override`` now enforces
+    rather than merely describes.
+
+    WORK-2 VERDICT (task 4030): the six 30.0 defaults derived from this
+    function were re-verified and STAND — they rest on task 3451's 4.71s
+    measurement above, not on the retracted 3491 claim; narrowing them would
+    re-introduce the flake commits 289ae708bb / 80ae271a34 fixed. What the
+    re-verification DID find uncovered was the COMPOSITION: the
+    ``_drive_infra_reds`` chainers were already covered by the task 3832
+    review's markers (commit d34260aef9), but
+    ``test_ib2_infra_run_in_flight_never_gates_merge`` composed this
+    function's 30s bound (raced concurrently by ``wait_entered``, so max not
+    sum) with :func:`_assert_infra_never_a_gate`'s 0.5 + 15.0 SEQUENTIALLY
+    after it — 45.5s — plus unbounded real-git spawns, and carried no
+    override. It does now.
     """
     inner_run_once = worker._run_once
     done = asyncio.Event()
@@ -467,15 +494,17 @@ class _ControllableInfraRunner:
         """Block until the held first call has actually started (is in-flight).
 
         ``timeout`` defaults to 30.0 for the same reason as ``_run_lane``'s
-        default (see the canonical derivation at
-        ``test_offline_lane_integration.py``:261-271): the ``_run_lane``
-        task created just before this call races the SAME clock, and this
-        call is entered only after ``OfflineLaneWorker._run_once`` has
-        already done its own real-git work (``get_main_sha`` plus a
-        persistent-worktree reset — 3-5 subprocess spawns) — a tighter
-        bound here would fire before ``_run_lane``'s ever could. Same safety
-        property: widening can never make a broken staging pass, it only
-        lengthens how long a genuinely wedged runner takes to fail.
+        default above (see that function's docstring for the full FLOOR/
+        CEILING derivation, canonically stated in
+        ``test_offline_lane_integration.py``'s own ``_run_lane``): the
+        ``_run_lane`` task created just before this call races the SAME
+        clock, and this call is entered only after
+        ``OfflineLaneWorker._run_once`` has already done its own real-git
+        work (``get_main_sha`` plus a persistent-worktree reset — 3-5
+        subprocess spawns) — a tighter bound here would fire before
+        ``_run_lane``'s ever could. Same safety property: widening can never
+        make a broken staging pass, it only lengthens how long a genuinely
+        wedged runner takes to fail.
         """
         await asyncio.wait_for(self._entered.wait(), timeout=timeout)
 
@@ -558,7 +587,9 @@ async def _drive_infra_reds(
     Each pass sums its own 30s :func:`_run_lane` bound (see that function's
     docstring); a caller whose ``n`` pushes the total at or above the 60s
     pyproject per-test timeout MUST carry its own ``@pytest.mark.timeout``
-    override (task 3832 review) — see IB4 below.
+    override (task 3832 review) — see IB4 below. This rule is enforced, not
+    merely described, by
+    ``test_every_composing_caller_carries_a_timeout_override``.
     """
     _inject_infra_red(worker, failing_ids)
     for _ in range(n):

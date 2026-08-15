@@ -403,9 +403,9 @@ class _ControllableSuiteRunner:
         """Block until the held first call has actually started (is in-flight).
 
         ``timeout`` defaults to 30.0 for the same reason as ``_run_lane``'s
-        default above (see the derivation at this module's lines 261-271):
-        the ``_run_lane`` task created just before this call races the SAME
-        clock, and this call is entered only after
+        default above (see that function's docstring for the full FLOOR/
+        CEILING derivation): the ``_run_lane`` task created just before this
+        call races the SAME clock, and this call is entered only after
         ``OfflineLaneWorker._run_once`` has already done its own real-git
         work (``get_main_sha`` plus a persistent-worktree reset — 3-5
         subprocess spawns) — a tighter bound here would fire before
@@ -590,6 +590,8 @@ async def _drive_reds(
     docstring); a caller whose ``n`` (or count of calls) pushes the total at
     or above the 60s pyproject per-test timeout MUST carry its own
     ``@pytest.mark.timeout`` override (task 3832 review) — see B5/B7 below.
+    This rule is enforced, not merely described, by
+    ``test_every_composing_caller_carries_a_timeout_override``.
     """
     _inject_red(worker, failing_ids)
     for _ in range(n):
