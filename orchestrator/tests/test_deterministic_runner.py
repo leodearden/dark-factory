@@ -2342,6 +2342,13 @@ class TestDefaultRunnerInnerTimeoutDeployParity:
     Drives the REAL ``_default_run_script`` (``script_runner=None``) — the
     existing hung-seam coverage all injects a custom ``script_runner`` and so
     only ever exercises the OUTER guard.
+
+    BOTH deploy branches are pinned — target_unit-less
+    (``_run_deploy_script_guarded``) and named-target (``_RunFnProcShim`` ->
+    ``RestartPlan.execute()``).  They share ONE
+    ``_invoke_run_fn_translating_timeout``, so a drift that pushed the
+    ``ScriptTimeout`` restore down into either call site would degrade only
+    the other one — a single-branch pin would not catch it.
     """
 
     async def test_targetless_deploy_default_runner_inner_timeout_files_infra_issue(
@@ -2414,6 +2421,92 @@ class TestDefaultRunnerInnerTimeoutDeployParity:
         ]
         assert done_calls == [], 'set_task_status must NOT be called with done on timeout'
         unit_inspector.assert_not_awaited()
+
+    async def test_named_target_deploy_default_runner_inner_timeout_is_restart_failed(
+        self, tmp_path: Path,
+    ):
+        """Same parity pin for the OTHER deploy branch: a named ``target_unit``
+        routes the ``(rc, tail)`` pair through ``_RunFnProcShim`` into
+        ``RestartPlan.execute()``, which must classify it as
+        ``RESTART_FAILED`` -> the ``Deploy failed: <unit>`` infra_issue.
+
+        This is the half of ``_invoke_run_fn_translating_timeout``'s anti-drift
+        claim the target_unit-less case cannot cover.  Both deploy branches go
+        through that ONE shared wrapper; if the ``ScriptTimeout`` catch were
+        ever moved down into ``_run_deploy_script_guarded``, THIS branch would
+        silently degrade — ``ScriptTimeout`` would escape ``plan.execute()``
+        into ``run()``'s catch-all and be reported as 'Deploy run_fn raised an
+        unexpected error', i.e. the same category with materially worse
+        diagnostics.
+        """
+        import asyncio
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        script = tmp_path / 'slow-named-deploy.sh'
+        script.write_text('#!/bin/sh\nsleep 30\n')
+        script.chmod(0o755)
+
+        target_unit = 'orchestrator-reify.service'
+        task = _deploy_task(
+            task_id='4065b',
+            target_unit=target_unit,
+            script=str(script),
+            cwd=str(tmp_path),
+            timeout_secs=1,
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+        # Baseline inspect only: the script "fails" (rc=1), so execute() skips
+        # the post-deploy verify re-inspect entirely.
+        unit_inspector = AsyncMock(return_value=_BASELINE_UNIT_STATE)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=None,
+        )
+
+        # Hang tripwire: also proves the INNER timeout (1s) beat the outer
+        # guard (31s) rather than the other way round.
+        outcome = await asyncio.wait_for(runner.run(assignment), timeout=20)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+
+        pending = queue.get_by_task('4065b', status='pending')
+        assert len(pending) == 1, f'Expected exactly 1 pending escalation, got {len(pending)}'
+        esc = pending[0]
+        assert esc.level == 2
+        assert esc.severity == 'critical'
+        assert esc.agent_role == 'orchestrator-deterministic'
+        assert esc.category == 'infra_issue'
+        assert esc.summary == f'Deploy failed: {target_unit}', (
+            f'the restored (rc, tail) pair must reach RestartPlan.execute() and '
+            f'come back as RESTART_FAILED — NOT escape as a raw ScriptTimeout '
+            f"into run()'s catch-all ('Deploy run_fn failed (unexpected error): "
+            f"{target_unit}'): {esc.summary!r}"
+        )
+        assert 'rc=1' in esc.detail, (
+            f'the legacy rc=1 must still reach the named-target classifier: '
+            f'{esc.detail!r}'
+        )
+        assert '<script timed out after 1s>' in esc.detail, (
+            f'the legacy timed-out tail marker must survive the _RunFnProcShim '
+            f'round-trip verbatim: {esc.detail!r}'
+        )
+
+        assert unit_inspector.await_count == 1, (
+            f'baseline inspect only — a failed script skips the verify '
+            f're-inspect: {unit_inspector.await_count}'
+        )
+        done_calls = [
+            c for c in scheduler.set_task_status.call_args_list
+            if c.args[1] == 'done'
+        ]
+        assert done_calls == [], 'set_task_status must NOT be called with done on timeout'
 
 
 # ---------------------------------------------------------------------------
@@ -9391,26 +9484,17 @@ class TestPredicateDefaultRunnerInnerTimeout:
 
         # The message must identify WHICH guard fired: all three predicate
         # infra_issue arms share one category, so the text is the only
-        # discriminator a human gets.
-        text = f'{esc.summary}\n{esc.detail}'
-        assert 'timed out' in text.lower(), (
-            f'the escalation must name the timeout: {text!r}'
-        )
-        assert "before_done['timeout_secs']" in text, (
-            f"the escalation must cite before_done['timeout_secs'] as the "
-            f'budget that was overrun: {text!r}'
-        )
-        assert '1s' in text, (
-            f'the escalation must cite the actual 1s budget: {text!r}'
-        )
-        assert 'unexpected error' not in text.lower(), (
-            f'a per-script timeout is a well-understood, expected event — it '
-            f"must not be reported through the generic unexpected-error arm's "
-            f'wording: {text!r}'
-        )
-        assert 'outer guard' not in text.lower(), (
-            f'the INNER per-script timeout must be distinguishable from the '
-            f'outer wall-clock backstop: {text!r}'
+        # discriminator a human gets.  Each arm has a unique, STABLE summary,
+        # so pin that exactly rather than sniffing the detail — detail
+        # substrings do not actually discriminate (the outer-guard detail also
+        # cites before_done['timeout_secs'], and its '31s' contains '1s'), and
+        # negative substring pins would fail on a purely additive wording
+        # improvement.
+        assert esc.summary == 'Predicate check script timed out (no verdict produced)', (
+            f'must be the INNER per-script timeout arm — not the outer-guard '
+            f"arm ('Predicate check timed out (subprocess hung)') nor the "
+            f"generic arm ('Predicate check run_fn failed (unexpected "
+            f"error)'): {esc.summary!r}"
         )
 
         scheduler.update_task.assert_not_awaited()  # no gate_escalated_at stamp
