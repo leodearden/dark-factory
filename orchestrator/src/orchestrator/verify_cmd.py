@@ -1360,7 +1360,7 @@ def _cargo_scope_structured(cmd: VerifyCmd, crates: list[str]) -> VerifyCmd:
 _PYTEST_INVOCATION_RE = re.compile(r'\bpytest\b[^&|;]*')
 
 
-def _split_at_unbalanced_close(segment: str) -> tuple[str, str]:
+def _split_at_unbalanced_close(segment: str) -> tuple[str, str] | None:
     """Split *segment* at its first depth-0, UNQUOTED ')', or return it whole.
 
     Scans *segment*'s unquoted characters only (via ``_unquoted_chars``,
@@ -1392,8 +1392,31 @@ def _split_at_unbalanced_close(segment: str) -> tuple[str, str]:
     char-class-widening fix for. Building on ``_unquoted_chars`` instead of a
     second, weaker hand-rolled paren counter fixes this for free: a ``)``
     inside quotes is never even offered to the depth check below.
+
+    REFUSAL — returns ``None`` (task 4121, recovered from task 3650's review;
+    see task 4023). When ``_unquoted_chars`` reports ``unterminated``,
+    *segment* ENDS inside an unclosed quote, so there is no correct place to
+    append at all: anything put at the end of ``body`` lands INSIDE a live
+    quoted argument. That is not hypothetical — ``_PYTEST_INVOCATION_RE`` is
+    quote-blind and stops at the first ``&&``/``|``/``;`` it sees, including
+    one inside a quoted ``-k`` expression, so ``pytest -k 'a && b' tests/ &&
+    true`` yields exactly such a span (measured: ``"pytest -k 'a "``) and the
+    appender produced ``pytest -k 'a -p no:xdist -o addopts='' && b' tests/
+    && true`` — which still passes ``bash -n``, because bash re-tokenises it
+    into a single ``-k`` word ``a -p no:xdist -o addopts= && b``. The
+    recovery flags never reach pytest as flags, and the wrong tests run
+    silently. Refusing restores the exact pre-mutation command instead.
+
+    This mirrors the SAME flag's other consumer: ``_scan_and_chain`` already
+    does ``if strict and (unterminated or depth != 0): return None``, which
+    is why ``_unquoted_chars`` returns the flag at all and why ``None`` is
+    this module's established spelling of "refuse". The first cut of this
+    function discarded it (``chars, _unterminated = ...``); honouring it here
+    is the whole of the fix.
     """
-    chars, _unterminated = _unquoted_chars(segment)
+    chars, unterminated = _unquoted_chars(segment)
+    if unterminated:
+        return None
     depth = 0
     for i, ch in chars:
         if ch == '(':
@@ -1403,6 +1426,40 @@ def _split_at_unbalanced_close(segment: str) -> tuple[str, str]:
                 return segment[:i], segment[i:]
             depth -= 1
     return segment, ''
+
+
+def _has_unspliceable_pytest_invocation(raw: str) -> bool:
+    """True when ANY ``_PYTEST_INVOCATION_RE`` span in *raw* refuses to split.
+
+    The whole-string pre-screen for ``_append_to_raw_pytest_invocations``,
+    defined in terms of ``_split_at_unbalanced_close`` so the screen and the
+    per-span split share ONE definition of refusal and cannot drift apart.
+
+    WHY WHOLE-STRING RATHER THAN PER-SPAN — both halves measured, neither
+    assumed:
+
+    * On ``pytest -k 'a && b' t1/ && pytest t2/`` the spans' ``unterminated``
+      flags are ``[True, False]``: one corrupt span plus a perfectly clean
+      ``pytest t2/``. Skipping only the offending span would leave invocation
+      1 unflagged and invocation 2 flagged — a HALF-serial chain that
+      ``_is_serial_forced`` (a plain ``'no:xdist' in cmd.raw`` substring test)
+      still reports as fully serial, which then suppresses a later ``-n``
+      injection on a command that is not actually serial.
+    * On ``pytest -k 'a && pytest b' tests/`` the spans are
+      ``["pytest -k 'a ", "pytest b' tests/"]`` — BOTH unterminated, because
+      the second ``\\bpytest\\b`` the regex finds sits INSIDE the quoted
+      ``-k`` expression. Once one span ends mid-quote, the regex's
+      segmentation of the whole string is untrustworthy, so no later span in
+      that string can be trusted either.
+
+    Whole-string refusal is the only rule sound under both, and it restores
+    the untouched original — the same discipline ``split_chain_tail`` follows
+    when it rejects.
+    """
+    return any(
+        _split_at_unbalanced_close(match.group(0)) is None
+        for match in _PYTEST_INVOCATION_RE.finditer(raw)
+    )
 
 
 def _append_to_raw_pytest_invocations(raw: str, suffix: str) -> str:
@@ -1440,10 +1497,32 @@ def _append_to_raw_pytest_invocations(raw: str, suffix: str) -> str:
     implementation — the operational impact they pin (``serial_pytest``
     drives the env-transient and flaky-scoped recovery re-runs, so this
     fired at shipped defaults with no knob set) is recorded there.
+
+    REFUSAL CONTRACT (task 4121). When any matched span ends inside an
+    unclosed quote — ``_has_unspliceable_pytest_invocation``, i.e. there is
+    no position in that span where *suffix* would land outside a live quoted
+    argument — this returns *raw* BYTE-IDENTICALLY and the caller re-runs the
+    original command. The asymmetry is what decides it: a lost recovery flag
+    costs one retry its flags and the run then fails for its own reason,
+    loudly, whereas a suffix spliced into a ``-k`` expression runs the WRONG
+    TESTS and still exits ``bash -n`` 0. Refusal is whole-string, not
+    per-span; ``_has_unspliceable_pytest_invocation``'s docstring records the
+    two measurements behind that.
     """
+    if _has_unspliceable_pytest_invocation(raw):
+        return raw
+
     def _rewrite(match: re.Match[str]) -> str:
         segment = match.group(0)
-        body, closer = _split_at_unbalanced_close(segment)
+        split = _split_at_unbalanced_close(segment)
+        # The pre-screen above already returned early for every *raw*
+        # containing a refusing span, so this cannot be None here. Asserting
+        # rather than re-handling keeps a future scanner edit that leaks a
+        # refusal past the screen LOUD, instead of silently reintroducing the
+        # splice — the same convention ``split_top_level_and`` uses for
+        # ``_scan_and_chain``'s ``None``.
+        assert split is not None
+        body, closer = split
         stripped = body.rstrip()
         trailing = body[len(stripped) :]
         return f'{stripped}{suffix}{trailing}{closer}'
