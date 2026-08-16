@@ -318,9 +318,26 @@ class TestMachineryBoundary:
 
         for path in sorted(pathlib.Path(__file__).parent.glob('**/*.py')):
             scanned.add(path.name)
-            leaked = set(MACHINERY) & imported_names_from(
-                parse_python_module(path), HELPERS_MODULE
-            )
+            source = path.read_text()
+            if HELPERS_MODULE not in source or not any(n in source for n in MACHINERY):
+                # Cheap prefilter — a discarded raw read, deliberately the same
+                # convention the sibling barrier guard's _discover_live_index_modules
+                # uses and for the same reason. It is a strict superset of the AST
+                # criterion below: `from _fm_helpers import calls_named` cannot
+                # exist without both tokens present as text. Parsing unfiltered
+                # would parse AND retain a tree for all 293 modules under tests/
+                # for the rest of the session (parse_python_module memoises), when
+                # 4 survive the filter. `scanned` is populated BEFORE this, so the
+                # non-vacuity floor still sees the whole corpus.
+                continue
+            try:
+                tree = parse_python_module(path)
+            except SyntaxError:
+                # A module that does not parse cannot be importing anything. A
+                # deliberately-malformed Python fixture is some other test's
+                # subject; it must not surface here as an AST-machinery failure.
+                continue
+            leaked = set(MACHINERY) & imported_names_from(tree, HELPERS_MODULE)
             if leaked:
                 offenders[path.name] = sorted(leaked)
 
