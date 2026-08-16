@@ -327,15 +327,49 @@ class TestWireEvidence:
         assert detect(correction['decision']) is None
 
     def test_no_inconclusive_specimen_is_committed_as_evidence(self) -> None:
-        """3567 and 4096 must NOT be cited here, in either direction.
+        """The evidence covers ONE specimen, and that scope is machine-enforced.
 
-        They do not reproduce byte-identity on every field. Committing them
-        alongside 3727 would let a reader take the general claim the scope
-        limit explicitly withholds.
+        3727 is the only task on which the harness argument-boundary hypothesis
+        can be tested cleanly. 3567 and 4096 do not reproduce byte-identity on
+        every field, so citing them here — in either direction — would let a
+        reader take the general claim the scope limit explicitly withholds.
+
+        Enforced structurally, in two halves. The provenance fields must agree
+        on one specimen: the plan path and the archive path both name the task
+        the evidence claims to be about, so a fixture assembled from two
+        different tasks' artifacts fails here rather than silently supporting a
+        cross-specimen claim. And neither inconclusive id may appear anywhere in
+        the EVIDENCE.
+
+        ``note`` is deliberately excluded from that second check, and the
+        exclusion is the entire point: the note is prose whose job is to NAME
+        3567 and 4096 as the specimens deliberately left out. Scanning it would
+        invert the test. So the scope limit stays machine-enforced over every
+        field that carries evidence, while the prose stays free to be reworded.
+
+        This is deliberately NOT generalized to "no other task id appears in the
+        evidence" — that assertion is doomed and must not be written. 3727's own
+        specimen prose references other tasks, so the evidence blob legitimately
+        contains other four-digit ids (measured 2026-08-16: 2014, 2026, 2194,
+        3256, 3619, 7756, 7761, 7763, 7768).
         """
         doc = load_wire_evidence()
         assert doc['task_id'] == '3727'
-        assert '3567' in doc['note'] and '4096' in doc['note'], (
-            'the fixture must NAME the inconclusive specimens, so their absence '
-            'reads as a deliberate scope limit rather than an oversight'
+
+        assert doc['task_id'] in doc['source_plan'], (
+            f'the plan path {doc["source_plan"]!r} is not the plan of the task '
+            f'this evidence claims to be about ({doc["task_id"]})'
         )
+        assert doc['task_id'] in doc['source_archive'], (
+            f'the archive path {doc["source_archive"]!r} is not the transcript '
+            f'archive of task {doc["task_id"]}'
+        )
+
+        evidence = json.dumps({k: v for k, v in doc.items() if k != 'note'})
+        for inconclusive in ('3567', '4096'):
+            assert inconclusive not in evidence, (
+                f'task {inconclusive} appears in a committed evidence field. It '
+                'does not reproduce byte-identity on every field and is '
+                'INCONCLUSIVE, so it may be named only in the prose note as a '
+                'scope limit — never carried as evidence.'
+            )
