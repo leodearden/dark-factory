@@ -7,7 +7,8 @@ this batch:
 
   alpha (2924) -- GitOps.remove_merge_worktree_guarded (git_ops.py):
       lease-enforced removal primitive; outcome vocabulary 'removed' /
-      'skipped_lease_held' / 'skipped_persistent' / 'not_present' / 'failed'.
+      'skipped_lease_held' / 'skipped_persistent' / 'not_present' / 'failed'
+      / 'skipped_lock_error'.
   beta  (2925) -- classify_worktree_entry (git_ops.py) + the C2 namespace
       guard in Harness._recover_crashed_tasks (harness.py): the
       crash-recovery sweep SKIPS+REPORTS `_merge-*`/infra bands instead of
