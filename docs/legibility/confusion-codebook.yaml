@@ -1400,6 +1400,12 @@ entries:
     manifested_phase: recon
     invariant_violated: StructuredOutput schema mismatch
     note: 'StructuredOutput wrapper contains nested double-wrapping: outer schema expects {findings: [], severity: string} but output has {findings: {findings: [], severity: ...}}, causing ''root: must have required property'' error; recon agent''s digest extraction is triggering protocol validation failure on turn 11'
+  - date: '2026-08-11'
+    project: dark_factory
+    session: d09bd233-0e9f-4da4-8d1a-ab4d1a87511f
+    origin_phase: implement
+    manifested_phase: implement
+    note: Orchestrated-task worktree session (3775) shows 3 identical 'Your previous run was interrupted by a usage limit. Continue where you left off and complete your task.' boilerplate turns (133, 143, 152) — a usage-limit resume storm matching this entry's named 'usage-limit resume storms' cause.
 - id: prose-routing-intent
   title: Execution-routing intent lives only in description prose — no-code deploys, gates, operator actions, and design decisions dispatch into the TDD architect pipeline
   severity: medium
@@ -1975,6 +1981,12 @@ entries:
     origin_phase: recon
     manifested_phase: recon
     note: memory_consolidator stage reports llm_calls=34 but tokens_used=0 (impossible)
+  - date: '2026-08-12'
+    project: dark_factory
+    session: 509e18d2-91a5-445f-82e0-5122229d64b1
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'memory_consolidator stage report shows "llm_calls": 65 with "tokens_used": 0 — the exact zero-cost-telemetry-despite-nonzero-llm_calls pattern.'
 - id: entry-cand-20260722-3
   title: watcher-rearm.sh requires undocumented DARK_FACTORY_ROOT env var not set by rotation launch context
   severity: medium
@@ -2335,6 +2347,12 @@ entries:
     origin_phase: unknown
     manifested_phase: verify
     note: 'Turn 32: multi-command Bash sequence (cat|head; ls; cat) exits code 1 in worktree. Static-analysis pre-check may reject `;`-separated commands.'
+  - date: '2026-08-10'
+    project: dark_factory
+    session: c8e1481a-2081-4fb1-a68f-0d8f3e349067
+    origin_phase: unknown
+    manifested_phase: implement
+    note: 'Bash({command: ''python3 -c "\nimport json\n...''}) with embedded newlines executed with the newlines stripped into a single physical line (''File "<string>", line 1 ... import json p=json.load(...) pre=... print(...) bad=...''), producing IndentationError: unexpected indent — the multi-line-script flattening bug referenced by 20260722-6, here manifesting as silent corruption rather than outright pre-check rejection.'
 - id: entry-cand-20260714-2
   title: resolve_ticket timeout gives no outcome signal, forcing redundant state polling
   severity: medium
@@ -2803,6 +2821,24 @@ entries:
     origin_phase: ops
     manifested_phase: ops
     note: Digest for this watcher session (295 bytes, score 0.0, all signal_counts zero) contains no actual session content — only the harness's injected system-reminder boilerplate (deferred-tool list, agent-type list, MCP server instructions, skill listing). The digest-capture pipeline collapsed a real (or near-empty) watcher rotation to pure context-stuffing boilerplate, discarding whatever substance the session actually had, exactly matching the documented pattern.
+  - date: '2026-08-11'
+    project: dark_factory
+    session: 5e723e7b-b6c8-4840-8912-a1ddfb7a521a
+    origin_phase: ops
+    manifested_phase: ops
+    note: Watcher session ran to at least turn 47 (interrupted there) but the digest's entire captured content is the turn-6 slash-command launch boilerplate (/recon-escalation-watcher's result.md-writing instructions) plus the turn-47 interrupt notice — 1141 bytes, score 12.0, none of the ~40 intervening turns' substance (what the watcher actually observed/did in the escalation queue) survived extraction.
+  - date: '2026-08-10'
+    project: dark_factory
+    session: 5c74ec4f-7d27-4c36-aec3-ddeb308a7d81
+    origin_phase: recon
+    manifested_phase: recon
+    note: Digest for this recon-class session (2026-08-10) is reduced to bare frontmatter only — 293 bytes total, score 0.0, every signal_count (tool_error/self_correct/not_found/df_guard/interrupt) reading zero — with no transcript excerpt or evidence body surviving extraction, matching the known pattern of digest generation collapsing a real session to boilerplate and discarding whatever substance it contained.
+  - date: '2026-08-10'
+    project: dark_factory
+    session: 4217a3a4-45f3-4371-aa25-0e2a795b6df2
+    origin_phase: recon
+    manifested_phase: ops
+    note: Digest for this recon-class session is 293 bytes with score 0.0 and every signal_count at 0, and the only 'session content' rendered is verbatim system-reminder boilerplate (deferred-tool list, agent-type roster, MCP server instructions, skills catalog) — no actual transcript substance survived extraction, matching the pattern of a scored session collapsing to injected boilerplate.
 - id: entry-cand-20260720-7
   title: Recon stage self-reported counters diverge from computed pipeline stats, with mismatched field names between the two
   severity: medium
@@ -3066,6 +3102,12 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: Session-start memory search returned task-irrelevant high-scored context (Tasks 1470, 2531, 841 with relevance 0.9–1.0)
+  - date: '2026-08-15'
+    project: dark_factory
+    session: d0e753b6-0022-483c-a211-f5eeef43cade
+    origin_phase: ops
+    manifested_phase: unknown
+    note: The recalled memories injected at session start (task 1470 wiring /audit into /review, reify task 2531's plan.json finding, architecture-doc corroboration) score 1.0/0.95/0.9 relevance but read as generic project facts with no evident connection to whatever task 3956's worktree actually concerns — matches the generic-high-score-but-irrelevant pattern.
 - id: entry-cand-20260717-2
   title: Rotation-hour budget invisible during long blocking re-arm waits
   severity: medium
@@ -3603,6 +3645,18 @@ entries:
     origin_phase: recon
     manifested_phase: recon
     note: 'memory_consolidator stage report shows tokens_used: 0 alongside llm_calls: 16 — cost telemetry zeroed despite nonzero LLM call count.'
+  - date: '2026-08-10'
+    project: dark_factory
+    session: da843dcc-deab-485c-802e-438fb062ab56
+    origin_phase: unknown
+    manifested_phase: recon
+    note: 'Embedded memory_consolidator stage report shows "llm_calls": 20 paired with "tokens_used": 0, the same zero-cost-telemetry-despite-real-LLM-activity pattern.'
+  - date: '2026-08-12'
+    project: dark_factory
+    session: ed849786-2ae7-471a-a644-b32ca3807a57
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'The embedded memory_consolidator stage report shows "llm_calls": 26 alongside "tokens_used": 0 — the reconciliation stage cost telemetry is zeroed despite nonzero LLM call count, the same defect this entry already tracks.'
 - id: entry-cand-20260713-2
   title: Stage report carries a nested '_reported' stats dict that disagrees with its own top-level actual stats
   severity: medium
@@ -4069,6 +4123,18 @@ entries:
     origin_phase: recon
     manifested_phase: recon
     note: memory_consolidator stats nest a redundant _reported dict duplicating top-level counters (memories_added, graphiti_writes_queued, edges_updated)
+  - date: '2026-08-10'
+    project: dark_factory
+    session: da843dcc-deab-485c-802e-438fb062ab56
+    origin_phase: unknown
+    manifested_phase: recon
+    note: memory_consolidator stats nest a '_reported' subdict (memories_written/memories_added/edges_updated/graphiti_writes_queued) duplicating top-level counters with an extra field (memories_written) absent from the top level.
+  - date: '2026-08-12'
+    project: dark_factory
+    session: 509e18d2-91a5-445f-82e0-5122229d64b1
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'memory_consolidator stats nest a "_reported": {"memories_added": 6.0, "memories_written": 6.0} subtotal duplicating the top-level "memories_added": 6 counter — the redundant _reported-subtotal pattern.'
 - id: entry-cand-20260722-27
   title: Trickle-coder digest pipeline ingests its own prior invocations as session digests
   severity: medium
@@ -4311,6 +4377,12 @@ entries:
     origin_phase: architect
     manifested_phase: architect
     note: 'Worktree session hits file-not-found errors during exploration phase. Read tool error shows path with malformed package nesting: fused-memory/fused-memory instead of canonical fused-memory/src/fused_memory convention (3 not_found signals)'
+  - date: '2026-08-10'
+    project: dark_factory
+    session: c8e1481a-2081-4fb1-a68f-0d8f3e349067
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Not-Found signal at turn 13 records a bare 'modulenotfounderror' inside the task-3689 worktree with no further context captured in the digest — consistent with 20260722-29's ModuleNotFoundError-in-task-worktree pattern, though evidence here is too terse to confirm the phase as architect explore specifically.
 - id: entry-cand-20260720-10
   title: Architect overrides explicit in-task dependency-coordination branching instructions instead of following them
   severity: medium
@@ -4411,6 +4483,12 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: Bash sed command with line-number offsets (ranges 959–1010 and 9030–9050 in orchestrator/src/orchestrator/harness.py) failed with exit code 2; fragile offset-based navigation of a large Python module.
+  - date: '2026-08-15'
+    project: dark_factory
+    session: 554f30cd-b6dd-45e3-bdbd-f2efe24bb045
+    origin_phase: implement
+    manifested_phase: implement
+    note: 'Turn 47: Read on dashboard/tests/test_memory_evals_data.py at offset=1380/limit=220 (chunked offset navigation of a large test file) produced a malformed-JSON InputValidationError (stray extra comma) before the agent presumably retried — consistent with the fragility of offset/grep-based navigation this entry documents for oversized test files.'
 - id: entry-cand-20260722-31
   title: Trickle-coder digest generator mislabels the injected task/system prompt as a 'User Correction'
   severity: medium
@@ -5031,6 +5109,30 @@ entries:
     origin_phase: unknown
     manifested_phase: review
     note: Guard trip recorded in signal_counts (df_guard=1) but rendered as bare template 'blocked:' with no matched detail or substantive diagnostic
+  - date: '2026-08-15'
+    project: dark_factory
+    session: 5ea0604f-7114-40ac-b4c6-308e1f28dc6f
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Guard Trips section renders four entries as bare '(turn N) blocked:' with nothing after the colon — the digest captured the guard-trip template but dropped the matched substring/detail, same signature as the cited candidate.
+  - date: '2026-08-15'
+    project: dark_factory
+    session: eea99f40-e136-484f-964d-e0c3c9cc3050
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Digest's 'Guard Trips' entry reads '(turn 17) blocked:' with nothing after the colon, and 'Not Found' reads '(turn 51) does not exist' with no subject before it — both signal templates rendered with the matched substring (guard name/reason, missing-entity name) dropped, exactly the bare-template defect this entry describes.
+  - date: '2026-08-10'
+    project: dark_factory
+    session: 5eb75d73-3b90-474e-822b-73c86f28620e
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Digest's 'Guard Trips' section renders two entries as bare '(turn N) blocked:' with nothing after the colon — the matched guard/block message text was dropped, leaving an uninformative template exactly as described by this candidate.
+  - date: '2026-08-15'
+    project: dark_factory
+    session: ca92c63f-be62-4c5a-b56d-03fb1e3d47e5
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Digest body is two bare 'not_found' templates ('(turn 6) does not exist', '(turn 27) does not exist') with the actual matched substring/entity dropped — same bare-template pattern as entry-cand-20260722-33, leaving no evidence of what the session was actually confused about.
 - id: entry-cand-20260722-34
   title: Census-verifier agent doesn't know the transcript storage path convention, so it blind-searches the filesystem and repeatedly hits approval gates
   severity: medium
@@ -5451,6 +5553,12 @@ entries:
     origin_phase: recon
     manifested_phase: recon
     note: Digest captured injected memory-search '# Context' briefing under 'User Corrections' (turn 3); the digest itself warns this context is not a worktree description
+  - date: '2026-08-12'
+    project: dark_factory
+    session: b976febe-ee9f-4157-ac6f-a8f756377b8e
+    origin_phase: ops
+    manifested_phase: ops
+    note: Turn 3 is the standard injected '# Context' memory-recall briefing block (with the 'NOT a description of this worktree... verify it exists before reading it' disclaimer), captured verbatim into the 'User Corrections' bucket — same mislabeling pattern as the matched entry.
 - id: entry-cand-20260725-3
   title: Digest 'User Corrections' bucket captures pasted non-corrective report/log content
   severity: medium
@@ -5553,6 +5661,36 @@ entries:
     origin_phase: review
     manifested_phase: unknown
     note: 'Code review feedback from verify/review phase categorized under ''User Corrections'' (turn 3: ''The implementation was reviewed and blocking issues were found.'') despite being review output, not user-provided agent correction. Review section exists separately but digest mislabels the outcome summary.'
+  - date: '2026-08-10'
+    project: dark_factory
+    session: f010dbb9-3140-40f1-9328-7534724c5bd6
+    origin_phase: ops
+    manifested_phase: ops
+    note: Same digest's 'User Corrections' bucket also captured a raw <task-notification> block (background command 'Locate shared task_claimant' completion) — non-corrective tool/system output filed under corrections, matching the generic 'captures pasted non-corrective report/log content' pattern.
+  - date: '2026-08-11'
+    project: dark_factory
+    session: 5e723e7b-b6c8-4840-8912-a1ddfb7a521a
+    origin_phase: ops
+    manifested_phase: ops
+    note: The '## User Corrections' section captures the turn-6 <command-message>/<command-args> block — the skill's own injected launch/exit-protocol boilerplate for /recon-escalation-watcher — not any actual corrective feedback from a human; same digest-heuristic overreach as the cataloged '# Context'-block mislabeling variants, just triggered by a command-invocation block instead.
+  - date: '2026-08-11'
+    project: dark_factory
+    session: d54ead31-0cb1-496c-a7d1-38a2683e5e6d
+    origin_phase: unknown
+    manifested_phase: ops
+    note: Turn-3 content captured under 'User Corrections' is not user feedback at all — it's an injected task-tagging/file-prediction subagent prompt ('predict which files each task will create or modify... used to derive concurrency locks') pasted verbatim into a watcher-class session and mislabeled by the digest extractor as a corrective User Correction.
+  - date: '2026-08-11'
+    project: dark_factory
+    session: 4396db7a-92bc-4ba5-bfb2-64eeb3cb59e9
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Digest's 'User Corrections' bucket captures a system-generated <task-notification> (sub-agent failed on weekly usage-limit) and a generic harness resume message ('Your previous run was interrupted by a usage limit. Continue where you left off') — neither is corrective user feedback, matching the non-corrective-content-mislabeled-as-correction pattern.
+  - date: '2026-08-11'
+    project: dark_factory
+    session: 146ba9dc-d7e1-4195-8568-7346e0169900
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The same digest's 'User Corrections' bucket also captures the harness's own resume boilerplate ('Your previous run was interrupted by a usage limit. Continue where you left off...') twice (turns 320, 332) — non-corrective injected/log-style text, not user feedback.
 - id: entry-cand-20260728-1
   title: Digest pipeline mislabels an ordinary task's injected '# Context' project-briefing block as a 'User Correction'
   severity: medium
@@ -5650,6 +5788,12 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: Orchestrated task's injected '# Context' and '## Project Context' memory-search blocks appear under 'User Corrections' heading in digest; they are system-injected briefing, not user feedback.
+  - date: '2026-08-10'
+    project: dark_factory
+    session: f010dbb9-3140-40f1-9328-7534724c5bd6
+    origin_phase: ops
+    manifested_phase: ops
+    note: Digest's 'User Corrections' bucket captured the injected '# Context' project-memory-search block (graphiti excerpts about tasks 1470/2531/841, explicitly disclaimed as 'NOT a description of this worktree') verbatim as if it were a human correction — same recurring digest-pipeline mislabeling as prior entries.
 - id: entry-cand-20260731-1
   title: Digest 'User Corrections' bucket captures a raw reconciliation run-review JSON dump as if it were corrective user feedback
   severity: medium
@@ -5916,6 +6060,72 @@ entries:
     origin_phase: recon
     manifested_phase: recon
     note: 'Raw reconciliation run-review JSON dump (with detailed memory_consolidator stage-report stats: memories_updated, graphiti_queue_health, status_correction_reconciliation, etc.) appears in ''User Corrections'' bucket instead of being recognized as system output'
+  - date: '2026-08-10'
+    project: dark_factory
+    session: 50d5023c-56ba-486f-a26a-7dc5b64b2924
+    origin_phase: recon
+    manifested_phase: unknown
+    note: The captured content is literally titled 'Reconciliation Run Review' with Run ID/Project/Type/Trigger/Events-processed/Status metadata plus nested Stage Reports — a raw recon run-review dump filed under User Corrections as if it were corrective feedback.
+  - date: '2026-08-12'
+    project: dark_factory
+    session: a374a6f4-9d7a-4238-b88a-e4101736e8b1
+    origin_phase: recon
+    manifested_phase: unknown
+    note: Session's sole 'User Correction' (turn 3) is a full Reconciliation Run Review — Run ID 3ee868fa, memory_consolidator stage report JSON with items_flagged/stats — pasted verbatim and mislabeled as corrective user feedback, exact duplicate of this entry's phenomenon.
+  - date: '2026-08-13'
+    project: dark_factory
+    session: 7f73c74f-1c89-4a56-b758-bebc93e0431f
+    origin_phase: ops
+    manifested_phase: recon
+    note: Digest's 'User Corrections' section for this recon session is a verbatim 'Reconciliation Run Review' / Stage Reports JSON dump (memory_consolidator stats block) pasted in as if it were corrective user feedback, not actual user correction text.
+  - date: '2026-08-10'
+    project: dark_factory
+    session: da843dcc-deab-485c-802e-438fb062ab56
+    origin_phase: unknown
+    manifested_phase: recon
+    note: Digest 'User Corrections' section for this recon-class session verbatim-pastes a full reconciliation Run Review report (Run ID 6314b5bc..., Stage Reports JSON for memory_consolidator/task_knowledge_sync) as if it were corrective user feedback — no actual user correction occurred.
+  - date: '2026-08-12'
+    project: dark_factory
+    session: 509e18d2-91a5-445f-82e0-5122229d64b1
+    origin_phase: recon
+    manifested_phase: ops
+    note: Digest verbatim captured a full 'Reconciliation Run Review' (stage-report JSON dump) under 'User Corrections' for a recon session; signal_counts are all zero, matching the raw run-review-JSON-as-corrective-feedback mislabeling pattern.
+  - date: '2026-08-12'
+    project: dark_factory
+    session: ec28ffbe-7eec-4fc9-bd19-48128e61cec8
+    origin_phase: recon
+    manifested_phase: recon
+    note: Digest's 'User Corrections' section for this recon session is entirely a pasted 'Reconciliation Run Review' (Stage Reports JSON dump for memory_consolidator) — not corrective user feedback.
+  - date: '2026-08-12'
+    project: dark_factory
+    session: 7d2d416b-2cbc-49b5-bb3a-b92b8dee44ee
+    origin_phase: recon
+    manifested_phase: ops
+    note: The captured 'User Correction' is literally a raw reconciliation run-review JSON dump (stage_reports.memory_consolidator.stats with dozens of counter fields), not corrective feedback — matches this entry's exact failure mode.
+  - date: '2026-08-10'
+    project: dark_factory
+    session: 6b74fdb5-ebe5-4a6c-8d3c-901df48a92df
+    origin_phase: recon
+    manifested_phase: ops
+    note: Turn 3 'User Corrections' content is verbatim a Reconciliation Run Review (Run ID 0f487e78..., project reify, Stage Reports JSON for memory_consolidator) pasted wholesale — a raw recon run-review dump mislabeled as corrective user feedback, exactly the pattern this entry describes.
+  - date: '2026-08-13'
+    project: dark_factory
+    session: 832e27ba-c66b-433c-ac34-e470edce0dd3
+    origin_phase: recon
+    manifested_phase: recon
+    note: Sole 'User Correction' in this digest is a pasted Reconciliation Run Review (Run ID 447567b5-a80a-4782-b6d2-27a5661252ec, project reify, type full) with a raw Stage Reports JSON blob (memory_consolidator stats) — the digest pipeline mislabeled a recon run-review dump as corrective user feedback, matching this candidate's exact pattern.
+  - date: '2026-08-10'
+    project: dark_factory
+    session: 562fd430-2207-496b-b165-3f360553b278
+    origin_phase: recon
+    manifested_phase: recon
+    note: Digest 'User Corrections' section is entirely a pasted 'Reconciliation Run Review' (Run ID bc5f0979, project autopilot_video) with Stage Reports JSON (memory_consolidator items_flagged/stats) — a raw recon run-review dump misfiled as corrective user feedback, not an actual correction.
+  - date: '2026-08-12'
+    project: dark_factory
+    session: 01ebc989-36b5-49a5-92b2-29777a88d555
+    origin_phase: unknown
+    manifested_phase: recon
+    note: The captured 'User Correction' is a raw reconciliation run-review JSON dump (Run ID 05e427c6, project know_live, Stage Reports block) — not corrective user feedback — matching the 'raw run-review JSON dump mislabeled as correction' entry precisely.
 - id: entry-cand-20260728-2
   title: Digest score and 'User Corrections' label are decoupled from the session's own signal_counts
   severity: medium
@@ -6047,6 +6257,42 @@ entries:
     origin_phase: ops
     manifested_phase: ops
     note: Digest score (5.0) decoupled from signal_counts evidence (all 0); mislabeled 'User Corrections' section likely inflates severity despite zero detected signals.
+  - date: '2026-08-11'
+    project: dark_factory
+    session: 146ba9dc-d7e1-4195-8568-7346e0169900
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Session scores 16.0 while signal_counts shows only not_found=1 nonzero (tool_error/self_correct/df_guard/interrupt all 0) — score appears driven by the 3 mislabeled 'User Corrections' entries rather than the tracked signal counters, consistent with the score/label decoupling pattern.
+  - date: '2026-08-10'
+    project: dark_factory
+    session: da843dcc-deab-485c-802e-438fb062ab56
+    origin_phase: unknown
+    manifested_phase: recon
+    note: Digest assigns score=5.0 while every signal_counts field (tool_error, self_correct, not_found, df_guard, interrupt) reads 0 — score and label are decoupled from the session's own fired counters.
+  - date: '2026-08-12'
+    project: dark_factory
+    session: 509e18d2-91a5-445f-82e0-5122229d64b1
+    origin_phase: recon
+    manifested_phase: ops
+    note: 'score: 5.0 assigned despite every signal_count field reading 0 — score and the ''User Corrections'' label are decoupled from the session''s actual signal_counts, matching this entry directly.'
+  - date: '2026-08-12'
+    project: dark_factory
+    session: 7d2d416b-2cbc-49b5-bb3a-b92b8dee44ee
+    origin_phase: recon
+    manifested_phase: ops
+    note: score=5.0 is assigned even though every individual signal_count in the digest reads 0 — score and label are decoupled from the session's own signal_counts, as this entry describes.
+  - date: '2026-08-12'
+    project: dark_factory
+    session: ed849786-2ae7-471a-a644-b32ca3807a57
+    origin_phase: recon
+    manifested_phase: unknown
+    note: Digest assigned score=5.0 while every signal_counts field (tool_error, self_correct, not_found, df_guard, interrupt) reads 0 — the severity scoring is decoupled from the session's own fired signals, consistent with this entry.
+  - date: '2026-08-12'
+    project: dark_factory
+    session: 01ebc989-36b5-49a5-92b2-29777a88d555
+    origin_phase: unknown
+    manifested_phase: recon
+    note: Session scored 5.0 with every individual signal_count at 0, reproducing the score/label-decoupled-from-signal_counts pattern.
 - id: entry-cand-20260729-3
   title: Digest generator files a recon stage's reconciliation run-review report under 'User Corrections' despite zero fired signal counters
   severity: medium
@@ -6217,6 +6463,84 @@ entries:
     origin_phase: recon
     manifested_phase: recon
     note: signal_counts are all zero (tool_error/self_correct/not_found/df_guard/interrupt = 0) yet the digest files the recon stage report (memory_consolidator/task_knowledge_sync) under User Corrections with score 5.0 — matches the 'despite zero fired signal counters' pattern exactly.
+  - date: '2026-08-12'
+    project: dark_factory
+    session: a374a6f4-9d7a-4238-b88a-e4101736e8b1
+    origin_phase: recon
+    manifested_phase: unknown
+    note: Recon stage's reconciliation run-review report (memory_consolidator stage) filed under User Corrections while signal_counts (tool_error/self_correct/not_found/df_guard/interrupt) all read 0 — matches 'despite zero fired signal counters' exactly.
+  - date: '2026-08-10'
+    project: dark_factory
+    session: 5153022e-3b14-4320-87f9-bb26b4fd4076
+    origin_phase: recon
+    manifested_phase: recon
+    note: Digest 'User Corrections' section is verbatim the pasted Reconciliation Run Review / stage report JSON (memory_consolidator stats, task_count_verification, graphiti_queue_health, etc.) from a recon session — same recurring mislabeling of a recon stage-report dump as corrective user feedback.
+  - date: '2026-08-13'
+    project: dark_factory
+    session: 53ed1070-76d7-452a-aac8-a1ef04a6235f
+    origin_phase: recon
+    manifested_phase: ops
+    note: Digest for this recon session files a verbatim 'Reconciliation Run Review' stage-report (memory_consolidator stats JSON, project solar_challenge_platform) under 'User Corrections' turn 3, despite every signal_count (tool_error/self_correct/not_found/df_guard/interrupt) reading 0 and score=5.0 — same pattern as the prior recon-run-review-as-User-Correction instances.
+  - date: '2026-08-13'
+    project: dark_factory
+    session: 7f73c74f-1c89-4a56-b758-bebc93e0431f
+    origin_phase: ops
+    manifested_phase: recon
+    note: signal_counts are all 0 (tool_error/self_correct/not_found/df_guard/interrupt) yet the digest still assigns score 5.0 and files the recon stage-report dump under User Corrections — same 'zero fired counters, still labeled/scored' pattern.
+  - date: '2026-08-12'
+    project: dark_factory
+    session: 509e18d2-91a5-445f-82e0-5122229d64b1
+    origin_phase: recon
+    manifested_phase: ops
+    note: This exact session shows the reconciliation stage report (memory_consolidator/task_knowledge_sync) filed under 'User Corrections' while tool_error/self_correct/not_found/df_guard/interrupt are all 0 — zero fired signal counters, as the entry describes.
+  - date: '2026-08-12'
+    project: dark_factory
+    session: ec28ffbe-7eec-4fc9-bd19-48128e61cec8
+    origin_phase: recon
+    manifested_phase: recon
+    note: All signal_counts read 0 (tool_error/self_correct/not_found/df_guard/interrupt) yet the digest still assigns score 5.0 and files a recon stage's run-review report under User Corrections, matching the zero-fired-counters mislabeling pattern.
+  - date: '2026-08-12'
+    project: dark_factory
+    session: 7d2d416b-2cbc-49b5-bb3a-b92b8dee44ee
+    origin_phase: recon
+    manifested_phase: ops
+    note: 'Digest ''User Corrections'' section contains a verbatim reconciliation Run Review (Run Metadata + Stage Reports JSON dump for memory_consolidator) pasted in as if it were user feedback, while all signal_counts (tool_error, self_correct, not_found, df_guard, interrupt) read zero yet score=5.0 — same shape as this entry: recon stage report mislabeled as correction despite zero fired counters.'
+  - date: '2026-08-10'
+    project: dark_factory
+    session: 6b74fdb5-ebe5-4a6c-8d3c-901df48a92df
+    origin_phase: recon
+    manifested_phase: ops
+    note: All signal_counts read 0 (tool_error/self_correct/not_found/df_guard/interrupt) yet the digest still scored 5.0 and filed a recon stage's reconciliation run-review report under User Corrections — matches this entry's 'despite zero fired signal counters' framing precisely.
+  - date: '2026-08-13'
+    project: dark_factory
+    session: 832e27ba-c66b-433c-ac34-e470edce0dd3
+    origin_phase: recon
+    manifested_phase: recon
+    note: All signal_counts read zero (tool_error/self_correct/not_found/df_guard/interrupt=0) yet the session still scored 5.0 and filed a recon stage report under User Corrections — matches this candidate's 'zero fired signal counters' shape.
+  - date: '2026-08-12'
+    project: dark_factory
+    session: ed849786-2ae7-471a-a644-b32ca3807a57
+    origin_phase: recon
+    manifested_phase: recon
+    note: Turn 3 'User Corrections' is a verbatim pasted Reconciliation Run Review (Run ID c0a85b1d..., Stage Reports for memory_consolidator/task_knowledge_sync) with all signal_counts at 0 (tool_error/self_correct/not_found/df_guard/interrupt) — the digest pipeline mislabeled a recon stage-report dump as a corrective user statement, matching this entry's exact signature.
+  - date: '2026-08-13'
+    project: dark_factory
+    session: 510a935e-e2f6-4457-aac8-0e251c54ac9b
+    origin_phase: unknown
+    manifested_phase: recon
+    note: Digest 'User Corrections' section verbatim-embeds a reconciliation run-review report (Run ID c4786255..., Stage Reports JSON for memory_consolidator) pulled from a recon session, mislabeling ordinary reconciliation output as corrective user feedback.
+  - date: '2026-08-10'
+    project: dark_factory
+    session: 562fd430-2207-496b-b165-3f360553b278
+    origin_phase: recon
+    manifested_phase: recon
+    note: All signal_counts (tool_error, self_correct, not_found, df_guard, interrupt) are 0, yet the digest still files the stage report content under User Corrections — matches the pattern of a recon stage's reconciliation run-review report being bucketed as a correction despite zero fired signal counters.
+  - date: '2026-08-12'
+    project: dark_factory
+    session: 01ebc989-36b5-49a5-92b2-29777a88d555
+    origin_phase: unknown
+    manifested_phase: recon
+    note: Digest for this recon-class session captures a full 'Reconciliation Run Review' stage-report JSON (memory_consolidator stats block) verbatim under 'User Corrections', with all signal_counts reading 0 (tool_error/self_correct/not_found/df_guard/interrupt) — exact repeat of the recon-stage-report-as-User-Correction pattern despite zero fired signals.
 - id: entry-cand-20260730-30
   title: Digest severity score assigned despite every individual signal_count reading zero
   severity: medium
@@ -6407,6 +6731,42 @@ entries:
     origin_phase: unknown
     manifested_phase: ops
     note: Digest assigned severity score 5.0 despite all signal_counts (tool_error, self_correct, not_found, df_guard, interrupt) reading zero; high score decoupled from evidence
+  - date: '2026-08-10'
+    project: dark_factory
+    session: 50d5023c-56ba-486f-a26a-7dc5b64b2924
+    origin_phase: recon
+    manifested_phase: unknown
+    note: Digest score=5.0 assigned despite every individual signal_count (tool_error, self_correct, not_found, df_guard, interrupt) reading exactly 0 — score decoupled from the signal counters that ostensibly drive it.
+  - date: '2026-08-12'
+    project: dark_factory
+    session: a374a6f4-9d7a-4238-b88a-e4101736e8b1
+    origin_phase: recon
+    manifested_phase: unknown
+    note: Digest assigned score=5.0 despite every individual signal_count in the digest reading 0, same score/signal-count decoupling this entry tracks.
+  - date: '2026-08-10'
+    project: dark_factory
+    session: 5153022e-3b14-4320-87f9-bb26b4fd4076
+    origin_phase: recon
+    manifested_phase: recon
+    note: score=5.0 assigned despite every signal_counts field (tool_error, self_correct, not_found, df_guard, interrupt) reading exactly 0 — severity score decoupled from the session's own zero signal counters.
+  - date: '2026-08-13'
+    project: dark_factory
+    session: 510a935e-e2f6-4457-aac8-0e251c54ac9b
+    origin_phase: unknown
+    manifested_phase: recon
+    note: Session's signal_counts are all zero (tool_error/self_correct/not_found/df_guard/interrupt all 0) yet the digest assigns score=5.0, matching the decoupling of severity score from underlying zero signal counts.
+  - date: '2026-08-12'
+    project: dark_factory
+    session: b976febe-ee9f-4157-ac6f-a8f756377b8e
+    origin_phase: ops
+    manifested_phase: ops
+    note: score=15.0 assigned while every individual signal_count (tool_error, self_correct, not_found, df_guard, interrupt) reads exactly 0 — score is fully decoupled from the counters that ostensibly drive it.
+  - date: '2026-08-10'
+    project: dark_factory
+    session: 562fd430-2207-496b-b165-3f360553b278
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'score: 5.0 is assigned even though every individual signal_count in the frontmatter reads 0 — score decoupled from the signals that ostensibly justify it.'
 - id: entry-cand-20260729-4
   title: Bash cwd persists across turns, causing relative-path git commit --only pathspec failures on PRD doc commits
   severity: medium
@@ -6878,6 +7238,54 @@ entries:
     origin_phase: ops
     manifested_phase: ops
     note: Orchestrated-task session digest's 'User Corrections' section contains injected review-adjudication task briefing (procedure + prior-round structured data), not user-provided corrections.
+  - date: '2026-08-10'
+    project: dark_factory
+    session: c8e1481a-2081-4fb1-a68f-0d8f3e349067
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: orchestrated-task session (worktree 3689); digest's User Corrections bucket captures the injected '# Context' block (fused-memory search results, e.g. 'Reify task 2531 confirms...') verbatim and mislabels it as a user correction — same phenomenon as 20260730-31.
+  - date: '2026-08-15'
+    project: dark_factory
+    session: 5ea0604f-7114-40ac-b4c6-308e1f28dc6f
+    origin_phase: ops
+    manifested_phase: ops
+    note: Turn-3 'User Corrections' entry is verbatim the injected memory-search '# Context' block (explicitly labeled '_This context was recalled from the dark_factory project's memory_' with a Project Context JSON results dump) from an orchestrated-task session — exact match to the recurring digest-mislabeling pattern.
+  - date: '2026-08-11'
+    project: dark_factory
+    session: 146ba9dc-d7e1-4195-8568-7346e0169900
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'Digest for this orchestrated-task session (worktree 3581) files the turn-3 injected ''# Context'' memory-search block (Graphiti results re: tasks 1470/2531/841, explicitly disclaimed as ''NOT a description of this worktree'') under ''User Corrections'' — exact match to the established orchestrated-task/memory-search-context mislabeling pattern.'
+  - date: '2026-08-15'
+    project: dark_factory
+    session: d0e753b6-0022-483c-a211-f5eeef43cade
+    origin_phase: ops
+    manifested_phase: ops
+    note: Session d0e753b6 (orchestrated-task, worktree 3956) turn 3's 'User Corrections' bucket captures the injected '# Context' memory-search recall block verbatim (raw JSON of Graphiti search results with ids/relevance_score/provenance) — not an actual user correction. Exact match to this entry's described pattern of an orchestrated-task session's injected memory-search context block being mislabeled.
+  - date: '2026-08-10'
+    project: dark_factory
+    session: f576d214-2318-46ea-8e19-68aa80c57c4c
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'Turn 3 ''User Corrections'' entry is the injected orchestrated-task ''# Context'' block (memory-search results: graphiti entities/relevance_score JSON dump), mislabeled as a User Correction — same digest-capture pipeline defect.'
+  - date: '2026-08-15'
+    project: dark_factory
+    session: 9d443a0a-cd01-457a-922d-077322671bea
+    origin_phase: ops
+    manifested_phase: ops
+    note: 'orchestrated-task session in .worktrees/3823: the digest''s ''User Corrections'' bucket captures the injected session-start ''# Context'' memory-search block (with its own disclaimer ''this context was recalled from the dark_factory project''s memory... NOT a description of this worktree'') and the raw Mem0/Graphiti JSON results dump, mislabeling it as a user correction despite self_correct=0 in signal_counts — same trickle-coder digest-pipeline mislabeling pattern.'
+  - date: '2026-08-15'
+    project: dark_factory
+    session: 554f30cd-b6dd-45e3-bdbd-f2efe24bb045
+    origin_phase: ops
+    manifested_phase: ops
+    note: Turn 3 'User Corrections' bucket captures the standard injected '# Context' memory-recall block (dark_factory project memory search results, explicitly labeled as background not task description) for this orchestrated-task worktree session (4168) — same digest-pipeline mislabeling pattern as this entry, not an actual user correction.
+  - date: '2026-08-15'
+    project: dark_factory
+    session: a2ea4751-03c3-46c4-9610-f18fed883ad2
+    origin_phase: ops
+    manifested_phase: ops
+    note: 'Turn 3 ''User Corrections'' entry is verbatim the injected memory-recall ''# Context'' block (''This context was recalled from the dark_factory project''s memory... ## Project Context'' with graphiti/mem0 JSON search results) for orchestrated-task session on worktree 4025 — the digest extractor mislabeled this session-start memory-search briefing as a user correction, matching the recurring digest-pipeline mislabeling bug.'
 - id: entry-cand-20260729-5
   title: Sibling planning sessions race on a shared in-progress design doc
   severity: medium
@@ -7006,6 +7414,24 @@ entries:
     origin_phase: recon
     manifested_phase: recon
     note: Pasted recon stage-report dump (with nested stats and a redundant _reported subtotal) labeled a 'User Correction' while every individual signal_count reads zero — same phenomenology as this prior candidate.
+  - date: '2026-08-10'
+    project: dark_factory
+    session: 50d5023c-56ba-486f-a26a-7dc5b64b2924
+    origin_phase: recon
+    manifested_phase: unknown
+    note: Session's sole 'User Correction' (turn 3) is a pasted '## Reconciliation Run Review' with a full Stage Reports JSON dump (memory_consolidator stats) for the solar_challenge project — not user feedback. All signal_counts (tool_error/self_correct/not_found/df_guard/interrupt) read 0, matching this entry's exact shape.
+  - date: '2026-08-13'
+    project: dark_factory
+    session: 53ed1070-76d7-452a-aac8-a1ef04a6235f
+    origin_phase: recon
+    manifested_phase: ops
+    note: Score of 5.0 assigned to a session whose signal_counts are all zero, with the 'evidence' being a pasted stage-report dump rather than an actual correction — matches the zero-signal-counts-but-nonzero-score digest defect.
+  - date: '2026-08-10'
+    project: dark_factory
+    session: 6b74fdb5-ebe5-4a6c-8d3c-901df48a92df
+    origin_phase: recon
+    manifested_phase: ops
+    note: 'Same shape: pasted recon stage-report dump (Stage Reports: memory_consolidator items_flagged/stats) labeled as a User Correction with all-zero signal_counts.'
 - id: entry-cand-20260730-32
   title: Digest generator mislabels a dispatched task's injected '# Context' briefing block as a 'User Correction'
   severity: medium
@@ -8392,6 +8818,36 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: Orchestrated-task worktree (4097) fires 5 not_found signals from turn 352 across categories ('no such file or directory', 'modulenotfounderror', 'command not found', 'does not exist', 'not found in') with no diagnostic context beyond exit code 1 from Bash tool call.
+  - date: '2026-08-11'
+    project: dark_factory
+    session: 4396db7a-92bc-4ba5-bfb2-64eeb3cb59e9
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: orchestrated-task in .worktrees/3959 fires 3x 'no such file or directory'/'does not exist' (turns 36, 45) with zero tool_error/self_correct/df_guard signal and no other diagnostic context in the digest, matching the repeated-not-found-with-no-other-signal pattern.
+  - date: '2026-08-10'
+    project: dark_factory
+    session: f576d214-2318-46ea-8e19-68aa80c57c4c
+    origin_phase: unknown
+    manifested_phase: implement
+    note: Session runs in .worktrees/3236 (orchestrated-task); both errors are bare relative-path 'No such file or directory' (cd escalation; sed on orchestrator/src/orchestrator/workflow.py) with signal_counts otherwise all zero — matches the 'repeated no-such-file-or-directory, no other diagnostic signal' worktree pattern exactly.
+  - date: '2026-08-10'
+    project: dark_factory
+    session: 5273bfb2-2e6a-4c42-9321-6863f0a4179d
+    origin_phase: unknown
+    manifested_phase: implement
+    note: orchestrated-task session in .worktrees/3142 hits exit-code-2 ls probes for completion_claim_gate.py/its test file plus a turn-30 'no such file or directory' not-found signal and a turn-56 guard block, with almost no other diagnostic content in the digest (697 bytes total) — matches the sparse 'no such file or directory, no other diagnostic signal' shape already logged.
+  - date: '2026-08-11'
+    project: dark_factory
+    session: 4f7f051e-9edc-459f-b6f0-0b6d01db2700
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Interactive session in a task worktree (.worktrees/3689/shared) logs two 'no such file or directory' Not-Found signals (turns 10, 17) with every other signal_count at zero and no further detail in the digest body — matches the known signature of repeated not-found errors in a worktree task carrying no other diagnostic signal.
+  - date: '2026-08-16'
+    project: dark_factory
+    session: fa12295b-7295-407d-ab29-22249b911653
+    origin_phase: unknown
+    manifested_phase: implement
+    note: orchestrated-task session in .worktrees/4104 fired two bare 'does not exist' not-found signals (turns 18, 46) with no other diagnostic content in a 403-byte digest — matches the pattern of repeated no-such-file/not-found hits with no accompanying diagnostic signal in an orchestrated worktree task.
 - id: entry-cand-20260809-16
   title: Agent falls back to a whole-filesystem `find /` to locate an installed package's source, timing out the Bash call
   severity: medium
@@ -8417,6 +8873,45 @@ entries:
     origin_phase: implement
     manifested_phase: ops
     note: 'Periodic-census verifier session tasked with confirming this cluster. Session encountered tool_error×3 and not_found×1. Error neighborhoods show: turn 31 grep searching for evidence in docs (no match found); turns 36, 44 find commands hitting approval gates during verification attempts.'
+- id: entry-cand-20260815-17
+  title: Read tool call regenerates a stray-comma JSON syntax error identically on retry, only varying the limit value
+  severity: medium
+  status: open
+  origin_phase: unknown
+  manifested_phase: implement
+  sightings:
+  - date: '2026-08-15'
+    project: dark_factory
+    session: 5ea0604f-7114-40ac-b4c6-308e1f28dc6f
+    origin_phase: unknown
+    manifested_phase: implement
+    evidence_quote: 'Read({"file_path": ".../cross_graph_move.py", "offset": 1240, , "limit"...) -> InputValidationError: Read was called with input that could not be parsed as JSON... You sent: {"file_path": ..., "offset": 1240, , "limit": 1} ... (turn 18) ... {"file_path": ..., "offset": 1240, , "limit": 260}'
+- id: entry-cand-20260811-6
+  title: Sub-agent resumed after weekly usage-limit hit has no persisted partial progress to resume from
+  severity: medium
+  status: open
+  origin_phase: unknown
+  manifested_phase: unknown
+  sightings:
+  - date: '2026-08-11'
+    project: dark_factory
+    session: 4396db7a-92bc-4ba5-bfb2-64eeb3cb59e9
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: 'Agent "Find prior legibility census fixes" failed: Agent terminated early due to an API error: You''ve hit your weekly limit ... <result>I''ll start with the git log searches and repo structure exploration in parallel.</result> ... Your previous run was interrupted by a usage limit. Continue where you left off and complete your task.'
+- id: entry-cand-20260812-20
+  title: Digest 'User Corrections' bucket captures generic usage-limit resume boilerplate as a correction
+  severity: medium
+  status: open
+  origin_phase: ops
+  manifested_phase: ops
+  sightings:
+  - date: '2026-08-12'
+    project: dark_factory
+    session: b976febe-ee9f-4157-ac6f-a8f756377b8e
+    origin_phase: ops
+    manifested_phase: ops
+    evidence_quote: (turn 199) Your previous run was interrupted by a usage limit. Continue where you left off and complete your task.
 candidates:
 - id: cand-20260715-1
   title: Recon remediation cycles timeout on fused-memory I/O
@@ -13194,3 +13689,71 @@ candidates:
     origin_phase: implement
     manifested_phase: implement
     evidence_quote: 'Turn 12: Read({…, "offset": 600, , "limit": 120}) with double comma; Turn 18: Bash call with __unparsedToolInput indicates JSON parse failure on pytest command invocation'
+- id: cand-20260815-17
+  title: Read tool call regenerates a stray-comma JSON syntax error identically on retry, only varying the limit value
+  cause: 'The agent''s Read tool-call JSON for a large source file (offset 1240) contains an empty parameter slot between ''offset'' and ''limit'' (e.g. {"offset": 1240, , "limit": 1}), which InputValidationError rejects as unparseable. On the very next attempt (3 turns later) the agent reissues the same malformed structure — offset and the stray comma unchanged, only limit edited (1 → 260) — indicating it diagnosed the failure as a bad limit value rather than the actual JSON syntax defect, so the retry was not a real self-correction.'
+  area: tool-call-generation
+  first_seen: '2026-08-15'
+  disposition: promoted
+  sightings:
+  - date: '2026-08-15'
+    project: dark_factory
+    session: 5ea0604f-7114-40ac-b4c6-308e1f28dc6f
+    origin_phase: unknown
+    manifested_phase: implement
+    evidence_quote: 'Read({"file_path": ".../cross_graph_move.py", "offset": 1240, , "limit"...) -> InputValidationError: Read was called with input that could not be parsed as JSON... You sent: {"file_path": ..., "offset": 1240, , "limit": 1} ... (turn 18) ... {"file_path": ..., "offset": 1240, , "limit": 260}'
+  promoted_to: entry-cand-20260815-17
+- id: cand-20260811-6
+  title: Sub-agent resumed after weekly usage-limit hit has no persisted partial progress to resume from
+  cause: The harness auto-injects 'Continue where you left off' after a usage-limit interruption, but the interrupted sub-agent's only captured output ('I'll start with the git log searches and repo structure exploration in parallel.') shows it never got past stating intent — there is no partial-analysis artifact for the resume to actually continue, so 'continue where you left off' is a false continuity claim.
+  area: orchestrator/harness resume-after-usage-limit
+  first_seen: '2026-08-11'
+  disposition: promoted
+  sightings:
+  - date: '2026-08-11'
+    project: dark_factory
+    session: 4396db7a-92bc-4ba5-bfb2-64eeb3cb59e9
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: 'Agent "Find prior legibility census fixes" failed: Agent terminated early due to an API error: You''ve hit your weekly limit ... <result>I''ll start with the git log searches and repo structure exploration in parallel.</result> ... Your previous run was interrupted by a usage limit. Continue where you left off and complete your task.'
+  promoted_to: entry-cand-20260811-6
+- id: cand-20260815-18
+  title: Amendment satisfies review's literal wording via source-introspection meta-test, not the intended real reuse
+  cause: 'After a review round asked for genuine code reuse (import and use the same pattern) rather than a duplicated/fake copy, the implementer''s amendment instead added a test that regex-scrapes the target function''s source text via inspect.getsource() to recover a local string literal. This technically avoids ''duplicating'' the pattern but pins cosmetic implementation details (local variable name ''pattern'', single-quoted raw-string style, exactly one such assignment) rather than testing behavior, reintroducing the exact fragility (test breaks on refactors with unchanged behavior; also silently mis-extracts and compares corrupted values if the source pattern contains a quote) that the original review was trying to eliminate. This is a letter-vs-intent compliance failure: the agent optimized for satisfying the reviewer''s words rather than the underlying goal, in a way a second review pass had to catch.'
+  area: review-remediation/test-design
+  first_seen: '2026-08-15'
+  disposition: rejected
+  sightings:
+  - date: '2026-08-15'
+    project: dark_factory
+    session: f008f85f-4ade-4214-9740-ed42d8121238
+    origin_phase: implement
+    manifested_phase: review
+    evidence_quote: The prior review asked for real reuse of the pattern, not a source-text scraper; this amendment substituted introspection for reuse and thereby added the failure mode it was meant to remove.
+- id: cand-20260811-7
+  title: Digest signal extraction miscategorizes usage-limit auto-resume boilerplate
+  cause: 'The digest pipeline''s signal detector doesn''t recognize the harness-injected ''Your previous run was interrupted by a usage limit. Continue where you left off and complete your task.'' resume message as what it is: it buckets it under ''User Corrections'' (implying human corrective feedback, though it''s a system/harness-generated resume prompt) while the dedicated ''interrupt'' signal counter reads 0 despite the same session text documenting 3 separate interruptions — so neither signal correctly represents the underlying usage-limit resume event.'
+  area: trickle-coder digest pipeline / signal extraction
+  first_seen: '2026-08-11'
+  disposition: rejected
+  sightings:
+  - date: '2026-08-11'
+    project: dark_factory
+    session: d09bd233-0e9f-4da4-8d1a-ab4d1a87511f
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: '(turn 133) Your previous run was interrupted by a usage limit. Continue where you left off and complete your task. [...] signal_counts: interrupt: 0'
+- id: cand-20260812-20
+  title: Digest 'User Corrections' bucket captures generic usage-limit resume boilerplate as a correction
+  cause: The digest extraction heuristic appears to treat any non-assistant turn as a candidate 'User Correction' without filtering out system/harness-injected continuation boilerplate, so the standard 'Your previous run was interrupted by a usage limit. Continue where you left off and complete your task.' resume message is captured twice (turns 199 and 273) as if it were corrective user feedback, alongside the unrelated '# Context' memory block from turn 3 — inflating the corrections bucket with zero-signal content while all five signal_counts read 0.
+  area: trickle-coder / digest pipeline
+  first_seen: '2026-08-12'
+  disposition: promoted
+  sightings:
+  - date: '2026-08-12'
+    project: dark_factory
+    session: b976febe-ee9f-4157-ac6f-a8f756377b8e
+    origin_phase: ops
+    manifested_phase: ops
+    evidence_quote: (turn 199) Your previous run was interrupted by a usage limit. Continue where you left off and complete your task.
+  promoted_to: entry-cand-20260812-20
