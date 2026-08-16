@@ -34,6 +34,7 @@ from orchestrator.harness import (
     _WATCHER_TIMEOUT_GRACE_SECS,
     Harness,
 )
+from orchestrator.repo_paths import DARK_FACTORY_ROOT_ENV
 
 # ---------------------------------------------------------------------------
 # step-3: Config field presence and defaults
@@ -641,6 +642,59 @@ class TestRunWatcherRotation:
         assert 'Escalation queue:' in prompt
 
     @pytest.mark.asyncio
+    async def test_rearm_queue_dir_matches_the_queue_the_harness_watches(
+        self, tmp_path: Path
+    ) -> None:
+        """The banner's --queue-dir is the SAME path the orchestrator itself uses.
+
+        Task 3605 (review amendment).  escalation.queue_dir is an unconstrained
+        str with nothing forcing it relative, and the harness's own authoritative
+        resolution (_emit_digest) is `Path(project_root) / queue_dir`, which
+        returns an absolute RHS unchanged.  Building the banner's copy by f-string
+        concatenation instead would render '/project//abs/queue' — harmless while
+        it was only a display line, but this banner now hands the agent an
+        executable `--queue-dir` it is told to run verbatim, so a divergence arms
+        an inotify watcher on a directory that never receives escalations and
+        times out (exit 124) every slice for the whole rotation: a silent no-op,
+        precisely what watcher-rearm.sh's guards exist to prevent.
+
+        Asserted against `Path(project_root) / queue_dir` rather than a literal, so
+        this cannot pass by re-deriving the bug it is pinning.
+        """
+        from shared.cli_invoke import AgentResult
+
+        h = _make_rotation_harness(tmp_path)
+        abs_queue = tmp_path / 'elsewhere' / 'escalations'
+        h.config.escalation.queue_dir = str(abs_queue)
+        df_root = tmp_path / 'df-tooling-checkout'
+        captured: dict = {}
+
+        async def fake_invoke(usage_gate, label, *, invoke_fn, **kwargs):
+            captured['prompt'] = kwargs.get('prompt', '')
+            return AgentResult(success=True, output='')
+
+        with (
+            patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke),
+            patch('orchestrator.harness.resolve_dark_factory_root', return_value=df_root),
+        ):
+            await h._run_watcher_rotation()
+
+        prompt = captured['prompt']
+        expected = str(
+            Path(h.config.project_root) / h.config.escalation.queue_dir
+        )
+        assert f'--queue-dir {expected}' in prompt, (
+            'the re-arm command must name the queue the harness itself watches; '
+            f'expected --queue-dir {expected} in:\n{prompt}'
+        )
+        assert f'Escalation queue: {expected}' in prompt, (
+            'the banner line and the re-arm argument must be the same string'
+        )
+        assert f'{h.config.project_root}{abs_queue}' not in prompt, (
+            'an absolute queue_dir must not be concatenated onto project_root'
+        )
+
+    @pytest.mark.asyncio
     async def test_banner_flags_cross_project_tooling_root(self, tmp_path: Path) -> None:
         """Cross-project: the banner says outright that the tooling root is another repo.
 
@@ -719,16 +773,21 @@ class TestRunWatcherRotation:
 
     @pytest.mark.asyncio
     async def test_banner_degrades_loudly_when_root_unresolvable(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Unresolvable: say so, and render NO empty interpolation (task 3605).
 
         A bare `cd  && scripts/watcher-rearm.sh` (or a `root: ` line with nothing
         after it) is the sighted failure rendered into the prompt itself.  The
         degraded banner must be loud instead.
+
+        The env var is cleared so this test pins the GENUINELY-UNSET variant; the
+        inherited-but-known-bad variant is a separate test below, and the two make
+        contradictory claims that must not be able to swap under an ambient export.
         """
         from shared.cli_invoke import AgentResult
 
+        monkeypatch.delenv(DARK_FACTORY_ROOT_ENV, raising=False)
         h = _make_rotation_harness(tmp_path)
         captured: dict = {}
 
@@ -746,13 +805,64 @@ class TestRunWatcherRotation:
         assert 'could not be auto-resolved' in prompt, (
             f'the banner must state the degradation outright; got:\n{prompt}'
         )
+        assert 'DARK_FACTORY_ROOT is NOT set' in prompt, (
+            f'with the var genuinely unset the banner must say so; got:\n{prompt}'
+        )
+        assert 'ask the operator' in prompt, (
+            'the degraded banner must give the agent its ONE sanctioned next move: '
+            'ask, rather than guess a path or sweep the filesystem (census #1/#4); '
+            f'got:\n{prompt}'
+        )
         assert 'cd  &&' not in prompt, 'never render an empty $DARK_FACTORY_ROOT expansion'
         assert ': None' not in prompt, 'never render the Python None literal as a path'
-        for line in prompt.splitlines():
-            stripped = line.rstrip()
-            assert not (stripped.endswith(':') and 'root' in stripped.lower()), (
-                f'banner renders a root label with nothing after it: {line!r}'
-            )
+
+    @pytest.mark.asyncio
+    async def test_banner_does_not_claim_unset_when_a_bad_value_is_inherited(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A rejected ambient export is reported as INHERITED-and-bad, not as unset.
+
+        Task 3605 (review amendment).  Omitting the key from env_overrides does not
+        unset it in the child: shared/cli_invoke.py seeds the subprocess env from
+        os.environ and then applies the overrides, so a stale export on the
+        orchestrator process (a systemd unit, say) reaches the rotation regardless.
+        Claiming "DARK_FACTORY_ROOT is NOT set" there is simply false, and an agent
+        that believes it will `cd` into a directory that exists but carries no
+        watcher-rearm.sh — passing that script's own `[ -d ]` guard and getting a
+        bare "No such file or directory" instead of the designed exit-2 diagnostic.
+        """
+        from shared.cli_invoke import AgentResult
+
+        stale = tmp_path / 'stale-not-a-df-checkout'
+        stale.mkdir()
+        monkeypatch.setenv(DARK_FACTORY_ROOT_ENV, str(stale))
+        h = _make_rotation_harness(tmp_path)
+        captured: dict = {}
+
+        async def fake_invoke(usage_gate, label, *, invoke_fn, **kwargs):
+            captured['prompt'] = kwargs.get('prompt', '')
+            return AgentResult(success=True, output='')
+
+        # Only the RESOLVER is patched (ascent also fails); the rejected-override
+        # helper runs for real against the env var set above.
+        with (
+            patch('orchestrator.harness.invoke_with_cap_retry', fake_invoke),
+            patch('orchestrator.harness.resolve_dark_factory_root', return_value=None),
+        ):
+            await h._run_watcher_rotation()
+
+        prompt = captured['prompt']
+        assert 'DARK_FACTORY_ROOT is NOT set' not in prompt, (
+            'the banner must not assert the var is unset when the child inherits it; '
+            f'got:\n{prompt}'
+        )
+        assert str(stale) in prompt, (
+            f'the inherited value must be named so the agent can recognise it; '
+            f'got:\n{prompt}'
+        )
+        assert 'INHERITED' in prompt, 'the banner must say the value reaches the child'
+        assert 'known-bad' in prompt, 'the banner must say the inherited value is wrong'
+        assert 'ask the operator' in prompt
 
     @pytest.mark.asyncio
     async def test_rotation_start_logs_bash_max_timeout_ms(
