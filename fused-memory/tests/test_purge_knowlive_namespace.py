@@ -941,9 +941,16 @@ class TestRunApplyStoreMutationPreflight:
         ``main`` has no handler at all here -- the refusal exits the
         interpreter as an uncaught traceback -- so this ERROR record is the
         ONLY place the operator is told what was refused and what to do
-        instead. Pinned on the fail-closed marker and the remedy rather than
-        the full prose: rewording the message stays cheap, deleting it does
-        not.
+        instead. Pinned on the fail-closed marker and the remedy noun ONLY, so
+        every other word of the message stays free to reword.
+
+        Asserting on message CONTENT is deliberate, and is the narrow exception
+        to the repo's don't-pin-guard-message-prose norm (task 3799): the record
+        this test is about is defined BY its content -- mere record-existence
+        would still pass if the whole diagnosis were replaced by "boom",
+        precisely the regression this exists to catch. Verified non-vacuous:
+        mutating the marker in the script turns this assertion red (task 4127
+        amendment).
         """
         return [
             rec for rec in caplog.records
