@@ -148,11 +148,19 @@ class _L2CloseClass:
 #       the terminal-status one on a 'status=' / 'status:' shape rather than a
 #       free-standing "is done" English phrase, and the two moved-on ones on an
 #       explicit preposition ('to'/'into'/'as' for re-scoped, 'as' only for
-#       re-dispatched) plus a concrete task/run identifier. So neither "the work
-#       is done" nor "was rescoped last week" nor "re-dispatched it this
-#       morning" can satisfy it — the identity that writes this text is the
-#       LLM-driven watcher rotation, whose free-form close prose is exactly
-#       where such phrasing appears incidentally.
+#       re-dispatched) plus a task/run identifier. So neither "the work is
+#       done" nor "was rescoped last week" nor "re-dispatched it this morning"
+#       can satisfy it — the identity that writes this text is the LLM-driven
+#       watcher rotation, whose free-form close prose is exactly where such
+#       phrasing appears incidentally.
+#
+#       Precisely what the identifier requires, so the anchor is not read as
+#       stronger than it is: a token containing a DIGIT, optionally wrapped in
+#       '#' / quotes / backticks. It is not validated as a real task or run id,
+#       and a bare number counts — so count-shaped prose that happens to use
+#       the same preposition ("re-scoped into 2 subtasks") still matches. The
+#       load-bearing part is the preposition+token STRUCTURE, which the casual
+#       phrasing this anchor exists to reject never produces.
 #
 #       This class shares its INTENT with harness._revalidate_open_l2 — a
 #       subject that has gone terminal or moved on moots the escalation — but
@@ -206,8 +214,15 @@ L2_AUTO_CLOSE_ALLOWLIST: tuple[_L2CloseClass, ...] = (
         evidence=(
             (
                 r'status\s*[=:]\s*(done|cancelled)',
-                r're-?scoped\s+(?:to|into|as)\s+(?:task\s+)?[a-z0-9_.:-]*\d',
-                r're-?dispatched\s+as\s+(?:run|task)?[- ]?[a-z0-9_.:-]*\d',
+                # The optional [#`"'] wrappers admit the spellings this repo
+                # actually writes task references in — 'task #3821', a
+                # markdown-quoted `3821`, a quoted "task 3821" — which the
+                # as-ruled shapes rejected. They relax only the citation's
+                # PUNCTUATION, never its structure: an explicit preposition
+                # plus an identifier containing a digit is still required, so
+                # every casual-prose negative stays rejected.
+                r'''re-?scoped\s+(?:to|into|as)\s+[#`"']?(?:task\s+)?[#`"']?[a-z0-9_.:-]*\d''',
+                r'''re-?dispatched\s+as\s+[#`"']?(?:run|task)?[- ]?[#`"']?[a-z0-9_.:-]*\d''',
             ),
         ),
     ),
