@@ -1671,6 +1671,54 @@ class ReconReportState:
             if run_sig_index.get(derived_sig) == finding.finding_id:
                 run_sig_index.pop(derived_sig, None)
 
+    def _derived_sig_anchor_project_id(
+        self, run_id: str, anchor_finding_id: str, c_cited_task_id: str | None
+    ) -> str | None:
+        """Return the project_id that PINS *anchor_finding_id*'s ownership of the
+        derived ``(c_cited_task_id, flag_type)`` signature, or None when the
+        anchor carries no such pin (task-4185).
+
+        The derived signature is deliberately PROJECTLESS (see
+        ``_run_sig_index``'s declaration), so a hit on it does not by itself
+        mean the two findings are about the same task — only about the same
+        task NUMBER. This helper answers the narrower question the guard
+        needs: did the anchor's own primary citation pin that number to a
+        project?
+
+        Returns None — meaning "unpinned, fold as before" — in two cases,
+        neither of which is a mismatch:
+
+        (i) The anchor has no ``cited_tasks`` at all. Its ownership of the
+            derived sig came from :meth:`add_finding`'s ordinary, equally
+            projectless ``(task_id, flag_type)`` key, and a bare top-level
+            ``task_id`` names no project — so there is nothing to compare
+            against and the fold is the INTENDED one (operator ruling
+            2026-08-12; see ``_run_sig_index``).
+
+        (ii) The anchor's primary citation names a DIFFERENT task. Such a
+            citation says nothing about which project THIS task id belongs
+            to, so comparing its project_id would break a legitimate
+            pre-existing fold — pinned by
+            ``test_anchor_citing_a_different_task_still_folds``.
+
+        Reads ``cited_tasks[0]`` — the same slot :meth:`_purge_finding` uses
+        to reconstruct the derived sig it must clear — so registration,
+        cleanup and this guard all agree on which citation owns the key.
+        Comparison runs through :func:`_canonical_sig_field`, the coercion
+        the index itself uses, so an int-vs-str ``task_id`` (common in LLM
+        output) cannot make a genuine pin look like a different task.
+        """
+        resolved = self._resolve_finding(run_id, anchor_finding_id)
+        if resolved is None:
+            return None
+        anchor = resolved[1]
+        if not anchor.cited_tasks:
+            return None
+        primary = anchor.cited_tasks[0]
+        if _canonical_sig_field(primary['task_id']) != c_cited_task_id:
+            return None
+        return primary['project_id']
+
     def _log_cite_task_fold_purge(
         self,
         *,
@@ -2007,6 +2055,21 @@ class ReconReportState:
             else None
         )
 
+        # task-4185: the derived sig is PROJECTLESS, so a hit can mean two
+        # projects' findings about same-NUMBERED tasks rather than one task.
+        # Per the operator ruling (2026-08-12) the key stays projectless —
+        # only the detectable cite_task→cite_task half is guarded here, by
+        # asking whether the anchor's OWN primary citation pins this task id
+        # to a different project.  An unpinned anchor (see
+        # _derived_sig_anchor_project_id's two None cases) folds as before.
+        entity_project_mismatch = False
+        if entity_existing_id is not None and entity_existing_id != finding.finding_id:
+            anchor_project_id = self._derived_sig_anchor_project_id(
+                run_id, entity_existing_id, c_cited_task_id
+            )
+            if anchor_project_id is not None and anchor_project_id != project_id:
+                entity_project_mismatch = True
+
         # Sequential (not project_hit/entity_hit booleans + a re-derived
         # existing_id) so pyright narrows each *_existing_id to `str` from
         # its own `is not None` check at the call site — see cited_task_key
@@ -2026,7 +2089,11 @@ class ReconReportState:
             self._purge_finding(run_id, finding_entry, finding)
             self._persist_run(run_id)
             return _duplicate_finding_error(project_existing_id)
-        if entity_existing_id is not None and entity_existing_id != finding.finding_id:
+        if (
+            entity_existing_id is not None
+            and entity_existing_id != finding.finding_id
+            and not entity_project_mismatch
+        ):
             self._log_cite_task_fold_purge(
                 run_id=run_id,
                 fold='entity_scoped',
