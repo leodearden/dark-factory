@@ -158,6 +158,39 @@ _FOREIGN_HOLDER_TEARDOWN_SECS = 5.0
 #: kernel attribution of the pid, not mere heldness of the lock.
 _FOREIGN_HOLDER_ATTRIBUTION_SECS = 12.0
 
+#: The ``child.wait(timeout=...)`` :func:`foreign_lane_lock_holder`'s
+#: ``_kill_group`` spends reaping the SIGKILLed child.  Unconditional on every
+#: exit path, so it is a term of both ceiling models below — named here rather
+#: than copied into them as a bare ``5.0`` so the fixture and the models cannot
+#: disagree about it (task 3783 review amendment).
+_FOREIGN_HOLDER_KILL_WAIT_SECS = 5.0
+
+#: The acquire wait a consumer shortens ``_RESET_WARM_LANE_LOCK_WAIT_SECS`` /
+#: ``_MERGE_VERIFY_LEASE_WAIT_SECS`` to before driving a contended raise INSIDE
+#: a ``with foreign_lane_lock_holder(...)`` block.  A term of the settle-bound
+#: ceiling model, and shared with those consumers so the model cannot silently
+#: stop describing them: shortening the acquire to, say, 5s in one test while
+#: the model still assumes 1s is exactly the drift task 3836 hit.
+#:
+#: NOT pinned by a regex scan of the two modules, deliberately: the two
+#: CANCELLATION consumers (``test_cancelled_merge_verify_lease_leaves_the_lane_free``,
+#: ``test_cancelled_reset_leaves_the_lane_free_and_the_tree_untouched``) set
+#: deliberately LONGER waits inside the same ``with`` block so the cancellation
+#: lands mid-acquire, and never reach the contended raise or its settle at all.
+#: A scan cannot tell those apart from a raise-driving consumer, so it would be
+#: red on correct code.
+_SHORTENED_ACQUIRE_WAIT_SECS = 1.0
+
+#: Fraction of the effective per-test timeout a wait stack may occupy.  SHARED
+#: by both ceiling invariants below, which bound different stacks against the
+#: same premise: no test in this module or its sibling consumer opts out with
+#: ``@pytest.mark.timeout``, so once a stack collides with the global timeout,
+#: pytest-timeout fires FIRST and — under ``timeout_method="thread"`` with
+#: ``--max-worker-restart=0`` — os._exit()s the xdist worker rather than
+#: failing cleanly.  The remaining 40% is headroom for the real-git fixture
+#: work sharing the same per-test budget.
+_CEILING_FRACTION = 0.6
+
 #: Bound on how long :func:`require_lane_lock_holders` retries an UNREADABLE
 #: kernel lock table before failing loudly.  Deliberately NOT the 30s
 #: spawn-latency class (_FOREIGN_HOLDER_*_SECS): this retries a procfs read,
@@ -191,11 +224,25 @@ def foreign_lane_lock_holder(
     ``/proc/locks`` NAMES ``child.pid`` as the FLOCK holder, within
     :data:`_FOREIGN_HOLDER_ATTRIBUTION_SECS`.  Until task 3598, only the first
     half was ever established, even though ``test_foreign_holder_is_contention_not_a_leak``'s
-    ``child.pid in holders`` assertion (and ``_lane_lock_holder_facts``'
-    raise-time re-read, at the point ``git_ops`` reports the timeout) both
-    depend on the second — so every "the foreign holder" assertion downstream
-    was racing ``/proc/locks`` settling under load rather than testing
-    genuine contention.
+    ``child.pid in holders`` assertion (and the PRODUCTION-side read, at the
+    point ``git_ops`` reports the timeout) both depend on the second — so
+    every "the foreign holder" assertion downstream was racing
+    ``/proc/locks`` settling under load rather than testing genuine
+    contention.
+
+    That second dependent is now hardened at its own end (task 3783): both
+    acquire-timeout sites read through
+    :func:`~orchestrator.git_ops._settled_lane_lock_holder_pids`, which
+    re-reads a bounded number of times when the kernel hands back an EMPTY
+    holder set — the measured seq_file chunked-read transient this fixture's
+    own gate absorbs on the staging side.  So a consumer's downstream "the
+    timeout must name the foreign holder" assertion no longer rides on this
+    gate alone: staging and production each settle their own read, and
+    neither one covers for the other.  Note the consequence for the ceiling
+    invariant below — a consumer that drives a contended raise INSIDE this
+    ``with`` block now pays that production bound on top of this helper's
+    unconditional stack (pinned by
+    ``test_settle_bound_stays_clear_of_the_foreign_holder_ceiling``).
 
     Yields ``(child, holders)``: *child* is the ``flock(1)`` subprocess, and
     *holders* is the SAME kernel-reported holder-pid snapshot fact (2) above
@@ -232,7 +279,7 @@ def foreign_lane_lock_holder(
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(child.pid, signal.SIGKILL)
         with contextlib.suppress(subprocess.TimeoutExpired):
-            child.wait(timeout=5)
+            child.wait(timeout=_FOREIGN_HOLDER_KILL_WAIT_SECS)
 
     clean_exit = False
     try:
@@ -767,6 +814,344 @@ class TestRequireLaneLockHolders:
 
 
 # ---------------------------------------------------------------------------
+# `_settled_lane_lock_holder_pids` (task 3783) — the PRODUCTION-side settle,
+# and the third member of this family.
+#
+# `wait_for_lane_lock_holder` and `require_lane_lock_holders` above harden the
+# TEST side's positive and negative reads (tasks 3598/3604).  Neither reaches
+# the two PRODUCTION reads on the acquire-timeout path
+# (`reset_persistent_merge_worktree`, `merge_verify_lease`), which stayed
+# one-shot — so the same measured transient still lands there, and lands on
+# something worse than a test assertion: it drops the holder pid+pgid out of
+# the operator-facing message AND fails layer (1) of the self-owned-leak
+# predicate, degrading a loud B13 escalation into a quiet contended defer.
+#
+# Pinned here in isolation against an INJECTED reader — the same convention as
+# the two classes above — so every case is deterministic, and touches no real
+# lock and no real /proc/locks.  No case asserts on ELAPSED wall clock (this
+# repo's 1335/1836/2819/3451/3491 load-sensitive flake class); the one case
+# that must observe the helper polling at all bounds the loop through the
+# explicit `timeout=`/`interval=0` parameters instead of shrinking the module
+# global, which leaves its read count robust by orders of magnitude rather than
+# by two sleeps (task 3783 review amendment — see that case's docstring).  The
+# end-to-end behaviour at both real call sites is pinned separately, further
+# below, by `TestContendedRaiseSurvivesALossyHolderRead`.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSettledLaneLockHolderRead:
+    """The contended-raise path must settle its kernel read, fail-safe."""
+
+    async def test_polls_past_a_lossy_empty_read(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """THE headline case: a lossy empty snapshot must not be the answer.
+
+        Mechanism absorbed, measured on this host and recorded in full at
+        ``test_live_in_process_span_is_not_a_leak`` below (:1723-1731):
+        ``/proc/locks`` is a seq_file the kernel serves one PAGE per read(2)
+        regardless of the caller's buffer (a 13062-byte table took 4 reads
+        even for a 1 MiB request), and each read restarts the per-CPU
+        lock-list walk from a POSITIONAL index — so a lock released at an
+        earlier position between chunks shifts every later record down and
+        ours is skipped outright.  Reproduced at 1.54% of reads (144/9337)
+        against a real held flock with 24 concurrent churners.
+
+        Why emptiness is the retry trigger: at the call sites this helper
+        exists for, the read happens IMMEDIATELY AFTER a bounded-wait acquire
+        TIMED OUT.  We waited the full wait and did not get the lock, so
+        somebody held it; "nobody holds it" contradicts the timeout that just
+        produced the question.  Not impossible — the holder may genuinely
+        have released in between, which is exactly what today's degraded
+        message says — so it is RE-READ, not disbelieved (see
+        ``test_a_permanently_empty_read_degrades_and_never_raises``).
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()  # stat-able: NOT the structural-empty short-circuit
+
+        scripted: list[list[int]] = [[], [], [4242]]
+        calls: list[Path] = []
+
+        def _lossy_reader(path: Path) -> list[int]:
+            calls.append(path)
+            return scripted.pop(0) if scripted else [4242]
+
+        monkeypatch.setattr(git_ops_mod, 'lane_lock_holder_pids', _lossy_reader)
+
+        result = await git_ops_mod._settled_lane_lock_holder_pids(lock_path)
+
+        assert result == [4242], (
+            f'a lossy empty read must be polled past, not returned as the '
+            f'holder set — returning it drops the holder pid+pgid from the '
+            f'operator message and fails layer (1) of the leak predicate; '
+            f'got {result!r} after {len(calls)} read(s)'
+        )
+
+    async def test_a_non_empty_first_read_is_returned_without_a_second_read(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """The ORDINARY contention path must not pay extra procfs I/O.
+
+        A non-empty first read is a real answer and agrees with the timeout
+        that produced it; re-reading it could only replace a good snapshot
+        with a later, possibly-lossier one.  Exactly-once is asserted rather
+        than "at most a few": this is the path every healthy contended raise
+        takes, and it is also what keeps the single-snapshot invariant
+        ``_lane_lock_holder_facts`` documents cheap to honour.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+
+        calls: list[Path] = []
+
+        def _reader(path: Path) -> list[int]:
+            calls.append(path)
+            return [4242]
+
+        monkeypatch.setattr(git_ops_mod, 'lane_lock_holder_pids', _reader)
+
+        result = await git_ops_mod._settled_lane_lock_holder_pids(lock_path)
+
+        assert result == [4242]
+        assert len(calls) == 1, (
+            f'the ordinary contention path must read the kernel lock table '
+            f'exactly once; the reader was called {len(calls)} time(s)'
+        )
+
+    async def test_a_permanently_empty_read_degrades_and_never_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """FAIL-SAFE: a still-unknown answer degrades, it never raises.
+
+        The holder may genuinely have released between the timeout and this
+        probe — today's message says so in as many words.  This helper
+        decorates a raise; it must never BE one, or a diagnostic degradation
+        would be promoted into a merge failure at the one site whose job is
+        to report why a merge is deferring.
+
+        The bound is narrowed through the ``timeout``/``interval`` PARAMETERS
+        rather than the module globals, for two reasons (task 3783 review
+        amendment).  They are the only caller-facing knobs the helper exposes,
+        so leaving them unexercised would make them dead surface; and
+        ``interval=0`` removes the wall clock from the poll-count assertion
+        below.  With the shipped 0.02s gap, a ``0.05s`` bound leaves room for
+        barely two sleeps, so a scheduling hiccup could legitimately produce a
+        SINGLE read and turn this case into one more member of the repo's
+        1335/1836/2819/3451/3491 load-sensitive flake class — precisely the
+        class this whole task exists to shrink.  At ``interval=0`` each
+        iteration is a bare loop yield, so "more than one read in 10ms" holds
+        by three or four orders of magnitude rather than by two sleeps.
+        Call-time resolution of the module globals is pinned separately and
+        deterministically by
+        ``test_the_settle_bound_is_read_from_the_module_globals_at_call_time``;
+        the shipped default pair is exercised by
+        ``test_polls_past_a_lossy_empty_read`` above.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+
+        calls: list[Path] = []
+
+        def _always_empty(path: Path) -> list[int]:
+            calls.append(path)
+            return []
+
+        monkeypatch.setattr(git_ops_mod, 'lane_lock_holder_pids', _always_empty)
+
+        result = await git_ops_mod._settled_lane_lock_holder_pids(
+            lock_path, timeout=0.01, interval=0,
+        )
+
+        assert result == [], (
+            f'an exhausted settle must return the empty snapshot unchanged so '
+            f'the call site degrades to exactly today behaviour; got {result!r}'
+        )
+        assert len(calls) > 1, (
+            f'the helper must actually have polled before degrading — a bound '
+            f'that never re-reads is the one-shot read this task removes; the '
+            f'reader was called {len(calls)} time(s)'
+        )
+
+    async def test_the_settle_bound_is_read_from_the_module_globals_at_call_time(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """An omitted bound resolves from the GLOBAL, not a def-time default.
+
+        The seam every end-to-end case in this suite narrows the bound
+        through (``monkeypatch.setattr(git_ops_mod,
+        '_LANE_LOCK_HOLDER_SETTLE_SECS', ...)``), and the same call-time
+        resolution requirement ``wait_for_lane_lock_holder`` documents for its
+        reader: a default frozen into the signature at def time would be
+        immune to that patch, and every consumer narrowing the bound would
+        silently pay the full 0.5s instead.
+
+        Deterministic with NO wall-clock dependence at all: a bound of ``0``
+        makes ``time.monotonic() < deadline`` false on its first evaluation
+        (monotonic never goes backwards), so the poll body cannot run even
+        once and the read count is exactly one.  Were the 0.5s default frozen
+        instead, the same reader would be called ~25 times.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()  # stat-able: NOT the structural-empty short-circuit
+
+        calls: list[Path] = []
+
+        def _always_empty(path: Path) -> list[int]:
+            calls.append(path)
+            return []
+
+        monkeypatch.setattr(git_ops_mod, 'lane_lock_holder_pids', _always_empty)
+        monkeypatch.setattr(git_ops_mod, '_LANE_LOCK_HOLDER_SETTLE_SECS', 0)
+
+        result = await git_ops_mod._settled_lane_lock_holder_pids(lock_path)
+
+        assert result == []
+        assert len(calls) == 1, (
+            f'a zeroed _LANE_LOCK_HOLDER_SETTLE_SECS must be honoured, which '
+            f'it can only be if the helper reads the module global INSIDE its '
+            f'body; a def-time default would poll ~25 times regardless of the '
+            f'patch, and every test that narrows the bound would quietly pay '
+            f'the full 0.5s; the reader was called {len(calls)} time(s)'
+        )
+
+    async def test_an_unstatable_lock_path_is_answered_in_one_read(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """A STRUCTURAL empty is answered immediately — no bound is paid.
+
+        ``lane_lock_holder_pids`` returns ``[]`` for an unstat-able path
+        because ``os.stat`` raised before a single ``/proc/locks`` row was
+        examined.  No amount of re-reading can change that (task 3604's
+        headline case — a held lane whose lock file was unlinked — keeps
+        failing the same stat), so polling it would spend the whole bound to
+        learn nothing.  This is also what keeps the existing stubbed-acquire
+        contended tests, which never create a lock file, from paying the
+        bound.
+
+        Contrast with ``test_polls_past_a_lossy_empty_read``: identical
+        return value, opposite cause, and the ``_lane_lock_identity``
+        short-circuit is what tells them apart.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+
+        lock_path = tmp_path / 'never-created.lock'
+        assert not lock_path.exists(), 'staging error: the path must be unstat-able'
+
+        calls: list[Path] = []
+
+        def _always_empty(path: Path) -> list[int]:
+            calls.append(path)
+            return []
+
+        monkeypatch.setattr(git_ops_mod, 'lane_lock_holder_pids', _always_empty)
+
+        result = await git_ops_mod._settled_lane_lock_holder_pids(lock_path)
+
+        assert result == []
+        assert len(calls) == 1, (
+            f'an unstat-able lock path is a STRUCTURAL empty no re-read can '
+            f'change; it must be answered after ONE read rather than spending '
+            f'the settle bound; the reader was called {len(calls)} time(s)'
+        )
+
+    async def test_settle_bound_stays_clear_of_the_foreign_holder_ceiling(
+        self, pytestconfig,
+    ):
+        """The settle bound must clear the global pytest-timeout ceiling too.
+
+        The CEILING half of this bound's two-sided derivation, in the same
+        style as ``test_foreign_holder_bounds_stay_clear_of_the_global_pytest_timeout``
+        below — and it is the half that forbids simply copying the test
+        side's ``_LANE_LOCK_STRICT_READ_SECS = 2.0``.
+
+        A contended raise driven INSIDE a ``with foreign_lane_lock_holder(...)``
+        block now pays this PRODUCTION bound on top of that helper's own
+        unconditional stack.  That is precisely the case task 3836's
+        amendment to the sibling invariant calls out as NOT covered by its
+        computation: "a further bounded wait a consumer pays inside the
+        ``with`` block".  Three tests do exactly this
+        (``test_foreign_holder_is_contention_not_a_leak``,
+        test_merge_verify_lease_guard.py's reset-lock case, and the new
+        ``TestContendedRaiseSurvivesALossyHolderRead`` cases below), so the
+        sum asserted here — 12.0 startup + 12.0 attribution + 5.0 teardown +
+        5.0 kill-wait + 1.0 monkeypatched acquire wait + the settle bound —
+        is their real worst case.
+
+        Breaching the ceiling would not merely slow a failure: no test in
+        this module or its sibling consumer opts out with
+        ``@pytest.mark.timeout`` (pinned by
+        ``test_no_foreign_holder_consumer_opts_out_of_the_global_timeout``),
+        so pytest-timeout fires first and, under ``timeout_method="thread"``
+        with ``--max-worker-restart=0``, os._exit()s the xdist worker rather
+        than failing cleanly — trading this flake class for a strictly worse
+        one that carries no diagnostics at all.
+
+        The FLOOR half needs no executable pin beyond the behavioural cases
+        above: against the measured 1.54%-per-read loss, the 0.5s/0.02s pair
+        gives ~25 reads (~1e-45 under independence, ~3e-8 even at a
+        deliberately pessimistic 50%-per-read correlated-burst rate), and a
+        re-read either succeeds in microseconds or is structurally broken —
+        the same reasoning that sized ``_LANE_LOCK_STRICT_READ_SECS``.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+
+        global_timeout = _require_effective_per_test_timeout(
+            pytestconfig, premise='the settle bound',
+        )
+
+        settle = git_ops_mod._LANE_LOCK_HOLDER_SETTLE_SECS
+        # Every term is the SAME symbol its owner uses (task 3783 review
+        # amendment): the kill-wait is what `_kill_group` passes to
+        # `child.wait`, and the shortened acquire is what the raise-driving
+        # consumers monkeypatch _RESET_WARM_LANE_LOCK_WAIT_SECS /
+        # _MERGE_VERIFY_LEASE_WAIT_SECS to — so a consumer that lengthens
+        # either one cannot leave this model silently describing something
+        # else.
+        consumer_stack = (
+            _FOREIGN_HOLDER_STARTUP_SECS
+            + _FOREIGN_HOLDER_ATTRIBUTION_SECS
+            + _FOREIGN_HOLDER_TEARDOWN_SECS
+            + _FOREIGN_HOLDER_KILL_WAIT_SECS
+            + _SHORTENED_ACQUIRE_WAIT_SECS
+            + settle
+        )
+        ceiling = _CEILING_FRACTION * global_timeout
+        assert consumer_stack <= ceiling, (
+            f'a consumer driving a contended raise inside '
+            f'foreign_lane_lock_holder now pays the production settle bound '
+            f'({settle}s) on top of the helper\'s unconditional stack, for a '
+            f'worst case of {consumer_stack}s '
+            f'({_FOREIGN_HOLDER_STARTUP_SECS} startup + '
+            f'{_FOREIGN_HOLDER_ATTRIBUTION_SECS} attribution + '
+            f'{_FOREIGN_HOLDER_TEARDOWN_SECS} teardown + '
+            f'{_FOREIGN_HOLDER_KILL_WAIT_SECS} kill-wait + '
+            f'{_SHORTENED_ACQUIRE_WAIT_SECS} shortened acquire wait + '
+            f'{settle} settle), which exceeds '
+            f'{_CEILING_FRACTION:.0%} of '
+            f'the effective per-test timeout ({global_timeout}s, resolved from '
+            f'{pytestconfig.inipath}) — only {ceiling}s is allowed. Task 3836 '
+            f'documents that a bounded wait paid INSIDE the `with` block is '
+            f'not covered by the sibling invariant\'s computation, which is '
+            f'why this bound gets its own pin. Exceeding the effective timeout '
+            f'does not merely delay a failure: pytest-timeout fires first and, '
+            f'under timeout_method="thread" with --max-worker-restart=0, '
+            f'os._exit()s the xdist worker, discarding every bit of structured '
+            f'evidence the failure carried. This is a worst-case bound, not a '
+            f'typical cost: the settle returns the instant a non-empty '
+            f'snapshot lands, so a healthy contended raise pays one read.'
+        )
+
+
+# ---------------------------------------------------------------------------
 # `lane_is_free` must never pass on an UNKNOWN read (task 3604).
 #
 # Measured against the real kernel before this was written, with a leaked fd
@@ -1114,6 +1499,52 @@ def _effective_per_test_timeout(config) -> float | None:
     return None
 
 
+def _require_effective_per_test_timeout(config, *, premise: str) -> float:
+    """:func:`_effective_per_test_timeout`, or fail/skip if none is in effect.
+
+    Extracted (task 3783 review amendment) from the two ceiling invariants
+    below, which had grown byte-identical copies of this resolution differing
+    only in one clause of prose — and the sibling copy already carries a
+    hand-applied task-3836 amendment, which is precisely how two copies drift.
+
+    The fail-vs-skip split is the load-bearing part, and is why this cannot
+    just be ``_effective_per_test_timeout(config) or pytest.skip(...)``. When
+    ``orchestrator/pyproject.toml`` IS the governing inifile, a missing
+    per-test timeout means the pytest-timeout / os._exit() premise these
+    bounds are sized against has genuinely been removed — a regression, so it
+    FAILS. Under any other governing inifile (e.g. a root-bound run whose
+    pyproject.toml declares no ``timeout`` key) it is an invocation artifact
+    with nothing to say about the bounds, so it SKIPS, naming the inifile.
+
+    *premise* names what is sized against the timeout, for both messages.
+    """
+    timeout = _effective_per_test_timeout(config)
+    if timeout is not None:
+        return timeout
+
+    orchestrator_pyproject = Path(__file__).resolve().parents[1] / 'pyproject.toml'
+    governing_inifile = config.inipath
+    if (
+        governing_inifile is not None
+        and governing_inifile.resolve() == orchestrator_pyproject
+    ):
+        pytest.fail(
+            f'{governing_inifile} is the governing inifile for this run, yet '
+            f'no per-test timeout is in effect (checked --timeout, '
+            f'PYTEST_TIMEOUT, and [tool.pytest.ini_options].timeout) — this is '
+            f'a genuine regression: the pytest-timeout / os._exit() premise '
+            f'behind {premise} no longer holds. Either restore the timeout key '
+            f'or re-derive {premise} without it.'
+        )
+    pytest.skip(
+        f'no per-test timeout is in effect under the governing inifile '
+        f'{governing_inifile!r} — this is not {orchestrator_pyproject}, so '
+        f'this is an invocation artifact (e.g. a root-bound run), not drift; '
+        f'the pytest-timeout ceiling this invariant checks does not apply to '
+        f'this run'
+    )
+
+
 def _stub_pytest_config(
     *,
     cli_timeout: float | None,
@@ -1341,45 +1772,28 @@ def test_foreign_holder_bounds_stay_clear_of_the_global_pytest_timeout(pytestcon
     (``git_repo``/``real_git_ops``, ``_get_merge_commit``,
     ``reset_persistent_merge_worktree``) sharing the same per-test budget.
     """
-    global_timeout = _effective_per_test_timeout(pytestconfig)
-    if global_timeout is None:
-        orchestrator_pyproject = Path(__file__).resolve().parents[1] / 'pyproject.toml'
-        governing_inifile = pytestconfig.inipath
-        if governing_inifile is not None and governing_inifile.resolve() == orchestrator_pyproject:
-            pytest.fail(
-                f'{governing_inifile} is the governing inifile for this run, '
-                f'yet no per-test timeout is in effect (checked --timeout, '
-                f'PYTEST_TIMEOUT, and [tool.pytest.ini_options].timeout) — '
-                f'this is a genuine regression: the pytest-timeout / '
-                f'os._exit() premise the foreign-holder bounds in this '
-                f'module are sized against no longer holds. Either restore '
-                f'the timeout key or re-derive these bounds without it.'
-            )
-        pytest.skip(
-            f'no per-test timeout is in effect under the governing inifile '
-            f'{governing_inifile!r} — this is not {orchestrator_pyproject}, '
-            f'so this is an invocation artifact (e.g. a root-bound run), '
-            f'not drift; the pytest-timeout ceiling this invariant checks '
-            f'does not apply to this run'
-        )
+    global_timeout = _require_effective_per_test_timeout(
+        pytestconfig, premise='the foreign-holder bounds in this module',
+    )
 
-    # The _kill_group kill-wait (child.wait(timeout=5)) runs unconditionally
-    # on every exit path, in addition to the three named _FOREIGN_HOLDER_*
-    # bounds.
+    # The _kill_group kill-wait runs unconditionally on every exit path, in
+    # addition to the three named _FOREIGN_HOLDER_* bounds.
     unconditional_stack = (
         _FOREIGN_HOLDER_STARTUP_SECS
         + _FOREIGN_HOLDER_ATTRIBUTION_SECS
         + _FOREIGN_HOLDER_TEARDOWN_SECS
-        + 5.0
+        + _FOREIGN_HOLDER_KILL_WAIT_SECS
     )
-    ceiling = 0.6 * global_timeout
+    ceiling = _CEILING_FRACTION * global_timeout
     assert unconditional_stack <= ceiling, (
         f'the WORST-CASE unconditional wait stack inside '
         f'foreign_lane_lock_holder is {unconditional_stack}s '
         f'({_FOREIGN_HOLDER_STARTUP_SECS} startup + '
         f'{_FOREIGN_HOLDER_ATTRIBUTION_SECS} attribution + '
-        f'{_FOREIGN_HOLDER_TEARDOWN_SECS} teardown + 5.0 kill-wait), which '
-        f'exceeds 60% of the effective per-test timeout ({global_timeout}s, '
+        f'{_FOREIGN_HOLDER_TEARDOWN_SECS} teardown + '
+        f'{_FOREIGN_HOLDER_KILL_WAIT_SECS} kill-wait), which '
+        f'exceeds {_CEILING_FRACTION:.0%} of '
+        f'the effective per-test timeout ({global_timeout}s, '
         f'resolved from {pytestconfig.inipath}) — only {ceiling}s of '
         f'headroom is allowed. No test in this module, nor in the sibling '
         f'consumer test_merge_verify_lease_guard.py, opts out with '
@@ -1653,7 +2067,11 @@ class TestSelfOwnedLaneLockLeak:
         from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
         from orchestrator.git_ops import LaneLockSelfOwnedLeak  # noqa: PLC0415
 
-        monkeypatch.setattr(git_ops_mod, '_RESET_WARM_LANE_LOCK_WAIT_SECS', 1)
+        monkeypatch.setattr(
+            git_ops_mod,
+            '_RESET_WARM_LANE_LOCK_WAIT_SECS',
+            _SHORTENED_ACQUIRE_WAIT_SECS,
+        )
 
         commit_a = await _get_merge_commit(real_git_ops, 'leak-f1', 'leak_f1.py')
         await real_git_ops.reset_persistent_merge_worktree(commit_a)
@@ -1780,6 +2198,539 @@ class TestSelfOwnedLaneLockLeak:
                 assert real_git_ops._lane_lock_self_owned_leak(lock_path, 1.0) is None
             finally:
                 remove_lock_holder_pgid(real_git_ops.worktree_base)
+
+
+# ---------------------------------------------------------------------------
+# Task 3783: the PRODUCTION contended-raise path must survive a LOSSY read.
+#
+# `TestSettledLaneLockHolderRead` above pins the settle helper in isolation;
+# this class pins what it is FOR, end to end at the real call sites, with the
+# measured transient made deterministic by scripting the first read to `[]`.
+#
+# Both consequences of the one-shot read are pinned, because they are separate
+# defects that happen to share a cause:
+#   (1) DIAGNOSTIC LOSS — `_lane_lock_holder_facts` renders its degraded "no
+#       FLOCK holder" clause precisely when the lane IS contended, dropping the
+#       holder pid+pgid, which is the one datum DF 3003/3081 had to reconstruct
+#       by hand;
+#   (2) FALSE NEGATIVE ON A LOUD ESCALATION — an empty snapshot also fails
+#       layer (1) of `_lane_lock_self_owned_leak` (`self_pid not in []`), so a
+#       genuine self-owned leak is misreported as ordinary foreign contention
+#       and defers quietly.  That is the B13 detector failing OPEN under
+#       exactly the load where it matters, and it is the stronger reason this
+#       is a production defect rather than message polish.
+#
+# The scripted first-`[]` reader is installed INSIDE the staging block, after
+# the fixture has settled its own attribution, so the read it steals is
+# unambiguously the production one.  The fixture reads through THIS module's
+# `lane_lock_holder_pids` global, not `git_ops`', so the two never collide.
+# ---------------------------------------------------------------------------
+
+#: A pid the scripted readers below return on reads AFTER the one the
+#: production site is supposed to settle on.  Deliberately implausible (Linux
+#: pid_max is nowhere near this) so a rendered message naming it is
+#: unmistakably a LATER read leaking into the raise.
+#:
+#: Returned ALONGSIDE `os.getpid()` (task 3783 review amendment), because the
+#: two consumers of the settled snapshot fail visibly in different ways and one
+#: scripted value cannot catch both: a later read reaching the MESSAGE shows up
+#: as this pid in the rendered clause, while a later read reaching the
+#: PREDICATE shows up only as a changed exception TYPE — our own pid passes
+#: layer (1), and with an empty registry and no rendezvous neither layer (2)
+#: nor layer (3) vetoes, so the raise becomes `LaneLockSelfOwnedLeak`.  Pairing
+#: them makes the same scripted read fatal to either consumer independently.
+_BOGUS_LATER_PID = 2**31 - 2
+
+
+def _first_read_is_lossy(
+    real_reader: Callable[[Path], list[int]],
+) -> Callable[[Path], list[int]]:
+    """Wrap *real_reader* so its FIRST call returns ``[]``, then delegates.
+
+    Reproduces the measured seq_file transient exactly — a successful read
+    that simply missed our record — at the one read the production site takes,
+    with zero timing dependence.  Everything after it is the genuine kernel,
+    so the settled answer these tests assert on is a REAL attribution and not
+    a scripted one.
+    """
+    reads: list[int] = []
+
+    def _reader(path: Path) -> list[int]:
+        reads.append(1)
+        if len(reads) == 1:
+            return []
+        return real_reader(path)
+
+    return _reader
+
+
+@pytest.mark.asyncio
+class TestContendedRaiseSurvivesALossyHolderRead:
+    """A lossy /proc/locks read must not degrade the contended-raise path."""
+
+    async def test_a_lossy_first_read_still_names_the_foreign_holder(
+        self, real_git_ops, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """THE headline regression: esc-3060-4, reproduced deterministically.
+
+        `test_foreign_holder_is_contention_not_a_leak` above asserts the same
+        `str(child.pid) in str(excinfo.value)` and is the test that actually
+        flaked — but only when the kernel happened to serve a lossy chunk, so
+        it could neither be reproduced on demand nor pinned.  Scripting the
+        production site's FIRST read to `[]` makes that exact failure certain
+        instead of rare: the lane is genuinely contended by a genuinely
+        foreign process, and the only thing wrong is the snapshot.
+
+        RED before task 3783: the single lossy read degrades the message to
+        "the kernel reports no FLOCK holder of that lock", discarding the
+        holder pid+pgid — the one forensic datum the incident needed.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+
+        monkeypatch.setattr(
+            git_ops_mod,
+            '_RESET_WARM_LANE_LOCK_WAIT_SECS',
+            _SHORTENED_ACQUIRE_WAIT_SECS,
+        )
+
+        commit_a = await _get_merge_commit(real_git_ops, 'lossy-a', 'lossy_a.py')
+        await real_git_ops.reset_persistent_merge_worktree(commit_a)  # create-once
+        commit_b = await _get_merge_commit(real_git_ops, 'lossy-b', 'lossy_b.py')
+
+        lock_path = lane_lock_path(real_git_ops.persistent_merge_worktree_path)
+
+        with foreign_lane_lock_holder(lock_path) as (child, holders):
+            assert child.pid in holders, (
+                f'staging error: the fixture must have settled a genuine '
+                f'foreign attribution before the lossy read is injected, or '
+                f'this test would be asserting about nothing; observed '
+                f'holders={holders!r}'
+            )
+            monkeypatch.setattr(
+                git_ops_mod,
+                'lane_lock_holder_pids',
+                _first_read_is_lossy(git_ops_mod.lane_lock_holder_pids),
+            )
+
+            with pytest.raises(MergeVerifyLeaseContended) as excinfo:
+                await real_git_ops.reset_persistent_merge_worktree(commit_b)
+
+            assert str(child.pid) in str(excinfo.value), (
+                f'a lossy first read must be settled past: the timeout must '
+                f'still name the kernel-reported holder, which is what the '
+                f'incident needed manual /proc/locks + stat forensics to '
+                f'learn; got {str(excinfo.value)!r}'
+            )
+
+    async def test_the_settled_snapshot_drives_both_the_predicate_and_the_message(
+        self, real_git_ops, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """ONE settled snapshot reaches BOTH consumers — no raise-time re-read.
+
+        The invariant `_lane_lock_holder_facts`' docstring documents (task
+        3081) must survive the settle: a second, independent read at render
+        time could observe a DIFFERENT holder set than the leak predicate
+        evaluated, quietly misdescribing the decision during exactly the
+        forensics the clause exists for.  Settling makes that failure more
+        likely, not less, if it were re-read — the whole point is that the
+        answer changes between reads.
+
+        Scripted `[]` -> `[child.pid]` -> `[os.getpid(), _BOGUS_LATER_PID]`
+        forever: the raise must be driven ENTIRELY by the second read.  Both
+        consumers are covered, and each by an assertion the other cannot make
+        (task 3783 review amendment — this case previously asserted only on
+        the rendered message, so an independent re-read inside
+        `_lane_lock_self_owned_leak` would have gone unnoticed: it would have
+        received `[_BOGUS_LATER_PID]`, still failed `self_pid not in`, still
+        raised the same type with the same message, and this test would have
+        stayed green):
+
+        * MESSAGE — `_BOGUS_LATER_PID` must not appear in the rendered clause.
+          `_lane_lock_holder_facts` re-reads only when `holder_pids is None`,
+          so this fails the moment the call site stops passing the snapshot.
+        * PREDICATE — the type must be exactly `MergeVerifyLeaseContended`.
+          A re-read inside the predicate would see OUR pid, pass layer (1),
+          and — the registry being empty and no rendezvous written — raise
+          `LaneLockSelfOwnedLeak` against an entirely foreign hold.  That is
+          an IS-A of the caught type, so only `type(...) is` catches it.
+
+        Asserted on the raise rather than on a reader call count deliberately
+        — a count would itself be racy if a delegated real read were ever
+        lossy.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+
+        monkeypatch.setattr(
+            git_ops_mod,
+            '_RESET_WARM_LANE_LOCK_WAIT_SECS',
+            _SHORTENED_ACQUIRE_WAIT_SECS,
+        )
+
+        commit_a = await _get_merge_commit(real_git_ops, 'settle-a', 'settle_a.py')
+        await real_git_ops.reset_persistent_merge_worktree(commit_a)  # create-once
+        commit_b = await _get_merge_commit(real_git_ops, 'settle-b', 'settle_b.py')
+
+        lock_path = lane_lock_path(real_git_ops.persistent_merge_worktree_path)
+
+        with foreign_lane_lock_holder(lock_path) as (child, _holders):
+            scripted: list[list[int]] = [[], [child.pid]]
+            later = [os.getpid(), _BOGUS_LATER_PID]
+
+            def _scripted_reader(path: Path) -> list[int]:
+                return scripted.pop(0) if scripted else later
+
+            monkeypatch.setattr(
+                git_ops_mod, 'lane_lock_holder_pids', _scripted_reader,
+            )
+
+            with pytest.raises(MergeVerifyLeaseContended) as excinfo:
+                await real_git_ops.reset_persistent_merge_worktree(commit_b)
+
+            assert type(excinfo.value) is MergeVerifyLeaseContended, (
+                f'the leak PREDICATE must evaluate the settled snapshot it was '
+                f'handed, not take a read of its own: a later read names our '
+                f'pid, passes layer (1), and turns an entirely foreign hold '
+                f'into a loud human-escalating B13 leak report; got '
+                f'{type(excinfo.value).__name__}'
+            )
+            msg = str(excinfo.value)
+            assert str(child.pid) in msg, (
+                f'the settled snapshot must be the one rendered; got {msg!r}'
+            )
+            assert str(_BOGUS_LATER_PID) not in msg, (
+                f'the MESSAGE must NOT take a second, independent read: the '
+                f'clause would then describe a holder set the leak predicate '
+                f'never evaluated (the task-3081 single-snapshot invariant); '
+                f'got {msg!r}'
+            )
+
+    async def test_a_lossy_first_read_does_not_mask_a_self_owned_leak(
+        self, real_git_ops, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """The FALSE-NEGATIVE half — a B13 leak must not defer quietly.
+
+        The stronger of the two defects.  Layer (1) of
+        `_lane_lock_self_owned_leak` asks whether OUR pid is among the kernel
+        holders; against a lossy `[]` it answers no, so a genuinely leaked
+        lane — an unregistered fd nothing will ever release, the state reify
+        esc-5548-5 found by hand — is misreported as ordinary foreign
+        contention and DEFERS.  The lane then stays locked until process exit
+        with nothing loud ever said about it: the detector failing OPEN under
+        exactly the load that produces the lossy read.
+
+        `type(...) is` is not needed here (the leak type IS the assertion),
+        but the contrast with the contended case above is the point: identical
+        kernel state, identical staging, and the only difference is whether
+        the read was settled.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+        from orchestrator.git_ops import LaneLockSelfOwnedLeak  # noqa: PLC0415
+
+        monkeypatch.setattr(git_ops_mod, '_RESET_WARM_LANE_LOCK_WAIT_SECS', 1)
+
+        commit_a = await _get_merge_commit(real_git_ops, 'lossyleak-a', 'll_a.py')
+        await real_git_ops.reset_persistent_merge_worktree(commit_a)  # create-once
+        commit_b = await _get_merge_commit(real_git_ops, 'lossyleak-b', 'll_b.py')
+
+        lock_path = lane_lock_path(real_git_ops.persistent_merge_worktree_path)
+
+        with leaked_lane_lock(lock_path):
+            monkeypatch.setattr(
+                git_ops_mod,
+                'lane_lock_holder_pids',
+                _first_read_is_lossy(git_ops_mod.lane_lock_holder_pids),
+            )
+
+            with pytest.raises(LaneLockSelfOwnedLeak):
+                await real_git_ops.reset_persistent_merge_worktree(commit_b)
+
+    async def test_a_permanently_unreadable_holder_set_still_raises_contended(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """FAIL-SAFE at the call site: a settle that learns nothing changes nothing.
+
+        Expected to hold both before and after task 3783 — that is what makes
+        it the regression guard.  The new poll must not be able to convert a
+        degraded read into a raise of a different type, a hang, or a leak
+        misreport: when the holder set stays unknown, the site degrades to
+        exactly today's `MergeVerifyLeaseContended` carrying today's "no FLOCK
+        holder" clause.
+
+        `type(...) is` and not `isinstance`: `LaneLockSelfOwnedLeak` IS-A
+        `MergeVerifyLeaseContended`, so an isinstance check would pass even if
+        an empty snapshot were misrouted into a loud leak escalation — the
+        precise false alarm this asymmetry exists to prevent.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+
+        git_ops = _git_ops(tmp_path)
+        # Simulate acquire_merge_verify_flock's bounded-wait TIMEOUT (-> None),
+        # the established stub for reaching a contended branch without staging
+        # a real holder (test_merge_verify_lease_guard.py:118-122).
+        monkeypatch.setattr(
+            git_ops_mod, 'acquire_merge_verify_flock', lambda *a, **k: None,
+        )
+        monkeypatch.setattr(
+            git_ops_mod, 'lane_lock_holder_pids', lambda path: [],
+        )
+        monkeypatch.setattr(git_ops_mod, '_LANE_LOCK_HOLDER_SETTLE_SECS', 0.05)
+
+        with pytest.raises(MergeVerifyLeaseContended) as excinfo:
+            await git_ops.reset_persistent_merge_worktree('HEAD')
+
+        assert type(excinfo.value) is MergeVerifyLeaseContended, (
+            f'an unknown holder set must stay ordinary contention, never a '
+            f'loud leak escalation; got {type(excinfo.value).__name__}'
+        )
+        assert 'no FLOCK holder' in str(excinfo.value), (
+            f'an exhausted settle must degrade to exactly today\'s clause — '
+            f'the holder may genuinely have released between the timeout and '
+            f'this probe, which is what that wording says; got '
+            f'{str(excinfo.value)!r}'
+        )
+
+    # -- the window the settle WIDENS (task 3783 review amendment) ---------
+    #
+    # Polling turns ONE glimpse of the kernel table into ~25, so anything that
+    # was momentarily true between reads is now sampled repeatedly.  The one
+    # such thing that matters is an IN-PROCESS SIBLING winning this same lane
+    # mid-poll: at layer (1) its healthy hold is indistinguishable from our own
+    # leak (both are flocks attributed to our pid), and layer (3) cannot help
+    # because `write_lock_holder_pgid` runs only after the acquire returns.
+    # ONLY layer (2)'s registry separates them — so the registry must not lag
+    # the kernel, which is what the first case below pins and the second one
+    # spends.  The empty-first-read case is exactly when a waiter is MOST
+    # likely to win, so this is not a theoretical pairing.
+
+    async def test_a_won_fd_is_registered_on_the_acquires_own_thread_not_on_the_loop(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Registration must be atomic with the acquire, not deferred to the loop.
+
+        `_acquire_lane_flock_off_thread` used to call
+        `_register_held_lane_lock` on the EVENT LOOP, after `await
+        asyncio.shield(inner)` resumed.  Between the flock and that resume sits
+        a scheduling hop whose length is unbounded exactly under load — and
+        across it the kernel already names our pid (layer 1 TRUE) while
+        `_HELD_LANE_LOCK_FDS` is still empty (layer 2 False, and an EMPTY
+        registry is the one case `_lane_lock_held_in_process` calls
+        unambiguous).  A sibling probing there raises a LOUD, human-escalating
+        B13 leak against a perfectly healthy hold.
+
+        Asserted on the THREAD rather than on an ordering of events, because
+        the thread is what actually discriminates: on the worker thread the
+        window is the two syscalls between the flock and the registry insert;
+        on the loop it is however long the loop takes to get back to us.
+        Fully deterministic — the acquire is stubbed, so no real lock, no
+        `/proc/locks` read and no wall clock is involved.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+
+        real_register = git_ops_mod._register_held_lane_lock
+        observed: dict[str, int | None] = {'acquire': None, 'register': None}
+
+        def _acquire(*_a, **_k) -> int:
+            observed['acquire'] = threading.get_ident()
+            return _SENTINEL_FD
+
+        def _register(fd: int, path: Path) -> None:
+            observed['register'] = threading.get_ident()
+            real_register(fd, path)
+
+        released: list[int] = []
+        monkeypatch.setattr(git_ops_mod, 'acquire_merge_verify_flock', _acquire)
+        monkeypatch.setattr(git_ops_mod, '_register_held_lane_lock', _register)
+        monkeypatch.setattr(
+            git_ops_mod, 'release_merge_verify_flock', released.append,
+        )
+
+        lock_path = lane_lock_path(tmp_path / 'lane')
+        fd = await GitOps._acquire_lane_flock_off_thread(lock_path, 5.0)
+        try:
+            assert fd == _SENTINEL_FD, 'the won fd must still reach its caller'
+            assert observed['acquire'] is not None, (
+                'the acquire never ran — this case would prove nothing'
+            )
+            assert observed['register'] == observed['acquire'], (
+                f'the won fd must be registered ON the acquire\'s own worker '
+                f'thread, so the registry cannot lag the kernel across an '
+                f'event-loop scheduling hop — a sibling probing inside that '
+                f'gap reads layer (1) TRUE / layer (2) FALSE and reports a '
+                f'healthy hold as a self-owned leak, and the settle now '
+                f'samples that gap ~25 times per contended raise; acquire ran '
+                f'on {observed["acquire"]!r}, register on '
+                f'{observed["register"]!r}'
+            )
+            assert observed['register'] != threading.get_ident(), (
+                'registration ran on the EVENT LOOP thread — that is the '
+                'deferred ordering this pins against'
+            )
+        finally:
+            # Pops the registration too: a surviving {fd: None} entry would
+            # make _lane_lock_held_in_process answer True for every path and
+            # mask real leaks in every test after this one.
+            GitOps._release_lane_flock(fd)
+
+    async def test_a_sibling_hold_won_during_the_settle_is_contention_not_a_leak(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """A sibling winning the lane mid-poll is CONTENTION, never a B13 leak.
+
+        The consequence of the ordering pinned above, spent at the raise site.
+        Staged in the production order: the kernel starts attributing the lane
+        to our pid on the SAME read at which the sibling's registration lands,
+        because `_acquire_lane_flock_off_thread` does both on one worker
+        thread.  Layer (1) therefore passes and layer (2) vetoes, which is the
+        whole point — the settle may promote a snapshot naming our pid, but it
+        must never promote it past the registry.
+
+        `type(...) is` and not `isinstance`: `LaneLockSelfOwnedLeak` IS-A
+        `MergeVerifyLeaseContended`, so an isinstance check would pass on
+        exactly the false alarm this excludes.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+
+        git_ops = _git_ops(tmp_path)
+        lock_path = lane_lock_path(git_ops.persistent_merge_worktree_path)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.touch()  # stat-able: the settle must actually poll here
+
+        # Our own acquire times out (the established stub, cf.
+        # test_merge_verify_lease_guard.py:118-122) — the sibling's is the one
+        # that wins, and is simulated by the reader below.
+        monkeypatch.setattr(
+            git_ops_mod, 'acquire_merge_verify_flock', lambda *a, **k: None,
+        )
+
+        sibling_fd = os.open(lock_path, os.O_RDWR)
+        reads: list[int] = []
+
+        def _sibling_wins_mid_settle(path: Path) -> list[int]:
+            reads.append(1)
+            if len(reads) == 1:
+                return []  # the empty read that starts the settle
+            if len(reads) == 2:
+                # The sibling's acquire wins HERE, registering on its own
+                # worker thread in the same breath as the kernel flock.
+                git_ops_mod._register_held_lane_lock(sibling_fd, path)
+            return [os.getpid()]
+
+        monkeypatch.setattr(
+            git_ops_mod, 'lane_lock_holder_pids', _sibling_wins_mid_settle,
+        )
+
+        try:
+            with pytest.raises(MergeVerifyLeaseContended) as excinfo:
+                await git_ops.reset_persistent_merge_worktree('HEAD')
+        finally:
+            GitOps._release_lane_flock(sibling_fd)
+
+        assert type(excinfo.value) is MergeVerifyLeaseContended, (
+            f'a sibling\'s registered, healthy hold observed during the settle '
+            f'must stay ordinary contention: layer (1) sees our pid because '
+            f'the kernel truthfully reports it, and layer (2) is what says it '
+            f'is not a leak. Raising here is the loud human-escalating false '
+            f'alarm the register-when-in-doubt asymmetry exists to prevent; '
+            f'got {type(excinfo.value).__name__}'
+        )
+
+    # -- the LEASE site (task 3783 step-5) ---------------------------------
+    #
+    # `merge_verify_lease` is a SEPARATE raise site with its own bounded-wait
+    # constant and its own byte-identical one-shot read, so the reset-site fix
+    # above cannot vouch for it.  Both properties are re-pinned here rather
+    # than assumed: the two sites have drifted apart before (task 3003 gave
+    # the reset its own constant), and this pair is exactly the kind that
+    # silently diverges when only one of them has a test.
+
+    async def test_the_lease_contended_raise_also_names_the_foreign_holder(
+        self, real_git_ops, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """The lease's contended raise must survive the same lossy read.
+
+        Same defect, same staging, different call site — and the lease is the
+        one whose refusal DEFERS a 1--2h verify, so its message is what an
+        operator reads when the merge queue stalls.  The body must never run:
+        a lease that never took the lock cannot protect the window it exists
+        to protect (task 2828 limb 2).
+
+        RED before task 3783: the one-shot read at the lease site degrades the
+        clause to "no FLOCK holder" exactly as the reset site did.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+
+        monkeypatch.setattr(
+            git_ops_mod,
+            '_MERGE_VERIFY_LEASE_WAIT_SECS',
+            _SHORTENED_ACQUIRE_WAIT_SECS,
+        )
+
+        lock_path = lane_lock_path(real_git_ops.persistent_merge_worktree_path)
+
+        with foreign_lane_lock_holder(lock_path) as (child, holders):
+            assert child.pid in holders, (
+                f'staging error: the fixture must have settled a genuine '
+                f'foreign attribution before the lossy read is injected; '
+                f'observed holders={holders!r}'
+            )
+            monkeypatch.setattr(
+                git_ops_mod,
+                'lane_lock_holder_pids',
+                _first_read_is_lossy(git_ops_mod.lane_lock_holder_pids),
+            )
+
+            with pytest.raises(MergeVerifyLeaseContended) as excinfo:
+                async with real_git_ops.merge_verify_lease():
+                    pytest.fail(
+                        'the lease body must never run while the lane lock is '
+                        'held by a foreign process — that is the unprotected '
+                        '1-2h verify window task 2828 closed'
+                    )
+
+            assert str(child.pid) in str(excinfo.value), (
+                f'the lease timeout must also name the kernel-reported '
+                f'holder; a lossy first read must not be what an operator '
+                f'sees when the merge queue stalls; got {str(excinfo.value)!r}'
+            )
+
+    async def test_the_lease_degrades_fail_safe_on_a_permanently_empty_read(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """FAIL-SAFE at the lease site: the refusal's SHAPE cannot change.
+
+        The lease-site counterpart of
+        `test_a_permanently_unreadable_holder_set_still_raises_contended`, and
+        green before and after.  It additionally guards the rendezvous: a
+        lease that never acquired must not record itself as the holder, or it
+        would corrupt the very liveness signal layer (3) of the leak predicate
+        reads.  The new await sits between the timed-out acquire and the
+        raise, so this pins that it can neither leave a rendezvous behind nor
+        let the body run.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+
+        git_ops = _git_ops(tmp_path)
+        monkeypatch.setattr(
+            git_ops_mod, 'acquire_merge_verify_flock', lambda *a, **k: None,
+        )
+        monkeypatch.setattr(
+            git_ops_mod, 'lane_lock_holder_pids', lambda path: [],
+        )
+        monkeypatch.setattr(git_ops_mod, '_LANE_LOCK_HOLDER_SETTLE_SECS', 0.05)
+
+        entered = False
+        with pytest.raises(MergeVerifyLeaseContended) as excinfo:
+            async with git_ops.merge_verify_lease():
+                entered = True
+
+        assert type(excinfo.value) is MergeVerifyLeaseContended, (
+            f'an unknown holder set must stay ordinary contention at the '
+            f'lease site too; got {type(excinfo.value).__name__}'
+        )
+        assert not entered, 'the lease body must NOT run on a contended flock'
+        assert read_lock_holder_pgid(git_ops.worktree_base) is None, (
+            'a lease that never acquired must not record itself as the holder'
+        )
 
 
 # ---------------------------------------------------------------------------

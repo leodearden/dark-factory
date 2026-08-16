@@ -2455,6 +2455,23 @@ def test_lease_decision_has_exactly_acquired_stand_down_proceed() -> None:
     assert sr.LeaseDecision.PROCEED.value == 'proceed'
 
 
+def test_lease_mutation_has_exactly_applied_forced_absent_refused_faulted() -> None:
+    values = {member.value for member in sr.LeaseMutation}
+    assert values == {'applied', 'forced', 'absent', 'refused', 'faulted'}
+    assert sr.LeaseMutation.APPLIED.value == 'applied'
+    assert sr.LeaseMutation.FORCED.value == 'forced'
+    assert sr.LeaseMutation.ABSENT.value == 'absent'
+    assert sr.LeaseMutation.REFUSED.value == 'refused'
+    assert sr.LeaseMutation.FAULTED.value == 'faulted'
+
+
+def test_lease_mutation_is_a_str_enum_like_its_siblings() -> None:
+    # Mirrors LeasePolicy/LeaseDecision: the CLI prints `.value` directly and
+    # a StrEnum member compares equal to its own string form.
+    assert issubclass(sr.LeaseMutation, str)
+    assert sr.LeaseMutation.REFUSED == 'refused'
+
+
 def test_lease_heartbeat_ttl_is_a_timedelta() -> None:
     assert isinstance(sr.LEASE_HEARTBEAT_TTL, timedelta)
 
@@ -2471,6 +2488,139 @@ def test_lease_holder_dict_round_trip_is_lossless() -> None:
         session_slug='watcher-df-100', pid=4242, start_ts='2026-07-07T12:00:00+00:00'
     )
     assert sr.LeaseHolder.from_dict(holder.to_dict()) == holder
+
+
+# --- _render_contention_message (task 3994 defect 3) ----------------------
+#
+# The old form was `lease held by <slug> ({alive|dead}, heartbeat <n>s ago)`,
+# which reads as SELF-CONTRADICTORY on its most important branch: "dead,
+# heartbeat 42s ago" invites the reader to conclude the holder is gone and
+# the lease is reclaimable, when a fresh heartbeat means precisely the
+# opposite. That exact string misled the 2026-08-08 rotation into
+# force-releasing a live holder's lease. Liveness and freshness are two
+# INDEPENDENT axes and each must now name itself.
+
+_LIVE_HOLDER = sr.LeaseHolder(
+    session_slug='watcher-df-100', pid=4242, start_ts='2026-07-07T12:00:00+00:00'
+)
+
+
+def test_contention_message_live_holder_names_the_slug_and_the_pid() -> None:
+    msg = sr._render_contention_message(
+        _LIVE_HOLDER, holder_alive=True, age_secs=42.0, policy=sr.LeasePolicy.STAND_DOWN
+    )
+
+    assert 'watcher-df-100' in msg
+    assert '4242' in msg
+    assert 'pid 4242 alive' in msg
+    assert msg.endswith('— standing down')
+
+
+def test_contention_message_dead_pid_but_fresh_heartbeat_says_not_reclaimable() -> None:
+    ttl = timedelta(seconds=7200)
+    msg = sr._render_contention_message(
+        _LIVE_HOLDER,
+        holder_alive=False,
+        age_secs=1200.0,
+        policy=sr.LeasePolicy.STAND_DOWN,
+        ttl=ttl,
+    )
+
+    # The withdrawn string, pinned as an ANTI-assertion.
+    assert '(dead, heartbeat' not in msg
+    lowered = msg.lower()
+    assert 'not running' in lowered  # the pid axis, named
+    assert 'fresh' in lowered  # the heartbeat axis, named
+    assert 'not reclaimable' in lowered  # the decision, explained
+    assert '6000' in msg  # the remaining TTL, in seconds
+
+
+def test_contention_message_remaining_ttl_tracks_the_injected_ttl() -> None:
+    msg = sr._render_contention_message(
+        _LIVE_HOLDER,
+        holder_alive=False,
+        age_secs=100.0,
+        policy=sr.LeasePolicy.STAND_DOWN,
+        ttl=timedelta(seconds=900),
+    )
+    assert '800' in msg
+
+
+def test_contention_message_dead_pid_past_ttl_is_phrased_as_reclaim_eligible() -> None:
+    msg = sr._render_contention_message(
+        _LIVE_HOLDER,
+        holder_alive=False,
+        age_secs=9000.0,
+        policy=sr.LeasePolicy.STAND_DOWN,
+        ttl=timedelta(seconds=7200),
+    )
+
+    assert '(dead, heartbeat' not in msg
+    lowered = msg.lower()
+    assert 'not running' in lowered
+    # Past the TTL the lease WAS reclaim-eligible; we are here only because
+    # the reclaim race was lost to someone else, and the message must say so
+    # rather than implying the holder is still healthy.
+    assert 'reclaim' in lowered
+    assert 'not reclaimable' not in lowered
+
+
+def test_contention_message_corrupt_body_does_not_invent_a_holder() -> None:
+    msg = sr._render_contention_message(
+        None, holder_alive=False, age_secs=42.0, policy=sr.LeasePolicy.STAND_DOWN
+    )
+
+    assert 'unreadable' in msg.lower()
+    assert '42s ago' in msg  # freshness is still reported
+    assert msg.endswith('— standing down')
+
+
+@pytest.mark.parametrize(
+    ('policy', 'suffix'),
+    [
+        (sr.LeasePolicy.STAND_DOWN, '— standing down'),
+        (sr.LeasePolicy.WARN_AND_PROCEED, '— proceeding anyway'),
+    ],
+)
+@pytest.mark.parametrize(
+    ('holder', 'alive', 'age'),
+    [
+        (_LIVE_HOLDER, True, 42.0),
+        (_LIVE_HOLDER, False, 1200.0),
+        (_LIVE_HOLDER, False, 9000.0),
+        (None, False, 42.0),
+    ],
+    ids=['live', 'dead-fresh', 'dead-expired', 'corrupt'],
+)
+def test_contention_message_is_always_one_greppable_line(
+    policy: sr.LeasePolicy,
+    suffix: str,
+    holder: sr.LeaseHolder | None,
+    alive: bool,
+    age: float,
+) -> None:
+    msg = sr._render_contention_message(holder, holder_alive=alive, age_secs=age, policy=policy)
+
+    assert '\n' not in msg
+    assert msg.endswith(suffix)
+
+
+def test_claim_lease_dead_holder_within_ttl_reports_the_non_contradictory_message(
+    tmp_path: Path,
+) -> None:
+    # End-to-end: the branch the 2026-08-08 rotation actually hit.
+    dead = sr.LeaseHolder(session_slug='watcher-df-dead', pid=_DEAD_PID, start_ts=_NOW.isoformat())
+    sr.claim_lease('watcher-df', holder=dead, root=tmp_path, now=_NOW)
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    _set_mtime(lease_path, _NOW, sr.LEASE_HEARTBEAT_TTL - timedelta(minutes=10))
+
+    contender = sr.LeaseHolder(session_slug='watcher-df-200', pid=os.getpid(), start_ts=_NOW.isoformat())
+    claim = sr.claim_lease('watcher-df', holder=contender, root=tmp_path, now=_NOW)
+
+    assert claim.decision == sr.LeaseDecision.STAND_DOWN
+    assert '(dead, heartbeat' not in claim.message
+    assert 'not reclaimable' in claim.message.lower()
+    assert str(_DEAD_PID) in claim.message
 
 
 # --- claim_lease: free lease --------------------------------------------
@@ -2512,7 +2662,10 @@ def test_claim_lease_held_by_live_holder_stand_down_policy(tmp_path: Path) -> No
     assert claim.holder.session_slug == 'watcher-df-100'
     assert claim.holder_alive is True
     assert claim.heartbeat_age_secs == 42
-    assert claim.message == 'lease held by watcher-df-100 (alive, heartbeat 42s ago) — standing down'
+    assert claim.message == (
+        f'lease held by watcher-df-100 (pid {os.getpid()} alive, heartbeat 42s ago) '
+        '— standing down'
+    )
     # No clobber: the on-disk body still names the ORIGINAL holder.
     assert sr.LeaseHolder.from_json(lease_path.read_text()) == original
 
@@ -2771,15 +2924,10 @@ def test_heartbeat_lease_advances_mtime(tmp_path: Path) -> None:
     _set_mtime(lease_path, _NOW, timedelta(hours=1))
     old_mtime = lease_path.stat().st_mtime
 
-    result = sr.heartbeat_lease('watcher-df', root=tmp_path)
+    result = sr.heartbeat_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
 
-    assert result is True
+    assert result is sr.LeaseMutation.APPLIED
     assert lease_path.stat().st_mtime > old_mtime
-
-
-def test_heartbeat_lease_on_absent_lease_returns_false_without_raising(tmp_path: Path) -> None:
-    result = sr.heartbeat_lease('watcher-df', root=tmp_path)
-    assert result is False
 
 
 def test_release_lease_removes_the_lease_file(tmp_path: Path) -> None:
@@ -2787,9 +2935,9 @@ def test_release_lease_removes_the_lease_file(tmp_path: Path) -> None:
     sr.claim_lease('watcher-df', holder=holder, root=tmp_path, now=_NOW)
     lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
 
-    result = sr.release_lease('watcher-df', root=tmp_path)
+    result = sr.release_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
 
-    assert result is True
+    assert result is sr.LeaseMutation.APPLIED
     assert not lease_path.exists()
 
 
@@ -2797,11 +2945,268 @@ def test_release_lease_is_idempotent_on_a_second_call(tmp_path: Path) -> None:
     holder = sr.LeaseHolder(session_slug='watcher-df-100', pid=os.getpid(), start_ts=_NOW.isoformat())
     sr.claim_lease('watcher-df', holder=holder, root=tmp_path, now=_NOW)
 
-    first = sr.release_lease('watcher-df', root=tmp_path)
-    second = sr.release_lease('watcher-df', root=tmp_path)
+    first = sr.release_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
+    second = sr.release_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
 
-    assert first is True
-    assert second is False
+    assert first is sr.LeaseMutation.APPLIED
+    assert second is sr.LeaseMutation.ABSENT
+
+
+# --- heartbeat_lease: ownership (task 3994 defect 1) -----------------------
+
+
+def _seed_lease(tmp_path: Path, *, slug: str = 'watcher-df-100', pid: int | None = None) -> Path:
+    """Claim `watcher-df` for *slug*/*pid* under tmp_path; return its lease path.
+
+    Shared by the three task-3994 sections below (heartbeat ownership, release
+    ownership, lease_status) -- defined once, here, at its first use.
+    """
+    holder = sr.LeaseHolder(
+        session_slug=slug, pid=os.getpid() if pid is None else pid, start_ts=_NOW.isoformat()
+    )
+    sr.claim_lease('watcher-df', holder=holder, root=tmp_path, now=_NOW)
+    return sr.lease_path_for_name('watcher-df', root=tmp_path)
+
+
+def test_heartbeat_lease_by_a_stranger_is_refused_and_the_mtime_is_untouched(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    lease_path = _seed_lease(tmp_path)
+    _set_mtime(lease_path, _NOW, timedelta(hours=1))
+    backdated_mtime = lease_path.stat().st_mtime
+
+    with caplog.at_level(logging.ERROR):
+        result = sr.heartbeat_lease('watcher-df', slug='watcher-df-STRANGER', root=tmp_path)
+
+    assert result is sr.LeaseMutation.REFUSED
+    # THE assertion: an unrelated caller can no longer keep someone else's
+    # lease structurally unreapable by refreshing its heartbeat clock.
+    assert lease_path.stat().st_mtime == backdated_mtime
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors
+    blob = ' '.join(r.getMessage() for r in errors)
+    assert 'watcher-df-100' in blob
+    assert 'watcher-df-STRANGER' in blob
+
+
+def test_heartbeat_lease_on_an_absent_lease_is_absent_and_quiet(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.ERROR):
+        result = sr.heartbeat_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
+
+    assert result is sr.LeaseMutation.ABSENT
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+
+
+def test_heartbeat_lease_on_a_reaped_lease_is_absent_and_the_owner_can_re_claim(
+    tmp_path: Path,
+) -> None:
+    """ABSENT on a HEARTBEAT is not the harmless idempotence it is on a release.
+
+    Code backing for the skill contract: the holder's own per-cycle heartbeat
+    reporting ABSENT means its lease is GONE (reaped here; an operator
+    `--force` release does the same), so the session is now running un-leased
+    and any duplicate can take the name freely. The prescribed response is to
+    re-claim, which must actually work — a watcher that kept beating into the
+    void would sit at `result=absent` forever, which is the duplicate-watcher
+    condition the lease exists to prevent.
+    """
+    lease_path = _seed_lease(tmp_path, pid=_DEAD_PID)
+    _set_mtime(lease_path, _NOW, sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1))
+    assert [r.reason for r in sr.reap_stale_leases(root=tmp_path, now=_NOW)] == ['stale_pid']
+
+    result = sr.heartbeat_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
+
+    assert result is sr.LeaseMutation.ABSENT
+    # ...and re-claiming is the documented recovery, so it must succeed.
+    reclaim = sr.claim_lease(
+        'watcher-df',
+        holder=sr.LeaseHolder(
+            session_slug='watcher-df-100', pid=os.getpid(), start_ts=_NOW.isoformat()
+        ),
+        root=tmp_path,
+        now=_NOW,
+    )
+    assert reclaim.acquired
+    assert sr.heartbeat_lease('watcher-df', slug='watcher-df-100', root=tmp_path) is (
+        sr.LeaseMutation.APPLIED
+    )
+
+
+def test_heartbeat_lease_on_a_corrupt_body_is_refused_with_mtime_untouched(
+    tmp_path: Path,
+) -> None:
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    lease_path.parent.mkdir(parents=True, exist_ok=True)
+    lease_path.write_text('{not valid json')
+    _set_mtime(lease_path, _NOW, timedelta(hours=1))
+    backdated_mtime = lease_path.stat().st_mtime
+
+    result = sr.heartbeat_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
+
+    assert result is sr.LeaseMutation.REFUSED
+    assert lease_path.stat().st_mtime == backdated_mtime
+
+
+def test_heartbeat_lease_with_force_overrides_a_stranger_refusal_loudly(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    lease_path = _seed_lease(tmp_path)
+    _set_mtime(lease_path, _NOW, timedelta(hours=1))
+    backdated_mtime = lease_path.stat().st_mtime
+
+    with caplog.at_level(logging.WARNING):
+        result = sr.heartbeat_lease(
+            'watcher-df', slug='watcher-df-STRANGER', force=True, root=tmp_path
+        )
+
+    assert result is sr.LeaseMutation.FORCED
+    assert lease_path.stat().st_mtime > backdated_mtime
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings
+    blob = ' '.join(r.getMessage() for r in warnings)
+    assert 'watcher-df-100' in blob
+    assert 'watcher-df-STRANGER' in blob
+
+
+def test_heartbeat_lease_faults_soft_when_utime_itself_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _seed_lease(tmp_path)
+
+    def _boom_utime(*_args: object, **_kwargs: object) -> None:
+        raise OSError('simulated permission error')
+
+    monkeypatch.setattr(sr.os, 'utime', _boom_utime)
+
+    with caplog.at_level(logging.ERROR):
+        result = sr.heartbeat_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
+
+    # Fail-soft: a lease-substrate fault never raises into a watcher's loop.
+    assert result is sr.LeaseMutation.FAULTED
+    assert any(r.levelno >= logging.ERROR for r in caplog.records)
+
+
+def test_a_strangers_refused_heartbeat_leaves_a_dead_holders_lease_reapable(
+    tmp_path: Path,
+) -> None:
+    # The structural-unreapability defect, pinned end to end: before task 3994
+    # any caller could bump a dead holder's lease mtime forever, so the
+    # (dead pid AND aged heartbeat) staleness AND-guard could never fire and
+    # the lease outlived its holder indefinitely.
+    lease_path = _seed_lease(tmp_path, slug='watcher-df-dead', pid=_DEAD_PID)
+    _set_mtime(lease_path, _NOW, sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1))
+
+    assert sr.heartbeat_lease('watcher-df', slug='watcher-df-STRANGER', root=tmp_path) is (
+        sr.LeaseMutation.REFUSED
+    )
+
+    reaped = sr.reap_stale_leases(root=tmp_path, now=_NOW)
+
+    assert {r.lease_name: r.reason for r in reaped} == {'watcher-df': 'stale_pid'}
+    assert not lease_path.exists()
+
+
+# --- release_lease: ownership (task 3994 defect 1) -------------------------
+
+
+def test_release_lease_by_a_stranger_is_refused_and_the_lease_survives(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    lease_path = _seed_lease(tmp_path)
+    original_body = lease_path.read_text()
+
+    with caplog.at_level(logging.ERROR):
+        result = sr.release_lease('watcher-df', slug='watcher-df-STRANGER', root=tmp_path)
+
+    assert result is sr.LeaseMutation.REFUSED
+    assert lease_path.is_file()
+    # Byte-identical: a refused release must not touch the holder's body.
+    assert lease_path.read_text() == original_body
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors, 'a refused release must be loud (INV-2 structured-facts-at-failure)'
+    blob = ' '.join(r.getMessage() for r in errors)
+    # Both parties named: the real holder AND the would-be releaser.
+    assert 'watcher-df-100' in blob
+    assert 'watcher-df-STRANGER' in blob
+
+
+def test_release_lease_on_an_absent_lease_is_absent_and_quiet(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.ERROR):
+        result = sr.release_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
+
+    assert result is sr.LeaseMutation.ABSENT
+    # An idempotent release is not a failure -- it must not cry ERROR.
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+
+
+def test_release_lease_on_a_corrupt_body_is_refused_and_the_file_survives(
+    tmp_path: Path,
+) -> None:
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    lease_path.parent.mkdir(parents=True, exist_ok=True)
+    lease_path.write_text('{not valid json')
+
+    result = sr.release_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
+
+    # Fail TOWARD held, mirroring _read_lease_holder_state's documented rule.
+    assert result is sr.LeaseMutation.REFUSED
+    assert lease_path.read_text() == '{not valid json'
+
+
+def test_release_lease_with_force_overrides_a_stranger_refusal_loudly(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    lease_path = _seed_lease(tmp_path)
+
+    with caplog.at_level(logging.WARNING):
+        result = sr.release_lease(
+            'watcher-df', slug='watcher-df-STRANGER', force=True, root=tmp_path
+        )
+
+    assert result is sr.LeaseMutation.FORCED
+    assert not lease_path.exists()
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings, 'an operator force must be attributable'
+    blob = ' '.join(r.getMessage() for r in warnings)
+    assert 'watcher-df-100' in blob  # the displaced holder
+    assert 'watcher-df-STRANGER' in blob  # who forced it
+
+
+def test_release_lease_with_force_on_a_corrupt_body_removes_it(tmp_path: Path) -> None:
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    lease_path.parent.mkdir(parents=True, exist_ok=True)
+    lease_path.write_text('{not valid json')
+
+    result = sr.release_lease('watcher-df', slug='watcher-df-100', force=True, root=tmp_path)
+
+    assert result is sr.LeaseMutation.FORCED
+    assert not lease_path.exists()
+
+
+def test_release_lease_faults_soft_when_the_unlink_itself_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    lease_path = _seed_lease(tmp_path)
+    real_unlink = Path.unlink
+
+    def _flaky_unlink(self: Path, *args: Any, **kwargs: Any) -> None:
+        if self == lease_path:
+            raise OSError('simulated permission error')
+        real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'unlink', _flaky_unlink)
+
+    with caplog.at_level(logging.ERROR):
+        result = sr.release_lease('watcher-df', slug='watcher-df-100', root=tmp_path)
+
+    # Fail-soft: a lease-substrate fault never raises into a watcher's loop.
+    assert result is sr.LeaseMutation.FAULTED
+    assert lease_path.is_file()
+    assert any(r.levelno >= logging.ERROR for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -2885,6 +3290,128 @@ def test_reap_stale_leases_continues_sweep_when_one_removal_fails(
 
 
 # ---------------------------------------------------------------------------
+# lease_status / lease-show (task 3994 defect 3)
+#
+# `cat <lease>` CANNOT show freshness: the body carries an immutable
+# `start_ts` and the heartbeat lives only in the file mtime, so the archaeology
+# a human actually needs is `cat` + `stat -c %y` + a TTL comparison done by
+# hand. That is what misled the 2026-08-08 rotation. lease_status computes all
+# of it through the same _read_lease_holder_state claim_lease decides on --
+# one reader, one clock -- and lease-show prints it.
+# ---------------------------------------------------------------------------
+
+
+def test_lease_status_reports_the_holder_and_the_heartbeat_clock(tmp_path: Path) -> None:
+    path = _seed_lease(tmp_path)
+    _set_mtime(path, _NOW, timedelta(minutes=30))
+
+    status = sr.lease_status('watcher-df', root=tmp_path, now=_NOW)
+
+    assert status.name == 'watcher-df'
+    assert status.state == 'held'
+    assert status.holder_slug == 'watcher-df-100'
+    assert status.holder_pid == os.getpid()
+    assert status.holder_pid_alive is True
+    # Freshness is derived from the MTIME, the axis `cat` cannot show.
+    assert int(status.heartbeat_age_secs) == 1800
+    # heartbeat_ts is None only for an absent lease; a held one always has one.
+    assert status.heartbeat_ts is not None
+    assert datetime.fromisoformat(status.heartbeat_ts).replace(microsecond=0) == _NOW - timedelta(
+        minutes=30
+    )
+    assert status.reclaimable is False
+
+
+def test_lease_status_heartbeat_age_tracks_the_mtime(tmp_path: Path) -> None:
+    path = _seed_lease(tmp_path)
+
+    for age in (timedelta(seconds=5), timedelta(minutes=17), timedelta(hours=3)):
+        _set_mtime(path, _NOW, age)
+        status = sr.lease_status('watcher-df', root=tmp_path, now=_NOW)
+        assert int(status.heartbeat_age_secs) == int(age.total_seconds())
+
+
+@pytest.mark.parametrize(
+    ('age', 'expected'),
+    [
+        (sr.LEASE_HEARTBEAT_TTL - timedelta(seconds=1), False),
+        (sr.LEASE_HEARTBEAT_TTL, False),
+        (sr.LEASE_HEARTBEAT_TTL + timedelta(seconds=1), True),
+    ],
+)
+def test_lease_status_reclaimable_flips_exactly_at_the_ttl_for_a_dead_pid(
+    tmp_path: Path, age: timedelta, expected: bool
+) -> None:
+    path = _seed_lease(tmp_path, pid=_DEAD_PID)
+    _set_mtime(path, _NOW, age)
+
+    status = sr.lease_status('watcher-df', root=tmp_path, now=_NOW)
+
+    assert status.holder_pid_alive is False
+    # Exactly claim_lease/reap_stale_leases' own predicate: staleness needs
+    # BOTH a dead pid AND a heartbeat STRICTLY past the TTL. The display and
+    # the decision cannot disagree, because they are the same computation.
+    assert status.reclaimable is expected
+
+
+def test_lease_status_never_reports_a_live_holder_reclaimable_at_any_age(tmp_path: Path) -> None:
+    path = _seed_lease(tmp_path)  # our own, provably-live, pid
+    _set_mtime(path, _NOW, timedelta(days=30))
+
+    status = sr.lease_status('watcher-df', root=tmp_path, now=_NOW)
+
+    assert status.holder_pid_alive is True
+    assert int(status.heartbeat_age_secs) == 30 * 24 * 3600
+    # A live holder is never reclaimable however quiet it has been -- the
+    # inverse reading is the duplicate-spawn incident.
+    assert status.reclaimable is False
+
+
+def test_lease_status_on_an_absent_lease_reports_state_absent(tmp_path: Path) -> None:
+    status = sr.lease_status('watcher-df', root=tmp_path, now=_NOW)
+
+    assert status.name == 'watcher-df'
+    assert status.state == 'absent'
+    assert status.holder_slug is None
+    assert status.holder_pid is None
+    assert status.holder_pid_alive is False
+    assert status.reclaimable is False
+
+
+def test_lease_status_on_a_corrupt_body_is_unreadable_but_still_dates_the_heartbeat(
+    tmp_path: Path,
+) -> None:
+    path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{not valid json')
+    _set_mtime(path, _NOW, timedelta(minutes=42))
+
+    status = sr.lease_status('watcher-df', root=tmp_path, now=_NOW)
+
+    # Fail-soft: an unreadable body is REPORTED, never raised, and never
+    # rendered as a fake holder -- but its freshness is still real, which is
+    # exactly what decides whether it is reapable.
+    assert status.state == 'unreadable'
+    assert status.holder_slug is None
+    assert status.holder_pid is None
+    assert int(status.heartbeat_age_secs) == 2520
+
+
+def test_lease_status_is_read_only(tmp_path: Path) -> None:
+    path = _seed_lease(tmp_path)
+    _set_mtime(path, _NOW, timedelta(hours=1))
+    mtime_before = path.stat().st_mtime
+    body_before = path.read_text()
+
+    sr.lease_status('watcher-df', root=tmp_path, now=_NOW)
+
+    # Inspecting a lease must never be a heartbeat: an operator running
+    # lease-show cannot be allowed to keep a dead holder's lease unreapable.
+    assert path.stat().st_mtime == mtime_before
+    assert path.read_text() == body_before
+
+
+# ---------------------------------------------------------------------------
 # CLI lease-* verbs + fail-open fail-soft
 # ---------------------------------------------------------------------------
 
@@ -2901,8 +3428,14 @@ def test_main_lease_claim_on_free_name_acquires_and_prints_decision_token(
     )
 
     assert rc == 0
-    out = capsys.readouterr().out
-    assert out.splitlines()[0] == 'decision=acquired'
+    lines = capsys.readouterr().out.splitlines()
+    # The WHOLE acquired-path contract, not just line 1: a successful claim has
+    # no contending holder, so it must not print `holder_liveness=held` (which
+    # reads as "someone else has it"). `none` is the third token in the
+    # vocabulary, and it is pinned here because nothing else exercises it.
+    assert lines[0] == 'decision=acquired'
+    assert lines[-1] == 'holder_liveness=none'
+    assert len(lines) == 3
     assert sr.lease_path_for_name('watcher-df', root=tmp_path).is_file()
 
 
@@ -2935,7 +3468,9 @@ def test_main_lease_claim_when_held_by_live_holder_stands_down(
     out = capsys.readouterr().out
     lines = out.splitlines()
     assert lines[0] == 'decision=stand-down'
-    assert re.search(r'lease held by \S+ \(alive, heartbeat \d+s ago\) — standing down', lines[1])
+    assert re.search(
+        r'lease held by \S+ \(pid \d+ alive, heartbeat \d+s ago\) — standing down', lines[1]
+    )
     # the on-disk holder must still be the ORIGINAL claimant (no clobber).
     body = sr.lease_path_for_name('watcher-df', root=tmp_path).read_text()
     assert 'watcher-df-100' in body
@@ -2953,7 +3488,7 @@ def test_main_lease_heartbeat_bumps_mtime(
     _set_mtime(lease_path, _NOW, timedelta(hours=1))
     backdated_mtime = lease_path.stat().st_mtime
 
-    rc = sr.main(['lease-heartbeat', '--name', 'watcher-df'])
+    rc = sr.main(['lease-heartbeat', '--name', 'watcher-df', '--slug', 'watcher-df-100'])
 
     assert rc == 0
     assert lease_path.stat().st_mtime > backdated_mtime
@@ -2969,10 +3504,464 @@ def test_main_lease_release_removes_the_file(
     lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
     assert lease_path.is_file()
 
-    rc = sr.main(['lease-release', '--name', 'watcher-df'])
+    rc = sr.main(['lease-release', '--name', 'watcher-df', '--slug', 'watcher-df-100'])
 
     assert rc == 0
     assert not lease_path.exists()
+
+
+# --- CLI holder_liveness orphan signal (task 3994 defect 4) ---------------
+#
+# SINGLE-SIGNAL by construction: `holder_liveness=orphaned` means exactly
+# "the pid recorded in the lease body is not running". These tests run under
+# PRODUCTION-REALISTIC conditions -- no session record is written anywhere,
+# because a lease's `session_slug` is a claimant-chosen ownership token
+# (`watcher-<project>-<pid>`) and NOT a session-registry record key, so no
+# production path can ever put a record there (see
+# TestLeaseSlugIsNotASessionRecordKey below). The originally-designed
+# session-record corroboration was withdrawn for exactly that reason; the
+# emitted values are byte-identical either way.
+
+
+def _contend_via_cli(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], *, holder_pid: int
+) -> list[str]:
+    """Seed a lease held by watcher-df-100/holder_pid, contend it, return stdout lines."""
+    sr.main(['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-100', '--pid', str(holder_pid)])
+    capsys.readouterr()
+    rc = sr.main(
+        ['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-200', '--pid', str(os.getpid())]
+    )
+    assert rc == 0
+    return capsys.readouterr().out.splitlines()
+
+
+def test_main_lease_claim_orphan_signal_is_additive_after_decision(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    lines = _contend_via_cli(tmp_path, capsys, holder_pid=os.getpid())
+
+    # `decision=` STAYS line 1 and the message line 2, so a skill parser that
+    # reads only the first two lines is provably unaffected by the addition.
+    assert lines[0] == 'decision=stand-down'
+    assert lines[1].startswith('lease held by watcher-df-100')
+    assert lines[2] == 'holder_liveness=held'
+
+
+def test_main_lease_claim_reports_orphaned_for_a_dead_holder_pid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    # No session record is written -- that is the production shape, and the
+    # dead pid is the whole of the evidence.
+    lines = _contend_via_cli(tmp_path, capsys, holder_pid=_DEAD_PID)
+
+    assert lines[0] == 'decision=stand-down'
+    assert lines[-1] == 'holder_liveness=orphaned'
+
+
+def test_main_lease_claim_reports_held_for_an_unreadable_lease_body(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    lease_path.parent.mkdir(parents=True, exist_ok=True)
+    lease_path.write_text('{not valid json')
+
+    rc = sr.main(
+        ['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-200', '--pid', str(os.getpid())]
+    )
+
+    assert rc == 0
+    # 'unknown' must never be promoted to an orphan finding: fail toward held.
+    assert capsys.readouterr().out.splitlines()[-1] == 'holder_liveness=held'
+
+
+class TestLeaseSlugIsNotASessionRecordKey:
+    """`read_record(<a lease slug>)` raises — pinned so the withdrawn corroboration cannot return.
+
+    Task 3994 originally corroborated the orphan signal with the holder's own
+    session_registry record, via ``read_record(holder.session_slug)``. That
+    lookup is STRUCTURALLY IMPOSSIBLE, and the tests that appeared to exercise
+    its branches only did so by hand-writing a record under a lease-shaped
+    slug — a state no production path can produce. They were deleted; this
+    class replaces them with the reason.
+
+    MEASURED EVIDENCE (2026-08-15, live fleet root): the real
+    ``~/.claude/fleet/leases/watcher-df.lease`` holds
+    ``session_slug=watcher-df-1894895``, while 0 of the 46,624
+    ``~/.claude/fleet/sessions/`` record dirs begin with ``watcher-``. Real
+    record slugs look like ``architect-dark_factory-3133-25737ee4-...``.
+
+    The namespaces differ in all three segments:
+    - the LEASE slug is claimant-chosen, prescribed by the skills as
+      ``<lease-role>-<project>-<session pid>``
+      (skills/escalation-watcher/SKILL.md:50) — there is no production
+      *builder* for it, only shell in a SKILL.md, so it is spelled out here;
+    - the RECORD slug comes from ``build_session_slug(role, project, task,
+      <uniqueness token>)``, where the token is a session UUID for a
+      hand-launched session (``session_hooks.hook_session_slug``) and the
+      project token is the registry's project id (``dark_factory``), not the
+      lease's short name (``df``).
+
+    Only ONE test lives here, on purpose: the disjointness RATIONALE belongs to
+    (and is recorded in) ``LeaseHolder.session_slug``'s docstring, and a test
+    that merely compares a literal this file wrote against
+    ``build_session_slug``'s output cannot fail as a result of any production
+    change. The single assertion below has real coupling — it would break if
+    ``read_record`` ever started resolving a lease slug, which is exactly the
+    reintroduction worth catching.
+    """
+
+    # A hand-launched session's uniqueness token: hook_session_slug passes the
+    # hook's `session_id` (a UUID string) into build_session_slug's
+    # launcher_pid slot. Kept literal so the test is deterministic.
+    SESSION_UUID = '25737ee4-3b1e-4a7f-9f0e-6a1c2d3e4f50'
+
+    def _lease_slug(self, project: str = 'df', pid: int = 1894895) -> str:
+        """The lease slug exactly as skills/escalation-watcher/SKILL.md:50 builds it."""
+        return f'watcher-{project}-{sr.resolve_session_pid({sr.SESSION_PID_ENV: str(pid)})}'
+
+    def _record_slug(self, project: str = 'dark_factory') -> str:
+        """The record slug exactly as session_hooks.hook_session_slug builds it."""
+        return sr.build_session_slug(
+            'session',
+            project,
+            None,
+            self.SESSION_UUID,  # type: ignore[arg-type]
+        )
+
+    def test_a_real_record_provably_does_not_live_under_its_lease_slug(
+        self, tmp_path: Path
+    ) -> None:
+        # A well-formed record IS written for this notional session, under the
+        # slug the registry actually keys on...
+        record_slug = self._record_slug()
+        sr.write_record(_make_record(session_slug=record_slug), root=tmp_path)
+        assert sr.read_record(record_slug, root=tmp_path).session_slug == record_slug
+
+        # ...and read_record(<lease slug>) STILL raises FileNotFoundError. That
+        # is why holder_session_state was a constant 'absent' in production.
+        with pytest.raises(FileNotFoundError):
+            sr.read_record(self._lease_slug(), root=tmp_path)
+
+
+# --- resolve_session_pid (task 3994 defect 2) ------------------------------
+
+
+def test_session_pid_env_names_claude_pid() -> None:
+    assert sr.SESSION_PID_ENV == 'CLAUDE_PID'
+
+
+def test_resolve_session_pid_prefers_claude_pid(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING):
+        pid = sr.resolve_session_pid({'CLAUDE_PID': '1348600'})
+
+    assert pid == 1348600
+    # The happy path is silent: a resolvable session pid is not a degradation.
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+@pytest.mark.parametrize(
+    'env',
+    [
+        {},
+        {'CLAUDE_PID': ''},
+        {'CLAUDE_PID': '   '},
+        {'CLAUDE_PID': 'not-a-pid'},
+        {'CLAUDE_PID': '0'},
+        {'CLAUDE_PID': '-1'},
+    ],
+    ids=['unset', 'empty', 'blank', 'non-numeric', 'zero', 'negative'],
+)
+def test_resolve_session_pid_falls_back_loudly_to_a_provably_dead_pid(
+    env: dict[str, str], caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING):
+        pid = sr.resolve_session_pid(env)
+
+    # Fallback, never a raise -- and never a pid that merely LOOKS resolved.
+    # THE assertion: the degraded pid must be one `_pid_alive` reports dead,
+    # so the lease's staleness AND-guard collapses to its heartbeat half (the
+    # documented degradation) rather than to a never-reapable lease. The
+    # earlier `os.getsid(0)` fallback failed this: the POSIX session leader is
+    # the interactive shell, which outlives a crashed `claude`.
+    assert pid == 0
+    assert sr._pid_alive(pid) is False
+    # LOUD, not silent: the repo's loud-over-silent-degradation norm (INV-2).
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings
+    blob = ' '.join(r.getMessage() for r in warnings).lower()
+    assert 'degraded' in blob
+
+
+def test_resolve_session_pid_defaults_to_os_environ(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv('CLAUDE_PID', '424242')
+    assert sr.resolve_session_pid() == 424242
+
+
+def test_a_degraded_pid_lease_still_ages_out_and_is_reaped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """End-to-end: an unresolvable CLAUDE_PID must not make a lease immortal.
+
+    The whole point of returning 0 rather than a durable-but-unrelated pid:
+    both staleness rules need a DEAD pid AND an aged heartbeat, so a fallback
+    pid that stays alive (the interactive shell) would make a crashed holder's
+    lease permanently unreapable — recoverable only by a human `--force`.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.delenv('CLAUDE_PID', raising=False)
+
+    sr.main(['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-degraded'])
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    assert json.loads(lease_path.read_text())['pid'] == 0
+
+    # Fresh: NOT reaped — the heartbeat half of the guard still protects it.
+    _set_mtime(lease_path, _NOW, timedelta(seconds=60))
+    assert sr.reap_stale_leases(root=tmp_path, now=_NOW) == []
+    assert lease_path.is_file()
+
+    # Aged past the TTL: reaped, exactly as pre-3994 heartbeat-only behaviour.
+    _set_mtime(lease_path, _NOW, sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1))
+    reaped = sr.reap_stale_leases(root=tmp_path, now=_NOW)
+
+    assert [r.reason for r in reaped] == ['stale_pid']
+    assert not lease_path.exists()
+
+
+def test_main_lease_claim_without_pid_writes_the_resolved_session_pid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    # Deliberately NOT this process's own pid: that is what the old
+    # `--pid` default was, so an env-blind implementation would still pass.
+    monkeypatch.setenv('CLAUDE_PID', str(_DEAD_PID))
+
+    rc = sr.main(['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-100'])
+
+    assert rc == 0
+    # The correct pid is STRUCTURAL: it no longer depends on every skill doc
+    # getting one shell token right (the `--pid $$` defect).
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    assert sr.LeaseHolder.from_json(lease_path.read_text()).pid == _DEAD_PID
+
+
+def test_main_lease_claim_explicit_pid_still_overrides_the_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setenv('CLAUDE_PID', str(os.getpid()))
+
+    rc = sr.main(
+        ['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-100', '--pid', str(_DEAD_PID)]
+    )
+
+    assert rc == 0
+    # The operator-override path operators already used by hand.
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    assert sr.LeaseHolder.from_json(lease_path.read_text()).pid == _DEAD_PID
+
+
+# --- CLI ownership on the mutating verbs (task 3994 defect 1) -------------
+
+
+def _claim_via_cli(slug: str = 'watcher-df-100', pid: int | None = None) -> None:
+    sr.main(
+        [
+            'lease-claim',
+            '--name',
+            'watcher-df',
+            '--slug',
+            slug,
+            '--pid',
+            str(os.getpid() if pid is None else pid),
+        ]
+    )
+
+
+@pytest.mark.parametrize('verb', ['lease-heartbeat', 'lease-release'])
+def test_main_lease_mutating_verbs_require_slug(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, verb: str
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _claim_via_cli()
+
+    # A pre-3994 invocation must now FAIL LOUDLY rather than silently
+    # evicting/refreshing a lease it may not hold. argparse exits 2.
+    with pytest.raises(SystemExit) as excinfo:
+        sr.main([verb, '--name', 'watcher-df'])
+
+    assert excinfo.value.code == 2
+
+
+@pytest.mark.parametrize('verb', ['lease-heartbeat', 'lease-release'])
+def test_main_lease_mutating_verbs_print_result_applied_for_the_owner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    verb: str,
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _claim_via_cli()
+    capsys.readouterr()
+
+    rc = sr.main([verb, '--name', 'watcher-df', '--slug', 'watcher-df-100'])
+
+    assert rc == 0
+    # Mirrors lease-claim's `decision=` convention: one parse rule for all
+    # four lease verbs.
+    assert capsys.readouterr().out.splitlines()[0] == 'result=applied'
+
+
+@pytest.mark.parametrize('verb', ['lease-heartbeat', 'lease-release'])
+def test_main_lease_mutating_verbs_refuse_a_stranger_without_changing_rc(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    verb: str,
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _claim_via_cli()
+    capsys.readouterr()
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    original_body = lease_path.read_text()
+
+    rc = sr.main([verb, '--name', 'watcher-df', '--slug', 'watcher-df-STRANGER'])
+
+    # Fail-soft: a refusal is an OUTCOME, not an exit-code change.
+    assert rc == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == 'result=refused'
+    # The human line must name the REAL holder, so an agent reading stdout
+    # learns who owns it rather than only that it was told no.
+    assert 'watcher-df-100' in lines[1]
+    assert lease_path.read_text() == original_body
+
+
+@pytest.mark.parametrize('verb', ['lease-heartbeat', 'lease-release'])
+def test_main_lease_mutating_verbs_force_overrides_a_stranger_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    verb: str,
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _claim_via_cli()
+    capsys.readouterr()
+
+    rc = sr.main([verb, '--name', 'watcher-df', '--slug', 'watcher-df-STRANGER', '--force'])
+
+    assert rc == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == 'result=forced'
+    assert 'watcher-df-100' in lines[1]
+
+
+@pytest.mark.parametrize('verb', ['lease-heartbeat', 'lease-release'])
+def test_main_lease_mutating_verbs_report_absent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    verb: str,
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    rc = sr.main([verb, '--name', 'watcher-df', '--slug', 'watcher-df-100'])
+
+    assert rc == 0
+    assert capsys.readouterr().out.splitlines()[0] == 'result=absent'
+
+
+# --- CLI lease-show (task 3994 defect 3) ----------------------------------
+
+
+def _parse_kv(out: str) -> dict[str, str]:
+    """Parse lease-show's `key=value` lines -- the whole point of the verb."""
+    return dict(line.split('=', 1) for line in out.splitlines() if '=' in line)
+
+
+def test_main_lease_show_prints_machine_readable_fields_for_a_held_lease(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _claim_via_cli()
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    _set_mtime(lease_path, datetime.now(UTC), timedelta(hours=1))
+    capsys.readouterr()
+
+    rc = sr.main(['lease-show', '--name', 'watcher-df'])
+
+    assert rc == 0
+    fields = _parse_kv(capsys.readouterr().out)
+    assert fields['name'] == 'watcher-df'
+    assert fields['state'] == 'held'
+    assert fields['holder_slug'] == 'watcher-df-100'
+    assert fields['holder_pid'] == str(os.getpid())
+    assert fields['holder_pid_alive'] == 'true'
+    assert fields['reclaimable'] == 'false'
+    # The freshness clock `cat <lease>` cannot show, replacing `stat -c %y`.
+    assert abs(int(fields['heartbeat_age_secs']) - 3600) <= 5
+    assert datetime.fromisoformat(fields['heartbeat_ts']).tzinfo is not None
+
+
+def test_main_lease_show_reports_a_dead_and_expired_holder_reclaimable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    _claim_via_cli(pid=_DEAD_PID)
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    _set_mtime(lease_path, datetime.now(UTC), sr.LEASE_HEARTBEAT_TTL + timedelta(minutes=1))
+    capsys.readouterr()
+
+    rc = sr.main(['lease-show', '--name', 'watcher-df'])
+
+    assert rc == 0
+    fields = _parse_kv(capsys.readouterr().out)
+    assert fields['holder_pid_alive'] == 'false'
+    assert fields['reclaimable'] == 'true'
+
+
+def test_main_lease_show_on_an_absent_lease_reports_state_absent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    rc = sr.main(['lease-show', '--name', 'watcher-df'])
+
+    assert rc == 0
+    assert 'state=absent' in capsys.readouterr().out.splitlines()
+
+
+def test_main_lease_show_on_a_corrupt_body_is_fail_soft(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    lease_path.parent.mkdir(parents=True, exist_ok=True)
+    lease_path.write_text('{not valid json')
+    _set_mtime(lease_path, datetime.now(UTC), timedelta(hours=1))
+
+    rc = sr.main(['lease-show', '--name', 'watcher-df'])
+
+    assert rc == 0
+    fields = _parse_kv(capsys.readouterr().out)
+    # Marks the body unreadable rather than asserting a fake holder -- and
+    # still reports a REAL heartbeat age, the axis that decides reapability.
+    assert fields['state'] == 'unreadable'
+    assert abs(int(fields['heartbeat_age_secs']) - 3600) <= 5
+    assert lease_path.is_file()  # read-only: inspection never reaps
 
 
 def test_main_lease_reap_removes_a_stale_lease(
