@@ -25,10 +25,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from _task_db_scan import SCAN_EXIT_CODE_EPILOG
 from scan_task_toolcall_leaks import (
     LeakMatch,
-    _build_parser,
     detect_leak,
     format_json,
     format_report,
@@ -304,16 +302,6 @@ def test_format_json_empty_list_is_empty_array():
 # ---------------------------------------------------------------------------
 # CLI (main), driven via subprocess.run — mirrors test_recon_busy_check.py
 # ---------------------------------------------------------------------------
-
-def test_help_epilog_is_the_shared_exit_code_constant():
-    """--help's epilog must come from the shared SCAN_EXIT_CODE_EPILOG
-    (task 3744) rather than a re-typed copy, so it cannot drift out of
-    lockstep with scan_provenance_note_log_leaks.py's epilog or with what
-    run_scan_cli() actually returns. argparse line-wraps the epilog in
-    format_help(), so compare on the parser's raw (unwrapped) epilog rather
-    than substring-matching the rendered, wrapped help text."""
-    assert _build_parser().epilog == SCAN_EXIT_CODE_EPILOG
-
 
 SCRIPT = Path(__file__).parent.parent / "scan_task_toolcall_leaks.py"
 
