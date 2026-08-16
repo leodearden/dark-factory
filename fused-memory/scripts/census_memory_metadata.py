@@ -860,7 +860,9 @@ def _build_topic_coverage(
     ]
     canonical_non_conforming.sort(key=lambda tc: (-tc[1], tc[0]))
 
-    preconditions = [dict(e) for e in ENFORCE_FLIP_PRECONDITIONS]
+    # `dict[str, Any]`, not the declared `dict[str, str]`: the copy is widened
+    # below with a nested `live_re_measurement` mapping.
+    preconditions: list[dict[str, Any]] = [dict(e) for e in ENFORCE_FLIP_PRECONDITIONS]
     # The legacy-spelling citation carries a RECORDED status (discharged
     # 2026-08-04) plus THIS run's live counts as its standing re-measurement:
     # a bucket recorded empty can regrow, and the 98 -> 103 history proves it
@@ -977,12 +979,13 @@ def _regrade_uniqueness_at_project_grain(
     # actionable without saying WHERE. Ordered by count desc then
     # (topic, project) asc, matching _table's existing total order, so two
     # runs over the same corpus produce byte-identical artifacts.
+    merged: list[dict[str, Any]] = [
+        {'project_id': project_id, **row}
+        for project_id, block in blocks
+        for row in (block.get('multiple_canonical_topics') or [])
+    ]
     regraded['multiple_canonical_topics'] = sorted(
-        (
-            {'project_id': project_id, **row}
-            for project_id, block in blocks
-            for row in (block.get('multiple_canonical_topics') or [])
-        ),
+        merged,
         key=lambda row: (-row['canonical_count'], row['topic'], row['project_id']),
     )
     return regraded

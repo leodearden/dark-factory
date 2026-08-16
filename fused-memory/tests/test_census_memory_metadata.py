@@ -14,6 +14,7 @@ import json
 import sys
 import types
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -489,7 +490,11 @@ PREF = MemoryCategory.preferences_and_norms.value
 DEC = MemoryCategory.decisions_and_rationale.value
 
 
-def _census(payloads: list[dict]) -> object:
+def _census(payloads: list[dict]) -> Any:
+    # `Any`, not `object`: `_mod` is loaded from a path at runtime, so
+    # `CategoryCensus` has no statically-known type to name here -- and
+    # callers legitimately read `.records` off the result, which `object`
+    # forbids.
     c = _mod.CategoryCensus()
     for p in payloads:
         c.add(p)
@@ -1114,7 +1119,11 @@ class TestTopicSlugConformance:
     def _block(payloads, project='dark_factory'):
         cells = {project: {OBS: _census(payloads)}}
         collection = 'fused_dark_factory' if project == 'dark_factory' else 'fused_reify'
-        cov = {project: _coverage(collection, len(payloads), {OBS: (len(payloads),) * 2})}
+        cov = {
+            project: _coverage(
+                collection, len(payloads), {OBS: (len(payloads), len(payloads))}
+            )
+        }
         report = _mod.build_report(cells, cov, top_n=50)
         return report['projects'][project]['topic_coverage']
 
@@ -1308,10 +1317,12 @@ class TestRegistryCoverageGauge:
         import sys as _sys
         from pathlib import Path as _Path
 
+        assert _mod.__file__ is not None
         probe_path = _Path(_mod.__file__).parent / 'memory_eval_retrieval_probe.py'
         cached = _sys.modules.get('memory_eval_retrieval_probe')
         if cached is None:
             spec = _ilu.spec_from_file_location('memory_eval_retrieval_probe', probe_path)
+            assert spec is not None and spec.loader is not None
             cached = _ilu.module_from_spec(spec)
             _sys.modules['memory_eval_retrieval_probe'] = cached
             spec.loader.exec_module(cached)
