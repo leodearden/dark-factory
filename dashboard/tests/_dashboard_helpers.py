@@ -120,6 +120,10 @@ def apply_isolated_env(mp: pytest.MonkeyPatch, root: Path) -> None:
 _DUAL_EVAL_ID = 'e1-retrieval-health'
 _DUAL_RUN_STAMPS = ('20260703T031500Z', '20260704T031500Z', '20260705T031500Z')
 _DUAL_LINKED_FINGERPRINT = f'eval:{_DUAL_EVAL_ID}|metric:dangling-pointers|item:node-7'
+_DUAL_STORM_FINGERPRINT = f'storm:{_DUAL_RUN_STAMPS[-1]}'
+# Deliberately names an eval and metric the tree does not contain, so no
+# verdict can ever claim it — that is what makes it `no_matching_verdict`.
+_DUAL_ORPHAN_FINGERPRINT = 'eval:e9-absent|metric:never-emitted'
 
 
 @dataclass(frozen=True)
@@ -138,7 +142,26 @@ class DualEscalationTree:
 
     config: DashboardConfig
     linked_id: str
-    """Reaches ``evals[i].metrics[j].escalation`` — its fingerprint matches a verdict."""
+    """Reaches ``evals[i].metrics[j].escalation`` — its fingerprint matches a verdict.
+
+    In ``storm=True`` mode it reaches ``unmatched_escalations`` instead, with
+    reason ``storm_suppressed``: a triggered storm collapses per-metric links
+    into the aggregate, so the row renders none.  Same record, different reach
+    path — which is exactly the behaviour the two modes exist to cover.
+    """
+
+    unmatched_id: str
+    """Reaches ``unmatched_escalations`` with reason ``no_matching_verdict``."""
+
+    unfingerprinted_id: str
+    """Reaches ``unmatched_escalations`` with reason ``no_fingerprint``.
+
+    Carries no ``dedupe_fingerprint``, so it never enters the index at all —
+    ``_index_escalations`` carries it out in its second return value instead.
+    """
+
+    storm_id: str | None
+    """Reaches ``storm_escape.escalation``; ``None`` unless built with ``storm=True``."""
 
 
 def _dual_dump(path: Path, body: Any) -> Path:
@@ -188,7 +211,7 @@ def _dual_escalation(
     })
 
 
-def build_dual_escalation_tree(tmp_path: Path) -> DualEscalationTree:
+def build_dual_escalation_tree(tmp_path: Path, *, storm: bool = False) -> DualEscalationTree:
     """One artifact tree feeding BOTH dashboard payloads that carry escalation ids.
 
     ``build_memory_evals`` and ``build_escalation_queues`` read the same queue
@@ -202,6 +225,21 @@ def build_dual_escalation_tree(tmp_path: Path) -> DualEscalationTree:
     path would write where only one of the two readers looks — and the test
     would then be checking a directory the producers do not share, which is
     the one thing this fixture exists to avoid.
+
+    Args:
+        storm: write a TRIGGERED ``storm_escape`` block into the root verdicts
+            artifact, with an aggregate escalation to match.
+
+    WHY ``storm`` IS A MODE AND NOT JUST ANOTHER RECORD.  The two states are
+    mutually exclusive in the producer, measured not assumed: ``_build_eval``
+    consults the escalation index only when the program-wide storm block is
+    ``None``, so a triggered storm empties EVERY per-metric link and moves
+    those fingerprints to ``unmatched_escalations`` with reason
+    ``storm_suppressed``.  ``evals[i].metrics[j].escalation`` and
+    ``storm_escape.escalation`` therefore cannot both be populated in one
+    payload — the storm exists precisely to collapse the per-metric links into
+    one aggregate filing.  Covering both reach paths takes two trees; a caller
+    wanting full coverage builds one of each and takes the union.
 
     Returns a :class:`DualEscalationTree` naming each record by the reach path
     it exercises.
@@ -251,7 +289,7 @@ def build_dual_escalation_tree(tmp_path: Path) -> DualEscalationTree:
 
     # Root-scoped M2 verdicts.  The alarming metric's fingerprint is what the
     # escalation below joins on, so the metric-row reach path yields a link.
-    _dual_dump(root / 'verdicts-current.json', {
+    verdicts: dict[str, Any] = {
         'schema_version': 1,
         'run_stamp': _DUAL_RUN_STAMPS[-1],
         'entries': [
@@ -269,11 +307,40 @@ def build_dual_escalation_tree(tmp_path: Path) -> DualEscalationTree:
                 'run_stamp': _DUAL_RUN_STAMPS[-1],
             },
         ],
-    })
+    }
+    storm_id: str | None = None
+    if storm:
+        # Run-scoped and only surfaced while TRIGGERED — an untriggered block
+        # is dropped by `_load_verdicts` and would render as no storm at all.
+        verdicts['storm_escape'] = {
+            'triggered': True,
+            'alarm_count': 9,
+            'aggregate_fingerprint': _DUAL_STORM_FINGERPRINT,
+        }
+        storm_id = 'esc-eval-storm'
+        _dual_escalation(esc_dir, storm_id, dedupe_fingerprint=_DUAL_STORM_FINGERPRINT,
+                         summary='memory-eval storm escape')
+    _dual_dump(root / 'verdicts-current.json', verdicts)
 
+    # (1) the linked record — a metric-row link, or a storm_suppressed
+    #     unmatched entry when the storm collapsed the per-metric links.
     _dual_escalation(esc_dir, 'esc-eval-linked', dedupe_fingerprint=_DUAL_LINKED_FINGERPRINT)
+    # (2) open, fingerprinted, and claimed by no verdict — `no_matching_verdict`.
+    _dual_escalation(esc_dir, 'esc-eval-unmatched', dedupe_fingerprint=_DUAL_ORPHAN_FINGERPRINT,
+                     summary='memory-eval regression nothing claims')
+    # (3) open with NO usable fingerprint — `no_fingerprint`.  Reaches the
+    #     payload through `_index_escalations`' second return value rather than
+    #     the index, so it is a distinct code path, not a second instance of (2).
+    _dual_escalation(esc_dir, 'esc-eval-unfingerprinted', dedupe_fingerprint=None,
+                     summary='memory-eval regression with no fingerprint')
 
-    return DualEscalationTree(config=config, linked_id='esc-eval-linked')
+    return DualEscalationTree(
+        config=config,
+        linked_id='esc-eval-linked',
+        unmatched_id='esc-eval-unmatched',
+        unfingerprinted_id='esc-eval-unfingerprinted',
+        storm_id=storm_id,
+    )
 
 
 RECONCILIATION_SCHEMA = """
