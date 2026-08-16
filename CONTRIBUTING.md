@@ -101,7 +101,7 @@ Other top-level dirs:
   `<prd-stem>.capability-manifest.yaml` sidecar — schema in
   `shared/src/shared/capability_manifest.py`). This is the durable record;
   `plans/` is not.
-- **`docs/legibility/`** — `design-invariants.md` (INV-1..INV-8, gates
+- **`docs/legibility/`** — `design-invariants.md` (gates
   `/prd` decompose and `/review` phase 2 — see §6) plus its calibration
   fixtures and the confusion-codebook incident taxonomy.
 - **`dashboard/`** — web UI for task/escalation state.
@@ -266,13 +266,10 @@ Every PRD authored or decomposed through `/prd` runs a fixed gate sequence
   boundary-test sketch) vs. a bare vertical slice.
 - **G6** premise validity — numeric bounds, exactness claims, and rejection
   assertions must be substantiated, not guessed.
-- **G7** design invariants — re-checked against
-  `docs/legibility/design-invariants.md` (**INV-1..INV-8**:
-  `contracts-machine-checked`, `structured-facts-at-failure`,
-  `corroborate-before-acting`, `storm-escape-required`,
-  `no-lockstep-duplication`, `status-matches-liveness`,
-  `holds-owned-and-bounded`, `loop-thread-occupancy-bounded`). An
-  unresolved, unwaived hit blocks the batch;
+- **G7** design invariants — every task in a batch is re-checked against the
+  named, checkable invariants in `docs/legibility/design-invariants.md` (the
+  single normative list; slugs are stable ids, so read it rather than a copy).
+  An unresolved, unwaived hit blocks the batch;
   a deliberate exception is a `G7 waiver: <slug> — <rationale>` line in the
   PRD plus `metadata.g7_waivers` on the filed task.
 - **Capability manifest** — mechanizes G3/G6 per leaf task, committed
@@ -281,10 +278,12 @@ Every PRD authored or decomposed through `/prd` runs a fixed gate sequence
   oversight, produce a complete, coherent, good design?"
 
 `design-invariants.md` also gates `/review` phase 2's cross-module audit —
-it's the single normative copy of the eight invariants; don't restate them
-elsewhere. If you're hand-writing a task (not going through `/prd`) for a
-nontrivial design change, walk it against the same checklist yourself
-before filing.
+it's the single normative copy; don't restate them elsewhere (a restatement
+here went stale once already — task 3802, and
+`scripts/tests/test_design_invariants_consistency.py` now fails if a copy
+comes back; citing one invariant by name is still fine). If you're hand-writing a task (not going through
+`/prd`) for a nontrivial design change, walk it against the same checklist
+yourself before filing.
 
 ---
 
