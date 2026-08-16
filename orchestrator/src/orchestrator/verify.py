@@ -3662,17 +3662,24 @@ def _match_clock_marker(line: str, cfg: ClockStopConfig) -> str | None:
 
 
 _CS_ATTRIBUTION_SLACK_MIN = 0.5      # seconds
-_CS_ATTRIBUTION_SLACK_FRAC = 0.02    # 2% of the named limit
+_CS_ATTRIBUTION_SLACK_FRAC = 0.02    # 2% of the named limit, bounded by the cap below
+_CS_ATTRIBUTION_SLACK_CAP = 5.0      # seconds — ceiling on the fractional term
 
 
 def _clock_stop_attribution_slack(limit: float) -> float:
-    """One-sided slack for clock-stop attribution: ``max(0.5s, 2% of limit)``.
+    """One-sided slack for clock-stop attribution: ``max(0.5s, min(5s, 2% of
+    limit))``.
 
-    Absorbs float/scheduling noise around a genuine deadline expiry without
-    ever accepting a stop that occurred meaningfully before *limit* elapsed
-    (task 3806 / esc-3694-3 — see :func:`_clock_stop_reason`).
+    Every deadline in the clock-stop loop is one-sided — an ``asyncio``
+    timer can only fire late — so a genuine expiry always yields
+    ``remaining <= 0``; slack exists only to absorb float/scheduling noise,
+    not to scale with the limit's size. Left uncapped, the fractional term
+    opened a 108s blind spot at the 5400s wall-clock budget from
+    esc-3694-3 (task 3806); the 5s cap bounds that regardless of *limit*,
+    while the 0.5s floor still covers small limits.
     """
-    return max(_CS_ATTRIBUTION_SLACK_MIN, _CS_ATTRIBUTION_SLACK_FRAC * limit)
+    fractional = min(_CS_ATTRIBUTION_SLACK_CAP, _CS_ATTRIBUTION_SLACK_FRAC * limit)
+    return max(_CS_ATTRIBUTION_SLACK_MIN, fractional)
 
 
 def _clock_stop_reason(*, kind: str, limit: float, elapsed: float, remaining: float) -> str:
