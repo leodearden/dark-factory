@@ -5443,6 +5443,60 @@ class TestColdReattachIdentityGuard:
         assert (info.path / 'orphan_work.py').exists(), 'guard opt-in only — must resume'
         assert not git_ops.quarantine_base.exists()
 
+    async def test_cold_reattach_mismatch_clears_foreign_meta_root(
+        self, git_ops: GitOps,
+    ):
+        """A confirmed identity mismatch must also clear the foreign sibling
+        .task-meta/<id> root — otherwise the deleted task's plan.json
+        survives and workflow.py's plan-resume adopts it onto the NEW task
+        (the cited reify task 3770 misattribution). Quarantining only the
+        branch leaves this half of the hole open."""
+        task_id = 'cold-clears-meta'
+        await _build_cold_orphan_branch(git_ops, task_id)
+        meta = TaskArtifacts.meta_root_for(git_ops.worktree_base, task_id)
+        _write_sibling_stored_title(
+            git_ops.worktree_base, task_id, 'Trajectory beta: spline solver',
+        )
+        (meta / 'plan.json').write_text(json.dumps({
+            'task_id': task_id,
+            'title': 'Trajectory beta: spline solver',
+            'steps': [],
+            'confirmed': True,
+        }))
+
+        await git_ops.create_worktree(
+            task_id, expected_title='Cycle-breaker beta: dedup edges',
+        )
+
+        assert not (meta / 'plan.json').exists(), (
+            "the deleted task's plan.json must not survive onto the new task"
+        )
+
+    async def test_cold_reattach_match_preserves_meta_root(self, git_ops: GitOps):
+        """A same-task resume (matching title) must keep its own
+        .task-meta artifacts intact — _clear_foreign_meta_root's contract
+        explicitly says it must NOT be called on same-task reuse routes."""
+        task_id = 'cold-preserves-meta'
+        await _build_cold_orphan_branch(git_ops, task_id)
+        meta = TaskArtifacts.meta_root_for(git_ops.worktree_base, task_id)
+        _write_sibling_stored_title(
+            git_ops.worktree_base, task_id, 'Cycle-breaker beta: dedup edges',
+        )
+        (meta / 'plan.json').write_text(json.dumps({
+            'task_id': task_id,
+            'title': 'Cycle-breaker beta: dedup edges',
+            'steps': [],
+            'confirmed': True,
+        }))
+
+        await git_ops.create_worktree(
+            task_id, expected_title='Cycle-breaker beta: dedup edges',
+        )
+
+        assert (meta / 'plan.json').exists(), (
+            'a same-task resume must preserve its own plan.json'
+        )
+
 
 @pytest.mark.asyncio
 class TestOrphanWorktreeHelpers:
