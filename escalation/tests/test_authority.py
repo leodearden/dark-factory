@@ -192,8 +192,19 @@ class TestL2AutoCloseClass:
         )
         assert result == 'stale_task_scoped', f'Expected match, got: {result!r}'
 
+    def test_stale_task_scoped_status_colon_citation(self) -> None:
+        """The anchored 'status=' alternative also accepts the ':' spelling —
+        untouched by the task-4192 tightening, pinned here as a regression guard."""
+        resolution = 'probe: get_task 604 -> status: cancelled'
+        result = l2_auto_close_class(
+            identity=self.WATCHER, level=2, action='close_only',
+            category='task_failure', agent_role='some-agent',
+            resolution=resolution,
+        )
+        assert result == 'stale_task_scoped', f'Expected match, got: {result!r}'
+
     def test_stale_task_scoped_rescoped_citation(self) -> None:
-        resolution = 'Subject task was re-scoped per get_task; escalation moot.'
+        resolution = 'get_task 3821 -> re-scoped to task 3821; escalation moot.'
         result = l2_auto_close_class(
             identity=self.WATCHER, level=2, action='close_only',
             category='task_failure', agent_role='some-agent',
@@ -202,13 +213,85 @@ class TestL2AutoCloseClass:
         assert result == 'stale_task_scoped', f'Expected match, got: {result!r}'
 
     def test_stale_task_scoped_redispatched_citation(self) -> None:
-        resolution = 'Subject task was re-dispatched per get_task; escalation moot.'
+        resolution = 'Subject task re-dispatched as run-abc123/3821 per get_task; escalation moot.'
         result = l2_auto_close_class(
             identity=self.WATCHER, level=2, action='close_only',
             category='task_failure', agent_role='some-agent',
             resolution=resolution,
         )
         assert result == 'stale_task_scoped', f'Expected match, got: {result!r}'
+
+    def test_stale_task_scoped_cited_spelling_variants(self) -> None:
+        """The accepted citation spellings: 're-scoped' takes to/into/as,
+        're-dispatched' takes 'as' only; the 'task' word and the '-' between a
+        run/task keyword and its identifier are both optional."""
+        for resolution in (
+            're-scoped into 3821',
+            're-scoped as task 3821',
+            'rescoped to 3821',
+            're-dispatched as task 3821',
+            'redispatched as run abc123',
+        ):
+            result = l2_auto_close_class(
+                identity=self.WATCHER, level=2, action='close_only',
+                category='task_failure', agent_role='some-agent',
+                resolution=resolution,
+            )
+            assert result == 'stale_task_scoped', (
+                f'Expected cited variant {resolution!r} to match, got: {result!r}'
+            )
+
+    def test_stale_task_scoped_casual_rescoped_prose_no_match(self) -> None:
+        """Casual 're-scoped' prose with no concrete task identifier is NOT a
+        live get_task citation — it must not satisfy the evidence requirement."""
+        resolution = 'The concern was rescoped last week.'
+        result = l2_auto_close_class(
+            identity=self.WATCHER, level=2, action='close_only',
+            category='task_failure', agent_role='some-agent',
+            resolution=resolution,
+        )
+        assert result is None, (
+            f'Expected no match (casual "rescoped" prose cites no task), got: {result!r}'
+        )
+
+    def test_stale_task_scoped_casual_redispatched_prose_no_match(self) -> None:
+        """Casual 're-dispatched' prose with no concrete run/task identifier is
+        NOT a live get_task citation."""
+        resolution = 're-dispatched it this morning, all good.'
+        result = l2_auto_close_class(
+            identity=self.WATCHER, level=2, action='close_only',
+            category='task_failure', agent_role='some-agent',
+            resolution=resolution,
+        )
+        assert result is None, (
+            f'Expected no match (casual "re-dispatched" prose cites no run/task), got: {result!r}'
+        )
+
+    def test_stale_task_scoped_uncited_rescoped_no_match(self) -> None:
+        """Naming get_task without quoting WHAT it returned is not evidence:
+        this exact string was blessed before task 4192 and must no longer pass."""
+        resolution = 'Subject task was re-scoped per get_task; escalation moot.'
+        result = l2_auto_close_class(
+            identity=self.WATCHER, level=2, action='close_only',
+            category='task_failure', agent_role='some-agent',
+            resolution=resolution,
+        )
+        assert result is None, (
+            f'Expected no match (re-scoped with no task citation), got: {result!r}'
+        )
+
+    def test_stale_task_scoped_uncited_redispatched_no_match(self) -> None:
+        """The re-dispatched counterpart of the above — also blessed before
+        task 4192, also no longer sufficient."""
+        resolution = 'Subject task was re-dispatched per get_task; escalation moot.'
+        result = l2_auto_close_class(
+            identity=self.WATCHER, level=2, action='close_only',
+            category='task_failure', agent_role='some-agent',
+            resolution=resolution,
+        )
+        assert result is None, (
+            f'Expected no match (re-dispatched with no run/task citation), got: {result!r}'
+        )
 
     def test_stale_task_scoped_no_status_citation_no_match(self) -> None:
         resolution = 'Looks stale but no live status was checked.'
@@ -275,6 +358,21 @@ class TestL2AutoCloseClass:
             resolution=resolution,
         )
         assert result is None, f'Expected denylist to block design_concern, got: {result!r}'
+
+    def test_design_concern_denied_even_with_cited_rescoped_evidence(self) -> None:
+        """The denylist beats class (c)'s re-scoped citation too, not just its
+        'status=' alternative — every other denylist test uses 'status=done',
+        so nothing else pins this second door shut."""
+        resolution = 're-scoped to task 3821'
+        result = l2_auto_close_class(
+            identity=self.WATCHER, level=2, action='close_only',
+            category='design_concern', agent_role='some-agent',
+            resolution=resolution,
+        )
+        assert result is None, (
+            f'Expected denylist to block design_concern despite cited re-scoped '
+            f'evidence, got: {result!r}'
+        )
 
     def test_milestone_gate_denied(self) -> None:
         resolution = 'Subject task status=done per get_task; escalation moot.'
