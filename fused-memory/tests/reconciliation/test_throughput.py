@@ -817,18 +817,92 @@ async def test_build_report_carries_every_section(recon_db):
         remediation_duty_cycle(expected_drain))
     assert report['remediation_duty_cycle'] == pytest.approx(0.438, abs=0.001)
 
-    assert report['sustainable_events_per_day'] == pytest.approx(
-        sustainable_events_per_day(
-            expected_drain['drain_seconds_per_event'],
-            remediation_duty_cycle(expected_drain),
-        )
-    )
+    # HAND-COMPUTED, not re-executed from the implementation's own expression.
+    # Fixture: 719 events; backlog 1914s; remediation 1495s; total 3409s.
+    #   observed status quo  = 86400 * 719 / 3409 = 18222.8/day
+    #   post-lever-1         = 86400 * 719 / 1914 = 32456.4/day
+    # Each figure applies the remediation penalty exactly once, in its own rate.
+    assert report['sustainable_events_per_day'] == pytest.approx(18222.8, abs=1.0)
+    assert report['remediation_free_events_per_day'] == pytest.approx(32456.4, abs=1.0)
+
     assert report['capacity_verdict']['verdict'] in {'sufficient', 'insufficient'}
     assert report['capacity_verdict']['observed_burst_per_day'] == (
         OBSERVED_BURST_EVENTS_PER_DAY)
 
+    assert isinstance(report['retention_note'], str) and report['retention_note']
+
     # The whole thing must survive a JSON round-trip — it is a CLI payload.
     assert json.loads(json.dumps(report)) == report
+
+
+@pytest.mark.asyncio
+async def test_build_report_applies_the_remediation_penalty_exactly_once(recon_db):
+    """Regression: the headline must not be the double-discounted figure.
+
+    `drain_seconds_per_event` (4.7413) already carries the remediation penalty
+    — remediation wall-clock is in its numerator, remediation's zero events add
+    nothing to its denominator.  Feeding it to
+    `sustainable_events_per_day(rate, duty)` with the measured duty applies the
+    same penalty a SECOND time and yields 86400*(1-0.4385)/4.7413 = 10231.3,
+    understating the observed capacity by 1/(1-duty) ~ 1.78x.
+    """
+    db = recon_db._db_path
+    _seed_addendum_2(db)
+
+    report = build_report(db, 'reify')
+
+    assert report['sustainable_events_per_day'] != pytest.approx(10231.3, abs=1.0), (
+        'sustainable_events_per_day is the double-discounted figure — the '
+        'remediation penalty applied twice, once in the inclusive rate and '
+        'again via the duty cycle argument'
+    )
+    assert report['sustainable_events_per_day'] == pytest.approx(18222.8, abs=1.0)
+
+
+@pytest.mark.asyncio
+async def test_build_report_lever_1_delta_is_exactly_the_duty_cycle(recon_db):
+    """The gap between the two capacity figures IS the remediation duty cycle.
+
+    Pinning the identity keeps the pair from drifting apart: whatever the
+    window, the post-lever-1 figure is the observed one scaled by 1/(1-duty),
+    because lever 1 removes remediation from the drain path and changes nothing
+    else.
+    """
+    db = recon_db._db_path
+    _seed_addendum_2(db)
+
+    report = build_report(db, 'reify')
+    duty = report['remediation_duty_cycle']
+
+    assert duty == pytest.approx(1495.0 / 3409.0)
+    assert (
+        report['remediation_free_events_per_day']
+        / report['sustainable_events_per_day']
+    ) == pytest.approx(1 / (1 - duty))
+
+
+@pytest.mark.asyncio
+async def test_build_report_renders_each_verdict_from_its_own_figure(recon_db):
+    """Two capacity figures, two verdicts — neither may be rendered from the other."""
+    db = recon_db._db_path
+    _seed_addendum_2(db)
+
+    report = build_report(db, 'reify')
+
+    assert report['capacity_verdict']['sustainable_per_day'] == pytest.approx(
+        report['sustainable_events_per_day'])
+    assert report['remediation_free_capacity_verdict'][
+        'sustainable_per_day'] == pytest.approx(
+        report['remediation_free_events_per_day'])
+
+    # On this fixture both clear the 3500/day burst: ~5.2x and ~9.3x headroom.
+    assert report['capacity_verdict']['verdict'] == 'sufficient'
+    assert report['capacity_verdict']['headroom_ratio'] == pytest.approx(5.21, abs=0.01)
+    assert report['remediation_free_capacity_verdict']['verdict'] == 'sufficient'
+    assert report['remediation_free_capacity_verdict'][
+        'headroom_ratio'] == pytest.approx(9.27, abs=0.01)
+    assert report['remediation_free_capacity_verdict'][
+        'observed_burst_per_day'] == OBSERVED_BURST_EVENTS_PER_DAY
 
 
 @pytest.mark.asyncio
@@ -873,6 +947,10 @@ async def test_build_report_degrades_on_an_empty_database(recon_db):
     assert report['remediation_duty_cycle'] == 0.0
     assert report['sustainable_events_per_day'] is None
     assert report['capacity_verdict'] is None
+    # The post-lever-1 pair degrades the same way — no rate, no claim.
+    assert report['drain']['drain_only_seconds_per_event'] is None
+    assert report['remediation_free_events_per_day'] is None
+    assert report['remediation_free_capacity_verdict'] is None
     assert report['retention_note']
 
 
