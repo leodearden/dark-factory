@@ -65,7 +65,7 @@ from dashboard.data.escalation_analytics import (
 )
 from dashboard.data.escalations import build_escalation_queues
 from dashboard.data.load import get_load_metrics
-from dashboard.data.mcp_fanout import TTLCache, first_success
+from dashboard.data.mcp_fanout import PreformattedFanoutError, TTLCache, first_success
 from dashboard.data.memory_evals import build_memory_evals, root_scan_succeeded
 from dashboard.data.merge_halt import get_merge_halt_status
 from dashboard.data.merge_queue import (
@@ -1124,7 +1124,14 @@ async def api_curator_cancel(request: Request) -> JSONResponse:
             ValueError,
         ) as exc:
             logger.warning('cancel_ticket failed for %s: %s', url, exc)
-            raise ValueError(
+            # PreformattedFanoutError, not ValueError: the message below is
+            # already a rendered 'Type: message', and first_success renders
+            # every caught exception through describe_exc — which would
+            # prepend a second type name, surfacing 'ValueError: ConnectError:
+            # refused' in the 502 detail and the offline pill. See that
+            # class's docstring. str(exc) (NOT the composed string) is what
+            # gets truncated, so the cap bounds the exception text alone.
+            raise PreformattedFanoutError(
                 f'{type(exc).__name__}: {str(exc)[:_CANCEL_DETAIL_EXC_CHAR_LIMIT]}'
             ) from exc
         if result.get('error') == 'not_found':
