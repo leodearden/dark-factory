@@ -42,6 +42,7 @@ from fused_memory.backends.falkor_indices import (
     plan_index_statements,
     resolve_header_positions,
     vector_drop_statement,
+    vector_index_properties,
 )
 from fused_memory.backends.llm_clients import ForceJsonObjectOpenAIGenericClient
 from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
@@ -3510,18 +3511,60 @@ class GraphitiBackend:
 
     @_canonicalize_group_args
     async def drop_vector_indices(self, *, group_id: str) -> list[dict]:
-        """Drop all VECTOR-type indices in the graph.
+        """Drop every VECTOR index in the graph, one property at a time.
 
-        Calls list_indices() to find indices with type == 'VECTOR', then calls
-        drop_index() for each.  Returns a list of {'label': ..., 'field': ...}
-        dicts for each dropped index.
+        Calls :meth:`list_indices`, asks
+        :func:`fused_memory.backends.falkor_indices.vector_index_properties`
+        which properties of each record carry a VECTOR index, and issues one
+        :meth:`drop_vector_index` per (label, property).
+
+        Until task 3769 this was a PERMANENT NO-OP with THREE distinct defects,
+        each of which alone would have been enough to break it:
+
+        1. The predicate was ``entry.get('type') == 'VECTOR'``, comparing the
+           ``types`` COLUMN — a dict of property -> list of type strings, e.g.
+           ``{'name_embedding': ['VECTOR']}`` — against a bare string.  Never
+           true, so nothing was ever dropped.
+        2. It passed ``entry['field']`` — a LIST of properties, because FalkorDB
+           MERGES every index on a label into one record — where a per-property
+           string is required.  A list renders as ``ON (n.['name_embedding'])``.
+        3. It routed through :meth:`drop_index`, whose old-style
+           ``DROP INDEX ON :label(field)`` form targets RANGE indices ONLY.
+           MEASURED 2026-08-16: it fails against a live VECTOR index with
+           ``ERR Unable to drop index on :Entity(emb): no such index.``  So
+           repairing (1) and (2) alone would have converted a silent no-op into a
+           drop path that RAISES on the first vector index — a worse regression
+           than the bug, since ``reindex(drop_indices=True)`` would go from
+           quietly doing nothing to failing outright.
+
+        The ``logger.info`` line below was therefore a measured-FALSE report: it
+        emitted "Dropped 0 VECTOR index(es)" on graphs that demonstrably had
+        vector indices.  An operator reading an old log line must not treat that
+        0 as evidence of an index-free graph.
+
+        Per-statement failures are NOT absorbed — deliberately the inverse of
+        :meth:`ensure_indices`, which tolerates them because a partial provision
+        beats none.  The sole caller (``maintenance/reindex.py``) drops indices
+        immediately BEFORE re-embedding, so a partial drop reported as success
+        would leave stale fixed-dimension indices behind while the operator
+        believes the rebuild was clean — the same silent fail-soft this method's
+        defect was.
+
+        Returns:
+            One ``{'label': ..., 'field': ...}`` dict per dropped index, with
+            ``field`` a single property STRING.  The shape is deliberately
+            unchanged: ``reindex.py``'s docstring documents it and
+            ``test_returns_list_of_dropped_indices`` asserts exact dict equality,
+            and ``label`` already disambiguates Entity from RELATES_TO.
         """
         indices = await self.list_indices(group_id=group_id)
         dropped: list[dict] = []
-        for entry in indices:
-            if entry.get('type') == 'VECTOR':
-                await self.drop_index(entry['label'], entry['field'], group_id=group_id)
-                dropped.append({'label': entry['label'], 'field': entry['field']})
+        for record in indices:
+            for prop in vector_index_properties(record):
+                await self.drop_vector_index(
+                    record['label'], prop, record['entity_type'], group_id=group_id,
+                )
+                dropped.append({'label': record['label'], 'field': prop})
         logger.info(f'Dropped {len(dropped)} VECTOR index(es)')
         return dropped
 
