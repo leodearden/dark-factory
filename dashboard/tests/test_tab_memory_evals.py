@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import html.parser
 import re
-from pathlib import Path
 
 import pytest
 from starlette.testclient import TestClient
@@ -1118,6 +1117,15 @@ def test_presence_greps_are_falsified_by_deleting_the_code(
 # a way the presence direction is not: a violation is by definition executable,
 # so it cannot hide inside a comment.
 #
+# CONVENTION for live guards: consume the patterns via
+# `_forbidden_patterns(label)` rather than restating a regex at the call site,
+# search the comment-stripped `code` fixture, and carry the table's flags
+# through to `re.search` — one of these entries is `re.IGNORECASE` and the rest
+# are not, so a flag dropped at the call site is a guard quietly weakened with
+# nothing failing.  Advisory, for the same reason as the presence table above:
+# a regex over this module's own source asserts the formatting of test code
+# rather than behaviour.
+#
 # Entry: (label, ((pattern, what), ...), an accurate comment, flags).
 _FINGERPRINT_PARSE: tuple[tuple[str, str], ...] = tuple(
     (rf'{field}\s*{op}', f'`{field}` is {verb}')
@@ -1247,15 +1255,6 @@ def _with_injected_comment(body: str, comment: str) -> str:
     return body[: eol + 1] + comment + '\n' + body[eol + 1 :]
 
 
-# The one shape a live forbidden-pattern assertion may take: patterns, their
-# description and their flags all come from the table, and the search runs over
-# the comment-stripped `code`.
-_FORBIDDEN_CONSUMPTION_SHAPE = (
-    r'for\s+(\w+)\s*,\s*\w+\s*,\s*(\w+)\s+in\s+_forbidden_patterns\('
-    r'\s*[\'"]{label}[\'"]\s*\)\s*:([\s\S]{{0,400}})'
-)
-
-
 def test_an_accurate_comment_never_fails_a_forbidden_pattern_guard(
     tab_memory_evals_jsx_body: str,
 ) -> None:
@@ -1308,52 +1307,6 @@ def test_an_accurate_comment_never_fails_a_forbidden_pattern_guard(
                 'exists to explain these invariants; a guard that forbids '
                 'explaining them teaches the next author to delete the '
                 'explanation instead.'
-            )
-
-
-def test_every_forbidden_contract_is_consumed_over_comment_stripped_source() -> None:
-    """Same front door as the presence table, for the same reason.
-
-    `test_an_accurate_comment_never_fails_a_forbidden_pattern_guard` proves the
-    tabled patterns are comment-safe.  That says nothing about the assertions
-    that actually run, unless those assertions are the tabled patterns — so
-    this reads this module's source and requires every entry to be consumed by
-    a real loop over `code`, with the table's own flags.
-
-    Checked at EVERY occurrence, not just the first: one of these contracts is
-    consumed at two render sites, and a second site left on `body` (or with the
-    flags dropped) is exactly the drift a table is supposed to make impossible.
-    """
-    src = Path(__file__).read_text(encoding='utf-8')
-
-    for label, _patterns, _comment, _flags in _FORBIDDEN_PATTERNS:
-        shape = _FORBIDDEN_CONSUMPTION_SHAPE.format(label=re.escape(label))
-        sites = list(re.finditer(shape, src))
-        assert sites, (
-            f'[{label}] is in _FORBIDDEN_PATTERNS but no assertion consumes it via '
-            '`for <pattern>, <what>, <flags> in _forbidden_patterns('
-            f'{label!r}):`. The contract is comment-tested and then ignored — '
-            'whatever assertion really rejects this is greping a pattern nothing '
-            'checks.'
-        )
-        for site in sites:
-            pattern_var, flags_var, block = site.group(1), site.group(2), site.group(3)
-            call = re.search(
-                rf're\.search\(\s*{re.escape(pattern_var)}\s*,\s*(\w+)\s*,'
-                rf'\s*{re.escape(flags_var)}\s*\)',
-                block,
-            )
-            assert call is not None, (
-                f'[{label}] consumes the table but does not then call '
-                f'`re.search({pattern_var}, code, {flags_var})`. Both the pattern '
-                'and its flags must reach the search, or the table describes a '
-                'guard that is not the one running.'
-            )
-            assert call.group(1) == 'code', (
-                f'[{label}] is searched over {call.group(1)!r}, not the comment-'
-                'stripped `code` fixture. Over the raw body this guard rejects the '
-                '.jsx prose that describes the invariant, so documenting the rule '
-                'breaks the build and deleting the documentation fixes it.'
             )
 
 
