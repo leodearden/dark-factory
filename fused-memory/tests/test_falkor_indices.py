@@ -713,9 +713,8 @@ class TestVectorIndexProperties:
         """THE named signal: one merged record, one vector property out.
 
         This is the shape ``drop_vector_indices`` actually receives from
-        ``list_indices()`` on any real graph.  The defect this replaces compared
-        the whole ``types`` DICT against the STRING ``'VECTOR'`` — never true, so
-        the drop was a permanent no-op.
+        ``list_indices()`` on any real graph — and the shape a record-level
+        predicate cannot express.
         """
         record = {
             'label': 'Entity',

@@ -2,12 +2,11 @@
 
 Context: Task 3769.
 
-``drop_vector_indices()`` was a PERMANENT NO-OP, and the whole defect class here
-is "unit mocks pinned a fiction": its predicate compared the ``types`` COLUMN (a
-dict) against the string ``'VECTOR'``, it handed ``drop_index()`` a LIST of
-properties where a per-property string was required, and it used the old-style
-``DROP INDEX`` verb, which FalkorDB applies to RANGE indices only.  No unit test
-could have caught the third defect, because a mock accepts any statement string.
+``drop_vector_indices()`` was a PERMANENT NO-OP (its docstring records the three
+defects), and the whole defect class here is "unit mocks pinned a fiction".  One
+of the three — the old-style ``DROP INDEX`` verb, which FalkorDB applies to RANGE
+indices only — is one NO unit test could have caught, because a mock accepts any
+statement string.  That is what this module exists for.
 
 So this module locks the fix in END TO END against live FalkorDB: seed a graph
 carrying a NODE vector index, a RELATIONSHIP vector index and a RANGE index,

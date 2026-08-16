@@ -3206,11 +3206,10 @@ class GraphitiBackend:
         Note the returned ``type`` value is the ``types`` COLUMN — a dict of
         property -> list of index-type strings, e.g. ``{'uuid': ['RANGE']}`` —
         NOT a scalar.  ``fused_memory.backends.falkor_indices.normalize_index_record``
-        models that shape.  So does
-        ``falkor_indices.vector_index_properties``, through which
-        ``drop_vector_indices`` now consumes it PER PROPERTY (task 3769); until
-        then that method compared the whole dict against the string ``'VECTOR'``
-        and was a permanent no-op.
+        models that shape, as does ``falkor_indices.vector_index_properties``,
+        through which ``drop_vector_indices`` consumes it PER PROPERTY.  Reading
+        it as a scalar is exactly the defect task 3769 fixed; see that method's
+        docstring.
 
         Note on the CALL db.indexes() procedure and the read-only path:
         ``CALL db.indexes()`` is the *only* stored-procedure call sent on the
@@ -3534,6 +3533,14 @@ class GraphitiBackend:
            drop path that RAISES on the first vector index — a worse regression
            than the bug, since ``reindex(drop_indices=True)`` would go from
            quietly doing nothing to failing outright.
+
+        The measured-WORKING replacements, synthesized by
+        :func:`fused_memory.backends.falkor_indices.vector_drop_statement`, are
+        ``DROP VECTOR INDEX FOR (n:Label) ON (n.prop)`` for nodes and
+        ``DROP VECTOR INDEX FOR ()-[e:Label]-() ON (e.prop)`` for relationships
+        (``Indices deleted: 1`` each).  ``entity_type`` selects between them and
+        is load-bearing, not cosmetic: measured, the node form against a
+        RELATIONSHIP vector index also fails with ``no such index``.
 
         The ``logger.info`` line below was therefore a measured-FALSE report: it
         emitted "Dropped 0 VECTOR index(es)" on graphs that demonstrably had

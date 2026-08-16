@@ -467,20 +467,14 @@ class TestDropVectorIndices:
     unnoticed.
 
     Task 3706 recorded the defect against that real shape as two
-    ``xfail(strict=True)`` tests naming task 3769: the predicate
-    ``entry.get('type') == 'VECTOR'`` compared a dict to a string, was always
-    False, and the function dropped nothing while logging "Dropped 0 VECTOR
-    index(es)".  Task 3769 fixed it, so those marks are gone.
-
-    Un-xfailing was NOT sufficient.  Those tests asserted on ``drop_index``,
-    which the fix no longer calls: measured 2026-08-16, the old-style
-    ``DROP INDEX ON :Entity(emb)`` statement that method issues FAILS against a
-    live VECTOR index with ``no such index`` (it targets RANGE only), so
-    repairing the predicate alone would have converted a silent no-op into a
-    RAISING drop path.  Every assertion here is retargeted to
-    ``drop_vector_index``, and the calls are checked to carry the per-property
-    STRING field (``'name_embedding'``, not ``['name_embedding']``) plus the
-    record's ``entity_type``, which selects the statement shape.
+    ``xfail(strict=True)`` tests naming task 3769; task 3769 fixed it, so those
+    marks are gone.  Un-xfailing was NOT sufficient: they asserted on
+    ``drop_index``, which the fix no longer calls (see ``drop_vector_indices``'
+    docstring for why that method cannot serve VECTOR).  So every assertion here
+    is retargeted to ``drop_vector_index``, and the calls are checked to carry
+    the per-property STRING field (``'name_embedding'``, not
+    ``['name_embedding']``) plus the record's ``entity_type``, which selects the
+    statement shape.
     """
 
     @pytest.mark.asyncio
