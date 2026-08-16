@@ -24,6 +24,7 @@ from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.throughput import (
     drain_stats,
+    remediation_duty_cycle,
     inflow_daily,
     inflow_hourly,
     utc_hour_bucket,
@@ -448,3 +449,70 @@ async def test_drain_stats_scopes_by_project_and_since(recon_db):
     assert later['modes']['backlog_chunk']['run_count'] == 1
     assert later['modes']['backlog_chunk']['events'] == 326
     assert later['modes']['remediation']['run_count'] == 1
+
+
+# ── remediation duty cycle ─────────────────────────────────────────────
+#
+# The number lever 1 exists to recover.  Remediation is an unconditional
+# inline tail of every completed run_full_cycle (harness.py:2963), and
+# BacklogIterator runs each chunk as a full cycle — so every chunk drags in
+# its own zero-event remediation pass.  ADDENDUM 2 measured that as roughly
+# half the backlog-mode drain wall-clock.
+
+
+@pytest.mark.asyncio
+async def test_remediation_duty_cycle_reproduces_the_addendum_2_measurement(recon_db):
+    """Exact arithmetic over the observed 2026-07-25 reify sequence.
+
+    remediation 756 + 739 = 1495s, over 1495 + 954 + 960 = 3409s total
+    lock-held drain wall-clock => 0.4385.  This is fixture arithmetic, not a
+    measurement tolerance, so it pins the definition rather than the weather.
+    """
+    db = recon_db._db_path
+    _seed_addendum_2(db)
+
+    duty = remediation_duty_cycle(drain_stats(db, 'reify'))
+    assert duty == pytest.approx(1495.0 / 3409.0)
+    assert 0.44 == pytest.approx(round(duty, 2))
+
+
+@pytest.mark.asyncio
+async def test_remediation_duty_cycle_ignores_targeted_runs(recon_db):
+    """Targeted runs hold no lock, so they must not move the duty cycle.
+
+    If they leaked into the denominator, adding concurrent targeted work would
+    make remediation preemption look cheaper than it is — exactly the wrong
+    signal for sizing lever 1.
+    """
+    db = recon_db._db_path
+    _seed_addendum_2(db)
+    before = remediation_duty_cycle(drain_stats(db, 'reify'))
+
+    for i in range(4):
+        _insert_run(
+            db, run_type='targeted', trigger_reason='task_status_changed',
+            started_at=_t(f'15:1{i}:00'), completed_at=_t(f'15:1{i}:50'),
+            events_processed=2,
+        )
+
+    assert remediation_duty_cycle(drain_stats(db, 'reify')) == pytest.approx(before)
+
+
+@pytest.mark.asyncio
+async def test_remediation_duty_cycle_counts_steady_state_wall_clock(recon_db):
+    """Steady-state runs are lock-held drain too, so they sit in the denominator."""
+    db = recon_db._db_path
+    _seed_addendum_2(db)
+    _insert_run(
+        db, trigger_reason='quiescence',
+        started_at=_t('15:00:00'), completed_at=_t('15:15:45'), events_processed=50,
+    )  # 945s
+
+    duty = remediation_duty_cycle(drain_stats(db, 'reify'))
+    assert duty == pytest.approx(1495.0 / (3409.0 + 945.0))
+
+
+@pytest.mark.asyncio
+async def test_remediation_duty_cycle_is_zero_for_an_empty_denominator(recon_db):
+    """No drain wall-clock at all returns 0.0 rather than raising."""
+    assert remediation_duty_cycle(drain_stats(recon_db._db_path, 'reify')) == 0.0
