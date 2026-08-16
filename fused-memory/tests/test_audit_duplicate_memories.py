@@ -82,6 +82,29 @@ _build_parser = _mod._build_parser
 _run = _mod._run
 
 
+@pytest.fixture(autouse=True)
+def _neutralise_store_mutation_preflight(monkeypatch):
+    """Keep this MOCK-unit suite independent of the REAL ``~/.mem0``.
+
+    ``_run(args)`` with ``--apply`` runs a fail-closed capability preflight
+    before it constructs a MemoryService (task 4127). That probe touches the
+    real filesystem, so without this fixture every ``--apply`` test would pass
+    or fail according to whether the machine running pytest happens to be able
+    to write mem0's history directory -- and it genuinely cannot inside an
+    agent sandbox, which is the whole reason the guard exists. This suite is
+    deliberately MOCK-unit (``_FakeMemoryService``, no live Qdrant), so the
+    environment must not be an input to it.
+
+    ``TestApplyStoreMutationPreflight`` re-rigs this per test -- to refuse, to
+    record, or to pass -- so the guard's own behaviour is still pinned
+    explicitly rather than assumed away.
+
+    Deliberately NOT ``raising=False``: if the guard is ever removed from the
+    script this fixture must break loudly rather than silently no-op.
+    """
+    monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -5934,3 +5957,172 @@ class TestLivenessDetectorRegexBudget:
             ('96', ['08aa0017', '1eef7df7']),
         ]
         assert disclosure == dict.fromkeys(_LIVENESS_DISCLOSURE_KEYS, 0)
+
+
+@pytest.mark.asyncio
+class TestApplyStoreMutationPreflight:
+    """``--apply`` refuses to START when this process cannot write mem0's store.
+
+    Ported from ``test_sweep_toolcall_xml_leak.TestRunApplyStoreMutationPreflight``
+    (task 3686), which is the in-repo precedent for this contract.
+
+    ``apply_deletions`` wraps each ``delete_memory`` in a per-record
+    ``except Exception`` and increments ``delete_errors``, so in a write-denied
+    environment it would produce N logged errors and N already-destroyed
+    Qdrant points -- mem0's ``_delete_memory`` removes the point BEFORE writing
+    its SQLite history. This module's own docstring warns that "under --apply
+    every non-survivor of that chain is an irreversible delete"; the guard is
+    what makes that warning enforceable rather than advisory.
+    """
+
+    @staticmethod
+    def _deny(monkeypatch):
+        """Rig the preflight to refuse, as it would inside an agent sandbox."""
+        def _raise(*_args, **_kwargs):
+            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
+
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
+
+    def _raw(self) -> dict:
+        """A real two-member cluster, so ``--apply`` has work to refuse."""
+        return {_PK: [
+            _raw('m1', _VENV_GOTCHA_A, '2026-01-01T00:00:00+00:00'),
+            _raw('m2', _VENV_GOTCHA_B, '2026-01-02T00:00:00+00:00'),
+        ]}
+
+    async def test_apply_never_even_opens_a_client_when_the_store_is_unwritable(
+        self, monkeypatch, tmp_path,
+    ):
+        """The strongest available zero-mutation proof for this script: it
+        cannot delete because it never constructs a MemoryService at all.
+
+        The guard sits ahead of both the config load and the service
+        construction, so a refused --apply also never reaches the
+        ``finally: await memory.close()`` teardown of a service that was never
+        initialized.
+        """
+        self._deny(monkeypatch)
+        _install_run_doubles(monkeypatch, self._raw())
+        args = _build_parser().parse_args([
+            '--project-id', 'p', '--apply', '--threshold', '0.75',
+            '--metrics-root', str(tmp_path),
+        ])
+
+        with pytest.raises(
+            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+        ):
+            await _run(args)
+
+        assert _FakeMemoryService.instances == [], (
+            'no MemoryService may be constructed once the preflight has refused'
+        )
+
+    async def test_the_guard_sits_before_the_scan_and_the_ann_fan_out(
+        self, monkeypatch, tmp_path,
+    ):
+        """It aborts without a single Qdrant read: neither ``fetch_memories``'
+        per-category scroll (with_vectors=True) nor ``fetch_ann_neighbors``'
+        per-record query fan-out is paid for."""
+        self._deny(monkeypatch)
+        _install_run_doubles(monkeypatch, self._raw())
+        called: list[str] = []
+        monkeypatch.setattr(
+            _mod, 'fetch_memories',
+            lambda *a, **kw: called.append('fetch_memories'),
+        )
+        monkeypatch.setattr(
+            _mod, 'fetch_ann_neighbors',
+            lambda *a, **kw: called.append('fetch_ann_neighbors'),
+        )
+        args = _build_parser().parse_args([
+            '--project-id', 'p', '--apply', '--threshold', '0.75',
+            '--metrics-root', str(tmp_path),
+        ])
+
+        with pytest.raises(_mod.StoreMutationUnavailable):
+            await _run(args)
+
+        assert called == [], 'the scan must not run once the preflight has refused'
+
+    async def test_a_dry_run_is_never_gated_on_write_capability(
+        self, monkeypatch, tmp_path,
+    ):
+        """A read-only run mutates nothing, so it must not require the ability
+        to mutate -- the audit report stays obtainable from anywhere."""
+        self._deny(monkeypatch)
+        _install_run_doubles(monkeypatch, self._raw())
+        args = _build_parser().parse_args([
+            '--project-id', 'p', '--threshold', '0.75',
+            '--metrics-root', str(tmp_path),
+        ])
+
+        rc = await _run(args)
+
+        assert rc == 0
+        assert _FakeMemoryService.instances[-1].deleted == []
+
+    async def test_apply_is_unchanged_when_the_preflight_passes(
+        self, monkeypatch, tmp_path,
+    ):
+        """Happy path: a writable environment deletes exactly as before."""
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+        _install_run_doubles(monkeypatch, self._raw())
+        args = _build_parser().parse_args([
+            '--project-id', 'p', '--apply', '--threshold', '0.75',
+            '--metrics-root', str(tmp_path),
+        ])
+
+        rc = await _run(args)
+
+        assert rc == 0
+        assert _FakeMemoryService.instances[-1].deleted == ['m2'], 'the oldest survives'
+
+    async def test_the_probe_names_the_operation_being_gated(
+        self, monkeypatch, tmp_path,
+    ):
+        """The refusal has to be attributable in a log, so the operation string
+        identifies this script and its mutating mode."""
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            _mod, 'assert_store_mutation_allowed', lambda **kw: calls.append(kw)
+        )
+        _install_run_doubles(monkeypatch, self._raw())
+        args = _build_parser().parse_args([
+            '--project-id', 'p', '--apply', '--threshold', '0.75',
+            '--metrics-root', str(tmp_path),
+        ])
+
+        await _run(args)
+
+        assert len(calls) == 1, 'probed ONCE per run, not once per delete candidate'
+        assert 'audit_duplicate_memories' in calls[0]['operation']
+        assert '--apply' in calls[0]['operation']
+
+    async def test_the_refusal_raises_and_is_never_confusable_with_the_report_shaped_one(
+        self, monkeypatch, tmp_path,
+    ):
+        """``_apply_refusal_reason`` already refuses ``--apply`` on
+        empty-scan/truncation grounds -- but it returns an integer through the
+        NORMAL path, a handled outcome an operator can reasonably read past.
+
+        A write-capability denial is categorically different: proceeding would
+        leave a half-completed, unrecoverable store mutation. So it RAISES, and
+        that must not degrade into any of this script's ordinary integer
+        returns. ``main`` has no try/except, so it exits non-zero.
+
+        Rigged with an EMPTY scan -- the exact condition that drives
+        ``_apply_refusal_reason`` to return 1 -- to prove the write-capability
+        refusal wins over, rather than collapsing into, the report-shaped one.
+        """
+        self._deny(monkeypatch)
+        _install_run_doubles(monkeypatch, {})
+        args = _build_parser().parse_args([
+            '--project-id', 'p', '--apply',
+            '--metrics-root', str(tmp_path),
+        ])
+
+        with pytest.raises(_mod.StoreMutationUnavailable) as excinfo:
+            await _run(args)
+
+        assert not isinstance(excinfo.value, int)
+        assert _FakeMemoryService.instances == []
