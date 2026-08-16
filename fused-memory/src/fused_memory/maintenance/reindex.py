@@ -106,6 +106,15 @@ class ReindexManager:
                 fixed-dimension indices must be rebuilt.  Defaults to False for
                 backward compatibility.
 
+                HISTORICAL: this was a measured NO-OP until task 3769 —
+                ``drop_vector_indices`` compared the ``types`` dict against the
+                string ``'VECTOR'``, matched nothing, and dropped nothing.  An
+                operator reading an old ``Dropped 0 VECTOR index(es)`` log line
+                must NOT read it as evidence that the graph had no vector
+                indices; it was emitted regardless.  From 3769 on the count is
+                truthful, and a failed drop propagates rather than being reported
+                as a clean run.
+
         Returns:
             Dict with reindex_result (ReindexResult), replay_count (int), and
             indices_dropped (list of {label, field} dicts).
