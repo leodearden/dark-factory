@@ -3,7 +3,6 @@
 import ast
 import pathlib
 
-import _fm_helpers
 import pytest
 from _ast_guard import calls_named, imported_names_from, parse_python_module
 
@@ -287,19 +286,33 @@ class TestMachineryBoundary:
     already applies to the barrier.
     """
 
-    def test_fm_helpers_no_longer_exposes_the_ast_machinery(self):
-        """``_fm_helpers`` must not re-acquire the three names.
+    def test_fm_helpers_does_not_redefine_the_ast_machinery(self):
+        """``_fm_helpers`` must not hold a second COPY of the parse/search machinery.
 
-        A boundary contract, not a naming check. What ``_fm_helpers`` may not
-        hold is a second copy of the parse/search machinery: two copies drift
-        apart while all three migration guards keep reporting green, which is
-        precisely the false-green those guards exist to prevent.
+        A boundary contract, not a naming check. Two copies drift apart while
+        all three migration guards keep reporting green, which is precisely the
+        false-green those guards exist to prevent.
+
+        Asserts over DEFINITIONS rather than probing ``hasattr``, mirroring
+        test_falkor_index_barrier_guard.test_does_not_redefine_the_barrier_locally.
+        Name-presence would be wrong in both directions against the contract
+        stated above: it passes a re-export that holds no copy at all while
+        accusing the author of having re-forked one, and it is satisfied by a
+        re-fork that merely renamed itself on the way in.
         """
-        readded = [name for name in MACHINERY if hasattr(_fm_helpers, name)]
+        tree = parse_python_module(pathlib.Path(__file__).parent / f'{HELPERS_MODULE}.py')
 
-        assert not readded, (
-            f'{HELPERS_MODULE} exposes {readded} again — the AST machinery lives in '
-            f'_ast_guard. Import it from there rather than re-forking a copy here.'
+        defs = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name in MACHINERY
+        ]
+
+        assert not defs, (
+            f'{HELPERS_MODULE}.py defines {[d.name for d in defs]} at line(s) '
+            f'{[d.lineno for d in defs]} — the AST machinery lives in _ast_guard. '
+            f'Import it from there rather than re-forking a copy here.'
         )
 
     def test_no_test_module_imports_the_ast_machinery_from_fm_helpers(self):
