@@ -216,6 +216,37 @@ install -m 0755 "$REPO_ROOT/scripts/wait-for-port.py" "$HOME/bin/wait-for-port.p
 # unless the checker's own [orchestrator_unit_parity] tag appears in the
 # output it produced.
 _orch_parity_script="$REPO_ROOT/scripts/check_orchestrator_unit_parity.py"
+
+# The units this section installs, declared ONCE. Both loops below iterate this
+# array, and check_orchestrator_unit_parity.py's UNITS registry is checked
+# against it by tests/scripts/test_check_orchestrator_unit_parity.py — so
+# adding a unit is a one-line edit here instead of a `cp` line plus an
+# `enable` line kept in step by hand.
+#
+# Declared HERE, below the parity-script assignment rather than up beside the
+# section header, for a harness reason worth stating: the behavioural tests
+# slice this file from the first mention of the checker through the install
+# construct's closing `fi` and execute THAT slice. An array declared above the
+# slice's start would be unbound at run time and kill the script under `set -u`.
+#
+# ENABLE POLICY. Every project orchestrator is enabled by default, to match the
+# running production stack — they coexist on separate escalation ports, noted
+# per entry below. Disable selectively (see SETUP.md's `systemctl --user
+# disable --now` block) if a host should not be part of the unattended
+# workload. This script marks real exclusions with an explicit "Deliberately
+# NOT wired" note; an absent note means the unit belongs here.
+_orch_units=(
+  orchestrator-dark-factory.service              # this repo's own orchestrator, escalation 8102
+  orchestrator-reify.service                     # reify, escalation 8100
+  orchestrator-autopilot-video.service           # joined 2026-05-29, escalation 8101 (separate target, selected purely via --config)
+  orchestrator-my-solar-challenge.service        # joined 2026-05-31, escalation 8106
+  orchestrator-solar-challenge-platform.service  # joined 2026-06-21, escalation 8107
+  orchestrator-know-live.service                 # escalation 8105; committed since e5273d8623, wired in by task 3641 (its absence was an omission, not a policy)
+  orchestrator-pump-web-ui.service               # joined 2026-07-17, escalation 8108; ran on the host with no committed template until task 3641 transcribed it
+  orchestrator-watchdog.service                  # static (no [Install]) — pulled in by the .timer, so the enable loop below skips it
+  orchestrator-watchdog.timer                    # 60s liveness probe + dead-enabled revival: the safety net that revives an orchestrator killed by e.g. a boot-race dependency cancel
+)
+
 # 1 => the units were NOT verified as safe to overwrite (drift, unverifiable
 # state, or the gate itself did not run). Consumed by the install block below.
 _orch_install_blocked=0
@@ -269,40 +300,29 @@ else
     warn "DF_INSTALL_ORCH_UNITS=1 — installing over the reported drift"
   fi
 
-  cp "$REPO_ROOT/scripts/orchestrator-dark-factory.service"   "$UNIT_DIR/"
-  cp "$REPO_ROOT/scripts/orchestrator-reify.service"          "$UNIT_DIR/"
-  cp "$REPO_ROOT/scripts/orchestrator-autopilot-video.service" "$UNIT_DIR/"
-  cp "$REPO_ROOT/scripts/orchestrator-my-solar-challenge.service" "$UNIT_DIR/"
-  cp "$REPO_ROOT/scripts/orchestrator-solar-challenge-platform.service" "$UNIT_DIR/"
-  cp "$REPO_ROOT/scripts/orchestrator-know-live.service"      "$UNIT_DIR/"
-  cp "$REPO_ROOT/scripts/orchestrator-pump-web-ui.service"    "$UNIT_DIR/"
-  cp "$REPO_ROOT/scripts/orchestrator-watchdog.service"       "$UNIT_DIR/"
-  cp "$REPO_ROOT/scripts/orchestrator-watchdog.timer"         "$UNIT_DIR/"
+  for _unit in "${_orch_units[@]}"; do
+    cp "$REPO_ROOT/scripts/$_unit" "$UNIT_DIR/"
+  done
 
   systemctl --user daemon-reload
-  # Watchdog timer always enabled — it's the safety net that revives a
-  # dead-enabled orchestrator (e.g. after a boot-race dependency cancel).
-  systemctl --user enable orchestrator-watchdog.timer
-  # Both orchestrators enabled by default to match the running production stack
-  # (they coexist on separate escalation ports: reify=8100, dark-factory=8102).
-  # Disable selectively if a host should not be part of the unattended workload.
-  systemctl --user enable orchestrator-reify.service
-  systemctl --user enable orchestrator-dark-factory.service
-  # autopilot-video joined the unattended workload 2026-05-29 (separate target,
-  # selected purely via --config). Enabled by default like the other two.
-  systemctl --user enable orchestrator-autopilot-video.service
-  # my-solar-challenge joined 2026-05-31 (escalation port 8106). Enabled by default.
-  systemctl --user enable orchestrator-my-solar-challenge.service
-  # solar-challenge-platform joined 2026-06-21 (escalation port 8107). Enabled by default.
-  systemctl --user enable orchestrator-solar-challenge-platform.service
-  # know-live (escalation port 8105) has had a committed template since e5273d8623
-  # and a running unit on the host, but was never wired in here — an omission, not
-  # a policy: this script marks real exclusions with an explicit "Deliberately NOT
-  # wired" note and carries none for know-live. Enabled by default like the rest.
-  systemctl --user enable orchestrator-know-live.service
-  # pump-web-ui joined 2026-07-17 (escalation port 8108) and likewise ran on the
-  # host with no committed template until task 3641 transcribed it. Enabled by default.
-  systemctl --user enable orchestrator-pump-web-ui.service
+
+  # The enable obligation is DERIVED from each unit's own [Install] section,
+  # not from a hand-listed exception for the static watchdog service. Two
+  # reasons, both load-bearing:
+  #   - `systemctl enable` on a unit with no [Install] is an ERROR, not a
+  #     no-op, so under `set -e` a hand-list that fell out of step with the
+  #     units would abort the installer outright.
+  #   - a hand-maintained exception list has to be edited for every future
+  #     unit, and a unit nobody remembers to add is precisely the class of bug
+  #     the array above exists to close.
+  # This is the same rule tests/scripts/test_orchestrator_service_files.py's
+  # _unit_has_install_section predicate expresses in Python.
+  for _unit in "${_orch_units[@]}"; do
+    if grep -q '^\[Install\]' "$REPO_ROOT/scripts/$_unit"; then
+      systemctl --user enable "$_unit"
+    fi
+  done
+
   ok "orchestrator units + watchdog installed and enabled"
 fi
 

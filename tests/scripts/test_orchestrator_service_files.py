@@ -833,7 +833,14 @@ _INSTALL_LOOP_CP = f'cp "$REPO_ROOT/scripts/$_unit" "{_UNIT_DIR_VAR}/"'
 # section — the same rule _unit_has_install_section expresses here in Python —
 # rather than from a hand-maintained exception list naming the static watchdog
 # service.  See test_setup_host_installs_every_orchestrator_unit.
-_ENABLE_INSTALL_PREDICATE = "grep -q '^\\[Install\\]' \"$REPO_ROOT/scripts/$_unit\""
+#
+# Pinned as the whole `if ...; then` statement rather than the bare grep, so
+# this asserts the predicate is used as a GUARD.  A grep whose result is
+# discarded would enable the static watchdog service — an error, not a no-op,
+# which under `set -e` aborts the installer.
+_ENABLE_INSTALL_GUARD = (
+    "if grep -q '^\\[Install\\]' \"$REPO_ROOT/scripts/$_unit\"; then"
+)
 _ENABLE_STATEMENT = 'systemctl --user enable "$_unit"'
 
 
@@ -958,12 +965,12 @@ def test_setup_host_installs_every_orchestrator_unit(
         "enable loop, so it is copied to the host and then never starts at boot. "
         f"Expected the statement:\n    {_ENABLE_STATEMENT}"
     )
-    assert _ENABLE_INSTALL_PREDICATE in SETUP_HOST_STATEMENTS, (
+    assert _ENABLE_INSTALL_GUARD in SETUP_HOST_STATEMENTS, (
         f"{SETUP_HOST_SH.name}'s enable loop does not gate on the unit's own "
         "[Install] section, so it would either skip enable-able units or run "
         "`systemctl enable` on a static one — which is an ERROR, not a no-op, "
         "and under `set -e` aborts the installer. Expected:\n"
-        f"    {_ENABLE_INSTALL_PREDICATE}"
+        f"    {_ENABLE_INSTALL_GUARD}"
     )
 
 
