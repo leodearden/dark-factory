@@ -103,6 +103,12 @@ from fused_memory.backends.mem0_client import (
 )
 from fused_memory.models.enums import GRAPHITI_PRIMARY, MEM0_PRIMARY, MemoryCategory
 
+# THE shared slug predicate, imported and called -- never re-expressed as a
+# second regex here (INV-5; tests/test_topic_slug_namespace.py pins the same
+# identity by ``is``). topic_slug is a stdlib-only leaf, so this adds no
+# heavy import to the census.
+from fused_memory.topic_slug import is_valid_topic_slug
+
 logger = logging.getLogger('census_memory_metadata')
 
 # Default artifact paths, relative to the repo root (this file lives at
@@ -629,6 +635,16 @@ def _build_topic_coverage(
     0.0 asserts "measured, and nothing is stamped", which is a different
     claim from "there was nothing to measure", and fabricating the former is
     the failure task 3291 hardened ``extract_done_count`` against.
+
+    NAMED CONSUMER. The two slug-conformance partitions below are the
+    standing re-measurement of gate **3626**'s recipe items 3 and 4 -- that
+    task's description already names this script as their instrument, and
+    until now the census emitted neither number, so a ``pending`` milestone
+    carried a recipe its own instrument could not execute. They stay two
+    columns rather than one because the predicates differ and PRD §159's
+    discharge claim is stated over the narrower one only; see the block
+    comment at the computation for which is which, and why a non-empty
+    canonical-scoped list REGRESSES that discharge.
     """
     by_topic = census.canonical_true_by_topic
     exactly_one = zero = multiple = 0
@@ -645,6 +661,46 @@ def _build_topic_coverage(
     # Same total order _table() uses (count desc, then value asc), so the
     # artifact stays byte-stable across re-runs over an unchanged corpus.
     violators.sort(key=lambda tc: (-tc[1], tc[0]))
+
+    # SLUG CONFORMANCE -- two partitions, because gate 3626's re-measurement
+    # recipe asks two different questions and PRD §159's discharge claim is
+    # stated over only the second:
+    #
+    #   item 3: the non-conforming DISTINCT-TOPIC count, corpus-wide. Its
+    #           history (leaf-alpha census: 98 -> 103 on 2026-08-04) is a
+    #           distinct-VALUE series, so a legacy topic stamped on 8 records
+    #           is ONE non-conforming topic, not eight.
+    #   item 4: every live ``canonical: true`` record's topic passes the slug
+    #           regex, per project. Strictly narrower than item 3.
+    #
+    # A non-empty canonical-scoped list REGRESSES the discharge PRD §159
+    # records for the ``legacy_topic_spelling_remains`` precondition. Merging
+    # the two would report the exact state §159 records as of 2026-08-04 --
+    # legacy spellings among ordinary records, none among canonicals -- as an
+    # undifferentiated failure.
+    non_conforming: list[tuple[str, int]] = [
+        (topic, count)
+        for topic, count in census.topic_values.items()
+        if not is_valid_topic_slug(topic)
+    ]
+    non_conforming.sort(key=lambda tc: (-tc[1], tc[0]))
+
+    canonical_non_conforming: list[tuple[str, int]] = [
+        (topic, count)
+        for topic, count in by_topic.items()
+        if not is_valid_topic_slug(topic)
+    ]
+    canonical_non_conforming.sort(key=lambda tc: (-tc[1], tc[0]))
+
+    preconditions = [dict(e) for e in ENFORCE_FLIP_PRECONDITIONS]
+    # The legacy-spelling citation carries a RECORDED status (discharged
+    # 2026-08-04) plus THIS run's live counts as its standing re-measurement:
+    # a bucket recorded empty can regrow, and the 98 -> 103 history proves it
+    # does. 3202 and 3626 get no such field -- they are cited, not measured.
+    preconditions[0]['live_re_measurement'] = {
+        'slug_non_conforming': len(non_conforming),
+        'canonical_slug_non_conforming': len(canonical_non_conforming),
+    }
 
     return {
         'records': census.records,
@@ -671,7 +727,20 @@ def _build_topic_coverage(
         # Deep-copied, never aliased: a consumer mutating the report must not
         # silently rewrite every later run's citations in the same process
         # (the nightly wrapper censuses two projects in one invocation).
-        'enforce_flip_preconditions': [dict(e) for e in ENFORCE_FLIP_PRECONDITIONS],
+        'enforce_flip_preconditions': preconditions,
+        # Gate 3626 recipe item 3 -- corpus-wide distinct-topic conformance.
+        'slug_conforming': len(census.topic_values) - len(non_conforming),
+        'slug_non_conforming': len(non_conforming),
+        'non_conforming_topics': [
+            {'topic': t, 'count': c} for t, c in non_conforming
+        ],
+        # Gate 3626 recipe item 4 -- the strictly narrower canonical-scoped
+        # predicate PRD §159's discharge claim is actually stated over.
+        'canonical_slug_conforming': len(by_topic) - len(canonical_non_conforming),
+        'canonical_slug_non_conforming': len(canonical_non_conforming),
+        'canonical_slug_non_conforming_topics': [
+            {'topic': t, 'count': c} for t, c in canonical_non_conforming
+        ],
         'canonical_true': census.canonical_true,
         # Named rather than dropped: these canonicals are invisible to every
         # per-topic tally above, so without this the block cannot be
