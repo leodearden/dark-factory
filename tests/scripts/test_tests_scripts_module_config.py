@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import pathlib
 
+import pytest
 import yaml
 from orchestrator.config import OrchestratorConfig, _discover_module_configs
 from orchestrator.module_charter import derive_modules
@@ -281,6 +282,106 @@ def test_tests_scripts_diff_executes_its_own_suite_and_keeps_lint_and_type() -> 
         'TYPE to a vacuously-passing CheckRun.skipped at rc=0, silently '
         'DELETING gating that the fallback path performs correctly today '
         '(esc-3062-3 logs pyright tests/scripts/test_spawn_claude.py rc=0)'
+    )
+
+
+def test_executed_for_touched_is_hermetic_against_the_ambient_orch_config_path(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``_executed_for_touched`` must not read the ambient ``ORCH_CONFIG_PATH``.
+
+    Task 3703, reviewer-flagged — the mirror of the repair commit 6c72a7da5a
+    landed next door in ``test_module_verify_budgets.py``. This file's helper
+    used to construct its OWN ``OrchestratorConfig(project_root=REPO_ROOT)``,
+    and ``project_root`` selects NOTHING: ``settings_customise_sources`` builds
+    the ``YamlSettingsSource`` from ``os.environ['ORCH_CONFIG_PATH']`` alone,
+    falling back to a CWD-relative ``config.yaml``. NO caller in this file
+    anchored that variable at all — worse than the sibling's ordering
+    dependency, which at least anchors it somewhere — so the helper read
+    whatever yaml the ambient process happened to point at: the pydantic
+    DEFAULTS inside verify (``verify._target_subprocess_env`` scrubs the whole
+    ``ORCH_`` prefix), or the MAIN checkout's config in an operator shell.
+    Taking the config as an argument makes the dependency structural instead of
+    ambient.
+
+    WHY THE HOSTILE YAML IS ONE THE LOADER REJECTS, rather than one that merely
+    holds different values. This is not a stylistic choice; it is the only
+    formulation that can fail BEFORE the fix. MEASURED at base d6a5e32535:
+    ``derive_verify_plan`` consults its ``config`` argument in exactly two
+    places — ``_merge_breadth_is_full(config)`` on the role='merge' branch, and
+    ``_derive_fallback_runs`` when ``module_configs`` is EMPTY. This call is
+    role='task' with one non-empty ModuleConfig, so it reaches NEITHER: a
+    differently-VALUED config yields a byte-identical plan, and a test built on
+    one would pass before the fix as readily as after — a guard that reads as
+    enforcement while enforcing nothing. A type-invalid value instead makes the
+    PRE-fix helper's own ``OrchestratorConfig`` construction raise pydantic
+    ``ValidationError``, which is the single observable signal that the ambient
+    dependency exists at all.
+
+    The post-fix GREEN is reachable rather than assumed, measured at that same
+    base: ``_discover_module_configs``, ``derive_verify_plan`` and
+    ``verify._executed_module_configs_from_plan`` are all unaffected by the
+    poisoned env — they read this module's own yaml and the config they are
+    handed, never ``ORCH_CONFIG_PATH``.
+
+    ORDER IS LOAD-BEARING: the anchored config is built FIRST, while the
+    environment is still sane, and the poison applied SECOND. Anchoring
+    afterwards would overwrite the poison and leave this test vacuous.
+    """
+    # (1) The anchored config, built while the environment is still sane.
+    cfg = _root_config(monkeypatch)
+
+    # (2) NOW poison the ambient environment, with a config the PRODUCTION
+    # loader REJECTS — see the docstring for why rejected and not merely
+    # different.
+    hostile = tmp_path / 'hostile.yaml'
+    hostile.write_text(
+        'verify_command_timeout_secs: "not-a-number"\n', encoding='utf-8'
+    )
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(hostile))
+
+    # (3) The helper must not consult that variable. A helper that builds its
+    # own config raises pydantic ValidationError here instead of returning.
+    executed = _executed_for_touched([SAMPLE_TOUCHED_FILE], cfg)
+
+    assert executed.prefix == MODULE_PREFIX, (
+        f'under a poisoned ORCH_CONFIG_PATH the production bridge executed '
+        f'{executed.prefix!r}, not {MODULE_PREFIX!r} (task 3703) — module '
+        'routing is reading the ambient environment'
+    )
+    assert executed.test_command is not None and 'pytest' in executed.test_command, (
+        f'executed test_command is {executed.test_command!r} under a poisoned '
+        f'ORCH_CONFIG_PATH (task 3703); {MODULE_PREFIX} must still run its own '
+        'suite regardless of what the ambient environment points at'
+    )
+    assert MODULE_PREFIX in executed.test_command, (
+        f'executed test_command {executed.test_command!r} does not target '
+        f'{MODULE_PREFIX}/ under a poisoned ORCH_CONFIG_PATH (task 3703)'
+    )
+
+    # The lint/type legs, for the same reason assertions (c)/(d) of
+    # test_tests_scripts_diff_executes_its_own_suite_and_keeps_lint_and_type
+    # exist: a None command is a VACUOUSLY PASSING CheckRun.skipped at rc=0, so
+    # an ambient-config leak that silently dropped them would report green.
+    assert executed.lint_command is not None, (
+        'executed lint_command is None under a poisoned ORCH_CONFIG_PATH (task '
+        '3703) — a None command is a vacuously-passing CheckRun.skipped at '
+        'rc=0, so this leak would delete lint gating without reporting anything'
+    )
+    assert executed.type_check_command is not None, (
+        'executed type_check_command is None under a poisoned ORCH_CONFIG_PATH '
+        '(task 3703) — same vacuous-pass mechanism as the lint leg above'
+    )
+
+    # The module budget survives too: the figure must come from THIS module's
+    # yaml, which the poisoned env cannot reach, not from whatever the ambient
+    # config declares.
+    declared = _discovered()[MODULE_PREFIX].verify_command_timeout_secs
+    assert executed.verify_command_timeout_secs == declared, (
+        f'executed verify_command_timeout_secs='
+        f'{executed.verify_command_timeout_secs} under a poisoned '
+        f'ORCH_CONFIG_PATH, not the {declared} this module declares (task '
+        '3703) — the budget is being resolved from the ambient environment'
     )
 
 
