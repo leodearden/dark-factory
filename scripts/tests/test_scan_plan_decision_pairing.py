@@ -50,13 +50,17 @@ file text. Leave it escaped.
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 from scan_plan_decision_pairing import (
+    DEFAULT_ROOT,
     PairingRecord,
     SkippedFile,
     TreeScan,
+    _default_root,
     format_json,
     format_report,
     scan_plan_file,
@@ -587,3 +591,148 @@ class TestFormatJson:
         scan = scan_tree(tree)
 
         assert format_json(scan) == format_json(scan)
+
+
+# ---------------------------------------------------------------------------
+# Where the sweep points when nobody says — a constant, pinned in-process.
+# ---------------------------------------------------------------------------
+
+
+class TestDefaultRoot:
+    """Both checkout shapes must resolve to the ONE real lane tree.
+
+    Measured 2026-08-16: a task worktree lives at ``<repo>/.worktrees/<lane>/``,
+    so the naive ``<checkout>/.worktrees/.task-meta`` resolves inside a worktree
+    to ``<repo>/.worktrees/<lane>/.worktrees/.task-meta`` — a directory that
+    does not exist. The sweep then reports zero hits over zero files, which
+    reads as a clean corpus. ``TreeScan.scanned`` makes that visible, but a
+    default that walks into it by construction is a defect, not a diagnostic.
+    """
+
+    def test_a_main_checkout_resolves_to_its_own_worktrees_lane_tree(self):
+        assert _default_root(Path('/repo')) == Path('/repo/.worktrees/.task-meta')
+
+    def test_a_task_worktree_resolves_to_the_shared_lane_tree_beside_it(self):
+        assert (
+            _default_root(Path('/repo/.worktrees/3967'))
+            == Path('/repo/.worktrees/.task-meta')
+        )
+
+    def test_the_shipped_default_is_the_one_this_checkout_actually_has(self):
+        """This file runs from a worktree or from the main checkout — either
+        way the shipped constant must name a tree that exists here."""
+        assert _default_root(Path(__file__).resolve().parents[2]) == DEFAULT_ROOT
+
+
+# ---------------------------------------------------------------------------
+# CLI (main), driven via subprocess.run — mirrors test_scan_task_toolcall_leaks.py
+# ---------------------------------------------------------------------------
+
+SCRIPT = Path(__file__).parent.parent / 'scan_plan_decision_pairing.py'
+
+
+def _run_cli(*args, timeout=60):
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+class TestCli:
+    """The invocation an operator actually uses, driven end to end.
+
+    Every case passes an explicit ``--root`` at ``tmp_path``. None of these
+    ever sweeps the live corpus: a bare run would, and its result would be a
+    live prevalence count that no assertion here may depend on.
+    """
+
+    def test_help_succeeds(self):
+        result = _run_cli('--help')
+
+        assert result.returncode == 0, result.stderr
+        assert '--root' in result.stdout
+        assert '--fail-on-hit' in result.stdout
+
+    def test_json_output_matches_the_in_process_scan_of_the_same_tree(self, tree):
+        """The CLI is a thin shell: it must not re-derive or re-order anything."""
+        result = _run_cli('--root', str(tree), '--json')
+
+        assert result.returncode == 0, f'stderr={result.stderr!r}'
+        assert json.loads(result.stdout) == json.loads(format_json(scan_tree(tree)))
+
+    def test_plain_report_names_the_victims_and_what_was_scanned(self, tree):
+        result = _run_cli('--root', str(tree))
+
+        assert result.returncode == 0, f'stderr={result.stderr!r}'
+        assert 'task 2' in result.stdout
+        assert 'task 10' in result.stdout
+        assert 'scanned 3' in result.stdout
+
+    def test_a_dirty_tree_exits_zero_without_fail_on_hit(self, tree):
+        """Reporting is the default posture; failing is opt-in."""
+        result = _run_cli('--root', str(tree))
+
+        assert result.returncode == 0, f'stderr={result.stderr!r}'
+
+    def test_fail_on_hit_exits_nonzero_when_the_tree_has_a_mispairing(self, tree):
+        result = _run_cli('--root', str(tree), '--fail-on-hit')
+
+        assert result.returncode != 0
+        assert 'task 10' in result.stdout
+
+    def test_fail_on_hit_exits_zero_on_a_clean_tree(self, tmp_path):
+        root = tmp_path / 'task-meta'
+        write_plan(root, '10', [CLEAN_ENTRY])
+        write_plan(root, '30', [SUPERSEDES_ONLY_ENTRY])
+
+        result = _run_cli('--root', str(root), '--fail-on-hit')
+
+        assert result.returncode == 0, f'stdout={result.stdout!r} stderr={result.stderr!r}'
+
+    def test_fail_on_hit_over_a_missing_root_exits_zero_but_says_it_read_nothing(
+        self, tmp_path
+    ):
+        """The one case where exit 0 is NOT evidence of a clean corpus.
+
+        ``--fail-on-hit`` keys on hits, and a root that does not exist produces
+        none — so the exit code alone cannot distinguish "clean" from "swept
+        nothing". That is precisely why the summary always states the scanned
+        count: an operator reading the output can see it, even though an
+        operator branching only on ``$?`` cannot. Pinned so the caveat is
+        visible rather than discovered in an incident.
+        """
+        result = _run_cli('--root', str(tmp_path / 'no-such-tree'), '--fail-on-hit')
+
+        assert result.returncode == 0
+        assert 'scanned 0' in result.stdout
+
+    def test_the_tree_is_untouched_by_the_real_cli_path(self, tree):
+        """The read-only contract must survive the invocation operators use.
+
+        Asserted against the SUBPROCESS, not just the in-process functions: a
+        CLI is where an ``--apply`` convenience or a "normalize while we're
+        here" would land, and the scanner's real inputs are live plan documents
+        a running task may be reading.
+        """
+        before = _snapshot(tree)
+
+        result = _run_cli('--root', str(tree), '--fail-on-hit')
+
+        assert result.returncode != 0
+        _assert_unchanged(tree, before)
+
+    def test_a_tree_with_unreadable_files_is_reported_not_fatal(self, tmp_path):
+        root = tmp_path / 'task-meta'
+        write_raw_plan(root, '4', '{"design_decisions": [truncated')
+        write_plan(root, '10', [MISPAIRED_ENTRY])
+        before = _snapshot(root)
+
+        result = _run_cli('--root', str(root), '--json')
+
+        assert result.returncode == 0, f'stderr={result.stderr!r}'
+        payload = json.loads(result.stdout)
+        assert [s['reason'] for s in payload['skipped']] == ['unparseable']
+        assert payload['scanned'] == 1
+        _assert_unchanged(root, before)
