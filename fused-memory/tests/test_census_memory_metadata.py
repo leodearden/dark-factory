@@ -957,6 +957,172 @@ class TestEnforceFlipPreconditionCitations:
             assert len(block['enforce_flip_preconditions']) == 3
 
 
+class TestTopicSlugConformance:
+    """Two conformance partitions, because the gate asks two questions.
+
+    Gate 3626's re-measurement recipe asks item 3 -- "the non-conforming
+    distinct-topic count" -- and item 4 -- "confirm every live canonical:true
+    record's topic passes the slug regex, in BOTH projects" -- as SEPARATE
+    checks, and PRD §159's discharge claim is stated over the canonical-scoped
+    predicate only.  A single merged column would report the exact state §159
+    records as of 2026-08-04 (legacy spellings present among ordinary records,
+    none among canonicals) as an undifferentiated failure.
+    """
+
+    # Live-measured pair: the corpus carries the snake_case spelling (8
+    # records) while the committed registry carries the hyphenated one.
+    LEGACY = 'architect_report_task_already_done_main_reachability'
+    CONFORMING = 'architect-report-task-already-done-main-reachability'
+
+    @staticmethod
+    def _block(payloads, project='dark_factory'):
+        cells = {project: {OBS: _census(payloads)}}
+        collection = 'fused_dark_factory' if project == 'dark_factory' else 'fused_reify'
+        cov = {project: _coverage(collection, len(payloads), {OBS: (len(payloads),) * 2})}
+        report = _mod.build_report(cells, cov, top_n=50)
+        return report['projects'][project]['topic_coverage']
+
+    def test_predicate_is_the_shared_one_pinned_by_identity(self):
+        # INV-5: pinned by ``is``, matching tests/test_topic_slug_namespace.py,
+        # so no second copy of the regex can drift from the rule that
+        # metadata.topic and ProceduralTopicCluster.topic_id are both
+        # validated against.
+        import fused_memory.topic_slug as ts
+
+        assert _mod.is_valid_topic_slug is ts.is_valid_topic_slug
+
+    def test_distinct_topics_are_partitioned_by_conformance(self):
+        block = self._block([
+            {'topic': self.LEGACY},
+            {'topic': self.LEGACY},
+            {'topic': self.CONFORMING},
+            {'topic': 'merge-lane'},
+        ])
+        assert block['distinct_topics'] == 3
+        assert block['slug_conforming'] == 2
+        assert block['slug_non_conforming'] == 1
+
+    def test_the_partition_counts_DISTINCT_topics_not_records(self):
+        # Recipe item 3 asks for the distinct-topic count (its 98 -> 103
+        # history is a distinct-value series), so a topic stamped on 8
+        # records is ONE non-conforming topic, not eight.
+        block = self._block([{'topic': self.LEGACY}] * 8)
+        assert block['slug_non_conforming'] == 1
+
+    def test_non_conforming_topics_are_named(self):
+        block = self._block([
+            {'topic': self.LEGACY},
+            {'topic': 'Also Bad'},
+            {'topic': 'merge-lane'},
+        ])
+        assert [r['topic'] for r in block['non_conforming_topics']] == [
+            'Also Bad', self.LEGACY,
+        ]
+        assert all('count' in r for r in block['non_conforming_topics'])
+
+    def test_the_legacy_and_conforming_spellings_coexist_as_two_topics(self):
+        block = self._block([{'topic': self.LEGACY}, {'topic': self.CONFORMING}])
+        assert block['distinct_topics'] == 2
+        assert block['slug_non_conforming'] == 1
+        assert [r['topic'] for r in block['non_conforming_topics']] == [self.LEGACY]
+
+    def test_conformance_partition_sums_to_distinct_topics(self):
+        block = self._block([
+            {'topic': self.LEGACY}, {'topic': 'ok-one'}, {'topic': 'ok-two'},
+        ])
+        assert block['slug_conforming'] + block['slug_non_conforming'] == \
+            block['distinct_topics'] == 3
+
+    def test_canonical_scoped_partition_is_separate_and_narrower(self):
+        block = self._block([
+            {'topic': self.LEGACY, 'canonical': True},
+            {'topic': 'merge-lane', 'canonical': True},
+            {'topic': 'census'},
+        ])
+        assert block['slug_non_conforming'] == 1
+        assert block['canonical_slug_conforming'] == 1
+        assert block['canonical_slug_non_conforming'] == 1
+        assert [r['topic'] for r in block['canonical_slug_non_conforming_topics']] == [
+            self.LEGACY,
+        ]
+
+    def test_the_2026_08_04_recorded_state_reports_as_two_DIFFERENT_numbers(self):
+        # THE discriminating case.  PRD §159 records legacy spellings present
+        # among ordinary records but NONE among canonicals -- item 3 non-zero,
+        # item 4 zero.  A single merged column would collapse this into one
+        # undifferentiated failure and mis-report the discharge.
+        block = self._block([
+            {'topic': self.LEGACY},
+            {'topic': self.LEGACY},
+            {'topic': self.CONFORMING, 'canonical': True},
+            {'topic': 'merge-lane', 'canonical': True},
+        ])
+        assert block['slug_non_conforming'] == 1
+        assert block['canonical_slug_non_conforming'] == 0
+        assert block['canonical_slug_non_conforming_topics'] == []
+        assert block['canonical_slug_conforming'] == 2
+
+    def test_canonical_scoped_partition_ignores_non_canonical_records(self):
+        block = self._block([{'topic': self.LEGACY}, {'topic': self.LEGACY}])
+        assert block['canonical_slug_conforming'] == 0
+        assert block['canonical_slug_non_conforming'] == 0
+
+    def test_both_partitions_are_at_project_grain(self):
+        cells = {
+            'dark_factory': {
+                PROC: _census([{'topic': self.LEGACY}]),
+                OBS: _census([{'topic': self.LEGACY, 'canonical': True}]),
+            },
+            'reify': {OBS: _census([{'topic': 'clean-slug', 'canonical': True}])},
+        }
+        cov = {
+            'dark_factory': _coverage(
+                'fused_dark_factory', 2, {PROC: (1, 1), OBS: (1, 1)},
+            ),
+            'reify': _coverage('fused_reify', 1, {OBS: (1, 1)}),
+        }
+        report = _mod.build_report(cells, cov, top_n=50)
+        df = report['projects']['dark_factory']['topic_coverage']
+        rf = report['projects']['reify']['topic_coverage']
+        # One distinct topic in dark_factory across two categories, not two.
+        assert df['slug_non_conforming'] == 1
+        assert df['canonical_slug_non_conforming'] == 1
+        assert rf['slug_non_conforming'] == 0
+        assert rf['canonical_slug_non_conforming'] == 0
+
+    def test_named_lists_follow_the_house_total_order(self):
+        block = self._block([
+            {'topic': 'Bad One'}, {'topic': 'Bad One'}, {'topic': 'Bad One'},
+            {'topic': 'Zed Bad'}, {'topic': 'Zed Bad'},
+            {'topic': 'Aaa Bad'}, {'topic': 'Aaa Bad'},
+        ])
+        rows = block['non_conforming_topics']
+        assert [(r['topic'], r['count']) for r in rows] == [
+            ('Bad One', 3), ('Aaa Bad', 2), ('Zed Bad', 2),
+        ]
+
+    def test_the_legacy_bucket_citation_carries_this_runs_re_measurement(self):
+        # A bucket recorded empty on 2026-08-04 can REGROW -- the leaf-alpha
+        # census's own 98 -> 103 history proves it does.  So the citation must
+        # carry a live number, not only a recorded status.
+        block = self._block([
+            {'topic': self.LEGACY},
+            {'topic': self.CONFORMING, 'canonical': True},
+        ])
+        entry = block['enforce_flip_preconditions'][0]
+        assert entry['id'] == 'legacy_topic_spelling_remains'
+        assert entry['status'] == 'discharged_2026_08_04'
+        live = entry['live_re_measurement']
+        assert live['slug_non_conforming'] == 1
+        assert live['canonical_slug_non_conforming'] == 0
+
+    def test_the_other_two_citations_carry_no_re_measurement(self):
+        # 3202 and 3626 are cited, not measured -- the ruling's scope note.
+        block = self._block([{'topic': 'ok'}])
+        for entry in block['enforce_flip_preconditions'][1:]:
+            assert 'live_re_measurement' not in entry
+
+
 class TestBuildReportDeterminism:
     """A re-run must produce a byte-identical artifact."""
 
