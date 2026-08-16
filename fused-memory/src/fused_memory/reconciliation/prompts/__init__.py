@@ -492,21 +492,18 @@ def render_recon_report_tool_guidance() -> str:
 # Last-resort fallback if render_recon_report_tool_guidance() raises when first
 # called (e.g. a FastMCP upgrade changes the tool-manager internals guarded by
 # get_recon_report_tool_signatures(), or recon_report's server construction
-# regresses). This is a FROZEN, hand-written snapshot of a known-good render
-# — it is not exercised on the normal path and is not re-verified against the
-# live signatures, so treat it as a crash-avoidance safety net, not a source
-# of truth: it can go stale exactly like the hand-transcribed text this task
-# replaced. Every call shape below still carries run_id, so even a stale
-# fallback cannot regress the original run_id-omission bug this task fixed.
-#
-# The dict below is the ONLY hand-maintained input to the fallback: a frozen
-# snapshot of each tool's {param_name: required_bool}, in live parameter
-# order (order matters -- it drives the rendered kwarg order). It is pushed
-# through _frozen_signature() and then the *same* _render_recon_report_tool_guidance()
-# template and render_call() the live path uses, so the fallback's WORDING can
-# no longer drift from the generated guidance -- only this data can go stale,
-# and tests/test_recon_report_guidance_drift.py::TestFallbackIsDerivedFromTheSameRenderer
-# fails loudly the moment it does.
+# regresses) -- a crash-avoidance safety net, not a source of truth in its own
+# right. It is RENDERED from _FROZEN_RECON_REPORT_SIGNATURE_SPECS below through
+# the *same* _render_recon_report_tool_guidance() template and render_call()
+# the live guidance uses, so its WORDING cannot drift from the generated
+# guidance -- there is only one prose template and one renderer. The one
+# remaining hand-maintained surface is the snapshot's parameter data (names,
+# order, required-ness): a tool signature change needs that dict updated, and
+# tests/test_recon_report_guidance_drift.py::TestFallbackIsDerivedFromTheSameRenderer
+# fails loudly until it is. Every call shape below still carries run_id (true
+# by construction: run_id is required in the snapshot for all 9 tools), so
+# even a stale snapshot cannot regress the original run_id-omission bug
+# task-2559 fixed.
 _FROZEN_RECON_REPORT_SIGNATURE_SPECS: dict[str, tuple[tuple[str, bool], ...]] = {
     'add_finding': (
         ('run_id', True),
