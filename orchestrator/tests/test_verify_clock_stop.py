@@ -28,6 +28,24 @@ def _load_package_defaults() -> dict:
     return yaml.safe_load(defaults_file.read_text())
 
 
+def _make_clock_stop_cfg(
+    heartbeat_idle_max: float = 5.0,
+    max_total_secs: float = 0.0,
+):
+    """Shared ClockStopConfig factory (the @@REIFY_CLOCK_*@@ marker family)
+    for the clock-stop behavioral test classes below — TestRunCmdClockStop,
+    TestRunCmdMaxTotalSecs, TestClockStopMessageAttribution — so a change to
+    ClockStopConfig's required fields touches one site instead of four."""
+    from orchestrator.verify import ClockStopConfig
+    return ClockStopConfig(
+        marker_stop='@@REIFY_CLOCK_STOP@@',
+        marker_heartbeat='@@REIFY_CLOCK_HEARTBEAT@@',
+        marker_start='@@REIFY_CLOCK_START@@',
+        heartbeat_idle_max=heartbeat_idle_max,
+        max_total_secs=max_total_secs,
+    )
+
+
 # ── Step-1 / Step-2: Config default tests ─────────────────────────────────────
 
 
@@ -477,20 +495,6 @@ class TestRunCmdClockStop:
     so assertions are robust to CI timing jitter.
     """
 
-    @staticmethod
-    def _make_cfg(
-        heartbeat_idle_max: float = 5.0,
-        max_total_secs: float = 0.0,
-    ):
-        from orchestrator.verify import ClockStopConfig
-        return ClockStopConfig(
-            marker_stop='@@REIFY_CLOCK_STOP@@',
-            marker_heartbeat='@@REIFY_CLOCK_HEARTBEAT@@',
-            marker_start='@@REIFY_CLOCK_START@@',
-            heartbeat_idle_max=heartbeat_idle_max,
-            max_total_secs=max_total_secs,
-        )
-
     @pytest.mark.asyncio
     @pytest.mark.timeout(15)
     async def test_happy_exclude_span(self, tmp_path: Path):
@@ -509,7 +513,7 @@ class TestRunCmdClockStop:
             'echo "@@REIFY_CLOCK_START@@ waited=1.5"; '
             'exit 0'
         )
-        cfg = self._make_cfg(heartbeat_idle_max=2.0)
+        cfg = _make_clock_stop_cfg(heartbeat_idle_max=2.0)
         rc, out, timed_out = await _run_cmd(
             cmd, tmp_path, timeout=1.0, log_path=log_path, clock_stop=cfg,
         )
@@ -530,7 +534,7 @@ class TestRunCmdClockStop:
             'echo "@@REIFY_CLOCK_STOP@@ reason=pressure"; '
             'sleep 5'
         )
-        cfg = self._make_cfg(heartbeat_idle_max=0.5)
+        cfg = _make_clock_stop_cfg(heartbeat_idle_max=0.5)
         rc, out, timed_out = await _run_cmd(
             cmd, tmp_path, timeout=10.0, log_path=log_path, clock_stop=cfg,
         )
@@ -555,7 +559,7 @@ class TestRunCmdClockStop:
             'echo "@@REIFY_CLOCK_START@@ waited=0.2"; '
             'sleep 5'
         )
-        cfg = self._make_cfg(heartbeat_idle_max=5.0)
+        cfg = _make_clock_stop_cfg(heartbeat_idle_max=5.0)
         rc, out, timed_out = await _run_cmd(
             cmd, tmp_path, timeout=1.0, log_path=log_path, clock_stop=cfg,
         )
@@ -572,7 +576,7 @@ class TestRunCmdClockStop:
         from orchestrator.verify import _run_cmd
         log_path = tmp_path / 'verify.log'
         cmd = 'sleep 5'
-        cfg = self._make_cfg()
+        cfg = _make_clock_stop_cfg()
         rc, out, timed_out = await _run_cmd(
             cmd, tmp_path, timeout=1.0, log_path=log_path, clock_stop=cfg,
         )
@@ -615,20 +619,14 @@ class TestRunCmdMaxTotalSecs:
         won't fire).  Stub emits STOP then heartbeats every 0.2s.
         Expected: timed_out is True, killed at ~0.5s cumulative stopped time.
         """
-        from orchestrator.verify import ClockStopConfig, _run_cmd
+        from orchestrator.verify import _run_cmd
         log_path = tmp_path / 'verify.log'
         cmd = (
             'echo "@@REIFY_CLOCK_STOP@@ reason=pressure"; '
             'for i in $(seq 1 20); do sleep 0.2; echo "@@REIFY_CLOCK_HEARTBEAT@@ waited=$i"; done; '
             'exit 0'
         )
-        cfg = ClockStopConfig(
-            marker_stop='@@REIFY_CLOCK_STOP@@',
-            marker_heartbeat='@@REIFY_CLOCK_HEARTBEAT@@',
-            marker_start='@@REIFY_CLOCK_START@@',
-            heartbeat_idle_max=5.0,
-            max_total_secs=0.5,
-        )
+        cfg = _make_clock_stop_cfg(heartbeat_idle_max=5.0, max_total_secs=0.5)
         rc, out, timed_out = await _run_cmd(
             cmd, tmp_path, timeout=10.0, log_path=log_path, clock_stop=cfg,
         )
@@ -642,7 +640,7 @@ class TestRunCmdMaxTotalSecs:
         We run for only 1s total (timeout=1.5, but stub does STOP + quick
         heartbeat + START + exit 0) to keep the test fast.  Confirms 0 == no cap.
         """
-        from orchestrator.verify import ClockStopConfig, _run_cmd
+        from orchestrator.verify import _run_cmd
         log_path = tmp_path / 'verify.log'
         cmd = (
             'echo "@@REIFY_CLOCK_STOP@@ reason=pressure"; '
@@ -652,13 +650,7 @@ class TestRunCmdMaxTotalSecs:
             'echo "@@REIFY_CLOCK_START@@ waited=0.4"; '
             'exit 0'
         )
-        cfg = ClockStopConfig(
-            marker_stop='@@REIFY_CLOCK_STOP@@',
-            marker_heartbeat='@@REIFY_CLOCK_HEARTBEAT@@',
-            marker_start='@@REIFY_CLOCK_START@@',
-            heartbeat_idle_max=5.0,
-            max_total_secs=0.0,  # unlimited
-        )
+        cfg = _make_clock_stop_cfg(heartbeat_idle_max=5.0, max_total_secs=0.0)  # unlimited
         rc, out, timed_out = await _run_cmd(
             cmd, tmp_path, timeout=3.0, log_path=log_path, clock_stop=cfg,
         )
@@ -676,20 +668,6 @@ class TestClockStopMessageAttribution:
     this file asserts on the MESSAGE content of a clock-stop timeout — only
     on `timed_out`.
     """
-
-    @staticmethod
-    def _make_cfg(
-        heartbeat_idle_max: float = 5.0,
-        max_total_secs: float = 0.0,
-    ):
-        from orchestrator.verify import ClockStopConfig
-        return ClockStopConfig(
-            marker_stop='@@REIFY_CLOCK_STOP@@',
-            marker_heartbeat='@@REIFY_CLOCK_HEARTBEAT@@',
-            marker_start='@@REIFY_CLOCK_START@@',
-            heartbeat_idle_max=heartbeat_idle_max,
-            max_total_secs=max_total_secs,
-        )
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(15)
@@ -723,7 +701,7 @@ class TestClockStopMessageAttribution:
                 tmp_path,
                 timeout=5400.0,
                 log_path=log_path,
-                clock_stop=self._make_cfg(),
+                clock_stop=_make_clock_stop_cfg(),
             )
 
         assert timed_out is True, f'Expected timed_out=True; got timed_out={timed_out}'
@@ -753,7 +731,7 @@ class TestClockStopMessageAttribution:
         from orchestrator.verify import _run_cmd
         log_path = tmp_path / 'verify.log'
         cmd = 'echo "starting"; sleep 5'
-        cfg = self._make_cfg(heartbeat_idle_max=5.0)
+        cfg = _make_clock_stop_cfg(heartbeat_idle_max=5.0)
         rc, out, timed_out = await _run_cmd(
             cmd, tmp_path, timeout=1.0, log_path=log_path, clock_stop=cfg,
         )
@@ -777,7 +755,7 @@ class TestClockStopMessageAttribution:
             'echo "@@REIFY_CLOCK_STOP@@ reason=pressure"; '
             'sleep 5'
         )
-        cfg = self._make_cfg(heartbeat_idle_max=0.5)
+        cfg = _make_clock_stop_cfg(heartbeat_idle_max=0.5)
         rc, out, timed_out = await _run_cmd(
             cmd, tmp_path, timeout=10.0, log_path=log_path, clock_stop=cfg,
         )
@@ -811,7 +789,7 @@ class TestClockStopMessageAttribution:
             'for i in $(seq 1 20); do sleep 0.2; echo "@@REIFY_CLOCK_HEARTBEAT@@ waited=$i"; done; '
             'exit 0'
         )
-        cfg = self._make_cfg(heartbeat_idle_max=5.0, max_total_secs=0.5)
+        cfg = _make_clock_stop_cfg(heartbeat_idle_max=5.0, max_total_secs=0.5)
         rc, out, timed_out = await _run_cmd(
             cmd, tmp_path, timeout=10.0, log_path=log_path, clock_stop=cfg,
         )
@@ -893,7 +871,7 @@ class TestClockStopMessageAttribution:
         from orchestrator.verify import _run_cmd
         log_path = tmp_path / 'verify.log'
         cmd = 'echo "starting"; sleep 5'
-        cfg = self._make_cfg(heartbeat_idle_max=5.0)
+        cfg = _make_clock_stop_cfg(heartbeat_idle_max=5.0)
         with caplog.at_level(_logging.WARNING, logger='orchestrator.verify'):
             rc, out, timed_out = await _run_cmd(
                 cmd, tmp_path, timeout=1.0, log_path=log_path, clock_stop=cfg,
