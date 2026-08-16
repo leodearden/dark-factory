@@ -443,6 +443,7 @@ def build_report(
     canonical_uniqueness_enforced: bool | None = None,
     registry: Any = None,
     registry_error: str | None = None,
+    history: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble the JSON census report from per-(project, category) cells.
 
@@ -461,6 +462,10 @@ def build_report(
             function. Three-valued (``None`` = could not be read); see
             :func:`read_canonical_uniqueness_enforced`, which is what ``_run``
             passes.
+        history: the loaded coverage history, used to compute the
+            ``coverage_trend`` block. ``None`` (no history supplied) is
+            disclosed in that block's reason rather than rendered as a flat
+            trend -- see :func:`build_coverage_diff`.
 
     Returns:
         A JSON-serialisable dict with per-cell counts, per-project and
@@ -509,7 +514,7 @@ def build_report(
             project_totals, registry,
         )
 
-    return {
+    report = {
         # v2: value tables are the complete population (v1 capped them at
         # top_n, which could truncate the JSON while coverage read complete);
         # top_n is now the markdown render cap only. Coverage cells gained
@@ -529,7 +534,9 @@ def build_report(
         # grand-total 'topic_coverage' block carries the stamping RATE and
         # the three-way canonical partition (exactly one / zero / more than
         # one per topic), computed at PROJECT grain to match 3198's
-        # scope-wide uniqueness probe.
+        # scope-wide uniqueness probe. New top-level 'registry_coverage'
+        # (the accountable 32-topic target) and 'coverage_trend' (this run
+        # against the most recent prior run in the committed history).
         'schema_version': 4,
         'params': {
             'projects': sorted(cells),
@@ -547,8 +554,14 @@ def build_report(
         # at the top level rather than under any one project.
         'registry_coverage': registry_coverage,
         'registry_error': registry_error,
+        # Placeholder so the key keeps its position in the artifact; filled
+        # below, since the diff is computed FROM the finished report (one
+        # distillation path -- see _coverage_run_row).
+        'coverage_trend': None,
         'coverage': _build_coverage(coverage),
     }
+    report['coverage_trend'] = build_coverage_diff(report, history)
+    return report
 
 
 #: What still stands between here and flipping ``memory_metadata.enforce``.
@@ -1056,7 +1069,7 @@ def _registry_history_slices(
     return per_project, {k: digest[k] for k in sorted(digest)}
 
 
-def _coverage_run_row(report: dict[str, Any], *, stamp: str) -> dict[str, Any]:
+def _coverage_run_row(report: dict[str, Any], *, stamp: str | None = None) -> dict[str, Any]:
     """Distil one census report into a COMPACT persisted run.
 
     What this row may NOT hold is the load-bearing half. The history is
@@ -1076,7 +1089,11 @@ def _coverage_run_row(report: dict[str, Any], *, stamp: str) -> dict[str, Any]:
     appear in it.
 
     *stamp* is INJECTED, never read from the clock here, so a run row is
-    deterministic and testable and the artifact stays reproducible.
+    deterministic and testable and the artifact stays reproducible. It is
+    optional because :func:`build_coverage_diff` distils the CURRENT report
+    through this same function purely to compare it -- one distillation
+    path, so the persisted row and the trended row can never disagree about
+    what a column means.
     """
     registry_by_project, registry_topics = _registry_history_slices(
         report.get('registry_coverage'),
@@ -1143,6 +1160,202 @@ def append_coverage_run(
             'oldest_retained_stamp': kept[0]['stamp'] if kept else None,
         },
         'runs': kept,
+    }
+
+
+#: How the regrowth signal's bound is disclosed to a reader. It is scoped
+#: to the committed registry because that is the only per-topic state the
+#: history may bound-safely carry; saying so is not optional, since a
+#: silently narrowed signal reads as a corpus-wide all-clear.
+_REGROWTH_SCOPE_NOTE = (
+    'Scoped to the committed topic registry (the accountable target set) -- '
+    'the only per-topic state the nightly history carries, since the live '
+    'distinct-topic population is unbounded. Corpus-wide topic movement is '
+    'trended through the distinct_topics / slug_non_conforming columns '
+    'instead.'
+)
+
+
+def _regrowth_unavailable(reason: str) -> dict[str, Any]:
+    """A regrowth block that measures nothing, and says which nothing."""
+    return {
+        'available': False,
+        'scope': 'registry',
+        'scope_note': _REGROWTH_SCOPE_NOTE,
+        'reason': reason,
+        'new_topics': [],
+        'grown_topics': [],
+        'lost_canonical_topics': [],
+    }
+
+
+def _topic_regrowth(
+    before: dict[str, Any],
+    after: dict[str, Any],
+) -> dict[str, Any]:
+    """Name the per-topic classes that MOVED between two registry digests.
+
+    Both sides must exist. A missing baseline digest would otherwise report
+    every registry target as "newly appearing" the first time the gauge
+    runs -- a fabricated signal indistinguishable from a genuine 32-topic
+    regression -- and a missing current digest would report silence, which
+    reads as "nothing moved" rather than "nothing was measured" (INV-2).
+    """
+    if not before:
+        return _regrowth_unavailable(
+            'the baseline run carries no registry digest, so nothing can be '
+            'compared against it',
+        )
+    if not after:
+        return _regrowth_unavailable(
+            'this run produced no registry digest (the gauge did not run)',
+        )
+
+    def _split(key: str) -> tuple[str, str]:
+        project_id, _, topic = key.partition('::')
+        return project_id, topic
+
+    new_topics = []
+    grown_topics = []
+    lost_canonical_topics = []
+    for key in sorted(after):
+        project_id, topic = _split(key)
+        now = after[key]
+        was = before.get(key)
+        if was is None:
+            new_topics.append({
+                'project_id': project_id,
+                'topic': topic,
+                'records': now.get('records'),
+                'canonical': now.get('canonical'),
+            })
+            continue
+        if (now.get('records') or 0) > (was.get('records') or 0):
+            grown_topics.append({
+                'project_id': project_id,
+                'topic': topic,
+                'records_before': was.get('records'),
+                'records_after': now.get('records'),
+            })
+        # The actionable REGRESSION: a target that was met and no longer is.
+        if (was.get('canonical') or 0) > 0 and (now.get('canonical') or 0) == 0:
+            lost_canonical_topics.append({
+                'project_id': project_id,
+                'topic': topic,
+                'canonical_before': was.get('canonical'),
+                'canonical_after': now.get('canonical'),
+            })
+    return {
+        'available': True,
+        'scope': 'registry',
+        'scope_note': _REGROWTH_SCOPE_NOTE,
+        'new_topics': new_topics,
+        'grown_topics': grown_topics,
+        'lost_canonical_topics': lost_canonical_topics,
+    }
+
+
+def _column_delta(before: Any, after: Any) -> dict[str, Any]:
+    """One trended column: both endpoints and the movement between them.
+
+    ``delta`` is ``None`` -- never 0 -- when either endpoint is unmeasured.
+    "We cannot compare these" is a different claim from "nothing changed",
+    and only one of them is a measurement.
+    """
+    comparable = isinstance(before, (int, float)) and isinstance(after, (int, float))
+    delta: Any = None
+    if comparable and not isinstance(before, bool) and not isinstance(after, bool):
+        delta = after - before
+        if isinstance(delta, float):
+            delta = round(delta, 4)
+    return {'before': before, 'after': after, 'delta': delta}
+
+
+def _no_baseline_diff(reason: str) -> dict[str, Any]:
+    """A trend with nothing behind it -- stated, not rendered as zeros."""
+    return {
+        'baseline': None,
+        'baseline_reason': reason,
+        # Deliberately EMPTY rather than a zero-filled column set: a table
+        # of zeros reads as "coverage is flat", which is a claim this run
+        # cannot make (task 3291's fabricated-baseline failure).
+        'projects': {},
+        'topic_regrowth': _regrowth_unavailable(reason),
+    }
+
+
+def build_coverage_diff(
+    current: dict[str, Any],
+    history: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Diff this run's coverage against the most recent prior run.
+
+    PURE: no I/O and no clock, so it is fully unit-testable and a re-run
+    over the same inputs produces a byte-identical block. Neither argument
+    is mutated.
+
+    Args:
+        current: the report being built (its ``projects``,
+            ``topic_coverage`` and ``registry_coverage`` blocks).
+        history: a history as returned by :func:`load_coverage_history`.
+            ``None`` means none was supplied -- disclosed DISTINCTLY from an
+            empty one, because "nobody asked for a trend" and "there is no
+            prior run yet" are different facts about the same null.
+
+    Returns:
+        ``{baseline, baseline_reason, projects, topic_regrowth}``. Every
+        shortfall is named rather than defaulted: no baseline yields no
+        deltas at all, an unmeasured axis yields a ``null`` delta, a project
+        seen for the first time is ``new_project`` rather than a delta from
+        zero, and one that vanished is ``absent_from_this_run`` rather than
+        silently dropped out of the trend.
+    """
+    if history is None:
+        return _no_baseline_diff(
+            'no coverage history was supplied to this build -- the trend was '
+            'not requested, so no baseline was sought',
+        )
+    runs = list(history.get('runs') or [])
+    if not runs:
+        return _no_baseline_diff(
+            'no prior run is recorded in the coverage history -- this is the '
+            'first census in it, so there is nothing to compare against',
+        )
+
+    baseline = runs[-1]
+    row = _coverage_run_row(current)
+    before_projects = baseline.get('projects') or {}
+    after_projects = row.get('projects') or {}
+
+    projects: dict[str, Any] = {}
+    for project_id in sorted(set(before_projects) | set(after_projects)):
+        if project_id not in before_projects:
+            projects[project_id] = {'status': 'new_project'}
+            continue
+        if project_id not in after_projects:
+            # Named, not dropped: a project silently leaving the trend looks
+            # identical to one that never existed.
+            projects[project_id] = {'status': 'absent_from_this_run'}
+            continue
+        before_row = before_projects[project_id]
+        after_row = after_projects[project_id]
+        projects[project_id] = {
+            'status': 'compared',
+            'columns': {
+                column: _column_delta(before_row.get(column), after_row.get(column))
+                for column in (*_HISTORY_COVERAGE_COLUMNS, *_HISTORY_REGISTRY_COLUMNS)
+            },
+        }
+
+    return {
+        'baseline': baseline.get('stamp'),
+        'baseline_reason': (
+            f'compared against the most recent prior run ({baseline.get("stamp")})'
+        ),
+        'projects': projects,
+        'topic_regrowth': _topic_regrowth(
+            baseline.get('registry_topics') or {}, row.get('registry_topics') or {},
+        ),
     }
 
 
