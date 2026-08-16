@@ -1426,6 +1426,29 @@ def _setup_host_text() -> str:
     return SETUP_HOST_PATH.read_text(encoding="utf-8")
 
 
+def _anchor_index(text: str, anchor: str, what: str) -> int:
+    """`text.index(anchor)`, but failing with a message that explains itself.
+
+    Every slice below is anchored on a literal from setup-host.sh, and a bare
+    `str.index` raises `ValueError: substring not found` from inside a helper
+    when one of those literals is edited away. That error names neither the
+    file nor the missing statement, and — because the slicing helpers are
+    shared — it would ERROR OUT roughly fifteen behavioural tests in this
+    module at once, burying whichever guard was written to explain the change.
+
+    Raising here instead turns that into a single legible failure, and keeps
+    the guards downstream from being unreachable behind an exception thrown
+    before they run.
+    """
+    assert anchor in text, (
+        f"{SETUP_HOST_PATH}: {what} is gone, so this module can no longer "
+        f"locate the section it tests. Expected the statement:\n    {anchor}\n"
+        "Retarget the anchor deliberately — every behavioural test below "
+        "slices from it."
+    )
+    return text.index(anchor)
+
+
 def _orchestrator_gate_block(text: str) -> str:
     """Slice the gate's actual `if ... fi` construct out of setup-host.sh.
 
@@ -1442,7 +1465,9 @@ def _orchestrator_gate_block(text: str) -> str:
     script. End: the first column-0 `fi` after it — the gate's own `if` closes
     there, and every `fi` nested inside it is indented.
     """
-    mention = text.index("check_orchestrator_unit_parity.py")
+    mention = _anchor_index(
+        text, "check_orchestrator_unit_parity.py", "the parity gate's invocation"
+    )
     start = text.rfind("\n", 0, mention) + 1
     end = text.index("\nfi\n", mention) + len("\nfi\n")
     return text[start:end]
@@ -1459,7 +1484,7 @@ def _orchestrator_install_block(text: str) -> str:
     are invisible to it and the slice still terminates at the install
     construct's close.
     """
-    first_cp = text.index(_INSTALL_LOOP_CP)
+    first_cp = _anchor_index(text, _INSTALL_LOOP_CP, "the install loop's copy")
     start = text.rindex("\nif ", 0, first_cp) + 1
     end = text.index("\nfi\n", first_cp) + len("\nfi\n")
     return text[start:end]
@@ -1499,8 +1524,10 @@ def test_parity_gate_runs_BEFORE_the_units_are_copied():
     """
     text = _setup_host_text()
 
-    gate_at = text.index("check_orchestrator_unit_parity.py")
-    first_cp_at = text.index(_INSTALL_LOOP_CP)
+    gate_at = _anchor_index(
+        text, "check_orchestrator_unit_parity.py", "the parity gate's invocation"
+    )
+    first_cp_at = _anchor_index(text, _INSTALL_LOOP_CP, "the install loop's copy")
 
     assert gate_at < first_cp_at, (
         "check_orchestrator_unit_parity.py is invoked at offset "
@@ -1561,10 +1588,18 @@ def _installer_section() -> str:
     From the line carrying the first mention of the checker through the `fi`
     that closes the install construct — endpoints derived, so this follows a
     reflow of the block instead of pinning one.
+
+    Both anchors go through _anchor_index: every behavioural test below runs
+    this slice, so a bare `str.index` losing one of them would error out the
+    whole set with `ValueError: substring not found` instead of failing once,
+    legibly, on the literal that moved.
     """
     text = _setup_host_text()
-    start = text.rfind("\n", 0, text.index("check_orchestrator_unit_parity.py")) + 1
-    first_cp = text.index(_INSTALL_LOOP_CP)
+    mention = _anchor_index(
+        text, "check_orchestrator_unit_parity.py", "the parity gate's invocation"
+    )
+    start = text.rfind("\n", 0, mention) + 1
+    first_cp = _anchor_index(text, _INSTALL_LOOP_CP, "the install loop's copy")
     end = text.index("\nfi\n", first_cp) + len("\nfi\n")
     return text[start:end]
 
