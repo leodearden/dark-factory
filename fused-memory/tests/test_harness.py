@@ -16562,3 +16562,68 @@ class TestPerRunConfigDirGC:
             await harness._recover_one_run(run, lock_holder=None, lock_age=None)
 
         gc_spy.assert_any_call(journal.data_dir, run.id)
+
+
+# ── _in_backlog_mode (task 3049) ──────────────────────────────────────
+#
+# The backlog-mode threshold must have exactly ONE definition.  Extracting it
+# from BacklogIterator.should_iterate onto the harness lets _maybe_remediate's
+# deferral gate call the SAME predicate, so the condition that defers
+# remediation is provably identical to the condition that put the project into
+# chunked mode in the first place.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('buffer_size', 'expected'),
+    [
+        (0, False),
+        (14, False),
+        (15, False),   # exactly at threshold — strict >, so NOT backlog mode
+        (16, True),
+        (400, True),
+    ],
+)
+async def test_in_backlog_mode_uses_a_strict_threshold(
+    journal, event_buffer, mock_memory_service, buffer_size, expected,
+):
+    """True iff buffer size > buffer_size_threshold * opus_threshold_ratio."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness.config.buffer_size_threshold = 10
+    harness.config.opus_threshold_ratio = 1.5  # threshold = 15
+    harness.buffer.get_buffer_stats = AsyncMock(return_value={'size': buffer_size})
+
+    assert await harness._in_backlog_mode('reify') is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('buffer_size', [0, 14, 15, 16, 400])
+async def test_should_iterate_delegates_to_in_backlog_mode(
+    journal, event_buffer, mock_memory_service, buffer_size,
+):
+    """BacklogIterator.should_iterate stays behaviourally identical.
+
+    Straddling the threshold, the iterator's answer and the harness predicate
+    agree exactly — so the existing should_iterate expectations elsewhere in
+    this suite still hold after the extraction.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness.config.buffer_size_threshold = 10
+    harness.config.opus_threshold_ratio = 1.5
+    harness.buffer.get_buffer_stats = AsyncMock(return_value={'size': buffer_size})
+
+    iterator = BacklogIterator(harness.config, harness.journal, harness.buffer, harness)
+    assert await iterator.should_iterate('reify') == await harness._in_backlog_mode('reify')
+
+
+@pytest.mark.asyncio
+async def test_in_backlog_mode_treats_a_missing_size_as_not_backlogged(
+    journal, event_buffer, mock_memory_service,
+):
+    """A stats dict with no 'size' key must not crash the caller."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness.config.buffer_size_threshold = 10
+    harness.config.opus_threshold_ratio = 1.5
+    harness.buffer.get_buffer_stats = AsyncMock(return_value={})
+
+    assert await harness._in_backlog_mode('reify') is False
