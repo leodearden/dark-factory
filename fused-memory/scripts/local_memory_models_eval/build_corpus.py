@@ -1667,6 +1667,15 @@ def _handle_broken_pipe() -> int:
     unusable. Left uncaught it would surface as a raw traceback where every
     other failure in this CLI prints a single ``error: ...`` line.
 
+    THE one recovery for a closed stdout, reached from all three places the
+    failure can surface, so the remedy is decided once rather than per-caller:
+    :func:`main`'s ``except`` (a write large enough to flush mid-run and fail
+    in-band), :func:`_cli`'s explicit flush (a short write that stayed buffered
+    and would otherwise fail only at interpreter shutdown), and ``_cli``'s
+    ``SystemExit`` handler (``argparse``'s ``--help`` text, buffered and never
+    reaching ``main()``'s ``try`` at all). All three converge on the same
+    ``error: ...`` line and the same :data:`EXIT_RUN_FAILED`.
+
     Applies the dup2 dance from the interpreter docs' "Note on SIGPIPE" before
     returning: Python flushes ``sys.stdout`` during interpreter finalization,
     and if fd 1 still points at the closed pipe, that flush raises a SECOND,
@@ -1752,12 +1761,36 @@ def _cli() -> int:
     test suite drives and its contract is "parse and run, return a code";
     interpreter-lifecycle concerns belong at the process boundary, which is
     this function and the ``__main__`` guard that calls it.
+
+    ``argparse`` needs the second handler. ``--help`` and an unrecognized flag
+    both leave :func:`_build_parser`'s ``parse_args`` via ``SystemExit`` — which
+    happens inside ``main()`` but BEFORE its ``try``, and propagates past
+    ``except BrokenPipeError`` because nothing was raised in-band. Their text is
+    still buffered at that point, so without flushing here ``--help | head``
+    lands in the same deferred exit-120 as the short verdict.
+
+    That handler RE-RAISES on a successful flush rather than returning a
+    normalised code. ``SystemExit.code`` may be ``None`` (which the interpreter
+    treats as 0) or a non-int (which it prints to stderr before exiting 1);
+    re-raising delegates every one of those shapes back to the interpreter that
+    defines them, instead of re-implementing the mapping here where it could
+    drift. So ``--help`` still exits 0 and a bad flag still exits 2, unchanged.
+
+    ``SystemExit`` specifically, never a bare ``except BaseException``: that
+    would swallow ``KeyboardInterrupt`` and genuine builder bugs behind a tidy
+    message — the same silent fail-soft ``main()``'s own comment argues against.
     """
     try:
         code = main()
         sys.stdout.flush()
     except BrokenPipeError:
         return _handle_broken_pipe()
+    except SystemExit:
+        try:
+            sys.stdout.flush()
+        except BrokenPipeError:
+            return _handle_broken_pipe()
+        raise
     return code
 
 
