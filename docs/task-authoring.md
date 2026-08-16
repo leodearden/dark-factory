@@ -1056,7 +1056,10 @@ script's "no reader anywhere" grep argument covers only its six built-in
 default keys, so when you re-run it with your own `--keys` it validates
 them first and refuses an already-`x_`-prefixed key, a typed
 `TaskMetadata` field or a Tier-A blessed key — its read-back proves the
-rename *landed*, never that the rename was *safe*.
+rename *landed*, never that the rename was *safe*. Each run also writes
+its own timestamped pre-write snapshot and refuses to overwrite an
+existing one, so the re-run prescribed here cannot cost you the original
+row.
 
 **The write-path blocker** is why the third row is still open, and it
 bounds both of the others: `update_task` rejects any metadata payload

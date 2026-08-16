@@ -10,6 +10,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+#### `migrate_task_metadata_to_x_namespace.py`: a snapshot per run, and a recovery pointer on every post-write exit (task 4125)
+
+**Behaviour change, operator-visible.** Two changes to the pre-write snapshot
+`--apply` takes, and one to what a failed run tells you.
+
+**The default `--backup-path` is now stamped per run** —
+`/tmp/task-<id>-metadata-before-<UTC-stamp>.json` (`%Y%m%dT%H%M%SZ`, the stamp
+the rest of the repo already uses) rather than one fixed
+`/tmp/task-<id>-metadata-before.json`. `docs/task-authoring.md` §8 prescribes a
+mechanical per-task re-run of this script with different `--keys`, and under
+the fixed path run 2 wrote its already-partially-migrated row straight over run
+1's TRUE pre-migration row — silently destroying the one artifact the SAFETY
+section exists to produce, at the only moment it is wanted.
+
+**`write_backup` now REFUSES an occupied path** instead of overwriting it (an
+exclusive create, so the existence check and the create are one atomic
+operation with no window for a concurrent run). This is the behaviour change to
+flag: an operator reusing an explicit `--backup-path` across runs now gets the
+run refused — `FileExistsError`, which the existing `except OSError` turns into
+"Refusing to write without a recoverable snapshot" and exit 1 *before*
+`update_task` is called — where previously the earlier snapshot was lost with
+no sign. Move the file aside, or pass a different `--backup-path`.
+
+**Every exit after the write commits now names that snapshot**, including the
+one where the read-back itself crashes. `_fetch_task` on an unexpected payload
+(or `_coerce_metadata` on a non-dict blob) used to unwind out of `main_async`
+as a bare stack trace with the write already committed and UNVERIFIED — the
+recovery pointer was printed only on the reported-drift exit, so it was absent
+from exactly the path where the operator has least to go on. The sentence now has a single
+source (`recovery_pointer`) that both exits print verbatim, and the traceback
+is kept and printed first: the diagnosis is not traded for the instruction.
+
+Extends the SAFETY section added with the script itself in task 3697 (below).
+
 #### `update_memory`'s default allowlists now admit `curator-` on both arms (esc-3524-1)
 
 **Behaviour change, operator-visible.** `Mem0UpdateConfig`'s
