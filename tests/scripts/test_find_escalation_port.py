@@ -296,3 +296,199 @@ def test_fake_systemd_helper_round_trips_through_known_project_roots(
     assert (parent / "proj-a").resolve() in got
     # Nothing from the trailing quoted token leaked into the parsed root list.
     assert not any("reify-audit" in str(p) for p in got)
+
+
+# ---------------------------------------------------------------------------
+# known_project_roots — systemd-env branch, ordering, failure swallowing
+# ---------------------------------------------------------------------------
+
+
+def test_env_roots_are_comma_split_and_ordered_before_the_glob(
+    fep: types.ModuleType, fake_systemd, tmp_path: pathlib.Path
+) -> None:
+    """DASHBOARD_KNOWN_PROJECT_ROOTS is comma-split, and its roots come FIRST.
+
+    Ordering is a real contract, not an accident: the live unit env is the
+    AUTHORITATIVE source of what projects exist, and the sibling glob is the
+    documented fallback for what it misses. main() surveys roots in list order, so
+    the env's spelling of a project is the one that reaches the evidence table.
+
+    The two env roots are created OUTSIDE the sibling parent so their presence is
+    attributable to the env branch alone — the glob cannot reach them.
+
+    MEASURED RED at base ``fc6f048b55``, scratch mutation reverted before commit:
+    moving the env merge to AFTER the sibling glob (i.e. performing the
+    ``roots += [...glob...]`` first) — RED::
+
+        E  AssertionError: env roots must precede glob roots: env at [4, 5], glob at [0, 2, 3]
+        E  assert 5 < 0
+        E   +  where 5 = max([4, 5])
+        E   +  and   0 = min([0, 2, 3])
+
+    That same mutation also reddened
+    ``test_a_root_reachable_by_both_sources_appears_exactly_once`` (the retained
+    spelling flipped from the env alias to the glob's canonical path) — recorded
+    because it is evidence the two tests pin ONE contract from two directions, not
+    two independent coincidences.
+    """
+    parent, df_root = _project_tree(tmp_path)
+    env_a = tmp_path / "outside" / "env-a"
+    env_b = tmp_path / "outside" / "env-b"
+    for d in (env_a, env_b):
+        d.mkdir(parents=True)
+
+    fake_systemd([env_a, env_b])
+    roots = fep.known_project_roots(df_root)
+    resolved = [p.resolve() for p in roots]
+
+    # Comma-split: both listed roots survive as distinct entries.
+    assert env_a.resolve() in resolved
+    assert env_b.resolve() in resolved
+
+    glob_resolved = {(parent / n).resolve() for n in ("dark-factory", "proj-a", "target")}
+    env_at = [i for i, p in enumerate(resolved) if p in {env_a.resolve(), env_b.resolve()}]
+    glob_at = [i for i, p in enumerate(resolved) if p in glob_resolved]
+    assert glob_at, "sibling glob contributed nothing — fixture is not exercising the merge"
+    assert max(env_at) < min(glob_at), (
+        f"env roots must precede glob roots: env at {env_at}, glob at {glob_at}"
+    )
+
+
+def test_empty_comma_segments_do_not_become_a_cwd_entry(
+    fep: types.ModuleType, fake_systemd, tmp_path: pathlib.Path
+) -> None:
+    """A trailing or doubled comma is dropped by the ``if p`` filter.
+
+    Without it, ``"".split(",")`` segments become ``Path("")`` — which is
+    ``Path('.')``, the CURRENT WORKING DIRECTORY. That is not a harmless no-op: '.'
+    is a real directory, so it survives the ``r.is_dir()`` filter, and main() would
+    then look for a config in whatever directory the caller happened to run from
+    and silently fold its escalation port into the survey.
+
+    MEASURED RED at base ``fc6f048b55``, scratch mutation reverted before commit:
+    dropping the ``if p`` guard from the comma split (line 65) — RED::
+
+        E  AssertionError: an empty comma segment leaked in as Path('.'): [PosixPath('.')]
+        E  assert [PosixPath('.')] == []
+        E    Left contains one more item: PosixPath('.')
+    """
+    _parent, df_root = _project_tree(tmp_path)
+    env_a = tmp_path / "outside" / "env-a"
+    env_a.mkdir(parents=True)
+
+    # "<env_a>,,"  — one doubled comma and one trailing comma.
+    fake_systemd([str(env_a), "", ""])
+    roots = fep.known_project_roots(df_root)
+
+    cwd_entries = [p for p in roots if p == pathlib.Path(".")]
+    assert cwd_entries == [], f"an empty comma segment leaked in as Path('.'): {cwd_entries}"
+    assert env_a.resolve() in {p.resolve() for p in roots}
+
+
+def test_env_roots_that_are_not_existing_directories_are_dropped(
+    fep: types.ModuleType, fake_systemd, tmp_path: pathlib.Path
+) -> None:
+    """A stale unit env cannot inject a phantom project.
+
+    This is the dedup loop's ``r.is_dir()`` filter (line 77) — the one step-2
+    measured as unobservable through the glob branch, because the glob comprehension
+    filters non-directories of its own. The env branch does NOT, so this is the
+    filter's real job: a decommissioned project still listed in the unit env, and a
+    listed path that is a FILE rather than a directory, must both drop out rather
+    than reach find_config().
+
+    MEASURED RED at base ``fc6f048b55``, scratch mutation reverted before commit:
+    dropping ``and r.is_dir()`` from the dedup loop (line 77) — RED, and note this is
+    the SAME mutation step-2 observed green through the glob branch::
+
+        E  AssertionError: a nonexistent env root became a project root
+        E  assert PosixPath('.../outside/decommissioned') not in {PosixPath('.../dark-factory'),
+        E    PosixPath('.../outside/still-here'), PosixPath('.../proj-a'), ...}
+    """
+    parent, df_root = _project_tree(tmp_path)
+    phantom = tmp_path / "outside" / "decommissioned"  # never created
+    a_file = parent / "loose.txt"  # exists, but is not a directory
+    real = tmp_path / "outside" / "still-here"
+    real.mkdir(parents=True)
+
+    fake_systemd([phantom, a_file, real])
+    resolved = {p.resolve() for p in fep.known_project_roots(df_root)}
+
+    assert phantom.resolve() not in resolved, "a nonexistent env root became a project root"
+    assert a_file.resolve() not in resolved, "a non-directory env root became a project root"
+    assert real.resolve() in resolved
+
+
+def test_a_root_reachable_by_both_sources_appears_exactly_once(
+    fep: types.ModuleType, fake_systemd, tmp_path: pathlib.Path
+) -> None:
+    """Dedup keys on ``str(r.resolve())``, and the FIRST-SEEN spelling is retained.
+
+    The realistic collision is not a byte-identical repeat — it is the unit env
+    naming a project through a symlink alias while the glob finds its canonical
+    sibling path. A duplicate here would be a live bug in main(): the same project's
+    claimed port would be surveyed twice, and with --exclude-root only one of the two
+    spellings would match, so the excluded repo's own port would still be treated as
+    claimed.
+
+    The retained spelling is the ENV's (unresolved) one, because the env branch runs
+    first — pinned as observed behaviour, and consistent with the ordering contract
+    above.
+
+    MEASURED RED at base ``fc6f048b55``: the same "env merge moved AFTER the glob"
+    scratch mutation the ordering test names also reddens this one — RED::
+
+        E  AssertionError: expected the first-seen (env, unresolved) spelling to be retained
+        E  assert PosixPath('.../target') == PosixPath('.../outside/target-alias')
+
+    The dedup itself (``len(hits) == 1``) stayed green under that mutation, which is
+    the point: dedup keys on the RESOLVED path, so it survives a reordering — only
+    the retained spelling moves. Both halves are asserted because only the first
+    protects main() from surveying one project twice.
+    """
+    parent, df_root = _project_tree(tmp_path)
+    target = parent / "target"
+    alias = tmp_path / "outside" / "target-alias"
+    alias.parent.mkdir(parents=True)
+    alias.symlink_to(target, target_is_directory=True)
+
+    fake_systemd([alias])
+    roots = fep.known_project_roots(df_root)
+
+    hits = [p for p in roots if p.resolve() == target.resolve()]
+    assert len(hits) == 1, f"project surveyed twice under two spellings: {hits}"
+    assert hits[0] == alias, "expected the first-seen (env, unresolved) spelling to be retained"
+
+
+@pytest.mark.parametrize(
+    "boom",
+    [
+        pytest.param(FileNotFoundError("no systemctl on PATH"), id="binary-missing"),
+        pytest.param(
+            subprocess.TimeoutExpired(cmd=["systemctl"], timeout=10), id="hung-systemd"
+        ),
+    ],
+)
+def test_systemctl_failure_falls_back_to_the_full_sibling_set(
+    fep: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, boom
+) -> None:
+    """Both failure modes the bare ``except Exception`` swallows leave discovery whole.
+
+    TimeoutExpired is not hypothetical padding: the call passes ``timeout=10``, which
+    exists precisely because a hung systemd is a real state, and it raises rather than
+    returning a CompletedProcess. If either escaped, ``factory-init`` would crash on a
+    box with a sick or absent user manager instead of degrading to the sibling glob.
+    """
+    parent, df_root = _project_tree(tmp_path)
+
+    def _raise(*args, **kwargs):
+        raise boom
+
+    monkeypatch.setattr(subprocess, "run", _raise)
+
+    resolved = {p.resolve() for p in fep.known_project_roots(df_root)}
+    assert resolved == {
+        (parent / "dark-factory").resolve(),
+        (parent / "proj-a").resolve(),
+        (parent / "target").resolve(),
+    }
