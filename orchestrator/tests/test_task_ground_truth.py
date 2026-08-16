@@ -1098,6 +1098,7 @@ class TestClaimantRunIdIsComposedOrNone:
 
         assert claimant is not None
         assert claimant.source == ClaimantSource.PLAN_LOCK
+        assert claimant.run_id is not None
         assert claimant.run_id == compose_claimant_run_id(
             'run-abc', 'sess-13-abc123', os.getpid(),
         )
