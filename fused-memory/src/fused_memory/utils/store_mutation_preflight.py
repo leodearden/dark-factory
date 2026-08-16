@@ -33,6 +33,29 @@ two-phase mutation atomic -- it would only have lowered the probability. Only
 an application-level refusal BEFORE the first mutation bounds the blast radius,
 which is what :func:`assert_store_mutation_allowed` does.
 
+WHERE THIS IS ENFORCED (the rule for authors)
+---------------------------------------------
+Every ``--apply`` (or otherwise mutating) code path in ``fused-memory/scripts/``
+that constructs its own ``MemoryService``, or reaches Qdrant directly, calls
+:func:`assert_store_mutation_allowed` before its first mutation AND before its
+scan. As of task 4127 that is six scripts -- a claim a one-line grep for this
+function's name falsifies, rather than one that requires reading six files. The
+policy above outran the code by five call sites for a whole task cycle before
+anyone noticed; the count is here so the next divergence is cheap to spot.
+
+Two placement rules, which are the non-obvious part:
+
+  * ONE probe per run, before the scan -- never one per record. Every one of
+    these scripts fans its deletes out through either
+    ``asyncio.gather(..., return_exceptions=True)`` or a per-record
+    ``except Exception``, so a per-record probe converts a run-wide denial into
+    N irreversible deletions plus N log lines instead of an abort.
+  * A refusal RAISES; it does not return a report-shaped refusal. Several of
+    these scripts already refuse ``--apply`` through their normal return path
+    on other grounds (an empty scan, a truncated scan, a safety cap). Those are
+    handled outcomes an operator can reasonably read past. A half-completed
+    store mutation is not, so this refusal must not be mistakable for one.
+
 WHY A CAPABILITY PROBE, NOT AN "AM I SANDBOXED?" INFERENCE
 ----------------------------------------------------------
 A process cannot reliably introspect its own confinement from the inside, and
