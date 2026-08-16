@@ -269,6 +269,22 @@ class CategoryCensus:
     canonical_false: int = 0
     canonical_non_bool: int = 0
 
+    # The topic x canonical CROSS-TAB (task 4006).  ``topic_values`` and
+    # ``canonical_true`` above are INDEPENDENT counters, so the coverage
+    # partition -- topics with exactly one canonical / zero / more than one --
+    # is not derivable from either.  Keyed by topic, this mirrors 3198's
+    # write-time uniqueness probe ``count_memories_by_metadata(project_id,
+    # {'topic': T, 'canonical': True})`` (memory_service.py:594), which is
+    # scope-wide and NOT category-filtered -- so the partition must be read
+    # off the per-project ``merge()`` rollup, never off a single cell.
+    canonical_true_by_topic: Counter[str] = field(default_factory=Counter)
+    # A ``canonical: true`` carrying no topic cannot be keyed into the
+    # cross-tab, and dropping it would break the identity
+    # ``canonical_true == sum(by_topic) + without_topic``.  Reachable today:
+    # the ``canonical_without_topic`` shape rule is warn-mode under the
+    # shipped ``memory_metadata.enforce=false``, so such records DO land.
+    canonical_true_without_topic: int = 0
+
     supersedes_shapes: Counter[str] = field(default_factory=Counter)
     supersedes_member_shapes: Counter[str] = field(default_factory=Counter)
     supersedes_list_lengths: Counter[int] = field(default_factory=Counter)
@@ -297,9 +313,11 @@ class CategoryCensus:
             if not has_kind:
                 self.source_without_kind[str(source)] += 1
 
+        topic: str | None = None
         if 'topic' in payload and payload['topic'] is not None:
+            topic = str(payload['topic'])
             self.topic_present += 1
-            self.topic_values[str(payload['topic'])] += 1
+            self.topic_values[topic] += 1
         if 'parent_id' in payload and payload['parent_id'] is not None:
             self.parent_id_present += 1
 
@@ -308,6 +326,17 @@ class CategoryCensus:
             if isinstance(canonical, bool):
                 if canonical:
                     self.canonical_true += 1
+                    # The cross-tab, folded from the topic already parsed
+                    # above -- no second payload lookup.  A non-bool
+                    # ``canonical`` deliberately reaches neither branch:
+                    # a string 'true' is coercion drift, not a canonical,
+                    # and scoring it as one would manufacture uniqueness
+                    # violations out of the existing canonical_non_bool
+                    # population (1 record measured live in reify).
+                    if topic is None:
+                        self.canonical_true_without_topic += 1
+                    else:
+                        self.canonical_true_by_topic[topic] += 1
                 else:
                     self.canonical_false += 1
             elif canonical is not None:
@@ -339,6 +368,8 @@ class CategoryCensus:
         self.canonical_true += other.canonical_true
         self.canonical_false += other.canonical_false
         self.canonical_non_bool += other.canonical_non_bool
+        self.canonical_true_by_topic.update(other.canonical_true_by_topic)
+        self.canonical_true_without_topic += other.canonical_true_without_topic
         self.supersedes_shapes.update(other.supersedes_shapes)
         self.supersedes_member_shapes.update(other.supersedes_member_shapes)
         self.supersedes_list_lengths.update(other.supersedes_list_lengths)
@@ -388,6 +419,10 @@ def _census_to_dict(census: CategoryCensus) -> dict[str, Any]:
         'canonical_true': census.canonical_true,
         'canonical_false': census.canonical_false,
         'canonical_non_bool': census.canonical_non_bool,
+        # Through _table() like every other value axis: deterministic
+        # count-desc/value-asc order, and never capped in the JSON.
+        'canonical_true_by_topic': _table(census.canonical_true_by_topic),
+        'canonical_true_without_topic': census.canonical_true_without_topic,
         'supersedes_shapes': _table(census.supersedes_shapes),
         'supersedes_member_shapes': _table(census.supersedes_member_shapes),
         'supersedes_list_lengths': _table(census.supersedes_list_lengths),
