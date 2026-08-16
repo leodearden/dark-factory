@@ -443,6 +443,124 @@ def _dir_keys(targets: list[str]) -> list[str]:
     return [_dir_key(t) for t in targets]
 
 
+def test_executed_for_touched_is_hermetic_against_the_ambient_orch_config_path(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``_executed_for_touched`` must not read the ambient ``ORCH_CONFIG_PATH``.
+
+    Task 3703, reviewer-flagged — the mirror of the repair commit 6c72a7da5a
+    landed in ``test_module_verify_budgets.py``, and of the same repair in
+    ``test_tests_scripts_module_config.py``. This helper used to construct its
+    own ``OrchestratorConfig(project_root=REPO_ROOT)``, and ``project_root``
+    selects NOTHING — see ``_root_config``'s docstring, which spells out at
+    length that ``settings_customise_sources`` builds its ``YamlSettingsSource``
+    from ``os.environ['ORCH_CONFIG_PATH']`` alone.
+
+    THE ORDERING HAZARD THIS FILE CARRIES IS CONCRETE, and sharper than the
+    sibling's. ``test_scripts_module_carries_its_own_measured_verify_budget``
+    calls ``_root_config(monkeypatch)`` for assertion (c) and then
+    ``_executed_for_touched(...)`` for assertion (e), so that helper read the
+    right yaml ONLY as a SIDE EFFECT of an assertion made earlier in the same
+    test body. Two edits nobody would think twice about silently broke it:
+    reordering (c) after (e), or calling the helper from any of the three tests
+    that anchor nothing at all —
+    ``test_scripts_diff_is_lint_gated``, ``test_scripts_diff_is_type_gated``,
+    ``test_scripts_full_suite_pytest_covers_scripts_tests``. Either hands it a
+    defaults-collapsed config (inside verify, where
+    ``verify._target_subprocess_env`` scrubs the whole ``ORCH_`` prefix) or a
+    FOREIGN CHECKOUT's config (in an operator shell, where the variable points
+    at whichever checkout that orchestrator serves) — with no failure signal in
+    either direction. Taking the config as an argument makes the dependency
+    structural instead of ordering-dependent.
+
+    WHY THE HOSTILE YAML IS ONE THE LOADER REJECTS, rather than one that merely
+    holds different values. This is the only formulation that can fail BEFORE
+    the fix. MEASURED at base d6a5e32535: ``derive_verify_plan`` consults its
+    ``config`` argument in exactly two places — ``_merge_breadth_is_full``
+    (role='merge') and ``_derive_fallback_runs`` (``module_configs`` EMPTY) —
+    and this call is role='task' with one non-empty ModuleConfig, so it reaches
+    neither. A differently-VALUED config therefore yields a byte-identical
+    plan, and a test built on one would read as enforcement while enforcing
+    nothing. A type-invalid value instead makes the PRE-fix helper's own
+    ``OrchestratorConfig`` construction raise pydantic ``ValidationError`` — the
+    single observable signal that the ambient dependency exists.
+
+    The post-fix GREEN is reachable rather than assumed, measured at the same
+    base: ``_discover_module_configs``, ``derive_verify_plan`` and
+    ``verify._executed_module_configs_from_plan`` are unaffected by the
+    poisoned env.
+
+    ORDER IS LOAD-BEARING: the anchored config is built FIRST, while the
+    environment is still sane, and the poison applied SECOND. Anchoring
+    afterwards would overwrite the poison and leave this test vacuous.
+    """
+    # (1) The anchored config, built while the environment is still sane.
+    cfg = _root_config(monkeypatch)
+
+    # (2) NOW poison the ambient environment, with a config the PRODUCTION
+    # loader REJECTS — see the docstring for why rejected and not merely
+    # different.
+    hostile = tmp_path / 'hostile.yaml'
+    hostile.write_text(
+        'verify_command_timeout_secs: "not-a-number"\n', encoding='utf-8'
+    )
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(hostile))
+
+    # (3) The helper must not consult that variable. A helper that builds its
+    # own config raises pydantic ValidationError here instead of returning.
+    executed = _executed_for_touched([SAMPLE_TOUCHED_FILE], cfg)
+
+    assert executed.prefix == MODULE_PREFIX, (
+        f'under a poisoned ORCH_CONFIG_PATH the production bridge executed '
+        f'{executed.prefix!r}, not {MODULE_PREFIX!r} (task 3703) — module '
+        'routing is reading the ambient environment'
+    )
+
+    # The three legs, each asserted non-None and TARGETING this module, for the
+    # reason the lint/type gate tests below exist: a None command is not a
+    # deferral, it is DELETED gating that reports green (see _VACUOUS_PASS,
+    # quoted into each message below).
+    assert executed.test_command is not None and 'pytest' in executed.test_command, (
+        f'executed test_command is {executed.test_command!r} under a poisoned '
+        f'ORCH_CONFIG_PATH (task 3703); {MODULE_PREFIX} must run its own suite '
+        f'regardless of what the ambient environment points at: {_VACUOUS_PASS}'
+    )
+    assert MODULE_PREFIX in executed.test_command, (
+        f'executed test_command {executed.test_command!r} does not target '
+        f'{MODULE_PREFIX}/ under a poisoned ORCH_CONFIG_PATH (task 3703)'
+    )
+    assert executed.lint_command is not None and 'ruff' in executed.lint_command, (
+        f'executed lint_command is {executed.lint_command!r} under a poisoned '
+        f'ORCH_CONFIG_PATH (task 3703): {_VACUOUS_PASS}'
+    )
+    assert MODULE_PREFIX in executed.lint_command, (
+        f'executed lint_command {executed.lint_command!r} does not target '
+        f'{MODULE_PREFIX}/ under a poisoned ORCH_CONFIG_PATH (task 3703)'
+    )
+    assert (
+        executed.type_check_command is not None
+        and 'pyright' in executed.type_check_command
+    ), (
+        f'executed type_check_command is {executed.type_check_command!r} under '
+        f'a poisoned ORCH_CONFIG_PATH (task 3703): {_VACUOUS_PASS}'
+    )
+    assert MODULE_PREFIX in executed.type_check_command, (
+        f'executed type_check_command {executed.type_check_command!r} does not '
+        f'target {MODULE_PREFIX}/ under a poisoned ORCH_CONFIG_PATH (task 3703)'
+    )
+
+    # The module budget survives too: the figure must come from THIS module's
+    # yaml, which the poisoned env cannot reach, not from whatever the ambient
+    # config declares.
+    declared = _discovered()[MODULE_PREFIX].verify_command_timeout_secs
+    assert executed.verify_command_timeout_secs == declared, (
+        f'executed verify_command_timeout_secs='
+        f'{executed.verify_command_timeout_secs} under a poisoned '
+        f'ORCH_CONFIG_PATH, not the {declared} this module declares (task '
+        '3703) — the budget is being resolved from the ambient environment'
+    )
+
+
 def test_scripts_diff_is_lint_gated() -> None:
     """A diff confined to scripts/ must actually run ruff over scripts/.
 
