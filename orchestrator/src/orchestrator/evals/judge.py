@@ -703,26 +703,31 @@ Output JSON: {{"plan_quality": 0.0-1.0, "per_criterion": {{"<criterion>": 0.0-1.
             plan_quality = None
         else:
             raw_quality = float(raw_quality)
-            # NaN is unorderable, so clamp_unit_score cannot enforce [0, 1] on
-            # it (see that function's docstring for the mechanics) — checked
-            # BEFORE the clamp, not after. +/-Infinity IS orderable and falls
-            # through to the clamp + out-of-range warning below instead: a
-            # judge answering infinity clearly means "as high/low as it
-            # goes", the same intent-preserving reasoning that governs any
-            # other out-of-range-but-orderable answer.
-            if math.isnan(raw_quality):
+            # A non-finite answer is not a judgement at all, so it degrades
+            # to the None sentinel BEFORE the clamp (see clamp_unit_score's
+            # docstring for the mechanics): NaN because it is unordered and
+            # the clamp cannot constrain it at all; +/-Infinity because the
+            # clamp CAN constrain it, but only by fabricating the best/worst
+            # possible score (1.0/0.0) on a live ranking surface
+            # (report._mean_plan_quality -> select_survivors) — a worse
+            # failure than admitting no measurement. The finite
+            # out-of-range clamp + WARNING path immediately below is
+            # DELIBERATELY unchanged (operator SCOPE RULING 2026-08-12):
+            # this narrows the task-3410 amendment, it does not reverse it
+            # — finite overshoots stay orderable and intent-preserving.
+            if not math.isfinite(raw_quality):
                 logger.warning(
                     f'Plan judge for {cell} answered a non-finite '
-                    f'plan_quality (NaN) — not a real judgement, degraded to '
-                    f'the None sentinel (run_architect_eval falls back to '
-                    f'the deterministic structural floor).'
+                    f'plan_quality ({raw_quality!r}) — not a real judgement, '
+                    f'degraded to the None sentinel (run_architect_eval '
+                    f'falls back to the deterministic structural floor).'
                 )
                 return PlanQualityVerdict(
                     plan_quality=None,
                     per_criterion={},
                     reasoning=(
                         f'Plan judge answered a non-finite plan_quality '
-                        f'(NaN) for {cell}'
+                        f'({raw_quality!r}) for {cell}'
                     ),
                     # The judge DID run and produced an answer (a nonsense
                     # one) — real spend, not $0.
