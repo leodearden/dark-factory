@@ -80,10 +80,23 @@ from datetime import datetime
 from fused_memory.utils.async_utils import gather_collect
 
 try:
+    # One combined block, deliberately: TestEscalationBinding stubs
+    # ``sys.modules['escalation'] = None``, which fails BOTH imports, so a
+    # single ``if Escalation is None`` guard remains sufficient for the whole
+    # module.  A second try block would let the dedupe names bind while
+    # Escalation did not (or vice versa) and split that guard in two.
+    from escalation.dedupe import (  # type: ignore[import-untyped]
+        DedupeConfig,
+        compute_content_fingerprint,
+        submit_or_dedupe,
+    )
     from escalation.models import Escalation  # type: ignore[import-untyped]
     _HAS_ESCALATION = True
 except ImportError:
     Escalation = None  # type: ignore[assignment,misc]
+    DedupeConfig = None  # type: ignore[assignment,misc]
+    compute_content_fingerprint = None  # type: ignore[assignment]
+    submit_or_dedupe = None  # type: ignore[assignment]
     _HAS_ESCALATION = False
 
 logger = logging.getLogger(__name__)
@@ -542,6 +555,29 @@ async def maybe_escalate_stalled_gate_backlog(
         try:
             # make_id() and Escalation() are inside the try so that id-generation
             # or constructor failures are caught and logged rather than escaping.
+            #
+            # Fold key = (category, project_id, task_id) and nothing else.  It
+            # MUST NOT include the age, run_id, or any summary/detail prose:
+            # those drift every cycle, and a drifting key never folds, which
+            # would re-pin dedupe_count at 0 — the defect this stamp fixes.
+            # Stability is structural rather than by discipline: because
+            # ``affected_ids`` is non-empty, compute_content_fingerprint ignores
+            # the description argument entirely, so prose *cannot* enter the key.
+            # ``''`` for finding_category is the documented "no finding in
+            # scope" sentinel used by harness._escalate.
+            fingerprint = compute_content_fingerprint(
+                _GATE_BACKLOG_ESCALATION_CATEGORY, '', [f'{project_id}:{task_id}'], ''
+            )
+            # Raise (not assert — stripped under ``python -O``) so an empty key
+            # can never reach the queue: find_dedupe_parent treats a falsy key as
+            # "never fold", so filing anyway would mint a second visible record
+            # for this gate.  The existing handler below logs WARNING and
+            # excludes the task_id; the gate is still stalled next cycle, so this
+            # self-heals on retry.
+            if not fingerprint:
+                raise ValueError(
+                    f'empty dedupe_fingerprint for gate-backlog task_id={task_id}'
+                )
             esc = Escalation(
                 id=escalation_queue.make_id(task_id),
                 task_id=task_id,
@@ -551,6 +587,7 @@ async def maybe_escalate_stalled_gate_backlog(
                 summary=summary,
                 detail=detail,
                 level=1,
+                dedupe_fingerprint=fingerprint,
             )
             escalation_queue.submit(esc)
             escalated.append(task_id)
