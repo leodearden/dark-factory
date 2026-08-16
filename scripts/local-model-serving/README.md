@@ -251,11 +251,29 @@ The guard, from v5 on:
 - **Drift is pollution in BOTH directions.** Growth over-charges the arm; a
   shrink or a vanish *under*-charges it. The flattering direction is the one a
   fabricated artifact wants, so it fails too.
+- **The baseline capture is bracketed**: `lms_ctl start` reads the inventory,
+  then the memory reading, then the inventory again, and refuses if the two
+  inventories disagree by more than the floor. `nvidia-smi` cannot answer both
+  questions in one call, so pairing them is a claim about a *window*. Its
+  silent failure is the flattering one: a holder resident for the reading and
+  gone by the inventory inflates the baseline, `assert_clean_baseline` sees a
+  spotless card, and by probe time the mover is in neither reading — so nothing
+  downstream can tell. A co-resident arm appears in both inventories and is
+  therefore never a mover.
 
 This replaces an operator discipline — "check `nvidia-smi` before you measure" —
 that was never written down and that ε/θ/ι had no way to inherit.
 
-Three limits, stated rather than implied:
+Four limits, stated rather than implied:
+
+- **The bracket narrows the window; it does not abolish it.** A process that
+  both arrives and leaves between the first inventory and the reading is
+  invisible to both, and no arrangement of separate `nvidia-smi` calls can see
+  it. What is left is a sub-second race against a consumer that vanishes as
+  fast as it appeared, rather than the minutes-long `keep_alive` holding that
+  motivated the guard. Probe time is deliberately *not* bracketed: the arm
+  itself is legitimately allocating there, so refusing on any movement would
+  fail healthy runs.
 
 - **The inventory is not an accounting.** `--query-compute-apps` lists only CUDA
   compute applications; the ~3.3 GiB of KDE/X11 graphics contexts appear in it

@@ -248,11 +248,19 @@ def test_start_records_the_consumer_inventory_alongside_the_reading(
     assert record.consumers == [WHISPER]
 
 
-def test_start_probes_the_inventory_at_the_same_moment_as_the_reading(
+def test_start_brackets_the_reading_between_two_inventories(
     fake_systemctl, baseline_dir, monkeypatch,
 ):
     """One capture, not two.  A reading and an inventory taken at different
-    moments would describe a card that never existed."""
+    moments would describe a card that never existed.
+
+    Separate nvidia-smi invocations cannot be atomic, so `start` does the next
+    best thing and makes the window CHECKABLE: inventory, reading, inventory.
+    An earlier revision took the reading first and the inventory after it,
+    under a docstring claiming they were one capture -- which left the silent
+    failure open, where a holder resident for the reading and gone by the
+    inventory inflates the baseline and under-charges every later arm.
+    """
     probed = []
     monkeypatch.setattr(
         lms_vram, 'probe_gpu', lambda *a, **k: probed.append('reading') or MEASURED_GPU,
@@ -264,7 +272,50 @@ def test_start_probes_the_inventory_at_the_same_moment_as_the_reading(
 
     lms_ctl.start(_arm())
 
-    assert probed == ['reading', 'consumers']
+    assert probed == ['consumers', 'reading', 'consumers']
+    assert lms_vram.read_baseline_record('qwen3.5-9b').consumers == [WHISPER]
+
+
+def test_start_refuses_a_card_that_moved_under_the_baseline_capture(
+    fake_systemctl, baseline_dir, monkeypatch,
+):
+    """The window this bracket exists to close, in its flattering direction.
+
+    ollama holds the card while the reading is taken and its keep_alive expires
+    before the inventory: the baseline carries its 10314 MiB, the inventory
+    looks spotless, and every later `used - baseline` under-charges the arm with
+    nothing downstream able to notice.  Refused before any systemctl call and
+    with no baseline file left behind, like every other refusal here.
+    """
+    inventories = iter([[WHISPER, OLLAMA], [WHISPER]])
+    monkeypatch.setattr(
+        lms_vram, 'probe_gpu_consumers', lambda *a, **k: next(inventories),
+    )
+
+    with pytest.raises(lms_vram.PollutedBaselineError) as excinfo:
+        lms_ctl.start(_arm())
+
+    assert str(OLLAMA.pid) in str(excinfo.value)
+    assert not lms_vram.baseline_path('qwen3.5-9b').exists()
+    assert fake_systemctl.calls() == []
+
+
+def test_an_injected_inventory_is_the_callers_own_pairing(
+    fake_systemctl, baseline_dir, monkeypatch,
+):
+    """Passing `consumers=` skips the bracket rather than half-applying it.
+
+    The check is about a pairing this function made; a caller that supplies
+    both halves has made its own, and re-probing to second-guess it would
+    reintroduce exactly the mismatch the bracket exists to prevent.
+    """
+    monkeypatch.setattr(
+        lms_vram, 'probe_gpu_consumers',
+        lambda *a, **k: pytest.fail('probed the card despite an injected inventory'),
+    )
+
+    lms_ctl.start(_arm(), gpu=MEASURED_GPU, consumers=[WHISPER])
+
     assert lms_vram.read_baseline_record('qwen3.5-9b').consumers == [WHISPER]
 
 

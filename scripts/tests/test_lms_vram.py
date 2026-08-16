@@ -436,27 +436,11 @@ def test_the_recorded_baseline_is_stamped_with_an_aware_utc_time(
     assert stamped.tzinfo is not None
 
 
-def test_read_baseline_records_takes_the_most_conservative_of_several(
-    tmp_path, monkeypatch,
-):
-    """Probing several arms at once has several baselines; the LOWEST prior
-    usage attributes the MOST memory to the arms, which is the reading that
-    cannot flatter them."""
-    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path))
-    lms_vram.record_baseline('a', _reading(used_mib=7310, free_mib=16813), consumers=[])
-    lms_vram.record_baseline('b', _reading(used_mib=9000, free_mib=15123), consumers=[])
-
-    chosen = lms_vram.read_baseline_records(['a', 'b']).reading
-
-    assert chosen.used_mib == 7310
-    assert chosen.free_mib == 16813
-
-
-def test_read_baseline_records_raises_when_asked_for_nothing(tmp_path, monkeypatch):
-    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path))
-
-    with pytest.raises(lms_vram.VramProbeError):
-        lms_vram.read_baseline_records([])
+# The `read_baselines` pair that stood here retargeted onto `read_baseline_records`
+# when that adapter was deleted, at which point both were exact duplicates of the
+# record-API tests in section (h) -- one of them by NAME, which meant python bound
+# the later definition and the earlier ran not at all.  Removed rather than
+# renamed: section (h) asserts everything they did, plus the inventory.
 
 
 def test_clearing_a_baseline_is_idempotent(tmp_path, monkeypatch):
@@ -1281,3 +1265,121 @@ def test_a_snapshot_cannot_be_built_without_an_inventory():
             ),
             reading=_reading(),
         )
+
+
+# ---------------------------------------------------------------------------
+# (k) the baseline capture window — inventory, reading, inventory
+# ---------------------------------------------------------------------------
+#
+# A reading and an inventory are separate nvidia-smi invocations, so pairing
+# them is a claim about a WINDOW.  The dangerous direction is the silent one: a
+# holder resident for the reading and gone by the inventory inflates the
+# baseline, `assert_clean_baseline` sees a clean card, and every later
+# `used - baseline` UNDER-charges the arm with nothing downstream able to say
+# so.  Bracketing the reading between two inventories is what makes that
+# visible.
+
+
+def _capture_runner(*compute_apps_csv):
+    """A fake nvidia-smi answering successive compute-apps queries differently.
+
+    The memory query always answers the measured host reading; only WHO holds
+    the card changes between calls, which is the whole subject here.
+    """
+    remaining = list(compute_apps_csv)
+    recorded = []
+
+    def runner(argv):
+        recorded.append(argv)
+        if any(a.startswith('--query-compute-apps') for a in argv):
+            return remaining.pop(0) if remaining else ''
+        return MEASURED_CSV
+
+    return runner, recorded
+
+
+def test_two_agreeing_inventories_are_a_stable_capture():
+    assert lms_vram.unstable_capture_consumers([WHISPER], [WHISPER]) == []
+
+
+def test_sub_floor_jitter_is_not_a_moving_card():
+    """An exact-equality rule would refuse a start over whisper-writer breathing.
+
+    Same floor as everywhere else: below it a mover cannot move a verdict.
+    """
+    nudged = _consumer(used_mib=WHISPER.used_mib + lms_vram.POLLUTION_FLOOR_MIB - 1)
+
+    assert lms_vram.unstable_capture_consumers([WHISPER], [nudged]) == []
+
+
+def test_a_consumer_arriving_under_the_capture_is_a_mover():
+    movers = lms_vram.unstable_capture_consumers([WHISPER], [WHISPER, OLLAMA])
+
+    assert movers == [OLLAMA]
+
+
+def test_a_consumer_vanishing_under_the_capture_is_a_mover():
+    """THE case this exists for, and the one nothing else can catch.
+
+    ollama held the card for the reading and its keep_alive expired before the
+    inventory.  The recorded baseline carries its 10314 MiB while the inventory
+    looks spotless, so `assert_clean_baseline` passes, and from then on every
+    footprint is subtracted from an inflated number -- the flattering direction.
+    By probe time the mover is in neither reading, so `classify_pollution` sees
+    no newcomer and no drift either.
+    """
+    movers = lms_vram.unstable_capture_consumers([WHISPER, OLLAMA], [WHISPER])
+
+    # Reported as it was BEFORE: that is the memory the reading may carry.
+    assert movers == [OLLAMA]
+
+
+def test_a_consumer_growing_past_the_floor_under_the_capture_is_a_mover():
+    grown = _consumer(used_mib=WHISPER.used_mib + lms_vram.POLLUTION_FLOOR_MIB + 1)
+
+    movers = lms_vram.unstable_capture_consumers([WHISPER], [grown])
+
+    assert [c.used_mib for c in movers] == [grown.used_mib]
+
+
+def test_probe_baseline_capture_brackets_the_reading_between_two_inventories():
+    runner, recorded = _capture_runner(
+        MEASURED_WHISPER_ROW + '\n', MEASURED_WHISPER_ROW + '\n',
+    )
+
+    reading, consumers = lms_vram.probe_baseline_capture(runner)
+
+    assert reading.used_mib == 7362
+    assert [c.pid for c in consumers] == [7575]
+    # Inventory, reading, inventory -- in that order, or the reading is not
+    # bracketed by anything.
+    assert [argv[1].split('=')[0] for argv in recorded] == [
+        '--query-compute-apps', '--query-gpu', '--query-compute-apps',
+    ]
+
+
+def test_probe_baseline_capture_refuses_a_card_that_moved_under_it():
+    runner, _ = _capture_runner(
+        MEASURED_WHISPER_ROW + '\n',
+        f'{MEASURED_WHISPER_ROW}\n{MEASURED_OLLAMA_ROW}\n',
+    )
+
+    with pytest.raises(lms_vram.PollutedBaselineError) as excinfo:
+        lms_vram.probe_baseline_capture(runner)
+
+    # PollutedBaselineError, so it reaches the CLI branch that already exists
+    # for "another process is holding the card" -- same remedy, same exit code.
+    assert str(OLLAMA.pid) in str(excinfo.value)
+    assert [c.pid for c in excinfo.value.consumers] == [OLLAMA.pid]
+
+
+def test_probe_baseline_capture_refuses_a_holder_that_left_under_it():
+    """The under-charging direction refuses too.  A guard that only caught
+    arrivals would pass exactly the case that flatters the arm."""
+    runner, _ = _capture_runner(
+        f'{MEASURED_WHISPER_ROW}\n{MEASURED_OLLAMA_ROW}\n',
+        MEASURED_WHISPER_ROW + '\n',
+    )
+
+    with pytest.raises(lms_vram.PollutedBaselineError):
+        lms_vram.probe_baseline_capture(runner)

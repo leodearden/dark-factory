@@ -210,9 +210,17 @@ def start(
 ) -> None:
     """Start one arm, capturing the baseline the budget verdict will subtract.
 
-    Probes WHO holds the card alongside HOW MUCH is held, as one capture: a
-    reading taken at one instant paired with an inventory from another would
-    describe a card that never existed.
+    Probes WHO holds the card alongside HOW MUCH is held, through
+    :func:`lms_vram.probe_baseline_capture`, which brackets the reading between
+    two inventories and refuses a capture whose two halves disagree.  A reading
+    taken at one instant paired with an inventory from another would describe a
+    card that never existed, and its most dangerous form is silent: a holder
+    that is resident for the reading and gone by the inventory inflates the
+    baseline and UNDER-charges every arm measured against it afterwards.  That
+    narrows the window rather than abolishing it -- the residual is named on
+    :func:`lms_vram.unstable_capture_consumers`.  An INJECTED *gpu* or
+    *consumers* skips the bracket: the pairing is then the caller's own, which
+    is what the tests want and what the check has nothing to say about.
 
     Ordering is refuse-then-record-then-start throughout.  A polluted card
     raises before any systemctl call, so an arm is never launched onto a card
@@ -239,8 +247,11 @@ def start(
     MISDIRECTION, and the one inside ``record_baseline`` is the DATA INTEGRITY
     backstop that holds no matter which caller reaches it or in what order.
     """
-    reading = gpu if gpu is not None else lms_vram.probe_gpu()
-    held_by = consumers if consumers is not None else lms_vram.probe_gpu_consumers()
+    if gpu is None and consumers is None:
+        reading, held_by = lms_vram.probe_baseline_capture()
+    else:
+        reading = gpu if gpu is not None else lms_vram.probe_gpu()
+        held_by = consumers if consumers is not None else lms_vram.probe_gpu_consumers()
     coresident = preflight(
         arm, reading, exclusive=exclusive, consumers=held_by,
     )

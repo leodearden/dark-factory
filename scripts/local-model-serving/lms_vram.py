@@ -389,7 +389,12 @@ class GpuBaseline(BaseModel):
 
 
 class GpuSnapshot(BaseModel):
-    """One atomic "what the GPU is, what it holds, and who is holding it".
+    """What the GPU is, what it holds, and who is holding it, from one moment.
+
+    ONE MOMENT, not one instant -- see :func:`probe_gpu_snapshot` for the
+    window this is assembled across and why probe time is deliberately not
+    bracketed the way a baseline capture is.  Calling it atomic would claim a
+    guarantee three separate nvidia-smi invocations cannot give.
 
     *consumers* is REQUIRED, not optional.  An optional inventory would let a
     call site build a snapshot carrying no evidence about who else held the
@@ -798,12 +803,116 @@ def classify_pollution(
     return PollutionState.POLLUTED, '; '.join(reasons)
 
 
+def unstable_capture_consumers(
+    before: Sequence[GpuConsumer], after: Sequence[GpuConsumer],
+) -> list[GpuConsumer]:
+    """Who moved on the card WHILE a baseline was being captured.
+
+    A memory reading and a consumer inventory come from separate nvidia-smi
+    invocations, so pairing them is a claim about a WINDOW, not an instant.
+    Sandwiching the reading between two inventories makes that window
+    checkable: if the two disagree, the reading in the middle belongs to
+    neither of them, and the pair describes a card that never existed.
+
+    The direction that motivates this is the FLATTERING one, and it is silent.
+    If ollama allocates before the reading and its keep_alive then expires
+    before the inventory, the baseline carries its ~10 GiB while the inventory
+    looks clean: :func:`assert_clean_baseline` sees nothing wrong, an inflated
+    baseline is recorded, and every later ``used - baseline`` UNDER-charges the
+    arm.  Nothing downstream can detect it -- ``classify_pollution`` finds no
+    foreign newcomer and no drift, because by then the mover is gone from both
+    readings.  A disagreement between the two inventories is the only evidence
+    that survives, so it is treated as pollution in its own right.
+
+    Tolerance is :data:`POLLUTION_FLOOR_MIB`, the same floor as everywhere else:
+    below it a mover cannot move a verdict, and an exact-equality rule would
+    refuse a start over whisper-writer's ordinary jitter.
+
+    Returns the movers themselves -- an arrival and a growth as they appear
+    AFTER, a departure and a shrink as they appeared BEFORE, since that is the
+    memory the reading in the middle may have been charged.  Empty means the
+    two inventories agree to within the floor.
+
+    THE NAMED RESIDUAL: this narrows the window, it does not abolish it.  A
+    process that both arrives and leaves entirely between the first inventory
+    and the reading is invisible to both, and no arrangement of separate
+    nvidia-smi calls can see it.  What is left is a sub-second race against a
+    consumer that vanishes as fast as it appeared, rather than the minutes-long
+    keep_alive holding that motivated the guard.
+    """
+    was = {c.pid: c for c in before}
+    now = {c.pid: c for c in after}
+    movers = [
+        now[pid] for pid in sorted(set(now) - set(was))
+        if now[pid].used_mib >= POLLUTION_FLOOR_MIB
+    ]
+    movers += [
+        was[pid] for pid in sorted(set(was) - set(now))
+        if was[pid].used_mib >= POLLUTION_FLOOR_MIB
+    ]
+    movers += [
+        now[pid] for pid in sorted(set(was) & set(now))
+        if abs(now[pid].used_mib - was[pid].used_mib) >= POLLUTION_FLOOR_MIB
+    ]
+    return movers
+
+
+def probe_baseline_capture(
+    runner: GpuRunner | None = None,
+) -> tuple[GpuReading, list[GpuConsumer]]:
+    """A baseline memory reading and the inventory that explains it.
+
+    Inventory, reading, inventory -- so the reading in the middle is bracketed
+    by two observations of who held the card, and a mover between them is
+    caught rather than silently baked into the number.  See
+    :func:`unstable_capture_consumers` for what that catches, what it costs,
+    and the residual it does not close.
+
+    Raises :class:`PollutedBaselineError` on a mover, which makes this a PROBE
+    that refuses to hand back a self-inconsistent capture -- the same thing
+    :func:`parse_nvidia_smi_csv` does with an incoherent reading -- and NOT a
+    policy refusal composed in ``lms_ctl.start``.  That distinction is
+    load-bearing: every ARM-admission refusal lives in ``lms_ctl.preflight``,
+    in one order, and this must not become a second place that decides them.
+    It cannot fire on a co-resident arm, either: an arm that was already
+    running appears in BOTH inventories and so is not a mover.
+
+    The LATER inventory is returned.  It is the one adjacent to the moment
+    ``record_baseline`` stamps, and by then the two are known to agree.
+    """
+    before = probe_gpu_consumers(runner)
+    reading = probe_gpu(runner)
+    after = probe_gpu_consumers(runner)
+    movers = unstable_capture_consumers(before, after)
+    if movers:
+        raise PollutedBaselineError(
+            movers,
+            context=(
+                'the GPU baseline capture is not self-consistent: the card '
+                'moved while it was being taken, so the memory reading and the '
+                'inventory beside it describe different cards. Moved'
+            ),
+        )
+    return reading, after
+
+
 def probe_gpu_snapshot(runner: GpuRunner | None = None) -> GpuSnapshot:
     """Identity, a live memory reading, and who is holding it, as one value.
 
     Three nvidia-smi calls rather than one wide query, so the strict three-field
     memory parser -- the one whose failure would misreport the budget -- keeps
     its exact shape and its existing coverage.
+
+    THE NAMED RESIDUAL: three calls means a window, so this is one capture in
+    the sense that it describes one moment to within a few milliseconds -- not
+    an atomic one.  Deliberately NOT bracketed the way
+    :func:`probe_baseline_capture` is, and the asymmetry is the same one that
+    runs through this module: at baseline nothing of ours is on the card, so
+    any mover is a surprise; at PROBE time the arm itself is legitimately
+    allocating (vLLM may still be growing its KV cache), so refusing on any
+    movement would fail healthy runs.  Probe-time movement is judged against
+    the baseline instead, by :func:`classify_pollution`, which knows which
+    movements mean something.
     """
     return GpuSnapshot(
         identity=probe_gpu_identity(runner),
