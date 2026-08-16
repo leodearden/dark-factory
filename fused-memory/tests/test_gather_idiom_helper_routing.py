@@ -36,7 +36,7 @@ import ast
 import pathlib
 
 import pytest
-from _fm_helpers import calls_named, imported_names_from, parse_python_module
+from _ast_guard import calls_named, imported_names_from, parse_python_module
 
 SRC_ROOT = pathlib.Path(__file__).parents[1] / 'src' / 'fused_memory'
 

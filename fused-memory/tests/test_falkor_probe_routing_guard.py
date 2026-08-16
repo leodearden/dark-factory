@@ -46,7 +46,7 @@ import ast
 import pathlib
 
 import pytest
-from _fm_helpers import calls_named, parse_python_module
+from _ast_guard import calls_named, parse_python_module
 
 TESTS_ROOT = pathlib.Path(__file__).parent
 
