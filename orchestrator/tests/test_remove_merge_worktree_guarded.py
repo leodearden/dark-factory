@@ -97,6 +97,33 @@ def _raise_enospc(*_a, **_k):
     raise OSError(errno.ENOSPC, 'No space left on device')
 
 
+def _raise_emfile_spawn(*_a, **_k):
+    """Simulate the SECOND OSError escape: the git removal that cannot spawn.
+
+    ``_run`` raises before the child ever executes in two ways --
+    :class:`~orchestrator.git_ops.WorktreeMissing` (a ``FileNotFoundError``,
+    hence an ``OSError``) when its ``cwd`` has vanished, and a bare
+    ``OSError`` out of ``asyncio.create_subprocess_exec`` under EMFILE/
+    ENOMEM. EMFILE is the pointed case: fd exhaustion fails the lane-lock
+    open and the subprocess spawn from the SAME root cause, so guarding only
+    the former would leave cleanup_merge_worktree's "Never raises" contract
+    false under exactly the condition that motivated the guard.
+    """
+    raise OSError(errno.EMFILE, 'Too many open files')
+
+
+def _raise_runtime_error(*_a, **_k):
+    """A NON-OSError failure, for pinning the narrow ``except OSError``.
+
+    Both guards in remove_merge_worktree_guarded catch ``OSError`` only.
+    Widening either to a bare ``except Exception`` -- a very natural refactor
+    for a method documented as never raising -- would swallow programmer
+    errors (and, for ``BaseException``, ``CancelledError``) in silence. These
+    tests fail loudly if that ever happens.
+    """
+    raise RuntimeError('not an OSError -- must stay loud')
+
+
 # ---------------------------------------------------------------------------
 # step-1: uncontended removal
 # ---------------------------------------------------------------------------
@@ -344,6 +371,72 @@ class TestRemoveMergeWorktreeGuarded:
             'a live holder\'s'
         )
 
+    async def test_git_removal_spawn_error_returns_failed_and_warns_once(
+        self, git_ops: GitOps, monkeypatch, caplog,
+    ):
+        """The lane-lock open is not the only OSError escape: on the ACQUIRED-
+        lease path the ``git worktree remove`` subprocess can fail to spawn at
+        all (EMFILE/ENOMEM from create_subprocess_exec, or WorktreeMissing when
+        project_root vanished), which would propagate straight through
+        cleanup_merge_worktree's "Never raises" contract.
+
+        The outcome must be 'failed', NOT 'skipped_lock_error': we hold the
+        flock here, so the lease acquire already proved there is no live
+        holder -- the exact premise that licenses cleanup's force-rmtree
+        fallback. 'failed' is also honest, being precisely "git's removal did
+        not succeed and the tree survives"."""
+        wt = await _make_ephemeral_worktree(git_ops)
+        lock_path = lane_lock_path(wt)
+        monkeypatch.setattr('orchestrator.git_ops._run', _raise_emfile_spawn)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            outcome = await git_ops.remove_merge_worktree_guarded(wt, reason='sweep')
+
+        assert outcome == 'failed'
+        assert wt.exists(), 'git never ran, so the tree is necessarily still there'
+        assert lock_path.exists(), (
+            "'failed' retains the sibling lock -- the tree, and thus its lane, "
+            'survives (same rule as the non-worktree-directory failed case)'
+        )
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1, (
+            f'expected exactly one WARNING, got {len(warnings)}: '
+            f'{[r.getMessage() for r in warnings]}'
+        )
+        message = warnings[0].getMessage()
+        assert 'sweep' in message, message
+        assert 'Too many open files' in message, message
+
+    async def test_non_oserror_from_lane_lock_acquire_propagates(
+        self, git_ops: GitOps, monkeypatch,
+    ):
+        """Pins the lock guard's narrow ``except OSError`` in BEHAVIOUR, not
+        just in a comment. A non-OSError out of the acquire is a programmer
+        error (or, for BaseException, a cancellation) and must stay loud --
+        widening the catch to ``except Exception`` must break this test."""
+        wt = await _make_ephemeral_worktree(git_ops)
+        monkeypatch.setattr(
+            'orchestrator.git_ops.acquire_merge_verify_flock', _raise_runtime_error,
+        )
+
+        with pytest.raises(RuntimeError, match='must stay loud'):
+            await git_ops.remove_merge_worktree_guarded(wt, reason='sweep')
+
+    async def test_non_oserror_from_git_removal_propagates(
+        self, git_ops: GitOps, monkeypatch,
+    ):
+        """Same narrow-catch pin for the second guard, the git-removal spawn.
+
+        Degrading a genuine programmer error to 'failed' would be strictly
+        worse than raising: 'failed' routes to cleanup's force-rmtree, so a
+        widened catch would silently destroy trees on a code bug."""
+        wt = await _make_ephemeral_worktree(git_ops)
+        monkeypatch.setattr('orchestrator.git_ops._run', _raise_runtime_error)
+
+        with pytest.raises(RuntimeError, match='must stay loud'):
+            await git_ops.remove_merge_worktree_guarded(wt, reason='sweep')
+
 
 # ---------------------------------------------------------------------------
 # step-9: cleanup_merge_worktree routes through the guarded primitive
@@ -419,3 +512,34 @@ class TestCleanupMergeWorktreeRouting:
         # The docstring's idempotency half: a re-call must also not raise.
         await git_ops.cleanup_merge_worktree(wt)
         assert wt.exists()
+
+    async def test_cleanup_never_raises_when_the_git_removal_cannot_spawn(
+        self, git_ops: GitOps, monkeypatch,
+    ):
+        """The OTHER half of the "Never raises" contract. Guarding only the
+        lane-lock open would leave the contract false under fd exhaustion --
+        the very condition (EMFILE) that motivates the lock guard fails the
+        subprocess spawn too, so both escapes fire from one root cause.
+
+        Unlike the lock-open path the tree here IS force-removed, and that is
+        correct: the primitive held the flock, so the lease acquire proved no
+        live holder -- the premise the rmtree fallback is documented to rest
+        on. ``_prune_registrations`` swallows its own spawn failure, so
+        nothing escapes downstream of the fallback either."""
+        wt = await _make_ephemeral_worktree(git_ops)
+        monkeypatch.setattr('orchestrator.git_ops._run', _raise_emfile_spawn)
+
+        await git_ops.cleanup_merge_worktree(wt)
+
+        assert not wt.exists(), (
+            'the lease was confirmed (we held the flock), so the crash-safe '
+            'rmtree fallback is licensed and must clear this unleased tree'
+        )
+        assert not lane_lock_path(wt).exists(), (
+            'cleanup unlinks the lock the primitive retained on failed, once '
+            'the lane is gone'
+        )
+
+        # Idempotency half: a re-call over the now-absent tree must not raise
+        # either (the primitive short-circuits to 'not_present').
+        await git_ops.cleanup_merge_worktree(wt)
