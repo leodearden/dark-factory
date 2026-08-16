@@ -4146,6 +4146,22 @@ class GitOps:
                         f'preserved, relocate them manually (`git worktree move` '
                         f'+ `git branch -m`) and re-dispatch.'
                     )
+                # Clear the foreign sibling .task-meta/<branch_name> root too
+                # (W11 ε1 pattern — same call the warm-lane different-task
+                # acquisition routes already make). Quarantining the branch
+                # alone would leave the deleted task's plan.json to be
+                # adopted by workflow.py's plan-resume onto the NEW task.
+                # Placement is load-bearing: this runs AFTER read_worktree_title
+                # (which reads that same root to detect the mismatch) and
+                # ONLY on this confirmed-mismatch route — never on the
+                # match/fail-open path below, which is a same-task resume
+                # whose own artifacts must be preserved per
+                # _clear_foreign_meta_root's own "must NOT be called on
+                # same-task reuse routes" contract. The foreign work itself
+                # is not lost — the branch and its full tree are preserved
+                # under quarantine_base/<branch_name>-<ts>; only the
+                # orchestration sidecar (plan.json and friends) is dropped.
+                self._clear_foreign_meta_root(worktree_path)
                 return None
 
         info = await self._reuse_warm_lane(worktree_path, full_branch)
