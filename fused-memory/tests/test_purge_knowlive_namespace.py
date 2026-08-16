@@ -934,6 +934,25 @@ class TestRunApplyStoreMutationPreflight:
 
         monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
 
+    @staticmethod
+    def _fail_closed_records(caplog) -> list:
+        """The guard site's OWN diagnosis.
+
+        ``main`` has no handler at all here -- the refusal exits the
+        interpreter as an uncaught traceback -- so this ERROR record is the
+        ONLY place the operator is told what was refused and what to do
+        instead. Pinned on the fail-closed marker and the remedy rather than
+        the full prose: rewording the message stays cheap, deleting it does
+        not.
+        """
+        return [
+            rec for rec in caplog.records
+            if rec.name == 'purge_knowlive_namespace'
+            and rec.levelname == 'ERROR'
+            and 'NOT started (fail-closed)' in rec.getMessage()
+            and 'MCP server' in rec.getMessage()
+        ]
+
     @pytest.mark.asyncio
     async def test_apply_performs_zero_mutations_when_the_store_is_unwritable(
         self, monkeypatch
@@ -1062,7 +1081,9 @@ class TestRunApplyStoreMutationPreflight:
         assert 'purge_knowlive_namespace' in calls[0]['operation']
         assert '--apply' in calls[0]['operation']
 
-    def test_the_refusal_escapes_main_and_is_never_a_zero_exit(self, monkeypatch):
+    def test_the_refusal_escapes_main_and_is_never_a_zero_exit(
+        self, monkeypatch, caplog
+    ):
         """``main`` calls ``asyncio.run`` bare -- no try/except -- and otherwise
         returns 0 unconditionally, so the refusal must PROPAGATE and exit the
         interpreter non-zero (1) via an uncaught traceback.
@@ -1070,6 +1091,10 @@ class TestRunApplyStoreMutationPreflight:
         A silent zero exit here is the precise failure mode this task exists to
         prevent: this script has no other non-zero path at all, so if the
         refusal were swallowed anywhere it would read as a successful purge.
+
+        The guard site's ``logger.error`` is asserted alongside it: with no
+        handler in ``main``, that record is the only thing standing between an
+        operator and an unexplained traceback.
         """
         self._deny(monkeypatch)
         memory_service, _ = self._make_memory_service(
@@ -1092,10 +1117,15 @@ class TestRunApplyStoreMutationPreflight:
 
         monkeypatch.setattr(_mod.asyncio, 'run', _drive)
 
-        with pytest.raises(
+        with caplog.at_level('ERROR'), pytest.raises(
             _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
         ):
             _mod.main()
 
+        assert self._fail_closed_records(caplog), (
+            'nothing else explains this traceback -- the guard site must log '
+            'the fail-closed diagnosis before raising; got: '
+            f'{[rec.getMessage() for rec in caplog.records]}'
+        )
         memory_service.delete_memory.assert_not_awaited()
         memory_service.update_edge.assert_not_awaited()

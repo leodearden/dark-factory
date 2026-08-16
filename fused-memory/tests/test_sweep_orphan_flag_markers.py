@@ -2195,6 +2195,29 @@ class TestRunApplyStoreMutationPreflight:
 
         monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
 
+    @staticmethod
+    def _fail_closed_records(caplog) -> list:
+        """The guard site's OWN diagnosis, isolated from ``main``'s generic
+        handler.
+
+        Both emit ERROR from this script's logger, so neither the level nor the
+        logger name can tell them apart -- only the fail-closed marker and the
+        remedy can, and carrying those is the entire reason the site-specific
+        message exists. ``main`` logs "fatal error during sweep", which tells
+        an operator reading the journal nothing about what was refused or what
+        to do instead.
+
+        Pinned on those two clauses rather than the full prose: rewording the
+        message stays cheap, deleting it does not.
+        """
+        return [
+            r for r in caplog.records
+            if r.name == 'sweep_orphan_flag_markers'
+            and r.levelno >= logging.ERROR
+            and 'NOT started (fail-closed)' in r.getMessage()
+            and 'MCP server' in r.getMessage()
+        ]
+
     @pytest.mark.asyncio
     async def test_apply_performs_zero_mutations_when_the_store_is_unwritable(
         self, monkeypatch
@@ -2294,7 +2317,9 @@ class TestRunApplyStoreMutationPreflight:
 
         That handler labels it a generic fatal sweep error, which is precisely
         why the guard site's own ``logger.error`` must carry the fail-closed
-        diagnosis before the raise. Asserted here end-to-end: non-zero, never 0.
+        diagnosis before the raise. Both halves are asserted end-to-end: the
+        exit code is non-zero, never 0, AND the journal an operator reads
+        carries the diagnosis rather than only "fatal error during sweep".
         """
         self._deny(monkeypatch)
         memory_service = self._service()
@@ -2318,6 +2343,11 @@ class TestRunApplyStoreMutationPreflight:
             exit_code = _mod.main()
 
         assert exit_code == 2
+        assert self._fail_closed_records(caplog), (
+            "main's blanket handler only says 'fatal error during sweep', so "
+            'the guard site must log the fail-closed diagnosis itself; got: '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )
         memory_service.delete_memory.assert_not_awaited()
 
     def test_a_denied_check_predicate_never_reports_a_satisfied_backlog(
@@ -2354,4 +2384,9 @@ class TestRunApplyStoreMutationPreflight:
             exit_code = _mod.main()
 
         assert exit_code == 2, 'a refused --apply must never satisfy the --check gate'
+        assert self._fail_closed_records(caplog), (
+            'a gate that fails must say WHY it failed -- an exit 2 with no '
+            'fail-closed diagnosis is indistinguishable from a crashed sweep; '
+            f'got: {[r.getMessage() for r in caplog.records]}'
+        )
         memory_service.delete_memory.assert_not_awaited()

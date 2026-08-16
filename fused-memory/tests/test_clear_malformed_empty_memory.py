@@ -551,6 +551,29 @@ class TestRunApplyStoreMutationPreflight:
 
         monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
 
+    @staticmethod
+    def _fail_closed_records(caplog) -> list:
+        """The guard site's OWN diagnosis, isolated from ``main``'s generic
+        handler.
+
+        Both emit ERROR from this script's logger, so neither the level nor the
+        logger name can tell them apart -- only the fail-closed marker and the
+        remedy can, and carrying those is the entire reason the site-specific
+        message exists. ``main`` logs "fatal error during cleanup", which tells
+        an operator reading the journal nothing about what was refused or what
+        to do instead.
+
+        Pinned on those two clauses rather than the full prose: rewording the
+        message stays cheap, deleting it does not.
+        """
+        return [
+            rec for rec in caplog.records
+            if rec.name == 'clear_malformed_empty_memory'
+            and rec.levelname == 'ERROR'
+            and 'NOT started (fail-closed)' in rec.getMessage()
+            and 'MCP server' in rec.getMessage()
+        ]
+
     @pytest.mark.asyncio
     async def test_apply_performs_zero_mutations_when_the_store_is_unwritable(
         self, monkeypatch
@@ -646,7 +669,9 @@ class TestRunApplyStoreMutationPreflight:
         """Pinned surfacing: the exception PROPAGATES out of ``run``, so
         ``main``'s blanket ``except Exception`` (the fatal arm) catches it and
         returns 2. A silent zero-exit refusal is the exact failure mode this
-        task exists to prevent, so the non-zero outcome is asserted end-to-end.
+        task exists to prevent, so the non-zero outcome is asserted end-to-end
+        -- together with the guard site's own fail-closed diagnosis, which is
+        all that distinguishes this exit 2 from a crashed cleanup in a journal.
 
         Sync, not async: ``main`` calls ``asyncio.run`` itself. Replace
         ``asyncio.run`` so ``_run_live`` never constructs a real MemoryService
@@ -672,6 +697,11 @@ class TestRunApplyStoreMutationPreflight:
             exit_code = _mod.main()
 
         assert exit_code == 2
+        assert self._fail_closed_records(caplog), (
+            "main's blanket handler only says 'fatal error during cleanup', so "
+            'the guard site must log the fail-closed diagnosis itself; got: '
+            f'{[rec.getMessage() for rec in caplog.records]}'
+        )
         client.delete.assert_not_awaited()
         client.retrieve.assert_not_awaited()
 
