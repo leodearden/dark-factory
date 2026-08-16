@@ -180,7 +180,28 @@ reconciliation:
   data_dir: "${RECONCILIATION_DATA_DIR:./data/reconciliation}"
   buffer_size_threshold: 250
   max_staleness_seconds: 14400
-  conditional_trigger_ratio: 0.2
+  # Task 3049 lever 2 (was 0.2). The quiescent trigger fires at
+  # buffer_size_threshold * conditional_trigger_ratio, so 250 * 0.6 = 150 =
+  # throughput.STEADY_STATE_AMORTISATION_MIN_BATCH.
+  #
+  # Cycle cost fits T(B) = F + c*B with F ~ 900s and c ~ 2.5 s/event — almost
+  # entirely FIXED (measured 2026-07-25 on reify: 50 events/945s steady state =
+  # 18.9 s/event; 393 events/954s backlog chunk = 2.43 s/event). At the old
+  # 50-event batch that 900s bought only 50 events: (900 + 2.5*50)/50 = 20.5
+  # s/event, matching the 18.9 observed. At 150 it buys three times as many:
+  # (900 + 2.5*150)/150 = 8.5 s/event — a 2.2x amortisation for a batching
+  # change alone, no work saved.
+  #
+  # Latency stays bounded: max_staleness_seconds above is a HARD trigger that
+  # fires independently of this ratio (event_buffer.py:359), so raising it
+  # delays the quiescent trigger, NOT the staleness backstop. An event's
+  # worst-case wait is unchanged.
+  #
+  # The fit is deliberately conservative and comes from two points on two
+  # different tiers — re-derive it from live data with
+  # `python -m fused_memory.reconciliation.throughput --db ... --project ...`
+  # rather than trusting it indefinitely.
+  conditional_trigger_ratio: 0.6
   burst_window_seconds: 30
   burst_cooldown_seconds: 150
   stale_lock_seconds: 7200
