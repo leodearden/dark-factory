@@ -3040,6 +3040,8 @@ def _args(tmp_path, **overrides):
         'md_out': str(tmp_path / 'census.md'),
         'config': None,
         'registry': _mod.DEFAULT_REGISTRY_PATH,
+        'history_out': str(tmp_path / 'coverage-history.json'),
+        'no_history': False,
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)

@@ -94,6 +94,7 @@ import re
 import sys
 from collections import Counter
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -444,6 +445,7 @@ def build_report(
     registry: Any = None,
     registry_error: str | None = None,
     history: dict[str, Any] | None = None,
+    extra_params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble the JSON census report from per-(project, category) cells.
 
@@ -544,6 +546,10 @@ def build_report(
             'page_size': page_size,
             # Markdown render cap only — the tables below are complete.
             'top_n': top_n,
+            # Run-shaping CLI values recorded so _regen_command can
+            # reconstruct them; merged rather than enumerated so the parser
+            # and this block cannot drift apart (task 3507).
+            **(extra_params or {}),
         },
         'projects': projects,
         'grand_total': _census_to_dict(grand_total),
@@ -1706,6 +1712,14 @@ def _regen_command(params: dict[str, Any]) -> str:
     top_n = params.get('top_n')
     if top_n is not None and top_n != DEFAULT_TOP_N:
         parts.append(f'--top-n {top_n}')
+    registry = params.get('registry')
+    if registry is not None and registry != DEFAULT_REGISTRY_PATH:
+        parts.append(f'--registry {registry}')
+    history_out = params.get('history_out')
+    if history_out is not None and history_out != DEFAULT_HISTORY_OUT:
+        parts.append(f'--history-out {history_out}')
+    if params.get('no_history'):
+        parts.append('--no-history')
     return ' '.join(parts)
 
 
@@ -2461,12 +2475,39 @@ async def _run(args: argparse.Namespace) -> int:
             coverage[project_id] = project_coverage
 
         registry, registry_error = load_registry_or_error(args.registry)
+        # Loaded BEFORE the report is built (the trend is part of the
+        # artifact) and never swallowed: CoverageHistoryError propagates to
+        # the handler below, which exits 1 with the file untouched rather
+        # than silently restarting the series from empty.
+        history = load_coverage_history(args.history_out)
         report = build_report(
             cells, coverage, top_n=args.top_n, page_size=args.page_size,
             canonical_uniqueness_enforced=read_canonical_uniqueness_enforced(),
             registry=registry, registry_error=registry_error,
+            history=history,
+            extra_params={
+                'registry': args.registry,
+                'history_out': args.history_out,
+                'no_history': bool(args.no_history),
+            },
         )
         _write_artifacts(report, args.json_out, args.md_out)
+        if args.no_history:
+            logger.info(
+                'history NOT appended (--no-history): %s left byte-unchanged',
+                args.history_out,
+            )
+        else:
+            save_coverage_history(
+                append_coverage_run(
+                    history, report,
+                    # The clock is read HERE, at the process boundary, and
+                    # injected -- append_coverage_run stays pure.
+                    stamp=datetime.now(UTC).isoformat(timespec='seconds'),
+                ),
+                args.history_out,
+            )
+            logger.info('coverage history appended: %s', args.history_out)
 
         complete = report['coverage']['complete']
         logger.info(
@@ -2483,6 +2524,12 @@ async def _run(args: argparse.Namespace) -> int:
         return 0
     except CensusScanIncomplete:
         logger.exception('ABORT: a scroll could not enumerate its full result set')
+        return 1
+    except CoverageHistoryError:
+        # Loud, per INV-2: the trend is the point of the file, and a run
+        # that quietly started a new series would report "first recorded
+        # run" forever while the old one sat unread on disk.
+        logger.exception('ABORT: the coverage history could not be read')
         return 1
     finally:
         await backend.close()
@@ -2544,6 +2591,21 @@ def _build_parser() -> argparse.ArgumentParser:
             '(default: the 32-entry fixture). A load failure is DISCLOSED as '
             'registry_coverage: null + registry_error, never as an all-zero '
             'gauge.'
+        ),
+    )
+    parser.add_argument(
+        '--history-out', dest='history_out', default=DEFAULT_HISTORY_OUT,
+        help=(
+            'Committed append-only coverage-history file, read for the trend '
+            f'and extended by one compact run (default: {DEFAULT_HISTORY_OUT})'
+        ),
+    )
+    parser.add_argument(
+        '--no-history', dest='no_history', action='store_true',
+        help=(
+            'Measure and report the trend WITHOUT appending to the history. '
+            'For ad-hoc operator runs: the committed file is the nightly '
+            "timer's series, and a one-off look must not enter it."
         ),
     )
     parser.add_argument(
