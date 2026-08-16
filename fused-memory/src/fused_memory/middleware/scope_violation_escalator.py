@@ -25,9 +25,11 @@ advisory described in rejection wording reports a rejection that never
 happened — and tells the reader to resubmit work that was never blocked.
 The advisory wording may not over-claim in the other direction either
 (task 4159): ``report_rejection`` is called from the ``submit_task``
-PHASE-1 guard, before ``tm.add_task`` and before the curator chooses
-drop/combine/create/refuse, so it cannot state that a task exists.  The
-stamp above reaches a task only on the ``create`` outcome.
+PHASE-1 guard, before ``tm.add_task`` and before the submission has been
+resolved at all, so it cannot state that a task exists.  The stamp above
+reaches a task only when one is actually CREATED from the submission — a
+candidate that is dropped, or folded into an existing task, never carries
+it (``_execute_combine`` does not propagate it to a combine target).
 Both outcomes are severity ``info`` — the FLOOR of the
 ``blocking|info|critical|urgent`` vocabulary in ``escalation.models``, so the
 wording is what distinguishes them, not the severity.
@@ -217,11 +219,14 @@ class ScopeViolationEscalator:
         The advisory wording deliberately does NOT say a task exists
         (task 4159).  This method is reached from the ``submit_task``
         PHASE-1 path guard, which returns before ``tm.add_task`` is called
-        and before the curator picks drop/combine/create/refuse — so at the
-        moment this record is written the outcome is genuinely unknown, and
-        the ``metadata.possible_scope_mismatch`` stamp reaches a task only
-        on ``create`` (``_execute_combine`` does not propagate it to a
-        combine target).
+        and before the submission has been resolved — so at the moment this
+        record is written the outcome is genuinely unknown, and the
+        ``metadata.possible_scope_mismatch`` stamp reaches a task only when
+        one is actually created from the submission (``_execute_combine``
+        does not propagate it to a combine target).  The wording names no
+        resolver and no timing either: the ordinary ticket path is resolved
+        asynchronously by the curator, but ``planning_mode`` bypasses the
+        curator and creates the task synchronously.
 
         Returns the escalation id when one was filed, ``None`` otherwise
         (escalation package missing, queue write failed, etc.).  Never
@@ -299,26 +304,32 @@ class ScopeViolationEscalator:
         if advisory:
             # Claims ONLY what is established at guard time (task 4159).  This
             # fires from submit_task phase-1 — before tm.add_task, before the
-            # curator picks drop/combine/create/refuse — so any assertion that
-            # a task exists would be unverified here and false on a drop or a
-            # combine.  The stamp sentence is conditional on the CREATE outcome
-            # specifically: _execute_combine merges only curator_* keys onto
-            # the target, so a combine target never receives this candidate's
-            # possible_scope_mismatch.  Nor can this say "queued for curation"
-            # as an absolute — planning_mode bypasses the curator entirely, and
-            # that kwarg is not read until well after this guard runs.
+            # submission has been resolved at all — so any assertion that a
+            # task exists would be unverified here, and false if the candidate
+            # is dropped or folded into an existing task.  The prose states
+            # only that epistemic fact: it names no RESOLVER and no timing,
+            # because both differ by path.  The ordinary ticket path is
+            # resolved asynchronously by the curator, but planning_mode
+            # bypasses the curator and creates the task synchronously, and
+            # that kwarg is not read until well after this guard runs — so
+            # "queued for curation" / "resolved asynchronously" would be the
+            # same class of unverified claim in a new direction.  The stamp
+            # sentence is conditional on a task actually being CREATED:
+            # _execute_combine merges only curator_* keys onto the target, so
+            # a combine target never receives this candidate's
+            # possible_scope_mismatch.
             detail_lines.append(
                 'A task creation request cited paths that look like they belong '
                 'to another project, based on a heuristic scan of its prose '
                 '(title/description/details) only.  The submission was NOT '
                 'blocked, and no resubmission is needed.  This record is filed '
                 'at the submission guard, BEFORE the submission has been '
-                'resolved, so it does not establish that a task exists: '
-                'resolution happens asynchronously and may create a new task, '
-                'combine this candidate into an existing one, or drop it.  '
-                'Only a task the curator CREATES carries the match as '
+                'resolved, so it does not establish that a task exists: the '
+                'submission may result in a new task, be folded into an '
+                'existing one, or be dropped.  Only a task newly created from '
+                'this submission carries the match as '
                 'metadata.possible_scope_mismatch — a candidate that is '
-                'dropped, or combined into an existing task, does not.  '
+                'dropped, or folded into an existing task, does not.  '
                 'suggested_project above is a POSSIBLE owner, not a verdict: '
                 'review and reroute ONLY if a task does result and the '
                 'attribution above is actually correct.',

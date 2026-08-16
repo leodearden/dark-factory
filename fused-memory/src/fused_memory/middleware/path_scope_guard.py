@@ -37,10 +37,12 @@ here so a future reader need not re-derive the taxonomy from the call site:
    the SUBMISSION proceeds, stamped ``metadata.possible_scope_mismatch``,
    and a non-blocking advisory escalation fires.  Both attach at the
    ``submit_task`` PHASE-1 seam, before ``tm.add_task`` and before the
-   curator picks drop/combine/create/refuse — so the stamp reaches a task
-   only on ``create`` (``_execute_combine`` does not propagate it to a
-   combine target), and neither the stamp nor the escalation establishes
-   that a task exists (task 4159).  ITSELF GATED on attribution —
+   submission has been resolved (it may yield a new task, be folded into an
+   existing one, or be dropped) — so the stamp reaches a task only when one
+   is actually CREATED from the submission (``_execute_combine`` does not
+   propagate it to a combine target), and neither the stamp nor the
+   escalation establishes that a task exists (task 4159).  ITSELF GATED on
+   attribution —
    :func:`local_attesting_signals` (task 3106) asks whether the DECLARED
    deliverables (``metadata.files`` ∪ ``files_to_modify`` ∪ ``modules``)
    attest work in the FILING project, i.e. at least one is owned by it and

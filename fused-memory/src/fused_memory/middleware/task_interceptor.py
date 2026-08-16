@@ -1903,9 +1903,9 @@ class TaskInterceptor:
         resubmission of work that was never turned away.  The advisory
         wording must not over-claim in the other direction either: this seam
         sits in ``submit_task`` PHASE-1, before ``tm.add_task`` and before
-        the curator picks drop/combine/create/refuse, so neither this
-        docstring nor the escalation may state that a task exists
-        (task 4159).
+        the submission has been resolved (it may yield a new task, be folded
+        into an existing one, or be dropped), so neither this docstring nor
+        the escalation may state that a task exists (task 4159).
 
         The optional *llm_reason* is forwarded to ``report_rejection``
         (task 1822) so genuine-misroute / fail-safe cases carry the LLM
@@ -1977,8 +1977,8 @@ class TaskInterceptor:
           :meth:`_attach_possible_scope_mismatch`) and a ``scope_violation``
           escalation fires (loud, non-blocking).  Both act on the
           SUBMISSION: this runs in ``submit_task`` phase-1, so the stamp
-          reaches a task only if the curator later creates one, and the
-          escalation must not claim otherwise (task 4159).
+          reaches a task only if one is later CREATED from that submission,
+          and the escalation must not claim otherwise (task 4159).
 
           NOT SILENT when suppressed: one structured INFO record carries the
           matched prose prefixes, the prose-suggested owner, the filing
