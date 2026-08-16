@@ -284,12 +284,75 @@ def test_tests_scripts_diff_executes_its_own_suite_and_keeps_lint_and_type() -> 
     )
 
 
-# The tests/scripts suite's own measured wall-clock, from task 3062's four
-# independent fallback-path runs (esc-3062-3): 105-127s. The floor below is set
-# against the WORST of those (127s), so it is a measurement-derived bound rather
-# than a guess.
-MEASURED_SUITE_WORST_SECS = 127.0
-MIN_MODULE_BUDGET_SECS = 300
+def _min_budget(worst: float) -> int:
+    """~2x the worst measured run, rounded DOWN to the nearest 100s.
+
+    The EXACT expression both sibling guards use for their own floors
+    (``test_scripts_module_config.MIN_MODULE_BUDGET_SECS``, task 3458, and
+    ``test_module_verify_budgets._min_budget``, task 3473), COPIED rather than
+    imported so the three cannot drift in SHAPE while staying free to fail
+    INDEPENDENTLY — a test file importing a sibling test file couples two
+    guards that must be able to fail apart, the convention
+    ``test_module_verify_budgets.py``'s header states. What pins the shape
+    instead is ``_min_budget(930.59) == 1800`` against the sibling's published
+    pair, in ``test_min_module_budget_is_derived_from_the_measured_worst_run``.
+
+    DERIVED from the measurement rather than hand-set beside it, because that
+    exact pair has already rotted once undetected — in THIS file: a hand-set
+    300s floor left standing against a 127.0s figure while
+    ``tests/scripts/orchestrator.yaml`` had since recorded a 233.50s worst run
+    of the command this module actually declares (task 3703,
+    reviewer-flagged; both sibling guards had NAMED the staleness in prose,
+    which is precisely what a comment can do and an assertion could not).
+
+    DEGENERATES TO ZERO for cheap suites — ``_min_budget(22.49) == 0``, the
+    sampler case ``test_module_verify_budgets.py`` records — which would make
+    the floor assertion below VACUOUS. Assertion (iii) of the derivation test
+    pins that this suite is not in that regime.
+    """
+    return (int(2 * worst) // 100) * 100
+
+
+# The tests/scripts suite's own measured wall-clock. EVERY recorded run, the
+# inconvenient ones included: task 3350 exists because a single unrecorded
+# estimate ("Full warm verify here is ~2 min") was left standing in the root
+# yaml until it was off by an order of magnitude.
+#
+#   VERBATIM runs of the test_command this module config declares
+#   (`uv run --project shared pytest tests/scripts/ --tb=short -q --timeout=300`):
+#     233.50s, 167.73s               task 3350's worktree at HEAD 9d6af5289f;
+#                                    369 passed / 1 skipped each
+#     146.93s wall / 142.11s pytest  task 3703 pre-1 run A, base d6a5e32535;
+#                                    rc=0, 1072 passed / 2 skipped / 6
+#                                    deselected; /proc/loadavg 51.66 at start
+#                                    on a 32-core host
+#     185.29s wall / 180.47s pytest  task 3703 pre-1 run B, same base, same
+#                                    counts, rc=0; loadavg 61.43 at start
+#
+#   FALLBACK-PATH runs — A DIFFERENT COMMAND, kept for history and LABELLED so
+#   nobody sizes this budget against them again:
+#     105-127s                       four runs on the __fallback__ path (task
+#                                    3062, esc-3062-3) — the fleet chain's
+#                                    legs narrowed to this diff, not the
+#                                    command declared here
+#
+# SIZING RULE: the WORST RUN, never the mean and never fresh-only. Both of
+# pre-1's fresh runs came in BELOW 233.50s, so sizing on them would LOWER the
+# floor — the unsafe direction. The spread is this oversubscribed host's LOAD at
+# measurement time, not suite variance: 167.73s and 233.50s are the same command
+# on the same tree.
+#
+# HONEST CAVEAT, recorded rather than left implicit: 233.50s was measured when
+# this suite collected 369 tests, and it now collects 1072 (measured in pre-1).
+# It is therefore a LOWER BOUND on today's contended worst case, not a current
+# measurement. Do NOT scale it by the test-count ratio — RE-MEASURE under load
+# before ever tightening the budget against it.
+MEASURED_SUITE_WORST_SECS = 233.50
+# DERIVED from the measurement above, never hand-set beside it, so the two
+# cannot silently diverge again — see _min_budget's docstring for the rot that
+# motivated this and test_min_module_budget_is_derived_from_the_measured_worst_run
+# for the guard that now makes it a property. 2 * 233.50 -> 467.0 -> 400.
+MIN_MODULE_BUDGET_SECS = _min_budget(MEASURED_SUITE_WORST_SECS)
 
 
 def test_min_module_budget_is_derived_from_the_measured_worst_run() -> None:
@@ -349,8 +412,11 @@ def test_min_module_budget_is_derived_from_the_measured_worst_run() -> None:
         'produce a differently-sized floor in one file'
     )
 
-    # (ii) DERIVED, not hand-set — the rot this test exists to prevent.
-    assert MIN_MODULE_BUDGET_SECS == _min_budget(MEASURED_SUITE_WORST_SECS), (
+    # (ii) DERIVED, not hand-set — the rot this test exists to prevent. Written
+    # derivation-first rather than constant-first only because ruff's SIM300
+    # reads the other order as a Yoda condition; equality is symmetric and the
+    # claim is unchanged.
+    assert _min_budget(MEASURED_SUITE_WORST_SECS) == MIN_MODULE_BUDGET_SECS, (
         f'MIN_MODULE_BUDGET_SECS = {MIN_MODULE_BUDGET_SECS} but '
         f'_min_budget(MEASURED_SUITE_WORST_SECS={MEASURED_SUITE_WORST_SECS}) = '
         f'{_min_budget(MEASURED_SUITE_WORST_SECS)} (task 3703). The floor must '
@@ -381,9 +447,24 @@ def test_tests_scripts_module_carries_its_own_tight_verify_budget() -> None:
     This is what makes the fix a real NARROWING rather than a relabelling. Two
     sides are bounded:
 
-    - Below (b): at least 300s, which is >= 2.36x the worst of the four
-      independent measurements task 3062 logged for this suite (105-127s). An
-      achievable floor derived from measurement, not a guess.
+    - Below (b): at least ``MIN_MODULE_BUDGET_SECS``, which is not a literal
+      but ``_min_budget(MEASURED_SUITE_WORST_SECS)`` — ~2x the worst RECORDED
+      run of this module's VERBATIM test_command, floored to the nearest 100s.
+      An achievable floor derived from measurement, not a guess, and derived
+      rather than transcribed so it cannot fall out of step with the figure it
+      is derived from.
+
+        CORRECTED IN PLACE (task 3703). This bullet used to read "at least
+        300s, which is >= 2.36x the worst of the four independent measurements
+        task 3062 logged for this suite (105-127s)", and it was stale in BOTH
+        numbers and in WHICH COMMAND it credited: those four runs are
+        esc-3062-3's __fallback__-path runs, not runs of the command this
+        module config declares, and tests/scripts/orchestrator.yaml had since
+        recorded a 233.50s VERBATIM run that the hand-set 300s floor did not
+        reflect at all. Named rather than silently substituted, for the reason
+        the note in ``test_tests_scripts_is_a_registered_module_config`` gives
+        at length: this file exists BECAUSE a falsified constant was left
+        standing, so a quiet swap would defeat its purpose.
     - Above (c): strictly below the repo-root ceiling. The "tight timeouts
       surface hangs" intent that the root yaml states but — at a ceiling the
       honest green path provably cannot clear — could not deliver, now lives
@@ -404,14 +485,20 @@ def test_tests_scripts_module_carries_its_own_tight_verify_budget() -> None:
         'seven subprojects, applied to a suite that measures ~105-127s'
     )
 
-    # (b) Measurement-derived floor.
+    # (b) Measurement-derived floor — DERIVED by _min_budget from
+    # MEASURED_SUITE_WORST_SECS, not hand-set beside it (task 3703).
     assert mc.verify_command_timeout_secs >= MIN_MODULE_BUDGET_SECS, (
         f'{MODULE_PREFIX} verify_command_timeout_secs='
-        f'{mc.verify_command_timeout_secs} is below the {MIN_MODULE_BUDGET_SECS}s '
-        f'floor (task 3350). The suite measured up to {MEASURED_SUITE_WORST_SECS}s '
-        'across four independent runs (esc-3062-3); a budget under the floor '
-        'would manufacture infra_timeout on the honest green path — the exact '
-        'defect this task exists to remove, reintroduced one level down'
+        f'{mc.verify_command_timeout_secs} is below the '
+        f'{MIN_MODULE_BUDGET_SECS}s floor (task 3350). That floor is not a '
+        f'literal: it is _min_budget(MEASURED_SUITE_WORST_SECS='
+        f'{MEASURED_SUITE_WORST_SECS}), ~2x the worst RECORDED run of this '
+        "module's VERBATIM test_command floored to the nearest 100s — see the "
+        'provenance block above that constant for every run behind it. A budget '
+        'under the floor would manufacture infra_timeout on the honest green '
+        'path — the exact defect this task exists to remove, reintroduced one '
+        'level down. Raise MEASURED_SUITE_WORST_SECS from a fresh measurement '
+        'and the floor follows; do not hand-set the floor back'
     )
 
     # (c) Strictly tighter than the repo-root ceiling: a real narrowing.
