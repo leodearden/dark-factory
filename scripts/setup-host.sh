@@ -355,6 +355,27 @@ _orch_skip_reason() {
 _orch_install_units=()
 for _unit in "${_orch_units[@]}"; do
   _kinds="${_orch_verdict[$_unit]:-unverified}"
+
+  # Checked FIRST, ahead of the override, because it is physics rather than
+  # judgement: DF_INSTALL_ORCH_UNITS=1 says "install over the reported
+  # finding", and no amount of operator intent creates a source file. A bare
+  # `cp` from a missing template exits non-zero and, under `set -euo pipefail`,
+  # aborts this whole script — so every section BELOW would silently never run
+  # because one unit's template was deleted. Measured: rc=1 at `cp: cannot
+  # stat`, no daemon-reload, no enables.
+  #
+  # Deliberately a file test rather than a fourth `vanished` case arm: it must
+  # also cover a unit the gate never reported on. `_orch_units` and the
+  # checker's registry are kept in step by a test, but under the override a
+  # unit with no verdict is installed on trust, and trust does not create a
+  # file. (`unreadable` needs no such guard — `cp` copies bytes and never
+  # decodes, so copying to or from an undecodable unit is exactly the repair
+  # the operator asked for.)
+  if [ ! -f "$REPO_ROOT/scripts/$_unit" ]; then
+    warn "SKIPPING $_unit — $(_orch_skip_reason vanished "$_unit"); its installed copy is UNCHANGED"
+    continue
+  fi
+
   if [ "${DF_INSTALL_ORCH_UNITS:-0}" = "1" ] || [ "$_kinds" = clean ] || [ "$_kinds" = absent ]; then
     _orch_install_units+=("$_unit")
   else

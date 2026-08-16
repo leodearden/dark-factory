@@ -2109,6 +2109,50 @@ def test_force_all_installs_even_drifted_and_unverified_units(
     )
 
 
+def test_force_all_still_cannot_copy_a_source_that_does_not_exist(
+    tmp_path: pathlib.Path,
+):
+    """The override installs over a FINDING; it cannot conjure a missing file.
+
+    Measured before this guard existed: DF_INSTALL_ORCH_UNITS=1 with one
+    committed template deleted exits 1 at `cp: cannot stat ...`, and under
+    `set -euo pipefail` that aborts setup-host.sh outright — no daemon-reload,
+    no enables, and every LATER section of the host installer (jCodeMunch,
+    Claude config, ...) silently never runs. The operator asked to install over
+    a reported drift; they did not ask to halt the host setup.
+
+    The guard is deliberately PHYSICAL (does the source file exist) rather than
+    a fourth verdict arm, because it must also hold for a unit the gate never
+    reported on at all — `_orch_units` and the checker's registry are kept in
+    step by a test, but under the override a unit with no verdict is installed
+    on trust, and trust does not create a file.
+    """
+    repo = _fake_repo(tmp_path)
+    unit_dir = tmp_path / "installed"
+    _install_all_units(repo, unit_dir)
+    (repo / "scripts" / "orchestrator-know-live.service").unlink()
+
+    survivor = unit_dir / "orchestrator-watchdog.timer"
+    survivor.unlink()
+
+    result = _run_installer_section(
+        tmp_path, repo, unit_dir, env_extra={"DF_INSTALL_ORCH_UNITS": "1"}
+    )
+
+    assert result.returncode == 0, (
+        "DF_INSTALL_ORCH_UNITS=1 with a vanished committed unit ABORTED the "
+        "installer. Every section after this one was skipped.\n"
+        f"{result.stdout}\n{result.stderr}"
+    )
+    assert survivor.is_file(), (
+        "The vanished unit stopped its siblings from being installed even "
+        f"under the override.\n{result.stdout}"
+    )
+    assert "orchestrator-know-live.service" in _warnings_naming(
+        result.stdout, "orchestrator-know-live.service"
+    ), f"The unit with no source was skipped silently.\n{result.stdout}"
+
+
 def test_a_missing_checker_does_not_read_as_not_installed_here(
     tmp_path: pathlib.Path,
 ):
