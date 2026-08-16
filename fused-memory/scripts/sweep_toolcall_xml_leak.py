@@ -184,11 +184,23 @@ CLASSIFICATIONS = (CLEAN, REPAIRABLE_TAIL, REPAIRABLE_DUPLICATE, MANUAL_REVIEW)
 # fused-memory/tests/test_toolcall_xml_leak_sweep_artifacts.py) bind to this
 # constant directly rather than re-typing it and risking silent drift (task
 # 3738).
+#
+# The four PRODUCER sites set their flag through these names too, so the
+# vocabulary is single-sourced in both directions: the sites that raise a flag
+# and resolve_exit_code(), which acts on it, cannot disagree about a spelling.
+# ADDING A FIFTH OUTCOME means adding its name here and putting it in the tuple
+# -- a producer that writes a bare string literal instead is invisible to
+# resolve_exit_code(), which exits 0 while the record needs a human.
+RECORD_ERROR = 'record_error'
+CONTENT_LOST_IN_FLIGHT = 'content_lost_in_flight'
+SKIPPED_NOT_MEM0_ROUTED = 'skipped_not_mem0_routed'
+SKIPPED_METADATA_WOULD_BE_REJECTED = 'skipped_metadata_would_be_rejected'
+
 HUMAN_ADJUDICATION_FLAGS: tuple[str, ...] = (
-    'record_error',
-    'content_lost_in_flight',
-    'skipped_not_mem0_routed',
-    'skipped_metadata_would_be_rejected',
+    RECORD_ERROR,
+    CONTENT_LOST_IN_FLIGHT,
+    SKIPPED_NOT_MEM0_ROUTED,
+    SKIPPED_METADATA_WOULD_BE_REJECTED,
 )
 
 
@@ -720,7 +732,7 @@ async def run(args: Any, memory_service: Any, progress: dict | None = None) -> d
                     match.get('id'),
                 )
         except Exception as exc:  # noqa: BLE001 - one bad record must not void the run
-            record['record_error'] = True
+            record[RECORD_ERROR] = True
             record['error'] = str(exc)
             logger.exception(
                 'sweep_toolcall_xml_leak: memory_id=%s failed mid-repair (%s). '
@@ -785,7 +797,7 @@ async def _repair_record(
 
     routed, routing_reason = routes_to_mem0(payload)
     if not routed:
-        record['skipped_not_mem0_routed'] = True
+        record[SKIPPED_NOT_MEM0_ROUTED] = True
         record['error'] = routing_reason
         logger.warning(
             'sweep_toolcall_xml_leak: refusing to repair memory_id=%s -- %s. '
@@ -807,7 +819,7 @@ async def _repair_record(
         metadata, enforce=enforce, enforce_kind_registry=enforce_kind_registry
     )
     if not accepted:
-        record['skipped_metadata_would_be_rejected'] = True
+        record[SKIPPED_METADATA_WOULD_BE_REJECTED] = True
         record['error'] = metadata_reason
         logger.warning(
             'sweep_toolcall_xml_leak: refusing to repair memory_id=%s -- %s. '
@@ -857,7 +869,7 @@ def _report_content_lost(record: dict, memory_id: Any, error: str) -> None:
     already deleted, so the original text now exists only in this report.
     ``repaired`` is deliberately left False.
     """
-    record['content_lost_in_flight'] = True
+    record[CONTENT_LOST_IN_FLIGHT] = True
     record['error'] = error
     logger.error(
         'sweep_toolcall_xml_leak: CONTENT LOST IN FLIGHT for memory_id=%s -- '
