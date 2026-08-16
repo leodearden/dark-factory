@@ -20,9 +20,12 @@ Two tests, deliberately split (see the plan's design decision):
   because a guard keyed on the already-fixed set cannot catch the regression
   it exists to prevent: a fixture authored tomorrow in the same defective
   shape would be judged on plausibility with the suite still green. The two
-  fixtures that remain in that shape (``df_task_12``, ``df_task_13``) are
-  outside this task's editable scope and are named in ``_EXEMPT_NO_REFERENCE``
-  under a STRICT xfail, so the exemption is visible and shrinks loudly.
+  fixtures that once remained in that shape (``df_task_12``, ``df_task_13``)
+  were back-filled by task 3828, so ``_EXEMPT_NO_REFERENCE`` is now EMPTY and
+  the guard covers every fixture with a landed commit, no holdouts. The
+  exemption machinery survives as the documented escape hatch: a name added
+  there is held under a STRICT xfail, so the exemption is visible and shrinks
+  loudly the day it is fixed.
 * Test B materializes the real diff through the production helper
   ``snapshots.get_diff_between_commits`` — the PRD's named user-observable
   signal — and SKIPS with an explicit reason when the fixture's checkout or a
@@ -54,17 +57,18 @@ TASKS_DIR = Path(runner.__file__).parent / 'tasks'
 # ``_WITH_POST_TASK_COMMIT``).
 _BACKFILLED = ('reify_task_12', 'reify_task_27', 'df_task_18')
 
-# Fixtures that carry a top-level ``post_task_commit`` but no ``reference``
-# block. Task 3828 is back-filling the last two: ``df_task_12`` leaves this
-# list as its reference block lands, and ``df_task_13`` follows. (The original
-# justification — "outside this task's locked module set" — was 3628's, whose
-# lane could edit only the three fixtures above; it no longer applies.)
+# Fixtures exempted from the corpus guard below — now EMPTY, and meant to stay
+# that way. Task 3828 back-filled the last two holdouts (``df_task_12``,
+# ``df_task_13``), so every fixture carrying a landed ``post_task_commit``
+# declares a ``reference``.
 #
-# Listed by name, and enforced with a STRICT xfail rather than skipped, so the
-# exemption is both visible and shrinkable: the day one is back-filled its case
-# XPASSes and this suite fails until the name is removed. An exemption that can
-# be forgotten is how the corpus grew these two in the first place.
-_EXEMPT_NO_REFERENCE = ('df_task_13',)
+# Kept rather than deleted because it is the cheapest way to silence a genuine
+# corpus-guard failure, and therefore the thing that most needs a tripwire: a
+# name added here must be a GENUINELY defective fixture, which
+# ``test_the_exempt_set_is_exactly_the_known_defective_fixtures`` enforces —
+# not a way to quiet the guard. The STRICT xfail catches the opposite mistake:
+# a stale exemption XPASSes and fails this suite until the name is removed.
+_EXEMPT_NO_REFERENCE: tuple[str, ...] = ()
 
 
 def _fixture_names() -> list[str]:
