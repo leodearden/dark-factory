@@ -315,6 +315,12 @@ class GpuBaseline(BaseModel):
     reading: GpuReading
     consumers: list[GpuConsumer]
     measured_at: datetime
+    #: Arms the operator KNOWINGLY left resident when this baseline was taken
+    #: (`lms_ctl start --no-exclusive`).  Empty means the card was expected to
+    #: hold nothing of ours, which is the strict reading and the default: a
+    #: record that does not say otherwise excuses nobody.  See
+    #: :func:`unexpected_baseline_consumers` for what a non-empty list relaxes.
+    coresident_arms: list[str] = []
 
 
 class GpuSnapshot(BaseModel):
@@ -563,8 +569,25 @@ def probe_gpu_consumers(runner: GpuRunner | None = None) -> list[GpuConsumer]:
     return parse_nvidia_smi_compute_apps_csv(output)
 
 
+def matching_foreign_pattern(consumer: GpuConsumer) -> ConsumerPattern | None:
+    """The :data:`KNOWN_FOREIGN_CONSUMERS` entry this consumer wears, if any.
+
+    Authored once because three call sites need the SAME answer and would
+    otherwise each re-derive it: the baseline guard, the probe-time
+    classifier, and ``lms_ctl.start`` deciding whether a refusal could
+    possibly be a co-resident arm.  A pattern added here must not become
+    decidable in one of them and not the others.
+    """
+    return next(
+        (p for p in KNOWN_FOREIGN_CONSUMERS if p.matches(consumer.process_name)),
+        None,
+    )
+
+
 def unexpected_baseline_consumers(
     consumers: Sequence[GpuConsumer],
+    *,
+    coresident_arms: Sequence[str] = (),
 ) -> list[GpuConsumer]:
     """Which of these has no business holding the card before an arm starts?
 
@@ -576,11 +599,31 @@ def unexpected_baseline_consumers(
     possible rule is also the safest one — it catches ollama and equally
     catches whatever nobody anticipated.
 
-    :func:`classify_pollution` deliberately CANNOT use this rule.  At probe time
-    the arm's own container is legitimately a new consumer, and
-    ``--query-compute-apps=pid,process_name,used_memory`` cannot tell a
-    containerised vLLM ``python`` from any other ``python``, so this allowlist
-    there would flag every healthy run.  The asymmetry is intended.
+    *coresident_arms* is the ONE case where that premise does not hold, and it
+    is a documented, supported one: ``lms_ctl start --no-exclusive`` starts an
+    arm while another arm's unit is deliberately left running ("you have
+    checked the arithmetic yourself", README "One arm at a time").  Then
+    something of ours IS legitimately on the card at baseline, and
+    ``--query-compute-apps=pid,process_name,used_memory`` cannot tell that
+    containerised vLLM ``python`` from any other ``python`` -- the same
+    undecidability :func:`classify_pollution` documents.  So a NON-EMPTY
+    *coresident_arms* narrows this to the negative rule that is still decidable:
+    a consumer over the floor offends only if it matches
+    :data:`KNOWN_FOREIGN_CONSUMERS`.  ollama is still refused; an unrecognised
+    holder is excused rather than misdiagnosed as one.
+
+    That relaxation is deliberately NOT free, and the caller pays for it: the
+    excused consumers are recorded verbatim in the baseline inventory, the
+    arm ids that bought the excuse are recorded beside them
+    (:attr:`GpuBaseline.coresident_arms`), and :func:`classify_pollution` still
+    catches any DRIFT in those pids between baseline and probe.  An empty
+    *coresident_arms* -- the default, and what an older baseline file with no
+    such key reads as -- excuses nobody.
+
+    :func:`classify_pollution` deliberately CANNOT use the strict rule at all.
+    At probe time the arm's own container is legitimately a new consumer, so
+    this allowlist there would flag every healthy run.  The asymmetry is
+    intended.
 
     Size matters as much as name: an allowlist keyed on the process name alone
     would let a leftover containerised vLLM sit in a "clean" baseline under the
@@ -589,6 +632,10 @@ def unexpected_baseline_consumers(
     offenders: list[GpuConsumer] = []
     for consumer in consumers:
         if consumer.used_mib < POLLUTION_FLOOR_MIB:
+            continue
+        if coresident_arms:
+            if matching_foreign_pattern(consumer) is not None:
+                offenders.append(consumer)
             continue
         expected = any(
             entry.matches(consumer.process_name)
@@ -648,10 +695,7 @@ def classify_pollution(
             continue
         if consumer.used_mib < POLLUTION_FLOOR_MIB:
             continue
-        foreign = next(
-            (p for p in KNOWN_FOREIGN_CONSUMERS if p.matches(consumer.process_name)),
-            None,
-        )
+        foreign = matching_foreign_pattern(consumer)
         if foreign is not None:
             reasons.append(
                 f'{foreign.label} arrived while the arm ran: pid {consumer.pid} '
@@ -844,9 +888,16 @@ def baseline_path(arm_id: str) -> Path:
 
 
 def assert_clean_baseline(
-    consumers: Sequence[GpuConsumer], *, context: str = '',
+    consumers: Sequence[GpuConsumer],
+    *,
+    context: str = '',
+    coresident_arms: Sequence[str] = (),
 ) -> None:
     """Raise :class:`PollutedBaselineError` if anything foreign holds the card.
+
+    *coresident_arms* is passed straight through to
+    :func:`unexpected_baseline_consumers`; see there for what a non-empty list
+    narrows the rule to, and why only ``--no-exclusive`` may supply one.
 
     Exists so the offending-consumer message is authored ONCE and every caller
     raises the identical, pid-naming error.  There are two callers on purpose,
@@ -859,7 +910,9 @@ def assert_clean_baseline(
       INTEGRITY backstop: no polluted baseline is ever persisted, whatever a
       caller did or did not check first.
     """
-    offenders = unexpected_baseline_consumers(consumers)
+    offenders = unexpected_baseline_consumers(
+        consumers, coresident_arms=coresident_arms,
+    )
     if offenders:
         raise PollutedBaselineError(offenders, context=context)
 
@@ -869,6 +922,7 @@ def record_baseline(
     reading: GpuReading,
     *,
     consumers: Sequence[GpuConsumer],
+    coresident_arms: Sequence[str] = (),
 ) -> Path:
     """Persist the pre-start GPU reading AND inventory for *arm_id*.
 
@@ -889,10 +943,20 @@ def record_baseline(
     *consumers* is REQUIRED and keyword-only, not optional.  An optional
     inventory would let a caller record a baseline carrying no evidence about
     who else held the card, and downstream that absence reads as "clean".
+
+    *coresident_arms* names the arms a ``--no-exclusive`` start knowingly left
+    on the card.  It is PERSISTED, not merely consulted: every later reader of
+    this file -- the healthcheck included -- must apply the same relaxed rule
+    to the same inventory, and a relaxation that lived only in the caller's
+    memory would make the identical file mean two different things depending
+    on who read it.
     """
     consumers = list(consumers)
+    coresident_arms = list(coresident_arms)
     assert_clean_baseline(
-        consumers, context=f'refusing to record a baseline for arm {arm_id!r}',
+        consumers,
+        context=f'refusing to record a baseline for arm {arm_id!r}',
+        coresident_arms=coresident_arms,
     )
 
     path = baseline_path(arm_id)
@@ -904,6 +968,7 @@ def record_baseline(
         'used_mib': reading.used_mib,
         'free_mib': reading.free_mib,
         'consumers': [consumer.model_dump(mode='json') for consumer in consumers],
+        'coresident_arms': coresident_arms,
     }
     path.write_text(json.dumps(payload, indent=2) + '\n')
     return path
@@ -950,6 +1015,12 @@ def read_baseline_record(arm_id: str) -> GpuBaseline:
             ),
             consumers=[GpuConsumer(**entry) for entry in payload['consumers']],
             measured_at=datetime.fromisoformat(payload['measured_at']),
+            # Absent means NOBODY was excused, which is the strict reading and
+            # the safe direction: an older file cannot silently acquire an
+            # excuse it never earned.  Unlike `consumers`, whose absence is
+            # fatal, a missing key here cannot flatter anything -- it can only
+            # make the guard stricter than the writer intended.
+            coresident_arms=list(payload.get('coresident_arms', [])),
         )
     except (json.JSONDecodeError, KeyError, TypeError, ValueError,
             ValidationError) as exc:

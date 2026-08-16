@@ -124,6 +124,14 @@ unit is running. The PRD's funnel never needs the slate up simultaneously, and
 on one 24 GB card two arms is an OOM. `--no-exclusive` exists for the case
 where you have checked the arithmetic yourself.
 
+`--no-exclusive` also narrows the polluted-baseline refusal below, and only for
+the arms systemd reports running: those may hold the card at baseline, are
+recorded in the baseline's inventory alongside the arm ids that excused them,
+and any *drift* in them during the run still marks the report POLLUTED. ollama
+and anything else `KNOWN_FOREIGN_CONSUMERS` names is refused either way. On an
+otherwise idle card the flag changes nothing about pollution — there is nobody
+to excuse.
+
 `Restart=no` in the unit template is deliberate: a dead arm stays dead rather
 than thrashing the GPU in a restart loop while you read the journal.
 

@@ -749,6 +749,94 @@ def test_the_whisper_writer_ceiling_admits_a_reading_at_the_ceiling_exactly():
     assert lms_vram.unexpected_baseline_consumers([over_ceiling]) == [over_ceiling]
 
 
+# --- the ONE documented exception: a knowingly co-resident arm --------------
+#
+# `lms_ctl start --no-exclusive` leaves another arm's vLLM container on the
+# card on purpose.  nvidia-smi reports it as `python` far over whisper-writer's
+# ceiling -- the same undecidability `classify_pollution` documents -- so the
+# strict rule would call the operator's own arm an intruder.
+
+
+def test_a_coresident_arm_is_excused_only_when_an_arm_was_declared():
+    """Same inventory, opposite verdicts: the excuse comes from the caller
+    saying an arm is knowingly resident, never from the reading alone."""
+    arm_container = _consumer(pid=41001, process_name='python', used_mib=9000)
+
+    assert lms_vram.unexpected_baseline_consumers([arm_container]) == [arm_container]
+    assert lms_vram.unexpected_baseline_consumers(
+        [arm_container], coresident_arms=['phi-4-14b'],
+    ) == []
+
+
+def test_a_declared_coresident_arm_does_not_excuse_ollama():
+    """The relaxation narrows to the still-decidable negative rule; the holder
+    the whole guard exists for is refused either way."""
+    offenders = lms_vram.unexpected_baseline_consumers(
+        [WHISPER, OLLAMA], coresident_arms=['phi-4-14b'],
+    )
+
+    assert offenders == [OLLAMA]
+
+
+def test_the_coresident_relaxation_still_ignores_sub_floor_noise():
+    stray = _consumer(pid=4242, process_name='/usr/bin/glxgears', used_mib=512)
+
+    assert lms_vram.unexpected_baseline_consumers(
+        [stray], coresident_arms=['phi-4-14b'],
+    ) == []
+
+
+def test_the_excusing_arms_are_persisted_so_every_reader_applies_one_rule(
+    tmp_path, monkeypatch,
+):
+    """A relaxation held only in the writer's memory would make the identical
+    file mean two different things depending on who read it."""
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path))
+    arm_container = _consumer(pid=41001, process_name='python', used_mib=9000)
+
+    lms_vram.record_baseline(
+        'qwen3.5-9b', _reading(), consumers=[WHISPER, arm_container],
+        coresident_arms=['phi-4-14b'],
+    )
+    record = lms_vram.read_baseline_record('qwen3.5-9b')
+
+    assert record.coresident_arms == ['phi-4-14b']
+    assert arm_container in record.consumers
+
+
+def test_a_baseline_written_before_this_key_existed_excuses_nobody(
+    tmp_path, monkeypatch,
+):
+    """Absent reads as the STRICT rule.  Unlike a missing `consumers` key it
+    cannot flatter anything, so it raises nothing -- it can only make the guard
+    stricter than the writer intended."""
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path))
+    path = tmp_path / 'qwen3.5-9b.json'
+    path.write_text(json.dumps({
+        'arm_id': 'qwen3.5-9b',
+        'measured_at': '2026-08-06T12:00:00+00:00',
+        'total_mib': 24576, 'used_mib': 7310, 'free_mib': 16813,
+        'consumers': [WHISPER.model_dump(mode='json')],
+    }) + '\n')
+
+    assert lms_vram.read_baseline_record('qwen3.5-9b').coresident_arms == []
+
+
+def test_recording_is_still_refused_when_only_ollama_is_the_offender(
+    tmp_path, monkeypatch,
+):
+    """The data-integrity backstop keeps its teeth under the relaxation."""
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path))
+
+    with pytest.raises(lms_vram.PollutedBaselineError):
+        lms_vram.record_baseline(
+            'qwen3.5-9b', _reading(), consumers=[WHISPER, OLLAMA],
+            coresident_arms=['phi-4-14b'],
+        )
+
+    assert not lms_vram.baseline_path('qwen3.5-9b').exists()
+
+
 def test_polluted_baseline_error_is_a_vram_probe_error():
     """So every existing `except VramProbeError` handler still catches it, and
     a polluted baseline can never escape a caller that was already careful."""

@@ -355,6 +355,87 @@ def test_cli_start_still_returns_4_when_the_arm_simply_does_not_fit(
     assert ['start', 'lms-arm@qwen3.5-9b.service'] not in fake_systemctl.calls()
 
 
+# --- `--no-exclusive` must survive the pollution guard ----------------------
+#
+# The flag is documented and supported ("you have checked the arithmetic
+# yourself", README "One arm at a time"), and in exactly the case it exists for
+# another arm's containerised vLLM is legitimately on the card.  nvidia-smi
+# calls it `python` and it holds far more than whisper-writer's ceiling, so the
+# strict positive allowlist reads it as an intruder -- which would make the flag
+# unreachable and tell the operator to free a card they deliberately loaded.
+
+#: A co-resident arm's vLLM container as `--query-compute-apps` reports it:
+#: indistinguishable from any other `python`, and far over whisper's ceiling.
+CORESIDENT_ARM = lms_vram.GpuConsumer(pid=41001, process_name='python', used_mib=9000)
+
+
+def test_no_exclusive_starts_while_another_arm_legitimately_holds_the_card(
+    fake_systemctl, baseline_dir, cli_gpu, monkeypatch,
+):
+    """The flag must actually reach systemd, not die on the pollution guard."""
+    monkeypatch.setenv('FAKE_SYSTEMCTL_LIST_UNITS', _LIST_UNITS_FIXTURE)
+    cli_gpu['consumers'] = [WHISPER, CORESIDENT_ARM]
+
+    code = lms_ctl.main(['start', 'qwen3.5-9b', '--no-exclusive'])
+
+    assert code == 0
+    assert ['start', 'lms-arm@qwen3.5-9b.service'] in fake_systemctl.calls()
+
+
+def test_the_excused_arm_and_its_memory_are_both_recorded_not_forgotten(
+    fake_systemctl, baseline_dir, cli_gpu, monkeypatch,
+):
+    """Relaxing the rule buys an audit trail, not silence: the inventory keeps
+    the co-resident consumer verbatim and the record names who excused it."""
+    monkeypatch.setenv('FAKE_SYSTEMCTL_LIST_UNITS', _LIST_UNITS_FIXTURE)
+    cli_gpu['consumers'] = [WHISPER, CORESIDENT_ARM]
+
+    lms_ctl.main(['start', 'qwen3.5-9b', '--no-exclusive'])
+
+    record = lms_vram.read_baseline_record('qwen3.5-9b')
+    assert CORESIDENT_ARM in record.consumers
+    # The arm being started is never its own excuse.
+    assert record.coresident_arms == ['granite-embedding-english-r2']
+
+
+def test_no_exclusive_still_refuses_ollama_with_the_same_distinct_code(
+    fake_systemctl, baseline_dir, cli_gpu, monkeypatch, capsys,
+):
+    """The flag excuses ARMS, not the foreign holder the guard exists for."""
+    monkeypatch.setenv('FAKE_SYSTEMCTL_LIST_UNITS', _LIST_UNITS_FIXTURE)
+    cli_gpu['consumers'] = [WHISPER, CORESIDENT_ARM, OLLAMA]
+
+    code = lms_ctl.main(['start', 'qwen3.5-9b', '--no-exclusive'])
+
+    assert code == 5
+    assert '/usr/local/lib/ollama/llama-server' in capsys.readouterr().err
+    assert ['start', 'lms-arm@qwen3.5-9b.service'] not in fake_systemctl.calls()
+
+
+def test_no_exclusive_on_an_idle_card_keeps_the_strict_rule(
+    fake_systemctl, baseline_dir, cli_gpu,
+):
+    """Only arms systemd reports RUNNING buy the relaxation.  Otherwise the
+    flag would be a blanket opt-out of the guard, and a leftover containerised
+    vLLM could sit in a 'clean' baseline under the name `python`."""
+    cli_gpu['consumers'] = [WHISPER, CORESIDENT_ARM]
+
+    code = lms_ctl.main(['start', 'qwen3.5-9b', '--no-exclusive'])
+
+    assert code == 5
+    assert ['start', 'lms-arm@qwen3.5-9b.service'] not in fake_systemctl.calls()
+
+
+def test_an_exclusive_start_records_no_excuse_at_all(
+    fake_systemctl, baseline_dir, cli_gpu,
+):
+    """The ordinary path must leave `coresident_arms` empty, so a later reader
+    of the file applies the strict rule it was written under."""
+    lms_ctl.main(['start', 'qwen3.5-9b'])
+
+    assert lms_vram.read_baseline_record('qwen3.5-9b').coresident_arms == []
+
+
 # --- exit 5 must be REACHABLE in the scenario that motivated it -------------
 #
 # The intruder that motivates code 5 is, by construction, large enough to eat

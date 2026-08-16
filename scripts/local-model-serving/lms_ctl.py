@@ -103,6 +103,37 @@ def preflight(
             )
 
 
+def _coresident_excuse(
+    arm: ArmEntry,
+    consumers: list[lms_vram.GpuConsumer],
+    *,
+    exclusive: bool,
+) -> list[str]:
+    """Which running arms, if any, may be holding this card at baseline.
+
+    Empty for an exclusive start: ``preflight`` refuses on any other running
+    arm, so there would be nothing to excuse.
+
+    ASKS SYSTEMD ONLY WHEN THE ANSWER CAN CHANGE THE VERDICT, and that laziness
+    is deliberate rather than an optimisation.  On a card that is clean under
+    the strict rule, and on one whose only offender is a KNOWN FOREIGN process
+    (ollama, which no ``--no-exclusive`` may excuse), the outcome is already
+    settled -- and ``start``'s contract is that a refused arm issues NO
+    systemctl call at all.  A ``list-units`` is read-only and starts nothing,
+    but paying for one on every refusal blurs a boundary the whole module is
+    built to keep sharp.
+    """
+    if exclusive:
+        return []
+    offenders = lms_vram.unexpected_baseline_consumers(consumers)
+    could_be_an_arm = any(
+        lms_vram.matching_foreign_pattern(offender) is None for offender in offenders
+    )
+    if not could_be_an_arm:
+        return []
+    return sorted(active_arms() - {arm.arm_id})
+
+
 def start(
     arm: ArmEntry,
     gpu: lms_vram.GpuReading | None = None,
@@ -138,11 +169,28 @@ def start(
     That is not redundancy: this call fixes operator MISDIRECTION, and the one
     inside ``record_baseline`` is the DATA INTEGRITY backstop that holds no
     matter which caller reaches it or in what order.
+
+    THE POLLUTION CHECK IS ``exclusive``-AWARE, exactly as the pre-flight is.
+    ``--no-exclusive`` is a supported escape hatch (README "One arm at a
+    time"), and in precisely the case it exists for another arm's vLLM
+    container is legitimately on the card -- appearing in the inventory as a
+    ``python`` well over ``EXPECTED_CONSUMERS``' ceiling.  Under the strict
+    positive allowlist that arm reads as pollution, so the flag would be
+    unreachable and the operator would be told to free a card they deliberately
+    loaded.  So the arms systemd reports RUNNING are passed to the guard, which
+    narrows itself to the still-decidable negative rule: ollama is refused,
+    an unrecognised holder is excused and recorded.  Only arms actually running
+    buy that excuse -- ``--no-exclusive`` on an otherwise idle card keeps the
+    strict rule, because there is nothing for it to excuse.  See
+    :func:`_coresident_excuse` for when systemd is asked at all.
     """
     reading = gpu if gpu is not None else lms_vram.probe_gpu()
     held_by = consumers if consumers is not None else lms_vram.probe_gpu_consumers()
+    coresident = _coresident_excuse(arm, held_by, exclusive=exclusive)
     lms_vram.assert_clean_baseline(
-        held_by, context=f'refusing to start arm {arm.arm_id!r}',
+        held_by,
+        context=f'refusing to start arm {arm.arm_id!r}',
+        coresident_arms=coresident,
     )
     preflight(arm, reading, exclusive=exclusive)
     # The reading the pre-flight just admitted this arm on IS the "immediately
@@ -150,7 +198,9 @@ def start(
     # Recorded here, after the refusal path and before the side effect, so a
     # refused arm leaves no baseline behind for another arm's report to pick up.
     # This call also RAISES on a polluted card, and does so before it writes.
-    lms_vram.record_baseline(arm.arm_id, reading, consumers=held_by)
+    lms_vram.record_baseline(
+        arm.arm_id, reading, consumers=held_by, coresident_arms=coresident,
+    )
     _systemctl('start', unit_name(arm))
 
 

@@ -1006,6 +1006,7 @@ BASELINE_MEASURED_AT = _datetime.datetime(
 
 def _baseline(
     used_mib=BASELINE_USED_MIB, free_mib=BASELINE_FREE_MIB, consumers=None,
+    coresident_arms=(),
 ) -> lms_vram.GpuBaseline:
     """The pre-start card, as one RECORD: the reading and the inventory.
 
@@ -1022,6 +1023,7 @@ def _baseline(
         ),
         consumers=[] if consumers is None else consumers,
         measured_at=BASELINE_MEASURED_AT,
+        coresident_arms=list(coresident_arms),
     )
 
 
@@ -1912,6 +1914,44 @@ def test_a_polluted_recorded_baseline_produces_no_report_at_all():
             gpu_probe=lambda: _snapshot(),
             probe=_passing_probe,
             baseline=_baseline(consumers=[WHISPER_CONSUMER, OLLAMA_CONSUMER]),
+        )
+
+
+def test_a_baseline_recorded_with_a_declared_coresident_arm_still_reports():
+    """`lms_ctl start --no-exclusive` legitimately records another arm's
+    container in the inventory.  Re-applying the STRICT rule at report time
+    would refuse to report on a run that was never polluted -- and the flag
+    would be unusable end to end even once `start` accepted it."""
+    arm_container = lms_vram.GpuConsumer(
+        pid=41001, process_name='python', used_mib=9000,
+    )
+
+    report = lms_healthcheck.run_healthcheck(
+        [_arm()],
+        gpu_probe=lambda: _snapshot(),
+        probe=_passing_probe,
+        baseline=_baseline(
+            consumers=[WHISPER_CONSUMER, arm_container],
+            coresident_arms=['phi-4-14b'],
+        ),
+    )
+
+    # Recorded, not silently dropped: the inventory is the audit trail that
+    # pays for the relaxation.
+    assert arm_container in report.vram.baseline_consumers
+
+
+def test_a_declared_coresident_arm_does_not_excuse_ollama_at_report_time():
+    with pytest.raises(lms_vram.PollutedBaselineError,
+                       match=str(OLLAMA_CONSUMER.pid)):
+        lms_healthcheck.run_healthcheck(
+            [_arm()],
+            gpu_probe=lambda: _snapshot(),
+            probe=_passing_probe,
+            baseline=_baseline(
+                consumers=[WHISPER_CONSUMER, OLLAMA_CONSUMER],
+                coresident_arms=['phi-4-14b'],
+            ),
         )
 
 

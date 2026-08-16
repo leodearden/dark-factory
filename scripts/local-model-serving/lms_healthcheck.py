@@ -1076,7 +1076,15 @@ def run_healthcheck(
     base = baseline if baseline is not None else lms_vram.read_baseline_records(
         [arm.arm_id for arm in arms]
     )
-    polluted_baseline = lms_vram.unexpected_baseline_consumers(base.consumers)
+    # The SAME rule the baseline was written under, read off the record itself
+    # (`coresident_arms`) rather than re-derived here: a `--no-exclusive` start
+    # legitimately records another arm in its inventory, and re-applying the
+    # strict rule now would refuse to report on a run that was never polluted.
+    # Empty -- including for a file written before that key existed -- is the
+    # strict rule unchanged.
+    polluted_baseline = lms_vram.unexpected_baseline_consumers(
+        base.consumers, coresident_arms=base.coresident_arms,
+    )
     if polluted_baseline:
         raise lms_vram.PollutedBaselineError(
             polluted_baseline,
