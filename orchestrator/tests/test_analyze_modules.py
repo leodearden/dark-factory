@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+import _hold_history_fixtures as F
 import pytest
 
 from orchestrator.analyze_modules import (
@@ -164,5 +165,61 @@ def test_iter_events_opens_runs_db_read_only(event_store: EventStore) -> None:
 
     # Reads still work — seeded event is returned.
     assert len(rows) == 1
-    _ts, event_type, _task_id, _data = rows[0]
-    assert event_type == 'lock_acquired'
+    assert rows[0]['event_type'] == 'lock_acquired'
+
+
+# ===========================================================================
+# _iter_events row shape — the contract that lets iter_hold_spans consume it
+# ===========================================================================
+#
+# The CLI keeps its own read (``fetch_events_by_type_all_runs`` has no ``since``
+# predicate and returns one list per type), so the rows it yields must be
+# shaped like the ones that fetch returns or ``iter_hold_spans`` cannot read
+# them.  Every key below is one the span helper actually reads: drop ``run_id``
+# and the run-transition era boundary goes silent; drop ``service_restart`` at
+# the SQL level and the restart boundary never arrives at all.
+
+
+def test_iter_events_yields_event_store_shaped_dicts(tmp_path: Path, event_store: EventStore):
+    """Rows carry exactly the columns iter_hold_spans reads, in ``id`` order."""
+    F.write_trace(event_store, rows=[
+        F.acquire(1, 0, 'T1', ['orchestrator/src'], run_id='run-a'),
+        F.release(2, 60, 'T1', ['orchestrator/src'], run_id='run-a'),
+        F.row(3, 90, 'task_skipped', task_id='T2',
+              run_id='run-a', data={'modules': ['orchestrator/src']}),
+        F.service_restart(4, 120, run_id='run-a'),
+    ])
+
+    rows = list(_iter_events(event_store.db_path, F.BASE_TS - timedelta(seconds=1)))
+
+    assert [r['id'] for r in rows] == [1, 2, 3, 4], 'ascending id order is required'
+    assert [r['event_type'] for r in rows] == [
+        'lock_acquired', 'lock_released', 'task_skipped', 'service_restart',
+    ], 'service_restart must survive the SQL filter — it is an era boundary'
+    for r in rows:
+        assert set(r) == {'id', 'timestamp', 'run_id', 'task_id', 'event_type', 'data'}
+        assert r['run_id'] == 'run-a', 'run_id carries the store value, not None'
+        assert isinstance(r['data'], dict), 'data is already JSON-decoded'
+    assert rows[0]['task_id'] == 'T1'
+    assert rows[0]['data']['modules'] == ['orchestrator/src']
+    assert rows[0]['timestamp'] == F.ts(0)
+
+
+def test_iter_events_tolerates_malformed_data(event_store: EventStore):
+    """A payload that is not JSON costs its own ``data``, not the row."""
+    conn = sqlite3.connect(str(event_store.db_path))
+    try:
+        conn.execute(
+            'INSERT INTO events (id, timestamp, run_id, task_id, event_type, data) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            (1, F.ts(0), 'run-a', 'T1', 'lock_acquired', 'not-json{'),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    rows = list(_iter_events(event_store.db_path, F.BASE_TS - timedelta(seconds=1)))
+
+    assert len(rows) == 1
+    assert rows[0]['data'] == {}
+    assert rows[0]['event_type'] == 'lock_acquired'
