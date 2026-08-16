@@ -1917,6 +1917,39 @@ def test_a_polluted_recorded_baseline_produces_no_report_at_all():
         )
 
 
+def test_a_vanished_baseline_consumer_reports_pollution_not_a_broken_probe():
+    """whisper-writer exits mid-run and the arm takes less than it released, so
+    `used` lands BELOW `baseline`.
+
+    `evaluate_budget` raises for that reading, and evaluated first it reached
+    the CLI's generic branch as "the GPU probe failed" (exit 4) -- blaming
+    nvidia-smi for a probe that worked perfectly on a card that was polluted
+    (exit 7). The shrink diagnosis was already computed and never printed.
+    """
+    baseline = _baseline(used_mib=7362, consumers=[WHISPER_CONSUMER])
+    # whisper gone; the arm holds 3000 MiB, so used < baseline.
+    after = _snapshot(
+        used_mib=6312, free_mib=MEASURED_TOTAL_MIB - 6312,
+        consumers=[lms_vram.GpuConsumer(
+            pid=41001, process_name='python', used_mib=3000,
+        )],
+    )
+
+    with pytest.raises(lms_vram.PollutedMeasurementError) as excinfo:
+        lms_healthcheck.run_healthcheck(
+            [_arm()], gpu_probe=lambda: after,
+            probe=_passing_probe, baseline=baseline,
+        )
+
+    message = str(excinfo.value)
+    # The operator must be told the card moved, not that the tool is broken.
+    assert str(WHISPER_CONSUMER.pid) in message
+    assert 'GPU probe' not in message or 'probe itself is fine' in message
+    assert not isinstance(excinfo.value, lms_vram.PollutedBaselineError)
+    # Still a VramProbeError, so no pre-existing handler can let it escape.
+    assert isinstance(excinfo.value, lms_vram.VramProbeError)
+
+
 def test_a_baseline_recorded_with_a_declared_coresident_arm_still_reports():
     """`lms_ctl start --no-exclusive` legitimately records another arm's
     container in the inventory.  Re-applying the STRICT rule at report time

@@ -1093,17 +1093,33 @@ def run_healthcheck(
                 f'{base.measured_at.isoformat()}'
             ),
         )
+    # POLLUTION IS CLASSIFIED BEFORE THE BUDGET IS EVALUATED, and that order is
+    # load-bearing.  `evaluate_budget` raises a plain VramProbeError when
+    # `baseline > used` -- which is exactly the SHRINK/VANISH direction
+    # `classify_pollution` diagnoses, reachable whenever a baseline holder
+    # (whisper-writer at 4050 MiB) exits mid-run while the arm takes less than
+    # it released.  Evaluated first, that raise reached the CLI's generic
+    # branch and reported "the GPU probe failed" (exit 4) for a probe that
+    # worked perfectly on a card that was polluted (exit 7), and the shrink
+    # diagnosis this function had already computed was never printed.
+    pollution, pollution_reason = lms_vram.classify_pollution(
+        base.consumers, snapshot.consumers
+    )
+    if pollution is lms_vram.PollutionState.POLLUTED:
+        pollution_reason = f'{pollution_reason}. {POLLUTED_FOOTPRINT_NOTE}'
+        if base.reading.used_mib > reading.used_mib:
+            # Void, not merely unflattering: there is no footprint to report.
+            # Probe-time pollution is otherwise NOT fatal -- the report is the
+            # honest record of what was seen and is still emitted, POLLUTED,
+            # with the refusal carried by the exit code.  This narrow case is
+            # different only because the arithmetic cannot be performed at all.
+            raise lms_vram.PollutedMeasurementError(pollution_reason)
     budget = lms_vram.evaluate_budget(
         reading.used_mib,
         reading.total_mib,
         baseline_mib=base.reading.used_mib,
         baseline_free_mib=base.reading.free_mib,
     )
-    pollution, pollution_reason = lms_vram.classify_pollution(
-        base.consumers, snapshot.consumers
-    )
-    if pollution is lms_vram.PollutionState.POLLUTED:
-        pollution_reason = f'{pollution_reason}. {POLLUTED_FOOTPRINT_NOTE}'
 
     measured_at = _now_iso()
     rows: list[ArmRow] = []
@@ -1581,8 +1597,8 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         report = run_healthcheck(arms)
-    except lms_vram.PollutedBaselineError as exc:
-        # BEFORE the VramProbeError branch below, which it subclasses.  In the
+    except (lms_vram.PollutedBaselineError, lms_vram.PollutedMeasurementError) as exc:
+        # BEFORE the VramProbeError branch below, which they subclass.  In the
         # other order this refusal would be reported as "the GPU probe failed"
         # and blame nvidia-smi for a perfectly healthy card.  Nothing is written
         # on refusal, for the same reason as the merge and no-active-arms paths:

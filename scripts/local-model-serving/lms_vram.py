@@ -160,6 +160,34 @@ class PollutedBaselineError(VramProbeError):
         )
 
 
+class PollutedMeasurementError(VramProbeError):
+    """The card changed under the measurement, so the budget arithmetic is void.
+
+    Distinct from :class:`PollutedBaselineError`, which says the card was dirty
+    BEFORE the arm started.  This one says a non-arm consumer moved DURING the
+    run and drove the readings somewhere no subtraction can interpret --
+    typically the SHRINK/VANISH direction, where a baseline holder exits and
+    ``used`` lands below ``baseline``.
+
+    It exists because that case is otherwise indistinguishable, to a caller,
+    from a broken nvidia-smi: :func:`evaluate_budget` raises a plain
+    ``VramProbeError`` for it, and the CLI would report "the GPU probe failed"
+    (exit 4) for a probe that worked perfectly on a card that was polluted
+    (exit 7).  Same operator-misdirection class the ``lms_ctl`` refusal order
+    exists to prevent, and the same remedy: name the condition the operator can
+    actually act on.
+    """
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(
+            f'the card changed under this measurement, so the budget '
+            f'arithmetic is void rather than merely unflattering: {reason}. '
+            'The GPU probe itself is fine; nothing about the arm was learned, '
+            'so no report was produced'
+        )
+
+
 class GpuReading(BaseModel):
     model_config = ConfigDict(frozen=True)
 
