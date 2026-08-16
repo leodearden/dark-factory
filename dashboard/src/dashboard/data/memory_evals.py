@@ -68,7 +68,12 @@ escalation with no usable ``dedupe_fingerprint`` is named
 and a live alarm must never be absent from both.  The openness test is positive
 (``status`` is ``pending``) rather than a blocklist of closed states, so a
 status vocabulary that grows a new terminal state fails toward "not shown as
-open" rather than toward a closed alarm rendered as live.
+open" rather than toward a closed alarm rendered as live.  A record that is not
+even an object — the parsed queue file's top level was a list, string, number
+or other non-dict JSON value — is neither classifiable nor keyable, so it takes
+neither filter path above; it is instead the ``malformed_*`` case from the
+three disposal paths described earlier (``malformed_escalation_record``), since
+the file parsed but not into the expected shape.
 
 The derived ``parity`` badge answers to the same rule.  A verdict outside the
 closed M2 set has no badge, so it is NAMED (``unknown_verdict``) instead of
@@ -218,6 +223,14 @@ _LIMITS_PROVENANCE_KEYS = (
     'generator',
 )
 
+# A discarded queue record — or any single field read out of one before its
+# shape is known, such as a status or a fingerprint — is arbitrary JSON off
+# disk and may be arbitrarily large.  An issue detail names WHAT was read, so
+# the value is capped: an unbounded repr would put a multi-megabyte artifact
+# into every poll's payload, making the naming of the discard its own
+# degradation.
+_MAX_DISCARDED_VALUE_REPR = 120
+
 
 def _load_json(path: Path) -> Any:
     """Parse *path*, or raise for the caller's narrow handler to record."""
@@ -239,6 +252,24 @@ def _issue(
         'path': str(path) if path is not None else None,
         'detail': detail,
     })
+
+
+def _short_repr(value: Any) -> str:
+    """A length-capped ``repr`` for naming a discarded or unvalidated value in an issue detail.
+
+    Builds the full ``repr`` before capping it, so the OUTPUT is bounded but
+    this transient string is not.  Accepted rather than a streaming bound
+    (e.g. ``reprlib.Repr``): ``json.loads`` already paid an O(n) cost to parse
+    *value* (or the record it came from) off disk into the object graph being
+    repr'd here, so this adds no new order of magnitude of work — just one
+    extra allocation, the same size as one already paid for, that is
+    discarded immediately.  Revisit if that extra allocation itself ever
+    becomes the bottleneck.
+    """
+    text = repr(value)
+    if len(text) <= _MAX_DISCARDED_VALUE_REPR:
+        return text
+    return text[:_MAX_DISCARDED_VALUE_REPR] + '…'
 
 
 def _read_limits(
@@ -677,6 +708,20 @@ def _index_escalations(
     The kind is singular to stay separable from ``unreadable_escalations``
     (plural), which means the whole join blew up.
 
+    A record that DOES parse but is not an object takes a related, narrower
+    path one frame down: ``load_queue_escalations`` validates only that a file
+    PARSES, not that its top level is a dict, so a queue file whose JSON is a
+    bare list, string or number arrives here as a non-dict entry in
+    ``records``.  It is named ``malformed_escalation_record`` with the queue
+    DIR as its path, like the other record-level issues below — by this point
+    the loop has only the parsed value, not the file it came from, so the dir
+    is the most specific location available.  It is named but, unlike
+    ``unfingerprinted_escalation`` below, it is NOT carried into
+    ``unmatched_escalations``: a non-dict value has no ``category`` or
+    ``status`` to read, so the reader never established it was an open
+    ``eval_regression`` escalation at all, and asserting it into that list
+    would claim a classification that was never made.
+
     Openness is filtered EXPLICITLY on ``status``, not inferred from the fact
     that ``load_queue_escalations`` skips the archive subtree.  That inference
     does not hold: ``escalation.queue._archive_resolved`` is best-effort — on
@@ -710,6 +755,21 @@ def _index_escalations(
     first, and that is ``Path.glob`` order rather than a meaningful ranking —
     which is exactly why the issue names BOTH ids: the operator can see the
     colliding pair without depending on which one won.
+
+    The loser is deliberately NOT carried into ``unmatched_escalations``,
+    unlike the unfingerprinted case below — this is intentional, not an
+    oversight.  It is not unreachable from the payload the way an unnamed drop
+    would be: the issue above already names BOTH ids, so the operator can see
+    the colliding pair without a second list.  And carrying it could assert a
+    FALSEHOOD — the loser shares the winner's fingerprint, so if a metric row
+    claims that fingerprint the loser IS explained, and listing it under
+    ``no_matching_verdict`` would fire the parity signal on a fully-explained
+    escalation, exactly the failure :func:`_unmatched_projection`'s reason
+    vocabulary exists to prevent.  If no row claims the fingerprint, the winner
+    already lands in ``unmatched_escalations`` under it, so the fact is
+    surfaced either way.  The unfingerprinted case below is genuinely
+    different: it can never join ANY row and has no sibling record carrying
+    its signal, which is why it alone is both named and carried.
 
     An OPEN record whose ``dedupe_fingerprint`` is absent or not a string is
     the last place a live alarm could leave this payload: it cannot key the
@@ -749,6 +809,15 @@ def _index_escalations(
             )
     for record in records:
         if not isinstance(record, dict):
+            _issue(
+                issues, 'malformed_escalation_record', path=escalations_dir,
+                detail=(
+                    f'escalation queue record is {type(record).__name__}, not an object '
+                    f'({_short_repr(record)}); if it held an open eval_regression escalation '
+                    'it is missing from this payload, so unmatched_escalations cannot be read '
+                    'as exhaustive'
+                ),
+            )
             continue
         if record.get('category') != _EVAL_REGRESSION_CATEGORY:
             continue
@@ -769,8 +838,9 @@ def _index_escalations(
             _issue(
                 issues, 'unknown_escalation_status', path=escalations_dir,
                 detail=(
-                    f'escalation {record.get("id")!r} has unrecognised status {status!r}; '
-                    'not joined (only pending escalations are treated as open)'
+                    f'escalation {record.get("id")!r} has unrecognised status '
+                    f'{_short_repr(status)}; not joined (only pending escalations are '
+                    'treated as open)'
                 ),
             )
             continue
@@ -784,7 +854,8 @@ def _index_escalations(
                 issues, 'unfingerprinted_escalation', path=escalations_dir,
                 detail=(
                     f'escalation {record.get("id")!r} is open but carries no usable '
-                    f'dedupe_fingerprint ({fingerprint!r}); it can never join a metric row'
+                    f'dedupe_fingerprint ({_short_repr(fingerprint)}); it can never join '
+                    'a metric row'
                 ),
             )
             unfingerprinted.append(record)
@@ -794,7 +865,8 @@ def _index_escalations(
                 issues, 'duplicate_escalation_fingerprint', path=escalations_dir,
                 detail=(
                     f'escalation {record.get("id")!r} shares dedupe_fingerprint '
-                    f'{fingerprint!r} with {index[fingerprint].get("id")!r}; the first is used'
+                    f'{_short_repr(fingerprint)} with {index[fingerprint].get("id")!r}; '
+                    'the first is used'
                 ),
             )
             continue
