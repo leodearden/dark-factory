@@ -6,6 +6,7 @@ test_sweep_orphan_flag_markers.py / test_cleanup_count_snapshots.py.
 """
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import sys
 import types
@@ -64,6 +65,29 @@ def _make_graph_mock(rows: list[list] | None = None) -> MagicMock:
     graph.ro_query = AsyncMock(return_value=result)
     graph.query = AsyncMock(return_value=result)
     return graph
+
+
+@pytest.fixture(autouse=True)
+def _neutralise_store_mutation_preflight(monkeypatch):
+    """Keep this MOCK-unit suite independent of the REAL ``~/.mem0``.
+
+    ``run(..., apply=True)`` runs a fail-closed capability preflight before it
+    enumerates (task 4127). That probe touches the real filesystem, so without
+    this fixture every ``--apply`` test would pass or fail according to whether
+    the machine running pytest happens to be able to write mem0's history
+    directory -- and it genuinely cannot inside an agent sandbox, which is the
+    whole reason the guard exists. This suite is deliberately MOCK-unit (an
+    AsyncMock service, no live FalkorDB and no live Qdrant), so the
+    environment must not be an input to it.
+
+    ``TestRunApplyStoreMutationPreflight`` re-rigs this per test -- to refuse,
+    to record, or to pass -- so the guard's own behaviour is still pinned
+    explicitly rather than assumed away.
+
+    Deliberately NOT ``raising=False``: if the guard is ever removed from the
+    script this fixture must break loudly rather than silently no-op.
+    """
+    monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
 
 
 # ===========================================================================
@@ -854,3 +878,224 @@ class TestRunApply:
 
         assert report['invalidated'] == 1
         assert report['flags_failed'] == [_mod.STALE_FLAG_EDGE_UUIDS[0]]
+
+
+# ===========================================================================
+# Tests: --apply store-mutation preflight
+# ===========================================================================
+
+class TestRunApplyStoreMutationPreflight:
+    """``--apply`` refuses to START when this process cannot write mem0's store.
+
+    Ported from ``test_sweep_toolcall_xml_leak.TestRunApplyStoreMutationPreflight``
+    (task 3686), which is the in-repo precedent for this contract.
+
+    This script has the widest blast radius of the six call sites: THREE
+    distinct mutations, of which ``purge_graphiti_namespace``'s
+    ``MATCH (n) DETACH DELETE n`` is unbounded by ``--limit`` and runs FIRST.
+    The mem0 half fans deletes out through
+    ``asyncio.gather(..., return_exceptions=True)`` and funnels every failure
+    into a ``logger.warning``, so a write-denied environment would not abort --
+    it would produce N warnings and N already-destroyed Qdrant points, because
+    mem0's ``_delete_memory`` removes the point BEFORE writing its SQLite
+    history. Only a run-wide probe before the first mutation bounds that.
+    """
+
+    def _args(self, apply: bool = True, **overrides):
+        import types as _types
+        base = {'apply': apply}
+        base.update(overrides)
+        return _types.SimpleNamespace(**base)
+
+    def _make_memory_service(
+        self, graphiti_rows: list[list] | None = None,
+        mem0_members: list[dict] | None = None,
+    ):
+        """AsyncMock service wired for both enumerations and all three
+        mutations (mirrors TestRunApply._make_memory_service)."""
+        memory_service = AsyncMock()
+        graph = _make_graph_mock(graphiti_rows or [])
+        graphiti = MagicMock()
+        graphiti._graph_for = MagicMock(return_value=graph)
+        memory_service.graphiti = graphiti
+        members = mem0_members or []
+        memory_service.mem0 = MagicMock()
+        memory_service.mem0.count = AsyncMock(return_value=len(members))
+        memory_service.mem0.get_all = AsyncMock(return_value={'results': members})
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        memory_service.update_edge = AsyncMock(return_value=None)
+        return memory_service, graph
+
+    @staticmethod
+    def _deny(monkeypatch):
+        """Rig the preflight to refuse, as it would inside an agent sandbox."""
+        def _raise(*_args, **_kwargs):
+            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
+
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
+
+    @pytest.mark.asyncio
+    async def test_apply_performs_zero_mutations_when_the_store_is_unwritable(
+        self, monkeypatch
+    ):
+        """The whole point: refuse to start rather than half-complete.
+
+        All THREE mutations are asserted un-awaited, not just the mem0 delete
+        -- a zero-mutation claim that covered only one of the three would be
+        vacuous, and the Graphiti DETACH DELETE is the largest of them.
+        """
+        self._deny(monkeypatch)
+        memory_service, graph = self._make_memory_service(
+            graphiti_rows=[['uuid-1', ['Entity'], 'Node A']],
+            mem0_members=[_mem0_member('m1')],
+        )
+        invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
+
+        with pytest.raises(
+            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+        ):
+            await _mod.run(
+                self._args(apply=True), memory_service,
+                invalidation_time=invalidation_time,
+            )
+
+        graph.query.assert_not_called()          # MATCH (n) DETACH DELETE n
+        memory_service.delete_memory.assert_not_awaited()
+        memory_service.update_edge.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_guard_sits_before_both_enumerations(self, monkeypatch):
+        """It aborts without scanning either store -- two full-namespace scans
+        (a FalkorDB ro_query plus a mem0 count+get_all, --limit 1000 each) are
+        not paid for in an environment that was never going to be allowed to
+        purge."""
+        self._deny(monkeypatch)
+        memory_service, graph = self._make_memory_service(
+            graphiti_rows=[['uuid-1', ['Entity'], 'Node A']],
+            mem0_members=[_mem0_member('m1')],
+        )
+        invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
+
+        with pytest.raises(_mod.StoreMutationUnavailable):
+            await _mod.run(
+                self._args(apply=True), memory_service,
+                invalidation_time=invalidation_time,
+            )
+
+        graph.ro_query.assert_not_called()
+        memory_service.mem0.count.assert_not_awaited()
+        memory_service.mem0.get_all.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_dry_run_is_never_gated_on_write_capability(self, monkeypatch):
+        """A read-only run mutates nothing, so it must not require the ability
+        to mutate.
+
+        This is also the operator's remedy when --apply is refused: the module
+        docstring calls the dry-run manifest "the only recovery record of what
+        is about to be deleted", and it stays obtainable from anywhere.
+        """
+        self._deny(monkeypatch)
+        memory_service, graph = self._make_memory_service(
+            graphiti_rows=[['uuid-1', ['Entity'], 'Node A']],
+            mem0_members=[_mem0_member('m1')],
+        )
+        invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service,
+            invalidation_time=invalidation_time,
+        )
+
+        assert report['dry_run'] is True
+        assert report['graphiti']['node_uuids'] == ['uuid-1']
+        assert report['mem0']['memory_ids'] == ['m1']
+        graph.ro_query.assert_called_once()
+        memory_service.mem0.get_all.assert_awaited_once()
+        graph.query.assert_not_called()
+        memory_service.delete_memory.assert_not_awaited()
+        memory_service.update_edge.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_apply_is_unchanged_when_the_preflight_passes(self, monkeypatch):
+        """Happy path: a writable environment purges exactly as before -- all
+        three mutations fire and the post-purge re-scan still runs."""
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+        memory_service, graph = self._make_memory_service(
+            graphiti_rows=[['uuid-1', ['Entity'], 'Node A']],
+            mem0_members=[_mem0_member('m1')],
+        )
+        invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
+
+        report = await _mod.run(
+            self._args(apply=True), memory_service,
+            invalidation_time=invalidation_time,
+        )
+
+        graph.query.assert_called_once()
+        memory_service.delete_memory.assert_awaited_once()
+        assert memory_service.update_edge.await_count == len(_mod.STALE_FLAG_EDGE_UUIDS)
+        assert report['dry_run'] is False
+        assert report['deleted'] == 1
+        assert report['graphiti']['purge'] == {'ok': True, 'error': None}
+        assert 'after' in report
+
+    @pytest.mark.asyncio
+    async def test_the_probe_names_the_operation_being_gated(self, monkeypatch):
+        """The refusal has to be attributable in a log, so the operation string
+        identifies this script and its mutating mode."""
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            _mod, 'assert_store_mutation_allowed', lambda **kw: calls.append(kw)
+        )
+        memory_service, _ = self._make_memory_service(
+            mem0_members=[_mem0_member('m1'), _mem0_member('m2')],
+        )
+        invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
+
+        await _mod.run(
+            self._args(apply=True), memory_service,
+            invalidation_time=invalidation_time,
+        )
+
+        assert len(calls) == 1, 'probed ONCE per run, not once per member'
+        assert 'purge_knowlive_namespace' in calls[0]['operation']
+        assert '--apply' in calls[0]['operation']
+
+    def test_the_refusal_escapes_main_and_is_never_a_zero_exit(self, monkeypatch):
+        """``main`` calls ``asyncio.run`` bare -- no try/except -- and otherwise
+        returns 0 unconditionally, so the refusal must PROPAGATE and exit the
+        interpreter non-zero (1) via an uncaught traceback.
+
+        A silent zero exit here is the precise failure mode this task exists to
+        prevent: this script has no other non-zero path at all, so if the
+        refusal were swallowed anywhere it would read as a successful purge.
+        """
+        self._deny(monkeypatch)
+        memory_service, _ = self._make_memory_service(
+            mem0_members=[_mem0_member('m1')],
+        )
+        monkeypatch.setattr(
+            sys, 'argv', ['purge_knowlive_namespace.py', '--apply'],
+        )
+        invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
+        real_asyncio_run = asyncio.run
+
+        def _drive(coro, *_a, **_kw):
+            coro.close()  # never construct the live MemoryService
+            return real_asyncio_run(
+                _mod.run(
+                    self._args(apply=True), memory_service,
+                    invalidation_time=invalidation_time,
+                )
+            )
+
+        monkeypatch.setattr(_mod.asyncio, 'run', _drive)
+
+        with pytest.raises(
+            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+        ):
+            _mod.main()
+
+        memory_service.delete_memory.assert_not_awaited()
+        memory_service.update_edge.assert_not_awaited()
