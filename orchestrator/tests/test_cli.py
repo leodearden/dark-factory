@@ -139,17 +139,37 @@ class TestForceExitWatchdog:
 
         The subprocess-level counterpart (`test_shutdown_watchdog_force_exits_on_thread_leak`
         in test_shutdown.py) pins the opposite — fires when a non-daemon thread is leaked.
+
+        Structural fix (same class as test_disarm_prevents_force_exit below):
+        this previously armed with timeout_secs=2.0 and used a fixed
+        ``time.sleep(0.2)`` as a "10x margin" before checking ``calls == []``.
+        No fixed margin is safe under full-suite xdist load — the main thread's
+        wakeup from ``sleep(0.2)`` can itself be delayed by scheduler noise, and
+        if that delay pushes the check past the 2.0s deadline the watchdog has
+        legitimately fired by the time ``calls`` is read (same failure shape as
+        test_disarm_prevents_force_exit's observed ``calls == [137]``). Arming
+        with an effectively-unbounded timeout_secs instead makes the deadline
+        unreachable within the test's lifetime, so ``thread.join(timeout=...)``
+        can be used as the "has not fired yet" probe without racing a wall-clock
+        deadline: no matter how delayed the join itself is in landing,
+        ``is_alive()`` cannot go False before 3600s have elapsed.
         """
         calls: list[int] = []
 
         def stub(code: int) -> None:
             calls.append(code)
 
-        handle = _force_exit_after_delay(timeout_secs=2.0, _exit=stub)
+        handle = _force_exit_after_delay(timeout_secs=3600.0, _exit=stub)
 
-        # Sleep well within the timeout — 0.2s is 10x margin under any scheduler load.
-        time.sleep(0.2)
-
+        # "Has not fired yet" probe: join blocks for up to 0.2s or until the
+        # watchdog thread exits, whichever comes first. Unlike a free-standing
+        # sleep, there is no deadline here for scheduler noise to run past —
+        # timeout_secs is unreachable within the test's lifetime, so is_alive()
+        # cannot go False regardless of how delayed the join is in landing.
+        handle.thread.join(timeout=0.2)
+        assert handle.thread.is_alive(), (
+            'watchdog thread exited before its timeout elapsed — fired early?'
+        )
         assert calls == [], (
             f'watchdog fired before timeout elapsed (clean-exit window): {calls}'
         )

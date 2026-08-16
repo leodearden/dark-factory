@@ -404,10 +404,15 @@ class TestB2PreTurn1Wedge:
             'Expected the startup-grace kill path to fire and log the wedge; '
             f'caplog.text snippet: {caplog.text[-500:]!r}'
         )
-        # Quantitative half, on the WATCHDOG'S OWN clock (immune to outer
-        # scheduling noise): detected at the 0.05s grace bound, nowhere near
-        # the 5.0s ceiling. Guards a regression that still takes the wedge
-        # branch but only after ignoring startup_grace_secs.
+        # Quantitative half, measured inside the watchdog loop (cli_invoke.py's
+        # `elapsed = time.monotonic() - watchdog_start`), so it excludes
+        # descheduling OUTSIDE `_run_subprocess` (before t0 / after the await)
+        # — but NOT in-loop event-loop starvation, since `elapsed` is read
+        # from inside the same coroutine that can itself be starved. The 2.0s
+        # bound below is a load margin, not a tight assertion about the 0.05s
+        # grace; do not tighten it toward 0.05s on the assumption this
+        # measurement is starvation-free. Guards a regression that still takes
+        # the wedge branch but only after ignoring startup_grace_secs.
         detected_after = float(wedge_log.group(1))
         assert detected_after < 2.0, (
             f'Expected fast kill (<2s on the watchdog clock), got {detected_after}s '
