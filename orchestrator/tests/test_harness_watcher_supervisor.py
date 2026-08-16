@@ -508,7 +508,7 @@ class TestRunWatcherRotation:
         ):
             await h._run_watcher_rotation()
 
-        env_overrides = captured.get('env_overrides')
+        env_overrides = captured['env_overrides']
         # Assert against the known literal for the default config to catch formula drift.
         # Derivation: rotation_hours=4.0, grace=300.0 → 14700 s → 14700000 ms.
         assert env_overrides['BASH_MAX_TIMEOUT_MS'] == '14700000', (
