@@ -3684,14 +3684,9 @@ def _clock_stop_attribution_slack(limit: float) -> float:
 
 def _clock_stop_reason(*, kind: str, limit: float, elapsed: float, remaining: float) -> str:
     """Format a clock-stop timeout reason, attributing it to *kind* only when
-    the stop is CONSISTENT with the deadline actually armed (task 3806 /
-    esc-3694-3).
-
-    Without this check, esc-3694-3 reported ``wall-clock budget (5400s),
-    wall time 561.1s`` — a message that names a 5400s budget as the cause of
-    a stop that happened after only 561.1s, while the armed deadline still
-    had ~4839s left.  That combination is impossible: this helper refuses to
-    emit it.
+    the stop is CONSISTENT with the deadline actually armed. Guards against
+    the impossible-looking message from esc-3694-3, where a 5400s budget was
+    named as the cause of a stop that happened after only 561.1s (task 3806).
 
     Attribution requires BOTH conjuncts to hold, with
     ``slack = _clock_stop_attribution_slack(limit)``:
@@ -3701,17 +3696,10 @@ def _clock_stop_reason(*, kind: str, limit: float, elapsed: float, remaining: fl
        reason may never name a budget larger than the elapsed time that
        triggered it.
 
-    The slack is one-sided-safe: an ``asyncio`` timer can only fire LATE,
-    never early, and callers measure ``t0`` before the first
-    ``time.monotonic()`` read, so a genuine expiry always satisfies
-    ``elapsed >= limit``.  Slack therefore only absorbs float/scheduling
-    noise on the near side and can never turn a real timeout into a false
-    "unattributed" verdict — the failure mode that would matter, since it
-    would make ordinary verify timeouts look like infrastructure anomalies.
-
     When either conjunct fails, the stop is reported as unattributed
     (external or aggregate deadline) rather than blamed on *kind*, carrying
-    the real *elapsed* and the shortfall (*remaining*) instead.
+    the real *elapsed* and the shortfall (*remaining*) instead, and a
+    WARNING is logged with the same facts.
 
     Both returned strings are free of ``':'`` — ``_extract_cause_hint``'s
     ``clock-stop timed out[^:]+:`` pattern stops matching at the first
@@ -3727,10 +3715,8 @@ def _clock_stop_reason(*, kind: str, limit: float, elapsed: float, remaining: fl
     limit : float
         The configured number *kind* names, in seconds.
     elapsed : float
-        Wall seconds since the clock-stop loop started, measured AT THE
-        STOP — not at the top of the loop iteration, which is what let
-        esc-3694-3's reported elapsed go stale at the last read instead of
-        the actual stop time.
+        Wall seconds since the clock-stop loop started, measured AT THE STOP
+        (not at the top of the loop iteration).
     remaining : float
         Seconds the armed deadline still had left AT THE STOP.  ``<= 0``
         means it genuinely fired.
@@ -3745,17 +3731,11 @@ def _clock_stop_reason(*, kind: str, limit: float, elapsed: float, remaining: fl
     slack = _clock_stop_attribution_slack(limit)
     if remaining <= slack and limit <= elapsed + slack:
         return f'{kind} ({limit:.0f}s), wall time {elapsed:.1f}s'
-    # Self-consistency guard (scope item 2): make the anomaly LOUD, not just
-    # honest in the returned string.  A returned message is read only once a
-    # human triages the escalation; this WARNING is greppable across the
-    # fleet the moment it happens and is the only channel that survives
-    # _extract_cause_hint's 200-char cap truncating the returned message.
-    # Logged here (inside the helper) rather than at the two call sites in
-    # the clock-stop loop, so a future third stop site cannot bypass it, and
-    # this stays the single place attribution is decided.  Never logged on
-    # the attributed branch above: an ordinary verify timeout is already
-    # reported via the returned message and timed_out=True, and warning on
-    # every one of those would drown the anomaly this guard exists to catch.
+    # Loud, not just honest in the string (scope item 2): logged here, the
+    # one place attribution is decided, so no future stop site can skip it.
+    # Never logged on the attributed branch — that path already reports via
+    # the returned message, and warning on every ordinary timeout would
+    # drown the anomaly this guard exists to catch.
     logger.warning(
         'clock-stop attribution refused - armed %s (%.0fs) still had %.1fs left '
         'when the read stopped at wall time %.1fs; reporting the stop as '
@@ -4041,14 +4021,10 @@ async def _run_cmd(
         if proc is not None and pgid is not None:
             await terminate_process_group(proc, pgid, grace_secs=5.0)
         if _cs_timeout_msg:
-            # Clock-stop path: include actual wall time and which deadline fired
-            # (idle backstop / wall-clock budget / max-total cap) so infra_timeout
-            # incidents are distinguishable in the verify log.  [-1] (most
-            # recent), not [0]: both append sites raise immediately and no
-            # enclosing handler inside the `with open(log_path)` block resumes
-            # the loop, so today the list holds at most one element per call —
-            # [-1] is the intent-correct read if a future nested handler ever
-            # appends again (task 3806).
+            # Clock-stop path: include actual wall time and which deadline
+            # fired so infra_timeout incidents are distinguishable in the
+            # verify log.  [-1] (not [0]): intent-correct if a future nested
+            # handler ever appends more than once (task 3806).
             return 1, f'Command clock-stop timed out ({_cs_timeout_msg[-1]}): {cmd}', True
         return 1, f'Command timed out after {timeout}s: {cmd}', True
     except asyncio.CancelledError:
