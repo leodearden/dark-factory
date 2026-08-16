@@ -69,9 +69,11 @@ constant — do not restate them here.)
   invalidated as a whole the moment any ONE referenced id is terminal —
   see ``select_stale_status_snapshot_edges``.
 - The sweep is best-effort throughout (mirrors
-  ``degenerate_task_node_sweep``): an enumeration or cross-reference
-  failure aborts the rest of the cycle (self-heals next cycle); a per-edge
-  invalidation failure does not — see ``sweep_stale_status_snapshot_edges``.
+  ``degenerate_task_node_sweep``): an edge-enumeration
+  (``get_all_valid_edges``) or status cross-reference (``get_statuses``)
+  failure ends this cycle's sweep early (self-heals next cycle); a
+  per-edge invalidation failure does not — see
+  ``sweep_stale_status_snapshot_edges``.
 - 'blocked' is deliberately NOT added to ``INACTIVE_TASK_STATUSES`` (stays
   ``{done, cancelled}``), which is what preserves
   invalidate-only-on-positively-terminal for a genuinely-still-blocked
@@ -93,6 +95,11 @@ Known residuals (deliberate; all fail-safe/under-selection unless noted)
   and one fail-safe residual (a genuine subject-position enumeration
   sharing a clause with a listed preposition is missed) — see
   ``_ENUM_PREP_WORDS``.
+- task 4149: ``_CLAUSE_BREAK_CHARS``'s ';' and '?' are unconditional
+  breaks (only '.' gets the occurrence-level flanking test), so one
+  residual is pointed the WRONG way: a '?' inside a URL query string or a
+  ';' inside a path/branch name truncates the backward scan past the
+  governing preposition and OVER-selects — see ``_CLAUSE_BREAK_CHARS``.
 
 Two hypotheses were investigated and RULED OUT for the task-2613 miss
 rate; do not re-open them:
@@ -678,6 +685,15 @@ def _is_intra_token_dot(text: str, index: int) -> bool:
     one. A flanked '.' is a filename extension, version string, dotted
     module path or dotted section number — it ends no sentence, so it must
     not count as a clause break. (task 4149)
+
+    Cost (fail-safe, under-selection): a genuine sentence period with no
+    following space AND a following alphanumeric — e.g. 'Reviews for the
+    branch are done.Then tasks 1020 and 1030 are pending.' — is flanked by
+    alphanumerics on both sides too, so it reads as intra-token and the
+    backward scan extends past the governing preposition, suppressing a
+    real snapshot; the edge is simply not retired this cycle. Pinned by
+    test_intra_token_dot_narrowing_costs_only_under_selection in
+    test_stale_status_snapshot_edge_sweep.py.
     """
     return (
         index > 0
