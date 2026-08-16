@@ -941,13 +941,21 @@ marker deliberately stops BEFORE its ``{project_id}`` interpolation
 point: a marker spanning it would be project-specific and would fail for
 every non-dark_factory project the census runs against (this module has
 no knowledge of which project a transcript belongs to). These three
-markers are EXHAUSTIVE over ``_get_memory_context``'s four return paths
-as of this commit (each no-recalled-sections family has a plain and a
-drop_note-bearing variant, both covered by the same family marker) --
-that exhaustiveness claim is what
-``TestHarnessInjectedTurnFilter.test_no_recalled_sections_variant_is_excluded``'s
-parametrization checks, so a new return path added to that function
-should arrive with a fourth marker here. Matched only in CONJUNCTION with
+markers are EXHAUSTIVE over ``_get_memory_context``'s FIVE return paths
+as of this commit: the four no-recalled-sections paths (each of the two
+literal families has a plain and a drop_note-bearing variant, both
+covered by the same family marker), PLUS the recalled-sections path
+(briefing.py:1339-1350) -- covered by the caveat marker ALONE, including
+its own drop_note suffix (``'\n\n_In total, {drop_note}._'``) and the
+trailing "_Memory unavailable for the remaining queries..._" note a
+later-failing query appends, since both are appended AFTER the caveat
+prefix this marker matches on, never before it. That exhaustiveness
+claim is what
+``TestHarnessInjectedTurnFilter.test_no_recalled_sections_variant_is_excluded``
+(the four no-recalled-sections paths) and
+``test_recalled_sections_with_trailing_unavailable_note_is_excluded``
+(the fifth, composite path) together check, so a new return path added
+to that function should arrive with a fourth marker here. Matched only in CONJUNCTION with
 a line-anchored '# context' heading (see :func:`is_harness_injected_turn`),
 never as a relaxation of HARNESS_BRIEFING_HEADINGS' all() guard -- that
 guard is load-bearing and its two negative tests

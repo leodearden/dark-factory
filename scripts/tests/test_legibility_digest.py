@@ -1577,6 +1577,28 @@ like MEMORY_CONTEXT_CAVEAT: these are inlined string literals in
 ``_get_memory_context``'s body, not a module-level constant."""
 
 
+def _recalled_sections_with_trailing_unavailable_note():
+    """The recalled-sections return path's fullest composite shape
+    (orchestrator/src/orchestrator/agents/briefing.py:1339-1350) -- the
+    fifth of ``_get_memory_context``'s five return paths, distinct from
+    the four ``_NO_RECALLED_SECTIONS_VARIANTS`` shapes above (those all
+    have recalled_sections EMPTY; this one has it non-empty). Builds a
+    caveat carrying its own drop_note suffix (a foreign-tagged result was
+    filtered from an earlier query), a genuinely recalled section, AND
+    the trailing "_Memory unavailable for the remaining queries..._"
+    note appended when a LATER query then fails. LOCKSTEP via
+    MEMORY_CONTEXT_CAVEAT -- pins that HARNESS_CONTEXT_BLOCK_MARKERS'
+    caveat-prefix marker alone still covers this composite, not just the
+    plain caveat-only shape _memory_context_block() builds."""
+    caveat = MEMORY_CONTEXT_CAVEAT.format(project_id='dark_factory')
+    caveat += f'\n\n_In total, {_DROP_NOTE_EXAMPLE}._'
+    return (
+        '# Context\n\n' + caveat + '\n\n## Project Context\n\nSome overview.'
+        '\n\n---\n\n_Memory unavailable for the remaining queries — proceed '
+        'with codebase exploration for anything not covered above._'
+    )
+
+
 def _resume_and_context_block_records():
     """The confusion-census sighting shape (session b976febe), minus its
     one genuine correction: a turn-0 lone '# Context' memory block,
@@ -1870,6 +1892,18 @@ class TestHarnessInjectedTurnFilter:
         # above -- the marker set must cover every output of that
         # function, not merely its most common case.
         records = [_user_text(text)]
+
+        assert mod.iter_user_turns(records) == []
+
+    def test_recalled_sections_with_trailing_unavailable_note_is_excluded(self):
+        # The fifth _get_memory_context return path (recalled_sections
+        # non-empty), at its fullest composite: a drop_note folded into
+        # the caveat PLUS a trailing memory-unavailable note from a later
+        # failed query. Both suffixes are appended AFTER the caveat
+        # prefix HARNESS_CONTEXT_BLOCK_MARKERS matches on, so the caveat
+        # marker alone must still cover this shape -- not just the plain
+        # caveat-only shape _memory_context_block() builds.
+        records = [_user_text(_recalled_sections_with_trailing_unavailable_note())]
 
         assert mod.iter_user_turns(records) == []
 
