@@ -928,6 +928,56 @@ async def test_build_report_degrades_on_an_empty_database(recon_db):
 
 
 @pytest.mark.asyncio
+async def test_build_report_survives_a_cleanup_drained_signature_change(
+    recon_db, monkeypatch,
+):
+    """A renamed cleanup_drained parameter must not take the whole report down.
+
+    `_retention_note` reads the live cleanup window off
+    `EventBuffer.cleanup_drained`'s signature — good, because that is what
+    stops the caveat drifting into a confident lie.  But an unrelated rename of
+    `max_age_seconds` would turn a KeyError loose at report-BUILD time, killing
+    the drain, inflow and capacity figures an operator actually paged the tool
+    for.  A retention caveat is the least important line in the payload; it
+    must degrade to 'omit one number', never to 'crash'.
+
+    The monkeypatch works because `_retention_note` imports EventBuffer lazily
+    inside the function body (deliberately — event_buffer imports
+    `utc_hour_bucket` from throughput at module scope, so a top-level import
+    back would be circular), so the patched class attribute is picked up.
+    """
+    db = recon_db._db_path
+    _seed_addendum_2(db)
+    # A signature with no `max_age_seconds` parameter at all.
+    monkeypatch.setattr(EventBuffer, 'cleanup_drained', lambda self: None)
+
+    report = build_report(db, 'reify')
+
+    assert isinstance(report['retention_note'], str)
+    assert report['retention_note'], 'the note must degrade, not vanish'
+    # The figures the operator came for are unaffected.
+    assert report['sustainable_events_per_day'] == pytest.approx(18222.8, abs=1.0)
+    assert report['drain']['drain_events'] == 719
+
+
+@pytest.mark.asyncio
+async def test_main_survives_a_cleanup_drained_signature_change(
+    recon_db, monkeypatch, capsys,
+):
+    """The CLI degrades the same way: exit 0 and parseable JSON, not a traceback."""
+    db = recon_db._db_path
+    _seed_addendum_2(db)
+    monkeypatch.setattr(EventBuffer, 'cleanup_drained', lambda self: None)
+
+    rc = main(['--db', str(db), '--project', 'reify', '--json'])
+
+    assert rc == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert isinstance(printed['retention_note'], str)
+    assert printed['retention_note']
+
+
+@pytest.mark.asyncio
 async def test_build_report_threads_since_into_both_halves(recon_db):
     """`since` filters inflow and drain alike, so the two halves stay comparable."""
     db = recon_db._db_path
