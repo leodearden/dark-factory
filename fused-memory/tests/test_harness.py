@@ -16627,3 +16627,226 @@ async def test_in_backlog_mode_treats_a_missing_size_as_not_backlogged(
     harness.buffer.get_buffer_stats = AsyncMock(return_value={})
 
     assert await harness._in_backlog_mode('reify') is False
+
+
+# ── Task 3049 lever 1: defer the inline remediation pass in backlog mode ──────
+#
+# Remediation is not a separately-scheduled competitor for the reconciliation
+# lock — it is an unconditional inline tail of every completed run_full_cycle.
+# In backlog mode BacklogIterator runs many chunks back to back, so each chunk
+# drags its own zero-event remediation pass along and roughly halves the drain
+# duty cycle (measured ~44% of backlog-mode wall-clock on reify, 2026-07-25).
+#
+# Deferring that tail while the buffer is still deep is lossless: the parent
+# run's Stage-3 findings are already persisted in
+# stage_reports.integrity_check.items_flagged BEFORE _maybe_remediate is called,
+# and _get_prior_s3_findings forward-feeds them into the next cycle.  The
+# deferral debt is bounded by config.max_backlog_remediation_deferrals so a
+# long-lived backlog can never starve remediation forever.
+
+
+_DEFER_LOG = 'reconciliation.remediation_deferred_backlog'
+
+
+async def _persist_parent_run(journal, project_id: str, findings: list[dict]):
+    """Persist a completed parent run carrying *findings* as its S3 report.
+
+    Mirrors run_full_cycle's ordering: the stage reports are written (and the
+    run marked completed) BEFORE _maybe_remediate is ever called, which is what
+    makes a deferral lossless.
+    """
+    run = ReconciliationRun(
+        id=f'run-{uuid.uuid4().hex[:8]}',
+        project_id=project_id,
+        run_type=RunType.full,
+        trigger_reason='backlog_chunk:1:393',
+        started_at=datetime.now(UTC),
+        events_processed=393,
+        status=RunStatus.running,
+    )
+    await journal.start_run(run)
+    s3_report = {
+        'stage': 'integrity_check',
+        'items_flagged': findings,
+        'stats': {},
+    }
+    run.stage_reports = {'integrity_check': s3_report}
+    await journal.update_run_stage_reports(run.id, run.stage_reports)
+    await journal.complete_run(run.id, 'completed')
+    run.status = RunStatus.completed
+    return run
+
+
+def _remediation_harness(journal, event_buffer, mock_memory_service, *, buffer_size: int):
+    """Harness with a deterministic backlog threshold and a mocked remediation pass."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness.config.buffer_size_threshold = 10
+    harness.config.opus_threshold_ratio = 1.5  # threshold = 15
+    harness.buffer.get_buffer_stats = AsyncMock(return_value={'size': buffer_size})
+    harness._run_remediation_pass = AsyncMock()
+    return harness
+
+
+async def _call_maybe_remediate(harness, parent_run, project_id: str = 'test-project'):
+    from fused_memory.reconciliation.harness import TierConfig
+
+    await harness._maybe_remediate(
+        project_id,
+        parent_run.id,
+        parent_run,
+        TierConfig(model='sonnet', episode_limit=100, memory_limit=200),
+        scope=_scope(project_id, '/tmp/test-project'),
+    )
+
+
+def _defer_records(caplog):
+    return [r for r in caplog.records if r.getMessage() == _DEFER_LOG]
+
+
+@pytest.mark.asyncio
+async def test_maybe_remediate_defers_while_the_buffer_is_in_backlog_mode(
+    journal, event_buffer, mock_memory_service, caplog,
+):
+    """(a) Above the backlog threshold the inline remediation pass is skipped.
+
+    The skip must be observable: a structured
+    ``reconciliation.remediation_deferred_backlog`` record carrying the
+    project, the parent run, how many findings were held back, the buffer size
+    that caused the deferral, and how many consecutive cycles have now deferred.
+    """
+    harness = _remediation_harness(
+        journal, event_buffer, mock_memory_service, buffer_size=393,
+    )
+    findings = [_make_s3_findings()[0], _make_s3_findings()[1]]
+    parent_run = await _persist_parent_run(journal, 'test-project', findings)
+
+    with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
+        await _call_maybe_remediate(harness, parent_run)
+
+    harness._run_remediation_pass.assert_not_awaited()
+
+    # The deferral must not have been produced by the method's own except-branch
+    # swallowing an error — that would look identical from the outside.
+    assert not [r for r in caplog.records if 'Remediation check failed' in r.getMessage()], (
+        'Deferral must be a deliberate gate, not a swallowed exception'
+    )
+
+    records = _defer_records(caplog)
+    assert len(records) == 1, (
+        f'Expected exactly one {_DEFER_LOG!r} record; '
+        f'got {[r.getMessage() for r in caplog.records]}'
+    )
+    rec = records[0]
+    assert getattr(rec, 'project_id', None) == 'test-project'
+    assert getattr(rec, 'parent_run_id', None) == parent_run.id
+    assert getattr(rec, 'deferred_finding_count', None) == 2
+    assert getattr(rec, 'buffer_size', None) == 393
+    assert getattr(rec, 'consecutive_deferrals', None) == 1
+
+
+@pytest.mark.asyncio
+async def test_maybe_remediate_runs_and_resets_the_counter_below_the_threshold(
+    journal, event_buffer, mock_memory_service, caplog,
+):
+    """(b) Below the threshold remediation dispatches and the debt clears.
+
+    This is the self-terminating property: once the backlog drains (notably on
+    the backlog_final_consolidation pass, which runs against a drained buffer)
+    remediation resumes on its own with no extra bookkeeping.
+    """
+    harness = _remediation_harness(
+        journal, event_buffer, mock_memory_service, buffer_size=393,
+    )
+    findings = [_make_s3_findings()[0]]
+    parent_run = await _persist_parent_run(journal, 'test-project', findings)
+
+    # One deferral first, so the reset below is observable rather than vacuous.
+    await _call_maybe_remediate(harness, parent_run)
+    assert harness._remediation_deferrals.get('test-project', 0) == 1
+
+    harness.buffer.get_buffer_stats = AsyncMock(return_value={'size': 4})
+    with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
+        await _call_maybe_remediate(harness, parent_run)
+
+    assert harness._run_remediation_pass.await_count == 1
+    assert harness._remediation_deferrals.get('test-project', 0) == 0
+    assert _defer_records(caplog) == []
+
+
+@pytest.mark.asyncio
+async def test_maybe_remediate_never_defers_when_the_knob_is_zero(
+    journal, event_buffer, mock_memory_service, caplog,
+):
+    """(c) max_backlog_remediation_deferrals = 0 restores exact pre-3049 behaviour."""
+    harness = _remediation_harness(
+        journal, event_buffer, mock_memory_service, buffer_size=5000,
+    )
+    harness.config.max_backlog_remediation_deferrals = 0
+    parent_run = await _persist_parent_run(journal, 'test-project', [_make_s3_findings()[0]])
+
+    with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
+        for _ in range(3):
+            await _call_maybe_remediate(harness, parent_run)
+
+    assert harness._run_remediation_pass.await_count == 3
+    assert _defer_records(caplog) == []
+
+
+@pytest.mark.asyncio
+async def test_maybe_remediate_deferral_debt_is_bounded(
+    journal, event_buffer, mock_memory_service, caplog,
+):
+    """(d) After the configured number of consecutive deferrals, remediation runs anyway.
+
+    The buffer stays deep throughout, so only the bound can end the deferral
+    streak — a permanently backlogged project must not starve remediation.
+    """
+    harness = _remediation_harness(
+        journal, event_buffer, mock_memory_service, buffer_size=900,
+    )
+    harness.config.max_backlog_remediation_deferrals = 2
+    parent_run = await _persist_parent_run(journal, 'test-project', [_make_s3_findings()[0]])
+
+    with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
+        await _call_maybe_remediate(harness, parent_run)
+        await _call_maybe_remediate(harness, parent_run)
+        deferred_after_two = harness._run_remediation_pass.await_count
+        await _call_maybe_remediate(harness, parent_run)
+
+    assert deferred_after_two == 0, 'The first two cycles must defer'
+    assert len(_defer_records(caplog)) == 2
+    assert [getattr(r, 'consecutive_deferrals', None) for r in _defer_records(caplog)] == [1, 2]
+    assert harness._run_remediation_pass.await_count == 1, (
+        'The cycle after the bound is reached must remediate despite the deep buffer'
+    )
+    assert harness._remediation_deferrals.get('test-project', 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_maybe_remediate_deferral_leaves_the_findings_forward_feedable(
+    journal, event_buffer, mock_memory_service,
+):
+    """(e) A deferral loses nothing — the findings survive for the next cycle.
+
+    _get_prior_s3_findings reads them straight back off the persisted parent
+    run, which is the mechanism that makes deferring safe rather than dropping.
+    """
+    harness = _remediation_harness(
+        journal, event_buffer, mock_memory_service, buffer_size=393,
+    )
+    findings = [_make_s3_findings()[0], _make_s3_findings()[1]]
+    parent_run = await _persist_parent_run(journal, 'test-project', findings)
+
+    await _call_maybe_remediate(harness, parent_run)
+    harness._run_remediation_pass.assert_not_awaited()
+
+    persisted = await journal.get_run(parent_run.id)
+    assert persisted is not None
+    s3 = persisted.stage_reports['integrity_check']
+    items = s3['items_flagged'] if isinstance(s3, dict) else s3.items_flagged
+    assert items == findings, 'Deferral must leave the persisted S3 findings untouched'
+
+    forward_fed = await harness._get_prior_s3_findings('test-project')
+    assert forward_fed == findings, (
+        'Deferred findings must still be forward-fed into the next cycle'
+    )
