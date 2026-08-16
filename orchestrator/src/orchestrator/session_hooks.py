@@ -121,10 +121,59 @@ def resolve_hook_identity(
     return session_registry.parse_spawn_identity(env, title, prompt, cwd)
 
 
+def _hook_session_id(hook_input: Mapping[str, Any]) -> str:
+    """The hook's stdin ``session_id``, stripped -- ``''`` when there is none.
+
+    ONE definition of "a usable Claude Code session_id", shared by the
+    ownership probe, the binding stamp and the hand-launched slug builder so
+    the three can never disagree about what counts as a discriminator.
+    Missing, null, empty and whitespace-only all collapse to ``''``: a blank
+    token must fall back to ``'unknown'`` when building a slug, exactly as a
+    wholly absent one does, and must never be bound as an owner.
+    """
+    return str(hook_input.get('session_id') or '').strip()
+
+
+_OWNER_ONLY_SESSION_START_SOURCES = frozenset({'clear', 'resume', 'compact'})
+"""SessionStart ``source`` values only the session's OWN process can emit.
+
+The stdin ``session_id`` is NOT constant for the life of one Claude Code
+process: ``/clear`` (and the resume/compact paths) re-mints it in place. So
+an owning spawned session's later hooks legitimately arrive carrying an id
+that mismatches the binding its first SessionStart stamped -- and reading
+that as "an inheritor" would fork the real session onto a second record and
+freeze spawn-claude.sh's converged one at ``running``, re-introducing the
+exact task-2511 split for any spawned session the user ``/clear``s.
+
+``source`` discriminates cleanly: a nested ``claude`` is always a brand-new
+process and therefore always reports ``'startup'``, whereas these values can
+only come from the process that already owns the session. On them the
+ownership probe adopts anyway and ``run_session_start`` RE-binds the fresh
+id, so the record keeps tracking the session it belongs to.
+"""
+
+
+def _is_owner_only_session_start(hook_input: Mapping[str, Any]) -> bool:
+    """Did this event come from a source only the owning process can produce?
+
+    ``source`` is a SessionStart-only stdin field, so this is only ever
+    consulted from the SessionStart handler's own call path -- the
+    ``allow_remint`` seam on ``_env_slug_is_owned``/``_resolve_hook_slug``.
+    Notification and Stop stay under the strict bind-once rule rather than
+    trusting a field their event shape has no business carrying.
+    """
+    return (
+        str(hook_input.get('source') or '').strip().lower()
+        in _OWNER_ONLY_SESSION_START_SOURCES
+    )
+
+
 def _env_slug_is_owned(
     slug: str,
     hook_input: Mapping[str, Any],
     root: Path | str | None,
+    *,
+    allow_remint: bool = False,
 ) -> bool:
     """Is the inherited CLAUDE_SPAWN_SESSION_ID *slug* THIS session's own?
 
@@ -138,12 +187,22 @@ def _env_slug_is_owned(
     ``_bind_claude_session_id``). Only a binding that positively MISMATCHES
     returns False, sending the caller to the hand-launched keying.
 
+    With *allow_remint* a mismatch is ALSO forgiven when the event's
+    SessionStart ``source`` says only the owning process could have fired it
+    (``/clear`` and friends re-mint ``session_id`` in place -- see
+    ``_OWNER_ONLY_SESSION_START_SOURCES``); ``run_session_start`` re-binds
+    the record to the new id on that path. Only SessionStart passes it: a
+    Notification/Stop carrying a ``source`` at all is malformed, and
+    honouring one there would hand any inheritor a one-word bypass. The
+    owning session needs no such bypass on those events -- its SessionStart
+    has already re-bound the record to the fresh id by then.
+
     FAIL-SOFT: every failure mode resolves to adopt (True), never to fork.
     A probe that cannot answer degrades to the pre-task-4193 behaviour
     rather than inventing a record split, honouring the hook trio's hard
     rule that a registry fault never breaks a session.
     """
-    hook_session_id = str(hook_input.get('session_id') or '').strip()
+    hook_session_id = _hook_session_id(hook_input)
     if not hook_session_id:
         return True
     try:
@@ -168,7 +227,65 @@ def _env_slug_is_owned(
     bound = (record.claude_session_id or '').strip()
     if not bound:
         return True
-    return bound == hook_session_id
+    if bound == hook_session_id:
+        return True
+    # Not an inheritor if only the owning PROCESS could have fired this
+    # event: Claude Code re-mints session_id in place on /clear.
+    return allow_remint and _is_owner_only_session_start(hook_input)
+
+
+def _resolve_hook_slug(
+    hook_input: Mapping[str, Any],
+    env: Mapping[str, str],
+    root: Path | str | None,
+    *,
+    allow_remint: bool = False,
+) -> tuple[str, str | None]:
+    """Resolve ``(slug, rejected_env_slug)`` for one hook event.
+
+    ``slug`` is exactly what ``hook_session_slug`` returns -- see its
+    docstring for the adoption / fall-through contract.
+
+    ``rejected_env_slug`` is the sanitized ``CLAUDE_SPAWN_SESSION_ID`` when
+    one was present but disowned by ``_env_slug_is_owned``: this event
+    belongs to a nested ``claude`` that merely INHERITED the variable and is
+    being forked onto its own record. It is None on every other path
+    (adopted, or no env slug at all).
+
+    That one bit is worth returning because the fork path is the only place
+    where the true spawner IS known -- it is precisely the slug just
+    rejected -- and equally the only place where every OTHER inherited
+    ``CLAUDE_SPAWN_*`` value in scope describes the SPAWNER rather than this
+    session, so it must not be copied onto the new record wholesale (see
+    to tell the two apart (see ``run_session_start``).
+
+    *allow_remint* is forwarded to ``_env_slug_is_owned``; SessionStart is
+    the only caller that sets it.
+    """
+    spawn_session_id = (env.get('CLAUDE_SPAWN_SESSION_ID') or '').strip() or None
+    rejected: str | None = None
+    if spawn_session_id is not None:
+        # Sanitize BEFORE probing: it keeps the all-dots containment contract
+        # (task 4112) intact, and means an adversarial env token can no more
+        # escape sessions_dir when READ than when written.
+        candidate = session_registry.sanitize_slug(spawn_session_id)
+        if _env_slug_is_owned(candidate, hook_input, root, allow_remint=allow_remint):
+            return candidate, None
+        rejected = candidate
+
+    identity = resolve_hook_identity(hook_input, env)
+    session_id = _hook_session_id(hook_input) or 'unknown'
+    # session_id (str) deliberately fills the launcher_pid slot as the
+    # uniqueness token (see module docstring); build_session_slug only ever
+    # str()s this argument, so the int annotation is not a real runtime
+    # constraint here.
+    slug = session_registry.build_session_slug(
+        identity.role,
+        identity.project,
+        identity.task_id,
+        session_id,  # type: ignore[arg-type]
+    )
+    return slug, rejected
 
 
 def hook_session_slug(
@@ -176,6 +293,7 @@ def hook_session_slug(
     env: Mapping[str, str],
     *,
     root: Path | str | None = None,
+    allow_remint: bool = False,
 ) -> str:
     """Build the record-identity slug for one hook event.
 
@@ -202,39 +320,32 @@ def hook_session_slug(
     resolves the default fleet root.
 
     Otherwise (or on a proven mismatch) reuses
-    ``session_registry.build_session_slug`` with the
-    hook's ``session_id`` as the uniqueness token in place of
-    ``launcher_pid`` -- ``session_id`` is stable across the
-    SessionStart/Notification/Stop events of one Claude Code session, so
-    all three deterministically resolve to the same ``record.json`` (the
-    hand-launched fallback).
-    """
-    spawn_session_id = (env.get('CLAUDE_SPAWN_SESSION_ID') or '').strip() or None
-    if spawn_session_id is not None:
-        # Sanitize BEFORE probing: it keeps the all-dots containment contract
-        # (task 4112) intact, and means an adversarial env token can no more
-        # escape sessions_dir when READ than when written.
-        candidate = session_registry.sanitize_slug(spawn_session_id)
-        if _env_slug_is_owned(candidate, hook_input, root):
-            return candidate
+    ``session_registry.build_session_slug`` with the hook's ``session_id``
+    (via ``_hook_session_id``, so a blank token falls back to ``'unknown'``
+    exactly as an absent one does) as the uniqueness token in place of
+    ``launcher_pid``. ``session_id`` is stable across the
+    SessionStart/Notification/Stop events of one turn, so all three
+    deterministically resolve to the same ``record.json`` (the hand-launched
+    fallback). It is NOT stable across a ``/clear``, which re-mints it in
+    place -- a hand-launched session simply gets a new record from there on,
+    while a spawned one is kept whole by
+    ``_OWNER_ONLY_SESSION_START_SOURCES``.
 
-    identity = resolve_hook_identity(hook_input, env)
-    session_id = str(hook_input.get('session_id') or 'unknown')
-    # session_id (str) deliberately fills the launcher_pid slot as the
-    # uniqueness token (see module docstring); build_session_slug only ever
-    # str()s this argument, so the int annotation is not a real runtime
-    # constraint here.
-    return session_registry.build_session_slug(
-        identity.role,
-        identity.project,
-        identity.task_id,
-        session_id,  # type: ignore[arg-type]
-    )
+    *allow_remint* (SessionStart only) lets a ``/clear``-style re-mint keep
+    the record instead of forking -- see ``_env_slug_is_owned``.
+
+    Thin wrapper over ``_resolve_hook_slug``, which additionally reports
+    WHETHER an inherited env slug was rejected; callers that enrich a record
+    need that bit, callers that only need an identity do not.
+    """
+    return _resolve_hook_slug(hook_input, env, root, allow_remint=allow_remint)[0]
 
 
 def _bind_claude_session_id(
     record: session_registry.SessionRecord,
     hook_input: Mapping[str, Any],
+    *,
+    allow_rebind: bool = False,
 ) -> bool:
     """Stamp this hook's Claude Code session_id onto an unbound *record*.
 
@@ -245,11 +356,21 @@ def _bind_claude_session_id(
     would otherwise claim ownership under the same bogus token. Returns
     whether *record* was mutated, so the caller can fold the stamp into a
     write it was already making instead of adding one.
+
+    *allow_rebind* is the one sanctioned exception: Claude Code re-mints
+    ``session_id`` in place on ``/clear``, so the OWNING process itself can
+    arrive with a new id. ``run_session_start`` passes it only when
+    ``_is_owner_only_session_start`` says no nested ``claude`` could have
+    produced this event -- never on the Notification/Stop refresh path,
+    where no such ``source`` field exists to vouch for the caller.
     """
-    if (record.claude_session_id or '').strip():
-        return False
-    hook_session_id = str(hook_input.get('session_id') or '').strip()
+    hook_session_id = _hook_session_id(hook_input)
     if not hook_session_id:
+        return False
+    bound = (record.claude_session_id or '').strip()
+    if bound == hook_session_id:
+        return False
+    if bound and not allow_rebind:
         return False
     record.claude_session_id = hook_session_id
     return True
@@ -332,6 +453,54 @@ def _hand_launched_liveness_pid() -> int:
         return os.getsid(0)
     except OSError:
         return os.getppid()
+
+
+def _parent_pid_of(pid: int) -> int | None:
+    """The parent pid of *pid* per ``/proc/<pid>/status``, or None.
+
+    ``status`` (not ``stat``) is parsed deliberately: its ``PPid:`` line is
+    plainly whitespace-delimited, immune to the ``(comm)`` field's embedded
+    spaces and parens. Returns None -- never raises -- on a platform with no
+    ``/proc``, on a race where *pid* exits mid-read, and on any unparseable
+    body, so every caller can treat the answer as a best-effort hint.
+    """
+    try:
+        for line in Path(f'/proc/{pid}/status').read_text().splitlines():
+            if line.startswith('PPid:'):
+                return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _nested_claude_liveness_pid() -> int:
+    """A liveness pid that actually DIES with a forked inheritor's session.
+
+    ``_hand_launched_liveness_pid``'s ``os.getsid(0)`` is deliberately the
+    terminal's POSIX session leader, which OUTLIVES every nested ``claude``
+    started inside that terminal. Stamped on a forked-inheritor record it
+    would make the record unreapable: ``reap_stale_records``'s ``stale_pid``
+    rule needs a dead ``launcher_pid`` (plus the heartbeat TTL), and
+    IDLE/AWAITING_INPUT are non-terminal so ``terminal_ttl`` never applies
+    either -- so every nested ``claude -p`` an agent shells out to would
+    leave a permanent extra registry row for the terminal's whole lifetime.
+    Nested invocation is routine agent behaviour, so that is registry growth
+    proportional to it (task 4193 review).
+
+    The hook process tree is ``claude -> <hook>.sh -> python``, so THIS
+    process's grandparent is the nested ``claude`` itself -- exactly the
+    process whose exit should make the record reclaimable. Falls back to
+    ``_hand_launched_liveness_pid()`` whenever the grandparent cannot be
+    resolved (no ``/proc``, a mid-read race, or a hook reparented to init),
+    i.e. degrades to the durable-but-coarse pid rather than guessing. Note
+    the fallback is only ever *coarser*: ``stale_pid`` also requires
+    ``NON_TERMINAL_HEARTBEAT_TTL`` of silence, so a mis-resolved pid cannot
+    reap a record that is still being written to.
+    """
+    grandparent = _parent_pid_of(os.getppid())
+    if grandparent is not None and grandparent > 1:
+        return grandparent
+    return _hand_launched_liveness_pid()
 
 
 def _resolve_parent_session_id(env: Mapping[str, str]) -> str | None:
@@ -437,7 +606,12 @@ def _resolve_wm_window_id(
     return None
 
 
-def _resolve_display(env: Mapping[str, str], title: str) -> session_registry.Display | None:
+def _resolve_display(
+    env: Mapping[str, str],
+    title: str,
+    *,
+    allow_spawn_marker: bool = True,
+) -> session_registry.Display | None:
     """Resolve this session's best-effort focus target from env (Fleet Cockpit C2).
 
     TMUX takes precedence over WINDOWID (hybrid window model, PRD §3 fork 1):
@@ -458,6 +632,15 @@ def _resolve_display(env: Mapping[str, str], title: str) -> session_registry.Dis
     explicit env var -- no fallback to *title* itself -- so a hand-launched
     session (no CLAUDE_SPAWN_WM_TITLE) never invokes wmctrl here, and a
     resolver miss (or no marker at all) returns None exactly like today.
+
+    *allow_spawn_marker* is False on the forked-inheritor path (task 4193
+    review): ``CLAUDE_SPAWN_WM_TITLE`` names the SPAWNING session's window,
+    so resolving it for a nested ``claude`` would hand that session's row
+    the PARENT's window id -- cockpit focus on the nested row would raise
+    the parent's terminal, and ``mark_windowless_wm_sessions_exited`` would
+    treat the two rows as sharing one window. TMUX/WINDOWID are deliberately
+    left alone even there: those are set by the terminal the nested process
+    genuinely runs in, not by the spawn namespace.
     """
     if env.get('TMUX'):
         return session_registry.Display(
@@ -470,7 +653,7 @@ def _resolve_display(env: Mapping[str, str], title: str) -> session_registry.Dis
             wm_title=title,
             wm_window_id=env.get('WINDOWID'),
         )
-    marker = env.get('CLAUDE_SPAWN_WM_TITLE')
+    marker = env.get('CLAUDE_SPAWN_WM_TITLE') if allow_spawn_marker else None
     if marker:
         window_id = _resolve_wm_window_id(marker)
         if window_id is not None:
@@ -526,16 +709,39 @@ def run_session_start(
     into the single ``write_record`` below. The binding is never overwritten
     afterwards -- bind-once is what makes it a stable discriminator between
     the session spawn-claude.sh launched and a nested ``claude`` that merely
-    inherited ``CLAUDE_SPAWN_SESSION_ID`` from it.
+    inherited ``CLAUDE_SPAWN_SESSION_ID`` from it. The single exception is a
+    SessionStart whose ``source`` only the owning process could have
+    produced (``/clear`` re-mints ``session_id`` in place): there the record
+    is RE-bound to the new id, so the owner keeps its own record rather than
+    being mistaken for an inheritor (see
+    ``_OWNER_ONLY_SESSION_START_SOURCES``).
+
+    Forked-inheritor enrichment (task 4193 review): when the inherited env
+    slug is REJECTED, every remaining ``CLAUDE_SPAWN_*`` value in scope
+    still describes the SPAWNER, not this session, so it is not copied over
+    wholesale. ``parent_session_id`` is taken from the rejected slug itself
+    -- the one path where the true spawner is known exactly, and strictly
+    better than ``CLAUDE_SPAWN_PARENT_ID``, which names the spawner's OWN
+    parent and would render this session as its spawner's sibling. The
+    ``CLAUDE_SPAWN_WM_TITLE`` display resolution is skipped (see
+    ``_resolve_display``) and ``launcher_pid`` comes from
+    ``_nested_claude_liveness_pid`` so the forked record stays reapable.
     """
     identity = resolve_hook_identity(hook_input, env)
-    slug = hook_session_slug(hook_input, env, root=root)
+    slug, forked_from = _resolve_hook_slug(hook_input, env, root, allow_remint=True)
     try:
         record = session_registry.read_record(slug, root=root)
     except FileNotFoundError:
         cwd = str(hook_input.get('cwd') or os.getcwd())
         launcher_pid_raw = env.get('CLAUDE_SPAWN_LAUNCHER_PID')
-        launcher_pid = int(launcher_pid_raw) if launcher_pid_raw else _hand_launched_liveness_pid()
+        if forked_from is not None:
+            # An inherited CLAUDE_SPAWN_LAUNCHER_PID would be the SPAWNER's,
+            # and the terminal's session leader outlives this nested claude.
+            launcher_pid = _nested_claude_liveness_pid()
+        elif launcher_pid_raw:
+            launcher_pid = int(launcher_pid_raw)
+        else:
+            launcher_pid = _hand_launched_liveness_pid()
         record = session_registry.SessionRecord(
             session_slug=slug,
             status=session_registry.Status.RUNNING,
@@ -551,15 +757,21 @@ def run_session_start(
         )
 
     record.status = session_registry.Status.RUNNING
-    parent_session_id = _resolve_parent_session_id(env)
-    if parent_session_id is not None:
-        record.parent_session_id = parent_session_id
+    if forked_from is not None:
+        # The rejected env slug IS this nested claude's spawner.
+        record.parent_session_id = forked_from
+    else:
+        parent_session_id = _resolve_parent_session_id(env)
+        if parent_session_id is not None:
+            record.parent_session_id = parent_session_id
     title = record.title or hook_display_title(identity, env, record)
-    display = _resolve_display(env, title)
+    display = _resolve_display(env, title, allow_spawn_marker=forked_from is None)
     if display is not None:
         record.display = display
     # This path always writes, so the return value is deliberately ignored.
-    _bind_claude_session_id(record, hook_input)
+    _bind_claude_session_id(
+        record, hook_input, allow_rebind=_is_owner_only_session_start(hook_input)
+    )
     session_registry.write_record(record, root=root)
     return record
 
@@ -583,6 +795,30 @@ def _extract_question(hook_input: Mapping[str, Any]) -> session_registry.Questio
     return session_registry.Question(text=str(message), asked_at=datetime.now(UTC).isoformat())
 
 
+def _record_status_or_none(
+    slug: str,
+    root: Path | str | None,
+) -> session_registry.Status | None:
+    """The status of the record at *slug* BEFORE this event refreshes it.
+
+    None when there is no record yet (the ordinary forked/hand-launched
+    first sight) and, fail-soft, when it cannot be read at all -- the same
+    hard rule the ownership probe follows: a registry fault degrades to the
+    prior behaviour instead of breaking a session. Logged, never silent.
+    """
+    try:
+        return session_registry.read_record(slug, root=root).status
+    except FileNotFoundError:
+        return None
+    except Exception:
+        logger.warning(
+            'pre-refresh status read failed for slug %s; treating it as unsighted',
+            slug,
+            exc_info=True,
+        )
+        return None
+
+
 def _run_status_refresh_and_retitle(
     hook_input: Mapping[str, Any],
     env: Mapping[str, str],
@@ -600,14 +836,28 @@ def _run_status_refresh_and_retitle(
     same conditional write the pending question already used, so an
     ordinary bound-record event still performs exactly one registry write
     (``refresh_record``'s own); the extra write happens only on the single
-    event that first binds a legacy record.
+    event that first binds a legacy record -- and never at all while the
+    record is still LAUNCHING, so an inheritor cannot claim a spawn-created
+    record whose owner has not run its SessionStart yet.
     """
     identity = resolve_hook_identity(hook_input, env)
     slug = hook_session_slug(hook_input, env, root=root)
+    prior_status = _record_status_or_none(slug, root)
     record = session_registry.refresh_record(slug, root=root, status=status)
     # Bind on the record refresh_record RETURNED (post-status-flip), and write
     # after both mutations, so status, question and binding land atomically.
-    bound = _bind_claude_session_id(record, hook_input)
+    #
+    # A still-LAUNCHING record has not been sighted by its owning session's
+    # SessionStart yet. Binding one here would let a nested inheritor whose
+    # event happens to land first (the owner's SessionStart delayed, timed
+    # out under the 10s hook timeout, or failed) claim the spawn-created
+    # record -- which holds role/project/prompt/result_file and is the one
+    # spawn-claude.sh's finish() writes `exited` to -- and invert ownership
+    # permanently, the precise failure task 2511 fixed. Skipping the stamp
+    # costs nothing but a deferral: the owner's own SessionStart binds it.
+    bound = prior_status is not session_registry.Status.LAUNCHING and _bind_claude_session_id(
+        record, hook_input
+    )
     if question is not None:
         record.question = question
     if question is not None or bound:

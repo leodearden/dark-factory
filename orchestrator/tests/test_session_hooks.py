@@ -1000,16 +1000,37 @@ def test_main_session_start_fail_soft_when_probe_read_raises(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    # The CLI backstop, scoped to the PROBE's own read (the first of the two
+    # read_record calls session-start makes). Booby-trapping every read
+    # instead would prove nothing: main()'s pre-existing blanket except
+    # would return 0 even if the probe propagated, and the hook would be a
+    # no-op rather than fail-soft. So the assertion here is the OUTCOME --
+    # the degraded probe still let SessionStart complete its write.
+    slug = 'session-cockpit-3215073'
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
-    monkeypatch.setenv('CLAUDE_SPAWN_SESSION_ID', 'session-cockpit-3215073')
+    monkeypatch.setenv('CLAUDE_SPAWN_SESSION_ID', slug)
     _stdin_json(monkeypatch, {'session_id': 'uuid-parent', 'cwd': '/home/leo/src/dark-factory'})
 
-    def _boom(*_args: object, **_kwargs: object) -> None:
-        raise OSError('disk on fire')
+    real_read_record = sr.read_record
+    calls: list[int] = []
 
-    monkeypatch.setattr(sr, 'read_record', _boom)
+    def _boom_once(*args: object, **kwargs: object) -> sr.SessionRecord:
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError('disk on fire')
+        return real_read_record(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(sr, 'read_record', _boom_once)
 
     assert sh.main(['session-start']) == 0
+
+    # The probe was consulted (and degraded), and adopting the env slug
+    # unchecked is exactly the pre-task-4193 behaviour: one record, written.
+    assert len(calls) >= 1
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status == sr.Status.RUNNING
+    assert record.claude_session_id == 'uuid-parent'
+    assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 1
 
 
 def test_hand_launched_session_unaffected_by_ownership_probe(
@@ -1065,6 +1086,408 @@ def test_hook_session_slug_adopts_when_stdin_has_no_session_id(tmp_path: Path) -
     env = {'CLAUDE_SPAWN_SESSION_ID': slug}
 
     assert sh.hook_session_slug(hook_input, env, root=tmp_path) == slug
+
+
+# ---------------------------------------------------------------------------
+# Task 4193 amendment: one definition of a usable stdin session_id
+# ---------------------------------------------------------------------------
+
+
+def test_hook_session_id_normalizes_every_missing_shape() -> None:
+    # The probe, the binding stamp and the slug builder must agree on what
+    # counts as a discriminator, so all the "no session_id" shapes collapse
+    # to the same empty string.
+    assert sh._hook_session_id({}) == ''
+    assert sh._hook_session_id({'session_id': None}) == ''
+    assert sh._hook_session_id({'session_id': ''}) == ''
+    assert sh._hook_session_id({'session_id': '   '}) == ''
+    assert sh._hook_session_id({'session_id': ' uuid-x '}) == 'uuid-x'
+
+
+def test_hook_session_slug_treats_a_blank_session_id_as_unknown(tmp_path: Path) -> None:
+    # A whitespace-only stdin session_id used to reach build_session_slug
+    # verbatim (no .strip()), yielding a slug with a blank token while the
+    # two 4193 helpers already read it as "no discriminator at all".
+    blank = sh.hook_session_slug({'session_id': '   ', 'cwd': '/home/leo/src/df'}, {}, root=tmp_path)
+    absent = sh.hook_session_slug({'cwd': '/home/leo/src/df'}, {}, root=tmp_path)
+    assert blank == absent
+    assert blank.endswith('-unknown')
+
+
+def test_bind_claude_session_id_ignores_a_blank_stdin_session_id() -> None:
+    record = sr.SessionRecord(session_slug='s', status=sr.Status.LAUNCHING)
+    assert sh._bind_claude_session_id(record, {'session_id': '   '}) is False
+    assert record.claude_session_id is None
+
+
+# ---------------------------------------------------------------------------
+# Task 4193 amendment: /clear re-mints session_id inside the OWNING process
+# ---------------------------------------------------------------------------
+
+
+def test_hook_session_slug_adopts_env_slug_when_a_clear_remints_the_session_id(
+    tmp_path: Path,
+) -> None:
+    # /clear mints a new session_id in the SAME process, so the owning
+    # session's own SessionStart legitimately mismatches its binding.
+    # Reading that as an inheritor would re-introduce the task-2511 split.
+    slug = 'session-cockpit-3215080'
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug,
+            status=sr.Status.RUNNING,
+            launcher_pid=3215080,
+            claude_session_id='uuid-before-clear',
+        ),
+        root=tmp_path,
+    )
+    hook_input = {
+        'session_id': 'uuid-after-clear',
+        'source': 'clear',
+        'cwd': '/home/leo/src/dark-factory',
+    }
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+
+    assert sh.hook_session_slug(hook_input, env, root=tmp_path, allow_remint=True) == slug
+    # ... but only where a `source` field means anything. Without the
+    # SessionStart-only opt-in the same event is a plain mismatch and forks.
+    assert sh.hook_session_slug(hook_input, env, root=tmp_path) != slug
+
+
+@pytest.mark.parametrize('source', ['clear', 'resume', 'compact'])
+def test_run_session_start_rebinds_on_an_owner_only_source(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    # ... and the record is RE-bound to the new id, so the session stays
+    # discriminable from a nested claude on every subsequent event.
+    slug = f'session-cockpit-321508{["clear", "resume", "compact"].index(source) + 1}'
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug,
+            status=sr.Status.RUNNING,
+            launcher_pid=3215081,
+            claude_session_id='uuid-before',
+        ),
+        root=tmp_path,
+    )
+    hook_input = {
+        'session_id': 'uuid-after',
+        'source': source,
+        'cwd': '/home/leo/src/dark-factory',
+    }
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.claude_session_id == 'uuid-after'
+    assert record.status == sr.Status.RUNNING
+    assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 1
+
+
+def test_run_session_start_startup_source_with_mismatched_id_still_forks(
+    tmp_path: Path,
+) -> None:
+    # The other direction: a nested claude is always a fresh process and so
+    # always reports source='startup'. It must still fork.
+    slug = 'session-cockpit-3215084'
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug,
+            status=sr.Status.RUNNING,
+            launcher_pid=3215084,
+            claude_session_id='uuid-parent',
+        ),
+        root=tmp_path,
+    )
+    hook_input = {
+        'session_id': 'uuid-nested',
+        'source': 'startup',
+        'cwd': '/home/leo/src/dark-factory',
+    }
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    assert sr.read_record(slug, root=tmp_path).claude_session_id == 'uuid-parent'
+    assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 2
+
+
+def test_refresh_path_ignores_a_forged_owner_only_source(tmp_path: Path) -> None:
+    # Notification/Stop carry no `source` field, so nothing there can vouch
+    # for the caller: the re-mint escape hatch is SessionStart-only. A
+    # forged one on a Stop must not be honoured -- otherwise any inheritor
+    # gets a one-word bypass of the whole ownership check.
+    slug = 'session-cockpit-3215085'
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug,
+            status=sr.Status.RUNNING,
+            launcher_pid=3215085,
+            claude_session_id='uuid-parent',
+        ),
+        root=tmp_path,
+    )
+    hook_input = {
+        'session_id': 'uuid-nested',
+        'source': 'clear',
+        'cwd': '/home/leo/src/dark-factory',
+    }
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+
+    sh.run_stop(hook_input, env, root=tmp_path)
+
+    parent = sr.read_record(slug, root=tmp_path)
+    assert parent.claude_session_id == 'uuid-parent'
+    assert parent.status == sr.Status.RUNNING
+    assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 2
+
+
+# ---------------------------------------------------------------------------
+# Task 4193 amendment: a forked record describes ITSELF, not its spawner
+# ---------------------------------------------------------------------------
+
+
+def _write_bound_parent(slug: str, tmp_path: Path, pid: int) -> None:
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug,
+            status=sr.Status.RUNNING,
+            launcher_pid=pid,
+            claude_session_id='uuid-parent',
+        ),
+        root=tmp_path,
+    )
+
+
+def test_forked_inheritor_records_its_spawner_as_parent(tmp_path: Path) -> None:
+    # CLAUDE_SPAWN_PARENT_ID names the SPAWNER's OWN parent, so copying it
+    # onto the fork would render the nested session as its spawner's
+    # sibling. The fork path is the one place the true parent is known
+    # exactly: it is the env slug that was just rejected.
+    slug = 'session-cockpit-3215090'
+    _write_bound_parent(slug, tmp_path, 3215090)
+    hook_input = {'session_id': 'uuid-nested', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug, 'CLAUDE_SPAWN_PARENT_ID': 'some-other-root'}
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    forked = sr.read_record(sh.hook_session_slug(hook_input, env, root=tmp_path), root=tmp_path)
+    assert forked.parent_session_id == slug
+    # And the spawning session's own record still points where it did.
+    assert sr.read_record(slug, root=tmp_path).parent_session_id is None
+
+
+def test_forked_inheritor_does_not_claim_the_spawners_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # CLAUDE_SPAWN_WM_TITLE marks the SPAWNING session's window: resolving
+    # it here would give the forked row the parent's window id, so cockpit
+    # focus would raise the parent's terminal and
+    # mark_windowless_wm_sessions_exited would treat both rows as one
+    # window. The resolver must not even be consulted.
+    def _boom(*_args: object, **_kwargs: object) -> str:
+        raise AssertionError('a forked inheritor must not resolve the spawner window marker')
+
+    monkeypatch.setattr(sh, '_resolve_wm_window_id', _boom)
+
+    slug = 'session-cockpit-3215091'
+    _write_bound_parent(slug, tmp_path, 3215091)
+    hook_input = {'session_id': 'uuid-nested', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug, 'CLAUDE_SPAWN_WM_TITLE': 'parent-marker'}
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    forked = sr.read_record(sh.hook_session_slug(hook_input, env, root=tmp_path), root=tmp_path)
+    assert forked.display is None
+
+
+def test_adopted_session_still_resolves_the_spawn_window_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The gate is fork-only: the owning session's own SessionStart keeps the
+    # task-2510 / Cockpit C10 marker resolution untouched.
+    monkeypatch.setattr(sh, '_resolve_wm_window_id', lambda _marker: '0x1a')
+
+    slug = 'session-cockpit-3215092'
+    _write_bound_parent(slug, tmp_path, 3215092)
+    hook_input = {'session_id': 'uuid-parent', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug, 'CLAUDE_SPAWN_WM_TITLE': 'parent-marker'}
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    display = sr.read_record(slug, root=tmp_path).display
+    assert display is not None
+    assert display.wm_title == 'parent-marker'
+    assert display.wm_window_id == '0x1a'
+
+
+# ---------------------------------------------------------------------------
+# Task 4193 amendment: a forked record must stay reapable
+# ---------------------------------------------------------------------------
+
+
+def test_parent_pid_of_resolves_this_process_parent() -> None:
+    assert sh._parent_pid_of(os.getpid()) == os.getppid()
+
+
+def test_parent_pid_of_returns_none_for_an_unresolvable_pid() -> None:
+    # Never raises: an absent /proc entry (or no /proc at all) is a plain
+    # "cannot tell", which every caller treats as a best-effort miss.
+    assert sh._parent_pid_of(-1) is None
+
+
+def test_nested_claude_liveness_pid_prefers_the_grandparent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # claude -> <hook>.sh -> python, so the grandparent IS the nested claude
+    # whose death should make the forked record reclaimable.
+    monkeypatch.setattr(sh, '_parent_pid_of', lambda _pid: 424242)
+    assert sh._nested_claude_liveness_pid() == 424242
+
+
+@pytest.mark.parametrize('unresolvable', [None, 1])
+def test_nested_claude_liveness_pid_falls_back_to_the_durable_pid(
+    monkeypatch: pytest.MonkeyPatch,
+    unresolvable: int | None,
+) -> None:
+    # No /proc, a mid-read race, or a hook reparented to init: degrade to
+    # the coarse-but-durable pid rather than guessing.
+    monkeypatch.setattr(sh, '_parent_pid_of', lambda _pid: unresolvable)
+    assert sh._nested_claude_liveness_pid() == sh._hand_launched_liveness_pid()
+
+
+def test_forked_inheritor_record_gets_a_pid_that_dies_with_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # _hand_launched_liveness_pid's session leader outlives every nested
+    # claude, so a fork stamped with it would never satisfy
+    # reap_stale_records' stale_pid rule -- one permanent extra row per
+    # nested `claude -p` an agent shells out to.
+    monkeypatch.setattr(sh, '_nested_claude_liveness_pid', lambda: 424242)
+
+    slug = 'session-cockpit-3215093'
+    _write_bound_parent(slug, tmp_path, 3215093)
+    hook_input = {'session_id': 'uuid-nested', 'cwd': '/home/leo/src/dark-factory'}
+    # An inherited CLAUDE_SPAWN_LAUNCHER_PID is the SPAWNER's, so it must
+    # not win here either.
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug, 'CLAUDE_SPAWN_LAUNCHER_PID': '3215093'}
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    forked = sr.read_record(sh.hook_session_slug(hook_input, env, root=tmp_path), root=tmp_path)
+    assert forked.launcher_pid == 424242
+
+
+def test_hand_launched_record_keeps_the_durable_session_leader_pid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The nested-pid resolver is fork-only: a hand-launched session still
+    # gets the terminal-lifetime pid _hand_launched_liveness_pid documents.
+    def _boom() -> int:
+        raise AssertionError('the nested-claude pid resolver is for forked inheritors only')
+
+    monkeypatch.setattr(sh, '_nested_claude_liveness_pid', _boom)
+    monkeypatch.setattr(sh, '_hand_launched_liveness_pid', lambda: 515151)
+
+    hook_input = {'session_id': 'sess-hand', 'cwd': '/home/leo/src/dark-factory'}
+    sh.run_session_start(hook_input, env={}, root=tmp_path)
+
+    slug = sh.hook_session_slug(hook_input, env={}, root=tmp_path)
+    assert sr.read_record(slug, root=tmp_path).launcher_pid == 515151
+
+
+# ---------------------------------------------------------------------------
+# Task 4193 amendment: an inheritor cannot claim an unsighted launching record
+# ---------------------------------------------------------------------------
+
+
+def test_refresh_path_does_not_bind_a_still_launching_record(tmp_path: Path) -> None:
+    # spawn-claude.sh's `launching` write has not been sighted by its
+    # owner's SessionStart yet (delayed, timed out under the 10s hook
+    # timeout, or failed). A nested claude's Stop landing first must not be
+    # allowed to bind ITS id into that record -- that would invert ownership
+    # permanently, since the launching record is the one holding
+    # role/project/prompt/result_file and the one finish() writes `exited`
+    # to.
+    slug = 'session-cockpit-3215100'
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug,
+            status=sr.Status.LAUNCHING,
+            role='session',
+            project='cockpit',
+            prompt='/spawn cockpit',
+            launcher_pid=3215100,
+        ),
+        root=tmp_path,
+    )
+    hook_input = {'session_id': 'uuid-nested', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+
+    sh.run_stop(hook_input, env, root=tmp_path)
+
+    assert sr.read_record(slug, root=tmp_path).claude_session_id is None
+
+
+def test_owning_session_start_still_wins_the_launching_record_after_a_nested_stop(
+    tmp_path: Path,
+) -> None:
+    # The whole inversion story end to end: the nested event refrains, then
+    # the owner's SessionStart binds, and from there the nested claude forks
+    # onto its own record exactly as it should.
+    slug = 'session-cockpit-3215101'
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug,
+            status=sr.Status.LAUNCHING,
+            launcher_pid=3215101,
+            result_file='/tmp/result-3215101.md',
+        ),
+        root=tmp_path,
+    )
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+    nested = {'session_id': 'uuid-nested', 'cwd': '/home/leo/src/dark-factory'}
+    owner = {'session_id': 'uuid-parent', 'cwd': '/home/leo/src/dark-factory'}
+
+    sh.run_stop(nested, env, root=tmp_path)
+    sh.run_session_start(owner, env, root=tmp_path)
+
+    parent = sr.read_record(slug, root=tmp_path)
+    assert parent.claude_session_id == 'uuid-parent'
+    assert parent.result_file == '/tmp/result-3215101.md'
+
+    # The nested claude's next event now forks instead of flipping it.
+    sh.run_stop(nested, env, root=tmp_path)
+    assert sr.read_record(slug, root=tmp_path).status == sr.Status.RUNNING
+    forked = sr.read_record(sh.hook_session_slug(nested, env, root=tmp_path), root=tmp_path)
+    assert forked.status == sr.Status.IDLE
+    assert forked.claude_session_id == 'uuid-nested'
+
+
+def test_refresh_path_still_binds_a_legacy_record_that_is_past_launching(
+    tmp_path: Path,
+) -> None:
+    # The LAUNCHING guard must not cost the migration case it sits next to:
+    # a pre-task-4193 in-flight record is RUNNING/AWAITING_INPUT/IDLE, never
+    # LAUNCHING, so it is still bound by the very next event.
+    slug = 'session-cockpit-3215102'
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug, status=sr.Status.AWAITING_INPUT, launcher_pid=3215102
+        ),
+        root=tmp_path,
+    )
+    hook_input = {'session_id': 'uuid-parent', 'cwd': '/home/leo/src/dark-factory'}
+
+    sh.run_stop(hook_input, {'CLAUDE_SPAWN_SESSION_ID': slug}, root=tmp_path)
+
+    assert sr.read_record(slug, root=tmp_path).claude_session_id == 'uuid-parent'
 
 
 # ---------------------------------------------------------------------------

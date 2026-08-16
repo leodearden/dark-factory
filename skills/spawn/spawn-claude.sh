@@ -217,6 +217,20 @@ fi
 # session_id is the only token that can make that distinction -- a nested
 # claude is also a descendant of the original launcher, so PID lineage
 # cannot tell an owner from an inheritor.
+#
+# Two consequences of that fork worth knowing when reading a forked row:
+#   * it is parented to THIS spawn's slug (the inherited CLAUDE_SPAWN_PARENT_ID
+#     names this spawn's OWN parent, which would render the nested session as
+#     this one's sibling), it does not resolve CLAUDE_SPAWN_WM_TITLE (that
+#     marker is THIS window, and a row claiming it would misdirect cockpit
+#     focus), and its launcher_pid is the nested claude itself so the row is
+#     reapable once that process exits;
+#   * the discriminator survives /clear. Claude Code re-mints session_id in
+#     place there, so the owning session's own SessionStart would look like a
+#     mismatch -- session_hooks keys off the SessionStart-only `source` field
+#     ('clear'/'resume'/'compact', which a nested claude can never report,
+#     since it is always a fresh process reporting 'startup') and RE-binds
+#     this record instead of forking it.
 spawn_id_export=""
 parent_id_export=""
 if [ -n "$SESSION_RECORD_DIR" ]; then
