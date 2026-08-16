@@ -1671,6 +1671,80 @@ class ReconReportState:
             if run_sig_index.get(derived_sig) == finding.finding_id:
                 run_sig_index.pop(derived_sig, None)
 
+    def _log_cite_task_fold_purge(
+        self,
+        *,
+        run_id: str,
+        fold: Literal['project_scoped', 'entity_scoped'],
+        owning_entry: _ReportEntry,
+        finding: _Finding,
+        surviving_finding_id: str,
+        attempted_project_id: str,
+        attempted_task_id: str,
+    ) -> None:
+        """Emit the recovery WARNING for a finding :meth:`cite_task` is about
+        to fold away, and call it BEFORE :meth:`_purge_finding` runs.
+
+        The purge is WHOLESALE (see :meth:`_purge_finding`'s docstring): the
+        losing finding is dropped from ``owning_entry.findings`` entirely, so
+        its ``description`` / ``suggested_action`` and every citation already
+        attached to it are destroyed with no other trace — the returned
+        ``duplicate_finding`` error carries only the SURVIVOR's id. This log
+        line is therefore the SOLE recovery channel for that content: an
+        operator reconstructing what a fold discarded has nothing else to
+        read. Keep it exhaustive, and keep it ahead of the purge.
+
+        *fold* discriminates the two folds that share this helper — the
+        project-scoped null+null one (task-2425) and the entity-scoped
+        derived-signature one (task-2432) — so one grep for the shared
+        message finds both while each remains attributable. *owning_entry*
+        supplies the stage that FILED the purged finding, which on a
+        cross-stage fold is not the stage that is citing.
+
+        ``cited_tasks`` is deliberately absent from the payload: at fold time
+        it is empty by construction (the citation is appended only after the
+        fold check succeeds — see the comment in ``_purge_finding`` above and
+        the append at the end of :meth:`cite_task`). The attempted
+        ``(project_id, task_id)`` pair carries that information instead, and
+        is otherwise never recorded anywhere.
+
+        Lazy ``%``-style args (never an f-string), matching this module's
+        other warnings, so nothing is rendered when WARNING is disabled.
+        ``description`` / ``suggested_action`` need no capping here —
+        :meth:`add_finding` already truncates both to
+        ``_MAX_FINDING_TEXT_CHARS`` before storage.
+
+        KEYWORD-ONLY deliberately: four of the parameters are plain ``str``
+        (``run_id``, ``surviving_finding_id``, ``attempted_project_id``,
+        ``attempted_task_id``), so a transposed pair at a call site — most
+        plausibly a future third one — would type-check, run, and emit a
+        silently WRONG recovery log on the one path that has no other record
+        to cross-check against. Keeping them named makes that class of
+        mistake unrepresentable rather than merely untested.
+        """
+        logger.warning(
+            'recon_report: cite_task fold purged finding %r (%s fold) — its content is '
+            'discarded and recoverable ONLY from this line. run_id=%r stage=%r '
+            'surviving_finding_id=%r severity=%r category=%r flag_type=%r '
+            'description=%r suggested_action=%r attempted_citation=%r '
+            'cited_entities=%r cited_edges=%r cited_memories=%r cited_runs=%r',
+            finding.finding_id,
+            fold,
+            run_id,
+            owning_entry.stage,
+            surviving_finding_id,
+            finding.severity,
+            finding.category,
+            finding.flag_type,
+            finding.description,
+            finding.suggested_action,
+            (attempted_project_id, attempted_task_id),
+            finding.cited_entities,
+            finding.cited_edges,
+            finding.cited_memories,
+            finding.cited_runs,
+        )
+
     # ------------------------------------------------------------------
     # cite_* tools (task β)
     # ------------------------------------------------------------------
@@ -1858,6 +1932,17 @@ class ReconReportState:
            index add_finding already consults from every stage, so
            exempting one stage from registering it would just let that
            stage's findings silently evade the whole-run fold.
+
+        BOTH folds emit a WARNING carrying the losing finding's full content
+        (:meth:`_log_cite_task_fold_purge`) immediately BEFORE purging it.
+        The purge is wholesale and the returned ``duplicate_finding`` error
+        names only the SURVIVOR, so that line is the only recovery channel
+        for the discarded ``description`` / ``suggested_action`` and for any
+        cite_entity / cite_edge / cite_memory / cite_run citations already
+        attached to the folded finding. Keep the log ahead of the purge, and
+        keep it on both branches: a fold that purges silently is
+        unrecoverable, and the entity-scoped one has no stage carve-out so
+        it can fire from any stage.
         """
         entry = self._resolve_entry(run_id)
         if entry is None:
@@ -1929,10 +2014,28 @@ class ReconReportState:
         # narrow. Semantics are unchanged: project fold takes priority when
         # both would hit, purge runs exactly once, either way.
         if project_existing_id is not None and project_existing_id != finding.finding_id:
+            self._log_cite_task_fold_purge(
+                run_id=run_id,
+                fold='project_scoped',
+                owning_entry=finding_entry,
+                finding=finding,
+                surviving_finding_id=project_existing_id,
+                attempted_project_id=project_id,
+                attempted_task_id=task_id,
+            )
             self._purge_finding(run_id, finding_entry, finding)
             self._persist_run(run_id)
             return _duplicate_finding_error(project_existing_id)
         if entity_existing_id is not None and entity_existing_id != finding.finding_id:
+            self._log_cite_task_fold_purge(
+                run_id=run_id,
+                fold='entity_scoped',
+                owning_entry=finding_entry,
+                finding=finding,
+                surviving_finding_id=entity_existing_id,
+                attempted_project_id=project_id,
+                attempted_task_id=task_id,
+            )
             self._purge_finding(run_id, finding_entry, finding)
             self._persist_run(run_id)
             return _duplicate_finding_error(entity_existing_id)

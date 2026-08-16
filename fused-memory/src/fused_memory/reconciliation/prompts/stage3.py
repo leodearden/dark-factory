@@ -6,6 +6,7 @@ from fused_memory.reconciliation.policies import (
 )
 from fused_memory.reconciliation.prompts import (
     _STAGE3_PROJECT_ID_GUIDELINE,
+    DUPLICATE_FINDING_SALVAGE_GUIDANCE,
     get_recon_report_tool_guidance,
     render_escalation_boundary_note,
 )
@@ -362,6 +363,7 @@ you managed to confirm yourself.
 
 ## Report Channel — recon_report MCP Tools (PRD γ §9)
 {get_recon_report_tool_guidance()}
+{DUPLICATE_FINDING_SALVAGE_GUIDANCE}
 
 **NOTE — Stage 3 is read-only.** The `mcp__recon-report__*` tools write only to in-process \
 state (not Graphiti / Mem0 / Taskmaster) and are intentionally permitted in Stage 3. \

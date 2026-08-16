@@ -4,6 +4,7 @@ from fused_memory.reconciliation.prompts import (
     _STAGE1_GRAPHITI_QUEUED_GUIDANCE,
     _STAGE1_PROJECT_ID_GUIDELINE,
     AMEND_AND_EPISODE_TOOLS_BLOCK,
+    DUPLICATE_FINDING_SALVAGE_GUIDANCE,
     STALE_KNOWLEDGE_ANNOTATION_NORM,
     get_recon_report_tool_guidance,
     render_escalation_boundary_note,
@@ -207,10 +208,7 @@ in hand.
 
 A response containing an `error` key is NOT a new successful filing — do not invent or \
 count a `finding_id` for it:
-- `duplicate_finding` — an earlier stage of this run already filed the same \
-  (task_id, flag_type) pair. The response includes `existing_finding_id`: attach your \
-  citations to that `existing_finding_id` (the canonical id for this finding) rather \
-  than fabricating a new one.
+{DUPLICATE_FINDING_SALVAGE_GUIDANCE}
 - `run_id_unknown` / `report_already_completed` — nothing was filed. Do not fabricate a \
   `finding_id` or claim the finding was recorded.
 
