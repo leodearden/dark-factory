@@ -1037,24 +1037,16 @@ class TestEnforceFlipPreconditionCitations:
         ids = [e['id'] for e in self._block()['enforce_flip_preconditions']]
         assert ids == ['legacy_topic_spelling_remains', '3202', '3626']
 
-    def test_legacy_spelling_bucket_carries_its_RECORDED_status_not_open(self):
-        # PRD §159's 2026-08-04 amendment records this half DISCHARGED ("that
-        # bucket is empty ... every live canonical:true topic conforms in both
-        # projects").  Citing it as flatly open would be as wrong as omitting
-        # it.
+    def test_legacy_spelling_bucket_is_not_cited_as_flatly_open(self):
+        # PRD §159's 2026-08-04 amendment records this half DISCHARGED, so
+        # citing it as flatly open would be as wrong as omitting it.  Asserted
+        # as "not open" rather than against the date literal: WHICH discharge
+        # date is recorded is editorial and will be superseded, but the
+        # distinction between a discharged half and an open one is the thing a
+        # reader acts on.
         entry = self._block()['enforce_flip_preconditions'][0]
-        assert entry['status'] == 'discharged_2026_08_04'
-        assert '159' in entry['source']
-
-    def test_3202_is_cited_as_the_real_open_precondition(self):
-        entry = self._block()['enforce_flip_preconditions'][1]
-        assert entry['status'] == 'open'
-        assert '3202' in entry['source']
-
-    def test_3626_is_cited_as_the_deciding_gate(self):
-        entry = self._block()['enforce_flip_preconditions'][2]
-        assert entry['status'] == 'open'
-        assert '3626' in entry['source']
+        assert entry['status'] != 'open'
+        assert entry['source'], 'a citation with no source is not checkable'
 
     def test_citations_are_single_homed_in_a_module_constant(self):
         # One home for the three citations, so a future edit cannot leave the
@@ -1067,9 +1059,13 @@ class TestEnforceFlipPreconditionCitations:
         # mutating the report would silently rewrite every later run's
         # citations in the same process (the nightly wrapper censuses two
         # projects in one invocation).
+        # Compared against the constant's own captured value rather than a
+        # date literal, so this stays a pure aliasing test and does not
+        # re-pin the editorial status text the review flagged.
+        original = _mod.ENFORCE_FLIP_PRECONDITIONS[0]['status']
         block = self._block()
         block['enforce_flip_preconditions'][0]['status'] = 'MUTATED'
-        assert _mod.ENFORCE_FLIP_PRECONDITIONS[0]['status'] == 'discharged_2026_08_04'
+        assert _mod.ENFORCE_FLIP_PRECONDITIONS[0]['status'] == original
 
     def test_citations_are_citation_only_carrying_no_live_task_probe(self):
         # The ruling's scope note is explicit: cite the preconditions, do not
@@ -1256,7 +1252,6 @@ class TestTopicSlugConformance:
         ])
         entry = block['enforce_flip_preconditions'][0]
         assert entry['id'] == 'legacy_topic_spelling_remains'
-        assert entry['status'] == 'discharged_2026_08_04'
         live = entry['live_re_measurement']
         assert live['slug_non_conforming'] == 1
         assert live['canonical_slug_non_conforming'] == 0
@@ -2717,26 +2712,19 @@ class TestRenderMarkdownEnforcePreconditions:
         assert '3202' in md
         assert '3626' in md
 
-    def test_legacy_bucket_carries_its_recorded_status_and_a_live_re_measurement(self):
-        md = _mod.render_markdown(_coverage_md_report())
-        # Recorded DISCHARGED on 2026-08-04 -- citing it as flatly open
-        # would be as wrong as omitting it...
-        assert 'discharged_2026_08_04' in md
-        # ...but a bucket recorded empty can regrow (the leaf-alpha census's
-        # own 98 -> 103 history proves it does), so this run's own count
-        # rides alongside as the standing re-measurement.
-        assert 're-measur' in md.lower()
-
-    def test_citations_render_beneath_the_count_and_the_flag(self):
-        md = _mod.render_markdown(_coverage_md_report(canonical_uniqueness_enforced=False))
-        enforce_at = md.index('`memory_metadata.enforce`')
-        citations_at = md.index('legacy_topic_spelling_remains')
-        assert enforce_at < citations_at
-
-    def test_each_citation_names_a_checkable_source(self):
-        md = _mod.render_markdown(_coverage_md_report())
-        assert 'memory-metadata-vocabulary.md' in md
-        assert 'task 3626' in md
+    # DELIBERATELY NOT TESTED HERE (review of 2026-08-16): the rendered
+    # WORDING, the citation ORDER relative to the count/flag, and the
+    # 'discharged_2026_08_04' date literal.  Three tests pinning those were
+    # removed: `'re-measur' in md.lower()`, a positional
+    # `md.index(...) < md.index(...)` ordering assertion, and `'task 3626' in
+    # md`.  None could catch a defect in what the census MEASURES, and each
+    # turned a cosmetic re-wording -- or the ordinary event of 3202 landing
+    # and a status flipping -- into a suite failure.  What the ruling actually
+    # requires is that the citations REACH the reader and are never truncated;
+    # that is what the two surviving tests assert, keyed on stable IDs rather
+    # than prose.  The live re-measurement is asserted as COMPUTED COUNTS in
+    # `test_the_legacy_bucket_citation_carries_this_runs_re_measurement`,
+    # which is a measurement rather than a substring.
 
     def test_citations_are_NEVER_subject_to_the_top_n_cut(self):
         # A truncated precondition list silently under-reports what blocks
