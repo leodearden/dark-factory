@@ -662,6 +662,130 @@ def test_run_session_start_leaves_claude_session_id_unbound_when_stdin_has_no_se
 
 
 # ---------------------------------------------------------------------------
+# Task 4193 step-2: mismatched inheritors fork their own record
+# ---------------------------------------------------------------------------
+
+
+def test_hook_session_slug_adopts_env_slug_when_record_absent(tmp_path: Path) -> None:
+    # First sight: no record at the env slug yet, so this hook event is the
+    # one that will create/claim it.
+    slug = 'session-cockpit-3215050'
+    hook_input = {'session_id': 'uuid-parent', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+
+    assert sh.hook_session_slug(hook_input, env, root=tmp_path) == slug
+
+
+def test_hook_session_slug_adopts_env_slug_when_record_unbound(tmp_path: Path) -> None:
+    # A spawn-claude.sh `launching`-vintage (or pre-task-4193) record carries
+    # no binding; the first matching hook adopts and binds it.
+    slug = 'session-cockpit-3215051'
+    sr.write_record(
+        sr.SessionRecord(session_slug=slug, status=sr.Status.LAUNCHING, launcher_pid=3215051),
+        root=tmp_path,
+    )
+    hook_input = {'session_id': 'uuid-parent', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+
+    assert sh.hook_session_slug(hook_input, env, root=tmp_path) == slug
+
+
+def test_hook_session_slug_adopts_env_slug_when_binding_matches(tmp_path: Path) -> None:
+    slug = 'session-cockpit-3215052'
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug,
+            status=sr.Status.RUNNING,
+            launcher_pid=3215052,
+            claude_session_id='uuid-parent',
+        ),
+        root=tmp_path,
+    )
+    hook_input = {'session_id': 'uuid-parent', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+
+    assert sh.hook_session_slug(hook_input, env, root=tmp_path) == slug
+
+
+def test_hook_session_slug_forks_when_binding_mismatches(tmp_path: Path) -> None:
+    # A nested claude inherits the whole CLAUDE_SPAWN_* namespace but arrives
+    # with its OWN stdin session_id -- the only token that can tell it from
+    # the session spawn-claude.sh launched. It must fall through to the
+    # unchanged hand-launched keying instead of adopting the parent's slug.
+    slug = 'session-cockpit-3215053'
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug,
+            status=sr.Status.RUNNING,
+            launcher_pid=3215053,
+            claude_session_id='uuid-parent',
+        ),
+        root=tmp_path,
+    )
+    hook_input = {'session_id': 'uuid-nested', 'cwd': '/home/leo/src/dark-factory'}
+    env = {
+        'CLAUDE_SPAWN_SESSION_ID': slug,
+        'CLAUDE_SPAWN_ROLE': 'unblock',
+        'CLAUDE_SPAWN_PROJECT': 'df',
+        'CLAUDE_SPAWN_TASK_ID': '2085',
+    }
+
+    forked = sh.hook_session_slug(hook_input, env, root=tmp_path)
+    assert forked == sr.build_session_slug(
+        'unblock',
+        'df',
+        '2085',
+        'uuid-nested',  # type: ignore[arg-type]
+    )
+    assert forked != slug
+
+
+def test_run_session_start_nested_inheritor_forks_leaving_parent_untouched(
+    tmp_path: Path,
+) -> None:
+    # The blast radius: run_session_start overwrites status/parent_session_id/
+    # display on whatever record the slug resolves to. A nested claude's
+    # SessionStart must land on its OWN record, leaving the parent's byte-
+    # identical.
+    slug = 'session-cockpit-3215041'
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug,
+            status=sr.Status.RUNNING,
+            title='parent-title-marker',
+            launcher_pid=3215041,
+            parent_session_id='root-df-1-1',
+            display=sr.Display(kind='wm', wm_title='parent-marker', wm_window_id='0x1a'),
+            claude_session_id='uuid-parent',
+        ),
+        root=tmp_path,
+    )
+    snapshot = sr.read_record(slug, root=tmp_path).to_dict()
+
+    hook_input = {'session_id': 'uuid-nested', 'cwd': '/home/leo/src/dark-factory'}
+    # CLAUDE_SPAWN_PARENT_ID/CLAUDE_SPAWN_TITLE/WINDOWID are the concrete
+    # overwrite vectors: under the pre-task-4193 code they all landed on the
+    # parent's record.
+    env = {
+        'CLAUDE_SPAWN_SESSION_ID': slug,
+        'CLAUDE_SPAWN_PARENT_ID': 'some-other-root',
+        'CLAUDE_SPAWN_TITLE': 'nested-title',
+        'WINDOWID': '0x99',
+    }
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    assert sr.read_record(slug, root=tmp_path).to_dict() == snapshot
+
+    forked_slug = sh.hook_session_slug(hook_input, env, root=tmp_path)
+    assert forked_slug != slug
+    forked = sr.read_record(forked_slug, root=tmp_path)
+    assert forked.status == sr.Status.RUNNING
+    assert forked.claude_session_id == 'uuid-nested'
+    assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 2
+
+
+# ---------------------------------------------------------------------------
 # Task 2510 step-1: _resolve_wm_window_id resolver (Fleet Cockpit C10 fix)
 # ---------------------------------------------------------------------------
 
