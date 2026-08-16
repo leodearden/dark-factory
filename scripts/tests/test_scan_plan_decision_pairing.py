@@ -53,7 +53,6 @@ import json
 from pathlib import Path
 
 import pytest
-
 from scan_plan_decision_pairing import (
     PairingRecord,
     SkippedFile,
@@ -144,30 +143,37 @@ ENVELOPE_TAINTED_ENTRY = _entry(MISPAIRED_DECISION, ENVELOPE_TAINTED_RATIONALE)
 # ---------------------------------------------------------------------------
 
 
-def write_plan(root: Path, task_id: str, decisions: list, **plan_fields) -> Path:
-    """Write ``<root>/<task_id>/plan.json`` carrying *decisions*, return it.
+def write_plan(root: Path, lane: str, decisions: list, **plan_fields) -> Path:
+    """Write ``<root>/<lane>/plan.json`` carrying *decisions*, return it.
+
+    The first parameter is named *lane* rather than ``task_id`` deliberately:
+    the lane DIRECTORY and the document's own ``task_id`` field are distinct
+    things that disagree on four live plans, and
+    ``test_task_id_comes_from_the_lane_directory_not_the_document`` pins which
+    of them the scanner keys on by passing ``task_id=`` through
+    ``plan_fields``. Sharing one name here would make that test unwritable.
 
     Extra ``plan_fields`` are merged into the document, so a test can override
     or omit ``task_id``/``design_decisions`` to build an adversarial shape.
     """
-    lane = root / task_id
-    lane.mkdir(parents=True, exist_ok=True)
+    lane_dir = root / lane
+    lane_dir.mkdir(parents=True, exist_ok=True)
     plan: dict = {
-        'task_id': task_id,
-        'title': f'synthetic plan {task_id}',
+        'task_id': lane,
+        'title': f'synthetic plan {lane}',
         'design_decisions': decisions,
     }
     plan.update(plan_fields)
-    path = lane / 'plan.json'
+    path = lane_dir / 'plan.json'
     path.write_text(json.dumps(plan, indent=2))
     return path
 
 
-def write_raw_plan(root: Path, task_id: str, raw: str) -> Path:
-    """Write ``<root>/<task_id>/plan.json`` with *raw* bytes verbatim."""
-    lane = root / task_id
-    lane.mkdir(parents=True, exist_ok=True)
-    path = lane / 'plan.json'
+def write_raw_plan(root: Path, lane: str, raw: str) -> Path:
+    """Write ``<root>/<lane>/plan.json`` with *raw* text verbatim."""
+    lane_dir = root / lane
+    lane_dir.mkdir(parents=True, exist_ok=True)
+    path = lane_dir / 'plan.json'
     path.write_text(raw)
     return path
 
