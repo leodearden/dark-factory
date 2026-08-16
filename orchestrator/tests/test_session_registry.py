@@ -5464,6 +5464,63 @@ class TestStdlibOnlySelfContainment:
             f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}'
         )
 
+    def test_tier1_is_strictly_stronger_than_tier2(self, tmp_path):
+        """The two session_registry rows encode DIFFERENT contracts, not one twice.
+
+        They read like duplicates ("both just check that session_registry
+        imports"), so a tidy-up could delete the tier-1 row as redundant and
+        silently restore the exact hole task 4027 closed. They are not: tier-2
+        ACCEPTS an intra-orchestrator sibling import that tier-1 REJECTS, and
+        tier-1 is what spawn-claude.sh actually runs.
+        """
+        if _non_venv_interpreter() is None:
+            pytest.skip('no non-venv interpreter available on this host')
+
+        sibling = _first_bare_importable_sibling(tmp_path=tmp_path)
+        if sibling is None:
+            pytest.skip(
+                'no intra-orchestrator sibling is currently bare-importable under '
+                'the tier-2 env, so the two tiers cannot be told apart by this '
+                'probe (they still differ — see the row definitions)'
+            )
+
+        rows = {
+            row.shape: row
+            for row in _BARE_SHELL_ENTRYPOINTS
+            if row.path.name == 'session_registry.py'
+        }
+        assert set(rows) == {_EntrypointShape.SCRIPT, _EntrypointShape.IMPORT}, (
+            'session_registry.py must keep BOTH a SCRIPT row (tier-1, no '
+            'PYTHONPATH — what spawn-claude.sh runs) and an IMPORT row (tier-2, '
+            f'what Python consumers do). Present: {sorted(rows)}'
+        )
+
+        sandbox = _inject_import_sandbox(
+            tmp_path, 'session_registry.py', f'from orchestrator import {sibling}'
+        )
+        tier2 = _run_row(rows[_EntrypointShape.IMPORT], pkg_root=sandbox, tmp_path=tmp_path)
+        tier1 = _run_row(rows[_EntrypointShape.SCRIPT], pkg_root=sandbox, tmp_path=tmp_path)
+
+        both_encode_different_contracts = (
+            'The two session_registry rows are NOT duplicates and neither may be '
+            'deleted as a copy of the other: tier-2 (import with PYTHONPATH) '
+            'tolerates intra-orchestrator siblings, tier-1 (bare shell, no '
+            'PYTHONPATH) does not, and tier-1 is the one spawn-claude.sh runs.\n'
+            f'payload: from orchestrator import {sibling}\n'
+        )
+        assert tier2.returncode == 0, (
+            f'{both_encode_different_contracts}'
+            f'tier-2 was expected to ACCEPT it but exited {tier2.returncode}. If '
+            f'`{sibling}` has grown a non-stdlib dependency it is no longer a valid '
+            f'probe — extend _BARE_IMPORTABLE_SIBLINGS.\nstderr:\n{tier2.stderr}'
+        )
+        assert tier1.returncode != 0, (
+            f'{both_encode_different_contracts}'
+            'tier-1 was expected to REJECT it but exited 0, which means the tier-1 '
+            'row is no longer measuring the no-PYTHONPATH environment.\n'
+            f'stdout:\n{tier1.stdout}'
+        )
+
     @pytest.mark.parametrize(('entrypoint', 'payload'), _MUST_BE_REJECTED)
     def test_forbidden_import_is_rejected(self, entrypoint, payload, tmp_path):
         """Inject a forbidden import and demand that some covering row REJECTS it.
