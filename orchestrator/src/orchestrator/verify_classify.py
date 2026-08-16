@@ -192,13 +192,26 @@ _LINKER_SIGNAL_RE = re.compile(r'signal:?\s*7\b|SIGBUS|Bus error', re.IGNORECASE
 # REIFY_TEST_SEMAPHORE_WAIT=unlimited (lib_test_semaphore.sh:170-173), and
 # that wart is a real emitted shape, so the pattern must cover it.
 #
-# `@@REIFY_SLOT_TIMEOUT@@` is NOT emitted by reify today — verified by grep
-# over reify `scripts/` on 2026-08-05. It is the forward-compatible anchor for
-# reify's companion task (same column-0, first-token `@@REIFY_*@@` emission
-# contract as scripts/lib_clock_stop.sh:141), and a harmless no-op until that
-# lands. It is therefore a COMPLEMENT to the three grounded anchors and never
-# the sole positive — the category is detectable the moment this lands, rather
-# than waiting on another repo.
+# `@@REIFY_SLOT_TIMEOUT@@` is emitted by reify's `slot_acquire` (reify task
+# 6024, LANDED on reify main — scripts/lib_slot_acquire.sh:147):
+#
+#   printf '@@REIFY_SLOT_TIMEOUT@@ reason=%s slots=%s waited=%s disposition=%s lock=%s\n' ...
+#
+# Same column-0, first-token `@@REIFY_*@@` emission contract as
+# scripts/lib_clock_stop.sh:141. It is therefore a COMPLEMENT to the three
+# grounded anchors above and never the sole positive — the category is
+# detectable via either route.
+#
+# `disposition=<fatal|soft>` (task 4212) is the format string's 6th,
+# OPTIONAL field — closed vocabulary, default `fatal`, documented at reify
+# docs/notes/verify-pipeline-knobs.md:74-77. All three wrapper call sites
+# above call `slot_acquire` without that argument and so take the `fatal`
+# default; the ONE caller that passes `soft` is reify
+# `tests/infra/run_all.sh`'s pool worker (run_all.sh:1692), whose rc=75 is a
+# SOFT ADMISSION — it proceeds unslotted, the member still runs, and run_all
+# itself still exits 0 — rather than an infra hold. See
+# `_SLOT_TIMEOUT_SOFT_DISPOSITION_RE` below for the gate this distinction
+# feeds.
 #
 # PORTABILITY (task 3679 review). The allowlist above hardcodes three reify
 # script basenames into an otherwise project-generic classifier, which makes
@@ -215,6 +228,18 @@ _LINKER_SIGNAL_RE = re.compile(r'signal:?\s*7\b|SIGBUS|Bus error', re.IGNORECASE
 # lift the marker list into per-project `verify_env` config) rather than to
 # extend the alternation again.
 _SLOT_TIMEOUT_SENTINEL_RE = re.compile(r'^[ \t]*@@REIFY_SLOT_TIMEOUT@@', re.MULTILINE)
+
+# task 4212 — reify's slot-timeout sentinel carries `disposition=<fatal|soft>`
+# (reify scripts/lib_slot_acquire.sh:147, closed vocabulary documented at
+# reify docs/notes/verify-pipeline-knobs.md:74-77). `fatal` (the default,
+# taken by all three wrapper call sites) means the caller ABORTED and
+# propagated rc=75 — a genuine starvation event. `soft` is passed by
+# exactly one caller, tests/infra/run_all.sh's pool worker, whose rc=75
+# is a soft ADMISSION: it proceeds unslotted, the member still runs, and
+# run_all still exits 0. A soft deadline is a degraded-but-healthy pool,
+# not an infra hold, so it must not reach an INFRA_TRANSIENT category.
+_SLOT_TIMEOUT_SOFT_DISPOSITION_RE = re.compile(r'\bdisposition=soft\b')
+
 _SLOT_ACQUIRE_DEADLINE_RE = re.compile(
     r'^[ \t]*(?:ERROR: )?'
     r'(?:lib_test_semaphore|cargo-test-occt-gated|lib_lane_x_flock)\.sh: '
@@ -458,6 +483,28 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     event is now detected POSITIVELY, by the producer naming itself, instead
     of being inferred from a whole-output token co-occurrence.
 
+    task 4212 — the SENTINEL half of the arm is additionally gated on the
+    marker's ``disposition`` field (reify task 6024, landed at reify
+    scripts/lib_slot_acquire.sh:147): ``disposition=fatal`` (the default,
+    taken by all three wrapper call sites behind ``_SLOT_ACQUIRE_DEADLINE_RE``)
+    means the caller ABORTED on a genuine starvation event, while
+    ``disposition=soft`` is passed by exactly one caller — reify
+    ``tests/infra/run_all.sh``'s pool worker — whose rc=75 is a soft
+    ADMISSION: it proceeds unslotted, the member still runs, and run_all
+    itself still exits 0. A soft deadline is a degraded-but-healthy pool, not
+    an infra hold, so a ``disposition=soft`` sentinel must not reach
+    SEMAPHORE_TIMEOUT (``_SLOT_TIMEOUT_SOFT_DISPOSITION_RE`` above). The
+    BASENAME half (``_SLOT_ACQUIRE_DEADLINE_RE``) is deliberately left
+    UNGATED: all three allowlisted emitters call ``slot_acquire`` without a
+    6th argument and so take the ``fatal`` default, and their deadline lines
+    carry no ``disposition`` field to parse in the first place. Fail-safe
+    direction: demote ONLY on an explicit, literal ``disposition=soft`` — a
+    marker with no disposition field (older reify), an unknown future token,
+    or a malformed line all keep classifying SEMAPHORE_TIMEOUT, matching
+    today's pre-4212 behavior, because a missed starvation abort is a silent
+    infra hold nobody sees, while an over-classified soft admission is
+    visible and only reachable when the producer explicitly says so.
+
     What this replaced, and why it had to go: the arm previously fired when a
     lock/slot/semaphore token appeared ANYWHERE in *output* together with a
     "timed out" token ANYWHERE else in it. That precondition is satisfied by
@@ -587,7 +634,20 @@ def _classify_environmental(output: str) -> FailureCategory | None:
         return FailureCategory.ENV_TRANSIENT
     if is_interpreter_missing_workspace_packages(output):
         return FailureCategory.ENV_TRANSIENT
-    if _SLOT_TIMEOUT_SENTINEL_RE.search(output) or _SLOT_ACQUIRE_DEADLINE_RE.search(output):
+    # task 4212: the SENTINEL half fires only when *output* carries no
+    # whole-output `disposition=soft` token — demoting ONLY on that explicit,
+    # literal marker. A field-absent (older reify), unknown-token, or
+    # malformed marker keeps today's pre-4212 behavior and classifies, since
+    # a missed starvation abort is a silent infra hold nobody sees, while an
+    # over-classified soft admission is visible and only reachable when the
+    # producer explicitly says `soft`. The BASENAME half stays UNGATED — its
+    # three allowlisted emitters take `slot_acquire`'s `fatal` default and
+    # carry no `disposition` field at all (see `_SLOT_TIMEOUT_SOFT_DISPOSITION_RE`
+    # above for the full grounding).
+    if (
+        _SLOT_TIMEOUT_SENTINEL_RE.search(output)
+        and not _SLOT_TIMEOUT_SOFT_DISPOSITION_RE.search(output)
+    ) or _SLOT_ACQUIRE_DEADLINE_RE.search(output):
         return FailureCategory.SEMAPHORE_TIMEOUT
     return None
 
