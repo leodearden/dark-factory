@@ -202,12 +202,27 @@ class TestRemoveMergeWorktreeGuarded:
     async def test_never_created_path_returns_not_present(self, git_ops: GitOps):
         """A path that was never created (uncontended flock, nothing to
         remove) must report 'not_present' distinctly from a git-remove
-        failure on an existing-but-unregistered directory."""
+        failure on an existing-but-unregistered directory.
+
+        Also pins the SECOND tree-gone unlink. The primitive's docstring
+        promises the sibling ``<path>.lock`` unlink for 'removed' AND
+        'not_present', but only 'removed' was covered (by
+        test_removal_unlinks_its_own_lock_file) -- leaving the branch that
+        creates a lock file for a tree that never existed unasserted."""
         p = git_ops.worktree_base / '_merge-never-created'
+        lock_path = lane_lock_path(p)
 
         outcome = await git_ops.remove_merge_worktree_guarded(p, reason='t')
 
         assert outcome == 'not_present'
+        assert not lock_path.exists(), (
+            f'not_present is a tree-gone outcome: the flock acquire CREATES '
+            f'<path>.lock as a side effect, so the primitive must unlink it '
+            f'here exactly as it does on removed; {lock_path} leaked'
+        )
+        assert not list(git_ops.worktree_base.glob('_merge-*')), (
+            'a never-created path must leave no _merge-* dir OR lock-file orphan'
+        )
 
     async def test_non_worktree_directory_returns_failed(self, git_ops: GitOps):
         """Positive control pinning the distinct 'failed' outcome: an
