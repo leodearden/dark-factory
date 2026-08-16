@@ -5347,6 +5347,59 @@ class TestColdReattachIdentityGuard:
             'mismatch' in r.message.lower() for r in caplog.records
         ), 'a WARNING naming the identity mismatch must be logged (loud-over-silent)'
 
+    async def test_cold_reattach_mismatch_raises_when_quarantine_fails(
+        self, git_ops: GitOps,
+    ):
+        """If quarantine_worktree cannot relocate the mismatched orphan, the
+        caller must raise an actionable error — never fall through to the
+        opaque `git worktree add -b` collision with the still-present
+        branch and now-attached directory (the exact regression
+        _cleanup_leftover_branch's raise-not-destroy contract eliminated)."""
+        from unittest.mock import AsyncMock
+
+        full_branch = await _build_cold_orphan_branch(git_ops, 'cold-quarantine-fails')
+        _write_sibling_stored_title(
+            git_ops.worktree_base,
+            'cold-quarantine-fails',
+            'Trajectory beta: spline solver',
+        )
+        _, sha_before, _ = await _run(
+            ['git', 'rev-parse', full_branch], cwd=git_ops.project_root,
+        )
+        sha_before = sha_before.strip()
+
+        # quarantine_worktree never raises by contract — it returns None when
+        # it could not relocate. Force that outcome.
+        git_ops.quarantine_worktree = AsyncMock(return_value=None)
+
+        with pytest.raises(RuntimeError) as excinfo:
+            await git_ops.create_worktree(
+                'cold-quarantine-fails',
+                expected_title='Cycle-breaker beta: dedup edges',
+            )
+
+        message = str(excinfo.value)
+        assert 'refus' in message.lower()
+        assert full_branch in message
+        # Must NOT be the opaque fresh-create collision error a blind
+        # fall-through would produce.
+        assert 'Failed to create worktree' not in message
+        assert 'already exists' not in message
+
+        # Nothing was destroyed: the branch and its commit(s) survive intact.
+        rc, sha_after, _ = await _run(
+            ['git', 'rev-parse', full_branch], cwd=git_ops.project_root,
+        )
+        assert rc == 0, 'branch must still exist'
+        assert sha_after.strip() == sha_before, 'commit must be preserved'
+
+        rc, count_out, _ = await _run(
+            ['git', 'rev-list', '--count', f'main..{full_branch}'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        assert int(count_out.strip()) > 0, 'branch must still carry commits beyond main'
+
     async def test_cold_reattach_resumes_on_title_match(self, git_ops: GitOps):
         """A matching stored title must resume the orphan's WIP, not
         quarantine it."""
