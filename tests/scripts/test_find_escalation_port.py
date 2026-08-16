@@ -43,8 +43,10 @@ processes, ORCH_FLEET_DIR and fleet heartbeat files — none of them constrains 
 binding or subprocess patching, so no interaction with this module is expected.
 """
 
+import contextlib
 import importlib.util
 import pathlib
+import socket
 import subprocess
 import types
 
@@ -879,3 +881,85 @@ def test_unreadable_paths_return_none_instead_of_crashing_the_survey(
     a_dir = tmp_path / "dark-factory-orchestrator.yaml"
     a_dir.mkdir()
     assert fep.escalation_port(a_dir) is None
+
+
+# ---------------------------------------------------------------------------
+# is_bound — the collision-avoidance primitive (real sockets, ephemeral ports)
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _held_listener():
+    """Hold a real listening socket on an OS-ASSIGNED ephemeral port; yield the port.
+
+    ``bind(("127.0.0.1", 0))`` then ``getsockname()`` — never a hardcoded port. A
+    literal would be a coin flip against whatever is actually running on this
+    developer box, and the try/finally guarantees a failing assertion cannot leak a
+    bound socket into a sibling test.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", 0))
+        sock.listen()
+        yield sock.getsockname()[1]
+    finally:
+        sock.close()
+
+
+def test_is_bound_tracks_a_real_listener(fep: types.ModuleType) -> None:
+    """True while a real listener holds the port, False once it is released.
+
+    WHY THIS IS THE ONLY TEST THAT TOUCHES REAL SOCKETS, and why every main() test
+    below pins ``is_bound`` instead. MEASURED at base ``fc6f048b55`` with systemctl
+    neutralised but ``is_bound`` live: ``--base 8100`` over a tmp tree returned 8104
+    rather than 8102, and ``--base 8002`` returned 8004 rather than 8003 — because
+    live escalation servers hold those ports on this host. A main() test that let
+    the real probe run would therefore assert against the machine's current
+    process table, which is the opposite of hermetic.
+
+    WHY THE EPHEMERAL PORT IS REQUIRED: for the same reason. Asking the OS for a free
+    port is the only way to get one this host is not already using.
+
+    MEASURED RED at base ``fc6f048b55``, scratch mutation reverted before commit:
+    inverting the return values (``return True`` on successful bind, ``False`` in the
+    OSError handler) — RED, and it caught BOTH directions rather than just one
+    (``2 failed, 24 deselected``)::
+
+        E  AssertionError: is_bound must report a held port as bound
+        E  assert False is True
+        E   +  where False = <function is_bound at 0x...>(45259)
+        E  AssertionError: assert True is False
+        E   +  where True = <function is_bound at 0x...>(34009)
+    """
+    with _held_listener() as port:
+        assert fep.is_bound(port) is True, "is_bound must report a held port as bound"
+
+    # The listener is closed now. SO_REUSEADDR on both sides means the TIME_WAIT
+    # left by a never-connected listening socket does not block the re-bind.
+    assert fep.is_bound(port) is False, "is_bound must report a released port as free"
+
+
+def test_is_bound_leaves_nothing_behind(fep: types.ModuleType) -> None:
+    """Two consecutive probes of a free port both report False.
+
+    The function binds a socket to find out whether it can. If its own probe socket
+    outlived the call, the SECOND probe would see the FIRST one's leftover and report
+    the port as bound — and main()'s scan would then skip every port it examined,
+    walking the whole 100-port window and returning rc 1 on a machine with nothing
+    running. The ``with`` block is what prevents that; this asserts it.
+
+    MEASURED RED at base ``fc6f048b55``, scratch mutation reverted before commit:
+    replacing the ``with socket.socket(...)`` context manager with a bare socket held
+    in a module-level list (the leak this test exists to catch) — RED on the SECOND
+    probe only, exactly as the failure mode predicts::
+
+        E  AssertionError: is_bound saw its own leftover probe socket
+        E  assert True is False
+        E   +  where True = <function is_bound at 0x...>(34439)
+    """
+    with _held_listener() as port:
+        pass  # released immediately — now a known-free port on this host
+
+    assert fep.is_bound(port) is False
+    assert fep.is_bound(port) is False, "is_bound saw its own leftover probe socket"
