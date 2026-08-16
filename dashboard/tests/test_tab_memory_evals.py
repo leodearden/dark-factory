@@ -1188,7 +1188,11 @@ def test_tab_memory_evals_renders_eval_cards_and_trends(
     code = tab_memory_evals_jsx_code
 
     # (c) the component exists as a named function declaration
-    assert re.search(r'\bfunction\s+MemoryEvalsSection\s*\(', body), (
+    fn_decl = re.search(
+        _presence_pattern('MemoryEvalsSection function declaration', code), code,
+        re.MULTILINE,
+    )
+    assert fn_decl is not None, (
         'tab_memory_evals.jsx must define `function MemoryEvalsSection(`.'
     )
 
@@ -1196,7 +1200,8 @@ def test_tab_memory_evals_renders_eval_cards_and_trends(
     #     level, under file-unique aliases (the per-file alias convention:
     #     tabs.jsx uses CP/ST, tab_scheduler.jsx uses stUseState, ...).
     charts_destructure = re.search(
-        r'const\s*\{([^}]*)\}\s*=\s*window\.DF_CHARTS\s*;', body
+        _presence_pattern('DF_CHARTS module-level destructure', code), code,
+        re.MULTILINE,
     )
     assert charts_destructure is not None, (
         'tab_memory_evals.jsx must destructure its chart primitives off '
@@ -1215,8 +1220,13 @@ def test_tab_memory_evals_renders_eval_cards_and_trends(
     # collision at in-browser-Babel load time) is enforced structurally by
     # test_index_html_registers_tab_memory_evals_load_order, which pins this
     # file's script tag ahead of tabs.jsx.
+    # Both offsets are read from the SAME string.  They were compared across
+    # two different strings for a while — one from `body`, one from `code` —
+    # which is not a weak comparison but a meaningless one: comment stripping
+    # shifts every offset after it, so the two indices are not on a common
+    # axis and their `<` says nothing about where anything sits.
     charts_pos = charts_destructure.start()
-    fn_pos = body.index('function MemoryEvalsSection')
+    fn_pos = fn_decl.start()
     assert charts_pos < fn_pos, (
         'the window.DF_CHARTS destructure must sit at module top level, above '
         'MemoryEvalsSection — not inside it.'
@@ -1224,7 +1234,9 @@ def test_tab_memory_evals_renders_eval_cards_and_trends(
 
     # (e) reads DF_DATA.MEMORY_EVALS, maps evals keyed on eval_id, metrics on
     #     metric_id
-    assert 'window.DF_DATA' in body, (
+    assert re.search(
+        _presence_pattern('window.DF_DATA read', code), code, re.MULTILINE
+    ), (
         'tab_memory_evals.jsx must read window.DF_DATA.'
     )
     assert re.search(
@@ -1235,16 +1247,24 @@ def test_tab_memory_evals_renders_eval_cards_and_trends(
         'alias: a bare `MEMORY_EVALS` grep is answered by `DF_MEMORY_EVALS_FMT` '
         'and by the export statement, so it stayed green with the read deleted.'
     )
-    assert re.search(r'\.evals\b', body), (
+    assert re.search(
+        _presence_pattern('evals list read', code), code, re.MULTILINE
+    ), (
         'tab_memory_evals.jsx must render the payload\'s `evals` list.'
     )
-    assert re.search(r'key=\{[^}]*\beval_id\b', body), (
+    assert re.search(
+        _presence_pattern('eval card keyed on eval_id', code), code, re.MULTILINE
+    ), (
         'each eval card must be keyed on `eval_id`.'
     )
-    assert re.search(r'\.metrics\b', body), (
+    assert re.search(
+        _presence_pattern('metrics list read', code), code, re.MULTILINE
+    ), (
         "tab_memory_evals.jsx must render each eval's `metrics` list."
     )
-    assert re.search(r'key=\{[^}]*\bmetric_id\b', body), (
+    assert re.search(
+        _presence_pattern('metric row keyed on metric_id', code), code, re.MULTILINE
+    ), (
         'each metric row must be keyed on `metric_id`.'
     )
 
@@ -2252,7 +2272,9 @@ def test_escalation_links_and_storm_aggregate_banner(
         'id alone makes the operator click to find out what it is. Anchored to '
         'the JSX expression position, not a bare name grep.'
     )
-    assert re.search(r'm\.escalation\s*&&', body), (
+    assert re.search(
+        _presence_pattern('per-metric escalation guard', code), code, re.MULTILINE
+    ), (
         'the escalation control must be guarded by `m.escalation &&` so a null '
         'projection renders nothing rather than a dead control.'
     )
@@ -2290,7 +2312,8 @@ def test_escalation_links_and_storm_aggregate_banner(
         'the prose describing the banner.'
     )
     assert re.search(
-        r'(payload|MEDF\.MEMORY_EVALS|MEMORY_EVALS)\s*\.\s*storm_escape', body
+        _presence_pattern('storm banner reads the top-level block', code), code,
+        re.MULTILINE,
     ), (
         'the storm banner must read the TOP-LEVEL MEMORY_EVALS.storm_escape '
         '(memory_evals._build_payload() fills it; _empty_payload() declares it '
@@ -2302,7 +2325,8 @@ def test_escalation_links_and_storm_aggregate_banner(
 
     # (e) per-metric links are suppressed under storm.
     assert re.search(
-        r"parity\s*===\s*'storm_collapsed'", body
+        _presence_pattern('per-metric link suppressed under storm', code), code,
+        re.MULTILINE,
     ), (
         "the metric row must branch on `parity === 'storm_collapsed'` and "
         'render the suppression reason instead of a per-metric link — under '
@@ -2629,7 +2653,7 @@ def test_staleness_empty_states_and_issues_notice(
         'the eval card must READ `ev.latest_run_stamp`.'
     )
     stale_branch = re.search(
-        r'ev\.stale\s*&&\s*\(([\s\S]{0,700}?)\n\s*\)\}', body
+        _presence_pattern('stale hint branch', code), code, re.MULTILINE
     )
     assert stale_branch is not None, (
         '`ev.stale` must gate a visible hint badge.'
@@ -2693,8 +2717,11 @@ def test_staleness_empty_states_and_issues_notice(
     assert re.search(r'issue_count\s*>\s*0', code), (
         'the issues notice must be gated on `issue_count > 0`.'
     )
+    # Captured from `code`: the fixed-width window is a budget of CHARACTERS,
+    # so over the raw body every line of prose inside it displaced a line of
+    # markup the field assertions below were supposed to be reading.
     issues_block = re.search(
-        r'data-testid="memory-eval-issues"([\s\S]{0,1600})', body
+        _presence_pattern('artifact issues notice', code), code, re.MULTILINE
     )
     assert issues_block is not None
     issues_text = issues_block.group(1)
