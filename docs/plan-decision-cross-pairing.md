@@ -249,8 +249,11 @@ a script.** Two independent reasons:
    runtime state that a **live task may be reading right now** — not a
    reviewable code change. This is also why the scanner's read-only contract is
    *asserted* (bytes and `st_mtime_ns` snapshotted before and after every scan,
-   including on the unparseable and unreadable error paths) rather than merely
-   documented.
+   including on the unparseable, undecodable and unreadable error paths)
+   rather than merely documented. Those error paths are also *total*: every
+   per-file failure is reported as a skip and the sweep continues, so one bad
+   plan can never hide the rest of the corpus and silently understate a number
+   that is already only ever a lower bound.
 2. The go-forward fix is **task 3865's declared territory** — its plan already
    names `supersede_design_decision`, a `status='superseded'` field, and
    `active_design_decisions(plan)` across three read paths. 3865 is `pending`;
