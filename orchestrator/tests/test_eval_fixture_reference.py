@@ -10,7 +10,7 @@ the landed change — half the v1 hard subset, discoverable only by archaeology
 (``docs/plan-scoring-and-judge.md`` already cites the incoherent reify_task_12
 cell).
 
-Two tests, deliberately split (see the plan's design decision):
+Three tests, deliberately split (see the plan's design decision):
 
 * Test A is structural and ALWAYS runs — no git, no network, no LLM. It pins
   that the block exists and that its SHA is copied from the fixture's OWN
@@ -25,13 +25,19 @@ Two tests, deliberately split (see the plan's design decision):
   the guard covers every fixture with a landed commit, no holdouts. The
   exemption machinery survives as the documented escape hatch: a name added
   there is held under a STRICT xfail, so the exemption is visible and shrinks
-  loudly the day it is fixed.
+  loudly the day it is fixed. The emptiness is ASSERTED, not merely described,
+  by ``test_the_exempt_set_is_exactly_the_known_defective_fixtures``.
 * Test B materializes the real diff through the production helper
   ``snapshots.get_diff_between_commits`` — the PRD's named user-observable
   signal — and SKIPS with an explicit reason when the fixture's checkout or a
   SHA is absent on this machine. Splitting keeps Test A's pin unconditional;
   a single combined test would be vacuously skipped wherever the reify
   checkout is missing.
+* Test C pins ACCURACY, which A and B leave open: both accept invented numbers,
+  so it re-derives each declared ``diff_stat`` through the production
+  ``task_sampler.capture_reference`` and asserts equality. It shares B's
+  resolution and skip discipline through ``_resolve_or_skip`` — one definition,
+  so a later change to that discipline cannot weaken only one of them.
 
 Follows test_eval_diff_threading.py's convention (drive async entrypoints with
 ``asyncio.run``, no pytest-asyncio marker) and reuses test_eval_recovery.py's
@@ -43,6 +49,7 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
+from functools import cache
 from pathlib import Path
 
 import pytest
@@ -84,7 +91,7 @@ def _case(name: str):
                 strict=True,
                 reason=(
                     f'{name} carries a top-level post_task_commit with no '
-                    f'reference block and is outside task 3628 scope — '
+                    f'reference block and is a KNOWN-defective holdout — '
                     f'back-fill it and delete it from _EXEMPT_NO_REFERENCE'
                 ),
             ),
@@ -105,11 +112,48 @@ def _raw(name: str) -> dict:
         return json.load(f)
 
 
+@cache
 def _commit_exists(project_root: Path, sha: str) -> bool:
+    # Cached: the two git-materializing tests below probe the SAME
+    # (project_root, sha) pairs, so an uncached call costs 4 `git cat-file`
+    # subprocesses per fixture where 2 suffice. A checkout cannot gain or lose
+    # a commit mid-session, so the cache cannot go stale within a run.
     return subprocess.run(
         ['git', '-C', str(project_root), 'cat-file', '-e', f'{sha}^{{commit}}'],
         capture_output=True,
     ).returncode == 0
+
+
+def _resolve_or_skip(name: str) -> tuple[Path, str, str]:
+    """Resolve a fixture's ``(project_root, pre SHA, reference SHA)``, or SKIP.
+
+    The single definition of this suite's skip discipline, shared by the two
+    git-materializing tests below. They are parametrized over the same
+    ``_WITH_REFERENCE`` population and had drifted into carrying byte-identical
+    preambles, so a future change here — a shallow-clone guard, or treating a
+    ``git`` failure as a skip rather than an error — applied to only one of
+    them would silently weaken the other.
+
+    SKIPS rather than fails, loudly and naming both the fixture and what is
+    missing, when the checkout or either SHA is unavailable on this machine; a
+    silent skip would be the same class of defect this suite exists to remove.
+    """
+    raw = _raw(name)
+    project_root = Path(raw['project_root'])
+    if not project_root.exists():
+        pytest.skip(
+            f'{name}: checkout {project_root} is absent on this machine'
+        )
+
+    pre = raw['pre_task_commit']
+    post = raw['reference']['post_task_commit']
+    for label, sha in (('pre_task_commit', pre), ('reference SHA', post)):
+        if not _commit_exists(project_root, sha):
+            pytest.skip(
+                f'{name}: {label} {sha} does not resolve in {project_root}'
+            )
+
+    return project_root, pre, post
 
 
 _WITH_POST_TASK_COMMIT = [
@@ -179,12 +223,26 @@ def test_the_backfilled_three_are_inside_the_corpus_guard() -> None:
 
 
 def test_the_exempt_set_is_exactly_the_known_defective_fixtures() -> None:
-    """No silent growth of the exemption list.
+    """No silent growth of the exemption list — which is currently EMPTY.
 
     The xfail marks make a SHRINKING exemption loud (an XPASS fails the
     suite); this makes a GROWING one loud too — adding a name here that is
     not actually defective, to quiet a genuine failure, fails right here.
+
+    The equality assertion pins the state task 3828 reached: ZERO holdouts,
+    every fixture with a landed commit subject to the corpus guard. Without it
+    the loop below iterates an empty tuple and this test asserts nothing at
+    all, so the very invariant the back-fill established would be the one thing
+    unguarded. It is deliberately a speed bump, not a ban: a genuinely
+    defective fixture may still be exempted, but doing so must edit this line
+    and leave a written justification, rather than appending a name in silence.
     """
+    assert _EXEMPT_NO_REFERENCE == (), (
+        'the corpus guard covers every fixture with a landed post_task_commit; '
+        'adding a name here needs a written justification, and the fixture '
+        'must be genuinely defective (checked below)'
+    )
+
     for name in _EXEMPT_NO_REFERENCE:
         raw = _raw(name)
         assert raw.get('post_task_commit'), (
@@ -206,24 +264,10 @@ def test_backfilled_fixture_reference_diff_materializes(name: str) -> None:
 
     Drives the PRODUCTION helper ``snapshots.get_diff_between_commits`` — the
     same call run_architect_eval makes at runner.py step 6 — rather than a
-    parallel subprocess reimplementation. Skips (loudly, naming the fixture and
-    what is missing) when the checkout or a SHA is unavailable here; a silent
-    skip would be the same class of defect this task removes.
+    parallel subprocess reimplementation. Resolution and the skip discipline
+    live in ``_resolve_or_skip``, shared with the accuracy guard below.
     """
-    raw = _raw(name)
-    project_root = Path(raw['project_root'])
-    if not project_root.exists():
-        pytest.skip(
-            f'{name}: checkout {project_root} is absent on this machine'
-        )
-
-    pre = raw['pre_task_commit']
-    post = raw['reference']['post_task_commit']
-    for label, sha in (('pre_task_commit', pre), ('reference SHA', post)):
-        if not _commit_exists(project_root, sha):
-            pytest.skip(
-                f'{name}: {label} {sha} does not resolve in {project_root}'
-            )
+    project_root, pre, post = _resolve_or_skip(name)
 
     diff = asyncio.run(
         snapshots.get_diff_between_commits(project_root, pre, post)
@@ -252,29 +296,17 @@ def test_declared_diff_stat_matches_the_landed_diff(name: str) -> None:
     helper ``task_sampler.build_fixture_record`` uses to AUTHOR this block for
     sampler-generated fixtures — rather than reimplementing shortstat parsing
     test-side, so there stays exactly one definition of what a diff_stat means.
-    Skips loudly, on the same discipline as the test above, wherever a checkout
-    or a SHA is absent on this machine.
+    Shares ``_resolve_or_skip`` with the test above, so both guards observe one
+    skip discipline on machines where a checkout or a SHA is absent.
     """
-    raw = _raw(name)
-    project_root = Path(raw['project_root'])
-    if not project_root.exists():
-        pytest.skip(
-            f'{name}: checkout {project_root} is absent on this machine'
-        )
-
-    pre = raw['pre_task_commit']
-    post = raw['reference']['post_task_commit']
-    for label, sha in (('pre_task_commit', pre), ('reference SHA', post)):
-        if not _commit_exists(project_root, sha):
-            pytest.skip(
-                f'{name}: {label} {sha} does not resolve in {project_root}'
-            )
+    project_root, pre, post = _resolve_or_skip(name)
 
     captured = asyncio.run(
         task_sampler.capture_reference(project_root, pre, post)
     )
 
-    assert raw['reference']['diff_stat'] == {
+    declared = _raw(name)['reference']['diff_stat']
+    assert declared == {
         'files': captured.files,
         'insertions': captured.insertions,
         'deletions': captured.deletions,
