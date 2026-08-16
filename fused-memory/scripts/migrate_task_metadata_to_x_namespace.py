@@ -61,7 +61,13 @@ corpus-wide sweep at a per-task re-run of this script with other ``--keys``:
   one-of-a-kind row in a process that is about to exit. The default path is
   STAMPED with the UTC instant of the run, so the per-task re-run above gets
   a fresh artifact instead of overwriting the one holding the TRUE
-  pre-migration row.
+  pre-migration row, and an already-occupied path is REFUSED rather than
+  replaced.
+* Once the write has committed, EVERY exit names that snapshot — the exit
+  that reports read-back drift and the exit where the read-back itself
+  crashed alike (:func:`recovery_pointer` is the single source of that
+  sentence). An unverified committed write is the situation the artifact
+  exists for, so it is the last thing an operator is told.
 
 Idempotent — safe to re-run; an already-migrated task is a no-op. Defaults to
 a dry run: a real write requires an explicit ``--apply``.
@@ -81,6 +87,7 @@ import importlib.util
 import json
 import os
 import sys
+import traceback
 import types
 from collections.abc import Sequence
 from datetime import UTC, datetime
@@ -382,6 +389,22 @@ def write_backup(path: Path, before_task: dict) -> Path:
     return path
 
 
+def recovery_pointer(backup_path: Path) -> str:
+    """The one sentence telling an operator where the original row survives.
+
+    Deliberately the single source of that instruction: EVERY exit after the
+    write has committed must print the same words — the exit that reports
+    read-back drift and the exit where the read-back itself crashed alike. The
+    defect this closes was precisely that one of those exits knew about the
+    snapshot and the other did not, so a second hand-written copy of the
+    sentence would restore the asymmetry the moment either copy was edited.
+    """
+    return (
+        f'  The pre-write row (metadata AND description/details) is saved at '
+        f'{backup_path} — recover from there, do not re-derive by hand.'
+    )
+
+
 def _load_sibling_client() -> type:
     """Reuse ``FusedMemoryClient`` from ``strip_leaked_control_keys.py``.
 
@@ -584,25 +607,42 @@ async def main_async(args: argparse.Namespace) -> int:
             return 1
         print('  write accepted; verifying read-back...')
 
-        after_task = await _fetch_task(client, args.task_id, project_root)
-        problems, notes = _verify_read_back(
-            before_meta=before_meta,
-            expected_meta=migrated,
-            applied=applied,
-            before_task=before_task,
-            after_task=after_task,
-        )
+        # From here the write has ALREADY COMMITTED, so every exit has to name
+        # the snapshot. `_fetch_task` raises on an unexpected payload and
+        # `_verify_read_back` -> `_coerce_metadata` raises on a stored blob that
+        # is not a dict; unguarded, either unwinds out of `main_async` as a bare
+        # stack trace with the recovery instruction never printed — at the one
+        # moment the operator most needs it.
+        try:
+            after_task = await _fetch_task(client, args.task_id, project_root)
+            problems, notes = _verify_read_back(
+                before_meta=before_meta,
+                expected_meta=migrated,
+                applied=applied,
+                before_task=before_task,
+                after_task=after_task,
+            )
+        except Exception as exc:
+            # `Exception`, never `BaseException`: a Ctrl-C or a cancelled task
+            # must still propagate instead of being reported as a read-back
+            # failure. The traceback goes FIRST so the diagnosis is not lost,
+            # and the pointer LAST so it is the final line on screen.
+            traceback.print_exc()
+            print(
+                f'  [error] the post-write read-back could not COMPLETE: {exc!r}. '
+                f'The write has already committed, so the stored row is UNVERIFIED.',
+                file=sys.stderr,
+            )
+            print(recovery_pointer(backup_path), file=sys.stderr)
+            return 1
+
         for note in notes:
             print(f'    {note}')
         if problems:
             print('  [error] READ-BACK VERIFICATION FAILED:', file=sys.stderr)
             for problem in problems:
                 print(f'    - {problem}', file=sys.stderr)
-            print(
-                f'  The pre-write row (metadata AND description/details) is saved at '
-                f'{backup_path} — recover from there, do not re-derive by hand.',
-                file=sys.stderr,
-            )
+            print(recovery_pointer(backup_path), file=sys.stderr)
             return 1
 
         print('  read-back verified: x_ keys present, old spellings gone, '
