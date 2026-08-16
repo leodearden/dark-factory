@@ -287,6 +287,37 @@ def test_git_config_rejects_bypass_command_without_clear():
     assert 'main_gate_bypass_clear_command' in str(excinfo.value)
 
 
+async def _build_cold_orphan_branch(
+    git_ops: GitOps,
+    task_id: str,
+    *,
+    wip_name: str = 'orphan_work.py',
+    wip_content: str = 'value = 42\n',
+) -> str:
+    """Build the reaped-but-retained cold shape for *task_id*.
+
+    Build ``task/<task_id>`` in a throwaway worktree OUTSIDE
+    ``worktree_base``, commit a foreign WIP file onto it, then force-remove
+    the worktree — leaving the branch as a dangling ref carrying a real
+    commit beyond main, with ``worktree_base/<task_id>`` never having
+    existed. Returns the full branch name (``task/<task_id>``).
+    """
+    full_branch = f'task/{task_id}'
+    tmp_wt = git_ops.project_root.parent / f'tmp-{task_id}'
+    rc, _, err = await _run(
+        ['git', 'worktree', 'add', '-b', full_branch, str(tmp_wt), 'main'],
+        cwd=git_ops.project_root,
+    )
+    assert rc == 0, err
+    (tmp_wt / wip_name).write_text(wip_content)
+    await _run(['git', 'add', '-A'], cwd=tmp_wt)
+    await _run(['git', 'commit', '-m', 'orphan WIP commit'], cwd=tmp_wt)
+    await _run(
+        ['git', 'worktree', 'remove', '--force', str(tmp_wt)], cwd=git_ops.project_root,
+    )
+    return full_branch
+
+
 @pytest.mark.asyncio
 class TestWorktreeLifecycle:
     async def test_worktree_info_stale_commits_field(self, git_ops: GitOps):
@@ -493,21 +524,7 @@ class TestWorktreeLifecycle:
         """A leftover branch carrying a commit beyond main, whose worktree dir
         is gone (the reaped-but-retained shape), must be RE-ATTACHED and
         RESUMED — not destroyed via the old raise-on-leftover-branch path."""
-        full_branch = 'task/lo-commit'
-        # Build the branch with a real commit beyond main via a throwaway
-        # worktree, then remove the worktree so the branch is a dangling ref
-        # (worktree_base/'lo-commit' never existed — the reaped-but-retained
-        # shape: dir gone, branch survives).
-        tmp_wt = git_ops.project_root.parent / 'tmp-lo-commit'
-        rc, _, err = await _run(
-            ['git', 'worktree', 'add', '-b', full_branch, str(tmp_wt), 'main'],
-            cwd=git_ops.project_root,
-        )
-        assert rc == 0, err
-        (tmp_wt / 'orphan_work.py').write_text('value = 42\n')
-        await _run(['git', 'add', '-A'], cwd=tmp_wt)
-        await _run(['git', 'commit', '-m', 'orphan WIP commit'], cwd=tmp_wt)
-        await _run(['git', 'worktree', 'remove', '--force', str(tmp_wt)], cwd=git_ops.project_root)
+        full_branch = await _build_cold_orphan_branch(git_ops, 'lo-commit')
 
         info = await git_ops.create_worktree('lo-commit')
 
@@ -535,6 +552,10 @@ class TestWorktreeLifecycle:
         helper must raise rather than fall through to any destructive
         cleanup.  The branch, its commit, and the holding worktree's content
         all survive intact."""
+        # Deliberately does not use _build_cold_orphan_branch: that helper
+        # force-removes its throwaway worktree at the end (producing the
+        # dir-gone cold shape), but this test needs the OPPOSITE — the
+        # worktree left checked out and live — so it keeps its own setup.
         full_branch = 'task/lo-live'
         holding = git_ops.project_root.parent / 'holding-lo-live'
         rc, _, err = await _run(
@@ -5258,37 +5279,74 @@ class TestWorktreeReuseIdentityGuard:
         assert info2.path == info.path
         assert not git_ops.quarantine_base.exists()
 
+    async def test_mismatch_relocates_foreign_meta_root_to_quarantine(
+        self, git_ops: GitOps,
+    ):
+        """Mirrors TestColdReattachIdentityGuard's
+        test_cold_reattach_mismatch_clears_foreign_meta_root: a confirmed
+        identity mismatch on the REUSE path must also relocate the foreign
+        sibling .task-meta/<id> root alongside the quarantined worktree —
+        not just quarantine the branch. Otherwise the deleted task's
+        plan.json survives at the old path and workflow.py's plan-resume
+        adopts it onto the NEW task; and if it were merely deleted instead
+        of relocated, an operator inspecting the quarantined worktree later
+        would have no record of which task it belonged to."""
+        task_id = 'reuse-clears-meta'
+        info = await git_ops.create_worktree(task_id)
+        meta = TaskArtifacts.meta_root_for(git_ops.worktree_base, task_id)
+        _write_sibling_stored_title(
+            git_ops.worktree_base, task_id, 'Trajectory beta: spline solver',
+        )
+        (meta / 'plan.json').write_text(json.dumps({
+            'task_id': task_id,
+            'title': 'Trajectory beta: spline solver',
+            'steps': [],
+            'confirmed': True,
+        }))
+        (info.path / 'spline.rs').write_text('fn solve() {}\n')
+        await git_ops.commit(info.path, 'trajectory WIP')
 
-async def _build_cold_orphan_branch(
-    git_ops: GitOps,
-    task_id: str,
-    *,
-    wip_name: str = 'orphan_work.py',
-    wip_content: str = 'value = 42\n',
-) -> str:
-    """Build the reaped-but-retained cold shape for *task_id*.
+        await git_ops.create_worktree(
+            task_id, expected_title='Cycle-breaker beta: dedup edges',
+        )
 
-    Mirrors test_create_worktree_reattaches_reaped_but_retained_wip_branch's
-    setup (above): build ``task/<task_id>`` in a throwaway worktree OUTSIDE
-    ``worktree_base``, commit a foreign WIP file onto it, then force-remove
-    the worktree — leaving the branch as a dangling ref carrying a real
-    commit beyond main, with ``worktree_base/<task_id>`` never having
-    existed. Returns the full branch name (``task/<task_id>``).
-    """
-    full_branch = f'task/{task_id}'
-    tmp_wt = git_ops.project_root.parent / f'tmp-{task_id}'
-    rc, _, err = await _run(
-        ['git', 'worktree', 'add', '-b', full_branch, str(tmp_wt), 'main'],
-        cwd=git_ops.project_root,
-    )
-    assert rc == 0, err
-    (tmp_wt / wip_name).write_text(wip_content)
-    await _run(['git', 'add', '-A'], cwd=tmp_wt)
-    await _run(['git', 'commit', '-m', 'orphan WIP commit'], cwd=tmp_wt)
-    await _run(
-        ['git', 'worktree', 'remove', '--force', str(tmp_wt)], cwd=git_ops.project_root,
-    )
-    return full_branch
+        assert not (meta / 'plan.json').exists(), (
+            "the deleted task's plan.json must not survive at the old path"
+        )
+        quarantined = list(git_ops.quarantine_base.glob(f'{task_id}-*'))
+        assert len(quarantined) == 1
+        relocated_meta = TaskArtifacts.meta_root_for(
+            git_ops.quarantine_base, quarantined[0].name,
+        )
+        assert (relocated_meta / 'plan.json').exists(), (
+            'the sidecar must be relocated alongside the quarantined '
+            'worktree, not deleted'
+        )
+
+    async def test_match_preserves_meta_root(self, git_ops: GitOps):
+        """A same-task resume (matching title) must keep its own
+        .task-meta artifacts in place — _relocate_foreign_meta_root must
+        never be invoked on a same-task reuse route."""
+        task_id = 'reuse-preserves-meta'
+        await git_ops.create_worktree(task_id)
+        meta = TaskArtifacts.meta_root_for(git_ops.worktree_base, task_id)
+        _write_sibling_stored_title(
+            git_ops.worktree_base, task_id, 'Build the frobnicator',
+        )
+        (meta / 'plan.json').write_text(json.dumps({
+            'task_id': task_id,
+            'title': 'Build the frobnicator',
+            'steps': [],
+            'confirmed': True,
+        }))
+
+        await git_ops.create_worktree(
+            task_id, expected_title='Build the frobnicator',
+        )
+
+        assert (meta / 'plan.json').exists(), (
+            'a same-task resume must preserve its own plan.json in place'
+        )
 
 
 @pytest.mark.asyncio
@@ -5447,10 +5505,13 @@ class TestColdReattachIdentityGuard:
         self, git_ops: GitOps,
     ):
         """A confirmed identity mismatch must also clear the foreign sibling
-        .task-meta/<id> root — otherwise the deleted task's plan.json
-        survives and workflow.py's plan-resume adopts it onto the NEW task
-        (the cited reify task 3770 misattribution). Quarantining only the
-        branch leaves this half of the hole open."""
+        .task-meta/<id> root at its ORIGINAL path — otherwise the deleted
+        task's plan.json survives there and workflow.py's plan-resume adopts
+        it onto the NEW task (the cited reify task 3770 misattribution).
+        Quarantining only the branch leaves this half of the hole open. The
+        sidecar itself must not be destroyed, though — it is relocated
+        alongside the quarantined worktree, not deleted (it is the only
+        record tying the quarantined branch back to its original task)."""
         task_id = 'cold-clears-meta'
         await _build_cold_orphan_branch(git_ops, task_id)
         meta = TaskArtifacts.meta_root_for(git_ops.worktree_base, task_id)
@@ -5469,13 +5530,27 @@ class TestColdReattachIdentityGuard:
         )
 
         assert not (meta / 'plan.json').exists(), (
-            "the deleted task's plan.json must not survive onto the new task"
+            "the deleted task's plan.json must not survive at the old path"
+        )
+
+        # ...and must reappear alongside the quarantined worktree, not be
+        # destroyed outright.
+        quarantined = list(git_ops.quarantine_base.glob(f'{task_id}-*'))
+        assert len(quarantined) == 1
+        relocated_meta = TaskArtifacts.meta_root_for(
+            git_ops.quarantine_base, quarantined[0].name,
+        )
+        assert (relocated_meta / 'plan.json').exists(), (
+            'the sidecar must be relocated alongside the quarantined '
+            'worktree, not deleted'
         )
 
     async def test_cold_reattach_match_preserves_meta_root(self, git_ops: GitOps):
         """A same-task resume (matching title) must keep its own
-        .task-meta artifacts intact — _clear_foreign_meta_root's contract
-        explicitly says it must NOT be called on same-task reuse routes."""
+        .task-meta artifacts intact IN PLACE — _relocate_foreign_meta_root
+        (like _clear_foreign_meta_root before it) must never be invoked on
+        a same-task reuse route, which owns and must preserve its own
+        artifacts."""
         task_id = 'cold-preserves-meta'
         await _build_cold_orphan_branch(git_ops, task_id)
         meta = TaskArtifacts.meta_root_for(git_ops.worktree_base, task_id)
