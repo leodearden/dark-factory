@@ -47,6 +47,7 @@ task 3884 removed it. A regex guard would fail on all three.
 from __future__ import annotations
 
 import ast
+import functools
 import subprocess
 from pathlib import Path
 
@@ -95,6 +96,18 @@ def _killpg_over_getpgid(source: str) -> list[tuple[int, str]]:
     AST-based, returning ``[]`` on a :class:`SyntaxError` so a stray
     non-Python-3 file in the tree cannot break the guard.
     """
+    # Token prefilter before the (expensive) parse.  This is EXACTLY as strong
+    # as the detector, not an approximation: every hit below is an ast.Call
+    # whose func is an ast.Attribute with ``.attr == 'killpg'`` or an ast.Name
+    # with ``.id == 'killpg'``, and both spellings require the literal token
+    # `killpg` to appear in the source text.  A dynamic spelling that avoids
+    # the token (``getattr(os, 'kill' + 'pg')``) is invisible to the AST walk
+    # too, so nothing detectable is lost.  Worth it: ~97% of the repo's 1593
+    # swept files never mention killpg, and skipping ast.parse on them takes
+    # the ratchet from ~13.5s to ~0.5s.
+    if 'killpg' not in source:
+        return []
+
     try:
         tree = ast.parse(source)
     except SyntaxError:
@@ -178,8 +191,9 @@ def test_does_not_flag_docstring_or_comment_mention() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _git_tracked_python() -> list[Path]:
-    """Every .py file git tracks in this checkout, or ``[]`` if git is unavailable.
+@functools.cache
+def _git_tracked_python() -> tuple[Path, ...]:
+    """Every .py file git tracks in this checkout, or ``()`` if git is unavailable.
 
     ``git ls-files`` is the authoritative answer to "what is actually in this
     repo": it is complete by construction (no hand-maintained root list to grow
@@ -190,6 +204,10 @@ def _git_tracked_python() -> list[Path]:
     containing a space or a newline would silently truncate the tracked set,
     and a truncated ground truth makes the completeness test below *vacuously*
     pass -- the exact failure mode it exists to prevent.
+
+    Cached (and returning an immutable tuple, so a caller cannot corrupt the
+    shared value) because four tests in this module consume the sweep and the
+    subprocess would otherwise be re-run once per test.
     """
     try:
         out = subprocess.run(
@@ -197,8 +215,8 @@ def _git_tracked_python() -> list[Path]:
             capture_output=True, text=True, timeout=30, check=True,
         ).stdout
     except (OSError, subprocess.SubprocessError):
-        return []
-    return [REPO_ROOT / p for p in out.split('\0') if p]
+        return ()
+    return tuple(REPO_ROOT / p for p in out.split('\0') if p)
 
 
 def _root_glob_python() -> list[Path]:
@@ -236,7 +254,8 @@ def _root_glob_python() -> list[Path]:
     return files
 
 
-def _python_files() -> list[Path]:
+@functools.cache
+def _python_files() -> tuple[Path, ...]:
     """The sweep's file set: git-tracked UNION package roots, deduped.
 
     Both sources are load-bearing, and neither alone is sufficient:
@@ -266,9 +285,14 @@ def _python_files() -> list[Path]:
     structurally immune: git never lists those trees (untracked/ignored) and
     the root globs never reach them. Re-verify that immunity before adding any
     third source.
+
+    Cached, returning an immutable tuple: four tests in this module consume the
+    sweep, and without this the ``git ls-files`` subprocess plus the full rglob
+    (~0.25s) would run once per test. The cache is session-scoped, which is
+    correct here -- the tree does not change mid-run.
     """
     candidates = [*_git_tracked_python(), *_root_glob_python()]
-    return sorted({p for p in candidates if p.is_file()})
+    return tuple(sorted({p for p in candidates if p.is_file()}))
 
 
 def test_sweep_is_not_vacuous() -> None:
@@ -282,24 +306,44 @@ def test_sweep_is_not_vacuous() -> None:
     scanned = _python_files()
     relative = {str(p.relative_to(REPO_ROOT)) for p in scanned}
 
+    # Witnesses reachable from `_root_glob_python()` alone, so these hold
+    # unconditionally -- including on a machine with no git.
     for required in (
         'orchestrator/src/orchestrator/deterministic_runner.py',
         'orchestrator/tests/test_killpg_frozen_pgid_guard.py',
         'shared/src/shared/proc_group.py',
-        # One witness per tree the original hand-maintained root globs missed
-        # entirely. These are git-independent, so the specific hole cannot
-        # silently reopen even on a machine where
-        # test_sweep_covers_every_tracked_python_file skips. The top-level
-        # tests/scripts tree in particular holds the repo's highest density of
-        # live process-group killing outside the two sites task 3884 closed.
-        'tests/scripts/test_drain_process_leak_isolation.py',
-        'fused-memory/scripts/audit_duplicate_memories.py',
-        'skills/factory-init/scripts/find_escalation_port.py',
     ):
         assert required in relative, (
             f'{required} missing from the sweep -- the root globs or the skip '
             f'filter regressed (skip must be applied to the RELATIVE path)'
         )
+
+    # One witness per tree the original hand-maintained root globs missed
+    # entirely, pinning that specific hole shut. The top-level tests/scripts
+    # tree in particular holds the repo's highest density of live
+    # process-group killing outside the two sites task 3884 closed.
+    #
+    # These are asserted only when the git source is LIVE, because none of the
+    # three is reachable from `_root_glob_python()` (whose roots are `*/src/*`,
+    # `*/tests`, `scripts`, `hooks` and root-level `*.py` -- top-level `tests/`,
+    # `fused-memory/scripts/` and `skills/**` match none of them); they enter
+    # the sweep solely via `git ls-files`. Asserting them unconditionally would
+    # mean that on a git-less machine this test hard-fails pointing at "the
+    # root globs or the skip filter", sending a debugger at the wrong
+    # subsystem, while the test that actually owns completeness
+    # (`test_sweep_covers_every_tracked_python_file`) skips cleanly.
+    if _git_tracked_python():
+        for required in (
+            'tests/scripts/test_drain_process_leak_isolation.py',
+            'fused-memory/scripts/audit_duplicate_memories.py',
+            'skills/factory-init/scripts/find_escalation_port.py',
+        ):
+            assert required in relative, (
+                f'{required} is git-tracked but missing from the sweep -- the '
+                f'git ls-files source regressed or its output is being '
+                f'filtered. This is one of the trees the original root globs '
+                f'missed entirely; do not "fix" this by deleting the witness.'
+            )
 
     assert len(scanned) >= _MIN_SCANNED_FILES, (
         f'sweep scanned only {len(scanned)} files, expected >= '
