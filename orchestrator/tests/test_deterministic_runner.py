@@ -3650,9 +3650,13 @@ class TestBeforeDoneSubprocessTimeoutHardening:
         BOTH the killpg path and the proc.kill() fallback — an already-exited
         process must never propagate out of the timeout-cleanup helper.
 
-        RED today: ``_terminate_process_tree`` does not exist yet
-        (AttributeError).
+        Task 3884: the killpg now targets the pgid FROZEN at spawn (passed in
+        by the caller) rather than one re-derived via ``os.getpgid(proc.pid)``
+        at kill time, so the dispatch is actually reached here — the swallow
+        being asserted is the killpg's own ProcessLookupError, then the
+        proc.kill() fallback's.
         """
+        import signal
         from unittest.mock import patch
 
         from orchestrator.deterministic_runner import DeterministicRunner
@@ -3666,16 +3670,19 @@ class TestBeforeDoneSubprocessTimeoutHardening:
 
         mock_proc = MagicMock()
         mock_proc.pid = 12345
+        # A bare MagicMock's `.returncode` is a truthy Mock (i.e. `is not None`),
+        # which the task-3884 reaped-proc short-circuit would read as "already
+        # reaped" and skip the signal entirely.  This proc is still running.
+        mock_proc.returncode = None
         mock_proc.kill = MagicMock(side_effect=ProcessLookupError('already exited'))
         mock_proc.wait = AsyncMock(return_value=None)
 
-        with (
-            patch('os.getpgid', side_effect=ProcessLookupError('no such process')),
-            patch('os.killpg', side_effect=ProcessLookupError('no such process')) as mock_killpg,
-        ):
-            await runner._terminate_process_tree(mock_proc)
+        with patch(
+            'os.killpg', side_effect=ProcessLookupError('no such process'),
+        ) as mock_killpg:
+            await runner._terminate_process_tree(mock_proc, 12345)
 
-        mock_killpg.assert_not_called()
+        mock_killpg.assert_called_once_with(12345, signal.SIGKILL)
         mock_proc.kill.assert_called_once()
 
     async def test_terminate_process_tree_bounds_reap_when_proc_never_exits(
@@ -3706,22 +3713,59 @@ class TestBeforeDoneSubprocessTimeoutHardening:
 
         mock_proc = MagicMock()
         mock_proc.pid = 12345
+        # Still running (see the sibling test): a bare MagicMock's `.returncode`
+        # is truthy, which the task-3884 reaped-proc short-circuit would treat
+        # as already-reaped and skip the killpg this test asserts on.
+        mock_proc.returncode = None
         # proc.wait() never resolves — simulates an unkillable/D-state process
         # that ignores SIGKILL.
         never_resolves = asyncio.Event()
         mock_proc.wait = AsyncMock(side_effect=never_resolves.wait)
 
-        with (
-            patch('os.getpgid', return_value=12345),
-            patch('os.killpg') as mock_killpg,
-        ):
+        with patch('os.killpg') as mock_killpg:
             # Hang tripwire: if reap_grace_secs stops bounding the wait, fail
             # loudly instead of stalling the suite.
             await asyncio.wait_for(
-                runner._terminate_process_tree(mock_proc), timeout=5,
+                runner._terminate_process_tree(mock_proc, 12345), timeout=5,
             )
 
         mock_killpg.assert_called_once()
+
+    async def test_no_killpg_after_proc_reaped(self, tmp_path: Path):
+        """A reaped proc must receive NO killpg — its pid may already be recycled.
+
+        Task 3884 / task 845: freezing the pgid at spawn removes the
+        ``os.getpgid`` lookup, but the frozen NUMBER is itself stale once the
+        leader has been reaped — the kernel may have recycled that pid onto an
+        unrelated group (in the original incidents, the user's ``systemd --user``
+        group, which killed the whole login session).  So the helper must
+        dispatch no signal at all once ``proc.returncode is not None``, mirroring
+        ``shared.proc_group.terminate_process_group``'s step 1.
+        """
+        from unittest.mock import patch
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        runner = DeterministicRunner(
+            scheduler=MagicMock(),
+            escalation_queue=EscalationQueue(tmp_path),
+            reap_grace_secs=0.05,
+        )
+        mock_proc = MagicMock()
+        mock_proc.pid = 12345
+        mock_proc.returncode = 0          # already reaped by asyncio's child watcher
+        mock_proc.kill = MagicMock()
+        mock_proc.wait = AsyncMock(return_value=0)
+        killpg_calls: list[tuple[int, int]] = []
+        getpgid_calls: list[int] = []
+        with (
+            patch('os.killpg', side_effect=lambda pgid, sig: killpg_calls.append((pgid, sig))),
+            patch('os.getpgid', side_effect=lambda pid: getpgid_calls.append(pid) or 999),
+        ):
+            await runner._terminate_process_tree(mock_proc, 12345)
+        assert killpg_calls == [], f'must not killpg a reaped proc (task 845); got {killpg_calls}'
+        assert getpgid_calls == [], f'must never re-derive the pgid at kill time; got {getpgid_calls}'
+        mock_proc.kill.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
