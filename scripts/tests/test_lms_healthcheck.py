@@ -3278,3 +3278,116 @@ def test_top_level_count_is_none_when_the_question_does_not_apply():
 
     assert result.reason == lms_healthcheck.Reason.NOT_JSON
     assert result.top_level_entities_named is None
+
+
+# ---------------------------------------------------------------------------
+# Schema v5 and the not-comparable caveat (task 3781)
+#
+# Two things moved at once, and the version exists to stop a consumer papering
+# over either.  The ROW SHAPE gained `first_probe_ms`, `repeat_latencies_ms`
+# and `measured_cached_prompt_tokens` -- but more importantly `latency_ms`
+# CHANGED MEANING: up to v4 it was the first request after the arm reached
+# ready (engine-cold AND prefix-cold), and from v5 it is the engine-warm,
+# prefix-COLD measured run.  A consumer that read a v4 `latency_ms` as the same
+# quantity would be wrong, which is precisely what a version bump prevents.
+#
+# The CAVEAT is the load-bearing other half.  A corrected number without the
+# sentence saying what it is not re-creates the same false comparability the
+# corrected number was supposed to retire -- and eta (3720) and theta (3721)
+# read the JSON artifact, not the README, so the sentence has to live in a real
+# FIELD.  `prd_marker` already exists for exactly this reason.
+# ---------------------------------------------------------------------------
+
+
+def test_the_report_schema_version_is_five():
+    """The shape moved AND `latency_ms` changed meaning between v4 and v5."""
+    assert lms_healthcheck.REPORT_SCHEMA_VERSION == 5
+
+
+def test_the_report_carries_the_not_comparable_caveat_in_a_field():
+    """A contract test on an artifact FIELD, not a pin on prose: it checks the
+    three load-bearing claims are stated, not how they are worded."""
+    caveat = lms_healthcheck.LATENCY_CAVEAT
+
+    assert isinstance(caveat, str)
+    assert caveat.strip()
+    assert _report().latency_caveat == caveat
+
+    lowered = caveat.lower()
+    # (1) single-sample, (2) not the p95-under-load envelope metric zeta owns,
+    # (3) not a cross-arm ranking.
+    assert 'single-sample' in lowered
+    assert 'p95' in lowered
+    assert 'rank' in lowered
+
+
+def test_the_written_artifact_carries_the_caveat_and_both_latencies(cli_env, tmp_path):
+    """JSON carries no comments, which is exactly why this has to be a field --
+    the same reason `prd_marker` is one."""
+    out_path = tmp_path / 'health-report.json'
+
+    assert lms_healthcheck.main(['--all', '--output', str(out_path)]) == 0
+    written = json.loads(out_path.read_text())
+
+    assert written['latency_caveat'] == lms_healthcheck.LATENCY_CAVEAT
+    assert written['arms']
+    for row in written['arms']:
+        assert 'first_probe_ms' in row
+        assert 'latency_ms' in row
+
+
+def test_the_table_states_the_caveat_and_shows_both_numbers():
+    """An operator reading ONE ms column would re-create the same false
+    comparability the JSON just fixed, so the table splits it too."""
+    def probe(arm, *, warmup: bool = False):
+        return lms_healthcheck.ProbeResult(
+            verdict='PASS',
+            reason=lms_healthcheck.Reason.OK,
+            detail='ok',
+            latency_ms=4249.7 if warmup else 359.1,
+        )
+
+    table = lms_healthcheck.render_table(_report(probe=probe))
+
+    assert 'COLD-MS' in table
+    row_line = next(
+        line for line in table.splitlines() if line.startswith('qwen3.5-9b')
+    )
+    assert '4250' in row_line
+    assert '359' in row_line
+    assert lms_healthcheck.LATENCY_CAVEAT in table
+
+
+def test_merging_preserves_the_caveat_and_both_latencies():
+    """The caveat travels from the BINDING input -- the same report the
+    surviving vram block comes from -- so the merged artifact cannot state a
+    caveat no input ever made."""
+    small = _single(_arm())
+    big = _single(
+        _arm(arm_id='phi-4-14b', served_model_name='phi-4-14b', port=8412),
+        snapshot=_snapshot(used_mib=20000, free_mib=4576),
+    )
+
+    merged = lms_healthcheck.merge_reports([small, big])
+
+    assert merged.latency_caveat == lms_healthcheck.LATENCY_CAVEAT
+    assert all(row.first_probe_ms > 0 for row in merged.arms)
+
+    stamped = big.model_copy(update={'latency_caveat': 'from the binding run'})
+    assert lms_healthcheck.merge_reports(
+        [small, stamped]
+    ).latency_caveat == 'from the binding run'
+
+
+def test_a_v4_artifact_no_longer_reads_as_current():
+    """`latency_ms` changed meaning at v5, so a stale v4 part must be REFUSED
+    rather than reinterpreted alongside v5 rows."""
+    stale = _single(_arm()).model_copy(update={'schema_version': 4})
+    current = _single(
+        _arm(arm_id='phi-4-14b', served_model_name='phi-4-14b', port=8412)
+    )
+
+    with pytest.raises(
+        lms_healthcheck.ReportMergeError, match='mixed schema versions'
+    ):
+        lms_healthcheck.merge_reports([stale, current])
