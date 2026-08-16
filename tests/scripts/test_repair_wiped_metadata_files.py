@@ -627,7 +627,7 @@ def test_repair_one_issues_exactly_one_merge_mode_update_task():
 def test_repair_one_never_uses_replace_or_append_mode():
     """(b) replace was the primitive that CAUSED this wipe class: _execute_combine
     (task_interceptor.py) used to write a 3-key blob in replace mode, and
-    _merge_metadata (sqlite_task_backend.py:3301) returns `incoming` verbatim for
+    _merge_metadata (sqlite_task_backend.py) returns `incoming` verbatim for
     that mode, deleting every untouched key. Task 3446 switched _execute_combine
     to metadata_mode='merge', closing that hole, but this repair must still never
     use the wiper's own primitive."""

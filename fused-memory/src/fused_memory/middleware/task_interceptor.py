@@ -2411,6 +2411,12 @@ class TaskInterceptor:
             )
             return None
 
+        # ONE read of the target's stored metadata blob, shared by the guard's
+        # verdict below and by the wording that explains it: both must be
+        # derived from the same bytes, or the log could name a cause the
+        # refusal that actually fired did not have.
+        target_metadata = target.get('metadata')
+
         # ── Guard: never absorb a gated CANDIDATE into an ungated target ──
         # metadata_mode='merge' fixes the target-side loss only; the
         # candidate's metadata is never written anywhere by this path, so a
@@ -2436,7 +2442,7 @@ class TaskInterceptor:
         # fingerprint runs before eligibility, so a mis-targeted decision
         # exits above and never lands in the audited count.
         if self._is_gate_metadata(candidate_metadata) and not self._is_gate_metadata(
-            target.get('metadata')
+            target_metadata
         ):
             candidate_meta = self._extract_metadata_dict(candidate_metadata) or {}
             declared = {k: candidate_meta[k] for k in _GATE_MARKER_KEYS if k in candidate_meta}
@@ -2446,8 +2452,8 @@ class TaskInterceptor:
             # the log text — a shape-level re-check via _parse_metadata_value
             # (not _extract_metadata_dict, to avoid a second schema_warning
             # emission for the same blob) is enough. The refuse-and-degrade
-            # decision itself is unchanged either way.
-            target_metadata = target.get('metadata')
+            # decision itself is unchanged either way. Re-checks the SAME
+            # `target_metadata` the condition above consulted, deliberately.
             target_meta, _target_warnings = _parse_metadata_value(target_metadata)
             if target_metadata and target_meta is None:
                 target_reason = 'the target metadata could not be read (corrupt/unparseable)'

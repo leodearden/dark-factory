@@ -481,7 +481,7 @@ async def repair_one(
     this payload does not name untouched. Emphatically NOT ``'replace'``: that
     was the exact primitive behind the wipe class this script repairs
     (``_execute_combine``, task_interceptor.py, used to write a 3-key blob in
-    replace mode; ``_merge_metadata``, sqlite_task_backend.py:3301, returns
+    replace mode; ``_merge_metadata``, sqlite_task_backend.py, returns
     ``incoming`` verbatim for that mode, deleting ``files``, ``spawned_from``,
     ``source``, ``branch_base_sha`` and the rest). Task 3446 closed that hole
     by switching ``_execute_combine`` to ``metadata_mode='merge'``, but this

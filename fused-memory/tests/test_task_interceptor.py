@@ -1829,6 +1829,15 @@ async def test_curator_combine_refuses_gated_candidate_into_ungated_target(
         'combine-guard' in msg and '50' in msg and 'always_escalates' in msg
         for msg in messages
     ), f'expected a WARNING naming target 50 and the gate markers; got {messages}'
+    # An ABSENT gate, not an unreadable blob — the other branch of that
+    # conditional is pinned by
+    # test_curator_combine_refusal_names_an_unreadable_target_blob.
+    assert any('does not declare a gate' in msg for msg in messages), (
+        f'expected the refusal to blame the missing gate; got {messages}'
+    )
+    assert not any('corrupt/unparseable' in msg for msg in messages), (
+        f'a readable, ungated target must not be reported as corrupt; got {messages}'
+    )
 
 
 @pytest.mark.asyncio
@@ -1901,6 +1910,54 @@ async def test_curator_combine_gate_predicate_ignores_malformed_metadata(
 
     assert result['action'] == 'combine'
     taskmaster.update_task.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_curator_combine_refusal_names_an_unreadable_target_blob(
+    curator_interceptor,
+    taskmaster,
+    audit_dir,
+    caplog,
+):
+    """A gated candidate against a CORRUPT target blob says so in the refusal.
+
+    ``_is_gate_metadata`` is permissive-on-parse-failure, so an unreadable
+    target and a genuinely ungated one both answer False and both refuse
+    identically. Only the WARNING's wording separates them, so only a test on
+    that wording can hold the two apart: blaming "does not declare a gate"
+    sends an operator hunting a missing gate on a task whose metadata simply
+    could not be read. Paired with
+    ``test_curator_combine_refuses_gated_candidate_into_ungated_target``,
+    which pins the other branch of the same conditional — without both, an
+    edit that collapses the branch (e.g. dropping the ``target_metadata and``
+    guard) ships green.
+    """
+    _set_target(taskmaster, None)
+    # _set_target json.dumps() whatever it is given; overwrite with a raw blob
+    # that cannot round-trip through json.loads at all.
+    taskmaster.get_task.return_value['metadata'] = '{not json'
+    curator_interceptor._curator = _mock_curator(_combine_decision('unreadable target'))
+
+    with caplog.at_level(logging.WARNING):
+        result = await _submit_and_resolve(
+            curator_interceptor,
+            '/project',
+            title='Human gate: consolidate the duplicate cluster',
+            metadata=dict(_GATE_CANDIDATE_METADATA),
+        )
+
+    # Same refuse-and-degrade-to-create outcome as the ungated case; only the
+    # explanation differs.
+    assert result == {'id': '2', 'title': 'New Task'}
+    taskmaster.update_task.assert_not_called()
+    assert _combine_audit_lines(audit_dir) == []
+    messages = [rec.getMessage() for rec in caplog.records if rec.levelno >= logging.WARNING]
+    assert any(
+        'combine-guard' in msg and 'corrupt/unparseable' in msg for msg in messages
+    ), f'expected the refusal to name the unreadable target blob; got {messages}'
+    assert not any('does not declare a gate' in msg for msg in messages), (
+        f'an unreadable blob must not be reported as a declared-nothing target; got {messages}'
+    )
 
 
 @pytest.mark.asyncio
