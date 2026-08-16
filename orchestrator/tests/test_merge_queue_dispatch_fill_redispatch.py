@@ -47,17 +47,6 @@ from unittest.mock import MagicMock
 import pytest
 from _orch_helpers import MERGE_RESULT_TIMEOUT
 
-from orchestrator.config import OrchestratorConfig
-from orchestrator.git_ops import GitOps, MergeResult
-from orchestrator.merge_queue import (
-    InflightEntry,
-    ItemLifecycleState,
-    MergeOutcome,
-    RealMergeItem,
-    SpeculativeMergeWorker,
-)
-from orchestrator.verify_runner import HostAllocator
-
 # Reuse the γ multi-host test harness (established cross-test-module import
 # pattern -- orchestrator/tests/ has no __init__.py; precedent:
 # test_concurrent_verify_boundary.py:33) -- single source of truth for the
@@ -71,6 +60,17 @@ from test_merge_queue_concurrent_verify import (
     git_ops,  # noqa: F401 — pytest fixture re-exported from γ harness
     git_repo,  # noqa: F401 — pytest fixture re-exported from γ harness
 )
+
+from orchestrator.config import OrchestratorConfig
+from orchestrator.git_ops import GitOps, MergeResult
+from orchestrator.merge_queue import (
+    InflightEntry,
+    ItemLifecycleState,
+    MergeOutcome,
+    RealMergeItem,
+    SpeculativeMergeWorker,
+)
+from orchestrator.verify_runner import HostAllocator
 
 # ---------------------------------------------------------------------------
 # Shared harness: drive the REAL _verifier_loop against a REAL two-host

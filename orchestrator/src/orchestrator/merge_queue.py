@@ -15035,13 +15035,26 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
                 # Continue filling only if another slot is free (real verify entries
                 # consume a host slot, so check free_host_count).
-                # Also stop filling if we just dispatched from _redispatch and it is
-                # now empty: cascade-recovery items should proceed to FINALIZE-HEAD
-                # rather than blocking on _verifier_queue.get() waiting for new work
-                # (which would deadlock when the queue is empty after a cascade).
+                # task 3276: the hazard this second clause guards against is an
+                # EMPTY _verifier_queue -- blocking on _verifier_queue.get() would
+                # deadlock when the queue is empty after a cascade -- NOT an empty
+                # _redispatch. The two are different conditions: a redispatch-
+                # sourced dispatch that happens to drain _redispatch does not mean
+                # _verifier_queue is empty too. Testing _redispatch alone ended the
+                # fill pass (and forfeited a free host) even when _verifier_queue
+                # still held a ready item, so cascade-recovery items now proceed to
+                # FINALIZE-HEAD only when there is genuinely nothing left to
+                # dispatch: _redispatch is empty AND _verifier_queue is empty AND
+                # no persistent getter is holding an already-harvested item (a
+                # done-but-unharvested _pending_verifier_get means the harvest
+                # branch above would dispatch immediately on the next iteration,
+                # so the fill pass must not end in that state either).
                 allocator = self._ensure_host_allocator(entry.item.request.config)
                 if allocator.free_host_count() == 0 or (
-                    not is_from_verifier_queue and not self._redispatch
+                    not is_from_verifier_queue
+                    and not self._redispatch
+                    and self._verifier_queue.empty()
+                    and self._pending_verifier_get is None
                 ):
                     fill_done = True
                     break
