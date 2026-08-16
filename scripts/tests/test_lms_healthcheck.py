@@ -97,7 +97,12 @@ class _Resp:
         return self._payload
 
 
-def _completion(content: str | None, finish_reason: str = 'stop') -> dict:
+_UNSET = object()
+
+
+def _completion(
+    content: str | None, finish_reason: str = 'stop', usage=_UNSET
+) -> dict:
     """An OpenAI chat-completions response body carrying *content*.
 
     `None` is a REAL shape, not a test convenience: vLLM returns
@@ -105,8 +110,14 @@ def _completion(content: str | None, finish_reason: str = 'stop') -> dict:
     where llama.cpp returns `''`. Typing this `str` would make the null case
     unexpressible — and that case is exactly what made COMPLETION_TRUNCATED
     unreachable on the vLLM stack.
+
+    `usage` is likewise absent-by-default rather than defaulting to `None`,
+    because "no usage block at all" and "a usage block whose
+    prompt_tokens_details is null" are two distinct real shapes (task 3781):
+    the first is what a minimal server returns, the second is what vLLM
+    returns, and only the second proves the reader tolerates a null.
     """
-    return {
+    body: dict = {
         'id': 'cmpl-1',
         'object': 'chat.completion',
         'choices': [
@@ -117,6 +128,9 @@ def _completion(content: str | None, finish_reason: str = 'stop') -> dict:
             }
         ],
     }
+    if usage is not _UNSET:
+        body['usage'] = usage
+    return body
 
 
 def _models_payload(*names: str) -> dict:
@@ -703,6 +717,122 @@ def test_a_placeholder_arm_is_refused_before_any_request(install_fake_httpx):
 
     assert result.verdict == 'FAIL'
     assert result.reason == lms_healthcheck.Reason.PLACEHOLDER_ARM
+
+
+# ---------------------------------------------------------------------------
+# The cached-prompt-token diagnostic (task 3781)
+#
+# This is the only DIRECT evidence in the artifact that the measured probe
+# found the prefix cache COLD -- the claim the whole cold/warm split rests on.
+# Without it, "engine-warm, prefix-cold" is an assertion about the instrument
+# that the instrument's own output cannot support.
+#
+# The two stacks answer differently and the asymmetry is not hidden: llama.cpp
+# fills `usage.prompt_tokens_details.cached_tokens`, so a near-zero count there
+# proves it; vLLM returns `prompt_tokens_details: null`, so on that stack the
+# claim rests on latency alone.  REPORTED and NON-GATING, exactly like
+# `top_level_entities_named` -- it must never decide a verdict.
+# ---------------------------------------------------------------------------
+
+
+def _healthy_llm_wire(install_fake_httpx, body, model='qwen3.5-9b'):
+    """Install a fake httpx serving *body* from a correctly-identified arm."""
+    install_fake_httpx(
+        get=lambda url, **kw: _Resp(200, _models_payload(model)),
+        post=lambda url, **kw: _Resp(200, body),
+    )
+
+
+def test_a_llamacpp_shaped_response_records_its_cached_prompt_tokens(
+    install_fake_httpx,
+):
+    """The llama.cpp shape.  5 of 343 cached is what a genuinely cold prefix
+    looks like; 338 of 343 is the poisoned same-prompt warm-up this task's
+    design exists to avoid."""
+    _healthy_llm_wire(
+        install_fake_httpx,
+        _completion(
+            _valid_probe_json(),
+            usage={'prompt_tokens': 343, 'prompt_tokens_details': {'cached_tokens': 5}},
+        ),
+    )
+
+    result = lms_healthcheck.probe_llm_arm(_arm())
+
+    assert result.verdict == 'PASS'
+    assert result.cached_prompt_tokens == 5
+
+
+def test_a_vllm_shaped_null_prompt_tokens_details_still_produces_both_latencies(
+    install_fake_httpx,
+):
+    """The measured vLLM shape.  On that stack the cold/warm split has to be
+    visible through LATENCY ALONE, so a null here must never degrade a field,
+    move a verdict, or raise."""
+    _healthy_llm_wire(
+        install_fake_httpx,
+        _completion(
+            _valid_probe_json(),
+            usage={'prompt_tokens': 343, 'prompt_tokens_details': None},
+        ),
+    )
+
+    report = lms_healthcheck.run_healthcheck(
+        [_arm()], gpu_probe=lambda: _snapshot(), baseline=_baseline(),
+    )
+    row = report.arms[0]
+
+    assert row.verdict == 'PASS'
+    assert row.first_probe_ms > 0
+    assert row.latency_ms > 0
+    assert row.measured_cached_prompt_tokens is None
+
+
+def test_a_response_with_no_usage_block_at_all_records_no_cached_count(
+    install_fake_httpx,
+):
+    _healthy_llm_wire(install_fake_httpx, _completion(_valid_probe_json()))
+
+    result = lms_healthcheck.probe_llm_arm(_arm())
+
+    assert result.verdict == 'PASS'
+    assert result.cached_prompt_tokens is None
+
+
+@pytest.mark.parametrize(
+    'usage',
+    [
+        'nope',
+        {'prompt_tokens_details': []},
+        {'prompt_tokens_details': {'cached_tokens': 'many'}},
+        {'prompt_tokens_details': {'cached_tokens': True}},
+        {'prompt_tokens_details': {}},
+        None,
+    ],
+    ids=['string', 'list-details', 'string-count', 'bool-count', 'empty', 'null'],
+)
+def test_a_malformed_usage_block_is_tolerated_not_raised(install_fake_httpx, usage):
+    """Read defensively, exactly as `_extract_content` and `_was_truncated`
+    already read bodies: an unreadable diagnostic must never abort a sweep or
+    change a verdict.  `True` is rejected on its own account -- Python's
+    `isinstance(True, int)` hole, closed here as `verify_embedding_response`
+    already closes it for vector values."""
+    _healthy_llm_wire(
+        install_fake_httpx, _completion(_valid_probe_json(), usage=usage)
+    )
+
+    result = lms_healthcheck.probe_llm_arm(_arm())
+
+    assert result.verdict == 'PASS'
+    assert result.cached_prompt_tokens is None
+
+
+def test_an_embedding_row_records_no_cached_prompt_tokens():
+    """The question does not apply to an embedding arm, so the answer is None
+    rather than a 0 that reads like a measured cold cache."""
+    row = _report(arms=[_unprefixed_arm()]).arms[0]
+
+    assert row.measured_cached_prompt_tokens is None
 
 
 # ===========================================================================
