@@ -1529,6 +1529,74 @@ class TestCiteTaskCrossProjectNearCollision:
         assert later.get('error') == 'duplicate_finding'
         assert later.get('existing_finding_id') == citing_id
 
+    # -- THE BUG --------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_cross_project_near_collision_skips_the_fold(self):
+        """Two projects' findings about same-numbered tasks must BOTH survive.
+
+        The anchor's primary citation pins ('dark_factory', '42'); the
+        incoming citation names task '42' in other_project — a different
+        task entirely that merely shares a number. Before the guard, the
+        projectless derived sig ('42', 'X') made the incoming call return
+        duplicate_finding and purged the foreign finding WHOLESALE, its
+        content surviving only in the task-4184 fold-purge WARNING. With 9
+        registered project roots all carrying small-integer Taskmaster ids,
+        that numeric overlap is guaranteed-possible.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='run-1', stage='task_knowledge_sync', project_id='dark_factory')
+
+        local = state.add_finding(
+            run_id='run-1', severity='low', category='memory_stale',
+            description='local 42 is stale', suggested_action='a',
+            task_id='42', flag_type='X',
+        )
+        assert 'finding_id' in local, local
+        local_id = local['finding_id']
+
+        # Self-hit: registers the derived sig ('42', 'X') and pins
+        # cited_tasks[0]['project_id'] == 'dark_factory'.
+        cite_local = await state.cite_task('run-1', local_id, 'dark_factory', '42')
+        assert 'error' not in cite_local, cite_local
+
+        # Its own add_finding sig is (None, 'X'), so it allocates fresh.
+        foreign = state.add_finding(
+            run_id='run-1', severity='low', category='memory_stale',
+            description='foreign 42, worded differently', suggested_action='a',
+            task_id=None, flag_type='X',
+        )
+        assert 'finding_id' in foreign, foreign
+        foreign_id = foreign['finding_id']
+
+        result = await state.cite_task('run-1', foreign_id, 'other_project', '42')
+
+        # Ordinary citation dict, NOT duplicate_finding.
+        assert 'error' not in result, result
+        assert result['project_id'] == 'other_project'
+        assert result['task_id'] == '42'
+
+        # Not purged.
+        assert state._resolve_finding('run-1', foreign_id) is not None
+
+        report = state.get_assembled_report('run-1', 'task_knowledge_sync')
+        assert report is not None
+        ids = {item['finding_id'] for item in report['flagged_items']}
+        assert ids == {local_id, foreign_id}
+
+        # Each finding kept its OWN citation.
+        local_resolved = state._resolve_finding('run-1', local_id)
+        assert local_resolved is not None
+        assert [
+            (c['project_id'], c['task_id']) for c in local_resolved[1].cited_tasks
+        ] == [('dark_factory', '42')]
+
+        foreign_resolved = state._resolve_finding('run-1', foreign_id)
+        assert foreign_resolved is not None
+        assert [
+            (c['project_id'], c['task_id']) for c in foreign_resolved[1].cited_tasks
+        ] == [('other_project', '42')]
+
 
 # ---------------------------------------------------------------------------
 # task-4184 step-1/step-3: TestCiteTaskFoldPurgeLogging — RED until step-2/4
