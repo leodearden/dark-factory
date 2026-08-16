@@ -3169,9 +3169,13 @@ class TestMemoryMetadataConfig:
 # regression; a consecutive-deferral cap makes the debt bounded and explicit.
 
 
-def test_max_backlog_remediation_deferrals_defaults_to_five():
-    """Default bounds the deferral debt at five consecutive cycles."""
-    assert ReconciliationConfig().max_backlog_remediation_deferrals == 5
+def test_max_backlog_remediation_deferrals_defaults_to_the_ceiling():
+    """Default is the largest streak the escalation semantics can absorb."""
+    from fused_memory.config.schema import MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING
+
+    assert ReconciliationConfig().max_backlog_remediation_deferrals == 2
+    assert (ReconciliationConfig().max_backlog_remediation_deferrals
+            == MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING)
 
 
 def test_max_backlog_remediation_deferrals_rejects_a_negative_value():
@@ -3190,10 +3194,44 @@ def test_max_backlog_remediation_deferrals_accepts_zero_as_the_off_switch():
                                 ).max_backlog_remediation_deferrals == 0
 
 
-def test_max_backlog_remediation_deferrals_accepts_a_larger_bound():
-    """A deeper backlog can be given more rope without a schema change."""
-    assert ReconciliationConfig(max_backlog_remediation_deferrals=20
-                                ).max_backlog_remediation_deferrals == 20
+def test_max_backlog_remediation_deferrals_rejects_more_rope_than_the_ceiling():
+    """A longer streak would change escalation semantics, so the schema refuses it.
+
+    A deferred cycle writes ONE completed run instead of two, and
+    _finding_persistence_count counts completed runs that re-flag a finding.
+    Past the ceiling a backlogged project accumulates enough re-flaggings to
+    reach _INTEGRITY_FINDING_RECURRENCE_THRESHOLD without a single remediation
+    attempt having run, so the first failed remediation escalates immediately
+    instead of the fourth recurrence.  Rejecting at config-load is louder than
+    letting the operator believe the extra rope was granted.
+    """
+    from fused_memory.config.schema import MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING
+
+    assert ReconciliationConfig(
+        max_backlog_remediation_deferrals=MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING
+    ).max_backlog_remediation_deferrals == MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING
+
+    with pytest.raises(ValidationError):
+        ReconciliationConfig(
+            max_backlog_remediation_deferrals=MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING + 1
+        )
+    with pytest.raises(ValidationError):
+        ReconciliationConfig(max_backlog_remediation_deferrals=20)
+
+
+def test_shipped_config_max_backlog_remediation_deferrals_is_within_the_ceiling(
+    monkeypatch,
+):
+    """The SHIPPED config.yaml value must itself satisfy the bound.
+
+    The schema would reject a larger value at load, so this pins that the file
+    an operator actually runs cannot be the thing that fails config load.
+    """
+    from fused_memory.config.schema import MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING
+
+    cfg = _shipped_reconciliation_config(monkeypatch)
+    assert 0 <= cfg.max_backlog_remediation_deferrals <= (
+        MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING)
 
 
 # ── the capacity claim as a checkable config invariant (task 3049) ────

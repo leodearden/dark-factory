@@ -116,18 +116,40 @@ Three properties make this safe:
   notably on the `backlog_final_consolidation` pass, which runs against a drained buffer.
   It also covers the non-iterator path, where a plain cycle's buffer has meanwhile grown
   past the threshold.
-- **Bounded.** `max_backlog_remediation_deferrals` (default 5) caps the *consecutive*
+- **Bounded.** `max_backlog_remediation_deferrals` (default **2**) caps the *consecutive*
   deferral streak per project, so a permanently deep buffer cannot starve remediation
   into an integrity regression. `0` disables deferral entirely, restoring exact pre-3049
   behaviour. The counter is in-memory by design: a restart resets it, which only makes
   remediation run *sooner* — the fail-safe direction.
 
-The threshold has exactly one definition: `BacklogIterator.should_iterate` was reduced to
-delegating to `ReconciliationHarness._in_backlog_mode`, so the condition that defers
-remediation is provably the same one that put the project into chunked mode.
+  The bound of 2 is **derived, not chosen** (amendment, `reviewer_comprehensive`). A
+  deferred cycle writes ONE completed run (the parent) instead of the usual two (parent +
+  remediation), and `_finding_persistence_count` counts completed runs that re-flag a
+  finding. After D consecutive deferrals the cycle that finally remediates already sees
+  D+1 re-flaggings, so D must satisfy `D + 1 < _INTEGRITY_FINDING_RECURRENCE_THRESHOLD`
+  (= 4) for that counter to keep meaning *"this finding recurs DESPITE remediation"*.
+  At the originally-shipped 5, a backlogged project would have hit the threshold with
+  zero remediation attempts behind it and escalated `recon_integrity_issue` on the FIRST
+  failed remediation instead of the fourth recurrence — a throughput lever silently
+  redefining escalation semantics. The ceiling is enforced twice: `ge=0, le=2` on the
+  config field (rejects at load) and a `min()` clamp in `_maybe_remediate` (enforces at
+  the point of use, for duck-typed configs), pinned to
+  `_INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 2` by a runtime test.
 
-Gains ~1/(1−duty) on the same per-event rate — **~1.4x** at the measured lifetime duty,
-**~1.8x** in a backlog-mode window. A pure scheduling change; no work is saved or skipped.
+The threshold has exactly one definition: the pure module-level
+`harness.is_backlog_size(count, config)`. `BacklogIterator.should_iterate` (against its
+own injected config/buffer), `_select_tier`'s opus/sonnet choice and the harness's
+`_backlog_state` — which `_maybe_remediate`'s deferral gate calls — all evaluate it, so
+the condition that defers remediation is provably the same one that put the project into
+chunked mode and onto the opus tier.
+
+Gains ~1/(1−duty) on the same per-event rate *while the streak holds* — **~1.4x** at the
+measured lifetime duty, **~1.8x** in a backlog-mode window. The bound of 2 means
+remediation runs once per three cycles during a sustained backlog rather than never, so
+the realised backlog-mode gain is roughly **~1.5x**, not the full 1.8x; the
+`remediation_free_events_per_day` column below is therefore an *upper bound* on
+post-lever-1 capacity, approached only for streak-length windows. A pure scheduling
+change either way; no work is saved or skipped.
 
 ### Lever 2 — amortise the fixed per-cycle cost in steady state *(landed)*
 
@@ -283,7 +305,7 @@ which is why the readable summary leads with it.
 |---|---|
 | Report + capacity arithmetic | `fused-memory/src/fused_memory/reconciliation/throughput.py` |
 | Inflow rollup | `event_buffer.py` — `event_arrival_hourly`, written in `cleanup_drained` |
-| Deferral gate | `harness.py` — `_maybe_remediate`, `_in_backlog_mode` |
-| Deferral bound | `ReconciliationConfig.max_backlog_remediation_deferrals` (default 5) |
+| Deferral gate | `harness.py` — `_maybe_remediate`, `_backlog_state`, `is_backlog_size` |
+| Deferral bound | `ReconciliationConfig.max_backlog_remediation_deferrals` (default 2, `le=2`) |
 | Batch size | `reconciliation.conditional_trigger_ratio: 0.6` in `fused-memory/config/config.yaml` |
 | Claim-vs-config invariant | `fused-memory/tests/test_config_schema.py` |

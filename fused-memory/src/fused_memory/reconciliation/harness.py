@@ -200,6 +200,22 @@ _DEAD_OWNER_STORM_FINDING: dict[str, Any] = {
 # duration), long enough to filter transient findings.
 _INTEGRITY_FINDING_RECURRENCE_THRESHOLD = 4
 
+# Task 3049 amendment: hard ceiling on the EFFECTIVE value of
+# config.max_backlog_remediation_deferrals, derived from the threshold above so
+# the two can never desynchronise.
+#
+# Derivation.  A deferred cycle produces ONE completed run (the parent) instead
+# of the usual two (parent + remediation), and _finding_persistence_count counts
+# completed runs that re-flag a finding.  So after D consecutive deferrals the
+# cycle that finally remediates sees D+1 consecutive parent runs all carrying the
+# finding, and its post-remediation escalation gate reads persistence = D+1.
+# Requiring D + 1 < _INTEGRITY_FINDING_RECURRENCE_THRESHOLD, i.e.
+# D <= THRESHOLD - 2, preserves what that counter MEANS: 'this finding recurs
+# DESPITE remediation'.  Above the ceiling, a backlogged project would escalate
+# recon_integrity_issue on the FIRST failed remediation instead of the fourth
+# re-flagging — a throughput lever silently changing escalation semantics.
+_MAX_BACKLOG_REMEDIATION_DEFERRALS = _INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 2
+
 # Task 1669: suppress re-firing of a finding whose matching escalation was
 # resolved within this window.  Beyond it, a recurrence re-escalates so a
 # re-emerging problem is not hidden forever.  Value is a policy threshold —
@@ -338,6 +354,32 @@ class TierConfig:
     model: str = 'sonnet'
     episode_limit: int = 125
     memory_limit: int = 250
+
+
+def is_backlog_size(buffer_size: int, config) -> bool:
+    """True iff ``buffer_size`` puts a project in backlog mode.
+
+    Task 3049 — the SINGLE definition of the backlog-mode threshold.  Three
+    behaviours key off 'is this project backlogged': BacklogIterator's decision
+    to drain in chunks, the opus/sonnet tier selection, and ``_maybe_remediate``'s
+    decision to defer its inline remediation pass.  All three call this, so a
+    retune of either knob moves them together and they cannot desynchronise.
+
+    Deliberately a module-level PURE function over (size, config) rather than a
+    harness method: ``BacklogIterator`` holds its own injected ``config`` and
+    ``buffer``, and reaching through to the harness would silently compute the
+    answer against the harness's objects instead of the iterator's.
+
+    Args:
+        buffer_size: Buffered event count for the project.
+        config: Any object exposing ``buffer_size_threshold`` and
+            ``opus_threshold_ratio``.
+
+    Returns:
+        ``size > buffer_size_threshold * opus_threshold_ratio``, strictly: at
+        exactly the threshold the project is NOT in backlog mode.
+    """
+    return buffer_size > config.buffer_size_threshold * config.opus_threshold_ratio
 
 
 def build_stale_run_diagnostics(
@@ -2450,7 +2492,9 @@ class ReconciliationHarness:
     async def _select_tier(self, project_id: ProjectId) -> TierConfig:
         """Choose model tier based on buffer size."""
         buffer_count = (await self.buffer.get_buffer_stats(project_id)).get('size', 0)
-        use_opus = buffer_count > (self.config.buffer_size_threshold * self.config.opus_threshold_ratio)
+        # Same predicate as BacklogIterator.should_iterate and the remediation
+        # deferral gate (task 3049): 'backlogged' means one thing here.
+        use_opus = is_backlog_size(buffer_count, self.config)
 
         if use_opus:
             return TierConfig(
@@ -4254,13 +4298,14 @@ class ReconciliationHarness:
             )
             return False
 
-    async def _in_backlog_mode(self, project_id: str) -> bool:
-        """True while ``project_id``'s buffer is deep enough for chunked drain.
+    async def _backlog_state(self, project_id: str) -> tuple[bool, int]:
+        """``(in_backlog, buffer_size)`` from ONE buffer read.
 
-        Task 3049: single definition of the backlog-mode threshold, extracted
-        from ``BacklogIterator.should_iterate`` (which now delegates here) so
-        that ``_maybe_remediate``'s deferral gate provably tests the SAME
-        condition that put the project into chunked mode.
+        Task 3049: the pair is returned together so a caller that both gates on
+        the answer and reports the depth (``_maybe_remediate``'s deferral log)
+        uses the SAME number for both.  Two separate reads could straddle an
+        arrival or a drain and log a depth at or below the threshold next to a
+        'deferred because backlogged' message.
 
         The read is deliberately FRESH rather than a flag threaded down from
         BacklogIterator: that makes the gate stateless and self-terminating —
@@ -4270,15 +4315,25 @@ class ReconciliationHarness:
         a drained buffer. It also correctly covers the non-iterator path, where
         a plain full cycle whose buffer has meanwhile grown past the threshold
         defers too. Cost is one indexed COUNT(*) against a ~945s cycle.
+        """
+        stats = await self.buffer.get_buffer_stats(project_id)
+        size = stats.get('size', 0)
+        return is_backlog_size(size, self.config), size
+
+    async def _in_backlog_mode(self, project_id: str) -> bool:
+        """True while ``project_id``'s buffer is deep enough for chunked drain.
+
+        Thin convenience over :meth:`_backlog_state` for callers that need only
+        the verdict.  The threshold itself lives in one place — the pure
+        module-level :func:`is_backlog_size` — which ``BacklogIterator``
+        (against its own injected config/buffer) and ``_select_tier`` also use.
 
         Returns:
             ``size > buffer_size_threshold * opus_threshold_ratio``, strictly:
             at exactly the threshold the project is NOT in backlog mode.
         """
-        stats = await self.buffer.get_buffer_stats(project_id)
-        count = stats.get('size', 0)
-        threshold = self.config.buffer_size_threshold * self.config.opus_threshold_ratio
-        return count > threshold
+        in_backlog, _size = await self._backlog_state(project_id)
+        return in_backlog
 
     async def _maybe_remediate(
         self,
@@ -4465,29 +4520,39 @@ class ReconciliationHarness:
             # below the threshold would starve remediation indefinitely.
             # max_backlog_remediation_deferrals caps the consecutive streak; 0
             # disables deferral entirely (exact pre-3049 behaviour).
-            max_deferrals = getattr(self.config, 'max_backlog_remediation_deferrals', 0)
+            #
+            # WHY THE CEILING: the streak also has to leave the persistence
+            # counter's meaning intact — see _MAX_BACKLOG_REMEDIATION_DEFERRALS.
+            # The config field is schema-bounded to the same ceiling; the min()
+            # here is what ENFORCES it at the point of use, so a duck-typed or
+            # hand-patched config cannot quietly buy more rope than the
+            # escalation semantics can absorb.
+            configured_deferrals = getattr(
+                self.config, 'max_backlog_remediation_deferrals', 0)
+            max_deferrals = min(configured_deferrals, _MAX_BACKLOG_REMEDIATION_DEFERRALS)
             deferred_so_far = self._remediation_deferrals.get(project_id, 0)
-            if (
-                max_deferrals > 0
-                and deferred_so_far < max_deferrals
-                and await self._in_backlog_mode(project_id)
-            ):
-                self._remediation_deferrals[project_id] = deferred_so_far + 1
-                # Second stats read, on the defer path only, purely so the log
-                # record carries the buffer depth that caused the deferral.
-                buffer_stats = await self.buffer.get_buffer_stats(project_id)
-                logger.info(
-                    'reconciliation.remediation_deferred_backlog',
-                    extra={
-                        'project_id': project_id,
-                        'parent_run_id': parent_run_id,
-                        'deferred_finding_count': len(to_remediate),
-                        'buffer_size': buffer_stats.get('size', 0),
-                        'consecutive_deferrals': self._remediation_deferrals[project_id],
-                        'max_backlog_remediation_deferrals': max_deferrals,
-                    },
-                )
-                return
+            if max_deferrals > 0 and deferred_so_far < max_deferrals:
+                # ONE buffer read, on the defer path only: the depth that gates
+                # is the depth that gets logged.  Two reads could straddle an
+                # arrival or a drain and print a size at or below the threshold
+                # next to a 'deferred because backlogged' message.
+                in_backlog, buffer_size = await self._backlog_state(project_id)
+                if in_backlog:
+                    self._remediation_deferrals[project_id] = deferred_so_far + 1
+                    logger.info(
+                        'reconciliation.remediation_deferred_backlog',
+                        extra={
+                            'project_id': project_id,
+                            'parent_run_id': parent_run_id,
+                            'deferred_finding_count': len(to_remediate),
+                            'buffer_size': buffer_size,
+                            'consecutive_deferrals': self._remediation_deferrals[project_id],
+                            'max_backlog_remediation_deferrals': max_deferrals,
+                            'configured_max_backlog_remediation_deferrals':
+                                configured_deferrals,
+                        },
+                    )
+                    return
 
             # Dispatching (or the bound was reached) — the streak is over.
             self._remediation_deferrals[project_id] = 0
@@ -5124,12 +5189,16 @@ class BacklogIterator:
     async def should_iterate(self, project_id: str) -> bool:
         """Buffer count > 150% of trigger threshold.
 
-        Task 3049: delegates to ``ReconciliationHarness._in_backlog_mode`` so
-        the threshold has exactly ONE definition — the same predicate that
-        puts a project into chunked mode is the one ``_maybe_remediate``
-        consults when deciding to defer its inline remediation pass.
+        Task 3049: the threshold has exactly ONE definition — the pure
+        module-level :func:`is_backlog_size`, which the harness's
+        ``_backlog_state`` (and through it ``_maybe_remediate``'s deferral
+        gate) and ``_select_tier`` call too.  Evaluated here against THIS
+        iterator's own injected ``config`` and ``buffer`` rather than reaching
+        through to the harness's, so a caller that constructs an iterator with
+        different collaborators gets an answer computed from them.
         """
-        return await self.harness._in_backlog_mode(project_id)
+        stats = await self.buffer.get_buffer_stats(project_id)
+        return is_backlog_size(stats.get('size', 0), self.config)
 
     async def run(self, project_id: str) -> None:
         """Process backlog in token-budgeted chunks, oldest-first.

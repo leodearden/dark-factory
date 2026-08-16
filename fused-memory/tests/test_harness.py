@@ -16835,6 +16835,108 @@ async def test_maybe_remediate_deferral_debt_is_bounded(
 
 
 @pytest.mark.asyncio
+async def test_maybe_remediate_deferral_streak_cannot_outlast_the_persistence_gate(
+    journal, event_buffer, mock_memory_service, caplog,
+):
+    """(e) The streak is clamped so remediation is attempted before escalation can fire.
+
+    A deferred cycle writes ONE completed run (the parent) instead of the usual
+    two (parent + remediation), and _finding_persistence_count counts completed
+    runs that re-flag a finding.  After D consecutive deferrals the cycle that
+    finally remediates therefore already sees D+1 re-flaggings.  Left
+    unclamped at the old default of 5, a backlogged project would reach
+    _INTEGRITY_FINDING_RECURRENCE_THRESHOLD with ZERO remediation attempts
+    behind it and escalate recon_integrity_issue on the FIRST failed
+    remediation — a throughput lever silently redefining escalation semantics.
+
+    So: however much rope the config asks for, at most
+    _MAX_BACKLOG_REMEDIATION_DEFERRALS consecutive cycles may defer.
+    """
+    from fused_memory.reconciliation.harness import _MAX_BACKLOG_REMEDIATION_DEFERRALS
+
+    harness, remediation = _remediation_harness(
+        journal, event_buffer, mock_memory_service, buffer_size=900,
+    )
+    # More rope than the ceiling allows — a duck-typed or hand-patched config
+    # can ask for it even though the schema rejects it at load.
+    harness.config.max_backlog_remediation_deferrals = 5
+    parent_run = await _persist_parent_run(journal, 'test-project', [_make_s3_findings()[0]])
+
+    with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
+        for _ in range(3):
+            await _call_maybe_remediate(harness, parent_run)
+
+    # Unclamped, all three cycles would have deferred (5 > 3) and remediation
+    # would never have been attempted.
+    assert _MAX_BACKLOG_REMEDIATION_DEFERRALS == 2
+    assert len(_defer_records(caplog)) == 2
+    assert remediation.await_count == 1, (
+        'the clamped streak must end in a real remediation attempt, so a '
+        'finding that survives it is genuinely recurring DESPITE remediation'
+    )
+    assert harness._remediation_deferrals.get('test-project', 0) == 0
+
+    rec = _defer_records(caplog)[0]
+    assert getattr(rec, 'max_backlog_remediation_deferrals', None) == 2, (
+        'the log must report the EFFECTIVE bound, not the configured one'
+    )
+    assert getattr(rec, 'configured_max_backlog_remediation_deferrals', None) == 5, (
+        'the configured value stays visible so a clamped config is diagnosable'
+    )
+
+
+def test_max_backlog_remediation_deferrals_ceiling_matches_the_config_schema():
+    """The schema bound and the harness clamp are the same number, derived once.
+
+    The ceiling is derived from _INTEGRITY_FINDING_RECURRENCE_THRESHOLD here and
+    restated as a literal in config.schema (which must not import the harness).
+    This pins the two together at runtime so a retune of the recurrence
+    threshold cannot leave a stale bound behind in the config layer.
+    """
+    from fused_memory.config.schema import MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING
+    from fused_memory.reconciliation.harness import (
+        _INTEGRITY_FINDING_RECURRENCE_THRESHOLD,
+        _MAX_BACKLOG_REMEDIATION_DEFERRALS,
+    )
+
+    assert _MAX_BACKLOG_REMEDIATION_DEFERRALS == (
+        _INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 2)
+    assert MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING == _MAX_BACKLOG_REMEDIATION_DEFERRALS
+
+
+@pytest.mark.asyncio
+async def test_maybe_remediate_logs_the_buffer_depth_that_actually_gated(
+    journal, event_buffer, mock_memory_service, caplog,
+):
+    """(f) One buffer read on the defer path: the gating depth IS the logged depth.
+
+    With two reads the log could print a depth at or below the threshold next
+    to a 'deferred because backlogged' message — the buffer drains and fills
+    between them — which is exactly the confusion the field exists to prevent.
+    Simulated with a stats mock whose SECOND answer is below the threshold: if
+    the gate and the log read separately, the record shows the second value.
+    """
+    harness, remediation = _remediation_harness(
+        journal, event_buffer, mock_memory_service, buffer_size=900,
+    )
+    harness.buffer.get_buffer_stats = AsyncMock(
+        side_effect=[{'size': 900}, {'size': 3}, {'size': 3}],
+    )
+    parent_run = await _persist_parent_run(journal, 'test-project', [_make_s3_findings()[0]])
+
+    with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
+        await _call_maybe_remediate(harness, parent_run)
+
+    remediation.assert_not_awaited()
+    records = _defer_records(caplog)
+    assert len(records) == 1
+    assert getattr(records[0], 'buffer_size', None) == 900, (
+        'the logged depth must be the one the gate evaluated, not a later read'
+    )
+    assert harness.buffer.get_buffer_stats.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_maybe_remediate_deferral_leaves_the_findings_forward_feedable(
     journal, event_buffer, mock_memory_service,
 ):

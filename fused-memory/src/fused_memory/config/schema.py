@@ -35,6 +35,22 @@ from fused_memory.topic_slug import (
 # read and applied leaves from this default file.
 DEFAULT_CONFIG_PATH = 'config/config.yaml'
 
+# Task 3049 amendment: ceiling (and default) for
+# ReconciliationConfig.max_backlog_remediation_deferrals.
+#
+# Deferring the inline remediation pass is a THROUGHPUT lever, and it must not
+# become an escalation-semantics change: a deferred cycle writes one completed
+# run instead of two, so after D consecutive deferrals the cycle that finally
+# remediates already sees D+1 completed runs re-flagging the finding.  Keeping
+# D + 1 below reconciliation.harness._INTEGRITY_FINDING_RECURRENCE_THRESHOLD
+# (= 4) — i.e. D <= 2 — keeps that counter meaning 'recurs DESPITE remediation'.
+#
+# Restated here rather than imported because config.schema must not import the
+# reconciliation harness (which imports this module).  The derivation is pinned
+# against the live harness constant by a runtime test in tests/test_harness.py,
+# and the harness independently clamps to the same ceiling at the point of use.
+MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING = 2
+
 
 class YamlSettingsSource(PydanticBaseSettingsSource):
     """Custom settings source for loading from YAML files."""
@@ -1663,7 +1679,8 @@ class ReconciliationConfig(BaseModel):
     opus_model: str = Field(default='opus')
     opus_threshold_ratio: float = Field(default=1.5)
     max_backlog_remediation_deferrals: int = Field(
-        default=5, ge=0,
+        default=MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING,
+        ge=0, le=MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING,
         description=(
             'Task 3049. Number of CONSECUTIVE full cycles for which the inline '
             'remediation pass may be deferred while the project is in backlog '
@@ -1677,7 +1694,9 @@ class ReconciliationConfig(BaseModel):
             'forward-fed into the next cycle. The cap bounds the debt — after '
             'this many consecutive deferrals the pass runs anyway, so a '
             'persistently-deep backlog cannot starve remediation. 0 disables '
-            'deferral entirely, restoring pre-task-3049 behaviour.'
+            'deferral entirely, restoring pre-task-3049 behaviour. Bounded '
+            'above by MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING so the streak '
+            'cannot outlast the integrity-finding recurrence threshold.'
         ),
     )
     sonnet_episode_limit: int = Field(default=125)
