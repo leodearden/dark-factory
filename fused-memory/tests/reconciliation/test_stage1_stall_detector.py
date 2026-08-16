@@ -1078,6 +1078,90 @@ class TestMaybeEscalateStalledGateBacklog:
         assert pending['B'].dedupe_count == 0
 
     @pytest.mark.asyncio
+    async def test_folds_into_legacy_fingerprintless_parent(self, tmp_path):
+        """MIGRATION: a pre-stamp parent (dedupe_fingerprint=None) is still a fold target.
+
+        Every gate-backlog record filed before the fingerprint stamp landed
+        carries ``dedupe_fingerprint: None`` — 78 such records measured on the
+        live queue (``data/reconciliation/escalations/``), 100% of the pending
+        backlog.  If those cannot be folded into, the FIRST cycle after this
+        change mints a second pending record per stalled gate at
+        ``dedupe_count 0``, and the legacy record — whose key stays falsy
+        forever — never becomes a fold target again.  That is the exact defect
+        this task exists to remove, so it is pinned here as a test rather than
+        left to an operator backfill someone has to remember to run.
+
+        The parent is hand-filed in the PRE-change shape actually observed on
+        disk: relative-age summary (pre-3520) and the ``age_hours:`` detail key
+        (pre-3520), so the recovery must not depend on anything but detail's
+        first line.
+        """
+        from escalation.models import Escalation
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        stamp = (_GATE_NOW - timedelta(hours=49)).isoformat()
+
+        # --- hand-file the legacy parent exactly as the pre-change code did ---
+        legacy = Escalation(
+            id=queue.make_id('645'),
+            task_id='645',
+            agent_role='reconciliation-stage1',
+            severity='blocking',
+            category='reconciliation_stale_gate_backlog',
+            summary='Gate task 645 has awaited a human decision for 48.7h',
+            detail='\n'.join([
+                'project_id: autopilot_video',
+                'run_id: run-legacy',
+                'task_id: 645',
+                f'gate_escalated_at: {stamp}',
+                'age_hours: 48.7',
+                'title: Gate task 645',
+            ]),
+            level=1,
+        )
+        assert legacy.dedupe_fingerprint is None, 'fixture must reproduce the legacy shape'
+        legacy_id = queue.submit(legacy)
+
+        task_by_id = {'645': _gate_task_record(645, hours_ago=49)}
+
+        async def _cycle(now, run_id):
+            return await maybe_escalate_stalled_gate_backlog(
+                escalation_queue=queue,
+                project_id='autopilot_video',
+                run_id=run_id,
+                stalled_task_ids=['645'],
+                task_by_id=task_by_id,
+                now=now,
+            )
+
+        assert await _cycle(_GATE_NOW, 'run-1') == [], (
+            'folding into the legacy parent is not a NEW filing, so '
+            "stage1_gate_backlog_escalated must stay 0"
+        )
+
+        pending = queue.get_pending()
+        assert len(pending) == 1, (
+            'the legacy parent must absorb the new filing, not sit beside it; '
+            f'got {len(pending)}: {[e.id for e in pending]}'
+        )
+        parent = pending[0]
+        assert parent.id == legacy_id, 'no new record may be minted for this gate'
+        assert parent.dedupe_count == 1, (
+            f'the legacy record must start counting recurrences; got {parent.dedupe_count}'
+        )
+        assert len(parent.dedupe_children) == 1
+        assert parent.dedupe_children[0] != legacy_id
+
+        # Steady state: the recompute is deterministic, so the unstamped parent
+        # keeps resolving through the fallback every cycle.
+        assert await _cycle(_GATE_NOW + timedelta(hours=100), 'run-2') == []
+        assert len(queue.get_pending()) == 1
+        reread = queue.get(legacy_id)
+        assert reread is not None
+        assert reread.dedupe_count == 2
+
+    @pytest.mark.asyncio
     async def test_empty_stalled_list_returns_empty(self):
         """(d) empty stalled_task_ids → no calls, returns []."""
         queue = self._make_queue()
