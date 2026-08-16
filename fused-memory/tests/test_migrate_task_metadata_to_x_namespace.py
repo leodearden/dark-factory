@@ -25,6 +25,7 @@ import importlib.util
 import json
 import sys
 import types
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -64,6 +65,7 @@ validate_migration_keys = _mod.validate_migration_keys
 UnsafeMigrationKeyError = _mod.UnsafeMigrationKeyError
 write_backup = _mod.write_backup
 default_backup_path = _mod.default_backup_path
+DEFAULT_BACKUP_DIR = _mod.DEFAULT_BACKUP_DIR
 _verify_read_back = _mod._verify_read_back
 
 
@@ -608,3 +610,181 @@ def test_cli_defaults_to_dry_run_and_requires_apply_to_write():
 
     applied_args = build_parser().parse_args(['--task-id', '3083', '--apply'])
     assert applied_args.apply is True
+
+
+# --- case 12: the per-run pre-write snapshot --------------------------------
+#
+# docs/task-authoring.md §8 points the future corpus-wide sweep at "a mechanical
+# per-task re-run" of this script with different `--keys`. With a FIXED default
+# backup path, run 1 writes the TRUE pre-migration row and run 2 writes the
+# already-partially-migrated row straight over it — silently destroying the one
+# durable copy of the original, which is the exact artifact `write_backup`'s
+# docstring says the whole SAFETY section exists to produce. These tests pin
+# that every run gets its own file, and that an occupied path is refused rather
+# than clobbered.
+
+
+def _deep_copy(value):
+    """Round-trip through JSON — the same isolation idiom `_run_verify` uses."""
+    return json.loads(json.dumps(value, default=str))
+
+
+_PENDING_TASK_ROW = {
+    **_BEFORE_TASK,
+    # A metadata-only write must not move `status`, and `_verify_read_back`'s
+    # check (e) asserts exactly that — so the fake serves a non-terminal status
+    # and the end-to-end runs below prove it is carried through untouched.
+    'status': 'pending',
+}
+
+
+class _FakeClient:
+    """A scripted stand-in for the sibling JSON-RPC client.
+
+    Serves `get_task` from ONE stored row and applies `update_task` by
+    REPLACING that row's metadata with `json.loads(args['metadata'])` — the
+    contract `build_update_payload` writes against (`metadata_mode='replace'`,
+    blob serialized with `json.dumps`). Because the row lives on the instance,
+    a second `main_async` run against the same fake observes the
+    already-partially-migrated row, which is what makes the per-task re-run
+    that docs/task-authoring.md §8 prescribes reproducible with no server.
+
+    Every call is recorded on `self.calls`, so a test can assert a write was
+    never even attempted. `get_task_script` overrides successive `get_task`
+    replies (`None` = serve the live row; a callable is handed a copy of the
+    live row and returns the payload) for the read-back-failure cases.
+    """
+
+    def __init__(self, url: str = 'http://fake.invalid', *, row: dict | None = None):
+        self.url = url
+        self.row = _deep_copy(row if row is not None else _PENDING_TASK_ROW)
+        self.calls: list[tuple[str, dict]] = []
+        self.get_task_script: list = []
+        self._get_task_calls = 0
+
+    @property
+    def tools_called(self) -> list[str]:
+        return [name for name, _ in self.calls]
+
+    async def __aenter__(self) -> _FakeClient:
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        return None
+
+    async def call_tool(self, name: str, arguments: dict) -> dict:
+        self.calls.append((name, _deep_copy(arguments)))
+        if name == 'get_task':
+            index = self._get_task_calls
+            self._get_task_calls += 1
+            override = (
+                self.get_task_script[index] if index < len(self.get_task_script) else None
+            )
+            if override is not None:
+                return override(_deep_copy(self.row)) if callable(override) else override
+            return _deep_copy(self.row)
+        if name == 'update_task':
+            self.row['metadata'] = json.loads(arguments['metadata'])
+            return {
+                'id': self.row['id'],
+                'message': f'Successfully updated task {self.row["id"]}',
+                'updated': ['metadata'],
+                'updated_task': _deep_copy(self.row),
+            }
+        raise AssertionError(f'unexpected tool call: {name!r}')
+
+
+def _fake_client_cls(client: _FakeClient) -> type:
+    """Wrap one fake in the CLASS shape `main_async` expects.
+
+    `main_async` resolves `client_cls = _load_sibling_client()` and then does
+    `async with client_cls(url) as client`, so the monkeypatch seam has to
+    yield a class, not an instance. Binding that class to a single shared
+    `_FakeClient` is what lets two consecutive `main_async` runs see ONE
+    evolving task row.
+    """
+
+    class _BoundFakeClient:
+        def __init__(self, url: str):
+            client.url = url
+
+        async def __aenter__(self) -> _FakeClient:
+            return await client.__aenter__()
+
+        async def __aexit__(self, *exc) -> None:
+            return await client.__aexit__(*exc)
+
+    return _BoundFakeClient
+
+
+def _install_fake_client(monkeypatch, client: _FakeClient) -> _FakeClient:
+    monkeypatch.setattr(_mod, '_load_sibling_client', lambda: _fake_client_cls(client))
+    return client
+
+
+def test_default_backup_path_is_stamped_per_run():
+    """Two runs against the SAME task must not land on the same artifact.
+
+    The task-scoped default of case 11 protects task 3083 from task 3141; it
+    does nothing about 3083's own second run, which is precisely the workflow
+    docs/task-authoring.md §8 prescribes.
+    """
+    at_0930 = default_backup_path('3083', now=datetime(2026, 8, 15, 9, 30, 0, tzinfo=UTC))
+    assert at_0930 == DEFAULT_BACKUP_DIR / 'task-3083-metadata-before-20260815T093000Z.json'
+
+    at_0935 = default_backup_path('3083', now=datetime(2026, 8, 15, 9, 35, 0, tzinfo=UTC))
+    assert at_0935 != at_0930
+    assert '3083' in at_0935.name
+    assert at_0935.suffix == '.json'
+
+    # The two invariants case 11 already pins survive the stamp.
+    assert default_backup_path('3083') != default_backup_path('3141')
+    assert '3083' in str(default_backup_path('3083'))
+
+
+@pytest.mark.asyncio
+async def test_documented_per_task_rerun_keeps_the_true_pre_migration_backup(
+    monkeypatch, tmp_path,
+):
+    """The end-to-end loss this task exists to close.
+
+    Two `--apply` runs against one task with different `--keys` — verbatim the
+    "mechanical per-task re-run" of docs/task-authoring.md §8 — and neither
+    passes `--backup-path`, so both resolve the default. Run 2 observes the
+    partially-migrated row (the fake persists the write), so if both runs
+    shared one path the only surviving snapshot would be the one that ALREADY
+    has `x_origin_escalation` in it — useless for recovering the original.
+
+    `DEFAULT_BACKUP_DIR` is monkeypatched to `tmp_path` so the assertion is
+    still about the DEFAULT path while the suite (which runs `-n auto`) writes
+    nothing into a shared /tmp; `_utcnow` is pinned to two instants so "two
+    runs, minutes apart" needs no sleep and the assertion stays exact.
+    """
+    _install_fake_client(monkeypatch, _FakeClient())
+    monkeypatch.setattr(_mod, 'DEFAULT_BACKUP_DIR', tmp_path)
+    stamps = iter([
+        datetime(2026, 8, 15, 9, 30, 0, tzinfo=UTC),
+        datetime(2026, 8, 15, 9, 35, 0, tzinfo=UTC),
+    ])
+    monkeypatch.setattr(_mod, '_utcnow', lambda: next(stamps))
+
+    first = build_parser().parse_args(
+        ['--task-id', '3083', '--keys', 'origin_escalation', '--apply'],
+    )
+    assert await _mod.main_async(first) == 0
+    second = build_parser().parse_args(
+        ['--task-id', '3083', '--keys', 'origin_reify_task', '--apply'],
+    )
+    assert await _mod.main_async(second) == 0
+
+    written = sorted(tmp_path.glob('*.json'))
+    assert len(written) == 2, f'each run must get its own snapshot; got {written}'
+
+    run_1 = json.loads(written[0].read_text())['metadata']
+    assert 'origin_escalation' in run_1, 'run 1 captured the TRUE pre-migration row'
+    assert 'x_origin_escalation' not in run_1
+    assert 'origin_reify_task' in run_1
+
+    run_2 = json.loads(written[1].read_text())['metadata']
+    assert 'x_origin_escalation' in run_2, 'run 2 captured the partially-migrated row'
+    assert 'origin_reify_task' in run_2
