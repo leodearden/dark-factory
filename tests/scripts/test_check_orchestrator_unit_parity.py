@@ -687,12 +687,17 @@ def _run_cli(
     repo_root: pathlib.Path,
     installed_dir: pathlib.Path,
     *units: str,
+    extra_args: tuple[str, ...] = (),
 ) -> subprocess.CompletedProcess:
     """Invoke the checker as a real subprocess against tmp_path trees.
 
     Uses sys.executable rather than a bare `python3`: commit 5178360711 fixed
     exactly that defect in the sibling scanner CLI tests, where a bare python3
     resolved to a different interpreter than the one running the suite.
+
+    ``extra_args`` appends flags after the two tree flags, which is how the
+    machine-readable-verdict tests run the SAME invocation with and without
+    ``--print-verdicts`` to prove the flag is a pure addition.
     """
     argv = [
         sys.executable,
@@ -702,6 +707,7 @@ def _run_cli(
     ]
     for unit in units:
         argv += ["--unit", unit]
+    argv += list(extra_args)
     return subprocess.run(argv, capture_output=True, text=True)
 
 
@@ -903,6 +909,182 @@ def test_cli_run_that_compared_nothing_never_reports_parity(
     )
 
     assert rc != 0, "A run that compared zero units must not report parity."
+
+
+# ---------------------------------------------------------------------------
+# Machine-readable per-unit verdicts  (--print-verdicts)
+# ---------------------------------------------------------------------------
+#
+# The human report above is written to be READ. setup-host.sh needs the same
+# findings PER UNIT so it can install the clean units and skip only the drifted
+# ones, and re-parsing the free-form report for that would be a second, brittle
+# parser of prose that exists to be prose. `--print-verdicts` is the machine
+# channel: one line per SELECTED unit, carrying the same [orchestrator_unit_parity]
+# tag the installer's "did the gate actually run" guard already keys on.
+#
+# It is OPT-IN and additive by construction: without the flag nothing changes,
+# and with it neither the exit codes nor the human report move. Both halves are
+# asserted below, because a "machine-readable mode" that perturbs the exit code
+# would silently re-point the installer's 0/2/other branch.
+
+# The tag prefix every line of this checker's output carries. Spelled literally
+# rather than derived from checker.LOG_TAG so a rename of the constant cannot
+# quietly re-point BOTH sides of the assertion at each other — setup-host.sh
+# greps for this exact string.
+_LOG_TAG_PREFIX = "[orchestrator_unit_parity] "
+
+_VERDICT_LINE_RE = re.compile(
+    r"^" + re.escape(_LOG_TAG_PREFIX) + r"verdict (?P<unit>\S+) (?P<kinds>\S+)$"
+)
+
+
+def _verdict_lookalikes(stdout: str) -> list[str]:
+    """Every line that is trying to be a verdict line, tagged or not.
+
+    Deliberately looser than _VERDICT_LINE_RE: an UNTAGGED verdict line must
+    fail loudly here rather than be invisible to the strict parser, where it
+    would surface as a confusing "no verdict emitted for <unit>".
+    """
+    return [line for line in stdout.splitlines() if " verdict " in line]
+
+
+def _parse_verdicts(stdout: str) -> dict[str, list[str]]:
+    """Parse the verdict lines into ``{unit: [kind, ...]}``.
+
+    Duplicates raise instead of merging. Two lines for one unit would let a
+    last-write-wins consumer and a first-write-wins one disagree about the same
+    run — and the consumer here is a bash associative array, which silently
+    takes the last. A checker that can emit a unit twice must fail a test, not
+    a host.
+    """
+    verdicts: dict[str, list[str]] = {}
+    for line in _verdict_lookalikes(stdout):
+        match = _VERDICT_LINE_RE.match(line)
+        assert match is not None, (
+            f"Verdict-shaped line does not match the documented format "
+            f"'{_LOG_TAG_PREFIX}verdict <unit> <kind>[,<kind>...]':\n  {line!r}\n"
+            "setup-host.sh refuses to believe any output that does not carry "
+            "the [orchestrator_unit_parity] tag, so an untagged or reshaped "
+            "verdict line reaches the installer as NO verdict at all."
+        )
+        unit = match.group("unit")
+        assert unit not in verdicts, (
+            f"{unit} got more than one verdict line in a single run:\n{stdout}"
+        )
+        verdicts[unit] = match.group("kinds").split(",")
+    return verdicts
+
+
+def test_print_verdicts_emits_exactly_one_clean_line_per_selected_unit(
+    tmp_path: pathlib.Path,
+):
+    """Byte-identical trees => one `verdict <unit> clean` line per selected unit.
+
+    Compared as a DICT against the selected set, not with `in` checks: a
+    missing line and a duplicated line are both defects the installer would
+    experience as "this unit has no verdict" / "this unit's verdict is whichever
+    line came last", and only an exact comparison catches either.
+    """
+    repo_root, installed_dir = _make_trees(tmp_path)
+    (repo_root / _SECOND_UNIT_RELPATH).write_text(_BASE_SERVICE, encoding="utf-8")
+    (installed_dir / _SECOND_UNIT).write_text(_BASE_SERVICE, encoding="utf-8")
+
+    result = _run_cli(
+        repo_root,
+        installed_dir,
+        _REAL_UNIT,
+        _SECOND_UNIT,
+        extra_args=("--print-verdicts",),
+    )
+
+    assert result.returncode == 0, (
+        f"Expected 0 for matching copies; got {result.returncode}. "
+        f"stdout: {result.stdout} stderr: {result.stderr}"
+    )
+    assert _parse_verdicts(result.stdout) == {
+        _REAL_UNIT: ["clean"],
+        _SECOND_UNIT: ["clean"],
+    }, result.stdout
+
+
+def test_verdict_lines_carry_the_parity_log_tag(tmp_path: pathlib.Path):
+    """Every verdict line is prefixed with [orchestrator_unit_parity].
+
+    Not cosmetic. setup-host.sh believes NO status from this checker unless
+    that tag appears in the output (the guard that stops a renamed script's
+    argparse exit 2 from reading as the benign "not installed on this host").
+    Emitting the machine channel through the same tagged writer extends that
+    guard to it for free: rename the flag, argparse exits 2, no tag and no
+    verdict lines appear, and every unit falls back to "unverified" — so the
+    installer copies nothing. An untagged prefix would have re-opened exactly
+    the silent-green hole the tag guard exists to close.
+    """
+    repo_root, installed_dir = _make_trees(tmp_path)
+
+    result = _run_cli(
+        repo_root, installed_dir, _REAL_UNIT, extra_args=("--print-verdicts",)
+    )
+
+    lines = _verdict_lookalikes(result.stdout)
+    assert lines, f"--print-verdicts emitted no verdict line at all:\n{result.stdout}"
+    for line in lines:
+        assert line.startswith(_LOG_TAG_PREFIX), (
+            f"Verdict line is not tagged: {line!r}. setup-host.sh greps for "
+            f"{_LOG_TAG_PREFIX!r} before believing anything this checker says."
+        )
+
+
+def test_no_verdict_lines_without_the_flag(tmp_path: pathlib.Path):
+    """The channel is OPT-IN: a default run's output is unchanged.
+
+    An operator reading the human report should not have to skim past nine
+    machine lines to find the finding, and — more importantly — the report is
+    the artifact whose wording other tests and the docstring pin. Additive
+    means additive.
+    """
+    repo_root, installed_dir = _make_trees(tmp_path)
+
+    result = _run_cli(repo_root, installed_dir, _REAL_UNIT)
+
+    assert _verdict_lookalikes(result.stdout) == [], (
+        "A run WITHOUT --print-verdicts printed verdict lines:\n" + result.stdout
+    )
+    assert "[ok] parity" in result.stdout, result.stdout
+    assert "1 unit(s)" in result.stdout, result.stdout
+
+
+def test_print_verdicts_never_changes_the_exit_code(tmp_path: pathlib.Path):
+    """The flag is observationally pure on every exit-code path.
+
+    setup-host.sh's gate branches on 0 / 2 / other, and this flag is added to
+    that very invocation. If turning it on moved any exit code, the gate would
+    silently re-classify a host — a fresh machine reading as drift, or drift
+    reading as benign. Each path is run twice, with and without, and compared.
+    """
+    # parity => 0, drift => 1, installed copy absent => 2.
+    cases = {
+        "parity": _make_trees(tmp_path / "parity"),
+        "drift": _make_trees(tmp_path / "drift", installed_text=_DRIFTED_TIMER),
+        "absent": _make_trees(tmp_path / "absent", installed_text=None),
+    }
+
+    observed: dict[str, int] = {}
+    for label, (repo_root, installed_dir) in cases.items():
+        plain = _run_cli(repo_root, installed_dir, _REAL_UNIT)
+        with_flag = _run_cli(
+            repo_root, installed_dir, _REAL_UNIT, extra_args=("--print-verdicts",)
+        )
+        assert plain.returncode == with_flag.returncode, (
+            f"--print-verdicts changed the {label} exit code: "
+            f"{plain.returncode} -> {with_flag.returncode}.\n"
+            f"plain stdout: {plain.stdout}\nflagged stdout: {with_flag.stdout}"
+        )
+        observed[label] = plain.returncode
+
+    # Guard the guard: three fixtures that all happened to return the same code
+    # would satisfy the equality above while exercising ONE path. Pin which
+    # code each case is supposed to produce.
+    assert observed == {"parity": 0, "drift": 1, "absent": 2}, observed
 
 
 # ---------------------------------------------------------------------------
