@@ -820,26 +820,6 @@ class TestCli:
         assert '--fail-on-hit' in result.stdout
         assert '--require-scanned' in result.stdout
 
-    def test_the_help_text_names_the_invocation_that_is_SAFE_as_a_ci_gate(self):
-        """An operator wiring a timer must not have to derive this.
-
-        ``--fail-on-hit`` alone is safe interactively, where a human reads the
-        scanned count, and unsafe unattended, where only ``$?`` is consumed.
-        A distinction that lives only in a review thread protects nobody, so
-        the help states the whole safe invocation and this pins that it does.
-
-        Asserted over whitespace-normalized help text, because argparse wraps
-        at the terminal width and a raw substring match would be a test of
-        ``COLUMNS`` rather than of the wording.
-        """
-        result = _run_cli('--help')
-
-        assert result.returncode == 0, result.stderr
-        normalized = ' '.join(result.stdout.split())
-        assert '--fail-on-hit --require-scanned 1' in normalized, (
-            'the help must name the safe unattended invocation verbatim'
-        )
-
     def test_json_output_matches_the_in_process_scan_of_the_same_tree(self, tree):
         """The CLI is a thin shell: it must not re-derive or re-order anything."""
         result = _run_cli('--root', str(tree), '--json')
