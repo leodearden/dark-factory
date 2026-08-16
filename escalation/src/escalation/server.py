@@ -1521,10 +1521,11 @@ def create_server(
 
           ``pollable`` is the boolean shorthand ``poll_by != 'branch'`` — i.e.
           "this response carries a handle naming the in-flight merge".  Both
-          caller-side docs (skills/unblock/SKILL.md step 7, skills/merge-queue/
-          SKILL.md §5) consume this disclosure — picking the poll handle and
-          gating ``merge_cancel`` off ``poll_by``/``pollable`` rather than
-          assuming submit-then-poll-by-request_id and an unconditional
+          caller-side docs (skills/unblock/SKILL.md step 7;
+          skills/merge-queue/SKILL.md "Poll for completion" + §5) consume
+          this disclosure — picking the poll handle and gating
+          ``merge_cancel`` off ``poll_by``/``pollable`` rather than assuming
+          submit-then-poll-by-request_id and an unconditional
           ``merge_cancel`` on the attached request_id.
         - Duplicate-in-verify reject (C3/D3): ``{error, code='duplicate_in_verify',
           existing_mr, existing_sha, verify_age_secs, hint='merge_cancel then
