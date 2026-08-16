@@ -63,6 +63,10 @@ from datetime import UTC, datetime
 from typing import Any
 
 from fused_memory.models.scope import Scope
+from fused_memory.utils.store_mutation_preflight import (
+    StoreMutationUnavailable,
+    assert_store_mutation_allowed,
+)
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -285,6 +289,46 @@ async def run(
         getattr(args, 'flag_uuids', None) or STALE_FLAG_EDGE_UUIDS
     )
     host_project: str = getattr(args, 'flag_host_project', None) or FLAG_HOST_PROJECT
+
+    # Fail-CLOSED capability preflight, one probe per run, BEFORE both scans.
+    #
+    # Why run-wide rather than per-record: purge_mem0_namespace fans its
+    # deletes out through ``asyncio.gather(..., return_exceptions=True)`` and
+    # funnels every failure into a ``logger.warning``, so a write-denied
+    # environment does not abort -- it yields N warnings and N already-
+    # destroyed Qdrant points, because mem0's ``_delete_memory`` removes the
+    # point BEFORE writing its SQLite history. A per-record probe would detect
+    # a run-wide condition one destroyed record too late. Worse still,
+    # purge_graphiti_namespace's ``MATCH (n) DETACH DELETE n`` is UNBOUNDED by
+    # --limit and is the FIRST mutation in program order, so it is the largest
+    # blast radius in the whole set and nothing downstream can bound it.
+    #
+    # Why before the scans, accepting that a refused --apply emits NO manifest:
+    # this module's docstring calls the dry-run manifest "the only recovery
+    # record of what is about to be deleted", which makes refusing this early
+    # look costly. It is not. The operator's remedy is to re-run WITHOUT
+    # --apply, which needs no write capability and emits the full manifest.
+    # Scanning first would buy a manifest already obtainable for free, at the
+    # price of two full-namespace scans (a FalkorDB ro_query plus a mem0
+    # count+get_all, --limit 1000 each) in an environment that was never going
+    # to be permitted to purge. Same tradeoff the reference accepted
+    # (sweep_toolcall_xml_leak.py: "Nothing was scanned and nothing was
+    # mutated").
+    if args.apply:
+        try:
+            assert_store_mutation_allowed(operation='purge_knowlive_namespace --apply')
+        except StoreMutationUnavailable:
+            logger.error(
+                'purge_knowlive_namespace: --apply NOT started (fail-closed) -- this '
+                "process cannot write mem0's history directory, so a purge would "
+                'delete Qdrant points and then fail to write their history, and the '
+                'unbounded Graphiti DETACH DELETE cannot be undone at all. Nothing '
+                'was scanned and nothing was mutated. Route the purge through the '
+                'fused-memory MCP server (the unsandboxed owner of the store), or '
+                're-run from an unsandboxed operator shell. To obtain the deletion '
+                'manifest safely from anywhere, re-run without --apply.'
+            )
+            raise
 
     graphiti_rows = await enumerate_graphiti_namespace(
         memory_service.graphiti, namespace, limit=limit,
