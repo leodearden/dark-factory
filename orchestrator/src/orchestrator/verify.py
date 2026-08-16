@@ -683,9 +683,20 @@ def _is_bare_xdist_worker_crash(output: str) -> bool:
     flake, AND no such ERROR/INTERNALERROR surface is present, are the
     accompanying ``^E   `` traceback lines and ``=== N failed ===`` summary
     treated as attributable to those flakes and this returns ``True``. When
-    there are NO ``FAILED`` lines at all, this falls back to the original
-    strict guard: any ``^E   ``/failure-summary marker suppresses
+    there are NO ``FAILED`` lines at all, the fallback vetoes on the SAME
+    set of surfaces as the branch above — an ``^E   `` traceback line, a
+    failure summary, an ``INTERNALERROR>`` line, or either ``ERROR``
+    short-summary form (node-id or bare-file) — any one of which suppresses
     reclassification.
+
+    That last sentence used to name only the first two (task 4066): the two
+    branches had drifted apart, since tasks 3514/3597 added the
+    INTERNALERROR/ERROR veto to the FAILED-lines branch alone. verify-log
+    2829 is the real captured run that billed for the drift — 8 genuine
+    failures, 47 ``^INTERNALERROR>`` lines, and (because the INTERNALERROR
+    aborted the session before pytest could print its short-summary and
+    decorated stats lines) zero ``^FAILED `` lines and zero ``^E   ``
+    lines, which the old fallback reclassified as transient infra.
 
     Accepted fail-safe tradeoff: a genuine regression IN an allow-listed
     known-flake test, co-occurring with a crash, is discounted here and
@@ -722,9 +733,16 @@ def _is_bare_xdist_worker_crash(output: str) -> bool:
             if match is None or not _is_known_load_flake_nodeid(match.group(1)):
                 return False
         return True
+    # Same three surfaces the FAILED-lines branch vetoes on above. They
+    # produce no FAILED line of their own — which is precisely why they land
+    # in THIS branch, so omitting them here (as this fallback did until task
+    # 4066) leaves the very outputs the veto exists for unguarded.
     return not (
         _PYTEST_TRACEBACK_E_RE.search(output)
         or _PYTEST_FAILURE_SUMMARY_RE.search(output)
+        or _PYTEST_INTERNALERROR_RE.search(output)
+        or _ERROR_LINE_NODEID_RE.search(output)
+        or _ERROR_LINE_FILE_RE.search(output)
     )
 
 
