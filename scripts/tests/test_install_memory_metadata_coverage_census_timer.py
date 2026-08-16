@@ -221,8 +221,59 @@ def test_install_is_idempotent(tmp_path):
 # ── the committed unit files ────────────────────────────────────────────────
 
 
-def _unit(name):
-    return (TEMPLATES_DIR / name).read_text()
+def _directives(name) -> dict[str, list[tuple[str, str]]]:
+    """Parse a systemd unit into `{section: [(key, value), ...]}`.
+
+    WHY THIS EXISTS. A raw-substring check on a unit's text cannot tell a live
+    DIRECTIVE from the COMMENT that explains it -- and these units comment
+    heavily by design. Every literal these tests care about also appears in
+    prose: `Persistent=true` at memory-metadata-coverage-census.timer:20,
+    `census_memory_metadata.py` at memory-metadata-coverage-census.service:7.
+    Deleting the real directive left the substring assertions GREEN, which is
+    the class of finding this closes. Every unit assertion in this file routes
+    through here; no new raw-substring pins.
+
+    WHY IT IS HAND-ROLLED. Duplicate keys are preserved as separate pairs, never
+    collapsed -- the service legitimately carries THREE `Documentation=` lines,
+    which `configparser` would collapse or reject even with `strict=False`.
+
+    WHY NOT `systemd-analyze verify`. It IS available here (systemd 255) and was
+    deliberately not used: it cannot assert that a specific directive is SET,
+    and it would make this suite depend on systemd being installed in every
+    container/CI runner.
+
+    Accepts a unit filename (resolved under TEMPLATES_DIR) or a Path, so sibling
+    `*.timer` units can be parsed for the collision check.
+    """
+    path = name if isinstance(name, Path) else TEMPLATES_DIR / name
+    sections: dict[str, list[tuple[str, str]]] = {}
+    current = ''
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        # FULL-LINE comments only: systemd treats `#`/`;` as a comment lead-in at
+        # the start of a line, and a directive's value may legitimately contain
+        # either character (a Documentation= URL fragment, for instance).
+        if not line or line[0] in '#;':
+            continue
+        if line.startswith('[') and line.endswith(']'):
+            current = line[1:-1].strip()
+            sections.setdefault(current, [])
+            continue
+        if '=' not in line:
+            continue
+        key, value = line.split('=', 1)
+        sections.setdefault(current, []).append((key.strip(), value.strip()))
+    return sections
+
+
+def _values(directives, section, key) -> list[str]:
+    """Every value declared for `key` under `[section]`, in file order.
+
+    A list, not a scalar: asserting `== ['x']` pins both the value AND that it
+    is declared exactly once, so a second stray `OnCalendar=` (which systemd
+    reads as an ADDITIONAL firing) cannot slip in unnoticed.
+    """
+    return [v for k, v in directives.get(section, []) if k == key]
 
 
 def test_timer_fires_at_the_next_free_nightly_slot():
@@ -232,36 +283,43 @@ def test_timer_fires_at_the_next_free_nightly_slot():
     stagger is deliberate: these jobs all touch the same machine and, in
     several cases, the same backing stores -- this one scrolls every point in
     both live Qdrant collections."""
-    assert 'OnCalendar=*-*-* 05:00:00' in _unit(TIMER_NAME)
+    assert _values(_directives(TIMER_NAME), 'Timer', 'OnCalendar') == [
+        '*-*-* 05:00:00']
 
 
 def test_timer_does_not_collide_with_an_occupied_slot():
     """Guards the ladder itself, not just this unit's own literal: a future
     edit that re-cadences this job onto a taken slot fails here rather than
-    silently double-booking a third job."""
-    ours = _unit(TIMER_NAME)
-    our_slots = {ln.strip() for ln in ours.splitlines()
-                 if ln.startswith('OnCalendar=')}
-    assert our_slots, 'the timer declares no OnCalendar at all'
+    silently double-booking a third job.
+
+    Parsed on BOTH sides, so a commented-out slot in a sibling unit can neither
+    manufacture a phantom collision nor mask a real one.
+    """
+    ours = set(_values(_directives(TIMER_NAME), 'Timer', 'OnCalendar'))
+    assert ours, 'the timer declares no OnCalendar at all'
     for other in sorted(TEMPLATES_DIR.glob('*.timer')):
         if other.name == TIMER_NAME:
             continue
-        for line in other.read_text().splitlines():
-            line = line.strip()
-            if line.startswith('OnCalendar=') and line in our_slots:
-                raise AssertionError(
-                    f'{TIMER_NAME} shares {line!r} with {other.name} — pick a '
-                    f'free slot and update the OPERATIONS.md §12 ladder table')
+        clash = ours & set(_values(_directives(other), 'Timer', 'OnCalendar'))
+        if clash:
+            raise AssertionError(
+                f'{TIMER_NAME} shares {sorted(clash)!r} with {other.name} — '
+                f'pick a free slot and update the OPERATIONS.md §12 ladder '
+                f'table')
 
 
 def test_timer_catches_up_a_missed_night_and_avoids_a_thundering_herd():
-    text = _unit(TIMER_NAME)
-    assert 'Persistent=true' in text
-    assert 'RandomizedDelaySec=300' in text
+    """A silently skipped night is a hole in the series that no later run can
+    reconstruct -- this timer's output is a TREND. `Persistent=true` is what
+    makes a night missed to a sleeping laptop get caught up on next login."""
+    timer = _directives(TIMER_NAME)
+    assert _values(timer, 'Timer', 'Persistent') == ['true']
+    assert _values(timer, 'Timer', 'RandomizedDelaySec') == ['300']
 
 
 def test_timer_is_installed_into_timers_target():
-    assert 'WantedBy=timers.target' in _unit(TIMER_NAME)
+    assert _values(_directives(TIMER_NAME), 'Install', 'WantedBy') == [
+        'timers.target']
 
 
 def test_service_is_a_thin_oneshot_around_the_committed_wrapper():
@@ -271,19 +329,19 @@ def test_service_is_a_thin_oneshot_around_the_committed_wrapper():
     of the committed one, so the unit must name /home/leo/src/dark-factory even
     when these tests run from a worktree under .worktrees/.
     """
-    text = _unit(SERVICE_NAME)
-    assert 'Type=oneshot' in text
-    assert (f'ExecStart={PRODUCTION_ROOT}/scripts/'
-            f'memory-metadata-coverage-census.sh') in text
-    assert f'WorkingDirectory={PRODUCTION_ROOT}' in text
+    service = _directives(SERVICE_NAME)
+    assert _values(service, 'Service', 'Type') == ['oneshot']
+    assert _values(service, 'Service', 'ExecStart') == [
+        f'{PRODUCTION_ROOT}/scripts/memory-metadata-coverage-census.sh']
+    assert _values(service, 'Service', 'WorkingDirectory') == [PRODUCTION_ROOT]
 
 
 def test_service_sends_both_streams_to_the_journal():
     """The report is written to files, but the run's narration -- and any
     shortfall the census exits 1 on -- is only ever readable in the journal."""
-    text = _unit(SERVICE_NAME)
-    assert 'StandardOutput=journal' in text
-    assert 'StandardError=journal' in text
+    service = _directives(SERVICE_NAME)
+    assert _values(service, 'Service', 'StandardOutput') == ['journal']
+    assert _values(service, 'Service', 'StandardError') == ['journal']
 
 
 def test_service_execstart_points_at_a_real_executable_wrapper():
@@ -294,9 +352,7 @@ def test_service_execstart_points_at_a_real_executable_wrapper():
     too -- what it pins is that the unit does not name a wrapper that was
     renamed or never committed.
     """
-    text = _unit(SERVICE_NAME)
-    exec_line = next(ln for ln in text.splitlines() if ln.startswith('ExecStart='))
-    named = exec_line.split('=', 1)[1]
+    named, = _values(_directives(SERVICE_NAME), 'Service', 'ExecStart')
     assert named.startswith(f'{PRODUCTION_ROOT}/scripts/'), named
     here = TEMPLATES_DIR / named.split('/scripts/', 1)[1]
     assert here.is_file(), here
@@ -305,10 +361,18 @@ def test_service_execstart_points_at_a_real_executable_wrapper():
 
 def test_service_documents_where_the_normative_contract_lives():
     """The census script and the PRD are normative; the unit points a reader at
-    them rather than restating any figure that would drift."""
-    text = _unit(SERVICE_NAME)
-    assert 'Documentation=' in text
-    assert 'census_memory_metadata.py' in text
+    them rather than restating any figure that would drift.
+
+    Asserted as parsed `[Unit] Documentation=` VALUES: the bare filename also
+    appears in the unit's own comment at :7, so deleting the real directive left
+    a substring check green. Both entries are checked, which additionally
+    exercises the parser's duplicate-key preservation -- a dict-collapse would
+    keep only the last of the three.
+    """
+    docs = _values(_directives(SERVICE_NAME), 'Unit', 'Documentation')
+    assert docs, 'the unit points a reader at nothing'
+    assert any(d.endswith('/census_memory_metadata.py') for d in docs), docs
+    assert any(d.endswith('/memory-metadata-vocabulary.md') for d in docs), docs
 
 
 def test_no_cadence_knob_was_added_to_the_orchestrator_config():
