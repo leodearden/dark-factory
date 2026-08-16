@@ -712,6 +712,11 @@ def _cmd_apply(args: argparse.Namespace) -> int:
     value stays 0 so a batch that did land its other work is not
     misreported after a successful `dump()`. Only a codebook that fails
     `validate()` after the merge returns 1, leaving the file untouched.
+
+    `candidate_disposition_conflicts` counts a DIFFERENT thing and is not a
+    fourth failure mode: not a skipped record, but a successfully-merged
+    recurrence sighting appended to an already-adjudicated candidate, whose
+    disposition is left to the census.
     """
     codebook = load(args.codebook)
     if not isinstance(codebook, dict):
@@ -725,6 +730,7 @@ def _cmd_apply(args: argparse.Namespace) -> int:
         "matched": 0,
         "skipped_unknown_entry": 0,
         "candidates_applied": 0,
+        "candidate_disposition_conflicts": 0,
         "record_invalid": 0,
         "malformed_json": 0,
         "deletion_directive": 0,
@@ -768,6 +774,9 @@ def _cmd_apply(args: argparse.Namespace) -> int:
             totals["matched"] += stats["matched"]
             totals["skipped_unknown_entry"] += stats["skipped_unknown_entry"]
             totals["candidates_applied"] += stats["candidates_applied"]
+            totals["candidate_disposition_conflicts"] += stats[
+                "candidate_disposition_conflicts"
+            ]
             totals["record_invalid"] += int(stats["record_invalid"])
 
     errors = validate(codebook)
@@ -779,6 +788,7 @@ def _cmd_apply(args: argparse.Namespace) -> int:
     dump(codebook, args.codebook)
     print(
         "applied: matched={matched} candidates_applied={candidates_applied} "
+        "candidate_disposition_conflicts={candidate_disposition_conflicts} "
         "skipped_unknown_entry={skipped_unknown_entry} "
         "record_invalid={record_invalid} malformed_json={malformed_json} "
         "deletion_directive={deletion_directive}".format(**totals)
