@@ -377,11 +377,19 @@ else
     cp "$REPO_ROOT/scripts/$_unit" "$UNIT_DIR/"
   done
 
+  # ONCE, between the copies and the enables: systemd must not be asked to
+  # enable a unit it has not re-read, and re-running it per unit would only
+  # repeat work the first call already did.
   systemctl --user daemon-reload
 
-  # The enable obligation is DERIVED from each unit's own [Install] section,
-  # not from a hand-listed exception for the static watchdog service. Two
-  # reasons, both load-bearing:
+  # Enable exactly what was INSTALLED — _orch_install_units, never _orch_units.
+  # A unit whose install the gate declined must not be enabled either: enabling
+  # it acts on the very state the skip refused to act on (and on a first run it
+  # would enable a unit that is not on disk at all).
+  #
+  # Within that set the obligation is DERIVED from each unit's own [Install]
+  # section, not from a hand-listed exception for the static watchdog service.
+  # Two reasons, both load-bearing:
   #   - `systemctl enable` on a unit with no [Install] is an ERROR, not a
   #     no-op, so under `set -e` a hand-list that fell out of step with the
   #     units would abort the installer outright.
@@ -390,13 +398,16 @@ else
   #     the array above exists to close.
   # This is the same rule tests/scripts/test_orchestrator_service_files.py's
   # _unit_has_install_section predicate expresses in Python.
-  for _unit in "${_orch_units[@]}"; do
+  for _unit in "${_orch_install_units[@]}"; do
     if grep -q '^\[Install\]' "$REPO_ROOT/scripts/$_unit"; then
       systemctl --user enable "$_unit"
     fi
   done
 
-  ok "orchestrator units + watchdog installed and enabled"
+  # Reports what was ACTUALLY done, not what was attempted: with a per-unit
+  # gate a partial install is now a normal outcome, and an unqualified success
+  # line would read as "all nine" on a run that installed one.
+  ok "orchestrator units + watchdog installed and enabled (${#_orch_install_units[@]}/${#_orch_units[@]})"
 fi
 
 # ---------------------------------------------------------------------------
