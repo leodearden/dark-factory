@@ -509,6 +509,16 @@ def test_cancel_handler_call_site_warning_is_unaffected(client, caplog):
 
     log_failures=False keeps reporting solely at the call site; the single-prefix
     fix must not add a second mcp_fanout report or alter the call-site text.
+
+    Both assertions filter to *cancel_ticket* records rather than counting the
+    whole caplog stream: the client fixture runs the full app lifespan, whose
+    _metrics_loop fans out list_tickets/get_status/get_queue_stats/
+    get_curator_state/fetch_statuses against the same unreachable URL in the
+    background, each emitting its own dashboard.data.mcp_fanout WARNING (and a
+    'dashboard.app' one on the outer except).  Whether those land before this
+    request returns is a timing accident, so an unfiltered count would be
+    flaky on a loaded box — the same reason test_invalid_ticket_id_returns_400
+    filters handler calls from background ones.
     """
     exc_msg = 'connection refused: port 8002'
     with (
@@ -524,7 +534,9 @@ def test_cancel_handler_call_site_warning_is_unaffected(client, caplog):
 
     app_warnings = [
         r.getMessage() for r in caplog.records
-        if r.levelno == logging.WARNING and r.name == 'dashboard.app'
+        if r.levelno == logging.WARNING
+        and r.name == 'dashboard.app'
+        and r.getMessage().startswith('cancel_ticket failed for')
     ]
     assert len(app_warnings) == 1, (
         f'exactly one report per failing URL, from the call site, got {app_warnings}'
@@ -534,5 +546,6 @@ def test_cancel_handler_call_site_warning_is_unaffected(client, caplog):
         f'got {app_warnings[0]!r}'
     )
     assert not [
-        r for r in caplog.records if r.name == 'dashboard.data.mcp_fanout'
+        r for r in caplog.records
+        if r.name == 'dashboard.data.mcp_fanout' and 'cancel_ticket' in r.getMessage()
     ], 'log_failures=False must still leave reporting entirely to the caller'
