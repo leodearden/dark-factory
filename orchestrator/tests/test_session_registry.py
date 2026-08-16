@@ -5240,6 +5240,26 @@ _BARE_SHELL_ENTRYPOINTS: tuple[_BareShellEntrypoint, ...] = (
             'packages (task 3223 step-31).'
         ),
     ),
+    _BareShellEntrypoint(
+        name='session_registry.py (tier-1: bare shell, NO PYTHONPATH)',
+        path=_SR_PKG_ROOT / 'orchestrator' / 'session_registry.py',
+        # THE POINT OF THIS ROW: running a script by absolute path puts only
+        # the script's OWN directory on sys.path. Nothing else is reachable —
+        # not `shared`, not `orchestrator.<sibling>`. That is a STRICTLY
+        # stronger contract than the tier-2 row above, which the PYTHONPATH
+        # entry makes able to reach every intra-orchestrator sibling.
+        pythonpath=(),
+        shape=_EntrypointShape.SCRIPT,
+        argv=('--help',),
+        probe='from orchestrator import stop_instruction',
+        callers=(
+            'skills/spawn/spawn-claude.sh lines 145 (launching), 428 (exit), 596 '
+            'and 693 (refresh), 871 (set-display) — `python3 "$SESSION_REGISTRY_PY"` '
+            'with no venv, no install and no PYTHONPATH. FOUR OF THE FIVE end in '
+            '`|| true`, so a break here is SILENT: the subprocess simply never '
+            'writes record.json and the session goes missing from the fleet.'
+        ),
+    ),
 )
 
 #: Mutation matrix: ``(entrypoint filename, import injected at module scope)``.
