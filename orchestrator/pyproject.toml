@@ -92,6 +92,55 @@ filterwarnings = [
     # Sync def collected inside an @pytest.mark.asyncio class: mark mismatch.
     # Pins: pytest_asyncio/plugin.py (message emitted at the collection phase).
     "error:The test .* is marked with '@pytest.mark.asyncio' but it is not an async function:pytest.PytestWarning",
+    # A test's background thread died with an unhandled exception.
+    #
+    # GUARDS: the task-2413 autouse aiosqlite reaper
+    # (tests/conftest.py::_reap_leaked_aiosqlite_connections) and its
+    # task-2780 siblings (_reap_leaked_merge_workers,
+    # _reap_leaked_claimant_heartbeats). A leaked aiosqlite Connection runs a
+    # background worker thread; once its per-test event loop closes, the
+    # thread's next `future.get_loop().call_soon_threadsafe(...)` raises
+    # RuntimeError: Event loop is closed, and pytest's threadexception plugin
+    # attributes it to whatever UNRELATED test is running when the thread
+    # fires (under -n auto on an oversubscribed host, reliably an innocent one).
+    #
+    # WHY AN ERROR, NOT A WARNING: reap_leaked_aiosqlite_connections()'s
+    # MAINTENANCE NOTE documents that the helper degrades to a silent no-op
+    # (returns 0) if aiosqlite renames `_running` / `_thread` /
+    # `core._connection_worker_thread`. In that degraded state the leak still
+    # happens — but as a warning nobody reads, so the suite stays green and
+    # the regression is invisible. This entry is what makes the degradation
+    # loud. Task 4075.
+    #
+    # ANCHOR: category only, empty message field — deliberately unlike the two
+    # coroutine entries above, which anchor on a message verb. The
+    # thread-exception message is a formatted traceback
+    # ("Exception in thread <name>" + traceback.format_exception(...) + a
+    # tracemalloc hint), so the only stable prefix is the thread name — useless
+    # as a discriminator and brittle across versions. This is also the exact
+    # spelling already shipped at shared/tests/test_async_sqlite_base.py:596,
+    # keeping the repo's only two promotions of this category identical.
+    #
+    # MECHANISM (pytest 9.0.3 — revisit on a pytest major upgrade):
+    # _pytest/threadexception.py::collect_thread_exception emits via
+    # warnings.warn(...) inside a `try/except
+    # PytestUnhandledThreadExceptionWarning` and re-raises out of the trylast
+    # pytest_runtest_setup/call/teardown hooks, so an ini filter alone is
+    # sufficient — no -W flag and no plugin change needed.
+    #
+    # MEASURED: full orchestrator suite green with this promotion active —
+    # 16223 passed, 1 skipped, 2 xfailed in 872.57s under
+    # `-n auto --dist loadgroup --max-worker-restart=0 -m 'not warm_lane_bash'`.
+    # No pre-existing thread exceptions from any other source.
+    #
+    # NOT MIRRORED into the repo-root pyproject.toml (deliberate): that file's
+    # mirroring rule at its lines 50-56 is about MARKER deselection, whose
+    # failure mode is that deselected tests silently RUN. Mirroring here would
+    # instead impose an unmeasured promotion on shared/, fused-memory/,
+    # dashboard/ and sampler/. Consequence: a root-bound run does not promote,
+    # and the three guards in tests/test_aiosqlite_leak_isolation.py skip there
+    # by design (naming the governing inifile) rather than false-failing.
+    "error::pytest.PytestUnhandledThreadExceptionWarning",
 ]
 # Default per-test timeout — see shared/pyproject.toml for the full rationale
 # (UsageGate mock hang, make_gate_mock, asyncio-sleep footguns).
