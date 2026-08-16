@@ -996,7 +996,25 @@ class ArmRow(BaseModel):
     verdict: Verdict
     reason: Reason
     detail: str
+    #: The MEASURED probe: engine-warm and prefix-COLD, which is the state a
+    #: production request arrives in.  It CHANGED MEANING in schema v5 -- up to
+    #: v4 this was the first request after the arm reached ready, i.e. the cold
+    #: number now carried in `first_probe_ms`.
     latency_ms: float
+    #: The DISCARDED engine-cold warm-up run, kept rather than thrown away
+    #: because discarding the number would hide the very penalty this
+    #: instrument exists to expose: measured qwen3.5-9b 4249.7 ms cold against
+    #: 359.1 / 345.7 ms warm (~12x), moe-stretch 4822.9 cold against 2264-2872
+    #: warm.
+    #:
+    #: Cold is NOT reliably greater than warm and no check asserts it is:
+    #: qwen3.5-9b at `reasoning: on` measured 43.5 s cold against 41.0 s warm,
+    #: a generation-dominated arm where the gap is inside the noise.
+    #:
+    #: The DEFAULT is load-bearing, not incidental -- it is what lets a report
+    #: written by an older producer still validate through this model, the same
+    #: role `top_level_entities_named`'s default plays.
+    first_probe_ms: float = 0.0
     #: When THIS row was measured.  The merged artifact spans one run per arm,
     #: so a single top-level `measured_at` cannot say when any given arm was up.
     measured_at: str
@@ -1213,7 +1231,7 @@ def run_healthcheck(
         # still refuses fast at `_identity_gate`, so the doubled ceiling is paid
         # only by a pathologically slow one -- which is cheaper than a latency
         # column that lies about every healthy arm.
-        probe_one(arm, warmup=True)
+        warmup = probe_one(arm, warmup=True)
         result = probe_one(arm)
         rows.append(
             ArmRow(
@@ -1226,6 +1244,9 @@ def run_healthcheck(
                 reason=result.reason,
                 detail=result.detail,
                 latency_ms=result.latency_ms,
+                # The warm-up's LATENCY is kept even though its verdict is not:
+                # the number is the whole point of firing it in the open.
+                first_probe_ms=warmup.latency_ms,
                 measured_at=measured_at,
                 arm_footprint_mib=budget.arm_footprint_mib,
                 reasoning=arm.reasoning,
