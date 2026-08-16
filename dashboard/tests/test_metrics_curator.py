@@ -2247,3 +2247,121 @@ async def test_fan_out_list_tickets_default_budget_is_the_sampler_timeout(
             await fan_out_list_tickets(http_client, cfg)
 
     assert mock_mcp.call_args.kwargs.get('timeout') == _HTTP_SAMPLER_TIMEOUT_SECONDS
+
+
+# ---------------------------------------------------------------------------
+# Task 4133: per-project-root fan-out streak isolation + single type prefix
+# ---------------------------------------------------------------------------
+
+
+def _two_root_curator_cfg(tmp_path: Path) -> tuple[DashboardConfig, str, str]:
+    """One shared fused-memory URL, two project roots (A broken, B healthy)."""
+    root_a = tmp_path / 'proj-a'
+    root_b = tmp_path / 'proj-b'
+    root_a.mkdir()
+    root_b.mkdir()
+    cfg = DashboardConfig(
+        project_root=root_a,
+        fused_memory_urls=['http://localhost:18765'],
+        known_project_roots=[root_b],
+    )
+    return cfg, str(root_a), str(root_b)
+
+
+def _fail_root_a(root_a: str):
+    """mcp_tool_call side effect: ConnectError for root A, valid result for B."""
+    async def _call(client, url, tool, args, **kwargs):
+        if args.get('project_root') == root_a:
+            raise httpx.ConnectError('refused')
+        return {'count': 0, 'tickets': [], 'project_id': 'proj_b'}
+    return _call
+
+
+@pytest.mark.asyncio
+async def test_fan_out_list_tickets_broken_root_warns_once_across_cycles(
+    tmp_path: Path, caplog
+):
+    """A broken project_root must not re-arm its WARNING every sampler cycle.
+
+    The mcp_fanout throttle key is ``(log_label, url)`` and one fused-memory
+    URL serves every root, so the fixed literal 'list_tickets' label collapsed
+    both roots onto one key. ``note_fanout_success`` pops that key, so root B's
+    success cleared root A's streak and A's next failure was ``streak == 1``
+    again — an opening plus a 'recovered' WARNING every cycle, indefinitely.
+
+    Note: ``fan_out_list_tickets`` fans the roots out via ``asyncio.gather``,
+    so within a single call the two roots race. The assertion is therefore on
+    the WARNING total across cycles, not on ordering.
+    """
+    from dashboard.data.memory import reset_sessions
+    from dashboard.data.metrics import fan_out_list_tickets
+
+    cfg, root_a, _root_b = _two_root_curator_cfg(tmp_path)
+    mock_mcp = AsyncMock(side_effect=_fail_root_a(root_a))
+    transport = httpx.MockTransport(lambda req: httpx.Response(200, json={}))
+
+    reset_sessions()
+    with (
+        caplog.at_level(logging.DEBUG, logger='dashboard.data.mcp_fanout'),
+        patch('dashboard.data.metrics.mcp_tool_call', mock_mcp),
+    ):
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            for _ in range(3):
+                await fan_out_list_tickets(http_client, cfg)
+
+    warnings = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING and r.name == 'dashboard.data.mcp_fanout'
+    ]
+    assert len(warnings) == 1, (
+        f'a broken root must warn once, not once per sampler cycle, got {warnings}'
+    )
+    assert not [m for m in warnings if 'recovered' in m], (
+        f"root B's success must not close root A's streak, got {warnings}"
+    )
+    assert 'proj-a' in warnings[0], (
+        f'the WARNING must name the failing project_root, got {warnings[0]}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_fan_out_list_tickets_warning_names_the_cause_once(tmp_path: Path, caplog):
+    """The operator WARNING must not carry a doubled exception-type prefix.
+
+    metrics pre-renders the real cause with ``describe_exc`` and re-raises to
+    signal fall-through; ``first_success`` then renders THAT through
+    ``describe_exc`` again, so a bare ``ValueError`` re-raise reached the
+    operator as 'ValueError: ConnectError: refused (project_root=...)'.
+    """
+    from dashboard.data.memory import reset_sessions
+    from dashboard.data.metrics import fan_out_list_tickets
+
+    cfg, root_a, _root_b = _two_root_curator_cfg(tmp_path)
+    mock_mcp = AsyncMock(side_effect=_fail_root_a(root_a))
+    transport = httpx.MockTransport(lambda req: httpx.Response(200, json={}))
+
+    reset_sessions()
+    with (
+        caplog.at_level(logging.DEBUG, logger='dashboard.data.mcp_fanout'),
+        patch('dashboard.data.metrics.mcp_tool_call', mock_mcp),
+    ):
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            await fan_out_list_tickets(http_client, cfg)
+
+    warnings = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING and r.name == 'dashboard.data.mcp_fanout'
+    ]
+    assert len(warnings) == 1, f'expected one opening WARNING, got {warnings}'
+    message = warnings[0]
+    assert message.count('ConnectError: refused') == 1, (
+        f'the cause must be rendered exactly once, got {message}'
+    )
+    assert 'ValueError: ConnectError' not in message, (
+        f'the type prefix must not be doubled, got {message}'
+    )
+    assert f'(project_root={root_a})' in message, (
+        f'metrics\' own project_root suffix must survive the fix, got {message}'
+    )
