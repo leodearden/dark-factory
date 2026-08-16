@@ -1335,3 +1335,79 @@ def test_stdout_is_exactly_the_chosen_port_and_nothing_else(
     assert "Reserved:" in err
     assert "Claimed by existing project configs:" in err
     assert "CHOSEN escalation port: 8102" in err
+
+
+# ---------------------------------------------------------------------------
+# Parity with scripts/legibility/nightly.py._default_search_roots
+# ---------------------------------------------------------------------------
+
+
+def _load_nightly() -> types.ModuleType:
+    """Import ``legibility.nightly``, inserting ``scripts/legibility`` onto sys.path.
+
+    MEASURED at base ``fc6f048b55``: ``from legibility import nightly`` with only
+    ``scripts/`` on sys.path raises ``ModuleNotFoundError: No module named 'codebook'``
+    — ``scripts/legibility/coder.py`` line 45 does ``import codebook as codebook_mod``
+    and ``census.py`` line 90 likewise. ``tests/scripts/conftest.py`` inserts
+    ``scripts/`` and this directory but NOT ``scripts/legibility``, so the insertion
+    is done HERE (guarded, idempotent) rather than widening conftest for every sibling
+    test in this directory.
+
+    A BARE import, never ``pytest.importorskip``: if nightly stops importing under the
+    module config's own ``uv run --project shared`` env, this parity guard must fail
+    loudly rather than pass vacuously.
+    """
+    legibility_dir = REPO_ROOT / "scripts" / "legibility"
+    if str(legibility_dir) not in sys.path:
+        sys.path.insert(0, str(legibility_dir))
+    from legibility import nightly  # noqa: PLC0415
+
+    return nightly
+
+
+def test_known_project_roots_and_nightly_expand_a_shared_parent_identically(
+    fep: types.ModuleType, no_systemd: None, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """Both conventions enumerate the SAME candidate project-root set for one parent.
+
+    nightly's ``_default_search_roots`` docstring says it "mirrors
+    ``skills/factory-init/scripts/find_escalation_port.known_project_roots``'s
+    sibling-repos-under-/home/leo/src convention" — and nothing checked that. This is
+    that check: given the same parent directory, both sides yield immediate children,
+    directories only, no recursion.
+
+    WHAT THIS DELIBERATELY DOES NOT ASSERT, and why:
+
+    1. NOT that the two functions return equal VALUES. nightly returns the PARENT
+       (``resolve_config_path`` globs one level down); find_escalation_port returns
+       the CHILDREN. Different levels by design, so a naive equal-outputs assertion is
+       false by construction — the mirrored thing is a RULE, not a value.
+    2. NOT that their DEFAULTS agree. That is a FALSE PREMISE in every task worktree:
+       nightly derives repo_root from ``__file__`` (here ``.worktrees/3705``, parent
+       ``.worktrees``) while find_escalation_port defaults ``--df-root`` to the literal
+       ``/home/leo/src/dark-factory`` (parent ``/home/leo/src``). Those differ
+       permanently under any worktree, so such a test could never be greened.
+
+    The fixture includes a loose FILE and a GRANDCHILD directory so the equality is
+    falsifiable in both directions rather than trivially true.
+
+    MEASURED RED at base ``fc6f048b55``, scratch mutation reverted before commit:
+    widening find_escalation_port's glob to ``df_root.parent / '*' / '*'`` — which
+    breaks parity while leaving each side individually coherent — RED::
+
+        E  AssertionError: the two conventions disagree on the same parent
+    """
+    parent, df_root = _project_tree(tmp_path)
+    nightly = _load_nightly()
+    monkeypatch.setenv("LEGIBILITY_SEARCH_ROOTS", str(parent))
+
+    ours = {p.resolve() for p in fep.known_project_roots(df_root)}
+    theirs = {c.resolve() for r in nightly._default_search_roots() for c in r.iterdir() if c.is_dir()}
+
+    assert ours == theirs, "the two conventions disagree on the same parent"
+    # Non-vacuity: both really did enumerate the projects, and both really did omit
+    # the loose file and the grandchild.
+    assert ours == {(parent / n).resolve() for n in ("dark-factory", "proj-a", "target")}
+    assert (parent / "loose.txt").resolve() not in theirs
+    assert (parent / "proj-a" / "nested").resolve() not in theirs
