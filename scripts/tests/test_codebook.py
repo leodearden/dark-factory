@@ -582,6 +582,112 @@ def test_apply_coding_record_different_candidate_same_day_increments_id():
 
 
 # ---------------------------------------------------------------------------
+# task-4144 step-1: RED — the merger must never resurrect an adjudicated
+# candidate by fabricating a byte-identical-title pending twin. This is the
+# defect that turned rejected `cand-20260722-28` back into pending
+# `cand-20260724-2` in the live registry: `same_title` spans every
+# disposition, but `pending_match` filters to `pending` only, so a title
+# whose records are all rejected/promoted fell through to the create branch.
+# ---------------------------------------------------------------------------
+
+def _codebook_with_adjudicated_candidate(disposition: str) -> dict:
+    """A v2 codebook carrying exactly one already-adjudicated candidate —
+    the shape `census.reject_candidate`/`promote_candidate` leave behind."""
+    codebook = _codebook_with_entry_a()
+    codebook["candidates"] = [
+        {
+            "id": "cand-20260722-28",
+            "title": "novel shape",
+            "cause": "...",
+            "area": "...",
+            "first_seen": "2026-07-22",
+            "disposition": disposition,
+            "sightings": [
+                {
+                    "date": "2026-07-22",
+                    "project": "dark_factory",
+                    "session": "sess-old",
+                    "origin_phase": "architect",
+                    "manifested_phase": "verify",
+                }
+            ],
+        }
+    ]
+    return codebook
+
+
+def test_apply_coding_record_does_not_resurrect_rejected_candidate():
+    codebook = _codebook_with_adjudicated_candidate("rejected")
+    record = _candidate_record(title="novel shape", session="sess-new", date="2026-07-24")
+
+    result, stats = mod.apply_coding_record(codebook, record)
+
+    assert len(result["candidates"]) == 1  # NO pending twin fabricated
+    candidate = result["candidates"][0]
+    assert candidate["id"] == "cand-20260722-28"
+    assert candidate["disposition"] == "rejected"  # census verdict untouched
+    # recurrence signal preserved, append-only
+    assert len(candidate["sightings"]) == 2
+    assert candidate["sightings"][1]["session"] == "sess-new"
+    assert stats["candidate_disposition_conflicts"] == 1
+    assert stats["candidates_applied"] == 0
+    assert mod.validate(result) == []
+
+
+def test_apply_coding_record_does_not_duplicate_promoted_candidate():
+    codebook = _codebook_with_adjudicated_candidate("promoted")
+    record = _candidate_record(title="novel shape", session="sess-new", date="2026-07-24")
+
+    result, stats = mod.apply_coding_record(codebook, record)
+
+    assert len(result["candidates"]) == 1
+    candidate = result["candidates"][0]
+    assert candidate["id"] == "cand-20260722-28"
+    assert candidate["disposition"] == "promoted"  # census verdict untouched
+    assert len(candidate["sightings"]) == 2
+    assert candidate["sightings"][1]["session"] == "sess-new"
+    assert stats["candidate_disposition_conflicts"] == 1
+    assert stats["candidates_applied"] == 0
+    assert mod.validate(result) == []
+
+
+def test_apply_coding_record_adjudicated_conflict_is_idempotent():
+    """The pre-existing `already_seen` guard already spans every
+    disposition, so re-applying the same record appends nothing and reports
+    no fresh conflict."""
+    codebook = _codebook_with_adjudicated_candidate("rejected")
+    record = _candidate_record(title="novel shape", session="sess-new", date="2026-07-24")
+
+    once, first_stats = mod.apply_coding_record(codebook, record)
+    twice, second_stats = mod.apply_coding_record(once, record)
+
+    assert len(twice["candidates"]) == 1
+    assert len(twice["candidates"][0]["sightings"]) == 2  # unchanged by the 2nd apply
+    assert first_stats["candidate_disposition_conflicts"] == 1
+    assert second_stats["candidate_disposition_conflicts"] == 0
+    assert mod.validate(twice) == []
+
+
+def test_apply_coding_record_still_creates_pending_for_a_genuinely_new_title():
+    """Regression guard: the new conflict branch must not swallow genuinely
+    novel titles — only an ALREADY-SEEN title takes it."""
+    codebook = _codebook_with_adjudicated_candidate("rejected")
+    record = _candidate_record(
+        title="a different shape", session="sess-new", date="2026-07-24"
+    )
+
+    result, stats = mod.apply_coding_record(codebook, record)
+
+    assert len(result["candidates"]) == 2
+    fresh = next(c for c in result["candidates"] if c["title"] == "a different shape")
+    assert fresh["disposition"] == "pending"
+    assert fresh["id"] == "cand-20260724-1"
+    assert stats["candidates_applied"] == 1
+    assert stats["candidate_disposition_conflicts"] == 0
+    assert mod.validate(result) == []
+
+
+# ---------------------------------------------------------------------------
 # step-13: RED (§8.3 never-delete) — NeverDeleteError + assert_no_deletion
 # ---------------------------------------------------------------------------
 
