@@ -40,6 +40,7 @@ import pytest
 
 from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
     _ENUM_PREP_WORDS,
+    _last_clause_break,
     extract_snapshot_edge_task_ids,
     flatten_dedup_edges,
     select_stale_status_snapshot_edges,
@@ -793,6 +794,31 @@ class TestExtractSnapshotEdgeTaskIds:
             'Reviews of the following (still open): tasks 1020 and 1030 are pending.',
             'Statuses of the "next" tasks 1020 and 1030 are pending.',
             'Blockers for the merge lane [df] tasks 1020 and 1030 are pending.',
+            # INTRA-TOKEN '.' is not sentence-final punctuation, so it must
+            # not count as a clause break either: a '.' flanked by
+            # alphanumerics on both sides (filename extension, version
+            # string, dotted module path, dotted section number) ends no
+            # sentence, so treating it as a break truncates the backward
+            # scan short of the governing preposition — the same
+            # over-selection the punctuation-family exclusions above guard,
+            # just for a '.' occurrence rather than a different character.
+            # (amendment, reviewer_comprehensive correctness-precision
+            # finding, task 4149)
+            'Reviews for verify_cmd.py tasks 1020 and 1030 are pending.',
+            # CONTROL: identical but for the extension; already passed before
+            # this amendment and must keep passing.
+            'Reviews for verify_cmd tasks 1020 and 1030 are pending.',
+            'Blockers on scheduler.py tasks 1020 and 1030 are in progress.',
+            'Statuses of the v1.2 tasks 1020 and 1030 are pending.',
+            'Reviews for section 4.2.1 tasks 1020 and 1030 are pending.',
+            'Statuses of tasks in df.core tasks 1020 and 1030 are pending.',
+            # UNICODE flanking: _is_intra_token_dot's docstring claims
+            # str.isalnum() makes the test unicode-aware by construction,
+            # so a non-ASCII filename must be recognized as intra-token
+            # exactly like an ASCII one — pin that claim by behaviour
+            # rather than by prose. (amendment, reviewer_comprehensive
+            # test-coverage finding, task 4149)
+            'Reviews for café.py tasks 1020 and 1030 are pending.',
         ],
     )
     def test_plural_enumeration_precision_guards(self, fact):
@@ -959,6 +985,32 @@ class TestExtractSnapshotEdgeTaskIds:
             # (amendment, reviewer_comprehensive correctness-precision
             # finding, task 3079)
             ('Note: tasks 1020 and 1030 are pending.', {1020, 1030}),
+            # ...and the other edge of narrowing WHICH '.' occurrences count
+            # as a break (task 4149): a real sentence-ending '.' must still
+            # break the clause even when a dotted (intra-token) token
+            # precedes it in the same fact — proving the narrowing did not
+            # disable '.' as a break wholesale, only intra-token occurrences
+            # of it. The second case also pins that '!' stayed unconditional.
+            ('Reviews for verify_cmd.py are done. Tasks 1020 and 1030 are pending.',
+             {1020, 1030}),
+            ('Blockers on scheduler.py are resolved! Tasks 1020 and 1030 are pending.',
+             {1020, 1030}),
+            # ...and specifically the WALK'S RETRY behaviour: the loop must
+            # continue past an intra-token '.' to an EARLIER genuine
+            # sentence break, not give up at the first intra-token '.' it
+            # meets. Every other intra-token case above either never enters
+            # the loop (the break is already non-intra-token) or enters it
+            # and exhausts to -1 (no real break precedes); only this one has
+            # an earlier break to retry TO. Verified this pins the retry:
+            # replacing the `while` with a single
+            # `if dot > hard and _is_intra_token_dot(...): dot = -1` (give
+            # up instead of retrying) still passes every other case here,
+            # but turns this one from {1020, 1030} into set() — the scan
+            # runs back over 'for' in the PREVIOUS sentence instead of
+            # stopping at the '.' after 'branch'. (amendment,
+            # reviewer_comprehensive test-coverage finding, task 4149)
+            ('Notes v1.2 for the branch. Statuses v3.4 tasks 1020 and 1030 are pending.',
+             {1020, 1030}),
         ],
     )
     def test_plural_enumeration_subject_positives_survive_precision_guards(
@@ -1011,6 +1063,41 @@ class TestExtractSnapshotEdgeTaskIds:
         over-selection direction.
         """
         assert extract_snapshot_edge_task_ids(fact) == set()
+
+    def test_intra_token_dot_narrowing_costs_only_under_selection(self):
+        """Cost of the intra-token-dot narrowing, pinned from both sides. (task 4149)
+
+        Disqualifying an intra-token '.' as a break introduces exactly one
+        new residual: a genuine SENTENCE period with no following space AND
+        a following alphanumeric, sitting behind a listed preposition. Such
+        a '.' now reads as intra-token (flanked by alphanumerics on both
+        sides), so the backward scan does not stop there and the clause
+        extends back over the preposition, suppressing a genuine
+        subject-position enumeration. This is the fail-safe under-selection
+        direction — the edge is simply not retired this cycle and the next
+        sweep sees it again — mirroring
+        test_adverbial_preamble_is_a_documented_under_selection's framing
+        for the (unrelated) adverbial-preamble residual.
+
+        Pinned alongside the far more common no-space shape that is NOT
+        affected, so the residual's true, narrow boundary stays legible:
+        'prefix' is cut at '\\btasks\\b', so when the enumeration's own
+        marker word immediately follows the period with no space, that
+        period is the prefix's LAST character and has no right flank at
+        all — it is still a break regardless of the narrowing.
+        """
+        # ACCEPTED residual: 'done.Then' — the period is flanked by 'e' and
+        # 'T', both alnum, so it reads as intra-token and the scan continues
+        # back over 'for', suppressing the match.
+        assert extract_snapshot_edge_task_ids(
+            'Reviews for the branch are done.Then tasks 1020 and 1030 are pending.'
+        ) == set()
+        # UNAFFECTED: 'done.Tasks' — the period is the prefix's last
+        # character (prefix ends right before '\\btasks\\b'), so it has no
+        # right flank and stays a break regardless of the narrowing.
+        assert extract_snapshot_edge_task_ids(
+            'Reviews for the branch are done.Tasks 1020 and 1030 are pending.'
+        ) == {1020, 1030}
 
     def test_plural_enumeration_needs_two_or_more_ids(self):
         """A plural head over a single id is not an enumeration. (task 3079)
@@ -1244,6 +1331,46 @@ class TestExtractSnapshotEdgeTaskIds:
 # --------------------------------------------------------------------------- #
 
 
+class CountingStr(str):
+    """``str`` subclass that tallies characters TOUCHED by ``rfind``/indexing.
+
+    ``_last_clause_break``'s documented cost property is "no slicing,
+    O(len(prefix)) total scan work" (see its docstring) — a claim about how
+    many characters the walk examines, not about wall-clock time. A prior
+    version of this test asserted the property via ``time.perf_counter()``
+    instead, and a re-measurement showed that assertion could not actually
+    detect a quadratic regression at the input size it shipped with (the
+    regression's extra cost is C-level slice memcpy, cheap enough to stay
+    under budget until the input is enormous — see
+    ``test_intra_token_dot_walk_touches_linearly_many_characters`` below for
+    the numbers). Counting ``rfind``'s backward-scan distance (``stop -
+    result``, or ``stop - start`` when not found) and every single-character
+    ``__getitem__`` read observes the cost property directly, so a future
+    edit that reintroduces slicing or a non-resuming ``rfind`` is caught by
+    the touched-character count regardless of how fast the underlying C call
+    happens to run on the machine executing the test. (task 4149)
+    """
+
+    def __new__(cls, value):
+        self = super().__new__(cls, value)
+        self.touched = 0
+        return self
+
+    def rfind(self, sub, start=0, end=None):
+        stop = len(self) if end is None else end
+        result = str.rfind(self, sub, start, stop)
+        self.touched += stop - (result if result >= 0 else start)
+        return result
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            out = str.__getitem__(self, key)
+            self.touched += len(out)
+            return out
+        self.touched += 1
+        return str.__getitem__(self, key)
+
+
 class TestPluralEnumerationPerformance:
     """The plural enumeration separator must parse in linear, not exponential, time.
 
@@ -1325,6 +1452,77 @@ class TestPluralEnumerationPerformance:
             f'separated by {sep!r} (budget {self.BUDGET_SECONDS}s) — the '
             f'enumeration separator is backtracking exponentially'
         )
+
+    def test_intra_token_dot_walk_touches_linearly_many_characters(self):
+        """The intra-token-dot backward walk must not degrade to quadratic. (task 4149)
+
+        Supersedes an earlier wall-clock version of this test
+        (reviewer_comprehensive test-quality finding): a wall-clock budget
+        could not actually detect the regression it was meant to catch,
+        because the regression's extra cost is cheap C-level slice-memcpy
+        that stays under any reasonable budget until the input is enormous,
+        while the regex work already inside
+        ``extract_snapshot_edge_task_ids`` dominates the wall clock at any
+        size this suite can afford to run. This test instead counts
+        characters TOUCHED (``CountingStr``, above) and calls
+        ``_last_clause_break`` directly, observing the walk's documented
+        cost property itself rather than inferring it from a clock:
+
+          - resuming walk (real code): a FLAT ~4.67x of prefix length at
+            every size measured (200 / 1,000 / 2,000 / 20,000 dots) — size
+            independence IS the linearity claim.
+          - non-resuming walk (``dot = prefix[:dot].rfind('.')`` in place of
+            ``prefix.rfind('.', 0, dot)`` — the one realistic non-resuming
+            spelling, since re-calling ``prefix.rfind('.')`` with no
+            end-bound would infinite-loop rather than run slowly): 103.5x /
+            503.5x / 1,003.5x at 200 / 1,000 / 2,000 dots — the ratio
+            GROWING with n is the quadratic signature, and it already blows
+            the bound below at every size tested.
+
+        The bound is derived, not guessed: 3 unconditional full backward
+        scans (';', '!', '?' are each absent from this input, so each scans
+        the whole prefix once) + 1 telescoped '.' walk covering the prefix
+        once + 2 single-character reads per dot (~0.67 dots per 3-char
+        'ab.' token) ~= 4.7x prefix length. 8x leaves headroom for an
+        innocuous refactor while still failing any superlinear form
+        decisively.
+        """
+        dotted_tokens = 'ab.' * 20_000 + 'ab'
+        prefix = CountingStr(dotted_tokens)
+
+        result = _last_clause_break(prefix)
+
+        # Correctness alongside cost: every dot is intra-token and no
+        # ';!?' precedes, so the budget can't be met by the walk answering
+        # wrongly but cheaply.
+        assert result == -1
+        assert prefix.touched <= 8 * len(dotted_tokens), (
+            f'_last_clause_break touched {prefix.touched} characters for a '
+            f'{len(dotted_tokens)}-char dot-dense prefix (budget '
+            f'{8 * len(dotted_tokens)} = 8x length) — the intra-token-dot '
+            f'walk is no longer linear'
+        )
+
+    def test_intra_token_dot_prefix_still_extracts_correctly_end_to_end(self):
+        """A long dotted run still round-trips to set() through the real extractor. (task 4149)
+
+        Companion to the cost test above, kept end-to-end (through
+        ``extract_snapshot_edge_task_ids``, not the bare helper) so the
+        integration path — the extractor's own prefix slicing,
+        ``_enumeration_is_prepositional_complement``, the guard's regex
+        search — stays covered. No wall-clock assertion: without a timing
+        claim to justify a large adversarial input, this is sized small
+        (~2,000 dots, ~6KB) and runs in well under a millisecond regardless;
+        the suite-wide 60s xdist timeout still backstops a catastrophic
+        regression at any size.
+        """
+        dotted_tokens = 'ab.' * 2_000 + 'ab'
+        fact = f'Reviews for {dotted_tokens} tasks 1020 and 1030 are pending.'
+
+        # The dotted prefix still carries the governing preposition 'for'
+        # (none of the dots end a sentence), so the enumeration is still
+        # correctly read as its complement and suppressed.
+        assert extract_snapshot_edge_task_ids(fact) == set()
 
 
 # --------------------------------------------------------------------------- #
