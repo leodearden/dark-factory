@@ -834,10 +834,10 @@ _SLOT_TIMEOUT_LANE_X_OUTPUT = (
 # double duty as the FIELD-ABSENT / older-reify compatibility shape: a
 # sentinel line with no `disposition=` token at all. reify's emit is
 # prefix-compatible with the anchor, so this must keep classifying
-# SEMAPHORE_TIMEOUT unchanged — see
-# `_has_fatal_slot_timeout_sentinel`'s fail-safe-direction docstring
-# (verify_classify.py) and
-# ``TestFieldAbsentSlotTimeoutSentinelStaysSemaphoreTimeout`` below.
+# SEMAPHORE_TIMEOUT unchanged — pinned, across every ToolKind, by this
+# corpus entry's membership below in `TestGroundedSlotTimeoutMarkersAreDetected`;
+# see `_has_fatal_slot_timeout_sentinel`'s fail-safe-direction docstring
+# (verify_classify.py) for why an absent field classifies rather than demotes.
 _SLOT_TIMEOUT_SENTINEL_OUTPUT = (
     '@@REIFY_SLOT_TIMEOUT@@ reason=test_slot_starvation waited=1800s pid=4711\n'
 )
@@ -1020,41 +1020,6 @@ class TestGroundedSlotTimeoutMarkersAreDetected:
         assert result != FailureCategory.SEMAPHORE_TIMEOUT, (
             f'a mid-line quotation of the wrapper deadline text must not '
             f'classify semaphore_timeout, got {result!r}'
-        )
-
-
-class TestFieldAbsentSlotTimeoutSentinelStaysSemaphoreTimeout:
-    """task 4212 regression pin: a sentinel line carrying NO ``disposition``
-    field at all — ``_SLOT_TIMEOUT_SENTINEL_OUTPUT``, invented by task 3679
-    before reify 6024 landed the field — must keep classifying
-    SEMAPHORE_TIMEOUT unchanged.
-
-    Named explicitly, rather than left to be inferred from the
-    ``'sentinel'`` entry in ``_ANCHORED_SLOT_TIMEOUT_SHAPES`` (which already
-    covers this case via ``TestGroundedSlotTimeoutMarkersAreDetected``
-    above), because reify's ``@@REIFY_SLOT_TIMEOUT@@`` emit is
-    PREFIX-COMPATIBLE with the anchor: an older reify build, or any future
-    producer that omits the ``disposition`` field, must keep being detected
-    exactly as before this task landed. That additive-compatibility
-    guarantee is a property worth a reader finding by name, not just by
-    corpus membership.
-
-    GREEN ON ARRIVAL BY DESIGN, same precedent as
-    ``TestAnchoredSlotTimeoutWithCollateralIsEnvTransient`` (task 4126): the
-    defect here would be missing PROTECTION of behavior steps 2/4 already
-    get right, not wrong behavior, so there is no failing assertion to
-    author. See the task-4212 step-5 commit message for the two recorded
-    mutation-kills that supply the RED half — treating any disposition field
-    as soft (which this class's case would flip to ``unknown_test_failure``
-    only indirectly, via the ``sentinel_fatal`` corpus entry) and treating a
-    field-ABSENT sentinel as soft (which flips this exact case)."""
-
-    def test_field_absent_sentinel_is_semaphore_timeout(self):
-        result = _classify(ToolKind.OPAQUE, _SLOT_TIMEOUT_SENTINEL_OUTPUT, 1, False)
-        assert result == FailureCategory.SEMAPHORE_TIMEOUT, (
-            f'a @@REIFY_SLOT_TIMEOUT@@ sentinel with no disposition field '
-            f'must keep classifying semaphore_timeout (older-reify / '
-            f'additive-field compatibility), got {result!r}'
         )
 
 
@@ -1925,6 +1890,52 @@ class TestSoftDispositionDoesNotVetoAGenuineSlotTimeout:
             f'a disposition=soft sentinel forged with a disposition=fatal '
             f'lock path must still avoid every infra-transient category, '
             f'got {result!r}'
+        )
+
+    @pytest.mark.parametrize('tool', _REPRESENTATIVE_TOOL_KINDS)
+    def test_unrecognized_disposition_token_is_treated_as_fatal(self, tool):
+        """(e) Fail-safe-direction pin: `_has_fatal_slot_timeout_sentinel`'s
+        docstring promises an unrecognized future token is treated as NOT
+        soft. reify's disposition vocabulary is closed to `fatal`/`soft`
+        today (docs/notes/verify-pipeline-knobs.md:74-77), so `deferred` is
+        a deliberately-invented future/unknown token, not a grounded shape —
+        it exists solely to pin the documented fail-safe direction.
+        Mutation-killing: a whitelist read (`token == 'fatal'`) in place of
+        the documented blacklist (`token != 'soft'`) would silently demote
+        this to `unknown_test_failure`."""
+        output = (
+            '@@REIFY_SLOT_TIMEOUT@@ reason=test_slot_starvation slots=8 waited=1800 '
+            'disposition=deferred lock=/tmp/reify-test-slot.lock\n'
+        )
+        result = _classify(tool, output, 1, False)
+        assert result == FailureCategory.SEMAPHORE_TIMEOUT, (
+            f'an unrecognized disposition token must be treated as fatal '
+            f'(fail-safe direction), got {result!r}'
+        )
+
+    @pytest.mark.parametrize('tool', _REPRESENTATIVE_TOOL_KINDS)
+    def test_soft_disposition_with_no_lock_field_is_still_demoted(self, tool):
+        """(f) Every `_SLOT_TIMEOUT_SOFT_POOL_OUTPUT`-derived fixture used
+        elsewhere in this module carries a trailing ` lock=` field, so the
+        no-lock (`head = tail`) branch of `_has_fatal_slot_timeout_sentinel`'s
+        parse is otherwise never exercised. `slot_acquire`'s `lock=%s`
+        argument is always populated in practice, so this is a defensive-
+        parse pin rather than a grounded producer shape. Mutation-killing: a
+        parse that only ever looked at `tail[:lock.start()]` (assuming a
+        match) would raise ``AttributeError`` on this input instead of
+        falling back to the whole tail."""
+        output = (
+            '@@REIFY_SLOT_TIMEOUT@@ reason=run_all_pool_starvation slots=8 '
+            'waited=1800 disposition=soft\n'
+        )
+        result = _classify(tool, output, 1, False)
+        assert result != FailureCategory.SEMAPHORE_TIMEOUT, (
+            f'a disposition=soft sentinel with no trailing lock= field must '
+            f'still be demoted, got {result!r}'
+        )
+        assert result not in INFRA_TRANSIENT_CATEGORIES, (
+            f'a disposition=soft sentinel with no trailing lock= field must '
+            f'not land in an infra-transient category, got {result!r}'
         )
 
 
