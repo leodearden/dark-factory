@@ -3,6 +3,7 @@
 import functools
 import inspect
 import logging
+from collections.abc import Mapping
 
 logger = logging.getLogger(__name__)
 
@@ -376,21 +377,21 @@ _RECON_REPORT_PLACEHOLDERS = {
 }
 
 
-def render_recon_report_tool_guidance() -> str:
-    """Render _RECON_REPORT_TOOL_GUIDANCE's call shapes from live tool signatures.
+def _render_recon_report_tool_guidance(signatures: Mapping[str, inspect.Signature]) -> str:
+    """Render the recon-report tool-usage guidance prose from *signatures*.
 
-    Introspects each agent-called report tool's live signature (via
-    :func:`fused_memory.server.recon_report.get_recon_report_tool_signatures`,
-    which owns the one place this package reaches into FastMCP's tool-manager
-    internals) so every rendered call always carries every parameter the live
-    tool requires. This is the root-cause fix for run_id-omission drift: a
-    hand-transcribed example can silently go stale when a signature changes;
-    a generated one cannot (task-2559). A param with no entry in
-    _RECON_REPORT_PLACEHOLDERS falls back to a generic ``<param_name>``
-    placeholder, so even a newly-added required kwarg is guaranteed to render.
+    Shared by :func:`render_recon_report_tool_guidance` (live introspection)
+    and the frozen :data:`_RECON_REPORT_TOOL_GUIDANCE_FALLBACK` (rendered from
+    :data:`_FROZEN_RECON_REPORT_SIGNATURES`, itself built from
+    :data:`_FROZEN_RECON_REPORT_SIGNATURE_SPECS`) — both flow through this one
+    prose template and this one ``render_call``, so they cannot drift apart in
+    WORDING. The only surface that can still go stale is the frozen snapshot's
+    parameter data, which
+    ``tests/test_recon_report_guidance_drift.py::TestFallbackIsDerivedFromTheSameRenderer``
+    guards directly against the live signatures.
 
     Every parameter still renders — dropping optional ones would reopen the
-    drift hole this task closed — but a parameter carrying a default value
+    drift hole task-2559 closed — but a parameter carrying a default value
     (genuinely optional) is wrapped in square brackets, e.g.
     ``[task_id=<task_id>]``, so the example does not read as though every
     kwarg must always be supplied. A parameter with no default (required)
@@ -399,15 +400,7 @@ def render_recon_report_tool_guidance() -> str:
 
     start_report is harness-called (agents never call it themselves) and is
     intentionally excluded from generation — its mention below stays prose.
-
-    Raises whatever :func:`get_recon_report_tool_signatures` raises (e.g. if
-    FastMCP's internals have changed shape) — :func:`get_recon_report_tool_guidance`
-    catches this and falls back to a frozen static string rather than letting
-    it become an ImportError for every consumer of this package.
     """
-    from fused_memory.server.recon_report import get_recon_report_tool_signatures
-
-    signatures = get_recon_report_tool_signatures()
 
     def render_call(tool_name: str) -> str:
         parts = []
@@ -462,6 +455,40 @@ def render_recon_report_tool_guidance() -> str:
     )
 
 
+def render_recon_report_tool_guidance() -> str:
+    """Render _RECON_REPORT_TOOL_GUIDANCE's call shapes from live tool signatures.
+
+    Introspects each agent-called report tool's live signature (via
+    :func:`fused_memory.server.recon_report.get_recon_report_tool_signatures`,
+    which owns the one place this package reaches into FastMCP's tool-manager
+    internals) so every rendered call always carries every parameter the live
+    tool requires. This is the root-cause fix for run_id-omission drift: a
+    hand-transcribed example can silently go stale when a signature changes;
+    a generated one cannot (task-2559). A param with no entry in
+    _RECON_REPORT_PLACEHOLDERS falls back to a generic ``<param_name>``
+    placeholder, so even a newly-added required kwarg is guaranteed to render.
+
+    Every parameter still renders — dropping optional ones would reopen the
+    drift hole this task closed — but a parameter carrying a default value
+    (genuinely optional) is wrapped in square brackets, e.g.
+    ``[task_id=<task_id>]``, so the example does not read as though every
+    kwarg must always be supplied. A parameter with no default (required)
+    renders bare, mirroring common CLI usage-string conventions
+    (``cmd required [optional]``).
+
+    start_report is harness-called (agents never call it themselves) and is
+    intentionally excluded from generation — its mention below stays prose.
+
+    Raises whatever :func:`get_recon_report_tool_signatures` raises (e.g. if
+    FastMCP's internals have changed shape) — :func:`get_recon_report_tool_guidance`
+    catches this and falls back to a frozen static string rather than letting
+    it become an ImportError for every consumer of this package.
+    """
+    from fused_memory.server.recon_report import get_recon_report_tool_signatures
+
+    return _render_recon_report_tool_guidance(get_recon_report_tool_signatures())
+
+
 # Last-resort fallback if render_recon_report_tool_guidance() raises when first
 # called (e.g. a FastMCP upgrade changes the tool-manager internals guarded by
 # get_recon_report_tool_signatures(), or recon_report's server construction
@@ -471,50 +498,75 @@ def render_recon_report_tool_guidance() -> str:
 # of truth: it can go stale exactly like the hand-transcribed text this task
 # replaced. Every call shape below still carries run_id, so even a stale
 # fallback cannot regress the original run_id-omission bug this task fixed.
-_RECON_REPORT_TOOL_GUIDANCE_FALLBACK = (
-    'The harness calls `mcp__recon-report__start_report` for you before the stage begins'
-    ' — do NOT call it yourself. For each finding, call'
-    ' `mcp__recon-report__add_finding(run_id=<from Reconciliation Context>,'
-    ' severity=<severity>, category=<category>, description=<description>,'
-    ' suggested_action=<suggested_action>, actionable=<actionable>, task_id=<task_id>,'
-    ' flag_type=<flag_type>)` and capture the `finding_id` from the response. Then attach'
-    ' typed citations:\n'
-    '- `mcp__recon-report__cite_entity(run_id=<from Reconciliation Context>,'
-    ' finding_id=<finding_id from add_finding response>, name=<canonical entity name>)`'
-    ' — pass the ENTITY NAME (not a UUID); the server resolves the UUID internally.\n'
-    '- `mcp__recon-report__cite_edge(run_id=<from Reconciliation Context>,'
-    ' finding_id=<finding_id from add_finding response>, edge_uuid=<full 36-char UUID>)`'
-    ' — copy the UUID verbatim from the `id` field of a fresh tool result'
-    ' (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`). Never truncate or construct edge UUIDs.\n'
-    '- `mcp__recon-report__cite_task(run_id=<from Reconciliation Context>,'
-    ' finding_id=<finding_id from add_finding response>, project_id=<project_id>,'
-    ' task_id=<task_id>)` — both project_id and task_id are required. **Dedup anchor**:'
-    ' `_derive_affected_ids` reads `cited_tasks` (not the top-level `task_id` field of'
-    ' `add_finding`) when building the fingerprint for `compute_content_fingerprint`.'
-    ' Always call `cite_task` for the primary subject task so the fingerprint is stable.'
-    ' For multi-task findings, the cited_tasks signature shifts as citations grow or'
-    ' shrink — also pass `task_id=<primary>` at the top level of `add_finding` as a'
-    ' supplementary stable anchor when one clear primary subject exists. Exception:'
-    ' cross_project findings use `task_id=None` (operator routing); `cite_task` is the'
-    ' sole dedup anchor there.\n'
-    '- `mcp__recon-report__cite_memory(run_id=<from Reconciliation Context>,'
-    ' finding_id=<finding_id from add_finding response>, memory_id=<uuid>,'
-    " store=<'mem0'|'graphiti'>)` — `memory_id` must be the full 36-char UUID from the"
-    ' `id` field of a fresh tool result.\n'
-    '- `mcp__recon-report__cite_run(run_id=<from Reconciliation Context>,'
-    ' finding_id=<finding_id from add_finding response>,'
-    " cited_run_id=<full 36-char run UUID>)` — whenever a finding's description or"
-    " suggested_action references another reconciliation run's run_id, call this to"
-    ' confirm it exists and attach it. Copy `cited_run_id` verbatim from the `run_id`'
-    ' or `metadata.run_id` field of a fresh tool result — never re-type or paraphrase'
-    ' a run_id from memory.\n'
-    'For stats counters use `mcp__recon-report__set_stat(run_id=<from Reconciliation'
-    ' Context>, key=<key>, value=<value>)` or `mcp__recon-report__inc_stat(run_id=<from'
-    ' Reconciliation Context>, key=<key>, delta=<delta>)`. When all findings are recorded'
-    ' and all work is done, call `mcp__recon-report__complete(run_id=<from Reconciliation'
-    ' Context>, summary=<brief human-readable summary>)` as your terminal action — do NOT'
-    ' produce a structured JSON response; the assembled recon_report state is the'
-    ' authoritative output channel for this stage.'
+#
+# The dict below is the ONLY hand-maintained input to the fallback: a frozen
+# snapshot of each tool's {param_name: required_bool}, in live parameter
+# order (order matters -- it drives the rendered kwarg order). It is pushed
+# through _frozen_signature() and then the *same* _render_recon_report_tool_guidance()
+# template and render_call() the live path uses, so the fallback's WORDING can
+# no longer drift from the generated guidance -- only this data can go stale,
+# and tests/test_recon_report_guidance_drift.py::TestFallbackIsDerivedFromTheSameRenderer
+# fails loudly the moment it does.
+_FROZEN_RECON_REPORT_SIGNATURE_SPECS: dict[str, tuple[tuple[str, bool], ...]] = {
+    'add_finding': (
+        ('run_id', True),
+        ('severity', True),
+        ('category', True),
+        ('description', True),
+        ('suggested_action', True),
+        ('actionable', False),
+        ('task_id', False),
+        ('flag_type', False),
+    ),
+    'cite_entity': (('run_id', True), ('finding_id', True), ('name', True)),
+    'cite_edge': (('run_id', True), ('finding_id', True), ('edge_uuid', True)),
+    'cite_task': (
+        ('run_id', True),
+        ('finding_id', True),
+        ('project_id', True),
+        ('task_id', True),
+    ),
+    'cite_memory': (
+        ('run_id', True),
+        ('finding_id', True),
+        ('memory_id', True),
+        ('store', True),
+    ),
+    'cite_run': (('run_id', True), ('finding_id', True), ('cited_run_id', True)),
+    'set_stat': (('run_id', True), ('key', True), ('value', True)),
+    'inc_stat': (('run_id', True), ('key', True), ('delta', False)),
+    'complete': (('run_id', True), ('summary', True)),
+}
+
+
+def _frozen_signature(spec: tuple[tuple[str, bool], ...]) -> inspect.Signature:
+    """Build an ``inspect.Signature`` from a frozen ``(param_name, required)`` spec.
+
+    Uses ``KEYWORD_ONLY`` parameters for two reasons, both verified to hold for
+    every tool in :data:`_FROZEN_RECON_REPORT_SIGNATURE_SPECS`: (1) it sidesteps
+    ``inspect.Signature``'s "non-default argument follows default argument"
+    ``ValueError``, so *spec* can list parameters in live order regardless of
+    required-ness; (2) ``render_call`` (inside
+    :func:`_render_recon_report_tool_guidance`) reads only each parameter's
+    ``.name`` and ``.default``, never ``.kind``, so the rendered text is
+    identical to what the live ``POSITIONAL_OR_KEYWORD`` signatures produce.
+    """
+    return inspect.Signature(
+        [
+            inspect.Parameter(
+                name, inspect.Parameter.KEYWORD_ONLY, **({} if required else {'default': None})
+            )
+            for name, required in spec
+        ]
+    )
+
+
+_FROZEN_RECON_REPORT_SIGNATURES = {
+    tool: _frozen_signature(spec) for tool, spec in _FROZEN_RECON_REPORT_SIGNATURE_SPECS.items()
+}
+
+_RECON_REPORT_TOOL_GUIDANCE_FALLBACK = _render_recon_report_tool_guidance(
+    _FROZEN_RECON_REPORT_SIGNATURES
 )
 
 
