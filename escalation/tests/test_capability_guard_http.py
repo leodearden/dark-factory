@@ -34,11 +34,6 @@ See plans/escalation-connection-capability-guard-prd.md (tasks alpha/beta/gamma)
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
-import socket
-import threading
-import time
 from collections.abc import Iterator
 from typing import Any
 
@@ -48,143 +43,56 @@ from fastmcp.client.transports import StreamableHttpTransport
 
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
-from escalation.server import create_server
 
 # ---------------------------------------------------------------------------
 # Harness: a real escalation MCP server served over HTTP in a daemon thread.
+#
+# Delegates to the shared ``serve_escalation_mcp`` factory fixture
+# (``conftest.py``) instead of a module-local copy of the start/serve/teardown
+# machinery (task 3736, INV-5 lockstep duplication -- this module used to carry
+# its own ephemeral-port picker and pending-task drainer plus the full thread +
+# event-loop dance, which is in fact the copy ``serve_escalation_mcp`` was
+# originally lifted from). ``serve_escalation_mcp`` is module-scoped precisely
+# so this module-scoped fixture can depend on it; pytest forbids the reverse.
+# All teardown behaviour -- the ``stopping`` flag, the pending-task drain, the
+# bounded 5s join and its loud (never softened) hung-thread assert -- now lives
+# once in ``serve_escalation_mcp``, with its regression test in
+# ``test_serve_escalation_mcp_fixture.py``.
 # ---------------------------------------------------------------------------
-
-
-def _free_port() -> int:
-    """Return an ephemeral TCP port free on 127.0.0.1 at the time of the call.
-
-    Binds to port 0 (OS-assigned free port) and immediately closes the
-    socket. There is an inherent (small) TOCTOU window before the real
-    server binds the same port; acceptable for a single-threaded test run.
-    """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(('127.0.0.1', 0))
-        return s.getsockname()[1]
-
-
-def _drain_pending_tasks(loop: asyncio.AbstractEventLoop) -> None:
-    """Cancel and await every task still pending on *loop* before it closes.
-
-    Mirrors ``asyncio.run()``'s own internal shutdown sequence
-    (``_cancel_all_tasks``). Without this, a task still suspended
-    mid-``await`` when the loop is stopped -- the server's own root task
-    (``run_http_async``), or an internal one it spawns (e.g.
-    sse_starlette's ``_shutdown_watcher``) -- is only unwound later at
-    uncontrolled garbage-collection time, outside of any running task
-    context, which crashes anyio's shielded lifespan cleanup with an
-    unraisable ``TypeError``/``NoEventLoopError`` instead of shutting down
-    cleanly (task 2741).
-    """
-    pending = asyncio.all_tasks(loop)
-    if not pending:
-        return
-    for task in pending:
-        task.cancel()
-    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
 
 
 @pytest.fixture(scope='module')
 def http_server(
     tmp_path_factory: pytest.TempPathFactory,
+    serve_escalation_mcp,
 ) -> Iterator[tuple[str, EscalationQueue]]:
     """Serve a real escalation MCP server over HTTP for this module's tests.
 
-    Builds an ``EscalationQueue`` + ``create_server(queue, startup_sweep=False)``
-    (``startup_sweep=False`` so pre-seeded queue files are not relocated by the
-    startup sweep — mirrors the existing test convention), then serves it via
-    ``FastMCP.run_http_async`` on a free localhost port inside a daemon thread
-    running its own event loop. Readiness is polled by attempting a raw TCP
-    connect to the port (bounded to ~10s total) — no fixed sleep.
+    A thin scope/shape adapter over ``serve_escalation_mcp``: it owns no
+    server-lifecycle state, so there is nothing to tear down here -- teardown
+    happens once, in the shared fixture, at this module's end.
 
-    Yields ``(base_url, queue)``: tests seed pending escalations directly via
-    ``queue.submit()`` (file-backed, per-id locked — safe across the test
-    thread and the server's serving thread) and then connect a
+    Two module-specific facts it does own:
+
+    * ``startup_sweep=False``, so pre-seeded queue files are not relocated by
+      the startup sweep (the existing convention in this suite; also the
+      factory's default, passed explicitly to keep it legible here).
+    * The yielded shape, ``(base_url, queue)`` -- the factory's ``port`` is
+      dropped, since every call site below unpacks a two-tuple.
+
+    Tests seed pending escalations directly via ``queue.submit()``
+    (file-backed, per-id locked -- safe across the test thread and the
+    server's serving thread), then connect a
     ``fastmcp.Client(StreamableHttpTransport(f'{base_url}/mcp/', headers=...))``
     per scenario to send per-connection capability headers over real HTTP.
 
-    Teardown is explicit: the event loop is created here in the fixture
-    body (not inside the thread target), so it can be stopped thread-safely
-    at teardown — ``loop.call_soon_threadsafe(loop.stop)`` unblocks
-    ``run_until_complete`` in the serving thread, which is then joined
-    (bounded to 5s) before this fixture finishes tearing down. This
-    prevents the daemon thread's event loop from outliving the test and
-    acting as a background ``time.monotonic()`` caller for the rest of the
-    process (task 2741). Any task still pending at that point is cancelled
-    and drained (``_drain_pending_tasks``) inside the serving thread before
-    the loop closes, so cleanup runs inside a live task context instead of
-    at uncontrolled GC time. A ``stopping`` flag distinguishes that
-    deliberate, stop-induced ``RuntimeError`` from a genuine startup
-    failure, so ``serve_error`` below still reflects only real errors
-    (mirrors ``test_status_authority_gate.py``'s ``http_server`` fixture).
-    A teardown that fails to stop the thread within the 5s join bound is
-    asserted rather than swallowed, so a genuine hang surfaces loudly
-    instead of silently leaking a daemon thread past this fixture.
+    Module-scoped: every test here shares this ONE ``EscalationQueue``, so
+    each must seed under its own ``task_id`` rather than depend on ``make_id``
+    sequencing.
     """
     queue_dir = tmp_path_factory.mktemp('esc_capability_guard')
-    queue = EscalationQueue(queue_dir)
-    mcp = create_server(queue, startup_sweep=False)
-    port = _free_port()
-    loop = asyncio.new_event_loop()
-    serve_error: BaseException | None = None
-    stopping = False
-
-    def _serve_forever() -> None:
-        nonlocal serve_error
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(
-                mcp.run_http_async(
-                    host='127.0.0.1', port=port, show_banner=False, log_level='error',
-                )
-            )
-        except RuntimeError as exc:
-            # Expected when teardown stops the loop mid-serve ("Event loop
-            # stopped before Future completed") -- but only when *we*
-            # induced it; a RuntimeError raised before teardown began is a
-            # genuine startup failure and must be surfaced below.
-            if not stopping:
-                serve_error = exc
-        finally:
-            _drain_pending_tasks(loop)
-            loop.close()
-
-    thread = threading.Thread(
-        target=_serve_forever, name='escalation-capability-guard-http', daemon=True,
-    )
-    thread.start()
-
-    # Poll for readiness (bounded ~10s) instead of a fixed sleep.
-    deadline = time.monotonic() + 10.0
-    ready = False
-    while time.monotonic() < deadline:
-        with contextlib.suppress(OSError), socket.create_connection(('127.0.0.1', port), timeout=0.2):
-            ready = True
-        if ready:
-            break
-        time.sleep(0.05)
-    if not ready:
-        detail = f' (server thread raised: {serve_error!r})' if serve_error else ''
-        raise RuntimeError(
-            f'escalation HTTP test server did not become ready on '
-            f'127.0.0.1:{port} within 10s{detail}'
-        )
-
-    try:
-        yield f'http://127.0.0.1:{port}', queue
-    finally:
-        stopping = True
-        loop.call_soon_threadsafe(loop.stop)
-        thread.join(timeout=5.0)
-        assert not thread.is_alive(), (
-            'escalation-capability-guard-http serving thread did not stop '
-            'within the 5s teardown bound -- event loop stop is hung or the '
-            'server task is stuck in a non-cancellable await (task 2741)'
-        )
+    base_url, _port, queue = serve_escalation_mcp(queue_dir, startup_sweep=False)
+    yield base_url, queue
 
 
 # ---------------------------------------------------------------------------
