@@ -222,3 +222,64 @@ def test_a_module_scoped_fixture_may_depend_on_serve_escalation_mcp(
     tools = asyncio.run(_list_tools())
 
     assert tools, f'the module-scoped server at {base_url} returned no tools'
+
+
+# ---------------------------------------------------------------------------
+# Teardown must stop the daemon serving thread (task 2741).
+# ---------------------------------------------------------------------------
+
+
+def test_the_fixture_stops_its_serving_thread_on_teardown(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """Regression test (task 2741): ``serve_escalation_mcp`` must explicitly
+    stop the daemon serving thread + event loop of every server it started,
+    instead of relying on process exit to kill them.
+
+    Getting this wrong leaks a daemon thread whose event loop then acts as a
+    background ``time.monotonic()`` caller for the rest of the process, and
+    unwinds anyio's shielded lifespan cleanup at uncontrolled GC time.
+
+    THE canonical copy: this assertion used to exist verbatim in both
+    ``test_capability_guard_http.py`` and ``test_status_authority_gate.py``,
+    each driving its own module-local fixture. Once both delegate here those
+    would be two byte-similar tests of ONE fixture -- the lockstep duplication
+    (INV-5) task 3736 exists to remove -- so they were folded into this one.
+
+    Drives the fixture generator directly via ``__wrapped__``, bypassing
+    pytest's fixture caching, so this test's own server is isolated from the
+    module-scoped instance already serving the other tests in this file: the
+    ``threading.enumerate()`` before/after diff plus the port-qualified thread
+    name identify exactly one thread, this test's.
+    """
+    before = set(threading.enumerate())
+    gen = conftest.serve_escalation_mcp.__wrapped__()  # pyright: ignore[reportFunctionMemberAccess]
+    try:
+        start = next(gen)
+        _base_url, port, _queue = start(tmp_path_factory.mktemp('serve_teardown'))
+
+        new = [
+            t for t in set(threading.enumerate()) - before
+            if t.name == f'escalation-mcp-http-{port}'
+        ]
+        assert len(new) == 1, (
+            f'Expected exactly one new escalation-mcp-http-{port} serving '
+            f'thread; found {new}'
+        )
+        serving = new[0]
+        assert serving.is_alive(), 'Serving thread must be alive during yield'
+
+        with pytest.raises(StopIteration):
+            next(gen)
+
+        assert not serving.is_alive(), (
+            'serve_escalation_mcp leaked its daemon serving thread past '
+            'teardown (generator finalized via StopIteration) -- the fixture '
+            'must explicitly stop its event loop and join the thread instead '
+            'of relying on process exit to kill it.'
+        )
+    finally:
+        # Best-effort: ensure finalization ran even if an assertion above
+        # failed, so a RED failure does not leave extra servers running for
+        # the rest of the suite. No-op if already exhausted.
+        gen.close()
