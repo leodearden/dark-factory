@@ -69,7 +69,7 @@ The call returns with **either** a **terminal** status **or** a **non-terminal**
 
 - **Terminal at submit time** (`done`, `already_merged`, `conflict`, `blocked`, `unknown_branch`, `failed`, `superseded`): the merge resolved within the bounded wait. Jump straight to step 4.
   - `already_merged` means the branch tip was already an ancestor of main — treat it the same as `done`.
-  - `superseded` means your request was absorbed into a coalesced train before it could be individually processed. The response includes `superseded_by: "<train_request_id>"`. Re-poll the train request immediately (step 4 / follow-the-train protocol below).
+  - `superseded` means your request was replaced by a successor before it could be individually processed. The response includes `superseded_by: "<mr-* request id | coalesce-* train id>"`. See [Follow the superseded successor](#follow-the-superseded-successor) below to determine how to resolve it.
 
 - **Non-terminal** (`queued`, `attached`): the submission succeeded as **durable intent** — the merge worker has accepted the request and will process it. This is **not a failure**. The `request_id` in the response identifies your submission. Proceed to "Poll for completion" below.
   - `attached` means your submission was coalesced with an already-in-flight request for the same branch. Whether you share that in-flight entry's `request_id` depends on the response's own disclosure — see "Poll for completion" below, which branches on the `poll_by` field the response carries alongside `source`, `inflight_request_id`, `inflight_task_id`, and `pollable`.
@@ -103,13 +103,27 @@ Whichever handle you poll, the cadence and state handling below are the same for
 
 **Terminal states** (`done`, `conflict`, `blocked`, `abandoned`, `superseded`) — proceed to step 4.
 
-**`state: "superseded"`** — Your request was absorbed into a coalesced train. The response includes `superseded_by: "<train_request_id>"`. **Do NOT fall back to direct merge** — the train is already in flight and a direct merge would race it. Follow the train:
+**`state: "superseded"`** — Your request was superseded by a successor. The response includes `superseded_by: "<mr-* request id | coalesce-* train id>"`. **Never fall back to direct merge, and never resubmit, while that successor is unresolved** — it may already be in flight, and either would race it. The successor isn't always pollable the same way your own request was; see below for the shape branch.
 
-```
-mcp__escalation__merge_status(request_id="<superseded_by value>")
-```
+<a id="follow-the-superseded-successor"></a>**Follow the superseded successor.** `superseded_by` names one of two shapes, and only one of them is a request id you can poll by `request_id`:
 
-Poll the train request with the same 15 s→60 s backoff until it reaches a terminal state (`done`, `conflict`, `blocked`, `abandoned`). Your absorbed branch lands when the train lands. Handle the train's terminal state per step 4.
+- **`mr-*` id** (generation-advance path) — a real request id. `gen_next` was enqueued the normal way through `enqueue_merge_request`, and this outcome resolves as `MergeOutcome("superseded", superseded_by=gen_next.request_id, ...)` (`orchestrator/src/orchestrator/merge_queue.py:4387`). Poll it:
+  ```
+  mcp__escalation__merge_status(request_id="<superseded_by value>")
+  ```
+  with the same 15 s→60 s backoff, bounded by its own 20-minute wall-clock ceiling (same as the `task_id`/`branch` arms above). Handle its eventual terminal state per step 4. If this poll returns `state: "unknown"` on **any** tick — not only at the ceiling — do not fall through to the **`state: "unknown"`** handling below (it ends in a resubmit for the `request_id`/`task_id` arms, which risks racing a successor that may still be in flight); go straight to the escape below instead.
+
+- **`coalesce-*` id** (coalesce-train path) — this names the *train*, not a request. `_COALESCE_TRAIN_ID_PREFIX = 'coalesce-'` (`merge_queue.py:5380`); `train_id = f'{_COALESCE_TRAIN_ID_PREFIX}{tip_id}-{uuid.uuid4().hex[:8]}'` (`merge_queue.py:13739`) is what every absorbed single receives as its `superseded_by` (`merge_queue.py:13787`). **Do not poll it by `request_id`.** It resolves through none of `merge_status`'s tiers: no retention-ring alias is ever recorded for a train id (the ring is keyed on `req.request_id`, `merge_queue.py:4448-4449`), no event-store `merge_finalized` row is keyed on one, and the git-authority Tier 3.5 probe is skipped whenever only `request_id` is passed (`key = branch if branch is not None else task_id; if key is not None:`, `escalation/server.py:2619-2622`). Polling it by `request_id` returns an honest `state: "unknown"` that will never resolve to anything else. (The `GroupMergeRequest` carrying the train does get its own `mr-*` `request_id`, auto-generated at construction — `merge_types.py:804` — but the caller never sees it; the train id is not a stand-in for it.)
+
+**Escape** — for the `coalesce-*` case, or an `mr-*` poll that came back `unknown` or is still unresolved at its ceiling: stop polling by `request_id`. Fall back to the branch handle plus the [canonical ancestry check](#canonical-ancestry-check) on every tick:
+```
+mcp__escalation__merge_status(branch="task/<TASK_ID>")
+```
+Two rules make this fallback loop terminate correctly — for the full recovery procedure see `skills/unblock/SKILL.md:503-643`:
+1. **Drop `superseded` from this resumed loop's terminal set.** The branch handle re-serves the identical frozen `superseded` record on tick 1, and for a coalesce-absorbed member that record never changes — polling to a plain terminal set would just bounce you back into this same bullet. Use `("done", "conflict", "blocked", "abandoned")` plus a `superseded` whose `superseded_by` *differs* from the one you just disregarded (a genuinely new absorption — re-enter this subsection against it).
+2. **rc=128-with-empty-marker does not mean "not landed" here.** A train merges only the tip branch (`tip_branch=tip_req.branch`, `merge_queue.py:13754`), so a non-tip absorbed member's commits land on main with no `Merge task/<TASK_ID> into main` marker of its own. Under rc=128-with-empty-marker, instead check: the **tip's** merge marker on main — `git log main --fixed-strings --grep="Merge task/<TIP_ID> into main" --max-count=1 --format=%H` (the tip id is readable straight off a `coalesce-<TIP_ID>-<hex>` id) — and whether this task's own scheduler status has already flipped to `done`. Either one saying landed → treat as `done`/`found_on_main`.
+
+**Whichever shape `superseded_by` takes, never direct-merge and never resubmit while a successor is unresolved.**
 
 **`state: "unknown"`** — for the `request_id`/`task_id` poll arms, this means the orchestrator restarted and the retention ring no longer holds this request (a record that *was* enqueued). `merge_status` now self-resolves a landed merge via its git-authority tier: if the branch is provably on `main` it returns `state: "done"` with `kind: "found_on_main"` and `merge_sha` directly. If `merge_status` still returns `unknown`, confirm deterministically:
 <a id="canonical-ancestry-check"></a>**The canonical ancestry check — three outcomes, not two.** Every "is it on main?" confirmation in this skill means this check. **Never use the two-way idiom `git merge-base --is-ancestor ... && echo "on main" || echo "not on main"`**: a deleted branch ref exits **128**, which that idiom silently reports as "not on main" — inverting the truth for the normal post-merge state, since the merge lane deletes task branches on cleanup (`_delete_branch_if_on_main`, `orchestrator/src/orchestrator/git_ops.py:7538-7574`), and on the `branch` arm a *foreign* merger's cleanup deletes it out from under you.
@@ -178,15 +192,15 @@ The outcome arrives from either the submit call (terminal at submit time) or the
 - **Real conflict:** the rebase failed; the merge was bounced with a conflict that requires resolution. Fix the conflict in your worktree and resubmit.
 - **Bounce cap reached (`MERGE_BOUNCE_CAP=3`):** the 1688 thrash-backstop triggered — the task is blocked without further rebase. Read the reason, resolve the underlying conflict, and unblock manually.
 
-**`superseded`** — Your request was absorbed into a coalesced train (surfaces from either the submit call or the poll loop). The response includes `superseded_by: "<train_request_id>"`.
+**`superseded`** — Your request was superseded (surfaces from either the submit call or the poll loop). The response includes `superseded_by: "<mr-* request id | coalesce-* train id>"`.
 
-**Critical: do NOT fall back to a direct merge or resubmit on `superseded`** — doing so would race the in-flight train that already carries your branch's work. Follow the train instead:
+**Critical: do NOT fall back to a direct merge or resubmit on `superseded`** — a successor may already be in flight, and either would race it. Follow the successor instead:
 
 1. Take the `superseded_by` value from the response.
-2. Poll `merge_status(request_id=<superseded_by>)` with the same 15 s→60 s backoff.
-3. When the train reaches a terminal state, handle it exactly as you would handle that status for your own request (e.g., `done` → update task status; `conflict` → resolve and resubmit your branch).
+2. Determine how — and whether — to poll it per [Follow the superseded successor](#follow-the-superseded-successor) above; the handle depends on whether the value is an `mr-*` request id or a `coalesce-*` train id.
+3. When the successor reaches a terminal state, handle it exactly as you would handle that status for your own request (e.g., `done` → update task status; `conflict` → resolve and resubmit your branch).
 
-Your absorbed branch lands when the train lands.
+Your branch lands when the successor lands — but for a `coalesce-*` absorption of a non-tip member, that is confirmed via the tip's merge marker and this task's own scheduler status, not via `merge_status` (see the linked subsection).
 
 ### 5. Abandoning a submission (merge_cancel)
 
