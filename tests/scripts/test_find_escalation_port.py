@@ -492,3 +492,160 @@ def test_systemctl_failure_falls_back_to_the_full_sibling_set(
         (parent / "proj-a").resolve(),
         (parent / "target").resolve(),
     }
+
+
+# ---------------------------------------------------------------------------
+# find_config — candidate-name precedence
+# ---------------------------------------------------------------------------
+
+
+def _touch_config(root: pathlib.Path, name: str) -> pathlib.Path:
+    """Create an (empty) config file at ``root/name``, making parents as needed.
+
+    ``find_config`` never reads content — only ``is_file()`` — so the body is
+    irrelevant here. The nested ``orchestrator/config.yaml`` spelling is why parents
+    must be created.
+    """
+    path = root / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("")
+    return path
+
+
+def test_canonical_config_name_wins_over_every_legacy_spelling(
+    fep: types.ModuleType, tmp_path: pathlib.Path
+) -> None:
+    """With all four CONFIG_NAMES present at once, the canonical name is returned.
+
+    The module's own comment calls this load-bearing: "a migrated project's real
+    config wins over any legacy symlink/spelling still present alongside it". A
+    migration that leaves the old file behind is the normal end state, so picking the
+    wrong one would read a STALE escalation port and hand the same port to two
+    projects.
+
+    RE-MEASURED at base ``fc6f048b55``: canonical wins over a coexisting
+    orchestrator.yaml.
+    """
+    root = tmp_path / "proj-a"
+    root.mkdir()
+    for name in fep.CONFIG_NAMES:
+        _touch_config(root, name)
+
+    assert fep.find_config(root) == root / "dark-factory-orchestrator.yaml"
+
+
+def test_each_config_name_is_found_when_it_is_the_only_one_present(
+    fep: types.ModuleType, tmp_path: pathlib.Path
+) -> None:
+    """Every spelling in CONFIG_NAMES is reachable — including the NESTED one.
+
+    ``orchestrator/config.yaml`` is the entry a naive ``iterdir()``-based
+    implementation would miss entirely, which would make such a project invisible to
+    the port-collision scan: its claimed port would look free.
+
+    Driven from ``fep.CONFIG_NAMES`` rather than a hand-copied literal, so a name
+    added to the production tuple is exercised here without editing this test.
+    """
+    for i, name in enumerate(fep.CONFIG_NAMES):
+        root = tmp_path / f"only-{i}"
+        root.mkdir()
+        expected = _touch_config(root, name)
+        assert fep.find_config(root) == expected, f"{name} unreachable when it is the only config"
+
+
+def test_config_name_precedence_holds_for_every_pair(
+    fep: types.ModuleType, tmp_path: pathlib.Path
+) -> None:
+    """Precedence is checked PAIRWISE in CONFIG_NAMES order, plus an order ratchet.
+
+    TWO ASSERTIONS, AND THE TENSION BETWEEN THEM IS THE POINT — recorded because it
+    was MEASURED, not assumed.
+
+    1. MECHANICS, driven FROM ``fep.CONFIG_NAMES``: for every ordered pair (i < j),
+       both names are created in their own root and the earlier one must win. This
+       tracks the production tuple instead of mirroring it, so a name ADDED to
+       CONFIG_NAMES is exercised here with no edit to this test. What it catches is
+       an implementation that stops honouring the tuple's order at all — sorting the
+       candidates, or switching to an ``iterdir()`` sweep.
+
+    2. ORDER RATCHET, an explicit literal. Assertion 1 CANNOT catch a reordering of
+       the tuple itself, because it derives its expectation from that tuple: reorder
+       the production names and the expectation reorders with them. MEASURED at base
+       ``fc6f048b55``: swapping ONLY the middle two entries ("orchestrator.yaml" and
+       "orchestrator-config.yaml") left the whole module GREEN — ``15 passed``. Since
+       ``find_config`` returns the FIRST match, that order is a behavioural
+       specification and not a stylistic list, so it gets a literal ratchet. If a
+       reorder is ever deliberate, update the literal here and say why: the tuple is
+       documented as kept in sync with ``dashboard.config``'s _CANONICAL_CONFIG_NAME
+       + _LEGACY_CONFIG_NAMES, and a spelling recognized by one but not the other is
+       the latent trap the module's own comment warns about.
+
+    MEASURED RED at base ``fc6f048b55``, scratch mutation reverted before commit:
+    reversing CONFIG_NAMES entirely — RED (this test, on the ratchet)::
+
+        E  AssertionError: assert 'orchestrator/config.yaml' == 'dark-factory...estrator.yaml'
+        E    - dark-factory-orchestrator.yaml
+        E    + orchestrator/config.yaml
+
+    That same reversal also reddened
+    ``test_canonical_config_name_wins_over_every_legacy_spelling`` (2 failed,
+    13 passed), which is the canonical-first claim pinned independently.
+    """
+    names = fep.CONFIG_NAMES
+    assert len(names) > 1, "precedence is unfalsifiable with fewer than two candidates"
+
+    for i in range(len(names)):
+        for j in range(i + 1, len(names)):
+            root = tmp_path / f"pair-{i}-{j}"
+            root.mkdir()
+            winner = _touch_config(root, names[i])
+            _touch_config(root, names[j])
+            assert fep.find_config(root) == winner, (
+                f"{names[i]} must win over {names[j]}"
+            )
+
+    assert names == (
+        "dark-factory-orchestrator.yaml",
+        "orchestrator.yaml",
+        "orchestrator-config.yaml",
+        "orchestrator/config.yaml",
+    )
+
+
+def test_root_with_no_config_returns_none(fep: types.ModuleType, tmp_path: pathlib.Path) -> None:
+    """A directory that is not a dark-factory project is skipped, not guessed at.
+
+    main() relies on this: the sibling glob sweeps up every directory next to the
+    checkout, most of which are not projects at all.
+    """
+    root = tmp_path / "not-a-project"
+    root.mkdir()
+    (root / "README.md").write_text("# unrelated\n")
+
+    assert fep.find_config(root) is None
+
+
+def test_a_directory_named_like_a_config_is_not_returned(
+    fep: types.ModuleType, tmp_path: pathlib.Path
+) -> None:
+    """The ``is_file()`` guard — a stray DIRECTORY cannot be mistaken for a config.
+
+    ``escalation_port`` would swallow the resulting IsADirectoryError in its bare
+    ``except Exception`` and return None, so the project's real claimed port
+    (here in the legacy orchestrator.yaml) would silently vanish from the survey and
+    its port would be handed to a second project. Falling through to the next
+    candidate name is what keeps that from happening.
+
+    MEASURED RED at base ``fc6f048b55``, scratch mutation reverted before commit:
+    swapping ``cand.is_file()`` for ``cand.exists()`` — RED::
+
+        E  AssertionError: a directory was returned as a config file
+        E  assert PosixPath('.../proj-a/dark-factory-orchestrator.yaml') ==
+        E    PosixPath('.../proj-a/orchestrator.yaml')
+    """
+    root = tmp_path / "proj-a"
+    root.mkdir()
+    (root / "dark-factory-orchestrator.yaml").mkdir()  # a DIRECTORY with the canonical name
+    legacy = _touch_config(root, "orchestrator.yaml")
+
+    assert fep.find_config(root) == legacy, "a directory was returned as a config file"
