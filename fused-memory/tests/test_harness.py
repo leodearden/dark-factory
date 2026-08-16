@@ -13752,6 +13752,737 @@ class TestHarnessCheckGraphitiQueueHealth:
         assert result is None
 
 
+# ── Tests for task 3709: harness._check_index_health ──────────────────────────
+#
+# HAZARD compliance for every index-health test in this module: fixtures are
+# mock-driven throughout.  No FalkorDriver is constructed, no
+# GraphitiBackend.initialize() is called, and no index is created or dropped —
+# real graphs' index state is protected evidence for open escalation esc-3375-1.
+
+
+def _index_records_for(specs):
+    """Invert an IndexSpec set into GraphitiBackend.list_indices()-shaped records.
+
+    Reuses ``test_ensure_indices._rows_for`` (the single row inverter) and then
+    applies the SAME by-name column projection ``list_indices`` itself performs,
+    so the fixture cannot drift from the shape the real method returns: rows are
+    what ``CALL db.indexes()`` yields, records are what ``list_indices`` returns
+    after resolving ``LIVE_HEADER`` positions.
+
+    Fixtures stay DERIVED from ``expected_index_set()`` — never a hard-coded 38 —
+    so a graphiti upgrade that changes the index set cannot make these tests pass
+    against a stale expectation.
+    """
+    from test_ensure_indices import _rows_for
+    from test_falkor_indices import LIVE_HEADER
+
+    from fused_memory.backends.falkor_indices import resolve_header_positions
+
+    positions = resolve_header_positions(
+        LIVE_HEADER,
+        {
+            'label': 'label',
+            'field': 'properties',
+            'type': 'types',
+            'entity_type': 'entitytype',
+        },
+    )
+    return [
+        {key: row[idx] for key, idx in positions.items()} for row in _rows_for(specs)
+    ]
+
+
+class TestHarnessCheckIndexHealth:
+    """ReconciliationHarness._check_index_health reads and classifies a graph's indices.
+
+    step-7 (RED): _check_index_health does not exist yet.
+    step-8 (GREEN): add it to harness.py.
+    """
+
+    @pytest.mark.asyncio
+    async def test_fully_provisioned_graph_reports_healthy(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """A graph carrying every expected index classifies as healthy."""
+        from fused_memory.backends.falkor_indices import expected_index_set
+
+        expected = expected_index_set()
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.memory.graphiti = MagicMock()
+        harness.memory.graphiti.list_indices = AsyncMock(
+            return_value=_index_records_for(expected)
+        )
+
+        result = await harness._check_index_health('dark_factory')
+
+        assert result is not None
+        assert result['healthy'] is True
+        assert result['missing'] == []
+        assert result['expected_total'] == len(expected)
+        harness.memory.graphiti.list_indices.assert_awaited_once_with(
+            group_id='dark_factory'
+        )
+
+    @pytest.mark.asyncio
+    async def test_absent_index_reports_drift_at_one_altitude(
+        self, journal, event_buffer, mock_memory_service, caplog
+    ):
+        """One expected-but-absent index yields healthy=False and names it.
+
+        The drift WARNING itself belongs to `_detect_index_drift` (its only
+        caller), NOT here: warning in both places emitted two records carrying
+        the same facts, per project, per cycle, forever — noise that trains
+        readers to skip the field.  A read FAILURE is still logged here, because
+        those facts exist nowhere else; a successful classification is not.
+        """
+        import logging
+
+        from fused_memory.backends.falkor_indices import expected_index_set
+
+        expected = expected_index_set()
+        dropped = sorted(expected)[0]
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.memory.graphiti = MagicMock()
+        harness.memory.graphiti.list_indices = AsyncMock(
+            return_value=_index_records_for(expected - {dropped})
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = await harness._check_index_health('dark_factory')
+
+        assert result is not None
+        assert result['healthy'] is False
+        assert result['missing'] == [dropped]
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warnings == [], (
+            'A successful classification must not warn at this altitude — '
+            f'_detect_index_drift owns the drift WARNING; got {warnings}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_graphiti_is_none(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """No graphiti backend → None, not an exception."""
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.memory.graphiti = None  # type: ignore[assignment]
+
+        assert await harness._check_index_health('dark_factory') is None
+
+    @pytest.mark.asyncio
+    async def test_absent_graph_is_not_drift(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """A registered project whose graph does not exist yet is NOT drift.
+
+        α measured that `CALL db.indexes()` against a never-written graph key
+        raises `Invalid graph operation on empty key`.  PRD D6 names autotrade
+        and mission_control as registered projects with no graph yet — live, not
+        hypothetical.  Reporting the full expected set as missing would file an
+        escalation an operator cannot act on: there is nothing to repair until
+        something writes to the graph.
+
+        Absence is decided STRUCTURALLY via list_graphs() membership, never by
+        matching FalkorDB's error wording (D2).
+        """
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.memory.graphiti = MagicMock()
+        harness.memory.graphiti.list_indices = AsyncMock(
+            side_effect=RuntimeError('Invalid graph operation on empty key')
+        )
+        harness.memory.graphiti.list_graphs = AsyncMock(
+            return_value=['dark_factory', 'some_other_graph']
+        )
+
+        result = await harness._check_index_health('autotrade')
+
+        assert result is None, (
+            'A project with no graph yet must report unknown, never drift'
+        )
+
+    @pytest.mark.asyncio
+    async def test_read_failure_on_present_graph_is_fail_open(
+        self, journal, event_buffer, mock_memory_service, caplog
+    ):
+        """A read failure on a PRESENT graph degrades to unknown, never to 'fine'."""
+        import logging
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.memory.graphiti = MagicMock()
+        harness.memory.graphiti.list_indices = AsyncMock(
+            side_effect=RuntimeError('connection reset')
+        )
+        harness.memory.graphiti.list_graphs = AsyncMock(
+            return_value=['dark_factory', 'autotrade']
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = await harness._check_index_health('dark_factory')
+
+        assert result is None, (
+            'A failed read must degrade to unknown — never a fabricated healthy record'
+        )
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warnings, 'A failed read on a present graph must be logged'
+        assert any('dark_factory' in r.getMessage() for r in warnings), (
+            'The WARNING must name the group_id it failed for'
+        )
+
+    @pytest.mark.asyncio
+    async def test_list_graphs_failure_is_also_fail_open(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """Even the absence check failing degrades to None rather than raising."""
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.memory.graphiti = MagicMock()
+        harness.memory.graphiti.list_indices = AsyncMock(
+            side_effect=RuntimeError('connection reset')
+        )
+        harness.memory.graphiti.list_graphs = AsyncMock(
+            side_effect=RuntimeError('server down')
+        )
+
+        assert await harness._check_index_health('dark_factory') is None
+
+    @pytest.mark.asyncio
+    async def test_malformed_record_shape_is_not_swallowed_into_all_missing(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """α's fail-closed IndexRecordShapeError must not degrade to 'everything missing'.
+
+        Normalisation runs OUTSIDE the read's try block: swallowing a shape
+        error into `actual = set()` would report a fully-provisioned graph as
+        entirely un-provisioned and file a bogus escalation.
+        """
+        from fused_memory.backends.falkor_indices import IndexRecordShapeError
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.memory.graphiti = MagicMock()
+        # entity_type bound to the options column (a dict) — the exact
+        # mis-binding α's shape check exists to catch.
+        harness.memory.graphiti.list_indices = AsyncMock(
+            return_value=[
+                {
+                    'label': 'Entity',
+                    'field': ['name'],
+                    'type': {'name': ['RANGE']},
+                    'entity_type': {'uuid': {}},
+                }
+            ]
+        )
+
+        with pytest.raises(IndexRecordShapeError):
+            await harness._check_index_health('dark_factory')
+
+
+class TestHarnessDetectIndexDrift:
+    """ReconciliationHarness._detect_index_drift summarizes, escalates and memoizes.
+
+    Wired to a REAL EscalationQueue on tmp_path (the _make_dedup_harness pattern)
+    so the INV-4 storm escape is proven end-to-end at the caller's altitude, not
+    just against a mocked queue.
+
+    step-9 (RED): _detect_index_drift does not exist yet.
+    step-10 (GREEN): add it to harness.py.
+    """
+
+    def _harness_with_queue(
+        self, journal, event_buffer, mock_memory_service, tmp_path, specs
+    ):
+        from escalation.queue import EscalationQueue
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.memory.graphiti = MagicMock()
+        harness.memory.graphiti.list_indices = AsyncMock(
+            return_value=_index_records_for(specs)
+        )
+        queue_dir = tmp_path / 'recon_esc'
+        harness._escalation_queue = EscalationQueue(queue_dir)
+        return harness, queue_dir
+
+    # --- (a)+(b) storm escape at the caller's altitude ---
+
+    @pytest.mark.asyncio
+    async def test_repeated_drift_files_exactly_one_escalation(
+        self, journal, event_buffer, mock_memory_service, tmp_path
+    ):
+        """Two cycles observing the same drift file ONE escalation (boundary test 5)."""
+        import json as _json
+
+        from fused_memory.backends.falkor_indices import expected_index_set
+
+        expected = expected_index_set()
+        dropped = sorted(expected)[0]
+        harness, queue_dir = self._harness_with_queue(
+            journal, event_buffer, mock_memory_service, tmp_path, expected - {dropped}
+        )
+
+        first = await harness._detect_index_drift('dark_factory')
+        second = await harness._detect_index_drift('dark_factory')
+
+        files = list(queue_dir.glob('esc-*.json'))
+        assert len(files) == 1, f'Expected exactly one escalation, got {files}'
+        record = _json.loads(files[0].read_text())
+        assert record['category'] == 'recon_missing_index'
+        assert record['index_health']['group_id'] == 'dark_factory'
+
+        # (b) the caller always gets the facts, even when nothing was filed
+        assert first is not None and second is not None
+        assert first['healthy'] is False
+        assert second['healthy'] is False
+        assert second['missing'] == [dropped]
+
+    # --- (c) healthy is silent ---
+
+    @pytest.mark.asyncio
+    async def test_healthy_graph_files_nothing(
+        self, journal, event_buffer, mock_memory_service, tmp_path
+    ):
+        """A fully-provisioned graph returns its record and files no escalation."""
+        from fused_memory.backends.falkor_indices import expected_index_set
+
+        harness, queue_dir = self._harness_with_queue(
+            journal, event_buffer, mock_memory_service, tmp_path, expected_index_set()
+        )
+
+        result = await harness._detect_index_drift('dark_factory')
+
+        assert result is not None
+        assert result['healthy'] is True
+        assert list(queue_dir.glob('esc-*.json')) == []
+
+    # --- (d) no queue is not a crash ---
+
+    @pytest.mark.asyncio
+    async def test_no_escalation_queue_still_returns_record(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """With _escalation_queue None the detector still reports, and does not crash."""
+        from fused_memory.backends.falkor_indices import expected_index_set
+
+        expected = expected_index_set()
+        dropped = sorted(expected)[0]
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.memory.graphiti = MagicMock()
+        harness.memory.graphiti.list_indices = AsyncMock(
+            return_value=_index_records_for(expected - {dropped})
+        )
+        harness._escalation_queue = None
+
+        result = await harness._detect_index_drift('dark_factory')
+
+        assert result is not None
+        assert result['healthy'] is False
+
+    @pytest.mark.asyncio
+    async def test_unreadable_graph_returns_none(
+        self, journal, event_buffer, mock_memory_service, tmp_path
+    ):
+        """When the health read reports unknown, the detector propagates None."""
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.memory.graphiti = None  # type: ignore[assignment]
+
+        assert await harness._detect_index_drift('dark_factory') is None
+
+    # --- (d2) the drift WARNING lives here, and logs on CHANGE only ---
+
+    @pytest.mark.asyncio
+    async def test_drift_warns_once_per_unchanged_missing_set(
+        self, journal, event_buffer, mock_memory_service, tmp_path, caplog
+    ):
+        """An unchanged drift set warns ONCE, and the record carries every fact.
+
+        Until γ (provisioning) lands every registered graph is unprovisioned, so
+        an unconditional WARNING would repeat identical facts once per project
+        per cycle forever.  INV-4 makes the OPEN escalation — not the log line —
+        the standing loud signal, so the log records TRANSITIONS only.  The
+        record must still carry `actual_total`, the one fact the dropped
+        `_check_index_health` WARNING carried and this one did not.
+        """
+        import logging
+
+        from fused_memory.backends.falkor_indices import expected_index_set
+
+        expected = expected_index_set()
+        dropped = sorted(expected)[0]
+        harness, _ = self._harness_with_queue(
+            journal, event_buffer, mock_memory_service, tmp_path, expected - {dropped}
+        )
+
+        with caplog.at_level(logging.WARNING):
+            await harness._detect_index_drift('dark_factory')
+            await harness._detect_index_drift('dark_factory')
+
+        drift_logs = [
+            r for r in caplog.records if 'index_drift_detected' in r.getMessage()
+        ]
+        assert len(drift_logs) == 1, (
+            'An unchanged drift set must warn exactly once across two cycles, '
+            f'got {len(drift_logs)}'
+        )
+        assert drift_logs[0].missing_count == 1
+        assert drift_logs[0].expected_total == len(expected)
+        assert drift_logs[0].actual_total == len(expected) - 1, (
+            'actual_total must survive the drop of the inner WARNING — no fact '
+            'may be lost by collapsing the two records into one'
+        )
+
+    @pytest.mark.asyncio
+    async def test_changed_and_recovered_drift_sets_warn_again(
+        self, journal, event_buffer, mock_memory_service, tmp_path, caplog
+    ):
+        """A CHANGED missing set re-warns, and recovery re-arms the memo.
+
+        Recovery clearing the memo is what keeps a later re-drift loud: were the
+        pre-repair set left behind, a graph that lost the SAME index again would
+        be silently suppressed forever.
+        """
+        import logging
+
+        from fused_memory.backends.falkor_indices import expected_index_set
+
+        expected = expected_index_set()
+        first_dropped, second_dropped = sorted(expected)[:2]
+        harness, _ = self._harness_with_queue(
+            journal,
+            event_buffer,
+            mock_memory_service,
+            tmp_path,
+            expected - {first_dropped},
+        )
+
+        with caplog.at_level(logging.WARNING):
+            await harness._detect_index_drift('dark_factory')  # warns (new)
+            harness.memory.graphiti.list_indices = AsyncMock(
+                return_value=_index_records_for(
+                    expected - {first_dropped, second_dropped}
+                )
+            )
+            await harness._detect_index_drift('dark_factory')  # warns (changed)
+            harness.memory.graphiti.list_indices = AsyncMock(
+                return_value=_index_records_for(expected)
+            )
+            await harness._detect_index_drift('dark_factory')  # healthy: re-arms
+            harness.memory.graphiti.list_indices = AsyncMock(
+                return_value=_index_records_for(expected - {first_dropped})
+            )
+            await harness._detect_index_drift('dark_factory')  # warns (re-drift)
+
+        drift_logs = [
+            r for r in caplog.records if 'index_drift_detected' in r.getMessage()
+        ]
+        assert len(drift_logs) == 3, (
+            'Expected a WARNING for the first drift, the changed set and the '
+            f'post-recovery re-drift; got {len(drift_logs)}'
+        )
+        assert [r.missing_count for r in drift_logs] == [1, 2, 1]
+
+    # --- (e) Q4: unexpected indices log at INFO on CHANGE only ---
+
+    @pytest.mark.asyncio
+    async def test_unexpected_index_logs_info_once_and_files_nothing(
+        self, journal, event_buffer, mock_memory_service, tmp_path, caplog
+    ):
+        """An operator-added index is INFO-logged once, never escalated (Q4/D8).
+
+        Logging it every cycle would be the same noise in a cheaper channel: the
+        recon cadence runs continuously, so one operator-added index would emit
+        an identical line forever, training readers to ignore the field.
+        """
+        import logging
+
+        from fused_memory.backends.falkor_indices import expected_index_set
+
+        extra_spec = ('Entity', 'NODE', 'operator_added_field', 'RANGE')
+        harness, queue_dir = self._harness_with_queue(
+            journal,
+            event_buffer,
+            mock_memory_service,
+            tmp_path,
+            expected_index_set() | {extra_spec},
+        )
+
+        with caplog.at_level(logging.INFO):
+            first = await harness._detect_index_drift('dark_factory')
+            await harness._detect_index_drift('dark_factory')
+
+        assert first is not None
+        assert first['healthy'] is True
+        assert first['unexpected'] == [extra_spec]
+        assert list(queue_dir.glob('esc-*.json')) == [], (
+            'An operator-added index is not drift — it must never escalate'
+        )
+
+        unexpected_logs = [
+            r
+            for r in caplog.records
+            if 'index_unexpected_present' in r.getMessage()
+        ]
+        assert len(unexpected_logs) == 1, (
+            'The unchanged unexpected set must log exactly once across two '
+            f'cycles, got {len(unexpected_logs)}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_changed_unexpected_set_logs_again(
+        self, journal, event_buffer, mock_memory_service, tmp_path, caplog
+    ):
+        """A CHANGE in the unexpected set emits a second INFO — the memo is per-set."""
+        import logging
+
+        from fused_memory.backends.falkor_indices import expected_index_set
+
+        expected = expected_index_set()
+        first_extra = ('Entity', 'NODE', 'operator_added_one', 'RANGE')
+        second_extra = ('Entity', 'NODE', 'operator_added_two', 'RANGE')
+
+        harness, _ = self._harness_with_queue(
+            journal, event_buffer, mock_memory_service, tmp_path, expected | {first_extra}
+        )
+
+        with caplog.at_level(logging.INFO):
+            await harness._detect_index_drift('dark_factory')
+            harness.memory.graphiti.list_indices = AsyncMock(
+                return_value=_index_records_for(expected | {first_extra, second_extra})
+            )
+            await harness._detect_index_drift('dark_factory')
+
+        unexpected_logs = [
+            r for r in caplog.records if 'index_unexpected_present' in r.getMessage()
+        ]
+        assert len(unexpected_logs) == 2, (
+            'A changed unexpected set must be re-reported, got '
+            f'{len(unexpected_logs)} log(s)'
+        )
+
+    @pytest.mark.asyncio
+    async def test_unexpected_memo_is_keyed_by_graph(
+        self, journal, event_buffer, mock_memory_service, tmp_path, caplog
+    ):
+        """One graph's unexpected set must not suppress another graph's."""
+        import logging
+
+        from fused_memory.backends.falkor_indices import expected_index_set
+
+        extra_spec = ('Entity', 'NODE', 'operator_added_field', 'RANGE')
+        harness, _ = self._harness_with_queue(
+            journal,
+            event_buffer,
+            mock_memory_service,
+            tmp_path,
+            expected_index_set() | {extra_spec},
+        )
+
+        with caplog.at_level(logging.INFO):
+            await harness._detect_index_drift('dark_factory')
+            await harness._detect_index_drift('autotrade')
+
+        unexpected_logs = [
+            r for r in caplog.records if 'index_unexpected_present' in r.getMessage()
+        ]
+        assert len(unexpected_logs) == 2, (
+            'The memo is keyed by group_id, so a second graph reports its own '
+            f'unexpected set, got {len(unexpected_logs)}'
+        )
+
+
+class TestHarnessIndexHealthStartupSweep:
+    """ReconciliationHarness._check_index_health_at_startup is REGISTRY-scoped.
+
+    Q3's startup half.  The scope is `self._known_projects` — the same registry
+    D5 names (taskmaster.project_root + DASHBOARD_KNOWN_PROJECT_ROOTS) — NOT
+    `initialize()`'s `!= default_db and not endswith('_db')` graph filter.  That
+    filter matches all 35 probe/test/scratch graphs plus the real ones, and
+    since γ has not landed EVERY one of them is genuinely un-provisioned today:
+    sweeping it would file ~35 escalations on the first restart, converting a
+    loud signal into noise the watcher would close one by one.
+
+    step-11 (RED): _check_index_health_at_startup does not exist yet.
+    step-12 (GREEN): add it to harness.py.
+    """
+
+    def _sweep_harness(self, journal, event_buffer, mock_memory_service):
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness._known_projects = {
+            'dark_factory': '/tmp/df',
+            'autotrade': '/tmp/at',
+        }
+        harness.memory.graphiti = MagicMock()
+        # The graph server also hosts unregistered scratch graphs — the sweep
+        # must never health-check these.
+        harness.memory.graphiti.list_graphs = AsyncMock(
+            return_value=[
+                'dark_factory',
+                'autotrade',
+                '_test_foo_ab12cd34',
+                'probe_e1_gw3',
+                'my_solar_challenge',
+            ]
+        )
+        return harness
+
+    @pytest.mark.asyncio
+    async def test_sweep_visits_exactly_the_registered_projects(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """Only registered project ids are checked — never the scratch graphs."""
+        harness = self._sweep_harness(journal, event_buffer, mock_memory_service)
+        seen = []
+
+        async def _record(group_id, **kwargs):
+            seen.append(group_id)
+            return None
+
+        harness._detect_index_drift = _record
+
+        await harness._check_index_health_at_startup()
+
+        assert seen == ['autotrade', 'dark_factory'], (
+            'The sweep must visit exactly the REGISTERED projects, in sorted '
+            f'order, and no scratch graph; got {seen}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_sweep_never_touches_unregistered_scratch_graphs(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """A probe/test/scratch graph must not be turned into an escalation."""
+        harness = self._sweep_harness(journal, event_buffer, mock_memory_service)
+        seen = []
+
+        async def _record(group_id, **kwargs):
+            seen.append(group_id)
+            return None
+
+        harness._detect_index_drift = _record
+
+        await harness._check_index_health_at_startup()
+
+        for scratch in ('_test_foo_ab12cd34', 'probe_e1_gw3', 'my_solar_challenge'):
+            assert scratch not in seen, (
+                f'{scratch} is not a registered project — health-checking it '
+                'would file an escalation no operator can act on'
+            )
+
+    @pytest.mark.asyncio
+    async def test_one_project_failing_does_not_skip_the_rest(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """Isolation: a raise on the first project must not abort the sweep.
+
+        A health hiccup must never break harness startup — exactly the posture
+        the sibling one-shot recovery passes document.
+        """
+        harness = self._sweep_harness(journal, event_buffer, mock_memory_service)
+        seen = []
+
+        async def _flaky(group_id, **kwargs):
+            seen.append(group_id)
+            if group_id == 'autotrade':  # the FIRST in sorted order
+                raise RuntimeError('graph server unreachable')
+            return None
+
+        harness._detect_index_drift = _flaky
+
+        await harness._check_index_health_at_startup()
+
+        assert seen == ['autotrade', 'dark_factory'], (
+            f'The sweep must continue past a failing project; got {seen}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_empty_registry_is_a_silent_noop(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """No registered projects → nothing checked, nothing raised."""
+        harness = self._sweep_harness(journal, event_buffer, mock_memory_service)
+        harness._known_projects = {}
+        harness._detect_index_drift = AsyncMock()
+
+        await harness._check_index_health_at_startup()
+
+        harness._detect_index_drift.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_sweep_itself_never_raises(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """Every project failing still returns normally — startup is never broken."""
+        harness = self._sweep_harness(journal, event_buffer, mock_memory_service)
+        harness._detect_index_drift = AsyncMock(
+            side_effect=RuntimeError('everything is down')
+        )
+
+        await harness._check_index_health_at_startup()
+
+    @pytest.mark.asyncio
+    async def test_run_loop_sweeps_index_health_at_startup(
+        self, journal, event_buffer, mock_memory_service, monkeypatch
+    ):
+        """run_loop() must actually REACH the sweep — once, before the reaper ticks.
+
+        Without this the startup half of Q3 has no wiring test: every assertion
+        above drives `_check_index_health_at_startup` directly, so deleting its
+        call from run_loop would leave the whole suite green while the sweep
+        silently stopped running — the exact 'regression to invisible' the
+        cadence-half wiring test (TestFullCycleWiringIndexHealth) exists to
+        prevent.  Mirrors the sibling one-shot startup contract test
+        (test_run_loop_resumes_interrupted_runs_at_startup_before_reaper),
+        including its raise, which also pins that the startup guard around the
+        sweep cannot crash run_loop.
+        """
+        real_sleep = asyncio.sleep
+
+        async def fast_sleep(seconds: float) -> None:
+            await real_sleep(0)
+
+        monkeypatch.setattr('fused_memory.reconciliation.harness._sleep', fast_sleep)
+
+        harness = self._sweep_harness(journal, event_buffer, mock_memory_service)
+
+        call_order: list[str] = []
+        sweep_event = asyncio.Event()
+        stale_event = asyncio.Event()
+
+        async def sweep_side_effect():
+            call_order.append('sweep')
+            sweep_event.set()
+            raise RuntimeError('boom — simulated index-health failure')
+
+        async def stale_runs_side_effect():
+            call_order.append('stale')
+            if call_order.count('stale') >= 2:
+                stale_event.set()
+
+        harness._check_index_health_at_startup = AsyncMock(
+            side_effect=sweep_side_effect
+        )
+        harness._recover_predecessor_runs = AsyncMock(return_value=None)
+        harness._resume_interrupted_runs = AsyncMock(return_value=None)
+        harness._recover_stale_runs = AsyncMock(side_effect=stale_runs_side_effect)
+        harness._start_escalation_server = AsyncMock()
+        harness._stop_escalation_server = AsyncMock()
+        harness.buffer.get_active_projects = AsyncMock(return_value=[])
+        if harness.judge is not None:
+            harness.judge.initialize = AsyncMock()
+
+        await _drive_run_loop_until(harness, sweep_event, stale_event)
+
+        # Ran exactly once at startup despite raising — not once per iteration.
+        assert harness._check_index_health_at_startup.call_count == 1, (
+            'The index-health sweep must run exactly once at startup; called '
+            f'{harness._check_index_health_at_startup.call_count} times'
+        )
+        # The loop kept iterating (the startup try/except guard did not crash it).
+        assert harness._recover_stale_runs.call_count >= 2
+        # Ordering: the sweep precedes any reaper tick.
+        assert call_order[0] == 'sweep', (
+            '_check_index_health_at_startup must run before the first '
+            f'_recover_stale_runs tick; call order was: {call_order!r}'
+        )
+        assert 'stale' in call_order[1:]
+
+
 # ── Tests for task 1938: harness._reconcile_status_correction ──────────────────
 
 
@@ -14630,6 +15361,195 @@ async def test_finding_persistence_count_journal_failure_fails_toward_escalate(
         f'when journal.get_recent_runs raises, got {result!r}. '
         'RED: current impl returns 0 (suppresses escalation).'
     )
+
+
+class TestFullCycleWiringIndexHealth:
+    """run_full_cycle must reach the index drift detector and thread its record.
+
+    This pins the recon-cadence half of Q3.  Without it a wiring regression
+    would silently revert index drift to invisible — exactly the four-month
+    silent failure this PRD exists to end — while every unit test still passed.
+
+    step-15 (RED): run_full_cycle never calls the detector and
+        _configure_consolidator has no index_health parameter, so the class
+        default None survives to run() time.
+    step-16 (GREEN): call _detect_index_drift in run_full_cycle and thread it
+        through _configure_consolidator.
+    step-17 (RED): a record shape α fails closed on escapes run_full_cycle and
+        wedges the cycle for every project.
+    step-18 (GREEN): guard the cadence call site so the diagnostic degrades to
+        UNKNOWN instead of failing the cycle it diagnoses.
+    """
+
+    @pytest.mark.asyncio
+    async def test_run_full_cycle_threads_index_health_into_stage1(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """A full cycle reaches the detector and its record arrives at Stage 1."""
+        from fused_memory.backends.falkor_indices import expected_index_set
+        from fused_memory.reconciliation.stages.memory_consolidator import (
+            MemoryConsolidator,
+        )
+
+        expected = expected_index_set()
+        dropped = sorted(expected)[0]
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.memory.graphiti = MagicMock()
+        harness.memory.graphiti.list_indices = AsyncMock(
+            return_value=_index_records_for(expected - {dropped})
+        )
+
+        captured: dict = {}
+
+        async def capture_diags(stage):
+            captured['index_health'] = stage.index_health
+
+        for stage in harness.stages:
+            if isinstance(stage, MemoryConsolidator):
+                _mock_stage_run(stage, before_return=capture_diags)
+            else:
+                _mock_stage_run(stage)
+
+        await harness.run_full_cycle(
+            'test-project',
+            'index-health-wiring-test',
+            events=[_make_event()],
+        )
+
+        assert captured, (
+            'MemoryConsolidator.run() was never invoked — run_full_cycle '
+            'skipped it or the stage list changed'
+        )
+
+        ih = captured.get('index_health')
+        assert ih is not None, (
+            'MemoryConsolidator.index_health is None — run_full_cycle must call '
+            '_detect_index_drift and pass index_health= to _configure_consolidator '
+            'at the production call site'
+        )
+        assert ih['healthy'] is False, (
+            f'Expected the mocked drifted graph to report unhealthy, got {ih!r}'
+        )
+        assert ih['missing'] == [dropped]
+        assert ih['expected_total'] == len(expected)
+
+    @pytest.mark.asyncio
+    async def test_healthy_graph_still_threads_a_record(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """The HEALTHY record reaches Stage 1 too — ζ reads it to verify activation."""
+        from fused_memory.backends.falkor_indices import expected_index_set
+        from fused_memory.reconciliation.stages.memory_consolidator import (
+            MemoryConsolidator,
+        )
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.memory.graphiti = MagicMock()
+        harness.memory.graphiti.list_indices = AsyncMock(
+            return_value=_index_records_for(expected_index_set())
+        )
+
+        captured: dict = {}
+
+        async def capture_diags(stage):
+            captured['index_health'] = stage.index_health
+
+        for stage in harness.stages:
+            if isinstance(stage, MemoryConsolidator):
+                _mock_stage_run(stage, before_return=capture_diags)
+            else:
+                _mock_stage_run(stage)
+
+        await harness.run_full_cycle(
+            'test-project',
+            'index-health-wiring-healthy',
+            events=[_make_event()],
+        )
+
+        ih = captured.get('index_health')
+        assert ih is not None and ih['healthy'] is True
+
+    @pytest.mark.asyncio
+    async def test_malformed_index_record_does_not_abort_the_cycle(
+        self, journal, event_buffer, mock_memory_service, caplog
+    ):
+        """A surprising `CALL db.indexes()` record must not wedge the whole cycle.
+
+        A read-only diagnostic must never be able to fail the thing it is
+        diagnosing.  TODAY `IndexRecordShapeError` escapes `run_full_cycle`
+        straight out of the coroutine, and by that point `journal.start_run(run)`
+        has already persisted the run as `running` and the caller's
+        `buffer.drain()` has already marked the cycle's events drained — while
+        the project loop's generic `except Exception` only logs `Project loop
+        error` and `restore_drained` runs ONLY on the TimeoutError branch.  So
+        one surprising record wedges every full cycle for every project, leaves
+        dangling `running` runs and DROPS the drained event batch.
+
+        α's fail-closed intent is preserved, not discarded: the read still
+        yields UNKNOWN (never a synthesised healthy record) and still goes loud.
+        """
+        from fused_memory.backends.falkor_indices import expected_index_set
+        from fused_memory.reconciliation.stages.memory_consolidator import (
+            MemoryConsolidator,
+        )
+
+        # Derive the shape, then mis-bind exactly ONE column: `entity_type`
+        # carrying the options dict is the real mis-binding α fails closed on
+        # (falkor_indices.normalize_index_record rejects a non-str entity_type).
+        # Everything else about the record stays DERIVED, never hand-rolled.
+        malformed = dict(_index_records_for(expected_index_set())[0])
+        malformed['entity_type'] = {'some': 'option'}
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.memory.graphiti = MagicMock()
+        harness.memory.graphiti.list_indices = AsyncMock(return_value=[malformed])
+
+        captured: dict = {}
+
+        async def capture_diags(stage):
+            captured['index_health'] = stage.index_health
+
+        for stage in harness.stages:
+            if isinstance(stage, MemoryConsolidator):
+                _mock_stage_run(stage, before_return=capture_diags)
+            else:
+                _mock_stage_run(stage)
+
+        with caplog.at_level(logging.WARNING):
+            # (a) THE REGRESSION: this must COMPLETE, not raise.
+            await harness.run_full_cycle(
+                'test-project',
+                'index-health-malformed-record',
+                events=[_make_event()],
+            )
+
+        # (b) The cycle carried on and Stage 1 still ran — with UNKNOWN health,
+        # never a fabricated healthy record.  (Per step-14 a None record leaves
+        # the 'index_health' key ABSENT from report.stats, so no consumer can
+        # read it as "checked and fine".)
+        assert captured, (
+            'MemoryConsolidator.run() was never reached — the malformed index '
+            'record aborted the cycle instead of degrading to unknown health'
+        )
+        assert captured['index_health'] is None, (
+            'A failed diagnostics read must degrade to UNKNOWN (None), never to '
+            f'a health record: {captured["index_health"]!r}'
+        )
+
+        # (c) LOUD, not silent: α's fail-closed intent survives the guard.
+        warnings = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno >= logging.WARNING
+            and 'test-project' in r.getMessage()
+            and 'index' in r.getMessage().lower()
+        ]
+        assert warnings, (
+            'The surprising index record was swallowed silently. Expected a '
+            'WARNING naming the group_id; got: '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -22,6 +22,10 @@ from shared.cli_invoke import AllAccountsCappedException, read_transcript_record
 from shared.config_dir import TaskConfigDir
 from shared.usage_gate import UsageGate
 
+from fused_memory.backends.falkor_indices import (
+    expected_index_set,
+    normalize_index_records,
+)
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.mcp_tools.scheduler_state import read_scheduler_state
 from fused_memory.models.reconciliation import (
@@ -46,6 +50,8 @@ from fused_memory.reconciliation.cli_stage_runner import (
     recon_config_base_dir,
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
+from fused_memory.reconciliation.index_drift_detector import escalate_missing_indices
+from fused_memory.reconciliation.index_health import summarize_index_health
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.judge import Judge
 from fused_memory.reconciliation.mem0_dedup import find_prior_memory
@@ -655,6 +661,28 @@ class ReconciliationHarness:
         # drain or timeout raises mid-stage), never leaking a phantom-busy run.
         self._active_runs = ActiveRunRegistry()
 
+        # Q4 (task 3709): last-reported set of UNEXPECTED (operator-added)
+        # indices per graph, so `_detect_index_drift` logs one at INFO only when
+        # it CHANGES.  Logging every cycle would be noise in a cheaper channel —
+        # the recon cadence runs continuously, so one operator-added index would
+        # emit an identical line forever and train readers to ignore the field.
+        # Deliberately in-process and NOT durable: a restart re-logging each
+        # graph's current set once is correct, since a fresh process has never
+        # reported it.  Keyed by group_id so one graph cannot suppress another.
+        self._last_unexpected_indices: dict[str, tuple] = {}
+
+        # Same change-memo, applied to the MISSING set for the drift WARNING
+        # (task 3709).  Until γ (provisioning) lands every registered graph is
+        # unprovisioned, so an unconditional WARNING would emit identical facts
+        # once per project per cycle forever — the same noise failure the memo
+        # above exists to prevent, and INV-4 already designates the OPEN
+        # escalation, not the log line, as the standing loud signal.  Gates ONLY
+        # the log line: filing stays unconditional (the queue's own has_open_l1
+        # dedup owns that), so an escalation closed while the drift persists can
+        # still be re-filed.  Cleared when a graph recovers, so a later re-drift
+        # is loud again.
+        self._last_missing_indices: dict[str, tuple] = {}
+
     async def _notify_judge_halt(self, project_id: str, reason: str) -> None:
         """WP-D: forward judge halts to the backlog policy exactly once.
 
@@ -922,6 +950,7 @@ class ReconciliationHarness:
         filtered_task_tree: FilteredTaskTree | None = None,
         task_count_verification: dict | None = None,
         graphiti_queue_health: dict | None = None,
+        index_health: dict | None = None,
         status_correction_reconciliation: dict | None = None,
     ) -> None:
         """Apply tier limits and mode-specific attributes to MemoryConsolidator.
@@ -937,6 +966,8 @@ class ReconciliationHarness:
             in full-cycle passes; None in remediation passes).
         graphiti_queue_health: summarize_graphiti_queue_health record (available only
             in full-cycle passes; None in remediation passes).
+        index_health: _detect_index_drift record (task 3709; available only in
+            full-cycle passes; None in remediation passes).
         status_correction_reconciliation: _reconcile_status_correction record
             (task 1938; available only in full-cycle passes; None in
             remediation passes).
@@ -950,6 +981,7 @@ class ReconciliationHarness:
         stage.filtered_task_tree = filtered_task_tree
         stage.task_count_verification = task_count_verification
         stage.graphiti_queue_health = graphiti_queue_health
+        stage.index_health = index_health
         stage.status_correction_reconciliation = status_correction_reconciliation
 
     @staticmethod
@@ -1149,6 +1181,201 @@ class ReconciliationHarness:
                 f'_check_graphiti_queue_health failed for project_id={project_id!r}: {exc}'
             )
             return None
+
+    async def _check_index_health(self, group_id: str) -> dict | None:
+        """Read a graph's actual index set and classify it against the expected one.
+
+        Surfaces the silent-failure tail this PRD exists for: graphiti's index
+        provisioning was stubbed, so graphs served queries with none of the
+        indices they should have had.  Nothing failed — reads just got slower and
+        no signal was ever emitted.
+
+        The read is `ro_query`-based (`GraphitiBackend.list_indices` issues
+        `CALL db.indexes()` via `GRAPH.RO_QUERY`) and therefore CANNOT create,
+        drop or alter an index.  That is the HAZARD control which lets this run
+        against real graphs while esc-3375-1's index-state evidence stays intact.
+
+        Args:
+            group_id: The graph to check (a project id).
+
+        Returns:
+            A `summarize_index_health()` record, or None when the graphiti
+            backend is unavailable, the graph does not exist yet, or the read
+            failed.  None means UNKNOWN — never a synthesised healthy record.
+
+        Raises:
+            IndexRecordShapeError: `CALL db.indexes()` returned a record shape α
+                refuses to interpret.  Normalisation deliberately runs OUTSIDE
+                the try block: swallowing this into `actual = set()` would report
+                a fully-provisioned graph as entirely un-provisioned and file a
+                bogus escalation.
+        """
+        graphiti = getattr(self.memory, 'graphiti', None)
+        if graphiti is None:
+            return None
+        try:
+            records = await graphiti.list_indices(group_id=group_id)
+        except Exception as exc:
+            # Decide graph-absence STRUCTURALLY, never by matching FalkorDB's
+            # error wording (D2).  A registered project with no graph yet (D6
+            # names autotrade and mission_control) is NOT drift: there is
+            # nothing to repair until something writes to the graph, so
+            # reporting the full expected set as missing would file an
+            # escalation an operator cannot act on.
+            try:
+                if group_id not in await graphiti.list_graphs():
+                    return None
+            except Exception as probe_exc:
+                logger.warning(
+                    f'_check_index_health could not determine whether graph '
+                    f'{group_id!r} exists after a failed read: {probe_exc}'
+                )
+                return None
+            logger.warning(
+                f'_check_index_health failed for group_id={group_id!r}: {exc}'
+            )
+            return None
+
+        # Classify and return — the DRIFT verdict is deliberately not logged
+        # here.  `_detect_index_drift` logs it one layer up with the same facts
+        # plus run_id, and it is the only caller, so warning in both places
+        # would emit two identical records per project per cycle forever (the
+        # third being the stage report's).  Read failures above ARE logged here:
+        # those facts exist nowhere else, since this method degrades them to a
+        # None the caller cannot distinguish from "no graphiti backend".
+        return summarize_index_health(
+            normalize_index_records(records), expected_index_set()
+        )
+
+    async def _detect_index_drift(
+        self, group_id: str, *, run_id: str | None = None
+    ) -> dict | None:
+        """Check a graph's index health and escalate when it has drifted.
+
+        The ONE detector both Q3 paths call — the registry-scoped startup sweep
+        (`_check_index_health_at_startup`) and the recon cadence
+        (`run_full_cycle`).  Sharing the detector, not merely the pure
+        summarizer, is what keeps δ from forking into two copies that silently
+        disagree: the startup path has no stage, no StageReport and no run, so a
+        stage-resident filer could not serve it at all.
+
+        Args:
+            group_id: The graph to check (a project id).
+            run_id: Reconciliation run that observed this, when there is one —
+                the startup sweep has none.
+
+        Returns:
+            The health record, or None when health is unknown.  The caller
+            ALWAYS gets the facts, whether or not anything was filed.
+        """
+        health = await self._check_index_health(group_id)
+        if health is None:
+            return None
+
+        if not health['healthy']:
+            # Log the drift on CHANGE only, the same memo Q4 applies to the
+            # unexpected set below.  Until γ lands every registered graph is
+            # unprovisioned, so an unconditional WARNING here would repeat
+            # identical facts once per project per cycle forever and train
+            # readers to skip the field; INV-4 makes the OPEN escalation, not
+            # the log line, the standing loud signal.  What survives is the
+            # TRANSITIONS: the first observation in a fresh process (the startup
+            # sweep always logs, since the memo is in-process) and any change in
+            # the missing set.  The per-run record is unaffected — Stage 1
+            # carries `report.stats['index_health']` and its own WARNING every
+            # cycle.
+            missing_now = tuple(health['missing'])
+            if self._last_missing_indices.get(group_id) != missing_now:
+                logger.warning(
+                    'reconciliation.index_drift_detected',
+                    extra={
+                        'group_id': group_id,
+                        'run_id': run_id,
+                        'missing_count': len(missing_now),
+                        'expected_total': health['expected_total'],
+                        'actual_total': health['actual_total'],
+                    },
+                )
+            self._last_missing_indices[group_id] = missing_now
+            # Filing is deliberately NOT memo-gated: the queue's own
+            # category-scoped has_open_l1 dedup owns suppression, so an
+            # escalation closed while the drift persists is re-filed rather
+            # than silently dropped by an in-process memo.
+            #
+            # NOTE (blocking I/O): has_open_l1 globs and parses the pending
+            # queue and submit() writes fsync-durably, both synchronously on the
+            # event loop — the `stage1_stall_detector` precedent this module
+            # follows does the same. Cost scales with pending-queue size; if
+            # that ever becomes measurable, offload this call with
+            # `await asyncio.to_thread(escalate_missing_indices, ...)` here
+            # rather than making the filer itself async (its other caller shape
+            # is synchronous).
+            if HAS_ESCALATION and self._escalation_queue is not None:
+                escalate_missing_indices(
+                    self._escalation_queue,
+                    group_id,
+                    health,
+                    project_id=group_id,
+                    run_id=run_id,
+                )
+        else:
+            # A recovered graph re-arms the memo so a later re-drift is loud
+            # again rather than being suppressed by the stale pre-repair set.
+            self._last_missing_indices.pop(group_id, None)
+
+        # Q4: report operator-added indices at INFO on CHANGE only, never
+        # escalate them (D8 — an operator-added index is not drift to repair, so
+        # escalating it would generate guaranteed-benign pages).
+        unexpected = tuple(health['unexpected'])
+        if unexpected and self._last_unexpected_indices.get(group_id) != unexpected:
+            logger.info(
+                'reconciliation.index_unexpected_present',
+                extra={
+                    'group_id': group_id,
+                    'run_id': run_id,
+                    'unexpected_count': len(unexpected),
+                    'unexpected': [list(spec) for spec in unexpected],
+                },
+            )
+        self._last_unexpected_indices[group_id] = unexpected
+
+        return health
+
+    async def _check_index_health_at_startup(self) -> None:
+        """One-shot index-health sweep over the REGISTERED projects (task 3709, Q3).
+
+        Q3 asked whether index health is checked at startup, on the recon
+        cadence, or both.  Both — and both call `_detect_index_drift`, so there
+        is one detector rather than two that can silently disagree.
+
+        WHY THE REGISTRY IS THE SCOPE: `self._known_projects` is built by
+        `build_known_projects_map` from `taskmaster.project_root` +
+        `DASHBOARD_KNOWN_PROJECT_ROOTS` — exactly the registry PRD D5 names — so
+        δ inherits D5's scoping without writing a filter in `backends/` that γ
+        will later own, and without pre-empting γ, which owns provisioning.
+
+        The alternative — reusing `GraphitiBackend.initialize()`'s
+        `!= 'default_db' and not endswith('_db')` graph filter — was rejected:
+        D5 measured it as all 35 probe/test/scratch graphs plus the 6 real ones,
+        and since γ has not landed EVERY one of those is genuinely
+        un-provisioned today.  A sweep there would file ~35
+        `recon_missing_index` escalations on the first restart — a flood the
+        recon-escalation-watcher would have to close one by one, converting a
+        loud signal into noise (INV-4).
+
+        Projects are visited in sorted order for determinism.  Each is wrapped
+        in its own guard so one project's failure cannot skip the rest, matching
+        the "safety net, not a gate" posture of the sibling one-shot passes.
+        Never raises.
+        """
+        for project_id in sorted(self._known_projects):
+            try:
+                await self._detect_index_drift(project_id)
+            except Exception as e:
+                logger.warning(
+                    f'_check_index_health_at_startup failed for '
+                    f'project_id={project_id!r}: {e}'
+                )
 
     async def _reconcile_status_correction(
         self, project_id: str, statuses: dict[str, str]
@@ -2299,6 +2526,15 @@ class ReconciliationHarness:
         except Exception as e:
             logger.warning(f'_recover_pending_judge_reviews at startup failed: {e}')
 
+        # One-shot: health-check the registered projects' FalkorDB index state
+        # (task 3709 / PRD δ Q3). Placed AFTER _start_escalation_server() so the
+        # queue exists to file into. Guarded like the sibling one-shot passes so
+        # a health hiccup can never crash harness startup.
+        try:
+            await self._check_index_health_at_startup()
+        except Exception as e:
+            logger.warning(f'_check_index_health_at_startup at startup failed: {e}')
+
         loop_count = 0
         try:
             while True:
@@ -2846,6 +3082,42 @@ class ReconciliationHarness:
         # Read Graphiti async-queue dead-letter count — surfaces silent-drop tail (task 1785)
         graphiti_queue_health = await self._check_graphiti_queue_health(scope.project_id)
 
+        # Check FalkorDB index provisioning and escalate on drift (task 3709 / PRD δ).
+        # This is the recon-cadence half of Q3; the startup sweep calls the SAME
+        # detector.  Kept here, outside the _active_runs.track block below, so a
+        # slow `CALL db.indexes()` read cannot be misattributed to a stage —
+        # exactly where the sibling diagnostics reads sit.
+        #
+        # WHY THE GUARD: `_check_index_health` deliberately lets α's fail-closed
+        # errors propagate rather than fabricate a health record —
+        # `IndexRecordShapeError` (a surprising `CALL db.indexes()` record) and
+        # `UnparsedIndexStatementError` (any graphiti-core statement-syntax
+        # change; graphiti-core is pinned open-ended `>=0.28.1`, so that is a
+        # live upgrade hazard, not a hypothetical).  Unguarded HERE, either one
+        # would escape `run_full_cycle` AFTER `journal.start_run` has persisted
+        # the run as `running` and the caller has drained the event buffer,
+        # wedging every full cycle for every project — permanently, in the
+        # graphiti-upgrade case — while the project loop's generic handler only
+        # logs and never calls `restore_drained`.  A read-only diagnostic must
+        # never be able to fail the cycle it diagnoses.  The fail-closed intent
+        # is preserved by logging loudly and yielding UNKNOWN (None), never a
+        # synthesised healthy record.  The guard belongs at THIS call site, not
+        # inside `_check_index_health` (normalisation must stay outside its try)
+        # and not inside `_detect_index_drift` (which would make the startup
+        # sweep's own per-project guard redundant and hide programming errors
+        # from the detector's unit tests).  `except Exception` lets
+        # `asyncio.CancelledError` — a `BaseException` since 3.8 — propagate on
+        # shutdown, exactly as the sibling guards rely on.
+        try:
+            index_health = await self._detect_index_drift(
+                scope.project_id, run_id=run_id
+            )
+        except Exception as e:
+            logger.warning(
+                f'_detect_index_drift failed for project_id={scope.project_id!r}: {e}'
+            )
+            index_health = None
+
         current_stage_name: str | None = None
         cycle_start_time = datetime.now(UTC)
         stages = self._make_stages(scope)
@@ -2881,6 +3153,7 @@ class ReconciliationHarness:
                             filtered_task_tree=filtered_task_tree,
                             task_count_verification=task_count_verification,
                             graphiti_queue_health=graphiti_queue_health,
+                            index_health=index_health,
                             status_correction_reconciliation=status_correction_reconciliation,
                         )
 

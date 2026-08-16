@@ -407,10 +407,13 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     are line-scoped and both can appear in ONE aggregated leg output — verify
     merges stderr into stdout verbatim, and a single ``bash -c`` chain can
     miss a slot deadline in an early step and lose its worktree in a later
-    one. Measured on this branch: an anchored ``lib_test_semaphore.sh: failed
-    to acquire …`` line concatenated with a ``getcwd`` collateral line
-    classifies ENV_TRANSIENT in EITHER concatenation order, decided entirely
-    by the collateral branch being evaluated first below.
+    one. Measured on this branch and now pinned as a standing property, not
+    a one-off spot-check: every anchored producer line in the grounded
+    slot-timeout corpus, concatenated with ANY of the five documented
+    collateral shapes (``_VERIFY_WORKTREE_COLLATERAL_READ_FAILURE_RE`` plus
+    the four in ``_VERIFY_WORKTREE_COLLATERAL_PATTERNS``), in EITHER
+    concatenation order, classifies ENV_TRANSIENT — decided entirely by the
+    collateral branch being evaluated first below.
 
     ENV_TRANSIENT is the intended winner there, for the same reason DISK_FULL
     outranks both: the removed worktree is the more specific root cause, and
@@ -418,7 +421,17 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     (``RetryKind.ENV_SERIAL`` versus SEMAPHORE_TIMEOUT's ``RetryKind.NONE``,
     which surfaces to a human). Reading collateral as a slot timeout would
     convert a self-recovering host condition into a blocking escalation.
-    Pinned by ``TestAnchoredSlotTimeoutWithCollateralIsEnvTransient``.
+    Pinned by ``TestAnchoredSlotTimeoutWithCollateralIsEnvTransient``, which
+    parametrizes every anchored producer line in the grounded slot-timeout
+    corpus against every documented collateral shape, in BOTH concatenation
+    orders, at ``ToolKind.OPAQUE`` and one representative non-opaque tool.
+    Guard 3's tool-blindness is already cross-producted over every
+    ``ToolKind`` by ``TestMergeVerifyCollateralEnvGuard`` above, so
+    re-crossing the full axis here would add cases with no added detection
+    power. The same corpus separately pins the recovery path itself —
+    ``CATEGORY_POLICY[result].retry_kind is RetryKind.ENV_SERIAL`` — the
+    consequence named in the paragraph above, not merely the category
+    label, at ``ToolKind.OPAQUE``.
 
     What task 3679 changed is not whether the order matters but WHICH inputs
     reach the tie: before, the arm was a loose co-occurrence that collateral
@@ -429,7 +442,12 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     that ``TestReplayedMergeVerifyCollateralWinsOverSemaphore``'s replayed
     5164/5071 fixtures no longer contain any anchored marker, so those two
     now pass structurally and pin nothing about this tie — which is exactly
-    why the dedicated co-occurrence test above exists alongside them.
+    why the dedicated co-occurrence test above exists alongside them. That
+    disclaimer is itself measured, not inferred: the co-occurrence test's
+    mutation-kill (hoisting the SEMAPHORE_TIMEOUT arm above the
+    ENV_TRANSIENT branches) fails every one of its cases while the replayed
+    5164/5071 fixtures, and the other neighbouring guard classes, stay
+    green.
 
     SEMAPHORE_TIMEOUT — LINE-ANCHORED, producer-grounded marker (task 3679,
     esc-5848-2 / esc-5893-3). The arm fires when *output* contains, AT THE
@@ -493,7 +511,8 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     ENV_TRANSIENT — merge-verify restart collateral (task 2831): a WIDER
     class of the same broken-``_merge-verify``-worktree host condition,
     grounded in the reify merge-gate RCA (2026-07-19) — five documented
-    shapes (``_VERIFY_WORKTREE_COLLATERAL_PATTERNS``) emitted when the
+    shapes (``_VERIFY_WORKTREE_COLLATERAL_READ_FAILURE_RE`` plus the four in
+    ``_VERIFY_WORKTREE_COLLATERAL_PATTERNS``) emitted when the
     ephemeral worktree is removed out from under a running verify: a
     read-failure of some other tracked file, a missing ``verify.sh``
     entrypoint, a failure to write captured output back into the worktree, a

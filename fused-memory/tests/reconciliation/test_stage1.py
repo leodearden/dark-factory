@@ -1598,6 +1598,177 @@ class TestMemoryConsolidatorGraphitiQueueHealthWiring:
 
 
 # ---------------------------------------------------------------------------
+# Task 3709 (PRD δ): index_health stat wiring
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryConsolidatorIndexHealthWiring:
+    """MemoryConsolidator.run() must surface index_health in report.stats.
+
+    The stage is a SURFACING POINT ONLY — it deliberately does not file the
+    escalation (unlike the HOR/gate-backlog path). The startup sweep has no
+    stage, so the filing lives in the harness detector both Q3 paths share; a
+    stage-resident filer would fork δ into two divergent detectors.
+
+    step-13 (RED): the index_health attribute and stat-wiring don't exist yet.
+    step-14 (GREEN): add class attribute + stat block in run().
+    """
+
+    def _base_report(self) -> StageReport:
+        return StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+        )
+
+    async def _run(self, stage, run_id: str) -> StageReport:
+        dedup_mock = AsyncMock(return_value=[])
+        with (
+            patch.object(
+                BaseStage, 'run', new=AsyncMock(return_value=self._base_report())
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=dedup_mock,
+            ),
+        ):
+            return await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id=run_id,
+            )
+
+    @pytest.mark.asyncio
+    async def test_index_health_stat_set_when_unhealthy(self):
+        """An unhealthy record is carried into report.stats verbatim."""
+        stage = _make_consolidator(project_root='/tmp/reify')
+        health_record = {
+            'healthy': False,
+            'missing': [['Entity', 'NODE', 'name', 'RANGE']],
+            'unexpected': [],
+            'expected_total': 38,
+            'actual_total': 37,
+        }
+        stage.index_health = health_record
+
+        report = await self._run(stage, 'run-3709-ih-unhealthy')
+
+        assert 'index_health' in report.stats, (
+            "run() must set report.stats['index_health'] when stage.index_health "
+            f'is set; got stats={report.stats!r}'
+        )
+        assert report.stats['index_health'] == health_record
+
+    @pytest.mark.asyncio
+    async def test_index_health_warning_when_unhealthy(self, caplog):
+        """run() logs a WARNING naming the project_id, run_id and missing count."""
+        import logging
+
+        stage = _make_consolidator(project_root='/tmp/reify')
+        stage.index_health = {
+            'healthy': False,
+            'missing': [['Entity', 'NODE', 'name', 'RANGE']],
+            'unexpected': [],
+            'expected_total': 38,
+            'actual_total': 37,
+        }
+
+        dedup_mock = AsyncMock(return_value=[])
+        with (
+            patch.object(
+                BaseStage, 'run', new=AsyncMock(return_value=self._base_report())
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=dedup_mock,
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-3709-ih-warn',
+            )
+
+        drift_warnings = [
+            r
+            for r in caplog.records
+            if r.levelno >= logging.WARNING
+            and 'index_drift_stage1' in r.getMessage()
+        ]
+        assert drift_warnings, (
+            'Expected a reconciliation.index_drift_stage1 WARNING when '
+            'index_health.healthy=False'
+        )
+        record = drift_warnings[0]
+        assert getattr(record, 'missing_count', None) == 1
+        assert getattr(record, 'run_id', None) == 'run-3709-ih-warn'
+        assert getattr(record, 'project_id', None) is not None
+
+    @pytest.mark.asyncio
+    async def test_healthy_record_is_still_surfaced_without_warning(self, caplog):
+        """A HEALTHY record must be observable too — ζ's activation check reads it."""
+        import logging
+
+        stage = _make_consolidator(project_root='/tmp/reify')
+        health_record = {
+            'healthy': True,
+            'missing': [],
+            'unexpected': [],
+            'expected_total': 38,
+            'actual_total': 38,
+        }
+        stage.index_health = health_record
+
+        dedup_mock = AsyncMock(return_value=[])
+        with (
+            patch.object(
+                BaseStage, 'run', new=AsyncMock(return_value=self._base_report())
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=dedup_mock,
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            report = await stage.run(
+                events=[],
+                watermark=Watermark(project_id='test_project'),
+                prior_reports=[],
+                run_id='run-3709-ih-healthy',
+            )
+
+        assert report.stats['index_health'] == health_record, (
+            'ζ verifies activation by reading this record, so the healthy case '
+            'must be observable, not just the drifted one'
+        )
+        assert not [
+            r
+            for r in caplog.records
+            if r.levelno >= logging.WARNING
+            and 'index_drift_stage1' in r.getMessage()
+        ], 'A healthy graph must not warn'
+
+    @pytest.mark.asyncio
+    async def test_index_health_key_absent_when_none(self):
+        """None must leave the key ABSENT — never a null a consumer reads as 'fine'."""
+        stage = _make_consolidator(project_root='/tmp/reify')
+        # Explicitly leave index_health at the default (None)
+
+        report = await self._run(stage, 'run-3709-ih-none')
+
+        assert 'index_health' not in report.stats, (
+            'When stage.index_health is None the key must be ABSENT — a null '
+            'would read as "checked and fine"; got '
+            f'stats={report.stats!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # Tests for task 1938: MemoryConsolidator.run() status_correction_reconciliation
 # surfacing
 # ---------------------------------------------------------------------------
