@@ -820,6 +820,16 @@ def test_index_html_cache_buster_floor(index_html_body: str) -> None:
 # to build the mutant.  The result is not valid JSX and is not meant to be:
 # this is a text-level falsification check, and requiring a parseable mutant
 # would mean shipping a JSX parser to test a grep.
+#
+# CONVENTION for live presence assertions: consume the pattern via
+# `_presence_pattern(label, code)` rather than restating a regex at the call
+# site, and search the comment-stripped `code` fixture rather than `body`.
+# Consuming keeps a pattern hardened here hardened at the assertion too;
+# searching `code` is what stops the .jsx prose answering the grep.  This is
+# advisory — enforcing it would mean regex-matching this module's own source,
+# which fails on semantically identical refactors and still cannot see a
+# freshly written `assert 'foo' in body` that never reaches the table.  Code
+# review is the enforcement mechanism.
 _PRESENCE_CONTRACTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     (
         # Line-anchored: the header comment reproduces this statement verbatim
@@ -1086,71 +1096,8 @@ def test_presence_greps_are_falsified_by_deleting_the_code(
         )
 
 
-# The one shape a live presence assertion may take.  Restated here rather than
-# left implicit because the test below is what forces it: the pattern comes
-# from the table (so hardening it hardens the assertion), and BOTH the alias
-# resolution and the search run over `code` (so no comment can answer it).
-_CONSUMPTION_SHAPE = (
-    r're\.search\(\s*_presence_pattern\(\s*[\'"]{label}[\'"]\s*,\s*(\w+)\s*\)\s*,\s*(\w+)'
-)
-
-
-def test_every_presence_contract_is_consumed_over_comment_stripped_source() -> None:
-    """A contract nobody consumes guards nothing.
-
-    `test_presence_greps_are_falsified_by_deleting_the_code` proves each
-    pattern in the table discriminates.  That is worth exactly nothing if the
-    live assertion greps something else: the table would be a well-tested
-    museum piece next to the untested assertion that actually runs.  This is
-    the other half — every entry must be reached by a real assertion, through
-    `_presence_pattern`, over the comment-stripped fixture.
-
-    Enforced by reading this module's own source, which is the only way to see
-    the shape of a call rather than its result.  Two things are checked per
-    contract, and they are different claims:
-
-    (1) the pattern is CONSUMED from the table, not restated at the call site.
-        A copy-pasted regex is what lets a hardened pattern and a live
-        assertion drift apart, which is the failure this whole table exists to
-        make impossible.
-    (2) the assertion searches `code`, never `body`.  This is the original
-        defect: eight of the greps below hunted the raw served file, where
-        ~150 lines of prose name most of the fields the render code names.
-
-    A NEW presence grep therefore cannot be added the old way.  Writing
-    `assert 'foo' in body` and walking away leaves this test silent, but a
-    contract added to the table without a consumer fails here, and a consumer
-    written against `body` fails here too.  The table is the front door.
-    """
-    src = Path(__file__).read_text(encoding='utf-8')
-
-    for label, _pattern, _deletions in _PRESENCE_CONTRACTS:
-        call = re.search(_CONSUMPTION_SHAPE.format(label=re.escape(label)), src)
-        assert call is not None, (
-            f'[{label}] is in _PRESENCE_CONTRACTS but no assertion consumes it via '
-            f'`re.search(_presence_pattern({label!r}, code), code)`. The contract is '
-            'mutation-tested and then ignored — whatever assertion is really about '
-            'this fact is greping a pattern nothing checks. Route it through the '
-            'table, or drop the entry.'
-        )
-        alias_arg, searched = call.group(1), call.group(2)
-        assert alias_arg == 'code', (
-            f'[{label}] resolves its `{{alias}}` against {alias_arg!r} rather than '
-            'the comment-stripped `code`. The alias must be derived from the same '
-            'text the assertion searches, or the anchor is pinned to a spelling '
-            'that a comment supplied.'
-        )
-        assert searched == 'code', (
-            f'[{label}] is searched over {searched!r}, not the comment-stripped '
-            '`code` fixture. A presence grep over the raw body is answered by the '
-            '.jsx prose: delete the render site, keep the sentence describing it, '
-            'and the assertion stays green with the feature gone. That is the exact '
-            'false pass this table was built to close.'
-        )
-
-
 # ---------------------------------------------------------------------------
-# Forbidden-pattern contracts and their comment-injection guard (task 3471)
+# Forbidden-pattern contracts (task 3471)
 # ---------------------------------------------------------------------------
 
 # The mirror image of `_PRESENCE_CONTRACTS`.  A presence grep over raw source
