@@ -60,8 +60,22 @@ def _load_find_escalation_port() -> types.ModuleType:
     It is not on any package path and its directory has no ``__init__.py``, so a
     plain ``import`` cannot reach it. Mirrors ``_load_watchdog`` in
     ``test_orchestrator_watchdog.py``.
+
+    THE STALE-BYTECODE GUARD IS NOT DEFENSIVE PADDING — it was added after this
+    module was OBSERVED loading a stale ``__pycache__`` .pyc at base ``fc6f048b55``.
+    ``SourceFileLoader`` validates cached bytecode against the source's (mtime, size),
+    so a source edit that is SIZE-IDENTICAL and lands inside the same mtime tick —
+    exactly what a two-line reordering does, and exactly what this module's scratch
+    mutations do — can leave the cache looking valid. Observed concretely: after
+    ``git checkout`` restored CONFIG_NAMES, ``test_config_name_precedence_holds_for_every_pair``
+    still failed with ``At index 1 diff: 'orchestrator-config.yaml' != 'orchestrator.yaml'``
+    while ``git diff`` on the script was EMPTY. Dropping the cache entry makes every
+    load source-authoritative, which is what the MEASURED REDs recorded throughout
+    this module depend on being true.
     """
     assert SCRIPT_PATH.is_file(), f"script under test is missing: {SCRIPT_PATH}"
+    cached = importlib.util.cache_from_source(str(SCRIPT_PATH))
+    pathlib.Path(cached).unlink(missing_ok=True)
     spec = importlib.util.spec_from_file_location("find_escalation_port", SCRIPT_PATH)
     assert spec is not None, f"could not build spec from {SCRIPT_PATH}"
     assert spec.loader is not None
@@ -499,17 +513,48 @@ def test_systemctl_failure_falls_back_to_the_full_sibling_set(
 # ---------------------------------------------------------------------------
 
 
-def _touch_config(root: pathlib.Path, name: str) -> pathlib.Path:
-    """Create an (empty) config file at ``root/name``, making parents as needed.
+def _write_config(root: pathlib.Path, name: str, body: str) -> pathlib.Path:
+    """Write *body* to ``root/name``, creating parents as needed.
 
-    ``find_config`` never reads content — only ``is_file()`` — so the body is
-    irrelevant here. The nested ``orchestrator/config.yaml`` spelling is why parents
-    must be created.
+    THE single way this module puts a config on disk, so no two tests can drift into
+    disagreeing about what a project fixture looks like. Parents are created because
+    the nested ``orchestrator/config.yaml`` spelling must work through this same
+    helper.
     """
     path = root / name
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("")
+    path.write_text(body)
     return path
+
+
+def _touch_config(root: pathlib.Path, name: str) -> pathlib.Path:
+    """An EMPTY config at ``root/name``.
+
+    ``find_config`` never reads content — only ``is_file()`` — so the body is
+    irrelevant to the precedence tests, and an empty one keeps them honest about
+    testing name resolution rather than parsing.
+    """
+    return _write_config(root, name, "")
+
+
+def _config_body(escalation_port: int, decoy_port: int = 9999, *, decoy_first: bool = False) -> str:
+    """A realistic two-top-level-block config: ``escalation:`` plus a DECOY block.
+
+    The decoy is what makes ``escalation_port``'s block slicing OBSERVABLE rather
+    than incidental — a config with only one ``port:`` in it would look identical
+    under a correct parser and under one that just greps the whole file.
+
+    Both emission orders are supported because they exercise DIFFERENT branches:
+      - decoy AFTER (default): the loop must BREAK on the next column-0 key, so the
+        decoy's port is never collected;
+      - decoy BEFORE (``decoy_first=True``): collection must not have STARTED yet, so
+        the decoy's port is never even considered.
+    A parser broken in one direction can still look correct in the other, which is
+    why step-5 asserts both.
+    """
+    escalation_block = f"escalation:\n  host: 127.0.0.1\n  port: {escalation_port}\n"
+    decoy_block = f"dashboard:\n  port: {decoy_port}\n"
+    return decoy_block + escalation_block if decoy_first else escalation_block + decoy_block
 
 
 def test_canonical_config_name_wins_over_every_legacy_spelling(
@@ -572,7 +617,12 @@ def test_config_name_precedence_holds_for_every_pair(
        the tuple itself, because it derives its expectation from that tuple: reorder
        the production names and the expectation reorders with them. MEASURED at base
        ``fc6f048b55``: swapping ONLY the middle two entries ("orchestrator.yaml" and
-       "orchestrator-config.yaml") left the whole module GREEN — ``15 passed``. Since
+       "orchestrator-config.yaml"), with the ratchet below temporarily disabled, left
+       the whole module GREEN — ``16 passed``. RE-MEASURED after the stale-bytecode
+       guard in ``_load_find_escalation_port`` landed, since a size-identical
+       reordering is exactly the mutation a .pyc cache can mask; the result was
+       unchanged, so this is a property of the assertions and not a loader artifact.
+       Since
        ``find_config`` returns the FIRST match, that order is a behavioural
        specification and not a stylistic list, so it gets a literal ratchet. If a
        reorder is ever deliberate, update the literal here and say why: the tuple is
@@ -649,3 +699,35 @@ def test_a_directory_named_like_a_config_is_not_returned(
     legacy = _touch_config(root, "orchestrator.yaml")
 
     assert fep.find_config(root) == legacy, "a directory was returned as a config file"
+
+
+def test_config_helpers_round_trip_through_find_config_and_escalation_port(
+    fep: types.ModuleType, tmp_path: pathlib.Path
+) -> None:
+    """Verify the fixture builders themselves, before anything depends on them.
+
+    RE-MEASURED at base ``fc6f048b55``: a proj-a config carrying
+    ``escalation:\\n  host: 127.0.0.1\\n  port: 8100\\ndashboard:\\n  port: 9999``
+    surveys as 8100 — the escalation port, not the decoy.
+
+    This exists so a later red in the parsing or allocation tests is attributable to
+    the code under test rather than to a fixture that never contained what it claimed.
+    """
+    root = tmp_path / "proj-a"
+    root.mkdir()
+    written = _write_config(root, "dark-factory-orchestrator.yaml", _config_body(8100))
+
+    # The body really is the two-block shape the docstring claims.
+    assert "escalation:" in written.read_text()
+    assert "dashboard:" in written.read_text()
+    assert "9999" in written.read_text()
+
+    cfg = fep.find_config(root)
+    assert cfg == written
+    assert fep.escalation_port(cfg) == 8100
+
+    # And the decoy-first ordering round-trips to the same answer.
+    other = tmp_path / "proj-b"
+    other.mkdir()
+    _write_config(other, "dark-factory-orchestrator.yaml", _config_body(8101, decoy_first=True))
+    assert fep.escalation_port(fep.find_config(other)) == 8101
