@@ -68,7 +68,7 @@ Parameters:
 The call returns with **either** a **terminal** status **or** a **non-terminal** status:
 
 - **Terminal at submit time** (`done`, `already_merged`, `conflict`, `blocked`, `unknown_branch`, `failed`, `superseded`): the merge resolved within the bounded wait. Jump straight to step 4.
-  - `already_merged` means the branch tip was already an ancestor of main — treat it the same as `done`.
+  - `already_merged` means the branch tip was already an ancestor of main — treat it the same as `done` **only when** the response carries a `commit`, or the [canonical ancestry check](#canonical-ancestry-check)'s exact-subject marker search finds the merge on main. A branch that never advanced past its creation point is an ancestor of main too, so the ancestry fact alone does not establish that anything landed: when `commit` is falsy **and** that search comes back empty, do not stamp done — run that check and treat "nothing on main cites the task" as not landed.
   - `superseded` means your request was absorbed into a coalesced train before it could be individually processed. The response includes `superseded_by: "<train_request_id>"`. Re-poll the train request immediately (step 4 / follow-the-train protocol below).
 
 - **Non-terminal** (`queued`, `attached`): the submission succeeded as **durable intent** — the merge worker has accepted the request and will process it. This is **not a failure**. The `request_id` in the response identifies your submission. Proceed to "Poll for completion" below.
@@ -153,8 +153,8 @@ The outcome arrives from either the submit call (terminal at submit time) or the
   git branch -d task/<TASK_ID>
   ```
 
-**`already_merged`** — The branch was already an ancestor of main (another merge or a manual push landed it).
-- Same as `done` — update task status and clean up.
+**`already_merged`** — The branch was already an ancestor of main. Usually another merge or a manual push landed it, but a branch that never advanced past its creation point emits the identical signal with nothing landed.
+- Same as `done` — update task status and clean up — subject to the `commit`-or-marker-search condition under "Terminal at submit time" above.
 
 **`conflict`** — Merge conflicts detected. The `conflict_details` field has the specifics.
 - Resolve conflicts in your worktree.
