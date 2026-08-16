@@ -957,6 +957,8 @@ def _parse_verdicts(stdout: str) -> dict[str, list[str]]:
     takes the last. A checker that can emit a unit twice must fail a test, not
     a host.
     """
+    known_kinds = set(_load_checker().VERDICT_KINDS)
+
     verdicts: dict[str, list[str]] = {}
     for line in _verdict_lookalikes(stdout):
         match = _VERDICT_LINE_RE.match(line)
@@ -971,8 +973,219 @@ def _parse_verdicts(stdout: str) -> dict[str, list[str]]:
         assert unit not in verdicts, (
             f"{unit} got more than one verdict line in a single run:\n{stdout}"
         )
-        verdicts[unit] = match.group("kinds").split(",")
+        kinds = match.group("kinds").split(",")
+
+        # Checked HERE, in the shared parser, so it holds for every verdict
+        # case in this file rather than one dedicated test. VERDICT_KINDS is
+        # the published vocabulary setup-host.sh writes a case arm for; a kind
+        # emitted outside it reaches the installer's `*)` fallback and produces
+        # a warning naming no actionable cause. The vocabulary must not be able
+        # to grow silently.
+        unknown = [k for k in kinds if k not in known_kinds]
+        assert not unknown, (
+            f"{unit} was given verdict kind(s) {unknown} that are not in "
+            f"check_orchestrator_unit_parity.VERDICT_KINDS "
+            f"({sorted(known_kinds)}). Add the kind to that tuple AND a case "
+            "arm to setup-host.sh's _orch_skip_reason, or the installer will "
+            "skip the unit without telling the operator why."
+        )
+        verdicts[unit] = kinds
     return verdicts
+
+
+def _add_dropin(
+    installed_dir: pathlib.Path,
+    unit: str,
+    *,
+    body: str = "[Timer]\nAccuracySec=1min\n",
+    name: str = "override.conf",
+) -> pathlib.Path:
+    """Write a ``<unit>.d/<name>`` drop-in — what `systemctl --user edit` does."""
+    dropin_dir = installed_dir / f"{unit}.d"
+    dropin_dir.mkdir(exist_ok=True)
+    dropin = dropin_dir / name
+    dropin.write_text(body, encoding="utf-8")
+    return dropin
+
+
+def _verdict_for(
+    tmp_path: pathlib.Path,
+    *,
+    repo_text: str | None = _BASE_TIMER,
+    installed_text: str | None = _BASE_TIMER,
+    dropin: bool = False,
+    installed_bytes: bytes | None = None,
+) -> list[str]:
+    """Build a one-unit tree in the given shape and return that unit's kinds.
+
+    Returns ``[]`` when the checker emitted no verdict line for it — which is
+    itself a finding, since the installer reads a missing verdict as
+    "unverified" and declines to install.
+    """
+    repo_root, installed_dir = _make_trees(
+        tmp_path, repo_text=repo_text, installed_text=installed_text
+    )
+    if installed_bytes is not None:
+        (installed_dir / _REAL_UNIT).write_bytes(installed_bytes)
+    if dropin:
+        _add_dropin(installed_dir, _REAL_UNIT)
+
+    result = _run_cli(
+        repo_root, installed_dir, _REAL_UNIT, extra_args=("--print-verdicts",)
+    )
+    return _parse_verdicts(result.stdout).get(_REAL_UNIT, [])
+
+
+def test_verdict_kinds_is_the_published_vocabulary():
+    """VERDICT_KINDS is public, non-empty, deduplicated and ordered.
+
+    Guard the guard for _parse_verdicts' membership check above and for the
+    cross-artifact derivation against setup-host.sh: both iterate this tuple,
+    and an empty or duplicate-bearing one would let them pass while checking
+    less than they claim.
+    """
+    checker = _load_checker()
+
+    assert checker.VERDICT_KINDS, "VERDICT_KINDS is empty"
+    assert len(set(checker.VERDICT_KINDS)) == len(checker.VERDICT_KINDS), (
+        f"VERDICT_KINDS has duplicates: {checker.VERDICT_KINDS}"
+    )
+    # The two install-eligible kinds must exist by these names: setup-host.sh's
+    # install condition names them literally.
+    assert {"clean", "absent"} <= set(checker.VERDICT_KINDS), checker.VERDICT_KINDS
+
+
+def test_verdict_drifted_unit_reports_drift(tmp_path: pathlib.Path):
+    """A real directive difference => `drift`."""
+    assert _verdict_for(tmp_path, installed_text=_DRIFTED_TIMER) == ["drift"]
+
+
+def test_verdict_comment_only_difference_plus_dropin_is_override_not_drift(
+    tmp_path: pathlib.Path,
+):
+    """The LIVE reify shape: a drop-in over a comment-only difference.
+
+    ``~/.config/systemd/user/orchestrator-reify.service.d/warm-lane.conf`` is a
+    deliberate, in-use drop-in on this host. Its unit file differs from the
+    committed copy only in comments, which the shared parser strips before
+    comparison — so this must read as `override` ALONE.
+
+    Reporting `drift` here would send the operator hunting for a directive diff
+    that does not exist, and would make the installer's skip warning name the
+    wrong remedy: a drop-in is removed with `systemctl --user cat/edit`, not by
+    reconciling a directive.
+    """
+    commented = _BASE_TIMER + "# a comment-only edit, invisible to the parser\n"
+
+    assert _verdict_for(tmp_path, installed_text=commented, dropin=True) == [
+        "override"
+    ]
+
+
+def test_verdict_drift_and_dropin_render_in_precedence_order(
+    tmp_path: pathlib.Path,
+):
+    """Both conditions => exactly `drift,override`, in VERDICT_KINDS order.
+
+    Order is a CONTRACT, not an artifact of set iteration: a consumer diffing
+    one run's verdicts against another's (or one host against another) can only
+    do that if the same findings always render the same string.
+    """
+    assert _verdict_for(tmp_path, installed_text=_DRIFTED_TIMER, dropin=True) == [
+        "drift",
+        "override",
+    ]
+
+
+def test_verdict_absent_installed_copy_reports_absent(tmp_path: pathlib.Path):
+    """No installed copy => `absent`, which is install-eligible but NOT `clean`.
+
+    Kept apart from `clean` deliberately: this checker may only claim what it
+    verified, and an absent copy was never compared. Calling it `clean` would
+    be a parity assertion about a measurement that never happened.
+    """
+    assert _verdict_for(tmp_path, installed_text=None) == ["absent"]
+
+
+def test_verdict_vanished_committed_copy_reports_vanished(tmp_path: pathlib.Path):
+    """No COMMITTED copy => `vanished`.
+
+    Load-bearing for the installer: with no source file, a bare `cp` would fail
+    and abort the whole `set -e` script. This kind is what lets the installer
+    skip that unit instead of dying.
+    """
+    assert _verdict_for(tmp_path, repo_text=None) == ["vanished"]
+
+
+def test_verdict_undecodable_unit_reports_unreadable(tmp_path: pathlib.Path):
+    """A unit that exists but cannot be decoded => `unreadable`, never `clean`."""
+    assert _verdict_for(
+        tmp_path, installed_bytes=b"[Timer]\nOnBootSec=\xff\xfe30\n"
+    ) == ["unreadable"]
+
+
+def test_verdict_lines_are_restricted_to_the_selected_units(
+    tmp_path: pathlib.Path,
+):
+    """--unit scopes the machine channel exactly as it scopes the report.
+
+    A verdict for an unselected unit would tell the installer something the run
+    did not measure.
+    """
+    repo_root, installed_dir = _make_trees(tmp_path)
+    (repo_root / _SECOND_UNIT_RELPATH).write_text(_BASE_SERVICE, encoding="utf-8")
+    (installed_dir / _SECOND_UNIT).write_text(_BASE_SERVICE, encoding="utf-8")
+
+    scoped = _run_cli(
+        repo_root, installed_dir, _REAL_UNIT, extra_args=("--print-verdicts",)
+    )
+    assert _parse_verdicts(scoped.stdout) == {_REAL_UNIT: ["clean"]}, scoped.stdout
+
+    both = _run_cli(
+        repo_root,
+        installed_dir,
+        _REAL_UNIT,
+        _SECOND_UNIT,
+        extra_args=("--print-verdicts",),
+    )
+    assert _parse_verdicts(both.stdout) == {
+        _REAL_UNIT: ["clean"],
+        _SECOND_UNIT: ["clean"],
+    }, both.stdout
+
+
+def test_every_verdict_kind_is_reachable(tmp_path: pathlib.Path):
+    """COVERAGE: every VERDICT_KINDS member is actually emitted by some tree.
+
+    A kind nobody can produce is dead vocabulary that still forces a case arm
+    in setup-host.sh, and — worse — hides the reverse defect: a bucket the
+    checker populates but never renders leaves the installer with NO verdict
+    for that unit, which it fail-safes into "skip". A unit silently skipped
+    forever looks identical to a unit correctly declined.
+    """
+    checker = _load_checker()
+    commented = _BASE_TIMER + "# comment-only\n"
+
+    emitted = set()
+    emitted.update(_verdict_for(tmp_path / "clean"))
+    emitted.update(_verdict_for(tmp_path / "drift", installed_text=_DRIFTED_TIMER))
+    emitted.update(
+        _verdict_for(tmp_path / "override", installed_text=commented, dropin=True)
+    )
+    emitted.update(_verdict_for(tmp_path / "absent", installed_text=None))
+    emitted.update(_verdict_for(tmp_path / "vanished", repo_text=None))
+    emitted.update(
+        _verdict_for(
+            tmp_path / "unreadable",
+            installed_bytes=b"[Timer]\nOnBootSec=\xff\xfe30\n",
+        )
+    )
+
+    assert emitted == set(checker.VERDICT_KINDS), (
+        "VERDICT_KINDS and the kinds this checker can actually emit disagree.\n"
+        f"  declared but never emitted: {sorted(set(checker.VERDICT_KINDS) - emitted)}\n"
+        f"  emitted but not declared:   {sorted(emitted - set(checker.VERDICT_KINDS))}"
+    )
 
 
 def test_print_verdicts_emits_exactly_one_clean_line_per_selected_unit(
