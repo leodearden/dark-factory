@@ -1117,8 +1117,30 @@ def run_nightly(
             return result
 
         applied = 0
+        deletion_escalated = False
         for record in run.records:
-            cb, stats = codebook.apply_coding_record(cb, record)
+            try:
+                cb, stats = codebook.apply_coding_record(cb, record)
+            except codebook.NeverDeleteError as exc:
+                # One deletion-shaped coder record must not cost the whole
+                # night's merge: apply_coding_record raises before it deep-
+                # copies, so `cb` is untouched, but this loop's dump/commit are
+                # BELOW it -- an escaping exception discarded every
+                # already-merged record AND escaped run_nightly entirely
+                # (main() calls it bare, so it surfaced as an uncaught
+                # traceback with no escalation). Skip the record, surface it,
+                # keep the batch going. Non-fatal but loud: exit_code stays 0,
+                # the same shape census.py uses for its mass-rejection signal.
+                summary = (
+                    'legibility trickle: coding record carries a deletion directive; '
+                    'record skipped'
+                )
+                detail = f"session={record.get('session')}: {exc}"
+                logger.warning('%s (%s)', summary, detail)
+                deletion_escalated = (
+                    post_escalation(cfg, summary, detail, poster=poster) or deletion_escalated
+                )
+                continue
             applied += stats['matched'] + stats['candidates_applied']
 
         validation_errors = codebook.validate(cb)
@@ -1191,7 +1213,7 @@ def run_nightly(
             coder_status=run.status,
             census_line=census_line,
             census_fire=census_fire,
-            escalated=suppression_escalated,
+            escalated=suppression_escalated or deletion_escalated,
             budget_suppressed=budget_suppressed,
         )
         return result
