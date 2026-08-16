@@ -77,19 +77,20 @@ class TestDuplicateFindingSalvageGuidance:
             'DUPLICATE_FINDING_SALVAGE_GUIDANCE exactly once.'
         )
 
-    def test_guidance_names_the_salvage_target(self):
-        """Two API-surface facts, not prose: the field to salvage onto, and the
-        tool whose fold makes the loss unrecoverable.
-
-        Deliberately only these two substrings — pinning the surrounding
-        wording would make every reword a test edit, which is the failure mode
-        this file's wiring-not-prose posture exists to avoid.
-        """
-        assert 'existing_finding_id' in DUPLICATE_FINDING_SALVAGE_GUIDANCE, (
-            'The guidance must name `existing_finding_id` — the canonical id the '
-            'agent is told to attach its citations to.'
-        )
-        assert 'cite_task' in DUPLICATE_FINDING_SALVAGE_GUIDANCE, (
-            'The guidance must name `cite_task` — the second source of '
-            '`duplicate_finding`, whose fold purges the losing finding wholesale.'
-        )
+    # No substring pin on the guidance prose lives here — an
+    # `'existing_finding_id' in ...` / `'cite_task' in ...` assertion was tried
+    # and removed, for the same defect-in-both-directions reason recorded at
+    # test_recon_gate_closure_guidance.py:186-194. It is wrong whichever way it
+    # fires: a faithful reword that names the same API surface differently
+    # ("the id the response hands back", "the citation tool") goes red on a
+    # correct edit, while a paragraph that drops both tokens in while garbling
+    # the salvage protocol goes green — so it cannot detect the failure it
+    # purports to guard. Pinning wording inside a module-level prompt string
+    # literal is a documentation meta-test, not a behavioural contract.
+    #
+    # The four wiring assertions above already pin everything that can break
+    # SILENTLY: the constant existing and being importable, being interpolated
+    # into STAGE1/STAGE2/STAGE3_SYSTEM_PROMPT exactly once each, and surviving
+    # both branches of `build_stage2_system_prompt`. The salvage protocol's
+    # WORDING is maintained at its single source, prompts/__init__.py:244,
+    # under review rather than by assertion.
