@@ -63,11 +63,12 @@ corpus-wide sweep at a per-task re-run of this script with other ``--keys``:
   a fresh artifact instead of overwriting the one holding the TRUE
   pre-migration row, and an already-occupied path is REFUSED rather than
   replaced.
-* Once the write has committed, EVERY exit names that snapshot — the exit
-  that reports read-back drift and the exit where the read-back itself
-  crashed alike (:func:`recovery_pointer` is the single source of that
-  sentence). An unverified committed write is the situation the artifact
-  exists for, so it is the last thing an operator is told.
+
+Once that write has committed, EVERY exit names the snapshot — the exit that
+reports read-back drift and the exit where the read-back itself crashed alike
+(:func:`recovery_pointer` is the single source of that sentence). An
+unverified committed write is the situation the artifact exists for, so where
+to find it is the last thing an operator is told.
 
 Idempotent — safe to re-run; an already-migrated task is a no-op. Defaults to
 a dry run: a real write requires an explicit ``--apply``.
