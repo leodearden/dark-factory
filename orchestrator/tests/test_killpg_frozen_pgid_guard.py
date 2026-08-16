@@ -30,11 +30,25 @@ them still carry the literal unsafe idiom -- so sweeping them would make this
 guard permanently red in the main checkout over code that is not this tree's.
 Both file sources exclude them structurally rather than by allowlist.
 
-The detector matches the COMPOSITION — a ``getpgid`` call nested inside a
-``killpg`` call's arguments — rather than any ``os.getpgid`` call. That is
-deliberate: ``git_ops.py``'s ``pgid = os.getpgid(pid)`` renders a "kernel FLOCK
-holders: ..." diagnostics string and never signals anything, so it is correct
-as written and is excluded *structurally*, leaving no allowlist entry to rot.
+WHAT COUNTS AS A SITE. The detector flags a ``getpgid`` value REACHING a
+``killpg``, in either of its two spellings: the single-expression composition
+``killpg(... getpgid(...) ...)``, and the hoisted two-statement form
+``pgid = os.getpgid(p.pid)`` followed by ``os.killpg(pgid, ...)`` in the same
+function scope. Both are the identical defect — a pgid re-derived at kill time
+from a possibly-recycled pid — and the hoisted one is the likelier product of a
+refactor, since the failure message below says to "pass that frozen int to
+killpg". Taint is scope-local, and the residual gap that leaves is stated
+precisely in ``_killpg_over_getpgid``'s docstring rather than papered over.
+
+What is deliberately NOT flagged is any ``os.getpgid`` call that never reaches
+a ``killpg``: ``git_ops.py``'s ``pgid = os.getpgid(pid)`` renders a "kernel
+FLOCK holders: ..." diagnostics string and never signals anything, so it is
+correct as written and is excluded *structurally*, leaving no allowlist entry
+to rot. Keeping that exclusion structural under the widened detector is what
+the scope partitioning buys: that same file separately does ``os.killpg(pgid,
+0)`` as a liveness probe on a pgid read from a lock file, ~1000 lines away in a
+different method, and a module-wide taint walk would pair the two into a false
+violation.
 
 AST-based (not text/regex) so docstring and comment mentions of the unsafe
 idiom are never mistaken for a real call site. This polarity is load-bearing
@@ -84,14 +98,101 @@ def _called_name(node: ast.Call) -> str | None:
     return None
 
 
-def _killpg_over_getpgid(source: str) -> list[tuple[int, str]]:
-    """Return ``(lineno, description)`` for each ``killpg(... getpgid(...) ...)``
-    composition in *source*.
+# A ``killpg`` call node belongs to exactly one of these scopes, so taint is
+# never leaked between sibling functions. Lambdas and comprehensions are
+# deliberately NOT scope boundaries here: they close over the enclosing
+# function's locals, so a `lambda: os.killpg(pgid, 9)` must still see the
+# `pgid = os.getpgid(...)` bound outside it.
+_SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef)
 
-    A hit is an :class:`ast.Call` resolving to the name ``killpg`` that has,
-    anywhere within its own ``args``/``keywords``, a nested :class:`ast.Call`
-    resolving to the name ``getpgid``. Only the composition is flagged — a bare
-    ``pgid = os.getpgid(pid)`` (diagnostics, never signalled) is not a hit.
+_DIRECT = 'killpg(<...>getpgid(...))'
+_INDIRECT = 'killpg(<name bound to getpgid(...) in the same function>)'
+
+
+def _contains_call_to(node: ast.AST, func_name: str) -> bool:
+    """True if *node*'s subtree contains a call resolving to *func_name*."""
+    return any(
+        isinstance(inner, ast.Call) and _called_name(inner) == func_name
+        for inner in ast.walk(node)
+    )
+
+
+def _own_nodes(scope: ast.AST) -> list[ast.AST]:
+    """Every node lexically inside *scope* but NOT inside a nested function.
+
+    Partitioning matters: a plain ``ast.walk`` from the module would pull every
+    function's body into one namespace, so ``git_ops.py``'s diagnostics-only
+    ``pgid = os.getpgid(pid)`` (line ~1865) would taint the unrelated
+    ``os.killpg(pgid, 0)`` liveness probe ~1000 lines away in a different
+    method, whose ``pgid`` comes from ``read_lock_holder_pgid``. Measured: that
+    exact false positive appears without this partitioning and vanishes with it.
+    """
+    collected: list[ast.AST] = []
+
+    def descend(node: ast.AST) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, _SCOPE_NODES):
+                continue  # visited separately, as its own scope
+            collected.append(child)
+            descend(child)
+
+    descend(scope)
+    return collected
+
+
+def _pgid_tainted_names(nodes: list[ast.AST]) -> set[str]:
+    """Local names bound, in this scope, to an expression containing ``getpgid``.
+
+    Covers ``pgid = os.getpgid(pid)``, the annotated ``pgid: int = ...``, the
+    walrus ``(pgid := os.getpgid(pid))`` and tuple-unpacking spellings.
+    """
+    tainted: set[str] = set()
+    for node in nodes:
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        # AnnAssign.value is optional (`pgid: int` binds nothing);
+        # NamedExpr.value is always present.
+        elif isinstance(node, ast.AnnAssign | ast.NamedExpr) and node.value is not None:
+            targets, value = [node.target], node.value
+        else:
+            continue
+        if not _contains_call_to(value, 'getpgid'):
+            continue
+        for target in targets:
+            for name in ast.walk(target):
+                if isinstance(name, ast.Name):
+                    tainted.add(name.id)
+    return tainted
+
+
+def _killpg_over_getpgid(source: str) -> list[tuple[int, str]]:
+    """Return ``(lineno, description)`` for each unsafe ``killpg`` dispatch.
+
+    Two forms are flagged, because they are the same defect:
+
+    1. the DIRECT composition ``killpg(... getpgid(...) ...)`` — an
+       :class:`ast.Call` resolving to ``killpg`` with a nested :class:`ast.Call`
+       resolving to ``getpgid`` anywhere in its own ``args``/``keywords``;
+    2. the INDIRECT, two-statement spelling, where a local is bound from a
+       ``getpgid`` call and that local is then passed to ``killpg`` **within the
+       same function scope**::
+
+           pgid = os.getpgid(proc.pid)   # re-derived at kill time
+           os.killpg(pgid, signal.SIGKILL)
+
+    Form 2 matters more than it looks: it is the shape a refactor naturally
+    produces, precisely because this module's own failure message says to "pass
+    that frozen int to killpg", which reads as an instruction to hoist the
+    ``getpgid`` into a local. Flagging only form 1 would have let the exact
+    task-845 footgun ship green in a new spelling.
+
+    What is still NOT flagged, stated so the ratchet is not over-trusted: taint
+    is scope-local, so a pgid derived by ``getpgid`` in one function and passed
+    as an argument to another function that calls ``killpg`` is invisible here.
+    Tracking that needs cross-procedural analysis, which is well past what an
+    AST lint should attempt. A bare ``pgid = os.getpgid(pid)`` that never
+    reaches a ``killpg`` in its scope stays correctly unflagged — that is
+    ``git_ops.py``'s diagnostics read, excluded structurally, not by allowlist.
 
     AST-based, returning ``[]`` on a :class:`SyntaxError` so a stray
     non-Python-3 file in the tree cannot break the guard.
@@ -113,21 +214,31 @@ def _killpg_over_getpgid(source: str) -> list[tuple[int, str]]:
     except SyntaxError:
         return []
 
-    hits: list[tuple[int, str]] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or _called_name(node) != 'killpg':
-            continue
-        # Walk only this call's ARGUMENTS, not the whole subtree from the
-        # enclosing statement, so an unrelated sibling getpgid cannot pin a
-        # false positive on the killpg.
-        for arg in [*node.args, *(kw.value for kw in node.keywords)]:
-            if any(
-                isinstance(inner, ast.Call) and _called_name(inner) == 'getpgid'
+    # Keyed by lineno so the direct form always wins over the indirect one when
+    # a single call qualifies as both, and so the result is deterministic.
+    hits: dict[int, str] = {}
+    scopes: list[ast.AST] = [
+        tree, *(n for n in ast.walk(tree) if isinstance(n, _SCOPE_NODES))
+    ]
+    for scope in scopes:
+        nodes = _own_nodes(scope)
+        tainted = _pgid_tainted_names(nodes)
+        for node in nodes:
+            if not isinstance(node, ast.Call) or _called_name(node) != 'killpg':
+                continue
+            # Only this call's ARGUMENTS are inspected, not the whole subtree of
+            # the enclosing statement, so an unrelated sibling getpgid cannot
+            # pin a false positive on the killpg.
+            args = [*node.args, *(kw.value for kw in node.keywords)]
+            if any(_contains_call_to(arg, 'getpgid') for arg in args):
+                hits[node.lineno] = _DIRECT
+            elif tainted and any(
+                isinstance(inner, ast.Name) and inner.id in tainted
+                for arg in args
                 for inner in ast.walk(arg)
             ):
-                hits.append((node.lineno, 'killpg(<...>getpgid(...))'))
-                break
-    return hits
+                hits.setdefault(node.lineno, _INDIRECT)
+    return sorted(hits.items())
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +293,92 @@ def test_does_not_flag_docstring_or_comment_mention() -> None:
         '"""Never write os.killpg(os.getpgid(proc.pid), signal.SIGKILL)."""\n'
         "# os.killpg(os.getpgid(pid), sig)  <- the task-845 footgun, do not copy\n"
         "SAFE_FORM = 'os.killpg(pgid, signal.SIGKILL)'\n"
+    )
+    assert _killpg_over_getpgid(source) == []
+
+
+def test_flags_two_statement_spelling() -> None:
+    """The hoisted form is the same defect and must not ship green.
+
+    This is the spelling a refactor most naturally produces, because the
+    ratchet's own failure message says to "pass that frozen int to killpg" --
+    which reads as an instruction to hoist the getpgid into a local. The pgid
+    is still re-derived at kill time from a possibly-recycled pid, so the
+    task-845 hazard is identical to the single-expression form.
+    """
+    source = (
+        "def cleanup(proc):\n"
+        "    pgid = os.getpgid(proc.pid)\n"
+        "    os.killpg(pgid, signal.SIGKILL)\n"
+    )
+    assert _killpg_over_getpgid(source) == [(3, _INDIRECT)]
+
+
+def test_flags_hoisted_binding_in_its_other_spellings() -> None:
+    """An annotated binding and a closure over it are the same violation.
+
+    Lambdas and comprehensions are deliberately not scope boundaries in the
+    detector: they close over the enclosing function's locals, so a killpg
+    inside one still sees the tainted name bound outside it.
+    """
+    annotated = (
+        "def cleanup(proc):\n"
+        "    pgid: int = os.getpgid(proc.pid)\n"
+        "    os.killpg(pgid, signal.SIGKILL)\n"
+    )
+    assert _killpg_over_getpgid(annotated) == [(3, _INDIRECT)]
+
+    closure = (
+        "def cleanup(proc):\n"
+        "    pgid = os.getpgid(proc.pid)\n"
+        "    atexit.register(lambda: os.killpg(pgid, signal.SIGKILL))\n"
+    )
+    assert _killpg_over_getpgid(closure) == [(3, _INDIRECT)]
+
+
+def test_does_not_flag_getpgid_from_a_different_function() -> None:
+    """Taint is scope-local -- the precision half of the widened detector.
+
+    This is not a hypothetical: ``git_ops.py`` binds ``pgid = os.getpgid(pid)``
+    for a diagnostics string in one function and, ~1000 lines away in a
+    different method, does ``os.killpg(pgid, 0)`` as a liveness probe on a pgid
+    read from a lock file. Both are correct. A module-wide taint walk flags that
+    pair as a violation; scope partitioning is what keeps this ratchet
+    allowlist-free rather than accumulating exemptions for correct code.
+    """
+    source = (
+        "def describe(pid):\n"
+        "    pgid = os.getpgid(pid)\n"
+        "    return f'kernel FLOCK holders: {pgid}'\n"
+        "\n"
+        "def is_held(self):\n"
+        "    pgid = read_lock_holder_pgid(self.base)\n"
+        "    os.killpg(pgid, 0)\n"
+    )
+    assert _killpg_over_getpgid(source) == []
+
+
+def test_known_gap_taint_does_not_reach_a_nested_def() -> None:
+    """Documented boundary: a nested ``def`` does not inherit the outer taint.
+
+    Pinned as a test rather than left implicit so the ratchet's limits are
+    legible and nobody over-trusts it. Inheriting taint across a nested ``def``
+    would need shadowing analysis (an inner parameter named ``pgid`` is a
+    genuinely different value), and this spelling has zero incidence in the
+    repo today -- whereas the lambda/comprehension closure above, which IS
+    covered, is the form that actually occurs.
+
+    The broader residual, stated in ``_killpg_over_getpgid``'s docstring: a
+    pgid derived in one function and passed as an ARGUMENT to another that
+    calls killpg is likewise invisible. Catching that needs cross-procedural
+    analysis, well past what an AST lint should attempt.
+    """
+    source = (
+        "def outer(proc):\n"
+        "    pgid = os.getpgid(proc.pid)\n"
+        "    def inner():\n"
+        "        os.killpg(pgid, signal.SIGKILL)\n"
+        "    return inner\n"
     )
     assert _killpg_over_getpgid(source) == []
 
@@ -433,6 +630,10 @@ def test_no_killpg_over_getpgid_in_repo() -> None:
             'Fix: capture the pgid immediately after the '
             '`start_new_session=True` spawn (`pgid = proc.pid`, which POSIX '
             'guarantees at that moment) and pass that frozen int to killpg. '
+            'NOTE "frozen" means captured AT SPAWN: hoisting the same '
+            '`os.getpgid(proc.pid)` call into a local one line above the '
+            'killpg is NOT a fix -- it is the same re-derivation, and it is '
+            'flagged here too. '
             'Also short-circuit on `proc.returncode is not None` -- the frozen '
             'number itself goes stale once the leader is reaped. See '
             "shared/src/shared/proc_group.py's module docstring for the "
