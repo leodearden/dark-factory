@@ -356,6 +356,87 @@ def test_cli_start_still_returns_4_when_the_arm_simply_does_not_fit(
     assert ['start', 'lms-arm@qwen3.5-9b.service'] not in fake_systemctl.calls()
 
 
+# --- exit 5 must be REACHABLE in the scenario that motivated it -------------
+#
+# The intruder that motivates code 5 is, by construction, large enough to eat
+# the free VRAM the fit check measures: a process under POLLUTION_FLOOR_MIB is
+# not pollution at all.  So checking fit FIRST makes 5 unreachable in exactly
+# the case it exists for, and hands the operator code 4 -- "use a smaller arm"
+# -- for an arm that fits perfectly well once ollama releases the card.
+#
+# The card below is the measured 2026-08-06 one: whisper-writer 4050 MiB plus
+# ollama 10314 MiB, leaving 10212 MiB free, against a qwen3.5-9b that declares
+# 12.0 GiB in the committed manifest.
+
+#: The measured contended card: 4050 + 10314 held, 10212 MiB free.
+CONTENDED_GPU = lms_vram.GpuReading(total_mib=24576, used_mib=14364, free_mib=10212)
+
+
+def test_a_polluted_card_refuses_before_the_fit_check_gets_to_decide(
+    fake_systemctl, baseline_dir,
+):
+    """Both refusals are correct on this card; only one of them is USEFUL.
+
+    "Another process is holding the card" and "this arm is too big for this
+    card" have opposite fixes, and the operator can only act on the one they
+    are told.
+    """
+    oversized = _arm(est_vram_gib=12.0)
+    assert not lms_vram.arm_fits(oversized, CONTENDED_GPU.free_gib)
+
+    with pytest.raises(lms_vram.PollutedBaselineError) as excinfo:
+        lms_ctl.start(oversized, gpu=CONTENDED_GPU, consumers=[WHISPER, OLLAMA])
+
+    assert not isinstance(excinfo.value, lms_ctl.ArmPreflightError)
+    assert '/usr/local/lib/ollama/llama-server' in str(excinfo.value)
+    assert not lms_vram.baseline_path('qwen3.5-9b').exists()
+    assert fake_systemctl.calls() == []
+
+
+def test_cli_start_returns_5_not_4_on_the_measured_contended_card(
+    fake_systemctl, baseline_dir, cli_gpu, capsys,
+):
+    """The exact documented reading, through the CLI and the real manifest.
+
+    qwen3.5-9b declares 12.0 GiB + 0.5 GiB margin against 9.97 GiB free, so the
+    fit check WOULD refuse -- and would say the wrong thing.
+    """
+    cli_gpu['reading'] = CONTENDED_GPU
+    cli_gpu['consumers'] = [WHISPER, OLLAMA]
+
+    code = lms_ctl.main(['start', 'qwen3.5-9b'])
+
+    assert code == 5
+    assert code != 4
+    assert '/usr/local/lib/ollama/llama-server' in capsys.readouterr().err
+    assert not lms_vram.baseline_path('qwen3.5-9b').exists()
+    assert ['start', 'lms-arm@qwen3.5-9b.service'] not in fake_systemctl.calls()
+
+
+def test_cli_start_returns_4_for_a_sub_floor_stray_on_a_card_too_small(
+    fake_systemctl, baseline_dir, cli_gpu, capsys,
+):
+    """The floor still governs which refusal fires, so the hoist cannot
+    over-rotate into calling every occupied card polluted.
+
+    512 MiB is noise, not an intruder: this card is simply too small for this
+    arm, and 4 is the honest answer.
+    """
+    cli_gpu['reading'] = CONTENDED_GPU
+    cli_gpu['consumers'] = [
+        WHISPER,
+        lms_vram.GpuConsumer(
+            pid=905936, process_name='/usr/local/lib/ollama/llama-server',
+            used_mib=512,
+        ),
+    ]
+
+    code = lms_ctl.main(['start', 'qwen3.5-9b'])
+
+    assert code == 4
+    assert ['start', 'lms-arm@qwen3.5-9b.service'] not in fake_systemctl.calls()
+
+
 def test_stop_issues_exactly_one_systemctl_stop(fake_systemctl):
     lms_ctl.stop(_arm())
 
