@@ -826,6 +826,26 @@ _XDIST_CRASH_NO_FAILED_PLUS_UNDECORATED_SUMMARY_OUTPUT = (
     + '8 failed, 6971 passed, 216 warnings in 131.42s (0:02:11)\n'
 )
 
+# task 4066 amendment: the CRASH-INDUCED internal error — an INTERNALERROR
+# whose frames are all xdist's own scheduler, raised BY the node-down handling
+# under --max-worker-restart=0 rather than by any test. Zero genuine failures:
+# no tally of either form, no FAILED line, no ``E   `` line. This is the case
+# the fallback's INTERNALERROR veto costs us (it returns False, routing to the
+# debugger rather than the bounded infra-retry); the fixture exists so that
+# cost is pinned as a decision rather than discovered as a surprise. Frames
+# transcribed from the same verify-log 2829 tail as
+# _XDIST_CRASH_REAL_LOG_2829_OUTPUT above, with the real run's failures
+# removed — which is precisely what makes it the isolating counterpart.
+_XDIST_CRASH_INDUCED_LOADSCOPE_INTERNALERROR_OUTPUT = (
+    _XDIST_WORKER_CRASH_OUTPUT
+    + 'INTERNALERROR> Traceback (most recent call last):\n'
+    + 'INTERNALERROR>   File ".../xdist/scheduler/loadscope.py", line 336, in _reschedule\n'
+    + 'INTERNALERROR>     self._assign_work_unit(node)\n'
+    + 'INTERNALERROR>   File ".../xdist/scheduler/loadscope.py", line 275, in _assign_work_unit\n'
+    + 'INTERNALERROR>     worker_collection = self.registered_collections[node]\n'
+    + 'INTERNALERROR> KeyError: <WorkerController gw35>\n'
+)
+
 
 class TestBareXdistWorkerCrashDetector:
     """task 2365 step-1: verify._is_bare_xdist_worker_crash(output) pure helper.
@@ -968,9 +988,9 @@ class TestBareXdistWorkerCrashDetector:
         transcribed inline here because data/ is untracked runtime state and
         so cannot be referenced as a checked-in asset.
 
-        The asymmetry this closes: the FAILED-lines branch (verify.py:711-715)
-        already vetoes on INTERNALERROR / ERROR-nodeid / ERROR-file, but the
-        no-FAILED-lines fallback (verify.py:724-727) did not. Because the
+        The asymmetry this closes: _is_bare_xdist_worker_crash's FAILED-lines
+        branch already vetoes on INTERNALERROR / ERROR-nodeid / ERROR-file,
+        but its no-FAILED-lines fallback did not. Because the
         INTERNALERROR aborted the session, pytest printed NO ``FAILED`` short
         summary and NO decorated ``=== N failed ===`` stats line, so BOTH of
         the fallback's two markers missed and a run carrying 8 real failures
@@ -992,9 +1012,9 @@ class TestBareXdistWorkerCrashDetector:
     def test_no_failed_lines_plus_internalerror_is_false(self):
         """task 4066: crash signature + INTERNALERROR and NO FAILED line -> False.
 
-        The FAILED-lines branch (verify.py:711-715) has vetoed on
-        ``INTERNALERROR>`` since task 3514; the no-FAILED-lines fallback
-        (verify.py:724-727) did not, so an output carrying this surface and
+        _is_bare_xdist_worker_crash's FAILED-lines branch has vetoed on
+        ``INTERNALERROR>`` since task 3514; its no-FAILED-lines fallback
+        did not, so an output carrying this surface and
         no FAILED line was reclassified as transient infra. An INTERNALERROR
         produces no FAILED line of its own, which is precisely why it lands
         in THIS branch — the least defensible place to omit the veto.
@@ -1012,7 +1032,7 @@ class TestBareXdistWorkerCrashDetector:
         FAILED line -> False.
 
         Same asymmetry as above for the ``ERROR <nodeid>`` surface: vetoed in
-        the FAILED-lines branch (verify.py:713), absent from the
+        _is_bare_xdist_worker_crash's FAILED-lines branch, absent from its
         no-FAILED-lines fallback. A fixture/setup ERROR produces no FAILED
         line of its own, so this branch is where it is actually seen.
 
@@ -1028,7 +1048,7 @@ class TestBareXdistWorkerCrashDetector:
         file, no ``::``) and NO FAILED line -> False.
 
         Same asymmetry as the two cases above, for the ``ERROR <file.py>``
-        collection-failure surface vetoed at verify.py:714 in the
+        collection-failure surface, vetoed in _is_bare_xdist_worker_crash's
         FAILED-lines branch only. A collection failure produces no FAILED
         line of its own.
 
@@ -1064,6 +1084,42 @@ class TestBareXdistWorkerCrashDetector:
         )
         assert result is False
 
+    def test_crash_induced_loadscope_internalerror_is_false_by_design(self):
+        """task 4066 amendment: a crash-INDUCED loadscope INTERNALERROR with
+        ZERO genuine failures -> False, deliberately.
+
+        This is the acknowledged cost of the fallback's INTERNALERROR veto,
+        pinned so it reads as a decision rather than an oversight. Under
+        ``--max-worker-restart=0`` a node-down can trip xdist's own scheduler
+        (``xdist/scheduler/loadscope.py … KeyError: <WorkerController gwNN>``)
+        — an artefact of the crash handling, attributable to no test. So this
+        output IS a bare worker crash by intent, yet the veto returns False
+        and routes it to the debugger instead of the bounded infra-retry.
+
+        Why the veto is nevertheless kept un-narrowed: verify-log 2829's own
+        INTERNALERROR is scheduler-origin too (compare the frames here with
+        _XDIST_CRASH_REAL_LOG_2829_OUTPUT — identical modulo the removed
+        failures), so excluding scheduler-origin frames would leave the
+        motivating 8-real-failures case resting on the failure-summary marker
+        alone, restoring the single-point-of-failure that billed for this bug.
+        The failure direction is also the safe one: an infra crash sent to the
+        debugger is loud and self-correcting, whereas the bug being fixed sent
+        8 real failures to a silent retry.
+
+        If a future change decides this cost is too high, THIS test is what it
+        must consciously flip — see the second 'Accepted tradeoff' paragraph
+        of _is_bare_xdist_worker_crash's docstring.
+        """
+        output = _XDIST_CRASH_INDUCED_LOADSCOPE_INTERNALERROR_OUTPUT
+        # Pin the isolation: this is a crash + INTERNALERROR and nothing else,
+        # so the verdict below is attributable to the INTERNALERROR veto alone.
+        assert verify._XDIST_WORKER_CRASH_RE.search(output) is not None
+        assert verify._PYTEST_FAILED_LINE_RE.findall(output) == []
+        assert verify._PYTEST_TRACEBACK_E_RE.findall(output) == []
+        assert verify._PYTEST_FAILURE_SUMMARY_RE.search(output) is None
+
+        assert verify._is_bare_xdist_worker_crash(output) is False
+
 
 class TestPytestFailureSummaryRegex:
     """task 4066: _PYTEST_FAILURE_SUMMARY_RE must match pytest's UNDECORATED
@@ -1097,11 +1153,31 @@ class TestPytestFailureSummaryRegex:
 
     # Over-reach guards: dropping the trailing ``=+$`` requirement must not
     # turn this into "any line mentioning failure".
+    #
+    # The two ``failed to fetch`` samples are the reason the pattern keeps
+    # pytest's tally SHAPE (comma-joined ``<N> <word>`` parts + an ``in <N>s``
+    # duration) instead of ``.*$``: this repo's verify path runs chained
+    # ``cargo … && uv run pytest`` commands, so non-pytest retry chatter shares
+    # the output. Rung 3 of _extract_cause_hint sits AHEAD of the ``error: ``,
+    # ``… FAILED``, timeout-wrapper and ``ERROR: `` rungs, so a line matched
+    # here pre-empts a genuinely more informative hint. Note the second one
+    # carries an ``in 30s`` of its own — requiring a duration alone is not
+    # enough to reject it.
     NON_SUMMARY_SAMPLES = (
         '1 xfailed, 2 passed in 3s',
         'no tests ran in 0.01s',
         'FAILED orchestrator/tests/test_x.py::test_y - AssertionError',
         '0 failedcases reported',
+        '2 failed to fetch dependencies; retrying',
+        '2 failed to fetch dependencies; retrying in 30s',
+    )
+
+    # A bar-only separator line immediately preceding an undecorated tally —
+    # the shape wrapper/CI output produces when it echoes pytest's separator
+    # but not its stats decoration.
+    BAR_LINE_THEN_TALLY = (
+        '=========================\n'
+        '8 failed, 6971 passed in 1.00s\n'
     )
 
     def test_decorated_summary_forms_still_match(self):
@@ -1122,12 +1198,31 @@ class TestPytestFailureSummaryRegex:
 
     def test_non_failure_lines_do_not_match(self):
         """Over-reach guards: an xfail tally, a no-tests-ran line, a FAILED
-        node-id line, and ``0 failedcases`` (word-boundary guard) must all
-        stay unmatched."""
+        node-id line, ``0 failedcases`` (word-boundary guard) and non-pytest
+        ``N failed to …`` retry chatter must all stay unmatched."""
         for sample in self.NON_SUMMARY_SAMPLES:
             assert verify._PYTEST_FAILURE_SUMMARY_RE.search(sample) is None, (
                 f'over-reach — matched a non-summary line: {sample!r}'
             )
+
+    def test_match_never_spans_a_line_break(self):
+        """The optional ``=`` decoration group must not swallow a NEWLINE.
+
+        ``\\s`` matches ``\\n``, so under re.MULTILINE an optional ``(?:=+\\s+)?``
+        prefix happily starts on a bar-only separator line and runs into the
+        tally on the NEXT line — making group(0) two lines long.
+        _extract_cause_hint returns ``m.group(0).strip()[:200]`` and documents
+        the result as a single line, so that match would put a line break into
+        a cause hint that flows on into failure reports and events. Pinning
+        the horizontal-whitespace class here because every other sample in
+        this class is a single-line string and so cannot catch it.
+        """
+        match = verify._PYTEST_FAILURE_SUMMARY_RE.search(self.BAR_LINE_THEN_TALLY)
+        assert match is not None, 'the tally line itself must still match'
+        assert '\n' not in match.group(0), (
+            f'match spans a line break: {match.group(0)!r}'
+        )
+        assert match.group(0) == '8 failed, 6971 passed in 1.00s'
 
 
 class TestRunVerificationXdistWorkerCrashRetry:

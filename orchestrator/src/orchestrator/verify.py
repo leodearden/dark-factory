@@ -618,9 +618,21 @@ _PYTEST_INTERNALERROR_RE = re.compile(r'^INTERNALERROR>.+$', re.MULTILINE)
 # without a separator (``1 failed, 1 passed in 0.02s``). Requiring the bars is
 # what made this pattern decoration-dependent, so the trailing ``=+$`` is
 # dropped too: a line opening ``=== N failed`` is a failure summary whether or
-# not its bars are balanced. ``\b`` after ``failed`` is what does the
-# discriminating work (it rejects ``0 failedcases``); the line-anchored
-# ``\d+ failed`` prefix rejects ``1 xfailed`` and ``no tests ran``.
+# not its bars are balanced.
+#
+# What replaces ``=+$`` as the discriminator is pytest's OWN tally SHAPE, not
+# ``.*$``: comma-joined ``<N> <word>`` parts (terminal.py's
+# build_summary_stats_line) followed by a ``in <N>s`` duration. Dropping the
+# bars WITHOUT keeping that shape would make rung 3 of _extract_cause_hint
+# match any line opening ``<digits> failed`` — e.g. a chained
+# ``cargo … && uv run pytest`` command's retry chatter
+# (``2 failed to fetch dependencies; retrying in 30s``) — which would pre-empt
+# the more informative rungs 4-8 below it. Two further deliberate details:
+# ``\b`` after ``failed`` rejects ``0 failedcases``, and the optional
+# decoration group uses ``[ \t]`` rather than ``\s`` because ``\s`` matches a
+# NEWLINE — under re.MULTILINE that let the group span a bar-only separator
+# line into the tally below it, and _extract_cause_hint returns group(0), so a
+# hint it documents as single-line would have arrived with a line break in it.
 #
 # Two consumers, both of which benefit — kept as ONE constant deliberately, a
 # parallel undecorated-only pattern would recreate the very
@@ -631,7 +643,10 @@ _PYTEST_INTERNALERROR_RE = re.compile(r'^INTERNALERROR>.+$', re.MULTILINE)
 #   * _extract_cause_hint's ladder rung 3, where it upgrades an undecorated
 #     tally from the generic last-non-blank-line fallback to a real rung-3
 #     match.
-_PYTEST_FAILURE_SUMMARY_RE = re.compile(r'^(?:=+\s+)?\d+ failed\b.*$', re.MULTILINE)
+_PYTEST_FAILURE_SUMMARY_RE = re.compile(
+    r'^(?:=+[ \t]+)?\d+ failed\b(?:, \d+ \w+)* in \d+(?:\.\d+)?s\b.*$',
+    re.MULTILINE,
+)
 _PYTEST_TRACEBACK_E_RE = re.compile(r'^E   .+$', re.MULTILINE)
 _PYTEST_PROGRESS_BARE_RE = re.compile(r'^[\.FsxXEPp]+(\s+\[\s*\d+%\])?$')
 _PYTEST_PROGRESS_FILE_RE = re.compile(r'^\S+\.py [\.FsxXEPp]+(\s+\[\s*\d+%\])?$')
@@ -726,6 +741,27 @@ def _is_bare_xdist_worker_crash(output: str) -> bool:
     doesn't self-heal, unlike a load flake) the retry window is exhausted
     and it lands in infra_hold + escalate_to_human instead of the debugger
     — a human sees it, nothing is silently greened.
+
+    Second accepted tradeoff, in the OPPOSITE direction, deliberately
+    taken by task 4066: the ``INTERNALERROR>`` veto keys on a surface the
+    worker crash can itself PRODUCE. Under ``--max-worker-restart=0`` a
+    node-down can trip xdist's own scheduler — verify-log 2829's is
+    ``xdist/scheduler/loadscope.py … KeyError: <WorkerController gwNN>``,
+    an artefact of the node-down handling, not of any test. So a truly
+    bare crash carrying zero real failures, which happens to trip that
+    same loadscope KeyError, now returns ``False`` and routes to the
+    debugger rather than to the bounded infra-retry — i.e. the very case
+    this helper exists to recognize. That cost is accepted, not
+    overlooked. The veto is deliberately NOT narrowed to exclude
+    xdist-scheduler-origin frames, because 2829's INTERNALERROR *is*
+    scheduler-origin: narrowing would leave the motivating case resting
+    on the failure-summary marker alone, which is exactly the
+    single-point-of-failure that billed for this bug. The failure
+    direction is also the safe one — an infra crash sent to the debugger
+    is loud and self-correcting (the debugger re-runs and finds nothing),
+    whereas the bug being fixed sent 8 real failures to a silent retry.
+    ``test_crash_induced_loadscope_internalerror_is_false_by_design``
+    pins this verdict so a future reader knows it is a decision.
 
     The opposite-direction case — an UNLISTED co-occurring load flake that
     defeats this veto (esc-3514-2 / task 3514) — is deliberately NOT fixed
