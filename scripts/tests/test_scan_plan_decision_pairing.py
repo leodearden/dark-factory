@@ -50,6 +50,7 @@ file text. Leave it escaped.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -57,6 +58,7 @@ from pathlib import Path
 import pytest
 from scan_plan_decision_pairing import (
     DEFAULT_ROOT,
+    SKIP_UNDECODABLE,
     PairingRecord,
     SkippedFile,
     TreeScan,
@@ -179,6 +181,49 @@ def write_raw_plan(root: Path, lane: str, raw: str) -> Path:
     lane_dir.mkdir(parents=True, exist_ok=True)
     path = lane_dir / 'plan.json'
     path.write_text(raw)
+    return path
+
+
+#: A plan.json that is not TEXT at all: a valid UTF-8 prefix ending in a lone
+#: multibyte LEAD byte, so the sequence is truncated mid-character.
+#:
+#: Built by dropping the closing brace and appending ``\xc3`` rather than by
+#: slicing at a magic byte offset. The offset spelling works, but it is pinned
+#: to the exact length of this document — reword the title and the cut lands
+#: somewhere harmless and the specimen silently stops being undecodable, which
+#: would make every test below pass vacuously. Truncating at the END cannot
+#: drift that way, and it reproduces the identical failure:
+#: ``UnicodeDecodeError: 'utf-8' codec can't decode byte 0xc3 in position N:
+#: unexpected end of data``.
+#:
+#: That exception is the point. It is a ``ValueError`` subclass but is NEITHER
+#: an ``OSError`` NOR a ``json.JSONDecodeError``, so it escapes both of
+#: ``scan_tree``'s handlers and aborts the ENTIRE sweep — one bad file hiding
+#: the whole corpus, which is exactly what that function's docstring promises
+#: cannot happen.
+_UNDECODABLE_PLAN_BYTES = (
+    json.dumps(
+        {'task_id': '4', 'title': 'café résumé synthetic plan',
+         'design_decisions': []},
+        ensure_ascii=False,
+    ).encode('utf-8')[:-1] + b'\xc3'
+)
+
+
+def write_undecodable_plan(root: Path, lane: str) -> Path:
+    """Write ``<root>/<lane>/plan.json`` as bytes that are not valid UTF-8.
+
+    Asserts the specimen really is undecodable before handing it back, so a
+    future edit that accidentally makes these bytes decode fails HERE, loudly,
+    instead of leaving the callers below green against an input that no longer
+    exercises the path they exist to cover.
+    """
+    lane_dir = root / lane
+    lane_dir.mkdir(parents=True, exist_ok=True)
+    path = lane_dir / 'plan.json'
+    path.write_bytes(_UNDECODABLE_PLAN_BYTES)
+    with pytest.raises(UnicodeDecodeError):
+        path.read_text(encoding='utf-8')
     return path
 
 
@@ -631,12 +676,25 @@ class TestDefaultRoot:
 SCRIPT = Path(__file__).parent.parent / 'scan_plan_decision_pairing.py'
 
 
-def _run_cli(*args, timeout=60):
+def _run_cli(*args, timeout=60, env=None, python_args=()):
+    """Run the scanner CLI in a subprocess and return the CompletedProcess.
+
+    *python_args* go BEFORE the script path, so a caller can pass interpreter
+    flags such as ``-W error::EncodingWarning``; *env* is merged over a copy of
+    the ambient environment rather than replacing it, so PATH and the harness's
+    own redirects survive. Both are extensions of the one subprocess mechanism
+    rather than a second helper, so every CLI case here runs the same way.
+    """
+    full_env = None
+    if env is not None:
+        full_env = dict(os.environ)
+        full_env.update(env)
     return subprocess.run(
-        [sys.executable, str(SCRIPT), *args],
+        [sys.executable, *python_args, str(SCRIPT), *args],
         capture_output=True,
         text=True,
         timeout=timeout,
+        env=full_env,
     )
 
 
@@ -736,3 +794,117 @@ class TestCli:
         assert [s['reason'] for s in payload['skipped']] == ['unparseable']
         assert payload['scanned'] == 1
         _assert_unchanged(root, before)
+
+
+# ---------------------------------------------------------------------------
+# Undecodable plan bytes — the one per-file failure that is currently FATAL
+# ---------------------------------------------------------------------------
+
+
+class TestUndecodablePlan:
+    """A plan.json whose bytes are not text must be REPORTED, never fatal.
+
+    ``scan_tree``'s docstring already promises the contract: "Every per-file
+    failure is REPORTED as a SkippedFile and the sweep continues, so one
+    truncated plan cannot hide the rest of the corpus." Two handlers implement
+    it — ``json.JSONDecodeError`` and ``OSError`` — and an undecodable file
+    falls between them. ``UnicodeDecodeError`` is a ``ValueError`` subclass and
+    is neither of those types, so it propagates out of the loop and takes the
+    whole sweep with it, DISCARDING every lane already scanned.
+
+    The existing coverage misses this by construction: the unparseable case
+    uses ASCII-only malformed JSON (a genuine ``JSONDecodeError``) and the
+    unreadable case uses ``chmod 000`` (a genuine ``PermissionError``). Neither
+    ever produces bytes that fail to decode, so the gap between the two
+    handlers was never probed.
+
+    The load-bearing half of the tolerance test is not that the bad lane is
+    reported — it is that the CLEAN lane is still scanned. A scanner that
+    reports a lower bound and then silently loses the rest of the corpus to one
+    bad file reports a number that is not merely low but arbitrary.
+    """
+
+    def test_an_undecodable_plan_is_reported_and_the_rest_of_the_tree_is_scanned(
+        self, tmp_path
+    ):
+        """One file that is not text must not hide every file that is.
+
+        Asserted against ``scan_tree``'s SORTED output rather than against an
+        assumed ``iterdir`` order. That order is arbitrary, and today's failure
+        is order-dependent — a sweep that happens to reach the bad lane last
+        still loses everything it had already collected, so an assertion keyed
+        to one traversal order would be a coin flip.
+        """
+        root = tmp_path / 'task-meta'
+        write_plan(root, '10', [MISPAIRED_ENTRY])
+        write_undecodable_plan(root, '4')
+
+        scan = scan_tree(root)
+
+        assert [(r.task_id, r.index) for r in scan.records] == [('10', 0)], (
+            'the clean lane must survive an undecodable sibling'
+        )
+        assert [(s.task_id, s.reason) for s in scan.skipped] == [
+            ('4', SKIP_UNDECODABLE)
+        ]
+        assert scan.skipped[0].detail, 'a skip must say what went wrong'
+        assert scan.scanned == 1, 'a file that could not be decoded was not scanned'
+
+    def test_scan_plan_file_still_raises_on_an_undecodable_plan(self, tmp_path):
+        """The raise/report split the module already declares is PRESERVED.
+
+        ``scan_plan_file``'s docstring propagates ``OSError`` and
+        ``json.JSONDecodeError`` deliberately: ``scan_tree`` is what turns a
+        per-file failure into a reported skip, and a caller pointing the
+        function at one known file gets the error rather than an empty list
+        that reads as "this plan is clean". The new arm must join that split on
+        the same side — tolerating it HERE would make a single-file caller
+        unable to tell a clean plan from an unreadable one.
+        """
+        bad = write_undecodable_plan(tmp_path / 'task-meta', '4')
+
+        with pytest.raises(UnicodeDecodeError):
+            scan_plan_file(bad)
+
+    def test_the_tree_is_untouched_even_when_a_plan_is_undecodable(self, tmp_path):
+        """The read-only contract holds on the new error path too.
+
+        The error paths are where a scanner is most tempted to "normalize" an
+        input, and these inputs are live plan documents a running task may be
+        reading.
+        """
+        root = tmp_path / 'task-meta'
+        write_plan(root, '10', [MISPAIRED_ENTRY])
+        write_undecodable_plan(root, '4')
+        before = _snapshot(root)
+
+        scan_tree(root)
+
+        _assert_unchanged(root, before)
+
+    def test_the_cli_never_decodes_a_plan_in_the_ambient_locale_encoding(self, tree):
+        """PEP 597's own mechanism for detecting a locale-dependent read.
+
+        ``PYTHONWARNDEFAULTENCODING=1`` makes every ``read_text()`` that omits
+        ``encoding=`` emit an ``EncodingWarning``, and ``-W
+        error::EncodingWarning`` promotes it to an exception, so the pin is a
+        real failure rather than a string search over noise. A scanner that
+        inherits ``locale.getpreferredencoding()`` decodes the same corpus
+        differently on two machines, which for a tool whose entire output is a
+        prevalence count is a silent wrong answer, not a crash.
+
+        Deliberately NOT tested by running under ``LC_ALL=C``: that route was
+        checked and does not reproduce, because PEP 540 UTF-8 mode coercion
+        leaves the C locale decoding UTF-8 anyway. It would be a test that
+        passes for a reason unrelated to the property it claims to check.
+        """
+        result = _run_cli(
+            '--root', str(tree), '--json',
+            python_args=('-W', 'error::EncodingWarning'),
+            env={'PYTHONWARNDEFAULTENCODING': '1'},
+        )
+
+        assert result.returncode == 0, (
+            f'the CLI read a file in the ambient locale encoding:\n{result.stderr}'
+        )
+        assert 'EncodingWarning' not in result.stderr, result.stderr
