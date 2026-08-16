@@ -1151,6 +1151,11 @@ def test_presence_greps_are_falsified_by_deleting_the_code(
 # a way the presence direction is not: a violation is by definition executable,
 # so it cannot hide inside a comment.
 #
+# ANTI-VACUITY.  A forbidden pattern is asserted to match nothing, so one that
+# can NEVER match is indistinguishable from one guarding perfectly.
+# `test_forbidden_patterns_are_falsified_by_injecting_a_violation` splices each
+# entry's violating snippet into the source and requires the pattern to fire.
+#
 # CONVENTION for live guards: consume the patterns via
 # `_forbidden_patterns(label)` rather than restating a regex at the call site,
 # search the comment-stripped `code` fixture, and carry the table's flags
@@ -1160,40 +1165,68 @@ def test_presence_greps_are_falsified_by_deleting_the_code(
 # a regex over this module's own source asserts the formatting of test code
 # rather than behaviour.
 #
-# Entry: (label, ((pattern, what), ...), flags).
-_FINGERPRINT_PARSE: tuple[tuple[str, str], ...] = tuple(
-    (rf'{field}\s*{op}', f'`{field}` is {verb}')
+# Entry: (label, ((pattern, what, a violating snippet), ...), flags).
+#
+# The third member is what `test_forbidden_patterns_are_falsified_by_injecting_a_violation`
+# splices into the source to prove the pattern can still FIRE.  A forbidden
+# pattern has a failure mode the presence table does not: it is asserted to
+# match NOTHING, so a pattern that can never match anything is permanently
+# vacuous and no test says a word.  Typo `\.split\(` as `\.spilt\(` and
+# `dedupe_fingerprint.split('|')` could land in the .jsx with the suite green.
+#
+# The snippet is spelled INDEPENDENTLY of the regex — real JSX, not the pattern
+# with its escapes removed — because a snippet mechanically derived from the
+# pattern would carry the same typo and match it happily.
+_FINGERPRINT_PARSE: tuple[tuple[str, str, str], ...] = tuple(
+    (rf'{field}\s*{op}', f'`{field}` is {verb}', f'const bit = esc.{field}{call};')
     for field in ('dedupe_fingerprint', 'fingerprint')
-    for op, verb in (
-        (r'\.split\(', 'split'),
-        (r'\.slice\(', 'sliced'),
-        (r'\.match\(', 'matched'),
-        (r'\.substring\(', 'taken apart with substring()'),
+    for op, verb, call in (
+        (r'\.split\(', 'split', ".split('|')[0]"),
+        (r'\.slice\(', 'sliced', '.slice(0, 12)'),
+        (r'\.match\(', 'matched', '.match(/eval:([^|]+)/)'),
+        (r'\.substring\(', 'taken apart with substring()', '.substring(0, 12)'),
     )
 )
 
-_SYNTHETIC_ZERO: tuple[tuple[str, str], ...] = tuple(
-    (rf'\.\s*{field}\s*\|\|\s*0\b', f'`{field}` is defaulted with `|| 0`')
+_SYNTHETIC_ZERO: tuple[tuple[str, str, str], ...] = tuple(
+    (
+        rf'\.\s*{field}\s*\|\|\s*0\b',
+        f'`{field}` is defaulted with `|| 0`',
+        f'<td>{{fmtNum(m.{field} || 0)}}</td>',
+    )
     for field in ('current_value', 'value', 'n', 'denominator', 'alarm_count')
 )
 
 _FORBIDDEN_PATTERNS: tuple[
-    tuple[str, tuple[tuple[str, str], ...], int], ...
+    tuple[str, tuple[tuple[str, str, str], ...], int], ...
 ] = (
     (
         'trend series is never compacted',
         (
             # a chart fed a transformed series rather than the payload array itself
-            (r'values\s*=\s*\{[^}\n]*\.\s*(?:filter|flatMap|reduce)\(', 'a chart is fed a transformed series'),
+            (
+                r'values\s*=\s*\{[^}\n]*\.\s*(?:filter|flatMap|reduce)\(',
+                'a chart is fed a transformed series',
+                '<Chart values={trend.values.reduce(pack, [])} />',
+            ),
             # `.filter(Boolean)` drops nulls AND legitimate zeroes
-            (r'trend\.(?:values|labels)\s*\.\s*(?:filter|flatMap)\(\s*Boolean\s*\)', '.filter(Boolean) drops holes'),
+            (
+                r'trend\.(?:values|labels)\s*\.\s*(?:filter|flatMap)\(\s*Boolean\s*\)',
+                '.filter(Boolean) drops holes',
+                'const pts = trend.values.filter(Boolean);',
+            ),
             # a keep-the-non-nulls predicate — the dropping shape.  Note `!==`, not
             # `===`: `.filter(v => v === null).length` COUNTS holes and is fine.
             (
                 r'trend\.(?:values|labels)\s*\.\s*filter\([^)\n]*!==?\s*(?:null|undefined)',
                 'a null-dropping filter predicate',
+                'const pts = trend.values.filter(v => v !== null);',
             ),
-            (r'trend\.(?:values|labels)\s*\.\s*flatMap\(', 'flatMap can drop elements'),
+            (
+                r'trend\.(?:values|labels)\s*\.\s*flatMap\(',
+                'flatMap can drop elements',
+                'const pts = trend.values.flatMap(v => (v == null ? [] : [v]));',
+            ),
         ),
         0,
     ),
@@ -1202,12 +1235,24 @@ _FORBIDDEN_PATTERNS: tuple[
         # empty-series one).  Tabling it also collapses a spelling that was
         # written out twice and could have been hardened in only one place.
         'no chart render site is gated on Chart alone',
-        ((r'\{\s*Chart\s*(?:\?|&&)(?![^\n]*\bgaps\b)', 'a bare `Chart` gate'),),
+        (
+            (
+                r'\{\s*Chart\s*(?:\?|&&)(?![^\n]*\bgaps\b)',
+                'a bare `Chart` gate',
+                '{Chart && <Chart values={trend.values} labels={trend.labels} />}',
+            ),
+        ),
         0,
     ),
     (
         'the escalation projection has no url',
-        ((r'escalation\s*\.\s*url\b', 'the UI reads a `url` off the projection'),),
+        (
+            (
+                r'escalation\s*\.\s*url\b',
+                'the UI reads a `url` off the projection',
+                '<a href={escalation.url}>open</a>',
+            ),
+        ),
         0,
     ),
     (
@@ -1226,6 +1271,7 @@ _FORBIDDEN_PATTERNS: tuple[
             (
                 r'<details[^>]*>\s*<summary[^>]*>\s*\{?[^<]{0,40}issue',
                 'the issues notice is wrapped in a <details>',
+                '<details className="me-note"><summary>Artifact issues</summary>',
             ),
         ),
         re.IGNORECASE,
@@ -1242,12 +1288,65 @@ def _forbidden_patterns(label: str) -> tuple[tuple[str, str, int], ...]:
     """
     for entry_label, patterns, flags in _FORBIDDEN_PATTERNS:
         if entry_label == label:
-            return tuple((pattern, what, flags) for pattern, what in patterns)
+            return tuple((pattern, what, flags) for pattern, what, _violation in patterns)
     raise AssertionError(
         f'no _FORBIDDEN_PATTERNS entry labelled {label!r} — an assertion is '
         'rejecting something no table describes, so the pattern it runs is '
         'hardened in one place and spelled in another.'
     )
+
+
+def test_forbidden_patterns_are_falsified_by_injecting_a_violation(
+    tab_memory_evals_jsx_code: str,
+) -> None:
+    """Every forbidden pattern must still FIRE on the thing it forbids.
+
+    The inverse of `test_presence_greps_are_falsified_by_deleting_the_code`, and
+    it closes the hole that table's harness was written to close, left open on
+    this mirror table.  A presence grep fails loudly when its pattern rots — it
+    stops matching real code.  A FORBIDDEN pattern is asserted to match NOTHING,
+    so a pattern that can never match anything is indistinguishable from one
+    guarding perfectly: it is permanently vacuous and the suite stays green.
+
+    That is not a theoretical rot.  Typo `_FINGERPRINT_PARSE`'s `\\.split\\(` as
+    `\\.spilt\\(`, and `dedupe_fingerprint.split('|')` could land in the .jsx
+    with nothing failing — the fingerprint sliced into a synthetic "eval id"
+    that the payload never claimed, which is exactly what these guards exist to
+    stop.  The generated tuples make that likelier, not less: one typo in a
+    comprehension silently disarms eight patterns at once.
+
+    Two arms per pattern:
+
+    (1) it does NOT match the real comment-stripped source — the same thing the
+        live guards assert, restated here so arm (2) means something.  Without
+        it, a pattern matching the whole file would "pass" arm (2) trivially.
+    (2) it DOES match once its violating snippet is spliced in.  The snippet is
+        hand-written JSX carried in the table beside the pattern, deliberately
+        NOT derived from the pattern: a snippet generated by stripping the
+        regex's escapes would reproduce any typo and match it.
+
+    Nothing about what a guard REJECTS changes here — the snippets are appended
+    to a local copy of the source, never to the .jsx.
+    """
+    code = tab_memory_evals_jsx_code
+
+    for label, patterns, flags in _FORBIDDEN_PATTERNS:
+        for pattern, what, violation in patterns:
+            assert not re.search(pattern, code, flags), (
+                f'[{label}] pattern {pattern!r} ({what}) matches the real '
+                'comment-stripped source. Either the .jsx has a live violation, '
+                'or the pattern is far too broad — and if it matches everything, '
+                'the injection arm below proves nothing about it.'
+            )
+            mutant = f'{code}\n{violation}\n'
+            assert re.search(pattern, mutant, flags), (
+                f'[{label}] pattern {pattern!r} does NOT match {violation!r}, the '
+                f'very thing it claims to forbid ({what}). The guard is VACUOUS: '
+                'it can never fire, so the .jsx could grow this exact line and the '
+                'suite would stay green. Fix the pattern — and if the snippet is '
+                'the thing that is wrong, check it against a real render site '
+                'rather than re-deriving it from the pattern.'
+            )
 
 
 # ---------------------------------------------------------------------------
