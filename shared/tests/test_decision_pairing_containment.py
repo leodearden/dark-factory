@@ -33,6 +33,8 @@ tool-call envelope. Leave it escaped.
 from __future__ import annotations
 
 import contextlib
+import json
+from pathlib import Path
 
 import pytest
 
@@ -67,6 +69,25 @@ CROSS_PAIRED_RATIONALE = (
     'under the archive root, because the offline lane seeds it from a '
     'different parent and the two only coincide on the main checkout.'
 )
+
+
+WIRE_EVIDENCE_PATH = Path(__file__).parent / 'fixtures' / 'decision_pairing_wire_evidence.json'
+
+
+def load_wire_evidence() -> dict:
+    """Task 3727's on-disk pairs beside the tool-call inputs that produced them.
+
+    Committed rather than read from ``data/orchestrator/agent-transcripts``,
+    which is gitignored AND retention-bounded — the archive this was measured
+    from will not outlive the finding. Following the toolcall-markup PRD's
+    section 11.4 resolution that the committed artifact is the durable one.
+
+    Every opening angle bracket is stored as its ``\\u003c`` JSON escape, so the
+    file text carries none while the parsed value is byte-identical to what was
+    harvested. That matters here more than anywhere: this fixture's whole claim
+    is byte-identity, so a lossy round-trip would silently invalidate it.
+    """
+    return json.loads(WIRE_EVIDENCE_PATH.read_text())
 
 
 class TestDetectorBlindness:
