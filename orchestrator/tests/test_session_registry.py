@@ -5459,22 +5459,51 @@ def _inject_import_sandbox(tmp_path: Path, entrypoint_filename: str, payload: st
 
 
 class TestStdlibOnlySelfContainment:
-    """``session_registry`` must import with NO venv, install or workspace deps.
+    """The bare-shell entrypoints must run with NO venv, install or workspace deps.
 
-    This is an architectural contract, not a style preference.  The module
-    docstring (lines 5-12) states it is "deliberately stdlib-only and
-    self-contained (no intra-orchestrator imports)" so it can be "invoked
-    directly by ``skills/spawn/spawn-claude.sh`` via an absolute path (no
-    venv/PYTHONPATH/install required)".  That hook runs under an interpreter
-    with no workspace packages available, so ANY ``from shared import ...`` or
-    third-party import at module scope breaks the spawn path — and does so far
-    from here, as a hook subprocess that silently never writes ``record.json``.
+    This is an architectural contract, not a style preference.  Two production
+    shell paths execute orchestrator modules directly, and they do it under
+    DIFFERENT environments — so this class pins a REGISTRY
+    (``_BARE_SHELL_ENTRYPOINTS``) of invocations, not one module:
 
-    Task 3223's consolidation added ``from shared import safe_io`` and broke
-    exactly this (escalation esc-3223-2); the only symptom in the suite was two
-    downstream ``test_session_hooks.py`` failures, which is why the contract is
-    now pinned directly.  A future migration that finds this test in its way
-    should read the module docstring before deleting it.
+    - **tier-1 — bare shell, NO PYTHONPATH.**  ``skills/spawn/spawn-claude.sh``
+      runs ``session_registry.py`` by absolute path with nothing exported, so
+      only the script's own directory is on ``sys.path``: no ``shared``, no
+      third-party, and no ``orchestrator.<sibling>`` either.
+    - **tier-2 — bare shell (or plain import) WITH PYTHONPATH=orchestrator/src.**
+      ``skills/spawn/hooks/*.sh`` run ``session_hooks.py``, and Python consumers
+      import ``orchestrator.session_registry``.  Intra-orchestrator siblings are
+      reachable here; ``shared`` and third-party are still not.
+
+    Tier-1 is STRICTLY STRONGER, so the rows are not interchangeable and neither
+    may be deleted as a duplicate of the other — pinned by
+    ``test_tier1_is_strictly_stronger_than_tier2``.
+
+    The registry is MUTATION-TESTED (``_MUST_BE_REJECTED``): each forbidden
+    import is injected into a sandbox and some covering row must be observed
+    REJECTING it.  A guard that has never been observed to fail is not evidence
+    of anything — task 3223's consolidation added ``from shared import safe_io``
+    and broke exactly this contract (escalation esc-3223-2) while the only
+    symptom in the suite was two downstream ``test_session_hooks.py`` failures.
+    Each row also carries its own vacuity ``probe`` and SKIPS loudly when it
+    cannot discriminate, rather than reporting a green it did not earn.
+
+    Adding a bare-shell entrypoint?  Register a ROW plus a matrix entry.  Do not
+    write another ad-hoc test — a second one drifts from what the shells run.
+
+    DO NOT WIDEN THIS INTO A REPO-WIDE RULE.  "stdlib-only" names at least three
+    different contracts in this repo, and only the first is what these rows pin:
+
+    (a) bare-shell executability — ``session_registry``, ``session_hooks``;
+    (b) layering / cycle avoidance — ``routing``, ``stop_instruction``,
+        ``fm_retry``, ``agents/triage``, ``fused_memory/config``/``schema``,
+        where importing an intra-package sibling is perfectly fine;
+    (c) dependency footprint — ``memory_eval_limits``, ``evals/report``
+        ("no scipy/numpy"), which already import pydantic and
+        ``shared.memory_eval_metrics`` by design.
+
+    A blanket "no non-stdlib import in any file whose docstring says
+    stdlib-only" check false-positives on (c) and misreads (b).
     """
 
     def test_every_matrix_entrypoint_has_a_registry_row(self):
