@@ -468,36 +468,32 @@ class TestDropVectorIndex:
 class TestDropVectorIndices:
     """GraphitiBackend.drop_vector_indices() drops only VECTOR-type indices.
 
-    These stubs were rewritten (task 3706) from the SCALAR record shape
-    (``'type': 'VECTOR'``) to the MEASURED live one (``'type':
-    {'name_embedding': ['VECTOR']}``) — the same fiction ``TestListIndices``
-    above bans, and for the same reason: a stub live FalkorDB never emits is how
-    the ``entity_type: row[3]`` mis-binding survived unnoticed.
+    Stubs use the MEASURED live record shape (``'type': {'name_embedding':
+    ['VECTOR']}``), never the SCALAR fiction (``'type': 'VECTOR'``) — the same
+    fiction ``TestListIndices`` above bans, and for the same reason: a stub live
+    FalkorDB never emits is how the ``entity_type: row[3]`` mis-binding survived
+    unnoticed.
 
-    Against the real shape ``drop_vector_indices``' predicate
-    ``entry.get('type') == 'VECTOR'`` compares a dict to a string, is always
-    False, and the function drops nothing.  So the two tests that actually
-    exercise a VECTOR index are marked ``xfail(strict=True)`` — the no-op is now
-    recorded as a KNOWN RED rather than hidden behind a green fixture.  The fix
-    is **task 3769**, deliberately out of scope for 3706; when it lands, both
-    marks must be removed (``strict=True`` makes that mandatory — a fixed
-    implementation turns them into XPASS failures, so the marks cannot be
-    forgotten).
+    Task 3706 recorded the defect against that real shape as two
+    ``xfail(strict=True)`` tests naming task 3769: the predicate
+    ``entry.get('type') == 'VECTOR'`` compared a dict to a string, was always
+    False, and the function dropped nothing while logging "Dropped 0 VECTOR
+    index(es)".  Task 3769 fixed it, so those marks are gone.
 
-    ``test_no_op_when_no_vector_indices`` is deliberately NOT marked: it passes
-    under both the broken and the fixed implementation, so it is insensitive to
-    the defect rather than evidence of it, and a strict xfail there would fail
-    on XPASS today.
+    Un-xfailing was NOT sufficient.  Those tests asserted on ``drop_index``,
+    which the fix no longer calls: measured 2026-08-16, the old-style
+    ``DROP INDEX ON :Entity(emb)`` statement that method issues FAILS against a
+    live VECTOR index with ``no such index`` (it targets RANGE only), so
+    repairing the predicate alone would have converted a silent no-op into a
+    RAISING drop path.  Every assertion here is retargeted to
+    ``drop_vector_index``, and the calls are checked to carry the per-property
+    STRING field (``'name_embedding'``, not ``['name_embedding']``) plus the
+    record's ``entity_type``, which selects the statement shape.
     """
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason='drop_vector_indices compares the types dict against the string '
-               "'VECTOR', so it drops nothing — task 3769",
-    )
     @pytest.mark.asyncio
     async def test_drops_only_vector_type_indices(self, mock_config, make_backend):
-        """Calls drop_index for VECTOR indices only, not FULLTEXT/RANGE."""
+        """Calls drop_vector_index for VECTOR indices only, not FULLTEXT/RANGE."""
         backend = make_backend(mock_config)
 
         indices = [
@@ -515,24 +511,26 @@ class TestDropVectorIndices:
             },
         ]
         backend.list_indices = AsyncMock(return_value=indices)
-        backend.drop_index = AsyncMock()
+        backend.drop_vector_index = AsyncMock()
 
         await backend.drop_vector_indices(group_id='test')
 
-        assert backend.drop_index.call_count == 2
-        calls = backend.drop_index.call_args_list
-        called_pairs = [(c[0][0], c[0][1]) for c in calls]
-        assert ('Entity', 'name_embedding') in called_pairs
-        assert ('RELATES_TO', 'fact_embedding') in called_pairs
+        assert backend.drop_vector_index.call_count == 2
+        calls = backend.drop_vector_index.call_args_list
+        # The per-property STRING field, not the record's field LIST: a list here
+        # would render as `ON (n.['name_embedding'])` and drop nothing.
+        called = [(c[0][0], c[0][1], c[0][2]) for c in calls]
+        assert ('Entity', 'name_embedding', 'NODE') in called
+        assert ('RELATES_TO', 'fact_embedding', 'RELATIONSHIP') in called
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason='drop_vector_indices compares the types dict against the string '
-               "'VECTOR', so it returns [] — task 3769",
-    )
     @pytest.mark.asyncio
     async def test_returns_list_of_dropped_indices(self, mock_config, make_backend):
-        """Returns list of dicts with 'label' and 'field' for each dropped index."""
+        """Returns list of dicts with 'label' and 'field' for each dropped index.
+
+        The return shape stays EXACTLY ``{'label', 'field'}``: reindex.py's
+        docstring documents it and this exact-dict assertion pins it, so
+        ``entity_type`` is deliberately NOT added.
+        """
         backend = make_backend(mock_config)
 
         indices = [
@@ -546,7 +544,7 @@ class TestDropVectorIndices:
             },
         ]
         backend.list_indices = AsyncMock(return_value=indices)
-        backend.drop_index = AsyncMock()
+        backend.drop_vector_index = AsyncMock()
 
         result = await backend.drop_vector_indices(group_id='test')
 
@@ -554,13 +552,125 @@ class TestDropVectorIndices:
         assert result[0] == {'label': 'Entity', 'field': 'name_embedding'}
 
     @pytest.mark.asyncio
-    async def test_no_op_when_no_vector_indices(self, mock_config, make_backend):
-        """When no VECTOR indices exist, drop_index not called and returns [].
+    async def test_drops_vector_property_from_a_merged_record(
+        self, mock_config, make_backend,
+    ):
+        """THE shape live FalkorDB actually emits: one MERGED record per label.
 
-        NOT xfail-marked — see the class docstring: this passes both before and
-        after task 3769, so it is insensitive to the no-op rather than a witness
-        to it.
+        MEASURED 2026-08-16 on throwaway graph ``_impl3769_probe`` — a graph with
+        a VECTOR index on ``Entity.emb`` and a RANGE index on ``Entity.name``
+        yields a SINGLE row with ``properties=['emb','name']`` and
+        ``types={'emb': ['VECTOR'], 'name': ['RANGE']}``.  The one-record-per-
+        property stubs the other tests inherit are a milder fiction; this is the
+        real one, and a record-level predicate cannot express it.
         """
+        backend = make_backend(mock_config)
+
+        indices = [
+            {
+                'label': 'Entity',
+                'field': ['name_embedding', 'name'],
+                'type': {'name_embedding': ['VECTOR'], 'name': ['RANGE']},
+                'entity_type': 'NODE',
+            },
+        ]
+        backend.list_indices = AsyncMock(return_value=indices)
+        backend.drop_vector_index = AsyncMock()
+
+        result = await backend.drop_vector_indices(group_id='test')
+
+        backend.drop_vector_index.assert_called_once()
+        assert backend.drop_vector_index.call_args[0][:3] == (
+            'Entity', 'name_embedding', 'NODE',
+        )
+        assert result == [{'label': 'Entity', 'field': 'name_embedding'}]
+
+    @pytest.mark.asyncio
+    async def test_drops_a_property_carrying_both_range_and_vector(
+        self, mock_config, make_backend,
+    ):
+        """MEASURED: one property can carry ``['RANGE', 'VECTOR']``.
+
+        ``DROP VECTOR INDEX`` removes only the VECTOR half (measured: the record
+        came back as ``{name: ['RANGE']}``), so this property must be dropped, not
+        skipped.  A list-equality predicate would silently omit exactly these.
+        """
+        backend = make_backend(mock_config)
+
+        indices = [
+            {
+                'label': 'Entity', 'field': ['name'],
+                'type': {'name': ['RANGE', 'VECTOR']}, 'entity_type': 'NODE',
+            },
+        ]
+        backend.list_indices = AsyncMock(return_value=indices)
+        backend.drop_vector_index = AsyncMock()
+
+        result = await backend.drop_vector_indices(group_id='test')
+
+        backend.drop_vector_index.assert_called_once()
+        assert result == [{'label': 'Entity', 'field': 'name'}]
+
+    @pytest.mark.asyncio
+    async def test_drops_relationship_vector_index_with_relationship_syntax(
+        self, mock_config, make_backend,
+    ):
+        """entity_type must reach drop_vector_index — it selects the statement shape.
+
+        MEASURED 2026-08-16: the NODE form against a RELATIONSHIP vector index
+        (``DROP VECTOR INDEX FOR (n:RELATES_TO) ON (n.fact_embedding)``) fails
+        with ``no such index``, while the edge form deletes it.  Losing
+        ``entity_type`` here reproduces the exact failure this task removes.
+        """
+        backend = make_backend(mock_config)
+
+        indices = [
+            {
+                'label': 'RELATES_TO',
+                'field': ['uuid', 'fact_embedding'],
+                'type': {'uuid': ['RANGE'], 'fact_embedding': ['VECTOR']},
+                'entity_type': 'RELATIONSHIP',
+            },
+        ]
+        backend.list_indices = AsyncMock(return_value=indices)
+        backend.drop_vector_index = AsyncMock()
+
+        result = await backend.drop_vector_indices(group_id='test')
+
+        backend.drop_vector_index.assert_called_once()
+        assert backend.drop_vector_index.call_args[0][:3] == (
+            'RELATES_TO', 'fact_embedding', 'RELATIONSHIP',
+        )
+        assert result == [{'label': 'RELATES_TO', 'field': 'fact_embedding'}]
+
+    @pytest.mark.asyncio
+    async def test_does_not_absorb_a_failing_drop(self, mock_config, make_backend):
+        """A failed drop PROPAGATES; it is never reported as a clean run.
+
+        Deliberately the inverse of ``ensure_indices``, which absorbs per-statement
+        failures because a partial provision beats none.  The sole caller here
+        drops indices immediately BEFORE re-embedding, so a partial drop reported
+        as success leaves stale fixed-dimension indices behind while the operator
+        believes the rebuild was clean — the same silent fail-soft this task
+        exists to remove.
+        """
+        backend = make_backend(mock_config)
+
+        indices = [
+            {
+                'label': 'Entity', 'field': ['name_embedding'],
+                'type': {'name_embedding': ['VECTOR']}, 'entity_type': 'NODE',
+            },
+        ]
+        backend.list_indices = AsyncMock(return_value=indices)
+        backend.drop_vector_index = AsyncMock(side_effect=RuntimeError('boom'))
+
+        with pytest.raises(RuntimeError, match='boom'):
+            await backend.drop_vector_indices(group_id='test')
+
+    @pytest.mark.asyncio
+    async def test_no_op_when_no_vector_indices(self, mock_config, make_backend):
+        """When no VECTOR indices exist, drop_vector_index not called and returns []."""
         backend = make_backend(mock_config)
 
         indices = [
@@ -574,11 +684,11 @@ class TestDropVectorIndices:
             },
         ]
         backend.list_indices = AsyncMock(return_value=indices)
-        backend.drop_index = AsyncMock()
+        backend.drop_vector_index = AsyncMock()
 
         result = await backend.drop_vector_indices(group_id='test')
 
-        backend.drop_index.assert_not_called()
+        backend.drop_vector_index.assert_not_called()
         assert result == []
 
 
