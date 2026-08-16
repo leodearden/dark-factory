@@ -1084,6 +1084,19 @@ class ArmRow(BaseModel):
     #: embedding arm) or the stack declines to answer it: vLLM sends
     #: `prompt_tokens_details: null`, so there the split rests on latency alone.
     measured_cached_prompt_tokens: int | None = None
+    #: Every measured sample when `--repeat N` was asked for, `None` otherwise
+    #: -- "the question was not asked" and "a spread of one" are different
+    #: statements, the same distinction `top_level_entities_named` draws.
+    #:
+    #: Samples after the FIRST are PREFIX-CACHE WARM and therefore measure
+    #: generation with prompt processing largely free: the first measured probe
+    #: populates the cache the rest are served from.  Measured 2026-08-06 on
+    #: moe-stretch, a repeat was served 338 of its 343 prompt tokens from cache,
+    #: and the cache state even changed the OUTPUT at temperature 0 (276
+    #: completion tokens cold-cache against 236 warm).  Repeated identical
+    #: probes are NOT independent samples -- which is why `latency_ms` stays
+    #: pinned to `repeat_latencies_ms[0]`, the only prefix-cold one.
+    repeat_latencies_ms: list[float] | None = None
 
 
 class VramBlock(BaseModel):
@@ -1182,6 +1195,7 @@ def run_healthcheck(
     gpu_probe: Callable[[], lms_vram.GpuSnapshot] | None = None,
     probe: Callable[..., ProbeResult] | None = None,
     baseline: lms_vram.GpuBaseline | None = None,
+    repeat: int = 1,
 ) -> HealthReport:
     """Probe every arm and assemble the report.
 
@@ -1209,7 +1223,22 @@ def run_healthcheck(
     Each arm is probed TWICE (task 3781): a discarded warm-up, then the run
     that is actually measured.  See the per-arm loop for why the pairing lives
     here rather than inside `probe_arm`.
+
+    `repeat > 1` fires the MEASURED probe that many times and records every
+    latency, still behind exactly one warm-up.  It is observability only: the
+    first measured result alone supplies the verdict, so no number of repeats
+    can turn a row green.
     """
+    if repeat < 1:
+        # A caller error, never an arm failure -- recording it as a FAIL would
+        # blame the model for the harness, which this module's exception
+        # contract exists to prevent.
+        raise HealthcheckError(
+            f'repeat={repeat} would probe each arm zero times, producing a '
+            'report with no measurement in it that still reads as a completed '
+            'run'
+        )
+
     read_gpu = gpu_probe if gpu_probe is not None else lms_vram.probe_gpu_snapshot
     probe_one = probe if probe is not None else probe_arm
 
@@ -1286,7 +1315,13 @@ def run_healthcheck(
         # only by a pathologically slow one -- which is cheaper than a latency
         # column that lies about every healthy arm.
         warmup = probe_one(arm, warmup=True)
-        result = probe_one(arm)
+        # ONE warm-up regardless of `repeat`: the engine is warm after the
+        # first request, so re-warming would spend GPU time to learn nothing.
+        samples = [probe_one(arm) for _ in range(repeat)]
+        # The FIRST measured sample alone adjudicates.  It is also the only
+        # prefix-cold one, so it is the only sample comparable with a
+        # single-shot run.
+        result = samples[0]
         rows.append(
             ArmRow(
                 arm_id=arm.arm_id,
@@ -1306,6 +1341,9 @@ def run_healthcheck(
                 reasoning=arm.reasoning,
                 top_level_entities_named=result.top_level_entities_named,
                 measured_cached_prompt_tokens=result.cached_prompt_tokens,
+                repeat_latencies_ms=(
+                    [s.latency_ms for s in samples] if repeat > 1 else None
+                ),
             )
         )
 
@@ -1595,6 +1633,18 @@ def _consumer_lines(label: str, consumers: Sequence[lms_vram.GpuConsumer]) -> li
     ]
 
 
+def _ms_cell(row: ArmRow) -> str:
+    """The measured latency, with the `--repeat` spread appended when asked
+    for.  The spread is shown BESIDE the headline number, never instead of it:
+    only the first sample is prefix-cold, so the range is context, not a
+    better estimate."""
+    head = f'{row.latency_ms:.0f}'
+    spread = row.repeat_latencies_ms
+    if not spread:
+        return head
+    return f'{head} [{min(spread):.0f}-{max(spread):.0f}]'
+
+
 def render_table(report: HealthReport) -> str:
     """Render the report for a human.
 
@@ -1613,7 +1663,7 @@ def render_table(report: HealthReport) -> str:
             row.endpoint,
             row.verdict,
             str(row.reason),
-            f'{row.latency_ms:.0f}',
+            _ms_cell(row),
         )
         for row in report.arms
     ]
@@ -1693,6 +1743,21 @@ def _write_report(report: HealthReport, output: str | None) -> None:
     print(f'\nwrote {out_path}')
 
 
+def _positive_int(raw: str) -> int:
+    """argparse `type` for --repeat.  Rejected at PARSE time, not later, so
+    `--repeat 0` never reaches a sweep that would write a measurement-free
+    report reading as a completed run."""
+    try:
+        value = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f'{raw!r} is not an integer') from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(
+            f'{value} would probe each arm zero times; N must be at least 1'
+        )
+    return value
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog='lms_healthcheck',
@@ -1710,6 +1775,17 @@ def main(argv: list[str] | None = None) -> int:
         help='combine per-arm JSON reports into one slate artifact',
     )
     parser.add_argument('--output', help='write the JSON report to this path')
+    # Deliberately OUTSIDE the selector group: it is not a way of choosing arms
+    # and must compose with every way of choosing them.
+    parser.add_argument(
+        '--repeat', type=_positive_int, default=1, metavar='N',
+        help=(
+            'fire the measured probe N times per arm (one warm-up regardless) '
+            'and record every latency. Observability only — the first sample '
+            'alone decides the verdict, and samples after it are '
+            'prefix-cache WARM, so they are not independent measurements'
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.merge:
@@ -1753,7 +1829,7 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_NO_ACTIVE_ARMS
 
     try:
-        report = run_healthcheck(arms)
+        report = run_healthcheck(arms, repeat=args.repeat)
     except (lms_vram.PollutedBaselineError, lms_vram.PollutedMeasurementError) as exc:
         # BEFORE the VramProbeError branch below, which they subclass.  In the
         # other order this refusal would be reported as "the GPU probe failed"
