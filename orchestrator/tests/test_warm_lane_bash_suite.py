@@ -396,6 +396,11 @@ def _run_bash_suite(name: str) -> tuple[int, str, str]:
     output, rather than propagating ``TimeoutExpired`` (whose stdout/stderr hang
     off the exception object), so the hang path produces the same
     failure-with-captured-tail shape the module docstring and README promise.
+
+    The other half of that contract is that the pgid is FROZEN at spawn rather
+    than re-derived at kill time — see ``shared/src/shared/proc_group.py``'s
+    module docstring for why ``os.getpgid(proc.pid)`` in a kill path is the
+    task-845 footgun.
     """
     with subprocess.Popen(
         ['bash', str(BASH_TEST_DIR / name)],
@@ -406,11 +411,17 @@ def _run_bash_suite(name: str) -> tuple[int, str, str]:
         env=_sanitized_env(),
         start_new_session=True,
     ) as proc:
+        # Frozen at spawn: start_new_session=True makes proc its own group
+        # leader, so pgid == proc.pid by POSIX guarantee.  Re-reading it at kill
+        # time with os.getpgid would be the task-845 footgun — a reaped pid can
+        # be recycled onto an unrelated group (in the original incidents, the
+        # user's `systemd --user` group, killing the whole login session).
+        pgid = proc.pid
         try:
             stdout, stderr = proc.communicate(timeout=SUBPROC_TIMEOUT)
         except subprocess.TimeoutExpired:
             try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                os.killpg(pgid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):  # pragma: no cover
                 proc.kill()
             # ``Popen.communicate``'s ``TimeoutExpired`` carries no output (only
