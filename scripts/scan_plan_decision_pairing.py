@@ -512,10 +512,14 @@ def _build_parser() -> argparse.ArgumentParser:
             'correction entry. Every count reported is a STRICT LOWER BOUND -- '
             'only a mis-pairing someone noticed and documented leaves a trace. '
             'exit codes: 0 = the sweep ran; 1 = --fail-on-hit was passed and at '
-            'least one mis-paired entry was found. NOTE that 0 does not by '
-            'itself mean the corpus is clean: a --root that does not exist also '
-            'yields no hits, so read the "scanned N plan files" summary, which '
-            'is printed on every run for exactly this reason.'
+            'least one mis-paired entry was found; 2 = a usage error; 3 = '
+            '--require-scanned N was passed and fewer than N plan files were '
+            'read, so NOTHING can be concluded from the hit count (never treat '
+            '3 as a clean run). NOTE that 0 does not by itself mean the corpus '
+            'is clean when --require-scanned is omitted: a --root that does not '
+            'exist also yields no hits, so either pass that flag or read the '
+            '"scanned N plan files" summary, which is printed on every run for '
+            'exactly this reason.'
         ),
     )
     parser.add_argument(
@@ -531,9 +535,21 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         '--fail-on-hit', action='store_true',
-        help='Exit 1 when at least one mis-paired entry is found, for use as a '
-             'CI or timer gate. Skipped files do NOT trigger it -- see the '
-             'scanned count.',
+        help='Exit 1 when at least one mis-paired entry is found. Skipped '
+             'files do NOT trigger it, and neither does a sweep that read '
+             'nothing -- so ALONE this is safe interactively (a human reads '
+             'the scanned count) but NOT unattended, where only $? is '
+             'consumed. The invocation that is safe as a CI or timer gate is '
+             '`--fail-on-hit --require-scanned 1`.',
+    )
+    parser.add_argument(
+        '--require-scanned', type=int, default=0, metavar='N',
+        help='Exit 3 when fewer than N plan files were actually read. 0 (the '
+             'default) disables the check. This is the coverage floor: a '
+             'mistyped --root, a root not created yet, and a root whose '
+             'listing raised PermissionError all produce zero hits, which a '
+             'hit-keyed gate cannot tell from a clean corpus. A negative N is '
+             'rejected rather than silently disabling the gate.',
     )
     return parser
 
@@ -542,21 +558,45 @@ def main(argv: list[str] | None = None) -> int:
     """CLI entry point — a thin shell over the pure functions above.
 
     Exit codes: 0 = the sweep ran; 1 = ``--fail-on-hit`` was passed and at
-    least one mis-paired entry was found.
+    least one mis-paired entry was found; 2 = a usage error (argparse's own);
+    3 = ``--require-scanned N`` was passed and fewer than N plan files were
+    read.
 
-    Exit 0 is NOT by itself evidence of a clean corpus. ``--fail-on-hit`` keys
-    on hits, and a ``--root`` that does not exist produces none, so a
-    mistyped root exits 0 exactly as a clean sweep does. The summary therefore
-    states the scanned count on EVERY run, including the no-hits and JSON
-    paths, so the distinction is visible to anyone reading output rather than
-    only branching on ``$?``. That is the same failure mode the precedent
-    scanner reserves its exit 3 for; here it is surfaced in the report rather
-    than in a code, because a partial sweep (some lanes skipped) is normal for
-    this corpus and would make an all-or-nothing code misleading.
+    ``--fail-on-hit`` alone keys ONLY on hits, and a ``--root`` that does not
+    exist — mistyped, not created yet, or unlistable — produces none, so a
+    swept-nothing run exits 0 exactly as a clean sweep does. The summary states
+    the scanned count on EVERY run, including the no-hits and JSON paths, so a
+    human reading output can always see it; but a gate is consumed by ``$?``,
+    not by a reader, which is what ``--require-scanned`` is for. The two flags
+    are deliberately separate rather than ``--fail-on-hit`` being widened: the
+    flag then means what its name says, and a caller who wants a coverage floor
+    states one instead of inheriting a redefinition.
+
+    The coverage floor is a THRESHOLD rather than the precedent scanner's
+    all-or-nothing "every input was unreadable", because a partial sweep is
+    normal for this corpus — lanes legitimately come and go mid-run — so only
+    the caller knows how much coverage makes their gate meaningful. Exit 3 is
+    borrowed from that precedent all the same, with the same reading: nothing
+    can be concluded from the hit count, and 3 is never a clean run.
+
+    A coverage failure OUTRANKS a hit in the exit code. Both are non-zero, so
+    no gate is weakened either way; the question is only which is reported, and
+    a sweep that fell short of its floor found an unknown fraction of what is
+    there — so "at least one hit" would understate a run that cannot be read as
+    a measurement at all. The hits are still printed.
     """
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    if args.require_scanned < 0:
+        # A negative floor can never fire (`scanned < -1` is never true), so
+        # accepting one would silently disable the very check it was passed to
+        # enable — the failure mode this flag exists to remove, reintroduced by
+        # a typo. Rejected loudly instead, as argparse's own exit 2.
+        parser.error('--require-scanned must be >= 0')
     scan = scan_tree(args.root)
     print(format_json(scan) if args.json else format_report(scan))
+    if scan.scanned < args.require_scanned:
+        return 3
     if args.fail_on_hit and scan.records:
         return 1
     return 0

@@ -808,6 +808,27 @@ class TestCli:
         assert result.returncode == 0, result.stderr
         assert '--root' in result.stdout
         assert '--fail-on-hit' in result.stdout
+        assert '--require-scanned' in result.stdout
+
+    def test_the_help_text_names_the_invocation_that_is_SAFE_as_a_ci_gate(self):
+        """An operator wiring a timer must not have to derive this.
+
+        ``--fail-on-hit`` alone is safe interactively, where a human reads the
+        scanned count, and unsafe unattended, where only ``$?`` is consumed.
+        A distinction that lives only in a review thread protects nobody, so
+        the help states the whole safe invocation and this pins that it does.
+
+        Asserted over whitespace-normalized help text, because argparse wraps
+        at the terminal width and a raw substring match would be a test of
+        ``COLUMNS`` rather than of the wording.
+        """
+        result = _run_cli('--help')
+
+        assert result.returncode == 0, result.stderr
+        normalized = ' '.join(result.stdout.split())
+        assert '--fail-on-hit --require-scanned 1' in normalized, (
+            'the help must name the safe unattended invocation verbatim'
+        )
 
     def test_json_output_matches_the_in_process_scan_of_the_same_tree(self, tree):
         """The CLI is a thin shell: it must not re-derive or re-order anything."""
@@ -851,16 +872,92 @@ class TestCli:
         """The one case where exit 0 is NOT evidence of a clean corpus.
 
         ``--fail-on-hit`` keys on hits, and a root that does not exist produces
-        none — so the exit code alone cannot distinguish "clean" from "swept
-        nothing". That is precisely why the summary always states the scanned
-        count: an operator reading the output can see it, even though an
-        operator branching only on ``$?`` cannot. Pinned so the caveat is
-        visible rather than discovered in an incident.
+        none — so ITS exit code alone cannot distinguish "clean" from "swept
+        nothing". That is why the summary always states the scanned count: an
+        operator reading the output can see it, even though an operator
+        branching only on ``$?`` cannot. Pinned so the caveat is visible rather
+        than discovered in an incident.
+
+        The flag's semantics are deliberately left as they are — it means what
+        its name says — and the unattended gap is closed by ``--require-scanned``
+        instead (see the four cases below), so a caller who wants coverage
+        enforced asks for it rather than having it silently redefined.
         """
         result = _run_cli('--root', str(tmp_path / 'no-such-tree'), '--fail-on-hit')
 
         assert result.returncode == 0
         assert 'scanned 0' in result.stdout
+
+    def test_require_scanned_turns_a_read_nothing_sweep_into_a_FAILURE(
+        self, tmp_path
+    ):
+        """The gap that made ``--fail-on-hit`` unsafe unattended, closed.
+
+        A mistyped ``--root``, a root not created yet, or a root whose listing
+        raised ``PermissionError`` all yield zero hits, so a hit-keyed gate
+        reports success for a sweep that read nothing at all. A gate is
+        consumed by ``$?``, not by a human reading the scanned count, so the
+        coverage floor has to be expressible in the exit code.
+
+        Exit 3, matching the precedent scanner's reserved "nothing was scanned,
+        never treat this as a clean run" code rather than inventing a fourth
+        meaning for 1.
+        """
+        result = _run_cli(
+            '--root', str(tmp_path / 'no-such-tree'),
+            '--fail-on-hit', '--require-scanned', '1',
+        )
+
+        assert result.returncode == 3, (
+            f'stdout={result.stdout!r} stderr={result.stderr!r}'
+        )
+        assert 'scanned 0' in result.stdout, (
+            'the report is still printed before the code is decided'
+        )
+
+    def test_require_scanned_is_satisfied_by_a_sweep_that_read_enough(self, tmp_path):
+        """The floor is a floor, not an equality: reading MORE is fine."""
+        root = tmp_path / 'task-meta'
+        write_plan(root, '10', [CLEAN_ENTRY])
+        write_plan(root, '30', [SUPERSEDES_ONLY_ENTRY])
+
+        result = _run_cli(
+            '--root', str(root), '--fail-on-hit', '--require-scanned', '1',
+        )
+
+        assert result.returncode == 0, (
+            f'stdout={result.stdout!r} stderr={result.stderr!r}'
+        )
+
+    def test_a_coverage_failure_outranks_a_hit_in_the_exit_code(self, tree):
+        """Both are non-zero, so the question is only which one is REPORTED.
+
+        A sweep that fell short of its coverage floor found an unknown fraction
+        of what is there, so "at least one hit" understates the situation: the
+        honest report is that the run cannot be read as a measurement at all.
+        Exit 3 wins, and the hits are still printed.
+        """
+        result = _run_cli(
+            '--root', str(tree), '--fail-on-hit', '--require-scanned', '99',
+        )
+
+        assert result.returncode == 3, (
+            f'stdout={result.stdout!r} stderr={result.stderr!r}'
+        )
+        assert 'task 10' in result.stdout, 'the hits found are still reported'
+
+    def test_a_negative_require_scanned_is_rejected_not_silently_disabled(self):
+        """A mistyped floor must not quietly switch the gate off.
+
+        ``scanned < -1`` is never true, so a negative would disable the very
+        check it was passed to enable — the silent degradation this flag exists
+        to remove, reintroduced by a typo. argparse's own usage error (exit 2)
+        is the loud answer.
+        """
+        result = _run_cli('--root', '/nonexistent', '--require-scanned', '-1')
+
+        assert result.returncode == 2
+        assert '--require-scanned' in result.stderr
 
     def test_the_tree_is_untouched_by_the_real_cli_path(self, tree):
         """The read-only contract must survive the invocation operators use.

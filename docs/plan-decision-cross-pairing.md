@@ -269,7 +269,7 @@ already knows — the author who just wrote the correction.
 | Artifact | Purpose |
 |---|---|
 | `shared/src/shared/decision_pairing.py` | The single owner of both marker sets and of the predicate (INV-5). Detection only; no repair counterpart. |
-| `scripts/scan_plan_decision_pairing.py` | Re-runnable READ-ONLY CLI. `--root`, `--json`, `--fail-on-hit`. No `--apply`, ever. |
+| `scripts/scan_plan_decision_pairing.py` | Re-runnable READ-ONLY CLI. `--root`, `--json`, `--fail-on-hit`, `--require-scanned`. No `--apply`, ever. |
 | `shared/tests/fixtures/decision_pairing_corpus.jsonl` + README | 23 positives and 6 negative controls, so prevalence survives `.worktrees/` churn. |
 | `shared/tests/fixtures/decision_pairing_wire_evidence.json` | 3727's on-disk pairs beside its wire inputs, so the mechanism finding survives the `data/` retention window. |
 | `shared/tests/test_decision_pairing_containment.py` | The containment measurement and the wire-evidence replay. |
@@ -280,13 +280,25 @@ already knows — the author who just wrote the correction.
 python scripts/scan_plan_decision_pairing.py            # human report, exit 0
 python scripts/scan_plan_decision_pairing.py --json     # machine-readable
 python scripts/scan_plan_decision_pairing.py --fail-on-hit   # exit 1 on any hit
+
+# The invocation that is SAFE unattended (CI job, timer):
+python scripts/scan_plan_decision_pairing.py --fail-on-hit --require-scanned 1
 ```
 
 `--root` defaults to this checkout's `.worktrees/.task-meta` and resolves
-correctly from a task worktree as well as from the main checkout. Note that
-**exit 0 is not by itself evidence of a clean corpus** — a `--root` that does
-not exist also yields no hits. Every run therefore prints a
-`scanned N plan files` summary; read it.
+correctly from a task worktree as well as from the main checkout.
+
+**Exit 0 is not by itself evidence of a clean corpus, and `--fail-on-hit` alone
+is not a safe gate.** That flag keys only on hits, and a `--root` that is
+mistyped, not created yet, or unlistable yields none — so a sweep that read
+*nothing* exits 0 exactly as a clean one does. Interactively that is harmless,
+because every run prints a `scanned N plan files` summary and a human reads it;
+unattended it is not, because only `$?` is consumed. `--require-scanned N`
+states the coverage floor in the exit code: **exit 3** when fewer than N plan
+files were actually read, which is never a clean run. A coverage failure
+outranks a hit in the code (3 beats 1) — both fail, and a sweep short of its
+floor found an unknown fraction of what is there. Exit 2 is a usage error;
+a negative `N` is rejected rather than silently disabling the gate.
 
 ---
 
