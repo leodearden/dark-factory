@@ -18,7 +18,7 @@ import contextlib
 import shutil
 import types
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -26,6 +26,12 @@ from escalation.dedupe import DedupeConfig
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
+
+if TYPE_CHECKING:
+    # Annotation-only (PEP 563 via `from __future__ import annotations`): the
+    # runtime import stays local to each helper, mirroring every other
+    # orchestrator reference in this file.
+    from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -4020,6 +4026,7 @@ async def _run_fast_path_probe(
     metadata: dict[str, Any] | None = None,
     scheduler_raises: bool = False,
     with_scheduler: bool = True,
+    worker_outcome: MergeOutcome | None = None,
 ) -> tuple[dict, asyncio.Queue, list]:
     """Drive merge_request's submit-time fast path once.
 
@@ -4027,6 +4034,14 @@ async def _run_fast_path_probe(
     the future so the fall-through path (no fast-path hit) terminates instead
     of blocking, letting each test assert on the RESPONSE rather than on a
     timeout.
+
+    ``worker_outcome`` is the ``MergeOutcome`` that fake worker delivers.  It
+    defaults to ``MergeOutcome('done', reason='test done')``, which is a
+    STAND-IN, not a claim about production: tests that assert on the
+    fall-through response must pass the outcome the real worker would produce
+    for their wiring, or they measure the fake instead of the code under test.
+    Tests that assert only on the fast path itself (which returns before any
+    worker runs) are unaffected by this value.
     """
     import orchestrator.merge_queue as orchestrator_merge_queue  # type: ignore[reportMissingImports]
     from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
@@ -4083,7 +4098,11 @@ async def _run_fast_path_probe(
 
     async def _worker() -> None:
         req = await mq.get()
-        req.result.set_result(MergeOutcome('done', reason='test done'))
+        req.result.set_result(
+            worker_outcome
+            if worker_outcome is not None
+            else MergeOutcome('done', reason='test done')
+        )
         await mq.put(req)   # put it back so tests can assert the enqueue happened
 
     worker_task = asyncio.create_task(_worker())
@@ -4128,15 +4147,18 @@ class TestMergeRequestDegenerateBranchFastPath:
             metadata={'branch_base_sha': _DEGENERATE_TIP},
         )
 
-        assert result['status'] != 'already_merged', (
-            f'Degenerate branch must not fast-path as already_merged: {result}'
-        )
-        assert result.get('commit') != _DEGENERATE_TIP, (
-            f'The parked foreign SHA must not be returned as a commit: {result}'
-        )
+        # The guard controls SUBMIT-time behaviour only: the request is
+        # enqueued and audited instead of short-circuiting, and the parked
+        # foreign SHA never reaches the caller.  It does NOT control the final
+        # status — the worker still answers already_merged for this shape (its
+        # own ancestry short-circuit); see
+        # test_degenerate_branch_worker_path_answers_already_merged_with_no_commit.
         assert not mq.empty(), 'Expected the request to be enqueued instead'
         assert EventType.merge_queued in events, (
             f'Expected a merge_queued event on the fall-through path, got: {events}'
+        )
+        assert result.get('commit') != _DEGENERATE_TIP, (
+            f'The parked foreign SHA must not be returned as a commit: {result}'
         )
 
     async def test_degenerate_branch_also_skips_patch_id_backstop(
@@ -4151,15 +4173,68 @@ class TestMergeRequestDegenerateBranchFastPath:
         backstop and still answer already_merged.  This test is the only
         thing that catches that.
         """
-        result, mq, _ = await _run_fast_path_probe(
+        from orchestrator.event_store import EventType  # type: ignore[reportMissingImports]
+
+        result, mq, events = await _run_fast_path_probe(
             tmp_path, monkeypatch, is_ancestor_result=False, patch_contained=True,
             metadata={'branch_base_sha': _DEGENERATE_TIP},
         )
 
-        assert result['status'] != 'already_merged', (
-            f'Degenerate branch must not reach the patch-id backstop: {result}'
-        )
+        # Submit-time facts only — the backstop was not consulted, so the
+        # request was enqueued and audited.  As above, the final status is the
+        # worker's to decide and remains a known residual.
         assert not mq.empty(), 'Expected the request to be enqueued instead'
+        assert EventType.merge_queued in events, (
+            f'Expected a merge_queued event on the fall-through path, got: {events}'
+        )
+        assert result.get('commit') != _DEGENERATE_TIP, (
+            f'The parked foreign SHA must not be returned as a commit: {result}'
+        )
+
+    async def test_degenerate_branch_worker_path_answers_already_merged_with_no_commit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The honest end-to-end pin: the worker STILL answers already_merged.
+
+        This is the REMAINING gap, not a guarantee this task closes.  Declining
+        the submit-time fast path only redirects a degenerate branch to the
+        worker, which reaches the same verdict by its own route:
+        ``_already_merged_is_genuine`` (merge_queue.py:5455) resolves
+        ``candidate_tip`` to the same parked base and returns True at its FIRST
+        ancestry check (merge_queue.py:5515 — the single fix point), so the
+        worker emits a terminal ``MergeOutcome('already_merged')``.  Follow-up:
+        tkt_0RSHM98C6F78MW4J0SK3S29YZG.
+
+        What this task's guard DOES buy, and what this test therefore pins:
+        the response no longer fabricates a ``commit`` (the parked foreign SHA
+        that skills/unblock/SKILL.md stamps verbatim into ``done_provenance``)
+        — it is None — and the submission leaves an auditable queue record (a
+        ``request_id`` plus a ``merge_queued`` event) instead of vanishing into
+        a silent submit-time short-circuit.
+        """
+        from orchestrator.event_store import EventType  # type: ignore[reportMissingImports]
+        from orchestrator.merge_queue import MergeOutcome  # type: ignore[reportMissingImports]
+
+        result, _, events = await _run_fast_path_probe(
+            tmp_path, monkeypatch, is_ancestor_result=True,
+            metadata={'branch_base_sha': _DEGENERATE_TIP},
+            # Models merge_queue.py:5650 — the worker's terminal outcome for
+            # exactly this wiring (no merge_sha, hence commit=None).
+            worker_outcome=MergeOutcome('already_merged'),
+        )
+
+        assert result['status'] == 'already_merged', (
+            f'The worker-side residual is already_merged, got: {result}'
+        )
+        assert result['commit'] is None, (
+            f'The worker path must not carry a fabricated commit SHA: {result}'
+        )
+        assert result['request_id'] is not None, (
+            f'The redirected submission must be an auditable queue record: {result}'
+        )
+        assert EventType.merge_queued in events, (
+            f'Expected a merge_queued event for the redirected request: {events}'
+        )
 
     async def test_non_degenerate_ancestor_branch_still_already_merged(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
