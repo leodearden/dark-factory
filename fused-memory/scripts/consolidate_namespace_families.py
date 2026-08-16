@@ -433,7 +433,17 @@ async def merge_graph_family(
         ``mentions_recreated``, ``mentions_skipped`` (straight from the
         batch's ``SubgraphEdgeResult``), ``dropped_cross_target`` and
         ``blocked`` (both lists, passed through from the
-        ``SubgraphEdgeResult`` verbatim -- never silently dropped).
+        ``SubgraphEdgeResult`` verbatim -- never silently dropped), plus
+        ``merge_mentions_dropped`` and ``merge_mentions_dropped_uuids``
+        (task 4183's census of the MENTIONS links AT RISK -- destroyed if a
+        MERGE spec's wrong copy is deleted -- likewise passed through
+        verbatim).
+        This script builds MOVE specs only (see the ``move_specs`` assembly
+        below), so the census is structurally always 0/``[]`` here -- it
+        fires only for MERGE specs -- but both keys are surfaced anyway
+        under the same "never silently dropped" convention as
+        ``dropped_cross_target``/``blocked``, and so the field is already
+        wired should MERGE specs ever be added.
     """
     # --- Phase A: create every entity + episode in canonical ---------------
     create_failed: dict[str, Exception] = {}
@@ -580,6 +590,8 @@ async def merge_graph_family(
         'mentions_skipped': edge_result.mentions_skipped,
         'dropped_cross_target': edge_result.dropped_cross_target,
         'blocked': edge_result.blocked,
+        'merge_mentions_dropped': edge_result.merge_mentions_dropped,
+        'merge_mentions_dropped_uuids': edge_result.merge_mentions_dropped_uuids,
     }
 
 
@@ -794,7 +806,13 @@ async def run(
     ``has_dropped_cross_target``/``has_blocked_items`` exit-code folding,
     adapted to this script's per-item disposition rather than a parallel
     top-level predicate -- ``has_unresolved`` already scans every section
-    for ``'UNRESOLVED'``, so no new predicate is needed. A source whose
+    for ``'UNRESOLVED'``, so no new predicate is needed. The summary's
+    ``merge_mentions_dropped``/``merge_mentions_dropped_uuids`` census is
+    DELIBERATELY excluded from that predicate (task 4183, operator ruling
+    2026-08-12: visibility only) -- it is informational, like
+    ``migrate_cross_graph_leak.py``'s ``embedding_omitted``, and must not
+    flip an otherwise-clean family to ``UNRESOLVED``; the omission is a
+    decision, not an oversight. A source whose
     deletion was withheld (Phase-A create failure or Phase-B ``blocked``)
     leaves recoverable residue in the sibling graph, which also keeps that
     sibling's junk-key node count > 0 -- so its GRAPH.DELETE (step 3 below)

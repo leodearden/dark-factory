@@ -854,6 +854,30 @@ async def run(args: Any, memory_service: Any) -> dict:
     # informational -- deliberately NOT folded into exit_code, since a null
     # embedding is valid data, not a failure requiring human review.
     report['embedding_omitted'] = edge_result.embedding_omitted
+    # merge_mentions_dropped / _uuids (task 4183): the MERGE fold recreates
+    # RELATES_TO edges only, so an Episodic MENTIONS link pointing at a
+    # merged-away wrong copy is destroyed by that node's Phase-C DETACH
+    # DELETE. This link count plus the distinct mentioning-episode uuids
+    # convert that previously-silent loss into a reviewable report line.
+    # Read it as MENTIONS LINKS AT RISK IF PHASE C PROCEEDS -- an upper
+    # bound, not a confirmed loss. The census is taken in Phase B and cannot
+    # see the two paths above that withhold a source deletion: on
+    # phase_b_error every MERGE spec is skipped (yet the recovered
+    # exc.partial_result still carries its census), and a uuid in
+    # blocked_node_uuids keeps its source node. In both, the censused links
+    # SURVIVE. Attributing each link back to its spec to net those out would
+    # need a per-entity mapping on SubgraphEdgeResult; until then the
+    # per-spec logger.warning (which names entity + episode uuids) is what an
+    # operator cross-references against phase_b_blocked / the error field.
+    # Like embedding_omitted directly above -- and deliberately UNLIKE
+    # dropped_cross_target_edges/phase_b_blocked below -- it is informational
+    # and is NOT folded into exit_code: the operator ruling is visibility
+    # only, and a wrong-graph mentioning episode is EPISODIC_SKIP (never
+    # actioned), so a MERGE whose wrong copy carries MENTIONS is the expected
+    # steady state, not a failure needing a blocking exit. An operator who
+    # wants to withhold Phase C on a non-zero count acts on this report.
+    report['merge_mentions_dropped'] = edge_result.merge_mentions_dropped
+    report['merge_mentions_dropped_uuids'] = edge_result.merge_mentions_dropped_uuids
     report['dropped_cross_target_edges'] = edge_result.dropped_cross_target
     report['phase_b_blocked'] = edge_result.blocked
     report['post_verify'] = {
