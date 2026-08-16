@@ -35,7 +35,10 @@ task 3884 removed it. A regex guard would fail on all three.
 from __future__ import annotations
 
 import ast
+import subprocess
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -157,6 +160,29 @@ def test_does_not_flag_docstring_or_comment_mention() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _git_tracked_python() -> list[Path]:
+    """Every .py file git tracks in this checkout, or ``[]`` if git is unavailable.
+
+    ``git ls-files`` is the authoritative answer to "what is actually in this
+    repo": it is complete by construction (no hand-maintained root list to grow
+    holes) and it excludes every generated, ephemeral or sibling-checkout tree
+    without an allowlist, because none of them are tracked.
+
+    NUL-delimited (``-z``) rather than newline-delimited on purpose: a path
+    containing a space or a newline would silently truncate the tracked set,
+    and a truncated ground truth makes the completeness test below *vacuously*
+    pass -- the exact failure mode it exists to prevent.
+    """
+    try:
+        out = subprocess.run(
+            ['git', '-C', str(REPO_ROOT), 'ls-files', '-z', '--', '*.py'],
+            capture_output=True, text=True, timeout=30, check=True,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [REPO_ROOT / p for p in out.split('\0') if p]
+
+
 def _python_files() -> list[Path]:
     """Every .py file under the repo's package/script roots.
 
@@ -203,6 +229,15 @@ def test_sweep_is_not_vacuous() -> None:
         'orchestrator/src/orchestrator/deterministic_runner.py',
         'orchestrator/tests/test_killpg_frozen_pgid_guard.py',
         'shared/src/shared/proc_group.py',
+        # One witness per tree the original hand-maintained root globs missed
+        # entirely. These are git-independent, so the specific hole cannot
+        # silently reopen even on a machine where
+        # test_sweep_covers_every_tracked_python_file skips. The top-level
+        # tests/scripts tree in particular holds the repo's highest density of
+        # live process-group killing outside the two sites task 3884 closed.
+        'tests/scripts/test_drain_process_leak_isolation.py',
+        'fused-memory/scripts/audit_duplicate_memories.py',
+        'skills/factory-init/scripts/find_escalation_port.py',
     ):
         assert required in relative, (
             f'{required} missing from the sweep -- the root globs or the skip '
@@ -214,6 +249,58 @@ def test_sweep_is_not_vacuous() -> None:
         f'{_MIN_SCANNED_FILES} -- the guard is vacuous. Most likely the skip '
         f'filter is being applied to the absolute path, which contains '
         f'".worktrees" for every task worktree.'
+    )
+
+
+def test_sweep_covers_every_tracked_python_file() -> None:
+    """Every .py file git tracks must be inside the sweep.
+
+    This is the *completeness* assertion, and it is a different instrument from
+    ``test_sweep_is_not_vacuous`` above. A raw-count floor is structurally
+    incapable of detecting a PARTIAL hole: a sweep can miss an entire tree and
+    still sail past the floor by three orders of magnitude. Only a set
+    difference against an independently-derived ground truth catches that, and
+    ``git ls-files`` is the right ground truth -- it is exactly "the content
+    that can land on main".
+    """
+    tracked = {p for p in _git_tracked_python() if p.is_file()}
+    if not tracked:
+        pytest.skip('git unavailable -- completeness cannot be established')
+
+    missing = sorted(
+        str(p.relative_to(REPO_ROOT)) for p in tracked - set(_python_files())
+    )
+    if missing:
+        shown = '\n  '.join(missing[:20])
+        more = f'\n  ... and {len(missing) - 20} more' if len(missing) > 20 else ''
+        raise AssertionError(
+            f'{len(missing)} git-tracked .py file(s) are OUTSIDE this guard\'s '
+            f'sweep, i.e. UNGUARDED: someone can re-introduce '
+            f'`os.killpg(os.getpgid(p.pid), SIGKILL)` in any of them and ship '
+            f'green, which defeats the ratchet entirely.\n\n'
+            f'Fix by WIDENING `_python_files()` so it covers them -- do NOT '
+            f'trim this assertion or add an exclusion. The sweep is meant to '
+            f'be complete by construction; a hand-maintained root list is the '
+            f'mechanism that produced this hole in the first place.\n\n'
+            f'Unguarded files:\n  {shown}{more}'
+        )
+
+
+def test_sweep_yields_no_duplicates() -> None:
+    """The sweep must visit each file exactly once.
+
+    The roots OVERLAP (``*/tests`` matches ``scripts/tests``, which
+    ``REPO_ROOT/'scripts'`` also rglobs into; symmetrically ``*/scripts`` would
+    match ``tests/scripts`` under a ``REPO_ROOT/'tests'`` root), so an
+    append-without-dedupe loop double-counts whole trees. That inflates the
+    number the vacuity floor is compared against, re-reads and re-parses every
+    affected file, and reports any real offender twice in the failure message.
+    """
+    scanned = _python_files()
+    assert len(scanned) == len(set(scanned)), (
+        f'sweep visited {len(scanned)} paths but only '
+        f'{len(set(scanned))} are distinct -- the file sources overlap and are '
+        f'not deduped. Collect them into a set before returning.'
     )
 
 
