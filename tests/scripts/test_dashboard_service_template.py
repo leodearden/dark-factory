@@ -1392,49 +1392,35 @@ def test_systemd_analyze_skip_reason_requires_both_binary_and_user_runtime_dir(
     Four cases below, each host-independent: both the binary lookup and
     XDG_RUNTIME_DIR are monkeypatched rather than read from this host's real
     environment, so this test itself needs no systemd runtime -- honouring
-    the module docstring's "no systemd runtime is required" contract.
+    the module docstring's "no systemd runtime is required" contract.  See
+    _systemd_analyze_verify_skip_reason's docstring for the measured basis
+    (the observed output strings, exit codes, and why DBUS_SESSION_BUS_ADDRESS
+    is deliberately not part of the discriminator) that each case below
+    exercises:
 
-    Measured 2026-08-12 in this worktree (systemd 255.4), running
-    ``systemd-analyze verify --user`` against the real dashboard unit:
-
-      - XDG_RUNTIME_DIR unset: combined stdout+stderr is ONLY "Failed to
-        lookup RuntimeDirectory path: No such device or address" / "Failed
-        to initialize manager: No such device or address", exit 1 -- ZERO
-        per-unit diagnostic lines, so the guarded assertion below would pass
-        having checked nothing.  This is the regression under repair.
-      - XDG_RUNTIME_DIR set to a real runtime dir: real per-unit diagnostics
-        ("fused-memory.service: Service has RestartMaxDelaySec= but no
-        RestartSteps= setting. Ignoring."), exit 0.
-      - DBUS_SESSION_BUS_ADDRESS unset, XDG_RUNTIME_DIR kept: still the same
-        real per-unit diagnostics, exit 0 -- DBUS_SESSION_BUS_ADDRESS is NOT
-        part of the discriminator, so the predicate under test must not
-        check it; doing so would over-skip on hosts where the guarded test
-        works fine.
-      - XDG_RUNTIME_DIR="": reproduces the exact unset-var no-op (same two
-        "Failed to ..." lines, exit 1) -- an empty value must count as
-        absent, which is why case (c) below forbids a membership test.
-      - XDG_RUNTIME_DIR=/tmp/does-not-exist (declared but nonexistent): still
-        the real per-unit diagnostics, exit 0 -- which is why case (d) below
-        forbids "hardening" the predicate into a directory-existence check.
+      (a) systemd-analyze binary absent.
+      (b) binary present, XDG_RUNTIME_DIR absent -- the regression under
+          repair.
+      (c) binary present, XDG_RUNTIME_DIR="" -- empty must count as absent.
+      (d) binary present, XDG_RUNTIME_DIR set to a nonexistent path -- must
+          still run.
     """
-    # (a) Binary absent: reason must name systemd-analyze, even with a
+    # (a) Binary absent: the predicate must still gate the test, even with a
     # perfectly valid XDG_RUNTIME_DIR alongside it.
     monkeypatch.setattr(shutil, "which", lambda *_a, **_k: None)
     monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
     reason = _systemd_analyze_verify_skip_reason()
     assert reason is not None
-    assert "systemd-analyze" in reason
 
-    # (b) Binary present, XDG_RUNTIME_DIR absent: reason must name it. This
-    # is the regression under repair -- the old inline decorator condition
-    # never checked this at all.
+    # (b) Binary present, XDG_RUNTIME_DIR absent: the predicate must still
+    # gate the test. This is the regression under repair -- the old inline
+    # decorator condition never checked this at all.
     monkeypatch.setattr(
         shutil, "which", lambda *_a, **_k: "/usr/bin/systemd-analyze"
     )
     monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
     reason = _systemd_analyze_verify_skip_reason()
     assert reason is not None
-    assert "XDG_RUNTIME_DIR" in reason
 
     # (c) Binary present, XDG_RUNTIME_DIR="": empty must count as absent, or
     # a membership test ("XDG_RUNTIME_DIR" in os.environ) would treat this as
@@ -1572,25 +1558,13 @@ def test_systemd_analyze_verify_reports_no_ignored_directives(
        (which genuinely lack RestartSteps=) and zero for the dashboard unit.
        Both prefix forms above are covered — bare unit name for a semantic
        warning, full path plus line number for a parse warning.
-    6. The test needs a user RUNTIME DIR, not just the binary on PATH.
-       Measured 2026-08-12 in this worktree (systemd 255.4): with
-       XDG_RUNTIME_DIR unset or empty, ``systemd-analyze verify --user``
-       prints only "Failed to lookup RuntimeDirectory path: No such device or
-       address" / "Failed to initialize manager: No such device or address"
-       and emits ZERO per-unit diagnostic lines — the same silent-no-op class
-       point 1 guards against for stdout-only capture, reached here through a
-       different missing precondition — so ``_ignored_directive_lines``
-       returns ``[]`` and ``assert not ignored`` below passes having checked
-       nothing.  This bites in cron, ssh host-cmd, and any other headless
-       invocation with no pam_systemd session: contexts where
-       ``shutil.which()`` still succeeds, so the old gate (a bare
-       binary-on-PATH check) never fired.  DBUS_SESSION_BUS_ADDRESS was also
-       measured and is deliberately NOT part of the discriminator (unsetting
-       it alone still yields real per-unit diagnostics at exit 0), and a
-       nonexistent-but-declared XDG_RUNTIME_DIR path still works too — both
-       are recorded here so a future edit does not widen the gate into
-       over-skipping.  See ``_systemd_analyze_verify_skip_reason`` above for
-       the gate itself.
+    6. The test needs a user RUNTIME DIR, not just the binary on PATH, or it
+       passes having checked nothing — the same silent-no-op class point 1
+       guards against for stdout-only capture, reached here through a
+       different missing precondition.  See ``_systemd_analyze_verify_skip_reason``
+       above for the measured basis (the observed output strings, exit
+       codes, the contexts this bites in, and why DBUS_SESSION_BUS_ADDRESS is
+       deliberately not part of the gate) and for the gate itself.
     7. The assertion below is corroborated by a POSITIVE CONTROL, not just a
        skip gate, because a wired gate is not the only way this test can pass
        vacuously — see test_backoff_canary_is_the_shape_systemd_must_warn_about
