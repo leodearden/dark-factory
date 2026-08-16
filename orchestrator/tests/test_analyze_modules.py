@@ -129,17 +129,31 @@ def test_aggregate_keeps_sibling_modules_under_one_parent_distinct(event_store: 
 
 
 def test_aggregate_counts_a_repeated_module_once_per_event(event_store: EventStore):
-    """One event is one dispatch for a module however many times it names it."""
+    """One event is one dispatch for a module however many times it names it.
+
+    The HOLD path has to agree, and only does because ``modules_of``
+    de-duplicates for both consumers: otherwise the second ``shared/src``
+    reads as a double-acquire against the span the first just opened, and this
+    clean 60s pair reports two samples (a phantom 0.0s truncated one plus the
+    real one) for an average of 30s.
+    """
     event_store.emit(
         EventType.lock_acquired,
         task_id='1',
         data={'modules': ['shared/src', 'shared/src']},
+    )
+    event_store.emit(
+        EventType.lock_released,
+        task_id='1',
+        data={'modules': ['shared/src']},
     )
 
     from datetime import UTC, datetime, timedelta
     stats = aggregate(event_store.db_path, datetime.now(UTC) - timedelta(days=1))
 
     assert stats['shared/src'].dispatches == 1
+    assert stats['shared/src'].hold_samples == 1
+    assert stats['shared/src'].truncated_holds == 0
 
 
 # ===========================================================================

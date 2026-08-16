@@ -111,8 +111,21 @@ def _parse_ts(raw: Any) -> float | None:
 
 
 def _clean_modules(modules: Iterable[str]) -> list[str]:
-    """Non-empty string module keys, in order — the live feed's input guard."""
-    return [m for m in modules if isinstance(m, str) and m]
+    """Non-empty string module keys, DE-DUPLICATED, in first-seen order.
+
+    The one element-level guard for both feeds.  De-duplication is not cosmetic:
+    ``_apply_acquire`` treats a module it has already opened as a DOUBLE-ACQUIRE
+    and force-closes the prior span, so a payload naming the same module twice
+    would yield a phantom zero-duration ``truncated`` span — fabricating a
+    censoring signal on what is actually a clean pair.  ``files_to_modules``
+    de-duplicates upstream today, so this is defence against a payload
+    reconstructed from JSON rather than a live defect.
+
+    Filtering precedes hashing deliberately: ``modules`` comes off a JSON
+    payload and may carry unhashable junk (a nested list), which would make
+    ``dict.fromkeys`` raise instead of dropping it.
+    """
+    return list(dict.fromkeys(m for m in modules if isinstance(m, str) and m))
 
 
 def modules_of(row: dict) -> list[str]:
@@ -131,6 +144,11 @@ def modules_of(row: dict) -> list[str]:
     unambiguous about which single module it names, so dropping it would throw
     away a real hold), while an unusable shape yields ``[]`` rather than a
     phantom key.
+
+    The element-level filtering and de-duplication are delegated to
+    :func:`_clean_modules` rather than re-inlined, so the durable seed, the live
+    feed and the CLI cannot disagree about what a module list contains — the
+    same INV-5 reason this function is public at all.
     """
     data = row.get('data') or {}
     if not isinstance(data, dict):
@@ -140,7 +158,7 @@ def modules_of(row: dict) -> list[str]:
         modules = [modules]
     if not isinstance(modules, list):
         return []
-    return [m for m in modules if isinstance(m, str) and m]
+    return _clean_modules(modules)
 
 
 #: One open hold per (task_id, module) -> its start, in POSIX seconds.  Both the

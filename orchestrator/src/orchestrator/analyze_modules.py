@@ -209,21 +209,20 @@ def aggregate(db_path: Path, since: datetime) -> dict[str, ModuleStats]:
     # store, ~26k rows on the 136MB production runs.db.
     rows = list(_iter_events(db_path, since))
 
+    # The module keys are used VERBATIM: the payload already carries them
+    # depth-coarsened at the emitting project's own `lock_depth`, which is the
+    # exact key `ModuleLockTable._limit_for` and `module_overrides` look up
+    # (scheduler.py:1505-1517).  Re-applying `normalize_lock` here would need
+    # that project's `lock_depth`, and the CLI is handed a db path with no
+    # config to read it from.  `modules_of` already drops junk entries and
+    # de-duplicates within one event, for this loop and the span helper alike.
     for row in rows:
         event_type = row['event_type']
-        # The module keys are used VERBATIM: the payload already carries them
-        # depth-coarsened at the emitting project's own `lock_depth`, which is
-        # the exact key `ModuleLockTable._limit_for` and `module_overrides`
-        # look up (scheduler.py:1505-1517).  Re-applying `normalize_lock` here
-        # would need that project's `lock_depth`, and the CLI is handed a db
-        # path with no config to read it from.  `dict.fromkeys` de-duplicates
-        # within one event while preserving order.
-        keys = dict.fromkeys(hold_history.modules_of(row))
         if event_type == 'lock_acquired':
-            for k in keys:
+            for k in hold_history.modules_of(row):
                 stats[k].dispatches += 1
         elif event_type == 'task_skipped':
-            for k in keys:
+            for k in hold_history.modules_of(row):
                 stats[k].skipped_waiting += 1
 
     # Hold accounting is NOT done here (PRD INV-5): one shared era-boundary

@@ -1326,6 +1326,64 @@ def test_modules_of_drops_non_string_and_empty_entries_inside_the_list():
     assert modules_of(row) == ['ok']
 
 
+def test_modules_of_survives_an_unhashable_entry():
+    """De-duplication must not turn junk into a crash.
+
+    ``modules`` is reconstructed from JSON, so it can carry a nested list —
+    unhashable, and therefore fatal to ``dict.fromkeys`` if the de-dup ran
+    before the type filter.  It is dropped like any other non-string.
+    """
+    row = dict(F.row(1, 0, 'lock_acquired', task_id='T1'),
+               data={'modules': ['ok/src', ['nested'], {'k': 'v'}]})
+
+    assert modules_of(row) == ['ok/src']
+
+
+def test_modules_of_de_duplicates_a_repeated_module():
+    """One event names a module once, however many times its payload repeats it.
+
+    Not cosmetic: ``_apply_acquire`` reads the second occurrence as a
+    DOUBLE-ACQUIRE against the span the first just opened (see the next test).
+    """
+    row = F.acquire(1, 0, 'T1', ['shared/src', 'orchestrator/src', 'shared/src'])
+
+    assert modules_of(row) == ['shared/src', 'orchestrator/src'], \
+        'de-duplicated, and in FIRST-seen order'
+
+
+def test_a_repeated_module_in_one_acquire_yields_no_phantom_span():
+    """The end-to-end consequence of the de-dup, pinned on the spans themselves.
+
+    Without it the second ``shared/src`` force-closes the span the first opened
+    at the very same timestamp, so a clean 60s pair reported TWO samples — a
+    0.0s ``truncated`` one and the real one — halving the mean and inventing a
+    censoring signal out of nothing.
+    """
+    rows = [
+        F.acquire(1, 0, 'T1', ['shared/src', 'shared/src']),
+        F.release(2, 60, 'T1', ['shared/src']),
+    ]
+
+    spans = list(iter_hold_spans(rows))
+
+    assert len(spans) == 1
+    assert spans[0].duration == pytest.approx(60.0)
+    assert spans[0].truncated is False
+
+
+def test_the_live_feed_de_duplicates_a_repeated_module_too():
+    """``observe_acquired`` shares ``_clean_modules`` with the durable seed, so
+    the live feed cannot drift into recording the phantom span the seed no
+    longer produces."""
+    history = HoldHistory(min_samples=1)
+
+    history.observe_acquired('T1', ['shared/src', 'shared/src'], at=_at(0))
+    history.observe_released('T1', ['shared/src'], at=_at(60))
+
+    assert history.sample_count(['shared/src']) == 1
+    assert history.predicted_hold(['shared/src']) == pytest.approx(60.0)
+
+
 # ===========================================================================
 # truncated_fraction — how much of the evidence is censored
 # ===========================================================================
