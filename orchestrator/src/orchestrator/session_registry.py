@@ -475,6 +475,9 @@ def sanitize_slug(raw: str) -> str:
     untouched.
     """
     cleaned = _SLUG_SANITIZE_RE.sub('-', raw)
+    # Deleting this branch is now caught: test_sanitize_slug_collapses_all_dots_slug
+    # (orchestrator/tests/test_session_registry.py) pins it, mutation-verified under
+    # task 4112 -- before that, removing it shipped green.
     if _ALL_DOTS_RE.match(cleaned):
         cleaned = cleaned.replace('.', '-')
     return cleaned

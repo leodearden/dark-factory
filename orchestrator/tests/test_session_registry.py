@@ -494,6 +494,32 @@ def test_sanitize_slug_matches_build_session_slug_regression() -> None:
     assert slug == sr.sanitize_slug('un block-df/prod-20#85-4242')
 
 
+@pytest.mark.parametrize(
+    ('raw', 'expected'),
+    [('.', '-'), ('..', '--'), ('...', '---')],
+)
+def test_sanitize_slug_collapses_all_dots_slug(raw: str, expected: str) -> None:
+    # Task 4112: the all-dots branch is the SOLE guard against a path escape
+    # out of sessions_dir. '.' is inside _SLUG_SANITIZE_RE's allowed class, so
+    # the character substitution alone passes '..' straight through, and
+    # record_path_for_slug is a bare join that sanitizes nothing of its own --
+    # so an unguarded '..' would be handed to the filesystem as a traversal
+    # segment. Every '.' maps to '-', so length is preserved.
+    slug = sr.sanitize_slug(raw)
+    assert slug == expected
+    assert re.fullmatch(r'[A-Za-z0-9._-]+', slug)
+
+
+@pytest.mark.parametrize('raw', ['..foo', 'foo..', 'a.b', '.hidden-x'])
+def test_sanitize_slug_leaves_partially_dotted_slug_untouched(raw: str) -> None:
+    # The guard's LOWER edge: a value that merely CONTAINS dots alongside other
+    # characters is a literal, non-traversing directory name (sanitize_slug's
+    # docstring says so) and must pass through byte-identical. Pinning only the
+    # collapse direction would leave a future "hardening" free to over-broaden
+    # into stripping every dot, silently mangling ordinary slugs like 'a.b'.
+    assert sr.sanitize_slug(raw) == raw
+
+
 def test_fleet_root_defaults_to_dot_claude_fleet(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv('CLAUDE_FLEET_ROOT', raising=False)
     monkeypatch.setenv('HOME', '/home/fakeuser')
@@ -520,6 +546,33 @@ def test_fleet_root_explicit_root_overrides_env(
 def test_record_path_for_slug(tmp_path: Path) -> None:
     path = sr.record_path_for_slug('unblock-df-2085-4242', root=tmp_path)
     assert path == tmp_path / 'sessions' / 'unblock-df-2085-4242' / 'record.json'
+
+
+def test_record_path_for_slug_all_dots_slug_stays_under_sessions_dir(tmp_path: Path) -> None:
+    # Task 4112: the containment property sanitize_slug's all-dots branch buys.
+    # resolve() + is_relative_to, NOT a string prefix check -- str(root/'sessions'
+    # /'..'/'record.json') startswith str(root/'sessions') is TRUE, so a prefix
+    # check would pass for the very path that escapes. resolve() is non-strict
+    # (these paths do not exist) and collapses '..' with the exact filesystem
+    # semantics under defense.
+    sessions = sr.sessions_dir(root=tmp_path).resolve()
+    # '..' is the ONLY genuine escape vector in this loop; '.' and '...' are
+    # non-traversing CONTROLS, not extra attack coverage. Unsanitized,
+    # 'sessions/./record.json' still resolves under sessions_dir and '...' is a
+    # literal POSIX dirname resolve() leaves in place -- so only the '..'
+    # iteration discriminates against a guard-deleted build.
+    for raw in ('.', '..', '...'):
+        slug = sr.sanitize_slug(raw)
+        path = sr.record_path_for_slug(slug, root=tmp_path)
+        assert path.resolve().is_relative_to(sessions)
+
+    # NON-VACUITY COUNTERFACTUAL: the UNsanitized token genuinely escapes, i.e.
+    # record_path_for_slug performs NO sanitization of its own (it is a bare
+    # join) -- which is exactly why sanitize_slug has to be the chokepoint.
+    # Without this, the assertions above could pass for the wrong reason if
+    # record_path_for_slug's shape ever changed, and nobody would notice the
+    # test had stopped proving anything.
+    assert not sr.record_path_for_slug('..', root=tmp_path).resolve().is_relative_to(sessions)
 
 
 def test_transcript_path_for_cwd_encodes_slash() -> None:
