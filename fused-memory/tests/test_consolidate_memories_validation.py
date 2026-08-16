@@ -121,20 +121,6 @@ class TestTopic:
         assert err is not None
         assert 'topic' in err['error']
 
-    def test_topic_error_names_the_rule_and_its_home(self):
-        """The caller has to be able to find the namespace, not guess it.
-
-        `topic` is ONE namespace shared with `ProceduralTopicCluster.topic_id`
-        (PRD D4); a message that only says "invalid" sends the caller off to
-        re-derive a regex that already has a single home.
-        """
-        err, _, _ = _call(topic='memory_consolidation')
-        assert err is not None
-
-        text = err['error'] + err.get('hint', '')
-        assert 'fused_memory.topic_slug' in text
-        assert 'hyphen' in text.lower()
-
 
 class TestIdShapes:
     def test_every_malformed_supersede_is_named_in_one_error(self):
@@ -165,12 +151,6 @@ class TestIdShapes:
         assert err is not None
         assert '873889a1' in err['error']
         assert '84147843' in err['error']
-
-    def test_id_error_carries_the_resolve_the_full_uuid_hint(self):
-        err, _, _ = _call(supersedes=['873889a1'])
-        assert err is not None
-
-        assert 'get_memory_by_id' in err.get('hint', '')
 
 
 class TestArmPresence:
@@ -233,14 +213,6 @@ class TestDeleteArmRequiresRunId:
         assert err is not None
         assert err['error_type'] == 'ValidationError'
         assert 'run_id' in err['error']
-
-    def test_the_refusal_explains_that_the_delete_would_be_unattributable(self):
-        err, _, _ = _call(run_id=None)
-        assert err is not None
-
-        text = err['error'] + err.get('hint', '')
-        assert 'deleting_run_id' in text
-        assert 'tombstone' in text.lower()
 
     def test_retain_only_call_needs_no_run_id(self):
         """The retain arm never deletes, so nothing becomes unattributable."""

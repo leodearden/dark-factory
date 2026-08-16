@@ -33,6 +33,14 @@ retained peers tagged, then per supersede read → re-home children → corrobor
   never `parent_id` — so they keep their Qdrant point ids and every citation, parent
   pointer and supersedes edge already aimed at them stays valid. Retained ids never
   appear in the canonical's `metadata.supersedes`: they were not replaced.
+  A peer is first PROVEN not to be a canonical already, and one that is gets refused
+  with `RetainedPeerIsCanonical` rather than tagged. Not SETTING `canonical` is not the
+  same as ensuring it is unset: the patch is a server-side payload merge, so a peer
+  already holding the key would keep it and become a second claimant for
+  (project, topic) — invisibly, since `_apply_canonical_uniqueness` runs only on the
+  `add_memory` path. Refused rather than demoted, because a prior canonical in the
+  retain list is usually what the caller should have put in `supersedes`; an unreadable
+  peer fails closed the same way (`RetainCheckFailed`).
 - **`survivors` is the deliverable.** Computed only from a post-delete `get_memory_by_id`
   per id, so an id whose delete reported success but which still resolves is reported as
   a survivor, and an id whose delete raised but which is genuinely gone is not. Partial

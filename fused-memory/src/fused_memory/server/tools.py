@@ -4755,9 +4755,70 @@ def create_mcp_server(
         # `_apply_memory_metadata_validation`, so this slug is not
         # re-validated at the patch seam. It is validated at op entry
         # instead, which bounds the hole for this caller without closing it.
+        #
+        # THAT SAME SEAM IS WHY NOT SETTING `canonical` IS NOT ENOUGH. The
+        # patch is a server-side Qdrant payload MERGE, so a peer that ALREADY
+        # carries `canonical: True` keeps it and is now paired with the new
+        # `topic` — a second claimant for (project, T), minted without a
+        # rejection, a census line, or a `retain_failures` entry, because
+        # `_apply_canonical_uniqueness` is reached only from the `add_memory`
+        # path. Not setting a key and ensuring it is unset are different
+        # claims, and only the second one holds the invariant.
+        #
+        # This is REACHABLE THROUGH THE DEFAULT ARM, not through misuse: the
+        # ratchet this op exists to end is precisely "a cluster ends up
+        # containing the consolidator's own prior canonicals", so a cluster
+        # under consolidation routinely contains one, and retaining it is the
+        # natural call when its content is still correct and cited. The damage
+        # lands on the NEXT pass, which is the worst time to find it: the
+        # follow-up consolidation of T fails its own canonical write.
         retained: list[str] = []
         retain_failures: list[dict[str, Any]] = []
         for retain_id in retain_ids:
+            # (5a-i) PROVE THE PEER IS NOT ALREADY A CANONICAL, and FAIL
+            # CLOSED — the same posture as the child listing, for the same
+            # reason: a check that did not ANSWER is not a check that said
+            # "not canonical". Refusing costs one peer's tag, which a caller
+            # can retry; tagging on an unproven check mints a duplicate
+            # canonical that nothing downstream will catch.
+            #
+            # REFUSE rather than demote. Patching `canonical: False` would
+            # also hold the invariant, but it would silently rewrite a claim
+            # this op was not asked to touch — and a prior canonical in the
+            # retain list is usually an AUTHORING MISTAKE: that record is what
+            # the caller should have put in `supersedes`. Surfacing it as a
+            # named failure is the recoverable outcome; quietly demoting it
+            # is not.
+            try:
+                peer_record = await memory_service.get_memory_by_id(
+                    project_id=project_id, memory_id=retain_id
+                )
+            except Exception as exc:
+                retain_failures.append({
+                    'id': retain_id,
+                    'error': (
+                        f'refused to tag {retain_id}: it could not be read '
+                        f'({exc}), so it cannot be shown to be a non-canonical '
+                        'peer'
+                    ),
+                    'error_type': 'RetainCheckFailed',
+                })
+                continue
+            # A peer that does not resolve is NOT refused here: it falls
+            # through to `update_memory`, which reports MemoryNotFound in the
+            # structured shape below. One vocabulary for one condition.
+            if (peer_record or {}).get('metadata', {}).get('canonical') is True:
+                retain_failures.append({
+                    'id': retain_id,
+                    'error': (
+                        f'refused to tag {retain_id}: it is already the '
+                        f'canonical for its topic, and tagging it with '
+                        f'{topic!r} would make a second canonical for that '
+                        'topic — supersede it instead of retaining it'
+                    ),
+                    'error_type': 'RetainedPeerIsCanonical',
+                })
+                continue
             # A REJECTION HERE IS A RETURN VALUE, NOT A RAISE: `update_memory`
             # reports MemoryNotFound and its authorization refusals by
             # returning {'error_type': ...}. Code that only guarded against

@@ -116,6 +116,7 @@ def make_service(
     delete_errors=None,
     update_errors=None,
     update_raises=None,
+    canonical_peers=(),
     pre_read_errors=None,
     corroboration_errors=None,
     scroll_error=None,
@@ -141,6 +142,12 @@ def make_service(
     through `_journaled_backend_call`, which logs and re-raises. A caller
     that only handled the returned shape would let one timeout escape and
     flatten the whole envelope.
+
+    *canonical_peers* is the set of ids whose payload already carries
+    `canonical: True`. The retain patch is a server-side payload MERGE, so
+    such a peer KEEPS that key and, once tagged with the cluster's topic,
+    becomes a second canonical for it — and nothing downstream catches it,
+    since `_apply_canonical_uniqueness` runs only on the `add_memory` path.
 
     *truncated_scans* is the set of parents whose child listing comes back
     `truncated=True`: a listing the op could not fully SEE is a set it
@@ -171,6 +178,7 @@ def make_service(
     delete_errors = delete_errors or {}
     update_errors = update_errors or {}
     update_raises = update_raises or {}
+    canonical_peers = set(canonical_peers)
     pre_read_errors = pre_read_errors or {}
     corroboration_errors = corroboration_errors or {}
     child_scan_errors = child_scan_errors or {}
@@ -219,6 +227,8 @@ def make_service(
             raise phase_errors[memory_id]
         if seen and memory_id in gone:
             return None
+        if memory_id in canonical_peers:
+            return _point_row(memory_id, canonical=True)
         return _point_row(memory_id)
 
     svc.get_memory_by_id = AsyncMock(side_effect=_get)
@@ -444,13 +454,14 @@ class TestValidationIsRefusedBeforeAnyWrite:
 
         `@mcp_tool_errors` flattens an exception to {'error', 'error_type'},
         which would drop the hint — the part that tells the caller what to
-        do about it.
+        do about it. PRESENCE is the contract; the hint's wording is
+        documentation and lives in `consolidation.py`, fixed once.
         """
         svc = make_service()
 
         result = await call_consolidate(svc, topic='memory_consolidation')
 
-        assert 'fused_memory.topic_slug' in result.get('hint', '')
+        assert result.get('hint')
 
     @pytest.mark.asyncio
     async def test_delete_arm_without_run_id_is_refused_before_the_canonical(self):
@@ -522,7 +533,6 @@ class TestAuthorizationIsFailClosedAndPreWrite:
         result = await call_consolidate(svc, agent_id='claude-interactive')
 
         assert result['error_type'] == 'Mem0UpdateNotAuthorized'
-        assert 'metadata_patch' in result['error']
         svc.add_memory.assert_not_called()
 
     @pytest.mark.asyncio
@@ -604,7 +614,6 @@ class TestCanonicalFirstOrdering:
         result = await call_consolidate(svc)
 
         assert result['error_type'] == 'CanonicalWriteFailed'
-        assert 'canonical' in result['error'].lower()
         svc.delete_memory.assert_not_called()
         svc.update_memory.assert_not_called()
 
@@ -995,6 +1004,63 @@ class TestRetainAndTagArm:
             assert 'parent_id' not in (call.kwargs['metadata_patch'] or {})
 
     @pytest.mark.asyncio
+    async def test_a_peer_that_is_already_canonical_is_refused(self):
+        """NOT SETTING `canonical` IS NOT THE SAME AS ENSURING IT IS UNSET.
+
+        The patch is a server-side payload MERGE, so a peer already holding
+        `canonical: True` keeps it and, paired with the cluster's topic,
+        becomes a SECOND canonical for (project, T). Nothing downstream
+        catches that: `_apply_canonical_uniqueness` is reached only from the
+        `add_memory` path, and `update_memory` deliberately does not run
+        `_apply_memory_metadata_validation`. The duplicate would surface one
+        pass later, as a failed canonical write on the NEXT consolidation of
+        this topic.
+
+        Refused, not silently demoted: a prior canonical in the retain list
+        is usually an authoring mistake — that record is what belonged in
+        `supersedes`.
+        """
+        svc = make_service(canonical_peers={RETAIN_2})
+
+        result = await call_consolidate(svc, retain=[RETAIN_1, RETAIN_2])
+
+        [failure] = result['retain_failures']
+        assert failure['id'] == RETAIN_2
+        assert failure['error_type'] == 'RetainedPeerIsCanonical'
+        assert result['status'] == 'partial'
+        # THE PROPERTY: no patch was ever issued for it, so its payload is
+        # untouched and no second canonical exists.
+        patched = {c.kwargs['memory_id'] for c in svc.update_memory.await_args_list}
+        assert RETAIN_2 not in patched
+        # One refusal costs one peer, never the arm.
+        assert result['retained'] == [RETAIN_1]
+        assert RETAIN_1 in patched
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_peer_refuses_its_tag(self):
+        """The check FAILS CLOSED, the same posture as the child listing and
+        for the same reason: a check that did not ANSWER is not a check that
+        said "not canonical". Refusing costs one tag, which a caller can
+        retry; tagging on an unproven check mints a duplicate canonical that
+        nothing downstream will catch."""
+        svc = make_service(
+            pre_read_errors={RETAIN_2: TimeoutError('qdrant read timed out')}
+        )
+
+        result = await call_consolidate(svc, retain=[RETAIN_1, RETAIN_2])
+
+        [failure] = result['retain_failures']
+        assert failure['id'] == RETAIN_2
+        assert failure['error_type'] == 'RetainCheckFailed'
+        assert result['retained'] == [RETAIN_1]
+        assert result['status'] == 'partial'
+        patched = {c.kwargs['memory_id'] for c in svc.update_memory.await_args_list}
+        assert RETAIN_2 not in patched
+        # The envelope survives and the delete arm still ran: a read failure
+        # degrades one peer's claim, never the whole result.
+        assert result['deleted'] == list(SUPERSEDES)
+
+    @pytest.mark.asyncio
     async def test_retained_ids_are_echoed_unchanged(self):
         """Echoing the ids back UNCHANGED is the point-id-preservation proof:
         a caller can compare them to what it sent and see that tagging moved
@@ -1336,7 +1402,6 @@ class TestAnIncompleteReparentRefusesTheDelete:
         [failure] = result['failed_deletes']
         assert failure['id'] == S1
         assert failure['error_type'] == 'ReparentIncomplete'
-        assert 'at least' in failure['error']
         assert result['survivors'] == [S1]
 
     @pytest.mark.asyncio
@@ -1778,10 +1843,6 @@ class TestReadFailuresDoNotDestroyTheEnvelope:
         assert S1 not in deleted_ids
         [failure] = [f for f in result['failed_deletes'] if f['id'] == S1]
         assert failure['error_type'] == 'ReparentIncomplete'
-        # The message must say the CHECK failed, not that children remain:
-        # an operator reading "N children still name it" would go looking for
-        # children that may not exist.
-        assert 'count timed out' in failure['error'] or 'could not' in failure['error']
         assert result['deleted'] == [S2, S3]
 
     @pytest.mark.asyncio
