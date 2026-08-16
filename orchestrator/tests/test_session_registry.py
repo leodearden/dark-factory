@@ -5169,9 +5169,10 @@ def _non_venv_interpreter() -> str | None:
 #: expressed relative to this rather than hardcoded.
 _SR_PKG_ROOT = _SR_REPO_ROOT / 'orchestrator' / 'src'
 
-#: The one repo-relative ``PYTHONPATH`` entry the hook shells export.  A row
-#: naming it gets it rewritten to the sandbox root during a mutation run, so
-#: the row measures the MUTATED copy rather than the real tree.
+#: The one repo-relative ``PYTHONPATH`` entry the hook shells export.  Any row
+#: entry that RESOLVES to the same directory (``_row_env`` compares resolved
+#: paths, not strings) is rewritten to the sandbox root during a mutation run,
+#: so the row measures the MUTATED copy rather than the real tree.
 _SR_PKG_ROOT_ENTRY = 'orchestrator/src'
 
 
@@ -5211,6 +5212,10 @@ class _BareShellEntrypoint:
             violating one, and the mutation test skips loudly rather than
             passing vacuously.  Per-row rather than global because the rows
             forbid different sets (tier-1 forbids strictly more than tier-2).
+            It is a general health check for the row, NOT a stand-in for the
+            payload: ``test_forbidden_import_is_rejected`` additionally requires
+            the payload itself to be unreachable under this env, because probe
+            and payload can name different modules.
         callers: the shell scripts that make this invocation, so a failure
             names the production path that breaks.
     """
@@ -5289,12 +5294,47 @@ _MUST_BE_REJECTED: tuple[tuple[str, str], ...] = (
     ('session_registry.py', 'from shared import safe_io'),
     ('session_registry.py', 'from orchestrator import config'),
     ('session_registry.py', 'from orchestrator import stop_instruction'),
+    # The dependency-footprint half of the contract: a plain third-party import
+    # at module scope. Without it the matrix only ever exercises workspace
+    # packages, and nothing observes the rows rejecting `pip install`-ware.
+    #
+    # `pydantic` rather than `yaml` DELIBERATELY, and it is measured, not
+    # assumed: on this host `import yaml` resolves out of the distro's
+    # /usr/lib/python3/dist-packages and SUCCEEDS under every row's env (it is
+    # not user-site, so PYTHONNOUSERSITE does not remove it), which would make
+    # the payload non-discriminating and skip the row instead of pinning it.
+    # `pydantic` is absent from the bare interpreter — that absence is the same
+    # one that makes `from orchestrator import config` fail below.
+    ('session_registry.py', 'import pydantic'),
     # session_hooks.py's contract is the WEAKER tier-2 one: it does
     # `from orchestrator import session_registry` at module scope (line 50) and
     # its callers export PYTHONPATH for exactly that, so `orchestrator.*` is
-    # ALLOWED. `shared` is not — nothing puts shared/src on that path.
+    # ALLOWED. `shared` and third-party are not — nothing puts shared/src or a
+    # site-packages on that path.
     ('session_hooks.py', 'from shared import safe_io'),
+    ('session_hooks.py', 'import pydantic'),
 )
+
+
+def _registry_row(filename: str, shape: _EntrypointShape) -> _BareShellEntrypoint:
+    """The unique registry row for ``filename`` invoked as ``shape``.
+
+    Anything needing "the tier-2 env" must read it off the ROW via ``_row_env``
+    rather than hand-rolling a dict, so there is exactly ONE definition of each
+    row's environment.  Two copies drift: a scrub added to ``_row_env`` later
+    (``PYTHONNOUSERSITE`` was one) would reach the row but not the helper that
+    claims to characterise it.
+    """
+    matches = [
+        row
+        for row in _BARE_SHELL_ENTRYPOINTS
+        if row.path.name == filename and row.shape is shape
+    ]
+    assert len(matches) == 1, (
+        f'expected exactly one _BARE_SHELL_ENTRYPOINTS row for {filename} invoked '
+        f'as {shape}, found {[row.name for row in matches]}'
+    )
+    return matches[0]
 
 
 def _row_env(row: _BareShellEntrypoint, *, pkg_root: Path) -> dict[str, str]:
@@ -5309,14 +5349,46 @@ def _row_env(row: _BareShellEntrypoint, *, pkg_root: Path) -> dict[str, str]:
         # Every row, always: a sandbox mirrors the package as SYMLINKS, so
         # bytecode written through one would land in the real source tree.
         'PYTHONDONTWRITEBYTECODE': '1',
+        # STRICTER than production, deliberately.  The shells do not set this,
+        # but ``~/.local/lib/pythonX.Y/site-packages`` is on ``sys.path`` by
+        # default (``site.ENABLE_USER_SITE`` is True on the system interpreter),
+        # so one developer's ``pip install --user`` of anything named ``shared``
+        # would make these rows accept a module that breaks on every other box —
+        # and would silently defeat the vacuity probes below, which measure
+        # importability under exactly this env.  Erring toward the stricter
+        # environment can only produce a loud false RED, never a false green.
+        'PYTHONNOUSERSITE': '1',
     }
     # An empty tuple leaves the key genuinely ABSENT — see the dataclass
     # docstring; PYTHONPATH='' is not the same environment.
-    if row.pythonpath:
-        env['PYTHONPATH'] = os.pathsep.join(
-            str(pkg_root if entry == _SR_PKG_ROOT_ENTRY else _SR_REPO_ROOT / entry)
-            for entry in row.pythonpath
+    if not row.pythonpath:
+        return env
+
+    real_pkg_root = _SR_PKG_ROOT.resolve()
+    is_mutation_run = pkg_root.resolve() != real_pkg_root
+    entries: list[str] = []
+    for entry in row.pythonpath:
+        resolved = (_SR_REPO_ROOT / entry).resolve()
+        if resolved == real_pkg_root:
+            # THE substitution that makes a mutation run measure the sandbox.
+            entries.append(str(pkg_root))
+            continue
+        # Resolve-and-compare rather than string-equality against
+        # ``_SR_PKG_ROOT_ENTRY``: a row spelled 'orchestrator/src/',
+        # './orchestrator/src', or carrying a second entry that also reaches the
+        # package, would otherwise miss the substitution and point a MUTATION run
+        # at the real, UNMUTATED tree.  That row would then always exit 0 and
+        # quietly stop pinning anything — masked, because
+        # ``test_forbidden_import_is_rejected`` only needs ANY row to reject.
+        assert not (is_mutation_run and resolved.is_relative_to(real_pkg_root)), (
+            f'{row.name}: PYTHONPATH entry {entry!r} resolves inside the real '
+            f'{real_pkg_root} but was not substituted for the mutation sandbox '
+            f'{pkg_root}, so this run would import the UNMUTATED module and the '
+            f'mutation test would measure nothing. Spell it exactly '
+            f'{_SR_PKG_ROOT_ENTRY!r} so it is substituted.'
         )
+        entries.append(str(resolved))
+    env['PYTHONPATH'] = os.pathsep.join(entries)
     return env
 
 
@@ -5356,25 +5428,85 @@ def _run_row(
     )
 
 
-def _probe_discriminates(row: _BareShellEntrypoint, *, tmp_path: Path) -> bool:
-    """True when ``row.probe`` FAILS under ``row``'s own documented env.
+class _BareShellProbes:
+    """Session-scoped memo for the subprocess measurements the rows need.
 
-    Guards against a vacuous pass: on a host where the probed package really is
-    importable by the bare interpreter, this row would accept a violating module
-    too, so it must skip rather than report a green it did not earn.
+    Two kinds, each a pure function of (row env, subject) and therefore
+    identical for every test that asks:
+
+    - ``rejects(row, statement)`` — does ``statement`` FAIL as a bare import
+      under ``row``'s own documented env?  A row can only be counted as
+      discriminating when this is True; if the interpreter reaches the package
+      anyway, the row would accept a violating module too and its green is
+      unearned.
+    - ``control_run(row, entrypoint)`` — does ``row`` run CLEAN against a
+      sandbox with NOTHING injected?
+
+    Memoised because the mutation matrix asks the same questions repeatedly:
+    unmemoised, every (matrix entry x covering row) pair spawns its own
+    interpreter, so the two session_registry rows are re-probed once per payload
+    with identical inputs.  That count grows multiplicatively as rows and
+    payloads are added — exactly what a registry design invites — for results
+    that cannot differ.
     """
-    interpreter = _non_venv_interpreter()
-    assert interpreter is not None, 'callers skip when no non-venv interpreter exists'
 
-    probe = subprocess.run(
-        [interpreter, '-c', row.probe],
-        env=_row_env(row, pkg_root=_SR_PKG_ROOT),
-        cwd=tmp_path,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    return probe.returncode != 0
+    def __init__(self, cwd: Path) -> None:
+        #: Neutral cwd for every subprocess — LOAD-BEARING, see ``_run_row``.
+        self._cwd = cwd
+        self._rejects: dict[tuple[str, str], bool] = {}
+        self._control_sandboxes: dict[str, Path] = {}
+        self._control_runs: dict[tuple[str, str], subprocess.CompletedProcess[str]] = {}
+
+    def rejects(self, row: _BareShellEntrypoint, statement: str) -> bool:
+        """True when ``statement`` FAILS as a bare import under ``row``'s env."""
+        key = (row.name, statement)
+        if key not in self._rejects:
+            interpreter = _non_venv_interpreter()
+            assert interpreter is not None, (
+                'callers skip when no non-venv interpreter exists'
+            )
+            probe = subprocess.run(
+                [interpreter, '-c', statement],
+                env=_row_env(row, pkg_root=_SR_PKG_ROOT),
+                cwd=self._cwd,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self._rejects[key] = probe.returncode != 0
+        return self._rejects[key]
+
+    def control_run(
+        self, row: _BareShellEntrypoint, entrypoint: str
+    ) -> subprocess.CompletedProcess[str]:
+        """Run ``row`` against a sandbox of ``entrypoint`` with NOTHING injected.
+
+        The control for every rejection.  It proves the symlink farm and the
+        source rewrite still produce a RUNNABLE module, so a non-zero exit on a
+        mutated copy is attributable to the payload.  Without it, a silently
+        degraded sandbox — a missing symlink, an anchor line that lands inside a
+        docstring, a syntax-breaking rewrite — makes every covering row exit
+        non-zero and every mutation test PASS while measuring nothing, which is
+        the same silent-pass mode this registry exists to close.
+        """
+        if entrypoint not in self._control_sandboxes:
+            # Empty payload: same code path, same symlink farm, same rewrite —
+            # only the injected line differs from a mutation run.
+            self._control_sandboxes[entrypoint] = _inject_import_sandbox(
+                self._cwd, entrypoint, ''
+            )
+        key = (row.name, entrypoint)
+        if key not in self._control_runs:
+            self._control_runs[key] = _run_row(
+                row, pkg_root=self._control_sandboxes[entrypoint], tmp_path=self._cwd
+            )
+        return self._control_runs[key]
+
+
+@pytest.fixture(scope='session')
+def bare_shell_probes(tmp_path_factory: pytest.TempPathFactory) -> _BareShellProbes:
+    """Session-scoped so each (row, statement) pair is measured exactly once."""
+    return _BareShellProbes(tmp_path_factory.mktemp('bare-shell-probes'))
 
 
 #: Intra-orchestrator modules documented stdlib-only for LAYERING reasons
@@ -5392,7 +5524,7 @@ def _probe_discriminates(row: _BareShellEntrypoint, *, tmp_path: Path) -> bool:
 _BARE_IMPORTABLE_SIBLINGS = ('stop_instruction', 'fm_retry', 'routing')
 
 
-def _first_bare_importable_sibling(*, tmp_path: Path) -> str | None:
+def _first_bare_importable_sibling(probes: _BareShellProbes) -> str | None:
     """Return the first sibling importable under the tier-2 env, or None.
 
     Probed at runtime rather than hardcoded: if the chosen module later grows a
@@ -5400,26 +5532,15 @@ def _first_bare_importable_sibling(*, tmp_path: Path) -> str | None:
     reference would turn its caller into a confusing false failure instead of a
     skip. Probing the list degrades to None only when ALL candidates stop
     qualifying.
-    """
-    interpreter = _non_venv_interpreter()
-    assert interpreter is not None, 'callers skip when no non-venv interpreter exists'
 
-    env = {
-        'PATH': '/usr/bin:/bin',
-        'HOME': os.environ.get('HOME', '/tmp'),
-        'PYTHONDONTWRITEBYTECODE': '1',
-        'PYTHONPATH': str(_SR_PKG_ROOT),
-    }
+    The env comes off the tier-2 ROW itself (see ``_registry_row``), never a
+    local copy — this probe exists to characterise what that row accepts, so
+    measuring a different environment than the row would silently weaken
+    ``test_tier1_is_strictly_stronger_than_tier2``'s premise.
+    """
+    tier2 = _registry_row('session_registry.py', _EntrypointShape.IMPORT)
     for candidate in _BARE_IMPORTABLE_SIBLINGS:
-        probe = subprocess.run(
-            [interpreter, '-c', f'from orchestrator import {candidate}'],
-            env=env,
-            cwd=tmp_path,  # neutral cwd — see the comment in _run_row
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        if probe.returncode == 0:
+        if not probes.rejects(tier2, f'from orchestrator import {candidate}'):
             return candidate
     return None
 
@@ -5481,12 +5602,16 @@ class TestStdlibOnlySelfContainment:
 
     The registry is MUTATION-TESTED (``_MUST_BE_REJECTED``): each forbidden
     import is injected into a sandbox and some covering row must be observed
-    REJECTING it.  A guard that has never been observed to fail is not evidence
-    of anything — task 3223's consolidation added ``from shared import safe_io``
-    and broke exactly this contract (escalation esc-3223-2) while the only
-    symptom in the suite was two downstream ``test_session_hooks.py`` failures.
-    Each row also carries its own vacuity ``probe`` and SKIPS loudly when it
-    cannot discriminate, rather than reporting a green it did not earn.
+    REJECTING it, with a ``ModuleNotFoundError`` naming the payload's own
+    dependency and against a control run of the SAME sandbox with nothing
+    injected — so a degraded sandbox cannot masquerade as a working guard.  A
+    guard that has never been observed to fail is not evidence of anything —
+    task 3223's consolidation added ``from shared import safe_io`` and broke
+    exactly this contract (escalation esc-3223-2) while the only symptom in the
+    suite was two downstream ``test_session_hooks.py`` failures.  A row counts
+    as able to discriminate only when BOTH its own vacuity ``probe`` AND the
+    payload under test are unreachable under its documented env; otherwise it
+    SKIPS loudly rather than reporting a green it did not earn.
 
     Adding a bare-shell entrypoint?  Register a ROW plus a matrix entry.  Do not
     write another ad-hoc test — a second one drifts from what the shells run.
@@ -5540,7 +5665,7 @@ class TestStdlibOnlySelfContainment:
             f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}'
         )
 
-    def test_tier1_is_strictly_stronger_than_tier2(self, tmp_path):
+    def test_tier1_is_strictly_stronger_than_tier2(self, tmp_path, bare_shell_probes):
         """The two session_registry rows encode DIFFERENT contracts, not one twice.
 
         They read like duplicates ("both just check that session_registry
@@ -5552,7 +5677,7 @@ class TestStdlibOnlySelfContainment:
         if _non_venv_interpreter() is None:
             pytest.skip('no non-venv interpreter available on this host')
 
-        sibling = _first_bare_importable_sibling(tmp_path=tmp_path)
+        sibling = _first_bare_importable_sibling(bare_shell_probes)
         if sibling is None:
             pytest.skip(
                 'no intra-orchestrator sibling is currently bare-importable under '
@@ -5598,7 +5723,9 @@ class TestStdlibOnlySelfContainment:
         )
 
     @pytest.mark.parametrize(('entrypoint', 'payload'), _MUST_BE_REJECTED)
-    def test_forbidden_import_is_rejected(self, entrypoint, payload, tmp_path):
+    def test_forbidden_import_is_rejected(
+        self, entrypoint, payload, tmp_path, bare_shell_probes
+    ):
         """Inject a forbidden import and demand that some covering row REJECTS it.
 
         This is the signal that the rows above discriminate at all. A guard that
@@ -5615,15 +5742,46 @@ class TestStdlibOnlySelfContainment:
             'to close. Register a row for it.'
         )
 
+        # Discrimination is judged against THIS payload, not the row's fixed
+        # `probe` alone.  The two can be about different modules, and then a row
+        # is counted as discriminating on a probe unrelated to what it is being
+        # asked to reject.  Concretely: the tier-1 row's probe is `from
+        # orchestrator import stop_instruction` (no PYTHONPATH, so it fails on
+        # essentially any host), while one payload it must reject is `from shared
+        # import safe_io`.  On a host where `shared` IS reachable by the bare
+        # interpreter, tier-2 is correctly filtered out on its own probe, tier-1
+        # survives the filter on an unrelated one, and the mutated tier-1 run then
+        # exits 0 — a hard RED reporting a fact about the HOST rather than about
+        # the code.  The honest outcome there is the skip below.  Both conditions
+        # are required: the row probe guards the row in general, the payload
+        # guards this parametrization in particular.
         discriminating = [
-            row for row in covering if _probe_discriminates(row, tmp_path=tmp_path)
+            row
+            for row in covering
+            if bare_shell_probes.rejects(row, row.probe)
+            and bare_shell_probes.rejects(row, payload)
         ]
         if not discriminating:
             pytest.skip(
-                f'every registry row covering {entrypoint} can already import its own '
-                'probe under its documented env (workspace packages installed into the '
-                'bare interpreter?), so none of them can discriminate a compliant '
-                'module from a violating one'
+                f'every registry row covering {entrypoint} can already import '
+                f'`{payload}` (or its own vacuity probe) under its documented env '
+                '(workspace or third-party packages reachable by the bare '
+                'interpreter?), so none of them can discriminate a compliant module '
+                'from a violating one'
+            )
+
+        # CONTROL BEFORE CONCLUSION: the identical sandbox with NOTHING injected
+        # must run clean, or a non-zero exit on the mutated copy says nothing
+        # about the payload.
+        for row in discriminating:
+            control = bare_shell_probes.control_run(row, entrypoint)
+            assert control.returncode == 0, (
+                f'the UNMUTATED sandbox of {entrypoint} already fails under '
+                f'{row.name} (rc={control.returncode}), so any rejection below would '
+                'be attributable to the sandbox rather than to the injected import. '
+                '_inject_import_sandbox has degraded — a missing symlink, or an '
+                'anchor line that no longer sits at module scope.\n'
+                f'stderr:\n{control.stderr}'
             )
 
         sandbox = _inject_import_sandbox(tmp_path, entrypoint, payload)
@@ -5637,9 +5795,22 @@ class TestStdlibOnlySelfContainment:
             f'  stderr: {result.stderr.strip()[:400]}'
             for row, result in outcomes
         )
-        assert any(result.returncode != 0 for _, result in outcomes), (
-            f'{entrypoint} with `{payload}` injected at module scope was ACCEPTED by '
-            'every registry row covering it, so nothing pins that part of the '
-            'contract. Add the row whose environment rejects it.\n'
+        # ``ModuleNotFoundError``, not merely ``rc != 0``: the rejection must be
+        # caused by the module the payload names — directly, or transitively (`from
+        # orchestrator import config` fails on config.py's own pydantic import under
+        # tier-2).  A SyntaxError or a crash also exits non-zero, so accepting any
+        # non-zero exit would let a broken injection masquerade as a working guard.
+        rejected = [
+            row.name
+            for row, result in outcomes
+            if result.returncode != 0 and 'ModuleNotFoundError' in result.stderr
+        ]
+        assert rejected, (
+            f'{entrypoint} with `{payload}` injected at module scope was not rejected '
+            'for the right reason by any registry row covering it: each row either '
+            'ACCEPTED it — nothing pins that part of the contract, so add the row '
+            'whose environment rejects it — or failed WITHOUT a ModuleNotFoundError, '
+            'meaning the injection broke the module instead of exercising the import '
+            'guard.\n'
             f'{detail}'
         )
