@@ -7,7 +7,9 @@ invocation_end event tagging, sha-stamping, and keep-last-N trim.
 
 from __future__ import annotations
 
+import asyncio
 import json as _json
+import logging
 import subprocess
 from importlib import resources as pkg_resources
 from pathlib import Path
@@ -2172,9 +2174,9 @@ class TestDryRunTranscriptArchival:
     The per-investigation ``TaskConfigDir`` is named ``{task_id}-unblock``, and
     BOTH exit branches lose it today: the normal path ``rmtree``s it, and the
     forensic ``preserve_config_dir`` path merely defers the loss to ``git
-    worktree remove --force``. The ``cleanup_worktree`` teardown backstop
-    cannot cover either, because it composes its target by literal f-string
-    ``f'claude-config-{branch}'`` (git_ops.py:11780) — which never matches the
+    worktree remove --force``. The ``GitOps.cleanup_worktree`` teardown
+    backstop cannot cover either, because it composes its target by literal
+    f-string ``f'claude-config-{branch}'`` — which never matches the
     ``-unblock`` suffix. So the producer-side archival call is mandatory, not
     redundant, and it must sit ABOVE the preserve/cleanup branch.
     """
@@ -2391,3 +2393,143 @@ class TestDryRunTranscriptArchival:
         task_dir = worktree / '.task'
         leftover = list(task_dir.glob('claude-config-*-unblock')) if task_dir.exists() else []
         assert leftover == [], f'Expected config dir cleanup on success, found: {leftover}'
+
+    @pytest.mark.asyncio
+    async def test_archival_failure_neither_breaks_the_run_nor_skips_teardown(
+        self, tmp_path, caplog,
+    ):
+        """A raising archiver must not replace the run's result or its cleanup.
+
+        The hook's ``except Exception`` exists for exactly this: it sits in a
+        ``finally`` that may be unwinding an in-flight exception, so an archival
+        error must be logged as a structured fact and swallowed, never
+        propagated. And because the hook was inserted AHEAD of teardown, the
+        second property matters just as much — ``config_dir.cleanup()`` must
+        still run afterwards. (``archive_task_transcripts`` is total by
+        contract, so this drives the defense-in-depth branch directly rather
+        than hoping the real helper misbehaves.)
+        """
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        worktree = tmp_path / 'wt'
+        worktree.mkdir()
+        project_root = tmp_path / 'proj'
+
+        structured = {
+            'proposal_text': 'Rebase on main',
+            'risk_label': 'low',
+            'files_referenced': [],
+        }
+        side_effect, state = _transcript_writing_invoke(
+            [_make_agent_result(structured_output=structured)]
+        )
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with (
+            caplog.at_level(logging.WARNING, logger='orchestrator.dry_run_unblock'),
+            patch('orchestrator.dry_run_unblock.invoke_agent',
+                  new=AsyncMock(side_effect=side_effect)),
+            patch('orchestrator.dry_run_unblock.archive_task_transcripts',
+                  new=MagicMock(side_effect=OSError('boom'))) as mock_archive,
+        ):
+            await run_dry_run_unblock(
+                task_id='3274',
+                worktree=str(worktree),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(
+                    project_root=project_root,
+                    transcript_archive=TranscriptArchiveConfig(),
+                ),
+            )
+
+        assert mock_archive.called, 'archival must have been attempted'
+        assert len(state.sessions) == 1
+
+        # (a) The run's own result is intact — the archival error did not
+        # replace it, and the proposal still reached the scheduler.
+        entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
+        # The success shape carries no explicit 'status' (it defaults to 'ok'
+        # downstream) — so pin the substantive fields instead of a sentinel.
+        assert entry.get('status', 'ok') == 'ok'
+        assert entry['proposal_text'] == 'Rebase on main'
+        assert entry['risk_label'] == 'low'
+
+        # Loud, not silent: a structured WARNING names the failure.
+        assert any(
+            'transcript archival failed' in rec.message
+            and rec.levelno == logging.WARNING
+            for rec in caplog.records
+        ), f'Expected an archival-failure WARNING, got: {[r.message for r in caplog.records]}'
+
+        # (b) Teardown still ran. This is the property most likely to regress
+        # silently, since the archival hook was inserted ahead of it.
+        task_dir = worktree / '.task'
+        leftover = list(task_dir.glob('claude-config-*-unblock')) if task_dir.exists() else []
+        assert leftover == [], (
+            f'A failed archival must not skip config-dir teardown (the dir holds '
+            f'.credentials.json); found: {leftover}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_cancelled_archival_still_reaps_the_config_dir(self, tmp_path):
+        """CancelledError propagates — but must not take teardown down with it.
+
+        The archival ``await`` is the FIRST await point in this ``finally``, and
+        its ``except asyncio.CancelledError: raise`` is deliberate (cooperative
+        cancellation is a ``BaseException`` and must propagate). Under loop
+        teardown / SIGTERM that re-raise would, unnested, skip the
+        preserve-or-cleanup branch below it and strand a config dir containing
+        ``.credentials.json`` — a regression created purely by inserting a new
+        await ahead of teardown. The hook is nested in its own ``try/finally``
+        so cleanup runs either way.
+        """
+        from orchestrator.dry_run_unblock import run_dry_run_unblock
+
+        worktree = tmp_path / 'wt'
+        worktree.mkdir()
+        project_root = tmp_path / 'proj'
+
+        structured = {
+            'proposal_text': 'Rebase on main',
+            'risk_label': 'low',
+            'files_referenced': [],
+        }
+        side_effect, _state = _transcript_writing_invoke(
+            [_make_agent_result(structured_output=structured)]
+        )
+
+        scheduler = MagicMock()
+        scheduler.update_task = AsyncMock(return_value=True)
+
+        with (
+            patch('orchestrator.dry_run_unblock.invoke_agent',
+                  new=AsyncMock(side_effect=side_effect)),
+            patch('orchestrator.dry_run_unblock.archive_task_transcripts',
+                  new=MagicMock(side_effect=asyncio.CancelledError())),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await run_dry_run_unblock(
+                task_id='3275',
+                worktree=str(worktree),
+                reason='verify exhausted',
+                detail='',
+                scheduler=scheduler,
+                mcp=MagicMock(),
+                config=_make_config(
+                    project_root=project_root,
+                    transcript_archive=TranscriptArchiveConfig(),
+                ),
+            )
+
+        task_dir = worktree / '.task'
+        leftover = list(task_dir.glob('claude-config-*-unblock')) if task_dir.exists() else []
+        assert leftover == [], (
+            f'Cancellation must still reap the per-investigation config dir — it '
+            f'holds .credentials.json and was unconditionally cleaned up before '
+            f'the archival hook was inserted ahead of teardown; found: {leftover}'
+        )
