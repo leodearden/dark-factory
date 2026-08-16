@@ -37,6 +37,8 @@ the file text. Leave it escaped.
 from __future__ import annotations
 
 import copy
+import json
+from pathlib import Path
 
 import pytest
 
@@ -536,3 +538,153 @@ class TestScanDesignDecisions:
                 assert walker_verdict[0].header == entry_verdict.header
                 assert walker_verdict[0].marker == entry_verdict.marker
                 assert walker_verdict[0].field == entry_verdict.field
+
+
+# ---------------------------------------------------------------------------
+# Committed-corpus replay (TDD pair 3).
+# ---------------------------------------------------------------------------
+
+CORPUS_PATH = Path(__file__).parent / 'fixtures' / 'decision_pairing_corpus.jsonl'
+
+#: The victim task ids the corpus was extracted from, named here so a future
+#: edit CANNOT SILENTLY DROP A SPECIMEN. Dropping one means editing this list in
+#: the same commit, which is a reviewable event; a widened predicate that
+#: quietly loses a victim plan is not. This is an assertion about the COMMITTED
+#: corpus's contents, never about the live .worktrees tree — nothing in this
+#: file reads that.
+VICTIM_TASK_IDS = frozenset({
+    '3042', '3098', '3201', '3209', '3210', '3216', '3298', '3337', '3363',
+    '3382', '3415', '3473', '3567', '3664', '3668', '3727', '3757', '3918',
+    '4030', '4096',
+})
+
+#: The four near-miss classes observed in live plans. Each must be represented
+#: by at least one negative control, because each is a distinct way the
+#: predicate could lose precision if a conjunct were dropped.
+NEAR_MISS_CLASSES = frozenset({
+    'genuine-supersession-no-pairing-language',
+    'incidental-mid-prose-keyword',
+    'parenthetical-restatement-not-headed',
+    'meta-prose-about-another-plans-mispairing',
+})
+
+
+def load_corpus() -> list[dict]:
+    """Every committed specimen, parsed.
+
+    The fixture stores each opening angle bracket as its ``\\u003c`` JSON
+    escape, so the FILE TEXT carries none while the parsed value is
+    byte-identical to the harvested text. ``json.loads`` undoes it here; do not
+    "helpfully" rewrite the fixture to hold them verbatim.
+    """
+    return [json.loads(line) for line in CORPUS_PATH.read_text().splitlines() if line.strip()]
+
+
+def replay(record: dict) -> MispairingHit | None:
+    """The verdict under test for one record — spelled once, used everywhere."""
+    return detect_mispairing(record['text'], record['rationale_text'])
+
+
+class TestCommittedCorpus:
+    """Replay real victim text, and assert AGREEMENT WITH THE COMMITTED COLUMN.
+
+    Never a bare count threshold. A future predicate that legitimately detects
+    more must update the ``expect`` column in the same commit, which is a
+    reviewable improvement rather than a RED test. And no live count is
+    asserted anywhere: ``.worktrees/.task-meta`` grew from 1,196 to 1,297 plans
+    in about eight days, so a pinned prevalence would be flaky by construction
+    AND would invert the signal, making a better predicate read as a regression.
+    """
+
+    def test_corpus_is_present_and_non_empty(self) -> None:
+        records = load_corpus()
+        assert records, 'the committed corpus is empty — the durable artifact is gone'
+        assert all(r['expect'] in {'mispaired', 'clean'} for r in records)
+
+    def test_the_fixture_text_carries_no_raw_opening_angle_bracket(self) -> None:
+        """The authoring hazard, asserted rather than trusted to a convention.
+
+        Three specimens genuinely carry envelope literals (3201[1], 3382[1],
+        3209[8]). If a future regeneration wrote them verbatim, an agent
+        editing this fixture would emit that literal inside its own tool-call
+        arguments and truncate its own write.
+        """
+        assert chr(60) not in CORPUS_PATH.read_text()
+
+    def test_every_record_matches_its_committed_expectation(self) -> None:
+        disagreements = []
+        for record in load_corpus():
+            verdict = replay(record)
+            actual = 'mispaired' if verdict is not None else 'clean'
+            if actual != record['expect']:
+                disagreements.append(
+                    f"{record['task_id']}[{record['index']}]: "
+                    f"expected {record['expect']}, got {actual}"
+                )
+        assert not disagreements, (
+            'The detector disagrees with the committed corpus:\n  '
+            + '\n  '.join(disagreements)
+            + '\n\nIf the predicate legitimately improved, update the `expect` '
+              'column (and the README sidecar) IN THE SAME COMMIT. Never add a '
+              'per-specimen exception to the detector — widen or tighten the '
+              'marker sets, which live in exactly one place.'
+        )
+
+    def test_positives_report_a_declared_header_and_pairing_marker(self) -> None:
+        """A hit names its own evidence, from the module's own tuples (INV-2)."""
+        for record in load_corpus():
+            if record['expect'] != 'mispaired':
+                continue
+            hit = replay(record)
+            assert hit is not None
+            assert hit.header in HEADER_MARKERS, f"{record['task_id']}[{record['index']}]"
+            assert hit.marker in PAIRING_MARKERS, f"{record['task_id']}[{record['index']}]"
+            assert hit.field in {'decision', 'rationale'}
+
+    def test_the_committed_field_column_agrees_with_the_detector(self) -> None:
+        """The stored ``field`` is a measurement, so the detector must reproduce it."""
+        for record in load_corpus():
+            hit = replay(record)
+            if hit is None:
+                assert record['field'] is None, f"{record['task_id']}[{record['index']}]"
+            else:
+                assert hit.field == record['field'], f"{record['task_id']}[{record['index']}]"
+
+    def test_every_victim_task_id_is_still_represented(self) -> None:
+        """A widened predicate must not silently drop a victim plan."""
+        detected = {r['task_id'] for r in load_corpus()
+                    if r['expect'] == 'mispaired' and replay(r) is not None}
+        missing = VICTIM_TASK_IDS - detected
+        assert not missing, (
+            f'victim task ids no longer detected: {sorted(missing)}. '
+            'A specimen was dropped or the predicate narrowed.'
+        )
+
+    def test_every_near_miss_class_has_a_negative_control(self) -> None:
+        """Precision is pinned per FAILURE MODE, not by an aggregate count."""
+        present = {r['near_miss_class'] for r in load_corpus() if r['expect'] == 'clean'}
+        assert NEAR_MISS_CLASSES <= present, (
+            f'near-miss classes with no negative control: '
+            f'{sorted(NEAR_MISS_CLASSES - present)}'
+        )
+
+    def test_every_negative_control_is_actually_clean(self) -> None:
+        """Stated separately from the bulk agreement test so a precision
+        regression names itself as one rather than as an anonymous diff row."""
+        fired = [
+            f"{r['task_id']}[{r['index']}] ({r['near_miss_class']})"
+            for r in load_corpus() if r['expect'] == 'clean' and replay(r) is not None
+        ]
+        assert not fired, f'negative controls the predicate now falsely fires on: {fired}'
+
+    def test_replay_is_deterministic(self) -> None:
+        """Two passes give identical results — no ordering or state dependence."""
+        first = [replay(r) for r in load_corpus()]
+        second = [replay(r) for r in load_corpus()]
+        assert first == second
+
+    def test_positives_and_negatives_are_both_represented(self) -> None:
+        """A corpus of only positives is a recall pin; only negatives, a precision
+        pin. This one is both, and must stay both."""
+        expectations = {r['expect'] for r in load_corpus()}
+        assert expectations == {'mispaired', 'clean'}
