@@ -15035,27 +15035,64 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
                 # Continue filling only if another slot is free (real verify entries
                 # consume a host slot, so check free_host_count).
-                # task 3276: the hazard this second clause guards against is an
-                # EMPTY _verifier_queue -- blocking on _verifier_queue.get() would
-                # deadlock when the queue is empty after a cascade -- NOT an empty
-                # _redispatch. The two are different conditions: a redispatch-
-                # sourced dispatch that happens to drain _redispatch does not mean
-                # _verifier_queue is empty too. Testing _redispatch alone ended the
-                # fill pass (and forfeited a free host) even when _verifier_queue
-                # still held a ready item, so cascade-recovery items now proceed to
-                # FINALIZE-HEAD only when there is genuinely nothing left to
-                # dispatch: _redispatch is empty AND _verifier_queue is empty AND
-                # no persistent getter is holding an already-harvested item (a
-                # done-but-unharvested _pending_verifier_get means the harvest
-                # branch above would dispatch immediately on the next iteration,
-                # so the fill pass must not end in that state either).
+                #
+                # task 3276: this used to also stop filling whenever a
+                # redispatch-sourced dispatch drained self._redispatch, on the
+                # theory that continuing would risk blocking on
+                # _verifier_queue.get() and deadlocking once the queue is empty
+                # after a cascade. That theory conflated two different
+                # conditions -- an empty _redispatch is not the same as an
+                # empty _verifier_queue -- and cost a free host and real,
+                # ready work every time it fired while the queue was
+                # non-empty. Re-predicating onto "is _verifier_queue actually
+                # empty" (a prior revision of this comment) was still too
+                # narrow: it forfeits an item that arrives a moment *after*
+                # the guard evaluates, even though a host is free and the
+                # item is imminent (see
+                # test_late_arrival_dispatched_to_free_host_while_head_verify_runs).
+                #
+                # The clause is gone outright: tracing every path shows it was
+                # redundant, not merely mis-predicated. With self._redispatch
+                # empty, the top of this loop's NEXT iteration can only take
+                # one of three paths, none of which can block indefinitely:
+                #   1. the persistent-getter harvest (above, near the top of
+                #      this inner loop) consumes an already-arrived item
+                #      immediately;
+                #   2. get_nowait() dispatches immediately when
+                #      _verifier_queue is non-empty;
+                #   3. the QueueEmpty branch, which only blocks when
+                #      _has_running_inflight and a host is free -- and then
+                #      races a persistent getter against the running verify
+                #      tasks via asyncio.wait(..., FIRST_COMPLETED), so a
+                #      verify completing first always ends the wait and falls
+                #      through to FINALIZE-HEAD (the esc-1735-5 anti-block
+                #      property pinned by TestLastItemOfBurstFinalizes);
+                #      otherwise (no running inflight, or no free host) the
+                #      else there breaks straight to FINALIZE-HEAD.
+                # So the "would deadlock when the queue is empty after a
+                # cascade" hazard the original comment named cannot occur --
+                # that property was always provided by path 3 above, not by
+                # this clause. Deleting it also removes the very
+                # redispatch-sourced-vs-queue-sourced divergence that
+                # produced the bug: both kinds of dispatch now continue
+                # filling under the exact same rule (see
+                # test_empty_queue_after_redispatch_drain_still_finalizes_head
+                # for the fenced anti-deadlock invariant, and
+                # test_second_host_dispatched_from_verifier_queue_in_same_fill_pass
+                # for the primary repro this fixes).
+                #
+                # is_from_verifier_queue remains live -- it is not unused --
+                # it still selects the from_state (AWAITING_VERIFY vs
+                # REDISPATCH_PARKED) for the _note_transition call above.
+                #
+                # Do NOT add a free_host_count() == 0 special case here for
+                # single-host: that clause already covers it -- with one
+                # slot, dispatch acquires it, free_host_count() drops to 0,
+                # and the fill loop stops after one entry, preserving the
+                # SINGLE-HOST serial degeneracy documented in this method's
+                # docstring and pinned by TestSingleHostSerialByteIdentical.
                 allocator = self._ensure_host_allocator(entry.item.request.config)
-                if allocator.free_host_count() == 0 or (
-                    not is_from_verifier_queue
-                    and not self._redispatch
-                    and self._verifier_queue.empty()
-                    and self._pending_verifier_get is None
-                ):
+                if allocator.free_host_count() == 0:
                     fill_done = True
                     break
 
