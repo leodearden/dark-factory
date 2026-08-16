@@ -16,7 +16,13 @@ failure text observed against a NAMED scratch mutation of
 ``skills/factory-init/scripts/find_escalation_port.py``, reverted before commit —
 the convention ``test_skills_module_config_decision.py`` and
 ``test_root_lint_covers_nonmember_py.py`` already follow in this same directory.
-Every MEASURED RED below was observed at base main ``fc6f048b55``.
+Every MEASURED RED below was observed at base main ``fc6f048b55``. This branch was
+subsequently rebased onto main ``6339076d49``; the citations still name the base the
+mutations were actually run against, because that is what was measured. They carry
+over unchanged: ``git diff fc6f048b55 6339076d49 -- <script>`` is EMPTY, i.e. the
+file under test is byte-identical across the move (as are ``scripts/legibility/
+nightly.py``, which step-9's parity test reads, and both ``conftest.py``s). The
+scratch mutations were NOT re-run at the new base — they did not need to be.
 
 MUST NOT SKIP. There is no ``pytest.importorskip`` and no try/except-and-skip
 anywhere in this module. The script under test is a tracked file in this repo — the
