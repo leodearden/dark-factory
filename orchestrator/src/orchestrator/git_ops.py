@@ -3774,9 +3774,19 @@ class GitOps:
                         'creating fresh',
                         worktree_path, stored_title, expected_title,
                     )
-                    await self.quarantine_worktree(
+                    dest = await self.quarantine_worktree(
                         worktree_path, branch_name, 'reuse-identity-mismatch',
                     )
+                    # Relocate (not delete) the foreign sibling .task-meta
+                    # root alongside the quarantined worktree — mirrors the
+                    # cold-reattach guard's identical call below; see
+                    # _relocate_foreign_meta_root's docstring. Skipped when
+                    # dest is None (relocation failed): worktree_path is
+                    # still a live registered worktree, so the elif
+                    # self-heal branch below raises rather than destroying
+                    # anything, and the sidecar is correctly left in place.
+                    if dest is not None:
+                        self._relocate_foreign_meta_root(worktree_path, dest)
                     reuse_ok = False
             if reuse_ok:
                 logger.info(f'Reusing existing worktree at {worktree_path} on branch {full_branch}')
@@ -3961,12 +3971,9 @@ class GitOps:
                 )
                 if reattached is not None:
                     return reattached
-                # Identity mismatch: _reattach_cold_worktree already
-                # quarantined the orphan (dir + branch), so full_branch no
-                # longer exists — skip _cleanup_leftover_branch (it would
-                # rev-list a now-nonexistent branch, hit
-                # _branch_has_commits_beyond_main's fail-safe True, and raise
-                # spuriously) and fall through to the fresh create below.
+                # Mismatch quarantined full_branch — skip
+                # _cleanup_leftover_branch (it would rev-list a now-gone
+                # branch, hit the fail-safe True, and raise spuriously).
             else:
                 await self._cleanup_leftover_branch(full_branch, branch_name)
 
@@ -4103,14 +4110,7 @@ class GitOps:
                 f'`git branch -D {full_branch}` only after preserving work.'
             )
 
-        # ── Identity guard (mirrors the REUSE path's guard, git_ops.py
-        # ~3564-3576, verbatim in shape) ────────────────────────────────
-        # Runs AFTER the attach above (not before): quarantine_worktree ->
-        # rename_worktree starts with `git worktree move`, which requires a
-        # registered worktree directory. Attaching first is non-destructive
-        # (it just materialises the orphan tip into a fresh dir) and is what
-        # makes the existing quarantine_worktree primitive usable unchanged
-        # here, relocating both the directory and the branch.
+        # Identity guard — see docstring for why this runs after the attach.
         if expected_title is not None:
             stored_title = read_worktree_title(worktree_path)
             if not identities_match(stored_title, expected_title):
@@ -4146,22 +4146,15 @@ class GitOps:
                         f'preserved, relocate them manually (`git worktree move` '
                         f'+ `git branch -m`) and re-dispatch.'
                     )
-                # Clear the foreign sibling .task-meta/<branch_name> root too
-                # (W11 ε1 pattern — same call the warm-lane different-task
-                # acquisition routes already make). Quarantining the branch
-                # alone would leave the deleted task's plan.json to be
-                # adopted by workflow.py's plan-resume onto the NEW task.
-                # Placement is load-bearing: this runs AFTER read_worktree_title
-                # (which reads that same root to detect the mismatch) and
-                # ONLY on this confirmed-mismatch route — never on the
-                # match/fail-open path below, which is a same-task resume
-                # whose own artifacts must be preserved per
-                # _clear_foreign_meta_root's own "must NOT be called on
-                # same-task reuse routes" contract. The foreign work itself
-                # is not lost — the branch and its full tree are preserved
-                # under quarantine_base/<branch_name>-<ts>; only the
-                # orchestration sidecar (plan.json and friends) is dropped.
-                self._clear_foreign_meta_root(worktree_path)
+                # Relocate (not delete) the foreign sibling .task-meta root
+                # alongside the quarantined worktree — see
+                # _relocate_foreign_meta_root's docstring for why this must
+                # be a move, not a delete. Placement is load-bearing: runs
+                # AFTER read_worktree_title (which reads this same root to
+                # detect the mismatch) and ONLY on this confirmed-mismatch
+                # route — never on the match/fail-open path below, a
+                # same-task resume whose own artifacts must be preserved.
+                self._relocate_foreign_meta_root(worktree_path, dest)
                 return None
 
         info = await self._reuse_warm_lane(worktree_path, full_branch)
@@ -7109,6 +7102,49 @@ class GitOps:
             'acquisition',
             lane.name,
         )
+
+    def _relocate_foreign_meta_root(self, lane: Path, dest: Path) -> None:
+        """Move the sibling ``.task-meta/<lane.name>`` dir alongside *dest*.
+
+        Used by the two "nothing is destroyed" quarantine guards —
+        ``create_worktree``'s REUSE-path and ``_reattach_cold_worktree``'s
+        cold-path ``expected_title`` mismatch checks — where *dest* is the
+        :meth:`quarantine_worktree` return value
+        (``quarantine_base/<branch>-<ts>``). Unlike
+        :meth:`_clear_foreign_meta_root` (used by the warm-lane
+        DIFFERENT-task ACQUISITION routes, where the sidecar is genuinely
+        superseded by the new occupant's own artifacts), a quarantine must
+        not destroy anything: the sidecar
+        (plan.json/metadata.json/blocking_dependency.json/…) is the only
+        record tying the quarantined branch back to its original task, so
+        an operator inspecting ``quarantine_base/<branch>-<ts>`` later must
+        still be able to tell what task it was.
+
+        Moves ``TaskArtifacts.meta_root_for(self.worktree_base, lane.name)``
+        to ``TaskArtifacts.meta_root_for(self.quarantine_base, dest.name)``.
+        Best-effort and never raises: a no-op if the source root does not
+        exist, and falls back to :meth:`_clear_foreign_meta_root` (delete)
+        if the move itself fails, so a quarantine-time fault here can never
+        strand the caller.
+        """
+        src = TaskArtifacts.meta_root_for(self.worktree_base, lane.name)
+        if not src.exists():
+            return
+        dst = TaskArtifacts.meta_root_for(self.quarantine_base, dest.name)
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dst))
+            logger.debug(
+                '_relocate_foreign_meta_root: relocated .task-meta/%s -> %s',
+                lane.name, dst,
+            )
+        except Exception as e:
+            logger.warning(
+                '_relocate_foreign_meta_root: failed to relocate %s -> %s '
+                '(%s) — falling back to clearing it in place',
+                src, dst, e,
+            )
+            self._clear_foreign_meta_root(lane)
 
     async def _reset_warm_lane(
         self, lane_dir: Path, full_branch: str, target_commit: str,
