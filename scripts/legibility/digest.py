@@ -902,12 +902,24 @@ pre-3610 all-of-three rule did not catch either, so nothing regresses."""
 
 HARNESS_PROMPT_MARKERS: tuple[str, ...] = (
     'you are the trickle coder for the dark-factory agent-confusion codebook',
+    'your previous run was interrupted by a usage limit',
 )
 """Harness-authored PROSE preamble literals, matched as plain
 case-insensitive substrings (unlike the line-anchored heading markers
 above): the trickle coder's system prompt
-(scripts/legibility/coder.py:174 ``build_prompt``). Extend with future
-harness prompt literals as one-line additions."""
+(scripts/legibility/coder.py:174 ``build_prompt``), and the harness's
+cap-hit resume prompt (``shared.cli_invoke.CAP_HIT_RESUME_PROMPT`` -- the
+canonical source of the literal above). That marker is deliberately the
+constant's stable FIRST SENTENCE, not the whole two-sentence string: a
+future rewording of its second sentence ("Continue where you left off and
+complete your task.") must not silently un-cover the marker. Held in
+lockstep with the canonical constant by
+``TestHarnessInjectedTurnFilter.test_usage_limit_resume_prompt_is_excluded_lockstep``
+in scripts/tests/test_legibility_digest.py, which asserts
+``is_harness_injected_turn(CAP_HIT_RESUME_PROMPT) is True`` rather than
+restating the literal -- a harness rewording turns that test red instead
+of silently regressing coverage. Extend with future harness prompt
+literals as one-line additions."""
 
 
 def is_harness_injected_turn(text: str) -> bool:
