@@ -225,3 +225,96 @@ class TestTripwireAdmitsCrossPairedCalls:
 
         assert h.facts, 'the tripwire did not fire on envelope damage on this tool'
         assert h.recorder.calls == [], 'the corrupted write reached the tool anyway'
+
+
+class TestWireEvidence:
+    """THE MECHANISM FINDING: the harness hypothesis is REFUTED on this specimen.
+
+    The originating escalation hypothesised that the cross-pairing was produced
+    by the harness's tool-call argument parser over-consuming at an argument
+    boundary. For task **3727** that is refuted, and this is what refutes it.
+
+    All 7 of 3727's on-disk ``(decision, rationale)`` pairs are BYTE-IDENTICAL
+    to an ``add_design_decision`` ``tool_use`` input recovered from its archived
+    transcripts — INCLUDING the mis-paired entry ``[0]`` that entry ``[1]``
+    corrects, which is the discriminating case. plan-tools therefore wrote
+    exactly what it received: **the cross-pairing was already present in the
+    arguments the model composed.** An argument-boundary over-consumption defect
+    cannot produce a well-formed swap spanning two separate ``tool_use`` blocks
+    — by its documented mechanism it truncates one argument and drops that
+    call's siblings, leaving residue, and there is no residue here.
+
+    ## SCOPE LIMIT — read this before citing the finding
+
+    This is ONE clean specimen. Tasks **3567** and **4096** do NOT reproduce
+    byte-identity on every field (consistent with task 3692's read-time envelope
+    repair having rewritten them) and are INCONCLUSIVE; no wire record for
+    either is committed, and neither may be cited as evidence in either
+    direction. Nothing here licenses a general claim about every victim — only
+    that for this specimen the fix does not belong at the harness boundary.
+
+    The fixture is committed because ``data/`` is gitignored and
+    retention-bounded, so the archive this was measured from will not outlive
+    the finding.
+    """
+
+    def test_the_fixture_is_present_and_well_formed(self) -> None:
+        doc = load_wire_evidence()
+        assert doc['task_id'] == '3727'
+        assert len(doc['on_disk']) == 7
+        assert len(doc['wire']) == 7
+
+    def test_all_seven_on_disk_pairs_are_byte_identical_to_a_wire_input(self) -> None:
+        doc = load_wire_evidence()
+        wire_pairs = {(w['input']['decision'], w['input']['rationale']) for w in doc['wire']}
+        unmatched = [
+            entry['index'] for entry in doc['on_disk']
+            if (entry['decision'], entry['rationale']) not in wire_pairs
+        ]
+        assert not unmatched, (
+            f'on-disk entries with no byte-identical wire input: {unmatched}. '
+            'The mechanism finding does not hold as recorded — correct the '
+            'FIXTURE to what you measured and restate the finding. Do NOT relax '
+            'this assertion: that would launder a refuted claim into a green test.'
+        )
+        assert doc['measured_byte_identical_pairs'] == len(doc['on_disk'])
+
+    def test_the_mispaired_entry_itself_arrived_byte_intact(self) -> None:
+        """The discriminating case, stated on its own.
+
+        A harness defect would have to have corrupted THIS entry specifically.
+        It did not: entry [0] — the one entry [1] corrects — is on the wire
+        exactly as it is on disk.
+        """
+        doc = load_wire_evidence()
+        mispaired = doc['on_disk'][doc['mispaired_index']]
+        wire_pairs = {(w['input']['decision'], w['input']['rationale']) for w in doc['wire']}
+        assert (mispaired['decision'], mispaired['rationale']) in wire_pairs
+
+    def test_the_correction_entry_is_detected_and_is_envelope_clean(self) -> None:
+        """The correction is the ONLY machine-visible trace, and it carries no sentinel.
+
+        So the envelope detector could never have flagged this specimen, and
+        the write-time tripwire could never have contained it — which is the
+        containment finding above, reproduced on real archived data rather than
+        on a hand-authored pair.
+        """
+        doc = load_wire_evidence()
+        correction = doc['on_disk'][doc['correction_index']]
+
+        assert detect_mispairing(correction['decision'], correction['rationale']) is not None
+        assert detect(correction['decision']) is None
+
+    def test_no_inconclusive_specimen_is_committed_as_evidence(self) -> None:
+        """3567 and 4096 must NOT be cited here, in either direction.
+
+        They do not reproduce byte-identity on every field. Committing them
+        alongside 3727 would let a reader take the general claim the scope
+        limit explicitly withholds.
+        """
+        doc = load_wire_evidence()
+        assert doc['task_id'] == '3727'
+        assert '3567' in doc['note'] and '4096' in doc['note'], (
+            'the fixture must NAME the inconclusive specimens, so their absence '
+            'reads as a deliberate scope limit rather than an oversight'
+        )
