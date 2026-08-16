@@ -4282,17 +4282,10 @@ class GraphitiBackend:
     async def drop_index(self, label: str, field: str, *, group_id: str) -> None:
         """Drop a RANGE index on the given label and field (FalkorDB syntax).
 
-        RANGE ONLY.  The old-style ``DROP INDEX ON :label(field)`` form this
-        issues does NOT reach a VECTOR index: measured 2026-08-16 on throwaway
-        graph ``_impl3769_probe``, it fails with
-        ``ERR Unable to drop index on :Entity(emb): no such index.`` even while
-        that index is live and ``CALL db.indexes()`` reports it.  A VECTOR index
-        must go through :meth:`drop_vector_index`, which issues the
-        ``DROP VECTOR INDEX`` verb.
-
-        The previous docstring — "Drop an index on the given label and field" —
-        overstated the reach, which is part of how ``drop_vector_indices`` came to
-        route VECTOR drops through here and silently drop nothing (task 3769).
+        RANGE ONLY — measured, the old-style ``DROP INDEX ON :label(field)`` form
+        this issues fails with ``no such index`` against a live VECTOR index.  A
+        VECTOR index must go through :meth:`drop_vector_index`; see
+        :meth:`drop_vector_indices` for the measurement and why it matters.
         """
         graph = self._graph_for(group_id)
         cypher = f'DROP INDEX ON :{label}({field})'
@@ -4300,26 +4293,30 @@ class GraphitiBackend:
 
     @_canonicalize_group_args
     async def drop_vector_index(
-        self, label: str, field: str, entity_type: str, *, group_id: str,
+        self, label: str, field: str, *, entity_type: str, group_id: str,
     ) -> None:
         """Drop ONE VECTOR index, on the given label/property/entity type.
 
-        The VECTOR-specific sibling of :meth:`drop_index`, which is RANGE-only
-        (see its docstring for the measurement).  ``entity_type`` is load-bearing
-        rather than cosmetic — measured, the NODE statement against a
-        RELATIONSHIP vector index also fails with ``no such index`` — so it
-        selects the statement shape via
+        The VECTOR-specific sibling of :meth:`drop_index`, which is RANGE-only.
+        The statement shape comes from
         :func:`fused_memory.backends.falkor_indices.vector_drop_statement`, which
-        raises on an unrecognised value rather than guessing.
+        raises on an unrecognised ``entity_type`` rather than guessing; see
+        :meth:`drop_vector_indices` for the measurements behind both.
 
         Args:
             label: Node label or relationship type carrying the index.
             field: A SINGLE property name (not a list).
-            entity_type: ``'NODE'`` or ``'RELATIONSHIP'``.
+            entity_type: ``'NODE'`` or ``'RELATIONSHIP'``.  KEYWORD-ONLY: it is
+                load-bearing (measured, the NODE statement against a RELATIONSHIP
+                vector index fails with ``no such index``) and it is a plain
+                ``str`` just like *field*, so a positional swap would type-check.
+                The argument order matches ``vector_drop_statement`` exactly —
+                ``(label, field)`` positional, ``entity_type`` by keyword — so
+                neither call site has to re-order to reach the other.
             group_id: The graph to act on.
         """
         graph = self._graph_for(group_id)
-        await graph.query(vector_drop_statement(label, entity_type, field))
+        await graph.query(vector_drop_statement(label, field, entity_type=entity_type))
 
     @_canonicalize_group_args
     async def drop_vector_indices(self, *, group_id: str) -> list[dict]:
@@ -4362,6 +4359,15 @@ class GraphitiBackend:
         believes the rebuild was clean — the same silent fail-soft this method's
         defect was.
 
+        Propagating is not the same as saying nothing, though.  A mid-loop failure
+        leaves the graph GENUINELY half-dropped, and neither the exception nor
+        ``ReindexManager.reindex_and_replay`` reports which indices are already
+        gone: ``indices_dropped`` is never assigned because this never returns, and
+        the local list dies with the frame.  So the partial list is logged at ERROR
+        before the re-raise — structured facts at failure, so the operator
+        recovering from it knows what already changed.  The propagate-don't-absorb
+        contract is unchanged.
+
         Returns:
             One ``{'label': ..., 'field': ...}`` dict per dropped index, with
             ``field`` a single property STRING.  The shape is deliberately
@@ -4371,12 +4377,26 @@ class GraphitiBackend:
         """
         indices = await self.list_indices(group_id=group_id)
         dropped: list[dict] = []
-        for record in indices:
-            for prop in vector_index_properties(record):
-                await self.drop_vector_index(
-                    record['label'], prop, record['entity_type'], group_id=group_id,
-                )
-                dropped.append({'label': record['label'], 'field': prop})
+        try:
+            for record in indices:
+                for prop in vector_index_properties(record):
+                    await self.drop_vector_index(
+                        record['label'],
+                        prop,
+                        entity_type=record['entity_type'],
+                        group_id=group_id,
+                    )
+                    dropped.append({'label': record['label'], 'field': prop})
+        except Exception:
+            # The exception names the drop that FAILED; only this names the ones
+            # that already SUCCEEDED.  Without it the graph is half-dropped and
+            # nothing on the wire or in the logs says which half.
+            logger.error(
+                'drop_vector_indices failed on graph %r after dropping %d '
+                'index(es) — those are already gone, the rest remain: %r',
+                group_id, len(dropped), dropped,
+            )
+            raise
         logger.info(f'Dropped {len(dropped)} VECTOR index(es)')
         return dropped
 
