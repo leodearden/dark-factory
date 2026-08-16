@@ -166,6 +166,26 @@ def _drain_pending_tasks(loop) -> None:
     loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
 
 
+async def _mcp_handshake_ready(base_url: str) -> bool:
+    """True iff a real MCP client completes initialize+ping against
+    ``{base_url}/mcp/``.
+
+    A bare TCP connect only proves the OS accept queue is up; it does not
+    prove the FastMCP ASGI app has finished mounting the ``/mcp/`` route.
+    Polling a real handshake instead of a TCP probe closes that window — the
+    first call racing a 404/hang before the route is live."""
+    from fastmcp import Client
+    from fastmcp.client.transports import StreamableHttpTransport
+
+    transport = StreamableHttpTransport(f'{base_url}/mcp/')
+    try:
+        async with Client(transport) as client:
+            await client.ping()
+    except Exception:  # noqa: BLE001 - any failure just means "not ready yet"
+        return False
+    return True
+
+
 @pytest.fixture
 def serve_escalation_mcp():
     """Factory: serve a REAL escalation MCP server over REAL HTTP.
@@ -174,9 +194,10 @@ def serve_escalation_mcp():
     Builds ``EscalationQueue(queue_dir)`` + ``create_server(queue,
     startup_sweep=False, dedupe_config=...)`` and serves it via
     ``FastMCP.run_http_async`` on an OS-assigned free localhost port inside a
-    daemon thread running its own event loop.  Readiness is polled by a raw TCP
-    connect (bounded ~10s total) -- no fixed sleep.  Every server started
-    through the factory is torn down when the test finishes.
+    daemon thread running its own event loop.  Readiness is polled by a real
+    MCP handshake (``_mcp_handshake_ready``, bounded ~10s total) -- not a bare
+    TCP connect, and no fixed sleep.  Every server started through the factory
+    is torn down when the test finishes.
 
     ``startup_sweep=False`` so pre-seeded queue files are not relocated by the
     startup sweep (the existing test convention in this suite).
@@ -211,7 +232,6 @@ def serve_escalation_mcp():
     """
     import asyncio
     import contextlib
-    import socket
     import threading
     import time
 
@@ -260,22 +280,25 @@ def serve_escalation_mcp():
         thread.start()
         started.append((loop, thread, state, port))
 
-        # Poll for readiness (bounded ~10s) instead of a fixed sleep.
+        # Gate readiness on a real MCP handshake (initialize+ping), not a bare
+        # TCP connect: a successful connect only proves the OS accept queue is
+        # up, not that the FastMCP ASGI app has finished mounting /mcp/. Every
+        # poll implicitly re-probes the TCP layer too (a refused/reset connect
+        # just fails the handshake and retries), so no separate TCP wait is
+        # needed. Bounded ~10s instead of a fixed sleep.
+        base_url = f'http://127.0.0.1:{port}'
         deadline = time.monotonic() + 10.0
         ready = False
         while time.monotonic() < deadline:
-            with contextlib.suppress(OSError), socket.create_connection(
-                ('127.0.0.1', port), timeout=0.2,
-            ):
+            if asyncio.run(_mcp_handshake_ready(base_url)):
                 ready = True
-            if ready:
                 break
             time.sleep(0.05)
         if not ready:
             detail = f' (server thread raised: {serve_error!r})' if serve_error else ''
             raise RuntimeError(
-                f'escalation HTTP test server did not become ready on '
-                f'127.0.0.1:{port} within 10s{detail}'
+                f'escalation HTTP test server did not complete an MCP handshake '
+                f'on 127.0.0.1:{port} within 10s{detail}'
             )
 
         return f'http://127.0.0.1:{port}', port, queue
