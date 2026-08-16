@@ -1164,6 +1164,12 @@ class ReportMergeError(Exception):
     """Two per-arm reports cannot be combined into one slate artifact."""
 
 
+def _arm_ids(report: HealthReport) -> str:
+    """The arms a report speaks for, for a message that must attribute a
+    measurement to one of several inputs."""
+    return ', '.join(sorted(row.arm_id for row in report.arms))
+
+
 def merge_reports(
     reports: Sequence[HealthReport], expected_arm_ids: Sequence[str] | None = None
 ) -> HealthReport:
@@ -1187,10 +1193,49 @@ def merge_reports(
       nothing in this function noticed.  Absence is the one failure a report
       cannot describe, which is exactly why the check belongs here and not only
       in the commit-time gate.
-    * The surviving vram block is the FIRST FAILING one if any input failed, and
-      otherwise the one with the LARGEST arm footprint -- the binding
-      measurement.  Keeping only a passing block while an input failed would put
-      `overall` out of reach of its own evidence.
+    * The surviving vram block is the FIRST FAILING one if any input failed;
+      failing outranks everything because `overall` is computed from the block
+      that survives, so keeping a passing block while an input failed would put
+      `overall` out of reach of its own evidence.  Failing next to POLLUTED
+      would be worse still: a POLLUTED-but-PASS block promoted over a budget
+      FAIL flips a failing slate green.
+    * Otherwise the FIRST POLLUTED one, and only then the LARGEST arm footprint.
+      Pollution ranks above footprint because on a contended card the largest
+      footprint is the least meaningful number in the file, while the polluted
+      input is the one carrying the EVIDENCE -- the consumer lists an operator
+      needs in order to see who else held the card.
+    * A report carrying `pollution == UNMEASURED` does not merge AT ALL.  It is
+      not a measurement, so there is nothing to union it into: a v5-shaped
+      slate assembled partly from runs that never looked at the card is an
+      ASSEMBLY defect, which is exactly what EXIT_MERGE_ERROR means, and it
+      matches the refuse-and-write-nothing stance for a partial slate.  This
+      producer never emits UNMEASURED; the only way in is `--merge` reading a
+      pre-v5 file off disk.  Refusing also avoids inventing an eighth exit code
+      for a state that cannot otherwise exist.  POLLUTED is the opposite case
+      and PROPAGATES instead: it IS a measurement, exit 7 exists to report it,
+      and refusing a 7-arm slate because arm 5 was contended would throw away
+      six good measurements and downgrade a measurement fact into an assembly
+      error.
+
+    POLLUTION IS UNIONED ACROSS EVERY INPUT, not taken from the binding block:
+    POLLUTED if any input is POLLUTED, else CLEAN.  The union is applied with
+    `model_copy` so the merged block stays ONE input's real measurement rather
+    than a Frankenstein of two arms' readings -- this module's standing rule is
+    that a report describes a card that actually existed at one instant.
+
+    That leaves a residual the merged `pollution_reason` has to close: when a
+    FAILING block binds while a DIFFERENT arm was polluted, the block's
+    consumer lists belong to one arm and `pollution` to another, and
+    `render_table` prints the banner from `pollution` while printing the lists
+    from the block.  So each polluted input's reason is prefixed with the arm
+    id(s) it belongs to -- never by splicing one report's consumer lists into
+    another's block.  The prefix is dropped when there is only ONE input, where
+    there is no other arm to disambiguate from and `merge_reports([r])` must be
+    the identity on `r`'s pollution.
+
+    `overall` is deliberately untouched by pollution, matching the single-report
+    case: a polluted run yields verdict PASS / overall PASS / exit 7, and the
+    exit code is what a CI caller reads.
 
     Per-arm footprints survive on each row, so collapsing to one vram block
     loses no measurement.
@@ -1213,6 +1258,20 @@ def merge_reports(
         raise ReportMergeError(
             f'reports were measured on different GPUs {sorted(gpus)}; every '
             'verdict is relative to specific hardware'
+        )
+
+    # BEFORE any assembly: a report that never looked at the card cannot be
+    # combined into one that claims to know who held it.
+    blind = [r for r in reports if r.vram.pollution == lms_vram.PollutionState.UNMEASURED]
+    if blind:
+        raise ReportMergeError(
+            f'report(s) for arms [{"; ".join(_arm_ids(r) for r in blind)}] carry '
+            f'pollution={lms_vram.PollutionState.UNMEASURED.value}: nothing '
+            'recorded who else held the card while they were measured, so their '
+            'VRAM arithmetic cannot be combined into a slate artifact that '
+            'reads as knowing. This producer never emits it, so these were '
+            'written before schema v5 (task 3755). Re-run the arms rather than '
+            'merging a slate that is silent about a question it appears to answer'
         )
 
     rows: list[ArmRow] = []
@@ -1242,10 +1301,33 @@ def merge_reports(
             )
 
     failing = [r for r in reports if r.vram.verdict == 'FAIL']
-    binding = (
-        failing[0] if failing
-        else max(reports, key=lambda r: r.vram.arm_footprint_mib)
-    )
+    polluted = [
+        r for r in reports
+        if r.vram.pollution == lms_vram.PollutionState.POLLUTED
+    ]
+    # failing > polluted > largest footprint. See the docstring: the order is
+    # what keeps `overall` reachable from its own evidence AND still puts the
+    # pollution evidence in front of an operator whenever nothing failed.
+    if failing:
+        binding = failing[0]
+    elif polluted:
+        binding = polluted[0]
+    else:
+        binding = max(reports, key=lambda r: r.vram.arm_footprint_mib)
+
+    if not polluted:
+        merged_pollution = lms_vram.PollutionState.CLEAN
+        merged_reason = ''
+    else:
+        merged_pollution = lms_vram.PollutionState.POLLUTED
+        merged_reason = (
+            # One input: no other arm to disambiguate from, and merging one
+            # report must leave its pollution exactly as it found it.
+            polluted[0].vram.pollution_reason if len(reports) == 1
+            else ' | '.join(
+                f'{_arm_ids(r)}: {r.vram.pollution_reason}' for r in polluted
+            )
+        )
 
     everything_passed = (
         all(row.verdict == 'PASS' for row in rows)
@@ -1256,7 +1338,12 @@ def merge_reports(
         measured_at=max(r.measured_at for r in reports),
         gpu=binding.gpu,
         arms=rows,
-        vram=binding.vram,
+        # The binding block's OWN measurement, with only the unioned pollution
+        # overlaid -- never a splice of two arms' readings.
+        vram=binding.vram.model_copy(update={
+            'pollution': merged_pollution,
+            'pollution_reason': merged_reason,
+        }),
         overall='PASS' if everything_passed else 'FAIL',
     )
 
