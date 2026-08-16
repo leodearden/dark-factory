@@ -84,12 +84,17 @@ targeted reconciliation automatically.
 
 **Legal transitions** (`shared/src/shared/task_transitions.py`; every pair
 is annotated with its call site in code — this is a summary, not the full
-state machine. See `ARCHITECTURE.md` for the complete machine and the
-`WorkflowStateMachine`/`TaskInterceptor` enforcement layers):
+state machine. `task_transitions.py` is the authority; `ARCHITECTURE.md` §3.1
+redraws the complete edge set from it, plus the
+`WorkflowStateMachine`/`TaskInterceptor` enforcement layers.
+`docs/task-escalation-state-spec.md` is the normative specification
+of the task-status × escalation-state graph — which status a task must be in
+while an escalation owns it, and what each recovery sweep must write):
 
 ```
 pending ─dispatch→ in-progress ─merge→ done
 in-progress ─block→ blocked ─re-pend→ pending
+pending ─deterministic-gate(born-at-L2)→ blocked
 in-progress ─park(train)→ merge-deferred → done/blocked/cancelled/pending
 in-progress ─requeue→ pending
 pending → deferred (planning) → pending/done/blocked/cancelled
