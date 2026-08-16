@@ -5,6 +5,7 @@ without sys.path pollution — mirrors the pattern in test_cleanup_count_snapsho
 """
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import logging
 import sys
@@ -40,6 +41,29 @@ def _load_module() -> types.ModuleType:
 
 
 _mod = _load_module()
+
+
+@pytest.fixture(autouse=True)
+def _neutralise_store_mutation_preflight(monkeypatch):
+    """Keep this MOCK-unit suite independent of the REAL ``~/.mem0``.
+
+    ``run(..., apply=True)`` runs a fail-closed capability preflight before it
+    counts or scrolls (task 4127). That probe touches the real filesystem, so
+    without this fixture every ``--apply`` test would pass or fail according to
+    whether the machine running pytest happens to be able to write mem0's
+    history directory -- and it genuinely cannot inside an agent sandbox, which
+    is the whole reason the guard exists. This suite is deliberately MOCK-unit
+    (an AsyncMock service, no live Qdrant), so the environment must not be an
+    input to it.
+
+    ``TestRunApplyStoreMutationPreflight`` re-rigs this per test -- to refuse,
+    to record, or to pass -- so the guard's own behaviour is still pinned
+    explicitly rather than assumed away.
+
+    Deliberately NOT ``raising=False``: if the guard is ever removed from the
+    script this fixture must break loudly rather than silently no-op.
+    """
+    monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
 
 
 # ===========================================================================
@@ -2115,3 +2139,219 @@ class TestResolveTerminalTaskIds:
         assert 'RuntimeError' in caplog.text and 'boom' in caplog.text, (
             f'Expected the traceback text in caplog output, got: {caplog.text!r}'
         )
+
+
+# ===========================================================================
+# Tests: --apply store-mutation preflight
+# ===========================================================================
+
+class TestRunApplyStoreMutationPreflight:
+    """``--apply`` refuses to START when this process cannot write mem0's store.
+
+    Ported from ``test_sweep_toolcall_xml_leak.TestRunApplyStoreMutationPreflight``
+    (task 3686), which is the in-repo precedent for this contract.
+
+    ``delete_orphan_markers`` fans its deletes out through
+    ``asyncio.gather(..., return_exceptions=True)`` and tallies per-record
+    results rather than aborting, so in a write-denied environment it would
+    delete Qdrant points one at a time and record each history-write failure as
+    an individual error -- mem0's ``_delete_memory`` removes the point BEFORE
+    writing its SQLite history, so each of those "errors" is an
+    already-destroyed record. Only a run-wide probe ahead of the counts bounds
+    that.
+    """
+
+    _NEUTRAL_NOW = datetime(2026, 1, 1, tzinfo=UTC)
+
+    def _args(
+        self,
+        apply: bool = True,
+        project_id: str = 'dark_factory',
+        max_age_days: int = 14,
+    ):
+        """Mirror of ``TestRun._args``."""
+        import types as _types
+        return _types.SimpleNamespace(
+            apply=apply, project_id=project_id, max_age_days=max_age_days,
+        )
+
+    def _service(self) -> AsyncMock:
+        """AsyncMock service holding two deletable orphans."""
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = _counts(source=[3, 1], kind=[1, 1])
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[
+            _member('v1'),
+            _orphan('o1'),
+            _orphan('o2'),
+        ])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        return memory_service
+
+    @staticmethod
+    def _deny(monkeypatch):
+        """Rig the preflight to refuse, as it would inside an agent sandbox."""
+        def _raise(*_args, **_kwargs):
+            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
+
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
+
+    @pytest.mark.asyncio
+    async def test_apply_performs_zero_mutations_when_the_store_is_unwritable(
+        self, monkeypatch
+    ):
+        """The whole point: refuse to start rather than half-complete."""
+        self._deny(monkeypatch)
+        memory_service = self._service()
+
+        with pytest.raises(
+            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+        ):
+            await _mod.run(
+                self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+                terminal_task_ids=set(),
+            )
+
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_guard_sits_before_every_backend_read(self, monkeypatch):
+        """It aborts without a single round-trip: three counts (the two before-
+        counts plus the flag_for_stage2 census) and the scroll enumeration are
+        all skipped in an environment that was never going to be allowed to
+        delete."""
+        self._deny(monkeypatch)
+        memory_service = self._service()
+
+        with pytest.raises(_mod.StoreMutationUnavailable):
+            await _mod.run(
+                self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+                terminal_task_ids=set(),
+            )
+
+        memory_service.count_memories_by_metadata.assert_not_awaited()
+        memory_service.get_memories_by_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_dry_run_is_never_gated_on_write_capability(self, monkeypatch):
+        """A read-only run mutates nothing, so it must not require the ability
+        to mutate -- the sweep report stays obtainable from anywhere."""
+        self._deny(monkeypatch)
+        memory_service = self._service()
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+            terminal_task_ids=set(),
+        )
+
+        assert report['dry_run'] is True
+        assert set(report['orphan_ids']) == {'o1', 'o2'}
+        assert report['orphan_count'] == 2
+        memory_service.count_memories_by_metadata.assert_awaited()
+        memory_service.get_memories_by_metadata.assert_awaited()
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_apply_is_unchanged_when_the_preflight_passes(self, monkeypatch):
+        """Happy path: a writable environment sweeps exactly as before."""
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+        memory_service = self._service()
+
+        report = await _mod.run(
+            self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+            terminal_task_ids=set(),
+        )
+
+        assert memory_service.delete_memory.await_count == 2
+        assert report['dry_run'] is False
+        assert report['deleted'] == 2
+        assert 'after' in report
+
+    @pytest.mark.asyncio
+    async def test_the_probe_names_the_operation_being_gated(self, monkeypatch):
+        """The refusal has to be attributable in a log, so the operation string
+        identifies this script and its mutating mode."""
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            _mod, 'assert_store_mutation_allowed', lambda **kw: calls.append(kw)
+        )
+        memory_service = self._service()
+
+        await _mod.run(
+            self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+            terminal_task_ids=set(),
+        )
+
+        assert len(calls) == 1, 'probed ONCE per run, not once per orphan'
+        assert 'sweep_orphan_flag_markers' in calls[0]['operation']
+        assert '--apply' in calls[0]['operation']
+
+    def test_the_refusal_is_loud_and_reaches_mains_fatal_abort_path(
+        self, monkeypatch, caplog
+    ):
+        """Pinned surfacing: ``StoreMutationUnavailable`` subclasses
+        ``RuntimeError``, so it IS caught by ``main``'s blanket
+        ``except Exception``, which logs and returns 2.
+
+        That handler labels it a generic fatal sweep error, which is precisely
+        why the guard site's own ``logger.error`` must carry the fail-closed
+        diagnosis before the raise. Asserted here end-to-end: non-zero, never 0.
+        """
+        self._deny(monkeypatch)
+        memory_service = self._service()
+        monkeypatch.setattr(
+            sys, 'argv', ['sweep_orphan_flag_markers.py', '--apply'],
+        )
+        real_asyncio_run = asyncio.run
+
+        def _drive(coro, *_a, **_kw):
+            coro.close()  # never construct the live MemoryService
+            return real_asyncio_run(
+                _mod.run(
+                    self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+                    terminal_task_ids=set(),
+                )
+            )
+
+        monkeypatch.setattr(_mod.asyncio, 'run', _drive)
+
+        with caplog.at_level(logging.ERROR):
+            exit_code = _mod.main()
+
+        assert exit_code == 2
+        memory_service.delete_memory.assert_not_awaited()
+
+    def test_a_denied_check_predicate_never_reports_a_satisfied_backlog(
+        self, monkeypatch, caplog
+    ):
+        """``--apply --check --max-backlog N`` is a ``before_done.script``
+        predicate mode: its exit code is a deterministic gate's verdict.
+
+        A fail-closed guard that let that gate read as PASSED would be worse
+        than no guard at all -- it would convert "this process may not mutate
+        the store" into "the backlog is within budget". Pin that the refusal
+        wins: exit 2, never the predicate's 0.
+        """
+        self._deny(monkeypatch)
+        memory_service = self._service()
+        monkeypatch.setattr(
+            sys, 'argv',
+            ['sweep_orphan_flag_markers.py', '--apply', '--check', '--max-backlog', '100'],
+        )
+        real_asyncio_run = asyncio.run
+
+        def _drive(coro, *_a, **_kw):
+            coro.close()
+            return real_asyncio_run(
+                _mod.run(
+                    self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+                    terminal_task_ids=set(),
+                )
+            )
+
+        monkeypatch.setattr(_mod.asyncio, 'run', _drive)
+
+        with caplog.at_level(logging.ERROR):
+            exit_code = _mod.main()
+
+        assert exit_code == 2, 'a refused --apply must never satisfy the --check gate'
+        memory_service.delete_memory.assert_not_awaited()
