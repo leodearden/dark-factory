@@ -821,31 +821,51 @@ def test_index_html_cache_buster_floor(index_html_body: str) -> None:
 # would mean shipping a JSX parser to test a grep.
 _PRESENCE_CONTRACTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     (
+        # Line-anchored: the header comment reproduces this statement verbatim
+        # ("Exports: window.DF_MEMORY_EVALS = { MemoryEvalsSection }"), indented
+        # inside the block, so column 0 is what separates the export from the
+        # sentence describing it.
         'window.DF_MEMORY_EVALS export',
-        r'window\.DF_MEMORY_EVALS = \{',
+        r'^window\.DF_MEMORY_EVALS\s*=\s*\{',
         ('window.DF_MEMORY_EVALS = { MemoryEvalsSection };',),
     ),
     (
+        # Anchored to the payload READ, not the bare name. A plain
+        # comment-strip is NOT enough here: `window.DF_MEMORY_EVALS_FMT` and
+        # the export statement both survive it, so deleting the actual
+        # `MEDF.MEMORY_EVALS` read left the old grep green. The alias is
+        # DERIVED (`{alias}`) rather than pinned, so renaming it is a refactor
+        # and deleting the read is a failure.
         'DF_DATA.MEMORY_EVALS payload read',
-        r'MEMORY_EVALS',
+        r'{alias}\s*\.\s*MEMORY_EVALS',
         ('const payload = MEDF.MEMORY_EVALS;',),
     ),
     (
+        # `[:,}]` puts the primitive in an object/destructure position. Prose
+        # names these components in passing ("both Sparkline and StepSpark"),
+        # and a bare alternation is answered by that sentence.
         'charts.jsx primitive is used',
-        r'\b(MESpark|MEStep|METile|MELine|Sparkline|StepSpark|StatTile|LineChart)\b',
+        r'\b(MESpark|MEStep|METile|MELine|Sparkline|StepSpark|StatTile|LineChart)\b\s*[:,}]',
         (
             'Sparkline: MESpark, StepSpark: MEStep',
             'ME_CHART_BY_TAG = { step: MEStep, spark: MESpark }',
         ),
     ),
     (
+        # Anchored to the GATE. `\btruncated\b` also matches the operator-facing
+        # "(truncated)" label in the disclosure's own text, so deleting the flag
+        # that gates the disclosure left the grep matching the words inside it.
         'eval-level truncation disclosure',
-        r'\btruncated\b',
+        r'ev\.truncated\s*&&',
         ('{ev.truncated && (',),
     ),
     (
+        # `localStorage` is real code in this file (the persisted open-state
+        # helpers), so the old alternation stayed green with `<details` deleted
+        # — it was answered by a different feature entirely. `\s` spans the
+        # newline before `open={provOpen}`.
         'provenance is collapsed by default',
-        r'<details|useOpenSet|usePersistedState|localStorage',
+        r'<details\s+open=',
         ('<details',),
     ),
 )
@@ -879,6 +899,22 @@ def _resolved_pattern(pattern: str, code: str) -> str:
         'aliasing DF_DATA, re-derive the anchor rather than pinning a spelling.'
     )
     return pattern.replace('{alias}', re.escape(match.group(1)))
+
+
+def _presence_pattern(label: str, code: str) -> str:
+    """The `_PRESENCE_CONTRACTS` pattern for *label*, alias-resolved.
+
+    The live assertions call this rather than restating their own regex, so a
+    pattern hardened in the table is hardened at the assertion too — the guard
+    and the thing it guards cannot drift apart.
+    """
+    for entry_label, pattern, _deletions in _PRESENCE_CONTRACTS:
+        if entry_label == label:
+            return _resolved_pattern(pattern, code)
+    raise AssertionError(
+        f'no _PRESENCE_CONTRACTS entry labelled {label!r} — an assertion is reaching '
+        'for a contract that does not exist, so nothing mutation-tests it.'
+    )
 
 
 def test_presence_greps_are_falsified_by_deleting_the_code(
@@ -955,9 +991,19 @@ def test_presence_greps_are_falsified_by_deleting_the_code(
 # ---------------------------------------------------------------------------
 
 
-def test_tab_memory_evals_jsx_served_and_exports_section(_client) -> None:
+def test_tab_memory_evals_jsx_served_and_exports_section(
+    _client,
+    tab_memory_evals_jsx_code: str,
+) -> None:
     """The section file must be served and export MemoryEvalsSection on its
     own window global, following the scheduler_heatmap.jsx:191 producer idiom.
+
+    The export greps read the COMMENT-STRIPPED view of the same served file the
+    `_client` fetch returns (the fixture is that fetch).  The header comment
+    reproduces the export statement verbatim — "Exports:
+    window.DF_MEMORY_EVALS = { MemoryEvalsSection }" — so both assertions below
+    were satisfied by prose alone: deleting the real export at the file tail
+    left this test green while every tab blanked in the browser.
     """
     resp = _client.get('/static/redux/tab_memory_evals.jsx')
     assert resp.status_code == 200, (
@@ -965,14 +1011,16 @@ def test_tab_memory_evals_jsx_served_and_exports_section(_client) -> None:
         f'{resp.status_code} — index.html already references the file '
         '(step-4), so a missing file is a hard 404 in the browser.'
     )
-    body = resp.text
-    assert 'window.DF_MEMORY_EVALS = {' in body, (
+    code = tab_memory_evals_jsx_code
+    assert re.search(
+        _presence_pattern('window.DF_MEMORY_EVALS export', code), code, re.MULTILINE
+    ), (
         'tab_memory_evals.jsx must set `window.DF_MEMORY_EVALS = { ... }` at '
         'the file tail (the scheduler_heatmap.jsx:191 precedent) — that global '
         'is what tabs.jsx destructures at module top level.'
     )
     assert re.search(
-        r'window\.DF_MEMORY_EVALS\s*=\s*\{[^}]*\bMemoryEvalsSection\b', body
+        r'^window\.DF_MEMORY_EVALS\s*=\s*\{[^}]*\bMemoryEvalsSection\b', code, re.MULTILINE
     ), (
         'window.DF_MEMORY_EVALS must export MemoryEvalsSection — tabs.jsx '
         'renders it inside MemoryTab.'
@@ -1029,8 +1077,13 @@ def test_tab_memory_evals_renders_eval_cards_and_trends(
     assert 'window.DF_DATA' in body, (
         'tab_memory_evals.jsx must read window.DF_DATA.'
     )
-    assert 'MEMORY_EVALS' in body, (
-        'tab_memory_evals.jsx must read the MEMORY_EVALS key of DF_DATA.'
+    assert re.search(
+        _presence_pattern('DF_DATA.MEMORY_EVALS payload read', code), code, re.MULTILINE
+    ), (
+        'tab_memory_evals.jsx must read the MEMORY_EVALS key of DF_DATA. '
+        'Anchored to the payload-access expression on the file\'s own DF_DATA '
+        'alias: a bare `MEMORY_EVALS` grep is answered by `DF_MEMORY_EVALS_FMT` '
+        'and by the export statement, so it stayed green with the read deleted.'
     )
     assert re.search(r'\.evals\b', body), (
         'tab_memory_evals.jsx must render the payload\'s `evals` list.'
@@ -1081,9 +1134,12 @@ def test_tab_memory_evals_renders_eval_cards_and_trends(
         )
 
     # (g) charts.jsx primitives only — no new chart library
-    assert re.search(r'\b(MESpark|MEStep|METile|MELine|Sparkline|StepSpark|StatTile|LineChart)\b', body), (
+    assert re.search(
+        _presence_pattern('charts.jsx primitive is used', code), code, re.MULTILINE
+    ), (
         'the section must use at least one charts.jsx primitive '
-        '(Sparkline / StepSpark / StatTile / LineChart).'
+        '(Sparkline / StepSpark / StatTile / LineChart) — in an object or '
+        'destructure position, not merely named in a comment.'
     )
     # Run over the comment-stripped `code`, not `body`: a comment that merely
     # NAMES a library ("deliberately not d3") is prose, not a dependency, and
@@ -1107,8 +1163,13 @@ def test_tab_memory_evals_renders_eval_cards_and_trends(
     #     was two assertions about one fact.
 
     # (i) the truncation disclosure names both counts
-    assert re.search(r'\btruncated\b', body), (
-        "the eval-level `truncated` flag must gate a visible disclosure."
+    assert re.search(
+        _presence_pattern('eval-level truncation disclosure', code), code, re.MULTILINE
+    ), (
+        'the eval-level `truncated` flag must GATE a visible disclosure. '
+        'Anchored to the gate expression: a bare `truncated` grep is answered by '
+        'the operator-facing "(truncated)" label inside the disclosure itself, so '
+        'it survived deleting the very flag that decides whether it renders.'
     )
     assert re.search(r'\bev\.run_count\b', code) and re.search(
         r'\bev\.runs_on_disk\b', code
@@ -2157,14 +2218,17 @@ _LIMITS_KEYS = (
 
 
 def test_limits_provenance_rendered(
-    tab_memory_evals_jsx_body: str,
     tab_memory_evals_jsx_code: str,
     memory_evals_fmt_js_code: str,
 ) -> None:
     """Every limits-provenance key must be rendered, the staleness of the
     provenance itself must be disclosed, and a null limits artifact must say so.
+
+    Reads comment-stripped source only.  The raw body fixture is deliberately
+    NOT requested any more: the collapsed-by-default grep below was its last
+    consumer, and leaving it in scope invites the next assertion to reach for
+    it and re-open the false pass this test was just cleaned of.
     """
-    body = tab_memory_evals_jsx_body
     code = tab_memory_evals_jsx_code
 
     # Anchored to `lim.<key>` in comment-stripped source: the provenance keys
@@ -2212,10 +2276,22 @@ def test_limits_provenance_rendered(
     )
 
     # Compact / expandable so provenance does not dominate the card.
-    assert re.search(r'<details|useOpenSet|usePersistedState|localStorage', body), (
-        'the provenance block must be collapsed-by-default and expandable '
-        '(a <details> element or a persisted open-state key), so it does not '
-        'dominate the eval card.'
+    #
+    # Narrowed to the <details> element carrying an `open=` attribute. The old
+    # alternation also accepted `localStorage`, which is real code in this file
+    # for the persisted open-state helpers — so it stayed green with `<details`
+    # deleted, answered by a different feature entirely.
+    #
+    # It deliberately does NOT re-assert what the open state is BOUND to:
+    # `test_limits_provenance_open_state_is_per_eval` already pins that
+    # expression (`<details\s[^>]*open=\{(\w+)\}`) and follows it through to the
+    # per-eval key. Two assertions about one fact is how they drift.
+    assert re.search(
+        _presence_pattern('provenance is collapsed by default', code), code, re.MULTILINE
+    ), (
+        'the provenance block must be collapsed-by-default and expandable — a '
+        '<details> element with an `open=` attribute — so it does not dominate '
+        'the eval card.'
     )
 
     # Local re-assertion of the step-7 guard: alpha and min_samples appear only
