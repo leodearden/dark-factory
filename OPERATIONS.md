@@ -1329,7 +1329,7 @@ is the exact ambiguity this instrument exists to resolve.
 
 | File | Role |
 |---|---|
-| `scripts/memory-metadata-coverage-census.sh` | Wrapper: census, then rehearse |
+| `scripts/memory-metadata-coverage-census.sh` | Wrapper: census, rehearse, then commit |
 | `scripts/memory-metadata-coverage-census.service` | `Type=oneshot` around the wrapper |
 | `scripts/memory-metadata-coverage-census.timer` | `OnCalendar=*-*-* 05:00:00` |
 | `scripts/install-memory-metadata-coverage-census-timer.sh` | Installer |
@@ -1362,12 +1362,30 @@ regeneration diffs as content drift and never as a rendering-width change.
 For an **ad-hoc look that must not enter the trend**, add `--no-history`:
 the committed series belongs to the nightly run.
 
+**The job commits its own artifacts.** All three land in the `project_root`
+checkout — the census resolves them from its own `__file__`, so they go
+there regardless of cwd — and that checkout is machine-operated (the merge
+worker, the startup reconciler and git hooks act on it directly). Leaving
+them dirty every morning would not be untidiness but **data loss**: the
+history file is append-only and *is* the trend, so an uncommitted append
+that the merge worker's advance path resets away takes that night's row with
+it, permanently and with no error anywhere. The wrapper therefore closes
+with a scoped `git commit --only <the three paths>` — never a bare `git
+commit` (it would sweep up a concurrent process's staged work), never `git
+add -A`, never `git stash`. Same seam the 03:00 legibility job already uses
+for `docs/legibility/census-state.json`.
+
+Like both other steps it is **best-effort**: a failed commit is narrated and
+never propagated, and a night whose corpus did not drift is a no-op rather
+than a failure. For an ad-hoc run that must leave the checkout alone, set
+`CENSUS_COMMIT=0` (pairs with the census's own `--no-history`).
+
 **Reading the output.** Every line is prefixed
 `memory-metadata-coverage-census:` and the run ends with one summary line
-carrying both halves' exit codes:
+carrying all three steps' exit codes:
 
 ```
-memory-metadata-coverage-census: done (census=0 stamp=0)
+memory-metadata-coverage-census: done (census=0 stamp=0 commit=0)
 ```
 
 ```bash
@@ -1382,7 +1400,9 @@ artifacts are written anyway and carry the evidence of exactly which cell
 fell short. The wrapper always exits 0 for the reason the whole §12 family
 shares: a recurring `oneshot` that can fail enters systemd `failed` state
 and stays there, silently ending the trend. A red run is found by reading
-the summary line, not the unit state.
+the summary line, not the unit state — and a `commit=` other than 0 is the
+one worth acting on, since it means the regenerated artifacts are sitting
+uncommitted in a checkout other processes operate on.
 
 **The rehearsal is never `--apply`.** Committing bulk `canonical: true`
 stamps stays an operator decision, run by hand after reading the rehearsal:

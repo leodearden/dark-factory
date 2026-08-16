@@ -633,13 +633,22 @@ def test_wrapper_never_reaches_for_the_forbidden_git_verbs():
     """`git stash` is banned in EVERY dark-factory checkout: refs/stash is a
     single ref shared across all worktrees and the merge worker's advance path
     also consumes it (incident 13674d3c68). `git add -A`/`git checkout` in the
-    main checkout would likewise act on another process's state."""
+    main checkout would likewise act on another process's state.
+
+    Scanned over EXECUTABLE lines only, with comments stripped: the header
+    documents precisely which verbs are forbidden and why, and a check that
+    could not tell prose from code would forbid explaining itself.
+    """
     text = WRAPPER.read_text()
-    assert 'commit --only' in text, (
+    code = '\n'.join(
+        line for line in text.splitlines()
+        if not line.lstrip().startswith('#')
+    )
+    assert 'commit --only' in code, (
         'the scoped-commit form is the whole point; a bare `git commit` would '
         'sweep up a concurrent process staged work')
     for forbidden in ('git stash', 'git add -A', 'git add .', 'git checkout',
                       'git reset', 'commit -a'):
-        assert forbidden not in text, (
+        assert forbidden not in code, (
             f'{forbidden!r} must never appear in a wrapper that runs '
             f'unattended against the machine-operated main checkout')
