@@ -176,6 +176,10 @@ from functools import partial
 from typing import Any
 
 from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
+from fused_memory.utils.store_mutation_preflight import (
+    StoreMutationUnavailable,
+    assert_store_mutation_allowed,
+)
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -636,6 +640,50 @@ async def run(
     terminal_ids: set[str] = terminal_task_ids if terminal_task_ids else set()
     max_age_days: int = getattr(args, 'max_age_days', 14)
     delete_ids: set[str] = set(getattr(args, 'delete_ids', None) or [])
+
+    # Fail-CLOSED capability preflight, one probe per run, BEFORE every read.
+    #
+    # This slot precedes all four backend round-trips -- the two before-counts,
+    # the flag_for_stage2 census probe, and the scroll enumeration -- so a
+    # doomed --apply costs nothing.
+    #
+    # Guarding inside ``delete_orphan_markers`` (before its gather) would be
+    # too late: that gather uses ``return_exceptions=True`` and tallies
+    # per-record results, so in a write-denied environment it would delete
+    # Qdrant points one at a time and record each history-write failure as an
+    # individual error rather than aborting the run. mem0's ``_delete_memory``
+    # removes the point BEFORE writing its SQLite history, so every one of
+    # those "errors" is an already-destroyed record. A per-record probe detects
+    # a run-wide condition one destroyed record too late.
+    #
+    # The refusal reaches ``main``'s blanket ``except Exception``
+    # (StoreMutationUnavailable subclasses RuntimeError), which logs and
+    # returns 2. That is loud and non-zero, but the generic handler will label
+    # it a fatal sweep error -- which is exactly why the ``logger.error`` below
+    # must carry the fail-closed diagnosis (what was refused, that nothing was
+    # scanned or mutated, and the remedy) BEFORE the raise. This also holds
+    # under the ``--apply --check --max-backlog N`` predicate mode: a refused
+    # run exits 2, so it can never be mistaken for a satisfied backlog gate.
+    #
+    # Gated on ``args.apply`` (there is no ``dry_run`` local -- the report
+    # builds ``'dry_run': not args.apply`` inline) so a read-only run stays
+    # pure-read and needs no write capability at all.
+    if args.apply:
+        try:
+            assert_store_mutation_allowed(operation='sweep_orphan_flag_markers --apply')
+        except StoreMutationUnavailable:
+            logger.error(
+                'sweep_orphan_flag_markers: --apply NOT started (fail-closed) -- '
+                "this process cannot write mem0's history directory, so deleting a "
+                'marker would remove its Qdrant point and then fail to write the '
+                'history, destroying records that survive nowhere but this log. '
+                'Nothing was scanned and nothing was mutated, and no backlog '
+                'predicate was evaluated. Route the sweep through the fused-memory '
+                'MCP server (the unsandboxed owner of the store), or re-run from an '
+                'unsandboxed operator shell. To obtain the sweep report safely from '
+                'anywhere, re-run without --apply.'
+            )
+            raise
 
     # --- Before counts (deterministic Qdrant payload-filter, not semantic) ---
     source_filter = {'source': MARKER_SOURCE}
