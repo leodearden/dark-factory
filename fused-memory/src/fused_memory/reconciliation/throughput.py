@@ -39,9 +39,15 @@ in ``event_buffer.cleanup_drained`` route through it.
 
 from __future__ import annotations
 
+import sqlite3
+from collections import Counter
 from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
 
 __all__ = [
+    'inflow_daily',
+    'inflow_hourly',
     'utc_hour_bucket',
 ]
 
@@ -69,3 +75,166 @@ def utc_hour_bucket(ts: str) -> str:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC).strftime('%Y-%m-%dT%H')
+
+
+def _connect_ro(db_path: str | Path) -> sqlite3.Connection:
+    """Open the reconciliation DB read-only.
+
+    The report is meant to run out-of-process against a live production
+    database, so it must never be able to write.  ``mode=ro`` enforces that at
+    the SQLite level rather than by convention.
+
+    Raises:
+        FileNotFoundError: If ``db_path`` does not exist.  SQLite's own error
+            for a missing read-only file ('unable to open database file') is
+            indistinguishable from a permissions problem, so the check is
+            explicit — the CLI turns this into a clear message rather than a
+            traceback.
+    """
+    path = Path(db_path)
+    if not path.exists():
+        raise FileNotFoundError(f'reconciliation database not found: {path}')
+    conn = sqlite3.connect(f'file:{path}?mode=ro', uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    """True if ``table`` is present.
+
+    A DB written by an older build has no ``event_arrival_hourly``, and one
+    that has never run reconciliation has no ``runs``.  Readers degrade to
+    'no rows from that source' rather than raising, so a partially-populated
+    production DB still yields a report.
+    """
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
+def _normalise_since(since: str | None) -> str | None:
+    """Normalise a ``since`` argument to an hour-bucket key.
+
+    Accepts either an hour bucket ('2026-07-25T14') or a full ISO8601
+    timestamp, with or without an offset.  Both route through
+    ``utc_hour_bucket``, so an offset-bearing value is CONVERTED to UTC rather
+    than lexically compared — the METHOD NOTE trap, again.
+    """
+    if since is None:
+        return None
+    return utc_hour_bucket(since)
+
+
+def _arrival_counts(
+    db_path: str | Path,
+    project_id: str,
+    since: str | None = None,
+) -> Counter[tuple[str, str]]:
+    """Per-(hour_bucket, event_type) arrival counts for one project.
+
+    The UNION of two sources that partition the event set exactly:
+
+    * ``event_arrival_hourly`` — events already swept out of the buffer by
+      ``cleanup_drained``, which rolled them up in the same transaction as the
+      DELETE;
+    * ``event_buffer`` — every row still live, of ANY status ('buffered' and
+      'drained' alike), because a drained row that has not yet aged past
+      ``max_age_seconds`` is still an arrival that has not been rolled up.
+
+    Those two sets are disjoint and exhaustive by construction, so summing
+    them double-counts nothing and loses nothing.
+    """
+    floor = _normalise_since(since)
+    counts: Counter[tuple[str, str]] = Counter()
+
+    conn = _connect_ro(db_path)
+    try:
+        if _table_exists(conn, 'event_arrival_hourly'):
+            for row in conn.execute(
+                """SELECT hour_bucket, event_type, event_count
+                   FROM event_arrival_hourly WHERE project_id = ?""",
+                (project_id,),
+            ):
+                if floor is not None and row['hour_bucket'] < floor:
+                    continue
+                counts[(row['hour_bucket'], row['event_type'])] += row['event_count']
+
+        if _table_exists(conn, 'event_buffer'):
+            for row in conn.execute(
+                'SELECT timestamp, event_type FROM event_buffer WHERE project_id = ?',
+                (project_id,),
+            ):
+                # Bucket in Python.  Never filter these by a SQL comparison
+                # against a datetime('now') literal — see the METHOD NOTE.
+                bucket = utc_hour_bucket(row['timestamp'])
+                if floor is not None and bucket < floor:
+                    continue
+                counts[(bucket, row['event_type'])] += 1
+    finally:
+        conn.close()
+
+    return counts
+
+
+def inflow_hourly(
+    db_path: str | Path,
+    project_id: str,
+    since: str | None = None,
+) -> dict[str, int]:
+    """Per-hour event arrival counts for one project, oldest hour first.
+
+    Args:
+        db_path: Path to reconciliation.db (opened read-only).
+        project_id: Project to report on.
+        since: Optional inclusive floor — an hour bucket or an ISO8601
+            timestamp; normalised to a bucket key before comparison.
+
+    Returns:
+        ``{hour_bucket: event_count}``, insertion-ordered chronologically.
+        Hour-bucket keys sort lexicographically in true chronological order,
+        so the ordering is exact rather than approximate.
+    """
+    counts = _arrival_counts(db_path, project_id, since)
+    hourly: Counter[str] = Counter()
+    for (bucket, _event_type), n in counts.items():
+        hourly[bucket] += n
+    return {bucket: hourly[bucket] for bucket in sorted(hourly)}
+
+
+def inflow_daily(
+    db_path: str | Path,
+    project_id: str,
+    since: str | None = None,
+) -> dict[str, Any]:
+    """Per-day arrival totals plus the per-event_type composition.
+
+    Args:
+        db_path: Path to reconciliation.db (opened read-only).
+        project_id: Project to report on.
+        since: Optional inclusive floor (see :func:`inflow_hourly`).
+
+    Returns:
+        ``{'daily': {'YYYY-MM-DD': int}, 'composition': {event_type: int},
+        'total_events': int}``.  The composition map is the evidence needed to
+        size lever 3 (coalescing redundant task_status_changed / task_modified
+        events for one task id) — it says how much of the inflow is actually
+        those two types.
+    """
+    counts = _arrival_counts(db_path, project_id, since)
+
+    daily: Counter[str] = Counter()
+    composition: Counter[str] = Counter()
+    for (bucket, event_type), n in counts.items():
+        daily[bucket[:10]] += n  # 'YYYY-MM-DDTHH' -> 'YYYY-MM-DD'
+        composition[event_type] += n
+
+    return {
+        'daily': {day: daily[day] for day in sorted(daily)},
+        'composition': {
+            etype: composition[etype]
+            for etype in sorted(composition, key=lambda e: (-composition[e], e))
+        },
+        'total_events': sum(daily.values()),
+    }

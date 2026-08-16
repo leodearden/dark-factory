@@ -8,11 +8,11 @@ remediation duty cycle, and the pure capacity arithmetic.
 
 from __future__ import annotations
 
-import pytest
-import pytest_asyncio  # noqa: F401  — strict-mode async fixtures land here in later steps
-
 import uuid
 from datetime import UTC, datetime
+
+import pytest
+import pytest_asyncio  # noqa: F401  — strict-mode async fixtures land here in later steps
 
 from fused_memory.models.reconciliation import (
     EventSource,
