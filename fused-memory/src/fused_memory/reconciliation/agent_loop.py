@@ -420,6 +420,13 @@ class AgentLoop:
                 # Both kwargs survive every cap-retry resume: _reset_for_fresh_retry
                 # touches only resume_session_id/prompt/session_id, and the `if
                 # mcp_config:` argv block sits outside the resume conditional.
+                # Confirmed by reading shared/cli_invoke.py, but NOT independently
+                # pinned by a resume-path test at that layer — a future refactor
+                # that moved the mcp_config handling into build_claude_argv's
+                # `elif session_id:` branch would silently reopen this for every
+                # turn >= 2 with a green suite here. Tracked as a follow-up test
+                # in shared/tests/test_build_claude_argv.py (out of this task's
+                # locked-module scope).
                 cwd=Path(self.config.explore_codebase_root),
                 cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
             )
