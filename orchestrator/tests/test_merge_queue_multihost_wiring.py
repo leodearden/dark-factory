@@ -16,7 +16,7 @@ Covers:
 
 import asyncio
 import logging
-from typing import cast
+from typing import TypeGuard, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -3799,6 +3799,7 @@ class TestQuarantineUnreachableHostChokepoint:
         """Because the set is shared by reference, acquire_remote skips it at once."""
         worker, _eq = self._real_allocator_worker(remotes=('leo-laptop', 'spare'))
         worker._quarantine_unreachable_host('leo-laptop', 'ssh timeout', 1000.0)
+        assert worker._host_allocator is not None
         lease = worker._host_allocator.acquire_remote()
         assert lease is not None and lease.name == 'spare'
 
@@ -4532,7 +4533,7 @@ def _cancel_release_offenders(source: str) -> list[str]:
             cur = parent.get(id(cur))
         return getattr(cur, 'name', '<module>')
 
-    def _is_call(node) -> bool:
+    def _is_call(node) -> TypeGuard[ast.Call]:
         return (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
@@ -4661,6 +4662,7 @@ class TestParkedStrandRecordedFromRealCallSites:
             chain_failed=True,
             cancel_lease=True,
         )
+        assert entry.verify_task is not None
         await entry.verify_task
 
         assert alloc.is_parked('leo-laptop') is True
@@ -4679,6 +4681,7 @@ class TestParkedStrandRecordedFromRealCallSites:
             MergeOutcome('blocked', reason='dispatch error'),
             chain_failed=True,
         )
+        assert entry.verify_task is not None
         await entry.verify_task
 
         assert worker._runner_unavailable == {}
@@ -4709,6 +4712,7 @@ class TestParkedStrandRecordedFromRealCallSites:
 
         worker, _eq, alloc, _runner = _make_parking_worker()
         seed = _make_ru_entry(worker, 'leo-laptop')
+        assert seed.verify_task is not None
         await seed.verify_task            # retire the seeded RU task
         lease = alloc.acquire_remote()
         assert lease is not None
