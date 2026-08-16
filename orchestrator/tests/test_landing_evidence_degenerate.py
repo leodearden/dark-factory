@@ -91,6 +91,15 @@ _CASE_IDS = [c[0] for c in _DEGENERATE_CASES]
 
 
 def _stub_git_ops(tip: str | None) -> types.SimpleNamespace:
+    """A git_ops stand-in exposing ONLY ``resolve_branch_sha``.
+
+    Deliberately a ``SimpleNamespace`` rather than a ``MagicMock``: the
+    predicate must touch nothing else on git_ops, and any stray attribute
+    access here raises AttributeError instead of silently returning a truthy
+    auto-mock.  ``branch_is_degenerate`` duck-types its ``git_ops`` parameter
+    (see the landing_evidence module docstring), so call sites below carry
+    ``# type: ignore[arg-type]`` for the nominal ``GitOps`` annotation.
+    """
     return types.SimpleNamespace(resolve_branch_sha=AsyncMock(return_value=tip))
 
 
@@ -111,7 +120,7 @@ async def test_branch_is_degenerate(
     """
     git_ops = _stub_git_ops(tip)
 
-    result = await branch_is_degenerate(git_ops, 'task/999', metadata)
+    result = await branch_is_degenerate(git_ops, 'task/999', metadata)  # type: ignore[arg-type]
 
     assert result is expected
     if git_called:
@@ -144,9 +153,9 @@ async def test_harness_method_matches_extracted_function(
     fn_git = _stub_git_ops(tip)
 
     method_result = await Harness._branch_is_degenerate(
-        types.SimpleNamespace(git_ops=method_git), 'task/999', metadata,
+        types.SimpleNamespace(git_ops=method_git), 'task/999', metadata,  # type: ignore[arg-type]
     )
-    fn_result = await branch_is_degenerate(fn_git, 'task/999', metadata)
+    fn_result = await branch_is_degenerate(fn_git, 'task/999', metadata)  # type: ignore[arg-type]
 
     assert method_result == fn_result
     assert method_result is expected

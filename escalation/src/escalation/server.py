@@ -2596,7 +2596,12 @@ def create_server(
                                 branch_tip_sha=tip,
                                 pattern_template=pattern,
                             )
-                            if verdict.accepted:
+                            # `accepted` implies a non-None evidence_sha (see
+                            # LandingEvidenceVerdict), but assert it explicitly:
+                            # _found_on_main_response's merge_sha is a hard `str`,
+                            # and a contract violation must degrade to Tier-4
+                            # unknown rather than emit a `done` with a null sha.
+                            if verdict.accepted and verdict.evidence_sha is not None:
                                 return _found_on_main_response(
                                     request_id, verdict.evidence_sha,
                                 )
@@ -2635,7 +2640,10 @@ def create_server(
                                     branch_tip_sha=None,
                                     candidate_sha=marker,
                                 )
-                                if verdict.accepted:
+                                # Same non-None assertion as the ancestor arm
+                                # above: reject a null evidence sha into Tier-4
+                                # unknown rather than into a `done` response.
+                                if verdict.accepted and verdict.evidence_sha is not None:
                                     return _found_on_main_response(
                                         request_id, verdict.evidence_sha,
                                     )
