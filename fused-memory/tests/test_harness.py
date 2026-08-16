@@ -16655,6 +16655,8 @@ async def _persist_parent_run(journal, project_id: str, findings: list[dict]):
     run marked completed) BEFORE _maybe_remediate is ever called, which is what
     makes a deferral lossless.
     """
+    from fused_memory.models.reconciliation import StageId
+
     run = ReconciliationRun(
         id=f'run-{uuid.uuid4().hex[:8]}',
         project_id=project_id,
@@ -16666,7 +16668,7 @@ async def _persist_parent_run(journal, project_id: str, findings: list[dict]):
     )
     await journal.start_run(run)
     s3_report = StageReport(
-        stage='integrity_check',
+        stage=StageId.integrity_check,
         started_at=datetime.now(UTC),
         completed_at=datetime.now(UTC),
         items_flagged=findings,
@@ -16682,13 +16684,19 @@ async def _persist_parent_run(journal, project_id: str, findings: list[dict]):
 
 
 def _remediation_harness(journal, event_buffer, mock_memory_service, *, buffer_size: int):
-    """Harness with a deterministic backlog threshold and a mocked remediation pass."""
+    """Harness with a deterministic backlog threshold and a mocked remediation pass.
+
+    Returns the (harness, remediation_mock) pair — like _stage_run_mock, the
+    AsyncMock itself is handed back so callers can assert_not_awaited /
+    read await_count on it directly.
+    """
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     harness.config.buffer_size_threshold = 10
     harness.config.opus_threshold_ratio = 1.5  # threshold = 15
     harness.buffer.get_buffer_stats = AsyncMock(return_value={'size': buffer_size})
-    harness._run_remediation_pass = AsyncMock()
-    return harness
+    remediation = AsyncMock()
+    harness._run_remediation_pass = remediation
+    return harness, remediation
 
 
 async def _call_maybe_remediate(harness, parent_run, project_id: str = 'test-project'):
@@ -16718,7 +16726,7 @@ async def test_maybe_remediate_defers_while_the_buffer_is_in_backlog_mode(
     project, the parent run, how many findings were held back, the buffer size
     that caused the deferral, and how many consecutive cycles have now deferred.
     """
-    harness = _remediation_harness(
+    harness, remediation = _remediation_harness(
         journal, event_buffer, mock_memory_service, buffer_size=393,
     )
     findings = [_make_s3_findings()[0], _make_s3_findings()[1]]
@@ -16727,7 +16735,7 @@ async def test_maybe_remediate_defers_while_the_buffer_is_in_backlog_mode(
     with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
         await _call_maybe_remediate(harness, parent_run)
 
-    harness._run_remediation_pass.assert_not_awaited()
+    remediation.assert_not_awaited()
 
     # The deferral must not have been produced by the method's own except-branch
     # swallowing an error — that would look identical from the outside.
@@ -16758,7 +16766,7 @@ async def test_maybe_remediate_runs_and_resets_the_counter_below_the_threshold(
     the backlog_final_consolidation pass, which runs against a drained buffer)
     remediation resumes on its own with no extra bookkeeping.
     """
-    harness = _remediation_harness(
+    harness, remediation = _remediation_harness(
         journal, event_buffer, mock_memory_service, buffer_size=393,
     )
     findings = [_make_s3_findings()[0]]
@@ -16772,7 +16780,7 @@ async def test_maybe_remediate_runs_and_resets_the_counter_below_the_threshold(
     with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
         await _call_maybe_remediate(harness, parent_run)
 
-    assert harness._run_remediation_pass.await_count == 1
+    assert remediation.await_count == 1
     assert harness._remediation_deferrals.get('test-project', 0) == 0
     assert _defer_records(caplog) == []
 
@@ -16782,7 +16790,7 @@ async def test_maybe_remediate_never_defers_when_the_knob_is_zero(
     journal, event_buffer, mock_memory_service, caplog,
 ):
     """(c) max_backlog_remediation_deferrals = 0 restores exact pre-3049 behaviour."""
-    harness = _remediation_harness(
+    harness, remediation = _remediation_harness(
         journal, event_buffer, mock_memory_service, buffer_size=5000,
     )
     harness.config.max_backlog_remediation_deferrals = 0
@@ -16792,7 +16800,7 @@ async def test_maybe_remediate_never_defers_when_the_knob_is_zero(
         for _ in range(3):
             await _call_maybe_remediate(harness, parent_run)
 
-    assert harness._run_remediation_pass.await_count == 3
+    assert remediation.await_count == 3
     assert _defer_records(caplog) == []
 
 
@@ -16805,7 +16813,7 @@ async def test_maybe_remediate_deferral_debt_is_bounded(
     The buffer stays deep throughout, so only the bound can end the deferral
     streak — a permanently backlogged project must not starve remediation.
     """
-    harness = _remediation_harness(
+    harness, remediation = _remediation_harness(
         journal, event_buffer, mock_memory_service, buffer_size=900,
     )
     harness.config.max_backlog_remediation_deferrals = 2
@@ -16814,13 +16822,13 @@ async def test_maybe_remediate_deferral_debt_is_bounded(
     with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
         await _call_maybe_remediate(harness, parent_run)
         await _call_maybe_remediate(harness, parent_run)
-        deferred_after_two = harness._run_remediation_pass.await_count
+        deferred_after_two = remediation.await_count
         await _call_maybe_remediate(harness, parent_run)
 
     assert deferred_after_two == 0, 'The first two cycles must defer'
     assert len(_defer_records(caplog)) == 2
     assert [getattr(r, 'consecutive_deferrals', None) for r in _defer_records(caplog)] == [1, 2]
-    assert harness._run_remediation_pass.await_count == 1, (
+    assert remediation.await_count == 1, (
         'The cycle after the bound is reached must remediate despite the deep buffer'
     )
     assert harness._remediation_deferrals.get('test-project', 0) == 0
@@ -16835,14 +16843,14 @@ async def test_maybe_remediate_deferral_leaves_the_findings_forward_feedable(
     _get_prior_s3_findings reads them straight back off the persisted parent
     run, which is the mechanism that makes deferring safe rather than dropping.
     """
-    harness = _remediation_harness(
+    harness, remediation = _remediation_harness(
         journal, event_buffer, mock_memory_service, buffer_size=393,
     )
     findings = [_make_s3_findings()[0], _make_s3_findings()[1]]
     parent_run = await _persist_parent_run(journal, 'test-project', findings)
 
     await _call_maybe_remediate(harness, parent_run)
-    harness._run_remediation_pass.assert_not_awaited()
+    remediation.assert_not_awaited()
 
     persisted = await journal.get_run(parent_run.id)
     assert persisted is not None
