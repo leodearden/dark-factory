@@ -95,6 +95,13 @@ _CONSUMER_EVIDENCE_KEYS = (
     'pollution', 'pollution_reason',
 )
 
+#: The two branches `test_the_committed_artifact_accounts_for_who_else_held_
+#: the_card` can take.  Named so the test can assert that one of them actually
+#: RAN: a dispatch whose arms are both silently skippable is how five
+#: substantive assertions became dead code behind a `pytest.skip`.
+_BRANCH_MEASURED = 'v5+: inventory measured and checked'
+_BRANCH_GRANDFATHERED = 'v4: no inventory, and none may be smuggled in'
+
 
 @pytest.fixture(scope='module')
 def raw_artifact() -> dict:
@@ -175,77 +182,102 @@ def test_the_accepted_set_expires_at_the_next_schema_bump() -> None:
     )
 
 
-def test_a_current_artifact_proves_nobody_else_held_the_card(
+def test_the_accepted_set_grandfathers_exactly_one_older_version() -> None:
+    """The set may hold the producer's version plus ONE named older one.
+
+    Complements the expiry pin above from the other side: that one stops the
+    clause sliding FORWARD, this one stops the set quietly growing a SECOND
+    grandfathered version. Either change is a decision, and a decision belongs
+    in a reviewable diff rather than in a set literal nobody re-reads.
+    """
+    grandfathered = ACCEPTED_ARTIFACT_SCHEMA_VERSIONS - {REPORT_SCHEMA_VERSION}
+    assert grandfathered == {_GRANDFATHERED_ARTIFACT_SCHEMA_VERSION}, (
+        f'this gate grandfathers {sorted(grandfathered)}, but only '
+        f'v{_GRANDFATHERED_ARTIFACT_SCHEMA_VERSION} is named and justified '
+        f'here (owed live re-run: task {_OWED_LIVE_RERUN_TASK_ID}). Name the '
+        'other version and say why it is still acceptable evidence, or re-run '
+        'the slate live.'
+    )
+
+
+def test_the_committed_artifact_accounts_for_who_else_held_the_card(
     report: HealthReport, raw_artifact: dict,
 ) -> None:
-    """A v5 artifact's own numbers depend on the card being uncontended.
+    """One test, two branches, NO skips -- and it records which branch ran.
 
     `arm_footprint_mib` is `used - baseline`, which is the ARM's footprint only
     if nothing else moved between the two readings. From v5 the report records
-    what it saw, so this gate can check it rather than take the footprint on
-    trust -- strictly more than the version equality it replaces.
-    """
-    if report.schema_version < _CONSUMER_EVIDENCE_SCHEMA_VERSION:
-        pytest.skip(
-            f'committed artifact is v{report.schema_version}, produced before '
-            'the consumer inventory existed (task 3755). A live re-run is owed '
-            'and filed; it cannot be hand-written here.'
-        )
+    what it saw, so this gate can check it. Until the artifact is re-derived it
+    is v4 and cannot, so the v4 branch asserts the complementary property: a
+    producer that never inventoried the card cannot have left the keys behind.
 
+    The two branches used to be two tests, each `pytest.skip`-ing on the
+    version the other handled -- which meant that against the committed v4
+    artifact the v5 branch's five assertions were dead code and the widened
+    version set shipped with nothing compensating for it. Merged here so the
+    dispatch is visible, and `branch` is assigned only AFTER a branch's
+    assertions have all run, so an artifact matching neither turns this red
+    instead of passing silently.
+    """
     vram = raw_artifact['vram']
-    missing = [key for key in _CONSUMER_EVIDENCE_KEYS if key not in vram]
-    assert not missing, (
-        f'v{report.schema_version} artifact is missing {sorted(missing)}; it '
-        'was not produced by this version of run_healthcheck'
-    )
-    assert report.vram.probe_consumers, (
-        'probe_consumers is empty, but the arm itself runs as a CUDA compute '
-        'app and must appear in its own probe reading. An empty list here '
-        'means nothing was inventoried, not that the card was quiet.'
-    )
-    assert report.vram.consumer_inventory_note, (
-        'consumer_inventory_note is empty: the artifact carries the lists '
-        'without the caveat that they do not sum to memory.used'
-    )
-    assert report.vram.pollution == lms_vram.PollutionState.CLEAN, (
-        f'pollution={report.vram.pollution}: {report.vram.pollution_reason}. '
-        'A slate measured on a contended card is not evidence the arms fit.'
-    )
-    assert report.vram.pollution_reason == '', (
-        'pollution is CLEAN but a reason is recorded; the block contradicts '
-        'itself about what was seen'
-    )
+    branch: str | None = None
 
-
-def test_a_grandfathered_artifact_cannot_claim_evidence_it_never_took(
-    report: HealthReport, raw_artifact: dict,
-) -> None:
-    """The other half of the grandfather clause, and the reason it is safe.
-
-    A pre-v5 artifact was produced by code that never inventoried the card, so
-    its vram block must carry NONE of those keys. Checked on the RAW JSON on
-    purpose: through the model every one of them has a default, so a validated
-    v4 report shows `pollution=UNMEASURED` whether the key was absent or
-    hand-typed. Only the raw file can tell those apart -- which is what stops a
-    v4 artifact being edited to look like it recorded a clean, uncontended run.
-    """
     if report.schema_version >= _CONSUMER_EVIDENCE_SCHEMA_VERSION:
-        pytest.skip(
-            f'artifact is v{report.schema_version}; the current-artifact check '
-            'above applies instead'
+        missing = [key for key in _CONSUMER_EVIDENCE_KEYS if key not in vram]
+        assert not missing, (
+            f'v{report.schema_version} artifact is missing {sorted(missing)}; '
+            'it was not produced by this version of run_healthcheck'
         )
+        assert report.vram.probe_consumers, (
+            'probe_consumers is empty, but the arm itself runs as a CUDA '
+            'compute app and must appear in its own probe reading. An empty '
+            'list here means nothing was inventoried, not that the card was '
+            'quiet.'
+        )
+        assert report.vram.consumer_inventory_note, (
+            'consumer_inventory_note is empty: the artifact carries the lists '
+            'without the caveat that they do not sum to memory.used'
+        )
+        assert report.vram.pollution == lms_vram.PollutionState.CLEAN, (
+            f'pollution={report.vram.pollution}: '
+            f'{report.vram.pollution_reason}. A slate measured on a contended '
+            'card is not evidence the arms fit.'
+        )
+        assert report.vram.pollution_reason == '', (
+            'pollution is CLEAN but a reason is recorded; the block '
+            'contradicts itself about what was seen'
+        )
+        branch = _BRANCH_MEASURED
 
-    vram = raw_artifact['vram']
-    smuggled = [key for key in _CONSUMER_EVIDENCE_KEYS if key in vram]
-    assert not smuggled, (
-        f'v{report.schema_version} artifact carries {sorted(smuggled)}, but no '
-        'producer at that version could have measured them. Either the file '
-        'was hand-edited, or it is really a newer report mislabelled with an '
-        'older version -- both are worse than a missing field.'
-    )
-    assert report.vram.pollution == lms_vram.PollutionState.UNMEASURED, (
-        'a pre-v5 artifact must read as UNMEASURED, not CLEAN: nobody looked '
-        'at who else held the card during that run'
+    elif report.schema_version == _GRANDFATHERED_ARTIFACT_SCHEMA_VERSION:
+        # A pre-v5 artifact was produced by code that never inventoried the
+        # card, so its vram block must carry NONE of those keys. Checked on the
+        # RAW JSON on purpose: through the model every one of them has a
+        # default, so a validated v4 report reads the same whether the key was
+        # absent or hand-typed. Only the raw file can tell those apart -- which
+        # is what stops a v4 artifact being edited to look like it recorded a
+        # clean, uncontended run.
+        smuggled = [key for key in _CONSUMER_EVIDENCE_KEYS if key in vram]
+        assert not smuggled, (
+            f'v{report.schema_version} artifact carries {sorted(smuggled)}, '
+            'but no producer at that version could have measured them. Either '
+            'the file was hand-edited, or it is really a newer report '
+            'mislabelled with an older version -- both are worse than a '
+            'missing field.'
+        )
+        assert _OWED_LIVE_RERUN_TASK_ID.strip(), (
+            'the grandfather clause must point at a FILED, closeable task for '
+            'the owed live re-run. An unnamed promise is how a temporary '
+            'exemption becomes permanent.'
+        )
+        branch = _BRANCH_GRANDFATHERED
+
+    assert branch in (_BRANCH_MEASURED, _BRANCH_GRANDFATHERED), (
+        f'artifact is v{report.schema_version}, which neither branch of this '
+        f'test checks: v{_CONSUMER_EVIDENCE_SCHEMA_VERSION}+ carries the '
+        f'inventory and v{_GRANDFATHERED_ARTIFACT_SCHEMA_VERSION} is '
+        'grandfathered as carrying none. A version outside both would pass '
+        'this gate having been checked by nothing.'
     )
 
 
