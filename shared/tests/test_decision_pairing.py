@@ -303,6 +303,7 @@ class TestDetectMispairing:
             ({'decision': CORRECTION_DECISION}, []),
             ([CORRECTION_DECISION], object()),
             (b'CORRECTION. mis-paired.', b''),
+            (b'CORRECTION. mis-paired.', 'mis-paired'),
         ],
     )
     def test_never_raises_for_non_str_inputs(self, decision, rationale) -> None:
@@ -311,17 +312,42 @@ class TestDetectMispairing:
         The walker in ``scan_design_decisions`` guards these shapes too, but the
         entry predicate must be independently total: it is called directly by
         the scanner script over plan documents nobody validated.
-        """
-        assert detect_mispairing(decision, rationale) is None
 
-    def test_non_str_decision_with_valid_rationale_is_clean(self) -> None:
+        This asserts TOTALITY and a well-typed verdict, deliberately NOT that
+        every row is clean. Two rows carry a valid ``str`` decision that already
+        satisfies both conjuncts on its own; a non-``str`` rationale must not
+        suppress that hit, which is pinned separately below. Asserting ``is
+        None`` here would have conflated "does not raise" with "finds nothing"
+        and would have demanded the wrong behaviour.
+        """
+        verdict = detect_mispairing(decision, rationale)
+        assert verdict is None or isinstance(verdict, MispairingHit)
+
+    def test_non_str_rationale_does_not_suppress_a_decision_only_hit(self) -> None:
+        """A garbage rationale never masks evidence that is complete in ``decision``.
+
+        The commonest live shape by far: 23 of 23 corpus positives carry both
+        conjuncts in ``decision``. If a non-``str`` sibling could suppress the
+        hit, the walker would go quiet on exactly the adversarial plan shapes it
+        exists to survive.
+        """
+        for rationale in (None, 12345, [], object()):
+            hit = detect_mispairing(CORRECTION_DECISION, rationale)
+            assert hit is not None, f'suppressed by a {type(rationale).__name__} rationale'
+            assert hit.field == 'decision'
+
+    @pytest.mark.parametrize(
+        'decision',
+        [None, 12345, {'decision': CORRECTION_DECISION}, [CORRECTION_DECISION], b'CORRECTION.'],
+    )
+    def test_non_str_decision_is_always_clean(self, decision) -> None:
         """The header conjunct is anchored on ``decision`` ALONE.
 
         A non-str ``decision`` can never satisfy it, however the rationale
         reads — so the disjunction never promotes a rationale-only match into a
         hit on its own.
         """
-        assert detect_mispairing(None, 'CORRECTION. It was mis-paired.') is None
+        assert detect_mispairing(decision, 'CORRECTION. It was mis-paired.') is None
 
     def test_leading_whitespace_before_the_header_is_tolerated(self) -> None:
         hit = detect_mispairing('\n  ' + CORRECTION_DECISION, ORDINARY_RATIONALE)
