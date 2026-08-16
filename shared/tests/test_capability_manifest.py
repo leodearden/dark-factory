@@ -28,6 +28,8 @@ from capability_manifest_corpus import (
     REPO_ROOT,
     ScriptCheckRef,
     check_manifest,
+    check_script_target,
+    committed_file_mode,
     discover_manifests,
     iter_script_checks,
 )
@@ -840,6 +842,97 @@ tasks:
     def test_broken_yaml_sidecar_yields_nothing_instead_of_raising(self, tmp_path):
         sidecar = self._write(tmp_path, 'bad-syntax', 'prd: [unterminated')
         assert iter_script_checks(sidecar) == []
+
+
+class TestCheckScriptTarget:
+    """check_script_target(ref) — the working-tree exists+executable checker.
+
+    Mirrors check_manifest's contract: None on success, else ONE grep-able
+    line naming the sidecar and the capability. Each case builds a fake repo
+    root under tmp_path plus a hand-built ScriptCheckRef, so no committed
+    fixture files are needed (TestCheckManifest's convention).
+    """
+
+    def _ref(self, repo_root, script, capability='cap-one'):
+        return ScriptCheckRef(
+            manifest=repo_root / 'plans' / f'example-prd{MANIFEST_SUFFIX}',
+            task_label='δ',
+            capability=capability,
+            script=script,
+        )
+
+    def _make_script(self, repo_root, rel, mode):
+        target = repo_root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text('#!/usr/bin/env python3\n')
+        target.chmod(mode)
+        return target
+
+    def test_existing_executable_target_returns_none(self, tmp_path):
+        self._make_script(tmp_path, 'scripts/ok.py', 0o755)
+        ref = self._ref(tmp_path, 'scripts/ok.py')
+        assert check_script_target(ref, repo_root=tmp_path) is None
+
+    def test_missing_target_names_manifest_capability_and_script(self, tmp_path):
+        # The whole point of the corpus sweep is that the failure tells you
+        # WHICH capability in WHICH sidecar is broken — mirroring
+        # check_manifest's file-attribution contract.
+        (tmp_path / 'plans').mkdir()
+        ref = self._ref(tmp_path, 'scripts/gone.py', capability='cap-missing')
+        message = check_script_target(ref, repo_root=tmp_path)
+        assert message is not None
+        assert f'plans/example-prd{MANIFEST_SUFFIX}' in message
+        assert 'cap-missing' in message
+        assert 'scripts/gone.py' in message
+
+    def test_non_executable_target_names_the_bit_and_says_it_errors(self, tmp_path):
+        self._make_script(tmp_path, 'scripts/plain.py', 0o644)
+        ref = self._ref(tmp_path, 'scripts/plain.py')
+        message = check_script_target(ref, repo_root=tmp_path)
+        assert message is not None
+        assert 'executable' in message
+        # ERRORed, not FAILed: _run_script_check execs the target as argv[0],
+        # so the OSError maps to DeliveredCheckResult.ERRORED at dispatch —
+        # a distinction the reader of a red corpus sweep needs.
+        assert 'ERROR' in message
+        assert 'scripts/plain.py' in message
+
+    def test_directory_at_script_path_is_reported_as_missing(self, tmp_path):
+        # A directory is +x and would pass a naive os.access check, but
+        # exec'ing it raises — is_file() must gate first.
+        (tmp_path / 'scripts' / 'adir.py').mkdir(parents=True)
+        ref = self._ref(tmp_path, 'scripts/adir.py')
+        message = check_script_target(ref, repo_root=tmp_path)
+        assert message is not None
+        assert 'does not exist' in message
+
+    def test_message_is_a_single_grepable_line(self, tmp_path):
+        (tmp_path / 'plans').mkdir()
+        ref = self._ref(tmp_path, 'scripts/gone.py')
+        message = check_script_target(ref, repo_root=tmp_path)
+        assert message is not None
+        assert '\n' not in message
+
+
+class TestCommittedFileMode:
+    """committed_file_mode(rel) — the INDEX mode, not the working-tree bit.
+
+    os.access is greened by a local `chmod +x` that is never staged, which
+    would leave main exactly as broken while the guard reported green. This
+    checker is what proves a mode fix actually LANDS.
+    """
+
+    def test_known_executable_script_reports_100755(self):
+        # scripts/check_method_param_wiring.py is committed 100755 (task 3364).
+        assert committed_file_mode('scripts/check_method_param_wiring.py') == '100755'
+
+    def test_untracked_path_returns_none(self):
+        assert committed_file_mode('scripts/no-such-file-3649.py') is None
+
+    def test_non_checkout_root_returns_none(self, tmp_path):
+        # Mirrors discover_manifests' non-checkout contract: git ls-files
+        # exits non-zero outside a checkout, and this must not raise.
+        assert committed_file_mode('scripts/anything.py', repo_root=tmp_path) is None
 
 
 _MANIFEST_PATHS = discover_manifests() or []
