@@ -2628,7 +2628,7 @@ class TestAShortBufferedWriteIntoAClosedPipeIsAlsoARunFailure:
         assert 'ok' in capsys.readouterr().out.lower()
 
 
-def _spawn(*argv, closed_stdout: bool) -> tuple[int, str, str]:
+def _spawn(*argv, closed_stdout: bool, unbuffered: bool) -> tuple[int, str, str]:
     """Run build_corpus.py in a CHILD process and return (exit status, stdout, stderr).
 
     A real subprocess is the only shape that can observe the two things this
@@ -2644,25 +2644,46 @@ def _spawn(*argv, closed_stdout: bool) -> tuple[int, str, str]:
     re-installs ``SIGPIPE`` as ``SIG_IGN`` at startup, so the child gets EPIPE
     as a catchable ``BrokenPipeError`` rather than dying on the signal — the
     status here is therefore always a real exit code, never ``-13``.
+
+    *unbuffered* is set EXPLICITLY rather than inherited, and that is the whole
+    point of the parameter: ``PYTHONUNBUFFERED`` decides WHERE a closed-pipe
+    write fails (in-band inside ``argparse`` when unbuffered, at a later flush
+    when block-buffered), so a test that merely inherits it asserts against
+    whichever regime the ambient environment happens to supply. This suite is
+    normally run by a harness that exports ``PYTHONUNBUFFERED=1`` and by hand
+    without it, so an inherited value made the same test pass locally and fail
+    under the harness. Pinning it here makes each regime its own case.
     """
-    read_fd, write_fd = os.pipe() if closed_stdout else (None, None)
-    if closed_stdout:
+    env = {**os.environ}
+    if unbuffered:
+        env['PYTHONUNBUFFERED'] = '1'
+    else:
+        env.pop('PYTHONUNBUFFERED', None)
+    cmd = [sys.executable, str(SCRIPT_PATH), *argv]
+
+    if not closed_stdout:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    else:
+        read_fd, write_fd = os.pipe()
         os.close(read_fd)  # the reader is already gone, like `head` after its window
-    try:
-        proc = subprocess.Popen(
-            [sys.executable, str(SCRIPT_PATH), *argv],
-            stdout=write_fd if closed_stdout else subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-    finally:
-        if closed_stdout:
+        try:
+            proc = subprocess.Popen(cmd, stdout=write_fd, stderr=subprocess.PIPE, env=env)
+        finally:
             os.close(write_fd)  # the child now holds the only write end
+
     out, err = proc.communicate(timeout=120)
     return (
         proc.returncode,
         (out or b'').decode('utf-8', 'replace'),
         (err or b'').decode('utf-8', 'replace'),
     )
+
+
+#: Both stdout buffering regimes, which is the axis this CLI's closed-pipe
+#: handling actually turns on — NOT an incidental parametrization.
+_BUFFERING = pytest.mark.parametrize(
+    'unbuffered', [False, True], ids=['block-buffered', 'unbuffered']
+)
 
 
 class TestArgparseOutputIntoAClosedPipeExitsCleanlyToo:
@@ -2680,6 +2701,21 @@ class TestArgparseOutputIntoAClosedPipeExitsCleanlyToo:
     fd 1 exits 120 with that message, and it still does after the ``_cli()``
     flush lands, because ``SystemExit`` is not ``BrokenPipeError``.
 
+    Run against BOTH buffering regimes, because they fail in different places
+    and one handler catches only one of them — measured, each regime red on its
+    own before its own fix:
+
+    * BLOCK-buffered — the ~2.4 KB help text fits stdout's 8 KiB buffer, so
+      ``parse_args`` raises nothing and the failure waits for ``_cli()``'s
+      explicit flush. Exit 120 before that flush existed.
+    * UNBUFFERED (``PYTHONUNBUFFERED=1``, which the verify harness exports) —
+      the write reaches fd 1 during ``parse_args`` and raises there, inside
+      ``argparse._print_message``'s ``except (AttributeError, OSError): pass``.
+      ``BrokenPipeError`` is an ``OSError``, so argparse DISCARDS it; ``_cli``'s
+      flush then finds an empty buffer and the process exits **0** — no
+      traceback and no shutdown noise, but a success status for a run whose
+      output went nowhere. Closed by ``_LoudArgumentParser``.
+
     The controls matter as much as the assertion. ``--help`` must keep exiting
     0 and an unrecognized flag must keep exiting 2 — a fix that routed every
     ``SystemExit`` through the broken-pipe handler would satisfy the headline
@@ -2687,8 +2723,9 @@ class TestArgparseOutputIntoAClosedPipeExitsCleanlyToo:
     here rather than by a user.
     """
 
-    def test_help_into_a_closed_pipe_exits_run_failed_without_shutdown_noise(self):
-        code, _, err = _spawn('--help', closed_stdout=True)
+    @_BUFFERING
+    def test_help_into_a_closed_pipe_exits_run_failed_without_shutdown_noise(self, unbuffered):
+        code, _, err = _spawn('--help', closed_stdout=True, unbuffered=unbuffered)
         assert code == _mod.EXIT_RUN_FAILED
         assert 'Traceback' not in err
         assert 'Exception ignored' not in err
@@ -2700,13 +2737,23 @@ class TestArgparseOutputIntoAClosedPipeExitsCleanlyToo:
         # where stderr IS controlled.
         assert any(line.startswith('error: ') for line in err.splitlines())
 
-    def test_help_with_a_healthy_stdout_still_exits_zero_and_prints_usage(self):
-        """CONTROL: the ordinary `--help` contract is untouched."""
-        code, out, _ = _spawn('--help', closed_stdout=False)
+    @_BUFFERING
+    def test_help_with_a_healthy_stdout_still_exits_zero_and_prints_usage(self, unbuffered):
+        """CONTROL: the ordinary `--help` contract is untouched.
+
+        Sharper than it looks now that ``print_help`` is overridden: this is
+        what pins the override to still EMIT the help text, in full, rather
+        than merely re-raising on a broken pipe.
+        """
+        code, out, _ = _spawn('--help', closed_stdout=False, unbuffered=unbuffered)
         assert code == 0
         assert 'usage:' in out
+        # The whole document, not a truncated first line — `format_help()`
+        # output routed through the override unchanged.
+        assert '--verify' in out and '--seed' in out
 
-    def test_an_unrecognized_flag_still_exits_two(self):
+    @_BUFFERING
+    def test_an_unrecognized_flag_still_exits_two(self, unbuffered):
         """CONTROL: argparse's usage-error code survives, on BOTH stdout shapes.
 
         The closed-pipe half is the sharper of the two. argparse writes its
@@ -2716,12 +2763,19 @@ class TestArgparseOutputIntoAClosedPipeExitsCleanlyToo:
         regardless of whether the flush actually failed would go red here, and
         nowhere else.
         """
-        healthy_code, _, healthy_err = _spawn('--definitely-not-a-flag', closed_stdout=False)
+        healthy_code, _, healthy_err = _spawn(
+            '--definitely-not-a-flag', closed_stdout=False, unbuffered=unbuffered
+        )
         assert healthy_code == 2
         assert 'unrecognized' in healthy_err
 
-        closed_code, _, _ = _spawn('--definitely-not-a-flag', closed_stdout=True)
+        closed_code, _, closed_err = _spawn(
+            '--definitely-not-a-flag', closed_stdout=True, unbuffered=unbuffered
+        )
         assert closed_code == 2
+        # Still reported: the usage error goes to stderr, which is NOT the
+        # closed stream, so a closed stdout must not cost the diagnostic.
+        assert 'unrecognized' in closed_err
 
 
 class TestBuilderScriptSatisfiesTheDeliveredCheck:

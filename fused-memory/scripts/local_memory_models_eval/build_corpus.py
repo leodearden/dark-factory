@@ -137,6 +137,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import IO
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -1429,6 +1430,46 @@ def render_report(manifest: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
+class _LoudArgumentParser(argparse.ArgumentParser):
+    """An ``ArgumentParser`` whose help text cannot vanish down a closed pipe.
+
+    ``argparse`` prints every message through ``_print_message``, which wraps
+    its ``file.write`` in ``except (AttributeError, OSError): pass``.
+    ``BrokenPipeError`` IS an ``OSError``, so on ``--help | head`` argparse
+    discards the help text and exits 0 anyway — a success status for a run
+    whose entire output went nowhere.
+
+    Whether that swallow is even reached depends on stdout's BUFFERING, which
+    is why it hid behind the rest of the closed-pipe work:
+
+    * BLOCK-buffered stdout (a plain pipe, the default) — the help text is
+      ~2.4 KB and fits stdout's 8 KiB buffer, so ``write`` touches no fd and
+      cannot fail. The failure surfaces later, at :func:`_cli`'s explicit
+      flush, which already handles it.
+    * UNBUFFERED or line-buffered stdout (``PYTHONUNBUFFERED=1``, ``python
+      -u``, a tty) — ``write`` reaches fd 1 immediately and raises
+      ``BrokenPipeError`` INSIDE argparse, where it is swallowed. ``_cli``'s
+      flush then finds an empty buffer, nothing raises, and the process exits
+      0 with its output silently dropped.
+
+    Overriding the PUBLIC :meth:`print_help` rather than ``_print_message``:
+    stdout is the only stream argparse writes help to, and ``format_help`` is
+    public, so this needs no private API and leaves argparse's message
+    routing, formatting and exit codes untouched. ``parser.error`` still
+    reports through ``_print_message`` to STDERR, so an unrecognized flag keeps
+    exiting 2 unchanged.
+
+    The re-raised exception leaves ``parse_args`` — which runs before
+    :func:`main`'s own ``try`` — and lands in :func:`_cli`'s
+    ``except BrokenPipeError``, giving a closed stdout ONE outcome in BOTH
+    buffering regimes: :data:`EXIT_RUN_FAILED` plus a single ``error: ...``
+    line.
+    """
+
+    def print_help(self, file: IO[str] | None = None) -> None:
+        (file or sys.stdout).write(self.format_help())
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """The CLI: flat mode flags, no subcommands.
 
@@ -1437,7 +1478,7 @@ def _build_parser() -> argparse.ArgumentParser:
     ``--apply`` — and a test pins this flag set by EQUALITY so one cannot be
     added without a test saying so out loud.
     """
-    parser = argparse.ArgumentParser(
+    parser = _LoudArgumentParser(
         # The module docstring carries RST tables that argparse's formatter
         # reflows into rubble (the memory_eval_retrieval_probe treatment); the
         # first line plus the two guarantees is what an operator needs here.
@@ -1768,6 +1809,15 @@ def _cli() -> int:
     ``except BrokenPipeError`` because nothing was raised in-band. Their text is
     still buffered at that point, so without flushing here ``--help | head``
     lands in the same deferred exit-120 as the short verdict.
+
+    That covers argparse only while stdout is BLOCK-buffered. Unbuffered (
+    ``PYTHONUNBUFFERED=1``, ``python -u``, a tty) the help text reaches fd 1
+    during ``parse_args`` and fails there, inside a ``try/except OSError: pass``
+    argparse owns — leaving nothing for the flush below to find. That half is
+    closed by :class:`_LoudArgumentParser`, whose re-raised ``BrokenPipeError``
+    arrives at the FIRST handler here, not the ``SystemExit`` one. The two are
+    complementary, not alternatives: neither regime is reachable by the other's
+    handler.
 
     That handler RE-RAISES on a successful flush rather than returning a
     normalised code. ``SystemExit.code`` may be ``None`` (which the interpreter
