@@ -29,7 +29,7 @@ import logging
 import statistics
 import time
 from collections import deque
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
@@ -316,11 +316,22 @@ class HoldHistory:
         self,
         *,
         window: int = DEFAULT_WINDOW,
-        min_samples: int = DEFAULT_MIN_SAMPLES,
+        min_samples: int | Callable[[], int] = DEFAULT_MIN_SAMPLES,
         stale_open_secs: float = DEFAULT_STALE_OPEN_SECS,
     ) -> None:
         self._window = int(window)
-        self._min_samples = int(min_samples)
+        #: The sample floor, as a PROVIDER resolved on every read.  A plain int
+        #: becomes a constant closure (and keeps its eager coercion, so a bad
+        #: literal still fails loudly here rather than deep inside
+        #: :meth:`predicted_hold`); a callable is stored as-is so an owner
+        #: whose floor can change under it — e.g. a hot-reloadable config leaf
+        #: — stays live without this module ever seeing a config object.
+        self._min_samples_source: Callable[[], int]
+        if callable(min_samples):
+            self._min_samples_source = min_samples
+        else:
+            fixed = int(min_samples)
+            self._min_samples_source = lambda: fixed
         self._stale_open_secs = float(stale_open_secs)
         #: module -> bounded window of ``(duration, truncated)``.  The flag is
         #: carried alongside the duration rather than dropped at the window
@@ -335,6 +346,16 @@ class HoldHistory:
         #: the seed replays history that has already ended, this tracks holds
         #: still running, which is what :meth:`predicted_remaining` reads.
         self._open: OpenSpans = {}
+
+    @property
+    def min_samples(self) -> int:
+        """The floor in force RIGHT NOW — re-resolved on every access.
+
+        Read by :meth:`predicted_hold` per call rather than captured once, so a
+        caller whose floor comes from a hot-reloadable leaf does not have to
+        rebuild the predictor (or remember to push) after a reload.
+        """
+        return int(self._min_samples_source())
 
     # --- seeding from durable history -------------------------------------
 
@@ -590,10 +611,18 @@ class HoldHistory:
 
         ``min_samples`` is a constructor parameter, deliberately NOT read from
         config here — task η owns the ``backfill_min_samples`` leaf and this
-        module must stand alone without it.
+        module must stand alone without it.  It may however be a zero-argument
+        PROVIDER rather than a fixed int, in which case it is resolved on every
+        call: that is what lets the owner of a hot-reloadable leaf keep the
+        floor live (a value captured at construction would freeze it for the
+        process era, so an operator's reload would land in ``applied`` and
+        change nothing) while this module still learns nothing about config.
+        The pull is deliberate — a pushed setter would have to be re-issued at
+        every entry point, and :meth:`predicted_remaining` calls this method
+        internally, so a push discipline would silently miss that path.
         """
         pooled = self._pooled(modules)
-        if len(pooled) < self._min_samples:
+        if len(pooled) < self.min_samples:
             return None
         return float(statistics.median(pooled))
 

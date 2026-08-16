@@ -288,6 +288,29 @@ class EventType(StrEnum):
     # Scheduler-scoped (task_id=None). Payload: {consecutive_failures}.
     park_eviction_deferred_fm_unavailable = 'park_eviction_deferred_fm_unavailable'
     scheduler_tier_cap_idle = 'scheduler_tier_cap_idle'
+    # EASY-backfill admission through parks (task 3823 / scheduler-scoring PRD
+    # C7).  Emitted when a candidate blocked ONLY by another task's park is
+    # admitted through it because its predicted hold, times the configured
+    # safety factor, fits inside the gap that park is provably still waiting
+    # on.  Payload: {predicted_hold, safety_factor, admission_bound,
+    # provable_assembly_delay, park_owners, modules}.
+    #
+    # Predicted AND (via park_backfill_overstay) realized are both recorded so
+    # the modelled 7-9% overstay rate at safety x2.5
+    # (plans/evidence/scheduler-scoring-2026-08-06/PARKING_MODEL_REPORT.md:254-255)
+    # is MEASURED in production rather than assumed.  backfill_safety_factor
+    # is green-tier reloadable precisely so that measurement can retune it.
+    park_backfill_granted = 'park_backfill_granted'
+    # The settlement of the above: emitted at release when a back-filled hold
+    # ran LONGER than the bound its admission promised.  Payload:
+    # {predicted_hold, safety_factor, admission_bound, realized_hold,
+    # overstay_secs, park_owners, modules}.  Predicted and realized both ride
+    # on the event on purpose — the comparison is the finding, and nobody
+    # should have to reconstruct it from log lines.
+    #
+    # NOT emitted through _emit_lock_event: that chokepoint is contractually
+    # the lock-event single writer and raises on any other event type.
+    park_backfill_overstay = 'park_backfill_overstay'
 
     # Scheduler priority overrides
     #

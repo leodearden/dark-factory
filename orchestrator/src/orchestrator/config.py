@@ -3763,6 +3763,74 @@ class OrchestratorConfig(BaseSettings):
         ),
     )
 
+    # EASY-backfill admission through parks (task 3823 / PRD task η, C7).
+    # A candidate blocked ONLY by another task's park may be admitted through
+    # it when its predicted hold, times a safety factor, provably fits inside
+    # the gap the park's owner is going to wait anyway.  Flat top-level fields
+    # (not a submodel) mirroring the park_stop_* block above: the capability
+    # manifest greps config.py for the three literal leaf names below, and
+    # nesting would rename them.
+    #
+    # Evidence base:
+    # plans/evidence/scheduler-scoring-2026-08-06/PARKING_MODEL_REPORT.md
+    # :116-126 — module hold-history median is the ONLY predictor with a
+    # positive R² (0.26 dark-factory / 0.68 reify); every static-attribute
+    # predictor scored WORSE than the test-set mean.
+    backfill_enabled: bool = Field(
+        default=True,
+        description=(
+            'Enable EASY-backfill admission through parks (PRD C7). When '
+            'disabled, a candidate blocked by a foreign park is simply passed '
+            'over as before — the operator kill switch, mirroring '
+            'park_stop_enabled / starvation_watchdog.enabled.'
+        ),
+    )
+    backfill_safety_factor: float = Field(
+        default=2.5,
+        gt=0,
+        description=(
+            'Multiplier applied to a candidate\'s predicted hold before it is '
+            'compared against the parked owner\'s provable assembly delay; '
+            'admission requires predicted_hold * factor <= provable_delay. '
+            '2.5 is INTERPOLATED BETWEEN two measured 80%-coverage multipliers '
+            '(PARKING_MODEL_REPORT.md:126: x2.9 dark-factory, x2.0 reify) '
+            'rather than guessed, and the modelled overstay rate at x2.5 is '
+            '7-9% (:254-255). Green-tier so production park_backfill_overstay '
+            'data can settle 2.5-vs-2.9 without a restart (PRD Open Q3).'
+        ),
+    )
+    backfill_min_samples: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            'Minimum observed hold samples on a task\'s modules before the '
+            'predictor will answer at all; below it, predicted_hold is None '
+            'and backfill REFUSES. This is the SINGLE SOURCE OF TRUTH for '
+            'HoldHistory\'s sample floor — the Scheduler constructs its '
+            'HoldHistory with this value, and hold_history.py deliberately '
+            'carries only a module default so it can stand alone without the '
+            'config object. ge=1 is contract, not decoration: a floor of 0 '
+            'would let an EMPTY history certify a backfill, which C7 forbids '
+            'by name.'
+        ),
+    )
+    backfill_max_park_age_secs: float = Field(
+        default=3600.0,
+        gt=0,
+        description=(
+            'Refuse backfill through any park older than this many seconds, '
+            'measured from the owner\'s FIRST install (its total wait). The '
+            'CLAUSE is measured, the NUMBER is a judgment call: '
+            'PARKING_MODEL_REPORT.md:256 names the casualty of having no '
+            'cutoff (one reify starver flips to never-dispatched in-window) '
+            'but publishes no figure. 1h is ~40% of the measured 2.2-3h median '
+            'process era, so it protects parks that have already burned a '
+            'substantial fraction of an era while still admitting backfill in '
+            'the fresh window where most grants occur. Green-tier, so a replay '
+            'can retune it from production data without a deploy.'
+        ),
+    )
+
     # Escalation-watcher subprocess supervisor (AFK hardening, task 1326).
     # Keeps a fresh escalation-watcher-auto agent alive across multi-day AFK
     # windows with rotation, exponential backoff, and a crashloop→pause_scheduler
@@ -4967,6 +5035,15 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'steward_lifetime_budget',
         # Scheduler tuning
         'fairness.skip_threshold',
+        # EASY-backfill admission (task 3823 / PRD C7).  Explicit literals, not
+        # a _submodel_leaf_paths group: these are FLAT top-level fields, not a
+        # submodel.  Green-tier on purpose — PRD Open Q3 ships safety_factor
+        # 2.5 and lets production park_backfill_overstay data settle
+        # 2.5-vs-2.9, which is only actionable if the factor retunes live.
+        'backfill_enabled',
+        'backfill_safety_factor',
+        'backfill_min_samples',
+        'backfill_max_park_age_secs',
         'starvation_watchdog.enabled',
         'starvation_watchdog.skip_threshold',
         'starvation_watchdog.idle_secs',

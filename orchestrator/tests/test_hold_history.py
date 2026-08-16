@@ -706,6 +706,85 @@ def test_default_min_samples_is_three():
     assert three.predicted_hold(['m/src']) == pytest.approx(20.0)
 
 
+def test_min_samples_may_be_a_provider_resolved_at_read_time():
+    """A callable floor is re-resolved on EVERY ``predicted_hold`` call.
+
+    Task 3823 review fix 1.  ``backfill_min_samples`` is declared green-tier
+    hot-reloadable, but its only consumer builds the predictor once at
+    Scheduler construction — a floor captured by value there is frozen for the
+    process era, so an operator's reload lands in ``applied`` and changes
+    nothing.  Accepting a zero-argument provider lets the owner of a
+    reloadable leaf keep the floor live WITHOUT this module ever learning what
+    a config object is.
+
+    Resolution must happen at READ time, not once at construction: the whole
+    point is that the same ``HoldHistory`` instance answers differently after
+    the value behind the provider moves.
+    """
+    floor = {'value': 4}
+    history = _history_of(
+        {'orchestrator/src': [10.0, 20.0, 30.0]},
+        min_samples=lambda: floor['value'],
+    )
+
+    _assert_refuses(history, ['orchestrator/src'], 'provider floor 4, 3 samples')
+    assert history.min_samples == 4
+
+    # Loosen — the operator scenario that made the finding: the SAME instance,
+    # no reconstruction, must now answer.
+    floor['value'] = 3
+    assert history.min_samples == 3
+    assert history.predicted_hold(['orchestrator/src']) == pytest.approx(20.0)
+
+    # Tighten — the direction that matters for safety: a floor raised past the
+    # evidence must start refusing again, immediately.
+    floor['value'] = 10
+    assert history.min_samples == 10
+    _assert_refuses(history, ['orchestrator/src'], 'provider floor raised to 10')
+
+
+def test_a_non_numeric_min_samples_literal_still_fails_at_construction():
+    """Widening to accept a provider must not make a bad literal quiet.
+
+    ``int('later')`` raises today; the provider branch must be selected on
+    ``callable(...)`` alone, so every non-callable keeps the eager coercion and
+    its loud failure at the construction site rather than surfacing as a
+    confusing comparison error inside ``predicted_hold``.
+    """
+    with pytest.raises((TypeError, ValueError)):
+        HoldHistory(min_samples='later')  # type: ignore[arg-type]
+
+
+def test_the_module_still_stands_alone_without_config():
+    """Importing ζ must not drag in ``orchestrator.config``.
+
+    The provider is a bare ``Callable[[], int]`` precisely so this stays true:
+    the alternative — taking the config object — would trade ζ's stand-alone
+    property (hold_history.py:591-593) for the same liveness.  Checked against
+    the real import graph in a fresh interpreter rather than by reading the
+    source, so an indirect import through a new dependency is caught too.
+    """
+    import subprocess
+    import sys
+
+    probe = subprocess.run(
+        [
+            sys.executable,
+            '-c',
+            'import sys, orchestrator.hold_history; '
+            'print("orchestrator.config" in sys.modules)',
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert probe.returncode == 0, f'probe failed to import ζ at all: {probe.stderr}'
+    assert probe.stdout.strip() == 'False', (
+        'orchestrator.hold_history now pulls in orchestrator.config — ζ was '
+        'meant to stand alone and take a bare callable instead'
+    )
+
+
 def test_zero_length_holds_still_count_as_samples():
     """A 0.0 sample is an OBSERVATION; a 0.0 *prediction* from no samples is a
     fabrication.  The gate must not conflate them — three instant holds are
