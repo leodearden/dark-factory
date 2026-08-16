@@ -1,6 +1,7 @@
 """Tests for the submit_and_resolve helper in _fm_helpers.py."""
 
 import json
+import sys
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -1496,3 +1497,188 @@ class TestAwaitIndexOperational:
 
         with pytest.raises(AssertionError, match='not OPERATIONAL'):
             await await_index_operational(graph, timeout_s=0.05)
+
+
+# ---------------------------------------------------------------------------
+# Tests for the shared load_script_module() loader (task 3738)
+# ---------------------------------------------------------------------------
+# load_script_module imports a script that is NOT a package member and NOT on
+# PYTHONPATH (anything under `scripts/`) by file path, so its pure functions
+# can be tested without sys.path pollution. It was hoisted out of
+# test_sweep_toolcall_xml_leak.py and test_toolcall_xml_leak_sweep_artifacts.py,
+# which carried two independent copies of it.
+#
+# The REUSE guard is the reason the more-robust of those two copies was the one
+# promoted, and it is precisely the behaviour nothing pinned: both sweep modules
+# register the SAME sys.modules key, so an unconditional second load would
+# re-execute the 965-line script and silently replace the first module object,
+# leaving two live module objects whose identity depends on collection order.
+# That guard is currently exercised only INCIDENTALLY, as a side effect of
+# collection order across those two modules — drop it and both still pass. These
+# tests make it load-bearing directly.
+#
+# Everything here drives throwaway tmp_path scripts, never a real repo script,
+# so no case depends on the content of anything under scripts/.
+
+@pytest.fixture
+def registered_module_names():
+    """Yield a registrar for sys.modules keys a test is about to create.
+
+    Every registered key is popped afterwards, pass or fail, so a test that
+    loads a throwaway tmp_path script cannot leak a module object into sibling
+    tests (or shadow a real module for the rest of the session).
+    """
+    names: list[str] = []
+    yield names.append
+    for name in names:
+        sys.modules.pop(name, None)
+
+
+class TestLoadScriptModule:
+    """Unit tests for load_script_module(script_path, mod_name=None)."""
+
+    def test_module_level_names_are_reachable_on_the_returned_module(
+        self, tmp_path, registered_module_names
+    ):
+        """The whole point: a by-path script's constants and functions come back
+        as ordinary attributes of the returned module."""
+        from _fm_helpers import load_script_module
+
+        script = tmp_path / 'probe_script.py'
+        script.write_text('VALUE = 41\n\n\ndef bump(n):\n    return n + 1\n')
+        registered_module_names('probe_script')
+
+        mod = load_script_module(script)
+
+        assert mod.VALUE == 41
+        assert mod.bump(41) == 42
+
+    def test_registers_under_the_explicit_mod_name(
+        self, tmp_path, registered_module_names
+    ):
+        """An explicit mod_name is the sys.modules key — this is what lets two
+        test modules deliberately SHARE one key for the same script."""
+        from _fm_helpers import load_script_module
+
+        script = tmp_path / 'stem_is_ignored.py'
+        script.write_text("ORIGIN = 'explicit'\n")
+        registered_module_names('chosen_key')
+
+        mod = load_script_module(script, mod_name='chosen_key')
+
+        assert sys.modules['chosen_key'] is mod
+        assert 'stem_is_ignored' not in sys.modules
+
+    def test_registers_under_the_file_stem_when_mod_name_is_omitted(
+        self, tmp_path, registered_module_names
+    ):
+        """mod_name defaults to the file stem."""
+        from _fm_helpers import load_script_module
+
+        script = tmp_path / 'defaults_to_stem.py'
+        script.write_text("ORIGIN = 'stem'\n")
+        registered_module_names('defaults_to_stem')
+
+        mod = load_script_module(script)
+
+        assert sys.modules['defaults_to_stem'] is mod
+
+    def test_a_second_load_of_the_same_file_reuses_the_module_object(
+        self, tmp_path, registered_module_names
+    ):
+        """REUSE — the guard this loader exists for.
+
+        The second call must return the IDENTICAL object without re-executing
+        the file. Asserted by mutating the first module and looking for the
+        mutation afterwards: a re-execution would hand back a freshly built
+        module object with no SENTINEL on it, so `is`-identity plus the
+        surviving attribute together rule out both replacement and re-exec.
+        """
+        from _fm_helpers import load_script_module
+
+        script = tmp_path / 'reused_script.py'
+        script.write_text('VALUE = 1\n')
+        registered_module_names('reused_script')
+
+        first = load_script_module(script)
+        first.SENTINEL = 'set-by-first-caller'  # type: ignore[attr-defined]
+
+        second = load_script_module(script)
+
+        assert second is first
+        assert second.SENTINEL == 'set-by-first-caller'
+
+    def test_reuse_survives_a_non_normalised_path_to_the_same_file(
+        self, tmp_path, registered_module_names
+    ):
+        """The guard compares RESOLVED paths, so an unnormalised spelling of the
+        same file still reuses.
+
+        Callers build these paths with `Path(__file__).parent.parent / ...`, so
+        the second caller's spelling need not be string-equal to the first's.
+        An implementation comparing the cached ``__file__`` as a raw string
+        would re-execute here.
+        """
+        from _fm_helpers import load_script_module
+
+        subdir = tmp_path / 'subdir'
+        subdir.mkdir()
+        script = tmp_path / 'roundabout_script.py'
+        script.write_text('VALUE = 1\n')
+        registered_module_names('roundabout_script')
+
+        first = load_script_module(script)
+        first.SENTINEL = 'set-by-first-caller'  # type: ignore[attr-defined]
+
+        second = load_script_module(subdir / '..' / 'roundabout_script.py')
+
+        assert second is first
+        assert second.SENTINEL == 'set-by-first-caller'
+
+    def test_a_different_file_under_a_used_mod_name_is_not_reused(
+        self, tmp_path, registered_module_names
+    ):
+        """The guard keys on the FILE, not on the name.
+
+        Reusing on a name match alone would hand the second caller the first
+        script's module — silently serving the wrong code under the right key.
+        """
+        from _fm_helpers import load_script_module
+
+        first_script = tmp_path / 'first_source.py'
+        first_script.write_text("ORIGIN = 'first'\n")
+        second_script = tmp_path / 'second_source.py'
+        second_script.write_text("ORIGIN = 'second'\n")
+        registered_module_names('shared_key')
+
+        first = load_script_module(first_script, mod_name='shared_key')
+        assert first.ORIGIN == 'first'
+
+        second = load_script_module(second_script, mod_name='shared_key')
+
+        assert second is not first
+        assert second.ORIGIN == 'second'
+        assert sys.modules['shared_key'] is second
+
+    def test_an_exception_during_exec_propagates_and_leaves_no_partial_entry(
+        self, tmp_path, registered_module_names
+    ):
+        """A script that blows up mid-exec must not leave its half-built module
+        registered.
+
+        The module is inserted into sys.modules BEFORE exec_module (so the
+        script can import itself), which means the failure path has to undo
+        that. Otherwise the next caller's reuse check would find the cached
+        entry, match its __file__, and return a module whose top level never
+        finished running — a partially-initialised module served as a good one.
+        """
+        from _fm_helpers import load_script_module
+
+        script = tmp_path / 'exploding_script.py'
+        script.write_text("LOADED_SO_FAR = 1\nraise RuntimeError('boom during exec')\n")
+        registered_module_names('exploding_script')
+
+        with pytest.raises(RuntimeError, match='boom during exec'):
+            load_script_module(script)
+
+        assert 'exploding_script' not in sys.modules
