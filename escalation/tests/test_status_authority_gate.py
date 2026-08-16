@@ -29,10 +29,6 @@ escalation package's own read path), not an internal mock assertion.
 
 from __future__ import annotations
 
-import asyncio
-import socket
-import threading
-import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -98,151 +94,40 @@ def _seed(
 # ---------------------------------------------------------------------------
 
 
-def _free_port() -> int:
-    """Return an ephemeral TCP port free on 127.0.0.1 at the time of the call."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(('127.0.0.1', 0))
-        return s.getsockname()[1]
-
-
-def _drain_pending_tasks(loop: asyncio.AbstractEventLoop) -> None:
-    """Cancel and await every task still pending on *loop* before it closes
-    (mirrors test_capability_guard_http.py's ``_drain_pending_tasks``).
-
-    Mirrors ``asyncio.run()``'s own internal shutdown sequence
-    (``_cancel_all_tasks``). Without this, a task still suspended
-    mid-``await`` when the loop is stopped -- the server's own root task
-    (``run_http_async``), or an internal one it spawns (e.g.
-    sse_starlette's ``_shutdown_watcher``) -- is only unwound later at
-    uncontrolled garbage-collection time, outside of any running task
-    context, which crashes anyio's shielded lifespan cleanup with an
-    unraisable ``TypeError``/``NoEventLoopError`` instead of shutting down
-    cleanly (task 2741).
-    """
-    pending = asyncio.all_tasks(loop)
-    if not pending:
-        return
-    for task in pending:
-        task.cancel()
-    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-
-
-async def _mcp_handshake_ready(base_url: str) -> bool:
-    """True iff a real MCP client completes initialize+ping against
-    ``{base_url}/mcp/``.
-
-    A bare TCP connect only proves the OS accept queue is up; it does not
-    prove the FastMCP ASGI app has finished mounting the ``/mcp/`` route.
-    Polling a real handshake instead of a TCP probe closes that window — the
-    first C1-C4 call racing a 404/hang before the route is live."""
-    transport = StreamableHttpTransport(f'{base_url}/mcp/')
-    try:
-        async with Client(transport) as client:
-            await client.ping()
-    except Exception:  # noqa: BLE001 - any failure just means "not ready yet"
-        return False
-    return True
-
-
 @pytest.fixture(scope='module')
 def http_server(
     tmp_path_factory: pytest.TempPathFactory,
+    serve_escalation_mcp,
 ) -> Iterator[tuple[str, EscalationQueue]]:
-    """Serve a real escalation MCP server over HTTP for this module's tests
-    (mirrors test_capability_guard_http.py's ``http_server`` fixture).
+    """Serve a real escalation MCP server over HTTP for this module's tests.
 
-    Only a real ASGI request context resolves
-    ``X-Escalation-Levels``/``X-Escalation-Identity`` via
-    ``get_http_headers()`` — an in-process ``tool.fn(...)`` call always sees
-    ``{}``, which would make the C1-C4 capability-guard cells untestable.
+    A thin scope/shape adapter over the shared ``serve_escalation_mcp``
+    factory (``conftest.py``): it owns no server-lifecycle state, so the whole
+    start/serve/teardown protocol -- readiness gated on a real MCP handshake,
+    the ``stopping`` flag, the pending-task drain, the bounded 5s join and its
+    loud hung-thread assert -- lives once there, with its regression test in
+    ``test_serve_escalation_mcp_fixture.py`` (task 3736, INV-5). This module's
+    former local copy was the HARDENED variant; both of its hardenings were
+    promoted into the shared factory before this conversion, so nothing was
+    lost. The yielded ``(base_url, queue)`` shape is preserved for the C1-C4
+    call sites (the factory's ``port`` is dropped here).
 
-    Module-scoped: every C1-C4 test shares this ONE ``EscalationQueue``.
-    Isolation contract — each test MUST seed its escalation(s) under a
-    unique ``task_id`` (the existing ``zeta-c1-*``/``zeta-c2-*``/... prefixes
-    below); do not reuse a ``task_id`` across tests or depend on
-    ``make_id`` sequencing, or tests can silently interfere via shared
-    queue state.
+    Two facts remain module-specific and are the reason this indirection
+    exists at all:
 
-    Teardown is explicit (task 2741): the event loop is created here in the
-    fixture body (not inside the thread target), so it can be stopped
-    thread-safely at teardown — ``loop.call_soon_threadsafe(loop.stop)``
-    unblocks ``run_until_complete`` in the serving thread, which is then
-    joined (bounded to 5s). A ``stopping`` flag distinguishes that
-    deliberate, stop-induced ``RuntimeError`` from a genuine startup
-    failure, so ``serve_error`` below still reflects only real errors. Any
-    task still pending at that point is cancelled and drained
-    (``_drain_pending_tasks``) inside the serving thread before the loop
-    closes, so cleanup runs inside a live task context instead of at
-    uncontrolled GC time. A teardown that fails to stop the thread within
-    the 5s join bound is asserted rather than swallowed, so a genuine hang
-    surfaces loudly instead of silently leaking a daemon thread past this
-    fixture.
+    * Why real HTTP is required: only a real ASGI request context resolves
+      ``X-Escalation-Levels``/``X-Escalation-Identity`` via
+      ``get_http_headers()`` -- an in-process ``tool.fn(...)`` call always sees
+      ``{}``, which would make the C1-C4 capability-guard cells untestable.
+    * The isolation contract: module-scoped, so every C1-C4 test shares this
+      ONE ``EscalationQueue``. Each test MUST seed its escalation(s) under a
+      unique ``task_id`` (the existing ``zeta-c1-*``/``zeta-c2-*``/... prefixes
+      below); do not reuse a ``task_id`` across tests or depend on ``make_id``
+      sequencing, or tests can silently interfere via shared queue state.
     """
     queue_dir = tmp_path_factory.mktemp('status_authority_gate_http')
-    queue = EscalationQueue(queue_dir)
-    mcp = create_server(queue, startup_sweep=False)
-    port = _free_port()
-    loop = asyncio.new_event_loop()
-    # _free_port() binds-then-closes to find a free port, then the real bind
-    # happens below — a TOCTOU another process (or a concurrent xdist worker)
-    # could win. serve_error surfaces that as the actual OSError on timeout
-    # below, instead of only the generic "did not become ready" message.
-    serve_error: BaseException | None = None
-    stopping = False
-
-    def _serve_forever() -> None:
-        nonlocal serve_error
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(
-                mcp.run_http_async(
-                    host='127.0.0.1', port=port, show_banner=False, log_level='error',
-                )
-            )
-        except BaseException as exc:  # noqa: BLE001 - surfaced on timeout below
-            if not stopping:
-                serve_error = exc
-        finally:
-            _drain_pending_tasks(loop)
-            loop.close()
-
-    thread = threading.Thread(
-        target=_serve_forever, name='status-authority-gate-http', daemon=True,
-    )
-    thread.start()
-
-    # Gate readiness on a real MCP handshake (initialize+ping), not a bare
-    # TCP connect: a successful connect only proves the OS accept queue is
-    # up, not that the FastMCP ASGI app has finished mounting /mcp/. Every
-    # poll implicitly re-probes the TCP layer too (a refused/reset connect
-    # just fails the handshake and retries), so no separate TCP wait is
-    # needed.
-    base_url = f'http://127.0.0.1:{port}'
-    deadline = time.monotonic() + 10.0
-    ready = False
-    while time.monotonic() < deadline:
-        if asyncio.run(_mcp_handshake_ready(base_url)):
-            ready = True
-            break
-        time.sleep(0.05)
-    if not ready:
-        detail = f' (server thread raised: {serve_error!r})' if serve_error else ''
-        raise RuntimeError(
-            f'status-authority-gate HTTP test server did not complete an MCP '
-            f'handshake on 127.0.0.1:{port} within 10s{detail}'
-        )
-
-    try:
-        yield base_url, queue
-    finally:
-        stopping = True
-        loop.call_soon_threadsafe(loop.stop)
-        thread.join(timeout=5.0)
-        assert not thread.is_alive(), (
-            'status-authority-gate-http serving thread did not stop within '
-            'the 5s teardown bound -- event loop stop is hung or the server '
-            'task is stuck in a non-cancellable await (task 2741)'
-        )
+    base_url, _port, queue = serve_escalation_mcp(queue_dir)
+    yield base_url, queue
 
 
 async def _resolve_over_http(
@@ -290,57 +175,6 @@ async def _promote_over_http(
     async with Client(transport) as client:
         result = await client.call_tool('promote_to_l2', promote_kwargs)
         return result.data
-
-
-# ---------------------------------------------------------------------------
-# Harness sanity: http_server fixture teardown (mirrors
-# test_capability_guard_http.py's TestHarnessSanity).
-# ---------------------------------------------------------------------------
-
-
-def test_http_server_fixture_stops_serving_thread_on_teardown(
-    tmp_path_factory: pytest.TempPathFactory,
-) -> None:
-    """Regression test (task 2741): the module-scoped ``http_server``
-    fixture must explicitly stop its daemon serving thread + event loop at
-    teardown instead of relying on process exit to kill it (mirrors
-    test_capability_guard_http.py's identically-named test).
-
-    Drives the fixture's own generator directly via ``__wrapped__``
-    (bypassing pytest's fixture caching) so this test's own serving thread
-    can be identified precisely — via a ``threading.enumerate()``
-    before/after diff — independently of the module-scoped fixture instance
-    already serving this module's other tests under the same thread name.
-    """
-    before = set(threading.enumerate())
-    gen = http_server.__wrapped__(tmp_path_factory)  # pyright: ignore[reportAttributeAccessIssue]
-    try:
-        base_url, queue = next(gen)
-        new = [
-            t for t in set(threading.enumerate()) - before
-            if t.name == 'status-authority-gate-http'
-        ]
-        assert len(new) == 1, (
-            f'Expected exactly one new status-authority-gate-http serving '
-            f'thread; found {new}'
-        )
-        serving = new[0]
-        assert serving.is_alive(), 'Serving thread must be alive during yield'
-
-        with pytest.raises(StopIteration):
-            next(gen)
-
-        assert not serving.is_alive(), (
-            'http_server fixture leaked its daemon serving thread past '
-            'teardown (generator finalized via StopIteration) -- the '
-            'fixture must explicitly stop its event loop and join the '
-            'thread instead of relying on process exit to kill it.'
-        )
-    finally:
-        # Best-effort: ensure finalization ran even if an assertion above
-        # failed, so a RED failure does not leave extra servers running for
-        # the rest of the suite. No-op if already exhausted.
-        gen.close()
 
 
 # ---------------------------------------------------------------------------
