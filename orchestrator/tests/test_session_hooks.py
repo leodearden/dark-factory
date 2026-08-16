@@ -556,6 +556,112 @@ def test_run_notification_and_stop_converge_onto_spawn_claude_slug_not_uuid(
 
 
 # ---------------------------------------------------------------------------
+# Task 4193 step-1: SessionStart binds the owning claude session_id
+# ---------------------------------------------------------------------------
+
+
+def test_run_session_start_binds_claude_session_id_on_first_adoption(
+    tmp_path: Path,
+) -> None:
+    # The first hook event to adopt a spawn-claude.sh `launching` record
+    # stamps its own Claude Code session_id onto it -- the token that later
+    # tells this session apart from a nested claude that merely inherited
+    # CLAUDE_SPAWN_SESSION_ID.
+    slug = 'session-cockpit-3215040'
+    result_file = str(sr.record_path_for_slug(slug, root=tmp_path).parent / 'result.md')
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug,
+            status=sr.Status.LAUNCHING,
+            role='session',
+            project='cockpit',
+            prompt='/spawn cockpit',
+            cwd='/home/leo/src/dark-factory',
+            launcher_pid=3215040,
+            result_file=result_file,
+        ),
+        root=tmp_path,
+    )
+
+    hook_input = {'session_id': 'uuid-parent', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.claude_session_id == 'uuid-parent'
+    assert record.status == sr.Status.RUNNING
+    # The rich launching-vintage fields still survive the binding write.
+    assert record.role == 'session'
+    assert record.project == 'cockpit'
+    assert record.prompt == '/spawn cockpit'
+    assert record.launcher_pid == 3215040
+    assert record.result_file == result_file
+    dirs = list(sr.sessions_dir(root=tmp_path).iterdir())
+    assert len(dirs) == 1
+    assert dirs[0].name == slug
+
+
+def test_run_session_start_binds_claude_session_id_on_hand_launched_record(
+    tmp_path: Path,
+) -> None:
+    # No CLAUDE_SPAWN_SESSION_ID and no pre-existing record: the freshly
+    # synthesized record is bound too. Harmless (that slug already embeds
+    # the session_id, so it can never mismatch) and it keeps every record
+    # self-describing.
+    hook_input = {'session_id': 'sess-hl', 'cwd': '/home/leo/src/dark-factory'}
+
+    sh.run_session_start(hook_input, env={}, root=tmp_path)
+
+    slug = sh.hook_session_slug(hook_input, env={})
+    assert sr.read_record(slug, root=tmp_path).claude_session_id == 'sess-hl'
+
+
+def test_run_session_start_does_not_rebind_existing_claude_session_id(
+    tmp_path: Path,
+) -> None:
+    # Bind-once: a re-fired SessionStart against an already-bound record
+    # must not churn the binding.
+    slug = 'session-cockpit-3215042'
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug,
+            status=sr.Status.LAUNCHING,
+            launcher_pid=3215042,
+            claude_session_id='uuid-parent',
+        ),
+        root=tmp_path,
+    )
+    hook_input = {'session_id': 'uuid-parent', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    assert sr.read_record(slug, root=tmp_path).claude_session_id == 'uuid-parent'
+
+
+def test_run_session_start_leaves_claude_session_id_unbound_when_stdin_has_no_session_id(
+    tmp_path: Path,
+) -> None:
+    # hook_session_slug falls back to the literal 'unknown' when stdin
+    # carries no session_id; that must NEVER be bound as an owner token, or
+    # every discriminator-less session would collide on one bogus binding.
+    slug = 'session-cockpit-3215043'
+    sr.write_record(
+        sr.SessionRecord(session_slug=slug, status=sr.Status.LAUNCHING, launcher_pid=3215043),
+        root=tmp_path,
+    )
+    hook_input = {'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.claude_session_id is None
+    assert record.status == sr.Status.RUNNING
+
+
+# ---------------------------------------------------------------------------
 # Task 2510 step-1: _resolve_wm_window_id resolver (Fleet Cockpit C10 fix)
 # ---------------------------------------------------------------------------
 
