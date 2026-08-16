@@ -609,7 +609,29 @@ _CARGO_SCOPE_SAFE_NON_RS_NAMES = frozenset({'Cargo.lock', 'rust-toolchain'})
 # doesn't surface "...." dots as the cause hint.
 _PYTEST_FAILED_LINE_RE = re.compile(r'^FAILED .+$', re.MULTILINE)
 _PYTEST_INTERNALERROR_RE = re.compile(r'^INTERNALERROR>.+$', re.MULTILINE)
-_PYTEST_FAILURE_SUMMARY_RE = re.compile(r'^=+ \d+ failed.*=+$', re.MULTILINE)
+# The ``=+`` decoration is OPTIONAL (task 4066): pytest prints the tally line
+# with no ``=`` bars in two real, observed situations — (1) when an
+# ``INTERNALERROR`` aborts the session before the terminal reporter can write
+# its decorated stats line, which is exactly what verify-log 2829 captured
+# (``8 failed, 6971 passed, 216 warnings in 131.42s (0:02:11)``), and (2)
+# under ``-q`` (verbosity < 0), where the reporter writes the stats line
+# without a separator (``1 failed, 1 passed in 0.02s``). Requiring the bars is
+# what made this pattern decoration-dependent, so the trailing ``=+$`` is
+# dropped too: a line opening ``=== N failed`` is a failure summary whether or
+# not its bars are balanced. ``\b`` after ``failed`` is what does the
+# discriminating work (it rejects ``0 failedcases``); the line-anchored
+# ``\d+ failed`` prefix rejects ``1 xfailed`` and ``no tests ran``.
+#
+# Two consumers, both of which benefit — kept as ONE constant deliberately, a
+# parallel undecorated-only pattern would recreate the very
+# two-places-that-must-stay-in-sync drift task 4066 exists to fix:
+#   * _is_bare_xdist_worker_crash's no-FAILED-lines fallback, where a wider
+#     match strictly INCREASES strictness (it can only flip True -> False,
+#     never mask more).
+#   * _extract_cause_hint's ladder rung 3, where it upgrades an undecorated
+#     tally from the generic last-non-blank-line fallback to a real rung-3
+#     match.
+_PYTEST_FAILURE_SUMMARY_RE = re.compile(r'^(?:=+\s+)?\d+ failed\b.*$', re.MULTILINE)
 _PYTEST_TRACEBACK_E_RE = re.compile(r'^E   .+$', re.MULTILINE)
 _PYTEST_PROGRESS_BARE_RE = re.compile(r'^[\.FsxXEPp]+(\s+\[\s*\d+%\])?$')
 _PYTEST_PROGRESS_FILE_RE = re.compile(r'^\S+\.py [\.FsxXEPp]+(\s+\[\s*\d+%\])?$')
