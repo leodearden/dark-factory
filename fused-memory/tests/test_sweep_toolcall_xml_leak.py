@@ -279,6 +279,56 @@ class TestResolveExitCode:
 
         assert _mod.resolve_exit_code(report) != 0
 
+    # The parametrize above pins the CONSUMERS of HUMAN_ADJUDICATION_FLAGS; the
+    # pair below pins the PRODUCER — that resolve_exit_code() actually iterates
+    # the shared constant instead of keeping a private inline copy of the same
+    # four names. Without this, a regression that declared the constant but
+    # reverted the predicate to a hand-inlined or-chain would stay green,
+    # reinstating the very drift hazard task 3738 exists to remove.
+    #
+    # A monkeypatched synthetic fifth name is the probe rather than an
+    # inspect.getsource tripwire: the constant is looked up in module globals at
+    # call time, inside the function body, so patching the module attribute is a
+    # genuine RUNTIME observation of what the predicate reads. (Source-reading
+    # tripwires were deliberately removed from this suite as brittle —
+    # da8e5a4c96; see test_tool_errors.py, test_stages.py, test_mem0_tombstone.py,
+    # test_bulk_reset_guard.py.)
+    _SYNTHETIC_FLAG = 'synthetic_fifth_outcome'
+
+    def test_resolve_exit_code_reads_the_shared_flag_constant(self, monkeypatch):
+        """Grow HUMAN_ADJUDICATION_FLAGS by one name and the predicate must
+        honour it immediately.
+
+        An implementation that iterates the constant picks the new name up for
+        free; a hand-inlined or-chain ignores it and returns 0, which is exactly
+        the silent-green failure this test exists to catch."""
+        monkeypatch.setattr(
+            _mod,
+            'HUMAN_ADJUDICATION_FLAGS',
+            (*_mod.HUMAN_ADJUDICATION_FLAGS, self._SYNTHETIC_FLAG),
+        )
+        report = self._report(
+            dry_run=False, records=[{'id': 'x', self._SYNTHETIC_FLAG: True}]
+        )
+
+        assert _mod.resolve_exit_code(report) != 0
+
+    def test_an_unlisted_record_key_does_not_by_itself_fail_the_sweep(self):
+        """Negative control for the test above, and the reason it MEASURES the
+        constant.
+
+        With HUMAN_ADJUDICATION_FLAGS unpatched, the identical report exits 0 —
+        so the non-zero exit there came from the patched vocabulary and not from
+        a catch-all that treats any truthy record key as danger. Records legally
+        carry plenty of unrelated truthy keys (``repaired``, ``id``, ...), and
+        none of them is a human-adjudication outcome."""
+        assert self._SYNTHETIC_FLAG not in _mod.HUMAN_ADJUDICATION_FLAGS
+        report = self._report(
+            dry_run=False, records=[{'id': 'x', self._SYNTHETIC_FLAG: True}]
+        )
+
+        assert _mod.resolve_exit_code(report) == 0
+
 
 class TestBuildParser:
     """_build_parser — the CLI surface, testable without any live I/O."""
