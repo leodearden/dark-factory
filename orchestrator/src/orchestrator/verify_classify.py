@@ -227,7 +227,14 @@ _LINKER_SIGNAL_RE = re.compile(r'signal:?\s*7\b|SIGBUS|Bus error', re.IGNORECASE
 # that is the signal to promote the sentinel to the primary contract (or to
 # lift the marker list into per-project `verify_env` config) rather than to
 # extend the alternation again.
-_SLOT_TIMEOUT_SENTINEL_RE = re.compile(r'^[ \t]*@@REIFY_SLOT_TIMEOUT@@', re.MULTILINE)
+# Trailing capture group (task 4212) added IN PLACE rather than via a second
+# line-anchored regex, so there is exactly one `^[ \t]*@@REIFY_SLOT_TIMEOUT@@`
+# literal to keep in sync with the anchoring contract above (task 3679 /
+# reify task 4998 / esc-4791-52 — infra tests quote these lines mid-line in
+# assertion prose). Adding the group changes no match semantics: existing
+# `.search()` presence callers are unaffected, and `_has_fatal_slot_timeout_
+# sentinel` below is the only reader of `group(1)`.
+_SLOT_TIMEOUT_SENTINEL_RE = re.compile(r'^[ \t]*@@REIFY_SLOT_TIMEOUT@@([^\n]*)', re.MULTILINE)
 
 # task 4212 — reify's slot-timeout sentinel carries `disposition=<fatal|soft>`
 # (reify scripts/lib_slot_acquire.sh:147, closed vocabulary documented at
@@ -238,7 +245,58 @@ _SLOT_TIMEOUT_SENTINEL_RE = re.compile(r'^[ \t]*@@REIFY_SLOT_TIMEOUT@@', re.MULT
 # is a soft ADMISSION: it proceeds unslotted, the member still runs, and
 # run_all still exits 0. A soft deadline is a degraded-but-healthy pool,
 # not an infra hold, so it must not reach an INFRA_TRANSIENT category.
-_SLOT_TIMEOUT_SOFT_DISPOSITION_RE = re.compile(r'\bdisposition=soft\b')
+#
+# `lock=` is emitted LAST in the marker (reify lib_slot_acquire.sh:124-133,
+# docs/notes/verify-pipeline-knobs.md:74) because LOCK_BASE is the ONE
+# operator-controlled field (`REIFY_TEST_SEMAPHORE_LOCK` /
+# `REIFY_OCCT_LOCK` / `REIFY_LANE_X_FLOCK_LOCK` / `REIFY_RUN_ALL_POOL_LOCK`
+# and their TMPDIR-derived defaults) and so the only one that can contain
+# whitespace or arbitrary text. `_SLOT_TIMEOUT_LOCK_FIELD_RE` finds that
+# boundary so the disposition parse below never reads past it — an
+# operator-chosen lock path containing the literal `disposition=soft` (or
+# `disposition=fatal`) can therefore neither suppress nor forge a
+# classification.
+_SLOT_TIMEOUT_DISPOSITION_RE = re.compile(r'\bdisposition=(\S+)')
+_SLOT_TIMEOUT_LOCK_FIELD_RE = re.compile(r'\slock=')
+
+
+def _has_fatal_slot_timeout_sentinel(output: str) -> bool:
+    """True when *output* carries at least one ``@@REIFY_SLOT_TIMEOUT@@``
+    sentinel line that is NOT ``disposition=soft``.
+
+    Evaluated PER LINE via ``finditer`` — never as a single whole-output
+    ``disposition=soft`` search — because *output* is the ENTIRE aggregated
+    verify-leg output (stderr merged into stdout), and a soft pool deadline
+    and a fatal test-slot deadline CAN co-occur in one leg (reify's
+    ``run_all.sh`` pool worker in one phase, ``lib_test_semaphore.sh`` in
+    another). ANY non-soft sentinel line wins: a soft line must never veto a
+    co-occurring fatal one.
+
+    The disposition is read ONLY from the line's HEAD — the text before the
+    first `` lock=`` — and the FIRST ``disposition=`` match there is taken.
+    Both restrictions exist for the same reason (see the field-order comment
+    above ``_SLOT_TIMEOUT_DISPOSITION_RE``): ``lock=`` is the sole
+    operator-controlled field, so confining the parse to the head means an
+    operator-chosen lock path can neither forge nor suppress the
+    classification.
+
+    FAIL-SAFE DIRECTION: a sentinel line with no ``disposition`` field
+    (older reify — the field is additive and reify's emit stays
+    prefix-compatible with the anchor), an unrecognized future token, or a
+    malformed line are all treated as NOT soft, i.e. this returns ``True``
+    — matching pre-4212 behavior. A missed starvation abort is a silent
+    infra hold nobody sees; an over-classified soft admission is visible
+    and only reachable when the producer explicitly says ``soft``.
+    """
+    for match in _SLOT_TIMEOUT_SENTINEL_RE.finditer(output):
+        tail = match.group(1)
+        lock = _SLOT_TIMEOUT_LOCK_FIELD_RE.search(tail)
+        head = tail[: lock.start()] if lock else tail
+        field = _SLOT_TIMEOUT_DISPOSITION_RE.search(head)
+        if field is None or field.group(1) != 'soft':
+            return True
+    return False
+
 
 _SLOT_ACQUIRE_DEADLINE_RE = re.compile(
     r'^[ \t]*(?:ERROR: )?'
@@ -493,17 +551,36 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     ADMISSION: it proceeds unslotted, the member still runs, and run_all
     itself still exits 0. A soft deadline is a degraded-but-healthy pool, not
     an infra hold, so a ``disposition=soft`` sentinel must not reach
-    SEMAPHORE_TIMEOUT (``_SLOT_TIMEOUT_SOFT_DISPOSITION_RE`` above). The
-    BASENAME half (``_SLOT_ACQUIRE_DEADLINE_RE``) is deliberately left
-    UNGATED: all three allowlisted emitters call ``slot_acquire`` without a
-    6th argument and so take the ``fatal`` default, and their deadline lines
-    carry no ``disposition`` field to parse in the first place. Fail-safe
-    direction: demote ONLY on an explicit, literal ``disposition=soft`` — a
-    marker with no disposition field (older reify), an unknown future token,
-    or a malformed line all keep classifying SEMAPHORE_TIMEOUT, matching
-    today's pre-4212 behavior, because a missed starvation abort is a silent
-    infra hold nobody sees, while an over-classified soft admission is
-    visible and only reachable when the producer explicitly says so.
+    SEMAPHORE_TIMEOUT (``_has_fatal_slot_timeout_sentinel`` /
+    ``_SLOT_TIMEOUT_DISPOSITION_RE`` above). The BASENAME half
+    (``_SLOT_ACQUIRE_DEADLINE_RE``) is deliberately left UNGATED: all three
+    allowlisted emitters call ``slot_acquire`` without a 6th argument and so
+    take the ``fatal`` default, and their deadline lines carry no
+    ``disposition`` field to parse in the first place.
+
+    The disposition is evaluated PER SENTINEL LINE, never as a single
+    whole-output search: *output* is the ENTIRE aggregated verify-leg output
+    (stderr merged into stdout, same aggregation the ORDERING note above
+    already reasons about), so a soft pool deadline and a fatal test-slot
+    deadline CAN co-occur in one leg, and a whole-output soft search would
+    let the soft line veto a genuine co-occurring abort. ANY non-soft
+    sentinel line wins. Within a line, the disposition is read ONLY from the
+    HEAD — the text before the first `` lock=`` — because ``lock=`` is the
+    marker's sole OPERATOR-controlled field (reify's field-order contract,
+    lib_slot_acquire.sh:124-133); confining the parse to the head means an
+    operator-chosen lock path can neither forge nor suppress the
+    classification, pinned by
+    ``TestSoftDispositionDoesNotVetoAGenuineSlotTimeout``'s lock-path-forgery
+    cases in both directions.
+
+    Fail-safe direction, unchanged since the field was first read: demote
+    ONLY on an explicit, literal ``disposition=soft`` — a sentinel line with
+    no disposition field (older reify; the field is additive and reify's
+    emit stays prefix-compatible with the anchor), an unrecognized future
+    token, or a malformed line all keep classifying SEMAPHORE_TIMEOUT,
+    matching pre-4212 behavior, because a missed starvation abort is a
+    silent infra hold nobody sees, while an over-classified soft admission
+    is visible and only reachable when the producer explicitly says so.
 
     What this replaced, and why it had to go: the arm previously fired when a
     lock/slot/semaphore token appeared ANYWHERE in *output* together with a
@@ -634,20 +711,14 @@ def _classify_environmental(output: str) -> FailureCategory | None:
         return FailureCategory.ENV_TRANSIENT
     if is_interpreter_missing_workspace_packages(output):
         return FailureCategory.ENV_TRANSIENT
-    # task 4212: the SENTINEL half fires only when *output* carries no
-    # whole-output `disposition=soft` token — demoting ONLY on that explicit,
-    # literal marker. A field-absent (older reify), unknown-token, or
-    # malformed marker keeps today's pre-4212 behavior and classifies, since
-    # a missed starvation abort is a silent infra hold nobody sees, while an
-    # over-classified soft admission is visible and only reachable when the
-    # producer explicitly says `soft`. The BASENAME half stays UNGATED — its
-    # three allowlisted emitters take `slot_acquire`'s `fatal` default and
-    # carry no `disposition` field at all (see `_SLOT_TIMEOUT_SOFT_DISPOSITION_RE`
-    # above for the full grounding).
-    if (
-        _SLOT_TIMEOUT_SENTINEL_RE.search(output)
-        and not _SLOT_TIMEOUT_SOFT_DISPOSITION_RE.search(output)
-    ) or _SLOT_ACQUIRE_DEADLINE_RE.search(output):
+    # task 4212: the SENTINEL half fires only when at least one
+    # @@REIFY_SLOT_TIMEOUT@@ line is NOT disposition=soft, evaluated PER LINE
+    # (`_has_fatal_slot_timeout_sentinel` above) so a soft line can never veto
+    # a co-occurring fatal one. The BASENAME half stays UNGATED — its three
+    # allowlisted emitters take `slot_acquire`'s `fatal` default and carry no
+    # `disposition` field at all (see `_SLOT_TIMEOUT_DISPOSITION_RE` above
+    # for the full grounding).
+    if _has_fatal_slot_timeout_sentinel(output) or _SLOT_ACQUIRE_DEADLINE_RE.search(output):
         return FailureCategory.SEMAPHORE_TIMEOUT
     return None
 
