@@ -1597,6 +1597,70 @@ class TestCiteTaskCrossProjectNearCollision:
             (c['project_id'], c['task_id']) for c in foreign_resolved[1].cited_tasks
         ] == [('other_project', '42')]
 
+    @pytest.mark.asyncio
+    async def test_skipped_fold_does_not_steal_the_anchor(self):
+        """A skipped near-collision must not disable dedup for every
+        subsequent same-project duplicate of that task — first registrant
+        keeps the derived-sig anchor.
+
+        cite_task's registration tail assigns the derived sig
+        unconditionally when entity_fold_eligible, so a foreign finding
+        whose fold was SKIPPED would still overwrite the anchor. A later
+        genuine same-project duplicate would then compare against the
+        FOREIGN citation, see a mismatch, and stop folding — turning a
+        cross-project over-fold into a same-project under-fold. `third`
+        folds onto `local` on unmodified code, so this is behaviour
+        preservation, not a new rule.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='run-1', stage='task_knowledge_sync', project_id='dark_factory')
+
+        local = state.add_finding(
+            run_id='run-1', severity='low', category='memory_stale',
+            description='local 42 is stale', suggested_action='a',
+            task_id='42', flag_type='X',
+        )
+        assert 'finding_id' in local, local
+        local_id = local['finding_id']
+
+        cite_local = await state.cite_task('run-1', local_id, 'dark_factory', '42')
+        assert 'error' not in cite_local, cite_local
+
+        foreign = state.add_finding(
+            run_id='run-1', severity='low', category='memory_stale',
+            description='foreign 42, worded differently', suggested_action='a',
+            task_id=None, flag_type='X',
+        )
+        assert 'finding_id' in foreign, foreign
+        foreign_id = foreign['finding_id']
+
+        cite_foreign = await state.cite_task('run-1', foreign_id, 'other_project', '42')
+        assert 'error' not in cite_foreign, cite_foreign
+
+        # Comma-joined so its OWN add_finding signature ('42,7777', 'X') is
+        # fresh; '42' is a member of its parts, so it is entity-fold-eligible
+        # for the ('42', 'X') derived sig.
+        third = state.add_finding(
+            run_id='run-1', severity='low', category='memory_stale',
+            description='third 42 mention, worded differently', suggested_action='a',
+            task_id='42,7777', flag_type='X',
+        )
+        assert 'finding_id' in third, third
+        third_id = third['finding_id']
+
+        result = await state.cite_task('run-1', third_id, 'dark_factory', '42')
+
+        # The ORIGINAL anchor, not the foreign finding that skipped its fold.
+        assert result.get('error') == 'duplicate_finding'
+        assert result.get('existing_finding_id') == local_id
+
+        assert state._resolve_finding('run-1', third_id) is None
+
+        report = state.get_assembled_report('run-1', 'task_knowledge_sync')
+        assert report is not None
+        ids = {item['finding_id'] for item in report['flagged_items']}
+        assert ids == {local_id, foreign_id}
+
 
 # ---------------------------------------------------------------------------
 # task-4184 step-1/step-3: TestCiteTaskFoldPurgeLogging — RED until step-2/4
