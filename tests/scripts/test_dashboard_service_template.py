@@ -1417,6 +1417,74 @@ def test_systemd_analyze_skip_reason_requires_both_binary_and_user_runtime_dir(
     assert reason is None
 
 
+def test_backoff_canary_is_the_shape_systemd_must_warn_about(
+    tmp_path: pathlib.Path,
+) -> None:
+    """_write_backoff_canary must produce a unit systemd will actually warn about.
+
+    This pins the shape of the positive control that
+    test_systemd_analyze_verify_reports_no_ignored_directives uses below (its
+    docstring point 7): a canary deliberately defective in exactly the way
+    systemd's own pairing warning reports, so a verify run that draws no
+    warning for it means the invocation checked nothing, not that everything
+    is fine.  Pinned here host-independently -- (a) and (c) need no systemd
+    runtime -- so it holds even on a host where the canary can never actually
+    be FIRED through systemd-analyze.
+
+    (a) The trap is armed and not defused, checked through the repo's own
+        backoff invariant rather than by re-deriving the pairing rule by
+        hand: the canary must trip _assert_restart_backoff_effective's "but
+        no RestartSteps=" branch, backed by two direct reads of the
+        directives that branch depends on.
+
+    (b) The canary declares an ExecStart=.  LOAD-BEARING, not decoration.
+        Measured 2026-08-16 in this worktree (systemd 255.4-1ubuntu8.17): a
+        [Service]-only unit carrying just the restart stanza -- the bare
+        ``no_steps`` body test_restart_backoff_guard_rejects_ineffective_units
+        writes at :1121 -- is REFUSED by systemd-analyze before it ever
+        reaches the pairing check::
+
+          canary-noexec.service: Service has no ExecStart=, ExecStop=, or
+          SuccessAction=. Refusing.
+          Unit canary-noexec.service has a bad unit file setting.
+
+        (exit 1, and ZERO "Ignoring." line for the canary).  Adding
+        ``ExecStart=/bin/true`` to the same stanza restores the warning::
+
+          canary-exec.service: Service has RestartMaxDelaySec= but no
+          RestartSteps= setting. Ignoring.
+
+        (exit 0).  A canary left in the first shape would make the positive
+        control below FAIL on every healthy host -- the same defect class
+        this whole task removes, a guard reporting the opposite of the
+        truth.
+
+    (c) The written trap is detectable by the same filter the positive
+        control uses below (_ignored_directive_lines), read under the
+        canary's own path -- connecting the two halves of the mechanism
+        rather than pinning them in isolation.  The line asserted here is
+        real output measured today, not invented.
+    """
+    canary = _write_backoff_canary(tmp_path)
+
+    # (a) Armed, not defused.
+    with pytest.raises(AssertionError, match="but no RestartSteps="):
+        _assert_restart_backoff_effective(canary)
+    assert _restart_directive(canary, "RestartMaxDelaySec") is not None
+    assert _restart_directive(canary, "RestartSteps") is None
+
+    # (b) ExecStart present -- see docstring point (b) for why this is
+    # load-bearing rather than incidental.
+    assert _restart_directive(canary, "ExecStart") is not None
+
+    # (c) Detectable by the same filter the positive control below uses.
+    line = (
+        f"{canary.name}: Service has RestartMaxDelaySec= but no "
+        "RestartSteps= setting. Ignoring."
+    )
+    assert _ignored_directive_lines(line, canary) == [line]
+
+
 @pytest.mark.skipif(
     _SYSTEMD_ANALYZE_SKIP_REASON is not None,
     reason=_SYSTEMD_ANALYZE_SKIP_REASON or "",
