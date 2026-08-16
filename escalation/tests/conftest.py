@@ -186,9 +186,30 @@ async def _mcp_handshake_ready(base_url: str) -> bool:
     return True
 
 
-@pytest.fixture
+@pytest.fixture(scope='module')
 def serve_escalation_mcp():
     """Factory: serve a REAL escalation MCP server over REAL HTTP.
+
+    MODULE-scoped (task 3736), which is a contract, not a tuning choice:
+    pytest caches one instance per REQUESTING module, and a fixture may not
+    depend on a NARROWER-scoped one. Both consumer ``http_server`` fixtures
+    (``test_capability_guard_http.py``, ``test_status_authority_gate.py``) are
+    module-scoped by design -- each shares ONE server and ONE
+    ``EscalationQueue`` across its whole module -- so while this factory was
+    function-scoped they could not delegate to it at all (``ScopeMismatch``),
+    which is why each carried its own copy of this machinery.
+
+    Function-scoped consumers (``test_legibility_census_escalation_e2e.py``)
+    are unaffected in SAFETY: requesting a broader-scoped fixture from a
+    narrower one is always legal, and every factory call still starts an
+    independent server on its own ephemeral port. What changes for them is
+    teardown TIMING -- every server started within one test module is now torn
+    down together at that module's end, under the same bounded 5s join +
+    assert below, instead of one-by-one after each test. Bounded and small
+    today (that module has 5 tests, so ~5 concurrent servers at peak); if a
+    module ever grows enough for the accumulation to matter, the mechanical
+    fix is to split this into a shared ``_impl`` generator plus two thin
+    fixtures of differing scope.
 
     Call as ``serve_escalation_mcp(queue_dir)`` -> ``(base_url, port, queue)``.
     Builds ``EscalationQueue(queue_dir)`` + ``create_server(queue,
