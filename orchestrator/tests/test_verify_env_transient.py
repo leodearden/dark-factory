@@ -749,6 +749,72 @@ _XDIST_CRASH_KNOWN_FLAKE_PLUS_INTERNALERROR_OUTPUT = (
 )
 
 
+# task 4066: a TRIMMED, VERBATIM transcription of the real captured verify log
+# data/verify-logs/2829/attempt-1.fused-memory.test-20260720T142419_980341Z.log
+# (log lines 84-87, 106-107 and 144-155). That run had 8 GENUINE failures, yet
+# _is_bare_xdist_worker_crash returned True on it: the xdist worker crashes
+# aborted the session through an INTERNALERROR in xdist's own loadscope
+# scheduler, so pytest never printed the per-test ``FAILED`` short-summary
+# block NOR the decorated ``=== N failed ===`` stats line — leaving a marker
+# profile of ZERO ``^FAILED `` lines, ZERO ``^E   `` lines, ZERO ``^ERROR ``
+# lines and 47 ``^INTERNALERROR>`` lines, with an UNDECORATED final tally.
+#
+# Transcribed inline rather than checked in as a log asset: data/ is untracked
+# runtime state (absent from task worktrees entirely), and this module's
+# established _XDIST_*_OUTPUT convention keeps the marker profile visible at
+# the assertion site — which matters here, because the point of the fixture is
+# what is ABSENT from it.
+_XDIST_CRASH_REAL_LOG_2829_OUTPUT = (
+    '...[gw14] node down: Not properly terminated\n'
+    'F[gw24] node down: Not properly terminated\n'
+    'F.[gw2] node down: Not properly terminated\n'
+    'F...F................................................................... [ 73%]\n'
+    '........................INTERNALERROR> Traceback (most recent call last):\n'
+    'INTERNALERROR>   File "/home/leo/src/dark-factory/.worktrees/_merge-337571ee/.venv/lib/python3.13/site-packages/_pytest/main.py", line 318, in wrap_session\n'
+    'INTERNALERROR>   File "/home/leo/src/dark-factory/.worktrees/_merge-337571ee/.venv/lib/python3.13/site-packages/xdist/scheduler/loadscope.py", line 354, in schedule\n'
+    'INTERNALERROR>     self._reschedule(node)\n'
+    'INTERNALERROR>     ~~~~~~~~~~~~~~~~^^^^^^\n'
+    'INTERNALERROR>   File "/home/leo/src/dark-factory/.worktrees/_merge-337571ee/.venv/lib/python3.13/site-packages/xdist/scheduler/loadscope.py", line 336, in _reschedule\n'
+    'INTERNALERROR>     self._assign_work_unit(node)\n'
+    'INTERNALERROR>     ~~~~~~~~~~~~~~~~~~~~~~^^^^^^\n'
+    'INTERNALERROR>   File "/home/leo/src/dark-factory/.worktrees/_merge-337571ee/.venv/lib/python3.13/site-packages/xdist/scheduler/loadscope.py", line 275, in _assign_work_unit\n'
+    'INTERNALERROR>     worker_collection = self.registered_collections[node]\n'
+    'INTERNALERROR>                         ~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^\n'
+    'INTERNALERROR> KeyError: <WorkerController gw35>\n'
+    '\n'
+    '8 failed, 6971 passed, 216 warnings in 131.42s (0:02:11)\n'
+)
+
+# task 4066, ISOLATING fixture: crash signature + INTERNALERROR ONLY. No tally
+# line of EITHER form, no FAILED line, no ``E   `` line — so the summary-regex
+# widening cannot green this and only the INTERNALERROR veto in the
+# no-FAILED-lines fallback can. The FAILED-lines branch has vetoed on this same
+# surface since task 3514 (see _XDIST_CRASH_KNOWN_FLAKE_PLUS_INTERNALERROR_OUTPUT
+# above, its direct analogue); the no-FAILED-lines fallback had not, and that
+# asymmetry is the defect.
+_XDIST_CRASH_NO_FAILED_PLUS_INTERNALERROR_OUTPUT = (
+    _XDIST_WORKER_CRASH_OUTPUT
+    + 'INTERNALERROR> Traceback (most recent call last):\n'
+    + 'INTERNALERROR> KeyError: <WorkerController gw35>\n'
+)
+
+# task 4066, ISOLATING fixture: crash signature + an ERROR (fixture/setup)
+# short-summary line ONLY. Same isolation discipline as above — no tally, no
+# FAILED, no ``E   `` line.
+_XDIST_CRASH_NO_FAILED_PLUS_ERROR_NODEID_OUTPUT = (
+    _XDIST_WORKER_CRASH_OUTPUT
+    + 'ERROR orchestrator/tests/test_other.py::test_needs_fixture - '
+    'Exception: fixture setup failed\n'
+)
+
+# task 4066, ISOLATING fixture: crash signature + a whole-module collection
+# ERROR (bare file, no ``::``) ONLY. Same isolation discipline as above.
+_XDIST_CRASH_NO_FAILED_PLUS_COLLECTION_ERROR_OUTPUT = (
+    _XDIST_WORKER_CRASH_OUTPUT
+    + "ERROR orchestrator/tests/test_broken.py - ImportError: cannot import name 'foo'\n"
+)
+
+
 class TestBareXdistWorkerCrashDetector:
     """task 2365 step-1: verify._is_bare_xdist_worker_crash(output) pure helper.
 
@@ -879,6 +945,85 @@ class TestBareXdistWorkerCrashDetector:
         """
         result = verify._is_bare_xdist_worker_crash(
             _XDIST_CRASH_KNOWN_FLAKE_PLUS_INTERNALERROR_OUTPUT
+        )
+        assert result is False
+
+    def test_real_captured_log_2829_with_internalerror_is_false(self):
+        """task 4066: the REAL captured verify-log 2829 output -> False.
+
+        Provenance: data/verify-logs/2829/attempt-1.fused-memory.test-
+        20260720T142419_980341Z.log — a real run with 8 GENUINE failures,
+        transcribed inline here because data/ is untracked runtime state and
+        so cannot be referenced as a checked-in asset.
+
+        The asymmetry this closes: the FAILED-lines branch (verify.py:711-715)
+        already vetoes on INTERNALERROR / ERROR-nodeid / ERROR-file, but the
+        no-FAILED-lines fallback (verify.py:724-727) did not. Because the
+        INTERNALERROR aborted the session, pytest printed NO ``FAILED`` short
+        summary and NO decorated ``=== N failed ===`` stats line, so BOTH of
+        the fallback's two markers missed and a run carrying 8 real failures
+        was reclassified as transient infra and silently retried.
+
+        The four marker assertions pin exactly WHY the pre-fix code returned
+        True, so a later edit to the transcription (or to a regex) that
+        changes the shape fails loudly instead of silently weakening this
+        test into a tautology.
+        """
+        output = _XDIST_CRASH_REAL_LOG_2829_OUTPUT
+        assert verify._XDIST_WORKER_CRASH_RE.search(output) is not None
+        assert verify._PYTEST_FAILED_LINE_RE.findall(output) == []
+        assert verify._PYTEST_TRACEBACK_E_RE.findall(output) == []
+        assert len(verify._PYTEST_INTERNALERROR_RE.findall(output)) > 0
+
+        assert verify._is_bare_xdist_worker_crash(output) is False
+
+    def test_no_failed_lines_plus_internalerror_is_false(self):
+        """task 4066: crash signature + INTERNALERROR and NO FAILED line -> False.
+
+        The FAILED-lines branch (verify.py:711-715) has vetoed on
+        ``INTERNALERROR>`` since task 3514; the no-FAILED-lines fallback
+        (verify.py:724-727) did not, so an output carrying this surface and
+        no FAILED line was reclassified as transient infra. An INTERNALERROR
+        produces no FAILED line of its own, which is precisely why it lands
+        in THIS branch — the least defensible place to omit the veto.
+
+        Isolating by construction: no tally line of either form, so the
+        failure-summary regex widening cannot green this test.
+        """
+        result = verify._is_bare_xdist_worker_crash(
+            _XDIST_CRASH_NO_FAILED_PLUS_INTERNALERROR_OUTPUT
+        )
+        assert result is False
+
+    def test_no_failed_lines_plus_error_nodeid_is_false(self):
+        """task 4066: crash signature + an ERROR (fixture/setup) line and NO
+        FAILED line -> False.
+
+        Same asymmetry as above for the ``ERROR <nodeid>`` surface: vetoed in
+        the FAILED-lines branch (verify.py:713), absent from the
+        no-FAILED-lines fallback. A fixture/setup ERROR produces no FAILED
+        line of its own, so this branch is where it is actually seen.
+
+        Isolating by construction: no tally line of either form.
+        """
+        result = verify._is_bare_xdist_worker_crash(
+            _XDIST_CRASH_NO_FAILED_PLUS_ERROR_NODEID_OUTPUT
+        )
+        assert result is False
+
+    def test_no_failed_lines_plus_collection_error_is_false(self):
+        """task 4066: crash signature + a whole-module collection ERROR (bare
+        file, no ``::``) and NO FAILED line -> False.
+
+        Same asymmetry as the two cases above, for the ``ERROR <file.py>``
+        collection-failure surface vetoed at verify.py:714 in the
+        FAILED-lines branch only. A collection failure produces no FAILED
+        line of its own.
+
+        Isolating by construction: no tally line of either form.
+        """
+        result = verify._is_bare_xdist_worker_crash(
+            _XDIST_CRASH_NO_FAILED_PLUS_COLLECTION_ERROR_OUTPUT
         )
         assert result is False
 
