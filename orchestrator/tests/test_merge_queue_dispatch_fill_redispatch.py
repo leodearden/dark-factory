@@ -40,6 +40,7 @@ Step map:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 from typing import Any
 from unittest.mock import MagicMock
@@ -150,15 +151,44 @@ async def _teardown_fill_drive(
     task: asyncio.Task,  # type: ignore[type-arg]
     worker: SpeculativeMergeWorker,
 ) -> None:
-    """Unblock and cancel a ``_verifier_loop`` task driven by :func:`_drive_fill`.
+    """Unblock and shut down a ``_verifier_loop`` task driven by :func:`_drive_fill`.
 
     Shared by every test in this module so a RED failure and a GREEN success
     path both leave no dangling task / pending-task warning behind: release
-    every gated verify task, cancel the loop task, and cancel any persistent
+    every gated verify task, shut the loop down, and cancel any persistent
     ``_pending_verifier_get`` getter the QueueEmpty race may have launched.
+
+    Teardown goes through ``worker.stop()`` -- NOT a bare ``task.cancel()`` --
+    mirroring how ``TestLastItemOfBurstFinalizes``
+    (``test_merge_queue_concurrent_verify.py``) tears down the analogous
+    queue-sourced steady state.  ``stop()``'s protocol (resolve/cancel
+    ``_pending_verifier_get``, drain, then a ``None`` sentinel on
+    ``_verifier_queue``) is the teardown ``_verifier_loop``'s FINALIZE-HEAD
+    "Reuse the persistent getter" branch actually unwinds from, and it is
+    internally bounded (its ``asyncio.wait(..., timeout=...)``), so it cannot
+    hang this helper.
+
+    A bare ``task.cancel()`` is NOT sufficient there, for a reason that is
+    **pre-existing and unrelated to task 3276**: that branch's recovery clause
+    (``except asyncio.CancelledError: item = await self._verifier_queue.get()``
+    in ``merge_queue.py``) was written for ``stop()``'s ordering and cannot
+    distinguish "only ``_pending_verifier_get`` was cancelled" from "the whole
+    ``_verifier_loop`` task is being cancelled".  It absorbs the single
+    cancellation request delivered through the transitively-cancelled getter
+    and re-parks on a fresh, uncancelled ``get()``, so ``await task`` never
+    returns.  This reproduces on the pre-task-3276 baseline for a purely
+    queue-sourced dispatch (a shape the DISPATCH-FILL guard never gated), and
+    is reachable in production from ``SpeculativeMergeWorker.run()``'s own raw
+    ``cancel()``/``gather()`` shutdown path; it is filed as its own follow-up.
+    These tests fence the DISPATCH-FILL predicate, not cancellation semantics,
+    so they must not depend on that path being clean -- the loop's own
+    docstring already flags raw external cancellation as an accepted edge case.
     """
     drive.gate.set()
-    task.cancel()
+    with contextlib.suppress(BaseException):
+        await worker.stop()
+    if not task.done():
+        task.cancel()
     await asyncio.gather(task, return_exceptions=True)
     if worker._pending_verifier_get is not None:
         pending = worker._pending_verifier_get
