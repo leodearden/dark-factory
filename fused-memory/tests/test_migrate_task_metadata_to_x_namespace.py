@@ -25,6 +25,7 @@ import importlib.util
 import json
 import sys
 import types
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -658,9 +659,11 @@ class _FakeClient:
 
     def __init__(self, url: str = 'http://fake.invalid', *, row: dict | None = None):
         self.url = url
-        self.row = _deep_copy(row if row is not None else _PENDING_TASK_ROW)
+        self.row: dict = _deep_copy(row if row is not None else _PENDING_TASK_ROW)
         self.calls: list[tuple[str, dict]] = []
-        self.get_task_script: list = []
+        # Per-call `get_task` replies: a payload to return verbatim, a callable
+        # handed a copy of the live row, or None to serve the live row.
+        self.get_task_script: list[dict | Callable[[dict], dict] | None] = []
         self._get_task_calls = 0
 
     @property
