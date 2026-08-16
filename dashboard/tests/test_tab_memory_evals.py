@@ -793,6 +793,164 @@ def test_index_html_cache_buster_floor(index_html_body: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Presence-grep contracts and their mutation guard (task 3471)
+# ---------------------------------------------------------------------------
+
+# (label, pattern, deletion targets) for every POSITIVE presence assertion in
+# this file — the live assertion below consumes the pattern from here, so the
+# guard and the assertion cannot drift apart.
+#
+# A presence grep has TWO ways to pass without proving anything, and this table
+# exists because both were live:
+#
+#   1. COMMENT FALSE PASS — the grep runs over the raw served body, and the
+#      ~150 lines of explanatory prose in the .jsx name most of the payload
+#      fields the render code names.  Delete the render site, keep the comment,
+#      stay green.  The `tab_memory_evals_jsx_code` fixture already exists for
+#      this; the assertions below simply had not all been moved onto it.
+#   2. NON-DISCRIMINATING PATTERN — the grep runs over code, but the string it
+#      hunts for occurs somewhere OTHER than the render site it is about.
+#      `MEMORY_EVALS` also occurs in `window.DF_MEMORY_EVALS_FMT` and the export
+#      statement; `truncated` also occurs in the operator-facing "(truncated)"
+#      label.  Switching such a grep to comment-stripped source closes hole (1)
+#      and leaves hole (2) wide open — the same false pass, one layer down.
+#
+# `_deletions` are LITERAL substrings removed from the comment-stripped source
+# to build the mutant.  The result is not valid JSX and is not meant to be:
+# this is a text-level falsification check, and requiring a parseable mutant
+# would mean shipping a JSX parser to test a grep.
+_PRESENCE_CONTRACTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    (
+        'window.DF_MEMORY_EVALS export',
+        r'window\.DF_MEMORY_EVALS = \{',
+        ('window.DF_MEMORY_EVALS = { MemoryEvalsSection };',),
+    ),
+    (
+        'DF_DATA.MEMORY_EVALS payload read',
+        r'MEMORY_EVALS',
+        ('const payload = MEDF.MEMORY_EVALS;',),
+    ),
+    (
+        'charts.jsx primitive is used',
+        r'\b(MESpark|MEStep|METile|MELine|Sparkline|StepSpark|StatTile|LineChart)\b',
+        (
+            'Sparkline: MESpark, StepSpark: MEStep',
+            'ME_CHART_BY_TAG = { step: MEStep, spark: MESpark }',
+        ),
+    ),
+    (
+        'eval-level truncation disclosure',
+        r'\btruncated\b',
+        ('{ev.truncated && (',),
+    ),
+    (
+        'provenance is collapsed by default',
+        r'<details|useOpenSet|usePersistedState|localStorage',
+        ('<details',),
+    ),
+)
+
+
+def _comments_only(body: str) -> str:
+    """Just the comments — the exact complement of the `code` fixture's strip.
+
+    The `tab_memory_evals_jsx_code` fixture is
+    ``re.sub(r'/\\*[\\s\\S]*?\\*/|//[^\\n]*', '', body)``; this is
+    ``re.findall`` of the same expression.  Derived from one regex rather than
+    written twice on purpose: if the strip is ever widened, the projection this
+    guard tests against widens with it instead of silently going stale.
+    """
+    return '\n'.join(re.findall(r'/\*[\s\S]*?\*/|//[^\n]*', body))
+
+
+def _resolved_pattern(pattern: str, code: str) -> str:
+    """Substitute `{alias}` with the file's own `window.DF_DATA` local.
+
+    Derive-don't-pin, the idiom this file already uses for `lim_local` and the
+    cross-file prop names: renaming the alias is a refactor and must not fail a
+    test, while DELETING the payload read must.
+    """
+    if '{alias}' not in pattern:
+        return pattern
+    match = re.search(r'const\s+(\w+)\s*=\s*window\.DF_DATA\s*;', code)
+    assert match is not None, (
+        'no `const <alias> = window.DF_DATA;` in tab_memory_evals.jsx, so the '
+        'payload-read patterns below cannot be anchored to it. If the file stopped '
+        'aliasing DF_DATA, re-derive the anchor rather than pinning a spelling.'
+    )
+    return pattern.replace('{alias}', re.escape(match.group(1)))
+
+
+def test_presence_greps_are_falsified_by_deleting_the_code(
+    tab_memory_evals_jsx_body: str,
+    tab_memory_evals_jsx_code: str,
+) -> None:
+    """Every presence grep must go RED when the code it is about is deleted.
+
+    The task this test lands with prescribes exactly this discipline — "verify
+    each switch by mutation (delete the accessing expression → the assertion
+    must go red)" — as a MANUAL procedure.  A manual check leaves no evidence
+    and is not re-run: item (2a) of that task exists precisely because it was
+    not re-run when the .jsx comment block grew and quietly swallowed one more
+    assertion.  Making it executable is what stops the rot being fixed here
+    from simply recurring.
+
+    Three arms per contract, each closing a different way to pass vacuously:
+
+    (1) MATCHES the real comment-stripped source — otherwise the pattern is
+        wrong and the live assertion is about nothing.
+    (2) does NOT match once the accessing expression is deleted — the pattern
+        actually discriminates, rather than being satisfied by some unrelated
+        occurrence of the same string elsewhere in the file.
+    (3) does NOT match the comments-only projection — the pattern is answered
+        by CODE, not by prose that merely describes the code.
+
+    Arm (3) is deliberately stronger than "run it over the stripped fixture".
+    Both are needed: the fixture is what the live assertion reads, and this arm
+    is what stops a pattern so loose that a future comment re-opens the hole.
+    """
+    code = tab_memory_evals_jsx_code
+    comments = _comments_only(tab_memory_evals_jsx_body)
+    assert comments.strip(), (
+        'the comments-only projection is EMPTY, so arm (3) below would pass for '
+        'every pattern without checking anything. The .jsx carries ~150 lines of '
+        'prose — an empty projection means the strip regex and this complement '
+        'have diverged.'
+    )
+
+    for label, pattern, deletions in _PRESENCE_CONTRACTS:
+        resolved = _resolved_pattern(pattern, code)
+
+        assert re.search(resolved, code, re.MULTILINE), (
+            f'[{label}] pattern {resolved!r} does not match the comment-stripped '
+            'source at all. The live assertion that consumes it is therefore about '
+            'nothing — fix the pattern, not this guard.'
+        )
+
+        mutated = code
+        for target in deletions:
+            assert target in mutated, (
+                f'[{label}] the deletion target {target!r} is not present in the '
+                'comment-stripped source, so the falsification below would be '
+                'vacuous. The code moved; re-locate the accessing expression.'
+            )
+            mutated = mutated.replace(target, '')
+        assert not re.search(resolved, mutated, re.MULTILINE), (
+            f'[{label}] pattern {resolved!r} STILL matches after deleting '
+            f'{deletions!r}. It does not discriminate: something other than the '
+            'render site satisfies it, so the live assertion would stay green with '
+            'the feature removed. Anchor the pattern to the accessing expression.'
+        )
+
+        assert not re.search(resolved, comments, re.MULTILINE), (
+            f'[{label}] pattern {resolved!r} is satisfied by the .jsx COMMENTS '
+            'alone. A mention is not a render: delete the code, keep the prose, and '
+            'the live assertion stays green. Anchor the pattern to code syntax the '
+            'prose does not reproduce.'
+        )
+
+
+# ---------------------------------------------------------------------------
 # step-5 tests: tab_memory_evals.jsx is served and renders eval cards + trends
 # ---------------------------------------------------------------------------
 
