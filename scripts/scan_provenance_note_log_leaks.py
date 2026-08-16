@@ -205,6 +205,8 @@ def _build_parser() -> argparse.ArgumentParser:
         # beside NO_DB_RESOLVED_MESSAGE) is just a --help-visible copy of that
         # contract, shared with scan_task_toolcall_leaks.py so the two
         # scanners' epilogs cannot drift apart (task 3744, follow-up to 3547).
+        # main()'s docstring below restates the same numbers in its own prose,
+        # and nothing keeps the two in lockstep -- change them together.
         epilog=SCAN_EXIT_CODE_EPILOG,
     )
     add_db_discovery_args(
