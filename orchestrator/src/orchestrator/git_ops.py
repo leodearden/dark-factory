@@ -155,8 +155,21 @@ RecoverResult = Literal['rewound', 'cas_failed', 'error']
 # 'failed'              — the flock was acquired and the path existed, but
 #                         `git worktree remove --force` itself returned
 #                         non-zero.
+# 'skipped_lock_error' — the lane's `<path>.lock` could not be opened at all
+#                         (OSError from acquire_merge_verify_flock's pre-wait
+#                         mkdir/os.open: ENOSPC, EACCES, EMFILE, EROFS).
+#                         Removal is skipped and the tree is left for the
+#                         merge reaper. Deliberately NOT 'failed': 'failed'
+#                         means the lease acquire SUCCEEDED and proved no
+#                         live holder, which is what licenses
+#                         cleanup_merge_worktree's force-rmtree fallback. An
+#                         unopenable lock proves nothing about holders (a
+#                         live verify can hold the flock on an existing lock
+#                         inode while our own open fails), so this outcome
+#                         must never reach that fallback.
 RemovalOutcome = Literal[
     'removed', 'skipped_lease_held', 'skipped_persistent', 'not_present', 'failed',
+    'skipped_lock_error',
 ]
 
 
@@ -10037,10 +10050,25 @@ class GitOps:
         still held (mirroring :meth:`ephemeral_worktree`), so an ephemeral
         merge-worktree removal leaves no orphan ``_merge-<uuid>.lock`` behind.
         The lock is NEVER unlinked on ``'skipped_lease_held'`` (this call did
-        not acquire it — a live holder's lock is left untouched) or on
-        ``'failed'`` (the tree, and thus its lane, survives). This differs
-        from :meth:`merge_verify_lease`, whose persistent-lane lock is
+        not acquire it — a live holder's lock is left untouched), on
+        ``'skipped_lock_error'`` (likewise not acquired), or on ``'failed'``
+        (the tree, and thus its lane, survives). This differs from
+        :meth:`merge_verify_lease`, whose persistent-lane lock is
         deliberately retained across attempts.
+
+        **Unopenable lock**: :func:`~orchestrator.verify_cancel.
+        acquire_merge_verify_flock` prepares the lock file (``mkdir`` +
+        ``os.open``) BEFORE its bounded-wait loop, so ENOSPC, EACCES, EMFILE
+        or EROFS raises out of it rather than returning the ``None`` that
+        means "contended". This method catches that ``OSError``, logs a
+        single WARNING, and returns ``'skipped_lock_error'`` — it never
+        propagates, because :meth:`cleanup_merge_worktree` documents a
+        never-raises contract on top of it. The outcome is deliberately
+        distinct from ``'failed'``: a failed open confirms NOTHING about
+        live holders (a verify can hold the flock on an existing lock inode
+        while our own open fails), so the tree is left intact for the merge
+        reaper — exactly as for ``'skipped_lease_held'`` — and must never
+        reach cleanup's force-rmtree fallback.
 
         *reason* is a short caller-supplied label (e.g. the calling
         function's name) recorded in logs for diagnostics.
@@ -10053,7 +10081,26 @@ class GitOps:
             return 'skipped_persistent'
 
         lock_path = lane_lock_path(path)
-        fd = acquire_merge_verify_flock(lock_path, 0.0)
+        # acquire_merge_verify_flock's `path.parent.mkdir(...)` + `os.open(...)`
+        # run BEFORE its own bounded-wait try, so a lock file that cannot be
+        # prepared at all (ENOSPC/EACCES/EMFILE/EROFS) raises rather than
+        # returning the None that means "contended". Degrade to a distinct skip
+        # instead of propagating: this method backs cleanup_merge_worktree's
+        # "Never raises" contract. OSError ONLY — never bare Exception —
+        # so CancelledError keeps propagating and a non-OSError programmer
+        # error stays loud (loud-over-silent-degradation). The return sits
+        # BEFORE the try/finally below so `unlink_lock` stays False (we never
+        # unlink a lock we did not acquire) and the release never sees no fd.
+        try:
+            fd = acquire_merge_verify_flock(lock_path, 0.0)
+        except OSError as exc:
+            logger.warning(
+                'remove_merge_worktree_guarded: cannot open lane lock %s (%s); '
+                'skipping removal of %s (reason=%s) -- lease unconfirmed, leaving '
+                'for the merge reaper',
+                lock_path, exc, path, reason,
+            )
+            return 'skipped_lock_error'
         if fd is not None:
             # Registered like every other in-process lane-lock hold (task 3081):
             # this acquire is sub-millisecond and ephemeral-lane-only, but
@@ -10142,7 +10189,12 @@ class GitOps:
         construction AND ``'failed'`` already means the primitive's lease
         acquire confirmed NO live holder (a live holder yields
         ``'skipped_lease_held'``), so the tree is unleased and safe to
-        remove from the filesystem.
+        remove from the filesystem. That premise is exactly why a lock-file
+        ``OSError`` deliberately does NOT reach this fallback: the primitive
+        degrades it to ``'skipped_lock_error'``, not ``'failed'``, because a
+        lock it could not even open confirmed nothing about live holders —
+        force-removing on it would reintroduce the 23s TOCTOU C1 exists to
+        close, in silence.
 
         On ``'failed'`` the fallback: (1) band-guards via
         :meth:`_refuse_foreign_band` (defense-in-depth — the outcome check
@@ -10158,9 +10210,12 @@ class GitOps:
         already handle, so an interrupted teardown is always completable by
         a later sweep.
 
-        Every other outcome (``'removed'`` / ``'not_present'`` / the two
-        ``'skipped_*'``) returns immediately, so a live-leased tree and the
-        warm persistent lanes are NEVER force-removed. Never raises;
+        Every other outcome (``'removed'`` / ``'not_present'`` / the three
+        ``'skipped_*'``, including ``'skipped_lock_error'``) returns
+        immediately, so a live-leased tree, a tree whose lease could not be
+        established, and the warm persistent lanes are NEVER force-removed.
+        Never raises — the primitive absorbs the one escape, an ``OSError``
+        from preparing the lane lock file, into ``'skipped_lock_error'``;
         idempotent — a re-call sees the tree already gone → primitive
         ``'not_present'`` → early return.
         """
