@@ -926,11 +926,30 @@ restating the literal -- a harness rewording turns that test red instead
 of silently regressing coverage. Extend with future harness prompt
 literals as one-line additions."""
 
+HARNESS_CONTEXT_BLOCK_MARKERS: tuple[str, ...] = ('_this context was recalled from the ',)
+"""Body-literal prefix of the standing provenance caveat
+(``orchestrator.agents.briefing.MEMORY_CONTEXT_CAVEAT``), rendered by
+``_get_memory_context`` right after its '# Context' heading whenever any
+memory section was actually recalled. The marker deliberately stops
+BEFORE the caveat's ``{project_id}`` interpolation point: a marker
+spanning it would be project-specific and would fail for every
+non-dark_factory project the census runs against (this module has no
+knowledge of which project a transcript belongs to). Matched only in
+CONJUNCTION with a line-anchored '# context' heading (see
+:func:`is_harness_injected_turn`), never as a relaxation of
+HARNESS_BRIEFING_HEADINGS' all() guard -- that guard is load-bearing and
+its two negative tests
+(test_single_heading_alone_is_not_excluded,
+test_context_heading_mentioned_mid_sentence_is_not_excluded) must keep
+passing unchanged."""
+
 
 def is_harness_injected_turn(text: str) -> bool:
     """True when *text* is harness-injected rather than genuine human-typed
-    input: either the orchestrator's briefing preamble or a harness prose
-    preamble (any HARNESS_PROMPT_MARKERS substring).
+    input: either the orchestrator's briefing preamble, a harness prose
+    preamble (any HARNESS_PROMPT_MARKERS substring), or a lone memory-context
+    block (a line-anchored '# context' heading together with any
+    HARNESS_CONTEXT_BLOCK_MARKERS substring).
 
     The briefing rule is ANCHOR + CORROBORATOR: at least one
     HARNESS_BRIEFING_HEADINGS anchor must appear as its own stripped line,
@@ -952,6 +971,11 @@ def is_harness_injected_turn(text: str) -> bool:
     NO corroborator, so it falls below the >=2 threshold; and a '# Context'
     quoted mid-prose is not a stripped line at all, so it is never a
     heading -- matching stays line-anchored and never substring.
+
+    The memory-context rule is the residual the briefing rule declines: a
+    '# Context' block whose memory sections were recalled but which carries
+    no second heading is caught by its standing provenance caveat
+    (HARNESS_CONTEXT_BLOCK_MARKERS) instead of by a corroborator.
     """
     lowered = text.lower()
     lines = {line.strip() for line in lowered.splitlines()}
@@ -960,7 +984,9 @@ def is_harness_injected_turn(text: str) -> bool:
         corroborators = [h for h in HARNESS_BRIEFING_SUBHEADINGS if h in lines]
         if len(anchors) + len(corroborators) >= 2:
             return True
-    return any(marker in lowered for marker in HARNESS_PROMPT_MARKERS)
+    if any(marker in lowered for marker in HARNESS_PROMPT_MARKERS):
+        return True
+    return '# context' in lines and any(m in lowered for m in HARNESS_CONTEXT_BLOCK_MARKERS)
 
 
 def classify_agent_class(
@@ -1001,8 +1027,10 @@ def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     Excludes: non-'user' records, isSidechain=True (subagent) turns,
     isMeta=True (system-injected) turns, user records whose content is
-    entirely tool_result blocks, and harness-injected briefing/prompt turns
-    (see :func:`is_harness_injected_turn`) -- these are typed into the
+    entirely tool_result blocks, and harness-injected briefing/prompt/
+    context-block turns (see :func:`is_harness_injected_turn`, which
+    covers three shapes: the briefing preamble, a harness prose preamble,
+    and a lone memory-context block) -- these are typed into the
     transcript as ordinary user-role text (isMeta=False), so isMeta alone
     cannot exclude them. This function is the SINGLE source for both the
     gold user_corrections section and render_digest's n_user_turns score
