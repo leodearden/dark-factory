@@ -55,8 +55,12 @@ of quietly passing zero modules.
 AST (not string grep) for the assertions themselves so a docstring or comment
 that merely *describes* the barrier — e.g. "see
 _fm_helpers.await_index_operational" — cannot satisfy the check; only real
-ImportFrom / Call / FunctionDef nodes count. This mirrors
-tests/test_gather_idiom_helper_routing.py.
+ImportFrom / Call / FunctionDef nodes count. The parse and node-search
+machinery is shared with the sibling guards via ``_fm_helpers``
+(``parse_python_module`` / ``calls_named`` / ``imported_names_from``), so the
+three agree on those semantics by construction rather than by copy. The
+selection criteria below stay local: they are this guard's own policy, and it
+is their only consumer.
 
 NOT integration-marked: this file only parses source, so it must run in the
 default ``-m 'not integration'`` lane with no FalkorDB — the configuration
@@ -70,6 +74,7 @@ import pathlib
 import re
 
 import pytest
+from _fm_helpers import calls_named, imported_names_from, parse_python_module
 
 TESTS_ROOT = pathlib.Path(__file__).parent
 SELF = pathlib.Path(__file__).resolve()
@@ -94,25 +99,6 @@ VERIFIED_LIVE_INDEX_MODULES = {
     'test_falkor_fulltext_integration.py',
     'test_list_indices_integration.py',
 }
-
-
-def _parse(path: pathlib.Path) -> ast.Module:
-    assert path.exists(), f'{path} not found'
-    return ast.parse(path.read_text(), filename=str(path))
-
-
-def _calls_named(tree: ast.Module, name: str) -> list[ast.Call]:
-    """Every ast.Call whose callee is a bare ``name(...)`` or ends in ``.name(...)``."""
-    found: list[ast.Call] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        if (isinstance(func, ast.Name) and func.id == name) or (
-            isinstance(func, ast.Attribute) and func.attr == name
-        ):
-            found.append(node)
-    return found
 
 
 def _has_index_creating_literal(tree: ast.Module) -> bool:
@@ -141,9 +127,13 @@ def _discover_live_index_modules() -> list[pathlib.Path]:
             # This guard names the tokens in prose; it drives no graph.
             continue
         if _LIVE_GRAPH_CALL not in path.read_text():
-            continue  # cheap prefilter — strict superset of criterion (2)
-        tree = _parse(path)
-        if _has_index_creating_literal(tree) and _calls_named(tree, _LIVE_GRAPH_CALL):
+            # Cheap prefilter — strict superset of criterion (2). Deliberately a
+            # discarded raw read rather than parse_python_module: that would
+            # parse AND retain a tree for every test module here, when only ~7
+            # survive the prefilter to be parsed at all.
+            continue
+        tree = parse_python_module(path)
+        if _has_index_creating_literal(tree) and calls_named(tree, _LIVE_GRAPH_CALL):
             found.append(path)
     return found
 
@@ -177,11 +167,7 @@ class TestLiveIndexModulesUseSharedBarrier:
     """Every discovered live-index module imports, calls, and does not re-fork the barrier."""
 
     def test_imports_the_shared_barrier(self, path):
-        tree = _parse(path)
-        imported: set[str] = set()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and node.module == HELPERS_MODULE:
-                imported.update(alias.name for alias in node.names)
+        imported = imported_names_from(parse_python_module(path), HELPERS_MODULE)
         assert BARRIER in imported, (
             f'{path.name}: imports {sorted(imported) or "nothing"} from {HELPERS_MODULE}, '
             f'but this module creates an index on a live FalkorDB graph and so must '
@@ -191,8 +177,7 @@ class TestLiveIndexModulesUseSharedBarrier:
         )
 
     def test_actually_calls_the_barrier(self, path):
-        tree = _parse(path)
-        calls = _calls_named(tree, BARRIER)
+        calls = calls_named(parse_python_module(path), BARRIER)
         assert calls, (
             f'{path.name}: never calls {BARRIER}(...). The call belongs in the '
             f'live-graph fixture, AFTER index creation and BEFORE `yield graph` — '
@@ -208,7 +193,7 @@ class TestLiveIndexModulesUseSharedBarrier:
         duplication arose the first time, and a copy-pasted fixture carries the
         fork along with it.
         """
-        tree = _parse(path)
+        tree = parse_python_module(path)
         defs = [
             node
             for node in ast.walk(tree)
