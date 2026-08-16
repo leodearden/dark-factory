@@ -1147,13 +1147,17 @@ def _over_budget_snapshot() -> lms_vram.GpuSnapshot:
     return _snapshot(used_mib=24400, free_mib=MEASURED_TOTAL_MIB - 24400)
 
 
-def _passing_probe(arm):
+#: Both fakes ACCEPT `warmup` rather than ignoring it (task 3781).  A fake with
+#: a bare `(arm)` signature could not be called with the kwarg at all, so it
+#: would turn "the warm-up was never fired" into a TypeError somewhere else
+#: instead of a legible assertion here.
+def _passing_probe(arm, *, warmup: bool = False):
     return lms_healthcheck.ProbeResult(
         verdict='PASS', reason=lms_healthcheck.Reason.OK, detail='ok', latency_ms=12.5,
     )
 
 
-def _failing_probe(arm):
+def _failing_probe(arm, *, warmup: bool = False):
     return lms_healthcheck.ProbeResult(
         verdict='FAIL',
         reason=lms_healthcheck.Reason.IDENTITY_MISMATCH,
@@ -1162,13 +1166,120 @@ def _failing_probe(arm):
     )
 
 
-def _report(arms=None, probe=_passing_probe, snapshot=None, baseline=None):
+def _report(arms=None, probe=_passing_probe, snapshot=None, baseline=None, **kwargs):
     return lms_healthcheck.run_healthcheck(
         arms if arms is not None else [_arm()],
         gpu_probe=lambda: snapshot if snapshot is not None else _snapshot(),
         probe=probe,
         baseline=baseline if baseline is not None else _baseline(),
+        **kwargs,
     )
+
+
+def _recording_probe(result=None):
+    """A prober that logs `(arm_id, warmup)` per call.  Returns (fn, calls)."""
+    calls: list[tuple[str, bool]] = []
+
+    def probe(arm, *, warmup: bool = False):
+        calls.append((arm.arm_id, warmup))
+        return (result or _passing_probe)(arm, warmup=warmup)
+
+    return probe, calls
+
+
+# ---------------------------------------------------------------------------
+# The discarded warm-up (task 3781)
+#
+# `run_healthcheck` fires TWO probes per arm and keeps one.  The first is
+# thrown away entirely -- it exists only to warm CUDA graphs, the allocator,
+# kernel autotune and grammar compilation, so the SECOND one measures a warm
+# engine hitting a cold prefix cache, which is the state production is in.
+#
+# "Discarded" has to be load-bearing in both directions, and the two tests
+# below pin both: a failing warm-up must not fail a healthy arm, and a passing
+# warm-up must not launder a broken one.
+# ---------------------------------------------------------------------------
+
+
+def test_the_warmup_probe_is_fired_before_the_measured_one():
+    probe, calls = _recording_probe()
+
+    _report(probe=probe)
+
+    assert calls == [('qwen3.5-9b', True), ('qwen3.5-9b', False)]
+
+
+def test_a_failing_warmup_never_reaches_the_row():
+    """The first request after an arm reaches ready is the one most likely to
+    look bad for reasons that are not the arm's fault.  Its verdict is thrown
+    away, not merged in."""
+    def probe(arm, *, warmup: bool = False):
+        return _failing_probe(arm) if warmup else _passing_probe(arm)
+
+    report = _report(probe=probe)
+
+    assert report.arms[0].verdict == 'PASS'
+    assert report.arms[0].reason == lms_healthcheck.Reason.OK
+    assert report.overall == 'PASS'
+
+
+def test_a_passing_warmup_never_launders_a_failing_measured_probe():
+    """The inverse, and the one that matters more: without it, "discard the
+    first result" is a hole a broken arm could walk through."""
+    def probe(arm, *, warmup: bool = False):
+        return _passing_probe(arm) if warmup else _failing_probe(arm)
+
+    report = _report(probe=probe)
+
+    assert report.arms[0].verdict == 'FAIL'
+    assert report.arms[0].reason == lms_healthcheck.Reason.IDENTITY_MISMATCH
+    assert report.overall == 'FAIL'
+    assert lms_healthcheck.exit_code_for(report) == lms_healthcheck.EXIT_ARM_FAILED
+
+
+def test_the_warmup_is_fired_once_per_arm_not_once_per_sweep():
+    """A per-sweep warm-up warms NOTHING for arms two onward: each arm is a
+    separate server process with its own CUDA context, so being warmed by a
+    different arm's process is the same as not being warmed at all."""
+    probe, calls = _recording_probe()
+
+    _report(arms=[_arm(), _unprefixed_arm()], probe=probe)
+
+    assert calls == [
+        ('qwen3.5-9b', True),
+        ('qwen3.5-9b', False),
+        ('granite-embedding-english-r2', True),
+        ('granite-embedding-english-r2', False),
+    ]
+
+
+def test_a_placeholder_arm_still_issues_no_request_at_all(install_fake_httpx,
+                                                          monkeypatch, tmp_path):
+    """The warm-up must not re-open the refusal path.
+
+    A TBD arm has nothing to probe, and issuing the request anyway would report
+    a 404 on a literal `TBD-Q3` model id as an arm failure -- burying an
+    unresolved PRD Open Question under a transport error like every other one.
+    Doubling the requests per arm is exactly the change that could reintroduce
+    it, so this drives the REAL prober through the sweep.
+    """
+    def _boom(url, **kwargs):
+        raise AssertionError('no request may be issued for a placeholder arm')
+
+    install_fake_httpx(post=_boom, get=_boom)
+    placeholder = _moe_arm(
+        model_ref='TBD-Q3-pick-a-gguf', image='TBD-Q3', quant='TBD-Q3'
+    )
+    assert placeholder.is_placeholder is True
+
+    report = lms_healthcheck.run_healthcheck(
+        [placeholder],
+        gpu_probe=lambda: _snapshot(),
+        baseline=_baseline(),
+    )
+
+    assert report.arms[0].reason == lms_healthcheck.Reason.PLACEHOLDER_ARM
+    assert report.arms[0].verdict == 'FAIL'
 
 
 # ---------------------------------------------------------------------------
@@ -1271,8 +1382,11 @@ def test_overall_is_pass_only_when_every_row_and_the_vram_block_pass():
 
 
 def test_overall_is_fail_when_a_single_arm_fails():
-    def probe(arm):
-        return _failing_probe(arm) if arm.arm_id == 'qwen3.5-9b' else _passing_probe(arm)
+    def probe(arm, *, warmup: bool = False):
+        return (
+            _failing_probe(arm, warmup=warmup) if arm.arm_id == 'qwen3.5-9b'
+            else _passing_probe(arm, warmup=warmup)
+        )
 
     report = _report(arms=[_arm(), _unprefixed_arm()], probe=probe)
 
@@ -1454,8 +1568,11 @@ def test_the_table_takes_only_the_report_so_text_and_json_cannot_disagree():
 
 
 def test_the_table_shows_every_row_with_its_verdict_and_reason():
-    def probe(arm):
-        return _failing_probe(arm) if arm.arm_id == 'qwen3.5-9b' else _passing_probe(arm)
+    def probe(arm, *, warmup: bool = False):
+        return (
+            _failing_probe(arm, warmup=warmup) if arm.arm_id == 'qwen3.5-9b'
+            else _passing_probe(arm, warmup=warmup)
+        )
 
     report = _report(arms=[_arm(), _unprefixed_arm()], probe=probe)
 
@@ -1599,11 +1716,16 @@ def cli_env(monkeypatch, tmp_path):
     `lms_ctl.start` would: the CLI has no baseline parameter on purpose, so the
     only way a report gets one is that something actually started the arm.
     """
-    calls = {'probed': []}
+    calls = {'probed': [], 'calls': []}
 
-    def probe(arm):
-        calls['probed'].append(arm.arm_id)
-        return _passing_probe(arm)
+    def probe(arm, *, warmup: bool = False):
+        # `probed` stays the MEASURED sweep, so every pre-3781 assertion about
+        # which arms were covered keeps meaning what it said.  `calls` is the
+        # full wire sequence, warm-ups included, for the tests that care.
+        calls['calls'].append((arm.arm_id, warmup))
+        if not warmup:
+            calls['probed'].append(arm.arm_id)
+        return _passing_probe(arm, warmup=warmup)
 
     monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path / 'baselines'))
     for arm_id in lms_manifest.load_arms().arm_ids():
