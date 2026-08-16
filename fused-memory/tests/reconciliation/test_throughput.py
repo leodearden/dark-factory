@@ -23,7 +23,14 @@ from fused_memory.models.reconciliation import (
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.throughput import (
+    FITTED_CYCLE_FIXED_SECONDS,
+    FITTED_CYCLE_MARGINAL_SECONDS,
+    OBSERVED_BURST_EVENTS_PER_DAY,
+    STEADY_STATE_AMORTISATION_MIN_BATCH,
+    capacity_verdict,
+    cycle_seconds,
     drain_stats,
+    seconds_per_event,
     remediation_duty_cycle,
     inflow_daily,
     inflow_hourly,
@@ -516,3 +523,140 @@ async def test_remediation_duty_cycle_counts_steady_state_wall_clock(recon_db):
 async def test_remediation_duty_cycle_is_zero_for_an_empty_denominator(recon_db):
     """No drain wall-clock at all returns 0.0 rather than raising."""
     assert remediation_duty_cycle(drain_stats(recon_db._db_path, 'reify')) == 0.0
+
+
+# ── capacity arithmetic ────────────────────────────────────────────────
+#
+# Pure functions over caller-supplied inputs — nothing here measures a live
+# system, so these assertions are exact arithmetic rather than tolerances.
+#
+# The cost model is T(B) = F + c*B.  The two measured 2026-07-25 reify points
+# (50 events/945s steady state; 393 events/954s backlog chunk) fit it with
+# c ~ 0.03 s/event, i.e. essentially ALL fixed cost — but they ran on
+# different tiers, so that fit mixes regimes and would over-claim.  The
+# shipped constants take chunk 2's 2.94 s/event as an upper bound on marginal
+# cost instead: F = 900, c = 2.5.
+
+
+def test_cycle_seconds_implements_the_two_parameter_cost_model() -> None:
+    """T(B) = F + c*B, literally."""
+    assert cycle_seconds(50, 900.0, 2.5) == pytest.approx(1025.0)
+    assert cycle_seconds(150, 900.0, 2.5) == pytest.approx(1275.0)
+    # A zero-size batch still pays the full fixed cost — that IS the finding.
+    assert cycle_seconds(0, 900.0, 2.5) == pytest.approx(900.0)
+
+
+def test_seconds_per_event_reproduces_the_measured_steady_state_point() -> None:
+    """(a) The conservative fit predicts the observed steady-state point within 10%.
+
+    Measured: 50 events / 945s = 18.9 s/event.  Predicted: 1025/50 = 20.5.
+    A fit that could not reproduce its own input point would not be usable to
+    extrapolate to a larger batch.
+    """
+    measured = 945.0 / 50
+    predicted = seconds_per_event(50, FITTED_CYCLE_FIXED_SECONDS,
+                                  FITTED_CYCLE_MARGINAL_SECONDS)
+    assert predicted == pytest.approx(20.5)
+    assert measured == pytest.approx(18.9)
+    assert abs(predicted - measured) / measured < 0.10
+
+
+def test_seconds_per_event_predicts_the_amortised_cost_at_the_target_batch() -> None:
+    """(a) B=150 costs 8.5 s/event — a 2.2x amortisation over the measured point."""
+    predicted = seconds_per_event(STEADY_STATE_AMORTISATION_MIN_BATCH,
+                                  FITTED_CYCLE_FIXED_SECONDS,
+                                  FITTED_CYCLE_MARGINAL_SECONDS)
+    assert STEADY_STATE_AMORTISATION_MIN_BATCH == 150
+    assert predicted == pytest.approx(8.5)
+    assert (945.0 / 50) / predicted == pytest.approx(2.22, abs=0.01)
+
+
+def test_seconds_per_event_rejects_a_non_positive_batch() -> None:
+    """Per-event cost is undefined for an empty batch; raise rather than divide."""
+    with pytest.raises(ValueError):
+        seconds_per_event(0, 900.0, 2.5)
+
+
+def test_sustainable_events_per_day_applies_utilisation_and_duty_cycle() -> None:
+    """(b) 86400 * utilisation * (1 - duty_cycle) / seconds_per_event."""
+    # ADDENDUM 2 backlog-chunk rate, with the measured remediation duty cycle.
+    assert sustainable_events_per_day(2.43, 0.438, 1.0) == pytest.approx(
+        86400 * 1.0 * (1 - 0.438) / 2.43,
+    )
+    assert sustainable_events_per_day(2.43, 0.438, 1.0) == pytest.approx(19982.2, abs=0.1)
+    # Utilisation scales linearly.
+    assert sustainable_events_per_day(2.43, 0.438, 0.5) == pytest.approx(
+        sustainable_events_per_day(2.43, 0.438, 1.0) / 2,
+    )
+
+
+def test_sustainable_events_per_day_recovers_the_duty_cycle_lever_1_removes() -> None:
+    """(b) Driving the duty cycle to 0 is worth 1/(1-0.438) ~ 1.8x on the same rate.
+
+    That is the whole of lever 1: a scheduling change, no per-event work saved.
+    """
+    with_remediation = sustainable_events_per_day(2.43, 0.438, 1.0)
+    without = sustainable_events_per_day(2.43, 0.0, 1.0)
+    assert without / with_remediation == pytest.approx(1 / (1 - 0.438))
+    assert without / with_remediation > 1.7
+
+
+def test_sustainable_events_per_day_rejects_impossible_inputs() -> None:
+    """A non-positive rate or an out-of-range duty/utilisation is a caller bug."""
+    with pytest.raises(ValueError):
+        sustainable_events_per_day(0.0, 0.0, 1.0)
+    with pytest.raises(ValueError):
+        sustainable_events_per_day(2.43, 1.5, 1.0)
+    with pytest.raises(ValueError):
+        sustainable_events_per_day(2.43, 0.0, 0.0)
+
+
+def test_capacity_verdict_is_insufficient_for_the_pre_fix_ceiling() -> None:
+    """(c) B=50 with the measured 0.438 duty cycle does not clear the 3.5k/day burst.
+
+    2368.6/day sustainable against OBSERVED_BURST_EVENTS_PER_DAY = 3500 — the
+    overrun this task exists to fix.
+    """
+    pre_fix = sustainable_events_per_day(
+        seconds_per_event(50, FITTED_CYCLE_FIXED_SECONDS,
+                          FITTED_CYCLE_MARGINAL_SECONDS),
+        0.438, 1.0,
+    )
+    assert pre_fix == pytest.approx(2368.6, abs=0.1)
+
+    verdict = capacity_verdict(pre_fix, OBSERVED_BURST_EVENTS_PER_DAY)
+    assert verdict['verdict'] == 'insufficient'
+    assert verdict['headroom_ratio'] == pytest.approx(pre_fix / 3500)
+    assert verdict['headroom_ratio'] < 1.0
+
+
+def test_capacity_verdict_is_sufficient_for_the_post_fix_figure() -> None:
+    """(c) Both levers together clear the burst with headroom.
+
+    Lever 2 raises the batch to 150 (8.5 s/event) and lever 1 removes the
+    remediation duty cycle, giving 10164.7/day against a 3500/day burst.
+    """
+    post_fix = sustainable_events_per_day(
+        seconds_per_event(STEADY_STATE_AMORTISATION_MIN_BATCH,
+                          FITTED_CYCLE_FIXED_SECONDS,
+                          FITTED_CYCLE_MARGINAL_SECONDS),
+        0.0, 1.0,
+    )
+    assert post_fix == pytest.approx(10164.7, abs=0.1)
+
+    verdict = capacity_verdict(post_fix, OBSERVED_BURST_EVENTS_PER_DAY)
+    assert verdict['verdict'] == 'sufficient'
+    assert verdict['headroom_ratio'] == pytest.approx(post_fix / 3500)
+    assert verdict['headroom_ratio'] > 2.9
+
+
+def test_capacity_verdict_boundary_is_sufficient_at_exactly_break_even() -> None:
+    """Exactly meeting the burst counts as sufficient; a hair under does not."""
+    assert capacity_verdict(3500.0, 3500)['verdict'] == 'sufficient'
+    assert capacity_verdict(3499.0, 3500)['verdict'] == 'insufficient'
+    assert capacity_verdict(3500.0, 3500)['headroom_ratio'] == pytest.approx(1.0)
+
+
+def test_observed_burst_constant_matches_the_task_measurement() -> None:
+    """The burst figure the capacity claim is checked against is ~3.5k/day."""
+    assert OBSERVED_BURST_EVENTS_PER_DAY == 3500
