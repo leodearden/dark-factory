@@ -253,12 +253,21 @@ class ProbeResult(BaseModel):
     #: to judge.  `None` where the question does not apply: an embedding arm, or
     #: an LLM response that never parsed.
     top_level_entities_named: int | None = None
+    #: How many of this request's prompt tokens the server served from its
+    #: prefix cache.  REPORTED, NON-GATING, and `None` wherever the question
+    #: does not apply or cannot be answered -- an embedding arm, a stack that
+    #: does not report it (vLLM sends `prompt_tokens_details: null`), or a body
+    #: this code cannot read.  See `_cached_prompt_tokens`.
+    cached_prompt_tokens: int | None = None
 
     def with_latency(self, latency_ms: float) -> ProbeResult:
         return self.model_copy(update={'latency_ms': round(latency_ms, 1)})
 
     def with_top_level(self, count: int) -> ProbeResult:
         return self.model_copy(update={'top_level_entities_named': count})
+
+    def with_cached_tokens(self, count: int | None) -> ProbeResult:
+        return self.model_copy(update={'cached_prompt_tokens': count})
 
 
 def _ok(detail: str = '') -> ProbeResult:
@@ -448,6 +457,36 @@ def _known_entities_found(
         known for known in PROBE_KNOWN_ENTITIES
         if any(candidate and _norm(known) in candidate for candidate in haystack)
     ]
+
+
+def _cached_prompt_tokens(body: Any) -> int | None:
+    """How many prompt tokens the server says it served from its prefix cache.
+
+    The only DIRECT evidence in the artifact that the measured probe found the
+    prefix cache cold -- the claim the cold/warm split rests on.  On llama.cpp
+    a near-zero count proves it (measured 2026-08-06, a same-prompt warm run on
+    moe-stretch showed 338 of 343 cached).  vLLM sends
+    `prompt_tokens_details: null`, so on that stack the claim rests on latency
+    alone, and this returns None rather than pretending otherwise.
+
+    Read with the same defensive isinstance ladder `_extract_content` and
+    `_was_truncated` use: anything unreadable is None, never an exception.  A
+    diagnostic that could abort a sweep would be worse than no diagnostic.
+    `bool` is rejected explicitly -- `isinstance(True, int)` is True in Python,
+    the same hole `verify_embedding_response` closes for vector values.
+    """
+    if not isinstance(body, dict):
+        return None
+    usage = body.get('usage')
+    if not isinstance(usage, dict):
+        return None
+    details = usage.get('prompt_tokens_details')
+    if not isinstance(details, dict):
+        return None
+    cached = details.get('cached_tokens')
+    if isinstance(cached, bool) or not isinstance(cached, int):
+        return None
+    return cached
 
 
 def _was_truncated(body: Any) -> bool:
@@ -814,7 +853,11 @@ def _probe(
             Reason.MALFORMED_RESPONSE, f'POST {path}: {_exc_detail(exc)}'
         ).with_latency(elapsed_ms())
 
-    return verify(arm, body).with_latency(elapsed_ms())
+    # The success path is the only place the parsed body is in hand, so the
+    # cache diagnostic is attached here.  It never touches the verdict.
+    return verify(arm, body).with_latency(elapsed_ms()).with_cached_tokens(
+        _cached_prompt_tokens(body)
+    )
 
 
 def _placeholder_refusal(arm: ArmEntry) -> ProbeResult | None:
@@ -1030,6 +1073,17 @@ class ArmRow(BaseModel):
     #: Known entities promoted to TOP-LEVEL entities.  Reported, non-gating —
     #: see ProbeResult.  `None` for an embedding arm or an unparseable response.
     top_level_entities_named: int | None = None
+    #: Prompt tokens the MEASURED probe was served from the prefix cache.  The
+    #: warm-up's own count is not recorded and would be meaningless: the warm-up
+    #: is the run that DIRTIES the cache, not the one being judged.
+    #:
+    #: The artifact's only direct evidence that the measured probe found the
+    #: prefix COLD, which is the claim the whole cold/warm split rests on.
+    #: Reported, non-gating -- exactly like `top_level_entities_named`, it must
+    #: never decide a verdict.  `None` where the question does not apply (an
+    #: embedding arm) or the stack declines to answer it: vLLM sends
+    #: `prompt_tokens_details: null`, so there the split rests on latency alone.
+    measured_cached_prompt_tokens: int | None = None
 
 
 class VramBlock(BaseModel):
@@ -1251,6 +1305,7 @@ def run_healthcheck(
                 arm_footprint_mib=budget.arm_footprint_mib,
                 reasoning=arm.reasoning,
                 top_level_entities_named=result.top_level_entities_named,
+                measured_cached_prompt_tokens=result.cached_prompt_tokens,
             )
         )
 
