@@ -33,6 +33,8 @@ from pathlib import Path
 
 import conftest
 import pytest
+from fastmcp import Client
+from fastmcp.client.transports import StreamableHttpTransport
 
 # ---------------------------------------------------------------------------
 # A live TCP endpoint that is NOT an MCP server — the readiness discriminator.
@@ -169,3 +171,54 @@ def test_startup_failure_that_is_not_a_runtimeerror_is_named_in_the_timeout(
             'actually happened (the bind conflict), not just report that the '
             'server never became ready; got: ' + repr(message)
         )
+
+
+# ---------------------------------------------------------------------------
+# serve_escalation_mcp must be MODULE-scoped: the migration rests on it.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope='module')
+def module_scoped_consumer(
+    tmp_path_factory: pytest.TempPathFactory,
+    serve_escalation_mcp,
+) -> tuple[str, object]:
+    """A module-scoped consumer of ``serve_escalation_mcp``, exactly the shape
+    both converted ``http_server`` fixtures take.
+
+    This dependency is the whole reason ``serve_escalation_mcp`` is
+    module-scoped: pytest forbids a fixture from depending on a NARROWER-scoped
+    one, so while the factory was function-scoped this raised ``ScopeMismatch``
+    at setup and no module-scoped consumer could exist.
+    """
+    queue_dir = tmp_path_factory.mktemp('serve_escalation_mcp_scope')
+    base_url, _port, queue = serve_escalation_mcp(queue_dir)
+    return base_url, queue
+
+
+def test_a_module_scoped_fixture_may_depend_on_serve_escalation_mcp(
+    module_scoped_consumer: tuple[str, object],
+) -> None:
+    """The shared factory is usable from a module-scoped fixture, and the
+    server it returns answers a real MCP call.
+
+    This is the self-enforcing guard for the rest of task 3736: it takes the
+    same dependency ``test_capability_guard_http.py`` and
+    ``test_status_authority_gate.py`` now take, so a future narrowing of
+    ``serve_escalation_mcp`` back to function scope fails HERE, loudly and by
+    name, instead of surfacing as two unrelated modules going red for reasons
+    that read like a server bug.
+
+    The ``list_tools()`` round-trip is deliberate: a fixture that resolved
+    scope correctly but handed back a dead base_url would otherwise pass.
+    """
+    base_url, _queue = module_scoped_consumer
+
+    async def _list_tools() -> list:
+        transport = StreamableHttpTransport(f'{base_url}/mcp/')
+        async with Client(transport) as client:
+            return await client.list_tools()
+
+    tools = asyncio.run(_list_tools())
+
+    assert tools, f'the module-scoped server at {base_url} returned no tools'
