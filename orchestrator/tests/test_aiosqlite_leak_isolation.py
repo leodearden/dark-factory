@@ -136,8 +136,13 @@ def test_autouse_reap_fixture_is_active(request):
 # suite stays green and nobody finds out. Both
 # ``_orch_helpers.reap_leaked_aiosqlite_connections`` and
 # ``conftest._reap_leaked_aiosqlite_connections`` promise in prose that
-# orchestrator/pyproject.toml makes it an error — these three guards are what
-# keep that promise checkable instead of aspirational.
+# orchestrator/pyproject.toml makes it an error — the three guards below are
+# what keep that promise checkable instead of aspirational: a SOURCE pin on the
+# effective ini value, an IN-EFFECT pin on the live run, and an END-TO-END
+# non-vacuity pin in a subprocess. They deliberately overlap; the value is that
+# they fail in DIFFERENT combinations, and the combination localises the fault
+# (see the source pin's docstring). A fourth test covers the source pin's own
+# pytest-rename tripwire, so that guard cannot go green-by-absence either.
 # ---------------------------------------------------------------------------
 
 #: ``ORCH_PYPROJECT`` (the inifile these guards pin), ``sanitized_probe_env``
@@ -221,6 +226,29 @@ def test_pyprojects_filterwarnings_promotes_unhandled_thread_exceptions(pytestco
     re-implementing the ``action:message:category:module:lineno`` grammar,
     whose ``:`` field separator is already a documented footgun in
     pyproject.toml's own comment block.
+
+    WHAT THIS COVERS THAT THE END-TO-END PIN BELOW DOES NOT (asked at review;
+    the two do overlap, and the overlap is not the point):
+
+    * The **effective** ini value for THE RUN ACTUALLY HAPPENING. The E2E pin
+      spawns a child with ``-c ORCH_PYPROJECT`` and a sanitized env precisely
+      so it sees the file and nothing else — which means it is blind, by
+      construction, to a ``-o filterwarnings=...`` override, an ``-c`` pointing
+      the parent somewhere else, or a conftest-level ``addopts`` manipulation
+      that disarms the promotion for the very suite whose leaked threads it is
+      supposed to catch. This pin reads what pytest resolved for THIS process.
+    * **Fault localisation.** The two pins fail in different combinations and
+      the combination is the diagnosis: source FAIL + E2E FAIL = the entry is
+      missing (restore it); source PASS + E2E FAIL = the entry is present but
+      INERT, i.e. pytest no longer routes thread exceptions through
+      ``warnings.warn`` and the mechanism needs re-deriving; source FAIL + E2E
+      PASS = this invocation is disarmed while the file is fine. A single pin
+      cannot tell those apart, and "which of these three is it" is the first
+      question anyone debugging a red merge-verify will ask.
+    * **Cost and blast radius on failure.** This pin answers in microseconds
+      from data pytest already parsed; the E2E pin costs two full pytest
+      subprocesses. When both would fail, this is the one whose message names
+      the exact entry to restore.
     """
     require_orchestrator_inifile(pytestconfig, subject=_PIN_SUBJECT)
     apply = _require_apply_warning_filters()
@@ -266,6 +294,44 @@ def test_pyprojects_filterwarnings_promotes_unhandled_thread_exceptions(pytestco
             f'promotion as fact — restore the entry, or correct both '
             f'docstrings. Task 4075.'
         )
+
+
+def test_the_apply_warning_filters_tripwire_fails_loudly(monkeypatch):
+    """``_require_apply_warning_filters`` raises — it is checked, not just written.
+
+    Its raise branch is unreachable while the guarded import at the top of this
+    module succeeds, so nothing else here ever executes it. An unexercised
+    guard is precisely the "green by absence" shape task 4075 exists to close,
+    one level up: a typo in that message (say a stray name, raising NameError
+    instead of the intended AssertionError) would surface for the first time at
+    the exact moment a pytest internals rename made the guard fire — burying
+    the instructions that tell the reader how to repair the pin, in the one
+    situation where they are the only thing on screen.
+
+    Patching the module global is the real seam, not a re-implementation:
+    ``_require_apply_warning_filters`` resolves ``apply_warning_filters`` by
+    name at call time, which is exactly what an ImportError at module load
+    leaves behind. ``monkeypatch`` restores it at teardown, so the source pin
+    above is unaffected regardless of execution order.
+    """
+    monkeypatch.setattr(sys.modules[__name__], 'apply_warning_filters', None)
+
+    with pytest.raises(AssertionError, match='apply_warning_filters') as excinfo:
+        _require_apply_warning_filters()
+
+    message = str(excinfo.value)
+    # The message must actually RENDER (this is what a broken f-string would
+    # fail) and must carry its two actionable pointers: where to fix it, and
+    # under whose contract.
+    assert Path(__file__).name in message, (
+        f'the tripwire fired but its message does not name the module whose '
+        f'guarded import needs updating, which is the one thing its reader '
+        f'needs: {message!r}'
+    )
+    assert '4075' in message, (
+        f'the tripwire fired but its message does not cite the task that '
+        f'explains why skipping is not an option here: {message!r}'
+    )
 
 
 def test_the_promotion_is_in_effect_for_this_run(pytestconfig):
