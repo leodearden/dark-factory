@@ -1002,7 +1002,7 @@ class TestGateBacklogFingerprintKey:
         self,
         esc_id: str,
         *,
-        task_id: str | None = '166',
+        task_id: str = '166',
         detail: str | None = None,
         project_id: str = 'dark_factory',
         fingerprint: str | None = None,
@@ -1122,7 +1122,10 @@ class TestGateBacklogFingerprintKey:
         from escalation.dedupe import gate_backlog_fingerprint_key
 
         esc = self._legacy_esc('esc-166-1')
-        esc.detail = None
+        # Deliberate type violation: `Escalation.detail` is declared `str`, but a
+        # hand-edited or partially-migrated record on disk can deserialise with a
+        # null detail, and the adapter must fail CLOSED rather than raise there.
+        esc.detail = None  # pyright: ignore[reportAttributeAccessIssue]
         assert gate_backlog_fingerprint_key(esc) is None
 
     # --- (6) the literal token `None` is NOT special-cased ---
