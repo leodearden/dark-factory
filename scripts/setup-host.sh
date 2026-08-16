@@ -362,9 +362,17 @@ done <<< "$(printf '%s\n' "$_orch_parity_out" \
 # cross-artifact test asserts every member has an arm here.
 #
 # ARM ORDER IS PRECEDENCE, most-blocking first: the two kinds that mean "the
-# file itself is unusable" (vanished, unreadable) outrank a content finding,
-# and the combined drift+override arm must precede both single arms or a unit
-# with both would be reported as having only one.
+# file itself is unusable" (vanished, unreadable) outrank a content finding.
+# EVERY combined arm must precede both of its single arms, or a unit with both
+# findings is reported as having only one — an incomplete remedy, which is
+# worse than none because it looks like progress.
+#
+# The checker's control flow admits exactly two combinations, and both have an
+# arm: `drift,override` (a compared unit that differs AND is drop-in'd) and
+# `override,unreadable` (the drop-in check runs BEFORE the read, so an
+# undecodable unit can still be known to carry one). `vanished` and `absent`
+# take a `continue` before anything else is consulted, and `clean` asserts the
+# absence of every other finding, so none of the three can combine at all.
 #
 # Defined HERE, inside the region the behavioural tests slice and execute, not
 # near the top of this script: a helper defined above the slice would be
@@ -373,6 +381,15 @@ _orch_skip_reason() {
   case ",$1," in
     *,vanished,*)
       printf '%s' "there is no committed copy to install FROM (see the [vanished] report)" ;;
+    # The SECOND producible combination, and it needs its own arm for the same
+    # reason drift+override does: the checker marks `override` before it ever
+    # attempts the read, so an undecodable unit that also carries a drop-in
+    # renders `override,unreadable`. Falling through to the single unreadable
+    # arm below would send the operator to fix the file encoding, re-run, and
+    # be skipped again for a drop-in nobody mentioned. Alternated for the same
+    # contiguity reason as the drift+override arm.
+    *,override,unreadable,*|*,override,*,unreadable,*)
+      printf '%s' "a drop-in override AND a unit file that could not be read or decoded — BOTH must be resolved; inspect the drop-in with: systemctl --user cat $2" ;;
     *,unreadable,*)
       printf '%s' "its unit file exists but could not be read or decoded (see the [unreadable] report)" ;;
     # ALTERNATED, and the first branch is the one that actually fires today.

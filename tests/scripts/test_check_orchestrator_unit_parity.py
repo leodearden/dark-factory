@@ -1219,6 +1219,28 @@ def test_verdict_undecodable_unit_reports_unreadable(tmp_path: pathlib.Path):
     ) == ["unreadable"]
 
 
+def test_verdict_dropin_over_an_undecodable_unit_reports_both(
+    tmp_path: pathlib.Path,
+):
+    """The SECOND producible combination: `override,unreadable`.
+
+    The drop-in scan runs before either read is attempted, so a unit that is
+    both drop-in'd and undecodable carries both kinds — this is not a
+    hypothetical the vocabulary merely permits. It is asserted here because
+    setup-host.sh has a dedicated `_orch_skip_reason` arm for it, and an arm
+    for an unreachable combination is dead code while a reachable combination
+    with no arm tells the operator half a remedy.
+
+    `drift,unreadable` is NOT reachable by the same control flow: `drift` is
+    marked only after both reads have succeeded.
+    """
+    assert _verdict_for(
+        tmp_path,
+        installed_bytes=b"[Timer]\nOnBootSec=\xff\xfe30\n",
+        dropin=True,
+    ) == ["override", "unreadable"]
+
+
 def test_verdict_lines_are_restricted_to_the_selected_units(
     tmp_path: pathlib.Path,
 ):
@@ -2352,18 +2374,30 @@ def test_every_skip_reason_arm_fires_for_the_kinds_it_claims():
         message = _skip_reason(kind).strip()
         assert message, f"{kind} produced an EMPTY reason"
 
-    combined = _skip_reason("drift,override")
-    assert "drift" in combined and "drop-in" in combined, (
-        "A unit with BOTH byte-drift and a drop-in override is told about only "
-        f"one of them: {combined!r}\nThe operator fixes what they were told "
-        "about, re-runs, and is skipped again for the other."
-    )
+    # BOTH combinations the checker's control flow can produce. `drift` is
+    # marked only after both reads succeed, and `vanished`/`absent`/`clean`
+    # cannot combine at all, so these two are the whole space — and each is a
+    # separate chance to name half a remedy.
+    for kinds, first, second in (
+        ("drift,override", "drift", "drop-in"),
+        ("override,unreadable", "drop-in", "could not be read"),
+    ):
+        combined = _skip_reason(kinds)
+        assert first in combined and second in combined, (
+            f"A unit whose verdict is {kinds!r} is told about only one of its "
+            f"two findings: {combined!r}\nThe operator fixes what they were "
+            "told about, re-runs, and is skipped again for the other."
+        )
 
     # Each single kind must still get ITS OWN message, not the combined one —
     # a combined arm widened until it swallows the singles is the same defect
     # with the sign flipped.
     assert "drop-in" not in _skip_reason("drift"), _skip_reason("drift")
     assert "byte-drift" not in _skip_reason("override"), _skip_reason("override")
+    assert "drop-in" not in _skip_reason("unreadable"), _skip_reason("unreadable")
+    assert "could not be read" not in _skip_reason("override"), _skip_reason(
+        "override"
+    )
 
     unknown = _skip_reason("masked")
     assert "masked" in unknown, (
