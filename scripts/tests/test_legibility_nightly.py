@@ -1660,6 +1660,135 @@ def test_run_nightly_skips_deletion_directive_record_without_crashing(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# step-9/10: a conflict-only night must PERSIST its recurrence sighting.
+# apply_coding_record's adjudicated-title branch appends the sighting but
+# bumps neither `matched` nor `candidates_applied` -- so a night whose ONLY
+# merge effect is a conflict append would end with applied == 0, skip the
+# `if applied > 0` dump gate, and drop the mutated codebook on the floor.
+# ---------------------------------------------------------------------------
+
+def _fake_invoke_rejected_candidate(prompt: str, model: str) -> str:
+    """Mine a candidate whose title is ALREADY adjudicated in the codebook.
+
+    `matches` is deliberately empty: a single match would bump
+    stats['matched'], push `applied` above 0 for an unrelated reason and mask
+    the defect entirely. coder.py copies `candidates` verbatim from the parsed
+    judgment and _CANDIDATE_RECORD_SCHEMA requires only `title`, so this
+    record passes validate_coding_record and reaches the merger on the live
+    path."""
+    return json.dumps({
+        'matches': [],
+        'candidates': [{
+            'title': 'recurring rejected cause',
+            'cause': 'c',
+            'area': 'a',
+            'origin_phase': 'implement',
+            'manifested_phase': 'implement',
+        }],
+    })
+
+
+def test_run_nightly_persists_a_disposition_conflict_sighting(tmp_path):
+    work_cwd = str(tmp_path / 'work')
+    repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+
+    projects_root = tmp_path / 'projects'
+    session_path = projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl'
+    target_date = date(2026, 7, 13)
+    _write_transcript(
+        session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
+    )
+
+    # Seed an already-REJECTED candidate and commit it, so the tree is clean
+    # before the run (otherwise _git_status_changed would report true for an
+    # unrelated reason and the commit assertion would pass vacuously). The
+    # seeded sighting carries session 'session-old' -- NOT 'session-1' -- so
+    # apply_coding_record's `already_seen` guard does not short-circuit the
+    # conflict branch, and the later "sightings grew 1 -> 2" assertion
+    # unambiguously proves an APPEND rather than a create.
+    codebook_path = repo / 'docs' / 'legibility' / 'confusion-codebook.yaml'
+    cb = codebook.load(codebook_path)
+    cb['candidates'].append({
+        'id': 'cand-20260722-28',
+        'title': 'recurring rejected cause',
+        'first_seen': '2026-07-22',
+        'disposition': 'rejected',
+        'sightings': [{
+            'date': '2026-07-22',
+            'project': 'testproj',
+            'session': 'session-old',
+            'origin_phase': 'implement',
+            'manifested_phase': 'implement',
+        }],
+    })
+    codebook.dump(cb, codebook_path)
+    subprocess.run(['git', 'add', '-A'], cwd=repo, check=True)
+    subprocess.run(
+        ['git', 'commit', '-q', '-m', 'seed rejected candidate'], cwd=repo, check=True,
+    )
+
+    before_log = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+
+    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC)
+    escalation_calls = []
+
+    result = nightly.run_nightly(
+        config_path=config_path,
+        projects_root=projects_root,
+        target_date=target_date,
+        now=fixed_now,
+        invoke=_fake_invoke_rejected_candidate,
+        status_fetcher=None,
+        poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+    )
+
+    assert result.exit_code == 0
+    assert result.commit_made is True
+    assert result.applied == 1
+    assert result.coder_status == 'ok'
+
+    after_log = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+    assert len(after_log) == len(before_log) + 1
+
+    # The recurrence sighting survived to the COMMITTED file.
+    committed = codebook.load(codebook_path)
+    assert len(committed['candidates']) == 1
+    candidate = committed['candidates'][0]
+    assert candidate['id'] == 'cand-20260722-28'
+    assert candidate['disposition'] == 'rejected'
+    assert len(candidate['sightings']) == 2
+    assert candidate['sightings'][1]['session'] == 'session-1'
+    assert candidate['sightings'][1]['date'] == '2026-07-13'
+
+    # Idempotency: the widened dump gate must not re-commit the same sighting.
+    result_2 = nightly.run_nightly(
+        config_path=config_path,
+        projects_root=projects_root,
+        target_date=target_date,
+        now=fixed_now,
+        invoke=_fake_invoke_rejected_candidate,
+        status_fetcher=None,
+        poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+    )
+
+    assert result_2.exit_code == 0
+    assert result_2.commit_made is False
+    assert result_2.applied == 0
+
+    after_log_2 = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+    assert after_log_2 == after_log
+
+    committed_2 = codebook.load(codebook_path)
+    assert len(committed_2['candidates'][0]['sightings']) == 2
+
+
+# ---------------------------------------------------------------------------
 # step-21/22: run_nightly -- no-change night commits nothing (§6.7)
 # ---------------------------------------------------------------------------
 
