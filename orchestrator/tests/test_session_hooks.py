@@ -786,6 +786,142 @@ def test_run_session_start_nested_inheritor_forks_leaving_parent_untouched(
 
 
 # ---------------------------------------------------------------------------
+# Task 4193 step-3: Stop/Notification honour the record binding
+# ---------------------------------------------------------------------------
+
+
+def test_run_notification_and_stop_keep_writing_to_the_bound_record(
+    tmp_path: Path,
+) -> None:
+    # The owning session's own events still converge on its record, question
+    # capture included -- the ownership probe must not disturb the task-2511
+    # convergence it gates.
+    slug = 'session-cockpit-3215060'
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug,
+            status=sr.Status.RUNNING,
+            launcher_pid=3215060,
+            claude_session_id='uuid-parent',
+        ),
+        root=tmp_path,
+    )
+    hook_input = {
+        'session_id': 'uuid-parent',
+        'cwd': '/home/leo/src/dark-factory',
+        'message': 'approve rollout?',
+    }
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+
+    sh.run_notification(hook_input, env, root=tmp_path)
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status == sr.Status.AWAITING_INPUT
+    assert record.question is not None
+    assert record.question.text == 'approve rollout?'
+
+    sh.run_stop(hook_input, env, root=tmp_path)
+    assert sr.read_record(slug, root=tmp_path).status == sr.Status.IDLE
+    assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 1
+
+
+def test_run_stop_from_nested_inheritor_does_not_idle_the_parent(tmp_path: Path) -> None:
+    # The sharpest statement of the bug: a nested claude finishing its turn
+    # must not advertise the spawning session as idle mid-turn.
+    slug = 'session-cockpit-3215061'
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug,
+            status=sr.Status.RUNNING,
+            launcher_pid=3215061,
+            claude_session_id='uuid-parent',
+        ),
+        root=tmp_path,
+    )
+    hook_input = {'session_id': 'uuid-nested', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+
+    sh.run_stop(hook_input, env, root=tmp_path)
+
+    assert sr.read_record(slug, root=tmp_path).status == sr.Status.RUNNING
+    forked_slug = sh.hook_session_slug(hook_input, env, root=tmp_path)
+    assert forked_slug != slug
+    forked = sr.read_record(forked_slug, root=tmp_path)
+    assert forked.status == sr.Status.IDLE
+    assert forked.claude_session_id == 'uuid-nested'
+
+
+def test_run_notification_from_nested_inheritor_does_not_flip_the_parent(
+    tmp_path: Path,
+) -> None:
+    slug = 'session-cockpit-3215062'
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug,
+            status=sr.Status.RUNNING,
+            launcher_pid=3215062,
+            claude_session_id='uuid-parent',
+        ),
+        root=tmp_path,
+    )
+    hook_input = {
+        'session_id': 'uuid-nested',
+        'cwd': '/home/leo/src/dark-factory',
+        'message': 'nested asks something',
+    }
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+
+    sh.run_notification(hook_input, env, root=tmp_path)
+
+    parent = sr.read_record(slug, root=tmp_path)
+    assert parent.status == sr.Status.RUNNING
+    assert parent.question is None
+    forked = sr.read_record(sh.hook_session_slug(hook_input, env, root=tmp_path), root=tmp_path)
+    assert forked.status == sr.Status.AWAITING_INPUT
+    assert forked.question is not None
+    assert forked.question.text == 'nested asks something'
+
+
+def test_refresh_path_binds_a_legacy_unbound_record(tmp_path: Path) -> None:
+    # Migration safety: an in-flight session whose record predates task 4193
+    # (or was written by spawn-claude.sh's `launching`) is bound by the very
+    # next Notification/Stop, without waiting for a SessionStart that may
+    # never come again -- so the next nested event is already discriminable.
+    slug = 'session-cockpit-3215063'
+    sr.write_record(
+        sr.SessionRecord(session_slug=slug, status=sr.Status.RUNNING, launcher_pid=3215063),
+        root=tmp_path,
+    )
+    hook_input = {'session_id': 'uuid-parent', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+
+    sh.run_stop(hook_input, env, root=tmp_path)
+
+    record = sr.read_record(slug, root=tmp_path)
+    assert record.status == sr.Status.IDLE
+    assert record.claude_session_id == 'uuid-parent'
+    assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 1
+
+
+def test_refresh_path_does_not_rebind_or_write_when_already_bound(tmp_path: Path) -> None:
+    slug = 'session-cockpit-3215064'
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug,
+            status=sr.Status.RUNNING,
+            launcher_pid=3215064,
+            claude_session_id='uuid-parent',
+        ),
+        root=tmp_path,
+    )
+    hook_input = {'session_id': 'uuid-parent', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+
+    sh.run_stop(hook_input, env, root=tmp_path)
+
+    assert sr.read_record(slug, root=tmp_path).claude_session_id == 'uuid-parent'
+
+
+# ---------------------------------------------------------------------------
 # Task 2510 step-1: _resolve_wm_window_id resolver (Fleet Cockpit C10 fix)
 # ---------------------------------------------------------------------------
 
