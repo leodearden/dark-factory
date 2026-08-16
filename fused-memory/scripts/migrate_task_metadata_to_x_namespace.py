@@ -58,7 +58,10 @@ corpus-wide sweep at a per-task re-run of this script with other ``--keys``:
 * ``--apply`` writes the FULL pre-write task row (metadata *and*
   description/details) to ``--backup-path`` and refuses to write if it
   cannot. Without it, a read-back failure leaves the only copy of a
-  one-of-a-kind row in a process that is about to exit.
+  one-of-a-kind row in a process that is about to exit. The default path is
+  STAMPED with the UTC instant of the run, so the per-task re-run above gets
+  a fresh artifact instead of overwriting the one holding the TRUE
+  pre-migration row.
 
 Idempotent — safe to re-run; an already-migrated task is a no-op. Defaults to
 a dry run: a real write requires an explicit ``--apply``.
@@ -80,10 +83,23 @@ import os
 import sys
 import types
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 
 DEFAULT_SERVER = 'http://127.0.0.1:8002'
 DEFAULT_PROJECT_ROOT = '/home/leo/src/dark-factory'
+
+# Where an omitted --backup-path resolves. A named constant rather than a
+# literal inlined into `default_backup_path` so the end-to-end tests can point
+# the DEFAULT path at their own tmp dir, instead of racing each other writing
+# real files into a shared /tmp from parallel xdist workers.
+DEFAULT_BACKUP_DIR = Path('/tmp')
+# The UTC filename stamp the rest of this repo already agrees on
+# (`_STAMP_FORMAT` in shared/src/shared/memory_eval_metrics.py,
+# `_PARKING_STAMP_FORMAT` in scripts/reclaim_orphaned_worktrees.py,
+# orchestrator/src/orchestrator/verify.py, dashboard's `_RUN_STAMP_FORMAT`), so
+# the artifact this script drops sorts and reads like every other one.
+_BACKUP_STAMP_FORMAT = '%Y%m%dT%H%M%SZ'
 
 # The six ad-hoc keys measured on task 3083's live blob (2026-08-06) that have
 # no code reader anywhere in the repo. `last_blocked_at` is deliberately NOT
@@ -287,9 +303,37 @@ def _sha256(text: str | None) -> str:
     return hashlib.sha256((text or '').encode()).hexdigest()
 
 
-def default_backup_path(task_id: str) -> Path:
-    """Where the pre-write snapshot lands when ``--backup-path`` is omitted."""
-    return Path(f'/tmp/task-{task_id}-metadata-before.json')
+def _utcnow() -> datetime:
+    """The single clock seam behind :func:`default_backup_path`.
+
+    Exists so a test driving ``main_async`` — which resolves the path
+    internally and cannot be handed a ``now`` — can pin "two runs, minutes
+    apart" without a ``sleep``.
+    """
+    return datetime.now(UTC)
+
+
+def default_backup_path(task_id: str, *, now: datetime | None = None) -> Path:
+    """Where the pre-write snapshot lands when ``--backup-path`` is omitted.
+
+    Stamped with the UTC instant of the run. Task-scoping alone is not
+    enough: ``docs/task-authoring.md`` §8 prescribes a per-task RE-RUN of this
+    script with different ``--keys``, so run 1 saves the TRUE pre-migration
+    row and — with one fixed path — run 2 writes its already-partially-migrated
+    row straight over it. That silently destroys the single artifact this
+    script's whole SAFETY section exists to produce, which on task 3083 is a
+    one-of-a-kind hand-curated evidence log. Every run now gets its own file.
+
+    ``%Y%m%dT%H%M%SZ`` is the stamp the rest of the repo already uses. Second
+    resolution (not microsecond) is deliberate: it stays readable to an
+    operator hunting for the file under pressure.
+
+    ``now`` is injectable for deterministic tests — the shape
+    ``scripts/reclaim_orphaned_worktrees.py`` already uses for its age-based
+    reclaim.
+    """
+    stamp = (now or _utcnow()).strftime(_BACKUP_STAMP_FORMAT)
+    return DEFAULT_BACKUP_DIR / f'task-{task_id}-metadata-before-{stamp}.json'
 
 
 def write_backup(path: Path, before_task: dict) -> Path:
@@ -564,8 +608,9 @@ def build_parser() -> argparse.ArgumentParser:
         '--backup-path', dest='backup_path', default=None,
         help=(
             'Where to save the FULL pre-write task row before applying '
-            '(default: /tmp/task-<task-id>-metadata-before.json). The write is '
-            'refused if this cannot be written.'
+            '(default: /tmp/task-<task-id>-metadata-before-<UTC-stamp>.json, so '
+            'each run gets its own file and a re-run cannot land on an earlier '
+            "run's snapshot). The write is refused if this cannot be written."
         ),
     )
     parser.add_argument(
