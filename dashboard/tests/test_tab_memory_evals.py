@@ -980,18 +980,6 @@ _PRESENCE_CONTRACTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 )
 
 
-def _comments_only(body: str) -> str:
-    """Just the comments — the exact complement of the `code` fixture's strip.
-
-    The `tab_memory_evals_jsx_code` fixture is
-    ``re.sub(r'/\\*[\\s\\S]*?\\*/|//[^\\n]*', '', body)``; this is
-    ``re.findall`` of the same expression.  Derived from one regex rather than
-    written twice on purpose: if the strip is ever widened, the projection this
-    guard tests against widens with it instead of silently going stale.
-    """
-    return '\n'.join(re.findall(r'/\*[\s\S]*?\*/|//[^\n]*', body))
-
-
 def _resolved_pattern(pattern: str, code: str) -> str:
     """Substitute `{alias}` with the file's own `window.DF_DATA` local.
 
@@ -1027,7 +1015,6 @@ def _presence_pattern(label: str, code: str) -> str:
 
 
 def test_presence_greps_are_falsified_by_deleting_the_code(
-    tab_memory_evals_jsx_body: str,
     tab_memory_evals_jsx_code: str,
 ) -> None:
     """Every presence grep must go RED when the code it is about is deleted.
@@ -1040,28 +1027,24 @@ def test_presence_greps_are_falsified_by_deleting_the_code(
     assertion.  Making it executable is what stops the rot being fixed here
     from simply recurring.
 
-    Three arms per contract, each closing a different way to pass vacuously:
+    Two arms per contract, each closing a different way to pass vacuously:
 
     (1) MATCHES the real comment-stripped source — otherwise the pattern is
         wrong and the live assertion is about nothing.
     (2) does NOT match once the accessing expression is deleted — the pattern
         actually discriminates, rather than being satisfied by some unrelated
         occurrence of the same string elsewhere in the file.
-    (3) does NOT match the comments-only projection — the pattern is answered
-        by CODE, not by prose that merely describes the code.
 
-    Arm (3) is deliberately stronger than "run it over the stripped fixture".
-    Both are needed: the fixture is what the live assertion reads, and this arm
-    is what stops a pattern so loose that a future comment re-opens the hole.
+    Both arms run over the comment-stripped `code` fixture, which is what every
+    live presence assertion in this module reads.  Prose is therefore out of
+    scope by construction and cannot answer any of them — so this guard has no
+    business asserting on comment CONTENTS.  A third arm doing exactly that was
+    removed: it made writing an ACCURATE comment in tab_memory_evals.jsx a suite
+    failure (`// aliased off window.DF_DATA` would have tripped the payload-read
+    entry), which is the very pathology `_FORBIDDEN_PATTERNS` below decries,
+    merely with the opposite sign.
     """
     code = tab_memory_evals_jsx_code
-    comments = _comments_only(tab_memory_evals_jsx_body)
-    assert comments.strip(), (
-        'the comments-only projection is EMPTY, so arm (3) below would pass for '
-        'every pattern without checking anything. The .jsx carries ~150 lines of '
-        'prose — an empty projection means the strip regex and this complement '
-        'have diverged.'
-    )
 
     for label, pattern, deletions in _PRESENCE_CONTRACTS:
         resolved = _resolved_pattern(pattern, code)
@@ -1085,13 +1068,6 @@ def test_presence_greps_are_falsified_by_deleting_the_code(
             f'{deletions!r}. It does not discriminate: something other than the '
             'render site satisfies it, so the live assertion would stay green with '
             'the feature removed. Anchor the pattern to the accessing expression.'
-        )
-
-        assert not re.search(resolved, comments, re.MULTILINE), (
-            f'[{label}] pattern {resolved!r} is satisfied by the .jsx COMMENTS '
-            'alone. A mention is not a render: delete the code, keep the prose, and '
-            'the live assertion stays green. Anchor the pattern to code syntax the '
-            'prose does not reproduce.'
         )
 
 
