@@ -609,6 +609,21 @@ class ReconReportState:
         # down per-entry — so cross-stage in-run dedup and duplicate_finding
         # citation pointers survive an individual stage's TTL eviction for as
         # long as the run itself is still live.  See tick()'s docstring.
+        # task-4185 (operator ruling 2026-08-12): this index is deliberately
+        # keyed on a PROJECTLESS signature, and stays that way — do NOT
+        # project-namespace the key.  That projectlessness is exactly what
+        # lets a bare top-level task_id (which names no project) fold onto a
+        # foreign citation, and that fold is INTENDED.
+        #
+        # Only the cite_task→cite_task half of the resulting collision is
+        # DETECTABLE, and it is guarded: see cite_task's fold-2 bullet.  The
+        # add_finding → derived-sig half is inherently AMBIGUOUS and is
+        # ACCEPTED — an `add_finding(task_id='42', ...)` call carries no
+        # project whatsoever, so a run containing two projects' findings
+        # about task 42 can still collapse there, and no guard at this layer
+        # can tell that from a genuine duplicate.  That acceptance is
+        # executable, not merely documented, in
+        # test_unpinned_anchor_fold_emits_no_near_collision_warning.
         self._run_sig_index: dict[str, dict[tuple, str]] = {}  # run_id → {sig → finding_id}
         self._run_finding_index: dict[str, dict[str, _ReportEntry]] = {}  # run_id → {finding_id → entry}
         self._run_desc_index: dict[str, dict[str, str]] = {}  # run_id → {desc_hash → finding_id}
@@ -1981,6 +1996,21 @@ class ReconReportState:
            exempting one stage from registering it would just let that
            stage's findings silently evade the whole-run fold.
 
+           GUARDED (task-4185): because the derived key is projectless, a
+           hit proves only that two findings name the same task NUMBER. The
+           fold is SKIPPED — both findings kept, each with its own
+           citation, and the anchor's registration left untouched (the
+           derived sig has ONE owner per run; first registrant wins) — when
+           the ANCHOR's primary citation names the SAME task in a DIFFERENT
+           project. An anchor with no citation at all, or one whose primary
+           citation names a different task, carries no project pin and
+           folds exactly as before (:meth:`_derived_sig_anchor_project_id`
+           spells out both cases). A skipped near-collision logs a WARNING
+           and returns the ordinary ``{project_id, task_id, title}``
+           citation dict, NOT ``duplicate_finding``: the finding survives
+           and its citation is recorded, so telling the caller to stop
+           counting it as a new filing would be actively wrong.
+
         BOTH folds emit a WARNING carrying the losing finding's full content
         (:meth:`_log_cite_task_fold_purge`) immediately BEFORE purging it.
         The purge is wholesale and the returned ``duplicate_finding`` error
@@ -2069,6 +2099,31 @@ class ReconReportState:
             )
             if anchor_project_id is not None and anchor_project_id != project_id:
                 entity_project_mismatch = True
+                # This line is the ONLY observable signal that a run actually
+                # contained numerically-colliding cross-project task ids —
+                # which is why it is WARNING and not INFO.  Nothing is
+                # destroyed here (both findings survive), so it needs no
+                # _log_cite_task_fold_purge-style content record; but the
+                # UNGUARDABLE add_finding→derived-sig half (see
+                # ``_run_sig_index``) may have silently folded two projects'
+                # findings elsewhere in this same run, and nothing detects
+                # that after the fact.  An operator who sees this knows to
+                # distrust the run's dedup.  Lazy %-args, never an f-string.
+                logger.warning(
+                    'recon_report: cite_task entity-scoped fold SKIPPED — cross-project '
+                    'near-collision on a PROJECTLESS derived signature; BOTH findings kept, '
+                    'each with its own citation. run_id=%r stage=%r skipped_finding_id=%r '
+                    'attempted_citation=%r surviving_finding_id=%r anchor_citation=%r '
+                    'derived_sig=%r flag_type=%r',
+                    run_id,
+                    finding_entry.stage,
+                    finding.finding_id,
+                    (project_id, task_id),
+                    entity_existing_id,
+                    (anchor_project_id, task_id),
+                    derived_sig,
+                    finding.flag_type,
+                )
 
         # Sequential (not project_hit/entity_hit booleans + a re-derived
         # existing_id) so pyright narrows each *_existing_id to `str` from

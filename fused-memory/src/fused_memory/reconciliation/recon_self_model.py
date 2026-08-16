@@ -281,9 +281,12 @@ MCP_CALL_SIGNATURES: dict[str, str] = {
         'add_finding.task_id. cite_task also performs an in-run fold '
         '(task-2432): a finding whose top-level task_id is None, equals this '
         'cited task_id, or (if comma-joined) contains it among its parts, '
-        'collapses onto whichever finding first cited this task — so None, '
-        'single, comma-joined, and foreign top-level task_id shapes all '
-        'dedup through this one path once they share a cited task.'
+        'collapses onto whichever finding first cited this task — same-project '
+        'only where that first citer pinned a project, since two projects can '
+        'carry the same task NUMBER (task-4185: cross-project near-collisions '
+        'are kept distinct) — so None, single, comma-joined, and foreign '
+        'top-level task_id shapes all dedup through this one path once they '
+        'share a cited task.'
     ),
     'cite_entity': (
         "cite_entity(finding_id, name) -> {'ok': True}  "
