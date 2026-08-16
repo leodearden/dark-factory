@@ -51,7 +51,7 @@ Exit codes are per failure class, because each has a different remedy:
 | 3 | `hash_drift` | the selection is right, but episode bytes changed |
 | 4 | `missing_episodes` | an id the manifest names is gone from the store |
 | 5 | `bad_manifest` | the artifact is structurally unusable |
-| 1 | — | the run never reached a verdict (store unreachable, unsatisfiable `--n`) |
+| 1 | — | the run never reached a verdict (store unreachable, unsatisfiable `--n`, downstream pipe closed early — e.g. `\| head`) |
 
 To rebuild rather than check, drop `--verify`; add `--dry-run` to print the
 stratification report and write nothing.

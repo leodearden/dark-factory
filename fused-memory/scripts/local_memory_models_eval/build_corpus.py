@@ -115,15 +115,17 @@ Status                Exit  Meaning and remedy
 ====================  ====  ==================================================
 
 Exit ``1`` (:data:`EXIT_RUN_FAILED`) is reserved for a run that could not
-complete at all — the store was unreachable, or the requested corpus is
-unsatisfiable. It is deliberately outside the table above so a caller can tell
-"the corpus is wrong" from "the check never ran".
+complete at all — the store was unreachable, the requested corpus is
+unsatisfiable, or a downstream reader closed the output pipe before the run
+finished writing (``--verify | head``). It is deliberately outside the table
+above so a caller can tell "the corpus is wrong" from "the check never ran".
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import dataclasses
 import hashlib
 import json
@@ -1651,11 +1653,59 @@ def _store_error_types() -> tuple[type[BaseException], ...]:
     return (OSError, RedisError)
 
 
+def _handle_broken_pipe() -> int:
+    """Recover from a downstream reader (``| head``) closing stdout mid-run.
+
+    Every ``print`` in the CLI path — the report in :func:`_run_build`, the
+    verdict and diff in :func:`_emit_verdict` — writes to ``sys.stdout`` or
+    ``sys.stderr`` with no protection of its own. When the reader on the other
+    end of a pipe has already closed it, that write raises
+    :class:`BrokenPipeError`, which is not a store condition and not a builder
+    bug — it is the same "the run never reached a verdict" situation
+    :data:`EXIT_RUN_FAILED` already documents, only triggered by nothing being
+    there to read the output rather than by the store or the corpus being
+    unusable. Left uncaught it would surface as a raw traceback where every
+    other failure in this CLI prints a single ``error: ...`` line.
+
+    Applies the dup2 dance from the interpreter docs' "Note on SIGPIPE" before
+    returning: Python flushes ``sys.stdout`` during interpreter finalization,
+    and if fd 1 still points at the closed pipe, that flush raises a SECOND,
+    now-uncatchable ``BrokenPipeError`` — the "Exception ignored in:
+    <_io.TextIOWrapper name='<stdout>'>" noise the docs warn about, printed
+    even though the in-band exception here was already handled cleanly.
+    Redirecting fd 1 to ``os.devnull`` first means that later flush lands on a
+    device that always accepts the write.
+
+    The ``error: ...`` line goes to stderr on a best-effort basis: on the
+    ordinary ``| head`` shape only stdout is the closed pipe, so this succeeds
+    and looks exactly like every other exit-1 message; on the rarer shape
+    where stderr is ALSO a closed pipe, printing to it can itself raise
+    ``BrokenPipeError`` — swallowed rather than left to raise a THIRD
+    traceback out of the one place already meant to report failure quietly.
+    """
+    try:
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    except OSError:
+        return EXIT_RUN_FAILED
+    try:
+        os.dup2(devnull_fd, sys.stdout.fileno())
+    finally:
+        os.close(devnull_fd)
+    with contextlib.suppress(BrokenPipeError):
+        print(
+            'error: downstream reader closed the output pipe before the run finished',
+            file=sys.stderr,
+        )
+    return EXIT_RUN_FAILED
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the CLI and return a process exit code."""
     args = _build_parser().parse_args(argv)
     try:
         return _run_verify(args) if args.verify else _run_build(args)
+    except BrokenPipeError:
+        return _handle_broken_pipe()
     except CorpusBuildError as exc:
         # A typed build/read failure, reported as a message plus a documented
         # code rather than a traceback plus exit 1-by-accident. Distinct from

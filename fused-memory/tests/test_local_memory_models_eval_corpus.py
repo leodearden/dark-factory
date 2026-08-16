@@ -23,6 +23,7 @@ import dataclasses
 import hashlib
 import importlib.util
 import json
+import os
 import random
 import re
 import sys
@@ -2460,6 +2461,72 @@ class TestAWriteFailureIsNotBlamedOnTheStore:
         """
         code, _ = _run_cli(monkeypatch, '--verify', '--out', str(tmp_path / 'nope.json'))
         assert code == _mod.EXIT_CODES['bad_manifest']
+
+
+class TestBrokenPipeIsARunFailureNotATraceback:
+    """A downstream reader closing stdout early (``--verify | head``) must not traceback.
+
+    Task 3900, filed as an agent follow-up from 3757: the store-error handler
+    was correctly narrowed in 3757 step 8 to wrap only ``_fetch_population``,
+    the sole seam that talks to the store, so it no longer incidentally
+    swallows a ``BrokenPipeError`` from a ``print`` into a closed stdout — that
+    print is not a store condition at all. Left uncaught, it surfaces as a raw
+    traceback and only happens to exit 1 by accident, where every other
+    failure in this CLI prints one ``error: ...`` line.
+
+    Uses a REAL closed ``os.pipe()``, not a mocked ``print``, so a fix that
+    only satisfies a mock (e.g. patching ``builtins.print`` to raise) cannot
+    pass here — the assertion is on the actual OS-level write failure the
+    symptom describes.
+    """
+
+    def test_a_closed_stdout_pipe_exits_run_failed_without_a_traceback(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        out = tmp_path / 'corpus_manifest.json'
+        read_fd, write_fd = os.pipe()
+        os.close(read_fd)  # the reader is already gone, like `head` after its window
+        pipe_stdout = os.fdopen(write_fd, 'w', buffering=1)  # line-buffered: forces a real write() per print, not a deferred shutdown flush
+        original_stdout = sys.stdout
+        monkeypatch.setattr(sys, 'stdout', pipe_stdout)
+        capsys.readouterr()
+        try:
+            code, _ = _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out))
+        finally:
+            sys.stdout = original_stdout
+
+        assert code == _mod.EXIT_RUN_FAILED
+        assert not out.exists()
+        err = capsys.readouterr().err
+        assert err.startswith('error: ')
+
+        # The fix must dup2 the pipe's fd to os.devnull before returning, per
+        # the Python docs' "Note on SIGPIPE" — otherwise Python's shutdown-time
+        # flush of the (still-broken) pipe raises a SECOND, uncatchable
+        # BrokenPipeError, the "Exception ignored in: <_io.TextIOWrapper ...>"
+        # noise the docs warn about. Closing the wrapper here stands in for
+        # that shutdown flush and must not raise.
+        pipe_stdout.close()
+
+    def test_dry_run_build_also_exits_run_failed_on_a_closed_pipe(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """CONTROL: not specific to the write path — the report print itself is the hazard."""
+        out = tmp_path / 'corpus_manifest.json'
+        read_fd, write_fd = os.pipe()
+        os.close(read_fd)
+        pipe_stdout = os.fdopen(write_fd, 'w', buffering=1)  # line-buffered: forces a real write() per print, not a deferred shutdown flush
+        original_stdout = sys.stdout
+        monkeypatch.setattr(sys, 'stdout', pipe_stdout)
+        capsys.readouterr()
+        try:
+            code, _ = _run_cli(
+                monkeypatch, '--n', '20', '--seed', 's', '--out', str(out), '--dry-run'
+            )
+        finally:
+            sys.stdout = original_stdout
+        assert code == _mod.EXIT_RUN_FAILED
+        pipe_stdout.close()
 
 
 class TestBuilderScriptSatisfiesTheDeliveredCheck:
