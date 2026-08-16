@@ -4833,6 +4833,98 @@ class TestExtractLivenessSnapshotFact:
         ) is None
 
 
+# The exact pair the task measured live: identical framing and identical
+# readable `claimant_run_id=`/`heartbeat_at=` pairs, differing only in a
+# status value neither the quoted nor the bare branch can read whole (an
+# unterminated quote). Verbatim from the task's reproduction.
+_UNREADABLE_STATUS_IN_PROGRESS = (
+    'Liveness check performed 2026-08-11: '
+    'status="in progress claimant_run_id=null heartbeat_at=null'
+)
+_UNREADABLE_STATUS_DONE = (
+    'Liveness check performed 2026-08-11: '
+    'status="done, unclosed claimant_run_id=null heartbeat_at=null'
+)
+
+
+class TestLivenessSnapshotUnfieldedVerdictIsPerField:
+    """An unreadable field is a WHOLE-RECORD loss, never a key from survivors.
+
+    `_classify_liveness_snapshot` built its key from whatever fields happened
+    to parse and silently dropped the rest: `pairs` accumulated across every
+    match in the content, and `if not pairs: return True, None` only fired
+    when NO field parsed at all. One unreadable field beside a readable
+    sibling therefore produced a KEY, not a loss -- built from the survivors
+    only, so it groups records that assert DIFFERENT facts. Under `--apply` a
+    false cluster like that is an irreversible delete (the same guarantee
+    `extract_liveness_snapshot_fact`'s own docstring already claims). The
+    verdict must be per-field instead: any recognised field whose value
+    cannot be read whole makes the WHOLE record `(True, None)`, exactly like
+    the no-fields-at-all case already does.
+    """
+
+    def test_two_different_unreadable_statuses_do_not_share_a_key(self):
+        """The measured bug: an in-progress and a done snapshot, one key.
+
+        Measured on base: both classify as
+        `(True, 'claimant_run_id=null|heartbeat_at=null')` -- the SAME
+        partial key for two records asserting opposite statuses.
+        """
+        key_a = _classify_liveness_snapshot(_UNREADABLE_STATUS_IN_PROGRESS)
+        key_b = _classify_liveness_snapshot(_UNREADABLE_STATUS_DONE)
+
+        assert key_a == (True, None)
+        assert key_b == (True, None)
+
+        assert extract_liveness_snapshot_fact(
+            _memory('a', _UNREADABLE_STATUS_IN_PROGRESS, category=_OS),
+        ) is None, 'the extractor is a thin projection of the classifier'
+
+    @pytest.mark.parametrize('value', [
+        '"in progress',  # unterminated quote
+        '(unknown)',  # value starts outside the bare class
+        '"a|b"',  # `|` is the key's own pair delimiter
+    ])
+    def test_an_unreadable_value_beside_a_readable_sibling_is_a_whole_record_loss(
+        self, value,
+    ):
+        """A single unreadable field must poison the whole key, not just itself."""
+        content = (
+            'Point-in-time liveness check performed 2026-07-24 on task 94: '
+            f'status={value} claimant_run_id=null'
+        )
+
+        assert _classify_liveness_snapshot(content) == (True, None)
+
+    def test_a_value_that_cleans_to_nothing_is_a_whole_record_loss(self):
+        """A second, distinct route to the same defect -- survives step-2.
+
+        `.rstrip('./:+-')` can reduce a BARE value the pattern DID read (so
+        `quoted`/`bare` are never both `None`, and no unreadable-value
+        verdict ever fires) to the empty string, and the `if cleaned:` guard
+        then silently drops that field while a readable sibling still
+        contributes -- the same partial-key defect, reached without the
+        value ever being unreadable. A field the author WROTE but whose
+        value the reader cannot recover is exactly the case
+        `liveness_snapshot_unfielded` exists to make visible, not silently
+        fold into a key built from the survivors.
+        """
+        content = (
+            'Point-in-time liveness check performed 2026-07-24 on task 94: '
+            'status=--- claimant_run_id=null'
+        )
+        assert _classify_liveness_snapshot(content) == (True, None)
+
+        other = (
+            'Point-in-time liveness check performed 2026-07-24 on task 94: '
+            'status=... claimant_run_id=null'
+        )
+        assert _classify_liveness_snapshot(other) == (True, None), (
+            'a second value that also rstrips to empty must not fabricate '
+            'the same survivors-only key as the one above'
+        )
+
+
 class TestLivenessClassifierIsSingleCopy:
     """One classifier, two callers -- so the extractor's tests test production.
 
@@ -5205,6 +5297,107 @@ class TestFindLivenessSnapshotRecurrencesDisclosure:
         )
 
         assert set(disclosure.values()) == {0}
+
+
+class TestLivenessPartialKeyFalseGroup:
+    """The actual harm, pinned at the level `--apply` acts on.
+
+    `TestLivenessSnapshotUnfieldedVerdictIsPerField` is a unit-level guard on
+    the classifier; this class exercises `find_liveness_snapshot_recurrences`
+    instead, because the concrete damage this task exists to prevent is a
+    false RECURRENCE GROUP over two records asserting different facts -- and
+    a group is exactly what `--apply` would delete.
+    """
+
+    def test_two_records_with_different_unreadable_statuses_form_no_group(self):
+        """On the base commit these two records DO group -- an in-progress
+        snapshot merged with a done one, sharing the survivors-only key
+        `claimant_run_id=null|heartbeat_at=null`. The loss is now visible on
+        a counter instead of forming a silent, irreversible-under-`--apply`
+        false cluster.
+        """
+        corpus = [
+            _dated('ip', _UNREADABLE_STATUS_IN_PROGRESS, _TS_94_JUL24,
+                   category=_OS, metadata={'task_id': '94'}),
+            _dated('done', _UNREADABLE_STATUS_DONE, _TS_REVERIFY,
+                   category=_OS, metadata={'task_id': '94'}),
+        ]
+
+        groups, disclosure = find_liveness_snapshot_recurrences(corpus)
+
+        assert groups == [], (
+            'an in-progress snapshot and a done one must never group'
+        )
+        assert disclosure == dict.fromkeys(_LIVENESS_DISCLOSURE_KEYS, 0) | {
+            'liveness_snapshot_unfielded': 2,
+        }
+
+    # Recall bound -- the real motivating corpus must keep every key and
+    # count no loss -- is already pinned in full and not re-asserted here:
+    # TestExtractLivenessSnapshotFact.test_all_three_real_snapshots_yield_the_same_key
+    # (the three keys collapse to `_CORE_FACT_STRANDED`),
+    # TestFindLivenessSnapshotRecurrences.test_exactly_the_two_real_groups
+    # (the exact two groups) and TestFindLivenessSnapshotRecurrencesDisclosure
+    # .test_clean_run_zero_fills_every_key (an all-zero disclosure).
+
+    def test_a_quoted_value_containing_a_field_name_is_not_a_loss(self):
+        """The precision guard a naive mention-count fix would fail.
+
+        The inner `claimant_run_id=` sits inside the span already consumed
+        as `status`'s quoted value, so it is a readable value -- not a
+        second, unread mention of a sibling field.
+        """
+        content = (
+            'Point-in-time liveness check performed 2026-07-24 on task 94: '
+            'status="foo claimant_run_id=bar"'
+        )
+
+        key = extract_liveness_snapshot_fact(_memory('x', content, category=_OS))
+
+        assert key == 'status=foo claimant_run_id=bar'
+
+    def test_a_non_assignment_status_can_still_false_group(self):
+        """KNOWN LIMITATION, pinned not hidden -- the same discipline
+        `test_divergent_per_task_statuses_do_not_group` already uses.
+
+        This task's fix closes the ASSIGNMENT-form route to a survivors-only
+        key: a `<field>=` written but whose value could not be read. It does
+        not close every route to one. A status spelled `status:` (colon, not
+        `=`) carries no `<field>=` token at all, so `_LIVE_FIELD_SCAN_RE`
+        never matches it there -- it is invisible to the scan rather than an
+        unread mention of it, and the record still keys on whatever OTHER
+        fields parse. Two records asserting opposite statuses through this
+        spelling therefore still share one key and still form one group,
+        pre-existing and unchanged by this task.
+        """
+        done = (
+            'Liveness check performed 2026-08-11 on task 94: status: done, '
+            'claimant_run_id=null, heartbeat_at=null.'
+        )
+        in_progress = (
+            'Liveness check performed 2026-08-11 on task 94: status: '
+            'in-progress, claimant_run_id=null, heartbeat_at=null.'
+        )
+        done_key = _classify_liveness_snapshot(done)
+        in_progress_key = _classify_liveness_snapshot(in_progress)
+
+        assert done_key == in_progress_key, (
+            'the pre-existing gap this task does not close'
+        )
+        assert done_key != (True, None), 'both sides still classify -- no loss'
+
+        corpus = [
+            _dated('done', done, _TS_94_JUL24,
+                   category=_OS, metadata={'task_id': '94'}),
+            _dated('ip', in_progress, _TS_REVERIFY,
+                   category=_OS, metadata={'task_id': '94'}),
+        ]
+        groups, disclosure = find_liveness_snapshot_recurrences(corpus)
+
+        assert [(g['subject_task_id'], g['member_ids']) for g in groups] == [
+            ('94', ['done', 'ip']),
+        ], 'still forms a group -- closing it is out of scope for this task'
+        assert set(disclosure.values()) == {0}, 'and not a counted loss either'
 
 
 # The plan keys that existed before task 3098. Pinned so an additive change
@@ -5645,9 +5838,9 @@ class TestLivenessDetectorRegexBudget:
         """The load-bearing case for choosing the BROADER prefilter.
 
         This is the one record class that matches `LIVE_TASK_STATUS_RE` (via
-        the "actively driven by" paraphrase) but NOT
-        `_LIVE_FIELD_ASSIGNMENT_RE`. Prefiltering on the narrower assignment
-        pattern would read as one consult here too, while silently driving
+        the "actively driven by" paraphrase) but produces no match at all
+        against `_LIVE_FIELD_SCAN_RE`. Prefiltering on the narrower scan pattern
+        would read as one consult here too, while silently driving
         `liveness_snapshot_unfielded` to a permanent zero — turning a counted
         loss back into an invisible one.
         """
