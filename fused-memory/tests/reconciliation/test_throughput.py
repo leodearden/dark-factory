@@ -462,6 +462,126 @@ async def test_drain_stats_scopes_by_project_and_since(recon_db):
     assert later['modes']['remediation']['run_count'] == 1
 
 
+# ── the remediation-free drain rate ────────────────────────────────────
+#
+# `drain_seconds_per_event` is REMEDIATION-INCLUSIVE: remediation wall-clock
+# lands in the numerator while remediation's zero events add nothing to the
+# denominator, so the remediation penalty is ALREADY applied once in that rate.
+# A caller that multiplies it by (1 - duty_cycle) discounts twice.  These tests
+# pin the remediation-FREE companion rate that exists so a caller can pick the
+# right one, and pin the algebraic identity linking the two.
+
+
+@pytest.mark.asyncio
+async def test_drain_stats_exposes_a_remediation_free_rate(recon_db):
+    """(a)(b) The drain-only totals cover backlog_chunk + steady_state only.
+
+    On the ADDENDUM 2 fixture that is the two chunks: 954 + 960 = 1914s over
+    719 events = 2.662 s/event, against the inclusive 3409s / 719 = 4.741.
+    """
+    db = recon_db._db_path
+    _seed_addendum_2(db)
+
+    stats = drain_stats(db, 'reify')
+
+    assert stats['drain_only_wall_clock_seconds'] == pytest.approx(1914.0)
+    assert stats['drain_only_seconds_per_event'] == pytest.approx(1914.0 / 719)
+    assert stats['drain_only_seconds_per_event'] == pytest.approx(2.6620, abs=0.0001)
+
+
+@pytest.mark.asyncio
+async def test_drain_stats_remediation_inclusive_keys_are_unchanged(recon_db):
+    """(c) The new keys are purely additive — no existing value may move.
+
+    The inclusive rate is the OBSERVED status quo the measured window actually
+    sustained, so it stays the headline; adding the remediation-free companion
+    must not silently redefine it.
+    """
+    db = recon_db._db_path
+    _seed_addendum_2(db)
+
+    stats = drain_stats(db, 'reify')
+
+    assert stats['drain_wall_clock_seconds'] == pytest.approx(3409.0)
+    assert stats['drain_events'] == 719
+    assert stats['drain_seconds_per_event'] == pytest.approx(3409.0 / 719)
+    assert stats['drain_seconds_per_event'] == pytest.approx(4.7413, abs=0.0001)
+
+
+@pytest.mark.asyncio
+async def test_drain_only_rate_is_the_inclusive_rate_discounted_exactly_once(recon_db):
+    """(d) drain_only = inclusive * (1 - duty), algebraically and exactly.
+
+    This identity IS the statement that the inclusive rate already carries the
+    remediation penalty: applying (1 - duty) to it a second time lands on the
+    remediation-free rate, not on a further-degraded one.  A caller wanting the
+    remediation-free figure must therefore READ this key, never re-derive it by
+    discounting the inclusive rate again.
+    """
+    db = recon_db._db_path
+    _seed_addendum_2(db)
+    _insert_run(
+        db, trigger_reason='quiescence',
+        started_at=_t('15:00:00'), completed_at=_t('15:15:45'), events_processed=50,
+    )  # a steady-state run, so drain_only covers more than the chunks alone
+
+    stats = drain_stats(db, 'reify')
+    duty = remediation_duty_cycle(stats)
+
+    assert stats['drain_only_seconds_per_event'] == pytest.approx(
+        stats['drain_seconds_per_event'] * (1 - duty),
+    )
+    # Steady state joins the drain-only wall-clock; remediation still does not.
+    assert stats['drain_only_wall_clock_seconds'] == pytest.approx(1914.0 + 945.0)
+    assert stats['drain_events'] == 769
+
+
+@pytest.mark.asyncio
+async def test_drain_only_rate_is_none_when_no_events_drained(recon_db):
+    """(e) An empty DB and a remediation-only window both read None, never raise."""
+    db = recon_db._db_path
+
+    empty = drain_stats(db, 'reify')
+    assert empty['drain_only_seconds_per_event'] is None
+    assert empty['drain_only_wall_clock_seconds'] == pytest.approx(0.0)
+
+    # A window whose only completed runs are zero-event remediation passes:
+    # non-zero inclusive wall-clock, zero events, zero drain-only wall-clock.
+    _insert_run(
+        db, run_type='remediation', trigger_reason='integrity_findings:2',
+        started_at=_t('13:56:24'), completed_at=_t('14:09:00'), events_processed=0,
+    )
+    remediation_only = drain_stats(db, 'reify')
+
+    assert remediation_only['drain_wall_clock_seconds'] == pytest.approx(756.0)
+    assert remediation_only['drain_events'] == 0
+    assert remediation_only['drain_only_wall_clock_seconds'] == pytest.approx(0.0)
+    assert remediation_only['drain_only_seconds_per_event'] is None
+    assert remediation_only['drain_seconds_per_event'] is None
+
+
+@pytest.mark.asyncio
+async def test_drain_only_rate_ignores_targeted_runs(recon_db):
+    """(f) Targeted runs hold no lock (ADDENDUM 2 finding 5), so neither key moves."""
+    db = recon_db._db_path
+    _seed_addendum_2(db)
+    before = drain_stats(db, 'reify')
+
+    for i in range(5):
+        _insert_run(
+            db, run_type='targeted', trigger_reason='task_status_changed',
+            started_at=_t(f'15:0{i}:00'), completed_at=_t(f'15:0{i}:40'),
+            events_processed=3,
+        )
+    after = drain_stats(db, 'reify')
+
+    assert after['drain_only_wall_clock_seconds'] == pytest.approx(
+        before['drain_only_wall_clock_seconds'])
+    assert after['drain_only_seconds_per_event'] == pytest.approx(
+        before['drain_only_seconds_per_event'])
+    assert after['modes']['targeted']['run_count'] == 5
+
+
 # ── remediation duty cycle ─────────────────────────────────────────────
 #
 # The number lever 1 exists to recover.  Remediation is an unconditional
