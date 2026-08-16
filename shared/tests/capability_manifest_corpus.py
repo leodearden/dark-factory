@@ -49,36 +49,93 @@ MANIFEST_SUFFIX = '.capability-manifest.yaml'
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def discover_manifests(repo_root: Path = REPO_ROOT) -> list[Path] | None:
-    """Every checked-in ``*.capability-manifest.yaml`` sidecar under *repo_root*.
+class GitUnavailable(RuntimeError):
+    """``git`` could not answer the question at all — an INFRA condition.
 
-    Uses ``git ls-files`` rather than ``Path.rglob`` — see module docstring
-    for why. Returns ``None`` when *repo_root* is not a git checkout
-    (``git ls-files`` exits non-zero), mirroring
-    ``test_lock_charter_guard.py``'s ``_tracked_paths()``. Also returns
-    ``None`` when the ``git`` invocation itself can't complete — binary
-    missing/unrunnable (``OSError``, e.g. ``FileNotFoundError`` on an odd
-    ``PATH``) or wedged past a 30s timeout (``subprocess.TimeoutExpired``,
-    e.g. ``index.lock`` contention) — rather than letting either escape:
-    ``test_capability_manifest.py`` calls this at *module import time*
-    (``_MANIFEST_PATHS = discover_manifests() or []``), so an uncaught
-    exception here would take down collection of the entire test module,
-    not just the corpus-guard classes. Otherwise returns a sorted,
-    duplicate-free list of absolute paths.
+    Strictly distinct from "git answered, and the answer was 'no such
+    record'". Raised for: the binary missing/unrunnable (``OSError``, e.g.
+    ``FileNotFoundError`` on an odd ``PATH``), a wedge past the 30s timeout
+    (``subprocess.TimeoutExpired``, e.g. ``index.lock`` contention against
+    the merge worker operating on this same checkout — see CLAUDE.md
+    "Working in the main checkout"), and a non-zero exit (notably *repo_root*
+    not being a checkout at all).
+
+    Keeping this separate from a ``None`` return is what stops a transient
+    wedge from being rendered as a staged-mode defect: a caller that can't
+    proceed without git should ``pytest.skip`` on this, not fail (code-review
+    amendment, task 3649).
+    """
+
+
+class AmbiguousIndexEntry(GitUnavailable):
+    """git answered, but with several index records for ONE literal path.
+
+    A subclass because it is still "no single usable answer" — a caller that
+    doesn't care can catch the base :class:`GitUnavailable` alone. But it is
+    NOT a flake to be skipped past: it means either a conflicted index (stages
+    1/2/3 for the same path) or a ``script:`` value naming a *directory*,
+    whose literal pathspec matches every tracked file beneath it. Reading
+    ``records[0]`` in either case would report a mode belonging to some other
+    file — a green for a path that is not a runnable script (code-review
+    amendment, task 3649).
+    """
+
+
+def _git_ls_files(repo_root: Path, *args: str) -> list[str]:
+    """``git -C <repo_root> ls-files -z <args>``, NUL-split into records.
+
+    The single owner of this module's git shell-out: the argv shape, the 30s
+    timeout, the guarded exception set, the returncode check, and the NUL
+    split all live here once. Both :func:`discover_manifests` and
+    :func:`committed_file_mode` go through it, so their behaviour on a
+    missing binary / wedged index / non-checkout is identical *structurally*
+    rather than by two copies of the same code agreeing (code-review
+    amendment, task 3649 — the previous duplication asserted that identity in
+    prose, which the next timeout change would have silently broken).
+
+    Raises :class:`GitUnavailable` — never returns a sentinel — so each caller
+    decides how to degrade: ``discover_manifests`` swallows it into ``None``
+    (it runs at module import time and must not raise), while
+    ``committed_file_mode`` lets it propagate so a test can skip rather than
+    report a phantom defect.
     """
     try:
         result = subprocess.run(
-            ['git', '-C', str(repo_root), 'ls-files', '-z', '--', f'*{MANIFEST_SUFFIX}'],
+            ['git', '-C', str(repo_root), 'ls-files', '-z', *args],
             capture_output=True,
             text=True,
             timeout=30,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise GitUnavailable(f'git ls-files under {repo_root} did not run: {exc!r}') from exc
     if result.returncode != 0:
+        detail = ' '.join(result.stderr.split()) or f'exit {result.returncode}'
+        raise GitUnavailable(f'git ls-files under {repo_root} failed: {detail}')
+    return [record for record in result.stdout.split('\0') if record]
+
+
+def discover_manifests(repo_root: Path = REPO_ROOT) -> list[Path] | None:
+    """Every checked-in ``*.capability-manifest.yaml`` sidecar under *repo_root*.
+
+    Uses ``git ls-files`` rather than ``Path.rglob`` — see module docstring
+    for why. Returns ``None`` for every condition :class:`GitUnavailable`
+    covers: *repo_root* not being a git checkout (``git ls-files`` exits
+    non-zero, mirroring ``test_lock_charter_guard.py``'s ``_tracked_paths()``),
+    a missing/unrunnable binary, or a wedge past the 30s timeout.
+
+    The collapse to ``None`` is deliberate *here* specifically:
+    ``test_capability_manifest.py`` calls this at *module import time*
+    (``_MANIFEST_PATHS = discover_manifests() or []``), so an escaping
+    exception would take down collection of the entire test module, not just
+    the corpus-guard classes. Callers that run at test time instead — see
+    :func:`committed_file_mode` — keep the distinction. Otherwise returns a
+    sorted, duplicate-free list of absolute paths.
+    """
+    try:
+        rel_paths = _git_ls_files(repo_root, '--', f'*{MANIFEST_SUFFIX}')
+    except GitUnavailable:
         return None
-    rel_paths = sorted({p for p in result.stdout.split('\0') if p})
-    return [repo_root / rel for rel in rel_paths]
+    return [repo_root / rel for rel in sorted(set(rel_paths))]
 
 
 def check_manifest(path: Path) -> str | None:
@@ -153,9 +210,13 @@ def iter_script_checks(path: Path) -> list[ScriptCheckRef]:
        sidecar loudly, with a better field-path-attributed message, and a
        schema-invalid sidecar is a manifest-shape defect rather than a
        script-lifecycle one — re-reporting it here would misattribute it.
-    2. The swallow is layered under two guards that go red if it ever hides
-       everything: ``TestCheckedInScriptCheckTargets``' non-vacuity test and
-       its both-known-anchors test.
+    2. The swallow cannot hide a dropped target. ``TestCheckedInScriptCheckTargets``
+       layers three guards over it: non-vacuity (catches hiding *everything*),
+       both-known-anchors (catches hiding either of today's two targets), and
+       — because neither of those notices a *future* third target quietly
+       falling out — a count guard that re-derives the expected number by
+       regex over the sidecar TEXT, bypassing this loader entirely, and
+       asserts equality (code-review amendment, task 3649).
 
     The swallow is also load-bearing for collection: ``test_capability_manifest.py``
     calls this at *module import time* (``_SCRIPT_CHECKS = [...]``) to feed
@@ -237,25 +298,37 @@ def committed_file_mode(rel: str, repo_root: Path = REPO_ROOT) -> str | None:
     reported green — the precise hazard task 3649 exists to fix, since its whole
     subject is a mode bit that never made it into the index.
 
-    Reuses :func:`discover_manifests`' subprocess idiom verbatim — same ``-z``
-    output, same 30s timeout, same ``except (OSError, subprocess.TimeoutExpired)``
-    guard and returncode check — so this second git shell-out has identical
-    non-checkout / missing-binary / ``index.lock``-wedge behaviour rather than a
-    differently-guarded one. Returns ``None`` for empty output (path not tracked).
+    Three outcomes, deliberately NOT collapsed into one (code-review amendment,
+    task 3649 — the first cut returned ``None`` for all of them, so a caller
+    rendered an infra flake as "committed at mode None", sending the reader to
+    ``git update-index --chmod`` for a problem that was pure ``index.lock``
+    contention):
+
+    * exactly one index record -> its mode string;
+    * zero records -> ``None``, meaning git answered and *rel* is genuinely
+      **not tracked** — a real, distinct defect (a script that exists on disk
+      but was never ``git add``ed), not an infra failure;
+    * git could not answer -> :class:`GitUnavailable` propagates. Unlike
+      :func:`discover_manifests` this runs at test time, not import time, so
+      raising is safe and lets the caller skip.
+
+    The pathspec is ``:(literal)`` magic, not the bare *rel*. ``git ls-files``
+    takes a **pathspec**, so a bare value containing ``*``/``?``/``[`` would be
+    glob-expanded and the first match's mode reported for a file that is not the
+    target. With globbing disabled, several records can still come back — a
+    conflicted index (stages 1/2/3) or a *rel* naming a directory (leading-path
+    matching survives ``:(literal)``; measured: ``:(literal)scripts/tests`` ->
+    60 records) — and that raises :class:`AmbiguousIndexEntry` rather than
+    silently narrowing to ``records[0]``.
     """
-    try:
-        result = subprocess.run(
-            ['git', '-C', str(repo_root), 'ls-files', '-s', '-z', '--', rel],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if result.returncode != 0:
-        return None
-    records = [r for r in result.stdout.split('\0') if r]
+    records = _git_ls_files(repo_root, '-s', '--', f':(literal){rel}')
     if not records:
         return None
+    if len(records) > 1:
+        raise AmbiguousIndexEntry(
+            f'{rel} matched {len(records)} index records under {repo_root} — '
+            'a conflicted index (stages 1/2/3) or a path naming a directory, '
+            'so there is no single committed mode'
+        )
     # `git ls-files -s` record: "<mode> <object> <stage>\t<path>".
     return records[0].split(' ', 1)[0]

@@ -18,6 +18,7 @@ convention (see plans/capability-delivered-checks-prd.md §Contract):
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -26,6 +27,8 @@ import yaml
 from capability_manifest_corpus import (
     MANIFEST_SUFFIX,
     REPO_ROOT,
+    AmbiguousIndexEntry,
+    GitUnavailable,
     ScriptCheckRef,
     check_manifest,
     check_script_target,
@@ -920,6 +923,11 @@ class TestCommittedFileMode:
     os.access is greened by a local `chmod +x` that is never staged, which
     would leave main exactly as broken while the guard reported green. This
     checker is what proves a mode fix actually LANDS.
+
+    Its three outcomes are asserted separately (code-review amendment, task
+    3649), because collapsing them is what makes a red lie: a mode string, a
+    None meaning genuinely-untracked, and a raised GitUnavailable meaning git
+    never answered.
     """
 
     def test_known_executable_script_reports_100755(self):
@@ -927,12 +935,58 @@ class TestCommittedFileMode:
         assert committed_file_mode('scripts/check_method_param_wiring.py') == '100755'
 
     def test_untracked_path_returns_none(self):
+        # None means exactly one thing: git answered, and there is no index
+        # record. NOT "something went wrong" — that raises instead.
         assert committed_file_mode('scripts/no-such-file-3649.py') is None
 
-    def test_non_checkout_root_returns_none(self, tmp_path):
-        # Mirrors discover_manifests' non-checkout contract: git ls-files
-        # exits non-zero outside a checkout, and this must not raise.
-        assert committed_file_mode('scripts/anything.py', repo_root=tmp_path) is None
+    def test_non_checkout_root_raises_git_unavailable(self, tmp_path):
+        # git ls-files exits non-zero outside a checkout. discover_manifests
+        # swallows that into None because it runs at module import time; this
+        # one runs at test time, so it keeps the distinction rather than
+        # letting a non-checkout masquerade as an untracked path.
+        with pytest.raises(GitUnavailable):
+            committed_file_mode('scripts/anything.py', repo_root=tmp_path)
+
+    def test_missing_git_binary_raises_git_unavailable(self, tmp_path, monkeypatch):
+        def _raise(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+            raise FileNotFoundError('git')
+
+        monkeypatch.setattr(subprocess, 'run', _raise)
+        with pytest.raises(GitUnavailable):
+            committed_file_mode('scripts/anything.py', repo_root=tmp_path)
+
+    def test_wedged_git_raises_git_unavailable(self, tmp_path, monkeypatch):
+        # The index.lock-contention case: the merge worker operates on this
+        # same checkout concurrently (CLAUDE.md "Working in the main
+        # checkout"), so a wedge is a live possibility mid-run. It must be
+        # distinguishable from a staged-mode defect, not rendered as one.
+        def _raise(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+            raise subprocess.TimeoutExpired(cmd='git', timeout=30)
+
+        monkeypatch.setattr(subprocess, 'run', _raise)
+        with pytest.raises(GitUnavailable):
+            committed_file_mode('scripts/anything.py', repo_root=tmp_path)
+
+    def test_glob_metacharacters_are_not_expanded(self):
+        # git ls-files takes a PATHSPEC. Without :(literal) magic this pattern
+        # glob-expands and reports scripts/check_method_param_wiring.py's mode
+        # (measured) — a mode for a file that is not the named target. The
+        # literal pathspec must instead match nothing.
+        assert committed_file_mode('scripts/check_*_param_wiring.py') is None
+
+    def test_directory_path_raises_ambiguous_index_entry(self):
+        # Leading-path matching survives :(literal), so a directory matches
+        # every tracked file beneath it (measured: 60 records). Taking
+        # records[0] would report an unrelated file's mode as green — and the
+        # is_file() gate that would catch this lives in check_script_target,
+        # i.e. a different test method entirely.
+        with pytest.raises(AmbiguousIndexEntry):
+            committed_file_mode('scripts/tests')
+
+    def test_ambiguous_index_entry_is_catchable_as_git_unavailable(self):
+        # The subclass relationship is load-bearing: a caller that only wants
+        # "no single usable answer" writes one except clause.
+        assert issubclass(AmbiguousIndexEntry, GitUnavailable)
 
 
 _MANIFEST_PATHS = discover_manifests() or []
@@ -947,6 +1001,15 @@ _SCRIPT_CHECKS = [ref for path in _MANIFEST_PATHS for ref in iter_script_checks(
 _SCRIPT_CHECK_IDS = [
     f'{ref.manifest.relative_to(REPO_ROOT)}::{ref.capability}' for ref in _SCRIPT_CHECKS
 ]
+
+#: Independent, loader-free way to count the `kind: script` checks a sidecar
+#: DECLARES — deliberately a regex over raw text, so it still counts a check
+#: inside a sidecar that iter_script_checks dropped (schema-invalid, or
+#: tracked-but-absent from the working tree). Matches block style
+#: (`kind: script`) and the flow style the corpus also uses
+#: (`{kind: script, script: ...}`), quoted or bare. Feeds the count guard in
+#: TestCheckedInScriptCheckTargets (code-review amendment, task 3649).
+_SCRIPT_KIND_RE = re.compile(r'\bkind:\s*[\'"]?script\b')
 
 
 def _missing_from_worktree_message(manifest_path: Path) -> str:
@@ -1014,7 +1077,9 @@ class TestCheckedInManifestCorpus:
     second one (plans/agent-transcript-archival-prd.capability-manifest.yaml
     -> scripts/gc_agent_transcripts.py) was committed at mode 100644 and had
     been ERRORing forever. This class stays scoped to manifest SHAPE; the
-    sibling class covers script LIFECYCLE. Does NOT separately re-validate each capability via
+    sibling class covers script LIFECYCLE.
+
+    Does NOT separately re-validate each capability via
     `ManifestCapability.model_validate(cap.model_dump()) == cap`
     (code-review amendment, task 3362: dropped as tautological) —
     `load_capability_manifest` already constructs every `ManifestCapability`
@@ -1076,17 +1141,11 @@ class TestCheckedInScriptCheckTargets:
     NATURALLY RED (task 3649), unlike TestCheckedInManifestCorpus above, which
     was green on arrival and needed a mutation to prove its RED signal.
 
-    RED on arrival, measured across the corpus (2 script checks in 30 sidecars):
-
-        FAILED ...::test_target_exists_and_is_executable[
-            plans/agent-transcript-archival-prd.capability-manifest.yaml::
-            gc-prunes-archive-by-cap]
-        FAILED ...::test_target_is_committed_executable[  (same id)  ]
-
-    — working tree -rw-rw-r--, committed mode 100644 — while BOTH
-    docs/prds/memory-eval-program.capability-manifest.yaml::
-    qdrant-vector-access-for-ann cases stayed green. A one-line `chmod +x` on
-    scripts/gc_agent_transcripts.py greened both halves with no logic change.
+    Provenance: arrived RED on scripts/gc_agent_transcripts.py (working tree
+    -rw-rw-r--, committed 100644, both halves failing) and was greened by a
+    `chmod +x` with no logic change — task 3649. Corpus sizes and parametrize
+    ids are deliberately NOT quoted here: unlike the assertions below, prose
+    counts rot silently the first time a sidecar or script check is added.
 
     Both halves are asserted, as two separate methods rather than one combined
     assertion, because either alone is a hole: os.access is the exact property
@@ -1117,6 +1176,37 @@ class TestCheckedInScriptCheckTargets:
             'scripts/check_method_param_wiring.py',
         }
 
+    def test_sweep_covers_every_declared_script_check(self):
+        # Neither guard above detects coverage SHRINKAGE for a script check
+        # added after task 3649: non-vacuity only asserts non-empty, and the
+        # anchor test is a superset check pinned to today's two names. So a
+        # future third target whose sidecar is tracked but absent from the
+        # working tree, or temporarily schema-invalid, would drop out of
+        # iter_script_checks' swallow with both staying green (code-review
+        # amendment, task 3649).
+        #
+        # The cross-check re-derives the expected count by regex over raw
+        # sidecar TEXT — bypassing the loader entirely, so it still counts a
+        # declaration the loader could not parse — and asserts EQUALITY rather
+        # than a hand-bumped floor, so nothing has to be remembered later.
+        if discover_manifests() is None:
+            pytest.skip('not a git checkout (git ls-files failed)')
+        declared = 0
+        for path in _MANIFEST_PATHS:
+            try:
+                text = path.read_text(encoding='utf-8')
+            except OSError:
+                # Tracked but unreadable: the very case the swallow hides.
+                pytest.fail(_missing_from_worktree_message(path))
+            declared += len(_SCRIPT_KIND_RE.findall(text))
+        assert len(_SCRIPT_CHECKS) == declared, (
+            f'{declared} `kind: script` checks are declared across the checked-in '
+            f'sidecars but only {len(_SCRIPT_CHECKS)} reached the sweep — '
+            'iter_script_checks dropped one (unloadable or schema-invalid sidecar; '
+            'see TestCheckedInManifestCorpus for the attributed error), so it is '
+            'silently unguarded'
+        )
+
     @pytest.mark.parametrize('ref', _SCRIPT_CHECKS, ids=_SCRIPT_CHECK_IDS)
     def test_target_exists_and_is_executable(self, ref):
         # The WORKING-tree property _run_script_check actually execs.
@@ -1127,10 +1217,29 @@ class TestCheckedInScriptCheckTargets:
     def test_target_is_committed_executable(self, ref):
         # The INDEX mode — so a local-only `chmod +x` that is never staged
         # cannot green this guard while main stays broken.
-        mode = committed_file_mode(ref.script)
+        prefix = (
+            f'{ref.manifest.relative_to(REPO_ROOT)}: capability {ref.capability!r}: {ref.script}'
+        )
+        try:
+            mode = committed_file_mode(ref.script)
+        except AmbiguousIndexEntry as exc:
+            # Not skippable: either a conflicted index or a `script:` naming a
+            # directory. Both mean this method cannot answer, and the second is
+            # a real defect.
+            pytest.fail(f'{prefix}: {exc}')
+        except GitUnavailable as exc:
+            # Pure infra — a missing binary, or an index.lock wedge against the
+            # merge worker on this same checkout. Skip, matching the
+            # non-vacuity tests' skip-on-non-checkout convention, rather than
+            # rendering a flake as a staged-mode defect and sending the reader
+            # to `git update-index --chmod` (code-review amendment, task 3649).
+            pytest.skip(f'git could not answer: {exc}')
+        assert mode is not None, (
+            f'{prefix} is not tracked by git — it exists in the working tree but was '
+            'never `git add`ed, so main has no script for _run_script_check to exec'
+        )
         assert mode == '100755', (
-            f'{ref.manifest.relative_to(REPO_ROOT)}: capability {ref.capability!r}: '
-            f'{ref.script} is committed at mode {mode!r}, not 100755 — a working-tree '
+            f'{prefix} is committed at mode {mode}, not 100755 — a working-tree '
             'chmod that is never staged leaves main ERRORing'
         )
 
