@@ -271,7 +271,11 @@ _ALL_GROUP_ARG_SWEEP_CASES = [
     ('list_indices', (), {'group_id': _PATH_SHAPED}),
     ('ensure_indices', (), {'group_id': _PATH_SHAPED}),
     ('drop_index', ('Entity', 'name'), {'group_id': _PATH_SHAPED}),
-    ('drop_vector_index', ('Entity', 'name_embedding', 'NODE'), {'group_id': _PATH_SHAPED}),
+    (
+        'drop_vector_index',
+        ('Entity', 'name_embedding'),
+        {'entity_type': 'NODE', 'group_id': _PATH_SHAPED},
+    ),
     ('drop_vector_indices', (), {'group_id': _PATH_SHAPED}),
     ('retrieve_episodes', (), {'group_ids': [_PATH_SHAPED]}),
 ]

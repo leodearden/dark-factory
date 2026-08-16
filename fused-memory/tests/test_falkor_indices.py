@@ -1262,27 +1262,38 @@ class TestVectorDropStatement:
     MEASURED 2026-08-16 on throwaway graph ``_impl3769_probe`` (seeded, probed,
     then GRAPH.DELETE'd; no real project graph touched):
 
-    * ``DROP INDEX ON :Entity(emb)`` — the form ``GraphitiBackend.drop_index()``
-      issues — FAILS against a live VECTOR index with
-      ``ERR Unable to drop index on :Entity(emb): no such index.``  The old-style
-      form only targets RANGE.
     * ``DROP VECTOR INDEX FOR (n:Entity) ON (n.emb)`` returns ``Indices deleted: 1``.
     * ``DROP VECTOR INDEX FOR ()-[e:RELATES_TO]-() ON (e.fact_embedding)`` returns
       ``Indices deleted: 1``, while the NODE form against that same relationship
-      index fails with ``no such index``.
+      index fails with ``no such index`` — which is why ``entity_type`` is
+      load-bearing rather than cosmetic, and why it is keyword-only here.
 
-    That last pair is why ``entity_type`` is load-bearing rather than cosmetic.
+    Why VECTOR cannot reuse ``GraphitiBackend.drop_index()`` at all is recorded
+    once, in that method's and ``drop_vector_indices``' docstrings.
     """
 
     def test_node_form_is_the_measured_working_statement(self):
+        """The exact bytes measured to return ``Indices deleted: 1``.
+
+        This pin — with its RELATIONSHIP twin below — is what enforces the two
+        REGRESSION INTENTS of this class, so neither needs its own test:
+
+        * the emitted statement is never the old-style
+          ``DROP INDEX ON :Entity(name_embedding)`` form (which measured
+          ``no such index`` against a live VECTOR index), and
+        * the NODE and RELATIONSHIP forms differ, so ``entity_type`` cannot
+          silently collapse into one label-only shape.
+        """
         assert (
-            vector_drop_statement('Entity', 'NODE', 'name_embedding')
+            vector_drop_statement('Entity', 'name_embedding', entity_type='NODE')
             == 'DROP VECTOR INDEX FOR (n:Entity) ON (n.name_embedding)'
         )
 
     def test_relationship_form_is_the_measured_working_edge_statement(self):
         assert (
-            vector_drop_statement('RELATES_TO', 'RELATIONSHIP', 'fact_embedding')
+            vector_drop_statement(
+                'RELATES_TO', 'fact_embedding', entity_type='RELATIONSHIP',
+            )
             == 'DROP VECTOR INDEX FOR ()-[e:RELATES_TO]-() ON (e.fact_embedding)'
         )
 
@@ -1303,21 +1314,9 @@ class TestVectorDropStatement:
         ``reindex(drop_indices=True)`` would go from quietly doing nothing to
         failing outright.  This asserts the emitted statement is not that form.
         """
-        statement = vector_drop_statement(label, entity_type, prop)
+        statement = vector_drop_statement(label, prop, entity_type=entity_type)
         assert statement != f'DROP INDEX ON :{label}({prop})'
         assert statement.startswith('DROP VECTOR INDEX ')
-
-    def test_node_and_relationship_forms_differ(self):
-        """entity_type is LOAD-BEARING: measured, the wrong form errors 'no such index'.
-
-        Emitting one label-only shape for both would silently drop NOTHING for
-        whichever half guessed wrong — while reporting a successful drop, which is
-        the exact failure mode this task exists to remove.
-        """
-        assert (
-            vector_drop_statement('RELATES_TO', 'NODE', 'fact_embedding')
-            != vector_drop_statement('RELATES_TO', 'RELATIONSHIP', 'fact_embedding')
-        )
 
     @pytest.mark.parametrize(
         'entity_type',
@@ -1333,7 +1332,9 @@ class TestVectorDropStatement:
         must be caught, not silently pattern-matched.
         """
         with pytest.raises(ValueError) as excinfo:
-            vector_drop_statement('RELATES_TO', entity_type, 'fact_embedding')
+            vector_drop_statement(
+                'RELATES_TO', 'fact_embedding', entity_type=entity_type,
+            )
         assert 'RELATIONSHIP' in str(excinfo.value)
 
 

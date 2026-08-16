@@ -380,16 +380,19 @@ class TestDropIndex:
 class TestDropVectorIndex:
     """GraphitiBackend.drop_vector_index() issues the VECTOR-specific DROP verb.
 
-    The sibling ``drop_index`` above cannot serve VECTOR.  MEASURED 2026-08-16 on
-    throwaway graph ``_impl3769_probe``: the old-style
-    ``DROP INDEX ON :Entity(emb)`` form it issues fails against a live VECTOR
-    index with ``ERR Unable to drop index on :Entity(emb): no such index.`` —
-    that form only targets RANGE.
+    The sibling ``drop_index`` above cannot serve VECTOR — measured, its
+    old-style form fails with ``no such index`` against a live one (see
+    ``drop_vector_indices``' docstring for the full measurement).
 
     Statements are asserted against ``vector_drop_statement``'s output rather
     than re-spelled here, so the byte-for-byte pinning lives in exactly one
     place (``TestVectorDropStatement`` in ``test_falkor_indices.py``) and this
-    class pins the WIRING instead of re-forking the form.
+    class pins the WIRING instead of re-forking the form.  That chain also
+    carries the REGRESSION INTENT — the emitted statement can never be the
+    old-style ``DROP INDEX ON :label(field)`` form, because
+    ``TestVectorDropStatement`` pins the exact bytes it is compared against.  A
+    separate negative assertion here would only re-state what these equalities
+    already enforce.
     """
 
     @pytest.mark.asyncio
@@ -400,10 +403,12 @@ class TestDropVectorIndex:
         graph = make_graph_mock([])
         backend._driver._get_graph = MagicMock(return_value=graph)
 
-        await backend.drop_vector_index('Entity', 'name_embedding', 'NODE', group_id='test')
+        await backend.drop_vector_index(
+            'Entity', 'name_embedding', entity_type='NODE', group_id='test',
+        )
 
         assert extract_cypher(graph.query.call_args) == vector_drop_statement(
-            'Entity', 'NODE', 'name_embedding',
+            'Entity', 'name_embedding', entity_type='NODE',
         )
 
     @pytest.mark.asyncio
@@ -416,27 +421,12 @@ class TestDropVectorIndex:
         backend._driver._get_graph = MagicMock(return_value=graph)
 
         await backend.drop_vector_index(
-            'RELATES_TO', 'fact_embedding', 'RELATIONSHIP', group_id='test',
+            'RELATES_TO', 'fact_embedding', entity_type='RELATIONSHIP', group_id='test',
         )
 
         assert extract_cypher(graph.query.call_args) == vector_drop_statement(
-            'RELATES_TO', 'RELATIONSHIP', 'fact_embedding',
+            'RELATES_TO', 'fact_embedding', entity_type='RELATIONSHIP',
         )
-
-    @pytest.mark.asyncio
-    async def test_is_not_the_old_style_range_only_form(
-        self, mock_config, make_backend, make_graph_mock,
-    ):
-        """REGRESSION INTENT: never regress into the statement drop_index issues."""
-        backend = make_backend(mock_config)
-        graph = make_graph_mock([])
-        backend._driver._get_graph = MagicMock(return_value=graph)
-
-        await backend.drop_vector_index('Entity', 'name_embedding', 'NODE', group_id='test')
-
-        cypher = extract_cypher(graph.query.call_args)
-        assert cypher != 'DROP INDEX ON :Entity(name_embedding)'
-        assert cypher.startswith('DROP VECTOR INDEX ')
 
     @pytest.mark.asyncio
     async def test_uses_the_write_path_not_ro_query(
@@ -447,7 +437,9 @@ class TestDropVectorIndex:
         graph = make_graph_mock([])
         backend._driver._get_graph = MagicMock(return_value=graph)
 
-        await backend.drop_vector_index('Entity', 'name_embedding', 'NODE', group_id='test')
+        await backend.drop_vector_index(
+            'Entity', 'name_embedding', entity_type='NODE', group_id='test',
+        )
 
         graph.query.assert_called_once()
         graph.ro_query.assert_not_called()
@@ -457,7 +449,7 @@ class TestDropVectorIndex:
         backend = GraphitiBackend(mock_config)
         with pytest.raises(RuntimeError, match='not initialized'):
             await backend.drop_vector_index(
-                'Entity', 'name_embedding', 'NODE', group_id='test',
+                'Entity', 'name_embedding', entity_type='NODE', group_id='test',
             )
 
 
@@ -519,7 +511,10 @@ class TestDropVectorIndices:
         calls = backend.drop_vector_index.call_args_list
         # The per-property STRING field, not the record's field LIST: a list here
         # would render as `ON (n.['name_embedding'])` and drop nothing.
-        called = [(c[0][0], c[0][1], c[0][2]) for c in calls]
+        # entity_type is read from kwargs because it is keyword-only — it and
+        # `field` are both plain strings, so a positional slot would let a swap
+        # type-check.
+        called = [(c[0][0], c[0][1], c.kwargs['entity_type']) for c in calls]
         assert ('Entity', 'name_embedding', 'NODE') in called
         assert ('RELATES_TO', 'fact_embedding', 'RELATIONSHIP') in called
 
@@ -580,9 +575,9 @@ class TestDropVectorIndices:
         result = await backend.drop_vector_indices(group_id='test')
 
         backend.drop_vector_index.assert_called_once()
-        assert backend.drop_vector_index.call_args[0][:3] == (
-            'Entity', 'name_embedding', 'NODE',
-        )
+        call = backend.drop_vector_index.call_args
+        assert call[0][:2] == ('Entity', 'name_embedding')
+        assert call.kwargs['entity_type'] == 'NODE'
         assert result == [{'label': 'Entity', 'field': 'name_embedding'}]
 
     @pytest.mark.asyncio
@@ -638,9 +633,9 @@ class TestDropVectorIndices:
         result = await backend.drop_vector_indices(group_id='test')
 
         backend.drop_vector_index.assert_called_once()
-        assert backend.drop_vector_index.call_args[0][:3] == (
-            'RELATES_TO', 'fact_embedding', 'RELATIONSHIP',
-        )
+        call = backend.drop_vector_index.call_args
+        assert call[0][:2] == ('RELATES_TO', 'fact_embedding')
+        assert call.kwargs['entity_type'] == 'RELATIONSHIP'
         assert result == [{'label': 'RELATES_TO', 'field': 'fact_embedding'}]
 
     @pytest.mark.asyncio
@@ -667,6 +662,41 @@ class TestDropVectorIndices:
 
         with pytest.raises(RuntimeError, match='boom'):
             await backend.drop_vector_indices(group_id='test')
+
+    @pytest.mark.asyncio
+    async def test_logs_what_was_already_dropped_before_re_raising(
+        self, mock_config, make_backend, caplog,
+    ):
+        """Propagating is not the same as saying nothing.
+
+        A mid-loop failure leaves the graph GENUINELY half-dropped, and the
+        locally-accumulated list dies with the frame: ``reindex_and_replay``
+        never assigns ``indices_dropped`` because ``drop_vector_indices`` never
+        returns.  So the partial list must reach the operator recovering from it
+        — structured facts at failure.  The propagate-don't-absorb contract above
+        is unchanged; only the diagnostics improve.
+        """
+        backend = make_backend(mock_config)
+
+        indices = [
+            {
+                'label': 'Entity',
+                'field': ['name_embedding', 'other_embedding'],
+                'type': {
+                    'name_embedding': ['VECTOR'], 'other_embedding': ['VECTOR'],
+                },
+                'entity_type': 'NODE',
+            },
+        ]
+        backend.list_indices = AsyncMock(return_value=indices)
+        backend.drop_vector_index = AsyncMock(side_effect=[None, RuntimeError('boom')])
+
+        with caplog.at_level(logging.ERROR), pytest.raises(RuntimeError, match='boom'):
+            await backend.drop_vector_indices(group_id='test')
+
+        errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+        assert any('name_embedding' in msg for msg in errors), errors
+        assert any('after dropping 1' in msg for msg in errors), errors
 
     @pytest.mark.asyncio
     async def test_no_op_when_no_vector_indices(self, mock_config, make_backend):

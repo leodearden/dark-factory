@@ -736,24 +736,25 @@ def range_create_statement(spec: IndexSpec) -> str:
     )
 
 
-def vector_drop_statement(label: str, entity_type: str, prop: str) -> str:
+def vector_drop_statement(label: str, prop: str, *, entity_type: str) -> str:
     """Build the per-property VECTOR DROP statement for one indexed property.
 
-    VECTOR needs its OWN drop verb rather than reusing
-    ``GraphitiBackend.drop_index()``.  MEASURED 2026-08-16 on throwaway graph
-    ``_impl3769_probe`` (seeded, probed, then ``GRAPH.DELETE``'d):
-    ``DROP INDEX ON :Entity(emb)`` — the old-style form ``drop_index()`` issues —
-    fails against a live VECTOR index with
-    ``ERR Unable to drop index on :Entity(emb): no such index.``  That form only
-    targets RANGE.  ``DROP VECTOR INDEX FOR (n:Entity) ON (n.emb)`` returns
-    ``Indices deleted: 1``.
+    MEASURED 2026-08-16 on throwaway graph ``_impl3769_probe`` (seeded, probed,
+    then ``GRAPH.DELETE``'d):
 
-    ``entity_type`` is LOAD-BEARING, not cosmetic.  Measured on the same graph:
-    the NODE form against a RELATIONSHIP vector index
-    (``DROP VECTOR INDEX FOR (n:RELATES_TO) ON (n.fact_embedding)``) fails with
-    ``no such index``, while the edge form deletes it.  Graphiti indexes
-    ``fact_embedding`` on RELATES_TO edges and ``name_embedding`` on Entity nodes,
-    so both branches are live in production.
+    * ``DROP VECTOR INDEX FOR (n:Entity) ON (n.emb)`` returns
+      ``Indices deleted: 1``.
+    * ``DROP VECTOR INDEX FOR ()-[e:RELATES_TO]-() ON (e.fact_embedding)`` also
+      returns ``Indices deleted: 1``, while the NODE form against that same
+      relationship index fails with ``no such index``.  Graphiti indexes
+      ``fact_embedding`` on RELATES_TO edges and ``name_embedding`` on Entity
+      nodes, so both branches are live in production.
+    * ``DROP INDEX ON :Entity(emb)`` — the old-style form
+      ``GraphitiBackend.drop_index()`` issues — FAILS against a live VECTOR index
+      with ``ERR Unable to drop index on :Entity(emb): no such index.``  That form
+      targets RANGE only, which is why VECTOR needs its own builder rather than
+      reusing ``drop_index``.  See :meth:`GraphitiBackend.drop_vector_indices`
+      for the full defect history (task 3769).
 
     ``falkordb``'s own client builds the identical statements
     (``falkordb/asyncio/graph.py``, ``drop_node_vector_index`` /
@@ -765,10 +766,15 @@ def vector_drop_statement(label: str, entity_type: str, prop: str) -> str:
 
     Args:
         label: The node label or relationship type carrying the index.
-        entity_type: ``'NODE'`` or ``'RELATIONSHIP'``.
         prop: A SINGLE property name.  Single-property by construction, matching
             :func:`range_create_statement` and the per-property fan-out
             :func:`vector_index_properties` produces.
+        entity_type: ``'NODE'`` or ``'RELATIONSHIP'``.  KEYWORD-ONLY, and
+            deliberately so: it and *prop* are both plain ``str``, so a positional
+            swap would type-check and only ONE direction of it raises.  The same
+            ordering holds on :meth:`GraphitiBackend.drop_vector_index`, which
+            wraps this — ``(label, field)`` positional, ``entity_type`` by keyword
+            — so no call site has to re-order arguments to reach the other.
 
     Returns:
         The measured-working DROP statement.
