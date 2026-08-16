@@ -3240,3 +3240,142 @@ class TestCliParser:
         assert args.json_out == '/tmp/j.json'
         assert args.md_out == '/tmp/m.md'
         assert args.config == '/tmp/c.yaml'
+
+
+class TestCliHistoryFlags:
+    """`--history-out` / `--no-history` / `--registry` (task 4006).
+
+    The trend file is committed and written by a nightly timer, so an
+    operator's ad-hoc run must be able to MEASURE without polluting it --
+    otherwise the only safe way to look at coverage is not to look.
+    """
+
+    def test_parser_defaults_for_the_new_flags(self):
+        args = _mod._build_parser().parse_args([])
+        assert args.history_out == _mod.DEFAULT_HISTORY_OUT
+        assert args.no_history is False
+        assert args.registry == _mod.DEFAULT_REGISTRY_PATH
+
+    def test_new_flags_parse(self):
+        args = _mod._build_parser().parse_args([
+            '--history-out', '/tmp/h.json', '--no-history', '--registry', '/tmp/r.json',
+        ])
+        assert args.history_out == '/tmp/h.json'
+        assert args.no_history is True
+        assert args.registry == '/tmp/r.json'
+
+    @pytest.mark.asyncio
+    async def test_run_appends_a_run_to_the_history(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(_mod, 'census_project', _census_project_stub())
+        monkeypatch.setattr(_mod, '_build_backend', lambda cfg: AsyncMock())
+        history_out = str(tmp_path / 'history.json')
+        rc = await _mod._run(_args(tmp_path, history_out=history_out))
+        assert rc == 0
+        history = _mod.load_coverage_history(history_out)
+        assert len(history['runs']) == 1
+        assert history['runs'][0]['stamp']
+        assert 'dark_factory' in history['runs'][0]['projects']
+
+    @pytest.mark.asyncio
+    async def test_consecutive_runs_append_rather_than_overwrite(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(_mod, 'census_project', _census_project_stub())
+        monkeypatch.setattr(_mod, '_build_backend', lambda cfg: AsyncMock())
+        history_out = str(tmp_path / 'history.json')
+        await _mod._run(_args(tmp_path, history_out=history_out))
+        await _mod._run(_args(tmp_path, history_out=history_out))
+        assert len(_mod.load_coverage_history(history_out)['runs']) == 2
+
+    @pytest.mark.asyncio
+    async def test_no_history_leaves_the_file_byte_unchanged(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(_mod, 'census_project', _census_project_stub())
+        monkeypatch.setattr(_mod, '_build_backend', lambda cfg: AsyncMock())
+        history_out = tmp_path / 'history.json'
+        await _mod._run(_args(tmp_path, history_out=str(history_out)))
+        before = history_out.read_bytes()
+        rc = await _mod._run(_args(tmp_path, history_out=str(history_out), no_history=True))
+        assert rc == 0
+        assert history_out.read_bytes() == before
+
+    @pytest.mark.asyncio
+    async def test_no_history_still_REPORTS_the_trend_it_did_not_append(
+        self, tmp_path, monkeypatch,
+    ):
+        # Measure without polluting: the ad-hoc run still reads the history
+        # and renders the diff, it just does not extend it.
+        monkeypatch.setattr(_mod, 'census_project', _census_project_stub())
+        monkeypatch.setattr(_mod, '_build_backend', lambda cfg: AsyncMock())
+        history_out = str(tmp_path / 'history.json')
+        await _mod._run(_args(tmp_path, history_out=history_out))
+        await _mod._run(_args(tmp_path, history_out=history_out, no_history=True))
+        written = json.loads((tmp_path / 'census.json').read_text())
+        assert written['coverage_trend']['baseline'] is not None
+
+    @pytest.mark.asyncio
+    async def test_a_malformed_history_fails_the_run_loudly(self, tmp_path, monkeypatch):
+        # Losing the trend must be loud: a run that silently restarted the
+        # history from empty would report "first recorded run" forever.
+        monkeypatch.setattr(_mod, 'census_project', _census_project_stub())
+        monkeypatch.setattr(_mod, '_build_backend', lambda cfg: AsyncMock())
+        history_out = tmp_path / 'history.json'
+        history_out.write_text('{not json', encoding='utf-8')
+        rc = await _mod._run(_args(tmp_path, history_out=str(history_out)))
+        assert rc == 1
+        assert history_out.read_text(encoding='utf-8') == '{not json'
+
+    @pytest.mark.asyncio
+    async def test_an_incomplete_census_still_lands_its_artifacts_and_exits_1(
+        self, tmp_path, monkeypatch,
+    ):
+        # The pre-existing exit-code contract survives the new wiring.
+        monkeypatch.setattr(_mod, 'census_project', _census_project_stub(complete=False))
+        monkeypatch.setattr(_mod, '_build_backend', lambda cfg: AsyncMock())
+        rc = await _mod._run(_args(tmp_path, history_out=str(tmp_path / 'h.json')))
+        assert rc == 1
+        assert (tmp_path / 'census.json').exists()
+
+
+class TestRegenCommandCoversTheNewFlags:
+    """Task 3507's drift, re-armed for 4006's flags: a documented regen
+    command that no longer reproduces the artifact is worse than none."""
+
+    def test_default_new_flags_keep_the_bare_command(self):
+        md = _mod.render_markdown(_both_default_projects_report())
+        assert (
+            'Regenerate with `uv run python scripts/census_memory_metadata.py`.'
+            in md
+        )
+
+    def test_non_default_registry_is_named(self):
+        params = {'projects': ['dark_factory', 'reify'], 'registry': '/tmp/r.json'}
+        assert '--registry /tmp/r.json' in _mod._regen_command(params)
+
+    def test_non_default_history_out_is_named(self):
+        params = {'projects': ['dark_factory', 'reify'], 'history_out': '/tmp/h.json'}
+        assert '--history-out /tmp/h.json' in _mod._regen_command(params)
+
+    def test_no_history_is_named(self):
+        params = {'projects': ['dark_factory', 'reify'], 'no_history': True}
+        assert '--no-history' in _mod._regen_command(params)
+
+    def test_the_defaults_are_never_restated_in_the_command(self):
+        params = {
+            'projects': ['dark_factory', 'reify'],
+            'registry': _mod.DEFAULT_REGISTRY_PATH,
+            'history_out': _mod.DEFAULT_HISTORY_OUT,
+            'no_history': False,
+        }
+        assert _mod._regen_command(params) == (
+            'uv run python scripts/census_memory_metadata.py'
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_records_the_new_flags_in_params(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(_mod, 'census_project', _census_project_stub())
+        monkeypatch.setattr(_mod, '_build_backend', lambda cfg: AsyncMock())
+        await _mod._run(_args(
+            tmp_path, history_out='/tmp/h.json', no_history=True, registry='/tmp/r.json',
+        ))
+        written = json.loads((tmp_path / 'census.json').read_text())
+        assert written['params']['history_out'] == '/tmp/h.json'
+        assert written['params']['no_history'] is True
+        assert written['params']['registry'] == '/tmp/r.json'
