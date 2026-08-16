@@ -44,6 +44,7 @@ import pytest
 
 from shared.decision_pairing import (
     HEADER_MARKERS,
+    PAIRING_FIELDS,
     PAIRING_MARKERS,
     MispairingHit,
     detect_mispairing,
@@ -375,6 +376,24 @@ class TestDetectMispairing:
         assert HEADER_MARKERS and PAIRING_MARKERS
         assert all(isinstance(m, str) and m for m in HEADER_MARKERS)
         assert all(isinstance(m, str) and m for m in PAIRING_MARKERS)
+
+    def test_the_entry_field_names_are_a_public_constant_consumers_can_import(
+        self,
+    ) -> None:
+        """``PAIRING_FIELDS`` is part of the single-owner surface, not private.
+
+        The scanner script needs the same two names to look up the entry whose
+        envelope verdict it reports beside this predicate's. Re-spelling them
+        there would let the two damage classes be asked about DIFFERENT fields
+        — a wrong column rather than a missing one — so the tuple is public and
+        imported. Pinned so a rename back to a private name fails here, at the
+        owner, rather than silently in the importer.
+
+        The ORDER is asserted too: ``decision`` first is what makes a hit's
+        reported ``field`` deterministic when both texts carry a marker.
+        """
+        assert PAIRING_FIELDS == ('decision', 'rationale')
+        assert isinstance(PAIRING_FIELDS, tuple)
 
     def test_an_envelope_literal_does_not_by_itself_make_a_hit(self) -> None:
         """The two damage classes are disjoint AT THE DETECTOR.

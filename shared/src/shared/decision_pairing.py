@@ -49,9 +49,11 @@ load-bearing by their own tests:
   opens ``SUPERSEDES decision #3`` and genuinely does supersede it, but it is a
   design REVERSAL, not a mis-pairing.
 
-This module is the SINGLE OWNER of both marker tuples and of the accept/reject
-decision, exactly as :mod:`shared.toolcall_markup` owns the envelope literals
-(INV-5). No consumer re-spells a marker: the scanner script imports them, and
+This module is the SINGLE OWNER of both marker tuples, of the two names it
+reads out of an entry (:data:`PAIRING_FIELDS`), of the plan key those entries
+live under (:data:`DESIGN_DECISIONS_KEY`), and of the accept/reject decision,
+exactly as :mod:`shared.toolcall_markup` owns the envelope literals (INV-5).
+No consumer re-spells any of them: the scanner script imports them, and
 :func:`scan_design_decisions` delegates every verdict to
 :func:`detect_mispairing` rather than re-implementing the predicate, so the
 walker and the entry predicate can never disagree about what counts.
@@ -145,7 +147,13 @@ PAIRING_MARKERS: tuple[str, ...] = (
 
 #: The fields searched for pairing language, in the order searched. ``decision``
 #: is first so a hit's reported field is deterministic when both carry a marker.
-_PAIRING_FIELDS: tuple[str, ...] = ('decision', 'rationale')
+#:
+#: PUBLIC because the scanner script needs the same two names to look up the
+#: entry it is reporting on, and a second spelling there is exactly the drift
+#: the single-owner rule exists to prevent (INV-5) — the same argument as
+#: :data:`DESIGN_DECISIONS_KEY`. A consumer imports this tuple; it never
+#: re-spells the field names.
+PAIRING_FIELDS: tuple[str, ...] = ('decision', 'rationale')
 
 _HEADER_RES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
     (marker, re.compile(r'\s*' + re.escape(marker), re.IGNORECASE))
@@ -197,7 +205,7 @@ def _match_header(decision: object) -> str | None:
 
 def _match_pairing(decision: object, rationale: object) -> tuple[str, str] | None:
     """The first ``(marker, field)`` carrying pairing language, if any."""
-    for field, value in zip(_PAIRING_FIELDS, (decision, rationale), strict=True):
+    for field, value in zip(PAIRING_FIELDS, (decision, rationale), strict=True):
         if not isinstance(value, str):
             continue
         for marker, pattern in _PAIRING_RES:

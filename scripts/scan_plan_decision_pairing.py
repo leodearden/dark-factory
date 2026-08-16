@@ -26,7 +26,10 @@ two are disjoint at the detector.
 
 Every accept/reject verdict is DELEGATED to :mod:`shared.decision_pairing`,
 which is the single owner of the two marker literal sets and of the predicate
-(INV-5). This script never re-spells a marker; it discovers files, reports, and
+(INV-5). This script re-spells none of it — not a marker, not the
+``design_decisions`` key it looks entries up under
+(``DESIGN_DECISIONS_KEY``), not the two field names it reads out of an entry
+(``PAIRING_FIELDS``); it imports each and then discovers files, reports, and
 renders. The envelope verdict on each record likewise comes from
 ``toolcall_markup.detect``, unmodified — so ONE report distinguishes the two
 damage classes and flags a plan carrying both (the task 3382 shape) instead of
@@ -90,7 +93,11 @@ _SHARED_SRC = Path(__file__).resolve().parent.parent / 'shared' / 'src'
 if str(_SHARED_SRC) not in sys.path:
     sys.path.insert(0, str(_SHARED_SRC))
 
-from shared.decision_pairing import scan_design_decisions  # noqa: E402
+from shared.decision_pairing import (  # noqa: E402
+    DESIGN_DECISIONS_KEY,
+    PAIRING_FIELDS,
+    scan_design_decisions,
+)
 from shared.toolcall_markup import detect  # noqa: E402
 
 __all__ = [
@@ -223,12 +230,18 @@ def _entry_has_envelope_residue(entry: object) -> bool:
     Total for adversarial shapes for the same reason the predicate is: this
     walks plan documents nobody validated, and ``detect`` already returns
     ``None`` for any non-``str``.
+
+    The field names come from :data:`shared.decision_pairing.PAIRING_FIELDS`
+    rather than being re-spelled here, so the two damage classes are always
+    asked about the SAME two strings: a second spelling that drifted would
+    report an envelope verdict for one field while the pairing predicate read
+    another, which is a wrong column rather than a missing one.
     """
     if not isinstance(entry, dict):
         return False
     return any(
         detect(entry.get(field)) is not None
-        for field in ('decision', 'rationale')
+        for field in PAIRING_FIELDS
     )
 
 
@@ -259,7 +272,7 @@ def scan_plan_file(path: Path | str) -> list[PairingRecord]:
     """
     plan_path = Path(path)
     plan = json.loads(plan_path.read_text(encoding='utf-8'))
-    entries = plan.get('design_decisions') if isinstance(plan, dict) else None
+    entries = plan.get(DESIGN_DECISIONS_KEY) if isinstance(plan, dict) else None
     task_id = plan_path.parent.name
     text = str(plan_path)
     records: list[PairingRecord] = []
