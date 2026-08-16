@@ -377,18 +377,35 @@ _RECON_REPORT_PLACEHOLDERS = {
 }
 
 
-def _render_recon_report_tool_guidance(signatures: Mapping[str, inspect.Signature]) -> str:
+def _render_recon_report_tool_guidance(
+    signatures: Mapping[str, tuple[tuple[str, bool], ...]],
+) -> str:
     """Render the recon-report tool-usage guidance prose from *signatures*.
 
     Shared by :func:`render_recon_report_tool_guidance` (live introspection)
-    and the frozen :data:`_RECON_REPORT_TOOL_GUIDANCE_FALLBACK` (rendered from
-    :data:`_FROZEN_RECON_REPORT_SIGNATURES`, itself built from
+    and the frozen :func:`_frozen_recon_report_tool_guidance` (rendered from
     :data:`_FROZEN_RECON_REPORT_SIGNATURE_SPECS`) — both flow through this one
     prose template and this one ``render_call``, so they cannot drift apart in
     WORDING. The only surface that can still go stale is the frozen snapshot's
     parameter data, which
     ``tests/test_recon_report_guidance_drift.py::TestFallbackIsDerivedFromTheSameRenderer``
     guards directly against the live signatures.
+
+    *signatures* maps each tool name to an ordered ``(param_name, required)``
+    tuple sequence — deliberately not ``inspect.Signature`` objects — because
+    that pair (a name to render, a bool to decide bracketing) is all
+    ``render_call`` below ever reads. This is also the NATIVE shape of the
+    frozen snapshot, so :func:`_frozen_recon_report_tool_guidance` passes it
+    straight through with no conversion, while
+    :func:`render_recon_report_tool_guidance` converts the live
+    ``inspect.Signature`` objects into this same shape before calling here.
+    Sharing one input shape (rather than teaching this function to branch on
+    two) is what makes "the same render_call() code path" a literal fact
+    rather than a convention to maintain, and it retires a previous design
+    that fabricated synthetic ``inspect.Signature``/``inspect.Parameter``
+    objects for the frozen path purely to satisfy this function, including a
+    ``default=None`` that was never a real tool default and could mislead a
+    future reader who assumed it was.
 
     Every parameter still renders — dropping optional ones would reopen the
     drift hole task-2559 closed — but a parameter carrying a default value
@@ -404,10 +421,10 @@ def _render_recon_report_tool_guidance(signatures: Mapping[str, inspect.Signatur
 
     def render_call(tool_name: str) -> str:
         parts = []
-        for param_name, param in signatures[tool_name].parameters.items():
+        for param_name, required in signatures[tool_name]:
             placeholder = _RECON_REPORT_PLACEHOLDERS.get(param_name, f'<{param_name}>')
             kwarg = f'{param_name}={placeholder}'
-            parts.append(kwarg if param.default is inspect.Parameter.empty else f'[{kwarg}]')
+            parts.append(kwarg if required else f'[{kwarg}]')
         return f'mcp__recon-report__{tool_name}({", ".join(parts)})'
 
     add_finding_call = render_call('add_finding')
@@ -481,12 +498,20 @@ def render_recon_report_tool_guidance() -> str:
 
     Raises whatever :func:`get_recon_report_tool_signatures` raises (e.g. if
     FastMCP's internals have changed shape) — :func:`get_recon_report_tool_guidance`
-    catches this and falls back to a frozen static string rather than letting
+    catches this and falls back to the frozen fallback rather than letting
     it become an ImportError for every consumer of this package.
     """
     from fused_memory.server.recon_report import get_recon_report_tool_signatures
 
-    return _render_recon_report_tool_guidance(get_recon_report_tool_signatures())
+    signatures = get_recon_report_tool_signatures()
+    specs = {
+        tool: tuple(
+            (name, param.default is inspect.Parameter.empty)
+            for name, param in sig.parameters.items()
+        )
+        for tool, sig in signatures.items()
+    }
+    return _render_recon_report_tool_guidance(specs)
 
 
 # Last-resort fallback if render_recon_report_tool_guidance() raises when first
@@ -536,35 +561,35 @@ _FROZEN_RECON_REPORT_SIGNATURE_SPECS: dict[str, tuple[tuple[str, bool], ...]] = 
 }
 
 
-def _frozen_signature(spec: tuple[tuple[str, bool], ...]) -> inspect.Signature:
-    """Build an ``inspect.Signature`` from a frozen ``(param_name, required)`` spec.
+@functools.lru_cache(maxsize=1)
+def _frozen_recon_report_tool_guidance() -> str:
+    """Render the frozen fallback guidance, lazily, from the frozen snapshot.
 
-    Uses ``KEYWORD_ONLY`` parameters for two reasons, both verified to hold for
-    every tool in :data:`_FROZEN_RECON_REPORT_SIGNATURE_SPECS`: (1) it sidesteps
-    ``inspect.Signature``'s "non-default argument follows default argument"
-    ``ValueError``, so *spec* can list parameters in live order regardless of
-    required-ness; (2) ``render_call`` (inside
-    :func:`_render_recon_report_tool_guidance`) reads only each parameter's
-    ``.name`` and ``.default``, never ``.kind``, so the rendered text is
-    identical to what the live ``POSITIONAL_OR_KEYWORD`` signatures produce.
+    Deliberately NOT rendered at module-import time (reviewer robustness
+    finding). :data:`_FROZEN_RECON_REPORT_SIGNATURE_SPECS` is hand-maintained,
+    and ``render_call`` (inside :func:`_render_recon_report_tool_guidance`)
+    looks up each of the 9 agent-called tool names in it directly — a future
+    edit that drops, renames, or typos one of those keys raises a bare
+    ``KeyError``. Computing this eagerly at import time turned that into an
+    ImportError for every consumer of the ``prompts`` package, including
+    sibling submodules such as ``prompts.judge`` that never touch
+    recon-report guidance at all — exactly the blast radius
+    :func:`get_recon_report_tool_guidance`'s try/except exists to contain.
+    Deferring the render to first call means a broken snapshot edit only ever
+    surfaces here, when and if the live path has ALSO already failed and this
+    safety net is actually needed; see :func:`get_recon_report_tool_guidance`,
+    which logs loudly if this raises too rather than silently swallowing a
+    broken fallback.
+
+    Cached like :func:`_cached_recon_report_tool_guidance`: the input
+    (:data:`_FROZEN_RECON_REPORT_SIGNATURE_SPECS`) is a module-level constant
+    that cannot change within a process, so memoizing a successful render is
+    safe and avoids re-rendering on every call during a sustained outage.
+    ``lru_cache`` never memoizes a raised call, so a broken snapshot is
+    retried (and re-raises, and re-logs) on every fallback attempt rather
+    than being permanently pinned to failure.
     """
-    return inspect.Signature(
-        [
-            inspect.Parameter(
-                name, inspect.Parameter.KEYWORD_ONLY, **({} if required else {'default': None})
-            )
-            for name, required in spec
-        ]
-    )
-
-
-_FROZEN_RECON_REPORT_SIGNATURES = {
-    tool: _frozen_signature(spec) for tool, spec in _FROZEN_RECON_REPORT_SIGNATURE_SPECS.items()
-}
-
-_RECON_REPORT_TOOL_GUIDANCE_FALLBACK = _render_recon_report_tool_guidance(
-    _FROZEN_RECON_REPORT_SIGNATURES
-)
+    return _render_recon_report_tool_guidance(_FROZEN_RECON_REPORT_SIGNATURE_SPECS)
 
 
 @functools.lru_cache(maxsize=1)
@@ -596,27 +621,47 @@ def get_recon_report_tool_guidance() -> str:
     build, and the :func:`_cached_recon_report_tool_guidance` helper ensures a
     successful build happens at most once per process.
 
-    Falls back to the frozen :data:`_RECON_REPORT_TOOL_GUIDANCE_FALLBACK`
-    static string if :func:`render_recon_report_tool_guidance` raises (e.g. a
-    FastMCP upgrade changes the tool-manager internals guarded by
+    Falls back to :func:`_frozen_recon_report_tool_guidance` if
+    :func:`render_recon_report_tool_guidance` raises (e.g. a FastMCP upgrade
+    changes the tool-manager internals guarded by
     ``get_recon_report_tool_signatures``) rather than letting it become an
-    ImportError for every consumer of this package. Unlike the successful
-    path, the fallback is deliberately NOT cached — only
-    :func:`_cached_recon_report_tool_guidance`'s ``lru_cache`` is consulted,
-    and it never stores a raised call, so a transient failure (e.g. a
-    momentary hiccup constructing the throwaway FastMCP server) does not
-    permanently pin every later call in this same process to the frozen
-    fallback; the very next call retries the live render and self-heals as
-    soon as it succeeds.
+    ImportError for every consumer of this package. The fallback branch here
+    is deliberately NOT what is memoized by
+    :func:`_cached_recon_report_tool_guidance`'s ``lru_cache`` — only a
+    successful live render is, and it never stores a raised call, so a
+    transient failure (e.g. a momentary hiccup constructing the throwaway
+    FastMCP server) does not permanently pin every later call in this same
+    process to the fallback; the very next call retries the live render and
+    self-heals as soon as it succeeds. (:func:`_frozen_recon_report_tool_guidance`
+    has its own, separate cache over the frozen snapshot, which never changes
+    within a process — see its docstring.)
+
+    If the fallback ITSELF raises (a broken edit to
+    :data:`_FROZEN_RECON_REPORT_SIGNATURE_SPECS`, on top of a live
+    introspection failure), that is logged loudly and re-raised rather than
+    silently swallowed — a double failure like that means recon-report
+    guidance is genuinely unavailable, which callers must see rather than
+    silently receive stale or wrong text for.
     """
     try:
         return _cached_recon_report_tool_guidance()
     except Exception:
         logger.exception(
             'render_recon_report_tool_guidance() failed; falling back to '
-            'the frozen _RECON_REPORT_TOOL_GUIDANCE_FALLBACK static string. Recon-report '
+            'the frozen recon-report tool guidance snapshot (see '
+            '_frozen_recon_report_tool_guidance). Recon-report '
             'tool-call guidance may be stale until the underlying introspection failure '
             '(see fused_memory.server.recon_report.get_recon_report_tool_signatures) is '
             'fixed — the next call retries automatically, in this process or a fresh one.'
         )
-        return _RECON_REPORT_TOOL_GUIDANCE_FALLBACK
+        try:
+            return _frozen_recon_report_tool_guidance()
+        except Exception:
+            logger.exception(
+                'the frozen recon-report tool guidance fallback ALSO failed to render -- '
+                'check _FROZEN_RECON_REPORT_SIGNATURE_SPECS in '
+                'reconciliation/prompts/__init__.py for a dropped, renamed, or invalid '
+                'tool/parameter name. Both the live and the frozen recon-report guidance '
+                'paths are now broken.'
+            )
+            raise

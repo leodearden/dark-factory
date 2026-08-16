@@ -13,7 +13,9 @@ This module asserts:
   examples like stage2.py's cross-project routing snippets or stage3.py's
   verification pseudocode, which render_recon_report_tool_guidance() never
   touches.
-- _RECON_REPORT_TOOL_GUIDANCE_FALLBACK — rendered from
+- _frozen_recon_report_tool_guidance() — rendered lazily (reviewer robustness
+  finding: NOT at module-import time, so a bad snapshot edit cannot become an
+  ImportError for every consumer of the `prompts` package) from
   _FROZEN_RECON_REPORT_SIGNATURE_SPECS through the same template and
   render_call() as the live guidance — equals render_recon_report_tool_guidance(),
   and the frozen signature snapshot matches the live tool signatures (name,
@@ -51,7 +53,7 @@ import pytest
 from fused_memory.reconciliation import prompts as prompts_module
 from fused_memory.reconciliation.prompts import (
     _FROZEN_RECON_REPORT_SIGNATURE_SPECS,
-    _RECON_REPORT_TOOL_GUIDANCE_FALLBACK,
+    _frozen_recon_report_tool_guidance,
     get_recon_report_tool_guidance,
     render_recon_report_tool_guidance,
 )
@@ -176,12 +178,16 @@ class TestReconReportRunIdGuardOverAssembledPrompts:
 class TestReconReportGuidanceFallback:
     """get_recon_report_tool_guidance()'s exception/fallback branch (reviewer finding).
 
-    _RECON_REPORT_TOOL_GUIDANCE_FALLBACK exists specifically as a run_id-safe
+    _frozen_recon_report_tool_guidance() exists specifically as a run_id-safe
     safety net for when render_recon_report_tool_guidance() raises (e.g. a
-    FastMCP internals change). Unlike the generated path, it is hand-written
-    and was previously never exercised by a test nor scanned for the very
-    run_id-omission drift this task set out to eliminate. This class covers
-    both gaps.
+    FastMCP internals change). It was originally hand-written prose, never
+    exercised by a test nor scanned for the very run_id-omission drift this
+    task set out to eliminate — this class covers both gaps. (It is now
+    generated rather than hand-written, and lazily rather than at import
+    time — see TestFallbackIsDerivedFromTheSameRenderer and the function's own
+    docstring — but the tests below still guard the fallback BRANCH's
+    behaviour: that it is served on failure, logged, self-heals, and carries
+    run_id.)
     """
 
     def setup_method(self):
@@ -205,7 +211,7 @@ class TestReconReportGuidanceFallback:
         with caplog.at_level(logging.ERROR):
             result = get_recon_report_tool_guidance()
 
-        assert result == _RECON_REPORT_TOOL_GUIDANCE_FALLBACK
+        assert result == _frozen_recon_report_tool_guidance()
         error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
         assert any('falling back' in r.message for r in error_records), (
             f'Expected an ERROR log containing "falling back", got: '
@@ -219,15 +225,15 @@ class TestReconReportGuidanceFallback:
         fallback path is deliberately NOT memoized (only a successful render
         is, via _cached_recon_report_tool_guidance), a call made after the
         introspection failure clears should get the real generated guidance
-        again in the SAME process, not the frozen fallback forever.
+        again in the SAME process, not the fallback forever.
 
         The self-heal property is proven by the fallback branch NOT running on
         the healed call (no ERROR log containing "falling back"), rather than by
-        the healed text differing from the frozen fallback. The fallback is
+        the healed text differing from the fallback. The fallback is
         derived from a frozen signature snapshot through the same renderer as
         the live guidance, so the two strings are byte-identical whenever the
         snapshot is in sync with the live signatures — which is the intended
-        steady state, not a bug. That makes `healed != _RECON_REPORT_TOOL_GUIDANCE_FALLBACK`
+        steady state, not a bug. That makes `healed != _frozen_recon_report_tool_guidance()`
         false by construction, so it can no longer discriminate which code path
         ran — do not restore it.
         """
@@ -238,7 +244,7 @@ class TestReconReportGuidanceFallback:
         monkeypatch.setattr(
             'fused_memory.server.recon_report.get_recon_report_tool_signatures', _raise
         )
-        assert get_recon_report_tool_guidance() == _RECON_REPORT_TOOL_GUIDANCE_FALLBACK
+        assert get_recon_report_tool_guidance() == _frozen_recon_report_tool_guidance()
 
         monkeypatch.undo()
         caplog.clear()
@@ -259,16 +265,16 @@ class TestReconReportGuidanceFallback:
     def test_fallback_call_examples_all_carry_run_id(self):
         """Guard the frozen fallback string with the same run_id scan used above.
 
-        The fallback is hand-written and unlike the generated path is never
-        re-verified against live signatures — this pins it against the exact
-        drift bug (a call example silently missing `run_id`) this task exists
-        to eliminate.
+        The fallback is now generated (not hand-written) and is verified
+        against the live signatures elsewhere (see
+        TestFallbackIsDerivedFromTheSameRenderer) — this scan is retained as
+        a cheap belt-and-braces guard on the original task-2559 bug, not as
+        the mechanism that now prevents drift.
         """
+        fallback = _frozen_recon_report_tool_guidance()
         for tool_name in _AGENT_CALLED_REPORT_TOOLS:
-            for paren_idx in _iter_call_openers(_RECON_REPORT_TOOL_GUIDANCE_FALLBACK, tool_name):
-                args_substr = _extract_call_args_at(
-                    _RECON_REPORT_TOOL_GUIDANCE_FALLBACK, paren_idx
-                )
+            for paren_idx in _iter_call_openers(fallback, tool_name):
+                args_substr = _extract_call_args_at(fallback, paren_idx)
                 assert 'run_id' in args_substr, (
                     f'fallback: a `{tool_name}(...)` call example is missing '
                     f'`run_id` — got: {tool_name}({args_substr})'
@@ -278,8 +284,9 @@ class TestReconReportGuidanceFallback:
 class TestFallbackIsDerivedFromTheSameRenderer:
     """The fallback is rendered from a frozen signature snapshot, not hand-written prose.
 
-    _RECON_REPORT_TOOL_GUIDANCE_FALLBACK is no longer a second, hand-transcribed
-    copy of the guidance prose: it is rendered from
+    _frozen_recon_report_tool_guidance() is no longer a second, hand-transcribed
+    copy of the guidance prose: it is rendered lazily (on first use — reviewer
+    robustness finding, see its docstring) from
     _FROZEN_RECON_REPORT_SIGNATURE_SPECS through the *same* template and
     render_call() as the live guidance (render_recon_report_tool_guidance()), so
     the two cannot drift apart in WORDING — there is only one prose template and
@@ -289,7 +296,7 @@ class TestFallbackIsDerivedFromTheSameRenderer:
     """
 
     def test_fallback_equals_live_generated_guidance(self):
-        assert render_recon_report_tool_guidance() == _RECON_REPORT_TOOL_GUIDANCE_FALLBACK, (
+        assert render_recon_report_tool_guidance() == _frozen_recon_report_tool_guidance(), (
             'The frozen fallback no longer matches the live-generated guidance — '
             'update _FROZEN_RECON_REPORT_SIGNATURE_SPECS in '
             'reconciliation/prompts/__init__.py to match the live tool signatures.'
