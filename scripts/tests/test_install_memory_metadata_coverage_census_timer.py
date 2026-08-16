@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -784,26 +785,126 @@ def test_wrapper_narrates_the_commit_outcome_alongside_the_other_two(tmp_path):
     assert 'commit=0' in combined, combined
 
 
-def test_wrapper_never_reaches_for_the_forbidden_git_verbs():
-    """`git stash` is banned in EVERY dark-factory checkout: refs/stash is a
-    single ref shared across all worktrees and the merge worker's advance path
-    also consumes it (incident 13674d3c68). `git add -A`/`git checkout` in the
-    main checkout would likewise act on another process's state.
+# Forbidden git shapes, matched on the SUBCOMMAND after normalising away any
+# number of `-C <dir>` options -- because EVERY git call in this wrapper is
+# spelled `git -C "$REPO" <verb>`. The guard this replaces scanned for bare
+# literals (`'git stash'`, `'git add -A'`, ...), so a real violation written in
+# the file's own idiom contained none of them and most of the pattern set was
+# unreachable: the scan passed regardless of what the wrapper did.
+#
+# Each entry pairs a pattern with synthetic violations, in the wrapper's own
+# idiom, that it MUST match. Those synthetics are the load-bearing half -- a
+# guard whose reachability is never exercised is what produced the finding, so
+# reachability is now itself a test (see the self-check below).
+_FORBIDDEN_GIT_PATTERNS = (
+    (
+        # `git stash` is banned in EVERY dark-factory checkout: refs/stash is a
+        # SINGLE ref shared by every worktree and the merge worker's advance
+        # path also consumes it (incident 13674d3c68). reset/checkout/clean in
+        # the machine-operated main checkout would likewise act on -- and
+        # destroy -- another process's state.
+        r'\bgit\b(?:\s+-C\s+\S+)*\s+(?:stash|reset|checkout|clean)\b',
+        (
+            'git stash',
+            'git -C "$REPO" stash',
+            'git -C "$REPO" reset --hard',
+            'git -C "$REPO" checkout main',
+            'git -C "$REPO" clean -fd',
+        ),
+    ),
+    (
+        # Wholesale staging sweeps a concurrent process's WIP into our commit.
+        r'\bgit\b(?:\s+-C\s+\S+)*\s+add\s+(?:-A|--all|\.)(?:\s|$)',
+        (
+            'git add -A',
+            'git add .',
+            'git -C "$REPO" add -A',
+            'git -C "$REPO" add --all',
+            'git -C "$REPO" add . && echo done',
+        ),
+    ),
+    (
+        # `commit -a`/`--all` is the un-scoped commit that `--only` exists to
+        # avoid; it stages every tracked modification, ours or not.
+        r'\bgit\b(?:\s+-C\s+\S+)*\s+commit\b[^\n]*\s(?:-a|--all)\b',
+        (
+            'git commit -a -m x',
+            'git -C "$REPO" commit -a -m x',
+            'git -C "$REPO" commit --all -m x',
+        ),
+    ),
+)
 
-    Scanned over EXECUTABLE lines only, with comments stripped: the header
-    documents precisely which verbs are forbidden and why, and a check that
-    could not tell prose from code would forbid explaining itself.
+# The wrapper's own legitimate git calls. None may match any pattern above --
+# notably the scoped `git -C "$REPO" add -- "${ARTIFACTS[@]}"`, whose `--` is
+# neither `-A`, `--all` nor `.`.
+_LEGITIMATE_GIT_CALLS = (
+    'git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1',
+    'git -C "$REPO" status --porcelain -- "${ARTIFACTS[@]}" 2>/dev/null',
+    'git -C "$REPO" commit --only "${ARTIFACTS[@]}" -m "$commit_msg"',
+    'git -C "$REPO" add -- "${ARTIFACTS[@]}"',
+)
+
+
+def _wrapper_code() -> str:
+    r"""The wrapper's EXECUTABLE lines, with comments stripped.
+
+    BOTH full-line and TRAILING comments, and trailing matters in both
+    directions. The header documents precisely which verbs are forbidden and
+    why, so a check that could not tell prose from code would forbid the wrapper
+    from explaining itself -- but leaving trailing comments in lets a `# never
+    git stash here` note appended to a real command FALSE-POSITIVE the scan.
+
+    KNOWN LIMIT of `\s#`: a `#` preceded by whitespace INSIDE a double-quoted
+    string would truncate that line early. No such string exists in this wrapper
+    today (verified: no non-comment line matches `\s#` at all, so the trailing
+    strip is currently a no-op), and the anti-vacuity guard in the scan below
+    fails loudly if one is ever introduced and takes the scan body with it.
     """
-    text = WRAPPER.read_text()
-    code = '\n'.join(
-        line for line in text.splitlines()
+    return '\n'.join(
+        re.split(r'\s#', line, maxsplit=1)[0]
+        for line in WRAPPER.read_text().splitlines()
         if not line.lstrip().startswith('#')
     )
+
+
+def test_the_forbidden_git_patterns_can_actually_fire():
+    """The guard below is only worth its name if its patterns CAN match.
+
+    This is the finding restated as a test: the previous guard's literals could
+    never fire against this wrapper's `git -C "$REPO" <verb>` idiom, so it was
+    green by construction. Every pattern must match a violation written the way
+    this file writes git, and none may match the wrapper's legitimate calls.
+    """
+    for pattern, synthetics in _FORBIDDEN_GIT_PATTERNS:
+        for synthetic in synthetics:
+            assert re.search(pattern, synthetic), (
+                f'{pattern!r} does not match its own synthetic violation '
+                f'{synthetic!r} — the guard cannot fire')
+        for legitimate in _LEGITIMATE_GIT_CALLS:
+            assert not re.search(pattern, legitimate), (
+                f'{pattern!r} false-positives on the wrapper\'s legitimate '
+                f'{legitimate!r}')
+
+
+def test_wrapper_never_reaches_for_the_forbidden_git_verbs():
+    """The guard on CLAUDE.md's hardest prohibition, applied to a script that
+    commits UNATTENDED into the machine-operated project_root checkout."""
+    code = _wrapper_code()
+
+    # ANTI-VACUITY. An empty or over-trimmed scan body satisfies every
+    # "does not match" assertion below, so the guard would pass while checking
+    # nothing. Measured floor: 6 `git ` and 5 `git -C` invocations survive today.
+    assert code.count('git ') >= 5, (
+        f'only {code.count("git ")} `git ` invocations survived comment '
+        f'stripping — the scan body was over-trimmed and would pass vacuously')
     assert 'commit --only' in code, (
         'the scoped-commit form is the whole point; a bare `git commit` would '
         'sweep up a concurrent process staged work')
-    for forbidden in ('git stash', 'git add -A', 'git add .', 'git checkout',
-                      'git reset', 'commit -a'):
-        assert forbidden not in code, (
-            f'{forbidden!r} must never appear in a wrapper that runs '
-            f'unattended against the machine-operated main checkout')
+
+    for pattern, _ in _FORBIDDEN_GIT_PATTERNS:
+        found = re.search(pattern, code)
+        if found is not None:
+            raise AssertionError(
+                f'{found.group(0)!r} must never appear in a wrapper that runs '
+                f'unattended against the machine-operated main checkout')
