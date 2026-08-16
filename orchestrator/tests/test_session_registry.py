@@ -556,6 +556,11 @@ def test_record_path_for_slug_all_dots_slug_stays_under_sessions_dir(tmp_path: P
     # (these paths do not exist) and collapses '..' with the exact filesystem
     # semantics under defense.
     sessions = sr.sessions_dir(root=tmp_path).resolve()
+    # '..' is the ONLY genuine escape vector in this loop; '.' and '...' are
+    # non-traversing CONTROLS, not extra attack coverage. Unsanitized,
+    # 'sessions/./record.json' still resolves under sessions_dir and '...' is a
+    # literal POSIX dirname resolve() leaves in place -- so only the '..'
+    # iteration discriminates against a guard-deleted build.
     for raw in ('.', '..', '...'):
         slug = sr.sanitize_slug(raw)
         path = sr.record_path_for_slug(slug, root=tmp_path)
