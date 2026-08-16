@@ -29,13 +29,27 @@ applies ``_landed`` (reading ``write_ops.terminal_status``, stamped back by
 ``DurableWriteQueue``'s terminal hook) on top of the existing ``success``
 gates, so an operation whose writes all died reports 0 rather than green.
 
+That gate is applied PER LEG, not per op, because ``terminal_status``
+describes only an op's DURABLE-QUEUE leg — and a write_op row does not always
+map 1:1 to a queue item. ``MemoryService.add_memory`` mints ONE
+``write_op_id`` spanning a queued Graphiti leg AND a synchronous Mem0 leg,
+then journals a single Layer-1 row under that shared id; the queue's terminal
+hook is keyed on the same id, so a dead Graphiti leg stamps ``'dead'`` on the
+row that also carries Mem0's returned ``memory_ids``. The general rule, which
+any future dual-leg operation inherits: a counter may be suppressed by
+``terminal_status`` only when the queue item is the very thing that counter
+counts. So a dead queue leg suppresses ``graphiti_writes_queued`` (its whole
+subject is that queued write) but never ``memories_added`` (whose evidence,
+non-empty ``memory_ids``, could only have come back inline from the completed
+synchronous call).
+
 Excluding them would be truthful but SILENT, so a third fact is reported
 alongside: ``writes_dead_lettered`` answers "did the write reach the queue's
 dead-letter state". The pair is self-explaining — ``graphiti_writes_queued: 0``
 next to ``writes_dead_lettered: 12`` means the stage's writes DIED, which is a
-failure, not the no-op that a bare ``0`` would suggest. The two overlap on
-exactly one case (a post-execute dead-letter, which both landed and
-dead-lettered); ``_COMPUTED_STAT_KEYS`` documents why that is deliberate.
+failure, not the no-op that a bare ``0`` would suggest. The two overlap on two
+legitimate cases (a post-execute dead-letter, and a partially-landed dual
+write); ``_COMPUTED_STAT_KEYS`` documents why that is deliberate.
 """
 
 from __future__ import annotations
@@ -71,10 +85,18 @@ _OP_TO_STAT: dict[str, str] = {
 # The two facts these keys report are deliberately distinct. Every counter
 # other than 'writes_dead_lettered' answers "did the write LAND" (see
 # ``_landed``); 'writes_dead_lettered' answers "did the write reach the
-# queue's dead-letter state". They overlap on exactly one case — a
-# post-execute dead-letter, which landed AND dead-lettered — and that overlap
-# is intentional, not double-counting: the write persisted, and the item still
-# needs operator attention because it must not be blind-replayed.
+# queue's dead-letter state". They overlap on TWO legitimate cases, and
+# neither overlap is double-counting:
+#
+#   1. A post-execute dead-letter — it landed AND dead-lettered: the write
+#      persisted, and the item still needs operator attention because it must
+#      not be blind-replayed.
+#   2. A partially-landed dual write — 'memories_added: 1' next to
+#      'writes_dead_lettered: 1', where add_memory's synchronous Mem0 leg
+#      persisted but its queued Graphiti twin died. Both answers are honestly
+#      yes, and reporting both is the only signal that the op was PARTIAL;
+#      suppressing the dead-letter tally to keep the keys mutually exclusive
+#      would leave it looking like a clean success.
 #
 # KNOWN LIMITATION: a dead-letter whose Layer-1 row was never journalled has
 # no agent_id/operation, so it is invisible here — the same agent_id
@@ -133,8 +155,14 @@ def _landed(op: dict) -> bool:
     ``str | None`` — a dead-letter carrying no error string is reachable, is
     treated as NOT landed, and must not raise ``AttributeError``.
 
-    Applied by ``derive_stage_stats`` once per op, NOT by the ``_count_*``
-    helpers — those stay purely about ``result_summary`` shape.
+    Answers "did this op's DURABLE-QUEUE leg land", so ``derive_stage_stats``
+    applies it PER BRANCH, not once per op, and never inside the ``_count_*``
+    helpers — those stay purely about ``result_summary`` shape. It gates the
+    ``_count_graphiti_queued`` branch (whose subject IS the queued write) and
+    the generic branch (whose ops map 1:1 to one queue item, or never touch
+    the queue at all). It deliberately does NOT gate the ``_count_add_memory``
+    branch: that row's ``memory_ids`` come from the synchronous Mem0 leg, which
+    no queue-leg outcome can contradict.
     """
     if op.get('terminal_status') != 'dead':
         return True
@@ -220,11 +248,18 @@ def derive_stage_stats(ops: list[dict], stage_agent_id: str) -> dict[str, int]:
 
     Ops the durable queue dead-lettered are then dropped by ``_landed``: they
     were accepted at enqueue (``success=1``) but never reached the backend, so
-    counting them would report a 0%-landing-rate stage as green. The gate is
-    applied ONCE here rather than inside the ``_count_*`` helpers, so every
-    branch — including the ``add_memory`` arm's early ``continue`` — inherits
-    it by construction and the helpers stay purely about ``result_summary``
-    shape.
+    counting them would report a 0%-landing-rate stage as green.
+
+    That gate is applied PER BRANCH, never inside the ``_count_*`` helpers
+    (which stay purely about ``result_summary`` shape). It is NOT applied once
+    at the top of the loop, because ``terminal_status`` is a per-leg fact: the
+    ``add_memory`` arm's row spans a queued Graphiti leg and a synchronous
+    Mem0 leg under one shared ``write_op_id``, so a whole-op gate would let a
+    dead Graphiti leg zero a ``memories_added`` the Mem0 leg already proved.
+    Hence ``_count_add_memory`` counts ungated, while the
+    ``_count_graphiti_queued`` arm and the generic branch below — whose ops
+    map 1:1 to a single queue item, or never touch the queue at all — are
+    gated.
 
     Always returns every key in ``_COMPUTED_STAT_KEYS``, 0-default, even when
     no ops matched.
@@ -245,9 +280,10 @@ def derive_stage_stats(ops: list[dict], stage_agent_id: str) -> dict[str, int]:
             continue
 
         if op.get('terminal_status') == 'dead':
-            # Gated on the RAW status, not on _landed: a post-execute
-            # dead-letter DID land (and so still counts toward its landed
-            # counter below) but is surfaced here too, because it needs
+            # Gated on the RAW status, not on _landed, and sitting ABOVE every
+            # branch so a partially-landed dual write is still surfaced. A
+            # post-execute dead-letter DID land (and so still counts toward its
+            # landed counter below) but is reported here too, because it needs
             # operator attention and must not be blind-replayed. Also
             # deliberately NOT gated on `success` — reaching the dead-letter
             # queue is an outcome fact independent of whether the enqueue was
@@ -255,19 +291,32 @@ def derive_stage_stats(ops: list[dict], stage_agent_id: str) -> dict[str, int]:
             # from the counter instead of being reported.
             counts['writes_dead_lettered'] += 1
 
-        if not _landed(op):
-            continue
-
         if operation == 'add_memory':
             if _count_add_memory(op):
+                # NOT gated on _landed. This row spans two legs sharing one
+                # write_op_id, and terminal_status describes ONLY the queued
+                # Graphiti leg. A non-empty memory_ids can only have come back
+                # inline from the SYNCHRONOUS Mem0 call, so it is standalone
+                # proof that write persisted — a dead Graphiti leg must not
+                # veto it.
                 counts[stat_key] += 1
-            elif _count_graphiti_queued(op):
+            elif _landed(op) and _count_graphiti_queued(op):
+                # This branch's subject IS the queued Graphiti leg, so here
+                # terminal_status maps 1:1 onto what is being counted.
                 # Graphiti-only async enqueue: no inline ID, but store accepted
                 # the write. Track separately so it doesn't inflate memories_added.
                 counts['graphiti_writes_queued'] += 1
             # Either path accounts for the op — skip the generic counter.
             continue
-        elif operation == 'update_edge':
+
+        # Every other operation's Layer-1 row maps 1:1 to a single queue item
+        # (add_episode) or never touches the queue at all (update_edge,
+        # delete_memory, task writes — terminal_status stays NULL forever), so
+        # the whole-op gate is exact for them.
+        if not _landed(op):
+            continue
+
+        if operation == 'update_edge':
             if not _count_update_edge(op):
                 continue
         elif not op.get('success', 1):
