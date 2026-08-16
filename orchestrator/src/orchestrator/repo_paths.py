@@ -24,9 +24,11 @@ import logging
 import os
 from pathlib import Path
 
-from orchestrator.verify_runner import resolve_local_df_checkout
-
-__all__ = ['DARK_FACTORY_ROOT_ENV', 'resolve_dark_factory_root']
+__all__ = [
+    'DARK_FACTORY_ROOT_ENV',
+    'rejected_dark_factory_root_override',
+    'resolve_dark_factory_root',
+]
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +54,77 @@ def _validates(root: Path) -> bool:
     return root.is_dir() and root.joinpath(*_REARM_MARKER).is_file()
 
 
+def _ascend_for_rearm_marker(start: Path | None = None) -> Path | None:
+    """First ancestor of *start* that VALIDATES, or ``None``.
+
+    *start* defaults to this module's own file, so the running orchestrator
+    resolves the checkout whose code it is itself executing — the same
+    ``__file__``-anchored trick as
+    `orchestrator.agents.skill_prompt.load_skill_system_prompt` and
+    `orchestrator.verify_runner.resolve_local_df_checkout`.
+
+    The walk is keyed on ``_REARM_MARKER``, NOT on ``.git``, and that difference
+    is the point.  ``resolve_local_df_checkout`` answers "which is the first
+    ancestor containing ``.git``" — a different question, and one whose answer
+    can be wrong here in both directions: it terminates at the FIRST ``.git``
+    ancestor, so a dark-factory checkout nested under an outer git repo (vendored
+    tree, a repo-of-repos, an editable install under a parent workspace) resolves
+    to that outer repo and the walk gives up, even though a valid tooling root
+    sits right above it.  Ascending for the marker itself walks PAST any ancestor
+    that cannot serve a re-arm and keeps looking.  It also keeps this ~140-line
+    path utility from importing the 3k-line ``verify_runner`` (and, transitively,
+    the whole verify/RemoteRunner/sccache stack) for a ten-line ancestor walk —
+    a layering inversion, since repo_paths is the lower-level module.
+
+    Because every returned root has already passed `_validates`, callers may
+    trust the result without re-checking the marker.
+    """
+    here = Path(__file__).resolve() if start is None else start
+    # A file start begins the walk at its parent; a directory start is itself a
+    # candidate.  Either way we ascend to the filesystem root.
+    candidates = [here, *here.parents] if here.is_dir() else list(here.parents)
+    for d in candidates:
+        if _validates(d):
+            return d
+    return None
+
+
+def _raw_override() -> str:
+    """The ``DARK_FACTORY_ROOT`` export, stripped; ``''`` when unset or blank.
+
+    Single-sources the "an empty/whitespace-only value counts as unset" rule so
+    `resolve_dark_factory_root` and `rejected_dark_factory_root_override` cannot
+    disagree about whether an operator has set the var at all.
+    """
+    return os.environ.get(DARK_FACTORY_ROOT_ENV, '').strip()
+
+
+def rejected_dark_factory_root_override() -> str | None:
+    """The raw ``DARK_FACTORY_ROOT`` export when it is set but does NOT validate.
+
+    ``None`` when the var is unset/blank, or set to a value this module accepts.
+
+    Exists because omitting the key from a spawned agent's ``env_overrides`` does
+    NOT make it unset in the child: `shared.cli_invoke` seeds the subprocess env
+    from ``os.environ`` and then applies the overrides on top, so an unresolvable
+    root leaves whatever the orchestrator process itself exported INHERITED by
+    the rotation.  A caller that tells the agent "DARK_FACTORY_ROOT is not set"
+    in that situation is stating something false, and the agent will act on the
+    stale value — if it happens to name a real directory, ``watcher-rearm.sh``'s
+    ``[ -d ]`` guard passes and the agent gets a bare "No such file or directory"
+    instead of the designed exit-2 diagnostic.  This helper lets the caller say
+    "inherited, and known-bad" instead.
+
+    Deliberately SILENT: `resolve_dark_factory_root` already warns about a
+    rejected override, and a second warning per call would double-log the same
+    misconfiguration.
+    """
+    raw = _raw_override()
+    if not raw or _validates(Path(raw).resolve()):
+        return None
+    return raw
+
+
 def resolve_dark_factory_root() -> Path | None:
     """The dark-factory tooling checkout this orchestrator is running from.
 
@@ -73,10 +146,10 @@ def resolve_dark_factory_root() -> Path | None:
          is the normal orchestrator-process state, not an anomaly.  The value is
          resolved to an absolute path before use, so a relative export cannot be
          reinterpreted against the spawned agent's own cwd.
-      2. Otherwise `orchestrator.verify_runner.resolve_local_df_checkout`'s
-         ``__file__``-anchored ancestor walk, when its result validates.  Reusing
-         that helper rather than forking a second ascent is deliberate; this
-         function contributes only env precedence and marker validation.
+      2. Otherwise `_ascend_for_rearm_marker`'s ``__file__``-anchored walk for
+         the first ancestor carrying the marker.  See that function for why the
+         walk is keyed on the marker rather than reusing
+         `orchestrator.verify_runner.resolve_local_df_checkout`'s ``.git`` walk.
       3. Otherwise ``None``.
 
     A set-but-INVALID override is warned about and falls THROUGH to arm 2 rather
@@ -100,8 +173,12 @@ def resolve_dark_factory_root() -> Path | None:
     ``None`` is a degradation, never an error: an unresolvable root must still
     let the rotation launch (with the key omitted from its environment), so the
     receiving ``watcher-rearm.sh`` guard keeps its own loud exit-2 diagnostic.
+    Note that omitting the key does not UNSET it in a spawned child, which
+    inherits the orchestrator's own environment — a caller that reports the
+    degradation to an agent must consult `rejected_dark_factory_root_override`
+    before claiming the variable is unset.
     """
-    raw = os.environ.get(DARK_FACTORY_ROOT_ENV, '').strip()
+    raw = _raw_override()
     if raw:
         override = Path(raw).resolve()
         if _validates(override):
@@ -119,17 +196,17 @@ def resolve_dark_factory_root() -> Path | None:
             reason,
         )
 
-    root = resolve_local_df_checkout()
-    if root is not None and _validates(root):
+    root = _ascend_for_rearm_marker()
+    if root is not None:
         return root
 
     logger.warning(
-        'Could not resolve the dark-factory tooling root: %s=%s, ancestor walk=%s '
-        '(no ancestor carries %s). Spawned watcher rotations will NOT carry %s, so '
+        'Could not resolve the dark-factory tooling root: %s=%s and no ancestor of '
+        '%s carries %s. Spawned watcher rotations will NOT have %s overridden, so '
         'their `cd $%s && scripts/watcher-rearm.sh` re-arm cannot run.',
         DARK_FACTORY_ROOT_ENV,
         repr(raw) if raw else '<unset>',
-        root if root is not None else '<none>',
+        Path(__file__).resolve(),
         '/'.join(_REARM_MARKER),
         DARK_FACTORY_ROOT_ENV,
         DARK_FACTORY_ROOT_ENV,
