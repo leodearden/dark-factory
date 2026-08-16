@@ -46,6 +46,9 @@ from pathlib import Path
 from typing import Any
 
 __all__ = [
+    'DRAIN_MODES',
+    'classify_run',
+    'drain_stats',
     'inflow_daily',
     'inflow_hourly',
     'utc_hour_bucket',
@@ -237,4 +240,168 @@ def inflow_daily(
             for etype in sorted(composition, key=lambda e: (-composition[e], e))
         },
         'total_events': sum(daily.values()),
+    }
+
+
+# ── drain statistics ───────────────────────────────────────────────────
+#
+# Unlike event_buffer, the `runs` table has NO pruning anywhere in the
+# codebase, so drain history is fully derivable retrospectively — no new
+# instrumentation was needed for this half of the measurement.
+
+#: The four run modes a `runs` row is classified into.  ``targeted`` is
+#: reported but deliberately excluded from the drain-capacity totals: targeted
+#: runs never acquire the reconciliation lock (targeted.py:213), so they
+#: execute concurrently with a drain and consume none of its capacity
+#: (ADDENDUM 2 finding 5).
+DRAIN_MODES: tuple[str, ...] = (
+    'backlog_chunk',
+    'steady_state',
+    'remediation',
+    'targeted',
+)
+
+#: Modes that actually consume lock-held drain capacity.
+_CAPACITY_MODES: tuple[str, ...] = ('backlog_chunk', 'steady_state', 'remediation')
+
+#: BacklogIterator stamps each chunk with this trigger_reason prefix
+#: (harness.py:4848, 'backlog_chunk:{n}:{events}').  The final consolidation
+#: pass (harness.py:4873, 'backlog_final_consolidation') deliberately does NOT
+#: match — it runs after the chunks with a drained buffer and is a normal full
+#: cycle, so it belongs in steady_state.
+_BACKLOG_CHUNK_PREFIX = 'backlog_chunk:'
+
+
+def classify_run(run_type: str, trigger_reason: str) -> str:
+    """Classify one `runs` row into a :data:`DRAIN_MODES` bucket.
+
+    Args:
+        run_type: The row's ``run_type`` ('full' / 'targeted' / 'remediation').
+        trigger_reason: The row's ``trigger_reason``.
+
+    Returns:
+        One of :data:`DRAIN_MODES`.
+    """
+    if run_type == 'remediation':
+        return 'remediation'
+    if run_type == 'targeted':
+        return 'targeted'
+    if trigger_reason.startswith(_BACKLOG_CHUNK_PREFIX):
+        return 'backlog_chunk'
+    return 'steady_state'
+
+
+def _seconds_between(started_at: str, completed_at: str) -> float:
+    """Wall-clock seconds between two ISO8601 timestamps, offset-aware."""
+    start = datetime.fromisoformat(started_at)
+    end = datetime.fromisoformat(completed_at)
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=UTC)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=UTC)
+    return (end - start).total_seconds()
+
+
+def _per_event(wall_clock_seconds: float, events: int) -> float | None:
+    """Seconds per event, or None when the mode drained no events.
+
+    Remediation runs legitimately process zero events (they act on Stage-3
+    findings, not buffered events), and a mode with no runs at all is reported
+    present-but-empty.  Both must read as 'not applicable', not raise.
+    """
+    if events <= 0:
+        return None
+    return wall_clock_seconds / events
+
+
+def drain_stats(
+    db_path: str | Path,
+    project_id: str,
+    since: str | None = None,
+) -> dict[str, Any]:
+    """Per-mode drain statistics over the `runs` table for one project.
+
+    Args:
+        db_path: Path to reconciliation.db (opened read-only).
+        project_id: Project to report on.
+        since: Optional inclusive floor on ``started_at`` — an ISO8601
+            timestamp; rows that started earlier are ignored.
+
+    Returns:
+        ``{'modes': {mode: {events, wall_clock_seconds, run_count,
+        seconds_per_event}}, 'runs_in_flight': int,
+        'drain_wall_clock_seconds': float, 'drain_events': int,
+        'drain_seconds_per_event': float | None}``.
+
+        Every mode in :data:`DRAIN_MODES` is always present, empty if unseen,
+        so a consumer never has to guard on a missing key.
+
+        A run with ``completed_at IS NULL`` is still in flight: it has no
+        measurable wall-clock, so it is excluded from every aggregate (which
+        would otherwise be diluted by a partial run) and surfaced in
+        ``runs_in_flight`` instead — loud rather than silently dropped.
+
+        The top-level ``drain_*`` totals cover :data:`_CAPACITY_MODES` only.
+        Targeted runs hold no lock and consume no drain capacity, so folding
+        their wall-clock in would understate real throughput.
+    """
+    floor = None
+    if since is not None:
+        floor = datetime.fromisoformat(since)
+        if floor.tzinfo is None:
+            floor = floor.replace(tzinfo=UTC)
+
+    modes: dict[str, dict[str, Any]] = {
+        mode: {'events': 0, 'wall_clock_seconds': 0.0, 'run_count': 0}
+        for mode in DRAIN_MODES
+    }
+    runs_in_flight = 0
+
+    conn = _connect_ro(db_path)
+    try:
+        if _table_exists(conn, 'runs'):
+            rows = conn.execute(
+                """SELECT run_type, trigger_reason, started_at, completed_at,
+                          events_processed
+                   FROM runs WHERE project_id = ?""",
+                (project_id,),
+            ).fetchall()
+        else:
+            rows = []
+
+        for row in rows:
+            if floor is not None:
+                started = datetime.fromisoformat(row['started_at'])
+                if started.tzinfo is None:
+                    started = started.replace(tzinfo=UTC)
+                if started < floor:
+                    continue
+
+            if row['completed_at'] is None:
+                runs_in_flight += 1
+                continue
+
+            mode = modes[classify_run(row['run_type'] or '', row['trigger_reason'] or '')]
+            mode['run_count'] += 1
+            mode['events'] += row['events_processed'] or 0
+            mode['wall_clock_seconds'] += _seconds_between(
+                row['started_at'], row['completed_at'],
+            )
+    finally:
+        conn.close()
+
+    for mode in modes.values():
+        mode['seconds_per_event'] = _per_event(
+            mode['wall_clock_seconds'], mode['events'],
+        )
+
+    drain_wall_clock = sum(modes[m]['wall_clock_seconds'] for m in _CAPACITY_MODES)
+    drain_events = sum(modes[m]['events'] for m in _CAPACITY_MODES)
+
+    return {
+        'modes': modes,
+        'runs_in_flight': runs_in_flight,
+        'drain_wall_clock_seconds': drain_wall_clock,
+        'drain_events': drain_events,
+        'drain_seconds_per_event': _per_event(drain_wall_clock, drain_events),
     }
