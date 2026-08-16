@@ -411,7 +411,8 @@ def apply_coding_record(codebook: dict, record: dict) -> tuple[dict, dict]:
 
     Operates on a deep copy — never mutates `codebook` in place. Returns
     `(new_codebook, stats)` where stats has keys `matched`,
-    `skipped_unknown_entry`, `candidates_applied`, `record_invalid`.
+    `skipped_unknown_entry`, `candidates_applied`,
+    `candidate_disposition_conflicts`, `record_invalid`.
 
     A record that fails `validate_coding_record()` is skipped WHOLE (never
     partially applied): the input codebook comes back unchanged (deep
@@ -423,6 +424,22 @@ def apply_coding_record(codebook: dict, record: dict) -> tuple[dict, dict]:
     matched entry only if no existing sighting on that entry already
     carries this session (dedup key: (session, entry_id), the entry being
     implicit in "that entry's sightings list").
+
+    Candidate handling: a candidate title is resolved against the existing
+    `candidates` list. A still-`pending` record of that title absorbs the
+    sighting (`candidates_applied`); a genuinely unseen title creates a new
+    pending record (`candidates_applied`); a title whose records are ALL
+    already adjudicated (rejected/promoted) takes neither path — the
+    recurrence sighting is appended to the existing record and counted in
+    `candidate_disposition_conflicts`, but no pending twin is fabricated.
+
+    Never-resurrect: the merger must never re-open a census verdict. Only
+    the census writes `disposition` (census.py promote_candidate/
+    reject_candidate), so an adjudicated-title collision leaves that field
+    untouched and surfaces itself via `candidate_disposition_conflicts`
+    rather than by manufacturing a byte-identical-title pending record —
+    which is precisely how rejected `cand-20260722-28` reappeared as
+    pending `cand-20260724-2` in the live registry.
 
     Never-delete: a deletion-shaped `record` (top-level delete/remove/
     retract/drop key, or a match with a delete/remove action) raises
@@ -447,6 +464,7 @@ def apply_coding_record(codebook: dict, record: dict) -> tuple[dict, dict]:
         "matched": 0,
         "skipped_unknown_entry": 0,
         "candidates_applied": 0,
+        "candidate_disposition_conflicts": 0,
         "record_invalid": False,
     }
 
@@ -496,6 +514,21 @@ def apply_coding_record(codebook: dict, record: dict) -> tuple[dict, dict]:
         )
         if pending_match is not None:
             pending_match.setdefault("sightings", []).append(sighting)
+            stats["candidates_applied"] += 1
+        elif same_title:
+            # Every same-title candidate is already adjudicated (rejected/
+            # promoted). Fabricating a fresh pending twin here would silently
+            # undo that verdict (this is exactly how rejected
+            # cand-20260722-28 came back as pending cand-20260724-2 in the
+            # live codebook). Append the recurrence sighting to the existing
+            # record so the signal is not lost, leave `disposition` alone --
+            # promote/reject transitions are census-owned (census.py
+            # promote_candidate/reject_candidate) -- and surface the conflict
+            # via stats. `same_title[-1]` (last in list order = most recently
+            # added) is the deterministic tie-break when more than one
+            # adjudicated record shares a title.
+            same_title[-1].setdefault("sightings", []).append(sighting)
+            stats["candidate_disposition_conflicts"] += 1
         else:
             n = 1 + sum(
                 1 for c in candidates if str(c.get("id", "")).startswith(date_prefix)
@@ -511,7 +544,7 @@ def apply_coding_record(codebook: dict, record: dict) -> tuple[dict, dict]:
                     "sightings": [sighting],
                 }
             )
-        stats["candidates_applied"] += 1
+            stats["candidates_applied"] += 1
 
     assert_no_deletion(codebook, result)
     return result, stats
