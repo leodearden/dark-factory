@@ -30,6 +30,29 @@ DEFAULT_READY_INTERVAL_S = 5.0
 #: httpx.Timeout object: the shared test fake exposes only get/post.
 READY_PROBE_TIMEOUT_S = 5.0
 
+# Exit codes, named here rather than spelled as bare literals at the `return`,
+# so the meaning an operator acts on lives beside the number and a test can
+# assert the NAME.  Same pattern (and, for 2, the same number) as
+# `lms_healthcheck`'s block -- the two CLIs are read side by side in the README
+# and a code that meant one thing in one and another in the other would be
+# worse than no convention at all.
+EXIT_OK = 0
+#: `wait-ready` timed out, or the arm never served the model the manifest names.
+#: Only that verb returns it; nothing was started or stopped.
+EXIT_NOT_READY = 1
+#: The manifest, or the arm id asked for, is wrong.  Matches lms_healthcheck.
+EXIT_MANIFEST_ERROR = 2
+#: This arm must not be started AS ASKED: it does not fit the measured free
+#: VRAM, or another arm already holds the card and `--no-exclusive` was not
+#: given.  The fix is a smaller arm, a freed sibling, or a different flag.
+EXIT_ARM_REFUSED = 4
+#: Another PROCESS is holding the card, so a baseline taken now would charge
+#: its memory to this arm.  Deliberately NOT `EXIT_ARM_REFUSED`: these two have
+#: OPPOSITE fixes, and collapsing them would send an operator to shrink an arm
+#: that fits perfectly well on a card somebody else is sitting on.  Nothing was
+#: started and no baseline file was written.
+EXIT_CARD_HELD = 5
+
 
 class ArmPreflightError(Exception):
     """This arm must not be started, and nothing has been started."""
@@ -356,7 +379,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             for arm_id in stop_all():
                 print(f'stopped {arm_id}')
-        return 0
+        return EXIT_OK
 
     if not args.arm_id:
         parser.error(f'{args.verb} needs an arm_id')
@@ -365,36 +388,33 @@ def main(argv: list[str] | None = None) -> int:
         arm = load_arms().by_id(args.arm_id)
     except ArmManifestError as exc:
         print(f'lms_ctl: {exc}', file=sys.stderr)
-        return 2
+        return EXIT_MANIFEST_ERROR
 
     if args.verb == 'start':
         try:
             start(arm, exclusive=not args.no_exclusive)
-        # BEFORE the VramProbeError branch it subclasses. These two refusals
-        # have OPPOSITE fixes and so must not collapse into one code: 4 means
-        # this arm is too big for this card (use a smaller arm, or a bigger
-        # budget), 5 means another process is holding the card (free it and
-        # start the same arm again).
+        # BEFORE the VramProbeError branch it subclasses.  What each code means
+        # and why the two must not collapse is on the constants themselves.
         except lms_vram.PollutedBaselineError as exc:
             print(f'lms_ctl: refusing to start {arm.arm_id}: {exc}', file=sys.stderr)
-            return 5
+            return EXIT_CARD_HELD
         except (ArmPreflightError, lms_vram.VramProbeError) as exc:
             print(f'lms_ctl: refusing to start {arm.arm_id}: {exc}', file=sys.stderr)
-            return 4
+            return EXIT_ARM_REFUSED
         print(f'started {unit_name(arm)}')
-        return 0
+        return EXIT_OK
 
     if args.verb == 'stop':
         stop(arm)
         print(f'stopped {unit_name(arm)}')
-        return 0
+        return EXIT_OK
 
     if args.verb == 'status':
         return status(arm)
 
     ready = wait_ready(arm, timeout_s=args.timeout)
     print(f'{arm.arm_id}: {"ready" if ready else "NOT ready"}')
-    return 0 if ready else 1
+    return EXIT_OK if ready else EXIT_NOT_READY
 
 
 if __name__ == '__main__':  # pragma: no cover - process entry point

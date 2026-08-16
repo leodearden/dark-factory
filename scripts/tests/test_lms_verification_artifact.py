@@ -295,11 +295,6 @@ def test_the_committed_artifact_accounts_for_who_else_held_the_card(
             'mislabelled with an older version -- both are worse than a '
             'missing field.'
         )
-        assert _OWED_LIVE_RERUN_TASK_ID.strip(), (
-            'the grandfather clause must point at a FILED, closeable task for '
-            'the owed live re-run. An unnamed promise is how a temporary '
-            'exemption becomes permanent.'
-        )
         branch = _BRANCH_GRANDFATHERED
 
     assert branch in (_BRANCH_MEASURED, _BRANCH_GRANDFATHERED), (

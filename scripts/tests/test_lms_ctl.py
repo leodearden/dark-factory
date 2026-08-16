@@ -319,12 +319,27 @@ def cli_gpu(monkeypatch):
     return state
 
 
+def test_the_cli_exit_codes_are_the_numbers_the_readme_documents():
+    """The names are for readers; the NUMBERS are the contract.
+
+    Every other assertion in this file now goes through the constant, so
+    renumbering one would move the whole suite with it and pin nothing.  A
+    wrapper script and the README both read these as literals, and 2 is shared
+    with `lms_healthcheck` on purpose.
+    """
+    assert lms_ctl.EXIT_OK == 0
+    assert lms_ctl.EXIT_NOT_READY == 1
+    assert lms_ctl.EXIT_MANIFEST_ERROR == 2
+    assert lms_ctl.EXIT_ARM_REFUSED == 4
+    assert lms_ctl.EXIT_CARD_HELD == 5
+
+
 def test_cli_start_on_a_clean_card_succeeds(
     fake_systemctl, baseline_dir, cli_gpu, capsys,
 ):
     code = lms_ctl.main(['start', 'qwen3.5-9b'])
 
-    assert code == 0
+    assert code == lms_ctl.EXIT_OK
     assert ['start', 'lms-arm@qwen3.5-9b.service'] in fake_systemctl.calls()
 
 
@@ -342,7 +357,7 @@ def test_cli_start_returns_a_distinct_code_when_the_card_is_polluted(
 
     code = lms_ctl.main(['start', 'qwen3.5-9b'])
 
-    assert code == 5
+    assert code == lms_ctl.EXIT_CARD_HELD
     assert ['start', 'lms-arm@qwen3.5-9b.service'] not in fake_systemctl.calls()
 
 
@@ -375,7 +390,7 @@ def test_cli_start_still_returns_4_when_the_arm_simply_does_not_fit(
 
     code = lms_ctl.main(['start', 'qwen3.5-9b'])
 
-    assert code == 4
+    assert code == lms_ctl.EXIT_ARM_REFUSED
     assert ['start', 'lms-arm@qwen3.5-9b.service'] not in fake_systemctl.calls()
 
 
@@ -410,7 +425,7 @@ def test_an_exclusive_start_blames_the_running_arm_not_the_card(
 
     code = lms_ctl.main(['start', 'phi-4-14b'])
 
-    assert code == 4
+    assert code == lms_ctl.EXIT_ARM_REFUSED
     err = capsys.readouterr().err
     assert 'granite-embedding-english-r2' in err or 'qwen3.5-9b' in err
     assert 'stop them first' in err
@@ -429,7 +444,7 @@ def test_an_exclusive_start_on_an_idle_card_still_refuses_a_real_intruder(
 
     code = lms_ctl.main(['start', 'qwen3.5-9b'])
 
-    assert code == 5
+    assert code == lms_ctl.EXIT_CARD_HELD
     assert '/usr/local/lib/ollama/llama-server' in capsys.readouterr().err
 
 
@@ -442,7 +457,7 @@ def test_no_exclusive_starts_while_another_arm_legitimately_holds_the_card(
 
     code = lms_ctl.main(['start', 'qwen3.5-9b', '--no-exclusive'])
 
-    assert code == 0
+    assert code == lms_ctl.EXIT_OK
     assert ['start', 'lms-arm@qwen3.5-9b.service'] in fake_systemctl.calls()
 
 
@@ -471,7 +486,7 @@ def test_no_exclusive_still_refuses_ollama_with_the_same_distinct_code(
 
     code = lms_ctl.main(['start', 'qwen3.5-9b', '--no-exclusive'])
 
-    assert code == 5
+    assert code == lms_ctl.EXIT_CARD_HELD
     assert '/usr/local/lib/ollama/llama-server' in capsys.readouterr().err
     assert ['start', 'lms-arm@qwen3.5-9b.service'] not in fake_systemctl.calls()
 
@@ -486,7 +501,7 @@ def test_no_exclusive_on_an_idle_card_keeps_the_strict_rule(
 
     code = lms_ctl.main(['start', 'qwen3.5-9b', '--no-exclusive'])
 
-    assert code == 5
+    assert code == lms_ctl.EXIT_CARD_HELD
     assert ['start', 'lms-arm@qwen3.5-9b.service'] not in fake_systemctl.calls()
 
 
@@ -550,7 +565,7 @@ def test_cli_start_returns_5_not_4_on_the_measured_contended_card(
 
     code = lms_ctl.main(['start', 'qwen3.5-9b'])
 
-    assert code == 5
+    assert code == lms_ctl.EXIT_CARD_HELD
     assert code != 4
     assert '/usr/local/lib/ollama/llama-server' in capsys.readouterr().err
     assert not lms_vram.baseline_path('qwen3.5-9b').exists()
@@ -577,7 +592,7 @@ def test_cli_start_returns_4_for_a_sub_floor_stray_on_a_card_too_small(
 
     code = lms_ctl.main(['start', 'qwen3.5-9b'])
 
-    assert code == 4
+    assert code == lms_ctl.EXIT_ARM_REFUSED
     assert ['start', 'lms-arm@qwen3.5-9b.service'] not in fake_systemctl.calls()
 
 

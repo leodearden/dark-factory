@@ -871,6 +871,18 @@ POLLUTED_FOOTPRINT_NOTE = (
     'and measure again'
 )
 
+#: The body of the terminal banner `render_table` prints under
+#: `*** VRAM MEASUREMENT POLLUTED ***`.  ONE string, wrapped at render time by
+#: `_wrapped`, rather than pre-broken literals: hand-placed line breaks make
+#: every future edit to this text a re-wrapping chore, and a careless one leaves
+#: ragged output in the single place an operator most needs to read.
+POLLUTED_BANNER_BODY = (
+    'Another process moved on the card between the two readings, so every VRAM '
+    'figure above — and the OVERALL verdict, which is computed partly from '
+    'them — is void. This says NOTHING about whether the arm fits; measure '
+    'again on a quiet card.'
+)
+
 #: The delivered-check literal for task 3713.  Spelled once, here, and carried
 #: into the JSON artifact as a field.
 PRD_MARKER = 'PRD-MARKER:local-memory-models-eval serving'
@@ -1510,17 +1522,8 @@ def render_table(report: HealthReport) -> str:
     # Printed from the block's own `pollution` field, NOT re-derived from the
     # consumer lists above, so the banner and the JSON cannot drift apart.
     if report.vram.pollution == lms_vram.PollutionState.POLLUTED:
-        out.extend([
-            '',
-            '*** VRAM MEASUREMENT POLLUTED ***',
-            '  Another process moved on the card between the two readings, so '
-            'every VRAM',
-            '  figure above — and the OVERALL verdict, which is computed partly '
-            'from them —',
-            '  is void. This says NOTHING about whether the arm fits; measure '
-            'again on a',
-            '  quiet card.',
-        ])
+        out.extend(['', '*** VRAM MEASUREMENT POLLUTED ***'])
+        out.extend(_wrapped(POLLUTED_BANNER_BODY))
         out.extend(_wrapped(report.vram.pollution_reason))
     return '\n'.join(out)
 
