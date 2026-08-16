@@ -50,6 +50,15 @@ def reload_module_under_env(monkeypatch):
     override var name is restated here: both are imported from the module that
     owns them, so this fixture cannot become the next drifting copy.
 
+    That clearing happens BEFORE ``import_module``, not merely before ``reload``,
+    and the order is load-bearing: even the module's FIRST — cold — import
+    already runs under the fake environ, so no import-time side effect (a
+    ``warnings.warn``, a module-level pair resolution) can escape into a caller's
+    ``catch_warnings`` / ``pytest.warns`` region.  This matters because ``_reload``
+    is called from inside the test body, where such a region is already open —
+    unlike the pre-consolidation ``reload_integration_module``, which imported
+    during fixture SETUP and so dodged the hazard only by accident.
+
     Shared by every test module in this directory (visible via ``conftest.py``):
     ``test_usage_gate``, ``test_cli_invoke_integration`` and
     ``test_startup_completion_fixtures`` via ``test_oauth_accounts.py``, and
@@ -64,14 +73,14 @@ def reload_module_under_env(monkeypatch):
     reloaded: list[ModuleType] = []
 
     def _reload(module_name: str, **tokens: str) -> ModuleType:
-        module = importlib.import_module(module_name)
-        if module not in reloaded:
-            reloaded.append(module)
         for ch in ALL_TOKEN_LETTERS:
             monkeypatch.delenv(f'CLAUDE_OAUTH_TOKEN_{ch}', raising=False)
         monkeypatch.delenv(PAIR_OVERRIDE_VAR, raising=False)
         for name, value in tokens.items():
             monkeypatch.setenv(name, value)
+        module = importlib.import_module(module_name)
+        if module not in reloaded:
+            reloaded.append(module)
         return importlib.reload(module)
 
     try:
