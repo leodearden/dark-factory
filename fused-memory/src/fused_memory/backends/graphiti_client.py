@@ -41,6 +41,7 @@ from fused_memory.backends.falkor_indices import (
     normalize_index_records,
     plan_index_statements,
     resolve_header_positions,
+    vector_drop_statement,
 )
 from fused_memory.backends.llm_clients import ForceJsonObjectOpenAIGenericClient
 from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
@@ -3466,10 +3467,46 @@ class GraphitiBackend:
 
     @_canonicalize_group_args
     async def drop_index(self, label: str, field: str, *, group_id: str) -> None:
-        """Drop an index on the given label and field (FalkorDB syntax)."""
+        """Drop a RANGE index on the given label and field (FalkorDB syntax).
+
+        RANGE ONLY.  The old-style ``DROP INDEX ON :label(field)`` form this
+        issues does NOT reach a VECTOR index: measured 2026-08-16 on throwaway
+        graph ``_impl3769_probe``, it fails with
+        ``ERR Unable to drop index on :Entity(emb): no such index.`` even while
+        that index is live and ``CALL db.indexes()`` reports it.  A VECTOR index
+        must go through :meth:`drop_vector_index`, which issues the
+        ``DROP VECTOR INDEX`` verb.
+
+        The previous docstring — "Drop an index on the given label and field" —
+        overstated the reach, which is part of how ``drop_vector_indices`` came to
+        route VECTOR drops through here and silently drop nothing (task 3769).
+        """
         graph = self._graph_for(group_id)
         cypher = f'DROP INDEX ON :{label}({field})'
         await graph.query(cypher)
+
+    @_canonicalize_group_args
+    async def drop_vector_index(
+        self, label: str, field: str, entity_type: str, *, group_id: str,
+    ) -> None:
+        """Drop ONE VECTOR index, on the given label/property/entity type.
+
+        The VECTOR-specific sibling of :meth:`drop_index`, which is RANGE-only
+        (see its docstring for the measurement).  ``entity_type`` is load-bearing
+        rather than cosmetic — measured, the NODE statement against a
+        RELATIONSHIP vector index also fails with ``no such index`` — so it
+        selects the statement shape via
+        :func:`fused_memory.backends.falkor_indices.vector_drop_statement`, which
+        raises on an unrecognised value rather than guessing.
+
+        Args:
+            label: Node label or relationship type carrying the index.
+            field: A SINGLE property name (not a list).
+            entity_type: ``'NODE'`` or ``'RELATIONSHIP'``.
+            group_id: The graph to act on.
+        """
+        graph = self._graph_for(group_id)
+        await graph.query(vector_drop_statement(label, entity_type, field))
 
     @_canonicalize_group_args
     async def drop_vector_indices(self, *, group_id: str) -> list[dict]:
