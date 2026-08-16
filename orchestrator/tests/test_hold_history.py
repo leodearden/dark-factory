@@ -16,7 +16,7 @@ import _hold_history_fixtures as F
 import pytest
 
 from orchestrator.event_store import EventStore
-from orchestrator.hold_history import HoldHistory, HoldSpan, iter_hold_spans
+from orchestrator.hold_history import HoldHistory, HoldSpan, iter_hold_spans, modules_of
 
 
 def _offset(posix_seconds: float) -> float:
@@ -1271,6 +1271,58 @@ def test_record_ignores_an_empty_module_key():
     history.record('', 100.0)
 
     assert history.sample_count(['']) == 0
+
+
+# ===========================================================================
+# modules_of — the ONE "which modules does this event name" rule
+# ===========================================================================
+#
+# Public (task 3869) because ``analyze_modules`` needs the same answer for its
+# dispatch/skip counters, which ``iter_hold_spans`` does not supply.  The
+# alternative — a second copy of the coercion in the CLI — is the lockstep
+# duplication INV-5 exists to forbid, so the rule is pinned directly here
+# rather than only through the spans it feeds.
+
+
+def test_modules_of_returns_the_payload_list_verbatim_and_in_order():
+    """Order is part of the contract: ``analyze_modules`` renders these keys."""
+    row = F.acquire(1, 0, 'T1', ['shared/src', 'orchestrator/src'])
+
+    assert modules_of(row) == ['shared/src', 'orchestrator/src']
+
+
+def test_modules_of_coerces_a_bare_string_to_a_one_element_list():
+    """A string is unambiguous about which single module it names, so coercing
+    keeps a real hold that dropping would throw away."""
+    row = dict(F.row(1, 0, 'lock_acquired', task_id='T1'), data={'modules': 'orchestrator/src'})
+
+    assert modules_of(row) == ['orchestrator/src']
+
+
+@pytest.mark.parametrize(
+    'row',
+    [
+        pytest.param({'event_type': 'lock_acquired'}, id='no-data-key'),
+        pytest.param({'data': None}, id='data-is-None'),
+        pytest.param({'data': 'orchestrator/src'}, id='data-is-not-a-dict'),
+        pytest.param({'data': ['orchestrator/src']}, id='data-is-a-list'),
+        pytest.param({'data': {'modules': 42}}, id='modules-is-not-a-list-or-str'),
+        pytest.param({'data': {'modules': None}}, id='modules-is-None'),
+        pytest.param({'data': {}}, id='modules-key-absent'),
+    ],
+)
+def test_modules_of_returns_empty_for_every_unusable_payload(row):
+    """No modules means no keys — never a phantom '' or 'None' module."""
+    assert modules_of(row) == []
+
+
+def test_modules_of_drops_non_string_and_empty_entries_inside_the_list():
+    """``modules`` is reconstructed from a JSON payload, so the annotation
+    cannot enforce its element type.  An empty-string key would collect samples
+    under a module no lock event can ever name again."""
+    row = dict(F.row(1, 0, 'lock_acquired', task_id='T1'), data={'modules': ['ok', '', 3, None]})
+
+    assert modules_of(row) == ['ok']
 
 
 # ===========================================================================
