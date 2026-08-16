@@ -1954,6 +1954,161 @@ def test_the_live_reify_dropin_blocks_only_reify_and_the_watchdog_is_re_enabled(
     )
 
 
+def _verdict_stub(exit_code: int, verdicts: dict[str, str]) -> str:
+    """A stub checker printing a TAGGED report and the given verdict lines.
+
+    Used to reach states the real checker cannot be driven into from a tmp tree
+    — chiefly "the report is well formed but a unit has no verdict line", which
+    is what an older checker, a refactor that dropped the emit, or a registry
+    that does not know a unit would each produce.
+    """
+    lines = ["[orchestrator_unit_parity] stub report over 9 units"]
+    lines += [
+        f"[orchestrator_unit_parity] verdict {unit} {kinds}"
+        for unit, kinds in sorted(verdicts.items())
+    ]
+    return (
+        "import sys\n"
+        + "".join(f"print({line!r})\n" for line in lines)
+        + f"sys.exit({exit_code})\n"
+    )
+
+
+def test_a_report_with_no_verdict_lines_installs_nothing(tmp_path: pathlib.Path):
+    """FAIL-SAFE: a tagged, exit-0 report carrying NO verdicts installs NOTHING.
+
+    The third face of the same collision the two tests below cover, and the one
+    the machine channel newly opens: here the gate DID run, its tag IS present
+    and it exited 0 — everything the installer checks before reading verdicts
+    says "green" — yet it said nothing per-unit. A checker refactored to drop
+    the emit, an older copy on a rebuilt host, or a registry that does not know
+    these units all land exactly here.
+
+    Reading that as "no findings, install everything" would make the per-unit
+    gate strictly WEAKER than the all-or-nothing one it replaces: the states
+    that produce no verdict are precisely "nothing was checked", and installing
+    on the strength of nothing is the silent-drift failure this gate exists to
+    catch. A unit with no verdict is therefore BLOCKED, and the warning must
+    say so — "skipped" with no cause is indistinguishable from a real finding.
+    """
+    repo = _fake_repo(tmp_path, checker_body=_verdict_stub(0, {}))
+    unit_dir = tmp_path / "installed"
+    _install_all_units(repo, unit_dir)
+    deleted = unit_dir / "orchestrator-watchdog.timer"
+    deleted.unlink()
+
+    result = _run_installer_section(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, result.stderr
+    assert not deleted.exists(), (
+        "A unit with NO verdict was installed anyway. The gate reported no "
+        "finding because it measured nothing, not because there was nothing "
+        f"to find.\n{result.stdout}"
+    )
+    assert _enabled_units(tmp_path) == [], (
+        "Units were enabled on a run where nothing cleared the gate.\n"
+        f"{_systemctl_calls(tmp_path)}"
+    )
+    assert "SKIPPING" in result.stdout, result.stdout
+
+    warning = _warnings_naming(result.stdout, "orchestrator-watchdog.timer")
+    assert "no verdict" in warning, (
+        "The skip warning does not tell the operator the gate returned NO "
+        "VERDICT for this unit. Without that, a checker that silently stopped "
+        "reporting is indistinguishable from a host with real drift — and the "
+        f"remedies are opposite.\n{result.stdout}"
+    )
+
+
+def test_a_vanished_committed_unit_is_skipped_not_fatal(tmp_path: pathlib.Path):
+    """A missing SOURCE file must skip that unit, never abort the installer.
+
+    `cp` of a nonexistent source fails, and under `set -euo pipefail` that
+    aborts the whole script — taking every section after this one with it. The
+    `vanished` verdict is what lets the loop decline that unit instead of dying
+    on it, so this is the regression that must never land: the per-unit gate
+    made `cp` run inside a loop over a computed set, which is exactly where an
+    unguarded missing source would first bite.
+    """
+    repo = _fake_repo(tmp_path)
+    unit_dir = tmp_path / "installed"
+    _install_all_units(repo, unit_dir)
+    (repo / "scripts" / "orchestrator-know-live.service").unlink()
+
+    survivor = unit_dir / "orchestrator-watchdog.timer"
+    survivor.unlink()
+
+    result = _run_installer_section(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, (
+        "A vanished committed unit ABORTED the installer instead of being "
+        f"skipped.\n{result.stdout}\n{result.stderr}"
+    )
+    assert survivor.is_file(), (
+        "The vanished unit stopped its clean siblings from being installed.\n"
+        + result.stdout
+    )
+    assert "orchestrator-know-live.service" in _warnings_naming(
+        result.stdout, "orchestrator-know-live.service"
+    ), f"The vanished unit was skipped silently.\n{result.stdout}"
+    assert "orchestrator-know-live.service" not in _enabled_units(tmp_path), (
+        "A unit with no committed copy was enabled.\n"
+        f"{_systemctl_calls(tmp_path)}"
+    )
+
+
+def test_force_all_installs_even_drifted_and_unverified_units(
+    tmp_path: pathlib.Path,
+):
+    """DF_INSTALL_ORCH_UNITS=1 still means ALL, per-unit gate notwithstanding.
+
+    The override is the operator's escape hatch after they have read the report
+    and decided the committed side is correct. A per-unit gate that quietly
+    kept skipping the no-verdict units under the override would leave them with
+    no way to install those units at all without editing the installer.
+    """
+    checker = _load_checker()
+    unverified = "orchestrator-watchdog.timer"
+    drifted = "orchestrator-reify.service"
+    stub = _verdict_stub(
+        1,
+        {
+            unit: ("drift" if unit == drifted else "clean")
+            for unit in checker.UNITS
+            if unit != unverified
+        },
+    )
+    repo = _fake_repo(tmp_path, checker_body=stub)
+    unit_dir = tmp_path / "installed"
+    unit_dir.mkdir(parents=True, exist_ok=True)
+
+    result = _run_installer_section(
+        tmp_path, repo, unit_dir, env_extra={"DF_INSTALL_ORCH_UNITS": "1"}
+    )
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "SKIPPING" not in result.stdout, (
+        f"The override skipped a unit anyway.\n{result.stdout}"
+    )
+    assert "installing over the reported drift" in result.stdout, (
+        "The override installed over a reported finding SILENTLY. The escape "
+        "hatch must still say out loud that it acted against the gate — that "
+        f"line is the only record in the run's output.\n{result.stdout}"
+    )
+    missing = sorted(
+        name for name in checker.UNITS if not (unit_dir / name).is_file()
+    )
+    assert not missing, (
+        f"DF_INSTALL_ORCH_UNITS=1 did not install {missing}. The override is "
+        f"force-ALL; the per-unit gate narrows the default, not the escape "
+        f"hatch.\n{result.stdout}"
+    )
+    assert unverified in _enabled_units(tmp_path), (
+        f"{unverified} was force-installed but not enabled.\n"
+        f"{_systemctl_calls(tmp_path)}"
+    )
+
+
 def test_a_missing_checker_does_not_read_as_not_installed_here(
     tmp_path: pathlib.Path,
 ):
