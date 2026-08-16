@@ -5270,6 +5270,11 @@ _MUST_BE_REJECTED: tuple[tuple[str, str], ...] = (
     ('session_registry.py', 'from shared import safe_io'),
     ('session_registry.py', 'from orchestrator import config'),
     ('session_registry.py', 'from orchestrator import stop_instruction'),
+    # session_hooks.py's contract is the WEAKER tier-2 one: it does
+    # `from orchestrator import session_registry` at module scope (line 50) and
+    # its callers export PYTHONPATH for exactly that, so `orchestrator.*` is
+    # ALLOWED. `shared` is not — nothing puts shared/src on that path.
+    ('session_hooks.py', 'from shared import safe_io'),
 )
 
 
@@ -5405,6 +5410,24 @@ class TestStdlibOnlySelfContainment:
     now pinned directly.  A future migration that finds this test in its way
     should read the module docstring before deleting it.
     """
+
+    def test_every_matrix_entrypoint_has_a_registry_row(self):
+        """Every entrypoint named in the mutation matrix is actually registered.
+
+        Without this, a matrix entry naming an unregistered entrypoint makes
+        ``test_forbidden_import_is_rejected`` iterate an EMPTY row set — it
+        would neither fail nor skip while the contract went unpinned, which is
+        precisely the silent-pass failure mode this registry exists to close.
+        """
+        registered = {row.path.name for row in _BARE_SHELL_ENTRYPOINTS}
+        named = {entrypoint for entrypoint, _payload in _MUST_BE_REJECTED}
+
+        assert named <= registered, (
+            'these entrypoints are mutation-tested but have no '
+            f'_BARE_SHELL_ENTRYPOINTS row: {sorted(named - registered)}. Register '
+            'the production invocation (env + shape + vacuity probe + callers) as '
+            'a row rather than leaving the mutation unpinned.'
+        )
 
     @pytest.mark.parametrize('row', _BARE_SHELL_ENTRYPOINTS, ids=lambda row: row.name)
     def test_entrypoint_runs_clean_under_documented_env(self, row, tmp_path):
