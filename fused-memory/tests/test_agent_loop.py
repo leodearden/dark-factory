@@ -1238,6 +1238,11 @@ async def test_call_claude_cli_forwards_cwd_to_invoke_claude_agent(tmp_path):
     so that the kwargs-forwarding layer is exercised.  Omitting cwd from the
     invoke_with_cap_retry call would raise TypeError at runtime; this test
     catches that regression without requiring a live Claude CLI.
+
+    Uses ``autospec=True`` (not a bare ``AsyncMock``) so a misspelled or
+    unsupported kwarg at the call site raises TypeError here instead of
+    being forwarded and asserted-on silently — see the fuller rationale on
+    test_call_claude_cli_forwards_mcp_scoping_to_invoke_claude_agent below.
     """
     from pathlib import Path
 
@@ -1258,9 +1263,11 @@ async def test_call_claude_cli_forwards_cwd_to_invoke_claude_agent(tmp_path):
     # kwargs-forwarding path that the higher-level mock skips.
     # usage_gate=None takes the fast path in invoke_with_cap_retry
     # (single invocation, no cap retry), so the real forwarding code runs.
+    # autospec (not a bare AsyncMock): validates every kwarg against the
+    # real invoke_claude_agent signature instead of swallowing it silently.
     with patch(
         'shared.cli_invoke.invoke_claude_agent',
-        new_callable=AsyncMock,
+        autospec=True,
     ) as mock_agent:
         mock_agent.return_value = fake_result
 
@@ -1276,6 +1283,120 @@ async def test_call_claude_cli_forwards_cwd_to_invoke_claude_agent(tmp_path):
     mock_agent.assert_called_once()
     call_kwargs = mock_agent.call_args.kwargs
     assert call_kwargs['cwd'] == Path(explore_root)
+
+
+@pytest.mark.asyncio
+async def test_call_claude_cli_scopes_mcp_to_no_servers():
+    """_call_claude_cli strict-scopes its run to ZERO MCP servers.
+
+    ``disallowed_tools=['*']`` alone does NOT keep MCP tools unreachable here:
+    under an ``output_schema`` cli_invoke expands the wildcard into a
+    BUILT-INS-ONLY deny-list carrying no MCP tool pattern, and ``cwd`` is
+    ``explore_codebase_root`` (the project root, task 1989), which holds a live
+    ``.mcp.json`` the CLI would ambient-merge — under ``bypassPermissions``,
+    that is unreviewed access to tools like ``halt_scheduler`` /
+    ``delete_memory``.  Closing it takes a truthy scoping ``mcp_config`` plus
+    ``strict_mcp_config=True``; the four pre-existing guarantees are asserted
+    alongside so this fix cannot be traded against them.
+    """
+    from pathlib import Path
+
+    from fused_memory.reconciliation.agent_loop import CLAUDE_CLI_RESPONSE_SCHEMA
+
+    config = _make_cli_config()
+
+    fake_result = AgentResult(
+        success=True,
+        output='',
+        session_id='sess-mcp',
+        structured_output={'thinking': '', 'tool_calls': []},
+    )
+
+    with patch(
+        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+    ) as mock_invoke:
+        mock_invoke.return_value = fake_result
+
+        agent = AgentLoop(
+            config=config,
+            system_prompt='Test',
+            tools={},
+            usage_gate=make_gate_mock(),
+        )
+
+        await agent._call_claude_cli(prompt='hi', tools=[])
+
+    mock_invoke.assert_called_once()
+    call_kwargs = mock_invoke.call_args.kwargs
+
+    assert call_kwargs['strict_mcp_config'] is True
+    # A zero-server config, but a TRUTHY one — the --strict-mcp-config emit is
+    # gated on `if mcp_config:`, so an inline `{}` regression fails here.
+    assert call_kwargs['mcp_config'] == {'mcpServers': {}}
+
+    # Unregressed pre-existing guarantees.
+    assert call_kwargs['disallowed_tools'] == ['*']
+    assert call_kwargs['output_schema'] is CLAUDE_CLI_RESPONSE_SCHEMA
+    assert call_kwargs['permission_mode'] == 'bypassPermissions'
+    assert call_kwargs['cwd'] == Path(config.explore_codebase_root)
+
+
+@pytest.mark.asyncio
+async def test_call_claude_cli_forwards_mcp_scoping_to_invoke_claude_agent(tmp_path):
+    """Both MCP-scoping kwargs survive invoke_with_cap_retry's forwarding layer.
+
+    ``invoke_with_cap_retry`` takes ``**invoke_kwargs`` and forwards them blind,
+    so the kwargs-level test above proves only that AgentLoop NAMES these
+    kwargs.  Patching one level lower with ``usage_gate=None`` (the
+    single-invocation fast path) runs the real forwarding code, proving the
+    keys are not dropped en route — same rationale as
+    test_call_claude_cli_forwards_cwd_to_invoke_claude_agent above.
+
+    ``autospec=True`` is load-bearing, not incidental: a bare ``AsyncMock`` is
+    signature-less and swallows arbitrary keywords, so a misspelled
+    ``strict_mcp_configs=True`` would be forwarded and asserted-on happily here
+    and surface as a TypeError only in production.  The autospec'd mock is
+    built from the real ``invoke_claude_agent`` signature and raises TypeError
+    on a kwarg it does not accept, so this test also pins that both names are
+    genuinely supported parameters.
+
+    Deliberately NOT asserted: that the ambient .mcp.json is actually
+    suppressed.  That is the external CLI's own documented
+    ``--strict-mcp-config`` contract, not hermetically testable here.
+    """
+    # Use tmp_path so the cwd Path actually exists on disk.
+    config = _make_cli_config(explore_codebase_root=str(tmp_path))
+
+    fake_result = AgentResult(
+        success=True,
+        output='',
+        session_id='sess-mcp-deep',
+        structured_output={'thinking': '', 'tool_calls': []},
+    )
+
+    # autospec (not a bare AsyncMock): validates every kwarg against the real
+    # invoke_claude_agent signature, so an unsupported/misspelled one raises
+    # TypeError here instead of only in production. See the docstring.
+    with patch(
+        'shared.cli_invoke.invoke_claude_agent',
+        autospec=True,
+    ) as mock_agent:
+        mock_agent.return_value = fake_result
+
+        agent = AgentLoop(
+            config=config,
+            system_prompt='Test',
+            tools={},
+            usage_gate=None,  # fast path: real invoke_with_cap_retry, real forwarding
+        )
+
+        await agent._call_claude_cli(prompt='hi', tools=[])
+
+    mock_agent.assert_called_once()
+    call_kwargs = mock_agent.call_args.kwargs
+    assert call_kwargs['strict_mcp_config'] is True
+    assert call_kwargs['mcp_config'] == {'mcpServers': {}}
 
 
 # Shared by the two resume-prompt tests below: turn 1 calls `my_tool(x=7)`,
