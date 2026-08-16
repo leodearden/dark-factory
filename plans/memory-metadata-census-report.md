@@ -15,14 +15,14 @@ Coverage is **complete**: every category scrolled as many points as `count_by_me
 
 | project | collection | collection points | counted | residue | complete |
 | --- | --- | ---: | ---: | ---: | --- |
-| `dark_factory` | `fused_dark_factory` | 23,077 | 23,077 | +0 | yes |
+| `dark_factory` | `fused_dark_factory` | 23,297 | 23,297 | +0 | yes |
 | `reify` | `fused_reify` | 31,315 | 31,315 | +0 | yes |
 
 | project | category | expected | recount | scrolled | delta |
 | --- | --- | ---: | ---: | ---: | ---: |
-| `dark_factory` | `observations_and_summaries` | 17,652 | 17,652 | 17,652 | +0 |
-| `dark_factory` | `preferences_and_norms` | 1,492 | 1,492 | 1,492 | +0 |
-| `dark_factory` | `procedural_knowledge` | 3,932 | 3,932 | 3,932 | +0 |
+| `dark_factory` | `observations_and_summaries` | 17,741 | 17,741 | 17,741 | +0 |
+| `dark_factory` | `preferences_and_norms` | 1,518 | 1,518 | 1,518 | +0 |
+| `dark_factory` | `procedural_knowledge` | 4,037 | 4,037 | 4,037 | +0 |
 | `dark_factory` | `decisions_and_rationale` | 1 | 1 | 1 | +0 |
 | `dark_factory` | `entities_and_relations` | 0 | 0 | 0 | +0 |
 | `dark_factory` | `temporal_facts` | 0 | 0 | 0 | +0 |
@@ -43,9 +43,9 @@ On the **(all)** row the three canonical columns count (project, topic) CELLS �
 
 | scope | records | `topic` present | coverage | distinct topics | 1 canonical | 0 canonical | >1 canonical |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `dark_factory` | 23,077 | 203 | 0.8797% | 142 | 3 | 139 | 0 |
+| `dark_factory` | 23,297 | 203 | 0.8714% | 142 | 3 | 139 | 0 |
 | `reify` | 31,315 | 380 | 1.2135% | 280 | 21 | 259 | 0 |
-| **(all)** | 54,392 | 583 | 1.0718% | 420 | 24 | 398 | 0 |
+| **(all)** | 54,612 | 583 | 1.0675% | 420 | 24 | 398 | 0 |
 
 ### Canonical uniqueness
 
@@ -234,19 +234,72 @@ Registry topics: **32** · exactly one canonical: **19** · zero: **13** · more
 
 Movement since the most recent prior run in `plans/memory-metadata-coverage-history.json`.
 
-_No baseline — no prior run is recorded in the coverage history: this is the first recorded run, so there is nothing to compare against._
+Baseline: `2026-08-16T05:04:36+00:00`.
+
+| project | column | before | after | delta |
+| --- | --- | ---: | ---: | ---: |
+| `dark_factory` | `records` | 23,077 | 23,297 | +220 |
+| `dark_factory` | `topic_present` | 203 | 203 | 0 |
+| `dark_factory` | `topic_coverage_pct` | 0.8797 | 0.8714 | -0.0083 |
+| `dark_factory` | `distinct_topics` | 142 | 142 | 0 |
+| `dark_factory` | `topics_with_one_canonical` | 3 | 3 | 0 |
+| `dark_factory` | `topics_with_zero_canonical` | 139 | 139 | 0 |
+| `dark_factory` | `topics_with_multiple_canonical` | 0 | 0 | 0 |
+| `dark_factory` | `canonical_true` | 3 | 3 | 0 |
+| `dark_factory` | `canonical_true_without_topic` | 0 | 0 | 0 |
+| `dark_factory` | `slug_conforming` | 81 | 81 | 0 |
+| `dark_factory` | `slug_non_conforming` | 61 | 61 | 0 |
+| `dark_factory` | `canonical_slug_conforming` | 3 | 3 | 0 |
+| `dark_factory` | `canonical_slug_non_conforming` | 0 | 0 | 0 |
+| `dark_factory` | `registry_topics_total` | 12 | 12 | 0 |
+| `dark_factory` | `registry_topics_with_exactly_one_canonical` | 1 | 1 | 0 |
+| `dark_factory` | `registry_topics_with_zero_canonical` | 11 | 11 | 0 |
+| `dark_factory` | `registry_topics_with_multiple_canonical` | 0 | 0 | 0 |
+| `reify` | `records` | 31,315 | 31,315 | 0 |
+| `reify` | `topic_present` | 380 | 380 | 0 |
+| `reify` | `topic_coverage_pct` | 1.2135 | 1.2135 | 0 |
+| `reify` | `distinct_topics` | 280 | 280 | 0 |
+| `reify` | `topics_with_one_canonical` | 21 | 21 | 0 |
+| `reify` | `topics_with_zero_canonical` | 259 | 259 | 0 |
+| `reify` | `topics_with_multiple_canonical` | 0 | 0 | 0 |
+| `reify` | `canonical_true` | 21 | 21 | 0 |
+| `reify` | `canonical_true_without_topic` | 0 | 0 | 0 |
+| `reify` | `slug_conforming` | 227 | 227 | 0 |
+| `reify` | `slug_non_conforming` | 53 | 53 | 0 |
+| `reify` | `canonical_slug_conforming` | 21 | 21 | 0 |
+| `reify` | `canonical_slug_non_conforming` | 0 | 0 | 0 |
+| `reify` | `registry_topics_total` | 20 | 20 | 0 |
+| `reify` | `registry_topics_with_exactly_one_canonical` | 18 | 18 | 0 |
+| `reify` | `registry_topics_with_zero_canonical` | 2 | 2 | 0 |
+| `reify` | `registry_topics_with_multiple_canonical` | 0 | 0 | 0 |
+
+### Registry topic regrowth
+
+Scoped to the committed topic registry (the accountable target set) -- the only per-topic state the nightly history carries, since the live distinct-topic population is unbounded. Corpus-wide topic movement is trended through the distinct_topics / slug_non_conforming columns instead.
+
+#### Lost their `canonical: true`
+
+_(none)_
+
+#### Grew in member records
+
+_(none)_
+
+#### Newly registered targets
+
+_(none)_
 
 ## Record counts
 
 | project | category | records |
 | --- | --- | ---: |
-| `dark_factory` | `observations_and_summaries` | 17,652 |
-| `dark_factory` | `preferences_and_norms` | 1,492 |
-| `dark_factory` | `procedural_knowledge` | 3,932 |
+| `dark_factory` | `observations_and_summaries` | 17,741 |
+| `dark_factory` | `preferences_and_norms` | 1,518 |
+| `dark_factory` | `procedural_knowledge` | 4,037 |
 | `dark_factory` | `decisions_and_rationale` | 1 |
 | `dark_factory` | `entities_and_relations` | 0 |
 | `dark_factory` | `temporal_facts` | 0 |
-| `dark_factory` | **(all)** | **23,077** |
+| `dark_factory` | **(all)** | **23,297** |
 | `reify` | `observations_and_summaries` | 25,117 |
 | `reify` | `preferences_and_norms` | 1,614 |
 | `reify` | `procedural_knowledge` | 4,505 |
@@ -254,37 +307,37 @@ _No baseline — no prior run is recorded in the coverage history: this is the f
 | `reify` | `entities_and_relations` | 45 |
 | `reify` | `temporal_facts` | 18 |
 | `reify` | **(all)** | **31,315** |
-| **(all)** | **(all)** | **54,392** |
+| **(all)** | **(all)** | **54,612** |
 
 ## Grand total
 
-Records: **54,392**
+Records: **54,612**
 
 #### Top-level metadata key population
 
 | key | count |
 | --- | ---: |
-| `category` | 54,392 |
-| `created_at` | 54,392 |
-| `data` | 54,392 |
-| `hash` | 54,392 |
-| `user_id` | 54,392 |
-| `updated_at` | 50,653 |
-| `agent_id` | 39,344 |
-| `role` | 31,655 |
-| `task_id` | 19,537 |
-| `source` | 16,947 |
-| `transition` | 16,072 |
-| `_causation_id` | 8,502 |
-| `_deferred` | 8,490 |
+| `category` | 54,612 |
+| `created_at` | 54,612 |
+| `data` | 54,612 |
+| `hash` | 54,612 |
+| `user_id` | 54,612 |
+| `updated_at` | 50,873 |
+| `agent_id` | 39,508 |
+| `role` | 31,875 |
+| `task_id` | 19,597 |
+| `source` | 17,003 |
+| `transition` | 16,128 |
+| `_causation_id` | 8,558 |
+| `_deferred` | 8,546 |
 | `run_id` | 4,515 |
 | `stage` | 2,866 |
-| `kind` | 2,605 |
-| `stage2_suppress` | 2,139 |
-| `echo_used_provenance` | 1,814 |
+| `kind` | 2,606 |
+| `stage2_suppress` | 2,195 |
+| `echo_used_provenance` | 1,870 |
 | `topic` | 583 |
 | `task_ids` | 567 |
-| `commit` | 453 |
+| `commit` | 455 |
 | `memories_deleted` | 364 |
 | `flag_type` | 327 |
 | `memories_added` | 321 |
@@ -305,9 +358,9 @@ Records: **54,392**
 | `src_entity` | 236 |
 | `cycle` | 233 |
 | `recon_run_id` | 224 |
+| `escalation_id` | 218 |
 | `related_tasks` | 216 |
 | `date` | 215 |
-| `escalation_id` | 214 |
 | `type` | 206 |
 | `tasks_modified` | 195 |
 | `supersedes` | 178 |
@@ -323,7 +376,7 @@ Records: **54,392**
 | `entity_refresh_failed_uuids` | 103 |
 | `tasks` | 103 |
 | `tasks_created` | 101 |
-| `files` | 97 |
+| `files` | 98 |
 | `remediation_finding` | 94 |
 | `related_task_id` | 92 |
 | `related_task_ids` | 89 |
@@ -800,6 +853,7 @@ _Showing top 400 of 1,754 distinct values — this markdown view is **truncated*
 | `consolidation_residual` | 1 |
 | `contradiction_resolved` | 1 |
 | `coordination_resolved` | 1 |
+| `corpus_shape_measurement` | 1 |
 | `correction_note` | 1 |
 | `corrective_note` | 1 |
 | `corrective_stage2_summary` | 1 |
@@ -1057,13 +1111,13 @@ _Showing top 400 of 1,754 distinct values — this markdown view is **truncated*
 | `verify_mechanism_fact` | 1 |
 | `zombie_reset_bypass_rule` | 1 |
 
-`kind` missing: **51,787** record(s).
+`kind` missing: **52,006** record(s).
 
 #### `supersedes` shapes
 
 | shape | count |
 | --- | ---: |
-| `absent` | 54,214 |
+| `absent` | 54,434 |
 | `list` | 92 |
 | `scalar` | 86 |
 
@@ -1512,7 +1566,7 @@ _Showing top 400 of 420 distinct values — this markdown view is **truncated**;
 
 | source | count |
 | --- | ---: |
-| `targeted_reconciliation` | 15,708 |
+| `targeted_reconciliation` | 15,764 |
 | `consolidation` | 122 |
 | `reconciliation_stage2` | 79 |
 | `stage1_cycle_summary` | 79 |
@@ -1705,7 +1759,7 @@ _Showing top 400 of 420 distinct values — this markdown view is **truncated**;
 
 | source | count |
 | --- | ---: |
-| `targeted_reconciliation` | 15,693 |
+| `targeted_reconciliation` | 15,749 |
 | `consolidation` | 121 |
 | `reconciliation_stage2` | 79 |
 | `steward-triage` | 79 |
@@ -1877,33 +1931,33 @@ _Showing top 400 of 420 distinct values — this markdown view is **truncated**;
 
 ### All categories
 
-Records: **23,077**
+Records: **23,297**
 
 #### Top-level metadata key population
 
 | key | count |
 | --- | ---: |
-| `category` | 23,077 |
-| `created_at` | 23,077 |
-| `data` | 23,077 |
-| `hash` | 23,077 |
-| `user_id` | 23,077 |
-| `updated_at` | 21,815 |
-| `agent_id` | 17,864 |
-| `role` | 13,888 |
-| `task_id` | 6,982 |
-| `source` | 5,832 |
-| `transition` | 5,574 |
-| `_causation_id` | 3,189 |
-| `_deferred` | 3,181 |
+| `category` | 23,297 |
+| `created_at` | 23,297 |
+| `data` | 23,297 |
+| `hash` | 23,297 |
+| `user_id` | 23,297 |
+| `updated_at` | 22,035 |
+| `agent_id` | 18,028 |
+| `role` | 14,108 |
+| `task_id` | 7,042 |
+| `source` | 5,888 |
+| `transition` | 5,630 |
+| `_causation_id` | 3,245 |
+| `_deferred` | 3,237 |
 | `run_id` | 2,058 |
-| `stage2_suppress` | 1,227 |
-| `echo_used_provenance` | 1,209 |
+| `stage2_suppress` | 1,283 |
+| `echo_used_provenance` | 1,265 |
 | `stage` | 1,103 |
-| `kind` | 1,018 |
+| `kind` | 1,019 |
 | `topic` | 203 |
 | `task_ids` | 175 |
-| `commit` | 172 |
+| `commit` | 174 |
 | `memories_deleted` | 172 |
 | `memories_added` | 156 |
 | `flag_type` | 152 |
@@ -1928,9 +1982,9 @@ Records: **23,077**
 | `cycle_summary` | 96 |
 | `flags_emitted` | 95 |
 | `cycle_date` | 85 |
+| `escalation_id` | 85 |
 | `flag_id` | 84 |
 | `date` | 83 |
-| `escalation_id` | 81 |
 | `flag_for_stage2` | 80 |
 | `tasks_created` | 80 |
 | `entity_refresh_failed_uuids` | 79 |
@@ -1988,10 +2042,10 @@ Records: **23,077**
 | `corrective_for_run` | 14 |
 | `cycle` | 14 |
 | `db_path` | 14 |
+| `files` | 14 |
 | `flags_reviewed` | 14 |
 | `tasks_updated` | 14 |
 | `entity_summaries_refreshed` | 13 |
-| `files` | 13 |
 | `findings_resolved` | 13 |
 | `task_ref` | 13 |
 | `actionable` | 12 |
@@ -2358,6 +2412,7 @@ _Showing top 400 of 946 distinct values — this markdown view is **truncated**;
 | `consolidated_observation` | 1 |
 | `consolidation_outcome` | 1 |
 | `consolidation_pointer` | 1 |
+| `corpus_shape_measurement` | 1 |
 | `corrective_stage2_summary` | 1 |
 | `corroborating_evidence` | 1 |
 | `cross_project_routing_note` | 1 |
@@ -2455,13 +2510,13 @@ _Showing top 400 of 946 distinct values — this markdown view is **truncated**;
 | `verification_note` | 1 |
 | `verified_fix_confirmation` | 1 |
 
-`kind` missing: **22,059** record(s).
+`kind` missing: **22,278** record(s).
 
 #### `supersedes` shapes
 
 | shape | count |
 | --- | ---: |
-| `absent` | 23,011 |
+| `absent` | 23,231 |
 | `list` | 33 |
 | `scalar` | 33 |
 
@@ -2646,7 +2701,7 @@ _Showing top 400 of 946 distinct values — this markdown view is **truncated**;
 
 | source | count |
 | --- | ---: |
-| `targeted_reconciliation` | 5,476 |
+| `targeted_reconciliation` | 5,532 |
 | `remediation_run` | 28 |
 | `consolidation` | 25 |
 | `steward-triage` | 19 |
@@ -2737,7 +2792,7 @@ _Showing top 400 of 946 distinct values — this markdown view is **truncated**;
 
 | source | count |
 | --- | ---: |
-| `targeted_reconciliation` | 5,470 |
+| `targeted_reconciliation` | 5,526 |
 | `remediation_run` | 26 |
 | `consolidation` | 25 |
 | `steward-triage` | 19 |
@@ -2821,30 +2876,30 @@ _Showing top 400 of 946 distinct values — this markdown view is **truncated**;
 
 ### `dark_factory` / `observations_and_summaries`
 
-Records: **17,652**
+Records: **17,741**
 
 #### Top-level metadata key population
 
 | key | count |
 | --- | ---: |
-| `category` | 17,652 |
-| `created_at` | 17,652 |
-| `data` | 17,652 |
-| `hash` | 17,652 |
-| `user_id` | 17,652 |
-| `updated_at` | 16,511 |
-| `agent_id` | 12,444 |
-| `role` | 9,168 |
-| `task_id` | 6,882 |
-| `source` | 5,728 |
-| `transition` | 5,572 |
-| `_causation_id` | 3,183 |
-| `_deferred` | 3,181 |
+| `category` | 17,741 |
+| `created_at` | 17,741 |
+| `data` | 17,741 |
+| `hash` | 17,741 |
+| `user_id` | 17,741 |
+| `updated_at` | 16,600 |
+| `agent_id` | 12,477 |
+| `role` | 9,257 |
+| `task_id` | 6,939 |
+| `source` | 5,784 |
+| `transition` | 5,628 |
+| `_causation_id` | 3,239 |
+| `_deferred` | 3,237 |
 | `run_id` | 2,007 |
-| `stage2_suppress` | 1,222 |
-| `echo_used_provenance` | 1,209 |
+| `stage2_suppress` | 1,278 |
+| `echo_used_provenance` | 1,265 |
 | `stage` | 1,103 |
-| `kind` | 978 |
+| `kind` | 979 |
 | `memories_deleted` | 172 |
 | `task_ids` | 165 |
 | `commit` | 162 |
@@ -2883,7 +2938,7 @@ Records: **17,652**
 | `corrective_write` | 55 |
 | `remediation_run` | 54 |
 | `severity` | 54 |
-| `escalation_id` | 48 |
+| `escalation_id` | 49 |
 | `action` | 47 |
 | `flag_ids_processed` | 46 |
 | `flags_processed` | 46 |
@@ -3292,6 +3347,7 @@ _Showing top 400 of 814 distinct values — this markdown view is **truncated**;
 | `completion_note_unknown_provenance` | 1 |
 | `consolidated_observation` | 1 |
 | `consolidation_outcome` | 1 |
+| `corpus_shape_measurement` | 1 |
 | `corrective_stage2_summary` | 1 |
 | `corroborating_evidence` | 1 |
 | `cross_project_routing_note` | 1 |
@@ -3375,13 +3431,13 @@ _Showing top 400 of 814 distinct values — this markdown view is **truncated**;
 | `verification_note` | 1 |
 | `verified_fix_confirmation` | 1 |
 
-`kind` missing: **16,674** record(s).
+`kind` missing: **16,762** record(s).
 
 #### `supersedes` shapes
 
 | shape | count |
 | --- | ---: |
-| `absent` | 17,620 |
+| `absent` | 17,709 |
 | `scalar` | 26 |
 | `list` | 6 |
 
@@ -3479,7 +3535,7 @@ _Showing top 400 of 814 distinct values — this markdown view is **truncated**;
 
 | source | count |
 | --- | ---: |
-| `targeted_reconciliation` | 5,466 |
+| `targeted_reconciliation` | 5,522 |
 | `remediation_run` | 19 |
 | `reconciliation_stage2` | 17 |
 | `stage2_reconciliation` | 17 |
@@ -3545,7 +3601,7 @@ _Showing top 400 of 814 distinct values — this markdown view is **truncated**;
 
 | source | count |
 | --- | ---: |
-| `targeted_reconciliation` | 5,460 |
+| `targeted_reconciliation` | 5,516 |
 | `reconciliation_stage2` | 17 |
 | `remediation_run` | 17 |
 | `stage2_reconciliation` | 17 |
@@ -3605,24 +3661,24 @@ _Showing top 400 of 814 distinct values — this markdown view is **truncated**;
 
 ### `dark_factory` / `preferences_and_norms`
 
-Records: **1,492**
+Records: **1,518**
 
 #### Top-level metadata key population
 
 | key | count |
 | --- | ---: |
-| `category` | 1,492 |
-| `created_at` | 1,492 |
-| `data` | 1,492 |
-| `hash` | 1,492 |
-| `user_id` | 1,492 |
-| `agent_id` | 1,488 |
-| `updated_at` | 1,394 |
-| `role` | 1,077 |
+| `category` | 1,518 |
+| `created_at` | 1,518 |
+| `data` | 1,518 |
+| `hash` | 1,518 |
+| `user_id` | 1,518 |
+| `agent_id` | 1,514 |
+| `updated_at` | 1,420 |
+| `role` | 1,103 |
 | `source` | 53 |
 | `topic` | 23 |
-| `escalation_id` | 19 |
-| `task_id` | 18 |
+| `escalation_id` | 22 |
+| `task_id` | 21 |
 | `run_id` | 15 |
 | `spawned_from` | 11 |
 | `task_ref` | 7 |
@@ -3630,13 +3686,14 @@ Records: **1,492**
 | `date` | 6 |
 | `kind` | 6 |
 | `superseded_by` | 6 |
+| `commit` | 5 |
 | `merged_from` | 5 |
 | `cycle_id` | 4 |
 | `replaces` | 4 |
 | `source_of_truth` | 4 |
 | `applies_to` | 3 |
-| `commit` | 3 |
 | `context` | 3 |
+| `files` | 3 |
 | `module` | 3 |
 | `origin_event` | 3 |
 | `parent_task` | 3 |
@@ -3644,7 +3701,6 @@ Records: **1,492**
 | `consolidated_from` | 2 |
 | `consolidates` | 2 |
 | `corrected_at` | 2 |
-| `files` | 2 |
 | `related_task` | 2 |
 | `reviewer` | 2 |
 | `supersedes` | 2 |
@@ -3696,13 +3752,13 @@ Records: **1,492**
 | `consolidated_norm` | 1 |
 | `reconciliation_synthesis` | 1 |
 
-`kind` missing: **1,486** record(s).
+`kind` missing: **1,512** record(s).
 
 #### `supersedes` shapes
 
 | shape | count |
 | --- | ---: |
-| `absent` | 1,490 |
+| `absent` | 1,516 |
 | `list` | 1 |
 | `scalar` | 1 |
 
@@ -3801,20 +3857,20 @@ Records: **1,492**
 
 ### `dark_factory` / `procedural_knowledge`
 
-Records: **3,932**
+Records: **4,037**
 
 #### Top-level metadata key population
 
 | key | count |
 | --- | ---: |
-| `category` | 3,932 |
-| `created_at` | 3,932 |
-| `data` | 3,932 |
-| `hash` | 3,932 |
-| `user_id` | 3,932 |
-| `agent_id` | 3,931 |
-| `updated_at` | 3,909 |
-| `role` | 3,642 |
+| `category` | 4,037 |
+| `created_at` | 4,037 |
+| `data` | 4,037 |
+| `hash` | 4,037 |
+| `user_id` | 4,037 |
+| `agent_id` | 4,036 |
+| `updated_at` | 4,014 |
+| `role` | 3,747 |
 | `topic` | 93 |
 | `task_id` | 81 |
 | `source` | 50 |
@@ -4029,13 +4085,13 @@ Records: **3,932**
 | `task_dispatch_diagnosis` | 1 |
 | `task_routing_convention` | 1 |
 
-`kind` missing: **3,898** record(s).
+`kind` missing: **4,003** record(s).
 
 #### `supersedes` shapes
 
 | shape | count |
 | --- | ---: |
-| `absent` | 3,900 |
+| `absent` | 4,005 |
 | `list` | 26 |
 | `scalar` | 6 |
 

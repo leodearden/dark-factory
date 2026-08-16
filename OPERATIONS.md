@@ -1349,6 +1349,24 @@ nightly timer appending a full topic breakdown would grow a committed file
 without bound. Retention is capped and any drop is **disclosed in the file**
 rather than silently truncated.
 
+**What committing all three nightly costs, stated rather than assumed.** The
+two report artifacts are full rewrites every run (measured: JSON 1.04 MiB /
+markdown 223 KiB raw; 90 KiB / 47 KiB zlib-compressed, which is what git
+stores loose), against 5.3 KiB for the history. Counts shift nightly on a
+live corpus, so a quiet night is rare and the job writes roughly **140 KiB
+of new loose object content per night, ~50 MiB per year** before `git gc`
+delta-compresses the near-identical successive versions. That is deliberate,
+not an oversight: the JSON is a **cited, read** artifact — leaf beta's
+grandfather list and `fused-memory/scripts/memory_eval_retrieval_probe.py`
+(`DEFAULT_CENSUS_PATH`) both read it from the repo, so a snapshot that is
+only regenerated on demand would be silently stale for whoever reads it
+next. Not committing them is worse still: the wrapper regenerates them in
+the machine-operated `project_root` checkout regardless, so skipping the
+commit leaves that checkout carrying an uncommitted diff every morning. If
+the growth ever needs bounding, the `ARTIFACTS` array in the wrapper is the
+single place that decides which paths are committed — change it there, and
+update this paragraph.
+
 **The regen command** — what the report's own `regen` line reproduces, and
 the exact invocation the wrapper makes:
 
