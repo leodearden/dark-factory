@@ -28,6 +28,7 @@ import digest as mod
 import pytest
 import yaml
 from legibility import inventory as inventory_mod
+from shared.cli_invoke import CAP_HIT_RESUME_PROMPT
 
 
 def _assistant(*blocks):
@@ -1479,17 +1480,21 @@ def _split_frontmatter(digest):
 
 # ---------------------------------------------------------------------------
 # is_harness_injected_turn / iter_user_turns exclusion -- R1 (confusion
-# census 2026-07-24 Sec 4): a harness-injected briefing turn (the
-# orchestrator's '# Context' + '## Agent Identity' + '# Task' preamble, or
-# the trickle coder's system-prompt preamble) is typed into the transcript
-# as ordinary user-role text (isMeta=False -- it really is the first "user"
-# turn Claude Code sees), so it was previously indistinguishable from a
-# genuine human correction: it inflated both the gold user_corrections
-# section and score's n_user_turns component. Exclusion is by CONTENT (all
-# three headings must co-occur, line-anchored, mirroring
+# census 2026-07-24 Sec 4): a harness-injected turn -- the orchestrator's
+# '# Context' + '## Agent Identity' + '# Task' briefing preamble, the
+# trickle coder's system-prompt preamble, or the harness's
+# post-interruption resume prompt (e.g. after a usage-limit cap) -- is
+# typed into the transcript as ordinary user-role text (isMeta=False -- it
+# really is the first "user" turn Claude Code sees), so it was previously
+# indistinguishable from a genuine human correction: it inflated both the
+# gold user_corrections section and score's n_user_turns component. Three
+# shapes are covered, not two: the briefing preamble is excluded by CONTENT
+# co-occurrence (all three headings must co-occur, line-anchored, mirroring
 # ORCHESTRATED_TASK_MARKERS' all() guard) so an ordinary human turn that
 # merely mentions one heading, or quotes one mid-sentence, is never
-# over-excluded.
+# over-excluded; the trickle-coder preamble and the resume prompt are each
+# excluded by a plain case-insensitive substring match
+# (HARNESS_PROMPT_MARKERS).
 # ---------------------------------------------------------------------------
 
 def _briefing_text(body_filler='Project overview and recent decisions go here.'):
@@ -1719,6 +1724,39 @@ class TestHarnessInjectedTurnFilter:
         with_briefing = [_user_text(_briefing_text())] + base
 
         assert mod.signal_counts(with_briefing) == mod.signal_counts(base)
+
+    def test_usage_limit_resume_prompt_is_excluded_lockstep(self):
+        # LOCKSTEP: asserted against the canonical constant, not a restated
+        # literal, so a harness rewording of CAP_HIT_RESUME_PROMPT turns
+        # this suite red instead of silently drifting out of coverage.
+        assert mod.is_harness_injected_turn(CAP_HIT_RESUME_PROMPT) is True
+
+    def test_usage_limit_resume_prompt_excluded_from_iter_user_turns(self):
+        # Reproduces the sighting verbatim: the resume prompt appears both
+        # before and after a genuine correction. Neither occurrence must
+        # surface, while the genuine correction survives with its original
+        # record index preserved.
+        records = [
+            _user_text(CAP_HIT_RESUME_PROMPT),
+            _user_text('please fix the bug'),
+            _user_text(CAP_HIT_RESUME_PROMPT),
+        ]
+
+        turns = mod.iter_user_turns(records)
+
+        assert [t['text'] for t in turns] == ['please fix the bug']
+        assert [t['index'] for t in turns] == [1]
+
+    def test_usage_limit_mentioned_in_passing_is_not_excluded(self):
+        # Must NOT regress: a genuine human turn that merely MENTIONS a
+        # usage limit in passing -- not the harness's exact resume prompt
+        # -- stays in the gold bucket.
+        records = [_user_text('we keep hitting a usage limit, can you shorten the run?')]
+
+        turns = mod.iter_user_turns(records)
+
+        assert len(turns) == 1
+        assert turns[0]['text'] == 'we keep hitting a usage limit, can you shorten the run?'
 
 
 class TestRenderDigest:
