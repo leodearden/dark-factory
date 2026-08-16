@@ -10070,6 +10070,27 @@ class GitOps:
         reaper — exactly as for ``'skipped_lease_held'`` — and must never
         reach cleanup's force-rmtree fallback.
 
+        **Unrunnable git removal**: :func:`_run` likewise raises before the
+        child ever executes — :class:`WorktreeMissing` (a
+        ``FileNotFoundError``, hence an ``OSError``) when ``project_root``
+        has vanished, or a bare ``OSError`` from
+        ``asyncio.create_subprocess_exec`` under EMFILE/ENOMEM. That is the
+        SAME fd/memory exhaustion that can fail the lock open, so both
+        escapes co-occur; this method catches it too, logs a single WARNING
+        and returns ``'failed'``. ``'failed'`` — not a second skip literal —
+        because by then the flock IS held: the lease acquire has already
+        proved no live holder, which is precisely what licenses cleanup's
+        force-rmtree, and "git's removal did not succeed, the tree survives"
+        is exactly what ``'failed'`` already means. Both catches are narrow
+        (``OSError`` only) so ``CancelledError`` and programmer errors stay
+        loud. Together they make this method total with respect to
+        ``OSError``: every other call in its body — :func:`lane_lock_path`
+        (pure path math), :meth:`Path.exists`/:meth:`Path.resolve` (which
+        swallow ``OSError`` by contract), :func:`_register_held_lane_lock`,
+        :func:`read_lock_holder_pgid` and
+        :func:`_release_and_forget_held_lane_lock` — already suppresses its
+        own.
+
         *reason* is a short caller-supplied label (e.g. the calling
         function's name) recorded in logs for diagnostics.
         """
@@ -10129,10 +10150,38 @@ class GitOps:
             if not path.exists():
                 unlink_lock = True
                 return 'not_present'
-            rc, _, err = await _run(
-                ['git', 'worktree', 'remove', str(path), '--force'],
-                cwd=self.project_root,
-            )
+            try:
+                rc, _, err = await _run(
+                    ['git', 'worktree', 'remove', str(path), '--force'],
+                    cwd=self.project_root,
+                )
+            except OSError as exc:
+                # The SECOND escape from cleanup_merge_worktree's never-raises
+                # contract: _run can raise before the child ever executes --
+                # WorktreeMissing (a FileNotFoundError, so an OSError) when
+                # project_root has vanished, or a bare OSError out of
+                # asyncio.create_subprocess_exec under EMFILE/ENOMEM. EMFILE is
+                # the pointed case: fd exhaustion fails the lock open above AND
+                # this spawn from one root cause, so guarding only the former
+                # would leave the contract false under exactly the condition
+                # that motivated it.
+                #
+                # Degrade to 'failed', NOT to 'skipped_lock_error': we HOLD the
+                # flock here, so the lease acquire already proved there is no
+                # live holder -- the exact premise that licenses cleanup's
+                # force-rmtree fallback. 'failed' is also the honest reading of
+                # this state ("git's removal did not succeed, the tree
+                # survives"), so it needs no new outcome literal. OSError ONLY,
+                # never bare Exception: CancelledError must keep propagating,
+                # and degrading a programmer error to 'failed' would be worse
+                # than raising, since 'failed' routes to a destructive fallback.
+                logger.warning(
+                    'remove_merge_worktree_guarded: git worktree remove could not '
+                    'run for %s (reason=%s): %s -- treating as failed; the lease '
+                    'was held, so the tree is unleased and the caller may reclaim it',
+                    path, reason, exc,
+                )
+                return 'failed'
             if rc == 0:
                 logger.info(
                     'remove_merge_worktree_guarded: removed %s (reason=%s)', path, reason,
@@ -10214,9 +10263,25 @@ class GitOps:
         ``'skipped_*'``, including ``'skipped_lock_error'``) returns
         immediately, so a live-leased tree, a tree whose lease could not be
         established, and the warm persistent lanes are NEVER force-removed.
-        Never raises — the primitive absorbs the one escape, an ``OSError``
-        from preparing the lane lock file, into ``'skipped_lock_error'``;
-        idempotent — a re-call sees the tree already gone → primitive
+        Never raises. The primitive absorbs BOTH ``OSError`` escapes on the
+        way here — preparing the lane lock file (→ ``'skipped_lock_error'``,
+        tree retained) and a ``git worktree remove`` that cannot spawn at
+        all, i.e. :class:`WorktreeMissing` or EMFILE/ENOMEM out of
+        ``create_subprocess_exec`` (→ ``'failed'``, lease already confirmed,
+        so the fallback below is licensed). The two matter together because
+        fd exhaustion fails both from one root cause. Downstream of the
+        primitive nothing else can raise either: ``shutil.rmtree`` runs with
+        ``ignore_errors=True``, the ``.lock`` unlink is wrapped in
+        :func:`contextlib.suppress`, and both
+        :meth:`_refuse_foreign_band` and :meth:`_prune_registrations` carry
+        their own documented never-raise guarantees. Only a
+        ``BaseException`` deliberately let through — notably
+        ``CancelledError``, and a programmer error escaping the narrow
+        ``except OSError`` guards — still propagates, which is the intended
+        loud-over-silent behaviour and is pinned by
+        ``test_non_oserror_from_git_removal_propagates``.
+
+        Idempotent — a re-call sees the tree already gone → primitive
         ``'not_present'`` → early return.
         """
         outcome = await self.remove_merge_worktree_guarded(
