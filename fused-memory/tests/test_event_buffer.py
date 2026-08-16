@@ -694,6 +694,156 @@ async def test_cleanup_drained(tmp_path):
         await buf.close()
 
 
+# ── Hourly arrival rollup (task 3049) ────────────────────────────────
+#
+# cleanup_drained is the ONLY `DELETE FROM event_buffer` in the codebase — the
+# single chokepoint where arrival history is destroyed.  Rolling drained rows
+# up into event_arrival_hourly *inside the same transaction as the DELETE* is
+# what makes the inflow count exact: a row is either still live in
+# event_buffer or already in the aggregate, never both and never neither.
+
+
+async def _arrival_rollup(buf) -> dict[tuple[str, str, str], int]:
+    """Read event_arrival_hourly as {(project_id, hour_bucket, event_type): count}."""
+    db = buf._require_db()
+    async with db.execute(
+        'SELECT project_id, hour_bucket, event_type, event_count FROM event_arrival_hourly'
+    ) as cursor:
+        rows = await cursor.fetchall()
+    return {
+        (r['project_id'], r['hour_bucket'], r['event_type']): r['event_count']
+        for r in rows
+    }
+
+
+@pytest.mark.asyncio
+async def test_cleanup_drained_rolls_arrivals_up_per_hour_and_event_type(tmp_path):
+    """Drained rows are aggregated per (project, UTC hour, event_type) before deletion."""
+    buf = EventBuffer(db_path=tmp_path / 'rollup.db')
+    await buf.initialize()
+    try:
+        # Two distinct UTC hours, two distinct event types.
+        hour_a = datetime(2026, 7, 25, 13, 30, tzinfo=UTC)
+        hour_b = datetime(2026, 7, 25, 14, 5, tzinfo=UTC)
+        for _ in range(3):
+            await buf.push(_make_event(
+                timestamp=hour_a, event_type=EventType.task_status_changed))
+        await buf.push(_make_event(timestamp=hour_a, event_type=EventType.memory_added))
+        for _ in range(2):
+            await buf.push(_make_event(
+                timestamp=hour_b, event_type=EventType.task_status_changed))
+
+        await buf.drain('test-project')
+        deleted = await buf.cleanup_drained(max_age_seconds=0)
+        assert deleted == 6
+
+        assert await _arrival_rollup(buf) == {
+            ('test-project', '2026-07-25T13', 'task_status_changed'): 3,
+            ('test-project', '2026-07-25T13', 'memory_added'): 1,
+            ('test-project', '2026-07-25T14', 'task_status_changed'): 2,
+        }
+    finally:
+        await buf.close()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_drained_rollup_accumulates_across_sweeps(tmp_path):
+    """A second sweep into the SAME bucket UPSERTs additively, never overwrites."""
+    buf = EventBuffer(db_path=tmp_path / 'rollup_accum.db')
+    await buf.initialize()
+    try:
+        hour = datetime(2026, 7, 25, 13, 30, tzinfo=UTC)
+
+        for _ in range(2):
+            await buf.push(_make_event(
+                timestamp=hour, event_type=EventType.task_modified))
+        await buf.drain('test-project')
+        await buf.cleanup_drained(max_age_seconds=0)
+        assert await _arrival_rollup(buf) == {
+            ('test-project', '2026-07-25T13', 'task_modified'): 2,
+        }
+
+        # Second batch, same hour bucket, same event type.
+        for _ in range(5):
+            await buf.push(_make_event(
+                timestamp=hour, event_type=EventType.task_modified))
+        await buf.drain('test-project')
+        await buf.cleanup_drained(max_age_seconds=0)
+
+        assert await _arrival_rollup(buf) == {
+            ('test-project', '2026-07-25T13', 'task_modified'): 7,
+        }
+    finally:
+        await buf.close()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_drained_rollup_skips_locked_projects(tmp_path):
+    """A locked project's rows are neither deleted NOR rolled up.
+
+    cleanup_drained already excludes locked projects from the DELETE.  The
+    rollup must honour the SAME exclusion, otherwise the skipped rows would be
+    counted now and counted AGAIN on the later sweep that actually deletes
+    them — double-counting the project's inflow.
+    """
+    buf = EventBuffer(db_path=tmp_path / 'rollup_locked.db')
+    await buf.initialize()
+    try:
+        hour = datetime(2026, 7, 25, 13, 30, tzinfo=UTC)
+        for _ in range(4):
+            await buf.push(_make_event(
+                project_id='locked-project', timestamp=hour,
+                event_type=EventType.memory_added))
+        await buf.drain('locked-project')
+
+        assert await buf.mark_run_active('locked-project') is True
+        assert await buf.cleanup_drained(max_age_seconds=0) == 0
+        assert await _arrival_rollup(buf) == {}
+
+        # Once the lock is released the SAME rows roll up exactly once.
+        await buf.mark_run_complete('locked-project')
+        assert await buf.cleanup_drained(max_age_seconds=0) == 4
+        assert await _arrival_rollup(buf) == {
+            ('locked-project', '2026-07-25T13', 'memory_added'): 4,
+        }
+    finally:
+        await buf.close()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_drained_rollup_ignores_still_buffered_rows(tmp_path):
+    """Only rows the DELETE actually removes are rolled up.
+
+    Still-`buffered` rows remain countable directly from event_buffer, so
+    rolling them up would double-count them once they are eventually drained.
+    """
+    buf = EventBuffer(db_path=tmp_path / 'rollup_buffered.db')
+    await buf.initialize()
+    try:
+        hour = datetime(2026, 7, 25, 13, 30, tzinfo=UTC)
+        await buf.push(_make_event(
+            timestamp=hour, event_type=EventType.memory_added))
+        await buf.drain('test-project')
+        # This one arrives after the drain and stays buffered.
+        await buf.push(_make_event(
+            timestamp=hour, event_type=EventType.memory_added))
+
+        assert await buf.cleanup_drained(max_age_seconds=0) == 1
+        assert await _arrival_rollup(buf) == {
+            ('test-project', '2026-07-25T13', 'memory_added'): 1,
+        }
+
+        db = buf._require_db()
+        async with db.execute(
+            "SELECT COUNT(*) AS cnt FROM event_buffer WHERE status = 'buffered'"
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        assert row['cnt'] == 1
+    finally:
+        await buf.close()
+
+
 # ── Deferred writes (cycle fence) ────────────────────────────────────
 
 
