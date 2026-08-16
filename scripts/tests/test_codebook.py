@@ -1000,6 +1000,45 @@ class TestMainCLI:
         assert len(reloaded["candidates"]) == 1
         assert mod.validate(reloaded) == []
 
+    def test_apply_skips_deletion_directive_record_without_aborting_batch(
+        self, tmp_path, capsys
+    ):
+        """A single deletion-shaped record must be skipped and counted like
+        a malformed JSON line — not abort the whole batch. dump() is AFTER
+        the per-line loop, so a NeverDeleteError escaping _cmd_apply
+        discarded every already-applied in-memory record along with the
+        records that came after the bad line."""
+        codebook_path, records_path = self._write_apply_fixtures(tmp_path)
+        good = json.loads(records_path.read_text(encoding="utf-8"))
+
+        bad = _match_record()
+        bad["matches"][0]["action"] = "delete"  # trips _reject_deletion_directive
+
+        # A second good record under a DIFFERENT session, so it is not
+        # deduped away by the session-keyed idempotency guard — its arrival
+        # proves the records AFTER the bad line were not discarded.
+        good_2 = copy.deepcopy(good)
+        good_2["session"] = "sess-2"
+
+        records_path.write_text(
+            "\n".join(json.dumps(r) for r in (good, bad, good_2)) + "\n",
+            encoding="utf-8",
+        )
+
+        ret = mod.main(["apply", str(codebook_path), str(records_path)])
+        captured = capsys.readouterr()
+
+        assert ret == 0
+        assert str(records_path) in captured.err
+        assert ":2:" in captured.err  # the offending line number
+        assert "deletion directive" in captured.err
+        assert "deletion_directive=1" in captured.out
+
+        reloaded = mod.load(codebook_path)
+        entry = next(e for e in reloaded["entries"] if e["id"] == "entry-a")
+        assert {s["session"] for s in entry["sightings"]} == {"sess-1", "sess-2"}
+        assert mod.validate(reloaded) == []
+
     def test_migrate_empty_file_fails_loudly_instead_of_crashing(self, tmp_path, capsys):
         """An empty codebook file loads via yaml.safe_load() as None.
         _cmd_migrate must report a clear error and return 1, not raise an
