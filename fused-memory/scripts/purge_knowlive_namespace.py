@@ -314,6 +314,12 @@ async def run(
     # to be permitted to purge. Same tradeoff the reference accepted
     # (sweep_toolcall_xml_leak.py: "Nothing was scanned and nothing was
     # mutated").
+    #
+    # What that saves is scoped to ``run``, and the message below says so
+    # rather than claiming a doomed --apply costs nothing: ``main`` has already
+    # constructed the MemoryService and awaited ``initialize()`` before this
+    # function is entered. Neither of those mutates, so the guarantee that
+    # matters -- no enumeration, no mutation -- is exactly the one claimed.
     if args.apply:
         try:
             assert_store_mutation_allowed(operation='purge_knowlive_namespace --apply')
@@ -322,9 +328,10 @@ async def run(
                 'purge_knowlive_namespace: --apply NOT started (fail-closed) -- this '
                 "process cannot write mem0's history directory, so a purge would "
                 'delete Qdrant points and then fail to write their history, and the '
-                'unbounded Graphiti DETACH DELETE cannot be undone at all. Nothing '
-                'was scanned and nothing was mutated. Route the purge through the '
-                'fused-memory MCP server (the unsandboxed owner of the store), or '
+                'unbounded Graphiti DETACH DELETE cannot be undone at all. Neither '
+                'namespace was enumerated and nothing was mutated. Route the purge '
+                'through the fused-memory MCP server (the unsandboxed owner of the '
+                'store), or '
                 're-run from an unsandboxed operator shell. To obtain the deletion '
                 'manifest safely from anywhere, re-run without --apply.'
             )

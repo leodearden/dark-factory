@@ -264,6 +264,13 @@ async def run(args: Any, qdrant_client: Any, collection_name: str) -> dict:
     # Gated on ``not dry_run`` so a read-only run stays pure-read and needs no
     # write capability at all -- the payload + classification report IS the
     # investigation, and it must remain obtainable from anywhere.
+    #
+    # The message below is scoped to what THIS function controls -- no payload
+    # retrieved, nothing mutated -- rather than claiming a doomed --apply costs
+    # nothing: ``main`` has already constructed the MemoryService, awaited
+    # ``initialize()``, resolved the collection name and opened the async
+    # Qdrant client before ``run`` is entered. None of that mutates, so the
+    # narrower claim is the true one and is the one made.
     if not dry_run:
         try:
             assert_store_mutation_allowed(operation='clear_malformed_empty_memory --apply')
@@ -271,9 +278,10 @@ async def run(args: Any, qdrant_client: Any, collection_name: str) -> dict:
             logger.error(
                 'clear_malformed_empty_memory: --apply NOT started (fail-closed) -- '
                 "this process cannot write mem0's history directory, so it is not a "
-                'process that may mutate the shared store. Nothing was read and '
-                'nothing was mutated. Route the deletion through the fused-memory '
-                'MCP server (the unsandboxed owner of the store), or re-run from an '
+                'process that may mutate the shared store. No payload was '
+                'retrieved and nothing was mutated. Route the deletion through the '
+                'fused-memory MCP server (the unsandboxed owner of the store), or '
+                're-run from an '
                 'unsandboxed operator shell. To inspect the record safely from '
                 'anywhere, re-run without --apply.'
             )

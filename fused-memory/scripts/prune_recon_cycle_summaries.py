@@ -698,6 +698,11 @@ async def run(
     # Placing it here also saves the dominant cost of a doomed run: the scan
     # loop issues one ``scroll_by_metadata`` plus a conditional
     # ``count_by_metadata`` PER PROJECT, and ``--project-id`` is optional.
+    # That saving is scoped to ``run``, and the message below is worded to
+    # match rather than claiming a doomed --apply costs nothing: ``main`` has
+    # already constructed the MemoryService and awaited ``initialize()`` before
+    # this function is entered. Neither mutates, so what is claimed -- no
+    # project scanned, nothing mutated -- is exactly what is guaranteed.
     #
     # Gated on ``args.apply`` (there is no ``dry_run`` local -- the script
     # writes ``not args.apply`` inline) so a read-only run needs no write
@@ -713,7 +718,7 @@ async def run(
                 "this process cannot write mem0's history directory, so a prune "
                 'would delete Qdrant points and then fail to write their history, '
                 'destroying cycle summaries that would survive nowhere but this '
-                'run\'s log. Nothing was scanned and nothing was mutated. Route the '
+                'run\'s log. No project was scanned and nothing was mutated. Route the '
                 'prune through the fused-memory MCP server (the unsandboxed owner '
                 'of the store), or re-run from an unsandboxed operator shell. To '
                 'obtain the prune report safely from anywhere, re-run without '
