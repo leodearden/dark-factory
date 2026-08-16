@@ -13,7 +13,6 @@ import pytest
 
 from orchestrator.analyze_modules import (
     ModuleStats,
-    _first_component,
     _iter_events,
     _parse_since,
     aggregate,
@@ -29,13 +28,6 @@ def event_store(tmp_path: Path) -> EventStore:
     return EventStore(tmp_path / 'runs.db', run_id='test')
 
 
-def test_first_component_strips_and_splits():
-    assert _first_component('autopilot/analyze/asr') == 'autopilot'
-    assert _first_component('/crates/foo/src') == 'crates'
-    assert _first_component('bare') == 'bare'
-    assert _first_component('') == ''
-
-
 def test_parse_since_duration_shorthand():
     # '7d' shouldn't raise and must yield a past timestamp.
     from datetime import UTC, datetime
@@ -47,6 +39,19 @@ def test_parse_since_invalid_raises():
     import argparse
     with pytest.raises(argparse.ArgumentTypeError):
         _parse_since('nonsense')
+
+
+# ===========================================================================
+# The grouping key — the depth-coarsened lock module, verbatim
+# ===========================================================================
+#
+# `max_per_module` is enforced in `ModuleLockTable._limit_for`
+# (scheduler.py:1505-1517) under `normalize_lock(module, lock_depth)` — the
+# FULL depth-`lock_depth` path — and `module_overrides` is read under that same
+# key.  No first-path-component key exists anywhere in the lock layer, so a
+# `suggest` column published under one names something the enforcement layer
+# never consults.  These tests pin the key space the CLI's whole reason to
+# exist depends on.
 
 
 def test_aggregate_counts_dispatches_and_skips(tmp_path: Path, event_store: EventStore):
@@ -72,10 +77,46 @@ def test_aggregate_counts_dispatches_and_skips(tmp_path: Path, event_store: Even
     )
     from datetime import UTC, datetime, timedelta
     stats = aggregate(event_store.db_path, datetime.now(UTC) - timedelta(days=1))
-    assert 'crates' in stats
-    assert stats['crates'].dispatches == 1
-    assert stats['crates'].skipped_waiting == 2
-    assert stats['crates'].conflict_rate() == pytest.approx(2.0)
+    assert 'crates/foo/src' in stats
+    assert 'crates' not in stats, 'the first path component is not a lock key'
+    assert stats['crates/foo/src'].dispatches == 1
+    assert stats['crates/foo/src'].skipped_waiting == 2
+    assert stats['crates/foo/src'].conflict_rate() == pytest.approx(2.0)
+
+
+def test_aggregate_keeps_sibling_modules_under_one_parent_distinct(event_store: EventStore):
+    """Two modules sharing a parent are two lock keys, not one.
+
+    `ModuleLockTable` limits `orchestrator/src` and `orchestrator/tests`
+    independently, so rolling them into an `orchestrator` row would report a
+    contention figure for a key no override can address.
+    """
+    event_store.emit(
+        EventType.lock_acquired,
+        task_id='1',
+        data={'modules': ['orchestrator/src', 'orchestrator/tests']},
+    )
+
+    from datetime import UTC, datetime, timedelta
+    stats = aggregate(event_store.db_path, datetime.now(UTC) - timedelta(days=1))
+
+    assert sorted(stats) == ['orchestrator/src', 'orchestrator/tests']
+    assert stats['orchestrator/src'].dispatches == 1
+    assert stats['orchestrator/tests'].dispatches == 1
+
+
+def test_aggregate_counts_a_repeated_module_once_per_event(event_store: EventStore):
+    """One event is one dispatch for a module however many times it names it."""
+    event_store.emit(
+        EventType.lock_acquired,
+        task_id='1',
+        data={'modules': ['shared/src', 'shared/src']},
+    )
+
+    from datetime import UTC, datetime, timedelta
+    stats = aggregate(event_store.db_path, datetime.now(UTC) - timedelta(days=1))
+
+    assert stats['shared/src'].dispatches == 1
 
 
 def test_aggregate_ignores_events_before_since(tmp_path: Path, event_store: EventStore):
