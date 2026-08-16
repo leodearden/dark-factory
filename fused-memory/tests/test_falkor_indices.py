@@ -61,6 +61,7 @@ from fused_memory.backends.falkor_indices import (
     plan_index_statements,
     range_create_statement,
     resolve_header_positions,
+    vector_drop_statement,
     vector_index_properties,
 )
 
@@ -1253,6 +1254,87 @@ class TestRangeCreateStatement:
         automatically instead of leaving a stale hard-coded list passing.
         """
         assert parse_index_statement(range_create_statement(spec)) == [spec]
+
+
+class TestVectorDropStatement:
+    """VECTOR needs its OWN drop verb — the old-style form does not reach it.
+
+    MEASURED 2026-08-16 on throwaway graph ``_impl3769_probe`` (seeded, probed,
+    then GRAPH.DELETE'd; no real project graph touched):
+
+    * ``DROP INDEX ON :Entity(emb)`` — the form ``GraphitiBackend.drop_index()``
+      issues — FAILS against a live VECTOR index with
+      ``ERR Unable to drop index on :Entity(emb): no such index.``  The old-style
+      form only targets RANGE.
+    * ``DROP VECTOR INDEX FOR (n:Entity) ON (n.emb)`` returns ``Indices deleted: 1``.
+    * ``DROP VECTOR INDEX FOR ()-[e:RELATES_TO]-() ON (e.fact_embedding)`` returns
+      ``Indices deleted: 1``, while the NODE form against that same relationship
+      index fails with ``no such index``.
+
+    That last pair is why ``entity_type`` is load-bearing rather than cosmetic.
+    """
+
+    def test_node_form_is_the_measured_working_statement(self):
+        assert (
+            vector_drop_statement('Entity', 'NODE', 'name_embedding')
+            == 'DROP VECTOR INDEX FOR (n:Entity) ON (n.name_embedding)'
+        )
+
+    def test_relationship_form_is_the_measured_working_edge_statement(self):
+        assert (
+            vector_drop_statement('RELATES_TO', 'RELATIONSHIP', 'fact_embedding')
+            == 'DROP VECTOR INDEX FOR ()-[e:RELATES_TO]-() ON (e.fact_embedding)'
+        )
+
+    @pytest.mark.parametrize(
+        ('label', 'entity_type', 'prop'),
+        [
+            ('Entity', 'NODE', 'name_embedding'),
+            ('RELATES_TO', 'RELATIONSHIP', 'fact_embedding'),
+        ],
+        ids=['node', 'relationship'],
+    )
+    def test_is_never_the_old_style_range_only_form(self, label, entity_type, prop):
+        """REGRESSION INTENT: the fix must not become a RAISING drop path.
+
+        Repairing only the dict-vs-string predicate while still routing through
+        ``drop_index()`` would turn today's silent no-op into a drop that raises on
+        the first vector index — strictly worse, because
+        ``reindex(drop_indices=True)`` would go from quietly doing nothing to
+        failing outright.  This asserts the emitted statement is not that form.
+        """
+        statement = vector_drop_statement(label, entity_type, prop)
+        assert statement != f'DROP INDEX ON :{label}({prop})'
+        assert statement.startswith('DROP VECTOR INDEX ')
+
+    def test_node_and_relationship_forms_differ(self):
+        """entity_type is LOAD-BEARING: measured, the wrong form errors 'no such index'.
+
+        Emitting one label-only shape for both would silently drop NOTHING for
+        whichever half guessed wrong — while reporting a successful drop, which is
+        the exact failure mode this task exists to remove.
+        """
+        assert (
+            vector_drop_statement('RELATES_TO', 'NODE', 'fact_embedding')
+            != vector_drop_statement('RELATES_TO', 'RELATIONSHIP', 'fact_embedding')
+        )
+
+    @pytest.mark.parametrize(
+        'entity_type',
+        ['EDGE', None, '', 'node', 42],
+        ids=['falkordb-EDGE-vocabulary', 'none', 'empty-string', 'lowercase', 'int'],
+    )
+    def test_unknown_entity_type_raises_rather_than_guessing(self, entity_type):
+        """Mirrors range_create_statement's refuse-to-guess posture.
+
+        ``'EDGE'`` is specifically included because it is the vocabulary
+        ``falkordb``'s own client speaks (``falkordb/asyncio/graph.py``) where this
+        module's normal form says ``'RELATIONSHIP'`` — a vocabulary mismatch that
+        must be caught, not silently pattern-matched.
+        """
+        with pytest.raises(ValueError) as excinfo:
+            vector_drop_statement('RELATES_TO', entity_type, 'fact_embedding')
+        assert 'RELATIONSHIP' in str(excinfo.value)
 
 
 #: The trap state esc-3375-1 protected as evidence: an ``Entity(uuid)`` and a
