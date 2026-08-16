@@ -4,8 +4,10 @@ Provides:
 - DedupeConfig  — configuration knobs (defaults: enabled, 600s window,
                   infra_issue category only).  Named constructors for the
                   non-infra paths: DedupeConfig.for_recon() (recon integrity
-                  findings) and DedupeConfig.for_gate_backlog() (stale gate
-                  backlog); both use an unbounded window + content fingerprint.
+                  findings, key_fn=content_fingerprint_key) and
+                  DedupeConfig.for_gate_backlog() (stale gate backlog,
+                  key_fn=gate_backlog_fingerprint_key — a superset that also
+                  recovers pre-stamp parents); both use an unbounded window.
 - summary_dedupe_key() — pure function; normalises a summary string and
                          returns the first ≤3 tokens as a tuple.
 - find_dedupe_parent() — scans the live queue and returns the oldest
@@ -13,6 +15,10 @@ Provides:
                          or None.
 - compute_content_fingerprint() — deterministic sha256-based fingerprint
                                    keyed on finding identity for recon dedup.
+- content_fingerprint_key() / gate_backlog_fingerprint_key() — key adapters.
+                  The latter additionally recomputes the identity of a
+                  gate-backlog record filed before the fingerprint stamp
+                  existed, so the live backlog migrates itself in place.
 
 Design contracts (see plan.json design_decisions for rationale):
 - find_dedupe_parent() does NOT check DedupeConfig.infra_dedupe_enabled.
@@ -37,6 +43,7 @@ __all__ = [
     'compute_content_fingerprint',
     'content_fingerprint_key',
     'find_dedupe_parent',
+    'gate_backlog_fingerprint_key',
     'submit_or_dedupe',
     'summary_dedupe_key',
 ]
@@ -141,6 +148,93 @@ def content_fingerprint_key(esc: Escalation) -> str | None:
     return esc.dedupe_fingerprint
 
 
+# The one recovery site for a legacy gate-backlog record's project_id: the
+# emitter (stage1_stall_detector.maybe_escalate_stalled_gate_backlog) writes
+# ``detail_parts[0] = f'project_id: {project_id}'``.  Kept as a module constant
+# so the coupling to that emitter is named rather than inlined.
+_GATE_BACKLOG_DETAIL_PROJECT_PREFIX = 'project_id: '
+
+
+def gate_backlog_fingerprint_key(esc: Escalation) -> str | None:
+    """Key adapter for gate-backlog dedup that tolerates LEGACY unstamped parents.
+
+    A superset of ``content_fingerprint_key``: stamped records take the same
+    fast path, and only unstamped ones pay for prose recovery.
+
+    Why this exists — it is a self-executing, in-place migration.  Every
+    ``reconciliation_stale_gate_backlog`` record filed before the fingerprint
+    stamp landed carries ``dedupe_fingerprint: None`` (78 such records measured
+    on the live queue, i.e. 100% of the pending backlog).  Under the plain
+    stamped-only adapter each of those keys falsy, ``find_dedupe_parent``
+    short-circuits, and the first post-change cycle mints a DUPLICATE record at
+    ``dedupe_count 0`` for every stalled gate.  Worse, the legacy record's key
+    stays falsy forever, so it never becomes a fold target again.  Recovering
+    the record's true identity from its own ``detail`` fixes the whole backlog
+    with no operator step, and also covers records filed in the window between
+    the stamp landing and any backfill being run.
+
+    Keyed on ``(category, project_id, task_id)`` and deliberately NOT on
+    ``(category, task_id)``: the escalation queue is SHARED ACROSS PROJECTS
+    (7 observed live — dark_factory 37, reify 27, autopilot_video 5,
+    know_live 3, solar_challenge_platform 2, pump_web_ui 2, solar_challenge 2)
+    and task ids are small per-project integers.  A task_id-only fallback would
+    cross-fold two different projects' gates into a single record and silently
+    discard an escalation a human is waiting on.  Today's snapshot happens to
+    hold 78 distinct task_ids, but that is a property of the current backlog,
+    not an invariant.
+
+    ``project_id`` is NOT a persisted field on ``Escalation`` — it appears
+    nowhere in the on-disk record's key set — so ``detail``'s first line is the
+    only recovery site.  That couples this helper to the emitter's format: a
+    change to ``detail_parts[0]`` in ``stage1_stall_detector`` must update this
+    parser.  Because the parse fails CLOSED, the blast radius of such a drift is
+    duplicate records (visible, self-correcting once the new stamped record
+    becomes the parent), never wrong folds (which silently destroy an
+    escalation).  The same asymmetry drives taking the line remainder VERBATIM
+    rather than via ``\\S+``: truncating ``my project`` to ``my`` would turn a
+    parse ambiguity into a different, possibly colliding key.
+
+    The literal token ``None`` is deliberately not special-cased: the emitter
+    writes ``f'project_id: {project_id}'`` and stamps children as
+    ``f'{project_id}:{task_id}'``, so a filing made with ``project_id=None``
+    yields ``'None:645'`` on BOTH sides.  Reproducing ``str(project_id)``
+    byte-for-byte is exactly what makes parent and child keys agree.
+
+    Returns the stamped fingerprint, the recomputed one, or ``None`` (never
+    fold) when the record's identity cannot be recovered.
+    """
+    # Fast path — post-stamp records never touch the prose.
+    if esc.dedupe_fingerprint:
+        return esc.dedupe_fingerprint
+
+    task_id = esc.task_id
+    detail = esc.detail or ''
+    first_line = detail.split('\n', 1)[0]
+    if not first_line.startswith(_GATE_BACKLOG_DETAIL_PROJECT_PREFIX):
+        return None
+    # Verbatim remainder (only \r from a CRLF detail is dropped, which is not
+    # part of any project id) — see the docstring on why not \S+.
+    project_id = first_line[len(_GATE_BACKLOG_DETAIL_PROJECT_PREFIX):].rstrip('\r')
+
+    # Fail CLOSED: a falsy key hits find_dedupe_parent's short-circuit, so an
+    # unrecoverable parent simply does not fold and we mint a fresh, correctly
+    # stamped record instead of guessing an identity.  An EMPTY project_id
+    # (a bare ``project_id: `` line) is rejected here too, not mirrored: it far
+    # more likely means a truncated detail than a genuine ``project_id=''``
+    # filing, and a ``':166'`` key would collide with every other malformed
+    # record for task 166 across all projects — a wrong fold, the one
+    # unrecoverable outcome.
+    if not task_id or not project_id:
+        return None
+
+    # Identical construction to the child's stamp in stage1_stall_detector, so
+    # parent and child keys agree by construction rather than by a second,
+    # drift-prone formula.
+    return compute_content_fingerprint(
+        'reconciliation_stale_gate_backlog', '', [f'{project_id}:{task_id}'], ''
+    )
+
+
 def _default_summary_key(esc: Escalation) -> tuple[str, ...]:
     """Default key fn: wraps summary_dedupe_key for the key_fn=None path.
 
@@ -222,11 +316,14 @@ class DedupeConfig:
           record for the same gate and re-pins ``dedupe_count`` at 0, which is
           exactly the defect this config exists to prevent.
         - ``infra_dedupe_categories``  : ('reconciliation_stale_gate_backlog',)
-        - ``key_fn``                   : content_fingerprint_key — folds on
-          ``esc.dedupe_fingerprint``, so callers MUST stamp one.
-          ``find_dedupe_parent`` short-circuits to None on a falsy key, so an
-          unstamped escalation would silently never fold (the caller therefore
-          treats an empty fingerprint as a hard error rather than filing).
+        - ``key_fn``                   : gate_backlog_fingerprint_key — folds on
+          ``esc.dedupe_fingerprint`` when present, and otherwise recovers a
+          LEGACY parent's identity from its ``detail``.  The requirement to
+          stamp therefore binds the CANDIDATE, not the parent: the caller
+          treats an empty fingerprint as a hard error rather than filing
+          (``find_dedupe_parent`` short-circuits to None on a falsy key, so an
+          unstamped candidate would silently never fold), while an unstamped
+          PARENT filed before the stamp landed is still a valid fold target.
 
         Why a SIBLING of ``for_recon()`` rather than widening it: the tuple
         returned by ``for_recon().infra_dedupe_categories`` is consumed as the
@@ -244,7 +341,7 @@ class DedupeConfig:
             infra_dedupe_enabled=True,
             infra_dedupe_window_secs=float('inf'),
             infra_dedupe_categories=('reconciliation_stale_gate_backlog',),
-            key_fn=content_fingerprint_key,
+            key_fn=gate_backlog_fingerprint_key,
         )
 
 

@@ -866,13 +866,20 @@ class TestDedupeConfigForGateBacklog:
     # --- (a) config shape ---
 
     def test_for_gate_backlog_config_shape(self):
-        """for_gate_backlog() enables dedup on the gate-backlog category with a content key."""
-        from escalation.dedupe import DedupeConfig, content_fingerprint_key
+        """for_gate_backlog() enables dedup on the gate-backlog category with a content key.
+
+        ``key_fn`` is ``gate_backlog_fingerprint_key`` — a superset of
+        ``content_fingerprint_key`` that also recovers pre-stamp parents.  See
+        ``TestGateBacklogFingerprintKey`` for why the plain stamped-only adapter
+        is insufficient here (it would mint a duplicate for all 78 live legacy
+        records).
+        """
+        from escalation.dedupe import DedupeConfig, gate_backlog_fingerprint_key
 
         cfg = DedupeConfig.for_gate_backlog()
         assert cfg.infra_dedupe_enabled is True
         assert cfg.infra_dedupe_categories == (self._CATEGORY,)
-        assert cfg.key_fn is content_fingerprint_key
+        assert cfg.key_fn is gate_backlog_fingerprint_key
 
     def test_for_gate_backlog_window_is_unbounded(self):
         """The window MUST be unbounded — a 300h-old gate must still fold.
