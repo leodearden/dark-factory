@@ -36,6 +36,8 @@ the file text. Leave it escaped.
 """
 from __future__ import annotations
 
+import copy
+
 import pytest
 
 from shared.decision_pairing import (
@@ -43,6 +45,7 @@ from shared.decision_pairing import (
     PAIRING_MARKERS,
     MispairingHit,
     detect_mispairing,
+    scan_design_decisions,
 )
 
 # ---------------------------------------------------------------------------
@@ -381,3 +384,155 @@ class TestDetectMispairing:
         """
         envelope = '\x3c/decision>\n\x3cparameter name="rationale">'
         assert detect_mispairing('The census is computed inline. ' + envelope, '') is None
+
+
+class TestScanDesignDecisions:
+    """The document-level walker: total for adversarial plan shapes, read-only.
+
+    Its guard set mirrors ``plan_tools._walk_repairable`` (skip a missing key, a
+    non-list collection, a non-dict item, a non-str field) so the two walkers
+    agree on what an adversarial plan shape means.
+    """
+
+    @staticmethod
+    def _plan(*entries: object) -> dict:
+        return {'task_id': '9999', 'design_decisions': list(entries)}
+
+    @staticmethod
+    def _entry(decision: object, rationale: object = ORDINARY_RATIONALE) -> dict:
+        return {'decision': decision, 'rationale': rationale}
+
+    def test_finds_a_single_mispairing_and_names_its_index(self) -> None:
+        plan = self._plan(
+            self._entry('Return a Path, never a bool; callers spell existence as `is not None`.'),
+            self._entry(CORRECTION_DECISION),
+        )
+        hits = scan_design_decisions(plan)
+        assert len(hits) == 1
+        assert hits[0].index == 1
+        assert hits[0].header == 'CORRECTION'
+        assert hits[0].marker == 'mis-paired'
+
+    def test_two_mispairings_in_one_plan_both_reported_in_index_order(self) -> None:
+        """The real 3209 / 3567 / 4096 shape: two corrections in one plan.
+
+        Three of the twenty victim plans carry two matched entries each, so a
+        walker that stopped at the first would silently under-report 3 of 20.
+        """
+        plan = self._plan(
+            self._entry('An ordinary decision with nothing wrong with it.'),
+            self._entry(READ_THIS_INSTEAD_DECISION),
+            self._entry('Another ordinary decision.'),
+            self._entry(SUPERSEDES_DECISION),
+        )
+        hits = scan_design_decisions(plan)
+        assert [h.index for h in hits] == [1, 3]
+        assert [h.header for h in hits] == ['READ THIS INSTEAD', 'SUPERSEDES']
+
+    def test_indices_are_ascending_even_with_unwalkable_entries_interleaved(self) -> None:
+        """A skipped item still consumes its index, so indices stay addressable.
+
+        If the walker enumerated only the entries it could read, a reported
+        index would not address the entry a human opens the plan to find.
+        """
+        plan = self._plan(
+            'not a dict at all',
+            self._entry(CORRECTION_DECISION),
+            None,
+            self._entry(CORRECTED_DECISION),
+        )
+        hits = scan_design_decisions(plan)
+        assert [h.index for h in hits] == [1, 3]
+        assert plan['design_decisions'][1]['decision'] is CORRECTION_DECISION
+        assert plan['design_decisions'][3]['decision'] is CORRECTED_DECISION
+
+    # -- Totality for adversarial plan shapes --------------------------------
+
+    @pytest.mark.parametrize(
+        'plan',
+        [
+            {},
+            {'task_id': '9999'},
+            {'design_decisions': None},
+            {'design_decisions': 'CORRECTION. mis-paired.'},
+            {'design_decisions': {}},
+            {'design_decisions': 42},
+            {'design_decisions': []},
+            {'design_decisions': [None, 42, 'text', [], object()]},
+            {'design_decisions': [{}, {'decision': None}, {'rationale': None}]},
+            {'design_decisions': [{'decision': 42, 'rationale': []}]},
+            {'design_decisions': [{'decision': b'CORRECTION. mis-paired.'}]},
+        ],
+        ids=[
+            'empty-plan', 'key-absent', 'value-none', 'value-str', 'value-dict',
+            'value-int', 'value-empty-list', 'non-dict-items', 'fields-absent',
+            'fields-non-str', 'field-bytes',
+        ],
+    )
+    def test_adversarial_shapes_yield_no_hit_and_no_exception(self, plan: dict) -> None:
+        assert scan_design_decisions(plan) == []
+
+    def test_non_dict_plan_is_tolerated(self) -> None:
+        """The scanner hands it whatever ``json.loads`` returned from a plan file.
+
+        A plan file holding a bare list or string parses fine and reaches the
+        walker, so the top-level shape is as untrusted as the entries.
+        """
+        for plan in (None, [], 'CORRECTION. mis-paired.', 42, object()):
+            assert scan_design_decisions(plan) == []
+
+    # -- Read-only by construction -------------------------------------------
+
+    def test_never_mutates_the_plan(self) -> None:
+        """Read-only is ASSERTED, not merely documented.
+
+        The walker is handed live plan documents by the scanner. A walker that
+        normalized a field in passing would be mutating runtime state that a
+        running task may be reading.
+        """
+        plan = self._plan(
+            self._entry('An ordinary decision.'),
+            self._entry(CORRECTION_DECISION, CORRECTION_RATIONALE),
+            'not a dict',
+            self._entry(42, None),
+        )
+        before = copy.deepcopy(plan)
+        hits = scan_design_decisions(plan)
+        assert hits, 'guard: the specimen must actually produce a hit'
+        assert plan == before
+
+    def test_does_not_mutate_an_adversarial_plan_either(self) -> None:
+        """The skip paths are where a normalizing walker would be tempted."""
+        plan = {'design_decisions': [None, {}, {'decision': 42}, {'rationale': 'x'}]}
+        before = copy.deepcopy(plan)
+        assert scan_design_decisions(plan) == []
+        assert plan == before
+
+    def test_returns_a_fresh_list_each_call(self) -> None:
+        """No shared accumulator: a caller mutating the result cannot poison the next."""
+        plan = self._plan(self._entry(CORRECTION_DECISION))
+        first = scan_design_decisions(plan)
+        first.clear()
+        assert len(scan_design_decisions(plan)) == 1
+
+    def test_delegates_its_verdict_to_detect_mispairing(self) -> None:
+        """One mechanism, two readers (INV-5).
+
+        The walker must not re-implement the predicate: if it did, the entry
+        tests above and the corpus replay below could pass while the scanner —
+        the only consumer anyone actually runs — disagreed with both.
+        """
+        for decision in (
+            CORRECTION_DECISION,
+            GENUINE_SUPERSESSION_DECISION,
+            PARENTHETICAL_RESTATEMENT_DECISION,
+            META_PROSE_DECISION,
+        ):
+            plan = self._plan(self._entry(decision))
+            entry_verdict = detect_mispairing(decision, ORDINARY_RATIONALE)
+            walker_verdict = scan_design_decisions(plan)
+            assert bool(walker_verdict) == (entry_verdict is not None), decision[:60]
+            if entry_verdict is not None:
+                assert walker_verdict[0].header == entry_verdict.header
+                assert walker_verdict[0].marker == entry_verdict.marker
+                assert walker_verdict[0].field == entry_verdict.field
