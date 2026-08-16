@@ -1356,6 +1356,181 @@ class TestCiteTaskEntityScopedFold:
 
 
 # ---------------------------------------------------------------------------
+# task-4185: TestCiteTaskCrossProjectNearCollision — the entity-scoped fold's
+# derived signature is PROJECTLESS, so two projects' findings about
+# same-numbered tasks can collide. step-1 pins the three folds that must NOT
+# change; step-2/4/6 drive the guard itself.
+# ---------------------------------------------------------------------------
+
+
+class TestCiteTaskCrossProjectNearCollision:
+    """Cross-project near-collisions on the entity-scoped derived signature
+    (task-4185).
+
+    ``_run_sig_index``'s derived key is ``(canonical(cited task_id),
+    flag_type)`` — deliberately PROJECTLESS. Operator ruling (2026-08-12):
+    the projectless key STAYS, because it is what lets a bare top-level
+    task_id (which names no project at all) fold onto a foreign citation,
+    and that fold is INTENDED. Only the DETECTABLE half is guarded — a
+    cite_task→cite_task collision where the ANCHOR's own primary citation
+    pins the same task id to a different project.
+
+    The three tests below are CHARACTERIZATION PINS: each was confirmed to
+    fold on unmodified code and must keep folding after the guard lands, so
+    the guard cannot silently over-reach.
+    """
+
+    def _fake_ti(self):
+        """Fake task interceptor covering the cited ids under BOTH known roots.
+
+        These tests cite the SAME numeric task id from two different
+        projects, so every id must resolve under each of ``_KNOWN_PROJECTS``'
+        roots — otherwise a foreign citation would fail with
+        ``task_not_found`` before ever reaching the fold logic.
+        """
+        results = {}
+        for pr in _KNOWN_PROJECTS.values():
+            for tid in ['42', '99', '999', '2405', '7777']:
+                results[(tid, pr)] = {'id': tid, 'title': f'T-{tid}'}
+        return _FakeTaskInterceptor(results=results)
+
+    def _make_state(self, fake_ti=None):
+        from fused_memory.server.recon_report import ReconReportState
+
+        if fake_ti is None:
+            fake_ti = self._fake_ti()
+        t = [0.0]
+        state = ReconReportState(
+            ttl_seconds=300,
+            clock=lambda: t[0],
+            task_interceptor=fake_ti,
+        )
+        state.known_projects = dict(_KNOWN_PROJECTS)
+        return state, t
+
+    # -- CHARACTERIZATION PINS (green on unmodified code) ---------------
+
+    @pytest.mark.asyncio
+    async def test_same_project_cite_task_collision_still_folds(self):
+        """(b) A genuine SAME-project duplicate must keep folding.
+
+        The anchor's primary citation pins ('dark_factory', '2405'); the
+        incoming citation names the same task in the same project, so this
+        is an ordinary duplicate, not a near-collision.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='run-1', stage='task_knowledge_sync', project_id='dark_factory')
+
+        anchor = state.add_finding(
+            run_id='run-1', severity='low', category='memory_stale',
+            description='anchor 2405', suggested_action='a',
+            task_id='2405', flag_type='X',
+        )
+        assert 'finding_id' in anchor, anchor
+        anchor_id = anchor['finding_id']
+
+        # Self-hit: registers the derived sig ('2405', 'X') AND records
+        # cited_tasks[0] == {'dark_factory', '2405'} as the project pin.
+        cite_anchor = await state.cite_task('run-1', anchor_id, 'dark_factory', '2405')
+        assert 'error' not in cite_anchor, cite_anchor
+
+        incoming = state.add_finding(
+            run_id='run-1', severity='low', category='memory_stale',
+            description='incoming 2405, worded differently', suggested_action='a',
+            task_id=None, flag_type='X',
+        )
+        assert 'finding_id' in incoming, incoming
+        incoming_id = incoming['finding_id']
+
+        result = await state.cite_task('run-1', incoming_id, 'dark_factory', '2405')
+        assert result.get('error') == 'duplicate_finding'
+        assert result.get('existing_finding_id') == anchor_id
+
+        assert state._resolve_finding('run-1', incoming_id) is None
+
+        report = state.get_assembled_report('run-1', 'task_knowledge_sync')
+        assert report is not None
+        ids = [item['finding_id'] for item in report['flagged_items']]
+        assert ids == [anchor_id]
+
+    @pytest.mark.asyncio
+    async def test_anchor_citing_a_different_task_still_folds(self):
+        """(c3) An anchor whose primary citation names a DIFFERENT task
+        carries NO project pin for this derived signature — it must keep
+        folding.
+
+        The anchor's top-level task_id is '42' (which is what registered the
+        ordinary ('42', 'X') signature add_finding consults), but its only
+        citation is other_project:999 — '999' is not a member of {'42'}, so
+        that cite_task call registered no derived sig at all. A guard that
+        compared cited_tasks[0]['project_id'] against the incoming
+        project_id WITHOUT first checking the citation names the SAME task
+        would see 'other_project' != 'dark_factory' and wrongly break this
+        pre-existing fold.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='run-1', stage='task_knowledge_sync', project_id='dark_factory')
+
+        anchor = state.add_finding(
+            run_id='run-1', severity='low', category='memory_stale',
+            description='anchor 42', suggested_action='a',
+            task_id='42', flag_type='X',
+        )
+        assert 'finding_id' in anchor, anchor
+        anchor_id = anchor['finding_id']
+
+        cite_anchor = await state.cite_task('run-1', anchor_id, 'other_project', '999')
+        assert 'error' not in cite_anchor, cite_anchor
+
+        incoming = state.add_finding(
+            run_id='run-1', severity='low', category='memory_stale',
+            description='incoming 42, worded differently', suggested_action='a',
+            task_id=None, flag_type='X',
+        )
+        assert 'finding_id' in incoming, incoming
+        incoming_id = incoming['finding_id']
+
+        result = await state.cite_task('run-1', incoming_id, 'dark_factory', '42')
+        assert result.get('error') == 'duplicate_finding'
+        assert result.get('existing_finding_id') == anchor_id
+
+    @pytest.mark.asyncio
+    async def test_foreign_citation_then_bare_add_finding_still_folds(self):
+        """(c2) The shape the scope ruling explicitly PROTECTS: a bare
+        top-level task_id folding onto a FOREIGN citation.
+
+        A null-task_id finding cites other_project:2405, registering the
+        projectless derived sig ('2405', 'X'); a later
+        ``add_finding(task_id='2405', flag_type='X')`` — which names no
+        project whatsoever — collapses onto it via add_finding's own
+        ordinary signature lookup. This path never enters cite_task's guard;
+        the test exists so a future attempt to project-namespace the derived
+        key fails loudly here.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='run-1', stage='task_knowledge_sync', project_id='dark_factory')
+
+        citing = state.add_finding(
+            run_id='run-1', severity='low', category='memory_stale',
+            description='citing foreign 2405', suggested_action='a',
+            task_id=None, flag_type='X',
+        )
+        assert 'finding_id' in citing, citing
+        citing_id = citing['finding_id']
+
+        cite_result = await state.cite_task('run-1', citing_id, 'other_project', '2405')
+        assert 'error' not in cite_result, cite_result
+
+        later = state.add_finding(
+            run_id='run-1', severity='low', category='memory_stale',
+            description='bare 2405, worded differently', suggested_action='a',
+            task_id='2405', flag_type='X',
+        )
+        assert later.get('error') == 'duplicate_finding'
+        assert later.get('existing_finding_id') == citing_id
+
+
+# ---------------------------------------------------------------------------
 # task-4184 step-1/step-3: TestCiteTaskFoldPurgeLogging — RED until step-2/4
 # make both cite_task fold branches log the purged finding's content before
 # _purge_finding discards it wholesale.
