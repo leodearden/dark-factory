@@ -224,7 +224,7 @@ class TestGroupIdsFilterAgreement:
 # path-shaped constant) for every public group-arg GraphitiBackend method
 # NOT already covered by the step-1/3/5 positive-path tests
 # (get_nodes_by_exact_name, find_duplicate_entity_nodes, add_episode,
-# search, search_nodes, build_communities). Together these 39 + 6 = 45
+# search, search_nodes, build_communities). Together these 40 + 6 = 46
 # cover GraphitiBackend's full public group-arg surface (excluding
 # _driver_for/_graph_for/_ensure_indices/_resolve_or_create_entity/
 # node_count, which are deliberately undecorated, and _identity_lock_for,
@@ -278,12 +278,13 @@ _ALL_GROUP_ARG_SWEEP_CASES = [
     ('list_indices', (), {'group_id': _PATH_SHAPED}),
     ('ensure_indices', (), {'group_id': _PATH_SHAPED}),
     ('drop_index', ('Entity', 'name'), {'group_id': _PATH_SHAPED}),
+    ('drop_vector_index', ('Entity', 'name_embedding', 'NODE'), {'group_id': _PATH_SHAPED}),
     ('drop_vector_indices', (), {'group_id': _PATH_SHAPED}),
     ('retrieve_episodes', (), {'group_ids': [_PATH_SHAPED]}),
 ]
 
-assert len(_ALL_GROUP_ARG_SWEEP_CASES) == 39, (
-    'Sweep must cover exactly the 39 public group-arg GraphitiBackend methods '
+assert len(_ALL_GROUP_ARG_SWEEP_CASES) == 40, (
+    'Sweep must cover exactly the 40 public group-arg GraphitiBackend methods '
     'not already covered by the step-1/3/5 positive-path tests — update this '
     'table if the decorated surface ever changes.'
 )

@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _fm_helpers import assert_ro_query_only, extract_cypher, extract_params
 
+from fused_memory.backends.falkor_indices import vector_drop_statement
 from fused_memory.backends.graphiti_client import (
     EdgeNotFoundError,
     GraphitiBackend,
@@ -374,6 +375,90 @@ class TestDropIndex:
         backend = GraphitiBackend(mock_config)
         with pytest.raises(RuntimeError, match='not initialized'):
             await backend.drop_index('Entity', 'name_embedding', group_id='test')
+
+
+class TestDropVectorIndex:
+    """GraphitiBackend.drop_vector_index() issues the VECTOR-specific DROP verb.
+
+    The sibling ``drop_index`` above cannot serve VECTOR.  MEASURED 2026-08-16 on
+    throwaway graph ``_impl3769_probe``: the old-style
+    ``DROP INDEX ON :Entity(emb)`` form it issues fails against a live VECTOR
+    index with ``ERR Unable to drop index on :Entity(emb): no such index.`` —
+    that form only targets RANGE.
+
+    Statements are asserted against ``vector_drop_statement``'s output rather
+    than re-spelled here, so the byte-for-byte pinning lives in exactly one
+    place (``TestVectorDropStatement`` in ``test_falkor_indices.py``) and this
+    class pins the WIRING instead of re-forking the form.
+    """
+
+    @pytest.mark.asyncio
+    async def test_issues_the_node_vector_drop_statement(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        await backend.drop_vector_index('Entity', 'name_embedding', 'NODE', group_id='test')
+
+        assert extract_cypher(graph.query.call_args) == vector_drop_statement(
+            'Entity', 'NODE', 'name_embedding',
+        )
+
+    @pytest.mark.asyncio
+    async def test_issues_the_relationship_vector_drop_statement(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """entity_type is load-bearing: measured, the NODE form errors 'no such index' here."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        await backend.drop_vector_index(
+            'RELATES_TO', 'fact_embedding', 'RELATIONSHIP', group_id='test',
+        )
+
+        assert extract_cypher(graph.query.call_args) == vector_drop_statement(
+            'RELATES_TO', 'RELATIONSHIP', 'fact_embedding',
+        )
+
+    @pytest.mark.asyncio
+    async def test_is_not_the_old_style_range_only_form(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """REGRESSION INTENT: never regress into the statement drop_index issues."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        await backend.drop_vector_index('Entity', 'name_embedding', 'NODE', group_id='test')
+
+        cypher = extract_cypher(graph.query.call_args)
+        assert cypher != 'DROP INDEX ON :Entity(name_embedding)'
+        assert cypher.startswith('DROP VECTOR INDEX ')
+
+    @pytest.mark.asyncio
+    async def test_uses_the_write_path_not_ro_query(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        """A DROP is a write; ro_query would be rejected."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        await backend.drop_vector_index('Entity', 'name_embedding', 'NODE', group_id='test')
+
+        graph.query.assert_called_once()
+        graph.ro_query.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_raises_when_not_initialized(self, mock_config):
+        backend = GraphitiBackend(mock_config)
+        with pytest.raises(RuntimeError, match='not initialized'):
+            await backend.drop_vector_index(
+                'Entity', 'name_embedding', 'NODE', group_id='test',
+            )
 
 
 # ---------------------------------------------------------------------------
