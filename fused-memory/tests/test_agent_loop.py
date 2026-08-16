@@ -1238,6 +1238,11 @@ async def test_call_claude_cli_forwards_cwd_to_invoke_claude_agent(tmp_path):
     so that the kwargs-forwarding layer is exercised.  Omitting cwd from the
     invoke_with_cap_retry call would raise TypeError at runtime; this test
     catches that regression without requiring a live Claude CLI.
+
+    Uses ``autospec=True`` (not a bare ``AsyncMock``) so a misspelled or
+    unsupported kwarg at the call site raises TypeError here instead of
+    being forwarded and asserted-on silently — see the fuller rationale on
+    test_call_claude_cli_forwards_mcp_scoping_to_invoke_claude_agent below.
     """
     from pathlib import Path
 
@@ -1258,9 +1263,11 @@ async def test_call_claude_cli_forwards_cwd_to_invoke_claude_agent(tmp_path):
     # kwargs-forwarding path that the higher-level mock skips.
     # usage_gate=None takes the fast path in invoke_with_cap_retry
     # (single invocation, no cap retry), so the real forwarding code runs.
+    # autospec (not a bare AsyncMock): validates every kwarg against the
+    # real invoke_claude_agent signature instead of swallowing it silently.
     with patch(
         'shared.cli_invoke.invoke_claude_agent',
-        new_callable=AsyncMock,
+        autospec=True,
     ) as mock_agent:
         mock_agent.return_value = fake_result
 
