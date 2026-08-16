@@ -572,12 +572,26 @@ def _run_status_refresh_and_retitle(
     *,
     question: session_registry.Question | None = None,
 ) -> str:
-    """Shared refresh-then-retitle body for run_notification/run_stop."""
+    """Shared refresh-then-retitle body for run_notification/run_stop.
+
+    Resolves the record through the ownership check (task 4193), so a
+    nested ``claude`` that merely inherited ``CLAUDE_SPAWN_SESSION_ID``
+    refreshes its OWN record rather than flipping the spawning session's
+    status mid-turn. Binding an as-yet-unbound record is folded into the
+    same conditional write the pending question already used, so an
+    ordinary bound-record event still performs exactly one registry write
+    (``refresh_record``'s own); the extra write happens only on the single
+    event that first binds a legacy record.
+    """
     identity = resolve_hook_identity(hook_input, env)
-    slug = hook_session_slug(hook_input, env)
+    slug = hook_session_slug(hook_input, env, root=root)
     record = session_registry.refresh_record(slug, root=root, status=status)
+    # Bind on the record refresh_record RETURNED (post-status-flip), and write
+    # after both mutations, so status, question and binding land atomically.
+    bound = _bind_claude_session_id(record, hook_input)
     if question is not None:
         record.question = question
+    if question is not None or bound:
         session_registry.write_record(record, root=root)
     title = hook_display_title(identity, env, record)
     return osc_retitle_sequence(status, title)
@@ -588,7 +602,12 @@ def run_notification(
     env: Mapping[str, str],
     root: Path | str | None = None,
 ) -> str:
-    """Notification hook handler: status -> AWAITING_INPUT, stamp any question, return its OSC retitle."""
+    """Notification hook handler: status -> AWAITING_INPUT, stamp any question, return its OSC retitle.
+
+    Resolves the record through the ownership check (task 4193): a nested
+    inheritor's question lands on its own record, never on the spawning
+    session's.
+    """
     return _run_status_refresh_and_retitle(
         hook_input,
         env,
@@ -603,7 +622,12 @@ def run_stop(
     env: Mapping[str, str],
     root: Path | str | None = None,
 ) -> str:
-    """Stop hook handler: status -> IDLE, return its OSC retitle."""
+    """Stop hook handler: status -> IDLE, return its OSC retitle.
+
+    Resolves the record through the ownership check (task 4193): a nested
+    inheritor finishing its turn can no longer idle the spawning session
+    mid-turn.
+    """
     return _run_status_refresh_and_retitle(hook_input, env, root, session_registry.Status.IDLE)
 
 
