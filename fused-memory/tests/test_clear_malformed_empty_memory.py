@@ -5,6 +5,7 @@ sys.path pollution -- mirrors the pattern in test_consolidate_namespace_families
 """
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import sys
 import types
@@ -59,6 +60,29 @@ def _make_record(payload: dict | None = None) -> MagicMock:
     record = MagicMock()
     record.payload = payload if payload is not None else {}
     return record
+
+
+@pytest.fixture(autouse=True)
+def _neutralise_store_mutation_preflight(monkeypatch):
+    """Keep this MOCK-unit suite independent of the REAL ``~/.mem0``.
+
+    ``run(..., apply=True)`` runs a fail-closed capability preflight before it
+    retrieves (task 4127). That probe touches the real filesystem, so without
+    this fixture every ``--apply`` test would pass or fail according to whether
+    the machine running pytest happens to be able to write mem0's history
+    directory -- and it genuinely cannot inside an agent sandbox, which is the
+    whole reason the guard exists. This suite is deliberately MOCK-unit (an
+    AsyncMock Qdrant client, MagicMock points, no live Qdrant), so the
+    environment must not be an input to it.
+
+    ``TestRunApplyStoreMutationPreflight`` re-rigs this per test -- to refuse,
+    to record, or to pass -- so the guard's own behaviour is still pinned
+    explicitly rather than assumed away.
+
+    Deliberately NOT ``raising=False``: if the guard is ever removed from the
+    script this fixture must break loudly rather than silently no-op.
+    """
+    monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
 
 
 # ===========================================================================
@@ -493,6 +517,163 @@ class TestBuildParser:
         assert args.memory_id == 'X'
         assert args.project_id == 'reify'
         assert args.apply is True
+
+
+# ===========================================================================
+# Tests: --apply store-mutation preflight
+# ===========================================================================
+
+class TestRunApplyStoreMutationPreflight:
+    """``--apply`` refuses to START when this process cannot write mem0's store.
+
+    Ported from ``test_sweep_toolcall_xml_leak.TestRunApplyStoreMutationPreflight``
+    (task 3686), which is the in-repo precedent for this contract.
+
+    This script is the odd one out among the six call sites and deliberately so:
+    it bypasses mem0 entirely, issuing a raw ``AsyncQdrantClient.delete``
+    (because mem0's ``AsyncMemory.delete()`` would ``KeyError`` on the
+    null-payload records this tool targets). So mem0's SQLite history write --
+    the half of the measured 7d073281 incident that landlock denied -- never
+    happens here, and the split-mutation failure mode is not the direct hazard.
+
+    The guard still belongs: a raw Qdrant delete is a NETWORK call to
+    localhost:6333, and landlock governs the FILESYSTEM only, so no sandbox
+    can stop it. An application-level refusal is the only available control,
+    which makes this the purest instance of the module's stated policy rather
+    than an exception to it.
+    """
+
+    @staticmethod
+    def _deny(monkeypatch):
+        """Rig the preflight to refuse, as it would inside an agent sandbox."""
+        def _raise(*_args, **_kwargs):
+            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
+
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
+
+    @pytest.mark.asyncio
+    async def test_apply_performs_zero_mutations_when_the_store_is_unwritable(
+        self, monkeypatch
+    ):
+        """The whole point: refuse to start rather than half-complete."""
+        self._deny(monkeypatch)
+        payload = {'data': '', 'category': None, 'agent_id': None}
+        client = _make_qdrant_mock([_make_record(payload)])
+        args = types.SimpleNamespace(memory_id='id1', apply=True)
+
+        with pytest.raises(
+            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+        ):
+            await _mod.run(args, client, 'fused_dark_factory')
+
+        client.delete.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_guard_sits_before_the_read_not_before_the_delete(
+        self, monkeypatch
+    ):
+        """It aborts without even retrieving -- one probe per run, and no
+        round-trip to a store it was never going to be allowed to mutate."""
+        self._deny(monkeypatch)
+        payload = {'data': '', 'category': None, 'agent_id': None}
+        client = _make_qdrant_mock([_make_record(payload)])
+        args = types.SimpleNamespace(memory_id='id1', apply=True)
+
+        with pytest.raises(_mod.StoreMutationUnavailable):
+            await _mod.run(args, client, 'fused_dark_factory')
+
+        client.retrieve.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_dry_run_is_never_gated_on_write_capability(self, monkeypatch):
+        """A read-only run mutates nothing, so it must not require the ability
+        to mutate. Gating it would break this module's core promise -- that the
+        payload + classification report can always be obtained safely, from
+        anywhere. That report IS the investigation (module docstring).
+        """
+        self._deny(monkeypatch)
+        payload = {'data': '', 'category': None, 'agent_id': None}
+        client = _make_qdrant_mock([_make_record(payload)])
+        args = types.SimpleNamespace(memory_id='id1', apply=False)
+
+        report = await _mod.run(args, client, 'fused_dark_factory')
+
+        assert report['classification'] == 'malformed'
+        assert report['dry_run'] is True
+        assert report['deleted'] is False
+        client.retrieve.assert_awaited_once()
+        client.delete.assert_not_awaited()
+        assert _mod.resolve_exit_code(report) == 0
+
+    @pytest.mark.asyncio
+    async def test_apply_is_unchanged_when_the_preflight_passes(self, monkeypatch):
+        """Happy path: a writable environment deletes exactly as before."""
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+        payload = {'data': '', 'category': None, 'agent_id': None}
+        client = _make_qdrant_mock([_make_record(payload)])
+        args = types.SimpleNamespace(memory_id='id1', apply=True)
+
+        report = await _mod.run(args, client, 'fused_dark_factory')
+
+        client.delete.assert_awaited_once()
+        assert report['classification'] == 'malformed'
+        assert report['dry_run'] is False
+        assert report['deleted'] is True
+        assert report['payload'] == payload
+        assert _mod.resolve_exit_code(report) == 0
+
+    @pytest.mark.asyncio
+    async def test_the_probe_names_the_operation_being_gated(self, monkeypatch):
+        """The refusal has to be attributable in a log, so the operation string
+        identifies this script and its mutating mode."""
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            _mod, 'assert_store_mutation_allowed', lambda **kw: calls.append(kw)
+        )
+        payload = {'data': '', 'category': None, 'agent_id': None}
+        client = _make_qdrant_mock([_make_record(payload)])
+        args = types.SimpleNamespace(memory_id='id1', apply=True)
+
+        await _mod.run(args, client, 'fused_dark_factory')
+
+        assert len(calls) == 1, 'probed ONCE per run, not once per record'
+        assert 'clear_malformed_empty_memory' in calls[0]['operation']
+        assert '--apply' in calls[0]['operation']
+
+    def test_the_refusal_is_loud_and_reaches_mains_fatal_abort_path(
+        self, monkeypatch, caplog
+    ):
+        """Pinned surfacing: the exception PROPAGATES out of ``run``, so
+        ``main``'s blanket ``except Exception`` (the fatal arm) catches it and
+        returns 2. A silent zero-exit refusal is the exact failure mode this
+        task exists to prevent, so the non-zero outcome is asserted end-to-end.
+
+        Sync, not async: ``main`` calls ``asyncio.run`` itself. Replace
+        ``asyncio.run`` so ``_run_live`` never constructs a real MemoryService
+        (``TestMainFatalErrorHandling``'s idiom).
+        """
+        self._deny(monkeypatch)
+        payload = {'data': '', 'category': None, 'agent_id': None}
+        client = _make_qdrant_mock([_make_record(payload)])
+        monkeypatch.setattr(
+            sys, 'argv',
+            ['clear_malformed_empty_memory.py', '--memory-id', 'id1', '--apply'],
+        )
+        args = types.SimpleNamespace(memory_id='id1', apply=True)
+        real_asyncio_run = asyncio.run
+
+        def _drive(coro, *_a, **_kw):
+            coro.close()  # never construct the live MemoryService
+            return real_asyncio_run(_mod.run(args, client, 'fused_dark_factory'))
+
+        monkeypatch.setattr(_mod.asyncio, 'run', _drive)
+
+        with caplog.at_level('ERROR'):
+            exit_code = _mod.main()
+
+        assert exit_code == 2
+        client.delete.assert_not_awaited()
+        client.retrieve.assert_not_awaited()
 
 
 # ===========================================================================
