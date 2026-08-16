@@ -40,8 +40,14 @@ from typing import Any
 # docstring's stdlib-only clause and _atomic_write_text below. This module is
 # executed by absolute path from skills/spawn/spawn-claude.sh with no venv,
 # install or workspace packages available, so a `from shared import ...` here
-# makes it unimportable there. Pinned by
-# test_session_registry.py::TestStdlibOnlySelfContainment.
+# makes it unimportable there. Nor a `from orchestrator import <sibling>`:
+# running a script by path puts only the script's OWN directory on sys.path,
+# so intra-orchestrator imports fail there too even though they work for
+# consumers that import this module with PYTHONPATH set.
+# Pinned by the tier-1 (bare shell, NO PYTHONPATH) row of
+# _BARE_SHELL_ENTRYPOINTS in
+# test_session_registry.py::TestStdlibOnlySelfContainment, and mutation-tested
+# there via _MUST_BE_REJECTED.
 
 # ---------------------------------------------------------------------------
 # Schema / contract (PRD §6 G5): consumers import this; they never re-derive
@@ -606,7 +612,9 @@ def _atomic_write_text(path: Path, text: str) -> None:
     module unimportable there — measured as ``ModuleNotFoundError: No module
     named 'shared'`` — and the only visible symptom is a hook subprocess that
     silently never writes ``record.json``. The contract is pinned directly by
-    ``test_session_registry.py::TestStdlibOnlySelfContainment``, and this
+    the tier-1 (bare shell, NO PYTHONPATH) row of ``_BARE_SHELL_ENTRYPOINTS`` in
+    ``test_session_registry.py::TestStdlibOnlySelfContainment`` — which
+    mutation-tests it by injecting this very import — and this
     function is recorded in ``_ALLOWED_RENAMERS`` in
     ``shared/tests/test_safe_io.py`` so the anti-regrowth guard reads it as the
     documented exception it is rather than a fresh copy.

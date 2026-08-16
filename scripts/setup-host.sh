@@ -135,6 +135,16 @@ fi
 # ---------------------------------------------------------------------------
 # 5. Orchestrator systemd units + watchdog
 # ---------------------------------------------------------------------------
+# The install is gated PER UNIT (task 4198). Each unit is judged on its own
+# parity verdict, so a finding on one no longer declines the install of all
+# nine. The POLICY is unchanged and still ratified — a unit that did not clear
+# is never overwritten without DF_INSTALL_ORCH_UNITS=1, because a difference
+# does not tell you which side is stale — only the blast radius shrinks.
+#
+# HARNESS CONSTRAINT: do NOT name the parity checker's file in the prose below
+# — call it "the parity gate" up here. It bites silently, and the whole rule is
+# stated at the `_orch_parity_script=` assignment that anchors it.
+#
 # Installs and enables (kept in step with scripts/orchestrator-*.service by
 # test_setup_host_installs_every_orchestrator_unit — every template must be
 # copied here, and every template with an [Install] section must be enabled):
@@ -149,6 +159,14 @@ fi
 #   - orchestrator-watchdog.service/.timer  (60s liveness probe + dead-enabled revival)
 #     The .service is static (no [Install]) — the .timer carries the install, so
 #     only the timer is enabled below. `systemctl enable` on it would error.
+#     This pair is WHY the gate is per-unit. Under the old all-or-nothing gate
+#     the deliberate, permanent orchestrator-reify.service.d/warm-lane.conf
+#     drop-in on this host (owned by the reify repo, installed by its
+#     install-warm-lane-units.sh — NOT drift, and not going away) declined the
+#     install of every unit including these two, so a plain re-run could never
+#     reinstall or re-enable the supervision safety net. On 2026-08-10 that
+#     left the fleet 31.8h stale. It now blocks reify alone, and a plain
+#     `bash scripts/setup-host.sh` is the natural repair path for the pair.
 #
 # Drift direction (task 3641): know-live and pump-web-ui were transcribed from
 # the running host into the repo, i.e. committed-follows-installed. BOTH have
@@ -191,13 +209,17 @@ install -m 0755 "$REPO_ROOT/scripts/wait-for-port.py" "$HOME/bin/wait-for-port.p
 # unlike the dashboard's template-rendered unit, these are plain cp targets, so
 # a second run would only restate what the copy just did.)
 #
-# NON-FATAL, but not merely advisory: drift never aborts this script (the
+# NON-FATAL, but not merely advisory: a finding never aborts this script (the
 # sections below still run, and five of the seven registered units are KNOWN
-# RED on this host until the follow-up task lands) — it makes the ORCHESTRATOR
-# UNIT INSTALL opt-in instead. A bare warning would not be an intervention
-# point in a non-interactive `set -e` script: it scrolls past and the next line
+# RED on this host until the follow-up task lands) — it makes the install of
+# THAT UNIT opt-in instead. A bare warning would not be an intervention point
+# in a non-interactive `set -e` script: it scrolls past and the next line
 # overwrites the units anyway, so the operator is told to check the direction
 # at the one moment they can no longer act on it.
+#
+# Mechanically: the gate runs ONCE and reports a verdict per unit; the
+# per-unit install decision is taken from those verdicts further down. See the
+# section header for the policy that shape implements.
 #
 # NOTE the report does not mean "the installed copy is stale". Measured
 # 2026-08-02, the direction varies per unit: the repo copy is correct for
@@ -215,10 +237,61 @@ install -m 0755 "$REPO_ROOT/scripts/wait-for-port.py" "$HOME/bin/wait-for-port.p
 # invocation is guarded by an existence check, and NO exit code is believed
 # unless the checker's own [orchestrator_unit_parity] tag appears in the
 # output it produced.
+#
+# HARNESS CONSTRAINT, stated once, HERE, because this next line is what anchors
+# it. tests/scripts/test_check_orchestrator_unit_parity.py slices this file
+# from the FIRST mention of the parity checker's file name through the install
+# construct's closing `fi`, and EXECUTES that slice under bash. Two consequences,
+# both silent:
+#   - naming that file ABOVE this line moves the slice's start upward, so the
+#     suite runs this section's `install -m 0755 ... "$HOME/bin/..."` against
+#     the developer's REAL home directory;
+#   - anything the sliced code needs (the unit array, the skip-reason helper)
+#     must be declared BELOW this line, or it is unbound at run time and kills
+#     the run under `set -u`.
 _orch_parity_script="$REPO_ROOT/scripts/check_orchestrator_unit_parity.py"
-# 1 => the units were NOT verified as safe to overwrite (drift, unverifiable
-# state, or the gate itself did not run). Consumed by the install block below.
+
+# The units this section installs, declared ONCE. Both loops below iterate this
+# array, and check_orchestrator_unit_parity.py's UNITS registry is checked
+# against it by tests/scripts/test_check_orchestrator_unit_parity.py — so
+# adding a unit is a one-line edit here instead of a `cp` line plus an
+# `enable` line kept in step by hand.
+#
+# Declared below the parity-script assignment rather than up beside the section
+# header — see the harness constraint stated there.
+#
+# ENABLE POLICY. Every project orchestrator is enabled by default, to match the
+# running production stack — they coexist on separate escalation ports, noted
+# per entry below. Disable selectively (see SETUP.md's `systemctl --user
+# disable --now` block) if a host should not be part of the unattended
+# workload. This script marks real exclusions with an explicit "Deliberately
+# NOT wired" note; an absent note means the unit belongs here.
+_orch_units=(
+  orchestrator-dark-factory.service              # this repo's own orchestrator, escalation 8102
+  orchestrator-reify.service                     # reify, escalation 8100
+  orchestrator-autopilot-video.service           # joined 2026-05-29, escalation 8101 (separate target, selected purely via --config)
+  orchestrator-my-solar-challenge.service        # joined 2026-05-31, escalation 8106
+  orchestrator-solar-challenge-platform.service  # joined 2026-06-21, escalation 8107
+  orchestrator-know-live.service                 # escalation 8105; committed since e5273d8623, wired in by task 3641 (its absence was an omission, not a policy)
+  orchestrator-pump-web-ui.service               # joined 2026-07-17, escalation 8108; ran on the host with no committed template until task 3641 transcribed it
+  orchestrator-watchdog.service                  # static (no [Install]) — pulled in by the .timer, so the enable loop below skips it
+  orchestrator-watchdog.timer                    # 60s liveness probe + dead-enabled revival: the safety net that revives an orchestrator killed by e.g. a boot-race dependency cancel
+)
+
+# 1 => the run as a WHOLE reported something unverifiable. Still used for the
+# operator-facing summary below; the install decision itself is per-unit.
 _orch_install_blocked=0
+
+# unit -> the comma-joined verdict kinds the gate reported for it. A unit
+# ABSENT from this map has no verdict and is treated as `unverified` below,
+# which is BLOCKING: the states that produce no verdict line (checker missing,
+# renamed, run without --print-verdicts, or simply not knowing that unit) all
+# mean "nothing was checked", and installing on the strength of nothing is the
+# silent-drift failure this gate exists to catch.
+declare -A _orch_verdict=()
+# Initialised before the branch so the parse below is safe under `set -u` even
+# when the checker was missing and the else-branch never ran.
+_orch_parity_out=""
 
 if [ ! -f "$_orch_parity_script" ]; then
   fail "Orchestrator parity gate missing: $_orch_parity_script"
@@ -227,7 +300,8 @@ if [ ! -f "$_orch_parity_script" ]; then
 else
   _orch_parity_out="$(python3 "$_orch_parity_script" \
        --installed-dir "$UNIT_DIR" \
-       --repo-root     "$REPO_ROOT" 2>&1)" && _orch_parity_exit=0 || _orch_parity_exit=$?
+       --repo-root     "$REPO_ROOT" \
+       --print-verdicts 2>&1)" && _orch_parity_exit=0 || _orch_parity_exit=$?
   printf '%s\n' "$_orch_parity_out"
 
   if ! printf '%s\n' "$_orch_parity_out" | grep -q '\[orchestrator_unit_parity\]'; then
@@ -251,59 +325,208 @@ else
   fi
 fi
 
-# The install is SKIPPED on a blocked gate rather than warned about, because a
+# A unit that did not clear is SKIPPED rather than warned about, because a
 # warning scrolling past in a non-interactive `set -e` script is not an
-# intervention point: the very next line would overwrite the installed units.
-# Drift does not mean the installed copy is the stale one — measured
+# intervention point: the very next line would overwrite the installed unit.
+# A finding does not mean the installed copy is the stale one — measured
 # 2026-08-02, two COMMITTED units name --config paths that do not exist on this
 # host, so copying them would break those orchestrators on their next restart.
 # The gate stays non-fatal (it never aborts the run; sections below still
 # execute), it just declines to act on an unverified diff without being told.
-if [ "$_orch_install_blocked" -eq 1 ] && [ "${DF_INSTALL_ORCH_UNITS:-0}" != "1" ]; then
-  warn "SKIPPING the orchestrator unit install — nothing copied, nothing"
-  warn "  enabled, the installed units are UNCHANGED. Read the report above and"
-  warn "  reconcile whichever side is wrong, then re-run. To install anyway:"
+#
+# Parse the machine-readable verdict lines the gate just printed.
+#
+# `while read` fed by a HERE-STRING, never `... | while read`: a pipeline runs
+# the loop body in a SUBSHELL, so every _orch_verdict[...] assignment would be
+# discarded when it exits and every unit would silently fall through to
+# `unverified`. That is a fail-safe-SHAPED bug — it installs nothing and looks
+# exactly like a gate finding — so it would survive a casual read of the output.
+# `|| true` keeps a grep that matches nothing from tripping set -e/pipefail.
+while read -r _tag _kw _unit _kinds; do
+  [ "$_kw" = verdict ] || continue
+  _orch_verdict["$_unit"]="$_kinds"
+done <<< "$(printf '%s\n' "$_orch_parity_out" \
+            | grep -F '[orchestrator_unit_parity] verdict ' || true)"
+
+# Operator-facing phrasing for each BLOCKING verdict kind. Every kind names its
+# own REMEDY, because the remedies are genuinely different and the whole point
+# of the per-unit channel is that the operator is told what to do about THIS
+# unit: byte-drift is reconciled by editing a directive (after deciding which
+# side is stale), a drop-in is removed with `systemctl --user edit`, and a
+# vanished template is a repo problem, not a host one.
+#
+# The kinds come from VERDICT_KINDS in check_orchestrator_unit_parity.py, and a
+# cross-artifact test asserts every member has an arm here.
+#
+# ARM ORDER IS PRECEDENCE, most-blocking first: the two kinds that mean "the
+# file itself is unusable" (vanished, unreadable) outrank a content finding.
+# EVERY combined arm must precede both of its single arms, or a unit with both
+# findings is reported as having only one — an incomplete remedy, which is
+# worse than none because it looks like progress.
+#
+# The checker's control flow admits exactly two combinations, and both have an
+# arm: `drift,override` (a compared unit that differs AND is drop-in'd) and
+# `override,unreadable` (the drop-in check runs BEFORE the read, so an
+# undecodable unit can still be known to carry one). `vanished` and `absent`
+# take a `continue` before anything else is consulted, and `clean` asserts the
+# absence of every other finding, so none of the three can combine at all.
+#
+# Defined here rather than near the top of this script — see the harness
+# constraint at the parity-script assignment above.
+_orch_skip_reason() {
+  case ",$1," in
+    *,vanished,*)
+      printf '%s' "there is no committed copy to install FROM (see the [vanished] report)" ;;
+    # The SECOND producible combination, and it needs its own arm for the same
+    # reason drift+override does: the checker marks `override` before it ever
+    # attempts the read, so an undecodable unit that also carries a drop-in
+    # renders `override,unreadable`. Falling through to the single unreadable
+    # arm below would send the operator to fix the file encoding, re-run, and
+    # be skipped again for a drop-in nobody mentioned. Alternated for the same
+    # contiguity reason as the drift+override arm.
+    *,override,unreadable,*|*,override,*,unreadable,*)
+      printf '%s' "a drop-in override AND a unit file that could not be read or decoded — BOTH must be resolved; inspect the drop-in with: systemctl --user cat $2" ;;
+    *,unreadable,*)
+      printf '%s' "its unit file exists but could not be read or decoded (see the [unreadable] report)" ;;
+    # ALTERNATED, and the first branch is the one that actually fires today.
+    # `*,drift,*,override,*` alone can NEVER match ",drift,override," — the
+    # comma that `,drift,` consumes is the same one `,override,` needs — so it
+    # silently lost every match to the drift-only arm below, telling an
+    # operator with both problems about one of them. The kinds are adjacent in
+    # VERDICT_KINDS, so contiguity holds today; the second branch keeps this
+    # arm firing if a future kind is ever ordered between them.
+    *,drift,override,*|*,drift,*,override,*)
+      printf '%s' "byte-drift against the committed copy AND a drop-in override — BOTH must be resolved" ;;
+    *,drift,*)
+      printf '%s' "byte-drift against the committed copy — reconcile the directive, checking WHICH side is correct" ;;
+    *,override,*)
+      printf '%s' "a drop-in override; inspect with: systemctl --user cat $2" ;;
+    *,unverified,*)
+      printf '%s' "the parity gate returned no verdict for this unit — it did not run, or does not know it" ;;
+    *)
+      # LOUD, and self-describing down to the remedy. Reaching this arm means
+      # the checker's vocabulary grew without this script following — so the
+      # message names the offending kind VERBATIM and both files that have to
+      # change, rather than degrading to a generic "skipped" that leaves the
+      # operator diffing units looking for a problem the gate already named.
+      printf '%s' "the gate reported verdict kind '$1', which this installer has no case arm for, so it declined to act rather than guess. FIX: add an arm to _orch_skip_reason in scripts/setup-host.sh for every kind in VERDICT_KINDS (scripts/check_orchestrator_unit_parity.py)" ;;
+  esac
+}
+
+# The per-unit install decision — the gate the section header describes, here
+# in code: each unit is judged on ITS OWN verdict.
+#
+# `clean` and `absent` are the two install-eligible kinds, and the checker
+# guarantees neither ever appears alongside a blocking one, so an exact match
+# on the whole kind string is the right test.
+_orch_install_units=()
+for _unit in "${_orch_units[@]}"; do
+  _kinds="${_orch_verdict[$_unit]:-unverified}"
+
+  # Checked FIRST, ahead of the override, because it is physics rather than
+  # judgement: DF_INSTALL_ORCH_UNITS=1 says "install over the reported
+  # finding", and no amount of operator intent creates a source file. A bare
+  # `cp` from a missing template exits non-zero and, under `set -euo pipefail`,
+  # aborts this whole script — so every section BELOW would silently never run
+  # because one unit's template was deleted. Measured: rc=1 at `cp: cannot
+  # stat`, no daemon-reload, no enables.
+  #
+  # Deliberately a file test rather than a fourth `vanished` case arm: it must
+  # also cover a unit the gate never reported on. `_orch_units` and the
+  # checker's registry are kept in step by a test, but under the override a
+  # unit with no verdict is installed on trust, and trust does not create a
+  # file.
+  #
+  # It covers EXISTENCE only, and deliberately so — a source that exists can
+  # still be uncopyable (mode 000, or an installed copy this user cannot
+  # overwrite). That half is caught by the install loop's own failure handling
+  # below rather than by a pre-flight test, because only the copy itself knows.
+  if [ ! -f "$REPO_ROOT/scripts/$_unit" ]; then
+    warn "SKIPPING $_unit — $(_orch_skip_reason vanished "$_unit"); its installed copy is UNCHANGED"
+    continue
+  fi
+
+  if [ "${DF_INSTALL_ORCH_UNITS:-0}" = "1" ] || [ "$_kinds" = clean ] || [ "$_kinds" = absent ]; then
+    _orch_install_units+=("$_unit")
+  else
+    warn "SKIPPING $_unit — $(_orch_skip_reason "$_kinds" "$_unit"); its installed copy is UNCHANGED"
+  fi
+done
+
+if [ "${#_orch_install_units[@]}" -eq 0 ]; then
+  warn "SKIPPING the orchestrator unit install — NO unit cleared the gate, so"
+  warn "  nothing was copied, nothing enabled, the installed units are"
+  warn "  UNCHANGED. Read the report above and reconcile whichever side is"
+  warn "  wrong, then re-run. To install anyway:"
   warn "    DF_INSTALL_ORCH_UNITS=1 bash scripts/setup-host.sh"
 else
-  if [ "$_orch_install_blocked" -eq 1 ]; then
+  if [ "$_orch_install_blocked" -eq 1 ] && [ "${DF_INSTALL_ORCH_UNITS:-0}" = "1" ]; then
     warn "DF_INSTALL_ORCH_UNITS=1 — installing over the reported drift"
   fi
 
-  cp "$REPO_ROOT/scripts/orchestrator-dark-factory.service"   "$UNIT_DIR/"
-  cp "$REPO_ROOT/scripts/orchestrator-reify.service"          "$UNIT_DIR/"
-  cp "$REPO_ROOT/scripts/orchestrator-autopilot-video.service" "$UNIT_DIR/"
-  cp "$REPO_ROOT/scripts/orchestrator-my-solar-challenge.service" "$UNIT_DIR/"
-  cp "$REPO_ROOT/scripts/orchestrator-solar-challenge-platform.service" "$UNIT_DIR/"
-  cp "$REPO_ROOT/scripts/orchestrator-know-live.service"      "$UNIT_DIR/"
-  cp "$REPO_ROOT/scripts/orchestrator-pump-web-ui.service"    "$UNIT_DIR/"
-  cp "$REPO_ROOT/scripts/orchestrator-watchdog.service"       "$UNIT_DIR/"
-  cp "$REPO_ROOT/scripts/orchestrator-watchdog.timer"         "$UNIT_DIR/"
+  # Each copy is INDIVIDUALLY fault-tolerant, for the same reason the source
+  # existence test above exists: under `set -euo pipefail` one failing `cp`
+  # aborts this script outright, taking daemon-reload, every enable, and every
+  # LATER section of the host installer (jCodeMunch, Claude config, ...) with
+  # it. A unit is a bad reason to abandon a host setup.
+  #
+  # The existence test cannot cover this: the checker's `unreadable` is raised
+  # on (OSError, UnicodeDecodeError), and the OSError half is exactly a file
+  # `cp` cannot touch. Measured with DF_INSTALL_ORCH_UNITS=1 against a mode-000
+  # installed unit: `cp` exits 1 at "cannot create regular file: Permission
+  # denied". (The UnicodeDecodeError half really is harmless — `cp` copies
+  # bytes and never decodes.)
+  #
+  # A unit whose copy FAILED is dropped from _orch_installed_units, so it is
+  # neither enabled (enabling it would act on bytes nobody managed to write)
+  # nor counted in the success line below.
+  _orch_installed_units=()
+  for _unit in "${_orch_install_units[@]}"; do
+    if cp "$REPO_ROOT/scripts/$_unit" "$UNIT_DIR/"; then
+      _orch_installed_units+=("$_unit")
+    else
+      warn "FAILED to install $_unit — its installed copy is UNCHANGED; check permissions on $REPO_ROOT/scripts/$_unit and $UNIT_DIR/$_unit"
+    fi
+  done
 
+  # ONCE, between the copies and the enables: systemd must not be asked to
+  # enable a unit it has not re-read, and re-running it per unit would only
+  # repeat work the first call already did.
   systemctl --user daemon-reload
-  # Watchdog timer always enabled — it's the safety net that revives a
-  # dead-enabled orchestrator (e.g. after a boot-race dependency cancel).
-  systemctl --user enable orchestrator-watchdog.timer
-  # Both orchestrators enabled by default to match the running production stack
-  # (they coexist on separate escalation ports: reify=8100, dark-factory=8102).
-  # Disable selectively if a host should not be part of the unattended workload.
-  systemctl --user enable orchestrator-reify.service
-  systemctl --user enable orchestrator-dark-factory.service
-  # autopilot-video joined the unattended workload 2026-05-29 (separate target,
-  # selected purely via --config). Enabled by default like the other two.
-  systemctl --user enable orchestrator-autopilot-video.service
-  # my-solar-challenge joined 2026-05-31 (escalation port 8106). Enabled by default.
-  systemctl --user enable orchestrator-my-solar-challenge.service
-  # solar-challenge-platform joined 2026-06-21 (escalation port 8107). Enabled by default.
-  systemctl --user enable orchestrator-solar-challenge-platform.service
-  # know-live (escalation port 8105) has had a committed template since e5273d8623
-  # and a running unit on the host, but was never wired in here — an omission, not
-  # a policy: this script marks real exclusions with an explicit "Deliberately NOT
-  # wired" note and carries none for know-live. Enabled by default like the rest.
-  systemctl --user enable orchestrator-know-live.service
-  # pump-web-ui joined 2026-07-17 (escalation port 8108) and likewise ran on the
-  # host with no committed template until task 3641 transcribed it. Enabled by default.
-  systemctl --user enable orchestrator-pump-web-ui.service
-  ok "orchestrator units + watchdog installed and enabled"
+
+  # Enable exactly what was INSTALLED — _orch_installed_units, never
+  # _orch_units. A unit whose install the gate declined, or whose copy failed,
+  # must not be enabled either: enabling it acts on the very state the skip (or
+  # the failure) left unwritten, and on a first run it would enable a unit that
+  # is not on disk at all.
+  #
+  # Within that set the obligation is DERIVED from each unit's own [Install]
+  # section, not from a hand-listed exception for the static watchdog service.
+  # Two reasons, both load-bearing:
+  #   - `systemctl enable` on a unit with no [Install] is an ERROR, not a
+  #     no-op, so under `set -e` a hand-list that fell out of step with the
+  #     units would abort the installer outright.
+  #   - a hand-maintained exception list has to be edited for every future
+  #     unit, and a unit nobody remembers to add is precisely the class of bug
+  #     the array above exists to close.
+  # This is the same rule tests/scripts/test_orchestrator_service_files.py's
+  # _unit_has_install_section predicate expresses in Python.
+  for _unit in "${_orch_installed_units[@]}"; do
+    if grep -q '^\[Install\]' "$REPO_ROOT/scripts/$_unit"; then
+      systemctl --user enable "$_unit"
+    fi
+  done
+
+  # Reports what was ACTUALLY done, not what was attempted: with a per-unit
+  # gate a partial install is now a normal outcome, and an unqualified success
+  # line would read as "all nine" on a run that installed one. Counted from the
+  # units that COPIED, so a failed `cp` is never reported as an install.
+  if [ "${#_orch_installed_units[@]}" -eq 0 ]; then
+    warn "NO orchestrator unit was installed — every copy that cleared the gate"
+    warn "  FAILED; the installed units are UNCHANGED. See the FAILED lines above."
+  else
+    ok "orchestrator units + watchdog installed and enabled (${#_orch_installed_units[@]}/${#_orch_units[@]})"
+  fi
 fi
 
 # ---------------------------------------------------------------------------

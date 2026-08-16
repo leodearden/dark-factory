@@ -38,6 +38,34 @@ import re
 
 import pytest
 
+# Section 5's parsing is SHARED with
+# tests/scripts/test_check_orchestrator_unit_parity.py, whose registry
+# staleness guard derives the checker's UNITS set from the same `_orch_units`
+# array. Both modules held private copies pinned to the same brittle source
+# text; importable by name because tests/scripts/conftest.py puts this
+# directory on sys.path (cf. systemd_unit_invariants.py).
+from setup_host_parsing import (
+    DECISION_LOOP_HEADER as _DECISION_LOOP_HEADER,
+)
+from setup_host_parsing import (
+    INSTALL_LIST_APPEND as _INSTALL_LIST_APPEND,
+)
+from setup_host_parsing import (
+    INSTALL_LOOP_CP as _INSTALL_LOOP_CP,
+)
+from setup_host_parsing import (
+    INSTALL_LOOP_HEADER as _INSTALL_LOOP_HEADER,
+)
+from setup_host_parsing import (
+    UNIT_DIR_VAR as _UNIT_DIR_VAR,
+)
+from setup_host_parsing import (
+    declared_orchestrator_units as _declared_orchestrator_units,
+)
+from setup_host_parsing import (
+    shell_statements as _shell_statements,
+)
+
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 DF_SERVICE = REPO_ROOT / "scripts" / "orchestrator-dark-factory.service"
 REIFY_SERVICE = REPO_ROOT / "scripts" / "orchestrator-reify.service"
@@ -783,31 +811,25 @@ def _unit_has_install_section(content: str) -> bool:
     return "Install" in _parse_sections(content)
 
 
-def _shell_statements(script_text: str) -> list[str]:
-    """Non-comment, non-blank statements of a shell script, whitespace-stripped.
-
-    Comments are dropped so that a unit merely NAMED in the section header
-    prose above the cp block cannot satisfy an assertion that the installer
-    actually copies it.
-    """
-    return [
-        stripped
-        for line in script_text.splitlines()
-        if (stripped := line.strip()) and not stripped.startswith("#")
-    ]
-
-
 # Parsed once at import and shared by every consumer below (the parametrized
 # installer guard, one case per template, plus the SETUP.md parity guard) —
 # setup-host.sh does not change under a test run, so re-reading and re-parsing
 # it per case bought nothing.
 SETUP_HOST_STATEMENTS = _shell_statements(SETUP_HOST_SH.read_text(encoding="utf-8"))
 
-# Destination the installer must copy units into: ~/.config/systemd/user, via
-# the $UNIT_DIR variable setup-host.sh defines.  Asserted explicitly because a
-# `cp` to anywhere else leaves the unit uninstalled just as surely as no `cp`
-# at all — which is the failure class this whole section exists to close.
-_UNIT_DIR_VAR = "$UNIT_DIR"
+# The enable obligation is decided at RUN TIME from the unit's own [Install]
+# section — the same rule _unit_has_install_section expresses here in Python —
+# rather than from a hand-maintained exception list naming the static watchdog
+# service.  See test_setup_host_installs_every_orchestrator_unit.
+#
+# Pinned as the whole `if ...; then` statement rather than the bare grep, so
+# this asserts the predicate is used as a GUARD.  A grep whose result is
+# discarded would enable the static watchdog service — an error, not a no-op,
+# which under `set -e` aborts the installer.
+_ENABLE_INSTALL_GUARD = (
+    "if grep -q '^\\[Install\\]' \"$REPO_ROOT/scripts/$_unit\"; then"
+)
+_ENABLE_STATEMENT = 'systemctl --user enable "$_unit"'
 
 
 def test_setup_host_install_predicate_discriminates() -> None:
@@ -867,34 +889,76 @@ def test_setup_host_installs_every_orchestrator_unit(
     This does NOT assert the converse (that the installer names no unknown
     unit) — a `cp` of a template this glob cannot see would fail the installer
     loudly at run time, so it needs no test.
+
+    Shape note: setup-host.sh declares its units once as `_orch_units` and
+    loops, so coverage is a MEMBERSHIP question here plus two assertions that
+    the loops act on the array.  Those two are what keep membership meaningful:
+    a unit listed in an array nothing iterates is exactly as uninstalled as a
+    unit nobody listed.
     """
     basename = service_path.name
+    declared = _declared_orchestrator_units()
 
-    expected_cp = f'cp "$REPO_ROOT/scripts/{basename}" "{_UNIT_DIR_VAR}/"'
-    copied = any(
-        stmt.startswith("cp ")
-        and f"scripts/{basename}" in stmt
-        and _UNIT_DIR_VAR in stmt
-        for stmt in SETUP_HOST_STATEMENTS
+    # Guard the guard: an array parse that silently returned nothing would make
+    # the membership assertion below fail with a message blaming the installer
+    # for omitting a unit it in fact lists.
+    assert declared, (
+        f"Parsed ZERO units out of {SETUP_HOST_SH.name}'s `_orch_units` array. "
+        "The installer's declaration idiom has changed and "
+        "_ORCH_UNITS_ARRAY_RE no longer matches it — fix the regex, do not "
+        "weaken this test."
     )
-    assert copied, (
-        f"{SETUP_HOST_SH.name} never copies {basename} into {_UNIT_DIR_VAR}, so a "
-        "fresh host never gets that unit. The destination is asserted, not just "
-        "the source: a cp of the template to a staging path or any other "
-        "directory leaves the unit just as uninstalled as no cp at all. Add a "
-        f"line to the cp block:\n    {expected_cp}"
+
+    assert basename in declared, (
+        f"{SETUP_HOST_SH.name}'s `_orch_units` array does not list {basename}, so "
+        "a fresh host never gets that unit — however correct its contents. Add "
+        f"it to the array:\n    {basename}\nDeclared today: {sorted(declared)}"
     )
+
+    for expected, why in (
+        (
+            _DECISION_LOOP_HEADER,
+            "declares `_orch_units` but nothing iterates it, so listing "
+            f"{basename} there installs nothing",
+        ),
+        (
+            _INSTALL_LIST_APPEND,
+            "never adds a unit that cleared the parity gate to "
+            "`_orch_install_units`, so nothing is ever queued for install",
+        ),
+        (
+            _INSTALL_LOOP_HEADER,
+            "does not install from the CLEARED set, so the per-unit gate "
+            "decision has no effect on what reaches the host",
+        ),
+        (
+            _INSTALL_LOOP_CP,
+            f"does not copy into {_UNIT_DIR_VAR} with the copy's failure "
+            "handled; the destination is asserted, not just the source (a cp "
+            "of the template to a staging path leaves the unit just as "
+            "uninstalled as no cp at all), and so is the `if` around it (a "
+            "bare cp aborts the whole installer on the first unwritable unit)",
+        ),
+    ):
+        assert expected in SETUP_HOST_STATEMENTS, (
+            f"{SETUP_HOST_SH.name} {why}. Expected the statement:\n    {expected}"
+        )
 
     content = service_path.read_text(encoding="utf-8")
     if not _unit_has_install_section(content):
         return
 
-    expected_enable = f"systemctl --user enable {basename}"
-    enabled = any(stmt.startswith(expected_enable) for stmt in SETUP_HOST_STATEMENTS)
-    assert enabled, (
-        f"{basename} declares an [Install] section but {SETUP_HOST_SH.name} never "
-        "enables it, so it is copied to the host and then never starts at boot. "
-        f"Add a line to the enable block:\n    {expected_enable}"
+    assert _ENABLE_STATEMENT in SETUP_HOST_STATEMENTS, (
+        f"{basename} declares an [Install] section but {SETUP_HOST_SH.name} has no "
+        "enable loop, so it is copied to the host and then never starts at boot. "
+        f"Expected the statement:\n    {_ENABLE_STATEMENT}"
+    )
+    assert _ENABLE_INSTALL_GUARD in SETUP_HOST_STATEMENTS, (
+        f"{SETUP_HOST_SH.name}'s enable loop does not gate on the unit's own "
+        "[Install] section, so it would either skip enable-able units or run "
+        "`systemctl enable` on a static one — which is an ERROR, not a no-op, "
+        "and under `set -e` aborts the installer. Expected:\n"
+        f"    {_ENABLE_INSTALL_GUARD}"
     )
 
 
@@ -936,21 +1000,33 @@ _ORCHESTRATOR_UNIT_RE = re.compile(r"orchestrator-[\w.-]+?\.service")
 def _enabled_orchestrator_service_units() -> set[str]:
     """Orchestrator .service units that setup-host.sh actually enables.
 
-    Derived from the same comment-stripped view of setup-host.sh that the
-    installer-coverage guard uses, so the doc is checked against what the
-    installer DOES, never against what its section header prose says.
+    Derived from the declared ``_orch_units`` array — what the installer DOES,
+    never what its section header prose says — filtered by the SAME two rules
+    the installer's enable loop applies at run time:
 
-    The ``.service`` filter naturally drops ``orchestrator-watchdog.timer``,
-    which setup-host.sh also enables and which SETUP.md correctly tells the
-    reader to KEEP enabled (it skips disabled units, so it is harmless).
+    1. The ``.service`` suffix, which naturally drops
+       ``orchestrator-watchdog.timer``.  setup-host.sh enables that too, and
+       SETUP.md correctly tells the reader to KEEP it enabled (it skips
+       disabled units, so it is harmless).
+    2. The unit's own ``[Install]`` section, which is the shell's
+       ``grep -q '^\\[Install\\]'`` predicate expressed here in Python.  This
+       drops ``orchestrator-watchdog.service``: it is static, and
+       ``systemctl enable`` on it is an error rather than a no-op.
+
+    Deriving instead of scanning for one literal ``systemctl --user enable
+    <unit>`` statement per unit is what keeps this in step now that the
+    installer loops: the loop carries ONE enable statement for all nine units,
+    so a per-statement scan would collapse this set to empty and make the
+    SETUP.md parity guard below pass vacuously.
     """
-    prefix = "systemctl --user enable "
     units = set()
-    for stmt in SETUP_HOST_STATEMENTS:
-        if not stmt.startswith(prefix):
+    for unit in _declared_orchestrator_units():
+        if not (unit.startswith("orchestrator-") and unit.endswith(".service")):
             continue
-        unit = stmt.split()[-1]
-        if unit.startswith("orchestrator-") and unit.endswith(".service"):
+        template = REPO_ROOT / "scripts" / unit
+        if not template.is_file():
+            continue
+        if _unit_has_install_section(template.read_text(encoding="utf-8")):
             units.add(unit)
     return units
 

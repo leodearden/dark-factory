@@ -100,9 +100,9 @@ or prompt text that must stay in agreement with another site? What is the
 shared-helper / render-from-code alternative?
 
 **Survey evidence**: `canonical_queued_branch_name` un-normalized site
-(`server.py:1000`); already-merged guard duplicated until 5026;
-sibling-tool envelope divergence; hand-transcribed prompt text drifted
-twice in one file.
+(`escalation/src/escalation/server.py::merge_request`); already-merged
+guard duplicated until 5026; sibling-tool envelope divergence;
+hand-transcribed prompt text drifted twice in one file.
 
 **House pattern**: Extract helper (`canonical_queued_branch_name`); render
 prompts/examples from live schemas (2559) with drift/pinning tests.
