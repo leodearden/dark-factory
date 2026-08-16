@@ -84,6 +84,13 @@ A run that compared ZERO units can NEVER report parity.  This vocabulary is
 adopted unchanged from ``check_dashboard_unit_parity.py`` so setup-host.sh's
 existing 0/2/other branch shape carries over verbatim.
 
+NOTE these three codes describe the run as a WHOLE, and cannot say which unit
+they are about: with nine units, one finding collapses the run to 1 and says
+nothing about the other eight.  A consumer that needs to act per unit — as
+``setup-host.sh`` does — should read the PER-UNIT channel instead, via
+``--print-verdicts``; see "Machine-readable verdicts" below.  The exit codes
+are unchanged by that flag, so the two channels never disagree.
+
 Machine-readable verdicts
 -------------------------
 The exit code above is a WHOLE-RUN verdict: with nine units, one drifted unit
@@ -165,6 +172,14 @@ merely warning — a warning in a non-interactive ``set -e`` script scrolls
 past and the next line does the overwrite anyway.  An operator who has read
 the report and decided the committed side is right proceeds with
 ``DF_INSTALL_ORCH_UNITS=1``.  The gate never aborts the installer itself.
+
+Since task 4198 that skip is PER UNIT — the installer reads the verdict
+channel above and declines only the units that did not clear, installing the
+rest on the same run.  The policy is unchanged: a unit with a finding is
+still never overwritten without ``DF_INSTALL_ORCH_UNITS=1``.  So the four
+units in the second bullet are still protected from exactly the overwrite
+this section warns about, while a permanent, deliberate divergence on one
+unit no longer withholds the install from every other.
 
 Fixing all five is OWNED by the follow-up filed from task 3424 as ticket
 ``tkt_0RRZWH0V5F9PPG86A1WDJ3NV2R``.  Task 3424 deliberately converged only

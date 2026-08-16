@@ -135,6 +135,20 @@ fi
 # ---------------------------------------------------------------------------
 # 5. Orchestrator systemd units + watchdog
 # ---------------------------------------------------------------------------
+# The install is gated PER UNIT (task 4198). Each unit is judged on its own
+# parity verdict, so a finding on one no longer declines the install of all
+# nine. The POLICY is unchanged and still ratified — a unit that did not clear
+# is never overwritten without DF_INSTALL_ORCH_UNITS=1, because a difference
+# does not tell you which side is stale — only the blast radius shrinks.
+#
+# HARNESS CONSTRAINT, and it bites silently: the behavioural tests slice this
+# file from the FIRST mention of the parity checker's file name through the
+# install construct's closing `fi`, and EXECUTE that slice. Naming that file in
+# the prose below — anywhere above the `_orch_parity_script=` assignment —
+# moves the slice's start upward and makes the test suite run this section's
+# `install -m 0755 ... "$HOME/bin/..."` against the developer's REAL home
+# directory. Refer to it as "the parity gate" up here; name the file below.
+#
 # Installs and enables (kept in step with scripts/orchestrator-*.service by
 # test_setup_host_installs_every_orchestrator_unit — every template must be
 # copied here, and every template with an [Install] section must be enabled):
@@ -149,6 +163,14 @@ fi
 #   - orchestrator-watchdog.service/.timer  (60s liveness probe + dead-enabled revival)
 #     The .service is static (no [Install]) — the .timer carries the install, so
 #     only the timer is enabled below. `systemctl enable` on it would error.
+#     This pair is WHY the gate is per-unit. Under the old all-or-nothing gate
+#     the deliberate, permanent orchestrator-reify.service.d/warm-lane.conf
+#     drop-in on this host (owned by the reify repo, installed by its
+#     install-warm-lane-units.sh — NOT drift, and not going away) declined the
+#     install of every unit including these two, so a plain re-run could never
+#     reinstall or re-enable the supervision safety net. On 2026-08-10 that
+#     left the fleet 31.8h stale. It now blocks reify alone, and a plain
+#     `bash scripts/setup-host.sh` is the natural repair path for the pair.
 #
 # Drift direction (task 3641): know-live and pump-web-ui were transcribed from
 # the running host into the repo, i.e. committed-follows-installed. BOTH have
@@ -191,13 +213,21 @@ install -m 0755 "$REPO_ROOT/scripts/wait-for-port.py" "$HOME/bin/wait-for-port.p
 # unlike the dashboard's template-rendered unit, these are plain cp targets, so
 # a second run would only restate what the copy just did.)
 #
-# NON-FATAL, but not merely advisory: drift never aborts this script (the
+# NON-FATAL, but not merely advisory: a finding never aborts this script (the
 # sections below still run, and five of the seven registered units are KNOWN
-# RED on this host until the follow-up task lands) — it makes the ORCHESTRATOR
-# UNIT INSTALL opt-in instead. A bare warning would not be an intervention
-# point in a non-interactive `set -e` script: it scrolls past and the next line
+# RED on this host until the follow-up task lands) — it makes the install of
+# THAT UNIT opt-in instead. A bare warning would not be an intervention point
+# in a non-interactive `set -e` script: it scrolls past and the next line
 # overwrites the units anyway, so the operator is told to check the direction
 # at the one moment they can no longer act on it.
+#
+# PER UNIT since task 4198. The gate runs ONCE and reports a verdict for each
+# unit; the install decision is then taken per unit from those verdicts. What
+# changed is only the blast radius — a unit that did not clear is still never
+# overwritten without DF_INSTALL_ORCH_UNITS=1. What it buys: a permanent,
+# deliberate divergence on ONE unit (the reify warm-lane drop-in) no longer
+# holds the other eight hostage, which is what made the watchdog pair
+# unrepairable by the installer that is supposed to install it.
 #
 # NOTE the report does not mean "the installed copy is stale". Measured
 # 2026-08-02, the direction varies per unit: the repo copy is correct for
@@ -294,14 +324,19 @@ else
   fi
 fi
 
-# The install is SKIPPED on a blocked gate rather than warned about, because a
+# A unit that did not clear is SKIPPED rather than warned about, because a
 # warning scrolling past in a non-interactive `set -e` script is not an
-# intervention point: the very next line would overwrite the installed units.
-# Drift does not mean the installed copy is the stale one — measured
+# intervention point: the very next line would overwrite the installed unit.
+# A finding does not mean the installed copy is the stale one — measured
 # 2026-08-02, two COMMITTED units name --config paths that do not exist on this
 # host, so copying them would break those orchestrators on their next restart.
 # The gate stays non-fatal (it never aborts the run; sections below still
 # execute), it just declines to act on an unverified diff without being told.
+#
+# Since task 4198 that decision is taken PER UNIT rather than for the block as
+# a whole, so the units that DID clear are still installed and enabled on the
+# same run. The skip itself is unchanged in strength: same default, same
+# DF_INSTALL_ORCH_UNITS=1 override, same refusal to guess which side is stale.
 # Parse the machine-readable verdict lines the gate just printed.
 #
 # `while read` fed by a HERE-STRING, never `... | while read`: a pipeline runs
