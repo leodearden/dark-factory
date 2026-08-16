@@ -41,7 +41,7 @@ tasks:
         verdict: PASS
         delivered_check:
           kind: grep
-          pattern: "answers PRD open question 4"
+          pattern: "--q-ceiling"
           paths: ["scripts/run_fable_trial_v2_campaign.py"]
           expect: present
       - name: "driver-copy-source-exists"
