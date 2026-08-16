@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import html.parser
 import re
+from pathlib import Path
 
 import pytest
 from starlette.testclient import TestClient
@@ -868,6 +869,92 @@ _PRESENCE_CONTRACTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         r'<details\s+open=',
         ('<details',),
     ),
+    # -----------------------------------------------------------------------
+    # The rest of the class.  The five entries above are the ones MEASURED to
+    # be false-passing; these twelve are the remaining positive presence greps
+    # in this file, all of which were still reading the raw `body`.  Every one
+    # of them passes all three arms today — they are here as REGRESSION guards,
+    # and because enumerating instances has already failed once: item (2a) of
+    # the task this lands with exists solely because item (2) listed the sites
+    # it happened to notice rather than closing the class.  A grep that is
+    # discriminating today silently stops being so the next time the .jsx
+    # prose grows, and nothing would say a word.
+    # -----------------------------------------------------------------------
+    (
+        'MemoryEvalsSection function declaration',
+        r'\bfunction\s+MemoryEvalsSection\s*\(',
+        ('function MemoryEvalsSection(',),
+    ),
+    (
+        # Deletion target is the `= window.DF_CHARTS;` tail, not the whole
+        # destructure: adding a primitive to the list must not break the guard
+        # (it would fail as a stale deletion target, which reads like a bug in
+        # the .jsx rather than in this table).  The tail IS the accessing act.
+        'DF_CHARTS module-level destructure',
+        r'const\s*\{([^}]*)\}\s*=\s*window\.DF_CHARTS\s*;',
+        ('} = window.DF_CHARTS;',),
+    ),
+    (
+        'window.DF_DATA read',
+        r'window\.DF_DATA',
+        ('= window.DF_DATA;',),
+    ),
+    (
+        'evals list read',
+        r'\.evals\b',
+        ('payload.evals',),
+    ),
+    (
+        'eval card keyed on eval_id',
+        r'key=\{[^}]*\beval_id\b',
+        ('key={ev.eval_id}',),
+    ),
+    (
+        'metrics list read',
+        r'\.metrics\b',
+        ('ev.metrics',),
+    ),
+    (
+        'metric row keyed on metric_id',
+        r'key=\{[^}]*\bmetric_id\b',
+        ('key={m.metric_id}',),
+    ),
+    (
+        'per-metric escalation guard',
+        r'm\.escalation\s*&&',
+        ('m.escalation && (',),
+    ),
+    (
+        # The `MEDF\.` disjunct is a spelling pin that nothing matches today
+        # (the `payload` local is what the banner reads); it is kept verbatim
+        # from the assertion it replaces rather than quietly narrowed, since
+        # this step moves WHICH TEXT the greps run over, not what they accept.
+        'storm banner reads the top-level block',
+        r'(payload|MEDF\.MEMORY_EVALS|MEMORY_EVALS)\s*\.\s*storm_escape',
+        ('payload.storm_escape',),
+    ),
+    (
+        'per-metric link suppressed under storm',
+        r"parity\s*===\s*'storm_collapsed'",
+        ("parity === 'storm_collapsed'",),
+    ),
+    (
+        # A region ANCHOR, not a plain presence grep: its group(1) is fed to
+        # downstream assertions about the captured block.  It belongs in this
+        # table for the same reason as the rest — anchored to a comment, the
+        # capture is prose and every downstream assertion is about prose.
+        'stale hint branch',
+        r'ev\.stale\s*&&\s*\(([\s\S]{0,700}?)\n\s*\)\}',
+        ('ev.stale && (',),
+    ),
+    (
+        # The other region anchor.  Comment-stripping only ever grows what its
+        # fixed-width window reaches, so the captured block is a superset of
+        # the code it captured before.
+        'artifact issues notice',
+        r'data-testid="memory-eval-issues"([\s\S]{0,1600})',
+        ('data-testid="memory-eval-issues"',),
+    ),
 )
 
 
@@ -983,6 +1070,69 @@ def test_presence_greps_are_falsified_by_deleting_the_code(
             'alone. A mention is not a render: delete the code, keep the prose, and '
             'the live assertion stays green. Anchor the pattern to code syntax the '
             'prose does not reproduce.'
+        )
+
+
+# The one shape a live presence assertion may take.  Restated here rather than
+# left implicit because the test below is what forces it: the pattern comes
+# from the table (so hardening it hardens the assertion), and BOTH the alias
+# resolution and the search run over `code` (so no comment can answer it).
+_CONSUMPTION_SHAPE = (
+    r're\.search\(\s*_presence_pattern\(\s*[\'"]{label}[\'"]\s*,\s*(\w+)\s*\)\s*,\s*(\w+)'
+)
+
+
+def test_every_presence_contract_is_consumed_over_comment_stripped_source() -> None:
+    """A contract nobody consumes guards nothing.
+
+    `test_presence_greps_are_falsified_by_deleting_the_code` proves each
+    pattern in the table discriminates.  That is worth exactly nothing if the
+    live assertion greps something else: the table would be a well-tested
+    museum piece next to the untested assertion that actually runs.  This is
+    the other half — every entry must be reached by a real assertion, through
+    `_presence_pattern`, over the comment-stripped fixture.
+
+    Enforced by reading this module's own source, which is the only way to see
+    the shape of a call rather than its result.  Two things are checked per
+    contract, and they are different claims:
+
+    (1) the pattern is CONSUMED from the table, not restated at the call site.
+        A copy-pasted regex is what lets a hardened pattern and a live
+        assertion drift apart, which is the failure this whole table exists to
+        make impossible.
+    (2) the assertion searches `code`, never `body`.  This is the original
+        defect: eight of the greps below hunted the raw served file, where
+        ~150 lines of prose name most of the fields the render code names.
+
+    A NEW presence grep therefore cannot be added the old way.  Writing
+    `assert 'foo' in body` and walking away leaves this test silent, but a
+    contract added to the table without a consumer fails here, and a consumer
+    written against `body` fails here too.  The table is the front door.
+    """
+    src = Path(__file__).read_text(encoding='utf-8')
+
+    for label, _pattern, _deletions in _PRESENCE_CONTRACTS:
+        call = re.search(_CONSUMPTION_SHAPE.format(label=re.escape(label)), src)
+        assert call is not None, (
+            f'[{label}] is in _PRESENCE_CONTRACTS but no assertion consumes it via '
+            f'`re.search(_presence_pattern({label!r}, code), code)`. The contract is '
+            'mutation-tested and then ignored — whatever assertion is really about '
+            'this fact is greping a pattern nothing checks. Route it through the '
+            'table, or drop the entry.'
+        )
+        alias_arg, searched = call.group(1), call.group(2)
+        assert alias_arg == 'code', (
+            f'[{label}] resolves its `{{alias}}` against {alias_arg!r} rather than '
+            'the comment-stripped `code`. The alias must be derived from the same '
+            'text the assertion searches, or the anchor is pinned to a spelling '
+            'that a comment supplied.'
+        )
+        assert searched == 'code', (
+            f'[{label}] is searched over {searched!r}, not the comment-stripped '
+            '`code` fixture. A presence grep over the raw body is answered by the '
+            '.jsx prose: delete the render site, keep the sentence describing it, '
+            'and the assertion stays green with the feature gone. That is the exact '
+            'false pass this table was built to close.'
         )
 
 
