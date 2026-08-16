@@ -43,8 +43,15 @@ the card while those arms were measured.  Re-deriving it needs docker, systemd
 and the shared 3090 — and, pointedly, may be REFUSED by the very guard v5 adds
 if ollama is resident, which is the whole reason the guard exists.  So the
 version check became :data:`ACCEPTED_ARTIFACT_SCHEMA_VERSIONS` (see its
-comment) rather than being relaxed or, worse, greened by hand.  The owed re-run
-is filed as a follow-up task; do not close that gap by editing this file.
+comment) rather than being relaxed or, worse, greened by hand.
+
+That widening is a WIDENING, and this file says so rather than dressing it up:
+against the v4 artifact the live guards are the two version pins and the
+"carries none of the consumer keys" check, which is what stops a hand-edited
+v4 faking an inventory.  The stronger checks — a measured inventory and a
+CLEAN pollution state — start applying when the artifact is re-derived at v5,
+and not before.  The owed re-run is filed as task 4229
+(:data:`_OWED_LIVE_RERUN_TASK_ID`); do not close that gap by editing this file.
 """
 from __future__ import annotations
 
@@ -77,16 +84,39 @@ MANIFEST_PATH = _LMS_DIR / 'arms.yaml'
 #: 1. `test_the_accepted_set_expires_at_the_next_schema_bump` pins
 #:    `max(...) == REPORT_SCHEMA_VERSION`, so v6 turns this file RED and forces
 #:    a conscious decision here instead of the clause silently sliding forward.
-#: 2. The version-specific tests below are STRICTER than the equality they
-#:    replace: a v5 artifact must carry a measured inventory and a CLEAN
-#:    pollution state, and a grandfathered v4 must carry NO inventory keys at
-#:    all -- so a v4 file hand-edited to look like it recorded consumers fails.
+#: 2. `test_the_accepted_set_grandfathers_exactly_one_older_version` pins the
+#:    remainder to exactly `_GRANDFATHERED_ARTIFACT_SCHEMA_VERSION`, so a
+#:    SECOND older version cannot join the set without an edit here either.
+#: 3. The grandfathered branch of
+#:    `test_the_committed_artifact_accounts_for_who_else_held_the_card` is a
+#:    LIVE assertion, not a skip: the v4 file must carry NONE of the consumer
+#:    keys, so it cannot be hand-edited to fake an inventory.
 #:
-#: The owed live re-run is filed as a follow-up task, not left implicit.
+#: WHAT THIS IS AND IS NOT, stated honestly because a claim the suite does not
+#: enforce is worse than no claim.  Against the CURRENT v4 artifact the live
+#: checks are exactly (2), (3) and the expiry pin -- that is a real guard, but
+#: it is NOT the strictly-stronger check the widening once claimed to be.  The
+#: ADDITIONAL strictness -- a measured non-empty inventory and a CLEAN
+#: pollution state -- begins the moment the artifact is re-derived at v5, and
+#: is not in force today.
+#:
+#: The owed live re-run is FILED, not implicit: see _OWED_LIVE_RERUN_TASK_ID.
 ACCEPTED_ARTIFACT_SCHEMA_VERSIONS = frozenset({4, 5})
 
 #: The first version whose reports carry the consumer inventory (task 3755).
 _CONSUMER_EVIDENCE_SCHEMA_VERSION = 5
+
+#: The ONE older version this gate still accepts, and the reason the clause is
+#: narrow rather than open-ended.  Named so both the accepted-set pin and the
+#: grandfathered branch below refer to the same number.
+_GRANDFATHERED_ARTIFACT_SCHEMA_VERSION = 4
+
+#: The filed, closeable work item that ends the grandfather clause: task 4229,
+#: "lms: re-run the live 7-arm slate to regenerate health-report.json at schema
+#: v5" (pending; sibling filing 4202 covers the same gap, so the pin survives a
+#: dedupe of either).  A temporary exemption pointing at a real task can be
+#: closed; one pointing at nobody becomes permanent.
+_OWED_LIVE_RERUN_TASK_ID = '4229'
 
 #: The v5 vram keys.  Named once so both directions of the check use the same
 #: list and cannot drift apart.

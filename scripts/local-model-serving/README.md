@@ -615,11 +615,15 @@ cannot say who else held the card while those arms were measured. Re-deriving
 it needs docker, systemd and the shared 3090, and may itself be *refused* by the
 v5 guard if ollama is resident, which is the whole point of the guard. So the
 gate's version check is `ACCEPTED_ARTIFACT_SCHEMA_VERSIONS = {4, 5}` — a narrow,
-self-expiring grandfather clause that is *stricter* than the equality it
-replaced (a v5 artifact must carry a measured inventory and a `CLEAN` state; a
-v4 must carry none of those keys, so it cannot be hand-edited to fake one) and
-that turns red at the next bump. The owed live re-run is a filed follow-up
-task; do not close it by editing the artifact.
+self-expiring grandfather clause, and a *widening* of the equality it replaced
+rather than a strengthening of it. What still runs live against today's v4 file
+is: the v4 block must carry **none** of the five consumer keys (so it cannot be
+hand-edited to fake an inventory), the set may grandfather exactly one named
+older version, and the set expires at the next schema bump. The *additional*
+strictness — a v5 artifact must carry a measured inventory and a `CLEAN`
+pollution state — begins the moment the artifact is re-derived at v5, and is not
+in force today. That re-run is filed as task **4229**; do not close it by editing
+the artifact.
 
 ---
 
