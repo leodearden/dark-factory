@@ -1,7 +1,7 @@
 """Per-module conflict analysis — input for hand-curated orchestrator.yaml overrides.
 
 Reads ``runs.db`` events (``lock_acquired`` / ``lock_released`` /
-``task_skipped`` / ``merge_attempt`` / ``service_restart``) and aggregates:
+``task_skipped`` / ``service_restart``) and aggregates:
 
 * total dispatches
 * average hold time, and how much of it is censored (see below)
@@ -198,9 +198,12 @@ def _iter_events(
             'SELECT id, timestamp, run_id, task_id, event_type, data '
             'FROM events '
             'WHERE timestamp >= ? '
+            # Exactly the four types something downstream reads.  `merge_attempt`
+            # was selected here until task 3869's review and consumed by nothing:
+            # not the counters, not `iter_hold_spans`' interesting set.  It only
+            # grew the materialized list.
             "AND event_type IN "
-            "('lock_acquired','lock_released','task_skipped','merge_attempt',"
-            "'service_restart') "
+            "('lock_acquired','lock_released','task_skipped','service_restart') "
             # iter_hold_spans needs ONE stream in the store's own order, or a
             # release could be applied before its acquire.
             'ORDER BY id ASC',
@@ -255,9 +258,11 @@ def aggregate(db_path: Path, since: datetime) -> dict[str, ModuleStats]:
     # Hold accounting is NOT done here (PRD INV-5): one shared era-boundary
     # span-closing helper serves both the predictor and this report, so the two
     # cannot drift on what an acquire, a release or a lost process means.  The
-    # `task_skipped` / `merge_attempt` rows in this list are safe to hand over:
-    # they are not in the helper's interesting set and are skipped before
-    # `run_id` is read, so they cannot fabricate an era boundary.
+    # `task_skipped` rows in this list are safe to hand over: they are not in
+    # the helper's interesting set and are skipped before `run_id` is read, so
+    # one landing between two runs cannot shift where the era boundary closes.
+    # Pinned by test_analyze_modules.py, since that ordering lives in the OTHER
+    # module and nothing here would notice it changing.
     for span in hold_history.iter_hold_spans(rows):
         entry = stats[span.module]
         entry.total_hold_secs += span.duration

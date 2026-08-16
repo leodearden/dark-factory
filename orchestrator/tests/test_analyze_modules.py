@@ -210,7 +210,6 @@ def test_aggregate_reports_truncated_holds_per_module(canonical_trace_db: Path):
         'shared/src': 1,
         'fused-memory/src': 1,
     }
-    assert len(F.EXPECTED_TRUNCATED_SPANS) == 3, 'the fixture oracle still says three'
     assert stats['orchestrator/src'].truncated_fraction() == pytest.approx(1 / 5)
 
 
@@ -231,8 +230,8 @@ def test_a_service_restart_row_closes_the_hold_it_interrupted(tmp_path: Path):
     assert stats['fused-memory/src'].hold_samples == 1
     assert stats['fused-memory/src'].total_hold_secs == pytest.approx(200.0)
     assert stats['fused-memory/src'].truncated_holds == 1
-    # The restart row's task_id is the TRIGGER task, not a lock holder.
-    assert F.SERVICE_RESTART_TRIGGER_TASK not in {'T5'}
+    # The restart row's task_id is the TRIGGER task, not a lock holder, so it
+    # opens no span and contributes no key of its own.
     assert list(stats) == ['fused-memory/src'], 'the restart names no module of its own'
 
 
@@ -256,6 +255,53 @@ def test_a_run_transition_closes_at_the_previous_rows_timestamp(tmp_path: Path):
     assert stats['shared/src'].total_hold_secs == pytest.approx(100.0), \
         'closed at 1400 (last evidence of the hold), not at 1500'
     assert stats['shared/src'].truncated_holds == 1
+
+
+def test_an_uninteresting_row_between_runs_does_not_move_the_boundary(tmp_path: Path):
+    """`aggregate` hands `iter_hold_spans` rows it selected for its OWN counters.
+
+    A `task_skipped` row is one of them, and the run-transition boundary closes
+    at "the previous row's timestamp" -- so if the span helper updated `prev_at`
+    before checking its interesting set, a skip landing in the gap between two
+    runs would silently move every truncated duration in the report.  Nothing
+    in this module would notice: the ordering lives in hold_history.
+
+    Same trace as the test above, plus a skip at 1450 in the gap.  The answer
+    must not move off 100.0s.
+    """
+    db = _trace_db(tmp_path, rows=[
+        F.acquire(14, 1300, 'T7', ['shared/src']),
+        F.acquire(15, 1360, 'T8', ['orchestrator/src']),
+        F.release(16, 1400, 'T8', ['orchestrator/src']),
+        # In the gap, and still run-a: 1450 would be the close timestamp if the
+        # helper let an uninteresting row carry `prev_at` forward.
+        F.row(17, 1450, 'task_skipped', task_id='T9',
+              run_id=F.RUN_A, data={'modules': ['shared/src']}),
+        F.acquire(18, 1500, 'T9', ['shared/src'], run_id=F.RUN_B),
+    ])
+
+    stats = aggregate(db, _BEFORE_TRACE)
+
+    assert stats['shared/src'].total_hold_secs == pytest.approx(100.0), \
+        'the skip in the gap must not become the close timestamp (that would be 150.0)'
+    assert stats['shared/src'].truncated_holds == 1
+    # ...and it still counts for what it IS.
+    assert stats['shared/src'].skipped_waiting == 1
+
+
+def test_merge_attempt_rows_are_not_selected(tmp_path: Path):
+    """Nothing downstream reads them -- not the counters, not the span helper --
+    so they are filtered at the SQL rather than materialized and discarded."""
+    db = _trace_db(tmp_path, rows=[
+        F.acquire(1, 0, 'T1', ['orchestrator/src']),
+        F.row(2, 30, 'merge_attempt', task_id='T1',
+              run_id=F.RUN_A, data={'modules': ['orchestrator/src']}),
+        F.release(3, 60, 'T1', ['orchestrator/src']),
+    ])
+
+    rows = list(_iter_events(db, _BEFORE_TRACE))
+
+    assert [r['event_type'] for r in rows] == ['lock_acquired', 'lock_released']
 
 
 def test_a_double_acquire_keeps_the_hold_it_force_closes(tmp_path: Path):
