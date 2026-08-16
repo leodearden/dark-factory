@@ -52,7 +52,6 @@ reproducing the very bug under test. This module needs no such literal today
 from __future__ import annotations
 
 import hashlib
-import inspect
 import json
 import re
 import uuid
@@ -330,93 +329,50 @@ def _unrepaired_danger_records(report: dict) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Vocabulary drift — the hand copy vs the production script
+# Vocabulary — DANGER_FLAGS binds the production script's export
 # ---------------------------------------------------------------------------
 
 
-def _production_danger_flags() -> tuple[set[str], str]:
-    """The danger-flag set the SCRIPT actually acts on, plus where it came from.
+class TestDangerFlagsBindTheProductionVocabulary:
+    """DANGER_FLAGS binds the script's export; this pins the binding and each flag.
 
-    PREFERS a real exported constant. The moment the script grows one (the
-    clean fix — see the note on the getsource exception below), this binds to
-    it and the source-reading branch goes dormant with no test-side edit.
+    ``DANGER_FLAGS`` IS ``_mod.HUMAN_ADJUDICATION_FLAGS`` (task 3738). There is
+    no hand copy left to compare it against, so nothing here reads the script's
+    source: the earlier ``inspect.getsource`` + regex-over-source helper was
+    deleted once the export existed, because from that moment its
+    export-preferring branch always returned and the comparison it fed was
+    ``set(X) == set(X)`` — an unfalsifiable test guarding an unreachable
+    fallback, in the exact brittle style this suite documents having removed
+    (da8e5a4c96).
 
-    Falls back to reading the flag names out of ``resolve_exit_code``'s source,
-    because that function IS the production consumer of these flags and is
-    today the only place they are enumerated.
+    Two things are pinned instead, both falsifiable: that the binding is still
+    the export object itself, and that every name in it is one the production
+    exit-code predicate genuinely escalates to a human.
 
-    NORM EXCEPTION, stated rather than smuggled: fused-memory's tests
-    deliberately avoid ``inspect.getsource`` tripwires — four sites document
-    having REMOVED them as brittle (test_tool_errors.py, test_stages.py,
-    test_mem0_tombstone.py, test_bulk_reset_guard.py, citing da8e5a4c96) — and
-    the standing preference is a runtime-behaviour test instead. That norm
-    targets guards that pin WORDING or assert "pattern X must not reappear",
-    which go stale on any behaviour-preserving rewrite. This is a different
-    thing: it binds a VOCABULARY that has no exported constant to bind to, and
-    the behavioural half is here too (``test_each_flag_forces_a_non_zero_exit``
-    drives the real predicate). The exception is also self-limiting — it
-    disappears when the constant is exported, which is filed as follow-up.
-    """
-    for name in ('HUMAN_ADJUDICATION_FLAGS', 'DANGER_FLAGS'):
-        exported = getattr(_mod, name, None)
-        if exported is not None:
-            return set(exported), f'{name} exported by the script'
-    source = inspect.getsource(_mod.resolve_exit_code)
-    # Only record.get(...) — report.get('counts'/'truncated'/'records') are the
-    # run-level conditions, not per-record human-adjudication outcomes.
-    names = re.findall(r"record\.get\(\s*'([A-Za-z_][A-Za-z0-9_]*)'", source)
-    if not names:
-        # The one brittleness the norm warns about, made ACTIONABLE instead of
-        # cryptic: a behaviour-preserving refactor (iterating some constant
-        # this helper does not know the name of) empties the parse, and a bare
-        # set-difference would then read as "the script dropped all four
-        # flags". Say what actually happened and what to do about it.
-        pytest.fail(
-            'resolve_exit_code() no longer spells the danger flags inline, so '
-            'this module can no longer derive them from it. If they now live '
-            'in a module-level constant, name it HUMAN_ADJUDICATION_FLAGS (or '
-            'add its name to _production_danger_flags) so DANGER_FLAGS binds '
-            'to the real thing instead of drifting from it silently.'
-        )
-    return set(names), 'resolve_exit_code() source'
-
-
-class TestDangerFlagsMatchTheProductionScript:
-    """DANGER_FLAGS now binds directly to the script's own export. This backstops that.
-
-    DANGER_FLAGS is ``_mod.HUMAN_ADJUDICATION_FLAGS`` (task 3738), not a hand
-    copy, so ``test_hand_copy_equals_what_the_script_acts_on`` below is
-    ordinarily a tautology -- both sides resolve to the same tuple. It stays
-    as a backstop against a regression where DANGER_FLAGS is ever rebound to
-    a fresh literal (re-introducing the hand-copy hazard this task removed):
-    divergence there fails in the WORST direction, since a fifth danger
-    outcome added upstream would make ``_unrepaired_danger_records()`` return
-    ``[]`` for a record carrying it, every test in
-    ``TestUnrepairedMutationsAreTracked`` would take its ``if not outstanding``
-    early exit, and the suite would report all-green while a real unrepaired
-    live-corpus mutation landed with no tracking entry required — this module's
-    own failure class, reintroduced one level up.
+    The binding is worth a test because losing it fails in the WORST direction.
+    A DANGER_FLAGS rebound to a literal that has dropped a flag makes
+    ``_unrepaired_danger_records()`` return ``[]`` for a record carrying that
+    outcome, every test in ``TestUnrepairedMutationsAreTracked`` takes its ``if
+    not outstanding`` early exit, and the suite reports all-green while a real
+    unrepaired live-corpus mutation lands with no tracking entry required.
+    Note that the parametrized test below cannot catch that on its own: a
+    dropped flag also shrinks its parametrize set, so it stays green.
     """
 
-    def test_hand_copy_equals_what_the_script_acts_on(self) -> None:
-        production, origin = _production_danger_flags()
-        # Widened to set[str]: the tuple's inferred literal type makes the
-        # difference operator ill-typed against a set[str] read at runtime.
-        hand_copy: set[str] = set(DANGER_FLAGS)
-        assert hand_copy == production, (
-            f'DANGER_FLAGS {sorted(DANGER_FLAGS)} != the flags the script acts '
-            f'on {sorted(production)} (read from {origin}).'
-            '\n  missing here: '
-            f'{sorted(production - hand_copy)}'
-            '\n  stale here:   '
-            f'{sorted(hand_copy - production)}'
-            '\nRe-bind DANGER_FLAGS. Do NOT delete this assertion: while the '
-            'two lists disagree, an unrepaired mutation carrying a flag this '
-            'module does not know about is tracked by nobody and the whole '
-            'TestUnrepairedMutationsAreTracked class silently no-ops.'
+    def test_danger_flags_is_the_scripts_export(self) -> None:
+        assert DANGER_FLAGS is _mod.HUMAN_ADJUDICATION_FLAGS, (
+            'DANGER_FLAGS is no longer the HUMAN_ADJUDICATION_FLAGS object the '
+            'script exports. Re-bind it directly '
+            '(DANGER_FLAGS = _mod.HUMAN_ADJUDICATION_FLAGS) rather than '
+            're-typing the names: a fresh literal is a hand copy again, and '
+            'one that has silently dropped a flag passes every other test in '
+            'this class while _unrepaired_danger_records() goes blind to that '
+            'outcome. Identity is asserted rather than equality precisely so '
+            'that an equal-valued literal does not slip through today and '
+            'drift tomorrow.'
         )
 
-    def test_no_duplicates_in_the_hand_copy(self) -> None:
+    def test_no_duplicate_flag_names(self) -> None:
         assert len(set(DANGER_FLAGS)) == len(DANGER_FLAGS), (
             f'DANGER_FLAGS {DANGER_FLAGS} repeats a name'
         )

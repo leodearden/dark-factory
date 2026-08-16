@@ -270,7 +270,7 @@ class TestResolveExitCode:
     # Sourced from the script's own export, not re-typed, so this parametrize
     # set cannot silently drift from what resolve_exit_code() actually acts on
     # (task 3738; see also test_toolcall_xml_leak_sweep_artifacts.py's
-    # TestDangerFlagsMatchTheProductionScript, which binds the same constant).
+    # TestDangerFlagsBindTheProductionVocabulary, which binds the same constant).
     @pytest.mark.parametrize('flag', _mod.HUMAN_ADJUDICATION_FLAGS)
     def test_every_per_record_failure_flag_exits_non_zero(self, flag):
         """Each of these leaves a record a human still has to adjudicate, so
