@@ -1411,7 +1411,12 @@ def create_server(
           (fast-path — no enqueue, no request_id)
           or the worker detected the branch was already merged via merge marker
           (worker-path — also carries request_id and a None commit from
-          outcome.merge_sha).  All keys are present in both paths; callers
+          outcome.merge_sha).  The degeneracy guard REDIRECTS a degenerate
+          branch from the fast path to the worker rather than eliminating it:
+          the worker reaches ``already_merged`` by its own ancestry
+          short-circuit, so this status is still reachable for that shape — but
+          it arrives with ``commit=None`` and a request_id instead of the
+          parked foreign SHA.  All keys are present in both paths; callers
           can safely read reason/conflict_details/push_status without KeyError.
         """
         if merge_queue is None:
@@ -1483,10 +1488,49 @@ def create_server(
             #
             # Fail-soft with its OWN try/except (merge_request's fast-path has
             # no enclosing fire-safe wrapper): a probe fault must never break
-            # submission.  The failure direction is benign either way — an
-            # over-tightened check merely falls through to the normal
-            # coalesce/enqueue, where the worker re-detects already-merged.
-            # That is a redundant no-op merge, never a wrong answer.
+            # submission.
+            #
+            # What declining the fast path actually does.  NOT "the worker
+            # re-detects already-merged, a redundant no-op merge" — the worker
+            # performs no merge at all here.  merge_queue.py:5616 finds
+            # effective_tip (the parked base) an ancestor of main;
+            # _already_merged_is_genuine (:5455) resolves candidate_tip to that
+            # same parked base and returns True at its FIRST ancestry check
+            # (:5515); :5650 returns a terminal MergeOutcome('already_merged')
+            # with merge_sha=None, which the terminal-outcome block below maps
+            # to {'status':'already_merged', 'commit': None, 'request_id': ...}.
+            # A degenerate branch is therefore REDIRECTED to the worker, not
+            # eliminated, and this guard buys exactly three things:
+            #   (i)   the submit-time response can no longer carry the parked
+            #         foreign SHA as 'commit', which skills/unblock/SKILL.md
+            #         stamps verbatim as done_provenance={"commit": ...} — a
+            #         fabricated provenance record pointing at an unrelated
+            #         task's commit;
+            #   (ii)  the submission becomes an auditable queue record (a
+            #         request_id and a merge_queued event) instead of a silent
+            #         submit-time short-circuit;
+            #   (iii) on the worker path 'commit' is None, which routes that
+            #         same runbook clause to its exact-subject marker search —
+            #         empty for a genuinely unmerged branch — and thence to a
+            #         {"note": ...} provenance rather than a SHA.
+            # Residual, stated plainly: 'status' is still 'already_merged',
+            # which the runbooks treat as terminal success, so the phantom-done
+            # hole is narrowed, not closed.  Follow-up
+            # tkt_0RSHM98C6F78MW4J0SK3S29YZG; single fix point
+            # merge_queue.py:5515.
+            #
+            # Why this task does NOT instead gate _already_merged_is_genuine on
+            # branch_is_degenerate: that makes the worker fall THROUGH and
+            # merge.  _classify_branch_presence (merge_queue.py:3939) returns
+            # None because the ref is present, and `git merge --no-ff
+            # <ancestor>` is a no-op ("Already up to date.", rc 0, HEAD
+            # unchanged), so merge_to_main's `git rev-parse HEAD`
+            # (git_ops.py:9306) reads back that unchanged main HEAD and reports
+            # MergeResult(success=True, merge_commit=<unrelated main commit>).
+            # That converts today's already_merged/None into a 'done' carrying
+            # a real-looking foreign SHA — strictly worse — and burns a
+            # head-of-line verify slot on a guaranteed no-op.  Long form lives
+            # in the ticket above.
             try:
                 degenerate = await branch_is_degenerate(
                     git_ops_for_scan, full_branch,
@@ -1767,8 +1811,10 @@ def create_server(
         # Resolved within clamp → fall through to terminal outcome shape below.
         # 'commit' (outcome.merge_sha) is included for shape convergence with the
         # fast-path already_merged response.  It is None for most statuses and for
-        # the worker-produced already_merged case (merge marker path returns no SHA);
-        # it is non-None for 'done' and 'done_wip_recovery' where main was advanced.
+        # the worker-produced already_merged case (neither the merge-marker path
+        # nor the ancestry short-circuit that a degenerate branch takes returns a
+        # SHA); it is non-None for 'done' and 'done_wip_recovery' where main was
+        # advanced.
         result: dict[str, Any] = {
             'status': outcome.status,
             'request_id': merge_req.request_id,
