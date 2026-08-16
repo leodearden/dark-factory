@@ -227,21 +227,37 @@ def suggest_max_per_module(entry: ModuleStats) -> int:
     return 4
 
 
+#: Module-column width.  A depth-2 lock module such as
+#: ``fused-memory/src/fused_memory/reconciliation`` overflows the 32 this used
+#: to be, and two distinct hot modules sharing a 32-char prefix rendered as the
+#: SAME label — leaving an operator unable to tell which key the ``suggest``
+#: column meant.  Wide enough for the longest key in the measured evidence.
+_MODULE_COL = 56
+
+
 def render_table(stats: dict[str, ModuleStats]) -> str:
-    """Human-readable table sorted by descending conflict rate."""
+    """Human-readable table sorted by descending conflict rate.
+
+    ``trunc`` is how many of the hold samples behind ``avg_hold_s`` are
+    right-censored lower bounds rather than clean releases.
+    """
     lines = [
-        f'{"module":<32} {"dispatches":>12} {"skipped":>10} '
-        f'{"conflict":>10} {"avg_hold_s":>12} {"suggest":>8}'
+        f'{"module":<{_MODULE_COL}} {"dispatches":>12} {"skipped":>10} '
+        f'{"conflict":>10} {"avg_hold_s":>12} {"trunc":>7} {"suggest":>8}'
     ]
     ranked = sorted(
         stats.items(),
         key=lambda kv: (-kv[1].conflict_rate(), -kv[1].dispatches),
     )
     for module, entry in ranked:
+        # Deliberately NOT truncated to the column width: a clipped lock key is
+        # not a key, and pasting one into `module_overrides` silently does
+        # nothing.  An over-long module pushes its own row wide instead.
         lines.append(
-            f'{module[:32]:<32} {entry.dispatches:>12d} '
+            f'{module:<{_MODULE_COL}} {entry.dispatches:>12d} '
             f'{entry.skipped_waiting:>10d} {entry.conflict_rate():>10.2f} '
-            f'{entry.avg_hold_secs():>12.1f} {suggest_max_per_module(entry):>8d}'
+            f'{entry.avg_hold_secs():>12.1f} {entry.truncated_holds:>7d} '
+            f'{suggest_max_per_module(entry):>8d}'
         )
     return '\n'.join(lines)
 
@@ -254,6 +270,8 @@ def render_json(stats: dict[str, ModuleStats]) -> str:
             'skipped_waiting': e.skipped_waiting,
             'conflict_rate': round(e.conflict_rate(), 4),
             'avg_hold_secs': round(e.avg_hold_secs(), 2),
+            # How much of avg_hold_secs rests on censored lower bounds.
+            'truncated_holds': e.truncated_holds,
             'suggested_max_per_module': suggest_max_per_module(e),
         }
         for module, e in stats.items()
