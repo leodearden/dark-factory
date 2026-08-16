@@ -5,8 +5,9 @@ call sites, against an unbounded and growing number of ``TaskConfigDir``
 construction sites — and nothing asserted that ratio. A per-investigation
 config dir added to ``dry_run_unblock`` (commit 7a07c40820) was therefore
 ``rmtree``'d with its transcript intact and nobody noticed, because the
-teardown backstop composes ``f'claude-config-{branch}'`` literally
-(git_ops.py:11780) and silently never matched the ``-unblock`` suffix.
+teardown backstop in ``GitOps.cleanup_worktree`` composes
+``f'claude-config-{branch}'`` literally and silently never matched the
+``-unblock`` suffix.
 
 Fixing that one site does not stop the next one. This gate makes the audit
 DURABLE: each construction site must appear in
@@ -27,7 +28,7 @@ from collections import Counter
 from pathlib import Path
 
 import pytest
-from config_dir_archival_allowlist import AUDITED_SITES, DISPOSITIONS
+from config_dir_archival_allowlist import ARCHIVED, AUDITED_SITES, DISPOSITIONS
 from silent_fallthrough_scan import (
     _build_parent_map,
     _compute_qualname,
@@ -43,8 +44,24 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SiteKey = tuple[str, str]
 
 
-def _scan_task_config_dir_sites(repo_root: Path) -> list[_SiteKey]:
-    """Return a site key per ``TaskConfigDir(...)`` construction in first-party source.
+def _scan(repo_root: Path) -> tuple[list[_SiteKey], list[_SiteKey]]:
+    """Return ``(construction_sites, archival_reference_sites)``.
+
+    One AST walk yields both halves of the audit:
+
+    * every ``TaskConfigDir(...)`` construction — the thing that must carry a
+      recorded disposition;
+    * every reference to the name ``archive_task_transcripts`` — the thing that
+      makes an ``ARCHIVED`` disposition TRUE rather than merely asserted.
+
+    The second is deliberately a NAME scan, not a call scan: all three
+    producers pass the archiver as a value to ``asyncio.to_thread(...)`` rather
+    than calling it directly, so ``ast.Call(func=Name)`` would match none of
+    them. A ``from ... import archive_task_transcripts`` produces an
+    ``ast.alias``, not an ``ast.Name``, so module-level imports do not
+    contaminate the result — which is what lets the gate distinguish
+    ``TaskWorkflow._invoke`` (archives) from ``TaskWorkflow._recycle_config_dir``
+    (does not) inside the same module.
 
     ``iter_first_party_files`` already encodes the 7 scope roots, the
     ``tests``/``mem0``/``graphiti``/``conftest.py`` exclusions, and a
@@ -57,10 +74,15 @@ def _scan_task_config_dir_sites(repo_root: Path) -> list[_SiteKey]:
     shape this repo's gates exist to prevent.
     """
     sites: list[_SiteKey] = []
+    archival_refs: list[_SiteKey] = []
     for py_file in iter_first_party_files(repo_root):
         tree = ast.parse(py_file.read_text(encoding='utf-8'), filename=str(py_file))
         parent_map = _build_parent_map(tree)
+        rel = py_file.relative_to(repo_root).as_posix()
         for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and node.id == 'archive_task_transcripts':
+                archival_refs.append((rel, _compute_qualname(node, parent_map)))
+                continue
             if not isinstance(node, ast.Call):
                 continue
             func = node.func
@@ -72,16 +94,23 @@ def _scan_task_config_dir_sites(repo_root: Path) -> list[_SiteKey]:
                 continue
             if callee != 'TaskConfigDir':
                 continue
-            sites.append((
-                py_file.relative_to(repo_root).as_posix(),
-                _compute_qualname(node, parent_map),
-            ))
-    return sites
+            sites.append((rel, _compute_qualname(node, parent_map)))
+    return sites, archival_refs
 
 
 @pytest.fixture(scope='module')
-def scanned_sites() -> list[_SiteKey]:
-    return _scan_task_config_dir_sites(_REPO_ROOT)
+def scan_result() -> tuple[list[_SiteKey], list[_SiteKey]]:
+    return _scan(_REPO_ROOT)
+
+
+@pytest.fixture(scope='module')
+def scanned_sites(scan_result) -> list[_SiteKey]:
+    return scan_result[0]
+
+
+@pytest.fixture(scope='module')
+def archival_ref_sites(scan_result) -> set[_SiteKey]:
+    return set(scan_result[1])
 
 
 def _allowlist_keys() -> list[_SiteKey]:
@@ -144,6 +173,18 @@ class TestEverySiteIsAudited:
                     f'{key}: an UNARCHIVED_GAP must name its follow-up, or the '
                     f'gap is just an accepted loss with extra steps.'
                 )
+            if entry['disposition'] == ARCHIVED:
+                assert entry.get('archives_in'), (
+                    f'{key}: an ARCHIVED entry must name where the archival '
+                    f'actually happens, as a tuple of (path, qualname) pairs. '
+                    f'Without it the disposition is an unfalsifiable claim.'
+                )
+            else:
+                assert 'archives_in' not in entry, (
+                    f'{key}: archives_in is meaningful only for ARCHIVED; a '
+                    f'{entry["disposition"]} entry that names an archival site '
+                    f'is self-contradictory.'
+                )
 
 
 class TestGateSelfIntegrity:
@@ -164,9 +205,11 @@ class TestGateSelfIntegrity:
     def test_dry_run_unblock_disposition_is_archived(self):
         """Task 3271's fix is pinned in the audit record, not only in behaviour.
 
-        A revert of the producer hook in run_dry_run_unblock's finally must fail
-        HERE as well as in test_dry_run_unblock.py — the record and the code
-        cannot silently disagree about whether that site archives.
+        This half is the RECORD half — it says only what the table claims. The
+        claim is made falsifiable by
+        :meth:`TestDispositionsMatchTheCode.test_archived_entries_really_archive`,
+        which re-derives the archival references from the AST; deleting the
+        producer hook fails there.
         """
         matches = [
             e for e in AUDITED_SITES
@@ -176,10 +219,81 @@ class TestGateSelfIntegrity:
         assert len(matches) == 1, (
             f'Expected exactly one audited dry_run_unblock site, got {matches}'
         )
-        assert matches[0]['disposition'] == 'ARCHIVED', (
+        assert matches[0]['disposition'] == ARCHIVED, (
             'run_dry_run_unblock archives its per-investigation config dir '
             '(task 3271). If that hook was removed, restore it rather than '
             'downgrading this record: the cleanup_worktree backstop composes '
             "f'claude-config-{branch}' literally and can never cover a "
             "'-unblock' dir, so nothing else archives that transcript."
+        )
+
+
+class TestDispositionsMatchTheCode:
+    """The record must be falsifiable, not merely self-consistent.
+
+    Comparing two constants committed in the same diff proves nothing: deleting
+    a producer hook would leave an ``ARCHIVED`` label sitting there, green and
+    lying. These tests re-derive from the AST which functions actually reference
+    ``archive_task_transcripts`` and cross-check both directions, so the record
+    and the code cannot silently disagree.
+    """
+
+    def test_archived_entries_really_archive(self, archival_ref_sites):
+        """Every ARCHIVED entry's declared archival site must exist in the code."""
+        broken: list[str] = []
+        for entry in AUDITED_SITES:
+            if entry['disposition'] != ARCHIVED:
+                continue
+            for path, qualname in entry.get('archives_in', ()):
+                if (path, qualname) not in archival_ref_sites:
+                    broken.append(
+                        f'  {entry["path"]} :: {entry["qualname"]}  claims '
+                        f'ARCHIVED via {path} :: {qualname} — but no reference '
+                        f'to archive_task_transcripts was found there'
+                    )
+        assert not broken, (
+            'Audit record disagrees with the code — an ARCHIVED disposition '
+            'whose archival hook is gone:\n' + '\n'.join(broken)
+            + '\n\nEither the hook was removed (restore it — nothing else '
+              'archives these transcripts) or it moved (update archives_in). '
+              'Do NOT downgrade the disposition to make this pass without '
+              'first checking whether the transcripts are still being kept.\n'
+              f'Archival references found in the tree: {sorted(archival_ref_sites)}'
+        )
+
+    def test_unarchived_entries_really_do_not_archive(self, archival_ref_sites):
+        """An UNARCHIVED_* site whose own function archives is a stale record.
+
+        Checked against the enclosing FUNCTION, not the module: workflow.py
+        contains both an archiving function (``TaskWorkflow._invoke``) and a
+        non-archiving one (``TaskWorkflow._recycle_config_dir``), so a
+        module-level check would launder that gap into a false pass.
+        """
+        contradictions = [
+            f'  {e["path"]} :: {e["qualname"]}  is recorded {e["disposition"]}'
+            for e in AUDITED_SITES
+            if e['disposition'] != ARCHIVED
+            and (e['path'], e['qualname']) in archival_ref_sites
+        ]
+        assert not contradictions, (
+            'Audit record disagrees with the code — a site recorded as NOT '
+            'archiving now references archive_task_transcripts:\n'
+            + '\n'.join(contradictions)
+            + '\n\nIf the gap was closed, promote the entry to ARCHIVED and give '
+              'it an archives_in; if not, the reference needs explaining.'
+        )
+
+    def test_archival_reference_scan_is_not_vacuous(self, archival_ref_sites):
+        """Floor guard for the second scan, mirroring the site-count floor.
+
+        A Name-scan that silently found nothing would make
+        ``test_unarchived_entries_really_do_not_archive`` pass vacuously. (The
+        ARCHIVED direction self-guards — it fails loudly on an empty scan — but
+        the UNARCHIVED direction does not, so it needs this.)
+        """
+        assert len(archival_ref_sites) >= 3, (
+            f'Only {len(archival_ref_sites)} archive_task_transcripts reference '
+            f'site(s) found: {sorted(archival_ref_sites)}. Three producers are '
+            f'known (TaskWorkflow._invoke, GitOps.cleanup_worktree, '
+            f'run_dry_run_unblock) — is repo_root correct? ({_REPO_ROOT})'
         )
