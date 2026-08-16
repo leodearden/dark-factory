@@ -619,16 +619,28 @@ ANCESTRY_CHECK_INSTRUCTIONS = """\
     #           `git update-ref refs/heads/main <new> <old>` in `GitOps.advance_main`;
     #           every worktree reads that one shared ref out of the common `.git` dir,
     #           so a landed advance is visible here immediately, with no sync step.
-    #           Do NOT run `git fetch` here -- it cannot move `refs/heads/main`, only
-    #           the merge worker's local ref write does. More generally, do NOT try to
-    #           sync or advance this checkout at all (a `git pull`, `fetch origin
-    #           main:main`, etc. are the same mistake): every such attempt only touches
-    #           `refs/remotes/*` and the object store, so it is a strict no-op for this
-    #           comparison, and re-running afterward reproduces the same rc=1, the exact
-    #           false "really off main" verdict this block exists to prevent. If a merge
-    #           may still be in flight, confirm with `mcp__escalation__merge_status` and
-    #           re-run this same check once it reports the merge landed. Still rc=1
-    #           after that -> the SHA really is off main; re-derive the landing commit.
+    #           Do NOT run `git fetch` / `git fetch --all` here for THIS rc=1
+    #           comparison -- verified no-op: fetch writes only `refs/remotes/*`
+    #           and the object store, so it cannot move `refs/heads/main`, and
+    #           re-running afterward reproduces the same rc=1, the exact false
+    #           "really off main" verdict this block exists to prevent. (fetch
+    #           remains the right move under rc=128 below -- there the missing
+    #           thing is an unresolvable OBJECT, not a ref position.) More
+    #           generally, no local sync/advance operation helps THIS
+    #           comparison -- only the merge worker's own ref write does -- and
+    #           two of them are actively dangerous, not merely useless: `git
+    #           pull` WOULD move `refs/heads/main` (it merges origin/main into
+    #           the checked-out branch), racing the merge worker's own CAS `git
+    #           update-ref refs/heads/main <new> <old>` in `GitOps.advance_main`;
+    #           `fetch origin main:main` fails HARD instead (git refuses to
+    #           write a ref checked out in a worktree). Never run either in an
+    #           orchestrator checkout. If a merge may still be in flight,
+    #           confirm instead with `mcp__escalation__merge_status(request_id=
+    #           <from merge_request>)`, or `merge_status(task_id=<task>)` /
+    #           `merge_status(branch=<branch>)` when you have no request_id,
+    #           then re-run this same check once it reports the merge landed.
+    #           Still rc=1 after that -> the SHA really is off main; re-derive
+    #           the landing commit.
     # rc=128 -> git cannot resolve <sha> (or `main`) in this checkout: "fatal: Not a
     #           valid object name". This is NOT "not on main" -- it is "not yet
     #           confirmed". Usually a stale/unfetched <project_root>, a wrong -C path,
