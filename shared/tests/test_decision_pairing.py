@@ -1,0 +1,357 @@
+"""Tests for shared.decision_pairing — the semantic cross-pairing detector.
+
+Task 3967. The damage class is a ``design_decisions`` entry whose ``decision``
+and ``rationale`` are each perfectly well-formed prose but whose *association*
+is wrong. Nothing is malformed and no sentinel is present, so
+``shared.toolcall_markup.detect`` is structurally blind to it — the two damage
+classes are disjoint at the detector, which is why this is a separate module
+rather than a widening of that one.
+
+The only machine-visible trace is the **correction entry an author appends
+after noticing**. That is what this predicate keys on, and it is why every
+count derived from it is a strict lower bound.
+
+TDD pair 1 (step 1/2): :func:`detect_mispairing`, the entry-level predicate.
+TDD pair 2 (step 3/4): :func:`scan_design_decisions`, the document walker.
+TDD pair 3 (step 5/6): the committed-corpus replay.
+
+## Specimens are modelled on real victim text
+
+Every hand-authored specimen below is paraphrased from an entry actually
+observed in a live plan (the task id is named in each docstring), not invented.
+The committed corpus in ``TestCommittedCorpus`` replays the real text verbatim;
+these exist to state the CONTRACT in a form a reader can check by eye, and to
+cover the one branch no live specimen exercises (see
+``test_pairing_language_in_rationale_alone_counts``).
+
+## Sentinel-literal hazard — DO NOT "helpfully" un-escape these
+
+Every envelope literal in this file is spelled with the ``\\x3c`` escape for
+the opening angle bracket, exactly as ``shared/tests/test_toolcall_markup.py``
+and ``fused_memory/utils/toolcall_xml_leak.py`` lines 77-86 require. Writing
+one verbatim here would force any agent editing this file to emit that literal
+inside its own tool-call envelope, reproducing a defect adjacent to the one
+these tests pin. It is byte-identical at runtime and never appears verbatim in
+the file text. Leave it escaped.
+"""
+from __future__ import annotations
+
+import pytest
+
+from shared.decision_pairing import (
+    HEADER_MARKERS,
+    PAIRING_MARKERS,
+    MispairingHit,
+    detect_mispairing,
+)
+
+# ---------------------------------------------------------------------------
+# Specimens, paraphrased from live victim plans.
+# ---------------------------------------------------------------------------
+
+# Modelled on 3098[1] / 3216[1] / 3473[1] — by far the commonest live shape.
+CORRECTION_DECISION = (
+    'CORRECTION of the preceding entry, whose rationale was mis-paired with '
+    'its statement. The two were recorded in one call and the arguments were '
+    'associated the wrong way round; read this entry as the authoritative one.'
+)
+CORRECTION_RATIONALE = (
+    'The preceding entry states the scoping choice but carries the rationale '
+    'for the timeout override, which belongs to a different decision entirely.'
+)
+
+# Modelled on 3298[1] — the header form with an explicit slash.
+RESTATEMENT_DECISION = (
+    'CORRECTION/RESTATEMENT of decision #1, which was mis-paired with the '
+    'rationale for decision #2 when both were recorded.'
+)
+
+# Modelled on 3567[3] and 3209[3].
+READ_THIS_INSTEAD_DECISION = (
+    'READ THIS INSTEAD OF DECISIONS 2 AND 3, whose decision-lines and '
+    'rationales were cross-paired: each rationale sits under the other '
+    'decision-line.'
+)
+
+# Modelled on 3042[2] and 4096[3] — the SUPERSEDES header used for a genuine
+# mis-pairing, which is what makes 3382[5] below a discriminating control.
+SUPERSEDES_DECISION = (
+    'SUPERSEDES the entry above, whose rationale was mis-paired: the text '
+    'recorded there argues for the atomic-write choice, not for this one.'
+)
+
+# Modelled on 3210[1].
+CORRECTED_DECISION = (
+    'CORRECTED entry. The rationale immediately above was recorded against '
+    'the wrong decision-line; this entry restores the intended association.'
+)
+
+# Modelled on 3727[1], the wire-evidence specimen.
+MIS_TITLED_DECISION = (
+    'CORRECTION of the mis-titled entry above: the preceding rationale '
+    'belongs to THIS decision, not to the one it was filed under.'
+)
+
+# Modelled on 3209[3] — the `swapped` phrasing.
+SWAPPED_DECISION = (
+    'READ THIS INSTEAD OF THE TWO ENTRIES ABOVE, whose rationales were '
+    'swapped at the point they were recorded.'
+)
+
+ORDINARY_RATIONALE = (
+    'Re-verified on this worktree against the live code path before the '
+    'entry was written; the measurement is reproducible from the scanner.'
+)
+
+
+# ---------------------------------------------------------------------------
+# Negative controls, quoted from the four observed near-miss classes.
+# ---------------------------------------------------------------------------
+
+# 3382[5] verbatim in shape: a GENUINE design reversal. The header conjunct
+# holds and the entry really does supersede another — but nothing was
+# mis-paired, so the pairing conjunct must reject it.
+GENUINE_SUPERSESSION_DECISION = (
+    'SUPERSEDES decision #3 ("mirror the uv_cache precedent exactly: '
+    'grant-only, no pre-creation helper"). Its ACCEPTED RESIDUAL RISK is '
+    'REJECTED as a confirmed blocking defect.'
+)
+GENUINE_SUPERSESSION_RATIONALE = (
+    'Decision #3 argued the cache directory is TOOL-owned like the uv cache, '
+    'so the grant-only precedent applies. That reasoning does not survive '
+    'scrutiny: the grammar builds run INSIDE the sandbox.'
+)
+
+# 3209[1] in shape: `supersedes` used mid-sentence as the name of a metadata
+# edge kind. No start-anchored header at all.
+INCIDENTAL_KEYWORD_DECISION = (
+    'The dangling census is split across TWO metrics — one count over all '
+    'three pointer keys, and a tripwire over `supersedes` edges only — '
+    'rather than one, and the correction is applied at read time.'
+)
+
+# 3298[2] in shape: a restatement named PARENTHETICALLY, mid-prose. Only the
+# start-anchor separates this from a positive.
+PARENTHETICAL_RESTATEMENT_DECISION = (
+    'Annotate the PRD\'s historical "~42s" in place rather than overwriting '
+    'the number (restatement of decision #1 with its correct rationale).'
+)
+
+# 3692[8] in shape: prose ABOUT another plan's mis-pairing. This is the false
+# positive the originating task description acknowledged, and the one the
+# start-anchor is what sheds.
+META_PROSE_DECISION = (
+    "No RED test asserts that task 3567's plan is repaired, despite the task "
+    'description naming it as the concrete damage specimen to use as a test '
+    'case.'
+)
+META_PROSE_RATIONALE = (
+    'Its damage is SEMANTIC cross-pairing (a rationale recorded against the '
+    'wrong decision), which carries no sentinel and is therefore invisible to '
+    'the envelope detector.'
+)
+
+
+class TestDetectMispairing:
+    """The entry-level predicate: a CONJUNCTION, not a keyword scan."""
+
+    @pytest.mark.parametrize(
+        ('decision', 'expected_header'),
+        [
+            (CORRECTION_DECISION, 'CORRECTION'),
+            (RESTATEMENT_DECISION, 'CORRECTION'),
+            (READ_THIS_INSTEAD_DECISION, 'READ THIS INSTEAD'),
+            (SUPERSEDES_DECISION, 'SUPERSEDES'),
+            (CORRECTED_DECISION, 'CORRECTED'),
+            (MIS_TITLED_DECISION, 'CORRECTION'),
+            (SWAPPED_DECISION, 'READ THIS INSTEAD'),
+        ],
+    )
+    def test_each_live_header_form_fires(self, decision: str, expected_header: str) -> None:
+        """Every header form observed in a live victim plan is detected."""
+        hit = detect_mispairing(decision, ORDINARY_RATIONALE)
+        assert hit is not None, f'header form {expected_header!r} was not detected'
+        assert hit.header == expected_header
+
+    @pytest.mark.parametrize(
+        ('phrase', 'expected_marker'),
+        [
+            ('the rationale above was mis-paired with this statement', 'mis-paired'),
+            ('the two entries were cross-paired when recorded', 'cross-paired'),
+            ('this corrects the mis-titled entry above', 'mis-titled'),
+            ('the rationale was mis-attributed to the wrong entry', 'mis-attributed'),
+            ('that text was recorded against the wrong decision', 'recorded against the wrong'),
+            ('the two rationales were swapped at the point of writing', 'swapped'),
+            ('the preceding rationale belongs to THIS decision', 'belongs to THIS decision'),
+        ],
+    )
+    def test_each_pairing_marker_fires(self, phrase: str, expected_marker: str) -> None:
+        """Every pairing phrase observed in a live victim plan is detected.
+
+        The hit NAMES the matched marker, so a triager is never sent to
+        log-scrape which literal fired (INV-2).
+        """
+        hit = detect_mispairing('CORRECTION. ' + phrase + '.', ORDINARY_RATIONALE)
+        assert hit is not None, f'pairing marker {expected_marker!r} was not detected'
+        assert hit.marker == expected_marker
+
+    def test_hit_names_both_matched_markers_and_the_field(self) -> None:
+        """A hit is self-describing: header, pairing marker, and where it matched."""
+        hit = detect_mispairing(CORRECTION_DECISION, CORRECTION_RATIONALE)
+        assert isinstance(hit, MispairingHit)
+        assert hit.header == 'CORRECTION'
+        assert hit.marker == 'mis-paired'
+        assert hit.field == 'decision'
+        # The markers a hit reports are the module's OWN declared literals, not
+        # a re-spelling. If this drifts, some consumer has a second copy.
+        assert hit.header in HEADER_MARKERS
+        assert hit.marker in PAIRING_MARKERS
+
+    def test_pairing_language_in_rationale_alone_counts(self) -> None:
+        """Header on ``decision``, pairing language only in ``rationale``.
+
+        NO LIVE SPECIMEN EXERCISES THIS BRANCH. Measured over all 23 corpus
+        positives: every one carries its pairing marker in ``decision``; none
+        carries it in ``rationale`` only, and none in both. (The task's plan
+        asserted specimen 3727[1] splits the evidence this way; it does not —
+        it reads "CORRECTION of the mis-titled entry above: the preceding
+        rationale belongs to THIS decision", both halves in one field.)
+
+        The disjunction is deliberate recall headroom for a correction phrased
+        with a bare header and its reasoning deferred to the rationale. Because
+        no corpus record covers it, this hand-authored specimen is the ONLY
+        thing pinning it — do not delete it as redundant.
+        """
+        hit = detect_mispairing(
+            'CORRECTION of the entry immediately above.',
+            'Its rationale was mis-paired with a statement from a different '
+            'decision when both were recorded in one call.',
+        )
+        assert hit is not None
+        assert hit.header == 'CORRECTION'
+        assert hit.marker == 'mis-paired'
+        assert hit.field == 'rationale'
+
+    def test_decision_field_wins_when_both_carry_the_marker(self) -> None:
+        """``decision`` is searched first, so the reported field is stable."""
+        hit = detect_mispairing(CORRECTION_DECISION, 'Also mis-paired, for the record.')
+        assert hit is not None
+        assert hit.field == 'decision'
+
+    # -- Negative controls, one per observed near-miss class -----------------
+
+    def test_genuine_supersession_without_pairing_language_is_clean(self) -> None:
+        """3382[5]: a real design REVERSAL, not a mis-pairing.
+
+        The header conjunct holds. Dropping the pairing conjunct would sweep
+        this in, which is the precision cost the conjunction buys off.
+        """
+        assert detect_mispairing(
+            GENUINE_SUPERSESSION_DECISION, GENUINE_SUPERSESSION_RATIONALE
+        ) is None
+
+    def test_incidental_mid_prose_keyword_is_clean(self) -> None:
+        """3209[1]: `supersedes` and `correction` used mid-sentence.
+
+        Dropping the start-anchor would sweep in three separate 3209 entries.
+        """
+        assert detect_mispairing(INCIDENTAL_KEYWORD_DECISION, ORDINARY_RATIONALE) is None
+
+    def test_parenthetical_restatement_is_clean(self) -> None:
+        """3298[2]: a restatement named parenthetically, mid-prose.
+
+        The hardest control: the word ``restatement`` is a declared header
+        marker AND the entry really does restate another. Only the START-ANCHOR
+        separates it from a positive.
+        """
+        assert detect_mispairing(
+            PARENTHETICAL_RESTATEMENT_DECISION, ORDINARY_RATIONALE
+        ) is None
+
+    def test_meta_prose_about_another_plans_mispairing_is_clean(self) -> None:
+        """3692[8]: prose ABOUT task 3567's mis-pairing.
+
+        The acknowledged false positive of the originating task description's
+        own phrase-list predicate. Its rationale contains the pairing phrase
+        ``recorded against the wrong`` verbatim; the start-anchor sheds it.
+        """
+        assert detect_mispairing(META_PROSE_DECISION, META_PROSE_RATIONALE) is None
+
+    @pytest.mark.parametrize('decision', ['', '   ', '\n\t  \n'])
+    def test_empty_or_whitespace_decision_is_clean(self, decision: str) -> None:
+        assert detect_mispairing(decision, 'mis-paired with something') is None
+
+    def test_header_alone_without_pairing_language_is_clean(self) -> None:
+        """Both conjuncts are required; neither alone suffices."""
+        assert detect_mispairing('CORRECTION. The timeout is 150s, not 30s.', '') is None
+
+    def test_pairing_language_alone_without_a_header_is_clean(self) -> None:
+        assert detect_mispairing(
+            'The rationale here was mis-paired in an earlier draft.', ''
+        ) is None
+
+    # -- Totality ------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        ('decision', 'rationale'),
+        [
+            (None, None),
+            (None, 'CORRECTION. mis-paired.'),
+            (CORRECTION_DECISION, None),
+            (CORRECTION_DECISION, 12345),
+            (12345, CORRECTION_RATIONALE),
+            ({'decision': CORRECTION_DECISION}, []),
+            ([CORRECTION_DECISION], object()),
+            (b'CORRECTION. mis-paired.', b''),
+        ],
+    )
+    def test_never_raises_for_non_str_inputs(self, decision, rationale) -> None:
+        """Total for any input. A detector that raises is a detector that is off.
+
+        The walker in ``scan_design_decisions`` guards these shapes too, but the
+        entry predicate must be independently total: it is called directly by
+        the scanner script over plan documents nobody validated.
+        """
+        assert detect_mispairing(decision, rationale) is None
+
+    def test_non_str_decision_with_valid_rationale_is_clean(self) -> None:
+        """The header conjunct is anchored on ``decision`` ALONE.
+
+        A non-str ``decision`` can never satisfy it, however the rationale
+        reads — so the disjunction never promotes a rationale-only match into a
+        hit on its own.
+        """
+        assert detect_mispairing(None, 'CORRECTION. It was mis-paired.') is None
+
+    def test_leading_whitespace_before_the_header_is_tolerated(self) -> None:
+        hit = detect_mispairing('\n  ' + CORRECTION_DECISION, ORDINARY_RATIONALE)
+        assert hit is not None
+        assert hit.header == 'CORRECTION'
+
+    def test_header_and_marker_matching_are_case_insensitive(self) -> None:
+        """Live specimens shout their headers; the predicate must not depend on it."""
+        hit = detect_mispairing(
+            'Correction of the entry above, whose rationale was Mis-Paired.', ''
+        )
+        assert hit is not None
+        assert hit.header == 'CORRECTION'
+        assert hit.marker == 'mis-paired'
+
+    def test_marker_sets_are_immutable_and_non_empty(self) -> None:
+        """One owner, and no consumer can mutate the sets out from under it."""
+        assert isinstance(HEADER_MARKERS, tuple)
+        assert isinstance(PAIRING_MARKERS, tuple)
+        assert HEADER_MARKERS and PAIRING_MARKERS
+        assert all(isinstance(m, str) and m for m in HEADER_MARKERS)
+        assert all(isinstance(m, str) and m for m in PAIRING_MARKERS)
+
+    def test_an_envelope_literal_does_not_by_itself_make_a_hit(self) -> None:
+        """The two damage classes are disjoint AT THE DETECTOR.
+
+        A string carrying an envelope literal is the OTHER class's business
+        (``shared.toolcall_markup``); this predicate must not fire on it absent
+        its own two conjuncts. Specimen 3209[8] is exactly this shape in the
+        committed corpus, where it is a negative control.
+        """
+        envelope = '\x3c/decision>\n\x3cparameter name="rationale">'
+        assert detect_mispairing('The census is computed inline. ' + envelope, '') is None
