@@ -198,6 +198,32 @@ def test_hook_session_slug_sanitizes_malformed_claude_spawn_session_id() -> None
     assert slug == 'bad-id-x'
 
 
+@pytest.mark.parametrize(
+    ('spawn_session_id', 'expected'),
+    [('.', '-'), ('..', '--'), ('...', '---')],
+)
+def test_hook_session_slug_sanitizes_all_dots_claude_spawn_session_id(
+    spawn_session_id: str,
+    expected: str,
+    tmp_path: Path,
+) -> None:
+    # Task 4112: the live, externally-supplied entry point for the '..' escape.
+    # CLAUDE_SPAWN_SESSION_ID comes from outside the process, hook_session_slug
+    # hands it to sanitize_slug DIRECTLY (deliberately bypassing
+    # build_session_slug to avoid double-prefixing -- see its docstring), and
+    # record_path_for_slug then joins the result unsanitized. Covering only the
+    # registry unit would leave this attacker-reachable path untested, and a
+    # future refactor of that bypass could drop the sanitize call with every
+    # registry-level test still green.
+    hook_input = {'session_id': 'uuid-x', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_SESSION_ID': spawn_session_id}
+    slug = sh.hook_session_slug(hook_input, env=env)
+    assert slug == expected
+    assert sr.record_path_for_slug(slug, root=tmp_path).resolve().is_relative_to(
+        sr.sessions_dir(root=tmp_path).resolve()
+    )
+
+
 # ---------------------------------------------------------------------------
 # Step-3: pure OSC-retitle + display-title helpers
 # ---------------------------------------------------------------------------
