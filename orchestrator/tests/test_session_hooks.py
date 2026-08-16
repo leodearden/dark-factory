@@ -922,6 +922,135 @@ def test_refresh_path_does_not_rebind_or_write_when_already_bound(tmp_path: Path
 
 
 # ---------------------------------------------------------------------------
+# Task 4193 step-4: ownership probe is fail-soft
+# ---------------------------------------------------------------------------
+
+
+def test_hook_session_slug_adopts_when_record_is_corrupt(tmp_path: Path) -> None:
+    # A corrupt body must degrade to the pre-task-4193 behaviour (adopt), not
+    # fork a spurious record; the reaper already has its own 'corrupt' rule.
+    slug = 'session-cockpit-3215070'
+    record_path = sr.record_path_for_slug(slug, root=tmp_path)
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    record_path.write_text('not-json{{{')
+    with pytest.raises(sr.CorruptSessionRecord):
+        sr.read_record(slug, root=tmp_path)
+
+    hook_input = {'session_id': 'uuid-parent', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+
+    assert sh.hook_session_slug(hook_input, env, root=tmp_path) == slug
+
+
+def test_hook_session_slug_adopts_when_read_record_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    slug = 'session-cockpit-3215071'
+    hook_input = {'session_id': 'uuid-parent', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise OSError('disk on fire')
+
+    monkeypatch.setattr(sr, 'read_record', _boom)
+
+    with caplog.at_level(logging.WARNING):
+        assert sh.hook_session_slug(hook_input, env, root=tmp_path) == slug
+
+    # Degradation is never silent (repo's no-silent-fail-soft norm).
+    assert any(r.levelno >= logging.WARNING for r in caplog.records)
+
+
+def test_run_stop_fail_soft_when_probe_read_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slug = 'session-cockpit-3215072'
+    hook_input = {'session_id': 'uuid-parent', 'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise OSError('disk on fire')
+
+    monkeypatch.setattr(sr, 'read_record', _boom)
+
+    assert sh.run_stop(hook_input, env, root=tmp_path).startswith('\033]0;')
+
+
+def test_main_session_start_fail_soft_when_probe_read_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setenv('CLAUDE_SPAWN_SESSION_ID', 'session-cockpit-3215073')
+    _stdin_json(monkeypatch, {'session_id': 'uuid-parent', 'cwd': '/home/leo/src/dark-factory'})
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise OSError('disk on fire')
+
+    monkeypatch.setattr(sr, 'read_record', _boom)
+
+    assert sh.main(['session-start']) == 0
+
+
+def test_hand_launched_session_unaffected_by_ownership_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A hand-launched session (no CLAUDE_SPAWN_SESSION_ID) has nothing to
+    # probe and must pay no probe cost at all -- the must-not-be-called
+    # idiom, not merely an assertion that the outcome is unchanged. Note
+    # run_session_start legitimately calls sr.read_record itself, so it is
+    # sh._env_slug_is_owned that is booby-trapped here, not the registry.
+    def _boom(*_args: object, **_kwargs: object) -> bool:
+        raise AssertionError('ownership probe must not run for a hand-launched session')
+
+    monkeypatch.setattr(sh, '_env_slug_is_owned', _boom)
+
+    hook_input = {'session_id': 'sess-hand', 'cwd': '/home/leo/src/dark-factory'}
+    slug = sh.hook_session_slug(hook_input, env={}, root=tmp_path)
+
+    sh.run_session_start(hook_input, env={}, root=tmp_path)
+    assert sr.read_record(slug, root=tmp_path).status == sr.Status.RUNNING
+
+    sh.run_notification(hook_input, env={}, root=tmp_path)
+    assert sr.read_record(slug, root=tmp_path).status == sr.Status.AWAITING_INPUT
+
+    sh.run_stop(hook_input, env={}, root=tmp_path)
+    assert sr.read_record(slug, root=tmp_path).status == sr.Status.IDLE
+
+    assert slug == sr.build_session_slug(
+        'session',
+        'dark-factory',
+        None,
+        'sess-hand',  # type: ignore[arg-type]
+    )
+    assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 1
+
+
+def test_hook_session_slug_adopts_when_stdin_has_no_session_id(tmp_path: Path) -> None:
+    # With no discriminator the only safe answer is today's behaviour --
+    # forking here would key every discriminator-less session on the one
+    # 'unknown' literal hook_session_slug falls back to.
+    slug = 'session-cockpit-3215074'
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug,
+            status=sr.Status.RUNNING,
+            launcher_pid=3215074,
+            claude_session_id='uuid-parent',
+        ),
+        root=tmp_path,
+    )
+    hook_input = {'cwd': '/home/leo/src/dark-factory'}
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+
+    assert sh.hook_session_slug(hook_input, env, root=tmp_path) == slug
+
+
+# ---------------------------------------------------------------------------
 # Task 2510 step-1: _resolve_wm_window_id resolver (Fleet Cockpit C10 fix)
 # ---------------------------------------------------------------------------
 
