@@ -5377,6 +5377,53 @@ def _probe_discriminates(row: _BareShellEntrypoint, *, tmp_path: Path) -> bool:
     return probe.returncode != 0
 
 
+#: Intra-orchestrator modules documented stdlib-only for LAYERING reasons
+#: (cycle avoidance), NOT for bare-shell executability. Each is therefore
+#: importable under the tier-2 env and NOT under tier-1 — which is exactly the
+#: difference `test_tier1_is_strictly_stronger_than_tier2` demonstrates.
+#:
+#: `orchestrator.config` is deliberately NOT in this list. Measured: it fails
+#: the TIER-2 env too, because orchestrator/config.py imports pydantic, which
+#: the bare interpreter lacks — a dependency-footprint failure, not the
+#: layering one being demonstrated. Using it as the probe would make the test
+#: tautological and mislead the next reader. It stays in `_MUST_BE_REJECTED`
+#: (it must fail tier-1, and does), it just cannot serve as the tier-2-accepts
+#: probe.
+_BARE_IMPORTABLE_SIBLINGS = ('stop_instruction', 'fm_retry', 'routing')
+
+
+def _first_bare_importable_sibling(*, tmp_path: Path) -> str | None:
+    """Return the first sibling importable under the tier-2 env, or None.
+
+    Probed at runtime rather than hardcoded: if the chosen module later grows a
+    pydantic/yaml dependency it stops being bare-importable, and a hardcoded
+    reference would turn its caller into a confusing false failure instead of a
+    skip. Probing the list degrades to None only when ALL candidates stop
+    qualifying.
+    """
+    interpreter = _non_venv_interpreter()
+    assert interpreter is not None, 'callers skip when no non-venv interpreter exists'
+
+    env = {
+        'PATH': '/usr/bin:/bin',
+        'HOME': os.environ.get('HOME', '/tmp'),
+        'PYTHONDONTWRITEBYTECODE': '1',
+        'PYTHONPATH': str(_SR_PKG_ROOT),
+    }
+    for candidate in _BARE_IMPORTABLE_SIBLINGS:
+        probe = subprocess.run(
+            [interpreter, '-c', f'from orchestrator import {candidate}'],
+            env=env,
+            cwd=tmp_path,  # neutral cwd — see the comment in _run_row
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if probe.returncode == 0:
+            return candidate
+    return None
+
+
 def _inject_import_sandbox(tmp_path: Path, entrypoint_filename: str, payload: str) -> Path:
     """Mirror the orchestrator package, with ``payload`` injected into one file.
 
