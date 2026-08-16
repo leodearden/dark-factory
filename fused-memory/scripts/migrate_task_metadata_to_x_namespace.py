@@ -349,9 +349,36 @@ def write_backup(path: Path, before_task: dict) -> Path:
     is built around, and it was the one step with no durable output. The caller
     treats a failure here as fatal and skips the write — no write without a
     recoverable snapshot.
+
+    REFUSES an occupied path. :func:`default_backup_path` stamps each run, but
+    an explicit ``--backup-path`` reused across runs (and a same-second stamp
+    collision) still lands on an existing file — which may hold the TRUE
+    pre-migration row from an earlier run against this same task, while THIS
+    run would replace it with an already-partially-migrated one. The write is
+    an exclusive create (``open('x')``), so the existence check and the create
+    are one atomic OS operation with no window for a concurrent run to slip
+    between them.
+
+    The refusal is a :class:`FileExistsError`, which is an :class:`OSError` —
+    so ``main_async``'s existing ``except OSError`` around this call already
+    turns it into "Refusing to write without a recoverable snapshot" and
+    returns 1 BEFORE ``update_task`` is reached. Deliberately not a bespoke
+    exception class: that would need its own ``except`` clause, and an edit
+    that forgot it would let the refusal escape as a traceback while the write
+    went ahead.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(before_task, indent=2, sort_keys=True, default=str))
+    payload = json.dumps(before_task, indent=2, sort_keys=True, default=str)
+    try:
+        with path.open('x', encoding='utf-8') as handle:
+            handle.write(payload)
+    except FileExistsError as exc:
+        raise FileExistsError(
+            f'{path} already exists. It may hold the TRUE pre-write row from an '
+            f'earlier run against this task, and this run would replace it with an '
+            f'already-partially-migrated one. Move it aside, or pass a different '
+            f'--backup-path.'
+        ) from exc
     return path
 
 
