@@ -1723,5 +1723,43 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_RUN_FAILED
 
 
+def _cli() -> int:
+    """Process-boundary wrapper: run :func:`main` and force stdout out while it can fail usefully.
+
+    A closed stdout pipe (``--verify | head``) fails in two measurably
+    different ways, and only one of them ever reaches ``main()``'s
+    ``except BrokenPipeError``:
+
+    * LARGE write — the report from :func:`_run_build` exceeds stdout's 8 KiB
+      buffer, so ``print`` flushes mid-run, the ``write()`` fails, and the
+      error is raised in-band. ``main()`` catches it. Nothing here is needed.
+    * SHORT write — the one-line verdict from :func:`_emit_verdict` stays in
+      the buffer, so the run raises NOTHING. ``main()`` returns its ordinary
+      verdict code and the failure surfaces only when the interpreter flushes
+      ``sys.stdout`` during finalization: CPython reports "Exception ignored
+      on flushing sys.stdout: BrokenPipeError" and forces exit status 120,
+      at a point where no ``except`` can intervene.
+
+    The explicit ``flush()`` below is what converts the second case into the
+    first. It is NOT redundant with the interpreter's own shutdown flush and
+    must not be "simplified" away: its entire purpose is to attempt the
+    buffered write *earlier*, while this handler is still on the stack, so a
+    deferred and uncatchable exit-120 becomes the same documented
+    ``EXIT_RUN_FAILED`` plus single ``error: ...`` line every other failure in
+    this CLI produces.
+
+    Kept OUT of ``main()`` deliberately. ``main(argv) -> int`` is the seam the
+    test suite drives and its contract is "parse and run, return a code";
+    interpreter-lifecycle concerns belong at the process boundary, which is
+    this function and the ``__main__`` guard that calls it.
+    """
+    try:
+        code = main()
+        sys.stdout.flush()
+    except BrokenPipeError:
+        return _handle_broken_pipe()
+    return code
+
+
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(_cli())
