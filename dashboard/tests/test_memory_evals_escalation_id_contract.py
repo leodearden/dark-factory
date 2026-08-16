@@ -28,12 +28,11 @@ only as good as that one.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from _dashboard_helpers import build_dual_escalation_tree
+from _dashboard_helpers import build_dual_escalation_tree, write_escalation_record
 
 from dashboard.data.escalations import build_escalation_queues
 from dashboard.data.redux_api import shape_escalations
@@ -103,15 +102,28 @@ def collect_escalation_id_violations(
     Returns a list of ``{path, id, kind, detail}`` records, empty when every id
     resolves.  ``kind`` is:
 
+    * ``unusable_id``   — the emitted id is ``None``.  Checked FIRST, and a
+      violation regardless of what it collides with: `_escalation_projection`
+      does a bare ``record.get('id')``, so a queue file with no ``id`` field
+      projects ``id: None`` and the JSX calls ``onNavigate('esc', undefined)``.
+      `findEscalationRow` then compares ``row.id === id`` and matches the FIRST
+      row whose id is also undefined — an arbitrary wrong escalation, or none.
+      Without this arm that case reports CLEAN, because ``str(None)`` collides
+      with itself and ``type(None) is type(None)``.
     * ``absent``        — no row carries this id at all.  The link dead-ends.
     * ``type_mismatch`` — a row carries the same id VALUE but at a different
       Python type (``4242`` vs ``'4242'``).  Distinguished from ``absent``
       because it is the failure a `==` check cannot see and the browser
       cannot survive: `findEscalationRow` uses `row.id === id` with no
       `String()` coercion, so a str/int drift renders "escalation not found"
-      while both payloads look perfectly populated.  The sibling ``task_id``
-      IS `str()`-wrapped in `shape_escalations`; `id` deliberately is not, so
-      this is a live shape, not a hypothetical one.
+      while both payloads look perfectly populated.  No coercion exists on
+      either side TODAY — `shape_escalations` emits ``{**esc, ...}`` and the
+      ``str()`` calls at redux_api.py:757/764 are on the task-map LOOKUP KEY
+      (``root_tasks.get(str(esc.get('task_id', '')))``), not on any field
+      written into the row.  That is precisely why the check compares
+      ``type()`` and not ``==``: both payloads read the same JSON, so a future
+      one-sided coercion is invisible to a value comparison and would look
+      like a clean id space right up until the browser stopped resolving it.
 
     Directionality is deliberate and asserted separately by
     `test_the_id_space_subset_direction_is_asymmetric_by_design`: this checks
@@ -132,15 +144,35 @@ def collect_escalation_id_violations(
     # str-keyed so a same-value/different-type row is found and classified
     # rather than reported as absent.  The list holds every type seen under
     # that key, since two subsections may legitimately carry the same id.
+    #
+    # A row whose own id is None is NOT indexed: `findEscalationRow` would
+    # "resolve" it only for a link that is itself undefined, which is the
+    # unusable_id violation below rather than a successful resolution.  Leaving
+    # it in would let one broken row launder another broken link into clean.
     rows_by_str_id: dict[str, list[Any]] = {}
     for subsection in subsections or []:
         for row in subsection.get('escalations') or []:
-            if isinstance(row, dict):
+            if isinstance(row, dict) and row.get('id') is not None:
                 rows_by_str_id.setdefault(str(row.get('id')), []).append(row.get('id'))
 
     violations: list[dict[str, Any]] = []
     for path, escalation in _iter_memory_eval_escalations(memory_evals_payload):
         emitted = escalation.get('id')
+        if emitted is None:
+            violations.append({
+                'path': path,
+                'id': None,
+                'kind': 'unusable_id',
+                'detail': (
+                    f'MEMORY_EVALS {path} carries escalation id None — the queue '
+                    'record has no `id` and `_escalation_projection` passes that '
+                    "through verbatim. The JSX calls onNavigate('esc', undefined) "
+                    'and findEscalationRow matches the first row whose id is also '
+                    'undefined, so the link opens an arbitrary escalation or none. '
+                    'No row can make this id usable; the record itself is the bug.'
+                ),
+            })
+            continue
         candidates = rows_by_str_id.get(str(emitted))
         if candidates is None:
             violations.append({
@@ -221,14 +253,22 @@ def test_the_id_space_check_catches_a_divergent_projection(tmp_path: Path, monke
         like from the consumer's side.
 
     (2) TYPE divergence — the emitted id is `str()`-coerced while the row keeps
-        the raw JSON value.  Not hypothetical: `shape_escalations` ALREADY
-        wraps the sibling `task_id` in `str()` (redux_api.py), so the coercion
-        this simulates is one line away from being real, and a `==`-based
-        checker would call it clean.
+        the raw JSON value.  NEITHER side coerces today: `shape_escalations`
+        emits `{**esc, ...}` and the `str()` calls at redux_api.py:757/764 sit
+        on the task-map lookup key, not on a field written into the row.  That
+        is the reason to check `type()` rather than `==` — both payloads read
+        the same JSON, so a value comparison cannot see a coercion added to one
+        side and would keep reporting a clean id space after the browser
+        stopped resolving it.
 
-    Both arms monkeypatch `_escalation_projection` rather than editing the
-    payload after the fact, so the mutation enters through the real code path
-    that all three reach paths share.
+    (3) An UNUSABLE id — a queue record with no `id` field at all, which
+        `record.get('id')` projects as `None`.  Not a mutation of the producer:
+        this arm runs the REAL projection and only writes a degenerate record,
+        because the failure is in the artifact rather than in the reader.
+
+    Arms (1) and (2) monkeypatch `_escalation_projection` rather than editing
+    the payload after the fact, so the mutation enters through the real code
+    path that all three reach paths share.
     """
     from dashboard.data import memory_evals
 
@@ -280,22 +320,19 @@ def test_the_id_space_check_catches_a_divergent_projection(tmp_path: Path, monke
     #     NUMBER, so that `str()`-coercing the projection produces the same
     #     VALUE at a different TYPE.  Written here rather than baked into the
     #     shared tree: the mutation harness owns its own mutation.
+    #
+    #     Written through the SAME `write_escalation_record` the shared tree
+    #     uses (it takes an untyped `esc_id` precisely for this) rather than a
+    #     hand-rolled `json.dumps`: a fourth spelling of the record would drift
+    #     from `escalation.models.Escalation`, and dropping `sort_keys` /
+    #     `ensure_ascii` would stop this file being byte-shaped like a real one.
     numeric_id = 4242
     esc_dir = config.reconciliation_escalations_dir
-    esc_dir.mkdir(parents=True, exist_ok=True)
-    (esc_dir / f'{numeric_id}.json').write_text(json.dumps({
-        'id': numeric_id,
-        'task_id': 'memory-eval-e1',
-        'agent_role': 'memory-eval-runner',
-        'severity': 'blocking',
-        'category': 'eval_regression',
-        'summary': 'numeric-id escalation',
-        'detail': '',
-        'timestamp': '2026-07-30T03:15:00+00:00',
-        'status': 'pending',
-        'level': 1,
-        'dedupe_fingerprint': 'eval:no-such-eval|metric:no-such-metric',
-    }, indent=2) + '\n')
+    write_escalation_record(
+        esc_dir, numeric_id,
+        summary='numeric-id escalation',
+        dedupe_fingerprint='eval:no-such-eval|metric:no-such-metric',
+    )
 
     escalations_with_numeric = _build_escalations(config)
     assert any(
@@ -323,6 +360,46 @@ def test_the_id_space_check_catches_a_divergent_projection(tmp_path: Path, monke
     )
     assert type_violations[0]['id'] == str(numeric_id), (
         f'the violation must carry the EMITTED id, not the on-disk one: {type_violations}'
+    )
+
+    # (3) UNUSABLE id: a queue record with NO `id` key.  `_escalation_projection`
+    #     reads `record.get('id')`, so the projection emits `id: None` and the
+    #     link becomes `onNavigate('esc', undefined)`.  Run against the REAL
+    #     projection — nothing is monkeypatched here, because the degenerate
+    #     artifact IS the defect.
+    #
+    #     Carries no fingerprint, so it reaches the payload through
+    #     `unmatched_escalations`; the filename supplies the record's identity
+    #     on disk, which is exactly the trap — the file looks addressable and
+    #     the payload is not.
+    write_escalation_record(
+        esc_dir, 'esc-eval-idless', omit_id=True, dedupe_fingerprint=None,
+        summary='memory-eval regression whose record has no id',
+    )
+    escalations_with_idless = _build_escalations(config)
+    idless_payload = _build_memory_evals(config)
+    assert any(
+        escalation.get('id') is None
+        for _path, escalation in _iter_memory_eval_escalations(idless_payload)
+    ), (
+        'the id-less record did not reach MEMORY_EVALS with `id: None`, so the '
+        'arm below would pass vacuously. `_escalation_projection` uses '
+        "`record.get('id')`; if that changed to a filename fallback, this arm "
+        'should be re-aimed rather than deleted.'
+    )
+
+    idless_violations = collect_escalation_id_violations(
+        idless_payload, escalations_with_idless
+    )
+    assert [v['kind'] for v in idless_violations] == ['unusable_id'], (
+        'an escalation projected with `id: None` must be reported as exactly one '
+        'unusable_id violation. It is NOT clean merely because an ESCALATIONS row '
+        'also carries `id: None`: findEscalationRow compares `row.id === id`, so '
+        f'undefined matches the first id-less row and opens the wrong one. '
+        f'Got: {idless_violations}'
+    )
+    assert idless_violations[0]['id'] is None, (
+        f'the violation must carry the emitted id (None): {idless_violations}'
     )
 
 
@@ -372,9 +449,11 @@ def test_every_memory_eval_escalation_id_resolves_in_the_escalations_payload(
     three is required to contribute, and the `reconciliation` subsection is
     required to be non-empty — a MEMORY_EVALS id can only resolve against rows
     that are actually there.  Type agreement rides along inside the checker,
-    which compares `type()` rather than `==`: both sides read the same JSON
-    today, so only a `type()` check can see a future `str()` coercion on one
-    side (`shape_escalations` already applies one to the sibling `task_id`).
+    which compares `type()` rather than `==`: neither producer coerces the id
+    today (`shape_escalations` emits `{**esc, ...}`, and its `str()` calls are
+    on the task-map lookup key rather than on any emitted row field), so both
+    sides carry whatever the shared JSON held — and only a `type()` check can
+    see a coercion added later to one side alone.
     """
     trees = (
         ('no-storm', build_dual_escalation_tree(tmp_path / 'no-storm')),
