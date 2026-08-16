@@ -16,7 +16,12 @@ if TYPE_CHECKING:
     from anthropic.types import MessageParam, ToolParam
     from openai.types.chat import ChatCompletionMessageParam
 
-from shared.cli_invoke import AgentResult, build_failure_message, invoke_with_cap_retry
+from shared.cli_invoke import (
+    AgentResult,
+    build_failure_message,
+    invoke_with_cap_retry,
+    no_mcp_servers_config,
+)
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import JournalEntry
@@ -356,6 +361,12 @@ class AgentLoop:
                 system_prompt=self._build_cli_system_prompt(tools),
                 output_schema=CLAUDE_CLI_RESPONSE_SCHEMA,
                 disallowed_tools=['*'],
+                # Closes MCP separately from the wildcard deny above, which the
+                # schema expands into a BUILT-INS-ONLY list. Must stay truthy, or
+                # --strict-mcp-config is never emitted (build_claude_argv gates it
+                # on `if mcp_config:`).
+                mcp_config=no_mcp_servers_config(),
+                strict_mcp_config=True,
                 model=self.config.agent_llm_model,
                 # max_turns=1: AgentLoop.run() drives multi-turn externally by calling
                 # _call_claude_cli again with resume_session_id.  A single CLI
