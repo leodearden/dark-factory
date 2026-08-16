@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import itertools
 import json
 import logging
@@ -4887,6 +4888,24 @@ _STDIN_STARVATION_STUB = textwrap.dedent(
 )
 
 
+_STDIN_DIGEST_STUB = textwrap.dedent(
+    """
+    import sys, select, hashlib
+
+    r, _, _ = select.select([sys.stdin], [], [], 0.3)
+    if not r:
+        sys.stderr.write('Warning: no stdin data received in 3s, proceeding without it.\\n')
+        sys.stderr.write('Error: Input must be provided either through stdin or as a '
+                         'prompt argument when using --print\\n')
+        sys.exit(1)
+    data = sys.stdin.buffer.read()
+    # Length AND digest, so a concurrent result can be matched back to its own
+    # invocation and cross-wiring cannot hide behind an equal length.
+    sys.stdout.write('GOT:%d:%s' % (len(data), hashlib.sha256(data).hexdigest()[:16]))
+    """
+)
+
+
 def _make_starving_exec(block_secs: float):
     """Return a create_subprocess_exec fake that starves the loop after spawn.
 
@@ -4948,3 +4967,120 @@ class TestStdinStarvationRace:
         # Neither production marker line may appear.
         assert 'no stdin data received' not in result.stderr
         assert 'Input must be provided' not in result.stderr
+
+    @pytest.mark.timeout(60)
+    async def test_concurrent_starved_spawns_each_receive_their_own_payload(self, tmp_path):
+        """8 concurrent spawns under ONE starved loop each get their own payload.
+
+        This is the "under load" coverage: genuine concurrency, used to prove
+        payload ISOLATION rather than to trigger the timing race (which the
+        injected loop block already makes deterministic).
+
+        RED against two plausible-but-wrong implementations:
+          * a pre-filled ``os.pipe()`` fix — every payload here exceeds the
+            65536-byte default pipe capacity, so ``os.write`` would block the
+            parent before spawn with no reader attached and deadlock until this
+            test's timeout;
+          * any shared or module-level scratch buffer — the payloads have
+            distinct lengths AND distinct content, and each result is matched
+            back to its own invocation by digest.
+        """
+        stub = tmp_path / 'digest_cli.py'
+        stub.write_text(_STDIN_DIGEST_STUB)
+
+        # Distinct length AND distinct fill byte; every one >65536.
+        payloads = [bytes([65 + i]) * (70_000 + i * 1_000) for i in range(8)]
+
+        with patch(
+            'shared.cli_invoke.asyncio.create_subprocess_exec',
+            side_effect=_make_starving_exec(0.5),
+        ):
+            results = await asyncio.gather(*[
+                _run_subprocess(
+                    [sys.executable, str(stub)],
+                    tmp_path,
+                    env={},
+                    model=f'stub-{i}',
+                    timeout_seconds=40.0,
+                    stdin_data=payload,
+                )
+                for i, payload in enumerate(payloads)
+            ])
+
+        for i, (payload, result) in enumerate(zip(payloads, results, strict=True)):
+            expected = f'GOT:{len(payload)}:{hashlib.sha256(payload).hexdigest()[:16]}'
+            assert result.returncode == 0, (
+                f'spawn {i} rejected the invocation; stderr={result.stderr!r}'
+            )
+            assert result.stdout.strip() == expected, (
+                f'spawn {i} received the wrong payload — expected {expected}, '
+                f'got {result.stdout.strip()!r} (cross-wired or truncated)'
+            )
+
+    @pytest.mark.timeout(30)
+    async def test_stdin_survives_govern_and_nice_wrapper_chain(self, tmp_path):
+        """The pre-materialized payload survives the govern → nice → CLI exec chain.
+
+        The cpu-govern wrapper was named as a suspect for the original race and
+        was REFUTED as its cause (it is inert in the live deployment:
+        ``cpu_governance.exec_path`` is unset, so ``_cpu_govern_prefix`` emits
+        nothing).  But it remains a live risk to the FIX: ``cpu-governed-exec.sh``
+        execs ``systemd-run --user --scope``, and an exec chain that re-opened or
+        redirected fd 0 would silently destroy the pre-materialized payload.
+
+        The DF_AGENT_* pop assertions are kept alongside so the govern/nice env
+        contract stays pinned next to the stdin one.
+        """
+        stub = tmp_path / 'stub_cli.py'
+        stub.write_text(_STDIN_STARVATION_STUB)
+
+        govern = tmp_path / 'cpu-governed-exec.sh'
+        govern.write_text('#!/bin/sh\n# consume the `--role <role> --` contract, then exec in place\nshift 3\nexec "$@"\n')
+        govern.chmod(0o755)
+
+        payload = b'Z' * 4242
+        captured_args: list = []
+        captured_kwargs: dict = {}
+        starving = _make_starving_exec(1.0)
+
+        async def capturing_starving_exec(*args, **kwargs):
+            captured_args.extend(args)
+            captured_kwargs.update(kwargs)
+            return await starving(*args, **kwargs)
+
+        env = {
+            'DF_AGENT_CPU_GOVERN': str(govern),
+            'DF_AGENT_CPU_NICE': '10',
+            # `nice` is resolved by /bin/sh from the child's PATH.
+            'PATH': os.environ.get('PATH', ''),
+        }
+
+        with patch(
+            'shared.cli_invoke.asyncio.create_subprocess_exec',
+            side_effect=capturing_starving_exec,
+        ):
+            result = await _run_subprocess(
+                [sys.executable, str(stub)],
+                tmp_path,
+                env=env,
+                model='stub',
+                timeout_seconds=20.0,
+                stdin_data=payload,
+            )
+
+        # The wrapper chain really was in play (govern outermost, nice inner).
+        assert captured_args[:7] == [
+            str(govern), '--role', 'task', '--', 'nice', '-n', '10',
+        ], f'expected govern-outermost nice-inner prefix; got {captured_args[:7]}'
+
+        assert result.returncode == 0, (
+            f'stub CLI rejected the invocation through the wrapper chain; '
+            f'stderr={result.stderr!r}'
+        )
+        assert result.stdout.strip() == f'GOT:{len(payload)}'
+        assert 'no stdin data received' not in result.stderr
+
+        # Both DF_* keys stripped from the child env.
+        child_env = captured_kwargs.get('env', {})
+        assert 'DF_AGENT_CPU_GOVERN' not in child_env
+        assert 'DF_AGENT_CPU_NICE' not in child_env

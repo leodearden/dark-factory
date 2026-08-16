@@ -411,3 +411,128 @@ def test_no_mcp_servers_config_is_truthy_and_emits_strict_flag() -> None:
             assert json.load(f) == {'mcpServers': {}}
     finally:
         _cleanup(temp_files)
+
+
+# ── ARG_MAX / no-positional-prompt guard (task 3147) ─────────────────────────
+
+# Flags this builder emits with NO value of their own.  The walk below needs
+# arity knowledge only for these — every other flag opens a value run.  Kept
+# deliberately tiny and explicit; a newly-added boolean flag must be listed
+# here or the walk fails loudly, which is the intended forcing function.
+_BOOLEAN_FLAGS = {'--print', '--strict-mcp-config'}
+
+MAX_ARG_STRLEN = 131072  # Linux per-argument limit (128 KiB)
+
+
+def test_argv_never_carries_the_user_prompt() -> None:
+    """The user prompt can never reach argv — the single most tempting wrong fix.
+
+    `claude --help` on v2.1.226 documents `claude [options] [command] [prompt]`,
+    so the CLI *does* accept a positional prompt.  "Just pass the prompt on
+    argv" therefore looks like it would dodge the task-3147 stdin race
+    entirely, while silently:
+      * reintroducing the ARG_MAX ceiling this builder exists to avoid
+        (a 260 KB briefing exceeds MAX_ARG_STRLEN twice over), and
+      * leaking the full prompt into `ps` output and systemd scope names.
+
+    The load-bearing guard is structural: the builder has no parameter through
+    which a user prompt could arrive at all.
+    """
+    import inspect
+
+    params = inspect.signature(build_claude_argv).parameters
+    prompt_params = [n for n in params if 'prompt' in n and n != 'system_prompt']
+    assert not prompt_params, (
+        f'build_claude_argv grew a user-prompt parameter: {prompt_params}. '
+        'The prompt must reach the CLI over stdin, never argv (task 3147).'
+    )
+
+    # A 260 KB system prompt is the adversarial case: if it were inlined rather
+    # than written to --system-prompt-file, it alone would blow ARG_MAX.
+    big_system = 'S' * 260_000
+    cmd, temp_files = build_claude_argv(
+        model='opus',
+        max_budget_usd=5.0,
+        system_prompt=big_system,
+        max_turns=50,
+        permission_mode='bypassPermissions',
+        allowed_tools=['Read', 'Grep'],
+        disallowed_tools=['Bash'],
+        mcp_config={'mcpServers': {'foo': {'command': 'bar'}}},
+        output_schema={'type': 'object'},
+        effort='high',
+        resume_session_id=None,
+        session_id='sess-123',
+        strict_mcp_config=True,
+    )
+    try:
+        normalized = _normalize(cmd, temp_files)
+
+        # No `-` stdin marker.  Its ABSENCE is exactly why the CLI cannot tell
+        # "input is coming" from "there is no input" and gives up after ~3s —
+        # the mechanism task 3147 closes by pre-materializing stdin.  (The
+        # codex backend does append '-'; this builder deliberately does not.)
+        assert '-' not in cmd, f'argv grew a `-` stdin marker: {normalized}'
+
+        # No argument may exceed the Linux per-argument limit.
+        for tok in cmd:
+            assert len(tok.encode()) <= MAX_ARG_STRLEN, (
+                f'argv token exceeds MAX_ARG_STRLEN ({len(tok.encode())} bytes): {tok[:80]}...'
+            )
+
+        # The system prompt went to a file, never inline.
+        assert big_system not in cmd
+        assert '--system-prompt-file' in cmd
+
+        # PROVENANCE: every non-flag token must be something the caller
+        # supplied, a constant of the base argv, or a normalized temp path.
+        # This is the assertion that actually catches a smuggled-in prompt: a
+        # structural walk alone cannot, because a trailing positional is
+        # indistinguishable from one more value of the preceding multi-value
+        # flag (verified by mutation — appending a positional after
+        # `--json-schema <schema>` slips past the walk but fails here).
+        supplied = {
+            'claude', 'json',              # base argv constants
+            _TMP_PLACEHOLDER,              # --system-prompt-file / --mcp-config
+            'opus', '5.0', '50', 'bypassPermissions', 'high', 'sess-123',
+            'Read', 'Grep', 'Bash',
+            json.dumps({'type': 'object'}),
+        }
+        for tok in normalized:
+            if tok.startswith('--'):
+                continue
+            assert tok in supplied, (
+                f'argv carries a token the caller never supplied: {tok[:120]!r}. '
+                'If this is a new constant-valued flag, add it to `supplied`; if it '
+                'is the user prompt, that is exactly the ARG_MAX regression this '
+                'test exists to prevent (task 3147).'
+            )
+
+        # Structural walk: argv[0] is the program; everything after it is a
+        # flag or a flag's value.  There is no bare positional.
+        assert cmd[0] == 'claude'
+        tokens = normalized[1:]
+        assert tokens and tokens[0].startswith('--'), (
+            f'argv does not begin with a flag after the program name: {tokens[:3]}'
+        )
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            assert tok.startswith('--'), (
+                f'orphan positional token at index {i}: {tok!r} in {tokens}'
+            )
+            if tok in _BOOLEAN_FLAGS:
+                i += 1
+                continue
+            j = i + 1
+            assert j < len(tokens) and not tokens[j].startswith('--'), (
+                f'{tok} is treated as value-taking but has no value; if it is a new '
+                f'boolean flag, add it to _BOOLEAN_FLAGS. argv={tokens}'
+            )
+            # --allowed-tools / --disallowed-tools splat several values after
+            # one flag, so consume the whole run.
+            while j < len(tokens) and not tokens[j].startswith('--'):
+                j += 1
+            i = j
+    finally:
+        _cleanup(temp_files)
