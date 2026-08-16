@@ -1035,7 +1035,9 @@ class TestMaybeEscalateStalledGateBacklog:
         # Cycle 3 — still stale: the count keeps climbing on the same record.
         assert await _cycle(_GATE_NOW + timedelta(hours=200), 'run-3') == []
         assert len(queue.get_pending()) == 1
-        assert queue.get(parent_id).dedupe_count == 2
+        reread = queue.get(parent_id)
+        assert reread is not None
+        assert reread.dedupe_count == 2
 
     @pytest.mark.asyncio
     async def test_mixed_already_escalated_and_new(self, tmp_path):

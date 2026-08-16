@@ -934,7 +934,9 @@ class TestDedupeConfigForGateBacklog:
         assert len(pending) == 1, (
             f'fold must leave exactly ONE pending record; got {len(pending)}'
         )
-        assert queue.get(parent_id).dedupe_count == 1
+        reread = queue.get(parent_id)
+        assert reread is not None
+        assert reread.dedupe_count == 1
 
     # --- (d) negative ---
 

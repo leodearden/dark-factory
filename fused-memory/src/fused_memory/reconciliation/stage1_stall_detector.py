@@ -91,10 +91,12 @@ from fused_memory.utils.async_utils import gather_collect
 
 try:
     # One combined block, deliberately: TestEscalationBinding stubs
-    # ``sys.modules['escalation'] = None``, which fails BOTH imports, so a
-    # single ``if Escalation is None`` guard remains sufficient for the whole
-    # module.  A second try block would let the dedupe names bind while
-    # Escalation did not (or vice versa) and split that guard in two.
+    # ``sys.modules['escalation'] = None``, which fails BOTH imports, so all
+    # four names bind or fail together and a single ``is None`` check remains
+    # sufficient at RUNTIME.  A second try block would let the dedupe names bind
+    # while Escalation did not (or vice versa) and split that guard in two.
+    # Call sites still name every symbol they use in the guard, because only an
+    # identity check on the name itself narrows it for the type checker.
     from escalation.dedupe import (  # type: ignore[import-untyped]
         DedupeConfig,
         compute_content_fingerprint,
@@ -523,7 +525,18 @@ async def maybe_escalate_stalled_gate_backlog(
     with the live anchor when the age is known, alone in the fallback summary
     when it cannot be recomputed.
     """
-    if Escalation is None:
+    # All four names bind or fail together (one combined try/except), so any
+    # ONE identity check is sufficient at RUNTIME.  Every name used below is
+    # still listed explicitly because only an identity check on the name itself
+    # NARROWS that optionally-imported symbol for the type checker — a guard on
+    # ``Escalation`` alone leaves the other three typed ``... | None`` and their
+    # call/attribute sites below fail to type-check.
+    if (
+        Escalation is None
+        or DedupeConfig is None
+        or compute_content_fingerprint is None
+        or submit_or_dedupe is None
+    ):
         return []
 
     escalated: list[str] = []
