@@ -72,6 +72,7 @@ parsed at all — so a skip and a hit key alike.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -103,6 +104,7 @@ __all__ = [
     'TreeScan',
     'format_json',
     'format_report',
+    'main',
     'scan_plan_file',
     'scan_tree',
 ]
@@ -386,3 +388,73 @@ def format_json(scan: TreeScan) -> str:
         'scanned': scan.scanned,
     }
     return json.dumps(payload, indent=2, sort_keys=True)
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            'READ-ONLY sweep for semantically CROSS-PAIRED design_decisions '
+            'entries in task plans -- an entry whose decision and rationale are '
+            'each well-formed prose but whose association is wrong. '
+            'Detection/reporting only; it never mutates a plan.'
+        ),
+        epilog=(
+            'There is deliberately no --apply or --repair, and there never will '
+            'be: a mis-paired document carries both texts but no record of '
+            'which belonged where, so there is nothing to reconstruct and a '
+            '"repair" could only guess. Remediation is an author appending a '
+            'correction entry. Every count reported is a STRICT LOWER BOUND -- '
+            'only a mis-pairing someone noticed and documented leaves a trace. '
+            'exit codes: 0 = the sweep ran; 1 = --fail-on-hit was passed and at '
+            'least one mis-paired entry was found. NOTE that 0 does not by '
+            'itself mean the corpus is clean: a --root that does not exist also '
+            'yields no hits, so read the "scanned N plan files" summary, which '
+            'is printed on every run for exactly this reason.'
+        ),
+    )
+    parser.add_argument(
+        '--root', default=str(DEFAULT_ROOT),
+        help='Tree of <root>/*/plan.json to sweep (default: %(default)s). '
+             'Accepts any tree of that shape, e.g. a .worktrees-orphaned lane '
+             'tree.',
+    )
+    parser.add_argument(
+        '--json', action='store_true',
+        help='Emit a JSON object (records, skipped, scanned) instead of the '
+             'human-readable report.',
+    )
+    parser.add_argument(
+        '--fail-on-hit', action='store_true',
+        help='Exit 1 when at least one mis-paired entry is found, for use as a '
+             'CI or timer gate. Skipped files do NOT trigger it -- see the '
+             'scanned count.',
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point — a thin shell over the pure functions above.
+
+    Exit codes: 0 = the sweep ran; 1 = ``--fail-on-hit`` was passed and at
+    least one mis-paired entry was found.
+
+    Exit 0 is NOT by itself evidence of a clean corpus. ``--fail-on-hit`` keys
+    on hits, and a ``--root`` that does not exist produces none, so a
+    mistyped root exits 0 exactly as a clean sweep does. The summary therefore
+    states the scanned count on EVERY run, including the no-hits and JSON
+    paths, so the distinction is visible to anyone reading output rather than
+    only branching on ``$?``. That is the same failure mode the precedent
+    scanner reserves its exit 3 for; here it is surfaced in the report rather
+    than in a code, because a partial sweep (some lanes skipped) is normal for
+    this corpus and would make an all-or-nothing code misleading.
+    """
+    args = _build_parser().parse_args(argv)
+    scan = scan_tree(args.root)
+    print(format_json(scan) if args.json else format_report(scan))
+    if args.fail_on_hit and scan.records:
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
