@@ -1108,7 +1108,7 @@ def _now_iso() -> str:
 def run_healthcheck(
     arms: Sequence[ArmEntry],
     gpu_probe: Callable[[], lms_vram.GpuSnapshot] | None = None,
-    probe: Callable[[ArmEntry], ProbeResult] | None = None,
+    probe: Callable[..., ProbeResult] | None = None,
     baseline: lms_vram.GpuBaseline | None = None,
 ) -> HealthReport:
     """Probe every arm and assemble the report.
@@ -1133,6 +1133,10 @@ def run_healthcheck(
     Individual arm failures, by contrast, are recorded and the sweep continues:
     aborting on the first dead arm would drop verdicts already measured for the
     others and leave the report silently short of rows.
+
+    Each arm is probed TWICE (task 3781): a discarded warm-up, then the run
+    that is actually measured.  See the per-arm loop for why the pairing lives
+    here rather than inside `probe_arm`.
     """
     read_gpu = gpu_probe if gpu_probe is not None else lms_vram.probe_gpu_snapshot
     probe_one = probe if probe is not None else probe_arm
@@ -1194,6 +1198,22 @@ def run_healthcheck(
     measured_at = _now_iso()
     rows: list[ArmRow] = []
     for arm in arms:
+        # The PAIRING lives here, not in `probe_arm`, because `run_healthcheck`
+        # is the only layer that owns it: it is what assembles the ArmRow where
+        # both numbers land.  Keeping `probe_llm_arm`/`probe_embedding_arm`
+        # single-request also keeps every direct-probe test in this suite
+        # measuring exactly one thing.
+        #
+        # The warm-up's VERDICT is discarded outright -- see the two tests that
+        # pin it in both directions.  A failing warm-up must not fail a healthy
+        # arm, and a passing one must not launder a broken one.
+        #
+        # COST, ACCEPTED DELIBERATELY: a hung arm now burns up to 2x
+        # COMPLETION_TIMEOUT_S (360 s) rather than 180 s.  A genuinely dead arm
+        # still refuses fast at `_identity_gate`, so the doubled ceiling is paid
+        # only by a pathologically slow one -- which is cheaper than a latency
+        # column that lies about every healthy arm.
+        probe_one(arm, warmup=True)
         result = probe_one(arm)
         rows.append(
             ArmRow(
