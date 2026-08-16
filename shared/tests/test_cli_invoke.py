@@ -906,13 +906,25 @@ class TestLargePayloadHandling:
         assert not Path(file_path).exists(), 'Temp system prompt file was not cleaned up'
 
     async def test_prompt_sent_via_stdin_not_args(self, tmp_path):
-        """User prompt is piped via stdin, not passed as a CLI argument."""
+        """User prompt is delivered on stdin, not passed as a CLI argument."""
         captured_cmd = []
         captured_kwargs = {}
+        # Read the payload INSIDE the fake: _run_subprocess closes the parent's
+        # handle the moment create_subprocess_exec returns (that close is what
+        # gives the child its EOF), so it is unreadable by the time the
+        # assertions below run.
+        stdin_seen: dict = {}
 
         async def fake_exec(*args, **kwargs):
             captured_cmd.extend(args)
             captured_kwargs.update(kwargs)
+            stdin_arg = kwargs.get('stdin')
+            stdin_seen['is_pipe'] = stdin_arg == asyncio.subprocess.PIPE
+            stdin_seen['is_file'] = hasattr(stdin_arg, 'read')
+            if stdin_seen['is_file']:
+                stdin_seen['pos'] = stdin_arg.tell()
+                stdin_arg.seek(0)
+                stdin_seen['payload'] = stdin_arg.read()
             proc = MagicMock()
             proc.communicate = AsyncMock(return_value=(
                 _successful_json_output().encode(),
@@ -938,8 +950,18 @@ class TestLargePayloadHandling:
                 f'Prompt text found in cmd arg: {arg!r}'
             )
 
-        # stdin must be PIPE (for piping prompt data)
-        assert captured_kwargs.get('stdin') == asyncio.subprocess.PIPE
+        # stdin is a pre-materialized file object, NOT a PIPE (task 3147): the
+        # payload must already be readable by the kernel at execve, so a
+        # stalled event loop cannot cost the child its prompt.
+        assert not stdin_seen['is_pipe'], (
+            'stdin is a bare PIPE — the prompt would be written by the event '
+            'loop after execve, reopening the task-3147 starvation race'
+        )
+        assert stdin_seen['is_file'], (
+            f'stdin is not a readable file object: {captured_kwargs.get("stdin")!r}'
+        )
+        assert stdin_seen['pos'] == 0, 'pre-materialized stdin is not rewound to 0'
+        assert stdin_seen['payload'] == prompt_text.encode()
 
     async def test_temp_files_cleaned_up_on_error(self, tmp_path):
         """Temp files are cleaned up even when subprocess raises."""
@@ -975,14 +997,21 @@ class TestLargePayloadHandling:
         MAX_ARG_STRLEN = 131072  # 128KB, Linux per-argument limit
 
         captured_cmd = []
-        captured_communicate_input = []
+        # Read the pre-materialized stdin INSIDE the fake — _run_subprocess
+        # closes the parent's handle as soon as create_subprocess_exec returns.
+        captured_stdin_payload = []
 
         async def fake_exec(*args, **kwargs):
             captured_cmd.extend(args)
+            stdin_arg = kwargs.get('stdin')
+            assert hasattr(stdin_arg, 'read'), (
+                f'expected a pre-materialized stdin file object, got {stdin_arg!r}'
+            )
+            stdin_arg.seek(0)
+            captured_stdin_payload.append(stdin_arg.read())
             proc = MagicMock()
 
             async def fake_communicate(input=None):
-                captured_communicate_input.append(input)
                 return (_successful_json_output().encode(), b'')
 
             proc.communicate = fake_communicate
@@ -1008,9 +1037,12 @@ class TestLargePayloadHandling:
                 f'CLI arg exceeds MAX_ARG_STRLEN ({len(str(arg).encode())} bytes): {str(arg)[:100]}...'
             )
 
-        # The large prompt should arrive via stdin, not args
-        assert len(captured_communicate_input) == 1
-        assert captured_communicate_input[0] == large_prompt.encode()
+        # The large prompt should arrive via stdin, not args.  260 KB is
+        # load-bearing: it is >4x the 65536-byte default pipe capacity, so this
+        # also proves the task-3147 pre-materialization is not silently
+        # capacity-bounded the way a pre-filled os.pipe() fix would be.
+        assert len(captured_stdin_payload) == 1
+        assert captured_stdin_payload[0] == large_prompt.encode()
 
     async def test_resume_still_passes_system_prompt_file(self, tmp_path):
         """When resuming a session, --system-prompt-file is STILL used (task 3983).
