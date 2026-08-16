@@ -10263,6 +10263,16 @@ class GitOps:
         ``'skipped_*'``, including ``'skipped_lock_error'``) returns
         immediately, so a live-leased tree, a tree whose lease could not be
         established, and the warm persistent lanes are NEVER force-removed.
+
+        **Observability caveat**: this method returns ``None``, so the
+        primitive's outcome is DISCARDED here and a ``'skipped_lock_error'``
+        reached through this path is visible only as the primitive's single
+        WARNING — there is no event or escalation keyed on it. A durable
+        EACCES/EROFS/ENOSPC on the lane therefore accumulates ``_merge-``
+        trees quietly, backstopped only by the age-keyed worktree ledger.
+        Callers that need it structurally should use
+        :meth:`remove_merge_worktree_guarded` directly and emit the outcome
+        themselves, as merge_queue's cancel-retire arms already do.
         Never raises. The primitive absorbs BOTH ``OSError`` escapes on the
         way here — preparing the lane lock file (→ ``'skipped_lock_error'``,
         tree retained) and a ``git worktree remove`` that cannot spawn at
