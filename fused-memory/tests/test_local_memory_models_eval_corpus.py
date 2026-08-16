@@ -26,6 +26,7 @@ import json
 import os
 import random
 import re
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -2625,6 +2626,102 @@ class TestAShortBufferedWriteIntoAClosedPipeIsAlsoARunFailure:
         code, _ = _run_cli(monkeypatch, '--verify', '--out', str(out), entry=_mod._cli)
         assert code == 0
         assert 'ok' in capsys.readouterr().out.lower()
+
+
+def _spawn(*argv, closed_stdout: bool) -> tuple[int, str, str]:
+    """Run build_corpus.py in a CHILD process and return (exit status, stdout, stderr).
+
+    A real subprocess is the only shape that can observe the two things this
+    file's in-process tests structurally cannot: the interpreter's own
+    finalization-time flush of ``sys.stdout``, and the exit status the OS
+    actually reports (CPython forces 120 when that flush fails, which no
+    ``return`` value inside the process can express).
+
+    With *closed_stdout*, fd 1 is a pipe whose READ end is closed BEFORE the
+    spawn. Closing the reader first is what makes it deterministic: leave it
+    open and the child's write lands in the kernel's 64 KiB pipe buffer and
+    never fails, so the test would pass for the wrong reason. Python
+    re-installs ``SIGPIPE`` as ``SIG_IGN`` at startup, so the child gets EPIPE
+    as a catchable ``BrokenPipeError`` rather than dying on the signal — the
+    status here is therefore always a real exit code, never ``-13``.
+    """
+    read_fd, write_fd = os.pipe() if closed_stdout else (None, None)
+    if closed_stdout:
+        os.close(read_fd)  # the reader is already gone, like `head` after its window
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, str(SCRIPT_PATH), *argv],
+            stdout=write_fd if closed_stdout else subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    finally:
+        if closed_stdout:
+            os.close(write_fd)  # the child now holds the only write end
+    out, err = proc.communicate(timeout=120)
+    return (
+        proc.returncode,
+        (out or b'').decode('utf-8', 'replace'),
+        (err or b'').decode('utf-8', 'replace'),
+    )
+
+
+class TestArgparseOutputIntoAClosedPipeExitsCleanlyToo:
+    """``--help | head``: the leg that reaches neither ``main()`` nor ``_cli()``'s pipe handler.
+
+    ``argparse`` writes the help text and leaves via ``SystemExit(0)`` from
+    ``parse_args()`` — which happens INSIDE ``main()`` but before its ``try``,
+    and propagates straight past ``_cli()``'s ``except BrokenPipeError``
+    because nothing is raised in-band at all. The help text is still sitting in
+    stdout's buffer when the interpreter starts finalizing, so the failure
+    lands in exactly the unreachable place regime B lands in: "Exception
+    ignored on flushing sys.stdout" and a forced exit status 120.
+
+    Measured, not assumed: before this fix ``--help`` with a closed pipe on
+    fd 1 exits 120 with that message, and it still does after the ``_cli()``
+    flush lands, because ``SystemExit`` is not ``BrokenPipeError``.
+
+    The controls matter as much as the assertion. ``--help`` must keep exiting
+    0 and an unrecognized flag must keep exiting 2 — a fix that routed every
+    ``SystemExit`` through the broken-pipe handler would satisfy the headline
+    assertion by breaking argparse's ordinary contract, and would be caught
+    here rather than by a user.
+    """
+
+    def test_help_into_a_closed_pipe_exits_run_failed_without_shutdown_noise(self):
+        code, _, err = _spawn('--help', closed_stdout=True)
+        assert code == _mod.EXIT_RUN_FAILED
+        assert 'Traceback' not in err
+        assert 'Exception ignored' not in err
+        # Reads like every other failure in this CLI. Asserted as "contains"
+        # rather than "is exactly one line", unlike the in-process tests above:
+        # a child interpreter's stderr is not fully under this test's control
+        # (an unrelated warning would be a real signal, not a reason to go
+        # red), and the single-line contract is already pinned in-process
+        # where stderr IS controlled.
+        assert any(line.startswith('error: ') for line in err.splitlines())
+
+    def test_help_with_a_healthy_stdout_still_exits_zero_and_prints_usage(self):
+        """CONTROL: the ordinary `--help` contract is untouched."""
+        code, out, _ = _spawn('--help', closed_stdout=False)
+        assert code == 0
+        assert 'usage:' in out
+
+    def test_an_unrecognized_flag_still_exits_two(self):
+        """CONTROL: argparse's usage-error code survives, on BOTH stdout shapes.
+
+        The closed-pipe half is the sharper of the two. argparse writes its
+        error to stderr, so stdout's buffer is empty and the flush attempts no
+        write and cannot fail — meaning the exit status must still be 2. A fix
+        that collapsed "stdout is a closed pipe" into EXIT_RUN_FAILED
+        regardless of whether the flush actually failed would go red here, and
+        nowhere else.
+        """
+        healthy_code, _, healthy_err = _spawn('--definitely-not-a-flag', closed_stdout=False)
+        assert healthy_code == 2
+        assert 'unrecognized' in healthy_err
+
+        closed_code, _, _ = _spawn('--definitely-not-a-flag', closed_stdout=True)
+        assert closed_code == 2
 
 
 class TestBuilderScriptSatisfiesTheDeliveredCheck:
