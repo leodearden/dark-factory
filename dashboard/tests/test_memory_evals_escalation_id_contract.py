@@ -419,3 +419,85 @@ def test_every_memory_eval_escalation_id_resolves_in_the_escalations_payload(
             'Extend build_dual_escalation_tree rather than dropping this precondition '
             '— an unexercised reach path is exactly where the id space drifts unseen.'
         )
+
+
+def test_the_id_space_subset_direction_is_asymmetric_by_design(tmp_path: Path) -> None:
+    """MEMORY_EVALS ⊂ ESCALATIONS — strictly, in one direction, on purpose.
+
+    The containment is not a coincidence the previous test happens to observe;
+    it is the reason every link resolves, and it is one-way by construction:
+
+    * `_index_escalations` filters HARD — it drops every record whose
+      `category` is not `eval_regression`, every closed status
+      (resolved/dismissed), and every duplicate fingerprint.
+    * `shape_escalations` filters NOTHING — the reconciliation subsection ships
+      the whole queue, `{**esc, ...}`.
+
+    So ESCALATIONS is the superset by design, and asserting the reverse
+    direction would be WRONG: it would fail on the first resolved escalation an
+    operator closes, which is an ordinary Tuesday and not a defect.
+
+    This test exists so that a future move toward symmetry — a filter added to
+    `shape_escalations`, a category or status widening in `_index_escalations`
+    — is a DELIBERATE decision that has to come here and change an assertion,
+    rather than something that silently redefines what the previous test means.
+    Both halves are asserted: the non-linkable records really do reach the
+    consumer payload (so this is a live asymmetry, not an empty claim), and
+    they really are unreachable from the producer side.
+    """
+    tree = build_dual_escalation_tree(tmp_path)
+    memory_evals = _build_memory_evals(tree.config)
+    escalations = _build_escalations(tree.config)
+
+    row_ids = {
+        row.get('id')
+        for subsection in escalations['subsections']
+        for row in subsection['escalations']
+    }
+    reached_ids = {
+        escalation.get('id')
+        for _path, escalation in _iter_memory_eval_escalations(memory_evals)
+    }
+
+    # Anti-vacuity: the filter must be discarding SELECTIVELY, not discarding
+    # everything.  Without this, a totally broken `_index_escalations` that
+    # dropped every record would satisfy every assertion below.
+    assert tree.linked_id in reached_ids, (
+        f'the linked record {tree.linked_id!r} is not reachable from MEMORY_EVALS, so '
+        'the "never reachable" assertions below prove nothing — they would hold for a '
+        'producer that dropped every escalation it was given.'
+    )
+
+    for what, esc_id in (
+        ('a CLOSED (resolved) eval_regression', tree.resolved_id),
+        ('an OPEN record of another category', tree.other_category_id),
+    ):
+        assert esc_id in row_ids, (
+            f'{what} escalation {esc_id!r} is missing from ESCALATIONS. '
+            '`shape_escalations` filters nothing, so it must ship the whole queue — '
+            'if it has started filtering, the containment this module relies on is '
+            'no longer guaranteed and the id space can drift.'
+        )
+        assert esc_id not in reached_ids, (
+            f'{what} escalation {esc_id!r} IS reachable from MEMORY_EVALS. '
+            '`_index_escalations` is supposed to drop it: a closed alarm must not '
+            "render as open, and a non-eval_regression record is not this view's "
+            'subject matter.'
+        )
+
+    assert reached_ids < row_ids, (
+        'MEMORY_EVALS escalation ids must be a STRICT subset of ESCALATIONS row ids.\n'
+        f'  only in MEMORY_EVALS: {sorted(map(str, reached_ids - row_ids))}\n'
+        f'  only in ESCALATIONS:  {sorted(map(str, row_ids - reached_ids))}\n'
+        'A non-empty first line is the contract break the previous test names. An '
+        'EMPTY second line means the two id spaces have become equal — which is not '
+        'a break, but it does mean this test is no longer observing the asymmetry it '
+        'was written to pin, and the filters above should be re-read before it is '
+        'relaxed into an ordinary subset check.'
+    )
+
+    assert collect_escalation_id_violations(memory_evals, escalations) == [], (
+        'the checker must enforce MEMORY_EVALS ⊆ ESCALATIONS only. Rows that exist '
+        'solely on the consumer side are the DESIGNED state, and reporting them '
+        'would make the contract test fire on every escalation an operator closes.'
+    )
