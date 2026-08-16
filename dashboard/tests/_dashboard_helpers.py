@@ -7,15 +7,19 @@ the same process.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import aiosqlite
 import pytest
+
+from dashboard.config import DashboardConfig
 
 
 def live_aiosqlite_worker_threads() -> list[threading.Thread]:
@@ -107,6 +111,169 @@ def apply_isolated_env(mp: pytest.MonkeyPatch, root: Path) -> None:
     mp.delenv('DASHBOARD_KNOWN_PROJECT_ROOTS', raising=False)
     mp.delenv('RECONCILIATION_DATA_DIR', raising=False)
     mp.delenv('QUEUE_DATA_DIR', raising=False)
+
+
+# ---------------------------------------------------------------------------
+# Dual-payload memory-eval / escalation artifact tree (task 3471)
+# ---------------------------------------------------------------------------
+
+_DUAL_EVAL_ID = 'e1-retrieval-health'
+_DUAL_RUN_STAMPS = ('20260703T031500Z', '20260704T031500Z', '20260705T031500Z')
+_DUAL_LINKED_FINGERPRINT = f'eval:{_DUAL_EVAL_ID}|metric:dangling-pointers|item:node-7'
+
+
+@dataclass(frozen=True)
+class DualEscalationTree:
+    """What :func:`build_dual_escalation_tree` wrote, and where.
+
+    ``config`` is the single :class:`DashboardConfig` BOTH payload producers
+    read — that shared root is the whole point of the fixture, since the
+    coverage gap it closes is that no test had ever built ``MEMORY_EVALS`` and
+    ``ESCALATIONS`` from one directory.
+
+    The id fields name the records by the MEMORY_EVALS reach path each one is
+    written to exercise, so a test can assert about a specific path without
+    re-deriving which record landed where.
+    """
+
+    config: DashboardConfig
+    linked_id: str
+    """Reaches ``evals[i].metrics[j].escalation`` — its fingerprint matches a verdict."""
+
+
+def _dual_dump(path: Path, body: Any) -> Path:
+    """Write *body* in the producers' canonical artifact serialization.
+
+    ``indent=2, sort_keys=True, ensure_ascii=False`` plus a trailing newline —
+    the form ``shared/tests/fixtures/memory_eval/README.md`` pins for the
+    committed exemplars, mirroring ``test_memory_evals_data._dump`` so the
+    tmp_path trees are byte-shaped like the real ones.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(body, indent=2, sort_keys=True, ensure_ascii=False) + '\n')
+    return path
+
+
+def _dual_escalation(
+    esc_dir: Path,
+    esc_id: str,
+    *,
+    category: str = 'eval_regression',
+    status: str = 'pending',
+    dedupe_fingerprint: str | None = None,
+    summary: str = 'memory-eval regression',
+) -> Path:
+    """Write one escalation queue record at ``<esc_dir>/<esc_id>.json``.
+
+    Field names mirror ``escalation.models.Escalation`` (``timestamp``, not
+    ``created_at``) since that is what the queue serialises and what
+    ``load_queue_escalations`` passes through unchanged.  The
+    ``category='eval_regression'`` / ``status='pending'`` defaults are exactly
+    the pair ``memory_evals._index_escalations`` accepts; every other
+    combination is dropped by that reader and can only ever appear on the
+    ESCALATIONS side.
+    """
+    return _dual_dump(esc_dir / f'{esc_id}.json', {
+        'id': esc_id,
+        'task_id': 'memory-eval-e1',
+        'agent_role': 'memory-eval-runner',
+        'severity': 'blocking',
+        'category': category,
+        'summary': summary,
+        'detail': '',
+        'timestamp': '2026-07-30T03:15:00+00:00',
+        'status': status,
+        'level': 1,
+        'dedupe_fingerprint': dedupe_fingerprint,
+    })
+
+
+def build_dual_escalation_tree(tmp_path: Path) -> DualEscalationTree:
+    """One artifact tree feeding BOTH dashboard payloads that carry escalation ids.
+
+    ``build_memory_evals`` and ``build_escalation_queues`` read the same queue
+    directory but had no shared fixture: the set of test modules importing each
+    was disjoint, so nothing ever checked that an id one payload emits is one
+    the other can resolve.  This builds the tree both of them read.
+
+    Every path is resolved from *config properties*, never hand-spelled.
+    ``reconciliation_escalations_dir`` honours ``RECONCILIATION_DATA_DIR``
+    ahead of ``project_root`` (config.py ``_runtime_data_dir``), so a spelled
+    path would write where only one of the two readers looks — and the test
+    would then be checking a directory the producers do not share, which is
+    the one thing this fixture exists to avoid.
+
+    Returns a :class:`DualEscalationTree` naming each record by the reach path
+    it exercises.
+    """
+    config = DashboardConfig(project_root=tmp_path, known_project_roots=[])
+    root = config.memory_evals_dir
+    esc_dir = config.reconciliation_escalations_dir
+    esc_dir.mkdir(parents=True, exist_ok=True)
+
+    # M1 metrics series — one file per run, ordered by filename stamp.
+    for stamp in _DUAL_RUN_STAMPS:
+        _dual_dump(root / _DUAL_EVAL_ID / f'metrics-{stamp}.json', {
+            'schema_version': 1,
+            'eval_id': _DUAL_EVAL_ID,
+            'run_stamp': stamp,
+            'corpus': {
+                'project_id': 'dark_factory',
+                'counts': {'entities_and_relations': 1204, 'temporal_facts': 588},
+            },
+            'metrics': [
+                {
+                    'metric_id': 'canonical-in-top-5', 'kind': 'proportion',
+                    'value': 0.94, 'n': 50, 'denominator': 50,
+                },
+                {'metric_id': 'dangling-pointers', 'kind': 'count', 'value': 4.0, 'n': 4},
+            ],
+        })
+
+    # Per-eval limits (provenance only — no dashboard verdict comes from here).
+    _dual_dump(root / _DUAL_EVAL_ID / 'limits-current.json', {
+        'schema_version': 1,
+        'eval_id': _DUAL_EVAL_ID,
+        'run_stamp': _DUAL_RUN_STAMPS[-1],
+        'alpha': 0.002777777777777778,
+        'false_alarm_budget': 1.0,
+        'runs_per_quarter': 90,
+        'min_samples': 10,
+        'baseline_window': 3,
+        'baseline_run_stamps': list(_DUAL_RUN_STAMPS[:2]),
+        'grandfather_set_hash': 'f8c4' * 16,
+        'generator': 'shared.memory_eval_limits',
+        'verdicts': [
+            {'metric_id': 'canonical-in-top-5', 'rule_kind': 'proportion', 'status': 'ok', 'alarms': []},
+            {'metric_id': 'dangling-pointers', 'rule_kind': 'count', 'status': 'ok', 'alarms': []},
+        ],
+    })
+
+    # Root-scoped M2 verdicts.  The alarming metric's fingerprint is what the
+    # escalation below joins on, so the metric-row reach path yields a link.
+    _dual_dump(root / 'verdicts-current.json', {
+        'schema_version': 1,
+        'run_stamp': _DUAL_RUN_STAMPS[-1],
+        'entries': [
+            {
+                'eval_id': _DUAL_EVAL_ID, 'metric_id': 'dangling-pointers',
+                'verdict': 'alarm', 'fingerprint': _DUAL_LINKED_FINGERPRINT,
+                'value': 4.0, 'limit_ref': 'count>=3',
+                'run_stamp': _DUAL_RUN_STAMPS[-1], 'item': 'node-7',
+            },
+            {
+                'eval_id': _DUAL_EVAL_ID, 'metric_id': 'canonical-in-top-5',
+                'verdict': 'no_alarm',
+                'fingerprint': f'eval:{_DUAL_EVAL_ID}|metric:canonical-in-top-5',
+                'value': 0.94, 'limit_ref': None,
+                'run_stamp': _DUAL_RUN_STAMPS[-1],
+            },
+        ],
+    })
+
+    _dual_escalation(esc_dir, 'esc-eval-linked', dedupe_fingerprint=_DUAL_LINKED_FINGERPRINT)
+
+    return DualEscalationTree(config=config, linked_id='esc-eval-linked')
 
 
 RECONCILIATION_SCHEMA = """
