@@ -22,7 +22,7 @@ import logging
 from datetime import UTC, datetime
 
 import aiosqlite
-from shared.phantom_verdict import is_phantom_verdict_row
+from shared.phantom_verdict import is_phantom_verdict_json
 
 from dashboard.data.db import with_db
 from dashboard.data.utils import parse_utc, resolve_now
@@ -344,9 +344,10 @@ async def get_latest_verdict(db: aiosqlite.Connection | None) -> dict | None:
     ``severity`` and ``action_taken`` are reported verbatim and the renderer
     decides how to present them.
 
-    ``findings`` is loaded only to classify and is deliberately NOT returned:
-    ``/api/v2/dashboard/recon`` is a poll endpoint and the boolean is the whole
-    answer.
+    ``findings`` is selected only to classify (via
+    :func:`shared.phantom_verdict.is_phantom_verdict_json`, which owns the
+    decode too) and is deliberately NOT returned: ``/api/v2/dashboard/recon``
+    is a poll endpoint and the boolean is the whole answer.
     """
     async def _query(db: aiosqlite.Connection) -> dict | None:
         async with db.execute(
@@ -356,21 +357,19 @@ async def get_latest_verdict(db: aiosqlite.Connection | None) -> dict | None:
             row = await cursor.fetchone()
         if row is None:
             return None
-        # Narrow exceptions, matching get_journal_entries above: a malformed
-        # or NULL column degrades to "not a phantom" (the row is still shown,
-        # just unannotated), while a genuinely unexpected error still surfaces.
-        try:
-            findings = json.loads(row['findings']) if row['findings'] else []
-        except (json.JSONDecodeError, TypeError):
-            findings = []
-        if not isinstance(findings, list):
-            findings = []
+        # The raw-column decode lives in shared alongside the predicate, not
+        # here: journal.get_stats reads the same column and needs the identical
+        # preamble, and a copy in each consumer is how the non-mapping-element
+        # gap got past both.  A malformed or NULL column degrades to "not a
+        # phantom" (the row is still shown, just unannotated) and never raises
+        # — with_db catches only sqlite3.OperationalError/OSError, so an
+        # escaping AttributeError would 500 the whole /recon poll payload.
         return {
             'run_id': row['run_id'],
             'severity': row['severity'],
             'action_taken': row['action_taken'],
             'reviewed_at': row['reviewed_at'],
-            'is_phantom': is_phantom_verdict_row(row['severity'], findings),
+            'is_phantom': is_phantom_verdict_json(row['severity'], row['findings']),
         }
 
     return await with_db(db, _query, None)

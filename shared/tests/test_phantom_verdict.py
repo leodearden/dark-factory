@@ -24,13 +24,16 @@ conjunct exists to protect.
 from __future__ import annotations
 
 import enum
+import json
 
 import pytest
 
 from shared.phantom_verdict import (
     UNPARSEABLE_ISSUE_PREFIX,
     UNPARSEABLE_VERDICT_CODE,
+    coerce_findings,
     has_unparseable_marker,
+    is_phantom_verdict_json,
     is_phantom_verdict_row,
 )
 
@@ -146,6 +149,18 @@ def test_marker_branch_is_severity_agnostic():
         pytest.param([{'issue': None}], id='issue-is-none'),
         pytest.param([{'issue': 42}], id='issue-is-int'),
         pytest.param([{'code': None, 'issue': None}], id='both-keys-none'),
+        # Elements that are not mappings at all — what a findings column
+        # holding '["a string"]' / '[null]' / '[1, 2]' decodes to.  Both
+        # branches call .get() on an element, so an unguarded implementation
+        # raises AttributeError here rather than returning False.  That is not
+        # a cosmetic difference: neither DB caller catches AttributeError (both
+        # narrow to json.JSONDecodeError/TypeError around the decode ONLY), and
+        # the dashboard's with_db catches only sqlite3.OperationalError/OSError
+        # — so the exception would escape and 500 the whole /recon poll.
+        pytest.param(['a string'], id='element-is-str'),
+        pytest.param([None], id='element-is-none'),
+        pytest.param([1, 2], id='elements-are-ints'),
+        pytest.param([['nested']], id='element-is-list'),
     ],
 )
 def test_degenerate_findings_are_not_phantom_and_do_not_raise(findings):
@@ -155,6 +170,17 @@ def test_degenerate_findings_are_not_phantom_and_do_not_raise(findings):
     a real verdict rather than silently vanishing from the totals.
     """
     assert is_phantom_verdict_row('serious', findings) is False
+
+
+def test_non_mapping_element_does_not_hide_a_real_marker():
+    """Skipping a non-mapping entry must SKIP it, not abort the scan.
+
+    The guard is a filter, not an early return: a genuine marker sitting after
+    a junk element is still found.
+    """
+    findings = ['a string', None, *MARKED_PHANTOM_FINDINGS]
+    assert has_unparseable_marker(findings) is True
+    assert is_phantom_verdict_row('serious', findings) is True
 
 
 def test_multi_finding_marked_row_is_phantom():
@@ -225,3 +251,100 @@ def test_has_unparseable_marker_true_on_marked_row():
 def test_has_unparseable_marker_false_without_the_code(findings):
     """The marker scan is strictly the ``code`` check — it does not peek at issue."""
     assert has_unparseable_marker(findings) is False
+
+
+# --- the raw-column adapter both DB consumers call ---------------------------
+#
+# `coerce_findings` / `is_phantom_verdict_json` live here rather than being
+# copy-pasted into `dashboard.data.reconciliation.get_latest_verdict` and
+# `ReconciliationJournal.get_stats`.  Those two read the same TEXT column and
+# had byte-identical decode preambles; the duplication is what let the
+# non-mapping-element gap survive in both at once.
+
+
+@pytest.mark.parametrize(
+    ('raw', 'expected'),
+    [
+        pytest.param(None, [], id='null-column'),
+        pytest.param('', [], id='empty-string'),
+        pytest.param('not json', [], id='not-json'),
+        pytest.param('{"not": "a list"}', [], id='json-object-not-list'),
+        pytest.param('"a bare string"', [], id='json-string-not-list'),
+        pytest.param('42', [], id='json-number-not-list'),
+        pytest.param('[]', [], id='empty-list'),
+        pytest.param('[{"issue": "x"}]', [{'issue': 'x'}], id='ordinary-list'),
+        pytest.param('["a string"]', ['a string'], id='list-of-non-mappings'),
+    ],
+)
+def test_coerce_findings_normalises_every_column_shape(raw, expected):
+    """Anything not positively a findings list decodes to ``[]``, never raises.
+
+    Non-mapping ELEMENTS are passed through rather than filtered here: the
+    predicate tolerates them, and dropping them silently would make the decoded
+    length disagree with the stored row (the legacy branch's single-finding
+    conjunct reads that length).
+    """
+    assert coerce_findings(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ('severity', 'raw', 'expected'),
+    [
+        pytest.param(
+            'serious',
+            '[{"code": "unparseable_judge_response", "issue": "Judge response'
+            ' could not be parsed: x"}]',
+            True,
+            id='marked-phantom',
+        ),
+        pytest.param(
+            'moderate',
+            '[{"code": "unparseable_judge_response", "issue": "x"}]',
+            True,
+            id='marked-phantom-non-serious-severity',
+        ),
+        pytest.param(
+            'serious',
+            '[{"issue": "Judge response could not be parsed: x"}]',
+            True,
+            id='legacy-unmarked-phantom',
+        ),
+        pytest.param(
+            'serious',
+            '[{"issue": "a"}, {"issue": "b"}, {"issue": "c"},'
+            ' {"issue": "d"}, {"issue": "e"}]',
+            False,
+            id='genuine-five-finding-serious',
+        ),
+        pytest.param('serious', None, False, id='null-column'),
+        pytest.param('serious', 'not json', False, id='malformed-column'),
+        pytest.param(
+            'serious', '{"not": "a list"}', False, id='json-object-not-list'
+        ),
+        pytest.param('serious', '["a string"]', False, id='list-of-non-mappings'),
+        pytest.param('serious', '[null]', False, id='list-of-nulls'),
+        pytest.param('ok', '[]', False, id='ordinary-ok'),
+    ],
+)
+def test_is_phantom_verdict_json_classifies_a_raw_column(severity, raw, expected):
+    """The single call each DB read path makes: decode + classify, never raise."""
+    assert is_phantom_verdict_json(severity, raw) is expected
+
+
+def test_is_phantom_verdict_json_agrees_with_the_row_predicate():
+    """The JSON adapter is exactly ``is_phantom_verdict_row ∘ coerce_findings``.
+
+    Drift guard: the adapter must not grow a second, subtly different copy of
+    the classification.
+    """
+    for severity in ('ok', 'minor', 'moderate', 'serious'):
+        for findings in (
+            MARKED_PHANTOM_FINDINGS,
+            LEGACY_PHANTOM_FINDINGS,
+            GENUINE_SERIOUS_FINDINGS,
+            ORDINARY_FINDINGS,
+            [],
+        ):
+            assert is_phantom_verdict_json(
+                severity, json.dumps(findings)
+            ) is is_phantom_verdict_row(severity, findings)

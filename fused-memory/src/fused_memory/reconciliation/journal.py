@@ -17,7 +17,7 @@ from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daem
 # judge.py imports THIS module at module scope, so importing it back would be a
 # circular import.  The rule lives in shared precisely so this module and the
 # dashboard can both reach it; judge.py delegates to the same primitives.
-from shared.phantom_verdict import UNPARSEABLE_VERDICT_CODE, is_phantom_verdict_row
+from shared.phantom_verdict import UNPARSEABLE_VERDICT_CODE, is_phantom_verdict_json
 
 from fused_memory.models.reconciliation import (
     JournalEntry,
@@ -949,28 +949,36 @@ class ReconciliationJournal:
         # mentions the code string is still correctly rejected by
         # is_phantom_verdict_row in Python.  The LIKE pattern is built from the
         # shared constant so hoisting the rule does not reintroduce a second
-        # spelling of the marker by the back door.
+        # spelling of the marker by the back door — and it is the EXACT
+        # spelling, because `_` is a single-character wildcard in SQL LIKE and
+        # the constant contains three of them.  Unescaped, the pattern would
+        # also match `unparseable?judge?response`; ESCAPE '\' below makes it
+        # literal.  Widening a superset filter is harmless, but the idiom would
+        # not be, so it is not left here to be copied somewhere authoritative.
         #
         # Measured motivation (live DB, 30-day window): 10 candidate rows
         # versus ~2400 findings blobs a naive full-window scan would parse.
+        marker_like = '%{}%'.format(
+            UNPARSEABLE_VERDICT_CODE
+            .replace('\\', r'\\')
+            .replace('%', r'\%')
+            .replace('_', r'\_')
+        )
         phantom_counts: dict[str, int] = {}
         async with db.execute(
-            """SELECT jv.severity as severity, jv.findings as findings
+            r"""SELECT jv.severity as severity, jv.findings as findings
                FROM judge_verdicts jv JOIN runs r ON jv.run_id = r.id
                WHERE r.project_id = ? AND jv.reviewed_at > ?
-                 AND (jv.severity = 'serious' OR jv.findings LIKE ?)""",
-            (project_id, since_str, f'%{UNPARSEABLE_VERDICT_CODE}%'),
+                 AND (jv.severity = 'serious' OR jv.findings LIKE ? ESCAPE '\')""",
+            (project_id, since_str, marker_like),
         ) as cursor:
             candidate_rows = await cursor.fetchall()
 
+        # The decode-and-normalise preamble lives in shared beside the
+        # predicate rather than being copy-pasted here and in the dashboard's
+        # get_latest_verdict: is_phantom_verdict_json is that one call.
         for row in candidate_rows:
-            try:
-                findings = json.loads(row['findings']) if row['findings'] else []
-            except (json.JSONDecodeError, TypeError):
-                findings = []
-            if not isinstance(findings, list):
-                findings = []
-            if is_phantom_verdict_row(row['severity'], findings):
+            if is_phantom_verdict_json(row['severity'], row['findings']):
                 phantom_counts[row['severity']] = (
                     phantom_counts.get(row['severity'], 0) + 1
                 )

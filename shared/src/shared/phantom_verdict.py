@@ -58,6 +58,14 @@ dependency direction that is the whole point.  ``VerdictSeverity`` is a
 equal to its value and the same primitive comparison serves both a validated
 model field and a raw SQLite row with no conversion.
 
+**The raw-column adapter lives here too.**  Both DB consumers read the same
+TEXT ``findings`` column and need the same decode-and-normalise preamble; a
+predicate hoisted to one home with its adapter copy-pasted into each caller
+would have re-created the very duplication this module exists to remove — and
+the element-type gap that the duplicated preamble hid.  So
+:func:`coerce_findings` and :func:`is_phantom_verdict_json` are part of the
+public surface, and each DB site is one call.
+
 Not re-exported from ``shared/__init__.py``: ``shared.cap_markers`` and
 ``shared.invocation_outcome`` are not either, submodule imports are this
 package's norm, and ``test_public_api.py`` pins the curated top-level surface.
@@ -65,6 +73,7 @@ package's norm, and ``test_public_api.py`` pins the curated top-level surface.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -89,7 +98,7 @@ before the ``code`` marker existed and so cannot be identified any other way.
 """
 
 
-def has_unparseable_marker(findings: Sequence[Mapping[str, Any]]) -> bool:
+def has_unparseable_marker(findings: Sequence[Any]) -> bool:
     """True iff any entry in *findings* carries the structured
     ``code == 'unparseable_judge_response'`` marker.
 
@@ -103,13 +112,21 @@ def has_unparseable_marker(findings: Sequence[Mapping[str, Any]]) -> bool:
     (guaranteed ``list[dict]``) or a ``json.loads``-ed SQLite ``findings``
     column.  ``Mapping.get`` is the only operation used, so a raw parsed row
     needs no conversion.
+
+    Elements are NOT required to be mappings: a non-``Mapping`` entry (what a
+    ``findings`` column holding ``'["a string"]'`` decodes to) is skipped, not
+    an ``AttributeError``.  The declared contract is "``False`` for any shape
+    not positively recognised", and a read path that raised on a degenerate
+    row would take down the whole poll payload with it — the dashboard's
+    ``with_db`` catches only ``sqlite3.OperationalError``/``OSError``.
     """
-    return any(f.get('code') == UNPARSEABLE_VERDICT_CODE for f in findings)
+    return any(
+        isinstance(f, Mapping) and f.get('code') == UNPARSEABLE_VERDICT_CODE
+        for f in findings
+    )
 
 
-def is_phantom_verdict_row(
-    severity: str, findings: Sequence[Mapping[str, Any]]
-) -> bool:
+def is_phantom_verdict_row(severity: str, findings: Sequence[Any]) -> bool:
     """True iff this verdict row is a fabricated stand-in for a review that
     never happened, rather than a genuine judge finding.
 
@@ -123,17 +140,64 @@ def is_phantom_verdict_row(
             ``VerdictSeverity``, which lives in ``fused_memory`` and must not
             be imported here.
         findings: The verdict's findings, as validated model dicts or a
-            ``json.loads``-ed SQLite column.
+            ``json.loads``-ed SQLite column.  Entries that are not mappings are
+            tolerated and simply never match.
 
     Returns:
         ``False`` for any shape not positively recognised, including a
         malformed or empty findings list — an unrecognised row stays counted as
-        a genuine verdict rather than silently vanishing from the totals.
+        a genuine verdict rather than silently vanishing from the totals.  This
+        function never raises on a degenerate row.
     """
     if has_unparseable_marker(findings):
         return True
-    if severity == 'serious' and len(findings) == 1:
+    if (
+        severity == 'serious'
+        and len(findings) == 1
+        and isinstance(findings[0], Mapping)
+    ):
         issue = findings[0].get('issue')
         if isinstance(issue, str) and issue.startswith(UNPARSEABLE_ISSUE_PREFIX):
             return True
     return False
+
+
+def coerce_findings(raw: str | bytes | None) -> list[Any]:
+    """Decode a raw SQLite ``findings`` column into a list of findings.
+
+    The adapter half of the rule.  Both DB consumers — ``dashboard.data.
+    reconciliation.get_latest_verdict`` and ``ReconciliationJournal.get_stats``
+    — read the same TEXT column and need the same decode-and-normalise
+    preamble before :func:`is_phantom_verdict_row` can see it.  It lives here
+    with the predicate rather than being copy-pasted into each, for exactly the
+    reason the predicate itself was hoisted: one rule, one home.
+
+    Returns ``[]`` (never raises, never ``None``) for a NULL column, a column
+    that is not valid JSON, and JSON that decodes to something other than a
+    list — every shape that is not positively a findings list degrades to "no
+    findings", which :func:`is_phantom_verdict_row` then classifies as genuine.
+
+    The except is deliberately NARROW (``json.JSONDecodeError``/``TypeError``,
+    the two things a bad column can actually raise) rather than a broad
+    ``except Exception``: a genuinely unexpected error must still surface.  See
+    ``shared/tests/silent_fallthrough_scan.py``.
+    """
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return parsed
+
+
+def is_phantom_verdict_json(severity: str, findings_json: str | bytes | None) -> bool:
+    """:func:`is_phantom_verdict_row` over a raw SQLite ``findings`` column.
+
+    The one call both DB read paths make, so the decode, the list-shape
+    normalisation, the non-mapping-element tolerance and the predicate itself
+    all have a single implementation rather than one copy per consumer.
+    """
+    return is_phantom_verdict_row(severity, coerce_findings(findings_json))

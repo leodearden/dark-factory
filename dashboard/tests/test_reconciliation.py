@@ -769,16 +769,25 @@ class TestGetLatestVerdictPhantom:
             ("'not json'", 'malformed'),
             ('NULL', 'null'),
             ("'{\"not\": \"a list\"}'", 'json-object-not-list'),
+            # A well-formed JSON LIST whose elements are not objects.  The
+            # decode succeeds, so the narrow json/TypeError guard never fires
+            # and the predicate itself is what has to tolerate the shape — an
+            # unguarded `.get()` would raise AttributeError here, and with_db
+            # catches only sqlite3.OperationalError/OSError, so it would escape
+            # and 500 the whole /api/v2/dashboard/recon poll payload.
+            ("'[\"a string\"]'", 'json-list-of-strings'),
+            ("'[null]'", 'json-list-of-nulls'),
         ],
     )
     async def test_unparseable_findings_column_is_not_phantom_and_does_not_raise(
         self, tmp_path, findings_value, case_id
     ):
-        """(d) A malformed/NULL findings column degrades to False, never raises.
+        """(d) A malformed/NULL/degenerate findings column → False, never raises.
 
-        Uses the file's narrow ``(json.JSONDecodeError, TypeError)`` idiom
-        rather than a broad except, so a genuinely unexpected error still
-        surfaces instead of being swallowed.
+        Decode and classification both live in
+        ``shared.phantom_verdict.is_phantom_verdict_json``, whose except is
+        narrow (``json.JSONDecodeError``/``TypeError``) rather than broad, so a
+        genuinely unexpected error still surfaces instead of being swallowed.
         """
         from _dashboard_helpers import make_recon_db
 
