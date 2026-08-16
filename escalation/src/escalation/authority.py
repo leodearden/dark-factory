@@ -142,12 +142,36 @@ class _L2CloseClass:
 #       (paused / ActiveState / MainPID / ActiveEnterTimestamp) — NOT an
 #       arbitrary "word=word" token, so incidental '='s in prose (e.g.
 #       'note=ok') can't satisfy the evidence requirement.
-#   (c) stale_task_scoped — mirrors harness._revalidate_open_l2: category-agnostic,
-#       requires a live get_task status citation showing the subject task went
-#       terminal / re-scoped / re-dispatched. The terminal-status alternative
-#       is anchored on a 'status=' / 'status:' citation shape, not a
-#       free-standing "is done" English phrase, so casual prose ("the work is
-#       done") can't satisfy it.
+#   (c) stale_task_scoped — category-agnostic, requires a live get_task
+#       citation showing the subject task went terminal / was re-scoped / was
+#       re-dispatched. All THREE alternatives are citation-anchored (task 4192):
+#       the terminal-status one on a 'status=' / 'status:' shape rather than a
+#       free-standing "is done" English phrase, and the two moved-on ones on an
+#       explicit preposition ('to'/'into'/'as' for re-scoped, 'as' only for
+#       re-dispatched) plus a concrete task/run identifier. So neither "the work
+#       is done" nor "was rescoped last week" nor "re-dispatched it this
+#       morning" can satisfy it — the identity that writes this text is the
+#       LLM-driven watcher rotation, whose free-form close prose is exactly
+#       where such phrasing appears incidentally.
+#
+#       This class shares its INTENT with harness._revalidate_open_l2 — a
+#       subject that has gone terminal or moved on moots the escalation — but
+#       is NOT a mirror of it, in three ways (verified against harness.py
+#       _revalidate_open_l2 at main 6ee3eaec25):
+#         - Independent mechanism, no shared code: the harness sweep closes
+#           IN-PROCESS via self._escalation_queue.resolve(...) under the
+#           'harness-escalation-revalidation-sweep' role. It never issues an
+#           HTTP resolve_issue, so it never reaches l2_auto_close_class at all.
+#         - Strictly wider on CATEGORY: since task 2724 landed, the harness
+#           sweep is ALLOWLIST-gated on config.escalation_revalidation_allowlist
+#           (default {task_failure, stranded_blocked}); class (c) is
+#           category-AGNOSTIC modulo L2_AUTO_CLOSE_DENY_CATEGORIES.
+#         - Strictly wider on EVIDENCE: the harness closes only on a live batch
+#           get_statuses read showing the subject 'done'/'cancelled'; class (c)
+#           also accepts a cited re-scoped / re-dispatched citation, which the
+#           harness never checks.
+#       Class (c) is therefore the WIDEST auto-close door in this allowlist —
+#       weigh any further loosening of it against that.
 L2_AUTO_CLOSE_ALLOWLIST: tuple[_L2CloseClass, ...] = (
     _L2CloseClass(
         name='superseded_main_sweep',
@@ -166,6 +190,15 @@ L2_AUTO_CLOSE_ALLOWLIST: tuple[_L2CloseClass, ...] = (
             (r'\b(?:paused|ActiveState|MainPID|ActiveEnterTimestamp)\b\s*[=:>]\s*\S+',),
         ),
     ),
+    # FOLLOW-UP (open, deliberate — not an oversight): this class gates
+    # categories with a DENYLIST (L2_AUTO_CLOSE_DENY_CATEGORIES) while the
+    # harness revalidation sweep now gates with an ALLOWLIST
+    # (config.escalation_revalidation_allowlist, default
+    # {task_failure, stranded_blocked}). Task 2724 has landed on main, so that
+    # divergence is a fact today, not a future one. Aligning the two models is
+    # a behaviour change with its own blast radius — it would narrow which L2s
+    # the watcher can auto-close at all — and was scoped OUT of task 4192 by
+    # the 2026-08-12 operator ruling; it wants its own task and review.
     _L2CloseClass(
         name='stale_task_scoped',
         categories=None,
