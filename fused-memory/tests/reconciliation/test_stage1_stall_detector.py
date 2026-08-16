@@ -750,6 +750,15 @@ class TestMaybeEscalateStalledGateBacklog:
         q.has_open_l1.return_value = has_open_l1_return
         q.make_id.return_value = 'esc-645-001'
         q.submit.return_value = 'esc-645-001'
+        # REQUIRED once the path routes through submit_or_dedupe: find_dedupe_parent
+        # iterates queue.get_pending(), and `for parent in <bare MagicMock>` raises
+        # TypeError, which the caller's broad `except Exception` swallows into a
+        # WARNING — silently flipping every shape test below to result == [] with no
+        # visible error.
+        q.get_pending.return_value = []
+        # Pins observed_submit_response to its documented fail-open 'queued' branch
+        # instead of leaning on MagicMock attribute truthiness.
+        q.get.return_value = None
         return q
 
     @pytest.mark.asyncio
@@ -940,50 +949,131 @@ class TestMaybeEscalateStalledGateBacklog:
         assert fps[0] != fps[1], 'distinct gates must not share a fold key'
 
     @pytest.mark.asyncio
-    async def test_skips_when_open_gate_backlog_l1_exists(self):
-        """(b) has_open_l1(tid, category=...) True → no submit; category-scoped dedup."""
-        queue = self._make_queue(has_open_l1_return=True)
-        task_by_id = {'645': _gate_task_record(645)}
+    async def test_has_open_l1_no_longer_consulted(self):
+        """(b0) The categorized has_open_l1 skip is deliberately gone.
+
+        Dedup for this path is now the submit_or_dedupe fold, not a suppression
+        check — so consulting has_open_l1 at all would be a regression toward
+        the old "second cycle vanishes" behaviour.
+        """
+        queue = self._make_queue(has_open_l1_return=False)
 
         result = await maybe_escalate_stalled_gate_backlog(
             escalation_queue=queue,
-            project_id='p',
-            run_id='r',
+            project_id='autopilot_video',
+            run_id='run-xyz',
             stalled_task_ids=['645'],
-            task_by_id=task_by_id,
+            task_by_id={'645': _gate_task_record(645, hours_ago=49)},
             now=_GATE_NOW,
         )
 
-        assert result == []
-        queue.submit.assert_not_called()
-        queue.has_open_l1.assert_called_once_with(
-            '645', category='reconciliation_stale_gate_backlog'
-        )
+        assert result == ['645']
+        queue.has_open_l1.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_mixed_already_escalated_and_new(self):
-        """(c) task A already has an open gate-backlog L1, task B new → only B submitted."""
-        queue = MagicMock()
-        queue.has_open_l1.side_effect = lambda tid, *, category=None: tid == 'A'
-        queue.make_id.return_value = 'esc-B-001'
-        queue.submit.return_value = 'esc-B-001'
+    async def test_folds_into_existing_pending_gate_backlog_parent(self, tmp_path):
+        """(b) Repeat cycles over the same stale gate fold into ONE parent record.
+
+        Uses a REAL EscalationQueue: the load-bearing claim is "exactly one
+        pending record on disk, same id, dedupe_count incremented" — on-disk
+        state a MagicMock cannot express (it could only prove a call happened).
+        """
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        task_by_id = {'645': _gate_task_record(645, hours_ago=49)}
+
+        async def _cycle(now, run_id):
+            return await maybe_escalate_stalled_gate_backlog(
+                escalation_queue=queue,
+                project_id='autopilot_video',
+                run_id=run_id,
+                stalled_task_ids=['645'],
+                task_by_id=task_by_id,
+                now=now,
+            )
+
+        # Cycle 1 — gate 49h stale, first filing.
+        assert await _cycle(_GATE_NOW, 'run-1') == ['645']
+        pending = queue.get_pending()
+        assert len(pending) == 1
+        parent_id = pending[0].id
+        first_summary = pending[0].summary
+        first_detail = pending[0].detail
+
+        # Cycle 2 — same gate, now 149h stale. Must fold, not mint a second record.
+        assert await _cycle(_GATE_NOW + timedelta(hours=100), 'run-2') == [], (
+            'a folded cycle files no NEW escalation, so it reports no task_ids'
+        )
+
+        pending = queue.get_pending()
+        assert len(pending) == 1, (
+            f'fold must leave exactly ONE pending record; got {len(pending)}: '
+            f'{[e.id for e in pending]}'
+        )
+        parent = pending[0]
+        assert parent.id == parent_id, 'the fold target must be the SAME record'
+        assert parent.dedupe_count == 1, (
+            'dedupe_count is the recurrence signal a steward triages on; it must '
+            f'advance once per stale cycle. got {parent.dedupe_count}'
+        )
+        assert len(parent.dedupe_children) == 1
+        assert parent.dedupe_children[0] != parent_id, (
+            'the folded child id must be distinct from the parent id'
+        )
+        # No accidental ladder/severity drift: _max_severity is a no-op here
+        # because both records are blocking L1s.
+        assert parent.severity == 'blocking'
+        assert parent.level == 1
+
+        # attach_dedupe_child does NOT rewrite the text. That is SAFE only
+        # because task 3520 made the summary an absolute `since <ISO>` anchor,
+        # which never goes stale — unlike the elapsed-hours phrasing it replaced.
+        assert parent.summary == first_summary
+        assert parent.detail == first_detail
+
+        # Cycle 3 — still stale: the count keeps climbing on the same record.
+        assert await _cycle(_GATE_NOW + timedelta(hours=200), 'run-3') == []
+        assert len(queue.get_pending()) == 1
+        assert queue.get(parent_id).dedupe_count == 2
+
+    @pytest.mark.asyncio
+    async def test_mixed_already_escalated_and_new(self, tmp_path):
+        """(c) Gate A already has a pending record, gate B is new → only B is new."""
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
         task_by_id = {
             'A': _gate_task_record('A', hours_ago=50),
             'B': _gate_task_record('B', hours_ago=50),
         }
 
+        # Pre-file A's parent in an earlier cycle.
+        assert await maybe_escalate_stalled_gate_backlog(
+            escalation_queue=queue,
+            project_id='p',
+            run_id='r0',
+            stalled_task_ids=['A'],
+            task_by_id=task_by_id,
+            now=_GATE_NOW,
+        ) == ['A']
+        a_parent_id = queue.get_pending()[0].id
+
         result = await maybe_escalate_stalled_gate_backlog(
             escalation_queue=queue,
             project_id='p',
-            run_id='r',
+            run_id='r1',
             stalled_task_ids=['A', 'B'],
             task_by_id=task_by_id,
-            now=_GATE_NOW,
+            now=_GATE_NOW + timedelta(hours=1),
         )
 
-        assert result == ['B']
-        queue.submit.assert_called_once()
-        assert queue.submit.call_args[0][0].task_id == 'B'
+        assert result == ['B'], f'only the NEW filing is reported; got {result}'
+        pending = {e.task_id: e for e in queue.get_pending()}
+        assert set(pending) == {'A', 'B'}, f'expected one record per gate; got {pending}'
+        assert pending['A'].id == a_parent_id
+        assert pending['A'].dedupe_count == 1
+        assert pending['B'].dedupe_count == 0
 
     @pytest.mark.asyncio
     async def test_empty_stalled_list_returns_empty(self):
