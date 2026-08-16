@@ -2011,6 +2011,14 @@ class ReconReportState:
            and its citation is recorded, so telling the caller to stop
            counting it as a new filing would be actively wrong.
 
+           When fold 1 ALSO hits on the same call, fold 1 still wins: the
+           finding is purged and ``duplicate_finding`` is returned as
+           before, and NO near-collision WARNING is emitted — the skip
+           never took effect, so claiming both findings were kept would
+           contradict the purge record logged microseconds later. Skipping
+           fold 2 only ever ADDS survivors relative to the old behaviour;
+           it never rescues a finding fold 1 would have collapsed.
+
         BOTH folds emit a WARNING carrying the losing finding's full content
         (:meth:`_log_cite_task_fold_purge`) immediately BEFORE purging it.
         The purge is wholesale and the returned ``duplicate_finding`` error
@@ -2099,6 +2107,19 @@ class ReconReportState:
             )
             if anchor_project_id is not None and anchor_project_id != project_id:
                 entity_project_mismatch = True
+                # task-4185 amend: report the near-collision ONLY on the path
+                # where this finding actually SURVIVES it.  The project-scoped
+                # fold below is checked after this detection and takes
+                # priority when both would hit (see the sequential-branch
+                # comment): it purges this very finding and returns
+                # duplicate_finding, so an unconditional emit here would claim
+                # 'BOTH findings kept' one line before the task-4184 purge
+                # record for the SAME finding_id — a self-contradicting false
+                # positive in the one channel an operator has for this.
+                project_fold_wins = (
+                    project_existing_id is not None
+                    and project_existing_id != finding.finding_id
+                )
                 # This line is the ONLY observable signal that a run actually
                 # contained numerically-colliding cross-project task ids —
                 # which is why it is WARNING and not INFO.  Nothing is
@@ -2109,21 +2130,22 @@ class ReconReportState:
                 # findings elsewhere in this same run, and nothing detects
                 # that after the fact.  An operator who sees this knows to
                 # distrust the run's dedup.  Lazy %-args, never an f-string.
-                logger.warning(
-                    'recon_report: cite_task entity-scoped fold SKIPPED — cross-project '
-                    'near-collision on a PROJECTLESS derived signature; BOTH findings kept, '
-                    'each with its own citation. run_id=%r stage=%r skipped_finding_id=%r '
-                    'attempted_citation=%r surviving_finding_id=%r anchor_citation=%r '
-                    'derived_sig=%r flag_type=%r',
-                    run_id,
-                    finding_entry.stage,
-                    finding.finding_id,
-                    (project_id, task_id),
-                    entity_existing_id,
-                    (anchor_project_id, task_id),
-                    derived_sig,
-                    finding.flag_type,
-                )
+                if not project_fold_wins:
+                    logger.warning(
+                        'recon_report: cite_task entity-scoped fold SKIPPED — cross-project '
+                        'near-collision on a PROJECTLESS derived signature; BOTH findings kept, '
+                        'each with its own citation. run_id=%r stage=%r skipped_finding_id=%r '
+                        'attempted_citation=%r surviving_finding_id=%r anchor_citation=%r '
+                        'derived_sig=%r flag_type=%r',
+                        run_id,
+                        finding_entry.stage,
+                        finding.finding_id,
+                        (project_id, task_id),
+                        entity_existing_id,
+                        (anchor_project_id, task_id),
+                        derived_sig,
+                        finding.flag_type,
+                    )
 
         # Sequential (not project_hit/entity_hit booleans + a re-derived
         # existing_id) so pyright narrows each *_existing_id to `str` from
@@ -2178,6 +2200,19 @@ class ReconReportState:
         # deliberately NOT gated — its key already carries project_id, so
         # this finding legitimately anchors 'other_project:42' for its own
         # project.
+        #
+        # ACCEPTED consequence (task-4185 amend): duplicates WITHIN the
+        # foreign project are then not deduped by the derived sig at all —
+        # a second other_project:42 citation also finds the original
+        # (dark_factory-pinned) anchor, also mismatches, and also survives.
+        # Those fall back to the project-scoped index above when eligible
+        # ('other_project:42' is a real, project-carrying key); when they
+        # are not eligible for fold 1 (e.g. a non-null top-level task_id),
+        # both foreign findings simply survive.  That under-fold is the
+        # price of first-registrant-wins and is preferred to the
+        # alternative — handing the derived-sig anchor to the foreign
+        # finding and under-folding the ORIGINAL project instead.  Pinned
+        # by test_second_foreign_citation_also_survives.
         if entity_fold_eligible and not entity_project_mismatch:
             self._run_sig_index.setdefault(run_id, {})[derived_sig] = finding.finding_id
 
