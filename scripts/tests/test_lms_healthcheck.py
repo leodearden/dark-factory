@@ -2089,6 +2089,7 @@ def test_repeat_records_every_measured_sample():
 
     row = _report(probe=probe, repeat=3).arms[0]
 
+    assert row.repeat_latencies_ms is not None
     assert row.repeat_latencies_ms == [351.0, 352.0, 353.0]
     assert 4249.7 not in row.repeat_latencies_ms
     assert row.first_probe_ms == 4249.7
