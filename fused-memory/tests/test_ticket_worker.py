@@ -70,8 +70,11 @@ async def _poll_ticket_resolved(
 
     NOTE: the `task_created` journal event is emitted *after* the terminal
     write (task_interceptor.py:3812 single path / 4190 batch path), so this
-    is NOT a barrier for journal assertions — pair it with a short second
-    `poll_until` on the emission itself (see the two callers that do).
+    is NOT a barrier for journal assertions — pair it with
+    `_poll_journal_emitted` on the emission itself (see the two callers
+    that do), or — where the caller asserts an *exact* event count — with
+    `poll_until_stable` on the count, as
+    `test_worker_created_path_emits_journal_event` does.
 
     The 10s default is deliberately well inside the 60s pytest-timeout
     (pyproject.toml), whose thread method os._exit(1)s the whole xdist
@@ -85,6 +88,36 @@ async def _poll_ticket_resolved(
     return await poll_until(
         _resolved, timeout=timeout,
         message=f'worker did not resolve {what} ({ticket_id})',
+    )
+
+
+async def _poll_journal_emitted(journal_calls, event_type, *, timeout: float = 2.0):
+    """Bounded wait for an *event_type* event to land in *journal_calls*.
+
+    Pairs with `_poll_ticket_resolved` as a second, short barrier: the
+    `task_created` journal event is emitted *after* the ticket's terminal
+    write (task_interceptor.py:3812 single path / 4190 batch path), with
+    `_persist_worker_terminal`'s awaits in between — so
+    `_poll_ticket_resolved` alone can observe a terminal ticket one
+    event-loop hop before `_journal` actually runs. This closes that
+    narrow window: a genuine regression (the event never emitted) still
+    fails fast, in ~`timeout` seconds rather than the row poll's full 10s
+    budget.
+
+    Filters on `event_type` explicitly, rather than bare truthiness of
+    `journal_calls`, so a differently-typed event journalled earlier on
+    the same path can't turn this into a silent no-op.
+
+    LIVENESS poll, not a settle barrier: it returns at the *first* matching
+    event, so it does not by itself close the window on a duplicate arriving
+    later. `test_worker_created_path_emits_journal_event` uses
+    `poll_until_stable` on the count instead for exactly that reason (task
+    3697); the two callers here retain the liveness form.
+    """
+    return await poll_until(
+        lambda: [e for e in journal_calls if getattr(e, 'type', None) == event_type],
+        timeout=timeout,
+        message='ticket resolved but no journal event was emitted',
     )
 
 # ---------------------------------------------------------------------------
@@ -141,12 +174,17 @@ async def interceptor_with_store(taskmaster, event_buffer, ticket_store):
 class TestPollTicketResolvedHelper:
     """Pins the new ``_poll_ticket_resolved`` module-level helper (task 3901).
 
-    Both tests are fully deterministic — no timing dependence in either
-    direction. Generic ``poll_until`` machinery (truthy-return, timeout
-    raise, awaitable-predicate handling) is already covered by
-    ``TestPollUntil`` in test_fm_helpers.py:787+ (task 2377); these two
-    tests pin only what is new here: the ticket-row predicate and the
-    descriptive failure message.
+    The first and third tests are fully deterministic — no timing
+    dependence in either direction. The middle test resolves the ticket
+    from a background task after a short delay to pin the re-read-each-
+    iteration contract; its only timing dependence is that the delay must
+    stay well inside the helper's 10s poll budget, so it cannot flake
+    toward failure under load. Generic ``poll_until`` machinery
+    (truthy-return, timeout raise, awaitable-predicate handling) is
+    already covered by ``TestPollUntil`` in test_fm_helpers.py:787+ (task
+    2377); these tests pin only what is new here: the ticket-row
+    predicate, its re-evaluation over time, and the descriptive failure
+    message.
     """
 
     @pytest.mark.asyncio
@@ -158,6 +196,34 @@ class TestPollTicketResolvedHelper:
 
         assert row['status'] == 'created', (
             f'Expected the terminal row to be returned verbatim, got: {row}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_polls_again_after_pending_then_returns_once_resolved(
+        self, ticket_store,
+    ):
+        """Pins the re-read-each-iteration contract: a row that is pending
+        on the first poll and only becomes terminal later must still be
+        picked up.
+
+        The other two tests in this class only exercise the two degenerate
+        paths — already-terminal (short-circuits before any sleep) and
+        never-terminal (times out) — neither of which would catch a
+        regression that hoisted the ``ticket_store.get`` out of the
+        ``_resolved`` closure and re-checked a stale first snapshot forever.
+        """
+        tid = await ticket_store.submit('p', '{}')
+
+        async def _resolve_later() -> None:
+            await asyncio.sleep(0.1)
+            await ticket_store.mark_resolved(tid, status='created', task_id='42')
+
+        asyncio.create_task(_resolve_later(), name='test-resolve-later')
+
+        row = await _poll_ticket_resolved(ticket_store, tid)
+
+        assert row['status'] == 'created', (
+            f'Expected the row to reflect the later resolution, got: {row}'
         )
 
     @pytest.mark.asyncio
@@ -213,14 +279,12 @@ async def test_worker_processes_create_decision(
         ticket_id = result['ticket']
 
         # Let the worker drain the queue
-        await _poll_ticket_resolved(ticket_store, ticket_id)
+        row = await _poll_ticket_resolved(ticket_store, ticket_id)
 
     # Assert: tm.add_task was called once
     taskmaster.add_task.assert_called_once()
 
     # Assert: ticket row is now terminal
-    row = await ticket_store.get(ticket_id)
-    assert row is not None, 'Ticket row should still exist'
     assert row['status'] == 'created', (
         f'Expected status=created, got: {row["status"]}'
     )
@@ -272,14 +336,12 @@ async def test_worker_processes_drop_decision(
         ticket_id = result['ticket']
 
         # Let the worker drain
-        await _poll_ticket_resolved(ticket_store, ticket_id)
+        row = await _poll_ticket_resolved(ticket_store, ticket_id)
 
     # tm.add_task must NOT have been called
     taskmaster.add_task.assert_not_called()
 
     # Ticket must be terminal with status='combined'
-    row = await ticket_store.get(ticket_id)
-    assert row is not None
     assert row['status'] == 'combined', f'Expected combined, got {row["status"]}'
     assert row['task_id'] == '5', f'Expected task_id=5, got {row["task_id"]}'
     assert row['resolved_at'] is not None
@@ -363,7 +425,7 @@ async def test_worker_processes_combine_decision(
         ticket_id = result['ticket']
 
         # Let the worker drain
-        await _poll_ticket_resolved(ticket_store, ticket_id)
+        row = await _poll_ticket_resolved(ticket_store, ticket_id)
 
     # _execute_combine was called (confirms write_lock path was taken)
     assert len(execute_combine_calls) == 1, (
@@ -374,8 +436,6 @@ async def test_worker_processes_combine_decision(
     taskmaster.add_task.assert_not_called()
 
     # Ticket must be terminal with status='combined'
-    row = await ticket_store.get(ticket_id)
-    assert row is not None
     assert row['status'] == 'combined', f'Expected combined, got {row["status"]}'
     assert row['task_id'] == '5', f'Expected task_id=5, got {row["task_id"]}'
     assert row['resolved_at'] is not None
@@ -437,7 +497,7 @@ async def test_worker_r4_escalation_idempotency_returns_existing_task(
         ticket_id = result['ticket']
 
         # Let the worker drain
-        await _poll_ticket_resolved(ticket_store, ticket_id)
+        row = await _poll_ticket_resolved(ticket_store, ticket_id)
 
     # curator.curate must NOT have been called (short-circuit)
     mock_curator.curate.assert_not_called()
@@ -446,8 +506,6 @@ async def test_worker_r4_escalation_idempotency_returns_existing_task(
     taskmaster.add_task.assert_not_called()
 
     # Ticket must be terminal with status='combined'
-    row = await ticket_store.get(ticket_id)
-    assert row is not None
     assert row['status'] == 'combined', f'Expected combined, got {row["status"]}'
     assert row['task_id'] == '99', f'Expected task_id=99, got {row["task_id"]}'
     assert row['resolved_at'] is not None
@@ -498,14 +556,12 @@ async def test_worker_curator_failure_degrades_to_create(
         ticket_id = result['ticket']
 
         # Let the worker drain
-        await _poll_ticket_resolved(ticket_store, ticket_id)
+        row = await _poll_ticket_resolved(ticket_store, ticket_id)
 
     # tm.add_task MUST have been called (fallback to create)
     taskmaster.add_task.assert_called_once()
 
     # Ticket must be terminal with status='created'
-    row = await ticket_store.get(ticket_id)
-    assert row is not None
     assert row['status'] == 'created', f'Expected created, got {row["status"]}'
     assert row['task_id'] == '42', f'Expected task_id=42, got {row["task_id"]}'
     assert row['resolved_at'] is not None
@@ -571,11 +627,9 @@ async def test_worker_tm_add_task_failure_marks_ticket_failed(
         # by `status == 'created'` (task_interceptor.py:3806 / 4184), so no
         # event is ever built for a 'failed' ticket. There is no window in
         # which the event exists but has not yet been journalled.
-        await _poll_ticket_resolved(ticket_store, ticket_id, what='the failing ticket')
+        row = await _poll_ticket_resolved(ticket_store, ticket_id, what='the failing ticket')
 
     # Ticket must be terminal with status='failed'
-    row = await ticket_store.get(ticket_id)
-    assert row is not None
     assert row['status'] == 'failed', f'Expected failed, got {row["status"]}'
     assert 'db locked' in (row['reason'] or ''), (
         f'reason should mention the error: {row["reason"]!r}'
@@ -1059,24 +1113,15 @@ async def test_worker_post_create_failure_still_resolves_as_created(
         assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
         ticket_id = result['ticket']
 
-        await _poll_ticket_resolved(ticket_store, ticket_id)
-        # The ticket is terminalised *before* the worker journals the
-        # task_created event, so close that narrow window with a short
-        # second bounded poll on the emission itself — a genuine
-        # regression (event never emitted) still fails fast, in ~2s
-        # rather than the full 10s.
-        await poll_until(
-            lambda: journal_calls,
-            timeout=2.0,
-            message='ticket resolved but no journal event was emitted',
-        )
+        # See _poll_journal_emitted's docstring for why this second, short
+        # poll is needed in addition to the row-terminality poll.
+        row = await _poll_ticket_resolved(ticket_store, ticket_id)
+        await _poll_journal_emitted(journal_calls, EventType.task_created)
 
     # (1) tm.add_task was called exactly once
     taskmaster.add_task.assert_called_once()
 
     # (2) Ticket row ends with status='created' (NOT 'failed')
-    row = await ticket_store.get(ticket_id)
-    assert row is not None
     assert row['status'] == 'created', (
         f'Expected status=created after note_created failure, got {row["status"]!r}'
     )
@@ -1147,24 +1192,15 @@ async def test_worker_record_task_failure_still_resolves_as_created(
         assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
         ticket_id = result['ticket']
 
-        await _poll_ticket_resolved(ticket_store, ticket_id)
-        # The ticket is terminalised *before* the worker journals the
-        # task_created event, so close that narrow window with a short
-        # second bounded poll on the emission itself — a genuine
-        # regression (event never emitted) still fails fast, in ~2s
-        # rather than the full 10s.
-        await poll_until(
-            lambda: journal_calls,
-            timeout=2.0,
-            message='ticket resolved but no journal event was emitted',
-        )
+        # See _poll_journal_emitted's docstring for why this second, short
+        # poll is needed in addition to the row-terminality poll.
+        row = await _poll_ticket_resolved(ticket_store, ticket_id)
+        await _poll_journal_emitted(journal_calls, EventType.task_created)
 
     # (1) tm.add_task was called exactly once
     taskmaster.add_task.assert_called_once()
 
     # (2) Ticket row ends with status='created' (NOT 'failed')
-    row = await ticket_store.get(ticket_id)
-    assert row is not None
     assert row['status'] == 'created', (
         f'Expected status=created after record_task failure, got {row["status"]!r}'
     )
@@ -1217,11 +1253,13 @@ async def test_per_project_ticket_queues_do_not_serialise(
     """
     # Asyncio event to block project-a's curator
     unblock_a: asyncio.Event = asyncio.Event()
+    curate_a_entered = asyncio.Event()
 
     async def curate_side_effect(candidate, project_id, *args, **kwargs):
         # resolve_project_id converts hyphens to underscores:
         # '/project-a' -> 'project_a', '/project-b' -> 'project_b'
         if project_id == 'project_a':
+            curate_a_entered.set()
             await unblock_a.wait()
         return CuratorDecision(action='create')
 
@@ -1247,8 +1285,13 @@ async def test_per_project_ticket_queues_do_not_serialise(
             assert submit_a.get('ticket', '').startswith('tkt_'), f'Got: {submit_a}'
             ticket_a = submit_a['ticket']
 
-            # Let the event loop run so the worker starts and picks up the ticket
-            await asyncio.sleep(0.05)  # Intentional (task 3901 sweep): a scheduling yield so worker-a is inside the blocking curate() before project-b is submitted — not a wait-for-completion. The test's own asyncio.wait_for bounds still apply.
+            # Wait for worker-a to actually be inside the blocking curate()
+            # call before submitting project-b. This is an exact barrier
+            # rather than a scheduling-yield sleep: under xdist CPU
+            # oversubscription a fixed sleep's window could close before
+            # worker-a is even scheduled, silently degrading this test to
+            # asserting a weaker, already-true premise (task 3901 sweep).
+            await asyncio.wait_for(curate_a_entered.wait(), timeout=5.0)
 
             # (2) Submit project-b — must get an independent worker
             submit_b = await ti.submit_task(project_root=project_root_b, title='Task B')
@@ -2199,7 +2242,7 @@ class TestCuratorWorkerBatchDrain:
             interceptor_with_store._start_worker_if_needed(project_id)
 
             # Give the worker time to process (well under 0.5s is enough).
-            await _poll_ticket_resolved(ticket_store, t1)
+            row = await _poll_ticket_resolved(ticket_store, t1)
 
         # Worker should have called the prepared variant exactly once.
         assert len(call_args_log) == 1, (
@@ -2211,8 +2254,6 @@ class TestCuratorWorkerBatchDrain:
         )
 
         # Ticket should have resolved.
-        row = await ticket_store.get(t1)
-        assert row is not None
         assert row['status'] == 'created', f'Expected created, got {row["status"]}'
 
     @pytest.mark.asyncio
@@ -2662,7 +2703,7 @@ class TestCuratorWorkerTokenBudgetAccumulator:
                 # ticket resolved to 'failed' leaves the poll immediately
                 # and trips the status assertion below with the real
                 # status, instead of burning the whole timeout first.
-                await _poll_ticket_resolved(
+                row = await _poll_ticket_resolved(
                     ticket_store, t1, what='the oversize ticket',
                 )
         finally:
@@ -2673,8 +2714,6 @@ class TestCuratorWorkerTokenBudgetAccumulator:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await t
 
-        row = await ticket_store.get(t1)
-        assert row is not None
         assert row['status'] == 'created', (
             f'Whale ticket must still resolve even though it busts the '
             f'soft threshold; got status={row["status"]!r}'
