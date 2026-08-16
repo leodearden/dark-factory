@@ -272,3 +272,164 @@ class TestRedispatchDrainDoesNotEndFillPass:
         )
 
         await _teardown_fill_drive(drive, task, worker)
+
+    async def test_late_arrival_dispatched_to_free_host_while_head_verify_runs(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ) -> None:
+        """A late-arriving item -- one that lands in ``_verifier_queue`` a
+        moment AFTER the DISPATCH-FILL guard has already evaluated -- must
+        still be dispatched to a free host while the head's verify is still
+        running, not left to wait out the entire head verify.
+
+        Same shape as
+        ``test_second_host_dispatched_from_verifier_queue_in_same_fill_pass``
+        except ``_verifier_queue`` starts EMPTY: item_b is registered but not
+        yet queued when the loop starts, and only arrives after item_a has
+        already been dispatched and the guard has already run.
+
+        RED against the step-2 re-predicated guard: ``self._verifier_queue.empty()``
+        is genuinely True at the instant the guard evaluates (item_b has not
+        arrived yet), so the fill pass still ends there and the loop blocks
+        in FINALIZE-HEAD awaiting item_a's gated verify -- item_b is never
+        picked up even though it arrives moments later with a host still
+        free. Fails identically against the ORIGINAL (pre-step-2) predicate
+        too: this is the test proving re-predication is strictly weaker than
+        deleting the clause (step-4).
+
+        GREEN only after step-4: with the clause deleted, dispatching item_a
+        falls through to the QueueEmpty multi-host fill-ahead race
+        (``asyncio.wait`` over the persistent getter + running verify
+        tasks), which picks up item_b the moment it is put() and dispatches
+        it to the free second host.
+        """
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        allocator = _inject_two_host_allocator(worker, _make_fake_remote('laptop'))
+        assert allocator.free_host_count() == 2, 'precondition: two free hosts'
+
+        drive = _drive_fill(worker, allocator)
+
+        item_a = _make_real_item(git_ops, config, 'rd-late-a', 'aaa')
+        item_b = _make_real_item(git_ops, config, 'rd-late-b', 'bbb')
+
+        worker._register_item(item_a, initial=ItemLifecycleState.REDISPATCH_PARKED)
+        worker._register_item(item_b, initial=ItemLifecycleState.AWAITING_VERIFY)
+
+        worker._redispatch.append(item_a)
+        # _verifier_queue starts EMPTY -- item_b arrives only after the
+        # guard has already run (see below), not before the loop starts.
+
+        task = asyncio.ensure_future(worker._verifier_loop())
+        worker._verifier_task = task
+
+        try:
+            await asyncio.wait_for(drive.first_dispatched.wait(), timeout=MERGE_RESULT_TIMEOUT)
+
+            # The guard has now evaluated (deterministically -- the loop
+            # yields to the event loop for the first time only after the
+            # tail guard's break/continue decision has already been made).
+            # item_b arrives NOW, a moment later, with item_a's verify still
+            # gated (running) and a host slot still free.
+            await worker._verifier_queue.put(item_b)
+
+            await asyncio.wait_for(drive.second_dispatched.wait(), timeout=MERGE_RESULT_TIMEOUT)
+        except TimeoutError:
+            await _teardown_fill_drive(drive, task, worker)
+            pytest.fail(
+                'item_b was never dispatched within '
+                f'{MERGE_RESULT_TIMEOUT}s of arriving in _verifier_queue '
+                "while item_a's verify was still running and a host was "
+                'free. RED (against the step-2 re-predicated guard): '
+                '_verifier_queue.empty() is True at the instant the guard '
+                'evaluates (item_b has not arrived yet), so the fill pass '
+                'ends there and the loop blocks in FINALIZE-HEAD awaiting '
+                "item_a's gated verify -- item_b arriving moments later "
+                'changes nothing because the loop already committed to '
+                'FINALIZE-HEAD. This proves re-predicating the guard '
+                '(step-2) is strictly weaker than deleting it (step-4): a '
+                'narrower empty-queue snapshot still forfeits real, '
+                'imminent work. GREEN only after step-4 deletes the clause '
+                'so a free host always falls through to the QueueEmpty '
+                'fill-ahead race instead of a special-cased early exit.'
+            )
+
+        assert drive.dispatched == [item_a, item_b], (
+            f'expected [item_a, item_b] dispatched in order, got {drive.dispatched!r}'
+        )
+        assert allocator.free_host_count() == 0, (
+            'expected both host slots held simultaneously; '
+            f'free_host_count() == {allocator.free_host_count()}'
+        )
+
+        await _teardown_fill_drive(drive, task, worker)
+
+
+# ---------------------------------------------------------------------------
+# step-3(b): anti-deadlock invariant fence (NOT a RED/GREEN pair)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCascadeAntiDeadlockPreserved:
+    """Fences the anti-deadlock property the original DISPATCH-FILL guard's
+    comment claimed to provide -- task 3276.
+
+    NOT a RED/GREEN pair: this test is GREEN before step-2, GREEN after
+    step-2, and must STAY green after step-4 deletes the guard's second
+    clause entirely. Its job is to prove the deletion does not silently
+    reintroduce the "blocking on _verifier_queue.get() ... would deadlock
+    when the queue is empty after a cascade" hazard the original comment
+    named -- see step-4's rewritten comment on merge_queue.py for the traced
+    fall-through argument this test backs up empirically.
+    """
+
+    async def test_empty_queue_after_redispatch_drain_still_finalizes_head(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ) -> None:
+        """_redispatch drains to empty, _verifier_queue stays empty for the
+        whole test (no cascade follow-on work ever arrives), two hosts free.
+
+        FINALIZE-HEAD must still be reached and the merge() caller's result
+        Future must still be delivered once item_a's verify completes on its
+        own -- i.e. the loop must not hang forever waiting for a
+        _verifier_queue arrival that never comes.
+        """
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        allocator = _inject_two_host_allocator(worker, _make_fake_remote('laptop'))
+        assert allocator.free_host_count() == 2, 'precondition: two free hosts'
+
+        drive = _drive_fill(worker, allocator)
+
+        item_a = _make_real_item(git_ops, config, 'rd-fence-a', 'aaa')
+        worker._register_item(item_a, initial=ItemLifecycleState.REDISPATCH_PARKED)
+        worker._redispatch.append(item_a)
+        # _verifier_queue stays EMPTY for the whole test -- no follow-on
+        # work ever arrives; this is the exact cascade-drain shape the
+        # original guard's comment described.
+
+        task = asyncio.ensure_future(worker._verifier_loop())
+        worker._verifier_task = task
+
+        try:
+            await asyncio.wait_for(drive.first_dispatched.wait(), timeout=MERGE_RESULT_TIMEOUT)
+            drive.gate.set()  # item_a's verify completes on its own now.
+
+            outcome = await asyncio.wait_for(
+                item_a.request.result, timeout=MERGE_RESULT_TIMEOUT
+            )
+        except TimeoutError:
+            await _teardown_fill_drive(drive, task, worker)
+            pytest.fail(
+                "item_a's result Future was never resolved within "
+                f'{MERGE_RESULT_TIMEOUT}s of its gated verify completing, '
+                'with _verifier_queue empty the whole time. FINALIZE-HEAD '
+                'was never reached -- the anti-deadlock property the '
+                'original guard was written to provide has been lost.'
+            )
+
+        assert outcome.status == 'done', f'expected a done outcome, got {outcome!r}'
+
+        await _teardown_fill_drive(drive, task, worker)
