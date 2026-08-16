@@ -1004,12 +1004,16 @@ def _run_main(
     saved_argv, saved_is_bound = sys.argv, fep.is_bound
     try:
         sys.argv = ["find_escalation_port.py", *argv]
-        fep.is_bound = lambda port: port in bound
+        # ruff (B010) rejects setattr with a constant name and pyright rejects
+        # assigning to a ModuleType attribute, so the two gates disagree; the targeted
+        # pyright ignore is this repo's established resolution (see the `import pytest`
+        # line above). Neither gate is weakened and no exclude is added.
+        fep.is_bound = lambda port: port in bound  # pyright: ignore[reportAttributeAccessIssue]
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = fep.main()
     finally:
         sys.argv = saved_argv
-        fep.is_bound = saved_is_bound
+        fep.is_bound = saved_is_bound  # pyright: ignore[reportAttributeAccessIssue]
     return rc, out.getvalue(), err.getvalue()
 
 
