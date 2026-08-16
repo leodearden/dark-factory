@@ -18,6 +18,18 @@ Allowlist-free, following ``test_raw_semaphore_access_guard.py``: the
 requirement is ZERO sites, not a frozen residual, so any hit at all is a
 violation.
 
+SCOPE -- what "in the repo" means here, stated precisely because this guard is
+unusual among its siblings in claiming a REPO-WIDE rather than package-local
+invariant. The sweep covers every git-tracked ``.py`` file, unioned with every
+``.py`` under the package/script roots (so untracked work-in-progress inside a
+known package is covered too), and ``test_sweep_covers_every_tracked_python_file``
+holds that claim honest. Deliberately OUT of scope: sibling checkout trees under
+``.eval-worktrees/``, ``.claude/worktrees/`` and ``.worktrees/``. Those hold
+*other revisions of this same repo*, many predating the fix -- ~30 files under
+them still carry the literal unsafe idiom -- so sweeping them would make this
+guard permanently red in the main checkout over code that is not this tree's.
+Both file sources exclude them structurally rather than by allowlist.
+
 The detector matches the COMPOSITION — a ``getpgid`` call nested inside a
 ``killpg`` call's arguments — rather than any ``os.getpgid`` call. That is
 deliberate: ``git_ops.py``'s ``pgid = os.getpgid(pid)`` renders a "kernel FLOCK
@@ -44,9 +56,15 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 _SKIP_PARTS = {'.worktrees', '.venv', 'node_modules', '__pycache__'}
 
-# Minimum number of .py files the sweep must actually scan. Measured at 1567 in
-# this repo, so the floor sits ~7.8x below reality: low enough not to become
+# Minimum number of .py files the sweep must actually scan. Measured at 1593
+# unique files, so the floor sits ~8x below reality: low enough not to become
 # brittle as packages move, high enough that a filter regression trips it.
+#
+# This is the crude COLLAPSE detector only -- a raw-count floor cannot see a
+# partial hole (1516 of 1593 files once sailed past it with an entire tree
+# unguarded). `test_sweep_covers_every_tracked_python_file` owns real
+# completeness; this stays because it needs no git and still trips on a total
+# collapse, e.g. the absolute-vs-relative `.worktrees` filter bug.
 _MIN_SCANNED_FILES = 200
 
 
@@ -183,8 +201,12 @@ def _git_tracked_python() -> list[Path]:
     return [REPO_ROOT / p for p in out.split('\0') if p]
 
 
-def _python_files() -> list[Path]:
+def _root_glob_python() -> list[Path]:
     """Every .py file under the repo's package/script roots.
+
+    The second source of the sweep, and the one that covers a brand-new .py an
+    implementer has written but not yet ``git add``ed -- work git cannot see
+    yet, but that lives inside a known package root.
 
     The skip decision is made on the path RELATIVE to REPO_ROOT, never on the
     absolute path. Every orchestrator-dispatched task runs in a worktree rooted
@@ -212,6 +234,41 @@ def _python_files() -> list[Path]:
                 continue
             files.append(path)
     return files
+
+
+def _python_files() -> list[Path]:
+    """The sweep's file set: git-tracked UNION package roots, deduped.
+
+    Both sources are load-bearing, and neither alone is sufficient:
+
+    * git-tracked alone would miss a brand-new .py written but not yet
+      ``git add``ed. The roots keep covering in-progress work.
+    * the roots alone are what produced this guard's coverage hole, and they
+      are unmaintainable: the obvious widening (``REPO_ROOT/'tests'`` plus a
+      ``*/scripts`` glob) STILL misses
+      ``skills/factory-init/scripts/find_escalation_port.py``, because
+      ``*/scripts`` matches at depth 2 and that path is depth 3. A
+      hand-maintained root list keeps growing new holes; ``git ls-files`` is
+      complete by construction.
+
+    ``is_file()`` is required, not defensive: ``git ls-files`` lists INDEX
+    entries, so a tracked-but-deleted file would raise FileNotFoundError in the
+    ratchet's ``read_text`` and turn a coverage win into a crash. The ``set``
+    also fixes the roots' mutual overlap (``*/tests`` matches ``scripts/tests``,
+    which ``REPO_ROOT/'scripts'`` rglobs into as well).
+
+    *** Do NOT "simplify" this into a whole-repo rglob from REPO_ROOT. *** The
+    main checkout carries ``.eval-worktrees/`` and ``.claude/worktrees/`` --
+    full copies of THIS repo at older, pre-fix revisions -- and ~30 files under
+    them still contain the literal ``os.killpg(os.getpgid(proc.pid),
+    signal.SIGKILL)``. A whole-repo sweep would go permanently red in the main
+    checkout on code belonging to other revisions. Both sources here are
+    structurally immune: git never lists those trees (untracked/ignored) and
+    the root globs never reach them. Re-verify that immunity before adding any
+    third source.
+    """
+    candidates = [*_git_tracked_python(), *_root_glob_python()]
+    return sorted({p for p in candidates if p.is_file()})
 
 
 def test_sweep_is_not_vacuous() -> None:
@@ -309,7 +366,13 @@ def test_no_killpg_over_getpgid_in_repo() -> None:
     offenders: list[str] = []
 
     for py_file in _python_files():
-        source = py_file.read_text(encoding='utf-8')
+        try:
+            source = py_file.read_text(encoding='utf-8')
+        except (UnicodeDecodeError, OSError):
+            # The sweep now reaches script trees never parsed before. One
+            # undecodable or unreadable file must not take the whole ratchet
+            # down -- same posture as the detector's SyntaxError -> [].
+            continue
         for lineno, description in _killpg_over_getpgid(source):
             offenders.append(
                 f'{py_file.relative_to(REPO_ROOT)}:{lineno}: {description}'
