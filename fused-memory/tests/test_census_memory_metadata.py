@@ -288,6 +288,115 @@ class TestCategoryCensusOccurrenceAxes:
         assert c.canonical_non_bool == 2
 
 
+class TestCategoryCensusCanonicalByTopic:
+    """The topic x canonical CROSS-TAB (task 4006).
+
+    ``topic_values`` and ``canonical_true`` are INDEPENDENT counters, so the
+    three numbers the coverage ask needs -- topics with exactly one canonical,
+    with zero, with more than one -- cannot be derived from either.  This
+    accumulator joins them at fold time, keyed by topic, mirroring 3198's
+    write-time probe ``count_memories_by_metadata(project_id,
+    {'topic': T, 'canonical': True})`` (memory_service.py:594).
+    """
+
+    def test_canonical_true_keyed_by_its_topic(self):
+        c = _mod.CategoryCensus()
+        c.add({'topic': 'merge-lane', 'canonical': True})
+        c.add({'topic': 'merge-lane', 'canonical': True})
+        c.add({'topic': 'census', 'canonical': True})
+        assert c.canonical_true_by_topic['merge-lane'] == 2
+        assert c.canonical_true_by_topic['census'] == 1
+
+    def test_topic_without_canonical_true_is_not_in_the_cross_tab(self):
+        c = _mod.CategoryCensus()
+        c.add({'topic': 'merge-lane'})
+        c.add({'topic': 'merge-lane', 'canonical': False})
+        assert c.topic_values['merge-lane'] == 2
+        assert c.canonical_true_by_topic['merge-lane'] == 0
+        assert 'merge-lane' not in c.canonical_true_by_topic
+
+    def test_canonical_true_without_a_topic_is_named_not_dropped(self):
+        # Reachable today: the ``canonical_without_topic`` shape rule is
+        # warn-mode under the shipped ``memory_metadata.enforce=false``, so
+        # such records CAN land.  Counting them in a distinct scalar means
+        # canonical_true == sum(by_topic) + without_topic holds exactly, and
+        # no canonical vanishes silently in the join.
+        c = _mod.CategoryCensus()
+        c.add({'canonical': True})
+        c.add({'topic': None, 'canonical': True})
+        c.add({'topic': 'census', 'canonical': True})
+        assert c.canonical_true == 3
+        assert c.canonical_true_without_topic == 2
+        assert sum(c.canonical_true_by_topic.values()) == 1
+        assert c.canonical_true == sum(c.canonical_true_by_topic.values()) + \
+            c.canonical_true_without_topic
+
+    def test_non_bool_canonical_lands_in_neither_counter(self):
+        # Measured live: 1 such record in reify.  Matches the existing
+        # canonical_non_bool treatment -- a string 'true' is drift, not a
+        # canonical, and must not be scored as one.
+        c = _mod.CategoryCensus()
+        c.add({'topic': 'census', 'canonical': 'true'})
+        c.add({'topic': 'census', 'canonical': 1})
+        c.add({'canonical': 'true'})
+        assert c.canonical_non_bool == 3
+        assert sum(c.canonical_true_by_topic.values()) == 0
+        assert c.canonical_true_without_topic == 0
+
+    def test_merge_folds_both_the_counter_and_the_scalar(self):
+        a = _mod.CategoryCensus()
+        a.add({'topic': 'merge-lane', 'canonical': True})
+        a.add({'canonical': True})
+
+        b = _mod.CategoryCensus()
+        b.add({'topic': 'merge-lane', 'canonical': True})
+        b.add({'topic': 'census', 'canonical': True})
+        b.add({'canonical': True})
+
+        a.merge(b)
+        assert a.canonical_true_by_topic['merge-lane'] == 2
+        assert a.canonical_true_by_topic['census'] == 1
+        assert a.canonical_true_without_topic == 2
+        assert a.canonical_true == 5
+        # The rollup identity survives the merge.
+        assert a.canonical_true == sum(a.canonical_true_by_topic.values()) + \
+            a.canonical_true_without_topic
+
+    def test_merge_does_not_mutate_the_other_cross_tab(self):
+        a = _mod.CategoryCensus()
+        a.add({'topic': 't', 'canonical': True})
+        b = _mod.CategoryCensus()
+        b.add({'topic': 't', 'canonical': True})
+        b.add({'canonical': True})
+        a.merge(b)
+        assert b.canonical_true_by_topic['t'] == 1
+        assert b.canonical_true_without_topic == 1
+
+    def test_cross_tab_is_emitted_through_census_to_dict(self):
+        c = _mod.CategoryCensus()
+        c.add({'topic': 'merge-lane', 'canonical': True})
+        c.add({'topic': 'merge-lane', 'canonical': True})
+        c.add({'topic': 'census', 'canonical': True})
+        c.add({'canonical': True})
+        rendered = _mod._census_to_dict(c)
+        assert rendered['canonical_true_without_topic'] == 1
+        # Through _table(), so ordering is the deterministic count-desc /
+        # value-asc total order and the JSON table is never capped.
+        table = rendered['canonical_true_by_topic']
+        assert table['distinct_total'] == 2
+        assert [(e['value'], e['count']) for e in table['entries']] == [
+            ('merge-lane', 2),
+            ('census', 1),
+        ]
+
+    def test_add_does_not_mutate_a_canonical_topic_payload(self):
+        payload = {'topic': 'merge-lane', 'canonical': True}
+        before = dict(payload)
+        c = _mod.CategoryCensus()
+        c.add(payload)
+        assert payload == before
+
+
 class TestCategoryCensusSupersedes:
     """supersedes shape / member-shape / list-length census."""
 
