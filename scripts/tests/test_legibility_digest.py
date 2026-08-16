@@ -28,7 +28,7 @@ import digest as mod
 import pytest
 import yaml
 from legibility import inventory as inventory_mod
-from shared.cli_invoke import CAP_HIT_RESUME_PROMPT
+from shared.cli_invoke import CAP_HIT_RESUME_PROMPT, CRASH_RECOVERY_RESUME_PROMPT
 
 
 def _assistant(*blocks):
@@ -1725,11 +1725,26 @@ class TestHarnessInjectedTurnFilter:
 
         assert mod.signal_counts(with_briefing) == mod.signal_counts(base)
 
-    def test_usage_limit_resume_prompt_is_excluded_lockstep(self):
-        # LOCKSTEP: asserted against the canonical constant, not a restated
-        # literal, so a harness rewording of CAP_HIT_RESUME_PROMPT turns
-        # this suite red instead of silently drifting out of coverage.
-        assert mod.is_harness_injected_turn(CAP_HIT_RESUME_PROMPT) is True
+    @pytest.mark.parametrize(
+        'resume_prompt', [CAP_HIT_RESUME_PROMPT, CRASH_RECOVERY_RESUME_PROMPT],
+        ids=['usage_limit', 'crash_recovery'],
+    )
+    def test_resume_prompt_is_excluded_lockstep(self, resume_prompt):
+        # LOCKSTEP: asserted against each canonical constant, not a
+        # restated literal, so a harness rewording of either resume prompt
+        # turns this suite red instead of silently drifting out of
+        # coverage. One parametrize row per resume prompt -- a future
+        # resume prompt is covered by adding one more row.
+        assert mod.is_harness_injected_turn(resume_prompt) is True
+
+    def test_crash_recovery_resume_prompt_excluded_from_iter_user_turns(self):
+        # The sibling of the usage-limit resume prompt: same defect class
+        # (harness-injected continuation boilerplate typed into the
+        # transcript as an ordinary user turn), different cause
+        # (orchestrator restart, not a usage-cap interrupt).
+        records = [_user_text(CRASH_RECOVERY_RESUME_PROMPT)]
+
+        assert mod.iter_user_turns(records) == []
 
     def test_usage_limit_resume_prompt_excluded_from_iter_user_turns(self):
         # Reproduces the sighting verbatim: the resume prompt appears both
