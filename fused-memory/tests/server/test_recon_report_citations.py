@@ -1478,6 +1478,16 @@ class TestCiteTaskFoldPurgeLogging:
         assert 'reroute once unblocked' in message, message
         assert finding_id_1 in message, message  # surviving anchor
 
+        # The pre-attached citation, which the purge destroys along with the
+        # finding and which appears NOWHERE else afterwards — the returned
+        # duplicate_finding error names only the survivor. Without this the
+        # cited_entities/cited_edges/cited_memories/cited_runs half of the log
+        # line could be deleted with the whole suite staying green, even
+        # though those discarded citations are the primary thing the log
+        # exists to make recoverable.
+        assert 'e' * 32 in message, message  # cite_entity's recorded entity_uuid
+        assert 'Widget Service' in message, message  # ...and its canonical name
+
         # Discriminates this fold from the entity-scoped one.
         assert 'project_scoped' in message, message
 
