@@ -658,6 +658,93 @@ class TestStatsPhantomVerdicts:
         assert stats['verdicts'] == {}
         assert stats['phantom_verdicts'] == {}
 
+    # --- the SQL candidate prefilter's two disjuncts, exercised separately ---
+    #
+    # The prefilter is `(jv.severity = 'serious' OR jv.findings LIKE ?)`.  Every
+    # case above seeds its phantoms at severity=serious, so the FIRST disjunct
+    # alone satisfies all of them and the LIKE half is never exercised: if its
+    # pattern were wrong (wildcards dropped, constant mis-spelled, parameters
+    # swapped) every one of those tests would still pass.  The two cases below
+    # are the ones with teeth on it.
+
+    @pytest.mark.asyncio
+    async def test_marked_phantom_below_serious_is_caught_by_the_like_disjunct(
+        self, journal
+    ):
+        """(g) A marker-stamped phantom at a NON-serious severity is still split out.
+
+        `has_unparseable_marker` is documented as deliberately severity-agnostic
+        — the structured marker is ground truth about how the row was produced,
+        so a producer that stamps it at some severity other than `serious` is
+        still writing a phantom.  Reaching such a row requires the `findings
+        LIKE ?` disjunct: `severity = 'serious'` cannot match it.  This is the
+        only case in the class that fails if that pattern is broken.
+        """
+        now = datetime.now(UTC)
+        await self._seed_both_phantoms(journal, now)
+        await self._seed_verdict(
+            journal,
+            severity=VerdictSeverity.moderate,
+            findings=self._marked_phantom_findings(),
+            reviewed_at=now,
+            action=VerdictAction.halt,
+        )
+        await self._seed_ordinary(journal, now)
+
+        stats = await journal.get_stats('test-project', now - timedelta(hours=1))
+
+        assert stats['phantom_verdicts'] == {'serious': 2, 'moderate': 1}
+        # 'moderate' had exactly one row and it was phantom, so — like
+        # 'serious' in case (c) — the key leaves `verdicts` entirely rather
+        # than sitting at zero.  Nothing vanishes unnamed: it is reported
+        # above.
+        assert 'moderate' not in stats['verdicts']
+        assert stats['verdicts'] == {'ok': 1, 'minor': 1}
+
+    @pytest.mark.asyncio
+    async def test_genuine_row_mentioning_the_marker_string_stays_genuine(
+        self, journal
+    ):
+        """(h) The prefilter is a CANDIDATE filter, never the verdict.
+
+        The converse of (g): a real multi-finding serious review whose issue
+        prose merely MENTIONS `unparseable_judge_response` matches the LIKE
+        disjunct and is fetched — then correctly rejected in Python by
+        `is_phantom_verdict_row`, because it carries no `code` marker and has
+        more than one finding.  Widening the prefilter must never widen the
+        classification.
+        """
+        now = datetime.now(UTC)
+        mentions_marker = [
+            {
+                'issue': (
+                    'Nine judge verdicts in the 2026-07 window carry '
+                    'code=unparseable_judge_response and were never reviewed; '
+                    'the resume path needs a cap-storm guard.'
+                ),
+                'severity': 'serious',
+                'recommendation': 'Add a resume guard',
+            },
+            {
+                'issue': 'Entity resolution dropped two candidate merges',
+                'severity': 'serious',
+                'recommendation': 'Re-run resolution',
+            },
+        ]
+        await self._seed_verdict(
+            journal,
+            severity=VerdictSeverity.serious,
+            findings=mentions_marker,
+            reviewed_at=now,
+            action=VerdictAction.rollback,
+        )
+        await self._seed_both_phantoms(journal, now)
+
+        stats = await journal.get_stats('test-project', now - timedelta(hours=1))
+
+        assert stats['verdicts'] == {'serious': 1}
+        assert stats['phantom_verdicts'] == {'serious': 2}
+
 
 @pytest.mark.asyncio
 async def test_get_nonexistent_run(journal):
