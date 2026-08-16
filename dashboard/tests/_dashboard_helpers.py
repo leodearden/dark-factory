@@ -163,6 +163,12 @@ class DualEscalationTree:
     storm_id: str | None
     """Reaches ``storm_escape.escalation``; ``None`` unless built with ``storm=True``."""
 
+    resolved_id: str
+    """Reaches ESCALATIONS ONLY — closed, so ``_index_escalations`` drops it."""
+
+    other_category_id: str
+    """Reaches ESCALATIONS ONLY — not ``eval_regression``, so the join skips it."""
+
 
 def _dual_dump(path: Path, body: Any) -> Path:
     """Write *body* in the producers' canonical artifact serialization.
@@ -334,12 +340,32 @@ def build_dual_escalation_tree(tmp_path: Path, *, storm: bool = False) -> DualEs
     _dual_escalation(esc_dir, 'esc-eval-unfingerprinted', dedupe_fingerprint=None,
                      summary='memory-eval regression with no fingerprint')
 
+    # (4)+(5) NOT reachable from MEMORY_EVALS at all — one closed, one of
+    # another category.  `shape_escalations` ships both (it filters nothing);
+    # `_index_escalations` drops both.  They are what makes the containment
+    # STRICT and therefore observable: without them the two id spaces would be
+    # equal in this fixture and the asymmetry test would have nothing to see.
+    #
+    # NOT gated behind a keyword: they cannot disturb the reach-path
+    # preconditions, because being dropped by that reader is the entire reason
+    # they are here.  Distinct fingerprints rather than a collision with (1),
+    # so their exclusion is unambiguously the status/category filter rather
+    # than the duplicate-fingerprint one.
+    _dual_escalation(esc_dir, 'esc-eval-resolved', status='resolved',
+                     dedupe_fingerprint='eval:e1-retrieval-health|metric:closed-alarm',
+                     summary='memory-eval regression an operator closed')
+    _dual_escalation(esc_dir, 'esc-other-category', category='reconciliation_drift',
+                     dedupe_fingerprint='recon:drift|entity:node-7',
+                     summary='not a memory-eval regression at all')
+
     return DualEscalationTree(
         config=config,
         linked_id='esc-eval-linked',
         unmatched_id='esc-eval-unmatched',
         unfingerprinted_id='esc-eval-unfingerprinted',
         storm_id=storm_id,
+        resolved_id='esc-eval-resolved',
+        other_category_id='esc-other-category',
     )
 
 
