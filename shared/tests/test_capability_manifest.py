@@ -26,8 +26,10 @@ import yaml
 from capability_manifest_corpus import (
     MANIFEST_SUFFIX,
     REPO_ROOT,
+    ScriptCheckRef,
     check_manifest,
     discover_manifests,
+    iter_script_checks,
 )
 from pydantic import BaseModel, ValidationError
 
@@ -667,6 +669,177 @@ tasks: []
         # must not silently absorb it into a reported "problem" string.
         with pytest.raises(FileNotFoundError):
             check_manifest(tmp_path / 'does-not-exist.capability-manifest.yaml')
+
+
+class TestIterScriptChecks:
+    """iter_script_checks(path) — extract one ref per `kind: script` check.
+
+    The extraction layer TestCheckedInScriptCheckTargets' corpus sweep is
+    parametrized over. Follows TestCheckManifest's convention: each case
+    writes one inline sidecar to tmp_path (no committed bad-fixture files)
+    and drives one extraction property.
+    """
+
+    def _write(self, tmp_path, name, body):
+        sidecar = tmp_path / f'{name}{MANIFEST_SUFFIX}'
+        sidecar.write_text(body)
+        return sidecar
+
+    def test_grep_only_sidecar_yields_nothing(self, tmp_path):
+        sidecar = self._write(
+            tmp_path,
+            'grep-only',
+            """\
+prd: plans/example-prd.md
+schema_version: 1
+tasks:
+  - label: "alpha"
+    capabilities:
+      - name: "cap-one"
+        binding: "b"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "foo"
+          expect: present
+""",
+        )
+        assert iter_script_checks(sidecar) == []
+
+    def test_script_check_is_fully_attributed(self, tmp_path):
+        sidecar = self._write(
+            tmp_path,
+            'one-script',
+            """\
+prd: plans/example-prd.md
+schema_version: 1
+tasks:
+  - label: "δ"
+    capabilities:
+      - name: "cap-scripted"
+        binding: "b"
+        verdict: PASS
+        delivered_check:
+          kind: script
+          script: scripts/gc_agent_transcripts.py
+          args:
+            - --check
+          timeout_secs: 60
+""",
+        )
+        refs = iter_script_checks(sidecar)
+        assert refs == [
+            ScriptCheckRef(
+                manifest=sidecar,
+                task_label='δ',
+                capability='cap-scripted',
+                script='scripts/gc_agent_transcripts.py',
+            )
+        ]
+
+    def test_only_script_kind_is_extracted(self, tmp_path):
+        # grep / manual / a capability with NO delivered_check at all must
+        # neither be mistaken for a script check nor raise on the missing
+        # `delivered_check`.
+        sidecar = self._write(
+            tmp_path,
+            'mixed',
+            """\
+prd: plans/example-prd.md
+schema_version: 1
+tasks:
+  - label: "alpha"
+    capabilities:
+      - name: "cap-grep"
+        binding: "b"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "foo"
+          expect: present
+      - name: "cap-script"
+        binding: "b"
+        verdict: PASS
+        delivered_check:
+          kind: script
+          script: scripts/x.py
+          timeout_secs: 30
+      - name: "cap-manual"
+        binding: "b"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "covered by E8"
+      - name: "cap-unchecked"
+        binding: "b"
+        verdict: PASS
+""",
+        )
+        refs = iter_script_checks(sidecar)
+        assert [ref.capability for ref in refs] == ['cap-script']
+        assert refs[0].script == 'scripts/x.py'
+
+    def test_two_scripts_under_two_labels_are_each_attributed(self, tmp_path):
+        sidecar = self._write(
+            tmp_path,
+            'two-labels',
+            """\
+prd: plans/example-prd.md
+schema_version: 1
+tasks:
+  - label: "alpha"
+    capabilities:
+      - name: "cap-a"
+        binding: "b"
+        verdict: PASS
+        delivered_check:
+          kind: script
+          script: scripts/a.py
+          timeout_secs: 30
+  - label: "beta"
+    capabilities:
+      - name: "cap-b"
+        binding: "b"
+        verdict: PASS
+        delivered_check:
+          kind: script
+          script: scripts/b.py
+          timeout_secs: 30
+""",
+        )
+        refs = iter_script_checks(sidecar)
+        assert [(ref.task_label, ref.capability, ref.script) for ref in refs] == [
+            ('alpha', 'cap-a', 'scripts/a.py'),
+            ('beta', 'cap-b', 'scripts/b.py'),
+        ]
+
+    def test_unloadable_sidecar_yields_nothing_instead_of_raising(self, tmp_path):
+        # _SCRIPT_CHECKS is computed at MODULE IMPORT time to feed
+        # @pytest.mark.parametrize — the same hazard discover_manifests'
+        # docstring names. A raise here would take down collection of this
+        # entire module, not just the corpus-guard class. No signal is lost:
+        # TestCheckedInManifestCorpus.test_checked_in_manifest_validates
+        # already reports an unloadable sidecar loudly and with a better,
+        # field-path-attributed message.
+        sidecar = self._write(
+            tmp_path,
+            'bad-schema',
+            """\
+prd: plans/example-prd.md
+schema_version: 1
+tasks:
+  - label: "alpha"
+    capabilities:
+      - name: "cap-one"
+        binding: "b"
+        verdcit: PASS
+""",
+        )
+        assert iter_script_checks(sidecar) == []
+
+    def test_broken_yaml_sidecar_yields_nothing_instead_of_raising(self, tmp_path):
+        sidecar = self._write(tmp_path, 'bad-syntax', 'prd: [unterminated')
+        assert iter_script_checks(sidecar) == []
 
 
 _MANIFEST_PATHS = discover_manifests() or []
