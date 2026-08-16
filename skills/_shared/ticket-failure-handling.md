@@ -2,12 +2,13 @@
 
 This document is the single source of truth for how callers should handle a
 `failed` status returned by the two-phase `submit_task` / `resolve_ticket`
-pattern.  Four skills reference it:
+pattern.  Five skills reference it:
 
 - [`skills/review/references/phase3-triage.md`](../review/references/phase3-triage.md) — review cycle task creation
 - [`skills/unblock/SKILL.md`](../unblock/SKILL.md) — unblock non-blocker queuing
 - [`skills/escalation-watcher/SKILL.md`](../escalation-watcher/SKILL.md) — escalation suggestion queuing
 - [`skills/orchestrate/SKILL.md`](../orchestrate/SKILL.md) — PRD-decomposition task writing
+- [`skills/recon-escalation-watcher/SKILL.md`](../recon-escalation-watcher/SKILL.md) — recon-queue finding triage
 
 ---
 
