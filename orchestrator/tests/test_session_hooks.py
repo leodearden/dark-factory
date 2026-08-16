@@ -61,6 +61,26 @@ def _clear_claude_spawn_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv('CLAUDE_SPAWN_TASK_ID', raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_fleet_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Pin the fleet root to this test's tmp_path (Task 4193).
+
+    hook_session_slug now READS the session registry to decide whether an
+    inherited CLAUDE_SPAWN_SESSION_ID slug is this session's own record or
+    one it merely inherited, and the many call sites here that pass no
+    explicit root= would otherwise resolve through
+    session_registry.fleet_root to the developer's REAL ~/.claude/fleet --
+    a hermeticity leak of exactly the kind the neighbouring
+    _clear_claude_spawn_env fixture exists to prevent. Pinning the default
+    root to the same tmp_path the tests already hand to root= also keeps
+    the implicit and explicit roots in agreement. Deliberately creates no
+    directories: several tests assert the fleet's sessions dir holds
+    exactly one entry. Tests that set CLAUDE_FLEET_ROOT themselves simply
+    win over this fixture, which runs first.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+
 # ---------------------------------------------------------------------------
 # Step-1: identity + slug resolution
 # ---------------------------------------------------------------------------
