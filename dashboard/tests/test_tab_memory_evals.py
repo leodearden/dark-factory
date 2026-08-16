@@ -815,10 +815,28 @@ def test_index_html_cache_buster_floor(index_html_body: str) -> None:
 #      label.  Switching such a grep to comment-stripped source closes hole (1)
 #      and leaves hole (2) wide open — the same false pass, one layer down.
 #
-# `_deletions` are LITERAL substrings removed from the comment-stripped source
-# to build the mutant.  The result is not valid JSX and is not meant to be:
-# this is a text-level falsification check, and requiring a parseable mutant
+# `_deletions` are REGEXES whose every match is removed from the comment-stripped
+# source to build the mutant.  The result is not valid JSX and is not meant to
+# be: this is a text-level falsification check, and requiring a parseable mutant
 # would mean shipping a JSX parser to test a grep.
+#
+# Regexes rather than literal substrings because the live assertions they guard
+# are whitespace-tolerant and the targets must be too.  As literals, a cosmetic
+# reformat of the .jsx — collapsing `{ MemoryEvalsSection }` to
+# `{MemoryEvalsSection}`, wrapping the `ME_CHART_BY_TAG` initializer across
+# lines — left every real contract intact and every live assertion green while
+# failing this guard with "the deletion target is not present", i.e. a suite
+# failure caused purely by formatting in a repo that deliberately does not adopt
+# `ruff format` (CLAUDE.md).
+#
+# NOT derived from the guarded pattern's own match, which would be simpler and
+# is WRONG: deleting every match of the pattern deletes the unrelated occurrence
+# that makes a non-discriminating pattern non-discriminating, so arm (2) below
+# would pass on exactly the greps it exists to catch.  `\btruncated\b` matched
+# both `ev.truncated &&` and the `(truncated)` label; a target aimed at the GATE
+# leaves the label standing and the grep is caught.  The target is therefore
+# deliberately narrower than the pattern — it names the accessing site, and the
+# pattern is what the live assertion runs.
 #
 # CONVENTION for live presence assertions: consume the pattern via
 # `_presence_pattern(label, code)` rather than restating a regex at the call
@@ -837,7 +855,7 @@ _PRESENCE_CONTRACTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         # sentence describing it.
         'window.DF_MEMORY_EVALS export',
         r'^window\.DF_MEMORY_EVALS\s*=\s*\{',
-        ('window.DF_MEMORY_EVALS = { MemoryEvalsSection };',),
+        (r'window\.DF_MEMORY_EVALS\s*=\s*\{\s*MemoryEvalsSection\s*\}\s*;',),
     ),
     (
         # Same statement, captured, for the test that parses the exported NAMES
@@ -850,7 +868,7 @@ _PRESENCE_CONTRACTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         # message says it prevents — passed. Line-anchored, it fails.
         'window.DF_MEMORY_EVALS exported names',
         r'^window\.DF_MEMORY_EVALS\s*=\s*\{([^}]*)\}',
-        ('window.DF_MEMORY_EVALS = { MemoryEvalsSection };',),
+        (r'window\.DF_MEMORY_EVALS\s*=\s*\{\s*MemoryEvalsSection\s*\}\s*;',),
     ),
     (
         # Anchored to the payload READ, not the bare name. A plain
@@ -861,7 +879,9 @@ _PRESENCE_CONTRACTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         # and deleting the read is a failure.
         'DF_DATA.MEMORY_EVALS payload read',
         r'{alias}\s*\.\s*MEMORY_EVALS',
-        ('const payload = MEDF.MEMORY_EVALS;',),
+        # `{alias}` is resolved in deletion targets too, so the alias stays
+        # DERIVED on both sides of the guard rather than pinned on one.
+        (r'const\s+\w+\s*=\s*{alias}\s*\.\s*MEMORY_EVALS\s*;',),
     ),
     (
         # `[:,}]` puts the primitive in an object/destructure position. Prose
@@ -870,8 +890,8 @@ _PRESENCE_CONTRACTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         'charts.jsx primitive is used',
         r'\b(MESpark|MEStep|METile|MELine|Sparkline|StepSpark|StatTile|LineChart)\b\s*[:,}]',
         (
-            'Sparkline: MESpark, StepSpark: MEStep',
-            'ME_CHART_BY_TAG = { step: MEStep, spark: MESpark }',
+            r'Sparkline\s*:\s*MESpark\s*,\s*StepSpark\s*:\s*MEStep',
+            r'ME_CHART_BY_TAG\s*=\s*\{[^}]*\}',
         ),
     ),
     (
@@ -880,7 +900,7 @@ _PRESENCE_CONTRACTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         # that gates the disclosure left the grep matching the words inside it.
         'eval-level truncation disclosure',
         r'ev\.truncated\s*&&',
-        ('{ev.truncated && (',),
+        (r'\{\s*ev\.truncated\s*&&\s*\(',),
     ),
     (
         # `localStorage` is real code in this file (the persisted open-state
@@ -889,23 +909,42 @@ _PRESENCE_CONTRACTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         # newline before `open={provOpen}`.
         'provenance is collapsed by default',
         r'<details\s+open=',
-        ('<details',),
+        (r'<details\b',),
     ),
     # -----------------------------------------------------------------------
     # The rest of the class.  The five entries above are the ones MEASURED to
-    # be false-passing; these twelve are the remaining positive presence greps
-    # in this file, all of which were still reading the raw `body`.  Every one
-    # of them passes all three arms today — they are here as REGRESSION guards,
-    # and because enumerating instances has already failed once: item (2a) of
-    # the task this lands with exists solely because item (2) listed the sites
-    # it happened to notice rather than closing the class.  A grep that is
+    # be false-passing; the rest were still reading the raw `body`.  Every one
+    # of them passes both arms today — they are here as REGRESSION guards, and
+    # because enumerating instances has already failed once: item (2a) of the
+    # task this lands with exists solely because item (2) listed the sites it
+    # happened to notice rather than closing the class.  A grep that is
     # discriminating today silently stops being so the next time the .jsx
     # prose grows, and nothing would say a word.
+    #
+    # THE CLASS IS "positive presence greps over the RAW BODY", and after this
+    # table no such grep remains: `tab_memory_evals_jsx_body` is now consumed
+    # only by the `tab_memory_evals_jsx_code` fixture that strips it.  Two
+    # greps moved onto `code` WITHOUT joining the table, deliberately:
+    #
+    #   * the chart-gate pair in
+    #     test_trend_holes_are_never_handed_to_a_chart_primitive and
+    #     test_empty_trend_is_a_named_state_not_an_empty_chart_box — an inline
+    #     `{Chart && ...gaps...}` and a named-local `const p = Chart && gaps...;`
+    #     joined by `or`.  BOTH spellings are accepted on purpose, so exactly
+    #     one of them matches at any time (today: the named local).  Arm (1)
+    #     below requires every tabled pattern to match the real source, so
+    #     tabling either would pin the .jsx to one of two legal spellings and
+    #     make the refactor between them a suite failure.
+    #
+    # Greps that ALREADY read `code` and are not tabled (the `data-testid=`
+    # membership checks, `trendGaps(`, `{gaps`) are out of the class by
+    # construction: prose cannot answer them, since prose is not in the text
+    # they search.
     # -----------------------------------------------------------------------
     (
         'MemoryEvalsSection function declaration',
         r'\bfunction\s+MemoryEvalsSection\s*\(',
-        ('function MemoryEvalsSection(',),
+        (r'function\s+MemoryEvalsSection\s*\(',),
     ),
     (
         # Deletion target is the `= window.DF_CHARTS;` tail, not the whole
@@ -914,37 +953,48 @@ _PRESENCE_CONTRACTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         # the .jsx rather than in this table).  The tail IS the accessing act.
         'DF_CHARTS module-level destructure',
         r'const\s*\{([^}]*)\}\s*=\s*window\.DF_CHARTS\s*;',
-        ('} = window.DF_CHARTS;',),
+        (r'\}\s*=\s*window\.DF_CHARTS\s*;',),
     ),
     (
         'window.DF_DATA read',
         r'window\.DF_DATA',
-        ('= window.DF_DATA;',),
+        (r'=\s*window\.DF_DATA\s*;',),
     ),
     (
         'evals list read',
         r'\.evals\b',
-        ('payload.evals',),
+        (r'\bpayload\s*\.\s*evals\b',),
     ),
     (
         'eval card keyed on eval_id',
         r'key=\{[^}]*\beval_id\b',
-        ('key={ev.eval_id}',),
+        (r'key=\{\s*ev\.eval_id\s*\}',),
     ),
     (
         'metrics list read',
         r'\.metrics\b',
-        ('ev.metrics',),
+        (r'\bev\s*\.\s*metrics\b',),
     ),
     (
         'metric row keyed on metric_id',
         r'key=\{[^}]*\bmetric_id\b',
-        ('key={m.metric_id}',),
+        (r'key=\{\s*m\.metric_id\s*\}',),
     ),
     (
         'per-metric escalation guard',
         r'm\.escalation\s*&&',
-        ('m.escalation && (',),
+        (r'm\s*\.\s*escalation\s*&&\s*\(',),
+    ),
+    (
+        # The producer end of the escalation-link contract, and the exact site
+        # `test_memory_evals_escalation_id_contract.py` is built around: the id
+        # handed to `onNavigate` is what `tab_escalations.jsx` resolves with
+        # `row.id === id`.  Not comment-answered today, but the .jsx prose does
+        # discuss the navigation handoff, so one sentence naming the call is all
+        # it would take — which is the latent false pass this entry closes.
+        'escalation link navigates by id',
+        r"onNavigate\(\s*'esc'\s*,\s*escalation\.id\s*\)",
+        (r"onNavigate\(\s*'esc'\s*,\s*escalation\.id\s*\)",),
     ),
     (
         # The `MEDF\.` disjunct is a spelling pin that nothing matches today
@@ -953,12 +1003,12 @@ _PRESENCE_CONTRACTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         # this step moves WHICH TEXT the greps run over, not what they accept.
         'storm banner reads the top-level block',
         r'(payload|MEDF\.MEMORY_EVALS|MEMORY_EVALS)\s*\.\s*storm_escape',
-        ('payload.storm_escape',),
+        (r'\bpayload\s*\.\s*storm_escape\b',),
     ),
     (
         'per-metric link suppressed under storm',
         r"parity\s*===\s*'storm_collapsed'",
-        ("parity === 'storm_collapsed'",),
+        (r"parity\s*===\s*'storm_collapsed'",),
     ),
     (
         # A region ANCHOR, not a plain presence grep: its group(1) is fed to
@@ -967,7 +1017,7 @@ _PRESENCE_CONTRACTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         # capture is prose and every downstream assertion is about prose.
         'stale hint branch',
         r'ev\.stale\s*&&\s*\(([\s\S]{0,700}?)\n\s*\)\}',
-        ('ev.stale && (',),
+        (r'ev\s*\.\s*stale\s*&&\s*\(',),
     ),
     (
         # The other region anchor.  Comment-stripping only ever grows what its
@@ -1033,7 +1083,11 @@ def test_presence_greps_are_falsified_by_deleting_the_code(
         wrong and the live assertion is about nothing.
     (2) does NOT match once the accessing expression is deleted — the pattern
         actually discriminates, rather than being satisfied by some unrelated
-        occurrence of the same string elsewhere in the file.
+        occurrence of the same string elsewhere in the file.  The deletion is
+        driven by the entry's own targets, which name the SITE and are narrower
+        than the guarded pattern; deleting every match of the pattern itself
+        would take the unrelated occurrence with it and pass this arm on the
+        very greps it exists to catch.
 
     Both arms run over the comment-stripped `code` fixture, which is what every
     live presence assertion in this module reads.  Prose is therefore out of
@@ -1056,13 +1110,17 @@ def test_presence_greps_are_falsified_by_deleting_the_code(
         )
 
         mutated = code
-        for target in deletions:
-            assert target in mutated, (
-                f'[{label}] the deletion target {target!r} is not present in the '
+        for raw_target in deletions:
+            target = _resolved_pattern(raw_target, code)
+            assert re.search(target, mutated), (
+                f'[{label}] the deletion target {target!r} matches nothing in the '
                 'comment-stripped source, so the falsification below would be '
-                'vacuous. The code moved; re-locate the accessing expression.'
+                'vacuous. The code moved; re-locate the accessing expression. '
+                '(Targets are whitespace-tolerant REGEXES, so a reformat should '
+                'not land here — if one did, widen the target rather than pinning '
+                'the new spelling.)'
             )
-            mutated = mutated.replace(target, '')
+            mutated = re.sub(target, '', mutated)
         assert not re.search(resolved, mutated, re.MULTILINE), (
             f'[{label}] pattern {resolved!r} STILL matches after deleting '
             f'{deletions!r}. It does not discriminate: something other than the '
@@ -2043,7 +2101,6 @@ def test_no_client_side_alarm_derivation(
 
 
 def test_trend_holes_are_never_handed_to_a_chart_primitive(
-    tab_memory_evals_jsx_body: str,
     tab_memory_evals_jsx_code: str,
 ) -> None:
     """A series containing a hole must NOT be drawn — charts.jsx cannot
@@ -2066,7 +2123,6 @@ def test_trend_holes_are_never_handed_to_a_chart_primitive(
     verbatim (guarded above), but a series the primitive cannot represent is
     not drawn at all.
     """
-    body = tab_memory_evals_jsx_body
     code = tab_memory_evals_jsx_code
 
     # (iv) hole DETECTION must still exist and still run — the fix is to act on
@@ -2106,12 +2162,19 @@ def test_trend_holes_are_never_handed_to_a_chart_primitive(
     #      check that a gate exists at all, and deleting it silently reopens
     #      the defect 5ad120a0b3 fixed (charts.jsx coerces null to 0 and draws
     #      a fabricated plunge to the chart floor; see task 3436).
-    inline = re.search(r'\{\s*Chart\s*&&[^\n]*\bgaps\b', body)
+    #
+    #      Read over COMMENT-STRIPPED source, like every other presence grep in
+    #      this file — the .jsx prose discusses this very gate, so on the raw
+    #      body a sentence describing it would have been able to answer it.
+    #      Deliberately NOT in `_PRESENCE_CONTRACTS`: the two spellings are
+    #      alternatives joined by `or`, so exactly one matches at a time, and
+    #      that table's first arm requires every pattern to match today.
+    inline = re.search(r'\{\s*Chart\s*&&[^\n]*\bgaps\b', code)
     via_local = None
     for decl in re.finditer(
-        r'const\s+(\w+)\s*=\s*[^;\n]*\bChart\b[^;\n]*\bgaps\b[^;\n]*;', body
+        r'const\s+(\w+)\s*=\s*[^;\n]*\bChart\b[^;\n]*\bgaps\b[^;\n]*;', code
     ):
-        if re.search(r'\{\s*' + re.escape(decl.group(1)) + r'\b', body):
+        if re.search(r'\{\s*' + re.escape(decl.group(1)) + r'\b', code):
             via_local = decl.group(1)
             break
     assert inline or via_local, (
@@ -2149,7 +2212,6 @@ def test_trend_holes_are_never_handed_to_a_chart_primitive(
 
 
 def test_empty_trend_is_a_named_state_not_an_empty_chart_box(
-    tab_memory_evals_jsx_body: str,
     tab_memory_evals_jsx_code: str,
 ) -> None:
     """A metric with NO runs is a third suppression state, not a chart.
@@ -2168,7 +2230,6 @@ def test_empty_trend_is_a_named_state_not_an_empty_chart_box(
     Asserted on structure and on `data-testid` values, never on copy: a
     rewording keeps this green, deleting a state does not.
     """
-    body = tab_memory_evals_jsx_body
     code = tab_memory_evals_jsx_code
 
     row_body = _extract_function_body(code, 'MemoryEvalMetricRow')
@@ -2191,9 +2252,9 @@ def test_empty_trend_is_a_named_state_not_an_empty_chart_box(
     #     the two tests cannot drift apart on what "the gate" means.
     gate_decl = None
     for decl in re.finditer(
-        r'const\s+(\w+)\s*=\s*[^;\n]*\bChart\b[^;\n]*\bgaps\b[^;\n]*;', body
+        r'const\s+(\w+)\s*=\s*[^;\n]*\bChart\b[^;\n]*\bgaps\b[^;\n]*;', code
     ):
-        if re.search(r'\{\s*' + re.escape(decl.group(1)) + r'\b', body):
+        if re.search(r'\{\s*' + re.escape(decl.group(1)) + r'\b', code):
             gate_decl = decl
             break
     assert gate_decl is not None, (
@@ -2882,7 +2943,7 @@ def test_escalation_link_navigation_is_wired(
     app_jsx_body: str,
     tabs_jsx_body: str,
     tab_escalations_jsx_body: str,
-    tab_memory_evals_jsx_body: str,
+    tab_memory_evals_jsx_code: str,
 ) -> None:
     """The link from step-10 must navigate for real.
 
@@ -2991,7 +3052,16 @@ def test_escalation_link_navigation_is_wired(
         'visit to the tab.'
     )
 
-    # (f) the producer end of the contract, re-asserted here.
-    assert re.search(r"onNavigate\(\s*'esc'\s*,\s*escalation\.id\s*\)", tab_memory_evals_jsx_body), (
+    # (f) the producer end of the contract, re-asserted here — over
+    #     COMMENT-STRIPPED source, and through `_PRESENCE_CONTRACTS` so the
+    #     mutation guard covers it.  The id this call passes is what
+    #     tab_escalations.jsx resolves with `row.id === id`, which is the
+    #     contract `test_memory_evals_escalation_id_contract.py` checks on the
+    #     payload side; a sentence in the .jsx prose naming the call must not be
+    #     able to stand in for the call.
+    code = tab_memory_evals_jsx_code
+    assert re.search(
+        _presence_pattern('escalation link navigates by id', code), code, re.MULTILINE
+    ), (
         "tab_memory_evals.jsx's link must call onNavigate('esc', escalation.id)."
     )
