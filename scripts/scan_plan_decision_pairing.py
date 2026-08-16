@@ -98,6 +98,7 @@ __all__ = [
     'PLAN_FILENAME',
     'PairingRecord',
     'SKIP_MISSING',
+    'SKIP_UNDECODABLE',
     'SKIP_UNPARSEABLE',
     'SKIP_UNREADABLE',
     'SkippedFile',
@@ -153,6 +154,11 @@ DEFAULT_ROOT = _default_root(_CHECKOUT_ROOT)
 SKIP_MISSING = 'missing'        # the name exists but resolves to nothing
 SKIP_UNREADABLE = 'unreadable'  # an OSError opening or reading it
 SKIP_UNPARSEABLE = 'unparseable' # present and readable, but not JSON
+# Distinct from its neighbour above, and the distinction is the whole point:
+# UNPARSEABLE means the bytes decoded to text that is not JSON, UNDECODABLE
+# means the bytes are not TEXT at all. Collapsing the two would send a triager
+# looking for a syntax error in a file that has none.
+SKIP_UNDECODABLE = 'undecodable'
 
 
 class PairingRecord(NamedTuple):
@@ -235,14 +241,24 @@ def scan_plan_file(path: Path | str) -> list[PairingRecord]:
     non-dict items, non-``str`` fields — yield no hit and no exception, because
     that walker is total.
 
-    Propagates ``OSError`` and ``json.JSONDecodeError`` rather than swallowing
-    them; :func:`scan_tree` is what turns those into reported skips. The split
-    mirrors ``scan_task_toolcall_leaks.scan_db``, which likewise raises while
-    its CLI driver warns and continues, and it keeps this function honest for a
-    caller pointing it at one known file.
+    Propagates ``OSError``, ``UnicodeDecodeError`` and ``json.JSONDecodeError``
+    rather than swallowing them; :func:`scan_tree` is what turns those into
+    reported skips. The split mirrors ``scan_task_toolcall_leaks.scan_db``,
+    which likewise raises while its CLI driver warns and continues, and it
+    keeps this function honest for a caller pointing it at one known file: an
+    empty list must mean "this plan is clean", never "this plan could not be
+    read".
+
+    The read is pinned to ``encoding='utf-8'`` rather than left to
+    ``locale.getpreferredencoding()``. An ambient-locale read would decode the
+    same corpus differently on two machines, and for a tool whose entire output
+    is a prevalence count that is a silent wrong answer rather than a crash.
+    ``scripts/tests/test_scan_plan_decision_pairing.py`` pins it with PEP 597's
+    own mechanism — the CLI must survive ``PYTHONWARNDEFAULTENCODING=1`` under
+    ``-W error::EncodingWarning``.
     """
     plan_path = Path(path)
-    plan = json.loads(plan_path.read_text())
+    plan = json.loads(plan_path.read_text(encoding='utf-8'))
     entries = plan.get('design_decisions') if isinstance(plan, dict) else None
     task_id = plan_path.parent.name
     text = str(plan_path)
@@ -285,7 +301,23 @@ def scan_tree(root: Path | str) -> TreeScan:
     Every per-file failure is REPORTED as a :class:`SkippedFile` and the sweep
     continues, so one truncated plan cannot hide the rest of the corpus.
     ``scanned`` counts only files actually read AND parsed, so it never
-    overstates coverage.
+    overstates coverage. Four arms implement that contract: a plan that cannot
+    be opened (:data:`SKIP_UNREADABLE`), one whose bytes are not text at all
+    (:data:`SKIP_UNDECODABLE`), one whose text is not JSON
+    (:data:`SKIP_UNPARSEABLE`), and a name that resolves to nothing
+    (:data:`SKIP_MISSING`). Discovery itself — listing the root, probing a lane
+    — is guarded the same way, so a directory that becomes unreadable mid-sweep
+    is reported rather than discarding everything already collected.
+
+    The UNDECODABLE arm's scope, stated honestly: it is NOT defending against a
+    corruption observed in the live corpus. ``plan_tools`` writes every plan via
+    ``json.dumps(plan, indent=2)`` (``plan_tools.py:761``) whose default
+    ``ensure_ascii=True`` emits pure-ASCII bytes, so a plan written by the
+    system that owns these documents always decodes. What the arm defends is
+    this module's own declared total-report contract, and the arbitrary trees
+    ``--root`` accepts — an operator may point it at a salvaged, truncated or
+    hand-edited lane tree, which is exactly when a sweep must not go all or
+    nothing.
 
     Results are sorted by :func:`_sort_key` then by entry index. The ordering is
     load-bearing rather than cosmetic — see that helper.
@@ -298,25 +330,58 @@ def scan_tree(root: Path | str) -> TreeScan:
     if not root_path.is_dir():
         return TreeScan(records=[], skipped=[], scanned=0)
 
-    for lane in root_path.iterdir():
-        if not lane.is_dir():
-            continue
+    try:
+        # Materialised in one step rather than iterated lazily, so a readdir
+        # failure part-way through the listing is caught HERE — before any lane
+        # has been scanned — instead of surfacing mid-loop with results already
+        # collected. The root is reported with its own directory name in the
+        # task_id slot: there is no lane to key by, and `path` naming the root
+        # directory rather than a plan.json makes that unambiguous.
+        lanes = sorted(root_path.iterdir())
+    except OSError as exc:
+        skipped.append(
+            SkippedFile(
+                task_id=root_path.name,
+                path=str(root_path),
+                reason=SKIP_UNREADABLE,
+                detail=f'could not list the lane tree: {exc}',
+            )
+        )
+        lanes = []
+
+    for lane in lanes:
         candidate = lane / PLAN_FILENAME
-        # exists() follows symlinks; a lane whose plan.json is a DANGLING
-        # symlink (the live shape — every lane's plan.json points into
-        # .task-meta) must be reported, while a lane that simply never had a
-        # plan is not an error at all and is passed over silently.
-        if not candidate.exists():
-            if candidate.is_symlink():
-                skipped.append(
-                    SkippedFile(
-                        task_id=lane.name,
-                        path=str(candidate),
-                        reason=SKIP_MISSING,
-                        detail='dangling symlink: '
-                               f'{candidate.readlink()}',
+        try:
+            if not lane.is_dir():
+                continue
+            # exists() follows symlinks; a lane whose plan.json is a DANGLING
+            # symlink (the live shape — every lane's plan.json points into
+            # .task-meta) must be reported, while a lane that simply never had
+            # a plan is not an error at all and is passed over silently.
+            if not candidate.exists():
+                if candidate.is_symlink():
+                    skipped.append(
+                        SkippedFile(
+                            task_id=lane.name,
+                            path=str(candidate),
+                            reason=SKIP_MISSING,
+                            detail='dangling symlink: '
+                                   f'{candidate.readlink()}',
+                        )
                     )
+                continue
+        except OSError as exc:
+            # The PROBES can fail too, not just the read: a lane directory
+            # reclaimed or chmod'd during a live sweep makes is_dir()/exists()
+            # raise. Same posture as a failed read — report and continue.
+            skipped.append(
+                SkippedFile(
+                    task_id=lane.name,
+                    path=str(candidate),
+                    reason=SKIP_UNREADABLE,
+                    detail=str(exc),
                 )
+            )
             continue
         try:
             file_records = scan_plan_file(candidate)
@@ -326,6 +391,22 @@ def scan_tree(root: Path | str) -> TreeScan:
                     task_id=lane.name,
                     path=str(candidate),
                     reason=SKIP_UNPARSEABLE,
+                    detail=str(exc),
+                )
+            )
+            continue
+        except UnicodeDecodeError as exc:
+            # Its OWN clause, never a widened `except ValueError`. Both this
+            # and json.JSONDecodeError are ValueError subclasses but they are
+            # DISJOINT types, and catching ValueError broadly would also
+            # swallow unrelated programming errors escaping the delegated
+            # walker — converting a bug into a quietly skipped file, which is
+            # the failure mode this whole function exists to prevent.
+            skipped.append(
+                SkippedFile(
+                    task_id=lane.name,
+                    path=str(candidate),
+                    reason=SKIP_UNDECODABLE,
                     detail=str(exc),
                 )
             )
