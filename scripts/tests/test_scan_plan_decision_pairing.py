@@ -57,6 +57,7 @@ from pathlib import Path
 
 import pytest
 from scan_plan_decision_pairing import (
+    _WORKTREES_DIR,
     DEFAULT_ROOT,
     SKIP_UNDECODABLE,
     PairingRecord,
@@ -747,11 +748,13 @@ class TestDefaultRoot:
             == Path('/repo/.worktrees/.task-meta')
         )
 
-    def test_the_shipped_default_names_a_lane_tree_that_actually_EXISTS(self):
+    def test_the_default_resolves_to_a_tree_that_EXISTS_in_both_layouts(
+        self, tmp_path
+    ):
         """EXISTENCE, which is the property the two cases above cannot check.
 
         They compare paths, and a wrong path compares equal to itself — the
-        earlier spelling of this test asserted ``_default_root(<repo root>) ==
+        earliest spelling of this test asserted ``_default_root(<repo root>) ==
         DEFAULT_ROOT``, which is the same function applied to the same
         directory and so could only fail if ``_default_root`` were
         non-deterministic. The defect the helper was written for is a default
@@ -759,19 +762,43 @@ class TestDefaultRoot:
         the naive spelling yields ``<repo>/.worktrees/<lane>/.worktrees/
         .task-meta``), and only a filesystem probe can catch that.
 
-        Skipped rather than failed on a checkout with no ``.worktrees``
-        directory at all: a fresh clone legitimately has no lanes yet, and that
-        is the operator's tree being empty, not this default being wrong.
+        The probe runs against a SYNTHETIC tree, not this checkout. The
+        previous spelling probed the live tree and so conflated two unrelated
+        facts: it skipped on a missing ``.worktrees`` but FAILED on a checkout
+        that has lanes while ``.task-meta`` has not been materialised yet,
+        reporting a defect in ``_default_root`` when the operator's plan state
+        was merely empty. Here the naive spelling still fails by construction —
+        from ``lane`` it yields ``<tmp>/repo/.worktrees/3967/.worktrees/
+        .task-meta``, which this tree does not contain — while no state of the
+        real checkout can colour the result, so the case never skips either.
         """
-        worktrees_dir = DEFAULT_ROOT.parent
-        if not worktrees_dir.is_dir():
-            pytest.skip(
-                f'no lane tree on this checkout: {worktrees_dir} does not exist'
-            )
-        assert DEFAULT_ROOT.is_dir(), (
-            f'the shipped default names a directory that is not here: '
-            f'{DEFAULT_ROOT} — a sweep with no --root would read nothing and '
-            f'report a clean corpus'
+        repo = tmp_path / 'repo'
+        (repo / _WORKTREES_DIR / '.task-meta').mkdir(parents=True)
+        lane = repo / _WORKTREES_DIR / '3967'
+        lane.mkdir()
+
+        assert _default_root(repo).is_dir()
+        assert _default_root(lane).is_dir()
+
+    def test_the_shipped_default_nests_the_worktrees_dir_exactly_ONCE(self):
+        """The shipped constant itself, pinned structurally and unconditionally.
+
+        The synthetic probe above covers the function; this covers
+        ``DEFAULT_ROOT``, which is that function applied to ``_CHECKOUT_ROOT``,
+        and so is the only case that can catch a wrong checkout root. Counting
+        the nestings is what discriminates: the naive spelling names
+        ``.worktrees`` TWICE (``.worktrees/<lane>/.worktrees/.task-meta``)
+        where the correct one names it once. Note that
+        ``DEFAULT_ROOT.parent.name == '.worktrees'`` holds of BOTH spellings
+        and so distinguishes nothing. Reads no filesystem state, so it cannot
+        go red on a checkout whose lane tree is simply not populated.
+        """
+        assert DEFAULT_ROOT.name == '.task-meta'
+        assert DEFAULT_ROOT.parts.count(_WORKTREES_DIR) == 1, (
+            f'the shipped default nests {_WORKTREES_DIR!r} more than once: '
+            f'{DEFAULT_ROOT} — that is the naive spelling resolved from inside '
+            f'a task worktree, naming a directory that does not exist, and a '
+            f'sweep with no --root would read nothing and report a clean corpus'
         )
 
 
