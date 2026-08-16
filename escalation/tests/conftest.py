@@ -263,11 +263,23 @@ def serve_escalation_mcp():
                         show_banner=False, log_level='error',
                     )
                 )
-            except RuntimeError as exc:
-                # Expected when teardown stops the loop mid-serve ("Event loop
-                # stopped before Future completed") -- but only when *we*
-                # induced it; a RuntimeError raised before teardown began is a
-                # genuine startup failure and must be surfaced below.
+            except BaseException as exc:  # noqa: BLE001 - surfaced on timeout below
+                # Two distinct cases, told apart by the `stopping` flag:
+                #
+                # * Teardown stopped the loop mid-serve -- a deliberate,
+                #   expected RuntimeError ("Event loop stopped before Future
+                #   completed"), which must NOT be reported as an error.
+                # * Anything raised before teardown began is a genuine startup
+                #   failure and must be surfaced below.
+                #
+                # BaseException, not RuntimeError: _free_escalation_port()
+                # binds-then-closes, so a TOCTOU port steal (or any other bind
+                # failure) reaches here as an OSError -- or, since uvicorn
+                # calls sys.exit(1) on a failed bind, as SystemExit, which is
+                # not even an Exception subclass. Narrowing to RuntimeError
+                # leaves serve_error None for both, so the readiness timeout
+                # below reports only the generic "did not complete an MCP
+                # handshake" and silently drops the one fact a reader needs.
                 if not state['stopping']:
                     serve_error = exc
             finally:
