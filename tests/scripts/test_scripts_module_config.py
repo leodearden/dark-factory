@@ -196,7 +196,7 @@ def _discovered() -> dict:
     return _discover_module_configs(REPO_ROOT)
 
 
-def _executed_for_touched(files: list[str]):
+def _executed_for_touched(files: list[str], cfg: OrchestratorConfig):
     """Run the PRODUCTION plan->execution bridge and return the single executed config.
 
     ``derive_verify_plan`` decides scope; ``_executed_module_configs_from_plan``
@@ -204,11 +204,30 @@ def _executed_for_touched(files: list[str]):
     executes. Asserting on THAT is what makes "ruff ran over scripts/" a
     structural claim rather than an exit-code claim.
 
+    *cfg* IS A REQUIRED PARAMETER, not a convenience (task 3703, applying the
+    shape commit 6c72a7da5a landed in ``test_module_verify_budgets.py``). It
+    must be a config built by ``_root_config``, whose docstring spells out why
+    the ``ORCH_CONFIG_PATH`` anchor is load-bearing: an unset anchor collapses
+    every value to the pydantic defaults, SILENTLY.
+
+    This helper used to construct its own
+    ``OrchestratorConfig(project_root=REPO_ROOT)``, and in THIS file's call
+    graph that made it ORDERING-DEPENDENT in a way nothing could report.
+    ``test_scripts_module_carries_its_own_measured_verify_budget`` builds a
+    ``_root_config(monkeypatch)`` for assertion (c) and only then reaches
+    assertion (e)'s call here, so the helper read the right yaml purely as a
+    SIDE EFFECT of that earlier line — while the other three callers
+    (``test_scripts_diff_is_lint_gated``, ``test_scripts_diff_is_type_gated``,
+    ``test_scripts_full_suite_pytest_covers_scripts_tests``) anchored nothing
+    at all and were reading the ambient environment outright. Reordering (c)
+    after (e) would have broken the one working case with no failure signal.
+    Taking the config as an argument makes the dependency structural instead of
+    ordering-dependent.
+
     The ``lambda _f: None`` worktree_reader keeps this hermetic: no file reads,
     and nothing classifies STRUCTURAL, so the lint/type legs stay FILE_SCOPED.
     """
     mc = _discovered()[MODULE_PREFIX]
-    cfg = OrchestratorConfig(project_root=REPO_ROOT)
     plan = verify_plan.derive_verify_plan(files, [mc], cfg, lambda _f: None)
     executed = verify._executed_module_configs_from_plan([mc], plan)
     assert len(executed) == 1, (
@@ -561,7 +580,7 @@ def test_executed_for_touched_is_hermetic_against_the_ambient_orch_config_path(
     )
 
 
-def test_scripts_diff_is_lint_gated() -> None:
+def test_scripts_diff_is_lint_gated(monkeypatch: pytest.MonkeyPatch) -> None:
     """A diff confined to scripts/ must actually run ruff over scripts/.
 
     Five assertions, one contract. (1) and (2) are routing PRECONDITIONS: they
@@ -658,7 +677,7 @@ def test_scripts_diff_is_lint_gated() -> None:
             'an EMPTY module list and this config would gate nothing'
         )
 
-    executed = _executed_for_touched([SAMPLE_TOUCHED_FILE])
+    executed = _executed_for_touched([SAMPLE_TOUCHED_FILE], _root_config(monkeypatch))
 
     # (3) THE GATE ITSELF. A None command here is not "lint deferred to some
     # other config" — it is lint DELETED, and it reports green.
@@ -834,7 +853,7 @@ def test_root_pyright_extrapaths_resolves_scripts_imports() -> None:
         )
 
 
-def test_scripts_diff_is_type_gated() -> None:
+def test_scripts_diff_is_type_gated(monkeypatch: pytest.MonkeyPatch) -> None:
     """A diff confined to scripts/ must actually run pyright over scripts/.
 
     The TYPE half of the same contract ``test_scripts_diff_is_lint_gated``
@@ -892,7 +911,7 @@ def test_scripts_diff_is_type_gated() -> None:
     discovered = _discovered()
     mc = discovered[MODULE_PREFIX]
 
-    executed = _executed_for_touched([SAMPLE_TOUCHED_FILE])
+    executed = _executed_for_touched([SAMPLE_TOUCHED_FILE], _root_config(monkeypatch))
 
     # (a) THE GATE ITSELF, on the FILE_SCOPED render. A None command here is
     # not "type-checking deferred to some other config" — it is TYPE DELETED,
@@ -1000,7 +1019,9 @@ def test_scripts_diff_is_type_gated() -> None:
     )
 
 
-def test_scripts_full_suite_pytest_covers_scripts_tests() -> None:
+def test_scripts_full_suite_pytest_covers_scripts_tests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A FULL_SUITE pytest run for the ``scripts`` module must collect scripts/tests/.
 
     The TEST third of the contract ``test_scripts_diff_is_lint_gated`` and
@@ -1079,7 +1100,10 @@ def test_scripts_full_suite_pytest_covers_scripts_tests() -> None:
 
     # (2) TASK-ROLE ARM 3 — the task-3294 source-only floor, which runs the
     # declared command VERBATIM for any scripts/ production diff.
-    executed_production = _executed_for_touched([SAMPLE_TOUCHED_PRODUCTION_FILE])
+    cfg = _root_config(monkeypatch)
+    executed_production = _executed_for_touched(
+        [SAMPLE_TOUCHED_PRODUCTION_FILE], cfg
+    )
     assert executed_production.test_command is not None, (
         f'executed test_command is None for a diff touching '
         f'{SAMPLE_TOUCHED_PRODUCTION_FILE!r} (task 3460), so pytest is not run '
@@ -1106,7 +1130,7 @@ def test_scripts_full_suite_pytest_covers_scripts_tests() -> None:
 
     # (3) CONFTEST TRIGGER (arm 1) — the sharpest case, because the touched
     # file IS scripts/tests/'s own conftest.
-    executed_conftest = _executed_for_touched([SAMPLE_TOUCHED_CONFTEST])
+    executed_conftest = _executed_for_touched([SAMPLE_TOUCHED_CONFTEST], cfg)
     assert executed_conftest.test_command is not None, (
         f'executed test_command is None for a diff touching '
         f'{SAMPLE_TOUCHED_CONFTEST!r} (task 3460): {_VACUOUS_PASS}'
@@ -1473,7 +1497,10 @@ def test_scripts_module_carries_its_own_measured_verify_budget(
     # or refactor. This module is not cargo-scoped, but the bridge itself is
     # real production code this budget must survive, not just the resolver
     # exercised in isolation above.
-    executed = _executed_for_touched([SAMPLE_TOUCHED_FILE])
+    # Passed the SAME cfg assertion (c) already anchored above, rather than
+    # letting the helper re-derive one from the env that call left behind —
+    # that side effect was the ordering dependency task 3703 removed.
+    executed = _executed_for_touched([SAMPLE_TOUCHED_FILE], cfg)
     assert executed.verify_command_timeout_secs == mc.verify_command_timeout_secs, (
         'the production plan->execution bridge '
         '(verify._executed_module_configs_from_plan) rendered '
