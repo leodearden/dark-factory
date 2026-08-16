@@ -1013,62 +1013,34 @@ class TestJudgePlanQuality:
         assert verdict.plan_quality == 0.83
         assert _judge_warnings(caplog) == []
 
-    # -- The hole a bare clamp leaves open: NaN (task 3410) ----------------
-    # NaN is unordered, so a bare clamp does NOT keep plan_quality in [0, 1]
-    # (see clamp_unit_score's docstring in judge.py for the mechanics). A NaN
-    # would be persisted verbatim by runner.py and poison
-    # report._mean_plan_quality. json.loads('{"plan_quality": NaN}')
-    # SUCCEEDS in CPython, so this is reachable through the same
-    # schema-bypassing path the rest of this task is about — not
+    # -- The hole a bare clamp leaves open: non-finite answers (task 3410, --
+    # -- narrowed by task 4190) ---------------------------------------------
+    # A bare clamp does NOT keep plan_quality in [0, 1] for NaN: NaN is
+    # unordered, so it passes straight through unclamped (see
+    # clamp_unit_score's docstring in judge.py for the mechanics). A bare
+    # clamp DOES keep +/-Infinity in [0, 1] — but only by fabricating the
+    # best/worst possible score (1.0/0.0) on a surface
+    # report._mean_plan_quality -> select_survivors actually ranks on. Both
+    # are equally NOT a judgement, so both degrade to the None sentinel.
+    # Both are reachable through the SAME schema-bypassing
+    # json.loads(result.output) fallback — CPython's json.loads accepts the
+    # bare literals NaN and Infinity, and overflows 1e999 to inf — not
     # hypothetical.
+    #
+    # This is a NARROWING of the task-3410 clamp+warn doctrine, not a
+    # reversal: FINITE out-of-range answers (e.g. 1.5) stay orderable and
+    # intent-preserving, and keep the clamp+warn path pinned by the sibling
+    # tests directly above (~:930-994).
 
     @pytest.mark.parametrize('via', ['structured_output', 'json_output'])
-    async def test_nan_answer_degrades_to_the_none_sentinel_not_a_nan(
-        self, via, caplog,
-    ):
-        from orchestrator.evals.judge import judge_plan_quality
-
-        caplog.set_level(logging.WARNING, logger='orchestrator.evals.judge')
-        with patch(
-            'orchestrator.evals.judge.invoke_agent',
-            AsyncMock(return_value=_judge_result_scoring(float('nan'), via=via)),
-        ):
-            verdict = await judge_plan_quality(
-                _well_formed_plan(), 'diff', _judge_task(),
-            )
-
-        # The existing sentinel run_architect_eval already degrades to the
-        # deterministic structural floor on — never a NaN laundered into a
-        # number a downstream mean could be poisoned by.
-        assert verdict.plan_quality is None
-        # A nonsense answer is a CONTENT failure, never the 3118 infra-refusal
-        # exclusion shape.
-        assert verdict.invocation_error is None
-        # Same degraded shape the parse-failure fallback uses — pinned here
-        # too, not just plan_quality, so a future edit can't quietly leave
-        # per_criterion/reasoning out of step with that documented shape.
-        assert verdict.per_criterion == {}
-        assert 'nan' in verdict.reasoning.lower()
-
-        warnings = _judge_warnings(caplog)
-        assert len(warnings) == 1
-        assert 'df_task_2605' in warnings[0]           # WHICH cell
-        assert 'nan' in warnings[0].lower()            # WHAT was wrong
-
-    @pytest.mark.parametrize('via', ['structured_output', 'json_output'])
-    @pytest.mark.parametrize(('raw', 'expected'), [
-        pytest.param(float('inf'), 1.0, id='positive-infinity-clamps-high'),
-        pytest.param(float('-inf'), 0.0, id='negative-infinity-clamps-low'),
+    @pytest.mark.parametrize('raw', [
+        pytest.param(float('nan'), id='nan'),
+        pytest.param(float('inf'), id='positive-infinity'),
+        pytest.param(float('-inf'), id='negative-infinity'),
     ])
-    async def test_infinity_clamps_because_it_is_orderable_unlike_nan(
-        self, raw, expected, via, caplog,
+    async def test_non_finite_answer_degrades_to_the_none_sentinel(
+        self, raw, via, caplog,
     ):
-        """DELIBERATE asymmetry, documented in one place: infinity IS
-        orderable, so the clamp has a defined answer; NaN is not, so it has
-        none. Parametrized over both delivery paths like the sibling
-        range/NaN tests above, so this path isn't only covered on the
-        structured_output mock.
-        """
         from orchestrator.evals.judge import judge_plan_quality
 
         caplog.set_level(logging.WARNING, logger='orchestrator.evals.judge')
@@ -1080,11 +1052,23 @@ class TestJudgePlanQuality:
                 _well_formed_plan(), 'diff', _judge_task(),
             )
 
-        assert verdict.plan_quality == expected
-        # Infinity is out-of-range-but-orderable, so it takes the SAME
-        # clamp-and-warn path as any other out-of-contract answer (e.g.
-        # 1.5) — exactly one WARNING, never silent.
-        assert len(_judge_warnings(caplog)) == 1
+        # The existing sentinel run_architect_eval already degrades to the
+        # deterministic structural floor on — never a fabricated pool-best
+        # 1.0 laundered into a number a downstream mean could be poisoned by.
+        assert verdict.plan_quality is None
+        # A nonsense answer is a CONTENT failure, never the 3118 infra-refusal
+        # exclusion shape.
+        assert verdict.invocation_error is None
+        # Same degraded shape the parse-failure fallback uses — pinned here
+        # too, not just plan_quality, so a future edit can't quietly leave
+        # per_criterion/reasoning out of step with that documented shape.
+        assert verdict.per_criterion == {}
+        assert repr(raw) in verdict.reasoning
+
+        warnings = _judge_warnings(caplog)
+        assert len(warnings) == 1
+        assert 'df_task_2605' in warnings[0]  # WHICH cell to go look at
+        assert repr(raw) in warnings[0]       # WHAT was wrong
 
 
 # ---------------------------------------------------------------------------
