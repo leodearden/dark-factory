@@ -23,7 +23,6 @@ future reader auditing the leak defence sees both halves at once.
 """
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 import warnings
@@ -31,7 +30,12 @@ from pathlib import Path
 
 import aiosqlite
 import pytest
-from _orch_helpers import reap_leaked_aiosqlite_connections
+from _orch_helpers import (
+    ORCH_PYPROJECT,
+    reap_leaked_aiosqlite_connections,
+    require_orchestrator_inifile,
+    sanitized_probe_env,
+)
 
 try:  # pragma: no cover - the ImportError branch is a pytest-rename tripwire
     from _pytest.config import apply_warning_filters
@@ -136,14 +140,13 @@ def test_autouse_reap_fixture_is_active(request):
 # keep that promise checkable instead of aspirational.
 # ---------------------------------------------------------------------------
 
-#: Resolved from THIS FILE, never from the process CWD: the merge-verify
-#: harness runs pytest from the ``orchestrator/`` cwd
-#: (dark-factory-orchestrator.yaml:142) while a plain ``pytest
-#: orchestrator/tests`` runs from the repo root, and this contract must hold
-#: identically under both. Same idiom as
-#: test_warm_lane_bash_bucket_placement.py:58-61.
-ORCH_DIR = Path(__file__).resolve().parents[1]
-ORCH_PYPROJECT = ORCH_DIR / 'pyproject.toml'
+#: ``ORCH_PYPROJECT`` (the inifile these guards pin), ``sanitized_probe_env``
+#: (the env the subprocess arms below run under — it strips ``PYTHONWARNINGS``,
+#: which would otherwise contaminate BOTH arms of the end-to-end pin) and
+#: ``require_orchestrator_inifile`` all come from ``_orch_helpers``. They live
+#: there rather than here because each had already been re-derived in three to
+#: five test modules apiece; see that module's "Pytest-invocation helpers"
+#: section for the full rationale.
 
 #: The exact ``filterwarnings`` entry these guards pin. Anchored on the
 #: CATEGORY alone (empty message field) because the thread-exception message
@@ -152,20 +155,9 @@ ORCH_PYPROJECT = ORCH_DIR / 'pyproject.toml'
 #: shared/tests/test_async_sqlite_base.py:596.
 PROMOTION_ENTRY = 'error::pytest.PytestUnhandledThreadExceptionWarning'
 
-#: Environment keys stripped from the subprocess probes below. ``GIT_*``
-#: follows test_warm_lane_bash_bucket_placement.py:74-86's ``_sanitized_env``
-#: discipline (an inherited git pointer would aim the child at the wrong
-#: tree). ``PYTEST_ADDOPTS`` is load-bearing for a different reason: an
-#: inherited value carrying its own flags would override the child's
-#: ``-o addopts=`` and re-introduce ``-n auto``, making the probe slow and its
-#: exit code ambiguous.
-_HOSTILE_ENV_KEYS = frozenset({
-    'GIT_DIR',
-    'GIT_WORK_TREE',
-    'GIT_INDEX_FILE',
-    'PYTEST_ADDOPTS',
-    'PYTEST_CURRENT_TEST',
-})
+#: Named in every skip reason emitted by ``require_orchestrator_inifile`` here,
+#: so a skipped run says which contract went unchecked.
+_PIN_SUBJECT = f'the {PROMOTION_ENTRY!r} promotion'
 
 #: A test whose only sin is letting a thread die with an exception — exactly
 #: the shape a degraded reaper leaves behind, minus the aiosqlite machinery.
@@ -190,41 +182,6 @@ _CONTROL_INIFILE_SOURCE = '''\
 [tool.pytest.ini_options]
 addopts = ""
 '''
-
-
-def _sanitized_env() -> dict[str, str]:
-    """``os.environ`` minus the keys that would contaminate a probe."""
-    return {k: v for k, v in os.environ.items() if k not in _HOSTILE_ENV_KEYS}
-
-
-def _require_orchestrator_inifile(pytestconfig) -> None:
-    """Skip unless orchestrator/pyproject.toml governs this run.
-
-    MANDATORY for every pin in this section. pytest reads exactly ONE
-    ``[tool.pytest.ini_options]`` — the rootdir's inifile — and never merges
-    across workspace members (the repo-root pyproject.toml documents this at
-    its own lines 50-56). The root inifile declares no ``filterwarnings`` at
-    all, so under a root-bound run (``pytest orchestrator/tests`` from the
-    repo root, ``-c pyproject.toml``, or an arg set spanning two subprojects)
-    ``getini('filterwarnings')`` is empty and an unguarded pin would
-    FALSE-FAIL on an invocation artifact rather than on drift.
-
-    The merge-verify command is ``cd orchestrator && uv run pytest tests/``
-    (dark-factory-orchestrator.yaml:142), which IS orchestrator-bound, so this
-    guard never weakens the hot path. Skip-vs-fail split and message shape
-    copied from test_lane_lock_leak_guard.py:1346-1365, which solved the
-    identical problem for the ``timeout`` ini key.
-    """
-    governing_inifile = pytestconfig.inipath
-    if governing_inifile is not None and governing_inifile.resolve() == ORCH_PYPROJECT:
-        return
-    pytest.skip(
-        f'the governing inifile for this run is {governing_inifile!r}, not '
-        f'{ORCH_PYPROJECT} — the {PROMOTION_ENTRY!r} promotion lives in the '
-        f'latter and pytest reads exactly one inifile (never merging across '
-        f'workspace members), so this is an invocation artifact (e.g. a '
-        f'root-bound run), not drift'
-    )
 
 
 def _require_apply_warning_filters():
@@ -265,7 +222,7 @@ def test_pyprojects_filterwarnings_promotes_unhandled_thread_exceptions(pytestco
     whose ``:`` field separator is already a documented footgun in
     pyproject.toml's own comment block.
     """
-    _require_orchestrator_inifile(pytestconfig)
+    require_orchestrator_inifile(pytestconfig, subject=_PIN_SUBJECT)
     apply = _require_apply_warning_filters()
 
     ini_filters = list(pytestconfig.getini('filterwarnings'))
@@ -322,7 +279,7 @@ def test_the_promotion_is_in_effect_for_this_run(pytestconfig):
     ``-p no:warnings``) even though the ini text is still correct — a state
     the source pin above cannot see.
     """
-    _require_orchestrator_inifile(pytestconfig)
+    require_orchestrator_inifile(pytestconfig, subject=_PIN_SUBJECT)
 
     # stacklevel only satisfies ruff's B028 — see the note in the source pin.
     try:
@@ -369,7 +326,7 @@ def test_a_thread_exception_actually_fails_a_test_under_this_projects_inifile(
     test_warm_lane_bash_bucket_placement.py's ``--collect-only`` probe, cited
     approvingly by test_marker_registration_drift.py::test_the_sweep_is_not_vacuous.
     """
-    _require_orchestrator_inifile(pytestconfig)
+    require_orchestrator_inifile(pytestconfig, subject=_PIN_SUBJECT)
 
     probe = tmp_path / 'test_df4075_thread_probe.py'
     probe.write_text(_PROBE_TEST_SOURCE)
@@ -380,6 +337,12 @@ def test_a_thread_exception_actually_fails_a_test_under_this_projects_inifile(
         # ``-o addopts=`` clears the inifile's own addopts so the probe does
         # not drag in ``-n auto --dist loadgroup -m 'not warm_lane_bash'``;
         # ``-p no:cacheprovider`` keeps the child from writing a .pytest_cache.
+        # ``sanitized_probe_env`` strips PYTHONWARNINGS along with the git and
+        # PYTEST_* pointers: an ambient warning-filter env var is applied by
+        # CPython ahead of the inifile and would contaminate BOTH arms — an
+        # inherited ``PYTHONWARNINGS=error`` fails the CONTROL arm (reading as
+        # a broken harness) and can pass the TREATMENT arm for a reason that
+        # has nothing to do with orchestrator/pyproject.toml.
         return subprocess.run(
             [
                 sys.executable, '-m', 'pytest', str(probe),
@@ -391,7 +354,7 @@ def test_a_thread_exception_actually_fails_a_test_under_this_projects_inifile(
             capture_output=True,
             text=True,
             cwd=str(tmp_path),
-            env=_sanitized_env(),
+            env=sanitized_probe_env(),
         )
 
     control = _run(control_inifile)

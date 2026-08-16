@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from pydantic import BaseModel
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.psi import PsiSample
@@ -1100,3 +1101,123 @@ def git_env_with_ceiling(cwd: Path) -> dict[str, str]:
     env = os.environ.copy()
     env['GIT_CEILING_DIRECTORIES'] = str(Path(cwd).resolve().parent)
     return env
+
+
+# ===========================================================================
+# Pytest-invocation helpers: subproject paths, probe environments, inifile
+# guards (task 4075 review amendment)
+#
+# Hoisted here because each of these had already been re-derived per module:
+# ``Path(__file__).resolve().parents[1] / 'pyproject.toml'`` in
+# test_marker_registration_drift.py, test_lane_lock_leak_guard.py,
+# test_offline_lane_integration.py, test_offline_lane_infra_integration.py and
+# test_warm_lane_bash_bucket_placement.py; a ``_HOSTILE_ENV_KEYS`` /
+# ``_sanitized_env`` pair in test_warm_lane_bash_suite.py,
+# test_warm_lane_scripts_shipped.py and test_warm_lane_bash_bucket_placement.py;
+# and the skip-vs-fail inifile guard inline in three of those. Every copy is
+# another place that has to change when the sanitize set or the guard semantics
+# do. New call sites should import from here; the existing ones migrate
+# opportunistically (the warm-lane pair additionally strips
+# ``REIFY_WARM_LANE_*`` and takes a ceiling/extra, so it is NOT a drop-in for
+# them yet — see ``drop``/``extra`` below).
+# ===========================================================================
+
+#: The ``orchestrator/`` subproject root and its inifile, resolved from THIS
+#: FILE and never from the process CWD: the merge-verify harness runs pytest
+#: from the ``orchestrator/`` cwd (dark-factory-orchestrator.yaml:142) while a
+#: plain ``pytest orchestrator/tests`` runs from the repo root, and a contract
+#: pinned against either path must hold identically under both.
+ORCH_DIR = Path(__file__).resolve().parents[1]
+ORCH_PYPROJECT = ORCH_DIR / 'pyproject.toml'
+
+#: Environment keys stripped from a pytest/git subprocess probe by
+#: :func:`sanitized_probe_env`. Each one can silently turn a probe's result
+#: into an artifact of the ambient environment instead of a measurement:
+#:
+#: * ``GIT_DIR`` / ``GIT_WORK_TREE`` / ``GIT_INDEX_FILE`` — an inherited git
+#:   pointer (git hook, ``git rebase --exec``) aims the child at the wrong
+#:   tree, and makes even a bare ``git init`` in a synthetic repo fail.
+#: * ``PYTEST_ADDOPTS`` — an outer value carrying its own flags is appended
+#:   AFTER the child's own ``-o addopts=`` / ``-m``, so it can re-introduce
+#:   ``-n auto`` or override a marker selection and make the probe slow, or
+#:   its exit code ambiguous, or the whole pin vacuous.
+#: * ``PYTEST_CURRENT_TEST`` — leaks the parent's node id into the child.
+#: * ``PYTHONWARNINGS`` — CPython applies it as a warning filter in the child
+#:   ahead of anything the inifile says. An ambient ``PYTHONWARNINGS=error``
+#:   makes a control arm (deliberately configured NOT to promote) fail anyway,
+#:   which reads as a broken harness; an ambient promotion of the very category
+#:   under test makes a treatment arm pass for the wrong reason. Strictly
+#:   on-topic for any probe that measures warning behaviour.
+PROBE_HOSTILE_ENV_KEYS = frozenset({
+    'GIT_DIR',
+    'GIT_WORK_TREE',
+    'GIT_INDEX_FILE',
+    'PYTEST_ADDOPTS',
+    'PYTEST_CURRENT_TEST',
+    'PYTHONWARNINGS',
+})
+
+
+def sanitized_probe_env(
+    *, extra: dict[str, str] | None = None, drop: Sequence[str] = (),
+) -> dict[str, str]:
+    """``os.environ`` minus the keys that would contaminate a subprocess probe.
+
+    ``os.environ`` is COPIED rather than replaced wholesale: a child spawned
+    with a blank environment loses ``PATH``, ``HOME`` and its own config
+    discovery, which fails the probe for reasons that have nothing to do with
+    what it measures.
+
+    Args:
+        extra: entries to set in the child (applied after the strip, so a
+            caller may deliberately reinstate a stripped key with a value it
+            chose itself).
+        drop: additional keys to strip beyond :data:`PROBE_HOSTILE_ENV_KEYS` —
+            the seam by which a caller with its own resolution-hostile vars
+            (e.g. the warm-lane suites' ``REIFY_WARM_LANE_*``) can migrate onto
+            this helper without weakening it for everyone else.
+    """
+    hostile = PROBE_HOSTILE_ENV_KEYS.union(drop)
+    env = {k: v for k, v in os.environ.items() if k not in hostile}
+    if extra:
+        env.update(extra)
+    return env
+
+
+def require_orchestrator_inifile(pytestconfig, *, subject: str) -> None:
+    """Skip unless ``orchestrator/pyproject.toml`` governs the current run.
+
+    MANDATORY in front of any assertion about an
+    ``[tool.pytest.ini_options]`` key of the orchestrator subproject. pytest
+    reads exactly ONE inifile — the rootdir's — and never merges across
+    workspace members (the repo-root pyproject.toml documents this in its own
+    comment block). The root inifile declares neither ``filterwarnings`` nor
+    ``timeout``, so under a root-bound run (``pytest orchestrator/tests`` from
+    the repo root, ``-c pyproject.toml``, or an arg set spanning two
+    subprojects) ``getini(...)`` returns the empty default and an unguarded pin
+    FALSE-FAILS on an invocation artifact rather than on drift.
+
+    The merge-verify command is ``cd orchestrator && uv run pytest tests/``
+    (dark-factory-orchestrator.yaml:142), which IS orchestrator-bound, so this
+    guard never weakens the hot path.
+
+    Deliberately asymmetric, and that asymmetry is the whole design: it SKIPS
+    (never fails) when some other inifile governs, and simply RETURNS when ours
+    does — leaving the caller to make the real assertion and emit its own
+    diagnostic. Message shape and the skip-vs-fail split are the ones
+    test_lane_lock_leak_guard.py:1344-1365 arrived at for the ``timeout`` key.
+
+    Args:
+        subject: what the caller is about to pin, named in the skip reason so
+            the message says which contract was not checked (e.g. ``"the
+            'error::pytest.PytestUnhandledThreadExceptionWarning' promotion"``).
+    """
+    governing_inifile = pytestconfig.inipath
+    if governing_inifile is not None and Path(governing_inifile).resolve() == ORCH_PYPROJECT:
+        return
+    pytest.skip(
+        f'the governing inifile for this run is {governing_inifile!r}, not '
+        f'{ORCH_PYPROJECT} — {subject} lives in the latter and pytest reads '
+        f'exactly one inifile (never merging across workspace members), so '
+        f'this is an invocation artifact (e.g. a root-bound run), not drift'
+    )
