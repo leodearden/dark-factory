@@ -61,6 +61,7 @@ from fused_memory.backends.falkor_indices import (
     plan_index_statements,
     range_create_statement,
     resolve_header_positions,
+    vector_index_properties,
 )
 
 
@@ -687,6 +688,180 @@ class TestNormalizeIndexRecords:
         ]
 
         assert normalize_index_records(derived) == expected
+
+
+class TestVectorIndexProperties:
+    """The VECTOR detector: which properties of ONE record carry a VECTOR index.
+
+    A SEPARATE function from :func:`normalize_index_record` on purpose.  That one
+    projects VECTOR AWAY by design (``_REPRESENTABLE_INDEX_TYPES = {'RANGE',
+    'FULLTEXT'}``) because VECTOR is unrepresentable in the PRD normal form, so it
+    can never serve as the vector detector — a flag on it would have to defeat its
+    own reason for existing.
+
+    Every fixture here is built to the MEASURED MERGED record shape, re-confirmed
+    2026-08-16 on the throwaway graph ``_impl3769_probe``: FalkorDB merges every
+    index on a label into ONE record, so a graph with a VECTOR index on
+    ``Entity.emb`` and a RANGE index on ``Entity.name`` yields a single row with
+    ``properties=['emb','name']`` and ``types={'emb': ['VECTOR'], 'name':
+    ['RANGE']}``.  The one-record-per-property shape some older stubs model is a
+    shape live FalkorDB never emits.
+    """
+
+    def test_merged_record_yields_only_the_vector_property(self):
+        """THE named signal: one merged record, one vector property out.
+
+        This is the shape ``drop_vector_indices`` actually receives from
+        ``list_indices()`` on any real graph.  The defect this replaces compared
+        the whole ``types`` DICT against the STRING ``'VECTOR'`` — never true, so
+        the drop was a permanent no-op.
+        """
+        record = {
+            'label': 'Entity',
+            'entity_type': 'NODE',
+            'field': ['name_embedding', 'name'],
+            'type': {'name_embedding': ['VECTOR'], 'name': ['RANGE']},
+        }
+        assert vector_index_properties(record) == ['name_embedding']
+
+    def test_property_carrying_both_types_is_selected(self):
+        """MEASURED 2026-08-16: one property can carry ``['RANGE', 'VECTOR']``.
+
+        Pins MEMBERSHIP, not list equality.  A ``== ['VECTOR']`` predicate would
+        silently skip exactly these mixed properties — the same silent-omission
+        class as the original ``== 'VECTOR'`` string compare, just rarer.  Measured
+        on the probe graph: ``DROP VECTOR INDEX FOR (n:Entity) ON (n.name)``
+        surgically removed the VECTOR half and left ``{name: ['RANGE']}`` behind.
+        """
+        record = {
+            'label': 'Entity',
+            'entity_type': 'NODE',
+            'field': ['name'],
+            'type': {'name': ['RANGE', 'VECTOR']},
+        }
+        assert vector_index_properties(record) == ['name']
+
+    def test_range_and_fulltext_only_record_yields_nothing(self):
+        record = {
+            'label': 'Entity',
+            'entity_type': 'NODE',
+            'field': ['uuid', 'name'],
+            'type': {'uuid': ['RANGE'], 'name': ['RANGE', 'FULLTEXT']},
+        }
+        assert vector_index_properties(record) == []
+
+    def test_relationship_record_yields_its_vector_property(self):
+        """Graphiti indexes ``fact_embedding`` on RELATES_TO edges — both branches are live."""
+        record = {
+            'label': 'RELATES_TO',
+            'entity_type': 'RELATIONSHIP',
+            'field': ['uuid', 'fact_embedding'],
+            'type': {'uuid': ['RANGE'], 'fact_embedding': ['VECTOR']},
+        }
+        assert vector_index_properties(record) == ['fact_embedding']
+
+    def test_order_follows_the_field_list_not_the_type_keys(self):
+        """``field`` is the authoritative property membership, as in ``normalize_index_record``.
+
+        Driving off ``type.keys()`` instead would silently under-report the moment
+        the two disagree; here it would also make the emitted drop order depend on
+        a mapping this module does not own.
+        """
+        record = {
+            'label': 'Entity',
+            'entity_type': 'NODE',
+            'field': ['b_emb', 'a_name', 'c_emb'],
+            'type': OrderedDict([
+                ('c_emb', ['VECTOR']),
+                ('a_name', ['RANGE']),
+                ('b_emb', ['VECTOR']),
+            ]),
+        }
+        assert vector_index_properties(record) == ['b_emb', 'c_emb']
+
+    def test_bare_string_field_degrades_to_one_property(self):
+        """Symmetric with ``normalize_index_record``: a future scalar shape means ONE, not zero."""
+        record = {
+            'label': 'Entity',
+            'entity_type': 'NODE',
+            'field': 'name_embedding',
+            'type': {'name_embedding': ['VECTOR']},
+        }
+        assert vector_index_properties(record) == ['name_embedding']
+
+    def test_scalar_type_string_is_accepted_as_a_one_element_list(self):
+        record = {
+            'label': 'Entity',
+            'entity_type': 'NODE',
+            'field': ['name_embedding'],
+            'type': {'name_embedding': 'VECTOR'},
+        }
+        assert vector_index_properties(record) == ['name_embedding']
+
+    @pytest.mark.parametrize(
+        'label',
+        [OrderedDict({'uuid': OrderedDict()}), None, '', 42],
+        ids=['options-dict', 'none', 'empty-string', 'int'],
+    )
+    def test_non_string_label_raises(self, label):
+        record = {
+            'label': label,
+            'entity_type': 'NODE',
+            'field': ['name_embedding'],
+            'type': {'name_embedding': ['VECTOR']},
+        }
+        with pytest.raises(IndexRecordShapeError):
+            vector_index_properties(record)
+
+    @pytest.mark.parametrize(
+        'entity_type',
+        [OrderedDict({'uuid': OrderedDict()}), None, 'EDGE', ''],
+        ids=['options-dict', 'none', 'falkordb-EDGE-vocabulary', 'empty-string'],
+    )
+    def test_invalid_entity_type_raises(self, entity_type):
+        """``entity_type`` is LOAD-BEARING here, not cosmetic.
+
+        The OrderedDict case models the historic options-column mis-binding.
+        Measured 2026-08-16: node DROP syntax against a RELATIONSHIP vector index
+        fails with ``no such index``, so a wrong ``entity_type`` reproduces the
+        exact failure mode this task exists to kill — a drop that reports success
+        while dropping nothing.
+        """
+        record = {
+            'label': 'Entity',
+            'entity_type': entity_type,
+            'field': ['name_embedding'],
+            'type': {'name_embedding': ['VECTOR']},
+        }
+        with pytest.raises(IndexRecordShapeError):
+            vector_index_properties(record)
+
+    @pytest.mark.parametrize(
+        'field',
+        [None, [], {}, 42],
+        ids=['missing-none', 'empty-list', 'dict', 'int'],
+    )
+    def test_absent_or_empty_field_raises(self, field):
+        record = {
+            'label': 'Entity',
+            'entity_type': 'NODE',
+            'field': field,
+            'type': {'name_embedding': ['VECTOR']},
+        }
+        with pytest.raises(IndexRecordShapeError):
+            vector_index_properties(record)
+
+    def test_property_present_in_field_but_absent_from_type_raises(self):
+        """Silently skipping it would under-report — a vector index left undropped."""
+        record = {
+            'label': 'Entity',
+            'entity_type': 'NODE',
+            'field': ['name_embedding', 'group_id'],
+            'type': {'name_embedding': ['VECTOR']},
+        }
+        with pytest.raises(IndexRecordShapeError) as excinfo:
+            vector_index_properties(record)
+        assert 'group_id' in str(excinfo.value)
 
 
 # --- The MEASURED live CALL db.indexes() shape -----------------------------
