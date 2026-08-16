@@ -1669,6 +1669,15 @@ convert it into a task candidate and then close it:
         'mcp__escalation__get_escalation',
         'mcp__escalation__get_pending_escalations',
         'mcp__escalation__merge_request',
+        # Read-only merge-state query. Required, not optional: the rc=1 arm of
+        # ANCESTRY_CHECK_INSTRUCTIONS (spliced into this prompt at both
+        # "Marking tasks done" call sites) forbids `git fetch` as a remedy --
+        # it cannot move `refs/heads/main` -- and directs the steward to
+        # confirm an in-flight merge via `merge_status` instead. allowed_tools
+        # is passed to the SDK as an allowlist (steward.py), so omitting this
+        # would leave the block's only prescribed rc=1 remedy behind a
+        # permission denial, with the fetch fallback already forbidden.
+        'mcp__escalation__merge_status',
         *_STEWARD_MEMORY_TOOLS,
         *_JCODEMUNCH_TOOLS,
     ],

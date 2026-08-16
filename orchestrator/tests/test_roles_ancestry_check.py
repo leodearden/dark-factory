@@ -33,12 +33,46 @@ here: the only possible test would grep skills/merge-queue/SKILL.md and
 skills/unblock/SKILL.md for the echo form, which is a documentation
 meta-test that would couple this suite to prose in two skill docs that
 legitimately get rewritten.
+
+The rc=1 arm's replacement remedy points the steward at
+`mcp__escalation__merge_status`. `steward.py` passes `STEWARD.allowed_tools`
+to the SDK as an allowlist, so a prompt that prescribes a tool the role does
+not hold leaves the steward with a permission denial and no path at all --
+the fetch fallback having just been forbidden. That capability↔prompt
+coupling IS runtime behaviour (unlike the wording), so
+`test_steward_holds_every_mcp_tool_its_prompt_names` pins it, generically:
+it asserts on tool GRANTS, not on wording, so any rephrasing that keeps
+naming a tool still passes, and dropping the tool from the allowlist (or
+naming a new ungranted one) fails.
 """
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
+
+from orchestrator.agents.roles import STEWARD
+
+
+def test_steward_holds_every_mcp_tool_its_prompt_names() -> None:
+    """Every fully-qualified MCP tool STEWARD's prompt prescribes must be granted.
+
+    Guards the task-4107 regression directly: the rc=1 arm of
+    ANCESTRY_CHECK_INSTRUCTIONS named `mcp__escalation__merge_status` while
+    STEWARD.allowed_tools did not carry it. Deliberately generic -- it pins
+    no particular tool or phrasing, only the invariant that a prescribed
+    tool is a held tool.
+    """
+    named = set(re.findall(r'mcp__(?:escalation|fused-memory)__[a-z_]+', STEWARD.system_prompt))
+    granted = set(STEWARD.allowed_tools)
+    missing = sorted(named - granted)
+    assert not missing, (
+        f"STEWARD's system_prompt prescribes MCP tools absent from its allowed_tools "
+        f'allowlist: {missing}. steward.py passes allowed_tools to the SDK as an '
+        'allowlist, so the steward would hit a permission denial following its own '
+        'instructions -- either grant the tool or reword the instruction.'
+    )
 
 
 def _init_upstream_repo(repo: Path) -> None:
