@@ -72,6 +72,11 @@ import logging
 import sys
 from typing import Any
 
+from fused_memory.utils.store_mutation_preflight import (
+    StoreMutationUnavailable,
+    assert_store_mutation_allowed,
+)
+
 logger = logging.getLogger('clear_malformed_empty_memory')
 
 
@@ -234,9 +239,48 @@ async def run(args: Any, qdrant_client: Any, collection_name: str) -> dict:
       - classification == 'absent': no delete is attempted (nothing to
         delete) -- an INFO log notes the idempotent no-op.
     """
+    dry_run = not args.apply
+
+    # Fail-CLOSED capability preflight, one probe per run, BEFORE the read.
+    #
+    # This script is the odd one out among the guard's call sites, and the
+    # difference is worth stating rather than leaving a reviewer to find it:
+    # it bypasses mem0 entirely, issuing a raw ``AsyncQdrantClient.delete``
+    # (L179-182) because mem0's ``AsyncMemory.delete()`` would KeyError on the
+    # null-payload records this tool targets (module docstring). So mem0's
+    # SQLite history write never happens here, and the split delete-then-write
+    # failure mode that motivated the guard is NOT this script's direct hazard.
+    #
+    # The probe is still the right control. The module documents it as an
+    # honest CAPABILITY signal -- "it passes wherever the mutation would
+    # actually work and fails wherever it would not"
+    # (store_mutation_preflight.py:36-42) -- not as a mem0-specific check. And
+    # a raw Qdrant delete is a NETWORK call to localhost:6333, which landlock
+    # provably cannot block (landlock governs the FILESYSTEM only). An
+    # application-level refusal is therefore the ONLY available control here,
+    # which makes this the purest instance of the module's stated policy
+    # rather than an exception to it.
+    #
+    # Gated on ``not dry_run`` so a read-only run stays pure-read and needs no
+    # write capability at all -- the payload + classification report IS the
+    # investigation, and it must remain obtainable from anywhere.
+    if not dry_run:
+        try:
+            assert_store_mutation_allowed(operation='clear_malformed_empty_memory --apply')
+        except StoreMutationUnavailable:
+            logger.error(
+                'clear_malformed_empty_memory: --apply NOT started (fail-closed) -- '
+                "this process cannot write mem0's history directory, so it is not a "
+                'process that may mutate the shared store. Nothing was read and '
+                'nothing was mutated. Route the deletion through the fused-memory '
+                'MCP server (the unsandboxed owner of the store), or re-run from an '
+                'unsandboxed operator shell. To inspect the record safely from '
+                'anywhere, re-run without --apply.'
+            )
+            raise
+
     payload = await retrieve_payload(qdrant_client, collection_name, args.memory_id)
     classification = classify_payload(payload)
-    dry_run = not args.apply
     deleted = False
 
     if args.apply and classification == 'malformed':
