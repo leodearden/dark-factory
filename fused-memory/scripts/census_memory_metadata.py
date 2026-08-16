@@ -434,6 +434,7 @@ def build_report(
     coverage: dict[str, dict[str, Any]],
     top_n: int = DEFAULT_TOP_N,
     page_size: int | None = None,
+    canonical_uniqueness_enforced: bool | None = None,
 ) -> dict[str, Any]:
     """Assemble the JSON census report from per-(project, category) cells.
 
@@ -447,6 +448,11 @@ def build_report(
             JSON tables -- those are always the complete population.
         page_size: Scroll page size, recorded in ``params`` so a future
             re-run is comparable.
+        canonical_uniqueness_enforced: The live ``memory_metadata.enforce``
+            state, INJECTED rather than read here so this stays a pure
+            function. Three-valued (``None`` = could not be read); see
+            :func:`read_canonical_uniqueness_enforced`, which is what ``_run``
+            passes.
 
     Returns:
         A JSON-serialisable dict with per-cell counts, per-project and
@@ -476,7 +482,9 @@ def build_report(
             'total': _census_to_dict(project_total),
             # Off the ROLLUP, so the canonical partition is computed at the
             # project grain 3198's uniqueness invariant is stated at.
-            'topic_coverage': _build_topic_coverage(project_total),
+            'topic_coverage': _build_topic_coverage(
+                project_total, canonical_uniqueness_enforced,
+            ),
             'categories': rendered,
         }
 
@@ -511,12 +519,99 @@ def build_report(
         },
         'projects': projects,
         'grand_total': _census_to_dict(grand_total),
-        'topic_coverage': _build_topic_coverage(grand_total),
+        'topic_coverage': _build_topic_coverage(
+            grand_total, canonical_uniqueness_enforced,
+        ),
         'coverage': _build_coverage(coverage),
     }
 
 
-def _build_topic_coverage(census: CategoryCensus) -> dict[str, Any]:
+#: What still stands between here and flipping ``memory_metadata.enforce``.
+#: Emitted beside the violation count and the ``enforce`` flag so the report
+#: is SELF-CONTAINED: a reader gets the number, the regime that produced it,
+#: and what remains, without reconstructing the last part from the PRD
+#: (Leo's ruling of 2026-08-12, Option B on esc-4006-3).
+#:
+#: CITATION-ONLY, deliberately. The ruling's scope note is explicit that this
+#: task cites the preconditions and does not chase them: no live probe of
+#: 3202/3626's task status is issued here. Single-homed so the JSON and the
+#: markdown can never disagree about what blocks the flip.
+ENFORCE_FLIP_PRECONDITIONS: tuple[dict[str, str], ...] = (
+    {
+        'id': 'legacy_topic_spelling_remains',
+        'what': (
+            'No live topic value may remain in a legacy (non-conforming) '
+            'spelling -- such a topic is invisible to every registry-keyed '
+            'and exact-match read.'
+        ),
+        # NOT "open": PRD §159's 2026-08-04 amendment records the sweep
+        # applied and the residue normalized -- "that bucket is empty ...
+        # This half of the precondition is DISCHARGED". Citing it as open
+        # would be as wrong as omitting it. But a status recorded on
+        # 2026-08-04 is not a live fact, which is why the emitted entry
+        # carries THIS run's conformance count as its re-measurement: the
+        # leaf-alpha census's own history (98 -> 103 non-conforming distinct
+        # topics, which GREW while in warn mode) proves the bucket regrows.
+        'status': 'discharged_2026_08_04',
+        'source': 'docs/prds/memory-metadata-vocabulary.md §159 (2026-08-04 amendment)',
+    },
+    {
+        'id': '3202',
+        'what': (
+            "Leaf iota -- the writer-instruction slug contract -- must land. "
+            'PRD §159 names this "the real precondition" after measuring that '
+            'normalizing records at rest moved the false-rejection rate only '
+            '~20 -> ~19/week: enforce rejects WRITES and never re-validates '
+            'the corpus, so "theta WAS NOT THE GATE; iota IS".'
+        ),
+        'status': 'open',
+        'source': 'task 3202 (leaf iota) · docs/prds/memory-metadata-vocabulary.md §159',
+    },
+    {
+        'id': '3626',
+        'what': (
+            'The milestone gate that re-measures and DECIDES the flip. Its '
+            'recipe items 3 and 4 name this census as their instrument: the '
+            'non-conforming distinct-topic count, and confirmation that every '
+            'live canonical:true topic passes the slug regex in both projects.'
+        ),
+        'status': 'open',
+        'source': 'task 3626 ([MILESTONE] memory_metadata.enforce flip gate)',
+    },
+)
+
+
+def read_canonical_uniqueness_enforced() -> bool | None:
+    """Three-valued read of the live ``memory_metadata.enforce`` setting.
+
+    ``True``/``False`` are the measured flag; ``None`` means the config could
+    not be read at all -- a DIFFERENT claim from "the guard is off", and one
+    the report must be able to make. Defaulting a failed read to ``False``
+    would tell a reader the uniqueness violations are expected warn-mode
+    backlog when in fact nothing is known about the regime (INV-2
+    no-silent-fail-soft).
+
+    Never raises: losing the whole census to a config fault would be a
+    strictly worse outcome than an undisclosed flag, since the measurement
+    itself does not depend on the config.
+    """
+    try:
+        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+
+        return bool(FusedMemoryConfig().memory_metadata.enforce)
+    except Exception as exc:  # noqa: BLE001 - any load failure degrades to null
+        logger.warning(
+            'could not read memory_metadata.enforce (%s: %s) -- reporting null',
+            type(exc).__name__,
+            exc,
+        )
+        return None
+
+
+def _build_topic_coverage(
+    census: CategoryCensus,
+    canonical_uniqueness_enforced: bool | None = None,
+) -> dict[str, Any]:
     """Turn a MERGED census rollup into the topic/canonical COVERAGE block.
 
     Takes the per-project (or grand-total) rollup produced by
@@ -537,6 +632,7 @@ def _build_topic_coverage(census: CategoryCensus) -> dict[str, Any]:
     """
     by_topic = census.canonical_true_by_topic
     exactly_one = zero = multiple = 0
+    violators: list[tuple[str, int]] = []
     for topic in census.topic_values:
         count = by_topic.get(topic, 0)
         if count == 0:
@@ -545,6 +641,10 @@ def _build_topic_coverage(census: CategoryCensus) -> dict[str, Any]:
             exactly_one += 1
         else:
             multiple += 1
+            violators.append((topic, count))
+    # Same total order _table() uses (count desc, then value asc), so the
+    # artifact stays byte-stable across re-runs over an unchanged corpus.
+    violators.sort(key=lambda tc: (-tc[1], tc[0]))
 
     return {
         'records': census.records,
@@ -560,6 +660,18 @@ def _build_topic_coverage(census: CategoryCensus) -> dict[str, Any]:
         'topics_with_one_canonical': exactly_one,
         'topics_with_zero_canonical': zero,
         'topics_with_multiple_canonical': multiple,
+        # NAMED, not merely counted: an operator cannot act on an integer.
+        'multiple_canonical_topics': [
+            {'topic': t, 'canonical_count': c} for t, c in violators
+        ],
+        # The regime the count above was produced under. Without it a reader
+        # cannot tell "the guard is warn-only, so this is backlog" from "the
+        # guard broke". Three-valued -- see read_canonical_uniqueness_enforced.
+        'canonical_uniqueness_enforced': canonical_uniqueness_enforced,
+        # Deep-copied, never aliased: a consumer mutating the report must not
+        # silently rewrite every later run's citations in the same process
+        # (the nightly wrapper censuses two projects in one invocation).
+        'enforce_flip_preconditions': [dict(e) for e in ENFORCE_FLIP_PRECONDITIONS],
         'canonical_true': census.canonical_true,
         # Named rather than dropped: these canonicals are invisible to every
         # per-topic tally above, so without this the block cannot be
@@ -1266,6 +1378,7 @@ async def _run(args: argparse.Namespace) -> int:
 
         report = build_report(
             cells, coverage, top_n=args.top_n, page_size=args.page_size,
+            canonical_uniqueness_enforced=read_canonical_uniqueness_enforced(),
         )
         _write_artifacts(report, args.json_out, args.md_out)
 
