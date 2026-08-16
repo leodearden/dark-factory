@@ -459,3 +459,187 @@ def test_wrapper_runs_under_the_fused_memory_service_env(tmp_path):
     assert 'PROJECT_ROOT' in text
     assert 'uv run' in text, (
         'the default interpreter prefix must resolve fused_memory.* imports')
+
+
+# ── the wrapper commits what it regenerates (esc-4006-5) ────────────────────
+#
+# The census rewrites three GIT-TRACKED files under $REPO/plans/, and $REPO
+# defaults to the machine-operated project_root checkout. Leaving them dirty
+# every morning is not untidiness: memory-metadata-coverage-history.json is
+# APPEND-ONLY and IS the trend this task exists to build, so an uncommitted
+# append that the merge worker's advance path resets away takes that night's
+# row with it -- permanently, and with no error anywhere.
+#
+# Precedent for committing rather than not: scripts/legibility/census.py's
+# _build_default_commit already commits docs/legibility/census-state.json from
+# the 03:00 job, and scripts/legibility/nightly.py::_git_commit_docs_only does
+# the same, both via scoped `git commit --only`.
+
+_ARTIFACTS = (
+    'plans/memory-metadata-census-report.json',
+    'plans/memory-metadata-census-report.md',
+    'plans/memory-metadata-coverage-history.json',
+)
+
+
+def _git(repo, *args):
+    return subprocess.run(
+        ['git', '-C', str(repo), *args],
+        capture_output=True, text=True, check=False,
+    )
+
+
+def _git_repo_harness(tmp_path, *, dirty=True):
+    """Make $REPO a REAL git repo carrying the three tracked artifacts.
+
+    The fake census recorder does not write artifacts, so the drift a live run
+    would produce is staged here directly -- what is under test is the
+    wrapper's commit step, not the census's rendering.
+    """
+    repo = tmp_path / 'fake-repo'
+    (repo / 'plans').mkdir(parents=True, exist_ok=True)
+    (repo / 'fused-memory' / 'scripts').mkdir(parents=True, exist_ok=True)
+
+    _git(repo, 'init', '-q', '-b', 'main')
+    _git(repo, 'config', 'user.email', 'test@example.com')
+    _git(repo, 'config', 'user.name', 'Test')
+    # No hooks, no signing -- this exercises the wrapper, not the repo's gates.
+    _git(repo, 'config', 'commit.gpgsign', 'false')
+
+    for rel in _ARTIFACTS:
+        (repo / rel).write_text('{"baseline": true}\n')
+    _git(repo, 'add', '--', *_ARTIFACTS)
+    _git(repo, 'commit', '-q', '--no-verify', '-m', 'baseline')
+
+    if dirty:
+        for rel in _ARTIFACTS:
+            (repo / rel).write_text('{"regenerated": true}\n')
+    return repo
+
+
+def _run_wrapper_in_git_repo(tmp_path, repo, **kwargs):
+    env, state_path = _wrapper_harness(tmp_path, **kwargs)
+    env['REPO'] = str(repo)
+    result = subprocess.run(
+        ['bash', str(WRAPPER)],
+        env=env, capture_output=True, text=True, timeout=120,
+    )
+    return result, json.loads(state_path.read_text())
+
+
+def test_wrapper_commits_the_artifacts_it_regenerated(tmp_path):
+    """THE point of the fix. The history file is append-only and IS the trend;
+    an append left uncommitted in the machine-operated main checkout can be
+    reset away by the merge worker, silently losing that night's row."""
+    repo = _git_repo_harness(tmp_path)
+    result, _ = _run_wrapper_in_git_repo(tmp_path, repo)
+
+    assert result.returncode == 0, (
+        f'stdout={result.stdout!r} stderr={result.stderr!r}')
+    status = _git(repo, 'status', '--porcelain', '--', *_ARTIFACTS).stdout
+    assert status.strip() == '', (
+        f'artifacts left dirty after the run: {status!r}')
+    subject = _git(repo, 'log', '-1', '--pretty=%s').stdout.strip()
+    assert subject != 'baseline', 'no commit was made'
+
+
+def test_wrapper_commit_is_scoped_and_never_sweeps_unrelated_dirty_state(
+        tmp_path):
+    """CLAUDE.md's rule for this checkout: `git commit --only <paths>`, never a
+    bare `git commit` and never `git add -A`. A concurrent process's WIP in the
+    same tree must not be swept into the census's nightly commit."""
+    repo = _git_repo_harness(tmp_path)
+    bystander = repo / 'plans' / 'someone-elses-wip.md'
+    bystander.write_text('concurrent work, not ours\n')
+    tracked_bystander = repo / 'README.md'
+    tracked_bystander.write_text('unrelated tracked edit\n')
+    _git(repo, 'add', '--', 'README.md')
+    _git(repo, 'commit', '-q', '--no-verify', '-m', 'bystander baseline')
+    tracked_bystander.write_text('unrelated tracked edit, now dirty\n')
+
+    result, _ = _run_wrapper_in_git_repo(tmp_path, repo)
+    assert result.returncode == 0, result.stderr
+
+    committed = _git(repo, 'show', '--name-only', '--pretty=', 'HEAD').stdout
+    assert 'someone-elses-wip.md' not in committed, committed
+    assert 'README.md' not in committed, committed
+    for rel in _ARTIFACTS:
+        assert rel in committed, f'{rel} missing from {committed!r}'
+    # And the bystanders are still exactly as the other process left them.
+    assert bystander.exists()
+    assert 'now dirty' in tracked_bystander.read_text()
+
+
+def test_wrapper_treats_an_unchanged_artifact_set_as_a_no_op_not_a_failure(
+        tmp_path):
+    """A night whose corpus did not drift produces byte-identical artifacts.
+    `git commit` reports "nothing to commit" with a NON-ZERO code; reading that
+    as a fault would narrate a failure every quiet night."""
+    repo = _git_repo_harness(tmp_path, dirty=False)
+    before = _git(repo, 'rev-parse', 'HEAD').stdout.strip()
+
+    result, _ = _run_wrapper_in_git_repo(tmp_path, repo)
+    assert result.returncode == 0, result.stderr
+    after = _git(repo, 'rev-parse', 'HEAD').stdout.strip()
+    assert after == before, 'an empty commit was created'
+    combined = result.stdout + result.stderr
+    assert 'commit=0' in combined, (
+        f'a no-drift night must not be narrated as a commit failure: '
+        f'{combined!r}')
+
+
+def test_wrapper_still_exits_zero_when_the_commit_cannot_happen(tmp_path):
+    """Same oneshot contract as the other two halves: a commit failure is
+    narrated, never propagated, or the timer wedges in `failed` state and the
+    trend quietly ends. Exercised with $REPO not a git repo at all -- which is
+    also the state every other wrapper test runs in."""
+    result, calls = _run_wrapper(tmp_path)          # plain tmp dir, no .git
+    assert result.returncode == 0, (
+        f'stdout={result.stdout!r} stderr={result.stderr!r}')
+    # Both halves still ran; the commit step aborted neither.
+    assert [c['who'] for c in calls] == ['CENSUS', 'STAMP'], calls
+
+
+def test_wrapper_commits_even_when_the_census_reported_a_shortfall(tmp_path):
+    """The census exits 1 by design when `coverage.complete` is false, and the
+    header is explicit that the artifacts still carry the evidence of the
+    shortfall. That evidence is exactly what must reach the repo."""
+    repo = _git_repo_harness(tmp_path)
+    before = _git(repo, 'rev-parse', 'HEAD').stdout.strip()
+    result, _ = _run_wrapper_in_git_repo(tmp_path, repo, census_exit=1)
+    assert result.returncode == 0, result.stderr
+
+    after = _git(repo, 'rev-parse', 'HEAD').stdout.strip()
+    assert after != before, (
+        'a shortfall night committed nothing — the evidence never reached '
+        'the repo')
+    committed = _git(repo, 'show', '--name-only', '--pretty=', 'HEAD').stdout
+    for rel in _ARTIFACTS:
+        assert rel in committed, f'{rel} missing from {committed!r}'
+
+
+def test_wrapper_narrates_the_commit_outcome_alongside_the_other_two(tmp_path):
+    """Exiting 0 must never mean the outcome is invisible -- the journal is the
+    only place this job is readable."""
+    repo = _git_repo_harness(tmp_path)
+    result, _ = _run_wrapper_in_git_repo(tmp_path, repo)
+    combined = result.stdout + result.stderr
+    assert 'census=0' in combined, combined
+    assert 'stamp=0' in combined, combined
+    assert 'commit=0' in combined, combined
+
+
+def test_wrapper_never_reaches_for_the_forbidden_git_verbs():
+    """`git stash` is banned in EVERY dark-factory checkout: refs/stash is a
+    single ref shared across all worktrees and the merge worker's advance path
+    also consumes it (incident 13674d3c68). `git add -A`/`git checkout` in the
+    main checkout would likewise act on another process's state."""
+    text = WRAPPER.read_text()
+    assert 'commit --only' in text, (
+        'the scoped-commit form is the whole point; a bare `git commit` would '
+        'sweep up a concurrent process staged work')
+    for forbidden in ('git stash', 'git add -A', 'git add .', 'git checkout',
+                      'git reset', 'commit -a'):
+        assert forbidden not in text, (
+            f'{forbidden!r} must never appear in a wrapper that runs '
+            f'unattended against the machine-operated main checkout')
