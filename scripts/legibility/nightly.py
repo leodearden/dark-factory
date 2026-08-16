@@ -590,15 +590,20 @@ def evaluate_census_step(
     try:
         decision = decide(cfg.project_root, now=now, status_fetcher=status_fetcher)
     except Exception as exc:  # noqa: BLE001 - the census trigger must never fail the run
+        # The exception text is BOUNDED before it reaches either sink, and both
+        # sinks are single-line: the WARNING becomes one nightly journal line,
+        # and `census_line` is a one-line field on `NightlyResult`. An escaping
+        # exception's message is arbitrary -- a `StatusFetchUnavailable`
+        # chained from a large get_statuses payload, or a multi-line YAML /
+        # pydantic error -- so it is truncated (and its newlines escaped) by
+        # census_trigger's own log-hygiene helper rather than a second copy of
+        # that logic here. Formatted once, so the two sinks cannot drift.
+        detail = f'{type(exc).__name__}: {census_trigger._bounded_repr(str(exc))}'
         logger.warning(
-            'census trigger evaluation failed (%s: %s) -- NO-FIRE; the nightly '
-            'run is unaffected', type(exc).__name__, exc,
+            'census trigger evaluation failed (%s) -- NO-FIRE; the nightly '
+            'run is unaffected', detail,
         )
-        return (
-            f'census trigger: NO-FIRE -- trigger evaluation failed '
-            f'({type(exc).__name__}: {exc})',
-            False,
-        )
+        return f'census trigger: NO-FIRE -- trigger evaluation failed ({detail})', False
 
     line = 'census trigger: {} -- {}'.format(
         'FIRE' if decision.fire else 'NO-FIRE', '; '.join(decision.reasons),

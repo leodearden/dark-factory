@@ -1275,6 +1275,41 @@ def test_decide_for_project_survives_a_raising_compute_tasks_landed(
     assert "baseline exploded" in warnings[0].getMessage()
 
 
+def test_decide_for_project_bounds_a_huge_tasks_landed_failure(
+    tmp_path, caplog, monkeypatch
+):
+    """task 4085 (amendment): the guard above must keep this module's
+    one-WARNING-one-line discipline. A `StatusFetchUnavailable` chained from a
+    big get_statuses payload carries an arbitrarily large message, and this
+    WARNING lands in the nightly journal as a single line."""
+    _write_codebook(tmp_path)
+    _write_census_state(
+        tmp_path,
+        last_census_at=(NOW - timedelta(days=9)).isoformat(),
+        last_census_report="plans/confusion-census-prior.md",
+        last_census_done_count=500,
+    )
+
+    def _boom(*, state, status_fetcher):
+        raise ct.StatusFetchUnavailable("payload " + "x" * 50_000 + "\nsecond line")
+
+    monkeypatch.setattr(ct, "compute_tasks_landed", _boom)
+
+    with caplog.at_level(logging.WARNING):
+        decision = ct.decide_for_project(
+            tmp_path, now=NOW, status_fetcher=_wrapped_fetcher(_done_statuses(550))
+        )
+
+    assert decision.fire is False
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert len(message) < 1000
+    assert "\n" not in message
+    assert "StatusFetchUnavailable" in message
+    assert "repr truncated" in message
+
+
 # ---------------------------------------------------------------------------
 # step-19: RED — CLI `evaluate` subcommand (always exits 0, fail-safe)
 # ---------------------------------------------------------------------------

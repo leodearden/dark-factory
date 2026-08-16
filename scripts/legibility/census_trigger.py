@@ -1279,11 +1279,17 @@ def decide_for_project(
     try:
         tasks_landed = compute_tasks_landed(state=state, status_fetcher=status_fetcher)
     except Exception as exc:  # noqa: BLE001 - a fail-safe decision must never crash the caller
+        # `_bounded_repr(str(exc))`, not a bare `exc`: an escaping exception's
+        # message is arbitrary (a chained fetch failure can carry a whole
+        # get_statuses payload) and this WARNING is re-emitted as ONE nightly
+        # journal line, exactly like every other message in this module. The
+        # repr also escapes embedded newlines, so a multi-line exception text
+        # cannot break the one-line guarantee either.
         logger.warning(
             "tasks-landed computation failed unexpectedly (%s) -- condition (b) "
             "fails safe (no fire); conditions (a)/(c) are unaffected: %s",
             type(exc).__name__,
-            exc,
+            _bounded_repr(str(exc)),
         )
         # `None`, never `0` and never a re-raise: `evaluate()` already renders
         # None as "tasks-landed: delta unavailable ... -> N/A", so condition (b)

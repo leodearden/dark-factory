@@ -960,6 +960,41 @@ def test_evaluate_census_step_survives_a_raising_decide(tmp_path, caplog):
     assert 'TypeError' in warnings[0].getMessage()
 
 
+def test_evaluate_census_step_bounds_a_huge_decide_failure(tmp_path, caplog):
+    """task 4085 (amendment): the fail-safe path must keep the module's
+    one-line guarantee. `decide` is an injected seam and an escaping
+    exception's message is arbitrary -- a StatusFetchUnavailable chained from
+    a big get_statuses payload, a multi-line YAML error -- yet BOTH sinks here
+    are single-line: the WARNING is one nightly journal line and `census_line`
+    is a one-line field on NightlyResult. Dumping a whole payload into either
+    is the opposite of the legible failure this trigger exists for."""
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
+
+    def fake_decide(project_root, *, now=None, status_fetcher=None):
+        raise RuntimeError('boom ' + 'x' * 50_000 + '\nsecond line')
+
+    with caplog.at_level('WARNING', logger='legibility.nightly'):
+        line, fire = nightly.evaluate_census_step(
+            cfg, now=None, status_fetcher=None, decide=fake_decide,
+            entrypoint_exists=lambda: True, launcher=lambda: None,
+        )
+
+    assert fire is False
+    # Bounded, still well-formed, and still names the fault.
+    assert len(line) < 1000
+    assert line.startswith('census trigger: NO-FIRE -- trigger evaluation failed')
+    assert 'RuntimeError' in line
+    assert 'repr truncated' in line
+    # One line means one line: the repr escapes the embedded newline.
+    assert '\n' not in line
+
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert len(message) < 1000
+    assert '\n' not in message
+
+
 def test_default_census_launcher_logs_loud_on_nonzero_exit(monkeypatch, caplog):
     """A non-zero census subprocess exit must be logged LOUD (naming the
     returncode) rather than silently discarded -- the silent-census incident
