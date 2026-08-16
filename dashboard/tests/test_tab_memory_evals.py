@@ -1137,6 +1137,267 @@ def test_every_presence_contract_is_consumed_over_comment_stripped_source() -> N
 
 
 # ---------------------------------------------------------------------------
+# Forbidden-pattern contracts and their comment-injection guard (task 3471)
+# ---------------------------------------------------------------------------
+
+# The mirror image of `_PRESENCE_CONTRACTS`.  A presence grep over raw source
+# passes when it should fail; a FORBIDDEN-pattern grep over raw source fails
+# when it should pass — the same defect, opposite sign, and the more corrosive
+# of the two, because it punishes the operator for writing an accurate comment.
+# A guard that rejects `trend.values.filter(Boolean)` is right to; a guard that
+# also rejects the SENTENCE "we never call trend.values.filter(Boolean)" has
+# made the file's own explanation of an invariant into a violation of it, and
+# teaches the next author to delete the explanation.
+#
+# This is not hypothetical here: the .jsx carries ~150 lines of prose whose
+# whole job is naming what the render code must not do.  Two of these guards
+# had already been moved onto comment-stripped source for exactly this reason
+# (see `test_no_client_side_alarm_derivation`); the rest had not.
+#
+# Nothing a guard REJECTS changes — only which text it reads.  That is safe in
+# a way the presence direction is not: a violation is by definition executable,
+# so it cannot hide inside a comment.
+#
+# Entry: (label, ((pattern, what), ...), an accurate comment, flags).
+_FINGERPRINT_PARSE: tuple[tuple[str, str], ...] = tuple(
+    (rf'{field}\s*{op}', f'`{field}` is {verb}')
+    for field in ('dedupe_fingerprint', 'fingerprint')
+    for op, verb in (
+        (r'\.split\(', 'split'),
+        (r'\.slice\(', 'sliced'),
+        (r'\.match\(', 'matched'),
+        (r'\.substring\(', 'taken apart with substring()'),
+    )
+)
+
+_SYNTHETIC_ZERO: tuple[tuple[str, str], ...] = tuple(
+    (rf'\.\s*{field}\s*\|\|\s*0\b', f'`{field}` is defaulted with `|| 0`')
+    for field in ('current_value', 'value', 'n', 'denominator', 'alarm_count')
+)
+
+_FORBIDDEN_PATTERNS: tuple[
+    tuple[str, tuple[tuple[str, str], ...], str, int], ...
+] = (
+    (
+        'trend series is never compacted',
+        (
+            # a chart fed a transformed series rather than the payload array itself
+            (r'values\s*=\s*\{[^}\n]*\.\s*(?:filter|flatMap|reduce)\(', 'a chart is fed a transformed series'),
+            # `.filter(Boolean)` drops nulls AND legitimate zeroes
+            (r'trend\.(?:values|labels)\s*\.\s*(?:filter|flatMap)\(\s*Boolean\s*\)', '.filter(Boolean) drops holes'),
+            # a keep-the-non-nulls predicate — the dropping shape.  Note `!==`, not
+            # `===`: `.filter(v => v === null).length` COUNTS holes and is fine.
+            (
+                r'trend\.(?:values|labels)\s*\.\s*filter\([^)\n]*!==?\s*(?:null|undefined)',
+                'a null-dropping filter predicate',
+            ),
+            (r'trend\.(?:values|labels)\s*\.\s*flatMap\(', 'flatMap can drop elements'),
+        ),
+        '// Never compacted: trend.values.filter(Boolean) drops a real 0, '
+        'trend.values.filter(v => v !== null) drops the holes the shared x-axis '
+        'needs, trend.values.flatMap(x => x) can drop silently, and '
+        'values={trend.values.reduce(f, [])} feeds the chart something other '
+        'than the payload array.',
+        0,
+    ),
+    (
+        # Consumed at TWO render sites (the gap-suppression test and the
+        # empty-series one).  Tabling it also collapses a spelling that was
+        # written out twice and could have been hardened in only one place.
+        'no chart render site is gated on Chart alone',
+        ((r'\{\s*Chart\s*(?:\?|&&)(?![^\n]*\bgaps\b)', 'a bare `Chart` gate'),),
+        '// The render site is never {Chart && ...} or {Chart ? ...} on its '
+        'own — the hole count has to be in the gate, or a holed series reaches '
+        'the primitive and charts.jsx draws the null as a plunge to the floor.',
+        0,
+    ),
+    (
+        'the escalation projection has no url',
+        ((r'escalation\s*\.\s*url\b', 'the UI reads a `url` off the projection'),),
+        '// There is no escalation.url — the projection carries six keys and '
+        'the affordance is built here from escalation.id.',
+        0,
+    ),
+    (
+        'fingerprints are rendered whole',
+        _FINGERPRINT_PARSE,
+        '// Rendered whole: dedupe_fingerprint.split(...), '
+        'dedupe_fingerprint.slice(...), dedupe_fingerprint.match(...) and '
+        'dedupe_fingerprint.substring(...) would all couple this file to a '
+        "format the producer owns and may change.",
+        0,
+    ),
+    (
+        'absent scalars are dashed, never zeroed',
+        _SYNTHETIC_ZERO,
+        '// dash() everywhere: m.current_value || 0, m.value || 0, m.n || 0, '
+        'm.denominator || 0 and storm.alarm_count || 0 would each render an '
+        'absent measurement as a measured zero.',
+        0,
+    ),
+    (
+        'the artifact issues notice is never collapsed',
+        (
+            (
+                r'<details[^>]*>\s*<summary[^>]*>\s*\{?[^<]{0,40}issue',
+                'the issues notice is wrapped in a <details>',
+            ),
+        ),
+        '// Expanded by default: <details><summary>issues</summary> would hide '
+        'a degraded state behind a click, which is the silent degradation the '
+        'notice exists to prevent.',
+        re.IGNORECASE,
+    ),
+)
+
+
+def _forbidden_patterns(label: str) -> tuple[tuple[str, str, int], ...]:
+    """The `_FORBIDDEN_PATTERNS` entry for *label*, as (pattern, what, flags).
+
+    Flags travel WITH the pattern rather than being restated at the call site:
+    one of these guards is case-insensitive and the rest are not, and a flag
+    dropped at the call site is a guard quietly weakened with no test failing.
+    """
+    for entry_label, patterns, _comment, flags in _FORBIDDEN_PATTERNS:
+        if entry_label == label:
+            return tuple((pattern, what, flags) for pattern, what in patterns)
+    raise AssertionError(
+        f'no _FORBIDDEN_PATTERNS entry labelled {label!r} — an assertion is '
+        'rejecting something no table describes, so nothing checks that an '
+        'accurate comment survives it.'
+    )
+
+
+def _with_injected_comment(body: str, comment: str) -> str:
+    """Splice *comment* into *body* as a real line of the module.
+
+    Spliced mid-file rather than appended so the injected prose is surrounded
+    by code on both sides: several of these patterns contain `\\s*`, which
+    spans newlines, so a comment adjacent to code is a strictly harder case
+    than one alone at the end of the file.
+    """
+    marker = '= window.DF_DATA;'
+    assert marker in body, (
+        f'{marker!r} is gone from tab_memory_evals.jsx, so the injection point '
+        'below no longer exists. Re-anchor to any module-top-level statement — '
+        'the requirement is only that the comment lands between two lines of '
+        'real code.'
+    )
+    eol = body.index('\n', body.index(marker))
+    return body[: eol + 1] + comment + '\n' + body[eol + 1 :]
+
+
+# The one shape a live forbidden-pattern assertion may take: patterns, their
+# description and their flags all come from the table, and the search runs over
+# the comment-stripped `code`.
+_FORBIDDEN_CONSUMPTION_SHAPE = (
+    r'for\s+(\w+)\s*,\s*\w+\s*,\s*(\w+)\s+in\s+_forbidden_patterns\('
+    r'\s*[\'"]{label}[\'"]\s*\)\s*:([\s\S]{{0,400}})'
+)
+
+
+def test_an_accurate_comment_never_fails_a_forbidden_pattern_guard(
+    tab_memory_evals_jsx_body: str,
+) -> None:
+    """Prose that names a forbidden construct must not BE one.
+
+    The rule this enforces is already the file's own, stated at the chart-
+    library guard: "a comment that merely NAMES a library is prose, not a
+    dependency, and must not fail the build."  It was applied there, and to the
+    two alarm-derivation guards, one site at a time.  This closes the class.
+
+    Two arms per contract, and the first is what stops the second being a
+    tautology:
+
+    (1) ANTI-VACUITY — the injected comment must actually TRIP the pattern when
+        the source is read raw.  Without this the test would pass for a comment
+        that says nothing, and would prove only that stripping removes text.
+        A green arm (1) is the measurement that the guard really was
+        over-strict: this exact sentence, describing the invariant accurately,
+        was a build failure.
+    (2) the same pattern must NOT match once comments are stripped — the view
+        the live assertion is required to read.
+
+    Note what is NOT done here: no regex is made prose-tolerant.  Stripping is
+    the whole mechanism.  A pattern loosened to "match code but not English"
+    would be guessing at English, and the first violation written in an
+    unanticipated style would walk straight through it.
+    """
+    body = tab_memory_evals_jsx_body
+    strip = r'/\*[\s\S]*?\*/|//[^\n]*'
+
+    for label, patterns, comment, flags in _FORBIDDEN_PATTERNS:
+        assert comment.lstrip().startswith('//'), (
+            f'[{label}] the injected comment is not a comment — it would land in '
+            'the .jsx as executable text and both arms below would be about '
+            'something other than prose.'
+        )
+        mutated = _with_injected_comment(body, comment)
+        stripped = re.sub(strip, '', mutated)
+
+        for pattern, what in patterns:
+            assert re.search(pattern, mutated, flags), (
+                f'[{label}] the injected comment does not trip {pattern!r} '
+                f'({what}) even in RAW source, so arm (2) proves nothing for this '
+                'pattern — stripping cannot remove a match that was never there. '
+                'Write a comment that genuinely names the forbidden construct.'
+            )
+            assert not re.search(pattern, stripped, flags), (
+                f'[{label}] {pattern!r} ({what}) still matches after comments are '
+                'stripped, so an accurate comment is a build failure. The .jsx '
+                'exists to explain these invariants; a guard that forbids '
+                'explaining them teaches the next author to delete the '
+                'explanation instead.'
+            )
+
+
+def test_every_forbidden_contract_is_consumed_over_comment_stripped_source() -> None:
+    """Same front door as the presence table, for the same reason.
+
+    `test_an_accurate_comment_never_fails_a_forbidden_pattern_guard` proves the
+    tabled patterns are comment-safe.  That says nothing about the assertions
+    that actually run, unless those assertions are the tabled patterns — so
+    this reads this module's source and requires every entry to be consumed by
+    a real loop over `code`, with the table's own flags.
+
+    Checked at EVERY occurrence, not just the first: one of these contracts is
+    consumed at two render sites, and a second site left on `body` (or with the
+    flags dropped) is exactly the drift a table is supposed to make impossible.
+    """
+    src = Path(__file__).read_text(encoding='utf-8')
+
+    for label, _patterns, _comment, _flags in _FORBIDDEN_PATTERNS:
+        shape = _FORBIDDEN_CONSUMPTION_SHAPE.format(label=re.escape(label))
+        sites = list(re.finditer(shape, src))
+        assert sites, (
+            f'[{label}] is in _FORBIDDEN_PATTERNS but no assertion consumes it via '
+            '`for <pattern>, <what>, <flags> in _forbidden_patterns('
+            f'{label!r}):`. The contract is comment-tested and then ignored — '
+            'whatever assertion really rejects this is greping a pattern nothing '
+            'checks.'
+        )
+        for site in sites:
+            pattern_var, flags_var, block = site.group(1), site.group(2), site.group(3)
+            call = re.search(
+                rf're\.search\(\s*{re.escape(pattern_var)}\s*,\s*(\w+)\s*,'
+                rf'\s*{re.escape(flags_var)}\s*\)',
+                block,
+            )
+            assert call is not None, (
+                f'[{label}] consumes the table but does not then call '
+                f'`re.search({pattern_var}, code, {flags_var})`. Both the pattern '
+                'and its flags must reach the search, or the table describes a '
+                'guard that is not the one running.'
+            )
+            assert call.group(1) == 'code', (
+                f'[{label}] is searched over {call.group(1)!r}, not the comment-'
+                'stripped `code` fixture. Over the raw body this guard rejects the '
+                '.jsx prose that describes the invariant, so documenting the rule '
+                'breaks the build and deleting the documentation fixes it.'
+            )
+
+
+# ---------------------------------------------------------------------------
 # step-5 tests: tab_memory_evals.jsx is served and renders eval cards + trends
 # ---------------------------------------------------------------------------
 
