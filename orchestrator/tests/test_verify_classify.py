@@ -827,13 +827,17 @@ _SLOT_TIMEOUT_LANE_X_OUTPUT = (
     '(LOCK=/tmp/reify-lane-x.lock)\n'
 )
 
-# reify companion task — NOT emitted by reify today (verified by grep over
-# reify `scripts/` on 2026-08-05). Same column-0, first-token `@@REIFY_*@@`
-# emission contract as scripts/lib_clock_stop.sh:141, so DF can detect it the
-# moment reify starts emitting it. This asserts DF's OWN classifier behaviour
-# on an anchored line — a capability this task delivers and verifies
-# first-hand — NOT that reify emits the line; it is a COMPLEMENT to the three
-# grounded anchors above and never the sole positive.
+# task 4212 update: this shape predates reify 6024's `disposition` field
+# (invented by task 3679, before reify emitted `@@REIFY_SLOT_TIMEOUT@@` at
+# all — same column-0, first-token `@@REIFY_*@@` emission contract as
+# scripts/lib_clock_stop.sh:141). It is retained DELIBERATELY, now doing
+# double duty as the FIELD-ABSENT / older-reify compatibility shape: a
+# sentinel line with no `disposition=` token at all. reify's emit is
+# prefix-compatible with the anchor, so this must keep classifying
+# SEMAPHORE_TIMEOUT unchanged — see
+# `_has_fatal_slot_timeout_sentinel`'s fail-safe-direction docstring
+# (verify_classify.py) and
+# ``TestFieldAbsentSlotTimeoutSentinelStaysSemaphoreTimeout`` below.
 _SLOT_TIMEOUT_SENTINEL_OUTPUT = (
     '@@REIFY_SLOT_TIMEOUT@@ reason=test_slot_starvation waited=1800s pid=4711\n'
 )
@@ -877,6 +881,7 @@ _ANCHORED_SLOT_TIMEOUT_SHAPES: list[tuple[str, str]] = [
     ('occt', _SLOT_TIMEOUT_OCCT_OUTPUT),
     ('lane_x', _SLOT_TIMEOUT_LANE_X_OUTPUT),
     ('sentinel', _SLOT_TIMEOUT_SENTINEL_OUTPUT),
+    ('sentinel_fatal', _SLOT_TIMEOUT_FATAL_SENTINEL_OUTPUT),
     ('unlimited_wait', _SLOT_TIMEOUT_UNLIMITED_WAIT_OUTPUT),
     ('indented', _SLOT_TIMEOUT_INDENTED_OUTPUT),
 ]
@@ -1015,6 +1020,41 @@ class TestGroundedSlotTimeoutMarkersAreDetected:
         assert result != FailureCategory.SEMAPHORE_TIMEOUT, (
             f'a mid-line quotation of the wrapper deadline text must not '
             f'classify semaphore_timeout, got {result!r}'
+        )
+
+
+class TestFieldAbsentSlotTimeoutSentinelStaysSemaphoreTimeout:
+    """task 4212 regression pin: a sentinel line carrying NO ``disposition``
+    field at all — ``_SLOT_TIMEOUT_SENTINEL_OUTPUT``, invented by task 3679
+    before reify 6024 landed the field — must keep classifying
+    SEMAPHORE_TIMEOUT unchanged.
+
+    Named explicitly, rather than left to be inferred from the
+    ``'sentinel'`` entry in ``_ANCHORED_SLOT_TIMEOUT_SHAPES`` (which already
+    covers this case via ``TestGroundedSlotTimeoutMarkersAreDetected``
+    above), because reify's ``@@REIFY_SLOT_TIMEOUT@@`` emit is
+    PREFIX-COMPATIBLE with the anchor: an older reify build, or any future
+    producer that omits the ``disposition`` field, must keep being detected
+    exactly as before this task landed. That additive-compatibility
+    guarantee is a property worth a reader finding by name, not just by
+    corpus membership.
+
+    GREEN ON ARRIVAL BY DESIGN, same precedent as
+    ``TestAnchoredSlotTimeoutWithCollateralIsEnvTransient`` (task 4126): the
+    defect here would be missing PROTECTION of behavior steps 2/4 already
+    get right, not wrong behavior, so there is no failing assertion to
+    author. See the task-4212 step-5 commit message for the two recorded
+    mutation-kills that supply the RED half — treating any disposition field
+    as soft (which this class's case would flip to ``unknown_test_failure``
+    only indirectly, via the ``sentinel_fatal`` corpus entry) and treating a
+    field-ABSENT sentinel as soft (which flips this exact case)."""
+
+    def test_field_absent_sentinel_is_semaphore_timeout(self):
+        result = _classify(ToolKind.OPAQUE, _SLOT_TIMEOUT_SENTINEL_OUTPUT, 1, False)
+        assert result == FailureCategory.SEMAPHORE_TIMEOUT, (
+            f'a @@REIFY_SLOT_TIMEOUT@@ sentinel with no disposition field '
+            f'must keep classifying semaphore_timeout (older-reify / '
+            f'additive-field compatibility), got {result!r}'
         )
 
 
