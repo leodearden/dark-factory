@@ -535,26 +535,53 @@ def test_executed_for_touched_is_hermetic_against_the_ambient_orch_config_path(
         'routing is reading the ambient environment'
     )
 
-    # The three legs, each asserted non-None and TARGETING this module, for the
-    # reason the lint/type gate tests below exist: a None command is not a
-    # deferral, it is DELETED gating that reports green (see _VACUOUS_PASS,
-    # quoted into each message below).
+    # The three legs, each asserted non-None and TARGETING the file that
+    # changed, for the reason the lint/type gate tests below exist: a None
+    # command is not a deferral, it is DELETED gating that reports green (see
+    # _VACUOUS_PASS, quoted into each message below).
+    #
+    # SCOPED ON SAMPLE_TOUCHED_FILE, NOT ON MODULE_PREFIX (task 3703 amendment
+    # pass, reviewer-flagged). MODULE_PREFIX here is the bare string 'scripts',
+    # which is a SUBSTRING of the near-homograph sibling tree SIBLING_TESTS_DIR
+    # — so `MODULE_PREFIX in cmd` is satisfied by a command targeting ONLY
+    # tests/scripts/ and cannot tell the two trees apart, in the one file where
+    # that confusion is the documented realistic defect (see SIBLING_PREFIX).
+    # These three assertions therefore added less than they appeared to. The
+    # touched file is rooted at OWN_TESTS_DIR and discriminates outright; it is
+    # also the exact token the sibling gate tests below pin, because all three
+    # legs render FILE_SCOPED for this diff (measured through the production
+    # bridge: `pytest|ruff check|pyright scripts/tests/test_census_trigger.py`).
+    #
+    # What this does NOT buy is copy-paste detection, and it does not claim to:
+    # under a FILE_SCOPED render _scope_prefix_to_keyword REPLACES the declared
+    # targets with the touched-file list, so a config carrying the copy-pasted
+    # tests/scripts/ targets renders byte-identically — the reason assertion (4)
+    # of test_scripts_diff_is_lint_gated records at length, and why that claim
+    # lives on the DECLARED value in its assertion (5). The load-bearing
+    # discriminators for THIS test are executed.prefix above and the module
+    # budget below, neither of which the sibling config could satisfy.
     assert executed.test_command is not None and 'pytest' in executed.test_command, (
         f'executed test_command is {executed.test_command!r} under a poisoned '
         f'ORCH_CONFIG_PATH (task 3703); {MODULE_PREFIX} must run its own suite '
         f'regardless of what the ambient environment points at: {_VACUOUS_PASS}'
     )
-    assert MODULE_PREFIX in executed.test_command, (
-        f'executed test_command {executed.test_command!r} does not target '
-        f'{MODULE_PREFIX}/ under a poisoned ORCH_CONFIG_PATH (task 3703)'
+    assert SAMPLE_TOUCHED_FILE in executed.test_command, (
+        f'executed test_command {executed.test_command!r} does not target the '
+        f'touched file {SAMPLE_TOUCHED_FILE!r} under a poisoned '
+        f'ORCH_CONFIG_PATH (task 3703). Asserted on the file rather than on a '
+        f'bare {MODULE_PREFIX!r} substring, which a command targeting only '
+        f'{SIBLING_TESTS_DIR!r} would also satisfy'
     )
     assert executed.lint_command is not None and 'ruff' in executed.lint_command, (
         f'executed lint_command is {executed.lint_command!r} under a poisoned '
         f'ORCH_CONFIG_PATH (task 3703): {_VACUOUS_PASS}'
     )
-    assert MODULE_PREFIX in executed.lint_command, (
-        f'executed lint_command {executed.lint_command!r} does not target '
-        f'{MODULE_PREFIX}/ under a poisoned ORCH_CONFIG_PATH (task 3703)'
+    assert SAMPLE_TOUCHED_FILE in executed.lint_command, (
+        f'executed lint_command {executed.lint_command!r} does not target the '
+        f'touched file {SAMPLE_TOUCHED_FILE!r} under a poisoned '
+        f'ORCH_CONFIG_PATH (task 3703). Asserted on the file rather than on a '
+        f'bare {MODULE_PREFIX!r} substring, which a command targeting only '
+        f'{SIBLING_TESTS_DIR!r} would also satisfy'
     )
     assert (
         executed.type_check_command is not None
@@ -563,9 +590,12 @@ def test_executed_for_touched_is_hermetic_against_the_ambient_orch_config_path(
         f'executed type_check_command is {executed.type_check_command!r} under '
         f'a poisoned ORCH_CONFIG_PATH (task 3703): {_VACUOUS_PASS}'
     )
-    assert MODULE_PREFIX in executed.type_check_command, (
+    assert SAMPLE_TOUCHED_FILE in executed.type_check_command, (
         f'executed type_check_command {executed.type_check_command!r} does not '
-        f'target {MODULE_PREFIX}/ under a poisoned ORCH_CONFIG_PATH (task 3703)'
+        f'target the touched file {SAMPLE_TOUCHED_FILE!r} under a poisoned '
+        f'ORCH_CONFIG_PATH (task 3703). Asserted on the file rather than on a '
+        f'bare {MODULE_PREFIX!r} substring, which a command targeting only '
+        f'{SIBLING_TESTS_DIR!r} would also satisfy'
     )
 
     # The module budget survives too: the figure must come from THIS module's
@@ -1389,14 +1419,32 @@ def test_root_fleet_chain_and_scripts_module_agree_on_the_scripts_suites(
 # both have under-sized the floor.
 MEASURED_SUITE_WORST_SECS = 930.59
 # DERIVED from MEASURED_SUITE_WORST_SECS, not hand-set, so the two cannot
-# silently diverge — this exact pair has already rotted once: the sibling
-# tests/scripts/test_tests_scripts_module_config.py still hard-codes its
-# MIN_MODULE_BUDGET_SECS against a 127.0s worst run while its
-# tests/scripts/orchestrator.yaml has since recorded 233.50s as the worst
-# measured run, and nothing caught the drift (task 3458 amendment pass,
-# reviewer-flagged; the sibling file is out of this task's locked scope, so
-# it is filed as a follow-up rather than fixed here). ~2x the worst observed
-# run, rounded DOWN to the nearest 100s: 2 * 930.59 -> 1861.18 -> 1800.
+# silently diverge — that exact pair has already rotted once, in the sibling
+# guard tests/scripts/test_tests_scripts_module_config.py, which left a
+# HAND-SET floor standing against a stale worst-run figure while its own
+# tests/scripts/orchestrator.yaml had since recorded a worse one, and nothing
+# in the repo could fail on the drift (task 3458 amendment pass,
+# reviewer-flagged; the sibling was out of THAT task's locked scope, so it was
+# filed as a follow-up rather than fixed there).
+#
+# THAT FOLLOW-UP IS TASK 3703, AND IT LANDED — so the paragraph above is
+# HISTORY, not current state: the sibling now pins its MEASURED_SUITE_WORST_SECS
+# to a recorded run of its own VERBATIM test_command and DERIVES its floor from
+# it by this same expression, so that yaml's worst figure is gated. Corrected in
+# place rather than deleted, because the rot is why this constant is derived at
+# all; corrected rather than left standing, because an authoritative-reading
+# comment that a later change has falsified is precisely the defect both tasks
+# exist to remove — and this one had already been falsified by its own
+# follow-up (task 3703 amendment pass, reviewer-flagged).
+#
+# NO FIGURE OF THE SIBLING'S IS REPEATED HERE, deliberately. Cross-module
+# provenance has ONE home — the MEASURED_BY_SIBLING_GUARD table in
+# tests/scripts/test_module_verify_budgets.py — so that a re-measurement over
+# there does not have to be chased into this comment, which is the lockstep
+# duplication that table's own comment exists to refuse.
+#
+# ~2x the worst observed run, rounded DOWN to the nearest 100s:
+# 2 * 930.59 -> 1861.18 -> 1800.
 MIN_MODULE_BUDGET_SECS = (int(2 * MEASURED_SUITE_WORST_SECS) // 100) * 100
 
 
