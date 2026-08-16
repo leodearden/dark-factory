@@ -221,12 +221,16 @@ _ORCH_UNITS_ARRAY_RE = re.compile(
     r"^_orch_units=\(\n(?P<body>.*?)^\)$", re.MULTILINE | re.DOTALL
 )
 
-# The two statements that make the array MEAN something. Splitting the old
-# both-endpoints-anchored `cp` regex into "what is declared" + "what the loop
-# does with it" preserves exactly what that regex bought: a unit named in the
-# array but never copied, or copied somewhere other than $UNIT_DIR, is as
-# uninstalled as a unit nobody listed at all.
-_INSTALL_LOOP_HEADER = 'for _unit in "${_orch_units[@]}"; do'
+# The four statements that make the array MEAN something. Replacing the old
+# both-endpoints-anchored `cp` regex with this chain preserves everything that
+# regex bought and adds the per-unit link: a unit named in the array but never
+# judged, never added to the cleared set, or copied somewhere other than
+# $UNIT_DIR, is as uninstalled as a unit nobody listed at all.
+#
+#   declaration  ->  per-unit decision  ->  cleared set  ->  copy
+_DECISION_LOOP_HEADER = 'for _unit in "${_orch_units[@]}"; do'
+_INSTALL_LIST_APPEND = '_orch_install_units+=("$_unit")'
+_INSTALL_LOOP_HEADER = 'for _unit in "${_orch_install_units[@]}"; do'
 _INSTALL_LOOP_CP = 'cp "$REPO_ROOT/scripts/$_unit" "$UNIT_DIR/"'
 
 
@@ -339,30 +343,50 @@ def test_the_install_loop_actually_consumes_the_declared_unit_array():
     declared, registered, checked, and never installed, and every test here
     would still be green.
 
-    Two statements are asserted, and together they reconstruct exactly what the
+    Four statements are asserted, and together they reconstruct everything the
     old both-endpoints-anchored `cp` regex bought before section 5 was made
-    declarative: the loop iterates THE ARRAY (not some other list), and its
-    body copies into $UNIT_DIR (not a staging path, which would leave the unit
-    just as uninstalled as no copy at all).
+    declarative, plus the per-unit link the gate now depends on:
+
+        declaration -> per-unit decision -> cleared set -> copy into $UNIT_DIR
+
+    Break any one link and the array stops meaning "these units get installed":
+    a decision loop over some other list judges the wrong units, an install
+    loop over `_orch_units` rather than the cleared set installs the skipped
+    ones, and a copy to a staging path leaves the unit as uninstalled as no
+    copy at all.
 
     Read through the comment-stripped view so a `cp` shown as an EXAMPLE in the
     section's header prose cannot satisfy it.
     """
-    statements = _shell_statements(_orchestrator_install_block(_setup_host_text()))
+    statements = _shell_statements(_installer_section())
 
-    assert _INSTALL_LOOP_HEADER in statements, (
-        f"{SETUP_HOST_PATH} does not iterate its own `_orch_units` array to "
-        f"install the units. Expected the statement:\n    {_INSTALL_LOOP_HEADER}\n"
-        "Without it the array is documentation, and the registry staleness "
-        f"guard above is derived from documentation.\nBlock statements: {statements}"
-    )
-    assert _INSTALL_LOOP_CP in statements, (
-        f"{SETUP_HOST_PATH}'s install loop does not copy into $UNIT_DIR. "
-        f"Expected the statement:\n    {_INSTALL_LOOP_CP}\n"
-        "The destination is asserted, not just the source: a copy to a staging "
-        "path leaves the unit as uninstalled as no copy at all."
-        f"\nBlock statements: {statements}"
-    )
+    for expected, why in (
+        (
+            _DECISION_LOOP_HEADER,
+            "nothing walks the declared `_orch_units` array, so the array is "
+            "documentation — and the registry staleness guard above is derived "
+            "from documentation",
+        ),
+        (
+            _INSTALL_LIST_APPEND,
+            "the per-unit decision never adds a cleared unit to "
+            "`_orch_install_units`, so the decision has no effect",
+        ),
+        (
+            _INSTALL_LOOP_HEADER,
+            "the install loop does not iterate the CLEARED set, so a unit the "
+            "gate declined would be copied anyway",
+        ),
+        (
+            _INSTALL_LOOP_CP,
+            "the install loop does not copy into $UNIT_DIR; the destination is "
+            "asserted, not just the source",
+        ),
+    ):
+        assert expected in statements, (
+            f"{SETUP_HOST_PATH}: {why}.\nExpected the statement:\n"
+            f"    {expected}\nSection statements: {statements}"
+        )
 
 
 # ---------------------------------------------------------------------------

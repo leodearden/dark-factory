@@ -247,9 +247,20 @@ _orch_units=(
   orchestrator-watchdog.timer                    # 60s liveness probe + dead-enabled revival: the safety net that revives an orchestrator killed by e.g. a boot-race dependency cancel
 )
 
-# 1 => the units were NOT verified as safe to overwrite (drift, unverifiable
-# state, or the gate itself did not run). Consumed by the install block below.
+# 1 => the run as a WHOLE reported something unverifiable. Still used for the
+# operator-facing summary below; the install decision itself is per-unit.
 _orch_install_blocked=0
+
+# unit -> the comma-joined verdict kinds the gate reported for it. A unit
+# ABSENT from this map has no verdict and is treated as `unverified` below,
+# which is BLOCKING: the states that produce no verdict line (checker missing,
+# renamed, run without --print-verdicts, or simply not knowing that unit) all
+# mean "nothing was checked", and installing on the strength of nothing is the
+# silent-drift failure this gate exists to catch.
+declare -A _orch_verdict=()
+# Initialised before the branch so the parse below is safe under `set -u` even
+# when the checker was missing and the else-branch never ran.
+_orch_parity_out=""
 
 if [ ! -f "$_orch_parity_script" ]; then
   fail "Orchestrator parity gate missing: $_orch_parity_script"
@@ -258,7 +269,8 @@ if [ ! -f "$_orch_parity_script" ]; then
 else
   _orch_parity_out="$(python3 "$_orch_parity_script" \
        --installed-dir "$UNIT_DIR" \
-       --repo-root     "$REPO_ROOT" 2>&1)" && _orch_parity_exit=0 || _orch_parity_exit=$?
+       --repo-root     "$REPO_ROOT" \
+       --print-verdicts 2>&1)" && _orch_parity_exit=0 || _orch_parity_exit=$?
   printf '%s\n' "$_orch_parity_out"
 
   if ! printf '%s\n' "$_orch_parity_out" | grep -q '\[orchestrator_unit_parity\]'; then
@@ -290,17 +302,78 @@ fi
 # host, so copying them would break those orchestrators on their next restart.
 # The gate stays non-fatal (it never aborts the run; sections below still
 # execute), it just declines to act on an unverified diff without being told.
-if [ "$_orch_install_blocked" -eq 1 ] && [ "${DF_INSTALL_ORCH_UNITS:-0}" != "1" ]; then
-  warn "SKIPPING the orchestrator unit install — nothing copied, nothing"
-  warn "  enabled, the installed units are UNCHANGED. Read the report above and"
-  warn "  reconcile whichever side is wrong, then re-run. To install anyway:"
+# Parse the machine-readable verdict lines the gate just printed.
+#
+# `while read` fed by a HERE-STRING, never `... | while read`: a pipeline runs
+# the loop body in a SUBSHELL, so every _orch_verdict[...] assignment would be
+# discarded when it exits and every unit would silently fall through to
+# `unverified`. That is a fail-safe-SHAPED bug — it installs nothing and looks
+# exactly like a gate finding — so it would survive a casual read of the output.
+# `|| true` keeps a grep that matches nothing from tripping set -e/pipefail.
+while read -r _tag _kw _unit _kinds; do
+  [ "$_kw" = verdict ] || continue
+  _orch_verdict["$_unit"]="$_kinds"
+done <<< "$(printf '%s\n' "$_orch_parity_out" \
+            | grep -F '[orchestrator_unit_parity] verdict ' || true)"
+
+# Operator-facing phrasing for each BLOCKING verdict kind. The kinds come from
+# VERDICT_KINDS in check_orchestrator_unit_parity.py, and a cross-artifact test
+# asserts every member has an arm here — a kind that fell through to `*)` would
+# produce a warning naming no actionable cause.
+#
+# Defined HERE, inside the region the behavioural tests slice and execute, not
+# near the top of this script: a helper defined above the slice would be
+# undefined at run time and kill the run under set -u/set -e.
+_orch_skip_reason() {
+  case ",$1," in
+    *,vanished,*)
+      printf '%s' "there is no committed copy to install FROM (see the [vanished] report)" ;;
+    *,unreadable,*)
+      printf '%s' "its unit file exists but could not be read or decoded (see the [unreadable] report)" ;;
+    *,drift,*,override,*)
+      printf '%s' "byte-drift against the committed copy AND a drop-in override" ;;
+    *,drift,*)
+      printf '%s' "byte-drift against the committed copy — reconcile the directive, checking WHICH side is correct" ;;
+    *,override,*)
+      printf '%s' "a drop-in override; inspect with: systemctl --user cat $2" ;;
+    *,unverified,*)
+      printf '%s' "the parity gate returned no verdict for this unit — it did not run, or does not know it" ;;
+    *)
+      printf '%s' "an unhandled verdict kind '$1'; this installer does not know what that means, so it declined to act" ;;
+  esac
+}
+
+# The per-unit install decision. This is what the task bought: a unit is judged
+# on ITS OWN verdict, so one drifted or drop-in'd unit no longer declines the
+# install of all nine. The POLICY is unchanged and still ratified — a unit that
+# did not clear is never overwritten without DF_INSTALL_ORCH_UNITS=1, because
+# drift does not tell you which side is stale — only the blast radius shrinks.
+#
+# `clean` and `absent` are the two install-eligible kinds, and the checker
+# guarantees neither ever appears alongside a blocking one, so an exact match
+# on the whole kind string is the right test.
+_orch_install_units=()
+for _unit in "${_orch_units[@]}"; do
+  _kinds="${_orch_verdict[$_unit]:-unverified}"
+  if [ "${DF_INSTALL_ORCH_UNITS:-0}" = "1" ] || [ "$_kinds" = clean ] || [ "$_kinds" = absent ]; then
+    _orch_install_units+=("$_unit")
+  else
+    warn "SKIPPING $_unit — $(_orch_skip_reason "$_kinds" "$_unit"); its installed copy is UNCHANGED"
+  fi
+done
+
+if [ "${#_orch_install_units[@]}" -eq 0 ]; then
+  warn "SKIPPING the orchestrator unit install — NO unit cleared the gate, so"
+  warn "  nothing was copied, nothing enabled, the installed units are"
+  warn "  UNCHANGED. Read the report above and reconcile whichever side is"
+  warn "  wrong, then re-run. To install anyway:"
   warn "    DF_INSTALL_ORCH_UNITS=1 bash scripts/setup-host.sh"
 else
-  if [ "$_orch_install_blocked" -eq 1 ]; then
+  if [ "$_orch_install_blocked" -eq 1 ] && [ "${DF_INSTALL_ORCH_UNITS:-0}" = "1" ]; then
     warn "DF_INSTALL_ORCH_UNITS=1 — installing over the reported drift"
   fi
 
-  for _unit in "${_orch_units[@]}"; do
+  for _unit in "${_orch_install_units[@]}"; do
     cp "$REPO_ROOT/scripts/$_unit" "$UNIT_DIR/"
   done
 

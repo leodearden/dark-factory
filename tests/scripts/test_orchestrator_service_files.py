@@ -827,7 +827,12 @@ _ORCH_UNITS_ARRAY_RE = re.compile(
     r"^_orch_units=\(\n(?P<body>.*?)^\)$", re.MULTILINE | re.DOTALL
 )
 
-_INSTALL_LOOP_HEADER = 'for _unit in "${_orch_units[@]}"; do'
+# declaration -> per-unit gate decision -> cleared set -> copy.  A unit listed
+# in an array nothing walks, or copied from a list the gate never filtered, is
+# as badly wired as a unit nobody listed.
+_DECISION_LOOP_HEADER = 'for _unit in "${_orch_units[@]}"; do'
+_INSTALL_LIST_APPEND = '_orch_install_units+=("$_unit")'
+_INSTALL_LOOP_HEADER = 'for _unit in "${_orch_install_units[@]}"; do'
 _INSTALL_LOOP_CP = f'cp "$REPO_ROOT/scripts/$_unit" "{_UNIT_DIR_VAR}/"'
 # The enable obligation is decided at RUN TIME from the unit's own [Install]
 # section — the same rule _unit_has_install_section expresses here in Python —
@@ -944,17 +949,32 @@ def test_setup_host_installs_every_orchestrator_unit(
         f"it to the array:\n    {basename}\nDeclared today: {sorted(declared)}"
     )
 
-    assert _INSTALL_LOOP_HEADER in SETUP_HOST_STATEMENTS, (
-        f"{SETUP_HOST_SH.name} declares `_orch_units` but nothing iterates it, so "
-        f"listing {basename} there installs nothing. Expected the statement:\n"
-        f"    {_INSTALL_LOOP_HEADER}"
-    )
-    assert _INSTALL_LOOP_CP in SETUP_HOST_STATEMENTS, (
-        f"{SETUP_HOST_SH.name}'s install loop does not copy into {_UNIT_DIR_VAR}. "
-        "The destination is asserted, not just the source: a cp of the template "
-        "to a staging path or any other directory leaves the unit just as "
-        f"uninstalled as no cp at all. Expected:\n    {_INSTALL_LOOP_CP}"
-    )
+    for expected, why in (
+        (
+            _DECISION_LOOP_HEADER,
+            "declares `_orch_units` but nothing iterates it, so listing "
+            f"{basename} there installs nothing",
+        ),
+        (
+            _INSTALL_LIST_APPEND,
+            "never adds a unit that cleared the parity gate to "
+            "`_orch_install_units`, so nothing is ever queued for install",
+        ),
+        (
+            _INSTALL_LOOP_HEADER,
+            "does not install from the CLEARED set, so the per-unit gate "
+            "decision has no effect on what reaches the host",
+        ),
+        (
+            _INSTALL_LOOP_CP,
+            f"does not copy into {_UNIT_DIR_VAR}; the destination is asserted, "
+            "not just the source, because a cp of the template to a staging "
+            "path leaves the unit just as uninstalled as no cp at all",
+        ),
+    ):
+        assert expected in SETUP_HOST_STATEMENTS, (
+            f"{SETUP_HOST_SH.name} {why}. Expected the statement:\n    {expected}"
+        )
 
     content = service_path.read_text(encoding="utf-8")
     if not _unit_has_install_section(content):
