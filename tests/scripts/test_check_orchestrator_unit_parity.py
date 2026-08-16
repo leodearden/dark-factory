@@ -2222,6 +2222,99 @@ def test_a_usage_error_does_not_read_as_not_installed_here(
     ) == before
 
 
+# A `_orch_skip_reason` case arm: `*,drift,*)` / `*,drift,*,override,*)`.
+_SKIP_ARM_RE = re.compile(r"^\s*(\*,[a-z,*]+,\*)\)\s*$", re.M)
+# A literal kind named in the install-eligible condition: `[ "$_kinds" = clean ]`.
+_INSTALL_ELIGIBLE_RE = re.compile(r'\[\s*"\$_kinds"\s*=\s*([a-z]+)\s*\]')
+
+
+def _skip_arm_kinds(section: str) -> set[str]:
+    """Kinds named by `_orch_skip_reason`'s case arms."""
+    return {
+        kind
+        for arm in _SKIP_ARM_RE.findall(section)
+        for kind in re.findall(r"[a-z]+", arm)
+    }
+
+
+def _install_eligible_kinds(section: str) -> set[str]:
+    """Kinds the install condition accepts literally."""
+    return set(_INSTALL_ELIGIBLE_RE.findall(section))
+
+
+def test_setup_host_handles_every_verdict_kind_the_checker_can_emit():
+    """CROSS-ARTIFACT: the checker's vocabulary and the shell's arms agree.
+
+    The two artifacts are coupled by a string protocol with no compiler between
+    them. A kind added to VERDICT_KINDS later — by someone reading only the
+    checker — reaches setup-host.sh's `*)` fallback, and the operator gets a
+    unit skipped for a cause the installer cannot name. That is the precise
+    shape of silent degradation these gates exist to prevent: the install still
+    "works", it just quietly stops doing something, and the one line that could
+    have explained it says nothing actionable.
+
+    Kinds are matched by PARSING the case arms and the install condition, not
+    by searching the region for the word. The region's comments name every kind
+    repeatedly, so a substring check would pass on documentation alone —
+    exactly the vacuous guard this is meant not to be.
+    """
+    checker = _load_checker()
+    section = _installer_section()
+
+    # Guard the guard: every assertion below is over a derived set, and an
+    # empty derivation would pass while checking nothing.
+    assert section.strip(), "The installer section sliced EMPTY."
+    assert "_orch_skip_reason" in section, (
+        "The sliced region does not contain _orch_skip_reason — the slice "
+        "anchors have drifted off the block this test is about."
+    )
+    assert checker.VERDICT_KINDS, "VERDICT_KINDS is empty"
+
+    arms = _skip_arm_kinds(section)
+    eligible = _install_eligible_kinds(section)
+    assert arms, (
+        "Parsed ZERO case arms out of _orch_skip_reason. Fix the arm regex — "
+        "do NOT weaken this test; a zero-arm parse makes every assertion below "
+        "vacuously true."
+    )
+    assert eligible, (
+        "Parsed ZERO kinds out of the install-eligible condition. Fix the "
+        "regex rather than dropping the assertion."
+    )
+
+    unhandled = sorted(set(checker.VERDICT_KINDS) - arms - eligible)
+    assert not unhandled, (
+        f"check_orchestrator_unit_parity.VERDICT_KINDS can emit {unhandled}, "
+        "which setup-host.sh neither treats as install-eligible nor phrases in "
+        "_orch_skip_reason. Add a case arm (or name it in the install "
+        "condition) — otherwise a unit is skipped with a warning that names no "
+        "actionable cause."
+    )
+
+    # The shell-only kind: no verdict line at all. It never appears in
+    # VERDICT_KINDS (the checker cannot emit "I said nothing"), so it would be
+    # invisible to the loop above — and it is the single most likely kind an
+    # operator actually meets, since it is what a missing or older checker
+    # produces for every unit at once.
+    assert "unverified" in arms, (
+        "setup-host.sh's `unverified` default — a unit with NO verdict line — "
+        "has no _orch_skip_reason arm, so the most common real-world skip "
+        "would fall through to the unhandled-kind fallback."
+    )
+
+    assert "clean" in eligible and "absent" in eligible, (
+        "The two install-eligible kinds are no longer named literally in the "
+        f"install condition (found {sorted(eligible)}), so this guard can no "
+        "longer tell an install-eligible kind from an unhandled one."
+    )
+
+    assert re.search(r"^\s*\*\)\s*$", section, re.M), (
+        "_orch_skip_reason has no `*)` fallback arm. Under a future kind the "
+        "case would fall through and print nothing at all, leaving the warning "
+        "reading 'SKIPPING <unit> — ; its installed copy is UNCHANGED'."
+    )
+
+
 def test_setup_host_parses_cleanly():
     """`bash -n scripts/setup-host.sh` — the added block must not break the script."""
     result = subprocess.run(
