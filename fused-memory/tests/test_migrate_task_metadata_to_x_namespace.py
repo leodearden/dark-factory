@@ -788,3 +788,68 @@ async def test_documented_per_task_rerun_keeps_the_true_pre_migration_backup(
     run_2 = json.loads(written[1].read_text())['metadata']
     assert 'x_origin_escalation' in run_2, 'run 2 captured the partially-migrated row'
     assert 'origin_reify_task' in run_2
+
+
+def test_write_backup_refuses_to_overwrite_an_existing_snapshot(tmp_path):
+    """The stamped default does not cover an explicit `--backup-path`.
+
+    Reusing one path across runs is the obvious habit once you have used the
+    flag at all, and a same-second re-run collides on the stamp too. Both land
+    on an occupied path, where the earlier file may be the TRUE pre-migration
+    row — so the write is refused rather than silently replaced.
+
+    `isinstance(exc, OSError)` is load-bearing, not ceremony: `main_async`
+    already wraps `write_backup` in `except OSError` and turns any failure
+    into "Refusing to write without a recoverable snapshot" BEFORE
+    `update_task` is reached. A refusal outside that hierarchy would escape as
+    a traceback while the write went ahead — reintroducing exactly the class
+    of failure this guard exists to close.
+    """
+    path = tmp_path / 'nested' / 'before.json'
+    true_pre_migration_row = _deep_copy(_PENDING_TASK_ROW)
+    already_migrated_row = _deep_copy(_PENDING_TASK_ROW)
+    already_migrated_row['metadata'] = {
+        'x_origin_escalation': already_migrated_row['metadata']['origin_escalation'],
+    }
+
+    write_backup(path, true_pre_migration_row)
+
+    with pytest.raises(FileExistsError) as caught:
+        write_backup(path, already_migrated_row)
+
+    assert isinstance(caught.value, OSError), 'main_async catches OSError, so this must be one'
+    assert str(path) in str(caught.value)
+
+    survivor = json.loads(path.read_text())
+    assert survivor == true_pre_migration_row, 'the earlier snapshot must survive intact'
+    assert 'origin_escalation' in survivor['metadata']
+
+
+@pytest.mark.asyncio
+async def test_main_async_refuses_the_write_when_the_backup_path_is_already_taken(
+    monkeypatch, tmp_path, capsys,
+):
+    """An occupied backup path must stop the run BEFORE update_task.
+
+    The whole point of the snapshot is that the write is never attempted
+    without a recoverable copy of the row. Refusing to overwrite is only safe
+    if it is also fatal — a refusal that let the write proceed would leave the
+    operator with a committed change and someone else's backup.
+    """
+    client = _install_fake_client(monkeypatch, _FakeClient())
+    occupied = tmp_path / 'before.json'
+    sentinel = '{"an earlier run": "wrote this"}'
+    occupied.write_text(sentinel)
+
+    args = build_parser().parse_args([
+        '--task-id', '3083', '--keys', 'origin_escalation',
+        '--apply', '--backup-path', str(occupied),
+    ])
+
+    assert await _mod.main_async(args) == 1
+    assert 'update_task' not in client.tools_called, 'no write without a fresh snapshot'
+
+    err = capsys.readouterr().err
+    assert str(occupied) in err
+    assert 'Refusing to write without a recoverable snapshot' in err
+    assert occupied.read_text() == sentinel, 'the occupying file is left byte-identical'
