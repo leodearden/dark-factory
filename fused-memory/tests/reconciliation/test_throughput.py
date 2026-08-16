@@ -8,6 +8,7 @@ remediation duty cycle, and the pure capacity arithmetic.
 
 from __future__ import annotations
 
+import sqlite3
 import uuid
 from datetime import UTC, datetime
 
@@ -20,7 +21,9 @@ from fused_memory.models.reconciliation import (
     ReconciliationEvent,
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
+from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.throughput import (
+    drain_stats,
     inflow_daily,
     inflow_hourly,
     utc_hour_bucket,
@@ -43,9 +46,51 @@ def _make_event(
     )
 
 
+def _insert_run(
+    db_path,
+    *,
+    project_id: str = 'reify',
+    run_type: str = 'full',
+    trigger_reason: str = 'quiescence',
+    started_at: str,
+    completed_at: str | None,
+    events_processed: int = 0,
+) -> None:
+    """Insert one `runs` row directly, for exact control over the timestamps.
+
+    The schema comes from the real ReconciliationJournal (see the recon_db
+    fixture), so these rows are shaped exactly like production ones.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """INSERT INTO runs
+                   (id, project_id, run_type, trigger_reason, started_at,
+                    completed_at, events_processed, status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                str(uuid.uuid4()), project_id, run_type, trigger_reason,
+                started_at, completed_at, events_processed,
+                'running' if completed_at is None else 'completed',
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 @pytest_asyncio.fixture
 async def recon_db(tmp_path):
-    """A real reconciliation.db with the EventBuffer schema applied."""
+    """A real reconciliation.db with BOTH the journal and EventBuffer schemas.
+
+    Production puts `runs` (journal.py) and `event_buffer` (event_buffer.py)
+    in the same reconciliation.db file, so the report reads one path; this
+    fixture reproduces that layout rather than a synthetic one.
+    """
+    journal = ReconciliationJournal(tmp_path)
+    await journal.initialize()
+    await journal.close()
+
     buf = EventBuffer(db_path=tmp_path / 'reconciliation.db')
     await buf.initialize()
     yield buf
@@ -236,3 +281,170 @@ async def test_inflow_daily_composition_survives_the_rollup_boundary(recon_db):
         'memory_added': 2,
         'task_modified': 2,
     }
+
+
+# ── drain_stats ────────────────────────────────────────────────────────
+#
+# ADDENDUM 2's observed sequence, verbatim (2026-07-25, project reify).  Each
+# backlog chunk is immediately followed by a remediation pass that drained
+# zero events — the inline remediation tail of run_full_cycle — which is the
+# duty-cycle loss lever 1 exists to recover.
+_ADDENDUM_2_RUNS = [
+    # (run_type, trigger_reason, started_at, completed_at, events_processed)
+    ('full', 'backlog_chunk:1:393', '13:40:30', '13:56:24', 393),   # 954s
+    ('remediation', 'integrity_findings:2', '13:56:24', '14:09:00', 0),  # 756s
+    ('full', 'backlog_chunk:1:326', '14:13:36', '14:29:36', 326),   # 960s
+    ('remediation', 'integrity_findings:5', '14:29:41', '14:42:00', 0),  # 739s
+]
+
+
+def _t(hms: str) -> str:
+    """'13:40:30' -> the offset-bearing ISO8601 form the journal actually writes."""
+    return f'2026-07-25T{hms}+00:00'
+
+
+def _seed_addendum_2(db_path) -> None:
+    for run_type, reason, start, end, events in _ADDENDUM_2_RUNS:
+        _insert_run(
+            db_path, run_type=run_type, trigger_reason=reason,
+            started_at=_t(start), completed_at=_t(end), events_processed=events,
+        )
+
+
+@pytest.mark.asyncio
+async def test_drain_stats_classifies_the_four_run_modes(recon_db):
+    """Chunks, remediation, targeted and steady state land in distinct buckets."""
+    db = recon_db._db_path
+    _seed_addendum_2(db)
+    _insert_run(
+        db, trigger_reason='quiescence',
+        started_at=_t('15:00:00'), completed_at=_t('15:15:45'), events_processed=50,
+    )  # 945s steady state
+    _insert_run(
+        db, run_type='targeted', trigger_reason='task_status_changed',
+        started_at=_t('15:01:00'), completed_at=_t('15:01:30'), events_processed=1,
+    )
+
+    stats = drain_stats(db, 'reify')
+    modes = stats['modes']
+
+    assert modes['backlog_chunk']['run_count'] == 2
+    assert modes['backlog_chunk']['events'] == 719
+    assert modes['backlog_chunk']['wall_clock_seconds'] == pytest.approx(1914.0)
+
+    assert modes['remediation']['run_count'] == 2
+    assert modes['remediation']['events'] == 0
+    assert modes['remediation']['wall_clock_seconds'] == pytest.approx(1495.0)
+
+    assert modes['steady_state']['run_count'] == 1
+    assert modes['steady_state']['events'] == 50
+    assert modes['steady_state']['wall_clock_seconds'] == pytest.approx(945.0)
+    assert modes['steady_state']['seconds_per_event'] == pytest.approx(18.9)
+
+    assert modes['targeted']['run_count'] == 1
+    assert modes['targeted']['wall_clock_seconds'] == pytest.approx(30.0)
+
+
+@pytest.mark.asyncio
+async def test_drain_stats_does_not_classify_final_consolidation_as_a_chunk(recon_db):
+    """'backlog_final_consolidation' is a steady-state run, not a chunk.
+
+    Only trigger_reason values that literally start with 'backlog_chunk:' are
+    chunks.  The final consolidation pass runs AFTER the chunks with a drained
+    buffer, so folding it into the chunk bucket would understate chunk
+    throughput and hide the pass whose whole purpose is to let remediation
+    resume.
+    """
+    db = recon_db._db_path
+    _insert_run(
+        db, trigger_reason='backlog_final_consolidation',
+        started_at=_t('16:00:00'), completed_at=_t('16:10:00'), events_processed=12,
+    )
+
+    modes = drain_stats(db, 'reify')['modes']
+    assert modes['backlog_chunk']['run_count'] == 0
+    assert modes['steady_state']['run_count'] == 1
+    assert modes['steady_state']['events'] == 12
+
+
+@pytest.mark.asyncio
+async def test_drain_stats_excludes_in_flight_runs_from_wall_clock(recon_db):
+    """(a) completed_at IS NULL contributes no wall-clock but IS counted in-flight."""
+    db = recon_db._db_path
+    _insert_run(
+        db, trigger_reason='quiescence',
+        started_at=_t('15:00:00'), completed_at=_t('15:15:45'), events_processed=50,
+    )
+    _insert_run(
+        db, trigger_reason='quiescence',
+        started_at=_t('15:20:00'), completed_at=None, events_processed=0,
+    )
+
+    stats = drain_stats(db, 'reify')
+    assert stats['runs_in_flight'] == 1
+    assert stats['modes']['steady_state']['wall_clock_seconds'] == pytest.approx(945.0)
+    assert stats['modes']['steady_state']['run_count'] == 1, (
+        'an unfinished run has no measurable wall-clock and must not dilute the average'
+    )
+
+
+@pytest.mark.asyncio
+async def test_drain_stats_excludes_targeted_from_the_drain_capacity_totals(recon_db):
+    """(b) Targeted runs hold no lock and execute concurrently (ADDENDUM 2 finding 5).
+
+    They are reported separately so an operator can see them, but they consume
+    no drain capacity, so counting their wall-clock against the drain budget
+    would understate the pipeline's real throughput.
+    """
+    db = recon_db._db_path
+    _seed_addendum_2(db)
+    baseline = drain_stats(db, 'reify')
+
+    for i in range(5):
+        _insert_run(
+            db, run_type='targeted', trigger_reason='task_status_changed',
+            started_at=_t(f'15:0{i}:00'), completed_at=_t(f'15:0{i}:40'),
+            events_processed=3,
+        )
+    after = drain_stats(db, 'reify')
+
+    assert after['drain_wall_clock_seconds'] == baseline['drain_wall_clock_seconds']
+    assert after['drain_events'] == baseline['drain_events']
+    assert after['modes']['targeted']['run_count'] == 5
+    assert after['modes']['targeted']['wall_clock_seconds'] == pytest.approx(200.0)
+    assert after['drain_wall_clock_seconds'] == pytest.approx(3409.0)
+    assert after['drain_events'] == 719
+
+
+@pytest.mark.asyncio
+async def test_drain_stats_seconds_per_event_is_none_for_zero_event_modes(recon_db):
+    """(c) A zero-event remediation mode reports None, never a ZeroDivisionError."""
+    db = recon_db._db_path
+    _seed_addendum_2(db)
+
+    modes = drain_stats(db, 'reify')['modes']
+    assert modes['remediation']['events'] == 0
+    assert modes['remediation']['seconds_per_event'] is None
+    # An entirely absent mode is present-but-empty, also with None.
+    assert modes['targeted']['run_count'] == 0
+    assert modes['targeted']['seconds_per_event'] is None
+    assert modes['backlog_chunk']['seconds_per_event'] == pytest.approx(1914.0 / 719)
+
+
+@pytest.mark.asyncio
+async def test_drain_stats_scopes_by_project_and_since(recon_db):
+    """Rows are filtered by project and by an inclusive started_at floor."""
+    db = recon_db._db_path
+    _seed_addendum_2(db)
+    _insert_run(
+        db, project_id='other', trigger_reason='quiescence',
+        started_at=_t('13:40:30'), completed_at=_t('13:56:24'), events_processed=999,
+    )
+
+    assert drain_stats(db, 'reify')['drain_events'] == 719
+    assert drain_stats(db, 'other')['drain_events'] == 999
+
+    later = drain_stats(db, 'reify', since='2026-07-25T14:00:00+00:00')
+    assert later['modes']['backlog_chunk']['run_count'] == 1
+    assert later['modes']['backlog_chunk']['events'] == 326
+    assert later['modes']['remediation']['run_count'] == 1
