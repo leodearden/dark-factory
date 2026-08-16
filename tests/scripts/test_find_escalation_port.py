@@ -45,9 +45,11 @@ binding or subprocess patching, so no interaction with this module is expected.
 
 import contextlib
 import importlib.util
+import io
 import pathlib
 import socket
 import subprocess
+import sys
 import types
 
 import pytest  # pyright: ignore[reportMissingImports]
@@ -963,3 +965,83 @@ def test_is_bound_leaves_nothing_behind(fep: types.ModuleType) -> None:
 
     assert fep.is_bound(port) is False
     assert fep.is_bound(port) is False, "is_bound saw its own leftover probe socket"
+
+
+# ---------------------------------------------------------------------------
+# main() driver — hermetic, with the stdout/stderr split captured exactly
+# ---------------------------------------------------------------------------
+
+
+def _run_main(
+    fep: types.ModuleType,
+    argv: list[str],
+    *,
+    bound: frozenset = frozenset(),
+) -> tuple[int, str, str]:
+    """Run ``main()`` hermetically; return ``(rc, stdout, stderr)``.
+
+    THREE THINGS THIS DOES, EACH LOAD-BEARING:
+
+    1. Patches ``sys.argv``. ``main()`` calls ``parse_args()`` with no argument, so
+       there is no other way to drive it.
+    2. Rebinds the MODULE ATTRIBUTE ``fep.is_bound`` to a predicate over *bound*.
+       REQUIRED, not a convenience — see the measurement in
+       ``test_is_bound_tracks_a_real_listener``: the live probe makes results depend
+       on this host's process table. The module attribute is the right patch point
+       because ``main()`` resolves ``is_bound`` as a global at call time; patching
+       ``socket`` instead would leave the real bind path running.
+    3. Captures stdout and stderr SEPARATELY, because the whole design of this script
+       is that the evidence table goes to stderr and only the port goes to stdout.
+
+    The other machine dependency (systemctl) is the caller's job via ``no_systemd``.
+
+    ``main()`` returns an int — ``raise SystemExit(main())`` lives under the
+    ``__main__`` guard — so no ``pytest.raises(SystemExit)`` is needed here. An
+    argparse ERROR path would still raise SystemExit, so an invalid-argument case
+    added later must wrap this call accordingly.
+    """
+    out, err = io.StringIO(), io.StringIO()
+    saved_argv, saved_is_bound = sys.argv, fep.is_bound
+    try:
+        sys.argv = ["find_escalation_port.py", *argv]
+        fep.is_bound = lambda port: port in bound
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = fep.main()
+    finally:
+        sys.argv = saved_argv
+        fep.is_bound = saved_is_bound
+    return rc, out.getvalue(), err.getvalue()
+
+
+def _claiming_tree(tmp_path: pathlib.Path, claims: dict) -> tuple[pathlib.Path, pathlib.Path]:
+    """``_project_tree`` plus a config in each named sibling claiming a port.
+
+    ``claims`` maps a sibling directory name to the escalation port its config
+    declares. Every config is built by ``_config_body``, so each also carries a decoy
+    ``dashboard: port: 9999`` — meaning these allocation tests would break if the
+    block slicing regressed, not only if the allocation logic did.
+    """
+    parent, df_root = _project_tree(tmp_path)
+    for name, port in claims.items():
+        _write_config(parent / name, "dark-factory-orchestrator.yaml", _config_body(port))
+    return parent, df_root
+
+
+def test_run_main_driver_reproduces_the_measured_allocation(
+    fep: types.ModuleType, no_systemd: None, tmp_path: pathlib.Path
+) -> None:
+    """Verify the driver end-to-end before the allocation tests lean on it.
+
+    RE-MEASURED at base ``fc6f048b55`` with both machine dependencies patched:
+    ``--df-root <tmp>/dark-factory --base 8100`` with proj-a claiming 8100 and target
+    claiming 8101 returns ``(0, "8102\\n")``.
+    """
+    _parent, df_root = _claiming_tree(tmp_path, {"proj-a": 8100, "target": 8101})
+
+    rc, out, err = _run_main(fep, ["--df-root", str(df_root), "--base", "8100"])
+
+    assert (rc, out) == (0, "8102\n")
+    # The evidence table went to stderr, not stdout — the split this driver exists
+    # to observe.
+    assert "Escalation port survey" in err
+    assert "8102" in err
