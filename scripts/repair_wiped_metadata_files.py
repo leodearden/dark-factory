@@ -35,6 +35,17 @@ dials the server. Four gates stand between a candidate and a write:
 4. ``update_task(metadata_mode='merge')`` — shallow merge, never ``replace``.
    Replace is the wiper's own primitive and a repair must not use it.
 
+Gate 3's live re-read now fails LOUDLY. A re-read the server never usefully
+answered — a dead transport, or an empty/unreadable reply, both classified by
+``classify_reply`` — is reported as :data:`FAILED_LIVE_READ` and drives a
+non-zero exit (:data:`EXIT_LIVE_READ_FAILED`), instead of being filed as a
+benign :data:`SKIP_MISSING` indistinguishable from a task the server
+genuinely said is gone. This closes the "report a repair that never
+happened" gap for the READ path — the same gap ``classify_reply`` already
+closes for the WRITE path in ``repair_one``, where a write this script cannot
+confirm succeeded is reported as :data:`FAILED` rather than as a silent
+:data:`REPAIR`.
+
 Usage:
     python scripts/repair_wiped_metadata_files.py --project-root <root>          # dry run
     python scripts/repair_wiped_metadata_files.py --project-root <root> --apply  # write
@@ -266,7 +277,8 @@ SKIP_LOCK_LEVEL_FIDELITY: str = "skip_lock_level_fidelity"  # constraint 1, drop
 SKIP_LOCK_CHARTER: str = "skip_lock_charter"     # the interceptor would reject the files
 SKIP_NOT_TERMINAL: str = "skip_not_terminal"     # live task is not done/cancelled
 SKIP_FILES_PRESENT: str = "skip_files_present"   # already has a scope; re-run safe
-SKIP_MISSING: str = "skip_missing"               # live re-read returned nothing usable
+SKIP_MISSING: str = "skip_missing"               # the server CONFIRMED the task itself is gone (TaskNotFoundError)
+FAILED_LIVE_READ: str = "failed_live_read"       # re-read never confirmed the task's absence; candidate NEVER JUDGED
 FAILED: str = "failed"                           # the write was attempted and errored
 
 # Report order, and the exhaustive list the summary iterates. Printed in full
@@ -279,6 +291,7 @@ ALL_DISPOSITIONS: tuple[str, ...] = (
     SKIP_NOT_TERMINAL,
     SKIP_FILES_PRESENT,
     SKIP_MISSING,
+    FAILED_LIVE_READ,
     FAILED,
 )
 
@@ -286,6 +299,7 @@ ALL_DISPOSITIONS: tuple[str, ...] = (
 # aggregate "2 failed" tells an operator nothing they can act on.
 _ITEMISED_DISPOSITIONS: tuple[str, ...] = (
     FAILED,
+    FAILED_LIVE_READ,
     SKIP_LOCK_CHARTER,
     SKIP_CONTRADICTED,
     SKIP_LOCK_LEVEL_FIDELITY,
@@ -361,33 +375,97 @@ class RepairOutcome(NamedTuple):
     detail: str | None = None
 
 
-def _error_detail(result: object) -> str | None:
-    """Return an error description if *result* is an error-shaped reply, else None.
+class ReplyVerdict(NamedTuple):
+    """The result of classifying one MCP server reply.
+
+    ``ok`` mirrors ``fused_memory.middleware.task_interceptor.
+    interceptor_write_succeeded`` (fused-memory/src/fused_memory/middleware/
+    task_interceptor.py:5829-5868) — see :func:`classify_reply` for why this
+    is a TRANSCRIBED MIRROR, not an import, and for the full rule.
+
+    ``answered`` is the axis ``interceptor_write_succeeded`` has no need of:
+    whether the server explained ITSELF (an explicit ``error`` /
+    ``success: False`` marker) or said nothing usable at all (``{}``, or any
+    non-dict reply). It is NECESSARY BUT NOT SUFFICIENT for
+    :func:`repair_project`'s live re-read to treat a candidate as a benign,
+    named skip — see that function for the exact rule, which also inspects
+    the reply's ``error_type``: an answer is not by itself evidence the task
+    is gone, since ``@mcp_tool_errors`` gives a locked database or a timeout
+    the same shape as a real rejection.
+
+    ``detail`` is the operator-actionable reason for a non-``ok`` verdict,
+    and is ``None`` iff ``ok`` is ``True``.
+    """
+
+    ok: bool
+    answered: bool
+    detail: str | None
+
+
+def classify_reply(result: object) -> ReplyVerdict:
+    """Classify one MCP server reply: did it succeed, did the server answer, why not.
 
     The server ALWAYS reports a rejection by ANSWERING rather than raising:
     ``@mcp_tool_errors`` (fused-memory/src/fused_memory/server/tool_errors.py:44-59)
-    converts every exception into an ordinary reply dict, so nothing ever
-    crosses the wire as an exception. A bare truthiness check on the reply
-    would count an ``{"error": ...}`` body or a ``{"success": False}`` flag as a
-    repair that never happened, which is the silent fail-soft this script
-    exists to avoid. Anything else (including an empty dict, or a plain echoed
-    task) is a success: the ABSENCE of an error marker is not itself an error
-    marker.
+    converts every exception into an ordinary reply dict, so nothing
+    server-side ever crosses the wire as an exception. But the converse — a
+    reply this script cannot read as a positive success signal — is not
+    innocent either. This repo's canonical write-success contract,
+    ``interceptor_write_succeeded`` (fused-memory/src/fused_memory/middleware/
+    task_interceptor.py:5829-5868), treats an empty dict and any non-dict
+    response as **failure**. THIS REPLACES THIS FUNCTION'S OWN FORMER STANCE
+    — "the ABSENCE of an error marker is not itself an error marker" — which
+    was the bug: a wedged server that ACKs with a 202 or an empty body
+    reaches this script as literally ``{}``. See ``FusedMemoryClient._post``
+    (scripts/migrate_metadata_modules_to_files.py:89-90), which returns
+    ``{}`` for a 202 or an empty body, and ``call_tool`` (:126), which falls
+    through to ``result.get('result', {})`` when the reply carries neither
+    ``structuredContent`` nor text content — so ``{}`` is a genuinely
+    reachable shape through this script's own transport, not a hypothetical.
+    The old rule reported that reply, indistinguishable from a dead
+    transport, as a REPAIR that never happened.
 
-    ``error_type`` is included when present — it is the machine-readable half
-    of the reply (``TaskNotFoundError``, ``DuplicateCandidateKeyError``) and is
-    what an operator greps for.
+    ``answered`` exists for :func:`repair_project`'s live re-read, which must
+    tell a benign "the server explained itself" skip apart from "the server
+    never answered usefully at all" — see that function's docstring.
+
+    THE CHECK ORDER IS LOAD-BEARING: not-a-dict first (nothing else can call
+    ``.get`` on it), then emptiness (a ``{}`` has neither an ``error`` nor a
+    ``success`` key and would otherwise fall through to the ok branch), and
+    only then the error/success probes.
+
+    ``error_type`` is included in the detail when present — it is the
+    machine-readable half of the reply (``TaskNotFoundError``,
+    ``DuplicateCandidateKeyError``) and is what an operator greps for.
     """
     if not isinstance(result, dict):
-        return None
+        raw = repr(result)
+        if len(raw) > 200:
+            raw = raw[:200] + "…"
+        return ReplyVerdict(
+            False, False, f"server reply was not a dict: {type(result).__name__}: {raw}"
+        )
+    if not result:
+        return ReplyVerdict(
+            False,
+            False,
+            "server reply was empty ({}) — it carries no positive write signal",
+        )
     if result.get("error"):
         error_type = result.get("error_type")
         named = f"{error_type}: " if error_type else ""
-        return f"server returned an error: {named}{result['error']}"
-    if result.get("success") is False:
+        return ReplyVerdict(
+            False, True, f"server returned an error: {named}{result['error']}"
+        )
+    if not result.get("success", True):
+        # `not result.get("success", True)` — not `is False` — so it matches
+        # interceptor_write_succeeded's own falsy rule
+        # (`bool(resp.get('success', True))`) exactly: `{'success': None}`,
+        # `{'success': 0}` and `{'success': ''}` are failures under that
+        # canonical contract too, not just a literal `False`.
         detail = result.get("error_type") or result.get("message") or result
-        return f"server reported failure: {detail}"
-    return None
+        return ReplyVerdict(False, True, f"server reported failure: {detail}")
+    return ReplyVerdict(True, True, None)
 
 
 async def repair_one(
@@ -451,14 +529,19 @@ async def repair_one(
             detail=f"{type(exc).__name__}: {exc}",
         )
 
-    detail = _error_detail(result)
-    if detail is not None:
+    verdict = classify_reply(result)
+    if not verdict.ok:
+        # BOTH failure classes land here: an explicit error/success:False
+        # payload, AND an empty/unanswered reply. A write this script cannot
+        # confirm succeeded IS a failed write — that is the whole of the
+        # empty-reply fix, and it is why repair_one has no `answered` branch
+        # the way repair_project's live re-read does.
         return RepairOutcome(
             task_id=candidate.task_id,
             tag=candidate.tag,
             disposition=FAILED,
             files=writable_plan_files(candidate),
-            detail=detail,
+            detail=verdict.detail,
         )
     # `files` is what was WRITTEN, not what was recovered — the summary prints
     # its length, and reporting a count the payload did not carry would be the
@@ -486,6 +569,29 @@ class RepairResult(NamedTuple):
     coverage: AuditCoverage
 
 
+# Error types the live re-read may answer with that assert a task's absence
+# with CONFIDENCE, as opposed to a backend or transport condition (a locked
+# database, a timeout, a ReconciliationBacklogExceeded — all wrapped into the
+# same answered shape by @mcp_tool_errors) that merely answers but says
+# nothing about whether the task exists. An ALLOWLIST, deliberately,
+# mirroring TERMINAL_STATUSES's reasoning above: an error_type this repair
+# does not recognise fails CLOSED (the candidate is reported as unjudged)
+# rather than being read as "task missing" on the strength of a bare
+# `answered=True`. TaskNotFoundError is the ONLY error get_task raises for a
+# definitive zero-row absence (sqlite_task_backend.py's get_task: "the query
+# executed successfully and found nothing" — a connect/execute outage is a
+# different exception, raised earlier, by ensure_connected()).
+_TASK_ABSENT_ERROR_TYPES: frozenset[str] = frozenset({"TaskNotFoundError"})
+
+# Tolerate a one-off blip (a single candidate timing out) but not an
+# unbounded retry against a transport that has already proven dead: the
+# client's timeout is 30s (migrate_metadata_modules_to_files.py), so
+# re-dialling for every remaining candidate in a 40+ candidate sweep can cost
+# 20+ minutes before the summary or exit code ever print. See the comment
+# above the loop in repair_project that trips on this.
+_MAX_CONSECUTIVE_LIVE_READ_FAILURES = 3
+
+
 async def repair_project(
     client: _ToolClient | None,
     project_root: str,
@@ -505,8 +611,15 @@ async def repair_project(
        rather than silently filtered away, so an exclusion is visible in the
        report as a decision rather than as an absence.
     3. ``plan_files_rejection_reason`` — the lock-charter pre-check.
-    4. A live ``get_task`` re-read per surviving candidate, then
-       ``classify_live_task``.
+    4. A live ``get_task`` re-read per surviving candidate, classified by
+       ``classify_reply`` and then, on an ``ok`` reply, ``classify_live_task``.
+       A candidate the server CONFIRMED is gone — an answered reply whose
+       ``error_type`` is in :data:`_TASK_ABSENT_ERROR_TYPES` — is a
+       :data:`SKIP_MISSING`. Every other case (an unanswered reply, a dead
+       transport, or an answered reply that says something OTHER than "this
+       task does not exist", e.g. a locked database) is a
+       :data:`FAILED_LIVE_READ`, because the run cannot claim to have
+       examined the candidate.
     5. On :data:`REPAIR` AND only when *apply* is true, ``repair_one``.
 
     Writes are SEQUENTIAL, not gathered. The interceptor serialises per-project
@@ -555,7 +668,13 @@ async def repair_project(
             )
         )
 
-    for candidate in repairable:
+    # Once the transport has proven dead _MAX_CONSECUTIVE_LIVE_READ_FAILURES
+    # times in a row, the loop below stops dialling and bulk-records every
+    # remaining candidate instead of re-attempting a get_task per candidate
+    # against a socket that has already announced itself as dead.
+    consecutive_transport_failures = 0
+
+    for index, candidate in enumerate(repairable):
         # (3) Lock-charter pre-check, before any network call.
         reason = plan_files_rejection_reason(candidate)
         if reason is not None:
@@ -606,17 +725,54 @@ async def repair_project(
                     "project_root": project_root,
                 },
             )
-        except Exception as exc:  # noqa: BLE001 — one unreadable task, not a batch abort
+        except Exception as exc:  # noqa: BLE001 — transport-only, by construction; see below
+            # This arm can ONLY be client-side/transport. The fused-memory
+            # tool layer never raises across the wire — @mcp_tool_errors
+            # (fused-memory/src/fused_memory/server/tool_errors.py:44-59)
+            # converts every server-side exception into an ordinary reply
+            # dict — so every server-side reason (TaskNotFoundError and
+            # friends) arrives as a REPLY and is classified below, leaving
+            # nothing but a dead socket / refused connection / timeout to
+            # reach this `except`. The batch is still NOT aborted (`continue`
+            # stays); what changes is only that the candidate is now counted
+            # as UNJUDGED (FAILED_LIVE_READ) rather than as a benign skip —
+            # SKIP_MISSING would put it in the same bucket as a task the
+            # server told us is genuinely gone, and silently exit 0.
+            consecutive_transport_failures += 1
             outcomes.append(
                 RepairOutcome(
                     task_id=candidate.task_id,
                     tag=candidate.tag,
-                    disposition=SKIP_MISSING,
+                    disposition=FAILED_LIVE_READ,
                     files=candidate.plan_files,
                     detail=f"live re-read failed: {type(exc).__name__}: {exc}",
                 )
             )
+            if consecutive_transport_failures >= _MAX_CONSECUTIVE_LIVE_READ_FAILURES:
+                # THE TRIP. The transport has failed enough times in a row
+                # that re-dialling for the rest of this project's candidates
+                # would only spend another timeout per candidate for no new
+                # information — record them all as unjudged, without another
+                # network call, and let the batch move on to the next root
+                # (main_async still summarises every one of these by id).
+                for skipped in repairable[index + 1 :]:
+                    outcomes.append(
+                        RepairOutcome(
+                            task_id=skipped.task_id,
+                            tag=skipped.tag,
+                            disposition=FAILED_LIVE_READ,
+                            files=skipped.plan_files,
+                            detail=(
+                                "live re-read: transport dead after "
+                                f"{consecutive_transport_failures} consecutive "
+                                "failures; not re-dialled"
+                            ),
+                        )
+                    )
+                break
             continue
+
+        consecutive_transport_failures = 0
 
         # The server NEVER raises across the wire — @mcp_tool_errors
         # (fused-memory/src/fused_memory/server/tool_errors.py:44-59) turns every
@@ -627,15 +783,35 @@ async def repair_project(
         # lands in SKIP_MISSING with a detail that explains nothing. Read the
         # reply's own explanation FIRST so the disposition carries the server's
         # reason, as RepairOutcome.detail's docstring promises it does.
-        live_error = _error_detail(live)
-        if live_error is not None:
+        verdict = classify_reply(live)
+        if not verdict.ok:
+            # `answered=True` alone is NOT evidence the task is gone — it
+            # only means the reply carried an explicit error/success:False
+            # marker, and @mcp_tool_errors (fused-memory/src/fused_memory/
+            # server/tool_errors.py:44-59) converts EVERY server-side
+            # exception into exactly that shape. A locked database, a
+            # timeout, a ReconciliationBacklogExceeded all "answer" with an
+            # error_type that says nothing about whether the task exists.
+            # TaskNotFoundError is the one exception get_task raises for a
+            # DEFINITIVE zero-row absence (sqlite_task_backend.py's
+            # get_task: "the query executed successfully and found nothing"
+            # — a connect/execute outage is a different exception, raised
+            # earlier, by ensure_connected()) — so only that error_type earns
+            # the benign, named SKIP_MISSING. Every other answered error, and
+            # every unanswered reply, is a candidate the run cannot claim to
+            # have examined.
+            disposition = (
+                SKIP_MISSING
+                if verdict.answered and live.get("error_type") in _TASK_ABSENT_ERROR_TYPES
+                else FAILED_LIVE_READ
+            )
             outcomes.append(
                 RepairOutcome(
                     task_id=candidate.task_id,
                     tag=candidate.tag,
-                    disposition=SKIP_MISSING,
+                    disposition=disposition,
                     files=candidate.plan_files,
-                    detail=f"live re-read: {live_error}",
+                    detail=f"live re-read: {verdict.detail}",
                 )
             )
             continue
@@ -842,6 +1018,7 @@ EXIT_WRITE_FAILED = 1          # at least one candidate FAILED to write
 EXIT_NO_ROOT = 2               # no project root resolved to a readable tasks.db
 EXIT_NOTHING_SCANNED = 3       # roots resolved but EVERY one was unreadable
 EXIT_SERVER_UNREACHABLE = 4    # --apply, but the MCP server never handshook
+EXIT_LIVE_READ_FAILED = 5      # the live re-read died mid-batch; candidates were left UNEXAMINED
 
 
 def _transport_error_types() -> tuple[type[BaseException], ...]:
@@ -907,9 +1084,11 @@ def _build_parser() -> argparse.ArgumentParser:
             "FAILED to write; 2 = no project root resolved to a readable "
             "tasks.db; 3 = roots resolved but EVERY one was unreadable, so "
             "nothing was examined; 4 = --apply, but the fused-memory MCP "
-            "server could not be reached (nothing was written). Never read 2, "
-            "3 or 4 as a clean run -- and note that only 1 ever means a write "
-            "was attempted and failed."
+            "server could not be reached (nothing was written); 5 = the "
+            "fused-memory server stopped answering mid-batch, so one or more "
+            "candidates were never examined (some writes may already have "
+            "landed). Never read 2, 3, 4 or 5 as a clean run -- and note that "
+            "only 1 ever means a write was attempted and failed."
         ),
     )
     parser.add_argument(
@@ -992,9 +1171,10 @@ async def main_async(args: argparse.Namespace) -> int:
             except transport_errors as exc:
                 # A down server is a NAMED outcome, not a traceback. The catch
                 # is scoped to the handshake alone — a transport failure
-                # mid-batch is already a per-task FAILED/SKIP_MISSING inside
-                # repair_project — so this code can only ever mean "never
-                # connected", i.e. nothing was written.
+                # mid-batch is already a per-task FAILED / FAILED_LIVE_READ
+                # inside repair_project (see :data:`EXIT_LIVE_READ_FAILED`)
+                # — so this code can only ever mean "never connected", i.e.
+                # nothing was written.
                 print(
                     "error: could not reach the fused-memory MCP server at "
                     f"{args.server_url}: {type(exc).__name__}: {exc}; NOTHING "
@@ -1036,7 +1216,23 @@ async def main_async(args: argparse.Namespace) -> int:
         for outcome in result.outcomes
         if outcome.disposition == FAILED
     )
-    return EXIT_WRITE_FAILED if failed else EXIT_OK
+    unread = sum(
+        1
+        for result in results
+        for outcome in result.outcomes
+        if outcome.disposition == FAILED_LIVE_READ
+    )
+    # Both counts are already fully summarised above (format_summary /
+    # format_json_summary print every failed_live_read task id regardless of
+    # which exit code wins) -- this precedence only decides what the ONE exit
+    # code reports. A rejected write outranks an unread candidate: 1 is the
+    # more actionable signal, and 5's own meaning -- "candidates were left
+    # unexamined" -- does not describe a failed write.
+    if failed:
+        return EXIT_WRITE_FAILED
+    if unread:
+        return EXIT_LIVE_READ_FAILED
+    return EXIT_OK
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1045,7 +1241,8 @@ def main(argv: list[str] | None = None) -> int:
     Exit codes: 0 = ran, nothing failed; 1 = at least one candidate FAILED to
     write; 2 = no project root resolved to a readable tasks.db; 3 = roots
     resolved but every one was unreadable; 4 = ``--apply`` could not reach the
-    MCP server.
+    MCP server; 5 = the MCP server stopped answering mid-batch, after the
+    handshake had already succeeded.
 
     EACH CODE DENOTES EXACTLY ONE OUTCOME. 2, 3 and 4 are distinct from 0 for
     the reason the audit distinguishes them: 0 would otherwise cover both
@@ -1054,7 +1251,12 @@ def main(argv: list[str] | None = None) -> int:
     run. They are distinct from 1 for the mirror-image reason — 1 is the
     operator's signal that a WRITE was attempted and rejected, and folding an
     unreadable database or a down server into it would send them hunting for a
-    failed write that never happened.
+    failed write that never happened. 5 is distinct from 4 by the same
+    reasoning, applied to the read path, and the asymmetry between the two is
+    the operator's whole re-run decision procedure: 4 means the handshake
+    never happened, so NOTHING was written; 5 means the handshake succeeded
+    and the server then stopped answering, so writes may ALREADY HAVE LANDED
+    and the remaining candidates are unknown.
     """
     args = _build_parser().parse_args(argv)
     try:
