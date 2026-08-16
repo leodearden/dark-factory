@@ -186,6 +186,26 @@ def _build_escalations(config) -> dict[str, Any]:
     return shape_escalations(build_escalation_queues(config), {})['ESCALATIONS']
 
 
+def _reach_kind(path: str) -> str:
+    """Bucket a walker path string into one of the three reach paths.
+
+    Closed vocabulary on purpose: a path the walker learns to emit but this
+    function does not know is an AssertionError, not a silently-uncounted
+    fourth reach path that the coverage precondition below would then never
+    notice was untested.
+    """
+    if path.startswith('evals['):
+        return 'metric_row'
+    if path.startswith('storm_escape'):
+        return 'storm_escape'
+    if path.startswith('unmatched_escalations['):
+        return 'unmatched'
+    raise AssertionError(
+        f'_iter_memory_eval_escalations emitted an unclassified reach path {path!r} — '
+        'add it here AND to the coverage precondition, or it goes unchecked.'
+    )
+
+
 def test_the_id_space_check_catches_a_divergent_projection(tmp_path: Path, monkeypatch) -> None:
     """A projection that emits a divergent id MUST produce a structured violation.
 
@@ -304,3 +324,98 @@ def test_the_id_space_check_catches_a_divergent_projection(tmp_path: Path, monke
     assert type_violations[0]['id'] == str(numeric_id), (
         f'the violation must carry the EMITTED id, not the on-disk one: {type_violations}'
     )
+
+
+# ---------------------------------------------------------------------------
+# The contract itself
+# ---------------------------------------------------------------------------
+
+# The three reach paths, and WHY it takes two trees to exercise them.
+#
+# MEASURED against the real producer, not assumed: a TRIGGERED storm escape
+# suppresses every per-metric link program-wide.  `_build_eval` only consults
+# the escalation index when `storm is None`; otherwise the fingerprint goes to
+# `storm_suppressed` and the row renders `parity='storm_collapsed'` with
+# `escalation: None`.  So `evals[i].metrics[j].escalation` and
+# `storm_escape.escalation` can never BOTH be populated in one payload — they
+# are alternatives by design, since the storm exists precisely to collapse the
+# per-metric links into one aggregate filing.
+#
+# The coverage precondition below is therefore taken over the UNION of two
+# trees rather than weakened to "some path contributed".  Each tree is still
+# ONE directory feeding BOTH producers, which is the property under test; what
+# two trees buy is the two mutually-exclusive storm states.
+_REACH_PATHS = ('metric_row', 'storm_escape', 'unmatched')
+
+
+def test_every_memory_eval_escalation_id_resolves_in_the_escalations_payload(
+    tmp_path: Path,
+) -> None:
+    """Every escalation id MEMORY_EVALS emits resolves to an ESCALATIONS row.
+
+    The deliverable contract.  `tab_memory_evals.jsx` hands `escalation.id` to
+    `onNavigate('esc', ...)` and `tab_escalations.jsx` resolves it with
+    `row.id === id`; if the id spaces diverge the link dead-ends with both
+    payloads looking fully populated and the whole suite green.
+
+    Membership is the live exposure, not type.  `_index_escalations` filters
+    hard — non-`eval_regression` categories, closed statuses and duplicate
+    fingerprints are all dropped — while `shape_escalations` filters nothing,
+    so MEMORY_EVALS ids are a strict SUBSET of ESCALATIONS rows and that
+    containment is exactly why every link resolves today.  A filter added to
+    `shape_escalations`, or a category/status widening in `_index_escalations`,
+    breaks every link silently.  This is the test that would notice.
+
+    ANTI-VACUITY.  The assertion is `violations == []`, which an empty payload,
+    a walker aimed at the wrong keys or a fixture that reached no escalation
+    would all satisfy.  So the reach paths are counted and every one of the
+    three is required to contribute, and the `reconciliation` subsection is
+    required to be non-empty — a MEMORY_EVALS id can only resolve against rows
+    that are actually there.  Type agreement rides along inside the checker,
+    which compares `type()` rather than `==`: both sides read the same JSON
+    today, so only a `type()` check can see a future `str()` coercion on one
+    side (`shape_escalations` already applies one to the sibling `task_id`).
+    """
+    trees = (
+        ('no-storm', build_dual_escalation_tree(tmp_path / 'no-storm')),
+        ('storm', build_dual_escalation_tree(tmp_path / 'storm', storm=True)),
+    )
+
+    reached: dict[str, list[str]] = {kind: [] for kind in _REACH_PATHS}
+    for label, tree in trees:
+        memory_evals = _build_memory_evals(tree.config)
+        escalations = _build_escalations(tree.config)
+
+        reconciliation = [s for s in escalations['subsections'] if s['id'] == 'reconciliation']
+        assert len(reconciliation) == 1, (
+            f'[{label}] expected exactly one reconciliation subsection, got '
+            f'{[s["id"] for s in escalations["subsections"]]} — the memory-eval '
+            'escalations live in that one, so anything else means the consumer '
+            'side is not being built from this fixture at all.'
+        )
+        assert reconciliation[0]['escalations'], (
+            f'[{label}] the reconciliation subsection carries NO rows, so every id '
+            'below would have nothing to resolve against and the contract assertion '
+            'would pass by being asked nothing.'
+        )
+
+        for path, _escalation in _iter_memory_eval_escalations(memory_evals):
+            reached[_reach_kind(path)].append(f'{label}:{path}')
+
+        assert collect_escalation_id_violations(memory_evals, escalations) == [], (
+            f'[{label}] MEMORY_EVALS emits escalation ids that ESCALATIONS cannot '
+            'resolve. Each violation names the payload path, the id and whether the '
+            'row is missing outright or present at a different type:\n'
+            + '\n'.join(
+                f'  - {v["detail"]}'
+                for v in collect_escalation_id_violations(memory_evals, escalations)
+            )
+        )
+
+    for kind in _REACH_PATHS:
+        assert reached[kind], (
+            f'no escalation reached MEMORY_EVALS via the {kind!r} path across either '
+            f'tree, so the contract above was never checked there. Reached: {reached}. '
+            'Extend build_dual_escalation_tree rather than dropping this precondition '
+            '— an unexercised reach path is exactly where the id space drifts unseen.'
+        )
