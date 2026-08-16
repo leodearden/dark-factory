@@ -494,6 +494,32 @@ def test_sanitize_slug_matches_build_session_slug_regression() -> None:
     assert slug == sr.sanitize_slug('un block-df/prod-20#85-4242')
 
 
+@pytest.mark.parametrize(
+    ('raw', 'expected'),
+    [('.', '-'), ('..', '--'), ('...', '---')],
+)
+def test_sanitize_slug_collapses_all_dots_slug(raw: str, expected: str) -> None:
+    # Task 4112: the all-dots branch is the SOLE guard against a path escape
+    # out of sessions_dir. '.' is inside _SLUG_SANITIZE_RE's allowed class, so
+    # the character substitution alone passes '..' straight through, and
+    # record_path_for_slug is a bare join that sanitizes nothing of its own --
+    # so an unguarded '..' would be handed to the filesystem as a traversal
+    # segment. Every '.' maps to '-', so length is preserved.
+    slug = sr.sanitize_slug(raw)
+    assert slug == expected
+    assert re.fullmatch(r'[A-Za-z0-9._-]+', slug)
+
+
+@pytest.mark.parametrize('raw', ['..foo', 'foo..', 'a.b', '.hidden-x'])
+def test_sanitize_slug_leaves_partially_dotted_slug_untouched(raw: str) -> None:
+    # The guard's LOWER edge: a value that merely CONTAINS dots alongside other
+    # characters is a literal, non-traversing directory name (sanitize_slug's
+    # docstring says so) and must pass through byte-identical. Pinning only the
+    # collapse direction would leave a future "hardening" free to over-broaden
+    # into stripping every dot, silently mangling ordinary slugs like 'a.b'.
+    assert sr.sanitize_slug(raw) == raw
+
+
 def test_fleet_root_defaults_to_dot_claude_fleet(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv('CLAUDE_FLEET_ROOT', raising=False)
     monkeypatch.setenv('HOME', '/home/fakeuser')
