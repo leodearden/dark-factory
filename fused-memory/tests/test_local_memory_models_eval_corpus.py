@@ -19,9 +19,12 @@ server-side on the live path.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
+import errno
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import random
@@ -2476,6 +2479,65 @@ class TestAWriteFailureIsNotBlamedOnTheStore:
         assert code == _mod.EXIT_CODES['bad_manifest']
 
 
+@contextlib.contextmanager
+def _closed_pipe_stdout(monkeypatch, *, buffering: int | None = None, quiet_close: bool = True):
+    """Point ``sys.stdout`` at a pipe whose reader is already gone (the ``| head`` shape).
+
+    A REAL closed ``os.pipe()``, never a mocked ``print``: a fix that only
+    satisfies a mock cannot pass through here, because the assertion is on the
+    actual OS-level write failure.
+
+    *buffering* is the load-bearing knob, not a detail — it selects WHICH of
+    the two failure regimes the test exercises, so every caller states it:
+
+    * ``None`` (block buffering, the default) — a short write stays in the
+      buffer, nothing fails in-band, and only an explicit flush can surface it.
+    * ``1`` (line buffering) — every print does a real ``write()``, so the
+      failure is raised during the run.
+
+    The exit is itself an assertion. Closing the wrapper stands in for the
+    interpreter's finalization-time flush of ``sys.stdout``, which is where a
+    closed pipe would otherwise resurface as "Exception ignored ..." noise and
+    a forced exit status no ``return`` can override. It runs in a ``finally``
+    so a failing assertion in the body cannot skip it or leak the write fd;
+    the verdict on it is checked only when the body passed, so a real failure
+    is never masked by a second one here.
+
+    *quiet_close* says which LAYER is under test. ``True`` (``_cli``, the
+    process boundary) means that flush must not raise, because ``_cli`` owns
+    fd 1 and redirects it to ``os.devnull``. ``False`` (``main`` alone) means
+    it must raise: ``main(argv) -> int`` deliberately does not mutate a
+    process-global fd on behalf of a caller that only asked for an exit code.
+    """
+    read_fd, write_fd = os.pipe()
+    os.close(read_fd)  # the reader is already gone, like `head` after its window
+    if buffering is None:
+        pipe_stdout = os.fdopen(write_fd, 'w')
+    else:
+        pipe_stdout = os.fdopen(write_fd, 'w', buffering=buffering)
+    original_stdout = sys.stdout
+    monkeypatch.setattr(sys, 'stdout', pipe_stdout)
+    close_failure: BaseException | None = None
+    try:
+        yield pipe_stdout
+    finally:
+        sys.stdout = original_stdout
+        try:
+            pipe_stdout.close()
+        except BrokenPipeError as exc:
+            close_failure = exc
+    if quiet_close:
+        assert close_failure is None, (
+            'the interpreter\'s shutdown flush would have raised a second, '
+            f'uncatchable BrokenPipeError: {close_failure!r}'
+        )
+    else:
+        assert close_failure is not None, (
+            'this layer took over the caller\'s stdout fd — only the process '
+            'boundary may do that'
+        )
+
+
 class TestBrokenPipeIsARunFailureNotATraceback:
     """A downstream reader closing stdout early (``--verify | head``) must not traceback.
 
@@ -2487,59 +2549,60 @@ class TestBrokenPipeIsARunFailureNotATraceback:
     traceback and only happens to exit 1 by accident, where every other
     failure in this CLI prints one ``error: ...`` line.
 
-    Uses a REAL closed ``os.pipe()``, not a mocked ``print``, so a fix that
-    only satisfies a mock (e.g. patching ``builtins.print`` to raise) cannot
-    pass here — the assertion is on the actual OS-level write failure the
-    symptom describes.
+    Line-buffered here, so the failure is raised in-band during the run; the
+    class below covers the buffered regime it cannot see.
     """
 
     def test_a_closed_stdout_pipe_exits_run_failed_without_a_traceback(
         self, monkeypatch, tmp_path, capsys
     ):
         out = tmp_path / 'corpus_manifest.json'
-        read_fd, write_fd = os.pipe()
-        os.close(read_fd)  # the reader is already gone, like `head` after its window
-        pipe_stdout = os.fdopen(write_fd, 'w', buffering=1)  # line-buffered: forces a real write() per print, not a deferred shutdown flush
-        original_stdout = sys.stdout
-        monkeypatch.setattr(sys, 'stdout', pipe_stdout)
         capsys.readouterr()
-        try:
-            code, _ = _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out))
-        finally:
-            sys.stdout = original_stdout
+        with _closed_pipe_stdout(monkeypatch, buffering=1):
+            code, _ = _run_cli(
+                monkeypatch, '--n', '20', '--seed', 's', '--out', str(out), entry=_mod._cli
+            )
 
         assert code == _mod.EXIT_RUN_FAILED
         assert not out.exists()
-        err = capsys.readouterr().err
-        assert err.startswith('error: ')
+        # ONE line, the same `error: ` shape every other failure in this CLI
+        # prints — the failure is reported once even though it is seen twice,
+        # in-band by `main` and again by the boundary's flush.
+        err_lines = [line for line in capsys.readouterr().err.splitlines() if line.strip()]
+        assert len(err_lines) == 1
+        assert err_lines[0].startswith('error: ')
 
-        # The fix must dup2 the pipe's fd to os.devnull before returning, per
-        # the Python docs' "Note on SIGPIPE" — otherwise Python's shutdown-time
-        # flush of the (still-broken) pipe raises a SECOND, uncatchable
-        # BrokenPipeError, the "Exception ignored in: <_io.TextIOWrapper ...>"
-        # noise the docs warn about. Closing the wrapper here stands in for
-        # that shutdown flush and must not raise.
-        pipe_stdout.close()
+    def test_main_alone_reports_the_failure_without_taking_over_the_caller_s_stdout(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """The layering, pinned: ``main`` reports; only ``_cli`` redirects fd 1.
+
+        ``main(argv) -> int`` is the seam the rest of this module drives, and
+        its contract is "parse and run, return a code". Silently sending the
+        caller's fd 1 to ``os.devnull`` for the remainder of the process is not
+        in that contract — ``quiet_close=False`` is what fails if it creeps
+        back in.
+        """
+        out = tmp_path / 'corpus_manifest.json'
+        capsys.readouterr()
+        with _closed_pipe_stdout(monkeypatch, buffering=1, quiet_close=False):
+            code, _ = _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out))
+
+        assert code == _mod.EXIT_RUN_FAILED
+        assert capsys.readouterr().err.startswith('error: ')
 
     def test_dry_run_build_also_exits_run_failed_on_a_closed_pipe(
         self, monkeypatch, tmp_path, capsys
     ):
         """CONTROL: not specific to the write path — the report print itself is the hazard."""
         out = tmp_path / 'corpus_manifest.json'
-        read_fd, write_fd = os.pipe()
-        os.close(read_fd)
-        pipe_stdout = os.fdopen(write_fd, 'w', buffering=1)  # line-buffered: forces a real write() per print, not a deferred shutdown flush
-        original_stdout = sys.stdout
-        monkeypatch.setattr(sys, 'stdout', pipe_stdout)
         capsys.readouterr()
-        try:
+        with _closed_pipe_stdout(monkeypatch, buffering=1):
             code, _ = _run_cli(
-                monkeypatch, '--n', '20', '--seed', 's', '--out', str(out), '--dry-run'
+                monkeypatch, '--n', '20', '--seed', 's', '--out', str(out), '--dry-run',
+                entry=_mod._cli,
             )
-        finally:
-            sys.stdout = original_stdout
         assert code == _mod.EXIT_RUN_FAILED
-        pipe_stdout.close()
 
 
 class TestAShortBufferedWriteIntoAClosedPipeIsAlsoARunFailure:
@@ -2548,25 +2611,19 @@ class TestAShortBufferedWriteIntoAClosedPipeIsAlsoARunFailure:
     A closed stdout pipe fails in two measurably different ways, and the
     difference is buffering:
 
-    * REGIME A, in-band. The write exceeds stdout's 8 KiB buffer, so ``print``
-      flushes, the ``write()`` fails, and ``BrokenPipeError`` is raised inside
-      ``main()``'s ``try`` where the existing handler catches it. That is what
-      ``TestBrokenPipeIsARunFailureNotATraceback`` pins — deliberately, by
-      opening its pipe with ``buffering=1`` so every print does a real
-      ``write()``.
+    * REGIME A, in-band. The write is big enough to overflow stdout's buffer
+      (or the stream is line-buffered), so ``print`` flushes, the ``write()``
+      fails, and ``BrokenPipeError`` is raised inside ``main()``'s ``try``.
     * REGIME B, deferred — this class. The write is SHORT and stays in the
       buffer, so nothing is raised during the run at all: ``main()`` returns
-      its ordinary verdict code and the failure only surfaces when the
-      interpreter flushes ``sys.stdout`` during finalization, printing
-      "Exception ignored on flushing sys.stdout: BrokenPipeError" and forcing
-      exit status 120. No ``except`` anywhere can reach that point.
+      its ordinary verdict code and the failure surfaces only when the
+      interpreter flushes ``sys.stdout`` during finalization, where no
+      ``except`` can reach it and the returned code is overridden.
 
     ``--verify`` lands squarely in regime B: :func:`_emit_verdict` emits ONE
-    short ``verify: ok — ...`` line, far under the buffer. So the pipe here is
-    opened with DEFAULT block buffering — the absence of ``buffering=1`` is the
-    whole point, not an oversight — and the entry point under test is
-    ``_cli()``, the process boundary that flushes stdout explicitly while a
-    handler is still on the stack.
+    short ``verify: ok — ...`` line. So the pipe here is block-buffered and the
+    entry point is ``_cli()``, the process boundary that flushes stdout
+    explicitly while a handler is still on the stack.
     """
 
     def _built_manifest(self, monkeypatch, tmp_path) -> Path:
@@ -2580,25 +2637,15 @@ class TestAShortBufferedWriteIntoAClosedPipeIsAlsoARunFailure:
         """Not the verdict's own code: the run never reached its reader.
 
         Without the explicit flush this returns 0 — a clean "verify: ok" the
-        caller never received — and the process then dies at 120 with shutdown
-        noise. Both outcomes lie about what happened.
+        caller never received — and the process then dies with shutdown noise.
+        Both outcomes lie about what happened.
         """
         out = self._built_manifest(monkeypatch, tmp_path)
-        read_fd, write_fd = os.pipe()
-        os.close(read_fd)  # the reader is already gone, like `head` after its window
-        # DEFAULT block buffering — no buffering=1. The one short verdict line
-        # stays in the buffer, so nothing fails in-band and only an explicit
-        # flush can surface it.
-        pipe_stdout = os.fdopen(write_fd, 'w')
-        original_stdout = sys.stdout
-        monkeypatch.setattr(sys, 'stdout', pipe_stdout)
         capsys.readouterr()
-        try:
+        with _closed_pipe_stdout(monkeypatch):
             code, _ = _run_cli(
                 monkeypatch, '--verify', '--out', str(out), entry=_mod._cli
             )
-        finally:
-            sys.stdout = original_stdout
 
         assert code == _mod.EXIT_RUN_FAILED
 
@@ -2607,11 +2654,6 @@ class TestAShortBufferedWriteIntoAClosedPipeIsAlsoARunFailure:
         err_lines = [line for line in capsys.readouterr().err.splitlines() if line.strip()]
         assert len(err_lines) == 1
         assert err_lines[0].startswith('error: ')
-
-        # Stands in for the interpreter's shutdown flush, which is where this
-        # regime's failure would otherwise land: it must not raise, which is
-        # what pins the dup2-to-devnull rather than just the catch.
-        pipe_stdout.close()
 
     def test_a_healthy_stdout_still_returns_the_ordinary_verdict_code(
         self, monkeypatch, tmp_path, capsys
@@ -2628,22 +2670,138 @@ class TestAShortBufferedWriteIntoAClosedPipeIsAlsoARunFailure:
         assert 'ok' in capsys.readouterr().out.lower()
 
 
-def _spawn(*argv, closed_stdout: bool, unbuffered: bool) -> tuple[int, str, str]:
+class TestAPipeThatBrokeAfterTheManifestLandedSaysSo:
+    """``build_corpus.py --out ... | head``: exit 1 must not read as "nothing happened".
+
+    The ordering is the point, and it is reachable rather than theoretical: the
+    report and the trailing ``manifest: ...`` line both fit stdout's buffer, so
+    nothing fails in-band, ``write_manifest`` lands the artifact, and the pipe
+    failure surfaces only at the boundary's flush — AFTER the run did its work.
+
+    Exit 1 is documented as "the run could not complete at all", so on its own
+    it tells an operator or a CI wrapper that no artifact exists. It does. The
+    message therefore names it, which is the only channel left once the exit
+    code has been spent.
+    """
+
+    def test_the_error_line_names_the_manifest_that_was_written(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        out = tmp_path / 'corpus_manifest.json'
+        capsys.readouterr()
+        with _closed_pipe_stdout(monkeypatch):  # block-buffered: nothing fails in-band
+            code, _ = _run_cli(
+                monkeypatch, '--n', '20', '--seed', 's', '--out', str(out), entry=_mod._cli
+            )
+        err = capsys.readouterr().err
+
+        assert code == _mod.EXIT_RUN_FAILED
+        assert out.exists(), 'premise: the artifact landed before the pipe failure surfaced'
+        assert str(out) in err
+
+    def test_a_run_that_wrote_nothing_does_not_claim_a_manifest(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """CONTROL: --dry-run writes nothing, so nothing may be named.
+
+        The earlier successful build is deliberate: it leaves the module
+        holding a record of a manifest it once wrote, and this run must not
+        inherit it. Without a per-run reset, a stale path would be reported as
+        this run's output — a worse lie than the bare exit code.
+        """
+        out = tmp_path / 'corpus_manifest.json'
+        _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out))
+        out.unlink()
+
+        capsys.readouterr()
+        with _closed_pipe_stdout(monkeypatch):
+            code, _ = _run_cli(
+                monkeypatch, '--n', '20', '--seed', 's', '--out', str(out), '--dry-run',
+                entry=_mod._cli,
+            )
+        err = capsys.readouterr().err
+
+        assert code == _mod.EXIT_RUN_FAILED
+        assert not out.exists()
+        assert str(out) not in err
+
+
+class _StdoutWithAFailingFlush(io.StringIO):
+    """A stdout that accepts every write and fails on flush — ENOSPC, not a closed reader.
+
+    ``StringIO.fileno()`` raises ``io.UnsupportedOperation``, so this doubles as
+    a pin on the handler's fd guard: a stream with no real descriptor must not
+    turn the reported failure into a second, different traceback out of the
+    code meant to prevent the first one.
+    """
+
+    def __init__(self, exc: OSError):
+        super().__init__()
+        self._exc = exc
+
+    def flush(self) -> None:
+        raise self._exc
+
+
+class TestAStdoutFailureThatIsNotAClosedPipeIsAlsoReported:
+    """``build_corpus.py --dry-run > /full/disk/report.txt``: ENOSPC is not a traceback either.
+
+    The contract this whole area exists to keep is "every failure in this CLI
+    prints a single ``error: ...`` line". A flush guard that names only
+    ``BrokenPipeError`` keeps it for the ``| head`` shape and breaks it for the
+    disk-full and disconnected-tty ones — at least as likely for a builder
+    whose report is routinely redirected to a file.
+    """
+
+    def test_a_full_disk_on_the_final_flush_exits_run_failed_and_names_the_errno(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        out = tmp_path / 'corpus_manifest.json'
+        monkeypatch.setattr(
+            sys,
+            'stdout',
+            _StdoutWithAFailingFlush(OSError(errno.ENOSPC, 'No space left on device')),
+        )
+        capsys.readouterr()
+        code, _ = _run_cli(
+            monkeypatch, '--n', '20', '--seed', 's', '--out', str(out), '--dry-run',
+            entry=_mod._cli,
+        )
+        monkeypatch.undo()
+        err = capsys.readouterr().err
+
+        assert code == _mod.EXIT_RUN_FAILED
+        err_lines = [line for line in err.splitlines() if line.strip()]
+        assert len(err_lines) == 1
+        assert err_lines[0].startswith('error: ')
+        # The remedy differs from a closed reader's, so the message must too.
+        assert 'No space left on device' in err
+        assert 'closed the output pipe' not in err
+
+
+def _spawn(
+    *argv, closed_stdout: bool, unbuffered: bool, closed_stderr: bool = False
+) -> tuple[int, str, str]:
     """Run build_corpus.py in a CHILD process and return (exit status, stdout, stderr).
 
     A real subprocess is the only shape that can observe the two things this
     file's in-process tests structurally cannot: the interpreter's own
     finalization-time flush of ``sys.stdout``, and the exit status the OS
-    actually reports (CPython forces 120 when that flush fails, which no
-    ``return`` value inside the process can express).
+    actually reports (CPython overrides the returned code when that flush
+    fails, which nothing inside the process can express).
 
     With *closed_stdout*, fd 1 is a pipe whose READ end is closed BEFORE the
     spawn. Closing the reader first is what makes it deterministic: leave it
-    open and the child's write lands in the kernel's 64 KiB pipe buffer and
-    never fails, so the test would pass for the wrong reason. Python
-    re-installs ``SIGPIPE`` as ``SIG_IGN`` at startup, so the child gets EPIPE
-    as a catchable ``BrokenPipeError`` rather than dying on the signal — the
-    status here is therefore always a real exit code, never ``-13``.
+    open and the child's write lands in the kernel's pipe buffer and never
+    fails, so the test would pass for the wrong reason. Python re-installs
+    ``SIGPIPE`` as ``SIG_IGN`` at startup, so the child gets EPIPE as a
+    catchable ``BrokenPipeError`` rather than dying on the signal — the status
+    here is therefore always a real exit code, never ``-13``.
+
+    *closed_stderr* puts stderr on that SAME closed pipe: the ``cmd 2>&1 |
+    head`` shape, where the diagnostic has nowhere to go either. Returned
+    stderr is then empty by construction — the exit status is the only
+    observable, and the only one that matters there.
 
     *unbuffered* is set EXPLICITLY rather than inherited, and that is the whole
     point of the parameter: ``PYTHONUNBUFFERED`` decides WHERE a closed-pipe
@@ -2654,6 +2812,7 @@ def _spawn(*argv, closed_stdout: bool, unbuffered: bool) -> tuple[int, str, str]
     without it, so an inherited value made the same test pass locally and fail
     under the harness. Pinning it here makes each regime its own case.
     """
+    assert closed_stdout or not closed_stderr, 'closed_stderr shares stdout closed pipe'
     env = {**os.environ}
     if unbuffered:
         env['PYTHONUNBUFFERED'] = '1'
@@ -2667,11 +2826,24 @@ def _spawn(*argv, closed_stdout: bool, unbuffered: bool) -> tuple[int, str, str]
         read_fd, write_fd = os.pipe()
         os.close(read_fd)  # the reader is already gone, like `head` after its window
         try:
-            proc = subprocess.Popen(cmd, stdout=write_fd, stderr=subprocess.PIPE, env=env)
+            proc = subprocess.Popen(
+                cmd,
+                stdout=write_fd,
+                stderr=write_fd if closed_stderr else subprocess.PIPE,
+                env=env,
+            )
         finally:
             os.close(write_fd)  # the child now holds the only write end
 
-    out, err = proc.communicate(timeout=120)
+    # A wedged child must not outlive the run: it holds the only write end of
+    # the closed pipe, so an un-killed one leaks an interpreter per failure in
+    # a helper this module calls a dozen times.
+    try:
+        out, err = proc.communicate(timeout=120)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        raise
     return (
         proc.returncode,
         (out or b'').decode('utf-8', 'replace'),
@@ -2692,29 +2864,22 @@ class TestArgparseOutputIntoAClosedPipeExitsCleanlyToo:
     ``argparse`` writes the help text and leaves via ``SystemExit(0)`` from
     ``parse_args()`` — which happens INSIDE ``main()`` but before its ``try``,
     and propagates straight past ``_cli()``'s ``except BrokenPipeError``
-    because nothing is raised in-band at all. The help text is still sitting in
-    stdout's buffer when the interpreter starts finalizing, so the failure
-    lands in exactly the unreachable place regime B lands in: "Exception
-    ignored on flushing sys.stdout" and a forced exit status 120.
-
-    Measured, not assumed: before this fix ``--help`` with a closed pipe on
-    fd 1 exits 120 with that message, and it still does after the ``_cli()``
-    flush lands, because ``SystemExit`` is not ``BrokenPipeError``.
+    because nothing is raised in-band at all.
 
     Run against BOTH buffering regimes, because they fail in different places
     and one handler catches only one of them — measured, each regime red on its
     own before its own fix:
 
-    * BLOCK-buffered — the ~2.4 KB help text fits stdout's 8 KiB buffer, so
-      ``parse_args`` raises nothing and the failure waits for ``_cli()``'s
-      explicit flush. Exit 120 before that flush existed.
+    * BLOCK-buffered — the help text fits stdout's buffer, so ``parse_args``
+      raises nothing and the failure waits for ``_cli()``'s explicit flush.
+      Before that flush existed it landed at interpreter shutdown instead,
+      where the exit status is overridden and the noise cannot be caught.
     * UNBUFFERED (``PYTHONUNBUFFERED=1``, which the verify harness exports) —
-      the write reaches fd 1 during ``parse_args`` and raises there, inside
-      ``argparse._print_message``'s ``except (AttributeError, OSError): pass``.
-      ``BrokenPipeError`` is an ``OSError``, so argparse DISCARDS it; ``_cli``'s
-      flush then finds an empty buffer and the process exits **0** — no
-      traceback and no shutdown noise, but a success status for a run whose
-      output went nowhere. Closed by ``_LoudArgumentParser``.
+      the write reaches fd 1 during ``parse_args`` and raises inside argparse,
+      which discards it (``BrokenPipeError`` is an ``OSError``). ``_cli``'s
+      flush then finds an empty buffer and the process exits **0** — a success
+      status for a run whose output went nowhere. Closed by
+      ``_LoudArgumentParser``.
 
     The controls matter as much as the assertion. ``--help`` must keep exiting
     0 and an unrecognized flag must keep exiting 2 — a fix that routed every
@@ -2736,6 +2901,25 @@ class TestArgparseOutputIntoAClosedPipeExitsCleanlyToo:
         # red), and the single-line contract is already pinned in-process
         # where stderr IS controlled.
         assert any(line.startswith('error: ') for line in err.splitlines())
+
+    @_BUFFERING
+    def test_help_with_stderr_on_the_same_closed_pipe_still_exits_run_failed(self, unbuffered):
+        """``--help 2>&1 | head``: the diagnostic is lost; the exit code is not.
+
+        With both streams on the closed pipe the ``error: ...`` line cannot be
+        written and cannot be observed, so the exit status is the whole
+        contract — and it is enough. A stream left holding an unwritable buffer
+        fails again during interpreter finalization, and CPython overrides the
+        returned status when that happens; exiting EXIT_RUN_FAILED is therefore
+        a positive statement that NEITHER stream was left in that state.
+
+        Pins the best-effort stderr write as deliberate rather than accidental:
+        the message is allowed to vanish here, and nothing else is.
+        """
+        code, _, _ = _spawn(
+            '--help', closed_stdout=True, closed_stderr=True, unbuffered=unbuffered
+        )
+        assert code == _mod.EXIT_RUN_FAILED
 
     @_BUFFERING
     def test_help_with_a_healthy_stdout_still_exits_zero_and_prints_usage(self, unbuffered):
