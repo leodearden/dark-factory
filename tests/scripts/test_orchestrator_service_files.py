@@ -27,6 +27,22 @@ and the docs account for it, so template / installer / doc form one
 invariant.  Splitting them out would mean extracting those helpers into a
 shared module (cf. tests/scripts/systemd_unit_invariants.py) first.
 
+That extraction has since happened for ONE symbol set and deliberately not
+for the rest.  Task 3773 lifted CANONICAL_CONFIG_BASENAME,
+MalformedExecStart and the ``--config`` token scan into
+systemd_unit_invariants.py, because a second consumer had appeared and
+hand-copied them (tests/scripts/test_know_live_installed_unit_parity.py)
+and the two copies had already drifted.  ``_exec_start_line`` did NOT move:
+it still has exactly one consumer, and this directory's lift trigger is a
+second consumer, not proximity.  (``shell_statements`` had already moved
+for the same reason, to the sibling setup_host_parsing.py, and is imported
+below.)  ``_parse_sections`` DOES have a second consumer —
+test_orchestrator_watchdog.py's ``_unit_sections``, a local copy whose own
+docstring records that it exists only because a sibling TEST module cannot
+be imported under ``--import-mode=importlib`` — so it meets the trigger
+and is a lift waiting to happen, into a helper module rather than out of
+here.  It sat outside task 3773's locked scope; filed as follow-up.
+
 See also:
   - tests/scripts/test_dashboard_service_template.py — pattern reference
   - tests/scripts/test_systemd_restart_backoff.py — content-discovered
@@ -64,6 +80,22 @@ from setup_host_parsing import (
 )
 from setup_host_parsing import (
     shell_statements as _shell_statements,
+)
+
+# The --config token scan below is SHARED with
+# tests/scripts/test_know_live_installed_unit_parity.py, which had hand-copied
+# it (and CANONICAL_CONFIG_BASENAME) from this module and drifted; task 3773
+# lifted both, plus the MalformedExecStart class, into the directory's shared
+# helper module. Importable by name for the same reason as the block above —
+# tests/scripts/conftest.py puts this directory on sys.path, which pytest's
+# --import-mode=importlib deliberately does not. Imported UNALIASED, unlike
+# setup_host_parsing's names: the sibling parity modules import these three
+# under exactly these public names, and a private alias here would obscure
+# that they are one definition rather than three.
+from systemd_unit_invariants import (
+    CANONICAL_CONFIG_BASENAME,
+    MalformedExecStart,
+    config_arg_from_exec_start,
 )
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
@@ -593,23 +625,14 @@ def test_orchestrator_service_sets_own_orch_unit(
 
 # ---------------------------------------------------------------------------
 # Canonical orchestrator-config filename (task 3641; completes task 3512's sweep)
+#
+# CANONICAL_CONFIG_BASENAME, MalformedExecStart and the token scan itself now
+# live in tests/scripts/systemd_unit_invariants.py and are imported at the top
+# of this module (task 3773) — see that module's `--config` section header for
+# the lift trigger and the reconciled contract. What stays here is the
+# FILE-CONTENT half: finding the ExecStart= line, which has exactly one
+# consumer and so did not meet this directory's lift trigger.
 # ---------------------------------------------------------------------------
-
-CANONICAL_CONFIG_BASENAME = "dark-factory-orchestrator.yaml"
-
-
-
-class MalformedExecStart(ValueError):
-    """A unit's ExecStart= is broken — never a legitimate "no --config" answer.
-
-    Kept distinct from the ``None`` return below because the two outcomes want
-    opposite handling.  ``None`` means "this unit takes no ``--config``", which
-    is true of orchestrator-watchdog.service and must SKIP.  A missing
-    ``ExecStart=`` line, or a ``--config`` flag with no value after it, is a
-    malformed unit (or a regressed parser) and must FAIL: collapsing those into
-    the same ``None`` is how a guard silently waves through the very drift it
-    was written to catch.
-    """
 
 
 def _exec_start_line(content: str, unit_name: str = "<unit>") -> str:
@@ -640,31 +663,19 @@ def _exec_start_line(content: str, unit_name: str = "<unit>") -> str:
 def _exec_start_config_arg(content: str, unit_name: str = "<unit>") -> str | None:
     """Return the `--config` argument of the unit's ExecStart=, or None if absent.
 
-    None now means exactly ONE thing: the ExecStart= carries no ``--config``
-    flag at all.  That is a real answer, not a parse failure —
-    orchestrator-watchdog.service runs a probe script that takes no
-    ``--config`` — and callers skip on it, so the watchdog is not dragged into
-    an invariant that does not apply to it.
+    The part this wrapper owns is locating the ExecStart= line inside unit FILE
+    CONTENT (``_exec_start_line`` above); the token contract of what comes back
+    — when None is returned and when MalformedExecStart is raised — belongs to
+    systemd_unit_invariants.config_arg_from_exec_start and is documented there,
+    ONCE.  Restating it here would put two copies of a contract in the tree,
+    which is the same drift risk in miniature that lifting the parser removed.
 
-    Every other way this could previously have produced None now raises
-    MalformedExecStart (see that class): no ExecStart= line at all, and a
-    dangling ``--config`` as the final token with nothing after it.  The
-    dangling case in particular is a unit that would start the orchestrator
-    with no config path — a hard defect, not something to skip past.
+    The sibling parity module hands that shared parser an already-extracted
+    value instead (a ``restart_directive`` result, or a ``systemctl show``
+    ``argv[]`` segment); the scan is prefix-agnostic, so both call shapes reach
+    it without either side normalising first.
     """
-    tokens = _exec_start_line(content, unit_name).split()
-    for i, token in enumerate(tokens):
-        if token == "--config":
-            if i + 1 >= len(tokens):
-                raise MalformedExecStart(
-                    f"{unit_name} ends its ExecStart= with a dangling `--config` "
-                    "and no value after it. The orchestrator would start with no "
-                    f"config path at all. ExecStart line: {' '.join(tokens)!r}"
-                )
-            return tokens[i + 1]
-        if token.startswith("--config="):
-            return token.split("=", 1)[1]
-    return None
+    return config_arg_from_exec_start(_exec_start_line(content, unit_name), unit_name)
 
 
 # ---------------------------------------------------------------------------
