@@ -826,6 +826,137 @@ class TestDedupeConfigForRecon:
         assert result == 'esc-1-1'
 
 
+class TestDedupeConfigForGateBacklog:
+    """DedupeConfig.for_gate_backlog() — sibling constructor for stale-gate dedup.
+
+    The gate-backlog path (fused_memory.reconciliation.stage1_stall_detector's
+    ``maybe_escalate_stalled_gate_backlog``) files one ``reconciliation_stale_gate_backlog``
+    L1 per cycle a gate stays stalled.  Folding those into a single parent is what
+    makes ``dedupe_count`` a recurrence signal instead of a constant 0.
+    """
+
+    _CATEGORY = 'reconciliation_stale_gate_backlog'
+
+    def _make_gate_esc(
+        self,
+        esc_id: str,
+        fingerprint: str | None = 'gate-fp',
+        ts: str | None = None,
+    ):
+        from escalation.models import Escalation
+        esc = Escalation(
+            id=esc_id,
+            task_id='645',
+            agent_role='reconciler',
+            severity='blocking',
+            category=self._CATEGORY,
+            summary='Gate task 645 has awaited a human decision since 2026-08-10T00:00:00+00:00',
+            level=1,
+        )
+        esc.dedupe_fingerprint = fingerprint
+        if ts is not None:
+            esc.timestamp = ts
+        return esc
+
+    def _queue_files(self, queue):
+        return sorted(queue.queue_dir.glob('esc-*.json'))
+
+    # --- (a) config shape ---
+
+    def test_for_gate_backlog_config_shape(self):
+        """for_gate_backlog() enables dedup on the gate-backlog category with a content key."""
+        from escalation.dedupe import DedupeConfig, content_fingerprint_key
+
+        cfg = DedupeConfig.for_gate_backlog()
+        assert cfg.infra_dedupe_enabled is True
+        assert cfg.infra_dedupe_categories == (self._CATEGORY,)
+        assert cfg.key_fn is content_fingerprint_key
+
+    def test_for_gate_backlog_window_is_unbounded(self):
+        """The window MUST be unbounded — a 300h-old gate must still fold.
+
+        Asserted via ``math.isinf`` rather than an equality against a bounded
+        default: any finite window silently mints a duplicate pending record and
+        re-pins ``dedupe_count`` at 0, which is the exact bug this config exists
+        to prevent.
+        """
+        import math
+
+        from escalation.dedupe import DedupeConfig
+
+        cfg = DedupeConfig.for_gate_backlog()
+        assert math.isinf(cfg.infra_dedupe_window_secs), (
+            'gate-backlog window must be unbounded; a bounded window re-pins '
+            f'dedupe_count at 0 for long-rotting gates. got: {cfg.infra_dedupe_window_secs}'
+        )
+        assert cfg.infra_dedupe_window_secs > 0, 'window must be +inf, not -inf'
+
+    # --- (b) regression guard on the sibling ---
+
+    def test_for_recon_categories_unchanged(self):
+        """REGRESSION: for_recon() is NOT widened by the new sibling.
+
+        ``fused-memory/scripts/backfill_recon_escalations.py`` derives its
+        eligible-collapse set (:168) and the complement defining
+        ``blocking_pending`` (:290) from this exact tuple.  Admitting
+        ``reconciliation_stale_gate_backlog`` here would silently change that
+        one-shot operator script's collapse plan and its report semantics.
+        """
+        from escalation.dedupe import DedupeConfig
+
+        assert DedupeConfig.for_recon().infra_dedupe_categories == ('recon_integrity_issue',)
+
+    # --- (c) behavioural fold against a real queue ---
+
+    def test_for_gate_backlog_folds_regardless_of_age(self, tmp_path):
+        """A 400h-old parent still folds: same id, one pending record, dedupe_count==1."""
+        from datetime import UTC, datetime, timedelta
+
+        from escalation.dedupe import DedupeConfig, submit_or_dedupe
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+
+        # Backdate well past any bounded window (400h ≈ 16.7 days).
+        old_ts = (datetime.now(UTC) - timedelta(hours=400)).isoformat()
+        parent = self._make_gate_esc('esc-645-1', ts=old_ts)
+        parent_id = queue.submit(parent)
+
+        child = self._make_gate_esc('esc-645-2')
+        child.summary = 'Gate task 645 has awaited a human decision since 2026-08-10T00:00:00+00:00 (452h)'
+        result = submit_or_dedupe(queue, child, DedupeConfig.for_gate_backlog())
+
+        assert result['status'] == 'dedup_skipped', (
+            f'400h-old gate-backlog parent must still fold; got: {result}'
+        )
+        assert result['parent_id'] == parent_id
+        pending = queue.get_pending()
+        assert len(pending) == 1, (
+            f'fold must leave exactly ONE pending record; got {len(pending)}'
+        )
+        assert queue.get(parent_id).dedupe_count == 1
+
+    # --- (d) negative ---
+
+    def test_for_gate_backlog_different_fingerprint_does_not_fold(self, tmp_path):
+        """A different fingerprint (different gate) gets its own record."""
+        from escalation.dedupe import DedupeConfig, submit_or_dedupe
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+
+        parent = self._make_gate_esc('esc-645-1', fingerprint='gate-fp-a')
+        submit_or_dedupe(queue, parent, DedupeConfig.for_gate_backlog())
+
+        other = self._make_gate_esc('esc-646-1', fingerprint='gate-fp-b')
+        result = submit_or_dedupe(queue, other, DedupeConfig.for_gate_backlog())
+
+        assert result['status'] != 'dedup_skipped', (
+            f'distinct gates must not fold into each other; got: {result}'
+        )
+        assert len(queue.get_pending()) == 2
+
+
 class TestSubmitOrDedupe:
     """submit_or_dedupe(queue, esc, config, now=None) — gated orchestration wrapper."""
 
