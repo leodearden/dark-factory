@@ -64,6 +64,13 @@ from typing import NamedTuple
 
 import pytest
 
+# The D5 assertion helper is imported, NOT re-derived: precedent
+# test_toolcall_markup_corpus.py:32 -- it must be the SAME code the
+# hand-authored specimen tests in test_toolcall_markup.py run. Bare import
+# works via conftest's tests/ sys.path insert (the
+# capability_manifest_corpus.py precedent).
+from test_toolcall_markup import assert_repair_invariants
+
 import shared.toolcall_markup as tm
 
 # Mirrors shared/tests/conftest.py:21 rather than inventing a second
@@ -92,7 +99,7 @@ _ALT2 = re.compile(r'\x3c/[A-Za-z_]\w*>\s*\x3cparameter\s+name="[^"]+">')
 
 
 def _read_report() -> str:
-    return REPORT_PATH.read_text()
+    return REPORT_PATH.read_text(encoding='utf-8')
 
 
 class TestContainment:
@@ -133,6 +140,43 @@ class TestContainment:
             f'{REPORT_PATH.name} matches the collection predicate\'s second '
             f'alternative at {match!r} — a future re-extraction of the '
             'transcript archive could pick this report up as a specimen.'
+        )
+
+    def test_alt1_pattern_matches_a_known_corrupt_string(self) -> None:
+        """Positive control for test_report_does_not_match_collection_predicate_alt1.
+
+        The negative test above only proves the report avoids ALT1; on its
+        own it says nothing about whether ALT1 still recognizes real
+        corruption. A typo that made ALT1 unmatchable (e.g. a dropped
+        '\\s*') would leave both tests passing forever while the
+        containment guarantee they advertise silently stopped meaning
+        anything. Built from tm.INVOKE_CLOSER rather than a literal, per
+        this file's own sentinel-literal hygiene.
+        """
+        corrupt = 'x' + tm.INVOKE_CLOSER
+        assert _ALT1.search(corrupt) is not None, (
+            'ALT1 no longer matches a known-corrupt string ending in the '
+            'bare invoke closer -- the negative test above would pass '
+            'vacuously.'
+        )
+
+    def test_alt2_pattern_matches_a_known_corrupt_string(self) -> None:
+        """Positive control for test_report_does_not_match_collection_predicate_alt2.
+
+        Same rationale as the ALT1 control immediately above: proves ALT2
+        still recognizes the mis-close-then-canonical-reopen shape it
+        exists to catch, so its sibling negative test cannot pass
+        vacuously. Built from tm.closer_for()/tm.CANONICAL_OPENER_PREFIX
+        rather than a literal, per this file's own sentinel-literal
+        hygiene.
+        """
+        corrupt = (
+            'x' + tm.closer_for('description') + '\n'
+            + tm.CANONICAL_OPENER_PREFIX + '"priority">low'
+        )
+        assert _ALT2.search(corrupt) is not None, (
+            'ALT2 no longer matches a known-corrupt mis-close-then-reopen '
+            'string -- the negative test above would pass vacuously.'
         )
 
 
@@ -283,6 +327,31 @@ class TestSpecimenAntiFabrication:
         ids = [s.id for s in specimens]
         assert len(set(ids)) == len(ids), f'duplicate specimen id in {ids}'
 
+    def test_every_fenced_specimen_block_has_a_parsed_header(self) -> None:
+        """A fenced block with no (or malformed) header is silently skipped.
+
+        _SPECIMEN_HEADER_RE only matches a ```text block that is
+        IMMEDIATELY preceded by a well-formed machine-readable comment -- a
+        missing header, or one whose fields are reordered or spaced
+        differently, simply fails to match and _parse_specimens drops that
+        block with no error. The parametrized gates below only ever see
+        _SPECIMENS, so a block excluded that way is silently exempted from
+        the anti-fabrication check the module docstring promises for
+        "every specimen the report presents". This counts the fenced
+        blocks with a pattern that does NOT require the header, and fails
+        loudly on any mismatch instead of leaving it to be found by
+        inspection.
+        """
+        text = _read_report()
+        block_count = len(re.findall(r'^```text$', text, re.MULTILINE))
+        assert block_count == len(_SPECIMENS), (
+            f'{REPORT_PATH.name} has {block_count} fenced ```text block(s) '
+            f'but only {len(_SPECIMENS)} parsed as machine-readable '
+            'specimens -- at least one fenced block has a missing or '
+            'malformed &#60;!-- specimen ... --&gt; header and is being '
+            'silently excluded from the anti-fabrication gate.'
+        )
+
     @pytest.mark.parametrize('specimen', _SPECIMENS, ids=_SPECIMEN_IDS)
     def test_specimen_is_detected_as_corrupted(self, specimen: _Specimen) -> None:
         assert tm.detect(specimen.value) is not None, (
@@ -310,15 +379,9 @@ class TestSpecimenAntiFabrication:
             "report's claim must equal what production code independently "
             'recovers.'
         )
-        assert tm.detect(result.clean_value) is None, (
-            f'{specimen.id}: repair() clean_value still trips detect()'
-        )
-        assert specimen.value.startswith(result.clean_value), (
-            f'{specimen.id}: clean_value is not a prefix of the specimen '
-            'value (invariant D5)'
-        )
-        for name, recovered_value in result.recovered.items():
-            assert recovered_value in specimen.value, (
-                f'{specimen.id}: recovered value for {name!r} is not a '
-                'verbatim substring of the specimen value (invariant D5)'
-            )
+        # D5 structural invariants (prefix, verbatim-substring, misclose
+        # boundary, envelope-free clean_value) -- the SAME helper
+        # test_toolcall_markup_corpus.py imports for its committed-corpus
+        # replay, rather than a re-derived (and weaker) inline copy that
+        # omitted the misclose-boundary clause.
+        assert_repair_invariants(specimen.value, result)
