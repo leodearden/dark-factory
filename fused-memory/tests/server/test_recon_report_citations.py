@@ -1661,6 +1661,139 @@ class TestCiteTaskCrossProjectNearCollision:
         ids = {item['finding_id'] for item in report['flagged_items']}
         assert ids == {local_id, foreign_id}
 
+    # -- THE NEAR-COLLISION LOG ------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_near_collision_emits_operator_legible_warning(self, caplog):
+        """A skipped near-collision is the ONLY observable evidence that a run
+        contained numerically-colliding cross-project task ids — and the
+        UNGUARDABLE add_finding→derived-sig half of that same run may have
+        silently folded two projects' findings. The line must therefore be
+        legible enough to identify both sides without re-running the stage.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='run-1', stage='task_knowledge_sync', project_id='dark_factory')
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.server.recon_report'):
+            local = state.add_finding(
+                run_id='run-1', severity='low', category='memory_stale',
+                description='local 42 is stale', suggested_action='a',
+                task_id='42', flag_type='X',
+            )
+            assert 'finding_id' in local, local
+            local_id = local['finding_id']
+
+            cite_local = await state.cite_task('run-1', local_id, 'dark_factory', '42')
+            assert 'error' not in cite_local, cite_local
+
+            foreign = state.add_finding(
+                run_id='run-1', severity='low', category='memory_stale',
+                description='foreign 42, worded differently', suggested_action='a',
+                task_id=None, flag_type='X',
+            )
+            assert 'finding_id' in foreign, foreign
+            foreign_id = foreign['finding_id']
+
+            result = await state.cite_task('run-1', foreign_id, 'other_project', '42')
+
+        # The log must not be buyable by changing behaviour.
+        assert 'error' not in result, result
+
+        warnings = _near_collision_warnings(caplog)
+        assert len(warnings) == 1, warnings
+        message = warnings[0]
+
+        for expected in (
+            foreign_id,          # the finding whose fold was skipped
+            local_id,            # the surviving anchor
+            'other_project',     # attempted citation's project
+            'dark_factory',      # anchor citation's project
+            "'42'",              # the colliding task id
+            "'X'",               # the flag_type completing the derived sig
+            "'run-1'",
+            "'task_knowledge_sync'",  # the stage that owns the skipped finding
+        ):
+            assert expected in message, (expected, message)
+
+    @pytest.mark.asyncio
+    async def test_genuine_same_project_fold_emits_no_near_collision_warning(self, caplog):
+        """Negative control: an ordinary same-project duplicate is not a
+        near-collision. Its own task-4184 purge WARNING must still fire —
+        that fold DOES destroy content — but no near-collision line.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='run-1', stage='task_knowledge_sync', project_id='dark_factory')
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.server.recon_report'):
+            anchor = state.add_finding(
+                run_id='run-1', severity='low', category='memory_stale',
+                description='anchor 2405', suggested_action='a',
+                task_id='2405', flag_type='X',
+            )
+            assert 'finding_id' in anchor, anchor
+            anchor_id = anchor['finding_id']
+
+            cite_anchor = await state.cite_task('run-1', anchor_id, 'dark_factory', '2405')
+            assert 'error' not in cite_anchor, cite_anchor
+
+            incoming = state.add_finding(
+                run_id='run-1', severity='low', category='memory_stale',
+                description='incoming 2405, worded differently', suggested_action='a',
+                task_id=None, flag_type='X',
+            )
+            assert 'finding_id' in incoming, incoming
+            incoming_id = incoming['finding_id']
+
+            result = await state.cite_task('run-1', incoming_id, 'dark_factory', '2405')
+
+        assert result.get('error') == 'duplicate_finding'
+        assert result.get('existing_finding_id') == anchor_id
+
+        assert _near_collision_warnings(caplog) == []
+        assert _fold_purge_warnings(caplog) != []
+
+    @pytest.mark.asyncio
+    async def test_unpinned_anchor_fold_emits_no_near_collision_warning(self, caplog):
+        """The ACCEPTED-AMBIGUITY half, made executable rather than only
+        documented.
+
+        The anchor's derived-sig ownership came from
+        ``add_finding(task_id='99')``, which names NO project — so there is
+        nothing to compare the incoming other_project:99 citation against.
+        This fold still fires (it is the intended one per the operator
+        ruling) and must NOT be reported as a near-collision: no guard at
+        this layer can tell whether the two findings are about the same task.
+        """
+        state, _ = self._make_state()
+        state.start_report(run_id='run-1', stage='task_knowledge_sync', project_id='dark_factory')
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.server.recon_report'):
+            anchor = state.add_finding(
+                run_id='run-1', severity='low', category='memory_stale',
+                description='anchor 99, never cited', suggested_action='a',
+                task_id='99', flag_type='X',
+            )
+            assert 'finding_id' in anchor, anchor
+            anchor_id = anchor['finding_id']
+            # Deliberately NO cite_task on the anchor: cited_tasks stays empty,
+            # so it carries no project pin at all.
+
+            incoming = state.add_finding(
+                run_id='run-1', severity='low', category='memory_stale',
+                description='incoming 99, worded differently', suggested_action='a',
+                task_id=None, flag_type='X',
+            )
+            assert 'finding_id' in incoming, incoming
+            incoming_id = incoming['finding_id']
+
+            result = await state.cite_task('run-1', incoming_id, 'other_project', '99')
+
+        assert result.get('error') == 'duplicate_finding'
+        assert result.get('existing_finding_id') == anchor_id
+        assert state._resolve_finding('run-1', incoming_id) is None
+
+        assert _near_collision_warnings(caplog) == []
+
 
 # ---------------------------------------------------------------------------
 # task-4184 step-1/step-3: TestCiteTaskFoldPurgeLogging — RED until step-2/4
@@ -1669,6 +1802,13 @@ class TestCiteTaskCrossProjectNearCollision:
 # ---------------------------------------------------------------------------
 
 _FOLD_PURGE_MARKER = 'cite_task fold purged finding'
+
+# task-4185. Deliberately shares no substring with _FOLD_PURGE_MARKER: the two
+# filters below must partition this module's cite_task warnings, so each
+# family's negative control can assert `== []` without the other's line
+# satisfying it. Nothing is purged on this path — a near-collision KEEPS both
+# findings — so it is a distinct event, not a variant of the 4184 record.
+_NEAR_COLLISION_MARKER = 'cite_task entity-scoped fold SKIPPED'
 
 
 def _fold_purge_warnings(caplog) -> list[str]:
@@ -1679,6 +1819,13 @@ def _fold_purge_warnings(caplog) -> list[str]:
     unrelated warning from the same module.
     """
     return [r.getMessage() for r in caplog.records if _FOLD_PURGE_MARKER in r.getMessage()]
+
+
+def _near_collision_warnings(caplog) -> list[str]:
+    """The rendered cross-project near-collision WARNINGs captured so far
+    (task-4185). Marker-filtered, mirroring :func:`_fold_purge_warnings`.
+    """
+    return [r.getMessage() for r in caplog.records if _NEAR_COLLISION_MARKER in r.getMessage()]
 
 
 class TestCiteTaskFoldPurgeLogging:
