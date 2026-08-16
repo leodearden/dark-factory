@@ -379,16 +379,28 @@ def clamp_unit_score(score: float) -> float:
     path delivered it.
 
     Clamps to ``[0, 1]`` and rounds to 4 decimal places — the precision
-    :func:`score_plan_structure` has always used. Does NOT handle NaN: ``min``/
-    ``max`` are ordering operations and NaN is unordered, so a NaN input passes
-    straight through unclamped (``round(min(max(nan, 0.0), 1.0), 4)`` is
-    ``nan``). ``+/-Infinity`` DOES clamp mechanically (to ``1.0``/``0.0``), but
-    that answer is a fabricated best/worst score rather than a measurement —
-    not something this function can tell apart from a real one. A caller with
-    untrusted input (:func:`judge_plan_quality`) therefore rejects ALL
-    non-finite input, NaN and +/-Infinity alike, before ever calling this:
-    this function's contract is finite-in, ``[0, 1]``/4dp-out.
+    :func:`score_plan_structure` has always used. ``min``/``max`` are ordering
+    operations, so if this function accepted non-finite input, a NaN would
+    pass straight through unclamped (``round(min(max(nan, 0.0), 1.0), 4)`` is
+    ``nan``) and ``+/-Infinity`` would clamp mechanically (to ``1.0``/``0.0``)
+    while actually being a fabricated best/worst score rather than a
+    measurement — not something this function could tell apart from a real
+    one. Rather than leave that a convention callers must remember, this
+    function REJECTS all non-finite input outright with ``ValueError`` — a
+    loud floor, not just a documented one (structured-facts-at-failure). The
+    one caller with untrusted input (:func:`judge_plan_quality`) already
+    pre-checks with its own ``math.isfinite`` guard and degrades gracefully to
+    the ``None`` sentinel (with a WARNING) before ever reaching here, so in
+    practice this raise is a defense-in-depth backstop for a future second
+    caller that forgets to — the same class of gap :func:`is_scorable_plan`'s
+    docstring warns a second caller could otherwise silently re-open. This
+    function's contract is finite-in, ``[0, 1]``/4dp-out, ``ValueError`` on
+    anything else.
     """
+    if not math.isfinite(score):
+        raise ValueError(
+            f'clamp_unit_score requires finite input, got {score!r}'
+        )
     return round(min(max(score, 0.0), 1.0), 4)
 
 
