@@ -65,6 +65,30 @@ if __name__ == "__main__":
 '''
 
 
+@pytest.fixture(autouse=True)
+def no_real_gpu_probe(monkeypatch):
+    """Nothing in this module may shell out to the real `nvidia-smi`.
+
+    AUTOUSE, and that is the point.  `start()` reads the consumer inventory
+    itself when the caller passes no `consumers=`, so a test that only injects
+    `gpu=` silently reached the host's actual card -- and then PASSED OR FAILED
+    ON WHATEVER THAT CARD HAPPENED TO HOLD.  Verified: with a stub nvidia-smi
+    reproducing the documented 2026-08-06 reading (whisper 4050 + ollama
+    10314), seven tests in this file failed; they were green only because the
+    developer's card was idle at that moment.  A suite whose verdict depends on
+    the machine's GPU state is not pinning anything, and the failure would
+    surface as an unrelated-looking red on someone else's rig.
+
+    The default is the ORDINARY card -- whisper-writer alone, which every
+    `EXPECTED_CONSUMERS` rule admits -- so a test that does not care about the
+    inventory need not mention it.  A test that does care overrides this by
+    passing `consumers=` or monkeypatching again; both win, because they are
+    applied after.
+    """
+    monkeypatch.setattr(lms_vram, 'probe_gpu', lambda *a, **k: MEASURED_GPU)
+    monkeypatch.setattr(lms_vram, 'probe_gpu_consumers', lambda *a, **k: [WHISPER])
+
+
 @pytest.fixture
 def baseline_dir(tmp_path, monkeypatch):
     """Point the per-arm baseline store at tmp_path.
@@ -367,6 +391,46 @@ def test_cli_start_still_returns_4_when_the_arm_simply_does_not_fit(
 #: A co-resident arm's vLLM container as `--query-compute-apps` reports it:
 #: indistinguishable from any other `python`, and far over whisper's ceiling.
 CORESIDENT_ARM = lms_vram.GpuConsumer(pid=41001, process_name='python', used_mib=9000)
+
+
+def test_an_exclusive_start_blames_the_running_arm_not_the_card(
+    fake_systemctl, baseline_dir, cli_gpu, monkeypatch, capsys,
+):
+    """Exit 4 and "stop them first", NOT exit 5 and "free the card".
+
+    The co-resident arm is in the inventory as an oversized `python`, so the
+    strict pollution rule would call it a foreign intruder. Both refusals are
+    correct; only one is actionable. "Another ARM is running" is decidable from
+    systemd and nowhere else, so it must be asked BEFORE the guard that cannot
+    tell ours from theirs -- otherwise the operator is told to free a card they
+    deliberately loaded, and the message names ollama, which is not there.
+    """
+    monkeypatch.setenv('FAKE_SYSTEMCTL_LIST_UNITS', _LIST_UNITS_FIXTURE)
+    cli_gpu['consumers'] = [WHISPER, CORESIDENT_ARM]
+
+    code = lms_ctl.main(['start', 'phi-4-14b'])
+
+    assert code == 4
+    err = capsys.readouterr().err
+    assert 'granite-embedding-english-r2' in err or 'qwen3.5-9b' in err
+    assert 'stop them first' in err
+    # The polluted-card remedy must not appear: it would send the operator
+    # into a retry loop against an intruder that does not exist.
+    assert 'free the card' not in err
+    assert ['start', 'lms-arm@phi-4-14b.service'] not in fake_systemctl.calls()
+
+
+def test_an_exclusive_start_on_an_idle_card_still_refuses_a_real_intruder(
+    fake_systemctl, baseline_dir, cli_gpu, capsys,
+):
+    """Reordering exclusivity ahead of pollution must not cost exit 5 its
+    motivating case: with no arm running, ollama is still the answer."""
+    cli_gpu['consumers'] = [WHISPER, OLLAMA]
+
+    code = lms_ctl.main(['start', 'qwen3.5-9b'])
+
+    assert code == 5
+    assert '/usr/local/lib/ollama/llama-server' in capsys.readouterr().err
 
 
 def test_no_exclusive_starts_while_another_arm_legitimately_holds_the_card(
