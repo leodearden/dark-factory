@@ -132,3 +132,84 @@ def test_module_loads_with_its_documented_surface(fep: types.ModuleType) -> None
     assert set(fep.RESERVED) == {8002, 8103}
     assert len(fep.CONFIG_NAMES) > 0
     assert fep.CONFIG_NAMES[0] == "dark-factory-orchestrator.yaml"
+
+
+# ---------------------------------------------------------------------------
+# known_project_roots — sibling-fallback discovery
+# ---------------------------------------------------------------------------
+
+
+def test_known_project_roots_returns_immediate_directory_siblings(
+    fep: types.ModuleType, no_systemd: None, tmp_path: pathlib.Path
+) -> None:
+    """The sibling-glob fallback enumerates the immediate DIRECTORY children of
+    ``df_root.parent`` — nothing shallower, nothing deeper, no files.
+
+    RE-MEASURED at base main ``fc6f048b55``: over a parent also containing a
+    ``loose.txt`` and a grandchild ``proj-a/nested/``, the result is exactly
+    ``['dark-factory', 'proj-a', 'target']``.
+
+    Compared as a SET of resolved paths, never by index: ordering between the
+    systemd-env source and this glob is step-3's property, and pinning it here too
+    would over-constrain a rule this test does not own.
+
+    MEASURED RED at base ``fc6f048b55``, named scratch mutations of
+    find_escalation_port.py, all reverted before commit:
+
+      1. widening the glob (line 70) to ``df_root.parent / '*' / '*'`` — RED::
+
+           E  AssertionError: assert {PosixPath('/...oj-a/nested')} == {...}
+           E    Extra items in the left set:
+           E    PosixPath('.../test_known_project_roots_retur0/proj-a/nested')
+           E    Extra items in the right set:
+
+      2. the non-directory exclusion is guarded by a REDUNDANT PAIR of ``is_dir()``
+         checks, and reddens only when BOTH are removed. Recorded as measured, not
+         predicted, because the two single-filter mutations were each observed GREEN
+         and a docstring claiming otherwise would be false:
+
+           - dropping ONLY ``and r.is_dir()`` from the dedup loop (line 77):
+             ``3 passed`` — the glob comprehension's own filter still excludes
+             ``loose.txt``. That dedup-loop filter's observable role is the
+             SYSTEMD-ENV branch (a stale unit env naming a path that is not a
+             directory), which is why step-3 owns its falsification, not this test.
+           - dropping ONLY ``if Path(p).is_dir()`` from the glob (line 70):
+             ``3 passed`` — the dedup loop's filter still excludes it.
+           - dropping BOTH — RED::
+
+               E  AssertionError: assert {PosixPath('/...tur0/target')} == {...}
+               E    Extra items in the left set:
+               E    PosixPath('.../test_known_project_roots_retur0/loose.txt')
+    """
+    parent, df_root = _project_tree(tmp_path)
+
+    got = {p.resolve() for p in fep.known_project_roots(df_root)}
+
+    assert got == {
+        (parent / "dark-factory").resolve(),
+        (parent / "proj-a").resolve(),
+        (parent / "target").resolve(),
+    }
+
+    # The checkout itself is included: it is a project root too, and its own
+    # config is exactly what --exclude-root exists to suppress (step-8).
+    assert df_root.resolve() in got
+    # A non-directory sibling is excluded (the r.is_dir() filter).
+    assert (parent / "loose.txt").resolve() not in got
+    # Discovery does not recurse: a grandchild directory is not a project root.
+    assert (parent / "proj-a" / "nested").resolve() not in got
+
+
+def test_known_project_roots_on_empty_parent_returns_empty_list(
+    fep: types.ModuleType, no_systemd: None, tmp_path: pathlib.Path
+) -> None:
+    """An empty parent yields ``[]`` rather than raising.
+
+    The nonexistent ``df_root`` is deliberate: the function only ever touches
+    ``df_root.parent``, so a not-yet-created checkout must survey cleanly instead of
+    exploding — this is the path a fresh ``factory-init`` run takes.
+    """
+    empty_parent = tmp_path / "empty-parent"
+    empty_parent.mkdir()
+
+    assert fep.known_project_roots(empty_parent / "dark-factory") == []
