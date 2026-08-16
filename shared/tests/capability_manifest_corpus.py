@@ -26,6 +26,7 @@ discovery is ``git ls-files``-based instead — the same shape as
 
 from __future__ import annotations
 
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -179,3 +180,82 @@ def iter_script_checks(path: Path) -> list[ScriptCheckRef]:
         and cap.delivered_check.kind == 'script'
         and cap.delivered_check.script
     ]
+
+
+def check_script_target(ref: ScriptCheckRef, repo_root: Path = REPO_ROOT) -> str | None:
+    """Check one script target exists and is executable in the WORKING tree.
+
+    Returns ``None`` on success, else one grep-able line — the same contract
+    :func:`check_manifest` uses, with the same ``relative_to(repo_root)``
+    display-path convention and the same no-embedded-newline discipline, so
+    the two corpus checkers read identically and their failures grep alike.
+    Unlike ``check_manifest``, the line is attributed by sidecar AND
+    capability, because one sidecar can declare several script checks.
+
+    This is the exact property ``orchestrator.delivered_checks._run_script_check``
+    depends on: it builds ``argv = [str(Path(project_root) / meta.script), *args]``
+    and execs the target DIRECTLY (``argv[0]`` is the script, not ``python``),
+    so a missing or non-executable target raises ``OSError``, which
+    ``run_delivered_check``'s catch-all maps to ``DeliveredCheckResult.ERRORED``
+    — the check never FAILs, it ERRORs forever, silently un-gating the
+    capability it was supposed to gate. Hence ``is_file()`` gates before
+    ``os.access``: a *directory* at the script path is +x and would sail past
+    a bare ``os.access`` check while still being unexecutable.
+
+    Deliberately does NOT assert the target carries a valid shebang. A
+    shebang-less executable fails direct exec with ``ENOEXEC`` and would ERROR
+    the same way, but both current targets carry ``#!/usr/bin/env python3``
+    and ``scripts/tests/test_check_method_param_wiring.py``'s
+    ``TestEndToEndAgainstTheRealRepo`` already covers it for one of them by
+    actually exec'ing it — the omission is weighed, not missed (task 3649).
+    """
+    try:
+        display_manifest: Path | str = ref.manifest.relative_to(repo_root)
+    except ValueError:
+        display_manifest = ref.manifest
+    prefix = f'{display_manifest}: capability {ref.capability!r}: {ref.script}'
+    target = repo_root / ref.script
+    if not target.is_file():
+        return (
+            f'{prefix} does not exist — _run_script_check execs it as argv[0], '
+            'so the check ERRORs forever'
+        )
+    if not os.access(target, os.X_OK):
+        return (
+            f'{prefix} is not executable — _run_script_check execs it as argv[0], '
+            'so a non-executable target ERRORs forever'
+        )
+    return None
+
+
+def committed_file_mode(rel: str, repo_root: Path = REPO_ROOT) -> str | None:
+    """The git INDEX mode for *rel* (e.g. ``'100755'``), or ``None`` if untracked.
+
+    The companion to :func:`check_script_target`'s working-tree check, and not
+    redundant with it: ``os.access`` is greened by a local ``chmod +x`` that is
+    never staged, which would leave ``main`` exactly as broken while the guard
+    reported green — the precise hazard task 3649 exists to fix, since its whole
+    subject is a mode bit that never made it into the index.
+
+    Reuses :func:`discover_manifests`' subprocess idiom verbatim — same ``-z``
+    output, same 30s timeout, same ``except (OSError, subprocess.TimeoutExpired)``
+    guard and returncode check — so this second git shell-out has identical
+    non-checkout / missing-binary / ``index.lock``-wedge behaviour rather than a
+    differently-guarded one. Returns ``None`` for empty output (path not tracked).
+    """
+    try:
+        result = subprocess.run(
+            ['git', '-C', str(repo_root), 'ls-files', '-s', '-z', '--', rel],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    records = [r for r in result.stdout.split('\0') if r]
+    if not records:
+        return None
+    # `git ls-files -s` record: "<mode> <object> <stage>\t<path>".
+    return records[0].split(' ', 1)[0]
