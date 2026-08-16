@@ -196,22 +196,27 @@ fi
 # sessions (no CLAUDE_SPAWN_SESSION_ID in the environment) are unaffected --
 # their hooks still key on session_id, exactly as before.
 #
-# Caveat (reviewer-flagged): once exported, CLAUDE_SPAWN_SESSION_ID is
-# inherited by EVERY descendant process of the spawned session, not only its
-# top-level claude -- including a nested `claude` the spawned agent starts
-# directly by some OTHER means than this script (e.g. its own Bash tool). A
-# nested claude started THROUGH this script gets its own fresh value
-# (recomputed below from ITS OWN launcher_pid), so it is unaffected; a
-# nested claude NOT started through this script instead inherits this
-# value, and its SessionStart/Notification/Stop hooks then adopt it too --
-# collapsing that child's lifecycle writes onto THIS spawn's record instead
-# of getting a record of its own. This is a behavioral regression vs the
-# prior session_id-only keying, where every nested claude naturally got its
-# own record. Fixing it behaviorally belongs in hook_session_slug
-# (orchestrator/session_hooks.py, out of this task's module scope --
-# distinguishing a slug's first SessionStart from a later, different
-# session_id reusing the same inherited env var); documented here as a
-# known limitation rather than worked around in this script.
+# Caveat (reviewer-flagged; RESOLVED in task 4193, see below): once
+# exported, CLAUDE_SPAWN_SESSION_ID is inherited by EVERY descendant process
+# of the spawned session, not only its top-level claude -- including a nested
+# `claude` the spawned agent starts directly by some OTHER means than this
+# script (e.g. its own Bash tool). A nested claude started THROUGH this
+# script gets its own fresh value (recomputed below from ITS OWN
+# launcher_pid), so it is unaffected; a nested claude NOT started through
+# this script instead inherits this value.
+#
+# RESOLVED (task 4193) in the Python layer, with no change needed here --
+# this export and the spawn_id_export below stay exactly as they are. The
+# first hook event to adopt a slug binds its own Claude Code session_id
+# (hook stdin) into record.claude_session_id
+# (orchestrator/session_hooks.py, _bind_claude_session_id), and any later
+# hook arriving with a DIFFERENT stdin session_id is recognised as an
+# inheritor-not-owner: hook_session_slug falls through to the hand-launched
+# build_session_slug keying, so that nested claude gets its OWN record
+# instead of collapsing its lifecycle writes onto THIS spawn's. The stdin
+# session_id is the only token that can make that distinction -- a nested
+# claude is also a descendant of the original launcher, so PID lineage
+# cannot tell an owner from an inheritor.
 spawn_id_export=""
 parent_id_export=""
 if [ -n "$SESSION_RECORD_DIR" ]; then
