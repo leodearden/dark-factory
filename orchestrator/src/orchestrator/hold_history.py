@@ -177,7 +177,8 @@ def _apply_release(
     release for the modules a plan refinement narrowed away while the task keeps
     holding the rest (scheduler.py:6954-6959).  A release with no open span is
     an orphan (3,594 DF / 5,780 reify in the measured trace) and is skipped —
-    the ``if task_id in open_acquires`` guard from analyze_modules.py:145.
+    a rule inherited from ``analyze_modules``' own pairing loop, which task 3869
+    then deleted by converging that CLI onto this helper.
     """
     for module in modules:
         start = open_spans.pop((task_id, module), None)
@@ -202,9 +203,9 @@ def iter_hold_spans(rows: Iterable[dict]) -> Iterator[HoldSpan]:
     predictor anyway.
 
     A release with no open span is an ORPHAN-RELEASE (3,594 DF / 5,780 reify
-    in the measured trace) and is silently ignored — the
-    ``if task_id in open_acquires`` guard from analyze_modules.py:145 carried
-    over verbatim.
+    in the measured trace) and is silently ignored.  ``analyze_modules`` used
+    to guard this in its own pairing loop; task 3869 pointed that CLI here
+    instead, so the rule now lives in one place.
 
     ERA BOUNDARIES close every still-open span at the boundary timestamp and
     mark it ``truncated``.  The span is *counted*, not discarded:

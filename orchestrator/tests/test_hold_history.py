@@ -1230,9 +1230,10 @@ def test_a_lock_row_with_an_unusable_payload_opens_nothing(data):
 
 
 def test_a_bare_string_modules_payload_is_read_as_one_module():
-    """analyze_modules.py:135-136 tolerates the same shape.  It is coerced, not
-    dropped: a string is unambiguous about which single module it names, so
-    discarding it would throw away a real hold."""
+    """It is coerced, not dropped: a string is unambiguous about which single
+    module it names, so discarding it would throw away a real hold.  (Both
+    consumers now get this from ``modules_of``; analyze_modules carried its own
+    copy of the coercion until task 3869.)"""
     rows = [
         dict(F.row(1, 0, 'lock_acquired', task_id='T1'), data={'modules': 'orchestrator/src'}),
         F.release(2, 60, 'T1', ['orchestrator/src']),

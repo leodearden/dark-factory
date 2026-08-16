@@ -1,10 +1,10 @@
 """Per-module conflict analysis — input for hand-curated orchestrator.yaml overrides.
 
 Reads ``runs.db`` events (``lock_acquired`` / ``lock_released`` /
-``task_skipped`` / ``merge_attempt``) and aggregates per-first-path-component:
+``task_skipped`` / ``merge_attempt`` / ``service_restart``) and aggregates:
 
 * total dispatches
-* average hold time
+* average hold time, and how much of it is censored (see below)
 * conflict proxy — how often a dispatch on that module coincides with a
   skipped task that wanted the same module
 * suggested ``max_per_module`` override
@@ -13,6 +13,41 @@ The recommendation is intentionally coarse: 1 for highly-conflicted modules,
 2–3 for busy-but-mergeable ones, 4 for low-conflict modules.  Apply by hand
 to the relevant subproject ``orchestrator.yaml`` and observe follow-on
 ``task_skipped`` rates.
+
+THE GROUPING KEY IS THE LOCK MODULE
+-----------------------------------
+Rows are keyed by the depth-coarsened lock module as the event payload
+carries it — ``orchestrator/src``, not ``orchestrator``.  That is the exact
+key the lock layer enforces on: ``ModuleLockTable._limit_for``
+(scheduler.py:1505-1517) normalizes to ``normalize_lock(module, lock_depth)``
+and reads ``module_overrides`` under the same string.  No first-path-component
+key exists anywhere in the lock layer, so the ``suggest`` column — whose whole
+purpose is to be pasted into an override file — has to be published under this
+one to name anything real.
+
+The payload is used VERBATIM; ``normalize_lock`` is deliberately not re-applied
+here.  Doing so would need the *emitting* project's ``lock_depth``, and this CLI
+is handed a ``runs.db`` path with no config to read it from: hardcoding the
+default 2 would be a no-op for depth-2 payloads and would silently coarsen
+below the enforcement key for any project running deeper.
+
+WHAT ``avg_hold_s`` IS MADE OF
+------------------------------
+Hold spans come from :func:`hold_history.iter_hold_spans` — the one shared
+acquire→release pairing helper with era-boundary closing (PRD INV-5), also used
+by the dispatch-scoring predictor, so the two cannot drift on what a hold is.
+
+Consequently a span ended by an ERA BOUNDARY (a ``service_restart`` row, or a
+run change) IS counted, as a right-censored lower bound: the lock did block
+others up to that point (PARKING_MODEL_REPORT.md:102).  Before task 3869 those
+spans were dropped outright — 1,283 DF / 4,776 reify of them in the measured
+trace, all of them long holds — which biased ``avg_hold_s`` low in exactly the
+direction that hides contention.  The ``trunc`` column (``truncated_holds`` in
+``--json``) is how many samples behind the mean are such lower bounds.
+
+Still dropped, because nothing observed an end to fabricate one from: holds
+open at the end of the ``--since`` window.  A release whose acquire fell before
+the window is likewise an orphan and contributes nothing.
 
 Usage
 -----
