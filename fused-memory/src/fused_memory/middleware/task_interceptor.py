@@ -1893,13 +1893,19 @@ class TaskInterceptor:
         * ``False`` (default) — the FILES-certain hard reject.  No task was
           created; the caller receives the ``DarkFactoryPathScopeViolation``
           error dict.
-        * ``True`` — the PROSE-only advisory.  Nothing was blocked: the task
-          WAS created and stamped with ``metadata.possible_scope_mismatch``.
+        * ``True`` — the PROSE-only advisory.  Nothing was blocked: the
+          submission proceeds, stamped with
+          ``metadata.possible_scope_mismatch``.
 
         Getting this wrong is not cosmetic — an advisory filed with rejection
         wording tells the operator (and any agent reading it in a briefing)
-        that a task was rejected when it in fact exists, and instructs a
-        resubmission of work that already landed.
+        that a task was rejected when nothing was blocked, and instructs a
+        resubmission of work that was never turned away.  The advisory
+        wording must not over-claim in the other direction either: this seam
+        sits in ``submit_task`` PHASE-1, before ``tm.add_task`` and before
+        the submission has been resolved (it may yield a new task, be folded
+        into an existing one, or be dropped), so neither this docstring nor
+        the escalation may state that a task exists (task 4159).
 
         The optional *llm_reason* is forwarded to ``report_rejection``
         (task 1822) so genuine-misroute / fail-safe cases carry the LLM
@@ -1969,7 +1975,10 @@ class TaskInterceptor:
           unsuppressed hit,
           ``kwargs['metadata']['possible_scope_mismatch']`` is attached (via
           :meth:`_attach_possible_scope_mismatch`) and a ``scope_violation``
-          escalation fires (loud, non-blocking).
+          escalation fires (loud, non-blocking).  Both act on the
+          SUBMISSION: this runs in ``submit_task`` phase-1, so the stamp
+          reaches a task only if one is later CREATED from that submission,
+          and the escalation must not claim otherwise (task 4159).
 
           NOT SILENT when suppressed: one structured INFO record carries the
           matched prose prefixes, the prose-suggested owner, the filing
@@ -2072,7 +2081,9 @@ class TaskInterceptor:
         # PROSE-ADVISORY: a heuristic hit never blocks creation — the
         # escalation below preserves the signal loudly; the marker lets
         # async triage see it too.  advisory=True so the escalation the
-        # operator reads says the task was CREATED, not rejected (task 3119).
+        # operator reads says nothing was blocked, rather than reporting a
+        # rejection (task 3119) — and, since this is submit_task phase-1,
+        # without claiming a task exists either (task 4159).
         self._emit_scope_violation_escalation(
             verdict, candidate, kwargs, project_root, project_id,
             llm_reason=None, advisory=True,
@@ -2530,7 +2541,10 @@ class TaskInterceptor:
         Called from :meth:`_path_guard_or_skip`, which runs BEFORE
         ``submit_task`` pops ``kwargs['metadata']`` and serialises it into the
         ticket blob — so this in-place mutation is sufficient to carry the
-        marker onto the created task with no new plumbing.
+        marker onto the task the curator creates from that ticket, when one
+        is created, with no new plumbing.  It does not reach a ``combine``
+        target: :meth:`_execute_combine` merges only the ``curator_*`` keys
+        onto the existing task (task 4159).
         """
         metadata = kwargs.get('metadata')
         meta = TaskInterceptor._extract_metadata_dict(metadata)

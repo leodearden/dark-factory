@@ -10201,7 +10201,13 @@ class TestPathGuardEscalationWordingEndToEnd:
         interceptor,
         tmp_path,
     ):
-        """A prose-only hit: task created AND the record says so."""
+        """A prose-only hit: submission allowed AND the record says so.
+
+        Not "task created": this seam is ``submit_task`` phase-1, so what is
+        established here is that nothing was blocked and the stamp is on the
+        submission — whether a task results from it is not settled here
+        (task 4159).
+        """
         from fused_memory.middleware.scope_violation_escalator import (
             ScopeViolationEscalator,
         )
@@ -10233,7 +10239,7 @@ class TestPathGuardEscalationWordingEndToEnd:
         payload = self._written_payload(tmp_path)
         summary = payload['summary']
         assert 'reject' not in summary.lower(), (
-            f'record claims a rejection but the task was created: {summary!r}'
+            f'record claims a rejection but nothing was blocked: {summary!r}'
         )
         assert payload['suggested_action'] == 'no_action_advisory_only', payload
 
