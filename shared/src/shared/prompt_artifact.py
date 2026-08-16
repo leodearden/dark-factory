@@ -19,7 +19,8 @@ strict ``__all__`` union assertion untouched.
 A pinned artifact is only ever trusted when both its heuristics block and a
 schema-valid provenance sidecar are present; anything else (nothing pinned,
 an orphan heuristics file, a corrupt/incomplete provenance sidecar, or a
-sidecar that exists but cannot be read) fails safe to the in-code constant.
+sidecar, key directory, or ancestor directory that exists but cannot be read)
+fails safe to the in-code constant.
 :func:`default_artifacts_root` gives every consumer (the T6 optimization
 loop, T2/T3 call sites, T8 tooling) one agreed on-disk root, so they never
 each invent a divergent location for the same on-disk state.
@@ -285,13 +286,21 @@ class PromptArtifactStore:
         in-code constant — nothing pinned, an orphan heuristics file, a
         corrupt/incomplete provenance sidecar, a provenance sidecar recorded
         for a different ``harness_version`` than this key (e.g. a manually
-        relocated/tampered sidecar), a provenance sidecar that exists but
-        cannot be read (a permission flip mid-operation, or the path replaced
-        by a directory — logged once per path per process so a
+        relocated/tampered sidecar), an on-disk path that exists but cannot be
+        read, or a heuristics.txt that vanishes between the provenance check
+        below and the read (e.g. a concurrent :meth:`unpin` racing this call).
+
+        The unreadable case covers **both** on-disk reads, because either can
+        fail on its own: the ``exists()`` probe below (when the key directory
+        — or any *ancestor* of it, such as the whole artifacts root — is
+        unreadable) and the provenance sidecar itself (a permission flip
+        mid-operation, or the path replaced by a directory). Guarding only the
+        latter is not enough: ``Path.exists()`` swallows just
+        ENOENT/ENOTDIR/EBADF/ELOOP/EINVAL (``pathlib._abc._ignore_error``), so
+        EACCES propagates out of the probe before the sidecar load is ever
+        reached. Both limbs are logged once per path per process so a
         wholesale-unreadable root stays diagnosable rather than looking like
-        "nothing pinned"), or a heuristics.txt that vanishes between the
-        provenance check below and the read (e.g. a concurrent :meth:`unpin`
-        racing this call).
+        "nothing pinned".
 
         Performance note: this does disk I/O — an ``exists()`` check, a JSON
         load + schema validation, and a text read — on every call, with no
