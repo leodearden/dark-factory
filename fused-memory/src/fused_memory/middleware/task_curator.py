@@ -1042,6 +1042,16 @@ class TaskCurator:
         )
         return decision
 
+    @staticmethod
+    def _claim_verification_text(candidate: CandidateTask) -> str:
+        """Concatenated candidate text the claim-verification guard scans.
+
+        Single source of truth for both :meth:`_maybe_flag_unverified_claims`
+        (per-candidate extraction) and ``curate_batch_prepared``'s batch-level
+        "does any candidate carry a claim" pre-check, so the two never drift.
+        """
+        return f'{candidate.title}\n{candidate.description}\n{candidate.details}'
+
     async def _maybe_flag_unverified_claims(
         self, candidate: CandidateTask, probe: Callable[[str], bool] | None = None,
     ) -> list[AttributedClaim]:
@@ -1060,6 +1070,13 @@ class TaskCurator:
         ``self._cwd`` via ``make_source_and_history_probe`` when not injected —
         tests inject a fake probe to stay git-free).
 
+        Claim extraction runs FIRST and is pure/sync/cheap (a regex scan, no
+        I/O): when *candidate* carries no attributed claim at all — the
+        overwhelmingly common case, since a claim requires a code token AND a
+        numbered task/ACTION/commit anchor within the co-occurrence window —
+        this returns ``[]`` before a probe is ever built or a worker thread is
+        ever spawned for it.
+
         Unlike :meth:`_maybe_premise_refuted_drop`, this hook NEVER drops the
         candidate or returns/mutates a :class:`CuratorDecision` — it only surfaces
         unverified claims via a grep-stable ``recon_claim_verification.unverified``
@@ -1074,6 +1091,9 @@ class TaskCurator:
           claim can be verified (one WARNING logged).
         - *candidate*'s title/description/details carry no attributed claims at all.
         - Every attributed claim's token verifies present (self-correcting).
+        - Probe construction or verification raises for any reason (one
+          WARNING logged) — this is an advisory backstop and must never fail
+          the task submission it rides along with.
 
         Never raises.
         """
@@ -1090,31 +1110,51 @@ class TaskCurator:
             return []
 
         from fused_memory.middleware.recon_claim_verification_guard import (
+            extract_attributed_claims,
             make_source_and_history_probe,
-            unverified_claims_in_text,
+            verify_attributed_claims,
         )
 
-        if probe is None:
-            # Off the event loop: make_source_and_history_probe resolves the
-            # git top level via _resolve_git_toplevel — a blocking
-            # `git rev-parse --show-toplevel` subprocess bounded only by a 10s
-            # timeout. Typically milliseconds, but it is a fork/exec on the
-            # loop thread, and curate() reaches this on EVERY task submission
-            # while holding the per-project curator write lock. Mirrors
-            # curate_batch_prepared's construction (see the batch
-            # claim-verification block below), which already offloads.
-            probe = await asyncio.to_thread(make_source_and_history_probe, self._cwd)
+        claims = extract_attributed_claims(self._claim_verification_text(candidate))
+        if not claims:
+            return []
 
-        text = f'{candidate.title}\n{candidate.description}\n{candidate.details}'
-        # Offload to a worker thread: probe (when not injected by a test) is
-        # make_source_and_history_probe's blocking git-subprocess adapter —
-        # git grep, and on a miss (always true for a fabricated token, the
-        # exact case this guard targets) a full-history `git log --all -S`
-        # pickaxe too, up to ~10s each. Running it inline here would stall
-        # the curator/reconciliation event loop for every other coroutine
-        # sharing it. Both the construction (above) and this verification
-        # call are offloaded; unverified_claims_in_text itself stays pure/sync.
-        unverified = await asyncio.to_thread(unverified_claims_in_text, text, probe)
+        def _build_probe_and_verify(repo_root: Path) -> list[AttributedClaim]:
+            local_probe = make_source_and_history_probe(repo_root)
+            return verify_attributed_claims(claims, local_probe)
+
+        try:
+            if probe is None:
+                # Off the event loop, in a SINGLE thread-pool hop: construction
+                # resolves the git top level via _resolve_git_toplevel — a
+                # blocking `git rev-parse --show-toplevel` subprocess bounded
+                # only by a 10s timeout — and verification (git grep, and on a
+                # miss — always true for a fabricated token, the exact case
+                # this guard targets — a full-history `git log --all -S`
+                # pickaxe too, up to ~10s each) then runs against the
+                # freshly-built probe on that same worker thread. Only
+                # reached when `claims` above is non-empty, so a candidate
+                # with no attributed claim never pays for either. Mirrors
+                # curate_batch_prepared's construction (see the batch
+                # claim-verification block below), which likewise only
+                # builds a probe when at least one candidate in the batch
+                # carries a claim.
+                unverified = await asyncio.to_thread(_build_probe_and_verify, self._cwd)
+            else:
+                # probe was injected — curate_batch_prepared builds one probe
+                # per batch and shares it across candidates, or a test
+                # supplies a fake. Still offload: a real probe's git grep,
+                # and on a miss a full-history pickaxe, is blocking
+                # regardless of who built it.
+                unverified = await asyncio.to_thread(verify_attributed_claims, claims, probe)
+        except Exception as exc:
+            # Advisory backstop — must fail open rather than take the whole
+            # task submission down with it (see "Never raises" above).
+            logger.warning(
+                'recon_claim_verification: guard errored, failing open: %s', exc,
+            )
+            return []
+
         for claim in unverified:
             logger.warning(
                 'recon_claim_verification.unverified token=%s attribution=%s candidate=%r',
@@ -1617,21 +1657,32 @@ class TaskCurator:
         # surfacing is via the recon_claim_verification.unverified WARNING
         # census logged inside _maybe_flag_unverified_claims itself.
         #
-        # Build the probe ONCE for the whole batch — off the event loop, since
-        # construction resolves the git top level via a blocking subprocess
-        # call — and fan the per-candidate checks out concurrently instead of
-        # awaiting a freshly-built probe serially per candidate: a fabricated
-        # (i.e. actually-absent) token always runs the full
-        # git-grep-then-pickaxe path (up to ~10s), so a batch with several
-        # attributed tokens would otherwise serialize into tens of seconds of
-        # git work on the reconciliation path for a purely advisory check.
+        # Build the probe at most ONCE for the whole batch — off the event
+        # loop, since construction resolves the git top level via a blocking
+        # subprocess call — and only when at least one candidate actually
+        # attributes a code-level claim to prior work (extraction is
+        # pure/sync/cheap, so checking first costs nothing; a batch with no
+        # attributed claims at all, the common case, now skips the git
+        # subprocess entirely). When needed, fan the per-candidate checks out
+        # concurrently instead of awaiting a freshly-built probe serially per
+        # candidate: a fabricated (i.e. actually-absent) token always runs
+        # the full git-grep-then-pickaxe path (up to ~10s), so a batch with
+        # several attributed tokens would otherwise serialize into tens of
+        # seconds of git work on the reconciliation path for a purely
+        # advisory check.
         claim_probe: Callable[[str], bool] | None = None
         if self._config.curator.recon_claim_verification_enabled and self._cwd is not None:
             from fused_memory.middleware.recon_claim_verification_guard import (
+                extract_attributed_claims,
                 make_source_and_history_probe,
             )
 
-            claim_probe = await asyncio.to_thread(make_source_and_history_probe, self._cwd)
+            any_claims = any(
+                extract_attributed_claims(self._claim_verification_text(candidates[i]))
+                for i in unique_indices
+            )
+            if any_claims:
+                claim_probe = await asyncio.to_thread(make_source_and_history_probe, self._cwd)
         await asyncio.gather(
             *(
                 self._maybe_flag_unverified_claims(candidates[i], probe=claim_probe)
