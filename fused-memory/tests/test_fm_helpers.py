@@ -2,11 +2,16 @@
 
 import json
 import sys
+import types
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
-from _fm_helpers import submit_and_resolve
+from _fm_helpers import (
+    _LOADED_SCRIPT_MODULE_NAMES,
+    load_script_module,
+    submit_and_resolve,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1519,6 +1524,11 @@ class TestAwaitIndexOperational:
 #
 # Everything here drives throwaway tmp_path scripts, never a real repo script,
 # so no case depends on the content of anything under scripts/.
+#
+# load_script_module is imported at module level (with submit_and_resolve),
+# deliberately NOT lazily per-test the way the 8df8 section above does it:
+# every test in this section needs it, so seven copies of one import line bought
+# nothing.
 
 @pytest.fixture
 def registered_module_names():
@@ -1527,11 +1537,16 @@ def registered_module_names():
     Every registered key is popped afterwards, pass or fail, so a test that
     loads a throwaway tmp_path script cannot leak a module object into sibling
     tests (or shadow a real module for the rest of the session).
+
+    The helper's own record of which keys it installed is cleared for the same
+    keys, so a tmp_path name cannot arrive at a sibling test already marked as
+    helper-owned and quietly disarm the shadowing guard there.
     """
     names: list[str] = []
     yield names.append
     for name in names:
         sys.modules.pop(name, None)
+        _LOADED_SCRIPT_MODULE_NAMES.discard(name)
 
 
 class TestLoadScriptModule:
@@ -1542,8 +1557,6 @@ class TestLoadScriptModule:
     ):
         """The whole point: a by-path script's constants and functions come back
         as ordinary attributes of the returned module."""
-        from _fm_helpers import load_script_module
-
         script = tmp_path / 'probe_script.py'
         script.write_text('VALUE = 41\n\n\ndef bump(n):\n    return n + 1\n')
         registered_module_names('probe_script')
@@ -1558,8 +1571,6 @@ class TestLoadScriptModule:
     ):
         """An explicit mod_name is the sys.modules key — this is what lets two
         test modules deliberately SHARE one key for the same script."""
-        from _fm_helpers import load_script_module
-
         script = tmp_path / 'stem_is_ignored.py'
         script.write_text("ORIGIN = 'explicit'\n")
         registered_module_names('chosen_key')
@@ -1573,8 +1584,6 @@ class TestLoadScriptModule:
         self, tmp_path, registered_module_names
     ):
         """mod_name defaults to the file stem."""
-        from _fm_helpers import load_script_module
-
         script = tmp_path / 'defaults_to_stem.py'
         script.write_text("ORIGIN = 'stem'\n")
         registered_module_names('defaults_to_stem')
@@ -1594,8 +1603,6 @@ class TestLoadScriptModule:
         module object with no SENTINEL on it, so `is`-identity plus the
         surviving attribute together rule out both replacement and re-exec.
         """
-        from _fm_helpers import load_script_module
-
         script = tmp_path / 'reused_script.py'
         script.write_text('VALUE = 1\n')
         registered_module_names('reused_script')
@@ -1619,8 +1626,6 @@ class TestLoadScriptModule:
         An implementation comparing the cached ``__file__`` as a raw string
         would re-execute here.
         """
-        from _fm_helpers import load_script_module
-
         subdir = tmp_path / 'subdir'
         subdir.mkdir()
         script = tmp_path / 'roundabout_script.py'
@@ -1642,9 +1647,10 @@ class TestLoadScriptModule:
 
         Reusing on a name match alone would hand the second caller the first
         script's module — silently serving the wrong code under the right key.
-        """
-        from _fm_helpers import load_script_module
 
+        Replacement is allowed here because the helper installed that key
+        itself; the shadowing test below covers the case where it did not.
+        """
         first_script = tmp_path / 'first_source.py'
         first_script.write_text("ORIGIN = 'first'\n")
         second_script = tmp_path / 'second_source.py'
@@ -1672,8 +1678,6 @@ class TestLoadScriptModule:
         entry, match its __file__, and return a module whose top level never
         finished running — a partially-initialised module served as a good one.
         """
-        from _fm_helpers import load_script_module
-
         script = tmp_path / 'exploding_script.py'
         script.write_text("LOADED_SO_FAR = 1\nraise RuntimeError('boom during exec')\n")
         registered_module_names('exploding_script')
@@ -1682,3 +1686,86 @@ class TestLoadScriptModule:
             load_script_module(script)
 
         assert 'exploding_script' not in sys.modules
+
+    def test_a_module_the_helper_did_not_install_is_never_shadowed(
+        self, tmp_path, registered_module_names
+    ):
+        """A key some OTHER importer owns must raise, not be overwritten.
+
+        mod_name defaults to the file stem, and `scripts/` is full of names
+        that are also ordinary module names (config.py, utils.py, types.py).
+        Silently replacing `sys.modules['config']` with a script would persist
+        for the rest of the pytest process and surface as an unrelated test
+        failing far away, so the helper refuses and says which name collided.
+        """
+        script = tmp_path / 'shadow_target.py'
+        script.write_text("ORIGIN = 'the script'\n")
+        registered_module_names('shadow_target')
+        pre_existing = types.ModuleType('shadow_target')
+        pre_existing.__file__ = str(tmp_path / 'somewhere_else.py')
+        pre_existing.ORIGIN = 'the real module'  # type: ignore[attr-defined]
+        sys.modules['shadow_target'] = pre_existing
+
+        with pytest.raises(ImportError, match='refusing to shadow'):
+            load_script_module(script)
+
+        assert sys.modules['shadow_target'] is pre_existing
+        assert sys.modules['shadow_target'].ORIGIN == 'the real module'
+
+    def test_a_foreign_module_without_a_file_attribute_is_also_not_shadowed(
+        self, tmp_path, registered_module_names
+    ):
+        """Namespace packages and C/builtin modules have no usable __file__.
+
+        The reuse check reads __file__ to decide whether the cached entry IS
+        this script; a None there must fall through to the ownership guard
+        rather than to a replacement.
+        """
+        script = tmp_path / 'fileless_target.py'
+        script.write_text("ORIGIN = 'the script'\n")
+        registered_module_names('fileless_target')
+        pre_existing = types.ModuleType('fileless_target')
+        sys.modules['fileless_target'] = pre_existing
+
+        with pytest.raises(ImportError, match='refusing to shadow'):
+            load_script_module(script, mod_name='fileless_target')
+
+        assert sys.modules['fileless_target'] is pre_existing
+
+    def test_ownership_lapses_when_a_load_fails_mid_exec(
+        self, tmp_path, registered_module_names
+    ):
+        """A failed load leaves nothing installed, so it must leave no claim.
+
+        Otherwise the helper would still consider the name its own, and a
+        genuine `import <name>` landing in between would be replaced by the
+        next by-path load — the exact shadowing the guard exists to stop,
+        reachable through a failed load.
+        """
+        exploding = tmp_path / 'lapsed_key.py'
+        exploding.write_text("raise RuntimeError('boom during exec')\n")
+        script = tmp_path / 'later_script.py'
+        script.write_text("ORIGIN = 'the script'\n")
+        registered_module_names('lapsed_key')
+
+        with pytest.raises(RuntimeError, match='boom during exec'):
+            load_script_module(exploding)
+
+        pre_existing = types.ModuleType('lapsed_key')
+        pre_existing.__file__ = str(tmp_path / 'a_real_module.py')
+        sys.modules['lapsed_key'] = pre_existing
+
+        with pytest.raises(ImportError, match='refusing to shadow'):
+            load_script_module(script, mod_name='lapsed_key')
+
+        assert sys.modules['lapsed_key'] is pre_existing
+
+    def test_a_path_with_no_importable_loader_raises_import_error(self, tmp_path):
+        """The helper's only explicit error contract.
+
+        spec_from_file_location returns None when no loader claims the suffix,
+        and the helper must turn that into a named ImportError rather than an
+        AttributeError on None further down.
+        """
+        with pytest.raises(ImportError, match='Cannot load'):
+            load_script_module(tmp_path / 'not_a_module.txt')
