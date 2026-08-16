@@ -606,12 +606,22 @@ ANCESTRY_CHECK_INSTRUCTIONS = """\
     # it away.
     # rc=0   -> <sha> IS on main. Proceed with the set_task_status call.
     # rc=1   -> <sha> resolves here but is NOT reachable from the `main` ref as it
-    #           stands in THIS checkout. Usually the SHA is wrong (it is only on a
-    #           feature branch) -- but this checkout's `main` can also simply be
-    #           behind (a just-submitted merge, an unfetched <project_root>). If
-    #           that is plausible, run `git -C <project_root> fetch --all` and
-    #           re-run once before concluding. Still rc=1 after that -> the SHA
-    #           really is off main; re-derive the landing commit.
+    #           stands in THIS checkout. Usually the SHA is wrong (only on a feature
+    #           branch) -- but the other real cause is that the merge has not landed
+    #           YET. `refs/heads/main` is advanced only by the merge worker's own local
+    #           CAS, `git update-ref refs/heads/main <new> <old>` in
+    #           `GitOps.advance_main` (git_ops.py:11260-11262); every worktree reads
+    #           that one shared ref out of the common `.git` dir, so a landed advance
+    #           is visible here immediately, with no sync step. Do NOT try to sync or
+    #           advance this checkout before re-running: no git operation performed
+    #           here can move `refs/heads/main` -- only the merge worker's local ref
+    #           write above does. Such an attempt only touches `refs/remotes/*` and the
+    #           object store, so it is a strict no-op for this comparison, and
+    #           re-running afterward reproduces the same rc=1, the exact false "really
+    #           off main" verdict this block exists to prevent. If a merge may still be
+    #           in flight, confirm with `mcp__escalation__merge_status` and re-run this
+    #           same check once it reports the merge landed. Still rc=1 after that ->
+    #           the SHA really is off main; re-derive the landing commit.
     # rc=128 -> git cannot resolve <sha> (or `main`) in this checkout: "fatal: Not a
     #           valid object name". This is NOT "not on main" -- it is "not yet
     #           confirmed". Usually a stale/unfetched <project_root>, a wrong -C path,
