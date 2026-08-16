@@ -2846,7 +2846,11 @@ def _materialize_stdin(stdin_data: bytes) -> IO[bytes]:
     would do so invisibly — see the ``no-silent-fail-soft`` design invariant.
     On failure the file is closed before re-raising so no fd is leaked.
     """
-    f = tempfile.TemporaryFile()
+    # noqa SIM115: a context manager is exactly wrong here — the fd must
+    # OUTLIVE this call.  It is handed to create_subprocess_exec so the child
+    # can dup it, and the caller closes the parent's handle immediately after
+    # spawn (that close is what delivers EOF to the child).
+    f = tempfile.TemporaryFile()  # noqa: SIM115
     try:
         f.write(stdin_data)
         f.flush()
