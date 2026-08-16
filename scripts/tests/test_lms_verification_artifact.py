@@ -61,7 +61,7 @@ from pathlib import Path
 
 import lms_vram
 import pytest
-from lms_healthcheck import REPORT_SCHEMA_VERSION, HealthReport
+from lms_healthcheck import LATENCY_CAVEAT, REPORT_SCHEMA_VERSION, HealthReport
 from lms_manifest import load_arms
 
 _LMS_DIR = Path(__file__).resolve().parents[1] / 'local-model-serving'
@@ -143,9 +143,23 @@ def raw_artifact() -> dict:
     if not ARTIFACT_PATH.exists():
         pytest.fail(
             f'{ARTIFACT_PATH} does not exist. This artifact is the '
-            "task's user-observable signal and is written by a LIVE run:\n"
+            "task's user-observable signal and is written by a LIVE run, one "
+            'arm at a time — `--all` CANNOT produce it, because it would need '
+            'all seven arms up simultaneously (this card cannot hold them and '
+            '`lms_ctl start` is exclusive by default) and seven live VRAM '
+            'baselines. The real chain, per arm:\n'
             '    uv run --project shared python '
-            'scripts/local-model-serving/lms_healthcheck.py --all '
+            'scripts/local-model-serving/lms_ctl.py start <arm>\n'
+            '    uv run --project shared python '
+            'scripts/local-model-serving/lms_ctl.py wait-ready <arm>\n'
+            '    uv run --project shared python '
+            'scripts/local-model-serving/lms_healthcheck.py --arm <arm> '
+            '--output <arm>.json\n'
+            '    uv run --project shared python '
+            'scripts/local-model-serving/lms_ctl.py stop <arm>\n'
+            'then, once every arm has a part:\n'
+            '    uv run --project shared python '
+            'scripts/local-model-serving/lms_healthcheck.py --merge <parts...> '
             f'--output {ARTIFACT_PATH}\n'
             'Do NOT hand-write it to green this test.'
         )
@@ -413,6 +427,55 @@ def test_passing_rows_carry_a_real_measured_latency(report: HealthReport) -> Non
         f'arms {unmeasured} report a PASS with latency_ms <= 0; a real probe '
         'over HTTP cannot take zero time'
     )
+
+
+def test_every_passing_row_carries_both_a_cold_and_a_warm_latency(
+    report: HealthReport,
+) -> None:
+    """The artifact must PROVE the two-probe instrument ran (task 3781).
+
+    A row whose `first_probe_ms` is zero was produced by the pre-3781
+    single-probe instrument, which is what stops a stale artifact reading as a
+    re-measured one.
+
+    POSITIVITY ONLY.  Do NOT "strengthen" this into
+    `first_probe_ms > latency_ms`: qwen3.5-9b at `reasoning: on` measured 43.5 s
+    cold against 41.0 s warm, a generation-dominated arm where the load cost is
+    a rounding error against the generation itself and the ordering sits inside
+    the noise.  A cold-greater-than-warm gate would fail an arm that is serving
+    correctly — the exact failure mode esc-3713-6 already had to undo once for
+    the VRAM verdict.
+    """
+    unmeasured = sorted(
+        row.arm_id for row in report.arms
+        if row.verdict == 'PASS'
+        and not (row.first_probe_ms > 0.0 and row.latency_ms > 0.0)
+    )
+    assert not unmeasured, (
+        f'arms {unmeasured} report a PASS without BOTH a cold '
+        '(`first_probe_ms`) and a warm (`latency_ms`) measurement. A zero '
+        'first_probe_ms means the row came from the pre-3781 single-probe '
+        'instrument; re-run the arm, do not hand-write the number'
+    )
+
+
+def test_the_artifact_states_it_is_not_a_comparable_ranking_metric(
+    raw_artifact: dict,
+) -> None:
+    """The load-bearing half of the fix, gated on the committed file.
+
+    A corrected number without this sentence re-creates the same false
+    comparability the correction was for, and the consumers most at risk of
+    reading these seven numbers as a ranking (eta 3720, theta 3721) read this
+    JSON — not the README the caveat would otherwise live in alone.
+    """
+    assert raw_artifact.get('latency_caveat') == LATENCY_CAVEAT, (
+        f'{ARTIFACT_PATH.name} must carry lms_healthcheck.LATENCY_CAVEAT '
+        'verbatim in a `latency_caveat` field; JSON carries no comments, so a '
+        'caveat that lives only in prose is absent from the exact document '
+        'that would mislead a consumer'
+    )
+    assert LATENCY_CAVEAT.strip()
 
 
 def test_vram_block_passes_within_the_recorded_budget(report: HealthReport) -> None:
