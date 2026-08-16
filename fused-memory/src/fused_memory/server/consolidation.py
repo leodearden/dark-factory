@@ -74,6 +74,29 @@ _UUID_HINT = (
     'out of a search-result snippet is not a valid id.'
 )
 
+#: The recovery procedure for a ``'partial'`` result, stated where the caller
+#: that needs it is actually looking. There is deliberately NO resume arm —
+#: this op takes no existing canonical id — so the ONE unsafe recovery is the
+#: obvious one: re-running it writes a SECOND canonical for the same
+#: ``(project, topic)``, which uniqueness only WARNS about under the shipped
+#: ``enforce=False`` default and therefore admits. That is the +1-per-pass
+#: ratchet the whole op exists to end, so the hint names the by-hand path
+#: instead, per primitive, in the order a caller must apply them.
+_PARTIAL_RECOVERY_HINT = (
+    'PARTIAL IS NOT A RETRY SIGNAL. Do NOT re-run consolidate_memories for '
+    'this topic: the canonical in `canonical_id` already exists, and a second '
+    'call would write a SECOND canonical for the same (project, topic) — '
+    'admitted rather than refused wherever canonical uniqueness is still in '
+    'warn mode, which is the +1-per-pass ratchet this op exists to end. '
+    'Finish the named ids by hand instead: read `failed_deletes` / '
+    '`reparent_failures` / `retain_failures` for what did not happen and why, '
+    'fix the cause, then call delete_memory per still-listed id (it runs the '
+    'same citation gate and child guard this op does) and update_memory to '
+    'tag any peer that was not retained. Ids in `survivors` are still in the '
+    'corpus; ids in `survivor_check_failed` were proven neither gone nor '
+    'alive — re-read those with get_memory_by_id before acting on them.'
+)
+
 _RUN_ID_HINT = (
     'Pass the reconciliation run performing this consolidation. It is stamped as '
     'the tombstone\'s `deleting_run_id` (the run that KILLED the record) and is '
@@ -223,6 +246,8 @@ def build_consolidation_result(
     *,
     canonical_id: str,
     topic: str,
+    canonical_supersedes: list[str] | None = None,
+    supersedes_correction: dict[str, Any] | None = None,
     deleted: list[str],
     failed_deletes: list[dict[str, Any]],
     survivors: list[str],
@@ -279,12 +304,34 @@ def build_consolidation_result(
     end.  An audit gap is fixed by looking at the logs, never by repeating
     the delete.
 
+    WHAT ``'partial'`` IS NOT: a retry signal.  The lists say which ids keep
+    the cluster open, and they are there to be FINISHED BY HAND — never by
+    re-running this op.  A second call for the same ``(project, topic)``
+    writes a SECOND canonical: uniqueness ships in warn mode
+    (``enforce=False``), so the duplicate is censused and ADMITTED, which is
+    the "+1 entry per failed pass, until the cluster contains the
+    consolidator's own prior canonicals" ratchet this whole op exists to end.
+    That recovery procedure is stated in the envelope itself, under ``hint``,
+    because a caller reading a partial result is exactly the reader about to
+    make that mistake and the docstring is not where it will look.
+
+    ``canonical_supersedes`` is what the canonical DURABLY CLAIMS to have
+    replaced once the call is done, which on a partial run is narrower than
+    what was requested: the tool patches the field down to the
+    corroborated-gone set rather than leaving a live record listed as
+    superseded.  ``supersedes_correction`` reports that narrowing when it was
+    needed — including when it FAILED, in which case ``canonical_supersedes``
+    still shows the wider set the record is really carrying.
+
     Every disposition key is ALWAYS present, empty lists included, so a
     caller can read ``result['survivors']`` without a membership test and a
-    later arm cannot quietly stop reporting by omitting its key.
-    ``citation_repoint`` is the one exception: it is present iff citations
-    were actually rewritten, because an empty map would read as "the gate
-    ran and found nothing" on a call where the gate never ran at all.
+    later arm cannot quietly stop reporting by omitting its key.  Three keys
+    are deliberate exceptions, each present only when the thing it describes
+    actually happened: ``citation_repoint`` (an empty map would read as "the
+    gate ran and found nothing" on a call where the gate never ran at all),
+    ``supersedes_correction`` (absent means the canonical's claim was right
+    as written, not that a correction ran and changed nothing) and ``hint``
+    (recovery guidance on a clean run would be noise).
     """
     failed_deletes = list(failed_deletes)
     survivors = list(survivors)
@@ -303,6 +350,10 @@ def build_consolidation_result(
         'status': 'partial' if open_business else 'consolidated',
         'canonical_id': canonical_id,
         'topic': topic,
+        # What the canonical's `metadata.supersedes` actually says now — a
+        # claim about the corpus, distinct from `deleted` (what this call
+        # did) and from the requested set (what it was asked to do).
+        'canonical_supersedes': list(canonical_supersedes or []),
         'deleted': list(deleted),
         'failed_deletes': failed_deletes,
         'retained': list(retained or []),
@@ -332,4 +383,11 @@ def build_consolidation_result(
     }
     if citation_repoint:
         result['citation_repoint'] = citation_repoint
+    if supersedes_correction:
+        result['supersedes_correction'] = supersedes_correction
+    if open_business:
+        # Carried IN the envelope, not just in the docstring: the caller
+        # holding a partial result is the one about to re-run the op, and a
+        # re-run is the ratchet. See THE STATUS RULE above.
+        result['hint'] = _PARTIAL_RECOVERY_HINT
     return result

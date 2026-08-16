@@ -61,6 +61,30 @@ retained peers tagged, then per supersede read → re-home children → corrobor
   A shortfall is reported via `tombstones_written` / `tombstones_expected` and a WARNING;
   it deliberately does NOT flip `status`, since retrying a completed merge is the very
   ratchet this op ends.
+- **The canonical claims only what it actually replaced.** `metadata.supersedes` is
+  stamped at write time with the REQUESTED set — the write must precede every delete —
+  so on a partial run it would name records that are still live. Step (7) patches it
+  DOWN to the corroborated-gone set (the same set the tombstones are stamped for) and
+  reports the narrowing as `supersedes_correction`; `canonical_supersedes` always shows
+  what the record really carries, including when that patch itself failed. Nothing else
+  in the system repairs this field, so an uncorrected claim would persist in the corpus
+  pointing readers away from live records.
+- **`partial` is not a retry signal, and there is no resume arm.** The op takes no
+  existing canonical id, so re-running it for the same (project, topic) writes a SECOND
+  canonical — censused but ADMITTED under the shipped warn-mode default, i.e. the very
+  ratchet. The partial envelope therefore carries a `hint` with the by-hand recovery
+  (fix what the failure lists name, then `delete_memory` per still-listed id, which runs
+  the same citation gate and child guard, plus `update_memory` for any untagged peer).
+  Related bound, stated rather than widened: "a refused consolidation leaves the corpus
+  byte-identical" covers refusals from steps (1)-(4) only. The mutating citation repoint
+  runs over the whole delete set right after the canonical write, so an id later refused
+  for a non-citation reason has already had its citers rewritten onto the canonical while
+  it is still in the corpus. Under `metadata.enforce=True` one shape refuses outright: a
+  supersede that is itself the topic's incumbent canonical is still alive when the write
+  probes uniqueness, so `CanonicalUniquenessViolation` names it and nothing is deleted —
+  demote it (`metadata_patch={'canonical': False}`) and re-run, or leave it out of
+  `supersedes`. Under the shipped `enforce=False` default the write proceeds and this
+  op's own delete arm reaps the incumbent inside the same call.
 - Closure reads are deterministic Qdrant work only (`get_memory_by_id`,
   `get_memories_by_metadata({'topic': T})`); `MemoryService.search` is never called and a
   test pins that negative. Registered in `DISALLOW_MEMORY_WRITES` (hence Stage 3) and in

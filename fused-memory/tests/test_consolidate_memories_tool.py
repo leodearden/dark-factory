@@ -576,6 +576,45 @@ class TestCanonicalFirstOrdering:
         svc.update_memory.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_a_supersede_that_is_the_incumbent_canonical_is_refused_whole(self):
+        """The FLAGSHIP case under `enforce=True`, pinned as it actually behaves.
+
+        "A cluster ends up containing the consolidator's own prior
+        canonicals" IS the ratchet this op exists to end, so a supersede that
+        is itself the topic's incumbent canonical is common, not exotic. The
+        incumbent is necessarily still ALIVE when the canonical write probes
+        uniqueness — nothing destructive may precede that write — so under
+        `enforce=True` the probe finds it and the whole op refuses, naming it
+        as `incumbent_id`. Nothing is deleted, which is the point: the
+        alternative orderings all pay for the fold with a net loss.
+
+        Recovery is stated in the tool docstring: demote the incumbent
+        (`update_memory` with `metadata_patch={'canonical': False}`) and
+        re-run, or leave it out of `supersedes`. It is deliberately NOT
+        demoted here — that mutation would have to precede the canonical
+        write. Under the shipped `enforce=False` default the write proceeds
+        with a census line and this op's own delete arm reaps the incumbent,
+        closing the duplicate inside the same call.
+        """
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        svc = make_service()
+        svc.add_memory = AsyncMock(
+            side_effect=CanonicalUniquenessViolation(
+                project_id=PROJECT_ID, topic=TOPIC, incumbent_id=S1
+            )
+        )
+
+        result = await call_consolidate(svc)
+
+        assert result['error_type'] == 'CanonicalUniquenessViolation'
+        # The refusal NAMES the incumbent, which is what makes the by-hand
+        # recovery actionable — it is one of the ids the caller just passed.
+        assert S1 in result['error']
+        svc.delete_memory.assert_not_called()
+        svc.update_memory.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_metadata_rejection_destroys_nothing(self):
         from fused_memory.memory_metadata import (
             MemoryMetadataValidationError,
@@ -765,6 +804,49 @@ class TestTheDeleteSetGoesThroughTheCitationGate:
         assert S2 in result['survivors']
         attempted = [c.kwargs['memory_id'] for c in svc.delete_memory.await_args_list]
         assert attempted == [S1, S3]
+
+    @pytest.mark.asyncio
+    async def test_citations_are_repointed_even_when_the_delete_is_later_refused(self):
+        """(e) The BOUND on "a refused consolidation changes nothing".
+
+        The mutating repoint runs over the whole delete set right after the
+        canonical write, before any id's delete is EARNED — so an id refused
+        below for a non-citation reason (here `ChildScanFailed`) has already
+        had its live citers rewritten onto the canonical while it is still in
+        the corpus. Pinned rather than fixed: the byte-identical guarantee
+        covers the pre-flight refusals (steps 1-4), and this is the
+        recoverable direction, since the citation now names a record that
+        exists and states the merged claim. A caller must not read the
+        guarantee more broadly than it holds, so the observed behaviour is
+        asserted here and stated in the tool docstring.
+        """
+        svc = make_service(
+            # S1's delete is refused, so S1 is still in the corpus at the
+            # corroborating re-read — which is the whole point here.
+            gone=[S2, S3],
+            child_scan_errors={S1: TimeoutError('child scan timed out')},
+        )
+        interceptor = make_interceptor([
+            _task('501', 'pending', {'mem0_canonical_entry': S1}),
+        ])
+
+        result = await call_consolidate(
+            svc, task_interceptor=interceptor, known_projects=KNOWN_PROJECTS
+        )
+
+        # The citation was rewritten...
+        patched = [
+            json.loads(c.kwargs['metadata'])['mem0_canonical_entry']
+            for c in interceptor.update_task.await_args_list
+        ]
+        assert patched == [CANONICAL]
+        assert result['citation_repoint'][S1]['outcome'] == 'repointed'
+        # ...and the record it used to name is STILL THERE, refused for a
+        # reason the citation gate knows nothing about.
+        [failure] = [f for f in result['failed_deletes'] if f['id'] == S1]
+        assert failure['error_type'] == 'ChildScanFailed'
+        assert S1 in result['survivors']
+        assert result['status'] == 'partial'
 
     @pytest.mark.asyncio
     async def test_an_unscannable_project_is_never_enumerated(self):
@@ -1857,3 +1939,172 @@ class TestReadFailuresDoNotDestroyTheEnvelope:
 
         assert result['survivor_check_failed'] == []
         assert result['topic_members_available'] is True
+
+
+class TestTheCanonicalClaimsOnlyWhatItActuallyReplaced:
+    """`metadata.supersedes` must survive the call as OUTCOME, not intent.
+
+    It is stamped at write time with the REQUESTED set, because the write
+    has to precede every destructive step. On a partial run that leaves the
+    canonical durably claiming to have replaced records that are still live
+    and still stating their own claim — the same overclaim the retain arm
+    refuses to make, and worse here because nothing else in the system ever
+    repairs the field: no sweep patches it down, so the stale claim persists
+    in the corpus pointing future readers away from live records.
+
+    So the op narrows it to the CORROBORATED-GONE set — the same set the
+    tombstones are stamped for, and for the same reason: an id whose closure
+    could not be checked is not evidence of replacement either.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_clean_run_claims_everything_and_patches_nothing(self):
+        """No correction on a run with nothing to correct. The extra write is
+        paid only where the claim would otherwise be wrong."""
+        svc = make_service()
+
+        with patched_tombstone_writer():
+            result = await call_consolidate(svc)
+
+        assert result['canonical_supersedes'] == SUPERSEDES
+        assert 'supersedes_correction' not in result
+        # The canonical itself is never patched on the happy path.
+        svc.update_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_survivor_is_never_claimed_as_superseded(self):
+        """THE case: the delete reported success and the record still
+        resolves. Leaving it listed would tell every future reader to prefer
+        the canonical over a record that is still live and correct."""
+        svc = make_service(gone=[S1, S3])
+
+        with patched_tombstone_writer():
+            result = await call_consolidate(svc)
+
+        assert result['survivors'] == [S2]
+        assert result['canonical_supersedes'] == [S1, S3]
+        assert result['supersedes_correction'] == {
+            'outcome': 'corrected',
+            'from': SUPERSEDES,
+            'to': [S1, S3],
+        }
+        # ...and the claim was narrowed IN THE CORPUS, not just in the report.
+        [patch_call] = [
+            c for c in svc.update_memory.await_args_list
+            if c.kwargs['memory_id'] == CANONICAL
+        ]
+        assert patch_call.kwargs['metadata_patch'] == {'supersedes': [S1, S3]}
+        assert patch_call.kwargs['metadata_mode'] == 'merge'
+        # Metadata only: the canonical's text is not this patch's business.
+        assert patch_call.kwargs['content'] is None
+
+    @pytest.mark.asyncio
+    async def test_a_refused_delete_is_never_claimed_as_superseded(self):
+        svc = make_service(
+            gone=[S1, S3], delete_errors={S2: RuntimeError('mem0 backend unreachable')}
+        )
+
+        with patched_tombstone_writer():
+            result = await call_consolidate(svc)
+
+        assert [f['id'] for f in result['failed_deletes']] == [S2]
+        assert result['canonical_supersedes'] == [S1, S3]
+
+    @pytest.mark.asyncio
+    async def test_an_unproven_closure_is_not_claimed_either(self):
+        """Same rule as the tombstone set, from the same evidence: "we could
+        not check" is not proof of replacement, so an id whose corroborating
+        read failed is dropped from the claim too."""
+        svc = make_service(
+            corroboration_errors={S2: TimeoutError('qdrant read timed out')}
+        )
+
+        with patched_tombstone_writer():
+            result = await call_consolidate(svc)
+
+        assert [f['id'] for f in result['survivor_check_failed']] == [S2]
+        assert result['canonical_supersedes'] == [S1, S3]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_narrowing_reports_what_the_record_really_says(self):
+        """The correction is a WRITE, so it can fail — and then the canonical
+        is still carrying the wider claim. Reporting the intended set would
+        make the envelope lie about the corpus, which is the one thing this
+        op exists not to do."""
+        svc = make_service(
+            gone=[S1, S3],
+            update_raises={CANONICAL: TimeoutError('qdrant set_payload timed out')},
+        )
+
+        with patched_tombstone_writer():
+            result = await call_consolidate(svc)
+
+        assert result['supersedes_correction'] == {
+            'outcome': 'failed',
+            'from': SUPERSEDES,
+            'to': [S1, S3],
+            'error': 'qdrant set_payload timed out',
+            'error_type': 'TimeoutError',
+        }
+        # What the RECORD says, not what the call wanted it to say.
+        assert result['canonical_supersedes'] == SUPERSEDES
+        # And the raise never flattens the envelope: everything the op did
+        # is still reported.
+        assert result.get('error_type') != 'TimeoutError'
+        assert result['deleted'] == SUPERSEDES
+        assert result['status'] == 'partial'
+
+    @pytest.mark.asyncio
+    async def test_a_retain_only_call_claims_nothing(self):
+        """A retained peer was never replaced, so the canonical claims no
+        supersession at all — and there is no correction to make."""
+        svc = make_service()
+
+        result = await call_consolidate(
+            svc, supersedes=[], run_id=None, retain=[RETAIN_1, RETAIN_2]
+        )
+
+        assert result['canonical_supersedes'] == []
+        assert 'supersedes_correction' not in result
+
+
+class TestPartialIsNotARetrySignal:
+    """The recovery procedure travels WITH the partial envelope.
+
+    There is no resume arm — the op takes no existing canonical id — so
+    re-running it for the same (project, topic) writes a SECOND canonical,
+    which canonical uniqueness only WARNS about under the shipped
+    `enforce=False` default and therefore admits. That is the +1-per-pass
+    ratchet this op exists to end, reached by the most natural reading of
+    "partial". The hint is in the envelope rather than only in the docstring
+    because the caller holding a partial result is exactly the one about to
+    make that mistake.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_partial_envelope_carries_the_recovery_procedure(self):
+        svc = make_service(gone=[S1, S3])
+
+        with patched_tombstone_writer():
+            result = await call_consolidate(svc)
+
+        assert result['status'] == 'partial'
+        hint = result['hint']
+        # It must say the unsafe thing IS unsafe...
+        assert 'consolidate_memories' in hint
+        assert 'second canonical' in hint.lower()
+        # ...and name the by-hand path that replaces it.
+        assert 'delete_memory' in hint
+        assert 'update_memory' in hint
+
+    @pytest.mark.asyncio
+    async def test_a_clean_envelope_carries_no_hint(self):
+        """Recovery guidance on a run with nothing to recover is noise, and
+        noise is how a caller learns to skip the hint that matters."""
+        svc = make_service()
+
+        with patched_tombstone_writer():
+            result = await call_consolidate(svc)
+
+        assert result['status'] == 'consolidated'
+        assert 'hint' not in result

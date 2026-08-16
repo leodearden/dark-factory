@@ -408,7 +408,7 @@ Task operations (when Taskmaster is connected):
 - add_dependency / remove_dependency: Dependency management
 Management:
 - delete_memory: Remove a specific memory (edges for Graphiti, vector entries for Mem0)
-- consolidate_memories: The SANCTIONED path for folding a duplicate Mem0 cluster into one canonical entry — use it instead of hand-rolling add_memory + N delete_memory calls, which nets +1 entry per failed pass. Writes the canonical first, tags retained peers in place (the ratified default: peers keep their point ids), re-homes children before deleting their parent, and returns a `survivors` list CORROBORATED by a live re-read rather than inferred from the delete calls' return values. Requires run_id whenever supersedes is non-empty (it attributes the deletion).
+- consolidate_memories: The SANCTIONED path for folding a duplicate Mem0 cluster into one canonical entry — use it instead of hand-rolling add_memory + N delete_memory calls, which nets +1 entry per failed pass. Writes the canonical first, tags retained peers in place (the ratified default: peers keep their point ids), re-homes children before deleting their parent, and returns a `survivors` list CORROBORATED by a live re-read rather than inferred from the delete calls' return values. Requires run_id whenever supersedes is non-empty (it attributes the deletion). A `partial` result is NOT a retry signal — there is no resume arm, so re-running it for the same topic writes a SECOND canonical; finish the named ids by hand, per the envelope's `hint`.
 - delete_episode: Remove a Graphiti episode (with optional cascade)
 - redact_episode_content: Replace a Graphiti episode's raw content in place (non-destructive; PREFER over delete_episode(cascade=True) for corrupted text — preserves the extracted entities/edges a cascade would destroy)
 - update_edge: Update an existing Graphiti edge's fact text directly (no LLM pipeline)
@@ -4464,7 +4464,8 @@ def create_mcp_server(
             corroborate that, then delete.
         (6) Re-query deterministically — never `search`, whose top-N cutoff
             can silently omit the record just written.
-        (7) Tombstone the confirmed-gone set.
+        (7) Tombstone the confirmed-gone set, then narrow the canonical's own
+            ``metadata.supersedes`` to that same set.
         (8) Report structurally: anything that did not happen is named.
 
         Step (3) is the same tool-layer gate ``delete_memory`` runs, in two
@@ -4477,6 +4478,50 @@ def create_mcp_server(
         named no survivor" refusal is unreachable here and no
         dangling-citation escape is offered; the reachable refusal is a scan
         that could not be completed, which fails closed.
+
+        WHAT "A REFUSED CONSOLIDATION LEAVES THE CORPUS BYTE-IDENTICAL"
+        COVERS, exactly: refusals from steps (1)-(4) — validation,
+        authorization, the ``scan_only`` pre-flight and the canonical write
+        itself. It does NOT extend to a per-id refusal below step (4). The
+        MUTATING repoint pass runs over the whole delete set immediately
+        after the canonical write, before it is known whether any given id's
+        delete can be EARNED, so an id later refused for a non-citation
+        reason (``ChildScanFailed``, ``ReparentIncomplete``, a raised delete,
+        or a survivor) has ALREADY had its live task citations rewritten from
+        it onto the canonical while it is still in the corpus. That is
+        deliberate and it is the recoverable direction — the citation now
+        names a record that exists and states the merged claim, rather than
+        one that may be deleted moments later — but it is a mutation, so a
+        partial run is not a no-op. A test pins the observed behaviour.
+
+        UNDER ``metadata.enforce = True`` (NOT the shipped default), one
+        shape of this op's own flagship case refuses outright: a supersede
+        that is ITSELF the topic's incumbent canonical. The incumbent is
+        still alive when step (4) probes uniqueness — it cannot be otherwise,
+        since nothing destructive may precede the write — so the probe finds
+        it and ``add_memory`` raises ``CanonicalUniquenessViolation`` naming
+        it as ``incumbent_id``, and nothing is deleted. That case is COMMON,
+        not exotic: "a cluster ends up containing the consolidator's own
+        prior canonicals" is the ratchet this op exists to end. Recovery is
+        to demote the incumbent first (``update_memory`` with
+        ``metadata_patch={'canonical': False}``) and re-run, or to leave it
+        out of ``supersedes`` and fold the rest. It is NOT demoted here:
+        every mutation would have to precede the canonical write, breaking
+        the ordering that makes a net-loss impossible. Under the shipped
+        ``enforce=False`` default the write proceeds with a census line and
+        this op's own delete arm then reaps the incumbent, closing the
+        duplicate inside the same call.
+
+        THERE IS NO RESUME ARM, and ``'partial'`` is not a retry signal. This
+        op takes no existing canonical id, so a second call for the same
+        (project, topic) writes a SECOND canonical — censused but ADMITTED
+        under the shipped warn-mode default, which is precisely the
+        +1-per-pass ratchet. A partial result is finished BY HAND: fix what
+        the failure lists name, then ``delete_memory`` per still-listed id
+        (it runs this same citation gate and child guard) and
+        ``update_memory`` for any peer that was not tagged. The envelope
+        carries that procedure in its ``hint`` so the caller who needs it
+        does not have to find this docstring.
 
         Step (6) is deterministic Qdrant work ONLY: a ``get_memory_by_id``
         point read per supersede for ``survivors``, and one
@@ -4523,13 +4568,26 @@ def create_mcp_server(
                 metadata (may carry _causation_id for recon).
 
         Returns:
-            ``{'status', 'canonical_id', 'topic', 'deleted', 'failed_deletes',
-            'retained', 'retain_failures', 'reparented', 'reparent_failures',
-            'survivors', 'survivor_check_failed', 'topic_members',
+            ``{'status', 'canonical_id', 'canonical_supersedes', 'topic',
+            'deleted', 'failed_deletes', 'retained', 'retain_failures',
+            'reparented', 'reparent_failures', 'survivors',
+            'survivor_check_failed', 'topic_members',
             'topic_members_truncated', 'topic_members_available',
             'tombstones_written', 'tombstones_expected', ...}``.
             ``survivors`` is the load-bearing one: ids whose delete reported
             success but which STILL RESOLVE on the re-read.
+
+            ``canonical_supersedes`` is what the canonical DURABLY CLAIMS to
+            have replaced, which is not always what was requested. The field
+            is stamped at write time with the requested set — the write must
+            precede every delete — so on a partial run it would name records
+            that are still live and still stating their own claim. Step (7)
+            therefore patches it DOWN to the corroborated-gone set, the same
+            set the tombstones are stamped for, and reports the narrowing
+            under ``supersedes_correction`` (present only when one was
+            needed). If that patch itself fails, the outcome says so and
+            ``canonical_supersedes`` keeps showing the wider set the record is
+            really carrying — the claim in the corpus, never the intent.
 
             ``survivor_check_failed`` is its third sibling: an id whose
             corroborating read did not answer was neither observed alive nor
@@ -4597,6 +4655,58 @@ def create_mcp_server(
         if err:
             return err
         causation_id, source, cleaned_meta = _extract_causation(metadata, agent_id)
+
+        # ONE call-and-classify block for EVERY metadata patch this op makes:
+        # the retain-arm tag, the child reparent, and the canonical's
+        # supersedes correction. Extracted rather than copied because the
+        # contract it encodes is non-obvious and identical at all three sites
+        # (INV-5: two copies would have to stay in lockstep, and a drift
+        # between them would be silent, since both halves would still
+        # "work").
+        #
+        # THE CONTRACT, in one place: `update_memory` reports MemoryNotFound
+        # and its authorization refusals by RETURNING {'error_type': ...},
+        # while every OTHER failure goes through `_journaled_backend_call`,
+        # which logs and RE-RAISES. Code that guarded only exceptions would
+        # record a refusal as a success; code that guarded only the returned
+        # shape would let one Qdrant timeout escape to `@mcp_tool_errors`,
+        # which flattens the whole envelope to {'error', 'error_type'} —
+        # destroying the per-id dispositions of records that are ALREADY
+        # IRREVERSIBLY DELETED and skipping their tombstone write. So both
+        # shapes are handled, and they collapse to the same per-id verdict.
+        #
+        # Returns None on success, or the normalized {'error', 'error_type'}
+        # failure dict each arm decorates with its own keys (`id`, or
+        # `child_id`/`from`/`to`).
+        async def _patch_metadata(
+            memory_id: str, patch: dict[str, Any]
+        ) -> dict[str, Any] | None:
+            try:
+                outcome = await memory_service.update_memory(
+                    memory_id=memory_id,
+                    project_id=project_id,
+                    # No content, ever: this op stamps metadata and writes new
+                    # records; it never rewrites an existing record's text, so
+                    # nothing is re-embedded and no vector moves.
+                    content=None,
+                    metadata_patch=patch,
+                    metadata_mode='merge',
+                    agent_id=agent_id,
+                    session_id=session_id,
+                    causation_id=causation_id,
+                    _source=source,
+                )
+            except Exception as exc:
+                # `Exception`, not `BaseException`: a process going away
+                # (CancelledError/KeyboardInterrupt/SystemExit) must never be
+                # recorded as a per-id disposition.
+                return {'error': str(exc), 'error_type': type(exc).__name__}
+            if isinstance(outcome, dict) and outcome.get('error_type'):
+                return {
+                    'error': outcome.get('error'),
+                    'error_type': outcome.get('error_type'),
+                }
+            return None
 
         # (3) CITATION PRE-FLIGHT over the whole delete set — the same gate
         # `delete_memory` runs, in its non-mutating `scan_only` mode, reached
@@ -4819,52 +4929,15 @@ def create_mcp_server(
                     'error_type': 'RetainedPeerIsCanonical',
                 })
                 continue
-            # A REJECTION HERE IS A RETURN VALUE, NOT A RAISE: `update_memory`
-            # reports MemoryNotFound and its authorization refusals by
-            # returning {'error_type': ...}. Code that only guarded against
-            # exceptions would append the id to `retained` and report a peer
-            # as tagged when it was refused.
-            #
-            # BUT A BACKEND FAILURE *IS* A RAISE, so both shapes must be
-            # handled: only MemoryNotFound comes back structured, while every
-            # other failure goes through `_journaled_backend_call`, which logs
-            # and RE-RAISES. An unguarded await here would let one Qdrant
-            # timeout escape to `@mcp_tool_errors` and flatten the whole
-            # envelope to {'error', 'error_type'} — destroying the per-id
-            # dispositions for every peer already tagged and skipping the
-            # delete arm entirely. One failure costs one peer, either way.
-            try:
-                outcome = await memory_service.update_memory(
-                    memory_id=retain_id,
-                    project_id=project_id,
-                    content=None,
-                    metadata_patch={'topic': topic},
-                    metadata_mode='merge',
-                    agent_id=agent_id,
-                    session_id=session_id,
-                    causation_id=causation_id,
-                    _source=source,
-                )
-            except Exception as exc:
-                # `Exception`, not `BaseException`: same rationale as the
-                # delete guard below — a process going away
-                # (CancelledError/KeyboardInterrupt/SystemExit) must never be
-                # recorded as this peer's per-id disposition.
-                retain_failures.append({
-                    'id': retain_id,
-                    'error': str(exc),
-                    'error_type': type(exc).__name__,
-                })
-                continue
-            if isinstance(outcome, dict) and outcome.get('error_type'):
-                # One refusal costs one peer, never the arm: the peers that
-                # CAN be tagged are, and re-running to catch the rest would
-                # re-write the canonical — the +1-per-pass ratchet.
-                retain_failures.append({
-                    'id': retain_id,
-                    'error': outcome.get('error'),
-                    'error_type': outcome.get('error_type'),
-                })
+            # `topic` ONLY, through the shared classifier above: a raise and a
+            # returned rejection are THE SAME EVENT here (this peer was not
+            # tagged) and are recorded identically. One failure costs one
+            # peer, never the arm — the peers that CAN be tagged are, because
+            # re-running to catch the rest would re-write the canonical, the
+            # +1-per-pass ratchet.
+            failure = await _patch_metadata(retain_id, {'topic': topic})
+            if failure:
+                retain_failures.append({'id': retain_id, **failure})
                 continue
             retained.append(retain_id)
 
@@ -4998,36 +5071,16 @@ def create_mcp_server(
                 # gone with no forward pointer and no tombstone: exactly the
                 # indistinguishable-from-silent-data-loss hole the delete arm's
                 # tombstone contract exists to close.
-                try:
-                    outcome = await memory_service.update_memory(
-                        memory_id=child_id,
-                        project_id=project_id,
-                        content=None,
-                        metadata_patch={'parent_id': canonical_id},
-                        metadata_mode='merge',
-                        agent_id=agent_id,
-                        session_id=session_id,
-                        causation_id=causation_id,
-                        _source=source,
-                    )
-                except Exception as exc:
+                failure = await _patch_metadata(
+                    child_id, {'parent_id': canonical_id}
+                )
+                if failure:
                     stranded_children.append(child_id)
                     reparent_failures.append({
                         'child_id': child_id,
                         'from': supersede_id,
                         'to': canonical_id,
-                        'error': str(exc),
-                        'error_type': type(exc).__name__,
-                    })
-                    continue
-                if isinstance(outcome, dict) and outcome.get('error_type'):
-                    stranded_children.append(child_id)
-                    reparent_failures.append({
-                        'child_id': child_id,
-                        'from': supersede_id,
-                        'to': canonical_id,
-                        'error': outcome.get('error'),
-                        'error_type': outcome.get('error_type'),
+                        **failure,
                     })
                     continue
                 moved_children.append(child_id)
@@ -5321,12 +5374,75 @@ def create_mcp_server(
                 extra={'project_id': project_id, 'run_id': run_id},
             )
 
+        # (7b) CORRECT THE CANONICAL'S OWN CLAIM. `metadata.supersedes` was
+        # stamped at write time with the REQUESTED set, because the write has
+        # to precede every destructive step — so on a partial run the record
+        # durably claims to have replaced ids that are STILL LIVE and still
+        # stating their own claim. That is exactly the overclaim the retain
+        # arm refuses to make ("listing a retained peer there would tell every
+        # future reader to prefer the canonical over a record that is still
+        # live and correct"), and it is worse here because nothing else in
+        # the system ever repairs the field: no sweep patches it down, so a
+        # stale claim would persist in the corpus pointing readers away from
+        # live records.
+        #
+        # Patched down to the CORROBORATED-GONE set — the same set the
+        # tombstones are stamped for, and for the same reason. An id whose
+        # corroborating read failed is not claimed as superseded either: this
+        # field is a claim about what is GONE, and "we could not check" is not
+        # evidence of that.
+        #
+        # It runs LAST, after the closure is known, and it is the only patch
+        # this op makes to its own canonical. It fires ONLY on a run that is
+        # already `partial` by construction: every supersede missing from
+        # `confirmed_gone` is in `failed_deletes`, `survivors` or
+        # `survivor_check_failed`, each of which is open business. So the
+        # correction can never turn a clean run into a reported one, and its
+        # own failure — disclosed, never swallowed — cannot flip a status that
+        # is already `partial`.
+        canonical_supersedes = list(supersedes_ids)
+        supersedes_correction: dict[str, Any] | None = None
+        if set(confirmed_gone) != set(supersedes_ids):
+            correction = {
+                'from': list(supersedes_ids),
+                'to': list(confirmed_gone),
+            }
+            failure = await _patch_metadata(
+                canonical_id, {'supersedes': list(confirmed_gone)}
+            )
+            if failure:
+                # DISCLOSED, not swallowed: the canonical is still claiming
+                # the wider set, and a caller reading `canonical_supersedes`
+                # must see what the record actually says rather than what this
+                # call wanted it to say.
+                supersedes_correction = {
+                    'outcome': 'failed',
+                    **correction,
+                    **failure,
+                }
+                logger.warning(
+                    'consolidate_memories: could not narrow canonical %s '
+                    'metadata.supersedes from %d to %d id(s); it still claims '
+                    'records that are still live',
+                    canonical_id,
+                    len(supersedes_ids),
+                    len(confirmed_gone),
+                    extra={'project_id': project_id, 'run_id': run_id},
+                )
+            else:
+                canonical_supersedes = list(confirmed_gone)
+                supersedes_correction = {'outcome': 'corrected', **correction}
+
         # (8) Anything that did not happen is NAMED, and the status rule that
         # decides `consolidated` vs `partial` lives in ONE pure place rather
         # than being re-expressed at each return.
         return build_consolidation_result(
             canonical_id=canonical_id,
             topic=topic,
+            # What the canonical DURABLY CLAIMS to have replaced, after the
+            # correction above — not what this call was asked to fold.
+            canonical_supersedes=canonical_supersedes,
+            supersedes_correction=supersedes_correction,
             deleted=deleted,
             failed_deletes=failed_deletes,
             survivors=survivors,
