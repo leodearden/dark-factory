@@ -39,14 +39,40 @@ import { createRequire } from 'node:module';
 
 import sp from '../../src/dashboard/static/redux/spark_path.js';
 
-const { isPlottable, sparkScale, sparkPaths, stepPaths } = sp;
+const {
+  isPlottable,
+  sparkScale,
+  sparkPaths,
+  stepPaths,
+  plottableMax,
+  axisY,
+  axisPaths,
+  barFractions,
+  stackedAreaPaths,
+} = sp;
 
 const MODULE_SPECIFIER = '../../src/dashboard/static/redux/spark_path.js';
 
 // The module's complete public surface. Asserted EXHAUSTIVELY below: the
 // run-splitting and area-closing helpers are deliberately module-private, and
 // an accidental export would quietly widen the contract charts.jsx depends on.
-const EXPECTED_FUNCTION_NAMES = ['isPlottable', 'sparkPaths', 'sparkScale', 'stepPaths'];
+//
+// The `plottableMax`/`axisY` entries onward are the padded/offset chart
+// primitives added by task 3489, which extended this module from the two
+// sparklines to charts.jsx's LineChart/StackedAreaChart/BarChart/HistBar. They
+// live here rather than in a second module because they share this file's hole
+// predicate and its two private helpers.
+const EXPECTED_FUNCTION_NAMES = [
+  'isPlottable',
+  'sparkPaths',
+  'sparkScale',
+  'stepPaths',
+  'plottableMax',
+  'axisY',
+  'axisPaths',
+  'barFractions',
+  'stackedAreaPaths',
+];
 
 // Float tolerance for any y that is not exactly representable. The x
 // coordinates and the extrema below are all exact at these inputs (width=100
@@ -145,6 +171,74 @@ function legacyStepPaths(values, width, height) {
   return { line: linePath, area: areaPath };
 }
 
+// Frozen verbatim copy of charts.jsx's PRE-FIX LineChart arithmetic (task 3489,
+// charts.jsx:99-137 as it stood before this task). Same frozen-copy rules as
+// the two above: not a live mirror, valid for HOLE-FREE input only, and its
+// only job is to answer by exact string comparison whether the refactor moved
+// any existing chart.
+//
+// Takes the component's own inputs (`w` and `height` are the resize-observed
+// box; `labelCount` is labels.length, which drives stepX independently of the
+// series length) so the fixture below is charts.jsx's real geometry rather
+// than a re-derivation of it.
+function legacyLineChartPaths(values, w, height, labelCount) {
+  const padL = 38, padR = 12, padT = 8, padB = 22;
+  const chartW = Math.max(w - padL - padR, 50);
+  const chartH = height - padT - padB;
+  const all = values.slice();
+  const maxV = Math.max(...all, 1);
+  const minV = 0;
+  const range = maxV - minV || 1;
+  const n = labelCount;
+  const stepX = chartW / Math.max(n - 1, 1);
+  const pts = values.map((v, i) => {
+    const x = padL + i * stepX;
+    const y = padT + chartH - ((v - minV) / range) * chartH;
+    return [x, y];
+  });
+  const linePath = pts.map((p, i) => (i === 0 ? `M${p[0]},${p[1]}` : `L${p[0]},${p[1]}`)).join(' ');
+  const areaPath = `${linePath} L${padL + chartW},${padT + chartH} L${padL},${padT + chartH} Z`;
+  return { line: linePath, area: areaPath };
+}
+
+// Frozen verbatim copy of charts.jsx's PRE-FIX StackedAreaChart arithmetic
+// (task 3489, charts.jsx:159-201 as it stood before this task). Same frozen-copy
+// rules as the three above.
+//
+// Its `(st.values[i] || 0)` appears three times, exactly as the component had
+// it: once in the column totals that set the axis maximum, and once in each of
+// the cumulative top/base folds. That scrub is the defect — it turns a MISSING
+// sample into a measured zero, fabricating a zero-height band at the hole and
+// understating the column total that scales every band. It is reproduced here
+// verbatim precisely so the hole-free equivalence assertion is honest; fed a
+// hole, this snapshot reproduces the bug.
+function legacyStackedAreaPaths(stacks, w, height, labelCount) {
+  const padL = 38, padR = 12, padT = 8, padB = 22;
+  const chartW = Math.max(w - padL - padR, 50);
+  const chartH = height - padT - padB;
+  const n = labelCount;
+  const stepX = chartW / Math.max(n - 1, 1);
+  const labels = Array.from({ length: n });
+  const totals = labels.map((_, i) => stacks.reduce((s, st) => s + (st.values[i] || 0), 0));
+  const maxV = Math.max(...totals, 1);
+  const cumLayers = stacks.map((_, li) =>
+    labels.map((_, i) => stacks.slice(0, li + 1).reduce((s, st) => s + (st.values[i] || 0), 0)),
+  );
+  const baseLayers = stacks.map((_, li) =>
+    labels.map((_, i) => stacks.slice(0, li).reduce((s, st) => s + (st.values[i] || 0), 0)),
+  );
+  const yToPx = v => padT + chartH - (v / maxV) * chartH;
+  const paths = stacks.map((st, li) => {
+    const top = cumLayers[li];
+    const base = baseLayers[li];
+    const points = [];
+    for (let i = 0; i < n; i++) points.push([padL + i * stepX, yToPx(top[i])]);
+    for (let i = n - 1; i >= 0; i--) points.push([padL + i * stepX, yToPx(base[i])]);
+    return points.map((p, i) => (i === 0 ? `M${p[0]},${p[1]}` : `L${p[0]},${p[1]}`)).join(' ') + ' Z';
+  });
+  return { max: maxV, paths };
+}
+
 // ---------------------------------------------------------------------------
 // Module surface and dual export
 // ---------------------------------------------------------------------------
@@ -153,8 +247,8 @@ test('default-imported module exposes exactly the spark-path functions', () => {
   assert.deepEqual(
     Object.keys(sp).sort(),
     EXPECTED_FUNCTION_NAMES.slice().sort(),
-    'the public surface must be exactly these four — the run-splitting and ' +
-      'area-closing helpers stay module-private',
+    'the public surface must be exactly EXPECTED_FUNCTION_NAMES — the ' +
+      'run-splitting and area-closing helpers stay module-private',
   );
   for (const name of EXPECTED_FUNCTION_NAMES) {
     assert.equal(typeof sp[name], 'function', `sp.${name} should be a function`);
@@ -637,4 +731,734 @@ test('stepPaths: does not mutate its input array', () => {
   const before = values.slice();
   stepPaths(values, 100, 28);
   assert.deepEqual(values, before, 'the caller owns the series; it must come back untouched');
+});
+
+// ---------------------------------------------------------------------------
+// plottableMax — a NaN-proof `Math.max` over finite samples only (task 3489)
+//
+// charts.jsx's LineChart/BarChart/HistBar each folded their axis maximum with a
+// bare `Math.max(...values, 1)`. One `undefined` or `NaN` in the series makes
+// that fold NaN, and every downstream division then yields NaN — which in
+// LineChart's case invalidates the whole `d` attribute (SVG drops the entire
+// path) and in BarChart's case emits literal `height="NaN"` rects. Excluding
+// holes from the fold is the fix; the seed is deliberately kept.
+// ---------------------------------------------------------------------------
+
+test('plottableMax: an undefined or NaN hole no longer poisons the fold to NaN', () => {
+  // THE RED SIGNAL. Pre-fix `Math.max(1, undefined, 3, 1)` is NaN.
+  assert.equal(plottableMax([1, undefined, 3], 1), 3);
+  assert.equal(plottableMax([1, NaN, 3], 1), 3);
+});
+
+test('plottableMax: a null does not lower the result', () => {
+  // A bare null coerces to 0 under Math.max, which cannot lower a max already
+  // seeded at 1 — but it CAN mask a genuine maximum below 0, and it is a hole
+  // regardless of whether the arithmetic happens to survive it.
+  assert.equal(plottableMax([5, null, 2], 1), 5);
+  assert.equal(plottableMax([null], 1), 1);
+});
+
+test('plottableMax: the seed is honoured for empty and all-hole series', () => {
+  assert.equal(plottableMax([], 1), 1);
+  assert.equal(plottableMax([null, undefined, NaN], 1), 1);
+  assert.equal(plottableMax(null, 1), 1, 'a missing series must not throw');
+  assert.equal(plottableMax(undefined, 1), 1);
+  assert.equal(plottableMax([], 7), 7, 'the caller chooses the seed');
+});
+
+test('plottableMax: a measured 0 is admitted as a real sample', () => {
+  // The seed still floors the result at 1, exactly as the pre-fix code did —
+  // this asserts the 0s ENTER the fold rather than being screened out as holes,
+  // which is the distinction the whole module exists to preserve.
+  assert.equal(plottableMax([0, 0], 1), 1);
+  assert.equal(plottableMax([0, 0], 0), 0);
+  assert.equal(plottableMax([0, -5], -10), 0, 'a measured 0 beats a negative seed');
+});
+
+test('plottableMax: Infinity is rejected as garbage, not taken as the maximum', () => {
+  // ±Infinity would blow the axis out so far that every real sample collapses
+  // onto the floor — the same class of chart-destroying garbage as NaN.
+  assert.equal(plottableMax([1, Infinity, 3], 1), 3);
+  assert.equal(plottableMax([1, -Infinity, 3], 1), 3);
+});
+
+test('plottableMax: matches Math.max(...values, seed) exactly on hole-free input', () => {
+  // The guarantee that this refactor did not quietly re-scale every existing
+  // chart: on the dense series the dashboard actually serves today, the new
+  // fold is the old fold.
+  for (const values of [[0, 1, 2, 3, 4], [5], [0, 0, 0], [-3, -1], [0.95, 0.9], [1000, 2]]) {
+    for (const seed of [0, 1]) {
+      assert.equal(
+        plottableMax(values, seed),
+        Math.max(...values, seed),
+        `plottableMax(${JSON.stringify(values)}, ${seed}) must equal the legacy fold`,
+      );
+    }
+  }
+});
+
+test('plottableMax: does not mutate its input array', () => {
+  const values = [1, null, 3];
+  const before = values.slice();
+  plottableMax(values, 1);
+  assert.deepEqual(values, before, 'the caller owns the series; it must come back untouched');
+});
+
+// ---------------------------------------------------------------------------
+// axisY — value -> pixel y inside a PADDED box (task 3489)
+//
+// The sparkline builders scale into a bare 0..height box; the four chart
+// primitives scale into a box offset by the axis gutter, so the y expression is
+// `y0 + height - ((v - min) / range) * height`. Holes come back as null so the
+// caller can decline to plot them instead of drawing a fabricated point at the
+// chart floor.
+//
+// The fixture below is charts.jsx's real geometry at w=150/height=220
+// (padT=8, chartH=190) and is EXACTLY representable — every expected y is an
+// exact binary fraction, so these assertions need no float tolerance.
+// ---------------------------------------------------------------------------
+
+const AXIS_GEOM = { y0: 8, height: 190, min: 0, range: 4 };
+
+test('axisY: maps a plottable value to its exact pixel y in the padded box', () => {
+  assert.equal(axisY(0, AXIS_GEOM), 198, 'value 0 sits on the chart floor');
+  assert.equal(axisY(1, AXIS_GEOM), 150.5);
+  assert.equal(axisY(2, AXIS_GEOM), 103, 'the midpoint');
+  assert.equal(axisY(3, AXIS_GEOM), 55.5);
+  assert.equal(axisY(4, AXIS_GEOM), 8, 'the maximum sits at the top padding');
+});
+
+test('axisY: a measured 0 maps to the floor rather than being treated as a hole', () => {
+  // The distinction that matters: a real zero IS a measurement and belongs on
+  // the baseline; a missing sample must not be drawn there.
+  assert.equal(axisY(0, AXIS_GEOM), 198);
+  assert.equal(axisY(null, AXIS_GEOM), null);
+  assert.notEqual(axisY(0, AXIS_GEOM), axisY(null, AXIS_GEOM));
+});
+
+test('axisY: every hole flavour returns null instead of a fabricated pixel', () => {
+  for (const hole of [null, undefined, NaN, Infinity, -Infinity, '3', [], {}, true]) {
+    assert.equal(
+      axisY(hole, AXIS_GEOM),
+      null,
+      `${JSON.stringify(hole) ?? String(hole)} must not produce a plotted y`,
+    );
+  }
+});
+
+test('axisY: reproduces the legacy padded y expression on hole-free input', () => {
+  // charts.jsx's pre-fix LineChart y was
+  //   padT + chartH - ((v - minV) / range) * chartH
+  // and StackedAreaChart's yToPx was the same with min 0. Identical arithmetic
+  // produces identical doubles, so this is an exact comparison.
+  const geom = { y0: 8, height: 190, min: 0, range: 7 };
+  for (const v of [0, 1, 2.5, 6, 7]) {
+    assert.equal(
+      axisY(v, geom),
+      geom.y0 + geom.height - ((v - geom.min) / geom.range) * geom.height,
+    );
+  }
+});
+
+test('axisY: a degenerate value axis yields null, never ±Infinity or NaN', () => {
+  // `range` is the divisor and the only part of geom derived from DATA. A zero
+  // range divides by zero (±Infinity), a NaN range poisons the result — either
+  // one lands verbatim in an SVG coordinate. A caller that cannot be told "no
+  // pixel here" would draw the mark off-canvas or blank the whole path, which
+  // is the failure this module exists to remove; so a broken axis is answered
+  // the same way a broken sample is.
+  for (const range of [0, NaN, Infinity, -Infinity, undefined, null]) {
+    const y = axisY(1, { y0: 8, height: 190, min: 0, range });
+    assert.equal(y, null, `range=${String(range)} must not produce a plotted y (got ${y})`);
+  }
+
+  // A real 0 sample against a real axis is still plotted — the guard must not
+  // swallow the measured-zero case it sits next to.
+  assert.equal(axisY(0, AXIS_GEOM), 198);
+});
+
+test('axisY: honours a non-zero min', () => {
+  // Not used by charts.jsx today (LineChart hard-codes minV = 0 and that is
+  // deliberately preserved), but the parameter is part of the contract and a
+  // silent disregard would be a trap for the next caller.
+  const geom = { y0: 8, height: 190, min: 2, range: 2 };
+  assert.equal(axisY(2, geom), 198, 'the min sits on the floor');
+  assert.equal(axisY(4, geom), 8, 'min + range sits at the top');
+});
+
+// ---------------------------------------------------------------------------
+// axisPaths — the padded/offset analogue of sparkPaths (task 3489)
+//
+// charts.jsx's LineChart built its own points/line/area inline with no hole
+// handling, so a `null` was plotted as a real point at the chart floor and
+// joined by line segments to both neighbours, and the area was closed across
+// the FULL chart width regardless of where the measurements actually stopped.
+//
+// GEOMETRY NOTE — the exact-reproduction fixtures below are pinned on
+// DIVISIBLE geometry, deliberately. Per-run area closing ends at the run's own
+// `x0 + (count-1)*stepX`, whereas the pre-fix code closed at the literal
+// `x0 + width`; those are not always the same double. A sweep over width
+// 200..1400 x count 2..40 found 216 of 6708 combinations differing by 1 ULP
+// (e.g. width=228, count=12 gives 216.00000000000003 vs 216). w=150/height=220
+// -> padL=38, padT=8, chartW=100, chartH=190 with 5 points gives stepX=25 and
+// lastX=138 exactly, so exact equality here is a real assertion rather than a
+// doomed one. Do not "generalise" these fixtures to arbitrary numbers.
+// ---------------------------------------------------------------------------
+
+// charts.jsx's LineChart geometry at w=150, height=220, labels.length=5.
+const LINE_GEOM = { x0: 38, y0: 8, width: 100, height: 190, count: 5, min: 0, range: 4 };
+
+test('axisPaths: hole-free input reproduces the pre-fix LineChart paths exactly', () => {
+  // "Did this refactor quietly move every existing chart?" — answered by exact
+  // string comparison against the frozen pre-fix arithmetic, no tolerance.
+  const values = [0, 1, 2, 3, 4];
+  const legacy = legacyLineChartPaths(values, 150, 220, 5);
+  const actual = axisPaths(values, LINE_GEOM);
+
+  assert.equal(actual.line, legacy.line);
+  assert.equal(actual.area, legacy.area);
+  // Spelled out, so a reader can see the geometry rather than trust two
+  // implementations that could in principle drift together.
+  assert.equal(actual.line, 'M38,198 L63,150.5 L88,103 L113,55.5 L138,8');
+  assert.equal(actual.area, 'M38,198 L63,150.5 L88,103 L113,55.5 L138,8 L138,198 L38,198 Z');
+});
+
+test('axisPaths: a null mid-series breaks the line into two subpaths', () => {
+  // THE RED SIGNAL. Pre-fix, the null became a real point at y=198 (the chart
+  // floor) wired to both neighbours — a measured plunge to zero and back that
+  // never happened.
+  const { line } = axisPaths([0, 1, null, 3, 4], LINE_GEOM);
+
+  assert.equal(countCommand(line, 'M'), 2, 'the line must be genuinely discontinuous');
+  assert.equal(line, 'M38,198 L63,150.5 M113,55.5 L138,8');
+  assert.ok(!xs(line).includes(88), 'nothing may be drawn in the missing slot');
+});
+
+test('axisPaths: no area is painted across a hole', () => {
+  // Pre-fix the area closed at the full chart width, so the fill spanned the
+  // gap even where the line did not.
+  const { area } = axisPaths([0, 1, null, 3, 4], LINE_GEOM);
+
+  assert.equal(countCommand(area, 'M'), 2, 'one closed shape per run');
+  assert.equal(countCommand(area, 'Z'), 2, 'each run closes on itself');
+  assert.equal(
+    area,
+    'M38,198 L63,150.5 L63,198 L38,198 Z M113,55.5 L138,8 L138,198 L113,198 Z',
+  );
+});
+
+test('axisPaths: undefined and NaN holes behave exactly like null, with no NaN emitted', () => {
+  // Pre-fix these were WORSE than null: they poisoned maxV to NaN, `range =
+  // NaN - NaN || 1` silently fell back to 1, and a single NaN token in the `d`
+  // attribute makes SVG drop the ENTIRE path — the whole series vanished.
+  const reference = axisPaths([0, 1, null, 3, 4], LINE_GEOM);
+
+  for (const hole of [undefined, NaN]) {
+    const actual = axisPaths([0, 1, hole, 3, 4], LINE_GEOM);
+    assert.equal(actual.line, reference.line, `${String(hole)} must break like null`);
+    assert.equal(actual.area, reference.area, `${String(hole)} must break like null`);
+    assert.ok(!actual.line.includes('NaN'), `line still carries a NaN: ${actual.line}`);
+    assert.ok(!actual.area.includes('NaN'), `area still carries a NaN: ${actual.area}`);
+    for (const n of coords(actual.line).flat()) {
+      assert.ok(Number.isFinite(n), `every coordinate must be finite — got ${actual.line}`);
+    }
+  }
+});
+
+test('axisPaths: an all-hole or empty series yields empty strings rather than throwing', () => {
+  // The decline-to-render decision stays at the call site. LineChart keeps its
+  // axes, gridlines and tick labels (chart furniture describing the requested
+  // window) and skips only the series paths.
+  for (const values of [[null, null, null], [undefined, NaN], [null], [], null, undefined]) {
+    const { line, area } = axisPaths(values, LINE_GEOM);
+    assert.equal(line, '', `expected no line for ${JSON.stringify(values) ?? String(values)}`);
+    assert.equal(area, '', `expected no area for ${JSON.stringify(values) ?? String(values)}`);
+  }
+});
+
+test('axisPaths: a lone sample flanked by holes is a dot at its own x, with no area', () => {
+  // A bare Move command renders NOTHING in SVG, so an isolated sample is drawn
+  // as a zero-length segment. It is deliberately NOT extended toward either
+  // neighbour: that would assert a measurement in a slot known to be empty.
+  // The area is dropped because a zero-width fill is an invisible sliver, and
+  // the pre-fix full-width triangle under one sample was itself fabricated.
+  const { line, area } = axisPaths([null, 1, null], { ...LINE_GEOM, count: 3, range: 4 });
+
+  assert.equal(line, 'M88,150.5 L88,150.5');
+  assert.equal(distinctCoords(line).length, 1, 'one sample marks exactly one place');
+  assert.equal(area, '', 'a zero-width run contributes no area');
+});
+
+test('axisPaths: x comes from the ORIGINAL index, so a hole never shifts the axis', () => {
+  // Compacting instead would silently REDATE every surviving sample — the
+  // sample after the hole would slide back into the missing slot's x and claim
+  // to have been measured a bucket earlier than it was.
+  const dense = axisPaths([0, 1, 2, 3, 4], LINE_GEOM);
+  const holed = axisPaths([0, 1, null, 3, 4], LINE_GEOM);
+
+  const denseXs = xs(dense.line);
+  const holedXs = xs(holed.line);
+  assert.deepEqual(holedXs, [38, 63, 113, 138], 'surviving samples keep their own x');
+  assert.equal(holedXs[2], denseXs[3], 'the sample after the hole keeps index 3’s x');
+  assert.equal(ys(holed.line)[2], ys(dense.line)[3], '...and index 3’s y');
+});
+
+test('axisPaths: stepX derives from count (labels.length), not values.length', () => {
+  // charts.jsx drives stepX off the LABEL row, so a series shorter than the
+  // label row must stop at its own last x rather than being stretched across
+  // the full width and implying measurements it does not have.
+  const short = axisPaths([0, 1, 2], LINE_GEOM);
+
+  assert.deepEqual(xs(short.line), [38, 63, 88], 'three samples occupy the first three slots');
+  assert.ok(!xs(short.line).includes(138), 'a short series must not reach the last slot');
+});
+
+test('axisPaths: the returned stepX IS the spacing between consecutive plotted xs', () => {
+  // The caller positions its label row with this number and its marks with the
+  // path. If the two could disagree the labels would name the wrong columns —
+  // and a mislabelled chart renders as a plausible chart, not as an error. So
+  // the builder returns the one x-mapping rather than leaving the call site to
+  // recompute `width / Math.max(count - 1, 1)` beside it.
+  const { line, stepX } = axisPaths([0, 1, 2, 3, 4], LINE_GEOM);
+  const plottedXs = xs(line);
+
+  assert.equal(stepX, 25, 'width 100 over 5 columns');
+  for (let i = 1; i < plottedXs.length; i++) {
+    assert.equal(plottedXs[i] - plottedXs[i - 1], stepX, `gap ${i} must equal the returned stepX`);
+  }
+  assert.equal(plottedXs[0], LINE_GEOM.x0, 'column 0 sits on the box origin');
+
+  // It survives the degenerate calls too, since the axes and labels render even
+  // when nothing is plotted.
+  assert.equal(axisPaths([], LINE_GEOM).stepX, 25, 'an empty series still yields the mapping');
+  assert.equal(axisPaths([null, null], LINE_GEOM).stepX, 25);
+  assert.equal(
+    axisPaths([1], { ...LINE_GEOM, count: 1 }).stepX,
+    100,
+    'a single column falls back to the full width, matching Math.max(count - 1, 1)',
+  );
+});
+
+test('axisPaths: a measured 0 is plotted on the floor, a hole is not plotted at all', () => {
+  // The distinction the pre-fix code destroyed: both rendered as a point at
+  // y=198. Now only the measurement does.
+  const measured = axisPaths([0, 1, 0, 1, 0], LINE_GEOM);
+  const holed = axisPaths([0, 1, null, 1, 0], LINE_GEOM);
+
+  assert.equal(countCommand(measured.line, 'M'), 1, 'a real zero keeps the line continuous');
+  assert.ok(xs(measured.line).includes(88), 'the measured zero occupies its slot');
+  assert.equal(countCommand(holed.line, 'M'), 2, 'a hole breaks it');
+  assert.notEqual(measured.line, holed.line);
+});
+
+test('axisPaths: a single-sample series draws a dot rather than a full-width line', () => {
+  const { line, area } = axisPaths([2], { ...LINE_GEOM, count: 1, range: 4 });
+
+  assert.equal(line, 'M38,103 L38,103');
+  assert.equal(area, '');
+});
+
+test('axisPaths: does not mutate its input array', () => {
+  const values = [0, null, 2, null, 4];
+  const before = values.slice();
+  axisPaths(values, LINE_GEOM);
+  assert.deepEqual(values, before, 'the caller owns the series; it must come back untouched');
+});
+
+// ---------------------------------------------------------------------------
+// barFractions — value -> fraction-of-max, with a NULL for a hole (task 3489)
+//
+// charts.jsx's BarChart computed `(v / max) * chartH` and HistBar
+// `(v / max) * 100`, both after a bare `Math.max(...values, 1)`. A null gave a
+// ZERO-HEIGHT bar, indistinguishable from a measured zero; an undefined gave
+// `height="NaN"`; and HistBar's `minHeight: 1` turned a hole into a visible
+// 1px stub — a fabricated measurement.
+//
+// The fix hands the caller a `null` ENTRY rather than a number, because there
+// is no number a bar renderer can draw that means "absent": 0 and 1px both
+// read as measurements. Only an explicit null lets the caller decline to emit
+// the bar while keeping the slot's label and x position.
+// ---------------------------------------------------------------------------
+
+test('barFractions: a measured 0 and a null are DISTINCT, not both zero-height', () => {
+  // THE RED SIGNAL, and the entire point of the helper.
+  const { fractions } = barFractions([0, null], 4);
+
+  assert.equal(fractions[0], 0, 'a measured zero is a real fraction');
+  assert.equal(fractions[1], null, 'a hole is not a fraction at all');
+  assert.notEqual(fractions[0], fractions[1]);
+});
+
+test('barFractions: undefined and NaN yield null, and no entry is ever NaN', () => {
+  // Pre-fix an undefined poisoned max to NaN, so EVERY bar became
+  // height="NaN" — not just the missing one.
+  const { fractions } = barFractions([1, undefined, NaN, 2], 4);
+
+  assert.deepEqual(fractions, [0.25, null, null, 0.5]);
+  for (const f of fractions) {
+    assert.ok(f === null || Number.isFinite(f), `every entry must be null or finite — got ${f}`);
+  }
+});
+
+test('barFractions: a degenerate max yields all nulls, never Infinity or NaN', () => {
+  // The samples were always guarded; the DENOMINATOR was not. HistBar reaches
+  // this directly — `maxOverride ?? plottableMax(values, 1)` falls back only on
+  // null/undefined, so a `maxOverride={0}` (a natural empty-histogram guard)
+  // arrives here as a real zero and used to produce `height: 'Infinity%'`, and
+  // a NaN override `height: 'NaN%'`.
+  for (const max of [0, NaN, Infinity, -Infinity, undefined, null, '4']) {
+    const { fractions } = barFractions([1, 2], max);
+
+    assert.deepEqual(
+      fractions,
+      [null, null],
+      `max=${String(max)} is not an axis — every bar is unknowable, not zero-height`,
+    );
+  }
+
+  // The property the test above only claimed: with the denominator guarded, no
+  // entry can be non-finite for ANY (values, max) pair, not just a good one.
+  for (const max of [0, NaN, Infinity, undefined, null, 4]) {
+    for (const f of barFractions([1, null, 0, undefined, NaN, 2], max).fractions) {
+      assert.ok(f === null || Number.isFinite(f), `entry must be null or finite — got ${f}`);
+    }
+  }
+});
+
+test('barFractions: a degenerate max still preserves length and index alignment', () => {
+  // All-null is the right answer, but it must be an all-null of the SAME shape:
+  // the caller positions each slot by index and keeps the category label even
+  // where it draws no bar.
+  const values = [1, null, 3, 4];
+
+  assert.deepEqual(barFractions(values, 0).fractions, [null, null, null, null]);
+  assert.equal(barFractions(values, NaN).fractions.length, values.length);
+});
+
+test('barFractions: plain fractions are exact on divisible input', () => {
+  assert.deepEqual(barFractions([0, 1, 2, 4], 4).fractions, [0, 0.25, 0.5, 1]);
+});
+
+test('barFractions: length and index alignment are preserved', () => {
+  // A hole must never shift a bar into its neighbour's slot — the category
+  // labels are positioned by index, so a compacted array would silently
+  // relabel every surviving bar.
+  const values = [1, null, 3, undefined, 5];
+  const { fractions } = barFractions(values, 5);
+
+  assert.equal(fractions.length, values.length);
+  assert.deepEqual(fractions, [0.2, null, 0.6, null, 1]);
+});
+
+test('barFractions: an all-hole or empty series yields all nulls rather than throwing', () => {
+  assert.deepEqual(barFractions([null, undefined, NaN], 1).fractions, [null, null, null]);
+  assert.deepEqual(barFractions([], 1).fractions, []);
+  assert.deepEqual(barFractions(null, 1).fractions, [], 'a missing series must not throw');
+  assert.deepEqual(barFractions(undefined, 1).fractions, []);
+});
+
+test('barFractions: max is an explicit argument, so the override path shares one code path', () => {
+  // HistBar has a `maxOverride ?? ...` precedence that must survive the
+  // refactor; passing max in means the override and derived-max paths run the
+  // same arithmetic rather than diverging into two.
+  assert.deepEqual(barFractions([1, 2], 4).fractions, [0.25, 0.5]);
+  assert.deepEqual(barFractions([1, 2], 2).fractions, [0.5, 1], 'a different max rescales');
+});
+
+test('barFractions: reproduces the legacy v / max on hole-free input', () => {
+  // charts.jsx's pre-fix BarChart height was `(v / max) * chartH` and
+  // HistBar's was `(v / max) * 100`; both are this fraction times a constant.
+  for (const values of [[0, 1, 2, 3], [5, 5], [0, 0, 0], [7]]) {
+    const max = Math.max(...values, 1);
+    assert.deepEqual(barFractions(values, max).fractions, values.map(v => v / max));
+  }
+});
+
+test('barFractions: does not mutate its input array', () => {
+  const values = [1, null, 3];
+  const before = values.slice();
+  barFractions(values, 3);
+  assert.deepEqual(values, before, 'the caller owns the series; it must come back untouched');
+});
+
+// ---------------------------------------------------------------------------
+// stackedAreaPaths — banded areas with a PREFIX hole rule (task 3489)
+//
+// charts.jsx's StackedAreaChart scrubbed every sample with `(st.values[i] || 0)`
+// in three places — the column totals that set the axis maximum, and both
+// cumulative folds — so a MISSING sample was summed as a measured zero: the
+// band collapsed to zero height at that column (indistinguishable from a real
+// zero) and the total it fed understated the axis for every other band.
+//
+// THE HOLE RULE IS PREFIX-SHAPED, not per-layer. Layer li's base is the sum of
+// layers 0..li-1 and its top adds li's own value, so a hole in a LOWER layer
+// makes every band ABOVE it unknowable at that column — while the bands BELOW
+// it stay perfectly well-defined and keep drawing. Holing the whole column for
+// all layers would erase truthful lower bands: the same synthetic-data error in
+// the opposite direction.
+//
+// THE AXIS MAXIMUM covers the union of (a) the totals of FULLY-plottable
+// columns and (b) every DRAWN top (each plottable prefix sum actually
+// rendered), seeded with 1 as before. Clause (b) is what keeps the drawing
+// inside the box: under the prefix rule a lower layer is still drawn at a
+// column whose upper layers are holed, so an axis folded over full-column
+// totals alone can be exceeded by a band it must contain — measured at
+// HEAD=62687e86d5, the (e) fixture below rendered a vertex at y=-229.5 against
+// a plot box spanning y 8..198 (steward adjudication esc-3489-1). Clause (a)
+// is redundant for non-negative data — a full column's topmost drawn top IS its
+// total — and is kept explicit so "a partial sum is not a total" stays legible.
+//
+// GEOMETRY NOTE — same divisible-fixture discipline as the axisPaths block
+// above: w=150/height=220 -> padL=38, padT=8, chartW=100, chartH=190, and 3 or
+// 5 labels give stepX 50 or 25 with the last x landing exactly on 138. Every
+// pinned coordinate below is an exact binary fraction, so the exact-string
+// comparisons are real assertions rather than doomed ones. Do not "generalise"
+// these fixtures to arbitrary numbers.
+// ---------------------------------------------------------------------------
+
+// charts.jsx's StackedAreaChart geometry at w=150, height=220. `min` and
+// `range` are absent by design: this builder derives its own axis maximum from
+// the stacks (min is 0 and range is that maximum), which is why it returns
+// `max` for the caller's y-ticks.
+const STACK_GEOM_3 = { x0: 38, y0: 8, width: 100, height: 190, count: 3 };
+const STACK_GEOM_5 = { x0: 38, y0: 8, width: 100, height: 190, count: 5 };
+
+// charts.jsx passes its `stacks` prop straight through, so the tests use its
+// real shape ({ key, color, values }) rather than bare arrays.
+const layer = (key, values) => ({ key, color: '#8be9fd', values });
+
+function allYs(paths) {
+  return paths.flatMap(d => (d === '' ? [] : ys(d)));
+}
+
+test('stackedAreaPaths: hole-free input reproduces the pre-fix polygons exactly', () => {
+  // "Did this refactor quietly move every existing stacked chart?" — answered
+  // by exact string comparison against the frozen pre-fix arithmetic, no
+  // tolerance. On hole-free input the scrub never fires, so the new rule and
+  // the legacy one must agree character-for-character.
+  const stacks = [layer('a', [1, 2, 1]), layer('b', [3, 2, 3])];
+  const legacy = legacyStackedAreaPaths(stacks, 150, 220, 3);
+  const actual = stackedAreaPaths(stacks, STACK_GEOM_3);
+
+  assert.equal(actual.max, 4);
+  assert.equal(actual.max, legacy.max);
+  assert.deepEqual(actual.paths, legacy.paths);
+  // Spelled out, so a reader can see the geometry rather than trust two
+  // implementations that could in principle drift together. Forward along the
+  // top, back along the base, closed.
+  assert.deepEqual(actual.paths, [
+    'M38,150.5 L88,103 L138,150.5 L138,198 L88,198 L38,198 Z',
+    'M38,8 L88,8 L138,8 L138,150.5 L88,103 L38,150.5 Z',
+  ]);
+});
+
+test('stackedAreaPaths: a hole in a LOWER layer breaks every layer above it', () => {
+  // THE PREFIX RULE. Layer b has a perfectly good 3 at the holed column, but
+  // its base is a's cumulative sum, which is unknown there — so where b sits is
+  // unknowable and it must not be drawn. Pre-fix, a's hole became 0 and b was
+  // drawn at a fabricated base.
+  const { paths } = stackedAreaPaths(
+    [layer('a', [1, 1, null, 1, 1]), layer('b', [3, 3, 3, 3, 3])],
+    STACK_GEOM_5,
+  );
+
+  for (const [li, d] of paths.entries()) {
+    assert.equal(countCommand(d, 'M'), 2, `layer ${li} must break at the hole`);
+    assert.equal(countCommand(d, 'Z'), 2, `layer ${li} closes each run on itself`);
+    assert.ok(!xs(d).includes(88), `layer ${li} draws in the missing slot: ${d}`);
+  }
+  assert.deepEqual(paths, [
+    'M38,150.5 L63,150.5 L63,198 L38,198 Z M113,150.5 L138,150.5 L138,198 L113,198 Z',
+    'M38,8 L63,8 L63,150.5 L38,150.5 Z M113,8 L138,8 L138,150.5 L113,150.5 Z',
+  ]);
+});
+
+test('stackedAreaPaths: a hole in the TOP layer leaves every lower layer intact', () => {
+  // The other half of the prefix rule, and why it is not "hole the column".
+  // Layer a is fully measured at every column; nothing above it can take that
+  // away.
+  const { paths } = stackedAreaPaths(
+    [layer('a', [1, 1, 1, 1, 1]), layer('b', [3, 3, null, 3, 3])],
+    STACK_GEOM_5,
+  );
+
+  assert.equal(countCommand(paths[0], 'M'), 1, 'the lower band stays continuous');
+  assert.ok(xs(paths[0]).includes(88), 'and keeps drawing at the holed column');
+  assert.equal(
+    paths[0],
+    'M38,150.5 L63,150.5 L88,150.5 L113,150.5 L138,150.5 L138,198 L113,198 L88,198 L63,198 L38,198 Z',
+  );
+  assert.equal(countCommand(paths[1], 'M'), 2, 'only the holed layer breaks');
+  assert.ok(!xs(paths[1]).includes(88), 'and it draws nothing in the missing slot');
+});
+
+test('stackedAreaPaths: a measured 0 is a real zero-height band, not a hole', () => {
+  // The distinction `(st.values[i] || 0)` destroyed — from the other side. A
+  // measured zero MUST keep its column: the band pinches to zero height there
+  // and the layers above it sit lower, all of it true. Only a hole breaks the
+  // polygon.
+  const measured = stackedAreaPaths([layer('a', [1, 0, 1]), layer('b', [3, 3, 3])], STACK_GEOM_3);
+  const holed = stackedAreaPaths([layer('a', [1, null, 1]), layer('b', [3, 3, 3])], STACK_GEOM_3);
+
+  assert.equal(countCommand(measured.paths[0], 'M'), 1, 'a real zero keeps the band whole');
+  assert.ok(xs(measured.paths[0]).includes(88), 'the measured zero occupies its column');
+  assert.equal(measured.paths[0], 'M38,150.5 L88,198 L138,150.5 L138,198 L88,198 L38,198 Z');
+  assert.equal(
+    measured.paths[1],
+    'M38,8 L88,55.5 L138,8 L138,150.5 L88,198 L38,150.5 Z',
+    'the layer above sits lower at the measured zero, exactly as it should',
+  );
+
+  assert.equal(countCommand(holed.paths[0], 'M'), 2, 'a hole breaks it');
+  assert.ok(!xs(holed.paths[0]).includes(88), 'and nothing is drawn there at all');
+  assert.notDeepEqual(measured.paths, holed.paths, 'a measured 0 and a hole are NOT the same');
+});
+
+test('stackedAreaPaths: a hole is never scrubbed to 0 inside a column total', () => {
+  // The legacy `(st.values[i] || 0)` total at the holed column is 0 + 5 = 5 —
+  // a PARTIAL SUM passed off as a column total, which would rescale every band
+  // against a maximum no column ever reached. Under the prefix rule that column
+  // contributes no total and draws nothing, so the axis stays at 4.
+  const stacks = [layer('a', [1, 1, null]), layer('b', [3, 3, 5])];
+  const { max, paths } = stackedAreaPaths(stacks, STACK_GEOM_3);
+
+  assert.equal(legacyStackedAreaPaths(stacks, 150, 220, 3).max, 5, 'what the scrub used to give');
+  assert.equal(max, 4, 'the hole must not be summed as a measured zero');
+  for (const [li, d] of paths.entries()) {
+    assert.ok(!xs(d).includes(138), `layer ${li} must not draw at the holed column: ${d}`);
+  }
+});
+
+test('stackedAreaPaths: the axis covers every DRAWN top, so no band lands off-canvas', () => {
+  // The other direction, and the reason clause (b) exists. Layer a is still
+  // drawn at column 2 (its own value is measured; only b above it is holed), so
+  // its top of 9 MUST be inside the axis. Folding only fully-plottable column
+  // totals gives max=4 and puts that vertex at y=-229.5 — 237.5px above a plot
+  // box spanning y 8..198 (measured at HEAD=62687e86d5, esc-3489-1).
+  const { max, paths } = stackedAreaPaths(
+    [layer('a', [1, 1, 9]), layer('b', [3, 3, null])],
+    STACK_GEOM_3,
+  );
+
+  assert.equal(max, 9, 'the drawn top of 9 is in the fold, not just the full columns');
+
+  const top = STACK_GEOM_3.y0;
+  const floor = STACK_GEOM_3.y0 + STACK_GEOM_3.height;
+  for (const y of allYs(paths)) {
+    assert.ok(
+      Number.isFinite(y) && y >= top && y <= floor,
+      `every drawn vertex must sit inside the plot box [${top}, ${floor}] — got ${y}`,
+    );
+  }
+  assert.ok(ys(paths[0]).includes(8), 'the tallest drawn top sits exactly at the box top');
+});
+
+test('stackedAreaPaths: a column hole splits a layer into separate closed polygons', () => {
+  // Not one polygon with a notch and not a band drawn straight across: two
+  // independent closed shapes, each returning to the baseline under its own
+  // last column.
+  const { paths } = stackedAreaPaths([layer('a', [1, 2, null, 2, 1])], STACK_GEOM_5);
+
+  assert.equal(countCommand(paths[0], 'M'), 2);
+  assert.equal(countCommand(paths[0], 'Z'), 2);
+  assert.equal(
+    paths[0],
+    'M38,103 L63,8 L63,198 L38,198 Z M113,8 L138,103 L138,198 L113,198 Z',
+  );
+
+  // A run of ONE column is still emitted, as a zero-width polygon at its own x:
+  // under the component's existing stroke it reads as a thin tick, which is an
+  // honest "measured here, unknown either side". It is deliberately NOT widened
+  // toward a neighbour, which would assert a measurement in a known-empty slot.
+  const lone = stackedAreaPaths([layer('a', [1, null, 1])], STACK_GEOM_3);
+  assert.deepEqual(lone.paths, ['M38,8 L38,198 Z M138,8 L138,198 Z']);
+  assert.ok(!xs(lone.paths[0]).includes(88), 'still nothing in the missing slot');
+});
+
+test('stackedAreaPaths: an all-hole layer yields an empty path rather than throwing', () => {
+  // The decline-to-render decision stays at the call site: StackedAreaChart
+  // skips the empty <path> but keeps its axes, gridlines and tick labels, which
+  // are structural facts about the requested window rather than measurements.
+  const topGone = stackedAreaPaths(
+    [layer('a', [1, 2, 1]), layer('b', [null, null, null])],
+    STACK_GEOM_3,
+  );
+  assert.equal(topGone.paths[1], '', 'an all-hole layer draws nothing');
+  assert.notEqual(topGone.paths[0], '', 'the measured layer below still draws');
+  assert.equal(topGone.max, 2, 'the axis folds the drawn tops that remain');
+
+  // A holed BOTTOM layer takes everything above it with it, by the prefix rule.
+  const bottomGone = stackedAreaPaths(
+    [layer('a', [null, null, null]), layer('b', [1, 2, 3])],
+    STACK_GEOM_3,
+  );
+  assert.deepEqual(bottomGone.paths, ['', '']);
+  assert.equal(bottomGone.max, 1, 'the seed of 1 still frames the empty chart');
+
+  // Degenerate inputs must not throw either — a tab renders before its fetch
+  // resolves.
+  // stepX comes back even from a degenerate call: the caller's label row and
+  // axes still render, so it still needs the x-mapping. STACK_GEOM_3 is
+  // width 100 over 3 columns -> 50.
+  assert.deepEqual(stackedAreaPaths([], STACK_GEOM_3), { max: 1, paths: [], stepX: 50 });
+  assert.deepEqual(stackedAreaPaths(null, STACK_GEOM_3), { max: 1, paths: [], stepX: 50 });
+  assert.deepEqual(stackedAreaPaths(undefined, STACK_GEOM_3), { max: 1, paths: [], stepX: 50 });
+  assert.deepEqual(
+    stackedAreaPaths([layer('a', undefined)], STACK_GEOM_3),
+    { max: 1, paths: [''], stepX: 50 },
+  );
+});
+
+test('stackedAreaPaths: undefined and NaN are holes too, and no NaN is ever emitted', () => {
+  // Pre-fix, `undefined || 0` scrubbed to zero like a null, but a NaN survived
+  // the scrub (NaN is not falsy-replaced), poisoned maxV, and put a NaN token
+  // in every layer's `d` — which makes SVG drop the WHOLE path, so the entire
+  // chart vanished rather than one band.
+  const reference = stackedAreaPaths(
+    [layer('a', [1, 1, null, 1, 1]), layer('b', [3, 3, 3, 3, 3])],
+    STACK_GEOM_5,
+  );
+
+  for (const hole of [undefined, NaN]) {
+    const actual = stackedAreaPaths(
+      [layer('a', [1, 1, hole, 1, 1]), layer('b', [3, 3, 3, 3, 3])],
+      STACK_GEOM_5,
+    );
+    assert.equal(actual.max, reference.max, `${String(hole)} must not move the axis`);
+    assert.deepEqual(actual.paths, reference.paths, `${String(hole)} must break like null`);
+    for (const d of actual.paths) {
+      assert.ok(!d.includes('NaN'), `a path still carries a NaN: ${d}`);
+    }
+    for (const y of allYs(actual.paths)) {
+      assert.ok(Number.isFinite(y), `every coordinate must be finite — got ${y}`);
+    }
+  }
+});
+
+test('stackedAreaPaths: the returned stepX IS the spacing between consecutive band xs', () => {
+  // Same contract as axisPaths: StackedAreaChart positions its label row with
+  // this number and its bands with the polygons, so both must come from one
+  // x-mapping. A recomputed copy at the call site drifts silently.
+  const { paths, stepX } = stackedAreaPaths(
+    [layer('a', [1, 2, 1, 2, 1]), layer('b', [3, 2, 3, 2, 3])],
+    STACK_GEOM_5,
+  );
+
+  assert.equal(stepX, 25, 'width 100 over 5 columns');
+  // The forward half of a closed band walks the columns in order, so its first
+  // `count` xs are the column positions.
+  const forwardXs = xs(paths[0]).slice(0, STACK_GEOM_5.count);
+  for (let i = 1; i < forwardXs.length; i++) {
+    assert.equal(forwardXs[i] - forwardXs[i - 1], stepX, `gap ${i} must equal the returned stepX`);
+  }
+  assert.equal(forwardXs[0], STACK_GEOM_5.x0, 'column 0 sits on the box origin');
+
+  assert.equal(stackedAreaPaths([layer('a', [1, 2, 1])], STACK_GEOM_3).stepX, 50, '3 columns');
+});
+
+test('stackedAreaPaths: does not mutate its input stacks', () => {
+  const stacks = [layer('a', [1, null, 1]), layer('b', [3, 3, 3])];
+  const before = JSON.stringify(stacks);
+  stackedAreaPaths(stacks, STACK_GEOM_3);
+  assert.equal(JSON.stringify(stacks), before, 'the caller owns the stacks; hand them back untouched');
 });
