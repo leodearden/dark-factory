@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 
 import pytest
 
@@ -251,9 +250,10 @@ class TestAdvisoryVsRejectionWording:
 
     Task 4159 pins the other half of the same honesty property: the advisory
     fires from the ``submit_task`` PHASE-1 guard, before ``tm.add_task`` and
-    before the curator picks drop/combine/create/refuse, so it may not claim
-    a task EXISTS either.  Overcorrecting from 'rejected' to 'created' just
-    moved the false claim.
+    before the submission has been resolved (it may yield a new task, be
+    folded into an existing one, or be dropped), so it may not claim a task
+    EXISTS either.  Overcorrecting from 'rejected' to 'created' just moved
+    the false claim.
     """
 
     @staticmethod
@@ -267,6 +267,42 @@ class TestAdvisoryVsRejectionWording:
         assert len(payloads) == 1, f'expected exactly one escalation, found: {payloads}'
         return payloads[0]
 
+    # The canonical submit for each outcome mode, so a wording test reads as
+    # "file one advisory, assert on it" rather than five copies of the same
+    # four-argument call.  Per-test deltas stay visible as **overrides at the
+    # call site; tests that deliberately drive BOTH modes over one IDENTICAL
+    # shape (the cross-fold/fingerprint pins) build their own dict instead,
+    # since that shared shape is the property under test.
+    _ADVISORY_SHAPE = {
+        'project_id': 'reify',
+        'candidate_title': 'Rework the gui panel',
+        'matched_paths': ('gui/',),
+        'suggested_project': 'reify_gui',
+    }
+    _REJECTION_SHAPE = {
+        'project_id': 'reify',
+        'candidate_title': 'Edit fused-memory/X',
+        'matched_paths': ('fused-memory/',),
+        'suggested_project': 'dark_factory',
+    }
+
+    @classmethod
+    def _advisory(cls, esc, root, **overrides):
+        """File one PROSE-only advisory against *root*; returns the escalation id."""
+        return esc.report_rejection(
+            project_root=str(root),
+            advisory=True,
+            **{**cls._ADVISORY_SHAPE, **overrides},
+        )
+
+    @classmethod
+    def _rejection(cls, esc, root, **overrides):
+        """File one FILES-certain rejection against *root*; returns the escalation id."""
+        return esc.report_rejection(
+            project_root=str(root),
+            **{**cls._REJECTION_SHAPE, **overrides},
+        )
+
     def test_advisory_record_never_claims_a_rejection(self, tmp_path):
         """The advisory record must not label a created task as rejected.
 
@@ -279,14 +315,7 @@ class TestAdvisoryVsRejectionWording:
         ``possible_scope_mismatch`` stamp name an operator greps for.
         """
         esc = ScopeViolationEscalator()
-        esc_id = esc.report_rejection(
-            project_root=str(tmp_path),
-            project_id='reify',
-            candidate_title='Rework the gui panel',
-            matched_paths=('gui/',),
-            suggested_project='reify_gui',
-            advisory=True,
-        )
+        esc_id = self._advisory(esc, tmp_path)
         assert esc_id is not None
         payload = self._one_payload(tmp_path)
         summary = payload['summary']
@@ -324,39 +353,36 @@ class TestAdvisoryVsRejectionWording:
         WHY the old wording was unverified: this record is filed from
         ``_path_guard_or_skip``, which runs inside ``submit_task`` PHASE-1 —
         the phase that persists a ticket and returns its id, explicitly
-        *before* ``tm.add_task`` is ever called.  The curator resolves that
-        ticket asynchronously and only ONE of its five actions (``create``)
-        yields a new task; ``drop``, ``combine`` and ``refuse`` yield none.
-        So at the moment this escalation is written, "the task WAS created"
-        is a claim the escalator cannot possibly have verified, and on a
+        *before* ``tm.add_task`` is ever called.  Only an outcome that
+        actually CREATES a task yields one carrying the stamp; a submission
+        that is dropped yields no task at all, and one folded into an
+        existing task leaves that target without this candidate's stamp
+        (``_execute_combine`` propagates only the ``curator_*`` keys).  So
+        at the moment this escalation is written, "the task WAS created" is
+        a claim the escalator cannot possibly have verified, and on a
         drop/combine it is simply false — the operator (and any agent handed
         this text by ``briefing.py``) is told to go review a task that does
         not exist.
 
         Pins the STABLE contracts, per this class's convention: the absence
-        of the two specific false clauses, the presence of the curator's
-        no-task outcome vocabulary, and — structurally — that every sentence
-        naming the stamp is CONDITIONAL rather than asserted.
+        of the specific false clauses, the presence of the no-task outcome
+        vocabulary, and the one conditional clause the prose commits to.
         """
         esc = ScopeViolationEscalator()
-        esc_id = esc.report_rejection(
-            project_root=str(tmp_path),
-            project_id='reify',
-            candidate_title='Rework the gui panel',
-            matched_paths=('gui/',),
-            suggested_project='reify_gui',
-            advisory=True,
-        )
+        esc_id = self._advisory(esc, tmp_path)
         assert esc_id is not None
         detail = self._one_payload(tmp_path)['detail']
+        lowered = detail.lower()
 
-        # (a) The two clauses the bug shipped, named exactly.  Deliberately
-        # not a blanket 'created' ban: the corrected prose must still be free
-        # to describe the curator's create OUTCOME, conditionally.
-        assert 'the task WAS created' not in detail, (
+        # (a) The two clauses the bug shipped, banned case-INSENSITIVELY (as
+        # the sibling summary test does) so a recapitalised regression can't
+        # slip back in.  Deliberately not a blanket 'created' ban: the
+        # corrected prose must still be free to describe the create OUTCOME,
+        # conditionally.
+        assert 'task was created' not in lowered, (
             f'advisory detail asserts an unverified creation: {detail!r}'
         )
-        assert 'nothing was lost' not in detail, (
+        assert 'nothing was lost' not in lowered, (
             f'advisory detail claims an outcome it cannot know: {detail!r}'
         )
 
@@ -364,29 +390,23 @@ class TestAdvisoryVsRejectionWording:
         # the submission may yet be dropped or folded into an existing task,
         # not just that it was created.
         assert 'possible_scope_mismatch' in detail, detail
-        lowered = detail.lower()
         assert 'drop' in lowered, (
-            f"advisory detail must name the curator's drop outcome: {detail!r}"
+            f'advisory detail must name the drop outcome: {detail!r}'
         )
         assert 'combine' in lowered or 'fold' in lowered, (
-            f"advisory detail must name the curator's combine outcome: {detail!r}"
+            f'advisory detail must name the fold-into-existing outcome: {detail!r}'
         )
 
-        # (c) EVERY sentence naming the stamp is conditional.  A single
-        # unconditional "the task carries metadata.possible_scope_mismatch"
-        # would re-introduce the same false claim in a new phrasing — and
-        # would be false twice over, since a combine target never receives
-        # the candidate's stamp at all.
-        sentences = [s for s in re.split(r'(?<=\.)\s+', detail) if s.strip()]
-        stamp_sentences = [s for s in sentences if 'possible_scope_mismatch' in s]
-        assert stamp_sentences, (
-            f'expected at least one sentence naming the stamp: {detail!r}'
+        # (c) The stamp claim is CONDITIONAL, pinned as the one stable clause
+        # the prose commits to rather than as a shape-of-the-sentence regex:
+        # an unconditional "the task carries metadata.possible_scope_mismatch"
+        # would re-introduce the same false claim in a new phrasing, and would
+        # be false twice over, since a combine target never receives the
+        # candidate's stamp at all.
+        assert 'Only a task' in detail, (
+            'the stamp claim must stay conditional on a task actually being '
+            f'created: {detail!r}'
         )
-        for sentence in stamp_sentences:
-            assert any(m in sentence.lower() for m in ('if ', 'when ', 'only ')), (
-                'every sentence naming possible_scope_mismatch must be '
-                f'conditional on a task actually being created: {sentence!r}'
-            )
 
         # Invariants the rest of the suite already relies on, re-asserted here
         # so one careless rewrite is caught in one place.
@@ -415,14 +435,7 @@ class TestAdvisoryVsRejectionWording:
         only category/kind/affected_ids), so correcting both is equally safe.
         """
         esc = ScopeViolationEscalator()
-        esc_id = esc.report_rejection(
-            project_root=str(tmp_path),
-            project_id='reify',
-            candidate_title='Rework the gui panel',
-            matched_paths=('gui/',),
-            suggested_project='reify_gui',
-            advisory=True,
-        )
+        esc_id = self._advisory(esc, tmp_path)
         assert esc_id is not None
         summary = self._one_payload(tmp_path)['summary']
 
@@ -454,13 +467,12 @@ class TestAdvisoryVsRejectionWording:
         blocked — the same class of false instruction as ``resubmit_to_*``.
         """
         esc = ScopeViolationEscalator()
-        esc_id = esc.report_rejection(
-            project_root=str(tmp_path),
-            project_id='reify',
+        esc_id = self._advisory(
+            esc,
+            tmp_path,
             candidate_title='ambiguous prose hit',
             matched_paths=('fused-memory/', 'crates_other/'),
             suggested_project=None,
-            advisory=True,
         )
         assert esc_id is not None
         payload = self._one_payload(tmp_path)
@@ -477,13 +489,7 @@ class TestAdvisoryVsRejectionWording:
         rejected), so this change must not touch it.
         """
         esc = ScopeViolationEscalator()
-        esc.report_rejection(
-            project_root=str(tmp_path),
-            project_id='reify',
-            candidate_title='Edit fused-memory/X',
-            matched_paths=('fused-memory/',),
-            suggested_project='dark_factory',
-        )
+        self._rejection(esc, tmp_path)
         payload = self._one_payload(tmp_path)
         assert payload['summary'].startswith('Misrouted task rejected: cites '), payload
         assert 'was rejected' in payload['detail'], payload
@@ -505,21 +511,8 @@ class TestAdvisoryVsRejectionWording:
         rejection_root = tmp_path / 'rejection'
         advisory_root = tmp_path / 'advisory'
         esc = ScopeViolationEscalator()
-        esc.report_rejection(
-            project_root=str(rejection_root),
-            project_id='reify',
-            candidate_title='Edit fused-memory/X',
-            matched_paths=('fused-memory/',),
-            suggested_project='dark_factory',
-        )
-        esc.report_rejection(
-            project_root=str(advisory_root),
-            project_id='reify',
-            candidate_title='Edit fused-memory/X',
-            matched_paths=('fused-memory/',),
-            suggested_project='dark_factory',
-            advisory=True,
-        )
+        self._rejection(esc, rejection_root)
+        self._advisory(esc, advisory_root)
         for root in (rejection_root, advisory_root):
             payload = self._one_payload(root)
             assert payload['severity'] == 'info', (root, payload)
@@ -619,21 +612,8 @@ class TestAdvisoryVsRejectionWording:
         rejection_root = tmp_path / 'rejection'
         advisory_root = tmp_path / 'advisory'
         esc = ScopeViolationEscalator()
-        rejection_id = esc.report_rejection(
-            project_root=str(rejection_root),
-            project_id='reify',
-            candidate_title='Edit fused-memory/X',
-            matched_paths=('fused-memory/',),
-            suggested_project='dark_factory',
-        )
-        advisory_id = esc.report_rejection(
-            project_root=str(advisory_root),
-            project_id='reify',
-            candidate_title='Rework the gui panel',
-            matched_paths=('gui/',),
-            suggested_project='reify_gui',
-            advisory=True,
-        )
+        rejection_id = self._rejection(esc, rejection_root)
+        advisory_id = self._advisory(esc, advisory_root)
         assert rejection_id is not None
         assert advisory_id is not None
 
@@ -670,6 +650,42 @@ class TestAdvisoryVsRejectionWording:
             assert msg.startswith('scope_violation_escalator: queued'), msg
         assert rejection_id in rejection_msg, rejection_msg
         assert advisory_id in advisory_msg, advisory_msg
+
+    def test_unavailable_queue_debug_line_carries_the_same_mode_token(
+        self, tmp_path, caplog, monkeypatch,
+    ):
+        """The OTHER mode-labelled line agrees with the queued one.
+
+        ``_ADVISORY_MODE_LABEL`` / ``_REJECTION_MODE_LABEL`` are named
+        constants precisely so this module's two operator-facing lines emit
+        the SAME token and one grep finds both.  The queued WARNING is
+        pinned above; without this, the other half of that rationale — the
+        DEBUG line taken when ``_queue_for`` returns None because the
+        escalation package is unavailable — would be an unchecked comment.
+        """
+        caplog.set_level(
+            logging.DEBUG, logger='fused_memory.middleware.scope_violation_escalator',
+        )
+        esc = ScopeViolationEscalator()
+        # Force the package-unavailable branch: no queue, so no escalation is
+        # filed and the method returns None after logging the mode.
+        monkeypatch.setattr(esc, '_queue_for', lambda project_root: None)
+        assert self._advisory(esc, tmp_path) is None
+        assert self._rejection(esc, tmp_path) is None
+        assert not (tmp_path / 'data' / 'escalations').exists()
+
+        unavailable = [
+            r.getMessage() for r in caplog.records
+            if 'escalation package unavailable' in r.getMessage()
+        ]
+        assert len(unavailable) == 2, f'expected one line per submit: {unavailable}'
+        advisory_msgs = [m for m in unavailable if sve_mod._ADVISORY_MODE_LABEL in m]
+        rejection_msgs = [m for m in unavailable if sve_mod._REJECTION_MODE_LABEL in m]
+        assert len(advisory_msgs) == 1, unavailable
+        assert len(rejection_msgs) == 1, unavailable
+        # Same constants the queued WARNING interpolates, so the two lines
+        # cannot drift apart into two spellings of one mode.
+        assert advisory_msgs[0] != rejection_msgs[0], unavailable
 
     def test_rejection_fingerprint_is_byte_identical_to_legacy(self, tmp_path):
         """Load-bearing back-compat pin: the rejection digest must not change.

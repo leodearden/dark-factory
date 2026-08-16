@@ -10205,7 +10205,8 @@ class TestPathGuardEscalationWordingEndToEnd:
 
         Not "task created": this seam is ``submit_task`` phase-1, so what is
         established here is that nothing was blocked and the stamp is on the
-        submission — whether a task results is the curator's call (task 4159).
+        submission — whether a task results from it is not settled here
+        (task 4159).
         """
         from fused_memory.middleware.scope_violation_escalator import (
             ScopeViolationEscalator,
