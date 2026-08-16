@@ -814,6 +814,18 @@ _XDIST_CRASH_NO_FAILED_PLUS_COLLECTION_ERROR_OUTPUT = (
     + "ERROR orchestrator/tests/test_broken.py - ImportError: cannot import name 'foo'\n"
 )
 
+# task 4066, ISOLATING fixture: crash signature + an UNDECORATED tally line
+# ONLY — no INTERNALERROR, no ``ERROR``, no ``FAILED``, no ``E   `` line, so
+# none of the vetoes added alongside it can green this and only the
+# failure-summary widening can. Shape grounded in `pytest -q`, whose terminal
+# reporter writes the stats line with no ``=`` separator (verified by running
+# it: ``1 failed, 1 passed in 0.02s``); verify-log 2829's INTERNALERROR abort
+# produces the same undecorated shape.
+_XDIST_CRASH_NO_FAILED_PLUS_UNDECORATED_SUMMARY_OUTPUT = (
+    _XDIST_WORKER_CRASH_OUTPUT
+    + '8 failed, 6971 passed, 216 warnings in 131.42s (0:02:11)\n'
+)
+
 
 class TestBareXdistWorkerCrashDetector:
     """task 2365 step-1: verify._is_bare_xdist_worker_crash(output) pure helper.
@@ -1026,6 +1038,96 @@ class TestBareXdistWorkerCrashDetector:
             _XDIST_CRASH_NO_FAILED_PLUS_COLLECTION_ERROR_OUTPUT
         )
         assert result is False
+
+    def test_no_failed_lines_plus_undecorated_summary_is_false(self):
+        """task 4066: crash signature + an UNDECORATED ``N failed, ...`` tally
+        and NO FAILED line -> False.
+
+        Defense-in-depth, and honestly so: with the INTERNALERROR veto in
+        place the real verify-log 2829 shape is already caught by that veto,
+        so this fixture is not what rescues the motivating case. Its value is
+        that it proves the failure-summary marker vetoes INDEPENDENTLY — if a
+        future refactor drops or re-scopes the INTERNALERROR veto (exactly the
+        drift that caused task 4066 in the first place), the 2829 shape is
+        still caught here.
+
+        The shape is not hypothetical: `pytest -q` writes the stats line with
+        no ``=`` separator (verified by running it: ``1 failed, 1 passed in
+        0.02s``), which is a genuinely reachable undecorated tally with no
+        INTERNALERROR anywhere in the output.
+
+        Isolating by construction: no INTERNALERROR / ERROR / FAILED / ``E``
+        line, so only the failure-summary regex widening can green this.
+        """
+        result = verify._is_bare_xdist_worker_crash(
+            _XDIST_CRASH_NO_FAILED_PLUS_UNDECORATED_SUMMARY_OUTPUT
+        )
+        assert result is False
+
+
+class TestPytestFailureSummaryRegex:
+    """task 4066: _PYTEST_FAILURE_SUMMARY_RE must match pytest's UNDECORATED
+    tally line as well as the decorated one.
+
+    pytest prints the stats line without ``=`` bars in two real, observed
+    situations: when an ``INTERNALERROR`` aborts the session (verify-log 2829:
+    ``8 failed, 6971 passed, 216 warnings in 131.42s (0:02:11)``), and under
+    ``-q`` (``1 failed, 1 passed in 0.02s``). The original
+    ``^=+ \\d+ failed.*=+$`` matched neither, which is half of why a run with
+    8 genuine failures reclassified as transient infra.
+
+    The regex has exactly two consumers, and both benefit: the
+    no-FAILED-lines fallback in _is_bare_xdist_worker_crash (where a wider
+    match strictly INCREASES strictness — it can only flip True -> False) and
+    _extract_cause_hint's pattern-ladder rung 3.
+    """
+
+    # Decorated forms already matched before task 4066 — these are the
+    # preservation guards for the widening, not new coverage.
+    DECORATED_SAMPLES = (
+        '========== 1 failed, 2 passed in 5.00s ==========',
+        '=========================== 3 failed in 0.12s ============================',
+    )
+
+    # Undecorated forms, both transcribed verbatim from real output.
+    UNDECORATED_SAMPLES = (
+        '8 failed, 6971 passed, 216 warnings in 131.42s (0:02:11)',
+        '1 failed, 1 passed in 0.56s',
+    )
+
+    # Over-reach guards: dropping the trailing ``=+$`` requirement must not
+    # turn this into "any line mentioning failure".
+    NON_SUMMARY_SAMPLES = (
+        '1 xfailed, 2 passed in 3s',
+        'no tests ran in 0.01s',
+        'FAILED orchestrator/tests/test_x.py::test_y - AssertionError',
+        '0 failedcases reported',
+    )
+
+    def test_decorated_summary_forms_still_match(self):
+        """PRESERVATION: the ``=``-decorated forms the existing fixtures use
+        must keep matching after the widening."""
+        for sample in self.DECORATED_SAMPLES:
+            assert verify._PYTEST_FAILURE_SUMMARY_RE.search(sample) is not None, (
+                f'decorated summary no longer matches: {sample!r}'
+            )
+
+    def test_undecorated_summary_forms_match(self):
+        """The real undecorated tallies — verify-log 2829's INTERNALERROR-abort
+        line and the `pytest -q` form — must match."""
+        for sample in self.UNDECORATED_SAMPLES:
+            assert verify._PYTEST_FAILURE_SUMMARY_RE.search(sample) is not None, (
+                f'undecorated summary not matched: {sample!r}'
+            )
+
+    def test_non_failure_lines_do_not_match(self):
+        """Over-reach guards: an xfail tally, a no-tests-ran line, a FAILED
+        node-id line, and ``0 failedcases`` (word-boundary guard) must all
+        stay unmatched."""
+        for sample in self.NON_SUMMARY_SAMPLES:
+            assert verify._PYTEST_FAILURE_SUMMARY_RE.search(sample) is None, (
+                f'over-reach — matched a non-summary line: {sample!r}'
+            )
 
 
 class TestRunVerificationXdistWorkerCrashRetry:
