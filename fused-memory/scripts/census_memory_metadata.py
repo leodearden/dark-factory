@@ -441,6 +441,8 @@ def build_report(
     top_n: int = DEFAULT_TOP_N,
     page_size: int | None = None,
     canonical_uniqueness_enforced: bool | None = None,
+    registry: Any = None,
+    registry_error: str | None = None,
 ) -> dict[str, Any]:
     """Assemble the JSON census report from per-(project, category) cells.
 
@@ -472,6 +474,7 @@ def build_report(
     projects: dict[str, Any] = {}
     grand_total = CategoryCensus()
     category_order: list[str] = []
+    project_totals: dict[str, CategoryCensus] = {}
 
     for project_id in sorted(cells):
         project_cells = cells[project_id]
@@ -484,6 +487,7 @@ def build_report(
             rendered[category] = _census_to_dict(census)
             project_total.merge(census)
         grand_total.merge(project_total)
+        project_totals[project_id] = project_total
         projects[project_id] = {
             'total': _census_to_dict(project_total),
             # Off the ROLLUP, so the canonical partition is computed at the
@@ -493,6 +497,17 @@ def build_report(
             ),
             'categories': rendered,
         }
+
+    if registry is None:
+        registry_coverage = None
+        # A load failure the CALLER already diagnosed passes through verbatim;
+        # a bare None with no error means the gauge was not requested. Both
+        # are DISCLOSED rather than rendered as an all-zero (or perfect) score.
+        registry_error = registry_error or 'no topic registry supplied'
+    else:
+        registry_coverage, registry_error = _build_registry_coverage(
+            project_totals, registry,
+        )
 
     return {
         # v2: value tables are the complete population (v1 capped them at
@@ -528,6 +543,10 @@ def build_report(
         'topic_coverage': _build_topic_coverage(
             grand_total, canonical_uniqueness_enforced,
         ),
+        # Spans projects (each entry carries its own project_id), so it sits
+        # at the top level rather than under any one project.
+        'registry_coverage': registry_coverage,
+        'registry_error': registry_error,
         'coverage': _build_coverage(coverage),
     }
 
@@ -585,6 +604,135 @@ ENFORCE_FLIP_PRECONDITIONS: tuple[dict[str, str], ...] = (
         'source': 'task 3626 ([MILESTONE] memory_metadata.enforce flip gate)',
     },
 )
+
+
+#: The committed 32-entry registry: the ACCOUNTABLE target set. Every one of
+#: its topics should carry exactly one live ``canonical: true`` in its own
+#: project. Bounded and named, unlike a corpus-wide stamping percentage over
+#: ~49.6k records, most of which is cycle_summary-class with no meaningful
+#: topic -- and it is precisely the set E1's retrieval-health run scores
+#: 32/32 failing.
+DEFAULT_REGISTRY_PATH = str(
+    _REPO_ROOT / 'fused-memory' / 'tests' / 'fixtures'
+    / 'memory_eval_topic_registry.json'
+)
+
+_PROBE_SCRIPT_PATH = _REPO_ROOT / 'fused-memory' / 'scripts' / 'memory_eval_retrieval_probe.py'
+
+
+def _load_probe_module() -> Any:
+    """Load ``memory_eval_retrieval_probe`` by path.
+
+    ``scripts/`` is not a package, so a plain import cannot reach it. This is
+    the same importlib idiom ``retro_stamp_topics.py:149`` already established
+    for exactly this cross-script reuse, including the ``sys.modules``-first
+    lookup: that slot may already hold a module another by-path loader
+    executed, and re-executing would hand back a DIFFERENT class object for
+    ``RegistryEntry``, silently breaking identity across the seam.
+    """
+    import importlib.util  # noqa: PLC0415
+
+    mod_name = 'memory_eval_retrieval_probe'
+    cached = sys.modules.get(mod_name)
+    if cached is not None:
+        return cached
+    spec = importlib.util.spec_from_file_location(mod_name, _PROBE_SCRIPT_PATH)
+    if spec is None or spec.loader is None:
+        raise ImportError(f'Cannot load {_PROBE_SCRIPT_PATH}')
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(mod_name, None)
+        raise
+    return module
+
+
+#: REUSED, never re-parsed: the registry's schema-version check, its
+#: zero-entry rejection and its ``RegistryError`` type all stay single-homed
+#: in the probe. Bound as a module-level ALIAS rather than wrapped in a
+#: delegating function -- exactly as ``retro_stamp_topics.py:189`` does it --
+#: so the reuse is pinnable by ``is`` and a re-implementation cannot creep in
+#: behind a same-named shim.
+load_topic_registry = _load_probe_module().load_topic_registry
+
+
+def load_registry_or_error(path: str) -> tuple[Any | None, str | None]:
+    """Load the topic registry, returning ``(registry, error)``.
+
+    Exactly one of the pair is ever non-``None``. Degrades LOUDLY: the caller
+    emits ``registry_coverage: null`` plus the error string rather than a
+    silent all-zero gauge, which would read as "measured, and everything is
+    fine" -- indistinguishable from a genuinely clean result, when the whole
+    value of this gauge is that its zero is meaningful (INV-2).
+    """
+    try:
+        registry = load_topic_registry(path)
+    except Exception as exc:  # noqa: BLE001 - every load failure is disclosed
+        return None, f'{type(exc).__name__}: {exc}'
+    return registry, None
+
+
+def _build_registry_coverage(
+    project_totals: dict[str, CategoryCensus],
+    registry: Any,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Score the committed registry against measured corpus state.
+
+    NOT a duplicate of E1's ``METRIC_TOPIC_CANONICAL_PRESENT`` (INV-5
+    checked). That tripwire is computed from ``_tripwire_items(observations,
+    TRIPWIRE_K)`` -- from SEARCH observations -- so it conflates "the
+    canonical does not exist" with "it exists but ranks below K". This
+    task's whole thesis is that 32/32 fails because the canonicals are
+    ABSENT, and only a deterministic metadata count can establish that. The
+    two instruments answer different questions; this one disambiguates the
+    probe's.
+
+    Each entry is matched within its OWN ``project_id``. 3198's invariant is
+    per-(project, topic), so a canonical stamped in reify must not discharge
+    a dark_factory entry -- a global match would report the target met while
+    the dark_factory corpus stayed bare.
+    """
+    entries = list(getattr(registry, 'entries', []) or [])
+    if not entries:
+        return None, 'topic registry loaded but holds zero entries'
+
+    rows: list[dict[str, Any]] = []
+    exactly_one = zero = multiple = 0
+    for entry in sorted(entries, key=lambda e: (str(e.project_id), str(e.topic))):
+        topic = str(entry.topic)
+        project_id = str(entry.project_id)
+        # A registry entry naming an uncensused project measures ZERO, not
+        # "unknown": the topic demonstrably has no canonical in this run's
+        # evidence, and omitting the row would shrink the denominator.
+        census = project_totals.get(project_id)
+        records = census.topic_values.get(topic, 0) if census else 0
+        canonical_count = census.canonical_true_by_topic.get(topic, 0) if census else 0
+        if canonical_count == 0:
+            zero += 1
+        elif canonical_count == 1:
+            exactly_one += 1
+        else:
+            multiple += 1
+        rows.append({
+            'project_id': project_id,
+            'topic': topic,
+            'records': records,
+            'canonical_count': canonical_count,
+        })
+
+    return {
+        'registry_topics_total': len(rows),
+        'registry_topics_with_exactly_one_canonical': exactly_one,
+        'registry_topics_with_zero_canonical': zero,
+        'registry_topics_with_multiple_canonical': multiple,
+        # The ACTIONABLE worklist -- exactly the set 3201's idempotent retro
+        # sweep would stamp, which is why the nightly wrapper runs it (dry-run)
+        # right after this census.
+        'zero_canonical_topics': [r for r in rows if r['canonical_count'] == 0],
+        'topics': rows,
+    }, None
 
 
 def read_canonical_uniqueness_enforced() -> bool | None:
@@ -1445,9 +1593,11 @@ async def _run(args: argparse.Namespace) -> int:
             cells[project_id] = project_cells
             coverage[project_id] = project_coverage
 
+        registry, registry_error = load_registry_or_error(args.registry)
         report = build_report(
             cells, coverage, top_n=args.top_n, page_size=args.page_size,
             canonical_uniqueness_enforced=read_canonical_uniqueness_enforced(),
+            registry=registry, registry_error=registry_error,
         )
         _write_artifacts(report, args.json_out, args.md_out)
 
@@ -1518,6 +1668,15 @@ def _build_parser() -> argparse.ArgumentParser:
             f'(default: {DEFAULT_TOP_N}). '
             'The JSON report always carries every value; 0 or less renders the '
             'full population in the markdown too.'
+        ),
+    )
+    parser.add_argument(
+        '--registry', dest='registry', default=DEFAULT_REGISTRY_PATH,
+        help=(
+            'Committed topic registry scored by the coverage gauge '
+            '(default: the 32-entry fixture). A load failure is DISCLOSED as '
+            'registry_coverage: null + registry_error, never as an all-zero '
+            'gauge.'
         ),
     )
     parser.add_argument(

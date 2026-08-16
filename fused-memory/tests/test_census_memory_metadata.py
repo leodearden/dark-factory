@@ -2304,6 +2304,7 @@ def _args(tmp_path, **overrides):
         'json_out': str(tmp_path / 'census.json'),
         'md_out': str(tmp_path / 'census.md'),
         'config': None,
+        'registry': _mod.DEFAULT_REGISTRY_PATH,
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
