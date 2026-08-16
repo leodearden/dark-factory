@@ -913,6 +913,14 @@ EXIT_MERGE_ERROR = 6
 #: recorded baseline and a probe-time intruder) because they carry one meaning:
 #: the VRAM numbers cannot be trusted.
 EXIT_VRAM_POLLUTED = 7
+#: No usable baseline was recorded before the arm started — the file is absent,
+#: or it predates the consumer inventory.  Distinct from EXIT_PROBE_ERROR for
+#: exactly the reason 7 is distinct from 3: the GPU is fine and nvidia-smi
+#: answered, so sending an operator to debug the probe is the wrong errand.  The
+#: fix is `lms_ctl start <arm>`, and the likeliest way to meet this is the most
+#: ordinary one — a pre-guard baseline still sitting in $XDG_RUNTIME_DIR from
+#: the current boot.
+EXIT_STALE_BASELINE = 8
 
 
 class GpuBlock(BaseModel):
@@ -1611,6 +1619,19 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return EXIT_VRAM_POLLUTED
+    except lms_vram.StaleBaselineError as exc:
+        # ALSO before the VramProbeError branch it subclasses, and for the same
+        # reason as the pollution branch above: through the generic handler this
+        # prints "GPU probe failed" and sends an operator to debug nvidia-smi
+        # on a card that answered perfectly.  The exception's own message names
+        # the file and the `lms_ctl start <arm>` that fixes it; this branch only
+        # has to stop the wrong prefix being stapled to the front of it.
+        print(
+            f'lms_healthcheck: no usable baseline, so no report was produced: '
+            f'{exc}',
+            file=sys.stderr,
+        )
+        return EXIT_STALE_BASELINE
     except lms_vram.VramProbeError as exc:
         print(
             f'lms_healthcheck: GPU probe failed, so no report was produced: {exc}',

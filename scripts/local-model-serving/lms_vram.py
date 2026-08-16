@@ -160,6 +160,33 @@ class PollutedBaselineError(VramProbeError):
         )
 
 
+class StaleBaselineError(VramProbeError):
+    """No usable baseline was recorded before this arm started.
+
+    Covers BOTH an absent file and one written before the consumer inventory
+    existed.  Those are one condition to an operator -- nothing usable was
+    recorded -- differing only in how far back the omission goes, and the remedy
+    never varies: ``lms_ctl start`` the arm again so a baseline is captured.
+
+    A :class:`VramProbeError` subclass for the same reason as
+    :class:`PollutedBaselineError`: every existing handler still catches it.
+    And it exists for the same reason too.  Routed through the generic branch
+    this reads as "the GPU probe failed", which sends someone to debug
+    nvidia-smi on a perfectly healthy card -- the exact operator-misdirection
+    class exit 7 was introduced to end.  The likeliest way to meet it is the
+    most ordinary one: an operator whose ``$XDG_RUNTIME_DIR`` still holds a
+    pre-guard baseline from the CURRENT boot, immediately after this lands.
+
+    Carries :attr:`path` so a caller can name the file, and :attr:`arm_id` so it
+    can name the command, rather than only that something was wrong.
+    """
+
+    def __init__(self, arm_id: str, path: Path, message: str):
+        self.arm_id = arm_id
+        self.path = path
+        super().__init__(message)
+
+
 class PollutedMeasurementError(VramProbeError):
     """The card changed under the measurement, so the budget arithmetic is void.
 
@@ -1025,25 +1052,33 @@ def read_baseline_record(arm_id: str) -> GpuBaseline:
     the one baseline we know NOTHING about look like the cleanest possible
     reading.  Baselines live in ``$XDG_RUNTIME_DIR`` and are per-boot, so the
     staleness window is bounded and the fix is one command.
+
+    Both of those raise :class:`StaleBaselineError` specifically, so the CLI can
+    say "re-take the baseline" instead of "the GPU probe failed".  An
+    UNREADABLE file does not: corrupt JSON is a genuine defect in the store, not
+    a missing capture, and telling an operator to re-run the same command that
+    just wrote garbage would be the wrong advice.
     """
     path = baseline_path(arm_id)
     if not path.exists():
-        raise VramProbeError(
+        raise StaleBaselineError(
+            arm_id, path,
             f'no baseline recorded for arm {arm_id!r} at {path}. The budget '
             'verdict needs the nvidia-smi reading taken before this arm '
-            'started; start it through `lms_ctl start` so the baseline is '
-            'captured, and do not substitute the frozen '
-            f'{MEASURED_BASELINE_GIB} GiB reference value'
+            f'started; start it through `lms_ctl start {arm_id}` so the '
+            'baseline is captured, and do not substitute the frozen '
+            f'{MEASURED_BASELINE_GIB} GiB reference value',
         )
     try:
         payload = json.loads(path.read_text())
         if 'consumers' not in payload:
-            raise VramProbeError(
+            raise StaleBaselineError(
+                arm_id, path,
                 f'baseline file {path} records no GPU consumer inventory, so '
                 'there is no evidence about who else held the card when it was '
                 'taken. Treating that as an empty (clean) list would flatter '
                 'the one baseline nothing is known about; re-take it with '
-                '`lms_ctl start`'
+                f'`lms_ctl start {arm_id}`',
             )
         return GpuBaseline(
             reading=GpuReading(

@@ -160,7 +160,9 @@ Exit codes: `0` all green · `1` an arm failed · `2` manifest/arm-id error ·
 `3` every arm passed but VRAM is over budget · `4` the GPU probe failed, so
 **no report was produced** · `5` `--active` found nothing running · `6` `--merge`
 refused to combine the inputs · `7` **the VRAM measurement is polluted** — a
-non-arm process moved on the card, so nothing was learned about the arm.
+non-arm process moved on the card, so nothing was learned about the arm ·
+`8` **no usable baseline** — none was recorded for this arm, or the one on disk
+predates the consumer inventory; re-take it with `lms_ctl start <arm>`.
 
 Every one of these is separate on purpose, because each has a different fix.
 A budget failure and a model failure are not the same problem. A broken
@@ -171,7 +173,11 @@ running must not exit 0, or a wrapper script would certify a slate nobody
 probed. And **7 is not 3**: 3 says the arm is genuinely too big and something
 should be stopped, whereas 7 says the arithmetic is void — stopping an arm in
 response would mean acting on a number nobody measured. A polluted run is never
-`0` either, however healthy the block's own `verdict` looks.
+`0` either, however healthy the block's own `verdict` looks. **8 is not 4** for
+the same reason inverted: the GPU answered fine and it is the *baseline store*
+that has nothing usable in it, so `4`'s "go debug nvidia-smi" would be the wrong
+errand — and the case is routine, not exotic, because a pre-guard baseline can
+still be sitting in `$XDG_RUNTIME_DIR` from the current boot.
 
 `lms_ctl start` has its own pair for the same reason: **4** the arm does not fit
 this card (use a smaller arm), **5** another process is holding the card (free

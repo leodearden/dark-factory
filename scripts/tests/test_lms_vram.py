@@ -981,15 +981,46 @@ def test_a_baseline_payload_with_no_consumers_key_raises_rather_than_reading_cle
         'free_mib': 16813,
     }))
 
-    with pytest.raises(lms_vram.VramProbeError, match='lms_ctl start'):
+    with pytest.raises(lms_vram.StaleBaselineError, match='lms_ctl start') as excinfo:
         lms_vram.read_baseline_record('qwen3.5-9b')
+
+    # The TYPE, not just the text: the CLI dispatches on it to avoid printing
+    # "GPU probe failed" for a card that answered perfectly.
+    assert excinfo.value.path == path
+    assert excinfo.value.arm_id == 'qwen3.5-9b'
 
 
 def test_reading_a_missing_baseline_record_raises(tmp_path, monkeypatch):
     monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path))
 
-    with pytest.raises(lms_vram.VramProbeError, match='no baseline'):
+    with pytest.raises(lms_vram.StaleBaselineError, match='no baseline'):
         lms_vram.read_baseline_record('qwen3.5-9b')
+
+
+def test_a_stale_baseline_is_still_caught_by_an_older_vram_probe_handler():
+    """StaleBaselineError SUBCLASSES VramProbeError on purpose.
+
+    The distinct type exists so a caller can say something better; it must not
+    let a baseline problem escape a caller written before it existed.
+    """
+    assert issubclass(lms_vram.StaleBaselineError, lms_vram.VramProbeError)
+
+
+def test_an_unreadable_baseline_is_not_reported_as_a_stale_one(
+    tmp_path, monkeypatch,
+):
+    """Corrupt JSON is a defect in the store, not a missing capture.
+
+    Telling an operator to re-run the command that just wrote garbage would be
+    the wrong advice, so this one stays a plain probe error.
+    """
+    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path))
+    lms_vram.baseline_path('qwen3.5-9b').write_text('not json at all')
+
+    with pytest.raises(lms_vram.VramProbeError) as excinfo:
+        lms_vram.read_baseline_record('qwen3.5-9b')
+
+    assert not isinstance(excinfo.value, lms_vram.StaleBaselineError)
 
 
 def test_read_baseline_records_returns_the_chosen_records_own_consumers(

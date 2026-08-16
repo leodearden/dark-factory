@@ -1678,6 +1678,42 @@ def test_cli_reports_probe_time_pollution_but_still_writes_the_artifact(
     assert str(OLLAMA_CONSUMER.pid) in written['vram']['pollution_reason']
 
 
+@pytest.mark.parametrize('mutate', ['delete', 'strip_consumers'])
+def test_cli_sends_a_stale_baseline_to_lms_ctl_not_to_nvidia_smi(
+    cli_env, tmp_path, capsys, mutate,
+):
+    """A baseline that is absent, or predates the inventory, is NOT a probe
+    failure.
+
+    Both spellings of "nothing usable was recorded" used to raise a plain
+    VramProbeError and land in the generic branch, printed as "GPU probe
+    failed" -- the operator-misdirection class exit 7 exists to end.  The
+    stripped-consumers case is not exotic: it is what every operator with a
+    pre-guard baseline still in $XDG_RUNTIME_DIR from this boot meets the first
+    time they run this after the guard lands, and the fix is `lms_ctl start`.
+    """
+    path = lms_vram.baseline_path('qwen3.5-9b')
+    if mutate == 'delete':
+        path.unlink()
+    else:
+        payload = json.loads(path.read_text())
+        del payload['consumers']
+        path.write_text(json.dumps(payload))
+    out_path = tmp_path / 'health-report.json'
+
+    code = lms_healthcheck.main(['--arm', 'qwen3.5-9b', '--output', str(out_path)])
+
+    assert code == lms_healthcheck.EXIT_STALE_BASELINE
+    assert code != lms_healthcheck.EXIT_PROBE_ERROR
+    err = capsys.readouterr().err
+    # The two things an operator needs: WHICH file, and WHAT to run.
+    assert 'lms_ctl start qwen3.5-9b' in err
+    assert 'GPU probe failed' not in err
+    if mutate == 'strip_consumers':
+        assert str(path) in err
+    assert not out_path.exists()
+
+
 def test_every_cli_exit_code_is_distinct():
     codes = [
         lms_healthcheck.EXIT_OK,
@@ -1688,6 +1724,7 @@ def test_every_cli_exit_code_is_distinct():
         lms_healthcheck.EXIT_NO_ACTIVE_ARMS,
         lms_healthcheck.EXIT_MERGE_ERROR,
         lms_healthcheck.EXIT_VRAM_POLLUTED,
+        lms_healthcheck.EXIT_STALE_BASELINE,
     ]
 
     assert len(set(codes)) == len(codes)
