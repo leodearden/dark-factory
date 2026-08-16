@@ -114,6 +114,26 @@ def describe_exc(exc: BaseException) -> str:
     return f'{type(exc).__name__}: {text}' if text else type(exc).__name__
 
 
+def project_label(project_root: str | os.PathLike[str]) -> str:
+    """Render *project_root* as the short project name the UI labels it with.
+
+    The basename, falling back to the full string for a root with no basename
+    (``'/'``) so a label can never degrade to empty. This is the single
+    definition of that rule for the fan-out cluster — :func:`fanout_label`
+    composes it rather than re-deriving it.
+
+    ``active_tasks._project_label`` and ``redux_api._project_label`` are
+    independent hand-rolled copies of the same rule. They are not imported here
+    (``active_tasks`` imports from ``tasks``, which imports this module), which
+    also means the delegation can only run the other way: those two can
+    eventually call *this*, collapsing three copies onto one. That cross-module
+    edit is out of task 4133's module lock and is filed as follow-up work; until
+    it lands, the three definitions must be kept string-identical by hand.
+    """
+    root_str = str(project_root)
+    return Path(root_str).name or root_str
+
+
 def fanout_label(base: str, project_root: str | os.PathLike[str]) -> str:
     """Compose a per-project-root fan-out log label, ``'base[project-name]'``.
 
@@ -135,18 +155,27 @@ def fanout_label(base: str, project_root: str | os.PathLike[str]) -> str:
     A collapsed key also erases the diagnosis: the message names only the
     shared URL, so the operator cannot tell *which* project_root is down.
 
-    The basename form is deliberately string-identical to
-    ``active_tasks._project_label`` / ``redux_api._project_label`` so operator
-    log labels match the project chips the UI already renders. Those cannot be
-    imported here — ``active_tasks`` imports from ``tasks``, which imports this
-    module — so ``mcp_fanout``, the leaf of this cluster, is the helper's home
-    and its docstring is the single place the convention is written down.
+    The discriminator is :func:`project_label` — the basename, deliberately
+    string-identical to ``active_tasks._project_label`` /
+    ``redux_api._project_label`` so operator log labels match the project chips
+    the UI already renders. ``mcp_fanout``, the leaf of this cluster, is the
+    helper's home (see :func:`project_label`) and this docstring is the single
+    place the convention is written down.
 
-    Falls back to the full string for a root with no basename (``'/'``), so the
-    label can never degrade to a content-free ``'base[]'``.
+    **The guarantee above assumes project-root basenames are distinct.** Two
+    configured roots sharing one (``/srv/team-a/app`` and ``/srv/team-b/app``,
+    or two checkouts both named ``dark-factory``) collapse back onto a single
+    key and reintroduce both failure modes described above. That assumption is
+    pre-existing and system-wide rather than introduced here —
+    ``scheduler``'s ``label_to_root = {_project_label(r): r for r in ...}``
+    already silently drops one of two same-basename roots, and ``redux_api``
+    keys its whole per-project payload on the same basename — so this helper
+    inherits it deliberately instead of diverging from every other project
+    label the dashboard renders. For ``list_tickets`` the unambiguous full root
+    is in any case still in the message body (metrics appends
+    ``(project_root=...)``).
     """
-    root_str = str(project_root)
-    return f'{base}[{Path(root_str).name or root_str}]'
+    return f'{base}[{project_label(project_root)}]'
 
 
 def log_fanout_failure(log_label: str, url: str, exc: BaseException) -> None:

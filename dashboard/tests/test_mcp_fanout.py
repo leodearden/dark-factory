@@ -465,6 +465,35 @@ class TestFanoutLabel:
             'fetch_tasks', '/srv/proj-b'
         )
 
+    def test_label_is_composed_from_the_single_project_label_definition(self):
+        """``fanout_label`` must delegate the basename rule, not re-derive it.
+
+        ``project_label`` is the one definition ``active_tasks._project_label``
+        and ``redux_api._project_label`` are meant to collapse onto; a future
+        edit that inlines the rule here again would silently re-fork it.
+        """
+        from pathlib import Path
+
+        from dashboard.data.mcp_fanout import fanout_label, project_label
+
+        for root in ('/home/leo/src/dark-factory', '/a/b/', '/', Path('/srv/proj-a')):
+            assert fanout_label('fetch_tasks', root) == f'fetch_tasks[{project_label(root)}]'
+
+    def test_same_basename_roots_share_a_label_by_design(self):
+        """Discrimination is by basename, so same-named roots still collapse.
+
+        Documented, inherited behaviour rather than an oversight: scheduler's
+        ``label_to_root`` and redux_api's per-project payload already key on the
+        same basename, so diverging to full paths here alone would make this one
+        log label inconsistent with every other project label the UI renders.
+        Pinned so the assumption is executable, not only prose in the docstring.
+        """
+        from dashboard.data.mcp_fanout import fanout_label
+
+        assert fanout_label('fetch_tasks', '/srv/team-a/app') == fanout_label(
+            'fetch_tasks', '/srv/team-b/app'
+        ) == 'fetch_tasks[app]'
+
     async def test_distinct_roots_keep_independent_streaks_on_one_url(self, caplog):
         """End-to-end: the discriminated labels really do decouple the streaks."""
         from dashboard.data.mcp_fanout import fanout_label
