@@ -2461,7 +2461,8 @@ class TestCuratorWorkerBatchDrain:
                 side_effect=tracking_batch,
             ):
                 ti._start_worker_if_needed(project_id)
-                await asyncio.sleep(0.5)
+                for tid in (t1, t2, t3):
+                    await _poll_ticket_resolved(ticket_store, tid, what=f'batch ticket {tid}')
         finally:
             workers = list(ti._worker_tasks.values()) if hasattr(ti, '_worker_tasks') else []
             for t in workers:
