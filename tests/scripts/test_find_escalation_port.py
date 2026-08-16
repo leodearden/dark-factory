@@ -1045,3 +1045,146 @@ def test_run_main_driver_reproduces_the_measured_allocation(
     # to observe.
     assert "Escalation port survey" in err
     assert "8102" in err
+
+
+def test_base_is_honoured_when_free_and_unclaimed(
+    fep: types.ModuleType, no_systemd: None, tmp_path: pathlib.Path
+) -> None:
+    """Nothing claims and nothing is bound — the base port itself is chosen."""
+    _parent, df_root = _claiming_tree(tmp_path, {})
+
+    rc, out, _err = _run_main(fep, ["--df-root", str(df_root), "--base", "8100"])
+
+    assert (rc, out) == (0, "8100\n")
+
+
+def test_a_sibling_claiming_the_base_port_pushes_the_choice_past_it(
+    fep: types.ModuleType, no_systemd: None, tmp_path: pathlib.Path
+) -> None:
+    """THE COLLISION TEST — two projects must never be handed the same port.
+
+    The task describes this failure mode as a silent cross-project dashboard bug
+    rather than a crash: hand a second project a port another project already claims
+    and the two escalation servers fight over it, with whichever loses simply not
+    coming up.
+
+    RE-MEASURED at base ``fc6f048b55`` with both dependencies patched: proj-a claims
+    8100, target claims 8101, ``--base 8100`` -> rc 0, stdout ``8102``.
+
+    MEASURED RED at base ``fc6f048b55``, scratch mutation reverted before commit:
+    removing ``if cand in blocked: continue`` from the scan loop — i.e. the collision
+    bug itself — RED::
+
+        E  AssertionError: assert (0, '8100\\n') == (0, '8102\\n')
+
+    That mutation reddened 4 tests (``4 failed, 31 passed``): this one, the driver
+    verifier, and both RESERVED cases — the blocked union is the single gate all of
+    them depend on.
+    """
+    _parent, df_root = _claiming_tree(tmp_path, {"proj-a": 8100, "target": 8101})
+
+    rc, out, err = _run_main(fep, ["--df-root", str(df_root), "--base", "8100"])
+
+    assert (rc, out) == (0, "8102\n")
+    # Both claims are visible in the evidence table, attributed to their projects.
+    assert "proj-a" in err
+    assert "target" in err
+
+
+@pytest.mark.parametrize(("base", "expected"), [(8103, "8104\n"), (8002, "8003\n")])
+def test_reserved_ports_are_never_handed_out(
+    fep: types.ModuleType, no_systemd: None, tmp_path: pathlib.Path, base: int, expected: str
+) -> None:
+    """RESERVED wins even with no config claiming it and nothing bound.
+
+    8002 is the fused-memory HTTP server shared by ALL projects and 8103 is the
+    shared reconciliation escalation queue — neither lives in any project config, so
+    the config survey alone would happily hand them out.
+
+    The parametrization is checked against ``fep.RESERVED`` below rather than trusted,
+    so adding a reserved port cannot leave this test asserting a stale set.
+
+    RE-MEASURED at base ``fc6f048b55``: ``--base 8103`` -> 8104, ``--base 8002`` -> 8003.
+
+    MEASURED RED at base ``fc6f048b55``, scratch mutation reverted before commit:
+    dropping RESERVED from the blocked union (``blocked = set(used)``) — RED::
+
+        E  AssertionError: assert (0, '8103\\n') == (0, '8104\\n')
+    """
+    assert base in fep.RESERVED, "parametrization drifted from the module's RESERVED set"
+    _parent, df_root = _claiming_tree(tmp_path, {})
+
+    rc, out, err = _run_main(fep, ["--df-root", str(df_root), "--base", str(base)])
+
+    assert (rc, out) == (0, expected)
+    assert str(base) in err, "the reserved port must appear in the evidence table"
+
+
+def test_every_reserved_port_is_covered_by_the_parametrization(fep: types.ModuleType) -> None:
+    """Drive the reserved set FROM the module, so a new reserved port fails loudly."""
+    assert set(fep.RESERVED) == {8002, 8103}
+
+
+def test_a_port_free_in_config_but_bound_is_skipped_and_reported(
+    fep: types.ModuleType, no_systemd: None, tmp_path: pathlib.Path
+) -> None:
+    """An in-flight-but-unconfigured server must not be double-allocated.
+
+    A project can be running an escalation server before its config exists — that is
+    precisely the state ``factory-init`` runs in. The config survey cannot see it, so
+    the bound check is the only thing standing between it and a duplicate assignment,
+    and the ``note:`` line is how a human reading the survey learns why the obvious
+    port was passed over.
+    """
+    _parent, df_root = _claiming_tree(tmp_path, {})
+
+    rc, out, err = _run_main(
+        fep, ["--df-root", str(df_root), "--base", "8100"], bound=frozenset({8100, 8101})
+    )
+
+    assert (rc, out) == (0, "8102\n")
+    note_lines = [ln for ln in err.splitlines() if "note:" in ln]
+    assert any("8100" in ln for ln in note_lines), f"no note: line mentioned 8100 — {note_lines}"
+    assert any("8101" in ln for ln in note_lines), f"no note: line mentioned 8101 — {note_lines}"
+
+
+def test_the_scan_window_is_bounded_and_failure_writes_nothing_to_stdout(
+    fep: types.ModuleType, no_systemd: None, tmp_path: pathlib.Path
+) -> None:
+    """Exhaustion returns rc 1, an ERROR on stderr, and an EMPTY stdout.
+
+    THE EMPTY STDOUT IS THE LOAD-BEARING HALF. SKILL.md invokes this script under
+    command substitution, so a caller doing ``PORT=$(...)`` must get an empty string
+    on failure — never a stale or partial value that would then be written into a
+    generated config as if it had been chosen.
+
+    RE-MEASURED at base ``fc6f048b55`` with ``is_bound`` pinned True for every port:
+    ``(1, "")``, stderr containing "ERROR: no free".
+    """
+    _parent, df_root = _claiming_tree(tmp_path, {})
+    everything = frozenset(range(8100, 8300))
+
+    rc, out, err = _run_main(
+        fep, ["--df-root", str(df_root), "--base", "8100"], bound=everything
+    )
+
+    assert rc == 1
+    assert out == "", f"stdout must be empty on failure, got {out!r}"
+    assert "ERROR: no free" in err
+
+
+def test_an_empty_survey_says_so_rather_than_looking_unparsed(
+    fep: types.ModuleType, no_systemd: None, tmp_path: pathlib.Path
+) -> None:
+    """"(none found)" — an empty result must be visible, not indistinguishable from a
+    survey that silently failed to parse anything.
+
+    Without the explicit line, "Claimed by existing project configs:" followed by
+    nothing reads identically whether no project claims a port or every config failed
+    to parse — and those call for opposite responses from whoever is reading it.
+    """
+    _parent, df_root = _claiming_tree(tmp_path, {})
+
+    _rc, _out, err = _run_main(fep, ["--df-root", str(df_root), "--base", "8100"])
+
+    assert "(none found)" in err
