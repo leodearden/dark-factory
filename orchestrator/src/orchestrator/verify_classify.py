@@ -203,15 +203,9 @@ _LINKER_SIGNAL_RE = re.compile(r'signal:?\s*7\b|SIGBUS|Bus error', re.IGNORECASE
 # detectable via either route.
 #
 # `disposition=<fatal|soft>` (task 4212) is the format string's 6th,
-# OPTIONAL field — closed vocabulary, default `fatal`, documented at reify
-# docs/notes/verify-pipeline-knobs.md:74-77. All three wrapper call sites
-# above call `slot_acquire` without that argument and so take the `fatal`
-# default; the ONE caller that passes `soft` is reify
-# `tests/infra/run_all.sh`'s pool worker (run_all.sh:1692), whose rc=75 is a
-# SOFT ADMISSION — it proceeds unslotted, the member still runs, and run_all
-# itself still exits 0 — rather than an infra hold. See
-# `_SLOT_TIMEOUT_SOFT_DISPOSITION_RE` below for the gate this distinction
-# feeds.
+# OPTIONAL field. See `_has_fatal_slot_timeout_sentinel` below — the sole
+# reader of this field — for the fatal/soft gate it feeds and its full
+# grounding.
 #
 # PORTABILITY (task 3679 review). The allowlist above hardcodes three reify
 # script basenames into an otherwise project-generic classifier, which makes
@@ -236,26 +230,12 @@ _LINKER_SIGNAL_RE = re.compile(r'signal:?\s*7\b|SIGBUS|Bus error', re.IGNORECASE
 # sentinel` below is the only reader of `group(1)`.
 _SLOT_TIMEOUT_SENTINEL_RE = re.compile(r'^[ \t]*@@REIFY_SLOT_TIMEOUT@@([^\n]*)', re.MULTILINE)
 
-# task 4212 — reify's slot-timeout sentinel carries `disposition=<fatal|soft>`
-# (reify scripts/lib_slot_acquire.sh:147, closed vocabulary documented at
-# reify docs/notes/verify-pipeline-knobs.md:74-77). `fatal` (the default,
-# taken by all three wrapper call sites) means the caller ABORTED and
-# propagated rc=75 — a genuine starvation event. `soft` is passed by
-# exactly one caller, tests/infra/run_all.sh's pool worker, whose rc=75
-# is a soft ADMISSION: it proceeds unslotted, the member still runs, and
-# run_all still exits 0. A soft deadline is a degraded-but-healthy pool,
-# not an infra hold, so it must not reach an INFRA_TRANSIENT category.
-#
-# `lock=` is emitted LAST in the marker (reify lib_slot_acquire.sh:124-133,
-# docs/notes/verify-pipeline-knobs.md:74) because LOCK_BASE is the ONE
-# operator-controlled field (`REIFY_TEST_SEMAPHORE_LOCK` /
-# `REIFY_OCCT_LOCK` / `REIFY_LANE_X_FLOCK_LOCK` / `REIFY_RUN_ALL_POOL_LOCK`
-# and their TMPDIR-derived defaults) and so the only one that can contain
-# whitespace or arbitrary text. `_SLOT_TIMEOUT_LOCK_FIELD_RE` finds that
-# boundary so the disposition parse below never reads past it — an
-# operator-chosen lock path containing the literal `disposition=soft` (or
-# `disposition=fatal`) can therefore neither suppress nor forge a
-# classification.
+# task 4212 — `disposition=<fatal|soft>` and the `lock=` field boundary these
+# two patterns parse (`lock=` is always the marker's LAST field — reify
+# lib_slot_acquire.sh:124-133 — because it is the sole operator-controlled
+# one). See `_has_fatal_slot_timeout_sentinel` below, the only reader of
+# both, for the full grounding, the fatal/soft distinction, and why the
+# parse stops at `lock=`.
 _SLOT_TIMEOUT_DISPOSITION_RE = re.compile(r'\bdisposition=(\S+)')
 _SLOT_TIMEOUT_LOCK_FIELD_RE = re.compile(r'\slock=')
 
@@ -542,45 +522,20 @@ def _classify_environmental(output: str) -> FailureCategory | None:
     of being inferred from a whole-output token co-occurrence.
 
     task 4212 — the SENTINEL half of the arm is additionally gated on the
-    marker's ``disposition`` field (reify task 6024, landed at reify
-    scripts/lib_slot_acquire.sh:147): ``disposition=fatal`` (the default,
-    taken by all three wrapper call sites behind ``_SLOT_ACQUIRE_DEADLINE_RE``)
-    means the caller ABORTED on a genuine starvation event, while
-    ``disposition=soft`` is passed by exactly one caller — reify
-    ``tests/infra/run_all.sh``'s pool worker — whose rc=75 is a soft
-    ADMISSION: it proceeds unslotted, the member still runs, and run_all
-    itself still exits 0. A soft deadline is a degraded-but-healthy pool, not
-    an infra hold, so a ``disposition=soft`` sentinel must not reach
-    SEMAPHORE_TIMEOUT (``_has_fatal_slot_timeout_sentinel`` /
-    ``_SLOT_TIMEOUT_DISPOSITION_RE`` above). The BASENAME half
-    (``_SLOT_ACQUIRE_DEADLINE_RE``) is deliberately left UNGATED: all three
-    allowlisted emitters call ``slot_acquire`` without a 6th argument and so
-    take the ``fatal`` default, and their deadline lines carry no
-    ``disposition`` field to parse in the first place.
-
-    The disposition is evaluated PER SENTINEL LINE, never as a single
-    whole-output search: *output* is the ENTIRE aggregated verify-leg output
-    (stderr merged into stdout, same aggregation the ORDERING note above
-    already reasons about), so a soft pool deadline and a fatal test-slot
-    deadline CAN co-occur in one leg, and a whole-output soft search would
-    let the soft line veto a genuine co-occurring abort. ANY non-soft
-    sentinel line wins. Within a line, the disposition is read ONLY from the
-    HEAD — the text before the first `` lock=`` — because ``lock=`` is the
-    marker's sole OPERATOR-controlled field (reify's field-order contract,
-    lib_slot_acquire.sh:124-133); confining the parse to the head means an
-    operator-chosen lock path can neither forge nor suppress the
-    classification, pinned by
-    ``TestSoftDispositionDoesNotVetoAGenuineSlotTimeout``'s lock-path-forgery
-    cases in both directions.
-
-    Fail-safe direction, unchanged since the field was first read: demote
-    ONLY on an explicit, literal ``disposition=soft`` — a sentinel line with
-    no disposition field (older reify; the field is additive and reify's
-    emit stays prefix-compatible with the anchor), an unrecognized future
-    token, or a malformed line all keep classifying SEMAPHORE_TIMEOUT,
-    matching pre-4212 behavior, because a missed starvation abort is a
-    silent infra hold nobody sees, while an over-classified soft admission
-    is visible and only reachable when the producer explicitly says so.
+    marker's ``disposition`` field: a sentinel line marked
+    ``disposition=soft`` (reify's ``run_all.sh`` pool worker is the sole
+    caller — a degraded-but-healthy admission, not an infra hold) does not,
+    by itself, satisfy this arm. The BASENAME half
+    (``_SLOT_ACQUIRE_DEADLINE_RE``) stays UNGATED: all three allowlisted
+    emitters take ``slot_acquire``'s ``fatal`` default and their deadline
+    lines carry no ``disposition`` field to parse. The gate is evaluated PER
+    SENTINEL LINE, not as a whole-output search, so a soft line can never
+    veto a co-occurring fatal one within the same aggregated leg output, and
+    is read only from each line's head so the operator-controlled ``lock=``
+    tail cannot forge or suppress it. See
+    ``_has_fatal_slot_timeout_sentinel`` — the sole implementation of this
+    gate — for the full grounding, the lock-tail rationale, and the
+    fail-safe direction on an absent or unrecognized disposition token.
 
     What this replaced, and why it had to go: the arm previously fired when a
     lock/slot/semaphore token appeared ANYWHERE in *output* together with a
@@ -711,13 +666,9 @@ def _classify_environmental(output: str) -> FailureCategory | None:
         return FailureCategory.ENV_TRANSIENT
     if is_interpreter_missing_workspace_packages(output):
         return FailureCategory.ENV_TRANSIENT
-    # task 4212: the SENTINEL half fires only when at least one
-    # @@REIFY_SLOT_TIMEOUT@@ line is NOT disposition=soft, evaluated PER LINE
-    # (`_has_fatal_slot_timeout_sentinel` above) so a soft line can never veto
-    # a co-occurring fatal one. The BASENAME half stays UNGATED — its three
-    # allowlisted emitters take `slot_acquire`'s `fatal` default and carry no
-    # `disposition` field at all (see `_SLOT_TIMEOUT_DISPOSITION_RE` above
-    # for the full grounding).
+    # task 4212: sentinel half is gated on disposition
+    # (`_has_fatal_slot_timeout_sentinel` above has the full grounding);
+    # basename half stays ungated — its emitters carry no `disposition` field.
     if _has_fatal_slot_timeout_sentinel(output) or _SLOT_ACQUIRE_DEADLINE_RE.search(output):
         return FailureCategory.SEMAPHORE_TIMEOUT
     return None
