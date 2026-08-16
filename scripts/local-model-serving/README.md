@@ -116,6 +116,13 @@ Useful variants: `lms_ctl active` / `stop-all`; `lms_fetch_weights --all`
 (non-placeholder arms) or `--images-only`; `lms_healthcheck --active`,
 `--all`, and `--output <path>` to write the JSON artifact.
 
+`lms_healthcheck --repeat N` is the operator's spread knob: it fires the
+measured probe N times behind the same single warm-up and records every sample
+in `repeat_latencies_ms`. Samples after the **first** are prefix-cache **warm**
+— the first measured probe populates the cache the rest are served from — so
+they are not independent samples, `latency_ms` stays pinned to the first, and
+`--repeat` can never change a verdict.
+
 Logs are the journal: `journalctl --user -u lms-arm@qwen3.5-9b.service -f`.
 
 ### The whole slate: `lms_slate_run.py`
@@ -579,9 +586,14 @@ lms_ctl stop granite-embedding-english-r2
 | — weight load | 1.6 s (0.29 GiB) |
 | — profile, KV cache, warmup | 22.0 s (16.6 s of it `torch.compile`) |
 | **resident VRAM while serving** | **796 MiB** (7309 → 8105 MiB used) |
-| embeddings probe latency | 192 ms |
+| embeddings probe latency | 192 ms (COLD single sample — see the caveat below) |
 | VRAM after `stop` | 7309 MiB — **exactly** the pre-start baseline |
 | whisper-writer throughout | 4050 MiB, undisturbed |
+
+That 192 ms was measured by the pre-3781 single-probe instrument, so it is the
+**cold** first request — the same arm re-measured on 2026-08-16 served the warm
+probe in **42.7 ms**. It is a single sample, not ζ's p95-under-load envelope
+metric (task **3719**), and it must not be used to rank arms.
 
 What this establishes that step 19 could not: the unit template instantiates
 against a real `arms.yaml` arm, the pre-flight admits an arm that fits, the
@@ -686,24 +698,46 @@ the card — which is how `0.6b` (2.0 -> 3.0) and `4b` (9.0 -> 10.0) were caught
 
 ---
 
-## Live slate run (measured, step 23 — 2026-08-06, COMPLETE)
+## Live slate run (measured, step 23 — re-measured 2026-08-16, COMPLETE)
 
-Every arm run through the committed chain, one at a time, 30 m 22 s of live host
-time on a card confirmed clean at 7205 MiB idle beforehand (whisper-writer the
-only compute app at 4050 MiB, no ollama model resident). **7 of 7 PASS.**
+Every arm run through the committed chain, one at a time, ~22 min of live host
+time on a card confirmed clean at 6126 MiB idle beforehand. **7 of 7 PASS.**
 
-| arm | ready | resident (footprint) | budget | probe | entities | verdict |
-|---|---|---|---|---|---|---|
-| `granite-embedding-english-r2` | 101 s | 789 MiB | 16922 MiB | 129 ms | — | **PASS** |
-| `gte-modernbert-base` | 111 s | 788 MiB | 16922 MiB | 115 ms | — | **PASS** |
-| `qwen3-embedding-0.6b` | 116 s | 3584 MiB | 16921 MiB | 507 ms | — | **PASS** |
-| `qwen3-embedding-4b` | 157 s | 10114 MiB | 16911 MiB | 630 ms | — | **PASS** |
-| `qwen3.5-9b` | 438 s | 14507 MiB | 16910 MiB | 43501 ms | 4/4 (4 top-level) | **PASS** |
-| `phi-4-14b` | 171 s | 15519 MiB | 16918 MiB | 2854 ms | 3/4 (2 top-level) | **PASS** |
-| `moe-stretch` | 20 s | 14604 MiB | 16915 MiB | 2465 ms | 4/4 (4 top-level) | **PASS** |
+Re-measured on **2026-08-16** (task 3781) with the two-probe instrument. The
+2026-08-06 run's single `probe` column is superseded: every number in it was a
+COLD first request, and on the embedding axis that overstated the served
+latency by up to **13.5×**.
 
-Every arm released **every** byte on stop (card back to 7198–7217 MiB within the
-first 3 s poll), whisper-writer held 4050 MiB undisturbed throughout, and no two
+| arm | ready | resident (footprint) | budget | COLD ms | WARM ms | cached prompt tok | entities | verdict |
+|---|---|---|---|---|---|---|---|---|
+| `granite-embedding-english-r2` | 101 s | 787 MiB | 17994 MiB | 112.3 | **42.7** | — | — | **PASS** |
+| `gte-modernbert-base` | 106 s | 784 MiB | 17994 MiB | 156.9 | **41.4** | — | — | **PASS** |
+| `qwen3-embedding-0.6b` | 116 s | 3584 MiB | 17996 MiB | 604.7 | **44.7** | — | — | **PASS** |
+| `qwen3-embedding-4b` | 147 s | 10121 MiB | 17994 MiB | 669.6 | **56.3** | — | — | **PASS** |
+| `qwen3.5-9b` (`reasoning: on`) | 399 s | 15601 MiB | 18010 MiB | 50119.4 | **39405.7** | null (vLLM) | 4/4 (4 top-level) | **PASS** |
+| `phi-4-14b` | 121 s | 16637 MiB | 17996 MiB | 1893.3 | **2241.2** | null (vLLM) | 3/4 (2 top-level) | **PASS** |
+| `moe-stretch` | 55 s | 14611 MiB | 17996 MiB | 2481.6 | **2210.6** | **26** of ~343 | 4/4 (4 top-level) | **PASS** |
+
+**These latencies are NOT comparable across arms — do not rank on them.** Each
+is a SINGLE SAMPLE from a health probe, taken with the engine warm and the
+prefix cache **cold** (a discarded warm-up on a different prompt precedes it).
+They are **not** ζ's p95-under-load envelope metric (task **3719**, PRD
+`episode-latency-p50/p95` under concurrent load), and the arms differ in axis,
+stack, reasoning mode and prompt shape, so a column ordering carries no meaning.
+The same sentence lives in the artifact's `latency_caveat` field, because JSON
+carries no comments and η/θ read the JSON, not this file.
+
+`moe-stretch`'s **26** cached prompt tokens of ~343 is the direct evidence that
+the measured probe found the prefix cache cold. vLLM reports
+`prompt_tokens_details: null`, so on those six arms the cold/warm split rests on
+latency alone — hence the two columns rather than one.
+
+`phi-4-14b` measured **cold LESS THAN warm** (1893.3 vs 2241.2). That ordering
+is not a fault and nothing gates on it: for a generation-dominated arm the
+first-request penalty is a rounding error against sampling variance. A
+cold > warm check would fail an arm that is serving correctly.
+
+Every arm released **every** byte on stop (card back to 6126 MiB), and no two
 arms were ever co-resident.
 
 `phi-4-14b` is the row the extraction floor was ruled on: `FalkorDB` appears
@@ -712,14 +746,46 @@ the floor does not scan. So it captures 3 of 4 and promotes 2 — both numbers a
 in the row, the floor passes it, and `top_level_entities_named` records the
 representation difference for η without α judging it.
 
-### Latency here is a COLD single sample — do not rank arms on it
+### How the instrument separates cold from warm (task 3781)
 
-`qwen3.5-9b` measured 2849 ms cold and ~350 ms warm at `reasoning: off` — a 12×
-gap. These numbers are one measurement each, taken on the first request after
-load, and they are **not** ζ's p95-under-load envelope metric. Task **3781**
-fixes the instrument (warm the engine, not the prefix cache; report cold and warm
-separately). The one exception is `qwen3.5-9b` at `reasoning: on`: 43.5 s cold vs
-41.0 s warm, because that cost is genuine generation rather than load.
+Up to 2026-08-16 this section carried a warning that the latency column was a
+cold single sample. Task **3781** fixed the instrument, so what follows is what
+it now does.
+
+`run_healthcheck` probes each arm **twice**. The first run is **discarded** —
+its verdict is thrown away entirely, and only its latency is kept, as
+`first_probe_ms`. It exists to warm CUDA graphs, the allocator, kernel autotune
+and grammar compilation. The second run is the one measured, and its latency is
+`latency_ms`. So the reported number is **engine-warm and prefix-cold**, which
+is the state a production request actually arrives in.
+
+The warm-up deliberately uses a **different prompt** (`WARMUP_PROBE_TEXT`,
+`WARMUP_EMBEDDING_QUERY`), diverging from the measured one at the very first
+user token. Warming with the *same* prompt is the measured trap: llama.cpp then
+serves the "measured" run from the prefix cache the warm-up just populated —
+**338 of 343** prompt tokens, observed on `moe-stretch`. Everything else about
+the warm-up request is byte-identical, so it exercises the same server path it
+is meant to warm.
+
+Two measured findings justify the shape, and both are why repeated identical
+probes are **not** independent samples:
+
+- prompt-cache state changed the **output** at temperature 0 — 276 completion
+  tokens on a cold cache vs 236 on a warm one;
+- samples 2..N of a `--repeat` run measure generation with prompt processing
+  nearly free. `latency_ms` therefore stays pinned to `repeat_latencies_ms[0]`,
+  the only prefix-cold sample, and `--repeat` can never move a verdict.
+
+On llama.cpp, `measured_cached_prompt_tokens` proves the cold prefix directly
+(26 of ~343 on the 2026-08-16 run). vLLM returns `prompt_tokens_details: null`,
+so on those arms the claim rests on latency alone — which the artifact records
+honestly as `null` rather than a misleading `0`.
+
+Naming the mode each figure belongs to, since two numbers for `qwen3.5-9b` have
+read as contradictory: at **`reasoning: off`** it measured 2849 ms cold against
+~350 ms warm (a 12× load penalty); at **`reasoning: on`** — the mode `arms.yaml`
+declares and the mode the slate table above was measured in — it is 50.1 s cold
+against 39.4 s warm, because that cost is genuine generation rather than load.
 
 ### The dropped arm
 
@@ -776,13 +842,40 @@ distance metric, and say which in its report.
 
 ## Verification artifact
 
-`verification/health-report.json` is written by a live run
-(`lms_healthcheck --all --output ...`) and committed. It carries
-`schema_version`, an aware-UTC `measured_at`, the GPU identity (which card,
-which driver — every verdict is relative to specific hardware), one row per arm,
-and the VRAM block. `scripts/tests/test_lms_verification_artifact.py` requires a
-`PASS` row for every arm in `arms.yaml` plus a passing VRAM block, so the test
-can only be greened by the run having actually happened.
+`verification/health-report.json` is written by a live run and committed. It
+carries `schema_version`, an aware-UTC `measured_at`, the GPU identity (which
+card, which driver — every verdict is relative to specific hardware), one row
+per arm with both latencies, the VRAM block, and `latency_caveat`.
+`scripts/tests/test_lms_verification_artifact.py` requires a `PASS` row for
+every arm in `arms.yaml`, a positive **cold and warm** latency on each, a
+passing VRAM block and the caveat field — so the test can only be greened by the
+run having actually happened.
+
+**Regenerating it.** `--all` cannot produce this file: it would need all seven
+arms up simultaneously, which this card cannot hold and which `lms_ctl start`
+refuses (exclusive by default), plus seven live VRAM baselines. The real chain
+is per arm, one at a time, then a merge:
+
+```bash
+# for each arm in arms.yaml:
+uv run --project shared python scripts/local-model-serving/lms_ctl.py start <arm>
+uv run --project shared python scripts/local-model-serving/lms_ctl.py wait-ready <arm>
+uv run --project shared python scripts/local-model-serving/lms_healthcheck.py \
+    --arm <arm> --output /tmp/parts/<arm>.json
+uv run --project shared python scripts/local-model-serving/lms_ctl.py stop <arm>
+
+# then, once every arm has a part:
+uv run --project shared python scripts/local-model-serving/lms_healthcheck.py \
+    --merge /tmp/parts/*.json \
+    --output scripts/local-model-serving/verification/health-report.json
+```
+
+`lms_ctl start` is the **only** writer of the VRAM baseline, which is what makes
+the artifact unfakeable — without it `run_healthcheck` raises `VramProbeError`
+and writes no report at all. `merge_reports` enforces manifest coverage, so a
+missing arm refuses the merge rather than yielding a short artifact that reads
+as complete. Long runs belong in a transient `systemd --user` unit (PRD
+decision 11), never a bare background shell.
 
 **The committed file is `schema_version: 4`; the producer is at 5.** It is
 evidence of a real ~39-minute 7-arm run and every other property of the gate
@@ -819,17 +912,25 @@ Every arm was started through the committed chain and probed with the committed
 health check. All four loaded under the vLLM pooling runner and returned a valid
 vector of their declared length:
 
-| arm | load | probe | resident VRAM | probe verdict |
-|---|---|---|---|---|
-| `granite-embedding-english-r2` | 123 s | 192 ms | 796 MiB | PASS |
-| `gte-modernbert-base` | 122 s | 286 ms | 788 MiB | PASS |
-| `qwen3-embedding-0.6b` | 143 s | 700 ms | ~~16603 MiB~~ **3584 MiB** | PASS |
-| `qwen3-embedding-4b` | 142 s | 580 ms | ~~16078 MiB~~ **10114 MiB** | PASS |
+| arm | load | probe (COLD, step 22) | probe (WARM, 2026-08-16) | resident VRAM | probe verdict |
+|---|---|---|---|---|---|
+| `granite-embedding-english-r2` | 123 s | 192 ms | **42.7 ms** | 796 MiB | PASS |
+| `gte-modernbert-base` | 122 s | 286 ms | **41.4 ms** | 788 MiB | PASS |
+| `qwen3-embedding-0.6b` | 143 s | 700 ms | **44.7 ms** | ~~16603 MiB~~ **3584 MiB** | PASS |
+| `qwen3-embedding-4b` | 142 s | 580 ms | **56.3 ms** | ~~16078 MiB~~ **10114 MiB** | PASS |
 
 Uniformity was the preferred outcome and measurement allowed it: one stack across
-all four removes a serving-stack confound from ι's query-latency comparison, so
-the latency column above is comparable as it stands. `fallback_stack: tei` stays
-in the manifest as the recorded fallback, unused.
+all four removes a serving-stack confound from ι's query-latency comparison.
+`fallback_stack: tei` stays in the manifest as the recorded fallback, unused.
+
+**Correction (task 3781).** This section previously concluded that "the latency
+column above is comparable as it stands". It was not. Removing the stack
+confound is necessary but nowhere near sufficient: the step-22 column was seven
+COLD single samples, and re-measuring warm collapsed a 192–700 ms spread to
+41–56 ms. Almost the entire apparent ranking was first-request load cost, not
+serving cost. Even the warm column is a **single sample per arm** and is **not**
+ζ's p95-under-load envelope metric (task **3719**) — ι must measure query
+latency under its own load, not inherit either column here.
 
 #### The resident-VRAM split is architectural, and it matters
 
