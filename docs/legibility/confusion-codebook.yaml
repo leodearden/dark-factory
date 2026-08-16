@@ -10373,7 +10373,7 @@ candidates:
   cause: The implementer prompt's Session Startup Protocol names two candidate locations for plan.json/iterations.jsonl ('.task/plan.json' and '.task-meta/<worktree-name>/plan.json') but in pooled .eval-worktrees layouts neither resolves; '.task/' holds only ephemeral 'claude-config-<task>' entries and '.task-meta/run-<id>/' yields no iterations.jsonl
   area: worktree/plan-state discovery
   first_seen: '2026-07-24'
-  disposition: pending
+  disposition: rejected
   sightings:
   - date: '2026-07-24'
     project: dark_factory
