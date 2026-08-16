@@ -9,6 +9,7 @@ Built bottom-up in TDD order (see task 2492's plan.json):
   - TestKeyIsolationAndPathSafety: per-model/per-harness isolation + traversal safety.
   - TestFailSafeUnverifiablePin: half-written/corrupt pins fall back to in-code.
   - TestUnreadableProvenanceWarns: the unreadable-sidecar fallback is loud, not silent.
+  - TestUnreadableKeyDirectory: an unreadable key dir/ancestor also falls back, not raises.
   - TestAtomicWriteText: _atomic_write_text's failure/cleanup path.
   - TestDefaultArtifactsRoot: default_artifacts_root() env override + monorepo walk-up.
 """
@@ -17,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -802,6 +804,127 @@ class TestUnreadableProvenanceWarns:
         assert len(caplog.records) == 0, (
             f'Expected no WARNING on the valid/absent paths, got: {caplog.records}'
         )
+
+
+class TestUnreadableKeyDirectory:
+    """The *other* limb of "never raises": an unreadable key dir or ancestor.
+
+    ``resolve()`` reaches ``heuristics_path.exists()`` BEFORE it ever calls
+    ``_load_valid_provenance``, and ``Path.exists()`` does not swallow EACCES
+    (``pathlib._abc._ignore_error`` ignores only ENOENT/ENOTDIR/EBADF/ELOOP/
+    EINVAL). So the sidecar guard covered by ``TestUnreadableProvenanceWarns``
+    is unreachable when the *directory* — rather than the sidecar file — is
+    what cannot be read, and a genuinely good pin still crashes the caller.
+
+    Each case starts from a fully valid ``pin()`` so the test proves a *good*
+    pin degrades to the in-code constant, not that an already-broken one does.
+    The chmod cases are the real end-to-end kernel EACCES path but are
+    uid-dependent (root bypasses permission bits), so they are paired with a
+    uid-independent monkeypatch twin that keeps the guard live under a root CI.
+    """
+
+    def _pin_valid_artifact(self, store, spec):
+        provenance = ArtifactProvenance(**_provenance_kwargs(harness_version='v1'))
+        store.pin(
+            spec.prompt_id, 'claude-opus-4', 'v1',
+            heuristics='pinned heuristics', provenance=provenance,
+        )
+        return store._key_dir(spec.prompt_id, 'claude-opus-4', 'v1')
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason='root bypasses directory permission bits')
+    def test_resolve_falls_back_when_key_directory_is_unreadable(self, tmp_path, caplog):
+        store = PromptArtifactStore(tmp_path / 'artifacts')
+        spec = _make_spec()
+        key_dir = self._pin_valid_artifact(store, spec)
+
+        try:
+            # The restore below is mandatory: without it pytest's tmp_path
+            # cleanup fails and surfaces as an unrelated teardown error.
+            os.chmod(key_dir, 0o000)
+            with caplog.at_level(logging.WARNING):
+                resolved = store.resolve(
+                    spec, executor_model='claude-opus-4', harness_version='v1'
+                )
+        finally:
+            os.chmod(key_dir, 0o755)
+
+        assert resolved.source == 'in_code'
+        assert resolved.text == spec.in_code_constant
+        assert resolved.provenance is None
+        assert len(caplog.records) == 1, (
+            f'Expected exactly one WARNING for the unreadable key dir, got: {caplog.records}'
+        )
+        assert str(key_dir / 'heuristics.txt') in caplog.records[0].message
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason='root bypasses directory permission bits')
+    def test_resolve_falls_back_when_artifacts_root_is_unreadable(self, tmp_path, caplog):
+        """The scenario the review reproduced: the unreadable directory is an
+        *ancestor* of the key dir (the whole artifacts root), not the key dir
+        itself — so the stat fails while walking down to ``heuristics.txt``.
+        """
+        artifacts_root = tmp_path / 'artifacts'
+        store = PromptArtifactStore(artifacts_root)
+        spec = _make_spec()
+        key_dir = self._pin_valid_artifact(store, spec)
+
+        try:
+            os.chmod(artifacts_root, 0o000)
+            with caplog.at_level(logging.WARNING):
+                resolved = store.resolve(
+                    spec, executor_model='claude-opus-4', harness_version='v1'
+                )
+        finally:
+            os.chmod(artifacts_root, 0o755)
+
+        assert resolved.source == 'in_code'
+        assert resolved.text == spec.in_code_constant
+        assert resolved.provenance is None
+        assert len(caplog.records) == 1, (
+            f'Expected exactly one WARNING for the unreadable artifacts root, '
+            f'got: {caplog.records}'
+        )
+        assert str(key_dir / 'heuristics.txt') in caplog.records[0].message
+
+    def test_resolve_falls_back_when_exists_check_raises_permission_error(
+        self, tmp_path, caplog, monkeypatch
+    ):
+        """The uid-INDEPENDENT twin of the two chmod cases above, so this
+        regression guard still runs under a root CI where those skip.
+
+        ``Path.exists`` is patched *selectively* — it raises only for
+        ``heuristics.txt`` and otherwise delegates to the captured real
+        implementation. An unconditional patch breaks pytest/caplog internals,
+        which stat unrelated paths.
+        """
+        store = PromptArtifactStore(tmp_path / 'artifacts')
+        spec = _make_spec()
+        key_dir = self._pin_valid_artifact(store, spec)
+        # Premise: this pin genuinely resolves before the permission flip, so
+        # the assertions below prove a *degradation*, not a never-pinned key.
+        assert store.resolve(
+            spec, executor_model='claude-opus-4', harness_version='v1'
+        ).source == 'artifact'
+
+        _real_exists = Path.exists
+
+        def boom(self, *args, **kwargs):
+            if self.name == 'heuristics.txt':
+                raise PermissionError(13, 'Permission denied')
+            return _real_exists(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, 'exists', boom)
+
+        with caplog.at_level(logging.WARNING):
+            resolved = store.resolve(spec, executor_model='claude-opus-4', harness_version='v1')
+
+        assert resolved.source == 'in_code'
+        assert resolved.text == spec.in_code_constant
+        assert resolved.provenance is None
+        assert len(caplog.records) == 1, (
+            f'Expected exactly one WARNING for the unreadable heuristics stat, '
+            f'got: {caplog.records}'
+        )
+        assert str(key_dir / 'heuristics.txt') in caplog.records[0].message
 
 
 class TestAtomicWriteText:
