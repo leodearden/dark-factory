@@ -2446,14 +2446,20 @@ class TestRegenCommand:
         assert _mod.render_markdown(report) == _mod.render_markdown(report)
 
 
-def _coverage_md_report(top_n: int = 50, *, history=None, registry=True, **kwargs) -> dict:
+def _coverage_md_report(top_n: int = 50, *, history=..., registry=True, **kwargs) -> dict:
     """A report exercising every new coverage/trend section of the markdown.
 
     dark_factory carries two legacy-spelled topics, a topic with exactly one
     canonical, and a DUPLICATE-canonical topic; reify carries a second
     duplicate. Two rows in every named list, so a ``--top-n 1`` render has
     something to cut.
+
+    Defaults to an EMPTY history rather than none, modelling the real first
+    nightly run: the timer always loads the history file, which on day one
+    simply has no runs in it.
     """
+    if history is ...:
+        history = _mod.empty_coverage_history()
     payloads = {
         'dark_factory': [
             {'topic': 'alpha', 'canonical': True},

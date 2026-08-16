@@ -1318,8 +1318,8 @@ def build_coverage_diff(
     runs = list(history.get('runs') or [])
     if not runs:
         return _no_baseline_diff(
-            'no prior run is recorded in the coverage history -- this is the '
-            'first census in it, so there is nothing to compare against',
+            'no prior run is recorded in the coverage history: this is the '
+            'first recorded run, so there is nothing to compare against',
         )
 
     baseline = runs[-1]
@@ -1747,6 +1747,9 @@ def render_markdown(report: dict[str, Any]) -> str:
 
     lines += _render_coverage(report.get('coverage', {}))
 
+    lines += _render_topic_coverage(report, top_n)
+    lines += _render_coverage_trend(report)
+
     lines += ['## Record counts', '']
     lines += _render_record_counts(report)
 
@@ -1906,6 +1909,408 @@ def _render_coverage(coverage: dict[str, Any]) -> list[str]:
                 # confident wrong diagnosis.
                 lines.append(f'- `{kind}` — {json.dumps(d, sort_keys=True)}')
         lines.append('')
+    return lines
+
+
+def _num(value: Any) -> str:
+    """Render a measured number, or ``n/a`` for an UNMEASURED one.
+
+    ``n/a`` and ``0`` must never be confused in this report: one is the
+    absence of a measurement, the other is a measurement.
+    """
+    if value is None:
+        return 'n/a'
+    if isinstance(value, bool):
+        return str(value).lower()
+    if isinstance(value, int):
+        return f'{value:,}'
+    if isinstance(value, float):
+        return f'{value:,}'
+    return str(value)
+
+
+def _pct(value: Any) -> str:
+    return 'n/a' if value is None else f'{value}%'
+
+
+def _signed(value: Any) -> str:
+    """A delta: signed, or ``n/a`` when the two ends are not comparable."""
+    if value is None:
+        return 'n/a'
+    if value == 0:
+        return '0'
+    return f'{value:+,}'
+
+
+def _render_named_rows(
+    title: str,
+    headers: list[str],
+    rows: list[list[str]],
+    top_n: int | None = None,
+    *,
+    aligns: list[str] | None = None,
+    cut: bool = True,
+) -> list[str]:
+    """Render a NAMED row table, cut to *top_n* with the same disclosure
+    :func:`_render_table` uses.
+
+    *cut* is opt-out for tables whose length is bounded by construction (the
+    registry-scoped ones) and for the ones where a cut would change the
+    conclusion rather than merely shorten the view.
+    """
+    lines = [f'#### {title}', '']
+    if not rows:
+        lines += ['_(none)_', '']
+        return lines
+    shown = rows if not cut or not top_n or top_n <= 0 else rows[:top_n]
+    resolved_aligns = aligns or ['---'] * len(headers)
+    lines += [
+        '| ' + ' | '.join(headers) + ' |',
+        '| ' + ' | '.join(resolved_aligns) + ' |',
+    ]
+    lines += ['| ' + ' | '.join(cells) + ' |' for cells in shown]
+    lines.append('')
+    if len(shown) < len(rows):
+        lines += [
+            f'_Showing top {len(shown):,} of {len(rows):,} rows — this markdown '
+            f'view is **truncated**; the JSON artifact carries the full '
+            f'population, and `--top-n` widens this view._',
+            '',
+        ]
+    return lines
+
+
+def _enforce_caveat(flag: bool | None) -> str:
+    """The regime line that makes the violation count above READABLE.
+
+    Three-valued on purpose. Rendering an unread flag as ``false`` would
+    tell a reader the duplicates are expected warn-mode backlog when in fact
+    nothing is known about the regime.
+    """
+    if flag is True:
+        return (
+            '`memory_metadata.enforce`: **true** — a duplicate `canonical: true` '
+            'is REJECTED at write time, so a non-zero count above is residue '
+            'from before the flip, or a live defect.'
+        )
+    if flag is False:
+        return (
+            '`memory_metadata.enforce`: **false** — warn-mode: a duplicate '
+            '`canonical: true` is censused and the write still PROCEEDS, so a '
+            'non-zero count above is partly backlog, not necessarily a broken '
+            'guard.'
+        )
+    return (
+        '`memory_metadata.enforce`: **unknown** — the config could not be read, '
+        'so the regime that produced the count above is not known. This is not '
+        'the same claim as the guard being off.'
+    )
+
+
+def _render_topic_coverage(report: dict[str, Any], top_n: int | None) -> list[str]:
+    """The headline: stamping RATE, the canonical partition, and the target.
+
+    Rendered from the report dict alone, like every other section -- the two
+    artifacts cannot disagree because there is only one traversal.
+    """
+    grand = report.get('topic_coverage') or {}
+    projects = report.get('projects') or {}
+    lines = [
+        '## Topic & canonical coverage',
+        '',
+        'Stamping **coverage** (a rate, not a raw count) and the per-topic '
+        '`canonical` partition. Computed at PROJECT grain across all censused '
+        "categories, matching 3198's scope-wide uniqueness probe "
+        '(`memory_service._check_canonical_uniqueness`) — a per-category tally '
+        'would score a topic whose canonical sits in another category as '
+        'having none.',
+        '',
+        '| scope | records | `topic` present | coverage | distinct topics | '
+        '1 canonical | 0 canonical | >1 canonical |',
+        '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
+    ]
+    for project_id in sorted(projects):
+        block = projects[project_id].get('topic_coverage') or {}
+        lines.append(
+            f'| `{project_id}` | {_num(block.get("records"))} | '
+            f'{_num(block.get("topic_present"))} | '
+            f'{_pct(block.get("topic_coverage_pct"))} | '
+            f'{_num(block.get("distinct_topics"))} | '
+            f'{_num(block.get("topics_with_one_canonical"))} | '
+            f'{_num(block.get("topics_with_zero_canonical"))} | '
+            f'{_num(block.get("topics_with_multiple_canonical"))} |',
+        )
+    lines.append(
+        f'| **(all)** | {_num(grand.get("records"))} | '
+        f'{_num(grand.get("topic_present"))} | '
+        f'{_pct(grand.get("topic_coverage_pct"))} | '
+        f'{_num(grand.get("distinct_topics"))} | '
+        f'{_num(grand.get("topics_with_one_canonical"))} | '
+        f'{_num(grand.get("topics_with_zero_canonical"))} | '
+        f'{_num(grand.get("topics_with_multiple_canonical"))} |',
+    )
+    lines.append('')
+
+    # ---- uniqueness: the count, then the REGIME, then what blocks the flip
+    lines += [
+        '### Canonical uniqueness',
+        '',
+        'Topics carrying more than one live `canonical: true`: '
+        f'**{_num(grand.get("topics_with_multiple_canonical"))}** '
+        f'(and **{_num(grand.get("canonical_true_without_topic"))}** '
+        '`canonical: true` record(s) carry no topic at all, so they appear in '
+        'no per-topic tally above).',
+        '',
+        _enforce_caveat(grand.get('canonical_uniqueness_enforced')),
+        '',
+    ]
+    violator_rows = [
+        [f'`{project_id}`', f'`{row["topic"]}`', f'{row["canonical_count"]:,}']
+        for project_id in sorted(projects)
+        for row in (
+            (projects[project_id].get('topic_coverage') or {}).get(
+                'multiple_canonical_topics',
+            ) or []
+        )
+    ]
+    lines += _render_named_rows(
+        'Topics with more than one `canonical: true`',
+        ['project', 'topic', 'canonical count'],
+        violator_rows,
+        top_n,
+        aligns=['---', '---', '---:'],
+    )
+
+    # NEVER cut: a truncated precondition list silently under-reports what
+    # blocks the flip -- the one list where a cut changes the conclusion
+    # rather than merely shortening the view (Leo's 2026-08-12 ruling).
+    lines += [
+        '#### What still blocks flipping `memory_metadata.enforce`',
+        '',
+        'Cited, not chased — this census measures, task 3626 decides.',
+        '',
+    ]
+    for entry in grand.get('enforce_flip_preconditions') or []:
+        line = (
+            f'- **`{entry.get("id")}`** — status `{entry.get("status")}`. '
+            f'{entry.get("what")} Source: {entry.get("source")}.'
+        )
+        live = entry.get('live_re_measurement')
+        if live:
+            line += (
+                ' Re-measured by THIS run: '
+                f'**{_num(live.get("slug_non_conforming"))}** non-conforming '
+                'distinct topic(s) corpus-wide, '
+                f'**{_num(live.get("canonical_slug_non_conforming"))}** among '
+                '`canonical: true` topics — a bucket recorded empty can regrow '
+                '(this census measured 98 → 103 while in warn mode).'
+            )
+        lines.append(line)
+    lines.append('')
+
+    # ---- slug conformance: two partitions, two questions
+    lines += [
+        '### Topic slug conformance',
+        '',
+        "The standing re-measurement of gate **3626**'s recipe: **item 3** is "
+        'the non-conforming DISTINCT-TOPIC count corpus-wide, **item 4** is the '
+        'strictly narrower check that every live `canonical: true` topic passes '
+        'the slug regex in both projects. They are two columns because they are '
+        "two questions, and PRD §159's discharge claim is stated over item 4 "
+        'only. A topic stamped in a legacy spelling is invisible to every '
+        'registry-keyed and exact-match read.',
+        '',
+        '| scope | distinct topics | conforming (item 3) | non-conforming (item 3) | '
+        '`canonical: true` topics | conforming (item 4) | non-conforming (item 4) |',
+        '| --- | ---: | ---: | ---: | ---: | ---: | ---: |',
+    ]
+    for project_id in sorted(projects):
+        block = projects[project_id].get('topic_coverage') or {}
+        lines.append(
+            f'| `{project_id}` | {_num(block.get("distinct_topics"))} | '
+            f'{_num(block.get("slug_conforming"))} | '
+            f'{_num(block.get("slug_non_conforming"))} | '
+            f'{_num((block.get("canonical_slug_conforming") or 0) + (block.get("canonical_slug_non_conforming") or 0))} | '
+            f'{_num(block.get("canonical_slug_conforming"))} | '
+            f'{_num(block.get("canonical_slug_non_conforming"))} |',
+        )
+    lines.append('')
+    for project_id in sorted(projects):
+        block = projects[project_id].get('topic_coverage') or {}
+        lines += _render_named_rows(
+            f'`{project_id}` — non-conforming topic values (item 3)',
+            ['topic', 'records'],
+            [
+                [f'`{row["topic"]}`', f'{row["count"]:,}']
+                for row in block.get('non_conforming_topics') or []
+            ],
+            top_n,
+            aligns=['---', '---:'],
+        )
+        lines += _render_named_rows(
+            f'`{project_id}` — non-conforming `canonical: true` topics (item 4)',
+            ['topic', '`canonical: true` records'],
+            [
+                [f'`{row["topic"]}`', f'{row["count"]:,}']
+                for row in block.get('canonical_slug_non_conforming_topics') or []
+            ],
+            top_n,
+            aligns=['---', '---:'],
+        )
+
+    lines += _render_registry_coverage(report, top_n)
+    return lines
+
+
+def _render_registry_coverage(report: dict[str, Any], top_n: int | None) -> list[str]:
+    """The TARGET: the committed registry scored against measured state."""
+    lines = [
+        '### Registry coverage — the accountable target',
+        '',
+        'Every topic in the committed registry '
+        '(`fused-memory/tests/fixtures/memory_eval_topic_registry.json`) should '
+        'carry exactly one live `canonical: true` **in its own project**. A '
+        'bounded, named, checkable set — unlike a corpus-wide stamping '
+        'percentage, which has no owner and no worklist.',
+        '',
+    ]
+    gauge = report.get('registry_coverage')
+    if not gauge:
+        lines += [
+            f'_Registry gauge did not run: {report.get("registry_error")}._',
+            '',
+        ]
+        return lines
+    lines += [
+        f'Registry topics: **{_num(gauge.get("registry_topics_total"))}** · '
+        'exactly one canonical: '
+        f'**{_num(gauge.get("registry_topics_with_exactly_one_canonical"))}** · '
+        'zero: '
+        f'**{_num(gauge.get("registry_topics_with_zero_canonical"))}** · '
+        'more than one: '
+        f'**{_num(gauge.get("registry_topics_with_multiple_canonical"))}**.',
+        '',
+    ]
+    lines += _render_named_rows(
+        'Worklist — registry topics with no live `canonical: true`',
+        ['project', 'topic', 'records', 'canonical'],
+        [
+            [
+                f'`{row["project_id"]}`', f'`{row["topic"]}`',
+                f'{row["records"]:,}', f'{row["canonical_count"]:,}',
+            ]
+            for row in gauge.get('zero_canonical_topics') or []
+        ],
+        top_n,
+        aligns=['---', '---', '---:', '---:'],
+    )
+    return lines
+
+
+def _render_coverage_trend(report: dict[str, Any]) -> list[str]:
+    """This run against the most recent prior one -- or a stated null.
+
+    No table is cut here: every table below is bounded by construction (the
+    trended column set, and the committed registry).
+    """
+    trend = report.get('coverage_trend') or {}
+    lines = [
+        '## Coverage trend',
+        '',
+        'Movement since the most recent prior run in '
+        '`plans/memory-metadata-coverage-history.json`.',
+        '',
+    ]
+    if not trend.get('baseline'):
+        # Deliberately no delta table: a table of zeros would read as
+        # "coverage is flat", which is not what an absent baseline means.
+        lines += [
+            f'_No baseline — {trend.get("baseline_reason", "no prior run")}._',
+            '',
+        ]
+        return lines
+
+    lines += [f'Baseline: `{trend.get("baseline")}`.', '']
+    projects = trend.get('projects') or {}
+    compared = {
+        pid: block for pid, block in projects.items() if block.get('status') == 'compared'
+    }
+    if compared:
+        lines += [
+            '| project | column | before | after | delta |',
+            '| --- | --- | ---: | ---: | ---: |',
+        ]
+        for project_id in sorted(compared):
+            for column, cell in compared[project_id]['columns'].items():
+                lines.append(
+                    f'| `{project_id}` | `{column}` | {_num(cell.get("before"))} | '
+                    f'{_num(cell.get("after"))} | {_signed(cell.get("delta"))} |',
+                )
+        lines.append('')
+    for project_id in sorted(projects):
+        status = projects[project_id].get('status')
+        if status == 'new_project':
+            lines += [
+                f'- `{project_id}`: **new_project** — first appearance in the '
+                'trend, so no deltas are shown; a delta from zero would '
+                'fabricate a baseline it never had.',
+            ]
+        elif status == 'absent_from_this_run':
+            lines += [
+                f'- `{project_id}`: **absent_from_this_run** — present in the '
+                'baseline but not censused now, so its trend is paused rather '
+                'than dropped.',
+            ]
+    if any(b.get('status') != 'compared' for b in projects.values()):
+        lines.append('')
+
+    regrowth = trend.get('topic_regrowth') or {}
+    lines += ['### Registry topic regrowth', '', regrowth.get('scope_note', ''), '']
+    if not regrowth.get('available'):
+        lines += [f'_Not available: {regrowth.get("reason")}._', '']
+        return lines
+    lines += _render_named_rows(
+        'Lost their `canonical: true`',
+        ['project', 'topic', 'canonical before', 'canonical after'],
+        [
+            [
+                f'`{r["project_id"]}`', f'`{r["topic"]}`',
+                _num(r.get('canonical_before')), _num(r.get('canonical_after')),
+            ]
+            for r in regrowth.get('lost_canonical_topics') or []
+        ],
+        None,
+        aligns=['---', '---', '---:', '---:'],
+        cut=False,
+    )
+    lines += _render_named_rows(
+        'Grew in member records',
+        ['project', 'topic', 'records before', 'records after'],
+        [
+            [
+                f'`{r["project_id"]}`', f'`{r["topic"]}`',
+                _num(r.get('records_before')), _num(r.get('records_after')),
+            ]
+            for r in regrowth.get('grown_topics') or []
+        ],
+        None,
+        aligns=['---', '---', '---:', '---:'],
+        cut=False,
+    )
+    lines += _render_named_rows(
+        'Newly registered targets',
+        ['project', 'topic', 'records', 'canonical'],
+        [
+            [
+                f'`{r["project_id"]}`', f'`{r["topic"]}`',
+                _num(r.get('records')), _num(r.get('canonical')),
+            ]
+            for r in regrowth.get('new_topics') or []
+        ],
+        None,
+        aligns=['---', '---', '---:', '---:'],
+        cut=False,
+    )
     return lines
 
 
