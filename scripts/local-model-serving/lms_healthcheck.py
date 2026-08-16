@@ -951,7 +951,26 @@ def probe_arm(arm: ArmEntry, *, warmup: bool = False) -> ProbeResult:
 #: the two readings; up to v4 nothing recorded whether that held, so a slate run
 #: with ollama resident (measured 2026-08-06: 10314 MiB on keep_alive) produced
 #: an artifact indistinguishable from a clean one.
-REPORT_SCHEMA_VERSION = 5
+#: v6 (2026-09-12, task 3781, renumbered under task 4229): the latency column
+#: split.  Rows gained `first_probe_ms` (the DISCARDED engine-cold warm-up),
+#: the optional `repeat_latencies_ms` spread behind `--repeat N`, and the
+#: `measured_cached_prompt_tokens` diagnostic; the report gained
+#: `latency_caveat`.  Most of all, `latency_ms` CHANGED MEANING: up to v5 it
+#: was the first request after the arm reached ready — engine-cold AND
+#: prefix-cold — and from v6 it is the engine-warm, PREFIX-COLD measured run,
+#: which is the state a production request arrives in.  A consumer holding a
+#: v5-or-older file must REFUSE it rather than reinterpret the same field name
+#: as the same quantity; that refusal is the whole reason this number exists.
+#:
+#: WHY 6 AND NOT 5.  This change was authored as v5 on branch task/3781 while
+#: task 3755 was independently landing its OWN v5 on main — two meanings for
+#: one integer, which git auto-merges with no conflict marker because the
+#: literal is textually identical.  Leo ruled the renumber on 2026-08-25
+#: (esc-4730-1, carried in task 4229): bump to 6 and take ONE live 7-arm slate
+#: run against the merged producer, so the artifact carries 3755's consumer
+#: inventory and 3781's cold/warm split together rather than paying for two
+#: exclusive-GPU runs.
+REPORT_SCHEMA_VERSION = 6
 
 #: Appended to a POLLUTED block's reason.  The observation alone is not enough:
 #: `arm_footprint_mib` is the headline number of this very block, and a reader
@@ -979,6 +998,22 @@ POLLUTED_BANNER_BODY = (
 #: The delivered-check literal for task 3713.  Spelled once, here, and carried
 #: into the JSON artifact as a field.
 PRD_MARKER = 'PRD-MARKER:local-memory-models-eval serving'
+
+#: What these latencies are NOT.  Spelled ONCE and carried into the artifact,
+#: the rendered table and the README, so those three cannot drift into three
+#: different caveats.
+#:
+#: This sentence is the load-bearing half of task 3781: a corrected number
+#: without it re-creates exactly the false comparability the correction was for
+#: — seven single samples in one column read as a ranking whether or not they
+#: are one.
+LATENCY_CAVEAT = (
+    'Latency here is a SINGLE-SAMPLE health-probe measurement taken with the '
+    'engine warm and the prefix cache COLD (one discarded warm-up on a '
+    'different prompt precedes it). It is NOT the p95-under-load envelope '
+    'metric (task 3719 zeta; PRD episode-latency-p50/p95 under concurrent '
+    'load), and it must not be used to rank arms against one another.'
+)
 
 EXIT_OK = 0
 #: At least one arm answered wrongly, or not at all.
@@ -1181,6 +1216,11 @@ class HealthReport(BaseModel):
     #: comments.  `test_lms_marker_contract.py` enumerates committed files; this
     #: is how the artifact satisfies the same grep the source files do.
     prd_marker: str = PRD_MARKER
+    #: What the latency columns are NOT — a real FIELD for the very same reason
+    #: `prd_marker` is one: JSON carries no comments, and the consumers that
+    #: would be misled by these numbers (eta 3720, theta 3721) read this
+    #: artifact, not the README the caveat would otherwise live in alone.
+    latency_caveat: str = LATENCY_CAVEAT
 
 
 def _now_iso() -> str:
@@ -1573,6 +1613,10 @@ def merge_reports(
             'pollution_reason': merged_reason,
         }),
         overall='PASS' if everything_passed else 'FAIL',
+        # Carried from the BINDING input rather than re-defaulted, for the same
+        # reason the vram block is: a merged artifact must not state a caveat
+        # that no input it was assembled from ever made.
+        latency_caveat=binding.latency_caveat,
     )
 
 
@@ -1654,7 +1698,12 @@ def render_table(report: HealthReport) -> str:
     the block's own `pollution` field, never re-derived from the consumer lists
     printed beside it, so the two cannot drift apart.
     """
-    headers = ('ARM', 'AXIS', 'STACK', 'ENDPOINT', 'VERDICT', 'REASON', 'MS')
+    # COLD-MS and MS are separate columns on purpose.  An operator reading ONE
+    # millisecond column re-creates in the terminal exactly the false
+    # comparability the artifact was just corrected to avoid.
+    headers = (
+        'ARM', 'AXIS', 'STACK', 'ENDPOINT', 'VERDICT', 'REASON', 'COLD-MS', 'MS',
+    )
     rows = [
         (
             row.arm_id,
@@ -1663,6 +1712,7 @@ def render_table(report: HealthReport) -> str:
             row.endpoint,
             row.verdict,
             str(row.reason),
+            f'{row.first_probe_ms:.0f}',
             _ms_cell(row),
         )
         for row in report.arms
@@ -1711,7 +1761,17 @@ def render_table(report: HealthReport) -> str:
     if report.vram.consumer_inventory_note:
         out.extend(_wrapped(report.vram.consumer_inventory_note))
 
-    out.extend(['', f'OVERALL: {report.overall}'])
+    out.extend(
+        [
+            '',
+            # One line, never wrapped: the table's readers are the ones most
+            # likely to line these numbers up against each other.
+            f'COLD-MS is the DISCARDED warm-up, MS the measured run. '
+            f'{LATENCY_CAVEAT}',
+            '',
+            f'OVERALL: {report.overall}',
+        ]
+    )
     for row in report.arms:
         if row.verdict == 'FAIL':
             out.append(f'  {row.arm_id}: {row.reason} — {row.detail}')

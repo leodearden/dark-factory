@@ -305,7 +305,9 @@ def test_the_warmup_text_diverges_at_the_first_user_token():
     measured = _user_content(lms_healthcheck.build_llm_probe_request(_arm()))
 
     shared = 0
-    for warm_char, measured_char in zip(warm, measured):
+    # strict=False deliberately: the two passages are different lengths, and
+    # the shorter one running out IS the end of any shared prefix.
+    for warm_char, measured_char in zip(warm, measured, strict=False):
         if warm_char != measured_char:
             break
         shared += 1
