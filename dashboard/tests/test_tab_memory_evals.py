@@ -831,6 +831,19 @@ _PRESENCE_CONTRACTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         ('window.DF_MEMORY_EVALS = { MemoryEvalsSection };',),
     ),
     (
+        # Same statement, captured, for the test that parses the exported NAMES
+        # rather than checking the statement exists.  That one was the worst of
+        # the false passes found here and the only one that was not merely
+        # latent: `re.search` over the raw body returned the HEADER COMMENT's
+        # copy of the statement (jsx:33, ~560 lines ahead of the real one), so
+        # the assertion parsed a sentence and never saw the export at all.
+        # Measured: re-exporting `verdictBadge` — the exact drift its own
+        # message says it prevents — passed. Line-anchored, it fails.
+        'window.DF_MEMORY_EVALS exported names',
+        r'^window\.DF_MEMORY_EVALS\s*=\s*\{([^}]*)\}',
+        ('window.DF_MEMORY_EVALS = { MemoryEvalsSection };',),
+    ),
+    (
         # Anchored to the payload READ, not the bare name. A plain
         # comment-strip is NOT enough here: `window.DF_MEMORY_EVALS_FMT` and
         # the export statement both survive it, so deleting the actual
@@ -1928,7 +1941,7 @@ def test_unknown_verdict_is_visibly_unrenderable(
 
 
 def test_verdict_badges_driven_by_persisted_verdict(
-    tab_memory_evals_jsx_body: str,
+    tab_memory_evals_jsx_code: str,
     memory_evals_fmt_js_code: str,
 ) -> None:
     """Badges must name every persisted verdict and every server-derived
@@ -1939,10 +1952,13 @@ def test_verdict_badges_driven_by_persisted_verdict(
     `memory_evals._verdict_class()`, which buckets an absent value to
     `unjudged` rather than to a verdict, and the UI must not undo it.
     """
-    body = tab_memory_evals_jsx_body
-    code = memory_evals_fmt_js_code
+    code = tab_memory_evals_jsx_code
+    fmt_code = memory_evals_fmt_js_code
 
-    export_m = re.search(r'window\.DF_MEMORY_EVALS\s*=\s*\{([^}]*)\}', body)
+    export_m = re.search(
+        _presence_pattern('window.DF_MEMORY_EVALS exported names', code), code,
+        re.MULTILINE,
+    )
     assert export_m, 'tab_memory_evals.jsx sets no window.DF_MEMORY_EVALS export.'
     exported = {n.strip() for n in export_m.group(1).split(',') if n.strip()}
     assert exported == {'MemoryEvalsSection'}, (
@@ -1966,7 +1982,7 @@ def test_verdict_badges_driven_by_persisted_verdict(
     # appears in the prose above verdictBadge, so a whole-file grep would stay
     # green after the branch itself was deleted.
     for parity in sorted(PARITY_STATES):
-        assert f"'{parity}'" in code, (
+        assert f"'{parity}'" in fmt_code, (
             f'memory_evals_fmt.js must name the server-derived parity state '
             f"'{parity}' in CODE, as a quoted string literal — the comment "
             'block above verdictBadge names all of them, so a whole-file grep '
@@ -1979,7 +1995,7 @@ def test_verdict_badges_driven_by_persisted_verdict(
 
     # Existing .badge vocabulary — no new CSS needed for four verdict states.
     for cls in ('badge bad', 'badge ok', 'badge warn', 'badge info', 'badge muted'):
-        assert cls in code, (
+        assert cls in fmt_code, (
             f"memory_evals_fmt.js must use the existing '{cls}' class "
             '(styles.css:239-261) rather than inventing badge styling. The '
             'badge tables moved there with verdictBadge (task 3481); the .jsx '
@@ -1987,7 +2003,7 @@ def test_verdict_badges_driven_by_persisted_verdict(
         )
 
     # A null/absent verdict renders its own state, not a defaulted one.
-    badge_body = _extract_function_body(code, 'verdictBadge')
+    badge_body = _extract_function_body(fmt_code, 'verdictBadge')
     assert badge_body, 'could not extract the verdictBadge body.'
     # (i) THE PARITY SHORT-CIRCUIT — that no parity branch may discard the
     #     verdict-derived label — now lives in
