@@ -990,7 +990,7 @@ class TestRunApplyStoreMutationPreflight:
         ]
 
     def _args(
-        self, apply=True, project_id='dark_factory', keep_recent=2,
+        self, apply=True, project_id: str | None = 'dark_factory', keep_recent=2,
         limit_per_project=1000, yes_i_am_sure=False, scan_limit=10000,
     ) -> argparse.Namespace:
         return argparse.Namespace(
