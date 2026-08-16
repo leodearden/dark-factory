@@ -66,6 +66,7 @@ UnsafeMigrationKeyError = _mod.UnsafeMigrationKeyError
 write_backup = _mod.write_backup
 default_backup_path = _mod.default_backup_path
 DEFAULT_BACKUP_DIR = _mod.DEFAULT_BACKUP_DIR
+recovery_pointer = _mod.recovery_pointer
 _verify_read_back = _mod._verify_read_back
 
 
@@ -853,3 +854,126 @@ async def test_main_async_refuses_the_write_when_the_backup_path_is_already_take
     assert str(occupied) in err
     assert 'Refusing to write without a recoverable snapshot' in err
     assert occupied.read_text() == sentinel, 'the occupying file is left byte-identical'
+
+
+# --- case 13: every post-write exit points at the backup --------------------
+#
+# Once `update_task` has committed, this process's memory is no longer the only
+# copy of the original row — the snapshot on disk is — but the operator only
+# learns WHERE that snapshot is if the read-back ran and reported drift. If the
+# read-back itself raises (`_fetch_task` on an unexpected payload,
+# `_coerce_metadata` on a non-dict blob), the exception unwinds out of
+# `main_async` as a bare stack trace at precisely the moment the recovery
+# instruction matters most: the write has landed and is UNVERIFIED.
+
+
+def _apply_args(backup_path, keys: str = 'origin_escalation'):
+    """`--apply` against task 3083 with an explicit, per-test backup path."""
+    return build_parser().parse_args([
+        '--task-id', '3083', '--keys', keys, '--apply', '--backup-path', str(backup_path),
+    ])
+
+
+def _drop_a_sibling_key(row: dict) -> dict:
+    """A read-back row that lost an untouched sibling — `_verify_read_back`'s
+    existing `(c) key-set drift` problem, i.e. the post-write exit that ALREADY
+    prints the pointer."""
+    return {**row, 'metadata': {k: v for k, v in row['metadata'].items() if k != 'source'}}
+
+
+@pytest.mark.asyncio
+async def test_read_back_fetch_failure_still_prints_the_recovery_pointer(
+    monkeypatch, tmp_path, capsys,
+):
+    """The write committed; the verification fetch then failed.
+
+    An unverified committed write is exactly the situation the snapshot exists
+    for, so this exit must name it — not hand back a traceback and a non-zero
+    exit for the operator to interpret.
+    """
+    client = _install_fake_client(monkeypatch, _FakeClient())
+    client.get_task_script = [None, {'unexpected': 'shape'}]
+    backup = tmp_path / 'fetch-failure.json'
+
+    assert await _mod.main_async(_apply_args(backup)) == 1
+
+    err = capsys.readouterr().err
+    assert str(backup) in err
+    assert 'recover from there' in err
+    assert backup.exists(), 'the pointer must not name a file that was never written'
+
+
+@pytest.mark.asyncio
+async def test_read_back_verification_exception_still_prints_the_recovery_pointer(
+    monkeypatch, tmp_path, capsys,
+):
+    """The fetch succeeded and the VERIFICATION raised.
+
+    Proves the guard wraps the whole post-write read-back block rather than
+    just the fetch: `_coerce_metadata`, inside `_verify_read_back`, raises on a
+    stored blob that is not a dict, which is a real shape a damaged row can
+    have.
+    """
+    _install_fake_client(monkeypatch, _FakeClient())
+
+    def _boom(**kwargs):
+        raise RuntimeError('boom')
+
+    monkeypatch.setattr(_mod, '_verify_read_back', _boom)
+    backup = tmp_path / 'verify-exception.json'
+
+    assert await _mod.main_async(_apply_args(backup)) == 1
+
+    err = capsys.readouterr().err
+    assert str(backup) in err
+    assert 'recover from there' in err
+    assert backup.exists()
+
+
+@pytest.mark.asyncio
+async def test_recovery_pointer_is_identical_on_the_drift_exit_and_the_exception_exit(
+    monkeypatch, tmp_path, capsys,
+):
+    """One sentence, two exits, no drift.
+
+    The defect is precisely that one post-write exit knows about the snapshot
+    and the other does not. Two hand-written copies of the instruction would
+    restore that asymmetry the moment either is edited, so this pins the
+    rendered sentence VERBATIM on both exits rather than substring-matching a
+    fragment in each.
+    """
+    drift_client = _install_fake_client(monkeypatch, _FakeClient())
+    drift_client.get_task_script = [None, _drop_a_sibling_key]
+    drift_backup = tmp_path / 'drift.json'
+    assert await _mod.main_async(_apply_args(drift_backup)) == 1
+    drift_err = capsys.readouterr().err
+    assert 'key-set drift' in drift_err, 'this must be the EXISTING reported-drift exit'
+
+    crash_client = _install_fake_client(monkeypatch, _FakeClient())
+    crash_client.get_task_script = [None, {'unexpected': 'shape'}]
+    crash_backup = tmp_path / 'crash.json'
+    assert await _mod.main_async(_apply_args(crash_backup)) == 1
+    crash_err = capsys.readouterr().err
+
+    assert recovery_pointer(drift_backup) in drift_err
+    assert recovery_pointer(crash_backup) in crash_err
+
+
+@pytest.mark.asyncio
+async def test_read_back_exception_still_surfaces_the_underlying_cause(
+    monkeypatch, tmp_path, capsys,
+):
+    """Swallowing the exception must not cost the operator the diagnosis.
+
+    The complaint is that a stack trace arrives INSTEAD of the recovery
+    instruction; the fix is both, not a trade.
+    """
+    client = _install_fake_client(monkeypatch, _FakeClient())
+    client.get_task_script = [None, {'unexpected': 'shape'}]
+    backup = tmp_path / 'cause.json'
+
+    assert await _mod.main_async(_apply_args(backup)) == 1
+
+    err = capsys.readouterr().err
+    assert 'get_task returned an unexpected payload' in err
+    assert recovery_pointer(backup) in err
