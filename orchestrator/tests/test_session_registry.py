@@ -548,6 +548,28 @@ def test_record_path_for_slug(tmp_path: Path) -> None:
     assert path == tmp_path / 'sessions' / 'unblock-df-2085-4242' / 'record.json'
 
 
+def test_record_path_for_slug_all_dots_slug_stays_under_sessions_dir(tmp_path: Path) -> None:
+    # Task 4112: the containment property sanitize_slug's all-dots branch buys.
+    # resolve() + is_relative_to, NOT a string prefix check -- str(root/'sessions'
+    # /'..'/'record.json') startswith str(root/'sessions') is TRUE, so a prefix
+    # check would pass for the very path that escapes. resolve() is non-strict
+    # (these paths do not exist) and collapses '..' with the exact filesystem
+    # semantics under defense.
+    sessions = sr.sessions_dir(root=tmp_path).resolve()
+    for raw in ('.', '..', '...'):
+        slug = sr.sanitize_slug(raw)
+        path = sr.record_path_for_slug(slug, root=tmp_path)
+        assert path.resolve().is_relative_to(sessions)
+
+    # NON-VACUITY COUNTERFACTUAL: the UNsanitized token genuinely escapes, i.e.
+    # record_path_for_slug performs NO sanitization of its own (it is a bare
+    # join) -- which is exactly why sanitize_slug has to be the chokepoint.
+    # Without this, the assertions above could pass for the wrong reason if
+    # record_path_for_slug's shape ever changed, and nobody would notice the
+    # test had stopped proving anything.
+    assert not sr.record_path_for_slug('..', root=tmp_path).resolve().is_relative_to(sessions)
+
+
 def test_transcript_path_for_cwd_encodes_slash() -> None:
     assert (
         sr.transcript_path_for_cwd('/home/leo/src/dark-factory')
