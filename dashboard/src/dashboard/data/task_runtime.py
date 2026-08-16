@@ -7,11 +7,19 @@ its own worktrees (loops/attempts/started/lane/phase/lane_state — see
 concurrently and aggregate the results into a ``{project_label:
 TaskRuntimeSnapshot}`` dict.
 
-Clones the ``dashboard.data.merge_halt`` fan-out pattern: per-call
-``asyncio.wait_for`` timeout (the default ``mcp_tool_call`` timeout is 10s —
-too slow for a fast-polling dashboard), ``asyncio.gather``, and per-project
-offline degradation so one unreachable/misbehaving orchestrator never takes
-down the others.
+Clones the ``dashboard.data.merge_halt`` fan-out pattern: ``asyncio.gather``,
+per-project offline degradation so one unreachable/misbehaving orchestrator
+never takes down the others, and the same **two complementary layers** of
+timeout bound (the default ``mcp_tool_call`` timeout is 10s — too slow for a
+fast-polling dashboard):
+
+1. **Per HTTP request** — ``per_call_timeout`` is threaded into
+   ``mcp_tool_call``, which hands it to ``client.post``, bounding
+   connect/read/write *and pool acquisition* on the shared client.
+2. **Per whole operation** — the enclosing ``asyncio.wait_for`` stays,
+   because layer 1 alone cannot cap the call: a *cold* session performs
+   three posts (initialize, notifications/initialized, tools/call), so a
+   per-request bound of T permits roughly 3T overall.
 
 The wire payload is decoded through ``TaskRuntimeSnapshot.model_validate`` —
 the SAME shared model the server projects into (INV-1 contracts-machine-
@@ -43,7 +51,9 @@ async def _probe_one(
 ) -> TaskRuntimeSnapshot:
     try:
         result = await asyncio.wait_for(
-            mcp_tool_call(client, base_url, 'get_task_runtime_state', {}),
+            mcp_tool_call(
+                client, base_url, 'get_task_runtime_state', {}, timeout=timeout,
+            ),
             timeout=timeout,
         )
     except (TimeoutError, httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError, ValueError, OSError) as exc:

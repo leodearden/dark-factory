@@ -134,9 +134,9 @@ class TestDisallowListForAmendAndEpisodeTools:
     shipped with task 3088 in NO disallow list at all — Stage 3 (the read-only
     integrity check) held a live Mem0 silent-rewrite primitive. Its agent_id
     `recon-stage-integrity_check` matches `Mem0UpdateConfig`'s default
-    `content_amend_allowed_agent_prefixes=['recon-stage-']`, and the
-    `mem0_update` block in `config/config.yaml` is fully commented out, so that
-    default applies — Stage 3 both passed the authz gate and held the tool.
+    `content_amend_allowed_agent_prefixes` via its `recon-stage-` entry, and
+    the `mem0_update` block in `config/config.yaml` is fully commented out, so
+    that default applies — Stage 3 both passed the authz gate and held the tool.
     """
 
     # -- PART A: set membership (cheap structural guard) --------------------
@@ -284,22 +284,35 @@ class TestMem0UpdateConfigDefaultAdmitsEveryReconStage:
     """Regression pin for the premise cli_stage_runner.py's DISALLOW_MEMORY_WRITES
     comment depends on (esc-3623-3 / task 3088): Stage 3's agent_id
     'recon-stage-integrity_check' clears Mem0UpdateConfig's default
-    content_amend_allowed_agent_prefixes=['recon-stage-'], so the server-side
-    mem0_update authz gate does NOT turn Stage 3 away from `update_memory` on its
-    own — the CLI-level `--disallowed-tools` denial this task added to
-    DISALLOW_MEMORY_WRITES is the ONLY thing keeping Stage 3 read-only for that
-    tool, not defence-in-depth on top of an independent server-side refusal.
+    content_amend_allowed_agent_prefixes=['recon-stage-', 'curator-'] via its
+    recon-stage- entry, so the server-side mem0_update authz gate does NOT turn
+    Stage 3 away from `update_memory` on its own — the CLI-level
+    `--disallowed-tools` denial this task added to DISALLOW_MEMORY_WRITES is the
+    ONLY thing keeping Stage 3 read-only for that tool, not defence-in-depth on
+    top of an independent server-side refusal.
 
-    If either half of this premise silently changes — the schema default
-    narrows, or config/config.yaml's commented-out `mem0_update:` block is
-    uncommented with a narrower `content_amend_allowed_agent_prefixes` — the
-    cli_stage_runner.py comment's reasoning needs to be re-examined; that is
-    exactly what these three tests exist to catch.
+    If either half of this premise silently changes — the schema default stops
+    admitting recon-stage agent_ids, or config/config.yaml grows an active
+    `mem0_update:` override (ANY override, wider or narrower: production
+    authority silently moving from schema to YAML is itself the event a human
+    should look at) — the cli_stage_runner.py comment's reasoning needs to be
+    re-examined; that is exactly what these three tests exist to catch.
+
+    They fired once, as designed: commit 65b011ed8c (2026-08-11) uncommented
+    the YAML block to grant curator- both arms per esc-3524-1 ruling (b). The
+    re-examination concluded no recon-stage guarantee moved (curator- matches
+    no recon agent_id), and the ruling of 2026-08-12 promoted the grant into
+    the schema default and re-commented the YAML block — which is why the
+    default now carries two entries.
     """
 
-    def test_schema_default_content_amend_prefix_is_recon_stage(self) -> None:
+    def test_schema_default_content_amend_prefixes_are_recon_stage_and_curator(
+        self,
+    ) -> None:
         from fused_memory.config.schema import Mem0UpdateConfig
-        assert Mem0UpdateConfig().content_amend_allowed_agent_prefixes == ['recon-stage-']
+        assert Mem0UpdateConfig().content_amend_allowed_agent_prefixes == [
+            'recon-stage-', 'curator-',
+        ]
 
     def test_shipped_config_yaml_leaves_mem0_update_at_the_schema_default(
         self, monkeypatch: pytest.MonkeyPatch

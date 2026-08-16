@@ -76,6 +76,7 @@ from fused_memory.middleware.task_curator import (
     PreparedCandidate,
     TaskCurator,
     flatten_task_tree,
+    is_combine_eligible_status,
     normalize_title,
 )
 from fused_memory.models.reconciliation import (
@@ -935,6 +936,53 @@ class TaskInterceptor:
             # meanwhile — the same pattern curator_escalator.py's
             # _persist_state uses to offload a blocking write while holding
             # _persist_lock.
+            #
+            # task_metadata (task 3751) comes off the SAME `before` snapshot
+            # as old_status, so the metadata and live_status the gate sees can
+            # never disagree, and no second get_task is issued. The RAW value
+            # is forwarded deliberately: check() owns the coercion (via
+            # _coerce_metadata_dict), so a dict, a JSON-object string, a
+            # malformed blob, or an absent key all degrade to
+            # task_kind=None / pure_gate=False — fail-safe TOWARD live. What
+            # the forwarding enables at gate 2 is live_workflow_detector's
+            # task_kind-scoped rules: rule 2 (blocked + deterministic, task
+            # 2067), rule 3 (blocked + normal + bare, task 2409) and rule 5
+            # (pending + deterministic + pure gate, task 3751). Only rule 5
+            # actually changes gate 2's verdict — rule 3 already fired there
+            # on the previous implicit task_kind=None, and rule 2's extra
+            # coverage is masked because gate 2 reads is_live, which ORs in
+            # the per-task worktree/commit evidence. See check()'s Gate 2
+            # docstring for the full no-widening argument and the tests
+            # pinning it.
+            #
+            # task_snapshot (task 2964) is that SAME `before` dict — not a
+            # second read. old_status, task_metadata and the claimant fields
+            # the corroboration gate needs (`claimant_run_id`/`heartbeat_at`,
+            # the same top-level pair live_task_write_guard.has_live_claimant
+            # (before) consumes further down this method) therefore all come
+            # from one snapshot taken under _write_lock, so they can never
+            # disagree, and no extra get_task is issued. It is passed as a
+            # SEPARATE kwarg from task_metadata because those two claimant
+            # fields live at the task's top level, not inside `metadata` — see
+            # check()'s Gate 2 docstring. The corroboration assembly performs
+            # two more blocking on-disk reads (scheduler_state.json and
+            # orchestrator.lock); they ride the asyncio.to_thread hop that
+            # already exists for gate 2's blocking git I/O rather than needing
+            # a second hop or re-blocking the event loop, which is why the
+            # verdict is computed inside check() rather than here. What it
+            # unlocks is the detector's in-progress corroboration gate (task
+            # 2963): an in-progress task killed by a fleet redeploy, whose
+            # lingering worktree registration and freshly re-acquired
+            # project-wide lock both still assert liveness with no recent
+            # commit, is now downgraded here exactly as the render-time
+            # Live-Workflow Signals section already downgrades it — closing
+            # the task 599/600 Gate-2-vs-renderer divergence (5 consecutive
+            # guard rejections, run dbfa3df8-0d7d-40e6-bc4a-bc30cce38228).
+            #
+            # The other check() call site — update_task's, further down this
+            # module — is deliberately NOT given a task_snapshot: gate 2 fires
+            # only for op == 'set_task_status', so the kwarg would be inert
+            # there and would only buy that path two pointless disk reads.
             if is_recon_stage_write:
                 # is_recon_stage_write already guarantees this (it's defined
                 # as `isinstance(agent_id, str) and ...`); re-asserted here
@@ -951,6 +999,8 @@ class TaskInterceptor:
                     target_status=status,
                     live_status=old_status,
                     snapshot_token=None,
+                    task_metadata=before.get('metadata') if isinstance(before, dict) else None,
+                    task_snapshot=before if isinstance(before, dict) else None,
                 )
                 if verdict.is_rejection:
                     return verdict.to_error_dict()
@@ -2046,11 +2096,23 @@ class TaskInterceptor:
         metadata blob (``metadata_mode='merge'``) — it does not replace that
         blob. See the comment at the write for why (task 3446).
 
-        Before writing, verifies the target's fingerprint and status. A
-        mismatched fingerprint (curator targeted the wrong task) or terminal
-        status (done/cancelled) aborts the write and returns None so the
-        caller degrades to ``create`` instead of silently clobbering an
-        unrelated task.
+        Before writing, verifies the decision found its target and that the
+        target is still combine-ELIGIBLE, IN THAT ORDER. A mismatched
+        fingerprint (curator targeted the wrong task) aborts first, so a
+        misdirected decision can never be recorded as an eligibility refusal
+        against a row it never meant. Eligibility is then the shared
+        ``is_combine_eligible_status`` (task_curator) — the same predicate the
+        curator's selection snapshot uses, so the two cannot drift apart —
+        conjoined with an execution-only check the snapshot cannot make: a
+        target carrying a ``claimant_run_id`` stamp is refused even when its
+        status is pending (task 4035). That conjunct tests only for a present,
+        non-blank stamp; unlike ``shared.task_claimant.has_live_claimant`` it
+        does NOT check heartbeat freshness, so a stale stamp refuses too —
+        conservative by design, since refusing only degrades to ``create``.
+        Every abort returns None so the caller degrades to ``create`` instead
+        of clobbering a task that has moved on since selection. Eligibility
+        refusals are recorded in the combine audit with a ``refused_reason``
+        token so the refusal rate is countable.
 
         A third abort condition joins those two: *candidate_metadata*
         declaring an escalation gate while the live target does not. The
@@ -2091,17 +2153,18 @@ class TaskInterceptor:
             )
             return None
 
-        target_status = str(target.get('status', '') or '')
-        if target_status in {'done', 'cancelled'}:
-            logger.warning(
-                'combine-guard: target %s has terminal status %r — aborting '
-                'combine to avoid silently losing candidate work',
-                decision.target_id,
-                target_status,
-            )
-            return None
-
         target_title = str(target.get('title', '') or '')
+
+        # ── Guard: the decision must be aimed at the task it named ──
+        # Ordered FIRST, ahead of the eligibility check, precisely because the
+        # eligibility refusal is AUDITED. A mismatched fingerprint means the
+        # curator targeted the wrong row, so this row's status/title/
+        # description describe a task that was never the intended target;
+        # auditing it as an eligibility refusal would write an actively
+        # misleading old.* record AND contaminate the refusal-rate metric
+        # with a separate population (mis-targeting, not raced-target).
+        # Refusing here keeps the audited population exactly "decisions that
+        # found their target but arrived too late" (task 4035).
         expected_fp = normalize_title(target_title)
         got_fp = normalize_title(decision.target_fingerprint or '')
         if not got_fp or expected_fp != got_fp:
@@ -2111,6 +2174,72 @@ class TaskInterceptor:
                 decision.target_id,
                 target_title[:80],
                 (decision.target_fingerprint or '')[:80],
+            )
+            return None
+
+        # ── Guard: the target must still be combine-ELIGIBLE right now ──
+        # Shared with the curator's selection snapshot (task_curator's
+        # is_combine_eligible_status) so the two cannot drift apart again —
+        # the hand-copied `status == 'pending'` that used to live here as
+        # `in {'done','cancelled'}` let 20.2% of combines rewrite targets
+        # that had moved on since selection (task 4035).
+        target_status = str(target.get('status', '') or '')
+        # Present-and-non-blank, NOT `is not None`: a blank/whitespace
+        # claimant is this codebase's spelling for "unclaimed"
+        # (shared/task_claimant.py; live_task_write_guard.has_live_claimant),
+        # and .get() keeps it safe on a row with no such key at all.
+        #
+        # Deliberately WEAKER than shared.task_claimant.has_live_claimant:
+        # this checks only that a claimant STAMP is present, not that its
+        # heartbeat is fresh, so a stale stamp left by a hard-crashed run
+        # also refuses. That is the conservative direction (refusing degrades
+        # to create, which loses no work), and reading heartbeat_at against a
+        # configured TTL here would put a liveness policy in the combine path
+        # that the selection snapshot cannot mirror. Do not describe this as
+        # a "live" claimant — it is not that check.
+        target_claimant = target.get('claimant_run_id')
+        target_is_claimed = isinstance(target_claimant, str) and target_claimant.strip() != ''
+
+        if not is_combine_eligible_status(target_status):
+            refused_reason = COMBINE_REFUSED_NOT_PENDING
+            logger.warning(
+                'combine-guard: target %s is not combine-eligible (status=%r) — '
+                'aborting combine to avoid silently losing candidate work',
+                decision.target_id,
+                target_status,
+            )
+        elif target_is_claimed:
+            # Status alone has the same TOCTOU shape one level down: a target
+            # can read 'pending' at the check above and be dispatched a moment
+            # later. The claimant rides along on the dict already re-read
+            # above, so this closes the inner window at no extra I/O.
+            refused_reason = COMBINE_REFUSED_CLAIMED
+            logger.warning(
+                'combine-guard: target %s carries a claimant stamp — aborting '
+                'combine to avoid rewriting a task under an agent that may '
+                'still be running',
+                decision.target_id,
+            )
+        else:
+            refused_reason = None
+
+        if refused_reason is not None:
+            # Audit the refusal so it is COUNTABLE, not merely logged: a
+            # refusal rate cannot be computed from success records alone. The
+            # old.* fields come from the live re-read above — and, thanks to
+            # the fingerprint guard ABOVE, they always describe the task the
+            # curator actually meant to combine into. The new.* fields record
+            # the rewrite that was averted.
+            _append_combine_audit(
+                project_id=project_id,
+                target_id=decision.target_id,
+                old_title=target_title,
+                old_description=str(target.get('description', '') or ''),
+                old_status=target_status,
+                new_title=rt.title,
+                new_description=rt.description,
+                justification=decision.justification,
+                refused_reason=refused_reason,
             )
             return None
 
@@ -2129,8 +2258,15 @@ class TaskInterceptor:
         # Degrading to create files the gate as its own task, which is the
         # right conservative outcome for a duplicate human gate.
         #
-        # Placed before _append_combine_audit so a refusal writes no audit
-        # record, matching the fingerprint and terminal-status guards above.
+        # Placed before the success-path _append_combine_audit so this refusal
+        # writes no audit record, matching the fingerprint guard above. Only
+        # the ELIGIBILITY guard is audited (task 4035): its refusal rate is
+        # the operational signal being measured, whereas a gate-metadata or
+        # fingerprint refusal means the curator targeted the wrong task —
+        # a decision-quality problem the audit's old-vs-new record does not
+        # help diagnose. Guard ORDER is what keeps those populations apart:
+        # fingerprint runs before eligibility, so a mis-targeted decision
+        # exits above and never lands in the audited count.
         if self._is_gate_metadata(candidate_metadata) and not self._is_gate_metadata(
             target.get('metadata')
         ):
@@ -2930,6 +3066,38 @@ class TaskInterceptor:
             'count': len(rows),
             'rows': rows,
         }
+
+    async def get_ticket_row(self, ticket_id: str) -> dict | None:
+        """Return the ticket row for ``ticket_id``, or None if it does not exist.
+
+        A PURE READ: no wait, no mutation, no created_at window. It is the
+        existence authority for ``tkt_`` claims in the completion-claim
+        verification gate (task 3142,
+        :mod:`fused_memory.services.completion_claim_gate`).
+
+        Deliberately NOT :meth:`list_tickets`, which the task text named:
+        list_tickets defaults to a 7-day window and requires a project_root, so
+        it would report a genuine but older ticket as absent (a FALSE
+        unverified verdict) and would force a project-scoping choice.
+        :meth:`TicketStore.get` is a primary-key lookup over the single shared
+        ``tickets.db``, so it is window-free, exact and project-agnostic — and
+        the row it returns NAMES its owning ``project_id``, which is what lets
+        a cross-project claim (esc-3085-1 instance (2): a reify agent claiming
+        a dark_factory ticket) be adjudicated without knowing the writer's
+        project.
+
+        Returns None — never raises — when no ticket store is configured, so
+        the ingestion path can map that onto "unresolvable" and tag the episode
+        instead of failing the write.
+        """
+        if self._ticket_store is None:
+            logger.warning(
+                'get_ticket_row: ticket_store not configured; '
+                'existence of ticket %s is unresolvable',
+                ticket_id,
+            )
+            return None
+        return await self._ticket_store.get(ticket_id)
 
     async def cancel_ticket(self, ticket_id: str) -> dict:
         """Cancel a pending curator ticket by ticket_id.
@@ -5833,6 +6001,16 @@ def _combine_audit_path() -> Path:
     return Path(os.getenv('DARK_FACTORY_DATA_DIR', 'data')) / 'combine_audit.jsonl'
 
 
+# Refusal-reason vocabulary for the combine audit (task 4035). Two stable
+# coarse tokens, deliberately NOT one per status: an operator greps these to
+# compute the refusal rate, while the record's own old.status field supplies
+# the per-status breakdown for free. A token per status would make this
+# vocabulary track the status enum and force a consumer update every time a
+# status is added.
+COMBINE_REFUSED_NOT_PENDING = 'target_not_pending'
+COMBINE_REFUSED_CLAIMED = 'target_claimed'
+
+
 def _append_combine_audit(
     *,
     project_id: str,
@@ -5843,8 +6021,19 @@ def _append_combine_audit(
     new_title: str,
     new_description: str,
     justification: str,
+    refused_reason: str | None = None,
 ) -> None:
-    """Append a one-line JSON record documenting an about-to-happen combine.
+    """Append a one-line JSON record documenting a combine.
+
+    Records both about-to-happen combines (``refused_reason=None``) and
+    REFUSED ones (task 4035) — an operator cannot compute a refusal rate from
+    success records alone. When *refused_reason* is None the emitted record is
+    byte-for-byte the historical shape, so existing records stay parseable and
+    ``rec.get('refused_reason')`` cleanly partitions refusal from success.
+
+    The ``new`` block is populated on a refusal too: it records the title and
+    description that would have overwritten the target, which is precisely the
+    work that was almost lost.
 
     Append-only, best-effort. Failures log WARN but never propagate —
     a flaky audit write should not block task-merge progress.
@@ -5865,6 +6054,8 @@ def _append_combine_audit(
         },
         'justification_truncated': justification[:500],
     }
+    if refused_reason is not None:
+        record['refused_reason'] = refused_reason
     path = _combine_audit_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)

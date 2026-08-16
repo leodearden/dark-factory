@@ -169,6 +169,39 @@ class TestEvalMetricsInvocationErrorField:
         assert 'cap_tainted' in d
         assert d['cap_tainted'] is False
 
+    def test_judged_without_reference_default_is_false(self):
+        """False, not None: an absent marker means "no degradation observed".
+
+        Exactly how ``cap_tainted`` behaves — a result persisted before the
+        field existed reads back as not-degraded rather than as unknown.
+        """
+        assert EvalMetrics().judged_without_reference is False
+
+    def test_to_dict_carries_judged_without_reference_key_defaulting_false(
+        self,
+    ):
+        """The key must SERIALIZE on healthy cells, carrying False.
+
+        Load-bearing cross-consumer contract (task 3628 σ → task 3632):
+        ``scripts/run_fable_trial_v2_campaign.py`` decides per-cell reference
+        validity by KEY PRESENCE — its ``MARKER_KEY not in metrics`` means "not
+        known-good", never False, and the count it consumes from
+        ``report._judged_blind_count`` is None for any config with even one
+        keyless cell. If this key
+        were emitted only when True (a conditional dict update, or filtering
+        falsy fields out of the persisted dict), every HEALTHY cell would be
+        indistinguishable from a pre-σ one and that consumer would report None
+        for every candidate forever.
+
+        Spelled as an ``in`` check FOLLOWED BY an ``is False`` check on
+        purpose: a single ``d['judged_without_reference'] is False`` would pass
+        just as well against a conditional-emit implementation that omits the
+        key precisely in the healthy case.
+        """
+        d = EvalMetrics().to_dict()
+        assert 'judged_without_reference' in d
+        assert d['judged_without_reference'] is False
+
 
 # ---------------------------------------------------------------------------
 # detect_invocation_error — the pure transport-refusal classifier (3118 step-3/4)
@@ -1557,6 +1590,18 @@ def _arch_task() -> dict:
     }
 
 
+def _arch_task_no_reference() -> dict:
+    """``_arch_task()`` minus the ``reference`` key.
+
+    The shape the three back-filled fixtures had before task 3628 — a
+    top-level ``post_task_commit`` with no ``reference`` block — which
+    ``run_architect_eval`` reduces to an EMPTY reference diff.
+    """
+    task = _arch_task()
+    task.pop('reference', None)
+    return task
+
+
 async def _run_architect_eval_hermetic(
     cfg,
     *,
@@ -1566,6 +1611,10 @@ async def _run_architect_eval_hermetic(
     arch_success: bool = True,
     invoke_side_effect=None,
     arch_result=None,
+    orch_prices: dict | None = None,
+    orch_config_side_effect=None,
+    task_override=None,
+    reference_diff: str = '--- a/x\n+++ b/x\n+ landed change\n',
 ):
     """Drive run_architect_eval with every git/worktree/LLM boundary patched.
 
@@ -1579,6 +1628,30 @@ async def _run_architect_eval_hermetic(
     carrying the campaign 429 payload (``api_error_status=429`` +
     "You've hit your session limit · resets 8pm"), which the MagicMock cannot
     express because every attribute access on it returns a truthy Mock.
+
+    ``orch_prices`` seeds the PRICE TABLE on the patched ``build_eval_orch_config``
+    return, which the runner reads to resolve the architect component's cost
+    provenance (Invariant P5). It defaults to an EMPTY dict rather than a bare
+    ``MagicMock`` deliberately: a bare MagicMock's ``.get(model)`` returns a
+    truthy Mock, which would send ``resolve_cost_usd`` down its price-table
+    branch and multiply Mocks into ``cost_usd``. The default ``invoke_agent``
+    return likewise carries REAL integer token/turn counts for EVERY usage leaf
+    the runner reads (input/output, both cache counts, turns) for the same
+    reason — a truthy Mock is one that ``or 0`` cannot rescue, and it would
+    land verbatim in the persisted cell. Both make the harness model reality so
+    a RED here is caused by production behaviour, never by the double.
+
+    ``orch_config_side_effect`` makes the patched ``build_eval_orch_config``
+    RAISE — the harness-crash shape where the eval orch config (and therefore
+    the price table) is never bound at all. It has to live here rather than in
+    a caller-side ``patch``: this helper patches the same name from inside, so
+    an outer patch would be shadowed.
+
+    ``task_override`` replaces the task dict ``load_task`` returns (e.g.
+    ``_arch_task_no_reference()``), and ``reference_diff`` is what the patched
+    ``get_diff_between_commits`` returns — both defaulting to today's hardcoded
+    values so every existing caller keeps byte-identical behavior. Together
+    they drive the ``judged_without_reference`` cases (task 3628).
     """
     from orchestrator.evals import runner
     from orchestrator.evals.judge import PlanQualityVerdict
@@ -1590,6 +1663,8 @@ async def _run_architect_eval_hermetic(
 
     invoke_return = arch_result if arch_result is not None else MagicMock(
         success=arch_success, cost_usd=1.23, duration_ms=4567, output='done',
+        input_tokens=12_000, output_tokens=3_000,
+        cache_read_tokens=48_000, cache_create_tokens=6_000, turns=9,
     )
     mock_invoke = AsyncMock(return_value=invoke_return, side_effect=invoke_side_effect)
 
@@ -1609,18 +1684,25 @@ async def _run_architect_eval_hermetic(
                 AsyncMock(return_value=(Path('/fake/wt'), 'run-abc'))))
         p(patch('orchestrator.evals.snapshots.cleanup_eval_worktree', AsyncMock()))
         p(patch('orchestrator.evals.snapshots.get_diff_between_commits',
-                AsyncMock(return_value='--- a/x\n+++ b/x\n+ landed change\n')))
+                AsyncMock(return_value=reference_diff)))
         p(patch('orchestrator.agents.invoke.invoke_agent', mock_invoke))
         p(patch('orchestrator.artifacts.TaskArtifacts',
                 MagicMock(return_value=artifacts_instance)))
         p(patch('orchestrator.agents.briefing.BriefingAssembler',
                 MagicMock(return_value=briefing_instance)))
         p(patch('orchestrator.evals.runner.build_eval_orch_config',
-                MagicMock(return_value=MagicMock())))
+                MagicMock(
+                    return_value=MagicMock(
+                        prices=orch_prices if orch_prices is not None else {},
+                    ),
+                    side_effect=orch_config_side_effect,
+                )))
         p(patch('orchestrator.evals.judge.judge_plan_quality', mock_judge))
         p(patch('orchestrator.evals.runner.save_result', mock_save))
         p(patch('orchestrator.evals.runner.load_task',
-                MagicMock(return_value=_arch_task())))
+                MagicMock(return_value=(
+                    _arch_task() if task_override is None else task_override
+                ))))
         p(patch('orchestrator.verify.run_verification', mock_verify))
         result = await runner.run_architect_eval(
             Path('/fake/task.json'), cfg, base_config=MagicMock(),
@@ -2087,6 +2169,404 @@ class TestArchitectCellRecordsJudgeSpend:
         assert persisted['cost_usd'] == pytest.approx(1.23 + 0.42)
 
 
+def _token_agent_result(input_tokens, output_tokens, *, cost_usd: float = 1.23):
+    """A REAL ``AgentResult`` carrying explicit token counts.
+
+    Real, not a MagicMock, because the ``int | None`` "provider did not report"
+    shape is exactly what these tests pin — a MagicMock cannot express a
+    genuine ``None`` on an attribute the runner reads.
+    """
+    from shared.cli_invoke import AgentResult
+
+    return AgentResult(
+        success=True,
+        output='done',
+        cost_usd=cost_usd,
+        duration_ms=4567,
+        turns=3,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+    )
+
+
+@pytest.mark.asyncio
+class TestArchitectCellStampsTokenUsageAndProxySignal:
+    """Task 3656 step-1: the architect cell must record the run's TOKEN USAGE
+    and its PROXY signal, not leave all three at their dataclass defaults.
+
+    These are the three inputs :func:`~orchestrator.evals.metrics.resolve_cost_usd`
+    needs to resolve cost provenance per Invariant P5. Without them the
+    price-table path is unreachable on the architect side no matter what the
+    resolver is asked, so they are pinned BEFORE the resolution itself
+    (step-5). Every assertion checks the PERSISTED cell as well as the returned
+    result — the persisted JSON is what ``report.py`` and an operator read.
+    """
+
+    def _cfg(self, **kw):
+        from orchestrator.evals.configs import EvalConfig
+
+        return EvalConfig(
+            'architect-sonnet-high', 'claude', 'sonnet', 'high',
+            role='architect', **kw,
+        )
+
+    async def test_reported_token_counts_are_stamped(self):
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=_well_formed_plan(),
+            arch_result=_token_agent_result(12_000, 3_000),
+        )
+
+        assert result.metrics['input_tokens'] == 12_000
+        assert result.metrics['output_tokens'] == 3_000
+
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['input_tokens'] == 12_000
+        assert persisted['output_tokens'] == 3_000
+
+    async def test_unreported_token_counts_persist_as_zero_not_none(self):
+        """``AgentResult`` declares both ``int | None``; a provider that did not
+        report must persist an honest ``0``, never a ``None`` that would poison
+        the arithmetic in ``resolve_cost_usd`` (and ``json`` a bare null into a
+        field the report layer treats as an int)."""
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=_well_formed_plan(),
+            arch_result=_token_agent_result(None, None),
+        )
+
+        assert result.metrics['input_tokens'] == 0
+        assert result.metrics['output_tokens'] == 0
+        assert result.metrics['input_tokens'] is not None
+        assert result.metrics['output_tokens'] is not None
+
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['input_tokens'] == 0
+        assert persisted['output_tokens'] == 0
+        # Same ``int | None`` contract for the cache counts (this AgentResult
+        # leaves both at their None default).
+        assert persisted['cache_read_tokens'] == 0
+        assert persisted['cache_create_tokens'] == 0
+
+    async def test_cache_tokens_and_turns_are_stamped(self):
+        """The REST of the token profile ``collect_metrics`` stamps.
+
+        These price nothing, but a native Claude run is cache-read dominated:
+        a cell reporting 12k input / 3k output beside a zeroed cache block
+        reads as a far smaller run than it was, so the persisted evidence must
+        be symmetric with the implementer path's (reviewer: completeness).
+        """
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan=_well_formed_plan(),
+        )
+
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['cache_read_tokens'] == 48_000
+        assert persisted['cache_create_tokens'] == 6_000
+        assert persisted['turns_used'] == 9
+        # output_tokens ÷ that leg's own duration — the identical formula
+        # collect_metrics uses, over the same duration workflow_duration_ms
+        # carries.
+        assert persisted['workflow_duration_ms'] == 4567
+        assert persisted['tokens_per_second'] == pytest.approx(
+            round(3_000 / (4567 / 1000), 2),
+        )
+        assert result.metrics['cache_read_tokens'] == 48_000
+
+    async def test_zero_duration_cell_reports_zero_tokens_per_second(self):
+        """A timed-out cell has no duration to divide by — 0.0, not a
+        ZeroDivisionError that would lose the whole cell."""
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=_well_formed_plan(),
+            invoke_side_effect=TimeoutError(),
+        )
+
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['tokens_per_second'] == 0.0
+        assert persisted['turns_used'] == 0
+        assert result.metrics['tokens_per_second'] == 0.0
+
+    async def test_proxied_candidate_is_flagged_local(self):
+        """``ANTHROPIC_BASE_URL`` set == a PROXIED endpoint, the signal Invariant
+        P5 keys on to stop trusting the CLI's own cost figure."""
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(env_overrides={'ANTHROPIC_BASE_URL': 'http://localhost:8000/v1'}),
+            produced_plan=_well_formed_plan(),
+        )
+
+        assert result.metrics['is_local_model'] is True
+        assert mocks['save'].call_args.args[0].metrics['is_local_model'] is True
+
+    async def test_native_candidate_is_not_flagged_local(self):
+        """Today's shape (``architect-opus-max`` / ``architect-fable-max``):
+        native cloud, no proxy, so the CLI cost stays trustworthy."""
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(env_overrides={}),
+            produced_plan=_well_formed_plan(),
+        )
+
+        assert result.metrics['is_local_model'] is False
+        assert mocks['save'].call_args.args[0].metrics['is_local_model'] is False
+
+
+_PROXY_ENV = {'ANTHROPIC_BASE_URL': 'http://localhost:8000/v1'}
+
+
+@pytest.mark.asyncio
+class TestArchitectCellResolvesCostProvenance:
+    """Task 3656 step-5: the architect cell's cost must be RESOLVED through
+    :func:`~orchestrator.evals.metrics.resolve_cost_usd`, not copied from the
+    raw CLI figure with an UNVERIFIED ``cost_source='cli'`` dataclass default.
+
+    Invariant P5: a PROXIED endpoint's CLI cost figure is untrustworthy, so a
+    proxied architect candidate must land on the price table (or the defined,
+    LOUD fallback) rather than keeping the proxy's number. ``collect_metrics``
+    (the implementer path) has resolved through this seam since task 2820;
+    ``run_architect_eval`` bypassed it entirely.
+
+    The plan judge is held to ZERO spend throughout (the harness's default
+    ``PlanQualityVerdict`` carries ``cost_usd=0.0``) so these cases isolate the
+    ARCHITECT component — composing the two-component label is step-7's.
+    """
+
+    def _cfg(self, **kw):
+        from orchestrator.evals.configs import EvalConfig
+
+        kw.setdefault('model', 'sonnet')
+        return EvalConfig(
+            'architect-candidate', 'claude', effort='high', role='architect', **kw,
+        )
+
+    async def test_native_candidate_keeps_the_cli_figure_verbatim(self):
+        """REGRESSION PIN for every architect cell that has already landed.
+
+        ``architect-opus-max`` / ``architect-fable-max`` are native cloud
+        (``env_overrides={}``) and unlisted in the price table, so
+        ``resolve_cost_usd`` takes its ``not is_local_model`` branch and returns
+        ``(cli_cost_usd, 'cli')`` VERBATIM. Both the figure and the label must
+        be byte-identical to today's — the change bites only a PROXIED
+        candidate, and turns today's UNVERIFIED 'cli' into a DERIVED one.
+        """
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(env_overrides={}),
+            produced_plan=_well_formed_plan(),
+            orch_prices={},
+        )
+
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['cost_source'] == 'cli'
+        assert persisted['cost_usd'] == pytest.approx(1.23)
+        assert result.metrics['cost_source'] == 'cli'
+        assert result.metrics['cost_usd'] == pytest.approx(1.23)
+
+    async def test_priced_proxied_candidate_uses_the_price_table(self):
+        """A proxied candidate whose model IS listed must be priced from the
+        table, NOT from the proxy's own (wrong) CLI figure."""
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(model='qwen3-coder', env_overrides=dict(_PROXY_ENV)),
+            produced_plan=_well_formed_plan(),
+            arch_result=_token_agent_result(1_000_000, 500_000, cost_usd=99.0),
+            orch_prices={'qwen3-coder': {'input_per_1m': 0.30, 'output_per_1m': 1.20}},
+        )
+
+        expected = (1_000_000 * 0.30 + 500_000 * 1.20) / 1_000_000
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['cost_source'] == 'price_table'
+        assert persisted['cost_usd'] == pytest.approx(expected)
+        assert persisted['cost_usd'] == pytest.approx(0.90)
+        # Emphatically NOT the raw proxied CLI figure.
+        assert persisted['cost_usd'] != pytest.approx(99.0)
+        assert result.metrics['cost_source'] == 'price_table'
+
+    async def test_unpriced_proxied_candidate_warns_and_uses_defined_fallback(
+        self, caplog,
+    ):
+        """A proxied candidate with NO price entry degrades to the DEFINED
+        ``_FALLBACK_PRICE`` and says so loudly — never a silent raw-CLI
+        number (the loud-over-silent-degradation norm)."""
+        from orchestrator.evals.metrics import _FALLBACK_PRICE
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.evals.metrics'):
+            result, mocks = await _run_architect_eval_hermetic(
+                self._cfg(model='qwen3-coder', env_overrides=dict(_PROXY_ENV)),
+                produced_plan=_well_formed_plan(),
+                arch_result=_token_agent_result(1_000_000, 500_000, cost_usd=99.0),
+                orch_prices={},
+            )
+
+        # Import the constant rather than hardcoding 2.0/8.0, so a future rate
+        # change updates this expectation instead of leaving a stale magic
+        # number (the single-home discipline of task 2459).
+        expected = (
+            1_000_000 * _FALLBACK_PRICE['input_per_1m']
+            + 500_000 * _FALLBACK_PRICE['output_per_1m']
+        ) / 1_000_000
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['cost_source'] == 'unpriced_proxy'
+        assert persisted['cost_usd'] == pytest.approx(expected)
+        assert persisted['cost_usd'] != pytest.approx(99.0)
+        assert result.metrics['cost_source'] == 'unpriced_proxy'
+
+        warnings = [
+            r.message for r in caplog.records
+            if r.levelno >= logging.WARNING
+            and 'No configured price for proxied-endpoint model' in r.message
+        ]
+        assert warnings, (
+            'Expected the LOUD unpriced-proxy WARNING from '
+            'orchestrator.evals.metrics; got '
+            f'{[r.message for r in caplog.records]}'
+        )
+
+    async def test_orch_config_never_built_still_lands_a_cell(self):
+        """The price table lives on the eval orch config, which is built INSIDE
+        the try — so a harness crash before it is bound must leave an explicit
+        ``None`` the resolver tolerates, never an ``UnboundLocalError`` /
+        ``AttributeError`` that loses the whole cell.
+
+        That path never invoked the architect (0 tokens, $0.00), so no price
+        table could have changed the number anyway.
+        """
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(env_overrides={}),
+            produced_plan=_well_formed_plan(),
+            orch_config_side_effect=RuntimeError('config build exploded'),
+        )
+
+        persisted = mocks['save'].call_args.args[0].metrics
+        # The cell LANDED — marked and excluded, not lost.
+        assert persisted['cap_tainted'] is True
+        assert 'harness_error' in (persisted['invocation_error'] or '')
+        assert persisted['cost_usd'] == pytest.approx(0.0)
+        # A concrete label, not merely "some member of the vocabulary": nothing
+        # was spent, so the resolution is skipped and the documented 'cli'
+        # default stands (reviewer: an `in {the whole vocabulary}` check cannot
+        # fail, so it pinned nothing).
+        assert persisted['cost_source'] == 'cli'
+        assert result.metrics['cap_tainted'] is True
+
+    async def test_zero_spend_proxied_cell_does_not_warn_about_pricing(
+        self, caplog,
+    ):
+        """A cell that spent NOTHING has no provenance to resolve.
+
+        The timeout / harness-error / pre-invoke-cap paths never bind
+        ``result``, so they reach the resolution with 0 tokens and $0.00.
+        Resolving anyway would fire the LOUD unpriced-proxy WARNING for spend
+        that never happened on EVERY timed-out proxied cell — training
+        operators to ignore the warning that matters — and would label a $0.00
+        figure 'unpriced_proxy' as though the degradation were real. The
+        loud-over-silent norm is about REAL degradation (reviewer: log-noise).
+        """
+        with caplog.at_level(logging.WARNING, logger='orchestrator.evals.metrics'):
+            result, mocks = await _run_architect_eval_hermetic(
+                self._cfg(model='qwen3-coder', env_overrides=dict(_PROXY_ENV)),
+                produced_plan=_well_formed_plan(),
+                invoke_side_effect=TimeoutError(),
+                orch_prices={},
+            )
+
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['cost_usd'] == pytest.approx(0.0)
+        assert persisted['input_tokens'] == 0
+        assert persisted['output_tokens'] == 0
+        assert persisted['cost_source'] == 'cli'
+        assert result.metrics['cost_source'] == 'cli'
+        assert not [
+            r for r in caplog.records
+            if 'No configured price for proxied-endpoint model' in r.message
+        ], (
+            'A $0.00 / 0-token cell must not emit the unpriced-proxy '
+            f'degradation WARNING; got {[r.message for r in caplog.records]}'
+        )
+
+
+@pytest.mark.asyncio
+class TestArchitectCellCostSourceIsComposed:
+    """Task 3656 step-7: the cell's ``cost_usd`` is a TWO-COMPONENT sum
+    (architect spend + plan-judge spend), so its single ``cost_source`` must
+    not silently describe two differently-sourced components.
+
+    Only the ARCHITECT component is resolved. The plan judge is always a
+    native-cloud opus call — ``judge_plan_quality`` takes neither the
+    candidate's model nor its ``env_overrides`` — so its CLI figure is
+    trustworthy by construction, and re-resolving it against the candidate's
+    price table would price opus tokens at a vLLM rate. The label therefore
+    COMPOSES (``metrics.compose_cost_source``): agreement → that source,
+    disagreement with judge dollars actually in the sum → ``'mixed'``.
+    """
+
+    def _cfg(self, **kw):
+        from orchestrator.evals.configs import EvalConfig
+
+        kw.setdefault('model', 'sonnet')
+        return EvalConfig(
+            'architect-candidate', 'claude', effort='high', role='architect', **kw,
+        )
+
+    def _spending_judge(self):
+        from orchestrator.evals.judge import PlanQualityVerdict
+
+        return PlanQualityVerdict(
+            plan_quality=0.77, per_criterion={}, reasoning='good', cost_usd=0.42,
+        )
+
+    async def test_price_table_architect_plus_cli_judge_reads_mixed(self):
+        """A price-table architect component beside a CLI judge component: the
+        figure is the RESOLVED architect cost plus the judge's CLI cost, and the
+        label says the two disagree rather than claiming either one."""
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(model='qwen3-coder', env_overrides=dict(_PROXY_ENV)),
+            produced_plan=_well_formed_plan(),
+            judge_return=self._spending_judge(),
+            arch_result=_token_agent_result(1_000_000, 500_000, cost_usd=99.0),
+            orch_prices={'qwen3-coder': {'input_per_1m': 0.30, 'output_per_1m': 1.20}},
+        )
+
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['cost_usd'] == pytest.approx(0.90 + 0.42)
+        assert persisted['judge_cost_usd'] == pytest.approx(0.42)
+        assert persisted['cost_source'] == 'mixed'
+        assert result.metrics['cost_source'] == 'mixed'
+
+    async def test_todays_native_shape_with_a_spending_judge_stays_cli(self):
+        """REGRESSION PIN: both components are CLI-sourced, so a spending judge
+        must NOT tip today's architect cells into 'mixed'. Keeps every landed
+        result and ``TestArchitectCellRecordsJudgeSpend`` byte-identical."""
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(env_overrides={}),
+            produced_plan=_well_formed_plan(),
+            judge_return=self._spending_judge(),
+            orch_prices={},
+        )
+
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['cost_source'] == 'cli'
+        assert persisted['cost_usd'] == pytest.approx(1.23 + 0.42)
+        assert result.metrics['cost_source'] == 'cli'
+
+    async def test_judge_skipped_labels_the_architect_component_alone(self):
+        """An unscorable plan SKIPS the judge (``_create_plan_stub`` is the
+        header-only artifact ``create_plan`` writes), so no judge dollars enter
+        the sum and the label describes the architect component alone — NOT
+        'mixed', which would announce a blend that never happened."""
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(model='qwen3-coder', env_overrides=dict(_PROXY_ENV)),
+            produced_plan=_create_plan_stub(),
+            judge_return=self._spending_judge(),
+            arch_result=_token_agent_result(1_000_000, 500_000, cost_usd=99.0),
+            orch_prices={'qwen3-coder': {'input_per_1m': 0.30, 'output_per_1m': 1.20}},
+        )
+
+        mocks['judge'].assert_not_called()
+        persisted = mocks['save'].call_args.args[0].metrics
+        assert persisted['judge_cost_usd'] == pytest.approx(0.0)
+        assert persisted['cost_source'] == 'price_table'
+        assert persisted['cost_usd'] == pytest.approx(0.90)
+        assert result.metrics['cost_source'] == 'price_table'
+
+
 @pytest.mark.asyncio
 class TestArchitectRunnerJudgeCostReadIsDefensive:
     """Step-7: the runner's read of ``verdict.cost_usd`` must not fabricate
@@ -2375,6 +2855,215 @@ class TestSteplessPlanIsNeverJudged:
 
 
 # ---------------------------------------------------------------------------
+# judged_without_reference — the validity marker (eval-revival σ, task 3628)
+#
+# True on EXACTLY the cells whose persisted plan_quality is the LLM judge's own
+# number produced from an EMPTY reference_diff. The three negative twins below
+# define the predicate as much as the positive does: a cap-tainted cell has no
+# plan_quality to bound, and both floor paths score via score_plan_structure,
+# which never consults a reference. Keying on `not reference_diff` at the
+# materialization site alone would fire on ~every no-plan cell in a hard
+# campaign — precisely the population the consumer must see PAST — so the
+# negatives are what lock the semantics against that over-broad implementation.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestJudgedWithoutReference:
+    def _cfg(self):
+        from orchestrator.evals.configs import EvalConfig
+
+        return EvalConfig(
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+        )
+
+    async def test_judged_blind_cell_is_marked_and_still_scored(self):
+        """POSITIVE: the judge ran without ground truth — mark it, keep it.
+
+        The cell is NOT excluded: plan_quality is still the judge's float and
+        the cell stays in every pool at that score. The marker bounds VALIDITY,
+        not membership.
+        """
+        _, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=_well_formed_plan(),
+            task_override=_arch_task_no_reference(),
+            reference_diff='',
+        )
+        # Assert on the dict handed to save_result — that dict is what both the
+        # report layer and the downstream campaign driver actually read.
+        persisted = mocks['save'].call_args.args[0].metrics
+
+        assert persisted['judged_without_reference'] is True
+        assert persisted['plan_quality'] == 0.77
+        assert persisted['cap_tainted'] is False
+
+    async def test_healthy_cell_carries_the_key_as_false(self):
+        """NEGATIVE (healthy) — and the key must be PRESENT, not omitted.
+
+        The presence assertion is the cross-consumer contract:
+        ``scripts/run_fable_trial_v2_campaign.py`` (task 3632) reads per-cell
+        reference validity by KEY PRESENCE, so a healthy cell must carry the
+        key with False rather than omit it. Omitting it would make every
+        healthy cell read as "never measured" downstream — forever, and
+        silently. This is the assertion that catches a conditional-emit
+        implementation, which every other case in this class would pass.
+        """
+        _, mocks = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan=_well_formed_plan(),
+        )
+        persisted = mocks['save'].call_args.args[0].metrics
+
+        assert 'judged_without_reference' in persisted
+        assert persisted['judged_without_reference'] is False
+
+    async def test_cap_tainted_cell_is_not_marked(self):
+        """NEGATIVE (cap-tainted): nothing was scored, so nothing to bound.
+
+        The judge is skipped entirely, plan_quality is None, and the cell is
+        already counted — disjointly — by cap_excluded. Marking it too would
+        double-count one cell across two counts that must stay disjoint.
+        """
+        _, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan={},
+            arch_result=_cap_agent_result(),
+            task_override=_arch_task_no_reference(),
+            reference_diff='',
+        )
+        persisted = mocks['save'].call_args.args[0].metrics
+
+        assert persisted['plan_quality'] is None
+        assert persisted['cap_tainted'] is True
+        assert persisted['judged_without_reference'] is False
+
+    @pytest.mark.parametrize('plan', _STEPLESS_PLANS)
+    async def test_structural_floor_cell_is_not_marked(self, plan):
+        """NEGATIVE (structural floor): the floor never consults a reference.
+
+        ``score_plan_structure`` derives its number from the plan alone, so the
+        score is valid ground-truth-independently — there is no validity to
+        bound. The judge-not-called assertion ties the marker to the judge path
+        rather than to the emptiness of reference_diff.
+
+        Parametrized over ``_STEPLESS_PLANS``, not the wider
+        ``_UNSCORABLE_PLAN_SHAPES``: this is a RUNNER-level test, and
+        ``run_architect_eval`` does ``plan = artifacts.read_plan() or {}``, so
+        it can only ever be handed a dict (see the note above
+        ``TestSteplessPlanIsNeverJudged``, which scopes itself the same way).
+        """
+        _, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=plan,
+            task_override=_arch_task_no_reference(),
+            reference_diff='',
+        )
+        persisted = mocks['save'].call_args.args[0].metrics
+
+        assert persisted['judged_without_reference'] is False
+        mocks['judge'].assert_not_called()
+
+    async def test_judge_degraded_to_floor_is_not_marked(self):
+        """NEGATIVE (judge failed → floor): the PERSISTED number is the floor.
+
+        The judge WAS asked without a reference, but its answer was discarded,
+        so the score that landed is again reference-independent. The marker
+        asserts something about the persisted score, not about what was asked.
+        """
+        from orchestrator.evals.judge import score_plan_structure
+
+        plan = _well_formed_plan()
+        _, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=plan,
+            judge_side_effect=RuntimeError('judge exploded'),
+            task_override=_arch_task_no_reference(),
+            reference_diff='',
+        )
+        persisted = mocks['save'].call_args.args[0].metrics
+
+        assert persisted['plan_quality'] == score_plan_structure(plan)
+        assert persisted['judged_without_reference'] is False
+
+    async def test_missing_reference_is_logged_loudly(self, caplog):
+        """The INV-2 log half beside the structured half.
+
+        A fixture with no reference block must be loud at RUN time — the whole
+        point of σ is that the v1 degradation was findable only by archaeology.
+        """
+        with caplog.at_level(logging.WARNING):
+            await _run_architect_eval_hermetic(
+                self._cfg(),
+                produced_plan=_well_formed_plan(),
+                task_override=_arch_task_no_reference(),
+                reference_diff='',
+            )
+
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        ]
+        assert any(
+            'df_task_2605' in m and 'reference' in m.lower() for m in warnings
+        ), f'no warning naming the task and the missing reference: {warnings}'
+
+    async def test_missing_reference_warning_states_only_a_fixture_fact(
+        self, caplog,
+    ):
+        """The step-6 line must not claim anything about a judge score.
+
+        It fires BEFORE the architect's outcome is known, so on a cap-tainted
+        cell — which skips the judge entirely — a claim that "any plan judge
+        score will be plausibility-based" is simply false (reviewer:
+        robustness). The claim belongs to the step-7 warning, which fires
+        exactly where the judge is invoked blind, and which must not appear on
+        this path at all.
+        """
+        with caplog.at_level(logging.WARNING):
+            await _run_architect_eval_hermetic(
+                self._cfg(),
+                produced_plan={},
+                arch_result=_cap_agent_result(),
+                task_override=_arch_task_no_reference(),
+                reference_diff='',
+            )
+
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        ]
+        fixture_lines = [m for m in warnings if 'reference.post_task_commit' in m]
+        assert len(fixture_lines) == 1, warnings
+        # The judge never ran here, so NOTHING may assert how its score was
+        # produced — neither the removed 'PLAUSIBILITY' overclaim nor the
+        # step-7 line.
+        assert 'plausibility' not in fixture_lines[0].lower()
+        assert not any('EMPTY reference diff' in m for m in warnings), warnings
+
+    async def test_blind_judge_claim_is_made_once_by_step_7(self, caplog):
+        """On the ONE path where the claim is true, it is stated ONCE.
+
+        The pair of warnings must not double-report: the fixture-level line
+        names the authoring defect, the step-7 line names the consequence for
+        the score, and neither repeats the other.
+        """
+        with caplog.at_level(logging.WARNING):
+            await _run_architect_eval_hermetic(
+                self._cfg(),
+                produced_plan=_well_formed_plan(),
+                task_override=_arch_task_no_reference(),
+                reference_diff='',
+            )
+
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        ]
+        fixture_lines = [m for m in warnings if 'reference.post_task_commit' in m]
+        judge_lines = [m for m in warnings if 'EMPTY reference diff' in m]
+
+        assert len(fixture_lines) == 1, warnings
+        assert len(judge_lines) == 1, warnings
+        assert 'EMPTY reference diff' not in fixture_lines[0]
+
+
+# ---------------------------------------------------------------------------
 # plan_quality report column — additive interim surface (step-11/12)
 #
 # A distinct per-(task_id, config_name, role_under_test) column μ/λ consume in
@@ -2390,6 +3079,7 @@ def _architect_result(
     config_name: str = 'architect-sonnet-high',
     plan_quality: float = 0.75,
     plan_steps: int = 6,
+    judged_without_reference: bool | None = False,
 ):
     """An architect cell that DID produce a plan.
 
@@ -2397,19 +3087,31 @@ def _architect_result(
     over the steps a plan actually carried, and ``plan_steps > 0`` is the
     predicate the report layer reads to know one exists. A stepless cell is the
     distinct no-plan shape, requested explicitly by the tests that exercise it.
+
+    ``judged_without_reference`` (task 3628) mints a cell whose score came from
+    a judge handed an EMPTY reference diff. THREE-VALUED on purpose, because
+    the report layer is: ``True``/``False`` both WRITE the key — the production
+    shape, since ``EvalMetrics.to_dict`` emits it on every cell — while
+    ``None`` OMITS it, minting the pre-σ legacy shape whose validity was never
+    measured. The default is an explicit ``False``: a healthy modern cell, not
+    a legacy one.
     """
     from orchestrator.evals.runner import EvalResult
+
+    metrics = {
+        'role_under_test': 'architect',
+        'plan_quality': plan_quality,
+        'plan_steps': plan_steps,
+        'composite_score': 0.0,
+    }
+    if judged_without_reference is not None:
+        metrics['judged_without_reference'] = judged_without_reference
 
     return EvalResult(
         task_id=task_id,
         config_name=config_name,
         outcome='done',
-        metrics={
-            'role_under_test': 'architect',
-            'plan_quality': plan_quality,
-            'plan_steps': plan_steps,
-            'composite_score': 0.0,
-        },
+        metrics=metrics,
         worktree_path='/tmp/wt-arch',
     )
 
@@ -2581,6 +3283,202 @@ class TestPlanQualityReport:
             _cap_tainted_result(task_id='t3', config_name='b'),
         ])
         assert report['cap_excluded'] == 2
+
+    # -- judged_without_reference (task 3628) --------------------------------
+    #
+    # The θ-surface twin of cap_excluded, with one decisive difference: it
+    # BOUNDS validity rather than excluding. The flagged cell stays in `n` and
+    # in `mean_plan_quality` at its real score.
+
+    def test_rows_distinguish_measured_false_from_an_absent_marker(self):
+        """THREE-VALUED: True, False, and None-for-never-measured.
+
+        The row must not collapse absence into False (reviewer:
+        architecture-coherence). A metrics dict written before σ landed never
+        had its validity measured, and reading it back as False asserts the
+        reassuring answer to a question the instrument never asked — the exact
+        inversion of the rule the sibling consumer
+        ``scripts/run_fable_trial_v2_campaign.py`` enforces per cell.
+        """
+        from orchestrator.evals.report import build_plan_quality_report
+
+        report = build_plan_quality_report([
+            _architect_result(task_id='t1', judged_without_reference=True),
+            _architect_result(task_id='t2', judged_without_reference=False),
+            _architect_result(task_id='t3', judged_without_reference=None),
+        ])
+        by_task = {r['task_id']: r for r in report['rows']}
+
+        assert by_task['t1']['judged_without_reference'] is True
+        # MEASURED clean — the instrument ran and found a reference diff.
+        assert by_task['t2']['judged_without_reference'] is False
+        # NEVER MEASURED — a metrics dict predating the field.
+        assert by_task['t3']['judged_without_reference'] is None
+
+    def test_per_config_count_bounds_but_does_not_exclude(self):
+        """The flagged cells are COUNTED yet still averaged in.
+
+        The single most likely misimplementation is to treat this like
+        cap_excluded and drop the cell from the pool. It is not an exclusion:
+        the score is real, only the confidence in it is reduced. Pinned by
+        asserting the mean is over all THREE cells, not just the healthy one.
+        """
+        from orchestrator.evals.report import build_plan_quality_report
+
+        cfg = 'architect-opus-high'
+        report = build_plan_quality_report([
+            _architect_result(
+                task_id='t1', config_name=cfg, plan_quality=0.9,
+                judged_without_reference=True,
+            ),
+            _architect_result(
+                task_id='t2', config_name=cfg, plan_quality=0.6,
+                judged_without_reference=True,
+            ),
+            _architect_result(task_id='t3', config_name=cfg, plan_quality=0.3),
+        ])
+        agg = {c['config_name']: c for c in report['configs']}[cfg]
+
+        assert agg['judged_without_reference'] == 2
+        assert agg['n'] == 3
+        assert agg['mean_plan_quality'] == 0.6  # (0.9 + 0.6 + 0.3) / 3
+
+    def test_cap_tainted_cell_is_not_counted_as_judged_blind(self):
+        """Disjoint from cap_excluded: the θ count is scoped to the ADMITTED pool.
+
+        A cap-tainted cell has no plan_quality to bound, so even carrying the
+        flag it must land in cap_excluded ALONE — exactly how `no_plan` is
+        scoped on this surface.
+        """
+        from orchestrator.evals.report import build_plan_quality_report
+
+        cfg = 'architect-opus-high'
+        capped = _cap_tainted_result(task_id='t2', config_name=cfg)
+        capped.metrics['judged_without_reference'] = True
+
+        report = build_plan_quality_report([
+            _architect_result(task_id='t1', config_name=cfg, plan_quality=0.9),
+            capped,
+        ])
+        agg = {c['config_name']: c for c in report['configs']}[cfg]
+
+        assert agg['cap_excluded'] == 1
+        assert agg['judged_without_reference'] == 0
+
+    def test_report_level_judged_without_reference_total(self):
+        from orchestrator.evals.report import build_plan_quality_report
+
+        report = build_plan_quality_report([
+            _architect_result(
+                task_id='t1', config_name='a', judged_without_reference=True,
+            ),
+            _architect_result(
+                task_id='t2', config_name='b', judged_without_reference=True,
+            ),
+            _architect_result(task_id='t3', config_name='b'),
+        ])
+        assert report['judged_without_reference'] == 2
+        assert sum(
+            c['judged_without_reference'] for c in report['configs']
+        ) == report['judged_without_reference']
+
+    def test_one_keyless_admitted_cell_makes_the_count_unmeasured(self):
+        """ABSENCE POISONS THE COUNT: None, never a partial sum reading as whole.
+
+        A config whose pool mixes measured and pre-σ cells cannot report how
+        many of its scores were judged blind — it can only report that it does
+        not know. Reporting the measured ones' count (here 1) would understate
+        the bound while wearing the appearance of a complete answer. This is
+        ``report._judged_blind_count``'s rule, which task 3632's campaign
+        script consumes rather than re-deriving, so the two surfaces of one
+        field answer the same question identically.
+        """
+        from orchestrator.evals.report import build_plan_quality_report
+
+        cfg = 'architect-opus-high'
+        report = build_plan_quality_report([
+            _architect_result(
+                task_id='t1', config_name=cfg, judged_without_reference=True,
+            ),
+            _architect_result(
+                task_id='t2', config_name=cfg, judged_without_reference=None,
+            ),
+        ])
+        agg = {c['config_name']: c for c in report['configs']}[cfg]
+
+        assert agg['judged_without_reference'] is None
+        # …with the size of the unmeasured population beside it: 1-of-2 and
+        # 2-of-2 are different findings and the None alone cannot say which.
+        assert agg['judged_without_reference_unmeasured'] == 1
+        # The cells are still in the pool at their real scores — an unmeasured
+        # BOUND excludes nothing, exactly as a measured one does not.
+        assert agg['n'] == 2
+        # …and the campaign-wide total is unknown for the same reason.
+        assert report['judged_without_reference'] is None
+        assert report['judged_without_reference_unmeasured'] == 1
+
+    def test_a_fully_measured_campaign_still_reports_a_number(self):
+        """The None is not contagious to a corpus the instrument DID measure.
+
+        The negative twin of the test above: absence poisons the count, but a
+        campaign whose every admitted cell carries the key reports a real
+        count — including a real ZERO, which is the one case where 0 is the
+        honest answer.
+        """
+        from orchestrator.evals.report import build_plan_quality_report
+
+        cfg = 'architect-opus-high'
+        report = build_plan_quality_report([
+            _architect_result(
+                task_id='t1', config_name=cfg, judged_without_reference=False,
+            ),
+            _architect_result(
+                task_id='t2', config_name=cfg, judged_without_reference=False,
+            ),
+        ])
+        agg = {c['config_name']: c for c in report['configs']}[cfg]
+
+        assert agg['judged_without_reference'] == 0
+        assert agg['judged_without_reference_unmeasured'] == 0
+        assert report['judged_without_reference'] == 0
+
+    def test_a_keyless_cap_tainted_cell_does_not_poison_the_count(self):
+        """Scoped to the ADMITTED pool, absence included.
+
+        A cap-tainted cell has no plan_quality to bound whether or not it
+        carries the marker, so its keylessness must not make the config's bound
+        unknown — otherwise every campaign with one cap-window cell would read
+        UNMEASURED forever.
+        """
+        from orchestrator.evals.report import build_plan_quality_report
+
+        cfg = 'architect-opus-high'
+        capped = _cap_tainted_result(task_id='t2', config_name=cfg)
+        capped.metrics.pop('judged_without_reference', None)
+
+        report = build_plan_quality_report([
+            _architect_result(
+                task_id='t1', config_name=cfg, judged_without_reference=True,
+            ),
+            capped,
+        ])
+        agg = {c['config_name']: c for c in report['configs']}[cfg]
+
+        assert agg['cap_excluded'] == 1
+        assert agg['judged_without_reference'] == 1
+        assert agg['judged_without_reference_unmeasured'] == 0
+
+    def test_non_architect_rows_are_not_counted(self):
+        """Architect-scoped, like every other count on this surface."""
+        from orchestrator.evals.report import build_plan_quality_report
+
+        impl = _implementer_result(task_id='t2', config_name='opus-high')
+        impl.metrics['judged_without_reference'] = True
+
+        report = build_plan_quality_report([
+            _architect_result(task_id='t1', config_name='a'), impl,
+        ])
+        assert report['judged_without_reference'] == 0
 
     def test_exclusions_are_broken_out_by_cause(self):
         # The causes are NOT interchangeable: a cap hit is transient and

@@ -52,12 +52,9 @@ dependency of ``dark-factory-shared``, following the stdlib-only precedent of
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import json
 import math
-import os
-import tempfile
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -65,6 +62,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from shared import safe_io
 from shared.memory_eval_metrics import (
     Metric,
     MetricDirection,
@@ -1278,28 +1276,23 @@ def _artifact_from_result(result: EvaluationResult) -> LimitsArtifact:
 def _atomic_write_text(path: Path, text: str) -> None:
     """Write *text* to *path* via temp-in-dir + os.replace.
 
-    Copied from ``shared.prompt_artifact._atomic_write_text`` rather than
-    imported (it is module-private there, and ``shared.safe_io`` has only a
-    lenient reader — there is no atomic writer in ``shared/`` to reuse). The
-    temp comes from :func:`tempfile.mkstemp`, an OS-guaranteed fresh name,
-    rather than a pid-derived one, because the memory-eval runners all write
-    under a single artifact root and a shared ``<name>.<pid>.tmp`` would let
-    concurrent writers clobber each other mid-write.
+    Delegates to :func:`shared.safe_io.atomic_write_text` (task 3223, which
+    consolidated the four copies of this writer that used to exist). The
+    arguments preserve exactly what the previously-inlined body produced:
+    ``mode=0o600`` matches the :func:`tempfile.mkstemp` create, utf-8 was
+    already the encoding, and this site neither fsynced nor created its parent.
+
+    The unique-per-writer temp name the shared helper guarantees is what this
+    site always needed: the memory-eval runners all write under a single
+    artifact root, and a shared ``<name>.<pid>.tmp`` would let concurrent
+    writers clobber each other mid-write.
 
     This matters more here than for the metrics artifact: this file is
     RESUMABLE STATE, so a torn write would take the grandfather set with it and
     the next run would alarm on everything that was already known-bad. Either
     the old contents survive intact or the new ones land whole.
     """
-    fd, tmp_name = tempfile.mkstemp(suffix='.tmp', prefix=f'{path.name}.', dir=str(path.parent))
-    try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as fh:
-            fh.write(text)
-        os.replace(tmp_name, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_name)
-        raise
+    safe_io.atomic_write_text(path, text, encoding='utf-8', mode=0o600)
 
 
 def _artifact_payload(artifact: LimitsArtifact) -> dict[str, object]:

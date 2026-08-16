@@ -14,7 +14,7 @@ import uuid as uuid_mod
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 from graphiti_core.nodes import EpisodeType
 
@@ -26,10 +26,14 @@ from fused_memory.backends.mem0_client import (
 )
 from fused_memory.config.schema import FusedMemoryConfig, MemoryMetadataConfig
 from fused_memory.memory_metadata import (
+    PARENT_ID_DEAD_CODE,
+    PARENT_ID_UNAVAILABLE_CODE,
     CanonicalUniquenessViolation,
     MemoryMetadataValidationError,
     MetadataViolation,
+    ParentHasChildrenError,
     is_valid_topic_slug,
+    parent_liveness_violation,
     validate_memory_metadata,
 )
 from fused_memory.middleware.mem0_update_storm_escalator import Mem0UpdateStormEscalator
@@ -73,6 +77,7 @@ from fused_memory.services.memory_metadata_census import (
 )
 from fused_memory.utils.async_utils import gather_collect, gather_or_raise
 from fused_memory.utils.task_naming import canonicalize_task_node_name
+from fused_memory.utils.validation import require_full_uuid
 
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -414,6 +419,7 @@ async def _apply_memory_metadata_validation(
     config: MemoryMetadataConfig,
     storm_detector: UnknownKeyStormDetector,
     project_root: str,
+    parent_lookup: Callable[[str, str], Awaitable[dict | None]],
     count_canonical: Callable[[str, dict], Awaitable[int]],
     find_canonical: Callable[..., Awaitable[list[dict]]],
 ) -> None:
@@ -429,14 +435,56 @@ async def _apply_memory_metadata_validation(
     is a second write path that a tools-layer validator would leak past.
     Two call sites with drifting behaviour would reopen that hole.
 
-    Discharges three obligations:
+    Discharges five obligations:
 
     1. **Normalize + shape-check** via ``validate_memory_metadata`` (the only
        in-place mutation is ``supersedes`` scalar→list, PRD D2).
-    2. **Census** every violation, fatal or not, so warn-mode leaves a trace.
-    3. **Reject** — but ONLY when ``enforce`` is on AND at least one
+    2. **Resolve ``parent_id`` LIVENESS** (task 3197, leaf δ) — see below.
+    3. **Census** every violation, fatal or not, so warn-mode leaves a trace.
+    4. **Reject** — but ONLY when ``enforce`` is on AND at least one
        violation is fatal.  Unknown keys are never fatal, so flipping
        ``enforce`` cannot turn the 1,627-key long tail into an outage.
+    5. **Re-check ``canonical`` UNIQUENESS** (task 3198, leaf ε) via
+       :func:`_check_canonical_uniqueness`, which raises its own
+       :class:`CanonicalUniquenessViolation`.  It runs AFTER the reject arm
+       above: malformed metadata is refused on shape before any live-state
+       probe is spent on it.
+
+    LIVENESS IS HERE, NOT IN THE REGISTRY, on purpose.  Leaf β made
+    ``validate_memory_metadata`` a pure synchronous function taking only a
+    dict, so it structurally *cannot* perform a store lookup — a boundary
+    its docstring states explicitly so a later leaf "cannot accidentally
+    grow a second implementation of it in here (INV-5)".  This helper is
+    the nearest layer that can reach a store, and it is already the SINGLE
+    shared home for both write paths, so putting liveness here gets
+    ``add_system_record`` covered by construction.  Only the CODES and the
+    message wording stay in the registry, behind
+    :func:`~fused_memory.memory_metadata.parent_liveness_violation`, so the
+    rule still has exactly one normative home.
+
+    The lookup fires only when ``parent_id`` is PRESENT *and* already
+    shape-valid: the common write path (no ``parent_id`` at all — leaf α
+    measured zero live records carrying one) pays no round-trip, and an id
+    no store could resolve is never spent on.  Liveness ADDS a violation
+    rather than opening a second rejection path: because
+    ``parent_liveness_violation`` is ``fatal=True``, warn mode censuses and
+    proceeds while ``enforce`` rejects, both through the same arms below.
+
+    A lookup that FAILS is a different fact from a parent that is gone, and
+    gets its own code (``parent_id_liveness_unavailable``).
+    ``Mem0Backend.get_point_by_id`` propagates a Qdrant read-timeout rather
+    than collapsing it into ``None`` precisely to preserve that
+    distinction; folding both into ``dead_parent_id`` would discard it here
+    and tell an operator a live parent is dead.  That code is fatal too, so
+    ``enforce`` fails CLOSED on it — INV-3 read literally: an actor that
+    cannot corroborate must not act.  The blast radius of failing closed is
+    confined to writes that actually carry ``parent_id``, a population leaf
+    α measured at zero live records, and only while ``enforce`` is on.
+
+    ``parent_lookup`` is REQUIRED and takes no ``None`` default.  A
+    defaultable resolver would let a future third write path construct this
+    helper without one and silently skip liveness — reintroducing the exact
+    silent-orphan class leaf δ exists to close, and doing it invisibly.
 
     The enforce flags are read PER CALL off the shared config object rather
     than captured, so a config edit takes effect on the next write.
@@ -464,6 +512,37 @@ async def _apply_memory_metadata_validation(
     violations = validate_memory_metadata(
         meta, enforce_kind_registry=config.enforce_kind_registry
     )
+
+    # parent_id LIVENESS (leaf δ). Gated on the SHAPE check having passed —
+    # `validate_memory_metadata` emits `invalid_parent_id_shape` under the
+    # same key, so any parent_id-keyed violation means the id is malformed
+    # and no store could resolve it in that spelling.
+    if 'parent_id' in meta and not any(v.key == 'parent_id' for v in violations):
+        try:
+            parent = await parent_lookup(project_id, meta['parent_id'])
+        except Exception as exc:
+            # `Exception`, never `BaseException`: CancelledError,
+            # KeyboardInterrupt and SystemExit must keep propagating, per
+            # the repo's cancellation convention.
+            #
+            # The exception TYPE is logged so the raw backend cause is
+            # degraded, not discarded — the census code says only "could
+            # not be checked", and an operator debugging a burst of
+            # `parent_id_liveness_unavailable` needs something to correlate
+            # against.
+            logger.warning(
+                'memory_metadata: parent_id liveness lookup failed for '
+                'project_id=%r parent_id=%r: %s: %s',
+                project_id, meta['parent_id'], type(exc).__name__, exc,
+            )
+            liveness_code = PARENT_ID_UNAVAILABLE_CODE
+        else:
+            liveness_code = None if parent is not None else PARENT_ID_DEAD_CODE
+        if liveness_code is not None:
+            violations.append(
+                parent_liveness_violation(meta['parent_id'], code=liveness_code)
+            )
+
     # NOTE: this is `if violations:`, not an early `return` — the canonical
     # uniqueness re-check below must still run for metadata that is
     # perfectly well-formed, which is the overwhelmingly common case for a
@@ -1072,6 +1151,20 @@ class ReconcileStats:
     nodes_resolved: int = 0
     task_names_normalized: int = 0
     errors: list[str] = field(default_factory=list)
+
+
+class DescendantScan(NamedTuple):
+    """What a cascade WOULD destroy — and whether that answer is complete.
+
+    ``truncated`` is not decoration: a read-only walk cannot page past
+    ``MemoryService._CHILD_SCAN_LIMIT``, so the id list can genuinely be a
+    subset. Carrying that as data forces a caller gating an irreversible
+    multi-record delete to decide what to do about "I could not see all of
+    them" instead of reading a partial set as complete.
+    """
+
+    ids: list[str]
+    truncated: bool
 
 
 class MemoryService:
@@ -2207,6 +2300,10 @@ class MemoryService:
         causation_id = payload.pop('_causation_id', None)
         write_op_id = payload.pop('_write_op_id', None)
         temporal_context = payload.pop('temporal_context', None)
+        # task 3142: rides the same payload channel temporal_context does, so
+        # the tag reaches the persisted episodic node (and, via
+        # _dual_write_callback, every fact derived from it).
+        unverified_claim = bool(payload.pop('unverified_claim', False))
         reference_time_iso = payload.pop('reference_time', None)
         reference_time = None
         if reference_time_iso is not None:
@@ -2248,6 +2345,7 @@ class MemoryService:
                     uuid=payload.get('uuid'),
                     temporal_context=temporal_context,
                     reference_time=reference_time,
+                    unverified_claim=unverified_claim,
                 ),
             )
             reconcile_stats = await self._reconcile_episode_identity(
@@ -2337,6 +2435,7 @@ class MemoryService:
         fact_text = payload['fact_text']
         causation_id = payload.get('_causation_id')
         temporal_context = payload.get('temporal_context')
+        unverified_claim = bool(payload.get('unverified_claim', False))
         write_op_id = str(uuid_mod.uuid4())
         scope = Scope(
             project_id=payload.get('project_id', 'main'),
@@ -2357,6 +2456,11 @@ class MemoryService:
             metadata['secondary_category'] = classification.secondary.value
         if temporal_context == 'planning':
             metadata['planned'] = True
+        # Omitted entirely when untagged (task 3142) rather than set False, so
+        # no existing record shape changes and a metadata filter for the key
+        # matches only genuinely flagged facts.
+        if unverified_claim:
+            metadata['unverified_claim'] = True
 
         result = await self._journaled_backend_call(
             write_op_id=write_op_id,
@@ -2468,6 +2572,11 @@ class MemoryService:
                         'session_id': payload.get('session_id'),
                         '_causation_id': payload.get('_causation_id'),
                         'temporal_context': payload.get('temporal_context'),
+                        # task 3142: the Mem0 half rides its own payload
+                        # channel, so the episode's tag must be copied onto
+                        # every derived fact explicitly — those facts ARE the
+                        # artefacts the incident produced.
+                        'unverified_claim': payload.get('unverified_claim', False),
                     },
                 }
                 for edge in edges
@@ -2509,9 +2618,18 @@ class MemoryService:
         source_description: str = '',
         causation_id: str | None = None,
         temporal_context: str | None = None,
+        unverified_claim: bool = False,
         _source: str = 'mcp_tool',
     ) -> AddEpisodeResponse:
-        """Full ingestion pipeline — durably enqueue episode, return immediately."""
+        """Full ingestion pipeline — durably enqueue episode, return immediately.
+
+        ``unverified_claim`` (task 3142) marks an episode carrying a completion
+        claim that could not be confirmed against its live authority. It is a
+        LABEL, never a rejection: the episode is ingested either way, and the
+        flag follows the same payload -> backend path as ``temporal_context``
+        so both the Graphiti episodic node and every derived Mem0 fact carry
+        it.
+        """
         scope = Scope(project_id=project_id, agent_id=agent_id, session_id=session_id)
         episode_id = str(uuid_mod.uuid4())
         write_op_id = str(uuid_mod.uuid4())
@@ -2545,6 +2663,7 @@ class MemoryService:
                     '_causation_id': causation_id,
                     '_write_op_id': write_op_id,
                     'temporal_context': temporal_context,
+                    'unverified_claim': unverified_claim,
                     'reference_time': reference_time.isoformat() if reference_time is not None else None,
                 },
                 callback_type='dual_write_episode',
@@ -2655,6 +2774,7 @@ class MemoryService:
             # Bound methods, not `self`: the module-level helper stays
             # decoupled from MemoryService and trivially stubbable, matching
             # how it already takes storm_detector/config as collaborators.
+            parent_lookup=self.get_memory_by_id,
             count_canonical=self.count_memories_by_metadata,
             find_canonical=self.get_memories_by_metadata,
         )
@@ -3026,6 +3146,7 @@ class MemoryService:
             # Bound methods, not `self`: the module-level helper stays
             # decoupled from MemoryService and trivially stubbable, matching
             # how it already takes storm_detector/config as collaborators.
+            parent_lookup=self.get_memory_by_id,
             count_canonical=self.count_memories_by_metadata,
             find_canonical=self.get_memories_by_metadata,
         )
@@ -4094,6 +4215,246 @@ class MemoryService:
     # Delete
     # ------------------------------------------------------------------
 
+    #: How many child ids :meth:`delete_memory` lists in one scroll.
+    #:
+    #: The refusal message has to be READABLE — an unbounded listing of a
+    #: pathological fan-out would produce an error string no agent or
+    #: operator can act on, and the scroll fetches full payloads.  When the
+    #: live count exceeds what the scroll returned, the listing is marked
+    #: ``truncated`` ("at least N") rather than silently reading as
+    #: exhaustive.  A CASCADE is not bounded by this: it re-scrolls until a
+    #: pass yields no unvisited children.
+    _CHILD_SCAN_LIMIT = 100
+
+    async def _count_children(self, memory_id: str, *, project_id: str) -> int:
+        """Live count of records whose ``metadata.parent_id`` is *memory_id*.
+
+        The cheap exact primitive (Qdrant's count API), read fresh at every
+        call — INV-3: corroborate against the store, never against
+        remembered state.  A child can be written between two deletes, so a
+        gate trusting a cached "childless" answer would be checking history.
+        """
+        return await self.count_memories_by_metadata(
+            project_id, {'parent_id': memory_id}
+        )
+
+    async def _list_children(self, memory_id: str, *, project_id: str) -> list[str]:
+        """Ids of *memory_id*'s children, bounded by ``_CHILD_SCAN_LIMIT``."""
+        rows = await self.get_memories_by_metadata(
+            project_id, {'parent_id': memory_id}, limit=self._CHILD_SCAN_LIMIT
+        )
+        return [row['id'] for row in rows]
+
+    async def list_descendant_ids(
+        self, memory_id: str, *, project_id: str
+    ) -> DescendantScan:
+        """Every descendant of *memory_id*, deepest-first — WITHOUT deleting.
+
+        The read-only twin of :meth:`_cascade_delete_children`: same
+        primitives (:meth:`_count_children` / :meth:`_list_children`), same
+        visited-set termination for self-parent records and cycles, same
+        deepest-first order, no new backend call and no second tree-walk
+        (INV-5).  The enumeration a caller GATES on and the traversal the
+        cascade PERFORMS therefore cannot disagree about the shape of the
+        tree — a disagreement would mean checking one set and destroying
+        another.
+
+        Public and side-effect-free on purpose.  The citation-repoint gate
+        lives at the MCP tool layer, which needs to ask "what would this
+        cascade destroy?" *before* anything is destroyed; a hook that
+        mutated would turn look-before-you-leap into the leap.
+
+        ONE deliberate divergence from the cascade, surfaced as data rather
+        than hidden: ``truncated``.  ``_cascade_delete_children`` re-scrolls
+        past ``_CHILD_SCAN_LIMIT`` only because DELETING a page is what
+        makes the next one visible; a non-mutating walk has no such lever,
+        so a fan-out wider than the bound genuinely cannot be fully seen
+        here.  Do not "fix" this by copying the cascade's ``while`` loop
+        into this context — it would spin on the same page forever.  Say so
+        instead, and let the caller refuse.
+
+        Returns:
+            DescendantScan: ``ids`` deepest-first (the order the cascade
+            would destroy them in), excluding *memory_id* itself; and
+            ``truncated``, true when any visited node reported more children
+            than the bounded scroll returned.
+        """
+        # Seeded with the target so a record that is its own parent, or a
+        # cycle leading back to the target, terminates instead of recursing.
+        visited = {memory_id}
+        ordered: list[str] = []
+        truncated = False
+
+        async def walk(node: str) -> None:
+            nonlocal truncated
+            # Count first, scroll only on a non-zero count — the same cheap
+            # ordering the refusal gate uses, so a leaf costs one exact
+            # count and no payload fetch.
+            count = await self._count_children(node, project_id=project_id)
+            if not count:
+                return
+            children = await self._list_children(node, project_id=project_id)
+            if len(children) < count:
+                truncated = True
+            for child in children:
+                if child in visited:
+                    continue
+                visited.add(child)
+                await walk(child)
+                # Appended AFTER its own subtree: post-order is what makes
+                # the listing deepest-first.
+                ordered.append(child)
+
+        await walk(memory_id)
+        return DescendantScan(ids=ordered, truncated=truncated)
+
+    async def refuse_if_children(self, memory_id: str, *, project_id: str) -> None:
+        """Raise ``ParentHasChildrenError`` if *memory_id* still has children.
+
+        PUBLIC and side-effect-free (it either raises or returns), for the
+        same reason :meth:`list_descendant_ids` is: the MCP tool layer needs
+        to ask "would this delete be refused?" BEFORE it runs the citation
+        gate, whose repoint pass mutates live task metadata.  Without that
+        pre-flight a delete of a cited PARENT rewrote every citation to the
+        replacement and only then hit this refusal — mutation left behind by
+        an operation that reported failure, and the exact asymmetry the
+        cascade path avoids by enumerating before it gates.  Exposing the
+        one gate (rather than a count the caller re-wraps in its own error)
+        keeps the refusal's construction — ids, count, ``truncated``,
+        registry pointer — with exactly one home (INV-5).
+
+        Count FIRST, scroll only on a non-zero count: the count is exact and
+        cheap while the scroll fetches full payloads, and ``delete_memory``
+        has six in-repo recon callers (including bulk pool GC) that would
+        otherwise pay for a listing nobody reads.
+
+        A scroll returning FEWER ids than the count — the bound above, or a
+        concurrent write between the two reads — still refuses, marked
+        ``truncated``.  Downgrading a disagreement to "no children" would be
+        precisely the silent orphan this gate exists to prevent; presenting
+        a partial list as exhaustive would understate it.
+        """
+        child_count = await self._count_children(memory_id, project_id=project_id)
+        if child_count == 0:
+            return
+        child_ids = await self._list_children(memory_id, project_id=project_id)
+        raise ParentHasChildrenError(
+            parent_id=memory_id,
+            child_ids=child_ids,
+            truncated=len(child_ids) < child_count,
+        )
+
+    async def _cascade_delete_children(
+        self,
+        memory_id: str,
+        *,
+        project_id: str,
+        agent_id: str | None,
+        session_id: str | None,
+        causation_id: str | None,
+        _source: str,
+        visited: set[str] | None,
+    ) -> list[str]:
+        """Delete *memory_id*'s subtree, depth-first, and return EVERY id it took.
+
+        The return value is the whole destroyed set — grandchildren
+        included, deepest-first — not just the direct children.  It is what
+        the caller reports as ``cascaded_child_ids`` on the result, the
+        journal row and the ``memory_deleted`` event, and an MCP caller
+        never sees the server's journal: naming only the direct children
+        would tell them a SMALLER set was destroyed than actually was, and
+        leave them to reconstruct the rest from a log they cannot read.
+
+        CHILDREN FIRST, parent last — the caller deletes the parent only
+        after this returns.  Parent-first would re-open precisely the orphan
+        window this gate closes: a crash between the two leaves live
+        children pointing at a dead uuid, still recognised as children,
+        still suppressed from grouped search, content unreachable while
+        remaining in Qdrant.  Children-first fails safe: the surviving state
+        is "parent alive, some children gone", which the refusal gate still
+        protects and an operator can retry.
+
+        Each child is deleted by RE-ENTERING :meth:`delete_memory` rather
+        than by a local ``mem0.delete`` loop, so every child gets its own
+        write-journal row, its own reconciliation event and its own child
+        gate for free — no second, unguarded delete implementation to drift
+        (INV-5).
+
+        The ``await`` loop is SEQUENTIAL on purpose: an ``asyncio.gather``
+        would destroy the ordering the contract depends on (and trip the
+        repo's gather-convention guard).
+
+        *visited* terminates self-parent records and parent cycles: it is
+        seeded with the parent id and carries every id the chain has
+        committed to deleting, so a cycle's second visit is filtered out
+        instead of recursing.  The loop re-scrolls until a pass yields
+        nothing unvisited, so a fan-out wider than ``_CHILD_SCAN_LIMIT`` is
+        fully covered — the id LISTING is bounded, the cascade is not.
+        :meth:`list_descendant_ids` walks the same tree read-only and
+        therefore CANNOT re-scroll like this (deleting a page is what makes
+        the next one visible), which is why it reports ``truncated`` where
+        this loop simply keeps going.
+
+        Then CORROBORATE (INV-3, after acting): re-count the children and
+        raise rather than delete the parent if any survived.  Survivors are
+        measured against the ENCLOSING frames' in-flight set only, never
+        against the ids this frame just deleted — otherwise a child whose
+        delete silently did not take would be filtered out as "already
+        handled", which is exactly the partial-failure this re-read exists
+        to catch.  Without it the operation reports success while leaving
+        an orphan behind.
+        """
+        # Records an ENCLOSING frame is already committed to deleting. They
+        # are excluded from the corroboration below — an ancestor still in
+        # flight is not an orphan-to-be. Ids THIS frame deletes are
+        # deliberately NOT added here, so a delete that silently did not
+        # take resurfaces as a survivor instead of being explained away.
+        in_flight = set(visited) if visited else set()
+        in_flight.add(memory_id)
+        visited = set(in_flight)
+        deleted: list[str] = []
+
+        while await self._count_children(memory_id, project_id=project_id):
+            child_ids = await self._list_children(memory_id, project_id=project_id)
+            fresh = [cid for cid in child_ids if cid not in visited]
+            if not fresh:
+                break
+            for child_id in fresh:
+                visited.add(child_id)
+                child_result = await self.delete_memory(
+                    memory_id=child_id,
+                    store='mem0',
+                    project_id=project_id,
+                    agent_id=agent_id,
+                    session_id=session_id,
+                    causation_id=causation_id,
+                    _source=_source,
+                    cascade=True,
+                    _visited=visited,
+                    _cascade_parent=memory_id,
+                )
+                # The child's OWN subtree went first, so its ids precede it
+                # here — the same deepest-first order the deletes actually
+                # ran in. Dropping this frame's return value would report
+                # A→B→C as having destroyed only B.
+                deleted.extend(child_result.get('cascaded_child_ids') or [])
+                deleted.append(child_id)
+
+        if await self._count_children(memory_id, project_id=project_id):
+            survivors = [
+                cid
+                for cid in await self._list_children(
+                    memory_id, project_id=project_id
+                )
+                if cid not in in_flight
+            ]
+            if survivors:
+                raise ParentHasChildrenError(
+                    parent_id=memory_id, child_ids=survivors
+                )
+
+        return deleted
+
     async def delete_memory(
         self,
         memory_id: str,
@@ -4103,11 +4464,108 @@ class MemoryService:
         session_id: str | None = None,
         causation_id: str | None = None,
         _source: str = 'mcp_tool',
+        *,
+        cascade: bool = False,
+        _visited: set[str] | None = None,
+        _cascade_parent: str | None = None,
     ) -> dict:
-        """Delete a memory from the specified store."""
+        """Delete a memory from the specified store.
+
+        REFUSES to orphan children (task 3197, leaf δ; PRD V3's lifecycle
+        contract — "no operation may silently orphan a child or dangle a
+        pointer it could have seen").  Deleting a Mem0 record that other
+        records point at via ``metadata.parent_id`` raises
+        :class:`~fused_memory.memory_metadata.ParentHasChildrenError`
+        listing the child ids, BEFORE any backend call, journal row or
+        reconciliation event — so a refused delete leaves nothing claiming a
+        deletion happened.  The caller's explicit way out is
+        ``cascade=True``.
+
+        The gate is UNCONDITIONAL — deliberately not behind
+        ``memory_metadata.enforce``, unlike the V1 shape checks.  It is a
+        lifecycle safety gate, not a vocabulary check: behind a default-off
+        flag the orphan hole would stay open exactly as long as the flag
+        stayed off, i.e. the machinery would ship and none of the
+        protection.  Shipping it on is safe because leaf α measured
+        ``metadata.parent_id`` at zero live corpus footprint — there are no
+        existing children, so no live delete (including the six in-repo
+        recon callers) can regress.
+
+        The child check is a LIVE re-read per INV-3, never cached state, and
+        it is charged only where the relationship can exist: ``parent_id``
+        is a Mem0 payload key, so the graphiti arm keeps its current
+        zero-extra-round-trip cost.  On the common childless path the cost
+        is ONE exact Qdrant count and ZERO scrolls; the payload scroll is
+        paid only when there is something to list, because the error
+        contract needs the child *ids* and a count cannot supply them.
+
+        ``cascade=True`` is the caller's explicit opt-in: it deletes the
+        CHILDREN FIRST and the parent last, then re-checks.  See
+        :meth:`_cascade_delete_children`.  The result's
+        ``cascaded_child_ids`` — and the journal row and ``memory_deleted``
+        event that carry it — name EVERY record the cascade destroyed,
+        grandchildren included, deepest-first.  ``cascade`` is Mem0-only:
+        ``store='graphiti'`` with ``cascade=True`` raises ``ValueError``
+        rather than performing a silent plain delete (see below).
+
+        ``memory_id`` is validated for SHAPE ONLY: it must be a canonical
+        36-character UUID. A truncated id (e.g. an 8-char hex prefix lifted out
+        of a search-result snippet) raises rather than silently no-opping —
+        both backends treat a miss as "already deleted", so without this guard
+        such a call got a confirming ``{'status': 'deleted'}`` envelope, a
+        ``success=True`` journal entry and a ``memory_deleted`` event while
+        nothing was removed.
+
+        EXISTENCE IS NOT CHECKED, and the difference is user-visible: a
+        well-formed UUID that no longer resolves — a stale id copied out of an
+        old report, a survivor id from an earlier consolidation — still reports
+        ``deleted``, for exactly the same backend reason. Closing that half
+        needs a per-store existence read: ``update_memory`` below already does
+        it for its Qdrant arm (see the §5(c) read-leg comment there), while the
+        Graphiti arm additionally needs a ``remove_edge`` that distinguishes
+        not-found from already-deleted. Deliberately out of scope here — task
+        3132 closes the malformed-shape half only.
+
+        The guard sits above the store branch so ONE check covers both the
+        Graphiti and Mem0 paths, and above the journal write and event emission
+        so a rejected delete leaves no false audit trail. It sits BELOW
+        ``SourceStore(store)`` so a call that is wrong in both ways reports the
+        bad store first — the same store-then-shape precedence the MCP boundary
+        gives agents, rather than the inverse for internal callers.
+
+        Raises:
+            ParentHasChildrenError: the target still has children and
+                ``cascade`` was not requested — or a child SURVIVED a
+                requested cascade, in which case the parent is left in
+                place too.
+            ValueError: ``cascade=True`` was combined with a non-Mem0
+                store, which no store branch can honour.
+        """
         scope = Scope(project_id=project_id)
         source = SourceStore(store)
+        # `cascade` is MEM0-ONLY, and an unhonourable request is refused
+        # rather than dropped. The graphiti arm has no `metadata.parent_id`
+        # to recurse on, so tolerating the flag there meant a plain delete
+        # returning a bare {'status': 'deleted'} — while the `memory_deleted`
+        # event still carried `cascade: True` with an empty child list,
+        # recording a cascade as requested-and-satisfied when nothing
+        # recursive ever ran. Refusing keeps the audit trail unable to lie
+        # (loud-over-silent-degradation).
+        #
+        # Placed with the store check and BEFORE `require_full_uuid` so this
+        # layer and the MCP boundary agree on precedence: store validity,
+        # then store/cascade compatibility, then id shape.
+        if cascade and source != SourceStore.mem0:
+            raise ValueError(
+                f'cascade=True is not supported for store={store!r}: parent/child '
+                'links are the Mem0 payload key metadata.parent_id, so a '
+                f'{store} record has no children to cascade to. Retry without '
+                'cascade if a plain delete of this record is what was meant.'
+            )
+        require_full_uuid(memory_id, field_name='memory_id')
+
         write_op_id = str(uuid_mod.uuid4())
+        cascaded_child_ids: list[str] = []
 
         if source == SourceStore.graphiti:
             await self._journaled_backend_call(
@@ -4120,6 +4578,23 @@ class MemoryService:
             )
             result = {'status': 'deleted', 'store': 'graphiti', 'id': memory_id}
         else:
+            # Child gate — BEFORE the backend call, the journal row and the
+            # event, so a refused delete leaves no trace claiming a
+            # deletion. `parent_id` is a Mem0 payload key, which is why this
+            # is in the mem0 arm only.
+            if cascade:
+                cascaded_child_ids = await self._cascade_delete_children(
+                    memory_id,
+                    project_id=project_id,
+                    agent_id=agent_id,
+                    session_id=session_id,
+                    causation_id=causation_id,
+                    _source=_source,
+                    visited=_visited,
+                )
+            else:
+                await self.refuse_if_children(memory_id, project_id=project_id)
+
             del_result = await self._journaled_backend_call(
                 write_op_id=write_op_id,
                 causation_id=causation_id,
@@ -4129,6 +4604,8 @@ class MemoryService:
                 coro=self.mem0.delete(memory_id, scope),
             )
             result = {'status': 'deleted', 'store': 'mem0', 'id': memory_id, **del_result}
+            if cascaded_child_ids:
+                result['cascaded_child_ids'] = cascaded_child_ids
 
         if self._write_journal:
             await self._write_journal.log_write_op(
@@ -4139,7 +4616,16 @@ class MemoryService:
                 project_id=project_id,
                 agent_id=agent_id,
                 session_id=session_id,
-                params={'memory_id': memory_id, 'store': store},
+                params={
+                    'memory_id': memory_id,
+                    'store': store,
+                    'cascade': cascade,
+                    # Whose cascade took this record. Without it a cascaded
+                    # delete is indistinguishable from a direct one in the
+                    # journal, and the PRD's "children deleted too,
+                    # journalled" signal is only half legible.
+                    'cascade_parent_id': _cascade_parent,
+                },
                 result_summary=result,
                 success=True,
             )
@@ -4150,7 +4636,13 @@ class MemoryService:
             source=EventSource.agent,
             project_id=project_id,
             timestamp=datetime.now(UTC),
-            payload={'memory_id': memory_id, 'store': store},
+            payload={
+                'memory_id': memory_id,
+                'store': store,
+                'cascade': cascade,
+                'cascade_parent_id': _cascade_parent,
+                'cascaded_child_ids': cascaded_child_ids,
+            },
         ))
 
         return result

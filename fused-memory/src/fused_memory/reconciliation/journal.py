@@ -431,29 +431,7 @@ class ReconciliationJournal:
             row = await cursor.fetchone()
         if row is None:
             return None
-        reports_raw = json.loads(row['stage_reports'] or '{}')
-        stage_reports: dict[str, StageReport | dict] = {}
-        for k, v in reports_raw.items():
-            if isinstance(v, dict) and 'stage' in v:
-                stage_reports[k] = StageReport(**v)
-            else:
-                stage_reports[k] = v  # Keep _error and other raw entries as-is
-        return ReconciliationRun(
-            id=row['id'],
-            project_id=row['project_id'],
-            run_type=row['run_type'],
-            trigger_reason=row['trigger_reason'],
-            started_at=datetime.fromisoformat(row['started_at']),
-            completed_at=_parse_dt(row['completed_at']),
-            events_processed=row['events_processed'],
-            stage_reports=stage_reports,
-            status=row['status'],
-            triggered_by=row['triggered_by'],
-            instance_id=row['instance_id'],
-            session_id=row['session_id'],
-            stage_cursor=row['stage_cursor'],
-            attempt=row['attempt'] or 0,
-        )
+        return _row_to_run(row)
 
     async def get_recent_runs(
         self, project_id: str, limit: int = 10
@@ -464,34 +442,7 @@ class ReconciliationJournal:
             (project_id, limit),
         ) as cursor:
             rows = await cursor.fetchall()
-        runs = []
-        for row in rows:
-            reports_raw = json.loads(row['stage_reports'] or '{}')
-            stage_reports: dict[str, StageReport | dict] = {}
-            for k, v in reports_raw.items():
-                if isinstance(v, dict) and 'stage' in v:
-                    stage_reports[k] = StageReport(**v)
-                else:
-                    stage_reports[k] = v  # Keep _error and other raw entries as-is
-            runs.append(
-                ReconciliationRun(
-                    id=row['id'],
-                    project_id=row['project_id'],
-                    run_type=row['run_type'],
-                    trigger_reason=row['trigger_reason'],
-                    started_at=datetime.fromisoformat(row['started_at']),
-                    completed_at=_parse_dt(row['completed_at']),
-                    events_processed=row['events_processed'],
-                    stage_reports=stage_reports,
-                    status=row['status'],
-                    triggered_by=row['triggered_by'],
-                    instance_id=row['instance_id'],
-                    session_id=row['session_id'],
-                    stage_cursor=row['stage_cursor'],
-                    attempt=row['attempt'] or 0,
-                )
-            )
-        return runs
+        return [_row_to_run(row) for row in rows]
 
     async def is_run_active(self, project_id: str) -> bool:
         db = self._require_db()
@@ -986,10 +937,11 @@ def _fmt_dt(val: datetime | None) -> str | None:
 def _row_to_run(row: aiosqlite.Row) -> ReconciliationRun:
     """Map a single ``runs`` table row to a ``ReconciliationRun``.
 
-    Shared by ``get_stale_runs`` and ``get_running_runs`` (task 2711
-    amendment) — the two queries differ only in their WHERE clause, so the
-    row→model mapping (including ``stage_reports`` parsing) lives in exactly
-    one place and can't drift between them.
+    Shared by ``get_run``, ``get_recent_runs``, ``get_stale_runs``,
+    ``get_running_runs``, and ``get_interrupted_runs`` (task 3885 dedup;
+    originally task 2711) — every query differs only in its WHERE clause, so
+    the row→model mapping (including ``stage_reports`` parsing) lives in
+    exactly one place and can't drift between call sites.
     """
     reports_raw = json.loads(row['stage_reports'] or '{}')
     stage_reports: dict[str, StageReport | dict] = {}

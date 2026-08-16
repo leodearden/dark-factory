@@ -62,13 +62,36 @@ def test_tests_scripts_is_a_registered_module_config() -> None:
     NOTE on assertion (3)/(4) — a falsified premise corrected against measured
     reality (the same class of defect this task exists to fix). Task 3350's
     plan asserted ``lock_depth == 2``, reading the pydantic Field default at
-    config.py:2593. The EFFECTIVE value is 4: the package-bundled
-    ``orchestrator/src/orchestrator/defaults.yaml:7`` ships ``lock_depth: 4``
-    and is layered over the Field default on every load. At depth 4,
-    ``derive_modules([SAMPLE_TOUCHED_FILE], 4)`` returns the full path
-    ``['tests/scripts/test_spawn_claude.py']``, NOT ``['tests/scripts']`` —
-    3 path components is below the depth-4 truncation threshold, so
-    ``normalize_lock`` leaves it whole.
+    config.py:2593. That is not the effective value, and neither is the
+    package-bundled ``orchestrator/src/orchestrator/defaults.yaml:7`` layered
+    over it on every load: THIS project's ``dark-factory-orchestrator.yaml``
+    overrides both, and that override is what a real load resolves here.
+
+        CORRECTED IN PLACE (task 3866): this note used to say "The EFFECTIVE
+        value is 4" and reason "at depth 4", which broke when lock_depth moved
+        4 -> 12. Noted rather than silently rewritten — this docstring exists
+        BECAUSE task 3350 encoded a falsified constant, and a second silent
+        substitution would defeat its purpose. Which is also why the repair
+        names no new constant: assertion (3) reads ``cfg.lock_depth`` live, so
+        the next retune of that knob falsifies nothing written here.
+
+        CORRECTED AGAIN (task 3866, review repair): that first repair broke
+        the rule it had just stated. In place of the stale constant it
+        asserted a resolved path — ``derive_modules([SAMPLE_TOUCHED_FILE],
+        cfg.lock_depth)`` "returns the full path ..., NOT ['tests/scripts'] —
+        3 path components is below the truncation threshold at every layer" —
+        and that quantifier is false at a layer the paragraph above
+        enumerates by hand. MEASURED:
+        ``normalize_lock('tests/scripts/test_spawn_claude.py', 2)`` ->
+        ``'tests/scripts'``, which is exactly the value the sentence claimed
+        was excluded; depths 3 / 4 / 12 do leave it whole. A 3-component path
+        survives only at ``lock_depth >= 3``, and the pydantic Field default
+        of 2 sits below that threshold. The sentence is DELETED rather than
+        re-scoped, because a resolved lock key IS a depth assertion in prose
+        and the note directly above already forbids those; re-scoping would
+        merely re-stake the claim on ``SAMPLE_TOUCHED_FILE`` remaining 3
+        components. What survives is the depth-invariant claim the assertions
+        actually check — every derived key RESOLVES back to this config.
 
     That does not weaken the fix, and the plan's conclusion still holds: what
     actually matters is that the derived lock key RESOLVES to this module
@@ -107,8 +130,10 @@ def test_tests_scripts_is_a_registered_module_config() -> None:
     # (3) Reachability precondition: a prefix DEEPER than lock_depth is honoured
     # by run_full_verification (which iterates module_configs.values() directly)
     # but is unreachable via scheduler/workflow, which pass normalize_lock-
-    # truncated keys. config.py:4719 warns; it does not fail. Holds at both the
-    # Field default (2) and the shipped defaults.yaml value (4).
+    # truncated keys. config.py:4719 warns; it does not fail. Asserted against
+    # the live cfg.lock_depth rather than any named constant, so it holds at
+    # whichever layer is in force — Field default, shipped defaults.yaml, or
+    # this project's override.
     assert prefix_depth <= cfg.lock_depth, (
         f'module config prefix {MODULE_PREFIX!r} has depth {prefix_depth} but '
         f'lock_depth={cfg.lock_depth}; the scheduler (_limit_for) and workflow '
@@ -137,7 +162,10 @@ def test_tests_scripts_is_a_registered_module_config() -> None:
         )
 
     # (5) The prefix itself resolves — the form scheduler/workflow pass when the
-    # touched path IS truncated to lock_depth (i.e. at any lock_depth <= 2).
+    # touched path IS truncated to lock_depth (i.e. whenever lock_depth is below
+    # the sample path's own depth; above it the path is passed whole, which
+    # assertion (4) covers). Both forms are pinned so neither side of that
+    # threshold depends on where the knob currently sits.
     resolved_prefix = cfg.for_module(MODULE_PREFIX)
     assert resolved_prefix is not None and resolved_prefix.prefix == MODULE_PREFIX, (
         f'cfg.for_module({MODULE_PREFIX!r}) did not resolve to the discovered '

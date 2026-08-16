@@ -47,13 +47,15 @@ discriminator described above is unchanged.
 
 Note the division of labour with :mod:`fused_memory.server.markup_tripwire`,
 which owns the LIVE write-boundary rejection at the
-``submit_task``/``update_task``/``add_memory``/``add_episode`` MCP tools and
-is the authoritative enumeration of the envelope literals. That guard is
-deliberately broader (a bare substring scan, accepting over-reporting to
-maximise recall at write time). This detector is deliberately PRECISE,
-because it runs over an already-stored corpus where a false positive would
-provoke an unnecessary content rewrite. The two are not redundant and must
-not be collapsed into one another.
+``submit_task``/``update_task``/``add_memory``/``add_episode`` MCP tools. That
+write-boundary guard is deliberately broader (a bare substring scan,
+accepting over-reporting to maximise recall at write time). This detector is
+deliberately PRECISE, because it runs over an already-stored corpus where a
+false positive would provoke an unnecessary content rewrite. The two are not redundant and must
+not be collapsed into one another. What they DO share, since task 3688, is the
+envelope-literal enumeration itself: it lives once in
+:mod:`shared.toolcall_markup` (INV-5), and the two calibrations are two named
+predicates over that one set rather than two independently spelled sets.
 """
 from __future__ import annotations
 
@@ -89,6 +91,28 @@ from _task_db_scan import (
 _FM_SRC = Path(__file__).resolve().parent.parent / "fused-memory" / "src"
 if str(_FM_SRC) not in sys.path:
     sys.path.insert(0, str(_FM_SRC))
+
+# ...and shared/src alongside it, same idiom and same precedence argument:
+# toolcall_xml_leak now imports the envelope-literal enumeration from
+# shared.toolcall_markup (INV-5, task 3688), so without this entry the import
+# below fails outright, and with a hardcoded or install-provided one a worktree
+# run would resolve `shared` to the MAIN checkout's copy of the literals.
+#
+# NOTE the cost, so the "bare interpreter" claim above is not read too strongly:
+# shared/__init__.py imports the whole package eagerly, so
+# `import shared.toolcall_markup` drags in shared's third-party dependencies
+# (aiosqlite and friends) even though toolcall_markup is itself pure and
+# stdlib-only. A dependency-free system python can therefore no longer run this
+# script; an interpreter that has the project's dependencies — the repo venv,
+# `uv run` — still can. That is not a new class of constraint here:
+# scripts/repair_wiped_metadata_files.py and
+# scripts/audit_combine_gate_marker_loss.py already import `shared` through this
+# identical bootstrap and already pay it. Making a leaf importable without the
+# package init would be a shared-wide change and is deliberately not one this
+# task takes on.
+_SHARED_SRC = Path(__file__).resolve().parent.parent / "shared" / "src"
+if str(_SHARED_SRC) not in sys.path:
+    sys.path.insert(0, str(_SHARED_SRC))
 
 from fused_memory.utils.toolcall_xml_leak import (  # noqa: E402
     LEAK_TAIL,

@@ -15,6 +15,7 @@ Covers:
 """
 
 import asyncio
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1499,6 +1500,132 @@ class TestRunInflightVerifyRunnerUnavailableReason:
         assert 'Could not resolve hostname' in result.reason
 
 
+@pytest.mark.asyncio
+class TestRunInflightVerifyRunnerUnavailableSpecWarm:
+    """The RU sentinel carries spec_warm, not just merge_wt (task 3251 amend).
+
+    ``_finalize_inflight`` disposes of the RU'd worktree with
+    ``_release_or_cleanup(vr.merge_wt, spec_warm=vr.spec_warm)``, so
+    ``vr.spec_warm`` is the ONLY thing standing between a pool-owned ``_spec-``
+    lane and a ``git worktree remove`` of a lane the pool still holds ASSIGNED.
+    The RU return site was the one ``InflightVerifyResult`` construction in
+    ``_run_inflight_verify`` that omitted the kwarg, hard-wiring it False; these
+    pin the propagation at the SOURCE so the ledger class's warm test (which
+    hand-builds its result) is no longer the sole evidence for the warm route.
+
+    Note on reachability, so nobody mistakes these for live-path coverage: the
+    warm lane is derived by the real production helper, but the
+    RunnerUnavailable itself is INJECTED.  A LOCAL lease dispatches
+    ``runner=None``, which builds a LocalRunner-only pool, and every raise site
+    lives in RemoteRunner or behind the INV-2 gate's ``isinstance(...,
+    RemoteRunner)`` break — so today no local-lease verify can actually raise
+    it, and REMOTE leases (which can) skip the warm swap.  What is pinned here
+    is the CONTRACT: if the raise ever reaches this handler with a warm lane in
+    hand, the flag must ride along with the path it describes.
+    """
+
+    def _make_item(self, tmp_path, merge_wt, *, config=None, speculative=False):
+        from orchestrator.merge_queue import RealMergeItem
+
+        merge_result = MagicMock()
+        merge_result.merge_commit = 'abc123def456789abc1'
+        return RealMergeItem(
+            request=_make_merge_request(
+                config or _make_config(), task_files=[], worktree=tmp_path,
+            ),
+            merge_result=merge_result,
+            merge_wt=merge_wt,
+            base_sha='base123',
+            speculative=speculative,
+        )
+
+    async def test_ru_local_lease_warm_lane_propagates_spec_warm(self, tmp_path):
+        """LOCAL lease + warm _spec- lane + RU raise → vr.spec_warm is True.
+
+        The warm swap is driven through the REAL ``_acquire_warm_verify_worktree``
+        (spec-lane-pool knob on + speculative item + valve disabled, the three
+        preconditions of its ``_spec-`` branch) with only ``git_ops`` stubbed —
+        never by monkeypatching the helper onto ``orchestrator.merge_queue``,
+        which ``test_merge_queue_reachback_patch_guard`` freezes.  So the True
+        asserted below is the value production would compute, not one injected.
+        """
+        from orchestrator.config import GitConfig, OrchestratorConfig
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.verify_runner import HostLease, RunnerUnavailable
+
+        lane = tmp_path / '_spec-0'
+        lane.mkdir()
+        cold_wt = tmp_path / '_merge-cold'
+        cold_wt.mkdir()
+
+        git_ops = _make_git_ops_mock()
+        # The one production input that decides warm-ness: the pool hands back a
+        # seeded lane.  Everything downstream of it is the real code path.
+        git_ops.acquire_spec_lane = AsyncMock(return_value=(lane, True))
+        q: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q)
+
+        config = OrchestratorConfig(
+            git=GitConfig(main_branch='main', merge_spec_warm_lane_pool=True),
+        )
+        # persistent_merge_worktree_safety_valve_every_n defaults to 0 → the
+        # inv.6 cold valve is disabled, so the _spec- branch is taken.
+        assert config.git.persistent_merge_worktree_safety_valve_every_n == 0
+        item = self._make_item(tmp_path, cold_wt, config=config, speculative=True)
+
+        fake_local = MagicMock()
+        fake_local.name = 'local'
+        fake_local.is_local = True
+        lease = HostLease(name='local', runner=fake_local, is_local=True)
+
+        async def _raise_unavailable(*args, **kwargs):
+            raise RunnerUnavailable('INV-2 contract-currency sync failed')
+
+        with patch('orchestrator.merge_queue._run_post_merge_verify', new=_raise_unavailable):
+            result = await worker._run_inflight_verify(item, lease)
+
+        assert result.status == 'RUNNER_UNAVAILABLE'
+        assert result.merge_wt == lane, 'the warm lane is the worktree handed to the chokepoint'
+        assert result.spec_warm is True, (
+            'the RU sentinel must carry spec_warm=_spec_warm — _finalize_inflight '
+            'routes _release_or_cleanup on it, and a False here would `git worktree '
+            'remove` a lane spec_warm_lane_pool still holds ASSIGNED'
+        )
+
+    async def test_ru_cold_worktree_reports_spec_warm_false(self, tmp_path):
+        """REMOTE lease (no warm swap) → vr.spec_warm stays False.
+
+        The companion to the warm pin: passing the flag through must not
+        mis-mark a genuinely cold ``_merge-<uuid>`` as pool-owned, which would
+        send the chokepoint down ``release_spec_lane`` and leak the directory.
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+        from orchestrator.verify_runner import HostLease, RunnerUnavailable
+
+        git_ops = _make_git_ops_mock()
+        q: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q)
+
+        cold_wt = tmp_path / '_merge-cold'
+        cold_wt.mkdir()
+        item = self._make_item(tmp_path, cold_wt)
+
+        fake_runner = MagicMock()
+        fake_runner.name = 'leo-laptop'
+        fake_runner.is_local = False
+        lease = HostLease(name='leo-laptop', runner=fake_runner, is_local=False)
+
+        async def _raise_unavailable(*args, **kwargs):
+            raise RunnerUnavailable('ssh spawn failed')
+
+        with patch('orchestrator.merge_queue._run_post_merge_verify', new=_raise_unavailable):
+            result = await worker._run_inflight_verify(item, lease)
+
+        assert result.status == 'RUNNER_UNAVAILABLE'
+        assert result.merge_wt == cold_wt
+        assert result.spec_warm is False
+
+
 # ---------------------------------------------------------------------------
 # Task 2307 step-7 RED: production wiring — _run_inflight_verify threads the
 # worker's escalation queue into _run_post_merge_verify, so a laptop-side
@@ -1958,6 +2085,124 @@ class TestAlarmVerifyWorktreeContention:
 # ---------------------------------------------------------------------------
 # 1795/step-9 RED: RU branch of _finalize_inflight wired to tracker + alarm
 # ---------------------------------------------------------------------------
+#
+# task 3251/pre-1: the two builders below were promoted verbatim out of
+# ``TestFinalizeInflightRunnerUnavailableEscalation`` to module level so the
+# worktree-ledger class further down can reuse them instead of re-scaffolding a
+# worker/entry/allocator triple.  The class's methods now delegate here and its
+# tests are behaviourally unchanged; the only additions are the two defaulted
+# keyword args on ``_make_ru_entry`` (``merge_wt`` so a caller can supply a REAL
+# directory — MagicMock has no mtime for os.utime / no Path.resolve() — and
+# ``spec_warm`` so the warm ``_spec-``-lane RU case can be constructed).
+
+
+def _make_ru_worker(*, escalate_after_n=2):
+    """Build a minimal SpeculativeMergeWorker with fake allocator + escalation queue."""
+    import asyncio
+
+    from orchestrator.merge_queue import SpeculativeMergeWorker
+
+    git_ops = _make_git_ops_mock()
+    git_ops.project_root = None  # no real git needed for this test
+    q: asyncio.Queue = asyncio.Queue()
+    worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q)
+    worker._unreachable_escalate_after_n = escalate_after_n
+
+    # Fake escalation queue
+    eq = _FakeEscalationQueue(open_l1=False)
+    worker._escalation_queue = eq
+
+    # Fake host allocator with async quarantine_and_release
+    fake_alloc = MagicMock()
+    fake_alloc.quarantine_and_release = AsyncMock()
+    fake_alloc.release = AsyncMock()
+    fake_alloc.cancel_and_release = AsyncMock()
+    worker._host_allocator = fake_alloc
+
+    return worker, eq, fake_alloc
+
+
+def _make_ru_entry(worker, host_name, *, reason='ssh timeout', merge_wt=None, spec_warm=False):
+    """Build an InflightEntry whose verify_task yields RUNNER_UNAVAILABLE.
+
+    Registers the item in ``worker._lifecycle`` at VERIFYING first (task
+    2169 kappa): production always reaches ``_finalize_inflight`` via the
+    registered DISPATCHING -> VERIFYING dispatch path, so an unregistered
+    entry here would spuriously fire the best-effort-loud
+    "rejected transition" escalation on every kappa-wired
+    ``_note_transition`` call inside the RUNNER_UNAVAILABLE branch,
+    polluting ``eq.submitted`` for tests that count escalations.
+
+    Args:
+        merge_wt: real ``Path`` to use as the item's merge worktree.  Defaults
+            to a ``MagicMock()`` (sufficient for the escalation-wiring tests,
+            which never touch the path); ledger tests pass a real directory so
+            ``os.utime`` / ``Path.resolve()`` / ``snapshot()`` are meaningful.
+        spec_warm: threaded into the ``InflightVerifyResult`` so the warm
+            ``_spec-``-lane RU case is buildable.  Production cannot currently
+            emit ``spec_warm=True`` alongside RUNNER_UNAVAILABLE (see
+            ``TestRunInflightVerifyRunnerUnavailableSpecWarm``), so a caller
+            passing True is exercising the chokepoint's routing contract, not a
+            live path.
+    """
+    import asyncio
+
+    from orchestrator.merge_queue import (
+        InflightEntry,
+        InflightStatus,
+        InflightVerifyResult,
+        ItemLifecycleState,
+        MergeRequest,
+        RealMergeItem,
+    )
+    from orchestrator.verify_runner import HostLease
+
+    loop = asyncio.get_running_loop()
+    req = MergeRequest(
+        task_id='task-ru',
+        branch=QueuedBranch.parse('task/ru', 'task/'),
+        worktree=MagicMock(),
+        pre_rebased=False,
+        task_files=[],
+        module_configs=[],
+        config=_make_config(),
+        result=loop.create_future(),
+    )
+
+    fake_runner = MagicMock()
+    fake_runner.name = host_name
+    fake_runner.is_local = False
+    lease = HostLease(name=host_name, runner=fake_runner, is_local=False)
+
+    merge_result = MagicMock()
+    merge_result.merge_commit = 'deadbeefdeadbeef1234'
+
+    item = RealMergeItem(
+        request=req,
+        merge_result=merge_result,
+        merge_wt=MagicMock() if merge_wt is None else merge_wt,
+        base_sha='base123',
+        speculative=False,
+    )
+    worker._register_item(item, initial=ItemLifecycleState.VERIFYING)
+
+    async def _fake_ru_verify():
+        return InflightVerifyResult(
+            outcome=None,
+            merge_wt=item.merge_wt,
+            status=InflightStatus.RUNNER_UNAVAILABLE,
+            reason=reason,
+            spec_warm=spec_warm,
+        )
+
+    verify_task = asyncio.ensure_future(_fake_ru_verify())
+    return InflightEntry(
+        item=item,
+        lease=lease,
+        verify_task=verify_task,
+        merge_wt=item.merge_wt,
+        was_speculative=False,
+    )
 
 
 @pytest.mark.asyncio
@@ -1968,98 +2213,12 @@ class TestFinalizeInflightRunnerUnavailableEscalation:
     """
 
     def _make_worker(self, *, escalate_after_n=2):
-        """Build a minimal SpeculativeMergeWorker with fake allocator + escalation queue."""
-        import asyncio
-
-        from orchestrator.merge_queue import SpeculativeMergeWorker
-
-        git_ops = _make_git_ops_mock()
-        git_ops.project_root = None  # no real git needed for this test
-        q: asyncio.Queue = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q)
-        worker._unreachable_escalate_after_n = escalate_after_n
-
-        # Fake escalation queue
-        eq = _FakeEscalationQueue(open_l1=False)
-        worker._escalation_queue = eq
-
-        # Fake host allocator with async quarantine_and_release
-        fake_alloc = MagicMock()
-        fake_alloc.quarantine_and_release = AsyncMock()
-        fake_alloc.release = AsyncMock()
-        fake_alloc.cancel_and_release = AsyncMock()
-        worker._host_allocator = fake_alloc
-
-        return worker, eq, fake_alloc
+        """Delegate to the module-level builder (task 3251/pre-1)."""
+        return _make_ru_worker(escalate_after_n=escalate_after_n)
 
     def _make_ru_entry(self, worker, host_name, reason='ssh timeout'):
-        """Build an InflightEntry whose verify_task yields RUNNER_UNAVAILABLE.
-
-        Registers the item in ``worker._lifecycle`` at VERIFYING first (task
-        2169 kappa): production always reaches ``_finalize_inflight`` via the
-        registered DISPATCHING -> VERIFYING dispatch path, so an unregistered
-        entry here would spuriously fire the best-effort-loud
-        "rejected transition" escalation on every kappa-wired
-        ``_note_transition`` call inside the RUNNER_UNAVAILABLE branch,
-        polluting ``eq.submitted`` for tests that count escalations.
-        """
-        import asyncio
-
-        from orchestrator.merge_queue import (
-            InflightEntry,
-            InflightStatus,
-            InflightVerifyResult,
-            ItemLifecycleState,
-            MergeRequest,
-            RealMergeItem,
-        )
-        from orchestrator.verify_runner import HostLease
-
-        loop = asyncio.get_running_loop()
-        req = MergeRequest(
-            task_id='task-ru',
-            branch=QueuedBranch.parse('task/ru', 'task/'),
-            worktree=MagicMock(),
-            pre_rebased=False,
-            task_files=[],
-            module_configs=[],
-            config=_make_config(),
-            result=loop.create_future(),
-        )
-
-        fake_runner = MagicMock()
-        fake_runner.name = host_name
-        fake_runner.is_local = False
-        lease = HostLease(name=host_name, runner=fake_runner, is_local=False)
-
-        merge_result = MagicMock()
-        merge_result.merge_commit = 'deadbeefdeadbeef1234'
-
-        item = RealMergeItem(
-            request=req,
-            merge_result=merge_result,
-            merge_wt=MagicMock(),
-            base_sha='base123',
-            speculative=False,
-        )
-        worker._register_item(item, initial=ItemLifecycleState.VERIFYING)
-
-        async def _fake_ru_verify():
-            return InflightVerifyResult(
-                outcome=None,
-                merge_wt=item.merge_wt,
-                status=InflightStatus.RUNNER_UNAVAILABLE,
-                reason=reason,
-            )
-
-        verify_task = asyncio.ensure_future(_fake_ru_verify())
-        return InflightEntry(
-            item=item,
-            lease=lease,
-            verify_task=verify_task,
-            merge_wt=item.merge_wt,
-            was_speculative=False,
-        )
+        """Delegate to the module-level builder (task 3251/pre-1)."""
+        return _make_ru_entry(worker, host_name, reason=reason)
 
     async def test_quarantine_and_release_still_runs(self):
         """RUNNER_UNAVAILABLE → quarantine_and_release called (existing behavior preserved)."""
@@ -2178,6 +2337,274 @@ class TestFinalizeInflightRunnerUnavailableEscalation:
         # _n_failed is written from _n_failed_val inside finalize; read back
         # via the worker's attribute — it must stay False after RU.
         assert worker._n_failed is False
+
+
+# ---------------------------------------------------------------------------
+# 3251/step-1 RED: the RU branch of _finalize_inflight must DISPOSE of the
+# RU'd merge worktree instead of stranding it in the owned-liveness ledger
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestFinalizeInflightRunnerUnavailableWorktreeLedger:
+    """RUNNER_UNAVAILABLE re-dispatch must not strand its merge worktree (task 3251).
+
+    THE LEAK. ``_run_inflight_verify``'s ``except RunnerUnavailable`` returns
+    ``merge_wt`` UN-cleaned, and ``_finalize_inflight``'s RU branch disposes of
+    the host lease (``quarantine_and_release``), the dead base
+    (``_record_dead_base``) and the lifecycle registry
+    (FINALIZING -> MERGING -> REDISPATCH_PARKED) — but never the worktree.  It
+    then calls ``_remerge``, which allocates and registers a BRAND-NEW
+    ``_merge-<uuid>``.  The old path therefore stays in
+    ``_owned_merge_worktrees`` for the life of the process, one stranded entry
+    per RU re-dispatch.
+
+    WHY A RETAINED LEDGER ENTRY IS UNRECOVERABLE, not merely untidy:
+      · ``_touch_owned_merge_worktrees`` ``os.utime``s it every heartbeat tick,
+        pinning the ROOT-inode mtime that the disk-scan coalesce arm reads as
+        proof of liveness — an immortal corpse;
+      · it is exempt from both ``reap_orphaned_merge_worktrees`` and the
+        ``keep_worktrees=set(self._owned_merge_worktrees)`` guard;
+      · it is INVISIBLE to ``worktree_ledger_violations``, which flags only
+        on-disk ``_merge-`` dirs ABSENT from the ledger (``if path in owned:
+        continue``).
+
+    Task 3148 added ``_inflight_worktree_is_stale``, which CONTAINS the symptom
+    at the coalesce gate; these tests pin the leak itself closed at the source.
+    """
+
+    async def test_ru_finalize_drops_old_merge_worktree_from_ledger(self, tmp_path):
+        """The RU'd worktree leaves the ledger — and stops being heartbeat-pinned."""
+        import os
+
+        from orchestrator.merge_queue import RealMergeItem
+
+        # escalate_after_n high so the unavailability alarm never fires and
+        # cannot confound the ledger assertions.
+        worker, eq, fake_alloc = _make_ru_worker(escalate_after_n=99)
+        worker._running = True
+
+        old_wt = tmp_path / '_merge-old'
+        old_wt.mkdir()
+        entry = _make_ru_entry(worker, 'laptop', merge_wt=old_wt)
+        worker._register_owned_merge_worktree(old_wt)
+        assert old_wt in worker._owned_merge_worktrees  # precondition
+
+        # A REAL RealMergeItem, not MagicMock(spec=SpeculativeItem): the latter
+        # is a TypeAlias (RealMergeItem | DecidedItem), so the mock specs a
+        # UnionType, exposes no `.request`, and trips snapshot()'s
+        # item_merge_wt() assert_never.  Production's _remerge re-merges THIS
+        # request into a FRESH _merge-<uuid>, so this is also the faithful shape.
+        # It registers nothing in the ledger, so any entry left at the end is a
+        # stranded RU'd worktree and nothing else.  A DISTINCT merge_result:
+        # the re-merge produces a new merge commit, and the RU'd item's old one
+        # was just passed to _record_dead_base.  (Reaching for
+        # entry.item.merge_result would also be a union-typed read —
+        # InflightEntry.item is RealMergeItem | DecidedItem and only the former
+        # carries merge_result.)
+        remerged = RealMergeItem(
+            request=entry.item.request,
+            merge_result=MagicMock(merge_commit='cafebabecafebabe0000'),
+            merge_wt=tmp_path / '_merge-new',
+            base_sha='base456',
+            speculative=False,
+        )
+        with patch.object(worker, '_remerge', new=AsyncMock(return_value=remerged)):
+            result = await worker._finalize_inflight(entry)
+
+        # ── the leak itself ────────────────────────────────────────────────
+        assert old_wt not in worker._owned_merge_worktrees, (
+            'RU re-dispatch stranded the old merge worktree in the liveness ledger'
+        )
+        assert str(old_wt.resolve()) not in worker.snapshot()['owned_merge_worktrees']
+
+        # ── the "immortal heartbeat-pinned corpse" symptom ─────────────────
+        # Stamp a known-old mtime, then run one heartbeat tick: it must touch
+        # nothing and leave the RU'd path's mtime alone, so the path can age
+        # out of the liveness window instead of being refreshed forever.
+        os.utime(old_wt, (0, 0))
+        mtime_before = old_wt.stat().st_mtime
+        assert worker._touch_owned_merge_worktrees() == 0
+        assert old_wt.stat().st_mtime == mtime_before
+
+        # ── RU control flow UNCHANGED ──────────────────────────────────────
+        assert result is False
+        fake_alloc.quarantine_and_release.assert_awaited_once()
+        assert worker._redispatch[0] is remerged
+        assert not entry.item.request.result.done()
+
+    async def test_ru_redispatch_ledger_does_not_accumulate(self, tmp_path):
+        """N successive RU re-dispatches must not grow the ledger by N entries."""
+        from orchestrator.merge_queue import RealMergeItem
+
+        worker, eq, fake_alloc = _make_ru_worker(escalate_after_n=99)
+        worker._running = True
+
+        # The stubbed _remerge registers NOTHING, so every ledger entry left
+        # behind at the end is a stranded RU'd worktree and nothing else.
+        async def _fake_remerge(request, started_monotonic):
+            return RealMergeItem(
+                request=request,
+                merge_result=MagicMock(merge_commit='cafebabecafebabe0000'),
+                merge_wt=tmp_path / f'_merge-new-{request.request_id[:8]}',
+                base_sha='base456',
+                speculative=False,
+            )
+
+        with patch.object(worker, '_remerge', new=AsyncMock(side_effect=_fake_remerge)):
+            for n in range(3):
+                wt = tmp_path / f'_merge-{n}'
+                wt.mkdir()
+                entry = _make_ru_entry(worker, 'laptop', merge_wt=wt)
+                worker._register_owned_merge_worktree(wt)
+                await worker._finalize_inflight(entry)
+
+        assert worker._owned_merge_worktrees == set(), (
+            'ledger grew one stranded entry per RU re-dispatch: '
+            f'{sorted(str(p) for p in worker._owned_merge_worktrees)}'
+        )
+
+    # ── 3251/step-3: disk reclamation + warm-lane routing + ordering ───────
+
+    async def test_ru_finalize_reclaims_old_worktree_from_disk(self, tmp_path):
+        """Cold case: the RU'd worktree is reclaimed NOW, not left to the reaper.
+
+        Deregistering alone would trade a heartbeat-pinned ledger leak for an
+        on-disk orphan that only ``_maybe_reap_orphaned_merge_worktrees``
+        eventually claims (at the PERIODIC_REAP_MIN_AGE_SECS floor), and that
+        would meanwhile become a recurring ``worktree_ledger_violations`` I6
+        finding once past RESOURCE_AUDIT_WORKTREE_GRACE_SECS.  Reclaim it at
+        the moment the item is known dead — ``_record_dead_base`` four lines
+        later in the same branch has just declared its merge commit dead.
+        """
+        from orchestrator.merge_queue import RealMergeItem
+
+        worker, eq, fake_alloc = _make_ru_worker(escalate_after_n=99)
+        worker._running = True
+
+        old_wt = tmp_path / '_merge-old'
+        old_wt.mkdir()
+        new_wt = tmp_path / '_merge-new'
+        entry = _make_ru_entry(worker, 'laptop', merge_wt=old_wt)
+        worker._register_owned_merge_worktree(old_wt)
+
+        remerged = RealMergeItem(
+            request=entry.item.request,
+            merge_result=MagicMock(merge_commit='cafebabecafebabe0000'),
+            merge_wt=new_wt,
+            base_sha='base456',
+            speculative=False,
+        )
+        with patch.object(worker, '_remerge', new=AsyncMock(return_value=remerged)):
+            await worker._finalize_inflight(entry)
+
+        cleaned = [
+            c.args[0] for c
+            in cast(AsyncMock, worker._git_ops.cleanup_merge_worktree).await_args_list
+        ]
+        assert cleaned == [old_wt], (
+            f'expected exactly one disk reclamation of the RU\'d worktree; got {cleaned}'
+        )
+        # The freshly-allocated replacement must survive — it is what the
+        # re-dispatched item will verify in.
+        assert new_wt not in cleaned
+
+    async def test_ru_finalize_releases_warm_spec_lane_instead_of_removing_it(self, tmp_path):
+        """Warm case: a pool-owned _spec- lane is RELEASED, never `worktree remove`d.
+
+        This is why the fix calls ``_release_or_cleanup`` and not
+        ``_cleanup_owned_merge_worktree``: the cold arm would ``git worktree
+        remove`` a lane belonging to ``spec_warm_lane_pool`` instead of
+        returning it FREE — and ``remove_merge_worktree_guarded`` exempts only
+        the persistent merge/offline-deep trees, so the lane would be destroyed
+        on disk while the pool still held it ASSIGNED.
+
+        Scope, stated honestly (task 3251 amend): the ``spec_warm=True`` result
+        is HAND-BUILT here, and today production cannot emit one — the warm swap
+        is LOCAL-only, a LOCAL lease dispatches ``runner=None`` into a
+        LocalRunner-only pool, and every ``RunnerUnavailable`` raise site sits in
+        RemoteRunner or behind the INV-2 gate's ``isinstance(..., RemoteRunner)``
+        break.  So this pins the chokepoint's ROUTING given a warm vr, nothing
+        about reachability.  The other half of the contract — that
+        ``_run_inflight_verify`` propagates ``spec_warm`` onto the RU sentinel
+        at all, rather than hard-wiring it False — is pinned separately by
+        ``TestRunInflightVerifyRunnerUnavailableSpecWarm``; without that pin
+        this test would keep passing over a vr shape nothing could produce.
+        """
+        from orchestrator.merge_queue import RealMergeItem
+
+        worker, eq, fake_alloc = _make_ru_worker(escalate_after_n=99)
+        worker._running = True
+        # _make_git_ops_mock() does not expose release_spec_lane; a bare
+        # MagicMock attribute is not awaitable, so install a recording stub.
+        worker._git_ops.release_spec_lane = AsyncMock()
+
+        lane = tmp_path / '_spec-3'
+        lane.mkdir()
+        entry = _make_ru_entry(worker, 'laptop', merge_wt=lane, spec_warm=True)
+        worker._register_owned_merge_worktree(lane)
+
+        remerged = RealMergeItem(
+            request=entry.item.request,
+            merge_result=MagicMock(merge_commit='cafebabecafebabe0000'),
+            merge_wt=tmp_path / '_merge-new',
+            base_sha='base456',
+            speculative=False,
+        )
+        with patch.object(worker, '_remerge', new=AsyncMock(return_value=remerged)):
+            await worker._finalize_inflight(entry)
+
+        worker._git_ops.release_spec_lane.assert_awaited_once_with(lane, warm=True)
+        cleaned = [
+            c.args[0] for c
+            in cast(AsyncMock, worker._git_ops.cleanup_merge_worktree).await_args_list
+        ]
+        assert lane not in cleaned, 'a pool-owned _spec- lane must never be removed from disk'
+        # ...and either way it leaves the ledger (task 3148 invariant).
+        assert lane not in worker._owned_merge_worktrees
+
+    async def test_ru_finalize_disposes_before_remerge(self, tmp_path):
+        """Disposal happens BEFORE _remerge, permanently.
+
+        _remerge does not always yield a replacement worktree — ``DecidedItem``
+        (already-merged / conflicted / vanished branch) carries none, and
+        _remerge can raise outright.  Deregistering only once _remerge had
+        registered a replacement would therefore re-open the leak on exactly
+        those paths.  Both sibling sites (``_void_and_remerge``, the
+        head-failure cascade) dispose first; this pins that ordering so the
+        alternative can never be reintroduced silently.
+        """
+        from orchestrator.merge_queue import DecidedItem
+
+        worker, eq, fake_alloc = _make_ru_worker(escalate_after_n=99)
+        worker._running = True
+
+        old_wt = tmp_path / '_merge-old'
+        old_wt.mkdir()
+        entry = _make_ru_entry(worker, 'laptop', merge_wt=old_wt)
+        worker._register_owned_merge_worktree(old_wt)
+
+        observed: dict = {}
+
+        async def _spy_remerge(request, started_monotonic):
+            observed['in_ledger'] = old_wt in worker._owned_merge_worktrees
+            # DecidedItem is structurally worktree-less: no merge_wt field.
+            return DecidedItem(
+                request=request,
+                immediate_outcome=MagicMock(),
+                base_sha='base456',
+                speculative=False,
+            )
+
+        with patch.object(worker, '_remerge', new=AsyncMock(side_effect=_spy_remerge)):
+            await worker._finalize_inflight(entry)
+
+        assert observed['in_ledger'] is False, (
+            'the RU\'d worktree was still in the ledger when _remerge was entered — '
+            'disposal must precede _remerge, which may return a worktree-less '
+            'DecidedItem or raise'
+        )
+        assert old_wt not in worker._owned_merge_worktrees
 
 
 # ---------------------------------------------------------------------------

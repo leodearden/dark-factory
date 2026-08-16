@@ -73,6 +73,10 @@ for _p in (str(_TESTS_DIR), str(_SRC_DIR)):
         sys.path.insert(0, _p)
 
 import startup_completion_fixtures as _scf  # noqa: E402  (isort: after src bootstrap)
+from _oauth_accounts import (  # noqa: E402  (isort: after tests-dir bootstrap)
+    ALL_TOKEN_LETTERS,
+    first_available_token,
+)
 
 from shared.cli_invoke import (  # noqa: E402
     _resolve_transcript_path,
@@ -473,14 +477,14 @@ def _cli_version() -> str:
 def _oauth_token() -> tuple[str, str] | None:
     """Return ``(env_var_name, token)`` for the first available OAuth account.
 
-    Mirrors ``shared/tests/test_cli_invoke_integration.py``'s ``_AVAILABLE_TOKENS``
-    discovery so a machine with no accounts degrades to a legible skip.
+    ``ALL_TOKEN_LETTERS``, not ``_oauth_accounts``' fleet default: this probe
+    spends no fleet capacity and only needs SOME account so a machine with none
+    degrades to a legible skip, so the interactive/primary account ``A`` counts.
+
+    ``_oauth_accounts`` is the single home for this scan (task 3700) — see its
+    module docstring; the letter set is not restated here.
     """
-    for var in [f'CLAUDE_OAUTH_TOKEN_{c}' for c in 'ABCDEFG']:
-        token = os.environ.get(var)
-        if token:
-            return (var, token)
-    return None
+    return first_available_token(os.environ, ALL_TOKEN_LETTERS)
 
 
 def _build_argv(

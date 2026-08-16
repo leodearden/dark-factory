@@ -11,22 +11,31 @@ WorkingDirectory=/home/leo/src/dark-factory
 # force-cancels whatever is still running, so the process reaches lifespan shutdown by
 # ~T+8s -- comfortably inside TimeoutStopSec=15, leaving ~7s for lifespan shutdown,
 # interpreter exit and the `uv run` parent's own teardown. Without this flag the drain
-# was unbounded: a browser polling every 3s never let its keep-alive connections idle
-# out, so the drain never completed and every restart ended in
+# was unbounded: a browser polling every few seconds never let its keep-alive connections
+# idle out, so the drain never completed and every restart ended in
 # "State 'stop-sigterm' timed out. Killing." -> SIGKILL -> a ~16s dead window.
 #
-# --timeout-keep-alive 5 is uvicorn's own default, pinned deliberately rather than
-# changed. It is kept ABOVE the client's 3s poll interval on purpose: dropping it below
-# 3s would close the polling socket in the gap between polls, exposing the
-# server-closes-while-client-writes race -- trading a shutdown bug for a request-failure
-# bug. Keep-alive is not being asked to bound the drain; --timeout-graceful-shutdown
-# already does that. Pinning it makes the poll-interval/keep-alive relationship explicit
-# and greppable instead of hiding behind an implicit default.
+# --timeout-keep-alive 6 is pinned ABOVE THE SLOWEST client poller. The browser runs TWO
+# independent recurring HTTP pollers -- data.js's 3s data refresh (POLL_INTERVAL_MS) and
+# tab_overview.jsx's 5s /api/load host-load poll (LOAD_POLL_INTERVAL_MS) -- and each holds
+# its own keep-alive connection, reusing it at its own interval. So the bound must clear
+# the SLOWEST of them, not merely the busiest: 6 is the smallest value above the 5s
+# poller. Below a poller's own interval the server closes that socket in the gap between
+# its polls, exposing the server-closes-while-client-writes race -- trading a shutdown bug
+# for a request-failure bug. This is one second above uvicorn's 5s default, which sat
+# exactly ON the /api/load boundary (5s keep-alive vs a 5s poll) and so did not clear it.
+# Keep-alive is not being asked to bound the drain; --timeout-graceful-shutdown already
+# does that. Pinning it makes the poll-interval/keep-alive relationship explicit and
+# greppable instead of hiding behind an implicit default. Enforced by
+# tests/scripts/test_dashboard_service_template.py::
+# test_keep_alive_timeout_is_pinned_above_poll_interval, which derives this floor from
+# every poller registered in CLIENT_POLLERS -- so adding a slower poller, or slowing an
+# existing one, requires raising this value in BOTH unit files.
 ExecStart=/home/leo/.local/bin/uv run --project dashboard \
   python -m uvicorn dashboard.app:app \
   --host 127.0.0.1 --port 8080 \
   --timeout-graceful-shutdown 8 \
-  --timeout-keep-alive 5
+  --timeout-keep-alive 6
 
 # Cost/burndown aggregation roots (comma-separated). Standalone default: this repo only — additional project roots are LOCAL settings, added to the installed unit, not committed here. Keep spaces out of the value; systemd treats unquoted spaces as assignment separators.
 Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=/home/leo/src/dark-factory

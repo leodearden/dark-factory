@@ -13,6 +13,25 @@ Covers:
                 HEALTHY multi-entry chained frozen prefix produces NO such
                 violation (guards against a naive "every entry == newest tip"
                 implementation).
+  3206 step-3  — the PRD §5.3 RE-MERGE CARVE-OUT applies to this surface too:
+                a frozen entry carrying `remerge_recovery=True` produces no
+                verify-base⊄frozen-tip violation, the carve-out is
+                emission-only (the shared `_frozen_base_chain` walk still
+                advances past the entry, so successors are not falsely
+                flagged), and BOTH §5.3 surfaces decide identically on the
+                same inputs — the anti-drift parity the shared-generator
+                design exists to protect.
+  3206 step-7  — REGRESSION PINS for the ADVISORY contract: a phantom frozen
+                tip never refuses a dispatch (the measured 5687 / 5830 shape),
+                the WARNING accompanies a COMPLETED dispatch, the mismatch
+                path leaks no host lease, and the healthy path is unchanged.
+
+CHARACTERIZATION-TEST NOTE (task 3206). The §5.3 verify-base rule is ADVISORY
+BY DECISION and is never promoted to hard control-flow enforcement (PRD §5.3
+and §10). The step-7 pins are expected to pass immediately; their purpose is
+to make a future SILENT flip to enforcement impossible — each fails the moment
+the guard changes control flow. If they go red, re-derive the evidence in PRD
+§5.3 before "fixing" them.
 
 See _warn_if_verify_base_not_frozen_tip (merge_queue.py) for the log-only
 dispatch-time guard this promotes to snapshot granularity, and
@@ -22,6 +41,7 @@ check_frozen_prefix_invariant for the base-chain math this mirrors.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from pathlib import Path
 from typing import Literal
 from unittest.mock import AsyncMock, MagicMock
@@ -34,6 +54,7 @@ from orchestrator.merge_queue import (
     DecidedItem,
     InflightEntry,
     InflightVerifyResult,
+    ItemLifecycleState,
     MergeOutcome,
     MergeRequest,
     QueuedBranch,
@@ -157,6 +178,17 @@ def _make_fake_item(
     return req, item
 
 
+def _mark_recovery(item: SpeculativeItem) -> SpeculativeItem:
+    """Stamp the §5.3 re-merge recovery marker (task 3206) on *item*.
+
+    Mirrors what `_remerge` does in production — it is the single producer of
+    recovery items for all five consumer paths, so the marker is set once at
+    the producer rather than threaded through each consumer.  Mirrors the
+    helper of the same name in test_merge_queue_frozen_prefix.py.
+    """
+    return dataclasses.replace(item, remerge_recovery=True)
+
+
 def _make_inflight_entry(
     item: SpeculativeItem,
     *,
@@ -270,6 +302,191 @@ class TestVerifyBaseFrozenTipPromotion:
         assert violations == [], (
             f'expected a healthy chained frozen prefix to have no violations, got: {violations}'
         )
+
+
+# ── task 3206 step-3 RED: §5.3 re-merge carve-out at the SNAPSHOT surface ────
+
+
+@pytest.mark.asyncio
+class TestRemergeCarveOutAtSnapshotSurface:
+    """The snapshot §5.3 surface honours the same re-merge carve-out (task 3206).
+
+    §5.3 has TWO surfaces: the dispatch-time guard
+    (:meth:`_warn_if_verify_base_not_frozen_tip`) and this snapshot-granularity
+    promotion (:meth:`_verify_base_frozen_tip_violations`, task 1999 I5).  The
+    PRD §5.3 re-merge carve-out is a property of the RULE, not of one surface,
+    so BOTH must apply it — otherwise a recovery re-merge is silent at dispatch
+    but still reported as a violation in the health snapshot.  That is exactly
+    the silent-disagreement failure `_verify_base_frozen_tip_violations`' own
+    docstring says the shared `_frozen_base_chain` generator exists to prevent.
+
+    Asserted STRUCTURALLY (helper call + composition into two_layer_invariants /
+    snapshot), per this module's established convention — never by matching
+    violation prose, which the two surfaces intentionally word differently.
+
+    RED until step-4 GREEN skips marked entries at violation-emission time.
+    """
+
+    async def test_recovery_entry_produces_no_verify_base_violation(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """CARVE-OUT: a frozen entry marked remerge_recovery emits no violation.
+
+        Same shape as test_stale_verify_base_produces_distinct_violation above
+        (base_sha != the chained expected base), plus the marker — so the ONLY
+        difference between violation and silence is the carve-out itself.
+        """
+        worker = _make_worker(git_ops)
+        main_sha = 'M0'
+        _, item = _make_fake_item(
+            't-recovery', base_sha='deadbeef', merge_commit='c1',
+            config=config, git_repo=git_repo,
+        )
+        item = _mark_recovery(item)
+        worker._inflight.append(_make_inflight_entry(item, verifying=True))
+
+        assert worker._verify_base_frozen_tip_violations(main_sha) == [], (
+            '§5.3 re-merge carve-out (task 3206): a recovery entry must not '
+            'produce a verify-base⊄frozen-tip violation'
+        )
+
+        # …and it must be absent from BOTH composed surfaces, not merely from
+        # the helper (a carve-out applied only in the helper but re-derived
+        # elsewhere would still leak into the health snapshot).
+        rid = item.request.request_id
+        violations = worker.two_layer_invariants(main_sha)
+        assert not [v for v in violations if 'verify-base' in v and rid in v], (
+            f'expected no verify-base violation for the recovery entry in '
+            f'two_layer_invariants(), got: {violations}'
+        )
+
+        worker._last_known_main_sha = main_sha
+        snap_violations = worker.snapshot()['two_layer_invariants']
+        assert not [v for v in snap_violations if 'verify-base' in v and rid in v], (
+            f'expected no verify-base violation for the recovery entry in '
+            f'snapshot()["two_layer_invariants"], got: {snap_violations}'
+        )
+
+    async def test_unmarked_entry_still_produces_exactly_one_violation(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """CONTROL: without the marker, step-01's behaviour is preserved exactly.
+
+        The carve-out must be narrow — it may not swallow a genuine violation.
+        """
+        worker = _make_worker(git_ops)
+        main_sha = 'M0'
+        _, item = _make_fake_item(
+            't-stale', base_sha='deadbeef', merge_commit='c1',
+            config=config, git_repo=git_repo,
+        )
+        worker._inflight.append(_make_inflight_entry(item, verifying=True))
+        rid = item.request.request_id
+
+        direct = worker._verify_base_frozen_tip_violations(main_sha)
+        assert len(direct) == 1, (
+            f'expected exactly 1 verify-base violation for an unmarked stale '
+            f'entry, got: {direct}'
+        )
+        assert rid in direct[0], f'violation must name {rid!r}, got: {direct[0]!r}'
+
+        assert all(v in worker.two_layer_invariants(main_sha) for v in direct)
+
+    async def test_recovery_entry_still_advances_the_chain_for_successors(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """The carve-out suppresses EMISSION only — never the chain walk itself.
+
+        `_frozen_base_chain` is shared with check_frozen_prefix_invariant, and
+        each entry's merge_commit advances the expected base for its
+        successors.  Dropping a recovery entry from the WALK would corrupt the
+        expected base of every entry behind it, converting one suppressed
+        violation into a cascade of false ones.
+
+        Here entry0 is a recovery entry (base != main, suppressed) whose
+        merge_commit is C1; entry1 is a HEALTHY successor based on C1.  entry1
+        must stay clean — which is only true if entry0 still advanced the chain.
+        """
+        worker = _make_worker(git_ops)
+        main_sha = 'M0'
+        _, item_0 = _make_fake_item(
+            't-recovery', base_sha='some-other-main', merge_commit='C1',
+            config=config, git_repo=git_repo,
+        )
+        item_0 = _mark_recovery(item_0)
+        _, item_1 = _make_fake_item(
+            't-successor', base_sha='C1', merge_commit='C2',
+            config=config, git_repo=git_repo,
+        )
+        worker._inflight.append(_make_inflight_entry(item_0, verifying=True))
+        worker._inflight.append(_make_inflight_entry(item_1, verifying=True))
+
+        assert worker._verify_base_frozen_tip_violations(main_sha) == [], (
+            'recovery entry suppressed, healthy successor clean — a chain '
+            'corrupted by filtering the recovery entry OUT of the walk would '
+            'falsely flag the successor'
+        )
+
+        # check_frozen_prefix_invariant shares the same generator and is
+        # deliberately NOT carved out: it still sees the recovery entry's own
+        # base-chain break, proving the walk was not filtered.
+        chain_violations = worker.check_frozen_prefix_invariant(main_sha)
+        assert [v for v in chain_violations if item_0.request.request_id in v], (
+            f'expected check_frozen_prefix_invariant to still see the recovery '
+            f'entry in the shared walk, got: {chain_violations}'
+        )
+        assert not [v for v in chain_violations if item_1.request.request_id in v], (
+            f'the healthy successor must NOT be flagged — chain advanced past '
+            f'the recovery entry, got: {chain_violations}'
+        )
+
+    async def test_two_surfaces_agree_on_the_same_inputs(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """ANTI-DRIFT PARITY: both §5.3 surfaces decide identically.
+
+        For the identical (item, main_sha) inputs the dispatch guard's decision
+        to WARN and the snapshot surface's decision to report a VIOLATION must
+        agree: both fire for the unmarked case, both stay silent for the
+        marked one.  This is the explicit anti-drift assertion the
+        `_verify_base_frozen_tip_violations` docstring says the shared-generator
+        design exists to protect — a carve-out landed on only one surface
+        passes that surface's own tests but fails here.
+        """
+        import logging
+
+        main_sha = 'M0'
+        for marked, want_fire in ((False, True), (True, False)):
+            worker = _make_worker(git_ops)
+            _, item = _make_fake_item(
+                f't-parity-{marked}', base_sha='deadbeef', merge_commit='c1',
+                config=config, git_repo=git_repo,
+            )
+            if marked:
+                item = _mark_recovery(item)
+
+            # Snapshot surface: the entry IS the frozen head, expected == main.
+            worker._inflight.append(_make_inflight_entry(item, verifying=True))
+            snapshot_fired = bool(worker._verify_base_frozen_tip_violations(main_sha))
+
+            # Dispatch surface: same item, same main, evaluated as the
+            # candidate against an EMPTY frozen prefix (so frozen_prefix_tip
+            # == main_sha) — the same expected-vs-actual comparison the
+            # snapshot surface makes for the head entry.
+            dispatch_worker = _make_worker(git_ops)
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+                dispatch_worker._warn_if_verify_base_not_frozen_tip(item, main_sha)
+            dispatch_fired = any(
+                r.levelno >= logging.WARNING for r in caplog.records
+            )
+
+            assert dispatch_fired == snapshot_fired == want_fire, (
+                f'§5.3 surfaces disagree for marked={marked}: '
+                f'dispatch_fired={dispatch_fired}, snapshot_fired={snapshot_fired}, '
+                f'expected both={want_fire}'
+            )
 
 
 # ── DEFECT 2 (task 2357) RED: dequeue/dispatch-time refresh of _last_known_main_sha ──
@@ -508,4 +725,233 @@ class TestNoOverCorrectionRegressionLock:
         assert snap_violations == [], (
             f'expected snapshot() to be clean once _last_known_main_sha is the '
             f'real tip for a healthy chained stack, got: {snap_violations!r}'
+        )
+
+
+# ── task 3206 step-7: regression pins for the ADVISORY contract ──────────────
+#
+# CHARACTERIZATION TESTS. Most of these pass immediately after steps 2/4/6 —
+# that is the point. Their job is not to drive new behaviour but to make a
+# future SILENT flip to enforcement impossible: each one FAILS the moment the
+# §5.3 guard changes control flow. Task 3206 adjudicated that the guard STAYS
+# ADVISORY (PRD §5.3, §10); these are the executable half of that fence, the
+# PRD prose being the other half.
+
+
+@pytest.mark.asyncio
+class TestAdvisoryContractRegressionPins:
+    """The §5.3 guard is advisory: it may log, but it may never refuse.
+
+    Task regression items (1), (4), (5) plus the lease-leak trap. If a future
+    change makes `_warn_if_verify_base_not_frozen_tip` (or the dispatch site
+    around it) refuse a dispatch, every test here goes red — which is the
+    designed outcome, not a flake to be silenced. Re-derive the evidence in
+    PRD §5.3 first.
+    """
+
+    async def _stranded_finalize_head(
+        self, worker: SpeculativeMergeWorker, config: OrchestratorConfig,
+        git_repo: Path, *, dead_commit: str,
+    ) -> SpeculativeItem:
+        """Install a stranded (phantom) finalize head whose merge_commit is dead.
+
+        Reproduces the measured 2026-08-08 shape (the task-3082 class): an
+        entry registered at FINALIZING but NOT present in `_inflight` is
+        exactly what `_finalizing_head_entry()` returns, and `_entry_phase`
+        reports 'finalizing' — a qualifying phase — so
+        `_frozen_inflight_entries()` counts it and `frozen_prefix_tip(main)`
+        returns *dead_commit* instead of the live main tip.
+        """
+        _, head_item = _make_fake_item(
+            't-phantom', base_sha='some-older-main', merge_commit=dead_commit,
+            config=config, git_repo=git_repo,
+        )
+        head_entry = _make_inflight_entry(head_item, verifying=True)
+        worker._register_item(head_entry, initial=ItemLifecycleState.FINALIZING)
+        assert worker.frozen_prefix_tip('LIVEMAIN') == dead_commit, (
+            'fixture precondition: the phantom head must poison frozen_prefix_tip'
+        )
+        return head_item
+
+    async def test_phantom_frozen_tip_does_not_block_dispatch(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """(a) THE 3082 COUPLING PIN — the headline regression (task item 4).
+
+        A stranded finalize head makes `frozen_prefix_tip()` return a DEAD
+        merge commit, so an unrelated item dispatching against the LIVE MAIN
+        TIP mismatches it.  That dispatch must still go through: the verify
+        task is launched, a live InflightEntry is returned, and the host lease
+        is NOT released.
+
+        Production instances (orchestrator-reify, both `verify_depth=1`):
+          2026-08-08 00:09:07  task 5687 (mr-441b5c13)  base 9d08d3d3
+          2026-08-08 01:35:00  task 5830 (mr-ad16d177)  base 2b903602
+        both mismatched a phantom expected-tip 95908e44 that persisted 86
+        minutes.  5687 then PASSED and LANDED — 'verify end (merge=2b903602,
+        passed=True)' → 'Advanced main to 2b903602' at 00:59:55.  Under hard
+        enforcement both would have been REFUSED; this test is what makes that
+        regression loud.
+        """
+        worker = _make_worker(git_ops)
+        live_main = 'LIVEMAIN'
+        await self._stranded_finalize_head(
+            worker, config, git_repo, dead_commit='DEADPHANTOM',
+        )
+
+        # The unrelated dispatch: its base IS the live main tip — correct by
+        # every measure except the poisoned frozen tip.
+        _, item = _make_fake_item(
+            't-victim', base_sha=live_main, merge_commit='c-victim',
+            config=config, git_repo=git_repo,
+        )
+        assert isinstance(item, RealMergeItem)  # narrow for item.merge_wt (pyright)
+
+        worker._git_ops.get_main_sha = AsyncMock(return_value=live_main)  # type: ignore[method-assign]
+        allocator = _fake_local_allocator()
+        worker._host_allocator = allocator
+        worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
+            return_value=InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
+        )
+
+        entry = await worker._dispatch_item(item)
+
+        assert entry is not None, (
+            'ADVISORY CONTRACT VIOLATED (task 3206, PRD §5.3): a phantom frozen '
+            'tip must never refuse a dispatch whose base is the live main tip. '
+            'This is the measured 5687 / 5830 shape — that dispatch passed and '
+            'landed in production.'
+        )
+        assert entry.verify_task is not None, (
+            'the real-verify task must still be launched, not skipped'
+        )
+        assert entry.passthrough_outcome is None, (
+            'the item must not be short-circuited into a passthrough outcome'
+        )
+
+    async def test_advisory_warns_and_still_dispatches(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(b) ADVISORY PROCEEDS (task item 1) — WARNING *and* dispatch, together.
+
+        Asserted in one test on purpose: nobody can keep the log and drop the
+        flow, or keep the flow and silently drop the log.
+        """
+        import logging
+
+        worker = _make_worker(git_ops)
+        live_main = 'LIVEMAIN'
+        await self._stranded_finalize_head(
+            worker, config, git_repo, dead_commit='DEADPHANTOM',
+        )
+
+        _, item = _make_fake_item(
+            't-victim2', base_sha=live_main, merge_commit='c-victim2',
+            config=config, git_repo=git_repo,
+        )
+        assert isinstance(item, RealMergeItem)
+        worker._git_ops.get_main_sha = AsyncMock(return_value=live_main)  # type: ignore[method-assign]
+        worker._host_allocator = _fake_local_allocator()
+        worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
+            return_value=InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            entry = await worker._dispatch_item(item)
+
+        guard_warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and '§5.3 guard' in r.getMessage()
+        ]
+        assert len(guard_warnings) == 1, (
+            f'expected exactly one §5.3 guard WARNING, got: '
+            f'{[r.getMessage() for r in guard_warnings]}'
+        )
+        assert entry is not None, (
+            'the guard WARNING must accompany a COMPLETED dispatch — logging '
+            'without proceeding is enforcement by another name'
+        )
+
+    async def test_mismatch_path_does_not_leak_the_host_lease(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """(c) NO LEASE LEAK — the trap any future enforcement must solve.
+
+        The guard sits AFTER `allocator.acquire()` in `_dispatch_item`, so a
+        bare `return None` inserted at the guard would leak the host lease:
+        acquired, never released, never attached to a returned entry.  Pin
+        both halves — the lease is acquired and NOT released/cancelled, and it
+        is handed to the returned entry rather than dropped on the floor.
+        """
+        worker = _make_worker(git_ops)
+        live_main = 'LIVEMAIN'
+        await self._stranded_finalize_head(
+            worker, config, git_repo, dead_commit='DEADPHANTOM',
+        )
+
+        _, item = _make_fake_item(
+            't-victim3', base_sha=live_main, merge_commit='c-victim3',
+            config=config, git_repo=git_repo,
+        )
+        assert isinstance(item, RealMergeItem)
+        worker._git_ops.get_main_sha = AsyncMock(return_value=live_main)  # type: ignore[method-assign]
+        allocator = _fake_local_allocator()
+        worker._host_allocator = allocator
+        worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
+            return_value=InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
+        )
+
+        entry = await worker._dispatch_item(item)
+
+        assert allocator.acquire.await_count == 1, (
+            'fixture precondition: the dispatch must have acquired a lease'
+        )
+        for leaked in ('release', 'cancel_and_release', 'quarantine_and_release'):
+            assert not getattr(allocator, leaked).called, (
+                f'HOST LEASE LEAK / premature release: allocator.{leaked} was '
+                f'called on the §5.3 mismatch path. The guard runs AFTER '
+                f'acquire(); an enforcement flip that returns early here must '
+                f'hand the lease back explicitly (task 3206).'
+            )
+        assert entry is not None and entry.lease is not None, (
+            'the acquired lease must be attached to the returned entry, not dropped'
+        )
+
+    async def test_healthy_base_dispatches_with_no_warning(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """(e) HEALTHY UNAFFECTED (task item 5) — base == frozen tip.
+
+        No WARNING, dispatch completes exactly as before. Pins that steps
+        2/4/6 changed nothing on the healthy path.
+        """
+        import logging
+
+        worker = _make_worker(git_ops)
+        live_main = 'LIVEMAIN'
+
+        _, item = _make_fake_item(
+            't-healthy', base_sha=live_main, merge_commit='c-healthy',
+            config=config, git_repo=git_repo,
+        )
+        assert isinstance(item, RealMergeItem)
+        worker._git_ops.get_main_sha = AsyncMock(return_value=live_main)  # type: ignore[method-assign]
+        worker._host_allocator = _fake_local_allocator()
+        worker._run_inflight_verify = AsyncMock(  # type: ignore[method-assign]
+            return_value=InflightVerifyResult(outcome=None, merge_wt=item.merge_wt)
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            entry = await worker._dispatch_item(item)
+
+        assert entry is not None, 'a healthy dispatch must complete'
+        guard_warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and '§5.3 guard' in r.getMessage()
+        ]
+        assert guard_warnings == [], (
+            f'healthy base == frozen tip must emit no §5.3 WARNING, got: '
+            f'{[r.getMessage() for r in guard_warnings]}'
         )

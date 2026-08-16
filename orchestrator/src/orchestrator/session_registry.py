@@ -36,6 +36,13 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+# NOTE: no non-stdlib imports at module scope, deliberately — see the module
+# docstring's stdlib-only clause and _atomic_write_text below. This module is
+# executed by absolute path from skills/spawn/spawn-claude.sh with no venv,
+# install or workspace packages available, so a `from shared import ...` here
+# makes it unimportable there. Pinned by
+# test_session_registry.py::TestStdlibOnlySelfContainment.
+
 # ---------------------------------------------------------------------------
 # Schema / contract (PRD §6 G5): consumers import this; they never re-derive
 # the record shape. Bump SCHEMA_VERSION on any breaking field change.
@@ -586,12 +593,36 @@ class CorruptSessionRecord(Exception):
 def _atomic_write_text(path: Path, text: str) -> None:
     """Atomically write *text* to *path* (tmp file in the same dir, then os.replace).
 
-    Mirrors ``LaneStore._write`` (lane_lifecycle.py:279-298): the tmp file is
-    created in the target's own parent dir so the replace stays within one
-    filesystem, and is cleaned up on any failure. Shared atomic-write core:
-    write_record calls this and lets a failure propagate (its sole caller,
-    the CLI main(), provides the outer fail-soft boundary); write_decision
-    calls this too but swallows a failure itself (it is called directly by
+    THIS IS THE DELIBERATE EXCEPTION to task 3223's consolidation, which moved
+    this repo's copies of the tmp+rename writer onto
+    :func:`shared.safe_io.atomic_write_text`. This module does NOT delegate,
+    and must not be "finished off" by a later cleanup.
+
+    Why: this module is invoked by absolute path from
+    ``skills/spawn/spawn-claude.sh`` under an interpreter with no venv, no
+    install and no workspace packages on ``sys.path`` (see the module
+    docstring's stdlib-only clause, which is a hard constraint, not a stylistic
+    preference). A module-scope ``from shared import safe_io`` makes the whole
+    module unimportable there — measured as ``ModuleNotFoundError: No module
+    named 'shared'`` — and the only visible symptom is a hook subprocess that
+    silently never writes ``record.json``. The contract is pinned directly by
+    ``test_session_registry.py::TestStdlibOnlySelfContainment``, and this
+    function is recorded in ``_ALLOWED_RENAMERS`` in
+    ``shared/tests/test_safe_io.py`` so the anti-regrowth guard reads it as the
+    documented exception it is rather than a fresh copy.
+
+    The cost is conscious: the repo keeps two hand-rolled copies of this
+    pattern instead of one. A documented, allowlisted, test-pinned second copy
+    is strictly better than a module that cannot be imported by its own
+    documented entrypoint.
+
+    ``os.fdopen(fd, 'w')`` is locale-dependent rather than utf-8. That is a
+    latent bug — JSON written under a non-UTF-8 locale — but it is the
+    behaviour this module has always had, and changing it is out of scope here.
+
+    Error policy stays with the callers: write_record lets a failure propagate
+    (its sole caller, the CLI main(), provides the outer fail-soft boundary);
+    write_decision swallows a failure itself (it is called directly by
     watchers/cockpit code with no such boundary).
     """
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -910,8 +941,9 @@ def decision_id_lock(decision_id: str, root: Path | str | None = None) -> Iterat
     task 1609) near-verbatim, retargeted to the decisions dir.
 
     WHY A SIDECAR (PRD-D3 rationale, same as 1609): write_decision's writer
-    is atomic tmp+os.replace (_atomic_write_text). After a replace, the data
-    file ``<decisions_dir>/<id>.json`` is a NEW inode. A second writer that
+    is atomic tmp+os.replace (``_atomic_write_text`` above). After a replace,
+    the data file
+    ``<decisions_dir>/<id>.json`` is a NEW inode. A second writer that
     flock()s the (new) data-file path binds to a different inode and races
     anyway -- the lock is defeated. The fix is a STABLE lock target:
     ``<decisions_dir>/<id>.json.lock``, created once via os.open(O_CREAT)

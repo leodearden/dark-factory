@@ -11,10 +11,12 @@ See also:
   - dashboard/src/dashboard/config.py — DashboardConfig.from_env handling of DASHBOARD_KNOWN_PROJECT_ROOTS (COMMA-separated split)
 """
 
+import functools
 import pathlib
 import re
 import shutil
 import subprocess
+import typing
 
 import pytest
 from systemd_unit_invariants import (
@@ -616,7 +618,25 @@ MIN_SHUTDOWN_MARGIN_SECONDS = 5
 # the real invariant (5 > 6) is violated.  Parsing the live value instead makes
 # that bump fail loudly, the same way test_template_renders_to_hardcoded_file
 # renders the template rather than restating its contents.
-POLL_JS = REPO_ROOT / "dashboard" / "src" / "dashboard" / "static" / "redux" / "data.js"
+#
+# CORRECTION (task 4087): deriving that value from data.js ALONE was the same
+# class of rot one level up.  The browser runs more than one recurring HTTP
+# poller, and each holds its own keep-alive connection and reuses it at its own
+# interval — so the bound must clear the SLOWEST of them, not whichever one this
+# module happened to know about.  tab_overview.jsx has polled /api/load every
+# 5000ms for the entire life of this invariant while the derivation saw only
+# data.js's 3000ms, leaving keep-alive=5 sitting exactly ON the boundary
+# (5000 > 5000 is false) with the suite green.  CLIENT_POLLERS below makes the
+# covered set explicit and _slowest_client_poll_ms() makes the bound relational
+# against all of it; test_every_client_setinterval_is_registered_or_allowlisted
+# makes an UNcovered new poller a loud failure rather than a silent one.
+REDUX_DIR = REPO_ROOT / "dashboard" / "src" / "dashboard" / "static" / "redux"
+POLL_JS = REDUX_DIR / "data.js"
+
+# The SECOND recurring HTTP poller: HostLoadCard's /api/load poll.  It is fully
+# independent of data.js's refresh — its own setInterval, its own connection,
+# its own reuse interval — so the keep-alive bound has to clear it too.
+LOAD_POLL_JSX = REDUX_DIR / "tab_overview.jsx"
 
 # The poller names its period explicitly, so anchor on that name rather than on
 # whichever call site happens to consume it.  An earlier revision scraped the
@@ -624,43 +644,348 @@ POLL_JS = REPO_ROOT / "dashboard" / "src" / "dashboard" / "static" / "redux" / "
 # poller was refactored to pass a named constant (and gained unrelated
 # setTimeout-based fetch deadlines), because the literal no longer appeared at
 # the call site.  Binding to the declaration is both stabler and more precise.
-_POLL_INTERVAL_DECL_RE = re.compile(
-    r"^\s*(?:const|let|var)\s+POLL_INTERVAL_MS\s*=\s*(\d+)\s*;", re.MULTILINE
-)
-_POLL_INTERVAL_USE_RE = re.compile(r"setInterval\([^;]*?,\s*POLL_INTERVAL_MS\s*\)")
+#
+# The name is a PARAMETER rather than a module constant because more than one
+# client poller declares a period (see CLIENT_POLLERS below).  The patterns are
+# otherwise byte-identical per name; in particular the ``^\s*(?:const|let|var)
+# \s+`` anchor is what makes LOAD_POLL_INTERVAL_MS and POLL_INTERVAL_MS
+# mutually non-matching, so one poller can never answer a lookup for another.
+@functools.cache
+def _int_decl_pattern(const_name: str) -> re.Pattern[str]:
+    """Return the compiled ``const <const_name> = <int literal>;`` pattern."""
+    return re.compile(
+        rf"^\s*(?:const|let|var)\s+{re.escape(const_name)}\s*=\s*(\d+)\s*;",
+        re.MULTILINE,
+    )
 
 
-def _parse_poll_interval_ms(source: str, origin: str) -> int:
-    """Return the browser's data-refresh period in *source*, in milliseconds.
+@functools.cache
+def _poll_interval_patterns(const_name: str) -> tuple[re.Pattern[str], re.Pattern[str]]:
+    """Return the (declaration, use) regex pair for *const_name*, compiled once."""
+    return (
+        _int_decl_pattern(const_name),
+        re.compile(rf"setInterval\([^;]*?,\s*{re.escape(const_name)}\s*\)"),
+    )
 
-    Reads the ``POLL_INTERVAL_MS`` declaration, and separately asserts that the
+
+def _parse_declared_int(source: str, origin: str, const_name: str) -> int:
+    """Return the single integer literal *const_name* is declared with in *source*.
+
+    The declaration half of _parse_poll_interval_ms, factored out because not
+    every timing constant the keep-alive bound depends on is a ``setInterval``
+    period — data.js's ``JITTER_MAX_MS`` is awaited inside the request path, not
+    passed to a timer, so it has no call site to bind to.  Exactly one
+    declaration is still required, for the same reason: an ambiguous value is
+    not a value.
+    """
+    decls = _int_decl_pattern(const_name).findall(source)
+    assert len(decls) == 1, (
+        f"Expected exactly one {const_name} = <literal> declaration in "
+        f"{origin}, found {len(decls)}: {decls}. The keep-alive bound in this "
+        "module is derived from that constant; if it was renamed, moved, or "
+        "made non-literal, update the reader to identify the value explicitly "
+        "rather than dropping the check."
+    )
+    return int(decls[0])
+
+
+def _parse_poll_interval_ms(
+    source: str, origin: str, const_name: str = "POLL_INTERVAL_MS"
+) -> int:
+    """Return the period named *const_name* in *source*, in milliseconds.
+
+    Reads the ``<const_name>`` declaration, and separately asserts that the
     constant is what actually drives a ``setInterval``.  Both halves must hold:
     a declaration nobody schedules on would let this module measure a dead
     constant, and a scheduler whose period we cannot read would let the
     keep-alive bound be checked against nothing.  Exactly one declaration is
     required so the period can never be ambiguous.
+
+    *const_name* defaults to data.js's ``POLL_INTERVAL_MS``, but is a parameter
+    because the browser runs more than one recurring HTTP poller and each names
+    its own period — tab_overview.jsx's host-load card declares
+    ``LOAD_POLL_INTERVAL_MS``.  Parameterizing the existing parser rather than
+    writing a second one carries both halves of the contract above to every
+    poller for free.  Every message names the REQUESTED constant, so a miss on
+    one poller cannot report itself as a problem with another.
     """
-    decls = _POLL_INTERVAL_DECL_RE.findall(source)
-    assert len(decls) == 1, (
-        f"Expected exactly one POLL_INTERVAL_MS = <literal> declaration in "
-        f"{origin}, found {len(decls)}: {decls}. The keep-alive bound in this "
-        "module is derived from that period; if the poller was renamed, moved, "
-        "or its period made non-literal, update _parse_poll_interval_ms to "
-        "identify the data-refresh interval explicitly rather than dropping "
-        "the check."
-    )
-    assert _POLL_INTERVAL_USE_RE.search(source), (
-        f"POLL_INTERVAL_MS is declared in {origin} but never passed as a "
-        "setInterval(...) period, so it may no longer be the browser's actual "
-        "data-refresh interval. Update _parse_poll_interval_ms to read "
+    _, use_re = _poll_interval_patterns(const_name)
+    period = _parse_declared_int(source, origin, const_name)
+    assert use_re.search(source), (
+        f"{const_name} is declared in {origin} but never passed as a "
+        "setInterval(...) period, so it may no longer be that poller's actual "
+        "interval. Update _parse_poll_interval_ms to read "
         "whatever now schedules the poll."
     )
-    return int(decls[0])
+    return period
 
 
 def _client_poll_interval_ms() -> int:
     """Return the browser's data-refresh poll interval, in milliseconds."""
     return _parse_poll_interval_ms(POLL_JS.read_text(encoding="utf-8"), str(POLL_JS))
+
+
+class ClientPoller(typing.NamedTuple):
+    """One recurring HTTP poller the browser runs, for keep-alive purposes.
+
+    *what* is prose naming the poller, so a failure can say WHICH one set the
+    keep-alive floor instead of just printing a number.
+
+    *jitter_const* names a declared delay the poller adds ON TOP of its timer
+    period before issuing the request, or None when it adds none.  It is part of
+    the entry because the quantity this module actually needs is the worst-case
+    gap between two consecutive requests on one connection, not the timer period
+    — see _poller_reuse_ms.
+    """
+
+    path: pathlib.Path
+    const_name: str
+    what: str
+    jitter_const: str | None = None
+
+
+# Every recurring HTTP poller in the shipped client.  Membership is the property
+# that matters: an unregistered poller is one the keep-alive floor does not
+# clear, which is exactly how tab_overview.jsx's 5s /api/load poll went
+# unnoticed.  Periods are read from the live sources at run time (never restated
+# here), so there is no third copy to go stale.
+#
+# data.js registers its JITTER_MAX_MS too, because its timer period alone
+# UNDERSTATES how far apart its requests can land — refreshOne awaits
+# `sleep(random() * jitterMaxMs)` inside the in-flight window (data.js:261), so
+# consecutive requests on one endpoint can be POLL_INTERVAL_MS + JITTER_MAX_MS
+# apart.  Deriving the floor from the bare period would be the same silent
+# understatement this module is a correction for, one level further down.
+#
+# A new recurring poller MUST be added here.  The completeness guard
+# (test_every_client_setinterval_is_registered_or_allowlisted) fails on any
+# setInterval under redux/ that is neither registered here nor in
+# NON_POLLING_TIMERS, so forgetting is loud rather than silent.
+CLIENT_POLLERS: tuple[ClientPoller, ...] = (
+    ClientPoller(
+        POLL_JS, "POLL_INTERVAL_MS", "main data refresh", jitter_const="JITTER_MAX_MS"
+    ),
+    ClientPoller(
+        LOAD_POLL_JSX, "LOAD_POLL_INTERVAL_MS", "host-load card, /api/load"
+    ),
+)
+
+
+def _poller_reuse_ms(entry: ClientPoller) -> int:
+    """Return the worst-case gap between two of *entry*'s consecutive requests.
+
+    The keep-alive invariant is about the interval at which the browser REUSES
+    a connection, which is the timer period only when the poller fires its
+    request the instant the timer does.  data.js does not: refreshOne awaits a
+    random jitter of up to JITTER_MAX_MS *inside* the in-flight window before
+    fetching, so a zero-jitter tick followed by a max-jitter tick puts
+    POLL_INTERVAL_MS + JITTER_MAX_MS between the two requests.  Summing the two
+    is therefore the honest bound; using the period alone would certify a
+    keep-alive that the real spacing can exceed.
+    """
+    source = entry.path.read_text(encoding="utf-8")
+    period = _parse_poll_interval_ms(
+        source, str(entry.path), const_name=entry.const_name
+    )
+    if entry.jitter_const is None:
+        return period
+    jitter = _parse_declared_int(source, str(entry.path), entry.jitter_const)
+    # The declaration is only meaningful if something still applies it; a jitter
+    # constant left behind after the delay was removed would inflate the floor
+    # off a dead number.  Two occurrences = the declaration plus at least one use.
+    uses = len(re.findall(rf"\b{re.escape(entry.jitter_const)}\b", source))
+    assert uses >= 2, (
+        f"{entry.jitter_const} is declared in {entry.path} ({entry.what}) but "
+        "never referenced again, so it may no longer delay the request. Update "
+        "the CLIENT_POLLERS entry to name whatever now offsets the poll, or "
+        "drop jitter_const if the poller fires on its timer."
+    )
+    return period + jitter
+
+
+def _slowest_client_poll() -> tuple[int, ClientPoller]:
+    """Return (reuse_ms, poller) for the SLOWEST registered client poller.
+
+    Returns the entry alongside the interval so callers can name which poller
+    set the keep-alive floor; a bare number leaves the reader to go find it.
+    The interval is the connection-REUSE interval from _poller_reuse_ms, not the
+    bare timer period.
+    """
+    measured = [(_poller_reuse_ms(entry), entry) for entry in CLIENT_POLLERS]
+    return max(measured, key=lambda pair: pair[0])
+
+
+def _slowest_client_poll_ms() -> int:
+    """Return the slowest registered connection-reuse interval, in milliseconds."""
+    return _slowest_client_poll()[0]
+
+
+# Recurring client timers that are deliberately NOT pollers, keyed on
+# (relpath, period-text) with the reason they are exempt.
+#
+# ENTRY CRITERION — the timer must open NO network connection.  If it fetches
+# anything it belongs in CLIENT_POLLERS instead, because it then independently
+# holds a keep-alive socket and reuses it at its own interval, which is exactly
+# what the --timeout-keep-alive floor has to clear.  Parking a real poller here
+# would silence the guard while re-creating the bug it exists to catch.
+#
+# Entries are checked for staleness too: one that matches no live call site is
+# reported by test_every_client_setinterval_is_registered_or_allowlisted, so the
+# allowlist cannot quietly rot into a no-op.
+NON_POLLING_TIMERS: dict[tuple[str, str], str] = {
+    ("redux/app.jsx", "1000"): (
+        "App-wide clock tick: setInterval(() => setNow(new Date()), 1000) only "
+        "advances React state so rendered times refresh. No fetch, no "
+        "connection."
+    ),
+    ("redux/shell.jsx", "2000"): (
+        "LiveFeed re-tick: setInterval(() => tick(n => n + 1), 2000) re-renders "
+        "the relative `timeago` strings from the already-fetched window.DF_DATA "
+        "even when it has not changed. Issues no request."
+    ),
+}
+
+
+# Matches a `//` line comment or a `/* ... */` block comment.  Block first, so a
+# `//` inside a block does not end the line-comment match early.
+#
+# The `(?<![:\w])` guard keeps a URL's `//` from being read as a comment start.
+# The live client carries `http://www.w3.org/2000/svg` inside a template literal
+# at redux/tweaks-panel.jsx:82; without the guard everything after that `//` is
+# blanked, which would HIDE any call site sharing the line.
+_JS_COMMENT_RE = re.compile(r"/\*.*?\*/|(?<![:\w])//[^\n]*", re.DOTALL)
+
+
+def _strip_js_comments(source: str) -> str:
+    """Return *source* with comments blanked out, preserving line structure.
+
+    Comment bodies are replaced by their own newlines rather than deleted, so a
+    site's line number and the file's shape survive the strip.
+
+    Load-bearing, not cosmetic.  The live client mentions ``setInterval(...)``
+    inside a ``//`` comment in tab_tasks.jsx, so a raw-text scan would report a
+    call site that does not exist — training maintainers to allowlist fictions,
+    and (worse) letting an allowlist entry be "satisfied" by a commented-out
+    line.  This is the same hazard _uvicorn_int_flag already handles from the
+    other direction, by scoping its lookup to the logical ExecStart line rather
+    than the whole file, because both unit files discuss the very flags it reads
+    in prose above the command.  Scope to code, never to raw file text.
+
+    Still a regex, not a JS lexer, so it stays naive about strings and regex
+    literals — but the naivety is bounded where it actually bites.  The common
+    real case is a URL, whose ``//`` follows a ``:``, and the pattern's
+    ``(?<![:\\w])`` guard refuses to start a comment there; the live tree has
+    exactly that, inside a template literal at redux/tweaks-panel.jsx:82.  A
+    protocol-relative ``"//cdn…"`` or a ``//`` inside a regex literal would
+    still over-strip.
+
+    That residual is a real hole, NOT a safe direction.  An earlier version of
+    this docstring claimed over-stripping "can only HIDE a site, which the
+    stale-allowlist half then surfaces" — that is wrong, and worth recording so
+    nobody re-derives it: the stale check only fires for a site that ALREADY has
+    a NON_POLLING_TIMERS entry.  A newly added poller sharing a line with an
+    over-stripped ``//`` has no entry to go stale, so it would be hidden with
+    nothing to report it — precisely the silent-uncovered-poller failure this
+    guard exists to prevent.  If such a line ever appears, extend the stripper
+    to skip string/template spans rather than working around it.
+    """
+    return _JS_COMMENT_RE.sub(lambda m: "\n" * m.group(0).count("\n"), source)
+
+
+def _setinterval_period_args(source: str) -> list[str]:
+    """Return the period argument text of every ``setInterval(`` call in *source*.
+
+    Scans the argument list with a balanced-paren walk and takes the text after
+    the LAST top-level comma.  A naive ``setInterval\\([^)]*\\)`` regex stops at
+    the first ``)``, which both live non-polling timers contain in their
+    callbacks — ``setInterval(() => setNow(new Date()), 1000)`` and
+    ``setInterval(() => tick(n => n + 1), 2000)`` — so it would yield a garbled
+    period for exactly the sites this scanner exists to classify.
+    """
+    periods: list[str] = []
+    for match in re.finditer(r"\bsetInterval\s*\(", source):
+        depth = 1
+        last_comma = None
+        idx = match.end()
+        while idx < len(source) and depth:
+            char = source[idx]
+            if char in "([{":
+                depth += 1
+            elif char in ")]}":
+                depth -= 1
+                if not depth:
+                    break
+            elif char == "," and depth == 1:
+                last_comma = idx
+            idx += 1
+        if depth and idx >= len(source):
+            # Unbalanced call — report the whole tail rather than silently
+            # dropping a site the maintainer needs to see.
+            periods.append(source[match.end():].strip())
+            continue
+        arg_start = match.end() if last_comma is None else last_comma + 1
+        periods.append(source[arg_start:idx].strip())
+    return periods
+
+
+def _site_relpath(path: pathlib.Path) -> str:
+    """Return the short ``<dir>/<file>`` key a call site is reported under.
+
+    Two components, so the key is stable across checkouts and worktrees (an
+    absolute path would make every allowlist entry machine-specific) while still
+    being unambiguous and greppable within the client tree.
+    """
+    return f"{path.parent.name}/{path.name}"
+
+
+def _unclassified_setinterval_sites(
+    paths: typing.Iterable[pathlib.Path],
+    known_sites: typing.AbstractSet[tuple[str, str]],
+    allowlist: typing.Mapping[tuple[str, str], str],
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """Sort every live ``setInterval`` under *paths* into known / allowed / new.
+
+    *known_sites* is keyed on the ``(relpath, const_name)`` PAIR, not on the
+    constant name alone.  Matching on the name alone would wave through a
+    ``setInterval(fetchX, POLL_INTERVAL_MS)`` in some other file — covered, says
+    the guard; never read, says _slowest_client_poll, which only ever opens the
+    paths CLIENT_POLLERS registers — re-creating this task's silent-coverage
+    hole one level down.  That is reachable rather than theoretical for .jsx:
+    they load as ``type="text/babel"`` and Babel standalone evaluates each
+    separately, so a same-named top-level ``const`` in a second .jsx need not
+    collide with data.js's global (dashboard/tests/js/classic_script_scope.test.mjs).
+
+    Returns ``(unclassified, stale)``:
+
+    * *unclassified* — ``(relpath, period_text)`` for each call site that is
+      neither a *known_sites* pair (a registered poller, in the file it is
+      registered for) nor an *allowlist* key.  These are the sites nothing has
+      decided about, so the keep-alive floor may not clear them.
+    * *stale* — *allowlist* keys matching no live call site.  An entry that
+      matches nothing checks nothing, and rots the gate into a green no-op —
+      the same staleness reasoning as
+      test_registry_keys_are_all_declared_in_the_committed_units in
+      tests/scripts/test_check_dashboard_unit_parity.py.  Reporting it also
+      keeps a commented-out site from satisfying its own allowlist entry.
+
+    Both lists are returned rather than asserted here so the caller can name the
+    concrete remedy for each; see _strip_js_comments and
+    _setinterval_period_args for why the scan is done over comment-stripped
+    source with a balanced-paren walk.
+    """
+    unclassified: list[tuple[str, str]] = []
+    live: set[tuple[str, str]] = set()
+    for path in paths:
+        relpath = _site_relpath(path)
+        code = _strip_js_comments(path.read_text(encoding="utf-8"))
+        for period in _setinterval_period_args(code):
+            site = (relpath, period)
+            live.add(site)
+            if site in known_sites or site in allowlist:
+                continue
+            unclassified.append(site)
+    stale = sorted(key for key in allowlist if key not in live)
+    return unclassified, stale
 
 
 def _logical_exec_start(path: pathlib.Path) -> str:
@@ -887,7 +1212,8 @@ def test_uvicorn_flag_lookup_is_scoped_to_exec_start(tmp_path: pathlib.Path) -> 
 
     Both real unit files carry an explanatory comment block above ExecStart that
     names these flags verbatim — dark-factory-dashboard.service literally
-    contains the string "--timeout-keep-alive 5" in a comment.  So a future
+    contains "--timeout-keep-alive" followed by its value in a comment (quoted
+    without the number here so this claim cannot rot on a retune).  So a future
     refactor of _uvicorn_int_flag to a whole-file regex would keep every test in
     this module green while the flag had actually been deleted from the command
     systemd runs, which is the exact regression these tests exist to catch.
@@ -991,6 +1317,202 @@ def test_poll_interval_parser_requires_exactly_one_interval() -> None:
         )
 
 
+def test_poll_interval_parser_reads_an_arbitrary_constant_name() -> None:
+    """_parse_poll_interval_ms must parse ANY named period, not just POLL_INTERVAL_MS.
+
+    More than one client poller declares a period — data.js's POLL_INTERVAL_MS
+    (the main data refresh) and tab_overview.jsx's LOAD_POLL_INTERVAL_MS (the
+    host-load card's /api/load poll) — and the keep-alive lower bound is derived
+    from the SLOWEST of them.  Rather than growing a second bespoke parser, the
+    existing declaration-anchored one takes the constant name as a parameter, so
+    both halves of its contract (exactly-one-declaration, and the declared
+    constant actually schedules a setInterval) carry over to every poller for
+    free instead of being re-derived per poller.
+
+    Two properties beyond "it parses" are pinned here.  The failure messages must
+    name the REQUESTED constant: a LOAD_POLL_INTERVAL_MS miss that reported
+    itself as a POLL_INTERVAL_MS problem would send the fixer to the wrong file.
+    And the two names must not cross-match, or a max over the poller registry
+    could be computed twice from the same source with the other poller silently
+    dropping out — the exact silent-coverage failure this registry exists to
+    remove.
+    """
+    assert (
+        _parse_poll_interval_ms(
+            "const LOAD_POLL_INTERVAL_MS = 5000;\n"
+            "const id = setInterval(fetchLoad, LOAD_POLL_INTERVAL_MS);\n",
+            "synthetic",
+            const_name="LOAD_POLL_INTERVAL_MS",
+        )
+        == 5000
+    )
+
+    # Both halves of the contract still hold for the requested name, and each
+    # failure names the constant it was actually looking for.
+    with pytest.raises(AssertionError, match="found 0") as absent:
+        _parse_poll_interval_ms(
+            "fetchLoad();\n", "synthetic", const_name="LOAD_POLL_INTERVAL_MS"
+        )
+    assert "LOAD_POLL_INTERVAL_MS" in str(absent.value)
+
+    with pytest.raises(AssertionError, match="found 2") as ambiguous:
+        _parse_poll_interval_ms(
+            "const LOAD_POLL_INTERVAL_MS = 5000;\n"
+            "const LOAD_POLL_INTERVAL_MS = 9000;\n"
+            "setInterval(fetchLoad, LOAD_POLL_INTERVAL_MS);\n",
+            "synthetic",
+            const_name="LOAD_POLL_INTERVAL_MS",
+        )
+    assert "LOAD_POLL_INTERVAL_MS" in str(ambiguous.value)
+
+    with pytest.raises(AssertionError, match="never passed as a setInterval") as dead:
+        _parse_poll_interval_ms(
+            "const LOAD_POLL_INTERVAL_MS = 5000;\nsetInterval(fetchLoad, 250);\n",
+            "synthetic",
+            const_name="LOAD_POLL_INTERVAL_MS",
+        )
+    assert "LOAD_POLL_INTERVAL_MS" in str(dead.value)
+
+    # The two live names must not cross-match in EITHER direction. The
+    # ``^\s*(?:const|let|var)\s+`` anchor is what keeps LOAD_POLL_INTERVAL_MS
+    # from satisfying a POLL_INTERVAL_MS lookup by suffix; a substring match
+    # would let one poller answer for both.
+    with pytest.raises(AssertionError, match="found 0"):
+        _parse_poll_interval_ms(
+            "const POLL_INTERVAL_MS = 3000;\n"
+            "setInterval(() => pollTick(opts), POLL_INTERVAL_MS);\n",
+            "synthetic",
+            const_name="LOAD_POLL_INTERVAL_MS",
+        )
+
+    with pytest.raises(AssertionError, match="found 0"):
+        _parse_poll_interval_ms(
+            "const LOAD_POLL_INTERVAL_MS = 5000;\n"
+            "setInterval(fetchLoad, LOAD_POLL_INTERVAL_MS);\n",
+            "synthetic",
+        )
+
+
+def _write_synthetic_client(path: pathlib.Path, source: str) -> pathlib.Path:
+    """Write a synthetic client-side source file for scanner-verification tests.
+
+    The sibling of _write_synthetic_unit for the JS side: the scanner's own
+    behaviour is pinned against sources this module controls, so the live-tree
+    guard is the only test coupled to the real dashboard client.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(source, encoding="utf-8")
+    return path
+
+
+def test_setinterval_scanner_classifies_every_call_site(
+    tmp_path: pathlib.Path,
+) -> None:
+    """_unclassified_setinterval_sites must sort live timers into known/allowed/new.
+
+    This is the guard-the-guard test for the completeness check: a scanner that
+    silently reported nothing would turn
+    test_every_client_setinterval_is_registered_or_allowlisted into a green
+    no-op, which is the exact failure mode that let a second poller go
+    unnoticed in the first place.
+
+    Two hazards get their own cases.  Comment immunity: the live tree mentions
+    ``setInterval(...)`` inside a ``//`` comment at tab_tasks.jsx, so a raw-text
+    scan would report a phantom site and train maintainers to allowlist
+    fictions.  That is the same trap _uvicorn_int_flag already handles from the
+    other direction by scoping to the logical ExecStart line rather than the
+    whole file (see test_uvicorn_flag_lookup_is_scoped_to_exec_start).  And
+    nested calls: a naive ``setInterval\\([^)]*\\)`` match stops at the FIRST
+    ``)``, so ``setInterval(() => tick(n => n + 1), 2000)`` would yield a
+    garbled period — both live non-polling timers have exactly this shape.
+
+    Two more cases pin the edges of "classified".  A registered constant used
+    in an UNregistered file must still be reported: coverage is the
+    (file, constant) pair, because _slowest_client_poll only ever reads the
+    paths CLIENT_POLLERS names, so a name-only match would claim coverage
+    nothing provides.  And a URL's ``//`` must not start a comment, or a real
+    call site sharing that line is blanked out of the scan entirely — with no
+    allowlist entry to go stale and report it.
+    """
+    redux = tmp_path / "redux"
+
+    # Registered: driven by a known poller constant, in its registered file.
+    registered = _write_synthetic_client(
+        redux / "data.js",
+        "const POLL_INTERVAL_MS = 3000;\n"
+        "setInterval(() => pollTick(opts), POLL_INTERVAL_MS);\n",
+    )
+    # Same constant NAME, different (unregistered) file — must NOT be waved
+    # through: nothing reads this file's declaration, so nothing bounds it.
+    impostor = _write_synthetic_client(
+        redux / "tab_impostor.jsx",
+        "const POLL_INTERVAL_MS = 9000;\n"
+        "setInterval(fetchOther, POLL_INTERVAL_MS);\n",
+    )
+    # A live call site sharing a line with a URL inside a string literal.
+    urly = _write_synthetic_client(
+        redux / "tab_urly.jsx",
+        "const u = 'https://x/y'; setInterval(fetchUrly, 8000);\n",
+    )
+    # Allowlisted: a pure UI tick, and a NESTED call in the callback.
+    allowlisted = _write_synthetic_client(
+        redux / "app.jsx",
+        "setInterval(() => setNow(new Date()), 1000);\n",
+    )
+    # Unregistered and unallowlisted — must be reported.
+    unknown = _write_synthetic_client(
+        redux / "tab_thing.jsx",
+        "setInterval(fetchThing, 4000);\n",
+    )
+    # Also unclassified, and nested two deep: pins the balanced-paren scan.
+    nested = _write_synthetic_client(
+        redux / "shell.jsx",
+        "setInterval(() => tick(n => n + 1), 2000);\n",
+    )
+    # Comments only: a `//` mention and a `/* */` block. Neither is live code.
+    commented = _write_synthetic_client(
+        redux / "tab_tasks.jsx",
+        "// ...`setInterval(() => setNow(...), 1000)`, unrelated\n"
+        "/* legacy, removed:\n"
+        "setInterval(fetchOld, 7000);\n"
+        "*/\n",
+    )
+
+    allowlist = {
+        ("redux/app.jsx", "1000"): "clock tick — opens no connection",
+        # Points at a call site that now exists only inside a comment.
+        ("redux/tab_tasks.jsx", "1000"): "checks nothing anymore",
+    }
+    unclassified, stale = _unclassified_setinterval_sites(
+        [registered, impostor, urly, allowlisted, unknown, nested, commented],
+        known_sites={("redux/data.js", "POLL_INTERVAL_MS")},
+        allowlist=allowlist,
+    )
+
+    # (a) known (file, constant) pair, (b) allowlisted, (d) comment-only: none
+    # reported.  (c) every genuinely new timer is, named with file and period —
+    # including the name-collision impostor and the site sharing a URL's line.
+    assert sorted(unclassified) == [
+        ("redux/shell.jsx", "2000"),
+        ("redux/tab_impostor.jsx", "POLL_INTERVAL_MS"),
+        ("redux/tab_thing.jsx", "4000"),
+        ("redux/tab_urly.jsx", "8000"),
+    ], (
+        "Scanner must report exactly the unregistered, unallowlisted call sites "
+        f"— with their periods — and nothing else; got {sorted(unclassified)}. "
+        "A phantom from a commented-out site would train maintainers to "
+        "allowlist fictions; a missed real site is a poller the keep-alive "
+        "floor does not clear."
+    )
+
+    # (e) an allowlist entry whose site is now only a comment is STALE, not
+    # silently satisfied — otherwise the allowlist rots into a no-op gate.
+    assert stale == [("redux/tab_tasks.jsx", "1000")], (
+        "An allowlist entry matching no live call site must be reported stale; "
+        f"got {stale}."
+    )
+
+
 def test_client_poll_interval_is_readable_from_the_shipped_client() -> None:
     """The live client source must still yield a poll interval to compare against.
 
@@ -1003,6 +1525,259 @@ def test_client_poll_interval_is_readable_from_the_shipped_client() -> None:
         "is derived from it; update POLL_JS if the client moved."
     )
     assert _client_poll_interval_ms() > 0
+
+
+def test_host_load_poller_declares_a_named_interval() -> None:
+    """The host-load card's /api/load poller must expose a parseable period too.
+
+    HostLoadCard in tab_overview.jsx runs an INDEPENDENT second HTTP poller: it
+    fetches /api/load on its own setInterval, entirely separate from data.js's
+    data refresh.  It therefore holds its own keep-alive connection and reuses
+    it at its own interval, so its period is a load-bearing input to the
+    keep-alive lower bound and must be derivable — a poller whose period cannot
+    be read is a poller the bound cannot clear.
+
+    Naming the period rather than leaving a bare ``setInterval(fetchLoad, 5000)``
+    literal is what makes that derivation stable.  This module already learned
+    and recorded that lesson for data.js (see the comment above
+    _poll_interval_patterns): scraping the literal at the call site broke the
+    moment the poller was refactored to pass a named constant, and binding to
+    the declaration is both stabler and more precise.  The same reasoning
+    applies here, and the declaration additionally gives the JSX a place to
+    carry the "this feeds the systemd keep-alive bound" warning.
+    """
+    assert LOAD_POLL_JSX.is_file(), (
+        f"Host-load poll source not found at {LOAD_POLL_JSX}. The keep-alive "
+        "lower bound is derived from it; update LOAD_POLL_JSX if the host-load "
+        "card moved."
+    )
+    assert (
+        _parse_poll_interval_ms(
+            LOAD_POLL_JSX.read_text(encoding="utf-8"),
+            str(LOAD_POLL_JSX),
+            const_name="LOAD_POLL_INTERVAL_MS",
+        )
+        > 0
+    )
+
+
+def test_poller_reuse_interval_adds_declared_jitter(tmp_path: pathlib.Path) -> None:
+    """A poller's reuse interval must include any delay it adds before fetching.
+
+    Pinned against synthetic sources so the arithmetic is checked independently
+    of whatever the live client currently declares.  The keep-alive floor is
+    about how long a connection sits idle between two requests, and a poller
+    that sleeps up to J ms inside its request path spaces consecutive requests
+    by up to period + J — so deriving the floor from the timer period alone
+    understates it, silently, in the direction that certifies a too-low
+    keep-alive.  data.js does exactly this (JITTER_MAX_MS, awaited inside the
+    in-flight window at data.js:261).
+    """
+    plain = _write_synthetic_client(
+        tmp_path / "plain.js",
+        "const POLL_INTERVAL_MS = 3000;\nsetInterval(tick, POLL_INTERVAL_MS);\n",
+    )
+    assert (
+        _poller_reuse_ms(ClientPoller(plain, "POLL_INTERVAL_MS", "no jitter")) == 3000
+    ), "A poller that fires on its timer reuses at exactly its period."
+
+    jittered = _write_synthetic_client(
+        tmp_path / "jittered.js",
+        "const JITTER_MAX_MS = 1500;\n"
+        "const POLL_INTERVAL_MS = 3000;\n"
+        "setInterval(tick, POLL_INTERVAL_MS);\n"
+        "async function go() { await sleep(random() * JITTER_MAX_MS); }\n",
+    )
+    assert (
+        _poller_reuse_ms(
+            ClientPoller(
+                jittered, "POLL_INTERVAL_MS", "jittered", jitter_const="JITTER_MAX_MS"
+            )
+        )
+        == 4500
+    ), (
+        "Worst-case spacing is period + jitter: a zero-jitter tick followed by a "
+        "max-jitter tick puts POLL_INTERVAL_MS + JITTER_MAX_MS between requests."
+    )
+
+    # A jitter constant nothing applies would inflate the floor off a dead
+    # number — as wrong as omitting it, just in the other direction.
+    dead = _write_synthetic_client(
+        tmp_path / "dead.js",
+        "const JITTER_MAX_MS = 1500;\n"
+        "const POLL_INTERVAL_MS = 3000;\n"
+        "setInterval(tick, POLL_INTERVAL_MS);\n",
+    )
+    with pytest.raises(AssertionError, match="never referenced again") as unused:
+        _poller_reuse_ms(
+            ClientPoller(
+                dead, "POLL_INTERVAL_MS", "dead jitter", jitter_const="JITTER_MAX_MS"
+            )
+        )
+    assert "JITTER_MAX_MS" in str(unused.value)
+
+
+def test_slowest_client_poll_is_derived_from_every_registered_poller() -> None:
+    """The keep-alive floor must come from the SLOWEST poller, not from data.js.
+
+    CLIENT_POLLERS is the explicit statement of which recurring HTTP pollers the
+    keep-alive bound covers, and _slowest_client_poll_ms() reduces it with max()
+    — because each poller independently reuses its own connection at its own
+    interval, so a bound that clears only the fastest one still closes the
+    slower socket in the gap between its polls.
+
+    The registry gets the same staleness guard as
+    test_registry_keys_are_all_declared_in_the_committed_units in
+    tests/scripts/test_check_dashboard_unit_parity.py: every registered path must
+    exist and every registered constant must still parse, so a moved file or a
+    renamed constant fails loudly here instead of silently dropping a poller out
+    of the max and quietly lowering the floor.
+
+    The defect this task exists to remove is a registry that covers only
+    data.js, so what is pinned is MEMBERSHIP: at least two entries, both
+    specific pollers present, and the reduction returning one of them.  The
+    relative ORDER of the two periods is deliberately left unpinned — an earlier
+    revision asserted the slowest was strictly slower than data.js's, which
+    reads as "the registry collapsed" but would also fire on a perfectly
+    legitimate retune (dropping /api/load to 2s, or raising the data refresh
+    past 5s) that leaves the registry complete and the bound correct.  A guard
+    that reports a false cause is worse than one that reports nothing.
+    """
+    assert len(CLIENT_POLLERS) >= 2, (
+        f"CLIENT_POLLERS has {len(CLIENT_POLLERS)} entr(y/ies); the shipped "
+        "client runs at least two independent recurring HTTP pollers, so a "
+        "shorter registry means one has been dropped and the keep-alive floor "
+        "no longer clears it."
+    )
+    registered = {(entry.path, entry.const_name) for entry in CLIENT_POLLERS}
+    assert (POLL_JS, "POLL_INTERVAL_MS") in registered, (
+        "data.js's main data refresh is missing from CLIENT_POLLERS; the "
+        "keep-alive floor would stop covering it."
+    )
+    assert (LOAD_POLL_JSX, "LOAD_POLL_INTERVAL_MS") in registered, (
+        "tab_overview.jsx's /api/load host-load poll is missing from "
+        "CLIENT_POLLERS. It is an independent recurring HTTP poller and holds "
+        "its own keep-alive connection, so the floor must clear it too."
+    )
+
+    reuses = []
+    for entry in CLIENT_POLLERS:
+        assert entry.path.is_file(), (
+            f"CLIENT_POLLERS registers {entry.path} ({entry.what}) but that file "
+            "does not exist. Update the registry entry rather than leaving a "
+            "poller silently uncovered by the keep-alive floor."
+        )
+        period = _parse_poll_interval_ms(
+            entry.path.read_text(encoding="utf-8"),
+            str(entry.path),
+            const_name=entry.const_name,
+        )
+        assert period > 0
+        reuse = _poller_reuse_ms(entry)
+        assert reuse >= period, (
+            f"{entry.what}'s connection-reuse interval ({reuse}ms) is below its "
+            f"own timer period ({period}ms), which is incoherent — jitter can "
+            "only push consecutive requests further apart, never closer."
+        )
+        reuses.append(reuse)
+
+    # data.js's jitter must stay wired into the registry, not just exist in the
+    # source: dropping jitter_const would put the derivation back to the bare
+    # period and re-open the understatement (see _poller_reuse_ms).
+    data_entry = next(e for e in CLIENT_POLLERS if e.path == POLL_JS)
+    assert data_entry.jitter_const, (
+        "data.js's CLIENT_POLLERS entry no longer names a jitter constant. Its "
+        "refreshOne awaits a random delay inside the in-flight window, so its "
+        "requests land further apart than POLL_INTERVAL_MS; without "
+        "jitter_const the keep-alive floor is derived from a gap smaller than "
+        "the real one. Re-point jitter_const at whatever now delays the fetch, "
+        "or remove it only once the delay itself is gone."
+    )
+    assert _poller_reuse_ms(data_entry) > _parse_poll_interval_ms(
+        POLL_JS.read_text(encoding="utf-8"), str(POLL_JS)
+    ), (
+        "data.js's reuse interval equals its bare poll period, so the declared "
+        f"jitter ({data_entry.jitter_const}) is contributing nothing to the "
+        "keep-alive floor."
+    )
+
+    slowest_ms, slowest = _slowest_client_poll()
+    assert slowest_ms == max(reuses), (
+        "_slowest_client_poll() must be the max over every registered poller's "
+        f"connection-reuse interval; got {slowest_ms} against {reuses}."
+    )
+    assert slowest in CLIENT_POLLERS, (
+        f"_slowest_client_poll() returned {slowest}, which is not a registered "
+        "entry — the floor must be attributable to a poller the registry names."
+    )
+
+
+def test_every_client_setinterval_is_registered_or_allowlisted() -> None:
+    """Every recurring timer in the client must be classified, not merely absent.
+
+    This is the guard that would have caught the defect this module now carries
+    a correction for.  tab_overview.jsx polled /api/load every 5000ms for the
+    entire life of the keep-alive invariant; the derivation read data.js and
+    nothing else, so the second poller was never part of the bound and
+    keep-alive sat exactly ON its boundary (5000 > 5000 is false) with the whole
+    suite green.  Nothing failed, because nothing was looking.
+
+    So membership is checked from the CLIENT side, not just the registry side:
+    every setInterval under the shipped redux tree must be accounted for by one
+    of two explicit decisions, and an unclassified one fails loudly with both
+    remedies named.  Files are globbed live rather than enumerated, so a new
+    client file is covered the moment it lands rather than when someone
+    remembers to add it here.
+
+    ``.html`` is in the sweep alongside ``.js``/``.jsx`` because index.html sits
+    in this same directory and is where every ``<script>`` tag lives: an inline
+    ``<script>setInterval(...)</script>`` there would otherwise be exactly as
+    invisible as the /api/load poller was.  The comment-stripper and
+    balanced-paren scanner read inline script text unchanged.
+
+    Coverage is asserted per (file, constant) pair rather than per constant
+    name — see _unclassified_setinterval_sites for why a name-only match would
+    claim coverage that _slowest_client_poll does not actually provide.
+    """
+    sources = sorted(
+        path
+        for path in REDUX_DIR.rglob("*")
+        if path.suffix in (".js", ".jsx", ".html") and path.is_file()
+    )
+    assert sources, (
+        f"No .js/.jsx/.html sources found under {REDUX_DIR}. This guard would "
+        "pass vacuously — update REDUX_DIR to wherever the client moved rather "
+        "than leaving every client timer unchecked."
+    )
+
+    unclassified, stale = _unclassified_setinterval_sites(
+        sources,
+        known_sites={
+            (_site_relpath(entry.path), entry.const_name) for entry in CLIENT_POLLERS
+        },
+        allowlist=NON_POLLING_TIMERS,
+    )
+
+    assert not unclassified, (
+        "Unclassified setInterval call site(s) in the dashboard client: "
+        f"{unclassified}. Every recurring timer must be an explicit decision, "
+        "because a timer that performs HTTP holds its own keep-alive connection "
+        "and reuses it at its own interval — which is how tab_overview.jsx's 5s "
+        "/api/load poll went unnoticed while the keep-alive floor was derived "
+        "from data.js alone.\n"
+        "  - If it PERFORMS HTTP: name its period as a *_POLL_INTERVAL_MS "
+        "constant and register it in CLIENT_POLLERS. If it is the slowest "
+        "poller this raises the --timeout-keep-alive floor, and "
+        "test_keep_alive_timeout_is_pinned_above_poll_interval will say so.\n"
+        "  - If it is a pure UI tick that opens NO connection: add it to "
+        "NON_POLLING_TIMERS with a reason."
+    )
+    assert not stale, (
+        f"NON_POLLING_TIMERS entries matching no live call site: {stale}. "
+        "An entry that matches nothing checks nothing, so it silently rots this "
+        "gate — remove it, or fix it to match the timer it was meant to cover. "
+        "Note a commented-out call site does not count as live."
+    )
 
 
 def test_shutdown_drain_is_bounded_in_both_unit_files() -> None:
@@ -1022,45 +1797,61 @@ def test_keep_alive_timeout_is_pinned_above_poll_interval() -> None:
     """--timeout-keep-alive must be pinned explicitly, and pinned ABOVE the poll interval.
 
     The lower bound is the non-obvious half of this test.  The tempting move —
-    dropping keep-alive below the client's 3s poll so idle connections close on
-    their own — is wrong here: it would make the server close the polling socket
-    in the gap between polls, exposing the classic
+    dropping keep-alive below the slowest client poll so idle connections close
+    on their own — is wrong here: it would make the server close that polling
+    socket in the gap between its polls, exposing the classic
     server-closes-while-client-writes race, i.e. trading a shutdown-time stall
     for request-time failures on a change whose whole purpose is availability.
     The hard drain guarantee already comes from --timeout-graceful-shutdown, so
     keep-alive is not being asked to do that job.
 
-    Pinning it explicitly (at uvicorn's own default) is still worth doing: it
-    surfaces the interaction that caused the incident — the 5s default exceeds
-    the 3s poll, which is precisely why the connection never idles out — makes
-    it greppable, and gives the unit-file parity check a concrete directive to
-    diff.
+    The bound must clear EVERY recurring HTTP poller, not just the busiest one.
+    Each poller holds its own keep-alive connection and reuses it at its OWN
+    interval, so a keep-alive above data.js's 3s data refresh but at-or-below
+    tab_overview.jsx's 5s /api/load poll still exposes that race on the slower
+    socket — which is precisely the state this test used to certify as green
+    (see the CORRECTION note above CLIENT_POLLERS).  Hence the comparison is
+    against _slowest_client_poll_ms().
 
-    The poll interval is read out of the client source (POLL_JS) rather than
-    restated, so raising the poller past the pinned keep-alive fails here
-    instead of passing against a stale copy of the number.  The comparison is
-    done in milliseconds to keep a non-whole-second poll (e.g. 3500ms) from
-    being floored into a looser bound than the client actually uses.
+    That comparison is against the connection-REUSE interval, which is not the
+    same as the timer period: data.js delays each request by up to
+    JITTER_MAX_MS inside the in-flight window, so its requests can land
+    POLL_INTERVAL_MS + JITTER_MAX_MS apart.  Comparing against the bare period
+    would understate the gap the socket actually has to survive — see
+    _poller_reuse_ms.
+
+    Pinning it explicitly is still worth doing beyond the bound itself: it
+    surfaces the interaction that caused the incident — keep-alive exceeds the
+    poll interval, which is precisely why the connection never idles out —
+    makes it greppable, and gives the unit-file parity check a concrete
+    directive to diff.
+
+    Every period is read out of the live client sources rather than restated,
+    so raising a poller past the pinned keep-alive fails here instead of passing
+    against a stale copy of the number.  The comparison is done in milliseconds
+    to keep a non-whole-second poll (e.g. 3500ms) from being floored into a
+    looser bound than the client actually uses.
     """
-    poll_ms = _client_poll_interval_ms()
+    poll_ms, slowest = _slowest_client_poll()
     for path in (TEMPLATE, HARDCODED):
         keep_alive = _uvicorn_int_flag(path, "timeout-keep-alive")
         assert keep_alive is not None, (
             f"No --timeout-keep-alive flag in the ExecStart of {path}. "
             "Leaving it implicit hides the interaction that caused the incident: "
-            "uvicorn's 5s default exceeds the client's "
-            f"{poll_ms / 1000:g}s poll ({POLL_JS}), which is why the polling "
-            "connection never idles out."
+            "keep-alive exceeds the slowest client connection-reuse interval — "
+            f"{poll_ms / 1000:g}s, from {slowest.what} ({slowest.path}) — which "
+            "is why the polling connection never idles out."
         )
         assert keep_alive * 1000 > poll_ms, (
-            f"--timeout-keep-alive {keep_alive}s is not above the client's "
-            f"{poll_ms / 1000:g}s poll interval ({POLL_JS}) in {path}. "
-            "Below the poll interval the server closes the polling socket in the "
+            f"--timeout-keep-alive {keep_alive}s is not above the slowest client "
+            f"connection-reuse interval of {poll_ms / 1000:g}s — {slowest.what}, "
+            f"{slowest.const_name} in {slowest.path} — in {path}. "
+            "Below that poller's interval the server closes its socket in the "
             "gap between polls, exposing the server-closes-while-client-writes "
             "race and turning a shutdown fix into a source of failed polls. The "
             "drain is already bounded by --timeout-graceful-shutdown; do not "
             "retune keep-alive to compensate for it — raise keep-alive above the "
-            "new poll interval, or lower the poll interval."
+            "new poll interval (in BOTH unit files), or lower the poll interval."
         )
         stop = _timeout_stop_sec(path)
         assert keep_alive < stop, (

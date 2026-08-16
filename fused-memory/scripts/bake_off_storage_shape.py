@@ -62,6 +62,37 @@ the real guard.  ``guard_adequacy`` therefore returns
      so nobody trends it across embedding-config changes as if it were
      stable.
 
+RANK-BASED IS NOT TRANSFORM-BLIND
+--------------------------------
+**The single statement of the credit mechanism.**  Every other site in this
+module and its tests points HERE rather than restating it, because five
+copies of one paragraph drift into five subtly different claims.
+
+Discoverability is reported in BOTH forms.  ``canonical_in_top_5_rate`` is
+measured over the read window, where ``apply_grouped_read`` has already
+synthesised a grouped document carrying the CANONICAL's ``record_id`` — and
+``topic_discoverability`` identifies the canonical BY ``record_id``.  So
+under ``b_grouped`` any child hit that folds upward materialises a record
+wearing the canonical's id and is scored as "the canonical was found", while
+under ``c_peers``/``status_quo`` the canonical's own stored record must
+itself have ranked.  ``apply_topic_anchor`` credits it the same way, by
+injecting the canonical outright — so grouping is not the only transform
+that can move that column.
+
+``stored_canonical_in_top_5_rate`` (with its median rank and censored
+denominator) is measured over the RAW store hits, before either transform,
+and so answers the narrower question: did the canonical's own stored record
+rank?  It is therefore identical across a shape's two pin variants by
+construction.
+
+Neither number is corrected toward the other — the transform-credited one is
+arguably the right thing to credit, since a grouped read genuinely does put
+the canonical body in the reader's window.  The gap between them is the read
+transform's contribution, DISCLOSED rather than folded invisibly into one
+column.  See ``render_markdown``'s reading guide for the operator-facing
+statement of the same thing (the one legitimate second copy, because it is
+output rather than commentary).
+
 BLIND-AUTHORING PROTOCOL (resolves PRD §10's open tactical question
 "Blind-authoring protocol for ζ's arms (two-agent cross-check vs
 single-author-blind-to-metrics)")
@@ -1774,8 +1805,16 @@ _REQUIRED_ARM_METRICS: dict[str, tuple[str, ...]] = {
     # The rate, AND the censored denominator the median rank is taken over:
     # a median over successes only lets an arm that rarely finds the
     # canonical print the best rank, so the two must travel together.
+    #
+    # The `stored_` trio travels with them for the same class of reason — see
+    # the module docstring, "Rank-based is not transform-blind".  Registered
+    # rather than merely produced, because a table carrying only the
+    # transform-credited half IS the undisclosed state it exists to fix.
     'discoverability': ('canonical_in_top_5_rate', 'median_canonical_rank',
-                        'canonical_found_count', 'canonical_candidates'),
+                        'canonical_found_count', 'canonical_candidates',
+                        'stored_canonical_in_top_5_rate',
+                        'stored_canonical_median_rank',
+                        'stored_canonical_found_count'),
     # eval-design §5 E2 names claim recall and discoverability as DISTINCT
     # metrics, and the fixture splits its queries accordingly. Required, not
     # optional: a pooled-only report cannot tell a shape that wins on claim
@@ -1791,6 +1830,21 @@ _REQUIRED_ARM_METRICS: dict[str, tuple[str, ...]] = {
                        'threshold_replay', 'threshold', 'max_observed_score',
                        'probes', 'guard_covered_probes'),
 }
+
+#: What each ``by_query_kind`` subset must carry, on top of the kind names
+#: registered above.  The metric BLOCKS are named here; the keys inside them
+#: are the same tuples the pooled block is checked against, reused rather than
+#: retyped — a subset is the pooled block computed over fewer rows (one
+#: ``_aggregate_queries`` call for both), so a second key list here could
+#: drift into disagreeing with the code that produces both.
+#:
+#: Validating only the kind NAMES was a fail-obscure gap: the by-kind table
+#: subscripts ``subset['discoverability'][...]`` and ``subset['queries']``
+#: directly, so a subset missing one surfaced as a raw ``KeyError`` out of
+#: ``render_markdown`` instead of an :class:`IncompleteReportError` naming the
+#: arm, the kind and the key.
+_REQUIRED_SUBSET_KEYS: tuple[str, ...] = ('queries',)
+_REQUIRED_SUBSET_METRICS: tuple[str, ...] = ('claim_recall', 'discoverability')
 
 #: What the artifact must say about how it was produced.  An arbitration
 #: artifact whose provenance is not in it cannot be re-read six months later
@@ -1808,6 +1862,11 @@ DECISION_TABLE_COLUMNS: tuple[str, ...] = (
     'claim recall@5',
     'claim recall@10',
     'canonical in top-5',
+    # The same question, asked of the RAW store hits — see the module
+    # docstring, "Rank-based is not transform-blind".  ADJACENT on purpose:
+    # the gap between the two IS the read transform's contribution, and a
+    # qualifier placed anywhere else is not a qualifier on this number.
+    'canonical in top-5 (stored)',
     'median canonical rank',
     'tokens/query',
     'guard candidate present',
@@ -1828,7 +1887,11 @@ DEFAULT_REPORT_MD = _PACKAGE_ROOT.parent / 'plans' / 'e2-storage-shape-bakeoff-r
 
 #: Bumped when the JSON's shape changes, so a reader of an old artifact is
 #: never silently comparing two different schemas.
-REPORT_SCHEMA_VERSION = 1
+#: v2 — the `discoverability` block gained the transform-blind trio
+#: (`stored_canonical_in_top_5_rate` / `_median_rank` / `_found_count`), so a
+#: v1 artifact and a v2 one answer different questions in the same column
+#: names and must not be diffed as if they were the same schema.
+REPORT_SCHEMA_VERSION = 2
 
 
 class IncompleteReportError(RuntimeError):
@@ -1918,6 +1981,33 @@ def _check_arms(arms: dict[str, Any]) -> None:
                     raise IncompleteReportError(
                         f"arm '{arm}' metric '{metric}' is missing '{key}'"
                     )
+
+        # The same rule, INSIDE each subset.  The loop above proves every kind
+        # name is present; a subset that is present but hollow renders a
+        # by-kind row out of `KeyError` rather than out of this error class,
+        # and the whole completeness discipline here is that a missing
+        # measurement is named, never discovered by a traceback.
+        by_kind = measurement['by_query_kind']
+        for kind in (*QUERY_KINDS, HELD_OUT_SUBSET):
+            subset = by_kind[kind]
+            for key in _REQUIRED_SUBSET_KEYS:
+                if key not in subset:
+                    raise IncompleteReportError(
+                        f"arm '{arm}' by_query_kind '{kind}' is missing "
+                        f"'{key}'"
+                    )
+            for metric in _REQUIRED_SUBSET_METRICS:
+                if metric not in subset:
+                    raise IncompleteReportError(
+                        f"arm '{arm}' by_query_kind '{kind}' is missing "
+                        f"metric '{metric}'"
+                    )
+                for key in _REQUIRED_ARM_METRICS[metric]:
+                    if key not in subset[metric]:
+                        raise IncompleteReportError(
+                            f"arm '{arm}' by_query_kind '{kind}' metric "
+                            f"'{metric}' is missing '{key}'"
+                        )
 
 
 def build_report(
@@ -2048,6 +2138,93 @@ def _pin_cell(rate: Any) -> str:
     return _cell(rate)
 
 
+def stored_gap_bullet_prefix(arm: str) -> str:
+    """The machine-findable anchor for one arm's stored-vs-credited bullet.
+
+    Same contract as :func:`pin_bullet_prefix` — renderer and test both go
+    through here, so the bullet's prose stays free to change and only the
+    numbers are pinned.  Deliberately NOT the same string: that anchor is
+    ``- **`{shape}`** —``, and a per-ARM bullet reusing it would give the pin
+    test two bullets where it asserts exactly one.
+    """
+    return f'- `{arm}` stored vs credited:'
+
+
+def _gap_cell(gap: float) -> str:
+    """A stored-vs-credited gap, where a rounded-down nonzero would be a lie.
+
+    Same rule as :func:`_pin_cell`, for the same reason: this block sorts arms
+    by whether the two columns AGREE, so a real gap must never print as
+    ``0.00`` — the value the surrounding sentence reads as "identical".
+    """
+    if gap and abs(gap) < _PIN_RATE_ROUNDS_TO_ZERO:
+        return _PIN_RATE_UNDERFLOW if gap > 0 else f'-{_PIN_RATE_UNDERFLOW}'
+    return _cell(gap)
+
+
+def _stored_gap_lines(report: dict[str, Any]) -> list[str]:
+    """The stored-vs-credited comparison, DERIVED from the arms it describes.
+
+    Every run-specific finding in this renderer is computed from ``report``
+    (see the pin bullets below), and this one is no exception on purpose.
+    This file is a rerunnable generator: a hand-typed sentence about a
+    previous run's numbers silently becomes a false statement sitting three
+    lines above the table that contradicts it, in the one artifact gate η
+    reads.  The numbers here move when the table's do, or not at all.
+
+    The causal claim is kept general for the same reason.  Agreement is NOT
+    evidence that a shape "runs no grouping transform": ``apply_topic_anchor``
+    also injects the canonical and so also diverges the two columns wherever
+    the pin fires.  What agreement licenses is the narrower statement that no
+    read-side transform changed what the credited column counted on that arm.
+    """
+    lines: list[str] = [
+        '',
+        'As measured in THIS run, per arm (derived from the table above, not '
+        'asserted — no threshold is set on either column):',
+        '',
+    ]
+    bullets: list[str] = []
+    for arm in ARM_VARIANTS:
+        discoverability = report['arms'][arm]['discoverability']
+        credited = discoverability['canonical_in_top_5_rate']
+        stored = discoverability['stored_canonical_in_top_5_rate']
+        anchor = stored_gap_bullet_prefix(arm)
+        if credited is None or stored is None:
+            bullets.append(
+                f'{anchor} {_cell(stored)} vs {_cell(credited)} — not '
+                f'comparable; one of the two columns was never measured.'
+            )
+            continue
+        if credited == stored:
+            bullets.append(
+                f'{anchor} {_cell(stored)} vs {_cell(credited)} — identical, '
+                f'so no read-side transform changed what the credited column '
+                f'counted on this arm.'
+            )
+            continue
+        bullets.append(
+            f'{anchor} {_cell(stored)} vs {_cell(credited)} — a gap of '
+            f'{_gap_cell(credited - stored)}, which is what the read-side '
+            f'transforms added on top of what retrieval put in front of the '
+            f'reader.'
+        )
+    lines += bullets
+    lines += [
+        '',
+        'Where the two agree, `canonical in top-5` is reporting retrieval '
+        'alone on that arm.  Where they diverge, the gap is a read '
+        'transform\'s contribution rather than a retrieval difference, and '
+        '`pin changed window` is what says WHICH transform: a row whose pin '
+        'never fired can only have been moved by grouping.  Whether the gap '
+        'is worth crediting is gate η\'s call, and it is a different call '
+        'from "this shape retrieves the canonical better".  Read the same two '
+        'columns on the `held_out` rows of the by-kind table, which are the '
+        'only rows measuring generalisation.',
+    ]
+    return lines
+
+
 def render_markdown(report: dict[str, Any]) -> str:
     """The operator-facing artifact: prose, decision table, D10, provenance.
 
@@ -2106,6 +2283,38 @@ def render_markdown(report: dict[str, Any]) -> str:
         'full fetch depth, not the k=5 read window, so "outside top-5" and '
         '"absent entirely" stay distinguishable.',
         '',
+        '`canonical in top-5` is measured over the READ window, and under '
+        '`b_grouped` that is not the same question it is under the other two '
+        'shapes.  `apply_grouped_read` synthesises its grouped document '
+        'carrying the CANONICAL\'s `record_id`, and the metric identifies the '
+        'canonical by `record_id` — so any child hit that folds upward is '
+        'scored as "the canonical was found", whereas under `c_peers` and '
+        '`status_quo` the canonical\'s own stored record must itself have '
+        'ranked.  Grouping is not the only transform that credits it: '
+        '`apply_topic_anchor` injects the canonical outright, so a `+pin` row '
+        'whose pin fired can move this column too.  Either way it is a '
+        'property of the READ TRANSFORM, not purely of retrieval.  It is also '
+        'arguably the right thing to credit: a grouped read genuinely does '
+        'put the canonical body in the reader\'s window, which is what a '
+        'reader of that window cares about.',
+        '',
+        '`canonical in top-5 (stored)` is the transform-blind counterpart — '
+        'the canonical\'s OWN stored record, measured over the raw store hits '
+        'before grouping and before the pin.  It is therefore identical '
+        'across a shape\'s two pin variants by construction, and comparable '
+        'across all six arms.  **Read the two together: the gap between them '
+        'is what the read transforms added.**  This is DISCLOSURE, not '
+        'correction — no '
+        'arm, pin, window or threshold was re-tuned to move either column, '
+        'and both numbers are recorded exactly as measured (gate G6/D10 '
+        'assert no threshold on any of them).',
+    ]
+
+    # Run-specific, so DERIVED rather than typed — see `_stored_gap_lines`.
+    lines += _stored_gap_lines(report)
+
+    lines += [
+        '',
         '`pin changed window` is the diagnostic that makes the `+pin` rows '
         'readable.  Every variant is scored over a window of the SAME size '
         '(k), so an additive pin can only pay off where a read-side transform '
@@ -2130,6 +2339,8 @@ def render_markdown(report: dict[str, Any]) -> str:
             _cell(measurement['claim_recall']['at_5']),
             _cell(measurement['claim_recall']['at_10']),
             _cell(measurement['discoverability']['canonical_in_top_5_rate']),
+            _cell(measurement['discoverability'][
+                'stored_canonical_in_top_5_rate']),
             _rank_cell(measurement['discoverability']),
             _cell(measurement['tokens_per_query']['mean'], precision=1),
             _cell(guard['candidate_present_rate']),
@@ -2198,8 +2409,9 @@ def render_markdown(report: dict[str, Any]) -> str:
         'than recall of the derivation input.',
         '',
         '| arm | kind | queries | claim recall@5 | claim recall@10 | '
-        'canonical in top-5 | median canonical rank |',
-        '| --- | --- | --- | --- | --- | --- | --- |',
+        'canonical in top-5 | canonical in top-5 (stored) | '
+        'median canonical rank |',
+        '| --- | --- | --- | --- | --- | --- | --- | --- |',
     ]
 
     for arm in ARM_VARIANTS:
@@ -2213,6 +2425,11 @@ def render_markdown(report: dict[str, Any]) -> str:
                 _cell(subset['claim_recall']['at_5']),
                 _cell(subset['claim_recall']['at_10']),
                 _cell(subset['discoverability']['canonical_in_top_5_rate']),
+                # Per subset, from the subset's own block — `held_out` is the
+                # row that measures generalisation, and it is exactly the row
+                # where a transform-credited rate is least safe to read alone.
+                _cell(subset['discoverability'][
+                    'stored_canonical_in_top_5_rate']),
                 _rank_cell(subset['discoverability']),
             ]) + ' |')
 
@@ -2892,14 +3109,24 @@ def _aggregate_queries(rows: list[dict[str, Any]], limit: int) -> dict[str, Any]
     ``queries: 0`` is a legitimate result and every metric under it is
     ``None`` — an empty subset is "not asked", never a measured zero.
     """
+    import statistics  # noqa: PLC0415
+
     canonical_ranks = [
         row['canonical_rank'] for row in rows if row['canonical_rank'] is not None
     ]
     median_rank: float | None = None
     if canonical_ranks:
-        import statistics  # noqa: PLC0415
-
         median_rank = float(statistics.median(canonical_ranks))
+    #: The TRANSFORM-BLIND half of the same question — see the module
+    #: docstring, "Rank-based is not transform-blind".  Same aggregation, over
+    #: ranks the caller measured on the raw store hits.
+    stored_ranks = [
+        row['stored_canonical_rank'] for row in rows
+        if row['stored_canonical_rank'] is not None
+    ]
+    stored_median_rank: float | None = None
+    if stored_ranks:
+        stored_median_rank = float(statistics.median(stored_ranks))
     return {
         'queries': len(rows),
         'claim_recall': {
@@ -2923,6 +3150,18 @@ def _aggregate_queries(rows: list[dict[str, Any]], limit: int) -> dict[str, Any]
             # run actually looked. That is the same class of defect as the
             # censored median this field exists to disclose.
             'canonical_rank_window': limit,
+            # The transform-blind counterpart of the three keys above, in the
+            # same order and with the same contracts: rate through `_mean`
+            # (so a query with no canonical is a non-observation, not a 0.0),
+            # median over successes only, and the censored denominator that
+            # median is taken over.  `canonical_candidates` is shared — both
+            # halves ask about the same queries, only through different
+            # windows — so it is not duplicated.
+            'stored_canonical_in_top_5_rate': _mean(
+                [row['stored_canonical_in_5'] for row in rows],
+            ),
+            'stored_canonical_median_rank': stored_median_rank,
+            'stored_canonical_found_count': len(stored_ranks),
         },
     }
 
@@ -2987,6 +3226,12 @@ def measure_arm(
 
         canonical_in_5: float | None = None
         canonical_rank: int | None = None
+        #: The SAME question asked of the raw store hits, before any
+        #: read-side transform ran — see the module docstring, "Rank-based is
+        #: not transform-blind".  Measured over `[hit.record for hit in
+        #: hits]`, so this pair is blind to grouping AND to the pin.
+        stored_canonical_in_5: float | None = None
+        stored_canonical_rank: int | None = None
         canonical_id = seeded.canonical_by_cluster.get(query.cluster_id)
         if canonical_id is not None:
             found = topic_discoverability(top_5, query.topic, canonical_id, 5)
@@ -3002,6 +3247,19 @@ def measure_arm(
                 query.topic, canonical_id, 5,
             )
             canonical_rank = deep['canonical_rank']
+            # ONE call, over the untransformed hits: `topic_discoverability`
+            # already scans the full list for the rank and derives
+            # `canonical_in_top_k` from it against the k it is passed, so a
+            # second windowed call would be redundant.  No `read_path` here
+            # is the whole point — neither `apply_grouped_read` nor
+            # `apply_topic_anchor` runs, so nothing can materialise a record
+            # the store did not return.  Read-only over hits already
+            # fetched: no arm, pin, window or threshold is re-tuned.
+            stored = topic_discoverability(
+                [hit.record for hit in hits], query.topic, canonical_id, 5,
+            )
+            stored_canonical_in_5 = 1.0 if stored['canonical_in_top_k'] else 0.0
+            stored_canonical_rank = stored['canonical_rank']
 
         rows.append({
             'kind': query.kind,
@@ -3013,6 +3271,10 @@ def measure_arm(
             # for a non-observation.
             'canonical_in_5': canonical_in_5,
             'canonical_rank': canonical_rank,
+            # Same None-not-0.0 discipline, for the same reason: a query with
+            # no canonical was never asked either question.
+            'stored_canonical_in_5': stored_canonical_in_5,
+            'stored_canonical_rank': stored_canonical_rank,
             'has_canonical': canonical_id is not None,
             'tokens': float(tokens_returned(top_10, 10, estimator)['tokens']),
         })

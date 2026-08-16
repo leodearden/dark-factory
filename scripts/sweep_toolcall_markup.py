@@ -1,0 +1,1392 @@
+"""Retro-sweep leaked tool-call markup out of TERMINAL persisted state.
+
+Task 3691, PRD ``plans/toolcall-markup-containment-prd.md`` contract C3.
+
+## What this sweeps — two pinned path sets, and nothing else
+
+* ``data/escalations/**/*.json`` — escalation records, recursively (59 of the
+  60 corrupted records measured live sit under ``archive/<date>/``). Only
+  records in a TERMINAL status are rewritten; see :data:`TERMINAL_STATUSES`.
+* ``.worktrees-orphaned/*/.task/plan.json`` — the plan artifacts of reclaimed
+  worktree lanes. The exact ``.task/plan.json`` tail, never ``**/*.json``.
+
+Discovery is an ALLOWLIST of those two shapes rather than a repo-wide ``.json``
+walk, because the dominant hazard here is over-reach: an orphaned worktree is a
+full checkout, so a ``**/*.json`` walk beneath one would find committed
+evidence that legitimately QUOTES leak specimens and "repair" it. See
+:data:`NEVER_TOUCH`.
+
+## What it does NOT do
+
+It never repairs LIVE state. PRD D4 splits the corpus: terminal records and
+orphaned lanes are this sweep's; a live lane's plan.json belongs to task 3692's
+lazy write-back at the plan-tools boundary. That split is enforced
+mechanically, not by assumption — an orphaned plan whose symlink resolves into
+a meta-root a LIVE ``.worktrees/<id>`` still shares is skipped and reported.
+
+## Running it
+
+Dry run is the DEFAULT; ``--apply`` is required to write anything::
+
+    uv run --project shared python scripts/sweep_toolcall_markup.py
+    uv run --project shared python scripts/sweep_toolcall_markup.py --apply
+
+The ``uv run --project shared`` prefix is not optional. ``shared/__init__.py``
+imports the whole package eagerly, so ``import shared.toolcall_markup`` drags
+in shared's third-party dependencies even though ``toolcall_markup`` is itself
+pure and stdlib-only — a dependency-free system python cannot run this script.
+The same cost is recorded at ``scripts/scan_task_toolcall_leaks.py:102-112``,
+which carries this identical bootstrap.
+
+## AUTHORING HAZARD — this file spells NO envelope literal, ever
+
+Every sentinel this module needs is imported from ``shared.toolcall_markup``
+(the sole owner of the enumeration, INV-5) and never re-spelled here. That is
+belt-and-braces: it keeps this from becoming a third enumeration site, AND it
+keeps a raw ``chr(60)`` + ``/`` sequence out of the file text. Writing one
+verbatim would force any agent editing this file to emit that literal inside
+its own tool-call envelope, reproducing the very defect this script exists to
+clean up — the agent's Write/Edit argument terminates early, truncating the
+file and silently dropping the sibling arguments of that same call. The
+rationale is recorded in full at ``shared/src/shared/toolcall_markup.py``
+lines 52-62. If you need a literal here, import it; do not type it.
+"""
+from __future__ import annotations
+
+import argparse
+import difflib
+import json
+import os
+import stat
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any, NamedTuple
+
+# shared/src bootstrap. Same idiom and same precedence argument as
+# scripts/scan_task_toolcall_leaks.py:113-115 and
+# scripts/repair_wiped_metadata_files.py:67-73: resolve it from __file__ and
+# insert at sys.path[0], so a run inside a task worktree resolves `shared` to
+# THIS checkout's copy of the envelope-literal enumeration rather than to
+# whatever editable install happens to be on the path. The fused-memory/shared
+# editable installs are ordinary .pth entries, so sys.path ORDER decides the
+# winner and a hardcoded or install-provided path would silently test the main
+# checkout's literals.
+_SHARED_SRC = Path(__file__).resolve().parent.parent / 'shared' / 'src'
+if str(_SHARED_SRC) not in sys.path:
+    sys.path.insert(0, str(_SHARED_SRC))
+
+from shared.toolcall_markup import (  # noqa: E402
+    CANONICAL_OPENER_PREFIX,
+    INVOKE_CLOSER,
+    PREFILTER_NEEDLES,
+    Repair,
+    detect,
+    repair,
+)
+
+__all__ = [
+    'ACTION_DID_NOT_CONVERGE',
+    'ACTION_REFUSED',
+    'ACTION_REPAIRED',
+    'CANONICAL_OPENER_PREFIX',
+    'EXIT_CLEAN',
+    'EXIT_DID_NOT_CONVERGE',
+    'EXIT_REPAIRABLE_REMAINS',
+    'EXIT_WRITE_FAILED',
+    'INVOKE_CLOSER',
+    'LANE_ESCALATIONS',
+    'LANE_PLANS',
+    'NEVER_TOUCH',
+    'PREFILTER_NEEDLES',
+    'REASON_CHANGED_UNDER_US',
+    'REASON_DANGLING_SYMLINK',
+    'REASON_FORMAT_NOT_REPRODUCIBLE',
+    'REASON_LIST_ELEMENT_NO_OBJECT',
+    'REASON_LIVE_LANE_PRESENT',
+    'REASON_NEVER_TOUCH',
+    'REASON_NON_TERMINAL',
+    'REASON_NOT_AN_ESCALATION_RECORD',
+    'REASON_NO_STRING_HOLE_TARGET',
+    'REASON_ROUND_BOUND_EXCEEDED',
+    'REASON_SELF_NAMING_TAIL',
+    'REASON_UNPARSEABLE',
+    'REASON_UNREPAIRABLE',
+    'REASON_UNSANCTIONED_ESCALATION_LOCATION',
+    'REASON_UNSANCTIONED_PLAN_LOCATION',
+    'REASON_VERIFY_FAILED',
+    'REASON_WRITE_FAILED',
+    'RESIDUE_LEAK',
+    'RESIDUE_QUOTED_ONLY',
+    'TERMINAL_STATUSES',
+    'LoadedDocument',
+    'Outcome',
+    'Refusal',
+    'Repair',
+    'ResolvedTarget',
+    'Summary',
+    'Target',
+    'WriteFailure',
+    'dedupe_by_realpath',
+    'detect',
+    'discover_targets',
+    'has_leak_signature',
+    'load_target',
+    'main',
+    'repair',
+    'repair_document',
+    'resolve_write_target',
+    'round_trips',
+    'run_sweep',
+    'serialize_like',
+    'write_repaired',
+]
+
+# ---------------------------------------------------------------------------
+# Lanes.
+# ---------------------------------------------------------------------------
+
+#: Escalation records under ``data/escalations``. Gated on terminal status.
+LANE_ESCALATIONS = 'escalations'
+
+#: Plan artifacts under ``.worktrees-orphaned/*/.task/``. NOT status-gated —
+#: an orphaned lane has no status to read; its liveness gate is the
+#: ``.worktrees/<id>`` check instead.
+LANE_PLANS = 'plans'
+
+#: Where the escalations lane is rooted, relative to the repo root.
+_ESCALATIONS_DIR = ('data', 'escalations')
+
+#: Where the plans lane is rooted, relative to the repo root.
+_ORPHANED_DIR = '.worktrees-orphaned'
+
+#: The exact tail an orphaned plan target must have, as path components.
+_PLAN_TAIL = ('.task', 'plan.json')
+
+
+class Target(NamedTuple):
+    """One discovered file, tagged with the lane whose rules govern it.
+
+    The lane travels WITH the path rather than being re-derived downstream,
+    because the two lanes are gated differently (terminal-status vs
+    live-lane-presence) and re-deriving the lane from the path shape at each
+    gate is exactly the kind of duplicated predicate that drifts.
+    """
+
+    #: Absolute path as discovered — NOT yet realpath-resolved. Resolution is
+    #: :func:`resolve_write_target`'s job and happens only on the write path.
+    path: Path
+    #: :data:`LANE_ESCALATIONS` or :data:`LANE_PLANS`.
+    lane: str
+
+
+def _has_dot_component(relative: Path) -> bool:
+    """True if any component of *relative* is dot-prefixed.
+
+    Applied to the path RELATIVE to the lane root, never to the absolute path:
+    both lane roots are themselves dot-prefixed (``.worktrees-orphaned``, and
+    the ``.task`` tail), and a repo checked out beneath a dotted directory
+    would otherwise exclude everything.
+    """
+    return any(part.startswith('.') for part in relative.parts)
+
+
+def discover_targets(root: Path | str) -> list[Target]:
+    """Every sweepable file under *root*, sorted, deterministic.
+
+    Returns the union of the two pinned path sets described in the module
+    docstring. An absent lane directory yields nothing rather than raising:
+    ``.worktrees-orphaned`` only exists once the reclaim timer has rotated at
+    least one lane, so a fresh checkout legitimately has neither.
+
+    Dot-prefixed files under ``data/escalations`` are EXCLUDED, explicitly.
+    ``data/escalations/.watch-fire.json`` carries a full escalation-record
+    shape but is live watcher state, so nothing about its content excludes it.
+    This is the design decision 8 fork: ``glob.glob`` silently skips dotfiles
+    while ``Path.rglob`` silently includes them, so the choice is made here in
+    the open — and tested — instead of being inherited from whichever globbing
+    API the implementation happened to reach for.
+
+    Sorting is load-bearing, not cosmetic: an operator diffs one run's report
+    against the next, and an unstable order would manufacture churn that reads
+    as new corruption.
+    """
+    root_path = Path(root)
+    targets: list[Target] = []
+
+    escalations_dir = root_path.joinpath(*_ESCALATIONS_DIR)
+    if escalations_dir.is_dir():
+        for path in escalations_dir.rglob('*.json'):
+            if not path.is_file():
+                continue
+            if _has_dot_component(path.relative_to(escalations_dir)):
+                continue
+            targets.append(Target(path=path, lane=LANE_ESCALATIONS))
+
+    orphaned_dir = root_path / _ORPHANED_DIR
+    if orphaned_dir.is_dir():
+        for lane_dir in orphaned_dir.iterdir():
+            if not lane_dir.is_dir():
+                continue
+            candidate = lane_dir.joinpath(*_PLAN_TAIL)
+            # is_file() follows symlinks, which is what we want at DISCOVERY
+            # time: all five live orphaned plans are symlinks, and a dangling
+            # one is reported by the writer (with a `dangling-symlink` reason)
+            # rather than silently dropped here.
+            if candidate.is_file() or candidate.is_symlink():
+                targets.append(Target(path=candidate, lane=LANE_PLANS))
+
+    return sorted(targets)
+
+
+# ---------------------------------------------------------------------------
+# The must-not-touch guard, and write-target resolution.
+# ---------------------------------------------------------------------------
+
+#: Repo-relative paths this sweep must NEVER rewrite, whatever it is handed.
+#:
+#: Both are COMMITTED EVIDENCE that legitimately quotes leak specimens, so
+#: their corrupted-looking strings are the artifact, not a defect:
+#:
+#: * ``docs/task-recovery-2026-05-13/worktree-inventory.json`` — 355 KB of
+#:   git-tracked recovery inventory quoting real specimens. It is replicated
+#:   into EVERY worktree checkout, so it appears beneath every orphaned lane;
+#:   that is what makes it the likeliest thing a widened plans glob would eat.
+#: * ``docs/toolcall-xml-leak-sweep-2026-08-05/dry-run-report.json`` — the 41
+#:   verbatim leak records captured by the earlier dry-run sweep. "Repairing"
+#:   the report of a leak destroys the record OF the leak.
+#:
+#: Finding 4 of the capability manifest names both. This constant is strictly
+#: redundant against today's :func:`discover_targets`, which cannot yield
+#: either — and that redundancy is the point. It is defence in depth against a
+#: future widening of the globs, and it makes the rule greppable rather than
+#: implicit in a path pattern.
+NEVER_TOUCH: frozenset[str] = frozenset({
+    'docs/task-recovery-2026-05-13/worktree-inventory.json',
+    'docs/toolcall-xml-leak-sweep-2026-08-05/dry-run-report.json',
+})
+
+#: Refusal reasons. Named constants rather than inline strings so the report
+#: renderer, the tests and the operator all key on ONE spelling.
+REASON_NEVER_TOUCH = 'never-touch'
+REASON_UNSANCTIONED_PLAN_LOCATION = 'unsanctioned-plan-location'
+#: The escalations-lane counterpart of the plans-lane location gate. The
+#: asymmetry it removes was accidental rather than argued: ``discover_targets``
+#: walks with ``rglob('*.json')`` and ``is_file()``, and BOTH follow symlinked
+#: FILES, so a link at ``data/escalations/x.json`` pointing at a
+#: terminal-record-shaped file anywhere on the filesystem would be
+#: realpath-resolved by :func:`resolve_write_target` and then rewritten
+#: entirely outside the repo. The plans lane already refuses exactly that shape
+#: (:func:`_is_sanctioned_plan_location`); this makes the escalations lane
+#: refuse it too, with its own spelling so the report names the lane.
+REASON_UNSANCTIONED_ESCALATION_LOCATION = 'unsanctioned-escalation-location'
+#: The orphaned plan's symlink target no longer exists. Refused rather than
+#: followed, because os.replace onto a dangling link CREATES a regular file —
+#: inventing a plan for a lane whose meta-root was already reclaimed.
+REASON_DANGLING_SYMLINK = 'dangling-symlink'
+#: The plan resolves into a meta-root that a LIVE `.worktrees/<id>` lane still
+#: shares, so rewriting it would rewrite a plan a running task is reading.
+#: PRD D4 assigns those to task 3692's lazy write-back, not to this sweep;
+#: this is how that split is enforced mechanically instead of by assumption.
+#: Measured at plan time: `.worktrees/3415` is live, which leaves exactly one
+#: repairable orphaned plan (3162) in the corpus today.
+REASON_LIVE_LANE_PRESENT = 'live-lane-present'
+
+#: The shared meta-root a lane's plan.json is symlinked into.
+_META_ROOT = ('.worktrees', '.task-meta')
+
+
+class ResolvedTarget(NamedTuple):
+    """A target cleared for writing, with the path the swap will land on."""
+
+    #: The path as discovered — the link, when the target is a symlink.
+    path: Path
+    lane: str
+    #: The ``os.path.realpath``-resolved file. THIS is what ``os.replace``
+    #: must land on. Landing on the LINK instead would replace it with a
+    #: regular file and re-fork the lane and meta-root copies — the esc-5205-9
+    #: stale-plan divergence ``plan_tools._atomic_write_plan`` documents at
+    #: line 715.
+    write_path: Path
+
+
+class Refusal(NamedTuple):
+    """A target this sweep declines to write, and why.
+
+    Returned as a VALUE, never raised-and-swallowed. ``scripts`` is inside
+    ``shared/tests/silent_fallthrough_scan.py``'s ``_SCOPE_ROOTS``, so a broad
+    ``except Exception`` funnelling into a default would trip the ratchet — and
+    would also discard the reason a human needs in order to adjudicate the
+    refusal. Every refusal reaches the report.
+    """
+
+    path: Path
+    lane: str
+    reason: str
+
+
+def _matches_never_touch(path: Path) -> bool:
+    """True if *path* ends with a :data:`NEVER_TOUCH` entry, component-wise.
+
+    Anchored on a ``/`` boundary so a sibling like
+    ``…/not-the-worktree-inventory.json`` cannot match by mere suffix.
+    """
+    text = path.as_posix()
+    return any(text == rel or text.endswith('/' + rel) for rel in NEVER_TOUCH)
+
+
+def _is_sanctioned_plan_location(resolved: Path, root_real: Path) -> bool:
+    """True if *resolved* is one of the two shapes a plan may legally be.
+
+    Measured at plan time: all five live ``.worktrees-orphaned/*/.task/
+    plan.json`` are ABSOLUTE symlinks into ``<root>/.worktrees/.task-meta/
+    <id>/plan.json``. Both that shape and a plain file in the orphaned
+    worktree's own ``.task/`` are sanctioned; anything else means the link is
+    not what this sweep believes it is, and following it would write through to
+    an unknown file.
+    """
+    try:
+        parts = resolved.relative_to(root_real).parts
+    except ValueError:
+        return False  # resolves outside the repo root entirely
+    if len(parts) != 4:
+        return False
+    if parts[0] == _ORPHANED_DIR and parts[2:] == _PLAN_TAIL:
+        return True
+    return parts[:2] == _META_ROOT and parts[3] == 'plan.json'
+
+
+def resolve_write_target(target: Target, root: Path | str) -> ResolvedTarget | Refusal:
+    """Clear *target* for writing, or refuse it with a reason.
+
+    Resolves symlinks FIRST and matches the guards against the resolved path as
+    well as the literal one. Checking only the discovered path would be
+    defeated by exactly the shape this corpus is full of — every live orphaned
+    plan is a symlink — so a link pointing at committed evidence has to be
+    caught by its target, not its name.
+
+    BOTH lanes are containment-gated, symmetrically: a resolved escalation must
+    still be under ``data/escalations`` and a resolved plan must still be one of
+    the two sanctioned plan shapes. Neither lane's discovery excludes symlinked
+    files, so without the containment check the realpath resolution that makes
+    the write land on the right FILE would equally happily land it outside the
+    repo. The lane roots are themselves realpath-resolved before the comparison,
+    so a checkout reached through a symlinked parent is contained rather than
+    refused wholesale.
+
+    :data:`NEVER_TOUCH` is checked BEFORE either location gate so the refusal
+    names the real hazard rather than a generic location miss.
+
+    This function performs no I/O beyond path resolution and never writes.
+    """
+    root_real = Path(os.path.realpath(root))
+    resolved = Path(os.path.realpath(target.path))
+
+    if _matches_never_touch(target.path) or _matches_never_touch(resolved):
+        return Refusal(path=target.path, lane=target.lane, reason=REASON_NEVER_TOUCH)
+
+    if target.lane == LANE_ESCALATIONS:
+        lane_root = Path(os.path.realpath(root_real.joinpath(*_ESCALATIONS_DIR)))
+        if not resolved.is_relative_to(lane_root):
+            return Refusal(
+                path=target.path,
+                lane=target.lane,
+                reason=REASON_UNSANCTIONED_ESCALATION_LOCATION,
+            )
+
+    if target.lane == LANE_PLANS:
+        if not _is_sanctioned_plan_location(resolved, root_real):
+            return Refusal(
+                path=target.path,
+                lane=target.lane,
+                reason=REASON_UNSANCTIONED_PLAN_LOCATION,
+            )
+
+        if not resolved.exists():
+            # A dangling link. Refusing here is load-bearing: an unguarded
+            # os.replace onto this path would CREATE a regular file, inventing
+            # a plan for a lane whose meta-root was already reclaimed.
+            return Refusal(
+                path=target.path, lane=target.lane, reason=REASON_DANGLING_SYMLINK
+            )
+
+        lane_id = _meta_root_lane_id(resolved, root_real)
+        if lane_id is not None and (root_real / '.worktrees' / lane_id).exists():
+            return Refusal(
+                path=target.path, lane=target.lane, reason=REASON_LIVE_LANE_PRESENT
+            )
+
+    return ResolvedTarget(path=target.path, lane=target.lane, write_path=resolved)
+
+
+def _meta_root_lane_id(resolved: Path, root_real: Path) -> str | None:
+    """The lane id *resolved* belongs to, if it lives in the shared meta-root.
+
+    ``None`` for a plain-file plan in an orphaned worktree's own ``.task/``:
+    that file is not shared with anything, so there is no lane whose liveness
+    could make it unsafe. Deriving an "id" from whatever directory happened to
+    be the parent would yield ``.task`` there and check a path that is not a
+    lane at all.
+    """
+    try:
+        parts = resolved.relative_to(root_real).parts
+    except ValueError:
+        return None
+    if len(parts) == 4 and parts[:2] == _META_ROOT:
+        return parts[2]
+    return None
+
+
+def dedupe_by_realpath(targets: list[Target]) -> list[Target]:
+    """Drop targets whose realpath a previous target already claims.
+
+    Order-preserving, so the FIRST discovery of a shared file wins and the
+    result stays as deterministic as :func:`discover_targets`.
+
+    Several orphaned lanes can symlink into the same meta-root file. Writing it
+    twice in one run is not merely wasteful: the second pass would re-read the
+    first pass's output, and any asymmetry between the two would surface as
+    churn an operator cannot account for.
+    """
+    seen: set[Path] = set()
+    kept: list[Target] = []
+    for target in targets:
+        resolved = Path(os.path.realpath(target.path))
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        kept.append(target)
+    return kept
+
+
+# ---------------------------------------------------------------------------
+# repair_document — the uniform per-OBJECT rule.
+# ---------------------------------------------------------------------------
+#
+# WHY A PER-OBJECT RULE RATHER THAN A TOOL SCHEMA (design decision 1).
+#
+# `repair()` wants (param, schema_params, supplied) — the shape of a live MCP
+# tool call. A persisted JSON document has no tool call, so the mapping has to
+# be invented. The sound one is per containing OBJECT:
+#
+#   schema_params = that object's OWN keys   — a recovered name must name a
+#                                              real field of this very record;
+#   legal targets = sibling keys whose current value is a string HOLE
+#                   (empty or whitespace-only);
+#   supplied      = every other key, so repair()'s own B8/B9 accept conditions
+#                   do the refusing rather than a second policy layer here.
+#
+# Delegating to `orchestrator.mcp.plan_tools._repair_plan_fields` was the first
+# choice (INV-5, no lockstep duplication) and it imports fine under a full
+# venv — but the gated test command for this module is
+# `uv run --project shared pytest scripts/tests/`, and `import fastmcp` FAILS
+# in that env (re-measured this iteration), so plan_tools cannot be imported
+# where its behaviour would be exercised.
+#
+# The uniform rule needs no tool schema at all, and it is strictly NARROWER
+# than a parameter-name-keyed recovery on both hazards plan_tools names:
+#   * a recovered name that is not already a key of this record is refused, so
+#     no junk key (`step_type` beside `type`) can be invented;
+#   * a target whose current value is not a STRING is always in `supplied`, so
+#     a bare str can never land on `evidence: []` or on a `files` list and
+#     silently change that field's type.
+# Measured parity on the live corpora: identical 26/26 escalation repairs to
+# the tool-schema table, and identical 5/5 `rationale` repairs to epsilon's own
+# `_repair_plan_fields`. The envelope-literal enumeration itself is still taken
+# solely from `shared.toolcall_markup`, which is the INV-5 property that
+# actually matters here.
+
+#: A repair was applied: the field was truncated to its clean prefix and every
+#: recovered sibling restored.
+ACTION_REPAIRED = 'repaired'
+#: The string was flagged by detect() but repair() declined. The value is left
+#: BYTE-IDENTICAL and the reason is reported for human adjudication.
+ACTION_REFUSED = 'refused'
+
+#: The tail parsed and every recovered name IS a field of this record, but at
+#: least one of them currently holds authored content (or a non-string value)
+#: rather than an empty string hole. Restoring would DISPLACE that content,
+#: which design decision 2 forbids: the swallowed text still survives inside
+#: the corrupted field, so refusing loses nothing while overwriting would
+#: destroy a real value to rescue another.
+REASON_NO_STRING_HOLE_TARGET = 'no-string-hole-target'
+#: repair() declined even with the string-hole constraint lifted: the tail did
+#: not parse with zero leftover, or a recovered name is not a field of this
+#: record at all, or the clean prefix would itself still carry markup.
+REASON_UNREPAIRABLE = 'unrepairable'
+#: The repair walk was still applying changes when the round bound ran out.
+#: Reported loudly rather than silently truncated into a plausible-looking
+#: clean result — a document that stops converging is a signal that repair()'s
+#: behaviour has changed, not something to paper over.
+ACTION_DID_NOT_CONVERGE = 'did-not-converge'
+
+#: How many times the walk may repeat before giving up. Small on purpose: a
+#: recovered value can carry markup at most one level deep before B5 refuses
+#: the parse, so anything past two rounds already means repair() is behaving
+#: differently than measured. Four leaves headroom without turning a runaway
+#: into a hang.
+_MAX_REPAIR_ROUNDS = 4
+
+#: Paired with :data:`ACTION_DID_NOT_CONVERGE`.
+REASON_ROUND_BOUND_EXCEEDED = 'round-bound-exceeded'
+
+#: The tail names the very field it mis-closed. Applying it would make the
+#: field's clean prefix and its recovered value fight over one key, and one of
+#: them would be silently dropped — so this refuses instead.
+REASON_SELF_NAMING_TAIL = 'self-naming-tail'
+
+#: A BARE STRING inside a list. It has no sibling keys, so there is no object to
+#: derive ``schema_params`` from and nowhere legal to restore a recovered value
+#: to; repairing it could only truncate, which design decision 2 forbids.
+#:
+#: Declining to repair it was always right. Emitting NO OUTCOME for it was not:
+#: the residue counts ARE the human-adjudication queue this sweep exists to
+#: produce, so a flagged string that never reaches them is unrepaired leak that
+#: silently never enters the queue — and ``strings_detected`` under-reports it.
+#: It is reported and counted here, and left byte-identical.
+REASON_LIST_ELEMENT_NO_OBJECT = 'list-element-no-object'
+
+
+class Outcome(NamedTuple):
+    """What happened to one detect()-flagged string, and where."""
+
+    #: Dotted/indexed location within the document, e.g.
+    #: ``design_decisions[1].rationale``. Built for the operator's report.
+    json_path: str
+    field: str
+    action: str
+    #: Names restored into their holes. EMPTY on a successful repair is the
+    #: B4 last-parameter case (the mis-closed field was the call's final
+    #: argument, so nothing was dropped) — every corrupted plan rationale
+    #: measured live is this shape.
+    recovered_names: tuple[str, ...]
+    #: '' when the action is a repair.
+    reason: str
+    #: For a REFUSAL: :data:`RESIDUE_LEAK` when the string carries the PRD
+    #: section-2 leak signature, :data:`RESIDUE_QUOTED_ONLY` when it merely
+    #: quotes an envelope literal in prose. '' otherwise. Report-only — it
+    #: never gates a repair.
+    residue: str = ''
+
+
+def _join(path: str, key: str) -> str:
+    """Extend a json path by one object key."""
+    return f'{path}.{key}' if path else key
+
+
+def _last_key(path: str) -> str:
+    """The final OBJECT key in a json path, with any list index stripped.
+
+    Used as the ``field`` of a list-element outcome, which has no key of its
+    own: ``evidence[1].tags`` -> ``tags``, so the report groups the element
+    under the list that holds it. ``''`` for a document whose ROOT is a list —
+    there is no containing key to name, and the ``json_path`` (``[0]``) already
+    locates it unambiguously.
+    """
+    tail = path.rsplit('.', 1)[-1]
+    bracket = tail.find('[')
+    return tail if bracket < 0 else tail[:bracket]
+
+
+def _string_holes(node: dict) -> set[str]:
+    """Keys of *node* whose current value is an empty/whitespace-only string.
+
+    The "hole" concept is adopted from ``plan_tools._is_authored`` and
+    TIGHTENED for this sweep: a legal target must additionally be STRING-typed.
+    ``None`` and empty containers are holes to plan_tools but are NOT targets
+    here, because filling one with a recovered ``str`` would change that
+    field's type. Non-string holes are simply left in ``supplied``, which
+    routes them through repair()'s existing B9 refusal instead of adding a
+    second policy layer.
+    """
+    return {
+        key
+        for key, value in node.items()
+        if isinstance(value, str) and not value.strip()
+    }
+
+
+def _classify_refusal(value: str, field: str, schema: set[str]) -> str:
+    """Name the reason repair() declined *value*.
+
+    Re-runs repair() ONCE with the string-hole constraint lifted (``supplied``
+    empty). If it then succeeds, the tail parsed and every recovered name is a
+    real field of this record, so the only thing that blocked the real call was
+    a target already holding content — :data:`REASON_NO_STRING_HOLE_TARGET`.
+    Otherwise the refusal is structural — :data:`REASON_UNREPAIRABLE`.
+
+    Deliberately re-uses repair() rather than re-parsing the tail here: this
+    module implements no matching or parsing of its own (INV-5), so the reason
+    is DERIVED from the same algorithm that made the decision. It runs only on
+    the refusal path, never on the clean or repaired paths.
+    """
+    if repair(value, field, schema, ()) is not None:
+        return REASON_NO_STRING_HOLE_TARGET
+    return REASON_UNREPAIRABLE
+
+
+def _repair_dict(node: dict, path: str, outcomes: list[Outcome]) -> tuple[dict, bool]:
+    """Repair one object's own string fields, then recurse into its children.
+
+    Copy-on-write: *node* itself is returned unchanged unless something
+    actually changed, so a clean document comes back by IDENTITY. That is not
+    tidiness — the sweep decides whether to rewrite a file by whether the
+    document changed, so a repairer that copied unconditionally would make
+    every file look dirty and rewrite the whole corpus.
+    """
+    working = node
+    changed = False
+
+    for key in list(node.keys()):
+        value = working[key]
+
+        if isinstance(value, str):
+            if detect(value) is None:
+                continue
+            # Recomputed per FIELD, not once per object: a hole filled by an
+            # earlier repair in this same pass is no longer a hole, and two
+            # corrupted fields must never both claim it.
+            schema = set(working.keys())
+            targets = _string_holes(working) - {key}
+            result = repair(value, key, schema, schema - targets - {key})
+
+            if result is None:
+                outcomes.append(Outcome(
+                    json_path=_join(path, key),
+                    field=key,
+                    action=ACTION_REFUSED,
+                    recovered_names=(),
+                    reason=_classify_refusal(value, key, schema),
+                    residue=RESIDUE_LEAK if has_leak_signature(value) else RESIDUE_QUOTED_ONLY,
+                ))
+                continue
+
+            if key in result.recovered:
+                outcomes.append(Outcome(
+                    json_path=_join(path, key),
+                    field=key,
+                    action=ACTION_REFUSED,
+                    recovered_names=(),
+                    reason=REASON_SELF_NAMING_TAIL,
+                    residue=RESIDUE_LEAK if has_leak_signature(value) else RESIDUE_QUOTED_ONLY,
+                ))
+                continue
+
+            if working is node:
+                working = dict(node)
+            working[key] = result.clean_value
+            for name, recovered_value in result.recovered.items():
+                working[name] = recovered_value
+            changed = True
+            outcomes.append(Outcome(
+                json_path=_join(path, key),
+                field=key,
+                action=ACTION_REPAIRED,
+                recovered_names=tuple(sorted(result.recovered)),
+                reason='',
+            ))
+
+        elif isinstance(value, (dict, list)):
+            new_child, child_changed = _repair_node(value, _join(path, key), outcomes)
+            if child_changed:
+                if working is node:
+                    working = dict(node)
+                working[key] = new_child
+                changed = True
+
+    return working, changed
+
+
+def _repair_list(node: list, path: str, outcomes: list[Outcome]) -> tuple[list, bool]:
+    """Recurse into a list's object/list elements, copy-on-write.
+
+    Bare strings inside a list are deliberately NOT repaired: a list element
+    has no sibling keys, so there is no object to derive schema_params from and
+    nowhere legal to restore a recovered value to. Such a string would be
+    truncate-only, which design decision 2 forbids.
+
+    A flagged one is nonetheless REPORTED, with
+    :data:`REASON_LIST_ELEMENT_NO_OBJECT` and the usual residue split. Skipping
+    it silently — the original behaviour — kept it out of the residue counters
+    entirely, which is the one thing this sweep must never do with unrepaired
+    leak: those counts are the human-adjudication queue, and a string that
+    reaches neither the repair nor the queue is simply lost.
+    """
+    working = node
+    changed = False
+    for index, item in enumerate(node):
+        if isinstance(item, str):
+            if detect(item) is not None:
+                outcomes.append(Outcome(
+                    json_path=f'{path}[{index}]',
+                    field=_last_key(path),
+                    action=ACTION_REFUSED,
+                    recovered_names=(),
+                    reason=REASON_LIST_ELEMENT_NO_OBJECT,
+                    residue=(
+                        RESIDUE_LEAK if has_leak_signature(item) else RESIDUE_QUOTED_ONLY
+                    ),
+                ))
+            continue
+        if not isinstance(item, (dict, list)):
+            continue
+        new_item, item_changed = _repair_node(item, f'{path}[{index}]', outcomes)
+        if item_changed:
+            if working is node:
+                working = list(node)
+            working[index] = new_item
+            changed = True
+    return working, changed
+
+
+def _repair_node(node, path: str, outcomes: list[Outcome]):
+    """Dispatch one node of the document walk."""
+    if isinstance(node, dict):
+        return _repair_dict(node, path, outcomes)
+    if isinstance(node, list):
+        return _repair_list(node, path, outcomes)
+    return node, False
+
+
+def repair_document(obj: Any) -> tuple[Any, list[Outcome]]:
+    """Repair every repairable string in *obj*; return ``(new_obj, outcomes)``.
+
+    Typed ``Any`` in and ``Any`` out on purpose: the argument is a decoded JSON
+    document, so its static type is the open ``dict | list | str | int | float
+    | bool | None`` union and every caller immediately subscripts the result by
+    a key it knows from the record shape. Narrowing the return to ``dict``
+    would be a lie for a document whose root is a list; leaving it unannotated
+    made pyright infer ``dict | list`` and reject every ``result['field']`` at
+    24 call sites. The real shape guarantee is structural and is asserted in
+    the tests, not expressible here.
+
+    Walks every dict in the document depth-first and applies the uniform
+    per-object rule documented above. A refused string is left BYTE-IDENTICAL
+    and reported with its reason; a clean document is returned by identity with
+    zero outcomes.
+
+    Restore-or-refuse (design decision 2): a repair never truncates alone. The
+    swallowed text currently survives inside the corrupted field, so writing
+    back only ``clean_value`` would DELETE it — destroying exactly the values
+    cancelled task 3662 identified as the harm. Every applied repair is
+    therefore lossless: ``clean_value`` is a prefix and every recovered value a
+    verbatim substring (invariant D5, enforced by construction in repair()), so
+    the union of the rewritten fields contains every byte of the original
+    except the markup tags themselves.
+
+    The walk repeats until a pass changes nothing, bounded by
+    :data:`_MAX_REPAIR_ROUNDS`. The loop exists because a recovered value is a
+    verbatim substring of the corrupted tail and can therefore itself carry
+    markup — the nested double-leak class cancelled task 3654 identified.
+    Landing such a value in a hole and stopping would leave a repairable string
+    behind and break the binding "a second run reports 0" invariant.
+
+    Measured today, the loop never runs twice: ``_parse_tail`` refuses outright
+    when a recovered item contains a further mis-close (B5), so on every shape
+    repair() accepts, one pass already converges and a second yields zero
+    repairs on both live corpora. The loop is therefore INSURANCE — it makes
+    the second-run-zero invariant STRUCTURAL rather than an empirical
+    observation that a future widening of repair() could quietly invalidate.
+
+    Exceeding the bound is reported LOUDLY as a
+    :data:`ACTION_DID_NOT_CONVERGE` outcome naming the path that was still
+    changing. The bound truncates the LOOP, never a repair: every repair
+    already applied stays applied and the document stays valid, because a
+    half-converged document is still strictly better than a corrupted one —
+    and silently returning it as if it were clean is the failure mode that
+    would matter.
+
+    LOUDLY means all the way to the operator, not merely into this return
+    value: :func:`run_sweep` counts it into ``Summary.did_not_converge``,
+    :func:`main` prints it, and it forces :data:`EXIT_DID_NOT_CONVERGE`. The
+    outcome is unreachable with today's repair() (B5 refuses a nested parse),
+    which is precisely why the wiring has to exist BEFORE a future widening
+    makes it reachable — a tripwire connected to nothing is not a tripwire.
+    """  # noqa: D205
+    # The two outcome classes accumulate DIFFERENTLY across rounds, because
+    # they mean different things:
+    #
+    #   REPAIRED is work APPLIED in that round — cumulative. A round-2 repair
+    #     is a distinct event from a round-1 repair, so these EXTEND.
+    #   REFUSED is a pure function of the CURRENT document state, re-derived
+    #     from scratch on every pass: a string that refuses in round 1 is still
+    #     present and still refuses in round 2. So only the TERMINAL pass's
+    #     refusals describe the true residue, and these are REPLACED.
+    #
+    # Extending both (the original blanket `outcomes.extend`) emitted every
+    # refusal once per round. That is a corrupted report rather than a cosmetic
+    # defect: the residue counts ARE the human-adjudication queue this sweep
+    # exists to produce. It also broke the diff-stability run_sweep's docstring
+    # claims — a document mixing repairs with refusals loops twice on run 1 and
+    # once on run 2, so an operator diffing the runs saw residue DROP with no
+    # repair to explain it, reading as if unrepairable residue had been
+    # silently fixed.
+    #
+    # REPLACEMENT was chosen over deduping by (json_path, action, reason):
+    # dedupe is merely approximate — it would silently MERGE two genuinely
+    # DISTINCT refusals that happen to collide on a path across rounds —
+    # whereas replacement is exact. Replacement also preserves the case that
+    # motivates the loop existing at all: a refusal that only becomes VISIBLE
+    # in a later round (the nested double-leak residue, refusable only once
+    # round 1 has landed it in its hole) is reported, where a naive "keep only
+    # round 1" correction would drop it.
+    #
+    # The partition is exhaustive: the walk emits ONLY ACTION_REPAIRED and
+    # ACTION_REFUSED — ACTION_DID_NOT_CONVERGE is appended after the loop and
+    # never appears in `round_outcomes` — so `!= ACTION_REPAIRED` cleanly
+    # selects refusals.
+    repaired_outcomes: list[Outcome] = []
+    refusals: list[Outcome] = []
+    current = obj
+
+    for _round in range(_MAX_REPAIR_ROUNDS):
+        round_outcomes: list[Outcome] = []
+        current, changed = _repair_node(current, '', round_outcomes)
+        repaired_outcomes.extend(
+            o for o in round_outcomes if o.action == ACTION_REPAIRED
+        )
+        refusals = [o for o in round_outcomes if o.action != ACTION_REPAIRED]
+        if not changed:
+            return current, repaired_outcomes + refusals
+        last_changed = round_outcomes
+    else:
+        # The bound was reached with the last pass STILL changing something.
+        # This branch composes from the SAME partition as the in-loop return:
+        # appending to a separately-accumulated list here is how the
+        # duplicate-refusal bug survives a fix applied only to the loop.
+        stalled = next(
+            (o for o in last_changed if o.action == ACTION_REPAIRED), None
+        )
+        refusals = refusals + [Outcome(
+            json_path=stalled.json_path if stalled is not None else '',
+            field=stalled.field if stalled is not None else '',
+            action=ACTION_DID_NOT_CONVERGE,
+            recovered_names=(),
+            reason=REASON_ROUND_BOUND_EXCEEDED,
+        )]
+
+    return current, repaired_outcomes + refusals
+
+
+# ---------------------------------------------------------------------------
+# Loading and gating one target.
+# ---------------------------------------------------------------------------
+
+#: The escalation statuses this sweep will rewrite. Design decision 3.
+#:
+#: `data/escalations` is written CONTINUOUSLY by the live queue, and this
+#: script's temp-verify-replace prevents a torn READ but not a lost UPDATE: the
+#: queue's own concurrency control is a `{escalation_id}.json.lock` sidecar
+#: (queue.py:36-60) that this script deliberately does not take. Restricting to
+#: terminal records is what makes that safe, and it costs almost nothing —
+#: measured at plan time, 59 of the 60 corrupted files are already archived and
+#: terminal, so exactly ONE pending record is skipped.
+TERMINAL_STATUSES = frozenset({'resolved', 'dismissed'})
+
+#: The record's status is not in :data:`TERMINAL_STATUSES` — including an
+#: unrecognised one, which skips in the FAIL-SAFE direction rather than
+#: guessing at a lifecycle state this sweep does not model.
+REASON_NON_TERMINAL = 'non-terminal'
+#: A JSON document under ``data/escalations`` that is not a record at all (no
+#: ``id`` / ``status``). Excluded on SHAPE, never on "we found no markup" —
+#: ``b3-state.json`` carries flagged strings and matches the glob.
+REASON_NOT_AN_ESCALATION_RECORD = 'not-an-escalation-record'
+#: The file could not be read or parsed. Reported so the sweep continues to the
+#: next file: aborting the run on one bad file would leave the corpus
+#: half-swept with no record of where it stopped.
+REASON_UNPARSEABLE = 'unparseable'
+
+
+class LoadedDocument(NamedTuple):
+    """A target that passed its lane's gate, with its bytes and its parse."""
+
+    target: Target
+    #: The source text EXACTLY as read. Carried rather than re-read later
+    #: because re-reading would race the live queue writer — the round-trip
+    #: precondition must check the same bytes the parse came from.
+    raw: str
+    obj: Any
+
+
+def _is_escalation_record(obj: Any) -> bool:
+    """True if *obj* has the shape of an escalation record."""
+    return isinstance(obj, dict) and 'id' in obj and 'status' in obj
+
+
+def load_target(target: Target) -> LoadedDocument | Refusal:
+    """Read, parse and gate one target.
+
+    Error handling is NARROW by construction — only ``OSError``,
+    ``UnicodeDecodeError`` and ``json.JSONDecodeError`` are caught, each
+    recorded with a reason and returned as a value. ``scripts`` is inside
+    ``shared/tests/silent_fallthrough_scan.py``'s ``_SCOPE_ROOTS``, so a broad
+    ``except Exception`` funnelling into a default would trip the ratchet; more
+    to the point, it would swallow a genuine bug in the repairer as though it
+    were a malformed file.
+
+    The escalation lane is gated on terminal status; the plans lane is NOT. A
+    plan has no ``status`` field to read — its liveness gate is the
+    ``.worktrees/<id>`` check in :func:`resolve_write_target`'s caller. Applying
+    the escalation gate to plans would skip every plan in the corpus while
+    still reporting a clean run.
+    """
+    try:
+        raw = target.path.read_text(encoding='utf-8')
+        obj = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return Refusal(path=target.path, lane=target.lane, reason=REASON_UNPARSEABLE)
+
+    if target.lane == LANE_ESCALATIONS:
+        if not _is_escalation_record(obj):
+            return Refusal(
+                path=target.path,
+                lane=target.lane,
+                reason=REASON_NOT_AN_ESCALATION_RECORD,
+            )
+        if obj.get('status') not in TERMINAL_STATUSES:
+            return Refusal(
+                path=target.path, lane=target.lane, reason=REASON_NON_TERMINAL
+            )
+
+    return LoadedDocument(target=target, raw=raw, obj=obj)
+
+
+# ---------------------------------------------------------------------------
+# Round-trip-or-refuse (design decision 5).
+# ---------------------------------------------------------------------------
+
+#: Re-serializing the file's UNMODIFIED parse did not reproduce its bytes, so
+#: this sweep cannot rewrite it without introducing changes the corrupted
+#: strings did not cause. Refused and counted, never rewritten.
+REASON_FORMAT_NOT_REPRODUCIBLE = 'format-not-reproducible'
+
+
+def serialize_like(raw: str, obj: Any) -> str:
+    """Serialize *obj* the way *raw*'s own writer would have.
+
+    ``json.dumps(obj, indent=2)``, plus a trailing newline when the source had
+    one. Those are the only two conventions in play: ``Escalation.to_json``
+    writes ``indent=2`` with NO trailing newline (models.py:194) and
+    ``artifacts`` writes ``indent=2`` WITH one (artifacts.py:1370).
+
+    ``ensure_ascii`` stays at its default. The live corpus is full of
+    em-dashes and smart quotes stored as ``\\uXXXX`` escapes; flipping it would
+    rewrite every one of them and turn a two-field repair into a whole-file
+    diff.
+    """
+    text = json.dumps(obj, indent=2)
+    return text + '\n' if raw.endswith('\n') else text
+
+
+def round_trips(raw: str, obj: Any) -> bool:
+    """True if *obj* re-serializes to exactly *raw*.
+
+    Called with the file's UNMODIFIED parse, BEFORE any repair. That is what
+    buys the guarantee behind "each byte-diff is confined to the corrupted
+    strings": if ``dumps(before) == raw``, then ``dumps(after)`` differs from
+    ``raw`` exactly where the parsed object differs — proven per file at run
+    time rather than asserted once in a test.
+
+    It also fail-safes any hand-edited or unusually-formatted file for free.
+    Reusing ``plan_tools._atomic_write_plan`` was rejected for the same reason:
+    it stamps ``_schema_version`` and re-indents, which would put changes in
+    the diff that the corrupted strings did not cause.
+    """
+    return serialize_like(raw, obj) == raw
+
+
+# ---------------------------------------------------------------------------
+# The atomic writer (PRD contract C3, boundary row B11).
+# ---------------------------------------------------------------------------
+
+#: The swap itself failed (os.replace, fsync, or the write).
+REASON_WRITE_FAILED = 'write-failed'
+#: The temp file did not re-parse as JSON, so it was never swapped in.
+REASON_VERIFY_FAILED = 'verify-failed'
+#: The target's bytes changed between the read the repair was computed from and
+#: the swap, so the swap was SKIPPED.
+#:
+#: :data:`TERMINAL_STATUSES` makes a concurrent write unlikely, not impossible
+#: — the queue's ``{escalation_id}.json.lock`` sidecar is deliberately not
+#: taken, and a terminal record is not strictly immutable (triage stamping and
+#: archive moves both rewrite one). Without this check the swap would silently
+#: REVERT that concurrent update, because the payload is a full
+#: re-serialization of a parse taken before it. One extra read per repaired
+#: file (26 live) buys a lost update becoming a reported, re-runnable failure.
+REASON_CHANGED_UNDER_US = 'changed-under-us'
+
+#: Prefix for this sweep's temp files. Dot-prefixed so a crashed run's debris
+#: is excluded by the same dot rule discovery uses, and named so an operator
+#: can tell whose leftovers they are.
+_TEMP_PREFIX = '.sweep.'
+_TEMP_SUFFIX = '.tmp'
+
+
+class WriteFailure(NamedTuple):
+    """A write that did not happen, and why. The original is untouched."""
+
+    path: Path
+    lane: str
+    reason: str
+    #: The underlying error, stringified — an operator needs ENOSPC vs EACCES.
+    error: str
+
+
+def _target_file_mode(path: Path) -> int | None:
+    """The target's current permission bits, or ``None`` if it does not exist.
+
+    Mirrors ``plan_tools._target_file_mode``. Without this the swapped-in file
+    inherits ``mkstemp``'s 0600 and the record silently becomes unreadable to
+    every other process that shares the queue directory.
+    """
+    try:
+        return stat.S_IMODE(os.stat(path).st_mode)
+    except OSError:
+        return None
+
+
+def write_repaired(
+    target: ResolvedTarget, raw: str, new_obj: Any
+) -> WriteFailure | None:
+    """Atomically replace *target* with *new_obj*. ``None`` on success.
+
+    PRD contract C3, boundary row B11: **the original file is never left
+    partially written**. If the process is interrupted at any point, the target
+    is either its old bytes or its new bytes — never a mixture, and never
+    truncated.
+
+    The ordering is load-bearing and follows ``plan_tools._atomic_write_plan``:
+
+    1. ``mkstemp`` in the RESOLVED TARGET'S OWN DIRECTORY — ``os.replace`` is
+       only atomic within a filesystem, so a ``/tmp`` scratch file would
+       silently degrade the swap into a copy.
+    2. write, ``flush``, ``fsync`` — so the bytes are durable before the swap,
+       not merely in the page cache.
+    3. restore the target's permission bits BEFORE the swap, so the file is
+       never briefly 0600 and never left that way.
+    4. verify the temp RE-PARSES as JSON.
+    5. re-read the target and confirm it is still *raw* — the bytes this
+       repair was computed from. See :data:`REASON_CHANGED_UNDER_US`: the
+       payload is a full re-serialization of a parse taken before the read, so
+       swapping it over someone else's concurrent write would silently REVERT
+       that write. Checked as late as possible, immediately before the swap, so
+       the window it leaves is a single ``os.replace``.
+    6. ``os.replace``.
+
+    Verifying before replacing is what makes step 6 safe to be the only
+    destructive operation: whatever lands is already known to parse.
+
+    ``target.write_path`` is the realpath-resolved file, so the swap lands on
+    the FILE and never on a symlink pointing at it — replacing the link would
+    re-fork the lane and meta-root copies (plan_tools:715).
+
+    On any failure the temp is unlinked in a ``finally`` and a
+    :class:`WriteFailure` is returned as a VALUE carrying the path and the
+    underlying error. Caught exceptions are narrow (``OSError``,
+    ``UnicodeError``, ``json.JSONDecodeError``) so a genuine bug in the
+    repairer surfaces as a traceback rather than as a plausible "write failed".
+    """
+    write_path = target.write_path
+    tmp_path: Path | None = None
+    reason = REASON_WRITE_FAILED
+    try:
+        payload = serialize_like(raw, new_obj)
+        handle_fd, tmp_name = tempfile.mkstemp(
+            prefix=_TEMP_PREFIX, suffix=_TEMP_SUFFIX, dir=str(write_path.parent)
+        )
+        tmp_path = Path(tmp_name)
+        with os.fdopen(handle_fd, 'w', encoding='utf-8') as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        mode = _target_file_mode(write_path)
+        if mode is not None:
+            os.chmod(tmp_path, mode)
+
+        reason = REASON_VERIFY_FAILED
+        with open(tmp_path, encoding='utf-8') as verify_handle:
+            json.load(verify_handle)
+
+        # The last-moment lost-update check. A raise from this read (the file
+        # was deleted or replaced by something unreadable) is ALSO a
+        # changed-under-us, which is why `reason` is set before it runs.
+        reason = REASON_CHANGED_UNDER_US
+        if write_path.read_text(encoding='utf-8') != raw:
+            return WriteFailure(
+                path=write_path,
+                lane=target.lane,
+                reason=REASON_CHANGED_UNDER_US,
+                error='the target changed between the read and the swap',
+            )
+
+        reason = REASON_WRITE_FAILED
+        os.replace(tmp_path, write_path)
+        tmp_path = None
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return WriteFailure(
+            path=write_path, lane=target.lane, reason=reason, error=str(exc)
+        )
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Residue classification (design decision 7) — REPORT-ONLY.
+# ---------------------------------------------------------------------------
+
+#: The refused string carries the PRD section-2 leak signature: real corruption
+#: a human needs to adjudicate.
+RESIDUE_LEAK = 'leak_unrepaired'
+#: The refused string merely QUOTES an envelope literal in prose. Measured
+#: live: 81 of the 144 detect()-flagged strings are this, 39 of them
+#: evidence[].observation fields in records ABOUT markup incidents.
+RESIDUE_QUOTED_ONLY = 'quoted_only'
+
+#: The section-2 collection predicate, assembled from the shared constants
+#: rather than from newly spelled literals — so this never becomes a third
+#: enumeration site (INV-5) and no raw sentinel enters this file.
+#:
+#: Report-only, and deliberately never a gate: repair()'s accept conditions are
+#: far stricter than this predicate, and every one of the 26 live repairs also
+#: matches it, so a leak in a shape this predicate misses is still REPAIRED.
+#:
+#: `fused_memory.utils.toolcall_xml_leak.has_toolcall_xml_leak` was evaluated
+#: as the ready-made predicate and rejected on measurement: it matches only 16
+#: of the 63, being calibrated for task-text with a mandatory-whitespace
+#: discriminator.
+_LEAK_SIGNATURE_NEEDLES = (INVOKE_CLOSER, CANONICAL_OPENER_PREFIX)
+
+
+def has_leak_signature(value: str) -> bool:
+    """True if *value* carries the section-2 leak signature."""
+    return any(needle in value for needle in _LEAK_SIGNATURE_NEEDLES)
+
+
+# ---------------------------------------------------------------------------
+# The CLI.
+# ---------------------------------------------------------------------------
+
+#: Nothing left to repair. The BINDING signal: a second run must produce this.
+EXIT_CLEAN = 0
+#: Repairable strings remain — always the case for a dry run that found any.
+EXIT_REPAIRABLE_REMAINS = 1
+#: A write or verification failed. Distinct from 1 because it needs an
+#: operator, not another run.
+EXIT_WRITE_FAILED = 2
+#: A document was still changing when the round bound ran out. Its own code
+#: rather than folding into 2, because it says something categorically
+#: different: 2 is one file's environment (EACCES, ENOSPC), 3 is repair()'s
+#: measured contract no longer holding for this corpus.
+EXIT_DID_NOT_CONVERGE = 3
+
+_LANE_CHOICES = (LANE_ESCALATIONS, LANE_PLANS, 'all')
+
+
+class Summary(NamedTuple):
+    """Counters for one sweep run."""
+
+    files_scanned: int
+    strings_detected: int
+    #: Repairs that are ON DISK — or, on a dry run, that WOULD be. A repair
+    #: belonging to a file whose write failed is counted in
+    #: :attr:`repaired_not_written` instead, never here.
+    repaired: int
+    leak_unrepaired: int
+    quoted_only: int
+    skipped: dict[str, int]
+    failed: int
+    pending: int
+    #: Repairs computed for a file whose ``--apply`` write then FAILED, so they
+    #: are not on disk. Defaulted so the counter is additive for any caller
+    #: constructing a Summary positionally.
+    repaired_not_written: int = 0
+    #: Documents that were still changing when the round bound ran out.
+    did_not_converge: int = 0
+
+    def as_dict(self) -> dict:
+        return dict(self._asdict())
+
+    def exit_code(self) -> int:
+        """Residue NEVER sets the exit status.
+
+        37 predicate-matching strings legitimately refuse repair today and will
+        still be there after ``--apply``. Keying the exit code on residue would
+        make the second run red forever and destroy the very signal this task
+        is measured by — the residue is not re-runnable work, it needs a human.
+
+        Non-convergence outranks a write failure. Both need an operator, but a
+        write failure is one file's environment and may well clear on a re-run,
+        whereas non-convergence means repair()'s measured behaviour no longer
+        holds — no re-run fixes that, and it is the tripwire the whole
+        ``ACTION_DID_NOT_CONVERGE`` outcome exists to be. It must never leave
+        the process at :data:`EXIT_CLEAN`: under ``--apply`` a non-converging
+        document is still WRITTEN, ``failed`` and ``pending`` both stay 0, and
+        exiting 0 there would be exactly the false "second run reports 0"
+        signal this task is measured by.
+        """
+        if self.did_not_converge:
+            return EXIT_DID_NOT_CONVERGE
+        if self.failed:
+            return EXIT_WRITE_FAILED
+        return EXIT_REPAIRABLE_REMAINS if self.pending else EXIT_CLEAN
+
+
+def run_sweep(root: Path | str, lane: str = 'all', apply: bool = False):
+    """Sweep *root*; return ``(summary, diffs)``.
+
+    Pipeline order is deliberate: load-and-gate, then resolve-the-write-target,
+    THEN repair. Resolving before repairing means a gate-skip (a live lane, a
+    dangling link, committed evidence) is counted as ``skipped`` and never as
+    pending work — otherwise a permanently-skipped file would keep the exit
+    code at 1 forever and break the second-run-zero invariant.
+
+    ``repaired`` counts what is ON DISK. Under ``--apply`` a file's repairs are
+    added only AFTER its write returns success; a failed write puts them in
+    ``repaired_not_written`` instead. Counting them before the write made
+    ``repaired: 26 / write failures: 1`` unresolvable — an operator could not
+    tell which 26 landed — and made the number irreproducible on the next run,
+    which is the same run-to-run diff stability the residue counters are held
+    to. A dry run adds them to ``repaired`` because nothing failed: the run
+    wrote nothing BY DESIGN, and ``pending`` is what says so.
+    """
+    root_path = Path(root)
+    targets = discover_targets(root_path)
+    if lane != 'all':
+        targets = [t for t in targets if t.lane == lane]
+    targets = dedupe_by_realpath(targets)
+
+    skipped: dict[str, int] = {}
+    diffs: list[str] = []
+    scanned = detected = repaired_count = leaks = quotes = failed = pending = 0
+    not_written = stalled = 0
+
+    for target in targets:
+        scanned += 1
+
+        loaded = load_target(target)
+        if isinstance(loaded, Refusal):
+            skipped[loaded.reason] = skipped.get(loaded.reason, 0) + 1
+            continue
+
+        resolved = resolve_write_target(target, root_path)
+        if isinstance(resolved, Refusal):
+            skipped[resolved.reason] = skipped.get(resolved.reason, 0) + 1
+            continue
+
+        if not round_trips(loaded.raw, loaded.obj):
+            reason = REASON_FORMAT_NOT_REPRODUCIBLE
+            skipped[reason] = skipped.get(reason, 0) + 1
+            continue
+
+        new_obj, outcomes = repair_document(loaded.obj)
+        file_repairs = 0
+        for outcome in outcomes:
+            if outcome.action == ACTION_REPAIRED:
+                detected += 1
+                file_repairs += 1
+            elif outcome.action == ACTION_REFUSED:
+                detected += 1
+                if outcome.residue == RESIDUE_LEAK:
+                    leaks += 1
+                else:
+                    quotes += 1
+            elif outcome.action == ACTION_DID_NOT_CONVERGE:
+                # Deliberately NOT counted into strings_detected: it is a
+                # loop-bound event, not a flagged string, and folding it in
+                # would corrupt the one-outcome-per-string arithmetic the
+                # residue counters rest on. It gets its own counter, its own
+                # report line, and its own exit code.
+                stalled += 1
+
+        if not file_repairs:
+            continue
+
+        if apply:
+            failure = write_repaired(resolved, loaded.raw, new_obj)
+            if failure is not None:
+                failed += 1
+                pending += 1
+                not_written += file_repairs
+            else:
+                repaired_count += file_repairs
+        else:
+            repaired_count += file_repairs
+            payload = serialize_like(loaded.raw, new_obj)
+            diffs.append(''.join(difflib.unified_diff(
+                loaded.raw.splitlines(keepends=True),
+                payload.splitlines(keepends=True),
+                fromfile=str(target.path),
+                tofile=str(target.path) + ' (repaired)',
+            )))
+            pending += 1
+
+    return Summary(
+        files_scanned=scanned,
+        strings_detected=detected,
+        repaired=repaired_count,
+        leak_unrepaired=leaks,
+        quoted_only=quotes,
+        skipped=skipped,
+        failed=failed,
+        pending=pending,
+        repaired_not_written=not_written,
+        did_not_converge=stalled,
+    ), diffs
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Entry point. Dry run is the DEFAULT; ``--apply`` is required to write."""
+    parser = argparse.ArgumentParser(
+        prog='sweep_toolcall_markup',
+        description=(
+            'Retro-sweep leaked tool-call markup out of TERMINAL persisted '
+            'state: data/escalations/**/*.json (resolved/dismissed records '
+            'only) and .worktrees-orphaned/*/.task/plan.json. Dry run by '
+            'default. Never touches '
+            'docs/task-recovery-2026-05-13/worktree-inventory.json or '
+            'docs/toolcall-xml-leak-sweep-2026-08-05/dry-run-report.json, '
+            'which are committed evidence that legitimately quotes specimens.'
+        ),
+    )
+    parser.add_argument(
+        '--root',
+        default=str(Path(__file__).resolve().parent.parent),
+        help='repo root to sweep (default: this script\'s own checkout)',
+    )
+    parser.add_argument(
+        '--apply', action='store_true',
+        help='actually rewrite files (default: report only)',
+    )
+    parser.add_argument('--lane', choices=_LANE_CHOICES, default='all')
+    parser.add_argument(
+        '--json', action='store_true', dest='as_json',
+        help='emit the summary as JSON instead of text',
+    )
+    args = parser.parse_args(argv)
+
+    summary, diffs = run_sweep(args.root, lane=args.lane, apply=args.apply)
+
+    if args.as_json:
+        print(json.dumps(summary.as_dict(), indent=2, sort_keys=True))
+        return summary.exit_code()
+
+    for diff in diffs:
+        print(diff, end='')
+    print(f'files scanned      : {summary.files_scanned}')
+    print(f'strings detected   : {summary.strings_detected}')
+    print(f'repaired           : {summary.repaired}')
+    print(f'leak (unrepaired)  : {summary.leak_unrepaired}')
+    print(f'quoted only        : {summary.quoted_only}')
+    print(f'write failures     : {summary.failed}')
+    print(f'repairs not written: {summary.repaired_not_written}')
+    print(f'did not converge   : {summary.did_not_converge}')
+    for reason in sorted(summary.skipped):
+        print(f'skipped/{reason:<10}: {summary.skipped[reason]}')
+    return summary.exit_code()
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

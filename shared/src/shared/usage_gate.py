@@ -422,6 +422,10 @@ class InvokeSlot:
 
         Forwards ``self.scope`` (PRD task β) so a scoped cap detected here
         attributes to only this account's model-scope.
+
+        Settling suppresses ``invoke_slot()``'s ``__aexit__`` safety net, so
+        settling here also releases the PROBE_IN_FLIGHT claim explicitly
+        (task 4096) — see the comment below for why it is unconditional.
         """
         hit = self._gate.detect_cap_hit(
             stderr,
@@ -431,6 +435,15 @@ class InvokeSlot:
             scope=self.scope,
         )
         if hit:
+            # Settling below suppresses invoke_slot()'s __aexit__ safety net, so
+            # the PROBE_IN_FLIGHT claim must be released here (task 4096) —
+            # mirroring report()'s arms. A guarded no-op whenever the gate
+            # handler already moved the account off PROBE_IN_FLIGHT (the
+            # unscoped CapHit -> CAPPED case), so the general path is unchanged.
+            # It is load-bearing for the two handlers that take no phase
+            # transition at all: the SCOPED _handle_cap_detected branch
+            # (invariant S5) and _handle_near_cap_warning in EITHER scope.
+            self._gate.release_probe_slot(self.token)
             self._settled = True
         return hit
 
@@ -456,10 +469,14 @@ class InvokeSlot:
         caller discipline (PRD §7.4, task W4-ε): ``_settled`` is set in a
         ``finally`` so every variant leaves the slot settled exactly once.
         The PROBE_IN_FLIGHT claim taken by ``before_invoke()`` is released on
-        every path — OK/CapHit/AuthFailed release it as a side effect of
-        their phase transition; NearCap and the no-phase-change variants
-        (ZeroOutputWedge/CliLocalError/Failure) release it explicitly via
-        ``release_probe_slot`` since they don't otherwise touch phase.
+        every path — OK/AuthFailed and an UNSCOPED CapHit release it as a side
+        effect of their phase transition; a SCOPED CapHit (which takes no phase
+        transition at all — see below), NearCap, and the no-phase-change
+        variants (ZeroOutputWedge/CliLocalError/Failure) release it explicitly
+        via ``release_probe_slot`` since they don't otherwise touch phase. The
+        CapHit arm calls ``release_probe_slot`` unconditionally: it is a
+        guarded no-op once the account is already CAPPED, so one call covers
+        both scopes (task 4096).
 
         Dispatches to the gate's existing handlers — this method owns no
         transition logic of its own:
@@ -468,8 +485,11 @@ class InvokeSlot:
           ``near_cap``). Does not accumulate cost — ``OK`` carries none; cost
           stays a caller concern (``confirm()`` / ``on_agent_complete``).
         - CapHit -> ``_handle_cap_detected`` (-> CAPPED), forwarding
-          ``self.scope`` (PRD task β): a scoped cap attributes to only this
-          account's model-scope and leaves the account phase AVAILABLE.
+          ``self.scope`` (PRD task β), then ``release_probe_slot``: a scoped
+          cap attributes to only this account's model-scope and takes no phase
+          transition, so the probe claim is released explicitly there (a no-op
+          on the unscoped path, where the CAPPED transition already released
+          it) and the account is left AVAILABLE.
         - AuthFailed -> ``_handle_auth_failure`` (-> AUTH_FAILED; a no-op if
           already CAPPED — CAPPED takes precedence, per that handler's own
           guard). Scope-blind.
@@ -510,6 +530,21 @@ class InvokeSlot:
                     token,
                     scope=self.scope,
                 )
+                # Unconditional, mirroring the NearCap arm (task 4096). The
+                # general (scope=None) path is unaffected: _handle_cap_detected
+                # has already transitioned the account to CAPPED, and
+                # release_probe_slot is guarded on `phase == PROBE_IN_FLIGHT`,
+                # so this is a no-op there — the exact idempotency pinned by
+                # test_usage_gate_exhaustive.py::TestReleaseProbeSlot::
+                # test_noop_after_handle_cap_detected_already_cleared. The
+                # SCOPED path needs it: _handle_cap_detected's `scope is not
+                # None` branch deliberately bypasses _transition (invariant S5)
+                # and returns before any phase write, so without this the
+                # PROBE_IN_FLIGHT claim taken by before_invoke() is never
+                # released, and `finally: _settled = True` below also suppresses
+                # invoke_slot()'s __aexit__ safety net — the account is skipped
+                # by before_invoke's predicate forever.
+                self._gate.release_probe_slot(token)
             elif isinstance(outcome, AuthFailed):
                 self._gate._handle_auth_failure(f'HTTP {outcome.status}', token)
             elif isinstance(outcome, NearCap):
@@ -1310,6 +1345,10 @@ class UsageGate:
             # account-level cap_hit event site, so the scoped path deliberately
             # bypasses it and fires its own cap_hit event (scope detail added)
             # to preserve observability without transitioning the account.
+            # Consequence (task 4096): because this branch takes NO phase
+            # transition, a caller holding a PROBE_IN_FLIGHT claim owns
+            # releasing it — this handler will not do it for them (see
+            # InvokeSlot.report / InvokeSlot.detect_cap_hit).
             # resets_at is the value the generic classifier already parsed
             # (decision 2); an unknown (None) is stored verbatim — the
             # None-backoff policy is γ's (task 2857).
@@ -2092,11 +2131,27 @@ class UsageGate:
             self._transition(acct, AccountPhase.AVAILABLE)
 
     def release_probe_slot(self, oauth_token: str | None) -> None:
-        """Release a probe slot claimed by before_invoke() when invoke raises an exception.
+        """Release a probe claim taken by before_invoke() on any path that does
+        not itself transition phase.
 
-        Called in the except handler of invoke_with_cap_retry / _invoke_with_session
-        to clean up probe state when the invoke call raises (subprocess failure,
-        CancelledError, etc.) before confirm_account_ok() or detect_cap_hit() can run.
+        Three callers, none of which the account's phase machine settles on its
+        own (task 4096 widened this from exception-only):
+
+        - **Exception** — the except handler of invoke_with_cap_retry /
+          _invoke_with_session, when the invoke call raises (subprocess failure,
+          CancelledError, etc.) before confirm_account_ok() or detect_cap_hit()
+          can run; and ``invoke_slot()``'s ``__aexit__`` safety net.
+        - **Scoped cap** — ``_handle_cap_detected``'s ``scope is not None``
+          branch writes ``scope_caps[scope]`` and deliberately bypasses
+          ``_transition`` (invariant S5), so the account-level claim is left for
+          the caller: see ``InvokeSlot.report`` / ``InvokeSlot.detect_cap_hit``.
+        - **Near-cap** — ``_handle_near_cap_warning`` is annotation-only in
+          EITHER scope and never transitions phase.
+
+        An UNSCOPED cap needs no call here (``_handle_cap_detected`` already
+        transitioned the account to CAPPED), but the callers above make it
+        unconditionally: the ``phase == PROBE_IN_FLIGHT`` guard below makes it a
+        no-op, which is cheaper than re-deriving what the handler just did.
 
         Effects (only when probe_in_flight is True on the matched account):
         - Clears probe_in_flight
@@ -2109,7 +2164,7 @@ class UsageGate:
         - probe_in_flight is False on the matched account (nothing to release)
 
         Does NOT touch near_cap or capped — those flags track cap status, which
-        is orthogonal to whether an exception occurred during invocation.
+        is orthogonal to why the probe claim is being handed back.
         """
         if not oauth_token:
             return
@@ -2118,12 +2173,13 @@ class UsageGate:
             return
         if acct.phase == AccountPhase.PROBE_IN_FLIGHT:
             logger.info(
-                f'Account {acct.name}: probe slot released after exception — opening to all tasks',
+                f'Account {acct.name}: probe slot released — opening to all tasks',
             )
             # _transition owns: the phase write, probe_count reset, and the
             # centralized _open recompute. clear_near_cap=False preserves
             # this method's documented "does NOT touch near_cap" contract —
-            # this is an exception path, orthogonal to cap status.
+            # releasing the claim is orthogonal to cap status on every caller
+            # (exception, scoped cap, near-cap).
             self._transition(acct, AccountPhase.AVAILABLE, clear_near_cap=False)
 
     def lease_is_current(self, lease: AccountLease) -> bool:

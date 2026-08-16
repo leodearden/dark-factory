@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -4057,3 +4058,175 @@ def test_main_reap_decisions_refuses_unknown_queue_even_when_reaper_passes_the_s
     assert rc == 0
     listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
     assert listed['dec-unknown-selfmatch'] == sr.DecisionState.OPEN
+
+
+class TestAtomicWriteSemantics:
+    """``_atomic_write_text``'s on-disk semantics, pinned WITHOUT a delegation seam.
+
+    Task 3223 consolidated the repo's tmp+rename writers into
+    ``shared.safe_io.atomic_write_text``, but this module is the deliberate
+    exception: it is stdlib-only so ``skills/spawn/spawn-claude.sh`` can run it
+    with no venv (see ``TestStdlibOnlySelfContainment`` below and
+    ``_ALLOWED_RENAMERS`` in ``shared/tests/test_safe_io.py``).
+
+    So these assert the OBSERVABLE result on disk rather than that a particular
+    helper was called. That is the more durable pin anyway: it holds whether
+    the body is inlined or delegated, and it does not go stale the next time
+    the implementation choice is revisited.
+    """
+
+    def test_writes_0600_and_leaves_no_temp_residue(self, tmp_path):
+        """The record is created 0600 (mkstemp's mode), with no tmp left behind."""
+        target = tmp_path / 'record.json'
+
+        sr._atomic_write_text(target, '{"a": 1}')
+
+        assert target.read_text() == '{"a": 1}'
+        assert target.stat().st_mode & 0o777 == 0o600, (
+            'session records hold session state and must stay owner-only'
+        )
+        assert sorted(p.name for p in tmp_path.iterdir()) == ['record.json']
+
+    def test_creates_missing_parent_dirs(self, tmp_path):
+        """The parent chain is created rather than surfacing FileNotFoundError."""
+        target = tmp_path / 'nested' / 'deeper' / 'record.json'
+
+        sr._atomic_write_text(target, '{"a": 1}')
+
+        assert target.read_text() == '{"a": 1}'
+
+    def test_overwrites_atomically_leaving_no_residue(self, tmp_path):
+        """A rewrite replaces the contents wholesale and leaves no tmp file."""
+        target = tmp_path / 'record.json'
+
+        sr._atomic_write_text(target, '{"a": 1}')
+        sr._atomic_write_text(target, '{"b": 2}')
+
+        assert target.read_text() == '{"b": 2}'
+        assert sorted(p.name for p in tmp_path.iterdir()) == ['record.json']
+
+    def test_failed_write_leaves_original_intact_and_no_residue(
+        self, tmp_path, monkeypatch
+    ):
+        """On a mid-write failure the original survives and the tmp is cleaned up."""
+        target = tmp_path / 'record.json'
+        sr._atomic_write_text(target, '{"original": true}')
+
+        def _boom(*_args, **_kwargs):
+            raise OSError('disk full')
+
+        monkeypatch.setattr(sr.os, 'replace', _boom)
+
+        with pytest.raises(OSError, match='disk full'):
+            sr._atomic_write_text(target, '{"replacement": true}')
+
+        assert target.read_text() == '{"original": true}'
+        assert sorted(p.name for p in tmp_path.iterdir()) == ['record.json']
+
+    def test_write_record_creates_missing_nested_dir_and_round_trips(self, tmp_path):
+        """End-to-end: write_record into a non-existent nested root still works."""
+        root = tmp_path / 'does' / 'not' / 'exist'
+        assert not root.exists()
+
+        record = _make_record(session_slug='sess-3223', task_id='3223')
+        sr.write_record(record, root=root)
+
+        loaded = sr.read_record('sess-3223', root=root)
+        assert loaded is not None
+        assert loaded.session_slug == 'sess-3223'
+        assert loaded.task_id == '3223'
+
+
+#: Repo root of this worktree, resolved from THIS FILE so the subprocess
+#: contract test below is CWD-independent (the suite is run from
+#: ``<worktree>/orchestrator``, but a scratch-CWD run must behave identically).
+_SR_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _non_venv_interpreter() -> str | None:
+    """Return an interpreter that has no workspace packages installed, or None.
+
+    ``sys.executable`` is the venv interpreter, which HAS ``shared`` installed
+    and therefore cannot discriminate — the contract under test is precisely
+    "imports without a venv".  Prefer the system interpreter, then the base
+    interpreter this venv was built from.
+    """
+    candidates = ['/usr/bin/python3', str(Path(sys.base_prefix) / 'bin' / 'python3')]
+    for candidate in candidates:
+        if Path(candidate).is_file() and Path(candidate).resolve() != Path(
+            sys.executable
+        ).resolve():
+            return candidate
+    return None
+
+
+class TestStdlibOnlySelfContainment:
+    """``session_registry`` must import with NO venv, install or workspace deps.
+
+    This is an architectural contract, not a style preference.  The module
+    docstring (lines 5-12) states it is "deliberately stdlib-only and
+    self-contained (no intra-orchestrator imports)" so it can be "invoked
+    directly by ``skills/spawn/spawn-claude.sh`` via an absolute path (no
+    venv/PYTHONPATH/install required)".  That hook runs under an interpreter
+    with no workspace packages available, so ANY ``from shared import ...`` or
+    third-party import at module scope breaks the spawn path — and does so far
+    from here, as a hook subprocess that silently never writes ``record.json``.
+
+    Task 3223's consolidation added ``from shared import safe_io`` and broke
+    exactly this (escalation esc-3223-2); the only symptom in the suite was two
+    downstream ``test_session_hooks.py`` failures, which is why the contract is
+    now pinned directly.  A future migration that finds this test in its way
+    should read the module docstring before deleting it.
+    """
+
+    def test_imports_under_a_bare_interpreter_with_no_workspace_packages(self, tmp_path):
+        """`import orchestrator.session_registry` succeeds with only orchestrator/src."""
+        interpreter = _non_venv_interpreter()
+        if interpreter is None:
+            pytest.skip('no non-venv interpreter available on this host')
+
+        env = {
+            'PYTHONPATH': str(_SR_REPO_ROOT / 'orchestrator' / 'src'),
+            'PATH': '/usr/bin:/bin',
+            'HOME': os.environ.get('HOME', '/tmp'),
+            'PYTHONDONTWRITEBYTECODE': '1',
+        }
+
+        # ``cwd=tmp_path`` on both runs below is LOAD-BEARING, not tidiness.
+        # Python puts the process's own cwd on sys.path, so a run from the REPO
+        # ROOT resolves ``<repo>/shared`` — the wrapper directory, NOT the real
+        # ``shared/src/shared`` package — as an empty NAMESPACE package.  The
+        # probe's ``shared`` import then succeeds, this test skips, and the
+        # contract goes unpinned.  Measured: inert from the repo root, live from
+        # ``orchestrator/``.  The canonical test_command runs
+        # ``cd orchestrator && pytest tests/``, so it only bit an ad-hoc
+        # ``pytest orchestrator/tests/...`` from the root — which is exactly what
+        # someone checking this one file types.  A neutral cwd holds either way.
+        #
+        # Guard against a vacuous pass: on a host where ``shared`` really is
+        # installed into this interpreter, the assertion below would succeed even
+        # with the contract broken.  Probe the SAME import shape the contract
+        # forbids — a bare ``import shared`` is satisfied by a namespace dir that
+        # ``from shared import safe_io`` still fails on, so probing the bare form
+        # can only ever over-skip.
+        probe = subprocess.run(
+            [interpreter, '-c', 'from shared import safe_io'],
+            env=env, cwd=tmp_path, capture_output=True, text=True, timeout=60,
+        )
+        if probe.returncode == 0:
+            pytest.skip(
+                'this interpreter can already import `shared`; the test cannot '
+                'discriminate a stdlib-only module from one that imports it'
+            )
+
+        result = subprocess.run(
+            [interpreter, '-c', 'import orchestrator.session_registry'],
+            env=env, cwd=tmp_path, capture_output=True, text=True, timeout=60,
+        )
+
+        assert result.returncode == 0, (
+            'session_registry must import with no venv/install — it is executed '
+            'by absolute path from skills/spawn/spawn-claude.sh. Remove the '
+            'non-stdlib module-scope import.\n'
+            f'stderr:\n{result.stderr}'
+        )

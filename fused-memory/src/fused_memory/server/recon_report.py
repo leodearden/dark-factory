@@ -15,7 +15,6 @@ import hashlib
 import inspect
 import json
 import logging
-import re
 import uuid
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
@@ -24,6 +23,7 @@ from typing import Any, Literal
 from graphiti_core.errors import EdgeNotFoundError
 
 from fused_memory.services.memory_service import MemoryNotFoundError
+from fused_memory.utils.validation import is_full_uuid
 
 logger = logging.getLogger(__name__)
 
@@ -503,15 +503,6 @@ def _stat_type_mismatch_error(key: str) -> dict[str, str]:
 # cite_* error helpers (task β)
 # ---------------------------------------------------------------------------
 
-# Compiled UUID shape gate: ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
-# re.IGNORECASE: Graphiti/Neo4j and mem0 do not normalise UUID case on read-back,
-# and Python's stdlib uuid.UUID accepts mixed case — rejecting uppercase here would
-# mask real edges/memories as malformed before the service is even called.
-_UUID_RE = re.compile(
-    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
-    re.IGNORECASE,
-)
-
 _ERR_FINDING_UNKNOWN: dict[str, str] = {
     'error': 'finding_unknown',
     'error_type': 'ReconReportFindingUnknown',
@@ -549,6 +540,8 @@ _ERR_RUN_NOT_FOUND: dict[str, str] = {
     'error_type': 'ReconReportRunNotFound',
 }
 
+# Shape gate: utils.validation.is_full_uuid (INV-5).  Only the predicate is
+# shared; this envelope stays this module's own.
 _ERR_INVALID_UUID_SHAPE: dict[str, str] = {
     'error': 'invalid_uuid_shape',
     'error_type': 'ReconReportInvalidUuid',
@@ -920,7 +913,124 @@ class ReconReportState:
         stage: str,
         project_id: str,
     ) -> dict[str, Any]:
-        """Create a new in-progress report entry."""
+        """Create a new in-progress report entry, or no-op on a repeat call.
+
+        Idempotent per PRD §9.2/§9.4. A FIRST call for a given ``(run_id,
+        stage)`` creates a fresh entry and returns ``{run_id, stage,
+        already_started: False}``. A REPEAT call for an ``(run_id, stage)``
+        pair already present in ``self._state`` mutates NOTHING on the
+        existing entry — not its findings, stats, summary, created_at, or
+        completed_at, and none of the four run-scoped dedup indices — and
+        returns ``{run_id, stage, already_started: True, project_id,
+        finding_count, completed, warning}`` describing the RETAINED entry.
+        A structured WARNING is logged whenever a repeat is detected. This
+        closes an unconditional-overwrite bug where a second call silently
+        destroyed every finding/citation/stat recorded so far, orphaned the
+        run-scoped dedup indices (a ``duplicate_finding`` pointer that could
+        no longer resolve), and reset ``completed_at`` — bypassing the
+        post-:meth:`complete` mutation guard.
+
+        If the incoming ``project_id`` differs from the retained entry's,
+        the ORIGINAL is kept and the divergence is surfaced in the response
+        ``warning`` and the logged message — AND, fully mirroring
+        :meth:`complete`'s different-summary handling, appended to
+        ``entry.summary_warnings`` and persisted, so a genuine cross-project
+        run_id collision is visible to every ``get_assembled_report`` reader,
+        not only the process log. A pure repeat with no divergence stays a
+        zero-store-write no-op.
+
+        One deliberate exception to "mutate nothing": if ``self._active``
+        has NO entry for ``run_id`` at all, the repeat call REPAIRS
+        ``self._active[run_id] = stage`` and persists. ``_resolve_entry``
+        (used by ``add_finding``/``set_stat``/``inc_stat``/``complete``)
+        follows ``_active``, so a run whose pointer was dropped — by
+        :meth:`tick` evicting the active stage (see its docstring, "Remove
+        _active pointer only if it still points at this stage"), or by a
+        :meth:`hydrate_from_store` where no persisted row carried
+        ``is_active``  — would otherwise answer ``run_id_unknown`` on
+        EVERY subsequent call, forever: strictly worse than today's
+        overwrite bug, since there would be no way back in. Adopting the
+        pointer in exactly that case is purely additive (nothing already
+        set is overwritten) and restores usability.
+
+        The pointer is NEVER stolen from a different, currently-active
+        stage of the same run BY THIS REPEAT-CALL BRANCH — i.e. for as long
+        as the earlier stage's entry is still resident in ``self._state``,
+        the repair only fires when ``self._active.get(run_id) is None``,
+        never when it already names a different stage. Re-pointing at an
+        earlier stage would itself be a corruption channel: a confused agent
+        naming stage 1 while stage 2 is live would silently redirect stage
+        2's findings into stage 1's entry and close the wrong stage — the
+        exact cross-stage corruption this guard closes elsewhere.
+
+        This guard is keyed solely on ``(run_id, stage)`` PRESENCE in
+        ``self._state`` — it deliberately does not (and cannot, without a
+        known-stage vocabulary) police a stage name that does not yet exist
+        for this run; that remains a legal fresh-create, matching a normal
+        stage transition within a run. Consequently the never-stolen
+        guarantee above LAPSES once the earlier stage's entry evicts from
+        ``self._state`` (TTL past :meth:`complete`, via :meth:`tick`): a
+        call naming that now-absent ``(run_id, stage)`` no longer matches
+        ``existing is not None`` below, so it takes the fresh-create path,
+        which unconditionally sets ``self._active[run_id] = stage`` — still
+        capable of stealing the pointer from a different, live stage of the
+        same run. Closing that residual needs the same known-stage
+        vocabulary this docstring already disclaims; it is an explicit scope
+        boundary of this guard (task 3988), not a guarantee made here.
+        """
+        existing = self._state.get((run_id, stage))
+        if existing is not None:
+            warning = (
+                f'start_report called again for an existing report '
+                f'(run_id={run_id!r} stage={stage!r}); preserving the '
+                f'existing report ({len(existing.findings)} finding(s), '
+                f'completed={existing.completed_at is not None}) — call ignored.'
+            )
+            needs_persist = False
+            if project_id != existing.project_id:
+                warning += (
+                    f' project_id mismatch: incoming {project_id!r} != '
+                    f'retained {existing.project_id!r}; retained project_id kept.'
+                )
+                # Fully mirror complete()'s different-summary handling: record
+                # the divergence ON THE ENTRY (not just this transient
+                # response), so get_assembled_report's summary_warnings
+                # surfaces a genuine cross-project run_id collision to every
+                # downstream reader, not only the process log.
+                existing.summary_warnings.append(warning)
+                needs_persist = True
+            logger.warning(
+                'recon_report: start_report called again for an existing entry '
+                'run_id=%r stage=%r (findings=%d completed=%s incoming_project_id=%r '
+                'retained_project_id=%r); existing report preserved, call ignored',
+                run_id,
+                stage,
+                len(existing.findings),
+                existing.completed_at is not None,
+                project_id,
+                existing.project_id,
+            )
+            # Repair-only exception (see docstring): adopt the pointer ONLY
+            # when the run has no active stage at all; never steal it from a
+            # different, currently-active stage. Persist ONLY on this repair
+            # or the project_id-divergence branch above, so a pure no-op
+            # repeat (no divergence, pointer intact) still performs zero
+            # store writes.
+            if self._active.get(run_id) is None:
+                self._active[run_id] = stage
+                needs_persist = True
+            if needs_persist:
+                self._persist_run(run_id)
+            return {
+                'run_id': run_id,
+                'stage': stage,
+                'already_started': True,
+                'project_id': existing.project_id,
+                'finding_count': len(existing.findings),
+                'completed': existing.completed_at is not None,
+                'warning': warning,
+            }
+
         entry = _ReportEntry(
             run_id=run_id,
             stage=stage,
@@ -930,7 +1040,7 @@ class ReconReportState:
         self._state[(run_id, stage)] = entry
         self._active[run_id] = stage
         self._persist_run(run_id)
-        return {'run_id': run_id, 'stage': stage}
+        return {'run_id': run_id, 'stage': stage, 'already_started': False}
 
     def add_finding(
         self,
@@ -1665,7 +1775,7 @@ class ReconReportState:
             return _ERR_FINDING_UNKNOWN.copy()
         finding_entry, finding = resolved
 
-        if not _UUID_RE.match(edge_uuid):
+        if not is_full_uuid(edge_uuid):
             return _ERR_INVALID_UUID_SHAPE.copy()
 
         if self._memory_service is None:
@@ -1874,7 +1984,7 @@ class ReconReportState:
             return _ERR_FINDING_UNKNOWN.copy()
         finding_entry, finding = resolved
 
-        if not _UUID_RE.match(memory_id):
+        if not is_full_uuid(memory_id):
             return _ERR_INVALID_UUID_SHAPE.copy()
 
         if self._memory_service is None:
@@ -1955,7 +2065,7 @@ class ReconReportState:
             return _ERR_FINDING_UNKNOWN.copy()
         finding_entry, finding = resolved
 
-        if not _UUID_RE.match(cited_run_id):
+        if not is_full_uuid(cited_run_id):
             return _ERR_INVALID_UUID_SHAPE.copy()
 
         if self._memory_service is None:
@@ -2185,7 +2295,11 @@ Tools: start_report, add_finding, set_stat, inc_stat, complete, delete_finding,
        cite_entity, cite_edge, cite_task, cite_memory, cite_run.
 
 Usage pattern (per PRD §9.2):
-1. start_report — open a new report at the start of a stage run.
+1. start_report — open a new report at the start of a stage run.  Idempotent:
+                  a repeat call for the same (run_id, stage) preserves the
+                  existing report untouched and returns already_started: True
+                  (with the retained report's project_id/finding_count/
+                  completed/a warning) instead of resetting it.
 2. add_finding — append a diagnostic finding (deduplicated by task_id + flag_type
                   across ALL stages of the same run_id).  Overlength
                   description/suggested_action are truncated with a
@@ -2223,10 +2337,14 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
 
     @mcp.tool()
     async def start_report(run_id: str, stage: str, project_id: str) -> dict:
-        """Open a new in-progress report for this stage run.
+        """Open a new in-progress report for this stage run.  Idempotent.
 
         PRD §9.2 — start_report(run_id, stage, project_id).
-        Returns {run_id, stage}.
+        A first call returns {run_id, stage, already_started: False}. A
+        repeat call for the same (run_id, stage) preserves the existing
+        report untouched and returns {run_id, stage, already_started: True,
+        project_id, finding_count, completed, warning} describing the
+        retained report instead of resetting it.
         """
         return state.start_report(run_id=run_id, stage=stage, project_id=project_id)
 

@@ -1131,6 +1131,12 @@ def _make_minimal_worker() -> SpeculativeMergeWorker:
     """Build a bare SpeculativeMergeWorker with no real git ops needed."""
     git_ops = MagicMock()
     git_ops.project_root = None
+    # GitOps.cleanup_merge_worktree is async, and a bare MagicMock attribute is
+    # not awaitable.  _finalize_inflight's RUNNER_UNAVAILABLE branch reaches it
+    # via _release_or_cleanup (task 3251), so the stand-in must model the
+    # coroutine or every RU finalize test dies on "MagicMock can't be used in
+    # 'await' expression" long before its own assertions run.
+    git_ops.cleanup_merge_worktree = AsyncMock()
     q: asyncio.Queue = asyncio.Queue()
     worker = SpeculativeMergeWorker(git_ops=git_ops, queue=q)
     worker._shutdown_timeout = 2.0

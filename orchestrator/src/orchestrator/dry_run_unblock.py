@@ -95,6 +95,12 @@ _BUDGET_SUBTYPES: frozenset[str] = frozenset({'error_max_budget_usd'})
 _INFRA_FAILURE_KINDS: frozenset[AgentFailureKind] = frozenset({
     AgentFailureKind.TIMED_OUT,
     AgentFailureKind.EMPTY_OUTPUT,
+    # The CLI rejected the invocation before any model turn (task 3143 /
+    # esc-3118-1) — the investigation never ran, so this must stay a retryable
+    # infra_failure proposal rather than a human-review conclusion. It reached
+    # this set via EMPTY_OUTPUT before the taxonomy split; listing it keeps that
+    # verdict while the proposal text now carries the CLI's real cause.
+    AgentFailureKind.CLI_INPUT_REJECTED,
 })
 
 # Outer wall-clock sanity bound for invoke_with_cap_retry's cap-hit patience

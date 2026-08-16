@@ -1360,7 +1360,7 @@ def _cargo_scope_structured(cmd: VerifyCmd, crates: list[str]) -> VerifyCmd:
 _PYTEST_INVOCATION_RE = re.compile(r'\bpytest\b[^&|;]*')
 
 
-def _split_at_unbalanced_close(segment: str) -> tuple[str, str]:
+def _split_at_unbalanced_close(segment: str) -> tuple[str, str] | None:
     """Split *segment* at its first depth-0, UNQUOTED ')', or return it whole.
 
     Scans *segment*'s unquoted characters only (via ``_unquoted_chars``,
@@ -1392,8 +1392,24 @@ def _split_at_unbalanced_close(segment: str) -> tuple[str, str]:
     char-class-widening fix for. Building on ``_unquoted_chars`` instead of a
     second, weaker hand-rolled paren counter fixes this for free: a ``)``
     inside quotes is never even offered to the depth check below.
+
+    REFUSAL — returns ``None`` when ``_unquoted_chars`` reports
+    ``unterminated``, i.e. *segment* ends inside an unclosed quote: every
+    position at the end of ``body`` is then INSIDE a live quoted argument, so
+    no correct append site exists in it at all. ``None`` is this module's
+    established spelling of "refuse" — ``_scan_and_chain`` already does ``if
+    strict and (unterminated or depth != 0): return None`` on the very same
+    flag, which is why ``_unquoted_chars`` returns it. Task 4121 (recovered
+    from task 3650's review; see task 4023): the first cut of this function
+    DISCARDED that flag (``chars, _unterminated = ...``).
+
+    What refusal means for the raw-chain appender — which spans count as
+    invocations, why the refusal is whole-string, and the measured corruption
+    it prevents — lives in ONE place: ``_unspliceable_pytest_spans``.
     """
-    chars, _unterminated = _unquoted_chars(segment)
+    chars, unterminated = _unquoted_chars(segment)
+    if unterminated:
+        return None
     depth = 0
     for i, ch in chars:
         if ch == '(':
@@ -1403,6 +1419,95 @@ def _split_at_unbalanced_close(segment: str) -> tuple[str, str]:
                 return segment[:i], segment[i:]
             depth -= 1
     return segment, ''
+
+
+def _pytest_invocation_spans(raw: str) -> list[re.Match[str]]:
+    """The ``_PYTEST_INVOCATION_RE`` matches in *raw* that are real invocations.
+
+    ONE definition of "is this span an invocation", shared by the refusal
+    screen (``_unspliceable_pytest_spans``) and the rewrite
+    (``_append_to_raw_pytest_invocations``) so the two cannot disagree about
+    what they are looking at.
+
+    A match counts only when its ``pytest`` token STARTS at an unquoted index
+    of *raw* — ``_unquoted_chars``, the same scanner everything else in this
+    module walks. ``_PYTEST_INVOCATION_RE`` is quote-blind in both
+    directions, so it happily matches the word ``pytest`` sitting inside
+    ANOTHER command's quoted argument: ``pytest tests/ && echo "pytest
+    done"`` yields spans ``['pytest tests/ ', 'pytest done"']`` (measured),
+    where the second is ``echo``'s argument text and appending to it is pure
+    collateral damage. Excluding those keeps a suffix out of unrelated
+    arguments, and — the reason this filter exists at all — stops such a span
+    from being mistaken for an unspliceable INVOCATION and refusing a rewrite
+    that the command's real, perfectly clean invocation could have taken.
+    """
+    unquoted = {index for index, _char in _unquoted_chars(raw)[0]}
+    return [match for match in _PYTEST_INVOCATION_RE.finditer(raw) if match.start() in unquoted]
+
+
+def _unspliceable_pytest_spans(raw: str) -> list[str]:
+    """The pytest invocation spans in *raw* that NO suffix can be appended to.
+
+    THE definition of "refuse" for the raw-chain appender, and the home of
+    the rationale every other docstring in this chain points at. A span
+    qualifies when it is a real invocation (``_pytest_invocation_spans`` — its
+    ``pytest`` token is not itself inside someone else's quotes) AND
+    ``_split_at_unbalanced_close`` refuses it, i.e. the span ends inside an
+    unclosed quote so no position in it lands outside a live quoted argument.
+
+    WHAT REFUSING PREVENTS (measured, not hypothetical).
+    ``_PYTEST_INVOCATION_RE`` is quote-blind and stops at the first
+    ``&&``/``|``/``;`` it sees, including one inside a quoted ``-k``
+    expression: ``pytest -k 'a && b' tests/ && true`` yields the span
+    ``"pytest -k 'a "``, and appending there produced ``pytest -k 'a -p
+    no:xdist -o addopts='' && b' tests/ && true`` — which still passes ``bash
+    -n``, because bash re-tokenises it into a single ``-k`` word ``a -p
+    no:xdist -o addopts= && b``. The recovery flags never reach pytest as
+    flags and the WRONG TESTS run, silently. Returning the untouched original
+    instead costs one retry its flags, loudly.
+
+    WHY WHOLE-STRING RATHER THAN PER-SPAN, once a qualifying span exists —
+    both halves measured, neither assumed:
+
+    * On ``pytest -k 'a && b' t1/ && pytest t2/`` the spans' ``unterminated``
+      flags are ``[True, False]``: one corrupt span plus a perfectly clean
+      ``pytest t2/``. Skipping only the offending span would leave invocation
+      1 unflagged and invocation 2 flagged — a HALF-serial chain that
+      ``_is_serial_forced`` (a plain ``'no:xdist' in cmd.raw`` substring test)
+      still reports as fully serial, which then suppresses a later ``-n``
+      injection on a command that is not actually serial.
+    * On ``pytest -k 'a && pytest b' tests/`` the spans are
+      ``["pytest -k 'a ", "pytest b' tests/"]`` — BOTH unterminated, because
+      the second ``\\bpytest\\b`` the regex finds sits INSIDE the quoted
+      ``-k`` expression. Once one span ends mid-quote, the regex's
+      segmentation of the whole string is untrustworthy, so no later span in
+      that string can be trusted either.
+
+    Whole-string refusal is the only rule sound under both — for the strings
+    that reach it at all, which is exactly what ``_pytest_invocation_spans``
+    bounds. A chain whose ONLY unterminated span is a false match inside
+    another command's quoted argument (``pytest tests/ && echo "pytest
+    done"``, ``echo "running pytest" && pytest tests/`` — both measured) is
+    NOT refused: its real invocation is spliceable, and refusing there would
+    silently disable serial recovery and the ``-n`` cap for a command that
+    never had the defect. Returning the spans rather than a bare bool is what
+    lets ``verify._serial_pytest_str`` name the offending one in its WARNING
+    instead of asserting a cause it has not checked.
+    """
+    return [
+        match.group(0)
+        for match in _pytest_invocation_spans(raw)
+        if _split_at_unbalanced_close(match.group(0)) is None
+    ]
+
+
+def _has_unspliceable_pytest_invocation(raw: str) -> bool:
+    """True when *raw* holds any span ``_unspliceable_pytest_spans`` refuses.
+
+    The whole-string pre-screen for ``_append_to_raw_pytest_invocations``.
+    The rule, and every measurement behind it, live in that function.
+    """
+    return bool(_unspliceable_pytest_spans(raw))
 
 
 def _append_to_raw_pytest_invocations(raw: str, suffix: str) -> str:
@@ -1440,15 +1545,42 @@ def _append_to_raw_pytest_invocations(raw: str, suffix: str) -> str:
     implementation — the operational impact they pin (``serial_pytest``
     drives the env-transient and flaky-scoped recovery re-runs, so this
     fired at shipped defaults with no knob set) is recorded there.
+
+    REFUSAL CONTRACT (task 4121). Returns *raw* BYTE-IDENTICALLY, leaving the
+    caller to re-run the original command, whenever
+    ``_has_unspliceable_pytest_invocation`` holds — the asymmetry that decides
+    it, and why the refusal covers the whole string rather than the offending
+    span alone, are recorded once in ``_unspliceable_pytest_spans``. Spans
+    that are not invocations at all (the word ``pytest`` inside another
+    command's quoted argument — ``_pytest_invocation_spans``) are neither
+    refused NOR rewritten: they are passed through untouched, so the real
+    invocation in such a chain still gets *suffix*.
     """
-    def _rewrite(match: re.Match[str]) -> str:
+    if _has_unspliceable_pytest_invocation(raw):
+        return raw
+
+    # Rewrite by span rather than via `re.sub`'s own scan: `sub` would also
+    # substitute the quote-interior false matches this filter drops.
+    out: list[str] = []
+    cursor = 0
+    for match in _pytest_invocation_spans(raw):
         segment = match.group(0)
-        body, closer = _split_at_unbalanced_close(segment)
+        split = _split_at_unbalanced_close(segment)
+        # The pre-screen above already returned early for every *raw*
+        # containing a refusing invocation span, so this cannot be None here.
+        # Asserting rather than re-handling keeps a future scanner edit that
+        # leaks a refusal past the screen LOUD, instead of silently
+        # reintroducing the splice — the same convention ``split_top_level_and``
+        # uses for ``_scan_and_chain``'s ``None``.
+        assert split is not None
+        body, closer = split
         stripped = body.rstrip()
         trailing = body[len(stripped) :]
-        return f'{stripped}{suffix}{trailing}{closer}'
-
-    return _PYTEST_INVOCATION_RE.sub(_rewrite, raw)
+        out.append(raw[cursor : match.start()])
+        out.append(f'{stripped}{suffix}{trailing}{closer}')
+        cursor = match.end()
+    out.append(raw[cursor:])
+    return ''.join(out)
 
 
 def serial_pytest(cmd: VerifyCmd) -> VerifyCmd:
@@ -1463,13 +1595,21 @@ def serial_pytest(cmd: VerifyCmd) -> VerifyCmd:
     ``_force_serial_pytest``), so each chained invocation recovers
     independently. No-ops unless ``cmd.tool is ToolKind.PYTEST`` (covers
     OPAQUE and every other tool — P1).
+
+    Also a no-op on the raw path when the appender REFUSES (task 4121 — see
+    ``_unspliceable_pytest_spans``). Returning *cmd* ITSELF rather than an
+    equal ``replace`` copy is deliberate: the caller's ``is`` identity guard
+    (``verify._serial_pytest_str``'s ``if rewritten is parsed: return cmd``)
+    only fires on identity, and it is what hands back the operator's own
+    command string BYTE-identically instead of an argv-equivalent re-render.
     """
     if cmd.tool is not ToolKind.PYTEST:
         return cmd
     if cmd.raw is not None:
-        return replace(
-            cmd, raw=_append_to_raw_pytest_invocations(cmd.raw, " -p no:xdist -o addopts=''")
-        )
+        rewritten = _append_to_raw_pytest_invocations(cmd.raw, " -p no:xdist -o addopts=''")
+        if rewritten == cmd.raw:
+            return cmd
+        return replace(cmd, raw=rewritten)
     return replace(cmd, base_flags=(*cmd.base_flags, '-p', 'no:xdist', '-o', 'addopts='))
 
 
@@ -1519,11 +1659,20 @@ def apply_pytest_numprocesses(cmd: VerifyCmd, n: str) -> VerifyCmd:
     re-run) build their command via ``serial_pytest`` and then pass it back
     through the same injection site, so this guard is what keeps the ``-n``
     knob from breaking those recovery paths.
+
+    One further no-op on the raw path: the appender REFUSES (task 4121 — see
+    ``_unspliceable_pytest_spans``). As in ``serial_pytest``, returning *cmd*
+    ITSELF rather than an equal ``replace`` copy is what lets the caller's
+    ``is`` identity guard (``verify._with_pytest_numprocesses_str``) keep the
+    command BYTE-identical instead of argv-equivalent.
     """
     if cmd.tool is not ToolKind.PYTEST or n in {'', 'auto'} or _is_serial_forced(cmd):
         return cmd
     if cmd.raw is not None:
-        return replace(cmd, raw=_append_to_raw_pytest_invocations(cmd.raw, f' -n {n}'))
+        rewritten = _append_to_raw_pytest_invocations(cmd.raw, f' -n {n}')
+        if rewritten == cmd.raw:
+            return cmd
+        return replace(cmd, raw=rewritten)
     return replace(cmd, base_flags=(*cmd.base_flags, '-n', n))
 
 

@@ -59,7 +59,13 @@ class TestTopicSlugLeafModule:
         unloadable).
         """
         clusters = _default_topic_guard_clusters()
-        assert len(clusters) == 7, 'seeded cluster set changed — re-verify the slug rule'
+        # Was 4 after b536ae972c retired both eval-worktree clusters
+        # (`eval-worktree-plan-tools-missing`, `eval-worktree-venv-shadowing`)
+        # from the seed, their gate tasks 2841/2844 being done; 5 since task
+        # 3862 seeded `npx-pyright-eacces-agent-sandbox`. The count is a
+        # canary, not the contract — the slug check below is. Re-verified: all
+        # five remaining ids are valid slugs.
+        assert len(clusters) == 5, 'seeded cluster set changed — re-verify the slug rule'
         for cluster in clusters:
             assert is_valid_topic_slug(cluster.topic_id), (
                 f'seeded cluster id {cluster.topic_id!r} must be a valid topic slug'

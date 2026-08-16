@@ -605,7 +605,22 @@ def test_default_status_fetcher_raises_status_fetch_unavailable_when_unreachable
 
 
 class _FakeHttpxResponse:
+    """A 200/`application/json` `httpx.Response` stand-in for the
+    `default_status_fetcher` tests.
+
+    `status_code` and `headers` were added in the task-3644 amendment pass:
+    `default_status_fetcher._fetch` no longer hand-rolls its own POST, it
+    routes through `post_mcp_tool_call` like the other three legibility MCP
+    consumers -- which reads `status_code` (to detect a stateful server's 400
+    "Missing session ID") and `headers` (to pick the JSON vs SSE decoder).
+    The values pin the STATELESS fused-memory shape this fetcher actually
+    talks to, so these tests keep exercising the single-POST fast path.
+    """
+
     def __init__(self, payload):
+        self.status_code = 200
+        self.headers = {"content-type": "application/json"}
+        self.text = ""
         self._payload = payload
 
     def raise_for_status(self):
@@ -1001,3 +1016,720 @@ def test_cli_evaluate_malformed_state_never_crashes_and_exits_0(tmp_path, capsys
     captured = capsys.readouterr()
     assert exit_code == 0
     assert "DECISION:" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# task 3644: post_mcp_tool_call — the MCP streamable-HTTP session handshake
+# ---------------------------------------------------------------------------
+#
+# The escalation MCP server (:8103) is a STATEFUL FastMCP streamable-HTTP
+# server; the fused-memory one (:8002) is STATELESS. All four legibility MCP
+# consumers used to bare-POST `tools/call` at both, which the stateful one
+# rejects at the TRANSPORT layer -- before the tool ever runs -- with
+# (captured verbatim from a live probe against :8103 on 2026-08-05):
+#
+#     HTTP/1.1 400 Bad Request
+#     mcp-session-id: 93599e03ba3b4baeb5bd0d2b6b399ddd
+#     {"jsonrpc":"2.0","id":"server-error",
+#      "error":{"code":-32600,"message":"Bad Request: Missing session ID"}}
+#
+# so every legibility fail-loud escalation was silently swallowed. These tests
+# pin the adaptive fix: POST session-less first, and ONLY on a 400 perform the
+# handshake and retry once, so the stateless path stays exactly one POST.
+
+_SESSION_REQUIRED_400_BODY = {
+    "jsonrpc": "2.0",
+    "id": "server-error",
+    "error": {"code": -32600, "message": "Bad Request: Missing session ID"},
+}
+
+# The live 400 carries an `mcp-session-id` RESPONSE header of its own (see the
+# probe above). It is NOT a usable session -- a client that scrapes it and
+# replays it gets 404 "Session not found". The fakes below hand back this
+# sentinel so a test fails loudly if the implementation ever reuses it instead
+# of running the real `initialize` handshake.
+_UNUSABLE_SESSION_FROM_400 = "sid-scraped-off-the-400-do-not-reuse"
+
+
+class _FakeMcpResponse:
+    """An `httpx.Response` stand-in exposing exactly what the MCP transport
+    helper is allowed to touch: `status_code`, `headers`, `text`, `json()` and
+    `raise_for_status()`.
+
+    Deliberately a separate class from `_FakeHttpxResponse` above rather than
+    an extension of it: that one models only a 200/JSON reply, and widening it
+    with transport states would silently change the premise of every existing
+    test that uses it.
+    """
+
+    def __init__(self, *, status_code=200, headers=None, payload=None, text=""):
+        self.status_code = status_code
+        self.headers = headers or {}
+        self.text = text
+        self._payload = payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            # A plain RuntimeError, NOT httpx.HTTPStatusError: the shared
+            # `install_fake_httpx` stub exposes only `post` and `pytest.fail`s
+            # on any other attribute, so neither the code under test nor this
+            # test may name an httpx exception type (task 3376's constraint).
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("response has no JSON body")
+        return self._payload
+
+
+def _stateful_mcp_post(recorded, *, session_id="sid-abc", tool_result=None):
+    """Build a fake `httpx.post` behaving like the STATEFUL escalation server.
+
+    `tools/call` without a valid `mcp-session-id` request header -> 400
+    "Missing session ID"; `initialize` -> 200 carrying the server-ASSIGNED id
+    as a response header; `notifications/initialized` -> 202 with no body;
+    `tools/call` WITH the assigned header -> 200 + a normal JSON-RPC envelope.
+    Every request is appended to *recorded* as `(url, kwargs)`.
+    """
+    tool_result = {"id": "esc-42"} if tool_result is None else tool_result
+
+    def _post(url, **kwargs):
+        recorded.append((url, kwargs))
+        envelope = kwargs.get("json") or {}
+        method = envelope.get("method")
+        if method == "initialize":
+            return _FakeMcpResponse(
+                status_code=200,
+                headers={"mcp-session-id": session_id,
+                         "content-type": "application/json"},
+                payload={"jsonrpc": "2.0", "id": envelope.get("id"), "result": {}},
+            )
+        if method == "notifications/initialized":
+            return _FakeMcpResponse(status_code=202, headers={}, text="")
+        if (kwargs.get("headers") or {}).get("mcp-session-id") != session_id:
+            return _FakeMcpResponse(
+                status_code=400,
+                headers={"content-type": "application/json",
+                         "mcp-session-id": _UNUSABLE_SESSION_FROM_400},
+                payload=_SESSION_REQUIRED_400_BODY,
+                # The real 400 carries this body as TEXT too; the transport
+                # keeps it so a 400 that was NOT about a missing session can
+                # still be diagnosed from the resulting error message.
+                text=json.dumps(_SESSION_REQUIRED_400_BODY),
+            )
+        return _FakeMcpResponse(
+            status_code=200,
+            headers={"content-type": "application/json"},
+            payload={"jsonrpc": "2.0", "id": envelope.get("id"),
+                     "result": {"structuredContent": tool_result}},
+        )
+
+    return _post
+
+
+def _recording_delete(deleted):
+    """Build a fake `httpx.delete` recording each MCP session-termination call.
+
+    `post_mcp_envelope` DELETEs the endpoint after a handshake so the server
+    does not leak one session (a `_server_instances` entry + a live per-session
+    anyio task) per legibility escalation. The stub is OPT-IN, so every test
+    that reaches a handshake must supply one -- which is the point: a test that
+    forgets lands in `install_fake_httpx`'s loud-miss `pytest.fail` rather than
+    silently exercising a different path.
+    """
+    def _delete(url, **kwargs):
+        deleted.append((url, kwargs))
+        return _FakeMcpResponse(status_code=200, headers={}, text="")
+
+    return _delete
+
+
+def _methods(recorded):
+    """The ordered list of JSON-RPC `method`s actually put on the wire."""
+    return [(kwargs.get("json") or {}).get("method") for _url, kwargs in recorded]
+
+
+def test_post_mcp_tool_call_handshakes_when_the_server_demands_a_session(
+    install_fake_httpx
+):
+    """A stateful server's 400 must trigger initialize -> notifications/
+    initialized -> retry, with the SERVER-assigned session id."""
+    recorded = []
+    deleted = []
+    install_fake_httpx(_stateful_mcp_post(recorded), delete=_recording_delete(deleted))
+
+    result = ct.post_mcp_tool_call(
+        "http://localhost:8103/mcp",
+        "escalate_info",
+        {"task_id": "legibility-census-dark_factory", "summary": "s"},
+    )
+
+    # The unwrapped TOOL result, not the JSON-RPC envelope.
+    assert result == {"id": "esc-42"}
+
+    assert _methods(recorded) == [
+        "tools/call",            # session-less first attempt -> 400
+        "initialize",            # handshake
+        "notifications/initialized",
+        "tools/call",            # retried with the session header
+    ]
+
+    headers = [kwargs.get("headers") or {} for _url, kwargs in recorded]
+
+    # `initialize` MUST be session-less. A client that invents (or scrapes)
+    # its own id here gets 404 "Session not found" from a stateful server --
+    # the trap documented in fused-memory/scripts/cgl_eta_scheduler_gate.py's
+    # McpClient (task 2491).
+    assert "mcp-session-id" not in headers[1]
+
+    # ...and the id used afterwards is the one `initialize` assigned, never
+    # the unusable one the 400 response carried.
+    assert headers[2].get("mcp-session-id") == "sid-abc"
+    assert headers[3].get("mcp-session-id") == "sid-abc"
+
+    # The task-2953 Accept/Content-Type contract still rides on EVERY request,
+    # handshake requests included -- a 406 there would be just as fatal.
+    for sent in headers:
+        assert sent.get("Accept") == ct.MCP_STREAMABLE_HTTP_HEADERS["Accept"]
+        assert sent.get("Content-Type") == ct.MCP_STREAMABLE_HTTP_HEADERS["Content-Type"]
+
+    # The retry re-sends the ORIGINAL call, not a rebuilt/mangled one.
+    retried = (recorded[3][1].get("json") or {})["params"]
+    assert retried["name"] == "escalate_info"
+    assert retried["arguments"]["task_id"] == "legibility-census-dark_factory"
+
+    # ...and the session we opened is RELEASED. Without the DELETE the
+    # long-lived escalation server accumulates one `_server_instances` entry
+    # plus one live per-session anyio task per escalation, for ever.
+    assert len(deleted) == 1, f"expected exactly one session DELETE, got {deleted}"
+    delete_url, delete_kwargs = deleted[0]
+    assert delete_url == "http://localhost:8103/mcp"
+    assert (delete_kwargs.get("headers") or {}).get("mcp-session-id") == "sid-abc"
+
+
+def test_post_mcp_tool_call_makes_exactly_one_post_against_a_stateless_server(
+    install_fake_httpx
+):
+    """Regression guard for the fused-memory submit_task path.
+
+    :8002 is STATELESS -- a bare `tools/call` POST returns 200 with
+    `content-type: application/json` and no session id -- and
+    `census.default_submit_fn` files every curator task through it today. The
+    handshake must therefore be ADAPTIVE: no 400, no extra round trips, so
+    this fix cannot regress task filing.
+    """
+    recorded = []
+
+    def _post(url, **kwargs):
+        recorded.append((url, kwargs))
+        return _FakeMcpResponse(
+            status_code=200,
+            headers={"content-type": "application/json"},
+            payload={"jsonrpc": "2.0", "id": 1,
+                     "result": {"structuredContent": {"task_id": "3644"}}},
+        )
+
+    install_fake_httpx(_post)
+
+    result = ct.post_mcp_tool_call(
+        "http://localhost:8002/mcp", "submit_task", {"title": "t"},
+    )
+
+    assert result == {"task_id": "3644"}
+    assert _methods(recorded) == ["tools/call"]
+    assert "mcp-session-id" not in (recorded[0][1].get("headers") or {})
+
+
+def test_post_mcp_tool_call_does_not_retry_a_non_400_failure(install_fake_httpx):
+    """A real server failure must propagate, never be masked by a handshake.
+
+    Only 400 means "missing session ID". Retrying a 500 would double-send a
+    side-effecting tools/call and bury the actual fault under handshake noise.
+    """
+    recorded = []
+
+    def _post(url, **kwargs):
+        recorded.append((url, kwargs))
+        return _FakeMcpResponse(
+            status_code=500,
+            headers={"content-type": "application/json"},
+            payload={"error": "boom"},
+        )
+
+    install_fake_httpx(_post)
+
+    with pytest.raises(RuntimeError, match="HTTP 500"):
+        ct.post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {})
+
+    assert _methods(recorded) == ["tools/call"]
+
+
+# ---------------------------------------------------------------------------
+# task 3644: post_mcp_tool_call — SSE body decoding
+# ---------------------------------------------------------------------------
+#
+# The second half of the same defect. Once a session EXISTS, the stateful
+# escalation server answers `tools/call` with an SSE-framed body, not JSON
+# (captured verbatim from the live probe against :8103 on 2026-08-05):
+#
+#     HTTP/1.1 200 OK
+#     content-type: text/event-stream
+#
+#     event: message
+#     data: {"jsonrpc":"2.0","id":1,"result":{...}}
+#
+# `response.json()` raises a JSONDecodeError on that body, so even a perfectly
+# handshaken client still drops the escalation. The fakes below make `json()`
+# raise exactly as httpx would, so a test cannot pass by accidentally taking
+# the JSON path on an SSE response.
+
+
+class _FakeSseResponse(_FakeMcpResponse):
+    """A 200 `text/event-stream` response whose `json()` raises, exactly as
+    `httpx.Response.json()` does on an SSE body."""
+
+    def __init__(self, text, *, status_code=200):
+        super().__init__(
+            status_code=status_code,
+            headers={"content-type": "text/event-stream"},
+            text=text,
+        )
+
+    def json(self):
+        raise json.JSONDecodeError("Expecting value", self.text or "", 0)
+
+
+def _sse_body(payload) -> str:
+    """Frame *payload* the way the escalation server frames a tools/call
+    reply: an `event:` line, a `data:` line, and a blank terminator."""
+    return f"event: message\ndata: {json.dumps(payload)}\n\n"
+
+
+def test_post_mcp_tool_call_decodes_an_sse_tools_call_response(install_fake_httpx):
+    """The post-handshake retry's SSE body must be parsed off its `data:`
+    line -- the JSON path is never taken for an SSE response."""
+    recorded = []
+    deleted = []
+    stateful = _stateful_mcp_post(recorded)
+
+    def _post(url, **kwargs):
+        response = stateful(url, **kwargs)
+        envelope = kwargs.get("json") or {}
+        if envelope.get("method") == "tools/call" and response.status_code == 200:
+            return _FakeSseResponse(_sse_body(
+                {"jsonrpc": "2.0", "id": 1,
+                 "result": {"structuredContent": {"id": "esc-77", "level": 0}}},
+            ))
+        return response
+
+    install_fake_httpx(_post, delete=_recording_delete(deleted))
+
+    result = ct.post_mcp_tool_call(
+        "http://localhost:8103/mcp", "escalate_info", {"summary": "s"},
+    )
+
+    assert result == {"id": "esc-77", "level": 0}
+    assert _methods(recorded)[-1] == "tools/call"
+    assert len(deleted) == 1
+
+
+def test_post_mcp_tool_call_decodes_an_sse_response_without_a_handshake(
+    install_fake_httpx
+):
+    """SSE framing is a property of the RESPONSE, not of the handshake: a
+    server that answers the first (session-less) POST with an SSE body must
+    decode identically, with no extra round trips."""
+    recorded = []
+
+    def _post(url, **kwargs):
+        recorded.append((url, kwargs))
+        return _FakeSseResponse(_sse_body(
+            {"jsonrpc": "2.0", "id": 1, "result": {"structuredContent": {"ok": True}}},
+        ))
+
+    install_fake_httpx(_post)
+
+    assert ct.post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {}) == {
+        "ok": True
+    }
+    assert _methods(recorded) == ["tools/call"]
+
+
+def test_post_mcp_tool_call_still_decodes_a_plain_json_response(install_fake_httpx):
+    """Regression guard: the stateless fused-memory shape
+    (`content-type: application/json`) must keep decoding via `json()`
+    unchanged -- SSE support is additive, not a replacement."""
+    recorded = []
+
+    def _post(url, **kwargs):
+        recorded.append((url, kwargs))
+        return _FakeMcpResponse(
+            status_code=200,
+            headers={"content-type": "application/json"},
+            payload={"jsonrpc": "2.0", "id": 1,
+                     "result": {"structuredContent": {"task_id": "3644"}}},
+        )
+
+    install_fake_httpx(_post)
+
+    assert ct.post_mcp_tool_call("http://localhost:8002/mcp", "submit_task", {}) == {
+        "task_id": "3644"
+    }
+    assert _methods(recorded) == ["tools/call"]
+
+
+def test_post_mcp_tool_call_fails_loud_on_an_sse_body_with_no_data_line(
+    install_fake_httpx
+):
+    """A malformed stream must raise a bounded, diagnosable error rather than
+    degrade to `{}` -- a silently-empty result is exactly the green-on-paper
+    failure this task exists to close."""
+    def _post(url, **kwargs):
+        return _FakeSseResponse("event: message\n: keep-alive comment\n\n")
+
+    install_fake_httpx(_post)
+
+    with pytest.raises(Exception, match="no SSE data line") as excinfo:
+        ct.post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {})
+
+    # The offending body is reported at all...
+    assert "keep-alive" in str(excinfo.value)
+
+
+def test_post_mcp_tool_call_bounds_the_reported_sse_body(install_fake_httpx):
+    """...and reported BOUNDED. Separated from the test above deliberately:
+    "the marker text appears" passes identically for an unbounded
+    `repr(response.text)`, so on its own it asserts nothing about boundedness
+    and a refactor swapping `_bounded_repr` for a raw f-string would stay
+    green while re-introducing the multi-kilobyte-log-line problem this module
+    documents at `_MAX_REPR_CHARS`.
+
+    Every one of these messages is re-emitted verbatim into the nightly
+    systemd journal by `compute_tasks_landed` / `run_census`, one line each.
+    """
+    oversized = "event: message\n: " + ("x" * 5000) + "\n\n"
+
+    def _post(url, **kwargs):
+        return _FakeSseResponse(oversized)
+
+    install_fake_httpx(_post)
+
+    with pytest.raises(Exception, match="no SSE data line") as excinfo:
+        ct.post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {})
+
+    message = str(excinfo.value)
+    assert "repr truncated" in message
+    # Bounded to roughly `_MAX_REPR_CHARS` plus the surrounding prose -- the
+    # 5000-char body must NOT be in there. A generous ceiling: the assertion
+    # under test is "orders of magnitude smaller than the body", not an exact
+    # length.
+    assert len(message) < ct._MAX_REPR_CHARS + 300, (
+        f"error message is {len(message)} chars for a {len(oversized)}-char "
+        f"body -- the bounded repr is not being applied"
+    )
+
+
+def test_post_mcp_envelope_tolerates_an_empty_202_body(install_fake_httpx):
+    """`notifications/initialized` answers 202 with no body at all; decoding
+    must yield `{}` rather than raising on the absent JSON."""
+    def _post(url, **kwargs):
+        return _FakeMcpResponse(status_code=202, headers={}, text="")
+
+    install_fake_httpx(_post)
+
+    assert ct.post_mcp_envelope(
+        "http://localhost:8103/mcp",
+        {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
+    ) == {}
+
+
+def test_post_mcp_tool_call_skips_sse_notification_frames(install_fake_httpx):
+    """A notification frame ahead of the response must be SKIPPED, not
+    mistaken for it.
+
+    FastMCP streams progress/log notifications over the same `tools/call` SSE
+    stream whenever a tool takes a `Context`. Returning the first `data:` line
+    would hand `_extract_tool_result` a notification and raise "malformed MCP
+    response (no result)" on a call that SUCCEEDED server-side -- a transport
+    bug in appearance, re-opening exactly this investigation.
+    """
+    body = (
+        'event: message\n'
+        'data: {"jsonrpc":"2.0","method":"notifications/progress",'
+        '"params":{"progress":1}}\n'
+        '\n'
+        'event: message\n'
+        'data: {"jsonrpc":"2.0","id":1,'
+        '"result":{"structuredContent":{"id":"esc-99"}}}\n'
+        '\n'
+    )
+
+    def _post(url, **kwargs):
+        return _FakeSseResponse(body)
+
+    install_fake_httpx(_post)
+
+    assert ct.post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {}) == {
+        "id": "esc-99"
+    }
+
+
+def test_post_mcp_tool_call_joins_multiline_sse_data_fields(install_fake_httpx):
+    """Per the SSE spec a single event's `data` field may span several `data:`
+    lines, which must be newline-JOINED before parsing. Parsing only the first
+    would feed `json.loads` a fragment and raise on a well-formed response."""
+    body = (
+        'event: message\n'
+        'data: {"jsonrpc":"2.0","id":1,\n'
+        'data:  "result":{"structuredContent":{"id":"esc-split"}}}\n'
+        '\n'
+    )
+
+    def _post(url, **kwargs):
+        return _FakeSseResponse(body)
+
+    install_fake_httpx(_post)
+
+    assert ct.post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {}) == {
+        "id": "esc-split"
+    }
+
+
+def test_post_mcp_tool_call_fails_loud_on_a_notification_only_sse_stream(
+    install_fake_httpx
+):
+    """Data frames that carry no JSON-RPC result/error at all are a real
+    fault, not an empty success."""
+    body = (
+        'event: message\n'
+        'data: {"jsonrpc":"2.0","method":"notifications/progress"}\n'
+        '\n'
+    )
+
+    def _post(url, **kwargs):
+        return _FakeSseResponse(body)
+
+    install_fake_httpx(_post)
+
+    with pytest.raises(Exception, match="no MCP result/error frame"):
+        ct.post_mcp_tool_call("http://localhost:8103/mcp", "escalate_info", {})
+
+
+# ---------------------------------------------------------------------------
+# task 3644 (amendment pass): a 200 carrying a TOOL-LEVEL failure is not a
+# success
+# ---------------------------------------------------------------------------
+#
+# `nightly.post_escalation` and `check_transcript_persistence.post_findings`
+# discard the decoded body and report True on "no exception raised", so an
+# `isError: true` (or a JSON-RPC `error`) envelope read as a landed escalation
+# -- the same green-on-paper/nothing-filed failure this task exists to close,
+# one layer up from the transport.
+
+
+# A realistic `tools/call` envelope for the transport-level tests below, so
+# `_methods()` sees the method actually being retried rather than a bare stub.
+_ESCALATE_ENVELOPE = {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": {"name": "escalate_info", "arguments": {"summary": "s"}},
+}
+
+def test_post_mcp_envelope_raises_on_a_tool_error_envelope(install_fake_httpx):
+    """`result.isError: true` -- FastMCP's shape for a raised ToolError."""
+    def _post(url, **kwargs):
+        return _FakeMcpResponse(
+            status_code=200,
+            headers={"content-type": "application/json"},
+            payload={"jsonrpc": "2.0", "id": 1, "result": {
+                "isError": True,
+                "content": [{"type": "text", "text": "unknown category 'nope'"}],
+            }},
+        )
+
+    install_fake_httpx(_post)
+
+    with pytest.raises(ct.StatusFetchUnavailable, match="MCP tool reported an error"):
+        ct.post_mcp_envelope("http://localhost:8103/mcp", _ESCALATE_ENVELOPE)
+
+
+def test_post_mcp_envelope_raises_on_a_jsonrpc_error_envelope(install_fake_httpx):
+    """A JSON-RPC-level `error` (the request never reached a tool) on a 200."""
+    def _post(url, **kwargs):
+        return _FakeMcpResponse(
+            status_code=200,
+            headers={"content-type": "application/json"},
+            payload={"jsonrpc": "2.0", "id": 1,
+                     "error": {"code": -32602, "message": "Unknown tool"}},
+        )
+
+    install_fake_httpx(_post)
+
+    with pytest.raises(ct.StatusFetchUnavailable, match="JSON-RPC error"):
+        ct.post_mcp_envelope("http://localhost:8103/mcp", _ESCALATE_ENVELOPE)
+
+
+# ---------------------------------------------------------------------------
+# task 3644 (amendment pass): the handshake's own failure paths
+# ---------------------------------------------------------------------------
+#
+# These are the paths an operator actually hits when the server is
+# misconfigured or rejects the protocol version -- and an unexercised error
+# path in this transport is precisely how the original defect survived. Each
+# also pins that the ORIGINAL 400's body is carried into the message, so a 400
+# that was NOT about a missing session is still diagnosable instead of being
+# replaced by a misleading session-protocol complaint.
+
+
+def test_post_mcp_envelope_raises_when_initialize_assigns_no_session_id(
+    install_fake_httpx
+):
+    """A stateless server answering a genuinely-bad request with 400 answers
+    `initialize` with 200 and NO session id. That must name the ORIGINAL 400's
+    reason, not just complain about the session protocol -- and must not go on
+    to send a doomed retry."""
+    recorded = []
+
+    def _post(url, **kwargs):
+        recorded.append((url, kwargs))
+        envelope = kwargs.get("json") or {}
+        if envelope.get("method") == "initialize":
+            return _FakeMcpResponse(
+                status_code=200,
+                headers={"content-type": "application/json"},  # no session id
+                payload={"jsonrpc": "2.0", "id": 1, "result": {}},
+            )
+        return _FakeMcpResponse(
+            status_code=400,
+            headers={"content-type": "application/json"},
+            text='{"error":{"message":"category must be one of ..."}}',
+        )
+
+    install_fake_httpx(_post)
+
+    with pytest.raises(RuntimeError, match="assigned no mcp-session-id") as excinfo:
+        ct.post_mcp_envelope("http://localhost:8002/mcp", _ESCALATE_ENVELOPE)
+
+    # The server's OWN stated reason survives into the message.
+    assert "category must be one of" in str(excinfo.value)
+    # No `notifications/initialized`, no retry: the handshake stopped dead.
+    assert _methods(recorded) == ["tools/call", "initialize"]
+
+
+def test_post_mcp_envelope_raises_when_initialize_itself_fails(install_fake_httpx):
+    """A non-2xx `initialize` (protocol version rejected, server wedged) must
+    surface with its status AND the original 400, and must not retry."""
+    recorded = []
+
+    def _post(url, **kwargs):
+        recorded.append((url, kwargs))
+        envelope = kwargs.get("json") or {}
+        if envelope.get("method") == "initialize":
+            return _FakeMcpResponse(status_code=500, headers={}, text="boom")
+        return _FakeMcpResponse(
+            status_code=400, headers={},
+            text='{"error":{"message":"Missing session ID"}}',
+        )
+
+    install_fake_httpx(_post)
+
+    with pytest.raises(RuntimeError, match="HTTP 500") as excinfo:
+        ct.post_mcp_envelope("http://localhost:8103/mcp", _ESCALATE_ENVELOPE)
+
+    assert "failed at initialize" in str(excinfo.value)
+    assert "Missing session ID" in str(excinfo.value)
+    assert _methods(recorded) == ["tools/call", "initialize"]
+
+
+def test_post_mcp_envelope_raises_when_notifications_initialized_fails(
+    install_fake_httpx
+):
+    """A failing `notifications/initialized` must abort before the retry --
+    and still release the session it already opened."""
+    recorded = []
+    deleted = []
+
+    def _post(url, **kwargs):
+        recorded.append((url, kwargs))
+        envelope = kwargs.get("json") or {}
+        method = envelope.get("method")
+        if method == "initialize":
+            return _FakeMcpResponse(
+                status_code=200,
+                headers={"mcp-session-id": "sid-abc",
+                         "content-type": "application/json"},
+                payload={"jsonrpc": "2.0", "id": 1, "result": {}},
+            )
+        if method == "notifications/initialized":
+            return _FakeMcpResponse(status_code=500, headers={}, text="boom")
+        return _FakeMcpResponse(
+            status_code=400, headers={},
+            text='{"error":{"message":"Missing session ID"}}',
+        )
+
+    install_fake_httpx(_post, delete=_recording_delete(deleted))
+
+    with pytest.raises(RuntimeError, match="HTTP 500") as excinfo:
+        ct.post_mcp_envelope("http://localhost:8103/mcp", _ESCALATE_ENVELOPE)
+
+    assert "failed at notifications/initialized" in str(excinfo.value)
+    assert _methods(recorded) == [
+        "tools/call", "initialize", "notifications/initialized",
+    ]
+    # The session existed by then, so it is released on the failure path too.
+    assert [(kw.get("headers") or {}).get("mcp-session-id") for _u, kw in deleted] == [
+        "sid-abc"
+    ]
+
+
+def test_post_mcp_envelope_raises_when_the_retry_still_fails(install_fake_httpx):
+    """A 400 that was never about the session: the retry fails the same way,
+    and the message must say so rather than blame the handshake."""
+    recorded = []
+    deleted = []
+
+    def _post(url, **kwargs):
+        recorded.append((url, kwargs))
+        envelope = kwargs.get("json") or {}
+        if envelope.get("method") == "initialize":
+            return _FakeMcpResponse(
+                status_code=200,
+                headers={"mcp-session-id": "sid-abc",
+                         "content-type": "application/json"},
+                payload={"jsonrpc": "2.0", "id": 1, "result": {}},
+            )
+        if envelope.get("method") == "notifications/initialized":
+            return _FakeMcpResponse(status_code=202, headers={}, text="")
+        return _FakeMcpResponse(
+            status_code=400, headers={},
+            text='{"error":{"message":"task_id must be a non-empty string"}}',
+        )
+
+    install_fake_httpx(_post, delete=_recording_delete(deleted))
+
+    with pytest.raises(RuntimeError, match="still rejected the envelope") as excinfo:
+        ct.post_mcp_envelope("http://localhost:8103/mcp", _ESCALATE_ENVELOPE)
+
+    assert "task_id must be a non-empty string" in str(excinfo.value)
+    # Exactly ONE retry -- never a loop.
+    assert _methods(recorded).count("tools/call") == 2
+    assert len(deleted) == 1
+
+
+def test_post_mcp_envelope_never_lets_a_failing_session_delete_propagate(
+    install_fake_httpx
+):
+    """Session tidy-up is best-effort by design: the envelope has ALREADY been
+    delivered by the time the DELETE runs, so a failure to release the session
+    must never turn a landed escalation into a reported failure."""
+    recorded = []
+
+    def _exploding_delete(url, **kwargs):
+        raise OSError("[Errno 111] Connection refused")
+
+    install_fake_httpx(_stateful_mcp_post(recorded), delete=_exploding_delete)
+
+    assert ct.post_mcp_tool_call(
+        "http://localhost:8103/mcp", "escalate_info", {"summary": "s"},
+    ) == {"id": "esc-42"}

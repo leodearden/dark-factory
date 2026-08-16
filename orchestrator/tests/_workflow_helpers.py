@@ -25,6 +25,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _orch_helpers import pydantic_spec, wire_scheduler_liveness_mock
 from escalation.queue import EscalationQueue
+from shared.locking import normalize_lock
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.artifacts import TaskArtifacts
@@ -38,6 +39,7 @@ from orchestrator.mcp.verdict_tools import (
 from orchestrator.mcp.verdict_tools import (
     _submit_review_verdict,
 )
+from orchestrator.module_charter import sanitize_files_for_persist
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import TaskWorkflow
@@ -187,6 +189,202 @@ class FakeScheduler:
 
     def clear_merge_phase(self, tid: str) -> None:
         pass
+
+
+def _merge_values_additive(old: object, new: object) -> object:
+    """Port of fused-memory's ``_merge_values`` (sqlite_task_backend.py:3264).
+
+    Kept byte-for-byte faithful to the production rules so the fake's
+    ``'additive'`` mode cannot pin behaviour production does not have:
+
+    * both lists — concatenate then dedupe hashable items in stable
+      old-then-new order; fall back to plain concatenation if any item is
+      unhashable;
+    * both dicts — recurse over the union of keys, pass through keys present on
+      only one side;
+    * anything else (scalar collision, type mismatch) — **OLD wins**.
+    """
+    if isinstance(old, list) and isinstance(new, list):
+        combined = old + new
+        try:
+            seen: set = set()
+            deduped: list = []
+            for item in combined:
+                if item not in seen:
+                    seen.add(item)
+                    deduped.append(item)
+            return deduped
+        except TypeError:
+            return combined
+    if isinstance(old, dict) and isinstance(new, dict):
+        merged: dict = {}
+        for key in old.keys() | new.keys():
+            if key in old and key in new:
+                merged[key] = _merge_values_additive(old[key], new[key])
+            elif key in old:
+                merged[key] = old[key]
+            else:
+                merged[key] = new[key]
+        return merged
+    return old
+
+
+class FakeMetadataBackend:
+    """Merge-faithful ``metadata`` backend for workflow tests (task 3579).
+
+    Unlike ``FakeScheduler`` — whose ``update_task`` records call arguments and
+    persists nothing — this fake keeps a real ``blob`` and models BOTH:
+
+    - fused-memory's #1827 ``metadata_mode`` contract, with the same precedence
+      ``Scheduler.update_task`` resolves (scheduler.py:3793-3799):
+      ``metadata_mode`` > ``append=True`` -> ``'additive'`` > ``'merge'``, and
+      the same per-mode semantics ``_merge_metadata`` implements
+      (sqlite_task_backend.py:3301) — ``'merge'`` shallow last-write-wins
+      (supplied keys overwrite wholesale, omitted keys preserved),
+      ``'replace'`` whole-blob overwrite, ``'additive'`` recursive list
+      union+dedup / dict-recursive / scalar OLD-wins (see
+      ``_merge_values_additive`` above).  An unrecognised mode raises rather
+      than silently degrading to ``'merge'`` — the backend validates against
+      ``_METADATA_MODES`` too.
+    - the scheduler-side ``metadata.files`` persist that
+      ``handle_blast_radius_expansion(persist_files=...)`` performs via
+      ``Scheduler._persist_files_metadata`` (scheduler.py:6890),
+      ``merged = {**fresh_md, 'files': sanitize_files_for_persist(files)}`` —
+      on BOTH the successful-refinement branch (scheduler.py:6974) and the
+      lock-conflict/requeue branch (scheduler.py:7023, task 2868).  The only
+      non-persist path is the no-op early return when the depth-normalised
+      module set is unchanged, modelled here too.
+
+    NOT modelled: the corrupt-existing-blob guard (``'merge'``/``'additive'``
+    raise ``TaskmasterError`` rather than clobber a non-dict blob), the legacy
+    ``memory_hints`` shape normalisation, and the lock-table/``set_task_status``
+    side-effects of the requeue branch — no workflow test drives any of them,
+    and the blob here is always a dict.
+
+    It exists so tests can assert on BACKEND STATE rather than merely on call
+    arguments — a whole-blob write that reverts a freshly-persisted
+    ``metadata.files`` is invisible to a call-argument assertion but obvious in
+    ``self.blob``.
+
+    ``update_task`` accepts *metadata* both positionally and as the ``metadata=``
+    keyword on purpose: workflow stamps call it either way, and a signature
+    mismatch would raise ``TypeError`` inside a caller's blanket
+    ``except Exception``, silently leaving the blob untouched.
+
+    Opt-in: wire it into a test's existing ``MagicMock()`` scheduler with
+    ``wire_metadata_backend`` below.  ``FakeScheduler`` is deliberately NOT
+    changed — it has ~20 importers and ``test_workflow_dry_run_hook.py`` pins
+    that passing ``metadata_mode`` to it raises ``TypeError``.
+    """
+
+    def __init__(self, initial: dict | None = None, *, lock_depth: int = 2):
+        self.blob: dict = dict(initial or {})
+        self.update_task_calls: list[dict] = []
+        self.blast_radius_calls: list[tuple[list[str], list[str], list[str] | None]] = []
+        self.blast_radius_result: bool = True
+        # Matches the fixtures' config.lock_depth; only used to model
+        # handle_blast_radius_expansion's no-op early return.
+        self.lock_depth = lock_depth
+
+    async def update_task(
+        self,
+        task_id: str,
+        metadata: str | dict | None = None,
+        *,
+        append: bool = False,
+        metadata_mode: str | None = None,
+    ) -> bool:
+        self.update_task_calls.append({
+            'task_id': task_id,
+            'metadata': metadata,
+            'append': append,
+            'metadata_mode': metadata_mode,
+        })
+        payload = json.loads(metadata) if isinstance(metadata, str) else (metadata or {})
+        # Mirror Scheduler.update_task's precedence exactly.
+        if metadata_mode is not None:
+            effective = metadata_mode
+        elif append:
+            effective = 'additive'
+        else:
+            effective = 'merge'
+
+        if effective == 'merge':
+            self.blob = {**self.blob, **payload}
+        elif effective == 'replace':
+            self.blob = dict(payload)
+        elif effective == 'additive':
+            merged = _merge_values_additive(self.blob, payload)
+            assert isinstance(merged, dict)
+            self.blob = merged
+        else:
+            raise ValueError(f'unsupported metadata_mode: {effective!r}')
+        return True
+
+    async def handle_blast_radius_expansion(
+        self,
+        task_id: str,
+        current: list[str],
+        needed: list[str],
+        /,
+        *,
+        persist_files: list[str] | None = None,
+    ) -> bool:
+        self.blast_radius_calls.append((current, needed, persist_files))
+        depth = self.lock_depth
+        if {normalize_lock(m, depth) for m in current} == {
+            normalize_lock(m, depth) for m in needed
+        }:
+            # No-op early return (scheduler.py:6935): nothing acquired, nothing
+            # released, nothing persisted.
+            return True
+        # Production persists metadata.files on BOTH the grant and the
+        # lock-conflict/requeue branch — only the RETURN differs.  Gating the
+        # persist on blast_radius_result would model the deny path wrongly.
+        if persist_files is not None:
+            self.blob = {
+                **self.blob,
+                'files': sanitize_files_for_persist(persist_files),
+            }
+        return self.blast_radius_result
+
+    async def get_task(self, task_id: str) -> dict:
+        return {'id': task_id, 'metadata': dict(self.blob)}
+
+
+def wire_metadata_backend(
+    scheduler: MagicMock,
+    backend: FakeMetadataBackend,
+    *,
+    seed: dict,
+    grants: bool,
+) -> tuple[AsyncMock, AsyncMock]:
+    """Route a ``MagicMock`` scheduler's metadata methods through *backend*.
+
+    Keeps the MagicMock (so every other auto-mocked attribute such as
+    ``set_task_status`` still works) but rebinds ``update_task`` /
+    ``handle_blast_radius_expansion`` / ``get_task`` to *backend*, wrapped in
+    ``AsyncMock`` side-effects so call-argument assertions keep working
+    alongside blob assertions.
+
+    *seed* is the dispatch-time ``task['metadata']`` the workflow starts with in
+    memory; the backend's blob is seeded from it (any value already on the blob
+    wins) so backend and in-memory start consistent, as production does at
+    dispatch time.  *grants* sets ``blast_radius_result``.
+
+    Returns ``(handle_blast_radius_expansion, update_task)`` so a fixture can
+    expose the same AsyncMocks it exposes in the un-wired case.
+    """
+    backend.blob = {**dict(seed), **backend.blob}
+    backend.blast_radius_result = grants
+    handle_blast_radius_expansion = AsyncMock(
+        side_effect=backend.handle_blast_radius_expansion,
+    )
+    update_task = AsyncMock(side_effect=backend.update_task)
+    scheduler.handle_blast_radius_expansion = handle_blast_radius_expansion
+    scheduler.update_task = update_task
+    scheduler.get_task = AsyncMock(side_effect=backend.get_task)
+    return handle_blast_radius_expansion, update_task
 
 
 class FakeBriefing:
@@ -960,6 +1158,80 @@ def _build_workflow_with_escalation(
         merge_worker=worker,
     )
     return workflow, scheduler, queue
+
+
+# ---------------------------------------------------------------------------
+# Lock-module path construction (shared: the same premise is asserted by
+# test_workflow_status_on_resume.py and test_workflow_metadata_files_reconcile.py)
+# ---------------------------------------------------------------------------
+
+
+def same_module_siblings(lock_depth: int) -> tuple[str, str]:
+    """Two DISTINCT file paths guaranteed to share a module at *lock_depth*.
+
+    ``shared.locking.normalize_lock`` truncates a path to its first ``depth``
+    components, so two files share a lock module iff those components agree.
+    A fixed literal like ``a/b/c/d/{e,f}.py`` satisfies that only while
+    ``lock_depth <= 4``: at a deeper setting the two paths normalize to
+    themselves and become DIFFERENT modules, making the "same-module widen"
+    premise unsatisfiable.
+
+    That is not hypothetical — it is why these tests went red on main when
+    ``dark-factory-orchestrator.yaml`` moved ``lock_depth`` 4 -> 12 (commit
+    094d634465, deliberately making module locks file-granular). The autouse
+    ``_isolate_orch_config`` fixture in conftest.py pins ``ORCH_CONFIG_PATH``
+    at the LIVE operational config, so ``config.lock_depth`` here is the real
+    deployed value by design, not a code default.
+
+    Deriving the package prefix FROM ``lock_depth`` keeps the premise true BY
+    CONSTRUCTION at any depth, so these stay tests of same-module widen
+    behaviour instead of silently becoming tests of the knob's current value.
+
+    The same-module/different-file state itself stays LIVE at every depth, so
+    this constructor is not life support for a dead branch (task 3866 answered
+    that question explicitly): the code under test is depth-GENERIC — it reads
+    ``config.lock_depth`` and ships in the orchestrator package, whose bundled
+    ``defaults.yaml`` still declares 4 over a pydantic Field default of 2, and
+    ``lock_depth: 12`` is one project's operational override — while even at 12
+    any path deeper than ``lock_depth`` still collapses onto its truncated
+    prefix.
+
+    Raises ``ValueError`` below ``lock_depth == 1``, the one input where the
+    by-construction guarantee breaks SILENTLY rather than loudly.  MEASURED,
+    not assumed: at depth 0 the package prefix is empty, so the pair is
+    ``/e.py`` / ``/f.py``; ``normalize_lock`` truncates to ``parts[:0]`` and
+    both normalize to ``''``, which ``files_to_modules`` then DROPS — the
+    module list is ``[]``, not two modules.  That is worse than an outright
+    wrong answer, because the usual precondition
+    ``files_to_modules([f1]) == files_to_modules([f1, f2])`` degenerates to
+    ``[] == []`` and PASSES VACUOUSLY while the workflow under test holds no
+    module lock at all.  ``OrchestratorConfig.lock_depth`` carries no ``ge=1``
+    constraint, so a caller forwarding ``config.lock_depth`` really can reach
+    this; failing loudly beats handing back a pair whose preconditions are
+    satisfied by emptiness.
+
+    CONTRACT TEST — ``TestSameModuleSiblings`` in
+    ``test_workflow_status_on_resume.py`` pins every guarantee above across
+    depths [1, 2, 3, 4, 12, 20] plus the sub-1 boundary.  It lives in a
+    CONSUMER suite rather than next door in ``test_workflow_helpers.py``
+    (where the rest of this module's coverage sits) for a scope reason, not a
+    design one: task 3866 held no lock on that file.  Relocating it is filed
+    as follow-up work.  Until that lands, this pointer is the only thing that
+    keeps the guard discoverable from the helper it guards — so if you move
+    the test, update this paragraph, and if you change the contract, that
+    class is what will tell you.
+    """
+    if lock_depth < 1:
+        raise ValueError(
+            f'same_module_siblings requires lock_depth >= 1; got {lock_depth}. '
+            'At depth < 1 the shared package prefix is empty, so both paths '
+            "normalize to '' and files_to_modules DROPS them entirely — the "
+            'module list is [], not two modules. The callers\' same-module '
+            'precondition would then pass VACUOUSLY on two empty sets while '
+            'the workflow under test holds no module lock at all.'
+        )
+    package = '/'.join(f'p{i}' for i in range(lock_depth))
+    return f'{package}/e.py', f'{package}/f.py'
 
 
 # ---------------------------------------------------------------------------

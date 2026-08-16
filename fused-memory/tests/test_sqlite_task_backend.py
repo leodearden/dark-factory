@@ -6,9 +6,11 @@ import asyncio
 import json
 import logging
 import re
+import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
+import aiosqlite
 import pytest
 import pytest_asyncio
 from pydantic import ValidationError
@@ -20,6 +22,7 @@ from fused_memory.backends.sqlite_task_backend import (
     _emit_schema_warning,
     _format_task_id,
     _merge_metadata,
+    _migrate_v3_to_v4,
     _parse_qualified_dep,
     _parse_task_id,
     _resolve_metadata_mode,
@@ -2960,6 +2963,41 @@ def _make_v3_db_with_dup_groups(
     conn.close()
 
 
+class _FailingExecuteConn:
+    """Delegating proxy over an aiosqlite.Connection that raises from
+    `execute()` when `should_fail(sql, self)` returns True.
+
+    Used to inject a deterministic mid-migration failure into
+    `_migrate_v3_to_v4` without monkeypatching aiosqlite internals: every
+    other attribute (`commit`, `rollback`, `row_factory`, ...) is forwarded
+    verbatim via `__getattr__`, so the migration exercises the real
+    connection for everything except the one statement under test.
+    """
+
+    def __init__(self, inner, should_fail):
+        self._inner = inner
+        self._should_fail = should_fail
+        self.cancel_updates = 0          # counts `SET status = 'cancelled'` executes
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    async def execute(self, sql, *args, **kwargs):
+        if "SET status = 'cancelled'" in str(sql):
+            self.cancel_updates += 1
+        if self._should_fail(str(sql), self):
+            raise sqlite3.OperationalError('injected failure (test)')
+        return await self._inner.execute(sql, *args, **kwargs)
+
+
+async def _open_raw_v3_conn(db_path: Path) -> aiosqlite.Connection:
+    """Open a bare aiosqlite connection over a v3 DB — the minimal connection
+    shape `_migrate_v3_to_v4` needs (it indexes rows by column name)."""
+    conn = await aiosqlite.connect(str(db_path))
+    conn.row_factory = aiosqlite.Row
+    return conn
+
+
 @pytest.mark.asyncio
 async def test_v3_to_v4_migration_clean_audit_builds_partial_unique_index(
     backend, project_root,
@@ -3446,6 +3484,307 @@ async def test_v3_to_v4_mixed_db_heals_genuine_while_flagging_ambiguous(tmp_path
             'task_ids': ['3', '4'], 'count': 2, 'reason': 'mixed_status',
         },
     ], residual_groups
+
+
+@pytest.mark.asyncio
+async def test_v3_to_v4_midloop_heal_failure_leaves_no_partial_heal_on_cached_connection(
+    tmp_path,
+):
+    """A heal-loop failure partway through a group (id=3's metadata blob is
+    corrupt, so `_merge_metadata` raises `TaskmasterError` while cancelling
+    it) must not leave id=2's already-executed cancel UPDATE sitting
+    uncommitted on the cached write connection. Without a rollback on the
+    failure path, the very next unrelated successful write -- `_txn` commits
+    with no BEGIN/rollback preamble -- silently flushes that partial heal to
+    disk. This reproduces the reported bug end-to-end through the real
+    backend rather than by calling `_migrate_v3_to_v4` directly.
+    """
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v3_db_with_dup_groups(db_path, [
+        (1, 'Dup task', 'pending', []),   # canonical (lowest id)
+        (2, 'Dup task', 'pending', []),   # cancel target #1 -- metadata None, UPDATE succeeds
+        (3, 'Dup task', 'pending', []),   # cancel target #2 -- corrupted below, raises
+    ])
+    # Corrupt id=3's blob directly rather than widening the shared seeding
+    # helper. Files must stay empty on every row (see module docstring on
+    # _make_v3_db_with_dup_groups / plan rationale): _files_for_key falls
+    # back to [] on a malformed blob, so the corrupt row only recomputes to
+    # the group's stored candidate_key -- and stays classified `heal` rather
+    # than `title_divergent` -- when that key was itself computed from an
+    # empty files list.
+    corrupt_conn = sqlite3.connect(str(db_path))
+    corrupt_conn.execute("UPDATE tasks SET metadata = '{not json' WHERE tag='master' AND id=3")
+    corrupt_conn.commit()
+    corrupt_conn.close()
+
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    b = SqliteTaskBackend(cfg)
+    await b.start()
+    try:
+        # Drives connection-open (_migrate); must NOT raise (never-raise
+        # contract) even though the heal loop below raises mid-group.
+        await b.get_tasks(project_root=project_root)
+
+        # The very next unrelated successful write -- exactly the "later
+        # flushed" scenario from the bug report. A title distinct from
+        # 'Dup task' so the write-path dedup guard doesn't reject it.
+        add_result = await b.add_task(project_root=project_root, title='unrelated follow-up')
+
+        # Read through an INDEPENDENT connection while the backend is still
+        # open, so only durably committed rows are visible -- uncommitted
+        # writes on the backend's own cached connection are invisible here
+        # by construction.
+        check_conn = sqlite3.connect(str(db_path))
+        try:
+            statuses = dict(
+                check_conn.execute(
+                    "SELECT id, status FROM tasks WHERE tag='master' AND id IN (1,2,3)",
+                ),
+            )
+            unrelated_status = check_conn.execute(
+                "SELECT status FROM tasks WHERE tag='master' AND id=?",
+                (int(add_result['id']),),
+            ).fetchone()
+            user_version = check_conn.execute('PRAGMA user_version').fetchone()[0]
+            indexes = {row[1] for row in check_conn.execute('PRAGMA index_list(tasks)')}
+        finally:
+            check_conn.close()
+    finally:
+        await b.close()
+
+    # RED today: id=2's cancel rides in on the unrelated write's commit, so
+    # this comes back {1: 'pending', 2: 'cancelled', 3: 'pending'}.
+    assert statuses == {1: 'pending', 2: 'pending', 3: 'pending'}, (
+        f'a later unrelated write flushed a partial self-heal onto disk: {statuses}'
+    )
+    # The rollback must scope itself to the failed migration only -- it must
+    # not eat the caller's own unrelated write.
+    assert unrelated_status is not None and unrelated_status[0] == 'pending', unrelated_status
+    # Unchanged pre-existing behaviour on a failed migration pass -- guards
+    # against over-correcting.
+    assert user_version == 3, user_version
+    assert not any('candidate_key' in idx for idx in indexes), indexes
+
+
+@pytest.mark.asyncio
+async def test_v3_to_v4_reports_healed_groups_when_the_index_build_step_raises(tmp_path):
+    """When a LATER step (the index build / user_version stamp) raises after
+    a genuine duplicate group has already been healed and committed, the
+    result dict must report that heal -- not hard-code `healed: []` -- since
+    the cancel is durably on disk and callers (`reaudit_candidate_key_index`,
+    the `rebuild_candidate_key_index` MCP tool) surface this dict verbatim.
+    """
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v3_db_with_dup_groups(db_path, [
+        (1, 'Alpha task', 'pending', ['a.py']),   # canonical
+        (2, 'Alpha task', 'pending', ['a.py']),   # cancelled by the self-heal
+    ])
+
+    conn = await _open_raw_v3_conn(db_path)
+    try:
+        # Fails at 'PRAGMA user_version = 4' -- AFTER the heal loop's cancel
+        # UPDATE(s) and their commit have already happened.
+        proxy = _FailingExecuteConn(conn, lambda sql, _p: 'user_version = 4' in sql)
+        result = await _migrate_v3_to_v4(
+            cast(aiosqlite.Connection, proxy), project_root=project_root,
+        )
+
+        assert result['index_built'] is False, result
+        assert result['flagged'] == [], result
+        assert result['healed'] == [
+            {
+                'tag': 'master',
+                'candidate_key': compute_candidate_key('Alpha task', ['a.py']),
+                'canonical_id': 1,
+                'cancelled_ids': [2],
+            },
+        ], f'the failure path must report the heal it already committed; got {result}'
+
+        # Confirm the report is not merely optimistic -- the heal really WAS
+        # durable. rollback() discards anything still pending (the failed
+        # index-build's own transaction); whatever survives was committed
+        # before the failure.
+        await conn.rollback()
+        status_cursor = await conn.execute("SELECT id, status FROM tasks WHERE tag='master'")
+        statuses = {row['id']: row['status'] for row in await status_cursor.fetchall()}
+        assert statuses == {1: 'pending', 2: 'cancelled'}, statuses
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_v3_to_v4_commits_each_healed_group_so_a_later_failure_cannot_unwind_it(
+    tmp_path,
+):
+    """A group that fully healed must be COMMITTED -- not merely reported --
+    before a later group in the same loop raises. Without a per-group
+    commit, the except handler's rollback (added so a partial heal can't
+    ride on the NEXT unrelated write) would also unwind an EARLIER
+    already-completed group's cancel from the SAME pass, while the hoisted
+    accumulator still reports it as healed -- trading the original
+    under-claim bug for an over-claim. This pins the invariant that keeps
+    the report and on-disk state in agreement: `healed` must name exactly
+    the groups whose cancels are durably committed.
+    """
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v3_db_with_dup_groups(db_path, [
+        (1, 'Alpha task', 'pending', ['a.py']),
+        (2, 'Alpha task', 'pending', ['a.py']),
+        (3, 'Beta task', 'pending', ['b.py']),
+        (4, 'Beta task', 'pending', ['b.py']),
+    ])
+
+    conn = await _open_raw_v3_conn(db_path)
+    try:
+        # One cancel target per group -- this makes the test order-
+        # independent. The audit query has no ORDER BY and SQLite does not
+        # specify GROUP BY result order (a probe against this worktree
+        # showed it iterating the 'Beta' group before 'Alpha', not the
+        # lowest-id one), but with a single cancel target per group,
+        # cancel-UPDATE #1 always belongs to whichever group is iterated
+        # first (heals fully) and #2 always belongs to the second (raises
+        # before writing anything) -- regardless of which named group that is.
+        proxy = _FailingExecuteConn(
+            conn,
+            lambda sql, p: "SET status = 'cancelled'" in sql and p.cancel_updates == 2,
+        )
+        result = await _migrate_v3_to_v4(
+            cast(aiosqlite.Connection, proxy), project_root=project_root,
+        )
+
+        assert result['index_built'] is False, result
+        assert result['flagged'] == [], result
+        assert len(result['healed']) == 1, (
+            f'exactly the one fully-healed group must be reported; got {result["healed"]}'
+        )
+
+        # rollback() discards anything still pending (the second group's
+        # failed attempt); whatever survives was committed before it raised.
+        await conn.rollback()
+        status_cursor = await conn.execute("SELECT id, status FROM tasks WHERE tag='master'")
+        statuses = {row['id']: row['status'] for row in await status_cursor.fetchall()}
+        cancelled_on_disk = {tid for tid, status in statuses.items() if status == 'cancelled'}
+
+        # Catches BOTH directions at once: under-claiming (a cancel on disk
+        # that isn't reported) and over-claiming (a reported cancel that the
+        # rollback actually unwound).
+        assert cancelled_on_disk == set(result['healed'][0]['cancelled_ids']), (
+            f"reported healed group {result['healed'][0]} does not match what is "
+            f'durably on disk: cancelled_on_disk={cancelled_on_disk}'
+        )
+        # The survivor survived.
+        assert result['healed'][0]['canonical_id'] not in cancelled_on_disk, result['healed'][0]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_v3_to_v4_reports_flagged_groups_and_skips_escalation_on_the_failure_path(
+    tmp_path,
+):
+    """The except-path result dict must report BOTH halves of a mixed pass --
+    a genuinely healed group AND an already-classified ambiguous (flagged)
+    group -- when a LATER group's cancel raises, and must NEVER invoke
+    `residual_dup_escalation_cb` from that path. Neither behaviour was
+    previously exercised: the other two failure-path tests both assert
+    `flagged == []`, so `flagged_groups` being hoisted/reported on this path
+    was unpinned, and nothing asserted the (documented, but untested)
+    decision not to escalate a partial pass.
+
+    Three residual duplicate groups:
+
+    * a title-divergent (flagged) group, given an EXPLICIT stored
+      candidate_key starting with `!` (0x21) -- every REAL
+      `compute_candidate_key` output is a 16-char lowercase sha256-hex
+      string (`[0-9a-f]`, see its docstring), all of which sort AFTER `!` in
+      SQLite's default BINARY collation. `_migrate_v3_to_v4`'s audit query
+      has no ORDER BY and SQLite implements this GROUP BY via a temp B-tree
+      (empirically confirmed: `EXPLAIN QUERY PLAN` on this exact query
+      shows `USE TEMP B-TREE FOR GROUP BY`), which visits groups in
+      ascending (tag, candidate_key) order -- so this group is GUARANTEED
+      to be classified (and appended to `flagged_groups`) before either
+      heal-eligible group below, regardless of their real candidate_key
+      values.
+    * two genuine duplicate groups, each with exactly one cancel target and
+      a REAL (non-overridden) candidate_key -- title_divergent's "verified
+      same" check applies to heal groups too, so (unlike the flagged group
+      above) neither can use an arbitrary override to pin its position. Their
+      relative order is unspecified (same caveat as
+      `..._later_failure_cannot_unwind_it` above), so the fail predicate
+      targets the 2nd-ever cancel UPDATE ordinally: whichever of the two is
+      visited first fully heals and commits, and the other raises before
+      writing anything -- exactly one heals, exactly one fails, regardless
+      of which is which.
+    """
+    project_root = str(tmp_path / 'proj')
+    db_path = Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
+    _make_v3_db_with_dup_groups(db_path, [
+        # Flagged (title_divergent) -- always classified first, see docstring.
+        (30, 'Ambiguous task', 'pending', ['x.py'], '!flagged_group_key'),
+        (31, 'Ambiguous task', 'pending', ['x.py'], '!flagged_group_key'),
+        # Two heal-eligible groups, real candidate_keys, one cancel target
+        # each -- see docstring for why the fail predicate is ordinal.
+        (10, 'Alpha task', 'pending', ['a.py']),
+        (11, 'Alpha task', 'pending', ['a.py']),
+        (20, 'Zeta task', 'pending', ['z.py']),
+        (21, 'Zeta task', 'pending', ['z.py']),
+    ])
+
+    recorded: list[tuple[str, list[dict]]] = []
+
+    def recording_stub(project_root_arg, residual_groups):
+        recorded.append((project_root_arg, residual_groups))
+
+    conn = await _open_raw_v3_conn(db_path)
+    try:
+        proxy = _FailingExecuteConn(
+            conn,
+            lambda sql, p: "SET status = 'cancelled'" in sql and p.cancel_updates == 2,
+        )
+        result = await _migrate_v3_to_v4(
+            cast(aiosqlite.Connection, proxy),
+            project_root=project_root,
+            residual_dup_escalation_cb=recording_stub,
+        )
+
+        assert result['index_built'] is False, result
+        assert result['audit_complete'] is False, result
+        # Deterministic (see docstring): the flagged group always sorts --
+        # and is therefore classified -- first. RED without the hoisted
+        # `flagged_groups` reporting: today this comes back `[]`.
+        assert result['flagged'] == [
+            {
+                'tag': 'master', 'candidate_key': '!flagged_group_key',
+                'task_ids': ['30', '31'], 'count': 2, 'reason': 'title_divergent',
+            },
+        ], f'flagged reporting on the failure path must not be hard-coded []; got {result["flagged"]}'
+        assert len(result['healed']) == 1, (
+            f'exactly one of the two heal-eligible groups must be reported; got {result["healed"]}'
+        )
+
+        # Confirm the reported heal is durable and matches on-disk state --
+        # same invariant as `..._later_failure_cannot_unwind_it` above.
+        await conn.rollback()
+        status_cursor = await conn.execute("SELECT id, status FROM tasks WHERE tag='master'")
+        statuses = {row['id']: row['status'] for row in await status_cursor.fetchall()}
+        cancelled_on_disk = {tid for tid, status in statuses.items() if status == 'cancelled'}
+        assert cancelled_on_disk == set(result['healed'][0]['cancelled_ids']), (
+            f"reported healed group {result['healed'][0]} does not match what is "
+            f'durably on disk: cancelled_on_disk={cancelled_on_disk}'
+        )
+        # The ambiguous group is untouched either way.
+        assert statuses[30] == 'pending' and statuses[31] == 'pending', statuses
+    finally:
+        await conn.close()
+
+    # Escalation is reserved for the completed-audit path -- a half-finished
+    # pass must never fire it, partial or otherwise.
+    assert recorded == [], (
+        f'residual_dup_escalation_cb must not be invoked on the failure path; got {recorded}'
+    )
 
 
 # ── rebuild-without-restart: live re-audit (task 2402) ──────────────────

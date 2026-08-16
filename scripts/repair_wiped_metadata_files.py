@@ -151,7 +151,7 @@ def plan_files_rejection_reason(candidate: WipeCandidate) -> str | None:
     that a drifting copy undercounting the extension allowlist by 22 entries is
     exactly what incident #3117 was; ``fused_memory.middleware.lock_charter_guard``
     duplicates it verbatim for the same reason. Note this correctly accepts
-    systemd ``.timer``/``.service`` units, which are in ``CODE_EXTENSIONS``.
+    systemd ``.timer``/``.service`` units, which are in ``FILE_EXTENSIONS``.
 
     An EMPTY (or all-blank) plan_files is rejected separately and first: there
     is nothing to restore, and a write setting ``files`` to ``[]`` would

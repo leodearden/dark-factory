@@ -49,7 +49,7 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from orchestrator.git_ops import GitOps
+from orchestrator.git_ops import PERSISTENT_MERGE_WORKTREE_NAME, GitOps
 from orchestrator.merge_types import MergeRequest
 
 if TYPE_CHECKING:
@@ -457,8 +457,9 @@ def _alarm_verify_host_unreachable(
 
     * ``level=1`` (L1 blocking) — loud (steward→auto-watcher→human ladder)
       but NON-halting: the merge-halt gate fires only for categories
-      ``wip_conflict`` / ``unmerged_state``; ``verify_host_unreachable`` is
-      intentionally excluded so the serial-local fallback keeps flowing.
+      ``wip_conflict`` / ``unmerged_state`` / ``stash_failed``;
+      ``verify_host_unreachable`` is intentionally excluded so the
+      serial-local fallback keeps flowing.
     * ``category='verify_host_unreachable'``
     * ``task_id=_verify_host_unreachable_sentinel(host)``
 
@@ -739,6 +740,105 @@ async def _acquire_warm_verify_worktree(
     if merge_wt is not None and merge_wt.resolve() != warm_path.resolve():
         await git_ops.cleanup_merge_worktree(merge_wt)
     return warm_path, True
+
+
+async def acquire_chain_build_lane(
+    git_ops: GitOps,
+    config: OrchestratorConfig,
+    base_commit: str,
+) -> tuple[Path | None, bool]:
+    """Acquire the ONE scratch worktree a deep merge-ahead chain builds in
+    (task 3184, PRD β).
+
+    Worktree-routing seam for :func:`orchestrator.merge_queue.build_chain`,
+    mirroring :func:`_acquire_warm_verify_worktree`'s role for the verify
+    path.  Exists so acquire/release are a documented matched pair at one
+    place and ``build_chain`` itself contains no worktree-provisioning
+    branching.
+
+    Delegates to :meth:`~orchestrator.git_ops.GitOps.acquire_spec_lane` — the
+    single lane the whole chain build (and, later, γ's tip verify) runs in.
+    That method already handles knob-off (``spec_warm_lane_pool is None``) and
+    pool exhaustion by cold-falling-back to
+    :meth:`~orchestrator.git_ops.GitOps.create_throwaway_verify_worktree` with
+    ``warm=False``, so no knob branch is needed here.
+
+    **Fail-closed serial-lane guard.**  A resolution that lands on the serial
+    ``_merge-verify`` lane (:data:`PERSISTENT_MERGE_WORKTREE_NAME`) is
+    REFUSED: the lane is released and ``(None, False)`` returned, with a
+    WARNING so the refusal is loud rather than a silent ``None``.  The chain
+    build is spec-lane-side and structurally exempt from DF-3071's serial-head
+    lane-lock admission gate (whose enforcement point,
+    :func:`enforce_persistent_worktree_serial_lane`, lives in this same
+    module).  Borrowing ``_merge-verify`` would silently make the chain build
+    contend with the serial head verify, and 3071's guard would then read the
+    lane BUSY and defer the fleet.
+
+    **Never raises.**  Any exception degrades the round to "no chain this
+    round" (``(None, False)``, logged at WARNING with ``exc_info``) rather
+    than propagating into the dispatch loop — mirroring ``acquire_spec_lane``'s
+    own documented never-raise contract (inv.6).
+
+    Args:
+        git_ops: Live :class:`~orchestrator.git_ops.GitOps` instance.
+        config: Orchestrator config of the item driving the build.  Accepted
+            for symmetry with the other seams in this module and for future
+            policy knobs; the lane choice itself is ``git_ops``-resident.
+        base_commit: The SHA to check the lane out at — the frozen prefix tip
+            (``SpeculativeMergeWorker.frozen_prefix_tip``), i.e. the chain's
+            ``head_merge_commit``.
+
+    Returns:
+        ``(lane, warm)`` on success; ``(None, False)`` when no chain is
+        possible this round.  ``build_chain`` maps ``(None, False)`` to an
+        empty :class:`~orchestrator.merge_types.ChainResult`.
+    """
+    del config  # accepted for seam symmetry; lane choice is git_ops-resident
+    try:
+        lane, warm = await git_ops.acquire_spec_lane(base_commit)
+    except Exception:
+        logger.warning(
+            'acquire_chain_build_lane: lane acquisition failed for %s — '
+            'no chain this round', base_commit[:8], exc_info=True,
+        )
+        return None, False
+
+    if lane.name == PERSISTENT_MERGE_WORKTREE_NAME:
+        logger.warning(
+            'acquire_chain_build_lane: REFUSING the serial %s lane for a '
+            'chain build at %s — the chain build is spec-lane-side and would '
+            'contend with the serial head verify (DF-3071); no chain this '
+            'round', PERSISTENT_MERGE_WORKTREE_NAME, base_commit[:8],
+        )
+        await release_chain_build_lane(git_ops, lane, warm=warm)
+        return None, False
+
+    return lane, warm
+
+
+async def release_chain_build_lane(
+    git_ops: GitOps,
+    lane: Path | None,
+    *,
+    warm: bool,
+) -> None:
+    """Release a lane acquired by :func:`acquire_chain_build_lane` (task 3184).
+
+    No-op when *lane* is ``None``, so a caller can release unconditionally
+    without branching on whether a chain was built.  Otherwise delegates to
+    :meth:`~orchestrator.git_ops.GitOps.release_spec_lane`, which is already
+    idempotent, handles both warm-pool release (ASSIGNED→FREE, worktree and
+    ``target/`` retained) and cold cleanup (``cleanup_merge_worktree``), and
+    never raises.
+
+    Thin by design: it exists so acquire/release read as a matched pair at one
+    seam.  Callers MUST pass the ``warm`` flag they received from
+    :func:`acquire_chain_build_lane` (or ``ChainResult.lane_warm``) — a warm
+    lane released as cold would have its pooled worktree removed.
+    """
+    if lane is None:
+        return
+    await git_ops.release_spec_lane(lane, warm=warm)
 
 
 def enforce_persistent_worktree_serial_lane(

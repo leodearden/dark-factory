@@ -621,6 +621,68 @@ def render_source_completion_section(*, can_file_tasks: bool) -> str:
     )
 
 
+def render_task_creation_accounting_section() -> str:
+    """Render the Task-Creation Accounting section (task 3046, run_id
+    507bc25b evidence).
+
+    Stage 2's `tasks_created` increment mandate (`## Verifying Task
+    Operations`, prompts/stage2.py) is stated once, but never declares the
+    counter's SCOPE: whether a task confirmed via a mid-cycle side quest —
+    the Proactive Task Sample, the Done-Task Completion-Memory Audit,
+    Cross-Project Routing, a Source-Completion residual, or a
+    predicate-contradiction gate — counts the same as one confirmed from a
+    Stage 1 flagged item. Run 507bc25b filed task 3045 via the
+    proactive/cross-project sample-review surface yet Stage 2 self-reported
+    `tasks_created: 0` — exactly the gap this section closes, by stating the
+    counter is path-agnostic and by giving the framework an action-record
+    ground truth (`task_created_records`) it can repair from, modeled
+    directly on `flag_deleted_records`' established convention (see
+    `## Per-Cycle Counter Schema` in prompts/stage2.py).
+
+    Rendered once, as a shared renderer (INV-5) — not restated in
+    `assemble_payload`'s "Your Task" block, where the Proactive Task Sample /
+    Cross-Project Routing instructions actually live, to avoid two copies of
+    the same rule drifting apart. Like `render_source_completion_section`,
+    this is new canonical text with no prior prompt precedent, and is
+    written as a plain (non-f) string so its literal `{`/`}` record-shape
+    example needs no brace-doubling when interpolated into the f-string
+    ``STAGE2_SYSTEM_PROMPT``.
+    """
+    return (
+        '## Task-Creation Accounting\n'
+        '`tasks_created` is PATH-AGNOSTIC: it counts EVERY task you confirm '
+        'this cycle, regardless of which surface produced the work — a '
+        'Stage 1 flagged item, the **Proactive Task Sample**, the '
+        '`### Done-Task Completion-Memory Audit`, Cross-Project Routing (a '
+        "task filed into ANOTHER project's `project_root` still counts — it "
+        'is a task you created this cycle), a Source-Completion residual, '
+        'or a predicate-contradiction gate. A creation is never exempt from '
+        'the count because it was a mid-cycle side-quest rather than the '
+        'finding you started from.\n\n'
+        'Confirmation rule: see `## Verifying Task Operations` above for the '
+        'full rule, including its `get_task`-verified fallback for a status '
+        'other than `created`/`combined`/`failed`. Only the '
+        '`resolve_ticket`-confirmed subset of that rule — `status` `created` '
+        'or `combined` WITH a `task_id` — is machine-countable via the '
+        'action record below; never record on the `submit_task` call '
+        'attempt, and `failed` never counts. A creation you confirm via the '
+        '`get_task` fallback still counts toward your own `tasks_created` '
+        'self-report, but has no `task_created_records` entry of its own — '
+        'so under-reporting it is not auto-repaired the way an omitted '
+        '`created`/`combined` record is.\n\n'
+        'Action record: at the moment of each confirmation, append one '
+        "entry to `stats['task_created_records']`:\n"
+        '  `{"action": "task_created", "task_id": <id>, '
+        '"status": "created"|"combined", "project_id": <project the task '
+        'was filed into>, "source_path": <short label of the surface that '
+        'produced it>}`\n\n'
+        'The framework treats this list as ground truth and REPAIRS '
+        '`tasks_created` upward when the two disagree (recording the '
+        'pre-repair value under `tasks_created_reported`), so a missed '
+        'increment is recovered rather than lost.'
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Invariant predicates
 # --------------------------------------------------------------------------- #

@@ -18,6 +18,7 @@ from shared.prompt_artifact import (
     PromptSpec,
     compose_prompt,
 )
+from shared.task_statuses import TaskStatus
 
 from fused_memory.backends.task_backend_errors import TaskmasterError, TaskNotFoundError
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
@@ -42,6 +43,7 @@ from fused_memory.middleware.task_curator import (
     _to_pool_entry,
     _trim_pool,
     flatten_task_tree,
+    is_combine_eligible_status,
     normalize_title,
 )
 
@@ -88,7 +90,13 @@ class TestTaskDependencies:
 
 
 class TestToPoolEntry:
-    def test_pending_is_combine_eligible(self):
+    def test_maps_task_fields(self):
+        """Field mapping only — combine_eligible is covered by the class below.
+
+        (The per-status eligibility assertions that used to live here are
+        subsumed by ``TestCombineEligibilityNoDivergence``, which parametrizes
+        the same call over the full status vocabulary.)
+        """
         task = {
             'id': '42',
             'title': 'Fix parser',
@@ -101,15 +109,8 @@ class TestToPoolEntry:
         entry = _to_pool_entry(task, source='module', lock_depth=2)
         assert entry is not None
         assert entry.task_id == '42'
-        assert entry.combine_eligible is True
         assert entry.source == 'module'
         assert entry.module_keys == ['src/parser.py']
-
-    def test_done_is_not_combine_eligible(self):
-        task = {'id': '1', 'title': 'x', 'status': 'done'}
-        entry = _to_pool_entry(task, source='module', lock_depth=2)
-        assert entry is not None
-        assert entry.combine_eligible is False
 
     def test_missing_id_returns_none(self):
         entry = _to_pool_entry({'title': 'x'}, source='module', lock_depth=2)
@@ -117,6 +118,79 @@ class TestToPoolEntry:
 
     def test_none_returns_none(self):
         assert _to_pool_entry(None, source='module', lock_depth=2) is None
+
+
+class TestIsCombineEligibleStatus:
+    """The ONE shared combine STATUS predicate (task 4035).
+
+    Selection (``_to_pool_entry.combine_eligible``) and execution
+    (``task_interceptor._execute_combine``) previously hand-copied
+    ``status == 'pending'`` and silently diverged, letting combines land on
+    non-pending targets mid-planning. These tests pin the single definition;
+    the SELECTION call site is pinned to it by
+    ``TestCombineEligibilityNoDivergence`` below, and the EXECUTION call site
+    by ``test_curator_combine_execution_matches_shared_predicate`` in
+    ``test_task_interceptor.py``.
+    """
+
+    @pytest.mark.parametrize('status', list(TaskStatus))
+    def test_pending_only_over_full_vocabulary(self, status: TaskStatus):
+        expected = status is TaskStatus.PENDING
+        assert is_combine_eligible_status(status.value) is expected
+
+    def test_in_progress_is_not_eligible(self):
+        """THE BUG, kept as a named regression case though the sweep above covers it.
+
+        An in-progress target sailed through the old execution guard; naming
+        the incident status explicitly is what makes a future deletion of this
+        behaviour read as deliberate rather than as parametrize-list churn.
+        """
+        assert is_combine_eligible_status('in-progress') is False
+
+    @pytest.mark.parametrize(
+        'status',
+        [
+            'unknown',
+            '',
+            'PENDING',  # wrong case is not the canonical spelling
+            'Pending',
+            ' pending ',
+            'pending-review',
+        ],
+    )
+    def test_unrecognised_status_fails_closed(self, status: str):
+        assert is_combine_eligible_status(status) is False
+
+
+class TestCombineEligibilityNoDivergence:
+    """INV-5 anti-divergence pin for the SELECTION site only.
+
+    Scope is deliberately narrow: these assertions drive
+    ``_to_pool_entry`` and say nothing about the interceptor. Because
+    ``_to_pool_entry`` calls ``is_combine_eligible_status`` directly, they
+    fail only if that call is deleted or re-forked into a second literal —
+    which is exactly the selection-side half of the 20.2% race.
+
+    The EXECUTION site (``task_interceptor._execute_combine``, the half that
+    actually diverged and caused the incident) cannot be covered from here;
+    it is pinned by ``test_curator_combine_execution_matches_shared_predicate``
+    in ``test_task_interceptor.py``, which drives the real combine path over
+    the same full vocabulary.
+    """
+
+    @pytest.mark.parametrize('status', list(TaskStatus))
+    def test_pool_entry_agrees_with_shared_predicate(self, status: TaskStatus):
+        task = {'id': '42', 'title': 'Fix parser', 'status': status.value}
+        entry = _to_pool_entry(task, source='module', lock_depth=2)
+        assert entry is not None
+        assert entry.combine_eligible is is_combine_eligible_status(status.value)
+
+    def test_pool_entry_agrees_on_unknown_status(self):
+        """A task dict with no status reads as 'unknown' — both sides refuse it."""
+        entry = _to_pool_entry({'id': '42', 'title': 'x'}, source='module', lock_depth=2)
+        assert entry is not None
+        assert entry.combine_eligible is is_combine_eligible_status('unknown')
+        assert entry.combine_eligible is False
 
 
 class TestFlattenTaskTree:
@@ -343,7 +417,7 @@ def _pool_with_ids(*pairs: tuple[str, str]) -> list[_PoolEntry]:
             status=status,
             priority='medium',
             source='module',
-            combine_eligible=(status == 'pending'),
+            combine_eligible=is_combine_eligible_status(status),
         )
         for tid, status in pairs
     ]

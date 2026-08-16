@@ -18,11 +18,13 @@ above runs over ALREADY-STORED content, where a false positive would provoke an
 unnecessary rewrite of a user's memory.
 
 It is NOT the live write-boundary guard. That is
-:mod:`fused_memory.server.markup_tripwire`, which owns the authoritative
-enumeration of the envelope literals and is deliberately calibrated the other
-way — a bare substring scan that accepts over-reporting to maximise recall at
-write time, where the cost of a false positive is only a retry. The two are
-complementary and must not be collapsed into one another.
+:mod:`fused_memory.server.markup_tripwire`, which is deliberately calibrated
+the other way — a bare substring scan that accepts over-reporting to maximise
+recall at write time, where the cost of a false positive is only a retry. The
+two are complementary and must not be collapsed into one another. Since task
+3688 they DO share the envelope-literal enumeration itself, which lives once
+in :mod:`shared.toolcall_markup` (INV-5); the two calibrations are two named
+predicates over that one set, not two independently spelled sets.
 
 ## Root cause (task 3083, WORK a)
 
@@ -85,15 +87,41 @@ that same call. ``\\x3c`` is byte-identical at runtime (both in the regex
 engine and in Python string literals) and never appears verbatim in the file
 text, so it is immune. Leave it escaped.
 
-This module is pure and stdlib-only. It deliberately imports nothing else
-from ``fused_memory`` so that every layer — backends, services, middleware,
-the MCP tools layer, and standalone scripts — can depend on it without a
-cycle.
+This module's own code is pure and stdlib-only, and it deliberately imports
+nothing else from ``fused_memory`` so that every layer — backends, services,
+middleware, the MCP tools layer, and standalone scripts — can depend on it
+without a cycle.
+
+## It is NOT dependency-free — know what the import actually costs
+
+``shared.toolcall_markup`` OWNS the envelope-literal enumeration (INV-5) and
+is itself stdlib-only and pure, but importing a shared SUB-module executes
+``shared/__init__.py``, which imports the whole shared public API eagerly.
+Measured on this worktree, ``import shared.toolcall_markup`` therefore drags
+in ``pydantic``, ``pydantic_core``, ``aiosqlite``, ``yaml``, ``dotenv``,
+``annotated_types`` and ``typing_extensions``, and costs ~0.4 s warm (several
+seconds cold) — none of which this module or ``toolcall_markup`` uses. So a
+dependency-free system ``python`` can no longer import this module; an
+interpreter that has the project's dependencies (the repo venv, ``uv run``)
+still can, and every current consumer has them: fused-memory declares
+``dark-factory-shared`` as a workspace dependency, and
+``fused-memory/scripts/sweep_toolcall_xml_leak.py`` runs inside that venv.
+
+A standalone script must additionally put ``shared/src`` on ``sys.path``
+alongside ``fused-memory/src``; ``scripts/scan_task_toolcall_leaks.py``
+carries that bootstrap, records the same cost in a comment, and is the
+pattern to copy. Making a shared leaf importable without the package init
+(a lazy ``__getattr__`` in ``shared/__init__.py``) would restore the
+dependency-light property, but it is a shared-wide change that task 3688
+held no lock for and deliberately did not take on. **Task 3896** owns it;
+when that lands, revisit this section rather than trusting it.
 """
 from __future__ import annotations
 
 import re
 from typing import NamedTuple
+
+from shared.toolcall_markup import PARAMETER_CLOSER_NAMES, PREFILTER_NEEDLES
 
 __all__ = [
     'LEAK_TAIL',
@@ -104,20 +132,20 @@ __all__ = [
     'has_toolcall_xml_leak',
 ]
 
+# PREFILTER_NEEDLES — imported above, NOT spelled here. The enumeration is
+# owned by shared.toolcall_markup (INV-5); its VALUE and ORDER are unchanged by
+# the move, and tests/test_mem0_client.py zips this tuple against the Qdrant
+# filter clauses with strict=True, so the order stays load-bearing.
+#
 # Literal substrings a store-side PREFILTER can search for cheaply. Every leak
 # necessarily contains one of these — they are the closing-tag alternation of
-# LEAK_TAIL — so OR-ing them is a strict SUPERSET of the real match set and can
-# never miss a leak the detector would find.
+# LEAK_TAIL, now literally so, since both are built from the same name tuple —
+# so OR-ing them is a strict SUPERSET of the real match set and can never miss
+# a leak the detector would find.
 #
 # They are a speed optimisation ONLY. The authoritative verdict is always
 # find_toolcall_xml_leak() re-run over each returned record, because a bare
 # closing tag is common in ordinary prose and matches nothing on its own.
-PREFILTER_NEEDLES = (
-    '\x3c/description>',
-    '\x3c/parameter>',
-    '\x3c/details>',
-    '\x3c/content>',
-)
 
 # Promoted verbatim from scripts/scan_task_toolcall_leaks.py (task 2939), with
 # exactly two generalizations for the Mem0 specimens (task 3083):
@@ -129,7 +157,7 @@ PREFILTER_NEEDLES = (
 # The \s+ real-whitespace requirement between the two halves is UNCHANGED and
 # must stay that way; see the module docstring for the 2938/2939 rationale.
 LEAK_TAIL = re.compile(
-    r'\x3c/(?:description|parameter|details|content)>'
+    r'\x3c/(?:' + '|'.join(PARAMETER_CLOSER_NAMES) + r')>'
     r'\s+'
     r'(\x3c(?:parameter\s+name="[^"]*">|/invoke>).*)$',
     re.DOTALL,

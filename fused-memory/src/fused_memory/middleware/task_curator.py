@@ -47,10 +47,12 @@ from shared.cli_invoke import (
 from shared.locking import files_to_modules
 from shared.neutral_cwd import neutral_cli_cwd
 from shared.prompt_artifact import PromptArtifactStore, PromptSpec, default_artifacts_root
+from shared.task_statuses import TaskStatus
 
 from fused_memory.backends.task_backend_errors import TaskNotFoundError
 from fused_memory.middleware.candidate_key import compute_candidate_key
 from fused_memory.reconciliation.context_assembler import estimate_tokens
+from fused_memory.utils.task_dependency_ids import task_dependency_ids as _task_dependencies
 
 if TYPE_CHECKING:
     from qdrant_client.models import ExtendedPointId
@@ -2760,14 +2762,6 @@ def _task_files(task: dict) -> list[str]:
     return [str(f) for f in files if f]
 
 
-def _task_dependencies(task: dict) -> list[str]:
-    deps = task.get('dependencies') or []
-    if isinstance(deps, str):
-        # CSV fallback
-        return [d.strip() for d in deps.split(',') if d.strip()]
-    return [str(d) for d in deps if d]
-
-
 def _task_metadata_spawned_from(task: dict) -> str | None:
     meta = task.get('metadata') or {}
     if isinstance(meta, dict):
@@ -2775,6 +2769,26 @@ def _task_metadata_spawned_from(task: dict) -> str | None:
         if isinstance(v, str) and v:
             return v
     return None
+
+
+def is_combine_eligible_status(status: str) -> bool:
+    """Single source of truth for combine STATUS eligibility (task 4035).
+
+    Called from BOTH the curator's selection snapshot
+    (``_to_pool_entry.combine_eligible``) and the interceptor's
+    execution-time combine guard (``_execute_combine``). Keeping one
+    definition is the point: the two sites previously hand-copied
+    ``status == 'pending'`` and silently diverged, letting 20.2% of combines
+    land on non-pending targets mid-planning.
+
+    Status ONLY. Liveness (``claimant_run_id``) is execution-side and
+    deliberately NOT part of this predicate — the selection snapshot cannot
+    observe it (D11).
+
+    Fails closed: anything outside the canonical vocabulary (an unknown
+    status, a blank, a case variant) is not eligible.
+    """
+    return status == TaskStatus.PENDING.value
 
 
 def _to_pool_entry(
@@ -2797,7 +2811,7 @@ def _to_pool_entry(
         status=status,
         priority=str(task.get('priority', DEFAULT_PRIORITY)),
         source=source,
-        combine_eligible=(status == 'pending'),
+        combine_eligible=is_combine_eligible_status(status),
     )
 
 

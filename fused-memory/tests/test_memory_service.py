@@ -80,15 +80,26 @@ def service(mock_config):
     # Default read payload carries BOTH mem0-owned keys and custom provenance
     # keys, so the preservation assertions have something to preserve.
     svc.mem0.get_point_by_id = AsyncMock(return_value=dict(DEFAULT_POINT_PAYLOAD))
-    # REQUIRED SETUP, not decoration (task 3198, leaf ε) — do not delete.
-    # `svc.mem0` is a bare MagicMock, so the canonical-uniqueness re-check at
-    # `_apply_memory_metadata_validation` would hit
-    # `await svc.mem0.count_by_metadata(...)` → `TypeError: object MagicMock
-    # can't be used in 'await' expression`, breaking already-green tests that
-    # merely write `canonical: True` (e.g.
-    # TestMemoryMetadataValidationAtSeam::test_valid_metadata_round_trips_to_the_backend).
-    # `0` / `[]` mean "no incumbent", the correct default for every
-    # pre-existing test; `_mm_set_canonical_incumbent` flips them per-test.
+    # REQUIRED SETUP, not decoration — do not delete.  TWO independent
+    # consumers need this deterministic read surface, which is why the
+    # defaults are shared:
+    #
+    #  * leaf ε (task 3198) — `svc.mem0` is a bare MagicMock, so the
+    #    canonical-uniqueness re-check at
+    #    `_apply_memory_metadata_validation` would hit
+    #    `await svc.mem0.count_by_metadata(...)` → `TypeError: object
+    #    MagicMock can't be used in 'await' expression`, breaking
+    #    already-green tests that merely write `canonical: True` (e.g.
+    #    TestMemoryMetadataValidationAtSeam::test_valid_metadata_round_trips_to_the_backend).
+    #  * leaf δ (task 3197) — `delete_memory`'s child gate awaits
+    #    `count_by_metadata` on EVERY mem0 delete, so without this every
+    #    pre-existing delete test would fail the same confusing way.
+    #
+    # `0` / `[]` are the correct default for both: "no incumbent" for ε, and
+    # CHILDLESS for δ — which also models the live corpus leaf α measured
+    # (`metadata.parent_id` has zero footprint, so no existing record has
+    # children).  `_mm_set_canonical_incumbent` and the child-gate tests
+    # override them per-test.
     svc.mem0.count_by_metadata = AsyncMock(return_value=0)
     svc.mem0.scroll_by_metadata = AsyncMock(return_value=[])
 
@@ -1299,7 +1310,7 @@ class TestDeleteMemory:
     @pytest.mark.asyncio
     async def test_delete_graphiti(self, service):
         result = await service.delete_memory(
-            memory_id='abc-123', store='graphiti', project_id='test'
+            memory_id='00000000-0000-4000-8000-000000000001', store='graphiti', project_id='test'
         )
         assert result['status'] == 'deleted'
         assert result['store'] == 'graphiti'
@@ -1307,7 +1318,7 @@ class TestDeleteMemory:
     @pytest.mark.asyncio
     async def test_delete_mem0(self, service):
         result = await service.delete_memory(
-            memory_id='xyz-456', store='mem0', project_id='test'
+            memory_id='00000000-0000-4000-8000-000000000002', store='mem0', project_id='test'
         )
         assert result['status'] == 'deleted'
         assert result['store'] == 'mem0'
@@ -1318,9 +1329,11 @@ class TestDeleteMemory:
         because search returns edge UUIDs."""
         service.graphiti.remove_edge = AsyncMock()
         await service.delete_memory(
-            memory_id='edge-uuid-123', store='graphiti', project_id='test'
+            memory_id='00000000-0000-4000-8000-000000000003', store='graphiti', project_id='test'
         )
-        service.graphiti.remove_edge.assert_called_once_with('edge-uuid-123', group_id='test')
+        service.graphiti.remove_edge.assert_called_once_with(
+            '00000000-0000-4000-8000-000000000003', group_id='test'
+        )
         service.graphiti.remove_episode.assert_not_called()
 
 
@@ -2626,7 +2639,7 @@ class TestSearchDeleteRoundtrip:
         """End-to-end contract test: search returns edge UUIDs that work with delete_memory."""
         from _fm_helpers import MockEdge, MockNode
 
-        edge_uuid = 'edge-roundtrip-uuid-42'
+        edge_uuid = '00000000-0000-4000-8000-000000000042'
         service.graphiti.search = AsyncMock(return_value=[
             MockEdge(
                 fact='Payment gateway depends on billing API',
@@ -11128,3 +11141,829 @@ class TestCanonicalUniquenessAtSeam:
                 metadata={'topic': self._TOPIC, 'canonical': True},
                 category='decisions_and_rationale',
             )
+
+
+class TestParentIdLivenessAtSeam:
+    """Write-time `metadata.parent_id` LIVENESS (task 3197, leaf δ).
+
+    Leaf β pinned `validate_memory_metadata` as pure-by-construction — it
+    takes a dict and structurally cannot reach a store — and reserved
+    liveness for this leaf "at the seam". So the lookup lives in
+    `_apply_memory_metadata_validation`, and every case runs against BOTH
+    entry points: D8/§2 pin enforcement at the SERVICE seam precisely so
+    `add_system_record` cannot bypass it.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_live_parent_resolves_in_the_writes_own_project(
+        self, service, entry_point
+    ):
+        """One lookup, keyed by the WRITE's project_id.
+
+        Same-project scoping is structural, not a filter: `Scope` selects a
+        per-project Qdrant collection, so passing the write's own project_id
+        is what makes "same-project" true. A parent living in another
+        project's collection must not satisfy this check.
+        """
+        service.mem0.get_point_by_id = AsyncMock(
+            return_value=dict(DEFAULT_POINT_PAYLOAD)
+        )
+
+        await _mm_write(
+            service, entry_point,
+            metadata={'parent_id': _MM_UUID},
+            project_id='dark_factory',
+        )
+
+        _mm_backend_mock(service, entry_point).assert_awaited_once()
+        service.mem0.get_point_by_id.assert_awaited_once()
+        args, _ = service.mem0.get_point_by_id.call_args
+        assert args[0] == _MM_UUID
+        assert args[1].project_id == 'dark_factory'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_dead_parent_rejects_under_enforce_before_any_backend_call(
+        self, service, entry_point
+    ):
+        from fused_memory.memory_metadata import MemoryMetadataValidationError
+
+        journal = _mm_install_journal(service)
+        service.mem0.get_point_by_id = AsyncMock(return_value=None)
+        service.config.memory_metadata.enforce = True
+
+        with pytest.raises(MemoryMetadataValidationError) as excinfo:
+            await _mm_write(service, entry_point, metadata={'parent_id': _MM_UUID})
+
+        assert 'dead_parent_id' in {v.code for v in excinfo.value.violations}
+        _mm_backend_mock(service, entry_point).assert_not_called()
+        # Rejection ordering: no write-ahead intent may be journalled for a
+        # write that never happened.
+        journal.log_mem0_intent.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_dead_parent_censuses_and_proceeds_in_warn_mode(
+        self, service, entry_point, caplog
+    ):
+        """Warn mode never blocks a write — it produces the data that makes a
+        later `enforce` flip informed rather than blind."""
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+        assert service.config.memory_metadata.enforce is False
+        service.mem0.get_point_by_id = AsyncMock(return_value=None)
+
+        await _mm_write(service, entry_point, metadata={'parent_id': _MM_UUID})
+
+        _mm_backend_mock(service, entry_point).assert_awaited_once()
+        assert 'dead_parent_id' in _mm_census_codes(caplog)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_no_parent_id_costs_no_round_trip(self, service, entry_point):
+        """The common write path pays nothing.
+
+        `parent_id` is absent from essentially every live record (leaf α
+        measured it at zero corpus footprint), so a lookup on every write
+        would be pure overhead on the hot path.
+        """
+        service.mem0.get_point_by_id = AsyncMock(
+            return_value=dict(DEFAULT_POINT_PAYLOAD)
+        )
+
+        await _mm_write(service, entry_point, metadata={'topic': 'a-good-slug'})
+
+        _mm_backend_mock(service, entry_point).assert_awaited_once()
+        service.mem0.get_point_by_id.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_shape_invalid_parent_id_never_reaches_the_store(
+        self, service, entry_point, caplog
+    ):
+        """Liveness fires only AFTER the shape check passes.
+
+        No store could resolve 'not-a-uuid', so spending a round-trip on it
+        would be waste — and censusing `dead_parent_id` for it would blame
+        the wrong rule.
+        """
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+        service.mem0.get_point_by_id = AsyncMock(
+            return_value=dict(DEFAULT_POINT_PAYLOAD)
+        )
+
+        await _mm_write(service, entry_point, metadata={'parent_id': 'not-a-uuid'})
+
+        service.mem0.get_point_by_id.assert_not_awaited()
+        codes = _mm_census_codes(caplog)
+        assert 'invalid_parent_id_shape' in codes
+        assert 'dead_parent_id' not in codes
+        assert 'parent_id_liveness_unavailable' not in codes
+
+    # -- lookup FAILURE is not the same fact as a dead parent -------------
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_lookup_failure_censuses_unavailable_not_dead_in_warn_mode(
+        self, service, entry_point, caplog
+    ):
+        """A timed-out read must never be reported as a dead parent.
+
+        `get_point_by_id` deliberately PROPAGATES a Qdrant read timeout
+        rather than collapsing it into None, precisely so the two facts stay
+        distinguishable; folding both into `dead_parent_id` would discard
+        that at the seam and tell an operator a live parent is dead. Warn
+        mode also keeps its promise: validation never blocks a write.
+        """
+        caplog.set_level(logging.WARNING)
+        assert service.config.memory_metadata.enforce is False
+        service.mem0.get_point_by_id = AsyncMock(
+            side_effect=TimeoutError('qdrant read timeout')
+        )
+
+        await _mm_write(service, entry_point, metadata={'parent_id': _MM_UUID})
+
+        _mm_backend_mock(service, entry_point).assert_awaited_once()
+        codes = _mm_census_codes(caplog)
+        assert 'parent_id_liveness_unavailable' in codes
+        assert 'dead_parent_id' not in codes
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_lookup_failure_logs_the_raw_backend_cause(
+        self, service, entry_point, caplog
+    ):
+        """The backend cause is degraded, not discarded.
+
+        The census code says only "could not be checked"; without the
+        exception type in the log an operator debugging a burst of
+        `parent_id_liveness_unavailable` has nothing to correlate against.
+        """
+        caplog.set_level(logging.WARNING, logger='fused_memory.services.memory_service')
+        service.mem0.get_point_by_id = AsyncMock(
+            side_effect=TimeoutError('qdrant read timeout')
+        )
+
+        await _mm_write(service, entry_point, metadata={'parent_id': _MM_UUID})
+
+        text = '\n'.join(r.getMessage() for r in caplog.records)
+        assert 'TimeoutError' in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_lookup_failure_fails_closed_under_enforce(
+        self, service, entry_point
+    ):
+        """INV-3: an actor that cannot corroborate must not act.
+
+        Blast radius is confined to writes that actually carry `parent_id`
+        — a population leaf α measured at zero live records — and only when
+        `enforce` is on.
+        """
+        from fused_memory.memory_metadata import MemoryMetadataValidationError
+
+        service.mem0.get_point_by_id = AsyncMock(
+            side_effect=TimeoutError('qdrant read timeout')
+        )
+        service.config.memory_metadata.enforce = True
+
+        with pytest.raises(MemoryMetadataValidationError) as excinfo:
+            await _mm_write(service, entry_point, metadata={'parent_id': _MM_UUID})
+
+        codes = {v.code for v in excinfo.value.violations}
+        assert 'parent_id_liveness_unavailable' in codes
+        assert 'dead_parent_id' not in codes
+        _mm_backend_mock(service, entry_point).assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_backend_exception_never_leaks_past_the_seam(
+        self, service, entry_point
+    ):
+        """The MCP boundary must report the metadata contract, not a backend
+        detail: a raw TimeoutError there reads as a transport fault an agent
+        should retry, when the actual state is "this write was rejected"."""
+        from fused_memory.memory_metadata import MemoryMetadataValidationError
+
+        service.mem0.get_point_by_id = AsyncMock(
+            side_effect=TimeoutError('qdrant read timeout')
+        )
+        service.config.memory_metadata.enforce = True
+
+        with pytest.raises(MemoryMetadataValidationError) as excinfo:
+            await _mm_write(service, entry_point, metadata={'parent_id': _MM_UUID})
+        assert type(excinfo.value) is MemoryMetadataValidationError
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_non_timeout_backend_failure_takes_the_same_arm(
+        self, service, entry_point, caplog
+    ):
+        """The mapping is "liveness is UNKNOWN", not "the timeout case".
+
+        Special-casing TimeoutError would leave every other transport fault
+        — a connection reset, a serialization error — falling through to
+        whatever the raw exception did.
+        """
+        caplog.set_level(logging.WARNING)
+        service.mem0.get_point_by_id = AsyncMock(
+            side_effect=RuntimeError('qdrant transport blew up')
+        )
+
+        await _mm_write(service, entry_point, metadata={'parent_id': _MM_UUID})
+
+        _mm_backend_mock(service, entry_point).assert_awaited_once()
+        assert 'parent_id_liveness_unavailable' in _mm_census_codes(caplog)
+
+
+# --- delete_memory parent-lifecycle gate (task 3197, leaf δ) ---------------
+#
+# PRD V3: "no operation may silently orphan a child or dangle a pointer it
+# could have seen." The gate is UNCONDITIONAL — deliberately not behind
+# `memory_metadata.enforce`, unlike the V1 shape checks — because it is a
+# lifecycle safety gate, not a vocabulary check, and behind a default-off
+# flag the orphan hole would stay open exactly as long as the flag stayed
+# off.
+
+# Full 36-char UUIDs, not readable handles: `delete_memory` validates id
+# SHAPE (`require_full_uuid`, task 3132) above the store branch, so a short
+# handle is refused before the child gate is ever reached — every id the
+# cascade re-enters with has to be well-formed too.
+def _dm_uuid(suffix: str) -> str:
+    """Build a canonical UUID ending in *suffix* (<=12 hex chars)."""
+    return f'00000000-0000-4000-8000-{suffix.rjust(12, "0")}'
+
+
+_DM_PARENT = _dm_uuid('d001')
+_DM_CHILD_A = _dm_uuid('d00a')
+_DM_CHILD_B = _dm_uuid('d00b')
+
+
+def _dm_children(svc, child_ids, *, count=None):
+    """Report *child_ids* as children of whatever is being deleted.
+
+    *count* defaults to ``len(child_ids)``; pass it explicitly to model a
+    count/scroll DISAGREEMENT (a bounded scroll, or a concurrent write
+    between the two reads).
+    """
+    svc.mem0.count_by_metadata = AsyncMock(
+        return_value=len(child_ids) if count is None else count
+    )
+    svc.mem0.scroll_by_metadata = AsyncMock(
+        return_value=[{'id': cid, 'metadata': {}} for cid in child_ids]
+    )
+
+
+def _dm_event_buffer(svc):
+    buffer = MagicMock()
+    buffer.push = AsyncMock()
+    svc._event_buffer = buffer
+    return buffer
+
+
+def _dm_deleted_ids(svc):
+    """Ids passed to the mem0 backend delete, in call order."""
+    return [call.args[0] for call in svc.mem0.delete.call_args_list]
+
+
+class TestDeleteMemoryChildRefusal:
+    """`delete_memory` refuses to orphan children (task 3197, leaf δ)."""
+
+    @pytest.mark.asyncio
+    async def test_refuses_and_names_every_child(self, service):
+        """The refusal is the task's user-observable signal.
+
+        An agent that trips it at the MCP wire receives only
+        `{'error': str(e), 'error_type': ...}`, so the ids have to be in
+        the message, not merely on the exception object.
+        """
+        from fused_memory.memory_metadata import ParentHasChildrenError
+
+        _dm_children(service, [_DM_CHILD_A, _DM_CHILD_B])
+
+        with pytest.raises(ParentHasChildrenError) as excinfo:
+            await service.delete_memory(
+                memory_id=_DM_PARENT, store='mem0', project_id='test'
+            )
+
+        assert excinfo.value.child_ids == [_DM_CHILD_A, _DM_CHILD_B]
+        text = str(excinfo.value)
+        assert _DM_CHILD_A in text
+        assert _DM_CHILD_B in text
+
+    @pytest.mark.asyncio
+    async def test_refusal_leaves_no_delete_no_journal_row_no_event(self, service):
+        """A refused delete must leave no trace claiming a deletion happened.
+
+        The gate therefore runs BEFORE the backend call, before
+        `log_write_op` and before the `memory_deleted` event — a journal row
+        or a reconciliation event for a delete that never happened would
+        make downstream recon act on a record that is still there.
+        """
+        from fused_memory.memory_metadata import ParentHasChildrenError
+
+        journal = _mm_install_journal(service)
+        buffer = _dm_event_buffer(service)
+        _dm_children(service, [_DM_CHILD_A])
+
+        with pytest.raises(ParentHasChildrenError):
+            await service.delete_memory(
+                memory_id=_DM_PARENT, store='mem0', project_id='test'
+            )
+
+        service.mem0.delete.assert_not_awaited()
+        journal.log_write_op.assert_not_awaited()
+        buffer.push.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_child_lookup_filter_and_project_scope(self, service):
+        """The gate asks exactly one question, in the delete's own project."""
+        from fused_memory.memory_metadata import ParentHasChildrenError
+
+        _dm_children(service, [_DM_CHILD_A])
+
+        with pytest.raises(ParentHasChildrenError):
+            await service.delete_memory(
+                memory_id=_DM_PARENT, store='mem0', project_id='dark_factory'
+            )
+
+        scope, filters = service.mem0.count_by_metadata.call_args.args[:2]
+        assert filters == {'parent_id': _DM_PARENT}
+        assert scope.project_id == 'dark_factory'
+
+    @pytest.mark.asyncio
+    async def test_childless_delete_is_unchanged_and_costs_one_count(self, service):
+        """The common path pays one exact count and ZERO scrolls.
+
+        `delete_memory` has six in-repo recon callers including bulk pool
+        GC, so paying a full payload scroll per delete would be a real cost
+        for a listing nobody reads when there is nothing to list.
+        """
+        journal = _mm_install_journal(service)
+        buffer = _dm_event_buffer(service)
+        service.mem0.count_by_metadata = AsyncMock(return_value=0)
+        service.mem0.scroll_by_metadata = AsyncMock(return_value=[])
+
+        result = await service.delete_memory(
+            memory_id=_DM_PARENT, store='mem0', project_id='test'
+        )
+
+        assert result['status'] == 'deleted'
+        assert _dm_deleted_ids(service) == [_DM_PARENT]
+        journal.log_write_op.assert_awaited_once()
+        buffer.push.assert_awaited_once()
+        service.mem0.count_by_metadata.assert_awaited_once()
+        service.mem0.scroll_by_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_graphiti_delete_pays_no_child_lookup(self, service):
+        """`parent_id` is a Mem0 payload key — a Graphiti edge has none.
+
+        Charging the graphiti arm a Qdrant count for a relationship that
+        cannot exist there would be pure overhead.
+        """
+        service.mem0.count_by_metadata = AsyncMock(return_value=0)
+
+        await service.delete_memory(
+            memory_id=_dm_uuid('ed9e'), store='graphiti', project_id='test'
+        )
+
+        service.mem0.count_by_metadata.assert_not_awaited()
+        service.mem0.scroll_by_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_count_is_re_read_live_on_every_delete(self, service):
+        """INV-3: corroborate against the store, never against cached state.
+
+        A child can be written between two deletes, so a gate that trusted
+        a remembered "childless" answer would be checking history.
+        """
+        from fused_memory.memory_metadata import ParentHasChildrenError
+
+        service.mem0.count_by_metadata = AsyncMock(return_value=0)
+        service.mem0.scroll_by_metadata = AsyncMock(return_value=[])
+
+        await service.delete_memory(
+            memory_id=_DM_PARENT, store='mem0', project_id='test'
+        )
+        assert service.mem0.count_by_metadata.await_count == 1
+
+        _dm_children(service, [_DM_CHILD_A])
+        with pytest.raises(ParentHasChildrenError):
+            await service.delete_memory(
+                memory_id=_DM_PARENT, store='mem0', project_id='test'
+            )
+        assert service.mem0.count_by_metadata.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_scroll_shortfall_still_refuses_and_marks_truncated(self, service):
+        """A disagreement between the two reads is never downgraded.
+
+        If the scroll returns fewer ids than the live count — a bounded
+        scroll or a concurrent write — reporting "no children" would be the
+        exact silent orphan this gate exists to prevent, and reporting an
+        exhaustive-looking list would understate it.
+        """
+        from fused_memory.memory_metadata import ParentHasChildrenError
+
+        _dm_children(service, [_DM_CHILD_A], count=5)
+
+        with pytest.raises(ParentHasChildrenError) as excinfo:
+            await service.delete_memory(
+                memory_id=_DM_PARENT, store='mem0', project_id='test'
+            )
+
+        assert excinfo.value.truncated is True
+        assert 'at least' in str(excinfo.value)
+        service.mem0.delete.assert_not_awaited()
+
+
+
+
+class _DMGraph:
+    """A minimal parent→children Mem0 double for cascade tests.
+
+    Models the one relationship the gate reads (`metadata.parent_id`) plus
+    the effect a delete has on it, so cascade ORDER and TERMINATION are
+    exercised against state that actually changes — a static mock would let
+    an unbounded loop or a parent-first delete pass.
+    """
+
+    def __init__(self, edges, *, page_size=None):
+        #: parent id -> ids of records whose metadata.parent_id is that id
+        self.edges = {k: list(v) for k, v in edges.items()}
+        self.deleted = []
+        self.page_size = page_size
+
+    async def count(self, scope, filters):
+        return len(self.edges.get(filters['parent_id'], []))
+
+    async def scroll(self, scope, filters, limit):
+        rows = self.edges.get(filters['parent_id'], [])
+        bound = min(limit, self.page_size) if self.page_size else limit
+        return [{'id': r, 'metadata': {}} for r in rows[:bound]]
+
+    async def delete(self, memory_id, scope):
+        self.deleted.append(memory_id)
+        # A deleted record is nobody's child any more.
+        for kids in self.edges.values():
+            if memory_id in kids:
+                kids.remove(memory_id)
+        return {'message': 'deleted'}
+
+    def install(self, svc):
+        svc.mem0.count_by_metadata = AsyncMock(side_effect=self.count)
+        svc.mem0.scroll_by_metadata = AsyncMock(side_effect=self.scroll)
+        svc.mem0.delete = AsyncMock(side_effect=self.delete)
+        return self
+
+
+class TestDeleteMemoryCascade:
+    """`cascade=True` — the explicit opt-in (task 3197, leaf δ)."""
+
+    @pytest.mark.asyncio
+    async def test_cascade_deletes_children_and_parent(self, service):
+        graph = _DMGraph({_DM_PARENT: [_DM_CHILD_A, _DM_CHILD_B]}).install(service)
+
+        await service.delete_memory(
+            memory_id=_DM_PARENT, store='mem0', project_id='test', cascade=True
+        )
+
+        assert sorted(graph.deleted) == sorted([_DM_CHILD_A, _DM_CHILD_B, _DM_PARENT])
+
+    @pytest.mark.asyncio
+    async def test_children_are_deleted_strictly_before_the_parent(self, service):
+        """THE load-bearing ordering assertion, not decoration.
+
+        Parent-first would re-open precisely the orphan window this task
+        closes: a crash between the parent's delete and the children's
+        leaves live children whose parent_id points at a dead uuid — still
+        recognised as children, still suppressed from grouped search,
+        content unreachable while remaining in Qdrant. Children-first fails
+        safe: the surviving state is "parent alive, some children gone",
+        which the refusal gate still protects and an operator can retry.
+        """
+        graph = _DMGraph({_DM_PARENT: [_DM_CHILD_A, _DM_CHILD_B]}).install(service)
+
+        await service.delete_memory(
+            memory_id=_DM_PARENT, store='mem0', project_id='test', cascade=True
+        )
+
+        assert graph.deleted[-1] == _DM_PARENT
+        assert graph.deleted.index(_DM_CHILD_A) < graph.deleted.index(_DM_PARENT)
+        assert graph.deleted.index(_DM_CHILD_B) < graph.deleted.index(_DM_PARENT)
+
+    @pytest.mark.asyncio
+    async def test_every_child_gets_its_own_journal_row(self, service):
+        """Re-entering the SAME guarded delete per child is what buys this.
+
+        A second, unguarded `mem0.delete` loop would have deleted the same
+        records while producing one row for the parent only — the PRD's
+        "children deleted too, journalled" signal, silently absent.
+        """
+        journal = _mm_install_journal(service)
+        _DMGraph({_DM_PARENT: [_DM_CHILD_A, _DM_CHILD_B]}).install(service)
+
+        await service.delete_memory(
+            memory_id=_DM_PARENT, store='mem0', project_id='test', cascade=True
+        )
+
+        rows = {
+            call.kwargs['params']['memory_id']: call.kwargs
+            for call in journal.log_write_op.call_args_list
+        }
+        assert set(rows) == {_DM_CHILD_A, _DM_CHILD_B, _DM_PARENT}
+        for row in rows.values():
+            assert row['operation'] == 'delete_memory'
+            json.dumps(row['params'])  # rows are persisted as JSON
+        for child in (_DM_CHILD_A, _DM_CHILD_B):
+            assert rows[child]['params']['cascade'] is True
+            # The row must say WHOSE cascade took this record; without it a
+            # cascaded delete is indistinguishable from a direct one.
+            assert rows[child]['params']['cascade_parent_id'] == _DM_PARENT
+        parent_row = rows[_DM_PARENT]
+        assert sorted(parent_row['result_summary']['cascaded_child_ids']) == sorted(
+            [_DM_CHILD_A, _DM_CHILD_B]
+        )
+
+    @pytest.mark.asyncio
+    async def test_reported_ids_name_the_whole_destroyed_set(self, service):
+        """A grandchild is destroyed, so it must be NAMED as destroyed.
+
+        `cascaded_child_ids` is the only account of the operation an MCP
+        caller can read — they never see the server's journal. Reporting
+        the DIRECT children only would tell them a three-level cascade
+        A→B→C destroyed just B, leaving them to reconstruct the rest from a
+        log they have no access to.
+        """
+        journal = _mm_install_journal(service)
+        buffer = _dm_event_buffer(service)
+        grandchild = _dm_uuid('9a9a')
+        graph = _DMGraph(
+            {_DM_PARENT: [_DM_CHILD_A], _DM_CHILD_A: [grandchild]}
+        ).install(service)
+
+        result = await service.delete_memory(
+            memory_id=_DM_PARENT, store='mem0', project_id='test', cascade=True
+        )
+
+        assert graph.deleted == [grandchild, _DM_CHILD_A, _DM_PARENT]
+        # Deepest-first, mirroring the order they were destroyed in.
+        assert result['cascaded_child_ids'] == [grandchild, _DM_CHILD_A]
+        parent_row = next(
+            call.kwargs for call in journal.log_write_op.call_args_list
+            if call.kwargs['params']['memory_id'] == _DM_PARENT
+        )
+        assert parent_row['result_summary']['cascaded_child_ids'] == [
+            grandchild, _DM_CHILD_A,
+        ]
+        parent_event = next(
+            call.args[0] for call in buffer.push.call_args_list
+            if call.args[0].payload['memory_id'] == _DM_PARENT
+        )
+        assert parent_event.payload['cascaded_child_ids'] == [
+            grandchild, _DM_CHILD_A,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_self_parent_terminates_and_deletes_once(self, service):
+        """A record whose own parent_id points at itself.
+
+        Without a visited set this recurses until RecursionError; with a
+        naive post-cascade count it would refuse forever, because the record
+        is its own surviving child right up until it is deleted.
+        """
+        graph = _DMGraph({_DM_PARENT: [_DM_PARENT]}).install(service)
+
+        await service.delete_memory(
+            memory_id=_DM_PARENT, store='mem0', project_id='test', cascade=True
+        )
+
+        assert graph.deleted == [_DM_PARENT]
+
+    @pytest.mark.asyncio
+    async def test_parent_cycle_terminates_and_deletes_each_once(self, service):
+        graph = _DMGraph(
+            {_DM_PARENT: [_DM_CHILD_A], _DM_CHILD_A: [_DM_PARENT]}
+        ).install(service)
+
+        await service.delete_memory(
+            memory_id=_DM_PARENT, store='mem0', project_id='test', cascade=True
+        )
+
+        assert graph.deleted == [_DM_CHILD_A, _DM_PARENT]
+
+    @pytest.mark.asyncio
+    async def test_fan_out_beyond_one_scroll_page(self, service):
+        """The listing is bounded; the CASCADE must not be.
+
+        Stopping at one page would delete the parent while later-page
+        children survived — a silent orphan produced by the very operation
+        meant to prevent one.
+        """
+        kids = [_dm_uuid(f'c{i}') for i in range(5)]
+        graph = _DMGraph({_DM_PARENT: kids}, page_size=2).install(service)
+
+        await service.delete_memory(
+            memory_id=_DM_PARENT, store='mem0', project_id='test', cascade=True
+        )
+
+        assert sorted(graph.deleted) == sorted([*kids, _DM_PARENT])
+        assert graph.deleted[-1] == _DM_PARENT
+
+    @pytest.mark.asyncio
+    async def test_partial_cascade_refuses_the_parent(self, service):
+        """Corroborate AFTER acting.
+
+        A child delete that DID NOT TAKE — the backend reported success and
+        the record is still there — must stop the parent's deletion.
+        Without this re-read the operation reports success while leaving an
+        orphan, the exact silent partial-failure class INV-3 exists to
+        close.
+
+        Note the survivor is a child this cascade already TRIED to delete.
+        A corroboration that excluded everything the cascade touched would
+        explain this away as "already handled" and find nothing — which is
+        why survivors are measured against the enclosing frames' in-flight
+        set only. (A child that merely raced in AFTER the cascade started
+        needs no refusal: the re-scroll loop picks it up and deletes it.)
+        """
+        from fused_memory.memory_metadata import ParentHasChildrenError
+
+        graph = _DMGraph({_DM_PARENT: [_DM_CHILD_A]}).install(service)
+
+        async def delete_that_silently_does_not_take(memory_id, scope):
+            graph.deleted.append(memory_id)
+            if memory_id == _DM_CHILD_A:
+                return {'message': 'deleted'}  # ...but the record survives
+            return await graph.delete(memory_id, scope)
+
+        service.mem0.delete = AsyncMock(side_effect=delete_that_silently_does_not_take)
+
+        with pytest.raises(ParentHasChildrenError) as excinfo:
+            await service.delete_memory(
+                memory_id=_DM_PARENT, store='mem0', project_id='test', cascade=True
+            )
+
+        assert excinfo.value.child_ids == [_DM_CHILD_A]
+        assert _DM_PARENT not in graph.deleted
+
+    @pytest.mark.asyncio
+    async def test_cascade_on_a_childless_entry_is_a_plain_delete(self, service):
+        graph = _DMGraph({}).install(service)
+
+        await service.delete_memory(
+            memory_id=_DM_PARENT, store='mem0', project_id='test', cascade=True
+        )
+
+        assert graph.deleted == [_DM_PARENT]
+        service.mem0.scroll_by_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cascade_on_a_graphiti_delete_is_refused(self, service):
+        """A request no store branch can honour is refused, not dropped.
+
+        `parent_id` is a Mem0 payload key, so the graphiti arm has nothing
+        to recurse on. Tolerating the flag deleted the edge and reported
+        plain success — while `log_write_op` and the `memory_deleted` event
+        still carried `cascade: True` with an empty `cascaded_child_ids`,
+        recording a cascade as requested-and-satisfied when nothing
+        recursive ever ran.
+        """
+        journal = _mm_install_journal(service)
+        buffer = _dm_event_buffer(service)
+
+        with pytest.raises(ValueError, match='cascade'):
+            await service.delete_memory(
+                memory_id=_DM_PARENT, store='graphiti', project_id='test',
+                cascade=True,
+            )
+
+        service.graphiti.remove_edge.assert_not_awaited()
+        journal.log_write_op.assert_not_awaited()
+        buffer.push.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cascade_defaults_to_false(self, service):
+        """The destructive path is opt-IN. A caller that never heard of this
+        contract gets the refusal, not a silent recursive delete."""
+        from fused_memory.memory_metadata import ParentHasChildrenError
+
+        graph = _DMGraph({_DM_PARENT: [_DM_CHILD_A]}).install(service)
+
+        with pytest.raises(ParentHasChildrenError):
+            await service.delete_memory(
+                memory_id=_DM_PARENT, store='mem0', project_id='test'
+            )
+        assert graph.deleted == []
+
+
+class TestListDescendantIds:
+    """The read-only enumeration the citation gate pre-flights on.
+
+    The tool layer has to answer "what would this cascade destroy?" BEFORE
+    deciding to destroy it, so this walk must see the same tree the cascade
+    walks, in the same order, while mutating nothing.
+    """
+
+    @pytest.mark.asyncio
+    async def test_two_level_tree_returns_every_descendant_deepest_first(
+        self, service
+    ):
+        """Same order the cascade destroys in — grandchild before child.
+
+        A gate that visited ids in a different order than the traversal it
+        gates would be reasoning about a different sequence than the one
+        that actually runs.
+        """
+        grandchild = _dm_uuid('9a1')
+        _DMGraph(
+            {
+                _DM_PARENT: [_DM_CHILD_A, _DM_CHILD_B],
+                _DM_CHILD_A: [grandchild],
+            }
+        ).install(service)
+
+        scan = await service.list_descendant_ids(_DM_PARENT, project_id='test')
+
+        assert sorted(scan.ids) == sorted([_DM_CHILD_A, _DM_CHILD_B, grandchild])
+        assert scan.ids.index(grandchild) < scan.ids.index(_DM_CHILD_A)
+        assert _DM_PARENT not in scan.ids
+
+    @pytest.mark.asyncio
+    async def test_fully_visible_tree_is_not_truncated(self, service):
+        grandchild = _dm_uuid('9a1')
+        _DMGraph(
+            {
+                _DM_PARENT: [_DM_CHILD_A, _DM_CHILD_B],
+                _DM_CHILD_A: [grandchild],
+            }
+        ).install(service)
+
+        scan = await service.list_descendant_ids(_DM_PARENT, project_id='test')
+
+        assert scan.truncated is False
+
+    @pytest.mark.asyncio
+    async def test_childless_target_scans_empty(self, service):
+        _DMGraph({}).install(service)
+
+        scan = await service.list_descendant_ids(_DM_PARENT, project_id='test')
+
+        assert scan == ([], False)
+
+    @pytest.mark.asyncio
+    async def test_scan_is_read_only(self, service):
+        """It runs BEFORE the caller has decided to delete anything.
+
+        A walk that deleted, journalled or emitted would turn the gate's
+        look-before-you-leap into the leap.
+        """
+        journal = _mm_install_journal(service)
+        buffer = _dm_event_buffer(service)
+        graph = _DMGraph({_DM_PARENT: [_DM_CHILD_A]}).install(service)
+
+        await service.list_descendant_ids(_DM_PARENT, project_id='test')
+
+        service.mem0.delete.assert_not_awaited()
+        assert graph.deleted == []
+        journal.log_write_op.assert_not_awaited()
+        buffer.push.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_self_parent_terminates(self, service):
+        _DMGraph({_DM_PARENT: [_DM_PARENT]}).install(service)
+
+        scan = await service.list_descendant_ids(_DM_PARENT, project_id='test')
+
+        assert scan.ids == []
+
+    @pytest.mark.asyncio
+    async def test_cycle_terminates_and_lists_each_id_once(self, service):
+        _DMGraph(
+            {_DM_PARENT: [_DM_CHILD_A], _DM_CHILD_A: [_DM_PARENT]}
+        ).install(service)
+
+        scan = await service.list_descendant_ids(_DM_PARENT, project_id='test')
+
+        assert scan.ids == [_DM_CHILD_A]
+
+    @pytest.mark.asyncio
+    async def test_partial_visibility_reports_truncated(self, service):
+        """THE load-bearing case.
+
+        A read-only walk cannot page past `_CHILD_SCAN_LIMIT` the way the
+        cascade can — the cascade only ever sees the next page because
+        deleting the previous one made it visible. So the enumeration has to
+        be able to say "I could not see all of them"; silently returning the
+        visible subset would let the gate read a partial set as complete and
+        clear a cascade over records it never checked.
+        """
+        _DMGraph(
+            {_DM_PARENT: [_DM_CHILD_A, _DM_CHILD_B]}, page_size=1
+        ).install(service)
+
+        scan = await service.list_descendant_ids(_DM_PARENT, project_id='test')
+
+        assert scan.truncated is True
+        assert scan.ids == [_DM_CHILD_A]

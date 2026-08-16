@@ -114,7 +114,31 @@ _ESCALATION_TOOLS = [
     'mcp__escalation__escalate_blocker',
 ]
 
-_ESCALATION_INSTRUCTIONS = """
+# Split (task 4169): the original single `_ESCALATION_INSTRUCTIONS` literal
+# ended with a paragraph telling every escalating role that `level=1` is "the
+# STEWARD's route, not yours" -- correct for the six non-steward escalating
+# roles below, but wrong for STEWARD itself, whose own body mandates
+# `escalate_blocker(..., level=1)` re-escalation in four places (Rule 2
+# be-conservative, Rule 6 wip_conflict/unmerged_state, MAX_TURNS,
+# CLI_INPUT_REJECTED -- see STEWARD's system_prompt below). Appending the
+# "not yours" gate after those mandates made the steward's LAST-read
+# instruction about escalation levels contradict its own mandated recourse.
+#
+# ESCALATION_LADDER_CORE carries the mechanics (what escalate_info /
+# escalate_blocker do, severity policy, the level=0-vs-1 ladder) and goes to
+# EVERY escalating role, steward included -- it is what the steward's own
+# level=1 mandates depend on. NON_STEWARD_LEVEL_GATE carries the "level=1 is
+# not yours" framing and goes to every escalating role EXCEPT steward.
+#
+# `_ESCALATION_INSTRUCTIONS` (the pre-split name) is kept alive as their
+# concatenation rather than renamed: (1) it keeps the six non-steward splice
+# sites below byte-identical to before the split, and (2)
+# escalation/src/escalation/server.py cites `_ESCALATION_INSTRUCTIONS` BY
+# NAME in the docstring of its level-1 observability warning. Plain `+`
+# concatenation, like every other splice in this file -- these prompts are
+# deliberately not f-strings (see the MANDATED_STAGING_COMMAND note above).
+# Regression-guarded by orchestrator/tests/test_roles_escalation_ladder.py.
+ESCALATION_LADDER_CORE = """
 ## Escalation
 
 If you encounter a problem you cannot solve at your scope, you can escalate:
@@ -162,10 +186,30 @@ If an agent files `critical` or `urgent`, the escalation server **downgrades it 
 `[downgraded:critical]` / `[downgraded:urgent]` suffix).  Self-assigning a higher
 severity buys no faster human attention — only noise.
 
-To reach a human, use the existing ladder: file with `escalate_blocker` (L0 →
-steward); if the steward cannot resolve it, re-escalate with `level=1` (steward →
-auto-watcher; auto-watcher promotes to L2 if a human is needed).
+To reach a human, use the existing ladder: agents file with `escalate_blocker`
+at L0 → steward; the steward re-escalates unresolved issues by passing
+`level=1` to `escalate_blocker` (steward → auto-watcher; auto-watcher promotes
+to L2 if a human is needed).  `escalate_blocker` accepts only `level=0` (the
+default) or `level=1` — anything else is rejected with an `{'error': ...}`
+response and nothing is filed.
 """
+
+# The "level=1 is not yours" framing. Correct for every escalating role
+# EXCEPT steward -- see the comment above ESCALATION_LADDER_CORE. Splice
+# order is always core-then-gate; the two never appear reordered or split
+# across roles (test_roles_escalation_ladder.py::test_composite_is_core_plus_gate).
+NON_STEWARD_LEVEL_GATE = """
+**`level=1` is the STEWARD's route, not yours.** As a non-steward role your
+filings belong at `level=0` (the default): that is where the steward — the
+consumer that can actually resolve your blocker — reads them.  Level 1 skips
+the steward entirely and goes to the auto-watcher.  The server does not reject
+a non-steward `level=1`, because `agent_role` is caller-supplied and a reject
+would lose a legitimate steward filing — but every one is **logged at WARNING
+naming your role and task_id**.  Filing at level 1 to jump the queue buys no
+faster resolution, only an audit trail showing you bypassed your handler.
+"""
+
+_ESCALATION_INSTRUCTIONS = ESCALATION_LADDER_CORE + NON_STEWARD_LEVEL_GATE
 
 _MEMORY_TOOLS = [
     'mcp__fused-memory__add_memory',
@@ -1441,8 +1485,12 @@ wording differs.
 
 1. **Stay in scope.** Only fix what the escalation describes. Do not refactor surrounding
    code or add features.
-2. **Be conservative.** If the fix is not obvious, re-escalate with level=1 (steward→auto-watcher; auto-watcher promotes to L2 if a human is needed)
-   via `escalate_blocker` rather than guessing.
+2. **Be conservative.** If the fix is not obvious, re-escalate by calling
+   `escalate_blocker(..., level=1)` (steward→auto-watcher; auto-watcher promotes to L2
+   if a human is needed) rather than guessing.  The `level=1` argument is what makes it
+   a re-escalation: a filing left at the default `level=0` lands back in your own
+   queue, is never read by the auto-watcher, and is eligible for the workflow's
+   level=0 dismissal sweeps.
 3. **Verify fixes.** Run the relevant tests after making changes.
 4. **Resolve each escalation** by calling `resolve_issue` with a summary of what you did.
 5. **For raw suggestions:** Read the code at each location, search memory and tasks for
@@ -1453,8 +1501,9 @@ wording differs.
    uncommitted work; `unmerged_state` means project_root already had UU/AA/DD markers
    before the merge attempted to advance. Do NOT run destructive git commands (`git reset`,
    `git checkout -- .`, `git stash drop/clear`, `git restore`, `git clean`) against the
-   main project root. Instead, immediately re-escalate to level-1 via `escalate_blocker`
-   preserving the original category (`wip_conflict` or `unmerged_state`) and
+   main project root. Instead, immediately re-escalate by calling
+   `escalate_blocker(..., level=1)`, preserving the original category
+   (`wip_conflict` or `unmerged_state`) and
    `suggested_action='manual_intervention'`.
 
 ## CRITICAL: Git Staging Rules
@@ -1485,10 +1534,26 @@ choose your response:
 - **MAX_TURNS** — the agent ran out of its turn budget without completing.
   This is NOT transient. Retrying the same inputs will fail the same way.
   Either the task is under-specified, the agent is thrashing, or the budget
-  is too low. Prefer re-escalating to level=1 unless you can narrow the task
-  or raise the budget deliberately.
-- **EMPTY_OUTPUT** — the agent returned nothing. This may be transient (CLI
-  glitch); one retry is reasonable before re-escalating.
+  is too low. Prefer re-escalating via `escalate_blocker(..., level=1)` unless
+  you can narrow the task or raise the budget deliberately.
+- **EMPTY_OUTPUT** (`subtype='error_empty_output'`) — the agent WAS dispatched
+  and the model ran, but the invocation came back with no output. This may be
+  transient (CLI glitch); one retry is reasonable before re-escalating. Do not
+  confuse this with CLI_INPUT_REJECTED below: here the agent was actually asked
+  the question, so turns/cost may be non-zero and partial work may exist.
+- **CLI_INPUT_REJECTED** (`subtype='error_cli_input_rejected'`) — the CLI
+  rejected the invocation *before any model turn*: turns=0, $0.00 billed, the
+  agent was never asked anything at all (esc-3118-1: the prompt never reached
+  the CLI's stdin, and it exited on argument validation before contacting the
+  API). The summary carries the CLI's real stderr cause — quote it when you
+  re-escalate. The orchestrator has ALREADY retried this automatically at the
+  transport layer (`invoke_with_cap_retry` re-dispatches once with a fresh
+  session), and for planning also at the workflow layer. So by the time you see
+  it, the automatic retries are spent and a second occurrence is NOT transient
+  — it means a deterministic cause (a genuinely blank prompt, or a persistent
+  wrapper/stdio bug) that needs a human. Re-escalate via
+  `escalate_blocker(..., level=1)` with the stderr cause rather than retrying
+  again.
 - **API_ERROR** — HTTP error from the provider. Usually transient; account
   failover often helps. Retry is reasonable.
 - **TIMED_OUT** — subprocess wall-clock timeout. Inspect whether the task
@@ -1579,7 +1644,7 @@ convert it into a task candidate and then close it:
       ticket id (or the created/combined task id) so the same note is not swept
       again on a later session. An info-note that describes NO actionable work
       is left as-is — only work-describing notes become candidates.
-""" + _ESCALATION_INSTRUCTIONS,
+""" + ESCALATION_LADDER_CORE,
     allowed_tools=[
         'Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep',
         *_ESCALATION_TOOLS,

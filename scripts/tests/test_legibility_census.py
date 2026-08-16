@@ -16,6 +16,7 @@ state.
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import logging
 from datetime import UTC, datetime, timedelta
@@ -28,6 +29,7 @@ import digest as digest_mod
 import inventory
 import pytest
 from legibility import census_trigger
+from shared.cap_markers import BLOCKING_BANNER_MARKERS, REAL_CLI_CAP_MESSAGES
 
 import config as config_mod
 
@@ -621,6 +623,54 @@ def test_preflight_headroom_invocation_error_defers_fail_safe():
         )
 
     result = mod.preflight_headroom(raising_invoke, model="sonnet")
+    assert result.ok is False
+    assert result.reason
+
+
+# ---------------------------------------------------------------------------
+# task 3645 / DEFECT 1: the probe's marker list must cover the cap text the
+# CLI ACTUALLY emits, not just the four strings this module happened to
+# start with.
+#
+# The corpus is IMPORTED from shared.cap_markers rather than restated here.
+# That is the whole point: the marker list is a CONTRACT checked against real
+# CLI transcripts at both consuming sites, so a future cap rewording is one
+# corpus edit that turns this suite AND shared/tests/test_cap_markers.py red
+# until the markers cover it — instead of the situation this task found, where
+# the same blind spot had to be discovered independently at two sites.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("message", REAL_CLI_CAP_MESSAGES)
+def test_preflight_headroom_defers_on_every_real_cli_cap_message(message):
+    """Every verbatim real-CLI cap message defers, naming the matched marker.
+
+    Fails today on the weekly-limit, "You've used all available credits" and
+    "You're out of extra usage" messages: none of them contains any of the
+    four original markers, so a weekly cap sailed through the preflight and
+    every subsequent verify call was fail-closed rejected as an ordinary
+    verdict.
+    """
+    fake_invoke = _make_fake_invoke(default=message)
+    result = mod.preflight_headroom(fake_invoke, model="sonnet")
+    assert result.ok is False, f"real CLI cap message passed the probe: {message!r}"
+    assert result.reason
+    # The reason must quote the marker that fired, so an operator reading the
+    # log can tell WHICH signal tripped rather than just that something did.
+    assert "banner marker" in result.reason
+
+
+def test_preflight_headroom_defers_on_ticket_weekly_limit_phrasing():
+    """The exact phrasing quoted in task 3645, with a hyphen separator.
+
+    The corpus carries the middot spelling (the first-hand transcript); the
+    ticket quotes the hyphen one.  Both are pinned because the separator is
+    incidental punctuation the CLI has already varied, and a guard that
+    depends on it is one release away from silence.
+    """
+    fake_invoke = _make_fake_invoke(
+        default="You've hit your weekly limit - resets Aug 5, 11am"
+    )
+    result = mod.preflight_headroom(fake_invoke, model="sonnet")
     assert result.ok is False
     assert result.reason
 
@@ -1411,6 +1461,9 @@ def test_run_census_defers_on_headroom_banner(tmp_path, caplog):
 
     assert outcome.status == "deferred"
     assert outcome.reason
+    # The two defer sites must be distinguishable by FIELD, not by parsing
+    # prose out of a shared reason string (task 3645).
+    assert outcome.deferred_stage == "preflight"
 
     assert len(fake_escalate_fn.calls) == 1
     call = fake_escalate_fn.calls[0]
@@ -1423,6 +1476,85 @@ def test_run_census_defers_on_headroom_banner(tmp_path, caplog):
     assert not kwargs["codebook_path"].exists()
     assert not kwargs["census_state_path"].exists()
     assert not kwargs["report_path"].exists()
+
+
+# ---------------------------------------------------------------------------
+# task 3645 / DEFECT 2: the stage-boundary re-probe.
+#
+# Headroom was probed exactly ONCE, at preflight. A cap arriving during the
+# long, expensive gap between preflight and verify was never noticed -- and
+# because the default verifier fails CLOSED per cluster, it then presented as
+# an ordinary run in which every cluster happened to be rejected.
+# ---------------------------------------------------------------------------
+
+def _capped_after_preflight_invoke(cap_message=REAL_CLI_CAP_MESSAGES[0]):
+    """`invoke` that passes the FIRST headroom probe and fails every later one.
+
+    Keys on the probe prompt specifically rather than on call ordinal, because
+    mining shares this same seam: mining prompts must keep returning real
+    judgments (otherwise there would be no novel cluster to verify, and the
+    gate under test would be skipped for the wrong reason).
+    """
+    probes = []
+
+    def response_fn(prompt, model):
+        if prompt == mod._HEADROOM_PROBE_PROMPT:
+            probes.append(prompt)
+            return "pong" if len(probes) == 1 else cap_message
+        return _happy_invoke_response(prompt, model)
+
+    return response_fn
+
+
+def test_run_census_defers_at_verify_boundary_when_cap_arrives_after_preflight(
+    tmp_path, caplog
+):
+    """A cap arriving after preflight aborts BEFORE verify, persisting nothing.
+
+    The load-bearing assertions are the three `not ... .exists()` ones. They
+    prove no matrix was rendered from a truncated verified list, no
+    reject_candidate burned a cluster that was never actually adjudicated, and
+    -- most importantly -- last_census_at never advanced past a window that
+    was not adjudicated, so these sightings ARE re-mined on the next run. The
+    mining spend is sunk; the state stays honest.
+    """
+    batch = [_hand_digest("novel-verified", "a genuinely new confusion shape")]
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_capped_after_preflight_invoke()),
+        batch_source=[batch],
+        verify_fn=_poison("verify_fn"),
+        synthesize_fn=_poison("synthesize_fn"),
+        commit=_poison("commit"),
+    )
+    fake_submit_fn = kwargs["submit_fn"]
+    fake_escalate_fn = kwargs["escalate_fn"]
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "deferred"
+    assert outcome.deferred_stage == "verify"
+    assert outcome.unverified_clusters == 1
+    assert outcome.reason
+    assert "verify" in outcome.reason.lower(), "the reason names the stage that was skipped"
+
+    # verify_fn is a _poison: reaching it at all would have raised.
+    assert fake_submit_fn.calls == []
+    assert not kwargs["report_path"].exists()
+    assert not kwargs["codebook_path"].exists()
+    assert not kwargs["census_state_path"].exists()
+
+    assert len(fake_escalate_fn.calls) == 1
+    call = fake_escalate_fn.calls[0]
+    assert call.get("category") == "infra_issue"
+    assert call.get("severity") == "info"
+    summary = call.get("summary") or ""
+    detail = call.get("detail") or ""
+    assert "verify" in (summary + detail).lower(), "the escalation names the stage"
+    assert "1" in (summary + detail), "the escalation names the unverified count"
+
+    assert sum(1 for r in caplog.records if r.levelno >= logging.WARNING) >= 1
 
 
 # ---------------------------------------------------------------------------
@@ -2929,8 +3061,21 @@ def test_default_batch_source_passes_resolved_archive_roots_to_enumerate(tmp_pat
 # ---------------------------------------------------------------------------
 
 class _FakeHttpxResponse:
+    """A 200 `application/json` reply, i.e. the STATELESS fused-memory shape.
+
+    `status_code` and `headers` were added for task 3644: `_post_mcp_tool_call`
+    now delegates to `census_trigger.post_mcp_tool_call`, which reads
+    `status_code` (to detect the stateful escalation server's 400 "Missing
+    session ID") and `content-type` (to detect an SSE-framed body) before
+    decoding. Without them this fake would die on an AttributeError and stop
+    exercising the real code path -- so the task-2953 header contract below
+    keeps being asserted against the transport that actually ships, not
+    against a fake the implementation has outgrown."""
+
     def __init__(self, payload):
         self._payload = payload
+        self.status_code = 200
+        self.headers = {"content-type": "application/json"}
 
     def raise_for_status(self):
         pass
@@ -3067,3 +3212,865 @@ def test_main_wires_per_stage_timeouts_into_run_census(tmp_path, monkeypatch):
     # (3) synthesize_fn -> the one large Fable call carries 1800.
     kwargs["synthesize_fn"]([{"title": "x"}], model="fable")
     assert recorded[-1] == {"model": "fable", "timeout": 1800}
+
+
+# ---------------------------------------------------------------------------
+# task 3645 / DEFECT 3: a cap arriving DURING verification must never be
+# laundered into a verdict.
+#
+# _build_default_verify_fn fails CLOSED per cluster: any invocation error or
+# parse failure appends the cluster to `rejected` and continues. That is the
+# right default for a genuinely unverifiable CLAIM, and exactly wrong for an
+# infra failure -- a cap mid-verify silently mass-rejects the remaining
+# population, and the run exits 0 looking unremarkable.
+#
+# Three detectors, ordered cheapest-first. These two fire at the FIRST
+# corrupted cluster, which is what a periodic counter alone cannot do.
+# ---------------------------------------------------------------------------
+
+def _verdict(verified=True):
+    return json.dumps({"verified": verified, "reason": "because"})
+
+
+def _clusters(n):
+    return [{"title": f"cluster-{i}"} for i in range(n)]
+
+
+def _make_recording_probe(*results):
+    """Fake `headroom_probe() -> HeadroomResult` seam, recording its calls.
+
+    Returns the i-th result for the i-th call, repeating the last one after
+    that, so a test can say "healthy, then capped" without counting calls.
+    """
+    calls = []
+
+    def probe():
+        calls.append(len(calls))
+        return results[min(len(calls) - 1, len(results) - 1)]
+
+    probe.calls = calls
+    return probe
+
+
+@pytest.mark.parametrize("message", REAL_CLI_CAP_MESSAGES)
+def test_every_real_cli_cap_message_fails_to_parse_as_a_verdict(message):
+    """The load-bearing premise of detector (a), pinned directly.
+
+    (a) scans for a banner ONLY on the parse-failure path, and that loses no
+    detection precisely because a real CLI cap banner is plain prose that
+    `parse_coder_output` cannot turn into a verdict. Nothing pinned that
+    premise: a newly-observed cap phrasing that happened to embed a `{...}`
+    fragment (parse_coder_output brace-slices prose) would PARSE, bypass (a)
+    entirely, and fall through to the weaker (c) backstop with every test
+    still green.
+
+    Parametrized over the whole corpus so the "one corpus edit turns both
+    suites red until the markers cover it" property holds for the in-verify
+    detector too, not just the preflight probe.
+    """
+    with pytest.raises(coder.CoderParseError):
+        coder.parse_coder_output(message)
+
+
+@pytest.mark.parametrize("message", REAL_CLI_CAP_MESSAGES)
+def test_default_verify_fn_raises_when_the_raw_reply_carries_a_banner(message):
+    """Detector (a): the cap text arrives as the verify reply itself.
+
+    This is the common case -- the CLI prints its cap banner to stdout, which
+    parse_coder_output would otherwise turn into a parse failure and thus a
+    rejection. The banner-matching CONTENT is only the TRIGGER: a probe
+    CONFIRMS the cap before the run is aborted, so the detector can never
+    decide from content alone that the account is capped.
+
+    Parametrized over every recorded real-CLI cap message, so adding a newly
+    observed phrasing to the corpus exercises this detector too rather than
+    only the marker list.
+    """
+    cap = message
+    replies = [_verdict(), _verdict(), cap, _verdict(), _verdict()]
+    calls = []
+
+    def invoke(prompt, model):
+        calls.append(prompt)
+        return replies[len(calls) - 1]
+
+    probe = _make_recording_probe(
+        mod.HeadroomResult(ok=False, reason="probe reply carries a banner marker: 'weekly limit'")
+    )
+    verify_fn = mod._build_default_verify_fn(
+        "/tmp/root", invoke, headroom_probe=probe, probe_every=100,
+    )
+
+    with pytest.raises(mod.CensusHeadroomExhausted) as excinfo:
+        verify_fn(_clusters(5), model="sonnet")
+
+    exc = excinfo.value
+    assert exc.stage == "verify"
+    assert exc.reason and "banner" in exc.reason.lower()
+    assert exc.verified == 2, "the two clusters adjudicated before the cap"
+    assert exc.unverified == 3, "the hitting cluster plus the two never attempted"
+    assert len(probe.calls) == 1, "exactly one confirming probe, on a path that already failed"
+
+
+# ---------------------------------------------------------------------------
+# task 3645 / REVIEW FIX, part 1/2: detector (a) must never re-read a
+# WELL-FORMED verdict as a cap banner.
+#
+# The verify reply is a model-authored {"verified":…, "reason":…} whose reason
+# legitimately QUOTES the cluster under adjudication -- and this repo's
+# codebook is dominated by clusters ABOUT usage/weekly limits
+# (docs/legibility/confusion-codebook.yaml carries ~15 such sightings at lines
+# 569, 575, 925, 985, 1048-1163). A loose OR-substring scan over the whole raw
+# reply therefore fires on ordinary healthy output.
+#
+# The consequence is worse than merely over-deferring: _defer returns before
+# every write AND before advance_census_state, so last_census_at is untouched,
+# the next run re-mines the same window, re-hits the same cluster and aborts
+# again -- a permanent census stall plus a stream of false infra_issue
+# escalations claiming the account is capped.
+# ---------------------------------------------------------------------------
+
+def _cap_themed_verdict(marker, *, verified=True):
+    """A WELL-FORMED verdict whose `reason` quotes a cap-themed cluster.
+
+    This is ordinary healthy verifier output, not a banner: the model is
+    adjudicating a confusion cluster that happens to be ABOUT usage limits.
+    """
+    return json.dumps(
+        {
+            "verified": verified,
+            "reason": (
+                "Confirmed against main: the watcher rotation was interrupted "
+                f"by a {marker}; the 'continue where you left off' resume "
+                "prompt appears at turns 17/27."
+            ),
+        }
+    )
+
+
+@pytest.mark.parametrize("marker", BLOCKING_BANNER_MARKERS)
+def test_default_verify_fn_does_not_read_a_cap_themed_verdict_as_a_banner(marker):
+    """A reply that PARSES into a verdict IS a verdict, whatever it quotes.
+
+    Parametrized over every marker in the shared contract, so the guarantee is
+    "no marker can be smuggled through a reason string", not "the two the test
+    author happened to think of".
+    """
+    def invoke(prompt, model):
+        return _cap_themed_verdict(marker)
+
+    probe = _make_recording_probe(
+        mod.HeadroomResult(ok=False, reason="must never be consulted on a parsed verdict")
+    )
+    verify_fn = mod._build_default_verify_fn(
+        "/tmp/root", invoke, headroom_probe=probe, probe_every=100,
+    )
+
+    result = verify_fn(_clusters(3), model="sonnet")
+
+    assert [c["title"] for c in result["verified"]] == ["cluster-0", "cluster-1", "cluster-2"]
+    assert result["rejected"] == []
+    assert probe.calls == [], "a parsed verdict is never a cap, so nothing to confirm"
+
+
+@pytest.mark.parametrize("marker", ["usage limit", "weekly limit"])
+def test_default_verify_fn_reads_a_cap_themed_refutation_as_an_ordinary_rejection(marker):
+    """`verified: false` about a cap-themed cluster is an ordinary verdict too.
+
+    The refutation half of the same class: a well-formed rejection must reject,
+    not abort the census.
+    """
+    def invoke(prompt, model):
+        return _cap_themed_verdict(marker, verified=False)
+
+    probe = _make_recording_probe(mod.HeadroomResult(ok=False, reason="must never be consulted"))
+    verify_fn = mod._build_default_verify_fn(
+        "/tmp/root", invoke, headroom_probe=probe, probe_every=100,
+    )
+
+    result = verify_fn(_clusters(2), model="sonnet")
+
+    assert result["verified"] == []
+    assert [c["title"] for c in result["rejected"]] == ["cluster-0", "cluster-1"]
+    assert probe.calls == []
+
+
+def test_run_census_completes_when_the_real_verifier_returns_cap_themed_verdicts(tmp_path):
+    """END-TO-END: a cap-themed verdict must not stall the census.
+
+    Uses the REAL `_build_default_verify_fn`, not a fake, so the whole
+    detector -> _defer -> abort-before-persistence chain is in the loop.
+
+    The load-bearing assertions are that report_path / codebook_path /
+    census_state_path all EXIST -- i.e. advance_census_state ran and
+    last_census_at MOVED. That is what pins this defect as non-self-
+    perpetuating: with the pre-parse scan in place the run aborts before every
+    write, last_census_at is untouched, and the next run re-mines the same
+    window, re-hits the same cluster and aborts again, forever.
+    """
+    verdict = _cap_themed_verdict("usage limit")
+
+    def response_fn(prompt, model):
+        if prompt == mod._HEADROOM_PROBE_PROMPT:
+            return "pong"
+        if prompt.startswith("You are the periodic-census verifier"):
+            return verdict
+        return _happy_invoke_response(prompt, model)
+
+    fake_invoke = _make_fake_invoke(response_fn)
+    fake_submit_fn = _make_fake_submit_fn()
+    fake_escalate_fn = _make_fake_escalate_fn()
+
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=fake_invoke,
+        batch_source=[[_hand_digest("novel-verified", "a genuinely new confusion shape")]],
+        verify_fn=mod._build_default_verify_fn(str(tmp_path), fake_invoke),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=fake_submit_fn,
+        escalate_fn=fake_escalate_fn,
+        commit=_make_fake_commit(),
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status != "deferred", (
+        "a cap-themed verdict is healthy output, not a cap: "
+        f"deferred_stage={outcome.deferred_stage!r} reason={outcome.reason!r}"
+    )
+    assert outcome.deferred_stage is None
+    assert kwargs["report_path"].exists(), "the report was written"
+    assert kwargs["codebook_path"].exists(), "the codebook merge was persisted"
+    assert kwargs["census_state_path"].exists(), (
+        "advance_census_state ran: last_census_at MOVED, so the next run does "
+        "not re-mine this window and re-hit the same cluster forever"
+    )
+    assert len(fake_submit_fn.calls) == 1, "the verified cluster was filed"
+    assert not any(
+        c.get("category") == "infra_issue" for c in fake_escalate_fn.calls
+    ), "no false 'the account is capped' escalation"
+
+
+# ---------------------------------------------------------------------------
+# task 3645 / REVIEW FIX, part 2/2: the RESIDUAL half of the same false-
+# positive class.
+#
+# Confining the scan to parse FAILURES stops a well-formed verdict being
+# re-read as a banner, but an unparseable reply is still arbitrary model
+# output about cap-related subject matter: if the model ignores the prompt's
+# "STRICT JSON ONLY (no prose, no markdown fences)" instruction and answers in
+# prose about a usage-limit cluster, the marker still matches and the run
+# still aborts with nothing written -- the identical self-perpetuating stall,
+# just reached less often.
+#
+# The principle these pin: banner-matching CONTENT may only TRIGGER a probe,
+# never itself decide that the account is capped.
+# ---------------------------------------------------------------------------
+
+_UNPARSEABLE_CAP_THEMED_PROSE = (
+    "Verified. The rotation really was interrupted by a usage limit at turns "
+    "17 and 27, per the digest."
+)
+
+
+def _prose_at_cluster_two_invoke():
+    """`invoke` returning STRICT-JSON-violating prose for cluster #2 of 4.
+
+    The prose is about a cap-themed cluster, so it matches a marker -- and it
+    is unparseable, so it reaches the scan. This is the residual case that
+    survives the parse-success split.
+    """
+    calls = []
+
+    def invoke(prompt, model):
+        calls.append(prompt)
+        if len(calls) == 2:
+            return _UNPARSEABLE_CAP_THEMED_PROSE
+        return _verdict()
+
+    return invoke
+
+
+def test_default_verify_fn_rejects_unparseable_cap_themed_prose_when_the_probe_says_healthy():
+    """A healthy probe means the marker matched CONTENT, not a real cap.
+
+    The fail-closed default for an unparseable verdict is preserved: the
+    cluster rejects and the loop runs to completion, exactly as it would for
+    any other malformed reply.
+    """
+    probe = _make_recording_probe(mod.HeadroomResult(ok=True))
+    verify_fn = mod._build_default_verify_fn(
+        "/tmp/root", _prose_at_cluster_two_invoke(), headroom_probe=probe, probe_every=100,
+    )
+
+    result = verify_fn(_clusters(4), model="sonnet")
+
+    assert len(probe.calls) == 1, "one confirming probe, only on the matched-marker path"
+    assert len(result["verified"]) == 3, "the loop ran to completion"
+    assert [c["title"] for c in result["rejected"]] == ["cluster-1"]
+
+
+def test_default_verify_fn_raises_when_an_unparseable_banner_reply_is_probe_confirmed():
+    """A probe that reports no capacity turns the same content into an abort."""
+    probe = _make_recording_probe(
+        mod.HeadroomResult(ok=False, reason="probe reply carries a banner marker: 'weekly limit'")
+    )
+    verify_fn = mod._build_default_verify_fn(
+        "/tmp/root", _prose_at_cluster_two_invoke(), headroom_probe=probe, probe_every=100,
+    )
+
+    with pytest.raises(mod.CensusHeadroomExhausted) as excinfo:
+        verify_fn(_clusters(4), model="sonnet")
+
+    exc = excinfo.value
+    assert exc.stage == "verify"
+    assert exc.verified == 1
+    assert exc.unverified == 3
+    reason = (exc.reason or "").lower()
+    assert "usage limit" in reason, "the reason names the matched marker"
+    assert "probe" in reason, "and says a probe confirmed it, not that content decided it"
+
+
+def test_default_verify_fn_never_infers_a_cap_from_content_without_a_probe():
+    """With no probe there is no way to confirm, so a cap is never inferred.
+
+    This is the whole principle in one assertion: content triggers, the probe
+    decides. Absent a probe, banner-matching content is just another
+    unparseable verdict.
+    """
+    verify_fn = mod._build_default_verify_fn("/tmp/root", _prose_at_cluster_two_invoke())
+
+    result = verify_fn(_clusters(4), model="sonnet")
+
+    assert len(result["verified"]) == 3
+    assert [c["title"] for c in result["rejected"]] == ["cluster-1"]
+
+
+def test_default_verify_fn_raises_when_an_invocation_error_reprobes_capped():
+    """Detector (b): a per-cluster invocation error, then a failing re-probe.
+
+    The cluster that hit the cap must NOT be recorded as rejected. Recording
+    it would be the defect in miniature: an infra failure written into the
+    codebook as a verdict about the claim.
+    """
+    calls = []
+
+    def invoke(prompt, model):
+        calls.append(prompt)
+        if len(calls) == 2:
+            raise coder.CoderInvocationError("claude CLI exited 1: simulated cap")
+        return _verdict()
+
+    probe = _make_recording_probe(
+        mod.HeadroomResult(ok=False, reason="probe reply carries a banner marker")
+    )
+    verify_fn = mod._build_default_verify_fn(
+        "/tmp/root", invoke, headroom_probe=probe, probe_every=100,
+    )
+
+    with pytest.raises(mod.CensusHeadroomExhausted) as excinfo:
+        verify_fn(_clusters(4), model="sonnet")
+
+    exc = excinfo.value
+    assert exc.stage == "verify"
+    assert exc.verified == 1
+    assert exc.unverified == 3
+    assert len(probe.calls) == 1, "exactly one re-probe, on a path that already failed"
+
+
+def test_default_verify_fn_still_rejects_when_the_reprobe_says_healthy():
+    """Detector (b), negative: a healthy re-probe preserves the fail-closed contract.
+
+    An invocation error with capacity still available means the claim really
+    could not be verified. That must keep rejecting exactly as it does today
+    -- the guard narrows the fail-closed default to non-cap causes, it does
+    not remove it.
+    """
+    calls = []
+
+    def invoke(prompt, model):
+        calls.append(prompt)
+        if len(calls) == 2:
+            raise coder.CoderInvocationError("claude CLI exited 1: unrelated outage")
+        return _verdict()
+
+    probe = _make_recording_probe(mod.HeadroomResult(ok=True))
+    verify_fn = mod._build_default_verify_fn(
+        "/tmp/root", invoke, headroom_probe=probe, probe_every=100,
+    )
+
+    result = verify_fn(_clusters(4), model="sonnet")
+
+    assert len(probe.calls) == 1
+    assert len(result["verified"]) == 3, "the loop ran to completion"
+    rejected_titles = {c["title"] for c in result["rejected"]}
+    assert rejected_titles == {"cluster-1"}, "the failing cluster rejects, as today"
+
+
+def test_default_verify_fn_without_probe_args_behaves_exactly_as_before():
+    """The pre-existing signature keeps working, unguarded and fail-closed.
+
+    Every existing call site and test passes no probe; they must be
+    completely unaffected by this work.
+    """
+    calls = []
+
+    def invoke(prompt, model):
+        calls.append(prompt)
+        if len(calls) == 2:
+            raise coder.CoderInvocationError("claude CLI exited 1: simulated outage")
+        return _verdict()
+
+    verify_fn = mod._build_default_verify_fn("/tmp/root", invoke)
+    result = verify_fn(_clusters(3), model="sonnet")
+
+    assert len(result["verified"]) == 2
+    assert [c["title"] for c in result["rejected"]] == ["cluster-1"]
+    assert result["fixed"] == []
+
+
+def test_run_census_aborts_cleanly_on_mid_verify_headroom_exhaustion(tmp_path, caplog):
+    """A CensusHeadroomExhausted raised INSIDE verify_fn aborts before any write.
+
+    `invoke` answers every headroom probe with "pong", so the stage-boundary
+    gate passes and this test isolates the in-verify path.
+
+    The three `not ... .exists()` assertions are the load-bearing ones: they
+    prove no matrix was rendered from the truncated `verified` list, no
+    reject_candidate burned a cluster that was never actually adjudicated, and
+    last_census_at never advanced past a window that was not adjudicated.
+    """
+    def raising_verify_fn(clusters, *, model):
+        raise mod.CensusHeadroomExhausted(
+            stage="verify",
+            reason="verify reply carries a banner marker: 'weekly limit'",
+            verified=1,
+            unverified=4,
+        )
+
+    fake_escalate_fn = _make_fake_escalate_fn()
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_three_novel_invoke),
+        batch_source=[_three_novel_batch()],
+        verify_fn=raising_verify_fn,
+        synthesize_fn=_poison("synthesize_fn"),
+        submit_fn=_make_fake_submit_fn(),
+        escalate_fn=fake_escalate_fn,
+        status_fetcher=_make_fake_status_fetcher(0),
+        commit=_poison("commit"),
+    )
+    fake_submit_fn = kwargs["submit_fn"]
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "deferred"
+    assert outcome.deferred_stage == "verify"
+    assert outcome.unverified_clusters == 4
+
+    # synthesize_fn and commit are _poison: reaching either would have raised.
+    assert fake_submit_fn.calls == []
+    assert not kwargs["report_path"].exists()
+    assert not kwargs["codebook_path"].exists()
+    assert not kwargs["census_state_path"].exists()
+
+    # Exactly one escalation -- the mass-rejection detector must NOT also fire,
+    # because the abort returns before it.
+    assert len(fake_escalate_fn.calls) == 1, fake_escalate_fn.calls
+    call = fake_escalate_fn.calls[0]
+    assert call["category"] == "infra_issue"
+    assert call["severity"] == "info"
+    blob = (call.get("summary") or "") + (call.get("detail") or "")
+    assert "verify" in blob.lower()
+    assert "4" in blob, "the escalation names the unverified count"
+    # BOTH counts, so the escalation sizes what the cap interrupted from
+    # either side -- CensusHeadroomExhausted carries `verified` precisely so
+    # an operator can tell "capped on cluster 2 of 5" from "capped on 5 of 5".
+    assert "1 cluster(s) verified" in blob, "and the count adjudicated BEFORE the cap"
+
+
+def test_run_census_calls_verify_fn_once_with_the_full_cluster_list(tmp_path):
+    """No-regression: the verify_fn(clusters, *, model) seam is UNCHANGED.
+
+    The obvious reading of "re-probe between verify batches" would have
+    run_census chunk the list and call verify_fn once per chunk — changing the
+    contract of an injected seam for every fake in this file and any custom
+    verifier. In-verify probing lives inside the DEFAULT verifier instead, so
+    this stays one call with the whole list.
+    """
+    fake_verify_fn = _make_fake_verify_fn(verified_titles=set(_THREE_NOVEL_TITLES))
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_three_novel_invoke),
+        batch_source=[_three_novel_batch()],
+        verify_fn=fake_verify_fn,
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_make_fake_submit_fn(),
+        escalate_fn=_make_fake_escalate_fn(),
+        status_fetcher=_make_fake_status_fetcher(0),
+        commit=_make_fake_commit(),
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    assert len(fake_verify_fn.calls) == 1, "one call, not one per batch"
+    assert len(fake_verify_fn.calls[0]["clusters"]) == 3, "the FULL cluster list"
+    assert fake_verify_fn.calls[0]["model"] == "sonnet"
+
+
+def test_default_verify_fn_probes_at_batch_boundaries_only():
+    """Detector (c): the periodic backstop probes between batches, not per cluster.
+
+    `invoke` returns a clean verdict every time, so neither the banner
+    detector nor the exception detector can fire — this isolates the backstop.
+    12 clusters at probe_every=5 means boundaries after clusters 5 and 10:
+    twice, not twelve times. The probe is cheap but not free, and verification
+    is already one agentic call per cluster.
+    """
+    probe = _make_recording_probe(mod.HeadroomResult(ok=True))
+    verify_fn = mod._build_default_verify_fn(
+        "/tmp/root", lambda prompt, model: _verdict(), headroom_probe=probe, probe_every=5,
+    )
+
+    result = verify_fn(_clusters(12), model="sonnet")
+
+    assert len(result["verified"]) == 12
+    assert len(probe.calls) == 2, "boundaries after clusters 5 and 10 only"
+
+
+def test_default_verify_fn_backstop_raises_at_the_first_failing_boundary():
+    """The backstop aborts at its boundary, leaving the rest untouched."""
+    probe = _make_recording_probe(
+        mod.HeadroomResult(ok=False, reason="probe reply carries a banner marker")
+    )
+    verify_fn = mod._build_default_verify_fn(
+        "/tmp/root", lambda prompt, model: _verdict(), headroom_probe=probe, probe_every=5,
+    )
+
+    with pytest.raises(mod.CensusHeadroomExhausted) as excinfo:
+        verify_fn(_clusters(12), model="sonnet")
+
+    exc = excinfo.value
+    assert exc.stage == "verify"
+    assert exc.verified == 5
+    assert exc.unverified == 7, "clusters 6-12, none of them adjudicated"
+    assert len(probe.calls) == 1
+
+
+def test_default_verify_fn_backstop_does_not_probe_after_the_last_cluster():
+    """No probe when nothing remains -- it would guard a stage already over."""
+    probe = _make_recording_probe(mod.HeadroomResult(ok=True))
+    verify_fn = mod._build_default_verify_fn(
+        "/tmp/root", lambda prompt, model: _verdict(), headroom_probe=probe, probe_every=5,
+    )
+
+    verify_fn(_clusters(5), model="sonnet")
+
+    assert probe.calls == [], "cluster 5 is the last one; there is nothing left to guard"
+
+
+def test_report_cost_note_counts_real_headroom_probes(tmp_path):
+    """The cost note reports the probes this run ACTUALLY made, not a literal 1.
+
+    A legibility tool that under-reports its own spend, in the very artifact
+    an operator reads to check --max-verify-clusters, is the same defect class
+    this pipeline exists to find.
+
+    A run with clusters to verify pays the preflight probe AND the
+    stage-boundary gate, so the honest count is at least 2.
+    """
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_three_novel_invoke),
+        batch_source=[_three_novel_batch()],
+        verify_fn=_make_fake_verify_fn(verified_titles=set(_THREE_NOVEL_TITLES)),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_make_fake_submit_fn(),
+        escalate_fn=_make_fake_escalate_fn(),
+        status_fetcher=_make_fake_status_fetcher(0),
+        commit=_make_fake_commit(),
+    )
+
+    mod.run_census(**kwargs)
+
+    cost_line = kwargs["report_path"].read_text(encoding="utf-8").split("## Cost", 1)[1]
+    assert "headroom-probe=1" not in cost_line, "the hardcoded literal must be gone"
+    assert "headroom-probe=2" in cost_line, "preflight + the pre-verify stage gate"
+
+
+def test_report_cost_note_reports_one_probe_when_nothing_is_verified(tmp_path):
+    """No clusters to verify -> the stage gate is skipped -> genuinely 1 probe.
+
+    The count must track what happened, in both directions: reading 2 here
+    would be over-reporting, which is the same dishonesty as under-reporting.
+    """
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[[_hand_digest("dup-1", "nothing new here")]],
+        verify_fn=_make_fake_verify_fn(),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_make_fake_submit_fn(),
+        escalate_fn=_make_fake_escalate_fn(),
+        status_fetcher=_make_fake_status_fetcher(0),
+        commit=_make_fake_commit(),
+    )
+
+    mod.run_census(**kwargs)
+
+    cost_line = kwargs["report_path"].read_text(encoding="utf-8").split("## Cost", 1)[1]
+    assert "verify=0" in cost_line
+    assert "headroom-probe=1" in cost_line
+
+
+# ---------------------------------------------------------------------------
+# task 3645 / AMENDMENT: the probe count must include the probes spent INSIDE
+# verification.
+#
+# run_census counted only its own two probes (preflight + the stage gate). The
+# three in-verify detectors probe through the `headroom_probe` seam, which
+# main() wires with no counter -- so a healthy 20-cluster run at
+# probe_every=5 really spends 1 + 1 + 3 = 5 trickle probes and the report
+# still printed `headroom-probe=2`. Under-reporting its own spend, in the very
+# artifact an operator reads to size a run, is the defect class this pipeline
+# exists to find.
+# ---------------------------------------------------------------------------
+
+_TWELVE_NOVEL = 12
+
+
+def _twelve_novel_invoke(prompt, model):
+    """Fake coder-LLM reply chooser yielding TWELVE distinct novel candidates.
+
+    Session ids are zero-padded (`nov-00` .. `nov-11`) because this chooser
+    keys on a substring and a bare `nov-1` is a prefix of `nov-10`/`nov-11`.
+    Twelve is the smallest count that crosses more than one probe_every=5
+    backstop boundary, so the cost note has something to under-report.
+    """
+    for i in range(_TWELVE_NOVEL):
+        if f"nov-{i:02d}" in prompt:
+            return json.dumps(
+                {
+                    "matches": [],
+                    "candidates": [
+                        {
+                            "title": f"novel cluster {i:02d}",
+                            "cause": f"cause for cluster {i:02d}",
+                            "area": "orchestrator",
+                            "origin_phase": "implement",
+                            "manifested_phase": "verify",
+                            "evidence_quote": f"quote for cluster {i:02d}",
+                        }
+                    ],
+                }
+            )
+    return json.dumps({"matches": [{"entry_id": "entry-a"}], "candidates": []})
+
+
+def _twelve_novel_batch():
+    return [_hand_digest(f"nov-{i:02d}", f"novel body {i:02d}") for i in range(_TWELVE_NOVEL)]
+
+
+def test_default_verify_fn_reports_the_headroom_probes_it_spent():
+    """The verifier reports its probe spend back in the result dict.
+
+    That report is the ONLY way run_census can know what the probes inside
+    verification cost: the seam is wired by main(), not by run_census, so a
+    counter would have to be threaded through a second wiring site that
+    nothing forces anyone to connect.
+    """
+    probe = _make_recording_probe(mod.HeadroomResult(ok=True))
+    verify_fn = mod._build_default_verify_fn(
+        "/tmp/root", lambda prompt, model: _verdict(), headroom_probe=probe, probe_every=5,
+    )
+
+    result = verify_fn(_clusters(12), model="sonnet")
+
+    assert len(probe.calls) == 2, "backstops after clusters 5 and 10"
+    assert result["headroom_probes"] == 2, "and the result SAYS so"
+
+
+def test_default_verify_fn_reports_zero_probes_when_it_has_no_probe_seam():
+    """No probe seam -> nothing spent -> the report says 0, not nothing."""
+    verify_fn = mod._build_default_verify_fn("/tmp/root", lambda prompt, model: _verdict())
+
+    result = verify_fn(_clusters(12), model="sonnet")
+
+    assert result["headroom_probes"] == 0
+
+
+def test_report_cost_note_counts_the_in_verify_backstop_probes(tmp_path):
+    """END-TO-END: the cost note counts the REAL verifier's own probes.
+
+    Wires the REAL `_build_default_verify_fn` with a real `preflight_headroom`
+    probe -- the production shape -- over 12 novel clusters at probe_every=5.
+    The honest count is 4: preflight, the pre-verify stage gate, and the two
+    backstops after clusters 5 and 10.
+
+    `test_report_cost_note_counts_real_headroom_probes` cannot catch this: it
+    injects a FAKE verify_fn over 3 clusters, so no in-verify probe is ever
+    spent in the scenario it pins.
+    """
+    def response_fn(prompt, model):
+        if prompt == mod._HEADROOM_PROBE_PROMPT:
+            return "pong"
+        if prompt.startswith("You are the periodic-census verifier"):
+            return _verdict()
+        return _twelve_novel_invoke(prompt, model)
+
+    fake_invoke = _make_fake_invoke(response_fn)
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=fake_invoke,
+        batch_source=[_twelve_novel_batch()],
+        verify_fn=mod._build_default_verify_fn(
+            str(tmp_path),
+            fake_invoke,
+            headroom_probe=functools.partial(
+                mod.preflight_headroom, fake_invoke, model="haiku",
+            ),
+            probe_every=5,
+        ),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_make_fake_submit_fn(),
+        escalate_fn=_make_fake_escalate_fn(),
+        status_fetcher=_make_fake_status_fetcher(0),
+        commit=_make_fake_commit(),
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done", f"reason={outcome.reason!r}"
+    cost_line = kwargs["report_path"].read_text(encoding="utf-8").split("## Cost", 1)[1]
+    assert "verify=12" in cost_line
+    assert "headroom-probe=4" in cost_line, (
+        "preflight + the stage gate + the two in-verify backstops -- "
+        f"got: {cost_line.splitlines()[:4]}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# task 3645 / AMENDMENT: `headroom_probe` is an INJECTED seam with no
+# exception contract.
+#
+# Production wires `preflight_headroom`, which folds any failure into
+# HeadroomResult(ok=False) -- but a seam that RAISES would escape _verify_fn,
+# sail past run_census's `except CensusHeadroomExhausted` and land in main()'s
+# hard-failure path: exit 1 plus a traceback escalation, after the whole
+# mining spend, on a path that has ALREADY failed once. That is strictly worse
+# than the deferral this feature exists to produce.
+# ---------------------------------------------------------------------------
+
+def _raising_probe(exc=None):
+    """A `headroom_probe` seam that raises instead of returning a verdict."""
+    def probe():
+        raise exc or RuntimeError("probe transport blew up")
+
+    return probe
+
+
+def test_default_verify_fn_treats_a_raising_probe_as_no_headroom():
+    """Detector (b): a raising re-probe defers, it does not crash the census."""
+    calls = []
+
+    def invoke(prompt, model):
+        calls.append(prompt)
+        if len(calls) == 2:
+            raise coder.CoderInvocationError("claude CLI exited 1: simulated cap")
+        return _verdict()
+
+    verify_fn = mod._build_default_verify_fn(
+        "/tmp/root", invoke, headroom_probe=_raising_probe(), probe_every=100,
+    )
+
+    with pytest.raises(mod.CensusHeadroomExhausted) as excinfo:
+        verify_fn(_clusters(4), model="sonnet")
+
+    exc = excinfo.value
+    assert exc.stage == "verify"
+    assert exc.verified == 1
+    assert exc.unverified == 3
+    assert "raised" in (exc.reason or "").lower(), (
+        "the reason says the probe itself failed, not that a banner was seen"
+    )
+
+
+def test_default_verify_fn_backstop_treats_a_raising_probe_as_no_headroom():
+    """Detector (c): same fail-safe stance at the periodic backstop."""
+    verify_fn = mod._build_default_verify_fn(
+        "/tmp/root",
+        lambda prompt, model: _verdict(),
+        headroom_probe=_raising_probe(),
+        probe_every=5,
+    )
+
+    with pytest.raises(mod.CensusHeadroomExhausted) as excinfo:
+        verify_fn(_clusters(12), model="sonnet")
+
+    exc = excinfo.value
+    assert exc.stage == "verify"
+    assert exc.verified == 5
+    assert exc.unverified == 7
+    assert "raised" in (exc.reason or "").lower()
+
+
+def test_main_deferred_output_names_the_stage_and_the_unverified_count(tmp_path, monkeypatch, capsys):
+    """The CLI's deferred line must print the FIELDS, not only the prose.
+
+    `outcome.reason` reads much the same for the two defer flavours, but they
+    cost an operator completely different things: a preflight defer spent
+    nothing, a verify defer sank the whole mining spend and left N clusters
+    unadjudicated. deferred_stage/unverified_clusters exist to make that
+    distinguishable by field -- printing neither hides it from the one person
+    watching the run.
+    """
+    (tmp_path / "docs" / "legibility").mkdir(parents=True)
+    (tmp_path / "docs" / "legibility" / "legibility.yaml").write_text(
+        "project_id: dark_factory\n"
+        f"project_root: {tmp_path}\n"
+        "escalation_port: 8103\n"
+        "cwd_prefixes:\n"
+        f"  - {tmp_path}\n",
+        encoding="utf-8",
+    )
+
+    def fake_run_census(**kwargs):
+        return mod.CensusOutcome(
+            status="deferred",
+            reason="headroom exhausted during verification: probe reports no capacity",
+            deferred_stage="verify",
+            unverified_clusters=7,
+        )
+
+    monkeypatch.setattr(mod, "run_census", fake_run_census)
+    # --force must never reach the trigger gate.
+    monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+
+    assert mod.main(["--project-root", str(tmp_path), "--force"]) == 0
+
+    out = capsys.readouterr().out
+    assert "deferred" in out
+    assert "stage=verify" in out, "WHICH gate fired"
+    assert "unverified_clusters=7" in out, "and how much work it interrupted"
+    assert "probe reports no capacity" in out, "the reason prose is still there"
+
+
+def test_default_verify_fn_unparseable_banner_treats_a_raising_probe_as_no_headroom():
+    """Detector (a): a raising confirmation probe defers rather than escaping."""
+    verify_fn = mod._build_default_verify_fn(
+        "/tmp/root",
+        _prose_at_cluster_two_invoke(),
+        headroom_probe=_raising_probe(),
+        probe_every=100,
+    )
+
+    with pytest.raises(mod.CensusHeadroomExhausted) as excinfo:
+        verify_fn(_clusters(4), model="sonnet")
+
+    exc = excinfo.value
+    assert exc.stage == "verify"
+    assert exc.verified == 1
+    assert exc.unverified == 3
+    assert "raised" in (exc.reason or "").lower()

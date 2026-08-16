@@ -43,6 +43,14 @@ logger = logging.getLogger(__name__)
 
 _CAP_HIT_COOLDOWN_SECS = 5.0
 _MAX_CAP_COOLDOWN_SECS = 300.0
+# Bounded retry budget for a pre-turn CLI rejection (task 3143 / esc-3118-1):
+# the CLI exited on argument validation before contacting the API, so nothing
+# was billed and no work was lost — a free retry.  ONE is deliberate: a single
+# rejection is consistent with a transient race delivering the prompt to the
+# child's stdin, but a SECOND consecutive one is deterministic (a genuinely
+# blank prompt, a broken argv, a wrapper that never pipes stdin) and must reach
+# a human via the normal steward/escalation path instead of looping.
+_MAX_CLI_INPUT_REJECTED_RETRIES = 1
 # Poll interval for the two-regime liveness watchdog in _run_subprocess.
 # Each tick reads the on-disk transcript to check for assistant turns; the
 # actual sleep per tick is min(_WATCHDOG_POLL_SECS, time_to_grace, time_to_ceiling)
@@ -148,10 +156,12 @@ __all__ = [
     'ended_awaiting_background_for_session',
     'invoke_claude_agent',
     'invoke_with_cap_retry',
+    'is_cli_invocation_rejected',
     'is_server_error_status',
     'is_timed_out_with_progress',
     'is_zero_output_timeout',
     'read_transcript_records',
+    'require_non_blank_prompt',
     'transcript_exists',
 ]
 
@@ -547,6 +557,173 @@ def is_timed_out_with_progress(result: AgentResult) -> bool:
     return result.timed_out and (result.transcript_turns or 0) > 0
 
 
+def _stderr_has_cli_input_required(stderr: str) -> bool:
+    """Case-insensitive scan of *stderr* for the CLI's input-required error.
+
+    The single place the marker table is consulted, shared by
+    ``is_cli_invocation_rejected`` (which takes an ``AgentResult``) and
+    ``_parse_claude_output`` (which only has a ``_SubprocessResult``), so the
+    subtype and the predicate can never disagree about what the marker is.
+    """
+    if not stderr:
+        return False
+    # Lazy (function-local) import — see the identical note in
+    # classify_agent_failure: invocation_outcome imports cli_invoke at module
+    # top, so a module-top import here would create a circular import.
+    from shared.invocation_outcome import CLI_INPUT_REQUIRED_MARKERS
+
+    stderr_lower = stderr.lower()
+    return any(marker in stderr_lower for marker in CLI_INPUT_REQUIRED_MARKERS)
+
+
+def _cli_input_rejection_cause(stderr: str) -> str:
+    """Extract the operator-facing CAUSE line for a pre-turn CLI rejection.
+
+    The CLI's own stderr is the ONLY evidence of what actually happened, so
+    this returns REAL OBSERVED TEXT or an explicit absence marker — never an
+    invented explanation.  Preference order:
+
+    1. the first stderr line carrying one of ``CLI_INPUT_REQUIRED_MARKERS``
+       (the CLI's verbatim argument-validation error);
+    2. the LAST non-empty stderr line (defensive: a caller stamped the subtype
+       by hand, or the CLI's wording drifted off the marker table — either way
+       the tail is the closest thing to a real cause we observed);
+    3. ``'<no stderr captured>'`` when stderr is empty — an explicit statement
+       that nothing was observed, which is the honest degradation.  Fabricating
+       a plausible-sounding cause here would be exactly the laundering this
+       task exists to remove.
+    """
+    # Lazy (function-local) import — see _stderr_has_cli_input_required.
+    from shared.invocation_outcome import CLI_INPUT_REQUIRED_MARKERS
+
+    lines = [line.strip() for line in (stderr or '').splitlines()]
+    non_empty = [line for line in lines if line]
+    for line in non_empty:
+        line_lower = line.lower()
+        if any(marker in line_lower for marker in CLI_INPUT_REQUIRED_MARKERS):
+            return line
+    if non_empty:
+        return non_empty[-1]
+    return '<no stderr captured>'
+
+
+def is_cli_invocation_rejected(result: AgentResult) -> bool:
+    """Return True when the CLI rejected the invocation BEFORE any model turn.
+
+    The signature is a pre-first-turn *transport* rejection: ``success=False``,
+    ``timed_out=False``, ``turns == 0``, ``cost_usd == 0.0``, and a stderr
+    carrying one of ``CLI_INPUT_REQUIRED_MARKERS``.  The agent was never asked
+    anything — nothing was billed and no work was done — so the run is a free
+    retry candidate rather than an agent failure.
+
+    Observed payload (esc-3118-1, 2026-07-28 ~16:31Z)::
+
+        Warning: no stdin data received in 3s, proceeding without it. ...
+        Error: Input must be provided either through stdin or as a prompt
+        argument when using --print
+
+    with ``turns=0``, ``cost_usd=0.0``, ``duration_ms=17331``,
+    ``timed_out=False``, and empty stdout.
+
+    Deliberately contrasted with ``is_zero_output_timeout``: that predicate is
+    keyed to the TIMEOUT family (it returns False immediately unless
+    ``result.timed_out``), so it always misses this failure — which is exactly
+    why no timeout-keyed consumer (the resume wedge guard, the workflow
+    circuit breaker) ever caught the observed incident.  A killed run is not a
+    pre-turn rejection: when ``timed_out`` is set the timeout predicates stay
+    authoritative and this one returns False even if the marker text is
+    present on stderr.
+
+    EVIDENCE (either suffices, both mean the same thing):
+
+    - ``result.subtype == 'error_cli_input_rejected'`` — the subtype
+      ``_parse_claude_output`` mints for exactly this shape, so a result that
+      has already been adjudicated stays adjudicated;
+    - the stderr marker scan — catches a rejection that ``_parse_claude_output``
+      could not label, e.g. one that happened to emit some stdout and so never
+      entered the empty-stdout branch where the subtype is minted.
+
+    Accepting BOTH is what keeps this predicate (the retry policy) and
+    ``classify_agent_failure``'s CLI_INPUT_REJECTED rule (the taxonomy) from
+    disagreeing about what happened: that rule consults this predicate, and
+    this predicate accepts that rule's subtype, so neither can claim a result
+    the other rejects.  See ``TestPredicateAndClassifierAgree``.
+
+    ONE deliberate asymmetry remains, pinned there too: a hand-stamped subtype
+    on a run that observably BILLED (turns/cost above zero — unreachable from
+    ``_parse_claude_output``, which mints that subtype only when stdout is
+    empty and therefore turns/cost were never parsed) is still classified
+    CLI_INPUT_REJECTED but is NOT retried.  This predicate gates an ACTION
+    with a cost, so on contradictory evidence it declines; stricter on the
+    acting side is the safe direction.
+    """
+    if result.success or result.timed_out:
+        return False
+    if result.turns != 0 or result.cost_usd != 0.0:
+        return False
+    return (
+        result.subtype == 'error_cli_input_rejected'
+        or _stderr_has_cli_input_required(result.stderr)
+    )
+
+
+def require_non_blank_prompt(
+    prompt: str | None, *, context: str, detail: str = ''
+) -> None:
+    """Raise ``ValueError`` when *prompt* is None, empty, or whitespace-only.
+
+    The other half of the esc-3118-1 fix: make the "prompt never reached the
+    CLI" failure impossible to cause from OUR side.
+
+    The claude backend is 100% stdin-dependent.  ``build_claude_argv`` emits
+    ``cmd = ['claude', '--print', '--output-format', 'json']`` and NEVER
+    appends a positional prompt or a ``-`` stdin marker (unlike the codex
+    backend in ``orchestrator/agents/invoke.py``, which passes its own input
+    argument).  The prompt is delivered solely by
+    ``stdin_data = prompt.encode()``, and a blank one pipes happily — the CLI
+    then exits on argument validation with an opaque
+    "Input must be provided either through stdin or as a prompt argument"
+    error, zero-cost and zero-turn, with no indication that WE sent nothing.
+
+    Called at every boundary that can originate an invocation, so the failure
+    surfaces at the caller that built the blank prompt — with *context* naming
+    it — instead of as an unattributable CLI error many layers away.
+
+    THE SINGLE raise site for "blank prompt" across this module, deliberately:
+    a caller that wants to defensively handle "I built a blank prompt" catches
+    ONE exception type, and it does not vary with an unrelated flag.  The
+    ``invoke_with_cap_retry`` resume branch — which previously raised its own
+    hand-rolled ``TypeError`` for the same caller bug — delegates here and
+    passes its resume-specific rationale as *detail* rather than forking the
+    type.  *detail*, when given, is appended to the standard message.
+
+    None is accepted and rejected loudly (not an ``AttributeError``): an
+    explicitly-passed ``prompt=None`` is precisely the shape this guard exists
+    to catch.
+    """
+    if prompt is None or not prompt.strip():
+        message = (
+            f'{context}: prompt must be a non-empty, non-whitespace string. '
+            f'The claude CLI receives the prompt ONLY via stdin (the argv carries '
+            f'no positional prompt), so a blank prompt is piped silently and the '
+            f'CLI rejects the invocation before any model turn with an opaque '
+            f'argument error (esc-3118-1). Got {prompt!r}.'
+        )
+        if detail:
+            message = f'{message}  {detail}'
+        raise ValueError(message)
+
+
+def _should_retry_cli_input_rejected(result: AgentResult, retries_used: int) -> bool:
+    """The SINGLE definition of the pre-turn-rejection retry policy.
+
+    Called by both ``invoke_with_cap_retry`` dispatch sites — the gated
+    ``while True`` loop and the ``usage_gate is None`` fast path — so the
+    ceiling can never drift between them.
+    """
+    return is_cli_invocation_rejected(result) and retries_used < _MAX_CLI_INPUT_REJECTED_RETRIES
+
+
 def is_server_error_status(status: int | None) -> TypeGuard[int]:
     """Return True when *status* is a server-side HTTP error (5xx).
 
@@ -591,6 +768,7 @@ class AgentFailureKind(enum.StrEnum):
     ENDED_AWAITING_BACKGROUND = 'ended_awaiting_background'
     MAX_TURNS = 'max_turns'
     EMPTY_OUTPUT = 'empty_output'
+    CLI_INPUT_REJECTED = 'cli_input_rejected'
     API_ERROR = 'api_error'
     MODEL_NOT_FOUND = 'model_not_found'
     TIMED_OUT = 'timed_out'
@@ -676,12 +854,32 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
        NON-5xx statuses ever reach here (a 5xx is claimed above), so this
        rule now covers 4xx/429 exclusively — its verdict for those is
        unchanged.
-    8. ``result.subtype == 'error_empty_output'`` → ``EMPTY_OUTPUT``
+    8. ``result.subtype == 'error_cli_input_rejected'`` OR
+       ``is_cli_invocation_rejected(result)`` → ``CLI_INPUT_REJECTED``
+       (task 3143 / esc-3118-1): the CLI rejected the
+       invocation on ARGUMENT VALIDATION before any model turn, because no
+       prompt ever reached it.  The predicate disjunct keeps this rule and
+       the retry policy in ``invoke_with_cap_retry`` from telling an operator
+       two different stories about one run — the subtype is minted only
+       inside ``_parse_claude_output``'s empty-stdout branch, so a rejection
+       that emitted some stdout carries no subtype yet still satisfies the
+       predicate.  Precedence is unchanged by the disjunct: the predicate
+       requires ``not timed_out``, so rule 2 still claims every killed run,
+       and rules 3/6/7 still claim a run carrying a server error, a
+       ModelNotFound marker or an ``api_error_status``.  Placed immediately ABOVE rule 9 because a
+       rejection is a strict, MORE SPECIFIC subset of "empty stdout": both
+       arrive with empty output, but only this one means the agent was never
+       asked anything.  Ranked below it, the generic rule would claim every
+       such run first and launder a transport rejection into the transient
+       agent-failure bucket, replacing the only evidence there is (the CLI's
+       own stderr line) with the fixed, actively-wrong string 'agent returned
+       empty output'.  The summary embeds that stderr line verbatim.
+    9. ``result.subtype == 'error_empty_output'`` → ``EMPTY_OUTPUT``
        (may be transient).
-    9. ``result.schema_salvaged`` → ``STRUCTURAL`` (schema-salvage: the
+    10. ``result.schema_salvaged`` → ``STRUCTURAL`` (schema-salvage: the
        subtype looked like an error but a valid structured output was
        recovered; callers usually treat as success).
-    10. otherwise → ``UNKNOWN``.
+    11. otherwise → ``UNKNOWN``.
 
     ``diagnostic_detail`` always includes: subtype, turns, cost_usd,
     duration_ms, timed_out, transcript_turns, api_error_status, output
@@ -821,6 +1019,35 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
             summary=f'agent API error: HTTP {result.api_error_status}',
             diagnostic_detail=diagnostic_detail,
         )
+    # Pre-turn CLI rejection — ranked immediately ABOVE the generic
+    # empty-output rule below.  A rejection is a strict subset of "empty
+    # stdout" (both land here with no output), so ordering these the other way
+    # round would have the generic rule claim every rejection first — exactly
+    # the laundering task 3143 exists to remove: 'agent returned empty output'
+    # asserts we asked the agent something and got nothing back, when in fact
+    # the prompt never reached the CLI and no model turn ever ran.  The cause
+    # is carried through verbatim from stderr (the only evidence there is)
+    # rather than replaced by a fixed string.
+    #
+    # The `or is_cli_invocation_rejected(...)` disjunct is what keeps the
+    # TAXONOMY (this rule) and the RETRY POLICY (that predicate) from
+    # disagreeing about what happened: the subtype is minted only inside
+    # _parse_claude_output's empty-stdout branch, so a rejection that emitted
+    # some stdout carries no subtype at all — it would be retried by
+    # invoke_with_cap_retry and then reported downstream as EMPTY_OUTPUT,
+    # i.e. the two layers telling an operator two different stories about one
+    # run.  Consulting the predicate here closes that direction; the predicate
+    # accepting this rule's subtype closes the other.
+    if result.subtype == 'error_cli_input_rejected' or is_cli_invocation_rejected(result):
+        cause = _cli_input_rejection_cause(result.stderr)
+        return AgentFailureClass(
+            kind=AgentFailureKind.CLI_INPUT_REJECTED,
+            summary=(
+                'CLI rejected the invocation before any model turn '
+                f'(no prompt reached the CLI): {cause}'
+            ),
+            diagnostic_detail=diagnostic_detail,
+        )
     if result.subtype == 'error_empty_output':
         return AgentFailureClass(
             kind=AgentFailureKind.EMPTY_OUTPUT,
@@ -941,7 +1168,12 @@ async def invoke_claude_agent(
 
     *resume_session_id*, when set, resumes an existing session via
     ``--resume <id>`` instead of starting a new one.  The system prompt is
-    skipped on resume (it was already set in the initial session).
+    re-passed on resume via ``--system-prompt-file``: it is a
+    process-invocation parameter that the session does not carry, so a resumed
+    invocation that omits it runs under the stock Claude Code prompt with no
+    role charter.  A resumed session therefore gets the CURRENT role prompt —
+    see ``build_claude_argv`` for the full rationale and the probed CLI
+    behaviour.
 
     *session_id*, when set and *resume_session_id* is not, pre-allocates the
     session UUID via ``--session-id <id>`` so callers can resume the same
@@ -1090,6 +1322,18 @@ async def invoke_with_cap_retry(
     (multi-backend reconnect, PRD harness-backend-reconnect-pi T1) — the
     default ``invoke_claude_agent`` path never does, since it has no
     ``backend`` parameter.
+
+    A pre-turn CLI REJECTION (``is_cli_invocation_rejected``: the prompt never
+    reached the child's stdin, so the CLI exited on argument validation before
+    contacting the API) is retried FRESH at most
+    ``_MAX_CLI_INPUT_REJECTED_RETRIES`` (1) time — nothing was billed and no
+    transcript exists, so the retry is free and loses nothing.  The branch sits
+    ABOVE the heuristic cap safety-net deliberately: the CLI's stdin wait is
+    only 3s, so a fast-exit rejection falls inside that net's sub-5s window and
+    would otherwise be converted into a synthetic cap hit, churning the whole
+    account pool for a local argument error the API never saw.  Once the budget
+    is spent the failed result is returned unchanged for normal steward
+    handling — a second consecutive rejection is deterministic, not a glitch.
     """
     model = invoke_kwargs.get('model', 'opus')
     original_prompt = invoke_kwargs.get('prompt', '')
@@ -1104,16 +1348,38 @@ async def invoke_with_cap_retry(
     # this swap: its resumed session must receive the real prompt, not the short
     # crash-recovery continuation prompt.
     if invoke_kwargs.get('resume_session_id'):
-        if not original_prompt:
-            raise TypeError(
-                "invoke_with_cap_retry: 'prompt' must be a non-empty string when "
-                "'resume_session_id' is set.  The prompt is the real task context used "
-                'for fresh-fallback recovery if the resume invocation fails; passing an '
-                'empty or missing prompt silently corrupts that fallback.'
-            )
+        # ONE exception type for "blank prompt" (task 3143 amendment): this
+        # branch used to raise its own hand-rolled TypeError, so the SAME
+        # caller bug surfaced as TypeError or ValueError depending on an
+        # unrelated flag — a caller defending against it had to catch both.
+        # Delegating also fixes the None shape: `original_prompt` is
+        # `invoke_kwargs.get('prompt', '')`, so an explicitly-passed
+        # `prompt=None` used to die on `None.strip()` with an incidental
+        # AttributeError instead of this deliberate, well-messaged raise —
+        # precisely the shape the guard exists to catch loudly.  The
+        # resume-specific rationale rides along as `detail` so nothing is lost.
+        require_non_blank_prompt(
+            original_prompt,
+            context=f'{label} (resume_session_id set)',
+            detail=(
+                'On a resume invocation the prompt is the real task context '
+                'kept for fresh-fallback recovery if the resume fails; passing '
+                'an empty or missing prompt silently corrupts that fallback.'
+            ),
+        )
         if not resume_delivers_prompt:
             invoke_kwargs['prompt'] = CRASH_RECOVERY_RESUME_PROMPT
+    else:
+        # Non-resume invocation: the prompt IS the whole request, so a blank one
+        # is always a caller bug.  Raised here — before any invoke_slot is
+        # acquired — so a blank prompt never consumes an account slot, never
+        # burns a dispatch, and never reaches the CLI as an opaque argument
+        # error (esc-3118-1).  Same guard, same exception type as the resume
+        # branch above; only the context/detail differ, since that branch
+        # legitimately overwrites `prompt` with a short continuation string.
+        require_non_blank_prompt(invoke_kwargs.get('prompt'), context=f'{label}')
     consecutive_cap_hits = 0
+    cli_input_rejected_retries = 0
     num_accounts = max(usage_gate.account_count, 1) if usage_gate else 1
     retry_start = time.monotonic()
     last_cap_wait_log_at: float | None = None
@@ -1220,20 +1486,46 @@ async def invoke_with_cap_retry(
         # silently clobbered.
         invoke_kwargs.setdefault('backend', backend)
 
-    # Fast path: no usage gate → single invocation, no cap retry.
+    # Fast path: no usage gate → no cap retry (there is no account pool to fail
+    # over to), but the pre-turn-rejection retry below still applies: it is not
+    # an account failure, and this path is taken by the gate-less fused-memory
+    # callers (reconciliation, judge, curator) that would otherwise keep eating
+    # the failure silently.  Bounded by the SAME
+    # _should_retry_cli_input_rejected policy the gated loop uses, so the
+    # ceiling can never drift between the two dispatch sites.
+    #
     # NOTE: if `resume_session_id` was set by the caller (crash-recovery path),
     # this fast path will attempt the resume but cannot fall back to a fresh
-    # invocation on failure — the non-cap-hit resume→fresh-fallback branch in
-    # the while-loop below only runs when usage_gate is provided.  In practice
-    # the orchestrator always supplies a gate, but callers without one should be
-    # aware that a failed resume returns the failure result directly.
+    # invocation on a general failure — the non-cap-hit resume→fresh-fallback
+    # branch in the while-loop below only runs when usage_gate is provided.  In
+    # practice the orchestrator always supplies a gate, but callers without one
+    # should be aware that a failed resume returns the failure result directly.
+    # A pre-turn REJECTION is the one exception, and it is not really an
+    # exception to that rule: the CLI exited before contacting the API, so
+    # there is no session to preserve and _reset_for_fresh_retry's switch to a
+    # fresh invocation discards nothing.
     if not usage_gate:
-        started_at = datetime.now(UTC).isoformat()
-        result = await invoke(
-            **invoke_kwargs,
-            config_dir=config_dir.path if config_dir else None,
-        )
-        completed_at = datetime.now(UTC).isoformat()
+        while True:
+            started_at = datetime.now(UTC).isoformat()
+            result = await invoke(
+                **invoke_kwargs,
+                config_dir=config_dir.path if config_dir else None,
+            )
+            completed_at = datetime.now(UTC).isoformat()
+            # Re-stamped per attempt (above), so started_at/completed_at always
+            # describe the attempt actually RETURNED — leaving the discarded
+            # attempt's stamps in place would write a silently false window
+            # into the cost_store invocations row.
+            if not _should_retry_cli_input_rejected(result, cli_input_rejected_retries):
+                break
+            cli_input_rejected_retries += 1
+            logger.warning(
+                f'{label}: CLI rejected the invocation before any model turn '
+                f'(no prompt reached the CLI) — retrying fresh '
+                f'({cli_input_rejected_retries}/{_MAX_CLI_INPUT_REJECTED_RETRIES}). '
+                f'Cause: {_cli_input_rejection_cause(result.stderr)}',
+            )
+            _reset_for_fresh_retry(invoke_kwargs, original_prompt)
     else:
         # Derive this invocation's cap scope once (PRD task β, write half of
         # boundary B1): the invoked model when it is a scoped-cap model, else
@@ -1340,6 +1632,52 @@ async def invoke_with_cap_retry(
                     if not unattributed_cap:
                         slot.confirm(result.cost_usd)
                     break
+
+                # Pre-turn CLI REJECTION (task 3143 / esc-3118-1): the prompt
+                # never reached the child's stdin, so the CLI exited on
+                # argument validation BEFORE contacting the API.  The agent was
+                # never asked anything, nothing was billed and no transcript
+                # exists — so this is a free retry, not an agent failure.
+                #
+                # POSITIONING is load-bearing in two directions:
+                # - ABOVE the heuristic cap safety-net below: the CLI's stdin
+                #   wait is only 3s, so a fast-exit rejection lands inside that
+                #   net's `duration_ms < 5000` window.  Reaching it would
+                #   convert a local argument error into a SYNTHETIC CapHit and
+                #   churn the whole account pool through compounding cooldowns.
+                #   (The CliLocalError escape added with CLI_INPUT_REQUIRED_MARKERS
+                #   also covers this — defence in depth, not redundancy: this
+                #   branch retries, that escape merely declines to cap.)
+                # - BELOW the ModelNotFound/AuthFailed branches: those are
+                #   account- or model-scoped verdicts that must keep their own
+                #   terminal/failover handling.
+                #
+                # Retried FRESH, never resumed: no session was ever created, so
+                # there is nothing to resume, and reusing the prior attempt's
+                # pre-allocated session_id would hit the reify-3604 'Session ID
+                # ... is already in use' wedge.  _reset_for_fresh_retry
+                # regenerates it.  The caller's rebuild_prompt hook is
+                # deliberately NOT invoked: it signals session_lost, and here no
+                # context was ever built, let alone lost — the original prompt
+                # is still exactly the right thing to send.
+                #
+                # slot.confirm settles the slot as a normal zero-cost
+                # completion (mirroring the ModelNotFound branch's shape): no
+                # account is marked capped or auth_failed, because nothing about
+                # the ACCOUNT failed.
+                if _should_retry_cli_input_rejected(result, cli_input_rejected_retries):
+                    cli_input_rejected_retries += 1
+                    if not unattributed_cap:
+                        slot.confirm(result.cost_usd)
+                    logger.warning(
+                        f'{label}: CLI rejected the invocation before any model turn '
+                        f'(no prompt reached the CLI) on account {account_name} — '
+                        f'retrying fresh '
+                        f'({cli_input_rejected_retries}/{_MAX_CLI_INPUT_REJECTED_RETRIES}). '
+                        f'Cause: {_cli_input_rejection_cause(result.stderr)}',
+                    )
+                    _reset_for_fresh_retry(invoke_kwargs, original_prompt)
+                    continue
 
                 # Wedge guard: a full-timeout CLI call (timed_out=True with zero
                 # turns and zero cost) means the subprocess never executed any
@@ -1810,9 +2148,10 @@ def build_claude_argv(
     byte-identical.
 
     Returns ``(cmd, temp_files)``: ``cmd`` is the assembled argv list;
-    ``temp_files`` lists the temp file paths created (empty when resuming and
-    no ``mcp_config`` is set).  The caller owns cleanup of a successful
-    return, typically via
+    ``temp_files`` lists the temp file paths created.  It is never empty — the
+    sysprompt path is always present, on the resume path too (task 3983) —
+    plus the mcp-config path when an ``mcp_config`` is supplied.  The caller
+    owns cleanup of a successful return, typically via
     ``finally: for p in temp_files: Path(p).unlink(missing_ok=True)``.
 
     On exception (e.g. a non-serializable ``mcp_config``), any temp files
@@ -1833,20 +2172,50 @@ def build_claude_argv(
     # back to a clean unlink of everything created so far, leaving no
     # orphaned temp files for the caller to worry about.
     try:
+        # Write system prompt to temp file to avoid ARG_MAX on large payloads.
+        #
+        # UNCONDITIONAL — including on resume (task 3983).  This used to live in
+        # the `else` below, on the belief that --system-prompt-file and --resume
+        # were incompatible.  They are NOT: probed on CLI 2.1.226, the pair is
+        # accepted and fails only on a nonexistent session id, i.e. past argument
+        # validation.  CLI CHANGELOG 2.0.64 — "Fixed --system-prompt being ignored
+        # when using --continue or --resume flags" — makes re-passing the intended
+        # usage.  The system prompt is a process-invocation parameter that is never
+        # persisted with the session, so omitting it on resume dropped the role
+        # charter entirely and the agent silently ran under the stock Claude Code
+        # prompt.
+        #
+        # REPLACE, not append: roles are RESTRICTIVE charters, and
+        # --append-system-prompt-file would layer them over the stock
+        # general-purpose identity that produced the role-disowning behaviour in
+        # the first place.  Replace also keeps fresh and resumed argv
+        # byte-identical.  Re-passing is a prompt-cache HIT; omitting it was a
+        # total cache MISS — this is cheaper than the status quo, not costlier.
+        #
+        # A resumed session gets the CURRENT role prompt, not a byte-replay of the
+        # original.  That is the intended semantics: no role prompt is templated
+        # with per-invocation task context (that lives in the USER prompt), though
+        # a few are built from live inputs that can shift between invocations —
+        # recon Stage 2 branches on `project_id`, reviewer/curator prompts are
+        # model-keyed artifacts, Stage 1/3 introspect live FastMCP signatures, and
+        # recon-verify is tool-list templated.
+        fd, sysprompt_path = tempfile.mkstemp(suffix='.txt', prefix='sysprompt_')
+        temp_files.append(sysprompt_path)
+        with open(fd, 'w') as f:
+            f.write(system_prompt)
+        cmd.extend(['--system-prompt-file', sysprompt_path])
+
         if resume_session_id:
-            # Resume an existing session — skip --system-prompt (incompatible)
+            # Resume an existing session.
             cmd.extend(['--resume', resume_session_id])
-        else:
-            # Write system prompt to temp file to avoid ARG_MAX on large payloads
-            fd, sysprompt_path = tempfile.mkstemp(suffix='.txt', prefix='sysprompt_')
-            temp_files.append(sysprompt_path)
-            with open(fd, 'w') as f:
-                f.write(system_prompt)
-            cmd.extend(['--system-prompt-file', sysprompt_path])
+        elif session_id:
             # Pre-allocate the session UUID so future --resume can find it.
-            # --session-id and --resume are mutually exclusive at the CLI level.
-            if session_id:
-                cmd.extend(['--session-id', session_id])
+            # Unlike --system-prompt-file, --session-id IS genuinely exclusive
+            # with --resume, verbatim from the CLI: "--session-id can only be
+            # used with --continue or --resume if --fork-session is also
+            # specified."  So it stays in the branch while the system prompt
+            # does not.
+            cmd.extend(['--session-id', session_id])
 
         cmd.extend(['--permission-mode', permission_mode])
         cmd.extend(['--max-turns', str(max_turns)])
@@ -1952,6 +2321,10 @@ async def _invoke_claude(
     strict_mcp_config: bool = False,
 ) -> AgentResult:
     """Invoke Claude Code CLI."""
+    # BEFORE build_claude_argv, which writes system-prompt / mcp-config temp
+    # files: a blank prompt can never produce a useful run, so failing here
+    # leaves nothing to clean up and never spawns a subprocess.
+    require_non_blank_prompt(prompt, context='_invoke_claude')
     cmd, temp_files = build_claude_argv(
         model=model,
         max_budget_usd=max_budget_usd,
@@ -2054,9 +2427,20 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
         # done" for a productive run (reify-4827). Mirrors
         # is_timed_out_with_progress's condition inline since that predicate
         # takes an AgentResult, not this _SubprocessResult.
+        #
+        # Third arm (task 3143 / esc-3118-1): a NOT-timed-out fast exit whose
+        # stderr carries the CLI's input-required error is a pre-turn
+        # invocation REJECTION — the prompt never reached the child's stdin, so
+        # the CLI exited on argument validation before contacting the API.
+        # Extends the same argument: conflating a rejection ("we never asked
+        # the agent anything") with an empty output ("we asked and got
+        # nothing") fabricates a false narrative and makes the fixed summary
+        # 'agent returned empty output' actively misdescribe the cause.
         empty_output_subtype = (
             'error_timeout_killed_with_progress'
             if result.timed_out and (result.transcript_turns or 0) > 0
+            else 'error_cli_input_rejected'
+            if not result.timed_out and _stderr_has_cli_input_required(result.stderr)
             else 'error_empty_output'
         )
         return AgentResult(

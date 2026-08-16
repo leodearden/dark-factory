@@ -11,6 +11,26 @@ llm:
   model: "gpt-4o-mini"
   max_tokens: 4096
 
+  # Which graphiti LLM client to build (restart-tier — not hot-reloadable).
+  # Leave commented for stock OpenAI. Uncomment for an OpenAI-compatible LOCAL
+  # endpoint (llama.cpp / vLLM / LM Studio): those serve chat.completions but
+  # not the Responses API that the default 'openai' client requires. Point
+  # providers.openai.api_url below at the local endpoint as well.
+  # client_class: "openai_generic"
+  #
+  # Force response_format={'type': 'json_object'} instead of json_schema.
+  # Only applies when client_class is "openai_generic". Needed for the
+  # llama.cpp MoE arm, which silently ignores $ref/$defs in a json_schema
+  # response_format (llama.cpp#21228).
+  # structured_output_mode: "json_object"
+
+  # NOTE: api_url below is always passed explicitly to the LLM/embedder
+  # clients, so this config WINS over the ambient OPENAI_BASE_URL /
+  # OPENAI_API_BASE environment variables that the openai SDK and mem0 would
+  # otherwise fall back to. If you route OpenAI traffic through a gateway by
+  # exporting OPENAI_BASE_URL, set OPENAI_API_URL (or edit api_url) to the same
+  # value — otherwise traffic goes to whatever is written here. A disagreement
+  # is logged as a warning at client construction.
   providers:
     openai:
       api_key: ${OPENAI_API_KEY}
@@ -23,8 +43,18 @@ llm:
 embedder:
   provider: "openai"
   model: "text-embedding-3-small"
+  # NOTE: changing this on an EXISTING deployment is not a live migration.
+  # It is now plumbed through to both the embedder (what width is requested
+  # from the API) and the Qdrant collection (what width the collection is
+  # created with), but mem0 skips creation for a collection that already
+  # exists — so an existing 1536-wide collection stays 1536-wide and every
+  # upsert then fails on a dimension mismatch. Recreate and re-embed the
+  # collection when changing this.
   dimensions: 1536
 
+  # api_url wins over OPENAI_BASE_URL / OPENAI_API_BASE here too — see the
+  # note in the llm block above. Set this to a different literal from the llm
+  # one to point the embedder at a separate endpoint.
   providers:
     openai:
       api_key: ${OPENAI_API_KEY}

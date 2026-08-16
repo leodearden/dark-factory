@@ -1,0 +1,344 @@
+# Machine-readable twin of plans/task-amendment-delivery-prd.capability-manifest.md
+#
+# INSTALL PATH (strictly derived — never rename, decompose-mode.md Step 2.5):
+#   plans/task-amendment-delivery-prd.capability-manifest.yaml
+#   = re.sub(r'\.md$', '', prd_path) + '.capability-manifest.yaml'
+#
+# Schema + validating loader: shared/src/shared/capability_manifest.py
+# (CapabilityManifestDoc, schema_version 1).  Full field reference:
+# plans/capability-delivered-checks-prd.md §Contract.
+#
+# AUTHORED 2026-08-12 at decompose, against main @ 8eeb862fa5.
+# task_id values are those stamped by commit_planning on 2026-08-12 (batch
+# 4031-4037) and are PRESERVED verbatim.  commit_planning round-trips this file
+# through yaml.safe_dump, which STRIPS COMMENTS — the per-check measured counts
+# and anchoring rationale below were restored by hand in the same session,
+# immediately after the stamp, changing nothing but comments.  Re-verify the
+# counts (not just the patterns) if this file is ever re-stamped.
+#
+# RED-TODAY DISCIPLINE.  Every mechanical check below was executed as
+#   git grep -E -c '<pattern>' -- <paths>
+# against main and is RED today: an `expect: present` check MISSES (0 hits);
+# an `expect: absent` check HITS.  Measured counts are recorded per check.
+# Never file:line — line anchors rot.  20 mechanical checks, all verified RED;
+# 10 manual checks, sidecar-only and excluded from the dispatch gate.
+#
+# ANCHORING.  Checks anchor on PRODUCTION symbols wherever the PRD's contracts
+# fix one.  Three are test-anchored BY NECESSITY and say so at the check:
+#   - β's reconciler call (its production call form is byte-identical to the
+#     existing single call site, so a `present` grep on the symbol is vacuously
+#     green — the discriminator is that the revalidation-skip test home starts
+#     exercising it),
+#   - β's duplicate-sha refusal (C5 fixes the INVARIANT but no symbol),
+#   - η's two boundary-test roots (η's whole deliverable IS tests).
+#
+# MANUAL checks are used where the PRD deliberately leaves a name undecided
+# (α's fault channel, ε's refusal-reason vocabulary and helper home, γ's counter
+# channel), where the evidence is out-of-tree runtime state (ζ's live plan.json
+# sweep), or where the deliverable is a NEGATIVE property that emits no new
+# symbol (β's bounded-hold reuse, γ's INV-8 discipline — `subprocess.run`
+# already has 0 hits in merge_gates.py, so an `expect: absent` there would be
+# vacuously green rather than a measurement).
+prd: plans/task-amendment-delivery-prd.md
+schema_version: 1
+tasks:
+  - label: "α"
+    task_id: 4031
+    title: "Task-text fingerprint gates plan-revalidation skip"
+    capabilities:
+      - name: "task-text-fingerprint-helper-in-shared"
+        binding: "capability→producer (built by α) — D2 puts the helper in shared/src/shared/, a verified workspace dep of BOTH orchestrator (pyproject.toml:21,26) and fused-memory (pyproject.toml:23,27), so α's and δ's copies cannot diverge (INV-5). Nothing fingerprint-shaped exists in shared/ today."
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def task_text_fingerprint"
+          paths: ["shared/src/shared/"]
+          expect: present
+          # RED today: 0 hits.  Anchored on the def, not a bare mention, so a
+          # docstring reference elsewhere in shared/ cannot green it.
+      - name: "fingerprint-is-explicitly-NOT-the-recon-normalizer"
+        binding: "no-lockstep-duplication (INV-5), inverted — D2 says these two predicates must DIFFER: recon's _normalize_content_description (flag_dedup.py:1375) casefolds because its predicate is finding-dedup where case is noise; ours asks 'did the author change the text', where a case change IS a change. The deliverable is the explicit non-unification note that stops a future tidy-up collapsing them."
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_normalize_content_description"
+          paths: ["shared/src/shared/"]
+          expect: present
+          # RED today: 0 hits anywhere under shared/.  Goes green only when
+          # α's docstring names the sibling it must not be merged with —
+          # which is exactly the deliverable D2 specifies.
+      - name: "skip-predicate-reads-the-fingerprint"
+        binding: "capability→producer (wired) — _can_skip_revalidation (workflow.py:4764) already receives the plan and can read self.task; it has four conjuncts and reads NO task text. C3 adds the fifth conjunct there. The task text plays no part in today's revalidate-vs-architect decision, and Lever B short-circuits even the overlap pass, removing the last chance to re-read the task."
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_task_text_fp"
+          paths: ["orchestrator/src/orchestrator/workflow.py"]
+          expect: present
+          # RED today: 0 hits.  C2 fixes the plan-document key name, so this
+          # is a contract-fixed symbol, not a guess.
+      - name: "fingerprint-mirrored-onto-task-metadata"
+        binding: "capability→producer (wired) — D10 forbids δ reading the filesystem, so α mirrors the fingerprint + plan-authored timestamp onto task.metadata via Scheduler.update_task, which is metadata-only (verified across ~30 orchestrator call sites, none writes text). This is the DB read δ consumes."
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "plan_text_fp"
+          paths: ["orchestrator/src/"]
+          expect: present
+          # RED today: 0 hits.  C2 fixes this metadata key name too.  Scoped
+          # to orchestrator/src/ so δ's fused-memory landing cannot green α.
+      - name: "revalidation-text-gate-is-green-tier"
+        binding: "capability→producer (wired) — RELOADABLE_FIELDS exists in config.py; revalidation_skip_enabled (config.py:3237) and max_revalidation_age_hours are present but RED TIER today. C3 requires the new gate bool to land green-tier so it is hot-reloadable. §8 deliberately leaves widening the two EXISTING flags out of scope."
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "text_fp|task_text_fingerprint"
+          paths: ["orchestrator/src/orchestrator/config.py"]
+          expect: present
+          # RED today: 0 hits.  Disjunction covers both plausible spellings of
+          # the flag/comment so α's naming choice cannot false-RED it.
+      - name: "missing-fingerprint-is-a-structured-fault-not-a-silent-decline"
+        binding: "structured-facts-at-failure + storm-escape-required (INV-2/INV-4) via D3/C3 — a plan without _task_text_fp after ζ's sweep means a writer skipped the stamp, so the predicate declines the skip AND emits a structured fault with a counter. Explicitly NOT a permanent legacy-tolerance branch. Pinned end-to-end by §10 row 4."
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "§11 open question 1 deliberately leaves the fault CHANNEL undecided (phase_skipped-style event vs a dedicated counter vs an info escalation — all three satisfy INV-2/INV-4), so no production symbol is fixed; a grep on a guessed channel name would be a false RED at the dispatch gate rather than a check"
+  - label: "β"
+    task_id: 4032
+    title: "Done-step integrity + sanctioned descope on the revalidation path"
+    capabilities:
+      - name: "descope-record-promoted-to-plan-schema"
+        binding: "capability→producer (built by β) — promotes 2971's hand-rolled _rescoped_at/_rescoped_by/_rescoped_note (verified on disk at .worktrees/.task-meta/2971/plan.json, note reading '…step-1 test done @orphaned 309c22ab6f…') from one operator's improvisation to schema. C4. Six worked precedents share the same five moves; this codifies rather than invents."
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_rescoped_at"
+          paths: ["orchestrator/src/"]
+          expect: present
+          # RED today: 0 hits under orchestrator/src/.  The only occurrences
+          # anywhere in the tree are inside the PRD prose itself, so scoping
+          # to the production root is what makes this a real measurement.
+      - name: "dropped-done-steps-keyed-on-step-id-plus-commit"
+        binding: "capability→producer (built by β) — C5's DROPPED := D_before \\ D_after keyed on (step_id, commit) + disposition, NOT count. D5: a count invariant is refuted in BOTH directions by the only two real cases — 2971 (done count 1→1 while a done step was destroyed and 309c22ab6f deliberately orphaned) and 3143 (19→0, a legitimate phantom-done wipe). C4's _descoped_steps is the machine-checkable twin of the prose note."
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_descoped_steps"
+          paths: ["orchestrator/src/"]
+          expect: present
+          # RED today: 0 hits.  C4 fixes the key name.
+      - name: "revalidation-path-calls-the-existing-reconciler"
+        binding: "capability→producer (wired) — _reconcile_done_step_commits (workflow.py:8440) EXISTS and is sound (tasks 2386, 2762 done): WIP-filename-subset → GitOps.find_equivalent_commit (git_ops.py:8855) patch-id/subject matching → non-blocking severity='info' escalation. The gap is PHASE PLACEMENT: exactly one call site, workflow.py:7976, inside the implement loop; _plan() and _apply_revalidation_skip never call it. D6 forbids a second, parallel reachability mechanism (INV-5)."
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_reconcile_done_step_commits"
+          paths: ["orchestrator/tests/test_plan_revalidation_skip.py"]
+          expect: present
+          # RED today: 0 hits in that file.  TEST-HOME-ANCHORED BY NECESSITY:
+          # β's new production call is byte-identical to the existing one at
+          # workflow.py:7976, so a `present` grep on the symbol in
+          # workflow.py would be VACUOUSLY GREEN and would certify a task
+          # that had done nothing.  The discriminator is that the natural
+          # home for the revalidation-skip tests (15 tests, 467 lines) starts
+          # exercising the reconciler.
+      - name: "sha-unresolvable-is-expected-never-a-failure"
+        binding: "numeric premise, basis cited — D6/§2.7 from task 3157's 2026-08-05 addendum: 991 of 1,973 (50.2%) recorded done-step SHAs no longer exist as git objects (gc pruned the pre-rebase originals), and a bare merge-base --is-ancestor check fires on 185/200 live branches (92.5%), or 39/49 (79.6%) restricted to the non-terminal branches a gate would inspect. 'Verify the recorded SHA is reachable' is unimplementable as literally worded for half the corpus. Phantom-done is genuinely RARE: zero confirmed cases in the same 1,973, four candidates all hand-falsified."
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "this is a NEGATIVE requirement on β's classifier — that unresolvable never itself trips the refusal — and is provable only by the 3143 replay (§10 row 9), which η owns; no grep over the tree can distinguish a classifier that treats unresolvable as expected from one that does not"
+      - name: "duplicate-done-step-shas-refused"
+        binding: "capability→producer (built by β) — D6's cheap, sound companion assertion, separate from the reconciler: SHA uniqueness across done steps closes the hole where a count- or set-based check is gamed by duplicating a sha. Pinned by §10 row 10."
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "test_duplicate_done_step_sha|test_.*duplicate.*done_step|test_done_step_shas_.*uniq"
+          paths: ["orchestrator/tests/"]
+          expect: present
+          # RED today: 0 hits across the whole orchestrator test root.
+          # Test-anchored because C5 fixes the INVARIANT but not a symbol;
+          # the disjunction covers three plausible test namings so β's
+          # choice cannot false-RED it.
+      - name: "beta-refusal-routes-through-the-existing-bounded-hold"
+        binding: "status-matches-liveness + holds-owned-and-bounded (INV-6/INV-7) via D13 — β refuses INSIDE the plan loop, so the first exit owner is the architect itself (remedy-and-recheck, the same shape _try_narrow_plan already uses at γ's site). Unresolved refusals route to _handle_no_plan_failure (workflow.py:4649, 4 call sites), which increments RetryLedger.consecutive_no_plan_failures keyed by the main SHA and escalates to a HUMAN at ≥2 rather than re-pending. A pre-existing owned-and-bounded hold with a storm escape — reused, not duplicated (INV-4/5/7)."
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the deliverable is REUSE of an existing choke point, which emits no new production symbol — `_handle_no_plan_failure` already has 4 hits in workflow.py, so any `present` grep on it is vacuously green"
+  - label: "γ"
+    task_id: 4033
+    title: "Converse merge gate at submission: branch commits ⊆ owned ∪ descoped"
+    capabilities:
+      - name: "gate-reads-the-descope-record"
+        binding: "capability→producer + DAG-direction — the producer of _descoped_steps is β, which is UPSTREAM of γ (dependency wired). C6's DESCOPED set is exactly β's C4 record, so γ adds no second descope vocabulary."
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_descoped_steps"
+          paths: ["orchestrator/src/orchestrator/merge_gates.py"]
+          expect: present
+          # RED today: 0 hits.  Deliberately scoped to merge_gates.py and NOT
+          # to orchestrator/src/: β lands the same key in workflow.py, which
+          # would vacuously green γ under a wider scope.
+      - name: "commit-ownership-gate-at-the-sibling-gate-site"
+        binding: "capability→producer (wired) — D9: _check_plan_files_touched_in_branch (merge_gates.py:1333) ALREADY runs inside TaskWorkflow._submit_to_merge_queue (called at workflow.py:10090) BEFORE register_and_enqueue_merge_request (workflow.py:1740), with an in-place remedy-and-recheck precedent at workflow.py:10108 (_try_narrow_plan). γ goes at the same site so the workflow can address a rejection immediately instead of waiting for the queue front."
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "unowned_commit|commit_ownership|owned_commits|branch_commits_owned|_check_branch_commits"
+          paths: ["orchestrator/src/orchestrator/merge_gates.py"]
+          expect: present
+          # RED today: 0 hits.  Five-way disjunction over plausible gate
+          # namings so γ's choice cannot false-RED it, scoped to the sibling
+          # gates' own module.
+      - name: "fail-open-branch-carries-a-storm-escape"
+        binding: "G7 REDESIGN (INV-4, storm-escape-required) — C6 says 'fail-open on git error (matching the sibling gates' documented convention)'. That convention, read at _check_plan_files_touched_in_branch, is 'Loud-log so regressions surface in ops' — a WARNING with NO counter. A γ fail-open firing 100× in an hour would be silent by inheritance. γ's fail-open must carry a streak counter and escalate on it. Recorded in the .md manifest's G7 section; required conjunct in γ's task text."
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the counter's channel is not fixed by the PRD (the sibling gates have none to reuse and remedying THEM is outside γ's scope), so a grep on a guessed counter name would be a false RED at the dispatch gate"
+      - name: "commit-walk-is-loop-safe-and-bounded"
+        binding: "loop-thread-occupancy-bounded (INV-8) via C6 — the commit walk uses the async git runner (git_ops._run, git_ops.py:1726, wrapping asyncio.create_subprocess_exec), never a blocking subprocess.run; fan-out bounded by the branch's commit count with loop-invariant probes hoisted. The house pattern the task-3778 incident established."
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "`subprocess.run` already has 0 occurrences in merge_gates.py, so an `expect: absent` check there would be VACUOUSLY GREEN today rather than a RED-today measurement; the property is a discipline on new code, verifiable only by review"
+  - label: "δ"
+    task_id: 4034
+    title: "Write-boundary amendment advisory + task_text_amended event"
+    capabilities:
+      - name: "update-task-result-carries-the-advisory"
+        binding: "capability→producer (wired) — UpdateTaskResult (fused-memory/src/fused_memory/backends/task_backend_types.py:18-22) exists today with id/message/updated/updated_task and NO advisory key. C7 adds `amendment_advisory: NotRequired[dict]`, so the envelope declares itself where callers see it rather than being discovered by failure (INV-1)."
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "amendment_advisory"
+          paths: ["fused-memory/src/fused_memory/backends/task_backend_types.py"]
+          expect: present
+          # RED today: 0 hits.  C7 fixes the key name verbatim.
+      - name: "advisory-emitted-at-the-should-reembed-chokepoint"
+        binding: "capability→producer (wired) — the should_reembed predicate (task_interceptor.py:4467) already tests exactly `any(k in kwargs for k in ('prompt','title','description','details'))`, which is precisely the text-field set C1's fingerprint covers. No new predicate is needed; the advisory fires when that one does AND task.metadata.plan_text_fp exists and disagrees."
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "amendment_advisory"
+          paths: ["fused-memory/src/fused_memory/middleware/task_interceptor.py"]
+          expect: present
+          # RED today: 0 hits.  Paired with the TypedDict check above so a
+          # bare schema addition with no emitter cannot certify δ.
+      - name: "structured-task-text-amended-event-carries-writer-source"
+        binding: "capability→producer (built by δ) — LOAD-BEARING because the TaskCurator's combine calls tm.update_task DIRECTLY, bypassing TaskInterceptor entirely, so no advisory can ever reach it (its classifier LLM has already exited). Of 57,128 journalled update_task ops, 1,454 carried a text field, 100% source='mcp_tool' — and the largest writer is invisible to that journal. The event is the only channel that keeps curator writes operator-visible (INV-2)."
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "task_text_amended"
+          paths: ["fused-memory/src/"]
+          expect: present
+          # RED today: 0 hits.  C7 fixes the event name.
+      - name: "advisory-reads-task-metadata-never-the-filesystem"
+        binding: "loop-thread-occupancy-bounded (INV-8) via D10 — plan.json lives under <worktree_base>/.task-meta/… and is INVISIBLE to fused-memory; a filesystem or git probe on the fused-memory event loop is exactly the task-3778 incident (29–43 s loop-thread occupancy per render, /health 12–35 ms → 31–43 s). δ compares against α's mirrored task.metadata.plan_text_fp — a DB read already in hand. Pinned by §10 row 14."
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "plan_text_fp"
+          paths: ["fused-memory/src/"]
+          expect: present
+          # RED today: 0 hits.  This is the POSITIVE proof δ took the DB-read
+          # route: the mirrored metadata key can only appear in fused-memory
+          # if δ consumed it instead of stat-ing plan.json.
+  - label: "ε"
+    task_id: 4035
+    title: "Curator combine: execution-time predicate matches selection"
+    capabilities:
+      - name: "terminal-only-execution-predicate-retired"
+        binding: "rejection-mechanism — the pending-only combine constraint is enforced at SELECTION (task_curator.py:2793, combine_eligible=(status=='pending'), parsed at :2949-2960) and NOT re-checked at EXECUTION, where the entire status predicate is `if target_status in {'done','cancelled'}` (task_interceptor.py:2144). Nothing blocks in-progress. Measured over data/combine_audit.jsonl (640 records): 511 pending, 129 in-progress (20.2%); of the 129, 128 rewrote the description and 127 the title; 23 carry an LLM justification asserting the target 'is pending' in the same record whose old.status reads in-progress. All 36 dark_factory cases landed after task_started and before the architect's plan invocation_end — mid-planning, after the briefing was assembled. Task 2951: combine landed 9.3 s after dispatch. No test pins the current behaviour."
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "target_status in \\{'done', 'cancelled'\\}"
+          paths: ["fused-memory/src/fused_memory/middleware/task_interceptor.py"]
+          expect: absent
+          # RED today: 1 hit.  Anchored on the defective production
+          # expression itself and scoped to the single file that carries it —
+          # not a whole-repo absent sweep, which would be vacuous.
+      - name: "live-claimant-checked-at-combine-execution"
+        binding: "capability→producer (built by ε), D11 — status alone has the same TOCTOU shape one level down: a target can be pending at the guard and dispatched a moment later, and _curator_lock's own docstring (task_interceptor.py:2298-2300) says 'Short writes (set_task_status etc.) never take this lock' while dispatch IS a set_task_status. _execute_combine ALREADY re-reads the live target (:2126) — this is a re-read with the wrong predicate, not a missing one — so the claimant field is one .get away on a dict already in hand (no extra I/O; INV-8-neutral)."
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "target\\.get\\(['\"]claimant_run_id"
+          paths: ["fused-memory/src/fused_memory/middleware/task_interceptor.py"]
+          expect: present
+          # RED today: 0 hits.  Anchored on the target.get(...) FORM because
+          # the bare symbol `claimant_run_id` already has 15 hits in this
+          # file — anchoring on the bare name would have been vacuously GREEN
+          # and would have certified a task that had done nothing.
+      - name: "one-eligibility-predicate-shared-by-selection-and-execution"
+        binding: "G7 REDESIGN (INV-5, no-lockstep-duplication) — C8 as written hand-copies `status == 'pending'` from task_curator.py:2793 into task_interceptor.py:2144: two sites that must agree byte-for-byte, which is exactly the INV-5 shape and exactly how the original divergence arose. ε extracts ONE shared eligibility predicate called by both (they already sit in the same fused_memory.middleware package). The claimant conjunct stays EXECUTION-ONLY and is deliberately not pushed into selection — the selection snapshot cannot know it. Recorded in the .md manifest's G7 section; required conjunct in ε's task text."
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the helper's name and home are an implementation choice ε makes (module-level in task_curator, task_interceptor, or a new sibling), so a guessed grep would false-RED a correctly-completed task; the paired `expect: absent` check above already proves the execution site stopped hand-rolling its predicate"
+      - name: "refusal-is-countable-from-the-combine-audit"
+        binding: "structured-facts-at-failure + storm-escape-required (INV-2/INV-4) — the abort path is ALREADY safe ('# combine failed → fall through to create', task_interceptor.py:3487), so refusing files the candidate as its own task; and _append_combine_audit (:2215, path helper :5914) already exists. INV-4's own evidence names 'curator degrade-to-create' as a fail-soft path, and at a measured 20.2% rate an operator must be able to compute it — so the refusal carries a STABLE MACHINE-READABLE reason on the audit record, making the rate countable without log-scraping. Reuse of an existing artifact, not a new channel."
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "§11 open question 5 deliberately leaves the refusal-reason vocabulary (and whether ε emits anything beyond the existing refusal log line) undecided, so no token is fixed; data/combine_audit.jsonl is also a runtime artifact outside the git tree and cannot be observed by git grep"
+  - label: "ζ"
+    task_id: 4036
+    title: "One-off plan-fingerprint migration sweep"
+    capabilities:
+      - name: "migration-script-stamps-live-plans"
+        binding: "capability→producer (built by ζ), consuming α's shared/ helper rather than re-implementing the hash (INV-5). D3 makes this load-bearing: because ζ stamps every live plan during migration, a plan WITHOUT _task_text_fp afterwards means a writer skipped the stamp, which lets α's predicate treat it as a FAULT instead of carrying a permanent legacy-tolerance branch. Nothing fingerprint-related exists under scripts/ today."
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_task_text_fp"
+          paths: ["scripts/"]
+          expect: present
+          # RED today: 0 hits under scripts/.
+      - name: "exposed-set-is-re-derived-not-hard-coded"
+        binding: "G6 RELAXATION (recorded in the .md manifest) + corroborate-before-acting (INV-3) — PRD §7a's ζ row asserts 'the 27 measured-exposed tasks carry the forcing sentinel'. 27 is an authoring-time measurement that will have moved by the time ζ runs, so per G6 branch-1 resolution (b) the filed signal asserts the RE-DERIVED set instead. This is also what §11 open question 3 already directs and what D4 needs: plans whose text has moved get a sentinel that cannot match, forcing exactly one re-plan; plans whose text is current get their true fingerprint and are undisturbed."
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "'does not hard-code a number' is a negative property of the script's logic, not a greppable symbol; the 27 is retained in ζ's task text as a sanity band rather than an assertion"
+      - name: "every-live-plan-carries-the-fingerprint-after-the-sweep"
+        binding: "capability→producer (wired, out-of-tree) — the assertion is over .worktrees/.task-meta/*/plan.json, live runtime state on a running fleet. ζ also reports counts per class (stamped-true / stamped-sentinel / skipped) so the sweep's outcome is legible rather than a silent bulk write."
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the evidence is runtime state OUTSIDE the git tree — no `git grep` in this repo can observe .worktrees/.task-meta/*/plan.json — and a script check would have to mutate or stat a live fleet's worktrees"
+  - label: "η"
+    task_id: 4037
+    title: "End-to-end amendment-delivery boundary tests (B+H integration gate)"
+    capabilities:
+      - name: "orchestrator-side-boundary-rows-exercised"
+        binding: "capability→producer + DAG-direction — §10 rows 1–12 (fingerprint trigger, no-amendment skip, mid-EXECUTE non-refresh, missing-fingerprint fault, whitespace-vs-case, silent wipe refused, 2971 replay, 3143 replay, duplicate-sha, γ's two ride-along rows) are delivered by α/β/γ, ALL UPSTREAM of η (dependencies wired). No §10 row depends on a task that depends on η. TEST-ANCHORED BY CONSTRUCTION: η's whole deliverable IS the boundary-test table."
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_descoped_steps"
+          paths: ["orchestrator/tests/"]
+          expect: present
+          # RED today: 0 hits across the whole orchestrator test root.
+          # Scoped to tests/ (β's check is scoped to src/) so the two cannot
+          # green each other.
+      - name: "fused-memory-side-boundary-rows-exercised"
+        binding: "capability→producer + DAG-direction — §10 rows 13–16 (advisory returned + task_text_amended emitted, δ does no filesystem/git I/O under load, combine into in-progress refused as the 2951 replay, combine into claimed-pending refused) are delivered by δ/ε, both upstream. This is the half that makes η a genuine CROSS-PACKAGE boundary gate rather than an orchestrator-only test task."
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "task_text_amended|amendment_advisory"
+          paths: ["fused-memory/tests/"]
+          expect: present
+          # RED today: 0 hits for either token across the whole fused-memory
+          # test root.
+      - name: "mid-execute-non-refresh-and-loop-safety-pinned"
+        binding: "the two rows the rest of the design silently depends on. Row 3: a mid-EXECUTE amendment must NOT self-clear via the per-implementer-iteration provenance re-stamp — C2 marks that site MUST-NOT-STAMP (setdefault/skip only), because refreshing there from the live task would make the trigger never fire; it is the same unconditional-re-stamp shape that wrote straight over 2971's manual _rescoped_at (_created_at 14:22:41 post-dating _rescoped_at 10:07:27). Row 14: INV-8 on the fused-memory loop."
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "both are NEGATIVE properties spread across α's and δ's production shapes (a stamp that must not happen; an I/O call that must not be made), and the two positive anchors above already prove η's test modules exist and exercise both packages"

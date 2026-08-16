@@ -3518,6 +3518,11 @@ class _HangThenPassVerify:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(180)  # task 3927: real (unmocked) worker.run() loop with
+# real git subprocesses, gating on wait_for(20) + wait_for(40) deadlines per
+# drive cycle -- widened from the 60s default to tolerate host
+# oversubscription, same convention as test_crash_recovery.py (task 2376)
+# and test_merge_queue_restart_hook.py (task 3927).
 class TestDeadVerifyAbortSelfHealsEndToEnd:
     """A dead-verify no-progress abort must SELF-HEAL through the live queue,
     leaving every user-observable surface truthful (task 3082 step-9).
@@ -3553,11 +3558,21 @@ class TestDeadVerifyAbortSelfHealsEndToEnd:
         worker = SpeculativeMergeWorker(git_ops, q, escalation_queue=fake_eq)
 
         # Same small instance-level constants step-5 uses — REAL wall clock,
-        # no monkeypatched time.*, and small enough for the 60s per-test
-        # timeout (timeout_method='thread').
+        # no monkeypatched time.* — sized to stay well inside this class's
+        # widened 180s per-test timeout (see the class decorator above).
         worker.VERIFY_ABANDON_POLL_SECS = 0.02
-        worker.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.02
-        worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 0.2
+        # task 3927 amend (reviewer finding, robustness): PROBE/BUDGET raised
+        # 0.02/0.2 -> 0.2/2.0 (same 1:10 ratio) to address the gate.calls
+        # load-sensitivity at its root, not just its symptom. Under host CPU
+        # oversubscription the whole process can be descheduled for a
+        # stretch; too small a budget mistakes that scheduling stall for
+        # genuine verify no-progress and fires an extra abort before the
+        # just-redispatched call ever gets to run. 2.0s makes that far less
+        # likely while staying well inside the wait_for(40) below — the
+        # first verify hangs forever, so the abort still fires promptly at
+        # the budget boundary.
+        worker.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.2
+        worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 2.0
 
         req = _make_request(branch, branch, wt, config)
         gate = _HangThenPassVerify()
@@ -3602,11 +3617,37 @@ class TestDeadVerifyAbortSelfHealsEndToEnd:
 
         # ── (1) the request ACTUALLY re-enters the live queue and is
         #        re-dispatched — not swallowed by _coalesce_reentrant_drain.
-        assert gate.calls == 2, (
+        #
+        # task 3927: exact equality (calls == 2) is load-sensitive. Under
+        # host CPU oversubscription, the no-progress watchdog's independent
+        # wall-clock poll can race ahead of the just-redispatched call-2
+        # coroutine actually getting scheduled and fire a SECOND no-progress
+        # abort before call 2 ever runs, inflating the count to 3 (observed:
+        # esc-3609-4) — this is a load-induced extra retry, not the
+        # coalesce-drop bug this assertion actually guards against (which
+        # would show calls == 1). Lower bound (2) still fails on that
+        # coalesce-drop regression.
+        #
+        # task 3927 amend (reviewer finding, test-quality): the upper bound
+        # is derived from worker.MAX_INFLIGHT_DEAD_VERIFY_ABORTS rather than
+        # a hardcoded literal. _drive_abort_then_land never monkeypatches
+        # that cap (default 3 -- see merge_queue.py), and the per-task
+        # dead-abort counter is only cleared once verify_task actually
+        # returns a result, so each CONSECUTIVE dead/no-progress abort counts
+        # toward it; the MAX_INFLIGHT_DEAD_VERIFY_ABORTS-th one takes the
+        # terminal 'blocked' branch instead of re-dispatching again. So
+        # gate.calls == worker.MAX_INFLIGHT_DEAD_VERIFY_ABORTS is the true
+        # reachable ceiling -- a hardcoded 5 would be unreachable (vacuous)
+        # and would silently stop catching a genuine redispatch-storm
+        # regression anywhere below it. A busy-loop-cap trip is instead
+        # caught by `outcome.status == 'done'` below (it would read
+        # 'blocked').
+        assert 2 <= gate.calls <= worker.MAX_INFLIGHT_DEAD_VERIFY_ABORTS, (
             f'expected the abort to be followed by a genuine RE-DISPATCH '
-            f'(run_scoped_verification called twice), got {gate.calls} call(s) — '
-            f'a single call means the re-queued request was dropped before '
-            f're-dispatch'
+            f'(run_scoped_verification called >=2 times), got {gate.calls} '
+            f'call(s) — a single call means the re-queued request was dropped '
+            f'before re-dispatch, and >{worker.MAX_INFLIGHT_DEAD_VERIFY_ABORTS} '
+            f'calls cannot happen without also tripping the busy-loop cap'
         )
         drop_warnings = [
             m for m in messages
@@ -3742,9 +3783,20 @@ class TestDeadVerifyAbortSelfHealsEndToEnd:
             )
         )
 
-        assert gate.calls == 2, (
+        # task 3927: see the sibling test above for why exact equality is
+        # load-sensitive (a starved no-progress watchdog can add a
+        # load-induced extra retry) — bounded range keeps the coalesce-drop
+        # guard (lower bound) meaningful.
+        #
+        # task 3927 amend (reviewer finding, test-quality): upper bound
+        # derived from worker.MAX_INFLIGHT_DEAD_VERIFY_ABORTS, not a
+        # hardcoded literal -- see the sibling test above for why a fixed 5
+        # is vacuous (unreachable given the untouched default cap of 3).
+        assert 2 <= gate.calls <= worker.MAX_INFLIGHT_DEAD_VERIFY_ABORTS, (
             f'the abort path must re-dispatch on its own, with no operator '
-            f'intervention; run_scoped_verification saw {gate.calls} call(s)'
+            f'intervention; run_scoped_verification saw {gate.calls} call(s) '
+            f'(expected >=2, and <={worker.MAX_INFLIGHT_DEAD_VERIFY_ABORTS} to '
+            f'still catch a redispatch storm)'
         )
         assert outcome.status == 'done', (
             f'the request must land unaided, got {outcome!r}'

@@ -3,10 +3,14 @@ orchestrator scheduler and the task curator."""
 
 from __future__ import annotations
 
+import subprocess
+from pathlib import Path
+
 import pytest
 
 from shared.locking import (
-    CODE_EXTENSIONS,
+    EXTENSIONLESS_FILENAMES,
+    FILE_EXTENSIONS,
     directory_locks,
     files_to_modules,
     is_file_path,
@@ -16,9 +20,9 @@ from shared.locking import (
 )
 
 # ---------------------------------------------------------------------------
-# Drift guard — pins shared.locking.CODE_EXTENSIONS to the canonical vector.
+# Drift guard — pins shared.locking.FILE_EXTENSIONS to the canonical vector.
 #
-# Update _CANONICAL_EXTENSIONS AND CODE_EXTENSIONS together when the allowlist
+# Update _CANONICAL_EXTENSIONS AND FILE_EXTENSIONS together when the allowlist
 # changes.  Also update the verbatim copy in
 # fused-memory/src/fused_memory/middleware/lock_charter_guard.py AND its
 # corresponding _CANONICAL_EXTENSIONS in
@@ -43,7 +47,7 @@ _CANONICAL_EXTENSIONS = [
 # ---------------------------------------------------------------------------
 # Classification corpora — deliberate verbatim duplicates of the corpora in
 # fused-memory/tests/test_lock_charter_guard.py, for the same reason the two
-# CODE_EXTENSIONS frozensets are duplicated (locking.py:16-25): the two copies
+# FILE_EXTENSIONS frozensets are duplicated (locking.py:16-25): the two copies
 # are NOT linked by a re-export, so each must be pinned INDEPENDENTLY — and
 # this is the copy the orchestrator scheduler (the α enforcement point) actually
 # imports.  Keeping the two lists byte-identical is what lets a reader diff them.
@@ -162,6 +166,146 @@ _DOTTED_DIRECTORY_PATHS = [
     '.taskmaster',
 ]
 
+# ---------------------------------------------------------------------------
+# Extension-less tracked FILES (dark_factory #3248).
+#
+# The second half of the classifier: real tracked files whose final segment
+# carries NO extension at all, so the FILE_EXTENSIONS lookup can never reach
+# them.  Before #3248 every one of these classified as a DIRECTORY, which made
+# `hooks/project-checks` undeclarable in metadata.files (γ rejected it with a
+# LockCharterViolation) and — worse, because it was silent — made a task
+# declaring ONLY such paths strip to an empty charter and fall through to the
+# per-task `task-<id>` synthetic lock, holding no lock on the file it edits.
+#
+# Update _CANONICAL_EXTENSIONLESS AND EXTENSIONLESS_FILENAMES together when the
+# vector changes.  Also update the verbatim copies in
+# fused-memory/src/fused_memory/middleware/lock_charter_guard.py AND
+# fused-memory/tests/test_lock_charter_guard.py.
+#
+# EVIDENCE — `git ls-files -s` over BOTH repos, re-measured 2026-08-09 (and
+# identical to the 2026-07-31 measurement): every tracked path whose final
+# segment contains no '.'.  dark-factory contributes Dockerfile LICENSE
+# pre-commit pre-merge-commit project-checks; reify adds cargo
+# cargo-audit-orphans reference-transaction.  Union = the 8 below.
+#
+# GITLINK EXCLUSION (load-bearing, not a measurement artefact): entries with
+# mode 160000 are submodule mount points — `graphiti` and `mem0` in
+# dark-factory — and are deliberately NOT admitted.  They are extension-less
+# and would otherwise qualify, but admitting them would let a task declare an
+# entire vendored submodule as its lock charter, which is strictly worse than
+# the bug being fixed.  They stay DIRECTORIES by design.  The sweep below
+# asserts this filter is doing real work rather than passing vacuously.
+# ---------------------------------------------------------------------------
+
+_CANONICAL_EXTENSIONLESS = [
+    'Dockerfile',
+    'LICENSE',
+    'cargo',
+    'cargo-audit-orphans',
+    'pre-commit',
+    'pre-merge-commit',
+    'project-checks',
+    'reference-transaction',
+]
+
+# One REAL tracked path per canonical extension-less name — dark-factory unless
+# the comment says reify (same convention as _ACCEPT_PATHS above).  Verified
+# tracked with `git ls-files --error-unmatch` on 2026-08-09.  Enforced complete
+# by TestExtensionlessFilenames::test_accept_corpus_covers_every_canonical_name.
+_EXTENSIONLESS_ACCEPT_PATHS = [
+    'LICENSE',
+    'fused-memory/docker/Dockerfile',
+    'hooks/pre-commit',
+    'hooks/pre-merge-commit',
+    'hooks/project-checks',
+    # reify
+    'hooks/reference-transaction',
+    # reify
+    'scripts/agent-bin/cargo',
+    # reify
+    'scripts/cargo-audit-orphans',
+]
+
+# Repo roots for the tracked-corpus self-audit sweep.  dark-factory is resolved
+# from this file (works in a worktree too: <root>/shared/tests/ -> parents[2]);
+# reify is a sibling under the same src/ directory.  Same resolution the γ suite
+# uses for _DF_REPO_ROOT / _REIFY_REPO_ROOT.
+_DF_REPO_ROOT = Path(__file__).parents[2]
+_REIFY_REPO_ROOT = Path(__file__).parents[5] / 'reify'
+
+# The bash third copy of the predicate.  Same resolution the γ suite uses.
+_REIFY_GUARD_SCRIPT = _REIFY_REPO_ROOT / 'scripts' / 'lock-charter-guard.sh'
+
+
+def _reify_guard_vector(flag: str) -> list[str]:
+    """Return the sorted vector emitted by the reify guard script's *flag*.
+
+    Verbatim counterpart of the γ suite's helper of the same name, duplicated
+    for the same reason the corpora are: the two suites are not linked by an
+    import, and each must be able to pin its own copy of the predicate against
+    bash on its own.
+
+    LOUD on failure.  The callers skipif on the script's ABSENCE — a standalone
+    checkout legitimately has no reify sibling — but a script that EXISTS and
+    then fails is real signal and is raised, never skipped.  Measured
+    2026-08-09: an unrecognised flag prints usage and exits 2, so a
+    skip-on-any-non-zero would retire the guard the moment reify renamed an
+    emitter, leaving it green forever while enforcing nothing.
+    """
+    result = subprocess.run(
+        ['bash', str(_REIFY_GUARD_SCRIPT), flag],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, (
+        f'reify {_REIFY_GUARD_SCRIPT.name} {flag} exited {result.returncode}, '
+        f'expected 0 — the emitter this cross-source drift guard depends on is '
+        f'gone, renamed, or broken.  Check `bash {_REIFY_GUARD_SCRIPT} --help`.  '
+        f'Hard failure, not a skip: silently retiring a cross-source guard would '
+        f'let the three copies of the predicate diverge with every test green.\n'
+        f'  stdout: {result.stdout[:400]!r}\n'
+        f'  stderr: {result.stderr[:400]!r}'
+    )
+    return sorted(line.strip() for line in result.stdout.splitlines() if line.strip())
+
+
+def _tracked_entries(repo_root: Path) -> tuple[list[str], list[str]] | None:
+    """``(non_gitlink_paths, gitlink_paths)`` for *repo_root*, or None if not a checkout.
+
+    ``git ls-files -s`` (not plain ``ls-files``) is what makes the mode column
+    available.  Mode ``160000`` means a submodule gitlink; those entries are
+    returned SEPARATELY rather than discarded, because the sweeps need them to
+    prove the exclusion is doing real work.  See the GITLINK EXCLUSION note
+    above for why the filter is load-bearing rather than cosmetic.
+    """
+    result = subprocess.run(
+        ['git', '-C', str(repo_root), 'ls-files', '-s', '-z'],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    paths: list[str] = []
+    gitlinks: list[str] = []
+    for entry in result.stdout.split('\0'):
+        if not entry:
+            continue
+        # Format: "<mode> <sha> <stage>\t<path>"
+        meta, _, path = entry.partition('\t')
+        if not path:
+            continue
+        if meta.split(' ', 1)[0] == '160000':
+            gitlinks.append(path)
+        else:
+            paths.append(path)
+    return paths, gitlinks
+
+
+def _tracked_file_paths(repo_root: Path) -> list[str] | None:
+    """Tracked NON-GITLINK paths under *repo_root*, or None if not a checkout."""
+    entries = _tracked_entries(repo_root)
+    return None if entries is None else entries[0]
+
 
 class TestNormalizeLock:
     def test_default_depth_is_two(self):
@@ -279,16 +423,16 @@ class TestIsFilePath:
         assert not is_file_path('src/server/')
 
     def test_uppercase_extension_is_not_file_case_sensitive(self):
-        # Case-sensitive allowlist: 'MD' not in CODE_EXTENSIONS
+        # Case-sensitive allowlist: 'MD' not in FILE_EXTENSIONS
         assert not is_file_path('README.MD')
 
-    def test_code_extensions_is_frozenset(self):
-        assert isinstance(CODE_EXTENSIONS, frozenset)
+    def test_file_extensions_is_frozenset(self):
+        assert isinstance(FILE_EXTENSIONS, frozenset)
         # Spot-check canonical members
-        assert 'py' in CODE_EXTENSIONS
-        assert 'rs' in CODE_EXTENSIONS
-        assert 'ts' in CODE_EXTENSIONS
-        assert 'md' in CODE_EXTENSIONS
+        assert 'py' in FILE_EXTENSIONS
+        assert 'rs' in FILE_EXTENSIONS
+        assert 'ts' in FILE_EXTENSIONS
+        assert 'md' in FILE_EXTENSIONS
 
     @pytest.mark.parametrize('path', _ACCEPT_PATHS)
     def test_accept_corpus_paths_are_files(self, path: str):
@@ -297,7 +441,7 @@ class TestIsFilePath:
         One representative path per canonical extension (all 59, not just the 22
         added by the 2026-07-28 sweep).  Before this amendment only the 22 new
         extensions had behavioural coverage here while the original 36 had nothing
-        but four spot-checks in ``test_code_extensions_is_frozenset`` — leaving
+        but four spot-checks in ``test_file_extensions_is_frozenset`` — leaving
         the copy the orchestrator scheduler actually imports pinned strictly
         weaker than the fused-memory copy, which defeats the point of
         independently pinning two deliberately-duplicated definitions.
@@ -325,7 +469,7 @@ class TestIsFilePath:
         """_ACCEPT_PATHS must exercise every entry in _CANONICAL_EXTENSIONS.
 
         Turns the corpus comment's "one path per canonical extension" claim into
-        an enforced invariant, so an extension cannot be added to CODE_EXTENSIONS
+        an enforced invariant, so an extension cannot be added to FILE_EXTENSIONS
         and pinned in the drift guard while never being run through an actual
         classification assertion.  Mirrors the assertion of the same name in
         fused-memory/tests/test_lock_charter_guard.py, which also carries the
@@ -390,6 +534,244 @@ class TestIsFilePath:
         )
 
 
+class TestExtensionlessFilenamesDriftGuard:
+    """Pins shared.locking.EXTENSIONLESS_FILENAMES to the canonical vector."""
+
+    def test_matches_canonical_vector(self):
+        assert sorted(EXTENSIONLESS_FILENAMES) == _CANONICAL_EXTENSIONLESS
+
+    @pytest.mark.skipif(
+        not _REIFY_GUARD_SCRIPT.is_file(),
+        reason='reify script not present (standalone checkout; cross-repo drift check skipped)',
+    )
+    def test_extensionless_drift_guard_vs_reify_script(self):
+        """Tier-2 (cross-source): this α copy must match reify --list-extensionless.
+
+        WHY THIS EXISTS ON THE α SIDE TOO, rather than being left to the γ
+        suite's identical test.  Tier-1 above compares this frozenset against
+        ``_CANONICAL_EXTENSIONLESS``, a literal in THIS file.  An edit that
+        changes both together — the natural way to "add a name" — therefore
+        passes every guard in the shared tree while silently diverging from the
+        γ copy and from bash.  The whole hole was that nothing in this package
+        could observe the other two copies.
+
+        With both suites pinned against the same bash emitter the α↔γ agreement
+        follows transitively: α == bash here and γ == bash there implies α == γ,
+        which is what lets the two Python copies stay verbatim duplicates
+        without a re-export linking them.  Neither Tier-2 alone gives that; both
+        together do, and that is the precise sense in which three-way agreement
+        is ENFORCED.
+
+        A present-but-failing script is a hard failure, not a skip — see
+        _reify_guard_vector.
+        """
+        script_names = _reify_guard_vector('--list-extensionless')
+        assert script_names == sorted(EXTENSIONLESS_FILENAMES), (
+            f'α/γ/bash drift detected on the extension-less vector!\n'
+            f'  reify --list-extensionless        : {script_names!r}\n'
+            f'  α EXTENSIONLESS_FILENAMES         : {sorted(EXTENSIONLESS_FILENAMES)!r}\n'
+            f'Update EXTENSIONLESS_FILENAMES here, in '
+            f'fused-memory/src/fused_memory/middleware/lock_charter_guard.py, '
+            f"and reify's own scripts/lock-charter-guard.sh _EXTLESS, plus "
+            f'_CANONICAL_EXTENSIONLESS in both test copies — all five places.'
+        )
+
+    def test_is_frozenset(self):
+        assert isinstance(EXTENSIONLESS_FILENAMES, frozenset)
+
+    def test_members_are_bare_final_segments(self):
+        """Every member must be a non-empty, dot-free, slash-free name.
+
+        Structural invariant, not style policing.  A member is compared against
+        a path's FINAL SEGMENT, so:
+          - a name containing '.' is in the wrong allowlist — its post-dot token
+            belongs in FILE_EXTENSIONS, and putting it here would shadow that
+            lookup with an exact-name match that almost never fires;
+          - a name containing '/' could never equal a final segment, so it would
+            be permanently dead weight that reads as coverage.
+        """
+        for name in sorted(EXTENSIONLESS_FILENAMES):
+            assert isinstance(name, str) and name, f'{name!r} must be a non-empty str'
+            assert '.' not in name, (
+                f'{name!r} contains a dot — a dotted name is an EXTENSION and '
+                f'belongs in FILE_EXTENSIONS, not EXTENSIONLESS_FILENAMES'
+            )
+            assert '/' not in name, (
+                f'{name!r} contains a slash — members are matched against a '
+                f"path's final segment, which can never contain '/'"
+            )
+
+
+class TestExtensionlessFilenames:
+    """Extension-less tracked FILES classify as files (dark_factory #3248).
+
+    The hazard these pin, stated concretely: two tasks editing
+    ``hooks/project-checks`` concurrently could both hold NO lock on it, because
+    a charter that strips to empty degrades to a per-task ``task-<id>`` synthetic
+    lock that conflicts with nothing.
+    """
+
+    @pytest.mark.parametrize('path', _EXTENSIONLESS_ACCEPT_PATHS)
+    def test_extensionless_accept_corpus_paths_are_files(self, path: str):
+        assert is_file_path(path) is True, (
+            f'{path!r} is a real tracked FILE whose final segment carries no '
+            f'extension; it must classify as a file via EXTENSIONLESS_FILENAMES'
+        )
+
+    def test_accept_corpus_covers_every_canonical_name(self):
+        """_EXTENSIONLESS_ACCEPT_PATHS must exercise every canonical name.
+
+        The GAMMA-4 trap guard, mirroring
+        test_accept_corpus_covers_every_canonical_extension.  Adding a name to
+        the allowlist without a matching real accept path would otherwise swap
+        one red test for a different red test rather than closing the gap.
+
+        Coverage is derived from ``is_file_path`` itself rather than a
+        re-implementation of its segment parsing: a path counts for ``name``
+        only if the predicate ACCEPTS it and its final segment IS ``name``.
+        """
+        accepted = [p for p in _EXTENSIONLESS_ACCEPT_PATHS if is_file_path(p)]
+        uncovered = sorted(
+            name
+            for name in _CANONICAL_EXTENSIONLESS
+            if not any(p.rsplit('/', 1)[-1] == name for p in accepted)
+        )
+        assert not uncovered, (
+            f'{len(uncovered)} allowlisted name(s) are pinned in '
+            f'_CANONICAL_EXTENSIONLESS but never classified by any '
+            f'_EXTENSIONLESS_ACCEPT_PATHS entry: {uncovered!r}\n'
+            f'Add one real tracked representative path per name.'
+        )
+
+    @pytest.mark.parametrize(
+        ('repo', 'repo_root'),
+        [('dark-factory', _DF_REPO_ROOT), ('reify', _REIFY_REPO_ROOT)],
+    )
+    def test_no_canonical_name_is_also_a_directory(self, repo: str, repo_root: Path):
+        """No member may appear as a NON-FINAL component of any tracked path.
+
+        This is what bounds the risk of matching on a bare basename.  A member
+        that were ALSO a directory name somewhere in the tree would make that
+        directory declarable as a lock charter — the exact over-wide-charter
+        failure the guard exists to prevent.  Measured zero collisions across
+        both repos on 2026-08-09; this pins that property permanently rather
+        than leaving it as a one-time observation.
+
+        SCOPE, stated plainly so the guard is not over-read: it bounds the risk
+        for these TWO checkouts only, while the predicate governs lock charters
+        for every project the orchestrator targets.  Several members are generic
+        basenames (`cargo`, `Dockerfile`, `LICENSE`, `pre-commit`), so a third
+        project with a real `tools/cargo/` DIRECTORY would have it classified as
+        a file and retained as a subtree-wide prefix lock, unswept by this test.
+        That is why admitting a generic basename is a cross-project commitment —
+        see the CROSS-PROJECT SCOPE note on the EXTENSIONLESS_FILENAMES vector.
+        """
+        if not repo_root.is_dir():
+            pytest.skip(f'{repo} checkout not present at {repo_root}')
+        paths = _tracked_file_paths(repo_root)
+        if paths is None:
+            pytest.skip(f'{repo_root} is not a git checkout (git ls-files failed)')
+        assert paths, f'git ls-files returned no tracked paths for {repo_root}'
+
+        collisions: dict[str, str] = {}
+        for path in paths:
+            for component in path.split('/')[:-1]:
+                if component in EXTENSIONLESS_FILENAMES:
+                    collisions.setdefault(component, path)
+
+        assert not collisions, (
+            f'{len(collisions)} EXTENSIONLESS_FILENAMES member(s) are also '
+            f'DIRECTORY names in {repo}, so declaring that directory would now '
+            f'be accepted as a file-level lock charter:\n'
+            + '\n'.join(f'  {name} — e.g. {path}' for name, path in sorted(collisions.items()))
+            + '\nRemove the name from the allowlist, or rename the directory.'
+        )
+
+    @pytest.mark.parametrize(
+        ('repo', 'repo_root'),
+        [('dark-factory', _DF_REPO_ROOT), ('reify', _REIFY_REPO_ROOT)],
+    )
+    def test_every_tracked_extensionless_file_is_allowlisted(
+        self, repo: str, repo_root: Path
+    ):
+        """Corpus->allowlist self-audit: the 9th extensionless file must go RED.
+
+        Turns "add 8 names" into a self-auditing invariant.  When someone adds a
+        new extension-less tracked file to either repo, this test names it here
+        rather than letting it surface later as a LockCharterViolation at
+        submit time — or, worse, as a silent under-lock.
+
+        This sweep IS duplicated in the γ suite, unlike the extension-corpus
+        sweep which is deliberately α-free (see
+        test_accept_corpus_covers_every_canonical_extension for that rationale).
+        The difference is the failure mode: the extension vector is fully pinned
+        by the two drift guards, whereas this one gates a REPO-level property —
+        a newly-added tracked file changes the correct answer without any test
+        vector changing, so whichever suite runs must be able to see it.
+
+        Gitlink mount points are excluded by _tracked_file_paths and must NOT be
+        admitted; that exclusion is asserted below.  The gitlink set is DERIVED
+        from git's own mode column rather than hardcoded, which matters in both
+        directions: hardcoding ``('graphiti', 'mem0')`` made the assertion
+        vacuously true for the reify parametrization (reify vendors no
+        submodules), and would have gone red for no real defect if dark-factory
+        ever de-vendored them.  A repo with no submodules now skips the
+        sub-assertion explicitly instead of passing it silently — so read this
+        guard as non-vacuous exactly where gitlinks actually exist, which today
+        is the dark-factory parametrization.
+        """
+        if not repo_root.is_dir():
+            pytest.skip(f'{repo} checkout not present at {repo_root}')
+        entries = _tracked_entries(repo_root)
+        if entries is None:
+            pytest.skip(f'{repo_root} is not a git checkout (git ls-files failed)')
+        paths, gitlinks = entries
+        assert paths, f'git ls-files returned no tracked paths for {repo_root}'
+
+        # The gitlink filter must be doing real work, not passing vacuously.
+        if gitlinks:
+            overlap = sorted(set(gitlinks) & set(paths))
+            assert not overlap, (
+                f'{overlap!r} appear as BOTH mode-160000 gitlinks and ordinary '
+                f'tracked paths in {repo}; _tracked_entries must partition the '
+                f'corpus, and admitting a submodule mount point would let a task '
+                f'declare an entire vendored submodule as its lock charter'
+            )
+            for gitlink in gitlinks:
+                assert not is_file_path(gitlink), (
+                    f'{gitlink!r} is a submodule mount point (mode 160000) and '
+                    f'must stay a DIRECTORY — see the GITLINK EXCLUSION note on '
+                    f'the corpus.  Admitting it would make an entire vendored '
+                    f'submodule declarable as a lock charter, strictly worse '
+                    f'than the bug #3248 fixed.'
+                )
+
+        unknown: dict[str, str] = {}
+        for path in paths:
+            seg = path.rsplit('/', 1)[-1]
+            if '.' in seg:
+                continue
+            if not is_file_path(path):
+                unknown.setdefault(seg, path)
+
+        assert not unknown, (
+            f'{len(unknown)} extension-less tracked {repo} file(s) classify as '
+            f'DIRECTORIES, so any task declaring one in metadata.files is either '
+            f'rejected with a LockCharterViolation or — silently — stripped to an '
+            f'empty charter and given a task-<id> synthetic lock that conflicts '
+            f'with nothing:\n'
+            + '\n'.join(f'  {name} — e.g. {path}' for name, path in sorted(unknown.items()))
+            + '\nAdd each name to EXTENSIONLESS_FILENAMES in '
+            'shared/src/shared/locking.py AND '
+            'fused-memory/src/fused_memory/middleware/lock_charter_guard.py, '
+            'and to reify scripts/lock-charter-guard.sh _EXTLESS (all three must '
+            'agree — omitting reify reds '
+            'test_extensionless_drift_guard_vs_reify_script), '
+            'plus _CANONICAL_EXTENSIONLESS and _EXTENSIONLESS_ACCEPT_PATHS in '
+            'both test copies.'
+        )
+
+
 class TestDirectoryLocks:
     """directory_locks — returns ordered directory-like entries, drops files."""
 
@@ -443,8 +825,8 @@ class TestStripDirectoryLocks:
         assert strip_directory_locks(files) == ['src/foo.py']
 
 
-class TestCodeExtensionsDriftGuard:
-    """Pin shared.locking.CODE_EXTENSIONS to the canonical extension vector.
+class TestFileExtensionsDriftGuard:
+    """Pin shared.locking.FILE_EXTENSIONS to the canonical extension vector.
 
     This is the α-copy drift guard for the shared.locking canonical source.
     The corresponding γ-copy guard lives in
@@ -454,16 +836,43 @@ class TestCodeExtensionsDriftGuard:
     """
 
     def test_extension_drift_guard(self):
-        """sorted(CODE_EXTENSIONS) must match _CANONICAL_EXTENSIONS.
+        """sorted(FILE_EXTENSIONS) must match _CANONICAL_EXTENSIONS.
 
-        Update _CANONICAL_EXTENSIONS AND CODE_EXTENSIONS together when the
+        Update _CANONICAL_EXTENSIONS AND FILE_EXTENSIONS together when the
         allowlist changes.  Also update the verbatim copy in
         lock_charter_guard.py and its _CANONICAL_EXTENSIONS list.
         """
-        assert sorted(CODE_EXTENSIONS) == _CANONICAL_EXTENSIONS, (
-            f'shared.locking.CODE_EXTENSIONS has drifted from the canonical vector.\n'
+        assert sorted(FILE_EXTENSIONS) == _CANONICAL_EXTENSIONS, (
+            f'shared.locking.FILE_EXTENSIONS has drifted from the canonical vector.\n'
             f'  canonical : {_CANONICAL_EXTENSIONS!r}\n'
-            f'  actual    : {sorted(CODE_EXTENSIONS)!r}\n'
-            f'Update CODE_EXTENSIONS and _CANONICAL_EXTENSIONS together; also update '
+            f'  actual    : {sorted(FILE_EXTENSIONS)!r}\n'
+            f'Update FILE_EXTENSIONS and _CANONICAL_EXTENSIONS together; also update '
             f'lock_charter_guard.py.'
+        )
+
+    @pytest.mark.skipif(
+        not _REIFY_GUARD_SCRIPT.is_file(),
+        reason='reify script not present (standalone checkout; cross-repo drift check skipped)',
+    )
+    def test_extension_drift_guard_vs_reify_script(self):
+        """Tier-2 (cross-source): this α copy must match reify --list-extensions.
+
+        The extension-half counterpart of
+        TestExtensionlessFilenamesDriftGuard::test_extensionless_drift_guard_vs_reify_script,
+        added for the same reason and closing the same structural hole: before
+        this, ONLY the γ suite invoked the bash emitter, so an α-only edit that
+        moved FILE_EXTENSIONS and the local _CANONICAL_EXTENSIONS together
+        passed everything in this package while diverging from the other two
+        copies.  That hole predates #3248 — the extension vector has been
+        α-unpinned against bash since the two Python copies were split — and is
+        fixed here rather than left as the one asymmetry between the suites.
+        """
+        script_exts = _reify_guard_vector('--list-extensions')
+        assert script_exts == sorted(FILE_EXTENSIONS), (
+            f'α/γ/bash drift detected on the extension vector!\n'
+            f'  reify --list-extensions : {script_exts!r}\n'
+            f'  α FILE_EXTENSIONS       : {sorted(FILE_EXTENSIONS)!r}\n'
+            f'Update FILE_EXTENSIONS here, in lock_charter_guard.py, and in '
+            f"reify's scripts/lock-charter-guard.sh _EXTS, plus "
+            f'_CANONICAL_EXTENSIONS in both test copies.'
         )

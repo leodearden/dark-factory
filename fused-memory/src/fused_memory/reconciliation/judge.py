@@ -96,6 +96,90 @@ _JUDGE_CLI_MAX_TURNS = 3
 # rather than from a real verdict construction.
 _VERDICT_PROBE_RUN_ID = '__verdict_schema_probe__'
 
+# Machine-readable marker on a JudgeVerdict finding that identifies the
+# verdict as PHANTOM — a placeholder fabricated by _parse_verdict's except
+# block when the judge's raw output could not be parsed, not a genuine
+# review. One spelling, shared by three production call sites (the stamp in
+# _parse_verdict, review_run's is_parse_failure halt-reason branch, and
+# is_phantom_verdict below) so a reword of the marker can never silently
+# desync the detector from the producer.
+_UNPARSEABLE_VERDICT_CODE = 'unparseable_judge_response'
+
+# Prefix of the 'issue' text _parse_verdict stamps on its fabricated finding
+# (see the f'{_UNPARSEABLE_ISSUE_PREFIX}: {e}' construction below). Hoisted
+# to a constant for the same reason as _UNPARSEABLE_VERDICT_CODE: it is the
+# ONLY signal available on a pre-2947 row, which was written before the
+# 'code' marker existed and so cannot be identified any other way.
+_UNPARSEABLE_ISSUE_PREFIX = 'Judge response could not be parsed'
+
+# Severities counted as "non-ok" by _check_error_trends' streak and count
+# gates. One spelling for both gates so they cannot independently drift on
+# what counts as evidence of trouble.
+_NON_OK_SEVERITIES = ('moderate', 'serious')
+
+
+def _has_unparseable_marker(verdict: JudgeVerdict) -> bool:
+    """True iff any finding on *verdict* carries the structured
+    ``code == 'unparseable_judge_response'`` marker.
+
+    This is the machine-readable half of phantom detection: the marker
+    ``_parse_verdict`` stamps on its fabricated placeholder finding for
+    every row written after task 2947 landed (see
+    ``_UNPARSEABLE_VERDICT_CODE``). Shared by :func:`is_phantom_verdict`'s
+    primary branch and :meth:`Judge.review_run`'s halt-reason branch so the
+    marker scan has exactly one spelling and the two call sites can never
+    independently drift on what counts as a match.
+
+    No isinstance guard on each finding: ``JudgeVerdict.findings`` is
+    pydantic-validated ``list[dict]`` (models/reconciliation.py), and
+    ``journal.get_recent_verdicts`` — the path that rehydrates a verdict
+    from stored JSON — builds ``JudgeVerdict`` through its normal
+    (validating) constructor, so every entry reaching here is already
+    guaranteed to be a ``dict``.
+    """
+    return any(f.get('code') == _UNPARSEABLE_VERDICT_CODE for f in verdict.findings)
+
+
+def is_phantom_verdict(verdict: JudgeVerdict) -> bool:
+    """True iff *verdict* is a fabricated stand-in for a review that never
+    happened, not a genuine judge finding.
+
+    A phantom verdict is built by :meth:`Judge._parse_verdict`'s except
+    block when the judge's raw output could not be parsed into a verdict at
+    all — there is no real judge opinion behind it, only a loud, fail-closed
+    placeholder stamped so downstream code does not silently drop the run.
+    This is deliberately NOT the same thing as a genuine verdict whose
+    *content* the judge rated severity=serious: that is a real review
+    outcome and must never be treated as phantom.
+
+    Two shapes are recognised:
+
+    1. **Structured marker** (primary, via :func:`_has_unparseable_marker`):
+       any row written after task 2947 landed (merged 2026-07-23) carries
+       ``code == 'unparseable_judge_response'`` on its (sole) finding.
+    2. **Legacy unmarked shape** (fallback): rows written BEFORE task 2947
+       carry no ``code`` key at all, so they are identified by the shape
+       ``_parse_verdict`` has always fabricated — severity=serious AND
+       exactly one finding AND that finding's ``issue`` starts with
+       ``_UNPARSEABLE_ISSUE_PREFIX``. All three conjuncts matter: the
+       fabrication path only ever emits severity=serious (never moderate);
+       the sole genuine severity=serious row in the live DB (bc9459b8) has
+       FIVE findings, so the single-finding conjunct is what keeps this
+       fallback from swallowing it; and ``startswith`` (not a substring
+       test) means a genuine finding that merely *mentions* parsing
+       somewhere in its prose is not mistaken for the fabricated one. A
+       future variant shape that fails one of these conjuncts falls back to
+       the status quo (still counted as evidence) rather than silently
+       under-counting — fail-closed in the safe direction.
+    """
+    if _has_unparseable_marker(verdict):
+        return True
+    if verdict.severity == VerdictSeverity.serious and len(verdict.findings) == 1:
+        issue = verdict.findings[0].get('issue')
+        if isinstance(issue, str) and issue.startswith(_UNPARSEABLE_ISSUE_PREFIX):
+            return True
+    return False
+
 
 UnhaltCallback = Callable[[str], Awaitable[None] | None]
 """Fired by :meth:`Judge.unhalt` after the halt state is cleared.
@@ -300,10 +384,7 @@ class Judge:
                     # survives for the anthropic/openai text fallback, which has
                     # no --json-schema mechanism and so can still return prose
                     # that must be treated fail-closed.
-                    is_parse_failure = any(
-                        f.get('code') == 'unparseable_judge_response'
-                        for f in verdict.findings
-                    )
+                    is_parse_failure = _has_unparseable_marker(verdict)
                     if is_parse_failure:
                         halt_reason = (
                             f'Unparseable judge response in run {run_id} '
@@ -669,9 +750,22 @@ Review this run and provide your verdict as JSON.
         # correctly treated as infra rather than a benign empty verdict.
         #
         # Every other failure kind (API_ERROR / TIMED_OUT / MODEL_NOT_FOUND /
-        # MAX_TURNS / ENDED_AWAITING_BACKGROUND / UNKNOWN) is a transport/infra
-        # failure: raise JudgeInfraError (replacing the previous generic
-        # RuntimeError) so review_run can branch on it explicitly.
+        # MAX_TURNS / ENDED_AWAITING_BACKGROUND / CLI_INPUT_REJECTED / UNKNOWN)
+        # is a transport/infra failure: raise JudgeInfraError (replacing the
+        # previous generic RuntimeError) so review_run can branch on it
+        # explicitly.
+        #
+        # CLI_INPUT_REJECTED (task 3143 / esc-3118-1) is deliberately in that
+        # bucket rather than folded into the EMPTY_OUTPUT contract above, even
+        # though both arrive with empty stdout.  The legacy "empty stdout =
+        # valid empty verdict" semantics rest on our having ASKED the judge and
+        # got nothing back; a rejection means the CLI exited on argument
+        # validation before any model turn, so we never asked at all.  Returning
+        # '' would have _parse_verdict fabricate a benign severity=minor verdict
+        # for a review that never happened — loud over silent degradation.  By
+        # the time a rejection reaches here, invoke_with_cap_retry has already
+        # spent its one automatic fresh retry, so raising is escalation, not
+        # impatience.
         #
         # Schema-tool denial first (CLI 2.1.168 regression guard). The verdict
         # contract now rides --json-schema, which is delivered through the
@@ -877,14 +971,19 @@ Review this run and provide your verdict as JSON.
                 reviewed_at=datetime.now(UTC),
                 severity=VerdictSeverity.serious,
                 findings=[{
-                    'issue': f'Judge response could not be parsed: {e}',
+                    # Built from _UNPARSEABLE_ISSUE_PREFIX (not a literal
+                    # string) so the stamped text and is_phantom_verdict's
+                    # legacy-shape prefix check can never drift apart — the
+                    # prefix is the ONLY signal is_phantom_verdict has for a
+                    # row that predates the 'code' marker below.
+                    'issue': f'{_UNPARSEABLE_ISSUE_PREFIX}: {e}',
                     'severity': 'serious',
                     # Machine-readable marker (task 2947 ask b): lets review_run
                     # pick the truthful 'Unparseable judge response' halt reason
                     # via a structured field rather than fragile substring
                     # matching. Kept on this SINGLE finding so len(findings)==1
                     # (the existing loud-not-fabricated test) still holds.
-                    'code': 'unparseable_judge_response',
+                    'code': _UNPARSEABLE_VERDICT_CODE,
                     'recommendation': (
                         'This verdict was not a real review — the judge output was '
                         'unparseable. Investigate the judge LLM/CLI output before '
@@ -910,6 +1009,15 @@ Review this run and provide your verdict as JSON.
            the pipeline produces a clean verdict.
         3. **No post-unhalt grace, no active cooldown**: operator intervention
            gets breathing room before the detector re-fires.
+
+        Before either of the last two gates, phantom verdicts (task 3070) —
+        fabricated by ``_parse_verdict`` as a stand-in when judge output
+        could not be parsed, see ``is_phantom_verdict`` — are removed from
+        the verdict list, restricted to the verdicts the time window already
+        selected (so the discarded-evidence log below describes only
+        evidence the gates could actually have used). A phantom carries no
+        evidence that a review ever happened, so it must not be able to feed
+        the count gate or complete the consecutive-streak gate.
         """
         if not self.config.halt_on_judge_serious:
             return
@@ -931,26 +1039,78 @@ Review this run and provide your verdict as JSON.
             )
             return
 
+        # Restrict to the trend window FIRST, before phantom-exclusion runs,
+        # so the discarded-evidence accounting below describes only verdicts
+        # the gates could actually have used. A phantom that fell outside
+        # the window was never going to influence a gate regardless of its
+        # phantom-ness, so it must not be reported as "trend evidence was
+        # discounted" — that would misrepresent a window-irrelevant detail
+        # as a phantom-caused near miss. Windowing is a pure subset filter
+        # (it does not reorder), so restricting first and phantom-filtering
+        # second yields the same final evidence set the gates see as the
+        # reverse order would; only the diagnostics below change.
         window_hours = float(self.config.halt_trend_window_hours)
         window_start = now - timedelta(hours=window_hours)
-        windowed = sorted(
-            (v for v in verdicts if v.reviewed_at >= window_start),
-            key=lambda v: v.reviewed_at,
-            reverse=True,
-        )
+        in_window = [v for v in verdicts if v.reviewed_at >= window_start]
+
+        # Phantom non-ok verdicts (task 3070) are fabricated placeholders for a
+        # review that never happened — _parse_verdict stamps them when the
+        # judge output could not be parsed (see is_phantom_verdict). They
+        # carry no evidence either way, so they are removed from the evidence
+        # set BEFORE either of the remaining two gates below run, not merely
+        # uncounted afterward: a phantom must not be able to complete the
+        # consecutive-most-recent streak any more than it should inflate the
+        # count. The exclusion is deliberately restricted to non-ok
+        # severities: a phantom is only ever severity=serious (see
+        # is_phantom_verdict), so this can never drop an ok/minor verdict
+        # from the ordering and un-break a streak (that would be a fail-open
+        # change, outside this task's ask).
+        evidence: list[JudgeVerdict] = []
+        excluded_run_ids: list[str] = []
+        for v in in_window:
+            if v.severity in _NON_OK_SEVERITIES and is_phantom_verdict(v):
+                excluded_run_ids.append(v.run_id)
+            else:
+                evidence.append(v)
+
+        # The detector is discarding evidence here, not just failing to find
+        # a trend — those are different operator-facing facts. Without this
+        # record, an operator watching a project that did NOT halt cannot
+        # tell "no trend" apart from "trend evidence was discounted as
+        # phantom" (loud-over-silent-degradation). Silent when nothing was
+        # dropped, so this never adds noise to the common case. Scoped to
+        # in-window verdicts only (see above), so this can never fire for a
+        # phantom that was already outside the window and so was never
+        # discountable in the first place.
+        if excluded_run_ids:
+            logger.warning(
+                'reconciliation.judge_trend_phantom_excluded',
+                extra={
+                    'project_id': project_id,
+                    'excluded_count': len(excluded_run_ids),
+                    # Bounded defensively: the trend query itself caps at
+                    # limit=50 (get_recent_verdicts), so this slice cannot
+                    # truncate real information today, only guard against a
+                    # future caller passing a larger verdict list.
+                    'excluded_run_ids': excluded_run_ids[:50],
+                    'remaining_verdicts': len(evidence),
+                },
+            )
+
+        windowed = sorted(evidence, key=lambda v: v.reviewed_at, reverse=True)
 
         consecutive_required = max(1, self.config.halt_trend_consecutive_required)
         if len(windowed) < consecutive_required:
             return
         if not all(
-            v.severity in ('moderate', 'serious')
+            v.severity in _NON_OK_SEVERITIES
             for v in windowed[:consecutive_required]
         ):
             return
 
-        non_ok_in_window = [
-            v for v in windowed if v.severity in ('moderate', 'serious')
-        ]
+        # Phantoms are already excluded above, so this is now a plain
+        # membership test — the exclusion has exactly one spelling.
+        non_ok_in_window = [v for v in windowed if v.severity in _NON_OK_SEVERITIES]
         if len(non_ok_in_window) < self.config.halt_trend_moderate_count:
             return
 

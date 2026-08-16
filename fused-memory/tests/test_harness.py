@@ -1095,6 +1095,71 @@ class TestStage1LedgerWriteMissingPredicate:
         assert _stage1_ledger_write_missing({'error_type': 'RuntimeError'}) is False
 
 
+class TestStage2LedgerWriteMissingPredicate:
+    """`_stage2_ledger_write_missing(report)` is a pure, synchronous
+    predicate — no harness/journal/ledger fixtures needed (task 3732).
+
+    Mirrors TestStage1LedgerWriteMissingPredicate above one-for-one: the
+    Stage 2 backstop must inherit the same three structural properties —
+    `== 0` (never `!= 1`) keying, exclusion of the arm's own degraded synth,
+    and non-StageReport tolerance.
+    """
+
+    @staticmethod
+    def _report(**stats) -> StageReport:
+        from fused_memory.models.reconciliation import StageId
+
+        return StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats=stats,
+            llm_calls=1,
+            tokens_used=10,
+        )
+
+    def test_explicit_zero_stat_returns_true(self):
+        from fused_memory.reconciliation.harness import _stage2_ledger_write_missing
+
+        report = self._report(stage2_cycle_summary_ledger_written=0)
+        assert _stage2_ledger_write_missing(report) is True
+
+    def test_explicit_one_stat_returns_false(self):
+        from fused_memory.reconciliation.harness import _stage2_ledger_write_missing
+
+        report = self._report(stage2_cycle_summary_ledger_written=1)
+        assert _stage2_ledger_write_missing(report) is False
+
+    def test_absent_stat_returns_false(self):
+        """The no-fire rule that keeps `_mock_stage_run`-shaped reports
+        (stats={}) — and any Stage 2 that died before reaching its own
+        write — inert."""
+        from fused_memory.reconciliation.harness import _stage2_ledger_write_missing
+
+        report = self._report()
+        assert _stage2_ledger_write_missing(report) is False
+
+    def test_degraded_backstop_synth_is_excluded(self):
+        """The degraded-synth arm's own row must never re-trigger the
+        write-recovered arm — the two arms can never double-process."""
+        from fused_memory.reconciliation.harness import _stage2_ledger_write_missing
+
+        report = self._report(
+            stage2_cycle_summary_ledger_written=0,
+            stage2_cycle_summary_degraded_backstop=True,
+        )
+        assert _stage2_ledger_write_missing(report) is False
+
+    def test_non_stagereport_object_returns_false(self):
+        """A plain dict — the `_error` / journal-round-trip shape
+        `run.stage_reports` is typed to allow — has no .stats attribute at
+        all and must not raise."""
+        from fused_memory.reconciliation.harness import _stage2_ledger_write_missing
+
+        assert _stage2_ledger_write_missing({'error_type': 'RuntimeError'}) is False
+
+
 # ---------------------------------------------------------------------------
 # Task 2440: harness-level backstop for the Stage 1 cycle_summary write.
 #
@@ -1939,6 +2004,813 @@ class TestStage1CycleSummaryRemediationBackstop:
             'the breadcrumb must be stamped on the deferral (return, not raise) '
             'exit path too'
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 3732: harness-level backstop for the STAGE 2 cycle_summary write —
+# the arm missing from _ensure_stage1_cycle_summary's Stage-1-only coverage.
+#
+# Deliberately NARROWER than Stage 1's: both arms are hard-gated on the
+# task_knowledge_sync key being PRESENT in run.stage_reports, so a run whose
+# Stage 2 never produced a report can never have a row synthesized for it
+# (there is no Stage-2 analogue of Stage 1's arm 1 raise-path synthesis).
+#
+# RED — no _ensure_stage2_cycle_summary yet.
+# ---------------------------------------------------------------------------
+
+
+class TestStage2CycleSummaryHarnessBackstop:
+    """run_full_cycle's finally block recovers a Stage 2 cycle_summary ledger
+    row whose in-stage write failed — but never fabricates one for a cycle
+    whose Stage 2 did not run."""
+
+    @pytest_asyncio.fixture
+    async def ledger_store(self, tmp_path):
+        from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
+
+        s = ReconLedgerStore(tmp_path / 'harness_backstop_ledger.db')
+        await s.initialize()
+        yield s
+        await s.close()
+
+    @staticmethod
+    def _stage2_report(**stats) -> StageReport:
+        from fused_memory.models.reconciliation import StageId
+
+        return StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats=stats,
+            llm_calls=9,
+            tokens_used=900,
+        )
+
+    @pytest.mark.asyncio
+    async def test_stage2_completed_but_ledger_write_failed_triggers_recovery(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """The write-recovered arm: Stage 2 COMPLETED and returned a real
+        report while its own in-stage ledger upsert failed transiently — the
+        report carries the explicit failure signal
+        (stats['stage2_cycle_summary_ledger_written'] == 0). This is the arm
+        that closes the confirmed genuine Stage 2 write gaps, and it must
+        re-attempt with the REAL report (the upsert is idempotent on its
+        5-part identity, so a re-attempt cannot duplicate)."""
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        stage2_report = self._stage2_report(stage2_cycle_summary_ledger_written=0)
+        _mock_stage_run(harness.stages[0])
+        harness.stages[1].run = AsyncMock(return_value=stage2_report)
+        _mock_stage_run(harness.stages[2])
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage2_cycle_summary',
+            AsyncMock(return_value=True),
+        ) as mock_write:
+            run = await harness.run_full_cycle('test-project', 'test-trigger')
+
+        assert run.status == RunStatus.completed
+        mock_write.assert_awaited_once()
+        assert mock_write.await_args is not None
+        written = mock_write.await_args.args[2]
+        assert written.llm_calls == 9 and written.tokens_used == 900, (
+            'the re-attempt must reuse the REAL Stage 2 report (honest '
+            'llm_calls/tokens), not a zeroed synthesis'
+        )
+        assert written.stats.get('stage2_cycle_summary_ledger_written') == 0, (
+            "the re-attempt must carry the real report's stats verbatim"
+        )
+        assert written is not stage2_report, (
+            'the writer must be handed a marker-stamped COPY, never the live '
+            'report mutated across the asyncio.shield boundary — see '
+            '_reattempt_cycle_summary_write'
+        )
+        assert stage2_report.stats.get('stage2_cycle_summary_write_recovered_backstop') is True
+        assert 'stage2_cycle_summary_degraded_backstop' not in stage2_report.stats, (
+            'the write-recovered arm must never stamp the degraded-synth marker — '
+            'the two arms self-identify with distinct markers'
+        )
+
+    @pytest.mark.asyncio
+    async def test_write_returns_false_stamps_marker_false_not_true(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """The recovered-backstop marker must reflect the re-attempt's ACTUAL
+        outcome, not merely that a re-attempt was made. If the re-attempt also
+        fails (returns False — e.g. the transient ledger fault hasn't cleared),
+        the marker must be stamped False, not a false-positive True that would
+        read to an operator/dashboard as 'recovery succeeded'."""
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        stage2_report = self._stage2_report(stage2_cycle_summary_ledger_written=0)
+        _mock_stage_run(harness.stages[0])
+        harness.stages[1].run = AsyncMock(return_value=stage2_report)
+        _mock_stage_run(harness.stages[2])
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage2_cycle_summary',
+            AsyncMock(return_value=False),
+        ) as mock_write:
+            run = await harness.run_full_cycle('test-project', 'test-trigger')
+
+        assert run.status == RunStatus.completed
+        mock_write.assert_awaited_once()
+        assert stage2_report.stats.get('stage2_cycle_summary_write_recovered_backstop') is False, (
+            'a re-attempt that itself fails must stamp False, not True — the marker '
+            'must never claim recovery succeeded when no ledger row was actually created'
+        )
+
+    @pytest.mark.asyncio
+    async def test_write_raises_corrects_marker_to_false_not_true(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """Complements the False-return case: if the re-attempt RAISES, the
+        optimistic True stamped before the call (needed so a genuinely
+        successful re-attempt's OWN ledger row — serialized synchronously at
+        call time — carries the marker) must be caught and corrected back to
+        False, and the exception must never escape the finally block. The
+        cycle itself must still complete; only the best-effort write failed."""
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        stage2_report = self._stage2_report(stage2_cycle_summary_ledger_written=0)
+        _mock_stage_run(harness.stages[0])
+        harness.stages[1].run = AsyncMock(return_value=stage2_report)
+        _mock_stage_run(harness.stages[2])
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage2_cycle_summary',
+            AsyncMock(side_effect=RuntimeError('ledger boom')),
+        ) as mock_write:
+            run = await harness.run_full_cycle('test-project', 'test-trigger')
+
+        assert run.status == RunStatus.completed, (
+            'a failing backstop re-attempt must not fail the overall cycle'
+        )
+        mock_write.assert_awaited_once()
+        assert stage2_report.stats.get('stage2_cycle_summary_write_recovered_backstop') is False, (
+            'a re-attempt that raises must correct the marker to False, never leave '
+            'it falsely True'
+        )
+
+    @pytest.mark.asyncio
+    async def test_writer_always_sees_marker_true_even_when_outcome_unconfirmed(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """The marker must not be mutated on the LIVE report across the
+        asyncio.shield boundary. write_cycle_summary serializes report.stats
+        into payload_json only once the shielded task takes its first step —
+        so if the harness task is already being cancelled, the await raises
+        BEFORE that step and any post-hoc correction of the live report would
+        be picked up by the still-pending serialization, landing a row stamped
+        False for a write that actually succeeded.
+
+        Pinned by holding onto the object the writer was handed and reading it
+        back AFTER the harness has corrected the live report: the writer's
+        report must still read True (a shielded serialization that happens
+        later still records the recovery), while the live report — the copy
+        update_run_stage_reports persists — reads only the CONFIRMED outcome,
+        False. Handing the writer the live report itself would collapse the
+        two and leak the correction into the row."""
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        stage2_report = self._stage2_report(stage2_cycle_summary_ledger_written=0)
+        _mock_stage_run(harness.stages[0])
+        harness.stages[1].run = AsyncMock(return_value=stage2_report)
+        _mock_stage_run(harness.stages[2])
+
+        handed_to_writer: list[StageReport] = []
+
+        async def _capturing_writer(_memory, _project_id, report, _run_id, **_kw):
+            handed_to_writer.append(report)
+            raise RuntimeError('cancelled-analogue: never returns')
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage2_cycle_summary',
+            _capturing_writer,
+        ):
+            run = await harness.run_full_cycle('test-project', 'test-trigger')
+
+        assert run.status == RunStatus.completed
+        assert len(handed_to_writer) == 1
+        # Read AFTER the harness corrected the live report: a serialization that
+        # only happens later (the shielded task's first step) must still see True.
+        assert handed_to_writer[0].stats.get(
+            'stage2_cycle_summary_write_recovered_backstop'
+        ) is True, (
+            'the report handed to the writer — the one serialized into the row '
+            '— must still carry the marker True after the correction, so a '
+            'landed row records the recovery it actually performed'
+        )
+        assert stage2_report.stats.get(
+            'stage2_cycle_summary_write_recovered_backstop'
+        ) is False, (
+            'the live, journal-persisted report must record only the CONFIRMED '
+            'outcome and never over-claim'
+        )
+
+    # -- idempotency of the re-attempt --------------------------------------
+    #
+    # The write-recovered arm re-attempts with the REAL report on the grounds
+    # that the ledger upsert is idempotent on its 5-part identity. That claim
+    # is load-bearing (it is why re-attempting is safe at all), so it is pinned
+    # against a REAL ledger rather than a patched writer.
+
+    @staticmethod
+    async def _count_cycle_summary_rows(ledger_store, run_id: str) -> int:
+        cursor = await ledger_store._require_db().execute(
+            """
+            SELECT COUNT(*) FROM recon_ledger
+            WHERE project_id = ? AND record_kind = 'cycle_summary'
+              AND task_id = '' AND flag_type = 'task_knowledge_sync'
+              AND run_id = ?
+            """,
+            ('test-project', run_id),
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        return int(row[0])
+
+    @pytest.mark.asyncio
+    async def test_repeat_backstop_invocations_leave_exactly_one_honest_row(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """Drives run_full_cycle with the REAL write_stage2_cycle_summary (no
+        patch), then fires the backstop AGAIN on the same run — the
+        interrupt-then-resume shape, where the finally runs once per driver
+        invocation on the same run_id. Exactly one row must exist, and it must
+        carry the REAL llm_calls both times (never degraded to zeros)."""
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        stage2_report = self._stage2_report(stage2_cycle_summary_ledger_written=0)
+        _mock_stage_run(harness.stages[0])
+        harness.stages[1].run = AsyncMock(return_value=stage2_report)
+        _mock_stage_run(harness.stages[2])
+
+        run = await harness.run_full_cycle('test-project', 'test-trigger')
+        assert run.status == RunStatus.completed
+
+        record = await ledger_store.get_by_identity(
+            'test-project', 'cycle_summary',
+            flag_type='task_knowledge_sync', run_id=run.id,
+        )
+        assert record is not None, (
+            'the write-recovered arm must land a real row through the real writer'
+        )
+        assert json.loads(record.payload_json)['llm_calls'] == 9
+        assert await self._count_cycle_summary_rows(ledger_store, run.id) == 1
+
+        # Fire again on the SAME run (resume path): the report still carries
+        # stage2_cycle_summary_ledger_written == 0, so the arm re-fires.
+        await harness._ensure_stage2_cycle_summary(
+            run, run.id, 'test-project', run.started_at,
+        )
+
+        assert await self._count_cycle_summary_rows(ledger_store, run.id) == 1, (
+            'the upsert is idempotent on its 5-part identity — a re-attempt '
+            'must never duplicate the row'
+        )
+        record = await ledger_store.get_by_identity(
+            'test-project', 'cycle_summary',
+            flag_type='task_knowledge_sync', run_id=run.id,
+        )
+        assert record is not None
+        assert json.loads(record.payload_json)['llm_calls'] == 9, (
+            'a repeat re-attempt must keep the row honest, never zero it out'
+        )
+
+    # -- no-fire boundaries -------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_happy_path_does_not_fire(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """Stage 2's own in-stage write succeeded (stat == 1) — there is
+        nothing to recover and the backstop must stay silent."""
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        _mock_stage_run(harness.stages[0])
+        harness.stages[1].run = AsyncMock(
+            return_value=self._stage2_report(stage2_cycle_summary_ledger_written=1)
+        )
+        _mock_stage_run(harness.stages[2])
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage2_cycle_summary',
+            AsyncMock(),
+        ) as mock_write:
+            run = await harness.run_full_cycle('test-project', 'test-trigger')
+
+        assert run.status == RunStatus.completed
+        mock_write.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_absent_stat_does_not_fire(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """A Stage 2 report with no stage2_cycle_summary_ledger_written key at
+        all (the shape every stubbed-Stage-2 test in this file uses via
+        _mock_stage_run, and the shape BaseStage returns when the agent died
+        before recon_report.complete) must not be treated as a write failure —
+        only the explicit 0 is a failure signal. Keeps every existing stubbed
+        harness test in this file green."""
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        _mock_stage_run(harness.stages[0])
+        _mock_stage_run(harness.stages[1])
+        _mock_stage_run(harness.stages[2])
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage2_cycle_summary',
+            AsyncMock(),
+        ) as mock_write:
+            run = await harness.run_full_cycle('test-project', 'test-trigger')
+
+        assert run.status == RunStatus.completed
+        mock_write.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_recon_ledger_unwired_does_not_fire(
+        self, journal, event_buffer, mock_memory_service
+    ):
+        """recon_ledger_enabled=False is a supported production config whose
+        stat is ALWAYS 0 — firing there would re-attempt, and WARNING, every
+        single cycle for no reason."""
+        mock_memory_service.recon_ledger = None
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        _mock_stage_run(harness.stages[0])
+        harness.stages[1].run = AsyncMock(
+            return_value=self._stage2_report(stage2_cycle_summary_ledger_written=0)
+        )
+        _mock_stage_run(harness.stages[2])
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage2_cycle_summary',
+            AsyncMock(),
+        ) as mock_write:
+            run = await harness.run_full_cycle('test-project', 'test-trigger')
+
+        assert run.status == RunStatus.completed
+        mock_write.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stage2_never_ran_synthesizes_nothing(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """THE CORE SAFETY TEST — the cycle dies in Stage 1, so no
+        task_knowledge_sync key is ever recorded in run.stage_reports and
+        Stage 2 demonstrably never ran. The backstop must write nothing at
+        all: no re-attempt, and no cycle_summary row in the real ledger.
+
+        This is the regression lock on 'never fabricate a cycle that did not
+        happen' — the reason this method has no analogue of Stage 1's arm 1
+        raise-path synthesis."""
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.stages[0].run = AsyncMock(side_effect=RuntimeError('stage1 exploded'))
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage2_cycle_summary',
+            AsyncMock(),
+        ) as mock_write, pytest.raises(RuntimeError, match='stage1 exploded'):
+            await harness.run_full_cycle('test-project', 'test-trigger')
+
+        mock_write.assert_not_awaited()
+
+        recent = await journal.get_recent_runs('test-project', limit=1)
+        assert recent, 'expected the failed run to be persisted by the journal'
+        assert 'task_knowledge_sync' not in recent[0].stage_reports, (
+            'precondition: Stage 2 never produced a report on this cycle'
+        )
+        record = await ledger_store.get_by_identity(
+            'test-project', 'cycle_summary',
+            flag_type='task_knowledge_sync', run_id=recent[0].id,
+        )
+        assert record is None, (
+            'a run whose Stage 2 never ran must leave NO Stage 2 cycle_summary '
+            'row — synthesizing one would fabricate a cycle that did not happen'
+        )
+
+    # -- degraded-synth arm --------------------------------------------------
+    #
+    # The one remaining shape where Stage 2 demonstrably produced a report yet
+    # no faithful re-attempt is possible: the entry survives only as a plain
+    # dict. run.stage_reports is typed dict[str, StageReport | dict], and
+    # journal.py reconstructs StageReport(**v) only when
+    # isinstance(v, dict) and 'stage' in v — so an adopted/resumed run can
+    # carry one. A row is honest (Stage 2 ran); its real numbers are not
+    # recoverable, so the row is zeroed and self-identifies.
+
+    @staticmethod
+    def _run_with_stage2_entry(entry, **extra_reports) -> ReconciliationRun:
+        """A run carrying *entry* under the Stage 2 key.
+
+        The backstop reads only run.stage_reports and run.run_type and keys
+        its write on the run_id it is handed, so it is invoked directly here
+        rather than through a driver — the plain-dict entry shape cannot be
+        produced by a live in-process stage.run() at all (it arises from a
+        journal round-trip on an adopted/resumed run).
+        """
+        run = ReconciliationRun(
+            id=str(uuid.uuid4()),
+            project_id='test-project',
+            run_type=RunType.full,
+            trigger_reason='test-trigger',
+            started_at=datetime.now(UTC),
+        )
+        run.stage_reports['task_knowledge_sync'] = entry
+        run.stage_reports.update(extra_reports)
+        return run
+
+    @pytest.mark.asyncio
+    async def test_unusable_dict_report_writes_degraded_row(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """Uses a REAL ledger store (no patch) so the persisted row itself is
+        the assertion target."""
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        run = self._run_with_stage2_entry({'items_flagged': []})
+        anchor = datetime(2026, 8, 10, 9, 0, 0, tzinfo=UTC)
+        await harness._ensure_stage2_cycle_summary(
+            run, run.id, 'test-project', anchor,
+        )
+
+        record = await ledger_store.get_by_identity(
+            'test-project', 'cycle_summary',
+            flag_type='task_knowledge_sync', run_id=run.id,
+        )
+        assert record is not None, (
+            'a Stage 2 that ran but survives only as an unusable dict must still '
+            'leave an honest, degraded ledger row'
+        )
+        payload = json.loads(record.payload_json)
+        assert payload['llm_calls'] == 0
+        assert payload['tokens_used'] == 0
+        assert payload['items_flagged_count'] == 0
+        assert payload['stats'].get('stage2_cycle_summary_degraded_backstop') is True, (
+            'the synthesized row MUST self-identify — a consumer summing '
+            'llm_calls/tokens has to be able to filter it out or it undercounts'
+        )
+        assert 'stage2_cycle_summary_write_recovered_backstop' not in payload['stats'], (
+            'the degraded arm must never stamp the write-recovered marker'
+        )
+        assert datetime.fromisoformat(payload['started_at']) == anchor, (
+            "the anchor must be the cycle's own start, not a fabricated stage start"
+        )
+
+    @pytest.mark.asyncio
+    async def test_degraded_arm_stamps_error_breadcrumb(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """When the run already carries an _error record, the degraded arm
+        stamps its outcome there — the same place operators already look for
+        a failed cycle's diagnosis (mirrors the Stage 1 arm's breadcrumb)."""
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        run = self._run_with_stage2_entry(
+            {'items_flagged': []}, _error={'error_type': 'RuntimeError'},
+        )
+
+        await harness._ensure_stage2_cycle_summary(
+            run, run.id, 'test-project', datetime.now(UTC),
+        )
+
+        err = run.stage_reports.get('_error')
+        assert isinstance(err, dict)
+        assert err['stage2_cycle_summary_backstop_written'] is True
+
+    @pytest.mark.asyncio
+    async def test_degraded_arm_never_clobbers_an_existing_authoritative_row(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """Unlike the write-recovered arm, this arm has NO evidence Stage 2's
+        own write failed — it fires on the SHAPE of the stage_reports entry
+        alone. The ledger upsert is last-write-wins on the 5-part identity, so
+        firing blind over a Stage 2 that DID write its row would replace real
+        llm_calls/tokens with zeros: strictly worse than doing nothing. The arm
+        must read the row back first and skip."""
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            write_stage2_cycle_summary,
+        )
+
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+        run = self._run_with_stage2_entry({'items_flagged': []})
+
+        # An authoritative row for this identity already exists — Stage 2's own
+        # in-stage write landed it before the entry decayed to a plain dict.
+        written = await write_stage2_cycle_summary(
+            mock_memory_service,
+            'test-project',
+            self._stage2_report(stage2_cycle_summary_ledger_written=1),
+            run.id,
+        )
+        assert written is True
+
+        await harness._ensure_stage2_cycle_summary(
+            run, run.id, 'test-project', datetime.now(UTC),
+        )
+
+        record = await ledger_store.get_by_identity(
+            'test-project', 'cycle_summary',
+            flag_type='task_knowledge_sync', run_id=run.id,
+        )
+        assert record is not None
+        payload = json.loads(record.payload_json)
+        assert payload['llm_calls'] == 9 and payload['tokens_used'] == 900, (
+            'the degraded arm must never overwrite an authoritative row with zeros'
+        )
+        assert 'stage2_cycle_summary_degraded_backstop' not in payload['stats'], (
+            'the pre-existing honest row must survive unstamped'
+        )
+        assert run.stage_reports.get('_error') is None
+
+
+class TestStage2CycleSummaryRemediationBackstop:
+    """_run_remediation_pass's finally block fires the Stage 2 backstop too —
+    the DELIBERATE divergence from Stage 1 (task 3732).
+
+    Stage 1's arm 2 excludes RunType.remediation because its own run()
+    early-returns before its summary write on such a pass, so firing there
+    would fabricate a spurious row. Stage 2 is the exact opposite and its
+    source says so explicitly (the cross-reference comment above
+    TaskKnowledgeSync.run()'s write: the call "is unconditional — it also
+    fires on remediation passes, not just full cycles. That is intentional,
+    not a missed guard ... Do not 'fix' this to mirror Stage 1's
+    full-cycle-only gating"). A lost Stage 2 ledger write on a remediation
+    pass is therefore a genuine gap this backstop must close.
+    """
+
+    @pytest_asyncio.fixture
+    async def ledger_store(self, tmp_path):
+        from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
+
+        s = ReconLedgerStore(tmp_path / 'harness_backstop_ledger.db')
+        await s.initialize()
+        yield s
+        await s.close()
+
+    @staticmethod
+    def _build_harness(journal, event_buffer, mock_memory_service, ledger_store):
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        return _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    @staticmethod
+    async def _invoke_remediation(harness):
+        from fused_memory.reconciliation.harness import TierConfig
+
+        await harness._run_remediation_pass(
+            'test-project',
+            'parent-run-id',
+            [_make_s3_findings()[0]],
+            TierConfig(model='sonnet', episode_limit=100, memory_limit=200),
+            scope=_scope('test-project', '/tmp/test-project'),
+        )
+
+    @staticmethod
+    def _stage2_report(**stats) -> StageReport:
+        from fused_memory.models.reconciliation import StageId
+
+        return StageReport(
+            stage=StageId.task_knowledge_sync,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats=stats,
+            llm_calls=4,
+            tokens_used=400,
+        )
+
+    @pytest.mark.asyncio
+    async def test_remediation_stage2_write_failure_is_recovered(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """The row is recovered on a remediation pass (where Stage 1's arm
+        deliberately does NOT fire), and the recovered row is indistinguishable
+        from what the in-stage write would have stamped — payload['remediation']
+        is True, which get_cycle_summary_presence reads to disambiguate
+        expected-missing rows."""
+        harness = self._build_harness(
+            journal, event_buffer, mock_memory_service, ledger_store,
+        )
+        stage2_report = self._stage2_report(stage2_cycle_summary_ledger_written=0)
+        _mock_stage_run(harness.stages[0])
+        harness.stages[1].run = AsyncMock(return_value=stage2_report)
+        _mock_stage_run(harness.stages[2])
+
+        await self._invoke_remediation(harness)
+
+        recent = await journal.get_recent_runs('test-project', limit=1)
+        assert recent and recent[0].run_type == 'remediation', (
+            'expected the remediation run to be persisted by the journal'
+        )
+
+        record = await ledger_store.get_by_identity(
+            'test-project', 'cycle_summary',
+            flag_type='task_knowledge_sync', run_id=recent[0].id,
+        )
+        assert record is not None, (
+            'a lost Stage 2 ledger write on a remediation pass is a genuine gap — '
+            "Stage 2's in-stage write is unconditional by explicit design"
+        )
+        payload = json.loads(record.payload_json)
+        assert payload['remediation'] is True, (
+            'the recovered row must carry the same remediation flag the in-stage '
+            'write would have stamped'
+        )
+        assert payload['llm_calls'] == 4, (
+            'the re-attempt must reuse the REAL report, not a zeroed synth'
+        )
+        assert payload['stats'].get('stage2_cycle_summary_write_recovered_backstop') is True
+
+    @pytest.mark.asyncio
+    async def test_remediation_happy_path_does_not_fire(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """No remediation-specific over-firing: a pass whose Stage 2 write
+        succeeded (stat == 1) still leaves the backstop silent."""
+        harness = self._build_harness(
+            journal, event_buffer, mock_memory_service, ledger_store,
+        )
+        _mock_stage_run(harness.stages[0])
+        harness.stages[1].run = AsyncMock(
+            return_value=self._stage2_report(stage2_cycle_summary_ledger_written=1)
+        )
+        _mock_stage_run(harness.stages[2])
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage2_cycle_summary',
+            AsyncMock(),
+        ) as mock_write:
+            await self._invoke_remediation(harness)
+
+        mock_write.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_backstop_failure_is_contained_on_the_remediation_driver(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """The same containment contract on the second driver: a raising
+        Stage 2 backstop must not escape the finally (this call would
+        otherwise propagate RuntimeError out of _invoke_remediation), and the
+        persistence step that follows it must still run.
+
+        Asserts awaited-at-least-once rather than awaited-once: unlike
+        run_full_cycle, this driver persists stage reports at several points,
+        so the finally's call is not the only one."""
+        harness = self._build_harness(
+            journal, event_buffer, mock_memory_service, ledger_store,
+        )
+        _mock_stage_run(harness.stages[0])
+        harness.stages[1].run = AsyncMock(
+            return_value=self._stage2_report(stage2_cycle_summary_ledger_written=0)
+        )
+        _mock_stage_run(harness.stages[2])
+        harness.journal.update_run_stage_reports = AsyncMock()
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage2_cycle_summary',
+            AsyncMock(side_effect=RuntimeError('ledger boom')),
+        ):
+            await self._invoke_remediation(harness)
+
+        harness.journal.update_run_stage_reports.assert_awaited()
+
+
+class TestStage2CycleSummaryBackstopFailureContainment:
+    """The new Stage 2 arm inherits Stage 1's safety contract verbatim: it is
+    awaited unshielded in a finally, so an escaping exception would replace
+    whatever exception is already propagating AND skip the
+    update_run_stage_reports call that follows. It must also never be able to
+    starve the pre-existing Stage 1 arm (task 3732)."""
+
+    @pytest_asyncio.fixture
+    async def ledger_store(self, tmp_path):
+        from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
+
+        s = ReconLedgerStore(tmp_path / 'harness_backstop_ledger.db')
+        await s.initialize()
+        yield s
+        await s.close()
+
+    @staticmethod
+    def _report(stage_id, **stats) -> StageReport:
+        return StageReport(
+            stage=stage_id,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats=stats,
+            llm_calls=3,
+            tokens_used=300,
+        )
+
+    @pytest.mark.asyncio
+    async def test_does_not_mask_original_exception_or_skip_persistence(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """Stage 2 completes with a failed write (so the backstop FIRES), then
+        Stage 3 raises. The Stage 2 writer also raises. The original Stage 3
+        exception must still propagate, and update_run_stage_reports must
+        still be awaited — an unguarded backstop failure in a finally would
+        both replace the real exception and skip that persistence step.
+
+        Patches the WRITER, not the method: the method's own
+        `except BaseException` swallow IS the contract under test."""
+        from fused_memory.models.reconciliation import StageId
+
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        _mock_stage_run(harness.stages[0])
+        harness.stages[1].run = AsyncMock(
+            return_value=self._report(
+                StageId.task_knowledge_sync, stage2_cycle_summary_ledger_written=0,
+            )
+        )
+        harness.stages[2].run = AsyncMock(side_effect=RuntimeError('stage3 exploded'))
+        harness.journal.update_run_stage_reports = AsyncMock()
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage2_cycle_summary',
+            AsyncMock(side_effect=RuntimeError('ledger boom')),
+        ) as mock_write, pytest.raises(RuntimeError, match='stage3 exploded'):
+            await harness.run_full_cycle('test-project', 'buffer_size:2')
+
+        mock_write.assert_awaited_once()
+        harness.journal.update_run_stage_reports.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_stage2_failure_does_not_starve_the_stage1_arm(
+        self, journal, event_buffer, mock_memory_service, ledger_store
+    ):
+        """Ordering lock: BOTH arms fire on the same cycle, with the Stage 2
+        writer raising and Stage 1's writer real. The Stage 1 row must STILL
+        land — proving the new call sits after the Stage 1 arm and cannot
+        prevent it from running."""
+        from fused_memory.models.reconciliation import StageId
+
+        mock_memory_service.recon_ledger = ledger_store
+        mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        harness.stages[0].run = AsyncMock(
+            return_value=self._report(
+                StageId.memory_consolidator, stage1_cycle_summary_ledger_written=0,
+            )
+        )
+        harness.stages[1].run = AsyncMock(
+            return_value=self._report(
+                StageId.task_knowledge_sync, stage2_cycle_summary_ledger_written=0,
+            )
+        )
+        _mock_stage_run(harness.stages[2])
+
+        with patch(
+            'fused_memory.reconciliation.harness.write_stage2_cycle_summary',
+            AsyncMock(side_effect=RuntimeError('ledger boom')),
+        ) as mock_write:
+            run = await harness.run_full_cycle('test-project', 'test-trigger')
+
+        assert run.status == RunStatus.completed
+        mock_write.assert_awaited_once()
+
+        record = await ledger_store.get_by_identity(
+            'test-project', 'cycle_summary',
+            flag_type='memory_consolidator', run_id=run.id,
+        )
+        assert record is not None, (
+            "a Stage 2 backstop fault must never starve Stage 1's arm — the "
+            'Stage 1 row must still be written'
+        )
+        assert json.loads(record.payload_json)['stats'].get(
+            'stage1_cycle_summary_write_recovered_backstop'
+        ) is True
 
 
 @pytest.mark.asyncio
@@ -11659,6 +12531,413 @@ async def test_live_workflow_gate_threads_task_kind_for_blocked_deterministic_ci
         f'Expected is_workflow_live_for_task to receive task_kind="deterministic" '
         f'for task 2059; got received_task_kinds={received_task_kinds!r}'
     )
+
+
+# ---------------------------------------------------------------------------
+# Integrity-escalation gate: corroboration + pure_gate input parity (task 2964)
+# ---------------------------------------------------------------------------
+
+
+class TestIntegrityGateInputParityWithRenderer:
+    """The integrity-escalation gate must pass the SAME detector inputs as the
+    render-time Live-Workflow Signals section.
+
+    Three consumers compute liveness from one detector. Before task 2964 they
+    disagreed about what to feed it:
+
+    | consumer                       | status | task_kind | pure_gate | corroborated |
+    |--------------------------------|--------|-----------|-----------|--------------|
+    | _render_live_workflow_section   |  yes   |    yes    |    yes    |     yes      |
+    | recon_write_policy Gate 2       |  yes   |    yes    |    yes    |  NO -> yes   |
+    | this integrity gate             |  yes   |    yes    |  NO->yes  |  NO -> yes   |
+
+    Two remaining input gaps are closed here: `corroborated` (the in-progress
+    fleet-redeploy false positive, task 2963) and `pure_gate` (task 3751 wired
+    the renderer and the policy gate but not this one). After both, all three
+    consumers pass the identical status/task_kind/pure_gate/corroborated tuple.
+
+    Fail-safe direction at THIS consumer is unchanged and is the opposite
+    OUTCOME from Gate 2's — but each is its own pre-existing posture: any
+    corroboration error leaves corroborated=None, the detector gate stays inert,
+    and the escalation is still SUPPRESSED. This is never a new silencing path;
+    only an explicit corroborated=False lets a stranded escalation through.
+    """
+
+    _TASK_ID = '599'
+
+    @staticmethod
+    def _heartbeat(delta: timedelta) -> str:
+        """ISO heartbeat stamped *delta* from now (negative = past).
+
+        Stale/fresh margins are set against live_workflow_detector's
+        DEFAULT_HEARTBEAT_TTL (10 minutes) with enough slack that real-clock
+        drift during the test can never flip the verdict.
+        """
+        return (datetime.now(UTC) + delta).isoformat()
+
+    @classmethod
+    def _cited_task(cls, **overrides) -> dict:
+        """A killed-in-progress cited task: durable claimant, STALE heartbeat.
+
+        A killed workflow's `claimant_run_id` PERSISTS — heartbeat freshness,
+        not the claimant's presence, separates a live pipeline from a stranded
+        one. No routing metadata, and `_run_gate` stubs the other two
+        corroboration inputs to their empty forms (see there), so none of the
+        three corroborating signals can fire.
+        """
+        task = {
+            'id': int(cls._TASK_ID),
+            'title': 'Killed in-progress task',
+            'status': 'in-progress',
+            'claimant_run_id': 'run-dbfa3df8',
+            'heartbeat_at': cls._heartbeat(timedelta(minutes=-30)),
+            'metadata': {'task_kind': 'normal'},
+            'dependencies': [],
+        }
+        task.update(overrides)
+        return task
+
+    @staticmethod
+    async def _run_gate(
+        *, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+        caplog, cited_task, fake_is_live,
+    ) -> tuple[list, list]:
+        """Drive _run_remediation_pass's persistence-gated live-workflow gate once.
+
+        Verbatim reuse of the setup
+        test_live_workflow_gate_threads_task_kind_for_blocked_deterministic_cited_task
+        uses: _make_test_harness + an EscalationQueue(tmp_path / 'esc'),
+        taskmaster.get_tasks seeding remediation_tree with *cited_task*, the
+        _INTEGRITY_FINDING_RECURRENCE_THRESHOLD persistence-seeding loop, and a
+        stage-3 stub returning the actionable finding.
+
+        Returns ``(stranded_escalations, suppression_records)``.
+        """
+        import uuid as _uuid
+
+        from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+        import fused_memory.reconciliation.harness as harness_module
+        from fused_memory.reconciliation.harness import (
+            _INTEGRITY_FINDING_RECURRENCE_THRESHOLD,
+        )
+
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        harness._escalation_queue = esc_queue
+
+        actionable_finding = _make_finding_with_cited_task(str(cited_task['id']))
+        harness.taskmaster.get_tasks.return_value = {  # type: ignore[union-attr,attr-defined]
+            'tasks': [cited_task]
+        }
+
+        monkeypatch.setattr(harness_module, 'is_workflow_live_for_task', fake_is_live)
+
+        # Pin the two on-disk corroboration inputs to their empty forms. Every
+        # case in this class rests on "no scheduler/orchestrator signal can
+        # corroborate" — but _make_test_harness hard-codes project_root to the
+        # shared, pytest-unmanaged /tmp/test-project, so leaving these real would
+        # make the premise depend on that directory happening not to exist on the
+        # machine. A stale /tmp/test-project/data/orchestrator/scheduler_state.json
+        # dropped by any other process or developer would flip `corroborated` and
+        # break test_uncorroborated_in_progress_cited_task_escalates for reasons
+        # having nothing to do with the code under test. Stub values mirror the
+        # real absent-file returns exactly: read_scheduler_state's empty skeleton
+        # (scheduler_state.py::_empty_skeleton) and orchestrator_started_at's None
+        # for an absent/unparseable lock.
+        monkeypatch.setattr(
+            harness_module, 'read_scheduler_state',
+            lambda _root: {
+                'queue': [], 'parks': {}, 'park_stacks': {},
+                'effective_priorities': {}, 'pin_queue': [], 'overrides': {},
+                'current_holders': {}, 'is_paused': False, 'pause_reason': None,
+                'snapshot_at': None,
+            },
+        )
+        monkeypatch.setattr(harness_module, 'orchestrator_started_at', lambda _root: None)
+
+        n_seed = max(1, _INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 2)
+        base_time = datetime.now(UTC) - timedelta(minutes=n_seed + 1)
+        for i in range(n_seed):
+            rid = str(_uuid.uuid4())
+            run = ReconciliationRun(
+                id=rid,
+                project_id='test-project',
+                run_type=RunType.full,
+                trigger_reason='buffer_size:1',
+                started_at=base_time + timedelta(minutes=i),
+                events_processed=1,
+                status=RunStatus.running,
+            )
+            await journal.start_run(run)
+            await journal.update_run_stage_reports(
+                rid, {'integrity_check': {'items_flagged': [actionable_finding]}}
+            )
+            await journal.complete_run(rid, 'completed')
+
+        await event_buffer.push(_make_event())
+
+        async def s3_returns_finding(
+            events, watermark, prior_reports, run_id, model=None, _s=harness.stages[2],
+        ):
+            return StageReport(
+                stage=_s.stage_id,
+                started_at=datetime.now(UTC),
+                completed_at=datetime.now(UTC),
+                items_flagged=[actionable_finding],
+                stats={},
+                llm_calls=0,
+                tokens_used=0,
+            )
+
+        _mock_stage_run(harness.stages[0])
+        _mock_stage_run(harness.stages[1])
+        harness.stages[2].run = s3_returns_finding
+
+        with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
+            await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+        stranded = [
+            e for e in esc_queue.get_pending()
+            if e.category == 'recon_integrity_issue'
+            and 'Persistently unresolved' in e.summary
+        ]
+        suppressed = [
+            r for r in caplog.records
+            if r.getMessage()
+            == 'reconciliation.integrity_escalation_suppressed_live_workflow'
+        ]
+        return stranded, suppressed
+
+    # ----- corroboration (task 2963 -> this consumer) -----
+
+    @pytest.mark.asyncio
+    async def test_uncorroborated_in_progress_cited_task_escalates(
+        self, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch, caplog,
+    ):
+        """THE FIX — a killed-but-lingering in-progress cited task no longer
+        silences its stranded-work escalation.
+
+        The fake reports live for EVERYTHING except corroborated=False, so this
+        passes only if the harness actually forwards the real verdict. A pre-fix
+        call site passes no `corroborated` kwarg at all — kw.get('corroborated')
+        is None, the task reads as live, and the escalation is suppressed
+        forever while the renderer has already stopped listing it.
+        """
+        received: list[bool | None] = []
+
+        def _fake_is_live(_tid, _pr, **kw):
+            received.append(kw.get('corroborated'))
+            return kw.get('corroborated') is not False
+
+        stranded, suppressed = await self._run_gate(
+            journal=journal, event_buffer=event_buffer,
+            mock_memory_service=mock_memory_service, tmp_path=tmp_path,
+            monkeypatch=monkeypatch, caplog=caplog,
+            cited_task=self._cited_task(), fake_is_live=_fake_is_live,
+        )
+
+        assert False in received, (
+            f'Expected is_workflow_live_for_task to receive corroborated=False '
+            f'for the stale-heartbeat in-progress task; got {received!r}'
+        )
+        assert len(stranded) >= 1, (
+            'Expected a stranded-work escalation for the uncorroborated '
+            'in-progress cited task; got none'
+        )
+        assert suppressed == [], (
+            f'Expected NO suppression log; got affected_ids: '
+            f'{[r.__dict__.get("affected_ids") for r in suppressed]}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_fresh_heartbeat_cited_task_is_still_suppressed(
+        self, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch, caplog,
+    ):
+        """DIFFERENTIAL — a genuinely live workflow is still protected. The ONLY
+        difference from the case above is heartbeat freshness."""
+        received: list[bool | None] = []
+
+        def _fake_is_live(_tid, _pr, **kw):
+            received.append(kw.get('corroborated'))
+            return kw.get('corroborated') is not False
+
+        stranded, suppressed = await self._run_gate(
+            journal=journal, event_buffer=event_buffer,
+            mock_memory_service=mock_memory_service, tmp_path=tmp_path,
+            monkeypatch=monkeypatch, caplog=caplog,
+            cited_task=self._cited_task(
+                heartbeat_at=self._heartbeat(timedelta(seconds=-5)),
+            ),
+            fake_is_live=_fake_is_live,
+        )
+
+        assert received == [True], (
+            f'Expected corroborated=True for the fresh-heartbeat task; got {received!r}'
+        )
+        assert stranded == [], (
+            f'Expected the escalation to be SUPPRESSED for a live workflow; got '
+            f'{[e.summary for e in stranded]}'
+        )
+        assert len(suppressed) >= 1, 'Expected a suppression log for the live task'
+
+    @pytest.mark.asyncio
+    async def test_non_in_progress_cited_task_gets_corroborated_none(
+        self, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch, caplog,
+    ):
+        """INERT — the gate is in-progress-only, mirroring the renderer's
+        `task.get('status') == 'in-progress'` guard. Every other status keeps its
+        exact pre-2964 verdict, which for a blocked cited task under the bare
+        lock is: suppressed."""
+        received: list[bool | None] = []
+
+        def _fake_is_live(_tid, _pr, **kw):
+            received.append(kw.get('corroborated'))
+            return kw.get('corroborated') is not False
+
+        stranded, suppressed = await self._run_gate(
+            journal=journal, event_buffer=event_buffer,
+            mock_memory_service=mock_memory_service, tmp_path=tmp_path,
+            monkeypatch=monkeypatch, caplog=caplog,
+            cited_task=self._cited_task(status='blocked'),
+            fake_is_live=_fake_is_live,
+        )
+
+        assert received == [None], (
+            f'Expected corroborated=None for a non-in-progress cited task; '
+            f'got {received!r}'
+        )
+        assert stranded == []
+        assert len(suppressed) >= 1
+
+    # ----- pure_gate (task 3751 rule 5 -> this consumer) -----
+    #
+    # The last remaining harness-vs-renderer input gap. Task 3751 wired
+    # `pure_gate` into _render_live_workflow_section AND into
+    # recon_write_policy.check(), but not into this gate — so a cited PENDING
+    # deterministic PURE GATE still disagreed with Live-Workflow Signals, the
+    # same class of divergence this task exists to close.
+
+    @classmethod
+    def _pure_gate_task(cls, **overrides) -> dict:
+        """Task 3845's verified real metadata shape: `always_escalates` with NO
+        `before_done`, in status `pending`.
+
+        Such a task's ENTIRE run is "file one born-at-L2 escalation, stamp
+        gate_escalated_at, set blocked" — no script, no systemd, no git_ops — so
+        it never acquires a worktree or branch and the bare project-wide lock is
+        never task-specific evidence for it.
+        """
+        fields = {
+            'status': 'pending',
+            'metadata': {'task_kind': 'deterministic', 'always_escalates': True},
+        }
+        fields.update(overrides)
+        return cls._cited_task(**fields)
+
+    @pytest.mark.asyncio
+    async def test_pending_pure_gate_cited_task_escalates(
+        self, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch, caplog,
+    ):
+        """THE FIX — a cited pending deterministic PURE GATE is not suppressed by
+        the bare project-wide orchestrator lock.
+
+        The fake reports not-live ONLY for task_kind='deterministic' AND
+        pure_gate is True, so this passes only if the harness forwards BOTH. A
+        pre-fix call site passes no `pure_gate` kwarg at all.
+        """
+        received: list[tuple] = []
+
+        def _fake_is_live(_tid, _pr, **kw):
+            received.append((kw.get('task_kind'), kw.get('pure_gate')))
+            return not (
+                kw.get('task_kind') == 'deterministic' and kw.get('pure_gate') is True
+            )
+
+        stranded, suppressed = await self._run_gate(
+            journal=journal, event_buffer=event_buffer,
+            mock_memory_service=mock_memory_service, tmp_path=tmp_path,
+            monkeypatch=monkeypatch, caplog=caplog,
+            cited_task=self._pure_gate_task(), fake_is_live=_fake_is_live,
+        )
+
+        assert ('deterministic', True) in received, (
+            f'Expected the gate to forward task_kind="deterministic" AND '
+            f'pure_gate=True for the pending pure gate; got {received!r}'
+        )
+        assert len(stranded) >= 1, (
+            'Expected a stranded-work escalation for the cited pending pure gate'
+        )
+        assert suppressed == []
+
+    @pytest.mark.asyncio
+    async def test_before_done_deterministic_cited_task_is_still_suppressed(
+        self, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch, caplog,
+    ):
+        """NARROWING — a deterministic task WITH a truthy `before_done` forwards
+        pure_gate=False, so detector rule 5 stays inert and the lock keeps
+        protecting it while it may be mid-deploy inside DeterministicRunner (a
+        blocking script run leaves no git evidence, and the task's status stays
+        'pending' throughout)."""
+        received: list[tuple] = []
+
+        def _fake_is_live(_tid, _pr, **kw):
+            received.append((kw.get('task_kind'), kw.get('pure_gate')))
+            return not (
+                kw.get('task_kind') == 'deterministic' and kw.get('pure_gate') is True
+            )
+
+        stranded, suppressed = await self._run_gate(
+            journal=journal, event_buffer=event_buffer,
+            mock_memory_service=mock_memory_service, tmp_path=tmp_path,
+            monkeypatch=monkeypatch, caplog=caplog,
+            cited_task=self._pure_gate_task(metadata={
+                'task_kind': 'deterministic',
+                'always_escalates': True,
+                'before_done': {'kind': 'predicate', 'script': 'x.sh'},
+            }),
+            fake_is_live=_fake_is_live,
+        )
+
+        assert received == [('deterministic', False)], (
+            f'Expected pure_gate=False for a deterministic task WITH before_done; '
+            f'got {received!r}'
+        )
+        assert stranded == []
+        assert len(suppressed) >= 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'metadata', [None, 'not-a-dict', 42, []],
+        ids=['none', 'str', 'int', 'list'],
+    )
+    async def test_malformed_metadata_forwards_pure_gate_false(
+        self, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+        caplog, metadata,
+    ):
+        """FAIL-SAFE — an absent or non-Mapping metadata blob forwards
+        pure_gate=False (toward live), relying on is_pure_gate_metadata's own
+        documented non-Mapping -> False contract rather than a guard at the call
+        site. Only POSITIVE evidence of the pure-gate shape suppresses the lock.
+        """
+        received: list[tuple] = []
+
+        def _fake_is_live(_tid, _pr, **kw):
+            received.append((kw.get('task_kind'), kw.get('pure_gate')))
+            return True
+
+        await self._run_gate(
+            journal=journal, event_buffer=event_buffer,
+            mock_memory_service=mock_memory_service, tmp_path=tmp_path,
+            monkeypatch=monkeypatch, caplog=caplog,
+            cited_task=self._cited_task(status='pending', metadata=metadata),
+            fake_is_live=_fake_is_live,
+        )
+
+        assert received == [(None, False)], (
+            f'Expected task_kind=None, pure_gate=False for metadata={metadata!r}; '
+            f'got {received!r}'
+        )
 
 
 @pytest.mark.asyncio

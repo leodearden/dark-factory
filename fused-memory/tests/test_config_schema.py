@@ -174,6 +174,135 @@ class TestLLMConfigProvider:
             LLMConfig(provider='cohere')  # type: ignore[arg-type]
 
 
+class TestLLMConfigClientClass:
+    """Tests for LLMConfig.client_class / structured_output_mode Literal validation.
+
+    Both knobs are restart-tier by omission (config/reload.py RELOADABLE_FIELDS
+    carries no ``llm.*`` leaf) and BOTH default to today's behaviour — the task's
+    binding acceptance condition is that the shipped config stays byte-identical.
+    """
+
+    def test_default_client_class_is_openai(self):
+        config = LLMConfig()
+        assert config.client_class == 'openai'
+
+    def test_valid_client_class_openai(self):
+        config = LLMConfig(client_class='openai')
+        assert config.client_class == 'openai'
+
+    def test_valid_client_class_openai_generic(self):
+        config = LLMConfig(client_class='openai_generic')
+        assert config.client_class == 'openai_generic'
+
+    def test_invalid_client_class_ollama_raises_validation_error(self):
+        with pytest.raises(ValidationError):
+            LLMConfig(client_class='ollama')  # type: ignore[arg-type]
+
+    def test_invalid_client_class_empty_raises_validation_error(self):
+        with pytest.raises(ValidationError):
+            LLMConfig(client_class='')  # type: ignore[arg-type]
+
+    def test_default_structured_output_mode_is_auto(self):
+        config = LLMConfig()
+        assert config.structured_output_mode == 'auto'
+
+    def test_valid_structured_output_mode_json_object(self):
+        config = LLMConfig(
+            client_class='openai_generic', structured_output_mode='json_object',
+        )
+        assert config.structured_output_mode == 'json_object'
+
+    def test_invalid_structured_output_mode_raises_validation_error(self):
+        with pytest.raises(ValidationError):
+            LLMConfig(structured_output_mode='json_schema_strict')  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize('client_class', ['openai', None])
+    def test_json_object_without_the_generic_client_is_rejected(self, client_class):
+        """The knob pair must not be settable into a silently-inert state.
+
+        structured_output_mode is read on exactly one arm of build_llm_client.
+        An operator who uncomments it but forgets client_class would otherwise
+        get stock Responses-API behaviour with no warning, no log line and no
+        error — the no-silent-fail-soft failure mode
+        (docs/legibility/design-invariants.md). ``None`` covers omitting
+        client_class entirely, i.e. leaving it at its 'openai' default.
+        """
+        kwargs = {'structured_output_mode': 'json_object'}
+        if client_class is not None:
+            kwargs['client_class'] = client_class
+
+        with pytest.raises(ValidationError) as exc:
+            LLMConfig(**kwargs)  # type: ignore[arg-type]
+
+        message = str(exc.value)
+        assert 'structured_output_mode' in message and 'client_class' in message, (
+            f'the error must name BOTH knobs so the fix is obvious: {message}'
+        )
+
+    def test_auto_mode_is_accepted_on_every_client_class(self):
+        """The default combination stays valid on both arms — the validator
+        must gate the opt-in, not the shipped configuration."""
+        assert LLMConfig(client_class='openai').structured_output_mode == 'auto'
+        assert LLMConfig(client_class='openai_generic').structured_output_mode == 'auto'
+
+    @pytest.mark.parametrize('yaml_name', ['config.yaml', 'config-docker.yaml'])
+    def test_shipped_config_yaml_does_not_opt_in(self, monkeypatch, yaml_name):
+        """The shipped deployment YAMLs must leave BOTH knobs at their defaults.
+
+        Byte-identical guard: uncommenting either knob would change the
+        constructed graphiti LLM client for every existing deployment. The
+        examples in those files are deliberately commented out. Both files are
+        checked — config-docker.yaml is what containerised deployments load, so
+        guarding only config.yaml would leave that half unguarded.
+        """
+        yaml_path = Path(__file__).resolve().parent.parent / 'config' / yaml_name
+        assert yaml_path.is_file(), f'expected {yaml_name} at {yaml_path}'
+        monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
+        cfg = FusedMemoryConfig()
+        assert cfg.llm.client_class == 'openai', (
+            f'fused-memory/config/{yaml_name} must leave llm.client_class at its '
+            "'openai' default — the openai_generic example must stay commented out."
+        )
+        assert cfg.llm.structured_output_mode == 'auto', (
+            f'fused-memory/config/{yaml_name} must leave llm.structured_output_mode '
+            "at its 'auto' default — the json_object example must stay commented out."
+        )
+
+    @pytest.mark.parametrize('yaml_name', ['config.yaml', 'config-docker.yaml'])
+    def test_shipped_config_yaml_shares_one_openai_api_url_default(
+        self, monkeypatch, yaml_name,
+    ):
+        """llm and embedder provider blocks must resolve to the SAME api_url.
+
+        Both are ``${OPENAI_API_URL:https://api.openai.com/v1}`` today. Independent
+        LLM/embedder endpoints come from setting the two blocks to different
+        literals — but the shipped DEFAULT must stay shared, so a deployment that
+        sets only OPENAI_API_URL keeps pointing both at one endpoint.
+        """
+        yaml_path = Path(__file__).resolve().parent.parent / 'config' / yaml_name
+        assert yaml_path.is_file(), f'expected {yaml_name} at {yaml_path}'
+        monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
+
+        # Unset so the ${...:default} branch is exercised deterministically,
+        # independent of the developer's environment.
+        monkeypatch.delenv('OPENAI_API_URL', raising=False)
+        cfg = FusedMemoryConfig()
+        assert cfg.llm.providers.openai is not None
+        assert cfg.embedder.providers.openai is not None
+        assert cfg.llm.providers.openai.api_url == 'https://api.openai.com/v1'
+        assert (
+            cfg.llm.providers.openai.api_url == cfg.embedder.providers.openai.api_url
+        ), f'llm and embedder api_url defaults must stay identical in {yaml_name}'
+
+        # And when it IS set, both blocks follow it together.
+        monkeypatch.setenv('OPENAI_API_URL', 'http://127.0.0.1:1234/v1')
+        cfg2 = FusedMemoryConfig()
+        assert cfg2.llm.providers.openai is not None
+        assert cfg2.embedder.providers.openai is not None
+        assert cfg2.llm.providers.openai.api_url == 'http://127.0.0.1:1234/v1'
+        assert cfg2.embedder.providers.openai.api_url == 'http://127.0.0.1:1234/v1'
+
+
 class TestEmbedderConfigProvider:
     """Tests for EmbedderConfig.provider Literal validation."""
 
@@ -725,11 +854,22 @@ class TestMem0UpdateConfig:
         """A named kill switch, defaulting ON — the tool ships usable."""
         assert Mem0UpdateConfig().enabled is True
 
-    def test_default_content_amend_allowlist_is_recon_stage(self):
-        assert Mem0UpdateConfig().content_amend_allowed_agent_prefixes == ['recon-stage-']
+    def test_default_content_amend_allowlist_is_recon_stage_and_curator(self):
+        """recon-stage- admits every reconciliation stage; curator- admits the
+        interactive consolidation sitting (esc-3524-1 ruling (b), promoted to
+        an all-deployments schema default by ruling 2026-08-12 because
+        skills/curate-fused-memories does not work without the grant)."""
+        assert Mem0UpdateConfig().content_amend_allowed_agent_prefixes == [
+            'recon-stage-', 'curator-',
+        ]
 
-    def test_default_metadata_patch_allowlist_is_recon_stage(self):
-        assert Mem0UpdateConfig().metadata_patch_allowed_agent_prefixes == ['recon-stage-']
+    def test_default_metadata_patch_allowlist_is_recon_stage_and_curator(self):
+        """curator- deliberately holds BOTH arms: gate 3200's retain-and-tag
+        stamps retained peers via metadata-only patches, so content_amend alone
+        would be the destructive half without the preserving half."""
+        assert Mem0UpdateConfig().metadata_patch_allowed_agent_prefixes == [
+            'recon-stage-', 'curator-',
+        ]
 
     def test_default_storm_threshold_is_20(self):
         assert Mem0UpdateConfig().storm_threshold == 20
@@ -746,8 +886,10 @@ class TestMem0UpdateConfig:
         cfg = Mem0UpdateConfig()
         assert cfg.content_amend_allowed_agent_prefixes is not \
             cfg.metadata_patch_allowed_agent_prefixes
-        cfg.metadata_patch_allowed_agent_prefixes.append('curator-')
-        assert cfg.content_amend_allowed_agent_prefixes == ['recon-stage-'], (
+        cfg.metadata_patch_allowed_agent_prefixes.append('auditor-')
+        assert cfg.content_amend_allowed_agent_prefixes == [
+            'recon-stage-', 'curator-',
+        ], (
             'widening one list must not mutate the other, got '
             f'{cfg.content_amend_allowed_agent_prefixes!r}'
         )
@@ -755,7 +897,7 @@ class TestMem0UpdateConfig:
     def test_separate_instances_do_not_share_lists(self):
         a, b = Mem0UpdateConfig(), Mem0UpdateConfig()
         a.content_amend_allowed_agent_prefixes.append('x-')
-        assert b.content_amend_allowed_agent_prefixes == ['recon-stage-']
+        assert b.content_amend_allowed_agent_prefixes == ['recon-stage-', 'curator-']
 
     # --- overrides accepted ---
 
@@ -763,13 +905,13 @@ class TestMem0UpdateConfig:
         cfg = Mem0UpdateConfig(
             enabled=False,
             content_amend_allowed_agent_prefixes=[],
-            metadata_patch_allowed_agent_prefixes=['recon-stage-', 'curator-'],
+            metadata_patch_allowed_agent_prefixes=['recon-stage-', 'auditor-'],
             storm_threshold=5,
             storm_window_seconds=600.0,
         )
         assert cfg.enabled is False
         assert cfg.content_amend_allowed_agent_prefixes == []
-        assert cfg.metadata_patch_allowed_agent_prefixes == ['recon-stage-', 'curator-']
+        assert cfg.metadata_patch_allowed_agent_prefixes == ['recon-stage-', 'auditor-']
         assert cfg.storm_threshold == 5
         assert cfg.storm_window_seconds == 600.0
 
@@ -793,12 +935,21 @@ class TestMem0UpdateConfig:
 
     # --- wired onto FusedMemoryConfig as a top-level section ---
 
-    def test_top_level_field_with_default_factory(self):
-        """An unconfigured deployment still gets the narrow allowlists."""
+    def test_top_level_field_with_default_factory(self, tmp_path, monkeypatch):
+        """An unconfigured deployment still gets the narrow allowlists.
+
+        CONFIG_PATH is pinned at a missing file because a bare
+        ``FusedMemoryConfig()`` is a BaseSettings that otherwise loads
+        ``config/config.yaml`` from the test cwd — which made this test
+        silently assert on the shipped YAML, not the schema default, and
+        was one of the three 65b011ed8c tripwire casualties."""
+        monkeypatch.setenv('CONFIG_PATH', str(tmp_path / 'missing.yaml'))
         cfg = FusedMemoryConfig()
         assert isinstance(cfg.mem0_update, Mem0UpdateConfig)
         assert cfg.mem0_update.enabled is True
-        assert cfg.mem0_update.content_amend_allowed_agent_prefixes == ['recon-stage-']
+        assert cfg.mem0_update.content_amend_allowed_agent_prefixes == [
+            'recon-stage-', 'curator-',
+        ]
 
     def test_field_is_bare_submodel_not_optional(self):
         """Bare (non-Optional) so config/reload.py's _iter_leaves descends into
@@ -1608,7 +1759,7 @@ class TestProceduralTopicClusterTopicIdSlug:
         than at an operator's config load.
         """
         clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
-        assert len(clusters) >= 5
+        assert clusters, 'the seed must not be empty, or this asserts nothing'
         for cluster in clusters:
             assert is_valid_topic_slug(cluster.topic_id)
 
@@ -1701,28 +1852,64 @@ MERGE_BASE_NEGATIVE_CONTROL_NOTE = (
 class TestProceduralTopicGuardClustersDefault:
     """ReconciliationConfig seeds all known topic-guard clusters by default.
 
-    Mix of known-contradictory (plan-tools, venv-shadowing, architect
-    report_task_already_done main-reachability) and known-recurring
+    Mix of known-contradictory (architect report_task_already_done
+    main-reachability, `npx pyright` EACCES) and known-recurring
     (pytest-xdist, architect plan-revalidation after requeue/lock, `ruff
-    format` not an enforced gate) topics -- see the >=6 count and the
-    per-topic-id assertions below.
+    format` not an enforced gate) topics -- see the exact-set assertion
+    below.
+
+    The set is asserted EXACTLY, not as a lower bound. It was a ``>= 6``
+    floor plus per-id ``in`` checks, which could only catch a cluster going
+    MISSING; retiring a cluster is now a normal operation on this seed
+    (two already have been), so the failure this class must catch is a
+    cluster silently coming BACK.
     """
+
+    # The surviving seed, in seed order. `npx-pyright-eacces-agent-sandbox`
+    # (task 3862) was registered prospectively ahead of its still-blocked
+    # human gate 3417, on the same precedent as the two architect clusters
+    # and ruff-format.
+    EXPECTED = (
+        'pytest-xdist-serial-override',
+        'architect-report-task-already-done-main-reachability',
+        'architect-plan-revalidation-requeue-lock',
+        'ruff-format-not-an-enforced-gate',
+        'npx-pyright-eacces-agent-sandbox',
+    )
+
+    # Retired, and pinned as retired. Both carried a hint routing a blocked
+    # writer to a human gate task that is now ``done`` (2841 / 2844), and
+    # both double-counted one concept as two spelling-variant phrases
+    # ('eval-worktree' / 'eval worktree') at min_phrase_hits=2 -- so merely
+    # NAMING the eval worktree in both spellings scored 2 and blocked the
+    # write with no on-topic content in it at all. The matcher-level fix for
+    # that double-count is task 4179; these two do not wait for it.
+    RETIRED = (
+        'eval-worktree-plan-tools-missing',
+        'eval-worktree-venv-shadowing',
+    )
 
     def test_default_seeds_non_empty_clusters(self):
         clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
         assert isinstance(clusters, list)
-        assert len(clusters) >= 7
+        assert len(clusters) == len(self.EXPECTED)
 
-    def test_default_seeds_all_known_topic_ids(self):
+    def test_default_seeds_exactly_the_known_topic_ids(self):
         clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
-        topic_ids = {c.topic_id for c in clusters}
-        assert 'eval-worktree-plan-tools-missing' in topic_ids
-        assert 'eval-worktree-venv-shadowing' in topic_ids
-        assert 'pytest-xdist-serial-override' in topic_ids
-        assert 'architect-report-task-already-done-main-reachability' in topic_ids
-        assert 'architect-plan-revalidation-requeue-lock' in topic_ids
-        assert 'ruff-format-not-an-enforced-gate' in topic_ids
-        assert 'npx-pyright-eacces-agent-sandbox' in topic_ids
+        assert [c.topic_id for c in clusters] == list(self.EXPECTED)
+
+    @pytest.mark.parametrize('topic_id', RETIRED)
+    def test_retired_cluster_is_absent(self, topic_id):
+        """A retired cluster must stay retired.
+
+        Asserted per-id (rather than folded into the exact-set test above)
+        so a reinstatement names WHICH cluster came back in the failure
+        line, and so the two retirements cannot be undone by an edit that
+        happens to keep ``len(EXPECTED)`` intact by swapping one id for
+        another.
+        """
+        clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
+        assert topic_id not in {c.topic_id for c in clusters}
 
     def test_pytest_xdist_cluster_hint_points_at_canonical_memory(self):
         cluster = _seeded_cluster('pytest-xdist-serial-override')
@@ -1750,7 +1937,14 @@ class TestProceduralTopicGuardClustersDefault:
         format' (ruff-format cluster, task 3435) and bare 'plan.json' beside
         '.task/plan.json' (plan-revalidation cluster). So the guard is
         asserted over EVERY seeded cluster rather than one, and holds for all
-        six today.
+        four today.
+
+        NOT sufficient on its own: the two RETIRED eval-worktree clusters
+        each carried 'eval-worktree' beside 'eval worktree' -- one concept,
+        two spelling-variant phrases, neither nesting inside the other --
+        which scored two distinct hits off a single mention and passed this
+        test cleanly. Sibling spelling variants are task 4179's matcher-level
+        fix, not this invariant's.
 
         Compared by INDEX, not identity: two phrases that are accidentally
         equal must fail here too (an exact duplicate is the degenerate
@@ -1912,14 +2106,19 @@ class TestArchitectPlanRevalidationRequeueLockCluster:
         clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
         assert find_matching_topic_cluster('A warm-lane reseed happened.', clusters) is None
 
-    def test_full_default_cluster_list_resolves_here_not_plan_tools_cluster(self):
-        # eval-worktree-plan-tools-missing is seeded earlier in the default
-        # list and find_matching_topic_cluster returns the FIRST qualifying
-        # cluster, so a plan-revalidation note must not be shadowed by it.
-        # The note below hits only 1 distinct phrase on that earlier cluster
-        # ('plan.json', via '.task/plan.json') -- below its min_phrase_hits
-        # of 2 -- so matching correctly falls through to this cluster's own
-        # >=2 hits ('.task/plan.json', 'plan-revalidation', 'requeue rebase').
+    def test_full_default_cluster_list_resolves_here_not_another_cluster(self):
+        # find_matching_topic_cluster returns the FIRST qualifying cluster in
+        # seed order, so a plan-revalidation note must reach THIS cluster and
+        # not be shadowed by an earlier one. Historically the shadowing risk
+        # was concrete: eval-worktree-plan-tools-missing was seeded first and
+        # carried bare 'plan.json', which the note below substring-matches
+        # via '.task/plan.json' -- 1 distinct hit, below that cluster's
+        # min_phrase_hits of 2, so it fell through even then. That cluster is
+        # now retired, which removes the risk rather than the need for the
+        # test: this pins that a note reaches its own cluster against the
+        # WHOLE seeded list, not against this cluster in isolation.
+        # The note scores >=2 here ('.task/plan.json', 'plan-revalidation',
+        # 'requeue rebase').
         clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
         note = (
             'During architect plan-revalidation after a requeue rebase, check '

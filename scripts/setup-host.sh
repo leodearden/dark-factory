@@ -151,14 +151,22 @@ fi
 #     only the timer is enabled below. `systemctl enable` on it would error.
 #
 # Drift direction (task 3641): know-live and pump-web-ui were transcribed from
-# the running host into the repo, i.e. committed-follows-installed. Task 3642
-# (2026-08-06) reconciled know-live's host unit — reinstalled from the
-# committed template, daemon-reload + restart — so this installer run is now
-# a genuine no-op for know-live. pump-web-ui's RestartSteps=4 remains the one
-# line intentionally ahead of the host: a declared forward-fix (see that
-# template's own header, owned by task 3424) which this run still propagates
-# outward — without it systemd ignores that unit's RestartMaxDelaySec= cap and
-# its advertised 10s->60s backoff never engages.
+# the running host into the repo, i.e. committed-follows-installed. BOTH have
+# since been reconciled back in the installer's direction — know-live by task
+# 3642 (2026-08-06, reinstall + daemon-reload + restart) and pump-web-ui by
+# task 3763 (2026-08-08, reinstall from the committed template + daemon-reload;
+# no restart was needed, the reloaded config takes effect at the next restart
+# scheduling) — so this installer run is now a genuine no-op for BOTH
+# transcribed units, with no committed line left ahead of the host in either.
+# pump-web-ui's RestartSteps=4 was the last such line: without it systemd
+# ignores that unit's RestartMaxDelaySec= cap and its advertised 10s->60s
+# backoff never engages. It is now installed and live (`systemctl --user show
+# orchestrator-pump-web-ui.service -p RestartSteps` reports 4, and
+# `systemd-analyze --user verify` no longer warns for this unit). That
+# template's own header — the forward-fix note owned by task 3424 — is
+# deliberately retained as the standing instruction to any future parity pass
+# NOT to reconcile RestartSteps=4 back out, since a rebuilt host or a stale
+# re-install would reopen exactly the gap it warns about.
 #
 # The orchestrator units run `uv run --frozen ...`, so process start never
 # implicitly re-syncs the shared dark-factory/.venv. After any dependency change

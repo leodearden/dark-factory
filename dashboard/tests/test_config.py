@@ -14,7 +14,7 @@ import logging
 import pytest
 import yaml
 
-from dashboard.config import _discover_escalation_urls
+from dashboard.config import DashboardConfig, _discover_escalation_urls
 
 _LOGGER_NAME = 'dashboard.config'
 
@@ -22,6 +22,13 @@ _LOGGER_NAME = 'dashboard.config'
 def _write_yaml(path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(data))
+
+
+def _write_raw(path, text: str) -> None:
+    """Write literal (possibly malformed) YAML text — for cases ``_write_yaml``
+    can't produce, e.g. unparseable or wrong-typed-at-the-root documents."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
 
 
 class TestCanonicalConfigPreferred:
@@ -69,32 +76,33 @@ class TestCanonicalConfigPreferred:
         assert 'myproj' in records[0].getMessage()
 
     @pytest.mark.parametrize(
-        ('earlier_raw', 'expect_parse_warning'),
+        ('earlier_raw', 'expect_parse_warning', 'expect_mapping_warning'),
         [
-            (yaml.safe_dump({'escalation': {'host': '127.0.0.1'}}), False),
-            ('escalation: [unclosed', True),
+            (yaml.safe_dump({'escalation': {'host': '127.0.0.1'}}), False, False),
+            ('escalation: [unclosed', True, False),
+            ('escalation: not-a-dict', False, True),
         ],
-        ids=['portless-earlier', 'unparseable-earlier'],
+        ids=['portless-earlier', 'unparseable-earlier', 'non-mapping-earlier'],
     )
     def test_legacy_fallthrough_past_bad_earlier_spelling(
-        self, tmp_path, caplog, earlier_raw, expect_parse_warning
+        self, tmp_path, caplog, earlier_raw, expect_parse_warning, expect_mapping_warning
     ):
         """A no-URL earlier legacy spelling does not halt the fallback loop.
 
         With the canonical config absent, ``_discover_root_escalation_url``
-        iterates ``_LEGACY_CONFIG_NAMES`` in order. A portless or unparseable
-        config at an EARLIER spelling (``orchestrator.yaml``) must not stop
-        iteration nor be treated as authoritative — resolution continues to a
-        LATER legacy spelling (``orchestrator/config.yaml``) that carries a
-        valid port, still emitting the 'please migrate' nudge naming the
-        project. Guards against a regression that stopped after the first
-        legacy candidate returned None.
+        iterates ``_LEGACY_CONFIG_NAMES`` in order. A portless, unparseable,
+        or non-mapping-``escalation:`` config at an EARLIER spelling
+        (``orchestrator.yaml``) must not stop iteration nor be treated as
+        authoritative — resolution continues to a LATER legacy spelling
+        (``orchestrator/config.yaml``) that carries a valid port, still
+        emitting the 'please migrate' nudge naming the project. Guards
+        against a regression that stopped after the first legacy candidate
+        returned None.
         """
         root = tmp_path / 'myproj'
         # Earlier spelling (first in _LEGACY_CONFIG_NAMES): yields no URL.
         earlier = root / 'orchestrator.yaml'
-        earlier.parent.mkdir(parents=True, exist_ok=True)
-        earlier.write_text(earlier_raw)
+        _write_raw(earlier, earlier_raw)
         # Later spelling (last in _LEGACY_CONFIG_NAMES): valid port.
         _write_yaml(root / 'orchestrator/config.yaml', {'escalation': {'port': 9202}})
 
@@ -110,6 +118,8 @@ class TestCanonicalConfigPreferred:
         assert str(root / 'orchestrator/config.yaml') in migrate_msgs[0]
         # Unparseable earlier config additionally logs one parse-failure warning.
         assert sum('Failed to read' in m for m in messages) == (1 if expect_parse_warning else 0)
+        # Non-mapping-escalation earlier config logs one mapping-type warning.
+        assert sum('not a mapping' in m for m in messages) == (1 if expect_mapping_warning else 0)
         # The root DID resolve — no no-URL warning fired.
         assert not any('No escalation URL discovered' in m for m in messages)
 
@@ -186,7 +196,7 @@ class TestNoUrlWarnsNamingRoot:
         """
         root = tmp_path / 'myproj'
         _write_yaml(root / 'orchestrator.yaml', {'escalation': {'port': 9202}})
-        (root / 'dark-factory-orchestrator.yaml').write_text('escalation: [unclosed')
+        _write_raw(root / 'dark-factory-orchestrator.yaml', 'escalation: [unclosed')
 
         with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
             result = _discover_escalation_urls([root])
@@ -199,6 +209,201 @@ class TestNoUrlWarnsNamingRoot:
         assert sum('Failed to read' in m for m in messages) == 1
         assert sum('No escalation URL discovered' in m for m in messages) == 1
         assert not any('please migrate' in m for m in messages)
+
+
+class TestNonMappingEscalationSection:
+    """Scope 3: a non-mapping ``escalation:`` value, a non-mapping YAML
+    root, or a wrong-typed ``host``/``port`` leaf inside an otherwise
+    well-formed ``escalation:`` mapping, is malformed configuration. All
+    three map to the same warn-and-return-None path as a YAML parse error
+    — never to an exception, and never to a silently-malformed URL —
+    regardless of whether the wrong-typed value is truthy (``'x'``, ``5``,
+    ``true``, ``[a, b]``) or falsy (``[]``).
+    """
+
+    @pytest.mark.parametrize(
+        ('raw_body', 'type_name'),
+        [
+            ('escalation: not-a-dict', 'str'),
+            ('escalation: 5', 'int'),
+            ('escalation: true', 'bool'),
+            ('escalation: [a, b]', 'list'),
+            ('escalation: []', 'list'),
+        ],
+        ids=['str', 'int', 'bool', 'nonempty-list', 'empty-list'],
+    )
+    def test_non_mapping_escalation_warns_and_skips(
+        self, tmp_path, caplog, raw_body, type_name
+    ):
+        """A non-mapping ``escalation:`` value warns and yields no URL — never raises.
+
+        Covers both truthy wrong-typed values (which previously raised
+        ``AttributeError`` out of ``_discover_escalation_urls``) and the
+        falsy ``[]`` case (which previously degraded silently, with no
+        file-naming warning at all — only the caller's generic no-URL
+        warning fired).
+        """
+        root = tmp_path / 'myproj'
+        canonical_path = root / 'dark-factory-orchestrator.yaml'
+        _write_raw(canonical_path, raw_body)
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            result = _discover_escalation_urls([root])
+
+        assert result == {}
+        records = [r for r in caplog.records if r.name == _LOGGER_NAME]
+        assert len(records) == 2
+        assert all(r.levelno == logging.WARNING for r in records)
+        messages = [r.getMessage() for r in records]
+        mapping_msgs = [
+            m
+            for m in messages
+            if 'not a mapping' in m and str(canonical_path) in m and type_name in m
+        ]
+        assert len(mapping_msgs) == 1
+        assert sum('No escalation URL discovered' in m for m in messages) == 1
+        assert not any('please migrate' in m for m in messages)
+
+    @pytest.mark.parametrize(
+        ('raw_body', 'type_name'),
+        [
+            ('just-a-string', 'str'),
+            ('- a\n- b', 'list'),
+            ('[]', 'list'),
+        ],
+        ids=['scalar-root', 'list-root', 'empty-list-root'],
+    )
+    def test_non_mapping_yaml_root_warns_and_skips(
+        self, tmp_path, caplog, raw_body, type_name
+    ):
+        """A YAML document whose top-level value is not a mapping warns and yields no URL.
+
+        Pins that the pre-existing root guard becomes diagnostic — naming
+        the file and the offending type — rather than silently swallowing
+        the file. Includes the FALSY ``[]`` root: a naive ``safe_load(f) or
+        {}`` coalesce would silently rewrite an empty-list document into
+        ``{}`` before the mapping check ever saw it, reopening exactly the
+        truthy/falsy asymmetry this module already closed for
+        ``escalation:`` values (see the class docstring) one level up, at
+        the whole-document level.
+        """
+        root = tmp_path / 'myproj'
+        canonical_path = root / 'dark-factory-orchestrator.yaml'
+        _write_raw(canonical_path, raw_body)
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            result = _discover_escalation_urls([root])
+
+        assert result == {}
+        records = [r for r in caplog.records if r.name == _LOGGER_NAME]
+        assert len(records) == 2
+        assert all(r.levelno == logging.WARNING for r in records)
+        messages = [r.getMessage() for r in records]
+        mapping_msgs = [
+            m
+            for m in messages
+            if 'not a mapping' in m and str(canonical_path) in m and type_name in m
+        ]
+        assert len(mapping_msgs) == 1
+
+    def test_non_mapping_canonical_is_authoritative_over_valid_legacy(self, tmp_path, caplog):
+        """A non-mapping canonical config is NOT masked by a valid legacy config.
+
+        Mirrors ``test_malformed_canonical_is_authoritative_over_valid_legacy``
+        for the type-check branch: the canonical file's mere presence — even
+        with a wrong-typed ``escalation:`` — makes it authoritative, so
+        resolution never falls through to the legacy port.
+        """
+        root = tmp_path / 'myproj'
+        _write_yaml(root / 'orchestrator.yaml', {'escalation': {'port': 9202}})
+        _write_raw(root / 'dark-factory-orchestrator.yaml', 'escalation: not-a-dict')
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            result = _discover_escalation_urls([root])
+
+        assert result == {}
+        records = [r for r in caplog.records if r.name == _LOGGER_NAME]
+        assert len(records) == 2
+        assert all(r.levelno == logging.WARNING for r in records)
+        messages = [r.getMessage() for r in records]
+        assert sum('not a mapping' in m for m in messages) == 1
+        assert sum('No escalation URL discovered' in m for m in messages) == 1
+        assert not any('please migrate' in m for m in messages)
+
+    @pytest.mark.parametrize(
+        ('escalation_value', 'field_name', 'type_name'),
+        [
+            ({'host': ['a'], 'port': 9101}, 'escalation.host', 'list'),
+            ({'host': '127.0.0.1', 'port': [9101]}, 'escalation.port', 'list'),
+        ],
+        ids=['bad-host-type', 'bad-port-type'],
+    )
+    def test_non_mapping_leaf_warns_and_skips(
+        self, tmp_path, caplog, escalation_value, field_name, type_name
+    ):
+        """A wrong-typed ``host`` or ``port`` LEAF warns and yields no URL — never a bad URL.
+
+        ``escalation:`` here is itself a well-formed mapping (unlike the
+        other tests in this class); only a leaf inside it is wrong-typed.
+        Without validating the leaves, a wrong-typed ``host`` or ``port``
+        previously formatted straight into the URL string with no
+        diagnostic at all — e.g. ``host: [a]`` silently produced
+        ``"http://['a']:9101/mcp"``, a malformed URL that would only fail
+        much later, at request time, with an opaque connection error
+        instead of a startup warning naming the file.
+        """
+        root = tmp_path / 'myproj'
+        canonical_path = root / 'dark-factory-orchestrator.yaml'
+        _write_yaml(canonical_path, {'escalation': escalation_value})
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            result = _discover_escalation_urls([root])
+
+        assert result == {}
+        records = [r for r in caplog.records if r.name == _LOGGER_NAME]
+        assert len(records) == 2
+        assert all(r.levelno == logging.WARNING for r in records)
+        messages = [r.getMessage() for r in records]
+        leaf_msgs = [
+            m for m in messages if field_name in m and str(canonical_path) in m and type_name in m
+        ]
+        assert len(leaf_msgs) == 1
+        assert sum('No escalation URL discovered' in m for m in messages) == 1
+        assert not any('please migrate' in m for m in messages)
+
+    def test_startup_survives_a_malformed_project_config(self, tmp_path, caplog):
+        """``DashboardConfig()`` construction survives a malformed known-project config.
+
+        The blast-radius regression: one operator typo in one *known*
+        project's config must not abort dashboard startup for the process
+        as a whole. Exercised at the real entry point
+        (``DashboardConfig.__post_init__``), not just the private discovery
+        helper — a future try/except added only around the helper's callers
+        would leave a helper-only suite green over a still-broken startup.
+
+        ``main_root`` carries a VALID config so the assertion can tell
+        "survived and skipped the bad root" apart from "gave up on
+        everything": against an all-broken fixture, both an implementation
+        that aborts the whole discovery loop on the first malformed root
+        and one that unconditionally returns ``{}`` would still pass a bare
+        ``== {}`` assertion.
+        """
+        main_root = tmp_path / 'main'
+        _write_yaml(main_root / 'dark-factory-orchestrator.yaml', {'escalation': {'port': 9101}})
+        broken_root = tmp_path / 'broken'
+        broken_canonical = broken_root / 'dark-factory-orchestrator.yaml'
+        _write_raw(broken_canonical, 'escalation: not-a-dict')
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            cfg = DashboardConfig(project_root=main_root, known_project_roots=[broken_root])
+
+        # The good root still resolves despite the broken sibling.
+        assert cfg.escalation_urls == {'main': 'http://127.0.0.1:9101/mcp'}
+        messages = [r.getMessage() for r in caplog.records if r.name == _LOGGER_NAME]
+        mapping_msgs = [
+            m for m in messages if 'not a mapping' in m and str(broken_canonical) in m
+        ]
+        assert len(mapping_msgs) == 1
 
 
 class TestMultiRootDiscovery:

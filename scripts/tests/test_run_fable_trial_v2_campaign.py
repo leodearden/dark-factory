@@ -25,11 +25,24 @@ from pathlib import Path
 import pytest
 import run_fable_trial_v2_campaign as mod
 
+_PRE_SIGMA = (mod.MARKER_KEY,)
+"""``drop_metrics`` argument for a cell that PREDATES eval-revival σ (task 3628).
+
+σ declared ``judged_without_reference`` on ``EvalMetrics``, and ``to_dict`` is a
+bare ``asdict``, so every cell the live instrument emits now carries the key —
+that presence-on-every-cell property is exactly what this driver's per-cell
+validity rule (``MARKER_KEY not in metrics`` -> not known-good) reads, and it
+must NOT be weakened to a conditional emit. But a keyless cell remains a real
+input: ``--results-dir`` replays artifacts written by pre-σ runs. Dropping the
+key EXPLICITLY at those call sites states that premise on purpose, instead of
+inheriting it from the dataclass not yet having the field.
+"""
+
 
 def _cell(
     task_id, config_name, *, trial=1, plan_quality=None, plan_steps=0,
     role_under_test='architect', cap_tainted=False, invocation_error=None,
-    cost_usd=0.0, judge_cost_usd=0.0, extra_metrics=None,
+    cost_usd=0.0, judge_cost_usd=0.0, extra_metrics=None, drop_metrics=(),
 ):
     """Build a synthetic ``EvalResult`` with a production-shaped metrics dict.
 
@@ -38,10 +51,12 @@ def _cell(
     predicate the report layer reads — a cell declaring a ``plan_quality``
     without the step count it came from is a self-contradictory fixture.
 
-    ``extra_metrics`` merges keys the current ``EvalMetrics`` has no field for.
-    That is exactly how ``judged_without_reference`` will arrive once
-    eval-revival σ (task 3628) adds the field, so tests can exercise the
-    post-σ world without the driver forward-referencing an unlanded instrument.
+    ``extra_metrics`` merges keys on top of the dataclass's own fields, and
+    ``drop_metrics`` pops named keys AFTER that merge, yielding a genuinely
+    KEYLESS cell. Since σ (task 3628) landed, ``judged_without_reference`` is a
+    declared field and so arrives on every cell this helper builds; a call site
+    that needs the pre-σ shape must therefore ask for it with
+    ``drop_metrics=_PRE_SIGMA``. Do not pass the same key in both.
     """
     from orchestrator.evals.metrics import EvalMetrics
     from orchestrator.evals.runner import EvalResult
@@ -56,6 +71,8 @@ def _cell(
         invocation_error=invocation_error,
     )
     metrics = {**m.to_dict(), **(extra_metrics or {})}
+    for key in drop_metrics:
+        metrics.pop(key, None)
     return EvalResult(
         task_id=task_id,
         config_name=config_name,
@@ -67,17 +84,27 @@ def _cell(
 
 
 def _mixed_results():
-    """Candidate A with one cap-tainted cell, candidate B with one no-plan cell."""
+    """Candidate A with one cap-tainted cell, candidate B with one no-plan cell.
+
+    Every cell is PRE-σ (keyless), which is what makes this the fixture for the
+    "instrument never measured reference validity" direction — the corpus a
+    ``--results-dir`` replay of an old run produces.
+    """
     return [
         # A: one transport refusal (never got to ask the model) + two scored cells.
         _cell('f1', 'architect-opus-max', cap_tainted=True,
-              invocation_error='architect: cap_hit'),
-        _cell('f2', 'architect-opus-max', plan_quality=0.80, plan_steps=6),
-        _cell('f3', 'architect-opus-max', plan_quality=0.60, plan_steps=4),
+              invocation_error='architect: cap_hit', drop_metrics=_PRE_SIGMA),
+        _cell('f2', 'architect-opus-max', plan_quality=0.80, plan_steps=6,
+              drop_metrics=_PRE_SIGMA),
+        _cell('f3', 'architect-opus-max', plan_quality=0.60, plan_steps=4,
+              drop_metrics=_PRE_SIGMA),
         # B: one genuine no-plan measurement + two scored cells.
-        _cell('f1', 'architect-fable-high', plan_quality=0.0, plan_steps=0),
-        _cell('f2', 'architect-fable-high', plan_quality=0.70, plan_steps=5),
-        _cell('f3', 'architect-fable-high', plan_quality=0.50, plan_steps=3),
+        _cell('f1', 'architect-fable-high', plan_quality=0.0, plan_steps=0,
+              drop_metrics=_PRE_SIGMA),
+        _cell('f2', 'architect-fable-high', plan_quality=0.70, plan_steps=5,
+              drop_metrics=_PRE_SIGMA),
+        _cell('f3', 'architect-fable-high', plan_quality=0.50, plan_steps=3,
+              drop_metrics=_PRE_SIGMA),
     ]
 
 
@@ -91,7 +118,8 @@ def _mixed_marker_results():
     cells carrying the key alongside the old ones that never could.
     """
     return [
-        _cell('f_pre', 'A', plan_steps=5, plan_quality=0.95),
+        _cell('f_pre', 'A', plan_steps=5, plan_quality=0.95,
+              drop_metrics=_PRE_SIGMA),
         _cell('f_post', 'A', plan_steps=5, plan_quality=0.95,
               extra_metrics={'judged_without_reference': False}),
     ]
@@ -402,30 +430,27 @@ def test_rows_are_sorted_by_config_name():
 
 
 def test_marker_absent_everywhere_reports_none_not_zero():
-    """With today's instrument, the count is ``None`` for every candidate.
+    """Over a wholly pre-σ corpus, the count is ``None`` for every candidate.
 
     Asserting ``is None`` and NOT ``== 0`` is the whole point. The marker's
-    producer is eval-revival σ (task 3628), which is unlanded, so no cell can
-    carry the key yet. ``EvalMetrics.to_dict()`` is an ``asdict`` and therefore
-    emits every DECLARED field, which makes "key absent on every cell" mean
-    unambiguously "this instrument predates σ" rather than "no offending cell".
+    producer is eval-revival σ (task 3628); cells written before it landed
+    cannot carry the key, and ``--results-dir`` still replays them.
+    ``EvalMetrics.to_dict()`` is an ``asdict`` and therefore emits every
+    DECLARED field, which makes "key absent on every cell" mean unambiguously
+    "these cells predate σ" rather than "no offending cell".
     Reporting ``0`` would let ``plan_quality`` read as fully validity-bounded
     when nothing bounded it — the silent degradation the PRD exists to end.
     """
     results = _mixed_results()
 
-    counts = mod.count_judged_without_reference(results)
+    rows = {r['config_name']: r for r in mod.summarize_candidates(results)}
 
-    assert set(counts) == {'architect-opus-max', 'architect-fable-high'}
-    assert all(v is None for v in counts.values())
-    assert all(
-        row['judged_without_reference'] is None
-        for row in mod.summarize_candidates(results)
-    )
+    assert set(rows) == {'architect-opus-max', 'architect-fable-high'}
+    assert all(row[mod.MARKER_KEY] is None for row in rows.values())
 
 
 def test_marker_present_counts_per_candidate():
-    """Once σ lands, the key simply starts appearing and the Nones become counts."""
+    """With σ landed the key is simply present, and the Nones become real counts."""
     results = [
         _cell('f1', 'A', plan_quality=0.8, plan_steps=5,
               extra_metrics={'judged_without_reference': True}),
@@ -441,10 +466,10 @@ def test_marker_present_counts_per_candidate():
               extra_metrics={'judged_without_reference': False}),
     ]
 
-    counts = mod.count_judged_without_reference(results)
+    rows = {r['config_name']: r for r in mod.summarize_candidates(results)}
 
     # B's 0 is a REAL measurement here, precisely because the key IS present.
-    assert counts == {'A': 2, 'B': 0}
+    assert {name: row[mod.MARKER_KEY] for name, row in rows.items()} == {'A': 2, 'B': 0}
 
 
 def test_only_architect_cells_are_counted():
@@ -463,7 +488,9 @@ def test_only_architect_cells_are_counted():
               extra_metrics={'judged_without_reference': True}),
     ]
 
-    assert mod.count_judged_without_reference(results) == {'A': 0}
+    rows = {r['config_name']: r for r in mod.summarize_candidates(results)}
+
+    assert {name: row[mod.MARKER_KEY] for name, row in rows.items()} == {'A': 0}
 
 
 def test_rendered_table_marks_unmeasured_loudly():
@@ -544,13 +571,14 @@ def test_cap_tainted_cell_bands_unmeasured():
 def test_marker_unavailable_never_bands_ceiling():
     """THE load-bearing D6 safety rule: unknown validity can never discard.
 
-    With σ unlanded the driver cannot know whether a cell was judged against a
-    real reference diff, so the ceiling band's "valid reference exists" conjunct
-    is unsatisfiable and no fixture can be discarded. D6 is explicit about the
+    For a cell carrying no marker the driver cannot know whether it was judged
+    against a real reference diff, so the ceiling band's "valid reference
+    exists" conjunct is unsatisfiable and that fixture can never be discarded.
+    D6 is explicit about the
     asymmetry: misbanding-to-retain costs ~$20 of stage-2 spend, while
     misbanding-to-discard loses signal permanently.
     """
-    m = _metrics(plan_steps=5, plan_quality=0.95)
+    m = _metrics(plan_steps=5, plan_quality=0.95, drop_metrics=_PRE_SIGMA)
     assert mod.MARKER_KEY not in m, 'premise: this cell predates σ and carries no marker'
 
     assert mod.band_for_cell(m, 0.80) == 'intermittent'
@@ -944,7 +972,7 @@ def test_band_for_cell_reads_validity_per_cell():
     that looks load-bearing but is not is precisely the trap that produced this
     bug.
     """
-    keyless = _metrics(plan_steps=5, plan_quality=0.95)
+    keyless = _metrics(plan_steps=5, plan_quality=0.95, drop_metrics=_PRE_SIGMA)
     judged_without = _metrics(plan_steps=5, plan_quality=0.95,
                               extra_metrics={'judged_without_reference': True})
     validly_judged = _metrics(plan_steps=5, plan_quality=0.95,
@@ -966,19 +994,28 @@ def test_mixed_corpus_count_reads_unmeasured_not_zero():
     validity-bounded when one of the two cells was never bounded at all.
     Verified first-hand that the pre-fix code returned ``{'A': 0}`` here.
     """
-    counts = mod.count_judged_without_reference(_mixed_marker_results())
+    rows = {r['config_name']: r for r in mod.summarize_candidates(_mixed_marker_results())}
 
-    assert counts['A'] is None
-    assert counts['A'] != 0
+    assert rows['A'][mod.MARKER_KEY] is None
+    assert rows['A'][mod.MARKER_KEY] != 0
 
 
 def test_unmeasured_marker_cells_are_counted_per_candidate():
     """``None`` alone cannot distinguish 1-of-50 unmeasured from 50-of-50.
 
-    So the driver also reports HOW MANY architect cells lacked the key, which
-    makes a partially-instrumented corpus legible rather than merely unknown.
+    So the row also reports HOW MANY scored cells lacked the key, which makes a
+    partially-instrumented corpus legible rather than merely unknown. Every cell
+    below is in the admitted pool, so the count is the same one an all-architect
+    -cells scan would give — the two populations diverge only on a cap-tainted
+    cell, which is pinned separately.
     """
-    assert mod.count_unmeasured_marker_cells(_mixed_marker_results()) == {'A': 1}
+    def _unmeasured(results):
+        return {
+            r['config_name']: r[mod.UNMEASURED_CELLS_KEY]
+            for r in mod.summarize_candidates(results)
+        }
+
+    assert _unmeasured(_mixed_marker_results()) == {'A': 1}
 
     fully_keyed = [
         _cell('f1', 'A', plan_steps=5, plan_quality=0.9,
@@ -986,14 +1023,14 @@ def test_unmeasured_marker_cells_are_counted_per_candidate():
         _cell('f2', 'A', plan_steps=5, plan_quality=0.9,
               extra_metrics={'judged_without_reference': True}),
     ]
-    assert mod.count_unmeasured_marker_cells(fully_keyed) == {'A': 0}
+    assert _unmeasured(fully_keyed) == {'A': 0}
 
     fully_keyless = [
-        _cell('f1', 'A', plan_steps=5, plan_quality=0.9),
-        _cell('f2', 'A', plan_steps=5, plan_quality=0.9),
-        _cell('f3', 'A', plan_steps=5, plan_quality=0.9),
+        _cell('f1', 'A', plan_steps=5, plan_quality=0.9, drop_metrics=_PRE_SIGMA),
+        _cell('f2', 'A', plan_steps=5, plan_quality=0.9, drop_metrics=_PRE_SIGMA),
+        _cell('f3', 'A', plan_steps=5, plan_quality=0.9, drop_metrics=_PRE_SIGMA),
     ]
-    assert mod.count_unmeasured_marker_cells(fully_keyless) == {'A': 3}
+    assert _unmeasured(fully_keyless) == {'A': 3}
 
 
 def test_implementer_cell_missing_the_key_does_not_poison_the_count():
@@ -1009,11 +1046,14 @@ def test_implementer_cell_missing_the_key_does_not_poison_the_count():
               extra_metrics={'judged_without_reference': True}),
         _cell('f2', 'A', plan_steps=5, plan_quality=0.9,
               extra_metrics={'judged_without_reference': False}),
-        _cell('f3', 'A', role_under_test='implementer'),  # no marker key at all
+        # No marker key at all: the role filter must reject it BEFORE the key check.
+        _cell('f3', 'A', role_under_test='implementer', drop_metrics=_PRE_SIGMA),
     ]
 
-    assert mod.count_judged_without_reference(results) == {'A': 1}
-    assert mod.count_unmeasured_marker_cells(results) == {'A': 0}
+    row = {r['config_name']: r for r in mod.summarize_candidates(results)}['A']
+
+    assert row[mod.MARKER_KEY] == 1
+    assert row[mod.UNMEASURED_CELLS_KEY] == 0
 
 
 def test_uniform_corpora_are_unchanged():
@@ -1023,9 +1063,11 @@ def test_uniform_corpora_are_unchanged():
     corpus still reports every count ``None`` and discards nothing, and an
     all-keyed corpus still counts and bands exactly as it did.
     """
-    # All keyless (today's instrument): unmeasured everywhere, nothing discarded.
+    # All keyless (a pre-σ artifact replay): unmeasured everywhere, nothing discarded.
     keyless = _mixed_results()
-    assert all(v is None for v in mod.count_judged_without_reference(keyless).values())
+    assert all(
+        row[mod.MARKER_KEY] is None for row in mod.summarize_candidates(keyless)
+    )
     assert mod.partition_bands(keyless, 0.80)['discarded'] == []
 
     # All keyed (post-σ): real counts, and the ceiling band is reachable again.
@@ -1037,12 +1079,196 @@ def test_uniform_corpora_are_unchanged():
         _cell('f3', 'A', plan_steps=5, plan_quality=0.99,
               extra_metrics={'judged_without_reference': True}),
     ]
-    assert mod.count_judged_without_reference(keyed) == {'A': 1}
+    assert {
+        r['config_name']: r[mod.MARKER_KEY] for r in mod.summarize_candidates(keyed)
+    } == {'A': 1}
     part = mod.partition_bands(keyed, 0.80)
     assert part['discarded'] == ['f1']
     assert part['by_fixture'] == {
         'f1': 'ceiling', 'f2': 'intermittent', 'f3': 'intermittent',
     }
+
+
+# ===== review round 1: ONE marker count, SURFACED — never a second derivation =====
+#
+# Reproduced first-hand on this branch before these tests existed.
+# ``summarize_candidates`` builds ``build_plan_quality_report(results)`` and then,
+# one line later, RE-DERIVES the same per-candidate marker count itself. The two
+# implementations aggregate over DIFFERENT populations: the report layer counts
+# only the ADMITTED pool (a cap-tainted cell never reaches the count — pinned by
+# ``orchestrator/tests/test_eval_architect.py``'s
+# ``test_a_keyless_cap_tainted_cell_does_not_poison_the_count``), while this
+# driver's ``_architect_cells`` yields EVERY architect cell, cap-tainted ones
+# included. Measured on ``_cap_tainted_keyless_corpus()`` below:
+#
+#     build_plan_quality_report(results)['configs'][A]
+#         -> judged_without_reference=1, judged_without_reference_unmeasured=0
+#     summarize_candidates(results)[A]
+#         -> judged_without_reference=None, ..._unmeasured_cells=1
+#
+# So ONE keyless (pre-σ) cap-tainted cell poisoned the driver's answer to
+# UNMEASURED while the report object the same function had just built printed a
+# real number. That corpus is the NORMAL transition state, not a corner: γ1's
+# recipe re-runs cap-tainted fixtures, so a post-σ re-run writes keyed cells
+# beside older keyless ones. Two operator-facing surfaces, built inside one
+# function from one input, contradicting each other about one quantity is exactly
+# what ``report.py``:334-340 and ``metrics.py`` assert three times over must not
+# happen — "two consumers of one field must not answer the same question
+# differently".
+
+
+def _report_entries(results):
+    """The report layer's per-config accumulator, keyed by ``config_name``."""
+    from orchestrator.evals.report import build_plan_quality_report
+
+    return {c['config_name']: c for c in build_plan_quality_report(results)['configs']}
+
+
+def _summary_rows(results):
+    """The driver's per-candidate summary rows, keyed by ``config_name``."""
+    return {r['config_name']: r for r in mod.summarize_candidates(results)}
+
+
+def _cap_tainted_keyless_corpus():
+    """Two admitted keyed cells (one judged blind) + one PRE-σ cap-tainted cell.
+
+    The minimal corpus on which the two surfaces diverged: everything in the
+    ADMITTED pool is measured, so the report layer answers ``1``; the only
+    keyless cell is the one that never entered that pool.
+    """
+    return [
+        _cell('f1', 'A', plan_quality=0.8, plan_steps=5,
+              extra_metrics={mod.MARKER_KEY: True}),
+        _cell('f2', 'A', plan_quality=0.6, plan_steps=5,
+              extra_metrics={mod.MARKER_KEY: False}),
+        _cell('f3', 'A', plan_steps=5, cap_tainted=True,
+              invocation_error='architect: cap_hit', drop_metrics=_PRE_SIGMA),
+    ]
+
+
+def test_a_keyless_cap_tainted_cell_does_not_poison_the_summary():
+    """THE reproduction, kept as the agreement pin between the two surfaces.
+
+    THE POPULATION RULE: a cap-tainted cell has NO ``plan_quality`` to bound, so
+    its keylessness cannot make the candidate's bound unknown. It never entered
+    the admitted pool the count describes, and it is already counted —
+    disjointly — by ``cap_excluded``. Nothing is hidden by declining to poison
+    here: :func:`band_for_cell` still bands that very cell ``unmeasured`` at rung
+    1, per cell, where the question asked is a different one.
+    """
+    results = _cap_tainted_keyless_corpus()
+    assert mod.MARKER_KEY not in results[2].metrics, (
+        'premise: this cell is keyless on purpose (drop_metrics=_PRE_SIGMA)'
+    )
+
+    entry = _report_entries(results)['A']
+    row = _summary_rows(results)['A']
+
+    assert row[mod.MARKER_KEY] == entry['judged_without_reference'] == 1
+    assert (
+        row[mod.UNMEASURED_CELLS_KEY]
+        == entry['judged_without_reference_unmeasured']
+        == 0
+    )
+
+
+def test_a_keyless_admitted_cell_still_reads_unmeasured_on_both_surfaces():
+    """ANTI-OVERCORRECTION: the ``None`` direction must survive the fix.
+
+    A keyless cell INSIDE the admitted pool did contribute a ``plan_quality`` to
+    the candidate's aggregate, and nothing measured whether a reference bounded
+    it — so the bound is genuinely unknown and both surfaces must say so. Without
+    this pin the fix could degenerate into "always report a number", which is the
+    fabricated ``0`` the whole marker exists to prevent.
+    """
+    results = _mixed_marker_results()
+
+    entry = _report_entries(results)['A']
+    row = _summary_rows(results)['A']
+
+    assert row[mod.MARKER_KEY] is entry['judged_without_reference'] is None
+    assert (
+        row[mod.UNMEASURED_CELLS_KEY]
+        == entry['judged_without_reference_unmeasured']
+        == 1
+    )
+
+
+@pytest.mark.parametrize('corpus', [_mixed_results, _mixed_marker_results],
+                         ids=['mixed_results', 'mixed_marker_results'])
+def test_both_marker_values_agree_with_the_report_layer(corpus):
+    """Field for field, over every corpus this module already builds.
+
+    THE pin that stops the two accumulators drifting again — and it is cheap to
+    extend when a future corpus is added, which is the point of parametrizing it
+    rather than asserting on one fixture.
+    """
+    results = corpus()
+
+    entries = _report_entries(results)
+    rows = _summary_rows(results)
+
+    assert set(rows) == set(entries)
+    for name, row in rows.items():
+        entry = entries[name]
+        assert row[mod.MARKER_KEY] == entry['judged_without_reference'], (
+            f'{name}: marker count drifted from the report layer'
+        )
+        assert (
+            row[mod.UNMEASURED_CELLS_KEY]
+            == entry['judged_without_reference_unmeasured']
+        ), f'{name}: unmeasured-cell count drifted from the report layer'
+
+
+def test_an_empty_admitted_pool_answers_zero_on_both_surfaces():
+    """A vacuous pool reports ``0``, identically, and visibly is not a quality claim.
+
+    The single cell is cap-tainted but KEYED, so keylessness is not the variable:
+    what is pinned is that "no admitted cell was judged blind" over an empty pool
+    is a deliberate ``0`` rather than an accident of which surface answered.
+    ``mean_plan_quality is None`` is asserted alongside so the ``0`` cannot be
+    read as a claim about quality — nothing scored at all.
+    """
+    results = [
+        _cell('f1', 'A', plan_steps=5, cap_tainted=True,
+              invocation_error='architect: cap_hit',
+              extra_metrics={mod.MARKER_KEY: False}),
+    ]
+
+    entry = _report_entries(results)['A']
+    row = _summary_rows(results)['A']
+
+    assert row[mod.MARKER_KEY] == entry['judged_without_reference'] == 0
+    assert (
+        row[mod.UNMEASURED_CELLS_KEY]
+        == entry['judged_without_reference_unmeasured']
+        == 0
+    )
+    assert row['mean_plan_quality'] is entry['mean_plan_quality'] is None
+
+
+def test_the_rendered_fraction_quotes_one_population():
+    """``unmeasured (N of M cells)`` must not mix an admitted N with an all-cells M.
+
+    ``architect-opus-max`` in :func:`_mixed_results` has 3 architect cells but
+    only 2 admitted ones, and every cell is keyless — so the numerator (keyless
+    ADMITTED cells) is 2 and the denominator must be ``n``, not ``total``.
+    Rendering ``3 of 3`` would quote a numerator from one population against a
+    denominator from another and overstate how much of the admitted pool went
+    unmeasured. Asserted on the NUMBERS in that candidate's own line, not on the
+    surrounding prose, and not on the whole report — ``architect-fable-high``
+    legitimately reads ``3 of 3`` (n == total == 3 there).
+    """
+    report = {'candidates': mod.summarize_candidates(_mixed_results())}
+
+    text = mod.format_campaign_report(report)
+
+    line = next(
+        line for line in text.splitlines()
+        if line.startswith('architect-opus-max')
+    )
+    assert '2 of 2' in line, line
+    assert '3 of 3' not in line, line
 
 
 # ===== step 17: --results-dir must not silently absorb out-of-campaign cells =====
@@ -1620,12 +1846,14 @@ def test_missing_config_exits_naming_the_flag(tmp_path, monkeypatch):
 
 
 def test_architect_cells_is_the_single_source_of_the_role_filter():
-    """Both the counting and the banding paths consume ONE role filter.
+    """The banding path consumes THE role filter rather than an inline copy.
 
-    The filter's docstring argues at length that it must run first everywhere;
-    keeping a second inline copy in ``partition_bands`` would mean a change to
-    what counts as an architect cell had to be made twice, with only one site
-    carrying the argument for why it matters.
+    The filter's docstring argues at length that it must run first; keeping a
+    second inline copy in ``partition_bands`` would mean a change to what counts
+    as an architect cell had to be made twice, with only one site carrying the
+    argument for why it matters. (``partition_bands`` is now its ONLY consumer —
+    the per-candidate marker counts that also read it were retired in favour of
+    ``build_plan_quality_report``'s own architect-only aggregate.)
     """
     architect = _cell('f1', 'A', plan_steps=5, plan_quality=0.95,
                       extra_metrics={'judged_without_reference': False})
@@ -1640,13 +1868,3 @@ def test_architect_cells_is_the_single_source_of_the_role_filter():
     assert mod.partition_bands([architect, implementer], 0.80)['by_fixture'] == {
         'f1': 'ceiling',
     }
-
-
-def test_count_judged_without_reference_accepts_a_precomputed_map():
-    """Passing the map is an optimisation, never a behaviour change."""
-    results = _mixed_marker_results()
-
-    unmeasured = mod.count_unmeasured_marker_cells(results)
-
-    assert mod.count_judged_without_reference(results, unmeasured) == \
-        mod.count_judged_without_reference(results)

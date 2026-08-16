@@ -571,3 +571,52 @@ class TestNoteAssignedRecyclesQuarantined:
             and 'recycl' in r.getMessage().lower()
         ]
         assert len(recycle_warnings) == 1
+
+
+class TestDelegatesToSharedAtomicWriter:
+    """``LaneLifecycle._write`` delegates to ``shared.safe_io.atomic_write_text``.
+
+    Task 3223 consolidated the repo's tmp+rename writers into ``shared.safe_io``.
+    These pin that this site's semantics survived the move — in particular the
+    LOCALE-dependent encoding, which the inlined ``os.fdopen(fd, 'w')`` produced
+    and which this task deliberately preserves rather than silently upgrading
+    to utf-8.
+    """
+
+    def test_delegates_with_preserved_semantics(self, tmp_path, monkeypatch):
+        """One delegated call carrying mkdir=True, 0600, locale encoding, no fsync."""
+        import locale
+
+        import shared.safe_io as _safe_io
+
+        calls = []
+        monkeypatch.setattr(
+            _safe_io,
+            'atomic_write_text',
+            lambda path, text, **kwargs: calls.append((path, text, kwargs)),
+        )
+
+        lifecycle = _lifecycle(tmp_path)
+        lifecycle.transition(tmp_path / 'lane-1', LaneState.SEED)
+
+        assert len(calls) == 1, f'expected exactly one delegated call, got {calls}'
+        _path, text, kwargs = calls[0]
+        assert json.loads(text)['state'] == LaneState.SEED.value
+        assert kwargs.get('mkdir') is True, 'this site created its parent dir'
+        assert kwargs.get('mode') == 0o600, 'mkstemp created 0600; must not widen'
+        assert not kwargs.get('fsync'), 'this site never fsynced'
+        assert kwargs.get('encoding') == locale.getpreferredencoding(False), (
+            'locale-dependent encoding must be PRESERVED, not upgraded to utf-8'
+        )
+
+    def test_transition_creates_missing_state_dir_and_round_trips(self, tmp_path):
+        """End-to-end: a first transition creates state_dir and the record reloads."""
+        lifecycle = _lifecycle(tmp_path)
+        assert not lifecycle.state_dir.exists()
+
+        lifecycle.transition(tmp_path / 'lane-1', LaneState.SEED)
+
+        record = lifecycle.read('lane-1')
+        assert record is not None
+        assert record.state is LaneState.SEED
+        assert lifecycle._record_path('lane-1').stat().st_mode & 0o777 == 0o600

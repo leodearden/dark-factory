@@ -45,7 +45,10 @@ from .metrics import (
     EvalMetrics,
     coerce_cost_usd,
     collect_metrics,
+    compose_cost_source,
     detect_invocation_error,
+    is_proxied_endpoint,
+    resolve_cost_usd,
 )
 from .profile import apply_eval_profile
 from .snapshots import create_eval_worktree, read_python_pin
@@ -281,18 +284,19 @@ def build_eval_orch_config(
         )
     # Task 2820 (ν follow-up, escalation esc-2479-1 finding #3): auto-merge
     # claude_endpoint_price_table() into config.prices whenever THIS
-    # candidate's env_overrides carries a proxied ANTHROPIC_BASE_URL — the
-    # identical leaf collect_metrics reads (`is_local = bool(workflow.config
-    # .env_overrides.get('ANTHROPIC_BASE_URL'))`) before calling
-    # resolve_cost_usd(model=workflow.config.models.implementer,
-    # prices=workflow.config.prices, ...). Without this, an operator who
-    # forgets to seed prices manually silently gets cost_source=
-    # 'unpriced_proxy' (there's already a loud WARNING on that fallback, so
-    # this is convenience hardening, not a silent-fail fix). Merge, not
-    # replace: profiled.prices (the base/manually-seeded table) wins on
-    # conflict, mirroring claude_endpoint_price_table()'s own
-    # default-table-then-candidate-table override order.
-    if config.env_overrides.get('ANTHROPIC_BASE_URL'):
+    # candidate runs against a PROXIED endpoint — the SAME predicate
+    # collect_metrics and run_architect_eval read before calling
+    # resolve_cost_usd(..., is_local_model=...), which is why it has one home
+    # (metrics.is_proxied_endpoint) instead of three inline env reads: the
+    # table that gets seeded and the flag that decides whether to trust the CLI
+    # figure must never disagree. Without this, an operator who forgets to seed
+    # prices manually silently gets cost_source='unpriced_proxy' (there's
+    # already a loud WARNING on that fallback, so this is convenience
+    # hardening, not a silent-fail fix). Merge, not replace: profiled.prices
+    # (the base/manually-seeded table) wins on conflict, mirroring
+    # claude_endpoint_price_table()'s own default-table-then-candidate-table
+    # override order.
+    if is_proxied_endpoint(config.env_overrides):
         seeded_prices = {
             model: PriceEntry(**rates)
             for model, rates in claude_endpoint_price_table().items()
@@ -598,6 +602,28 @@ async def run_architect_eval(
     judge-skipped branch (tainted, refused-with-a-plan, unscorable plan)
     spends nothing on the judge, so ``cost_usd`` there is architect spend
     alone.
+
+    Cost PROVENANCE (task 3656): the ARCHITECT component of that total is
+    RESOLVED per Invariant P5, through the same
+    :func:`~orchestrator.evals.metrics.resolve_cost_usd` seam
+    ``collect_metrics`` uses on the implementer path — so a PROXIED architect
+    candidate no longer keeps the raw CLI figure P5 calls untrustworthy for a
+    proxy, and ``cost_source`` is DERIVED rather than left at an unverified
+    dataclass default. The PLAN-JUDGE component deliberately keeps its CLI
+    figure: the judge is always a native-cloud opus call
+    (:func:`~orchestrator.evals.judge.judge_plan_quality` takes neither the
+    candidate's model nor its ``env_overrides``), so re-resolving it against
+    the candidate's price table would price opus tokens at a vLLM rate. The
+    cell's single ``cost_source`` therefore reads ``'mixed'``
+    (:func:`~orchestrator.evals.metrics.compose_cost_source`) whenever those
+    two components disagree AND the judge actually spent — the
+    operator-visible answer to the mixed-provenance question, rather than one
+    label quietly standing in for two sources. A NATIVE candidate resolves
+    ``'cli'`` beside a ``'cli'`` judge, so today's cells keep both figure and
+    label byte-identical. A cell that spent NOTHING (timeout, harness error,
+    pre-invoke cap) skips the resolution altogether: $0.00 has no provenance to
+    resolve, and resolving it would attach a loud degradation WARNING to spend
+    that never happened.
     """
     from orchestrator.agents.briefing import BriefingAssembler
     from orchestrator.agents.invoke import invoke_agent
@@ -631,6 +657,29 @@ async def run_architect_eval(
     # additionally folds in the plan judge's spend (``judge_cost_usd``), so
     # the two must never be confused under one name.
     arch_cost_usd = 0.0
+    # The architect invocation's TOKEN USAGE — the price-table inputs Invariant
+    # P5 needs (see resolve_cost_usd). Pre-try for the same reason arch_cost_usd
+    # is: the timeout and harness-error paths never bind ``result``, so the
+    # honest zeros must already exist.
+    arch_input_tokens = 0
+    arch_output_tokens = 0
+    # The REST of the token profile ``collect_metrics`` stamps on the implementer
+    # path. Not P5 inputs — they price nothing — but on a native Claude run the
+    # cache reads typically DOMINATE the profile, so a cell reporting input/output
+    # beside a zeroed cache block would read as a far smaller run than it was
+    # (reviewer: completeness). Pre-try for the same reason as above.
+    arch_cache_read_tokens = 0
+    arch_cache_create_tokens = 0
+    arch_turns = 0
+    # Whether this candidate runs against a PROXIED endpoint, the third P5
+    # input. Read from the EvalConfig — not the built orch config — because it
+    # is literally what ``invoke_agent(env_overrides=config.env_overrides)``
+    # below is handed, and because reading it here means a harness crash inside
+    # the try cannot leave the proxy signal unknowable. Through the SAME
+    # ``is_proxied_endpoint`` predicate ``build_eval_orch_config`` keys its
+    # price-table seeding on (and ``collect_metrics`` reads on the implementer
+    # path), so the seeded table and the trust-the-CLI flag cannot drift apart.
+    is_local = is_proxied_endpoint(config.env_overrides)
     arch_duration_ms = 0
     outcome = 'done'
     # The architect-side infra marker (task 3118): WHAT went wrong, if anything.
@@ -649,6 +698,13 @@ async def run_architect_eval(
     # this a hung architect run would block indefinitely, bounded only by
     # max_budget_usd.
     timeout_minutes = timeout_override or task.get('timeout_minutes', 60)
+    # Hoisted out of the try so its PRICE TABLE survives to the cost resolution
+    # after the finally. A harness crash before it is built leaves an explicit
+    # ``None`` (which resolve_cost_usd tolerates) rather than an
+    # UnboundLocalError that would lose the whole cell — and that path never
+    # invoked the architect (0 tokens, $0.00), so no price table could have
+    # changed the number anyway.
+    orch_config: OrchestratorConfig | None = None
     try:
         # 2. Eval orch config (project_root / verify / profile parity).
         orch_config = build_eval_orch_config(
@@ -696,6 +752,16 @@ async def run_architect_eval(
             timeout=timeout_minutes * 60,
         )
         arch_cost_usd = result.cost_usd
+        # ``or 0``, not a bare read: AgentResult declares both ``int | None``,
+        # and a provider that did not report usage must persist an honest 0
+        # rather than a None that would poison the price-table arithmetic.
+        arch_input_tokens = result.input_tokens or 0
+        arch_output_tokens = result.output_tokens or 0
+        # Same ``or 0`` contract: both cache counts are ``int | None`` too, and
+        # ``turns`` is 0 when the provider does not track it.
+        arch_cache_read_tokens = result.cache_read_tokens or 0
+        arch_cache_create_tokens = result.cache_create_tokens or 0
+        arch_turns = result.turns or 0
         arch_duration_ms = result.duration_ms
         if not result.success:
             outcome = 'blocked'
@@ -747,6 +813,9 @@ async def run_architect_eval(
     reference = task.get('reference') or {}
     post = reference.get('post_task_commit')
     reference_diff = ''
+    # Set only where the judge's OWN number is kept (step 7) — see the comment
+    # there for why the assignment does not live at this site.
+    judged_without_reference = False
     if post:
         try:
             reference_diff = await snapshots.get_diff_between_commits(
@@ -754,6 +823,25 @@ async def run_architect_eval(
             )
         except Exception as e:
             logger.warning(f'reference diff failed for {task_id}: {e}')
+    else:
+        # Loud at RUN time (eval-revival σ, task 3628). The v1 campaign judged
+        # half its hard subset this way and it was discoverable only by
+        # archaeology, because a fixture with no ``reference`` block reached the
+        # judge silently.
+        #
+        # Scoped to the FIXTURE-LEVEL fact, which is all that is known here
+        # (reviewer: robustness). At this point the architect's outcome is not
+        # yet decided, so this site cannot say anything about a judge score: a
+        # cap-tainted cell and a no-scorable-plan cell both skip the judge
+        # entirely, and claiming their score is plausibility-based would be
+        # false. That claim belongs to — and is made by — the step-7 warning
+        # below, which fires exactly where the judge is invoked blind. This is
+        # the same over-broad keying the marker's comment at step 7 rejects for
+        # the metrics field, and it is rejected here for the same reason.
+        logger.warning(
+            f'Architect eval {task_id} × {config.name}: fixture carries no '
+            f'reference.post_task_commit, so NO reference diff is available'
+        )
 
     # 7. Score the produced plan: LLM judge vs the landed diff, degrading to the
     #    deterministic structural floor on ANY judge failure so plan_quality is a
@@ -851,6 +939,12 @@ async def run_architect_eval(
             f'scored on the structural floor ({plan_quality}), NOT tainted'
         )
     else:
+        if not reference_diff:
+            logger.warning(
+                f'Architect eval {task_id} × {config.name}: invoking the plan '
+                f'judge with an EMPTY reference diff — no ground truth to '
+                f'grade against'
+            )
         try:
             verdict = await judge_plan_quality(plan, reference_diff, task)
             plan_quality = verdict.plan_quality
@@ -891,6 +985,19 @@ async def run_architect_eval(
             )
         if plan_quality is None:
             plan_quality = score_plan_structure(plan)
+        else:
+            # The marker lives HERE, on the one path where the judge's own
+            # number is KEPT — not at the materialization site above (task
+            # 3628). Its name asserts something about the PERSISTED score:
+            # this score was judged, without a reference. Every other path
+            # persists ``score_plan_structure``, which never consults a
+            # reference and is therefore valid ground-truth-independently, so
+            # keying on ``not reference_diff`` at the materialization site
+            # would mark every no-plan and judge-failed cell too — ~every
+            # no-plan cell in a hard campaign, i.e. exactly the population the
+            # consumer must be able to see PAST — diluting the count used to
+            # bound plan_quality validity into uselessness.
+            judged_without_reference = not reference_diff
 
     wall_clock_ms = int(time.monotonic() * 1000) - start_ms
 
@@ -905,6 +1012,54 @@ async def run_architect_eval(
         for stage, marker in (('architect', arch_error), ('judge', judge_error))
         if marker
     ]
+
+    # Cost provenance (Invariant P5) for the ARCHITECT component, through the
+    # SAME seam collect_metrics uses on the implementer path — a proxied
+    # endpoint's own CLI figure is untrustworthy, so it must be resolved rather
+    # than copied. Two non-obvious arguments:
+    #   - ``model=config.model``: this path calls
+    #     ``invoke_agent(model=config.model)`` DIRECTLY, so the EvalConfig's
+    #     model is literally what produced the tokens being priced.
+    #     ``orch_config.models.architect`` would be the WRONG key —
+    #     build_eval_orch_config pins it to the frozen 'opus' default whenever
+    #     architect_config is None, which is every run_architect_eval caller,
+    #     so pricing would silently look up opus for a fable or vLLM candidate.
+    #   - ``prices`` from ``orch_config``, NOT ``base_config``:
+    #     build_eval_orch_config auto-merges claude_endpoint_price_table() into
+    #     .prices for a PROXIED candidate (task 2820), and that merge is exactly
+    #     what makes 'price_table' reachable here instead of the degraded
+    #     'unpriced_proxy'.
+    #
+    # SKIPPED entirely when NOTHING was spent — the timeout, harness-error and
+    # pre-invoke cap paths never bind ``result``, so they arrive here with 0
+    # tokens and $0.00. There is no provenance to resolve for a figure that is
+    # not there, and resolving it anyway would fire the LOUD unpriced-proxy
+    # WARNING for spend that never happened on EVERY timed-out or crashed
+    # proxied cell — training operators to ignore the warning that matters, and
+    # labelling a $0.00 cell 'unpriced_proxy' as if the degradation were real
+    # (reviewer: log-noise). The label then stays the documented 'cli' default,
+    # which is exactly what a $0.00 architect cell has always read.
+    if arch_input_tokens or arch_output_tokens or arch_cost_usd:
+        resolved_arch_cost, arch_cost_source = resolve_cost_usd(
+            arch_input_tokens,
+            arch_output_tokens,
+            model=config.model,
+            prices=orch_config.prices if orch_config is not None else None,
+            cli_cost_usd=arch_cost_usd,
+            is_local_model=is_local,
+        )
+    else:
+        resolved_arch_cost, arch_cost_source = 0.0, 'cli'
+
+    # Inference speed for the architect leg, the same formula collect_metrics
+    # uses one path over (output tokens ÷ that leg's own duration, which is
+    # what workflow_duration_ms below carries). Guarded: a timed-out or crashed
+    # cell has arch_duration_ms == 0.
+    arch_duration_secs = arch_duration_ms / 1000 if arch_duration_ms else 0.0
+    arch_tps = (
+        round(arch_output_tokens / arch_duration_secs, 2)
+        if arch_duration_secs > 0 else 0.0
+    )
     metrics = EvalMetrics(
         plan_quality=plan_quality,
         role_under_test='architect',
@@ -942,12 +1097,41 @@ async def run_architect_eval(
         # so invocation_error below reads "judge:raised: ...", telling a
         # reader "spend unknown", not "judge-free" (amendment, reviewer
         # robustness).
-        cost_usd=arch_cost_usd + judge_cost_usd,
+        # The architect component is the RESOLVED figure (Invariant P5), never
+        # the raw CLI one; the judge component keeps its CLI figure because the
+        # plan judge is always a native-cloud opus call. judge_cost_usd is still
+        # the judge's SHARE of this total, not a separately-resolved addend.
+        cost_usd=resolved_arch_cost + judge_cost_usd,
+        # ONE label for a TWO-component sum: the second component is the plan
+        # judge, always-native-cloud opus and therefore always CLI-sourced, so
+        # this reads 'mixed' exactly when the judge actually spent AND the two
+        # components' sources disagree — never letting one label quietly stand
+        # in for two.
+        cost_source=compose_cost_source(
+            arch_cost_source, secondary_cost_usd=judge_cost_usd,
+        ),
+        # The architect invocation's token usage + its proxy signal — the three
+        # inputs Invariant P5 resolves cost provenance from (resolve_cost_usd).
+        # Stamped on the cell so the persisted JSON carries the evidence behind
+        # its own cost figure, not just the figure.
+        input_tokens=arch_input_tokens,
+        output_tokens=arch_output_tokens,
+        is_local_model=is_local,
+        # The REST of that run's profile — priced by nothing, but stamped for
+        # the same reason: an architect cell reporting input/output beside a
+        # zeroed cache block reads as a much smaller run than it was (native
+        # Claude runs are cache-read dominated). Keeps the architect cell's
+        # token/turn block symmetric with collect_metrics' implementer one.
+        cache_read_tokens=arch_cache_read_tokens,
+        cache_create_tokens=arch_cache_create_tokens,
+        turns_used=arch_turns,
+        tokens_per_second=arch_tps,
         workflow_duration_ms=arch_duration_ms,
         invocation_error='; '.join(stage_markers) or None,
         cap_tainted=tainted,
         judge_cost_usd=judge_cost_usd,
         judge_invocations=judge_invocations,
+        judged_without_reference=judged_without_reference,
     )
     result_obj = EvalResult(
         task_id=task_id,
@@ -969,6 +1153,8 @@ async def run_architect_eval(
             f'{metrics.invocation_error}]'
             if metrics.invocation_error else ''
         )
+        # So a run's OWN log carries the validity bound, not just the report.
+        + (' [judged_without_reference]' if judged_without_reference else '')
     )
     return result_obj
 

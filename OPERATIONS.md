@@ -486,13 +486,19 @@ the authoritative list rather than treating this enumeration as exhaustive:
 - `mem0_update.content_amend_allowed_agent_prefixes` and
   `mem0_update.metadata_patch_allowed_agent_prefixes` — two independently
   configurable `agent_id`-prefix allowlists, both shipping as
-  `['recon-stage-']`. They are separate because the arms carry different
-  risk: widening **`metadata_patch_allowed_agent_prefixes` alone** is the
-  supported way to admit an interactive curator-gate tagging flow without
-  granting anyone content-amend authority. A mistagged record is cheap to
-  notice and cheap to correct; a silent content rewrite is neither.
-  (`agent_id` is self-reported, so this is a misuse deterrent for
-  cooperating callers, not a security boundary.)
+  `['recon-stage-', 'curator-']`: `recon-stage-` admits every
+  reconciliation stage agent, and `curator-` admits the interactive
+  memory-consolidation sitting defined by `skills/curate-fused-memories`
+  (esc-3524-1 ruling (b), promoted to an all-deployments schema default on
+  2026-08-12; it deliberately holds both arms because retain-and-tag
+  stamps retained peers via metadata-only patches). The lists are separate
+  because the arms carry different risk: widening
+  **`metadata_patch_allowed_agent_prefixes` alone** remains the supported
+  way to admit a new interactive tagging flow without granting anyone
+  content-amend authority. A mistagged record is cheap to notice and cheap
+  to correct; a silent content rewrite is neither. (`agent_id` is
+  self-reported, so this is a misuse deterrent for cooperating callers,
+  not a security boundary.)
 - `mem0_update.storm_threshold` and `mem0_update.storm_window_seconds` —
   the content-amend burst alarm (escalates, never blocks; metadata-only
   calls do not count toward it). Genuinely reload-safe because the shared
@@ -1080,6 +1086,163 @@ A night that could not run at all logs a `RUN FAILED` line ahead of its
 reach the MCP server` (a transport problem: check the fused-memory unit) vs
 `aborted on an unexpected error` (a bug in the consumer: read the exception
 type on that line). Requests are left in place either way.
+
+---
+
+## 13. One-off: transcript archive gunzip migration
+
+`scripts/migrate_transcript_archive_gunzip.py` converts the agent-transcript
+archive (`data/orchestrator/agent-transcripts/`) from `.jsonl.gz` to one
+plain, greppable `.jsonl` corpus. Task 3618, leaf α of
+`plans/transcript-preservation-seam-prd.md`.
+
+**This is a HUMAN-OPERATED step.** The task's implementer deliberately did not
+run `--apply`: an autonomous agent must not delete thousands of live files
+(the norm from task 1500, with precedents 1939/1945). The repo change and the
+live migration are separate acts, and the second one is yours.
+
+### The contract
+
+| | |
+|---|---|
+| Default | **Dry-run.** A bare invocation changes nothing. |
+| `--apply` | Opts into mutation. Without it, nothing is written or deleted. |
+| `--root` | Archive root (default `data/orchestrator/agent-transcripts`). |
+| Exit 0 | Every file migrated (or was already migrated). |
+| Exit 1 | **At least one file failed** — act on it. Unlike the `gc_agent_transcripts` sweep, which always exits 0 so a watchdog does not alarm, this is a one-off whose failures need a human. |
+| Exit 2 | **At least one conflict needs adjudication** (and nothing failed) — see below. Nothing is damaged; a `.gz` was retained next to a longer plain twin. Exit 1 wins when both are present. |
+
+stdout is a single JSON summary (`scanned` / `migrated` / `skipped` /
+`conflicts` / `conflict_paths` / `failed` / `failed_paths`); the LOUD lines go
+to stderr, so `... --apply | jq` works while failures stay visible.
+
+Per file it decompresses to a staging sibling (`<name>.jsonl.migrate-tmp`),
+**reads the result back**, mirrors the `.gz` mtime, atomically renames it over
+`<name>.jsonl`, and only then unlinks the source. A file it cannot corroborate
+is never destroyed — it is retained, counted and named. The mtime mirror
+matters: `gc_agent_transcripts` derives each task dir's retention age from its
+newest descendant mtime, so stamping `now` would silently reset the whole
+90-day retention window.
+
+Nothing is ever written over a plain `.jsonl` in place, which is what makes the
+re-run in step 5 safe when both forms coexist: if the `.gz` turns out to be
+damaged, the existing plain twin is left whole rather than being truncated by
+the attempt. A hard kill (SIGKILL, power loss) can strand a `.migrate-tmp`
+file; it is inert — no reader's `*.jsonl` glob matches it — and the next
+`--apply` rewrites it, so `find data/orchestrator/agent-transcripts -name
+'*.migrate-tmp' -delete` is cleanup, never recovery.
+
+It is **idempotent and re-runnable**. A `.gz` whose `.jsonl` twin already
+reads back cleanly is skipped and its source dropped, so a run you kill
+half-way resumes correctly — and so you can re-sweep later residue (see
+below).
+
+### The operator sequence
+
+```bash
+cd /home/leo/src/dark-factory
+
+# 1. Baseline.
+find data/orchestrator/agent-transcripts -name '*.gz' | wc -l
+
+# 2. Dry-run first — READ-ONLY, and real validation: it decompresses and
+#    UTF-8-decodes every source without writing anything.
+python3 scripts/migrate_transcript_archive_gunzip.py | jq
+
+#    Gate: `scanned` should equal the baseline count and `failed` MUST be 0.
+#    A non-zero `failed` names the offending files in `failed_paths` —
+#    investigate those before going further.
+#    `conflicts` need NOT be 0 to proceed — the sweep leaves those files
+#    untouched — but read `conflict_paths` first and resolve them per below.
+
+# 3. Migrate.
+python3 scripts/migrate_transcript_archive_gunzip.py --apply | jq
+
+# 4. Confirm.
+find data/orchestrator/agent-transcripts -name '*.gz' | wc -l
+#    expect 0 — or exactly `conflicts + failed` from step 3. BOTH counters
+#    leave their `.gz` on disk: conflicts are the files deliberately retained
+#    for you to resolve, and a failed file retains its source precisely
+#    because it could not be corroborated. Account for the residue against
+#    that sum, not against `conflicts` alone, or a run that develops new
+#    failures during `--apply` reads as an unexplained leftover. Resolve
+#    both, then re-run 3 and 4.
+```
+
+**Run this only AFTER the fleet has redeployed** past the task-3618 merge
+(§8). Until every orchestrator restarts, live units keep writing `.gz`, so a
+migration run before then leaves transition-window residue. Re-run step 3
+after the redeploy to sweep it — that is exactly what idempotency buys.
+
+### Resolving a conflict
+
+That re-run is also what produces conflicts, so expect them on the second
+pass. A session in flight ACROSS the redeploy has BOTH forms on disk: the
+pre-redeploy process archived `<sid>.jsonl.gz`, then the post-redeploy
+producer hook wrote a plain `<sid>.jsonl` for the same session — resumed, and
+therefore **longer**.
+
+A residual `.gz` with a longer plain twin beside it is exactly that shape.
+**The plain file is the authoritative copy.** The sweep refuses to gunzip over
+it (that would overwrite a live transcript with stale content and roll its
+mtime backwards, aging the task dir out early), and refuses to delete the
+`.gz` on its own judgement — being longer proves the twin is not a truncated
+stub, but never proves it *contains* the archived bytes. That last step is
+yours:
+
+```bash
+# For each path in conflict_paths — confirm the plain twin really is a superset
+# before deleting anything.
+(
+  set -o pipefail
+  gzip -t <sid>.jsonl.gz \
+    && n=$(zcat <sid>.jsonl.gz | wc -c) \
+    && zcat <sid>.jsonl.gz | diff - <(head -c "$n" <sid>.jsonl) \
+    && rm <sid>.jsonl.gz
+)
+```
+
+**`gzip -t` and `pipefail` are load-bearing, not decoration.** A bare
+`zcat ... | diff ... && rm` takes its exit status from `diff`, never from
+`zcat`. A *damaged* `.gz` still emits a short prefix before it dies, so `diff`
+would compare that prefix against the same-length head of the twin, succeed,
+and the `&& rm` would delete the only copy of the unrecoverable tail — exactly
+the unverified destruction the sweep refuses to do on its own judgement.
+`gzip -t` rejects such a file up front; `pipefail` makes the comparison itself
+fail loudly if `zcat` dies mid-stream anyway. A `.gz` that fails `gzip -t` is
+not a conflict to resolve — it is a damaged archive copy, and the plain twin
+beside it is all you have.
+
+If the two disagree, do NOT delete: that is a genuinely divergent pair, and
+the archive copy is the only record of the pre-redeploy content.
+
+Expect roughly a 4x expansion (≈485 MB → ≈1.9 GB at the sampled 3.93x ratio),
+a one-off cost against ~2.1 TB free.
+
+### The accepted gap between merge and your run
+
+The reader-side changes in task 3618 land at merge, but this migration runs
+later. In that window the legibility toolchain **under-reports** the archive:
+`_iter_archive_transcripts` now walks `rglob('*.jsonl')`, so a residual `.gz`
+is not enumerated at all — skipped rather than loudly failed.
+
+The gap announces itself rather than relying on you to remember it:
+
+- `inventory._iter_archive_transcripts` counts the residue on every walk and
+  emits one greppable WARNING — `rg 'residual \*.jsonl.gz'` over the nightly
+  logs — naming the count and this runbook.
+- `memory_eval_transcript_corpus`'s coverage JSON carries a `residual_gz`
+  field, and its report says in words how many transcripts the run could not
+  see. That is separate from `transcripts_found` and from `parse_failures`:
+  the residue was never found, and never failed to parse.
+
+Both are counts, not reads — no reader reopens a gzip stream — and both go to
+zero on their own once you have run the sweep.
+
+This is a known, accepted cost of not letting an agent delete live data, not
+a defect. It closes when you complete the sequence above. Validation for the
+migration itself was done at full scale: a dry run over all 4,574 live files
+decompressed and decoded every one of them with zero failures.
 
 ---
 

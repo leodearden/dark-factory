@@ -12,6 +12,7 @@ import time
 import types
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -1586,7 +1587,13 @@ class TestPreflightBaseline:
 
 
 def _make_summary(status: str, **overrides) -> EvalSummary:
-    defaults = dict(
+    # dict[str, Any]: the literal below is heterogeneous (str/float/bool/Path),
+    # so an inferred `dict[str, str | float | Path]` value type cannot be
+    # distributed across EvalSummary's per-field parameter types under
+    # `EvalSummary(**defaults)` — pyright reports one reportArgumentType error
+    # per field. The annotation is the narrowest fix that keeps `**overrides`
+    # ergonomic; EvalSummary itself stays strictly typed.
+    defaults: dict[str, Any] = dict(
         task_id="df_task_12",
         config_name="cfg",
         status=status,
@@ -1680,7 +1687,11 @@ class TestTearDownPod:
         )
         handle = PodHandle(
             pod=None,
-            tunnel_proc=fake_tunnel,
+            # fake_tunnel is a duck-typed SimpleNamespace stand-in exposing only
+            # the terminate/wait/kill surface tear_down_pod actually uses; it is
+            # deliberately not a real subprocess.Popen, which is what
+            # PodHandle.tunnel_proc declares.
+            tunnel_proc=fake_tunnel,  # type: ignore[arg-type]
             client=_FakeClient(),
             vllm_url="http://localhost:8100",
             local_port=8100,

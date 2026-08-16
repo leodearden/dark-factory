@@ -147,20 +147,29 @@ every run — do NOT pipe `2>&1` when you parse stdout as the escalation JSON, o
 parse.
 
 **Bash-tool timeout contract:** the wrapper blocks for up to `--timeout` seconds per slice before
-returning. Run as a **background** task (`run_in_background: true`), it is exempt from the Bash
-tool's foreground timeouts — it runs detached across turns and notifies on exit — so use the long
+returning, and **every** call — background *and* foreground — must carry an explicit Bash-tool
+`timeout` parameter sized to at least `(--timeout + 60s) × 1000` ms — e.g. `timeout: 3660000` for
+`--timeout 3600`. `run_in_background: true` does **not** exempt a call from the harness timeout:
+measured 2026-08-10, background arms launched with no `timeout` parameter were killed after ~116s
+(≈ the 120000ms Bash default) against a configured `--timeout 540` slice, so the slice length was
+never the constraint; re-arming the identical command with `timeout: 3660000` survived 6m32s and
+exited cleanly with `WATCHER_REARM_OUTCOME: FIRED exit=0`. With that parameter passed, use the long
 canonical slice: `--timeout 3600` yields at most one heartbeat wake per hour (`CEILING`) while a
-real L2 escalation still fires instantly via inotify. A short slice buys no protection in the
-background — the old `--timeout 540` merely forced a wake-notify-rearm turn every 9 minutes.
-Only **foreground** calls (e.g. debugging outside the background task) are governed by the harness
-timeouts. An omitted Bash `timeout` parameter kills the call at the 2-minute default before the
-wait can return (the 07-09 exit-143 failure mode this wrapper exists to prevent). For a foreground
-call, size the Bash `timeout` parameter to at least `(--timeout + 60s) × 1000` ms — e.g.
-`timeout: 3660000` for `--timeout 3600` — which requires `BASH_MAX_TIMEOUT_MS` ≥ that value in the
-settings env (dark-factory onboarding provisions it — see `skills/factory-init`). Only on a
-machine WITHOUT that setting does the harness's 600000ms (10 min) foreground cap apply: there,
-cap the slice at `--timeout 540` and set the Bash tool's `timeout` **≥ 600000ms** so the slice
-can return before the harness kills it.
+real L2 escalation still fires instantly via inotify. A short slice buys no protection — the old
+`--timeout 540` merely forced a wake-notify-rearm turn every 9 minutes. A slice that long requires
+`BASH_MAX_TIMEOUT_MS` ≥ that value in the settings env (dark-factory onboarding provisions it —
+see `skills/factory-init`). Only on a machine WITHOUT that setting does the harness's 600000ms
+(10 min) cap apply: there, cap the slice at `--timeout 540` and set the Bash tool's `timeout`
+**≥ 600000ms** so the slice can return before the harness kills it.
+
+**Diagnostic — watcher dies at ~2 minutes with no outcome line:** if an arm disappears after
+roughly 120s and stderr carries **no** `WATCHER_REARM_OUTCOME` line, the Bash `timeout` parameter
+was omitted. The wrapper emits that line on every exit path including its own timeout, so its
+absence means the exit handler never ran — an external SIGKILL to the process group, not a wrapper
+or watcher fault (the 07-09 exit-143 failure mode the wrapper exists to bound; it cannot bound a
+kill of the whole group). This hides during a backlog drain, where every arm FIRES within seconds
+and finishes well inside the 120s window; the kills only start once the queue is fully triaged and
+the watcher genuinely waits, leaving a loop that looks armed but reaps itself every ~2 minutes.
 
 **Re-arming over deliberately-pending items:** any L2 item you deliberately left pending (Priority
 3b, `design_concern`, `risk_identified`, `infra_issue`, AFK leave-pending paths) sits in the queue
@@ -608,14 +617,16 @@ task β, `orchestrator/src/orchestrator/merge_disposition.py`). It is a **closed
 | `branch_bug` | No landed commit is implicated — the failure is the branch's own bug. |
 | `indeterminate` | The classifier couldn't reach a verdict (evidence inconclusive, or an internal error — fail-open). Treat exactly like today's undifferentiated failure. |
 
-**Where it surfaces:** `integration_skew` does **not** get its own escalation
-category — it still arrives here as an ordinary `task_failure` / `wip_conflict`
-escalation. What changes is the content: the task's block reason carries an
-appended suffix of the form `integration_skew: port landed commit(s) <sha[, sha...]>
+**Where it surfaces:** `integration_skew` **does** get its own escalation
+category: the workflow layer files the block with `category='integration_skew'`
+and `suggested_action='port_landed_change'` (workflow.py, INTEGRATION_SKEW
+disposition branch). The task's block reason also carries an appended suffix of
+the form `integration_skew: port landed commit(s) <sha[, sha...]>
 touching <files> — do not hunt your own diff`, and the same disposition +
 implicated commits + overlap files are available verbatim in `merge_status`'s
-`failure_diagnostic` field. Look for that suffix/field before you (or a spawned
-`/unblock` session) start reading the branch's own diff for a bug that isn't there.
+`failure_diagnostic` field. Look for that category/suffix/field before you (or a
+spawned `/unblock` session) start reading the branch's own diff for a bug that
+isn't there.
 
 **Triage rule — the load-bearing part:**
 
@@ -800,8 +811,15 @@ Architectural or design questions. These already failed steward auto-resolution 
 
 **Always escalate to the human:**
 1. Present the concern with full context
-2. Leave the escalation pending
-3. Create a local task/todo to track it
+2. Leave the escalation pending — the open escalation record IS the durable record that something
+   needs doing
+3. Create a local todo **for this session only** — it does not survive session end and is not the
+   record
+3a. File (or confirm one already exists for this `esc-id`) a cockpit DecisionRecord via
+   `write-decision` — **this, not the todo, is what makes the item recoverable across sessions and
+   after this session ends** (same registry as the Priority-3b instructions above). Skipping this
+   step is how esc-3223-4/-5 kept task 3223 blocked for 11 days: the question never reached the
+   cockpit queue the human actually reads.
 4. Continue handling other escalations while waiting
 5. Append `<esc-id>` to the wrapper-owned exclude-file (see "Starting the watcher" above) while this item is pending
 
@@ -809,8 +827,11 @@ Architectural or design questions. These already failed steward auto-resolution 
 
 An agent flagged a risk during development. Risk assessment requires human judgment.
 
-**Escalate to the human.** Tell them, track as todo, continue with other work. Append `<esc-id>` to
-the wrapper-owned exclude-file (see "Starting the watcher" above) while this item is pending.
+**Escalate to the human.** Tell them; create a session-only todo (an attention aid — the pending
+escalation, not the todo, is the durable record); file (or confirm) a cockpit DecisionRecord via
+`write-decision` for this `esc-id`, exactly as in `design_concern` step 3a; continue with other
+work. Append `<esc-id>` to the wrapper-owned exclude-file (see "Starting the watcher" above) while
+this item is pending.
 
 ### `cleanup_needed` (info, rarely blocking)
 

@@ -277,6 +277,47 @@ _ESCALATION_CAPABLE_ROLES: frozenset[str] = frozenset(
 # caught at the constant definition rather than silently diverging across assertions.
 _ORPHAN_HALT_NO_QUEUE_TOKENS: tuple[str, ...] = ('orphan halt', 'unhalt_merge_queue')
 
+# Architect failure kinds eligible for ONE transient-glitch retry in ``_plan``
+# (task 3143; the 2026-07-28 ~16:31Z incident cluster, where a turns=0 /
+# $0.00 / no-plan.json architect failure terminally blocked a planning task).
+# Both kinds mean the run did NO work and billed NOTHING, so a retry cannot
+# double-bill and is the only thing standing between a sub-second transport
+# glitch and a terminally-blocked task.
+#
+# Deliberately EXCLUDED, because a second Opus dispatch buys nothing:
+# - TIMED_OUT: burned the full wall clock; the next attempt would too.
+# - MAX_TURNS: the run saturated its budget doing real work.
+# - API_ERROR: provider-side; the scheduler's transient requeue lane owns the
+#   pacing, and retrying here just multiplies load on a degraded provider.
+# - MODEL_NOT_FOUND: deterministic — the model does not exist for this account.
+_ARCHITECT_TRANSIENT_RETRY_KINDS: frozenset[AgentFailureKind] = frozenset({
+    AgentFailureKind.EMPTY_OUTPUT,
+    AgentFailureKind.CLI_INPUT_REJECTED,
+})
+
+
+def _is_transient_architect_glitch(result: AgentResult, *, plan_on_disk: bool) -> bool:
+    """Return True when an architect run shows the anomalous-premature-exit shape.
+
+    Few turns, negligible cost, and nothing written to disk: the run cannot
+    have done real planning work, so a single retry is cheap and plausibly
+    productive.  The SINGLE definition of that signature — evaluated on both
+    the ``success=True`` anomalous-exit path and the ``success=False``
+    zero-work-failure path — so the two can never drift apart on the numbers.
+
+    NOTE the numbers only testify on the SUCCESS path, where ``turns`` and
+    ``cost_usd`` are parsed from the CLI's JSON.  On the failure arms this
+    predicate serves (``error_empty_output`` / ``error_cli_input_rejected``)
+    that JSON is never parsed, so both are 0 by construction and the numeric
+    clauses are vacuous.  The failure call site therefore ANDs in the
+    transcript-authoritative ``not result.transcript_turns`` clause, which is
+    the only signal there that distinguishes "nothing ran" from "a productive
+    run was killed from outside".  That clause is kept at the call site rather
+    than folded in here precisely because it is NOT a no-op on the success
+    path.
+    """
+    return result.turns <= 2 and result.cost_usd < 0.20 and not plan_on_disk
+
 
 def _is_gating_escalation(e: Escalation) -> bool:
     """Return True if *e* should gate workflow progress (PRD C7 / decisions D4, D8).
@@ -4452,6 +4493,69 @@ class TaskWorkflow:
                             )
                         self.plan = salvaged
                         break  # fall through to validation / provenance / lock
+
+                    # Transient-glitch retry on the FAILURE path (task 3143).
+                    # The same anomalous-premature-exit signature the success
+                    # path below has always retried — few turns, negligible
+                    # cost, nothing on disk — but reached via success=False.
+                    # Ranked BELOW salvage (a finalized plan always wins) and
+                    # ABOVE the terminal _mark_blocked, which stays the
+                    # fall-through for the second occurrence and for every
+                    # non-transient kind: this strictly ADDS one retry and
+                    # removes no terminal path.
+                    #
+                    # TRANSCRIPT-AUTHORITATIVE extra clause, failure path only.
+                    # On the error_empty_output / error_cli_input_rejected
+                    # arms the CLI's JSON is never parsed, so result.turns and
+                    # result.cost_usd are 0 BY CONSTRUCTION — the numeric
+                    # clauses inside _is_transient_architect_glitch are
+                    # therefore vacuous here and cannot testify that no work
+                    # was done.  The transcript can: an architect SIGKILLed
+                    # from outside (OOM killer, not our watchdog, so
+                    # timed_out=False) after 40 productive turns arrives with
+                    # exactly this shape but transcript_turns>0, and retrying
+                    # it DOES double-bill a full Opus architect run.  Same
+                    # signal steward._is_empty_output already consults via
+                    # is_timed_out_with_progress.
+                    #
+                    # Deliberately NOT folded into
+                    # _is_transient_architect_glitch: on the success path turns
+                    # and cost are real, parsed numbers that already bound the
+                    # work done, and transcript_turns there tracks those turns
+                    # — so the clause would suppress genuine
+                    # anomalous-premature-exit retries rather than being the
+                    # no-op it is here.
+                    #
+                    # A zero-turn, $0.00, zero-transcript failure did no work,
+                    # so the retry cannot double-bill — and it is the only
+                    # thing standing between a sub-second transport glitch and
+                    # a terminally blocked planning task (2026-07-28 ~16:31Z).
+                    #
+                    # bool(salvaged) is the honest analogue of the success
+                    # path's `not self.plan`: `salvaged` is already
+                    # self.artifacts.read_plan(), which returns {} (never None)
+                    # when plan.json is absent, so re-reading here would only
+                    # risk the two branches disagreeing.
+                    if (
+                        attempt == 0
+                        and cls.kind in _ARCHITECT_TRANSIENT_RETRY_KINDS
+                        and not (result.transcript_turns or 0)
+                        and _is_transient_architect_glitch(
+                            result, plan_on_disk=bool(salvaged)
+                        )
+                    ):
+                        logger.warning(
+                            f'Task {self.task_id}: architect failed with a '
+                            f'zero-work transient glitch ({cls.kind.value}: '
+                            f'{cls.summary}) — turns={result.turns}, '
+                            f'cost=${result.cost_usd:.2f}, '
+                            f'duration={result.duration_ms}ms, '
+                            f'transcript_turns={result.transcript_turns}, '
+                            f'output_len={len(result.output)} '
+                            f'— retrying once'
+                        )
+                        continue
+
                     logger.error(
                         'Task %s: architect failed (%s): %s',
                         self.task_id, cls.kind.value, cls.summary,
@@ -4463,12 +4567,11 @@ class TaskWorkflow:
 
                 # Detect anomalous premature exit: succeeded but suspiciously
                 # few turns and low cost — likely a transient CLI issue.
+                # Shares _is_transient_architect_glitch with the failure-path
+                # retry above so there is exactly one copy of the numbers.
                 self.plan = self.artifacts.read_plan()
-                if (
-                    attempt == 0
-                    and result.turns <= 2
-                    and result.cost_usd < 0.20
-                    and not self.plan
+                if attempt == 0 and _is_transient_architect_glitch(
+                    result, plan_on_disk=bool(self.plan)
                 ):
                     logger.warning(
                         f'Task {self.task_id}: architect completed anomalously '
@@ -4974,25 +5077,60 @@ class TaskWorkflow:
         )
         return WorkflowOutcome.PLANNED
 
+    def _mutable_task_metadata(self) -> dict:
+        """Return ``self.task['metadata']`` as a mutable dict, normalising a
+        missing / ``None`` / non-dict value in place first (task 3579).
+
+        ``dict.setdefault('metadata', {})`` is NOT sufficient: it returns the
+        EXISTING value whenever the key is present, so a task dict carrying
+        ``metadata: None`` — or a not-yet-decoded JSON string, both shapes this
+        codebase defends against pervasively (``harness.py``,
+        ``deterministic_runner.py``, ``Scheduler._normalize_task_metadata``) —
+        would raise ``TypeError`` on the caller's item assignment.  The
+        in-memory stamps below deliberately run OUTSIDE their scheduler-write
+        ``try`` so they land regardless of persistence; that only stays
+        non-raising if the mirror itself cannot raise.
+        """
+        md = self.task.get('metadata')
+        if not isinstance(md, dict):
+            md = {}
+            self.task['metadata'] = md
+        return md
+
     async def _stamp_optimistic_path(self, kind: str) -> None:
         """Stamp ``metadata.optimistic_path`` on the task so the harness's
         auto-eval hook can detect that this task took the optimistic path
         on its current attempt.
 
         Fire-and-forget — failure logs a warning and does not block.
+
+        A NARROW single-key merge write, mirroring ``_stamp_simple_saturated``
+        below (task 3579).  Both call sites stamp immediately after
+        ``_reconcile_scope_locks``, which persists the refined
+        ``metadata.files`` backend-only and never refreshes
+        ``self.task['metadata']`` — so writing the whole in-memory blob at
+        shallow-merge mode would re-assert the stale dispatch-time ``files``
+        over the value just persisted, reverting the task's scope.  A payload
+        holding only ``optimistic_path`` cannot clobber a sibling key under
+        any merge mode.
         """
         try:
-            metadata = dict(self.task.get('metadata') or {})
-            metadata['optimistic_path'] = kind
-            self.task['metadata'] = metadata
             await self.scheduler.update_task(
-                self.task_id, metadata=metadata,
+                self.task_id,
+                {'optimistic_path': kind},
+                metadata_mode='merge',  # type: ignore[reportCallIssue]
             )
         except Exception as exc:  # noqa: BLE001 — best-effort
             logger.warning(
                 'Task %s: failed to stamp optimistic_path=%s: %s',
                 self.task_id, kind, exc,
             )
+        # Unconditional in-memory mirror (same as _stamp_simple_saturated):
+        # the harness auto-eval hook reads optimistic_path in-process even if
+        # persistence failed.  Routed through _mutable_task_metadata so a
+        # None/non-dict metadata cannot turn this fire-and-forget stamp into a
+        # TypeError that escapes into the caller.
+        self._mutable_task_metadata()['optimistic_path'] = kind
 
     async def _stamp_simple_saturated(self) -> None:
         """Stamp ``metadata.routing.simple_saturated=True`` (task ν).
@@ -5014,7 +5152,9 @@ class TaskWorkflow:
         failed scheduler write logs a warning and never raises, honoring the
         "routing telemetry must never block or crash a caller" philosophy.
         The in-memory ``self.task['metadata']['routing']`` update always runs
-        regardless of the scheduler write's outcome.
+        regardless of the scheduler write's outcome — via
+        ``_mutable_task_metadata`` so a None/non-dict metadata cannot make this
+        best-effort stamp raise (task 3579).
         """
         state = RoutingState.from_metadata(self.task.get('metadata'))
         if state.simple_saturated:
@@ -5032,7 +5172,7 @@ class TaskWorkflow:
                     'Task %s: failed to stamp routing.simple_saturated',
                     self.task_id, exc_info=True,
                 )
-        self.task.setdefault('metadata', {})['routing'] = new_state.model_dump()
+        self._mutable_task_metadata()['routing'] = new_state.model_dump()
 
     async def _validate_prerequisites_or_block(
         self, context: str
@@ -12226,7 +12366,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             # a cancelled-in-flight invocation keeps its sidecar for resume.
             if self.artifacts is not None and not session_preserved:
                 self.artifacts.clear_agent_session()
-            # Producer hook (task 2742, agent-transcript-archival-prd α): gzip
+            # Producer hook (task 2742, agent-transcript-archival-prd α): archive
             # this just-finished session's transcripts to a durable archive root
             # OUTSIDE the worktree (project_root / config.root), so they survive
             # worktree teardown. _last_invoke_session_id is set before the try,
@@ -12235,11 +12375,17 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             ta = self.config.transcript_archive
             if ta.enabled and self._config_dir is not None and self._last_invoke_session_id:
                 # Offload to a worker thread: archive_task_transcripts does
-                # blocking, CPU-bound work (glob + stream-gzip each transcript).
-                # This finally runs on the shared event loop for every role of
-                # every concurrent task, so a multi-MB transcript archived inline
-                # would stall all other in-flight tasks; to_thread keeps the loop
-                # free.
+                # blocking filesystem work (glob + move each transcript). Task
+                # 3618 dropped the compression, so the per-file cost is now an
+                # O(1) same-filesystem rename rather than a CPU-bound
+                # stream-gzip; what remains is the glob and the syscalls.
+                #
+                # The to_thread is therefore no longer load-bearing for loop
+                # latency, and it is what CancelledError kills at SIGTERM —
+                # losing every in-flight transcript. Collapsing this to a
+                # synchronous, uncancellable call is leaf 2 of
+                # plans/transcript-preservation-seam-prd.md, which 3618 exists
+                # to unblock. Do not re-justify the offload on gzip grounds.
                 try:
                     await asyncio.to_thread(
                         archive_task_transcripts,
@@ -14576,11 +14722,67 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     # resume the plan, not be triaged as "steward
                     # failed".  Dismiss the still-pending L0 — its only
                     # consumer (the steward) is done — and re-pend.
+                    #
+                    # Task 3236 — WHICH records this dismisses is deliberately
+                    # unchanged; only its OBSERVABILITY is.  Notes for anyone
+                    # tempted to narrow it:
+                    #
+                    # (i) The durable recourse for a steward that cannot
+                    #     resolve an L0 itself is escalate_blocker(level=1).
+                    #     A level-1 record is outside this level=0-scoped
+                    #     sweep BY CONSTRUCTION (no predicate to defeat), is
+                    #     non-gating per _is_gating_escalation, is read by the
+                    #     auto-watcher, and pins the task via
+                    #     escalation.pins QUEUE_HANDOFF regardless of the
+                    #     filer's liveness.  That is the structural fix; a
+                    #     preservation predicate here is not needed.
+                    # (ii) An agent_role-based predicate would be WRONG:
+                    #     agent_role is a free-form MCP tool argument, not an
+                    #     enforced property, and the steward routinely chains
+                    #     a benign follow-on infra_issue while resolving a
+                    #     task_failure (see
+                    #     test_workflow_merge_gating_strand.py), so preserving
+                    #     every steward-role L0 preserves mostly benign
+                    #     records — and a preserved severity='info' record
+                    #     defeats skip_if_idle in the post-merge success tail,
+                    #     burning the full steward_completion_timeout on an
+                    #     already-merged task.  Escalation.filing_claimant_run_id
+                    #     is the field that would make a real
+                    #     filed-by-this-incarnation predicate possible, but it
+                    #     is stamped only in tests today, never on a
+                    #     production filing path; stamping it is the
+                    #     principled follow-up.
+                    # (iii) Do NOT "fix" the sibling sweep sites by symmetry:
+                    #     each of them has an L1 open by construction, so
+                    #     dismissing a stray L0 there is deliberate
+                    #     anti-duplicate-L1-churn behaviour (incident
+                    #     esc-3576-234), and steward._dismiss_capped_l0
+                    #     dismisses only the single record it was handed.
                     if self.escalation_queue:
                         orphan_l0 = self.escalation_queue.get_by_task(
                             self.task_id, status='pending', level=0,
                         )
                         for esc in orphan_l0:
+                            # WARNING, not INFO, and per-record rather than a
+                            # count: a swallowed filing must be traceable to
+                            # WHICH record went and WHO filed it
+                            # (loud-over-silent-degradation /
+                            # no-silent-fail-soft).  Logged BEFORE the resolve
+                            # so the record is named even if resolve raises.
+                            logger.warning(
+                                'Task %s: auto-dismissing pending L0 %s '
+                                '(agent_role=%s, category=%s): %s — steward '
+                                'interrupted (%s) with WIP present, resuming '
+                                'plan.  A steward that still needs a human '
+                                'should re-file with '
+                                'escalate_blocker(level=1), which this '
+                                'level=0-scoped sweep does not touch.',
+                                self.task_id, esc.id,
+                                getattr(esc, 'agent_role', '<unknown>'),
+                                getattr(esc, 'category', '<unknown>'),
+                                getattr(esc, 'summary', '<no summary>'),
+                                outcome.reason,
+                            )
                             self.escalation_queue.resolve(
                                 esc.id,
                                 'Auto-dismissed: steward interrupted '

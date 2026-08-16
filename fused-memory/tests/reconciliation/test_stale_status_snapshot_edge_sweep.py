@@ -32,12 +32,14 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
+    _ENUM_PREP_WORDS,
     extract_snapshot_edge_task_ids,
     flatten_dedup_edges,
     select_stale_status_snapshot_edges,
@@ -579,6 +581,751 @@ class TestExtractSnapshotEdgeTaskIds:
         """
         assert extract_snapshot_edge_task_ids(fact) == set()
 
+    # ----------------------------------------------------------------- #
+    # task 3079 — genitive/possessive status form
+    # ----------------------------------------------------------------- #
+
+    @pytest.mark.parametrize(
+        ('fact', 'expected'),
+        [
+            # the finding's verbatim stale edge fact
+            (
+                "Task 2623's status is pending as of 2026-07-14T20:31:00Z, "
+                'linked to memory f20fbf15-41b7-4781-97a6-334f4e1d066a.',
+                {2623},
+            ),
+            # curly apostrophe (U+2019) — what most prose writers/LLMs emit
+            ('Task 2623’s status is pending as of 2026-07-14.', {2623}),
+            ("Task 5's status is blocked.", {5}),
+            ("Task 5's status is in-progress.", {5}),
+        ],
+    )
+    def test_genitive_status_form_extracts_id(self, fact, expected):
+        """"Task N's status is <marker>" -> {N}. (task 3079)
+
+        REPRO. This is the canonical shape Graphiti writes for a per-task
+        status snapshot, and every pre-3079 path missed it while the gate
+        (a bare '\\bpending\\b' search) fired — the exact "matched the gate
+        yet went undetected" symptom the finding reports:
+
+        - INDIVIDUAL_SNAPSHOT_RE is TASK_REF_RE + '\\s*' + copula, and the
+          '\\s*' cannot cross the intervening "'s status ".
+        - SNAPSHOT_STATUS_PHRASE_RE wants 'in <marker> status' — marker
+          BEFORE the noun; here the order is inverted ('status is <marker>').
+        - LIST_INTRODUCER_RE wants '<marker> tasks[:\\[]'.
+
+        So the extractor returned set() for a fact that plainly asserts a
+        non-terminal status, and the edge was never even a candidate. The
+        control shape 'The status of task 2623 is pending' already worked,
+        which is what makes this a lexical gap rather than a traversal one.
+        """
+        assert extract_snapshot_edge_task_ids(fact) == expected
+
+    @pytest.mark.parametrize(
+        'fact',
+        [
+            # negation / past-exit — refused for free by the closed-class
+            # _ADVERB_ALT, exactly as the individual form refuses it (the
+            # asymmetry the module docstring documents: no _GAP_EXCLUDED_ALT
+            # equivalent is needed on a closed-class-connective path).
+            "Task 5's status is no longer pending.",
+            "Task 5's status is not blocked.",
+            "Task 5's status was previously pending.",
+            # terminal status — the gate short-circuits before extraction
+            "Task 5's status is done.",
+            # head-noun hazard: a status REPORT that is pending review, not a
+            # pending task. Requiring 'status' + copula ADJACENCY excludes it
+            # outright, so this path needs no trailing noun-phrase lookahead
+            # of the kind SNAPSHOT_STATUS_PHRASE_RE carries.
+            "Task 5's status report is pending review.",
+            "Task 5's status update is pending.",
+            # HYPHENATED negation / past-exit, reaching the marker through
+            # the compound-modifier prefix rather than through the copula
+            # slot. The closed-class _ADVERB_ALT does not see these — the
+            # inverting token is fused to the marker, not a separate word —
+            # so _COMPOUND_PREFIX carries its own exclusion lookahead.
+            # (amendment, reviewer_comprehensive correctness-precision
+            # finding, task 3079)
+            "Task 5's status is un-blocked.",
+            "Task 5's status is non-blocked.",
+            "Task 5's status is previously-blocked.",
+        ],
+    )
+    def test_genitive_status_form_precision_guards(self, fact):
+        """Shapes the genitive path must NOT extract. (task 3079)
+
+        These pin the new path against the over-selection direction the
+        module docstring forbids: each fact below is either permanently
+        true (a past-exit/negated assertion), already terminal, or binds
+        the marker to a following head noun rather than to the task.
+        """
+        assert extract_snapshot_edge_task_ids(fact) == set()
+
+    # ----------------------------------------------------------------- #
+    # task 3079 — plural multi-task enumeration
+    # ----------------------------------------------------------------- #
+
+    @pytest.mark.parametrize(
+        ('fact', 'expected'),
+        [
+            ('Tasks 1020, 1030 and 1031 are pending.', {1020, 1030, 1031}),
+            # Oxford comma + closed-class adverb
+            (
+                'Tasks 1020, 1030, and 1031 are still in progress.',
+                {1020, 1030, 1031},
+            ),
+            ('Tasks 1020 and 1030 are blocked.', {1020, 1030}),
+            # repeated reference token in the enumeration tail
+            ('Tasks 1020, task 1030 and task 1031 are pending.', {1020, 1030, 1031}),
+        ],
+    )
+    def test_plural_enumeration_extracts_every_id(self, fact, expected):
+        """"Tasks A, B and C are <marker>" -> {A, B, C}. (task 3079)
+
+        REPRO, and the precise answer to the finding's second question: the
+        pre-3079 extractor got NONE of these ids, not merely the first.
+        TASK_REF_RE anchors '\\btask\\b', which does not match the plural
+        'Tasks' at all; and even if it did, the enumeration tail (', 1030,
+        and 1031') carries no reference token of its own, so the trailing
+        ids were unreachable by every path.
+
+        The Oxford comma case is load-bearing: a separator alternation
+        that handles ',' or 'and' but not ', and' silently misses the
+        finding's verbatim fact shape.
+        """
+        assert extract_snapshot_edge_task_ids(fact) == expected
+
+    @pytest.mark.parametrize(
+        'fact',
+        [
+            # transitive-verb reading — the mandatory copula must refuse it,
+            # exactly as INDIVIDUAL_SNAPSHOT_RE's transitive arm does. This
+            # is a permanently-true historical fact, not a status snapshot.
+            'Tasks 1020, 1030, and 1031 blocked task 5.',
+            'Tasks 1020 and 1030 block the merge queue.',
+            # terminal status — gate short-circuits
+            'Tasks 1020, 1030, and 1031 are done.',
+            # negation / past-exit, refused by the closed-class _ADVERB_ALT
+            'Tasks 1020, 1030, and 1031 are no longer pending.',
+            # marker present but NOT adjacent to the enumeration+copula: the
+            # BRANCH is active, not the tasks
+            'Tasks 1020 and 1030 were merged into the active branch.',
+            # ---------------------------------------------------------- #
+            # Prepositional-complement over-selection (amendment,
+            # reviewer_comprehensive correctness-precision finding, task
+            # 3079). In each of these the plural NP is the COMPLEMENT OF A
+            # PREPOSITION, so the copula's real subject is an outer head
+            # noun and the marker describes THAT, not the tasks. Every one
+            # is a permanently-true historical/meta fact, so the sweep
+            # would retire it the instant any referenced id went terminal —
+            # the over-selection direction the module docstring forbids,
+            # and the same class task 3042 closed for LIST_INTRODUCER_RE.
+            # ---------------------------------------------------------- #
+            # singular outer head — 'is' cannot agree with a plural subject,
+            # so plural-agreement on the copula alone already refuses these
+            'The merge of tasks 1020 and 1030 is blocked.',
+            'Review of tasks 1020 and 1030 is pending.',
+            'Documentation for tasks 1020 and 1030 is still pending.',
+            'Verification of tasks 1020, 1030, and 1031 is pending.',
+            # PLURAL outer head — the plural copula agrees with the OUTER
+            # head here, so these survive a plural-agreement-only fix and
+            # are what force the second remedy (preposition lookbehinds)
+            'Dependencies for tasks 1020 and 1030 are blocked.',
+            'The merges of tasks 1020 and 1030 are blocked.',
+            'Reviews of tasks 1020, 1030, and 1031 are pending.',
+            'Work on tasks 1020 and 1030 is blocked.',
+            'The dependency between tasks 1020 and 1030 is blocked.',
+            # DETERMINER between the preposition and the list noun. These
+            # defeated the original fixed-width-lookbehind spelling of the
+            # guard wholesale — one extremely common word re-opened every
+            # entry in the preposition list at once, and the suite's own
+            # positive case 'The tasks 1020 and 1030 are blocked.' is the
+            # head of exactly this shape. Plural agreement does not save
+            # them: 'Statuses'/'Reviews'/'Notes' are plural, which is the
+            # residue the preposition check exists to cover. (amendment,
+            # reviewer_comprehensive correctness-precision finding, task
+            # 3079)
+            'Statuses of the tasks 1020 and 1030 are blocked.',
+            'Reviews for the tasks 1020 and 1030 are pending.',
+            'Notes about the tasks 1020 and 1030 are pending.',
+            'Reviews of these tasks 1020 and 1030 are pending.',
+            'Notes regarding all tasks 1020 and 1030 are pending.',
+            # multi-space / newline gap before the list noun — the other
+            # defect the fixed-offset lookbehind could not see
+            'Reviews for  the\n  tasks 1020 and 1030 are pending.',
+            # NON-DETERMINER intervening words. The determiner cases above
+            # were first fixed with a six-word slot
+            # ('the|these|those|all|our|its'), which was a second closed
+            # vocabulary and failed the same way one word over. The gap is an
+            # OPEN class, so one case per class it admits — quantifier, bare
+            # adjective, possessive, determiner stack, participle — plus the
+            # THREE-word gaps that a merely-bounded slot (the review's
+            # suggested '{0,2} arbitrary words') would still admit, which is
+            # why the guard is clause-scoped and unbounded instead.
+            # (amendment, reviewer_comprehensive correctness-precision
+            # finding, task 3079)
+            'Statuses of some tasks 1020 and 1030 are pending.',
+            'Dependencies for both tasks 1020 and 1030 are blocked.',
+            'Notes about a few tasks 1020 and 1030 are pending.',
+            'Reviews of all the tasks 1020 and 1030 are pending.',
+            'Notes on remaining tasks 1020 and 1030 are pending.',
+            'Statuses of open tasks 1020 and 1030 are pending.',
+            'Blockers for downstream tasks 1020 and 1030 are pending.',
+            "Reviews of Leo's tasks 1020 and 1030 are pending.",
+            'Statuses of quite a few tasks 1020 and 1030 are pending.',
+            'Blockers for down-stream, still-unmerged tasks 1020 and 1030 are pending.',
+            # HYPHENATED negation / past-exit reaching the marker through
+            # _COMPOUND_PREFIX rather than the closed-class adverb slot
+            'Tasks 1020 and 1030 are un-blocked.',
+            'Tasks 1020 and 1030 are previously-blocked.',
+            # NON-SENTENCE-FINAL punctuation between the preposition and the
+            # list noun. Each of these over-selected while the clause-break
+            # class still contained ':', the paren/bracket family and the
+            # quote family: the break truncated the backward scan short of
+            # the governing preposition, so the guard saw a clause with no
+            # preposition in it and admitted the match. A colon typically
+            # INTRODUCES the complement its preposition governs, and a
+            # parenthetical or quoted aside is an interpolation inside the
+            # clause rather than a new one — neither ends government, so
+            # neither may be a break. (amendment, reviewer_comprehensive
+            # correctness-precision finding, task 3079)
+            'Statuses of the following: tasks 1020 and 1030 are pending.',
+            'Reviews of the following (still open): tasks 1020 and 1030 are pending.',
+            'Statuses of the "next" tasks 1020 and 1030 are pending.',
+            'Blockers for the merge lane [df] tasks 1020 and 1030 are pending.',
+        ],
+    )
+    def test_plural_enumeration_precision_guards(self, fact):
+        """Shapes the plural path must NOT extract. (task 3079)
+
+        Same anchoring discipline the rest of the module enforces: the
+        marker must sit immediately after the enumeration and its copula,
+        the copula is mandatory so a plural subject followed by a transitive
+        verb never reads as a status assertion, and the enumeration must be
+        the copula's SUBJECT rather than a preposition's complement.
+        """
+        assert extract_snapshot_edge_task_ids(fact) == set()
+
+    @pytest.mark.parametrize(
+        'fact',
+        [
+            'Reviews for tasks 1020, task 1030 and task 1031 are pending.',
+            'Statuses of the tasks 1020 and task 1030 are blocked.',
+            'Notes about tasks 1020, task 1030 and task 1031 are pairwise-stalled.',
+            "Reviews of Leo's tasks 1020 and task 1030 are pending.",
+        ],
+    )
+    def test_guard_rejected_enumeration_suppresses_ids_on_every_path(self, fact):
+        """Rejecting the plural match must not leave its tail extractable.
+
+        (amendment, reviewer_comprehensive correctness-precision finding,
+        task 3079)
+
+        The subjecthood guard used to ``continue`` past the plural match
+        and nothing more, so an enumeration that REPEATS the reference
+        token still handed its trailing ids to the unguarded individual
+        path: 'Reviews for tasks 1020, task 1030 and task 1031 are
+        pending' suppressed the plural match and then matched 'task 1031
+        are pending' on its own, yielding {1031}.
+
+        That leak is only reachable because this task newly blessed the
+        repeated-reference-token enumeration as a supported POSITIVE shape
+        (see the '{1020, 1030, 1031}' case below); its
+        prepositional-complement counterpart is therefore a live shape the
+        guard is documented to close. Every fact here is a permanently-true
+        meta assertion about reviews/statuses/notes, so extracting any id
+        retires a still-true edge as soon as that id goes terminal — the
+        unrecoverable over-selection direction.
+        """
+        assert extract_snapshot_edge_task_ids(fact) == set()
+
+    @pytest.mark.parametrize(
+        ('fact', 'expected'),
+        [
+            ('Tasks 1020, task 1030 and task 1031 are pending.', {1020, 1030, 1031}),
+            # The suppression is scoped to the REJECTED span, not to the
+            # whole fact: a genuine snapshot in a later clause survives.
+            ('Reviews for tasks 1020 and task 1030 are pending. Task 55 is blocked.', {55}),
+        ],
+    )
+    def test_span_suppression_is_scoped_to_the_rejected_enumeration(self, fact, expected):
+        """The suppression must not become a blanket whole-fact veto.
+
+        Pins the other edge of the guard above: the repeated-reference-token
+        enumeration is a supported positive when it IS the copula's subject,
+        and a rejected enumeration only silences ids inside its own span.
+        (task 3079)
+        """
+        assert extract_snapshot_edge_task_ids(fact) == expected
+
+    #: A plural-head fact per preposition in ``_ENUM_PREP_WORDS``. Plural
+    #: agreement is what refuses the far more natural singular-copula
+    #: phrasing of most of these ('Work on tasks ... IS blocked'), so only a
+    #: plural head puts the preposition guard itself on the hook. See the
+    #: test below for why that distinction decides whether these cases test
+    #: anything at all.
+    #:
+    #: This maps the SOURCE tuple's entries rather than restating the
+    #: vocabulary: the test parametrizes over ``_ENUM_PREP_WORDS`` directly,
+    #: so a preposition added to the guard without a case here fails as its
+    #: own parametrized case instead of shipping unexercised. (Earlier this
+    #: sync was enforced by scraping the then-lookbehind guard constant's
+    #: ``.pattern`` with a second regex — an introspection meta-test on a
+    #: private constant's spelling, deleted in favour of inverting the
+    #: dependency. amendment, reviewer_comprehensive test-quality finding,
+    #: task 3079)
+    _PREPOSITION_GUARD_FACTS = {
+        'of': 'Statuses of tasks 1020 and 1030 are blocked.',
+        'in': 'Delays in tasks 1020 and 1030 are blocked.',
+        'on': 'Notes on tasks 1020 and 1030 are pending.',
+        'to': 'Updates to tasks 1020 and 1030 are pending.',
+        're': 'Comments re tasks 1020 and 1030 are pending.',
+        'for': 'Reviews for tasks 1020 and 1030 are pending.',
+        'with': 'Problems with tasks 1020 and 1030 are blocked.',
+        'among': 'Conflicts among tasks 1020 and 1030 are blocked.',
+        'about': 'Notes about tasks 1020 and 1030 are pending.',
+        'across': 'Regressions across tasks 1020 and 1030 are pending.',
+        'against': 'Complaints against tasks 1020 and 1030 are pending.',
+        'between': 'Dependencies between tasks 1020 and 1030 are blocked.',
+        'regarding': 'Notes regarding tasks 1020 and 1030 are pending.',
+        'from': 'Dependencies from tasks 1020 and 1030 are blocked.',
+        'by': 'Reviews by tasks 1020 and 1030 are pending.',
+        'under': 'Sub-issues under the tasks 1020 and 1030 are blocked.',
+        'within': 'Failures within tasks 1020 and 1030 are blocked.',
+        'around': 'Discussions around tasks 1020 and 1030 are pending.',
+        'during': 'Blockers during tasks 1020 and 1030 are pending.',
+        'through': 'Regressions through tasks 1020 and 1030 are pending.',
+        'via': 'Escalations via tasks 1020 and 1030 are pending.',
+        'concerning': 'Notes concerning tasks 1020 and 1030 are pending.',
+    }
+
+    @pytest.mark.parametrize('preposition', _ENUM_PREP_WORDS)
+    def test_every_guarded_preposition_is_exercised_against_a_plural_head(
+        self, preposition
+    ):
+        """Each entry in ``_ENUM_PREP_WORDS`` is load-bearing. (task 3079)
+
+        The guard list could previously have SILENTLY LOST entries: most of
+        its prepositions appeared only in singular-copula facts ('Work on
+        tasks ... is blocked', 'The dependency between tasks ... is
+        blocked'), and those are already refused by ``_PLURAL_COPULA_ALT``
+        agreement — deleting 'on' or 'between' from the list would not have
+        failed a single test. Only a PLURAL head noun ('Notes', 'Delays',
+        'Dependencies') with a plural copula reaches the preposition check,
+        so these are the cases that actually pin it.
+
+        (amendment, reviewer_comprehensive test-coverage finding, task 3079)
+        """
+        fact = self._PREPOSITION_GUARD_FACTS.get(preposition)
+        assert fact is not None, (
+            f'preposition {preposition!r} was added to _ENUM_PREP_WORDS '
+            f'without a plural-head case in _PREPOSITION_GUARD_FACTS'
+        )
+        assert extract_snapshot_edge_task_ids(fact) == set(), (
+            f'preposition {preposition!r} is in _ENUM_PREP_WORDS but its '
+            f'complement still over-selects'
+        )
+
+    @pytest.mark.parametrize(
+        ('fact', 'expected'),
+        [
+            # These two are the load-bearing pair: both end in the letters
+            # 'on'/'ion' immediately before ' tasks', so they prove the
+            # preposition guard is \b-anchored and does not fire on a word
+            # that merely ENDS in a preposition.
+            ('Migration tasks 1020 and 1030 are pending.', {1020, 1030}),
+            ('Verification tasks 1020 and 1030 are pending.', {1020, 1030}),
+            # a marker-qualified plural head is still a subject
+            ('Blocked tasks 1020 and 1030 are pending.', {1020, 1030}),
+            # a determiner before the plural head is not a preposition
+            ('The tasks 1020 and 1030 are blocked.', {1020, 1030}),
+            # 'remain' must survive the copula narrowing to plural agreement
+            ('Tasks 1020 and 1030 remain pending.', {1020, 1030}),
+            # CLAUSE SCOPE. The preposition guard is unbounded within a
+            # clause, so these pin the other edge of it: strong punctuation
+            # ends the span a preposition governs, and an enumeration opening
+            # a new sentence/clause really is its own copula's subject even
+            # though a listed preposition appears earlier in the fact. Without
+            # a clause reset the guard would swallow the whole prefix and
+            # disable the plural path for any multi-sentence fact. (amendment,
+            # reviewer_comprehensive correctness-precision finding, task 3079)
+            ('Reviews for the branch are done. Tasks 1020 and 1030 are pending.',
+             {1020, 1030}),
+            ('Blocked on review; tasks 1020 and 1030 are pending.', {1020, 1030}),
+            # ...and the other edge of narrowing the break class to
+            # sentence-final punctuation: a colon-preambled genuine snapshot
+            # is unaffected, because the longer clause it now scans still
+            # contains no listed preposition for the guard to fire on.
+            # (amendment, reviewer_comprehensive correctness-precision
+            # finding, task 3079)
+            ('Note: tasks 1020 and 1030 are pending.', {1020, 1030}),
+        ],
+    )
+    def test_plural_enumeration_subject_positives_survive_precision_guards(
+        self, fact, expected
+    ):
+        """Subject-position enumerations still extract. (task 3079)
+
+        These pass before the prepositional-complement fix and must keep
+        passing after it — they are what stops the guard from over-reaching
+        into a blanket disabling of the plural path. Together with the
+        precision guards above they pin the fix from both directions.
+        """
+        assert extract_snapshot_edge_task_ids(fact) == expected
+
+    @pytest.mark.parametrize(
+        'fact',
+        [
+            # 'of' inside a date stamp — the shape the finding's own
+            # motivating fact carries ("... is pending as of 2026-07-14...")
+            'As of 2026-08-09, tasks 1020 and 1030 are pending.',
+            # 'in' inside a location-scoping preamble
+            'In the merge queue, tasks 1020 and 1030 are pending.',
+            # 'for' inside a cycle-scoping preamble
+            'For this cycle, tasks 1020 and 1030 are pending.',
+        ],
+    )
+    def test_adverbial_preamble_is_a_documented_under_selection(self, fact):
+        """Cost of the clause-scoped guard, pinned rather than left implicit.
+
+        (amendment, reviewer_comprehensive correctness-recall finding, task
+        3079)
+
+        The guard rejects when a listed preposition appears ANYWHERE between
+        the last sentence-final break and the enumeration, and a comma is
+        deliberately not a break (it does not end prepositional government).
+        Together those mean an ordinary sentence-initial ADVERBIAL PREAMBLE —
+        a date stamp, a location or a cycle scope, all common in this repo's
+        memory corpus — shares the clause with its own preposition and
+        suppresses a genuine subject-position snapshot behind it.
+
+        This is the fail-safe under-selection direction, so it is documented
+        behaviour rather than a defect: the edge is simply not retired this
+        cycle and the next sweep (or Stage 2) sees it again. It is pinned
+        here so the recall cost is VISIBLE and intentional — if the guard
+        widens further, these cases are where it shows up, and if the real
+        edge corpus ever makes the cost matter, this is the test that has to
+        be renegotiated first. Deliberately NOT fixed speculatively:
+        tightening the guard means measuring against the actual edge set,
+        and every candidate tightening trades back toward the unrecoverable
+        over-selection direction.
+        """
+        assert extract_snapshot_edge_task_ids(fact) == set()
+
+    def test_plural_enumeration_needs_two_or_more_ids(self):
+        """A plural head over a single id is not an enumeration. (task 3079)
+
+        Guards the plural path from degenerating into a second, weaker
+        individual form: 'Tasks 1020 are pending' is malformed English and
+        a single stray digit after a plural head is more likely a count
+        than an id. Requiring 2+ ids keeps the path's subject unambiguous.
+        The well-formed singular shape still routes through
+        INDIVIDUAL_SNAPSHOT_RE unchanged.
+
+        This also pins the separator against a defect the first draft of
+        _ENUM_IDS_ALT had: with every separator element optional, the
+        repeated group could match between two adjacent digits of a SINGLE
+        number, so '1020' parsed as '102' + '0' and this fact satisfied a
+        rule meant to require two ids. The separator's leading comma-or-
+        whitespace is now mandatory.
+        """
+        assert extract_snapshot_edge_task_ids('Tasks 1020 are pending.') == set()
+        assert extract_snapshot_edge_task_ids('Task 1020 is pending.') == {1020}
+
+    def test_plural_enumeration_collects_digits_only_from_its_own_span(self):
+        """An embedded count phrase never contributes a spurious id. (task 3079)
+
+        The module's standing invariant is that a bare '\\d+' may only
+        contribute an id from inside an already-detected, marker-anchored
+        segment — the property that keeps dates, commit hashes and ports in
+        ordinary prose from becoming task ids. The plural path preserves it
+        by collecting digits from its own 'ids' capture group ONLY, never
+        from the whole fact.
+
+        Here '3 tasks' sits in a second clause outside the enumeration, so
+        3 must not appear even though the fact as a whole is packed with
+        status markers.
+        """
+        ids = extract_snapshot_edge_task_ids(
+            'Tasks 1020 and 1030 are pending; 3 tasks remain in progress.'
+        )
+        assert ids == {1020, 1030}
+        assert 3 not in ids
+
+    def test_plural_enumeration_does_not_reach_across_an_intervening_count(self):
+        """A count phrase breaking the enumeration kills the match. (task 3079)
+
+        'Blocked tasks 1020 and 1030 plus 3 pending others ...' — the
+        enumeration cannot absorb 'plus 3', and the copula never follows
+        the ids, so the path yields nothing at all rather than leaking a
+        bare 3. Under-selection is the fail-safe direction this module
+        prefers throughout.
+        """
+        assert extract_snapshot_edge_task_ids(
+            'Blocked tasks 1020 and 1030 plus 3 pending others are pending.'
+        ) == set()
+
+    # ----------------------------------------------------------------- #
+    # task 3079 — 'stalled' as a recognized non-terminal marker
+    # ----------------------------------------------------------------- #
+
+    @pytest.mark.parametrize(
+        ('fact', 'expected'),
+        [
+            # the finding's verbatim stale edge fact — a hyphenated compound
+            (
+                'Tasks 1020, 1030, and 1031 are pairwise-stalled as of 2026-04-29.',
+                {1020, 1030, 1031},
+            ),
+            (
+                'Tasks 1020, 1030, and 1031 are pairwise-stalled and remain pending.',
+                {1020, 1030, 1031},
+            ),
+            # every other path must reach the new marker too — the module's
+            # standing rule is that a marker addition is checked against ALL
+            # paths, not just the one that motivated it
+            ('Task 5 is stalled.', {5}),
+            ('Task 5 is pairwise-stalled.', {5}),
+            ("Task 5's status is stalled.", {5}),
+            ('Task 5 is in a stalled status.', {5}),
+            ('Stalled tasks: 1020, 1030', {1020, 1030}),
+        ],
+    )
+    def test_stalled_is_a_recognized_marker(self, fact, expected):
+        """'stalled' asserts a non-terminal status. (task 3079)
+
+        REPRO, and the reason the 1020/1030/1031 cluster was unreachable
+        even in principle: SNAPSHOT_STATUS_RE — the whole-fact gate — did
+        not know the word, so extraction short-circuited to set() before
+        any reference parsing ran. A perfect plural-enumeration parser
+        alone would still not have selected this edge.
+
+        The cluster asserts a stalled (i.e. non-terminal, still-live)
+        condition on tasks that are now done, which is squarely in this
+        sweep's remit.
+        """
+        assert extract_snapshot_edge_task_ids(fact) == expected
+
+    @pytest.mark.parametrize(
+        'fact',
+        [
+            # THE reason 'stalled' belongs in _TRANSITIVE_MARKER_ALT rather
+            # than _ADJECTIVE_MARKER_ALT: like 'blocked' it is also a common
+            # transitive verb, and these are permanently-true historical
+            # facts. The optional-copula adjective arm would match them and
+            # retire them the moment task 5 went done.
+            'Task 5 stalled the merge queue.',
+            'Task 5 stalled the release for a week.',
+            'Tasks 1020 and 1030 stalled the merge queue.',
+            # negation / past-exit
+            'Task 5 is no longer stalled.',
+            "Task 5's status is no longer stalled.",
+        ],
+    )
+    def test_stalled_precision_guards(self, fact):
+        """Shapes the new marker must NOT extract. (task 3079)
+
+        Mirrors the task-3042 transitive-verb hardening exactly: 'stalled'
+        is admitted only in copula/article form, so the bare verb reading
+        stays out of every path.
+        """
+        assert extract_snapshot_edge_task_ids(fact) == set()
+
+    def test_stalled_count_quantity_is_stripped_from_aggregate_segment(self):
+        """'3 stalled' must not leak a bare id 3. (task 3079)
+
+        The non-obvious half of the module's standing marker-addition rule.
+        Widening _STATUS_MARKER_ALT feeds four consumers; three are safe by
+        construction (the gate merely admits a fact; the phrase form
+        requires the literal noun 'status'; the list introducer requires
+        adjacency to the list noun). COUNT_QUANTITY_RE is the one that is
+        NOT — it strips 'N <count-noun>' spans from an aggregate segment
+        before bare-digit collection, so a marker missing from ITS
+        alternation turns a count phrase into a spurious task id.
+        """
+        ids = extract_snapshot_edge_task_ids('Stalled tasks: 1020, 1030, and 3 stalled others')
+        assert ids == {1020, 1030}
+        assert 3 not in ids
+
+    def test_compound_prefix_is_a_single_hyphenated_token(self):
+        """The compound prefix cannot cross whitespace. (task 3079)
+
+        'pairwise-stalled' anchors to its copula via a bounded optional
+        '\\w+-' prefix. Deliberately ONE hyphenated token: were it allowed
+        to span whitespace it would additionally admit the multi-word
+        readings the mandatory-copula arms exist to exclude — here, a
+        merge that is blocked rather than the tasks.
+
+        NOTE this pins the gap's WIDTH only. Its LEXICAL CLASS is a
+        separate property with its own test below — the two were once
+        conflated, which is how the un-/non-/previously- class slipped in.
+        """
+        assert extract_snapshot_edge_task_ids(
+            'Tasks 1020 and 1030 are awaiting a blocked merge.'
+        ) == set()
+        assert extract_snapshot_edge_task_ids('Task 5 is awaiting stalled work.') == set()
+
+    @pytest.mark.parametrize(
+        'fact',
+        [
+            'Task 5 is un-blocked.',
+            'Task 5 is non-blocked.',
+            'Task 5 is not-pending.',
+            'Task 5 is never-blocked.',
+            'Task 5 is previously-blocked.',
+            'Task 5 is formerly-pending.',
+            'Task 5 is once-blocked.',
+            'Task 5 is briefly-stalled.',
+            # The privative 'in-', reached through the same door. Guarded by
+            # its own narrower lookahead because 'in-progress' is itself a
+            # marker, so a bare 'in' entry in the main alternation would
+            # refuse the positive along with the negation. (task 3079)
+            'Task 5 is in-active.',
+            "Task 5's status is in-active.",
+            'Tasks 1020 and 1030 are in-active.',
+        ],
+    )
+    def test_compound_prefix_refuses_inverting_modifiers(self, fact):
+        """A hyphenated negation / past-exit prefix must not reach the marker.
+
+        (amendment, reviewer_comprehensive correctness-precision finding,
+        task 3079)
+
+        The bare-marker forms of these ARE already refused, for free, by
+        the closed-class ``_ADVERB_ALT`` — 'Task 5 is no longer blocked'
+        and 'Task 5 is not blocked' never matched, because those tokens
+        simply are not in the alternation. The compound prefix reopened
+        the same class through a different door: bounding it to a single
+        non-whitespace-crossing token bounds its WIDTH, not its lexical
+        class, and 'un-'/'non-'/'previously-' are each one '\\w+-' token.
+
+        Each fact here is a permanently-true HISTORICAL or negated
+        assertion. Extracting an id from one means the sweep retires a
+        still-true edge as soon as that id goes done/cancelled — the
+        over-selection direction the module docstring forbids, and
+        unrecoverable, since an invalidated Graphiti edge is not
+        re-validated on the next cycle.
+        """
+        assert extract_snapshot_edge_task_ids(fact) == set()
+
+    @pytest.mark.parametrize(
+        ('fact', 'expected'),
+        [
+            ('Tasks 1020, 1030, and 1031 are pairwise-stalled.', {1020, 1030, 1031}),
+            ('Task 5 is merge-blocked.', {5}),
+            ('Task 5 is self-blocked.', {5}),
+            ('Tasks 7 and 8 are auto-stalled.', {7, 8}),
+            ("Task 5's status is merge-blocked.", {5}),
+            # The 'in-' lookahead is narrowed to spare 'in-progress', which
+            # is a MARKER rather than a prefixed one. Both the hyphenated
+            # and the spaced spellings must survive it, on every anchored
+            # path. (task 3079)
+            ('Task 5 is in-progress.', {5}),
+            ('Task 5 is in progress.', {5}),
+            ("Task 5's status is in-progress.", {5}),
+            ('Tasks 1020 and 1030 are in-progress.', {1020, 1030}),
+        ],
+    )
+    def test_compound_prefix_still_admits_ordinary_modifiers(self, fact, expected):
+        """Non-inverting compound modifiers must keep matching. (task 3079)
+
+        The exclusion above is a closed SUBTRACTION from an open-class
+        prefix, not a whitelist: the observed modifier vocabulary
+        ('pairwise-', 'merge-', 'self-', 'auto-') is not closed, and an
+        unlisted-but-innocent modifier must not silently drop a genuine
+        snapshot. 'pairwise-stalled' is the finding's verbatim fact shape,
+        so this is the case the prefix exists for in the first place.
+        """
+        assert extract_snapshot_edge_task_ids(fact) == expected
+
+
+# --------------------------------------------------------------------------- #
+# extract_snapshot_edge_task_ids — catastrophic-backtracking regression
+# --------------------------------------------------------------------------- #
+
+
+class TestPluralEnumerationPerformance:
+    """The plural enumeration separator must parse in linear, not exponential, time.
+
+    (amendment, reviewer_comprehensive performance-redos finding, task 3079)
+
+    ``_ENUM_SEP_ALT``'s trailing ``\\s*`` overlaps its own leading
+    ``\\s*,\\s*`` / ``\\s+``, so a whitespace run between two ids can be
+    apportioned between those elements in ``len(run) + 1`` distinct ways.
+    Under ``_ENUM_IDS_ALT``'s ``+`` repetition that is ``(w + 1) ** n``
+    parses, ALL of which get explored when the overall match ultimately
+    FAILS — which is the common case, since most enumerations in real prose
+    are not followed by a copula and a status marker.
+
+    Why this is a liveness property and not a micro-optimisation:
+    ``sweep_stale_status_snapshot_edges`` calls this extractor once per
+    valid edge in an unguarded dict comprehension with no per-edge timeout,
+    over the whole group's edge set (~5868 edges in the task-3042 record).
+    One pathological fact stalls the entire reconciliation cycle.
+
+    SIZING NOTE: the blowup base scales with the WIDTH of the whitespace
+    run — each extra whitespace character adds another way to split it — so
+    the three shapes are ~2**n, ~3**n and ~6**n and are NOT interchangeable.
+    Each size below was measured pre-fix on this branch to land several
+    times over the budget while staying BOUNDED, so a regression presents as
+    a fast failure rather than a hang. A flat ~40-id input would instead
+    cost ~2**40 and hang until the session died.
+    """
+
+    #: Wall-clock budget for a single extract call. Post-fix all three
+    #: variants land at ~0.1ms, a >10,000x margin, so this is nowhere near
+    #: the CI-flake boundary.
+    BUDGET_SECONDS = 1.0
+
+    @pytest.mark.parametrize(
+        ('sep', 'count'),
+        [
+            # measured pre-fix: ~6.1s (base ~2**n)
+            (', ', 20),
+            # measured pre-fix: ~4.6s (base ~3**n)
+            (',  ', 13),
+            # measured pre-fix: ~16.6s (base ~6**n) — a newline-indented
+            # list of only NINE ids already wedges the sweep, a far lower
+            # real-world trigger threshold than a flat 2**n reading implies
+            (',\n    ', 9),
+        ],
+        ids=['comma-space', 'comma-two-spaces', 'comma-newline-indent'],
+    )
+    def test_long_non_matching_enumeration_parses_in_linear_time(self, sep, count):
+        """A long enumeration that does NOT match must not backtrack exponentially.
+
+        The fact is real prose this module targets: a plural head, a genuine
+        comma-separated id enumeration, and then a verb phrase that is NOT a
+        copula + status marker — so ``PLURAL_ENUM_SNAPSHOT_RE`` fails, which
+        is exactly what forces the engine to explore every apportionment of
+        every whitespace run.
+
+        The elapsed-time assertion below is the real regression signal. The
+        suite-wide ``timeout = 60`` / ``timeout_method = "thread"`` backstop
+        in pyproject.toml would eventually fire, but it ends in
+        ``os._exit(1)`` and takes the whole xdist worker with it — a 60x
+        slower, far less legible failure than the assertion. Pre-fix these
+        cases measured 4.6-16.6s, i.e. inside that backstop and invisible to
+        it, so BUDGET_SECONDS is what actually catches the regression.
+        """
+        ids = [str(1000 + i) for i in range(count)]
+        fact = f'Pending tasks {sep.join(ids)} were reviewed by the merge worker.'
+
+        start = time.perf_counter()
+        extracted = extract_snapshot_edge_task_ids(fact)
+        elapsed = time.perf_counter() - start
+
+        # Correctness is pinned alongside cost, so the budget can never be
+        # satisfied by making the pattern simply stop matching valid input:
+        # 'were reviewed by' is not a copula + status marker, so nothing is a
+        # candidate here regardless of how fast the parse is.
+        assert extracted == set()
+        assert elapsed < self.BUDGET_SECONDS, (
+            f'extract_snapshot_edge_task_ids took {elapsed:.3f}s for {count} ids '
+            f'separated by {sep!r} (budget {self.BUDGET_SECONDS}s) — the '
+            f'enumeration separator is backtracking exponentially'
+        )
+
 
 # --------------------------------------------------------------------------- #
 # flatten_dedup_edges
@@ -942,6 +1689,100 @@ class TestSweepStaleStatusSnapshotEdgesCore:
             'Expected get_statuses called with 2885 among the candidate ids — proving the '
             'blocked-worded ids now reach the cross-reference instead of being dropped by '
             'the gate'
+        )
+
+    @pytest.mark.asyncio
+    async def test_genitive_and_plural_snapshot_edges_invalidated_end_to_end(self):
+        """Deterministic stand-in for "re-run the sweep to confirm coverage"
+        (task 3079), following the task-3042 precedent directly above.
+
+        A LIVE re-run cannot prove anything here: Stage 1 already
+        invalidated and superseded all four of the finding's real edges
+        this cycle, so re-running the sweep would observe nothing and
+        report zero by construction. Replaying both verbatim fact shapes
+        (including the finding's real edge uuid) through the real
+        orchestrator is the repeatable proof that survives long after the
+        incident edges are gone.
+
+        Drives the full enumerate -> extract -> cross-reference ->
+        invalidate path. Both edges reference tasks whose census status is
+        now 'done', so both must be invalidated; the control edge
+        references task 3100, still 'pending', and must be left alone —
+        pinning invalidate-only-on-positively-terminal end-to-end for the
+        two new paths, not just at the pure-function layer.
+
+        The get_statuses assertion is the load-bearing one for the
+        finding's second question: ALL THREE ids of the pairwise fact must
+        reach the cross-reference, not merely the first.
+        """
+        memory_service = _make_memory_service()
+        taskmaster = _make_taskmaster()
+        now = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
+
+        genitive_edge = {
+            # the finding's real edge uuid and verbatim fact
+            'uuid': '3e78fd74-83a9-48bb-84ba-b13d32050439',
+            'fact': (
+                "Task 2623's status is pending as of 2026-07-14T20:31:00Z, "
+                'linked to memory f20fbf15-41b7-4781-97a6-334f4e1d066a.'
+            ),
+            'name': '',
+        }
+        plural_edge = {
+            'uuid': 'edge-1020-1030-1031',
+            'fact': 'Tasks 1020, 1030, and 1031 are pairwise-stalled as of 2026-04-29.',
+            'name': '',
+        }
+        control_edge = {
+            'uuid': 'edge-3100-control', 'fact': 'Task 3100 is pending.', 'name': '',
+        }
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [genitive_edge, plural_edge, control_edge]},
+        )
+        taskmaster.get_statuses = AsyncMock(
+            return_value={
+                '1020': 'done', '1030': 'done', '1031': 'done',
+                '2623': 'done', '3100': 'pending',
+            },
+        )
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, taskmaster, 'test_project', '/tmp/reify',
+            run_id='run-3079', now=now,
+        )
+
+        assert stats == {'scanned': 3, 'candidate_edges': 2, 'invalidated': 2, 'errors': 0}, (
+            f'Expected both repro-shape edges invalidated and the still-pending '
+            f'control edge left alone, got stats={stats!r}'
+        )
+
+        assert memory_service.update_edge.await_count == 2, (
+            'Expected update_edge awaited exactly twice, for the two repro-shape edges only'
+        )
+        invalidated_uuids = {call.args[0] for call in memory_service.update_edge.await_args_list}
+        assert invalidated_uuids == {
+            '3e78fd74-83a9-48bb-84ba-b13d32050439', 'edge-1020-1030-1031',
+        }, (
+            f'Expected only the two repro-shape edges invalidated, never the '
+            f'still-pending control edge, got {invalidated_uuids!r}'
+        )
+        for call in memory_service.update_edge.await_args_list:
+            assert call.kwargs.get('invalid_at') == now, (
+                f'Expected update_edge called with the explicit now= timestamp, got {call!r}'
+            )
+            assert call.kwargs.get('project_id') == 'test_project'
+            assert call.kwargs.get('agent_id') == 'recon-stage-memory_consolidator'
+            assert call.kwargs.get('causation_id') == 'run-3079'
+
+        taskmaster.get_statuses.assert_awaited_once()
+        get_statuses_call = taskmaster.get_statuses.await_args
+        assert get_statuses_call.args[0] == '/tmp/reify'
+        assert {'1020', '1030', '1031', '2623'} <= set(
+            get_statuses_call.kwargs.get('ids', [])
+        ), (
+            'Expected every candidate id to reach the cross-reference — 2623 from the '
+            'genitive shape, and ALL THREE of 1020/1030/1031 from the pairwise shape '
+            'rather than only the first, which is the precise gap the finding reports'
         )
 
 
