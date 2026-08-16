@@ -42,10 +42,12 @@ from shared.safe_io import load_json_or_warn
 
 logger = logging.getLogger(__name__)
 
-# Per-process dedup set for unreadable-sidecar warnings. Bounded by the number
-# of distinct provenance paths that go unreadable in a process lifetime; a
-# restart re-enables the warning (mirrors safe_io._warned_corrupt_paths:29).
-_warned_unreadable_provenance_paths: set[str] = set()
+# Per-process dedup set for unreadable-artifact-path warnings (both the
+# heuristics stat and the provenance load route through it, so an unreadable
+# key dir warns once, not once per file). Bounded by the number of distinct
+# artifact paths that go unreadable in a process lifetime; a restart
+# re-enables the warning (mirrors safe_io._warned_corrupt_paths:29).
+_warned_unreadable_paths: set[str] = set()
 
 __all__ = [
     'ArtifactProvenance',
@@ -163,6 +165,32 @@ def _encode_segment(segment: str) -> str:
     return urllib.parse.quote(segment, safe='').replace('.', '%2E')
 
 
+def _warn_unreadable_once(path: Path, exc: OSError) -> None:
+    """Warn once per *path* per process that an artifact path is unreadable.
+
+    Shared by both limbs of :meth:`PromptArtifactStore.resolve`'s fail-safe —
+    the ``heuristics.txt`` stat and the ``provenance.json`` load — so an
+    unreadable key directory warns once rather than once per file it contains.
+
+    Absorbed but NOT silent: these fallbacks sit on a per-invocation hot path
+    (``task_curator`` resolves through it every reconciliation cycle), so a
+    root that goes unreadable would otherwise revert every prompt to baseline
+    indistinguishably from "nothing pinned". The dedup gates the WARNING only
+    — every caller's fail-safe return always runs (the same split ``safe_io``
+    documents at :56-61).
+    """
+    key = str(path)
+    if key in _warned_unreadable_paths:
+        return
+    _warned_unreadable_paths.add(key)
+    logger.warning(
+        'prompt_artifact: unreadable artifact path %s (%s); falling back '
+        'to the in-code prompt for this key',
+        path,
+        exc,
+    )
+
+
 def _load_valid_provenance(
     path: Path, *, expected_harness_version: str | None = None
 ) -> ArtifactProvenance | None:
@@ -193,22 +221,7 @@ def _load_valid_provenance(
         # the fault is absorbed here rather than by widening safe_io.
         # (FileNotFoundError is an OSError subclass but is already handled
         # inside safe_io, so it never reaches this handler.)
-        #
-        # Absorbed but NOT silent: this fallback is on a per-invocation hot
-        # path (task_curator resolves through it every reconciliation cycle),
-        # so a root that goes unreadable would otherwise revert every prompt
-        # to baseline indistinguishably from "nothing pinned". The dedup set
-        # gates the WARNING only (once per path per process); the fail-safe
-        # return always runs — the same split safe_io documents at :56-61.
-        key = str(path)
-        if key not in _warned_unreadable_provenance_paths:
-            _warned_unreadable_provenance_paths.add(key)
-            logger.warning(
-                'prompt_artifact: unreadable provenance sidecar at %s (%s); falling back '
-                'to the in-code prompt for this key',
-                path,
-                exc,
-            )
+        _warn_unreadable_once(path, exc)
         return None
     if parsed is None:
         return None
@@ -293,7 +306,16 @@ class PromptArtifactStore:
         key_dir = self._key_dir(spec.prompt_id, executor_model, harness_version)
         heuristics_path = key_dir / _HEURISTICS_FILENAME
         provenance_path = key_dir / _PROVENANCE_FILENAME
-        if heuristics_path.exists():
+        try:
+            heuristics_present = heuristics_path.exists()
+        except OSError as exc:
+            # Path.exists() swallows only ENOENT/ENOTDIR/EBADF/ELOOP/EINVAL
+            # (pathlib._abc._ignore_error) — EACCES propagates. So an
+            # unreadable key dir, or any unreadable ancestor, raises here
+            # before the provenance guard below is ever reached.
+            _warn_unreadable_once(heuristics_path, exc)
+            return ResolvedPrompt(spec.in_code_constant, None, 'in_code')
+        if heuristics_present:
             provenance = _load_valid_provenance(
                 provenance_path, expected_harness_version=harness_version
             )

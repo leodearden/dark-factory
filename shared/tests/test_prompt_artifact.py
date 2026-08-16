@@ -69,11 +69,12 @@ def clear_warned_unreadable_paths():
 
     Mirrors shared/tests/test_safe_io.py lines 13-24. Without it the
     module-level set leaks across tests and the warn-once assertions in
-    ``TestUnreadableProvenanceWarns`` become test-order dependent.
+    ``TestUnreadableProvenanceWarns`` / ``TestUnreadableKeyDirectory`` become
+    test-order dependent.
     """
-    prompt_artifact._warned_unreadable_provenance_paths.clear()
+    prompt_artifact._warned_unreadable_paths.clear()
     yield
-    prompt_artifact._warned_unreadable_provenance_paths.clear()
+    prompt_artifact._warned_unreadable_paths.clear()
 
 
 class TestArtifactProvenance:
