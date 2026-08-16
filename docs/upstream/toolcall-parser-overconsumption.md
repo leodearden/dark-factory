@@ -74,18 +74,28 @@ was silently substituted for an argument the model had actually supplied.
 
 ## Specimens
 
-Four real examples, drawn from our own tool-call logs and reproduced below
-losslessly (each fenced block, once the `&#60;` escapes are read back as `<`,
-is the exact text the parser received as a single parameter's value). The
-tool names below — `submit_task`, `add_memory`, `update_memory` — are our own
+Four specimens, reconstructed from our own tool-call logs. The payload text
+inside each value below has been replaced with a neutral stand-in rather
+than quoted verbatim from the original call; what *is* reproduced exactly is
+the markup structure — the tags, the mis-close, the parameter names, and
+which of them end up dropped. The structure is the evidence this report
+rests on, not the payload prose, and the structure is what the
+machine-readable header above each block below is checked against. The tool
+names below — `submit_task`, `add_memory`, `update_memory` — are our own
 internal MCP tools; they appear only to illustrate the shape of the defect,
 not because they matter to the harness. Each specimen also carries a
 one-line HTML comment immediately above its block recording the call it
 came from in a structured form (`id`, `tool`, the parameter whose value
 absorbed the tail, the argument names that arrived intact, that tool's full
 parameter set, and the names that were dropped); the comment is invisible in
-a rendered view of this document and exists so the claims below are
-independently checkable against the parsed text, not just asserted.
+a rendered view of this document and exists so the structural claim — that a
+given piece of markup actually drops the named parameters — is independently
+checkable against the parsed text, not just asserted.
+
+This reconstruction applies only to the four specimens below. The Incidence,
+Repairability, and Reproducibility figures later in this report are direct
+measurements over the transcript archive, not reconstructions, and this
+caveat does not extend to them.
 
 | Specimen | Tool call | Corrupted parameter | Keys received | Keys dropped |
 |---|---|---|---|---|

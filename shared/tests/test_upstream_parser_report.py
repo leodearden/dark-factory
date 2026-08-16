@@ -28,8 +28,16 @@ Two gates, both genuinely behavioural rather than cosmetic:
    section): every specimen the report presents is parsed from a
    machine-readable header, un-escaped, and replayed through PRODUCTION
    ``repair()``. The parameters production code independently recovers must
-   equal the parameters the report claims were dropped. A specimen typed
-   from imagination cannot satisfy that.
+   equal the parameters the report claims were dropped. This is a
+   structural-fidelity check, not a provenance check: ``repair()`` is
+   deterministic over ``(value, param, schema, supplied)``, and all four of
+   those are hand-authored side by side in the same document, so an
+   internally coherent invention satisfies it. What it does catch is an
+   INCONSISTENT specimen -- a ``dropped`` list that disagrees with what
+   production code actually derives from the given markup, a block that
+   does not actually trip ``detect()``, or a ``clean_value`` that violates
+   the D5 prefix/substring invariant. Provenance is not machine-checkable
+   from a self-contained document, and nothing here claims otherwise.
 
 Nothing here asserts prose wording, and nothing asserts any of the report's
 counts or percentages -- the transcript archive this report measures grows
@@ -234,15 +242,22 @@ _SPECIMEN_IDS = [s.id for s in _SPECIMENS]
 
 
 class TestSpecimenAntiFabrication:
-    """Every specimen the report presents must be a REAL corrupted call.
+    """Every specimen the report presents must be structurally consistent.
 
     Un-escapes each specimen's fenced block back to real text and replays it
     through PRODUCTION ``shared.toolcall_markup.repair()`` -- the exact call
-    shape the report's own claims describe. A specimen typed from
-    imagination, with a plausible-looking but wrong ``dropped`` list, cannot
-    satisfy this: ``repair()`` independently re-derives what it would
-    recover, and the report's claim must equal that exactly. This is the
-    same anti-fabrication shape as
+    shape the report's own claims describe. This is a structural-fidelity
+    gate, not a provenance gate: ``repair()`` is deterministic over
+    ``(value, param, schema, supplied)``, and all four of those fields are
+    hand-authored side by side in the same document, so an internally
+    coherent invention satisfies it trivially. What it genuinely catches is
+    an INCONSISTENT specimen -- a ``dropped`` list that disagrees with what
+    production code independently derives from the given markup, a block
+    that does not actually trip ``detect()``, or a ``clean_value`` that
+    violates the D5 prefix/substring invariant. Provenance -- whether a
+    specimen's payload text was drawn verbatim from a real call -- is not
+    machine-checkable from a self-contained document, and this gate does not
+    claim to establish it. This is the same anti-fabrication shape as
     ``fused-memory/tests/test_toolcall_xml_leak_sweep_artifacts.py``, applied
     to a hand-authored report instead of a captured sweep.
     """
