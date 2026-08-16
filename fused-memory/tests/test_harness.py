@@ -16665,11 +16665,15 @@ async def _persist_parent_run(journal, project_id: str, findings: list[dict]):
         status=RunStatus.running,
     )
     await journal.start_run(run)
-    s3_report = {
-        'stage': 'integrity_check',
-        'items_flagged': findings,
-        'stats': {},
-    }
+    s3_report = StageReport(
+        stage='integrity_check',
+        started_at=datetime.now(UTC),
+        completed_at=datetime.now(UTC),
+        items_flagged=findings,
+        stats={},
+        llm_calls=0,
+        tokens_used=0,
+    )
     run.stage_reports = {'integrity_check': s3_report}
     await journal.update_run_stage_reports(run.id, run.stage_reports)
     await journal.complete_run(run.id, 'completed')

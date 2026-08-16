@@ -610,6 +610,15 @@ class ReconciliationHarness:
         self._resume_failures: deque[tuple[datetime, str]] = deque()
         self._last_resume_failure_storm_escalation_at: datetime | None = None
 
+        # Task 3049 lever 1: per-project count of CONSECUTIVE full cycles whose
+        # inline remediation tail was deferred because the project was still in
+        # backlog mode (see _maybe_remediate).  Reset to 0 the moment a
+        # remediation pass actually dispatches, so it measures the current
+        # deferral streak, not lifetime deferrals.  Deliberately in-memory:
+        # a restart resets every streak to 0, which only makes remediation run
+        # SOONER than the bound would have — the fail-safe direction.
+        self._remediation_deferrals: dict[str, int] = {}
+
         # Usage gate (multi-account cap failover)
         self.usage_gate: UsageGate | None = None
         if hasattr(self.config, 'usage_cap') and self.config.usage_cap.enabled:
@@ -4281,7 +4290,17 @@ class ReconciliationHarness:
         scope: ProjectScope,
         filtered_task_tree: FilteredTaskTree | None = None,
     ) -> None:
-        """Extract Stage 3 findings from the parent run and trigger remediation if needed."""
+        """Extract Stage 3 findings from the parent run and trigger remediation if needed.
+
+        Task 3049 lever 1 — this runs as an INLINE TAIL of every completed
+        run_full_cycle, so in backlog mode every BacklogIterator chunk drags its
+        own zero-event remediation pass along behind it (measured at ~44% of
+        backlog-mode drain wall-clock on reify, 2026-07-25).  The gate just
+        before the _run_remediation_pass dispatch below defers that tail while
+        the project is still in backlog mode, bounded by
+        config.max_backlog_remediation_deferrals.  See the comment at the gate
+        for why deferring is lossless and self-terminating.
+        """
         try:
             s3_report = parent_run.stage_reports.get('integrity_check')
             if s3_report is None:
@@ -4420,6 +4439,58 @@ class ReconciliationHarness:
 
             if not to_remediate:
                 return
+
+            # Task 3049 lever 1: while the project is still in backlog mode,
+            # DEFER this inline remediation pass rather than running it now.
+            #
+            # Placed here — after the non-actionable, placeholder and
+            # open-escalation filters — so a deferral is only ever recorded for
+            # findings that would genuinely have been remediated; the earlier
+            # filters' logging/escalation side effects still happen every cycle.
+            #
+            # WHY THIS IS LOSSLESS: the parent run's Stage-3 findings were
+            # already persisted by update_run_stage_reports (in run_full_cycle,
+            # BEFORE this method is called) and are forward-fed into the next
+            # cycle's S1/S2 by _get_prior_s3_findings.  Deferring therefore
+            # delays remediation; it never drops a finding.
+            #
+            # WHY IT SELF-TERMINATES: _in_backlog_mode re-reads the buffer, so
+            # as the backlog drains the answer flips on its own — notably on
+            # BacklogIterator's backlog_final_consolidation pass, which runs
+            # against a drained buffer.  No flag has to be threaded down, and
+            # the non-iterator path (a plain cycle whose buffer meanwhile grew
+            # past the threshold) is covered by the same predicate.
+            #
+            # WHY THE BOUND: without it, a project whose buffer never falls
+            # below the threshold would starve remediation indefinitely.
+            # max_backlog_remediation_deferrals caps the consecutive streak; 0
+            # disables deferral entirely (exact pre-3049 behaviour).
+            max_deferrals = getattr(self.config, 'max_backlog_remediation_deferrals', 0)
+            deferred_so_far = self._remediation_deferrals.get(project_id, 0)
+            if (
+                max_deferrals > 0
+                and deferred_so_far < max_deferrals
+                and await self._in_backlog_mode(project_id)
+            ):
+                self._remediation_deferrals[project_id] = deferred_so_far + 1
+                # Second stats read, on the defer path only, purely so the log
+                # record carries the buffer depth that caused the deferral.
+                buffer_stats = await self.buffer.get_buffer_stats(project_id)
+                logger.info(
+                    'reconciliation.remediation_deferred_backlog',
+                    extra={
+                        'project_id': project_id,
+                        'parent_run_id': parent_run_id,
+                        'deferred_finding_count': len(to_remediate),
+                        'buffer_size': buffer_stats.get('size', 0),
+                        'consecutive_deferrals': self._remediation_deferrals[project_id],
+                        'max_backlog_remediation_deferrals': max_deferrals,
+                    },
+                )
+                return
+
+            # Dispatching (or the bound was reached) — the streak is over.
+            self._remediation_deferrals[project_id] = 0
 
             logger.info(
                 f'Remediation: {len(to_remediate)} actionable findings from run {parent_run_id}, '
