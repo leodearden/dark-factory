@@ -46,6 +46,14 @@ from pathlib import Path
 from typing import Any
 
 __all__ = [
+    'FITTED_CYCLE_FIXED_SECONDS',
+    'FITTED_CYCLE_MARGINAL_SECONDS',
+    'OBSERVED_BURST_EVENTS_PER_DAY',
+    'STEADY_STATE_AMORTISATION_MIN_BATCH',
+    'capacity_verdict',
+    'cycle_seconds',
+    'seconds_per_event',
+    'sustainable_events_per_day',
     'DRAIN_MODES',
     'classify_run',
     'drain_stats',
@@ -434,3 +442,167 @@ def remediation_duty_cycle(drain_stats_result: dict[str, Any]) -> float:
     if denominator <= 0:
         return 0.0
     return modes['remediation']['wall_clock_seconds'] / denominator
+
+
+# ── capacity arithmetic ────────────────────────────────────────────────
+#
+# MEASUREMENT PROVENANCE for every constant below — 2026-07-25, project reify
+# (the ADDENDUM 2 sequence, reproduced verbatim as a test fixture):
+#
+#   steady state    50 events / 945s  = 18.90 s/event
+#   backlog chunk  393 events / 954s  =  2.43 s/event
+#   backlog chunk  326 events / ~960s =  2.94 s/event
+#
+# These are THREE points from TWO different model tiers (steady vs opus), so
+# any fit across them mixes regimes.  The constants here are deliberately
+# CONSERVATIVE rather than the optimistic fit the raw data supports, and they
+# are a snapshot of one day on one project.  They must be recomputed from live
+# data via build_report / the module CLI rather than trusted indefinitely —
+# the config invariant test in tests/test_config_schema.py is what forces the
+# shipped config and this claim to move together, but neither can detect that
+# the underlying system got slower.
+
+#: Observed burst inflow for reify, events/day.  The figure the sustainable
+#: capacity claim is checked against by :func:`capacity_verdict`.
+#: Provenance: task 3049's ~3.5k/day burst observation.  Recompute from
+#: :func:`inflow_daily` once the event_arrival_hourly rollup has history.
+OBSERVED_BURST_EVENTS_PER_DAY: int = 3500
+
+#: Fixed per-cycle cost in seconds — the part of a reconciliation cycle that
+#: does NOT scale with batch size (stage orchestration, context assembly, LLM
+#: round trips).
+#: Provenance: the 2026-07-25 reify points above.  Fitting T(B) = F + c*B
+#: across the 50-event steady-state point and the 393-event chunk gives
+#: c = 9/343 ~ 0.03 s/event, i.e. essentially ALL fixed cost — but those two
+#: points ran on different tiers, so that fit would over-claim.  This value
+#: pairs with the deliberately pessimistic marginal cost below and reproduces
+#: the measured steady-state point to within 8.5%.
+FITTED_CYCLE_FIXED_SECONDS: float = 900.0
+
+#: Marginal per-event cost in seconds.
+#: Provenance: chunk 2's observed 2.94 s/event taken as an UPPER BOUND on
+#: marginal cost, rounded down to 2.5.  Deliberately conservative: the raw fit
+#: supports ~0.03 s/event, so the real amortisation is very likely better than
+#: this model predicts.  Being wrong in this direction under-promises capacity
+#: rather than over-promising it.
+FITTED_CYCLE_MARGINAL_SECONDS: float = 2.5
+
+#: Minimum steady-state batch size at which the fixed per-cycle cost is
+#: adequately amortised.
+#: Derivation: at B=150 the model gives (900 + 2.5*150)/150 = 8.5 s/event
+#: against the 18.9 s/event measured at B=50 — a 2.2x amortisation, which
+#: clears OBSERVED_BURST_EVENTS_PER_DAY with headroom.  At the shipped
+#: buffer_size_threshold of 250 this requires conditional_trigger_ratio >= 0.6.
+#: tests/test_config_schema.py asserts the shipped config satisfies that, so
+#: the constant and the config cannot drift apart silently.
+STEADY_STATE_AMORTISATION_MIN_BATCH: int = 150
+
+
+def cycle_seconds(
+    batch_size: int,
+    fixed_seconds: float = FITTED_CYCLE_FIXED_SECONDS,
+    marginal_seconds: float = FITTED_CYCLE_MARGINAL_SECONDS,
+) -> float:
+    """Total wall-clock for one reconciliation cycle: ``T(B) = F + c*B``.
+
+    Args:
+        batch_size: Events processed in the cycle.
+        fixed_seconds: The per-cycle cost that does not scale with the batch.
+        marginal_seconds: The per-event cost.
+
+    Returns:
+        Predicted cycle wall-clock in seconds.  Note that ``batch_size = 0``
+        still costs the full fixed component — that is the finding this whole
+        model exists to express.
+    """
+    return fixed_seconds + marginal_seconds * batch_size
+
+
+def seconds_per_event(
+    batch_size: int,
+    fixed_seconds: float = FITTED_CYCLE_FIXED_SECONDS,
+    marginal_seconds: float = FITTED_CYCLE_MARGINAL_SECONDS,
+) -> float:
+    """Amortised per-event cost at ``batch_size``: ``T(B) / B``.
+
+    Raises:
+        ValueError: If ``batch_size <= 0``.  Per-event cost is undefined for an
+            empty batch, so this raises rather than dividing by zero or
+            returning a misleading sentinel.
+    """
+    if batch_size <= 0:
+        raise ValueError(f'batch_size must be positive, got {batch_size}')
+    return cycle_seconds(batch_size, fixed_seconds, marginal_seconds) / batch_size
+
+
+def sustainable_events_per_day(
+    seconds_per_event: float,
+    remediation_duty_cycle: float = 0.0,
+    utilisation: float = 1.0,
+) -> float:
+    """Events/day the pipeline can drain at a given per-event cost.
+
+    ``86400 * utilisation * (1 - remediation_duty_cycle) / seconds_per_event``.
+
+    Args:
+        seconds_per_event: Amortised drain cost per event.
+        remediation_duty_cycle: Fraction of lock-held drain wall-clock spent in
+            zero-event remediation passes (see :func:`remediation_duty_cycle`).
+            Lever 1 drives this toward 0, which is worth ``1/(1-duty)`` on the
+            same per-event rate — a pure scheduling win, no work saved.
+        utilisation: Fraction of the day the project is actually holding the
+            reconciliation lock and draining.  1.0 is the theoretical ceiling,
+            not an observed value.
+
+    Returns:
+        Sustainable events/day.
+
+    Raises:
+        ValueError: On a non-positive rate, a duty cycle outside ``[0, 1)``, or
+            a utilisation outside ``(0, 1]`` — all caller bugs that would
+            otherwise produce a silently nonsensical capacity claim.
+    """
+    if seconds_per_event <= 0:
+        raise ValueError(
+            f'seconds_per_event must be positive, got {seconds_per_event}',
+        )
+    if not 0.0 <= remediation_duty_cycle < 1.0:
+        raise ValueError(
+            f'remediation_duty_cycle must be in [0, 1), got {remediation_duty_cycle}',
+        )
+    if not 0.0 < utilisation <= 1.0:
+        raise ValueError(f'utilisation must be in (0, 1], got {utilisation}')
+    return 86400.0 * utilisation * (1.0 - remediation_duty_cycle) / seconds_per_event
+
+
+def capacity_verdict(
+    sustainable_per_day: float,
+    observed_burst_per_day: float = OBSERVED_BURST_EVENTS_PER_DAY,
+) -> dict[str, Any]:
+    """Does the sustainable drain rate clear the observed burst inflow?
+
+    Args:
+        sustainable_per_day: Output of :func:`sustainable_events_per_day`.
+        observed_burst_per_day: Measured burst inflow, events/day.
+
+    Returns:
+        ``{'verdict': 'sufficient' | 'insufficient', 'headroom_ratio': float,
+        'sustainable_per_day': float, 'observed_burst_per_day': float}``.
+        Break-even counts as sufficient (``headroom_ratio >= 1.0``).
+
+    Raises:
+        ValueError: If ``observed_burst_per_day <= 0`` — there is no verdict to
+            render against a zero burst, and returning infinity would read as
+            'lots of headroom'.
+    """
+    if observed_burst_per_day <= 0:
+        raise ValueError(
+            f'observed_burst_per_day must be positive, got {observed_burst_per_day}',
+        )
+    headroom = sustainable_per_day / observed_burst_per_day
+    return {
+        'verdict': 'sufficient' if headroom >= 1.0 else 'insufficient',
+        'headroom_ratio': headroom,
+        'sustainable_per_day': sustainable_per_day,
+        'observed_burst_per_day': observed_burst_per_day,
+    }

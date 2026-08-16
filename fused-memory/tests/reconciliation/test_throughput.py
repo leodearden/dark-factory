@@ -30,10 +30,11 @@ from fused_memory.reconciliation.throughput import (
     capacity_verdict,
     cycle_seconds,
     drain_stats,
-    seconds_per_event,
-    remediation_duty_cycle,
     inflow_daily,
     inflow_hourly,
+    remediation_duty_cycle,
+    seconds_per_event,
+    sustainable_events_per_day,
     utc_hour_bucket,
 )
 
@@ -480,7 +481,7 @@ async def test_remediation_duty_cycle_reproduces_the_addendum_2_measurement(reco
 
     duty = remediation_duty_cycle(drain_stats(db, 'reify'))
     assert duty == pytest.approx(1495.0 / 3409.0)
-    assert 0.44 == pytest.approx(round(duty, 2))
+    assert pytest.approx(round(duty, 2)) == 0.44
 
 
 @pytest.mark.asyncio
