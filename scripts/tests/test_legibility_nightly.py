@@ -1586,6 +1586,80 @@ def test_run_nightly_fail_loud_on_commit_failure(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# task-4144: run_nightly -- one deletion-directive record must not kill the
+# whole night's merge. This is the LIVE trickle path (nothing invokes
+# `codebook.py apply` outside its own tests), and it is worse than the CLI:
+# run_nightly has no enclosing try/except and main() calls it bare, so a
+# NeverDeleteError surfaces as an uncaught traceback -- no NightlyResult, no
+# escalation, dump/commit never reached.
+# ---------------------------------------------------------------------------
+
+def _fake_invoke_deletion_directive(prompt: str, model: str) -> str:
+    """Reachable in production: coder.py rebuilds the record from a fixed key
+    allowlist (stripping a top-level delete/remove/retract/drop key) but
+    copies `matches` VERBATIM, and _MATCH_SCHEMA only requires `entry_id` --
+    so a match-level `action: delete` passes validate_coding_record and lands
+    in run.records."""
+    return json.dumps({
+        'matches': [{
+            'entry_id': 'known-cause',
+            'origin_phase': 'implement',
+            'manifested_phase': 'implement',
+            'action': 'delete',
+        }],
+        'candidates': [],
+    })
+
+
+def test_run_nightly_skips_deletion_directive_record_without_crashing(tmp_path):
+    work_cwd = str(tmp_path / 'work')
+    repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+
+    projects_root = tmp_path / 'projects'
+    session_path = projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl'
+    target_date = date(2026, 7, 13)
+    _write_transcript(
+        session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
+    )
+
+    codebook_path = repo / 'docs' / 'legibility' / 'confusion-codebook.yaml'
+    before_bytes = codebook_path.read_bytes()
+    before_log = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+
+    fixed_now = datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC)
+    escalation_calls = []
+
+    # Load-bearing: this RETURNS today only once the merge loop is guarded --
+    # an unguarded NeverDeleteError escapes run_nightly entirely.
+    result = nightly.run_nightly(
+        config_path=config_path,
+        projects_root=projects_root,
+        target_date=target_date,
+        now=fixed_now,
+        invoke=_fake_invoke_deletion_directive,
+        status_fetcher=None,
+        poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+    )
+
+    assert result.exit_code == 0
+    assert result.applied == 0
+    assert result.coder_status == 'ok'
+
+    assert len(escalation_calls) == 1
+    _url, envelope = escalation_calls[0]
+    assert 'deletion directive' in envelope['params']['arguments']['summary'].lower()
+
+    # Nothing applied -> the existing no-change-night path holds.
+    assert codebook_path.read_bytes() == before_bytes
+    after_log = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+    assert after_log == before_log
+
+
+# ---------------------------------------------------------------------------
 # step-21/22: run_nightly -- no-change night commits nothing (§6.7)
 # ---------------------------------------------------------------------------
 
