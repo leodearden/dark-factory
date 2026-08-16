@@ -700,6 +700,19 @@ def _cmd_migrate(args: argparse.Namespace) -> int:
 
 
 def _cmd_apply(args: argparse.Namespace) -> int:
+    """Merge a JSONL batch of §7.3 coding records into a v2 codebook.
+
+    Per-record failures are skipped-and-counted, never fatal to the batch:
+    a malformed JSON line (`malformed_json`), a record that fails
+    `validate_coding_record()` (`record_invalid`, skipped whole inside
+    `apply_coding_record`), and a deletion-shaped record
+    (`deletion_directive`, rejected by `_reject_deletion_directive` before
+    the codebook is even copied). Each prints a `path:lineno:` line to
+    stderr and increments its counter in the stdout summary; the return
+    value stays 0 so a batch that did land its other work is not
+    misreported after a successful `dump()`. Only a codebook that fails
+    `validate()` after the merge returns 1, leaving the file untouched.
+    """
     codebook = load(args.codebook)
     if not isinstance(codebook, dict):
         print(
@@ -714,6 +727,7 @@ def _cmd_apply(args: argparse.Namespace) -> int:
         "candidates_applied": 0,
         "record_invalid": 0,
         "malformed_json": 0,
+        "deletion_directive": 0,
     }
 
     with open(args.records, encoding="utf-8") as f:
@@ -735,7 +749,22 @@ def _cmd_apply(args: argparse.Namespace) -> int:
                 )
                 totals["malformed_json"] += 1
                 continue
-            codebook, stats = apply_coding_record(codebook, record)
+            try:
+                codebook, stats = apply_coding_record(codebook, record)
+            except NeverDeleteError as exc:
+                # Mirror the malformed-JSON sibling above: one deletion-shaped
+                # record is dropped and counted, never aborts the rest of the
+                # nightly/trickle batch (dump() is after this loop, so an
+                # escaping exception discarded every already-applied in-memory
+                # record). apply_coding_record raises before it even
+                # deep-copies, so `codebook` is provably untouched by the bad
+                # record.
+                print(
+                    f"{args.records}:{lineno}: deletion directive rejected, skipping: {exc}",
+                    file=sys.stderr,
+                )
+                totals["deletion_directive"] += 1
+                continue
             totals["matched"] += stats["matched"]
             totals["skipped_unknown_entry"] += stats["skipped_unknown_entry"]
             totals["candidates_applied"] += stats["candidates_applied"]
@@ -751,7 +780,8 @@ def _cmd_apply(args: argparse.Namespace) -> int:
     print(
         "applied: matched={matched} candidates_applied={candidates_applied} "
         "skipped_unknown_entry={skipped_unknown_entry} "
-        "record_invalid={record_invalid} malformed_json={malformed_json}".format(**totals)
+        "record_invalid={record_invalid} malformed_json={malformed_json} "
+        "deletion_directive={deletion_directive}".format(**totals)
     )
     return 0
 
