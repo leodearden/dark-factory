@@ -667,6 +667,136 @@ def _exec_start_config_arg(content: str, unit_name: str = "<unit>") -> str | Non
     return None
 
 
+# ---------------------------------------------------------------------------
+# Fixture-string coverage for the FILE-CONTENT half of the --config parse
+#
+# The token scan itself is shared (systemd_unit_invariants.config_arg_from_
+# exec_start, task 3773) and its negative-case owner is the PARSER-layer
+# section of tests/scripts/test_know_live_installed_unit_parity.py, which
+# wrote it and keeps it under this directory's one-owner convention.  What
+# stays HERE is the other half — locating the ExecStart= line inside unit FILE
+# CONTENT (_exec_start_line) and the thin wrapper that feeds it to the scan —
+# and that half had NO fixture-string coverage at all: its only exercise was
+# the parametrized sweep over real committed templates, every one of which is
+# well-formed, so the raise branch and the None branch were asserted nowhere.
+# A regression in either would have surfaced only as a confusing failure about
+# some unit, or not at all.
+#
+# Inline fixtures rather than tmp_path files, matching how sibling guards in
+# this directory build unit text (cf. test_check_dashboard_unit_parity.py's
+# _SAMPLE_UNIT): both helpers take a string, so a file would add I/O without
+# adding coverage.
+# ---------------------------------------------------------------------------
+
+
+def _unit_fixture(*service_lines: str) -> str:
+    """A minimal [Service]-shaped unit carrying *service_lines*, for the parsers."""
+    body = "\n".join(service_lines)
+    return f"[Unit]\nDescription=Fixture\n\n[Service]\nType=simple\n{body}\n"
+
+
+@pytest.mark.parametrize(
+    ("exec_start", "expected"),
+    [
+        pytest.param(
+            "ExecStart=/usr/bin/uv run orchestrator run "
+            "--config /home/leo/src/x/dark-factory-orchestrator.yaml",
+            "/home/leo/src/x/dark-factory-orchestrator.yaml",
+            id="space-separated",
+        ),
+        pytest.param(
+            "ExecStart=/usr/bin/uv run orchestrator run "
+            "--config=/home/leo/src/x/dark-factory-orchestrator.yaml",
+            "/home/leo/src/x/dark-factory-orchestrator.yaml",
+            id="equals-form",
+        ),
+        pytest.param(
+            "ExecStart=/usr/bin/python3 /home/leo/src/x/scripts/orchestrator-watchdog.py",
+            None,
+            id="no-config-flag-at-all",
+        ),
+    ],
+)
+def test_exec_start_config_arg_answers_from_unit_content(exec_start: str, expected) -> None:
+    """_exec_start_config_arg answers from whole FILE CONTENT, not a bare value.
+
+    The None case is load-bearing rather than incidental, which is why it is
+    pinned as a RETURN here and not lumped in with the malformed cases below:
+    test_orchestrator_service_points_at_canonical_config_filename SKIPs on it
+    for orchestrator-watchdog.service (a probe script that takes no --config),
+    and test_exec_start_config_parser_answers_for_every_orchestrator_run_unit
+    asserts that skip branch stays genuinely exercised.  A rewire that turned
+    "no flag" into a raise would break both, and would do so on a unit whose
+    shape is entirely correct.
+    """
+    assert _exec_start_config_arg(_unit_fixture(exec_start), "fixture.service") == expected
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param(
+            _unit_fixture("ExecStartPre=/bin/mkdir -p /run/fixture"),
+            id="no-execstart-line-at-all",
+        ),
+        pytest.param(
+            _unit_fixture("ExecStart=/usr/bin/uv run orchestrator run --config"),
+            id="dangling-flag-no-value",
+        ),
+        pytest.param(
+            _unit_fixture("ExecStart=/usr/bin/uv run orchestrator run --config="),
+            id="equals-form-empty-value",
+        ),
+    ],
+)
+def test_exec_start_config_arg_raises_on_malformed_unit(content: str) -> None:
+    """A broken ExecStart= FAILS, and the failure names the unit it came from.
+
+    Three distinct ways to have no usable --config, all of which must stay
+    distinct from the legitimate None above.  The first is _exec_start_line's
+    own raise — pinned here because that helper stayed local when the token
+    scan was lifted, so this module owns its negative case; it must keep
+    raising the SHARED MalformedExecStart rather than a locally redefined
+    look-alike, which is what the shared parser's callers catch.  The other
+    two are the token scan's, reached THROUGH this module's wrapper, so a
+    rewire that stopped routing file content into the shared parser (or
+    quietly kept a divergent local copy) stops satisfying them.
+
+    The empty `--config=` case was the RED that drove the rewire: the local
+    parser this module used to carry returned "" for it, which the caller
+    then failed on with a message about an unexpected basename rather than
+    about a unit that would start the orchestrator with no config path at all.
+    """
+    with pytest.raises(MalformedExecStart) as excinfo:
+        _exec_start_config_arg(content, "fixture.service")
+    assert "fixture.service" in str(excinfo.value), (
+        "the raise must name the unit it was asked about — these parsers are "
+        "applied by a parametrized sweep over every committed template, so a "
+        "message that does not name the offender leaves the reader to guess "
+        f"which case failed. Got: {excinfo.value}"
+    )
+
+
+def test_exec_start_config_arg_ignores_exec_start_pre() -> None:
+    """ExecStartPre= must not be mistaken for ExecStart=, --config and all.
+
+    Pins the trailing-``=`` discrimination _exec_start_line's docstring calls
+    out.  A prefix match on "ExecStart" alone reads the FIRST ExecStartPre=
+    line as the unit's command, so a pre-command that happens to carry its own
+    --config (a config-rendering or validation step, exactly the shape a
+    preparatory ExecStartPre= takes) silently answers for the real one — and
+    the guard reports on a path the service never runs with.
+    """
+    content = _unit_fixture(
+        "ExecStartPre=/usr/bin/uv run orchestrator validate --config /tmp/staging.yaml",
+        "ExecStart=/usr/bin/uv run orchestrator run "
+        "--config /home/leo/src/x/dark-factory-orchestrator.yaml",
+    )
+    assert _exec_start_config_arg(content, "fixture.service") == (
+        "/home/leo/src/x/dark-factory-orchestrator.yaml"
+    )
+
+
 # Marker identifying a unit that launches the orchestrator CLI proper (as
 # opposed to orchestrator-watchdog.service, which runs a bare probe script).
 # `orchestrator run` REQUIRES a --config, so this is the mechanical predicate
