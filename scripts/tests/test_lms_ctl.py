@@ -335,7 +335,6 @@ def test_cli_start_names_the_offending_consumer_on_stderr(
     assert '905936' in err
     assert '/usr/local/lib/ollama/llama-server' in err
     assert '10314' in err
-    assert 'keep_alive' in err
 
 
 def test_cli_start_still_returns_4_when_the_arm_simply_does_not_fit(

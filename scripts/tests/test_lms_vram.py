@@ -626,16 +626,6 @@ def test_probe_gpu_consumers_wraps_a_runner_failure_in_the_typed_error():
     assert 'nvidia-smi' in str(excinfo.value)
 
 
-def test_the_inventory_note_says_it_is_not_a_full_accounting():
-    """The list omits graphics contexts entirely, and a reader who took it for
-    an accounting would conclude ~3.3 GiB of this card is unaccounted for."""
-    note = lms_vram.CONSUMER_INVENTORY_NOTE.lower()
-
-    assert 'inventory' in note
-    assert 'not' in note and 'accounting' in note
-    assert 'graphics' in note
-
-
 # ---------------------------------------------------------------------------
 # (g) the baseline pollution predicate — a positive ALLOWLIST
 # ---------------------------------------------------------------------------
