@@ -1622,6 +1622,20 @@ def test_systemd_analyze_verify_reports_no_ignored_directives(
            same unit name the filter scopes on; passing HARDCODED's repo path
            explicitly shadows it, measured as zero
            ``dark-factory-dashboard.service:`` lines in the combined run.
+         - WHY the canary is passed LAST, after HARDCODED: systemd-analyze
+           verify processes positional units in argument order, so an
+           "Ignoring." line for the LAST argument implies every earlier
+           argument was already reached — making the control transitively
+           attest to HARDCODED having actually been verified, not merely to
+           the invocation being alive in general.  This is a forward-looking
+           hardening rather than a fix for an observed failure: measured
+           2026-08-16 in this worktree (systemd 255.4-1ubuntu8.17), passing a
+           unit systemd REFUSES outright first (``bad-first.service: Service
+           has no ExecStart=, ExecStop=, or SuccessAction=. Refusing.``)
+           still lets a well-formed SECOND unit draw its own "Ignoring." line
+           in the same invocation, so today's systemd does not stop at the
+           first argument either way.  Ordering the canary last removes the
+           dependency on that continuing to hold.
          - On a systemd < 254 host the canary would degrade to the lowercase
            full-path "Unknown key name 'RestartMaxDelaySec' ... ignoring."
            form instead, which ``_ignored_directive_lines`` still matches via
@@ -1638,7 +1652,7 @@ def test_systemd_analyze_verify_reports_no_ignored_directives(
     """
     canary = _write_backoff_canary(tmp_path)
     result = subprocess.run(
-        ["systemd-analyze", "verify", "--user", str(canary), str(HARDCODED)],
+        ["systemd-analyze", "verify", "--user", str(HARDCODED), str(canary)],
         capture_output=True,
         text=True,
         timeout=60,
