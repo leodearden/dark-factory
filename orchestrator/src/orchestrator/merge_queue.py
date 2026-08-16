@@ -8532,6 +8532,33 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # under both.  Class attribute so tests monkeypatch it small (mirrors
     # MAX_INFLIGHT_DEAD_VERIFY_ABORTS).
     MAX_CONTENDED_LEASE_DEFER_SECS: float = 14400.0
+    # task 3043 amend (reviewer_comprehensive, efficiency): rate limit for the
+    # reprobe sweep's "still unreachable" record.  A host that is permanently
+    # gone — a laptop removed from the fleet, the reify 2026-07-25 shape —
+    # stays in the RU tracker forever while _reprobe_loop sweeps every
+    # verify_host_reprobe_interval_s (120 s), so an unconditional INFO per
+    # sweep is ~720 identical lines/day.  Unbounded repetition of an
+    # UNCHANGING fact is what destroys the greppability the decision logging
+    # exists to buy, so the record is INFO for the first few sweeps of an
+    # episode, INFO again on any CHANGE (a new streak), and thereafter at most
+    # one INFO per period — DEBUG in between, so nothing is ever actually
+    # dropped.  Recovery / park-skip / unresolvable-runner records are
+    # TRANSITIONS (at most one per episode) and are never throttled.
+    # Class attributes so tests can monkeypatch them (mirrors
+    # MAX_INFLIGHT_DEAD_VERIFY_ABORTS).
+    REPROBE_STILL_DOWN_INFO_SWEEPS: int = 3
+    REPROBE_STILL_DOWN_INFO_PERIOD_SECS: float = 1800.0
+    # task 3043 amend (reviewer_comprehensive, robustness): upper bound on
+    # _run_inflight_verify's orphan-guard reap.  The guard cancels its inner
+    # _run_post_merge_verify task and awaits it in a `finally` on a
+    # cancellation-unwind path, and BOTH external cancellers (stop()'s SIGTERM
+    # _inflight drain and the head-failure cascade) await the outer task — so
+    # an unbounded reap turns a slow inner unwind, against a host that is by
+    # hypothesis unreachable, into a stalled shutdown or a stalled cascade.
+    # A few seconds is far longer than a healthy cancellation unwind and far
+    # shorter than any drain deadline; on expiry the guard WARNs and abandons
+    # the reap rather than wedging the canceller.
+    ORPHAN_REAP_TIMEOUT_SECS: float = 5.0
     # task 3003 amend (reviewer_comprehensive, robustness): what makes the
     # streak above CONTINUOUS.  MAX_CONTENDED_LEASE_DEFER_SECS measures elapsed
     # time from the streak's FIRST defer, which is only a contention budget if
@@ -8959,6 +8986,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._unreachable_escalate_after_n: int = 3
         self._unreachable_escalate_after_secs: float = 600.0
         self._reprobe_interval_s: float = 120.0
+        # Rate-limit state for the reprobe sweep's "still unreachable" record
+        # (task 3043 amend).  {host: (last_info_at, last_streak, sweeps_seen)}.
+        # A host that
+        # is permanently gone stays tracked forever and the sweep runs every
+        # _reprobe_interval_s (120 s), so an unconditional INFO per sweep is
+        # ~720 identical lines/day — unbounded repetition of an unchanging fact,
+        # which degrades exactly the greppability the decision logging buys.
+        # Written only by _reprobe_quarantined_hosts; popped in lockstep with
+        # the tracker entry by _record_runner_recovered, so it cannot outlive
+        # the episode it describes.
+        self._reprobe_last_info: dict[str, tuple[float, int, int]] = {}
         # In-flight drift-detective asyncio.Tasks.  asyncio keeps only a WEAK
         # reference to running tasks, so without a strong ref here the drift
         # detective can be GC'd mid-run and a remote-PASS / local-FAIL
@@ -9803,15 +9841,24 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         After this call, a subsequent ``_record_runner_unavailable`` starts a
         fresh episode with ``streak=1`` and a new ``first_unavailable_at``.
+
+        The reprobe sweep's still-unreachable rate-limit state is popped in
+        lockstep (task 3043 amend), so the next downtime episode for this host
+        logs its first sweeps at INFO again instead of inheriting the previous
+        episode's throttle.
         """
         self._runner_unavailable.pop(host, None)
+        self._reprobe_last_info.pop(host, None)
 
     def _local_host_name(self) -> str:
-        """Name of the local (trust-anchor) host, per the allocator when present."""
+        """Name of the local (trust-anchor) host, per the allocator when present.
+
+        Reads :attr:`HostAllocator.local_name` (O(1)) rather than scanning
+        ``host_states()`` for the ``is_local`` flag, which materialised one
+        dict per host on every call (task 3043 amend).
+        """
         if isinstance(self._host_allocator, HostAllocator):
-            for _st in self._host_allocator.host_states():
-                if _st['is_local']:
-                    return _st['name']
+            return self._host_allocator.local_name
         return 'local'
 
     def _quarantine_unreachable_host(self, host: str, reason: str, now: float) -> None:
@@ -9844,12 +9891,24 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         ``has_open_l1`` dedup (exactly one open alarm per host per downtime
         episode).
 
-        Local is a no-op: it is the trust anchor, is never quarantined, and has
-        no remote to probe for recovery.  None-safe throughout — with no
-        allocator the tracker entry is still written, so recovery remains
-        possible once one exists.
+        Local is a no-op *for state*: it is the trust anchor, is never
+        quarantined, and has no remote to probe for recovery.  It is NOT a
+        silent no-op (task 3043 amend): the previous RUNNER_UNAVAILABLE
+        finalize path recorded a local lease unconditionally, so returning
+        without a word here would make "the trust anchor reported itself
+        unavailable" vanish entirely — the silent degradation this repo's
+        loud-over-silent norm and the no-silent-fail-soft design invariant
+        rule out.  A WARNING keeps the event greppable while preserving the
+        never-quarantine-local rule.  None-safe throughout — with no allocator
+        the tracker entry is still written, so recovery remains possible once
+        one exists.
         """
         if host == self._local_host_name():
+            logger.warning(
+                'RU-class quarantine requested for the LOCAL trust-anchor host %r '
+                '(reason: %s) — ignoring; local is never quarantined',
+                host, reason,
+            )
             return
 
         self._runner_quarantine.add(host)
@@ -10028,7 +10087,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
            still be running there", and freeing the slot on mere reachability
            could double-dispatch onto a host still churning on the previous
            merge.  A dirty host stays tracked and parked so the NEXT sweep
-           retries it.  Otherwise the host is **re-admitted** via
+           retries it.  A PARKED host whose runner does NOT expose the optional
+           probe is re-admitted on reachability alone but **loudly** (WARNING) —
+           see the inline note: refusing would make it permanently
+           non-acquirable, and the arm is unreachable against a real
+           ``HostAllocator``.  Otherwise the host is **re-admitted** via
            ``allocator.readmit`` — which un-quarantines *and* un-PARKs; plain
            ``clear_quarantine`` cannot recover a PARKED slot, since
            ``acquire_remote`` additionally requires ``_SLOT_FREE`` — then the
@@ -10078,6 +10141,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         decisions.  Deliberately **silent** when the tracker is empty: the
         healthy steady state runs every ``verify_host_reprobe_interval_s``
         (120 s) and must not become log noise.
+
+        For the same reason the **still-unreachable** record — the only one
+        that repeats for an unchanging state — is rate-limited to
+        ``REPROBE_STILL_DOWN_INFO_SWEEPS`` INFO lines per episode, plus one on
+        any streak change, plus one per ``REPROBE_STILL_DOWN_INFO_PERIOD_SECS``
+        thereafter; suppressed sweeps drop to DEBUG rather than vanishing (task
+        3043 amend).  Every other record is a TRANSITION, at most one per
+        episode, and is never throttled.
         """
         if self._host_allocator is None:
             # Silent when nothing is tracked (the common "no verify dispatched
@@ -10092,18 +10163,28 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 )
             return
 
+        # Loop-INVARIANT fallback map, hoisted out of the per-host loop and
+        # built AT MOST ONCE per sweep, lazily on the first `remote_runner`
+        # miss (task 3043 amend).  Against a real HostAllocator `remote_runner`
+        # always resolves, so this stays None and costs nothing; only the
+        # legacy-double path pays, and it now pays O(n_quarantined) per sweep
+        # instead of per tracked host.
+        _fallback_runners: dict[str, Any] | None = None
+        _resolve = getattr(self._host_allocator, 'remote_runner', None)
+
         for name, entry in list(self._runner_unavailable.items()):
             try:
                 # Resolve a runner for a host that may NOT be in the quarantine
                 # set — the strand shape `quarantined_remote_runners()`
                 # structurally cannot report.  Fallback keeps pre-existing
                 # allocator doubles (which predate `remote_runner`) working.
-                _resolve = getattr(self._host_allocator, 'remote_runner', None)
                 runner = _resolve(name) if _resolve is not None else None
                 if runner is None:
-                    runner = dict(
-                        self._host_allocator.quarantined_remote_runners()
-                    ).get(name)
+                    if _fallback_runners is None:
+                        _fallback_runners = dict(
+                            self._host_allocator.quarantined_remote_runners()
+                        )
+                    runner = _fallback_runners.get(name)
 
                 downtime_s = now - entry.first_unavailable_at
 
@@ -10130,7 +10211,35 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     _was_parked = bool(_is_parked(name)) if _is_parked is not None else False
                     if _was_parked:
                         _probe_clean = getattr(runner, 'probe_clean', None)
-                        if _probe_clean is not None and not await _probe_clean():
+                        if _probe_clean is None:
+                            # FAIL-OPEN, but never SILENTLY (task 3043 amend).
+                            # PARK is the state with the least evidence of
+                            # cleanliness, so treating "no probe" as clean is
+                            # the more permissive outcome for the weaker
+                            # evidence — a polarity worth stating out loud.
+                            # It is nonetheless the right default: refusing
+                            # would make such a host PERMANENTLY
+                            # non-acquirable with no recovery path, i.e. the
+                            # exact strand class this task exists to remove.
+                            # And it is UNREACHABLE against a real
+                            # HostAllocator today: cancel_and_release is the
+                            # only PARK writer and it calls
+                            # `lease.runner.probe_clean()` unconditionally on
+                            # that very path (verify_runner.py:3219, two lines
+                            # after the PARK at 3217), so a runner lacking the
+                            # method cannot reach PARKED at all.  The WARNING
+                            # is what makes a future runner class that DOES
+                            # reach it visible instead of silently trusted.
+                            logger.warning(
+                                'reprobe: host %r is reachable again after %.0fs and its '
+                                'slot is PARKED, but its runner (%s) exposes no '
+                                'probe_clean() — re-admitting on reachability ALONE; a '
+                                'stale verify could still be running there',
+                                name,
+                                downtime_s,
+                                type(runner).__name__,
+                            )
+                        elif not await _probe_clean():
                             logger.info(
                                 'reprobe: host %r is reachable again after %.0fs but its '
                                 'slot stays PARKED pending a clean probe (a stale verify '
@@ -10160,12 +10269,35 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         _was_parked,
                     )
                 else:
-                    logger.info(
+                    # Rate-limited (task 3043 amend): this is the one record
+                    # that repeats forever for a permanently-gone host.  INFO
+                    # for the first REPROBE_STILL_DOWN_INFO_SWEEPS sweeps of an
+                    # episode, INFO on any CHANGE (a new streak — a fresh
+                    # dispatch attempt failed since the last line), then at most
+                    # one INFO per REPROBE_STILL_DOWN_INFO_PERIOD_SECS.  Never
+                    # DROPPED: the suppressed sweeps log at DEBUG, so a
+                    # debug-level operator still sees every one.
+                    _last_at, _last_streak, _sweeps = self._reprobe_last_info.get(
+                        name, (None, None, 0)
+                    )
+                    _at_info = (
+                        _last_at is None
+                        or _sweeps < self.REPROBE_STILL_DOWN_INFO_SWEEPS
+                        or entry.streak != _last_streak
+                        or (now - _last_at) >= self.REPROBE_STILL_DOWN_INFO_PERIOD_SECS
+                    )
+                    logger.log(
+                        logging.INFO if _at_info else logging.DEBUG,
                         'reprobe: host %r still unreachable after %.0fs down '
                         '(streak=%d) — staying out of the verify pool',
                         name,
                         downtime_s,
                         entry.streak,
+                    )
+                    self._reprobe_last_info[name] = (
+                        now if _at_info else (_last_at if _last_at is not None else now),
+                        entry.streak,
+                        _sweeps + 1,
                     )
                     # Host still unreachable: fire the time-based alarm path
                     # (dedup'd — no-op if already open).
@@ -15754,10 +15886,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         The sole caller of BOTH steps — :meth:`_abort_remote_verify` and
         ``verify_task.cancel()`` — enforced by
         test_merge_queue_concurrent_verify.py's
-        ``TestVerifyTeardownChokepoint``. Its six callers are the two ``stop()``
-        drain paths (finalizing head and ``_inflight``), the head-failure
-        cascade, and the three ``_run_inflight_verify`` abort triggers
-        (sole-waiter abandon, operator halt, dead-verify no-progress).
+        ``TestVerifyTeardownChokepoint``. Its SEVEN callers are the two
+        ``stop()`` drain paths (finalizing head and ``_inflight``), the
+        head-failure cascade, the three ``_run_inflight_verify`` abort triggers
+        (sole-waiter abandon, operator halt, dead-verify no-progress), and —
+        added by task 3043 — ``_run_inflight_verify``'s ``finally`` orphan
+        guard, which reaps the inner verify task on any exit route the three
+        abort triggers do not cover (in practice: external cancellation).
 
         ORDER IS LOAD-BEARING, and sole-callership is what now guarantees it.
         The remote cancel must fire while ``_inflight_request_id`` is still
@@ -15788,7 +15923,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         the cancel-and-reap below never runs, so *verify_task* is left live;
         the two steps only no-op independently for their ``None`` cases, not
         for this one. That is deliberately the pre-extraction behaviour of
-        every one of the six sites (none wrapped the abort in ``try/finally``
+        the original six sites (none wrapped the abort in ``try/finally``
         either), and it is narrow in practice: :meth:`_abort_remote_verify`
         swallows ``Exception`` itself, so only a ``BaseException`` — in
         practice a ``CancelledError`` delivered because THIS coroutine is
@@ -15798,10 +15933,27 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         derailed the same way); at the
         three ``_run_inflight_verify`` triggers the escaping error is this
         coroutine's own cancellation, so the nested ``_run_post_merge_verify``
-        future it owns unwinds with the teardown that delivered it. Making the
-        reap unconditional was considered and NOT done here: it would add an
-        ``await`` to a ``finally`` on a cancellation-unwind path — a behaviour
-        change on exactly the paths this refactor promised to leave alone.
+        future it owns unwinds with the teardown that delivered it.
+
+        Task 3204 considered making the reap unconditional HERE and did not,
+        because it would add an ``await`` to a ``finally`` on a
+        cancellation-unwind path — a behaviour change on exactly the paths
+        that refactor promised to leave alone. **Task 3043 deliberately
+        reversed that call — but at the CALLER, not here.** Reify 2026-07-25
+        proved the gap was not theoretical: external cancellation left the
+        inner ``_run_post_merge_verify`` running against a down host and its
+        ``RunnerUnavailable`` unretrieved (``Task-350``), stranding the host
+        out of the verify pool. The unconditional reap therefore lives in
+        :meth:`_run_inflight_verify`'s own ``finally``, which owns that inner
+        task, rather than in this shared helper — so the five sites 3204
+        promised not to disturb still get exactly the pre-extraction
+        behaviour, and only the one coroutine that can actually orphan a task
+        pays for the guarantee. It is safe there because the guard is
+        additive (the three abort branches already reaped, so it no-ops for
+        them), never returns or raises (a ``return`` would swallow an
+        in-flight ``CancelledError``), and BOUNDS its await with
+        ``ORPHAN_REAP_TIMEOUT_SECS`` so a slow inner unwind cannot wedge the
+        canceller.
 
         Deliberately NOT owned here: each site's ``not verify_task.done()``
         guard. Sites 1 and 2 have one and the cascade deliberately does not, so
@@ -16860,10 +17012,45 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # with the task already finished and must not be touched.
             if verify_task is not None:
                 if not verify_task.done():
-                    await self._teardown_verify_task(
-                        None, verify_task, req.task_id,
-                        shutdown_defensive=True,
-                    )
+                    # BOUNDED reap (task 3043 amend, reviewer robustness).  The
+                    # inner task is BY HYPOTHESIS talking to an unreachable
+                    # host, and its cancellation unwind does further I/O
+                    # (clearing _inflight_request_id, subprocess teardown over
+                    # a dead ssh channel).  Both external cancellers now block
+                    # on this await — stop()'s SIGTERM _inflight drain and the
+                    # head-failure cascade each `await` the outer task — so an
+                    # unbounded reap converts a slow inner unwind into a
+                    # stalled shutdown or a stalled cascade: the same wedge
+                    # class as the reify 2026-07-25 incident, moved one level
+                    # up.  Before this guard the outer ended immediately on
+                    # cancel, so the bound is what keeps that property.
+                    #
+                    # The timeout can surface two ways and BOTH are handled by
+                    # re-checking `done()` afterwards rather than by trusting
+                    # the raise: wait_for cancels the awaited coroutine, and
+                    # _teardown_verify_task's `suppress(BaseException)` around
+                    # `await verify_task` may swallow that CancelledError and
+                    # return normally instead of letting TimeoutError out.
+                    with contextlib.suppress(TimeoutError):
+                        await asyncio.wait_for(
+                            self._teardown_verify_task(
+                                None, verify_task, req.task_id,
+                                shutdown_defensive=True,
+                            ),
+                            timeout=self.ORPHAN_REAP_TIMEOUT_SECS,
+                        )
+                    if not verify_task.done():
+                        # Re-orphaned rather than wedging the canceller — the
+                        # deliberate trade, made VISIBLE instead of silent.
+                        with contextlib.suppress(Exception):
+                            logger.warning(
+                                'Task %s: inner verify task on host %r did not '
+                                'unwind within %.1fs of cancellation — abandoning '
+                                'the reap so the cancelling path is not wedged; '
+                                'the task is left cancelled-but-pending',
+                                req.task_id, lease.name,
+                                self.ORPHAN_REAP_TIMEOUT_SECS,
+                            )
                 _orphan_exc: BaseException | None = None
                 if verify_task.done() and not verify_task.cancelled():
                     # The retrieval that suppresses the
@@ -16873,22 +17060,34 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # failure that never reached the RunnerUnavailable handler above
                 # still has to be quarantined AND recorded, or the host is
                 # stranded.  Strand detection can never break a verify exit
-                # path, hence the suppress + WARNING.
+                # path, hence the suppress.
+                #
+                # ORDER + SEPARATE suppress blocks are load-bearing (task 3043
+                # amend, reviewer robustness).  With the log first inside the
+                # SAME block, any failure in the logging call — a bad % arg, a
+                # wedged handler — would skip the state change this guard
+                # exists to perform, leaving the exact strand it was written to
+                # prevent.  The quarantine + record therefore runs FIRST, in
+                # its own suppressed block; the WARNING is a second, strictly
+                # subordinate block that can fail without costing anything.
+                # Mirrors the release path's tested protection
+                # (test_recording_failure_never_breaks_the_release_path).
                 if (
                     isinstance(_orphan_exc, RunnerUnavailable)
                     and not lease.is_local
                     and not _ru_owned_by_handler
                 ):
                     with contextlib.suppress(Exception):
+                        self._quarantine_unreachable_host(
+                            lease.name, str(_orphan_exc), time.time(),
+                        )
+                    with contextlib.suppress(Exception):
                         logger.warning(
                             'Task %s: in-flight verify unwound while its remote '
                             'verify task failed with RunnerUnavailable on host '
-                            '%r — quarantining + recording the host so the '
+                            '%r — quarantined + recorded the host so the '
                             'reprobe sweep can re-adopt it: %s',
                             req.task_id, lease.name, _orphan_exc,
-                        )
-                        self._quarantine_unreachable_host(
-                            lease.name, str(_orphan_exc), time.time(),
                         )
 
         # task 2420 amend (reviewer finding #1): verify_task returned a

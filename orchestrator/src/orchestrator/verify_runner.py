@@ -3049,6 +3049,21 @@ class HostAllocator:
             for name, state in self._slots.items()
         ]
 
+    @property
+    def local_name(self) -> str:
+        """Name of the local (trust-anchor) host this allocator was built with.
+
+        The O(1) read for "is this host the local anchor?".  Callers that need
+        only the name must use this rather than scanning :meth:`host_states`
+        for its ``is_local`` flag, which materialises one dict per host on
+        every call (task 3043 amend).  :meth:`host_states` remains the
+        sanctioned read when the *full* per-host block is wanted.
+
+        Pure read of the constructor argument — never None, never mutated
+        after construction.
+        """
+        return self._local_name
+
     def is_parked(self, name: str) -> bool:
         """Return True if host *name*'s slot is PARKED (held + non-acquirable).
 
