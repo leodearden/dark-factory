@@ -2109,7 +2109,21 @@ class ReconReportState:
 
         if project_fold_eligible:
             self._run_cited_task_index.setdefault(run_id, {})[cited_task_key] = finding.finding_id
-        if entity_fold_eligible:
+        # task-4185: the derived signature has exactly ONE owner per run and
+        # FIRST REGISTRANT WINS.  A finding whose fold was skipped for a
+        # project mismatch keeps its own citation but does NOT take
+        # ownership: otherwise it would overwrite the anchor, and every
+        # later same-project duplicate of that task would compare against
+        # this FOREIGN citation, see a mismatch, and stop folding — trading
+        # a cross-project over-fold for a same-project under-fold.  It also
+        # keeps _purge_finding's ownership check
+        # (`run_sig_index.get(derived_sig) == finding.finding_id`) honest:
+        # deleting a non-owning finding must not clear the anchor another
+        # finding still owns.  The project-scoped registration above is
+        # deliberately NOT gated — its key already carries project_id, so
+        # this finding legitimately anchors 'other_project:42' for its own
+        # project.
+        if entity_fold_eligible and not entity_project_mismatch:
             self._run_sig_index.setdefault(run_id, {})[derived_sig] = finding.finding_id
 
         # task-2425 amend: skip the append when an identical {project_id,
