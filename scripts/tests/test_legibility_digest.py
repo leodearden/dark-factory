@@ -28,6 +28,8 @@ import digest as mod
 import pytest
 import yaml
 from legibility import inventory as inventory_mod
+from orchestrator.agents.briefing import MEMORY_CONTEXT_CAVEAT
+from shared.cli_invoke import CAP_HIT_RESUME_PROMPT, CRASH_RECOVERY_RESUME_PROMPT
 
 
 def _assistant(*blocks):
@@ -1479,17 +1481,21 @@ def _split_frontmatter(digest):
 
 # ---------------------------------------------------------------------------
 # is_harness_injected_turn / iter_user_turns exclusion -- R1 (confusion
-# census 2026-07-24 Sec 4): a harness-injected briefing turn (the
-# orchestrator's '# Context' + '## Agent Identity' + '# Task' preamble, or
-# the trickle coder's system-prompt preamble) is typed into the transcript
-# as ordinary user-role text (isMeta=False -- it really is the first "user"
-# turn Claude Code sees), so it was previously indistinguishable from a
-# genuine human correction: it inflated both the gold user_corrections
-# section and score's n_user_turns component. Exclusion is by CONTENT (all
-# three headings must co-occur, line-anchored, mirroring
+# census 2026-07-24 Sec 4): a harness-injected turn -- the orchestrator's
+# '# Context' + '## Agent Identity' + '# Task' briefing preamble, the
+# trickle coder's system-prompt preamble, or the harness's
+# post-interruption resume prompt (e.g. after a usage-limit cap) -- is
+# typed into the transcript as ordinary user-role text (isMeta=False -- it
+# really is the first "user" turn Claude Code sees), so it was previously
+# indistinguishable from a genuine human correction: it inflated both the
+# gold user_corrections section and score's n_user_turns component. Three
+# shapes are covered, not two: the briefing preamble is excluded by CONTENT
+# co-occurrence (all three headings must co-occur, line-anchored, mirroring
 # ORCHESTRATED_TASK_MARKERS' all() guard) so an ordinary human turn that
 # merely mentions one heading, or quotes one mid-sentence, is never
-# over-excluded.
+# over-excluded; the trickle-coder preamble and the resume prompt are each
+# excluded by a plain case-insensitive substring match
+# (HARNESS_PROMPT_MARKERS).
 # ---------------------------------------------------------------------------
 
 def _briefing_text(body_filler='Project overview and recent decisions go here.'):
@@ -1532,6 +1538,81 @@ _TRICKLE_CODER_PREAMBLE = (
 )
 """Literal prefix of scripts/legibility/coder.py:174 build_prompt's
 harness-authored preamble."""
+
+
+def _memory_context_block(body='## Project Context\n\n{...}'):
+    """Build the real shape of a LONE '# Context' memory-context block --
+    ``_get_memory_context``'s recalled-sections return path
+    (orchestrator/src/orchestrator/agents/briefing.py) WITHOUT its
+    '## Agent Identity' / '# Task' siblings. This is exactly the shape
+    HARNESS_BRIEFING_HEADINGS' all()-co-occurrence guard admits today:
+    only one of its three headings is present."""
+    return '# Context\n\n' + MEMORY_CONTEXT_CAVEAT.format(project_id='dark_factory') + '\n\n' + body
+
+
+_DROP_NOTE_EXAMPLE = (
+    '2 memory result slot(s) across 1 query were tagged to another project '
+    'and filtered out'
+)
+"""Representative drop_note text -- the shape
+``_get_memory_context`` builds it in
+(``f'{foreign_dropped} memory result slot(s) across {queries_fired} '
+f'{query_word} were tagged to another project and filtered out'``)."""
+
+_NO_RECALLED_SECTIONS_VARIANTS = (
+    '# Context\n\n_Memory unavailable — proceed with codebase exploration._',
+    (
+        '# Context\n\n_Memory unavailable — proceed with codebase '
+        f'exploration. Note: {_DROP_NOTE_EXAMPLE} before the failure._'
+    ),
+    '# Context\n\n_No memory context available._',
+    f'# Context\n\n_No memory context available ({_DROP_NOTE_EXAMPLE})._',
+)
+"""The four literal shapes ``_get_memory_context`` returns when
+``recalled_sections`` is empty
+(orchestrator/src/orchestrator/agents/briefing.py:1321-1331) -- two
+literal families (memory-unavailable / no-memory-context available), each
+with a plain and a drop_note-bearing variant. Not lockstep-importable
+like MEMORY_CONTEXT_CAVEAT: these are inlined string literals in
+``_get_memory_context``'s body, not a module-level constant."""
+
+
+def _recalled_sections_with_trailing_unavailable_note():
+    """The recalled-sections return path's fullest composite shape
+    (orchestrator/src/orchestrator/agents/briefing.py:1339-1350) -- the
+    fifth of ``_get_memory_context``'s five return paths, distinct from
+    the four ``_NO_RECALLED_SECTIONS_VARIANTS`` shapes above (those all
+    have recalled_sections EMPTY; this one has it non-empty). Builds a
+    caveat carrying its own drop_note suffix (a foreign-tagged result was
+    filtered from an earlier query), a genuinely recalled section, AND
+    the trailing "_Memory unavailable for the remaining queries..._"
+    note appended when a LATER query then fails. LOCKSTEP via
+    MEMORY_CONTEXT_CAVEAT -- pins that HARNESS_CONTEXT_BLOCK_MARKERS'
+    caveat-prefix marker alone still covers this composite, not just the
+    plain caveat-only shape _memory_context_block() builds."""
+    caveat = MEMORY_CONTEXT_CAVEAT.format(project_id='dark_factory')
+    caveat += f'\n\n_In total, {_DROP_NOTE_EXAMPLE}._'
+    return (
+        '# Context\n\n' + caveat + '\n\n## Project Context\n\nSome overview.'
+        '\n\n---\n\n_Memory unavailable for the remaining queries — proceed '
+        'with codebase exploration for anything not covered above._'
+    )
+
+
+def _resume_and_context_block_records():
+    """The confusion-census sighting shape (session b976febe), minus its
+    one genuine correction: a turn-0 lone '# Context' memory block,
+    followed by the usage-limit resume prompt at two separate later
+    turns, and nothing else -- no tool_use/tool_result/assistant record
+    at all, so every one of the five signal detectors reports zero hits
+    regardless of the R1 exclusion filter. Used to pin that once R1
+    excludes all three turns, a session like this no longer presents as
+    gold-bearing."""
+    return [
+        _with_session_meta(_user_text(_memory_context_block())),
+        _with_session_meta(_user_text(CAP_HIT_RESUME_PROMPT)),
+        _with_session_meta(_user_text(CAP_HIT_RESUME_PROMPT)),
+    ]
 
 
 class TestHarnessInjectedTurnFilter:
@@ -1719,6 +1800,191 @@ class TestHarnessInjectedTurnFilter:
         with_briefing = [_user_text(_briefing_text())] + base
 
         assert mod.signal_counts(with_briefing) == mod.signal_counts(base)
+
+    @pytest.mark.parametrize(
+        'resume_prompt', [CAP_HIT_RESUME_PROMPT, CRASH_RECOVERY_RESUME_PROMPT],
+        ids=['usage_limit', 'crash_recovery'],
+    )
+    def test_resume_prompt_is_excluded_lockstep(self, resume_prompt):
+        # LOCKSTEP: asserted against each canonical constant, not a
+        # restated literal, so a harness rewording of either resume prompt
+        # turns this suite red instead of silently drifting out of
+        # coverage. One parametrize row per resume prompt -- a future
+        # resume prompt is covered by adding one more row.
+        assert mod.is_harness_injected_turn(resume_prompt) is True
+
+    def test_crash_recovery_resume_prompt_excluded_from_iter_user_turns(self):
+        # The sibling of the usage-limit resume prompt: same defect class
+        # (harness-injected continuation boilerplate typed into the
+        # transcript as an ordinary user turn), different cause
+        # (orchestrator restart, not a usage-cap interrupt).
+        records = [_user_text(CRASH_RECOVERY_RESUME_PROMPT)]
+
+        assert mod.iter_user_turns(records) == []
+
+    def test_usage_limit_resume_prompt_excluded_from_iter_user_turns(self):
+        # Reproduces the sighting verbatim: the resume prompt appears both
+        # before and after a genuine correction. Neither occurrence must
+        # surface, while the genuine correction survives with its original
+        # record index preserved.
+        records = [
+            _user_text(CAP_HIT_RESUME_PROMPT),
+            _user_text('please fix the bug'),
+            _user_text(CAP_HIT_RESUME_PROMPT),
+        ]
+
+        turns = mod.iter_user_turns(records)
+
+        assert [t['text'] for t in turns] == ['please fix the bug']
+        assert [t['index'] for t in turns] == [1]
+
+    def test_usage_limit_mentioned_in_passing_is_not_excluded(self):
+        # Must NOT regress: a genuine human turn that merely MENTIONS a
+        # usage limit in passing -- not the harness's exact resume prompt
+        # -- stays in the gold bucket.
+        records = [_user_text('we keep hitting a usage limit, can you shorten the run?')]
+
+        turns = mod.iter_user_turns(records)
+
+        assert len(turns) == 1
+        assert turns[0]['text'] == 'we keep hitting a usage limit, can you shorten the run?'
+
+    def test_lone_memory_context_block_is_excluded(self):
+        # LOCKSTEP: built from the imported MEMORY_CONTEXT_CAVEAT constant,
+        # not a restated copy, so a caveat rewording turns this suite red.
+        records = [_user_text(_memory_context_block())]
+
+        assert mod.iter_user_turns(records) == []
+
+    def test_bare_context_heading_over_human_prose_is_not_excluded(self):
+        # Pins that the co-occurrence guard is NOT being weakened by the
+        # new arm: a genuine human turn that merely opens with a
+        # '# Context' heading, with none of the memory-context body
+        # markers, stays in the gold bucket.
+        records = [_user_text('# Context\n\nwe discussed this yesterday; please redo it')]
+
+        turns = mod.iter_user_turns(records)
+
+        assert len(turns) == 1
+
+    def test_caveat_mid_prose_without_heading_is_not_excluded(self):
+        # Pins that the new arm is still a CONJUNCTION with the
+        # line-anchored heading: quoting the caveat mid-prose, with no
+        # '# Context' heading of its own, must not trigger exclusion.
+        records = [_user_text(
+            'Someone pasted this: ' + MEMORY_CONTEXT_CAVEAT.format(project_id='dark_factory')
+        )]
+
+        turns = mod.iter_user_turns(records)
+
+        assert len(turns) == 1
+
+    @pytest.mark.parametrize(
+        'text', _NO_RECALLED_SECTIONS_VARIANTS,
+        ids=[
+            'memory_unavailable', 'memory_unavailable_with_drop_note',
+            'no_memory_context', 'no_memory_context_with_drop_note',
+        ],
+    )
+    def test_no_recalled_sections_variant_is_excluded(self, text):
+        # Exhaustive over _get_memory_context's four no-recalled-sections
+        # return paths, not just the caveat-bearing happy path covered
+        # above -- the marker set must cover every output of that
+        # function, not merely its most common case.
+        records = [_user_text(text)]
+
+        assert mod.iter_user_turns(records) == []
+
+    def test_recalled_sections_with_trailing_unavailable_note_is_excluded(self):
+        # The fifth _get_memory_context return path (recalled_sections
+        # non-empty), at its fullest composite: a drop_note folded into
+        # the caveat PLUS a trailing memory-unavailable note from a later
+        # failed query. Both suffixes are appended AFTER the caveat
+        # prefix HARNESS_CONTEXT_BLOCK_MARKERS matches on, so the caveat
+        # marker alone must still cover this shape -- not just the plain
+        # caveat-only shape _memory_context_block() builds.
+        records = [_user_text(_recalled_sections_with_trailing_unavailable_note())]
+
+        assert mod.iter_user_turns(records) == []
+
+    def test_render_digest_zero_signal_session_has_no_gold_section(self):
+        # Acceptance test at the render_digest level, reproducing the
+        # sighting verbatim (session b976febe) minus its one genuine
+        # correction: a zero-signal session that used to present as
+        # gold-bearing (3 harness-injected turns, every signal_counts
+        # bucket 0) must no longer do so once R1's exclusion covers all
+        # three shapes. Asserted as "every bucket is 0" rather than
+        # against a hardcoded key set: the bucket vocabulary grows
+        # independently of this filter (task 4027 added
+        # 'designed_outcome'), and pinning the key set here would turn
+        # every such addition into a spurious failure of an R1 test.
+        records = _resume_and_context_block_records()
+
+        digest = mod.render_digest(records, agent_class='interactive')
+
+        frontmatter_yaml, body = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert set(meta['signal_counts']) >= {
+            'tool_error', 'self_correct', 'not_found', 'df_guard', 'interrupt',
+        }
+        assert all(count == 0 for count in meta['signal_counts'].values())
+        assert '## User Corrections' not in digest
+        # n_user_turns inflation is gone: score_signals(all-zero counts, 0).
+        assert meta['score'] == 0.0
+        assert 'previous run was interrupted' not in body
+        assert '# Context' not in body
+
+    def test_render_digest_retains_only_genuine_correction_alongside_excluded_turns(self):
+        # Non-regression half of the acceptance test: a genuine human
+        # correction added to the same zero-signal session must still
+        # surface, and ONLY it -- the excluded turns contribute nothing to
+        # either the gold section or the score.
+        records = _resume_and_context_block_records() + [
+            _with_session_meta(_user_text('This is wrong, please redo it.')),
+        ]
+
+        digest = mod.render_digest(records, agent_class='interactive')
+
+        frontmatter_yaml, body = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert '## User Corrections' in digest
+        correction_lines = [line for line in body.splitlines() if line.startswith('- (turn')]
+        assert correction_lines == ['- (turn 3) This is wrong, please redo it.']
+        assert 'previous run was interrupted' not in body
+        assert '# Context' not in body
+        assert meta['score'] == mod.score_signals(meta['signal_counts'], 1)
+
+    def test_signal_counts_unaffected_by_resume_and_context_block_turns(self):
+        # Mirrors test_signal_counts_unaffected_by_signal_free_briefing_turn,
+        # but for the two NEW exclusion arms this task adds (resume prompt,
+        # lone context block): prepending both to a records list that
+        # already trips every detector must not perturb any of the five
+        # signal_counts -- the filter must not leak into
+        # _signal_text_sources.
+        base = _all_signals_records()
+        augmented = [
+            _user_text(CAP_HIT_RESUME_PROMPT),
+            _user_text(_memory_context_block()),
+        ] + base
+
+        assert mod.signal_counts(augmented) == mod.signal_counts(base)
+
+    def test_classify_agent_class_still_detects_markers_inside_resume_turn(self):
+        # Sibling of test_classify_agent_class_still_detects_markers_inside_
+        # excluded_turn, for the resume-prompt exclusion arm specifically:
+        # classify_agent_class reads _signal_text_sources, a carrier never
+        # filtered by iter_user_turns, so orchestrated-task markers living
+        # inside an otherwise-excluded resume turn must still be found.
+        text = (
+            CAP_HIT_RESUME_PROMPT
+            + '\nTask ID: 4275\nWorktree: /home/leo/src/dark-factory/.worktrees/4275\n'
+        )
+        records = [_user_text(text)]
+
+        assert mod.iter_user_turns(records) == []
+        assert mod.classify_agent_class(records) == 'orchestrated-task'
 
 
 class TestRenderDigest:

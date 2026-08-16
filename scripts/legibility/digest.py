@@ -902,18 +902,74 @@ pre-3610 all-of-three rule did not catch either, so nothing regresses."""
 
 HARNESS_PROMPT_MARKERS: tuple[str, ...] = (
     'you are the trickle coder for the dark-factory agent-confusion codebook',
+    'your previous run was interrupted by a usage limit',
+    'you were interrupted by an orchestrator restart',
 )
 """Harness-authored PROSE preamble literals, matched as plain
 case-insensitive substrings (unlike the line-anchored heading markers
 above): the trickle coder's system prompt
-(scripts/legibility/coder.py:174 ``build_prompt``). Extend with future
-harness prompt literals as one-line additions."""
+(scripts/legibility/coder.py:174 ``build_prompt``), and the harness's two
+resume prompts -- ``shared.cli_invoke.CAP_HIT_RESUME_PROMPT`` (cap-hit)
+and ``shared.cli_invoke.CRASH_RECOVERY_RESUME_PROMPT`` (orchestrator
+restart), the canonical sources of the two literals above. Both resume
+prompts are one defect class -- harness-injected continuation boilerplate
+typed into the transcript as an ordinary isMeta=False user turn -- even
+though cli_invoke deliberately keeps the two strings separate because
+their causes differ (a usage-cap interrupt vs. an orchestrator restart).
+Each marker is deliberately its constant's stable FIRST SENTENCE, not the
+whole string: a future rewording of a later sentence must not silently
+un-cover the marker. Held in lockstep with the canonical constants by
+``TestHarnessInjectedTurnFilter.test_resume_prompt_is_excluded_lockstep``
+in scripts/tests/test_legibility_digest.py, which asserts
+``is_harness_injected_turn(<constant>) is True`` for each rather than
+restating the literal -- a harness rewording turns that test red instead
+of silently regressing coverage. Extend with future harness prompt
+literals as one-line additions."""
+
+HARNESS_CONTEXT_BLOCK_MARKERS: tuple[str, ...] = (
+    '_this context was recalled from the ',
+    '_memory unavailable — proceed with codebase exploration',
+    '_no memory context available',
+)
+"""Body literals ``_get_memory_context`` renders right after its
+'# Context' heading (orchestrator/src/orchestrator/agents/briefing.py):
+the standing provenance caveat's prefix
+(``orchestrator.agents.briefing.MEMORY_CONTEXT_CAVEAT``, when a memory
+section was actually recalled), and its two no-recalled-sections literal
+families (memory-unavailable / no-memory-context-available). The caveat
+marker deliberately stops BEFORE its ``{project_id}`` interpolation
+point: a marker spanning it would be project-specific and would fail for
+every non-dark_factory project the census runs against (this module has
+no knowledge of which project a transcript belongs to). These three
+markers are EXHAUSTIVE over ``_get_memory_context``'s FIVE return paths
+as of this commit: the four no-recalled-sections paths (each of the two
+literal families has a plain and a drop_note-bearing variant, both
+covered by the same family marker), PLUS the recalled-sections path
+(briefing.py:1339-1350) -- covered by the caveat marker ALONE, including
+its own drop_note suffix (``'\n\n_In total, {drop_note}._'``) and the
+trailing "_Memory unavailable for the remaining queries..._" note a
+later-failing query appends, since both are appended AFTER the caveat
+prefix this marker matches on, never before it. That exhaustiveness
+claim is what
+``TestHarnessInjectedTurnFilter.test_no_recalled_sections_variant_is_excluded``
+(the four no-recalled-sections paths) and
+``test_recalled_sections_with_trailing_unavailable_note_is_excluded``
+(the fifth, composite path) together check, so a new return path added
+to that function should arrive with a fourth marker here. Matched only in CONJUNCTION with
+a line-anchored '# context' heading (see :func:`is_harness_injected_turn`),
+never as a relaxation of the briefing anchor+corroborator guard -- that
+guard is load-bearing and its two negative tests
+(test_single_heading_alone_is_not_excluded,
+test_context_heading_mentioned_mid_sentence_is_not_excluded) must keep
+passing unchanged."""
 
 
 def is_harness_injected_turn(text: str) -> bool:
     """True when *text* is harness-injected rather than genuine human-typed
-    input: either the orchestrator's briefing preamble or a harness prose
-    preamble (any HARNESS_PROMPT_MARKERS substring).
+    input: either the orchestrator's briefing preamble, a harness prose
+    preamble (any HARNESS_PROMPT_MARKERS substring), or a lone memory-context
+    block (a line-anchored '# context' heading together with any
+    HARNESS_CONTEXT_BLOCK_MARKERS substring).
 
     The briefing rule is ANCHOR + CORROBORATOR: at least one
     HARNESS_BRIEFING_HEADINGS anchor must appear as its own stripped line,
@@ -935,6 +991,11 @@ def is_harness_injected_turn(text: str) -> bool:
     NO corroborator, so it falls below the >=2 threshold; and a '# Context'
     quoted mid-prose is not a stripped line at all, so it is never a
     heading -- matching stays line-anchored and never substring.
+
+    The memory-context rule is the residual the briefing rule declines: a
+    '# Context' block whose memory sections were recalled but which carries
+    no second heading is caught by its standing provenance caveat
+    (HARNESS_CONTEXT_BLOCK_MARKERS) instead of by a corroborator.
     """
     lowered = text.lower()
     lines = {line.strip() for line in lowered.splitlines()}
@@ -943,7 +1004,9 @@ def is_harness_injected_turn(text: str) -> bool:
         corroborators = [h for h in HARNESS_BRIEFING_SUBHEADINGS if h in lines]
         if len(anchors) + len(corroborators) >= 2:
             return True
-    return any(marker in lowered for marker in HARNESS_PROMPT_MARKERS)
+    if any(marker in lowered for marker in HARNESS_PROMPT_MARKERS):
+        return True
+    return '# context' in lines and any(m in lowered for m in HARNESS_CONTEXT_BLOCK_MARKERS)
 
 
 def classify_agent_class(
@@ -984,8 +1047,10 @@ def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     Excludes: non-'user' records, isSidechain=True (subagent) turns,
     isMeta=True (system-injected) turns, user records whose content is
-    entirely tool_result blocks, and harness-injected briefing/prompt turns
-    (see :func:`is_harness_injected_turn`) -- these are typed into the
+    entirely tool_result blocks, and harness-injected briefing/prompt/
+    context-block turns (see :func:`is_harness_injected_turn`, which
+    covers three shapes: the briefing preamble, a harness prose preamble,
+    and a lone memory-context block) -- these are typed into the
     transcript as ordinary user-role text (isMeta=False), so isMeta alone
     cannot exclude them. This function is the SINGLE source for both the
     gold user_corrections section and render_digest's n_user_turns score
