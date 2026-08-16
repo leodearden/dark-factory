@@ -1254,6 +1254,36 @@ def _ignored_directive_lines(output: str, unit: pathlib.Path) -> list[str]:
     ]
 
 
+def _write_backoff_canary(directory: pathlib.Path) -> pathlib.Path:
+    """Write a unit systemd-analyze will actually warn about, as a positive control.
+
+    Thin wrapper over ``_write_restart_unit`` (:1095) rather than a second
+    hand-rolled unit writer.  The body is the pre-fix ``no_steps`` shape
+    ``test_restart_backoff_guard_rejects_ineffective_units`` already writes
+    at :1121 (``Restart=on-failure`` / ``RestartSec=5`` /
+    ``RestartMaxDelaySec=60``), with ``ExecStart=/bin/true`` prepended.
+
+    The ExecStart is not decoration: measured 2026-08-16 in this worktree
+    (systemd 255.4-1ubuntu8.17), the bare restart stanza alone is REFUSED by
+    systemd-analyze before the pairing check ever runs
+    (``canary-noexec.service: Service has no ExecStart=, ExecStop=, or
+    SuccessAction=. Refusing.``, exit 1, zero "Ignoring." line) — a canary in
+    that shape would fail on every healthy host instead of drawing the
+    warning it exists to draw.  With the ExecStart present it instead draws
+    ``canary-exec.service: Service has RestartMaxDelaySec= but no
+    RestartSteps= setting. Ignoring.`` at exit 0.  See
+    test_backoff_canary_is_the_shape_systemd_must_warn_about for the pinned,
+    host-independent contract this shape must satisfy.
+
+    ``df-restart-backoff-canary.service`` is a name chosen not to collide
+    with any real unit on any host; measured working.
+    """
+    return _write_restart_unit(
+        directory / "df-restart-backoff-canary.service",
+        "ExecStart=/bin/true\nRestart=on-failure\nRestartSec=5\nRestartMaxDelaySec=60",
+    )
+
+
 def test_ignored_directive_filter_matches_both_systemd_spellings() -> None:
     """_ignored_directive_lines must catch both casings and only this unit.
 
@@ -1489,14 +1519,16 @@ def test_backoff_canary_is_the_shape_systemd_must_warn_about(
     _SYSTEMD_ANALYZE_SKIP_REASON is not None,
     reason=_SYSTEMD_ANALYZE_SKIP_REASON or "",
 )
-def test_systemd_analyze_verify_reports_no_ignored_directives() -> None:
+def test_systemd_analyze_verify_reports_no_ignored_directives(
+    tmp_path: pathlib.Path,
+) -> None:
     """systemd itself must not report discarding any directive in the unit.
 
     Confirmatory corroboration of the file-content invariant above, deliberately
     skippable so the module keeps the "no systemd runtime is required" contract
     stated in its docstring.
 
-    Six details here are load-bearing, each verified by measurement rather
+    Seven details here are load-bearing, each verified by measurement rather
     than assumed (2026-08-01, systemd 255.4 unless noted):
 
     1. stderr is captured, not just stdout.  The warning goes to stderr while
@@ -1554,6 +1586,44 @@ def test_systemd_analyze_verify_reports_no_ignored_directives() -> None:
        are recorded here so a future edit does not widen the gate into
        over-skipping.  See ``_systemd_analyze_verify_skip_reason`` above for
        the gate itself.
+    7. The assertion below is corroborated by a POSITIVE CONTROL, not just a
+       skip gate, because a wired gate is not the only way this test can pass
+       vacuously — see test_backoff_canary_is_the_shape_systemd_must_warn_about
+       for why the control's own shape needed pinning first.  A
+       ``df-restart-backoff-canary.service`` built by ``_write_backoff_canary``
+       is verified in the SAME invocation as HARDCODED, and the run must draw
+       an "Ignoring." line for the canary before the real assertion is trusted
+       at all.  Measured 2026-08-16 in this worktree (systemd
+       255.4-1ubuntu8.17):
+         - A healthy run emits, verbatim: ``df-restart-backoff-canary.service:
+           Service has RestartMaxDelaySec= but no RestartSteps= setting.
+           Ignoring.``
+         - The degenerate run emits it NOT AT ALL: with XDG_RUNTIME_DIR both
+           unset and set to ``""``, the combined output for this same
+           two-unit invocation collapses to only "Failed to lookup
+           RuntimeDirectory path: No such device or address" / "Failed to
+           initialize manager: No such device or address" (exit 1) — the
+           exact state point 6 describes, and this control fires on any other
+           degeneration too, whatever its cause, because it asserts the
+           property that actually matters (this invocation can detect a
+           defective unit) rather than a specific failure signature.
+         - WHY both units are verified in ONE invocation rather than two: a
+           control run in a separate subprocess would attest to a different
+           run than the one that produced this assertion's evidence.  The two
+           are also demonstrably not interchangeable — verifying the canary
+           ALONE loads the INSTALLED ``~/.config/systemd/user/dark-factory-dashboard.service``,
+           which on this host is stale (``RestartMaxDelaySec=60``, no
+           ``RestartSteps=``) and DOES emit the pairing warning under the
+           same unit name the filter scopes on; passing HARDCODED's repo path
+           explicitly shadows it, measured as zero
+           ``dark-factory-dashboard.service:`` lines in the combined run.
+         - On a systemd < 254 host the canary would degrade to the lowercase
+           full-path "Unknown key name 'RestartMaxDelaySec' ... ignoring."
+           form instead, which ``_ignored_directive_lines`` still matches via
+           its ``str(unit) in line`` arm, so the control survives the version
+           split point 4 exists for.  This is an INFERENCE from point 4's
+           measured ``RestartStepz`` behaviour, not a fresh measurement on
+           such a host — this host is 255.
 
     Scoping is what makes ``--user`` safe to pass, and passing it is the point:
     this is a --user unit (WantedBy=default.target, installed under
@@ -1561,14 +1631,24 @@ def test_systemd_analyze_verify_reports_no_ignored_directives() -> None:
     scope it never runs in and silently fails to resolve its user-scope
     dependencies.
     """
+    canary = _write_backoff_canary(tmp_path)
     result = subprocess.run(
-        ["systemd-analyze", "verify", "--user", str(HARDCODED)],
+        ["systemd-analyze", "verify", "--user", str(canary), str(HARDCODED)],
         capture_output=True,
         text=True,
         timeout=60,
         check=False,
     )
     combined = f"{result.stdout}{result.stderr}"
+    assert _ignored_directive_lines(combined, canary), (
+        f"systemd-analyze verify produced no 'Ignoring.' line for {canary.name}, a unit "
+        "built specifically to draw one — so this invocation did not actually verify "
+        "anything and the assertion below would pass having checked nothing. Causes, in "
+        "likelihood order: no usable --user manager in this environment (the skip gate "
+        "above should have caught that); this systemd no longer warns for a "
+        "RestartMaxDelaySec= without RestartSteps=; or _ignored_directive_lines has "
+        f"regressed.\nFull output:\n{combined}"
+    )
     ignored = _ignored_directive_lines(combined, HARDCODED)
     assert not ignored, (
         f"systemd-analyze verify reports directives it is IGNORING in {HARDCODED}:\n"
