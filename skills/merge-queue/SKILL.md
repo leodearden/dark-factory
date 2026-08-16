@@ -101,7 +101,7 @@ Whichever handle you poll, the cadence and state handling below are the same for
 
 **Live states** (`queued`, `verifying`, `gate`, `finalizing`) — keep polling.
 
-**Terminal states** (`done`, `conflict`, `blocked`, `abandoned`, `superseded`) — proceed to step 4.
+**Terminal states** (`done`, `conflict`, `blocked`, `abandoned`, `superseded`) — proceed to step 4. (Unlike the other four, `superseded` doesn't tell you the actual outcome by itself — it names a successor you still need to resolve; see [Follow the superseded successor](#follow-the-superseded-successor) below.)
 
 **`state: "superseded"`** — Your request was superseded by a successor. The response includes `superseded_by: "<mr-* request id | coalesce-* train id>"`. **Never fall back to direct merge, and never resubmit, while that successor is unresolved** — it may already be in flight, and either would race it. The successor isn't always pollable the same way your own request was; see below for the shape branch.
 
@@ -222,6 +222,8 @@ If your submit returned `status: "attached"`, whether the returned `request_id` 
 - `poll_by == "request_id"` — the returned `request_id` IS the in-flight entry's id; cancel it as shown above.
 - `poll_by == "task_id"` or `poll_by == "branch"` — the returned `request_id` names your own coalesced submission, not the in-flight entry. Treat the cancel as best-effort: `cancelled: false` / `state: "unknown"` is the expected outcome here, not evidence of a problem. On `"branch"` specifically, a foreign or pre-restart merger owns the worktree — reaching the real entry isn't this caller's cancel to make. Re-check the actual state first (`merge_status(task_id=...)` / `merge_status(branch="task/<TASK_ID>")`, which self-resolves a landed merge via the git-authority tier), then the `git merge-base --is-ancestor` confirmation described under `state: "unknown"` above, before deciding anything further.
 
+Separately — if you're holding a `coalesce-*` train id from a `superseded` response's `superseded_by` (not from an `attached` submit's `poll_by`), it is **not** cancellable via `merge_cancel` either: the train was never registered as a waiter under that id, so the call resolves to `cancelled: false` / `state: "unknown"` for the same reason it can't be polled by `request_id` (`escalation/server.py:2679-2681`: "callers holding a coalesced id will resolve to 'unknown' here"). There is no cancel path for an in-flight train — see [Follow the superseded successor](#follow-the-superseded-successor) instead.
+
 ### 6. Fallback: direct merge
 
 **This fallback is ONLY for orchestrator down/congested — NEVER a response to `state: "unknown"`.**
@@ -254,7 +256,7 @@ After a successful direct merge:
 | Outcome `conflict` | Fix in worktree, resubmit |
 | Outcome `blocked` | Read reason, fix, resubmit |
 | Outcome `done` or `already_merged` | Update task status, clean up |
-| Outcome `superseded` | Re-poll `merge_status(superseded_by)` until terminal; do NOT direct-merge or resubmit |
+| Outcome `superseded` | `superseded_by` is `mr-*` → poll it by `request_id` (own 20-min ceiling); `coalesce-*` → names the train, not a request — `merge_status(request_id=...)` returns `unknown` forever, so fall back to `merge_status(branch=...)` + the canonical ancestry check (rc=128-with-empty-marker is expected for a non-tip member). See [Follow the superseded successor](#follow-the-superseded-successor). Never direct-merge, never resubmit. |
 | Outcome `needs_rebase` — auto-rebase succeeded | Queue re-processed automatically; no action needed |
 | Outcome `needs_rebase` — real conflict or cap | Fix conflict in worktree, resubmit (or unblock if cap reached) |
 | Abandon a queued submission | `merge_cancel(request_id)` — the only explicit-cancellation path |
