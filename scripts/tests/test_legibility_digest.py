@@ -456,6 +456,15 @@ class TestAsUnreadableFileError:
         # OSError. A shape wrongly added here would be caught and re-wrapped
         # rather than propagating, and gzip.BadGzipFile in particular must
         # keep reaching callers by its own inheritance.
+        #
+        # Being a tuple is itself load-bearing and asserted separately: it
+        # is used directly as an `except UNREADABLE_FILE_ERRORS` clause in
+        # digest.load_transcript, and Python rejects a list there with
+        # "catching classes that do not inherit from BaseException is not
+        # allowed" -- only on the rare corrupt-file path. The comparison
+        # below wraps in tuple() to satisfy ruff SIM300, which would
+        # otherwise let a list-valued constant pass unnoticed.
+        assert isinstance(inventory_mod.UNREADABLE_FILE_ERRORS, tuple)
         expected_shapes = (EOFError, zlib.error, UnicodeDecodeError)
         assert tuple(inventory_mod.UNREADABLE_FILE_ERRORS) == expected_shapes
         assert not any(
@@ -1369,21 +1378,24 @@ class TestHarnessInjectedTurnFilter:
 
 
 # ---------------------------------------------------------------------------
-# is_pasted_report_turn / iter_user_turns exclusion -- R1 (confusion census
-# 2026-07-31 §1.1 facet (b), :81/:85): 5 sightings across 5 sessions where
-# the flagged "User Correction" is a full Reconciliation Run Review pasted
-# into a turn for review/discussion -- report output, not anyone correcting
-# the agent. The generator is a literal f-string,
-# fused-memory/src/fused_memory/reconciliation/judge.py:455-475
-# (``_build_prompt``), so the shape is greppable rather than guessed.
+# Run-review-prompt exclusion via is_harness_injected_turn -- R1 (confusion
+# census 2026-07-31 §1.1 facet (b), :81/:85): 5 sightings across 5 sessions
+# where the flagged "User Correction" is a full Reconciliation Run Review.
+# The generator is a literal f-string,
+# fused-memory/src/fused_memory/reconciliation/judge.py:411
+# (``_build_review_prompt``), so the shape is greppable rather than guessed.
 #
-# This is a SEPARATE predicate from is_harness_injected_turn, not a widening
-# of it: a briefing preamble is injected BY the harness into a user-role
-# record (the human never typed it), whereas a pasted report IS a genuine
-# human turn -- the human really did paste it, it just is not a correction.
-# The census tracks the two as facet (a) vs facet (b) and §6 names "zero
-# facet-(a) sightings next cycle" as the discriminating fix-confirmed
-# measurement, which needs the two predicates individually testable.
+# The census called this "pasted into a turn for review/discussion", i.e. a
+# genuine human turn. Transcript forensics on all five sightings refutes
+# that: the judge dispatches the prompt through shared.cli_invoke ->
+# `claude --print` (judge_llm_provider defaults to 'claude_cli'), and in each
+# transcript the run-review block is the FIRST user record, preceded only by
+# harness bookkeeping (queue-operation enqueue/dequeue, an
+# `entrypoint: sdk-cli` attachment), with no ordinary human turn anywhere.
+# So it is harness-INJECTED, exactly like facet (a)'s briefing block -- one
+# source class, two injectors -- which is why the heading set lives in
+# HARNESS_HEADING_SETS rather than behind a separate "pasted report"
+# predicate that would assert a human typed it.
 #
 # Exclusion is by line-anchored heading CO-OCCURRENCE (all(), not any()),
 # the same false-positive guard HARNESS_BRIEFING_HEADINGS and
@@ -1393,9 +1405,9 @@ class TestHarnessInjectedTurnFilter:
 # ---------------------------------------------------------------------------
 
 def _recon_run_review_text():
-    """Build the text of a pasted-reconciliation-run-review user turn -- the
-    literal shape ``ReconciliationJudge._build_prompt`` emits
-    (fused-memory/src/fused_memory/reconciliation/judge.py:455-475): a
+    """Build the text of an injected reconciliation-run-review user turn --
+    the literal shape ``ReconciliationJudge._build_review_prompt`` emits
+    (fused-memory/src/fused_memory/reconciliation/judge.py:411-476): a
     '## Reconciliation Run Review' heading, a '### Run Metadata' block whose
     first bullet is '- Run ID: {run.id}', a '### Stage Reports' block of
     ``json.dumps`` output, and '### MCP Actions (N total)' / '### Journal
@@ -1427,7 +1439,7 @@ def _recon_run_review_text():
     )
 
 
-class TestPastedReportTurnFilter:
+class TestRunReviewPromptTurnFilter:
     def test_recon_run_review_turn_is_excluded(self):
         records = [_user_text(_recon_run_review_text())]
 
@@ -1497,17 +1509,36 @@ class TestPastedReportTurnFilter:
 
         assert mod.signal_counts(with_report) == mod.signal_counts(base)
 
-    def test_pasted_report_is_not_classified_as_harness_injected(self):
-        # The two predicates stay semantically distinct: a pasted report is
-        # NOT harness-injected (a human really did paste it), which is why
-        # it is a separate predicate rather than a widening of the other.
-        # Keeping them individually testable is what lets a future census
-        # tell facet (a) from facet (b) (census §6).
-        text = _recon_run_review_text()
+    def test_run_review_prompt_is_classified_as_harness_injected(self):
+        # The run-review block IS harness-injected -- the judge's own prompt,
+        # recorded as the session's sole user record by `claude --print`
+        # (verified on all five census sightings) -- so it belongs to
+        # is_harness_injected_turn rather than to a separate predicate whose
+        # name would assert a human typed it.
+        assert mod.is_harness_injected_turn(_recon_run_review_text()) is True
+        assert mod.is_harness_injected_turn(_briefing_text()) is True
 
-        assert mod.is_harness_injected_turn(text) is False
-        assert mod.is_pasted_report_turn(text) is True
-        assert mod.is_pasted_report_turn(_briefing_text()) is False
+    def test_each_harness_heading_set_is_matched_independently(self):
+        # HARNESS_HEADING_SETS is an any()-over-sets fan-out with two real
+        # entries: a turn carrying ONE set's headings is excluded without
+        # needing the other's. Cross-set heading mixtures are not a match.
+        assert mod.HARNESS_BRIEFING_HEADINGS in mod.HARNESS_HEADING_SETS
+        assert mod.RECON_RUN_REVIEW_HEADINGS in mod.HARNESS_HEADING_SETS
+
+        crossed = '\n\n'.join(
+            ('# Context', '### Stage Reports', 'so what should I do here?'),
+        )
+        assert mod.is_harness_injected_turn(crossed) is False
+
+    def test_both_heading_sets_use_the_same_line_anchoring(self):
+        # One shared normalization (_has_all_heading_lines), so the two sets
+        # cannot silently diverge on what counts as a heading line: leading
+        # and trailing whitespace and case are stripped for both alike.
+        for headings in mod.HARNESS_HEADING_SETS:
+            padded = '\n'.join(f'  {heading.upper()}  ' for heading in headings)
+
+            assert mod.is_harness_injected_turn(padded) is True
+            assert mod.is_harness_injected_turn(' | '.join(headings)) is False
 
 
 class TestRenderDigest:
@@ -1879,13 +1910,10 @@ class TestTruncatedItemsFrontmatter:
         frontmatter_yaml, body = _split_frontmatter(digest)
         meta = yaml.safe_load(frontmatter_yaml)
 
-        pre_trim = sum(
-            line.count(mod.ITEM_TRUNCATION_MARKER)
-            for lines in mod._build_sections(
-                records, item_max_bytes=mod._item_byte_cap(max_bytes),
-            ).values()
-            for line in lines
+        _, pre_trim_truncated = mod._build_sections(
+            records, item_max_bytes=mod._item_byte_cap(max_bytes),
         )
+        pre_trim = len(pre_trim_truncated)
 
         assert pre_trim > meta['truncated_items'], (
             'fixture must actually evict a truncated item for this test to '
@@ -1893,6 +1921,29 @@ class TestTruncatedItemsFrontmatter:
         )
         assert meta['truncated_items'] == body.count(mod.ITEM_TRUNCATION_MARKER)
         assert len(digest.encode('utf-8')) <= max_bytes
+
+    def test_truncated_items_ignores_a_marker_the_item_content_merely_quotes(self):
+        # truncated_items counts what _cap_item actually truncated, not
+        # occurrences of ITEM_TRUNCATION_MARKER in the rendered body. The
+        # marker is an OPEN prefix and its literal lives in this repo's own
+        # data (docs/legibility/confusion-codebook.yaml evidence quotes,
+        # plans/confusion-census-2026-07-31.md), so any session that greps
+        # or reads those files renders items containing it. Counting by
+        # substring would inflate the field above the true count -- the
+        # exact "surface omits/misreports its own basis" defect (census
+        # §3.4) this key exists to fix.
+        quoting_turn = f'Why does the digest say "{mod.ITEM_TRUNCATION_MARKER}]" here?'
+        assert len(quoting_turn.encode('utf-8')) < mod.MIN_ITEM_BYTES  # never capped
+
+        digest = mod.render_digest(
+            [_with_session_meta(_user_text(quoting_turn))], agent_class='interactive',
+        )
+
+        frontmatter_yaml, body = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert mod.ITEM_TRUNCATION_MARKER in body  # the quote survived verbatim
+        assert meta['truncated_items'] == 0
 
 
 # ---------------------------------------------------------------------------
