@@ -330,26 +330,52 @@ def test_no_cadence_knob_was_added_to_the_orchestrator_config():
 # ── the committed wrapper ───────────────────────────────────────────────────
 
 _FAKE_RECORDER_SRC = '''#!/usr/bin/env python3
-"""Fake command recorder. Appends {"who", "argv"} to the JSON list at
-$FAKE_STATE, then exits with $FAKE_EXIT_<WHO> (default 0)."""
+"""Fake command recorder. Appends {"who", "argv", "env"} to the JSON list at
+$FAKE_STATE, then exits with $FAKE_EXIT_<WHO> (default 0).
+
+`env` carries the three service-env roots the wrapper is contracted to export.
+Recording them from INSIDE the invoked command is the only way to OBSERVE that
+the exports actually ran: all three names also appear in the wrapper's header
+comment, so a source-text grep stays green with the real `export` lines deleted.
+"""
 import json
 import os
 import sys
+
+SERVICE_ENV_KEYS = ("CONFIG_PATH", "PROJECT_ROOT", "FALKORDB_URI")
 
 who = os.environ["FAKE_WHO"]
 state_path = os.environ["FAKE_STATE"]
 with open(state_path) as f:
     state = json.load(f)
-state.append({"who": who, "argv": sys.argv[1:]})
+state.append({
+    "who": who,
+    "argv": sys.argv[1:],
+    "env": {k: os.environ.get(k) for k in SERVICE_ENV_KEYS},
+})
 with open(state_path, "w") as f:
     json.dump(state, f)
 
 sys.exit(int(os.environ.get(f"FAKE_EXIT_{who}", "0")))
 '''
 
+# The wrapper exports these with `${VAR:-default}` semantics, under which an
+# AMBIENT value WINS over the wrapper's own root. They are unset in a plain
+# login shell (verified) but the fused-memory service env sets them, so they are
+# popped explicitly rather than assumed absent -- otherwise the service-env
+# assertion below is ambient-dependent: green here, red under the service.
+_SERVICE_ENV_KEYS = ('CONFIG_PATH', 'PROJECT_ROOT', 'FALKORDB_URI')
 
-def _wrapper_harness(tmp_path, *, census_exit=0, stamp_exit=0, extra_env=None):
-    """Point both wrapper seams at fake recorders. Returns (env, state_path)."""
+
+def _wrapper_harness(tmp_path, *, census_exit=0, stamp_exit=0, extra_env=None,
+                     default_prefix=False):
+    """Point both wrapper seams at fake recorders. Returns (env, state_path).
+
+    With `default_prefix=True` the two `*_CMD` seams are left UNSET instead, so
+    the wrapper's own `uv run --frozen --project <FM> python` prefix is the
+    thing under test, with a fake `uv` recorder on PATH. Every other wrapper
+    test overrides both seams and therefore never exercises that prefix at all.
+    """
     bin_dir = tmp_path / 'wbin'
     bin_dir.mkdir(exist_ok=True)
     state_path = tmp_path / 'wrapper_state.json'
@@ -357,8 +383,13 @@ def _wrapper_harness(tmp_path, *, census_exit=0, stamp_exit=0, extra_env=None):
 
     # The interpreter is spelled ABSOLUTELY (sys.executable), never `python3`,
     # so a PATH-resolved shim can never re-enter itself.
-    for who in ('CENSUS', 'STAMP'):
-        shim = bin_dir / f'fake-{who.lower()}'
+    shims = {'fake-census': 'CENSUS', 'fake-stamp': 'STAMP'}
+    if default_prefix:
+        # ONE fake `uv` serves BOTH halves, so it cannot key on FAKE_WHO: every
+        # call lands under the same `who`, and the census's is simply the first.
+        shims['uv'] = 'UV'
+    for name, who in shims.items():
+        shim = bin_dir / name
         shim.write_text(
             '#!/usr/bin/env bash\n'
             f'FAKE_WHO={who} exec {sys.executable} '
@@ -373,8 +404,16 @@ def _wrapper_harness(tmp_path, *, census_exit=0, stamp_exit=0, extra_env=None):
     env = dict(os.environ)
     env['PATH'] = f'{bin_dir}{os.pathsep}{env["PATH"]}'
     env['REPO'] = str(repo)
-    env['COVERAGE_CENSUS_CMD'] = 'fake-census'
-    env['RETRO_STAMP_CMD'] = 'fake-stamp'
+    for key in _SERVICE_ENV_KEYS:
+        env.pop(key, None)
+    if default_prefix:
+        for key in ('COVERAGE_CENSUS_CMD', 'RETRO_STAMP_CMD'):
+            env.pop(key, None)
+        # Keeps the commit half out of the prefix assertion.
+        env['CENSUS_COMMIT'] = '0'
+    else:
+        env['COVERAGE_CENSUS_CMD'] = 'fake-census'
+        env['RETRO_STAMP_CMD'] = 'fake-stamp'
     env['FAKE_STATE'] = str(state_path)
     env['FAKE_EXIT_CENSUS'] = str(census_exit)
     env['FAKE_EXIT_STAMP'] = str(stamp_exit)
@@ -451,14 +490,66 @@ def test_wrapper_reports_both_exit_codes_rather_than_swallowing_them(tmp_path):
 
 def test_wrapper_runs_under_the_fused_memory_service_env(tmp_path):
     """A fused-memory maintenance action must run under the SERVICE env, not a
-    bare shell, or the census silently narrows to a different config/collection
-    -- the cgl_eta_auto_apply.sh runbook lesson already encoded in
-    fused-memory-flag-marker-sweep.sh."""
-    text = WRAPPER.read_text()
-    assert 'CONFIG_PATH' in text
-    assert 'PROJECT_ROOT' in text
-    assert 'uv run' in text, (
-        'the default interpreter prefix must resolve fused_memory.* imports')
+    bare shell, or -- in the wrapper's own words -- "the census silently narrows
+    to a different config and censuses a different collection than the artifacts
+    claim": the cgl_eta_auto_apply.sh runbook lesson already encoded in
+    fused-memory-flag-marker-sweep.sh.
+
+    OBSERVED from inside the invoked census rather than grepped out of the
+    wrapper's text. `CONFIG_PATH`, `PROJECT_ROOT` and `uv run` all appear in the
+    header comment that DESCRIBES this contract, so a source-text check stays
+    green after the real `export` lines are deleted -- it tests the comment, not
+    the code. The expected values are derived from the tmp fake repo, so they
+    can only be right if the exports actually ran.
+    """
+    repo = tmp_path / 'fake-repo'
+    result, calls = _run_wrapper(tmp_path)
+    assert result.returncode == 0, (
+        f'stdout={result.stdout!r} stderr={result.stderr!r}')
+
+    census = next(c for c in calls if c['who'] == 'CENSUS')
+    assert census['env'] == {
+        'CONFIG_PATH': f'{repo}/fused-memory/config/config.yaml',
+        'PROJECT_ROOT': str(repo),
+        # Rooted even though nothing here reaches FalkorDB: the census imports
+        # fused_memory.*, whose config resolution reads it at import time.
+        'FALKORDB_URI': 'redis://localhost:6379',
+    }, census['env']
+    # Both halves are fused-memory maintenance; neither may run bare.
+    stamp = next(c for c in calls if c['who'] == 'STAMP')
+    assert stamp['env'] == census['env'], stamp['env']
+
+
+def test_wrapper_runs_both_halves_under_uv_so_fused_memory_imports_resolve(
+        tmp_path):
+    """The DEFAULT interpreter prefix, exercised for real.
+
+    Every other wrapper test overrides COVERAGE_CENSUS_CMD/RETRO_STAMP_CMD and
+    so never reaches `uv run --frozen --project <FM> python` at all -- while the
+    literal `uv run` appears TWICE in the header comment, leaving a source-text
+    check green with both defaults deleted. Here both seams are UNSET and a fake
+    `uv` records what it was actually asked to run: without the prefix each
+    script would be exec'd bare and its `fused_memory.*` imports would not
+    resolve.
+    """
+    repo = tmp_path / 'fake-repo'
+    result, calls = _run_wrapper(tmp_path, default_prefix=True)
+    assert result.returncode == 0, (
+        f'stdout={result.stdout!r} stderr={result.stderr!r}')
+
+    # One fake `uv` for both halves, so `who` cannot disambiguate: the census is
+    # the first call and the rehearsal the second (ordering pinned elsewhere).
+    assert [c['who'] for c in calls] == ['UV', 'UV'], calls
+    prefix = ['run', '--frozen', '--project', f'{repo}/fused-memory', 'python']
+    expected_scripts = (
+        f'{repo}/fused-memory/scripts/census_memory_metadata.py',
+        f'{repo}/fused-memory/scripts/retro_stamp_topics.py',
+    )
+    for call, script in zip(calls, expected_scripts, strict=True):
+        argv = call['argv']
+        assert argv[:len(prefix)] == prefix, argv
+        # The script is the prefix's first argument, never a bare argv[0].
+        assert argv[len(prefix)] == script, argv
 
 
 # ── the wrapper commits what it regenerates (esc-4006-5) ────────────────────
