@@ -155,6 +155,29 @@ def hook_session_slug(
     )
 
 
+def _bind_claude_session_id(
+    record: session_registry.SessionRecord,
+    hook_input: Mapping[str, Any],
+) -> bool:
+    """Stamp this hook's Claude Code session_id onto an unbound *record*.
+
+    BIND-ONCE: an already-bound record is left untouched, and a hook whose
+    stdin carries no (or a blank) ``session_id`` binds nothing -- the
+    ``'unknown'`` fallback ``hook_session_slug`` uses for slug-building is
+    deliberately NOT a valid binding, since every discriminator-less session
+    would otherwise claim ownership under the same bogus token. Returns
+    whether *record* was mutated, so the caller can fold the stamp into a
+    write it was already making instead of adding one.
+    """
+    if (record.claude_session_id or '').strip():
+        return False
+    hook_session_id = str(hook_input.get('session_id') or '').strip()
+    if not hook_session_id:
+        return False
+    record.claude_session_id = hook_session_id
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Pure OSC-retitle + display-title helpers (PRD §4.6)
 # ---------------------------------------------------------------------------
@@ -419,6 +442,14 @@ def run_session_start(
     -> idle/awaiting-input -> exited onto ONE record. Hand-launched sessions
     (no CLAUDE_SPAWN_SESSION_ID) are unaffected -- they still key on
     session_id exactly as before.
+
+    Ownership binding (task 4193): the first hook event to adopt a slug
+    also stamps its own Claude Code ``session_id`` into
+    ``record.claude_session_id`` (see ``_bind_claude_session_id``), folded
+    into the single ``write_record`` below. The binding is never overwritten
+    afterwards -- bind-once is what makes it a stable discriminator between
+    the session spawn-claude.sh launched and a nested ``claude`` that merely
+    inherited ``CLAUDE_SPAWN_SESSION_ID`` from it.
     """
     identity = resolve_hook_identity(hook_input, env)
     slug = hook_session_slug(hook_input, env)
@@ -450,6 +481,8 @@ def run_session_start(
     display = _resolve_display(env, title)
     if display is not None:
         record.display = display
+    # This path always writes, so the return value is deliberately ignored.
+    _bind_claude_session_id(record, hook_input)
     session_registry.write_record(record, root=root)
     return record
 
