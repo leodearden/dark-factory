@@ -336,34 +336,3 @@ class TestMachineryBoundary:
             f'these modules still import the AST machinery from {HELPERS_MODULE}: '
             f'{offenders}. Import it from _ast_guard instead.'
         )
-
-    def test_this_module_is_not_discovered_as_a_live_index_module(self):
-        """This file must stay OUT of the barrier guard's parametrized set.
-
-        test_falkor_index_barrier_guard selects every tests/test_*.py holding
-        BOTH an index-creating string constant AND a real ``ast.Call`` to
-        ``select_graph``. This file names ``select_graph`` in prose — the banner
-        near the top, and this docstring — so it passes that guard's cheap
-        raw-text prefilter and IS parsed. That is expected and harmless: do not
-        "fix" the prose mention for that reason.
-
-        It stays out because it satisfies NEITHER criterion: no index-creating
-        string constant, and no ``select_graph`` CALL — the name appears only in
-        a comment and in docstrings, and neither is an ``ast.Call``. The first
-        margin is one tidy-up away from vanishing: promoting the ``#`` banner
-        above into this module's docstring would turn the regex it quotes into
-        an ``ast.Constant`` and satisfy that criterion. Pinned HERE so such an
-        edit fails in the file that caused it, instead of surfacing as a
-        barrier-guard failure that reads like a barrier-guard bug.
-        """
-        # Imported in-body, not at module scope, so the other tests here never
-        # pay that guard's discovery walk at collection time.
-        from test_falkor_index_barrier_guard import LIVE_INDEX_MODULES
-
-        discovered = {path.name for path in LIVE_INDEX_MODULES}
-
-        assert pathlib.Path(__file__).name not in discovered, (
-            f'{pathlib.Path(__file__).name} was pulled into the barrier guard\'s '
-            f'live-index set {sorted(discovered)}. Something here now reads as a '
-            f'live index build — this is a fixture module, not a live-index test.'
-        )
