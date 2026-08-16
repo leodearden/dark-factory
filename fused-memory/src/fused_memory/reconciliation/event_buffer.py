@@ -1122,45 +1122,73 @@ class EventBuffer:
         up here captures 100% of events regardless of which drain path
         (``drain`` / ``drain_oldest_chunk`` / ``drain_by_ids``) marked them.
 
-        The rollup runs inside the SAME ``_txn()`` as the DELETE and reuses the
-        SAME WHERE clause.  That is the correctness property: each row is
-        counted exactly once, because it is either still live in
-        ``event_buffer`` (countable directly) or already in the aggregate
-        (countable there), never both and never neither.  In particular the
-        lock exclusion must be honoured by both halves — rolling up a locked
-        project's rows that the DELETE then skips would count them again on
-        the later sweep that does delete them.
+        The rollup runs inside the SAME ``_txn()`` as the DELETE, and takes its
+        rows FROM that delete via ``DELETE ... RETURNING`` (SQLite >= 3.35,
+        already relied on by ``services/durable_queue.py``).  That is the
+        correctness property: each row is counted exactly once, because it is
+        either still live in ``event_buffer`` (countable directly) or in the
+        aggregate (countable there), never both and never neither.  Deriving
+        the aggregated set from the deletion itself — rather than re-evaluating
+        the same predicate in a separate SELECT — is what makes the two halves
+        structurally incapable of disagreeing, and it halves the scan cost of a
+        sweep that runs every 50s against a table that can hold six-figure row
+        counts after a deep backlog drain.  In particular the lock exclusion is
+        honoured by construction: a locked project's rows are not deleted, so
+        they are not returned, so they are not rolled up — they simply roll up
+        on the later sweep that does delete them.
+
+        A row whose timestamp cannot be parsed is still DELETED; it is only
+        left out of the rollup, with a structured warning naming it.  Bucketing
+        raises ``ValueError`` on a malformed timestamp and this transaction is
+        the ONLY path that prunes the buffer, so letting one poison row abort
+        it would wedge cleanup permanently (the caller logs a WARNING and
+        retries every 50s forever) and grow ``event_buffer`` without bound.
+        Losing one row from an inflow aggregate is a rounding error; losing the
+        only pruning path is an outage.
+
+        Returns:
+            The number of rows deleted — counted from the RETURNING output, so
+            it stays exact regardless of how the driver reports ``rowcount``
+            for a returning statement.
         """
         cutoff = datetime.fromtimestamp(
             datetime.now(UTC).timestamp() - max_age_seconds,
             tz=UTC,
         ).isoformat()
-        # Identical predicate for the rollup SELECT and the DELETE.  Keeping it
-        # in one string is what guarantees the two halves cannot drift apart.
-        where_clause = """WHERE status = 'drained'
+        async with self._txn() as db:
+            async with db.execute(
+                """DELETE FROM event_buffer
+                   WHERE status = 'drained'
                      AND timestamp < ?
                      AND project_id NOT IN (
                          SELECT project_id FROM reconciliation_locks
-                     )"""
-        async with self._txn() as db:
-            async with db.execute(
-                f'SELECT project_id, timestamp, event_type FROM event_buffer {where_clause}',
+                     )
+                   RETURNING project_id, timestamp, event_type""",
                 (cutoff,),
             ) as cursor:
-                doomed = await cursor.fetchall()
+                deleted = await cursor.fetchall()
 
             counts: dict[tuple[str, str, str], int] = {}
-            for row in doomed:
+            for row in deleted:
                 # Bucket by PARSING, never by a SQL comparison against a
                 # datetime('now') literal — see throughput's METHOD NOTE:
                 # event_buffer.timestamp carries an offset and is
                 # 'T'-separated, so string-comparing it against SQLite's
                 # space-separated render collapses a whole day into one bucket.
-                key = (
-                    row['project_id'],
-                    utc_hour_bucket(row['timestamp']),
-                    row['event_type'],
-                )
+                try:
+                    bucket = utc_hour_bucket(row['timestamp'])
+                except ValueError as exc:
+                    logger.warning(
+                        'event_buffer.rollup_unparseable_timestamp',
+                        extra={
+                            'project_id': row['project_id'],
+                            'event_type': row['event_type'],
+                            'timestamp': row['timestamp'],
+                            'error': str(exc),
+                        },
+                    )
+                    continue
+                key = (row['project_id'], bucket, row['event_type'])
                 counts[key] = counts.get(key, 0) + 1
 
             if counts:
@@ -1173,12 +1201,7 @@ class EventBuffer:
                     [(pid, bucket, etype, n) for (pid, bucket, etype), n in counts.items()],
                 )
 
-            cursor = await db.execute(
-                f'DELETE FROM event_buffer {where_clause}',
-                (cutoff,),
-            )
-            rowcount = cursor.rowcount
-        return rowcount
+        return len(deleted)
 
     async def request_trigger(self, project_id: str) -> None:
         """Manually request a reconciliation trigger for a project.

@@ -844,6 +844,66 @@ async def test_cleanup_drained_rollup_ignores_still_buffered_rows(tmp_path):
         await buf.close()
 
 
+@pytest.mark.asyncio
+async def test_cleanup_drained_is_not_blockable_by_an_unparseable_timestamp(tmp_path):
+    """One malformed timestamp must not wedge the only pruning path in the codebase.
+
+    The rollup buckets by PARSING, and parsing raises on a malformed value.
+    Because the rollup shares a transaction with the DELETE, an escaping
+    ValueError would roll the whole sweep back — and since the caller
+    (harness._project_loop) only logs a WARNING, cleanup would then fail every
+    50s forever while event_buffer grew without bound.  So: the poison row is
+    deleted like any other and merely omitted from the aggregate, and its
+    well-formed neighbours still roll up.
+    """
+    buf = EventBuffer(db_path=tmp_path / 'rollup_poison.db')
+    await buf.initialize()
+    try:
+        hour = datetime(2026, 7, 25, 13, 30, tzinfo=UTC)
+        await buf.push(_make_event(timestamp=hour, event_type=EventType.memory_added))
+        await buf.push(_make_event(timestamp=hour, event_type=EventType.memory_added))
+        await buf.drain('test-project')
+
+        # Corrupt one drained row's timestamp behind the buffer's back — a
+        # legacy/hand-edited row is the only way this can arise, since push()
+        # always writes .isoformat().
+        db = buf._require_db()
+        async with db.execute(
+            "SELECT id FROM event_buffer WHERE status = 'drained' LIMIT 1"
+        ) as cursor:
+            victim = await cursor.fetchone()
+        assert victim is not None
+        # The value both fails to parse AND sorts below the cutoff, so the
+        # DELETE genuinely reaches it — a poison row the sweep must survive,
+        # not one it silently never touches.
+        await db.execute(
+            'UPDATE event_buffer SET timestamp = ? WHERE id = ?',
+            ('0001-01-01 not a timestamp', victim['id']),
+        )
+        await db.commit()
+
+        deleted = await buf.cleanup_drained(max_age_seconds=0)
+
+        # Both rows are gone — the poison row does not survive the sweep.
+        assert deleted == 2
+        async with db.execute(
+            "SELECT COUNT(*) AS cnt FROM event_buffer WHERE status = 'drained'"
+        ) as cursor:
+            remaining = await cursor.fetchone()
+        assert remaining is not None
+        assert remaining['cnt'] == 0
+
+        # Only the parseable row reached the aggregate.
+        assert await _arrival_rollup(buf) == {
+            ('test-project', '2026-07-25T13', 'memory_added'): 1,
+        }
+
+        # And the path stays usable afterwards rather than wedging.
+        assert await buf.cleanup_drained(max_age_seconds=0) == 0
+    finally:
+        await buf.close()
+
+
 # ── Deferred writes (cycle fence) ────────────────────────────────────
 
 
