@@ -367,6 +367,8 @@ lint_command: "uv run ruff check shared escalation fused-memory orchestrator das
 #       skills/**/*.py and RUNS ruff over them (the deciding fact above).
 #   scripts/tests/test_legibility_inventory.py    — reads
 #       skills/spawn/spawn-claude.sh to cross-check a bash/Python encoder mirror.
+#   tests/scripts/test_find_escalation_port.py    — LOADS AND EXECUTES the real
+#       skills/factory-init/scripts/find_escalation_port.py (task 3705).
 # So the union includes orchestrator/tests/ — the fleet's largest suite —
 # duplicated on every review checkpoint, main-tip sweep and merge full-verify.
 # That is far worse than the single-suite duplication 3485 assumed, and it
