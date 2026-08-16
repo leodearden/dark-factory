@@ -32,6 +32,8 @@ tool-call envelope. Leave it escaped.
 """
 from __future__ import annotations
 
+import contextlib
+
 import pytest
 
 # Bare cross-file import, resolved by conftest's tests/ sys.path insert — the
@@ -189,23 +191,37 @@ class TestTripwireAdmitsCrossPairedCalls:
         )
         assert detect_mispairing(correction, CROSS_PAIRED_RATIONALE) is not None
 
-    async def test_envelope_damage_on_the_same_tool_emits_a_fact(self) -> None:
-        """The control, stated without policy-dependent control flow.
+    @BOTH_POLICIES
+    async def test_envelope_damage_on_the_same_tool_does_fire(self, policy) -> None:
+        """THE CONTROL: the tripwire is live on this tool, it just cannot see THIS.
 
-        Under ``FORWARD_REPAIR`` the call is forwarded rather than raised, so
-        the observable is the FACT, not an exception. Either way the tripwire
-        demonstrably fires on this tool — which is what makes its silence on the
-        cross-paired call a finding rather than an artefact.
+        Without this row, every assertion above would be equally satisfied by a
+        middleware that simply was not guarding ``add_design_decision`` at all,
+        and the whole file would measure nothing.
+
+        Same tool, same harness, same policy — only the damage class differs.
+        An envelope literal in ``rationale`` (the PRD's single largest real
+        victim, 109 corrupted calls in section 2.3) DOES enter the fact stream
+        and DOES stop the write.
+
+        The observable asserted is the FACT, not the exception type. This
+        specimen happens to be classified ``unrepairable``, which raises under
+        BOTH tiers rather than only under ``REJECT_WITH_REPAIR`` — a detail of
+        this one string, not of the policy, so pinning an exception type here
+        would pin the wrong thing.
         """
-        h = build_harness(RepairPolicy.FORWARD_REPAIR)
+        h = build_harness(policy)
         corrupted = (
             CROSS_PAIRED_RATIONALE
             + '\x3c/rationale>\n\x3cparameter name="step_type">impl\x3c/parameter>\n'
         )
+        assert detect(corrupted) is not None, 'guard: the control specimen must be dirty'
 
-        await h.call(
-            'add_design_decision',
-            {'decision': CROSS_PAIRED_DECISION, 'rationale': corrupted},
-        )
+        with contextlib.suppress(Exception):
+            await h.call(
+                'add_design_decision',
+                {'decision': CROSS_PAIRED_DECISION, 'rationale': corrupted},
+            )
 
         assert h.facts, 'the tripwire did not fire on envelope damage on this tool'
+        assert h.recorder.calls == [], 'the corrupted write reached the tool anyway'

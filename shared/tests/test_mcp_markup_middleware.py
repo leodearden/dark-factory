@@ -317,6 +317,25 @@ def build_harness(
         return 'reuse_1'
 
     @mcp.tool
+    def add_design_decision(decision: str, rationale: str) -> str:
+        """``add_design_decision.rationale`` is the PRD's LARGEST single victim.
+
+        109 corrupted calls in PRD section 2.3 — more than any other parameter
+        — so its absence from a harness whose declared purpose is to mirror
+        "the real victim signatures" was a gap regardless of any one task.
+
+        Added by task **3967**, which needs it for a second reason: it is the
+        surface on which SEMANTIC cross-pairing occurs (a ``decision`` and a
+        ``rationale`` that are each clean prose but wrongly associated), and
+        ``tests/test_decision_pairing_containment.py`` drives this tool to
+        measure that the guard ADMITS such a call unmodified under both policy
+        tiers. Do not delete this as unused — that test imports this harness
+        rather than cloning a second one, so the two live in different files.
+        """
+        rec.record('add_design_decision', decision=decision, rationale=rationale)
+        return 'decision_1'
+
+    @mcp.tool
     def scan_memory_content(needle: str) -> str:
         """The exemption case: its whole job is to be handed literal substrings."""
         rec.record('scan_memory_content', needle=needle)
