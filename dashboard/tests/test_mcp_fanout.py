@@ -341,6 +341,97 @@ class TestFanoutFailureNamesTheExceptionType:
         )
 
 
+# ── (c5) per-project-root label discrimination ───────────────────────
+
+
+class TestFanoutLabel:
+    """``fanout_label`` composes the throttle key's per-project-root discriminator.
+
+    The streak key is ``(log_label, url)``, and ONE fused-memory URL serves
+    every project_root — so a fan-out caller parameterized by project_root that
+    passes a fixed literal label collapses every root onto one key. Because
+    ``note_fanout_success`` *pops* that key, a healthy root's success in the
+    same poll cycle clears a broken root's open streak, re-arming the opening
+    WARNING (plus a 'recovered' WARNING) every cycle — the exact sustained
+    flood the transition-only policy exists to prevent.
+    """
+
+    def test_composes_base_and_project_basename(self):
+        from dashboard.data.mcp_fanout import fanout_label
+
+        assert fanout_label('fetch_tasks', '/home/leo/src/dark-factory') == (
+            'fetch_tasks[dark-factory]'
+        ), 'must generalize scheduler.py\'s existing base[label] shape'
+
+    def test_trailing_slash_is_stripped(self):
+        from dashboard.data.mcp_fanout import fanout_label
+
+        assert fanout_label('fetch_tasks', '/a/b/') == 'fetch_tasks[b]', (
+            'a configured root with a trailing slash must not yield an empty label'
+        )
+
+    def test_pathlib_path_yields_the_same_label_as_the_equivalent_str(self):
+        from pathlib import Path
+
+        from dashboard.data.mcp_fanout import fanout_label
+
+        # Callers pass both: metrics passes a Path-derived str, scheduler a Path.
+        assert fanout_label('list_tickets', Path('/a/b')) == fanout_label(
+            'list_tickets', '/a/b'
+        ) == 'list_tickets[b]'
+
+    def test_root_without_a_basename_falls_back_to_the_full_string(self):
+        from dashboard.data.mcp_fanout import fanout_label
+
+        assert fanout_label('fetch_tasks', '/') == 'fetch_tasks[/]', (
+            'a basename-less root must not degrade to a content-free "[]"'
+        )
+
+    def test_distinct_roots_produce_distinct_labels(self):
+        from dashboard.data.mcp_fanout import fanout_label
+
+        # This is the property the throttle key actually depends on.
+        assert fanout_label('fetch_tasks', '/srv/proj-a') != fanout_label(
+            'fetch_tasks', '/srv/proj-b'
+        )
+
+    async def test_distinct_roots_keep_independent_streaks_on_one_url(self, caplog):
+        """End-to-end: the discriminated labels really do decouple the streaks."""
+        from dashboard.data.mcp_fanout import fanout_label
+
+        url = 'http://shared-fused-memory:8765'
+
+        async def failing(_url):
+            raise httpx.ConnectError('refused')
+
+        async def healthy(_url):
+            return 'ok'
+
+        with caplog.at_level(logging.DEBUG, logger='dashboard.data.mcp_fanout'):
+            for _ in range(3):
+                await first_success(
+                    [url], failing,
+                    log_label=fanout_label('fetch_tasks', '/srv/proj-a'),
+                    offline_result=_offline_result,
+                )
+                await first_success(
+                    [url], healthy,
+                    log_label=fanout_label('fetch_tasks', '/srv/proj-b'),
+                    offline_result=_offline_result,
+                )
+
+        warnings = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'dashboard.data.mcp_fanout'
+        ]
+        assert len(warnings) == 1, (
+            f"root B's success must not pop root A's streak, got {warnings}"
+        )
+        assert 'proj-a' in warnings[0], (
+            f'the operator must be able to tell which root is down, got {warnings[0]}'
+        )
+
+
 # ── (d) success path: no invalidation, exactly one call ──────────────
 
 
