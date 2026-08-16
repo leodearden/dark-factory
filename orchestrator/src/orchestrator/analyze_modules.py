@@ -32,7 +32,7 @@ import sqlite3
 import sys
 from collections import defaultdict
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -76,7 +76,14 @@ class ModuleStats:
     skipped_waiting: int = 0
     total_hold_secs: float = 0.0
     hold_samples: int = 0
-    open_acquires: dict[str, float] = field(default_factory=dict)
+
+    #: How many of ``hold_samples`` are right-censored LOWER BOUNDS — spans an
+    #: era boundary or a double-acquire ended rather than a ``lock_released``.
+    #: Counted in the mean (PARKING_MODEL_REPORT.md:102 — "the lock did block
+    #: others until then"), but reported separately: a mean over mostly-censored
+    #: evidence is biased low-to-unknown, and an operator reading `avg_hold_s`
+    #: deserves to know which kind of evidence it rests on.
+    truncated_holds: int = 0
 
     def conflict_rate(self) -> float:
         """Fraction of skips over dispatches — ~0 is idle, >1 is contended."""
@@ -88,6 +95,19 @@ class ModuleStats:
         if self.hold_samples == 0:
             return 0.0
         return self.total_hold_secs / self.hold_samples
+
+    def truncated_fraction(self) -> float:
+        """Share of hold samples whose end was imposed rather than observed.
+
+        Returns 0.0 with no samples, matching :meth:`avg_hold_secs` — this is
+        deliberately NOT ``HoldHistory.truncated_fraction``'s None-refusal.
+        That refusal protects a *predictor* whose caller must not mistake
+        "unknown" for "clean"; here the value is a column in a table, and its
+        siblings on this dataclass already answer 0.0 for the empty case.
+        """
+        if self.hold_samples == 0:
+            return 0.0
+        return self.truncated_holds / self.hold_samples
 
 
 def _iter_events(
@@ -141,17 +161,21 @@ def _iter_events(
         conn.close()
 
 
-def _parse_ts(ts: str) -> float:
-    """Parse an ISO timestamp into POSIX seconds."""
-    return datetime.fromisoformat(ts).timestamp()
-
-
 def aggregate(db_path: Path, since: datetime) -> dict[str, ModuleStats]:
     """Scan ``db_path`` events since ``since`` and return per-module stats."""
     stats: dict[str, ModuleStats] = defaultdict(ModuleStats)
-    for row in _iter_events(db_path, since):
+
+    # Materialized, not streamed: `iter_hold_spans` needs ONE stream in `id`
+    # order and the dispatch/skip counters need the same rows.  A counting
+    # generator would keep it lazy at the cost of making the counters valid
+    # only once the span generator has been fully drained — an invariant with
+    # no local evidence, bought for nothing in an offline CLI.  The window is
+    # bounded by --since (default 7d); the unbounded worst case is the whole
+    # store, ~26k rows on the 136MB production runs.db.
+    rows = list(_iter_events(db_path, since))
+
+    for row in rows:
         event_type = row['event_type']
-        task_id = row['task_id']
         # The module keys are used VERBATIM: the payload already carries them
         # depth-coarsened at the emitting project's own `lock_depth`, which is
         # the exact key `ModuleLockTable._limit_for` and `module_overrides`
@@ -161,21 +185,25 @@ def aggregate(db_path: Path, since: datetime) -> dict[str, ModuleStats]:
         # within one event while preserving order.
         keys = dict.fromkeys(hold_history.modules_of(row))
         if event_type == 'lock_acquired':
-            posix = _parse_ts(row['timestamp'])
             for k in keys:
                 stats[k].dispatches += 1
-                if task_id:
-                    stats[k].open_acquires[task_id] = posix
-        elif event_type == 'lock_released':
-            posix = _parse_ts(row['timestamp'])
-            for k in keys:
-                if task_id and task_id in stats[k].open_acquires:
-                    start = stats[k].open_acquires.pop(task_id)
-                    stats[k].total_hold_secs += max(0.0, posix - start)
-                    stats[k].hold_samples += 1
         elif event_type == 'task_skipped':
             for k in keys:
                 stats[k].skipped_waiting += 1
+
+    # Hold accounting is NOT done here (PRD INV-5): one shared era-boundary
+    # span-closing helper serves both the predictor and this report, so the two
+    # cannot drift on what an acquire, a release or a lost process means.  The
+    # `task_skipped` / `merge_attempt` rows in this list are safe to hand over:
+    # they are not in the helper's interesting set and are skipped before
+    # `run_id` is read, so they cannot fabricate an era boundary.
+    for span in hold_history.iter_hold_spans(rows):
+        entry = stats[span.module]
+        entry.total_hold_secs += span.duration
+        entry.hold_samples += 1
+        if span.truncated:
+            entry.truncated_holds += 1
+
     return dict(stats)
 
 
