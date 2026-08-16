@@ -28,6 +28,7 @@ import digest as mod
 import pytest
 import yaml
 from legibility import inventory as inventory_mod
+from orchestrator.agents.briefing import MEMORY_CONTEXT_CAVEAT
 from shared.cli_invoke import CAP_HIT_RESUME_PROMPT, CRASH_RECOVERY_RESUME_PROMPT
 
 
@@ -1539,6 +1540,16 @@ _TRICKLE_CODER_PREAMBLE = (
 harness-authored preamble."""
 
 
+def _memory_context_block(body='## Project Context\n\n{...}'):
+    """Build the real shape of a LONE '# Context' memory-context block --
+    ``_get_memory_context``'s recalled-sections return path
+    (orchestrator/src/orchestrator/agents/briefing.py) WITHOUT its
+    '## Agent Identity' / '# Task' siblings. This is exactly the shape
+    HARNESS_BRIEFING_HEADINGS' all()-co-occurrence guard admits today:
+    only one of its three headings is present."""
+    return '# Context\n\n' + MEMORY_CONTEXT_CAVEAT.format(project_id='dark_factory') + '\n\n' + body
+
+
 class TestHarnessInjectedTurnFilter:
     def test_briefing_shaped_turn_is_excluded_by_content(self):
         records = [_user_text(_briefing_text())]
@@ -1772,6 +1783,36 @@ class TestHarnessInjectedTurnFilter:
 
         assert len(turns) == 1
         assert turns[0]['text'] == 'we keep hitting a usage limit, can you shorten the run?'
+
+    def test_lone_memory_context_block_is_excluded(self):
+        # LOCKSTEP: built from the imported MEMORY_CONTEXT_CAVEAT constant,
+        # not a restated copy, so a caveat rewording turns this suite red.
+        records = [_user_text(_memory_context_block())]
+
+        assert mod.iter_user_turns(records) == []
+
+    def test_bare_context_heading_over_human_prose_is_not_excluded(self):
+        # Pins that the co-occurrence guard is NOT being weakened by the
+        # new arm: a genuine human turn that merely opens with a
+        # '# Context' heading, with none of the memory-context body
+        # markers, stays in the gold bucket.
+        records = [_user_text('# Context\n\nwe discussed this yesterday; please redo it')]
+
+        turns = mod.iter_user_turns(records)
+
+        assert len(turns) == 1
+
+    def test_caveat_mid_prose_without_heading_is_not_excluded(self):
+        # Pins that the new arm is still a CONJUNCTION with the
+        # line-anchored heading: quoting the caveat mid-prose, with no
+        # '# Context' heading of its own, must not trigger exclusion.
+        records = [_user_text(
+            'Someone pasted this: ' + MEMORY_CONTEXT_CAVEAT.format(project_id='dark_factory')
+        )]
+
+        turns = mod.iter_user_turns(records)
+
+        assert len(turns) == 1
 
 
 class TestRenderDigest:
