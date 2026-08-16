@@ -722,27 +722,57 @@ def build_report(
         A JSON-serialisable dict with ``project_id``, ``db_path``, ``since``,
         ``inflow`` (hourly / daily / composition / total_events), ``drain``
         (the :func:`drain_stats` payload), ``remediation_duty_cycle``,
-        ``sustainable_events_per_day``, ``capacity_verdict`` and
-        ``retention_note``.
+        ``sustainable_events_per_day``, ``capacity_verdict``,
+        ``remediation_free_events_per_day``,
+        ``remediation_free_capacity_verdict`` and ``retention_note``.
 
-        ``sustainable_events_per_day`` and ``capacity_verdict`` are ``None``
-        when the observed data cannot support a claim — no drained events (so
-        no measured per-event rate), or a duty cycle of exactly 1.0 (only
-        remediation runs in the window).  The arithmetic deliberately raises on
-        those inputs rather than inventing a number; the REPORT's job is to say
-        'unknown' instead of propagating that to an operator who merely pointed
-        the tool at a fresh database.
+        TWO capacity figures, each with its own verdict:
+
+        * ``sustainable_events_per_day`` — the OBSERVED status quo, computed
+          from the remediation-inclusive rate.  This stays the headline
+          deliberately: it is what the measured window actually demonstrated,
+          not a projection.
+        * ``remediation_free_events_per_day`` — the post-lever-1 capacity,
+          computed from the remediation-free rate, i.e. what the step-18
+          backlog deferral gate leaves once remediation is off the drain path.
+
+        ``remediation_duty_cycle`` stays in the payload as the explanation of
+        the gap: the two figures differ by exactly ``1/(1 - duty)``.
+
+        Every capacity key is ``None`` when the observed data cannot support a
+        claim — no drained events (so no measured per-event rate), or a duty
+        cycle of exactly 1.0 (only remediation runs in the window).  The
+        arithmetic deliberately raises on those inputs rather than inventing a
+        number; the REPORT's job is to say 'unknown' instead of propagating
+        that to an operator who merely pointed the tool at a fresh database.
     """
     drain = drain_stats(db_path, project_id, since)
     duty = remediation_duty_cycle(drain)
     daily = inflow_daily(db_path, project_id, since)
 
+    # BOTH duty arguments below are 0.0, and that is NOT a bug to 'fix'.
+    # Per the drain_stats two-rates contract, each rate already carries its own
+    # remediation treatment: drain_seconds_per_event has remediation wall-clock
+    # in its numerator (penalty applied once, in the measurement), and
+    # drain_only_seconds_per_event has it excluded entirely (no penalty to
+    # apply — that is the point).  Passing `duty` here would discount a second
+    # time and understate the observed capacity by 1/(1 - duty) ~ 1.78x on the
+    # measured reify window.  The duty cycle's role in this payload is to
+    # EXPLAIN the gap between the two figures, not to scale either of them.
     rate = drain['drain_seconds_per_event']
     sustainable: float | None = None
     verdict: dict[str, Any] | None = None
     if rate is not None and rate > 0 and duty < 1.0:
-        sustainable = sustainable_events_per_day(rate, duty)
+        sustainable = sustainable_events_per_day(rate, 0.0)
         verdict = capacity_verdict(sustainable, OBSERVED_BURST_EVENTS_PER_DAY)
+
+    drain_only_rate = drain['drain_only_seconds_per_event']
+    remediation_free: float | None = None
+    remediation_free_verdict: dict[str, Any] | None = None
+    if drain_only_rate is not None and drain_only_rate > 0:
+        remediation_free = sustainable_events_per_day(drain_only_rate, 0.0)
+        remediation_free_verdict = capacity_verdict(
+            remediation_free, OBSERVED_BURST_EVENTS_PER_DAY)
 
     return {
         'project_id': project_id,
@@ -758,6 +788,8 @@ def build_report(
         'remediation_duty_cycle': duty,
         'sustainable_events_per_day': sustainable,
         'capacity_verdict': verdict,
+        'remediation_free_events_per_day': remediation_free,
+        'remediation_free_capacity_verdict': remediation_free_verdict,
         'retention_note': _retention_note(),
     }
 
@@ -806,6 +838,20 @@ def _format_report(report: dict[str, Any]) -> str:
             f'sustainable vs {verdict["observed_burst_per_day"]:.0f}/day burst '
             f'=> {verdict["verdict"]} '
             f'(headroom {verdict["headroom_ratio"]:.2f}x)'
+        )
+
+    # The post-lever-1 figure gets its own line rather than replacing the
+    # observed one: an operator needs to see what the pipeline demonstrably
+    # sustains AND where removing the remediation preemption takes it.
+    if report['remediation_free_events_per_day'] is None:
+        lines.append('          post-lever-1 (remediation-free): unknown')
+    else:
+        rf_verdict = report['remediation_free_capacity_verdict']
+        lines.append(
+            f'          post-lever-1 (remediation-free): '
+            f'{report["remediation_free_events_per_day"]:.0f} events/day '
+            f'=> {rf_verdict["verdict"]} '
+            f'(headroom {rf_verdict["headroom_ratio"]:.2f}x)'
         )
 
     lines.append('')
