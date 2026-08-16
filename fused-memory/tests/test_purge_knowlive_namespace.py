@@ -959,7 +959,7 @@ class TestRunApplyStoreMutationPreflight:
                 invalidation_time=invalidation_time,
             )
 
-        graph.query.assert_not_called()          # MATCH (n) DETACH DELETE n
+        graph.query.assert_not_awaited()          # MATCH (n) DETACH DELETE n
         memory_service.delete_memory.assert_not_awaited()
         memory_service.update_edge.assert_not_awaited()
 
@@ -982,7 +982,7 @@ class TestRunApplyStoreMutationPreflight:
                 invalidation_time=invalidation_time,
             )
 
-        graph.ro_query.assert_not_called()
+        graph.ro_query.assert_not_awaited()
         memory_service.mem0.count.assert_not_awaited()
         memory_service.mem0.get_all.assert_not_awaited()
 
@@ -1012,7 +1012,7 @@ class TestRunApplyStoreMutationPreflight:
         assert report['mem0']['memory_ids'] == ['m1']
         graph.ro_query.assert_called_once()
         memory_service.mem0.get_all.assert_awaited_once()
-        graph.query.assert_not_called()
+        graph.query.assert_not_awaited()
         memory_service.delete_memory.assert_not_awaited()
         memory_service.update_edge.assert_not_awaited()
 
