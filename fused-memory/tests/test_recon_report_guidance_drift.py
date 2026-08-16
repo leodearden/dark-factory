@@ -193,7 +193,7 @@ class TestReconReportGuidanceFallback:
             f'{[r.message for r in error_records]}'
         )
 
-    def test_self_heals_on_next_call_after_transient_failure(self, monkeypatch):
+    def test_self_heals_on_next_call_after_transient_failure(self, monkeypatch, caplog):
         """A transient failure must not be cached — the next call retries live.
 
         Regression guard for the reviewer's robustness finding: because the
@@ -201,6 +201,16 @@ class TestReconReportGuidanceFallback:
         is, via _cached_recon_report_tool_guidance), a call made after the
         introspection failure clears should get the real generated guidance
         again in the SAME process, not the frozen fallback forever.
+
+        The self-heal property is proven by the fallback branch NOT running on
+        the healed call (no ERROR log containing "falling back"), rather than by
+        the healed text differing from the frozen fallback. The fallback is
+        derived from a frozen signature snapshot through the same renderer as
+        the live guidance, so the two strings are byte-identical whenever the
+        snapshot is in sync with the live signatures — which is the intended
+        steady state, not a bug. That makes `healed != _RECON_REPORT_TOOL_GUIDANCE_FALLBACK`
+        false by construction, so it can no longer discriminate which code path
+        ran — do not restore it.
         """
 
         def _raise():
@@ -212,9 +222,20 @@ class TestReconReportGuidanceFallback:
         assert get_recon_report_tool_guidance() == _RECON_REPORT_TOOL_GUIDANCE_FALLBACK
 
         monkeypatch.undo()
-        healed = get_recon_report_tool_guidance()
+        caplog.clear()
+        with caplog.at_level(logging.ERROR):
+            healed = get_recon_report_tool_guidance()
         assert healed == render_recon_report_tool_guidance()
-        assert healed != _RECON_REPORT_TOOL_GUIDANCE_FALLBACK
+        fallback_error_records = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.ERROR and 'falling back' in r.message
+        ]
+        assert not fallback_error_records, (
+            'healed call must not have taken the fallback branch (expected no '
+            f'"falling back" ERROR log), but got: '
+            f'{[r.message for r in fallback_error_records]}'
+        )
 
     def test_fallback_call_examples_all_carry_run_id(self):
         """Guard the frozen fallback string with the same run_id scan used above.
