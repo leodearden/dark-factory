@@ -2960,6 +2960,39 @@ class HostAllocator:
         """
         self._quarantine.discard(name)
 
+    def readmit(self, name: str) -> None:
+        """Fully re-engage host *name* in the pool: un-quarantine AND un-PARK.
+
+        This is the auto-reprobe re-engagement primitive (task 1795 recovery,
+        task 3043 strand fix).  :meth:`clear_quarantine` alone cannot recover a
+        host whose slot the cancel-fail path PARKed, because
+        :meth:`acquire_remote` additionally requires ``_SLOT_FREE`` — so a
+        recovery that only discards the quarantine can resolve the host's L1 and
+        pop its unavailability-tracker entry while leaving it non-acquirable:
+        unquarantined, untracked AND unusable, invisible to every recovery
+        mechanism until an orchestrator restart.  That is how a host that was
+        down at orchestrator start stays out of the pool indefinitely.
+
+        BUSY carve-out: only a PARKED slot is reset.  A BUSY slot is left BUSY,
+        so re-admission can never steal a verify that is genuinely in flight
+        (cf. the "Known limitation (ABA)" note on :meth:`cancel_and_release`).
+        An unknown name never fabricates a slot entry — the lookup uses
+        ``.get``, never ``[]``/``setdefault`` — and the local host is unaffected
+        because local is never PARKED by the remote cancel-fail path.
+
+        Caller obligation: PARK means "the cancel RPC failed, so a stale verify
+        process may still be running on that host".  Callers must therefore have
+        probed the host clean first — the reprobe sweep gates re-admission on
+        ``health()`` AND ``probe_clean()`` — so that freeing the slot cannot
+        double-dispatch onto a host still churning on a previous merge.
+
+        Idempotent: a repeat call on an already-FREE, unquarantined host is a
+        safe no-op.
+        """
+        self._quarantine.discard(name)
+        if self._slots.get(name) == _SLOT_PARKED:
+            self._slots[name] = _SLOT_FREE
+
     def is_quarantined(self, name: str) -> bool:
         """Return True if host *name* is currently quarantined.
 
@@ -3015,6 +3048,63 @@ class HostAllocator:
             }
             for name, state in self._slots.items()
         ]
+
+    @property
+    def local_name(self) -> str:
+        """Name of the local (trust-anchor) host this allocator was built with.
+
+        The O(1) read for "is this host the local anchor?".  Callers that need
+        only the name must use this rather than scanning :meth:`host_states`
+        for its ``is_local`` flag, which materialises one dict per host on
+        every call (task 3043 amend).  :meth:`host_states` remains the
+        sanctioned read when the *full* per-host block is wanted.
+
+        Pure read of the constructor argument — never None, never mutated
+        after construction.
+        """
+        return self._local_name
+
+    def is_parked(self, name: str) -> bool:
+        """Return True if host *name*'s slot is PARKED (held + non-acquirable).
+
+        Exists because PARKED is a *strand* state no other accessor can cheaply
+        answer for (task 3043).  When :meth:`cancel_and_release` runs against an
+        unreachable host the cancel RPC returns rc != 0 and every
+        ``probe_clean()`` poll fails, so on exhaustion the slot is deliberately
+        left PARKED — the correct fail-closed state, since a stale verify
+        process may still be running there.  But that path writes **only**
+        ``_slots``: the host is NOT added to ``_quarantine``, so
+        :meth:`quarantined_remote_runners` never yields it and the auto-reprobe
+        path cannot even consider it.  ``SpeculativeMergeWorker`` uses this
+        predicate on its release paths to detect exactly that strand and record
+        the host in its unavailability tracker.
+
+        Deliberately consistent with :meth:`host_states`'s
+        ``slot_state == 'parked'`` — both read ``_slots``, and ``_SLOT_WIRE`` is
+        just the wire spelling of the same state.  This is the cheap per-host
+        boolean for the hot path; ``host_states()`` remains the sanctioned
+        list-shaped read for snapshot consumers.
+
+        A name this allocator does not manage returns False rather than raising.
+        """
+        return self._slots.get(name) == _SLOT_PARKED
+
+    def remote_runner(self, name: str) -> Any | None:
+        """Return the runner object declared for remote host *name*, else None.
+
+        Exists because reprobe candidacy is TRACKER-driven (task 3043): the
+        sweep iterates the worker's ``_runner_unavailable`` tracker and must
+        resolve a runner for hosts that are unavailable but **not** in the
+        quarantine set — the escaping-exception and PARKED-strand shapes.
+        :meth:`quarantined_remote_runners` structurally cannot supply those; it
+        filters on quarantine membership by construction.
+
+        Resolution is independent of slot state and of quarantine membership —
+        it is a pure declaration lookup.  Returns None for the local host name
+        (``_remote_runners`` holds only remotes; local is the trust anchor and
+        is never probed for re-admission) and None for an unknown name.
+        """
+        return self._remote_runners.get(name)
 
     def quarantined_remote_runners(self) -> list[tuple[str, Any]]:
         """Return (name, runner) pairs for remote runners currently in quarantine.
