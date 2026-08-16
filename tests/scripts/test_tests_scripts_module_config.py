@@ -74,6 +74,15 @@ def _root_config(monkeypatch: pytest.MonkeyPatch) -> OrchestratorConfig:
     that must be able to fail independently, and this anchor is load-bearing
     enough that it must be visibly present in the file that depends on it.
 
+    THE COST OF THAT, RECORDED RATHER THAN LEFT IMPLICIT (task 3703 amendment
+    pass, reviewer-flagged): this makes THREE verbatim copies of a helper that
+    is pure setup, and the no-cross-import argument — sound for ASSERTIONS —
+    does not reach ``tests/scripts/conftest.py``, which already exists and is
+    pytest's idiomatic home for exactly this. One anchoring implementation as a
+    conftest fixture would leave each guard's assertions just as independent.
+    NOT done here: conftest.py is outside this task's locked module list, so
+    de-triplicating it is filed as a follow-up rather than reached for.
+
     ANCHORING ``ORCH_CONFIG_PATH`` IS LOAD-BEARING, not hygiene.
     ``project_root`` is only a model FIELD and selects nothing:
     ``OrchestratorConfig.settings_customise_sources`` builds its
