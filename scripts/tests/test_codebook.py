@@ -1102,3 +1102,65 @@ def test_live_codebook_is_v2_and_validates_green():
     codebook = mod.load(_LIVE_CODEBOOK_PATH)
     assert codebook["version"] == 2
     assert mod.validate(codebook) == []
+
+
+def test_live_codebook_has_no_pending_twin_of_an_adjudicated_candidate():
+    """Live-file guard against the resurrection that already happened.
+
+    (a) is the resurrection signature: the merger fabricated a *pending* twin
+    for a title the census had already adjudicated (rejected cand-20260722-28
+    came back as pending cand-20260724-2). (b) is the forward guard — already
+    green today — asserted so the invariant is stated whole.
+
+    This is the checkable invariant the merge fix guarantees going forward: a
+    title with an existing pending record takes the `pending_match` branch; a
+    title whose records are all adjudicated takes the conflict branch (sighting
+    appended, disposition untouched, NO new pending); only a genuinely unseen
+    title reaches the create branch. census.py only flips dispositions and
+    never creates candidates, so it can only violate (a) by rejecting one of
+    two same-title pendings — which (b) proves cannot currently arise.
+
+    Deliberately asserted on the pending-vs-adjudicated split rather than on
+    duplicate titles outright: the never-delete contract forbids removing the
+    resurrected record, so the repair can only restore its verdict, not erase
+    it, and a "no duplicate titles" assertion could never go green.
+    """
+    codebook = mod.load(_LIVE_CODEBOOK_PATH)
+
+    by_title = {}
+    for candidate in codebook.get("candidates") or []:
+        by_title.setdefault(candidate.get("title"), []).append(candidate)
+
+    def _describe(title):
+        return "{!r}: {}".format(
+            title,
+            [
+                (c.get("id"), c.get("disposition"), c.get("first_seen"))
+                for c in by_title[title]
+            ],
+        )
+
+    # (a) THE RESURRECTION SIGNATURE — a pending record alongside an
+    #     already-adjudicated one for the byte-identical title.
+    resurrected = [
+        title
+        for title, group in by_title.items()
+        if any(c.get("disposition") == "pending" for c in group)
+        and any(c.get("disposition") in {"rejected", "promoted"} for c in group)
+    ]
+    assert resurrected == [], (
+        "pending candidate(s) coexist with an already-adjudicated candidate of "
+        "the same title — the census verdict was resurrected: "
+        + "; ".join(_describe(t) for t in resurrected)
+    )
+
+    # (b) forward guard — never two pending records for one title.
+    duplicated = [
+        title
+        for title, group in by_title.items()
+        if sum(1 for c in group if c.get("disposition") == "pending") > 1
+    ]
+    assert duplicated == [], (
+        "more than one pending candidate shares a title: "
+        + "; ".join(_describe(t) for t in duplicated)
+    )
