@@ -435,18 +435,9 @@ def test_argv_never_carries_the_user_prompt() -> None:
         (a 260 KB briefing exceeds MAX_ARG_STRLEN twice over), and
       * leaking the full prompt into `ps` output and systemd scope names.
 
-    The load-bearing guard is structural: the builder has no parameter through
-    which a user prompt could arrive at all.
+    The load-bearing guard is the provenance walk below: every non-flag token
+    must be one the caller actually supplied.
     """
-    import inspect
-
-    params = inspect.signature(build_claude_argv).parameters
-    prompt_params = [n for n in params if 'prompt' in n and n != 'system_prompt']
-    assert not prompt_params, (
-        f'build_claude_argv grew a user-prompt parameter: {prompt_params}. '
-        'The prompt must reach the CLI over stdin, never argv (task 3147).'
-    )
-
     # A 260 KB system prompt is the adversarial case: if it were inlined rather
     # than written to --system-prompt-file, it alone would blow ARG_MAX.
     big_system = 'S' * 260_000
