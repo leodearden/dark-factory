@@ -5260,6 +5260,25 @@ _BARE_SHELL_ENTRYPOINTS: tuple[_BareShellEntrypoint, ...] = (
             'writes record.json and the session goes missing from the fleet.'
         ),
     ),
+    _BareShellEntrypoint(
+        name='session_hooks.py (tier-2: bare shell + PYTHONPATH)',
+        path=_SR_PKG_ROOT / 'orchestrator' / 'session_hooks.py',
+        # A THIRD distinct shape: script-by-absolute-path WITH PYTHONPATH. Not
+        # reducible to either row above — the tier-1 row has no PYTHONPATH, and
+        # the tier-2 IMPORT row does not put the script's own directory on
+        # sys.path. This one is exactly what session-start.sh:25 + :29 does.
+        pythonpath=(_SR_PKG_ROOT_ENTRY,),
+        shape=_EntrypointShape.SCRIPT,
+        argv=('--help',),
+        probe='from shared import safe_io',
+        callers=(
+            'skills/spawn/hooks/{session-start,stop,notification,install-hooks}.sh '
+            '— each exports PYTHONPATH="$REPO_ROOT/orchestrator/src" (line 25) and '
+            'then runs session_hooks.py by absolute path (line 29). These fire on '
+            'EVERY session start / stop / notification in every project, including '
+            'hand-launched ones.'
+        ),
+    ),
 )
 
 #: Mutation matrix: ``(entrypoint filename, import injected at module scope)``.
