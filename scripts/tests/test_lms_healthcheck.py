@@ -946,12 +946,38 @@ MEASURED_USED_MIB = 7362
 MEASURED_FREE_MIB = 16761
 
 
+#: The arm's OWN container, as nvidia-smi sees it: arms run as docker
+#: containers and nvidia-smi reports HOST pids, so a containerised vLLM appears
+#: as an ordinary `python` compute app indistinguishable from any other.  That
+#: is why probe-time pollution cannot be judged by the baseline's allowlist.
+ARM_CONSUMER = lms_vram.GpuConsumer(
+    pid=910001, process_name='python', used_mib=MEASURED_USED_MIB - 3312,
+)
+
+#: ollama as measured on this host 2026-08-06, qwen3:14b resident on
+#: keep_alive.  The reading that motivated the pollution guard.
+OLLAMA_CONSUMER = lms_vram.GpuConsumer(
+    pid=905936, process_name='/usr/local/lib/ollama/llama-server', used_mib=10314,
+)
+
+#: whisper-writer, as measured on this host: the ONE compute app PRD D10
+#: requires resident before an arm starts, and the whole of EXPECTED_CONSUMERS.
+WHISPER_CONSUMER = lms_vram.GpuConsumer(
+    pid=7575, process_name='python', used_mib=4050,
+)
+
+
 def _snapshot(
     used_mib=MEASURED_USED_MIB,
     total_mib=MEASURED_TOTAL_MIB,
     free_mib=MEASURED_FREE_MIB,
+    consumers=None,
 ) -> lms_vram.GpuSnapshot:
-    """The measured host reading, as one injected GPU snapshot."""
+    """The measured host reading, as one injected GPU snapshot.
+
+    The default inventory is the arm's own container and nothing else: the
+    clean case, and the one every pre-existing test in this file assumes.
+    """
     return lms_vram.GpuSnapshot(
         identity=lms_vram.GpuIdentity(
             name='NVIDIA GeForce RTX 3090', driver_version='580.159.04',
@@ -959,6 +985,7 @@ def _snapshot(
         reading=lms_vram.GpuReading(
             total_mib=total_mib, used_mib=used_mib, free_mib=free_mib,
         ),
+        consumers=[ARM_CONSUMER] if consumers is None else consumers,
     )
 
 
@@ -970,9 +997,33 @@ BASELINE_FREE_MIB = 20811
 MEASURED_FOOTPRINT_MIB = MEASURED_USED_MIB - BASELINE_USED_MIB
 
 
-def _baseline(used_mib=BASELINE_USED_MIB, free_mib=BASELINE_FREE_MIB):
-    return lms_vram.GpuReading(
-        total_mib=MEASURED_TOTAL_MIB, used_mib=used_mib, free_mib=free_mib,
+#: A fixed stamp, so the fixture describes one specific past moment rather than
+#: drifting with the clock.  Aware UTC for the same reason `measured_at` is.
+BASELINE_MEASURED_AT = _datetime.datetime(
+    2026, 8, 6, 9, 30, tzinfo=_datetime.UTC,
+)
+
+
+def _baseline(
+    used_mib=BASELINE_USED_MIB, free_mib=BASELINE_FREE_MIB, consumers=None,
+    coresident_arms=(),
+) -> lms_vram.GpuBaseline:
+    """The pre-start card, as one RECORD: the reading and the inventory.
+
+    The default inventory is EMPTY, and that is the measured truth rather than
+    a convenience: 3312 MiB of KDE/X11 graphics contexts hold this card at
+    baseline and NONE of them are CUDA compute applications, so
+    `--query-compute-apps` lists nothing at all.  The default fixture is
+    therefore itself an instance of CONSUMER_INVENTORY_NOTE's point -- a
+    non-zero reading beside an empty inventory.
+    """
+    return lms_vram.GpuBaseline(
+        reading=lms_vram.GpuReading(
+            total_mib=MEASURED_TOTAL_MIB, used_mib=used_mib, free_mib=free_mib,
+        ),
+        consumers=[] if consumers is None else consumers,
+        measured_at=BASELINE_MEASURED_AT,
+        coresident_arms=list(coresident_arms),
     )
 
 
@@ -1211,6 +1262,70 @@ def test_an_arm_failure_dominates_a_simultaneous_vram_failure():
     assert lms_healthcheck.exit_code_for(report) == lms_healthcheck.EXIT_ARM_FAILED
 
 
+def _polluted_report(probe=_passing_probe, used_mib=MEASURED_USED_MIB,
+                     free_mib=MEASURED_FREE_MIB):
+    """A run ollama gatecrashed: the numbers exist but mean nothing."""
+    return _report(
+        probe=probe,
+        baseline=_baseline(consumers=[WHISPER_CONSUMER]),
+        snapshot=_snapshot(used_mib=used_mib, free_mib=free_mib,
+                           consumers=[WHISPER_CONSUMER, ARM_CONSUMER,
+                                      OLLAMA_CONSUMER]),
+    )
+
+
+def test_a_polluted_measurement_has_its_own_exit_code():
+    """"Over budget" and "unmeasurable" send an operator in opposite directions.
+
+    EXIT_VRAM_FAILED means the arm is genuinely too big and something should be
+    stopped. A polluted run says nothing about the arm at all -- stopping an arm
+    in response would be acting on a number nobody measured.
+    """
+    report = _polluted_report()
+
+    code = lms_healthcheck.exit_code_for(report)
+
+    assert code == lms_healthcheck.EXIT_VRAM_POLLUTED
+    assert code != lms_healthcheck.EXIT_VRAM_FAILED
+    assert code != lms_healthcheck.EXIT_ARM_FAILED
+    assert code != lms_healthcheck.EXIT_OK
+
+
+def test_a_polluted_measurement_is_never_a_pass():
+    """The block's own verdict may well say PASS -- computed from arithmetic
+    that is void.  The exit code is the only thing a CI caller reads."""
+    report = _polluted_report()
+
+    assert report.vram.verdict == 'PASS'
+    assert lms_healthcheck.exit_code_for(report) != lms_healthcheck.EXIT_OK
+
+
+def test_pollution_outranks_a_plain_budget_failure():
+    """A budget FAIL measured on a contended card is not a budget FAIL.
+
+    Reporting code 3 here would send an operator to shrink an arm that may fit
+    perfectly well once ollama releases the card.
+    """
+    report = _polluted_report(used_mib=24400,
+                              free_mib=MEASURED_TOTAL_MIB - 24400)
+
+    assert report.vram.verdict == 'FAIL'
+    assert lms_healthcheck.exit_code_for(report) == (
+        lms_healthcheck.EXIT_VRAM_POLLUTED
+    )
+
+
+def test_an_arm_failure_still_dominates_a_polluted_measurement():
+    """Unchanged precedence, for the reason already documented: an arm that
+    answered WRONGLY is the more actionable finding, and pollution cannot
+    explain a wrong answer -- it only voids the VRAM arithmetic, which is right
+    there in the artifact either way."""
+    report = _polluted_report(probe=_failing_probe)
+
+    assert report.vram.pollution == lms_vram.PollutionState.POLLUTED
+    assert lms_healthcheck.exit_code_for(report) == lms_healthcheck.EXIT_ARM_FAILED
+
+
 # ---------------------------------------------------------------------------
 # Table rendering
 # ---------------------------------------------------------------------------
@@ -1271,6 +1386,92 @@ def test_the_table_shows_both_vram_figures():
     assert str(lms_vram.MEASURED_OPERATING_BUDGET_GIB) in table
 
 
+def test_the_table_lists_who_else_held_the_card_at_each_reading():
+    """The operator reading the terminal must see what the JSON carries.
+
+    Otherwise the inventory is present in the artifact and absent from the only
+    output a human actually looks at, and "check nvidia-smi first" stays an
+    unwritten discipline that eta/theta/iota have no way to inherit.
+    """
+    table = lms_healthcheck.render_table(_report(
+        baseline=_baseline(consumers=[WHISPER_CONSUMER]),
+        snapshot=_snapshot(consumers=[WHISPER_CONSUMER, ARM_CONSUMER]),
+    ))
+
+    # Two SECTIONS, not one merged list: whisper-writer held the card at both
+    # readings and so appears twice, the arm only at the probe.  A structural
+    # count rather than a prose match -- `'baseline' in table` was already true
+    # before this section existed, from the footprint line's "7362 used - 3312
+    # baseline".
+    assert table.count(str(WHISPER_CONSUMER.pid)) == 2
+    assert table.count(str(ARM_CONSUMER.pid)) == 1
+    for consumer in (WHISPER_CONSUMER, ARM_CONSUMER):
+        assert consumer.process_name in table
+        assert str(consumer.pid) in table
+        assert str(consumer.used_mib) in table
+
+
+def test_the_table_shows_an_empty_inventory_as_a_measured_fact():
+    """`(none)` and not a blank line.
+
+    A silently absent section is indistinguishable from a section this build
+    does not render -- and an empty compute-app list beside a 3312 MiB baseline
+    is a real, explainable reading, not a missing one.
+    """
+    table = lms_healthcheck.render_table(_report(
+        baseline=_baseline(consumers=[]),
+        snapshot=_snapshot(consumers=[ARM_CONSUMER]),
+    ))
+
+    assert '(none)' in table
+
+
+def test_the_table_banners_a_polluted_run_and_names_the_intruder():
+    """The loudest thing in the output, because it is the only thing that
+    matters: every VRAM number above it is void."""
+    table = lms_healthcheck.render_table(_polluted_report())
+
+    assert 'POLLUTED' in table
+    assert OLLAMA_CONSUMER.process_name in table
+    assert str(OLLAMA_CONSUMER.pid) in table
+
+
+def test_a_clean_run_shows_no_pollution_banner():
+    """The banner must mean something.  Printed on every run it would be
+    ignored on the one run it matters."""
+    table = lms_healthcheck.render_table(_report())
+
+    assert 'POLLUTED' not in table
+
+
+def test_the_table_follows_the_report_when_the_pollution_state_changes():
+    """The anti-drift property, extended to the new field.
+
+    `render_table` takes the report and nothing else, so editing the STRUCTURE
+    must move the text -- proving the banner is rendered from the block and not
+    recomputed from the consumer lists beside it.
+    """
+    report = _report()
+    assert 'POLLUTED' not in lms_healthcheck.render_table(report)
+
+    flipped = report.model_copy(
+        update={
+            'vram': report.vram.model_copy(
+                update={
+                    'pollution': lms_vram.PollutionState.POLLUTED,
+                    'pollution_reason': 'pid 4242 /usr/local/lib/ollama/'
+                                        'llama-server arrived mid-run',
+                }
+            )
+        }
+    )
+
+    table = lms_healthcheck.render_table(flipped)
+
+    assert 'POLLUTED' in table
+    assert '4242' in table
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1292,7 +1493,10 @@ def cli_env(monkeypatch, tmp_path):
 
     monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path / 'baselines'))
     for arm_id in lms_manifest.load_arms().arm_ids():
-        lms_vram.record_baseline(arm_id, _baseline())
+        record = _baseline()
+        lms_vram.record_baseline(
+            arm_id, record.reading, consumers=record.consumers,
+        )
     monkeypatch.setattr(lms_vram, 'probe_gpu_snapshot', lambda *a, **k: _snapshot())
     monkeypatch.setattr(lms_healthcheck, 'probe_arm', probe)
     monkeypatch.setattr(lms_ctl, 'active_arms', lambda: set())
@@ -1420,6 +1624,96 @@ def test_cli_reports_a_broken_gpu_probe_and_writes_no_artifact(cli_env, monkeypa
     assert not out_path.exists()
 
 
+def test_cli_refuses_a_polluted_baseline_and_writes_no_artifact(
+    cli_env, tmp_path, capsys,
+):
+    """The baseline on disk was taken while ollama held 10314 MiB.
+
+    `lms_ctl.start` refuses to write such a file, so this one predates the
+    guard or was written by hand -- and either way its number is what every
+    footprint gets subtracted from. No artifact is written even though
+    `--output` was passed: a file on disk would later read as "the slate was
+    checked", which is the same reasoning as the merge and no-active-arms paths.
+    """
+    path = lms_vram.baseline_path('qwen3.5-9b')
+    payload = json.loads(path.read_text())
+    payload['consumers'] = [OLLAMA_CONSUMER.model_dump(mode='json')]
+    path.write_text(json.dumps(payload))
+    out_path = tmp_path / 'health-report.json'
+
+    code = lms_healthcheck.main(['--arm', 'qwen3.5-9b', '--output', str(out_path)])
+
+    assert code == lms_healthcheck.EXIT_VRAM_POLLUTED
+    # PollutedBaselineError SUBCLASSES VramProbeError, so a handler written in
+    # the obvious order would swallow it into EXIT_PROBE_ERROR and report
+    # "nvidia-smi is broken" for a perfectly healthy GPU.
+    assert code != lms_healthcheck.EXIT_PROBE_ERROR
+    err = capsys.readouterr().err
+    assert str(OLLAMA_CONSUMER.pid) in err
+    assert OLLAMA_CONSUMER.process_name in err
+    assert not out_path.exists()
+
+
+def test_cli_reports_probe_time_pollution_but_still_writes_the_artifact(
+    cli_env, monkeypatch, tmp_path,
+):
+    """The other pollution route, and it is NOT a refusal.
+
+    A baseline that was clean when taken and a card that got crowded afterwards
+    still produced an honest record of what was seen -- so the artifact is
+    written, carrying the POLLUTED state, and the refusal is in the exit code.
+    Suppressing it would destroy the only evidence that ollama was there.
+    """
+    monkeypatch.setattr(
+        lms_vram, 'probe_gpu_snapshot',
+        lambda *a, **k: _snapshot(consumers=[ARM_CONSUMER, OLLAMA_CONSUMER]),
+    )
+    out_path = tmp_path / 'health-report.json'
+
+    code = lms_healthcheck.main(['--arm', 'qwen3.5-9b', '--output', str(out_path)])
+
+    assert code == lms_healthcheck.EXIT_VRAM_POLLUTED
+    written = json.loads(out_path.read_text())
+    assert written['vram']['pollution'] == 'POLLUTED'
+    assert str(OLLAMA_CONSUMER.pid) in written['vram']['pollution_reason']
+
+
+@pytest.mark.parametrize('mutate', ['delete', 'strip_consumers'])
+def test_cli_sends_a_stale_baseline_to_lms_ctl_not_to_nvidia_smi(
+    cli_env, tmp_path, capsys, mutate,
+):
+    """A baseline that is absent, or predates the inventory, is NOT a probe
+    failure.
+
+    Both spellings of "nothing usable was recorded" used to raise a plain
+    VramProbeError and land in the generic branch, printed as "GPU probe
+    failed" -- the operator-misdirection class exit 7 exists to end.  The
+    stripped-consumers case is not exotic: it is what every operator with a
+    pre-guard baseline still in $XDG_RUNTIME_DIR from this boot meets the first
+    time they run this after the guard lands, and the fix is `lms_ctl start`.
+    """
+    path = lms_vram.baseline_path('qwen3.5-9b')
+    if mutate == 'delete':
+        path.unlink()
+    else:
+        payload = json.loads(path.read_text())
+        del payload['consumers']
+        path.write_text(json.dumps(payload))
+    out_path = tmp_path / 'health-report.json'
+
+    code = lms_healthcheck.main(['--arm', 'qwen3.5-9b', '--output', str(out_path)])
+
+    assert code == lms_healthcheck.EXIT_STALE_BASELINE
+    assert code != lms_healthcheck.EXIT_PROBE_ERROR
+    err = capsys.readouterr().err
+    # The two things an operator needs: WHICH file, and WHAT to run.
+    assert 'lms_ctl start qwen3.5-9b' in err
+    assert 'GPU probe failed' not in err
+    if mutate == 'strip_consumers':
+        assert str(path) in err
+    assert not out_path.exists()
+
+
 def test_every_cli_exit_code_is_distinct():
     codes = [
         lms_healthcheck.EXIT_OK,
@@ -1428,6 +1722,9 @@ def test_every_cli_exit_code_is_distinct():
         lms_healthcheck.EXIT_VRAM_FAILED,
         lms_healthcheck.EXIT_PROBE_ERROR,
         lms_healthcheck.EXIT_NO_ACTIVE_ARMS,
+        lms_healthcheck.EXIT_MERGE_ERROR,
+        lms_healthcheck.EXIT_VRAM_POLLUTED,
+        lms_healthcheck.EXIT_STALE_BASELINE,
     ]
 
     assert len(set(codes)) == len(codes)
@@ -1502,6 +1799,233 @@ def test_the_table_shows_the_arm_footprint_and_the_budget_it_was_judged_against(
 
 
 # ---------------------------------------------------------------------------
+# Who ELSE held the card (task 3755)
+#
+# `used - baseline` is only the arm's footprint if nothing else moved on the
+# card between the two readings.  Nothing in the v4 artifact recorded whether
+# that held, so a run with ollama resident produced numbers indistinguishable
+# from a clean one.  These tests pin the evidence into the block.
+# ---------------------------------------------------------------------------
+
+
+def test_the_vram_block_lists_the_consumers_seen_at_each_reading():
+    """Both inventories, not just one.
+
+    A single "who is on the card now" list cannot answer the question that
+    matters -- whether the SAME processes were there before -- and the drift
+    between the two readings is the whole pollution signal.
+    """
+    report = _report(
+        baseline=_baseline(consumers=[WHISPER_CONSUMER]),
+        snapshot=_snapshot(consumers=[WHISPER_CONSUMER, ARM_CONSUMER]),
+    )
+
+    assert report.vram.baseline_consumers == [WHISPER_CONSUMER]
+    assert report.vram.probe_consumers == [WHISPER_CONSUMER, ARM_CONSUMER]
+
+
+def test_the_vram_block_labels_the_inventory_as_not_an_accounting():
+    """The list does NOT sum to memory.used, and the artifact has to say so.
+
+    `--query-compute-apps` omits every graphics context, which is exactly why
+    this host's operating budget is ~16.4 GiB and not 19.5.  A reader who added
+    the entries up and found a shortfall would conclude the reading was wrong.
+    """
+    note = _report().vram.consumer_inventory_note
+
+    assert note == lms_vram.CONSUMER_INVENTORY_NOTE
+
+
+def test_the_default_fixture_shows_why_the_inventory_is_not_an_accounting():
+    """The clean baseline holds 3312 MiB with ZERO compute apps listed.
+
+    Not an artefact of the fixture: those are KDE/X11 graphics contexts, which
+    `--query-compute-apps` cannot see.  If an empty inventory were ever read as
+    "the card was empty", this is the reading that would prove it wrong.
+    """
+    vram = _report().vram
+
+    assert vram.baseline_consumers == []
+    assert vram.baseline_mib == BASELINE_USED_MIB > 0
+
+
+def test_a_clean_run_is_recorded_as_clean_with_no_reason():
+    """The arm's own container is a NEW consumer at probe time and that is
+    normal: arms are docker containers and nvidia-smi reports host pids, so a
+    containerised vLLM is just another `python`.  Marking that POLLUTED would
+    fail every healthy run."""
+    report = _report(
+        baseline=_baseline(consumers=[WHISPER_CONSUMER]),
+        snapshot=_snapshot(consumers=[WHISPER_CONSUMER, ARM_CONSUMER]),
+    )
+
+    assert report.vram.pollution == lms_vram.PollutionState.CLEAN
+    assert report.vram.pollution_reason == ''
+    assert report.vram.verdict == 'PASS'
+
+
+def test_an_ollama_newcomer_at_probe_time_marks_the_block_polluted():
+    """The exact measured hazard: ollama holding qwen3:14b on keep_alive.
+
+    Its 10314 MiB lands inside the probe reading and is charged straight to the
+    arm by `used - baseline`.  The block has to say so, and has to name the
+    process an operator would have to deal with.
+    """
+    report = _report(
+        baseline=_baseline(consumers=[WHISPER_CONSUMER]),
+        snapshot=_snapshot(consumers=[WHISPER_CONSUMER, ARM_CONSUMER,
+                                      OLLAMA_CONSUMER]),
+    )
+
+    assert report.vram.pollution == lms_vram.PollutionState.POLLUTED
+    reason = report.vram.pollution_reason
+    assert str(OLLAMA_CONSUMER.pid) in reason
+    assert OLLAMA_CONSUMER.process_name in reason
+    assert str(OLLAMA_CONSUMER.used_mib) in reason
+    # And the evidence is still in the block, not only in the prose.
+    assert OLLAMA_CONSUMER in report.vram.probe_consumers
+    assert OLLAMA_CONSUMER not in report.vram.baseline_consumers
+
+
+def test_a_baseline_consumer_that_shrank_is_polluted_in_the_report_too():
+    """The FLATTERING direction, end to end.
+
+    whisper-writer releasing the card mid-run leaves `used - baseline` smaller
+    than the arm truly took.  That is the direction a fabricated artifact wants,
+    so it must not reach the report as a clean PASS.
+    """
+    shrunk = lms_vram.GpuConsumer(
+        pid=WHISPER_CONSUMER.pid, process_name=WHISPER_CONSUMER.process_name,
+        used_mib=100,
+    )
+    report = _report(
+        baseline=_baseline(consumers=[WHISPER_CONSUMER]),
+        snapshot=_snapshot(consumers=[shrunk, ARM_CONSUMER]),
+    )
+
+    assert report.vram.pollution == lms_vram.PollutionState.POLLUTED
+
+
+def test_this_producer_never_emits_the_unmeasured_sentinel():
+    """The defaults exist ONLY so a pre-v5 artifact still parses.
+
+    A report this code writes always looked, so it must never carry the value
+    that means "nobody looked" -- otherwise UNMEASURED becomes indistinguishable
+    from a real measurement and the sentinel is worthless.
+    """
+    clean = _report(baseline=_baseline(consumers=[WHISPER_CONSUMER]),
+                    snapshot=_snapshot(consumers=[WHISPER_CONSUMER,
+                                                  ARM_CONSUMER]))
+    polluted = _report(baseline=_baseline(consumers=[WHISPER_CONSUMER]),
+                       snapshot=_snapshot(consumers=[WHISPER_CONSUMER,
+                                                     OLLAMA_CONSUMER]))
+
+    for report in (clean, polluted):
+        assert report.vram.pollution != lms_vram.PollutionState.UNMEASURED
+        assert report.vram.consumer_inventory_note != ''
+
+    # The sentinel does exist, though -- that is what lets a v4 artifact parse.
+    assert lms_vram.PollutionState.UNMEASURED == 'UNMEASURED'
+
+
+def test_the_report_schema_version_records_the_added_evidence():
+    """v5.  A v4 file read by a v5-aware consumer would show a `pollution` it
+    never measured, which is precisely the misreading this constant exists to
+    prevent."""
+    assert lms_healthcheck.REPORT_SCHEMA_VERSION == 5
+    assert _report().schema_version == 5
+
+
+def test_a_polluted_recorded_baseline_produces_no_report_at_all():
+    """Same stance as a dead GPU probe and a missing baseline.
+
+    A baseline taken while ollama held 10314 MiB has that memory built into the
+    number every footprint is measured against.  Swallowing it would emit a
+    report whose arithmetic is void but whose shape is indistinguishable from a
+    good one -- so it propagates instead.
+    """
+    with pytest.raises(lms_vram.PollutedBaselineError,
+                       match=str(OLLAMA_CONSUMER.pid)):
+        lms_healthcheck.run_healthcheck(
+            [_arm()],
+            gpu_probe=lambda: _snapshot(),
+            probe=_passing_probe,
+            baseline=_baseline(consumers=[WHISPER_CONSUMER, OLLAMA_CONSUMER]),
+        )
+
+
+def test_a_vanished_baseline_consumer_reports_pollution_not_a_broken_probe():
+    """whisper-writer exits mid-run and the arm takes less than it released, so
+    `used` lands BELOW `baseline`.
+
+    `evaluate_budget` raises for that reading, and evaluated first it reached
+    the CLI's generic branch as "the GPU probe failed" (exit 4) -- blaming
+    nvidia-smi for a probe that worked perfectly on a card that was polluted
+    (exit 7). The shrink diagnosis was already computed and never printed.
+    """
+    baseline = _baseline(used_mib=7362, consumers=[WHISPER_CONSUMER])
+    # whisper gone; the arm holds 3000 MiB, so used < baseline.
+    after = _snapshot(
+        used_mib=6312, free_mib=MEASURED_TOTAL_MIB - 6312,
+        consumers=[lms_vram.GpuConsumer(
+            pid=41001, process_name='python', used_mib=3000,
+        )],
+    )
+
+    with pytest.raises(lms_vram.PollutedMeasurementError) as excinfo:
+        lms_healthcheck.run_healthcheck(
+            [_arm()], gpu_probe=lambda: after,
+            probe=_passing_probe, baseline=baseline,
+        )
+
+    message = str(excinfo.value)
+    # The operator must be told the card moved, not that the tool is broken.
+    assert str(WHISPER_CONSUMER.pid) in message
+    assert 'GPU probe' not in message or 'probe itself is fine' in message
+    assert not isinstance(excinfo.value, lms_vram.PollutedBaselineError)
+    # Still a VramProbeError, so no pre-existing handler can let it escape.
+    assert isinstance(excinfo.value, lms_vram.VramProbeError)
+
+
+def test_a_baseline_recorded_with_a_declared_coresident_arm_still_reports():
+    """`lms_ctl start --no-exclusive` legitimately records another arm's
+    container in the inventory.  Re-applying the STRICT rule at report time
+    would refuse to report on a run that was never polluted -- and the flag
+    would be unusable end to end even once `start` accepted it."""
+    arm_container = lms_vram.GpuConsumer(
+        pid=41001, process_name='python', used_mib=9000,
+    )
+
+    report = lms_healthcheck.run_healthcheck(
+        [_arm()],
+        gpu_probe=lambda: _snapshot(),
+        probe=_passing_probe,
+        baseline=_baseline(
+            consumers=[WHISPER_CONSUMER, arm_container],
+            coresident_arms=['phi-4-14b'],
+        ),
+    )
+
+    # Recorded, not silently dropped: the inventory is the audit trail that
+    # pays for the relaxation.
+    assert arm_container in report.vram.baseline_consumers
+
+
+def test_a_declared_coresident_arm_does_not_excuse_ollama_at_report_time():
+    with pytest.raises(lms_vram.PollutedBaselineError,
+                       match=str(OLLAMA_CONSUMER.pid)):
+        lms_healthcheck.run_healthcheck(
+            [_arm()],
+            gpu_probe=lambda: _snapshot(),
+            probe=_passing_probe,
+            baseline=_baseline(
+                consumers=[WHISPER_CONSUMER, OLLAMA_CONSUMER],
+                coresident_arms=['phi-4-14b'],
+            ),
+        )
+
+
+# ---------------------------------------------------------------------------
 # merge_reports — the slate is measured one arm at a time
 # ---------------------------------------------------------------------------
 
@@ -1535,6 +2059,7 @@ def test_merging_refuses_reports_from_different_gpus():
     other_card = lms_vram.GpuSnapshot(
         identity=lms_vram.GpuIdentity(name='NVIDIA A100', driver_version='999'),
         reading=_snapshot().reading,
+        consumers=_snapshot().consumers,
     )
     second = _single(_arm(arm_id='phi-4-14b', served_model_name='phi-4-14b',
                           port=8412), snapshot=other_card)
@@ -1586,6 +2111,228 @@ def test_a_failing_arm_row_survives_the_merge():
 
     assert merged.overall == 'FAIL'
     assert lms_healthcheck.exit_code_for(merged) == lms_healthcheck.EXIT_ARM_FAILED
+
+
+# --- pollution must survive the merge (task 3755) --------------------------
+#
+# The slate is measured one arm at a time over ~39 minutes, so the ONLY place
+# an operator meets the pollution evidence is the merged artifact.  Binding
+# selection was `failing[0] if any FAIL else max(arm_footprint_mib)` and
+# pollution was not part of it, so a POLLUTED run that lost the footprint
+# contest was silently laundered into a clean slate.
+
+
+#: 8312 used against the 3312 MiB baseline: a 5000 MiB footprint.
+SMALL_USED_MIB = 8312
+#: 12312 used: a 9000 MiB footprint, still well inside the 20811 MiB budget,
+#: so BOTH sizes below are budget PASSes and only the footprint differs.
+LARGE_USED_MIB = 12312
+
+
+def _clean_single(arm, used_mib=MEASURED_USED_MIB):
+    """One arm's run on a card nobody else touched."""
+    return _single(
+        arm,
+        baseline=_baseline(consumers=[WHISPER_CONSUMER]),
+        snapshot=_snapshot(
+            used_mib=used_mib, free_mib=MEASURED_TOTAL_MIB - used_mib,
+            consumers=[WHISPER_CONSUMER, ARM_CONSUMER],
+        ),
+    )
+
+
+def _polluted_single(arm, used_mib=MEASURED_USED_MIB):
+    """One arm's run that ollama gatecrashed: the numbers exist, and mean
+    nothing.  The measured 2026-08-06 scenario, one arm at a time."""
+    return _single(
+        arm,
+        baseline=_baseline(consumers=[WHISPER_CONSUMER]),
+        snapshot=_snapshot(
+            used_mib=used_mib, free_mib=MEASURED_TOTAL_MIB - used_mib,
+            consumers=[WHISPER_CONSUMER, ARM_CONSUMER, OLLAMA_CONSUMER],
+        ),
+    )
+
+
+def _other_arm(arm_id='phi-4-14b', port=8412):
+    return _arm(arm_id=arm_id, served_model_name=arm_id, port=port)
+
+
+def _assert_names_the_intruder(text):
+    assert str(OLLAMA_CONSUMER.pid) in text
+    assert OLLAMA_CONSUMER.process_name in text
+    assert str(OLLAMA_CONSUMER.used_mib) in text
+
+
+@pytest.mark.parametrize(
+    'build', [_clean_single, _polluted_single], ids=['clean', 'polluted'],
+)
+def test_merging_one_report_carries_its_pollution_through_unchanged(build):
+    """THE CLASS-KILLING INVARIANT: a one-report merge is a no-op.
+
+    Any binding rule that can drop, invent or rewrite pollution shows up here
+    first, whatever the arithmetic of the multi-report cases happens to be.
+    """
+    single = build(_arm())
+
+    merged = lms_healthcheck.merge_reports([single])
+
+    assert merged.vram.pollution == single.vram.pollution
+    assert merged.vram.pollution_reason == single.vram.pollution_reason
+    assert (
+        lms_healthcheck.exit_code_for(merged)
+        == lms_healthcheck.exit_code_for(single)
+    )
+
+
+def test_a_polluted_run_survives_a_merge_it_loses_on_footprint():
+    """The flattering direction, and the one the old rule dropped.
+
+    A polluted arm that took LESS than a clean one loses the largest-footprint
+    contest, so its evidence left the artifact entirely: exit 0, no banner, and
+    a slate that reads as measured on an empty card.
+    """
+    polluted = _polluted_single(_arm(), used_mib=SMALL_USED_MIB)
+    clean = _clean_single(_other_arm(), used_mib=LARGE_USED_MIB)
+    assert polluted.vram.arm_footprint_mib < clean.vram.arm_footprint_mib
+
+    merged = lms_healthcheck.merge_reports([polluted, clean])
+
+    assert merged.vram.pollution == lms_vram.PollutionState.POLLUTED
+    _assert_names_the_intruder(merged.vram.pollution_reason)
+    assert 'qwen3.5-9b' in merged.vram.pollution_reason
+    assert (
+        lms_healthcheck.exit_code_for(merged)
+        == lms_healthcheck.EXIT_VRAM_POLLUTED
+    )
+    assert 'POLLUTED' in lms_healthcheck.render_table(merged)
+    # `overall` is what the ARMS earned, exactly as in the single-report case.
+    assert merged.overall == 'PASS'
+
+
+def test_a_polluted_run_survives_a_merge_it_wins_on_footprint():
+    """The growth direction passes today only by luck -- the polluted arm
+    happens to win the footprint contest.  Pinned so it cannot regress."""
+    polluted = _polluted_single(_arm(), used_mib=LARGE_USED_MIB)
+    clean = _clean_single(_other_arm(), used_mib=SMALL_USED_MIB)
+    assert polluted.vram.arm_footprint_mib > clean.vram.arm_footprint_mib
+
+    merged = lms_healthcheck.merge_reports([polluted, clean])
+
+    assert merged.vram.pollution == lms_vram.PollutionState.POLLUTED
+    _assert_names_the_intruder(merged.vram.pollution_reason)
+    assert 'qwen3.5-9b' in merged.vram.pollution_reason
+    assert (
+        lms_healthcheck.exit_code_for(merged)
+        == lms_healthcheck.EXIT_VRAM_POLLUTED
+    )
+    assert 'POLLUTED' in lms_healthcheck.render_table(merged)
+
+
+def test_a_failing_budget_still_outranks_pollution_for_the_binding_block():
+    """Binding precedence is failing > polluted > largest footprint.
+
+    Failing stays FIRST because `overall` is computed from the surviving
+    block: promoting a POLLUTED-but-PASS block over a budget FAIL would flip a
+    failing slate green.  Pollution still propagates alongside it.
+    """
+    over = _single(_arm(), snapshot=_over_budget_snapshot())
+    polluted = _polluted_single(_other_arm(), used_mib=SMALL_USED_MIB)
+
+    merged = lms_healthcheck.merge_reports([over, polluted])
+
+    assert merged.vram.verdict == 'FAIL'
+    assert merged.overall == 'FAIL'
+    assert merged.vram.pollution == lms_vram.PollutionState.POLLUTED
+    assert 'phi-4-14b' in merged.vram.pollution_reason
+    assert (
+        lms_healthcheck.exit_code_for(merged)
+        == lms_healthcheck.EXIT_VRAM_POLLUTED
+    )
+
+
+def test_with_nothing_failing_the_polluted_block_binds_over_a_bigger_footprint():
+    """The surviving block is ONE input's real measurement, so which input it
+    is decides whose consumer lists an operator gets to see.  On a contended
+    card the largest footprint is the least meaningful number in the file."""
+    polluted = _polluted_single(_arm(), used_mib=SMALL_USED_MIB)
+    clean = _clean_single(_other_arm(), used_mib=LARGE_USED_MIB)
+
+    merged = lms_healthcheck.merge_reports([clean, polluted])
+
+    assert merged.vram.arm_footprint_mib == polluted.vram.arm_footprint_mib
+    assert OLLAMA_CONSUMER in merged.vram.probe_consumers
+
+
+def test_two_polluted_runs_union_into_one_reason_naming_both_arms():
+    """The merged block belongs to ONE arm, so the reason is the only place the
+    others' pollution can be recorded at all."""
+    first = _polluted_single(_arm())
+    second = _polluted_single(_other_arm(), used_mib=SMALL_USED_MIB)
+
+    merged = lms_healthcheck.merge_reports([first, second])
+
+    assert merged.vram.pollution == lms_vram.PollutionState.POLLUTED
+    assert 'qwen3.5-9b' in merged.vram.pollution_reason
+    assert 'phi-4-14b' in merged.vram.pollution_reason
+    assert (
+        lms_healthcheck.exit_code_for(merged)
+        == lms_healthcheck.EXIT_VRAM_POLLUTED
+    )
+
+
+def _never_looked(report):
+    """A pre-v5 report as `--merge` reads it back off disk.
+
+    The five consumer fields are absent from the payload, so they default --
+    and `pollution` defaults to UNMEASURED precisely so this state is legible.
+    This producer never emits it; reading an old file is the only way in.
+    """
+    return report.model_copy(update={
+        'vram': report.vram.model_copy(update={
+            'baseline_consumers': [],
+            'probe_consumers': [],
+            'consumer_inventory_note': '',
+            'pollution': lms_vram.PollutionState.UNMEASURED,
+            'pollution_reason': '',
+        }),
+    })
+
+
+def test_merging_refuses_a_report_that_never_looked_at_the_card():
+    """UNMEASURED is not a measurement, so it cannot be unioned into one.
+
+    A v5-shaped slate assembled partly from runs that never looked genuinely IS
+    an assembly defect, which is what EXIT_MERGE_ERROR already means -- and
+    refusing avoids inventing an eighth exit code for a state the producer
+    cannot emit.  POLLUTED propagates instead, because it IS a measurement.
+    """
+    blind = _never_looked(_single(_arm()))
+
+    with pytest.raises(lms_healthcheck.ReportMergeError, match='qwen3.5-9b'):
+        lms_healthcheck.merge_reports([blind, _single(_other_arm())])
+
+
+def test_cli_merge_refuses_a_pre_v5_slate_and_writes_nothing(cli_env, tmp_path):
+    """The one path by which UNMEASURED reaches `merge_reports`: files written
+    before this producer recorded who else held the card."""
+    parts = []
+    for arm_id in lms_healthcheck.load_arms().arm_ids():
+        path = tmp_path / f'{arm_id}.json'
+        assert lms_healthcheck.main(['--arm', arm_id, '--output', str(path)]) == 0
+        payload = json.loads(path.read_text())
+        payload['schema_version'] = 4
+        for key in ('baseline_consumers', 'probe_consumers',
+                    'consumer_inventory_note', 'pollution', 'pollution_reason'):
+            del payload['vram'][key]
+        path.write_text(json.dumps(payload))
+        parts.append(str(path))
+
+    out = tmp_path / 'merged.json'
+    code = lms_healthcheck.main(['--merge', *parts, '--output', str(out)])
+
+    assert code == lms_healthcheck.EXIT_MERGE_ERROR
+    assert not out.exists()
 
 
 def test_the_report_carries_the_delivered_check_marker():

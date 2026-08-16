@@ -124,6 +124,14 @@ unit is running. The PRD's funnel never needs the slate up simultaneously, and
 on one 24 GB card two arms is an OOM. `--no-exclusive` exists for the case
 where you have checked the arithmetic yourself.
 
+`--no-exclusive` also narrows the polluted-baseline refusal below, and only for
+the arms systemd reports running: those may hold the card at baseline, are
+recorded in the baseline's inventory alongside the arm ids that excused them,
+and any *drift* in them during the run still marks the report POLLUTED. ollama
+and anything else `KNOWN_FOREIGN_CONSUMERS` names is refused either way. On an
+otherwise idle card the flag changes nothing about pollution — there is nobody
+to excuse.
+
 `Restart=no` in the unit template is deliberate: a dead arm stays dead rather
 than thrashing the GPU in a restart loop while you read the journal.
 
@@ -150,14 +158,31 @@ a `/health` probe:
 
 Exit codes: `0` all green · `1` an arm failed · `2` manifest/arm-id error ·
 `3` every arm passed but VRAM is over budget · `4` the GPU probe failed, so
-**no report was produced** · `5` `--active` found nothing running.
+**no report was produced** · `5` `--active` found nothing running · `6` `--merge`
+refused to combine the inputs · `7` **the VRAM measurement is polluted** — a
+non-arm process moved on the card, so nothing was learned about the arm ·
+`8` **no usable baseline** — none was recorded for this arm, or the one on disk
+predates the consumer inventory; re-take it with `lms_ctl start <arm>`.
 
-Codes 3, 4 and 5 are separate on purpose. A budget failure and a model failure
-have different fixes. A broken `nvidia-smi` must never degrade into a report
-whose VRAM block reads `used 0 MiB, headroom 19.5 GiB` — a passing budget with
-maximal headroom is the most trustworthy-looking wrong answer this rig can
-emit. And `--active` with nothing running must not exit 0, or a wrapper script
-would certify a slate nobody probed.
+Every one of these is separate on purpose, because each has a different fix.
+A budget failure and a model failure are not the same problem. A broken
+`nvidia-smi` must never degrade into a report whose VRAM block reads
+`used 0 MiB, headroom 19.5 GiB` — a passing budget with maximal headroom is the
+most trustworthy-looking wrong answer this rig can emit. `--active` with nothing
+running must not exit 0, or a wrapper script would certify a slate nobody
+probed. And **7 is not 3**: 3 says the arm is genuinely too big and something
+should be stopped, whereas 7 says the arithmetic is void — stopping an arm in
+response would mean acting on a number nobody measured. A polluted run is never
+`0` either, however healthy the block's own `verdict` looks. **8 is not 4** for
+the same reason inverted: the GPU answered fine and it is the *baseline store*
+that has nothing usable in it, so `4`'s "go debug nvidia-smi" would be the wrong
+errand — and the case is routine, not exotic, because a pre-guard baseline can
+still be sitting in `$XDG_RUNTIME_DIR` from the current boot.
+
+`lms_ctl start` has its own pair for the same reason: **4** the arm does not fit
+this card (use a smaller arm), **5** another process is holding the card (free
+it and start the same arm again). Collapsing those into one code would send an
+operator to shrink an arm that fits perfectly well.
 
 ---
 
@@ -189,6 +214,87 @@ artifact (`vram.nominal_ceiling_gib` = 19.5, `vram.operating_budget_gib`
 not have; showing only the measured budget would hide the deviation from D10.
 The `vram.verdict` is judged against the **nominal** ceiling, because that is
 how the PRD states its user-observable signal.
+
+### Non-arm GPU consumers (task 3755)
+
+`arm_footprint_mib` is `used − baseline`, which is the **arm's** footprint only
+if nothing else moved on the card between those two readings. Up to schema v4
+nothing recorded whether that held, so this happened and left no trace.
+
+Measured 2026-08-06, during a slate run:
+
+| pid | process | MiB | what it is |
+|---|---|---|---|
+| 7575 | `python` | 4050 | whisper-writer — PRD D10 requires it resident |
+| 905936 | `/usr/local/lib/ollama/llama-server` | 10314 | ollama, `qwen3:14b` held on `keep_alive` |
+
+`ollama.service` is a **persistent unit on this host**. It wakes on any request
+to `:11434`, holds its model for the `keep_alive` window, and nothing about
+starting an arm consults it. Ten gigabytes appearing between the baseline and
+the probe are charged straight to the arm by the subtraction.
+
+The guard, from v5 on:
+
+- **`lms_ctl start` refuses to record a polluted baseline** (exit 5, no file
+  written). At that moment no arm of ours is running, so the check is a positive
+  **allowlist** — whisper-writer under a 6144 MiB ceiling, and nothing else over
+  ~1 GiB. Anything unanticipated is caught, not just ollama.
+- **`lms_healthcheck` classifies the probe reading** and reports
+  `vram.pollution` plus both inventories in the artifact (exit 7). Here the rule
+  has to be different: arms are docker containers, `nvidia-smi` reports **host**
+  pids, and `--query-compute-apps=pid,process_name,used_memory` cannot tell a
+  containerised vLLM `python` from any other `python`. The same allowlist would
+  flag every healthy run. So probe-time pollution is a **known-foreign match**
+  (the `/usr/local/lib/ollama/` path, which no arm wears) plus **drift in any
+  consumer already present at baseline** — such a consumer is non-arm by
+  construction, because the arm was not running then.
+- **Drift is pollution in BOTH directions.** Growth over-charges the arm; a
+  shrink or a vanish *under*-charges it. The flattering direction is the one a
+  fabricated artifact wants, so it fails too.
+- **The baseline capture is bracketed**: `lms_ctl start` reads the inventory,
+  then the memory reading, then the inventory again, and refuses if the two
+  inventories disagree by more than the floor. `nvidia-smi` cannot answer both
+  questions in one call, so pairing them is a claim about a *window*. Its
+  silent failure is the flattering one: a holder resident for the reading and
+  gone by the inventory inflates the baseline, `assert_clean_baseline` sees a
+  spotless card, and by probe time the mover is in neither reading — so nothing
+  downstream can tell. A co-resident arm appears in both inventories and is
+  therefore never a mover.
+
+This replaces an operator discipline — "check `nvidia-smi` before you measure" —
+that was never written down and that ε/θ/ι had no way to inherit.
+
+Four limits, stated rather than implied:
+
+- **The bracket narrows the window; it does not abolish it.** A process that
+  both arrives and leaves between the first inventory and the reading is
+  invisible to both, and no arrangement of separate `nvidia-smi` calls can see
+  it. What is left is a sub-second race against a consumer that vanishes as
+  fast as it appeared, rather than the minutes-long `keep_alive` holding that
+  motivated the guard. Probe time is deliberately *not* bracketed: the arm
+  itself is legitimately allocating there, so refusing on any movement would
+  fail healthy runs.
+
+- **The inventory is not an accounting.** `--query-compute-apps` lists only CUDA
+  compute applications; the ~3.3 GiB of KDE/X11 graphics contexts appear in it
+  nowhere. That is exactly why the operating budget is ~16.4 GiB and not 19.5.
+  The entries name *who else held the card*; they do not sum to `memory.used`.
+  A clean baseline on this host really does show 3312 MiB used and **zero**
+  compute apps.
+- **Nothing here stops or polices ollama.** The tools refuse to measure, and say
+  what to free. ollama releases its model on `keep_alive` expiry by itself.
+- **The residual case.** A probe-time newcomer that matches no foreign pattern
+  and is not the arm cannot be told apart from `--query-compute-apps` alone. It
+  is recorded verbatim in `vram.probe_consumers` as the audit trail rather than
+  silently attributed to anybody. Resolving it exactly would need `docker top`
+  or cgroup introspection to map host pids back to `lms-arm-<arm_id>`, which
+  buys a docker dependency and a resolver whose own failure would mark every
+  real run polluted.
+
+The allowlist and the foreign list are **module constants with no environment
+override** (`lms_vram.EXPECTED_CONSUMERS`, `lms_vram.KNOWN_FOREIGN_CONSUMERS`).
+An env var could silence the guard invisibly; changing what this host is
+expected to run should be a code change with a reviewable diff.
 
 ### How `--gpu-memory-utilization` is derived
 
@@ -533,6 +639,23 @@ which driver — every verdict is relative to specific hardware), one row per ar
 and the VRAM block. `scripts/tests/test_lms_verification_artifact.py` requires a
 `PASS` row for every arm in `arms.yaml` plus a passing VRAM block, so the test
 can only be greened by the run having actually happened.
+
+**The committed file is `schema_version: 4`; the producer is at 5.** It is
+evidence of a real ~39-minute 7-arm run and every other property of the gate
+still holds against it — what it predates is the v5 consumer inventory, so it
+cannot say who else held the card while those arms were measured. Re-deriving
+it needs docker, systemd and the shared 3090, and may itself be *refused* by the
+v5 guard if ollama is resident, which is the whole point of the guard. So the
+gate's version check is `ACCEPTED_ARTIFACT_SCHEMA_VERSIONS = {4, 5}` — a narrow,
+self-expiring grandfather clause, and a *widening* of the equality it replaced
+rather than a strengthening of it. What still runs live against today's v4 file
+is: the v4 block must carry **none** of the five consumer keys (so it cannot be
+hand-edited to fake an inventory), the set may grandfather exactly one named
+older version, and the set expires at the next schema bump. The *additional*
+strictness — a v5 artifact must carry a measured inventory and a `CLEAN`
+pollution state — begins the moment the artifact is re-derived at v5, and is not
+in force today. That re-run is filed as task **4229**; do not close it by editing
+the artifact.
 
 ---
 
