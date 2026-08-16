@@ -56,6 +56,20 @@ decision, exactly as :mod:`shared.toolcall_markup` owns the envelope literals
 :func:`detect_mispairing` rather than re-implementing the predicate, so the
 walker and the entry predicate can never disagree about what counts.
 
+## Widenings, and the specimen each was added for
+
+Every relaxation below was forced by a real committed specimen the corpus
+replay caught, never guessed at in advance, and every one is a GENERAL RULE
+rather than a per-specimen carve-out. A per-specimen exception is exactly the
+drift the single-owner marker set exists to prevent.
+
+* **Hyphens in a pairing marker are OPTIONAL** (:func:`_hyphen_tolerant`).
+  Added for specimens ``3757[1]`` and ``4030[2]``, which both spell it
+  ``mispaired``, unhyphenated. Measured over the live corpus: the
+  hyphenated-only predicate finds 18 victim plans / 21 entries, the
+  hyphen-tolerant one 20 / 23 — the two specimens are 2 of the 20 victim
+  plans, so this is not a rounding difference.
+
 ## Every count derived from this is a STRICT LOWER BOUND
 
 The predicate can only ever find a mis-pairing that a human or an agent
@@ -114,9 +128,11 @@ HEADER_MARKERS: tuple[str, ...] = (
 )
 
 #: Explicit pairing language, matched anywhere in ``decision`` or ``rationale``,
-#: case-insensitively. This is the conjunct that separates a mis-pairing from a
-#: genuine supersession. Order is the match order and decides which marker a hit
-#: reports when a text carries more than one.
+#: case-insensitively AND with every literal hyphen OPTIONAL (see
+#: :func:`_hyphen_tolerant`, and "Widenings" in the module docstring). This is
+#: the conjunct that separates a mis-pairing from a genuine supersession. Order
+#: is the match order and decides which marker a hit reports when a text carries
+#: more than one.
 PAIRING_MARKERS: tuple[str, ...] = (
     'mis-paired',
     'cross-paired',
@@ -136,8 +152,18 @@ _HEADER_RES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
     for marker in HEADER_MARKERS
 )
 
+def _hyphen_tolerant(marker: str) -> str:
+    """*marker* as a pattern in which every literal hyphen is OPTIONAL.
+
+    Spelled by splitting on the hyphen rather than by post-processing
+    :func:`re.escape`'s output, so it does not depend on whether that function
+    escapes ``-`` in the running Python.
+    """
+    return '-?'.join(re.escape(part) for part in marker.split('-'))
+
+
 _PAIRING_RES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
-    (marker, re.compile(re.escape(marker), re.IGNORECASE))
+    (marker, re.compile(_hyphen_tolerant(marker), re.IGNORECASE))
     for marker in PAIRING_MARKERS
 )
 

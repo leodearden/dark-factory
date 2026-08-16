@@ -663,7 +663,7 @@ class TestCommittedCorpus:
     def test_every_near_miss_class_has_a_negative_control(self) -> None:
         """Precision is pinned per FAILURE MODE, not by an aggregate count."""
         present = {r['near_miss_class'] for r in load_corpus() if r['expect'] == 'clean'}
-        assert NEAR_MISS_CLASSES <= present, (
+        assert present >= NEAR_MISS_CLASSES, (
             f'near-miss classes with no negative control: '
             f'{sorted(NEAR_MISS_CLASSES - present)}'
         )
