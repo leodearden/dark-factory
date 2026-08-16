@@ -207,22 +207,57 @@ _EXPECTED_UNITS = {
     "orchestrator-pump-web-ui.service",
 }
 
-# Matches setup-host.sh's install lines, e.g.
-#   cp "$REPO_ROOT/scripts/orchestrator-reify.service"   "$UNIT_DIR/"
-# Anchored on BOTH endpoints (the scripts/ source and the $UNIT_DIR
-# destination) so an unrelated `cp` elsewhere in the installer cannot be
-# mistaken for a unit install.
-_CP_UNIT_RE = re.compile(
-    r'cp\s+"\$REPO_ROOT/scripts/(?P<unit>[^"]+\.(?:service|timer))"\s+"\$UNIT_DIR/?"'
+# setup-host.sh no longer carries one literal `cp` line per unit; it declares
+# the set once and loops. This matches that declaration:
+#
+#   _orch_units=(
+#     orchestrator-reify.service        # reify orchestrator, escalation 8100
+#     ...
+#   )
+#
+# Anchored on a column-0 `_orch_units=(` ... `)` pair so no other parenthesised
+# construct in the installer can be mistaken for it.
+_ORCH_UNITS_ARRAY_RE = re.compile(
+    r"^_orch_units=\(\n(?P<body>.*?)^\)$", re.MULTILINE | re.DOTALL
 )
+
+# The two statements that make the array MEAN something. Splitting the old
+# both-endpoints-anchored `cp` regex into "what is declared" + "what the loop
+# does with it" preserves exactly what that regex bought: a unit named in the
+# array but never copied, or copied somewhere other than $UNIT_DIR, is as
+# uninstalled as a unit nobody listed at all.
+_INSTALL_LOOP_HEADER = 'for _unit in "${_orch_units[@]}"; do'
+_INSTALL_LOOP_CP = 'cp "$REPO_ROOT/scripts/$_unit" "$UNIT_DIR/"'
+
+
+def _shell_statements(script_text: str) -> list[str]:
+    """Non-comment, non-blank statements, whitespace-stripped.
+
+    Mirrors tests/scripts/test_orchestrator_service_files.py's helper of the
+    same name, and for the same reason: a unit or a command merely NAMED in
+    the section's header prose must not satisfy an assertion that the
+    installer actually runs it.
+    """
+    return [
+        stripped
+        for line in script_text.splitlines()
+        if (stripped := line.strip()) and not stripped.startswith("#")
+    ]
 
 
 def _units_installed_by_setup_host() -> set[str]:
-    """Extract the unit names setup-host.sh `cp`s verbatim into $UNIT_DIR."""
-    return set(
-        m.group("unit")
-        for m in _CP_UNIT_RE.finditer(SETUP_HOST_PATH.read_text(encoding="utf-8"))
-    )
+    """Extract the unit names setup-host.sh installs, from its `_orch_units` array."""
+    match = _ORCH_UNITS_ARRAY_RE.search(SETUP_HOST_PATH.read_text(encoding="utf-8"))
+    if match is None:
+        return set()
+    units = set()
+    for line in match.group("body").splitlines():
+        # Each entry may carry a trailing `# rationale` comment — that prose is
+        # the per-unit justification the old enable block held, and it must not
+        # be parsed as part of the unit name.
+        if entry := line.split("#", 1)[0].strip():
+            units.add(entry)
+    return units
 
 
 def test_registry_covers_the_nine_verbatim_copied_units():
@@ -277,9 +312,9 @@ def test_registry_matches_setup_host_cp_lines():
     # assertion below would still fail, but with a message pointing at the
     # registry rather than at the parsing.
     assert installed_by_setup_host, (
-        f"Parsed ZERO `cp` unit lines out of {SETUP_HOST_PATH}. The installer's "
-        "cp idiom has changed and _CP_UNIT_RE no longer matches it — fix the "
-        "regex, do not weaken this test."
+        f"Parsed ZERO units out of {SETUP_HOST_PATH}'s `_orch_units` array. The "
+        "installer's declaration idiom has changed and _ORCH_UNITS_ARRAY_RE no "
+        "longer matches it — fix the regex, do not weaken this test."
     )
 
     assert installed_by_setup_host == set(checker.UNITS), (
@@ -293,6 +328,40 @@ def test_registry_matches_setup_host_cp_lines():
         "A unit the installer copies but the registry omits is "
         "installed-but-unchecked: it can drift forever while this gate "
         "reports green."
+    )
+
+
+def test_the_install_loop_actually_consumes_the_declared_unit_array():
+    """The `_orch_units` array is what DRIVES the copy, not decoration.
+
+    The staleness guard above derives the registry from that array, so the
+    array has to be the thing the installer acts on — otherwise a unit could be
+    declared, registered, checked, and never installed, and every test here
+    would still be green.
+
+    Two statements are asserted, and together they reconstruct exactly what the
+    old both-endpoints-anchored `cp` regex bought before section 5 was made
+    declarative: the loop iterates THE ARRAY (not some other list), and its
+    body copies into $UNIT_DIR (not a staging path, which would leave the unit
+    just as uninstalled as no copy at all).
+
+    Read through the comment-stripped view so a `cp` shown as an EXAMPLE in the
+    section's header prose cannot satisfy it.
+    """
+    statements = _shell_statements(_orchestrator_install_block(_setup_host_text()))
+
+    assert _INSTALL_LOOP_HEADER in statements, (
+        f"{SETUP_HOST_PATH} does not iterate its own `_orch_units` array to "
+        f"install the units. Expected the statement:\n    {_INSTALL_LOOP_HEADER}\n"
+        "Without it the array is documentation, and the registry staleness "
+        f"guard above is derived from documentation.\nBlock statements: {statements}"
+    )
+    assert _INSTALL_LOOP_CP in statements, (
+        f"{SETUP_HOST_PATH}'s install loop does not copy into $UNIT_DIR. "
+        f"Expected the statement:\n    {_INSTALL_LOOP_CP}\n"
+        "The destination is asserted, not just the source: a copy to a staging "
+        "path leaves the unit as uninstalled as no copy at all."
+        f"\nBlock statements: {statements}"
     )
 
 
@@ -1334,11 +1403,15 @@ def _orchestrator_gate_block(text: str) -> str:
 def _orchestrator_install_block(text: str) -> str:
     """Slice the construct that performs the orchestrator unit `cp`s.
 
-    Derived the same way: from the column-0 `if` preceding the first
-    orchestrator `cp` to the column-0 `fi` that closes it. Empty-ish slices
-    are impossible — the caller asserts the `cp` lines are inside.
+    Derived the same way: from the column-0 `if` preceding the install loop's
+    `cp` to the column-0 `fi` that closes it. Empty-ish slices are impossible —
+    the caller asserts the loop is inside.
+
+    The end anchor is a COLUMN-0 `fi`, so the loops' own indented `fi`/`done`
+    are invisible to it and the slice still terminates at the install
+    construct's close.
     """
-    first_cp = text.index('cp "$REPO_ROOT/scripts/orchestrator-dark-factory.service"')
+    first_cp = text.index(_INSTALL_LOOP_CP)
     start = text.rindex("\nif ", 0, first_cp) + 1
     end = text.index("\nfi\n", first_cp) + len("\nfi\n")
     return text[start:end]
@@ -1379,9 +1452,7 @@ def test_parity_gate_runs_BEFORE_the_units_are_copied():
     text = _setup_host_text()
 
     gate_at = text.index("check_orchestrator_unit_parity.py")
-    first_cp_at = text.index(
-        'cp "$REPO_ROOT/scripts/orchestrator-watchdog.service"'
-    )
+    first_cp_at = text.index(_INSTALL_LOOP_CP)
 
     assert gate_at < first_cp_at, (
         "check_orchestrator_unit_parity.py is invoked at offset "
@@ -1445,7 +1516,7 @@ def _installer_section() -> str:
     """
     text = _setup_host_text()
     start = text.rfind("\n", 0, text.index("check_orchestrator_unit_parity.py")) + 1
-    first_cp = text.index('cp "$REPO_ROOT/scripts/orchestrator-dark-factory.service"')
+    first_cp = text.index(_INSTALL_LOOP_CP)
     end = text.index("\nfi\n", first_cp) + len("\nfi\n")
     return text[start:end]
 
