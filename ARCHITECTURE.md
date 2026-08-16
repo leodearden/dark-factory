@@ -314,11 +314,11 @@ Legal transitions are a closed table (`shared/src/shared/task_transitions.py`)
 enforced by fused-memory's `TaskInterceptor`, keyed by the actor making the
 change — e.g. reconciliation is never allowed to transition a task *out of*
 `in-progress`. The diagram above is that table in full, not a happy-path
-sketch: every edge in it is a `TRANSITIONS` pair, and
-`shared/tests/test_architecture_doc_transition_parity.py` asserts set-equality
-in both directions, so an edge added to the table cannot silently rot out of
-the diagram (it had lost 19 of them before that test existed). Many of the
-drawn edges are operator or sweep recovery paths rather than normal flow —
+sketch: every edge in it is a `TRANSITIONS` pair. `task_transitions.py` is the
+authority — where the two disagree the table is right and the diagram is
+stale, so an edge added there must be drawn here too (the diagram had lost 19
+of them before this redraw). Many of the drawn edges are operator or sweep
+recovery paths rather than normal flow —
 `blocked --resume(infra)--> in-progress`, the `infra_hold`/`review` fan-outs,
 and reconciliation's any-non-terminal → `cancelled` family. One recovery path
 is deliberately *absent* from the table and so cannot be drawn: the rare,

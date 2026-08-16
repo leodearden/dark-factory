@@ -84,11 +84,10 @@ targeted reconciliation automatically.
 
 **Legal transitions** (`shared/src/shared/task_transitions.py`; every pair
 is annotated with its call site in code — this is a summary, not the full
-state machine. `ARCHITECTURE.md` §3.1 carries the complete edge set, pinned
-against `task_transitions.py` by
-`shared/tests/test_architecture_doc_transition_parity.py` so it cannot rot
-out of sync, plus the `WorkflowStateMachine`/`TaskInterceptor` enforcement
-layers. `docs/task-escalation-state-spec.md` is the normative specification
+state machine. `task_transitions.py` is the authority; `ARCHITECTURE.md` §3.1
+redraws the complete edge set from it, plus the
+`WorkflowStateMachine`/`TaskInterceptor` enforcement layers.
+`docs/task-escalation-state-spec.md` is the normative specification
 of the task-status × escalation-state graph — which status a task must be in
 while an escalation owns it, and what each recovery sweep must write):
 
