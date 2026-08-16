@@ -554,9 +554,14 @@ def worktree_base_for(repo: Path) -> Path:
 # silently multiply this module's runtime (Row 3 from ~17s to ~70s).  The
 # pin is now STRUCTURAL, not just asserted: the literals live on
 # ROW_WATCHDOG_HEARTBEAT_TIMEOUT_SECS / ROW_WATCHDOG_KILL_GRACE_SECS below,
-# nothing here imports verify_cancel, and ROW_TREE_KILL_CEILING_SECS /
-# ROW_PER_TEST_TIMEOUT_SECS are computed from those two floats, so they can
-# no longer drift out of step with the window.
+# and ROW_TREE_KILL_CEILING_SECS / ROW_PER_TEST_TIMEOUT_SECS are computed
+# from those two floats, so they can no longer drift out of step with the
+# window.  Nothing here imports verify_cancel's watchdog timing constants
+# (WATCHDOG_HEARTBEAT_TIMEOUT_SECS / WATCHDOG_KILL_GRACE_SECS) -- the /proc
+# walkers imported at the top of this module (collect_descendants,
+# pgid_file, etc.) are deliberately still shared; a dedicated drift test
+# below imports the two timing constants LOCALLY, on its own, purely to
+# notice if they ever diverge from this pin.
 #
 # This REPLACES a prior test-only 1.0s/0.5s tightening that bought speed and
 # no coverage, and was the measured cause of the "no descendant appeared
@@ -594,19 +599,78 @@ ROW_WATCHDOG_ENV: dict[str, str] = {
 #: is already failing.
 ROW_TREE_KILL_CEILING_SECS: float = ROW_WATCHDOG_WINDOW_SECS + 15.0  # 30.0
 
-#: Worst-case BOUNDED work in a row on the failure path: both
-#: ceiling-bounded waits run to full ceiling on top of one complete window.
+#: Ceiling for the two DISCOVERY waits every row runs BEFORE the watchdog is
+#: even armed -- wait_for_pgid_file and wait_subtree_live, both of which
+#: default to timeout=20.0.  Rows 1/2/3 pass this explicitly at their call
+#: sites below (instead of relying on the bare default) so this value and
+#: those defaults cannot silently drift apart.
+ROW_DISCOVERY_CEILING_SECS: float = 20.0
+
+#: Worst-case BOUNDED work in a row on the failure path: both discovery
+#: waits, then one full watchdog window, then both ceiling-bounded
+#: kill-confirmation waits run to their full ceiling.  (Deliberately excludes
+#: _setup_verify_repo's real git work and the finally block's ~5s
+#: child.kill()/wait() tail -- both small next to the >=2x headroom below.)
 _ROW_WORST_CASE_BOUNDED_SECS: float = (
-    2 * ROW_TREE_KILL_CEILING_SECS + ROW_WATCHDOG_WINDOW_SECS
-)  # 75.0
+    2 * ROW_DISCOVERY_CEILING_SECS
+    + ROW_WATCHDOG_WINDOW_SECS
+    + 2 * ROW_TREE_KILL_CEILING_SECS
+)  # 115.0
 
 #: Per-test opt-out from this module's inherited `timeout = 60`
 #: (orchestrator/pyproject.toml:103, thread-mode -- os._exit()s the xdist
 #: worker on expiry).  2x the bounded worst case, because this module's own
 #: comment (~:870-879) records ~15x elasticity on `from orchestrator.cli
 #: import main` under a full-suite storm.
-ROW_PER_TEST_TIMEOUT_SECS: int = int(2 * _ROW_WORST_CASE_BOUNDED_SECS)  # 150
+ROW_PER_TEST_TIMEOUT_SECS: int = int(2 * _ROW_WORST_CASE_BOUNDED_SECS)  # 230
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Task 4025 amendment -- drift detector for the pin above.  ROW_WATCHDOG_ENV
+# is pinned to today's production numbers but deliberately does not TRACK
+# verify_cancel's constants (see the banner above); that decoupling means
+# nothing else notices the day the two diverge.  This is the one test whose
+# whole job is to notice, so the import it performs (LOCAL to the test body,
+# not module-level) is a deliberate, narrow exception to "nothing here
+# imports verify_cancel's watchdog timing constants" above -- it exists
+# specifically to compare against them, not to consume them.
+# ---------------------------------------------------------------------------
+
+
+def test_row_watchdog_window_still_matches_production_constants():
+    """Fails the day ROW_WATCHDOG_* stops matching verify_cancel's WATCHDOG_*.
+
+    task 4025 pinned ROW_WATCHDOG_HEARTBEAT_TIMEOUT_SECS /
+    ROW_WATCHDOG_KILL_GRACE_SECS as literals specifically so Rows 1/2/3's
+    runtime does NOT track verify_cancel.WATCHDOG_HEARTBEAT_TIMEOUT_SECS /
+    WATCHDOG_KILL_GRACE_SECS -- task 4195 is expected to retune those toward
+    ~60s+.  Today the pinned literals happen to equal production, so this
+    passes; it exists to catch the moment that stops being true.
+
+    If this fails: production changed (task 4195 landing is the expected
+    trigger).  Do NOT "fix" it by importing the pinned literals from
+    verify_cancel -- that reintroduces the silent-runtime-multiplication
+    this task exists to prevent.  Instead update the three Row 1/2/3
+    docstrings' "pinned production-equivalent window" wording (it will no
+    longer be accurate), decide afresh whether
+    ROW_WATCHDOG_HEARTBEAT_TIMEOUT_SECS / ROW_WATCHDOG_KILL_GRACE_SECS
+    should move, and re-baseline this assert against the new production
+    values.
+    """
+    from orchestrator import verify_cancel
+
+    pinned = (ROW_WATCHDOG_HEARTBEAT_TIMEOUT_SECS, ROW_WATCHDOG_KILL_GRACE_SECS)
+    production = (
+        verify_cancel.WATCHDOG_HEARTBEAT_TIMEOUT_SECS,
+        verify_cancel.WATCHDOG_KILL_GRACE_SECS,
+    )
+    assert pinned == production, (
+        f'pinned ROW_WATCHDOG_* {pinned} no longer match production '
+        f'verify_cancel.WATCHDOG_* {production} -- the pin intentionally '
+        f'does not track production; update the docstrings\' '
+        f'"production-equivalent" wording and re-baseline this assert.'
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1094,6 +1158,7 @@ def test_normal_warm_path_reuses_fixed_worktree_twice_no_escalation(tmp_path, mo
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.timeout(ROW_PER_TEST_TIMEOUT_SECS)  # task 4025 amendment: shares the derived per-row budget -- same real-subprocess exposure as Rows 1/2/3, previously left on the module's bare 60s ini timeout
 def test_cancel_verify_tree_kills_under_live_watchdog(tmp_path, monkeypatch):
     """SS9 Row 4: cancel-verify leaves no orphan while the stdin watchdog is live.
 
@@ -1210,10 +1275,13 @@ def test_orchestrator_killed_mid_build_tree_killed_via_eof(tmp_path):
         extra_env=ROW_WATCHDOG_ENV,
     )
     try:
-        pgid_val = wait_for_pgid_file(pgf)
+        pgid_val = wait_for_pgid_file(pgf, timeout=ROW_DISCOVERY_CEILING_SECS)
         # Row 1 owns the DISPATCHER process, not the leader -- the leader's
         # own stdout/stderr aren't piped to this test, so pass the dispatcher.
-        wait_subtree_live(pgid_val, proc=dispatcher, proc_label='dispatcher')
+        wait_subtree_live(
+            pgid_val, proc=dispatcher, proc_label='dispatcher',
+            timeout=ROW_DISCOVERY_CEILING_SECS,
+        )
 
         dispatcher.kill()
         dispatcher.wait(timeout=10)
@@ -1282,8 +1350,8 @@ def test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive(tmp_path):
     )
     heartbeat = HeartbeatWriter(child, interval=0.2).start()
     try:
-        pgid_val = wait_for_pgid_file(pgf)
-        wait_subtree_live(pgid_val, proc=child)
+        pgid_val = wait_for_pgid_file(pgf, timeout=ROW_DISCOVERY_CEILING_SECS)
+        wait_subtree_live(pgid_val, proc=child, timeout=ROW_DISCOVERY_CEILING_SECS)
 
         heartbeat.close_stdin()
 
@@ -1366,8 +1434,8 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
     )
     heartbeat = HeartbeatWriter(child, interval=0.2).start()
     try:
-        pgid_val = wait_for_pgid_file(pgf)
-        wait_subtree_live(pgid_val, proc=child)
+        pgid_val = wait_for_pgid_file(pgf, timeout=ROW_DISCOVERY_CEILING_SECS)
+        wait_subtree_live(pgid_val, proc=child, timeout=ROW_DISCOVERY_CEILING_SECS)
 
         heartbeat.stop_heartbeats()
         assert child.stdin is not None and not child.stdin.closed, (
