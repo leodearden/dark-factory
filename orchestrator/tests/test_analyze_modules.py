@@ -371,8 +371,25 @@ def test_render_json_is_machine_readable():
     assert payload['crates/foo/src']['suggested_max_per_module'] == 2
     assert payload['crates/foo/src']['avg_hold_secs'] == 100.0
     # Two of the three samples are censored lower bounds — a consumer reading
-    # avg_hold_secs alone cannot tell, so the count travels with it.
+    # avg_hold_secs alone cannot tell, so the count travels with it...
     assert payload['crates/foo/src']['truncated_holds'] == 2
+    # ...and so does its DENOMINATOR, without which the count says nothing:
+    # trunc 2 means something different out of 3 samples than out of 300.
+    assert payload['crates/foo/src']['hold_samples'] == 3
+    assert payload['crates/foo/src']['truncated_fraction'] == 0.6667
+
+
+def test_render_json_reports_zero_censoring_with_no_samples():
+    """A module with no hold spans reports 0.0, not a crash or a null.
+
+    `truncated_fraction` must survive the empty case in the renderer, since
+    every skip-only module in a window hits it.
+    """
+    payload = json.loads(render_json({'quiet/src': ModuleStats(dispatches=2)}))
+
+    assert payload['quiet/src']['hold_samples'] == 0
+    assert payload['quiet/src']['truncated_fraction'] == 0.0
+    assert payload['quiet/src']['avg_hold_secs'] == 0.0
 
 
 # --- the table must not collapse two distinct lock keys into one row -------
@@ -400,8 +417,12 @@ def test_render_table_prints_a_long_lock_module_in_full():
         'each lock key needs its own distinguishable row'
 
 
-def test_render_table_reports_truncated_holds():
-    """The censoring is visible in the human surface too, not just --json."""
+def test_render_table_reports_truncated_holds_against_their_denominator():
+    """The censoring is visible in the human surface too, not just --json —
+    and so is the sample count it is a censoring OF.  A bare `trunc 2` next to
+    `avg_hold_s 100.0` reads completely differently at 4 samples than at 400,
+    and the operator has no other column to tell them apart.
+    """
     table = render_table({
         'orchestrator/src': ModuleStats(
             dispatches=5, skipped_waiting=1,
@@ -410,10 +431,11 @@ def test_render_table_reports_truncated_holds():
     })
 
     header, row = table.splitlines()
+    assert 'samples' in header
     assert 'trunc' in header
-    # Distinct values, so a trunc/suggest column swap cannot pass:
-    # conflict 1/5 = 0.2 → suggest 3; truncated_holds is 2.
-    assert row.split()[-3:] == ['100.0', '2', '3']
+    # Four distinct values, so no permutation of these columns can pass:
+    # avg 400/4 = 100.0; samples 4; trunc 2; conflict 1/5 = 0.2 → suggest 3.
+    assert row.split()[-4:] == ['100.0', '4', '2', '3']
 
 
 def test_iter_events_opens_runs_db_read_only(event_store: EventStore) -> None:

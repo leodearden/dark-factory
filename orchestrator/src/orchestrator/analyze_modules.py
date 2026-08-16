@@ -43,7 +43,10 @@ others up to that point (PARKING_MODEL_REPORT.md:102).  Before task 3869 those
 spans were dropped outright — 1,283 DF / 4,776 reify of them in the measured
 trace, all of them long holds — which biased ``avg_hold_s`` low in exactly the
 direction that hides contention.  The ``trunc`` column (``truncated_holds`` in
-``--json``) is how many samples behind the mean are such lower bounds.
+``--json``) is how many samples behind the mean are such lower bounds, and the
+``samples`` column (``hold_samples``) is the denominator that makes that
+number mean something — ``--json`` also publishes the ratio directly as
+``truncated_fraction``.
 
 Still dropped, because nothing observed an end to fabricate one from: holds
 open at the end of the ``--since`` window.  A release whose acquire fell before
@@ -272,12 +275,16 @@ _MODULE_COL = 56
 def render_table(stats: dict[str, ModuleStats]) -> str:
     """Human-readable table sorted by descending conflict rate.
 
-    ``trunc`` is how many of the hold samples behind ``avg_hold_s`` are
-    right-censored lower bounds rather than clean releases.
+    ``samples`` is how many hold spans ``avg_hold_s`` is the mean of, and
+    ``trunc`` how many of THOSE are right-censored lower bounds rather than
+    clean releases.  Both are printed because the censored count alone does not
+    say how much of the mean rests on censored evidence: ``trunc 2`` reads very
+    differently out of 3 samples than out of 300.
     """
     lines = [
         f'{"module":<{_MODULE_COL}} {"dispatches":>12} {"skipped":>10} '
-        f'{"conflict":>10} {"avg_hold_s":>12} {"trunc":>7} {"suggest":>8}'
+        f'{"conflict":>10} {"avg_hold_s":>12} {"samples":>9} {"trunc":>7} '
+        f'{"suggest":>8}'
     ]
     ranked = sorted(
         stats.items(),
@@ -290,8 +297,8 @@ def render_table(stats: dict[str, ModuleStats]) -> str:
         lines.append(
             f'{module:<{_MODULE_COL}} {entry.dispatches:>12d} '
             f'{entry.skipped_waiting:>10d} {entry.conflict_rate():>10.2f} '
-            f'{entry.avg_hold_secs():>12.1f} {entry.truncated_holds:>7d} '
-            f'{suggest_max_per_module(entry):>8d}'
+            f'{entry.avg_hold_secs():>12.1f} {entry.hold_samples:>9d} '
+            f'{entry.truncated_holds:>7d} {suggest_max_per_module(entry):>8d}'
         )
     return '\n'.join(lines)
 
@@ -304,8 +311,14 @@ def render_json(stats: dict[str, ModuleStats]) -> str:
             'skipped_waiting': e.skipped_waiting,
             'conflict_rate': round(e.conflict_rate(), 4),
             'avg_hold_secs': round(e.avg_hold_secs(), 2),
-            # How much of avg_hold_secs rests on censored lower bounds.
+            # The denominator travels with the mean, so a consumer can weigh
+            # `avg_hold_secs` by how much evidence is behind it...
+            'hold_samples': e.hold_samples,
+            # ...and both readings of the censoring: the raw count, and the
+            # share of the mean that rests on lower bounds rather than
+            # observed releases.  The count alone does not give the share.
             'truncated_holds': e.truncated_holds,
+            'truncated_fraction': round(e.truncated_fraction(), 4),
             'suggested_max_per_module': suggest_max_per_module(e),
         }
         for module, e in stats.items()

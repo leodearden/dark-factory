@@ -180,10 +180,11 @@ Output columns:
 - `skipped` — number of `task_skipped` events where this module appeared in the modules field
 - `conflict` — `skipped / dispatches` ratio (0 = idle, >1 = hot)
 - `avg_hold_s` — mean lock-held duration
+- `samples` — how many hold spans that mean is over — the denominator `trunc` is a share of
 - `trunc` — how many of those hold samples are right-censored **lower bounds** rather than clean releases
 - `suggest` — heuristic suggested `max_per_module` (1 for `conflict >= 2.0`, 2 for `>= 0.5`, 3 for `>= 0.1`, 4 otherwise)
 
-Hold statistics include spans an *era boundary* ended — a `service_restart` row, or a run change — because a lock really did block others up to that point. Those are the `trunc` count: real lower bounds, so `avg_hold_s` is an under-estimate by however much of it they make up. Holds still open at the end of the window are excluded entirely, since nothing observed their end.
+Hold statistics include spans an *era boundary* ended — a `service_restart` row, or a run change — because a lock really did block others up to that point. Those are the `trunc` count: real lower bounds, so `avg_hold_s` is an under-estimate by however much of it they make up — read `trunc` against `samples` to see how much that is (`--json` publishes the ratio directly as `truncated_fraction`, alongside `hold_samples`). Holds still open at the end of the window are excluded entirely, since nothing observed their end.
 
 Pass `--json` for machine-readable output, `--min-dispatches N` to drop quiet modules.
 
