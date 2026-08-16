@@ -50,6 +50,7 @@ __all__ = [
     'classify_run',
     'drain_stats',
     'inflow_daily',
+    'remediation_duty_cycle',
     'inflow_hourly',
     'utc_hour_bucket',
 ]
@@ -405,3 +406,31 @@ def drain_stats(
         'drain_events': drain_events,
         'drain_seconds_per_event': _per_event(drain_wall_clock, drain_events),
     }
+
+
+def remediation_duty_cycle(drain_stats_result: dict[str, Any]) -> float:
+    """Fraction of lock-held drain wall-clock consumed by remediation passes.
+
+    Remediation is an unconditional inline tail of every completed
+    ``run_full_cycle`` (``_maybe_remediate``, harness.py:2963), and
+    ``BacklogIterator`` runs each backlog chunk as its own full cycle — so
+    every chunk drags in its own remediation pass.  Those passes process zero
+    buffered events, so every second they hold is a second the backlog is not
+    draining.  That is the loss lever 1 recovers.
+
+    Args:
+        drain_stats_result: The return value of :func:`drain_stats`.
+
+    Returns:
+        ``remediation / (remediation + backlog_chunk + steady_state)`` over
+        wall-clock seconds, in ``[0.0, 1.0]``.  Targeted runs are excluded:
+        they never acquire the reconciliation lock, so counting them would
+        inflate the denominator and make remediation preemption look cheaper
+        than it is.  Returns ``0.0`` when there is no drain wall-clock at all,
+        rather than raising on an empty denominator.
+    """
+    modes = drain_stats_result['modes']
+    denominator = sum(modes[m]['wall_clock_seconds'] for m in _CAPACITY_MODES)
+    if denominator <= 0:
+        return 0.0
+    return modes['remediation']['wall_clock_seconds'] / denominator
