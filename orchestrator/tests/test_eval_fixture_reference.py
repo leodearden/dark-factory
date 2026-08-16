@@ -44,7 +44,7 @@ from pathlib import Path
 
 import pytest
 
-from orchestrator.evals import runner, snapshots
+from orchestrator.evals import runner, snapshots, task_sampler
 
 TASKS_DIR = Path(runner.__file__).parent / 'tasks'
 
@@ -55,15 +55,16 @@ TASKS_DIR = Path(runner.__file__).parent / 'tasks'
 _BACKFILLED = ('reify_task_12', 'reify_task_27', 'df_task_18')
 
 # Fixtures that carry a top-level ``post_task_commit`` but no ``reference``
-# block, and are NOT fixed here: they are outside this task's locked module set
-# (only the three above are editable in this lane), so back-filling them is
-# filed as follow-up work rather than smuggled in.
+# block. Task 3828 is back-filling the last two: ``df_task_12`` leaves this
+# list as its reference block lands, and ``df_task_13`` follows. (The original
+# justification — "outside this task's locked module set" — was 3628's, whose
+# lane could edit only the three fixtures above; it no longer applies.)
 #
 # Listed by name, and enforced with a STRICT xfail rather than skipped, so the
-# exemption is both visible and shrinkable: the day either one is back-filled
-# its case XPASSes and this suite fails until the name is removed. An exemption
-# that can be forgotten is how the corpus grew these two in the first place.
-_EXEMPT_NO_REFERENCE = ('df_task_12', 'df_task_13')
+# exemption is both visible and shrinkable: the day one is back-filled its case
+# XPASSes and this suite fails until the name is removed. An exemption that can
+# be forgotten is how the corpus grew these two in the first place.
+_EXEMPT_NO_REFERENCE = ('df_task_13',)
 
 
 def _fixture_names() -> list[str]:
@@ -227,4 +228,53 @@ def test_backfilled_fixture_reference_diff_materializes(name: str) -> None:
     assert diff, f'{name}: reference diff materialized EMPTY ({pre}..{post})'
     assert 'diff --git' in diff, (
         f'{name}: reference diff carries no git header — got {diff[:200]!r}'
+    )
+
+
+@pytest.mark.parametrize('name', _WITH_REFERENCE)
+def test_declared_diff_stat_matches_the_landed_diff(name: str) -> None:
+    """Every declared ``diff_stat`` is the stat the landed diff actually has.
+
+    The two guards above both accept INVENTED numbers: the structural one
+    asserts only that the three values are ints with ``files > 0`` and
+    ``insertions + deletions > 0``, and the materializing one asserts only that
+    the diff is non-empty — so ``{"files": 99, "insertions": 99,
+    "deletions": 99}`` sails through both. Nothing pinned a declared stat to the
+    change it claims to describe, and for a HAND-back-filled fixture the
+    accuracy of that triple is the entire deliverable (task 3828 measured two of
+    them by hand; "do not invent numbers" was until now unenforceable).
+
+    Re-derives the stat through ``task_sampler.capture_reference`` — the same
+    helper ``task_sampler.build_fixture_record`` uses to AUTHOR this block for
+    sampler-generated fixtures — rather than reimplementing shortstat parsing
+    test-side, so there stays exactly one definition of what a diff_stat means.
+    Skips loudly, on the same discipline as the test above, wherever a checkout
+    or a SHA is absent on this machine.
+    """
+    raw = _raw(name)
+    project_root = Path(raw['project_root'])
+    if not project_root.exists():
+        pytest.skip(
+            f'{name}: checkout {project_root} is absent on this machine'
+        )
+
+    pre = raw['pre_task_commit']
+    post = raw['reference']['post_task_commit']
+    for label, sha in (('pre_task_commit', pre), ('reference SHA', post)):
+        if not _commit_exists(project_root, sha):
+            pytest.skip(
+                f'{name}: {label} {sha} does not resolve in {project_root}'
+            )
+
+    captured = asyncio.run(
+        task_sampler.capture_reference(project_root, pre, post)
+    )
+
+    assert raw['reference']['diff_stat'] == {
+        'files': captured.files,
+        'insertions': captured.insertions,
+        'deletions': captured.deletions,
+    }, (
+        f'{name}: declared diff_stat does not match the real diff at '
+        f'{pre}..{post} in {project_root}'
     )
