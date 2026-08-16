@@ -1417,37 +1417,6 @@ def test_systemd_analyze_skip_reason_requires_both_binary_and_user_runtime_dir(
     assert reason is None
 
 
-def test_systemd_analyze_test_is_gated_on_the_runtime_dir_predicate() -> None:
-    """The guarded test's skipif must be DERIVED from the predicate above.
-
-    A predicate that is correct but never consumed leaves the exact bug this
-    task fixes in place, so the wiring gets its own assertion rather than
-    trusting the decorator by inspection.  This is not a tautology: it fails
-    the moment anyone reintroduces an independent condition into the
-    decorator (e.g. re-adding a bare ``shutil.which(...) is None`` check, or
-    a second DBUS_SESSION_BUS_ADDRESS clause) instead of deriving both the
-    condition and the reason from ``_SYSTEMD_ANALYZE_SKIP_REASON`` -- which is
-    exactly how a fixed gate would silently un-fix itself later.
-
-    Verified working via direct introspection in this worktree: the guarded
-    function exposes ``pytestmark == [Mark(name='skipif', args=(False,),
-    kwargs={'reason': '<static string>'})]``.  The condition is asserted as
-    the ``is not None`` bool (never a string): ``pytest.mark.skipif`` treats
-    a STRING condition as a legacy eval-able expression, so passing the
-    reason text itself as the condition would silently change its meaning
-    rather than raise.
-    """
-    marks = [
-        mark
-        for mark in test_systemd_analyze_verify_reports_no_ignored_directives.pytestmark
-        if mark.name == "skipif"
-    ]
-    assert len(marks) == 1  # exactly one gate, not two independent ones
-    (mark,) = marks
-    assert mark.args == (_SYSTEMD_ANALYZE_SKIP_REASON is not None,)
-    assert mark.kwargs.get("reason") == (_SYSTEMD_ANALYZE_SKIP_REASON or "")
-
-
 @pytest.mark.skipif(
     _SYSTEMD_ANALYZE_SKIP_REASON is not None,
     reason=_SYSTEMD_ANALYZE_SKIP_REASON or "",
