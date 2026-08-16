@@ -36,6 +36,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from orchestrator import hold_history
+
 _DURATION_RE = re.compile(r'^(\d+)([smhd])$')
 
 
@@ -86,11 +88,6 @@ class ModuleStats:
         if self.hold_samples == 0:
             return 0.0
         return self.total_hold_secs / self.hold_samples
-
-
-def _first_component(module: str) -> str:
-    """Return the first path component (groups by top-level path component for analytics)."""
-    return module.strip('/').split('/', 1)[0] if module else ''
 
 
 def _iter_events(
@@ -155,12 +152,14 @@ def aggregate(db_path: Path, since: datetime) -> dict[str, ModuleStats]:
     for row in _iter_events(db_path, since):
         event_type = row['event_type']
         task_id = row['task_id']
-        data = row['data']
-        modules = data.get('modules') or []
-        if isinstance(modules, str):
-            modules = [modules]
-        keys = {_first_component(m) for m in modules if m}
-        keys.discard('')
+        # The module keys are used VERBATIM: the payload already carries them
+        # depth-coarsened at the emitting project's own `lock_depth`, which is
+        # the exact key `ModuleLockTable._limit_for` and `module_overrides`
+        # look up (scheduler.py:1505-1517).  Re-applying `normalize_lock` here
+        # would need that project's `lock_depth`, and the CLI is handed a db
+        # path with no config to read it from.  `dict.fromkeys` de-duplicates
+        # within one event while preserving order.
+        keys = dict.fromkeys(hold_history.modules_of(row))
         if event_type == 'lock_acquired':
             posix = _parse_ts(row['timestamp'])
             for k in keys:
