@@ -1065,6 +1065,44 @@ class TestClaimantRunIdIsComposedOrNone:
         assert claimant.run_id is None
         assert claimant.session_id == 'sess-13-abc123'
 
+    async def test_string_owner_pid_composes_from_the_PARSED_int(
+        self, tmp_path: Path,
+    ) -> None:
+        """The composed identity embeds the PARSED int, not the raw JSON value.
+
+        Pins the ``parsed_pid`` hoist in ``_resolve_live_claimant`` against a
+        refactor back to composing from ``lock_data.get('owner_pid')`` (or to
+        re-parsing it separately from the liveness check).
+
+        The fixture uses a ZERO-PADDED pid string deliberately: it is the
+        cheapest spelling that survives ``int()`` as the live pid yet differs
+        under ``f'{...}'``.  A plain ``str(os.getpid())`` would NOT discriminate
+        — ``compose_claimant_run_id`` is an f-string, so ``'12345'`` and
+        ``12345`` format identically and the assertion would hold either way.
+        Here the raw value would compose ``.../pid=012345`` while the DB stamp,
+        built from ``os.getpid()``, composes ``.../pid=12345``: a byte mismatch
+        that ``classify_pins`` would read as a DIFFERENT live incarnation.
+        """
+        padded_pid = f'0{os.getpid()}'
+        assert int(padded_pid) == os.getpid()  # same process...
+        assert padded_pid != str(os.getpid())  # ...different byte sequence
+
+        _write_plan_lock(tmp_path, {
+            'session_id': 'sess-13-abc123',
+            'locked_at': datetime.now(UTC).isoformat(),
+            'owner_pid': padded_pid,
+            'run_id': 'run-abc',
+        })
+
+        claimant = await self._resolve(tmp_path)
+
+        assert claimant is not None
+        assert claimant.source == ClaimantSource.PLAN_LOCK
+        assert claimant.run_id == compose_claimant_run_id(
+            'run-abc', 'sess-13-abc123', os.getpid(),
+        )
+        assert f'/pid={padded_pid}' not in claimant.run_id
+
     @pytest.mark.parametrize(
         'session_id',
         ['', '   ', 42, None, ['sess']],
