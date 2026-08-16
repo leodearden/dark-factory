@@ -38,6 +38,34 @@ import re
 
 import pytest
 
+# Section 5's parsing is SHARED with
+# tests/scripts/test_check_orchestrator_unit_parity.py, whose registry
+# staleness guard derives the checker's UNITS set from the same `_orch_units`
+# array. Both modules held private copies pinned to the same brittle source
+# text; importable by name because tests/scripts/conftest.py puts this
+# directory on sys.path (cf. systemd_unit_invariants.py).
+from setup_host_parsing import (
+    DECISION_LOOP_HEADER as _DECISION_LOOP_HEADER,
+)
+from setup_host_parsing import (
+    INSTALL_LIST_APPEND as _INSTALL_LIST_APPEND,
+)
+from setup_host_parsing import (
+    INSTALL_LOOP_CP as _INSTALL_LOOP_CP,
+)
+from setup_host_parsing import (
+    INSTALL_LOOP_HEADER as _INSTALL_LOOP_HEADER,
+)
+from setup_host_parsing import (
+    UNIT_DIR_VAR as _UNIT_DIR_VAR,
+)
+from setup_host_parsing import (
+    declared_orchestrator_units as _declared_orchestrator_units,
+)
+from setup_host_parsing import (
+    shell_statements as _shell_statements,
+)
+
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 DF_SERVICE = REPO_ROOT / "scripts" / "orchestrator-dark-factory.service"
 REIFY_SERVICE = REPO_ROOT / "scripts" / "orchestrator-reify.service"
@@ -783,62 +811,12 @@ def _unit_has_install_section(content: str) -> bool:
     return "Install" in _parse_sections(content)
 
 
-def _shell_statements(script_text: str) -> list[str]:
-    """Non-comment, non-blank statements of a shell script, whitespace-stripped.
-
-    Comments are dropped so that a unit merely NAMED in the section header
-    prose above the cp block cannot satisfy an assertion that the installer
-    actually copies it.
-    """
-    return [
-        stripped
-        for line in script_text.splitlines()
-        if (stripped := line.strip()) and not stripped.startswith("#")
-    ]
-
-
 # Parsed once at import and shared by every consumer below (the parametrized
 # installer guard, one case per template, plus the SETUP.md parity guard) —
 # setup-host.sh does not change under a test run, so re-reading and re-parsing
 # it per case bought nothing.
 SETUP_HOST_STATEMENTS = _shell_statements(SETUP_HOST_SH.read_text(encoding="utf-8"))
 
-# Destination the installer must copy units into: ~/.config/systemd/user, via
-# the $UNIT_DIR variable setup-host.sh defines.  Asserted explicitly because a
-# `cp` to anywhere else leaves the unit uninstalled just as surely as no `cp`
-# at all — which is the failure class this whole section exists to close.
-_UNIT_DIR_VAR = "$UNIT_DIR"
-
-# setup-host.sh declares the units it installs ONCE, as an array, and loops
-# over it for both the copy and the enable — so "does the installer install X"
-# is now a membership question, and the loop statements below are what make
-# that membership mean anything.
-#
-#   _orch_units=(
-#     orchestrator-reify.service        # reify orchestrator, escalation 8100
-#     ...
-#   )
-#
-# The same array is parsed by tests/scripts/test_check_orchestrator_unit_parity.py's
-# registry staleness guard.  Duplicated rather than shared because these two
-# suites already parse setup-host.sh independently, and a shared helper between
-# two test modules is a heavier coupling than the six lines it would save.
-_ORCH_UNITS_ARRAY_RE = re.compile(
-    r"^_orch_units=\(\n(?P<body>.*?)^\)$", re.MULTILINE | re.DOTALL
-)
-
-# declaration -> per-unit gate decision -> cleared set -> copy.  A unit listed
-# in an array nothing walks, or copied from a list the gate never filtered, is
-# as badly wired as a unit nobody listed.
-_DECISION_LOOP_HEADER = 'for _unit in "${_orch_units[@]}"; do'
-_INSTALL_LIST_APPEND = '_orch_install_units+=("$_unit")'
-_INSTALL_LOOP_HEADER = 'for _unit in "${_orch_install_units[@]}"; do'
-# Pinned as the whole `if ...; then` rather than the bare `cp`, so the copy's
-# FAILURE handling is asserted too.  A bare `cp` under `set -euo pipefail`
-# aborts setup-host.sh on the first unit it cannot write — one uncopyable unit
-# would take daemon-reload, every enable and every later installer section
-# with it.
-_INSTALL_LOOP_CP = f'if cp "$REPO_ROOT/scripts/$_unit" "{_UNIT_DIR_VAR}/"; then'
 # The enable obligation is decided at RUN TIME from the unit's own [Install]
 # section — the same rule _unit_has_install_section expresses here in Python —
 # rather than from a hand-maintained exception list naming the static watchdog
@@ -852,23 +830,6 @@ _ENABLE_INSTALL_GUARD = (
     "if grep -q '^\\[Install\\]' \"$REPO_ROOT/scripts/$_unit\"; then"
 )
 _ENABLE_STATEMENT = 'systemctl --user enable "$_unit"'
-
-
-def _declared_orchestrator_units() -> set[str]:
-    """The unit basenames setup-host.sh's `_orch_units` array declares.
-
-    Trailing ``# rationale`` comments on an entry are stripped: that prose is
-    the per-unit justification the old one-line-per-unit enable block carried,
-    and it is not part of the unit name.
-    """
-    match = _ORCH_UNITS_ARRAY_RE.search(SETUP_HOST_SH.read_text(encoding="utf-8"))
-    if match is None:
-        return set()
-    units = set()
-    for line in match.group("body").splitlines():
-        if entry := line.split("#", 1)[0].strip():
-            units.add(entry)
-    return units
 
 
 def test_setup_host_install_predicate_discriminates() -> None:

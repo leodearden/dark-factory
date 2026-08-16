@@ -52,6 +52,23 @@ import types
 
 import pytest
 
+# The parsing of setup-host.sh section 5 is SHARED with
+# tests/scripts/test_orchestrator_service_files.py, which derives its own
+# claims from the same `_orch_units` array and the same loop statements. Both
+# suites held private copies of it; one brittle source text parsed two ways is
+# how a reflow of that section turns two suites red for one cause, with each
+# failure naming the other module's helper.
+#
+# Importable by name because tests/scripts/conftest.py puts this directory on
+# sys.path (cf. systemd_unit_invariants.py); pytest's --import-mode=importlib
+# deliberately does not.
+from setup_host_parsing import (
+    INSTALL_LOOP_CP as _INSTALL_LOOP_CP,
+)
+from setup_host_parsing import (
+    declared_orchestrator_units as _units_installed_by_setup_host,
+)
+
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 CHECKER_PATH = REPO_ROOT / "scripts" / "check_orchestrator_unit_parity.py"
 DASHBOARD_CHECKER_PATH = REPO_ROOT / "scripts" / "check_dashboard_unit_parity.py"
@@ -209,63 +226,6 @@ _EXPECTED_UNITS = {
     "orchestrator-pump-web-ui.service",
 }
 
-# setup-host.sh no longer carries one literal `cp` line per unit; it declares
-# the set once and loops. This matches that declaration:
-#
-#   _orch_units=(
-#     orchestrator-reify.service        # reify orchestrator, escalation 8100
-#     ...
-#   )
-#
-# Anchored on a column-0 `_orch_units=(` ... `)` pair so no other parenthesised
-# construct in the installer can be mistaken for it.
-_ORCH_UNITS_ARRAY_RE = re.compile(
-    r"^_orch_units=\(\n(?P<body>.*?)^\)$", re.MULTILINE | re.DOTALL
-)
-
-# The four statements that make the array MEAN something. Replacing the old
-# both-endpoints-anchored `cp` regex with this chain preserves everything that
-# regex bought and adds the per-unit link: a unit named in the array but never
-# judged, never added to the cleared set, or copied somewhere other than
-# $UNIT_DIR, is as uninstalled as a unit nobody listed at all.
-#
-#   declaration  ->  per-unit decision  ->  cleared set  ->  copy
-_DECISION_LOOP_HEADER = 'for _unit in "${_orch_units[@]}"; do'
-_INSTALL_LIST_APPEND = '_orch_install_units+=("$_unit")'
-_INSTALL_LOOP_HEADER = 'for _unit in "${_orch_install_units[@]}"; do'
-_INSTALL_LOOP_CP = 'if cp "$REPO_ROOT/scripts/$_unit" "$UNIT_DIR/"; then'
-
-
-def _shell_statements(script_text: str) -> list[str]:
-    """Non-comment, non-blank statements, whitespace-stripped.
-
-    Mirrors tests/scripts/test_orchestrator_service_files.py's helper of the
-    same name, and for the same reason: a unit or a command merely NAMED in
-    the section's header prose must not satisfy an assertion that the
-    installer actually runs it.
-    """
-    return [
-        stripped
-        for line in script_text.splitlines()
-        if (stripped := line.strip()) and not stripped.startswith("#")
-    ]
-
-
-def _units_installed_by_setup_host() -> set[str]:
-    """Extract the unit names setup-host.sh installs, from its `_orch_units` array."""
-    match = _ORCH_UNITS_ARRAY_RE.search(SETUP_HOST_PATH.read_text(encoding="utf-8"))
-    if match is None:
-        return set()
-    units = set()
-    for line in match.group("body").splitlines():
-        # Each entry may carry a trailing `# rationale` comment — that prose is
-        # the per-unit justification the old enable block held, and it must not
-        # be parsed as part of the unit name.
-        if entry := line.split("#", 1)[0].strip():
-            units.add(entry)
-    return units
-
-
 def test_registry_covers_the_nine_verbatim_copied_units():
     """UNITS registers exactly the nine units setup-host.sh copies verbatim."""
     checker = _load_checker()
@@ -337,58 +297,19 @@ def test_registry_matches_setup_host_cp_lines():
     )
 
 
-def test_the_install_loop_actually_consumes_the_declared_unit_array():
-    """The `_orch_units` array is what DRIVES the copy, not decoration.
-
-    The staleness guard above derives the registry from that array, so the
-    array has to be the thing the installer acts on — otherwise a unit could be
-    declared, registered, checked, and never installed, and every test here
-    would still be green.
-
-    Four statements are asserted, and together they reconstruct everything the
-    old both-endpoints-anchored `cp` regex bought before section 5 was made
-    declarative, plus the per-unit link the gate now depends on:
-
-        declaration -> per-unit decision -> cleared set -> copy into $UNIT_DIR
-
-    Break any one link and the array stops meaning "these units get installed":
-    a decision loop over some other list judges the wrong units, an install
-    loop over `_orch_units` rather than the cleared set installs the skipped
-    ones, and a copy to a staging path leaves the unit as uninstalled as no
-    copy at all.
-
-    Read through the comment-stripped view so a `cp` shown as an EXAMPLE in the
-    section's header prose cannot satisfy it.
-    """
-    statements = _shell_statements(_installer_section())
-
-    for expected, why in (
-        (
-            _DECISION_LOOP_HEADER,
-            "nothing walks the declared `_orch_units` array, so the array is "
-            "documentation — and the registry staleness guard above is derived "
-            "from documentation",
-        ),
-        (
-            _INSTALL_LIST_APPEND,
-            "the per-unit decision never adds a cleared unit to "
-            "`_orch_install_units`, so the decision has no effect",
-        ),
-        (
-            _INSTALL_LOOP_HEADER,
-            "the install loop does not iterate the CLEARED set, so a unit the "
-            "gate declined would be copied anyway",
-        ),
-        (
-            _INSTALL_LOOP_CP,
-            "the install loop does not copy into $UNIT_DIR; the destination is "
-            "asserted, not just the source",
-        ),
-    ):
-        assert expected in statements, (
-            f"{SETUP_HOST_PATH}: {why}.\nExpected the statement:\n"
-            f"    {expected}\nSection statements: {statements}"
-        )
+# The claim "the `_orch_units` array is what DRIVES the copy, not decoration"
+# — declaration -> per-unit decision -> cleared set -> copy into $UNIT_DIR — is
+# asserted ONCE, in tests/scripts/test_orchestrator_service_files.py's
+# test_setup_host_installs_every_orchestrator_unit, which makes the same four
+# statement assertions per committed template against an independently parsed
+# statement list. This module used to restate it verbatim; the duplicate was
+# pinned to the same brittle source text, so a reflow of section 5 turned two
+# suites red for one cause.
+#
+# The staleness guard above still depends on that claim (it derives the
+# registry from the array), and the behavioural tests at the end of this module
+# are its stronger guard anyway: they EXECUTE the sliced section against tmp
+# trees and assert which unit files actually appear.
 
 
 # ---------------------------------------------------------------------------
