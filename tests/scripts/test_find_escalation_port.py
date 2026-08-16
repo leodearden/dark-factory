@@ -1188,3 +1188,150 @@ def test_an_empty_survey_says_so_rather_than_looking_unparsed(
     _rc, _out, err = _run_main(fep, ["--df-root", str(df_root), "--base", "8100"])
 
     assert "(none found)" in err
+
+
+# ---------------------------------------------------------------------------
+# --exclude-root, and the stdout contract SKILL.md / SETUP.md depend on
+# ---------------------------------------------------------------------------
+
+
+def test_exclude_root_releases_the_targets_own_claim(
+    fep: types.ModuleType, no_systemd: None, tmp_path: pathlib.Path
+) -> None:
+    """--exclude-root exists so a target repo carrying a STALE config does not block
+    itself out of the port it already holds.
+
+    Re-running factory-init on an already-initialised repo is the normal case, and
+    without this the script would read that repo's own config, treat its port as
+    taken, and hand it a different one on every run.
+
+    RE-MEASURED at base ``fc6f048b55``: same tree, ``--base 8100`` yields 8102 without
+    the flag and 8101 with ``--exclude-root <target>`` — rc 0, stdout "8101".
+    """
+    parent, df_root = _claiming_tree(tmp_path, {"proj-a": 8100, "target": 8101})
+    target = parent / "target"
+
+    rc, out, _err = _run_main(fep, ["--df-root", str(df_root), "--base", "8100"])
+    assert (rc, out) == (0, "8102\n"), "without the flag, target's 8101 counts as claimed"
+
+    rc, out, _err = _run_main(
+        fep, ["--df-root", str(df_root), "--base", "8100", "--exclude-root", str(target)]
+    )
+    assert (rc, out) == (0, "8101\n"), "the excluded root's own claim must be released"
+
+
+def test_exclude_root_matches_on_the_resolved_path_from_either_side(
+    fep: types.ModuleType, fake_systemd, tmp_path: pathlib.Path
+) -> None:
+    """Exclusion survives a symlink on EITHER side of the comparison.
+
+    ``main()`` compares ``root.resolve() == Path(args.exclude_root).resolve()``, and
+    the two ``.resolve()`` calls guard DIFFERENT things. Written as one test because
+    covering only one side was MEASURED insufficient:
+
+      - RIGHT side (``Path(args.exclude_root).resolve()``, line 132): the operator
+        passes a symlink. SKILL.md passes whatever path the operator typed, so this
+        is the ordinary case.
+      - LEFT side (``root.resolve()``, line 136): the DISCOVERED root is itself a
+        non-canonical spelling. That is not hypothetical — step-3 pins that a root
+        named through a symlink alias in DASHBOARD_KNOWN_PROJECT_ROOTS is retained
+        under its UNRESOLVED spelling, so this is exactly the shape
+        ``known_project_roots`` hands to main().
+
+    MEASURED at base ``fc6f048b55``, and the reason this test covers both: dropping
+    ``.resolve()`` from the LEFT side while only the right-side case was asserted left
+    the whole module GREEN (``39 passed``), because ``exclude`` is already resolved at
+    parse time and the glob-discovered root was already canonical.
+
+    MEASURED RED at base ``fc6f048b55`` once the left-side case was added, scratch
+    mutation reverted before commit: dropping ``root.resolve()`` (``root == exclude``)
+    — RED::
+
+        E  AssertionError: a symlink-spelled discovered root stopped matching
+        E  assert (0, '8102\\n') == (0, '8101\\n')
+    """
+    parent, df_root = _claiming_tree(tmp_path, {"proj-a": 8100, "target": 8101})
+    alias = tmp_path / "outside" / "target-alias"
+    alias.parent.mkdir(parents=True, exist_ok=True)
+    alias.symlink_to(parent / "target", target_is_directory=True)
+
+    # RIGHT side: discovered canonically (glob), excluded via the symlink spelling.
+    fake_systemd([])
+    rc, out, _err = _run_main(
+        fep, ["--df-root", str(df_root), "--base", "8100", "--exclude-root", str(alias)]
+    )
+    assert (rc, out) == (0, "8101\n"), "a symlinked --exclude-root stopped matching"
+
+    # LEFT side: DISCOVERED through the alias (the unit env names it that way, and
+    # step-3 pins that the unresolved spelling is what survives dedup), excluded via
+    # the canonical path.
+    fake_systemd([alias])
+    rc, out, _err = _run_main(
+        fep,
+        ["--df-root", str(df_root), "--base", "8100", "--exclude-root", str(parent / "target")],
+    )
+    assert (rc, out) == (0, "8101\n"), "a symlink-spelled discovered root stopped matching"
+
+
+def test_excluding_an_unrelated_or_absent_root_changes_nothing(
+    fep: types.ModuleType, no_systemd: None, tmp_path: pathlib.Path
+) -> None:
+    """Excluding a root outside the discovered set is a no-op, and omitting the flag
+    leaves ``exclude`` None so nothing is excluded."""
+    parent, df_root = _claiming_tree(tmp_path, {"proj-a": 8100, "target": 8101})
+    unrelated = tmp_path / "outside" / "not-a-project"
+    unrelated.mkdir(parents=True)
+
+    baseline = _run_main(fep, ["--df-root", str(df_root), "--base", "8100"])
+    assert baseline[:2] == (0, "8102\n")
+
+    excluded = _run_main(
+        fep, ["--df-root", str(df_root), "--base", "8100", "--exclude-root", str(unrelated)]
+    )
+    assert excluded[:2] == baseline[:2]
+
+    # ...and the same tree with proj-a excluded DOES change, so the no-op above is
+    # a real no-op rather than an exclusion that never works.
+    assert _run_main(
+        fep,
+        ["--df-root", str(df_root), "--base", "8100", "--exclude-root", str(parent / "proj-a")],
+    )[:2] == (0, "8100\n")
+
+
+def test_stdout_is_exactly_the_chosen_port_and_nothing_else(
+    fep: types.ModuleType, no_systemd: None, tmp_path: pathlib.Path
+) -> None:
+    """THE MACHINE-READABLE CONTRACT.
+
+    SKILL.md invokes this script under command substitution
+    (``python3 <skill>/scripts/find_escalation_port.py --exclude-root <target>
+    --base 8100``) and SETUP.md documents it as the step that reserves a port — so
+    stdout is an interface, not a log. MEASURED via ``od -c``: the port digits and a
+    single newline, nothing else.
+
+    A stray debug ``print()`` added to stdout must break THIS test rather than
+    silently corrupting a caller's captured value.
+
+    MEASURED RED at base ``fc6f048b55``, scratch mutation reverted before commit:
+    changing the final ``print(chosen)`` to ``print(f"port: {chosen}")`` — RED::
+
+        E  AssertionError: stdout must be a bare integer, got 'port: 8102'
+    """
+    _parent, df_root = _claiming_tree(tmp_path, {"proj-a": 8100, "target": 8101})
+
+    rc, out, err = _run_main(fep, ["--df-root", str(df_root), "--base", "8100"])
+
+    assert rc == 0
+    # Exactly one line, and that line is a bare integer.
+    assert out.endswith("\n")
+    assert out.count("\n") == 1, f"stdout carried more than one line: {out!r}"
+    assert out.strip().isdigit(), f"stdout must be a bare integer, got {out.strip()!r}"
+    assert int(out.strip()) == 8102
+
+    # The entire evidence table is on stderr, and it names the chosen port. The
+    # structural markers are asserted; the table's prose deliberately is not.
+    assert err, "the evidence table must not be empty"
+    assert "Escalation port survey" in err
+    assert "Reserved:" in err
+    assert "Claimed by existing project configs:" in err
+    assert "CHOSEN escalation port: 8102" in err
