@@ -247,6 +247,99 @@ def test_building_an_llm_probe_for_an_embedding_arm_is_a_typed_error():
 
 
 # ---------------------------------------------------------------------------
+# The warm-up request (task 3781)
+#
+# The measured probe is meant to be ENGINE-warm and PREFIX-COLD -- the state a
+# production request actually arrives in.  That is only achievable if the
+# discarded warm-up carries a DIFFERENT prompt: warming with the same text
+# populates the very prefix cache the measured probe must find cold.  Measured
+# 2026-08-06 on moe-stretch, llama.cpp served the warm run with 338 of its 343
+# prompt tokens from cache, so a same-prompt warm-up does not merely blunt the
+# measurement, it inverts what the number means.
+# ---------------------------------------------------------------------------
+
+
+def _user_content(body: dict) -> str:
+    """The user message's text, which is where the probe passage lives."""
+    return next(m['content'] for m in body['messages'] if m['role'] == 'user')
+
+
+def test_the_llm_warmup_request_does_not_reuse_the_measured_probe_text():
+    warm = lms_healthcheck.build_llm_probe_request(_arm(), warmup=True)
+    measured = lms_healthcheck.build_llm_probe_request(_arm(), warmup=False)
+
+    warm_sent = json.dumps(warm['messages'])
+    measured_sent = json.dumps(measured['messages'])
+
+    assert lms_healthcheck.PROBE_TEXT not in warm_sent
+    assert lms_healthcheck.WARMUP_PROBE_TEXT in warm_sent
+    assert lms_healthcheck.PROBE_TEXT in measured_sent
+    assert lms_healthcheck.WARMUP_PROBE_TEXT not in measured_sent
+
+
+def test_the_warmup_text_diverges_at_the_first_user_token():
+    """The load-bearing property, not a cosmetic one.
+
+    A prefix cache is a PREFIX cache: it is the shared LEADING tokens that get
+    reused, so a warm-up sharing a long opening with the measured probe warms
+    exactly the thing the measured probe is supposed to find cold.  The probe
+    text is placed first in the user message precisely so a different passage
+    diverges at the very first user token, leaving only the short system
+    message cacheable.
+    """
+    warm = _user_content(lms_healthcheck.build_llm_probe_request(_arm(), warmup=True))
+    measured = _user_content(lms_healthcheck.build_llm_probe_request(_arm()))
+
+    shared = 0
+    for warm_char, measured_char in zip(warm, measured):
+        if warm_char != measured_char:
+            break
+        shared += 1
+
+    assert shared < 8, (
+        f'the warm-up and measured user messages share a {shared}-character '
+        'leading prefix; that prefix is exactly what a prefix cache reuses'
+    )
+
+
+@pytest.mark.parametrize('make_arm', [_arm, _moe_arm], ids=['vllm', 'llamacpp'])
+def test_the_warmup_request_is_otherwise_shape_identical(make_arm):
+    """Same code path, different text.
+
+    The warm-up's whole job is to warm what the measured probe will exercise --
+    grammar compilation, sampler setup, CUDA graph capture.  A warm-up that
+    differed in `response_format` or `chat_template_kwargs` would warm a
+    DIFFERENT path and leave the measured probe paying the cold cost anyway.
+    """
+    warm = lms_healthcheck.build_llm_probe_request(make_arm(), warmup=True)
+    measured = lms_healthcheck.build_llm_probe_request(make_arm())
+
+    for key in ('model', 'temperature', 'max_tokens', 'response_format'):
+        assert warm[key] == measured[key], key
+    assert warm.get('chat_template_kwargs') == measured.get('chat_template_kwargs')
+    assert set(warm) == set(measured)
+    assert [m['role'] for m in warm['messages']] == [
+        m['role'] for m in measured['messages']
+    ]
+    # The system message is the one part that may legitimately stay cached.
+    warm_system = next(m['content'] for m in warm['messages'] if m['role'] == 'system')
+    measured_system = next(
+        m['content'] for m in measured['messages'] if m['role'] == 'system'
+    )
+    assert warm_system == measured_system
+
+
+def test_warmup_defaults_to_false_so_the_measured_probe_is_the_default():
+    """Every existing caller asks for the measured probe by asking for nothing."""
+    assert lms_healthcheck.build_llm_probe_request(
+        _arm()
+    ) == lms_healthcheck.build_llm_probe_request(_arm(), warmup=False)
+    assert lms_healthcheck.build_embedding_probe_request(
+        _embedding_arm()
+    ) == lms_healthcheck.build_embedding_probe_request(_embedding_arm(), warmup=False)
+
+
+# ---------------------------------------------------------------------------
 # Response verdicts -- the same probe model judges every arm
 # ---------------------------------------------------------------------------
 
@@ -702,6 +795,27 @@ def test_an_arm_without_a_declared_prefix_gets_none_invented():
     body = lms_healthcheck.build_embedding_probe_request(_unprefixed_arm())
 
     assert 'Instruct:' not in body['input'][0]
+
+
+def test_the_embedding_warmup_query_differs_from_the_measured_one():
+    """The embedding axis needs its own distinct warm-up text, for the same
+    reason the LLM axis does -- and the declared `query_prefix` must be applied
+    to BOTH.  An unprefixed warm-up would warm the document-side path of an
+    asymmetric model, which is not the path the measured probe takes.
+    """
+    arm = _embedding_arm()
+    prefix = arm.query_prefix
+    assert prefix is not None
+
+    warm = lms_healthcheck.build_embedding_probe_request(arm, warmup=True)
+    measured = lms_healthcheck.build_embedding_probe_request(arm)
+
+    assert warm['input'][0] != measured['input'][0]
+    assert lms_healthcheck.EMBEDDING_PROBE_QUERY not in warm['input'][0]
+    assert warm['input'] == [prefix + lms_healthcheck.WARMUP_EMBEDDING_QUERY]
+    assert warm['input'][0].startswith('Instruct:')
+    assert warm['model'] == measured['model']
+    assert warm['encoding_format'] == measured['encoding_format']
 
 
 def test_building_an_embedding_probe_for_an_llm_arm_is_a_typed_error():
