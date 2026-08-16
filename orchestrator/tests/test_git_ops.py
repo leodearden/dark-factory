@@ -5194,6 +5194,23 @@ def _write_stored_title(worktree: Path, title: str) -> None:
     )
 
 
+def _write_sibling_stored_title(worktree_base: Path, name: str, title: str) -> None:
+    """Write a sibling ``.task-meta/<name>/metadata.json`` carrying *title*.
+
+    Cold-path analogue of :func:`_write_stored_title`: on the cold path the
+    worktree directory does not exist (only the branch survives), so
+    :func:`~orchestrator.worktree_identity.read_worktree_title` can only read
+    the SIBLING ``<worktree_base>/.task-meta/<name>`` root (which survives
+    ``cleanup_worktree``'s removal of the worktree dir), not an in-worktree
+    ``.task`` sidecar.
+    """
+    meta_root = TaskArtifacts.meta_root_for(worktree_base, name)
+    meta_root.mkdir(parents=True, exist_ok=True)
+    (meta_root / 'metadata.json').write_text(
+        json.dumps({'title': title, 'task_id': name})
+    )
+
+
 @pytest.mark.asyncio
 class TestWorktreeReuseIdentityGuard:
     """Fix C reuse path — create_worktree(expected_title=...) quarantines a
