@@ -4017,10 +4017,11 @@ class GraphitiBackend:
         Note the returned ``type`` value is the ``types`` COLUMN — a dict of
         property -> list of index-type strings, e.g. ``{'uuid': ['RANGE']}`` —
         NOT a scalar.  ``fused_memory.backends.falkor_indices.normalize_index_record``
-        models that shape.  (``drop_vector_indices`` still compares that dict
-        against the string ``'VECTOR'`` and is therefore a latent no-op; that is
-        pre-existing, deliberately out of scope for task 3706, and filed as a
-        separate follow-up.)
+        models that shape.  So does
+        ``falkor_indices.vector_index_properties``, through which
+        ``drop_vector_indices`` now consumes it PER PROPERTY (task 3769); until
+        then that method compared the whole dict against the string ``'VECTOR'``
+        and was a permanent no-op.
 
         Note on the CALL db.indexes() procedure and the read-only path:
         ``CALL db.indexes()`` is the *only* stored-procedure call sent on the
