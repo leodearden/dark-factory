@@ -626,6 +626,9 @@ class TestFanoutStreakIsolationAcrossProjectRoots:
                 a_result = await fetch_tasks(dummy_client, dummy_config, root_a)
                 b_result = await fetch_tasks(dummy_client, dummy_config, root_b)
 
+        # fetch_tasks returns ``list[dict] | dict``; narrow to the offline
+        # marker branch before reading it (same shape as the cache tests above).
+        assert isinstance(a_result, dict), 'root A must return the offline marker'
         assert a_result.get('offline') is True, 'root A must be failing'
         assert isinstance(b_result, list), 'root B must be healthy'
 
