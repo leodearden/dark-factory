@@ -275,8 +275,17 @@ DRAIN_MODES: tuple[str, ...] = (
     'targeted',
 )
 
-#: Modes that actually consume lock-held drain capacity.
-_CAPACITY_MODES: tuple[str, ...] = ('backlog_chunk', 'steady_state', 'remediation')
+#: Modes that drain buffered events — lock-held capacity MINUS remediation.
+#: This is the numerator of the remediation-FREE rate, and it is what the
+#: step-18 deferral gate leaves behind when it defers the inline remediation
+#: tail during backlog mode.
+_DRAIN_ONLY_MODES: tuple[str, ...] = ('backlog_chunk', 'steady_state')
+
+#: Modes that actually consume lock-held drain capacity.  Defined FROM
+#: :data:`_DRAIN_ONLY_MODES` so the two sets cannot drift apart: adding a new
+#: event-draining mode to one automatically adds it to the other, and the only
+#: intentional difference stays the single 'remediation' entry.
+_CAPACITY_MODES: tuple[str, ...] = (*_DRAIN_ONLY_MODES, 'remediation')
 
 #: BacklogIterator stamps each chunk with this trigger_reason prefix
 #: (harness.py:4848, 'backlog_chunk:{n}:{events}').  The final consolidation
@@ -345,7 +354,9 @@ def drain_stats(
         ``{'modes': {mode: {events, wall_clock_seconds, run_count,
         seconds_per_event}}, 'runs_in_flight': int,
         'drain_wall_clock_seconds': float, 'drain_events': int,
-        'drain_seconds_per_event': float | None}``.
+        'drain_seconds_per_event': float | None,
+        'drain_only_wall_clock_seconds': float,
+        'drain_only_seconds_per_event': float | None}``.
 
         Every mode in :data:`DRAIN_MODES` is always present, empty if unseen,
         so a consumer never has to guard on a missing key.
@@ -358,6 +369,28 @@ def drain_stats(
         The top-level ``drain_*`` totals cover :data:`_CAPACITY_MODES` only.
         Targeted runs hold no lock and consume no drain capacity, so folding
         their wall-clock in would understate real throughput.
+
+    TWO RATES, AND WHICH ONE TO USE — read this before doing arithmetic:
+
+    * ``drain_seconds_per_event`` is **remediation-INCLUSIVE**.  Remediation
+      wall-clock is in the numerator (it is lock-held capacity) while
+      remediation's zero events add nothing to the denominator, so the
+      remediation penalty is **already applied exactly once** in this rate.  A
+      caller must therefore NOT multiply it by ``(1 - duty_cycle)`` again —
+      that discounts twice and understates capacity by a factor of
+      ``1/(1 - duty)``.  Pair it with
+      ``sustainable_events_per_day(rate, remediation_duty_cycle=0.0)``.
+    * ``drain_only_seconds_per_event`` is the **remediation-FREE** rate:
+      :data:`_DRAIN_ONLY_MODES` wall-clock over the same ``drain_events``.
+      This is the one to pair with a *modelled* duty cycle, and it is the
+      post-lever-1 capacity — lever 1 (the step-18 backlog deferral gate)
+      removes remediation from the drain path, which is exactly what
+      excluding it from the numerator expresses.
+
+    The two are related by ``drain_only = inclusive * (1 - duty)`` exactly.
+    That identity is the algebraic statement that the inclusive rate already
+    carries the penalty; it is not an invitation to re-derive one from the
+    other in a caller.
     """
     floor = None
     if since is not None:
@@ -411,6 +444,12 @@ def drain_stats(
 
     drain_wall_clock = sum(modes[m]['wall_clock_seconds'] for m in _CAPACITY_MODES)
     drain_events = sum(modes[m]['events'] for m in _CAPACITY_MODES)
+    # Same event denominator, remediation wall-clock dropped from the
+    # numerator — remediation drains zero events, so the denominators are
+    # identical by construction and the two rates differ only by (1 - duty).
+    drain_only_wall_clock = sum(
+        modes[m]['wall_clock_seconds'] for m in _DRAIN_ONLY_MODES
+    )
 
     return {
         'modes': modes,
@@ -418,6 +457,9 @@ def drain_stats(
         'drain_wall_clock_seconds': drain_wall_clock,
         'drain_events': drain_events,
         'drain_seconds_per_event': _per_event(drain_wall_clock, drain_events),
+        'drain_only_wall_clock_seconds': drain_only_wall_clock,
+        'drain_only_seconds_per_event': _per_event(
+            drain_only_wall_clock, drain_events),
     }
 
 
@@ -549,12 +591,23 @@ def sustainable_events_per_day(
 
     ``86400 * utilisation * (1 - remediation_duty_cycle) / seconds_per_event``.
 
+    APPLY THE REMEDIATION PENALTY EXACTLY ONCE.  ``remediation_duty_cycle``
+    exists to model remediation overhead **on top of a remediation-free rate**.
+    Pass ``0.0`` whenever the supplied rate ALREADY includes remediation
+    wall-clock — which ``drain_stats``' ``drain_seconds_per_event`` does, and
+    which its ``drain_only_seconds_per_event`` does not.  Passing a measured
+    duty cycle alongside a measured inclusive rate double-discounts and
+    understates capacity by a factor of ``1/(1 - duty)``; see the two-rates
+    contract on :func:`drain_stats`.
+
     Args:
-        seconds_per_event: Amortised drain cost per event.
+        seconds_per_event: Amortised drain cost per event.  See above for
+            whether it should be paired with a non-zero duty cycle.
         remediation_duty_cycle: Fraction of lock-held drain wall-clock spent in
-            zero-event remediation passes (see :func:`remediation_duty_cycle`).
-            Lever 1 drives this toward 0, which is worth ``1/(1-duty)`` on the
-            same per-event rate — a pure scheduling win, no work saved.
+            zero-event remediation passes (see :func:`remediation_duty_cycle`),
+            to be applied to a rate that does NOT already include it.  Lever 1
+            drives this toward 0, which is worth ``1/(1-duty)`` on the same
+            per-event rate — a pure scheduling win, no work saved.
         utilisation: Fraction of the day the project is actually holding the
             reconciliation lock and draining.  1.0 is the theoretical ceiling,
             not an observed value.
