@@ -7,8 +7,9 @@ closes the incident's 23s TOCTOU: a non-blocking try-acquire of the tree's
 merge-verify flock is HELD across the ``git worktree remove`` (acquire-then-
 remove, never check-then-remove). This module pins the full outcome
 vocabulary — 'removed', 'skipped_lease_held', 'skipped_persistent',
-'not_present', 'failed' — via real git worktrees (no mocking of git itself),
-mirroring test_inflight_verify_merge_lease.py's fixture pattern.
+'not_present', 'failed', 'skipped_lock_error' — via real git worktrees (no
+mocking of git itself), mirroring test_inflight_verify_merge_lease.py's
+fixture pattern.
 
 TestRemoveMergeWorktreeGuarded exercises the primitive directly: uncontended
 removal; a lease-held skip that warns exactly once naming the holder pgid
@@ -23,6 +24,7 @@ force-removed, while uncontended removal is unchanged.
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
 import os
 from pathlib import Path
@@ -82,6 +84,17 @@ def git_ops(git_repo: Path) -> GitOps:
 async def _make_ephemeral_worktree(git_ops: GitOps) -> Path:
     """Build a real ephemeral ``_merge-<uuid>`` worktree at the repo's HEAD."""
     return await git_ops.create_throwaway_verify_worktree(await _head_sha(git_ops.project_root))
+
+
+def _raise_enospc(*_a, **_k):
+    """Simulate acquire_merge_verify_flock's PRE-bounded-wait failure.
+
+    verify_cancel.py does ``path.parent.mkdir(...)`` + ``os.open(path,
+    O_RDWR | O_CREAT)`` BEFORE its own try/except, so ENOSPC (a documented
+    recurring condition on this lane), EACCES, EMFILE or EROFS raises out
+    of the acquire rather than returning the None that means 'contended'.
+    """
+    raise OSError(errno.ENOSPC, 'No space left on device')
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +272,63 @@ class TestRemoveMergeWorktreeGuarded:
             release_merge_verify_flock(fd)
             remove_lock_holder_pgid(git_ops.worktree_base)
 
+    async def test_lane_lock_open_error_returns_skipped_lock_error_and_warns_once(
+        self, git_ops: GitOps, monkeypatch, caplog,
+    ):
+        """A lane lock that cannot be OPENED AT ALL must degrade to a distinct
+        skip outcome, never propagate. acquire_merge_verify_flock's pre-wait
+        ``mkdir`` + ``os.open`` sit outside its own try, so ENOSPC/EACCES/
+        EMFILE/EROFS raise instead of returning the None that means
+        'contended' -- and this primitive backs cleanup_merge_worktree's
+        documented "Never raises" contract.
+
+        The tree must SURVIVE: an unopenable lock never confirmed the lease,
+        so a live verify may still hold the flock on an existing lock inode
+        while our own open fails. The tree is left for the merge reaper."""
+        wt = await _make_ephemeral_worktree(git_ops)
+        monkeypatch.setattr(
+            'orchestrator.git_ops.acquire_merge_verify_flock', _raise_enospc,
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            outcome = await git_ops.remove_merge_worktree_guarded(wt, reason='sweep')
+
+        assert outcome == 'skipped_lock_error'
+        assert wt.exists(), (
+            'an unopenable lane lock leaves the lease unconfirmed, so the tree '
+            'must survive for the merge reaper'
+        )
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1, (
+            f'expected exactly one WARNING, got {len(warnings)}: '
+            f'{[r.getMessage() for r in warnings]}'
+        )
+        message = warnings[0].getMessage()
+        assert 'sweep' in message, message
+        assert 'No space left on device' in message, message
+
+    async def test_lane_lock_open_error_never_unlinks_a_lock_it_did_not_acquire(
+        self, git_ops: GitOps, monkeypatch,
+    ):
+        """Safety property mirroring test_lease_held_skip_preserves_holders_lock_file:
+        a failed open acquired nothing, so an already-present lock file (which
+        may be a live holder's) must be left untouched."""
+        wt = await _make_ephemeral_worktree(git_ops)
+        lock_path = lane_lock_path(wt)
+        lock_path.touch()
+        monkeypatch.setattr(
+            'orchestrator.git_ops.acquire_merge_verify_flock', _raise_enospc,
+        )
+
+        outcome = await git_ops.remove_merge_worktree_guarded(wt, reason='sweep')
+
+        assert outcome == 'skipped_lock_error'
+        assert lock_path.exists(), (
+            'a lock this call did not acquire must never be yanked -- it may be '
+            'a live holder\'s'
+        )
+
 
 # ---------------------------------------------------------------------------
 # step-9: cleanup_merge_worktree routes through the guarded primitive
@@ -305,3 +375,32 @@ class TestCleanupMergeWorktreeRouting:
         await git_ops.cleanup_merge_worktree(wt)
 
         assert not wt.exists()
+
+    async def test_cleanup_never_raises_when_lane_lock_cannot_be_opened(
+        self, git_ops: GitOps, monkeypatch,
+    ):
+        """Makes cleanup_merge_worktree's "Never raises; idempotent" docstring
+        contract actually checkable. An OSError out of the flock acquire (the
+        pre-wait mkdir/os.open) must not escape.
+
+        The tree must SURVIVE: the crash-safe ``shutil.rmtree`` fallback fires
+        ONLY on 'failed', and that force-removal is sound only because 'failed'
+        means the lease acquire SUCCEEDED and proved no live holder. An
+        unopenable lock proves nothing about holders, so it must never reach
+        that fallback -- a future refactor degrading this path to 'failed'
+        reintroduces the 23s TOCTOU C1 exists to close, and must break here."""
+        wt = await _make_ephemeral_worktree(git_ops)
+        monkeypatch.setattr(
+            'orchestrator.git_ops.acquire_merge_verify_flock', _raise_enospc,
+        )
+
+        await git_ops.cleanup_merge_worktree(wt)
+
+        assert wt.exists(), (
+            'the rmtree fallback must NOT fire on a lock-open error: the lease '
+            'was never confirmed, so a live holder cannot be ruled out'
+        )
+
+        # The docstring's idempotency half: a re-call must also not raise.
+        await git_ops.cleanup_merge_worktree(wt)
+        assert wt.exists()
