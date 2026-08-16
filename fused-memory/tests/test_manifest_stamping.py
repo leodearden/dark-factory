@@ -484,6 +484,7 @@ async def test_containment_refusal_is_reported_when_a_safe_sidecar_also_exists(t
         task_interceptor=task_interceptor,
     )
 
+    assert report is not None
     assert report['path'] == 'plans/good-prd.capability-manifest.yaml'
     assert report['stamped'] == ['beta']
     assert report['missing_labels'] == []
@@ -544,6 +545,7 @@ async def test_multiple_sidecars_processes_lexicographically_first(tmp_path):
         task_interceptor=task_interceptor,
     )
 
+    assert report is not None
     assert report['path'] == 'plans/alpha-prd.capability-manifest.yaml'
     assert report['stamped'] == ['alabel']
     assert report['missing_labels'] == []
@@ -609,6 +611,7 @@ async def test_rejected_update_task_write_is_recorded_not_silently_dropped(
             task_interceptor=task_interceptor,
         )
 
+    assert report is not None
     assert report['path'] == 'plans/good-prd.capability-manifest.yaml'
     # The rejection must NOT retroactively empty stamped.
     assert report['stamped'] == ['beta']
@@ -677,6 +680,7 @@ async def test_rejected_write_does_not_block_sibling_labels(tmp_path):
         c.args[0] for c in task_interceptor.update_task.call_args_list
     ] == ['11', '12']
 
+    assert report is not None
     assert report['stamped'] == ['first', 'second']
     assert report['missing_labels'] == []
 
