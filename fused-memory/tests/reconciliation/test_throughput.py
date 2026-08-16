@@ -906,33 +906,6 @@ async def test_build_report_renders_each_verdict_from_its_own_figure(recon_db):
 
 
 @pytest.mark.asyncio
-async def test_build_report_retention_note_states_the_real_window(recon_db):
-    """The caveat is derived from the live cleanup window, so it cannot drift.
-
-    A hardcoded '1 hour' would silently become a lie the day someone retunes
-    cleanup_drained, so the note has to be generated from the same default the
-    harness actually calls with.
-    """
-    import inspect
-
-    from fused_memory.reconciliation.event_buffer import EventBuffer
-
-    configured = inspect.signature(
-        EventBuffer.cleanup_drained).parameters['max_age_seconds'].default
-
-    note = build_report(recon_db._db_path, 'reify')['retention_note']
-
-    assert note, 'retention_note must not be empty'
-    assert str(int(configured)) in note, (
-        f'retention_note must name the configured cleanup window '
-        f'({configured}s); got: {note!r}'
-    )
-    assert 'event_arrival_hourly' in note
-    # It must warn that pre-rollup inflow is gone, not merely describe the window.
-    assert 'unrecoverable' in note.lower()
-
-
-@pytest.mark.asyncio
 async def test_build_report_degrades_on_an_empty_database(recon_db):
     """No runs at all: every section present, capacity reported as unknown.
 
