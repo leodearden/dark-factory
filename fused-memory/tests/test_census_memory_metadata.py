@@ -591,6 +591,195 @@ class TestBuildReportRollups:
         assert dict(_entries(report['grand_total']['kind'])) == {'k': 2, 'other': 1}
 
 
+class TestTopicCoverageBlock:
+    """The per-project ``topic_coverage`` block (task 4006).
+
+    The existing report counts topic_present and canonical_true as raw
+    integers.  Coverage is a RATE plus the three-way canonical partition,
+    and neither is derivable from those counts.
+    """
+
+    def test_block_carries_the_rate_and_the_counts(self):
+        cells = {
+            'dark_factory': {
+                OBS: _census(
+                    [{'topic': 'merge-lane'}, {'topic': 'census'}] + [{}] * 2,
+                ),
+            },
+        }
+        cov = {'dark_factory': _coverage('fused_dark_factory', 4, {OBS: (4, 4)})}
+        report = _mod.build_report(cells, cov, top_n=50)
+        block = report['projects']['dark_factory']['topic_coverage']
+        assert block['records'] == 4
+        assert block['topic_present'] == 2
+        assert block['topic_coverage_pct'] == 50.0
+        assert block['distinct_topics'] == 2
+
+    def test_empty_project_reports_a_null_rate_not_a_fabricated_zero(self):
+        # A 0.0 rate says "measured, and nothing is stamped"; null says
+        # "there was nothing to measure".  Conflating them is the same
+        # fabricated-baseline failure task 3291 hardened extract_done_count
+        # against -- and a ZeroDivisionError would lose the census entirely.
+        cells = {'dark_factory': {OBS: _census([])}}
+        cov = {'dark_factory': _coverage('fused_dark_factory', 0, {OBS: (0, 0)})}
+        report = _mod.build_report(cells, cov, top_n=50)
+        block = report['projects']['dark_factory']['topic_coverage']
+        assert block['records'] == 0
+        assert block['topic_coverage_pct'] is None
+
+    def test_three_way_canonical_partition(self):
+        cells = {
+            'dark_factory': {
+                OBS: _census([
+                    {'topic': 'exactly-one', 'canonical': True},
+                    {'topic': 'exactly-one'},
+                    {'topic': 'none-at-all'},
+                    {'topic': 'too-many', 'canonical': True},
+                    {'topic': 'too-many', 'canonical': True},
+                ]),
+            },
+        }
+        cov = {'dark_factory': _coverage('fused_dark_factory', 5, {OBS: (5, 5)})}
+        report = _mod.build_report(cells, cov, top_n=50)
+        block = report['projects']['dark_factory']['topic_coverage']
+        assert block['topics_with_one_canonical'] == 1
+        assert block['topics_with_zero_canonical'] == 1
+        assert block['topics_with_multiple_canonical'] == 1
+
+    def test_partition_sums_to_distinct_topics(self):
+        cells = {
+            'dark_factory': {
+                OBS: _census([
+                    {'topic': 'a', 'canonical': True},
+                    {'topic': 'b'},
+                    {'topic': 'c', 'canonical': True},
+                    {'topic': 'c', 'canonical': True},
+                    {'topic': 'd', 'canonical': False},
+                ]),
+            },
+        }
+        cov = {'dark_factory': _coverage('fused_dark_factory', 5, {OBS: (5, 5)})}
+        report = _mod.build_report(cells, cov, top_n=50)
+        block = report['projects']['dark_factory']['topic_coverage']
+        assert (
+            block['topics_with_one_canonical']
+            + block['topics_with_zero_canonical']
+            + block['topics_with_multiple_canonical']
+        ) == block['distinct_topics'] == 4
+
+    def test_partition_is_computed_at_project_grain_across_all_categories(self):
+        # THE load-bearing assertion.  3198's write-time probe is
+        # count_memories_by_metadata(project_id, {'topic': T, 'canonical':
+        # True}) -- scope-wide, NOT category-filtered.  A topic whose peers
+        # sit in procedural_knowledge while its lone canonical sits in
+        # observations_and_summaries has EXACTLY ONE canonical.  Partitioning
+        # per-(project, category) would score it as one zero-canonical topic
+        # plus one separate exactly-one topic, manufacturing a false gap.
+        cells = {
+            'dark_factory': {
+                PROC: _census([{'topic': 'split-topic'}, {'topic': 'split-topic'}]),
+                OBS: _census([{'topic': 'split-topic', 'canonical': True}]),
+            },
+        }
+        cov = {
+            'dark_factory': _coverage(
+                'fused_dark_factory', 3, {PROC: (2, 2), OBS: (1, 1)},
+            ),
+        }
+        report = _mod.build_report(cells, cov, top_n=50)
+        block = report['projects']['dark_factory']['topic_coverage']
+        assert block['distinct_topics'] == 1
+        assert block['topics_with_one_canonical'] == 1
+        assert block['topics_with_zero_canonical'] == 0
+
+    def test_a_canonical_split_across_categories_is_still_a_violation(self):
+        # The same grain in the other direction: two canonicals for one topic
+        # in DIFFERENT categories is exactly the duplicate 3198's probe would
+        # have caught, so the census must see it as one violation, not as two
+        # well-formed cells.
+        cells = {
+            'dark_factory': {
+                PROC: _census([{'topic': 'dup', 'canonical': True}]),
+                OBS: _census([{'topic': 'dup', 'canonical': True}]),
+            },
+        }
+        cov = {
+            'dark_factory': _coverage(
+                'fused_dark_factory', 2, {PROC: (1, 1), OBS: (1, 1)},
+            ),
+        }
+        report = _mod.build_report(cells, cov, top_n=50)
+        block = report['projects']['dark_factory']['topic_coverage']
+        assert block['topics_with_multiple_canonical'] == 1
+        assert block['topics_with_one_canonical'] == 0
+
+    def test_projects_are_scored_independently(self):
+        cells = {
+            'dark_factory': {OBS: _census([{'topic': 'shared', 'canonical': True}])},
+            'reify': {OBS: _census([{'topic': 'shared'}])},
+        }
+        cov = {
+            'dark_factory': _coverage('fused_dark_factory', 1, {OBS: (1, 1)}),
+            'reify': _coverage('fused_reify', 1, {OBS: (1, 1)}),
+        }
+        report = _mod.build_report(cells, cov, top_n=50)
+        df = report['projects']['dark_factory']['topic_coverage']
+        rf = report['projects']['reify']['topic_coverage']
+        assert df['topics_with_one_canonical'] == 1
+        assert rf['topics_with_one_canonical'] == 0
+        assert rf['topics_with_zero_canonical'] == 1
+
+    def test_grand_total_block_is_emitted(self):
+        cells = {
+            'dark_factory': {OBS: _census([{'topic': 'a', 'canonical': True}])},
+            'reify': {OBS: _census([{'topic': 'b'}, {}])},
+        }
+        cov = {
+            'dark_factory': _coverage('fused_dark_factory', 1, {OBS: (1, 1)}),
+            'reify': _coverage('fused_reify', 2, {OBS: (2, 2)}),
+        }
+        report = _mod.build_report(cells, cov, top_n=50)
+        block = report['topic_coverage']
+        assert block['records'] == 3
+        assert block['topic_present'] == 2
+        assert block['distinct_topics'] == 2
+
+    def test_canonical_without_a_topic_is_disclosed_in_the_block(self):
+        cells = {
+            'dark_factory': {
+                OBS: _census([{'topic': 'a', 'canonical': True}, {'canonical': True}]),
+            },
+        }
+        cov = {'dark_factory': _coverage('fused_dark_factory', 2, {OBS: (2, 2)})}
+        report = _mod.build_report(cells, cov, top_n=50)
+        block = report['projects']['dark_factory']['topic_coverage']
+        assert block['canonical_true'] == 2
+        assert block['canonical_true_without_topic'] == 1
+        # The join drops it from every per-topic tally, so naming it is what
+        # keeps the block reconcilable against the canonical_true axis.
+        assert block['topics_with_one_canonical'] == 1
+
+    def test_schema_version_is_bumped_for_the_new_block(self):
+        cells = {'dark_factory': {OBS: _census([{}])}}
+        cov = {'dark_factory': _coverage('fused_dark_factory', 1, {OBS: (1, 1)})}
+        report = _mod.build_report(cells, cov, top_n=50)
+        assert report['schema_version'] >= 4
+
+    def test_block_is_json_serialisable_and_deterministic(self):
+        cells = {
+            'dark_factory': {
+                OBS: _census([
+                    {'topic': 'a', 'canonical': True},
+                    {'topic': 'b'},
+                ]),
+            },
+        }
+        cov = {'dark_factory': _coverage('fused_dark_factory', 2, {OBS: (2, 2)})}
+        first = _mod.build_report(cells, cov, top_n=50)
+        second = _mod.build_report(cells, cov, top_n=50)
+        assert json.dumps(first, sort_keys=False) == json.dumps(second, sort_keys=False)
+
+
 class TestBuildReportDeterminism:
     """A re-run must produce a byte-identical artifact."""
 
