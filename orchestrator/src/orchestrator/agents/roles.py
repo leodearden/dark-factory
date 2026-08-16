@@ -589,12 +589,20 @@ abandoned work is recorded as a successful run."""
 # skills/unblock/SKILL.md, adapted for a commit-SHA subject rather than a
 # branch-ref subject: no rc=128 merge-marker search here, since that arm only
 # makes sense for a ref that merge-lane cleanup can delete out from under you.
-# It also diverges by echoing the captured rc (`echo "ancestry rc=$rc"`), which
-# the SKILL.md blocks' `cmd; rc=$?` form does not: a compound command's own
-# exit status is that of its LAST statement, so `cmd; rc=$?` always reports
-# exit 0 to the calling tool no matter what `cmd` did. The SKILL.md blocks
-# carry this identical silent-rc gap (confirmed against real git during task
-# 3406's step-8 amendment) but fixing them is outside this task's file scope.
+# It also echoes the captured rc (`echo "ancestry rc=$rc"`) -- necessary
+# because a compound command's own exit status is that of its LAST statement,
+# so `cmd; rc=$?` always reports exit 0 to the calling tool no matter what
+# `cmd` did. The SKILL.md blocks had this same silent-rc gap, but it is now
+# CLOSED: skills/merge-queue/SKILL.md and skills/unblock/SKILL.md's own `git
+# merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"`
+# lines both now carry the same echo, back-ported by task 3467 (commit
+# 45d19bf899) -- so this is a shared convention across all three blocks, not a
+# roles.py-only divergence. One divergence remains: unlike the SKILL.md
+# blocks, this block's rc=1 arm (task 4107) tells the reader not to try to
+# sync or advance the checkout at all, rather than naming a specific remedy
+# command, because a spurious rc=1 here is fixed temporally -- only the merge
+# worker's own local ref write ever advances the shared `main` this block
+# checks against.
 ANCESTRY_CHECK_INSTRUCTIONS = """\
     git -C <project_root> merge-base --is-ancestor <sha> main; rc=$?; echo "ancestry rc=$rc"
     # The trailing `echo` is REQUIRED, not decoration. `--is-ancestor` prints
