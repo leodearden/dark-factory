@@ -2547,6 +2547,7 @@ class TestRecreateSubgraphRelationships:
         wrong_mock = make_graph_mock()
 
         async def _wrong_ro_query(cypher, params=None):
+            params = params or {}
             # No RELATES_TO edges to fold in this scenario -- the census is
             # what is under test, and an empty edge set keeps the fold from
             # issuing any CREATE that could mask a census-side mutation.
