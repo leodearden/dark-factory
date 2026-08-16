@@ -1104,6 +1104,14 @@ def _write_restart_unit(path: pathlib.Path, body: str) -> pathlib.Path:
     return path
 
 
+# Shared by test_restart_backoff_guard_rejects_ineffective_units' `no_steps`
+# case and _write_backoff_canary below: both need the exact pre-fix "a cap
+# declared with nothing to interpolate over" shape, and hoisting it to one
+# constant makes their "same shape" claim hold structurally instead of by
+# comment — editing one no longer leaves the other's claim quietly false.
+_INERT_CAP_BODY = "Restart=on-failure\nRestartSec=5\nRestartMaxDelaySec=60"
+
+
 def test_restart_backoff_guard_rejects_ineffective_units(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -1118,10 +1126,7 @@ def test_restart_backoff_guard_rejects_ineffective_units(
     branch, which is exactly the confusion they exist to rule out.
     """
     # Bad: the pre-fix state — a cap declared with nothing to interpolate over.
-    no_steps = _write_restart_unit(
-        tmp_path / "no_steps.service",
-        "Restart=on-failure\nRestartSec=5\nRestartMaxDelaySec=60",
-    )
+    no_steps = _write_restart_unit(tmp_path / "no_steps.service", _INERT_CAP_BODY)
     with pytest.raises(AssertionError, match="but no RestartSteps="):
         _assert_restart_backoff_effective(no_steps)
 
@@ -1257,11 +1262,11 @@ def _ignored_directive_lines(output: str, unit: pathlib.Path) -> list[str]:
 def _write_backoff_canary(directory: pathlib.Path) -> pathlib.Path:
     """Write a unit systemd-analyze will actually warn about, as a positive control.
 
-    Thin wrapper over ``_write_restart_unit`` (:1095) rather than a second
-    hand-rolled unit writer.  The body is the pre-fix ``no_steps`` shape
-    ``test_restart_backoff_guard_rejects_ineffective_units`` already writes
-    at :1121 (``Restart=on-failure`` / ``RestartSec=5`` /
-    ``RestartMaxDelaySec=60``), with ``ExecStart=/bin/true`` prepended.
+    Thin wrapper over ``_write_restart_unit`` rather than a second
+    hand-rolled unit writer.  The body is ``_INERT_CAP_BODY`` — the same
+    pre-fix "cap declared with nothing to interpolate over" shape
+    ``test_restart_backoff_guard_rejects_ineffective_units``'s ``no_steps``
+    case writes — with ``ExecStart=/bin/true`` prepended.
 
     The ExecStart is not decoration: measured 2026-08-16 in this worktree
     (systemd 255.4-1ubuntu8.17), the bare restart stanza alone is REFUSED by
@@ -1280,7 +1285,7 @@ def _write_backoff_canary(directory: pathlib.Path) -> pathlib.Path:
     """
     return _write_restart_unit(
         directory / "df-restart-backoff-canary.service",
-        "ExecStart=/bin/true\nRestart=on-failure\nRestartSec=5\nRestartMaxDelaySec=60",
+        f"ExecStart=/bin/true\n{_INERT_CAP_BODY}",
     )
 
 
@@ -1469,10 +1474,10 @@ def test_backoff_canary_is_the_shape_systemd_must_warn_about(
 
     (b) The canary declares an ExecStart=.  LOAD-BEARING, not decoration.
         Measured 2026-08-16 in this worktree (systemd 255.4-1ubuntu8.17): a
-        [Service]-only unit carrying just the restart stanza -- the bare
-        ``no_steps`` body test_restart_backoff_guard_rejects_ineffective_units
-        writes at :1121 -- is REFUSED by systemd-analyze before it ever
-        reaches the pairing check::
+        [Service]-only unit carrying just the restart stanza -- ``_INERT_CAP_BODY``,
+        the same body test_restart_backoff_guard_rejects_ineffective_units'
+        ``no_steps`` case writes -- is REFUSED by systemd-analyze before it
+        ever reaches the pairing check::
 
           canary-noexec.service: Service has no ExecStart=, ExecStop=, or
           SuccessAction=. Refusing.
