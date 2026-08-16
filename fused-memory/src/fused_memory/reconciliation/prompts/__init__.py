@@ -231,10 +231,15 @@ work against it.\
 # Single-sourced per INV-5 `no-lockstep-duplication` (docs/legibility/design-invariants.md):
 # this paragraph originated as an inline bullet in stage1.py and now lives here ONLY, with
 # all three stage prompts interpolating it. Every stage can be handed a `duplicate_finding`
-# error — add_finding returns it on a colliding (task_id, flag_type) signature, and
-# cite_task returns it from BOTH in-run cited-task folds (task-2425 project-scoped,
-# task-2432 entity-scoped, the latter with no stage carve-out) — so the salvage protocol
-# has to reach all of them. Do NOT re-inline a per-stage copy; reword HERE.
+# error — add_finding returns it on a colliding (task_id, flag_type) signature AND on a
+# repeated description for a null-null finding (the _run_desc_index path, which every stage
+# reaches whenever it files informational / cross_project findings), and cite_task returns
+# it from BOTH in-run cited-task folds (task-2425 project-scoped, task-2432 entity-scoped,
+# the latter with no stage carve-out) — so the salvage protocol has to reach all of them.
+# Do NOT re-inline a per-stage copy; reword HERE. Keep the enumeration open-ended rather
+# than counting the paths: an exact count that a real response can contradict tells an
+# agent the shape it just received cannot occur, which is exactly what invites the
+# fabricate-a-finding_id behaviour this paragraph exists to prevent.
 #
 # NOTE: a PLAIN (non-f) string interpolated into the stage f-strings, so it must stay free
 # of literal braces. Rendered as a markdown BULLET so it drops cleanly into stage1's
@@ -243,16 +248,17 @@ work against it.\
 # example in an assembled prompt to carry `run_id=`) — name the tools, never call them.
 DUPLICATE_FINDING_SALVAGE_GUIDANCE = """\
 - `duplicate_finding` — NOT a new successful filing: never invent or count a \
-`finding_id` for it. Two different paths return it. `add_finding` returns it when this \
-run already holds a finding with the same (task_id, flag_type) signature, filed by this \
-stage or by an earlier one. `cite_task` returns it when the task you just cited is \
-already the in-run anchor for an equivalent finding — and on THAT path your own finding \
-is purged wholesale, taking its description, its suggested action, and any citations you \
-had already attached to it. Either way the response's `existing_finding_id` is the \
-canonical id for this finding: re-issue your citations against that id rather than \
-fabricating a new one, and carry over any detail your finding carried that the surviving \
-one does not. Once purged there is nothing left to recover it from, so do not simply \
-drop the extra detail as redundant.\
+`finding_id` for it. Several different paths return it. `add_finding` returns it when \
+this run already holds a finding with the same (task_id, flag_type) signature — or, for \
+a finding carrying neither, the same description — filed by this stage or by an earlier \
+one. `cite_task` returns it when the task you just cited is already the in-run anchor \
+for an equivalent finding — and on THAT path your own finding is purged wholesale, \
+taking its description, its suggested action, and any citations you had already attached \
+to it. Whichever path returned it, the response's `existing_finding_id` is the canonical \
+id for this finding: re-issue your citations against that id rather than fabricating a \
+new one, and carry over any detail your finding carried that the surviving one does not. \
+Once purged there is nothing left to recover it from, so do not simply drop the extra \
+detail as redundant.\
 """
 
 
