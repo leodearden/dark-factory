@@ -1439,13 +1439,15 @@ def test_tab_memory_evals_jsx_served_and_exports_section(
 
 
 def test_tab_memory_evals_renders_eval_cards_and_trends(
-    tab_memory_evals_jsx_body: str,
     tab_memory_evals_jsx_code: str,
 ) -> None:
     """The section renders one card per eval and a trend per metric, from the
     payload's own parallel-array trend shape.
+
+    Reads ONLY comment-stripped source.  The raw-body fixture is deliberately
+    not requested: an assertion here cannot accidentally be answered by the
+    .jsx prose if the prose is not in scope.
     """
-    body = tab_memory_evals_jsx_body
     code = tab_memory_evals_jsx_code
 
     # (c) the component exists as a named function declaration
@@ -1542,20 +1544,8 @@ def test_tab_memory_evals_renders_eval_cards_and_trends(
     # is explicitly permitted and in fact required (see
     # test_trend_holes_are_never_handed_to_a_chart_primitive below).  What is
     # forbidden is COMPACTION: a hole REMOVED from the series.
-    for hostile, what in (
-        # a chart fed a transformed series rather than the payload array itself
-        (r'values\s*=\s*\{[^}\n]*\.\s*(?:filter|flatMap|reduce)\(', 'a chart is fed a transformed series'),
-        # `.filter(Boolean)` drops nulls AND legitimate zeroes
-        (r'trend\.(?:values|labels)\s*\.\s*(?:filter|flatMap)\(\s*Boolean\s*\)', '.filter(Boolean) drops holes'),
-        # a keep-the-non-nulls predicate — the dropping shape.  Note `!==`, not
-        # `===`: `.filter(v => v === null).length` COUNTS holes and is fine.
-        (
-            r'trend\.(?:values|labels)\s*\.\s*filter\([^)\n]*!==?\s*(?:null|undefined)',
-            'a null-dropping filter predicate',
-        ),
-        (r'trend\.(?:values|labels)\s*\.\s*flatMap\(', 'flatMap can drop elements'),
-    ):
-        assert not re.search(hostile, body), (
+    for hostile, what, flags in _forbidden_patterns('trend series is never compacted'):
+        assert not re.search(hostile, code, flags), (
             f'trend values/labels must never be COMPACTED ({what}). A `null` '
             'in `values` is a deliberate hole (that run produced no sample); '
             'dropping it would shift this metric\'s points against every '
@@ -2335,12 +2325,15 @@ def test_trend_holes_are_never_handed_to_a_chart_primitive(
 
     # ...and the bare `Chart` guard must be gone, so no path reaches the
     # primitive without the gap check.
-    bare = re.search(r'\{\s*Chart\s*(?:\?|&&)(?![^\n]*\bgaps\b)', body)
-    assert bare is None, (
-        f'a chart render site is still guarded by `Chart` alone: '
-        f'{bare.group(0)!r} — a holed series would reach the primitive '
-        'through it.'
-    )
+    for gate, what, flags in _forbidden_patterns(
+        'no chart render site is gated on Chart alone'
+    ):
+        bare = re.search(gate, code, flags)
+        assert bare is None, (
+            f'a chart render site is still guarded by `Chart` alone ({what}): '
+            f'{bare.group(0)!r} — a holed series would reach the primitive '
+            'through it.'
+        )
 
     # (iii) a suppressed series must still DISCLOSE its gap count — silently
     #       withholding the sparkline would read as a render bug.  Asserted
@@ -2445,11 +2438,15 @@ def test_empty_trend_is_a_named_state_not_an_empty_chart_box(
 
     # (d) the existing guards must SURVIVE, re-asserted here so a later
     #     refactor to a `trendState()` discriminator cannot quietly drop them.
-    bare = re.search(r'\{\s*Chart\s*(?:\?|&&)(?![^\n]*\bgaps\b)', body)
-    assert bare is None, (
-        f'a chart render site is guarded by `Chart` alone: {bare.group(0)!r} — '
-        'a holed OR empty series would reach the primitive through it.'
-    )
+    for gate, what, flags in _forbidden_patterns(
+        'no chart render site is gated on Chart alone'
+    ):
+        bare = re.search(gate, code, flags)
+        assert bare is None, (
+            f'a chart render site is guarded by `Chart` alone ({what}): '
+            f'{bare.group(0)!r} — a holed OR empty series would reach the '
+            'primitive through it.'
+        )
     assert re.search(r'\{\s*gaps\b', code), (
         'the `gaps` count must still reach a render position — adding the '
         'no-runs state must not cost the holed-series disclosure.'
@@ -2508,14 +2505,15 @@ def test_empty_trend_is_a_named_state_not_an_empty_chart_box(
 
 
 def test_escalation_links_and_storm_aggregate_banner(
-    tab_memory_evals_jsx_body: str,
     tab_memory_evals_jsx_code: str,
     memory_evals_fmt_js_code: str,
 ) -> None:
     """The escalation affordances must be real, built only from fields the
     projection actually carries, and read the banner from the top-level block.
+
+    Reads ONLY comment-stripped source — see
+    `test_tab_memory_evals_renders_eval_cards_and_trends`.
     """
-    body = tab_memory_evals_jsx_body
     code = tab_memory_evals_jsx_code
 
     # (a) a metric row carrying an escalation renders a link, guarded so a null
@@ -2541,25 +2539,27 @@ def test_escalation_links_and_storm_aggregate_banner(
     )
 
     # (b) built from `id` only — the projection has no `url` field.
-    assert not re.search(r'escalation\s*\.\s*url\b', body), (
-        'the escalation projection has exactly six keys — id, summary, '
-        'severity, level, created_at, dedupe_fingerprint. There is no `url`; '
-        'the UI constructs its own affordance from `id`.'
-    )
+    for no_url, what, flags in _forbidden_patterns(
+        'the escalation projection has no url'
+    ):
+        assert not re.search(no_url, code, flags), (
+            f'{what}: the projection has exactly six keys — id, summary, '
+            'severity, level, created_at, dedupe_fingerprint. There is no `url`; '
+            'the UI constructs its own affordance from `id`.'
+        )
 
     # (c) fingerprints are rendered whole, never parsed.
     #     memory_evals._escalation_projection() — the fingerprint is the
     #     producer's private construction; the dashboard must not depend on
     #     its substructure.
-    for field in ('dedupe_fingerprint', 'fingerprint'):
-        for op in (r'\.split\(', r'\.slice\(', r'\.match\(', r'\.substring\('):
-            assert not re.search(rf'{field}\s*{op}', body), (
-                f'`{field}` must be rendered whole — never split/sliced/matched. '
-                'The fingerprint is the producer\'s private construction '
-                '(memory_evals._escalation_projection()); parsing its '
-                'substructure here would couple the dashboard to a format it '
-                'does not own.'
-            )
+    for parsed, what, flags in _forbidden_patterns('fingerprints are rendered whole'):
+        assert not re.search(parsed, code, flags), (
+            f'{what} — a fingerprint must be rendered whole. It is the '
+            'producer\'s private construction '
+            '(memory_evals._escalation_projection()); parsing its '
+            'substructure here would couple the dashboard to a format it '
+            'does not own.'
+        )
 
     # (d) the storm banner reads the TOP-LEVEL block, not an eval row's copy.
     assert 'data-testid="memory-eval-storm-banner"' in code, (
@@ -2894,13 +2894,14 @@ def test_limits_provenance_open_state_is_per_eval(
 
 
 def test_staleness_empty_states_and_issues_notice(
-    tab_memory_evals_jsx_body: str,
     tab_memory_evals_jsx_code: str,
 ) -> None:
     """Staleness is a HINT, the two empty states are distinct, missing scalars
     are em-dashes rather than zeros, and artifact issues are loudly visible.
+
+    Reads ONLY comment-stripped source — see
+    `test_tab_memory_evals_renders_eval_cards_and_trends`.
     """
-    body = tab_memory_evals_jsx_body
     code = tab_memory_evals_jsx_code
 
     # (a) latest-run age renders, and the stale branch carries no alarm wording.
@@ -2964,11 +2965,12 @@ def test_staleness_empty_states_and_issues_notice(
         'defining it and then interpolating raw fields leaves the synthetic-'
         'zero hole open (feedback_redux_no_synthetic_data).'
     )
-    for field in ('current_value', 'value', 'n', 'denominator', 'alarm_count'):
-        assert not re.search(rf'\.\s*{field}\s*\|\|\s*0\b', body), (
-            f'`{field}` is defaulted with `|| 0`. A synthetic zero reads as a '
-            'measured zero — use the dash() helper so an absent measurement '
-            'looks absent.'
+    for zeroed, what, flags in _forbidden_patterns(
+        'absent scalars are dashed, never zeroed'
+    ):
+        assert not re.search(zeroed, code, flags), (
+            f'{what}. A synthetic zero reads as a measured zero — use the dash() '
+            'helper so an absent measurement looks absent.'
         )
 
     # (d) the issues notice is VISIBLE and lists the detail, not just a count.
@@ -2993,11 +2995,15 @@ def test_staleness_empty_states_and_issues_notice(
             'silent-degradation failure the notice exists to prevent '
             '(INV-2/INV-4).'
         )
-    assert not re.search(r'<details[^>]*>\s*<summary[^>]*>\s*\{?[^<]{0,40}issue', body, re.IGNORECASE), (
-        'the issues notice must be expanded by default — collapsing a '
-        'degraded-state notice reproduces the silent degradation it exists to '
-        'prevent (INV-2/INV-4, the 2658 parse_failures precedent).'
-    )
+    for collapsed, what, flags in _forbidden_patterns(
+        'the artifact issues notice is never collapsed'
+    ):
+        assert not re.search(collapsed, code, flags), (
+            f'the issues notice must be expanded by default ({what}) — '
+            'collapsing a degraded-state notice reproduces the silent '
+            'degradation it exists to prevent (INV-2/INV-4, the 2658 '
+            'parse_failures precedent).'
+        )
 
     # (e) payload age is visible.
     assert re.search(r'\bpayload\.generated_at\b', code), (
