@@ -223,6 +223,17 @@ reconciliation:
   sonnet_model: "sonnet"
   opus_model: "opus"
   opus_threshold_ratio: 1.5
+  # Task 3049: consecutive full cycles for which the inline remediation pass is
+  # deferred while the project is in backlog mode (buffer >
+  # buffer_size_threshold * opus_threshold_ratio). Every backlog chunk is a full
+  # cycle and so drags in its own zero-event remediation pass — measured at ~44%
+  # of backlog-mode drain wall-clock on 2026-07-25 (reify), i.e. roughly half the
+  # drain duty cycle spent not draining. Deferral is lossless (Stage-3 findings
+  # are persisted before this point and forward-fed to the next cycle) and
+  # self-terminating (the gate re-reads the buffer, so remediation resumes once
+  # the backlog drains). The cap bounds the debt so a deep backlog cannot starve
+  # remediation; 0 disables deferral entirely.
+  max_backlog_remediation_deferrals: 5
   sonnet_episode_limit: 125
   sonnet_memory_limit: 250
   opus_episode_limit: 500

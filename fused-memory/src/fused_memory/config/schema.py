@@ -1662,6 +1662,24 @@ class ReconciliationConfig(BaseModel):
     sonnet_model: str = Field(default='sonnet')
     opus_model: str = Field(default='opus')
     opus_threshold_ratio: float = Field(default=1.5)
+    max_backlog_remediation_deferrals: int = Field(
+        default=5, ge=0,
+        description=(
+            'Task 3049. Number of CONSECUTIVE full cycles for which the inline '
+            'remediation pass may be deferred while the project is in backlog '
+            'mode (buffer size > buffer_size_threshold * opus_threshold_ratio). '
+            'Remediation is an unconditional inline tail of every completed '
+            'run_full_cycle and BacklogIterator runs each chunk as its own full '
+            'cycle, so every chunk otherwise drags in a zero-event remediation '
+            'pass — measured at ~44% of backlog-mode drain wall-clock. Deferring '
+            'is lossless: Stage-3 findings are already persisted in '
+            'stage_reports.integrity_check.items_flagged before this point and '
+            'forward-fed into the next cycle. The cap bounds the debt — after '
+            'this many consecutive deferrals the pass runs anyway, so a '
+            'persistently-deep backlog cannot starve remediation. 0 disables '
+            'deferral entirely, restoring pre-task-3049 behaviour.'
+        ),
+    )
     sonnet_episode_limit: int = Field(default=125)
     sonnet_memory_limit: int = Field(default=250)
     opus_episode_limit: int = Field(default=500)
