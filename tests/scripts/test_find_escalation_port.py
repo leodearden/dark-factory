@@ -9,20 +9,28 @@ it). ``tests/scripts/`` is collected by TWO registered module configs' test_comm
 (``tests/scripts`` and ``scripts``), so a module placed here actually runs inside
 ``verify.run_full_verification``'s gather rather than sitting uncollected.
 
-WHY THESE TESTS NEED A MEASURED RED. This is characterization work over code that is
-already correct, so every assertion below is green at HEAD BY CONSTRUCTION and a green
-run proves nothing about whether the guard bites. Each test therefore records the
-failure text observed against a NAMED scratch mutation of
-``skills/factory-init/scripts/find_escalation_port.py``, reverted before commit —
-the convention ``test_skills_module_config_decision.py`` and
+WHY THESE TESTS NEED A MEASURED RED, AND THE ONE PLACE THE BASE IS CITED. This is
+characterization work over code that is already correct, so every assertion below is
+green at HEAD BY CONSTRUCTION and a green run proves nothing about whether the guard
+bites. Each test therefore records the failure OBSERVED against a NAMED scratch
+mutation of ``skills/factory-init/scripts/find_escalation_port.py``, reverted before
+commit — the convention ``test_skills_module_config_decision.py`` and
 ``test_root_lint_covers_nonmember_py.py`` already follow in this same directory.
-Every MEASURED RED below was observed at base main ``fc6f048b55``. This branch was
-subsequently rebased onto main ``6339076d49``; the citations still name the base the
-mutations were actually run against, because that is what was measured. They carry
-over unchanged: ``git diff fc6f048b55 6339076d49 -- <script>`` is EMPTY, i.e. the
-file under test is byte-identical across the move (as are ``scripts/legibility/
-nightly.py``, which step-9's parity test reads, and both ``conftest.py``s). The
-scratch mutations were NOT re-run at the new base — they did not need to be.
+
+Every MEASURED RED below was observed at base main ``fc6f048b55``, and that SHA is
+cited HERE ONLY — the per-test docstrings say "MEASURED RED" without repeating it, so
+there is one place to correct rather than fifteen. This branch was subsequently
+rebased onto main ``6339076d49``; the measurements carry over unchanged because
+``git diff fc6f048b55 6339076d49 -- <script>`` is EMPTY, i.e. the file under test is
+byte-identical across the move (as are ``scripts/legibility/nightly.py``, which the
+parity test at the bottom drives, and both ``conftest.py``s). The scratch mutations
+were NOT re-run at the new base — they did not need to be.
+
+Code under test is cited BY SYMBOL (the enclosing function plus the expression), never
+by ``file:line``. Line pins rot silently on the first edit to the script and a reader
+cannot tell a stale one from a live one without re-running every mutation;
+``tests/scripts/orchestrator.yaml`` records exactly that rot for its own inherited
+``verify.py:4735`` / ``workflow.py:3558`` pins, both already stale when written.
 
 MUST NOT SKIP. There is no ``pytest.importorskip`` and no try/except-and-skip
 anywhere in this module. The script under test is a tracked file in this repo — the
@@ -47,16 +55,32 @@ fixtures (``_df_fleet_dir_redirect``, ``_df_no_leaked_drain_processes``,
 ``_df_no_synthetic_heartbeats_in_live_fleet``; tasks 3798/3799) govern drain-script
 processes, ORCH_FLEET_DIR and fleet heartbeat files — none of them constrains socket
 binding or subprocess patching, so no interaction with this module is expected.
+
+A THIRD, NON-HERMETIC NEIGHBOUR: A CONCURRENT COPY OF THIS SAME FILE.
+``tests/scripts/orchestrator.yaml`` documents that the ``scripts`` and
+``tests/scripts`` module configs BOTH collect ``tests/scripts/`` in one worktree on
+every review checkpoint, main-tip sweep and merge full-verify, and pytest-xdist is
+installed — so two processes can be inside the ``is_bound`` tests at once. The only
+assertion that can lose such a race is the one claiming a JUST-RELEASED ephemeral port
+reads back FREE: a second process can win that port in the window between
+``_held_listener``'s ``close()`` and the following probe. It is therefore written to
+RETRY on a fresh ephemeral port rather than fail once (see ``_FREE_PORT_ATTEMPTS``),
+because a lost race is not a regression. Anyone debugging a red there should start
+from that premise before suspecting ``is_bound`` itself.
+``test_is_bound_leaves_no_probe_socket_behind`` sidesteps the race entirely by
+asserting on descriptor COUNT rather than on what a probe returns.
 """
 
 import contextlib
 import importlib.util
 import io
+import os
 import pathlib
 import socket
 import subprocess
 import sys
 import types
+from collections.abc import Iterator
 
 import pytest  # pyright: ignore[reportMissingImports]
 
@@ -72,7 +96,7 @@ def _load_find_escalation_port() -> types.ModuleType:
     ``test_orchestrator_watchdog.py``.
 
     THE STALE-BYTECODE GUARD IS NOT DEFENSIVE PADDING — it was added after this
-    module was OBSERVED loading a stale ``__pycache__`` .pyc at base ``fc6f048b55``.
+    module was OBSERVED loading a stale ``__pycache__`` .pyc.
     ``SourceFileLoader`` validates cached bytecode against the source's (mtime, size),
     so a source edit that is SIZE-IDENTICAL and lands inside the same mtime tick —
     exactly what a two-line reordering does, and exactly what this module's scratch
@@ -127,7 +151,7 @@ def no_systemd(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 # Verbatim `systemctl --user show fused-memory.service -p Environment` output,
-# captured from the live unit on this host at base main fc6f048b55. ONE physical
+# captured from the live unit on this host. ONE physical
 # line, terminated by a single newline (confirmed with `cat -A`: a lone `$` at the
 # end, no trailing spaces). Pinned here in a comment for the same reason
 # test_orchestrator_watchdog.py pins its _SS_HEADER iproute2 rows verbatim — the
@@ -224,41 +248,34 @@ def test_known_project_roots_returns_immediate_directory_siblings(
     """The sibling-glob fallback enumerates the immediate DIRECTORY children of
     ``df_root.parent`` — nothing shallower, nothing deeper, no files.
 
-    RE-MEASURED at base main ``fc6f048b55``: over a parent also containing a
-    ``loose.txt`` and a grandchild ``proj-a/nested/``, the result is exactly
-    ``['dark-factory', 'proj-a', 'target']``.
+    RE-MEASURED: over a parent also containing a ``loose.txt`` and a grandchild
+    ``proj-a/nested/``, the result is exactly ``['dark-factory', 'proj-a', 'target']``.
 
     Compared as a SET of resolved paths, never by index: ordering between the
-    systemd-env source and this glob is step-3's property, and pinning it here too
-    would over-constrain a rule this test does not own.
+    systemd-env source and this glob is the following section's property, and pinning
+    it here too would over-constrain a rule this test does not own.
 
-    MEASURED RED at base ``fc6f048b55``, named scratch mutations of
-    find_escalation_port.py, all reverted before commit:
+    MEASURED RED, named scratch mutations of find_escalation_port.py, all reverted
+    before commit:
 
-      1. widening the glob (line 70) to ``df_root.parent / '*' / '*'`` — RED::
-
-           E  AssertionError: assert {PosixPath('/...oj-a/nested')} == {...}
-           E    Extra items in the left set:
-           E    PosixPath('.../test_known_project_roots_retur0/proj-a/nested')
-           E    Extra items in the right set:
+      1. widening ``known_project_roots``' fallback glob to
+         ``df_root.parent / '*' / '*'`` — RED, with the grandchild
+         ``proj-a/nested`` an extra item in the left set.
 
       2. the non-directory exclusion is guarded by a REDUNDANT PAIR of ``is_dir()``
          checks, and reddens only when BOTH are removed. Recorded as measured, not
          predicted, because the two single-filter mutations were each observed GREEN
          and a docstring claiming otherwise would be false:
 
-           - dropping ONLY ``and r.is_dir()`` from the dedup loop (line 77):
-             ``3 passed`` — the glob comprehension's own filter still excludes
+           - dropping ONLY ``and r.is_dir()`` from ``known_project_roots``' dedup
+             loop: GREEN — the glob comprehension's own filter still excludes
              ``loose.txt``. That dedup-loop filter's observable role is the
              SYSTEMD-ENV branch (a stale unit env naming a path that is not a
-             directory), which is why step-3 owns its falsification, not this test.
-           - dropping ONLY ``if Path(p).is_dir()`` from the glob (line 70):
-             ``3 passed`` — the dedup loop's filter still excludes it.
-           - dropping BOTH — RED::
-
-               E  AssertionError: assert {PosixPath('/...tur0/target')} == {...}
-               E    Extra items in the left set:
-               E    PosixPath('.../test_known_project_roots_retur0/loose.txt')
+             directory), which is why the systemd-env section owns its falsification,
+             not this test.
+           - dropping ONLY ``if Path(p).is_dir()`` from that same fallback glob:
+             GREEN — the dedup loop's filter still excludes it.
+           - dropping BOTH — RED, with ``loose.txt`` an extra item in the left set.
     """
     parent, df_root = _project_tree(tmp_path)
 
@@ -340,14 +357,11 @@ def test_env_roots_are_comma_split_and_ordered_before_the_glob(
     The two env roots are created OUTSIDE the sibling parent so their presence is
     attributable to the env branch alone — the glob cannot reach them.
 
-    MEASURED RED at base ``fc6f048b55``, scratch mutation reverted before commit:
-    moving the env merge to AFTER the sibling glob (i.e. performing the
-    ``roots += [...glob...]`` first) — RED::
+    MEASURED RED, scratch mutation reverted before commit: moving the env merge to
+    AFTER the sibling glob (i.e. performing the ``roots += [...glob...]`` first) —
+    RED::
 
         E  AssertionError: env roots must precede glob roots: env at [4, 5], glob at [0, 2, 3]
-        E  assert 5 < 0
-        E   +  where 5 = max([4, 5])
-        E   +  and   0 = min([0, 2, 3])
 
     That same mutation also reddened
     ``test_a_root_reachable_by_both_sources_appears_exactly_once`` (the retained
@@ -389,12 +403,11 @@ def test_empty_comma_segments_do_not_become_a_cwd_entry(
     then look for a config in whatever directory the caller happened to run from
     and silently fold its escalation port into the survey.
 
-    MEASURED RED at base ``fc6f048b55``, scratch mutation reverted before commit:
-    dropping the ``if p`` guard from the comma split (line 65) — RED::
+    MEASURED RED, scratch mutation reverted before commit: dropping the ``if p``
+    guard from ``known_project_roots``' comma split
+    (``m.group(1).split(",") if p``) — RED::
 
         E  AssertionError: an empty comma segment leaked in as Path('.'): [PosixPath('.')]
-        E  assert [PosixPath('.')] == []
-        E    Left contains one more item: PosixPath('.')
     """
     _parent, df_root = _project_tree(tmp_path)
     env_a = tmp_path / "outside" / "env-a"
@@ -414,20 +427,18 @@ def test_env_roots_that_are_not_existing_directories_are_dropped(
 ) -> None:
     """A stale unit env cannot inject a phantom project.
 
-    This is the dedup loop's ``r.is_dir()`` filter (line 77) — the one step-2
-    measured as unobservable through the glob branch, because the glob comprehension
-    filters non-directories of its own. The env branch does NOT, so this is the
-    filter's real job: a decommissioned project still listed in the unit env, and a
-    listed path that is a FILE rather than a directory, must both drop out rather
-    than reach find_config().
+    This is the ``and r.is_dir()`` filter in ``known_project_roots``' dedup loop — the
+    one the sibling-glob test above measured as unobservable through the glob branch,
+    because the glob comprehension filters non-directories of its own. The env branch
+    does NOT, so this is the filter's real job: a decommissioned project still listed
+    in the unit env, and a listed path that is a FILE rather than a directory, must
+    both drop out rather than reach ``find_config``.
 
-    MEASURED RED at base ``fc6f048b55``, scratch mutation reverted before commit:
-    dropping ``and r.is_dir()`` from the dedup loop (line 77) — RED, and note this is
-    the SAME mutation step-2 observed green through the glob branch::
+    MEASURED RED, scratch mutation reverted before commit: dropping
+    ``and r.is_dir()`` from that dedup loop — RED, and note this is the SAME mutation
+    the sibling-glob test observed green through the glob branch::
 
         E  AssertionError: a nonexistent env root became a project root
-        E  assert PosixPath('.../outside/decommissioned') not in {PosixPath('.../dark-factory'),
-        E    PosixPath('.../outside/still-here'), PosixPath('.../proj-a'), ...}
     """
     parent, df_root = _project_tree(tmp_path)
     phantom = tmp_path / "outside" / "decommissioned"  # never created
@@ -459,11 +470,10 @@ def test_a_root_reachable_by_both_sources_appears_exactly_once(
     first — pinned as observed behaviour, and consistent with the ordering contract
     above.
 
-    MEASURED RED at base ``fc6f048b55``: the same "env merge moved AFTER the glob"
-    scratch mutation the ordering test names also reddens this one — RED::
+    MEASURED RED: the same "env merge moved AFTER the glob" scratch mutation the
+    ordering test names also reddens this one — RED::
 
         E  AssertionError: expected the first-seen (env, unresolved) spelling to be retained
-        E  assert PosixPath('.../target') == PosixPath('.../outside/target-alias')
 
     The dedup itself (``len(hits) == 1``) stayed green under that mutation, which is
     the point: dedup keys on the RESOLVED path, so it survives a reordering — only
@@ -578,8 +588,7 @@ def test_canonical_config_name_wins_over_every_legacy_spelling(
     wrong one would read a STALE escalation port and hand the same port to two
     projects.
 
-    RE-MEASURED at base ``fc6f048b55``: canonical wins over a coexisting
-    orchestrator.yaml.
+    RE-MEASURED: canonical wins over a coexisting orchestrator.yaml.
     """
     root = tmp_path / "proj-a"
     root.mkdir()
@@ -625,14 +634,13 @@ def test_config_name_precedence_holds_for_every_pair(
 
     2. ORDER RATCHET, an explicit literal. Assertion 1 CANNOT catch a reordering of
        the tuple itself, because it derives its expectation from that tuple: reorder
-       the production names and the expectation reorders with them. MEASURED at base
-       ``fc6f048b55``: swapping ONLY the middle two entries ("orchestrator.yaml" and
+       the production names and the expectation reorders with them. MEASURED: swapping
+       ONLY the middle two entries ("orchestrator.yaml" and
        "orchestrator-config.yaml"), with the ratchet below temporarily disabled, left
-       the whole module GREEN — ``16 passed``. RE-MEASURED after the stale-bytecode
-       guard in ``_load_find_escalation_port`` landed, since a size-identical
-       reordering is exactly the mutation a .pyc cache can mask; the result was
-       unchanged, so this is a property of the assertions and not a loader artifact.
-       Since
+       the whole module GREEN. RE-MEASURED after the stale-bytecode guard in
+       ``_load_find_escalation_port`` landed, since a size-identical reordering is
+       exactly the mutation a .pyc cache can mask; the result was unchanged, so this
+       is a property of the assertions and not a loader artifact. Since
        ``find_config`` returns the FIRST match, that order is a behavioural
        specification and not a stylistic list, so it gets a literal ratchet. If a
        reorder is ever deliberate, update the literal here and say why: the tuple is
@@ -640,16 +648,14 @@ def test_config_name_precedence_holds_for_every_pair(
        + _LEGACY_CONFIG_NAMES, and a spelling recognized by one but not the other is
        the latent trap the module's own comment warns about.
 
-    MEASURED RED at base ``fc6f048b55``, scratch mutation reverted before commit:
-    reversing CONFIG_NAMES entirely — RED (this test, on the ratchet)::
+    MEASURED RED, scratch mutation reverted before commit: reversing CONFIG_NAMES
+    entirely — RED (this test, on the ratchet)::
 
         E  AssertionError: assert 'orchestrator/config.yaml' == 'dark-factory...estrator.yaml'
-        E    - dark-factory-orchestrator.yaml
-        E    + orchestrator/config.yaml
 
     That same reversal also reddened
-    ``test_canonical_config_name_wins_over_every_legacy_spelling`` (2 failed,
-    13 passed), which is the canonical-first claim pinned independently.
+    ``test_canonical_config_name_wins_over_every_legacy_spelling``, which is the
+    canonical-first claim pinned independently.
     """
     names = fep.CONFIG_NAMES
     assert len(names) > 1, "precedence is unfalsifiable with fewer than two candidates"
@@ -696,12 +702,10 @@ def test_a_directory_named_like_a_config_is_not_returned(
     its port would be handed to a second project. Falling through to the next
     candidate name is what keeps that from happening.
 
-    MEASURED RED at base ``fc6f048b55``, scratch mutation reverted before commit:
-    swapping ``cand.is_file()`` for ``cand.exists()`` — RED::
+    MEASURED RED, scratch mutation reverted before commit: swapping ``find_config``'s
+    ``cand.is_file()`` for ``cand.exists()`` — RED::
 
         E  AssertionError: a directory was returned as a config file
-        E  assert PosixPath('.../proj-a/dark-factory-orchestrator.yaml') ==
-        E    PosixPath('.../proj-a/orchestrator.yaml')
     """
     root = tmp_path / "proj-a"
     root.mkdir()
@@ -716,7 +720,7 @@ def test_config_helpers_round_trip_through_find_config_and_escalation_port(
 ) -> None:
     """Verify the fixture builders themselves, before anything depends on them.
 
-    RE-MEASURED at base ``fc6f048b55``: a proj-a config carrying
+    RE-MEASURED: a proj-a config carrying
     ``escalation:\\n  host: 127.0.0.1\\n  port: 8100\\ndashboard:\\n  port: 9999``
     surveys as 8100 — the escalation port, not the decoy.
 
@@ -765,9 +769,10 @@ def test_only_the_escalation_blocks_port_is_returned(
     A parser broken in one direction can look correct in the other, and a
     same-valued decoy would hide both — hence 8100 vs 9999.
 
-    MEASURED RED at base ``fc6f048b55``, scratch mutation reverted before commit:
-    searching the whole file instead of the sliced block (``PORT_RE.search(text)``) —
-    RED on the decoy-before case, where the decoy is the first ``port:`` in the file::
+    MEASURED RED, scratch mutation reverted before commit: making
+    ``escalation_port`` search the whole file instead of the sliced block
+    (``PORT_RE.search(text)``) — RED on the decoy-before case, where the decoy is the
+    first ``port:`` in the file::
 
         E  AssertionError: assert 9999 == 8100
 
@@ -798,11 +803,11 @@ def test_comments_and_blank_lines_do_not_terminate_the_block(
     ``escalation:`` and its ``port:`` does not silently truncate the block and hide
     the project's claim. A blank line survives via the leading ``ln and`` guard.
 
-    MEASURED RED at base ``fc6f048b55``, scratch mutation reverted before commit:
-    dropping the ``and not ln.lstrip().startswith("#")`` carve-out — RED::
+    MEASURED RED, scratch mutation reverted before commit: dropping the
+    ``and not ln.lstrip().startswith("#")`` carve-out from ``escalation_port``'s break
+    condition — RED::
 
         E  AssertionError: a column-0 comment truncated the block
-        E  assert None == 8100
     """
     root = tmp_path / "proj"
     root.mkdir()
@@ -876,13 +881,12 @@ def test_unreadable_paths_return_none_instead_of_crashing_the_survey(
     does not exist (FileNotFoundError) and a path that is a directory
     (IsADirectoryError).
 
-    MEASURED RED at base ``fc6f048b55``, scratch mutation reverted before commit:
-    removing the ``try/except Exception`` around ``read_text`` — RED, and note it
-    fails as an ERROR escaping the function rather than as a wrong value, which is
-    the crash this guard prevents::
+    MEASURED RED, scratch mutation reverted before commit: removing
+    ``escalation_port``'s ``try/except Exception`` around ``cfg.read_text()`` — RED,
+    and note it fails as an ERROR escaping the function rather than as a wrong value,
+    which is the crash this guard prevents::
 
-        E  FileNotFoundError: [Errno 2] No such file or directory:
-        E    '.../test_unreadable_paths_return_n0/nope/missing.yaml'
+        E  FileNotFoundError: [Errno 2] No such file or directory: '.../nope/missing.yaml'
     """
     assert fep.escalation_port(tmp_path / "nope" / "missing.yaml") is None
 
@@ -915,62 +919,117 @@ def _held_listener():
         sock.close()
 
 
+# How many fresh ephemeral ports to try before declaring a released-port probe
+# genuinely broken. A JUST-RELEASED ephemeral port reading back as BOUND is not
+# necessarily an is_bound defect: per the module docstring's hermeticity section, a
+# CONCURRENT copy of this same file (two module configs collect tests/scripts/, and
+# pytest-xdist is installed) can win that port in the microseconds between
+# _held_listener's close() and the probe. A lost race is retried on a fresh port; a
+# real defect reddens deterministically and so survives every attempt.
+_FREE_PORT_ATTEMPTS = 5
+
+
 def test_is_bound_tracks_a_real_listener(fep: types.ModuleType) -> None:
     """True while a real listener holds the port, False once it is released.
 
-    WHY THIS IS THE ONLY TEST THAT TOUCHES REAL SOCKETS, and why every main() test
-    below pins ``is_bound`` instead. MEASURED at base ``fc6f048b55`` with systemctl
-    neutralised but ``is_bound`` live: ``--base 8100`` over a tmp tree returned 8104
-    rather than 8102, and ``--base 8002`` returned 8004 rather than 8003 — because
-    live escalation servers hold those ports on this host. A main() test that let
-    the real probe run would therefore assert against the machine's current
-    process table, which is the opposite of hermetic.
+    WHY THIS IS ONE OF ONLY TWO TESTS THAT TOUCH REAL SOCKETS, and why every main()
+    test below pins ``is_bound`` instead. MEASURED with systemctl neutralised but
+    ``is_bound`` live: ``--base 8100`` over a tmp tree returned 8104 rather than 8102,
+    and ``--base 8002`` returned 8004 rather than 8003 — because live escalation
+    servers hold those ports on this host. A main() test that let the real probe run
+    would therefore assert against the machine's current process table, which is the
+    opposite of hermetic.
 
     WHY THE EPHEMERAL PORT IS REQUIRED: for the same reason. Asking the OS for a free
     port is the only way to get one this host is not already using.
 
-    MEASURED RED at base ``fc6f048b55``, scratch mutation reverted before commit:
-    inverting the return values (``return True`` on successful bind, ``False`` in the
-    OSError handler) — RED, and it caught BOTH directions rather than just one
-    (``2 failed, 24 deselected``)::
+    THE HELD-PORT DIRECTION IS RACE-FREE (we hold the socket ourselves, so nothing can
+    take it); only the RELEASED direction can be lost to a concurrent copy of this
+    suite, so only that one retries.
+
+    MEASURED RED, scratch mutation reverted before commit: inverting ``is_bound``'s
+    return values (``return True`` on successful bind, ``False`` in the OSError
+    handler) — RED, and it caught BOTH directions rather than just one::
 
         E  AssertionError: is_bound must report a held port as bound
-        E  assert False is True
-        E   +  where False = <function is_bound at 0x...>(45259)
-        E  AssertionError: assert True is False
-        E   +  where True = <function is_bound at 0x...>(34009)
+        E  AssertionError: is_bound must report a released port as free
     """
-    with _held_listener() as port:
-        assert fep.is_bound(port) is True, "is_bound must report a held port as bound"
+    for _ in range(_FREE_PORT_ATTEMPTS):
+        with _held_listener() as port:
+            assert fep.is_bound(port) is True, "is_bound must report a held port as bound"
 
-    # The listener is closed now. SO_REUSEADDR on both sides means the TIME_WAIT
-    # left by a never-connected listening socket does not block the re-bind.
-    assert fep.is_bound(port) is False, "is_bound must report a released port as free"
+        # The listener is closed now. SO_REUSEADDR on both sides means the TIME_WAIT
+        # left by a never-connected listening socket does not block the re-bind.
+        if fep.is_bound(port) is False:
+            return
+        # Lost the released port to another process — retry on a fresh one.
+
+    raise AssertionError(
+        "is_bound must report a released port as free: "
+        f"{_FREE_PORT_ATTEMPTS} distinct ephemeral ports all read BOUND after release, "
+        "which is too many to be the documented concurrent-run race"
+    )
 
 
-def test_is_bound_leaves_nothing_behind(fep: types.ModuleType) -> None:
-    """Two consecutive probes of a free port both report False.
+def _open_fd_count() -> int:
+    """This process's open file-descriptor count, via ``/proc/self/fd``.
 
-    The function binds a socket to find out whether it can. If its own probe socket
-    outlived the call, the SECOND probe would see the FIRST one's leftover and report
-    the port as bound — and main()'s scan would then skip every port it examined,
-    walking the whole 100-port window and returning rc 1 on a machine with nothing
-    running. The ``with`` block is what prevents that; this asserts it.
-
-    MEASURED RED at base ``fc6f048b55``, scratch mutation reverted before commit:
-    replacing the ``with socket.socket(...)`` context manager with a bare socket held
-    in a module-level list (the leak this test exists to catch) — RED on the SECOND
-    probe only, exactly as the failure mode predicts::
-
-        E  AssertionError: is_bound saw its own leftover probe socket
-        E  assert True is False
-        E   +  where True = <function is_bound at 0x...>(34439)
+    ``os.listdir`` (not ``Path.iterdir``) because it materialises the whole directory
+    and closes its own descriptor before returning, so the count does not include the
+    reading of it. Asserted rather than skipped, per this module's MUST NOT SKIP rule:
+    the script under test shells out to ``systemctl --user``, so this repo is Linux-
+    only and a missing ``/proc`` is a broken environment, not a reason to go green.
     """
-    with _held_listener() as port:
-        pass  # released immediately — now a known-free port on this host
+    assert pathlib.Path("/proc/self/fd").is_dir(), (
+        "this test counts descriptors via /proc/self/fd, which this host does not have"
+    )
+    return len(os.listdir("/proc/self/fd"))
 
-    assert fep.is_bound(port) is False
-    assert fep.is_bound(port) is False, "is_bound saw its own leftover probe socket"
+
+def test_is_bound_leaves_no_probe_socket_behind(fep: types.ModuleType) -> None:
+    """Repeated probing does not leak a file descriptor per call.
+
+    THE OBVIOUS ASSERTION HERE IS THE WRONG ONE, AND THAT IS THE MEASUREMENT WORTH
+    RECORDING. An earlier draft of this test asserted that two consecutive probes of a
+    free port BOTH report False, on the theory that a leaked probe socket would make
+    the second probe see the first one's leftover. That theory is FALSE on Linux, and
+    the scratch mutation it cited does not reproduce. MEASURED directly, both sockets
+    carrying SO_REUSEADDR exactly as ``is_bound`` sets it:
+
+        probe 1 (leaks a BOUND, non-listening socket) -> bind OK
+        probe 2 while that leak is bound, not listening -> bind OK
+        probe 3 after the leaked socket calls listen()  -> EADDRINUSE (98)
+
+    i.e. Linux only treats a bound port as in-use against a SO_REUSEADDR binder once
+    something is LISTENING on it — and ``is_bound`` never listens. So a leaked probe
+    socket does NOT make the next probe report bound, and asserting that it does is a
+    guard that cannot fire. The consequence that IS observable is descriptor
+    exhaustion: ``main()`` calls ``is_bound`` up to 100 times per run.
+
+    MEASURED, 20 probes each, ``/proc/self/fd`` counted before and after:
+      - HEAD (``with socket.socket(...)``):                     4 -> 4
+      - scratch mutation, bare socket kept in a module list:    4 -> 24  (RED here)
+    The mutation was reverted before commit. Both of ``is_bound``'s return paths are
+    exercised below — a held port (the ``except OSError`` branch) and a released one
+    (the successful-bind branch) — because both return from inside that ``with``.
+
+    NO RETRY LOOP AND NO RACE. This test never asserts what a probe RETURNS, only how
+    many descriptors it costs, so a concurrent copy of this suite winning the released
+    ephemeral port changes nothing.
+    """
+    with _held_listener() as held_port:
+        pass  # released — likely free; either answer is fine, only the fd cost matters
+
+    with _held_listener() as still_held_port:
+        before = _open_fd_count()
+        for _ in range(20):
+            fep.is_bound(still_held_port)  # OSError branch: bind refused
+            fep.is_bound(held_port)  # successful-bind branch
+        after = _open_fd_count()
+
+    assert after == before, (
+        f"is_bound leaked descriptors: {before} open before 40 probes, {after} after"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1037,26 +1096,6 @@ def _claiming_tree(tmp_path: pathlib.Path, claims: dict) -> tuple[pathlib.Path, 
     return parent, df_root
 
 
-def test_run_main_driver_reproduces_the_measured_allocation(
-    fep: types.ModuleType, no_systemd: None, tmp_path: pathlib.Path
-) -> None:
-    """Verify the driver end-to-end before the allocation tests lean on it.
-
-    RE-MEASURED at base ``fc6f048b55`` with both machine dependencies patched:
-    ``--df-root <tmp>/dark-factory --base 8100`` with proj-a claiming 8100 and target
-    claiming 8101 returns ``(0, "8102\\n")``.
-    """
-    _parent, df_root = _claiming_tree(tmp_path, {"proj-a": 8100, "target": 8101})
-
-    rc, out, err = _run_main(fep, ["--df-root", str(df_root), "--base", "8100"])
-
-    assert (rc, out) == (0, "8102\n")
-    # The evidence table went to stderr, not stdout — the split this driver exists
-    # to observe.
-    assert "Escalation port survey" in err
-    assert "8102" in err
-
-
 def test_base_is_honoured_when_free_and_unclaimed(
     fep: types.ModuleType, no_systemd: None, tmp_path: pathlib.Path
 ) -> None:
@@ -1073,32 +1112,38 @@ def test_a_sibling_claiming_the_base_port_pushes_the_choice_past_it(
 ) -> None:
     """THE COLLISION TEST — two projects must never be handed the same port.
 
+    Also the end-to-end verifier for ``_run_main`` itself, which every allocation test
+    below leans on: it is the one scenario that exercises discovery, config parsing,
+    the blocked union and the stdout/stderr split together.
+
     The task describes this failure mode as a silent cross-project dashboard bug
     rather than a crash: hand a second project a port another project already claims
     and the two escalation servers fight over it, with whichever loses simply not
     coming up.
 
-    RE-MEASURED at base ``fc6f048b55`` with both dependencies patched: proj-a claims
-    8100, target claims 8101, ``--base 8100`` -> rc 0, stdout ``8102``.
+    RE-MEASURED with both dependencies patched: proj-a claims 8100, target claims
+    8101, ``--base 8100`` -> rc 0, stdout ``8102``.
 
-    MEASURED RED at base ``fc6f048b55``, scratch mutation reverted before commit:
-    removing ``if cand in blocked: continue`` from the scan loop — i.e. the collision
+    MEASURED RED, scratch mutation reverted before commit: removing
+    ``if cand in blocked: continue`` from ``main``'s scan loop — i.e. the collision
     bug itself — RED::
 
         E  AssertionError: assert (0, '8100\\n') == (0, '8102\\n')
 
-    That mutation reddened 4 tests (``4 failed, 31 passed``): this one, the driver
-    verifier, and both RESERVED cases — the blocked union is the single gate all of
-    them depend on.
+    That mutation also reddened both RESERVED cases — the blocked union is the single
+    gate all of them depend on.
     """
     _parent, df_root = _claiming_tree(tmp_path, {"proj-a": 8100, "target": 8101})
 
     rc, out, err = _run_main(fep, ["--df-root", str(df_root), "--base", "8100"])
 
     assert (rc, out) == (0, "8102\n")
-    # Both claims are visible in the evidence table, attributed to their projects.
-    assert "proj-a" in err
-    assert "target" in err
+    # The evidence table went to stderr, not stdout, and each claim is attributed to
+    # the project holding it. Asserted on the project NAMES and the claimed PORT
+    # NUMBERS — never on the surrounding prose, which is a human-readable table and
+    # free to be reworded.
+    assert "proj-a" in err and "8100" in err
+    assert "target" in err and "8101" in err
 
 
 @pytest.mark.parametrize(("base", "expected"), [(8103, "8104\n"), (8002, "8003\n")])
@@ -1112,12 +1157,15 @@ def test_reserved_ports_are_never_handed_out(
     the config survey alone would happily hand them out.
 
     The parametrization is checked against ``fep.RESERVED`` below rather than trusted,
-    so adding a reserved port cannot leave this test asserting a stale set.
+    so adding a reserved port cannot leave this test asserting a stale set. The
+    converse — that the parametrization covers EVERY reserved port — is pinned by
+    ``test_module_loads_with_its_documented_surface``'s
+    ``set(fep.RESERVED) == {8002, 8103}``, so it is not restated here.
 
-    RE-MEASURED at base ``fc6f048b55``: ``--base 8103`` -> 8104, ``--base 8002`` -> 8003.
+    RE-MEASURED: ``--base 8103`` -> 8104, ``--base 8002`` -> 8003.
 
-    MEASURED RED at base ``fc6f048b55``, scratch mutation reverted before commit:
-    dropping RESERVED from the blocked union (``blocked = set(used)``) — RED::
+    MEASURED RED, scratch mutation reverted before commit: dropping RESERVED from
+    ``main``'s blocked union (``blocked = set(used)``) — RED::
 
         E  AssertionError: assert (0, '8103\\n') == (0, '8104\\n')
     """
@@ -1130,11 +1178,6 @@ def test_reserved_ports_are_never_handed_out(
     assert str(base) in err, "the reserved port must appear in the evidence table"
 
 
-def test_every_reserved_port_is_covered_by_the_parametrization(fep: types.ModuleType) -> None:
-    """Drive the reserved set FROM the module, so a new reserved port fails loudly."""
-    assert set(fep.RESERVED) == {8002, 8103}
-
-
 def test_a_port_free_in_config_but_bound_is_skipped_and_reported(
     fep: types.ModuleType, no_systemd: None, tmp_path: pathlib.Path
 ) -> None:
@@ -1143,8 +1186,12 @@ def test_a_port_free_in_config_but_bound_is_skipped_and_reported(
     A project can be running an escalation server before its config exists — that is
     precisely the state ``factory-init`` runs in. The config survey cannot see it, so
     the bound check is the only thing standing between it and a duplicate assignment,
-    and the ``note:`` line is how a human reading the survey learns why the obvious
-    port was passed over.
+    and stderr is how a human reading the survey learns why the obvious port was
+    passed over.
+
+    Asserted on the skipped port NUMBERS appearing at all, not on the ``note:`` prefix
+    or any other wording: that a passed-over port is reported is the information a
+    reader acts on, and the line it is reported in is a human-readable table.
     """
     _parent, df_root = _claiming_tree(tmp_path, {})
 
@@ -1153,9 +1200,8 @@ def test_a_port_free_in_config_but_bound_is_skipped_and_reported(
     )
 
     assert (rc, out) == (0, "8102\n")
-    note_lines = [ln for ln in err.splitlines() if "note:" in ln]
-    assert any("8100" in ln for ln in note_lines), f"no note: line mentioned 8100 — {note_lines}"
-    assert any("8101" in ln for ln in note_lines), f"no note: line mentioned 8101 — {note_lines}"
+    assert "8100" in err, f"the skipped bound port 8100 was never reported — {err!r}"
+    assert "8101" in err, f"the skipped bound port 8101 was never reported — {err!r}"
 
 
 def test_the_scan_window_is_bounded_and_failure_writes_nothing_to_stdout(
@@ -1168,8 +1214,8 @@ def test_the_scan_window_is_bounded_and_failure_writes_nothing_to_stdout(
     on failure — never a stale or partial value that would then be written into a
     generated config as if it had been chosen.
 
-    RE-MEASURED at base ``fc6f048b55`` with ``is_bound`` pinned True for every port:
-    ``(1, "")``, stderr containing "ERROR: no free".
+    RE-MEASURED with ``is_bound`` pinned True for every port: ``(1, "")``, and an
+    ERROR announced on stderr.
     """
     _parent, df_root = _claiming_tree(tmp_path, {})
     everything = frozenset(range(8100, 8300))
@@ -1180,24 +1226,67 @@ def test_the_scan_window_is_bounded_and_failure_writes_nothing_to_stdout(
 
     assert rc == 1
     assert out == "", f"stdout must be empty on failure, got {out!r}"
-    assert "ERROR: no free" in err
+    # That the failure is ANNOUNCED is actionable (a caller reading an empty capture
+    # needs somewhere to look); the wording of the announcement is not.
+    assert "ERROR" in err, f"a failed run must announce itself on stderr — {err!r}"
 
 
-def test_an_empty_survey_says_so_rather_than_looking_unparsed(
+def test_two_projects_claiming_the_same_port_still_allocate_past_it(
     fep: types.ModuleType, no_systemd: None, tmp_path: pathlib.Path
 ) -> None:
-    """"(none found)" — an empty result must be visible, not indistinguishable from a
-    survey that silently failed to parse anything.
+    """An ALREADY-COLLIDED fleet: two configs claiming 8100 at once.
 
-    Without the explicit line, "Claimed by existing project configs:" followed by
-    nothing reads identically whether no project claims a port or every config failed
-    to parse — and those call for opposite responses from whoever is reading it.
+    ``main`` accumulates claims as ``used[port] = f"{root.name} ({...})"`` — a plain
+    dict assignment — so the second project discovered on a port OVERWRITES the first
+    and the evidence table under-reports. PINNED AS OBSERVED, NOT ENDORSED: a human
+    reading the survey sees one project holding 8100 when two do, which is exactly the
+    broken state a port-allocation tool exists to surface. Filed as follow-up ticket
+    ``tkt_0RSH4GD31ZE7FQSP1844TQY6VY`` (reporting only — allocation is unaffected, since the port is
+    blocked either way, which is what the stdout assertion below pins).
+
+    WHICH of the two survives is deliberately NOT asserted: ``known_project_roots``'
+    fallback uses ``glob.glob``, which returns ``os.scandir`` order, so the winner is
+    filesystem-dependent. The falsifiable claim is that exactly ONE of the two names
+    reaches the table — if the reporting is ever fixed to list both, this test
+    reddens and the docstring above is what tells the next reader that greening it by
+    asserting both is a fix and not a regression.
     """
-    _parent, df_root = _claiming_tree(tmp_path, {})
+    parent, df_root = _claiming_tree(tmp_path, {"proj-a": 8100, "target": 8100})
 
-    _rc, _out, err = _run_main(fep, ["--df-root", str(df_root), "--base", "8100"])
+    rc, out, err = _run_main(fep, ["--df-root", str(df_root), "--base", "8100"])
 
-    assert "(none found)" in err
+    # Allocation is CORRECT regardless: 8100 is blocked, so the next free port wins.
+    assert (rc, out) == (0, "8101\n")
+    # Both configs really do claim 8100 — otherwise the collapse below is vacuous.
+    for name in ("proj-a", "target"):
+        cfg = parent / name / "dark-factory-orchestrator.yaml"
+        assert fep.escalation_port(cfg) == 8100
+
+    reported = [name for name in ("proj-a", "target") if name in err]
+    assert len(reported) == 1, (
+        "the duplicate claim on 8100 is expected to COLLAPSE to a single reported "
+        f"project (see tkt_0RSH4GD31ZE7FQSP1844TQY6VY), got {reported}"
+    )
+
+
+def test_df_root_falls_back_to_the_DARK_FACTORY_ROOT_env_var(
+    fep: types.ModuleType, no_systemd: None, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """With no ``--df-root``, the survey is rooted at ``$DARK_FACTORY_ROOT``.
+
+    ``main`` builds that default inside ``add_argument`` — ``os.environ.get(
+    "DARK_FACTORY_ROOT", "/home/leo/src/dark-factory")`` — so it is re-read on every
+    call rather than frozen at import. This is the branch that makes the script usable
+    at all from a checkout that is not the hardcoded literal, and asserting it here is
+    also what keeps a passing suite from depending on that literal existing.
+    """
+    _parent, df_root = _claiming_tree(tmp_path, {"proj-a": 8100, "target": 8101})
+    monkeypatch.setenv("DARK_FACTORY_ROOT", str(df_root))
+
+    rc, out, _err = _run_main(fep, ["--base", "8100"])
+
+    assert (rc, out) == (0, "8102\n"), "the env-var default did not root the survey"
 
 
 # ---------------------------------------------------------------------------
@@ -1215,8 +1304,11 @@ def test_exclude_root_releases_the_targets_own_claim(
     without this the script would read that repo's own config, treat its port as
     taken, and hand it a different one on every run.
 
-    RE-MEASURED at base ``fc6f048b55``: same tree, ``--base 8100`` yields 8102 without
-    the flag and 8101 with ``--exclude-root <target>`` — rc 0, stdout "8101".
+    RE-MEASURED: same tree, ``--base 8100`` yields 8102 without the flag and 8101 with
+    ``--exclude-root <target>`` — rc 0, stdout "8101". The no-flag leg is kept as this
+    test's CONTROL, not as a restatement of the collision test: without it, an
+    exclusion that silently did nothing and a tree that never claimed 8101 would be
+    indistinguishable.
     """
     parent, df_root = _claiming_tree(tmp_path, {"proj-a": 8100, "target": 8101})
     target = parent / "target"
@@ -1239,26 +1331,25 @@ def test_exclude_root_matches_on_the_resolved_path_from_either_side(
     the two ``.resolve()`` calls guard DIFFERENT things. Written as one test because
     covering only one side was MEASURED insufficient:
 
-      - RIGHT side (``Path(args.exclude_root).resolve()``, line 132): the operator
+      - RIGHT side (``exclude = Path(args.exclude_root).resolve()``): the operator
         passes a symlink. SKILL.md passes whatever path the operator typed, so this
         is the ordinary case.
-      - LEFT side (``root.resolve()``, line 136): the DISCOVERED root is itself a
-        non-canonical spelling. That is not hypothetical — step-3 pins that a root
-        named through a symlink alias in DASHBOARD_KNOWN_PROJECT_ROOTS is retained
-        under its UNRESOLVED spelling, so this is exactly the shape
+      - LEFT side (``root.resolve() == exclude`` in the survey loop): the DISCOVERED
+        root is itself a non-canonical spelling. That is not hypothetical —
+        ``test_a_root_reachable_by_both_sources_appears_exactly_once`` pins that a
+        root named through a symlink alias in DASHBOARD_KNOWN_PROJECT_ROOTS is
+        retained under its UNRESOLVED spelling, so this is exactly the shape
         ``known_project_roots`` hands to main().
 
-    MEASURED at base ``fc6f048b55``, and the reason this test covers both: dropping
-    ``.resolve()`` from the LEFT side while only the right-side case was asserted left
-    the whole module GREEN (``39 passed``), because ``exclude`` is already resolved at
-    parse time and the glob-discovered root was already canonical.
+    MEASURED, and the reason this test covers both: dropping ``.resolve()`` from the
+    LEFT side while only the right-side case was asserted left the whole module GREEN,
+    because ``exclude`` is already resolved at parse time and the glob-discovered root
+    was already canonical.
 
-    MEASURED RED at base ``fc6f048b55`` once the left-side case was added, scratch
-    mutation reverted before commit: dropping ``root.resolve()`` (``root == exclude``)
-    — RED::
+    MEASURED RED once the left-side case was added, scratch mutation reverted before
+    commit: dropping ``root.resolve()`` (``root == exclude``) — RED::
 
         E  AssertionError: a symlink-spelled discovered root stopped matching
-        E  assert (0, '8102\\n') == (0, '8101\\n')
     """
     parent, df_root = _claiming_tree(tmp_path, {"proj-a": 8100, "target": 8101})
     alias = tmp_path / "outside" / "target-alias"
@@ -1322,8 +1413,8 @@ def test_stdout_is_exactly_the_chosen_port_and_nothing_else(
     A stray debug ``print()`` added to stdout must break THIS test rather than
     silently corrupting a caller's captured value.
 
-    MEASURED RED at base ``fc6f048b55``, scratch mutation reverted before commit:
-    changing the final ``print(chosen)`` to ``print(f"port: {chosen}")`` — RED::
+    MEASURED RED, scratch mutation reverted before commit: changing ``main``'s final
+    ``print(chosen)`` to ``print(f"port: {chosen}")`` — RED::
 
         E  AssertionError: stdout must be a bare integer, got 'port: 8102'
     """
@@ -1338,86 +1429,153 @@ def test_stdout_is_exactly_the_chosen_port_and_nothing_else(
     assert out.strip().isdigit(), f"stdout must be a bare integer, got {out.strip()!r}"
     assert int(out.strip()) == 8102
 
-    # The entire evidence table is on stderr, and it names the chosen port. The
-    # structural markers are asserted; the table's prose deliberately is not.
+    # The OTHER half of the split: the evidence table went to stderr and it names the
+    # chosen port. Asserted on the port NUMBER, never on the table's prose — that
+    # table is human-readable output and rewording it is not a behaviour change.
     assert err, "the evidence table must not be empty"
-    assert "Escalation port survey" in err
-    assert "Reserved:" in err
-    assert "Claimed by existing project configs:" in err
-    assert "CHOSEN escalation port: 8102" in err
+    assert "8102" in err, "the chosen port must appear in the evidence table"
 
 
 # ---------------------------------------------------------------------------
-# Parity with scripts/legibility/nightly.py._default_search_roots
+# Parity with scripts/legibility/nightly's search-root convention
 # ---------------------------------------------------------------------------
 
 
-def _load_nightly() -> types.ModuleType:
-    """Import ``legibility.nightly``, inserting ``scripts/legibility`` onto sys.path.
+@pytest.fixture
+def nightly(monkeypatch: pytest.MonkeyPatch) -> Iterator[types.ModuleType]:
+    """``legibility.nightly``, imported with ``scripts/legibility`` on sys.path.
 
-    MEASURED at base ``fc6f048b55``: ``from legibility import nightly`` with only
-    ``scripts/`` on sys.path raises ``ModuleNotFoundError: No module named 'codebook'``
-    — ``scripts/legibility/coder.py`` line 45 does ``import codebook as codebook_mod``
-    and ``census.py`` line 90 likewise. ``tests/scripts/conftest.py`` inserts
-    ``scripts/`` and this directory but NOT ``scripts/legibility``, so the insertion
-    is done HERE (guarded, idempotent) rather than widening conftest for every sibling
-    test in this directory.
+    THE PATH MUTATION IS SCOPED TO THE TEST, deliberately. ``scripts/legibility``
+    contains generically-named top-level modules — ``config.py``, ``census.py``,
+    ``inventory.py``, ``sampling.py``, ``digest.py``, ``coder.py``, ``codebook.py`` —
+    so a bare ``sys.path.insert(0, ...)`` would leave every one of them a shadowing
+    candidate at position 0 for the REST of the pytest session. This module is
+    collected alongside ~38 others in ``tests/scripts/``, so whether a sibling saw
+    that path would depend on collection order, and any future import collision would
+    surface as an order-dependent red that reproduces under only some orders.
+    ``monkeypatch.syspath_prepend`` undoes it at teardown, and the ``sys.modules``
+    sweep below undoes the other half — the modules legibility imports under
+    ABSOLUTE top-level names (``import codebook``), which would otherwise stay
+    resolvable to a sibling long after the path entry is gone. Only names this
+    fixture itself introduced are removed.
+
+    (The other fix the review offered — a third insertion in
+    ``tests/scripts/conftest.py`` next to the two already there — is outside this
+    task's locked module set, so it is not taken here.)
+
+    MEASURED: ``from legibility import nightly`` with only ``scripts/`` on sys.path
+    raises ``ModuleNotFoundError: No module named 'codebook'`` —
+    ``scripts/legibility``'s ``coder.py`` and ``census.py`` both do a top-level
+    ``import codebook``. ``tests/scripts/conftest.py`` inserts ``scripts/`` and this
+    directory, but not ``scripts/legibility``.
 
     A BARE import, never ``pytest.importorskip``: if nightly stops importing under the
     module config's own ``uv run --project shared`` env, this parity guard must fail
     loudly rather than pass vacuously.
     """
-    legibility_dir = REPO_ROOT / "scripts" / "legibility"
-    if str(legibility_dir) not in sys.path:
-        sys.path.insert(0, str(legibility_dir))
-    from legibility import nightly  # noqa: PLC0415
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "scripts" / "legibility"))
+    before = set(sys.modules)
+    from legibility import nightly as nightly_mod  # noqa: PLC0415
 
-    return nightly
+    yield nightly_mod
+
+    for name in set(sys.modules) - before:
+        del sys.modules[name]
+
+
+def _write_legibility_config(root: pathlib.Path, project_id: str) -> pathlib.Path:
+    """Write the minimal ``docs/legibility/legibility.yaml`` ``load_config`` accepts.
+
+    Four required fields (project_id / project_root / escalation_port /
+    cwd_prefixes); every nested block defaults to its own all-defaults instance.
+    ``project_root`` and ``cwd_prefixes`` must be ABSOLUTE — ``LegibilityConfig``
+    rejects relative ones with a ValidationError at load time, and
+    ``resolve_config_path`` SKIPS a candidate whose config fails to load, so a
+    malformed fixture here would silently make this test vacuous rather than red.
+    """
+    path = root / "docs" / "legibility" / "legibility.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"project_id: {project_id}\n"
+        f"project_root: {root}\n"
+        "escalation_port: 8100\n"
+        "cwd_prefixes:\n"
+        f"  - {root}\n"
+    )
+    return path
 
 
 def test_known_project_roots_and_nightly_expand_a_shared_parent_identically(
-    fep: types.ModuleType, no_systemd: None, monkeypatch: pytest.MonkeyPatch,
-    tmp_path: pathlib.Path,
+    fep: types.ModuleType, no_systemd: None, nightly: types.ModuleType,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
 ) -> None:
     """Both conventions enumerate the SAME candidate project-root set for one parent.
 
     nightly's ``_default_search_roots`` docstring says it "mirrors
     ``skills/factory-init/scripts/find_escalation_port.known_project_roots``'s
     sibling-repos-under-/home/leo/src convention" — and nothing checked that. This is
-    that check: given the same parent directory, both sides yield immediate children,
-    directories only, no recursion.
+    that check.
+
+    IT IS DRIVEN THROUGH ``resolve_config_path``, NOT THROUGH A LOCAL RE-STATEMENT OF
+    THE RULE. ``_default_search_roots`` returns a PARENT and does no traversal at all;
+    the one-level glob that makes the mirror true lives in ``resolve_config_path``
+    (``for candidate_root in sorted(root.iterdir())``). An earlier draft computed the
+    nightly side with its own inline ``r.iterdir()`` comprehension, which meant the
+    only nightly code exercised was an env-var split — so switching
+    ``resolve_config_path`` to ``rglob`` would have left the guard green while
+    destroying the very mirror it exists to protect. Each project below therefore
+    carries a real ``docs/legibility/legibility.yaml`` and is located by ASKING
+    nightly to resolve its project_id.
 
     WHAT THIS DELIBERATELY DOES NOT ASSERT, and why:
 
-    1. NOT that the two functions return equal VALUES. nightly returns the PARENT
-       (``resolve_config_path`` globs one level down); find_escalation_port returns
-       the CHILDREN. Different levels by design, so a naive equal-outputs assertion is
-       false by construction — the mirrored thing is a RULE, not a value.
+    1. NOT that the two functions return equal VALUES. nightly's search root is the
+       PARENT; find_escalation_port returns the CHILDREN. Different levels by design,
+       so a naive equal-outputs assertion is false by construction — the mirrored
+       thing is a RULE, not a value.
     2. NOT that their DEFAULTS agree. That is a FALSE PREMISE in every task worktree:
        nightly derives repo_root from ``__file__`` (here ``.worktrees/3705``, parent
        ``.worktrees``) while find_escalation_port defaults ``--df-root`` to the literal
        ``/home/leo/src/dark-factory`` (parent ``/home/leo/src``). Those differ
        permanently under any worktree, so such a test could never be greened.
 
-    The fixture includes a loose FILE and a GRANDCHILD directory so the equality is
-    falsifiable in both directions rather than trivially true.
+    MEASURED RED, scratch mutations reverted before commit:
 
-    MEASURED RED at base ``fc6f048b55``, scratch mutation reverted before commit:
-    widening find_escalation_port's glob to ``df_root.parent / '*' / '*'`` — which
-    breaks parity while leaving each side individually coherent — RED::
+      - widening ``known_project_roots``' fallback glob to ``df_root.parent/'*'/'*'``
+        — which breaks parity while leaving each side individually coherent — RED::
 
-        E  AssertionError: the two conventions disagree on the same parent
+            E  AssertionError: the two conventions disagree on the same parent
+
+      - the nightly side's non-recursion assertion was falsified WITHOUT editing
+        ``nightly.py`` (it is outside this task's locked modules, so not even a
+        transient scratch edit is taken): calling
+        ``resolve_config_path('parity-grandchild', search_roots=[<parent>/proj-a])``
+        — i.e. handing it a parent one level higher so its EXISTING one-level glob
+        reaches the grandchild — RESOLVES that config. So the grandchild fixture is
+        genuinely loadable and genuinely discoverable-if-recursed, and the
+        ``pytest.raises(FileNotFoundError)`` below fails the moment
+        ``resolve_config_path`` starts recursing.
     """
     parent, df_root = _project_tree(tmp_path)
-    nightly = _load_nightly()
     monkeypatch.setenv("LEGIBILITY_SEARCH_ROOTS", str(parent))
 
+    ids = {"dark-factory": "parity-df", "proj-a": "parity-a", "target": "parity-t"}
+    for name, project_id in ids.items():
+        _write_legibility_config(parent / name, project_id)
+    # A GRANDCHILD carrying a valid config: reachable only if either side recurses.
+    _write_legibility_config(parent / "proj-a" / "nested", "parity-grandchild")
+
     ours = {p.resolve() for p in fep.known_project_roots(df_root)}
-    theirs = {c.resolve() for r in nightly._default_search_roots() for c in r.iterdir() if c.is_dir()}
+    # <root>/docs/legibility/legibility.yaml -> parents[2] is <root>.
+    theirs = {
+        nightly.resolve_config_path(project_id).parents[2].resolve()
+        for project_id in ids.values()
+    }
 
     assert ours == theirs, "the two conventions disagree on the same parent"
-    # Non-vacuity: both really did enumerate the projects, and both really did omit
-    # the loose file and the grandchild.
-    assert ours == {(parent / n).resolve() for n in ("dark-factory", "proj-a", "target")}
-    assert (parent / "loose.txt").resolve() not in theirs
-    assert (parent / "proj-a" / "nested").resolve() not in theirs
+
+    # Neither side recurses: the grandchild's config is unreachable for nightly, and
+    # the grandchild directory is not a project root for us.
+    with pytest.raises(FileNotFoundError):
+        nightly.resolve_config_path("parity-grandchild")
+    assert (parent / "proj-a" / "nested").resolve() not in ours
