@@ -341,6 +341,76 @@ class TestFanoutFailureNamesTheExceptionType:
         )
 
 
+# ── (c4b) an already-rendered cause must not be prefixed twice ───────
+
+
+class TestPreformattedFanoutError:
+    """A call site that already rendered 'Type: message' must not be re-prefixed.
+
+    ``first_success`` renders every caught exception through ``describe_exc``,
+    which unconditionally prepends ``type(exc).__name__``. A call site that has
+    already formatted the *real* cause and re-raises it therefore reached the
+    operator doubled — ``'ValueError: ConnectError: refused'`` in the
+    cancel_ticket 502 detail and in the dashboard's offline pill.
+    """
+
+    def test_is_a_value_error_subclass(self):
+        from dashboard.data.mcp_fanout import PreformattedFanoutError
+
+        assert issubclass(PreformattedFanoutError, ValueError), (
+            "first_success's catch tuple and callers' own `except ValueError` "
+            'must keep working unchanged'
+        )
+
+    def test_describe_exc_returns_the_message_verbatim(self):
+        from dashboard.data.mcp_fanout import PreformattedFanoutError, describe_exc
+
+        exc = PreformattedFanoutError('ConnectError: refused')
+        assert describe_exc(exc) == 'ConnectError: refused', (
+            'an already-rendered cause must not gain a second type prefix'
+        )
+
+    def test_a_plain_value_error_is_still_prefixed(self):
+        from dashboard.data.mcp_fanout import describe_exc
+
+        assert describe_exc(ValueError('ConnectError: refused')) == (
+            'ValueError: ConnectError: refused'
+        ), 'the opt-out is the marker type only — plain ValueError is unchanged'
+
+    def test_an_empty_message_still_names_a_type(self):
+        from dashboard.data.mcp_fanout import PreformattedFanoutError, describe_exc
+
+        # The content-free-log-line wart describe_exc exists to prevent
+        # (httpx.PoolTimeout stringifies to '') must not re-enter here.
+        assert describe_exc(PreformattedFanoutError('')) == 'PreformattedFanoutError'
+
+    async def test_first_success_emits_a_single_prefix_end_to_end(self, caplog):
+        from dashboard.data.mcp_fanout import PreformattedFanoutError
+
+        async def call(_url):
+            raise PreformattedFanoutError('ConnectError: refused')
+
+        with caplog.at_level(logging.WARNING, logger='dashboard.data.mcp_fanout'):
+            result = await first_success(
+                ['http://a'], call, log_label='cancel_ticket',
+                offline_result=_offline_result,
+            )
+
+        assert result['error'] == 'http://a: ConnectError: refused', (
+            f'the offline sentinel must carry one prefix, got {result["error"]!r}'
+        )
+        assert 'ValueError: ConnectError' not in result['error']
+
+        warnings = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'dashboard.data.mcp_fanout'
+        ]
+        assert len(warnings) == 1
+        assert 'ValueError: ConnectError' not in warnings[0], (
+            f'the WARNING must not double the prefix either, got {warnings[0]}'
+        )
+
+
 # ── (c5) per-project-root label discrimination ───────────────────────
 
 
