@@ -648,7 +648,8 @@ class NightlyResult:
     ExecStart / CLI caller: 0 on success (including a genuine no-change
     night), non-zero on a fail-loud trigger (PRD decision 8, layered on by
     later steps). ``applied`` is the total number of codebook mutations
-    (matched sightings + applied candidates) across every coding record
+    (matched sightings + applied candidates + recurrence sightings appended
+    to an already-adjudicated candidate) across every coding record
     this run merged -- 0 on a dedup-only or empty-coding night, which is
     exactly what gates the dump/commit below, giving a re-run its
     idempotency for free (PRD §6.7/§8.8).
@@ -1117,6 +1118,7 @@ def run_nightly(
             return result
 
         applied = 0
+        conflicts = 0
         deletion_escalated = False
         for record in run.records:
             try:
@@ -1141,7 +1143,26 @@ def run_nightly(
                     post_escalation(cfg, summary, detail, poster=poster) or deletion_escalated
                 )
                 continue
-            applied += stats['matched'] + stats['candidates_applied']
+            conflicts += stats['candidate_disposition_conflicts']
+            # A conflict-appended sighting IS a codebook mutation (a
+            # recurrence appended to an already-adjudicated candidate), so it
+            # must count toward the dump/commit gate below -- otherwise a
+            # night whose ONLY effect is conflict sightings ends with
+            # applied == 0, `if applied > 0` skips dump(), and the merged `cb`
+            # is discarded as a "no-change night", destroying the exact signal
+            # the elif-branch exists to preserve.
+            applied += (
+                stats['matched']
+                + stats['candidates_applied']
+                + stats['candidate_disposition_conflicts']
+            )
+
+        if conflicts:
+            logger.info(
+                'legibility trickle: %d candidate sighting(s) appended to an '
+                'already-adjudicated record; disposition left to the census',
+                conflicts,
+            )
 
         validation_errors = codebook.validate(cb)
         if validation_errors:
