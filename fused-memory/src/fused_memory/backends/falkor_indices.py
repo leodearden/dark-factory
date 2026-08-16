@@ -526,6 +526,110 @@ def normalize_index_record(record) -> list[IndexSpec]:
     return specs
 
 
+def vector_index_properties(record) -> list[str]:
+    """Return the properties of ONE ``list_indices()`` record carrying a VECTOR index.
+
+    The structural twin of :func:`normalize_index_record`, and deliberately a
+    SEPARATE function rather than a flag on it.  That one PROJECTS VECTOR AWAY by
+    design — ``_REPRESENTABLE_INDEX_TYPES = {'RANGE', 'FULLTEXT'}`` — because
+    VECTOR is unrepresentable in the PRD normal form and raising on it would make
+    the drift detector a false-alarm generator on every real graph.  A function
+    whose defining behaviour is discarding VECTOR can never be the VECTOR
+    detector, so the detector lives here.
+
+    Selection is ``'VECTOR' in raw_types`` — MEMBERSHIP, never ``== 'VECTOR'``
+    and never list equality.  MEASURED 2026-08-16 on throwaway graph
+    ``_impl3769_probe``: one property can carry BOTH types (``{name: ['RANGE',
+    'VECTOR']}``), and ``DROP VECTOR INDEX`` surgically removes only the VECTOR
+    half, leaving ``{name: ['RANGE']}``.  An ``== ['VECTOR']`` predicate would
+    silently skip exactly those mixed properties — the same silent-omission class
+    as the ``== 'VECTOR'`` string-vs-dict compare this function replaces, just
+    rarer and harder to spot.
+
+    Fan-out is driven by the record's ``field`` list (the authoritative property
+    membership) rather than ``type.keys()``, matching
+    :func:`normalize_index_record`'s deliberate choice: a divergence between the
+    two raises loudly instead of under-reporting.
+
+    Args:
+        record: A mapping with ``label``, ``entity_type``, ``field`` and ``type``
+            keys, as returned by ``GraphitiBackend.list_indices()``.  Note that
+            FalkorDB MERGES every index on a label into ONE record, so a single
+            record routinely carries a mix of VECTOR and RANGE properties.
+
+    Returns:
+        The subset of ``field``, in ``field`` order, whose ``type`` entry contains
+        ``'VECTOR'``.  Legitimately empty for a RANGE/FULLTEXT-only record.
+
+    Raises:
+        IndexRecordShapeError: ``label`` is not a non-empty string,
+            ``entity_type`` is not ``'NODE'``/``'RELATIONSHIP'``, ``field`` is
+            neither a string nor a non-empty list, or a property in ``field`` has
+            no entry in ``type``.
+    """
+    label = record.get('label')
+    entity_type = record.get('entity_type')
+
+    # Same guards, same wording, same reasoning as normalize_index_record: a
+    # column mis-binding is the failure class this module exists to catch, and
+    # both of these values are exactly as bindable to the wrong column.
+    if not isinstance(label, str) or not label:
+        raise IndexRecordShapeError(
+            f'index record has label {label!r}, expected a non-empty string. '
+            'CALL db.indexes() changed shape, or the caller bound the wrong '
+            'column. '
+            f'Record: {record!r}'
+        )
+
+    # entity_type is LOAD-BEARING for the caller, not cosmetic: it selects the
+    # DROP statement shape.  MEASURED 2026-08-16 -- node syntax against a
+    # RELATIONSHIP vector index fails with `no such index`, so tolerating a bogus
+    # entity_type here reproduces the exact failure mode this function exists to
+    # kill: a drop that reports success while dropping nothing.
+    if not isinstance(entity_type, str) or entity_type not in _VALID_ENTITY_TYPES:
+        raise IndexRecordShapeError(
+            f'index record for label {label!r} has entity_type {entity_type!r}, '
+            f'expected one of {sorted(_VALID_ENTITY_TYPES)}. CALL db.indexes() '
+            'changed shape, or the caller bound the wrong column (the options '
+            'column is a dict; entitytype is the string one). '
+            f'Record: {record!r}'
+        )
+
+    fields = record.get('field')
+    # A bare str degrades to "one property" rather than silently to zero, exactly
+    # as in normalize_index_record.
+    if isinstance(fields, str):
+        fields = [fields]
+    elif not isinstance(fields, Sequence) or not fields:
+        raise IndexRecordShapeError(
+            f'index record for label {label!r} has field {fields!r}, expected a '
+            'non-empty list of property names (or a single property string). '
+            'Refusing to project it to zero properties: that silently leaves '
+            'every vector index on this label undropped. '
+            f'Record: {record!r}'
+        )
+
+    types = record.get('type') or {}
+
+    props: list[str] = []
+    for prop in fields:
+        if prop not in types:
+            raise IndexRecordShapeError(
+                f'property {prop!r} is listed in the field list of the {label!r} '
+                f'index record but has no entry in its type mapping '
+                f'({sorted(types)}). Refusing to skip it: a skipped property '
+                'silently leaves a vector index in place while the caller '
+                'reports a clean drop. '
+                f'Record: {record!r}'
+            )
+        raw_types = types[prop]
+        if isinstance(raw_types, str):
+            raw_types = [raw_types]
+        if 'VECTOR' in raw_types:
+            props.append(prop)
+    return props
+
+
 def normalize_index_records(records) -> set[IndexSpec]:
     """Union :func:`normalize_index_record` over an iterable of records.
 
