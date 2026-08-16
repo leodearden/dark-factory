@@ -137,6 +137,11 @@ def _env_slug_is_owned(
     a pre-task-4193 record; the first matching hook binds it in
     ``_bind_claude_session_id``). Only a binding that positively MISMATCHES
     returns False, sending the caller to the hand-launched keying.
+
+    FAIL-SOFT: every failure mode resolves to adopt (True), never to fork.
+    A probe that cannot answer degrades to the pre-task-4193 behaviour
+    rather than inventing a record split, honouring the hook trio's hard
+    rule that a registry fault never breaks a session.
     """
     hook_session_id = str(hook_input.get('session_id') or '').strip()
     if not hook_session_id:
@@ -144,7 +149,21 @@ def _env_slug_is_owned(
     try:
         record = session_registry.read_record(slug, root=root)
     except FileNotFoundError:
-        # No record yet: this hook event IS the slug's first sight.
+        # No record yet: this hook event IS the slug's first sight. Its own
+        # arm, above the broad one, so an ordinary fresh spawn logs nothing.
+        return True
+    except Exception:
+        # A corrupt body, an unreadable fleet root, anything: an ownership
+        # probe that cannot answer must degrade to the pre-task-4193
+        # behaviour (adopt) rather than fork a spurious record or raise --
+        # the hook trio's hard rule is that a registry fault never breaks a
+        # session. Logged, never silent.
+        logger.warning(
+            'session-ownership probe failed for slug %s; adopting inherited '
+            'CLAUDE_SPAWN_SESSION_ID unchecked',
+            slug,
+            exc_info=True,
+        )
         return True
     bound = (record.claude_session_id or '').strip()
     if not bound:

@@ -967,16 +967,33 @@ def test_run_stop_fail_soft_when_probe_read_raises(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # End-to-end: a fault in the OWNERSHIP PROBE's read must never be what
+    # breaks Stop. Scoped to the probe's own read (the first of the two
+    # read_record calls run_stop makes: the probe reads, then
+    # refresh_record does) because refresh_record deliberately PROPAGATES a
+    # corrupt/unreadable body rather than overwriting it -- see its
+    # docstring, "A *corrupt* existing body is NOT treated as absent" -- and
+    # main()'s blanket except is the backstop for that pre-existing case.
     slug = 'session-cockpit-3215072'
     hook_input = {'session_id': 'uuid-parent', 'cwd': '/home/leo/src/dark-factory'}
     env = {'CLAUDE_SPAWN_SESSION_ID': slug}
 
-    def _boom(*_args: object, **_kwargs: object) -> None:
-        raise OSError('disk on fire')
+    real_read_record = sr.read_record
+    calls: list[int] = []
 
-    monkeypatch.setattr(sr, 'read_record', _boom)
+    def _boom_once(*args: object, **kwargs: object) -> sr.SessionRecord:
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError('disk on fire')
+        return real_read_record(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(sr, 'read_record', _boom_once)
 
     assert sh.run_stop(hook_input, env, root=tmp_path).startswith('\033]0;')
+    # The probe was consulted (and degraded) rather than skipped.
+    assert len(calls) >= 1
+    # Degrading to adopt means the env slug still owns the write.
+    assert sr.read_record(slug, root=tmp_path).status == sr.Status.IDLE
 
 
 def test_main_session_start_fail_soft_when_probe_read_raises(
