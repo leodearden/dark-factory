@@ -845,85 +845,50 @@ def test_compute_tasks_landed_int_baseline_still_computes_delta(baseline, expect
 # through `extract_done_count`'s messages), and the baseline guard above
 # promotes `_bounded_repr` from an incidental helper to the mechanism that
 # keeps a malformed hand-seeded baseline -- an arbitrarily large hand-edited
-# value -- to ONE nightly journal line. A helper that is load-bearing for log
-# hygiene on the failure path deserves its own pins, since a regression there
-# only ever manifests while something else is already going wrong.
+# value -- to ONE nightly journal line.
+#
+# Scope, per the amendment pass (review finding #3): these pin the PROPERTY
+# each helper exists for -- output stays bounded, the elision is marked, and
+# the true size is still reported -- not the exact wording of a private
+# format string, and not the `<=`/`>` boundary arithmetic, which would only
+# re-derive the implementation. The end-to-end guarantee that a malformed
+# baseline cannot dump itself into a journal line is pinned separately and
+# behaviourally by
+# `test_compute_tasks_landed_bad_baseline_warning_is_bounded` above; these
+# three are the unit-level backstop for the helpers it leans on.
 #
 # The two constants are read from the module rather than hard-coded, so
 # retuning 200/20 does not produce a false failure here.
 # ---------------------------------------------------------------------------
 
-def test_bounded_repr_short_value_is_plain_repr():
-    assert ct._bounded_repr(500) == "500"
-    assert ct._bounded_repr("2872") == "'2872'"
+def test_bounded_repr_bounds_an_arbitrarily_large_value():
+    """The point of the helper: census-state.json and a get_statuses payload
+    are both arbitrarily large, and neither may dump itself into a journal
+    line. A value small enough to print in full is left alone."""
     assert "repr truncated" not in ct._bounded_repr({"n": 1})
 
-
-def test_bounded_repr_at_the_limit_is_not_truncated():
-    """`<=` is the documented boundary: a repr of exactly _MAX_REPR_CHARS is
-    short enough. Two quote characters make the repr of an (N-2)-char string
-    exactly N."""
-    value = "x" * (ct._MAX_REPR_CHARS - 2)
-    assert len(repr(value)) == ct._MAX_REPR_CHARS
-
+    value = "x" * 100_000
     result = ct._bounded_repr(value)
 
-    assert result == repr(value)
-    assert "repr truncated" not in result
-
-
-def test_bounded_repr_one_char_over_the_limit_is_truncated_and_states_the_true_length():
-    value = "x" * (ct._MAX_REPR_CHARS - 1)
-    true_length = len(repr(value))
-    assert true_length == ct._MAX_REPR_CHARS + 1
-
-    result = ct._bounded_repr(value)
-
-    assert result.startswith(repr(value)[: ct._MAX_REPR_CHARS])
-    # The stated length is the TRUE repr length, not the truncated one -- that
-    # number is how an operator tells "slightly over" from "a whole payload".
-    assert result.endswith(f"... (repr truncated, {true_length} chars total)")
-
-
-def test_bounded_repr_honours_an_explicit_limit_override():
-    value = "abcdefghij"
-
-    assert ct._bounded_repr(value, limit=100) == repr(value)
-
-    result = ct._bounded_repr(value, limit=4)
-    assert result.startswith(repr(value)[:4])
-    assert result.endswith(f"... (repr truncated, {len(repr(value))} chars total)")
-
-
-def test_bounded_repr_bounds_an_enormous_value():
-    """The point of the helper: census-state.json and a get_statuses payload are
-    both arbitrarily large, and neither may dump itself into a journal line."""
-    result = ct._bounded_repr("x" * 100_000)
-
+    # Bounded, marked as elided, and the TRUE size still stated -- that number
+    # is how an operator tells "slightly over" from "a whole payload".
     assert len(result) < ct._MAX_REPR_CHARS + 100
-    assert "repr truncated, 100002 chars total" in result
+    assert "repr truncated" in result
+    assert str(len(repr(value))) in result
 
 
-def test_bounded_keys_under_the_cap_lists_every_key_with_no_total_suffix():
-    result = ct._bounded_keys({"statuses": {}, "error": "x", "another": 1})
-
-    assert result == "['another', 'error', 'statuses']"
-    assert "total" not in result
-
-
-def test_bounded_keys_over_the_cap_shows_the_cap_and_the_true_count():
+def test_bounded_keys_bounds_an_arbitrarily_wide_mapping():
+    """Same property for the key list: a get_statuses payload over a big
+    project has thousands of keys, and the shape is all diagnosis needs."""
     count = ct._MAX_REPORTED_KEYS + 5
     mapping = {f"k{i:02d}": i for i in range(count)}
 
     result = ct._bounded_keys(mapping)
 
-    for i in range(ct._MAX_REPORTED_KEYS):
-        assert f"'k{i:02d}'" in result
-    # ...and nothing past the cap.
-    for i in range(ct._MAX_REPORTED_KEYS, count):
-        assert f"'k{i:02d}'" not in result
+    shown = sum(1 for i in range(count) if f"'k{i:02d}'" in result)
+    assert shown == ct._MAX_REPORTED_KEYS
     # The suffix reports the TRUE key count, not the number shown.
-    assert result.endswith(f", ... ({count} total)")
+    assert str(count) in result
 
 
 def test_bounded_keys_survives_mixed_type_keys():
@@ -937,10 +902,6 @@ def test_bounded_keys_survives_mixed_type_keys():
     assert "1" in result
     assert "'b'" in result
     assert "None" in result
-
-
-def test_bounded_keys_empty_mapping():
-    assert ct._bounded_keys({}) == "[]"
 
 
 def test_default_status_fetcher_raises_status_fetch_unavailable_when_unreachable(
