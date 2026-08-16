@@ -1039,6 +1039,62 @@ class TestMainCLI:
         assert {s["session"] for s in entry["sightings"]} == {"sess-1", "sess-2"}
         assert mod.validate(reloaded) == []
 
+    def test_apply_summary_reports_candidate_disposition_conflicts(self, tmp_path, capsys):
+        """A recurrence sighting appended to an already-adjudicated candidate
+        must be REPORTED, not hidden. Secondary to the nightly fix: _cmd_apply
+        dumps unconditionally after its loop, so the sighting was always
+        persisted here — only the printed summary was blind, leaving the new
+        stat vestigial at this merge site."""
+        codebook_path, records_path = self._write_apply_fixtures(tmp_path)
+
+        cb = mod.load(codebook_path)
+        cb["candidates"] = [
+            {
+                "id": "cand-20260722-28",
+                "title": "recurring rejected cause",
+                "first_seen": "2026-07-22",
+                "disposition": "rejected",
+                "sightings": [
+                    {
+                        "date": "2026-07-22",
+                        "project": "dark_factory",
+                        "session": "sess-old",
+                        "origin_phase": "architect",
+                        "manifested_phase": "verify",
+                    }
+                ],
+            }
+        ]
+        mod.dump(cb, codebook_path)
+
+        # session must be absent from the seeded sightings, or `already_seen`
+        # short-circuits the conflict branch.
+        records_path.write_text(
+            json.dumps(
+                _candidate_record(
+                    title="recurring rejected cause", session="sess-new", date="2026-07-24"
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        ret = mod.main(["apply", str(codebook_path), str(records_path)])
+        captured = capsys.readouterr()
+
+        assert ret == 0
+        assert "candidate_disposition_conflicts=1" in captured.out
+        # Reported SEPARATELY rather than conflated with applied candidates.
+        assert "candidates_applied=0" in captured.out
+
+        reloaded = mod.load(codebook_path)
+        assert len(reloaded["candidates"]) == 1  # no fabricated pending twin
+        candidate = reloaded["candidates"][0]
+        assert candidate["disposition"] == "rejected"
+        assert len(candidate["sightings"]) == 2
+        assert candidate["sightings"][1]["session"] == "sess-new"
+        assert mod.validate(reloaded) == []
+
     def test_migrate_empty_file_fails_loudly_instead_of_crashing(self, tmp_path, capsys):
         """An empty codebook file loads via yaml.safe_load() as None.
         _cmd_migrate must report a clear error and return 1, not raise an
