@@ -1550,6 +1550,33 @@ def _memory_context_block(body='## Project Context\n\n{...}'):
     return '# Context\n\n' + MEMORY_CONTEXT_CAVEAT.format(project_id='dark_factory') + '\n\n' + body
 
 
+_DROP_NOTE_EXAMPLE = (
+    '2 memory result slot(s) across 1 query were tagged to another project '
+    'and filtered out'
+)
+"""Representative drop_note text -- the shape
+``_get_memory_context`` builds it in
+(``f'{foreign_dropped} memory result slot(s) across {queries_fired} '
+f'{query_word} were tagged to another project and filtered out'``)."""
+
+_NO_RECALLED_SECTIONS_VARIANTS = (
+    '# Context\n\n_Memory unavailable — proceed with codebase exploration._',
+    (
+        '# Context\n\n_Memory unavailable — proceed with codebase '
+        f'exploration. Note: {_DROP_NOTE_EXAMPLE} before the failure._'
+    ),
+    '# Context\n\n_No memory context available._',
+    f'# Context\n\n_No memory context available ({_DROP_NOTE_EXAMPLE})._',
+)
+"""The four literal shapes ``_get_memory_context`` returns when
+``recalled_sections`` is empty
+(orchestrator/src/orchestrator/agents/briefing.py:1321-1331) -- two
+literal families (memory-unavailable / no-memory-context available), each
+with a plain and a drop_note-bearing variant. Not lockstep-importable
+like MEMORY_CONTEXT_CAVEAT: these are inlined string literals in
+``_get_memory_context``'s body, not a module-level constant."""
+
+
 class TestHarnessInjectedTurnFilter:
     def test_briefing_shaped_turn_is_excluded_by_content(self):
         records = [_user_text(_briefing_text())]
@@ -1813,6 +1840,22 @@ class TestHarnessInjectedTurnFilter:
         turns = mod.iter_user_turns(records)
 
         assert len(turns) == 1
+
+    @pytest.mark.parametrize(
+        'text', _NO_RECALLED_SECTIONS_VARIANTS,
+        ids=[
+            'memory_unavailable', 'memory_unavailable_with_drop_note',
+            'no_memory_context', 'no_memory_context_with_drop_note',
+        ],
+    )
+    def test_no_recalled_sections_variant_is_excluded(self, text):
+        # Exhaustive over _get_memory_context's four no-recalled-sections
+        # return paths, not just the caveat-bearing happy path covered
+        # above -- the marker set must cover every output of that
+        # function, not merely its most common case.
+        records = [_user_text(text)]
+
+        assert mod.iter_user_turns(records) == []
 
 
 class TestRenderDigest:
