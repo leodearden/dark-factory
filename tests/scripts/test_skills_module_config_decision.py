@@ -174,6 +174,9 @@ SKILLS_CONSUMING_TESTS = (
     SKILLS_PY_RUFF_PROBE,
     # Reads skills/spawn/spawn-claude.sh to cross-check a bash/Python mirror.
     "scripts/tests/test_legibility_inventory.py",
+    # LOADS AND EXECUTES the real skills/factory-init/scripts/find_escalation_port.py
+    # via importlib (task 3705) — a REAL consumer, not a synthetic mention.
+    "tests/scripts/test_find_escalation_port.py",
 )
 
 
