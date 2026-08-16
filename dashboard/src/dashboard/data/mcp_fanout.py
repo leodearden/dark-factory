@@ -37,8 +37,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections.abc import Awaitable, Callable, Sequence
+from pathlib import Path
 from typing import Generic, TypeVar
 
 import httpx
@@ -79,6 +81,41 @@ def describe_exc(exc: BaseException) -> str:
     """
     text = str(exc)
     return f'{type(exc).__name__}: {text}' if text else type(exc).__name__
+
+
+def fanout_label(base: str, project_root: str | os.PathLike[str]) -> str:
+    """Compose a per-project-root fan-out log label, ``'base[project-name]'``.
+
+    **Every fan-out caller parameterized by project_root MUST compose its
+    ``log_label`` through this helper.** The contract is not cosmetic — it is
+    what makes the transition-only policy above hold at all:
+
+    - the throttle key is ``(log_label, url)``;
+    - ONE fused-memory URL serves *every* project_root, so a fixed literal
+      label collapses all roots onto a single key;
+    - :func:`note_fanout_success` **pops** that key, so a healthy root's
+      success in the same UI poll cycle clears a broken root's open streak.
+      The broken root's next failure is therefore ``streak == 1`` again,
+      re-arming the opening WARNING *and* adding a 'recovered' WARNING —
+      every cycle, indefinitely. That is precisely the sustained flood the
+      transition-only policy exists to prevent (task 3871), reintroduced
+      through the key rather than the level.
+
+    A collapsed key also erases the diagnosis: the message names only the
+    shared URL, so the operator cannot tell *which* project_root is down.
+
+    The basename form is deliberately string-identical to
+    ``active_tasks._project_label`` / ``redux_api._project_label`` so operator
+    log labels match the project chips the UI already renders. Those cannot be
+    imported here — ``active_tasks`` imports from ``tasks``, which imports this
+    module — so ``mcp_fanout``, the leaf of this cluster, is the helper's home
+    and its docstring is the single place the convention is written down.
+
+    Falls back to the full string for a root with no basename (``'/'``), so the
+    label can never degrade to a content-free ``'base[]'``.
+    """
+    root_str = str(project_root)
+    return f'{base}[{Path(root_str).name or root_str}]'
 
 
 def log_fanout_failure(log_label: str, url: str, exc: BaseException) -> None:
