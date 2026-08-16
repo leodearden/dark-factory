@@ -2628,6 +2628,25 @@ class TestRegenCommand:
         assert _mod.render_markdown(report) == _mod.render_markdown(report)
 
 
+def _md_section(md: str, heading: str, stop: str = '#') -> str:
+    """The body of *heading*, up to the next line starting with *stop*.
+
+    Section-scoped assertions cannot be satisfied by a match somewhere else
+    in a ~200KB document -- which is how three trend assertions came to pass
+    against lists that were empty ('lost' matched its own heading;
+    '`alpha`' and 'registry' matched unrelated sections). Asserts the
+    heading is unique, so a slice can never silently address the wrong one.
+    """
+    assert md.count(heading) == 1, f'{heading!r} occurs {md.count(heading)} times'
+    start = md.index(heading) + len(heading)
+    body: list[str] = []
+    for line in md[start:].split('\n'):
+        if line.startswith(stop):
+            break
+        body.append(line)
+    return '\n'.join(body)
+
+
 def _coverage_md_report(top_n: int = 50, *, history=..., registry=True, **kwargs) -> dict:
     """A report exercising every new coverage/trend section of the markdown.
 
@@ -2808,16 +2827,65 @@ class TestRenderMarkdownCoverageTrend:
         assert '`reify`' in md
         assert 'new_project' in md
 
+    @staticmethod
+    def _history_with_movement():
+        """A prior run the current fixture actually MOVES against.
+
+        ``_history()`` above happens to be static in every regrowth class --
+        alpha sits at 2 records / 1 canonical on both sides -- so a test
+        driven off it renders `_(none)_` under every heading and can only be
+        satisfied by matching the headings themselves. Here alpha GREW
+        (1 -> 2 records) and gamma LOST its canonical (1 -> 0), so both
+        actionable classes produce a real row to pin.
+        """
+        prior = _topic_report(
+            {'dark_factory': [
+                {'topic': 'alpha', 'canonical': True},
+                {'topic': 'gamma', 'canonical': True},
+            ]},
+            registry=_FakeRegistry([
+                _FakeEntry('alpha', 'dark_factory'),
+                _FakeEntry('gamma', 'dark_factory'),
+            ]),
+        )
+        return _mod.append_coverage_run(
+            _mod.empty_coverage_history(), prior, stamp='2026-08-15T05:00:00Z',
+        )
+
     def test_regrowth_classes_render_named(self):
+        # Pinned as whole ROWS under their own headings. `'lost' in
+        # md.lower()` matched the heading itself and `'`alpha`' in md`
+        # matched any of ~200KB of unrelated document, so both passed
+        # against a fixture in which every regrowth list was empty -- the
+        # green-by-construction class this suite's own
+        # test_the_forbidden_git_patterns_can_actually_fire exists to catch.
+        md = _mod.render_markdown(
+            _coverage_md_report(history=self._history_with_movement()),
+        )
+        lost = _md_section(md, '#### Lost their `canonical: true`')
+        assert '| `dark_factory` | `gamma` | 1 | 0 |' in lost
+        grew = _md_section(md, '#### Grew in member records')
+        assert '| `dark_factory` | `alpha` | 1 | 2 |' in grew
+
+    def test_a_class_with_nothing_to_report_says_so_rather_than_vanishing(self):
+        # The mirror image, and why the row assertions above are keyed to
+        # their own section: an empty class must render an explicit "(none)"
+        # under its heading, not disappear and leave the heading to carry a
+        # substring match for a class that was never measured.
         md = _mod.render_markdown(_coverage_md_report(history=self._history()))
-        assert 'lost' in md.lower()
-        # alpha kept its canonical but grew 2 -> 7 records... the digest
-        # tracks records per registry topic, so the growth is named.
-        assert '`alpha`' in md
+        assert _md_section(md, '#### Lost their `canonical: true`').strip() == '_(none)_'
+        assert _md_section(md, '#### Grew in member records').strip() == '_(none)_'
 
     def test_regrowth_scope_is_disclosed_in_the_markdown_too(self):
+        # `'registry' in md.lower()` could not fail: the document always
+        # carries a '### Registry coverage' section. The claim is that the
+        # NARROWING is disclosed where the signal is rendered, so assert the
+        # scope note itself, inside the regrowth section, verbatim from the
+        # single-homed constant.
         md = _mod.render_markdown(_coverage_md_report(history=self._history()))
-        assert 'registry' in md.lower()
+        regrowth = _md_section(md, '### Registry topic regrowth', stop='#### ')
+        assert _mod._REGROWTH_SCOPE_NOTE in regrowth
+        assert 'Scoped to the committed topic registry' in regrowth
 
 
 class TestRenderMarkdownCoverageCutsDiscloseThemselves:

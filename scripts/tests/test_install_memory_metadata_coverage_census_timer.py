@@ -671,12 +671,16 @@ def _git(repo, *args):
     )
 
 
-def _git_repo_harness(tmp_path, *, dirty=True):
-    """Make $REPO a REAL git repo carrying the three tracked artifacts.
+def _git_repo_harness(tmp_path, *, dirty=True, tracked=True):
+    """Make $REPO a REAL git repo carrying the three artifacts.
 
     The fake census recorder does not write artifacts, so the drift a live run
     would produce is staged here directly -- what is under test is the
     wrapper's commit step, not the census's rendering.
+
+    ``tracked=False`` models the FIRST-EVER run: the artifacts exist on disk
+    but git has never seen them, which is the only state that reaches the
+    wrapper's `did not match any file` retry branch.
     """
     repo = tmp_path / 'fake-repo'
     (repo / 'plans').mkdir(parents=True, exist_ok=True)
@@ -688,14 +692,24 @@ def _git_repo_harness(tmp_path, *, dirty=True):
     # No hooks, no signing -- this exercises the wrapper, not the repo's gates.
     _git(repo, 'config', 'commit.gpgsign', 'false')
 
-    for rel in _ARTIFACTS:
-        (repo / rel).write_text('{"baseline": true}\n')
-    _git(repo, 'add', '--', *_ARTIFACTS)
-    _git(repo, 'commit', '-q', '--no-verify', '-m', 'baseline')
-
-    if dirty:
+    if tracked:
         for rel in _ARTIFACTS:
-            (repo / rel).write_text('{"regenerated": true}\n')
+            (repo / rel).write_text('{"baseline": true}\n')
+        _git(repo, 'add', '--', *_ARTIFACTS)
+        _git(repo, 'commit', '-q', '--no-verify', '-m', 'baseline')
+        if dirty:
+            for rel in _ARTIFACTS:
+                (repo / rel).write_text('{"regenerated": true}\n')
+        return repo
+
+    # An untracked-artifacts repo still needs a root commit, so that `git
+    # commit --only <untracked path>` fails the way a real first run fails
+    # rather than the way an empty repo does.
+    (repo / 'README.md').write_text('unrelated\n')
+    _git(repo, 'add', '--', 'README.md')
+    _git(repo, 'commit', '-q', '--no-verify', '-m', 'baseline')
+    for rel in _ARTIFACTS:
+        (repo / rel).write_text('{"regenerated": true}\n')
     return repo
 
 
@@ -723,6 +737,52 @@ def test_wrapper_commits_the_artifacts_it_regenerated(tmp_path):
         f'artifacts left dirty after the run: {status!r}')
     subject = _git(repo, 'log', '-1', '--pretty=%s').stdout.strip()
     assert subject != 'baseline', 'no commit was made'
+
+
+def test_wrapper_commits_artifacts_git_has_never_tracked(tmp_path):
+    """The FIRST-EVER run, and the one path no other test reaches.
+
+    `git commit --only <path>` fails outright for a path git has never seen
+    ("did not match any file(s) known to git"), so the wrapper stages those
+    paths scoped and retries once. Every other git test here seeds the
+    artifacts as already-tracked, so the retry branch never executed and a
+    typo in it -- or a future change to git's message -- would silently turn
+    the very first night into a narrated non-commit, losing the baseline row
+    the whole commit step exists to protect.
+    """
+    repo = _git_repo_harness(tmp_path, tracked=False)
+    result, _ = _run_wrapper_in_git_repo(tmp_path, repo)
+
+    assert result.returncode == 0, (
+        f'stdout={result.stdout!r} stderr={result.stderr!r}')
+    # commit=0 in the narration, not merely "the script survived".
+    assert 'commit=0' in result.stdout, result.stdout
+    assert 'committed the regenerated artifacts' in result.stdout
+    status = _git(repo, 'status', '--porcelain', '--', *_ARTIFACTS).stdout
+    assert status.strip() == '', f'artifacts left untracked/dirty: {status!r}'
+    # All three landed in ONE commit, and the scope held: README.md was
+    # already committed, so the retry's `git add --` must not have swept
+    # anything else in.
+    files = _git(repo, 'show', '--name-only', '--pretty=', 'HEAD').stdout.split()
+    assert sorted(files) == sorted(_ARTIFACTS), files
+
+
+def test_the_untracked_retry_is_reached_only_because_the_plain_commit_fails(
+        tmp_path):
+    """Reachability, in the shape step-25 established for the git guard.
+
+    Asserts the PRECONDITION the retry branch keys on actually holds for
+    real git here: a scoped commit of a never-tracked path fails, and fails
+    with the message the wrapper greps for. If git ever reworded it, this
+    fails loudly instead of the wrapper silently not committing.
+    """
+    repo = _git_repo_harness(tmp_path, tracked=False)
+    proc = subprocess.run(
+        ['git', '-C', str(repo), 'commit', '--only', *_ARTIFACTS, '-m', 'probe'],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode != 0
+    assert 'did not match any file' in (proc.stdout + proc.stderr).lower()
 
 
 def test_wrapper_commit_is_scoped_and_never_sweeps_unrelated_dirty_state(
