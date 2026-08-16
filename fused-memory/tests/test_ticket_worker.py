@@ -1248,7 +1248,7 @@ async def test_per_project_ticket_queues_do_not_serialise(
             ticket_a = submit_a['ticket']
 
             # Let the event loop run so the worker starts and picks up the ticket
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.05)  # Intentional (task 3901 sweep): a scheduling yield so worker-a is inside the blocking curate() before project-b is submitted — not a wait-for-completion. The test's own asyncio.wait_for bounds still apply.
 
             # (2) Submit project-b — must get an independent worker
             submit_b = await ti.submit_task(project_root=project_root_b, title='Task B')
@@ -1360,7 +1360,7 @@ async def test_resolve_ticket_returns_server_closed_when_store_closes_post_wake(
 
     # Schedule the wakeup signal to fire after resolve_ticket has entered event.wait()
     async def signal_after_delay() -> None:
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.05)  # Intentional (task 3901 sweep): a deliberate delay before firing the signal, i.e. the test's stimulus, not a drain barrier.
         ti._signal_ticket_event(ticket_id)
 
     asyncio.create_task(signal_after_delay(), name='test-signal-shutdown-race')
