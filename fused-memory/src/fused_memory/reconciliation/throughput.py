@@ -39,7 +39,10 @@ in ``event_buffer.cleanup_drained`` route through it.
 
 from __future__ import annotations
 
+import argparse
+import json
 import sqlite3
+import sys
 from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
@@ -50,8 +53,10 @@ __all__ = [
     'FITTED_CYCLE_MARGINAL_SECONDS',
     'OBSERVED_BURST_EVENTS_PER_DAY',
     'STEADY_STATE_AMORTISATION_MIN_BATCH',
+    'build_report',
     'capacity_verdict',
     'cycle_seconds',
+    'main',
     'seconds_per_event',
     'sustainable_events_per_day',
     'DRAIN_MODES',
@@ -606,3 +611,208 @@ def capacity_verdict(
         'sustainable_per_day': sustainable_per_day,
         'observed_burst_per_day': observed_burst_per_day,
     }
+
+
+# ── report ─────────────────────────────────────────────────────────────
+
+
+def _retention_note() -> str:
+    """The report's own measurement caveat, derived from the live cleanup window.
+
+    ``cleanup_drained`` is the only ``DELETE FROM event_buffer`` in the
+    codebase, so before task 3049 added the ``event_arrival_hourly`` rollup a
+    project's arrival history survived only as long as that window — NOT the
+    week the task's ask (a) assumed.  (``event_journal`` is no help either: it
+    is a write-ahead log whose ``mark_processed`` deletes the row.)  Inflow
+    from before the rollup landed is therefore gone for good, and a reader of
+    this report has to know that before drawing a trend from it.
+
+    The window is read off ``EventBuffer.cleanup_drained``'s own signature
+    rather than restated here, so retuning the cleanup cannot turn this note
+    into a confident lie.  The import is deliberately LAZY: ``event_buffer``
+    imports ``utc_hour_bucket`` from this module at module scope, so a
+    top-level import back would be circular.
+    """
+    import inspect
+
+    from fused_memory.reconciliation.event_buffer import EventBuffer
+
+    window = inspect.signature(
+        EventBuffer.cleanup_drained).parameters['max_age_seconds'].default
+    return (
+        f'Inflow retention: EventBuffer.cleanup_drained deletes drained rows '
+        f'older than {int(window)}s ({int(window) / 3600:.1f}h), which is the '
+        f'only DELETE FROM event_buffer in the codebase. Task 3049 added the '
+        f'event_arrival_hourly rollup INSIDE that delete transaction, so from '
+        f'then on arrival history is durable and exact. Inflow from before the '
+        f'rollup landed was destroyed by that delete and is unrecoverable — '
+        f'treat any window extending back past the rollup as truncated, not as '
+        f'a period of low inflow.'
+    )
+
+
+def build_report(
+    db_path: str | Path,
+    project_id: str,
+    since: str | None = None,
+) -> dict[str, Any]:
+    """Full inflow + drain + capacity report for one project.
+
+    Args:
+        db_path: Path to reconciliation.db (opened read-only).
+        project_id: Project to report on.
+        since: Optional inclusive floor — an ISO8601 timestamp or hour bucket.
+            Threaded into BOTH halves so inflow and drain cover the same
+            window and can be compared directly.
+
+    Returns:
+        A JSON-serialisable dict with ``project_id``, ``db_path``, ``since``,
+        ``inflow`` (hourly / daily / composition / total_events), ``drain``
+        (the :func:`drain_stats` payload), ``remediation_duty_cycle``,
+        ``sustainable_events_per_day``, ``capacity_verdict`` and
+        ``retention_note``.
+
+        ``sustainable_events_per_day`` and ``capacity_verdict`` are ``None``
+        when the observed data cannot support a claim — no drained events (so
+        no measured per-event rate), or a duty cycle of exactly 1.0 (only
+        remediation runs in the window).  The arithmetic deliberately raises on
+        those inputs rather than inventing a number; the REPORT's job is to say
+        'unknown' instead of propagating that to an operator who merely pointed
+        the tool at a fresh database.
+    """
+    drain = drain_stats(db_path, project_id, since)
+    duty = remediation_duty_cycle(drain)
+    daily = inflow_daily(db_path, project_id, since)
+
+    rate = drain['drain_seconds_per_event']
+    sustainable: float | None = None
+    verdict: dict[str, Any] | None = None
+    if rate is not None and rate > 0 and duty < 1.0:
+        sustainable = sustainable_events_per_day(rate, duty)
+        verdict = capacity_verdict(sustainable, OBSERVED_BURST_EVENTS_PER_DAY)
+
+    return {
+        'project_id': project_id,
+        'db_path': str(db_path),
+        'since': since,
+        'inflow': {
+            'hourly': inflow_hourly(db_path, project_id, since),
+            'daily': daily['daily'],
+            'composition': daily['composition'],
+            'total_events': daily['total_events'],
+        },
+        'drain': drain,
+        'remediation_duty_cycle': duty,
+        'sustainable_events_per_day': sustainable,
+        'capacity_verdict': verdict,
+        'retention_note': _retention_note(),
+    }
+
+
+def _format_report(report: dict[str, Any]) -> str:
+    """Render a report as a short operator-readable summary.
+
+    Deliberately terse: the per-mode drain breakdown is the line an operator
+    reads to tell a THROUGHPUT overrun (healthy pipeline, drain simply slower
+    than inflow) apart from a judge halt (task 2920), which is a different
+    failure with a different fix.
+    """
+    lines = [f'project: {report["project_id"]}  db: {report["db_path"]}']
+    if report['since']:
+        lines.append(f'since:   {report["since"]}')
+
+    inflow = report['inflow']
+    lines.append(f'inflow:  {inflow["total_events"]} events over '
+                 f'{len(inflow["hourly"])} hour(s)')
+    for etype, n in inflow['composition'].items():
+        lines.append(f'           {etype}: {n}')
+
+    lines.append('drain:')
+    for mode in DRAIN_MODES:
+        stats = report['drain']['modes'][mode]
+        per_event = stats['seconds_per_event']
+        rate = 'n/a' if per_event is None else f'{per_event:.2f}s/event'
+        lines.append(
+            f'           {mode:<15} runs={stats["run_count"]:<4} '
+            f'events={stats["events"]:<6} '
+            f'wall={stats["wall_clock_seconds"]:.0f}s  {rate}'
+        )
+    if report['drain']['runs_in_flight']:
+        lines.append(f'           (in flight, excluded: '
+                     f'{report["drain"]["runs_in_flight"]})')
+
+    lines.append(f'remediation duty cycle: {report["remediation_duty_cycle"]:.3f} '
+                 f'of lock-held drain wall-clock')
+
+    if report['sustainable_events_per_day'] is None:
+        lines.append('capacity: unknown (no drained events in this window)')
+    else:
+        verdict = report['capacity_verdict']
+        lines.append(
+            f'capacity: {report["sustainable_events_per_day"]:.0f} events/day '
+            f'sustainable vs {verdict["observed_burst_per_day"]:.0f}/day burst '
+            f'=> {verdict["verdict"]} '
+            f'(headroom {verdict["headroom_ratio"]:.2f}x)'
+        )
+
+    lines.append('')
+    lines.append(report['retention_note'])
+    return '\n'.join(lines)
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            'Report reconciliation inflow, per-mode drain throughput and the '
+            'resulting sustainable events/day for one project (task 3049).'
+        ),
+    )
+    parser.add_argument(
+        '--db', required=True,
+        help='Path to reconciliation.db, e.g. data/reconciliation/reconciliation.db',
+    )
+    parser.add_argument(
+        '--project', required=True,
+        help='Project id to report on, e.g. reify',
+    )
+    parser.add_argument(
+        '--since', default=None,
+        help='Inclusive floor: an ISO8601 timestamp or an hour bucket '
+             "('2026-07-25T14'). Applies to inflow and drain alike.",
+    )
+    parser.add_argument(
+        '--json', action='store_true',
+        help='Emit the raw JSON report instead of the readable summary.',
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point.
+
+    Run as::
+
+        python -m fused_memory.reconciliation.throughput \\
+            --db data/reconciliation/reconciliation.db --project reify --json
+
+    Returns:
+        0 on success; 1 when the database is missing or a ``since`` value
+        cannot be parsed.  Both are operator input errors, so they surface as a
+        one-line stderr message and a non-zero exit rather than a traceback.
+    """
+    args = _build_parser().parse_args(argv)
+    try:
+        report = build_report(args.db, args.project, args.since)
+    except FileNotFoundError as e:
+        print(f'error: {e}', file=sys.stderr)
+        return 1
+    except ValueError as e:
+        print(f'error: could not parse --since {args.since!r}: {e}', file=sys.stderr)
+        return 1
+
+    print(json.dumps(report, indent=2) if args.json else _format_report(report))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
