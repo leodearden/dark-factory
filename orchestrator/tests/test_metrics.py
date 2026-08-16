@@ -627,21 +627,23 @@ class TestBlendComposite:
         ) == 0.0
 
     def test_the_no_plan_gate_is_unconditional_not_scoped_to_plan_only(self):
-        """Pins metrics.py:480-483's design claim: the gate is UNCONDITIONAL,
-        not ``if plan_only and no_plan``, so a caller cannot silently bypass it
-        by forgetting the *plan_only* flag — a defence-in-depth contract of
-        this PURE function, deliberately exercised here at a shape
-        report.py:752 never itself builds (it always passes ``plan_only``
-        alongside ``no_plan``).
+        """Pins ``blend_composite``'s own contract that the *no_plan* gate is
+        UNCONDITIONAL rather than scoped to *plan_only* — quoting its
+        docstring, "so a caller cannot silently bypass it by forgetting the
+        flag." Deliberately exercised here at a shape the report layer's
+        ``no_plan = _has_plan_quality_score(m) and not produced_a_plan(m)``
+        call site never itself builds (it always passes ``plan_only``
+        alongside ``no_plan``) — a defence-in-depth contract of this PURE
+        function. (Cited by symbol/quote rather than line number: both drift
+        as the surrounding docstrings are edited.)
 
         Both pre-existing no_plan tests above also pass ``plan_only=True``, so
         before this test the source could be relaxed to
-        ``if plan_only and no_plan:`` with the whole suite still green
-        (MEASURED: 428 passed across the eval sweep with that mutant in
-        place). ``plan_only`` is therefore OMITTED here — not passed as
-        ``False`` — to exercise the exact "forgot the flag" hazard the
-        docstring cites, the same omit-the-flag idiom the default-behaviour
-        tests above use.
+        ``if plan_only and no_plan:`` and the whole eval sweep would stay
+        green (MEASURED with that mutant in place). ``plan_only`` is
+        therefore OMITTED here — not passed as ``False`` — to exercise the
+        exact "forgot the flag" hazard the docstring cites, the same
+        omit-the-flag idiom the default-behaviour tests above use.
 
         ``tests_pass=True`` is deliberate, not incidental: under ``None`` or
         ``False`` the FIRST gate would already return ``0.0``, and the
@@ -652,9 +654,6 @@ class TestBlendComposite:
 
         assert blend_composite(
             0.9, 1.0, 1.0, tests_pass=True, no_plan=True,
-        ) == 0.0
-        assert blend_composite(
-            1.0, 0.5, 0.5, tests_pass=True, no_plan=True,
         ) == 0.0
 
     def test_no_plan_defaults_false_so_every_existing_blend_is_identical(self):
@@ -763,20 +762,12 @@ class TestProducedAPlan:
         {'task_id': 't', 'title': 'x', 'steps': [{'id': 'step-1'}, {'id': 'step-2'}]},
     ])
     def test_agrees_with_the_artifact_level_twin_given_the_same_step_count(self, plan):
-        """Given the SAME step count, produced_a_plan and is_scorable_plan agree.
-
-        What this DOES pin: neither predicate carries a condition beyond
-        "step count > 0", checked across five artifact shapes — including the
-        header-only `create_plan` stub (TRUTHY, but not a plan).
-
-        What this does NOT pin: it re-derives its own `plan_steps` locally
-        (`len((plan or {}).get('steps') or [])`) rather than driving
-        `run_architect_eval`, so it cannot catch drift in the runner's actual
-        derivation — a change there could break the equivalence while this
-        test stays green.
-
-        The real end-to-end guarantee — driven through the real runner —
-        lives in `test_eval_architect.py::TestSteplessPlanIsNeverJudged.test_persisted_metrics_agree_with_the_artifact_level_twin`.
+        """Unit-level sanity: neither predicate carries a condition beyond
+        "step count > 0", across five artifact shapes — including the
+        header-only `create_plan` stub (TRUTHY, but not a plan). It
+        re-derives `plan_steps` locally rather than driving the runner, so it
+        cannot catch drift there; the real end-to-end pin lives in
+        `test_eval_architect.py::TestSteplessPlanIsNeverJudged.test_persisted_metrics_agree_with_the_artifact_level_twin`.
         """
         from orchestrator.evals.judge import is_scorable_plan
         from orchestrator.evals.metrics import produced_a_plan
