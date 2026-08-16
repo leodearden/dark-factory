@@ -36,6 +36,7 @@ import ast
 import pathlib
 
 import pytest
+from _fm_helpers import calls_named, imported_names_from, parse_python_module
 
 SRC_ROOT = pathlib.Path(__file__).parents[1] / 'src' / 'fused_memory'
 
@@ -49,42 +50,14 @@ TOUCHED_FILES = [
 ]
 
 
-def _parse(path: pathlib.Path) -> ast.Module:
-    assert path.exists(), f'{path} not found'
-    return ast.parse(path.read_text(), filename=str(path))
-
-
-def _calls_named(tree: ast.Module, name: str) -> list[ast.Call]:
-    """Every ast.Call node whose callee is a bare `name(...)` or an attribute
-    access ending in `.name(...)` (e.g. `asyncio.gather(...)`)."""
-    found = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        if (isinstance(func, ast.Name) and func.id == name) or (
-            isinstance(func, ast.Attribute) and func.attr == name
-        ):
-            found.append(node)
-    return found
-
-
 def _gather_calls_with_return_exceptions(tree: ast.Module) -> list[ast.Call]:
     """Every gather(...) call (bare or asyncio.gather) carrying a
     `return_exceptions` keyword — the hand-rolled two-tier idiom's preamble."""
     return [
         node
-        for node in _calls_named(tree, 'gather')
+        for node in calls_named(tree, 'gather')
         if any(kw.arg == 'return_exceptions' for kw in node.keywords)
     ]
-
-
-def _names_imported_from(tree: ast.Module, module: str) -> set[str]:
-    names: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.module == module:
-            names.update(alias.name for alias in node.names)
-    return names
 
 
 @pytest.mark.parametrize('path', TOUCHED_FILES, ids=lambda p: p.name)
@@ -93,8 +66,7 @@ class TestGatherIdiomMigratedToNamedHelpers:
     propagate_cancellations calls remain only inside async_utils itself."""
 
     def test_no_direct_propagate_cancellations_calls(self, path):
-        tree = _parse(path)
-        calls = _calls_named(tree, 'propagate_cancellations')
+        calls = calls_named(parse_python_module(path), 'propagate_cancellations')
         assert not calls, (
             f'{path}: found {len(calls)} direct propagate_cancellations() call(s) '
             f'at line(s) {[c.lineno for c in calls]}. propagate_cancellations is Pass 1 '
@@ -105,8 +77,7 @@ class TestGatherIdiomMigratedToNamedHelpers:
         )
 
     def test_no_raw_gather_return_exceptions_calls(self, path):
-        tree = _parse(path)
-        calls = _gather_calls_with_return_exceptions(tree)
+        calls = _gather_calls_with_return_exceptions(parse_python_module(path))
         assert not calls, (
             f'{path}: found {len(calls)} raw gather(..., return_exceptions=...) call(s) '
             f'at line(s) {[c.lineno for c in calls]}. This is the preamble of the '
@@ -115,8 +86,7 @@ class TestGatherIdiomMigratedToNamedHelpers:
         )
 
     def test_imports_a_named_helper(self, path):
-        tree = _parse(path)
-        imported = _names_imported_from(tree, ASYNC_UTILS_MODULE)
+        imported = imported_names_from(parse_python_module(path), ASYNC_UTILS_MODULE)
         assert imported & NAMED_HELPERS, (
             f'{path}: imports {imported or "nothing"} from {ASYNC_UTILS_MODULE}, but '
             f'expected at least one of {sorted(NAMED_HELPERS)} to be in use after '

@@ -188,8 +188,17 @@ class _PlanField(NamedTuple):
     parameter vocabulary ``repair()`` validates against — which is not always
     the call that produced the corruption: ``replace_plan_step`` also writes
     ``steps[].description`` AND ``prerequisites[].description`` (its lookup loop
-    spans both collections), and ``update_plan_metadata`` also writes
-    ``analysis``. Naming only the owner would send whoever triages a fact to the
+    spans both collections), ``update_plan_metadata`` also writes ``analysis``,
+    and ``mark_step_committed`` ALSO writes ``steps[].description`` AND
+    ``prerequisites[].description`` — but differently from the other two: it
+    takes no ``description`` parameter at all. It re-reads the plan and
+    prepends ``TaskArtifacts.mark_step_committed``'s ``[COMMITTED <sha12>]``
+    provenance tag to whatever the field already held. It can therefore never
+    be the tail that INTRODUCES envelope markup into the field — it has no
+    prose argument to leak one from — but it IS a call site a triager may need
+    to account for when a ``[COMMITTED ...]``-prefixed description turns out
+    corrupt, which is why it is listed here despite writing no prose of its
+    own. Naming only the schema owner would send whoever triages a fact to the
     wrong call site; naming the alternates alongside it keeps the diagnosis
     honest without pretending the fact can identify the writer it cannot see.
     """
@@ -247,11 +256,16 @@ _ADD_REUSE_ITEM_TARGETS: Mapping[str, str] = MappingProxyType(
 )
 
 #: The OTHER tools that write a given field, per row of the table below. Each
-#: entry is machine-checked to name a real plan-tools entry point that actually
-#: takes that parameter
-#: (``TestRepairableFieldTable::test_every_alternate_writer_is_a_real_tool_taking_that_field``),
-#: so an alternate cannot drift into a prose label.
-_REPLACE_STEP_ALSO: tuple[str, ...] = ('replace_plan_step',)
+#: entry is machine-checked to name a real plan-tools entry point that is
+#: OBSERVED TO ACTUALLY WRITE the field
+#: (``TestRepairableFieldTable::test_every_alternate_writer_really_writes_that_field``),
+#: so an alternate cannot drift into a prose label. Checked BEHAVIOURALLY, not
+#: by signature: a writer need not take the field as a parameter to write it —
+#: ``mark_step_committed`` rewrites ``description`` by re-reading and
+#: rewriting the plan, never taking a ``description`` argument at all, so a
+#: signature-based check would have rejected it as an alternate despite it
+#: being a real one.
+_DESCRIPTION_ALSO: tuple[str, ...] = ('replace_plan_step', 'mark_step_committed')
 _UPDATE_METADATA_ALSO: tuple[str, ...] = ('update_plan_metadata',)
 
 #: THE declared enumeration of the repairable surface. Adding a prose field to
@@ -288,14 +302,14 @@ def _build_repairable_plan_fields() -> tuple[_PlanField, ...]:
             'description',
             _params_of(_add_prerequisite),
             _ADD_PREREQUISITE_TARGETS,
-            _REPLACE_STEP_ALSO,
+            _DESCRIPTION_ALSO,
         ),
         _PlanField(
             'steps',
             'description',
             _params_of(_add_plan_step),
             _ADD_PLAN_STEP_TARGETS,
-            _REPLACE_STEP_ALSO,
+            _DESCRIPTION_ALSO,
         ),
         _PlanField(
             'design_decisions',
@@ -328,12 +342,13 @@ def _build_repairable_plan_fields() -> tuple[_PlanField, ...]:
 #:
 #: NOT "the only tool that writes this collection", which would be false of this
 #: module: ``replace_plan_step`` also writes ``description`` on both ``steps``
-#: and ``prerequisites`` items, and ``update_plan_metadata`` also writes
-#: ``analysis``. A fact therefore carries ``also_written_by`` beside ``tool``
-#: (see :class:`_PlanField`) so a triager is not sent to a call site the
-#: corruption may never have passed through. Asserted callable via
-#: ``getattr(plan_tools, '_' + tool)`` by the repair tests, so the label cannot
-#: drift into prose.
+#: and ``prerequisites`` items, ``update_plan_metadata`` also writes
+#: ``analysis``, and ``mark_step_committed`` also writes ``description`` on
+#: both — without taking a ``description`` parameter at all. A fact therefore
+#: carries ``also_written_by`` beside ``tool`` (see :class:`_PlanField`) so a
+#: triager is not sent to a call site the corruption may never have passed
+#: through. Asserted callable via ``getattr(plan_tools, '_' + tool)`` by the
+#: repair tests, so the label cannot drift into prose.
 _COLLECTION_SCHEMA_TOOL: dict[str | None, str] = {
     None: 'create_plan',
     'prerequisites': 'add_prerequisite',
@@ -744,7 +759,6 @@ def _atomic_write_plan(path: Path, plan: dict) -> None:
 
     plan['_schema_version'] = PLAN_SCHEMA_VERSION
     payload = json.dumps(plan, indent=2) + '\n'
-    mode = _target_file_mode(target)
 
     fd, tmp_name = tempfile.mkstemp(
         dir=target.parent, prefix='.plan.json.', suffix='.tmp'
@@ -758,7 +772,12 @@ def _atomic_write_plan(path: Path, plan: dict) -> None:
         # Before the swap, never after: the replaced file must already carry the
         # right bits, or a reader between the two calls sees the 0600 mkstemp
         # forced — a window with the same shape as the torn read B12 forbids.
-        os.chmod(tmp_path, mode)
+        # Looked up HERE, inside the wrapper, so a stat() failure other than
+        # FileNotFoundError (EACCES, ELOOP, ENAMETOOLONG — _target_file_mode
+        # deliberately swallows only the former) surfaces as PlanWriteError
+        # naming the path, per this function's own docstring, instead of
+        # escaping bare before the try block ever ran.
+        os.chmod(tmp_path, _target_file_mode(target))
         _verify_plan_json(tmp_path)
         os.replace(tmp_path, target)
     except Exception as exc:
@@ -800,8 +819,19 @@ _MARKUP_WRITE_FAILED_EVENT = 'plan_markup_write_back_failed'
 #:
 #: Bounded by the number of DISTINCT refusals a process sees (a handful per
 #: plan), and keyed on the value's hash so an EDITED field reports again rather
-#: than being suppressed by a stale locator.
+#: than being suppressed by a stale locator. ONE refusal is never memoized at
+#: all: a locator that no longer resolves (see :data:`_UNRESOLVED_VALUE`) never
+#: gets a key built for it, so it is reported on every call instead of being
+#: suppressed under a key that means nothing.
 _REPORTED_REFUSALS: set[tuple[str, str | None, int | None, str, int]] = set()
+
+#: Sentinel returned by :func:`_fact_value` when a fact's locators no longer
+#: resolve against the plan (a collection shrank, an index moved). DISTINCT
+#: from a resolvable locator whose field is legitimately absent — both used to
+#: read back as plain ``None``, so "the locator broke" and "the field is
+#: missing" were indistinguishable and shared one memo key. Module-private;
+#: never leaves this file.
+_UNRESOLVED_VALUE = object()
 
 
 def _fact_value(plan: dict, fact: dict[str, Any]) -> object:
@@ -810,15 +840,21 @@ def _fact_value(plan: dict, fact: dict[str, Any]) -> object:
     Kept OUT of the fact itself: a fact is attached to the tool response, and
     echoing a whole corrupted prose field back into the caller's context is the
     amplification this memo exists to avoid. The locators are enough to find it.
+
+    Returns :data:`_UNRESOLVED_VALUE` — never plain ``None`` — when the
+    locators themselves no longer resolve, so that case can never share a memo
+    key with a locator that resolves to a field that is legitimately absent.
     """
     try:
         collection = fact['collection']
         holder = plan if collection is None else plan[collection][fact['index']]
         return holder.get(fact['field'])
     except (KeyError, IndexError, TypeError, AttributeError):
-        # A locator that no longer resolves cannot be memoized safely — report
-        # it every time rather than suppress on a key that means nothing.
-        return None
+        # An unresolvable locator is signalled distinctly and is NEVER
+        # memoized (see _report_markup_facts), so it is reported every time —
+        # rather than collapsing to a constant hash key under which a second,
+        # unrelated unresolvable refusal would be silently suppressed.
+        return _UNRESOLVED_VALUE
 
 
 def _report_markup_facts(
@@ -844,17 +880,22 @@ def _report_markup_facts(
             **fact,
         })
         if fact['outcome'] == 'unrepairable':
-            key = (
-                str(plan_path),
-                fact['collection'],
-                fact['index'],
-                fact['field'],
-                hash(_fact_value(plan, fact)),
-            )
-            if key in _REPORTED_REFUSALS:
-                logger.debug(payload)
-                continue
-            _REPORTED_REFUSALS.add(key)
+            value = _fact_value(plan, fact)
+            if value is not _UNRESOLVED_VALUE:
+                key = (
+                    str(plan_path),
+                    fact['collection'],
+                    fact['index'],
+                    fact['field'],
+                    hash(value),
+                )
+                if key in _REPORTED_REFUSALS:
+                    logger.debug(payload)
+                    continue
+                _REPORTED_REFUSALS.add(key)
+            # else: the locator no longer resolves. No key means anything for
+            # it, so nothing is built or inserted — fall through and report
+            # this call exactly like a first-time refusal, every time.
         logger.warning(payload)
         reportable.append(fact)
     return reportable

@@ -6,6 +6,7 @@ from typing import Any
 
 from mem0 import AsyncMemory
 
+from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.scope import Scope
 
@@ -110,6 +111,13 @@ def split_managed_metadata(
     return managed, custom
 
 
+# mem0's own default embedding dimensionality, shared by its Qdrant vector
+# store (mem0/configs/vector_stores/qdrant.py) and its OpenAI embedder
+# (mem0/embeddings/openai.py). Emitting the embedder key at this value would
+# be a behaviour CHANGE, not a no-op — see _build_config_dict.
+_MEM0_DEFAULT_EMBEDDING_DIMS = 1536
+
+
 class Mem0Backend:
     """Lazily creates AsyncMemory instances keyed by project_id."""
 
@@ -130,12 +138,39 @@ class Mem0Backend:
                 'config': {
                     'url': cfg.mem0.qdrant_url,
                     'collection_name': collection_name,
+                    # Note the deliberate asymmetry with the embedder's
+                    # 'embedding_dims' below: DIFFERENT key name, different
+                    # upstream semantics, different emission rule. This one
+                    # controls the dimensionality Qdrant CREATES the collection
+                    # with, and mem0's own default is already 1536
+                    # (mem0/configs/vector_stores/qdrant.py), so emitting it
+                    # unconditionally is a no-op at the shipped config.
+                    #
+                    # OPERATOR HAZARD at a NON-1536 embedder.dimensions on an
+                    # EXISTING deployment: neither key was plumbed before, so
+                    # such a config was inert — mem0 created the collection at
+                    # its own 1536 default and requested 1536-wide vectors.
+                    # Both now follow the config, but mem0's
+                    # QdrantDB.create_col short-circuits when the collection
+                    # already exists ('Collection ... already exists. Skipping
+                    # creation.'), leaving a 1536-wide collection that every
+                    # N-wide upsert then fails against at runtime. Changing
+                    # embedder.dimensions requires recreating and re-embedding
+                    # the Qdrant collection; it is not a live-migratable knob.
+                    'embedding_model_dims': cfg.embedder.dimensions,
                 },
             },
         }
 
         # LLM
         if cfg.llm.provider == 'openai' and cfg.llm.providers.openai:
+            # See the openai_base_url comment below: config now wins over the
+            # ambient env fallback, which is an egress change for a gateway
+            # deployment that set only OPENAI_BASE_URL. Report it, don't
+            # redirect silently.
+            warn_if_ambient_base_url_is_overridden(
+                cfg.llm.providers.openai.api_url, context='mem0 LLM',
+            )
             config_dict['llm'] = {
                 'provider': 'openai',
                 'config': {
@@ -143,6 +178,15 @@ class Mem0Backend:
                     'temperature': cfg.llm.temperature or 0.1,
                     'max_tokens': cfg.llm.max_tokens,
                     'api_key': cfg.llm.providers.openai.api_key,
+                    # Make config authoritative over the ambient
+                    # OPENAI_BASE_URL / OPENAI_API_BASE env fallback that
+                    # mem0/llms/openai.py would otherwise apply. The default
+                    # resolves to https://api.openai.com/v1, so this is
+                    # byte-identical for anyone not setting those vars.
+                    # OpenAIConfig-only — do NOT add it to the anthropic
+                    # branch below, which would TypeError out of mem0's
+                    # factory.
+                    'openai_base_url': cfg.llm.providers.openai.api_url,
                 },
             }
         elif cfg.llm.provider == 'anthropic' and cfg.llm.providers.anthropic:
@@ -158,12 +202,29 @@ class Mem0Backend:
 
         # Embedder
         if cfg.embedder.provider == 'openai' and cfg.embedder.providers.openai:
+            warn_if_ambient_base_url_is_overridden(
+                cfg.embedder.providers.openai.api_url, context='mem0 embedder',
+            )
+            embedder_config: dict[str, Any] = {
+                'model': cfg.embedder.model,
+                'api_key': cfg.embedder.providers.openai.api_key,
+                # Read from the EMBEDDER provider block, not the llm one, so
+                # the two endpoints stay independent.
+                'openai_base_url': cfg.embedder.providers.openai.api_url,
+            }
+            # Emitted ONLY at a non-default dimensionality. This guard is
+            # mandatory, not stylistic: mem0/embeddings/openai.py does
+            #     self._pass_dimensions_to_api = self.config.embedding_dims is not None
+            # so emitting the key at all — even as 1536 — would start sending a
+            # `dimensions` field on EVERY embeddings request under the shipped
+            # config, which is not byte-identical. Do not "simplify" this away.
+            # (Note the key name: the embedder takes `embedding_dims`;
+            # `embedding_model_dims` is the vector store's, set above.)
+            if cfg.embedder.dimensions != _MEM0_DEFAULT_EMBEDDING_DIMS:
+                embedder_config['embedding_dims'] = cfg.embedder.dimensions
             config_dict['embedder'] = {
                 'provider': 'openai',
-                'config': {
-                    'model': cfg.embedder.model,
-                    'api_key': cfg.embedder.providers.openai.api_key,
-                },
+                'config': embedder_config,
             }
 
         return config_dict

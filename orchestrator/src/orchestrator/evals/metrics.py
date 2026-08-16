@@ -201,6 +201,40 @@ class EvalMetrics:
     invocation_error: str | None = None
     cap_tainted: bool = False
 
+    # The third member of that family (eval-revival σ, task 3628) — a VALIDITY
+    # bound rather than an exclusion.
+    #
+    # True means: this cell's persisted ``plan_quality`` IS the LLM judge's own
+    # score, and the judge was handed an EMPTY ``reference_diff``. It graded
+    # the plan on PLAUSIBILITY, never against the landed change, because no
+    # ground truth was available (the fixture carried no ``reference`` block or
+    # no ``post_task_commit``, or materializing the diff failed).
+    #
+    # What it does NOT mean: it is NOT an exclusion. The cell stays in every
+    # pool — quality, composite, cost — at its real score, and the reported
+    # means still average it in. Only the CONFIDENCE attached to that number is
+    # reduced. That is what makes it disjoint from both existing counts:
+    # ``cap_tainted`` cells have no ``plan_quality`` at all, so there is
+    # nothing to bound; and a no-plan/structural-floor cell's score comes from
+    # ``score_plan_structure``, which never consults a reference, so it is
+    # valid ground-truth-independently. Marking either would inflate the count
+    # with cells that are not at risk and make the bound useless.
+    #
+    # ``False`` is the right legacy default for the same reason ``cap_tainted``
+    # defaults False: a result persisted before this field existed reads back
+    # as not-degraded. Cell-level ABSENCE, however, is NOT interchangeable with
+    # False — ``to_dict`` is a bare ``asdict``, so every cell written by
+    # post-σ code carries the key, and a consumer
+    # (``scripts/run_fable_trial_v2_campaign.py``, task 3632) reads a MISSING
+    # key as "never measured". Do not make the write conditional.
+    #
+    # Provenance: the 2026-07-29 v1 campaign judged half the hard subset this
+    # way — including reify_task_12, the fixture carrying the entire v1 result
+    # — and it was discoverable only by archaeology
+    # (``docs/plan-scoring-and-judge.md``). This marker exists so the next
+    # referenceless fixture is loud at run time instead.
+    judged_without_reference: bool = False
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 

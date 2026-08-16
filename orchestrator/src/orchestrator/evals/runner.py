@@ -813,6 +813,9 @@ async def run_architect_eval(
     reference = task.get('reference') or {}
     post = reference.get('post_task_commit')
     reference_diff = ''
+    # Set only where the judge's OWN number is kept (step 7) — see the comment
+    # there for why the assignment does not live at this site.
+    judged_without_reference = False
     if post:
         try:
             reference_diff = await snapshots.get_diff_between_commits(
@@ -820,6 +823,25 @@ async def run_architect_eval(
             )
         except Exception as e:
             logger.warning(f'reference diff failed for {task_id}: {e}')
+    else:
+        # Loud at RUN time (eval-revival σ, task 3628). The v1 campaign judged
+        # half its hard subset this way and it was discoverable only by
+        # archaeology, because a fixture with no ``reference`` block reached the
+        # judge silently.
+        #
+        # Scoped to the FIXTURE-LEVEL fact, which is all that is known here
+        # (reviewer: robustness). At this point the architect's outcome is not
+        # yet decided, so this site cannot say anything about a judge score: a
+        # cap-tainted cell and a no-scorable-plan cell both skip the judge
+        # entirely, and claiming their score is plausibility-based would be
+        # false. That claim belongs to — and is made by — the step-7 warning
+        # below, which fires exactly where the judge is invoked blind. This is
+        # the same over-broad keying the marker's comment at step 7 rejects for
+        # the metrics field, and it is rejected here for the same reason.
+        logger.warning(
+            f'Architect eval {task_id} × {config.name}: fixture carries no '
+            f'reference.post_task_commit, so NO reference diff is available'
+        )
 
     # 7. Score the produced plan: LLM judge vs the landed diff, degrading to the
     #    deterministic structural floor on ANY judge failure so plan_quality is a
@@ -917,6 +939,12 @@ async def run_architect_eval(
             f'scored on the structural floor ({plan_quality}), NOT tainted'
         )
     else:
+        if not reference_diff:
+            logger.warning(
+                f'Architect eval {task_id} × {config.name}: invoking the plan '
+                f'judge with an EMPTY reference diff — no ground truth to '
+                f'grade against'
+            )
         try:
             verdict = await judge_plan_quality(plan, reference_diff, task)
             plan_quality = verdict.plan_quality
@@ -957,6 +985,19 @@ async def run_architect_eval(
             )
         if plan_quality is None:
             plan_quality = score_plan_structure(plan)
+        else:
+            # The marker lives HERE, on the one path where the judge's own
+            # number is KEPT — not at the materialization site above (task
+            # 3628). Its name asserts something about the PERSISTED score:
+            # this score was judged, without a reference. Every other path
+            # persists ``score_plan_structure``, which never consults a
+            # reference and is therefore valid ground-truth-independently, so
+            # keying on ``not reference_diff`` at the materialization site
+            # would mark every no-plan and judge-failed cell too — ~every
+            # no-plan cell in a hard campaign, i.e. exactly the population the
+            # consumer must be able to see PAST — diluting the count used to
+            # bound plan_quality validity into uselessness.
+            judged_without_reference = not reference_diff
 
     wall_clock_ms = int(time.monotonic() * 1000) - start_ms
 
@@ -1090,6 +1131,7 @@ async def run_architect_eval(
         cap_tainted=tainted,
         judge_cost_usd=judge_cost_usd,
         judge_invocations=judge_invocations,
+        judged_without_reference=judged_without_reference,
     )
     result_obj = EvalResult(
         task_id=task_id,
@@ -1111,6 +1153,8 @@ async def run_architect_eval(
             f'{metrics.invocation_error}]'
             if metrics.invocation_error else ''
         )
+        # So a run's OWN log carries the validity bound, not just the report.
+        + (' [judged_without_reference]' if judged_without_reference else '')
     )
     return result_obj
 

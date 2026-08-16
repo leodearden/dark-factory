@@ -38,22 +38,67 @@ _LEGACY_CONFIG_NAMES: Final = (
 def _read_escalation_url(yaml_path: Path) -> str | None:
     """Parse *yaml_path* and return its escalation MCP URL, or None.
 
-    Returns None when the file doesn't exist, is malformed (logged at
-    warning level), or has no ``escalation.port``. Callers decide what
+    Returns None when the file doesn't exist, is unreadable/unparseable,
+    its top-level YAML is not a mapping (a falsy non-mapping document,
+    e.g. ``[]``/``false``/``0``, counts too — only a genuinely empty file,
+    which parses to ``None``, is treated as an absent mapping), its
+    ``escalation:`` value is present but not a mapping, its
+    ``escalation.host``/``escalation.port`` leaves are present but not the
+    expected type, or it has no ``escalation.port`` — all logged at
+    warning level except the last (a config with no escalation section
+    configured is not malformed). This function runs once per known
+    project root at process startup (via
+    ``DashboardConfig.__post_init__``), so a single operator typo in one
+    project's config must degrade to "no URL for this root" rather than
+    raising and aborting the whole dashboard, and must never silently
+    format a wrong-typed leaf into a bogus URL that only fails later, at
+    request time, with an opaque connection error. Callers decide what
     "no URL" means for logging purposes.
     """
     if not yaml_path.is_file():
         return None
     try:
         with yaml_path.open() as f:
-            data: Any = yaml.safe_load(f) or {}
+            data: Any = yaml.safe_load(f)
     except (OSError, yaml.YAMLError) as exc:
         logger.warning('Failed to read %s: %s', yaml_path, exc)
         return None
-    esc = (data.get('escalation') or {}) if isinstance(data, dict) else {}
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        logger.warning(
+            'Ignoring %s: top-level YAML is a %s, not a mapping',
+            yaml_path,
+            type(data).__name__,
+        )
+        return None
+    esc: Any = data.get('escalation')
+    if esc is None:
+        esc = {}
+    if not isinstance(esc, dict):
+        logger.warning(
+            "Ignoring %s: 'escalation:' is a %s, not a mapping",
+            yaml_path,
+            type(esc).__name__,
+        )
+        return None
     host = esc.get('host', '127.0.0.1')
     port = esc.get('port')
     if not port:
+        return None
+    if not isinstance(host, str):
+        logger.warning(
+            "Ignoring %s: 'escalation.host' is a %s, not a string",
+            yaml_path,
+            type(host).__name__,
+        )
+        return None
+    if not isinstance(port, (int, str)):
+        logger.warning(
+            "Ignoring %s: 'escalation.port' is a %s, not an int or string",
+            yaml_path,
+            type(port).__name__,
+        )
         return None
     return f'http://{host}:{port}/mcp'
 

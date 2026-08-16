@@ -94,10 +94,12 @@ from orchestrator.merge_liveness import (  # noqa: F401  re-export shim
     _clear_verify_host_unreachable,
     _safety_valve_due,
     _verify_host_unreachable_sentinel,
+    acquire_chain_build_lane,
     check_merge_liveness_margin,
     enforce_merge_liveness_margin,
     enforce_persistent_worktree_serial_lane,
     newest_content_mtime,
+    release_chain_build_lane,
 )
 from orchestrator.merge_request_ledger import (  # noqa: F401  re-export shim
     RequestLedger,
@@ -141,6 +143,7 @@ from orchestrator.merge_speculation_controller import (  # noqa: F401  re-export
 from orchestrator.merge_types import (  # noqa: F401  re-export shim
     _INFLIGHT_MERGE_ETA_ESTIMATE_SECS,
     CapPermit,
+    ChainResult,
     Decided,
     DecidedItem,
     GroupMergeRequest,
@@ -5908,6 +5911,215 @@ async def classify_and_merge(
         raise
 
 
+# ---------------------------------------------------------------------------
+# Deep merge-ahead chain builder (task 3184, PRD β —
+# ``plans/deep-merge-ahead-prd.md``)
+#
+# TWO INVARIANTS A FUTURE EDITOR MUST NOT BREAK:
+#
+# 1. PURITY.  ``build_chain`` is pure w.r.t. queue state: it never calls
+#    ``_pop_next_pickable``, ``_note_transition``, ``_emit_merge_attempt``,
+#    ``classify_and_merge``, ``_note_conflict_detected``, or any ``set_result``
+#    chokepoint (``_resolve_and_release``, ``_resolve_or_drop_abandoned``,
+#    ``_oob_deliver``, ``_resolve_merging_requests``).  PRD decision #4: a
+#    chain conflict at position j MUST NOT fire item j's conflict path — j may
+#    conflict only with an *unlanded* predecessor, and takes its normal
+#    sequential path later.
+#
+# 2. ONE WORKTREE.  Exactly one ``acquire_chain_build_lane`` per invocation;
+#    the merge loop reuses that lane via ``GitOps.merge_branch_into_worktree``.
+#    (``merge_to_main`` would provision a fresh worktree per item.)
+# ---------------------------------------------------------------------------
+
+
+async def build_chain(
+    git_ops: GitOps,
+    queue_snapshot: Sequence[MergeRequest],
+    head_merge_commit: str,
+    *,
+    cap: int,
+    target_depth: int,
+) -> ChainResult:
+    """Speculatively merge a prefix of the queue onto the frozen head's tip.
+
+    Merges up to ``min(len(queue_snapshot), cap, target_depth)`` items, in
+    submission order, sequentially into ONE scratch worktree, truncating at
+    the first item that does not merge cleanly.  Mirrors the free-function
+    convention of :func:`classify_and_merge` (collaborators injected rather
+    than reached for).
+
+    Nothing calls this yet — γ (task 3185, deep-tip dispatch) is the first
+    caller — so this commit cannot change any production behaviour.  With
+    α's shipped ``chain_cap`` default of 0, ``depth <= 0`` short-circuits
+    before any lane or subprocess is touched, which is what makes the kill
+    switch structurally free.
+
+    See the module section comment above for the two invariants (purity and
+    one-worktree) this function exists to uphold.
+
+    **Caller cost — γ must bound this.**  One call blocks on one lane
+    acquisition (``acquire_spec_lane``: ``git reset --hard``, ``git clean
+    -xfd``, a CoW seed) plus up to *depth* sequential real ``git merge``
+    subprocesses, plus one ``git diff`` per conflicted file on the conflict
+    arm — i.e. ~O(seconds) at ``chain_cap > 0``, with no internal deadline.
+    There is deliberately none here: an internal timeout would abandon a
+    half-built lane mid-``git merge``, and the honest bound belongs to the
+    policy layer.  So when γ (task 3185) wires this in, it must EITHER run
+    the build off the critical dispatch path (a background task whose result
+    is consumed on a later round) OR wrap the call in an
+    :func:`asyncio.timeout` — the ``except BaseException`` arm below already
+    releases the lane on cancellation, so a deadline is safe to impose from
+    outside.  Until then the cost is at least observable: every build that
+    reaches the merge loop logs ``elapsed_ms`` on its one-line summary.
+
+    Args:
+        git_ops: Live :class:`~orchestrator.git_ops.GitOps` instance.
+        queue_snapshot: The unfrozen suffix in pick order, from
+            :meth:`SpeculativeMergeWorker.chain_snapshot`.
+        head_merge_commit: The base to stack on — the frozen prefix tip, from
+            :meth:`SpeculativeMergeWorker.frozen_prefix_tip` (which returns
+            ``main_sha`` when nothing is verifying).
+        cap: Hard ceiling from ``MergeDeepConfig.chain_cap``.  ``0`` is the
+            kill switch.  Keyword-only, so a call site can never transpose it
+            with *target_depth*.
+        target_depth: How deep this round actually wants to go.
+
+    Returns:
+        A :class:`~orchestrator.merge_types.ChainResult`.  A non-empty result
+        HOLDS its lane and the caller MUST release it via
+        :func:`~orchestrator.merge_liveness.release_chain_build_lane`; an
+        empty result never holds one.
+    """
+    depth = min(len(queue_snapshot), cap, target_depth)
+    if depth <= 0:
+        # Kill switch / nothing to do: return BEFORE touching git — no lane
+        # acquisition, no subprocess.
+        return ChainResult(links=[], tip=head_merge_commit)
+
+    # Wall-clock for the whole build, reported on the summary line below.  The
+    # cost is real and invisible from the signature: one lane acquisition
+    # (`git reset --hard` + `git clean -xfd` + a CoW seed) plus up to `depth`
+    # sequential `git merge` subprocesses, plus — on the conflict arm — a
+    # `get_conflict_details` that spawns one `git diff` per conflicted file.
+    # Measured from before the acquisition so the lane reset is included.
+    started = time.monotonic()
+
+    # Exactly one lane for the whole chain (invariant 2 above).  `config` is
+    # read off the snapshot rather than taken as a parameter: every
+    # MergeRequest carries one, and that is the established idiom (see
+    # merge_liveness._acquire_warm_verify_worktree).
+    lane, warm = await acquire_chain_build_lane(
+        git_ops, queue_snapshot[0].config, head_merge_commit,
+    )
+    if lane is None:
+        return ChainResult(links=[], tip=head_merge_commit)
+
+    links: list[tuple[str, str]] = []
+    # `tip` starts at the base so a zero-link result still names a verifiable tip.
+    tip = head_merge_commit
+    truncated_at: str | None = None
+    truncated_reason: str | None = None
+    try:
+        for req in queue_snapshot[:depth]:
+            # ── DO NOT EMIT AN OUTCOME FOR `truncated_at` ────────────────
+            # PRD decision #4: item j may conflict only with an *unlanded*
+            # predecessor, so it takes its normal sequential path later and
+            # its verdict is not ours to render.  Firing
+            # `_emit_merge_attempt` / `_note_conflict_detected` /
+            # `set_result` here would also produce a deterministic reason
+            # string on EVERY round, hence an identical
+            # `merge_outcome_signature` round after round, which trips
+            # workflow.py's `consecutive_merge_thrash` ladder into a
+            # false-positive human escalation — the same failure class as
+            # MergeVerifyLeaseContended, documented in
+            # merge_liveness._acquire_warm_verify_worktree's Raises section.
+            # Truncation is recorded in the returned ChainResult and nowhere
+            # else.
+            if isinstance(req, GroupMergeRequest):
+                # A train carries `tip_branch` + `member_task_ids` + member
+                # callbacks and is landed by `_do_train_merge`; chaining it
+                # as a plain item would land a train without its member
+                # bookkeeping.  Truncate rather than skip past it — see the
+                # contiguous-prefix note below.
+                truncated_at = req.task_id
+                truncated_reason = 'train_request'
+                break
+            # bare_id so merge_branch_into_worktree's resolve_queued_branch_ref /
+            # branch_prefix handling matches the sequential path exactly.
+            res = await git_ops.merge_branch_into_worktree(lane, req.branch.bare_id)
+            if not res.success or res.merge_commit is None:
+                # Truncate. Do NOT retry, and do NOT skip past this item to try
+                # later ones: the chain must be a contiguous PREFIX of the
+                # queue, because δ lands `links` in order through the existing
+                # CAS advance and a hole would break the in-order /
+                # frozen-prefix invariant.
+                truncated_at = req.task_id
+                # Deliberately NOT collapsed into one reason: a textual
+                # conflict is an expected, benign chain outcome (the replay
+                # study saw 0/190 real ones), while a non-conflict merge
+                # failure — missing ref, hook rejection — is a genuine fault
+                # ε's telemetry must be able to see separately.
+                #
+                # Order matters: `already_up_to_date` is ALSO conflicts=False,
+                # so checking it second would swallow it into the fault
+                # bucket.  An already-landed item is BENIGN — its work is
+                # already in the base and it takes its normal sequential path,
+                # where `_is_genuinely_merged` renders the real verdict — so
+                # reporting it as a fault would inflate ε's deep-fail reader
+                # with non-faults and hide the real ones.
+                if res.already_up_to_date:
+                    truncated_reason = 'already_merged'
+                elif res.conflicts:
+                    truncated_reason = 'conflict'
+                else:
+                    truncated_reason = 'merge_error'
+                break
+            links.append((req.task_id, res.merge_commit))
+            tip = res.merge_commit
+    except BaseException:
+        # A cancellation mid-build must not strand a pool lane in ASSIGNED
+        # (mirrors merge_to_main's except BaseException cleanup).
+        await release_chain_build_lane(git_ops, lane, warm=warm)
+        raise
+
+    # One line per chain build, not per item — this runs on the dispatch path.
+    # Logged BEFORE the empty-links return so every build that reached the
+    # merge loop is observable, not just the ones that produced links: a
+    # truncation at position 0 is the single most interesting outcome and was
+    # previously the only one that left no trace at all.  `merge_error` is the
+    # documented fault bucket (missing ref, hook rejection) as opposed to the
+    # benign caps (conflict / already_merged / train_request), and ε's
+    # telemetry reader does not exist yet, so it escalates to WARNING — a
+    # silent fault here is exactly the shape the no-silent-fail-soft design
+    # invariant exists to prevent.
+    #
+    # `elapsed_ms` is on the line for the reason in the Caller-cost note of the
+    # docstring: the blocking cost of a round is otherwise invisible from the
+    # interface, and it must be observable BEFORE the cap is raised above 0.
+    logger.log(
+        logging.WARNING if truncated_reason == 'merge_error' else logging.INFO,
+        'build_chain: depth=%d built=%d tip=%s truncated_at=%s reason=%s '
+        'lane=%s elapsed_ms=%d',
+        depth, len(links), tip[:8], truncated_at, truncated_reason, lane.name,
+        (time.monotonic() - started) * 1000,
+    )
+
+    if not links:
+        # An empty result never holds a lane, so a caller that skips the
+        # release on the empty path cannot leak one.
+        await release_chain_build_lane(git_ops, lane, warm=warm)
+        return ChainResult(
+            links=[], tip=tip,
+            truncated_at=truncated_at, truncated_reason=truncated_reason,
+        )
+
+    return ChainResult(
+        links=links, tip=tip,
+        truncated_at=truncated_at, truncated_reason=truncated_reason,
+        lane=lane, lane_warm=warm,
+    )
+
+
 async def _journal_landed_then_advance(
     outbox: LandedOutbox | None,
     git_ops: Any,
@@ -9594,6 +9806,124 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         """
         self._runner_unavailable.pop(host, None)
 
+    def _host_states_block(self, now: float) -> list[dict]:
+        """Per-host slot state + quarantine classification for :meth:`snapshot`.
+
+        One dict per host the allocator manages, in allocator order (local
+        first), then one per **orphan** RU-tracked host (see below), each with
+        a **uniform schema** — every key always present, ``None`` where not
+        applicable::
+
+            {name, is_local, slot_state, quarantined, quarantine_class,
+             unavailable_since, unavailable_secs, streak, reason}
+
+        *now* is the snapshot's own clock (``time.time()``), passed in so
+        ``unavailable_secs`` is measured against the same instant as every
+        other relative age in the snapshot (``entries[].age_secs``,
+        ``verify_in_progress.age_secs``) rather than against a second,
+        slightly-later read of the wall clock.
+
+        The allocator owns slot state and quarantine membership
+        (:meth:`~orchestrator.verify_runner.HostAllocator.host_states`); the
+        RunnerUnavailable streak tracker is worker-owned, so the RU enrichment
+        is applied here rather than pushed down into the allocator.
+
+        Notes
+        -----
+        - ``quarantine_class`` is derived with the SAME predicate
+          :meth:`_reprobe_quarantined_hosts` uses to tell the two quarantine
+          origins apart — ``name in self._runner_unavailable``, i.e. its
+          ``entry = self._runner_unavailable.get(name); if entry is None:
+          continue`` skip under the comment "Skip divergence-quarantined hosts
+          — not tracked as RunnerUnavailable".  Sharing the predicate means
+          this snapshot and the reprobe path can never disagree about whether
+          a quarantined host is RU-recoverable (``'ru'``) or held for verdict
+          divergence (``'divergence'``, cleared only by an operator).
+        - ``unavailable_since`` / ``unavailable_secs`` / ``streak`` / ``reason``
+          are populated whenever the host is RU-tracked, **independent of
+          quarantine**, so a host accumulating failures below the quarantine
+          threshold is visible too.  ``unavailable_since`` is the absolute
+          epoch (for cross-log correlation); ``unavailable_secs`` is the
+          derived *relative* downtime — ``max(0.0, now - first_unavailable_at)``
+          — which is the operationally interesting form ("how long has this
+          host been down") and matches how every other time-valued field in
+          the snapshot is expressed.  Clamped at 0 so a clock step backwards
+          cannot surface a negative duration.
+        - **Orphan RU entries.** ``_runner_unavailable`` is only pruned on
+          recovery (:meth:`_record_runner_recovered`), while the allocator is
+          built once and cached for the worker's lifetime, so a host that
+          leaves the managed set (renamed/removed remote) can keep a live RU
+          streak that no allocator slot corresponds to.  Those names are
+          appended after the managed hosts with ``slot_state=None``
+          (``None`` = "not allocator-managed", keeping the non-null slot
+          vocabulary exactly :data:`~orchestrator.verify_runner._SLOT_WIRE`)
+          and ``is_local=False``, so an orphaned streak is never invisible —
+          that blind spot is the same class of gap this block exists to close.
+          Quarantine membership for them is read via
+          :meth:`~orchestrator.verify_runner.HostAllocator.is_quarantined`,
+          which answers from the shared-by-reference quarantine set and so
+          works for names the allocator does not manage —
+          :meth:`~orchestrator.verify_runner.HostAllocator.host_states` cannot
+          answer it, since an orphan has no slot to report.  Consequence:
+          ``len(hosts)`` equals ``occupancy.hosts_total`` **plus** the number
+          of orphan entries; with no orphans (the steady state) the two agree.
+        - The ``isinstance`` gate is a TYPE check, not a defensive fail-soft:
+          :meth:`_ensure_host_allocator` always constructs a real
+          :class:`~orchestrator.verify_runner.HostAllocator` and nothing else is
+          ever assigned in production, so the ``[]`` branch is unreachable
+          there.  It exists solely because ``_host_allocator`` carries a
+          ``MagicMock`` double at 79 assignment sites across 15 test files;
+          those doubles answer every attribute, so ``hasattr``/duck-typing
+          would let them crash or inject garbage into this read-only path.
+        - ``[]`` therefore also means "allocator not built yet (no verify
+          dispatched)".  Deliberately NOT a fabricated ``local`` entry — an
+          absent allocator is a distinct fact from an idle one.
+        """
+        if not isinstance(self._host_allocator, HostAllocator):
+            return []
+
+        def _entry(name: str, *, is_local: bool, slot_state: str | None,
+                   quarantined: bool) -> dict:
+            ru = self._runner_unavailable.get(name)
+            return {
+                'name': name,
+                'is_local': is_local,
+                'slot_state': slot_state,
+                'quarantined': quarantined,
+                'quarantine_class': (
+                    ('ru' if ru is not None else 'divergence') if quarantined else None
+                ),
+                'unavailable_since': ru.first_unavailable_at if ru is not None else None,
+                'unavailable_secs': (
+                    max(0.0, now - ru.first_unavailable_at) if ru is not None else None
+                ),
+                'streak': ru.streak if ru is not None else None,
+                'reason': ru.reason if ru is not None else None,
+            }
+
+        out: list[dict] = [
+            _entry(
+                st['name'],
+                is_local=st['is_local'],
+                slot_state=st['slot_state'],
+                quarantined=bool(st['quarantined']),
+            )
+            for st in self._host_allocator.host_states()
+        ]
+        # Orphan RU entries: RU-tracked hosts with no allocator slot. Appended
+        # after the managed hosts so the allocator's own ordering (local first,
+        # then remotes in declaration order) is untouched; sorted for a stable
+        # snapshot across calls.
+        _managed = {h['name'] for h in out}
+        for _orphan in sorted(set(self._runner_unavailable) - _managed):
+            out.append(_entry(
+                _orphan,
+                is_local=False,
+                slot_state=None,
+                quarantined=self._host_allocator.is_quarantined(_orphan),
+            ))
+        return out
+
     async def _reprobe_quarantined_hosts(self, now: float) -> None:
         """Probe each RU-quarantined remote host and clear on recovery.
 
@@ -10267,6 +10597,68 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         for lane in MERGE_LANES:  # high → normal, FIFO within lane
             rids.extend(req.request_id for req in self._lane_buffers[lane])
         return tuple(rids)
+
+    def chain_snapshot(self) -> tuple[MergeRequest, ...]:
+        """Return the unfrozen suffix as request OBJECTS, in dispatch pick order.
+
+        The :class:`MergeRequest`-typed twin of :meth:`unfrozen_suffix` (which
+        returns ``request_id`` strings), and the input to
+        :func:`build_chain` (task 3184, PRD β).
+
+        **Pure/synchronous (no await)** — same contract as
+        :meth:`frozen_prefix` / :meth:`unfrozen_suffix` /
+        :meth:`frozen_prefix_tip` / :meth:`_pop_next_pickable`, so it is
+        callable from :meth:`snapshot` and from sync unit tests with no
+        running loop.
+
+        **Reads, never pops.**  Iterating a deque does not consume it.  This
+        method must never call :meth:`_pop_next_pickable` (which pops the
+        deque, asserts single-writer, and fires a ``LANE_BUFFERED→MERGING``
+        transition), never :meth:`_note_transition`, and never resolve a
+        future — ``build_chain`` is pure w.r.t. queue state.  It must also NOT
+        call :meth:`_assert_single_writer`: that guard (task 1999 /
+        MQ-invariants ξ I7) is asserted at ``_lane_buffers`` MUTATION sites
+        only, and this is a reader.  Its existence is precisely why the
+        read-only contract here is an enforced repo invariant rather than
+        merely a PRD wish.
+
+        **Ordering is FIFO within lane, high lane first** — deliberately the
+        SAME order as :meth:`unfrozen_suffix`, so the checkable twin invariant
+        ``tuple(r.request_id for r in chain_snapshot()) == unfrozen_suffix()``
+        holds item for item.  Do NOT sort by :func:`_aging_key`: that key is
+        used only as a neighbor comparison inside :meth:`_pop_next_pickable`'s
+        clique-minimality test, never as a buffer sort key, and it diverges
+        from FIFO for a requeued item (``_note_requeue`` re-appends at the
+        tail while retaining an old ``merge_first_enqueued_at``).  FIFO is the
+        PRD's literal "submission order".
+
+        **Deliberate divergence from** :meth:`_pop_next_pickable`: its
+        clique-minimality tie-break over the suffix conflict graph (see
+        :meth:`recompute_suffix_conflict_graph`) is NOT applied here.  That
+        tie-break is a conflict-*avoidance* heuristic for the single-item
+        path, whereas ``build_chain`` performs real sequential ``git merge``es
+        and truncates on actual textual conflict — a strictly stronger and
+        more accurate test.  Applying clique-minimality would reorder the
+        chain away from submission order and break the contiguous in-order
+        prefix property δ's CAS walk depends on.
+
+        **Lane halts ARE honored**, unlike :meth:`unfrozen_suffix` (which
+        reports the whole buffer region regardless): an item in a halted lane
+        is not dispatchable, so chaining it would build a tip the pipeline
+        cannot land.  This matches :meth:`_pop_next_pickable`'s
+        ``is_lane_halted`` skip, and is the one place the twin invariant above
+        needs a same-halt-state caveat.
+
+        Returns the UNFROZEN suffix only (``_lane_buffers``) — never
+        frozen/in-flight items.  The frozen prefix is the immutable head that
+        supplies ``head_merge_commit`` via :meth:`frozen_prefix_tip`.
+        """
+        items: list[MergeRequest] = []
+        for lane in MERGE_LANES:  # high → normal, FIFO within lane
+            if self.is_lane_halted(lane):
+                continue
+            items.extend(self._lane_buffers[lane])
+        return tuple(items)
 
     def _newest_frozen_commit(self) -> str | None:
         """Return the newest frozen entry's merge_commit, or None (ε=1890).
@@ -11503,7 +11895,44 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             else None.  Passthrough entries (no verify task) produce None.
             verify_age_secs measures time since dispatch, which includes host-acquisition
             latency — it is NOT pure verify time.
-          occupancy: {hosts_total, hosts_busy, by_host} — per-host in-flight count.
+          occupancy: per-host in-flight breakdown —
+            hosts_total: number of hosts the allocator manages (1 when no
+              allocator has been built yet).
+            hosts_busy: count of DISTINCT hosts holding at least one leased
+              in-flight entry.  This is NOT the number of verifies in flight —
+              two entries sharing a host count once.  Consumers wanting the
+              in-flight count must read inflight_total (task 3275).
+            by_host: {host: task_id}, retained at its historical shape for
+              backward compatibility.  LOSSY: when two entries share a host it
+              keeps only the last (and the finalize-head prepend drops the
+              head's task_id in that case).  Preserved verbatim for existing
+              consumers and task 3044's in-flight rework; inflight_by_host is
+              the authoritative view.
+            inflight_by_host: {host: [task_id, ...]} — lossless, every leased
+              occupant present.  Ordered finalize head first, then _inflight
+              order, mirroring `entries`.
+            inflight_total: total leased in-flight entries across all hosts.
+          hosts: list of per-host state dicts (task 3275), one per host the
+            allocator manages, in allocator order (local first), each
+            {name, is_local, slot_state, quarantined, quarantine_class,
+            unavailable_since, unavailable_secs, streak, reason} — uniform
+            schema, None where N/A.  unavailable_since is an absolute epoch
+            (log correlation); unavailable_secs is the derived downtime
+            relative to this snapshot's `now`, matching every other age field
+            here.  [] when no allocator has been built yet (no verify
+            dispatched).  Any RU-tracked host with no allocator slot (an
+            orphan — e.g. a remote removed from the pool while its streak was
+            live) is appended after the managed hosts with slot_state=None, so
+            len(hosts) == occupancy.hosts_total + <orphan count> (equal in the
+            steady state).  This is what makes an under-full `verifying N/M
+            hosts` line diagnosable; the four causes and their discriminators:
+              - RU-quarantined         : quarantine_class == 'ru' (auto-recovers
+                                         via _reprobe_quarantined_hosts)
+              - divergence-quarantined : quarantine_class == 'divergence'
+                                         (operator-cleared only)
+              - leaked slot            : slot_state busy|parked with no matching
+                                         occupancy.inflight_by_host occupant
+              - free, never asked for  : slot_state == 'free', quarantined False
           is_wip_halted: bool.
           halt_owner_esc_id: str or None.
           owned_merge_worktrees: sorted resolved absolute path strings for this
@@ -11770,14 +12199,35 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             _fh_name = _fh_entry.lease.name
             _fh_tid = _fh_entry.item.request.task_id
             _by_host = {_fh_name: _fh_tid, **_by_host}
+        # 3275 additive: lossless per-host occupant lists, built in the SAME
+        # order (finalize head first, then _inflight order) as _by_host above.
+        # _by_host is left byte-for-byte unchanged — it is lossy by two paths
+        # (the dict comprehension collapses two entries sharing a host
+        # last-writer-wins, and the prepend splat above drops the head's
+        # task_id when the head shares a host with an in-flight entry) and it
+        # is the field task 3044 is reworking, so it is preserved verbatim
+        # rather than widened.
+        _inflight_by_host: dict[str, list[str]] = {}
+        if _fh_entry is not None and _fh_entry.lease is not None:
+            _inflight_by_host[_fh_entry.lease.name] = [_fh_entry.item.request.task_id]
+        for _infl in self._inflight:
+            if _infl.lease is not None:
+                _inflight_by_host.setdefault(_infl.lease.name, []).append(
+                    _infl.item.request.task_id
+                )
         _hosts_total = (
             len(self._host_allocator.host_names)
             if self._host_allocator is not None else 1
         )
         occupancy = {
             'hosts_total': _hosts_total,
-            'hosts_busy': len(_by_host),
+            # Identical value to len(_by_host) (same key set by construction),
+            # but sourced from the lossless map so a future edit to _by_host
+            # cannot silently perturb this count.
+            'hosts_busy': len(_inflight_by_host),
             'by_host': _by_host,
+            'inflight_by_host': _inflight_by_host,
+            'inflight_total': sum(len(v) for v in _inflight_by_host.values()),
         }
 
         return {
@@ -11788,6 +12238,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             'is_wip_halted': self.is_wip_halted,
             'halt_owner_esc_id': self.halt_owner_esc_id,
             'occupancy': occupancy,
+            # 3275 additive key: per-host slot state + quarantine class.
+            # Backward-compatible (no collision with the existing key set);
+            # pure synchronous read via HostAllocator.host_states() — no await,
+            # no I/O.  [] when the allocator has not been built yet.
+            'hosts': self._host_states_block(now),
             # δ/1889 additive key: per-suffix conflict relation (backward-compatible).
             # Populated by recompute_suffix_conflict_graph() after each drain.
             # Read here synchronously — no await; the expensive async build is
@@ -12016,6 +12471,24 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         side-check never affects this method's own return value, which still
         means exactly "a depth heartbeat was emitted".
 
+        Degradation segment (task 3275): when any host is quarantined the line
+        gains ``| DEGRADED <n>/<m> hosts quarantined: <name>=<class>``, and the
+        emitted ``merge_heartbeat`` event's ``data`` gains a ``hosts`` key
+        carrying the same facts structurally (repo structured-facts-at-failure
+        invariant — the log line must not be the only carrier).  It is built
+        from ``snapshot()['hosts']`` rather than from ``occupancy`` **on
+        purpose**: the occupancy suffix is gated on a non-empty ``by_host``, so
+        a pool that is quarantined but idle would report no degradation at all
+        — one of the three 2026-07 incidents where a stuck merge queue was
+        diagnosed only by hand-correlating a ``verifying N/M hosts`` line
+        against allocator internals.  ``<class>`` is ``ru`` (auto-recovers via
+        :meth:`_reprobe_quarantined_hosts`) or ``divergence``
+        (operator-cleared only).
+
+        The ``depth == 0`` no-op gate above is UNCHANGED: a fully idle pipeline
+        still logs nothing even when degraded, so an idle journal is not
+        spammed.  A degraded idle pool stays reachable via ``get_merge_queue``.
+
         MQ-invariants iota (task 1994): immediately after, UNCONDITIONALLY
         and for the same reason, runs the clock-injectable
         :meth:`_check_resource_audit` sweep — a leaked speculation permit/
@@ -12062,12 +12535,34 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 f'{_host_parts}'
             )
 
+        # 3275: degradation segment, built from snap['hosts'] and deliberately
+        # INDEPENDENT of the `if occ['by_host']:` gate above — a quarantined
+        # pool with nothing in flight has an empty by_host and would otherwise
+        # report no degradation at all.
+        _deg = [h for h in snap['hosts'] if h['quarantined']]
+        _deg_suffix = ''
+        if _deg:
+            # No `or <fallback>` on quarantine_class: _host_states_block sets it
+            # to exactly 'ru' or 'divergence' whenever quarantined is True (and
+            # _deg filters on that), so a fallback would be unreachable dead code
+            # that quietly papered over an invariant break. If the invariant ever
+            # does break, the anomalous None renders as-is — visible, not cosmetic
+            # (repo no-silent-fail-soft norm).
+            _deg_parts = ' '.join(
+                f'{h["name"]}={h["quarantine_class"]}' for h in _deg
+            )
+            _deg_suffix = (
+                f' | DEGRADED {len(_deg)}/{len(snap["hosts"])} hosts quarantined: '
+                f'{_deg_parts}'
+            )
+
         logger.info(
             'merge queue heartbeat: %d in pipeline, oldest age=%.0fs, '
-            'head=task %s (state=%s, age=%.0fs)%s',
+            'head=task %s (state=%s, age=%.0fs)%s%s',
             snap['depth'], oldest_age,
             head['task_id'], head['state'], head['age_secs'],
             _occ_suffix,
+            _deg_suffix,
         )
 
         if self._event_store is not None:
@@ -12081,6 +12576,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     'head_of_line': head_of_line,
                     'verify_in_progress': snap['verify_in_progress'],
                     'occupancy': occ,
+                    # 3275: same facts as the DEGRADED log segment, structured —
+                    # a consumer must not have to scrape the line.
+                    'hosts': snap['hosts'],
                 },
             )
 

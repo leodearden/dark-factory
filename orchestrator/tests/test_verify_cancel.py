@@ -923,27 +923,79 @@ time.sleep(300)
 
 
 def _is_running(pid: int) -> bool:
-    """Return True if *pid* is still alive (os.kill(pid, 0) succeeds)."""
+    """Return True if *pid* is alive AND not a zombie.
+
+    ``os.kill(pid, 0)`` succeeding is not enough: it also returns success for
+    zombies (state 'Z') and for processes that were just SIGKILLed but not
+    yet torn down — both are still visible in /proc even though they have
+    already been killed. SIGKILL delivery, orphan reparenting, and the final
+    reap are all asynchronous, so treating a zombie as "alive" turns this
+    check into a wall-clock race under host load rather than a test of
+    whether reaping actually happened. A zombie has already been killed; its
+    lingering /proc entry just means its parent hasn't called wait() yet.
+    """
     import os
     try:
         os.kill(pid, 0)
-        return True
-    except (ProcessLookupError, OSError):
+    except OSError:
+        # Covers ProcessLookupError (no such pid) — a subclass of OSError —
+        # alongside PermissionError and friends.
         return False
+    try:
+        stat = Path(f'/proc/{pid}/stat').read_text()
+        # Format: "pid (comm) state ...". comm may itself contain ')' or
+        # spaces, so split on the LAST ')' to reliably find the state field.
+        state = stat.rsplit(')', 1)[1].split()[0]
+    except (OSError, IndexError):
+        # Vanished between kill(0) and reading /proc (FileNotFoundError is
+        # itself an OSError subclass), or /proc unreadable — either way it
+        # is not confirmed running.
+        return False
+    return state != 'Z'
 
 
-def _wait_for_file(path, timeout=10.0, interval=0.1):
-    """Poll until *path* exists or *timeout* expires. Return True if found."""
+def _poll_until(predicate, timeout, interval=0.1):
+    """Poll *predicate* (a zero-arg callable) until truthy, or *timeout* expires.
+
+    Checks immediately, then every *interval* seconds; returns True the
+    moment *predicate()* is truthy, False once *timeout* elapses first. This
+    is the one poll/backoff primitive for the module — both
+    :func:`_wait_for_file` and :func:`_wait_until_all_dead` are expressed in
+    terms of it, rather than each hand-rolling its own deadline loop (the
+    same shape recurs as ``_wait_until`` in test_harness_resume_scheduler.py
+    and ``wait_until`` in test_lane_lock_leak_guard.py).
+    """
     import time
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if path.exists():
+        if predicate():
             return True
         time.sleep(interval)
     return False
 
 
-@pytest.mark.timeout(30)
+def _wait_for_file(path, timeout=10.0, interval=0.1):
+    """Poll until *path* exists or *timeout* expires. Return True if found."""
+    return _poll_until(path.exists, timeout, interval)
+
+
+def _wait_until_all_dead(pids, timeout=5.0, interval=0.02):
+    """Poll until every pid in *pids* is dead per :func:`_is_running`.
+
+    Returns whatever pids are still alive once *timeout* expires (empty if
+    all died sooner). Used instead of a fixed sleep so the check only waits
+    as long as the async SIGKILL/reparent/reap sequence actually takes on
+    this host, while still failing loudly if a pid never dies: a genuinely
+    un-reaped ``start_new_session`` escapee keeps sleeping (state 'S'/'R')
+    and will still be in the returned list at the deadline.
+    """
+    _poll_until(
+        lambda: not any(_is_running(pid) for pid in pids), timeout, interval
+    )
+    return [pid for pid in pids if _is_running(pid)]
+
+
+@pytest.mark.timeout(60)
 def test_cancel_request_reaps_start_new_session_escapes(tmp_path):
     """cancel_request reaps root AND start_new_session-escaped descendants.
 
@@ -986,24 +1038,31 @@ def test_cancel_request_reaps_start_new_session_escapes(tmp_path):
     # Run cancel_request (uses real /proc walk internally)
     rc = cancel_request(pgid_file_path)
 
-    # Allow a brief window for processes to be reaped
-    time.sleep(0.5)
-
     assert rc == 0, f'cancel_request returned {rc}, expected 0'
     assert not pgid_file_path.exists(), 'pgid file must be removed on success'
 
-    # Reap root_proc zombie BEFORE checking alive status.
-    # cancel_request kills root with SIGKILL, which makes it a zombie (state 'Z')
-    # until its parent (this test process) calls wait().  os.kill(pid, 0) returns
-    # success for zombies — they are still in /proc — so the alive check below
-    # would incorrectly report root as alive if we don't wait first.
+    # Reap the root zombie so this pytest process doesn't leak a child entry,
+    # and to confirm root actually exited (rather than merely left the
+    # tracked-pid set for some other reason). Note this is no longer
+    # load-bearing for the alive check below: _is_running already treats
+    # state 'Z' as dead, so a not-yet-reaped root zombie wouldn't be
+    # misreported as alive even without this wait.
     root_proc.wait(timeout=5)
 
-    # All tracked pids (including start_new_session escapes) must be dead
-    still_alive = [pid for pid in all_pids if _is_running(pid)]
+    # Poll (rather than sleep a fixed amount) until every tracked pid is
+    # confirmed dead. SIGKILL delivery, orphan reparenting to init, and the
+    # final reap are all asynchronous — a fixed sleep races host scheduling
+    # load, while a bounded poll only waits as long as actually needed and
+    # still fails loudly if a pid is never reaped (see _wait_until_all_dead).
+    # timeout is intentionally left at _wait_until_all_dead's own default
+    # (single source of truth) rather than repeated here.
+    still_alive = _wait_until_all_dead(all_pids)
     assert still_alive == [], (
         f'These pids survived cancel_request (start_new_session escapes not reaped?): '
-        f'{still_alive}'
+        f'{still_alive}. (On the off chance one of these pid numbers was '
+        f'recycled by the host to an unrelated process during the poll '
+        f'window rather than being a genuine escapee, cross-check it '
+        f'against read_ppid_map() output captured around this time.)'
     )
 
 

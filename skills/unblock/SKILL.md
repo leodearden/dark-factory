@@ -38,29 +38,69 @@ just made visible:
 
 ```bash
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-claim \
-  --name "unblock-<project>#<TASK_ID>" --slug "unblock-<project>-<TASK_ID>-$$" --pid $$ \
+  --name "unblock-<project>#<TASK_ID>" \
+  --slug "unblock-<project>-<TASK_ID>-${CLAUDE_PID:-$PPID}" \
   --policy warn-and-proceed
 ```
 
+**Never `$$` — it is both the wrong pid and an unusable slug.** Inside a Claude Code Bash tool call
+`$$` is the transient `/bin/bash -c` wrapper, dead the instant the call returns; the long-lived
+`claude` process is `$CLAUDE_PID` (fall back to `$PPID`) — verify with
+`ps -o comm= -p "${CLAUDE_PID:-$PPID}"`, which prints `claude`. A `$$` pid makes the lease's liveness
+guard inert (every holder reads as dead), and a `$$` slug is unusable as an identity because each
+Bash tool call gets a fresh one — so the release below would present a slug that never matches what
+you claimed with, and be refused. `${CLAUDE_PID:-$PPID}` is stable across tool calls (task 3994).
+`--pid` is now optional and resolves from `$CLAUDE_PID` inside the CLI; pass it only as an explicit
+operator override. With `$CLAUDE_PID` unset the CLI records **pid 0**, a never-alive sentinel that
+degrades the lease to heartbeat-only staleness (loudly logged) instead of recording an unrelated
+durable pid that would leave the lease unreapable forever.
+
 (`<project>` is the same short project token used elsewhere for this task, e.g. the basename of
-`PROJECT_ROOT`.) Parse the two printed lines (`decision=<acquired|proceed>` + message):
+`PROJECT_ROOT`.) Parse the printed lines (`decision=<acquired|proceed>`, message, then
+`holder_liveness=<none|held|orphaned>`):
 
 - **`decision=proceed` with a holder reported in the message**: surface that line verbatim to the
-  user (`lease held by <session> (alive|dead, heartbeat Ns ago) — proceeding anyway`) — this is
-  exactly the near-duplicate second-`/unblock`-on-the-same-task case (reify 06-28) — then continue
-  normally into Step 1. Never stand down or exit; `warn-and-proceed` never blocks this session.
-- **`decision=acquired`**: no prior holder; continue normally.
+  user — this is exactly the near-duplicate second-`/unblock`-on-the-same-task case (reify 06-28) —
+  then continue normally into Step 1. Never stand down or exit; `warn-and-proceed` never blocks this
+  session. The message names the two axes separately, e.g.
+
+  ```
+  lease held by unblock-df-2085-1348600 (pid 1348600 alive, heartbeat 42s ago) — proceeding anyway
+  lease held by unblock-df-2085-1348600 (pid 1348600 is not running, but its heartbeat is FRESH —
+  42s ago; the lease is still held and is NOT reclaimable for another 7158s) — proceeding anyway
+  ```
+
+  A fresh heartbeat means the holder is still held even when its pid reads as not running; a lease is
+  only stale with BOTH a dead pid and a heartbeat past the TTL. `holder_liveness=orphaned` restates
+  the pid half on its own — the pid in the lease body is not running, and that is the whole signal —
+  worth mentioning to the user, but it changes nothing here: `warn-and-proceed` continues either
+  way, and you never force-release someone else's lease to "clean up".
+- **`decision=acquired`**: no prior holder; continue normally. It prints `holder_liveness=none` —
+  there is no contending holder to report, the lease is yours.
+
+To inspect a lease, use `lease-show --name "unblock-<project>#<TASK_ID>"` — never `cat`, which shows
+the holder's immutable `start_ts` but cannot show freshness (the heartbeat is the file's mtime).
 
 **Fail-soft.** A lease-substrate fault also reports `decision=proceed` (fail-open), just with no
 holder to report — note it in passing and continue; a lease fault must never block an `/unblock`
 session.
 
 **Release on exit.** When this `/unblock` session ends (Step 4.5 reflect, or an early stop), release
-the lease so it doesn't linger and falsely report a holder to the next `/unblock` on this task:
+the lease so it doesn't linger and falsely report a holder to the next `/unblock` on this task. The
+slug is **required** and must be the one you claimed with — a mismatch is refused, so one `/unblock`
+session can never release another's lease:
 
 ```bash
-python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-release --name "unblock-<project>#<TASK_ID>"
+python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-release \
+  --name "unblock-<project>#<TASK_ID>" \
+  --slug "unblock-<project>-<TASK_ID>-${CLAUDE_PID:-$PPID}"
 ```
+
+It prints `result=<applied|forced|absent|refused|faulted>` first. `applied` = released; `absent` =
+nothing to release (idempotent, not an error); `refused` = you are not the holder, nothing was
+touched — inspect with `lease-show` rather than reflexively re-running with `--force` (`--force` is
+operator recovery and is logged loudly naming both parties); `faulted` = a substrate error, logged
+and swallowed so it cannot break your exit path.
 
 ---
 

@@ -210,9 +210,17 @@ class AllAccountsCappedException(Exception):
 #
 # KEEP IN SYNC with the CLI's built-in tool names: a *future new* built-in tool
 # would not be auto-denied by this list.  Accepted because (a) these prompts forbid
-# tool use, (b) no ``mcp_config`` is wired for these callers (MCP tools absent), and
-# (c) a future change to the CLI's tool-exclusion semantics is caught loudly by the
-# ``schema_tool_denied`` detection below rather than degrading silently.
+# tool use, and (b) a future change to the CLI's tool-exclusion semantics is caught
+# loudly by the ``schema_tool_denied`` detection below rather than degrading silently.
+#
+# SCOPE — BUILT-INS ONLY: this list contains no MCP tool pattern, so expanding the
+# ``'*'`` narrows the deny to built-ins and leaves every MCP tool REACHABLE.  That
+# is invisible only while no MCP server is in play; the CLI ambient-merges the
+# project-scoped ``.mcp.json`` found at ``cwd``, so a wildcard-deny caller running
+# at a cwd that carries one (e.g. the project root) silently regains MCP tools —
+# under ``bypassPermissions``, that is unreviewed write access.  Such a caller MUST
+# ALSO pass ``mcp_config=no_mcp_servers_config()`` with ``strict_mcp_config=True``
+# to keep MCP tools out of reach; denying built-ins alone does not do it.
 _SCHEMA_OUTPUT_TOOL = 'StructuredOutput'
 _REAL_BUILTIN_TOOLS_DENYLIST = [
     'Bash',
@@ -234,6 +242,32 @@ _REAL_BUILTIN_TOOLS_DENYLIST = [
     'ExitPlanMode',
     'SlashCommand',
 ]
+
+
+def no_mcp_servers_config() -> dict[str, Any]:
+    """Build a FRESH scoping ``mcp_config`` carrying ZERO MCP servers.
+
+    For callers that pass ``disallowed_tools=['*']`` and must keep MCP tools
+    unreachable even when an ``output_schema`` forces the wildcard expansion
+    above (which denies built-ins ONLY).  Paired with
+    ``strict_mcp_config=True`` this emits ``--mcp-config <file>
+    --strict-mcp-config``, scoping the invocation to the file's server set —
+    i.e. nothing — instead of ambient-merging the ``.mcp.json`` at the
+    caller's ``cwd``.
+
+    MUST STAY TRUTHY.  ``--strict-mcp-config`` is emitted only inside the
+    ``if mcp_config:`` block of ``build_claude_argv``, so "simplifying" the
+    return value to a bare ``{}`` would skip both flags and silently reinstate
+    ambient MCP access while still reading as correct at every call site.
+
+    A FACTORY, deliberately, not a module-level constant: a shared dict hands
+    every caller the same mutable object, so a single in-place
+    ``cfg['mcpServers']['some-server'] = ...`` would silently widen MCP access
+    for every other consumer — under ``bypassPermissions`` — with nothing but a
+    comment forbidding it and no test able to catch it.  Each call returns a
+    fresh, unaliased dict, so no caller can reach shared state.
+    """
+    return {'mcpServers': {}}
 
 
 @dataclass

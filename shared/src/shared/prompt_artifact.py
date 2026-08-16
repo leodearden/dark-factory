@@ -27,10 +27,8 @@ same on-disk state.
 
 from __future__ import annotations
 
-import contextlib
 import os
 import shutil
-import tempfile
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,6 +36,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+from shared import safe_io
 from shared.safe_io import load_json_or_warn
 
 __all__ = [
@@ -189,27 +188,27 @@ def _load_valid_provenance(
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
-    """Write *text* to *path* via temp-in-dir + os.replace (safe_io.py's pattern).
+    """Write *text* to *path* via temp-in-dir + os.replace.
 
-    The temp file comes from :func:`tempfile.mkstemp` — an OS-guaranteed
-    fresh, exclusively-created name — rather than a name derived only from
-    ``os.getpid()``. Two threads in the same process (e.g. a T6 optimization
-    loop evaluating candidates concurrently) pinning the same key at the same
-    time would otherwise share one ``<name>.<pid>.tmp`` path and could
-    clobber each other's in-flight write.
+    Delegates to :func:`shared.safe_io.atomic_write_text`, which task 3223
+    consolidated from this function and three byte-identical copies of it. The
+    arguments state this site's semantics explicitly: ``mode=0o600`` reproduces
+    what the previous :func:`tempfile.mkstemp` call created, and utf-8 was
+    already the encoding. No fsync and no parent-creation, as before.
+
+    The unique-per-writer temp name still matters here for the reason it always
+    did: two threads in the same process (e.g. a T6 optimization loop
+    evaluating candidates concurrently) pinning the same key at the same time
+    must not share one temp path and clobber each other's in-flight write.
 
     A reader never observes a half-written file: either the old contents (if
     any) or the complete new contents, never a truncated partial write.
+
+    Kept as a module-level name rather than inlined at its call sites because
+    shared/tests/test_prompt_artifact.py monkeypatches it to simulate write
+    failures.
     """
-    fd, tmp_name = tempfile.mkstemp(suffix='.tmp', prefix=f'{path.name}.', dir=str(path.parent))
-    try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            f.write(text)
-        os.replace(tmp_name, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_name)
-        raise
+    safe_io.atomic_write_text(path, text, encoding='utf-8', mode=0o600)
 
 
 class PromptArtifactStore:

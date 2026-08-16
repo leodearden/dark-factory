@@ -29,6 +29,7 @@ import contextlib
 import fcntl
 import os
 import re
+import select
 import socket
 import subprocess
 import sys
@@ -199,6 +200,19 @@ def subprocess_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     return env
 
 
+def stderr_tail(raw: bytes, *, limit: int = 2000) -> str:
+    """Decode *raw* subprocess stderr and keep the TAIL (last *limit* chars).
+
+    The actionable line (a traceback's final ``Error: ...``, a watchdog
+    self-kill message) consistently sits at the END of a subprocess's
+    stderr, so a head slice silently discards it -- task 3318 hit exactly
+    this bug from a head-truncated assertion message.  ``errors='replace'``
+    so a slice landing mid multi-byte UTF-8 sequence can't itself raise and
+    mask the real failure being reported.
+    """
+    return raw.decode(errors='replace')[-limit:]
+
+
 def apply_dispatcher_env(monkeypatch) -> None:
     """Patch THIS process's os.environ for a direct (in-process) real-dispatcher call.
 
@@ -360,7 +374,14 @@ def wait_for_pgid_file(path: Path, *, timeout: float = 20.0, interval: float = 0
     raise AssertionError(f'pgid file {path} did not appear within {timeout}s')
 
 
-def wait_subtree_live(pgid: int, *, timeout: float = 20.0, interval: float = 0.05) -> set[int]:
+def wait_subtree_live(
+    pgid: int,
+    *,
+    proc: subprocess.Popen | None = None,
+    proc_label: str = 'leader',
+    timeout: float = 20.0,
+    interval: float = 0.05,
+) -> set[int]:
     """Poll until *pgid* has at least one live descendant; return the descendant set.
 
     Raises AssertionError on timeout -- a live sleeper never appearing means
@@ -374,6 +395,30 @@ def wait_subtree_live(pgid: int, *, timeout: float = 20.0, interval: float = 0.0
     marker file the build's shell command touches) must poll for that
     artifact directly -- see :func:`wait_for_marker` -- rather than treating
     "subtree live" as a proxy for "build has started".
+
+    *proc* is the already-spawned leader (or, for a caller observing a
+    SEPARATE dispatcher process, that dispatcher) whose ``stdout``/``stderr``
+    were opened with ``subprocess.PIPE`` -- see :func:`spawn_verify_merge`.
+    It's optional so no existing call site is forced to change semantics.
+    *proc_label* names *proc* in the failure message (default ``"leader"``);
+    pass e.g. ``proc_label="dispatcher"`` when *proc* is a stand-in process
+    rather than the leader itself (e.g. the SSH dispatcher in the Row 1
+    orchestrator-killed test), so a reader doesn't apply the rc taxonomy
+    below to the wrong process.  When *proc* is given, a timeout failure
+    names its exit status (``<proc_label> rc=<n|None>``).  For the LEADER
+    specifically, that rc distinguishes a watchdog self-kill (rc == 1, no
+    ``Error:`` line), an exception exit (rc == 1 WITH an ``Error:`` line),
+    and a merely slow leader (rc is None) -- three causes that were
+    otherwise indistinguishable in every log this timeout has ever
+    produced; a non-leader *proc* follows its own exit-code conventions,
+    not this taxonomy.  ``stderr`` is read ONLY when ``proc.poll()`` is not
+    None, and even then via a ``select()``-bounded raw read (2s ceiling)
+    rather than a buffered ``.read()`` (which blocks to EOF): ``poll()``
+    only reports *proc*'s own exit, and a short-lived helper it spawned
+    with inherited fds could still be holding the pipe's write end open,
+    which would hang this helper (and the rest of the suite) rather than
+    raise.  The tail (not head) is kept -- see :func:`stderr_tail` -- since
+    the actionable line is at the END.
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -381,7 +426,28 @@ def wait_subtree_live(pgid: int, *, timeout: float = 20.0, interval: float = 0.0
         if descendants:
             return descendants
         time.sleep(interval)
-    raise AssertionError(f'pgid {pgid}: no descendant appeared within {timeout}s')
+    message = f'pgid {pgid}: no descendant appeared within {timeout}s'
+    if proc is not None:
+        rc = proc.poll()
+        message += f'; {proc_label} rc={rc}'
+        if rc is not None and proc.stderr is not None:
+            try:
+                chunks = []
+                read_deadline = time.monotonic() + 2.0
+                fd = proc.stderr.fileno()
+                while True:
+                    remaining = read_deadline - time.monotonic()
+                    if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+                        break
+                    chunk = os.read(fd, 65536)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                tail = stderr_tail(b''.join(chunks))
+            except Exception as e:  # noqa: BLE001
+                tail = f'<unreadable: {e!r}>'
+            message += f'; stderr tail:\n{tail}'
+    raise AssertionError(message)
 
 
 def wait_for_marker(path: Path, *, timeout: float = 20.0, interval: float = 0.05) -> None:
@@ -743,7 +809,7 @@ def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
 
     assert proc.returncode == 0, (
         f'expected exit 0 (contention result on stdout), got {proc.returncode}; '
-        f'stderr={stderr.decode()[:2000]!r}'
+        f'stderr={stderr_tail(stderr)!r}'
     )
     result = result_from_json(stdout.decode())
     assert result.category == FLOCK_CONTENTION_CATEGORY, (
@@ -763,7 +829,7 @@ def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
         'timing bootstrap patches orchestrator.cli.acquire_merge_verify_flock, '
         'so zero observations means the gate is no longer reached through that '
         'name and the ceiling assertion below would be vacuous; '
-        f'stderr={stderr.decode()[:2000]!r}'
+        f'stderr={stderr_tail(stderr)!r}'
     )
     longest = max(w.waited_secs for w in waits)
     assert longest < FLOCK_WAIT_CEILING_SECS, (
@@ -997,7 +1063,7 @@ def test_cancel_verify_tree_kills_under_live_watchdog(tmp_path, monkeypatch):
     heartbeat = HeartbeatWriter(child, interval=0.2).start()
     try:
         pgid_val = wait_for_pgid_file(pgf)
-        wait_subtree_live(pgid_val)
+        wait_subtree_live(pgid_val, proc=child)
 
         monkeypatch.setattr(cli_module, 'load_config', lambda _path: config_obj)
         result = CliRunner().invoke(main, [
@@ -1080,7 +1146,9 @@ def test_orchestrator_killed_mid_build_tree_killed_via_eof(tmp_path):
     )
     try:
         pgid_val = wait_for_pgid_file(pgf)
-        wait_subtree_live(pgid_val)
+        # Row 1 owns the DISPATCHER process, not the leader -- the leader's
+        # own stdout/stderr aren't piped to this test, so pass the dispatcher.
+        wait_subtree_live(pgid_val, proc=dispatcher, proc_label='dispatcher')
 
         dispatcher.kill()
         dispatcher.wait(timeout=10)
@@ -1148,7 +1216,7 @@ def test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive(tmp_path):
     heartbeat = HeartbeatWriter(child, interval=0.2).start()
     try:
         pgid_val = wait_for_pgid_file(pgf)
-        wait_subtree_live(pgid_val)
+        wait_subtree_live(pgid_val, proc=child)
 
         heartbeat.close_stdin()
 
@@ -1229,7 +1297,7 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
     heartbeat = HeartbeatWriter(child, interval=0.2).start()
     try:
         pgid_val = wait_for_pgid_file(pgf)
-        wait_subtree_live(pgid_val)
+        wait_subtree_live(pgid_val, proc=child)
 
         heartbeat.stop_heartbeats()
         assert child.stdin is not None and not child.stdin.closed, (
@@ -1325,7 +1393,7 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
     heartbeat_holder = HeartbeatWriter(holder, interval=0.2).start()
     try:
         holder_pgid_val = wait_for_pgid_file(pgf_holder)
-        wait_subtree_live(holder_pgid_val)
+        wait_subtree_live(holder_pgid_val, proc=holder)
 
         persistent_wt = worktree_base / '_merge-verify'
         marker = persistent_wt / 'target' / 'warm.marker'
@@ -1358,7 +1426,7 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
             # task 3318: tail-sliced (not head-truncated) -- the actual
             # failure cause (e.g. a watchdog self-kill traceback) is at the
             # END of stderr, and a 2000-char head slice was hiding it.
-            f'{waiter.returncode}; stderr={stderr.decode()[-4000:]!r}'
+            f'{waiter.returncode}; stderr={stderr_tail(stderr, limit=4000)!r}'
         )
         result = result_from_json(stdout.decode())
         assert is_flock_contention_failure(result), (

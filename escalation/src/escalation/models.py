@@ -49,6 +49,31 @@ class TrainState(TypedDict):
     failing_member: str   # this task's id (the one that triggered BLOCKED)
 
 
+class IndexHealthState(TypedDict):
+    """FalkorDB index-provisioning drift context for `recon_missing_index` (task 3709).
+
+    Shape mirrors the record produced by
+    fused_memory.reconciliation.index_health.summarize_index_health(), projected
+    by the drift detector (PRD δ, D8 + D11).
+
+    The drifted graph and the missing specs are carried as FIRST-CLASS FIELDS so
+    no consumer parses `summary`/`detail` prose to recover a fact the emitter
+    already had in a variable (INV-2).
+
+    Index specs are stored as JSON LISTS, never tuples: a tuple deserialises
+    back as a list, so storing tuples would make the on-disk record fail to
+    round-trip identically and break equality for any payload comparison.
+
+    TypedDict at runtime is a plain dict; existing from_dict / to_dict /
+    asdict() paths are unaffected — round-trip fidelity is unchanged.
+    """
+
+    group_id: str                  # the graph whose index state drifted
+    missing: list[list[str]]       # expected-but-absent specs, sorted
+    unexpected: list[list[str]]    # present-but-unexpected specs (reported, never acted on)
+    expected_total: int            # size of the expected set this was diffed against
+
+
 class EvidenceEntry(TypedDict):
     """A single structured raw-OBSERVATION backing an escalation (task 2558).
 
@@ -111,7 +136,14 @@ class Escalation:
     severity: str  # "blocking" | "info" | "critical" | "urgent"
     category: str  # scope_violation, design_concern, cleanup_needed,
     # dependency_discovered, risk_identified, infra_issue,
-    # reconciliation_stale_human_operator, reconciliation_stale_gate_backlog
+    # reconciliation_stale_human_operator, reconciliation_stale_gate_backlog,
+    # recon_missing_index
+    # REFACTOR TRIGGER (task 3709): this vocabulary is prose, not a checked
+    # contract — nothing rejects a typo'd category at submit time, and the
+    # dedup correctness of every categorized detector depends on filer and
+    # reader spelling it identically.  The NEXT category addition promotes
+    # this comment to an enum (or a submit-time lint) instead of growing
+    # another line.
     summary: str  # one-line
     detail: str = ''  # full context
     suggested_action: str = ''  # expand_scope, create_followup_task, abort_task, etc.
@@ -145,6 +177,15 @@ class Escalation:
     # None for all non-train escalations; legacy JSON (pre-field) deserialises to None
     # via the from_dict __dataclass_fields__ filter — no migration required.
     train_state: TrainState | None = None
+    # PRD δ (task 3709) — FalkorDB index-provisioning drift context for
+    # `recon_missing_index` escalations filed by the reconciliation harness's
+    # index drift detector.  None for every other escalation kind; legacy JSON
+    # (pre-field) deserialises to None via the from_dict __dataclass_fields__
+    # filter — zero migration, same pattern as members / train_state above.
+    # to_dict's asdict() serialises it for free, and submit / submit_resolved /
+    # _atomic_write / resolve / park / stamp_triage are field-agnostic
+    # passthroughs that need no change.
+    index_health: IndexHealthState | None = None
     # C1 action chosen at resolve_issue time (resume/restart/park/abandon/close_only).
     # None for records resolved before α1 or for L2 cascade members (β derives theirs
     # from the parent via resolved_by='l2-cascade:<id>' attribution).

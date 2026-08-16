@@ -55,11 +55,9 @@ code path rather than a habit each module keeps locally.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import re
-import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -72,6 +70,8 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+
+from shared import safe_io
 
 __all__ = [
     'RUN_STAMP_ENV_VAR',
@@ -550,28 +550,22 @@ def render_report(series: MetricSeries) -> str:
 def _atomic_write_text(path: Path, text: str) -> None:
     """Write *text* to *path* via temp-in-dir + os.replace.
 
-    Copied from ``shared.prompt_artifact._atomic_write_text`` rather than
-    imported (it is module-private there, and ``shared.safe_io`` has only a
-    lenient reader — there is no atomic writer in ``shared/`` to reuse). The
-    temp file comes from :func:`tempfile.mkstemp` — an OS-guaranteed fresh,
-    exclusively-created name — rather than a pid-derived one, because the
-    memory-eval runners (PRD leaves β/γ/δ) all write under a single artifact
-    root and a shared ``<name>.<pid>.tmp`` would let concurrent writers clobber
-    each other's in-flight write.
+    Delegates to :func:`shared.safe_io.atomic_write_text` (task 3223, which
+    consolidated the four copies of this writer that used to exist). The
+    arguments preserve exactly what the previously-inlined body produced:
+    ``mode=0o600`` matches the :func:`tempfile.mkstemp` create, utf-8 was
+    already the encoding, and this site neither fsynced nor created its parent.
+
+    The unique-per-writer temp name the shared helper guarantees is what this
+    site always needed: the memory-eval runners (PRD leaves β/γ/δ) all write
+    under a single artifact root, and a shared ``<name>.<pid>.tmp`` would let
+    concurrent writers clobber each other's in-flight write.
 
     A reader never observes a half-written file: either the old contents (if
     any) or the complete new contents. On any failure the temp is unlinked and
     the exception re-raised, so a failed write leaves nothing behind.
     """
-    fd, tmp_name = tempfile.mkstemp(suffix='.tmp', prefix=f'{path.name}.', dir=str(path.parent))
-    try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as fh:
-            fh.write(text)
-        os.replace(tmp_name, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_name)
-        raise
+    safe_io.atomic_write_text(path, text, encoding='utf-8', mode=0o600)
 
 
 def write_metric_series(

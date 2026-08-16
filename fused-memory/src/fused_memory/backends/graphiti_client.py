@@ -26,7 +26,9 @@ from graphiti_core.errors import EdgeNotFoundError
 from graphiti_core.errors import NodeNotFoundError as GraphitiCoreNodeNotFoundError
 from graphiti_core.helpers import validate_group_ids
 from graphiti_core.llm_client import OpenAIClient
+from graphiti_core.llm_client.client import LLMClient
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
+from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
 from graphiti_core.nodes import EpisodeType, EpisodicNode
 
 from fused_memory.backends.falkor_fulltext import build_query
@@ -40,6 +42,8 @@ from fused_memory.backends.falkor_indices import (
     plan_index_statements,
     resolve_header_positions,
 )
+from fused_memory.backends.llm_clients import ForceJsonObjectOpenAIGenericClient
+from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
 from fused_memory.config.schema import FusedMemoryConfig, OpenAIProviderConfig
 from fused_memory.utils.async_utils import gather_or_raise
 from fused_memory.utils.toolcall_xml_leak import has_toolcall_xml_leak
@@ -131,6 +135,130 @@ def check_openai_responses_api() -> None:
         "and restart the service to install a compatible openai version. "
         "(task 2053)"
     )
+
+
+def build_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
+    """Construct the graphiti LLM client from unified config, or None.
+
+    Returns None when the configured provider block is absent or carries no
+    api_key — the same "run without an LLM" posture ``initialize()`` has always
+    had.
+
+    Deliberately module-level and public: this is the DRIVER-FREE construction
+    seam. Callers that need an LLM client for a single arm (e.g. an evaluation
+    harness building one client per candidate model) must not have to call
+    ``GraphitiBackend.initialize()`` to get one — that would construct a
+    ``_MultiTenantFalkorDriver``, and ``FalkorDriver.__init__`` fire-and-forgets
+    ``build_indices_and_constraints()``, creating indices on a real graph. That
+    is a binding project hazard (docs/prds/falkordb-index-provisioning.md), and
+    a seam that makes it structurally unreachable is a far stronger guarantee
+    than a monkeypatch at every call site.
+
+    ``cfg.llm.client_class`` selects among the OpenAI-shaped clients only; the
+    anthropic branch is unaffected by it.
+    """
+    # LLMConfig's validator already rejects this combination at construction,
+    # but pydantic does not re-validate on attribute assignment, so a config
+    # mutated after loading — how tests and per-arm harnesses build variants —
+    # reaches here unchecked. Warn rather than raise: by this point the config
+    # is loaded and a hard failure would take down a server over a knob that is
+    # merely inert. Covers the anthropic arm too, where the mode is equally
+    # meaningless.
+    if cfg.llm.structured_output_mode != 'auto' and cfg.llm.client_class != 'openai_generic':
+        logger.warning(
+            f'llm.structured_output_mode={cfg.llm.structured_output_mode!r} is IGNORED: '
+            f'it applies only to llm.client_class="openai_generic", and client_class is '
+            f'{cfg.llm.client_class!r} (provider={cfg.llm.provider!r}). The client being '
+            'built will use its stock structured-output behaviour.'
+        )
+
+    if cfg.llm.provider == 'openai' and cfg.llm.providers.openai:
+        api_key = cfg.llm.providers.openai.api_key
+        if api_key:
+            # api_url has a non-None default ('https://api.openai.com/v1',
+            # config/schema.py OpenAIProviderConfig), so base_url below is now
+            # ALWAYS passed. That makes config authoritative over the ambient
+            # OPENAI_BASE_URL / OPENAI_API_BASE fallback the openai SDK would
+            # otherwise apply — which is the point of this plumbing, but it is
+            # not a no-op for a site that routes through a gateway by exporting
+            # OPENAI_BASE_URL without setting OPENAI_API_URL: that traffic now
+            # goes back to api.openai.com. An egress/billing change must not be
+            # silent, hence the warning.
+            warn_if_ambient_base_url_is_overridden(
+                cfg.llm.providers.openai.api_url, context='graphiti LLM',
+            )
+            llm_config = GraphitiLLMConfig(
+                api_key=api_key,
+                model=cfg.llm.model,
+                small_model=cfg.llm.model,
+                temperature=cfg.llm.temperature or 0.0,
+                max_tokens=cfg.llm.max_tokens,
+                # Mirrors the embedder (see initialize()) and the reranker,
+                # which have always passed the configured endpoint. The LLM
+                # path was the outlier: a configured api_url was silently
+                # dropped in favour of the openai SDK default.
+                base_url=cfg.llm.providers.openai.api_url,
+            )
+            llm_client: LLMClient
+            if cfg.llm.client_class == 'openai_generic':
+                # No preflight on this arm — deliberately. Its sole purpose is
+                # to guard OpenAIClient's client.responses.create call (see
+                # check_openai_responses_api above); OpenAIGenericClient drives
+                # chat.completions and never resolves that SDK surface, so the
+                # check is both unnecessary here and actively harmful — it
+                # would abort an otherwise-valid local endpoint on a
+                # requirement that endpoint does not have.
+                #
+                # max_tokens= is NOT redundant with GraphitiLLMConfig(max_tokens=...)
+                # above, and must not be "simplified" away: OpenAIGenericClient
+                # .__init__ declares its own `max_tokens: int = 16384` and
+                # re-assigns `self.max_tokens = max_tokens` immediately after
+                # super().__init__() has correctly set it from the config
+                # object. _generate_response then sends `self.max_tokens`,
+                # ignoring its per-call argument — so this constructor kwarg is
+                # the ONLY lever that reaches the wire. Without it every request
+                # on this arm asks for 16384 output tokens regardless of
+                # configuration, which a local endpoint may reject outright or
+                # which may overrun its served context.
+                # ForceJsonObjectOpenAIGenericClient overrides only
+                # _generate_response, so it inherits this __init__ unchanged —
+                # which is why the mode can select the CLASS and leave one
+                # shared construction call. Keeping a single call site is
+                # deliberate: two copies of the argument list are how one arm
+                # silently drifts from the other when a kwarg is added.
+                generic_cls: type[OpenAIGenericClient] = (
+                    ForceJsonObjectOpenAIGenericClient
+                    if cfg.llm.structured_output_mode == 'json_object'
+                    else OpenAIGenericClient
+                )
+                llm_client = generic_cls(config=llm_config, max_tokens=cfg.llm.max_tokens)
+            else:
+                check_openai_responses_api()
+                llm_client = OpenAIClient(config=llm_config)
+            logger.info(
+                f'Graphiti LLM: {cfg.llm.provider}/{cfg.llm.model} '
+                f'({type(llm_client).__name__})'
+            )
+            return llm_client
+    elif cfg.llm.provider == 'anthropic' and cfg.llm.providers.anthropic:
+        api_key = cfg.llm.providers.anthropic.api_key
+        if api_key:
+            try:
+                from graphiti_core.llm_client.anthropic_client import AnthropicClient
+
+                llm_config = GraphitiLLMConfig(
+                    api_key=api_key,
+                    model=cfg.llm.model,
+                    temperature=cfg.llm.temperature or 0.0,
+                    max_tokens=cfg.llm.max_tokens,
+                )
+                llm_client = AnthropicClient(config=llm_config)
+                logger.info(f'Graphiti LLM: {cfg.llm.provider}/{cfg.llm.model}')
+                return llm_client
+            except ImportError:
+                logger.warning('Anthropic client not available for Graphiti')
+
+    return None
 
 
 def _canonicalize_group_args(func):
@@ -541,36 +669,7 @@ class GraphitiBackend:
         cfg = self.config
 
         # --- LLM client ---
-        llm_client = None
-        if cfg.llm.provider == 'openai' and cfg.llm.providers.openai:
-            api_key = cfg.llm.providers.openai.api_key
-            if api_key:
-                check_openai_responses_api()
-                llm_config = GraphitiLLMConfig(
-                    api_key=api_key,
-                    model=cfg.llm.model,
-                    small_model=cfg.llm.model,
-                    temperature=cfg.llm.temperature or 0.0,
-                    max_tokens=cfg.llm.max_tokens,
-                )
-                llm_client = OpenAIClient(config=llm_config)
-                logger.info(f'Graphiti LLM: {cfg.llm.provider}/{cfg.llm.model}')
-        elif cfg.llm.provider == 'anthropic' and cfg.llm.providers.anthropic:
-            api_key = cfg.llm.providers.anthropic.api_key
-            if api_key:
-                try:
-                    from graphiti_core.llm_client.anthropic_client import AnthropicClient
-
-                    llm_config = GraphitiLLMConfig(
-                        api_key=api_key,
-                        model=cfg.llm.model,
-                        temperature=cfg.llm.temperature or 0.0,
-                        max_tokens=cfg.llm.max_tokens,
-                    )
-                    llm_client = AnthropicClient(config=llm_config)
-                    logger.info(f'Graphiti LLM: {cfg.llm.provider}/{cfg.llm.model}')
-                except ImportError:
-                    logger.warning('Anthropic client not available for Graphiti')
+        llm_client = build_llm_client(cfg)
 
         # --- Embedder ---
         embedder_client = None

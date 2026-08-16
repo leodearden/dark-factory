@@ -2181,33 +2181,35 @@ project's get_statuses call already targets."""
 
 
 def _post_mcp_tool_call(url: str, tool_name: str, arguments: dict) -> dict:
-    """POST one JSON-RPC ``tools/call`` envelope to *url* and unwrap the
-    result via ``census_trigger._extract_tool_result`` (reused rather than
-    reimplemented -- the same MCP envelope shape applies everywhere in this
-    codebase). ``httpx`` is imported lazily so importing this module for its
-    unit-tested pure core never needs it, and so the tests can substitute a
-    stub for the real POST -- not for availability, since httpx is a direct
-    dependency of ``shared`` (``httpx>=0.27``, task 2965) and this module
-    runs under ``uv run --project shared``. Mirrors
-    ``census_trigger.default_status_fetcher`` / ``nightly._default_poster``."""
-    import httpx
+    """Call MCP tool *tool_name* at *url*, returning its unwrapped result.
 
-    response = httpx.post(
-        url,
-        json={
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {"name": tool_name, "arguments": arguments},
-        },
-        # Required by the streamable-HTTP MCP transport -- single-sourced
-        # in census_trigger (already imported here) so a transport change is
-        # a one-line edit, not four lockstep edits with a silent-406 risk.
-        headers=census_trigger.MCP_STREAMABLE_HTTP_HEADERS,
-        timeout=30.0,
-    )
-    response.raise_for_status()
-    return census_trigger._extract_tool_result(response.json())
+    A thin delegate to ``census_trigger.post_mcp_tool_call``, which
+    single-sources the whole MCP transport contract for this subsystem
+    (headers, session handshake, body decoding, envelope unwrap). The seam
+    NAME and signature are preserved deliberately: ~6 tests monkeypatch this
+    function as THE single MCP boundary, and both consumers --
+    :func:`default_submit_fn` and :func:`_build_default_escalate_fn` -- keep
+    routing through it.
+
+    Two transport facts, both verified live and both previously unhandled
+    here, are why this is no longer a bare POST (task 3644):
+
+    * The escalation server (:8103) is a STATEFUL streamable-HTTP server. A
+      session-less ``tools/call`` is rejected at the transport layer, before
+      the tool runs, with ``400 Bad Request`` / ``"Missing session ID"``. The
+      client must first ``initialize`` (session-less), carry the
+      server-assigned ``mcp-session-id``, and retry.
+    * With a session, that server answers ``tools/call`` with
+      ``content-type: text/event-stream``, so ``response.json()`` raises.
+
+    Because :func:`_build_default_escalate_fn` swallows POST failures
+    best-effort, both defects were silent: every legibility census escalation
+    ever filed was dropped at the transport layer. The fused-memory server
+    (:8002) is STATELESS by contrast -- one bare POST, ``application/json``,
+    no session -- and ``post_mcp_tool_call`` handshakes only on a 400, so
+    :func:`default_submit_fn`'s path is unchanged.
+    """
+    return census_trigger.post_mcp_tool_call(url, tool_name, arguments, timeout=30.0)
 
 
 def default_submit_fn(**kwargs) -> dict:

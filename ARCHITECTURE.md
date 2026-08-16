@@ -256,26 +256,56 @@ waits.
 
 ```mermaid
 stateDiagram-v2
+    %% entry
     [*] --> deferred: planning_mode submit
     [*] --> pending: normal submit (via curator)
-    deferred --> pending
-    deferred --> done
-    deferred --> blocked
-    deferred --> cancelled
+    %% dispatch
     pending --> in_progress: dispatch
+    %% completion
     in_progress --> done: merge lands
-    in_progress --> blocked: unresolved failure
+    merge_deferred --> done
+    blocked --> done
+    pending --> done
+    deferred --> done
+    infra_hold --> done
+    review --> done
+    %% park (atomic train)
     in_progress --> merge_deferred: parked in an atomic train
+    %% requeue / re-pend
     in_progress --> pending: requeue
+    blocked --> pending: re-pend
+    merge_deferred --> pending
+    deferred --> pending
+    infra_hold --> pending
+    review --> pending
+    %% block
+    in_progress --> blocked: unresolved failure
+    pending --> blocked: deterministic gate (born-at-L2)
+    merge_deferred --> blocked
+    deferred --> blocked
+    infra_hold --> blocked
+    review --> blocked
+    %% cancel (any non-terminal)
+    pending --> cancelled
+    in_progress --> cancelled
+    blocked --> cancelled
+    deferred --> cancelled
+    merge_deferred --> cancelled
+    infra_hold --> cancelled
+    review --> cancelled
+    %% infra hold
     in_progress --> infra_hold
+    blocked --> infra_hold
     infra_hold --> in_progress
+    blocked --> in_progress: resume (infra)
+    %% review
     in_progress --> review
     review --> in_progress
-    blocked --> pending: re-pend
-    merge_deferred --> done
-    merge_deferred --> blocked
-    merge_deferred --> cancelled
-    merge_deferred --> pending
+    %% deferred (planning / park)
+    pending --> deferred
+    in_progress --> deferred
+    blocked --> deferred
+    %% terminal
     done --> [*]
     cancelled --> [*]
 ```
@@ -283,9 +313,18 @@ stateDiagram-v2
 Legal transitions are a closed table (`shared/src/shared/task_transitions.py`)
 enforced by fused-memory's `TaskInterceptor`, keyed by the actor making the
 change — e.g. reconciliation is never allowed to transition a task *out of*
-`in-progress`. `blocked --resume(infra)--> in-progress` and a rare, audited
-`done`/`cancelled --reopen--> *` (requiring an explicit `reopen_reason`) are
-operator recovery paths, not part of the normal happy path.
+`in-progress`. The diagram above is that table in full, not a happy-path
+sketch: every edge in it is a `TRANSITIONS` pair. `task_transitions.py` is the
+authority — where the two disagree the table is right and the diagram is
+stale, so an edge added there must be drawn here too (the diagram had lost 19
+of them before this redraw). Many of the drawn edges are operator or sweep
+recovery paths rather than normal flow —
+`blocked --resume(infra)--> in-progress`, the `infra_hold`/`review` fan-outs,
+and reconciliation's any-non-terminal → `cancelled` family. One recovery path
+is deliberately *absent* from the table and so cannot be drawn: the rare,
+audited `done`/`cancelled --reopen--> *` (requiring an explicit
+`reopen_reason`), which `is_legal_transition` gates on its `reopen` flag
+instead of on a `(from, to)` pair.
 
 ### 3.2 Submit
 
@@ -421,19 +460,156 @@ steward tries to resolve the issue itself; if it can't (budget exhaustion,
 retry/timeout/empty-output cap, a missing worktree at preflight), it
 auto-escalates to a human, starting the L1→L2 promotion path in §6.
 
+`ESCALATED` has exactly **two** dispositions, and which one a task takes is
+what decides whether its row stays `in-progress` or lands in `blocked`:
+
+- **(a) In-slot bounded wait.** The workflow keeps its slot and its live
+  claimant while `_ensure_steward_started()` → `_wait_for_resolution()` runs,
+  so an `in-progress` row here is legitimate rather than stranded — the row
+  still matches a live, heartbeating claimant (INV-6 `status-matches-liveness`,
+  [docs/legibility/design-invariants.md](docs/legibility/design-invariants.md)).
+  The wait is bounded by a **progress-refreshed idle window**, not a wall-clock
+  deadline (task 3170): every observed advance of the steward's progress
+  counter buys another full window, so the hold is one window for a silent
+  producer and at most `steward_max_attempts +
+  steward_max_timeouts_per_escalation` windows for a steward that keeps
+  invoking its agent — bounded by the steward's own attempt ceilings, which is
+  the property that makes it INV-7 `holds-owned-and-bounded`-legal. A record
+  that is born-at-L2 (severity `critical`/`urgent`) or at `level ≥ 2`
+  short-circuits the wait immediately: the orchestrator does not hold a slot
+  waiting on a human. This now covers **every** phase, MERGE entry included —
+  `_handle_merge_gate_escalations`
+  (`orchestrator/src/orchestrator/workflow.py`) replaced the old
+  steward-less bail, which returned `ESCALATED` with no steward, no wait and no
+  status write, leaving `in-progress` + NULL claimant + an open gating record
+  with nothing running to advance it (task 3536 / PRD γ1 / spec §8-E1).
+- **(b) Blocked exit.** When the wait concludes without resolution — idle-window
+  expiry, steward re-escalation, or a gating record still open on the
+  single-shot re-check — `_mark_blocked` parks the row `blocked` and frees the
+  slot. The open escalation record then *is* the ownership token and the wake
+  edge: resolving it re-pends the task (§6). The gate predicate itself
+  (`_is_gating_escalation`) is untouched stop-the-line either way — nothing
+  merges past an open gating record.
+
+Which exit status each outcome must write is specified normatively in
+[docs/task-escalation-state-spec.md](docs/task-escalation-state-spec.md) §4
+(the state × owner table) and §5 (the outcome contract).
+
 ### 3.7 Recovery and failure paths
 
-- **`_mark_blocked`** is the sole choke point that stamps a task `blocked`
-  and files the corresponding escalation — no code path blocks a task
-  silently.
-- **Stranded tasks.** `Harness._reconcile_stranded_in_progress` sweeps
-  `in-progress` tasks with no live claimant back to `pending`, or to `done`
-  with `found_on_main` provenance if the work is already on `main`. A
-  scheduler phase (`_phase_redispatch_stranded_blocked`) does the same for
-  stranded `blocked` tasks whose dependencies have since resolved and whose
-  escalation has closed.
-- **Orphaned worktrees.** The orphan-L0-reaper quarantines, then reaps,
-  `.worktrees/*` directories left behind by a crashed or killed workflow.
+The normative specification of the task-status × escalation-state graph is
+[docs/task-escalation-state-spec.md](docs/task-escalation-state-spec.md) — §4
+is the state × owner table, §5 the outcome contract, §7 the recovery and sweep
+contract. This section is the *descriptive* introduction to it: where the two
+disagree, the spec states the intent and the divergence is a defect (the spec's
+§8 keeps the live divergence register). The two invariants this section leans
+on, INV-6 `status-matches-liveness` and INV-7 `holds-owned-and-bounded`, are
+stated normatively in
+[docs/legibility/design-invariants.md](docs/legibility/design-invariants.md)
+and are not restated here.
+
+- **What `_mark_blocked` actually is.** `_mark_blocked`
+  (`orchestrator/src/orchestrator/workflow.py`) is the choke point for
+  `TaskWorkflow`'s **own** failure parks, and the only `blocked` writer that
+  also spawns the dry-run unblock proposal. It is **not** the only writer of
+  the status — every family below stamps `blocked` without it (anchors are
+  function + file, deliberately not line numbers: these are god-files whose
+  line numbers rot within days).
+  - **Sibling workflow paths** — `_persist_blocked_row` (whose docstring says
+    it deliberately bypasses `_mark_blocked` to avoid spawning
+    `_spawn_dry_run_unblock`), train attribution `_attribute_train_failure`,
+    and `_handle_terminal_exit_on_block`, reachable both from `_mark_blocked`
+    *and* independently from the dispatch-time `TerminalExitRejection`
+    handler.
+  - **Harness escalate-and-block gates** (`harness.py`) —
+    `_block_and_escalate_external_dep`, `_block_and_escalate_delivered_check`,
+    `_block_and_escalate_cross_repo`, `_block_and_escalate_substrate_flip`.
+  - **Table B `park`** — `_action_teardown_and_set_status` (`harness.py`), the
+    human-resolution effect in §6.
+  - **`DeterministicRunner`** — the `_file_*_and_block` family
+    (`deterministic_runner.py`: `_file_infra_issue_and_block`,
+    `_file_stop_instruction_and_block`,
+    `_file_curator_adjudication_missing_and_block`,
+    `_file_milestone_gate_and_block`,
+    `_file_milestone_check_failed_and_block`). Each wraps the status write in
+    `try`/`except` and *log-and-swallows* a failure (the escalation is already
+    durable), so it can file the record and still not write `blocked`. These
+    are also the `pending → blocked` edge §3.8 depends on — no workflow, and
+    so no `_mark_blocked`, is ever involved.
+  - **Scheduler retry caps** — `trigger_retry_cap_exhausted`
+    (`scheduler.py`).
+  - **Human `release_workflow`** — `escalation/src/escalation/server.py`,
+    which parks only on the no-live-claimant arm.
+  - **Reconciliation** — `_sweep_block_orphan`
+    (`fused-memory/.../reconciliation/targeted.py`), the `deferred → blocked`
+    edge.
+  - And the generic MCP surface: `set_task_status` validates only that the
+    status string is in the vocabulary, so any client can write `blocked` with
+    zero orchestrator involvement.
+
+  The invariant that actually makes a block non-silent is therefore **not**
+  single-writership but ownership: every `blocked` row is expected to carry an
+  open escalation record or gate marker that owns its re-entry (spec §3-S3;
+  INV-7 `holds-owned-and-bounded`), with the deterministic-MILESTONE park as
+  the sanctioned carve-out. `infra-hold`, unlike `blocked`, *does* have a
+  single production writer — `_mark_blocked(block_status='infra-hold')`, called
+  from the infra-resume path in `workflow.py`.
+- **Stranded tasks.** `Harness._reconcile_stranded_in_progress` (`harness.py`)
+  sweeps `in-progress` tasks with no live claimant, delegating per task
+  to `_reconcile_one_stranded`. Liveness is not guessed: it is the
+  `claimant_run_id` + `heartbeat_at` + `is_stranded` oracle in
+  `shared/src/shared/task_claimant.py`. The classification itself is a single
+  table, `_RECOVERY` in
+  `orchestrator/src/orchestrator/task_ground_truth.py`, keyed by
+  (status × branch-state × open-escalation × deploy-phase) and defaulting
+  fail-safe to `LEAVE` for any shape it does not recognize — including every
+  shape with a live claimant. `RecoveryAction` today has four members:
+  `MARK_DONE_WITH_PROVENANCE` (branch on `main` or carrying a merge
+  marker → `found_on_main`, behind the provenance and delivered-checks gates),
+  `REVERT_TO_PENDING` (branch off-main or gone, no open record),
+  `RE_FILE_ESCALATION` (a row that lost its record — re-files a
+  `stranded_blocked` L1 and deliberately changes **no** status), and `LEAVE`.
+  The matching sweep for stranded `blocked` rows is the scheduler phase
+  `_phase_redispatch_stranded_blocked` (`scheduler.py`).
+- **Pin discrimination — what an open record actually vetoes.** The shared
+  classifier `escalation/src/escalation/pins.py` distinguishes a **dead own-L0**
+  (`DEAD_L0`) from a **queue-backed L1/L2 handoff** (`QUEUE_HANDOFF`) from a
+  non-pinning `info` annotation, fails safe *to* pinning on an unknown severity,
+  and treats an unreadable store as a distinguishable third result
+  (`classify_pins(records=None)` → `store_unavailable`) rather than as "no
+  records". It is **already consumed in production by the done-flip gate**
+  (`Harness._already_landed_dispatch_gate`, asking `PinReport.vetoes_done_flip`;
+  task 3534 / spec §8-E8) — which is why a genuinely-landed task carrying a
+  lone `escalate_info` record no longer re-dispatches forever. What is **not**
+  yet rewired is the *stranded-recovery* veto: `_shape()` still folds the
+  question to `has_open_escalation = bool(report.open_escalations)`
+  (`task_ground_truth.py`) and `_phase_redispatch_stranded_blocked` still
+  short-circuits on a bare `get_by_task(tid, status='pending')` truthiness read
+  (`scheduler.py`), so at those two sites an open record of *any* level
+  and *any* severity holds a strand off. The plumbing is already in place —
+  `EscalationRef` carries `severity` and `filing_claimant_run_id` precisely so
+  a consumer can feed `classify_pins` without re-reading the store.
+  One gap is deliberately still open and should not be read as settled: when no
+  escalation queue is injected, `_resolve_open_escalations` returns `[]`, which
+  is indistinguishable from a genuine "no open escalations" — the
+  collapse the `store_unavailable` result exists to prevent. That is task 3535.
+- **Converting a pinned strand (normative — NOT yet landed).** The spec's
+  recovery rule is that a stranded row carrying a genuinely-pinning record must
+  be **converted to `blocked`** and attributed to that record —
+  `CONVERT_TO_BLOCKED` — rather than reverted to `pending` underneath the
+  responder or left stranded: nothing new is filed, in-flight work is
+  preserved, and the row re-couples to the ladder's existing wake edges. Read
+  this as intent, not as current behaviour: `RecoveryAction` has no such member
+  today (the enum is the four above, and `CONVERT_TO_BLOCKED` appears nowhere
+  in code). It lands via `plans/task-escalation-state-graph-prd.md` leaf δ, in
+  log-mode first with enforcement behind the soak gate.
+- **Orphaned worktrees.** `Harness._reap_orphan_worktrees` (`harness.py`)
+  quarantines, then reaps, `.worktrees/*` directories left behind by a
+  crashed or killed workflow.
+- **Orphaned L0 records.** A *separate* sweep,
+  `Harness._reap_orphan_l0_escalations` (`harness.py`), reclaims L0
+  escalation *records* whose steward died without escalating (§6). The two are
+  easily conflated — one reaps directories, the other reaps queue rows.
 - **Retry caps** bound every retryable failure mode (`requeue_cap=3`,
   `transient_requeue_cap=10`, `max_consecutive_infra_resumes=3`,
   `max_consecutive_merge_thrash=2`, `max_failure_signature_repeat=3`) — past
@@ -648,11 +824,42 @@ flowchart LR
 
   | Action | Effect on the task |
   |---|---|
-  | `resume` | → `pending` (or `resume_from_pause` for a paused workflow) |
+  | `resume` | → `pending`, `resume_from_pause` (two preconditions — see below) |
   | `restart` | → `pending`, `restart_from_scratch` |
   | `park` | → `blocked`; the L2 escalation stays open |
   | `abandon` | → `cancelled` |
   | `close_only` | no task effect — closes the escalation without touching the task |
+
+  The table is Table B (`escalation/src/escalation/action_effects.py`), and
+  `resolve_issue` itself writes **no** task status — it changes only the
+  escalation record and consults `effect_for` purely as a legality gate
+  (`escalation/src/escalation/server.py`); the task-status effect is applied by
+  the orchestrator harness. `resume_from_pause` is the *disposition* name that
+  routes the effect, not a second target status: the row is
+  `('resume', ANY, ANY) → TaskEffect('pending', 'resume_from_pause')`, and the
+  one production comparison against it (`WORKFLOW_RESUME`, in
+  `Harness._on_escalation_resolved`) routes to `_cascade_unblock_member`, which
+  sources its target from that same row and so writes `pending`. There is no
+  distinct paused-workflow target.
+
+  Two preconditions on `resume` are worth stating, because together they are
+  why a **stranded** row is unreachable by it:
+
+  1. **Status string equality, not liveness.** `_cascade_unblock_member`
+     (`harness.py`) re-reads the row and returns early at
+     `if status != 'blocked'`. Every other status — including an
+     `in-progress` row whose claimant is long dead — is DEBUG-skipped.
+     (`infra-hold` has its own pre-gate just above, which writes `in-progress`
+     instead.) The flip itself sits behind a same-signature re-block guard.
+  2. **L0 resolutions never reach it.** `_on_escalation_resolved` nests the
+     entire resume disposition inside `if escalation.level >= 1`, so resolving
+     an L0 produces no status change at all.
+
+  Normatively this is a defect, not a design: the spec
+  ([docs/task-escalation-state-spec.md](docs/task-escalation-state-spec.md)
+  §7.4, PRD leaf ζ) requires `resume` to key off **claimant liveness** rather
+  than `status == 'blocked'` string equality, and requires the L0-resolution
+  path to reach orphaned rows. Neither has landed yet.
 
   A level cap prevents the watcher's own MCP connection from resolving
   anything at L2 (`level_forbidden`) — except a narrow, evidence-gated

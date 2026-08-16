@@ -18,6 +18,12 @@
 #     inherit the spawner's default model. For other/extra claude flags use
 #     $CLAUDE_SPAWN_CLAUDE_ARGS (a raw passthrough, applied after --model).
 #
+# These, and every other CLAUDE_SPAWN_* var read below, are per-launch
+# INPUTS: consumed by this invocation and then REMOVED from the spawned
+# session's own environment (task 4015 -- see $sanitize_env further down), so
+# a session can never re-serve its own launch parameters to a session IT
+# spawns. Set them explicitly on each spawn; they do not propagate onward.
+#
 # Backend selection:
 #   $CLAUDE_SPAWN_BACKEND=tmux — bypass terminal-emulator discovery entirely
 #     and launch in a crash-survivable, reattachable tmux window instead
@@ -344,10 +350,52 @@ q_sentinel=$(printf %q "$sentinel")
 # UNCONDITIONALLY — a plain literal, deliberately NOT a SESSION_RECORD_DIR-
 # gated *_export var — so persistence holds even on registry-fault fail-soft
 # paths. See the 2026-07-22 /deb RCA (session 15de5e77) and task 2893.
+#
+# sanitize_env (task 4015): strip the ENTIRE inherited CLAUDE_SPAWN_*
+# namespace from the environment the payload execs claude with, so a spawned
+# session can never re-consume its own launch parameters. Single-quoted here
+# so the OUTER shell stores it literally and only the payload shell evaluates
+# `${!CLAUDE_SPAWN_@}` -- against the CHILD's environment, not this one.
+#
+# ORDERING IS THE WHOLE CONTRACT, in both directions:
+#   - This invocation's inputs are ALREADY fully consumed by the time $inner
+#     is built -- $flags baked above (CLAUDE_SPAWN_MODEL/CLAUDE_ARGS),
+#     spawn_mode read near the top, the `python3 ... launching` identity
+#     write (ROLE/PROJECT/TASK_ID/ESCALATION_ID) long since done in its own
+#     subprocess -- so the unset can never disturb them. Deliberate inputs
+#     still reach the direct child's argv exactly as before; what changes is
+#     only that they no longer travel onward in its ENVIRONMENT.
+#   - It must precede the four re-exports below, or it would erase the very
+#     per-child values being handed over.
+# Kept to ONE logical line: the mac-terminal branch writes $inner into a
+# tmpscript via printf '#!/usr/bin/env bash\n%s\n', so an embedded newline
+# would corrupt that path.
+#
+# Placing it INSIDE $inner -- not in this launcher process -- is what makes
+# it hold for every backend, including daemon-owned emulators
+# (gnome-terminal-server) that never inherit this script's own environment.
+#
+# UNCONDITIONAL, and at the TOP LEVEL of $inner -- never nested inside the
+# `[ -n "$SESSION_RECORD_DIR" ]` / `[ -n "$CLAUDE_SPAWN_RESULT_FILE" ]`
+# guards above, whose bodies are skipped on precisely the fail-soft path
+# this most needs to cover. On a registry fault result_export is the empty
+# string, so with the unset already run the child sees NO
+# CLAUDE_SPAWN_RESULT_FILE at all -- correct -- where before it inherited
+# the SPAWNER's path and would have written its own outcome over its
+# parent's result.md. The skip path must UNSET, not merely decline to set.
+#
+# Prefix-generic (`${!CLAUDE_SPAWN_@}` enumerates variable NAMES) rather
+# than an enumerated list, so a launch knob added later cannot silently fall
+# outside it, and so a value containing a newline or an `=` cannot spoof an
+# entry the way parsing `env` output can. No subprocess; bash 2.04+, so the
+# macOS bash 3.2 path the mac-terminal branch supports is fine; a safe no-op
+# under `set -u` when the namespace is empty.
+sanitize_env='for _v in ${!CLAUDE_SPAWN_@}; do unset "$_v"; done; unset _v; '
+
 inner="trap 'echo \"\${ec:-\$?}\" > $q_sentinel' EXIT; \
 trap 'exit 129' HUP; \
 trap 'exit 143' TERM; \
-${spawn_id_export}${parent_id_export}${result_export}${wm_title_export}export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; cd $q_cwd && claude $flags $q_prompt; ec=\$?; exit \$ec"
+${sanitize_env}${spawn_id_export}${parent_id_export}${result_export}${wm_title_export}export CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1; cd $q_cwd && claude $flags $q_prompt; ec=\$?; exit \$ec"
 
 # How long to wait for the sentinel to appear after the launcher returns
 # (covers a hair-late write or a very fast emulator).  Tests can shrink this.

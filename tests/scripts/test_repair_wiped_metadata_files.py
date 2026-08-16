@@ -25,6 +25,7 @@ gets subprocess coverage.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import sqlite3
 import subprocess
@@ -50,13 +51,17 @@ from audit_wiped_metadata_files import (
     WipeCandidate,
 )
 from repair_wiped_metadata_files import (
+    _MAX_CONSECUTIVE_LIVE_READ_FAILURES,
     ALL_DISPOSITIONS,
     CLIENT_NAME,
+    EXIT_LIVE_READ_FAILED,
     EXIT_NO_ROOT,
     EXIT_NOTHING_SCANNED,
     EXIT_OK,
     EXIT_SERVER_UNREACHABLE,
+    EXIT_WRITE_FAILED,
     FAILED,
+    FAILED_LIVE_READ,
     PROVENANCE_KEY,
     REPAIR,
     REPAIR_TASK_ID,
@@ -68,10 +73,13 @@ from repair_wiped_metadata_files import (
     SKIP_NOT_TERMINAL,
     RepairOutcome,
     RepairResult,
+    _build_parser,
     _make_client,
     build_repair_payload,
     classify_live_task,
+    classify_reply,
     format_summary,
+    main_async,
     plan_files_rejection_reason,
     repair_one,
     repair_project,
@@ -457,6 +465,87 @@ def test_classify_live_task_agrees_with_the_audit_on_a_whitespace_only_entry():
 
 
 # ---------------------------------------------------------------------------
+# classify_reply — the server-reply classifier shared by repair_one's write
+# and repair_project's live re-read.
+#
+# `ok` mirrors fused_memory.middleware.task_interceptor.
+# interceptor_write_succeeded (fused-memory/src/fused_memory/middleware/
+# task_interceptor.py:5829-5868) — see classify_reply's own docstring
+# (scripts/repair_wiped_metadata_files.py) for why this is a transcribed
+# mirror, not an import, and for the full rule. The canonical predicate's own
+# contract is independently pinned at fused-memory/tests/test_task_interceptor.py:
+# 10863+ ("task-1184: interceptor_write_succeeded helper contract") —
+# auditing one copy for drift means reading both, since neither can change
+# silently without its OWN table going red.
+#
+# `answered` is the second axis `interceptor_write_succeeded` has no need of:
+# whether the server explained ITSELF (an explicit error/success:False
+# marker) or said nothing usable at all (`{}`, non-dict -> indistinguishable
+# from a dead transport). NOTE: `answered` alone is not sufficient for
+# repair_project's live re-read to treat a reply as a benign, named skip —
+# see repair_project for the full rule.
+# ---------------------------------------------------------------------------
+
+
+def test_classify_reply_truth_table():
+    """One table, both axes, so `ok` and `answered` are read off one place."""
+    # Not a dict at all -> unanswered, non-empty detail naming what arrived.
+    for reply in (None, "ok", []):
+        verdict = classify_reply(reply)
+        assert verdict.ok is False, reply
+        assert verdict.answered is False, reply
+        assert verdict.detail, reply
+
+    # Empty dict -> unanswered, non-empty detail naming the emptiness: `{}`
+    # carries no positive write signal and must not be read as success.
+    verdict = classify_reply({})
+    assert verdict.ok is False
+    assert verdict.answered is False
+    assert verdict.detail
+    assert "empty" in verdict.detail.lower()
+
+    # An explicit error marker -> the server ANSWERED, and the detail carries
+    # BOTH the error_type and the message — the wording
+    # test_repair_project_reports_the_servers_own_reason_for_a_missing_task
+    # (below) already depends on; must not be weakened.
+    verdict = classify_reply(
+        {"error": "No tasks found for ID(s): 2464", "error_type": "TaskNotFoundError"}
+    )
+    assert verdict.ok is False
+    assert verdict.answered is True
+    assert "TaskNotFoundError" in (verdict.detail or "")
+    assert "No tasks found for ID(s): 2464" in (verdict.detail or "")
+
+    # success: False -> answered, non-empty detail.
+    verdict = classify_reply(
+        {"success": False, "error_type": "DuplicateCandidateKeyError"}
+    )
+    assert verdict.ok is False
+    assert verdict.answered is True
+    assert verdict.detail
+
+    # Any FALSY success value is a failure, not just a literal `False` —
+    # matching interceptor_write_succeeded's own rule,
+    # `bool(resp.get('success', True))`, exactly.
+    for reply in ({"success": None}, {"success": 0}):
+        verdict = classify_reply(reply)
+        assert verdict.ok is False, reply
+        assert verdict.answered is True, reply
+        assert verdict.detail, reply
+
+    # Ordinary success shapes -> ok, answered, no detail.
+    for reply in (
+        {"success": True},
+        {"id": "2464", "status": "done"},
+        {"id": "77", "status": "done", "metadata": {"files": []}},
+    ):
+        verdict = classify_reply(reply)
+        assert verdict.ok is True, reply
+        assert verdict.answered is True, reply
+        assert verdict.detail is None, reply
+
+
+# ---------------------------------------------------------------------------
 # repair_one — the write itself, against a FAKE client. No network, no MCP
 # server, no live database.
 # ---------------------------------------------------------------------------
@@ -488,6 +577,20 @@ class _DuplicateCandidateKeyError(RuntimeError):
     update, so backfilling files onto a batch of tasks can genuinely collide
     with another non-cancelled row. Simulated rather than imported so this test
     stays a pure unit test of repair_one's error handling."""
+
+
+class _ConnectError(OSError):
+    """Shape-alike for httpx.ConnectError — a dead socket mid-batch.
+
+    Not httpx.ConnectError itself, and not imported: a pure unit test of
+    repair_project's live re-read must not depend on a transport library, and
+    the `except Exception` arm it exercises (scripts/repair_wiped_metadata_files.py)
+    catches ANY exception type by construction — the fused-memory tool layer
+    never raises across the wire (`@mcp_tool_errors` converts every
+    server-side exception into an ordinary reply dict), so an exception
+    reaching that arm can only ever be client-side/transport, and no
+    sub-classification by exception type is needed or wanted there. A plain
+    OSError subclass is a faithful enough stand-in for that purpose."""
 
 
 def test_repair_one_issues_exactly_one_merge_mode_update_task():
@@ -568,10 +671,25 @@ def test_repair_one_treats_an_error_shaped_result_as_failed():
         assert result.detail, payload
 
 
+def test_repair_one_treats_an_empty_reply_as_failed():
+    """An empty reply carries no positive write signal — indistinguishable
+    from a wedged server that ACKed without writing — and must not be read
+    as success. `classify_reply({}).ok` is False, so this lands in FAILED
+    alongside the explicit-error-payload cases above."""
+    client = _FakeClient(returns={})
+
+    result = asyncio.run(repair_one(client, _ROOT, _candidate(4), now_iso=_NOW))
+
+    assert result.disposition == FAILED
+    assert result.detail
+
+
 def test_repair_one_accepts_a_plain_success_shape():
     """The complement of the above: an ordinary success must not be misread as
-    a failure just because it carries no explicit success flag."""
-    for payload in ({}, {"success": True}, {"id": "2464", "status": "done"}):
+    a failure just because it carries no explicit success flag. `{}` is NOT
+    among these any more — an empty reply carries no positive write signal
+    and is now covered by test_repair_one_treats_an_empty_reply_as_failed."""
+    for payload in ({"success": True}, {"id": "2464", "status": "done"}):
         client = _FakeClient(returns=payload)
 
         result = asyncio.run(repair_one(client, _ROOT, _candidate(4), now_iso=_NOW))
@@ -711,6 +829,44 @@ def test_format_summary_lists_each_lock_charter_skip_individually():
 
     assert "77" in summary
     assert "orchestrator/src/orchestrator" in summary
+
+
+def test_format_summary_lists_each_failed_live_read_individually():
+    """(b) same again for FAILED_LIVE_READ — an aggregate count alone tells an
+    operator nothing they can act on; the task id and the reason must both
+    appear under a dedicated heading."""
+    summary = format_summary(
+        _result(
+            [
+                _outcome(
+                    2464,
+                    FAILED_LIVE_READ,
+                    detail="live re-read: server reply was empty ({}) "
+                    "— it carries no positive write signal",
+                )
+            ]
+        )
+    )
+
+    assert "-- failed_live_read" in summary
+    assert "2464" in summary
+    assert "no positive write signal" in summary
+
+
+def test_failed_live_read_is_a_registered_disposition():
+    """FAILED_LIVE_READ must be a member of ALL_DISPOSITIONS, pinned
+    DIRECTLY rather than left to the zero-count test above or the JSON
+    `set(counts) == set(ALL_DISPOSITIONS)` assertion later in this file —
+    both DERIVE their own expectations from ALL_DISPOSITIONS itself, so
+    neither could ever notice FAILED_LIVE_READ going missing from it: the
+    `-- dispositions --` count block format_summary prints iterates
+    ALL_DISPOSITIONS directly, so a disposition absent from it would be
+    silently dropped from the printed counts even while still correctly
+    itemised elsewhere. (`_ITEMISED_DISPOSITIONS` membership needs no
+    equivalent direct check here — it is already proven by
+    test_format_summary_lists_each_failed_live_read_individually above,
+    which can only pass if FAILED_LIVE_READ is a member.)"""
+    assert FAILED_LIVE_READ in ALL_DISPOSITIONS
 
 
 def test_format_summary_echoes_the_audit_coverage_block():
@@ -1017,6 +1173,123 @@ def test_repair_project_short_circuits_a_lock_charter_reject_before_any_mcp_call
     assert "orchestrator/src/orchestrator" in (result.outcomes[0].detail or "")
 
 
+def test_repair_project_reports_a_mid_batch_transport_death_as_failed_live_read(tmp_path):
+    """A DEAD SOCKET MID-BATCH IS NOT A MISSING TASK. A server that dies
+    partway through a batch must not report every remaining candidate as a
+    benign skip indistinguishable from one the server genuinely said is
+    gone — that would let the run exit 0 having left candidates unexamined.
+    The `except` arm is transport-only BY CONSTRUCTION: ``@mcp_tool_errors``
+    (fused-memory/src/fused_memory/server/tool_errors.py:44-59) converts
+    every server-side exception into an ordinary reply dict, so nothing but a
+    client-side/transport failure can ever reach it — hence no
+    sub-classification by exception type here.
+    """
+    root = _wiped_project(tmp_path)
+    client = _FakeClient(raises=_ConnectError("Connection refused"))
+
+    result = asyncio.run(repair_project(client, str(root), apply=True, now_iso=_NOW))
+
+    assert [o.disposition for o in result.outcomes] == [FAILED_LIVE_READ]
+    detail = result.outcomes[0].detail or ""
+    assert "_ConnectError" in detail
+    assert "Connection refused" in detail
+    assert "update_task" not in [name for name, _ in client.calls]
+
+
+def test_repair_project_stops_dialling_after_repeated_transport_failures_mid_batch(tmp_path):
+    """A CIRCUIT BREAKER, NOT AN UNBOUNDED RETRY. Once the transport has
+    proven dead a few times in a row, every remaining candidate must be
+    recorded as FAILED_LIVE_READ WITHOUT another get_task call — a realistic
+    40+ candidate sweep must not spend 20+ minutes re-dialling (the client's
+    timeout is 30s, migrate_metadata_modules_to_files.py) a socket that has
+    already announced itself as dead, before the summary and exit code ever
+    print. This preserves the module's resilience argument (not losing the
+    record of writes already applied) without re-dialling a transport that
+    has already proven dead.
+    """
+    task_ids = [11, 22, 33, 44, 55]
+    root = _make_project(
+        tmp_path,
+        tasks=[{"id": tid, "status": "done", "metadata": {"files": []}} for tid in task_ids],
+        plans=[(str(tid), {"task_id": tid, "files": ["a.py"]}) for tid in task_ids],
+    )
+    client = _FakeClient(raises=_ConnectError("Connection refused"))
+
+    result = asyncio.run(repair_project(client, str(root), apply=True, now_iso=_NOW))
+
+    assert [o.disposition for o in result.outcomes] == [FAILED_LIVE_READ] * len(task_ids)
+    # EXACTLY _MAX_CONSECUTIVE_LIVE_READ_FAILURES calls, not one per
+    # candidate — proves the breaker tripped rather than dialling every
+    # remaining candidate against a socket already proven dead.
+    assert len(client.calls) == _MAX_CONSECUTIVE_LIVE_READ_FAILURES
+    tripped_detail = result.outcomes[-1].detail or ""
+    assert "not re-dialled" in tripped_detail
+    assert str(_MAX_CONSECUTIVE_LIVE_READ_FAILURES) in tripped_detail
+
+
+def test_repair_project_treats_an_answered_backend_error_as_failed_live_read(tmp_path):
+    """AN ANSWER IS NOT EVIDENCE OF ABSENCE UNLESS IT SAYS SO.
+    ``answered=True`` only means the reply carried an explicit
+    error/success:False marker — ``@mcp_tool_errors``
+    (fused-memory/src/fused_memory/server/tool_errors.py:44-59) converts
+    EVERY server-side exception into that same shape, so a locked database, a
+    timeout, or a ``ReconciliationBacklogExceeded`` all "answer" too. Only
+    ``TaskNotFoundError`` is the server confirming the task itself is gone;
+    every other answered error leaves the candidate exactly as unjudged as a
+    dead socket, and must not be filed as a benign SKIP_MISSING.
+    """
+    root = _wiped_project(tmp_path)
+    client = _FakeClient(
+        returns={"error": "database is locked", "error_type": "OperationalError"}
+    )
+
+    result = asyncio.run(repair_project(client, str(root), apply=True, now_iso=_NOW))
+
+    assert [o.disposition for o in result.outcomes] == [FAILED_LIVE_READ]
+    assert "OperationalError" in (result.outcomes[0].detail or "")
+
+
+def test_repair_project_reports_an_unanswered_live_reread_as_failed_live_read(tmp_path):
+    """AN UNANSWERED REPLY IS THE SAME UNJUDGED STATE AS A DEAD SOCKET. A
+    wedged server that ACKs with a 202 or an empty body reaches this script
+    as literally ``{}`` (``FusedMemoryClient._post``,
+    scripts/migrate_metadata_modules_to_files.py:89-90) — genuinely reachable
+    through this script's own transport, not a hypothetical. Filing it as a
+    benign SKIP_MISSING would be the empty-reply fix (classify_reply) leaking
+    straight back out here: the run would still exit 0 having left this
+    candidate unexamined.
+    """
+    root = _wiped_project(tmp_path)
+    client = _FakeClient(returns={})
+
+    result = asyncio.run(repair_project(client, str(root), apply=True, now_iso=_NOW))
+
+    assert [o.disposition for o in result.outcomes] == [FAILED_LIVE_READ]
+    assert [name for name, _ in client.calls] == ["get_task"]
+
+
+def test_repair_project_still_skips_a_genuinely_missing_task_as_skip_missing(tmp_path):
+    """REGRESSION GUARD, not a new behaviour. Reuses the exact payload from
+    test_repair_project_reports_the_servers_own_reason_for_a_missing_task
+    below: the server ANSWERED — it just said the task is gone — so this must
+    stay a benign SKIP_MISSING. Without this guard, splitting the live
+    re-read on ``answered`` could silently reclassify a genuinely-absent task
+    as a transport failure, which would make exit 5 fire on a healthy run.
+    """
+    root = _wiped_project(tmp_path)
+    client = _FakeClient(
+        returns={
+            "error": "No tasks found for ID(s): 2464",
+            "error_type": "TaskNotFoundError",
+        }
+    )
+
+    result = asyncio.run(repair_project(client, str(root), apply=True, now_iso=_NOW))
+
+    assert [o.disposition for o in result.outcomes] == [SKIP_MISSING]
+    assert "TaskNotFoundError" in (result.outcomes[0].detail or "")
+
+
 def test_repair_project_reports_the_servers_own_reason_for_a_missing_task(tmp_path):
     """AN ERROR REPLY IS NOT AN EXCEPTION, and its text must not be discarded.
 
@@ -1233,6 +1506,160 @@ def test_main_exit_3_when_every_resolved_root_is_unreadable(tmp_path):
     assert result.returncode == EXIT_NOTHING_SCANNED, result.stdout
     assert "NOTHING was examined" in result.stderr
     assert "not a clean result" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# EXIT_LIVE_READ_FAILED — a mid-batch transport death must be VISIBLE in the
+# exit code, not silently folded into exit 0.
+#
+# These run main_async IN-PROCESS with a monkeypatched _make_client, rather
+# than through the _run_cli subprocess fixture above. The bug needs the
+# handshake to SUCCEED and the server to die AFTER it; _run_cli's only
+# unreachable-server lever is _CLOSED_PORT_URL, which fails AT the handshake
+# and correctly yields EXIT_SERVER_UNREACHABLE (see
+# test_main_apply_is_the_only_way_to_write above) — it can never reach the
+# mid-batch state, and reproducing that in a subprocess would need a real stub
+# HTTP server that answers `initialize` and then closes. Patching
+# `_make_client` — the single, already-isolated construction seam that is
+# built lazily and only on the apply path — is the cheapest honest
+# reproduction. Do NOT "fix" this back into a subprocess test; it structurally
+# cannot exercise this branch. The subprocess tests for codes 0/2/3/4 above
+# are untouched.
+# ---------------------------------------------------------------------------
+
+
+@contextlib.asynccontextmanager
+async def _client_context(client):
+    """Async context manager stand-in for what `_make_client` normally
+    returns, so `main_async`'s `AsyncExitStack.enter_async_context` has
+    something to enter without dialling httpx at all. `__aenter__` hands back
+    *client* directly; teardown is a no-op, same as a real client's."""
+    yield client
+
+
+class _ScriptedClient:
+    """A `_ToolClient` whose replies are scripted ONE PER CALL, in order.
+
+    `main_async` constructs exactly ONE client for a whole `--apply` run and
+    shares it across every resolved root (the `for root in roots:` loop around
+    the single `_make_client` call), so proving the write/unread PRECEDENCE
+    needs one client that behaves differently call-to-call: a real write
+    failure on the first root, a dead transport on the second. `_FakeClient`
+    above only ever returns (or raises) the same thing on every call, which
+    cannot express that.
+    """
+
+    def __init__(self, script):
+        self.calls: list[tuple[str, dict]] = []
+        self._script = list(script)
+
+    async def call_tool(self, name: str, arguments: dict) -> dict:
+        self.calls.append((name, arguments))
+        action = self._script.pop(0)
+        if isinstance(action, BaseException):
+            raise action
+        return action
+
+
+def test_main_async_reports_a_mid_batch_transport_death_as_exit_live_read_failed(
+    tmp_path, monkeypatch
+):
+    """(a) A server that dies mid-batch leaves one or more candidates
+    unexamined, which is not a clean run — the CLI's own epilog defines exit
+    0 as "ran, nothing failed", so this run must return a distinct,
+    non-zero code instead.
+    """
+    root = _wiped_project(tmp_path)
+    monkeypatch.setattr(
+        "repair_wiped_metadata_files._make_client",
+        lambda server_url: _client_context(
+            _FakeClient(raises=_ConnectError("Connection refused"))
+        ),
+    )
+    args = _build_parser().parse_args(["--project-root", str(root), "--apply"])
+
+    exit_code = asyncio.run(main_async(args))
+
+    assert exit_code == EXIT_LIVE_READ_FAILED
+
+
+def test_main_async_returns_exit_ok_when_the_only_outcome_is_skip_missing(
+    tmp_path, monkeypatch
+):
+    """THE PRECEDENCE CASE THAT COULD REGRESS IF THE "task confirmed absent"
+    PREDICATE WERE EVER WIDENED: a live re-read the server ANSWERED by
+    confirming the task itself is gone is a benign, named skip, not an
+    unread candidate. A run whose only outcome is SKIP_MISSING must still
+    exit 0 — it must not be swept into EXIT_LIVE_READ_FAILED alongside the
+    genuinely-unjudged cases above.
+    """
+    root = _wiped_project(tmp_path)
+    monkeypatch.setattr(
+        "repair_wiped_metadata_files._make_client",
+        lambda server_url: _client_context(
+            _FakeClient(
+                returns={
+                    "error": "No tasks found for ID(s): 2464",
+                    "error_type": "TaskNotFoundError",
+                }
+            )
+        ),
+    )
+    args = _build_parser().parse_args(["--project-root", str(root), "--apply"])
+
+    exit_code = asyncio.run(main_async(args))
+
+    assert exit_code == EXIT_OK
+
+
+def test_exit_live_read_failed_is_distinct_from_every_other_exit_code():
+    """(b) 5 must not be a fold into 1, or into anything else. main()'s own
+    docstring states EACH CODE DENOTES EXACTLY ONE OUTCOME, and 1 specifically
+    means a WRITE was attempted and rejected — mapping an unread candidate
+    onto it would send an operator hunting for a failed write that never
+    happened, the same reasoning that made 3 and 4 separate codes.
+    """
+    codes = (
+        EXIT_OK,
+        EXIT_WRITE_FAILED,
+        EXIT_NO_ROOT,
+        EXIT_NOTHING_SCANNED,
+        EXIT_SERVER_UNREACHABLE,
+        EXIT_LIVE_READ_FAILED,
+    )
+    assert len(set(codes)) == len(codes), codes
+
+
+def test_exit_write_failed_outranks_exit_live_read_failed(tmp_path, monkeypatch):
+    """(c) PRECEDENCE: a rejected write is the more actionable signal, and 5's
+    own meaning — "candidates were left unexamined" — does not describe a
+    failed write. Root A produces a genuine FAILED write; root B's live
+    re-read dies mid-batch. The run must report EXIT_WRITE_FAILED, not
+    EXIT_LIVE_READ_FAILED, even though root B's candidate really was never
+    judged (both counts are still fully summarised above the exit code —
+    unchanged by this step).
+    """
+    root_a = _wiped_project(tmp_path, name="a", task_id=11)
+    root_b = _wiped_project(tmp_path, name="b", task_id=22)
+    client = _ScriptedClient(
+        [
+            {"id": "11", "status": "done", "metadata": {"files": []}},  # a: get_task
+            {"error": "lock_charter_error: directory lock rejected"},  # a: update_task
+            _ConnectError("Connection refused"),  # b: get_task dies
+        ]
+    )
+    monkeypatch.setattr(
+        "repair_wiped_metadata_files._make_client",
+        lambda server_url: _client_context(client),
+    )
+    args = _build_parser().parse_args(
+        ["--project-root", str(root_a), "--project-root", str(root_b), "--apply"]
+    )
+
+    exit_code = asyncio.run(main_async(args))
+
+    assert exit_code == EXIT_WRITE_FAILED
+    assert exit_code != EXIT_LIVE_READ_FAILED
 
 
 def test_make_client_is_attributable_to_this_repair_not_the_migration():

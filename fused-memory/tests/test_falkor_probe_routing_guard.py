@@ -46,7 +46,7 @@ import ast
 import pathlib
 
 import pytest
-from _fm_helpers import calls_named, parse_test_module
+from _fm_helpers import calls_named, parse_python_module
 
 TESTS_ROOT = pathlib.Path(__file__).parent
 
@@ -98,7 +98,7 @@ def _gating_skip_marker_calls(tree: ast.Module) -> list[ast.Call]:
 @pytest.mark.parametrize('path', MIGRATED_MODULES, ids=lambda p: p.name)
 def test_applies_the_shared_skip_marker(path):
     """The module must apply ``falkor_skipif()`` where pytest will honour it."""
-    calls = _gating_skip_marker_calls(parse_test_module(path))
+    calls = _gating_skip_marker_calls(parse_python_module(path))
     assert calls, (
         f'{path.name}: never applies {SKIP_MARKER}() in a gating position. This '
         f'module drives a live FalkorDB graph, so it must be gated on '

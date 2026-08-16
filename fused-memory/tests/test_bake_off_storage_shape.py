@@ -2796,20 +2796,44 @@ def _arm_measurement(*, recall5=0.8, recall10=0.9, estimator='injected:words',
             'canonical_candidates': 20,
             'canonical_rank_window': 10,
             'mean_topic_member_count': 3.0,
+            # Deliberately DIFFERENT from the transform-credited values above.
+            # Still arbitrary — but a renderer wired to the wrong key would
+            # print a number that matches its neighbour, and equal fixtures
+            # would let that pass.
+            'stored_canonical_in_top_5_rate': 0.4,
+            'stored_canonical_median_rank': 5.0,
+            'stored_canonical_found_count': 9,
         },
+        # EVERY subset carries different numbers — from the pooled block AND
+        # from each other.  Identical subsets would let a renderer that
+        # sourced every by-kind row from one subset (the first kind in
+        # iteration order, say) pass while printing `claim`'s numbers on the
+        # `held_out` row — which is precisely the row the transform-blind
+        # column exists for, since it is the only one measuring
+        # generalisation.  The per-kind offset is what makes that visible.
         'by_query_kind': {
             kind: {
-                'queries': 8,
-                'claim_recall': {'at_5': recall5, 'at_10': recall10},
+                'queries': 8 + index,
+                'claim_recall': {
+                    'at_5': round(recall5 - 0.01 * (index + 1), 2),
+                    'at_10': round(recall10 - 0.01 * (index + 1), 2),
+                },
                 'discoverability': {
-                    'canonical_in_top_5_rate': 0.7,
-                    'median_canonical_rank': 2.0,
-                    'canonical_found_count': 6,
-                    'canonical_candidates': 8,
+                    'canonical_in_top_5_rate': round(0.71 + 0.01 * index, 2),
+                    'median_canonical_rank': 2.0 + index,
+                    'canonical_found_count': 6 + index,
+                    'canonical_candidates': 8 + index,
                     'canonical_rank_window': 10,
+                    # Distinct from the pooled block's stored values too, so
+                    # a by-kind cell sourced from the pooled block is visible.
+                    'stored_canonical_in_top_5_rate': round(0.31 + 0.01 * index, 2),
+                    'stored_canonical_median_rank': 4.0 + index,
+                    'stored_canonical_found_count': 4 + index,
                 },
             }
-            for kind in (*_mod().QUERY_KINDS, _mod().HELD_OUT_SUBSET)
+            for index, kind in enumerate(
+                (*_mod().QUERY_KINDS, _mod().HELD_OUT_SUBSET),
+            )
         },
         'tokens_per_query': {'mean': 412.0, 'estimator': estimator},
         'guard_adequacy': {
@@ -3017,6 +3041,91 @@ class TestBuildReportRefusesAPartialTable:
         assert 'b_grouped' in str(excinfo.value)
         assert 'by_query_kind' in str(excinfo.value)
 
+    @pytest.mark.parametrize('kind', ['claim', 'topic_phrasing', 'held_out'])
+    @pytest.mark.parametrize('metric,key', [
+        ('discoverability', 'stored_canonical_in_top_5_rate'),
+        ('discoverability', 'canonical_in_top_5_rate'),
+        ('claim_recall', 'at_5'),
+    ])
+    def test_a_missing_key_INSIDE_a_by_kind_subset_raises(self, kind, metric, key):
+        """One level deeper than the subset-name check above.
+
+        The by-kind table subscripts `subset['discoverability'][...]`
+        directly, so before this the failure mode was a raw `KeyError` out of
+        `render_markdown` — a traceback where every other missing measurement
+        in this module produces an error naming the arm, the kind and the key.
+        Fail-loud versus fail-obscure: the artifact is refused either way, but
+        only one of them tells the operator which subset broke.
+        """
+        mod = _mod()
+        arms = _all_arms()
+        del arms['b_grouped']['by_query_kind'][kind][metric][key]
+
+        with pytest.raises(mod.IncompleteReportError) as excinfo:
+            mod.build_report(
+                arms=arms, audit_recall=_audit_recall(), protocol=_protocol(),
+            )
+
+        message = str(excinfo.value)
+        assert 'b_grouped' in message
+        assert kind in message
+        assert key in message
+
+    @pytest.mark.parametrize('block', ['claim_recall', 'discoverability',
+                                       'queries'])
+    def test_a_hollow_by_kind_subset_raises(self, block):
+        """The subset is PRESENT — so the kind-name check passes — and empty.
+        A split that produced the right keys with nothing under them would
+        otherwise publish a by-kind row assembled out of a traceback."""
+        mod = _mod()
+        arms = _all_arms()
+        del arms['c_peers+pin']['by_query_kind']['held_out'][block]
+
+        with pytest.raises(mod.IncompleteReportError) as excinfo:
+            mod.build_report(
+                arms=arms, audit_recall=_audit_recall(), protocol=_protocol(),
+            )
+
+        message = str(excinfo.value)
+        assert 'c_peers+pin' in message
+        assert 'held_out' in message
+        assert block in message
+
+    def test_the_transform_blind_trio_is_registered_not_merely_produced(self):
+        """Registration is what obliges the renderer to carry the column.
+
+        `_REQUIRED_ARM_METRICS` is "enumerated ONCE and used by both the
+        completeness check and the renderer, so a metric cannot be validated
+        into the JSON and then quietly dropped from the table".  A
+        transform-blind measurement that lived only in the JSON would leave
+        the artifact gate η actually reads exactly as undisclosed as before.
+        """
+        required = _mod()._REQUIRED_ARM_METRICS['discoverability']
+
+        assert 'stored_canonical_in_top_5_rate' in required
+        assert 'stored_canonical_median_rank' in required
+        assert 'stored_canonical_found_count' in required
+
+    @pytest.mark.parametrize('key', ['stored_canonical_in_top_5_rate',
+                                     'stored_canonical_median_rank',
+                                     'stored_canonical_found_count'])
+    def test_a_missing_transform_blind_key_raises(self, key):
+        """The nested case again: `discoverability` is present, so a shallow
+        check passes and the new column renders blank — reading as "measured,
+        and equal to its neighbour", which for THIS column is precisely the
+        conflation it exists to disclose."""
+        mod = _mod()
+        arms = _all_arms()
+        del arms['c_peers+pin']['discoverability'][key]
+
+        with pytest.raises(mod.IncompleteReportError) as excinfo:
+            mod.build_report(
+                arms=arms, audit_recall=_audit_recall(), protocol=_protocol(),
+            )
+
+        assert 'c_peers+pin' in str(excinfo.value)
+        assert key in str(excinfo.value)
+
     def test_an_unknown_arm_name_raises(self):
         """A typo would otherwise drop a real arm AND add a phantom one, and
         the table would still look complete."""
@@ -3151,6 +3260,307 @@ class TestRenderMarkdown:
 
         assert 'abc1234' in rendered
         assert 'e2_arm_claims.jsonl' in rendered
+
+
+_STORED_COLUMN = 'canonical in top-5 (stored)'
+
+
+def _cells(row: str) -> list[str]:
+    """`| a | b |` -> `['a', 'b']`."""
+    return [cell.strip() for cell in row.strip().strip('|').split('|')]
+
+
+def _by_kind_table(rendered: str) -> tuple[list[str], list[str]]:
+    """The by-query-kind table's (header cells, data rows).
+
+    Located by the renderer-emitted `## By query kind` heading rather than by
+    a line index, so it does not move when a paragraph above it does.  The
+    decision table's header ALSO starts with `| arm `, which is why the
+    search starts at the heading.
+    """
+    lines = rendered.splitlines()
+    start = lines.index('## By query kind')
+    header_at = next(
+        i for i, line in enumerate(lines[start:], start)
+        if line.startswith('| arm ')
+    )
+    rows = []
+    for line in lines[header_at + 2:]:  # skip the header and its `| --- |`
+        if not line.startswith('| '):
+            break
+        rows.append(line)
+    return _cells(lines[header_at]), rows
+
+
+class TestTheTransformBlindColumnReachesTheTables:
+    """The disclosure has to be beside the number it qualifies.
+
+    A caveat three sections away from `canonical in top-5` is not a caveat on
+    that column — gate η reads the decision table, and the single biggest
+    number in it is the one the grouped read credits.  So the transform-blind
+    rate is a COLUMN, immediately after its transform-credited twin, in the
+    headline table and in the by-kind table both.
+    """
+
+    def test_the_stored_column_sits_immediately_after_the_one_it_qualifies(self):
+        columns = _mod().DECISION_TABLE_COLUMNS
+
+        assert _STORED_COLUMN in columns
+        assert columns.index(_STORED_COLUMN) == \
+            columns.index('canonical in top-5') + 1
+
+    def test_the_rendered_header_is_still_the_pinned_column_set(self):
+        """The invariant the committed artifact is already held to, asserted
+        here on a synthetic report so a column added to the constant without
+        being rendered fails at the unit level rather than at regeneration."""
+        mod = _mod()
+
+        rendered = mod.render_markdown(_report())
+        header = next(
+            line for line in rendered.splitlines() if line.startswith('| arm ')
+        )
+
+        assert header == '| ' + ' | '.join(mod.DECISION_TABLE_COLUMNS) + ' |'
+
+    def test_each_arms_cell_comes_from_the_stored_rate(self):
+        """Located by column NAME, never by a hardcoded index.
+
+        The fixture's stored rate (0.40) differs from its transform-credited
+        neighbour (0.70) on purpose: a cell wired to the wrong key would
+        otherwise print a plausible number and pass.
+        """
+        mod = _mod()
+        report = _report()
+        column = mod.DECISION_TABLE_COLUMNS.index(_STORED_COLUMN)
+        neighbour = mod.DECISION_TABLE_COLUMNS.index('canonical in top-5')
+
+        rows = _decision_table_rows(mod.render_markdown(report))
+
+        assert rows
+        for row in rows:
+            cells = _cells(row)
+            arm = cells[0]
+            expected = report['arms'][arm]['discoverability'][
+                'stored_canonical_in_top_5_rate']
+            # Same precision as the column it qualifies — two numbers a
+            # reader is meant to compare must not be formatted differently.
+            assert cells[column] == f'{expected:.2f}'
+            assert cells[column] != cells[neighbour]
+
+    def test_an_unmeasured_stored_rate_renders_as_no_measurement(self):
+        """`—`, never `0.00`.  On THIS column a printed zero would read as
+        "retrieval never found the canonical", which is a finding — and the
+        opposite of "we did not measure"."""
+        mod = _mod()
+        arms = _all_arms()
+        arms['status_quo']['discoverability'][
+            'stored_canonical_in_top_5_rate'] = None
+        report = mod.build_report(
+            arms=arms, audit_recall=_audit_recall(), protocol=_protocol(),
+        )
+        column = mod.DECISION_TABLE_COLUMNS.index(_STORED_COLUMN)
+
+        row = next(
+            line for line in _decision_table_rows(mod.render_markdown(report))
+            if line.startswith('| status_quo |')
+        )
+
+        assert _cells(row)[column] == mod._NO_MEASUREMENT
+
+    def test_the_by_kind_table_carries_the_column_too(self):
+        """`held_out` is the row that measures generalisation, and it is
+        exactly the row where a transform-credited number is least safe to
+        read alone."""
+        mod = _mod()
+        report = _report()
+
+        header, rows = _by_kind_table(mod.render_markdown(report))
+        column = header.index(_STORED_COLUMN)
+
+        assert header.index('canonical in top-5') + 1 == column
+        assert rows
+        by_arm: dict[str, set[str]] = {}
+        for row in rows:
+            cells = _cells(row)
+            arm, kind = cells[0], cells[1]
+            expected = report['arms'][arm]['by_query_kind'][kind][
+                'discoverability']['stored_canonical_in_top_5_rate']
+            assert cells[column] == f'{expected:.2f}'
+            by_arm.setdefault(arm, set()).add(cells[column])
+
+        # Anti-vacuity: the fixture gives every subset a DIFFERENT stored
+        # rate, so a renderer sourcing all three rows from one subset prints
+        # one value three times.  If the fixture is ever re-flattened, this
+        # fails here rather than quietly reducing the loop above to a check
+        # that `claim`'s number appears on `held_out`'s row.
+        for arm, seen in by_arm.items():
+            assert len(seen) == len(rows) // len(by_arm), (
+                f'{arm}: by-kind rows are not distinguishable ({seen})'
+            )
+
+    def test_every_data_row_has_exactly_as_many_cells_as_its_header(self):
+        """A column added to a header but not to the row builder shifts every
+        cell after it one place left, and the table still LOOKS well-formed."""
+        mod = _mod()
+        rendered = mod.render_markdown(_report())
+
+        decision_rows = _decision_table_rows(rendered)
+        for row in decision_rows:
+            assert len(_cells(row)) == len(mod.DECISION_TABLE_COLUMNS)
+
+        header, by_kind_rows = _by_kind_table(rendered)
+        for row in by_kind_rows:
+            assert len(_cells(row)) == len(header)
+
+
+class TestTheRunSpecificClaimIsDerivedNotTyped:
+    """The reading guide's one run-specific paragraph, held to the table.
+
+    Everything else in this renderer that states a finding about THIS run is
+    computed from the report (the pin bullets are the precedent).  A hardcoded
+    sentence about the numbers cannot survive the rerun this file exists to
+    make cheap: the artifact is regenerated by `--json-out`/`--md-out`, the
+    rates already moved once on a rerun with unchanged fixtures, and a stale
+    paragraph sits three lines above the table that contradicts it — in the
+    artifact gate η reads.  So the claim is derived, and these tests pin it to
+    the arms rather than to any wording.
+    """
+
+    @staticmethod
+    def _bullet(mod, rendered: str, arm: str) -> str:
+        """The arm's bullet, located by the anchor the RENDERER emits.
+
+        Same discipline as the pin bullets: selecting on English wording would
+        break on a rewording rather than on a wrong number, which is the
+        opposite of what this checks.  Exactly one, so a duplicated or
+        dropped bullet fails loudly instead of silently skipping an arm.
+        """
+        prefix = mod.stored_gap_bullet_prefix(arm)
+        bullets = [
+            line for line in rendered.splitlines() if line.startswith(prefix)
+        ]
+        assert len(bullets) == 1, f'{arm}: {len(bullets)} bullets'
+        return bullets[0]
+
+    def _mixed_report(self):
+        """A report where one arm AGREES and the rest diverge.
+
+        `_all_arms()` makes every arm diverge, which would exercise only half
+        the block and let "always print the gap sentence" pass.
+        """
+        mod = _mod()
+        arms = _all_arms()
+        discoverability = arms['status_quo']['discoverability']
+        discoverability['stored_canonical_in_top_5_rate'] = \
+            discoverability['canonical_in_top_5_rate']
+        return mod.build_report(
+            arms=arms, audit_recall=_audit_recall(), protocol=_protocol(),
+        )
+
+    def test_every_bullet_restates_its_own_arms_two_rates(self):
+        mod = _mod()
+        report = self._mixed_report()
+
+        rendered = mod.render_markdown(report)
+
+        for arm, measurement in report['arms'].items():
+            disc = measurement['discoverability']
+            stored = disc['stored_canonical_in_top_5_rate']
+            credited = disc['canonical_in_top_5_rate']
+            assert f'{stored:.2f} vs {credited:.2f}' in self._bullet(
+                mod, rendered, arm,
+            ), arm
+
+    def test_an_arm_is_called_identical_exactly_when_its_columns_agree(self):
+        """The claim the old hardcoded paragraph made about `status_quo` and
+        `c_peers`.  Made about whichever arms actually agree, so a rerun that
+        moves one of them moves the sentence with it."""
+        mod = _mod()
+        report = self._mixed_report()
+
+        rendered = mod.render_markdown(report)
+
+        agreed = diverged = 0
+        for arm, measurement in report['arms'].items():
+            disc = measurement['discoverability']
+            stored = disc['stored_canonical_in_top_5_rate']
+            credited = disc['canonical_in_top_5_rate']
+            bullet = self._bullet(mod, rendered, arm)
+            if stored == credited:
+                agreed += 1
+                assert 'identical' in bullet, arm
+            else:
+                diverged += 1
+                assert 'identical' not in bullet, arm
+                assert f'gap of {credited - stored:.2f}' in bullet, arm
+        # Anti-vacuity: both branches were actually taken.
+        assert agreed and diverged, f'{agreed} agreed, {diverged} diverged'
+
+    def test_it_does_not_attribute_agreement_to_the_absence_of_grouping(self):
+        """The old paragraph's causal rule was false in general, not merely
+        fragile: `apply_topic_anchor` diverges the two columns too — see
+        `test_the_pin_moves_the_transformed_column_and_not_the_stored_one` —
+        so the columns agree when no read-side transform CHANGED the window,
+        not when the shape "runs no grouping transform"."""
+        mod = _mod()
+
+        rendered = mod.render_markdown(self._mixed_report())
+
+        bullet = self._bullet(mod, rendered, 'status_quo')
+        assert 'grouping' not in bullet
+        assert 'no read-side transform changed' in bullet
+
+    def test_an_unmeasured_column_is_reported_as_not_comparable(self):
+        """`—` vs a number is not a gap, and subtracting `None` is a crash in
+        the renderer that writes the operator's artifact."""
+        mod = _mod()
+        arms = _all_arms()
+        arms['c_peers']['discoverability'][
+            'stored_canonical_in_top_5_rate'] = None
+        report = mod.build_report(
+            arms=arms, audit_recall=_audit_recall(), protocol=_protocol(),
+        )
+
+        bullet = self._bullet(mod, mod.render_markdown(report), 'c_peers')
+
+        assert mod._NO_MEASUREMENT in bullet
+        assert 'not comparable' in bullet
+
+    def test_a_gap_that_rounds_to_zero_never_prints_as_the_agreement_value(self):
+        """`0.00` is the value the surrounding sentence reads as "identical",
+        so a real gap of 0.002 must not be allowed to print it — the same
+        rule, and the same reason, as the pin column's `<0.01`."""
+        mod = _mod()
+        arms = _all_arms()
+        disc = arms['b_grouped']['discoverability']
+        disc['canonical_in_top_5_rate'] = 0.502
+        disc['stored_canonical_in_top_5_rate'] = 0.5
+        report = mod.build_report(
+            arms=arms, audit_recall=_audit_recall(), protocol=_protocol(),
+        )
+
+        bullet = self._bullet(mod, mod.render_markdown(report), 'b_grouped')
+
+        assert f'gap of {mod._PIN_RATE_UNDERFLOW}' in bullet
+        assert 'gap of 0.00' not in bullet
+        assert 'identical' not in bullet
+
+    def test_the_anchor_does_not_collide_with_the_pin_bullets(self):
+        """Both anchors are `- `-prefixed and name the same three shapes.  A
+        collision would give `test_the_prose_bullet_restates_the_same_rate...`
+        two bullets where it asserts one, breaking a test about a different
+        column from a change to this one."""
+        mod = _mod()
+
+        rendered = mod.render_markdown(_report())
+
+        for shape in mod.ARM_SHAPES:
+            pin_anchor = mod.pin_bullet_prefix(shape)
+            assert not mod.stored_gap_bullet_prefix(shape).startswith(pin_anchor)
+            assert sum(
+                1 for line in rendered.splitlines()
+                if line.startswith(pin_anchor)
+            ) == 1, shape
 
 
 class TestTheTwoArtifactsAreWrittenAsAPair:
@@ -4190,6 +4600,349 @@ class TestByQueryKindSplitsTheQueriesItClaimsToSplit:
         assert by_kind['claim']['claim_recall']['at_5'] is not None
 
 
+# ---------------------------------------------------------------------------
+# The transform-blind discoverability sub-metric
+# ---------------------------------------------------------------------------
+#
+# The mechanism is stated ONCE, in the script's module docstring under
+# "Rank-based is not transform-blind" — a transform can materialise a record
+# wearing the canonical's `record_id`, so `canonical in top-5` is a property
+# of the READ TRANSFORM and not purely of retrieval, and the `stored_*` trio
+# is the transform-blind counterpart that discloses the gap.
+#
+# This section covers the AGGREGATION half only.  `measure_arm` populating
+# the rows — and the b_grouped-vs-c_peers divergence itself — is the next.
+
+
+def _agg_row(*, canonical_in_5: float | None = 1.0,
+             canonical_rank: int | None = 1,
+             stored_in_5: float | None = 1.0,
+             stored_rank: int | None = 1,
+             has_canonical=True, kind='claim', held_out=False,
+             recall_5=0.5, recall_10=0.5):
+    """One `measure_arm` row, in the shape `_aggregate_queries` consumes.
+
+    Hand-built: no store, no network, no embedder — so every expectation
+    below is exact.
+
+    The four canonical params are `| None`-typed because `measure_arm`
+    genuinely emits None for each: the RANK pair when the canonical never
+    ranked, the RATE pair when the cluster had no canonical to look for at
+    all (`bake_off_storage_shape.py:3111-3112`).  Both are non-observations
+    `_mean` must skip rather than average in as 0.0 — the distinction
+    several tests below exist to pin, so the defaults must not narrow it
+    away.
+    """
+    return {
+        'kind': kind,
+        'held_out': held_out,
+        'recall_5': recall_5,
+        'recall_10': recall_10,
+        'canonical_in_5': canonical_in_5,
+        'canonical_rank': canonical_rank,
+        'stored_canonical_in_5': stored_in_5,
+        'stored_canonical_rank': stored_rank,
+        'has_canonical': has_canonical,
+        'tokens': 10.0,
+    }
+
+
+class TestTransformBlindDiscoverabilityAggregation:
+    """`_aggregate_queries` reports the canonical twice: credited, and raw."""
+
+    def test_the_stored_trio_is_computed_from_the_stored_fields(self):
+        """The two halves must come from DIFFERENT inputs, not be aliased.
+
+        Every row here has the transformed canonical at rank 1 and the
+        stored canonical either deep or absent — the divergence a grouped
+        read produces.  If the new keys ever read the transformed fields,
+        they would print the transformed answer and the disclosure would be
+        a duplicated column.
+        """
+        block = _mod()._aggregate_queries([
+            _agg_row(canonical_in_5=1.0, canonical_rank=1,
+                     stored_in_5=0.0, stored_rank=9),
+            _agg_row(canonical_in_5=1.0, canonical_rank=1,
+                     stored_in_5=1.0, stored_rank=3),
+            _agg_row(canonical_in_5=1.0, canonical_rank=1,
+                     stored_in_5=0.0, stored_rank=None),
+        ], limit=10)['discoverability']
+
+        # Transformed: every row found it in the top 5, at rank 1.
+        assert block['canonical_in_top_5_rate'] == 1.0
+        assert block['median_canonical_rank'] == 1.0
+        assert block['canonical_found_count'] == 3
+        # Transform-blind: one row in five, ranks 9 and 3, one never found.
+        assert block['stored_canonical_in_top_5_rate'] == pytest.approx(1 / 3)
+        assert block['stored_canonical_median_rank'] == 6.0
+        assert block['stored_canonical_found_count'] == 2
+
+    def test_an_unasked_subset_reports_none_rather_than_a_measured_zero(self):
+        """`queries: 0` is "not asked".  A `0.00` would claim it was asked.
+
+        Same discipline the existing keys already hold to — a new column that
+        printed a measured zero for an empty subset would put a lie in the
+        by-kind table's held-out row on any arm that had none.
+        """
+        block = _mod()._aggregate_queries([], limit=10)
+
+        assert block['queries'] == 0
+        disc = block['discoverability']
+        assert disc['stored_canonical_in_top_5_rate'] is None
+        assert disc['stored_canonical_median_rank'] is None
+        # A COUNT of successes over an empty subset is honestly zero — it is
+        # a denominator, not a rate, exactly as `canonical_found_count` is.
+        assert disc['stored_canonical_found_count'] == 0
+        assert disc['canonical_found_count'] == 0
+
+    def test_a_query_with_no_canonical_is_excluded_not_averaged_in_as_zero(self):
+        """`_mean`'s contract: `None` is a non-observation, never a 0.0.
+
+        A claim query whose cluster has no canonical was never asked the
+        discoverability question.  Averaging it in as zero would drag the
+        rate down for a question the arm was never posed.
+        """
+        block = _mod()._aggregate_queries([
+            _agg_row(stored_in_5=1.0, stored_rank=1),
+            _agg_row(stored_in_5=None, stored_rank=None, canonical_in_5=None,
+                     canonical_rank=None, has_canonical=False),
+        ], limit=10)['discoverability']
+
+        # 1.0 over the ONE row that had a canonical — not 0.5 over both.
+        assert block['stored_canonical_in_top_5_rate'] == 1.0
+        assert block['stored_canonical_found_count'] == 1
+        assert block['canonical_candidates'] == 1
+
+    def test_the_found_count_is_the_denominator_the_median_is_censored_over(self):
+        """Mirrors the `canonical_found_count`/`canonical_candidates` pairing.
+
+        The median is over the queries where the stored canonical surfaced AT
+        ALL.  Without the count beside it, an arm whose stored canonical
+        almost never ranks prints the best stored median in the table —
+        scored on the handful of queries where it did.  That is the exact
+        trap the module already documents for the transformed column, and it
+        must not reopen one column over.
+        """
+        block = _mod()._aggregate_queries([
+            _agg_row(stored_in_5=1.0, stored_rank=1),
+            _agg_row(stored_in_5=0.0, stored_rank=None),
+            _agg_row(stored_in_5=0.0, stored_rank=None),
+        ], limit=10)['discoverability']
+
+        # A flawless-looking median...
+        assert block['stored_canonical_median_rank'] == 1.0
+        # ...taken over exactly one of three queries that HAD a canonical.
+        assert block['stored_canonical_found_count'] == 1
+        assert block['canonical_candidates'] == 3
+
+    def test_no_existing_discoverability_key_changed_name_or_value(self):
+        """The new trio is purely ADDITIVE.
+
+        The headline decision table is read by gate η off these keys; a
+        rename or a shifted value would silently re-point the whole artifact.
+        """
+        rows = [
+            _agg_row(canonical_in_5=1.0, canonical_rank=2,
+                     stored_in_5=0.0, stored_rank=7),
+            _agg_row(canonical_in_5=0.0, canonical_rank=None,
+                     stored_in_5=0.0, stored_rank=None),
+        ]
+
+        block = _mod()._aggregate_queries(rows, limit=25)['discoverability']
+
+        assert block['canonical_in_top_5_rate'] == 0.5
+        assert block['median_canonical_rank'] == 2.0
+        assert block['canonical_found_count'] == 1
+        assert block['canonical_candidates'] == 2
+        assert block['canonical_rank_window'] == 25
+
+
+def _credit_arm(shape, *, canonical_at=None, fillers=2):
+    """One canonical, one CHILD of it, and filler hits on another topic.
+
+    The canonical always exists in the arm (so a grouped read can resolve the
+    child upward into it) but appears among the fetched hits only when
+    *canonical_at* names its 1-based position.  ``canonical_at=None`` is the
+    case the credit mechanism turns on: the store never returned the
+    canonical's own record, and only the read transform can put it in the
+    window.
+    """
+    canonical = _rec(PARENT, topic='t', canonical=True, claim_ids=['k-canon'])
+    child = _rec('child-1', parent_id=PARENT, kind='amendment', topic='t',
+                 claim_ids=['k0'])
+    filler = [_rec(f'f{i}', topic='other', claim_ids=[f'kf{i}'])
+              for i in range(fillers)]
+    ranked = [child, *filler]
+    if canonical_at is not None:
+        ranked.insert(canonical_at - 1, canonical)
+    hits = [_sh(record, 0.9 - i / 100.0) for i, record in enumerate(ranked)]
+    seeded = _seeded(
+        shape,
+        [canonical, child, *filler],
+        canonical_by_topic={'t': canonical},
+        canonical_by_cluster={'c1': PARENT},
+        siblings_by_cluster={'c1': {'child-1'}},
+    )
+    return seeded, hits
+
+
+class TestGroupedReadCanonicalCreditIsDisclosed:
+    """The mechanism behind `b_grouped`'s headline discoverability number.
+
+    Stated once in the script's module docstring, "Rank-based is not
+    transform-blind"; the tests below are that statement made executable.  Not
+    a bug to be corrected — the numbers are recorded as measured (G6/D10
+    assert no threshold) — a mechanism to be DISCLOSED, and the
+    transform-blind column is the disclosure.
+    """
+
+    def test_a_child_folding_upward_is_credited_as_the_canonical(self):
+        """The conflation, stated as an executable difference.
+
+        The canonical's own record is absent from the fetch entirely; only
+        its child ranked.  The transformed column says "found, at rank 1".
+        The transform-blind column says "never returned" — and both are true
+        statements about different questions.
+        """
+        seeded, hits = _credit_arm('b_grouped')
+
+        disc = _measure(seeded, hits, pin=False)['discoverability']
+
+        assert disc['canonical_in_top_5_rate'] == 1.0
+        assert disc['median_canonical_rank'] == 1.0
+        assert disc['canonical_found_count'] == 1
+        assert disc['stored_canonical_in_top_5_rate'] == 0.0
+        assert disc['stored_canonical_found_count'] == 0
+        assert disc['stored_canonical_median_rank'] is None
+        # The query DID have a canonical to look for, so the 0.0 above is a
+        # measured miss and not a non-observation.
+        assert disc['canonical_candidates'] == 1
+
+    @pytest.mark.parametrize('shape', ['status_quo', 'c_peers'])
+    @pytest.mark.parametrize('canonical_at', [None, 2])
+    def test_without_grouping_the_two_columns_agree(self, shape, canonical_at):
+        """No grouping transform, so there is nothing for the credit to come
+        from and the two columns must report the same thing — whether the
+        canonical ranked (``canonical_at=2``) or never did (``None``).
+
+        This is what makes the divergence above attributable to grouping
+        specifically rather than to the new column being wired to a different
+        window, and it is what keeps the column from being always-zero.
+        """
+        seeded, hits = _credit_arm(shape, canonical_at=canonical_at)
+
+        disc = _measure(seeded, hits, pin=False)['discoverability']
+
+        assert disc['stored_canonical_in_top_5_rate'] == \
+            disc['canonical_in_top_5_rate']
+        assert disc['stored_canonical_median_rank'] == \
+            disc['median_canonical_rank']
+        assert disc['stored_canonical_found_count'] == \
+            disc['canonical_found_count']
+        # Not vacuous: a canonical that DID rank reads as found, at its rank.
+        expected_rate = 0.0 if canonical_at is None else 1.0
+        assert disc['stored_canonical_in_top_5_rate'] == expected_rate
+
+    @pytest.mark.parametrize('shape', ['status_quo', 'c_peers', 'b_grouped'])
+    def test_the_stored_column_is_blind_to_the_pin_as_well(self, shape):
+        """Transform-blind means blind to EVERY read-side transform.
+
+        `apply_topic_anchor` also injects the canonical into the window, so a
+        column blind only to grouping would still credit the pin for a
+        retrieval the ANN never performed — the same defect one transform
+        over.  Measured over the raw hits, the trio cannot depend on the pin,
+        which is what makes it comparable across all six arms.
+        """
+        seeded, hits = _credit_arm(shape)
+
+        off = _measure(seeded, hits, pin=False)['discoverability']
+        on = _measure(seeded, hits, pin=True)['discoverability']
+
+        for key in ('stored_canonical_in_top_5_rate',
+                    'stored_canonical_median_rank',
+                    'stored_canonical_found_count'):
+            assert on[key] == off[key], key
+
+    def test_the_pin_moves_the_transformed_column_and_not_the_stored_one(self):
+        """The anti-vacuity half of the test above.
+
+        Equality across pin variants is only meaningful if the pin actually
+        FIRED, so this pins a fixture where it does: the window has headroom,
+        the pin appends the canonical, and the transformed rate moves 0 -> 1
+        while the transform-blind rate stays where retrieval left it.
+        """
+        seeded, hits = _credit_arm('c_peers')
+
+        off = _measure(seeded, hits, pin=False)
+        on = _measure(seeded, hits, pin=True)
+
+        assert on['pin']['window_changed_rate'] > 0.0
+        assert off['discoverability']['canonical_in_top_5_rate'] == 0.0
+        assert on['discoverability']['canonical_in_top_5_rate'] == 1.0
+        assert on['discoverability']['stored_canonical_in_top_5_rate'] == 0.0
+
+    def test_the_stored_rank_is_not_censored_at_the_read_window(self):
+        """"Outside the top 5" and "absent entirely" stay different findings.
+
+        Exactly the contract the transformed rank already holds — a stored
+        rank censored at 5 would collapse a canonical that came NEARLY there
+        into the same None as one the store never returned.
+        """
+        deep_seeded, deep_hits = _credit_arm('c_peers', canonical_at=7,
+                                             fillers=7)
+        absent_seeded, absent_hits = _credit_arm('c_peers', fillers=7)
+
+        deep = _measure(deep_seeded, deep_hits, pin=False)['discoverability']
+        absent = _measure(absent_seeded, absent_hits,
+                          pin=False)['discoverability']
+
+        assert deep['stored_canonical_median_rank'] == 7.0
+        assert deep['stored_canonical_found_count'] == 1
+        assert deep['stored_canonical_in_top_5_rate'] == 0.0
+        assert absent['stored_canonical_median_rank'] is None
+        assert absent['stored_canonical_found_count'] == 0
+        assert absent['stored_canonical_in_top_5_rate'] == 0.0
+
+    def test_the_new_fields_add_keys_and_change_no_existing_measurement(self):
+        """Purely additive at the `measure_arm` seam, not only at aggregation.
+
+        Every block's key set is pinned by equality and every pre-existing
+        discoverability/claim_recall/pin value is hand-computed, so a change
+        that re-pointed an existing column while adding the new one cannot
+        pass.  The fixture is three plain records of `'body'` (4 chars) under
+        `c_peers`, with the canonical itself ranked first.
+        """
+        seeded, hits = _credit_arm('c_peers', canonical_at=1, fillers=1)
+
+        measurement = _measure(seeded, hits, pin=False)
+
+        assert set(measurement) == {
+            'pin', 'claim_recall', 'discoverability', 'by_query_kind',
+            'tokens_per_query', 'guard_adequacy',
+        }
+        assert measurement['pin'] == {'enabled': False,
+                                      'window_changed_rate': None}
+        assert measurement['claim_recall'] == {'at_5': 1.0, 'at_10': 1.0}
+        assert measurement['discoverability'] == {
+            'canonical_in_top_5_rate': 1.0,
+            'median_canonical_rank': 1.0,
+            'canonical_found_count': 1,
+            'canonical_candidates': 1,
+            'canonical_rank_window': 10,
+            'stored_canonical_in_top_5_rate': 1.0,
+            'stored_canonical_median_rank': 1.0,
+            'stored_canonical_found_count': 1,
+        }
+        assert measurement['tokens_per_query'] == {
+            'mean': 12.0, 'estimator': 'injected:chars', 'window': 10,
+        }
+        assert set(measurement['guard_adequacy']) == {
+            'candidate_present_rate', 'guard_matched_rate', 'threshold_replay',
+            'threshold', 'max_observed_score', 'probes', 'guard_covered_probes',
+            'guard_covered_category',
+        }
+
+
 class TestReadPathHoldsTheWindowBudget:
     """Pin-on and pin-off must be scored over equal-size windows."""
 
@@ -4995,7 +5748,13 @@ class TestCommittedReportJson:
 
     @pytest.mark.parametrize('metric,keys', [
         ('claim_recall', ('at_5', 'at_10')),
-        ('discoverability', ('canonical_in_top_5_rate',)),
+        # Both forms of the same column: the one measured over the read
+        # window, and the transform-blind one measured over the raw store
+        # hits.  A committed run missing the second leaves `b_grouped`'s
+        # headline rate readable only as though grouping were retrieval.
+        ('discoverability', ('canonical_in_top_5_rate',
+                             'stored_canonical_in_top_5_rate',
+                             'stored_canonical_found_count')),
         ('tokens_per_query', ('mean',)),
         # Both halves: the rank-based one and the flagged threshold replay.
         ('guard_adequacy', ('candidate_present_rate', 'guard_matched_rate')),
@@ -5026,10 +5785,54 @@ class TestCommittedReportJson:
                     assert by_kind[kind]['claim_recall'][key] is not None, (
                         f'{arm}.{kind}.claim_recall.{key}'
                     )
+                # The by-kind table renders the transform-blind column too,
+                # and `held_out` — the only subset that measures
+                # generalisation rather than recall of the derivation input
+                # — is the row where a transform-credited rate is least safe
+                # to read alone.
+                assert by_kind[kind]['discoverability'][
+                    'stored_canonical_in_top_5_rate'] is not None, (
+                    f'{arm}.{kind}.stored_canonical_in_top_5_rate'
+                )
             # held_out is a SUBSET of topic_phrasing, never a third kind, and
             # a strict one — the whole point is that some phrasings WERE the
             # registry's derivation input and so cannot measure generalisation.
             assert by_kind['held_out']['queries'] < by_kind['topic_phrasing']['queries']
+
+    def test_the_transform_blind_column_is_identical_across_a_shapes_pin_twins(self):
+        """Measured over the raw store hits, so it CANNOT depend on the pin.
+
+        The artifact-level statement of the unit-level property, and the one
+        that makes the column readable as retrieval rather than as any
+        read-side transform: a difference here would mean the column is
+        measuring something downstream of `read_path` after all.
+        """
+        report = _committed_report()
+
+        for shape in _mod().ARM_SHAPES:
+            off = report['arms'][shape]['discoverability']
+            on = report['arms'][f'{shape}+pin']['discoverability']
+            for key in ('stored_canonical_in_top_5_rate',
+                        'stored_canonical_median_rank',
+                        'stored_canonical_found_count'):
+                assert on[key] == off[key], f'{shape}.{key}'
+
+    def test_at_least_one_arm_reads_differently_before_and_after_the_transforms(self):
+        """Anti-vacuity, in the spirit of the `assert checked` guard below.
+
+        Pins NO rate, bound, direction or magnitude (G6) — only that a
+        difference EXISTS somewhere in the table.  Two columns that always
+        agreed would mean the disclosure column had been aliased to the one
+        it is supposed to qualify, and a future regeneration that quietly did
+        that would otherwise publish a duplicated number and pass.
+        """
+        report = _committed_report()
+
+        assert any(
+            measurement['discoverability']['stored_canonical_in_top_5_rate']
+            != measurement['discoverability']['canonical_in_top_5_rate']
+            for measurement in report['arms'].values()
+        ), 'no arm distinguishes the stored rate from the transform-credited one'
 
     def test_every_arm_carries_the_pin_diagnostic(self):
         """Both keys on all six rows. A `+pin` row identical to its twin is
@@ -5278,6 +6081,45 @@ class TestCommittedReportMarkdown:
             assert cell in bullets[0].split(), (
                 f'{shape}: table says {cell!r} for {shape}+pin, but the '
                 f'prose bullet does not restate it: {bullets[0]!r}'
+            )
+
+    def test_the_stored_gap_bullets_agree_with_the_committed_table(self):
+        """The run-specific paragraph, checked against the table it sits above.
+
+        Extracted from the MARKDOWN on both sides — the bullet's own text
+        versus the table's own cells — so this fails on exactly the defect the
+        derivation was introduced to prevent: an artifact whose prose states a
+        relationship the table three lines below contradicts.  A regeneration
+        that reverted the paragraph to a typed sentence would keep passing
+        `test_it_renders_byte_identically_from_the_committed_json` (both sides
+        render through the same function) but not this.
+        """
+        mod = _mod()
+        rendered = mod.DEFAULT_REPORT_MD.read_text(encoding='utf-8')
+        stored_column = mod.DECISION_TABLE_COLUMNS.index(
+            'canonical in top-5 (stored)')
+        credited_column = mod.DECISION_TABLE_COLUMNS.index('canonical in top-5')
+
+        cells = {}
+        for row in _decision_table_rows(rendered):
+            parsed = _cells(row)
+            cells[parsed[0]] = (parsed[stored_column], parsed[credited_column])
+
+        assert cells
+        for arm, (stored, credited) in cells.items():
+            prefix = mod.stored_gap_bullet_prefix(arm)
+            bullets = [
+                line for line in rendered.splitlines()
+                if line.startswith(prefix)
+            ]
+            assert len(bullets) == 1, f'{arm}: {len(bullets)} bullets'
+            assert f'{stored} vs {credited}' in bullets[0], (
+                f'{arm}: table says stored={stored} credited={credited}, the '
+                f'prose says: {bullets[0]!r}'
+            )
+            assert ('identical' in bullets[0]) is (stored == credited), (
+                f'{arm}: the bullet and the table disagree on whether the two '
+                f'columns match: {bullets[0]!r}'
             )
 
     def test_it_renders_byte_identically_from_the_committed_json(self):

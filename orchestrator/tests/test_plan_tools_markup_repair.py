@@ -26,6 +26,7 @@ module's OWN BYTES at import, so a future editor cannot quietly reintroduce one
 from __future__ import annotations
 
 import copy
+import errno
 import inspect
 import json
 import logging
@@ -274,6 +275,57 @@ _COLLECTION_SCHEMA_TOOL_NAME = {
     'reuse': 'add_reuse_item',
 }
 
+#: Every MCP-registered plan-tools impl that can reach ``artifacts.write_plan``
+#: (or an equivalent plan-mutating call) at all — the full candidate set for
+#: "could this be an UNDECLARED alternate writer of a
+#: ``_REPAIRABLE_PLAN_FIELDS`` cell?", used by
+#: ``test_no_plan_writing_tool_is_an_undeclared_alternate``.
+#:
+#: The ``report_*`` family (``report_blocking_dependency``,
+#: ``report_task_already_done``, ``report_ready_to_merge``,
+#: ``report_unactionable_task``, ``report_false_premise``) is excluded
+#: deliberately, not by oversight: each persists to an entirely separate
+#: artifact file (``artifacts.write_blocking_dependency`` / ``write_already_done``
+#: / ``write_ready_to_merge`` / ``write_unactionable_task`` / ``write_false_premise``,
+#: plan_tools.py:1339-1431) and never calls ``artifacts.write_plan`` at all, so
+#: none of them can possibly write a plan.json cell. Sweeping them in would only
+#: add unrecognised-parameter synthesis (``classification``, ``premise``,
+#: ``evidence``, ...) to observe a guaranteed no-op every time — the exact
+#: fragility the module's design decisions rejected a full entry-point sweep
+#: over.
+_PLAN_WRITING_TOOL_NAMES = (
+    'create_plan',
+    'add_plan_step',
+    'add_prerequisite',
+    'add_design_decision',
+    'add_reuse_item',
+    'update_plan_metadata',
+    'remove_plan_step',
+    'replace_plan_step',
+    'mark_step_done',
+    'mark_step_committed',
+    'confirm_plan',
+)
+
+
+def _seed_plan_through_real_writers(root) -> TaskArtifacts:
+    """Build a plan by calling the five REAL writer tools; return its artifacts.
+
+    The single source of the seeding shape. Both :func:`_observed_plan_keys`
+    and :func:`_alternate_writer_changed_the_cell` build their fixture plan
+    through this helper rather than each restating the same five calls, so
+    adding a sixth writer — or changing one of these five signatures — is one
+    edit instead of two silently-divergeable ones.
+    """
+    artifacts = TaskArtifacts(root)
+    artifacts.init('test-1', 'Test task', 'A test')
+    plan_tools._create_plan(artifacts, 'test-1', 'A title.', 'An analysis.', ['a.py'])
+    plan_tools._add_prerequisite(artifacts, 'pre-1', 'A prerequisite.')
+    plan_tools._add_plan_step(artifacts, 'step-1', 'test', 'A step.')
+    plan_tools._add_design_decision(artifacts, 'A decision.', 'A rationale.')
+    plan_tools._add_reuse_item(artifacts, 'A thing', 'somewhere.py', 'By importing it.')
+    return artifacts
+
 
 def _observed_plan_keys(root) -> dict[str | None, set[str]]:
     """Build a plan through the REAL writers; return the keys they actually wrote.
@@ -284,14 +336,7 @@ def _observed_plan_keys(root) -> dict[str | None, set[str]]:
     exactly as ``schema_params`` is derived from ``inspect.signature``, rather
     than restating them as a hardcoded literal a refactor could silently orphan.
     """
-    artifacts = TaskArtifacts(root)
-    artifacts.init('test-1', 'Test task', 'A test')
-    plan_tools._create_plan(artifacts, 'test-1', 'A title.', 'An analysis.', ['a.py'])
-    plan_tools._add_prerequisite(artifacts, 'pre-1', 'A prerequisite.')
-    plan_tools._add_plan_step(artifacts, 'step-1', 'test', 'A step.')
-    plan_tools._add_design_decision(artifacts, 'A decision.', 'A rationale.')
-    plan_tools._add_reuse_item(artifacts, 'A thing', 'somewhere.py', 'By importing it.')
-    plan = artifacts.read_plan()
+    plan = _seed_plan_through_real_writers(root).read_plan()
 
     observed: dict[str | None, set[str]] = {None: set(plan)}
     for collection in ('prerequisites', 'steps', 'design_decisions', 'reuse'):
@@ -299,6 +344,114 @@ def _observed_plan_keys(root) -> dict[str | None, set[str]]:
         assert items, f'{collection} came back empty — the writers did not run'
         observed[collection] = {key for item in items for key in item}
     return observed
+
+
+def _alternate_writer_changed_the_cell(
+    root, collection: str | None, field: str, tool_name: str
+) -> tuple[bool, dict[str, object] | None]:
+    """(changed, refusal) for calling *tool_name* on a plan seeded through the
+    real writers, addressed at the (*collection*, *field*) cell.
+
+    ``changed`` is True iff the cell's value differs after the call AND its
+    item still exists. ``refusal`` is the tool's own status envelope when that
+    envelope indicates it declined the call (``None`` on a successful call,
+    whether or not the cell changed). Every plan-tools impl returns its
+    refusal envelope BEFORE calling
+    ``artifacts.write_plan``/``update_step_status``/``mark_step_committed`` on
+    every refusal path, so ``refusal is not None`` always implies
+    ``changed is False`` — never the reverse. Separating the two lets a caller
+    distinguish "genuinely does not write this field" from "the probe called
+    it wrong" (e.g. a stale id, an item already ``done``); collapsing both into
+    a bare bool made every refusal read as proof of the former.
+
+    THE BEHAVIOURAL PROOF ``also_written_by`` NEEDS. A signature check
+    (``field in _tool_params(impl)``) can only see a writer that takes the
+    field AS A PARAMETER — false for ``mark_step_committed``, which prepends a
+    provenance tag to ``description`` by re-reading and rewriting the plan
+    without ever taking a ``description`` argument at all. Proving the write
+    behaviourally is the invariant the signature proxy was standing in for.
+
+    Seeds via :func:`_seed_plan_through_real_writers` (same five real writers
+    as :func:`_observed_plan_keys`), snapshots the addressed cell, invokes
+    *tool_name* with arguments synthesized from ITS OWN live signature — never
+    a hardcoded call. A parameter name this synthesis does not recognise
+    raises loudly rather than being silently left unset, so a probe can never
+    pass by having quietly called the alternate with a hole in its arguments.
+
+    A collection whose items carry no ``id`` (``design_decisions``, ``reuse``)
+    is addressed POSITIONALLY — the single seeded item at index 0 — rather
+    than by id, since there is no id to look up; probing one of their rows
+    used to raise a bare ``KeyError`` before this existed.
+
+    An alternate whose guard depends on state this fixture cannot supply
+    (currently only ``mark_step_committed``, via ``_sha_exists_on_branch`` —
+    ``root`` here is not a git repository) is the CALLER's responsibility to
+    satisfy first, e.g. via ``monkeypatch``.
+    """
+    artifacts = _seed_plan_through_real_writers(root)
+
+    seeded_id = None
+    address_by_index = False
+    if collection is not None:
+        items = artifacts.read_plan()[collection]
+        assert items and isinstance(items[0], dict), (
+            f'the seeded plan has no item in {collection!r} to probe'
+        )
+        if 'id' in items[0]:
+            seeded_id = items[0]['id']
+        else:
+            address_by_index = True
+
+    def _cell() -> tuple[object, bool]:
+        """(value, item still present) at the (collection, field) address."""
+        plan = artifacts.read_plan()
+        if collection is None:
+            return plan.get(field), True
+        items = plan.get(collection, [])
+        if address_by_index:
+            if items and isinstance(items[0], dict):
+                return items[0].get(field), True
+            return None, False
+        for item in items:
+            if isinstance(item, dict) and item.get('id') == seeded_id:
+                return item.get(field), True
+        return None, False
+
+    before, _ = _cell()
+
+    impl = getattr(plan_tools, '_' + tool_name)
+    kwargs: dict[str, object] = {}
+    for name in inspect.signature(impl).parameters:
+        if name == 'artifacts':
+            continue
+        if name in ('step_id', 'prereq_id'):
+            kwargs[name] = seeded_id
+        elif name == 'step_type':
+            kwargs[name] = 'test'
+        elif name in ('sha', 'commit_sha'):
+            kwargs[name] = 'a' * 40
+        elif name == 'files':
+            kwargs[name] = ['a.py']
+        elif name == 'task_id':
+            kwargs[name] = 'test-1'
+        elif name in (
+            'description', 'analysis', 'title', 'decision', 'rationale',
+            'what', 'where', 'how',
+        ):
+            kwargs[name] = f'Probe marker for {tool_name}.{name}.'
+        else:
+            raise AssertionError(
+                f'_alternate_writer_changed_the_cell does not know how to '
+                f'synthesize a value for {impl.__name__}({name!r}) — extend '
+                'the probe rather than silently probing nothing'
+            )
+    result = impl(artifacts, **kwargs)
+    refusal = None
+    if not (result.get('status') == 'ok' or result.get('ok') is True):
+        refusal = result
+
+    after, still_exists = _cell()
+    return still_exists and after != before, refusal
 
 
 class TestRepairableFieldTable:
@@ -422,51 +575,95 @@ class TestRepairableFieldTable:
             assert record.field in record.target_keys
             assert record.target_keys[record.field] == record.field
 
-    def test_every_alternate_writer_is_a_real_tool_taking_that_field(self):
-        """``also_written_by`` must name real call sites, not prose labels.
+    def test_every_alternate_writer_really_writes_that_field(self, tmp_path, monkeypatch):
+        """``also_written_by`` must name real call sites that ACTUALLY write the field.
 
         The fact's ``tool`` is the collection's SCHEMA OWNER, which is not always
         the call that produced the corruption — ``replace_plan_step`` also writes
         ``description`` on steps AND prerequisites, ``update_plan_metadata`` also
-        writes ``analysis``. An alternate that named no real entry point, or one
-        that does not take the field at all, would send a triager somewhere the
-        corruption could not have come from: a diagnostic that reads as precision
-        while pointing at nothing.
+        writes ``analysis``, and ``mark_step_committed`` prepends a provenance tag
+        to ``description`` on either collection. An alternate that named no real
+        entry point, or one that never actually touches the field, would send a
+        triager somewhere the corruption could not have come from: a diagnostic
+        that reads as precision while pointing at nothing.
+
+        Checked BEHAVIOURALLY, not by signature. The previous version of this
+        check asserted ``record.field in _tool_params(impl)`` — a proxy that can
+        only see a writer that takes the field AS A PARAMETER. That is false of
+        ``mark_step_committed``: it rewrites ``description`` by re-reading and
+        rewriting the plan without ever taking a ``description`` argument at
+        all, so the proxy would have REJECTED a real writer. Calling
+        :func:`_alternate_writer_changed_the_cell` instead proves the actual
+        invariant the proxy was standing in for, and is strictly stronger — it
+        catches a declared alternate that names no real entry point (as before)
+        AND one that names a real entry point that simply does not write the
+        field (which the signature proxy could not).
         """
+        monkeypatch.setattr(plan_tools, '_sha_exists_on_branch', lambda *_a, **_k: True)
         for record in plan_tools._REPAIRABLE_PLAN_FIELDS:
             assert isinstance(record.also_written_by, tuple)
             owner = _COLLECTION_SCHEMA_TOOL_NAME[record.collection]
             for name in record.also_written_by:
                 impl = getattr(plan_tools, '_' + name, None)
                 assert callable(impl), f'{name!r} is not a plan_tools function'
-                assert record.field in _tool_params(impl), (
-                    f'{record.collection}.{record.field} names {name!r} as an '
-                    f'alternate writer, but it takes no {record.field!r} '
-                    f'parameter — it cannot write that field'
-                )
                 assert name != owner, (
                     f'{name!r} is the schema owner, already reported as `tool`'
                 )
+                root = tmp_path / f'{record.collection}-{record.field}-{name}'
+                changed, refusal = _alternate_writer_changed_the_cell(
+                    root, record.collection, record.field, name
+                )
+                assert changed, (
+                    f'{name!r} refused the probe call: {refusal!r} — the probe '
+                    'called it wrong, it is not necessarily a non-writer'
+                    if refusal is not None else
+                    f'{record.collection}.{record.field} names {name!r} as an '
+                    'alternate writer, but the probe observed no change on '
+                    'that cell — it cannot actually write that field'
+                )
 
-    def test_the_known_multi_writer_fields_declare_their_alternates(self):
-        """The three fields with a second writer, pinned by behaviour above.
+    def test_no_plan_writing_tool_is_an_undeclared_alternate(self, tmp_path, monkeypatch):
+        """Completeness half of ``also_written_by``: nothing UNDECLARED writes a cell.
 
-        Read off the module under test at review time and re-derivable from the
-        signatures: ``_replace_plan_step`` walks BOTH ``prerequisites`` and
-        ``steps`` looking for its ``step_id``, so it writes ``description`` on
-        either; ``_update_plan_metadata`` writes top-level ``analysis``. A row
-        that quietly lost its alternate would go back to overstating the fact.
+        The soundness check above only proves every DECLARED alternate really
+        writes its field, and passes VACUOUSLY when an alternate is silently
+        dropped from the table. Mutation-verified in this worktree: dropping
+        ``replace_plan_step`` from ``_DESCRIPTION_ALSO``, or
+        ``update_plan_metadata`` from ``_UPDATE_METADATA_ALSO``, left every
+        test in this file green — this test is what catches both, and the
+        next undeclared writer along with them, without re-adding hardcoded
+        pins one at a time.
+
+        Sweeps every :data:`_PLAN_WRITING_TOOL_NAMES` tool against every row
+        and asserts the CONVERSE of the soundness check: whatever the probe
+        OBSERVES writing a cell is either that row's schema owner (already
+        reported as ``tool``, so skipped here) or already named in
+        ``also_written_by``. A refused probe call is not itself a failure —
+        most (tool, row) pairs are simply not applicable (``mark_step_done``
+        can never touch ``reuse``), and per
+        :func:`_alternate_writer_changed_the_cell`'s contract a refusal is
+        conclusive proof the cell was not written; only an OBSERVED,
+        UNDECLARED change fails this test.
         """
-        alternates = {
-            (r.collection, r.field): set(r.also_written_by)
-            for r in plan_tools._REPAIRABLE_PLAN_FIELDS
-        }
-        assert alternates[('steps', 'description')] == {'replace_plan_step'}
-        assert alternates[('prerequisites', 'description')] == {'replace_plan_step'}
-        assert alternates[(None, 'analysis')] == {'update_plan_metadata'}
-        # title has no second writer: update_plan_metadata does not take one.
-        assert alternates[(None, 'title')] == set()
-        assert 'title' not in _tool_params(plan_tools._update_plan_metadata)
+        monkeypatch.setattr(plan_tools, '_sha_exists_on_branch', lambda *_a, **_k: True)
+        for record in plan_tools._REPAIRABLE_PLAN_FIELDS:
+            owner = _COLLECTION_SCHEMA_TOOL_NAME[record.collection]
+            for tool_name in _PLAN_WRITING_TOOL_NAMES:
+                if tool_name == owner:
+                    continue  # already reported as `tool`, not an "alternate"
+                root = tmp_path / f'{record.collection}-{record.field}-{tool_name}'
+                changed, _refusal = _alternate_writer_changed_the_cell(
+                    root, record.collection, record.field, tool_name
+                )
+                if not changed:
+                    continue
+                assert tool_name in record.also_written_by, (
+                    f'{tool_name!r} was observed writing '
+                    f'{record.collection}.{record.field} but is declared '
+                    f'neither as that row\'s schema owner ({owner!r}) nor in '
+                    f'its also_written_by {record.also_written_by!r} — the '
+                    'table under-reports a real writer'
+                )
 
     def test_no_non_prose_parameter_is_ever_a_recovery_target(self):
         """Identifiers, enums and lists may never receive a recovered string.
@@ -481,6 +678,38 @@ class TestRepairableFieldTable:
                 f'{record.collection}.{record.field} declares non-prose '
                 f'recovery targets {sorted(illegal)}'
             )
+
+    def test_a_tag_prepending_writer_is_declared_like_any_other(
+        self, tmp_path, monkeypatch
+    ):
+        """S3 (task 3982): ``mark_step_committed`` belongs in ``also_written_by``.
+
+        It prepends a ``[COMMITTED <sha12>]`` provenance tag to ``description``
+        on either collection WITHOUT ever taking a ``description`` parameter —
+        the exact shape a signature-based check cannot see. PROVE the premise
+        first (the probe below), THEN assert the declaration — half (c) is the
+        invariant; the table is only a restatement of it.
+        """
+        monkeypatch.setattr(plan_tools, '_sha_exists_on_branch', lambda *_a, **_k: True)
+
+        for collection in ('steps', 'prerequisites'):
+            changed, refusal = _alternate_writer_changed_the_cell(
+                tmp_path / collection, collection, 'description', 'mark_step_committed'
+            )
+            assert changed, (
+                f'mark_step_committed refused the probe call: {refusal!r} — the '
+                'probe called it wrong, it is not necessarily a non-writer'
+                if refusal is not None else
+                f'mark_step_committed is supposed to rewrite {collection}.description '
+                '(it prepends a [COMMITTED <sha>] tag) but the probe observed no change'
+            )
+
+        alternates = {
+            (r.collection, r.field): set(r.also_written_by)
+            for r in plan_tools._REPAIRABLE_PLAN_FIELDS
+        }
+        assert 'mark_step_committed' in alternates[('steps', 'description')]
+        assert 'mark_step_committed' in alternates[('prerequisites', 'description')]
 
 
 # ---------------------------------------------------------------------------
@@ -1489,6 +1718,96 @@ class TestAtomicWritePlan:
         assert target.read_bytes() == before_bytes
         assert set(plan_dir.iterdir()) == before_entries
 
+    def test_target_file_mode_propagates_a_non_missing_file_os_error(
+        self, plan_dir, monkeypatch
+    ):
+        """Direct coverage of the premise the two tests below are built on.
+
+        Both monkeypatch ``_target_file_mode`` WHOLESALE, which proves
+        ``_atomic_write_plan`` correctly WRAPS whatever the lookup raises, but
+        never exercises what ``_target_file_mode`` itself actually swallows.
+        Mutation-verified in this worktree: widening its
+        ``except FileNotFoundError:`` to a bare ``except OSError:`` left every
+        other test in this file green — this is the test that catches it.
+        """
+        target = plan_dir / 'plan.json'
+        real_stat = Path.stat
+
+        # Scoped to *target* — falling back to the REAL stat() for every other
+        # path — rather than raising unconditionally, mirroring the same
+        # Path.stat patch idiom already used in test_session_registry.py and
+        # test_crash_recovery.py. A blanket raise would also break this
+        # module's autouse _no_mock_derived_stray_dirs conftest fixture, whose
+        # teardown itself calls Path.stat() (via Path.exists()) on an
+        # unrelated path.
+        def boom(self, *args, **kwargs):
+            if self == target:
+                raise OSError(errno.EACCES, 'Permission denied')
+            return real_stat(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, 'stat', boom)
+
+        with pytest.raises(OSError) as excinfo:
+            plan_tools._target_file_mode(target)
+
+        assert excinfo.value.errno == errno.EACCES, (
+            '_target_file_mode must swallow ONLY FileNotFoundError; any other '
+            'OSError from target.stat() (EACCES, ELOOP, ENAMETOOLONG) must '
+            'propagate so _atomic_write_plan can turn it into PlanWriteError'
+        )
+
+    def test_a_mode_lookup_failure_surfaces_as_PlanWriteError(self, plan_dir, monkeypatch):
+        """``_target_file_mode`` deliberately swallows only ``FileNotFoundError``.
+
+        Any OTHER ``OSError`` from ``target.stat()`` (EACCES on the parent dir,
+        ELOOP, ENAMETOOLONG) must still turn into the documented
+        ``PlanWriteError`` — the docstring promises 'Any failure ... raises
+        PlanWriteError naming the path', and today the lookup sits BEFORE the
+        try block that makes that true.
+        """
+        target = plan_dir / 'plan.json'
+        before_bytes = target.read_bytes()
+        before_entries = set(plan_dir.iterdir())
+
+        def boom(_target):
+            raise OSError(errno.EACCES, 'Permission denied')
+
+        monkeypatch.setattr(plan_tools, '_target_file_mode', boom)
+
+        with pytest.raises(plan_tools.PlanWriteError) as excinfo:
+            plan_tools._atomic_write_plan(target, corrupt_plan())
+
+        assert str(target) in str(excinfo.value), (
+            'the failure must name the path — loud, not a silent skip'
+        )
+        assert target.read_bytes() == before_bytes
+        assert set(plan_dir.iterdir()) == before_entries, (
+            'no .plan.json.*.tmp residue may be left behind'
+        )
+
+    def test_a_mode_lookup_failure_names_both_the_lane_and_resolved_paths(
+        self, lane_and_meta, monkeypatch
+    ):
+        """Mirrors ``test_dangling_symlink_fails_loudly_without_materialising_a_file``.
+
+        This is the half of the docstring contract the current ordering cannot
+        honour: when the target is a lane symlink, the wrapper's message must
+        name BOTH the original lane path and the resolved meta-root path.
+        """
+        lane_plan, real_plan = lane_and_meta
+
+        def boom(_target):
+            raise OSError(errno.EACCES, 'Permission denied')
+
+        monkeypatch.setattr(plan_tools, '_target_file_mode', boom)
+
+        with pytest.raises(plan_tools.PlanWriteError) as excinfo:
+            plan_tools._atomic_write_plan(lane_plan, corrupt_plan())
+
+        message = str(excinfo.value)
+        assert str(lane_plan) in message, 'the ORIGINAL path must be named'
+        assert str(real_plan) in message, 'the RESOLVED path must be named too'
+
     def test_writing_a_plan_that_does_not_serialize_leaves_no_residue(self, plan_dir):
         """An unserializable payload must not strand a temp file either."""
         target = plan_dir / 'plan.json'
@@ -1975,6 +2294,106 @@ class TestReadPlanRepaired:
         assert plan['design_decisions'][0]['rationale'] == _RATIONALE_PROSE
         assert any(f['outcome'] == 'repaired' for f in facts)
         assert 'disk on fire' in caplog.text, 'the write failure must be LOUD'
+
+
+# ---------------------------------------------------------------------------
+# task 3982 S1 — an UNRESOLVABLE locator must be reported every time, never
+# memoized under a key that means nothing. Drives ``_report_markup_facts``
+# directly: it is module-private and callable, which is how this branch is
+# reachable even though ``_read_plan_repaired`` can never produce it today
+# (it walks the same document it passes back, so its own locators always
+# resolve against it).
+# ---------------------------------------------------------------------------
+
+
+def _unresolvable_refusal_fact(**overrides: object) -> dict[str, object]:
+    """An 'unrepairable' fact in the exact shape ``_repair_one_field`` emits.
+
+    Defaults to locators that CANNOT resolve against ``corrupt_plan()``:
+    ``collection='steps'`` with ``index=99``, far past that plan's two-item
+    ``steps`` list.
+    """
+    fact: dict[str, object] = {
+        'tool': 'add_plan_step',
+        'also_written_by': [],
+        'param': 'description',
+        'pattern': 'a mis-close literal',
+        'misclose': None,
+        'outcome': 'unrepairable',
+        'recovered_params': [],
+        'declined_params': [],
+        'collection': 'steps',
+        'index': 99,
+        'field': 'description',
+    }
+    fact.update(overrides)
+    return fact
+
+
+class TestUnresolvableLocatorIsNeverMemoized:
+    """S1: a locator that no longer resolves must be reported every time.
+
+    ``_fact_value``'s except branch already carried a comment claiming this
+    ('report it every time rather than suppress on a key that means
+    nothing'), but returned plain ``None`` — indistinguishable from a
+    RESOLVABLE locator whose field is legitimately absent, so the two shared
+    one memo key and a SECOND unrelated unresolvable refusal was silently
+    suppressed. The comment disclaimed exactly what the code did.
+    """
+
+    def test_an_unresolvable_locator_is_reported_on_every_call(self, tmp_path, caplog):
+        plan = corrupt_plan()
+        fact = _unresolvable_refusal_fact()
+        plan_path = tmp_path / 'plan.json'
+
+        with caplog.at_level(logging.DEBUG, logger=plan_tools.__name__):
+            first = plan_tools._report_markup_facts(plan_path, plan, [fact])
+            second = plan_tools._report_markup_facts(plan_path, plan, [fact])
+
+        assert first == [fact]
+        assert second == [fact], (
+            'an unresolvable locator must be reported every time, not '
+            'suppressed on the second call'
+        )
+        assert set() == plan_tools._REPORTED_REFUSALS, (
+            'no key that means nothing may ever be recorded'
+        )
+        assert len(_fact_payloads(caplog)) == 2, 'both calls must log at WARNING'
+        debug_records = [
+            r for r in caplog.records
+            if r.name == plan_tools.__name__ and r.levelno == logging.DEBUG
+        ]
+        assert debug_records == [], (
+            'an unresolvable refusal must never be suppressed to DEBUG'
+        )
+
+    def test_a_resolvable_locator_with_an_absent_field_is_still_memoized(
+        self, tmp_path, caplog
+    ):
+        """The boundary that must NOT change: a legitimately absent field.
+
+        A locator that DOES resolve, whose field simply holds nothing (the
+        holder has no such key), is a different case from a BROKEN locator
+        and keeps the existing memoization behaviour. This guards against
+        over-widening the S1 fix into 'never memoize a None'.
+        """
+        plan = corrupt_plan()
+        assert 'not_a_real_field' not in plan['steps'][0], (
+            'the fixture must pick a field the holder genuinely lacks'
+        )
+        fact = _unresolvable_refusal_fact(index=0, field='not_a_real_field')
+        plan_path = tmp_path / 'plan.json'
+
+        with caplog.at_level(logging.DEBUG, logger=plan_tools.__name__):
+            first = plan_tools._report_markup_facts(plan_path, plan, [fact])
+            second = plan_tools._report_markup_facts(plan_path, plan, [fact])
+
+        assert first == [fact]
+        assert second == [], (
+            'a resolvable locator whose field is legitimately absent must '
+            'still converge to silence on repeat, unlike a broken locator'
+        )
+        assert len(plan_tools._REPORTED_REFUSALS) == 1
 
 
 # ---------------------------------------------------------------------------

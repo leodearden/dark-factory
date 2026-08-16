@@ -3276,10 +3276,15 @@ class TaskKnowledgeSync(BaseStage):
 
         ``report.stats['stage1_analytical_findings_processed']`` and
         ``report.stats['stage1_mem0_flags_processed']`` are Stage 2's
-        self-reported flag-processing counters. They are no longer clamped
-        against ground truth here: that reconciliation now happens via
-        ``derive_stage_stats`` + ``stats_verifier`` (task 2229), which
-        recompute canonical counters from the write journal.
+        self-reported flag-processing counters. The clamps that used to
+        check them against ground truth here were removed by task 2230
+        (W5-mu) and not replaced: neither counter is in
+        ``_COMPUTED_STAT_KEYS`` (stage_stats.py), so ``derive_stage_stats``
+        cannot recompute either from the write journal and
+        ``stats_verifier`` leaves both untouched. They remain purely
+        self-reported with no computed ground truth; this method only
+        normalizes their presence via ``setdefault(..., 0)`` below so
+        Stage 3's audit always sees a deterministic pair.
 
         Terminal-state, stall-guard-freshness, post-action-mismatch, and
         live-workflow writes are also no longer reclassified here: that write

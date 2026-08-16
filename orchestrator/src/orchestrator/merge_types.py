@@ -1167,6 +1167,71 @@ class Decided:
     merge_result: MergeResult | None = None
 
 
+@dataclass
+class ChainResult:
+    """Result of a deep merge-ahead chain build (``plans/deep-merge-ahead-prd.md``
+    §Contract, task β).
+
+    Returned by :func:`orchestrator.merge_queue.build_chain`, which
+    sequentially merges queued items in submission order onto the frozen
+    head's merge commit inside ONE scratch worktree, truncating at the first
+    textual conflict.  Sibling of the ``classify_and_merge`` sum type
+    (:class:`MergedOk` / :class:`Decided`) — same family, one level up: those
+    describe a single item's merge, this describes a whole speculative chain.
+
+    Field semantics:
+
+    * ``links`` — ``(task_id, merge_commit)`` in LAND order.  A contiguous
+      PREFIX of the queue snapshot: never a subset with a hole, because δ
+      lands these in order through the existing CAS advance and a hole would
+      break the in-order / frozen-prefix invariant.
+    * ``tip`` — the SHA the chain ends at.  Equals ``head_merge_commit`` when
+      ``links`` is empty, so a zero-link result still names a verifiable tip.
+    * ``truncated_at`` — ``task_id`` of the first item that did NOT chain, or
+      ``None``.  **A depth stop is NOT a truncation**: when the walk stopped
+      because it reached ``target_depth``/``cap``, or ran the whole snapshot
+      clean, ``truncated_at`` is ``None``.
+    * ``truncated_reason`` — ``'conflict'`` (genuine textual conflict — an
+      expected, benign chain outcome), ``'train_request'`` (a
+      :class:`GroupMergeRequest`, which ``_do_train_merge`` owns),
+      ``'already_merged'`` (the item's work is ALREADY in the base, so
+      ``git merge --no-ff`` was a no-op — benign: it caps the chain but
+      signals no fault, and the item's real verdict is rendered by the
+      sequential path's ``_is_genuinely_merged`` guard), or ``'merge_error'``
+      (a non-conflict merge failure: missing ref, hook rejection).  **Only
+      ``'merge_error'`` denotes a genuine fault** — the other three are
+      expected outcomes and are deliberately NOT collapsed into it, so ε's
+      deep-fail reader is not inflated with non-faults.
+    * ``lane`` / ``lane_warm`` — the ONE scratch worktree holding ``tip``.
+
+    **Decision #4 — the ``truncated_at`` item MUST NOT have any outcome
+    emitted for it.**  A chain conflict at position j may be a conflict with
+    an *unlanded* predecessor, so item j is not genuinely conflicted; it takes
+    its normal sequential path later.  ``build_chain`` therefore never
+    resolves a future, never calls ``_emit_merge_attempt``, and never calls
+    ``_note_conflict_detected`` for any item in the snapshot.
+
+    **Lane ownership.**  A NON-EMPTY result HOLDS ``lane``, and the caller
+    MUST release it via
+    :func:`orchestrator.merge_liveness.release_chain_build_lane` (passing
+    ``warm=lane_warm``) once done with the tip.  An EMPTY result never holds a
+    lane (``lane is None``, ``lane_warm is False``), so a caller that skips
+    the release on the empty path cannot leak one.
+    """
+
+    links: list[tuple[str, str]]
+    tip: str
+    truncated_at: str | None = None
+    truncated_reason: str | None = None
+    lane: Path | None = None
+    lane_warm: bool = False
+
+    @property
+    def depth(self) -> int:
+        """Number of chained links — the value γ emits as ``chain_items``."""
+        return len(self.links)
+
+
 class InflightStatus(StrEnum):
     """Sentinel status values for :class:`InflightEntry` / :class:`InflightVerifyResult`.
 

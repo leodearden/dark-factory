@@ -3061,8 +3061,21 @@ def test_default_batch_source_passes_resolved_archive_roots_to_enumerate(tmp_pat
 # ---------------------------------------------------------------------------
 
 class _FakeHttpxResponse:
+    """A 200 `application/json` reply, i.e. the STATELESS fused-memory shape.
+
+    `status_code` and `headers` were added for task 3644: `_post_mcp_tool_call`
+    now delegates to `census_trigger.post_mcp_tool_call`, which reads
+    `status_code` (to detect the stateful escalation server's 400 "Missing
+    session ID") and `content-type` (to detect an SSE-framed body) before
+    decoding. Without them this fake would die on an AttributeError and stop
+    exercising the real code path -- so the task-2953 header contract below
+    keeps being asserted against the transport that actually ships, not
+    against a fake the implementation has outgrown."""
+
     def __init__(self, payload):
         self._payload = payload
+        self.status_code = 200
+        self.headers = {"content-type": "application/json"}
 
     def raise_for_status(self):
         pass

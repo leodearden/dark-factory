@@ -1334,3 +1334,291 @@ class TestMem0BackendScanPayloadTextIntegration:
             ))['scanned'] == 1
         finally:
             await backend.close()
+
+
+class TestBuildConfigDictEndpointPlumbing:
+    """_build_config_dict is a pure function of config — no Qdrant, no
+    AsyncMemory, no _get_instance. Greenfield: nothing tested this dict before.
+    """
+
+    # --- default (shipped-config) behaviour: must stay byte-identical ---
+
+    def test_default_omits_embedding_dims_entirely(self, backend):
+        """The load-bearing byte-identical assertion.
+
+        mem0/embeddings/openai.py sets
+        ``_pass_dimensions_to_api = self.config.embedding_dims is not None``.
+        We omit the key today, so ``dimensions`` is NEVER sent on an
+        embeddings request. Emitting the key at all — even as 1536 — would
+        start sending it on every request under the shipped config. Hence the
+        emit-only-when-non-default rule; do not "simplify" it away.
+        """
+        config_dict = backend._build_config_dict('some_collection')
+
+        assert backend.config.embedder.dimensions == 1536
+        assert 'embedding_dims' not in config_dict['embedder']['config']
+
+    def test_default_emits_incumbent_base_urls(self, backend):
+        config_dict = backend._build_config_dict('some_collection')
+
+        assert config_dict['llm']['config']['openai_base_url'] == 'https://api.openai.com/v1'
+        assert (
+            config_dict['embedder']['config']['openai_base_url']
+            == 'https://api.openai.com/v1'
+        )
+
+    def test_default_vector_store_dims_match_mem0s_own_default(self, backend):
+        """Emitting this key is a no-op at the shipped config — mem0's Qdrant
+        default is already 1536 — but it is required for a collection to be
+        CREATED at a non-default dimensionality."""
+        from mem0.configs.vector_stores.qdrant import QdrantConfig
+
+        config_dict = backend._build_config_dict('some_collection')
+
+        assert config_dict['vector_store']['config']['embedding_model_dims'] == 1536
+        assert (
+            QdrantConfig.model_fields['embedding_model_dims'].default == 1536
+        ), 'mem0 changed its Qdrant dims default — the no-op claim above no longer holds'
+
+    def test_preexisting_keys_are_unchanged(self, backend):
+        config_dict = backend._build_config_dict('some_collection')
+
+        assert config_dict['version'] == 'v1.1'
+        assert config_dict['vector_store']['provider'] == 'qdrant'
+        assert config_dict['vector_store']['config']['url'] == backend.config.mem0.qdrant_url
+        assert config_dict['vector_store']['config']['collection_name'] == 'some_collection'
+
+        llm = config_dict['llm']['config']
+        assert config_dict['llm']['provider'] == 'openai'
+        assert llm['model'] == 'gpt-4o-mini'
+        assert llm['temperature'] == 0.1
+        assert llm['max_tokens'] == 4096
+        assert llm['api_key'] == 'test-key'
+
+        embedder = config_dict['embedder']['config']
+        assert config_dict['embedder']['provider'] == 'openai'
+        assert embedder['model'] == 'text-embedding-3-small'
+        assert embedder['api_key'] == 'test-key'
+
+    # --- local-endpoint behaviour ---
+
+    def test_llm_and_embedder_endpoints_are_independent(self, mock_config):
+        """The two provider blocks are read SEPARATELY — one is not reused for
+        both, which is what makes independent LLM/embedder endpoints possible.
+        """
+        mock_config.llm.providers.openai.api_url = 'http://127.0.0.1:1234/v1'
+        mock_config.embedder.providers.openai.api_url = 'http://127.0.0.1:5678/v1'
+        config_dict = Mem0Backend(mock_config)._build_config_dict('c')
+
+        assert config_dict['llm']['config']['openai_base_url'] == 'http://127.0.0.1:1234/v1'
+        assert (
+            config_dict['embedder']['config']['openai_base_url']
+            == 'http://127.0.0.1:5678/v1'
+        )
+
+    def test_non_default_dims_emitted_under_both_key_names(self, mock_config):
+        """BOTH keys are required for a non-1536 arm, and they are NOT the same
+        key: the embedder key controls what dimensionality is requested from
+        the API, the vector-store key controls what Qdrant creates the
+        collection with. Setting only one silently yields a mismatch.
+        """
+        mock_config.embedder.dimensions = 768
+        config_dict = Mem0Backend(mock_config)._build_config_dict('c')
+
+        assert config_dict['embedder']['config']['embedding_dims'] == 768
+        assert config_dict['vector_store']['config']['embedding_model_dims'] == 768
+
+    def test_anthropic_llm_block_carries_no_openai_base_url(self, mock_config):
+        """openai_base_url is an OpenAIConfig-only parameter; passing it to the
+        anthropic config class would TypeError out of mem0's factory."""
+        from fused_memory.config.schema import AnthropicProviderConfig
+
+        mock_config.llm.provider = 'anthropic'
+        mock_config.llm.providers.anthropic = AnthropicProviderConfig(api_key='ak')
+        config_dict = Mem0Backend(mock_config)._build_config_dict('c')
+
+        assert config_dict['llm']['provider'] == 'anthropic'
+        assert 'openai_base_url' not in config_dict['llm']['config']
+
+    # --- key-name guard ---
+
+    def test_every_emitted_key_is_accepted_by_the_installed_mem0(self, mock_config):
+        """The highest-value assertion here.
+
+        An unknown key raises TypeError from mem0/utils/factory.py, and
+        AsyncMemory.from_config only catches pydantic ValidationError — so a
+        misspelling escapes uncaught at instance construction, in production,
+        not here. The names are easy to get wrong: the EMBEDDER takes
+        `embedding_dims`, while `embedding_model_dims` is the VECTOR STORE's
+        key. Validate what we emit against the installed signatures.
+        """
+        import inspect
+
+        from mem0.configs.embeddings.base import BaseEmbedderConfig
+        from mem0.configs.llms.openai import OpenAIConfig
+        from mem0.configs.vector_stores.qdrant import QdrantConfig
+
+        # Non-default dims so every optional key is actually emitted.
+        mock_config.embedder.dimensions = 768
+        mock_config.llm.providers.openai.api_url = 'http://127.0.0.1:1234/v1'
+        mock_config.embedder.providers.openai.api_url = 'http://127.0.0.1:5678/v1'
+        config_dict = Mem0Backend(mock_config)._build_config_dict('c')
+
+        embedder_params = set(inspect.signature(BaseEmbedderConfig.__init__).parameters)
+        llm_params = set(inspect.signature(OpenAIConfig.__init__).parameters)
+        vector_store_params = set(QdrantConfig.model_fields)
+
+        for key in config_dict['embedder']['config']:
+            assert key in embedder_params, (
+                f'embedder key {key!r} is not a BaseEmbedderConfig parameter — '
+                f'mem0 would TypeError. Did you mean one of {sorted(embedder_params)}?'
+            )
+        for key in config_dict['llm']['config']:
+            assert key in llm_params, f'llm key {key!r} is not an OpenAIConfig parameter'
+        for key in config_dict['vector_store']['config']:
+            assert key in vector_store_params, (
+                f'vector_store key {key!r} is not a QdrantConfig field'
+            )
+
+        # And pin the two easily-confused spellings explicitly.
+        assert 'embedding_dims' in embedder_params
+        assert 'embedding_model_dims' not in embedder_params
+        assert 'embedding_model_dims' in vector_store_params
+
+
+class TestNonDefaultDimsAgainstAnExistingCollection:
+    """The migration hazard behind plumbing embedder.dimensions at all.
+
+    Neither dims key was plumbed before, so a deployment already configured
+    with ``embedder.dimensions != 1536`` was running INERT: mem0 created its
+    Qdrant collection at its own 1536 default and requested 1536-wide vectors.
+    Both now follow the config — but only for a collection that does not exist
+    yet. Changing the knob on a live deployment therefore requires recreating
+    and re-embedding the collection; it is not live-migratable.
+    """
+
+    @staticmethod
+    def _fake_qdrant_client(existing: list[str]):
+        collections = MagicMock()
+        collections.collections = [MagicMock(name=n) for n in existing]
+        # MagicMock(name=...) sets the mock's repr name, not a .name attribute.
+        for mock_col, real_name in zip(collections.collections, existing, strict=True):
+            mock_col.name = real_name
+
+        client = MagicMock()
+        client.get_collections.return_value = collections
+        return client
+
+    def test_existing_collection_is_left_at_its_old_dimensionality(self):
+        """Upstream short-circuits, so the new dims never reach Qdrant.
+
+        Measured against the installed mem0: ``Qdrant.create_col`` returns
+        early when the collection is already listed ('Collection ... already
+        exists. Skipping creation.'). The embedder meanwhile DOES start
+        requesting N-wide vectors, so every subsequent upsert fails on a
+        dimension mismatch at runtime. Pinning it here means a future mem0 that
+        learns to migrate — or to fail loudly — turns this red instead of
+        leaving a stale operator note in place.
+        """
+        from mem0.vector_stores.qdrant import Qdrant
+
+        client = self._fake_qdrant_client(['fused_dark_factory'])
+
+        Qdrant(
+            collection_name='fused_dark_factory',
+            embedding_model_dims=768,
+            client=client,
+        )
+
+        client.create_collection.assert_not_called()
+
+    def test_a_fresh_collection_is_created_at_the_configured_dimensionality(self):
+        """Control: the plumbing does work — on a collection that does not yet
+        exist, which is the only case where changing dimensions is safe."""
+        from mem0.vector_stores.qdrant import Qdrant
+
+        client = self._fake_qdrant_client([])
+
+        Qdrant(collection_name='brand_new', embedding_model_dims=768, client=client)
+
+        client.create_collection.assert_called_once()
+        vectors_config = client.create_collection.call_args.kwargs['vectors_config']
+        assert vectors_config.size == 768
+
+
+class TestAmbientBaseUrlPrecedenceIsReported:
+    """Config is now authoritative over OPENAI_BASE_URL / OPENAI_API_BASE.
+
+    That is intended — a written-down endpoint should beat an inherited env
+    var — but for a site that routed OpenAI traffic through a gateway by
+    exporting OPENAI_BASE_URL without OPENAI_API_URL, it silently sends that
+    traffic back to api.openai.com. An egress and billing change must be
+    announced (docs/legibility/design-invariants.md, no-silent-fail-soft).
+    """
+
+    #: Every ambient var ``warn_if_ambient_base_url_is_overridden`` inspects.
+    #: Both are live in the wild (mem0 still honours the deprecated
+    #: ``OPENAI_API_BASE`` spelling), so a test that sets only one is at the
+    #: mercy of whatever the host/CI runner exports for the other.
+    AMBIENT_VARS = ('OPENAI_BASE_URL', 'OPENAI_API_BASE')
+
+    @pytest.fixture(autouse=True)
+    def _clear_warn_cache(self, monkeypatch):
+        """Reset the once-per-process warn cache AND the ambient environment.
+
+        Clearing both vars here (rather than per-test) means every test in
+        this class starts from a known-empty ambient environment and then
+        sets only the var it means to exercise — otherwise an inherited
+        ``OPENAI_API_BASE`` on the runner adds a second pair of warnings and
+        flips the count assertions red.
+        """
+        from fused_memory.config.env_precedence import reset_warning_cache
+
+        for var in self.AMBIENT_VARS:
+            monkeypatch.delenv(var, raising=False)
+        reset_warning_cache()
+        yield
+        reset_warning_cache()
+
+    @pytest.mark.parametrize('var', ['OPENAI_BASE_URL', 'OPENAI_API_BASE'])
+    def test_disagreeing_env_var_is_reported(self, mock_config, monkeypatch, caplog, var):
+        monkeypatch.setenv(var, 'https://gateway.example.invalid/v1')
+
+        with caplog.at_level(logging.WARNING):
+            Mem0Backend(mock_config)._build_config_dict('c')
+
+        messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            var in m and 'https://api.openai.com/v1' in m for m in messages
+        ), f'expected a warning naming {var} and the configured endpoint, got {messages}'
+
+    def test_agreeing_env_var_is_silent(self, mock_config, monkeypatch, caplog):
+        """No warning when the environment and the config already agree —
+        otherwise the signal is noise on a correctly-configured deployment."""
+        monkeypatch.setenv('OPENAI_BASE_URL', 'https://api.openai.com/v1')
+
+        with caplog.at_level(logging.WARNING):
+            Mem0Backend(mock_config)._build_config_dict('c')
+
+        assert not [r for r in caplog.records if 'OPENAI_BASE_URL' in r.message]
+
+    def test_unset_env_is_silent(self, mock_config, caplog):
+        # Both ambient vars are already cleared by the autouse fixture.
+        with caplog.at_level(logging.WARNING):
+            Mem0Backend(mock_config)._build_config_dict('c')
+
+        assert not [r for r in caplog.records if 'takes precedence' in r.message]
+
+    def test_repeated_builds_warn_only_once(self, mock_config, monkeypatch, caplog):
+        """_build_config_dict runs once per project instance; an unguarded
+        warning would repeat per project and read as a fresh incident."""
+        monkeypatch.setenv('OPENAI_BASE_URL', 'https://gateway.example.invalid/v1')
+        backend = Mem0Backend(mock_config)
+
+        with caplog.at_level(logging.WARNING):
+            backend._build_config_dict('c1')
+            backend._build_config_dict('c2')
+
+        hits = [r for r in caplog.records if 'takes precedence' in r.message]
+        # One for the llm block, one for the embedder block — not four.
+        assert len(hits) == 2, [r.message for r in hits]

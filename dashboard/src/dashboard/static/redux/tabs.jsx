@@ -1326,7 +1326,10 @@ function BurnTab({ projectFilter, displayWindow }) {
                         <span key={l} style={{ color: 'var(--fg-2)' }}><span style={{ display: 'inline-block', width: 10, height: 10, background: c, marginRight: 5, verticalAlign: 'middle', borderRadius: 2 }}></span>{l}</span>
                       ))}
                     </div>
-                    <SA labels={b.labels} stacks={[
+                    {/* Bands must be indexed by THIS project's own snapshot row: b.labels is
+                        the sorted union across all projects (redux_api.py shape_burndown), so
+                        pairing it with pb.* both overruns and index-shifts them. */}
+                    <SA labels={pb.labels} stacks={[
                       { key: 'done',        color: CP.ok,     values: pb.done },
                       { key: 'in_progress', color: CP.accent, values: pb.in_progress },
                       { key: 'blocked',     color: CP.bad,    values: pb.blocked },

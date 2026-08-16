@@ -396,6 +396,8 @@ class TestIterErrorNeighborhoods:
         assert n['attempt_input_summary'] == json.dumps({'command': 'false'}, sort_keys=True)
         assert n['error_content'] == 'Exit code 1'
         assert n['index'] == 1
+        assert n['exit_code'] == 1
+        assert n['designed_outcome'] is None
 
     def test_ignores_non_error_result(self):
         records = [
@@ -431,6 +433,343 @@ class TestIterErrorNeighborhoods:
         assert neighborhoods[0]['attempt_tool'] is None
         assert neighborhoods[0]['attempt_input_summary'] is None
         assert neighborhoods[0]['error_content'] == 'boom'
+        assert neighborhoods[0]['exit_code'] is None
+        assert neighborhoods[0]['designed_outcome'] is None
+
+    def test_every_neighborhood_carries_the_two_classification_keys(self):
+        records = [
+            _assistant(_tool_use('Bash', {'command': 'false'}, id='tu-1')),
+            _tool_result('tu-1', 'boom, no code here', is_error=True),
+            _assistant(_tool_use('Bash', {'command': 'watcher'}, id='tu-2')),
+            _tool_result('tu-2', _CEILING_DECLARATION, is_error=True),
+        ]
+
+        neighborhoods = mod.iter_error_neighborhoods(records)
+
+        # Asserted BEFORE the loop: an empty return would otherwise skip
+        # the body and pass, which is the very regression this guards.
+        assert len(neighborhoods) == 2
+        for n in neighborhoods:
+            assert set(n) == {
+                'index', 'attempt_tool', 'attempt_input_summary',
+                'error_content', 'exit_code', 'designed_outcome',
+            }
+
+    def test_ceiling_result_is_enriched_with_code_and_label(self):
+        records = [
+            _assistant(_tool_use('Bash', {'command': 'watcher-rearm.sh'}, id='tu-c')),
+            _tool_result('tu-c', _CEILING_DECLARATION, is_error=True),
+        ]
+
+        n = mod.iter_error_neighborhoods(records)[0]
+
+        assert n['exit_code'] == 124
+        assert n['designed_outcome'] is not None
+
+    def test_plain_error_without_a_code_is_unclassified(self):
+        records = [
+            _assistant(_tool_use('Bash', {'command': 'false'}, id='tu-p')),
+            _tool_result('tu-p', 'something broke', is_error=True),
+        ]
+
+        n = mod.iter_error_neighborhoods(records)[0]
+
+        assert n['exit_code'] is None
+        assert n['designed_outcome'] is None
+
+
+# ---------------------------------------------------------------------------
+# iter_genuine_errors / iter_designed_outcomes — a TOTAL, LOSSLESS partition
+# of iter_error_neighborhoods on `designed_outcome is None`. The scan itself
+# stays single-source-of-truth; only the split is new.
+# ---------------------------------------------------------------------------
+
+def _mixed_error_records():
+    """2 declared CEILINGs + 1 bare exit-124 + 1 genuine exit-2 failure."""
+    return [
+        _assistant(_tool_use('Bash', {'command': 'w1'}, id='tu-c1')),
+        _tool_result('tu-c1', _CEILING_DECLARATION, is_error=True),
+        _assistant(_tool_use('Bash', {'command': 'w2'}, id='tu-c2')),
+        _tool_result('tu-c2', _CEILING_DECLARATION, is_error=True),
+        _assistant(_tool_use('Bash', {'command': 'poll'}, id='tu-t')),
+        _tool_result('tu-t', 'timed out after 600s, exit=124', is_error=True),
+        _assistant(_tool_use('Bash', {'command': 'real'}, id='tu-g')),
+        _tool_result('tu-g', 'DARK_FACTORY_ROOT unset, exit code 2', is_error=True),
+    ]
+
+
+class TestErrorNeighborhoodPartition:
+    def test_genuine_errors_are_exactly_the_undesigned_ones(self):
+        genuine = mod.iter_genuine_errors(_mixed_error_records())
+
+        assert len(genuine) == 1
+        assert genuine[0]['exit_code'] == 2
+        assert genuine[0]['designed_outcome'] is None
+
+    def test_designed_outcomes_are_exactly_the_rest(self):
+        designed = mod.iter_designed_outcomes(_mixed_error_records())
+
+        assert len(designed) == 3
+        assert all(d['designed_outcome'] is not None for d in designed)
+
+    def test_partition_is_disjoint(self):
+        records = _mixed_error_records()
+
+        genuine = mod.iter_genuine_errors(records)
+        designed = mod.iter_designed_outcomes(records)
+
+        # By record index, not object identity: separate calls build
+        # separate dicts, so an id()-based check can never intersect and
+        # would pass regardless of correctness.
+        assert genuine and designed
+        assert not ({n['index'] for n in genuine} & {n['index'] for n in designed})
+
+    def test_partition_accepts_a_precomputed_scan(self):
+        # The efficiency contract: a caller holding a scan partitions it
+        # in place instead of paying for a fresh one per half.
+        records = _mixed_error_records()
+        neighborhoods = mod.iter_error_neighborhoods(records)
+
+        genuine = mod.iter_genuine_errors(neighborhoods=neighborhoods)
+        designed = mod.iter_designed_outcomes(neighborhoods=neighborhoods)
+
+        assert genuine == mod.iter_genuine_errors(records)
+        assert designed == mod.iter_designed_outcomes(records)
+
+    def test_partition_without_records_or_neighborhoods_raises(self):
+        # Loud over silently returning an empty partition, which would read
+        # downstream as "this session had no errors".
+        with pytest.raises(TypeError):
+            mod.iter_genuine_errors()
+        with pytest.raises(TypeError):
+            mod.iter_designed_outcomes()
+
+    def test_render_digest_scans_error_neighborhoods_at_most_twice(
+        self, monkeypatch,
+    ):
+        # iter_error_neighborhoods rebuilds the tool_use index over every
+        # record and re-runs the classifier over every error body, so each
+        # extra call is a full rescan. signal_counts and _build_sections
+        # each need BOTH halves of the partition; feeding them one shared
+        # scan is what keeps a digest at the pre-3610 cost of two.
+        calls = []
+        original = mod.iter_error_neighborhoods
+
+        def counting(records):
+            calls.append(len(records))
+            return original(records)
+
+        monkeypatch.setattr(mod, 'iter_error_neighborhoods', counting)
+        mod.render_digest(_mixed_error_records(), agent_class='interactive')
+
+        assert len(calls) <= 2
+
+    def test_partition_is_total_and_lossless(self):
+        records = _mixed_error_records()
+
+        recombined = (
+            mod.iter_designed_outcomes(records) + mod.iter_genuine_errors(records)
+        )
+        all_neighborhoods = mod.iter_error_neighborhoods(records)
+
+        assert sorted(recombined, key=lambda n: n['index']) == all_neighborhoods
+
+
+# ---------------------------------------------------------------------------
+# _extract_exit_code / classify_designed_outcome — the 07-31 census cluster
+# 1.3 finding (plans/confusion-census-2026-07-31.md:97): watcher-rearm.sh's
+# bounded-wait CEILING is a DESIGNED loop-continuation outcome that the
+# extractor counted as a tool_error, inflating session a189558e's error
+# signal 4x and burying the one genuine failure among false positives.
+# Recognition is two-tier: the machine-readable self-declaration first
+# (scripts/watcher-rearm.sh:228-237), the bare exit code second.
+# ---------------------------------------------------------------------------
+
+_CEILING_DECLARATION = 'WATCHER_REARM_OUTCOME: CEILING exit=124'
+"""The sighted line verbatim (plans/confusion-census-2026-07-31.md:97)."""
+
+
+class TestDesignedOutcomeRecognition:
+    def test_extracts_exit_equals_form(self):
+        assert mod._extract_exit_code(_CEILING_DECLARATION) == 124
+
+    def test_extracts_exit_code_prose_form(self):
+        assert mod._extract_exit_code('command failed with exit code 2') == 2
+
+    def test_extracts_exit_status_prose_form(self):
+        assert mod._extract_exit_code('exit status 137') == 137
+
+    def test_extraction_is_case_insensitive(self):
+        assert mod._extract_exit_code('Exit Code 2') == 2
+
+    def test_returns_none_when_no_code_present(self):
+        assert mod._extract_exit_code('something went wrong') is None
+
+    def test_first_match_wins_when_several_appear(self):
+        text = 'exit=124\nlater the retry gave exit code 2\n'
+
+        assert mod._extract_exit_code(text) == 124
+
+    def test_declared_ceiling_is_designed(self):
+        exit_code, label = mod.classify_error_content(_CEILING_DECLARATION)
+
+        assert exit_code == 124
+        assert label is not None
+
+    def test_declared_fired_is_designed(self):
+        _, label = mod.classify_error_content('WATCHER_REARM_OUTCOME: FIRED exit=0')
+
+        assert label is not None
+
+    def test_declared_fired_reports_its_own_zero_exit_code(self):
+        # exit=0 is falsy: the deciding-marker code must be selected with an
+        # explicit None check, never a truthiness fallback.
+        exit_code, _ = mod.classify_error_content('WATCHER_REARM_OUTCOME: FIRED exit=0')
+
+        assert exit_code == 0
+
+    def test_declared_killed_is_a_genuine_failure(self):
+        # scripts/watcher-rearm.sh:234 classes 137|143|144 as KILLED -- a
+        # REAL failure the census should still see, not a designed outcome.
+        assert mod.classify_error_content(
+            'WATCHER_REARM_OUTCOME: KILLED exit=137',
+        ) == (137, None)
+
+    def test_declared_error_is_a_genuine_failure(self):
+        # scripts/watcher-rearm.sh:237's catch-all ERROR branch.
+        assert mod.classify_error_content(
+            'WATCHER_REARM_OUTCOME: ERROR exit=2',
+        ) == (2, None)
+
+    def test_bare_exit_124_is_a_designed_bounded_wait(self):
+        _, label = mod.classify_error_content('command timed out after 600s, exit=124')
+
+        assert label is not None
+
+    def test_ordinary_failure_is_not_designed(self):
+        assert mod.classify_error_content('boom, exit code 2') == (2, None)
+
+    def test_empty_content_with_no_exit_code_is_not_designed(self):
+        assert mod.classify_error_content('') == (None, None)
+
+    def test_declaration_and_bare_124_labels_are_distinct(self):
+        # Which rule fired must stay legible to a digest reader.
+        _, declared = mod.classify_error_content(_CEILING_DECLARATION)
+        _, bare = mod.classify_error_content('timed out, exit=124')
+
+        assert declared != bare
+
+    def test_accepts_a_raw_block_list_content_field(self):
+        # The public entry point takes a tool_result 'content' field as-is
+        # (str OR list of blocks), so no caller -- in this module or in
+        # sampling.py -- needs digest's private text flattener.
+        blocks = [{'type': 'text', 'text': _CEILING_DECLARATION}]
+
+        assert (
+            mod.classify_error_content(blocks)
+            == mod.classify_error_content(_CEILING_DECLARATION)
+        )
+
+    def test_bounded_wait_exit_code_constant_is_timeout_ceiling(self):
+        assert mod.BOUNDED_WAIT_EXIT_CODE == 124
+
+
+class TestCoMingledDesignedAndGenuineContent:
+    """A designed classification must hold for the WHOLE content.
+
+    One tool_result can carry both a designed declaration and a real
+    failure: a Bash call that loops scripts/watcher-rearm.sh, or that
+    tails its log beside a failing command. The script writes its marker
+    to STDERR (:228-237), so it co-mingles with any other stderr in the
+    same result. Classifying on the first designed marker alone deletes
+    the genuine failure from BOTH ``signal_counts['tool_error']`` and the
+    Error Neighborhoods section, and renders it under Designed Outcomes
+    with the wrong exit code -- exactly the under-count that
+    DESIGNED_OUTCOME_PATTERNS' own docstring refuses to trade for.
+    """
+
+    def test_ceiling_followed_by_an_error_marker_is_genuine(self):
+        text = (
+            'WATCHER_REARM_OUTCOME: CEILING exit=124\n'
+            'WATCHER_REARM_OUTCOME: ERROR exit=2'
+        )
+
+        assert mod.classify_error_content(text) == (2, None)
+
+    def test_fired_followed_by_a_killed_marker_is_genuine(self):
+        text = (
+            'WATCHER_REARM_OUTCOME: FIRED exit=0\n'
+            'WATCHER_REARM_OUTCOME: KILLED exit=137'
+        )
+
+        assert mod.classify_error_content(text) == (137, None)
+
+    def test_a_dissenting_marker_decides_even_when_it_comes_first(self):
+        text = (
+            'WATCHER_REARM_OUTCOME: ERROR exit=2\n'
+            'WATCHER_REARM_OUTCOME: CEILING exit=124'
+        )
+
+        assert mod.classify_error_content(text) == (2, None)
+
+    def test_repeated_designed_markers_stay_designed(self):
+        text = _CEILING_DECLARATION + '\nWATCHER_REARM_OUTCOME: CEILING exit=124'
+
+        exit_code, label = mod.classify_error_content(text)
+
+        assert exit_code == 124
+        assert label is not None
+
+    def test_unaccounted_failure_code_beside_a_ceiling_is_genuine(self):
+        # A declaration speaks only for its OWN invocation: a fatal code
+        # that no declaration accounts for outvotes it.
+        text = (
+            'tail of watcher.log: WATCHER_REARM_OUTCOME: CEILING exit=124\n'
+            'fatal: repo corrupt, exit code 128'
+        )
+
+        assert mod.classify_error_content(text) == (128, None)
+
+    def test_bare_ceiling_code_beside_a_failure_code_is_genuine(self):
+        # The same rule one tier down: a bare 124 classifies only when it
+        # is the ONLY outcome code in the content.
+        text = 'poll timed out, exit=124\nthe retry then died, exit code 2'
+
+        assert mod.classify_error_content(text) == (2, None)
+
+    def test_co_mingled_result_counts_as_a_tool_error(self):
+        records = [
+            _assistant(_tool_use('Bash', {'command': 'rearm-loop'}, id='tu-m')),
+            _tool_result(
+                'tu-m',
+                'WATCHER_REARM_OUTCOME: CEILING exit=124\n'
+                'WATCHER_REARM_OUTCOME: ERROR exit=2',
+                is_error=True,
+            ),
+        ]
+
+        counts = mod.signal_counts(records)
+
+        assert counts['tool_error'] == 1
+        assert counts['designed_outcome'] == 0
+
+    def test_co_mingled_result_renders_with_the_deciding_exit_code(self):
+        records = [
+            _assistant(_tool_use('Bash', {'command': 'rearm-loop'}, id='tu-m')),
+            _tool_result(
+                'tu-m',
+                'WATCHER_REARM_OUTCOME: CEILING exit=124\n'
+                'WATCHER_REARM_OUTCOME: ERROR exit=2',
+                is_error=True,
+            ),
+        ]
+
+        digest = mod.render_digest(records, agent_class='interactive')
+        _, body = _split_frontmatter(digest)
+
+        assert '## Designed Outcomes' not in body
+        error_block = body.split('## Error Neighborhoods', 1)[1].split('\n##', 1)[0]
+        assert '[exit 2]' in error_block
 
 
 # ---------------------------------------------------------------------------
@@ -767,7 +1106,7 @@ class TestDecoyFailSuppressionContract:
 # ---------------------------------------------------------------------------
 
 class TestSignalCountsAndScore:
-    def test_signal_counts_returns_exact_five_key_dict_for_mixed_fixture(self):
+    def test_signal_counts_returns_exact_key_dict_for_mixed_fixture(self):
         records = [
             _assistant(_tool_use('Bash', {'command': 'false'}, id='tu-1')),
             _tool_result('tu-1', 'Exit code 1', is_error=True),
@@ -785,6 +1124,7 @@ class TestSignalCountsAndScore:
             'not_found': 1,
             'df_guard': 1,
             'interrupt': 1,
+            'designed_outcome': 0,
         }
 
     def test_signal_counts_reports_zero_for_absent_classes(self):
@@ -798,7 +1138,56 @@ class TestSignalCountsAndScore:
             'not_found': 0,
             'df_guard': 0,
             'interrupt': 0,
+            'designed_outcome': 0,
         }
+
+    def test_ceiling_only_session_reports_zero_tool_errors(self):
+        # The 07-31 census cluster 1.3 headline: session a189558e's watcher
+        # ceilings were each counted as a tool_error. A session whose ONLY
+        # structured errors are declared CEILINGs has no errors at all.
+        records = []
+        for i in range(13):
+            records.append(
+                _assistant(_tool_use('Bash', {'command': f'w{i}'}, id=f'tu-{i}'))
+            )
+            records.append(_tool_result(f'tu-{i}', _CEILING_DECLARATION, is_error=True))
+
+        counts = mod.signal_counts(records)
+
+        assert counts['tool_error'] == 0
+        assert counts['designed_outcome'] == 13
+
+    def test_mixed_session_surfaces_the_one_genuine_failure(self):
+        # census :97 verbatim: 3 benign ceilings burying 1 real exit-2 bug.
+        records = []
+        for i in range(3):
+            records.append(
+                _assistant(_tool_use('Bash', {'command': f'w{i}'}, id=f'tu-c{i}'))
+            )
+            records.append(_tool_result(f'tu-c{i}', _CEILING_DECLARATION, is_error=True))
+        records.append(_assistant(_tool_use('Bash', {'command': 'real'}, id='tu-g')))
+        records.append(
+            _tool_result('tu-g', 'DARK_FACTORY_ROOT unset, exit code 2', is_error=True)
+        )
+
+        counts = mod.signal_counts(records)
+
+        assert counts['tool_error'] == 1
+        assert counts['designed_outcome'] == 3
+
+    def test_designed_outcome_has_no_signal_weight(self):
+        # Deliberate: score_signals iterates SIGNAL_WEIGHTS, so omitting the
+        # entry reports the count without perturbing the sampler's ranking.
+        assert 'designed_outcome' not in mod.SIGNAL_WEIGHTS
+
+    def test_score_is_bit_identical_across_designed_outcome_counts(self):
+        base = {
+            'tool_error': 2, 'self_correct': 1, 'not_found': 0,
+            'df_guard': 1, 'interrupt': 0, 'designed_outcome': 0,
+        }
+        noisy = dict(base, designed_outcome=13)
+
+        assert mod.score_signals(noisy, 3) == mod.score_signals(base, 3)
 
     def test_score_signals_is_monotonic_when_adding_a_signal(self):
         zero = {
@@ -927,7 +1316,9 @@ def _frontmatter_meta():
             'not_found': 3,
             'df_guard': 4,
             'interrupt': 5,
+            'designed_outcome': 6,
         },
+        'instrument_version': 2,
     }
 
 
@@ -950,7 +1341,7 @@ class TestRenderFrontmatter:
 
         assert top_level_keys == [
             'session', 'cwd', 'encoded_dir', 'agent_class', 'date',
-            'size_bytes', 'score', 'signal_counts',
+            'size_bytes', 'score', 'instrument_version', 'signal_counts',
         ]
 
     def test_signal_counts_nested_in_contract_order(self):
@@ -963,6 +1354,7 @@ class TestRenderFrontmatter:
 
         assert nested_keys == [
             'tool_error', 'self_correct', 'not_found', 'df_guard', 'interrupt',
+            'designed_outcome',
         ]
 
     def test_round_trips_via_yaml_safe_load(self):
@@ -973,6 +1365,44 @@ class TestRenderFrontmatter:
         loaded = yaml.safe_load(inner)
 
         assert loaded == meta
+
+    def test_instrument_version_constant_is_an_int_at_or_past_two(self):
+        # 1 is the implicit pre-3610 baseline (never emitted); this change
+        # is generation 2.
+        assert isinstance(mod.DIGEST_INSTRUMENT_VERSION, int)
+        assert mod.DIGEST_INSTRUMENT_VERSION >= 2
+
+    def test_instrument_version_is_appended_last_to_the_key_tuple(self):
+        # Appended, never inserted: the PRD Sec 7.2 prefix must stay
+        # byte-identical so downstream frontmatter diffs stay stable.
+        assert mod.FRONTMATTER_KEYS[-1] == 'instrument_version'
+        assert mod.FRONTMATTER_KEYS[:-1] == (
+            'session', 'cwd', 'encoded_dir', 'agent_class', 'date',
+            'size_bytes', 'score',
+        )
+
+    def test_instrument_version_emits_as_a_bare_numeric_scalar(self):
+        block = mod.render_frontmatter(_frontmatter_meta())
+
+        assert 'instrument_version: 2' in block
+        assert 'instrument_version: "2"' not in block
+
+    def test_instrument_version_round_trips_as_an_int(self):
+        block = mod.render_frontmatter(_frontmatter_meta())
+
+        inner = '\n'.join(block.splitlines()[1:-1])
+        loaded = yaml.safe_load(inner)
+
+        assert loaded['instrument_version'] == 2
+        assert isinstance(loaded['instrument_version'], int)
+
+    # The "absent key == predates task 3610" discriminator (07-31 :151, §6)
+    # is documented in PRD §7.2.2 and has no consumer-side code in this
+    # repo to exercise: a test of it could only hand-write a YAML literal
+    # the renderer never touches and assert PyYAML omits a key the input
+    # omitted. That test existed here and was deleted in the 3610 amendment
+    # pass; what the renderer actually guarantees is pinned above and
+    # end-to-end by TestEmitConsistencyGuard.
 
     def test_date_round_trips_as_string_not_a_yaml_date_object(self):
         # A bare unquoted 2026-07-14 is resolved by PyYAML's implicit
@@ -1082,6 +1512,18 @@ def _briefing_text(body_filler='Project overview and recent decisions go here.')
     )
 
 
+_CENSUS_MEMORY_CONTEXT_TURN = (
+    '# Context\n\n'
+    '## Project Context\n\n'
+    '{ "results": [ { "id": "ccf73ca4-8240-4f9a-8abf-32b210e5b35b", '
+    '"content": "Task 1470 wired /audit into /review Phase-2 Architectural '
+    'Coherence." } ] }\n'
+)
+"""The 07-31 census cluster 1.1(b) sighting verbatim
+(plans/confusion-census-2026-07-31.md:85): a context-ONLY briefing injection
+that the all-three-headings rule admitted into the gold section."""
+
+
 _TRICKLE_CODER_PREAMBLE = (
     'You are the trickle coder for the dark-factory agent-confusion '
     'codebook (plans/confusion-reduction-prd.md §7.3). Read the '
@@ -1113,6 +1555,106 @@ class TestHarnessInjectedTurnFilter:
 
         assert [t['text'] for t in turns] == ['This is wrong, please redo it.']
         assert [t['index'] for t in turns] == [1]
+
+    def test_census_sighted_memory_context_turn_is_excluded(self):
+        # The 07-31 census cluster 1.1(b) sighting, verbatim
+        # (plans/confusion-census-2026-07-31.md:85): a context-ONLY briefing
+        # injection -- '# Context' + '## Project Context' + the memory-search
+        # JSON dump. It carries NEITHER '## Agent Identity' NOR '# Task', so
+        # the old all-three rule let it through into the gold section.
+        text = _CENSUS_MEMORY_CONTEXT_TURN
+
+        assert mod.is_harness_injected_turn(text) is True
+        assert mod.iter_user_turns([_user_text(text)]) == []
+
+    def test_context_plus_conventions_subheading_is_excluded(self):
+        # briefing.py:1096 emits '## Conventions' under the same '# Context'.
+        records = [_user_text(
+            '# Context\n\n## Conventions\n\n{"results": []}\n'
+        )]
+
+        assert mod.iter_user_turns(records) == []
+
+    def test_memory_unavailable_context_variant_is_excluded(self):
+        # The REAL memory-unavailable shape, as it actually reaches a user
+        # turn. ``_get_memory_context``'s exception and no-context early
+        # returns emit '# Context' with a SINGLE hash (briefing.py:1325,
+        # :1328, :1330, :1331) -- the literal '## Context' is emitted
+        # nowhere in briefing.py. build_architect_prompt (:355-375) then
+        # composes that block as
+        # '{context}\n\n{identity}\n\n# Task\n\n...\n\n# Action\n\n...',
+        # so the injected turn carries 3 anchors plus 1 corroborator.
+        records = [_user_text(
+            '# Context\n\n_Memory unavailable — proceed with codebase '
+            'exploration._\n\n'
+            '## Agent Identity\n\n'
+            '- **agent_id:** `claude-task-3610-implementer`\n\n'
+            '# Task\n\ndo the thing\n\n'
+            '# Action\n\ngo\n'
+        )]
+
+        assert mod.iter_user_turns(records) == []
+
+    def test_human_double_hash_context_plus_conventions_is_retained(self):
+        # '## Context' is NOT a briefing anchor: briefing.py emits only the
+        # single-hash '# Context' (:1325/:1328/:1330/:1331/:1350), while
+        # '## Context' + '## Conventions' is a common human-authored
+        # markdown shape in this repo's own plans/ and docs/ prose. Treating
+        # it as an anchor silently drops a genuine human correction from the
+        # gold user_corrections section -- the exact pathology the
+        # instrument exists to prevent.
+        text = (
+            '## Context\n\nWe are debugging the merge worker.\n\n'
+            '## Conventions\n\nplease stop using tabs, this is wrong'
+        )
+
+        assert mod.is_harness_injected_turn(text) is False
+        assert len(mod.iter_user_turns([_user_text(text)])) == 1
+
+    def test_human_task_plus_action_prose_turn_is_retained(self):
+        # Two SINGLE-hash top-level headings is a human spec-writing shape,
+        # not a briefing shape. Every role prompt template composes
+        # '{context}\n\n{identity}\n\n# Task ... # Action ...'
+        # (briefing.py:357-367/430-435/501-506/584-589/661-670/1193-1212),
+        # so a real briefing always carries the '# Context' anchor and
+        # almost always '## Agent Identity' too -- it is never just these
+        # two. Corroborators are therefore '##'-level sub-blocks only; see
+        # HARNESS_BRIEFING_SUBHEADINGS for the recall corner this declines.
+        text = (
+            '# Task\n\nRewrite the retry loop so it backs off.\n\n'
+            '# Action\n\nStart with the tests, then the loop itself.\n'
+        )
+
+        assert mod.is_harness_injected_turn(text) is False
+        assert len(mod.iter_user_turns([_user_text(text)])) == 1
+
+    def test_every_corroborator_is_a_double_hash_subblock(self):
+        # Structural guard, so a future agent does not re-add a top-level
+        # heading to the corroborator tuple: a '# '-level corroborator pairs
+        # with the '# task' anchor to clear the >=2 threshold on its own,
+        # which is exactly the human shape above.
+        assert all(
+            heading.startswith('## ') for heading in mod.HARNESS_BRIEFING_SUBHEADINGS
+        )
+
+    def test_lone_context_anchor_with_prose_is_retained(self):
+        # The relaxation's boundary: ONE anchor and NO corroborating
+        # briefing heading is not enough to classify as injected.
+        records = [_user_text('# Context\n\nsome prose about the problem')]
+
+        turns = mod.iter_user_turns(records)
+
+        assert len(turns) == 1
+        assert turns[0]['text'] == '# Context\n\nsome prose about the problem'
+
+    def test_lone_subheading_without_an_anchor_is_retained(self):
+        # A corroborator alone never classifies -- at least one ANCHOR is
+        # required, so a human turn headed '## Conventions' stays gold.
+        records = [_user_text('## Conventions\n\nwe always use tabs, fix this')]
+
+        turns = mod.iter_user_turns(records)
+
+        assert len(turns) == 1
 
     def test_single_heading_alone_is_not_excluded(self):
         # Only ONE of the three co-occurring headings -- must not alone
@@ -1402,6 +1944,139 @@ class TestPerItemByteCap:
 
 
 # ---------------------------------------------------------------------------
+# Designed Outcomes section -- 07-31 census cluster 1.3 / R3. A declared
+# bounded-poll ceiling is reported, but in its OWN section: it must never
+# masquerade as an error neighborhood, and the error section must surface
+# exit codes so a bare 124 stays distinguishable to a human reader.
+# ---------------------------------------------------------------------------
+
+def _mixed_designed_and_genuine_records():
+    """3 declared CEILINGs plus 1 genuine exit-2 failure -- census :97."""
+    records = [_with_session_meta(_user_text('kick off the bounded poll'))]
+    for i in range(3):
+        records.append(_assistant(_tool_use('Bash', {'command': f'poll{i}'}, id=f'tu-c{i}')))
+        records.append(_tool_result(f'tu-c{i}', _CEILING_DECLARATION, is_error=True))
+    records.append(_assistant(_tool_use('Bash', {'command': 'real'}, id='tu-g')))
+    records.append(
+        _tool_result('tu-g', 'DARK_FACTORY_ROOT unset, exit code 2', is_error=True)
+    )
+    return records
+
+
+def _designed_outcomes_only_records():
+    """A session whose ONLY nonzero signal class is designed outcomes."""
+    records = []
+    for i in range(3):
+        records.append(_assistant(_tool_use('Bash', {'command': f'poll{i}'}, id=f'tu-{i}')))
+        records.append(_tool_result(f'tu-{i}', _CEILING_DECLARATION, is_error=True))
+    return records
+
+
+class TestDesignedOutcomesSection:
+    def test_registered_in_all_three_section_registries(self):
+        # All three or none: _SECTION_RENDERERS alone would leave
+        # _render_body/_truncate_sections unable to find the heading.
+        assert 'designed_outcomes' in mod.SECTION_HEADINGS
+        assert 'designed_outcomes' in mod.SECTION_PRIORITY
+        assert 'designed_outcomes' in mod._SECTION_RENDERERS
+
+    def test_ranks_lowest_in_section_priority(self):
+        # Index 0 == trimmed FIRST under the soft cap, below retry_loops:
+        # a designed outcome is explicitly NOT confusion.
+        assert mod.SECTION_PRIORITY[0] == 'designed_outcomes'
+
+    def test_genuine_error_alone_under_error_neighborhoods(self):
+        digest = mod.render_digest(
+            _mixed_designed_and_genuine_records(), agent_class='interactive',
+        )
+        _, body = _split_frontmatter(digest)
+
+        error_block = body.split('## Error Neighborhoods', 1)[1].split('\n##', 1)[0]
+
+        assert 'exit code 2' in error_block
+        assert 'CEILING' not in error_block
+
+    def test_designed_outcomes_render_under_their_own_heading(self):
+        digest = mod.render_digest(
+            _mixed_designed_and_genuine_records(), agent_class='interactive',
+        )
+        _, body = _split_frontmatter(digest)
+
+        assert '## Designed Outcomes' in body
+        designed_block = body.split('## Designed Outcomes', 1)[1].split('\n##', 1)[0]
+        assert designed_block.count('CEILING') == 3
+
+    def test_ceiling_text_is_never_rendered_in_both_sections(self):
+        digest = mod.render_digest(
+            _mixed_designed_and_genuine_records(), agent_class='interactive',
+        )
+        _, body = _split_frontmatter(digest)
+
+        # 3 ceilings, each rendered exactly once -- the partition is
+        # lossless, so the total must not double.
+        assert body.count(_CEILING_DECLARATION) == 3
+
+    def test_error_neighborhood_line_surfaces_the_exit_code(self):
+        # 07-31 R3's "record exit codes" ask: the code is promoted to a
+        # STRUCTURED marker on the line, not merely left buried in
+        # whatever prose the tool happened to echo -- and the error
+        # content can be byte-truncated away by the per-item cap.
+        records = [
+            _assistant(_tool_use('Bash', {'command': 'boom'}, id='tu-1')),
+            _tool_result('tu-1', 'fatal: bad thing, exit status 137', is_error=True),
+        ]
+
+        digest = mod.render_digest(records, agent_class='interactive')
+        _, body = _split_frontmatter(digest)
+
+        error_block = body.split('## Error Neighborhoods', 1)[1].split('\n##', 1)[0]
+        assert '[exit 137]' in error_block
+
+    def test_error_neighborhood_line_omits_the_marker_when_no_code(self):
+        records = [
+            _assistant(_tool_use('Bash', {'command': 'boom'}, id='tu-1')),
+            _tool_result('tu-1', 'something went wrong', is_error=True),
+        ]
+
+        digest = mod.render_digest(records, agent_class='interactive')
+        _, body = _split_frontmatter(digest)
+
+        error_block = body.split('## Error Neighborhoods', 1)[1].split('\n##', 1)[0]
+        assert '[exit' not in error_block
+
+    def test_designed_outcome_line_names_the_rule_that_fired(self):
+        # Distinct labels per rule keep which-rule-fired legible: a
+        # self-declared CEILING must not read the same as a bare 124.
+        _, declared = mod.classify_error_content(_CEILING_DECLARATION)
+        assert declared is not None
+
+        digest = mod.render_digest(
+            _designed_outcomes_only_records(), agent_class='interactive',
+        )
+        _, body = _split_frontmatter(digest)
+
+        designed_block = body.split('## Designed Outcomes', 1)[1].split('\n##', 1)[0]
+        assert declared in designed_block
+        assert '[exit 124]' in designed_block
+
+    def test_designed_outcome_only_session_renders_a_body_without_warning(self, caplog):
+        # The registration regression: signal_counts is now nonzero for a
+        # ceiling-only session, so an unregistered section would leave the
+        # body empty and trip _warn_if_body_evicted on EVERY such session.
+        caplog.set_level(logging.WARNING, logger='legibility.digest')
+        records = _designed_outcomes_only_records()
+
+        assert mod.signal_counts(records)['designed_outcome'] == 3
+
+        digest = mod.render_digest(records, agent_class='interactive')
+        _, body = _split_frontmatter(digest)
+
+        assert body.strip() != ''
+        assert '## Designed Outcomes' in body
+        assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+
+# ---------------------------------------------------------------------------
 # _warn_if_body_evicted / render_digest emit-time guard -- R2 part 2
 # (confusion census 2026-07-24 Sec 4): belt-and-braces backstop for the
 # invariant step-4's per-item cap makes structurally unreachable at any
@@ -1521,6 +2196,9 @@ class TestEmitConsistencyGuard:
         parsed = yaml.safe_load(frontmatter_yaml)
         assert set(parsed) == set(mod.FRONTMATTER_KEYS) | {'signal_counts'}
         assert set(parsed['signal_counts']) == set(mod.SIGNAL_COUNT_KEYS)
+        # Per-digest provenance travels with every rendered digest, so a
+        # census can tell which generation of the instrument produced it.
+        assert parsed['instrument_version'] == mod.DIGEST_INSTRUMENT_VERSION
 
         lines = frontmatter_yaml.splitlines()
         top_level_keys = [line.split(':', 1)[0] for line in lines if not line.startswith(' ')]
