@@ -1676,6 +1676,98 @@ def test_installer_copies_over_drift_when_explicitly_opted_in(
     )
 
 
+def _warnings(stdout: str) -> str:
+    """Just the harness's `WARN ` lines, joined.
+
+    The installer echoes the checker's whole report to stdout, and that report
+    NAMES every drifted unit. Asserting "no warning names a clean unit" against
+    raw stdout would therefore be asserting against the checker's own output.
+    Only the installer's own warnings are the installer's claim.
+    """
+    return "\n".join(
+        line for line in stdout.splitlines() if line.startswith("WARN ")
+    )
+
+
+def test_one_drifted_unit_does_not_block_its_clean_siblings(
+    tmp_path: pathlib.Path,
+):
+    """PER-UNIT: a single drifted unit must not decline the other eight.
+
+    This is the whole point of the task. The old gate was all-or-nothing: any
+    unit reporting drift, an override or an unverifiable state skipped the
+    install of ALL nine — so the deliberate, permanent
+    orchestrator-reify.service.d/warm-lane.conf drop-in on this host also
+    blocked the watchdog pair from ever being reinstalled and re-enabled by a
+    plain setup-host.sh run. A supervision safety net that cannot be repaired
+    by the installer is a worse outcome than the drift the gate was protecting.
+
+    The policy is UNCHANGED and still ratified: a drifted unit is never
+    overwritten without DF_INSTALL_ORCH_UNITS=1, because drift does not tell
+    you which side is stale. Only the blast radius shrinks, from nine to one.
+
+    The clean sibling checked here is one whose installed copy is DELETED
+    first, so its reinstall is positively observable — asserting on a unit that
+    was already byte-identical would be satisfied by doing nothing at all.
+    """
+    repo = _fake_repo(tmp_path)
+    unit_dir = tmp_path / "installed"
+    _install_all_units(repo, unit_dir)
+
+    drifted = unit_dir / "orchestrator-reify.service"
+    drifted.write_text(
+        drifted.read_text(encoding="utf-8") + "\n[Service]\nTimeoutStopSec=99\n",
+        encoding="utf-8",
+    )
+    before = drifted.read_text(encoding="utf-8")
+
+    reinstalled = unit_dir / "orchestrator-watchdog.timer"
+    reinstalled.unlink()
+
+    result = _run_installer_section(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, (
+        "The gate must stay NON-FATAL — it declines individual units, it does "
+        f"not abort the installer.\n{result.stdout}\n{result.stderr}"
+    )
+    assert reinstalled.is_file(), (
+        "orchestrator-watchdog.timer was clean (absent) but was not installed — "
+        "one unrelated unit's drift is still blocking the whole set.\n"
+        + result.stdout
+    )
+    assert reinstalled.read_text(encoding="utf-8") == (
+        repo / "scripts" / "orchestrator-watchdog.timer"
+    ).read_text(encoding="utf-8")
+
+    assert drifted.read_text(encoding="utf-8") == before, (
+        "The installer overwrote a unit the parity gate reported drift on. The "
+        "per-unit gate narrows the skip; it does not relax it."
+    )
+
+    warnings = _warnings(result.stdout)
+    assert "orchestrator-reify.service" in warnings, (
+        "The skip warning does not NAME the unit that was skipped. An operator "
+        f"cannot act on 'something drifted'.\n{result.stdout}"
+    )
+    assert "byte-drift" in warnings, (
+        "The skip warning does not say WHICH KIND of divergence was found. "
+        "byte-drift is reconciled by editing a directive; a drop-in is removed "
+        f"with systemctl --user edit — different remedies.\n{result.stdout}"
+    )
+
+    checker = _load_checker()
+    wrongly_named = sorted(
+        unit
+        for unit in set(checker.UNITS) - {"orchestrator-reify.service"}
+        if unit in warnings
+    )
+    assert not wrongly_named, (
+        f"The installer warned about clean units {wrongly_named}, which it "
+        f"installed. A warning naming a unit nothing was wrong with trains an "
+        f"operator to ignore the whole block.\n{result.stdout}"
+    )
+
+
 def test_a_missing_checker_does_not_read_as_not_installed_here(
     tmp_path: pathlib.Path,
 ):
