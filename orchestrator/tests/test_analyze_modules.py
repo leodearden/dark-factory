@@ -341,6 +341,97 @@ def test_suggest_max_per_module_tiers():
     assert suggest_max_per_module(ModuleStats(dispatches=100, skipped_waiting=0)) == 4
 
 
+# ===========================================================================
+# The SKIP-ONLY module — a row the new key space makes reachable
+# ===========================================================================
+#
+# Under the old first-path-component key, a skip on `orchestrator/tests`
+# collapsed onto the same row as an acquire on `orchestrator/src`, so the
+# dispatch denominator was almost never zero.  Keying by the lock module
+# removes that accidental cover: a module that only ever appears in
+# `task_skipped` payloads within the window is now its own row, with
+# `conflict_rate() == 0.0` -- indistinguishable, by that number alone, from a
+# genuinely idle module.  Default `--min-dispatches 0` shows these rows.
+
+
+def test_a_skip_only_module_is_not_advised_to_raise_its_limit():
+    """Nothing got through it all window, so `suggest` must not read 'idle'.
+
+    The bare ladder falls through to 4 here, because `conflict_rate()` answers
+    0.00 on a zero denominator exactly as it does for a quiet module.
+    """
+    skip_only = ModuleStats(dispatches=0, skipped_waiting=5)
+
+    assert skip_only.is_skip_only() is True
+    assert suggest_max_per_module(skip_only) == 1, 'serialize, not "raise the limit"'
+
+    # A module with no evidence at all is NOT skip-only: nothing was measured,
+    # so the default stands rather than a spurious "serialize this".
+    assert ModuleStats().is_skip_only() is False
+    assert suggest_max_per_module(ModuleStats()) == 4
+
+
+def test_render_table_marks_a_skip_only_conflict_as_not_available():
+    """0.00 in a column a human reads as a measurement would say 'idle'."""
+    table = render_table({'orchestrator/tests': ModuleStats(dispatches=0, skipped_waiting=5)})
+
+    row = table.splitlines()[1]
+
+    assert 'n/a' in row
+    assert '0.00' not in row, 'the ratio is undefined here, not zero'
+    assert row.split()[-1] == '1', 'and the advice is to serialize'
+
+
+def test_render_table_sorts_a_skip_only_module_above_a_finite_rate():
+    """Descending contention: "nothing got through" outranks any finite ratio.
+
+    Sorting on the 0.00 placeholder would bury the most serialized row at the
+    BOTTOM of the table, where an operator scanning from the top never reads it.
+    """
+    table = render_table({
+        'hot/src': ModuleStats(dispatches=5, skipped_waiting=20),   # rate 4.00
+        'blocked/src': ModuleStats(dispatches=0, skipped_waiting=2),
+        'idle/src': ModuleStats(dispatches=10, skipped_waiting=0),
+    })
+
+    labels = [line.split()[0] for line in table.splitlines()[1:]]
+    assert labels == ['blocked/src', 'hot/src', 'idle/src']
+
+
+def test_aggregate_reports_a_module_that_is_only_ever_skipped(event_store: EventStore):
+    """End to end: a task repeatedly skipped on a module it never acquires."""
+    for _ in range(3):
+        event_store.emit(
+            EventType.task_skipped,
+            task_id='1',
+            data={'modules': ['orchestrator/tests']},
+        )
+    event_store.emit(
+        EventType.lock_acquired,
+        task_id='2',
+        data={'modules': ['orchestrator/src']},
+    )
+
+    from datetime import UTC, datetime, timedelta
+    stats = aggregate(event_store.db_path, datetime.now(UTC) - timedelta(days=1))
+
+    assert stats['orchestrator/tests'].dispatches == 0
+    assert stats['orchestrator/tests'].skipped_waiting == 3
+    assert stats['orchestrator/tests'].is_skip_only() is True
+    # The sibling that DID get through is a separate row -- the collapse that
+    # used to hide the zero denominator no longer happens.
+    assert stats['orchestrator/src'].is_skip_only() is False
+
+    payload = json.loads(render_json(stats))
+    assert payload['orchestrator/tests']['suggested_max_per_module'] == 1
+    # `conflict_rate` stays a plain float so --json remains spec-valid and
+    # arithmetic-safe; the raw counts beside it are what make it derivable
+    # that the ratio is undefined rather than measured.
+    assert payload['orchestrator/tests']['conflict_rate'] == 0.0
+    assert payload['orchestrator/tests']['dispatches'] == 0
+    assert payload['orchestrator/tests']['skipped_waiting'] == 3
+
+
 def test_render_table_orders_by_conflict_desc():
     stats = {
         'low': ModuleStats(dispatches=10, skipped_waiting=0),

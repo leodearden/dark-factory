@@ -124,10 +124,34 @@ class ModuleStats:
     truncated_holds: int = 0
 
     def conflict_rate(self) -> float:
-        """Fraction of skips over dispatches — ~0 is idle, >1 is contended."""
+        """Fraction of skips over dispatches — ~0 is idle, >1 is contended.
+
+        With NO dispatches the ratio is undefined, not zero, and 0.0 here is a
+        placeholder rather than a measurement.  Callers that present the number
+        to a human must say so — see :meth:`is_skip_only` and ``render_table``.
+        (It stays a plain float rather than becoming ``inf`` or ``None`` so the
+        ``--json`` surface keeps emitting spec-valid JSON that ``jq`` can do
+        arithmetic on; the raw counts beside it make the undefinedness
+        derivable for a machine, which a human column cannot.)
+        """
         if self.dispatches == 0:
             return 0.0
         return self.skipped_waiting / self.dispatches
+
+    def is_skip_only(self) -> bool:
+        """Contention with nothing to show for it: skips, but not one dispatch.
+
+        Newly reachable as of task 3869.  Under the old first-path-component
+        key a skip on ``orchestrator/tests`` collapsed onto the same row as an
+        acquire on ``orchestrator/src``, so the denominator was almost never
+        zero; splitting the keys to what the lock layer actually enforces
+        removed that accidental cover.  A module that only ever appears in
+        ``task_skipped`` payloads within the window is now its own row, and is
+        the most serialized thing in the report — nothing got through it at all
+        — while :meth:`conflict_rate` scores it 0.00, i.e. exactly like an idle
+        module.  Both output surfaces consult this instead of re-deriving it.
+        """
+        return self.dispatches == 0 and self.skipped_waiting > 0
 
     def avg_hold_secs(self) -> float:
         if self.hold_samples == 0:
@@ -249,11 +273,21 @@ def suggest_max_per_module(entry: ModuleStats) -> int:
 
     Heuristic (conservative; applied by hand after review):
 
+    * skips but NO dispatches → 1 (see below)
     * conflict_rate >= 2.0 → 1 (highly contended — serialize)
     * conflict_rate >= 0.5 → 2
     * conflict_rate >= 0.1 → 3
     * otherwise → 4
+
+    The skip-only case is checked FIRST because the ratio cannot see it: with
+    a zero denominator ``conflict_rate`` answers 0.00 and the ladder below
+    would fall through to 4 — "this module is idle, raise its limit" — for a
+    module that produced nothing but contention all window.  Serializing it is
+    the direction the rest of the ladder already moves in under load, and it is
+    a suggestion an operator reviews, not an applied change.
     """
+    if entry.is_skip_only():
+        return 1
     rate = entry.conflict_rate()
     if rate >= 2.0:
         return 1
@@ -280,6 +314,13 @@ def render_table(stats: dict[str, ModuleStats]) -> str:
     clean releases.  Both are printed because the censored count alone does not
     say how much of the mean rests on censored evidence: ``trunc 2`` reads very
     differently out of 3 samples than out of 300.
+
+    A SKIP-ONLY module prints ``conflict n/a``.  Its ratio has a zero
+    denominator, and printing the 0.00 placeholder into a column a human reads
+    as a measurement would say "idle" about the most serialized row in the
+    report.  Those rows sort FIRST for the same reason: descending contention
+    puts "nothing got through at all" above any finite rate, and the ranking is
+    how an operator decides which rows to read.
     """
     lines = [
         f'{"module":<{_MODULE_COL}} {"dispatches":>12} {"skipped":>10} '
@@ -288,15 +329,17 @@ def render_table(stats: dict[str, ModuleStats]) -> str:
     ]
     ranked = sorted(
         stats.items(),
-        key=lambda kv: (-kv[1].conflict_rate(), -kv[1].dispatches),
+        key=lambda kv: (not kv[1].is_skip_only(), -kv[1].conflict_rate(),
+                        -kv[1].dispatches),
     )
     for module, entry in ranked:
+        conflict = 'n/a' if entry.is_skip_only() else f'{entry.conflict_rate():.2f}'
         # Deliberately NOT truncated to the column width: a clipped lock key is
         # not a key, and pasting one into `module_overrides` silently does
         # nothing.  An over-long module pushes its own row wide instead.
         lines.append(
             f'{module:<{_MODULE_COL}} {entry.dispatches:>12d} '
-            f'{entry.skipped_waiting:>10d} {entry.conflict_rate():>10.2f} '
+            f'{entry.skipped_waiting:>10d} {conflict:>10} '
             f'{entry.avg_hold_secs():>12.1f} {entry.hold_samples:>9d} '
             f'{entry.truncated_holds:>7d} {suggest_max_per_module(entry):>8d}'
         )
