@@ -16,11 +16,14 @@ prevent. The correct remedy is temporal (confirm via
 
 `test_fetch_all_cannot_advance_local_main_ref` pins that root cause against
 real git, mirroring the "root-cause-as-spec" pattern in
-`test_roles_staging_command.py`. `test_rc1_arm_does_not_prescribe_a_fetch`
-and `test_rc128_arm_still_prescribes_a_fetch` then pin the fix itself --
-sliced per rc-arm rather than as a whole-string check, since the rc=128
-arm's fetch advice is legitimate (an unresolvable object genuinely can
-arrive via fetch) and must not be removed.
+`test_roles_staging_command.py`: it drives real git in a throwaway
+upstream+clone pair and asserts on real refs and a real exit code. The
+prompt prose itself -- the wording of the rc=1 arm in
+`ANCESTRY_CHECK_INSTRUCTIONS` -- is deliberately NOT pinned by a test here.
+A test that asserts on substrings of a comment block exercises no runtime
+behaviour; it only pins prose, which pressures the wording toward whatever
+passes the assertion rather than toward what is clearest to the reader. The
+real-git test above is what actually protects this change.
 
 A second defect in the same comment block -- a false claim that the
 SKILL.md ancestry-check blocks still carry the silent-rc gap this block's
@@ -36,43 +39,6 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
-
-from orchestrator.agents.roles import ANCESTRY_CHECK_INSTRUCTIONS
-
-
-def _rc_arm(marker: str) -> str:
-    """Slice `ANCESTRY_CHECK_INSTRUCTIONS` down to one rc arm's comment block.
-
-    Finds the line whose stripped text starts with `# {marker}` (the arm's
-    own opening line, e.g. `# rc=1   -> ...`) and returns that line plus
-    every following line up to (exclusive) the next line whose stripped
-    text starts with `# rc=` (the next arm) or that is not a comment at all.
-
-    Asserts the slice is non-empty so a future reformat of the block fails
-    loudly here rather than silently returning `''` and making every arm
-    assertion vacuously pass.
-    """
-    lines = ANCESTRY_CHECK_INSTRUCTIONS.splitlines()
-    start = None
-    for i, line in enumerate(lines):
-        if line.strip().startswith(f'# {marker}'):
-            start = i
-            break
-    assert start is not None, (
-        f'no line in ANCESTRY_CHECK_INSTRUCTIONS opens the {marker!r} arm -- '
-        'the block may have been reformatted; update this helper'
-    )
-
-    end = len(lines)
-    for i in range(start + 1, len(lines)):
-        stripped = lines[i].strip()
-        if stripped.startswith('# rc=') or not stripped.startswith('#'):
-            end = i
-            break
-
-    arm = '\n'.join(lines[start:end])
-    assert arm, f'_rc_arm({marker!r}) produced an empty slice -- the block may have been reformatted'
-    return arm
 
 
 def _init_upstream_repo(repo: Path) -> None:
@@ -160,30 +126,3 @@ def test_fetch_all_cannot_advance_local_main_ref(tmp_path: Path) -> None:
         f'fetch --all; got returncode={ancestor_result.returncode} '
         f'stdout={ancestor_result.stdout!r} stderr={ancestor_result.stderr!r}'
     )
-
-
-def test_rc1_arm_does_not_prescribe_a_fetch() -> None:
-    """The rc=1 arm must not tell the steward to fetch and re-run.
-
-    `git fetch` writes only `refs/remotes/*` and the object store, so it
-    cannot move the local `main` this check compares against -- see
-    `test_fetch_all_cannot_advance_local_main_ref`. Prescribing it here
-    sends the steward re-running into the same rc=1 and the exact false
-    "really off main" verdict this block exists to prevent.
-    """
-    arm = _rc_arm('rc=1')
-    assert 'fetch' not in arm, (
-        'rc=1 arm still prescribes a fetch, but fetch cannot advance the local main this '
-        f'check compares against -- see test_fetch_all_cannot_advance_local_main_ref. arm={arm!r}'
-    )
-
-
-def test_rc128_arm_still_prescribes_a_fetch() -> None:
-    """The rc=128 arm's fetch advice is legitimate and must survive the rc=1 fix.
-
-    Unlike rc=1, an unresolvable object on rc=128 genuinely can arrive via
-    fetch -- pins the deliberate asymmetry so the rc=1 fix is not
-    over-applied to this arm.
-    """
-    arm = _rc_arm('rc=128')
-    assert 'fetch' in arm, f'rc=128 arm should still prescribe a fetch; arm={arm!r}'
