@@ -18,9 +18,11 @@ import dataclasses
 
 import pytest
 
+from fused_memory.utils import canonical_labels
 from fused_memory.utils.canonical_labels import (
     LabelScan,
     Referent,
+    _canonical_allowlist,
     parse_node_name,
     scan_content,
 )
@@ -402,6 +404,70 @@ class TestScanContentPrecision:
             ], content
 
 
+class TestQualifiedRefNeverSpansALineBreak:
+    """The PROJECT-QUALIFIED pattern's colon is padded with '[ \\t]', not '\\s',
+    for the same measured reason as the mention pattern's above: '\\s' matches
+    '\\n', and no real project-qualified reference is written across a line
+    break — while episode bodies routinely carry YAML/'key: value' blocks and
+    hard-wrapped prose, which the '\\s' spelling read as qualified refs.
+
+    Direction of safety: this narrowing REMOVES foreign refs, and for a
+    consumer performing destructive edge surgery a false positive
+    MISATTRIBUTES facts — so narrowing is the safe direction here, unlike the
+    _LOCAL_MENTION_PATTERN whitespace branch, deliberately left as '\\s+'
+    because narrowing THERE removes contests.
+    """
+
+    def test_colon_followed_by_newline_is_not_a_qualified_ref(self):
+        """A 'key:' line lead-in followed by a number on the next line — the
+        shape a YAML block or a hard-wrapped note produces — read as
+        'notes:2500', a foreign project that does not exist."""
+        assert scan_content('Notes:\n2500 items', group_id='reify').refs == ()
+
+    def test_newline_before_the_colon_is_not_a_qualified_ref(self):
+        """BOTH halves are narrowed: the '\\s*' preceding the colon spans a
+        newline exactly as the trailing one does, so fixing only the trailing
+        half would leave the stated invariant half-true."""
+        assert scan_content('Notes\n: 2500', group_id='reify').refs == ()
+
+    def test_blank_line_between_qualifier_and_number_is_not_a_qualified_ref(self):
+        content = 'See the section on graphiti:\n\n2500 rows were affected'
+        assert scan_content(content, group_id='reify').refs == ()
+
+    def test_a_hard_wrapped_genuine_ref_is_a_DELIBERATE_miss(self):
+        """The price of the narrowing, measured and accepted — not overlooked.
+
+        The three cases above are all TRUE negatives ('Notes:', 'graphiti:' are
+        not projects). This one is a FALSE negative: a real qualified ref that
+        hard wrapping split, since wrapping breaks at the space after the colon
+        (``textwrap.fill(..., 40)`` produces exactly this string). It is the
+        same '\\s'-vs-'[ \\t]' decision seen from the losing side, and it is
+        pinned here — and listed in scan_content's KNOWN BLIND SPOTS — so a
+        future reader sees the recall loss was weighed rather than missed. It
+        is accepted for the reason stated on the pattern: for a consumer doing
+        destructive edge surgery a missed ref is recoverable and a
+        misattributed one is not. Changing this to a match is a real design
+        decision, not a bug fix.
+        """
+        content = 'please see the reference dark_factory:\n2500 for more detail'
+        assert scan_content(content, group_id='reify').refs == ()
+
+    def test_same_line_spellings_are_unaffected(self):
+        """Regression guard, green before AND after: the padding still tolerates
+        the spaces and tabs humans actually write around a colon. This is what
+        proves the change narrows ONLY across line breaks and is not an
+        undeclared tightening of human spacing."""
+        for content in (
+            'dark_factory:2500',
+            'dark_factory: 2500',
+            'dark_factory :2500',
+            'dark_factory\t:\t2500',
+        ):
+            assert [r.node_name for r in scan_content(content, group_id='reify').refs] == [
+                'dark_factory:2500'
+            ], content
+
+
 class TestScanContentOrderingAndDedup:
     """Positional first-seen order, de-duplicated on (kind, project_id, number)
     — so the result is deterministic and a consumer can rely on it."""
@@ -483,6 +549,148 @@ class TestScanContentAllowlist:
             'task 7 and reify:8', group_id='reify', known_project_ids={'dark_factory'}
         )
         assert [r.node_name for r in scan.refs] == ['Task 7', 'Task 8']
+
+    def test_all_path_shaped_registry_is_permissive_not_fail_closed(self):
+        """A registry whose entries are ALL path-shaped degrades to PERMISSIVE.
+
+        The one-bad-entry case above is only half the contract
+        ``_canonical_allowlist`` states — "one bad entry never disables the
+        whole allowlist". When EVERY entry is skipped the surviving set is
+        empty, and an empty frozenset ``is not None``, so the qualified-ref
+        guard would read "allowlist of nothing" as "allow nothing" and drop
+        every foreign ref — silently disabling the detection this scanner
+        exists to provide. Mirrors ``validate_known_project_id``'s permissive
+        falsy-registry mode rather than inventing a fail-closed one.
+        """
+        scan = scan_content(
+            'see dark_factory:2500', group_id='reify', known_project_ids={'-home-leo-bad'}
+        )
+        assert [r.node_name for r in scan.refs] == ['dark_factory:2500']
+
+    def test_canonical_allowlist_returns_none_when_every_entry_is_path_shaped(self):
+        """``is None`` SPECIFICALLY, not merely falsy: an empty frozenset is
+        falsy too, and ``allowlist is not None`` is the exact property the
+        qualified-ref filter reads to decide whether to narrow at all."""
+        assert _canonical_allowlist({'-home-leo-bad', '-home-leo-other'}) is None
+
+    def test_a_blank_registry_key_also_yields_the_permissive_fallback(self):
+        """The path-shaped case is only one of TWO ways the surviving allowlist
+        becomes useless. ``canonicalize_project_id('')`` does NOT raise
+        PathShapedProjectIdError — it returns '' — so a blank key survives into
+        the set and makes it non-empty, reaching the caller as an "allowlist of
+        nothing" and dropping every foreign ref. '' can never match a foreign
+        referent anyway (the qualified-ref pattern requires a >=3-character
+        qualifier), so it is skipped like a path-shaped key and feeds the same
+        permissive fallback.
+        """
+        assert _canonical_allowlist({'', '-home-leo-bad'}) is None
+
+    def test_blank_registry_key_does_not_drop_foreign_refs_at_the_scan_boundary(self):
+        """The same contract at the boundary a caller actually uses."""
+        scan = scan_content(
+            'see dark_factory:2500', group_id='reify', known_project_ids={'', '-home-leo-bad'}
+        )
+        assert [r.node_name for r in scan.refs] == ['dark_factory:2500']
+
+    def test_a_blank_key_beside_a_usable_one_still_narrows(self):
+        """Regression guard for the blank-key skip, the twin of the mixed
+        path-shaped case below: dropping '' must not degenerate into disabling
+        an allowlist that still has a usable entry in it."""
+        scan = scan_content(
+            'see dark_factory:2500 and evil_proj:9',
+            group_id='reify',
+            known_project_ids={'dark_factory', ''},
+        )
+        assert [r.node_name for r in scan.refs] == ['dark_factory:2500']
+
+    def test_a_non_sized_registry_does_not_crash_on_the_degraded_path(self):
+        """The parameter is advertised as "any collection", which invites a
+        generator. A generator is truthy (so it passes the empty-registry
+        guard) but NOT Sized, so counting the entries with a trailing ``len()``
+        would raise TypeError from a memory write path — on the one branch
+        whose whole purpose is to degrade gracefully."""
+
+        def registry():
+            yield '-home-leo-bad'
+            yield ''
+
+        assert _canonical_allowlist(registry()) is None
+
+    def test_mixed_registry_still_narrows_after_bad_entries_skipped(self):
+        """Regression guard, green before AND after the permissive fallback:
+        the fallback must fire only when NOTHING survived canonicalization, not
+        degenerate into disabling the allowlist whenever an entry is skipped."""
+        scan = scan_content(
+            'see dark_factory:2500 and evil_proj:9',
+            group_id='reify',
+            known_project_ids={'dark_factory', '-home-leo-bad'},
+        )
+        assert [r.node_name for r in scan.refs] == ['dark_factory:2500']
+
+
+class TestAllPathShapedRegistryIsLoud:
+    """The permissive fallback for an all-path-shaped registry is a fail-SOFT
+    path, so it must be audible — INV-4 ``storm-escape-required``
+    (docs/legibility/design-invariants.md): every degradation carries an
+    escalation, loud over silent.
+
+    Warn-ONCE per process, mirroring ``validate_known_project_id``'s
+    ``_empty_registry_warned`` 250 lines away in the same package; the tests
+    below follow tests/test_validation.py::test_warn_once_on_empty_registry,
+    including resetting the process-global flag, without which they would pass
+    or fail depending on test ordering.
+    """
+
+    def test_all_path_shaped_registry_logs_a_warning(self, monkeypatch, caplog):
+        """A registry that was deliberately supplied and turned out entirely
+        unusable is an operator MISCONFIGURATION, and its consequence — the
+        cross-project filter silently running unnarrowed — is invisible without
+        this line."""
+        monkeypatch.setattr(canonical_labels, '_all_path_shaped_warned', False)
+        with caplog.at_level('WARNING', logger='fused_memory.utils.canonical_labels'):
+            _canonical_allowlist({'-home-leo-bad'})
+        warnings = [r for r in caplog.records if r.levelname == 'WARNING']
+        assert len(warnings) == 1, (
+            f'Expected exactly 1 WARNING for an all-path-shaped registry; '
+            f'got {len(warnings)}: {[r.message for r in warnings]}'
+        )
+        # Assert MEANING, not wording: the message must name the consequence
+        # (the filter is now permissive), not merely complain about an input.
+        assert 'permissive' in warnings[0].getMessage().lower()
+
+    def test_warning_is_emitted_only_once_per_process(self, monkeypatch, caplog):
+        """Warn-once: a scanner on a write path must not turn one
+        misconfiguration into a per-call log storm."""
+        monkeypatch.setattr(canonical_labels, '_all_path_shaped_warned', False)
+        with caplog.at_level('WARNING', logger='fused_memory.utils.canonical_labels'):
+            _canonical_allowlist({'-home-leo-bad'})
+            _canonical_allowlist({'-home-leo-other'})
+        warnings = [r for r in caplog.records if r.levelname == 'WARNING']
+        assert len(warnings) == 1, (
+            f'Expected exactly 1 WARNING across two calls (warn-once); '
+            f'got {len(warnings)}: {[r.message for r in warnings]}'
+        )
+
+    @pytest.mark.parametrize('registry', [None, set(), frozenset(), []])
+    def test_empty_and_none_registry_stay_silent(self, monkeypatch, caplog, registry):
+        """The load-bearing half. A missing/empty registry is pre-existing,
+        documented, and expected on every deployment that never wires one — and
+        ``validate_known_project_id`` already owns the warning for it. Warning
+        here would add a new noise source on the COMMON path; only the
+        misconfigured path is loud."""
+        monkeypatch.setattr(canonical_labels, '_all_path_shaped_warned', False)
+        with caplog.at_level('WARNING', logger='fused_memory.utils.canonical_labels'):
+            _canonical_allowlist(registry)
+        warnings = [r for r in caplog.records if r.levelname == 'WARNING']
+        assert warnings == [], f'Empty/None registry must stay silent; got {[r.message for r in warnings]}'
+
+    def test_fully_usable_registry_stays_silent(self, monkeypatch, caplog):
+        """Only the DEGRADED path is loud — a working registry logs nothing."""
+        monkeypatch.setattr(canonical_labels, '_all_path_shaped_warned', False)
+        with caplog.at_level('WARNING', logger='fused_memory.utils.canonical_labels'):
+            _canonical_allowlist({'dark_factory'})
+        warnings = [r for r in caplog.records if r.levelname == 'WARNING']
+        assert warnings == [], f'A usable registry must stay silent; got {[r.message for r in warnings]}'
 
 
 class TestShapeValidProseMatchesByDesign:

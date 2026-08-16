@@ -26,14 +26,40 @@ shape it copies.
 
 from __future__ import annotations
 
+import logging
 import re
-from collections.abc import Collection
+from collections.abc import Collection, Iterable
 from dataclasses import dataclass
 
 from fused_memory.utils.validation import (
     PathShapedProjectIdError,
     canonicalize_project_id,
 )
+
+logger = logging.getLogger(__name__)
+
+# Module-level flag for warn-once behaviour when a SUPPLIED registry
+# canonicalizes to nothing — see _canonical_allowlist. Copies the shape of
+# utils/validation.py's _empty_registry_warned rather than inventing a variant,
+# which keeps this module a stdlib-plus-utils/validation leaf. (The name keeps
+# the dominant case; a BLANK registry key trips it too, since that also yields
+# no usable project id — see _canonical_allowlist.)
+#
+# The flag is per-PROCESS, NOT per-registry, and here those are not the same
+# thing they are at the precedent site: validation's flag tracks a
+# process-STATIC fact — no registry is configured at all — so one line genuinely
+# describes that process for its lifetime, whereas THIS condition depends on a
+# per-call argument. So the FIRST unusable registry permanently silences every
+# later one, including a structurally different misconfiguration supplied by a
+# different caller, and the count in the message describes only that first one.
+# ABSENCE OF THE WARNING THEREFORE DOES NOT MEAN ABSENCE OF THE CONDITION: an
+# operator debugging a filter that is unexpectedly permissive must re-check the
+# registry itself rather than read a silent log as an all-clear. Accepted
+# deliberately — this scanner runs on a memory write path, where per-call
+# fidelity would cost a log storm. Keying the flag on the offending registry (a
+# bounded set of already-warned frozenset(known_project_ids) values) is the
+# alternative if a second distinct misconfiguration ever needs to be visible.
+_all_path_shaped_warned: bool = False
 
 #: The registry of referent kinds and the bare node-name label each renders.
 #: Deliberately holds only 'task' today; 'escalation' is the PRD's next entry
@@ -135,10 +161,38 @@ _LOCAL_MENTION_PATTERN = re.compile(
 # - The qualifier must start with a letter, so clock times ('12:30') never
 #   match, and must be at least 3 characters, so short non-project tokens
 #   ('w6:2', 'py:3', 'a:1') never match.
-# - '\s*' around the colon tolerates the spacing humans actually write.
+# - The colon is padded with '[ \t]', NOT '\s', on BOTH sides. It still
+#   tolerates the spaces and tabs humans actually write around a colon
+#   ('dark_factory: 2500', 'dark_factory\t:\t2500'), but it can never span a
+#   line break. This is measured, not stylistic: '\s' matches '\n', so
+#   '\s*:\s*' read a 'key:' line lead-in followed by a number on the NEXT line
+#   as a project-qualified reference — 'Notes:\n2500 items' yielded notes:2500,
+#   and 'Notes\n: 2500' likewise, since the padding BEFORE the colon spans a
+#   newline just as the trailing one does. Episode bodies routinely carry
+#   YAML/'key: value' blocks and hard-wrapped prose, and no real
+#   project-qualified reference is written across a line break.
+#   Direction of safety: this narrowing REMOVES foreign refs, and the consumer
+#   performs destructive edge surgery where a false positive MISATTRIBUTES
+#   facts — so narrowing is the safe direction here, unlike the
+#   _LOCAL_MENTION_PATTERN whitespace branch two blocks above, deliberately
+#   left as '\s+' because narrowing THERE removes bare mentions and so removes
+#   contests, which is the dangerous direction.
+#   This also brings the last '\s'-padded colon in the module into line with
+#   _TASK_NODE_NAME_PATTERN and _LOCAL_MENTION_PATTERN, which already pad
+#   '#'/':' with '[ \t]' for exactly this reason. _QUALIFIED_NODE_NAME_PATTERN
+#   above is deliberately NOT changed here: it is out of task 4123's scope and
+#   is tracked as task 4235 (duplicate filing: 4239), which carries the
+#   measurement — parse_node_name('reify:\n132') still parses today. Behaviour
+#   is identical for every LIVE consumer either way, because the only
+#   production chain (task_naming.canonicalize_task_node_name) returns None for
+#   any qualified referent and would equally return None if the name stopped
+#   parsing; the value of closing it is coherence, before a consumer that acts
+#   on qualified node names lands.
 # - '(?!\d)' anchors the number's right edge so a truncated prefix is never
 #   captured.
-_QUALIFIED_REF_PATTERN = re.compile(r'(?<![\w:/.-])([A-Za-z][A-Za-z0-9_-]{2,})\s*:\s*(\d+)(?!\d)')
+_QUALIFIED_REF_PATTERN = re.compile(
+    r'(?<![\w:/.-])([A-Za-z][A-Za-z0-9_-]{2,})[ \t]*:[ \t]*(\d+)(?!\d)'
+)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -302,27 +356,87 @@ class LabelScan:
     ambiguous: tuple[Referent, ...] = ()
 
 
-def _canonical_allowlist(known_project_ids: Collection[str] | None) -> frozenset[str] | None:
+def _canonical_allowlist(known_project_ids: Iterable[str] | None) -> frozenset[str] | None:
     """Canonicalize *known_project_ids*, or return None for permissive mode.
 
-    Returns None when the registry is missing or empty. That is PERMISSIVE by
-    design and mirrors ``validate_known_project_id``'s documented
-    empty-registry mode: failing closed would silently disable this protection
-    entirely on any deployment that never wires the registry, which is the
-    exact silent-degradation failure mode this scanner exists to eliminate.
+    Returns None — PERMISSIVE — in THREE cases: a missing registry, an empty
+    registry, and a non-empty registry in which NO entry yielded a usable
+    project id (every entry was either path-shaped or blank). The first two
+    mirror ``validate_known_project_id``'s documented empty-registry mode:
+    failing closed would silently disable this protection entirely on any
+    deployment that never wires the registry, which is the exact
+    silent-degradation failure mode this scanner exists to eliminate.
 
     A path-shaped registry key is skipped rather than normalized (normalizing a
     mangled path would mint a new, wrong canonical key — RCA §4) and rather
-    than raised, so one bad entry never disables the whole allowlist.
+    than raised, so one bad entry never disables the whole allowlist. A key
+    that canonicalizes to the EMPTY string is skipped for a different reason:
+    ``canonicalize_project_id('')`` does not raise, it returns ``''``, and ''
+    can never match a foreign referent (the qualified-ref pattern requires a
+    >=3-character qualifier). Keeping it would contribute nothing to the
+    allowlist while making it non-empty — which is exactly the failure the next
+    paragraph describes, reached through a blank key instead of a path-shaped
+    one. Both skips therefore feed the SAME ``if not canonical`` branch.
+
+    The third case returns None rather than the (empty) surviving frozenset
+    because an EMPTY frozenset ``is not None``, so the caller's
+    ``allowlist is not None`` guard in :func:`scan_content` would read "an
+    allowlist of nothing" as "allow nothing" and drop every foreign ref — the
+    whole-allowlist disablement the paragraph above forbids, arrived at by
+    skipping every entry instead of one.
+
+    That third case is LOUD: unlike the first two it is an operator
+    misconfiguration (a registry was deliberately supplied and none of it was
+    usable), so it logs a WARNING — warn-once per process, using the
+    module-level ``_all_path_shaped_warned`` flag, so a scanner on a write path
+    cannot turn one misconfiguration into a per-call log storm. Read the
+    comment on that flag before trusting its silence: it is per-PROCESS, not
+    per-registry. The missing/empty cases stay SILENT deliberately: they are
+    expected on every deployment that never wires a registry, and
+    ``validate_known_project_id`` already owns the warning for them. A registry
+    object that is truthy but yields no entries at all (an exhausted iterator)
+    is the empty case in disguise and stays silent too — there is nothing for
+    an operator to act on.
     """
+    global _all_path_shaped_warned
     if not known_project_ids:
         return None
+    # Counted DURING iteration rather than with len() afterwards, which is why
+    # this parameter is typed Iterable and not Collection like the public
+    # callers' is: the public docstrings advertise "any collection", and a
+    # caller reading that loosely may well hand a generator to a helper that
+    # only ever iterates it once. A generator is truthy (so it passes the guard
+    # above) but not Sized, so a trailing len() would raise TypeError on a
+    # memory write path — in the one branch whose entire purpose is to degrade
+    # gracefully. Iterable also states the real contract: consumed ONCE, here.
+    supplied = 0
     canonical = set()
     for raw in known_project_ids:
+        supplied += 1
         try:
-            canonical.add(canonicalize_project_id(raw))
+            cid = canonicalize_project_id(raw)
         except PathShapedProjectIdError:
             continue
+        if cid:
+            canonical.add(cid)
+    if not canonical:
+        if supplied and not _all_path_shaped_warned:
+            _all_path_shaped_warned = True
+            # Deliberately NOT interpolating the entries themselves: they are
+            # filesystem paths. The count is the actionable part.
+            logger.warning(
+                'cross-project ref allowlist disabled: none of the %d supplied '
+                'known_project_ids yielded a usable project id (each was path-shaped or '
+                'blank), so nothing survived canonicalization. The cross-project '
+                'reference filter is running in PERMISSIVE mode — foreign refs are no '
+                'longer narrowed by the registry. Likely cause: the registry was wired '
+                'with project ROOTS where project IDs were expected. Logged once per '
+                'PROCESS, not once per registry: a later, differently-broken registry '
+                'will NOT log, so re-check the registry rather than reading a silent '
+                'log as an all-clear.',
+                supplied,
+            )
+        return None
     return frozenset(canonical)
 
 
@@ -349,6 +463,18 @@ def scan_content(
     and Greek-letter or codename aliases are all invisible here by design.
     Recall is the consumer's problem; precision is this module's.
 
+    One blind spot was MEASURED and accepted rather than merely designed
+    around: a genuine qualified ref split across lines by HARD WRAPPING is
+    missed. Wrapping breaks at the space after the colon, so
+    ``textwrap.fill('...the reference dark_factory: 2500 for more detail', 40)``
+    produces 'dark_factory:\\n2500 for more detail', which
+    :data:`_QUALIFIED_REF_PATTERN`'s '[ \\t]' padding cannot span. That is a
+    real recall loss on wrapped episode bodies, not only a true-negative on
+    YAML-ish noise, and it is the price of the same narrowing that stops
+    'Notes:\\n2500 items' minting a 'notes' project — see the direction-of-safety
+    note on that pattern: for a consumer doing destructive edge surgery, a
+    missed ref is recoverable and a misattributed one is not.
+
     Args:
         content: The verbatim body. Falsy content yields an empty scan.
         group_id: The group the content belongs to (= the local
@@ -362,8 +488,10 @@ def scan_content(
             collection; a ``{project_id: project_root}`` mapping works, since
             iterating it yields its keys). When non-empty, FOREIGN referents
             naming a project outside it are dropped — own-project referents
-            are never dropped by it. When None or empty the filter is
-            PERMISSIVE — see :func:`_canonical_allowlist`.
+            are never dropped by it. When None, empty, or made up entirely of
+            unusable entries — path-shaped or blank, so that nothing survives
+            canonicalization — the filter is PERMISSIVE; see
+            :func:`_canonical_allowlist`.
 
     Returns:
         A :class:`LabelScan`. ``refs`` is safe to act on; ``ambiguous`` must

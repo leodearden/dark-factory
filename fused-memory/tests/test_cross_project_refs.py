@@ -299,6 +299,24 @@ class TestShapeValidProseMatchesRelyOnDownstreamGuards:
         assert scan.refs == []
 
 
+class TestQualifiedRefNeverSpansALineBreak:
+    """Whitespace-tolerant does NOT extend across a line break. The class above
+    accepts the '<word>: <number>' shape on ONE line because that is how humans
+    write a qualified reference; a qualifier and a number separated by a
+    newline is not that shape at all — it is a YAML/'key: value' block or
+    hard-wrapped prose, both routine in episode bodies."""
+
+    def test_colon_followed_by_newline_is_not_a_ref(self):
+        scan = find_cross_project_task_refs('Notes:\n2500 items', group_id='reify')
+        assert scan.refs == []
+
+    def test_the_same_line_spelling_is_unaffected(self):
+        """Guard: the narrowing is across newlines ONLY, not a tightening of the
+        spacing humans write."""
+        scan = find_cross_project_task_refs('Notes: 2500 items', group_id='reify')
+        assert [r.entity_name for r in scan.refs] == ['notes:2500']
+
+
 class TestKnownProjectIdsAllowlist:
     """An optional fourth narrowing: when a registry of known project ids is
     supplied, shape-valid qualifiers naming an unknown project are dropped."""
@@ -345,6 +363,23 @@ class TestKnownProjectIdsAllowlist:
             known_project_ids={'dark_factory', '-home-leo-src-oops'},
         )
         assert [r.entity_name for r in scan.refs] == ['dark_factory:2500']
+
+    def test_all_path_shaped_registry_is_permissive_not_fail_closed(self):
+        """The twin above only proves ONE bad entry is survivable. When EVERY
+        entry is path-shaped nothing survives canonicalization, and an empty
+        allowlist must NOT be read as "allow nothing" — that would silently
+        disable cross-project detection entirely on a registry misconfigured
+        with project ROOTS where project IDs were expected.
+
+        Enforces ``canonical_labels._canonical_allowlist``'s stated contract
+        ("one bad entry never disables the whole allowlist") at the public API,
+        and mirrors ``validate_known_project_id``'s permissive falsy-registry
+        mode.
+        """
+        scan = find_cross_project_task_refs(
+            'see dark_factory:2500', group_id='reify', known_project_ids={'-home-leo-bad'}
+        )
+        assert [(r.project_id, r.task_number) for r in scan.refs] == [('dark_factory', '2500')]
 
 
 class TestDigitsPreservedVerbatim:

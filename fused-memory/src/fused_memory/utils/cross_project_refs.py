@@ -150,8 +150,10 @@ def find_cross_project_task_refs(
         known_project_ids: Optional registry of known project ids (any
             collection; a ``{project_id: project_root}`` mapping works, since
             iterating it yields its keys). When non-empty, refs naming a
-            project outside it are dropped. When None or empty the filter is
-            PERMISSIVE — see :func:`canonical_labels._canonical_allowlist`.
+            project outside it are dropped. When None, empty, or made up
+            entirely of unusable entries — path-shaped or blank, so that
+            nothing survives canonicalization — the filter is PERMISSIVE; see
+            :func:`canonical_labels._canonical_allowlist`.
 
     Returns:
         A :class:`CrossProjectRefScan`. ``refs`` is safe to act on;
