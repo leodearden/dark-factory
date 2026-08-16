@@ -205,9 +205,11 @@ guessing a wrong terminator and discarding everything past it.
 
 ## What was actually lost
 
-The 334 calls above, by which parameter was silently dropped and how often,
-across our own MCP tools: `category` ×70, `project_id` ×32, `rationale`
-×25, `agent_id` ×18, `suggested_action` ×13, `issues` ×10, `priority` ×5.
+Of the 194 parameters recovered from those 334 calls, these seven were
+dropped most often, across our own MCP tools: `category` ×70, `project_id`
+×32, `rationale` ×25, `agent_id` ×18, `suggested_action` ×13, `issues` ×10,
+`priority` ×5 — 173 of the 194, with the remaining 21 spread thinly across
+other, lower-frequency parameters not itemized here.
 
 These are not abstract slots. A dropped `category` or `project_id` on a
 memory-write call means the record was filed under whatever fallback value
@@ -222,11 +224,13 @@ a correct one should be.
 ## Reproducibility
 
 A second, independent measurement on 2026-08-09 — a later, larger snapshot
-of the same transcript archive (roughly 4,400 to 5,704 files) — found 504
-corrupted calls: 443 repaired (87.9%), 61 unrepairable, 245 parameters
-recovered. The same parameters dominate, at larger counts: `category` ×110,
-`project_id` ×44, `agent_id` ×25, `issues` ×16, `rationale` ×13,
-`suggested_action` ×12, `priority` ×5.
+of the same transcript archive, 5,704 transcript files (up from roughly
+4,400 at the time of the 2026-08-05 measurement) — found 504 corrupted
+calls: 443 repaired (87.9%), 61 unrepairable, 245 parameters recovered. The
+same parameters dominate, at larger counts: `category` ×110, `project_id`
+×44, `agent_id` ×25, `issues` ×16, `rationale` ×13, `suggested_action` ×12,
+`priority` ×5 — 225 of the 245, with the remaining 20 spread thinly across
+other, lower-frequency parameters not itemized here.
 
 The repair rate moved from 92.2% to 87.9% between the two measurements, for
 two identified and unremarkable reasons rather than one: the underlying
