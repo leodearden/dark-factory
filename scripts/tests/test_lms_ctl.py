@@ -184,7 +184,7 @@ def test_start_records_the_pre_start_gpu_reading_as_this_arm_s_baseline(
     """
     lms_ctl.start(_arm(), gpu=MEASURED_GPU)
 
-    recorded = lms_vram.read_baseline('qwen3.5-9b')
+    recorded = lms_vram.read_baseline_record('qwen3.5-9b').reading
 
     assert recorded.used_mib == MEASURED_GPU.used_mib
     assert recorded.free_mib == MEASURED_GPU.free_mib
@@ -213,7 +213,7 @@ def test_restarting_an_arm_overwrites_its_previous_baseline(
 
     lms_ctl.start(_arm(), gpu=later)
 
-    assert lms_vram.read_baseline('qwen3.5-9b').used_mib == 8000
+    assert lms_vram.read_baseline_record('qwen3.5-9b').reading.used_mib == 8000
 
 
 # ---------------------------------------------------------------------------

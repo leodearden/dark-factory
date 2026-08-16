@@ -61,7 +61,7 @@ MEASURED_OPERATING_BUDGET_GIB = 16.37
 
 #: The non-arm baseline the figure above is the complement of: 4050 MiB
 #: whisper-writer plus ~3312 MiB of KDE/X11 graphics contexts.  Also a
-#: REFERENCE VALUE only -- see :func:`read_baseline`.  Subtracting a frozen
+#: REFERENCE VALUE only -- see :func:`read_baseline_record`.  Subtracting a frozen
 #: baseline from a live reading misattributes desktop drift to the arm, and in
 #: the fabrication-relevant direction: a desktop that shrank since 2026-08-05
 #: would hand the arm a discount it did not earn.
@@ -305,10 +305,20 @@ POLLUTION_FLOOR_MIB = 1024
 #: Changing what this host is expected to run is a code change with a
 #: reviewable diff.  (`LMS_BASELINE_DIR` is not a counterexample: it redirects
 #: WHERE a measurement is stored, not what counts as a passing one.)
+#:
+#: The NAME pattern admits the versioned interpreter spellings nvidia-smi
+#: actually reports -- `python`, `python3`, `python3.12`, and any of those with
+#: a path -- because whisper-writer under a venv or after a distro interpreter
+#: bump is a ROUTINE event, not an exotic one.  An anchor of `python3?$` alone
+#: would turn each of those restarts into an exit-5 refusal on a perfectly
+#: clean card, pointing the operator at ollama.  A false refusal is the safe
+#: direction for a genuine intruder; it is not a safe direction for the one
+#: process this host is required to be running.  The `$` and the `(?:^|/)`
+#: still hold the line: `pythonish` and `/opt/not-python` match nothing.
 EXPECTED_CONSUMERS: tuple[ExpectedConsumer, ...] = (
     ExpectedConsumer(
         label='whisper-writer (PRD D10 requires it resident)',
-        name_pattern=r'(?:^|/)python3?$',
+        name_pattern=r'(?:^|/)python(?:3(?:\.\d+)?)?$',
         ceiling_mib=6144,
     ),
 )
@@ -815,7 +825,7 @@ def evaluate_budget(
     so the arm is what gets judged.
 
     *baseline_mib* / *baseline_free_mib* come from an nvidia-smi reading taken
-    immediately BEFORE this arm started (see :func:`read_baseline`), never from
+    immediately BEFORE this arm started (see :func:`read_baseline_record`), never from
     :data:`MEASURED_BASELINE_GIB`.  Both reference figures still travel with the
     verdict as reported, non-gating fields.
 
@@ -1073,16 +1083,6 @@ def read_baseline_records(arm_ids: Sequence[str]) -> GpuBaseline:
         )
     records = [read_baseline_record(arm_id) for arm_id in arm_ids]
     return min(records, key=lambda record: record.reading.used_mib)
-
-
-def read_baseline(arm_id: str) -> GpuReading:
-    """The reading half of :func:`read_baseline_record`, for existing callers."""
-    return read_baseline_record(arm_id).reading
-
-
-def read_baselines(arm_ids: Sequence[str]) -> GpuReading:
-    """The reading half of :func:`read_baseline_records`, for existing callers."""
-    return read_baseline_records(arm_ids).reading
 
 
 def clear_baseline(arm_id: str) -> None:

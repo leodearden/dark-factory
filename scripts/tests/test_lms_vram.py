@@ -381,7 +381,7 @@ def test_baseline_round_trips_through_the_recorded_file(tmp_path, monkeypatch):
     monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path))
 
     lms_vram.record_baseline('qwen3.5-9b', _reading(), consumers=[])
-    restored = lms_vram.read_baseline('qwen3.5-9b')
+    restored = lms_vram.read_baseline_record('qwen3.5-9b').reading
 
     assert restored.used_mib == 7310
     assert restored.free_mib == 16813
@@ -396,8 +396,8 @@ def test_baseline_is_written_per_arm_and_does_not_collide(tmp_path, monkeypatch)
         'phi-4-14b', _reading(used_mib=7900, free_mib=16223), consumers=[],
     )
 
-    assert lms_vram.read_baseline('qwen3.5-9b').used_mib == 7310
-    assert lms_vram.read_baseline('phi-4-14b').used_mib == 7900
+    assert lms_vram.read_baseline_record('qwen3.5-9b').reading.used_mib == 7310
+    assert lms_vram.read_baseline_record('phi-4-14b').reading.used_mib == 7900
 
 
 def test_reading_a_missing_baseline_raises_rather_than_defaulting(
@@ -412,7 +412,7 @@ def test_reading_a_missing_baseline_raises_rather_than_defaulting(
     monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path))
 
     with pytest.raises(lms_vram.VramProbeError, match='no baseline'):
-        lms_vram.read_baseline('qwen3.5-9b')
+        lms_vram.read_baseline_record('qwen3.5-9b')
 
 
 def test_a_corrupt_baseline_file_raises(tmp_path, monkeypatch):
@@ -420,7 +420,7 @@ def test_a_corrupt_baseline_file_raises(tmp_path, monkeypatch):
     lms_vram.baseline_path('qwen3.5-9b').write_text('not json at all')
 
     with pytest.raises(lms_vram.VramProbeError):
-        lms_vram.read_baseline('qwen3.5-9b')
+        lms_vram.read_baseline_record('qwen3.5-9b')
 
 
 def test_the_recorded_baseline_is_stamped_with_an_aware_utc_time(
@@ -436,7 +436,7 @@ def test_the_recorded_baseline_is_stamped_with_an_aware_utc_time(
     assert stamped.tzinfo is not None
 
 
-def test_read_baselines_takes_the_most_conservative_of_several(
+def test_read_baseline_records_takes_the_most_conservative_of_several(
     tmp_path, monkeypatch,
 ):
     """Probing several arms at once has several baselines; the LOWEST prior
@@ -446,17 +446,17 @@ def test_read_baselines_takes_the_most_conservative_of_several(
     lms_vram.record_baseline('a', _reading(used_mib=7310, free_mib=16813), consumers=[])
     lms_vram.record_baseline('b', _reading(used_mib=9000, free_mib=15123), consumers=[])
 
-    chosen = lms_vram.read_baselines(['a', 'b'])
+    chosen = lms_vram.read_baseline_records(['a', 'b']).reading
 
     assert chosen.used_mib == 7310
     assert chosen.free_mib == 16813
 
 
-def test_read_baselines_raises_when_asked_for_nothing(tmp_path, monkeypatch):
+def test_read_baseline_records_raises_when_asked_for_nothing(tmp_path, monkeypatch):
     monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path))
 
     with pytest.raises(lms_vram.VramProbeError):
-        lms_vram.read_baselines([])
+        lms_vram.read_baseline_records([])
 
 
 def test_clearing_a_baseline_is_idempotent(tmp_path, monkeypatch):
@@ -677,7 +677,19 @@ def test_the_expected_consumer_allowlist_is_whisper_writer_alone():
 
 
 @pytest.mark.parametrize(
-    'process_name', ['python', 'python3', '/usr/bin/python3', '/usr/bin/python'],
+    'process_name',
+    [
+        'python',
+        'python3',
+        '/usr/bin/python3',
+        '/usr/bin/python',
+        # Versioned interpreters, which nvidia-smi reports on plenty of hosts.
+        # Omitting them made a routine whisper-writer restart under a venv or
+        # after a distro interpreter bump refuse an arm on a clean card.
+        'python3.11',
+        '/usr/bin/python3.12',
+        '/home/leo/.venvs/ww/bin/python3.13',
+    ],
 )
 def test_the_whisper_writer_pattern_matches_a_bare_or_pathed_python(process_name):
     (whisper,) = lms_vram.EXPECTED_CONSUMERS
@@ -692,6 +704,11 @@ def test_the_whisper_writer_pattern_matches_a_bare_or_pathed_python(process_name
         'llama-server',
         'pythonish',
         '/opt/not-python',
+        # The version suffix the pattern admits is `3`-only and must be a
+        # complete version: widening it for `python3.12` must not admit a
+        # different interpreter, nor a name that merely starts like one.
+        'python2',
+        'python3x',
     ],
 )
 def test_the_whisper_writer_pattern_does_not_match_anything_else(process_name):
@@ -1005,23 +1022,6 @@ def test_read_baseline_records_raises_when_asked_for_nothing(tmp_path, monkeypat
 
     with pytest.raises(lms_vram.VramProbeError):
         lms_vram.read_baseline_records([])
-
-
-def test_read_baseline_and_read_baselines_still_hand_back_a_plain_reading(
-    tmp_path, monkeypatch,
-):
-    """Existing callers are unchanged: the record is the new value, and the two
-    older accessors stay thin wrappers over its reading."""
-    monkeypatch.setenv(lms_vram.BASELINE_DIR_ENV, str(tmp_path))
-    lms_vram.record_baseline('a', _reading(used_mib=7310), consumers=[WHISPER])
-    lms_vram.record_baseline(
-        'b', _reading(used_mib=9000, free_mib=15123), consumers=[WHISPER],
-    )
-
-    assert isinstance(lms_vram.read_baseline('a'), lms_vram.GpuReading)
-    assert lms_vram.read_baseline('a').used_mib == 7310
-    assert isinstance(lms_vram.read_baselines(['a', 'b']), lms_vram.GpuReading)
-    assert lms_vram.read_baselines(['a', 'b']).used_mib == 7310
 
 
 def test_a_baseline_record_is_frozen():
