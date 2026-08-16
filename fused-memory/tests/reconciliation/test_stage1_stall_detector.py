@@ -837,6 +837,109 @@ class TestMaybeEscalateStalledGateBacklog:
         assert 'age_hours:' not in submitted.detail
 
     @pytest.mark.asyncio
+    async def test_stamps_expected_dedupe_fingerprint(self):
+        """(a3) The filed escalation carries the (category, project, task) content key.
+
+        The fingerprint is what ``DedupeConfig.for_gate_backlog()`` folds on, so
+        its exact composition is a contract, not an implementation detail.
+        """
+        from escalation.dedupe import compute_content_fingerprint
+
+        queue = self._make_queue(has_open_l1_return=False)
+        task_by_id = {'645': _gate_task_record(645, hours_ago=49)}
+
+        await maybe_escalate_stalled_gate_backlog(
+            escalation_queue=queue,
+            project_id='autopilot_video',
+            run_id='run-xyz',
+            stalled_task_ids=['645'],
+            task_by_id=task_by_id,
+            now=_GATE_NOW,
+        )
+
+        submitted = queue.submit.call_args[0][0]
+        expected = compute_content_fingerprint(
+            'reconciliation_stale_gate_backlog', '', ['autopilot_video:645'], ''
+        )
+        assert submitted.dedupe_fingerprint == expected
+
+        # NON-EMPTY is load-bearing on its own: find_dedupe_parent short-circuits
+        # to None on a falsy key, so an empty fingerprint means "never fold" —
+        # silently re-pinning dedupe_count at 0, the exact defect being fixed.
+        assert submitted.dedupe_fingerprint, (
+            'fingerprint must be non-empty; a falsy key makes find_dedupe_parent '
+            'never fold and silently mints a duplicate record every cycle'
+        )
+
+    @pytest.mark.asyncio
+    async def test_fingerprint_stable_across_cycles(self):
+        """(a4) 100h apart, drifting prose, same gate → identical non-empty fingerprint."""
+        task_by_id = {'645': _gate_task_record(645, hours_ago=49)}
+
+        queue1 = self._make_queue(has_open_l1_return=False)
+        await maybe_escalate_stalled_gate_backlog(
+            escalation_queue=queue1,
+            project_id='autopilot_video',
+            run_id='run-cycle-1',
+            stalled_task_ids=['645'],
+            task_by_id=task_by_id,
+            now=_GATE_NOW,
+        )
+        first = queue1.submit.call_args[0][0]
+
+        queue2 = self._make_queue(has_open_l1_return=False)
+        await maybe_escalate_stalled_gate_backlog(
+            escalation_queue=queue2,
+            project_id='autopilot_video',
+            run_id='run-cycle-2',
+            stalled_task_ids=['645'],
+            task_by_id=task_by_id,
+            now=_GATE_NOW + timedelta(hours=100),
+        )
+        second = queue2.submit.call_args[0][0]
+
+        # Precondition: the prose really did drift between the two cycles, so
+        # equality below is proving stability, not just re-reading a constant.
+        assert first.detail != second.detail
+        assert 'age_hours_at_filing: 49.0' in first.detail
+        assert 'age_hours_at_filing: 149.0' in second.detail
+
+        # Truthiness is REQUIRED here: today both fingerprints are None, so a
+        # bare `first == second` would pass vacuously green.
+        assert first.dedupe_fingerprint, 'cycle-1 fingerprint must be non-empty'
+        assert second.dedupe_fingerprint, 'cycle-2 fingerprint must be non-empty'
+        assert first.dedupe_fingerprint == second.dedupe_fingerprint, (
+            'fingerprint must not drift with age/run_id/prose — a drifting key '
+            'never folds and re-pins dedupe_count at 0'
+        )
+
+    @pytest.mark.asyncio
+    async def test_fingerprint_distinct_per_task(self):
+        """(a5) Two gates in the same project get distinct fingerprints (no cross-fold)."""
+        queue = MagicMock()
+        queue.has_open_l1.return_value = False
+        queue.make_id.side_effect = lambda tid: f'esc-{tid}-001'
+        queue.submit.side_effect = lambda esc: esc.id
+        task_by_id = {
+            'A': _gate_task_record('A', hours_ago=50),
+            'B': _gate_task_record('B', hours_ago=50),
+        }
+
+        await maybe_escalate_stalled_gate_backlog(
+            escalation_queue=queue,
+            project_id='autopilot_video',
+            run_id='r',
+            stalled_task_ids=['A', 'B'],
+            task_by_id=task_by_id,
+            now=_GATE_NOW,
+        )
+
+        fps = [call[0][0].dedupe_fingerprint for call in queue.submit.call_args_list]
+        assert len(fps) == 2
+        assert all(fps), f'both fingerprints must be non-empty; got {fps}'
+        assert fps[0] != fps[1], 'distinct gates must not share a fold key'
+
+    @pytest.mark.asyncio
     async def test_skips_when_open_gate_backlog_l1_exists(self):
         """(b) has_open_l1(tid, category=...) True → no submit; category-scoped dedup."""
         queue = self._make_queue(has_open_l1_return=True)
