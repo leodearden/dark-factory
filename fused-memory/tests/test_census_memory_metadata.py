@@ -780,6 +780,183 @@ class TestTopicCoverageBlock:
         assert json.dumps(first, sort_keys=False) == json.dumps(second, sort_keys=False)
 
 
+class TestUniquenessViolationsAreNamedAndReadable:
+    """>1 canonical per topic: NAMED, and readable against the live regime.
+
+    An operator cannot act on an integer, and a bare count is also
+    MISREADABLE: 3198 ships warn-mode-first behind ``memory_metadata.enforce``
+    (default False, config/schema.py:458), so a duplicate can land by an
+    ordinary write and a non-zero count is partly backlog, not proof the
+    guard broke.  The block therefore carries the violators, the live flag,
+    and -- per Leo's 2026-08-12 ruling (Option B on esc-4006-3) -- what still
+    stands between here and flipping that flag.
+    """
+
+    @staticmethod
+    def _violators_report(**kwargs):
+        cells = {
+            'dark_factory': {
+                OBS: _census([
+                    {'topic': 'three-way', 'canonical': True},
+                    {'topic': 'three-way', 'canonical': True},
+                    {'topic': 'three-way', 'canonical': True},
+                    {'topic': 'a-pair', 'canonical': True},
+                    {'topic': 'a-pair', 'canonical': True},
+                    {'topic': 'b-pair', 'canonical': True},
+                    {'topic': 'b-pair', 'canonical': True},
+                    {'topic': 'fine', 'canonical': True},
+                ]),
+            },
+        }
+        cov = {'dark_factory': _coverage('fused_dark_factory', 8, {OBS: (8, 8)})}
+        return _mod.build_report(cells, cov, top_n=50, **kwargs)
+
+    def test_violators_are_named_not_merely_counted(self):
+        block = self._violators_report()['projects']['dark_factory']['topic_coverage']
+        assert block['topics_with_multiple_canonical'] == 3
+        rows = block['multiple_canonical_topics']
+        assert [(r['topic'], r['canonical_count']) for r in rows] == [
+            ('three-way', 3),
+            ('a-pair', 2),
+            ('b-pair', 2),
+        ]
+
+    def test_violator_rows_follow_the_house_total_order(self):
+        # count desc, then topic asc -- the same total order _table() uses,
+        # so the artifact stays byte-stable across re-runs.
+        rows = self._violators_report()['projects']['dark_factory'][
+            'topic_coverage'
+        ]['multiple_canonical_topics']
+        assert rows == sorted(rows, key=lambda r: (-r['canonical_count'], r['topic']))
+
+    def test_a_clean_corpus_reports_an_empty_violator_list(self):
+        cells = {'dark_factory': {OBS: _census([{'topic': 'fine', 'canonical': True}])}}
+        cov = {'dark_factory': _coverage('fused_dark_factory', 1, {OBS: (1, 1)})}
+        report = _mod.build_report(cells, cov, top_n=50)
+        block = report['projects']['dark_factory']['topic_coverage']
+        assert block['multiple_canonical_topics'] == []
+
+    def test_enforce_state_is_disclosed_beside_the_count(self):
+        for state in (True, False):
+            block = self._violators_report(canonical_uniqueness_enforced=state)[
+                'projects'
+            ]['dark_factory']['topic_coverage']
+            assert block['canonical_uniqueness_enforced'] is state
+
+    def test_enforce_state_is_three_valued_never_defaulted_to_false(self):
+        # null means "could not read the config", which is a DIFFERENT claim
+        # from "the guard is off".  Fabricating False here would assert the
+        # wrong defect class confidently: it would tell a reader the
+        # violations are expected backlog when in fact nothing is known.
+        block = self._violators_report(canonical_uniqueness_enforced=None)[
+            'projects'
+        ]['dark_factory']['topic_coverage']
+        assert block['canonical_uniqueness_enforced'] is None
+
+    def test_enforce_reader_returns_a_bool_from_the_live_config(self):
+        assert _mod.read_canonical_uniqueness_enforced() in (True, False)
+
+    def test_enforce_reader_degrades_to_none_rather_than_raising(self, monkeypatch):
+        # The census must still produce its MEASUREMENT when config loading
+        # is broken -- losing the whole census to a config fault would be a
+        # strictly worse outcome than an undisclosed flag.
+        import fused_memory.config.schema as schema_mod
+
+        class _Exploding:
+            def __init__(self, *a, **kw):
+                raise RuntimeError('config is unloadable')
+
+        monkeypatch.setattr(schema_mod, 'FusedMemoryConfig', _Exploding)
+        assert _mod.read_canonical_uniqueness_enforced() is None
+
+
+class TestEnforceFlipPreconditionCitations:
+    """The report says what stands between here and flipping ``enforce``.
+
+    Leo's 2026-08-12 ruling (Option B on esc-4006-3): emitting the flag tells
+    a reader its CURRENT state but not what remains.  This is a REPORTING
+    addition -- the report cites the preconditions; it does not chase them.
+    """
+
+    @staticmethod
+    def _block():
+        cells = {'dark_factory': {OBS: _census([{'topic': 't', 'canonical': True}])}}
+        cov = {'dark_factory': _coverage('fused_dark_factory', 1, {OBS: (1, 1)})}
+        report = _mod.build_report(cells, cov, top_n=50)
+        return report['projects']['dark_factory']['topic_coverage']
+
+    def test_exactly_three_citations_each_fully_shaped(self):
+        entries = self._block()['enforce_flip_preconditions']
+        assert len(entries) == 3
+        for entry in entries:
+            assert set(entry) >= {'id', 'what', 'status', 'source'}
+            assert entry['what'] and entry['source']
+
+    def test_the_three_cited_ids(self):
+        ids = [e['id'] for e in self._block()['enforce_flip_preconditions']]
+        assert ids == ['legacy_topic_spelling_remains', '3202', '3626']
+
+    def test_legacy_spelling_bucket_carries_its_RECORDED_status_not_open(self):
+        # PRD §159's 2026-08-04 amendment records this half DISCHARGED ("that
+        # bucket is empty ... every live canonical:true topic conforms in both
+        # projects").  Citing it as flatly open would be as wrong as omitting
+        # it.
+        entry = self._block()['enforce_flip_preconditions'][0]
+        assert entry['status'] == 'discharged_2026_08_04'
+        assert '159' in entry['source']
+
+    def test_3202_is_cited_as_the_real_open_precondition(self):
+        entry = self._block()['enforce_flip_preconditions'][1]
+        assert entry['status'] == 'open'
+        assert '3202' in entry['source']
+
+    def test_3626_is_cited_as_the_deciding_gate(self):
+        entry = self._block()['enforce_flip_preconditions'][2]
+        assert entry['status'] == 'open'
+        assert '3626' in entry['source']
+
+    def test_citations_are_single_homed_in_a_module_constant(self):
+        # One home for the three citations, so a future edit cannot leave the
+        # JSON and the markdown disagreeing about what blocks the flip.
+        ids = [e['id'] for e in _mod.ENFORCE_FLIP_PRECONDITIONS]
+        assert ids == [e['id'] for e in self._block()['enforce_flip_preconditions']]
+
+    def test_the_emitted_block_does_not_alias_the_constant(self):
+        # Rendering must not hand out the module constant itself: a consumer
+        # mutating the report would silently rewrite every later run's
+        # citations in the same process (the nightly wrapper censuses two
+        # projects in one invocation).
+        block = self._block()
+        block['enforce_flip_preconditions'][0]['status'] = 'MUTATED'
+        assert _mod.ENFORCE_FLIP_PRECONDITIONS[0]['status'] == 'discharged_2026_08_04'
+
+    def test_citations_are_citation_only_carrying_no_live_task_probe(self):
+        # The ruling's scope note is explicit: cite the preconditions, do not
+        # chase them.  A live status probe here would silently expand this
+        # task into 3202/3626's territory and could go stale against the task
+        # store without any test noticing.
+        for entry in self._block()['enforce_flip_preconditions']:
+            assert 'task_status' not in entry
+            assert 'probed_at' not in entry
+
+    def test_citations_are_emitted_for_every_project_and_the_grand_total(self):
+        cells = {
+            'dark_factory': {OBS: _census([{'topic': 'a'}])},
+            'reify': {OBS: _census([{'topic': 'b'}])},
+        }
+        cov = {
+            'dark_factory': _coverage('fused_dark_factory', 1, {OBS: (1, 1)}),
+            'reify': _coverage('fused_reify', 1, {OBS: (1, 1)}),
+        }
+        report = _mod.build_report(cells, cov, top_n=50)
+        for block in (
+            report['projects']['dark_factory']['topic_coverage'],
+            report['projects']['reify']['topic_coverage'],
+            report['topic_coverage'],
+        ):
+            assert len(block['enforce_flip_preconditions']) == 3
+
+
 class TestBuildReportDeterminism:
     """A re-run must produce a byte-identical artifact."""
 
