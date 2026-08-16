@@ -598,11 +598,10 @@ abandoned work is recorded as a successful run."""
 # lines both now carry the same echo, back-ported by task 3467 (commit
 # 45d19bf899) -- so this is a shared convention across all three blocks, not a
 # roles.py-only divergence. One divergence remains: unlike the SKILL.md
-# blocks, this block's rc=1 arm (task 4107) tells the reader not to try to
-# sync or advance the checkout at all, rather than naming a specific remedy
-# command, because a spurious rc=1 here is fixed temporally -- only the merge
-# worker's own local ref write ever advances the shared `main` this block
-# checks against.
+# blocks, this block's rc=1 arm (task 4107) explicitly forbids `git fetch`
+# and points at `mcp__escalation__merge_status` instead, because a spurious
+# rc=1 here is fixed temporally -- only the merge worker's own local ref
+# write ever advances the shared `main` this block checks against.
 ANCESTRY_CHECK_INSTRUCTIONS = """\
     git -C <project_root> merge-base --is-ancestor <sha> main; rc=$?; echo "ancestry rc=$rc"
     # The trailing `echo` is REQUIRED, not decoration. `--is-ancestor` prints
@@ -616,20 +615,20 @@ ANCESTRY_CHECK_INSTRUCTIONS = """\
     # rc=1   -> <sha> resolves here but is NOT reachable from the `main` ref as it
     #           stands in THIS checkout. Usually the SHA is wrong (only on a feature
     #           branch) -- but the other real cause is that the merge has not landed
-    #           YET. `refs/heads/main` is advanced only by the merge worker's own local
-    #           CAS, `git update-ref refs/heads/main <new> <old>` in
-    #           `GitOps.advance_main` (git_ops.py:11260-11262); every worktree reads
-    #           that one shared ref out of the common `.git` dir, so a landed advance
-    #           is visible here immediately, with no sync step. Do NOT try to sync or
-    #           advance this checkout before re-running: no git operation performed
-    #           here can move `refs/heads/main` -- only the merge worker's local ref
-    #           write above does. Such an attempt only touches `refs/remotes/*` and the
-    #           object store, so it is a strict no-op for this comparison, and
-    #           re-running afterward reproduces the same rc=1, the exact false "really
-    #           off main" verdict this block exists to prevent. If a merge may still be
-    #           in flight, confirm with `mcp__escalation__merge_status` and re-run this
-    #           same check once it reports the merge landed. Still rc=1 after that ->
-    #           the SHA really is off main; re-derive the landing commit.
+    #           YET. `refs/heads/main` moves only via the merge worker's own local CAS,
+    #           `git update-ref refs/heads/main <new> <old>` in `GitOps.advance_main`;
+    #           every worktree reads that one shared ref out of the common `.git` dir,
+    #           so a landed advance is visible here immediately, with no sync step.
+    #           Do NOT run `git fetch` here -- it cannot move `refs/heads/main`, only
+    #           the merge worker's local ref write does. More generally, do NOT try to
+    #           sync or advance this checkout at all (a `git pull`, `fetch origin
+    #           main:main`, etc. are the same mistake): every such attempt only touches
+    #           `refs/remotes/*` and the object store, so it is a strict no-op for this
+    #           comparison, and re-running afterward reproduces the same rc=1, the exact
+    #           false "really off main" verdict this block exists to prevent. If a merge
+    #           may still be in flight, confirm with `mcp__escalation__merge_status` and
+    #           re-run this same check once it reports the merge landed. Still rc=1
+    #           after that -> the SHA really is off main; re-derive the landing commit.
     # rc=128 -> git cannot resolve <sha> (or `main`) in this checkout: "fatal: Not a
     #           valid object name". This is NOT "not on main" -- it is "not yet
     #           confirmed". Usually a stale/unfetched <project_root>, a wrong -C path,
