@@ -873,6 +873,102 @@ _ANCHORED_SLOT_TIMEOUT_SHAPES: list[tuple[str, str]] = [
 _GROUNDED_SLOT_TIMEOUT_OUTPUTS = [output for _, output in _ANCHORED_SLOT_TIMEOUT_SHAPES]
 
 
+# ---------------------------------------------------------------------------
+# task 4212 — reify task 6024 landed `disposition=<fatal|soft>` as
+# `slot_acquire`'s optional 6th argument (reify scripts/lib_slot_acquire.sh:147,
+# closed vocabulary documented at reify docs/notes/verify-pipeline-knobs.md:
+# 74-77; default `fatal`, taken by all three wrapper call sites whose grounded
+# shapes make up `_ANCHORED_SLOT_TIMEOUT_SHAPES` above). Exactly ONE caller
+# passes `soft`: reify tests/infra/run_all.sh:1692's pool worker
+# (run_all.sh:1398-1427). Its rc=75 is a SOFT ADMISSION — the worker proceeds
+# UNSLOTTED, the member still runs, and run_all itself still exits 0 — not an
+# infra hold. That pool wait is deliberately NOT one of the three basenames
+# `_SLOT_ACQUIRE_DEADLINE_RE` allowlists (run_all.sh:1398-1408 states this
+# explicitly), so the `@@REIFY_SLOT_TIMEOUT@@` sentinel is the pool's ONLY
+# classification route, which is exactly why a `disposition=soft` sentinel
+# must not classify SEMAPHORE_TIMEOUT.
+#
+# RED today (measured against the live module on this branch, not assumed):
+# every case below classifies `semaphore_timeout`.
+# ---------------------------------------------------------------------------
+
+# reify tests/infra/run_all.sh:1692 — the pool worker, the ONLY caller
+# that passes slot_acquire's 6th arg as `soft`. Its rc=75 is a SOFT
+# ADMISSION: the worker proceeds unslotted, the member still runs, and
+# run_all still exits 0. Deliberately NOT one of the three basenames in
+# _SLOT_ACQUIRE_DEADLINE_RE (run_all.sh:1398-1408), so this sentinel is
+# the pool's only classification route — which is why the gate belongs
+# on the sentinel arm.
+_SLOT_TIMEOUT_SOFT_POOL_OUTPUT = (
+    '@@REIFY_SLOT_TIMEOUT@@ reason=run_all_pool_starvation slots=8 waited=1800 '
+    'disposition=soft lock=/tmp/reify-run-all-pool.lock\n'
+)
+
+# Deliberately NOT added to `_ANCHORED_SLOT_TIMEOUT_SHAPES` above: that list
+# is the "must classify SEMAPHORE_TIMEOUT" corpus feeding
+# `_SLOT_TIMEOUT_WITH_COLLATERAL_CASES` below — the soft shape's contract is
+# the opposite.
+
+
+class TestSoftDispositionSlotTimeoutIsNotSemaphoreTimeout:
+    """task 4212: a `disposition=soft` slot-timeout sentinel is a degraded-
+    but-healthy pool admission (reify run_all.sh's pool worker proceeding
+    unslotted), not an infra hold, and must not classify SEMAPHORE_TIMEOUT —
+    mirroring `TestGroundedSlotTimeoutMarkersAreDetected`'s tool-blind style,
+    since a soft admission is equally not-a-timeout regardless of which
+    tool's command was waiting on the pool."""
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_soft_disposition_is_not_semaphore_timeout(self, tool):
+        result = _classify(tool, _SLOT_TIMEOUT_SOFT_POOL_OUTPUT, 1, False)
+        assert result != FailureCategory.SEMAPHORE_TIMEOUT, (
+            f'a disposition=soft slot-timeout sentinel must not classify '
+            f'semaphore_timeout, got {result!r}'
+        )
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_soft_disposition_is_not_infra_transient(self, tool):
+        """The operationally meaningful half, mirroring
+        ``TestDeterministicLintFailureIsNotSemaphoreTimeout.
+        test_deterministic_fault_is_not_infra_transient``'s stated reasoning:
+        merely asserting ``!= SEMAPHORE_TIMEOUT`` would still pass if the
+        output were relabelled to some other infra-transient category, which
+        would reproduce the incident this task exists to close (a red routed
+        into the bounded infra-retry loop, terminating in a blocking human
+        escalation, instead of reaching the debugger). The concrete post-fix
+        category is asserted too, so this cannot pass vacuously."""
+        result = _classify(tool, _SLOT_TIMEOUT_SOFT_POOL_OUTPUT, 1, False)
+        assert result == FailureCategory.UNKNOWN_TEST_FAILURE, (
+            f'a disposition=soft-only output with no other signal must fall '
+            f'through to unknown_test_failure, got {result!r}'
+        )
+        assert result not in INFRA_TRANSIENT_CATEGORIES, (
+            f'a disposition=soft slot-timeout sentinel must not land in an '
+            f'infra-transient category (it would be silently retried), got '
+            f'{result!r}'
+        )
+
+    @pytest.mark.parametrize('tool', [ToolKind.PYTEST, ToolKind.OPAQUE])
+    @pytest.mark.parametrize('order', ['soft_first', 'pytest_first'])
+    def test_soft_pool_sharing_a_leg_with_a_real_test_failure_keeps_test_failure(
+        self, order, tool
+    ):
+        """task 4212 / the misfiling incident itself: a genuine pytest red
+        sharing ONE aggregated leg with a degraded-but-healthy pool (a soft
+        admission, not an infra hold) must keep its real cause —
+        ``_SEMAPHORE_TIMEOUT_PYTEST_VERDICT_OUTPUT`` is the task-2821
+        grounded golden from the reify 2026-07-19 red-main incident."""
+        if order == 'soft_first':
+            output = _SLOT_TIMEOUT_SOFT_POOL_OUTPUT + _SEMAPHORE_TIMEOUT_PYTEST_VERDICT_OUTPUT
+        else:
+            output = _SEMAPHORE_TIMEOUT_PYTEST_VERDICT_OUTPUT + _SLOT_TIMEOUT_SOFT_POOL_OUTPUT
+        result = _classify(tool, output, 1, False)
+        assert result == FailureCategory.TEST_FAILURE, (
+            f'a genuine pytest verdict sharing a leg with a soft pool '
+            f'admission must keep classifying test_failure, got {result!r}'
+        )
+
+
 class TestGroundedSlotTimeoutMarkersAreDetected:
     """task 3679: every REAL reify slot-acquisition deadline line classifies
     SEMAPHORE_TIMEOUT, for every ToolKind — mirrors
