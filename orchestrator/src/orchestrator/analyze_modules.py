@@ -96,26 +96,50 @@ def _first_component(module: str) -> str:
 def _iter_events(
     db_path: Path,
     since: datetime,
-) -> Iterable[tuple[str, str, str | None, dict]]:
-    """Yield (timestamp, event_type, task_id, data) tuples from runs.db."""
+) -> Iterable[dict]:
+    """Yield ``runs.db`` event rows shaped like ``EventStore`` returns them.
+
+    Each row is a dict carrying ``id``, ``timestamp``, ``run_id``, ``task_id``,
+    ``event_type`` and a JSON-decoded ``data`` — the same shape
+    ``EventStore.fetch_events_by_type_all_runs`` produces, so
+    :func:`hold_history.iter_hold_spans` can consume this stream directly
+    instead of the CLI re-implementing acquire→release pairing (INV-5).
+
+    ``service_restart`` rows are selected even though this module never counts
+    them: they are one of the two era boundaries the span helper closes on.
+
+    The read stays raw sqlite rather than going through ``EventStore``: the
+    fetch API has no ``since`` predicate, so it would pull the whole store and
+    filter in Python, discarding the one thing ``--since`` exists to do.
+    """
     # Open read-only to avoid touching -wal/-shm sidecars; mirrors digest.py:242.
     conn = sqlite3.connect(f'{db_path.resolve().as_uri()}?mode=ro', uri=True)
     try:
         cur = conn.execute(
-            'SELECT timestamp, event_type, task_id, data '
+            'SELECT id, timestamp, run_id, task_id, event_type, data '
             'FROM events '
             'WHERE timestamp >= ? '
             "AND event_type IN "
-            "('lock_acquired','lock_released','task_skipped','merge_attempt') "
+            "('lock_acquired','lock_released','task_skipped','merge_attempt',"
+            "'service_restart') "
+            # iter_hold_spans needs ONE stream in the store's own order, or a
+            # release could be applied before its acquire.
             'ORDER BY id ASC',
             (since.isoformat(),),
         )
-        for ts, event_type, task_id, data in cur:
+        for row_id, ts, run_id, task_id, event_type, data in cur:
             try:
                 data_dict = json.loads(data) if data else {}
             except (TypeError, ValueError):
                 data_dict = {}
-            yield ts, event_type, task_id, data_dict
+            yield {
+                'id': row_id,
+                'timestamp': ts,
+                'run_id': run_id,
+                'task_id': task_id,
+                'event_type': event_type,
+                'data': data_dict,
+            }
     finally:
         conn.close()
 
@@ -128,20 +152,23 @@ def _parse_ts(ts: str) -> float:
 def aggregate(db_path: Path, since: datetime) -> dict[str, ModuleStats]:
     """Scan ``db_path`` events since ``since`` and return per-module stats."""
     stats: dict[str, ModuleStats] = defaultdict(ModuleStats)
-    for ts, event_type, task_id, data in _iter_events(db_path, since):
+    for row in _iter_events(db_path, since):
+        event_type = row['event_type']
+        task_id = row['task_id']
+        data = row['data']
         modules = data.get('modules') or []
         if isinstance(modules, str):
             modules = [modules]
         keys = {_first_component(m) for m in modules if m}
         keys.discard('')
         if event_type == 'lock_acquired':
-            posix = _parse_ts(ts)
+            posix = _parse_ts(row['timestamp'])
             for k in keys:
                 stats[k].dispatches += 1
                 if task_id:
                     stats[k].open_acquires[task_id] = posix
         elif event_type == 'lock_released':
-            posix = _parse_ts(ts)
+            posix = _parse_ts(row['timestamp'])
             for k in keys:
                 if task_id and task_id in stats[k].open_acquires:
                     start = stats[k].open_acquires.pop(task_id)
