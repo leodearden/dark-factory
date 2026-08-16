@@ -1723,9 +1723,10 @@ _SLOT_TIMEOUT_WITH_COLLATERAL_PARAMS = [
 # is tool-blind by construction (it never even receives `tool`); that
 # tool-blindness is already pinned, cross-producted over every ToolKind, by
 # `TestMergeVerifyCollateralEnvGuard` and `TestGroundedSlotTimeoutMarkersAreDetected`
-# above. Re-crossing ALL_TOOL_KINDS here would multiply the same 60 real
-# cases by 7 identical code paths for no added detection power — confirmed
-# by mutation-kill: hoisting the SEMAPHORE_TIMEOUT arm
+# above. Re-crossing ALL_TOOL_KINDS here would multiply the same 70 real
+# cases (task 4212 grew this from 60 by adding the `sentinel_fatal` shape to
+# `_ANCHORED_SLOT_TIMEOUT_SHAPES`) by 7 identical code paths for no added
+# detection power — confirmed by mutation-kill: hoisting the SEMAPHORE_TIMEOUT arm
 # (verify_classify.py:571-572) above the ENV_TRANSIENT branches flips every
 # case in this corpus regardless of which ToolKind carries it, so any single
 # tool already kills the mutant. OPAQUE (the generic fallback) plus PYTEST
