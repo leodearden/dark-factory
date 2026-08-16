@@ -869,6 +869,142 @@ class TestUniquenessViolationsAreNamedAndReadable:
         monkeypatch.setattr(schema_mod, 'FusedMemoryConfig', _Exploding)
         assert _mod.read_canonical_uniqueness_enforced() is None
 
+    # ── the corpus-wide block is graded at (project, topic) grain ──────────
+    #
+    # Caught on the FIRST live regeneration (step-22): the report headlined
+    # "Topics carrying more than one live canonical: true: 1" directly above a
+    # named-violator table reading "(none)".  Both were right about their own
+    # scope and the report was still wrong, which is the worst shape a measured
+    # artifact can take -- a reader either distrusts the number or hunts for a
+    # violation that does not exist.
+    #
+    # Cause: the corpus-wide block was built from a census merged ACROSS
+    # projects, which merges the two topic NAMESPACES.  3198's invariant is
+    # per-(project, topic) -- its probe is
+    # count_memories_by_metadata(project_id, {'topic': T, 'canonical': True}),
+    # bound to one project -- so a topic correctly carrying one canonical in
+    # dark_factory and one in reify is two compliant cells, not one violation.
+    # Live instance: `merge-request-bare-task-id-branch-arg`, canonical in both.
+
+    def test_one_canonical_in_each_of_two_projects_is_not_a_violation(self):
+        """The exact live shape that produced the contradictory artifact."""
+        shared = 'merge-request-bare-task-id-branch-arg'
+        cells = {
+            'dark_factory': {OBS: _census([{'topic': shared, 'canonical': True}])},
+            'reify': {OBS: _census([{'topic': shared, 'canonical': True}])},
+        }
+        cov = {
+            'dark_factory': _coverage('fused_dark_factory', 1, {OBS: (1, 1)}),
+            'reify': _coverage('fused_reify', 1, {OBS: (1, 1)}),
+        }
+        report = _mod.build_report(cells, cov, top_n=50)
+
+        for project_id in ('dark_factory', 'reify'):
+            block = report['projects'][project_id]['topic_coverage']
+            assert block['topics_with_multiple_canonical'] == 0, project_id
+            assert block['topics_with_one_canonical'] == 1, project_id
+
+        grand = report['topic_coverage']
+        assert grand['topics_with_multiple_canonical'] == 0
+        assert grand['multiple_canonical_topics'] == []
+        # Two compliant CELLS, not one merged topic: the partition is counted
+        # over (project, topic) pairs, the grain the invariant is stated at.
+        assert grand['topics_with_one_canonical'] == 2
+
+    def test_the_corpus_wide_count_and_its_named_list_can_never_disagree(self):
+        """The count IS the length of the named list, at every scope.
+
+        Pinned as an identity rather than as two numbers, because the artifact
+        that shipped had a count and a list sourced from different grains.
+        """
+        cells = {
+            'dark_factory': {
+                OBS: _census([
+                    # A real per-project violation: two canonicals, one topic.
+                    {'topic': 'dupe', 'canonical': True},
+                    {'topic': 'dupe', 'canonical': True},
+                    {'topic': 'shared', 'canonical': True},
+                ]),
+            },
+            'reify': {OBS: _census([{'topic': 'shared', 'canonical': True}])},
+        }
+        cov = {
+            'dark_factory': _coverage('fused_dark_factory', 3, {OBS: (3, 3)}),
+            'reify': _coverage('fused_reify', 1, {OBS: (1, 1)}),
+        }
+        report = _mod.build_report(cells, cov, top_n=50)
+
+        for block in (
+            report['projects']['dark_factory']['topic_coverage'],
+            report['projects']['reify']['topic_coverage'],
+            report['topic_coverage'],
+        ):
+            assert (block['topics_with_multiple_canonical']
+                    == len(block['multiple_canonical_topics']))
+
+        grand = report['topic_coverage']
+        # The genuine violation survives the regrade; the cross-project pair
+        # does not become one.
+        assert grand['topics_with_multiple_canonical'] == 1
+        assert [r['topic'] for r in grand['multiple_canonical_topics']] == ['dupe']
+        # A corpus-wide violator must name its project -- "dupe is duplicated"
+        # is not actionable without knowing where.
+        assert grand['multiple_canonical_topics'][0]['project_id'] == 'dark_factory'
+
+    def test_the_partition_still_sums_to_the_cell_population(self):
+        """one + zero + multiple == the number of (project, topic) cells.
+
+        The per-project blocks each partition their own topic_values, so the
+        corpus-wide sum must equal the sum of the per-project distinct counts
+        -- NOT the corpus-wide distinct-VALUE count, which de-duplicates a
+        topic shared by two projects.
+        """
+        cells = {
+            'dark_factory': {
+                OBS: _census([{'topic': 'shared', 'canonical': True}, {'topic': 'a'}]),
+            },
+            'reify': {OBS: _census([{'topic': 'shared'}, {'topic': 'b'}])},
+        }
+        cov = {
+            'dark_factory': _coverage('fused_dark_factory', 2, {OBS: (2, 2)}),
+            'reify': _coverage('fused_reify', 2, {OBS: (2, 2)}),
+        }
+        report = _mod.build_report(cells, cov, top_n=50)
+        grand = report['topic_coverage']
+        cells_total = sum(
+            report['projects'][p]['topic_coverage']['distinct_topics']
+            for p in ('dark_factory', 'reify')
+        )
+        assert cells_total == 4
+        assert (grand['topics_with_one_canonical']
+                + grand['topics_with_zero_canonical']
+                + grand['topics_with_multiple_canonical']) == cells_total
+        # And the distinct-VALUE axis is untouched: gate 3626's item-3 history
+        # (98 -> 103) is a distinct-value series, so de-duplicating `shared`
+        # here is correct and must NOT be regraded to the cell count.
+        assert grand['distinct_topics'] == 3
+
+    def test_slug_conformance_stays_on_the_distinct_value_axis(self):
+        """The regrade touches the canonical partition ONLY.
+
+        Item 3 counts non-conforming distinct topic VALUES corpus-wide; a
+        legacy spelling present in both projects is one non-conforming topic,
+        not two, or the series this census continues would step on re-grain.
+        """
+        legacy = 'legacy_snake_case_topic'
+        cells = {
+            'dark_factory': {OBS: _census([{'topic': legacy}])},
+            'reify': {OBS: _census([{'topic': legacy}])},
+        }
+        cov = {
+            'dark_factory': _coverage('fused_dark_factory', 1, {OBS: (1, 1)}),
+            'reify': _coverage('fused_reify', 1, {OBS: (1, 1)}),
+        }
+        report = _mod.build_report(cells, cov, top_n=50)
+        grand = report['topic_coverage']
+        assert grand['slug_non_conforming'] == 1
+        assert [r['topic'] for r in grand['non_conforming_topics']] == [legacy]
+
 
 class TestEnforceFlipPreconditionCitations:
     """The report says what stands between here and flipping ``enforce``.
@@ -2652,10 +2788,49 @@ class TestRenderMarkdownCoverageCutsDiscloseThemselves:
         md = _mod.render_markdown(_coverage_md_report(top_n=1))
         # The cut lands on the NEW lists too: one violator row shown, the
         # second cut -- and the cut says so and says where the rest is.
-        assert '| `dark_factory` | `dup` | 2 |' in md
-        assert '| `reify` | `beta` | 2 |' not in md
+        #
+        # WHICH row survives is severity-major, not project-major: the list is
+        # ordered by canonical count desc, then (topic, project) asc, matching
+        # _table's total order. Under a project-major order a `--top-n 1` cut
+        # would keep dark_factory's 2-canonical topic and drop a hypothetical
+        # 9-canonical one in reify -- a cut that changes the conclusion. Both
+        # fixture rows tie at 2, so the tiebreak is the topic: `beta` < `dup`.
+        assert '| `reify` | `beta` | 2 |' in md
+        assert '| `dark_factory` | `dup` | 2 |' not in md
         assert '**truncated**' in md
         assert 'JSON artifact carries the full population' in md
+
+    def test_the_violator_cut_keeps_the_worst_offender(self):
+        """Severity-major ordering, stated over rows that do NOT tie.
+
+        The tie in the fixture above makes the assertion above readable but
+        not load-bearing; this one fails if the order ever reverts to
+        project-major, which would silently cut the worse violation.
+        """
+        payloads = {
+            'dark_factory': [
+                {'topic': 'mild', 'canonical': True},
+                {'topic': 'mild', 'canonical': True},
+            ],
+            'reify': [
+                {'topic': 'severe', 'canonical': True},
+                {'topic': 'severe', 'canonical': True},
+                {'topic': 'severe', 'canonical': True},
+            ],
+        }
+        cells = {pid: {OBS: _census(p)} for pid, p in payloads.items()}
+        cov = {
+            pid: _coverage(
+                f'fused_{pid}',
+                sum(c.records for c in cats.values()),
+                {cat: (c.records, c.records) for cat, c in cats.items()},
+            )
+            for pid, cats in cells.items()
+        }
+        report = _mod.build_report(cells, cov, top_n=1, page_size=1000)
+        md = _mod.render_markdown(report)
+        assert '| `reify` | `severe` | 3 |' in md
+        assert '| `dark_factory` | `mild` | 2 |' not in md
 
     def test_markdown_cut_never_drops_a_value_from_the_json(self):
         report = _coverage_md_report(top_n=1)

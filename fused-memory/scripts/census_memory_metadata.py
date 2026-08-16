@@ -553,8 +553,9 @@ def build_report(
         },
         'projects': projects,
         'grand_total': _census_to_dict(grand_total),
-        'topic_coverage': _build_topic_coverage(
-            grand_total, canonical_uniqueness_enforced,
+        'topic_coverage': _regrade_uniqueness_at_project_grain(
+            _build_topic_coverage(grand_total, canonical_uniqueness_enforced),
+            projects,
         ),
         # Spans projects (each entry carries its own project_id), so it sits
         # at the top level rather than under any one project.
@@ -914,6 +915,77 @@ def _build_topic_coverage(
         # reconciled against the canonical_true axis.
         'canonical_true_without_topic': census.canonical_true_without_topic,
     }
+
+
+#: The canonical-partition fields of a ``topic_coverage`` block, i.e. exactly
+#: those whose meaning is fixed by 3198's per-(project, topic) invariant.
+#: Everything else in the block is a legitimate corpus-wide rollup.
+_UNIQUENESS_GRAIN_FIELDS: tuple[str, ...] = (
+    'topics_with_one_canonical',
+    'topics_with_zero_canonical',
+    'topics_with_multiple_canonical',
+    'multiple_canonical_topics',
+)
+
+
+def _regrade_uniqueness_at_project_grain(
+    grand_block: dict[str, Any],
+    projects: dict[str, Any],
+) -> dict[str, Any]:
+    """Re-grade the corpus-wide canonical partition onto (project, topic) cells.
+
+    WHY THIS EXISTS, measured on the first live regeneration. The corpus-wide
+    block is built from a census merged ACROSS projects, which merges the two
+    topic NAMESPACES. 3198's uniqueness invariant is per-(project, topic) --
+    its probe is ``count_memories_by_metadata(project_id, {'topic': T,
+    'canonical': True})``, bound to ONE project -- so a topic correctly
+    carrying one canonical in ``dark_factory`` and one in ``reify`` is two
+    COMPLIANT cells, and the cross-project merge scored it as a violation.
+    The live instance is ``merge-request-bare-task-id-branch-arg``.
+
+    The symptom was worse than a wrong integer: the report headlined "Topics
+    carrying more than one live canonical: true: **1**" directly above a
+    named-violator table reading "(none)", because the count came from the
+    merged block and the table was already iterating per-project. A reader
+    could only conclude the instrument was broken.
+
+    SCOPE IS DELIBERATELY NARROW -- only :data:`_UNIQUENESS_GRAIN_FIELDS`. The
+    rest of the block is a genuine corpus-wide rollup and stays one. In
+    particular the slug-conformance axes are NOT re-graded: gate 3626's recipe
+    item 3 is a distinct-VALUE series whose recorded history (98 -> 103) would
+    step discontinuously if a topic present in both projects started counting
+    twice. ``distinct_topics`` likewise stays a distinct-value count, so it is
+    deliberately NOT the sum of the partition below -- the two axes answer
+    different questions and the block would rather be honestly non-additive
+    than quietly re-grain one of them.
+
+    PURE: neither argument is mutated; a new dict is returned.
+    """
+    regraded = dict(grand_block)
+    blocks = [
+        (project_id, projects[project_id].get('topic_coverage') or {})
+        for project_id in sorted(projects)
+    ]
+
+    # `column`, not `field`: the module imports dataclasses.field at line 97.
+    for column in ('topics_with_one_canonical', 'topics_with_zero_canonical',
+                   'topics_with_multiple_canonical'):
+        regraded[column] = sum(block.get(column) or 0 for _, block in blocks)
+
+    # The union of the per-project named lists, each row carrying the project
+    # it was measured in: at corpus grain "topic X is duplicated" is not
+    # actionable without saying WHERE. Ordered by count desc then
+    # (topic, project) asc, matching _table's existing total order, so two
+    # runs over the same corpus produce byte-identical artifacts.
+    regraded['multiple_canonical_topics'] = sorted(
+        (
+            {'project_id': project_id, **row}
+            for project_id, block in blocks
+            for row in (block.get('multiple_canonical_topics') or [])
+        ),
+        key=lambda row: (-row['canonical_count'], row['topic'], row['project_id']),
+    )
+    return regraded
 
 
 #: Schema of the committed, append-only coverage-history file. Bumped only
@@ -2039,6 +2111,15 @@ def _render_topic_coverage(report: dict[str, Any], top_n: int | None) -> list[st
         'would score a topic whose canonical sits in another category as '
         'having none.',
         '',
+        'On the **(all)** row the three canonical columns count '
+        '(project, topic) CELLS — they are a sum of the rows above, because '
+        'the invariant is per-project and a topic carrying one canonical in '
+        'each of two projects is two compliant cells, not a violation. '
+        '`distinct topics` on that row stays a distinct-VALUE count '
+        '(de-duplicated across projects), which is the axis gate 3626 '
+        'recipe item 3 trends. The two therefore need not add up, and are '
+        'left honestly non-additive rather than quietly re-grained.',
+        '',
         '| scope | records | `topic` present | coverage | distinct topics | '
         '1 canonical | 0 canonical | >1 canonical |',
         '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
@@ -2078,14 +2159,16 @@ def _render_topic_coverage(report: dict[str, Any], top_n: int | None) -> list[st
         _enforce_caveat(grand.get('canonical_uniqueness_enforced')),
         '',
     ]
+    # Sourced from the SAME grand list the count above reports, so the two can
+    # never disagree. They once did: the count read a cross-project merge while
+    # this table iterated per-project, and the artifact shipped "**1**" above a
+    # table reading "(none)". _regrade_uniqueness_at_project_grain now puts
+    # both on the (project, topic) grain the invariant is stated at, and
+    # reading them off one list is what keeps them there.
     violator_rows = [
-        [f'`{project_id}`', f'`{row["topic"]}`', f'{row["canonical_count"]:,}']
-        for project_id in sorted(projects)
-        for row in (
-            (projects[project_id].get('topic_coverage') or {}).get(
-                'multiple_canonical_topics',
-            ) or []
-        )
+        [f'`{row.get("project_id")}`', f'`{row["topic"]}`',
+         f'{row["canonical_count"]:,}']
+        for row in (grand.get('multiple_canonical_topics') or [])
     ]
     lines += _render_named_rows(
         'Topics with more than one `canonical: true`',
