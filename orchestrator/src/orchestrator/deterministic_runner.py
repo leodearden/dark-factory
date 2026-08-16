@@ -320,6 +320,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from shared.proc_group import _unsafe_pgid_reason
 from shared.task_metadata import HUMAN_CURATOR_GATE_KEY, DoneProvenance
 
 from orchestrator import systemd_inspect
@@ -1228,6 +1229,27 @@ class DeterministicRunner:
         signalling a stranger.  Accepted trade-off, matching the shared
         helper's: if the leader is already reaped we forgo killing surviving
         grandchildren — refusing to kill a stranger beats reaping an orphan.
+
+        The third layer is ``shared.proc_group._unsafe_pgid_reason``, applied
+        below: even a frozen, unreaped pgid is refused if it resolves to init,
+        this process, our parent, our own group, or anything other than
+        ``proc.pid``.  This helper deliberately REUSES that predicate rather
+        than growing a third copy of it — the repo's other two group-killers
+        (``shared.proc_group.terminate_process_group`` and
+        ``df_pytest_isolation._kill_process_group``) both apply it, and a
+        divergent hand-rolled copy here would be the weakest of the three.  A
+        refusal degrades to the direct ``proc.kill()``, exactly as
+        ``df_pytest_isolation``'s does.
+
+        Why this does NOT simply delegate to ``terminate_process_group``, which
+        it otherwise resembles: that helper escalates SIGTERM → wait →
+        SIGKILL, while this path SIGKILLs immediately and bounds the reap once.
+        The immediate SIGKILL is deliberate for a deploy script that has
+        already blown its timeout budget, and delegation would also double the
+        worst-case wait (``2 * grace_secs``) and drop both the ``proc.kill()``
+        fallback and the reap-abandoned warning below.  Delegating is a
+        behaviour change, not a refactor; the shared *predicate* is the part
+        that is genuinely common, so that is what is shared.
         """
         if proc.returncode is not None:
             logger.debug(
@@ -1235,6 +1257,17 @@ class DeterministicRunner:
                 '(its pid may already be recycled onto another group)',
                 proc.pid,
             )
+        elif (reason := _unsafe_pgid_reason(pgid, proc.pid)) is not None:
+            # Residual defence, degrading to the direct child exactly as
+            # df_pytest_isolation._kill_process_group does on the same refusal.
+            logger.error(
+                'DeterministicRunner: refusing to killpg — %s. Falling back to '
+                'a direct kill() of pid %s; any grandchildren will be left to '
+                'the caller. This indicates a bug in the pgid capture.',
+                reason, proc.pid,
+            )
+            with contextlib.suppress(ProcessLookupError, OSError):
+                proc.kill()
         else:
             try:
                 os.killpg(pgid, signal.SIGKILL)

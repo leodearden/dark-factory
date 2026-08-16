@@ -400,7 +400,9 @@ def _run_bash_suite(name: str) -> tuple[int, str, str]:
     The other half of that contract is that the pgid is FROZEN at spawn rather
     than re-derived at kill time — see ``shared/src/shared/proc_group.py``'s
     module docstring for why ``os.getpgid(proc.pid)`` in a kill path is the
-    task-845 footgun.
+    task-845 footgun — and that the frozen number is only dispatched while the
+    leader is still unreaped, since a reaped pid may be recycled onto an
+    unrelated group.
     """
     with subprocess.Popen(
         ['bash', str(BASH_TEST_DIR / name)],
@@ -420,10 +422,25 @@ def _run_bash_suite(name: str) -> tuple[int, str, str]:
         try:
             stdout, stderr = proc.communicate(timeout=SUBPROC_TIMEOUT)
         except subprocess.TimeoutExpired:
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):  # pragma: no cover
-                proc.kill()
+            # The other half of the frozen-pgid contract: a frozen pgid is only
+            # safe while its leader is UNREAPED, because the number itself goes
+            # stale the moment the kernel may recycle that pid.  So dispatch no
+            # signal at all once the process has been reaped, mirroring
+            # `shared.proc_group.terminate_process_group` step 1 and
+            # `deterministic_runner._terminate_process_tree`.
+            #
+            # `Popen.communicate(timeout=...)` does not reap on timeout, so
+            # `poll()` is normally None here and this changes nothing in
+            # practice.  It is written anyway so both sites this task closed
+            # enforce the SAME two-part rule the killpg guard's failure message
+            # states -- a reader comparing them should not find the repo's
+            # stated contract and one of its two remaining killpg sites
+            # disagreeing.
+            if proc.poll() is None:
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):  # pragma: no cover
+                    proc.kill()
             # ``Popen.communicate``'s ``TimeoutExpired`` carries no output (only
             # ``subprocess.run`` repopulates it), so the resumed call is what
             # recovers the captured tail.  Bounded: a pipe held open by a
