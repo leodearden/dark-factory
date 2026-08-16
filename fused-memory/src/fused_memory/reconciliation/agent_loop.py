@@ -404,10 +404,22 @@ class AgentLoop:
                 # at the same time.
                 # Task 1989 (sweep verdict): kept at explore_codebase_root, NOT
                 # switched to a neutral cwd. This is a multi-turn agent that
-                # actively adjudicates memory-vs-codebase discrepancies with
-                # CLI built-in tools disabled (disallowed_tools=['*']), so the
+                # actively adjudicates memory-vs-codebase discrepancies, and the
                 # auto-loaded CLAUDE.md is plausibly its main passive codebase
                 # signal.
+                #
+                # This cwd is the project root and holds a live .mcp.json, which
+                # bypassPermissions would otherwise let the CLI ambient-merge and
+                # expose unreviewed. disallowed_tools=['*'] above does NOT cover
+                # that: with output_schema set, cli_invoke expands the wildcard
+                # into _REAL_BUILTIN_TOOLS_DENYLIST, a BUILT-INS-ONLY list that
+                # carries no MCP tool pattern. MCP tools are closed SEPARATELY,
+                # by the mcp_config=no_mcp_servers_config() + strict_mcp_config=True
+                # pair above — which must stay truthy, since --strict-mcp-config is
+                # emitted only inside build_claude_argv's `if mcp_config:` block.
+                # Both kwargs survive every cap-retry resume: _reset_for_fresh_retry
+                # touches only resume_session_id/prompt/session_id, and the `if
+                # mcp_config:` argv block sits outside the resume conditional.
                 cwd=Path(self.config.explore_codebase_root),
                 cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
             )
