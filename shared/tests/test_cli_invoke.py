@@ -8,6 +8,9 @@ import itertools
 import json
 import logging
 import os
+import sys
+import textwrap
+import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -4818,3 +4821,98 @@ class TestUnreadableTranscriptEscapeWiring:
                 f'must not fire for config_dir={config_dir!r} session_id={session_id!r}; '
                 f'got {[r.getMessage() for r in records]}'
             )
+# ── stdin-starvation race (task 3147 / esc-3118-1) ───────────────────────────
+#
+# The confirmed root cause of the pre-turn `CLI_INPUT_REJECTED` burst: the
+# spawn path handed the child a bare PIPE and left the prompt bytes to be
+# written by the EVENT LOOP after `execve`.  The claude CLI gives up on an
+# empty stdin after ~3s and exits on argument validation, so any event-loop
+# stall >= that deadline in the window between exec and the parent's write
+# silently loses the run (turns=0, cost=0, timed_out=False).
+#
+# These tests reproduce that gap deterministically rather than probabilistically
+# (see the module's design note in cli_invoke._materialize_stdin): the failure
+# is not "load" per se, it is ">=3s of wall clock between child exec and the
+# parent's stdin write", so the tests inject exactly that gap.
+
+_STDIN_STARVATION_STUB = textwrap.dedent(
+    """
+    import sys, select
+
+    # Mimics the claude CLI's stdin deadline, shortened so the test is fast.
+    # The stderr text below reproduces CLI_INPUT_REQUIRED_MARKERS
+    # (shared/src/shared/invocation_outcome.py) VERBATIM, so these tests pin
+    # the exact production rejection signature rather than a lookalike.
+    r, _, _ = select.select([sys.stdin], [], [], 0.3)
+    if not r:
+        sys.stderr.write('Warning: no stdin data received in 3s, proceeding without it.\\n')
+        sys.stderr.write('Error: Input must be provided either through stdin or as a '
+                         'prompt argument when using --print\\n')
+        sys.exit(1)
+    data = sys.stdin.buffer.read()
+    sys.stdout.write('GOT:%d' % len(data))
+    """
+)
+
+
+def _make_starving_exec(block_secs: float):
+    """Return a create_subprocess_exec fake that starves the loop after spawn.
+
+    Delegates to the REAL ``asyncio.create_subprocess_exec`` — a genuine child
+    is required to observe stdin delivery at the OS level — then blocks the
+    event loop with a SYNCHRONOUS ``time.sleep`` before returning the proc.
+
+    That blocking sleep is the whole point: it stalls the loop in exactly the
+    production window (between the child's exec and the parent's pipe write),
+    making the race deterministic instead of probabilistic.  In production the
+    same stall is produced by 48 concurrent agents sharing one event loop plus
+    multi-MB synchronous transcript parsing and fsync-per-commit SQLite writes.
+    """
+    real_exec = asyncio.create_subprocess_exec  # capture BEFORE patching
+
+    async def starving_exec(*args, **kwargs):
+        proc = await real_exec(*args, **kwargs)
+        time.sleep(block_secs)  # SYNCHRONOUS — blocks the event loop on purpose
+        return proc
+
+    return starving_exec
+
+
+@pytest.mark.asyncio
+class TestStdinStarvationRace:
+    """The prompt reaches the child even when the parent's loop stalls after spawn."""
+
+    @pytest.mark.timeout(30)
+    async def test_prompt_delivered_when_event_loop_starved_after_spawn(self, tmp_path):
+        """A 1.0s post-spawn loop stall must not cost the child its prompt.
+
+        RED before task 3147: the payload was written by the loop via
+        ``communicate(input=...)``, so the stalled parent missed the stub's
+        deadline and the child exited on argument validation with empty stdout.
+        """
+        stub = tmp_path / 'stub_cli.py'
+        stub.write_text(_STDIN_STARVATION_STUB)
+
+        payload = b'X' * 4242
+
+        with patch(
+            'shared.cli_invoke.asyncio.create_subprocess_exec',
+            side_effect=_make_starving_exec(1.0),
+        ):
+            result = await _run_subprocess(
+                [sys.executable, str(stub)],
+                tmp_path,
+                env={},
+                model='stub',
+                timeout_seconds=20.0,
+                stdin_data=payload,
+            )
+
+        assert result.returncode == 0, (
+            f'stub CLI rejected the invocation; stderr={result.stderr!r}'
+        )
+        # The child received the WHOLE payload, not a truncated prefix.
+        assert result.stdout.strip() == f'GOT:{len(payload)}'
+        # Neither production marker line may appear.
+        assert 'no stdin data received' not in result.stderr
+        assert 'Input must be provided' not in result.stderr
