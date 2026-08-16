@@ -1612,6 +1612,224 @@ class TestCoverageHistory:
         )
 
 
+def _topic_report(payloads_by_project: dict, registry=None, **kwargs) -> dict:
+    """A report over ``{project_id: [payload, ...]}``, all in one category."""
+    cells = {pid: {OBS: _census(p)} for pid, p in payloads_by_project.items()}
+    cov = {
+        pid: _coverage(
+            f'fused_{pid}',
+            sum(c.records for c in cats.values()),
+            {cat: (c.records, c.records) for cat, c in cats.items()},
+        )
+        for pid, cats in cells.items()
+    }
+    return _mod.build_report(cells, cov, top_n=50, registry=registry, **kwargs)
+
+
+class TestCoverageDiff:
+    """Trending: what MOVED since the most recent prior run.
+
+    The first-ever run is the load-bearing case. It reports ``baseline:
+    null`` with a stated reason and emits NO deltas at all -- a table of
+    zeros would read as "coverage is flat" when the truth is "there is
+    nothing to compare against". That fabricated-zero-baseline failure is
+    exactly what task 3291 hardened ``census_trigger.extract_done_count``
+    against, where a fabricated 0 was persisted twice and armed a threshold.
+    """
+
+    # A pair of runs that exercises all three regrowth classes at once:
+    # alpha grows 2 -> 3 records while LOSING its canonical, and beta is a
+    # newly registered target that arrives already stamped.
+    _PRIOR = {'dark_factory': [{'topic': 'alpha', 'canonical': True}, {'topic': 'alpha'}]}
+    _NOW = {
+        'dark_factory': [
+            {'topic': 'alpha'}, {'topic': 'alpha'}, {'topic': 'alpha'},
+            {'topic': 'beta', 'canonical': True},
+        ],
+    }
+
+    @classmethod
+    def _history_with_prior(cls) -> dict:
+        prior = _topic_report(
+            cls._PRIOR, registry=_FakeRegistry([_FakeEntry('alpha', 'dark_factory')]),
+        )
+        return _mod.append_coverage_run(
+            _mod.empty_coverage_history(), prior, stamp='2026-08-15T05:00:00Z',
+        )
+
+    @classmethod
+    def _current(cls) -> dict:
+        return _topic_report(
+            cls._NOW,
+            registry=_FakeRegistry([
+                _FakeEntry('alpha', 'dark_factory'), _FakeEntry('beta', 'dark_factory'),
+            ]),
+        )
+
+    # ---- the no-baseline case -------------------------------------------
+
+    def test_first_ever_run_reports_a_null_baseline_with_a_reason(self):
+        diff = _mod.build_coverage_diff(_topic_report(self._NOW), _mod.empty_coverage_history())
+        assert diff['baseline'] is None
+        assert diff['baseline_reason']
+        assert diff['projects'] == {}
+
+    def test_first_run_emits_no_fabricated_zero_anywhere(self):
+        diff = _mod.build_coverage_diff(_topic_report(self._NOW), _mod.empty_coverage_history())
+        zeros = [
+            n for n in _walk(diff)
+            if isinstance(n, (int, float)) and not isinstance(n, bool) and n == 0
+        ]
+        assert zeros == []
+
+    def test_an_absent_history_argument_is_disclosed_distinctly(self):
+        # "no history was supplied" is a different claim from "the history
+        # is empty", and both are different from "coverage is flat".
+        diff = _mod.build_coverage_diff(_topic_report(self._NOW), None)
+        assert diff['baseline'] is None
+        assert diff['baseline_reason'] != _mod.build_coverage_diff(
+            _topic_report(self._NOW), _mod.empty_coverage_history(),
+        )['baseline_reason']
+
+    # ---- per-project deltas ---------------------------------------------
+
+    def test_baseline_is_the_most_recent_prior_run(self):
+        history = self._history_with_prior()
+        history = _mod.append_coverage_run(
+            history, _topic_report(self._PRIOR), stamp='2026-08-16T05:00:00Z',
+        )
+        diff = _mod.build_coverage_diff(self._current(), history)
+        assert diff['baseline'] == '2026-08-16T05:00:00Z'
+
+    def test_every_headline_column_is_trended(self):
+        diff = _mod.build_coverage_diff(self._current(), self._history_with_prior())
+        columns = set(diff['projects']['dark_factory']['columns'])
+        assert columns == set(
+            _mod._HISTORY_COVERAGE_COLUMNS + _mod._HISTORY_REGISTRY_COLUMNS,
+        )
+
+    def test_each_column_carries_before_after_and_delta(self):
+        diff = _mod.build_coverage_diff(self._current(), self._history_with_prior())
+        cols = diff['projects']['dark_factory']['columns']
+        assert cols['records'] == {'before': 2, 'after': 4, 'delta': 2}
+        assert cols['distinct_topics'] == {'before': 1, 'after': 2, 'delta': 1}
+        assert cols['topics_with_zero_canonical'] == {'before': 0, 'after': 1, 'delta': 1}
+        # Unchanged columns keep a real 0 -- there IS a baseline here, so 0
+        # is a measurement, not a fabrication.
+        assert cols['canonical_true']['delta'] == 0
+
+    def test_an_unmeasured_axis_diffs_to_null_not_zero(self):
+        # The registry gauge ran now but not before: "we cannot compare" is
+        # not "nothing changed".
+        history = _mod.append_coverage_run(
+            _mod.empty_coverage_history(), _topic_report(self._PRIOR),
+            stamp='2026-08-15T05:00:00Z',
+        )
+        diff = _mod.build_coverage_diff(self._current(), history)
+        column = diff['projects']['dark_factory']['columns']['registry_topics_total']
+        assert column['before'] is None
+        assert column['delta'] is None
+        assert column['after'] == 2
+
+    def test_a_project_absent_from_the_prior_run_is_new_not_a_delta_from_zero(self):
+        current = _topic_report({**self._NOW, 'reify': [{'topic': 'gamma'}]})
+        diff = _mod.build_coverage_diff(current, self._history_with_prior())
+        assert diff['projects']['reify']['status'] == 'new_project'
+        assert 'columns' not in diff['projects']['reify']
+
+    def test_a_project_absent_from_this_run_is_disclosed_not_dropped(self):
+        history = _mod.append_coverage_run(
+            _mod.empty_coverage_history(),
+            _topic_report({**self._PRIOR, 'reify': [{'topic': 'gamma'}]}),
+            stamp='2026-08-15T05:00:00Z',
+        )
+        diff = _mod.build_coverage_diff(_topic_report(self._NOW), history)
+        assert diff['projects']['reify']['status'] == 'absent_from_this_run'
+
+    # ---- per-topic regrowth ---------------------------------------------
+
+    def test_regrowth_names_newly_registered_topics(self):
+        regrowth = _mod.build_coverage_diff(
+            self._current(), self._history_with_prior(),
+        )['topic_regrowth']
+        assert regrowth['new_topics'] == [
+            {'project_id': 'dark_factory', 'topic': 'beta', 'records': 1, 'canonical': 1},
+        ]
+
+    def test_regrowth_names_topics_whose_member_count_grew(self):
+        regrowth = _mod.build_coverage_diff(
+            self._current(), self._history_with_prior(),
+        )['topic_regrowth']
+        assert regrowth['grown_topics'] == [
+            {
+                'project_id': 'dark_factory', 'topic': 'alpha',
+                'records_before': 2, 'records_after': 3,
+            },
+        ]
+
+    def test_regrowth_names_topics_that_LOST_their_canonical(self):
+        # The actionable regression: a target that WAS met and no longer is.
+        regrowth = _mod.build_coverage_diff(
+            self._current(), self._history_with_prior(),
+        )['topic_regrowth']
+        assert regrowth['lost_canonical_topics'] == [
+            {
+                'project_id': 'dark_factory', 'topic': 'alpha',
+                'canonical_before': 1, 'canonical_after': 0,
+            },
+        ]
+
+    def test_regrowth_scope_is_disclosed_as_registry_bounded(self):
+        # The signal is scoped to the committed registry because that is
+        # what the history may bound-safely carry. Disclosed, never silently
+        # narrowed -- a reader must not take it for a corpus-wide sweep.
+        regrowth = _mod.build_coverage_diff(
+            self._current(), self._history_with_prior(),
+        )['topic_regrowth']
+        assert regrowth['available'] is True
+        assert regrowth['scope'] == 'registry'
+        assert 'registry' in regrowth['scope_note']
+
+    def test_regrowth_is_unavailable_rather_than_all_new_when_the_baseline_lacks_a_digest(self):
+        # Without this, every registry topic would be reported as "newly
+        # appearing" the first time the gauge runs -- a fabricated signal
+        # indistinguishable from a genuine 32-topic regression.
+        history = _mod.append_coverage_run(
+            _mod.empty_coverage_history(), _topic_report(self._PRIOR),
+            stamp='2026-08-15T05:00:00Z',
+        )
+        regrowth = _mod.build_coverage_diff(self._current(), history)['topic_regrowth']
+        assert regrowth['available'] is False
+        assert regrowth['reason']
+        assert regrowth['new_topics'] == []
+
+    # ---- wiring + determinism -------------------------------------------
+
+    def test_report_carries_the_trend_under_coverage_trend(self):
+        report = _topic_report(
+            self._NOW,
+            registry=_FakeRegistry([
+                _FakeEntry('alpha', 'dark_factory'), _FakeEntry('beta', 'dark_factory'),
+            ]),
+            history=self._history_with_prior(),
+        )
+        assert report['coverage_trend']['baseline'] == '2026-08-15T05:00:00Z'
+        assert report['coverage_trend']['projects']['dark_factory']['status'] == 'compared'
+
+    def test_a_report_built_without_history_still_carries_a_disclosed_trend(self):
+        report = _topic_report(self._NOW)
+        assert report['coverage_trend']['baseline'] is None
+        assert report['coverage_trend']['baseline_reason']
+
+    def test_diff_is_pure_and_deterministic(self):
+        history = self._history_with_prior()
+        before = json.dumps(history)
+        first = json.dumps(_mod.build_coverage_diff(self._current(), history))
+        second = json.dumps(_mod.build_coverage_diff(self._current(), history))
+        assert first == second
+        assert json.dumps(history) == before
+
+
 class TestBuildReportDeterminism:
     """A re-run must produce a byte-identical artifact."""
 
