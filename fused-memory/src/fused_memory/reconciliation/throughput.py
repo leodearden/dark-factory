@@ -685,22 +685,51 @@ def _retention_note() -> str:
     into a confident lie.  The import is deliberately LAZY: ``event_buffer``
     imports ``utc_hour_bucket`` from this module at module scope, so a
     top-level import back would be circular.
+
+    That introspection is NON-FATAL by design.  A retention caveat is the least
+    important line in the payload, so it must never be able to take down the
+    drain / inflow / capacity figures an operator actually paged the tool for.
+    Renaming ``max_age_seconds`` — an edit with no connection to this module —
+    would otherwise raise a ``KeyError`` at report-BUILD time and kill the
+    whole report and CLI.  When the window cannot be determined the note
+    degrades to a window-free variant of the same caveat: the failure mode goes
+    from 'crash the report' to 'omit one number', and the caveat itself
+    survives intact.
     """
-    import inspect
+    window: float | None = None
+    try:
+        import inspect
 
-    from fused_memory.reconciliation.event_buffer import EventBuffer
+        from fused_memory.reconciliation.event_buffer import EventBuffer
 
-    window = inspect.signature(
-        EventBuffer.cleanup_drained).parameters['max_age_seconds'].default
+        parameter = inspect.signature(
+            EventBuffer.cleanup_drained).parameters.get('max_age_seconds')
+        if parameter is not None and isinstance(parameter.default, int | float):
+            window = float(parameter.default)
+    except (ImportError, TypeError, ValueError):
+        window = None
+
+    if window is None:
+        # Window-free variant — never a partially-formatted string naming a
+        # window we could not actually read.
+        scope = (
+            'EventBuffer.cleanup_drained deletes drained rows past a configured '
+            'age, which is the only DELETE FROM event_buffer in the codebase'
+        )
+    else:
+        scope = (
+            f'EventBuffer.cleanup_drained deletes drained rows older than '
+            f'{int(window)}s ({int(window) / 3600:.1f}h), which is the only '
+            f'DELETE FROM event_buffer in the codebase'
+        )
+
     return (
-        f'Inflow retention: EventBuffer.cleanup_drained deletes drained rows '
-        f'older than {int(window)}s ({int(window) / 3600:.1f}h), which is the '
-        f'only DELETE FROM event_buffer in the codebase. Task 3049 added the '
-        f'event_arrival_hourly rollup INSIDE that delete transaction, so from '
-        f'then on arrival history is durable and exact. Inflow from before the '
-        f'rollup landed was destroyed by that delete and is unrecoverable — '
-        f'treat any window extending back past the rollup as truncated, not as '
-        f'a period of low inflow.'
+        f'Inflow retention: {scope}. Task 3049 added the event_arrival_hourly '
+        f'rollup INSIDE that delete transaction, so from then on arrival '
+        f'history is durable and exact. Inflow from before the rollup landed '
+        f'was destroyed by that delete and is unrecoverable — treat any window '
+        f'extending back past the rollup as truncated, not as a period of low '
+        f'inflow.'
     )
 
 
