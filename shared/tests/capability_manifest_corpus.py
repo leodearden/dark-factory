@@ -27,6 +27,7 @@ discovery is ``git ls-files``-based instead — the same shape as
 from __future__ import annotations
 
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
@@ -112,3 +113,69 @@ def check_manifest(path: Path) -> str | None:
         detail = ' '.join(str(exc).split())
         return f'{display_path}: schema validation failed: {detail}'
     return None
+
+
+@dataclass(frozen=True)
+class ScriptCheckRef:
+    """One ``kind: script`` delivered_check, attributed back to its author.
+
+    Everything a failure message needs to name WHICH check is broken:
+    the sidecar it came from, the Greek-label task block and capability
+    that declared it, and the repo-relative ``script:`` string verbatim
+    (i.e. exactly what ``_run_script_check`` joins onto ``project_root``
+    to build ``argv[0]``).
+    """
+
+    manifest: Path
+    task_label: str
+    capability: str
+    script: str
+
+
+def iter_script_checks(path: Path) -> list[ScriptCheckRef]:
+    """Every ``kind: script`` delivered_check declared in one sidecar.
+
+    Walks ``load_capability_manifest(path).tasks[].capabilities[]`` and emits
+    one :class:`ScriptCheckRef` per capability whose ``delivered_check`` is
+    non-``None`` with ``kind == 'script'``. ``delivered_check.script`` is
+    guaranteed non-empty by ``_check_kind_conditional_fields``' script branch
+    (``script is required when kind='script'``), so it is taken verbatim with
+    no re-validation. A capability with no ``delivered_check`` at all, or one
+    of ``kind`` ``'grep'``/``'manual'``, contributes nothing.
+
+    Returns ``[]`` — rather than raising — for a sidecar that fails to load
+    (``yaml.YAMLError``, ``pydantic.ValidationError``, ``OSError``). This is
+    NOT a fail-soft, for two reasons:
+
+    1. No signal is lost. ``TestCheckedInManifestCorpus.
+       test_checked_in_manifest_validates`` already reports an unloadable
+       sidecar loudly, with a better field-path-attributed message, and a
+       schema-invalid sidecar is a manifest-shape defect rather than a
+       script-lifecycle one — re-reporting it here would misattribute it.
+    2. The swallow is layered under two guards that go red if it ever hides
+       everything: ``TestCheckedInScriptCheckTargets``' non-vacuity test and
+       its both-known-anchors test.
+
+    The swallow is also load-bearing for collection: ``test_capability_manifest.py``
+    calls this at *module import time* (``_SCRIPT_CHECKS = [...]``) to feed
+    ``@pytest.mark.parametrize``, so an escaping exception would take down
+    collection of the entire test module — the same hazard
+    :func:`discover_manifests`' docstring names.
+    """
+    try:
+        doc = load_capability_manifest(path)
+    except (yaml.YAMLError, ValidationError, OSError):
+        return []
+    return [
+        ScriptCheckRef(
+            manifest=path,
+            task_label=task.label,
+            capability=cap.name,
+            script=cap.delivered_check.script,
+        )
+        for task in doc.tasks
+        for cap in task.capabilities
+        if cap.delivered_check is not None
+        and cap.delivered_check.kind == 'script'
+        and cap.delivered_check.script
+    ]
