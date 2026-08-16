@@ -29,8 +29,10 @@ import socket
 import threading
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import conftest
+import pytest
 
 # ---------------------------------------------------------------------------
 # A live TCP endpoint that is NOT an MCP server — the readiness discriminator.
@@ -113,4 +115,57 @@ def test_handshake_readiness_rejects_a_live_port_without_the_mcp_route() -> None
             'a live TCP port with no /mcp/ route must NOT read as ready -- '
             'gating readiness on a bare TCP connect is what lets the first '
             'call race a 404 against the not-yet-mounted /mcp/ route'
+        )
+
+
+# ---------------------------------------------------------------------------
+# A startup failure must NAME itself in the readiness-timeout error.
+# ---------------------------------------------------------------------------
+
+
+def test_startup_failure_that_is_not_a_runtimeerror_is_named_in_the_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server that dies during startup must name its cause on timeout.
+
+    ``_free_escalation_port()`` binds-then-closes, so there is an inherent
+    TOCTOU window in which another process (or a concurrent worker) steals the
+    port before the real bind. That loss arrives as an OSError, or as the
+    SystemExit uvicorn raises via ``sys.exit`` on a failed bind -- neither of
+    which is a ``RuntimeError``. A fixture that only captures RuntimeError
+    therefore reports the generic "did not become ready" and DROPS the one
+    fact a reader needs, which is what this test forbids.
+
+    Driven by monkeypatching the port allocator to hand back a port this test
+    is already holding, so the failure is a real bind conflict rather than a
+    simulated one.
+
+    NOTE: this test necessarily waits out the fixture's full ~10s readiness
+    bound before raising -- that is the assertion, not a hang. It sits well
+    inside the suite's 60s per-test pytest-timeout.
+    """
+    with _listener_without_mcp_route() as port:
+        monkeypatch.setattr(conftest, '_free_escalation_port', lambda: port)
+
+        gen = conftest.serve_escalation_mcp.__wrapped__()  # pyright: ignore[reportFunctionMemberAccess]
+        try:
+            start = next(gen)
+            with pytest.raises(RuntimeError) as excinfo:
+                start(tmp_path / 'queue')
+        finally:
+            # Finalize the fixture even on failure, so a RED run does not
+            # leave the half-started server's thread behind for the rest of
+            # the suite.
+            gen.close()
+
+        message = str(excinfo.value)
+        assert 'did not' in message, (
+            f'expected the readiness-timeout error text, got: {message!r}'
+        )
+        _, marker, detail = message.partition('server thread raised: ')
+        assert marker and detail.strip(' )'), (
+            'the readiness-timeout error must name the startup failure that '
+            'actually happened (the bind conflict), not just report that the '
+            'server never became ready; got: ' + repr(message)
         )
