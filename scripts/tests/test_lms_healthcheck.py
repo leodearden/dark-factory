@@ -2039,6 +2039,138 @@ def test_cli_output_writes_the_json_artifact_step_21_validates(cli_env, tmp_path
         assert key in written['arms'][0]
 
 
+# ---------------------------------------------------------------------------
+# --repeat N (task 3781)
+#
+# A pure OBSERVABILITY knob.  It shows an operator a spread and must never move
+# a verdict -- an operator who could turn a row green by running it again would
+# have the cheapest possible way to fake this artifact, which `merge_reports`
+# already refuses for exactly the same reason.
+#
+# Samples after the FIRST are prefix-cache WARM: the first measured probe
+# populates the cache the rest are served from.  Measured 2026-08-06 on
+# moe-stretch, 338 of 343 prompt tokens came from cache on a repeat, and the
+# cache state even changed the OUTPUT at temperature 0 (276 completion tokens
+# cold-cache vs 236 warm).  Repeated identical probes are NOT independent
+# samples, which is why latency_ms stays pinned to the only prefix-cold one.
+# ---------------------------------------------------------------------------
+
+
+def test_repeat_fires_the_measured_probe_n_times_and_the_warmup_once(cli_env):
+    """Exactly ONE warm-up regardless of N.  The engine is warm after the first
+    request; re-warming would only spend GPU time to learn nothing."""
+    code = lms_healthcheck.main(['--arm', 'qwen3.5-9b', '--repeat', '3'])
+
+    assert code == 0
+    assert cli_env['calls'] == [
+        ('qwen3.5-9b', True),
+        ('qwen3.5-9b', False),
+        ('qwen3.5-9b', False),
+        ('qwen3.5-9b', False),
+    ]
+
+
+def test_repeat_records_every_measured_sample():
+    seen = {'n': 0}
+
+    def probe(arm, *, warmup: bool = False):
+        if warmup:
+            return lms_healthcheck.ProbeResult(
+                verdict='PASS', reason=lms_healthcheck.Reason.OK, latency_ms=4249.7,
+            )
+        seen['n'] += 1
+        return lms_healthcheck.ProbeResult(
+            verdict='PASS',
+            reason=lms_healthcheck.Reason.OK,
+            latency_ms=float(350 + seen['n']),
+        )
+
+    row = _report(probe=probe, repeat=3).arms[0]
+
+    assert row.repeat_latencies_ms == [351.0, 352.0, 353.0]
+    assert 4249.7 not in row.repeat_latencies_ms
+    assert row.first_probe_ms == 4249.7
+
+
+def test_latency_ms_is_the_first_measured_sample():
+    """Not a mean.  Only the FIRST measured probe is prefix-cold; samples 2..N
+    are served from the cache it populated, so averaging them would quietly
+    redefine the artifact's headline number into a mean of incomparable
+    things."""
+    seen = {'n': 0}
+
+    def probe(arm, *, warmup: bool = False):
+        if warmup:
+            return _passing_probe(arm, warmup=True)
+        seen['n'] += 1
+        return lms_healthcheck.ProbeResult(
+            verdict='PASS',
+            reason=lms_healthcheck.Reason.OK,
+            latency_ms=float(1000 // seen['n']),
+        )
+
+    row = _report(probe=probe, repeat=3).arms[0]
+
+    assert row.repeat_latencies_ms is not None
+    assert row.latency_ms == row.repeat_latencies_ms[0]
+    assert row.latency_ms == 1000.0
+
+
+def test_repeat_never_changes_a_verdict():
+    """Observability, never adjudication.  The FIRST measured probe alone
+    supplies the verdict, so a later sample cannot move it in either
+    direction."""
+    seen = {'n': 0}
+
+    def probe(arm, *, warmup: bool = False):
+        if warmup:
+            return _passing_probe(arm, warmup=True)
+        seen['n'] += 1
+        return _failing_probe(arm) if seen['n'] == 3 else _passing_probe(arm)
+
+    report = _report(probe=probe, repeat=3)
+
+    assert report.arms[0].verdict == 'PASS'
+    assert report.arms[0].reason == lms_healthcheck.Reason.OK
+    assert report.overall == 'PASS'
+    assert lms_healthcheck.exit_code_for(report) == lms_healthcheck.EXIT_OK
+
+
+def test_without_repeat_the_spread_field_is_absent():
+    """None, not a one-element list.  "The question was not asked" and "a
+    spread of one" are different statements, the same distinction
+    top_level_entities_named already draws."""
+    assert _report().arms[0].repeat_latencies_ms is None
+
+
+@pytest.mark.parametrize('count', ['0', '-1'])
+def test_repeat_rejects_a_non_positive_count(cli_env, count):
+    """Silently probing zero times would write a report with no measurement in
+    it that still reads as a completed run."""
+    with pytest.raises(SystemExit) as excinfo:
+        lms_healthcheck.main(['--arm', 'qwen3.5-9b', '--repeat', count])
+
+    assert excinfo.value.code != 0
+
+
+def test_run_healthcheck_rejects_a_non_positive_repeat_as_a_caller_error():
+    """A HealthcheckError, never a FAIL row: this is the harness being asked
+    something incoherent, and blaming the arm for it is this module's stated
+    contract violation."""
+    with pytest.raises(lms_healthcheck.HealthcheckError):
+        _report(repeat=0)
+
+
+@pytest.mark.parametrize('selector', [['--arm', 'qwen3.5-9b'], ['--all'], ['--active']])
+def test_repeat_is_not_part_of_the_selector_group(cli_env, selector):
+    """A plain option, not a member of the required mutually-exclusive group,
+    so it composes with every way of choosing arms."""
+    code = lms_healthcheck.main([*selector, '--repeat', '2'])
+
+    # --active finds nothing under cli_env, which is its own non-zero code.
+    assert code in (0, lms_healthcheck.EXIT_NO_ACTIVE_ARMS)
+
+
 def test_cli_written_artifact_is_pure_json_with_no_enum_repr(cli_env, tmp_path):
     """`Reason` is a StrEnum: dumped in python mode it would serialise as an
     object repr that no downstream JSON consumer can match on."""
