@@ -3955,10 +3955,20 @@ class GitOps:
             # new task ids fall through to _cleanup_leftover_branch /
             # fresh-create unchanged.
             if not worktree_path.exists() and await self._orphan_has_commits(full_branch):
-                return await self._reattach_cold_worktree(
+                reattached = await self._reattach_cold_worktree(
                     worktree_path, full_branch, stale_commits,
+                    branch_name=branch_name, expected_title=expected_title,
                 )
-            await self._cleanup_leftover_branch(full_branch, branch_name)
+                if reattached is not None:
+                    return reattached
+                # Identity mismatch: _reattach_cold_worktree already
+                # quarantined the orphan (dir + branch), so full_branch no
+                # longer exists — skip _cleanup_leftover_branch (it would
+                # rev-list a now-nonexistent branch, hit
+                # _branch_has_commits_beyond_main's fail-safe True, and raise
+                # spuriously) and fall through to the fresh create below.
+            else:
+                await self._cleanup_leftover_branch(full_branch, branch_name)
 
         # Create worktree with new branch from the freshened ref
         rc, out, err = await _run(
@@ -3996,8 +4006,14 @@ class GitOps:
         )
 
     async def _reattach_cold_worktree(
-        self, worktree_path: Path, full_branch: str, stale_commits: int | None,
-    ) -> 'WorktreeInfo':
+        self,
+        worktree_path: Path,
+        full_branch: str,
+        stale_commits: int | None,
+        *,
+        branch_name: str,
+        expected_title: str | None = None,
+    ) -> 'WorktreeInfo | None':
         """Re-attach ``worktree_path`` to a surviving orphan ``full_branch``.
 
         Called by :meth:`create_worktree`'s cold path (the γ reattach guard)
@@ -4024,6 +4040,34 @@ class GitOps:
         cold re-attach is not guaranteed to reflect a same-tick remote
         fetch the way a fresh create would.
 
+        Identity guard (mirrors the REUSE path's ``expected_title`` guard on
+        create_worktree's reuse-existing block, git_ops.py ~3564-3576):
+        once the orphan is attached above, if *expected_title* is not
+        ``None`` its stored title — read via :func:`read_worktree_title`,
+        which resolves the sibling ``.task-meta/<branch_name>`` root first
+        (the only root that can survive a gone worktree dir) — is compared
+        against *expected_title* via :func:`identities_match`. A confirmed
+        mismatch means the orphan belongs to a DIFFERENT (deleted) task
+        whose id was recycled: the attached worktree + branch are
+        quarantined (preserving the WIP) and ``None`` is returned so the
+        caller falls through to a fresh create. The check runs AFTER the
+        attach (not before) because :meth:`quarantine_worktree` ->
+        :meth:`rename_worktree` starts with ``git worktree move``, which
+        requires a registered worktree directory — attaching first is
+        non-destructive and is what makes that existing primitive usable
+        unchanged here. ``identities_match`` fails open (returns ``True``)
+        when either side is blank, so a title-less legacy orphan is never
+        falsely quarantined. ``expected_title=None`` (the default) skips the
+        guard entirely, so every existing caller is unaffected.
+
+        Args:
+            branch_name: The bare branch name (no ``branch_prefix``) — used
+                only for the identity-guard quarantine relocation
+                (:meth:`quarantine_worktree` takes the bare name and derives
+                the full branch itself).
+            expected_title: The live task's title, or ``None`` to skip the
+                identity guard.
+
         Raises:
             RuntimeError: ``git worktree add`` failed (e.g. *full_branch* is
                 still checked out in another live worktree). The branch is
@@ -4034,7 +4078,9 @@ class GitOps:
         Returns:
             WorktreeInfo for the resumed worktree, with *stale_commits*
             carried over from the freshen result (mirrors create_worktree's
-            reuse-existing path).
+            reuse-existing path); or ``None`` if a confirmed identity
+            mismatch caused the orphan to be quarantined — the caller must
+            fall through to a fresh create.
         """
         logger.info(
             'create_worktree: cold-path reattach — orphan %s has commits; '
@@ -4056,6 +4102,29 @@ class GitOps:
                 f'preserved, remove the other worktree and retry: '
                 f'`git branch -D {full_branch}` only after preserving work.'
             )
+
+        # ── Identity guard (mirrors the REUSE path's guard, git_ops.py
+        # ~3564-3576, verbatim in shape) ────────────────────────────────
+        # Runs AFTER the attach above (not before): quarantine_worktree ->
+        # rename_worktree starts with `git worktree move`, which requires a
+        # registered worktree directory. Attaching first is non-destructive
+        # (it just materialises the orphan tip into a fresh dir) and is what
+        # makes the existing quarantine_worktree primitive usable unchanged
+        # here, relocating both the directory and the branch.
+        if expected_title is not None:
+            stored_title = read_worktree_title(worktree_path)
+            if not identities_match(stored_title, expected_title):
+                logger.warning(
+                    'create_worktree: cold-reattach identity MISMATCH for %s — '
+                    'stored title %r != expected %r; quarantining orphan %s and '
+                    'creating fresh',
+                    worktree_path, stored_title, expected_title, full_branch,
+                )
+                await self.quarantine_worktree(
+                    worktree_path, branch_name, 'cold-reattach-identity-mismatch',
+                )
+                return None
+
         info = await self._reuse_warm_lane(worktree_path, full_branch)
         return WorktreeInfo(
             path=info.path,
