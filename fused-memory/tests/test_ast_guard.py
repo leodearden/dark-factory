@@ -1,7 +1,9 @@
 """Unit coverage for the shared AST machinery in _ast_guard.py."""
 
 import ast
+import pathlib
 
+import _fm_helpers
 import pytest
 from _ast_guard import calls_named, imported_names_from, parse_python_module
 
@@ -257,4 +259,111 @@ class TestImportedNamesFrom:
         assert imported_names_from(tree, 'pkg.mod') == {'scoped', 'elsewhere'}, (
             'the whole-module search should still see every import — the narrowing '
             'must come from the node passed in, not from the search itself.'
+        )
+
+
+# ---------------------------------------------------------------------------
+# The boundary the move creates (task 3701)
+# ---------------------------------------------------------------------------
+
+# The three names this module owns, as one list rather than three, so a reader
+# asking "what moved out of _fm_helpers" gets a single answer.
+MACHINERY = ('calls_named', 'imported_names_from', 'parse_python_module')
+
+# The module the machinery moved OUT of. It keeps its runtime fixtures
+# (submit_and_resolve, await_index_operational, falkor_skipif) — importing
+# those from it is correct and must not trip anything below.
+HELPERS_MODULE = '_fm_helpers'
+
+
+class TestMachineryBoundary:
+    """The move is a boundary, not a rename — pinned so it cannot quietly undo.
+
+    Task 3701 specified this as a one-shot grep, which expires the moment the
+    task closes: nothing would then stop a future edit from re-importing the
+    machinery from ``_fm_helpers`` or re-forking a copy back into it. That is
+    how the duplication arose in the first place, and it is the same clause
+    test_falkor_index_barrier_guard.test_does_not_redefine_the_barrier_locally
+    already applies to the barrier.
+    """
+
+    def test_fm_helpers_no_longer_exposes_the_ast_machinery(self):
+        """``_fm_helpers`` must not re-acquire the three names.
+
+        A boundary contract, not a naming check. What ``_fm_helpers`` may not
+        hold is a second copy of the parse/search machinery: two copies drift
+        apart while all three migration guards keep reporting green, which is
+        precisely the false-green those guards exist to prevent.
+        """
+        readded = [name for name in MACHINERY if hasattr(_fm_helpers, name)]
+
+        assert not readded, (
+            f'{HELPERS_MODULE} exposes {readded} again — the AST machinery lives in '
+            f'_ast_guard. Import it from there rather than re-forking a copy here.'
+        )
+
+    def test_no_test_module_imports_the_ast_machinery_from_fm_helpers(self):
+        """No module under tests/ may source the three names from ``_fm_helpers``.
+
+        Dogfoods the moved helpers against their own migration: this is an
+        ImportFrom walk, not a grep, so prose naming the old home cannot trip
+        it — only a real import does.
+
+        Deliberately narrow. Only the three AST names count: a module importing
+        ``submit_and_resolve`` or ``await_index_operational`` from
+        ``_fm_helpers`` is correct and must stay green here.
+        """
+        scanned: set[str] = set()
+        offenders: dict[str, list[str]] = {}
+
+        for path in sorted(pathlib.Path(__file__).parent.glob('**/*.py')):
+            scanned.add(path.name)
+            leaked = set(MACHINERY) & imported_names_from(
+                parse_python_module(path), HELPERS_MODULE
+            )
+            if leaked:
+                offenders[path.name] = sorted(leaked)
+
+        # Non-vacuity floor, in the spirit of the barrier guard's own
+        # TestDiscoveryItself: a glob that quietly matched nothing would report
+        # green having checked nothing at all. Naming the two helper modules
+        # also proves the walk is not filtered down to test_*.py.
+        assert {'_ast_guard.py', '_fm_helpers.py'} <= scanned, (
+            f'the walk reached {len(scanned)} files and did not see both helper '
+            f'modules — it would pass having checked nothing. Fix the glob root.'
+        )
+        assert not offenders, (
+            f'these modules still import the AST machinery from {HELPERS_MODULE}: '
+            f'{offenders}. Import it from _ast_guard instead.'
+        )
+
+    def test_this_module_is_not_discovered_as_a_live_index_module(self):
+        """This file must stay OUT of the barrier guard's parametrized set.
+
+        test_falkor_index_barrier_guard selects every tests/test_*.py holding
+        BOTH an index-creating string constant AND a real ``ast.Call`` to
+        ``select_graph``. This file names ``select_graph`` in prose — the banner
+        near the top, and this docstring — so it passes that guard's cheap
+        raw-text prefilter and IS parsed. That is expected and harmless: do not
+        "fix" the prose mention for that reason.
+
+        It stays out because it satisfies NEITHER criterion: no index-creating
+        string constant, and no ``select_graph`` CALL — the name appears only in
+        a comment and in docstrings, and neither is an ``ast.Call``. The first
+        margin is one tidy-up away from vanishing: promoting the ``#`` banner
+        above into this module's docstring would turn the regex it quotes into
+        an ``ast.Constant`` and satisfy that criterion. Pinned HERE so such an
+        edit fails in the file that caused it, instead of surfacing as a
+        barrier-guard failure that reads like a barrier-guard bug.
+        """
+        # Imported in-body, not at module scope, so the other tests here never
+        # pay that guard's discovery walk at collection time.
+        from test_falkor_index_barrier_guard import LIVE_INDEX_MODULES
+
+        discovered = {path.name for path in LIVE_INDEX_MODULES}
+
+        assert pathlib.Path(__file__).name not in discovered, (
+            f'{pathlib.Path(__file__).name} was pulled into the barrier guard\'s '
+            f'live-index set {sorted(discovered)}. Something here now reads as a '
+            f'live index build — this is a fixture module, not a live-index test.'
         )
