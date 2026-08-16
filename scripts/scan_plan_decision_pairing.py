@@ -248,12 +248,24 @@ def scan_plan_file(path: Path | str) -> list[PairingRecord]:
     text = str(plan_path)
     records: list[PairingRecord] = []
     for hit in scan_design_decisions(plan):
-        entry = entries[hit.index] if isinstance(entries, list) else None
+        # Bind the index to a local and narrow it ONCE. MispairingHit.index is
+        # `int | None` because the entry-level predicate builds a hit outside
+        # any document walk; the walker used here always _replace()s an int in,
+        # so the None arm is unreachable from this call site. It is a narrowing
+        # limitation on the field, not a reachable None path — hence a local
+        # bind rather than a runtime assert, which would change behaviour on an
+        # unreachable path. Both uses below need the same narrowing.
+        index = hit.index
+        entry = (
+            entries[index]
+            if isinstance(entries, list) and index is not None
+            else None
+        )
         records.append(
             PairingRecord(
                 task_id=task_id,
                 path=text,
-                index=hit.index if hit.index is not None else -1,
+                index=index if index is not None else -1,
                 header=hit.header,
                 marker=hit.marker,
                 field=hit.field,
