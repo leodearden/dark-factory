@@ -928,6 +928,134 @@ class TestUnreadableKeyDirectory:
         assert str(key_dir / 'heuristics.txt') in caplog.records[0].message
 
 
+class TestUnreadableHeuristicsFile:
+    """The third limb of "never raises": ``heuristics.txt`` itself unreadable.
+
+    ``resolve()``'s last on-disk read is ``heuristics_path.read_text()``, and
+    it absorbs two very different failures. A *vanished* file is the benign,
+    expected, self-correcting unpin race the fallback exists for and stays
+    deliberately silent. Any other OSError is the same non-self-correcting
+    environmental fault the stat and sidecar limbs already warn about (a
+    permission flip, the path replaced by a directory), so it must be equally
+    loud — otherwise a pinned prompt silently reverts to baseline on every
+    resolve (every reconciliation cycle for ``task_curator``) with zero signal,
+    indistinguishable from "nothing pinned". That is the INV-4 storm escape the
+    other two limbs already provide.
+    """
+
+    def _pin_valid_artifact(self, store, spec):
+        provenance = ArtifactProvenance(**_provenance_kwargs(harness_version='v1'))
+        store.pin(
+            spec.prompt_id, 'claude-opus-4', 'v1',
+            heuristics='pinned heuristics', provenance=provenance,
+        )
+        return store._key_dir(spec.prompt_id, 'claude-opus-4', 'v1')
+
+    def test_resolve_warns_when_heuristics_file_is_unreadable(self, tmp_path, caplog):
+        """Directory-in-place-of-file: ``exists()`` is True and the sidecar is
+        still valid and readable, so both earlier guards pass and only the
+        ``read_text()`` limb sees the fault (a real, uid-independent EISDIR).
+        """
+        store = PromptArtifactStore(tmp_path / 'artifacts')
+        spec = _make_spec()
+        key_dir = self._pin_valid_artifact(store, spec)
+        heuristics_path = key_dir / 'heuristics.txt'
+        # Premise: this pin genuinely resolves before heuristics.txt goes bad,
+        # so the assertions below prove a *degradation* of a good pin.
+        assert store.resolve(
+            spec, executor_model='claude-opus-4', harness_version='v1'
+        ).source == 'artifact'
+
+        heuristics_path.unlink()
+        heuristics_path.mkdir()
+
+        with caplog.at_level(logging.WARNING):
+            resolved = store.resolve(spec, executor_model='claude-opus-4', harness_version='v1')
+
+        assert resolved.source == 'in_code'
+        assert resolved.text == spec.in_code_constant
+        assert resolved.provenance is None
+        assert len(caplog.records) == 1, (
+            f'Expected exactly one WARNING for the unreadable heuristics file, '
+            f'got: {caplog.records}'
+        )
+        assert str(heuristics_path) in caplog.records[0].message
+
+    def test_resolve_warns_when_heuristics_read_hits_permission_error(
+        self, tmp_path, caplog, monkeypatch
+    ):
+        """The permission-flip twin, injected deterministically because
+        ``chmod 0o000`` is a no-op under root.
+
+        ``Path.read_text`` is patched *selectively* (only ``heuristics.txt``
+        raises, everything else delegates to the captured real implementation)
+        for the same reason the ``Path.exists`` patch above is: an
+        unconditional patch breaks pytest internals that read unrelated files.
+        """
+        store = PromptArtifactStore(tmp_path / 'artifacts')
+        spec = _make_spec()
+        key_dir = self._pin_valid_artifact(store, spec)
+        heuristics_path = key_dir / 'heuristics.txt'
+
+        _real_read_text = Path.read_text
+
+        def boom(self, *args, **kwargs):
+            if self.name == 'heuristics.txt':
+                raise PermissionError(13, 'Permission denied')
+            return _real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, 'read_text', boom)
+
+        with caplog.at_level(logging.WARNING):
+            resolved = store.resolve(spec, executor_model='claude-opus-4', harness_version='v1')
+
+        assert resolved.source == 'in_code'
+        assert resolved.text == spec.in_code_constant
+        assert resolved.provenance is None
+        assert len(caplog.records) == 1, (
+            f'Expected exactly one WARNING for the unreadable heuristics read, '
+            f'got: {caplog.records}'
+        )
+        assert str(heuristics_path) in caplog.records[0].message
+
+    def test_vanished_heuristics_file_stays_silent(self, tmp_path, caplog, monkeypatch):
+        """The benign limb keeps its deliberate silence.
+
+        A concurrent ``unpin()`` landing between the provenance check and the
+        read is expected and self-correcting — the fallback IS the intended
+        outcome — so warning on it would be noise on normal operation. This
+        pins the loud/quiet split so a later "make it all loud" edit has to
+        argue with a failing test rather than a comment.
+        """
+        store = PromptArtifactStore(tmp_path / 'artifacts')
+        spec = _make_spec()
+        key_dir = self._pin_valid_artifact(store, spec)
+        heuristics_path = key_dir / 'heuristics.txt'
+
+        real_load_valid_provenance = prompt_artifact._load_valid_provenance
+
+        def racing_load_valid_provenance(path, *, expected_harness_version=None):
+            result = real_load_valid_provenance(
+                path, expected_harness_version=expected_harness_version
+            )
+            heuristics_path.unlink()
+            return result
+
+        monkeypatch.setattr(
+            prompt_artifact, '_load_valid_provenance', racing_load_valid_provenance
+        )
+
+        with caplog.at_level(logging.WARNING):
+            resolved = store.resolve(spec, executor_model='claude-opus-4', harness_version='v1')
+
+        assert resolved.source == 'in_code'
+        assert resolved.text == spec.in_code_constant
+        assert len(caplog.records) == 0, (
+            f'Expected the benign concurrent-unpin race to stay silent, '
+            f'got: {caplog.records}'
+        )
+
+
 class TestAtomicWriteText:
     """Direct coverage of the private write-then-replace helper's failure path."""
 

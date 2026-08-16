@@ -19,8 +19,8 @@ strict ``__all__`` union assertion untouched.
 A pinned artifact is only ever trusted when both its heuristics block and a
 schema-valid provenance sidecar are present; anything else (nothing pinned,
 an orphan heuristics file, a corrupt/incomplete provenance sidecar, or a
-sidecar, key directory, or ancestor directory that exists but cannot be read)
-fails safe to the in-code constant.
+heuristics file, sidecar, key directory, or ancestor directory that exists but
+cannot be read) fails safe to the in-code constant.
 :func:`default_artifacts_root` gives every consumer (the T6 optimization
 loop, T2/T3 call sites, T8 tooling) one agreed on-disk root, so they never
 each invent a divergent location for the same on-disk state.
@@ -169,9 +169,18 @@ def _encode_segment(segment: str) -> str:
 def _warn_unreadable_once(path: Path, exc: OSError) -> None:
     """Warn once per *path* per process that an artifact path is unreadable.
 
-    Shared by both limbs of :meth:`PromptArtifactStore.resolve`'s fail-safe —
-    the ``heuristics.txt`` stat and the ``provenance.json`` load — so an
-    unreadable key directory warns once rather than once per file it contains.
+    Shared by every unreadable-path limb of :meth:`PromptArtifactStore.resolve`
+    — the ``heuristics.txt`` stat, the ``provenance.json`` load, and the
+    ``heuristics.txt`` read — and by :meth:`PromptArtifactStore.read_provenance`
+    through that same load.
+
+    The dedup key is the full path, so it is once per distinct *artifact path*,
+    not once per key directory. Within a single ``resolve()`` that is also once
+    per call, since each limb fails safe immediately and the later ones are
+    never reached; but an unreadable key directory read through two entry
+    points (a ``resolve()`` warning for ``heuristics.txt``, then a
+    ``read_provenance()`` warning for ``provenance.json``) warns once per
+    entry point that touches it.
 
     Absorbed but NOT silent: these fallbacks sit on a per-invocation hot path
     (``task_curator`` resolves through it every reconciliation cycle), so a
@@ -290,17 +299,20 @@ class PromptArtifactStore:
         read, or a heuristics.txt that vanishes between the provenance check
         below and the read (e.g. a concurrent :meth:`unpin` racing this call).
 
-        The unreadable case covers **both** on-disk reads, because either can
-        fail on its own: the ``exists()`` probe below (when the key directory
-        — or any *ancestor* of it, such as the whole artifacts root — is
-        unreadable) and the provenance sidecar itself (a permission flip
+        The unreadable case covers **all three** on-disk reads, because each
+        can fail on its own: the ``exists()`` probe below (when the key
+        directory — or any *ancestor* of it, such as the whole artifacts root
+        — is unreadable), the provenance sidecar, and the ``heuristics.txt``
+        read itself (either of the latter two via a permission flip
         mid-operation, or the path replaced by a directory). Guarding only the
-        latter is not enough: ``Path.exists()`` swallows just
+        sidecar is not enough: ``Path.exists()`` swallows just
         ENOENT/ENOTDIR/EBADF/ELOOP/EINVAL (``pathlib._abc._ignore_error``), so
         EACCES propagates out of the probe before the sidecar load is ever
-        reached. Both limbs are logged once per path per process so a
-        wholesale-unreadable root stays diagnosable rather than looking like
-        "nothing pinned".
+        reached. Every unreadable path is logged once per path per process so
+        a wholesale-unreadable root stays diagnosable rather than looking like
+        "nothing pinned". The one deliberately *silent* fallback is the
+        vanished heuristics.txt above — a benign, self-correcting unpin race
+        where the fallback is the intended outcome, not a fault to report.
 
         Performance note: this does disk I/O — an ``exists()`` check, a JSON
         load + schema validation, and a text read — on every call, with no
@@ -331,10 +343,23 @@ class PromptArtifactStore:
             if provenance is not None:
                 try:
                     heuristics = heuristics_path.read_text(encoding='utf-8')
-                except OSError:
+                except FileNotFoundError:
                     # Concurrent unpin()/external deletion raced in between
                     # the provenance check above and this read — fail safe
-                    # rather than let the error propagate.
+                    # rather than let the error propagate. Deliberately
+                    # SILENT: this race is benign, expected and
+                    # self-correcting (the fallback is the intended outcome),
+                    # so logging it would be noise on normal operation.
+                    return ResolvedPrompt(spec.in_code_constant, None, 'in_code')
+                except OSError as exc:
+                    # Any *other* OSError is not that race: the file is there
+                    # but unreadable (a permission flip, the path replaced by
+                    # a directory) — the same environmental fault the two
+                    # guards above absorb, which will not self-correct and
+                    # which nothing else reports. So it is loud, once per
+                    # path, or a pinned prompt reverts to baseline on every
+                    # resolve indistinguishably from "nothing pinned".
+                    _warn_unreadable_once(heuristics_path, exc)
                     return ResolvedPrompt(spec.in_code_constant, None, 'in_code')
                 return ResolvedPrompt(
                     compose_prompt(spec.contract, heuristics), provenance, 'artifact'
