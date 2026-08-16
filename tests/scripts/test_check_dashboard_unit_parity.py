@@ -1228,8 +1228,26 @@ def test_registry_exec_start_flags_are_really_on_the_committed_command():
             )
 
 
-def test_registry_environment_sections_really_declare_environment():
-    """STALENESS GUARD, Environment edition."""
+def test_registry_environment_sections_name_a_section_the_committed_unit_has():
+    """STALENESS GUARD, Environment edition — re-aimed for injection-visibility registrations.
+
+    This guard used to require the committed unit to declare an actual
+    Environment= line in the registered section. That is now the WRONG
+    expectation: the watchdog service registers environment_section="Service"
+    while declaring no Environment= at all, ON PURPOSE — the same "present in
+    neither copy today" shape UnitSpec.override_directives already documents
+    (see that field's comment: "an override directive is expected to exist in
+    NEITHER copy ... Putting it on present_only would fail that staleness
+    test on arrival"). Requiring a declared Environment= here would fail that
+    registration on arrival for the identical reason.
+
+    What still needs guarding did not go away: a typo'd or nonexistent
+    section name — environment_section="Servcie" — would compare against a
+    section the parser never populates, so the branch would compare nothing,
+    forever, while reporting green. Asserting the section EXISTS in the
+    parsed committed unit (regardless of whether it declares Environment= yet)
+    keeps that protection without rejecting a deliberately-empty registration.
+    """
     mod = _load_checker()
 
     for name, spec in mod.UNITS.items():
@@ -1238,10 +1256,56 @@ def test_registry_environment_sections_really_declare_environment():
         parsed = mod.parse_unit_directives(
             (REPO_ROOT / spec.repo_relpath).read_text(encoding="utf-8")
         )
-        assert "Environment" in parsed.get(spec.environment_section, {}), (
+        assert spec.environment_section in parsed, (
             f"{name}: registry compares Environment= in "
-            f"[{spec.environment_section}], but the committed unit declares none."
+            f"[{spec.environment_section}], but the committed unit has no "
+            "such section at all — the entry checks nothing. Fix the "
+            "registry or the unit."
         )
+
+
+def test_committed_environment_declarations_are_all_registered():
+    """INVERTED staleness guard: every declared Environment= is registered.
+
+    The sibling guard above
+    (test_registry_environment_sections_name_a_section_the_committed_unit_has)
+    only checks one direction: registration implies the section exists. That
+    left the actual hazard task 4090 fixed completely unchecked — a committed
+    unit can declare Environment= in a section nobody registered, and every
+    directive still compares equal, forever, while the checker reports green.
+    This is the missing direction: for every section a committed unit
+    declares Environment= in, that section must be the spec's registered
+    environment_section — so a future watchdog knob promoted into the
+    committed unit while environment_section stayed None fails loudly here
+    instead of silently going uncompared. That is precisely task 4090's
+    defect, generalized to any unit in the registry, present or future.
+
+    Passes on arrival today: only dashboard.service declares Environment=,
+    and it registers "Service". This is a forward guard, not a second red.
+
+    UnitSpec carries exactly one environment_section, so a unit that ever
+    needs Environment= compared in more than one section cannot be expressed
+    yet; the assertion message says so explicitly rather than failing in a
+    way that reads like a simple typo.
+    """
+    mod = _load_checker()
+
+    for name, spec in mod.UNITS.items():
+        parsed = mod.parse_unit_directives(
+            (REPO_ROOT / spec.repo_relpath).read_text(encoding="utf-8")
+        )
+        for section, directives in parsed.items():
+            if "Environment" not in directives:
+                continue
+            assert spec.environment_section == section, (
+                f"{name}: the committed unit declares Environment= in "
+                f"[{section}], but environment_section is "
+                f"{spec.environment_section!r} — register "
+                f"environment_section={section!r} (UnitSpec holds only one "
+                "section; extend it if a unit ever needs more than one "
+                "registered) so this directive is actually compared instead "
+                "of silently skipped."
+            )
 
 
 def test_registry_env_matches_directive_entries_are_declared_in_the_committed_units():
@@ -1531,11 +1595,22 @@ def test_environment_file_dropped_from_the_installed_copy_is_drift():
     assert [d.key for d in drifts] == ["EnvironmentFile"], drifts
 
 
-def test_registry_registers_environment_file_on_both_service_units():
-    """The two service units must actually carry the override registration.
+def test_registry_registers_environment_overrides_on_both_service_units():
+    """The two service units must actually carry both override registrations.
 
     A helper-only test would pass while the real registry left the hole open —
-    the same rot the key-staleness tests exist to prevent one level down.
+    the same rot the key-staleness tests exist to prevent one level down. Both
+    EnvironmentFile= and environment_section are pinned here, in one loop over
+    the two service units, rather than as two near-identical loops — either
+    registration going missing on either unit must fail loudly rather than
+    silently reopen the hole its counterpart test in this module measures.
+
+    The timer is pinned the OTHER way, and the message states why: the
+    committed dark-factory-dashboard-watchdog.timer parses to sections Unit /
+    Timer / Install — there is no [Service] section, and Environment= is not a
+    valid directive in a timer unit. Registering a section there would compare
+    absent-to-absent forever, which is exactly the rot the staleness guards
+    elsewhere in this module exist to prevent.
     """
     mod = _load_checker()
 
@@ -1545,6 +1620,70 @@ def test_registry_registers_environment_file_on_both_service_units():
             "would leave the checker reporting parity over an unknown "
             "effective configuration."
         )
+        assert mod.UNITS[name].environment_section == "Service", (
+            f"{name} does not register environment_section='Service', so an "
+            "Environment= line added to the installed copy alone would leave "
+            "the checker reporting parity over an unknown effective "
+            "configuration."
+        )
+
+    assert mod.UNITS[_WATCHDOG_TIMER].environment_section is None, (
+        f"{_WATCHDOG_TIMER} has no [Service] section (it parses to Unit / "
+        "Timer / Install) and Environment= is not valid in a timer unit — "
+        "registering environment_section here would compare absent-to-absent "
+        "forever."
+    )
+
+
+def test_watchdog_environment_injected_on_the_installed_copy_is_drift():
+    """The measured hole: an inline Environment= on the installed copy alone.
+
+    scripts/dashboard-watchdog.py reads nine env knobs — PROBE_URL,
+    PROBE_TIMEOUT, GRACE_SECS, FAIL_STREAK, MAX_RESTARTS, RATE_WINDOW_SECS,
+    STATE_PATH, ESCALATION_QUEUE_DIR, UV_BIN — and those knobs ARE the
+    hysteresis/grace/rate-ceiling supervision policy. An installed copy that
+    picked up ``Environment=DASHBOARD_WATCHDOG_FAIL_STREAK=99`` outside the
+    repo (``systemctl --user edit`` writing a bare Environment= line, or a
+    hand-edit of the installed file) means ~99 consecutive failed probes
+    before any restart — supervision effectively off. Measured: with
+    ``environment_section`` unset on the watchdog spec, this exact input
+    produces zero drift lines — ``compare_unit`` returns ``[]``, a clean
+    "[ok] parity" over a unit whose effective failure tolerance was silently
+    disabled.
+
+    Uses the REAL registry spec and the REAL committed unit, not a fixture
+    UnitSpec — a fixture-only test would pass while the registry left the hole
+    open, the same reason
+    test_registry_registers_environment_overrides_on_both_service_units states
+    in its own docstring. The installed text is the repo text plus one
+    injected line, so this is a REPO-side-only read and stays green on CI and
+    on a host whose installed units are drifted.
+    """
+    mod = _load_checker()
+    spec = mod.UNITS[_WATCHDOG_SERVICE]
+    repo_text = (REPO_ROOT / spec.repo_relpath).read_text(encoding="utf-8")
+    # Inserted right after the [Service] header rather than appended at EOF.
+    # The committed unit happens to have no section after [Service] today (no
+    # [Install] stanza), so appending at EOF currently lands in the same
+    # section too — but relying on that would silently couple this fixture to
+    # section order: a future [Install] or [Unit] added after [Service] would
+    # make the appended line land outside it, _environment_map would read an
+    # empty [Service] on both sides, and this test would fail with
+    # `assert [] == [...]`, reading like the checker regressed rather than
+    # like the fixture drifted. [Service] appears exactly once, so inserting
+    # right after its header is unambiguous regardless of what sections exist
+    # before or after it.
+    installed_text = repo_text.replace(
+        "[Service]\n", "[Service]\nEnvironment=DASHBOARD_WATCHDOG_FAIL_STREAK=99\n", 1
+    )
+
+    drifts = mod.compare_unit(spec, repo_text, installed_text)
+
+    assert [d.key for d in drifts] == ["Environment=DASHBOARD_WATCHDOG_FAIL_STREAK"], drifts
+    assert drifts[0].section == "Service"
+    assert drifts[0].installed_value == "99"
+    assert drifts[0].repo_value == mod._ABSENT
+    assert "installed copy" in drifts[0].reason
 
 
 def test_find_dropins_returns_nothing_when_no_dropin_dir_exists(tmp_path: pathlib.Path):

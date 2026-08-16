@@ -108,7 +108,10 @@ are split by CLASS, because one rule cannot fit all of them:
   ``EnvironmentFile=`` is registered per unit
   (``UnitSpec.override_directives``) and fires when one copy declares it and
   the other does not.  Neither is present for these units today, so neither
-  can misfire now.
+  can misfire now.  A third path needs no separate file at all: an
+  ``Environment=`` line added straight to the installed unit.  That is
+  registered per unit too (``UnitSpec.environment_section``, compared by
+  variable-NAME set) and is now closed on both service units.
 
 One unit has THREE sites, not two: ``setup-host.sh`` installs
 ``dark-factory-dashboard.service`` by RENDERING
@@ -287,8 +290,13 @@ class UnitSpec:
     present_only: tuple[tuple[str, str], ...] = ()
     # Section whose Environment= directives are compared by variable-NAME set
     # (values compared only for names off DIVERGENCE_ALLOWLIST). None disables
-    # the branch entirely, which is right for the two watchdog units — they
-    # declare no Environment= at all.
+    # the branch entirely, which is right for the .timer ONLY: it has no
+    # [Service] section, and Environment= is not a valid directive in a timer
+    # unit. Registering a section whose Environment= set is EMPTY in BOTH
+    # copies today (the watchdog .service) is deliberate, not rot — the
+    # comparison is by variable-NAME set, so a variable declared on either
+    # side alone is reported, which is the whole point on a unit that should
+    # declare none at all.
     environment_section: str | None = None
     # Bare uvicorn flag names (no leading '--') compared INSIDE [Service]
     # ExecStart. This is how a presence-only ExecStart still gets its
@@ -896,6 +904,19 @@ UNITS: dict[str, UnitSpec] = {
         # (it is activated by the timer, never enabled directly).
         present_only=(("Service", "ExecStart"),),
         override_directives=(("Service", "EnvironmentFile"),),
+        # Neither copy declares Environment= today, so this branch
+        # contributes zero drift lines until real drift appears — same
+        # registration shape as the dashboard spec's environment_section
+        # above. Registering the section is what makes an inline
+        # `Environment=DASHBOARD_WATCHDOG_FAIL_STREAK=99` added to the
+        # installed copy ALONE visible: scripts/dashboard-watchdog.py reads
+        # nine knobs (PROBE_URL, PROBE_TIMEOUT, GRACE_SECS, FAIL_STREAK,
+        # MAX_RESTARTS, RATE_WINDOW_SECS, STATE_PATH, ESCALATION_QUEUE_DIR,
+        # UV_BIN) that ARE the hysteresis/grace/rate-ceiling supervision
+        # policy, so an inline injection here is the same class of hole
+        # EnvironmentFile= was registered to close — on the same unit, left
+        # open until now.
+        environment_section="Service",
     ),
     "dark-factory-dashboard-watchdog.timer": UnitSpec(
         name="dark-factory-dashboard-watchdog.timer",
