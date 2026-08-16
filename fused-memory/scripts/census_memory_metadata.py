@@ -120,6 +120,52 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_JSON_OUT = str(_REPO_ROOT / 'plans' / 'memory-metadata-census-report.json')
 DEFAULT_MD_OUT = str(_REPO_ROOT / 'plans' / 'memory-metadata-census-report.md')
 
+
+def _repo_relative(path: str) -> str:
+    """Project *path* to a repo-relative string when it is inside the repo.
+
+    ``_REPO_ROOT`` is derived from this file's location, so it differs
+    between the main checkout and every ``.worktrees/<id>`` lane. Recording a
+    resolved ABSOLUTE path in the committed artifact's ``params`` therefore
+    (a) churns the artifact the first time a run happens in a different
+    checkout, and (b) points a reader at a worktree that will be reclaimed.
+    Worse, :func:`_regen_command` prints a flag whenever the recorded value
+    departs from the default resolved AT READ TIME, so an artifact generated
+    in one checkout emits a regen command naming a path that does not exist
+    there -- task 3507's failure exactly ("a documented regen command that no
+    longer reproduces the artifact is worse than none").
+
+    Paths outside the repo are returned resolved-absolute: they are genuinely
+    checkout-independent, and shortening them is not this function's job.
+
+    RECORDING side. *path* is whatever the CLI was handed, so it is resolved
+    with the process's CWD semantics -- the same way the run itself
+    interpreted it. Reading such a value back is :func:`_resolved_repo_path`,
+    which anchors at the repo root instead; the two are not interchangeable.
+    """
+    resolved = Path(path).resolve()
+    try:
+        return str(resolved.relative_to(_REPO_ROOT))
+    except ValueError:
+        return str(resolved)
+
+
+def _resolved_repo_path(value: str) -> str:
+    """Resolve a path RECORDED in ``params`` back to an absolute path.
+
+    READING side of :func:`_repo_relative`. A recorded relative value is
+    relative to the REPO ROOT, never to the reader's CWD -- anchoring it at
+    the CWD would make an artifact compare unequal to its own default
+    depending on which directory the reader happened to run from (measured:
+    the census suite runs from ``fused-memory/``, the wrapper from the repo
+    root). Absolute values are honoured as-is, which is what lets a
+    pre-4006 artifact's absolute default still normalise.
+    """
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = _REPO_ROOT / candidate
+    return str(candidate.resolve())
+
 DEFAULT_PROJECT_IDS = ['dark_factory', 'reify']
 
 # CLI defaults for --page-size / --top-n, shared with the argparse setup
@@ -669,13 +715,35 @@ def _load_probe_module() -> Any:
     return module
 
 
-#: REUSED, never re-parsed: the registry's schema-version check, its
-#: zero-entry rejection and its ``RegistryError`` type all stay single-homed
-#: in the probe. Bound as a module-level ALIAS rather than wrapped in a
-#: delegating function -- exactly as ``retro_stamp_topics.py:189`` does it --
-#: so the reuse is pinnable by ``is`` and a re-implementation cannot creep in
-#: behind a same-named shim.
-load_topic_registry = _load_probe_module().load_topic_registry
+#: Memoized holder for the probe's loader. ``None`` means "not loaded yet",
+#: never "unavailable" -- an unavailable probe raises out of the accessor and
+#: is disclosed by :func:`load_registry_or_error`.
+_TOPIC_REGISTRY_LOADER: Any = None
+
+
+def topic_registry_loader() -> Any:
+    """Return the probe's ``load_topic_registry``, loading it on FIRST USE.
+
+    REUSED, never re-parsed: the registry's schema-version check, its
+    zero-entry rejection and its ``RegistryError`` type all stay single-homed
+    in the probe, exactly as ``retro_stamp_topics.py:189`` establishes -- and
+    the reuse stays pinnable by ``is``, through this accessor.
+
+    LAZY and memoized, not an import-time module alias. As an alias the load
+    ran at ``import census_memory_metadata`` time, which made the most likely
+    registry failure -- the probe script renamed, moved, or carrying an import
+    error -- the one mode that could NOT be disclosed: it killed the whole
+    nightly census (no coverage numbers, no report, no trend row) and this
+    module's entire test suite with it, bypassing the ``registry_coverage:
+    null`` + ``registry_error`` path built for exactly that failure. The
+    registry gauge is ONE optional block of the report; it must not be able to
+    take the measurement down with it (INV-2 no-silent-fail-soft cuts both
+    ways -- disclose the shortfall, do not escalate it into a total loss).
+    """
+    global _TOPIC_REGISTRY_LOADER  # noqa: PLW0603 - one-shot memo
+    if _TOPIC_REGISTRY_LOADER is None:
+        _TOPIC_REGISTRY_LOADER = _load_probe_module().load_topic_registry
+    return _TOPIC_REGISTRY_LOADER
 
 
 def load_registry_or_error(path: str) -> tuple[Any | None, str | None]:
@@ -688,7 +756,10 @@ def load_registry_or_error(path: str) -> tuple[Any | None, str | None]:
     value of this gauge is that its zero is meaningful (INV-2).
     """
     try:
-        registry = load_topic_registry(path)
+        # The loader itself is resolved INSIDE the try: an unloadable probe
+        # module is a registry failure like any other, and is disclosed the
+        # same way rather than aborting the census.
+        registry = topic_registry_loader()(path)
     except Exception as exc:  # noqa: BLE001 - every load failure is disclosed
         return None, f'{type(exc).__name__}: {exc}'
     return registry, None
@@ -755,7 +826,7 @@ def _build_registry_coverage(
     }, None
 
 
-def read_canonical_uniqueness_enforced() -> bool | None:
+def read_canonical_uniqueness_enforced(config: Any | None = None) -> bool | None:
     """Three-valued read of the live ``memory_metadata.enforce`` setting.
 
     ``True``/``False`` are the measured flag; ``None`` means the config could
@@ -765,14 +836,23 @@ def read_canonical_uniqueness_enforced() -> bool | None:
     backlog when in fact nothing is known about the regime (INV-2
     no-silent-fail-soft).
 
+    Pass *config* to report the regime the run ACTUALLY operated under: the
+    census builds its backend from one :class:`FusedMemoryConfig`, and a
+    second, independently-constructed one can resolve a different
+    ``CONFIG_PATH`` and disclose an ``enforce`` state belonging to a config
+    the census never used. Omitting it keeps the standalone contract for
+    callers that have none.
+
     Never raises: losing the whole census to a config fault would be a
     strictly worse outcome than an undisclosed flag, since the measurement
     itself does not depend on the config.
     """
     try:
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+        if config is None:
+            from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
 
-        return bool(FusedMemoryConfig().memory_metadata.enforce)
+            config = FusedMemoryConfig()
+        return bool(config.memory_metadata.enforce)
     except Exception as exc:  # noqa: BLE001 - any load failure degrades to null
         logger.warning(
             'could not read memory_metadata.enforce (%s: %s) -- reporting null',
@@ -1787,11 +1867,20 @@ def _regen_command(params: dict[str, Any]) -> str:
     top_n = params.get('top_n')
     if top_n is not None and top_n != DEFAULT_TOP_N:
         parts.append(f'--top-n {top_n}')
+    # Both path params are compared through _resolved_repo_path, so an
+    # artifact reads the same way in every checkout: a run made in a worktree
+    # lane and read from the main checkout must not emit a --registry flag
+    # naming a path that only ever existed in that lane. This also normalises
+    # the absolute spellings written by pre-4006 artifacts.
     registry = params.get('registry')
-    if registry is not None and registry != DEFAULT_REGISTRY_PATH:
+    if registry is not None and _resolved_repo_path(registry) != _resolved_repo_path(
+        DEFAULT_REGISTRY_PATH,
+    ):
         parts.append(f'--registry {registry}')
     history_out = params.get('history_out')
-    if history_out is not None and history_out != DEFAULT_HISTORY_OUT:
+    if history_out is not None and _resolved_repo_path(
+        history_out,
+    ) != _resolved_repo_path(DEFAULT_HISTORY_OUT):
         parts.append(f'--history-out {history_out}')
     if params.get('no_history'):
         parts.append('--no-history')
@@ -2545,8 +2634,16 @@ async def _run(args: argparse.Namespace) -> int:
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)
 
-    backend = _build_backend(FusedMemoryConfig())
+    config = FusedMemoryConfig()
+    backend = _build_backend(config)
     try:
+        # Read FIRST, before a multi-minute paginated scroll of both live
+        # collections. An unusable history is fatal by design (see the
+        # handler below), and failing after the scroll would discard a
+        # completed measurement over a fault in an unrelated file that costs
+        # milliseconds to validate -- the nightly job would then produce
+        # nothing at all, every night, until someone noticed.
+        history = load_coverage_history(args.history_out)
         cells: dict[str, dict[str, CategoryCensus]] = {}
         coverage: dict[str, dict[str, Any]] = {}
         for project_id in args.project_id:
@@ -2561,19 +2658,19 @@ async def _run(args: argparse.Namespace) -> int:
             coverage[project_id] = project_coverage
 
         registry, registry_error = load_registry_or_error(args.registry)
-        # Loaded BEFORE the report is built (the trend is part of the
-        # artifact) and never swallowed: CoverageHistoryError propagates to
-        # the handler below, which exits 1 with the file untouched rather
-        # than silently restarting the series from empty.
-        history = load_coverage_history(args.history_out)
         report = build_report(
             cells, coverage, top_n=args.top_n, page_size=args.page_size,
-            canonical_uniqueness_enforced=read_canonical_uniqueness_enforced(),
+            # The SAME config the backend was built from, so the disclosed
+            # regime provably belongs to the run that measured the count.
+            canonical_uniqueness_enforced=read_canonical_uniqueness_enforced(config),
             registry=registry, registry_error=registry_error,
             history=history,
+            # Recorded repo-relative: these two land in a COMMITTED artifact,
+            # and an absolute path would name the checkout that happened to
+            # generate it (see _repo_relative).
             extra_params={
-                'registry': args.registry,
-                'history_out': args.history_out,
+                'registry': _repo_relative(args.registry),
+                'history_out': _repo_relative(args.history_out),
                 'no_history': bool(args.no_history),
             },
         )

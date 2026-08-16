@@ -1321,7 +1321,47 @@ class TestRegistryCoverageGauge:
             cached = _ilu.module_from_spec(spec)
             _sys.modules['memory_eval_retrieval_probe'] = cached
             spec.loader.exec_module(cached)
-        assert _mod.load_topic_registry is cached.load_topic_registry
+        # Through the ACCESSOR, not a module attribute: the loader is bound
+        # lazily so an unloadable probe degrades to registry_error instead of
+        # killing the import (and with it the whole census). The reuse is
+        # still pinned by identity.
+        assert _mod.topic_registry_loader() is cached.load_topic_registry
+
+    def test_the_probe_is_not_loaded_at_import_time(self):
+        # The load must be reachable from load_registry_or_error's try block,
+        # which is only true if it has not already happened at import.
+        import ast
+        import inspect
+
+        src = inspect.getsource(_mod.topic_registry_loader)
+        assert '_load_probe_module()' in src
+        module_src = Path(_mod.__file__).read_text(encoding='utf-8')
+        tree = ast.parse(module_src)
+        top_level_calls = [
+            node
+            for stmt in tree.body
+            if not isinstance(stmt, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)
+            for node in ast.walk(stmt)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == '_load_probe_module'
+        ]
+        assert top_level_calls == []
+
+    def test_an_unloadable_probe_is_DISCLOSED_not_fatal(self, monkeypatch):
+        # The registry gauge is one optional block. A probe that cannot be
+        # loaded must take the same registry_error path every other registry
+        # failure takes -- not abort the measurement.
+        monkeypatch.setattr(_mod, '_TOPIC_REGISTRY_LOADER', None)
+
+        def _boom():
+            raise ImportError('memory_eval_retrieval_probe moved')
+
+        monkeypatch.setattr(_mod, '_load_probe_module', _boom)
+        registry, error = _mod.load_registry_or_error(_mod.DEFAULT_REGISTRY_PATH)
+        assert registry is None
+        assert error is not None
+        assert error.startswith('ImportError:')
 
     def test_default_registry_path_is_the_committed_fixture(self):
         assert _mod.DEFAULT_REGISTRY_PATH.endswith(
@@ -1462,7 +1502,7 @@ class TestRegistryCoverageGauge:
     def test_the_committed_registry_still_holds_the_32_named_targets(self):
         # The accountable set this task names as the TARGET. If the fixture
         # grows or shrinks, the target moved and the docs must say so.
-        registry = _mod.load_topic_registry(_mod.DEFAULT_REGISTRY_PATH)
+        registry = _mod.topic_registry_loader()(_mod.DEFAULT_REGISTRY_PATH)
         assert len(registry.entries) == 32
 
 
@@ -3499,6 +3539,32 @@ class TestCliHistoryFlags:
         assert history_out.read_text(encoding='utf-8') == '{not json'
 
     @pytest.mark.asyncio
+    async def test_a_malformed_history_fails_BEFORE_the_scroll(self, tmp_path, monkeypatch):
+        # The fault costs milliseconds to detect and the scroll costs minutes
+        # over ~54k live payloads. Validating after it would discard a
+        # completed measurement over an unrelated file -- and the nightly job
+        # would then emit nothing at all, every night, until someone noticed.
+        scrolled: list[str] = []
+
+        async def _stub(backend, project_id, categories=None, page_size=1000, max_pages=200):
+            scrolled.append(project_id)
+            return {OBS: _census([{'kind': 'cycle_summary'}])}, _coverage(
+                'fused_x', 1, {OBS: (1, 1)},
+            )
+
+        monkeypatch.setattr(_mod, 'census_project', _stub)
+        monkeypatch.setattr(_mod, '_build_backend', lambda cfg: AsyncMock())
+        history_out = tmp_path / 'history.json'
+        history_out.write_text('{not json', encoding='utf-8')
+        rc = await _mod._run(_args(tmp_path, history_out=str(history_out)))
+        assert rc == 1
+        assert scrolled == []
+        # And the artifacts do not half-land: nothing was measured, so
+        # nothing claims to have been.
+        assert not (tmp_path / 'census.json').exists()
+        assert not (tmp_path / 'census.md').exists()
+
+    @pytest.mark.asyncio
     async def test_an_incomplete_census_still_lands_its_artifacts_and_exits_1(
         self, tmp_path, monkeypatch,
     ):
@@ -3552,6 +3618,122 @@ class TestRegenCommandCoversTheNewFlags:
             tmp_path, history_out='/tmp/h.json', no_history=True, registry='/tmp/r.json',
         ))
         written = json.loads((tmp_path / 'census.json').read_text())
+        # Out-of-tree paths stay absolute: they are already
+        # checkout-independent, and shortening them is not _repo_relative's job.
         assert written['params']['history_out'] == '/tmp/h.json'
         assert written['params']['no_history'] is True
         assert written['params']['registry'] == '/tmp/r.json'
+
+
+class TestCommittedParamsAreCheckoutIndependent:
+    """The artifact is COMMITTED, so a param that names the checkout which
+    happened to generate it churns the diff, points a reader at a worktree
+    that will be reclaimed, and makes _regen_command print a path that does
+    not exist where the artifact is read (task 3507, re-armed)."""
+
+    def test_an_in_repo_path_is_recorded_relative_to_the_repo_root(self):
+        assert _mod._repo_relative(_mod.DEFAULT_REGISTRY_PATH) == (
+            'fused-memory/tests/fixtures/memory_eval_topic_registry.json'
+        )
+        assert _mod._repo_relative(_mod.DEFAULT_HISTORY_OUT) == (
+            'plans/memory-metadata-coverage-history.json'
+        )
+
+    def test_an_out_of_tree_path_stays_absolute(self):
+        assert _mod._repo_relative('/tmp/elsewhere/r.json') == '/tmp/elsewhere/r.json'
+
+    def test_a_recorded_relative_value_is_re_anchored_at_the_repo_root_not_the_cwd(self):
+        # The reader's CWD is not the repo root (this suite runs from
+        # fused-memory/, the wrapper from the repo root). Anchoring a
+        # recorded value at the CWD would make an artifact compare unequal to
+        # its own default depending on where it was read from.
+        assert _mod._resolved_repo_path(
+            'plans/memory-metadata-coverage-history.json',
+        ) == _mod._resolved_repo_path(_mod.DEFAULT_HISTORY_OUT)
+        assert _mod._resolved_repo_path('plans/x.json').startswith(str(_mod._REPO_ROOT))
+
+    @pytest.mark.asyncio
+    async def test_run_records_the_default_paths_repo_relative(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(_mod, 'census_project', _census_project_stub())
+        monkeypatch.setattr(_mod, '_build_backend', lambda cfg: AsyncMock())
+        await _mod._run(_args(
+            tmp_path, registry=_mod.DEFAULT_REGISTRY_PATH,
+            history_out=_mod.DEFAULT_HISTORY_OUT, no_history=True,
+        ))
+        params = json.loads((tmp_path / 'census.json').read_text())['params']
+        assert params['registry'] == (
+            'fused-memory/tests/fixtures/memory_eval_topic_registry.json'
+        )
+        assert params['history_out'] == 'plans/memory-metadata-coverage-history.json'
+        # The load-bearing half: no absolute prefix, so no worktree lane can
+        # be baked into a committed artifact.
+        assert not params['registry'].startswith('/')
+        assert '.worktrees' not in params['history_out']
+
+    def test_a_relative_default_still_reproduces_the_bare_regen_command(self):
+        # An artifact generated in one checkout and read in another must not
+        # emit a --registry flag naming a path that no longer exists.
+        params = {
+            'projects': ['dark_factory', 'reify'],
+            'registry': 'fused-memory/tests/fixtures/memory_eval_topic_registry.json',
+            'history_out': 'plans/memory-metadata-coverage-history.json',
+            'no_history': False,
+        }
+        assert _mod._regen_command(params) == (
+            'uv run python scripts/census_memory_metadata.py'
+        )
+
+    def test_a_pre_4006_absolute_default_is_normalised_too(self):
+        # Artifacts already committed carry the absolute spelling; reading
+        # them must not manufacture a spurious flag either.
+        params = {
+            'projects': ['dark_factory', 'reify'],
+            'registry': _mod.DEFAULT_REGISTRY_PATH,
+            'history_out': _mod.DEFAULT_HISTORY_OUT,
+        }
+        assert _mod._regen_command(params) == (
+            'uv run python scripts/census_memory_metadata.py'
+        )
+
+
+class TestTheDisclosedRegimeIsTheOneTheRunUsed:
+    @pytest.mark.asyncio
+    async def test_the_enforce_flag_is_read_from_the_censuss_own_config(
+        self, tmp_path, monkeypatch,
+    ):
+        # Two independently-constructed FusedMemoryConfig()s can resolve
+        # different CONFIG_PATHs, so the report could disclose an `enforce`
+        # regime belonging to a config the census never operated under.
+        seen: dict[str, object] = {}
+
+        def _backend_of(cfg):
+            seen['backend'] = cfg
+            return AsyncMock()
+
+        def _enforce_of(config=None):
+            seen['enforce'] = config
+            return True
+
+        monkeypatch.setattr(_mod, 'census_project', _census_project_stub())
+        monkeypatch.setattr(_mod, '_build_backend', _backend_of)
+        monkeypatch.setattr(_mod, 'read_canonical_uniqueness_enforced', _enforce_of)
+        await _mod._run(_args(tmp_path))
+        assert seen['enforce'] is seen['backend']
+        assert seen['enforce'] is not None
+
+    def test_an_injected_config_is_read_without_constructing_a_second(self):
+        class _Cfg:
+            memory_metadata = types.SimpleNamespace(enforce=True)
+
+        assert _mod.read_canonical_uniqueness_enforced(_Cfg()) is True
+
+    def test_an_unreadable_injected_config_still_degrades_to_null(self):
+        class _Broken:
+            @property
+            def memory_metadata(self):
+                raise RuntimeError('config is a wreck')
+
+        # Never raises: the measurement does not depend on the config, and
+        # losing the whole census to a config fault is strictly worse than an
+        # undisclosed flag.
+        assert _mod.read_canonical_uniqueness_enforced(_Broken()) is None
