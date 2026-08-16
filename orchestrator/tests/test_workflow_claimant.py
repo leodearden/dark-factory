@@ -323,15 +323,28 @@ def _resolve_plan_lock_claimant(wf: TaskWorkflow):
     Uses the claimant-absent task shape, which is the ONLY shape that reaches
     the plan.lock leg (a present db claimant wins outright).
 
-    ``.task`` COMPAT SHIM: ``TaskWorkflow`` builds its artifacts with
-    ``meta_root=_meta_root_for_worktree(...)``, so plan.lock lives in the
-    ``.task-meta`` SIBLING, whereas ``_resolve_live_claimant`` constructs a
-    bare ``TaskArtifacts(worktree_path)`` and therefore reads
-    ``<worktree>/.task/plan.lock``.  The symlink below reproduces the in-repo
-    ``.task`` -> ``.task-meta`` compat shape so the resolver reads the lock
-    the workflow actually wrote.  That divergence is a PRE-EXISTING gap in the
-    resolver, unrelated to and untouched by task 3563 (which normalises the
-    identity SHAPE, not where the lock is looked up) — filed separately.
+    FIXTURE-ONLY SYMLINK — read this before trusting the tests below.
+    ``TaskWorkflow`` builds its artifacts with
+    ``meta_root=_meta_root_for_worktree(...)`` (workflow.py:2384-2385), so
+    plan.lock lives in the ``.task-meta`` SIBLING, whereas
+    ``_resolve_live_claimant`` constructs a bare ``TaskArtifacts(worktree_path)``
+    and therefore reads ``<worktree>/.task/plan.lock``.  NOTHING in production
+    bridges those two paths: ``TaskArtifacts.ensure_lane_plan_symlink``
+    (artifacts.py:354-386) relocates ``plan.json`` ONLY — there is no
+    ``.task`` -> ``.task-meta`` compat shape for plan.lock, and ``_read_path``
+    has no new-then-old fallback (unlike ``Harness._resolve_recovery_artifact``).
+    The link below is manufactured HERE and nowhere else.
+
+    So these tests prove the identity ALGEBRA — that one incarnation's
+    lock-derived and DB-stamped identities are the same string, and that the
+    result discriminates in the real ``classify_pins`` — NOT that the
+    composition branch is reachable on a real orchestrator run.  It is not:
+    the only plan.lock a real run can find at that path is a PRE-3563 legacy
+    lock with no ``run_id``, which resolves to the fail-safe ``run_id=None``,
+    so that leg is inert in production until the path gap closes.  The gap is
+    out of task 3563's scope (which normalises the identity SHAPE, not where
+    the lock is looked up) and is tracked as task 4262 (relocate the read),
+    with task 4028 tracking deletion of the leg if that is the ruling instead.
     """
     from orchestrator.task_ground_truth import TaskGroundTruth
 

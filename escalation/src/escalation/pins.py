@@ -202,11 +202,16 @@ def _norm_id(value: str | None) -> str | None:
       ``None``: its DB source yields the composed identity, its plan.lock
       source yields a composed identity when the lock records a run_id and
       ``None`` (unknown) otherwise, and its in-memory source yields ``None``.
+      That is a claim about the SHAPES it can emit, not about what it emits in
+      practice: its plan.lock leg still reads the pre-relocation lock path, so
+      on a real orchestrator run it finds only legacy locks and resolves to
+      ``None`` (task 4262), and no production caller passes a live identity
+      into this module yet at all (task 3541).
       This guard nonetheless stays load-bearing DEFENCE IN DEPTH — legacy
-      plan.lock files already on disk, harness-less workflows, and any future
-      producer can still hand this module a non-composed identity.  A format
-      mismatch is not PROOF that the filer is dead, and this module may only
-      convert on proof.
+      plan.lock files already on disk, harness-less workflows (whose DB stamp
+      is itself partial), and any future producer can still hand this module a
+      non-composed identity.  A format mismatch is not PROOF that the filer is
+      dead, and this module may only convert on proof.
 
     A SHAPE check, never a parse: the value is compared WHOLE and never
     decomposed (a differing ``pid=`` suffix is a different incarnation).

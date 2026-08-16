@@ -428,11 +428,17 @@ class TestLiveClaimantIdShapeGuard:
     mismatch is not PROOF that the filer is dead, so a non-composed identity
     on EITHER side is treated as unknown.
 
+    That describes the SHAPES that resolver can emit, not production reach: its
+    plan.lock leg still reads the pre-relocation lock path and so resolves to
+    ``None`` on a real run (task 4262), and no production caller passes a live
+    identity into ``classify_pins`` yet (task 3541).
+
     The cases below are UNCHANGED and stay load-bearing: a bare session_id is
     still a shape this guard must reject, merely no longer one the in-repo
     resolver produces. Legacy plan.lock files already on disk, harness-less
-    workflows, and any future producer can still supply one — defence in
-    depth, not a substitute for the producer-side normalisation.
+    workflows (whose DB claimant stamp is itself partial), and any future
+    producer can still supply one — defence in depth, not a substitute for the
+    producer-side normalisation.
     """
 
     @pytest.mark.parametrize(

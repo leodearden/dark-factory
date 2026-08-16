@@ -33,8 +33,21 @@ Task 3563 normalised the OTHER side of that comparison: :class:`Claimant`'s
 for the normative contract. This is disposition-neutral by construction: no
 production consumer reads ``Claimant.run_id`` at all (every read is a
 presence check or a ``.source`` check), so it changes no recovery outcome —
-it only makes the field COMPARABLE by ``escalation.pins``, which is what
-makes live-vs-dead filer discrimination reachable at all.
+it only makes the field COMPARABLE by ``escalation.pins``.
+
+SCOPE HONESTY on that last point: 3563 shipped the SHAPE contract, NOT
+end-to-end reachability. Two gaps outside its scope still gate the payoff.
+(1) The plan.lock leg of :meth:`TaskGroundTruth._resolve_live_claimant` reads
+``<worktree>/.task/plan.lock`` while the production writer targets the
+``.task-meta`` SIBLING, so on a real orchestrator run that leg can only ever
+find a pre-3563 legacy lock and resolves ``run_id=None`` — i.e. the
+composition branch is INERT in production today (task 4262 relocates the read;
+task 4028 tracks deleting the leg outright if that is the ruling instead).
+(2) The only production ``escalation.pins.classify_pins`` call site still
+passes ``live_claimant=False`` with no ``live_claimant_id`` (task 3541 wires
+it). Live-vs-dead filer discrimination becomes REACHABLE when those land; what
+3563 delivers is that the identity is now expressible at all, and that the
+bare-``session_id`` shape which would have made that comparison UNSAFE is gone.
 """
 
 from __future__ import annotations
@@ -131,7 +144,16 @@ class Claimant:
     composed.  Per source:
 
     * DB — the ``claimant_run_id`` column, already composed at dispatch, kept
-      VERBATIM.
+      VERBATIM.  CAVEAT: that stored value may ITSELF be partial —
+      ``TaskWorkflow`` stamps ``compose_claimant_run_id(self._process_run_id or
+      '', ...)`` (workflow.py:2297-2299), so a harness-less workflow writes
+      ``'/{session_id}/pid={pid}'`` to the column, exactly the shape the rule
+      above forbids.  This resolver neither detects nor repairs it:
+      ``shared.task_claimant`` ships no parser, so a composed value passes
+      through whole.  The plan.lock leg's fail-safe is deliberately NOT mirrored
+      here — normalising that PRODUCER is a 3563 follow-up (ticket
+      ``tkt_0RSGFS860E6VY37A7XH6S9FYCP``), and the "never partially composed"
+      rule holds for all three sources only once it lands.
     * PLAN_LOCK — composed here from the lock's ``run_id``/``session_id``/
       ``owner_pid``, which ``TaskArtifacts.lock_plan`` records in the same
       process that stamps the DB claimant, making the two byte-identical for
@@ -149,13 +171,18 @@ class Claimant:
     A format mismatch is not proof the filer is dead; ``None`` (unknown) fails
     safe to pinning, a wrong-but-well-shaped identity does not.
 
-    ``session_id`` carries the RAW id only when the source knows it directly —
-    i.e. PLAN_LOCK.  It stays ``None`` for DB on purpose: ``shared.task_claimant``
-    ships a composer and DELIBERATELY no parser (the identity is compared whole,
-    never decomposed), so this resolver must not split a composed identity to
-    back-fill it.  Defaulted so every existing construction site keeps working —
-    the same additive-widening pattern task 3533 used on :class:`EscalationRef`.
-    It MUST stay last: ``run_id``/``heartbeat_at``/``source`` have no defaults.
+    ``session_id`` is DIAGNOSTIC SURFACE, not a contract to build on: NO
+    production consumer reads it (nor ``run_id`` — every production read of a
+    :class:`Claimant` is a presence check or a ``.source`` check), and
+    ``escalation.pins`` compares ``run_id`` only.  It exists solely so that
+    re-shaping ``run_id`` does not silently DELETE the raw id the PLAN_LOCK
+    source used to expose; a future consumer should justify itself rather than
+    assume this field is load-bearing.  It carries the raw id only where the
+    source knows it directly (PLAN_LOCK), staying ``None`` for DB because
+    ``shared.task_claimant`` ships no parser — this resolver must not split a
+    composed identity to back-fill it.  Defaulted (like task 3533's
+    :class:`EscalationRef` widening) and last, since ``run_id``/``heartbeat_at``/
+    ``source`` have no defaults.
     """
 
     run_id: str | None
@@ -487,7 +514,10 @@ class TaskGroundTruth:
            lock's own run_id/session_id/owner_pid, or left ``None`` when any
            component is missing or malformed — see the :class:`Claimant`
            docstring for why a partial composition is never acceptable
-           (task 3563).
+           (task 3563).  That composition is INERT on a real orchestrator run
+           today: this leg reads the legacy lock path, which the production
+           writer no longer targets (see the PATH GAP comment at the read
+           site below, task 4262).
 
         A present-but-stale db claimant (``is_stranded`` True) collapses
         straight to ``None`` — it deliberately does NOT fall through to the
@@ -528,6 +558,18 @@ class TaskGroundTruth:
                 source=ClaimantSource.DB,
             )
 
+        # PATH GAP — task 4262, deliberately NOT fixed by task 3563 (which
+        # normalises the identity SHAPE, not where the lock is looked up).
+        # No ``meta_root`` here, so this reads the LEGACY
+        # ``<worktree>/.task/plan.lock``, while the production writer
+        # (``TaskWorkflow``, workflow.py:2384-2385) targets the ``.task-meta``
+        # SIBLING and nothing bridges the two: ``ensure_lane_plan_symlink``
+        # (artifacts.py:354-386) relocates plan.json ONLY, and ``_read_path``
+        # has no new-then-old fallback (unlike ``Harness._resolve_recovery_
+        # artifact``). So on a real run this finds at most a PRE-3563 legacy
+        # lock, carrying no ``run_id``, and the composition below resolves to
+        # the fail-safe ``None``. Task 4028 tracks deleting this leg outright
+        # if that is the ruling instead of relocating the read.
         try:
             lock_data = TaskArtifacts(worktree_path).read_plan_lock()
         except (ValueError, OSError):

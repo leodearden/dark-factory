@@ -2292,6 +2292,19 @@ class TaskWorkflow:
         # PRD task-status-authority C4/D4 (task 2188, omega1): stamp the
         # claimant atomically with the dispatch status write, so there is no
         # window where the task is in-progress with no live claimant.
+        #
+        # KNOWN HAZARD, unfixed here (ticket tkt_0RSGFS860E6VY37A7XH6S9FYCP,
+        # a task 3563 follow-up): `or ''` means a HARNESS-LESS workflow
+        # (`_process_run_id is None` — tests/evals, see the field comment at
+        # its declaration) stamps the PARTIAL identity '/{session_id}/pid={pid}'.
+        # That string carries the '/pid=' marker, so it passes
+        # escalation.pins._norm_id's shape guard and is then compared whole
+        # against filing identities as if it were KNOWN. The plan.lock writer
+        # below deliberately does the OPPOSITE — it omits the key entirely when
+        # the run id is unknown, so TaskGroundTruth resolves a fail-safe None
+        # (see the lock_plan call site and the Claimant docstring). Normalising
+        # THIS side is the follow-up's job; do not "fix" it by changing the
+        # plan.lock side to match.
         await self.scheduler.set_task_status(
             self.task_id, 'in-progress',
             claimant_run_id=compose_claimant_run_id(
