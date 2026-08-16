@@ -1919,7 +1919,9 @@ def _cli_rows(population=None) -> list[list[object]]:
     ]
 
 
-def _run_cli(monkeypatch, *argv, rows=None, double=None) -> tuple[int, _StubReaderFactory]:
+def _run_cli(
+    monkeypatch, *argv, rows=None, double=None, entry=None
+) -> tuple[int, _StubReaderFactory]:
     """Drive ``main()`` in-process against the offline double.
 
     Precedent: ``_run_cli`` in test_memory_eval_transcript_corpus.py. Returns
@@ -1929,12 +1931,22 @@ def _run_cli(monkeypatch, *argv, rows=None, double=None) -> tuple[int, _StubRead
     *rows* is the ordinary path: a store that answers. *double* substitutes the
     graph handle outright, for a store that does not — see
     ``_UnreachableDouble``.
+
+    *entry* selects which layer to drive. The default, ``None``, means
+    ``main(argv)`` — the seam every other CLI test in this module goes through,
+    left byte-for-byte unchanged. Pass ``_mod._cli`` to drive the
+    process-boundary wrapper instead; it takes NO argv, because the ``__main__``
+    guard calls it bare, so *argv* is installed on ``sys.argv`` the way a real
+    invocation supplies it rather than handed over as a parameter.
     """
     if double is None:
         double = _FalkorDouble(rows if rows is not None else _cli_rows())
     factory = _StubReaderFactory(double)
     monkeypatch.setattr(_mod, 'EpisodeReader', factory)
-    return _mod.main(list(argv)), factory
+    if entry is None:
+        return _mod.main(list(argv)), factory
+    monkeypatch.setattr(sys, 'argv', ['build_corpus.py', *argv])
+    return entry(), factory
 
 
 class TestCliFlagSurface:
@@ -2527,6 +2539,92 @@ class TestBrokenPipeIsARunFailureNotATraceback:
             sys.stdout = original_stdout
         assert code == _mod.EXIT_RUN_FAILED
         pipe_stdout.close()
+
+
+class TestAShortBufferedWriteIntoAClosedPipeIsAlsoARunFailure:
+    """The task's headline shape — ``--verify | head`` — which the class above cannot see.
+
+    A closed stdout pipe fails in two measurably different ways, and the
+    difference is buffering:
+
+    * REGIME A, in-band. The write exceeds stdout's 8 KiB buffer, so ``print``
+      flushes, the ``write()`` fails, and ``BrokenPipeError`` is raised inside
+      ``main()``'s ``try`` where the existing handler catches it. That is what
+      ``TestBrokenPipeIsARunFailureNotATraceback`` pins — deliberately, by
+      opening its pipe with ``buffering=1`` so every print does a real
+      ``write()``.
+    * REGIME B, deferred — this class. The write is SHORT and stays in the
+      buffer, so nothing is raised during the run at all: ``main()`` returns
+      its ordinary verdict code and the failure only surfaces when the
+      interpreter flushes ``sys.stdout`` during finalization, printing
+      "Exception ignored on flushing sys.stdout: BrokenPipeError" and forcing
+      exit status 120. No ``except`` anywhere can reach that point.
+
+    ``--verify`` lands squarely in regime B: :func:`_emit_verdict` emits ONE
+    short ``verify: ok — ...`` line, far under the buffer. So the pipe here is
+    opened with DEFAULT block buffering — the absence of ``buffering=1`` is the
+    whole point, not an oversight — and the entry point under test is
+    ``_cli()``, the process boundary that flushes stdout explicitly while a
+    handler is still on the stack.
+    """
+
+    def _built_manifest(self, monkeypatch, tmp_path) -> Path:
+        out = tmp_path / 'corpus_manifest.json'
+        _run_cli(monkeypatch, '--n', '20', '--seed', 's', '--out', str(out))
+        return out
+
+    def test_a_short_verdict_into_a_closed_pipe_exits_run_failed(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """Not the verdict's own code: the run never reached its reader.
+
+        Without the explicit flush this returns 0 — a clean "verify: ok" the
+        caller never received — and the process then dies at 120 with shutdown
+        noise. Both outcomes lie about what happened.
+        """
+        out = self._built_manifest(monkeypatch, tmp_path)
+        read_fd, write_fd = os.pipe()
+        os.close(read_fd)  # the reader is already gone, like `head` after its window
+        # DEFAULT block buffering — no buffering=1. The one short verdict line
+        # stays in the buffer, so nothing fails in-band and only an explicit
+        # flush can surface it.
+        pipe_stdout = os.fdopen(write_fd, 'w')
+        original_stdout = sys.stdout
+        monkeypatch.setattr(sys, 'stdout', pipe_stdout)
+        capsys.readouterr()
+        try:
+            code, _ = _run_cli(
+                monkeypatch, '--verify', '--out', str(out), entry=_mod._cli
+            )
+        finally:
+            sys.stdout = original_stdout
+
+        assert code == _mod.EXIT_RUN_FAILED
+
+        # One line, the same `error: ` shape every other failure in this CLI
+        # prints — not a traceback, and not the "Exception ignored" noise.
+        err_lines = [line for line in capsys.readouterr().err.splitlines() if line.strip()]
+        assert len(err_lines) == 1
+        assert err_lines[0].startswith('error: ')
+
+        # Stands in for the interpreter's shutdown flush, which is where this
+        # regime's failure would otherwise land: it must not raise, which is
+        # what pins the dup2-to-devnull rather than just the catch.
+        pipe_stdout.close()
+
+    def test_a_healthy_stdout_still_returns_the_ordinary_verdict_code(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """CONTROL: the wrapper is a pass-through, not a swallow.
+
+        A fix that returned EXIT_RUN_FAILED unconditionally, or that ate the
+        verdict line, would satisfy the test above and be caught here.
+        """
+        out = self._built_manifest(monkeypatch, tmp_path)
+        capsys.readouterr()
+        code, _ = _run_cli(monkeypatch, '--verify', '--out', str(out), entry=_mod._cli)
+        assert code == 0
+        assert 'ok' in capsys.readouterr().out.lower()
 
 
 class TestBuilderScriptSatisfiesTheDeliveredCheck:
