@@ -202,3 +202,46 @@ def detect_mispairing(decision: object, rationale: object) -> MispairingHit | No
         return None
     marker, field = pairing
     return MispairingHit(header=header, marker=marker, field=field)
+
+
+#: The plan key holding the entries this module walks. Named once so the walker
+#: and the scanner script cannot drift on where decisions live.
+DESIGN_DECISIONS_KEY = 'design_decisions'
+
+
+def scan_design_decisions(plan: object) -> list[MispairingHit]:
+    """Every self-documented mis-pairing in *plan*, in ascending index order.
+
+    READ-ONLY BY CONSTRUCTION: it never assigns into *plan* or into any nested
+    item, and returns a fresh list each call. The scanner hands this live plan
+    documents that a running task may be reading, so a walker that normalized a
+    field in passing would be mutating runtime state.
+
+    TOTAL for adversarial shapes, mirroring
+    ``orchestrator.mcp.plan_tools._walk_repairable``'s guard set so the two
+    walkers agree on what an adversarial plan means: a non-dict *plan*, a
+    missing or non-list ``design_decisions``, a non-dict item, and an absent or
+    non-``str`` field are all skipped rather than raising. *plan* is whatever
+    ``json.loads`` returned from a plan file, so its top-level shape is as
+    untrusted as its entries.
+
+    A skipped item still CONSUMES its index: a reported index always addresses
+    the entry a reader will find at that position in the file.
+
+    Every accept/reject decision DELEGATES to :func:`detect_mispairing` rather
+    than re-implementing the predicate, so the walker and the entry predicate
+    can never disagree about what counts (INV-5).
+    """
+    if not isinstance(plan, dict):
+        return []
+    entries = plan.get(DESIGN_DECISIONS_KEY)
+    if not isinstance(entries, list):
+        return []
+    hits: list[MispairingHit] = []
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            continue
+        hit = detect_mispairing(entry.get('decision'), entry.get('rationale'))
+        if hit is not None:
+            hits.append(hit._replace(index=index))
+    return hits
