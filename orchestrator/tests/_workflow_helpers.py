@@ -1166,6 +1166,23 @@ def _build_workflow_with_escalation(
 # ---------------------------------------------------------------------------
 
 
+def _unguarded_sibling_pair(lock_depth: int) -> tuple[str, str]:
+    """The raw path construction behind `same_module_siblings`, WITHOUT its guard.
+
+    Split out so the sub-1 boundary test can demonstrate the silent failure the
+    guard prevents by driving the REAL construction, not a copy of it.  A copy
+    would keep asserting today's shape if this scheme ever changed (different
+    prefix, absolute paths, a suffix other than ``e.py``/``f.py``) and the
+    demonstration would drift SILENTLY — the empty-set assertions hold for any
+    empty-prefix pair, so nothing would go red.
+
+    ``range`` is empty at every rejected depth (0 and below), so the package
+    prefix there is ``''`` and the pair is ``/e.py`` / ``/f.py``.
+    """
+    package = '/'.join(f'p{i}' for i in range(lock_depth))
+    return f'{package}/e.py', f'{package}/f.py'
+
+
 def same_module_siblings(lock_depth: int) -> tuple[str, str]:
     """Two DISTINCT file paths guaranteed to share a module at *lock_depth*.
 
@@ -1212,7 +1229,9 @@ def same_module_siblings(lock_depth: int) -> tuple[str, str]:
 
     CONTRACT TEST — ``TestSameModuleSiblings`` in ``test_workflow_helpers.py``
     (this module's own smoke-test suite) pins every guarantee above across
-    depths [1, 2, 3, 4, 12, 20] plus the sub-1 boundary.  It previously lived
+    depths [1, 2, 3, 4, 12, 20] plus the sub-1 boundary, driving that boundary
+    case through ``_unguarded_sibling_pair`` so its silent-failure
+    demonstration cannot drift from the construction below.  It previously lived
     in the consumer suite ``test_workflow_status_on_resume.py`` — task 3866
     held no lock on this file, so it left the class behind as a scope-only
     remedy; task 3903 relocated it here once that file was in scope.  If you
@@ -1228,8 +1247,7 @@ def same_module_siblings(lock_depth: int) -> tuple[str, str]:
             'precondition would then pass VACUOUSLY on two empty sets while '
             'the workflow under test holds no module lock at all.'
         )
-    package = '/'.join(f'p{i}' for i in range(lock_depth))
-    return f'{package}/e.py', f'{package}/f.py'
+    return _unguarded_sibling_pair(lock_depth)
 
 
 # ---------------------------------------------------------------------------

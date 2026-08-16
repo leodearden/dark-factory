@@ -1,9 +1,15 @@
-"""Smoke tests for the _workflow_helpers module.
+"""Smoke tests for the _workflow_helpers module, plus its helpers' contract suites.
 
 Verifies that FakeScheduler, FakeMcp, and FakeBriefing behave as expected.
 Import-contract verification for _make_resolving_steward and
 _make_status_setting_steward relies on indirect coverage from
 test_workflow_e2e.py and test_workflow_status_on_resume.py.
+
+Beyond those smoke checks this file also owns the behavioural CONTRACT tests
+for helpers _workflow_helpers defines — today `TestSameModuleSiblings`, which
+pins `same_module_siblings` across every plausible lock_depth (relocated here
+from the consumer suite test_workflow_status_on_resume.py by task 3903 so the
+contract sits beside the helper it guards).
 """
 
 from __future__ import annotations
@@ -280,7 +286,10 @@ class TestSameModuleSiblings:
         `OrchestratorConfig.lock_depth` carries no `ge=1` constraint, so a
         caller forwarding `config.lock_depth` can genuinely reach this input.
         """
-        from _workflow_helpers import same_module_siblings  # noqa: PLC0415
+        from _workflow_helpers import (  # noqa: PLC0415
+            _unguarded_sibling_pair,
+            same_module_siblings,
+        )
 
         from orchestrator.scheduler import files_to_modules  # noqa: PLC0415
 
@@ -293,8 +302,14 @@ class TestSameModuleSiblings:
         # DROPS them, and the same-module precondition the callers assert
         # degenerates to [] == [] — passing VACUOUSLY while the workflow under
         # test holds no module lock at all.
-        package = '/'.join(f'p{i}' for i in range(max(lock_depth, 0)))
-        f1, f2 = f'{package}/e.py', f'{package}/f.py'
+        #
+        # Driven through the REAL construction (`_unguarded_sibling_pair`, the
+        # body `same_module_siblings` runs once past its guard) rather than a
+        # literal pair: the assertions below hold for ANY empty-prefix pair, so
+        # a hand-written copy would keep passing — and stop demonstrating what
+        # the guarded constructor would actually have produced — if the path
+        # scheme ever changed.
+        f1, f2 = _unguarded_sibling_pair(lock_depth)
         assert files_to_modules([f1, f2], lock_depth) == [], (
             f'expected the unguarded pair at lock_depth={lock_depth} to yield NO '
             f'modules; got {files_to_modules([f1, f2], lock_depth)!r}. If this '
