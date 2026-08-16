@@ -1577,6 +1577,22 @@ like MEMORY_CONTEXT_CAVEAT: these are inlined string literals in
 ``_get_memory_context``'s body, not a module-level constant."""
 
 
+def _resume_and_context_block_records():
+    """The confusion-census sighting shape (session b976febe), minus its
+    one genuine correction: a turn-0 lone '# Context' memory block,
+    followed by the usage-limit resume prompt at two separate later
+    turns, and nothing else -- no tool_use/tool_result/assistant record
+    at all, so every one of the five signal detectors reports zero hits
+    regardless of the R1 exclusion filter. Used to pin that once R1
+    excludes all three turns, a session like this no longer presents as
+    gold-bearing."""
+    return [
+        _with_session_meta(_user_text(_memory_context_block())),
+        _with_session_meta(_user_text(CAP_HIT_RESUME_PROMPT)),
+        _with_session_meta(_user_text(CAP_HIT_RESUME_PROMPT)),
+    ]
+
+
 class TestHarnessInjectedTurnFilter:
     def test_briefing_shaped_turn_is_excluded_by_content(self):
         records = [_user_text(_briefing_text())]
@@ -1856,6 +1872,81 @@ class TestHarnessInjectedTurnFilter:
         records = [_user_text(text)]
 
         assert mod.iter_user_turns(records) == []
+
+    def test_render_digest_zero_signal_session_has_no_gold_section(self):
+        # Acceptance test at the render_digest level, reproducing the
+        # sighting verbatim (session b976febe) minus its one genuine
+        # correction: a zero-signal session that used to present as
+        # gold-bearing (3 harness-injected turns, all five signal_counts
+        # 0) must no longer do so once R1's exclusion covers all three
+        # shapes.
+        records = _resume_and_context_block_records()
+
+        digest = mod.render_digest(records, agent_class='interactive')
+
+        frontmatter_yaml, body = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert meta['signal_counts'] == {
+            'tool_error': 0, 'self_correct': 0, 'not_found': 0,
+            'df_guard': 0, 'interrupt': 0,
+        }
+        assert '## User Corrections' not in digest
+        # n_user_turns inflation is gone: score_signals(all-zero counts, 0).
+        assert meta['score'] == 0.0
+        assert 'previous run was interrupted' not in body
+        assert '# Context' not in body
+
+    def test_render_digest_retains_only_genuine_correction_alongside_excluded_turns(self):
+        # Non-regression half of the acceptance test: a genuine human
+        # correction added to the same zero-signal session must still
+        # surface, and ONLY it -- the excluded turns contribute nothing to
+        # either the gold section or the score.
+        records = _resume_and_context_block_records() + [
+            _with_session_meta(_user_text('This is wrong, please redo it.')),
+        ]
+
+        digest = mod.render_digest(records, agent_class='interactive')
+
+        frontmatter_yaml, body = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert '## User Corrections' in digest
+        correction_lines = [line for line in body.splitlines() if line.startswith('- (turn')]
+        assert correction_lines == ['- (turn 3) This is wrong, please redo it.']
+        assert 'previous run was interrupted' not in body
+        assert '# Context' not in body
+        assert meta['score'] == mod.score_signals(meta['signal_counts'], 1)
+
+    def test_signal_counts_unaffected_by_resume_and_context_block_turns(self):
+        # Mirrors test_signal_counts_unaffected_by_signal_free_briefing_turn,
+        # but for the two NEW exclusion arms this task adds (resume prompt,
+        # lone context block): prepending both to a records list that
+        # already trips every detector must not perturb any of the five
+        # signal_counts -- the filter must not leak into
+        # _signal_text_sources.
+        base = _all_signals_records()
+        augmented = [
+            _user_text(CAP_HIT_RESUME_PROMPT),
+            _user_text(_memory_context_block()),
+        ] + base
+
+        assert mod.signal_counts(augmented) == mod.signal_counts(base)
+
+    def test_classify_agent_class_still_detects_markers_inside_resume_turn(self):
+        # Sibling of test_classify_agent_class_still_detects_markers_inside_
+        # excluded_turn, for the resume-prompt exclusion arm specifically:
+        # classify_agent_class reads _signal_text_sources, a carrier never
+        # filtered by iter_user_turns, so orchestrated-task markers living
+        # inside an otherwise-excluded resume turn must still be found.
+        text = (
+            CAP_HIT_RESUME_PROMPT
+            + '\nTask ID: 4275\nWorktree: /home/leo/src/dark-factory/.worktrees/4275\n'
+        )
+        records = [_user_text(text)]
+
+        assert mod.iter_user_turns(records) == []
+        assert mod.classify_agent_class(records) == 'orchestrated-task'
 
 
 class TestRenderDigest:
