@@ -120,13 +120,25 @@ def pytest_configure(config):
 # for every file in this directory, whereas `from conftest import ...` is
 # fragile under the repo-wide `--import-mode=importlib` addopts.
 #
-# The teardown semantics below are COPIED VERBATIM from
-# `test_capability_guard_http.py`'s `http_server` fixture rather than
-# re-derived: task 2741 exists precisely because getting them wrong leaks a
-# daemon thread and crashes anyio's shielded lifespan cleanup at GC time.
-# That module is deliberately NOT refactored onto this fixture here — its
-# fixture is module-scoped with tuned teardown, and converting it is a
-# separate, riskier change.
+# This is the SINGLE home of the escalation HTTP test harness. Task 3736 folded
+# the last two module-local copies into it (`test_capability_guard_http.py` and
+# `test_status_authority_gate.py`, whose `http_server` fixtures are now thin
+# scope/shape adapters over the factory below); `test_legibility_census_
+# escalation_e2e.py` already drove it. There is no other copy to keep in
+# lockstep — which is the point, per INV-5.
+#
+# Two properties below are load-bearing and must not be softened:
+#
+# * The teardown semantics (`stopping` flag, `_drain_pending_tasks`, bounded
+#   5s join with hung threads collected then asserted). Task 2741 exists
+#   precisely because getting them wrong leaks a daemon thread and crashes
+#   anyio's shielded lifespan cleanup at GC time.
+# * Readiness is an MCP handshake, not a TCP connect (`_mcp_handshake_ready`),
+#   and any startup failure is captured as BaseException — reasoning inherited
+#   from the hardened `test_status_authority_gate.py` variant when task 3736
+#   deduped these copies by UNION rather than by intersection.
+#
+# Both are pinned by tests in `test_serve_escalation_mcp_fixture.py`.
 
 
 def _free_escalation_port() -> int:
@@ -233,14 +245,13 @@ def serve_escalation_mcp():
     the precise failure mode task 3644 exists to close.  Pass an explicit
     ``dedupe_config=`` to opt back in when dedupe is the thing under test.
 
-    Teardown is explicit and mirrors ``test_capability_guard_http.py``
-    (task 2741): the event loop is created in the fixture body (NOT inside the
-    thread target) so it can be stopped thread-safely; a ``stopping`` flag
-    distinguishes the deliberate stop-induced ``RuntimeError`` from a genuine
-    startup failure; ``_drain_pending_tasks`` cancels+gathers inside the
-    serving thread before ``loop.close()``; and the join is bounded at 5s with
-    an assert, so a hang surfaces loudly instead of silently leaking a daemon
-    thread past this fixture.
+    Teardown is explicit (task 2741): the event loop is created in the fixture
+    body (NOT inside the thread target) so it can be stopped thread-safely; a
+    ``stopping`` flag distinguishes the deliberate stop-induced
+    ``RuntimeError`` from a genuine startup failure; ``_drain_pending_tasks``
+    cancels+gathers inside the serving thread before ``loop.close()``; and the
+    join is bounded at 5s with an assert, so a hang surfaces loudly instead of
+    silently leaking a daemon thread past this fixture.
 
     Two teardown details are load-bearing (review finding #7, task 3644):
     the ``loop.stop`` is suppressed on ``RuntimeError`` because a server thread
