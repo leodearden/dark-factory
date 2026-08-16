@@ -731,3 +731,151 @@ def test_config_helpers_round_trip_through_find_config_and_escalation_port(
     other.mkdir()
     _write_config(other, "dark-factory-orchestrator.yaml", _config_body(8101, decoy_first=True))
     assert fep.escalation_port(fep.find_config(other)) == 8101
+
+
+# ---------------------------------------------------------------------------
+# escalation_port — top-level block slicing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("decoy_first", [False, True], ids=["decoy-after", "decoy-before"])
+def test_only_the_escalation_blocks_port_is_returned(
+    fep: types.ModuleType, tmp_path: pathlib.Path, decoy_first: bool
+) -> None:
+    """A ``port:`` in a DIFFERENT top-level block is never returned — in BOTH orders.
+
+    This is the parse that decides whether a project's claimed port is seen at all,
+    and reading the wrong block is worse than reading none: the survey would record a
+    port the project does not actually hold, leave the real one looking free, and hand
+    it to a second project.
+
+    Both orders are asserted because they pin different code:
+      - decoy AFTER pins the ``break`` on the next column-0 key;
+      - decoy BEFORE pins that collection only STARTS at the ``escalation:`` line.
+    A parser broken in one direction can look correct in the other, and a
+    same-valued decoy would hide both — hence 8100 vs 9999.
+
+    MEASURED RED at base ``fc6f048b55``, scratch mutation reverted before commit:
+    searching the whole file instead of the sliced block (``PORT_RE.search(text)``) —
+    RED on the decoy-before case, where the decoy is the first ``port:`` in the file::
+
+        E  AssertionError: assert 9999 == 8100
+
+    The decoy-AFTER case stayed green under that same mutation, which is exactly why
+    both orders are asserted: whole-file search happens to return the right answer
+    when the escalation block comes first. The mutation also reddened
+    ``test_config_helpers_round_trip_through_find_config_and_escalation_port``
+    (``assert 9999 == 8101``, its decoy-first half) — the fixture verifier catching
+    the same defect independently.
+    """
+    root = tmp_path / "proj"
+    root.mkdir()
+    cfg = _write_config(
+        root, "dark-factory-orchestrator.yaml", _config_body(8100, 9999, decoy_first=decoy_first)
+    )
+
+    assert fep.escalation_port(cfg) == 8100
+
+
+def test_comments_and_blank_lines_do_not_terminate_the_block(
+    fep: types.ModuleType, tmp_path: pathlib.Path
+) -> None:
+    """An indented comment, a blank line, and a COLUMN-0 comment all keep the block open.
+
+    The column-0 comment is the interesting one: the break condition is
+    ``ln and not ln[0].isspace() and not ln.lstrip().startswith("#")``, so the
+    ``#``-carve-out exists precisely so a commented-out key sitting between
+    ``escalation:`` and its ``port:`` does not silently truncate the block and hide
+    the project's claim. A blank line survives via the leading ``ln and`` guard.
+
+    MEASURED RED at base ``fc6f048b55``, scratch mutation reverted before commit:
+    dropping the ``and not ln.lstrip().startswith("#")`` carve-out — RED::
+
+        E  AssertionError: a column-0 comment truncated the block
+        E  assert None == 8100
+    """
+    root = tmp_path / "proj"
+    root.mkdir()
+    cfg = _write_config(
+        root,
+        "dark-factory-orchestrator.yaml",
+        "escalation:\n"
+        "  host: 127.0.0.1\n"
+        "  # an indented comment\n"
+        "\n"
+        "# a column-0 comment — NOT a new top-level key\n"
+        "  port: 8100\n"
+        "dashboard:\n"
+        "  port: 9999\n",
+    )
+
+    assert fep.escalation_port(cfg) == 8100, "a column-0 comment truncated the block"
+
+
+def test_first_port_in_the_block_wins(fep: types.ModuleType, tmp_path: pathlib.Path) -> None:
+    """With two ``port:`` lines in the block, the FIRST is returned.
+
+    ``PORT_RE.search`` semantics, pinned as OBSERVED behaviour rather than endorsed
+    design — a config with two escalation ports is malformed either way, and this
+    records which one the survey would believe if one ever appeared.
+    """
+    root = tmp_path / "proj"
+    root.mkdir()
+    cfg = _write_config(
+        root,
+        "dark-factory-orchestrator.yaml",
+        "escalation:\n  host: 127.0.0.1\n  port: 8100\n  port: 8200\n",
+    )
+
+    assert fep.escalation_port(cfg) == 8100
+
+
+@pytest.mark.parametrize(
+    ("body", "why"),
+    [
+        pytest.param("dashboard:\n  port: 9999\n", "no escalation: block at all", id="no-block"),
+        pytest.param("escalation:\n  host: 127.0.0.1\n", "block with no port:", id="no-port"),
+        pytest.param("", "empty file", id="empty"),
+    ],
+)
+def test_configs_without_an_escalation_port_return_none(
+    fep: types.ModuleType, tmp_path: pathlib.Path, body: str, why: str
+) -> None:
+    """None means "claims nothing", which main() folds into the survey as no claim.
+
+    Distinct from the error paths below only in cause, not in effect — but both must
+    be None rather than a crash or a zero, because ``used[port]`` would otherwise
+    record a phantom claim on port 0.
+    """
+    root = tmp_path / "proj"
+    root.mkdir()
+    cfg = _write_config(root, "dark-factory-orchestrator.yaml", body)
+
+    assert fep.escalation_port(cfg) is None, why
+
+
+def test_unreadable_paths_return_none_instead_of_crashing_the_survey(
+    fep: types.ModuleType, tmp_path: pathlib.Path
+) -> None:
+    """The bare ``except Exception`` around ``read_text`` — one malformed project must
+    not take down the whole survey.
+
+    main() calls this for EVERY discovered root, so an unreadable path here is the
+    difference between "that project is skipped" and "factory-init crashes on a box
+    with one odd sibling directory". Both realistic causes are covered: a path that
+    does not exist (FileNotFoundError) and a path that is a directory
+    (IsADirectoryError).
+
+    MEASURED RED at base ``fc6f048b55``, scratch mutation reverted before commit:
+    removing the ``try/except Exception`` around ``read_text`` — RED, and note it
+    fails as an ERROR escaping the function rather than as a wrong value, which is
+    the crash this guard prevents::
+
+        E  FileNotFoundError: [Errno 2] No such file or directory:
+        E    '.../test_unreadable_paths_return_n0/nope/missing.yaml'
+    """
+    assert fep.escalation_port(tmp_path / "nope" / "missing.yaml") is None
+
+    a_dir = tmp_path / "dark-factory-orchestrator.yaml"
+    a_dir.mkdir()
+    assert fep.escalation_port(a_dir) is None
