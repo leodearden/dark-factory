@@ -1123,6 +1123,207 @@ class TestTopicSlugConformance:
             assert 'live_re_measurement' not in entry
 
 
+class _FakeEntry:
+    """Minimal stand-in for the probe's RegistryEntry (topic + project_id)."""
+
+    def __init__(self, topic: str, project_id: str):
+        self.topic = topic
+        self.project_id = project_id
+
+
+class _FakeRegistry:
+    def __init__(self, entries):
+        self.entries = entries
+
+
+class TestRegistryCoverageGauge:
+    """The TARGET: every committed registry topic carries exactly one canonical.
+
+    A corpus-wide stamping percentage over 49.6k records has no owner and no
+    bounded worklist.  The committed 32-entry registry is a bounded, named,
+    checkable set -- and it is precisely the set E1's retrieval-health run
+    scores 32/32 failing.
+
+    NOT a duplicate of E1's METRIC_TOPIC_CANONICAL_PRESENT (INV-5): that one
+    is computed from _tripwire_items(observations, TRIPWIRE_K) -- from SEARCH
+    observations -- so it cannot distinguish "the canonical does not exist"
+    from "it exists but ranks below K".  Only a deterministic metadata count
+    can establish the former, which is this task's central claim.
+    """
+
+    @staticmethod
+    def _report(cells, registry, **kwargs):
+        cov = {
+            pid: _coverage(
+                f'fused_{pid}',
+                sum(c.records for c in cats.values()),
+                {cat: (c.records, c.records) for cat, c in cats.items()},
+            )
+            for pid, cats in cells.items()
+        }
+        return _mod.build_report(cells, cov, top_n=50, registry=registry, **kwargs)
+
+    def test_loader_is_the_probes_pinned_by_identity(self):
+        # Imported through the same _load_probe_module importlib idiom
+        # retro_stamp_topics.py:149,189 already established, so the schema
+        # check, the zero-entry rejection and the RegistryError type stay
+        # single-homed rather than re-parsed here.
+        import importlib.util as _ilu
+        import sys as _sys
+        from pathlib import Path as _Path
+
+        probe_path = _Path(_mod.__file__).parent / 'memory_eval_retrieval_probe.py'
+        cached = _sys.modules.get('memory_eval_retrieval_probe')
+        if cached is None:
+            spec = _ilu.spec_from_file_location('memory_eval_retrieval_probe', probe_path)
+            cached = _ilu.module_from_spec(spec)
+            _sys.modules['memory_eval_retrieval_probe'] = cached
+            spec.loader.exec_module(cached)
+        assert _mod.load_topic_registry is cached.load_topic_registry
+
+    def test_default_registry_path_is_the_committed_fixture(self):
+        assert _mod.DEFAULT_REGISTRY_PATH.endswith(
+            'tests/fixtures/memory_eval_topic_registry.json',
+        )
+        assert Path(_mod.DEFAULT_REGISTRY_PATH).is_file()
+
+    def test_per_topic_record_and_canonical_counts(self):
+        cells = {
+            'dark_factory': {
+                OBS: _census([
+                    {'topic': 'alpha', 'canonical': True},
+                    {'topic': 'alpha'},
+                    {'topic': 'alpha'},
+                    {'topic': 'beta'},
+                ]),
+            },
+        }
+        registry = _FakeRegistry([
+            _FakeEntry('alpha', 'dark_factory'),
+            _FakeEntry('beta', 'dark_factory'),
+            _FakeEntry('gamma', 'dark_factory'),
+        ])
+        block = self._report(cells, registry)['registry_coverage']
+        rows = {r['topic']: r for r in block['topics']}
+        assert rows['alpha']['records'] == 3
+        assert rows['alpha']['canonical_count'] == 1
+        assert rows['beta']['records'] == 1
+        assert rows['beta']['canonical_count'] == 0
+        # Absent from the corpus entirely -- measured zero, not omitted.
+        assert rows['gamma']['records'] == 0
+        assert rows['gamma']['canonical_count'] == 0
+
+    def test_rollup_partitions_the_registry(self):
+        cells = {
+            'dark_factory': {
+                OBS: _census([
+                    {'topic': 'one', 'canonical': True},
+                    {'topic': 'many', 'canonical': True},
+                    {'topic': 'many', 'canonical': True},
+                    {'topic': 'zero'},
+                ]),
+            },
+        }
+        registry = _FakeRegistry([
+            _FakeEntry(t, 'dark_factory') for t in ('one', 'many', 'zero', 'absent')
+        ])
+        block = self._report(cells, registry)['registry_coverage']
+        assert block['registry_topics_total'] == 4
+        assert block['registry_topics_with_exactly_one_canonical'] == 1
+        assert block['registry_topics_with_zero_canonical'] == 2
+        assert block['registry_topics_with_multiple_canonical'] == 1
+
+    def test_zero_canonical_topics_are_named_as_the_worklist(self):
+        cells = {
+            'dark_factory': {
+                OBS: _census([{'topic': 'has-one', 'canonical': True}, {'topic': 'bare'}]),
+            },
+        }
+        registry = _FakeRegistry([
+            _FakeEntry('has-one', 'dark_factory'),
+            _FakeEntry('bare', 'dark_factory'),
+            _FakeEntry('missing', 'dark_factory'),
+        ])
+        block = self._report(cells, registry)['registry_coverage']
+        # The actionable list -- exactly what 3201's retro sweep would stamp.
+        assert [r['topic'] for r in block['zero_canonical_topics']] == [
+            'bare', 'missing',
+        ]
+
+    def test_registry_is_matched_within_its_own_project_not_globally(self):
+        # A canonical stamped in reify does NOT discharge a dark_factory
+        # registry entry: 3198's invariant is per-(project, topic), and a
+        # global match would report the target met while the dark_factory
+        # corpus stayed bare.
+        cells = {
+            'dark_factory': {OBS: _census([{'topic': 'shared'}])},
+            'reify': {OBS: _census([{'topic': 'shared', 'canonical': True}])},
+        }
+        registry = _FakeRegistry([_FakeEntry('shared', 'dark_factory')])
+        block = self._report(cells, registry)['registry_coverage']
+        assert block['registry_topics_with_zero_canonical'] == 1
+        assert block['registry_topics_with_exactly_one_canonical'] == 0
+
+    def test_an_entry_for_an_uncensused_project_is_measured_as_zero(self):
+        cells = {'dark_factory': {OBS: _census([{'topic': 'a', 'canonical': True}])}}
+        registry = _FakeRegistry([
+            _FakeEntry('a', 'dark_factory'), _FakeEntry('b', 'reify'),
+        ])
+        block = self._report(cells, registry)['registry_coverage']
+        rows = {r['topic']: r for r in block['topics']}
+        assert rows['b']['records'] == 0
+        assert rows['b']['project_id'] == 'reify'
+        assert block['registry_topics_with_zero_canonical'] == 1
+
+    def test_rows_carry_their_project_and_are_deterministically_ordered(self):
+        cells = {'dark_factory': {OBS: _census([])}}
+        registry = _FakeRegistry([
+            _FakeEntry('zulu', 'reify'),
+            _FakeEntry('alpha', 'reify'),
+            _FakeEntry('mike', 'dark_factory'),
+        ])
+        block = self._report(cells, registry)['registry_coverage']
+        assert [(r['project_id'], r['topic']) for r in block['topics']] == [
+            ('dark_factory', 'mike'), ('reify', 'alpha'), ('reify', 'zulu'),
+        ]
+
+    def test_a_missing_registry_is_disclosed_not_silently_all_zero(self):
+        # A silent all-zero gauge reads as "measured, and everything is
+        # fine" -- indistinguishable from a real clean result. The whole
+        # point of the gauge is that its zero is meaningful.
+        cells = {'dark_factory': {OBS: _census([{'topic': 'a'}])}}
+        report = self._report(cells, None, registry_error='cannot read registry: nope')
+        assert report['registry_coverage'] is None
+        assert 'cannot read registry' in report['registry_error']
+
+    def test_a_zero_entry_registry_is_disclosed_as_an_error_not_a_perfect_score(self):
+        cells = {'dark_factory': {OBS: _census([{'topic': 'a'}])}}
+        report = self._report(cells, _FakeRegistry([]))
+        assert report['registry_coverage'] is None
+        assert report['registry_error']
+
+    def test_registry_error_is_absent_when_the_gauge_loaded(self):
+        cells = {'dark_factory': {OBS: _census([{'topic': 'a', 'canonical': True}])}}
+        report = self._report(cells, _FakeRegistry([_FakeEntry('a', 'dark_factory')]))
+        assert report['registry_error'] is None
+        assert report['registry_coverage']['registry_topics_total'] == 1
+
+    def test_gauge_is_json_serialisable_and_deterministic(self):
+        cells = {'dark_factory': {OBS: _census([{'topic': 'a', 'canonical': True}])}}
+        registry = _FakeRegistry([
+            _FakeEntry('a', 'dark_factory'), _FakeEntry('b', 'reify'),
+        ])
+        first = self._report(cells, registry)
+        second = self._report(cells, registry)
+        assert json.dumps(first) == json.dumps(second)
+
+    def test_the_committed_registry_still_holds_the_32_named_targets(self):
+        # The accountable set this task names as the TARGET. If the fixture
+        # grows or shrinks, the target moved and the docs must say so.
+        registry = _mod.load_topic_registry(_mod.DEFAULT_REGISTRY_PATH)
+        assert len(registry.entries) == 32
+
+
 class TestBuildReportDeterminism:
     """A re-run must produce a byte-identical artifact."""
 
