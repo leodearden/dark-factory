@@ -292,6 +292,89 @@ MEASURED_SUITE_WORST_SECS = 127.0
 MIN_MODULE_BUDGET_SECS = 300
 
 
+def test_min_module_budget_is_derived_from_the_measured_worst_run() -> None:
+    """The floor must be DERIVED from the measurement, in the family's canonical shape.
+
+    Task 3703, reviewer-flagged. This exact pair had already rotted once,
+    undetected: ``MEASURED_SUITE_WORST_SECS`` sat at 127.0 with a HAND-SET
+    ``MIN_MODULE_BUDGET_SECS = 300`` while ``tests/scripts/orchestrator.yaml``
+    had since recorded a 233.50s worst run of the VERBATIM command this module
+    declares — so the yaml's own worst figure was gated by NOTHING, and the two
+    sibling guards could only NAME the staleness in their comment blocks
+    (``test_scripts_module_config.py``'s ``MIN_MODULE_BUDGET_SECS`` comment and
+    ``test_module_verify_budgets.py``'s ``_min_budget`` docstring both call it
+    out verbatim) rather than fail on it. Deriving the floor is what turns that
+    from a documented observation into a property.
+
+    Three claims, each falsifiable on its own:
+
+    (i) The derivation is the FAMILY's expression, not a local variant. Checked
+        against the sibling's PUBLISHED pair — ``test_scripts_module_config.py``
+        holds ``MEASURED_SUITE_WORST_SECS = 930.59`` with
+        ``MIN_MODULE_BUDGET_SECS`` deriving to 1800 — so a divergent multiple,
+        or a round UP instead of DOWN, fails HERE rather than silently producing
+        a different-shaped floor in one of three sibling guards whose whole
+        point is that they cannot drift. That pair is QUOTED, not imported: a
+        test file importing a sibling test file couples two guards that must be
+        able to fail independently (the convention
+        ``test_module_verify_budgets.py``'s header states, and the reason
+        ``_min_budget`` is copied into each file rather than shared).
+
+    (ii) THIS file's pair is derived from THIS file's measurement, so the two
+        cannot silently diverge again — the precise rot described above.
+
+    (iii) The derivation is NON-DEGENERATE for this suite. ``_min_budget``
+        floors to the nearest 100s, so a cheap suite derives a floor of ZERO:
+        ``test_module_verify_budgets.py`` documents exactly that case for
+        sampler (``_min_budget(22.49) == 0``), where the corresponding budget
+        assertion becomes VACUOUSLY true. At this suite's measured cost it does
+        not degenerate, and this pins that — so assertion (b) of
+        ``test_tests_scripts_module_carries_its_own_tight_verify_budget`` below
+        is checking something real.
+    """
+    # The sibling's PUBLISHED pair, quoted from test_scripts_module_config.py
+    # (task 3458). See the docstring for why quoted and not imported.
+    sibling_worst = 930.59
+    sibling_floor = 1800
+
+    # (i) The family's canonical expression, pinned against the sibling's pair.
+    assert _min_budget(sibling_worst) == sibling_floor, (
+        f'_min_budget({sibling_worst}) == {_min_budget(sibling_worst)}, but the '
+        f'sibling guard tests/scripts/test_scripts_module_config.py publishes '
+        f'MEASURED_SUITE_WORST_SECS = {sibling_worst} / MIN_MODULE_BUDGET_SECS = '
+        f'{sibling_floor} for the SAME derivation (task 3703). These three '
+        'guards are one family precisely so their floors cannot take different '
+        'shapes; a different multiple, or rounding UP instead of DOWN to the '
+        'nearest 100s, is a divergence that must fail here rather than quietly '
+        'produce a differently-sized floor in one file'
+    )
+
+    # (ii) DERIVED, not hand-set — the rot this test exists to prevent.
+    assert MIN_MODULE_BUDGET_SECS == _min_budget(MEASURED_SUITE_WORST_SECS), (
+        f'MIN_MODULE_BUDGET_SECS = {MIN_MODULE_BUDGET_SECS} but '
+        f'_min_budget(MEASURED_SUITE_WORST_SECS={MEASURED_SUITE_WORST_SECS}) = '
+        f'{_min_budget(MEASURED_SUITE_WORST_SECS)} (task 3703). The floor must '
+        'be DERIVED from the measurement rather than hand-set beside it: that '
+        'exact pair already drifted once here — a 300s floor left standing '
+        'against a 127.0s figure while tests/scripts/orchestrator.yaml recorded '
+        'a 233.50s worst run — and nothing in the repo could fail on it. Update '
+        'MEASURED_SUITE_WORST_SECS and let the floor follow; do not re-hand-set '
+        'the floor'
+    )
+
+    # (iii) Non-degenerate for THIS suite, so the budget floor is not vacuous.
+    assert MIN_MODULE_BUDGET_SECS > 0, (
+        f'MIN_MODULE_BUDGET_SECS derives to {MIN_MODULE_BUDGET_SECS} from '
+        f'MEASURED_SUITE_WORST_SECS={MEASURED_SUITE_WORST_SECS} (task 3703). '
+        '_min_budget floors to the nearest 100s, so a worst run under 50s '
+        'derives a ZERO floor — the degenerate case test_module_verify_budgets.py '
+        'records for sampler (_min_budget(22.49) == 0), where the >= floor '
+        'assertion passes for ANY declared budget. This suite measures far above '
+        'that, so a zero here means the measurement was lost, not that the suite '
+        'got cheap'
+    )
+
+
 def test_tests_scripts_module_carries_its_own_tight_verify_budget() -> None:
     """The module must carry its own budget, tighter than the repo-root ceiling.
 
