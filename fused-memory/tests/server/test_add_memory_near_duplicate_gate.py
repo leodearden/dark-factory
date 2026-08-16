@@ -36,6 +36,7 @@ from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.models.scope import Scope
 from fused_memory.server.tools import create_mcp_server
+from fused_memory.services.memory_service import RRF_K
 
 _PROJECT_ID = 'dark_factory'
 _CONTENT = 'canonical .task gitignore gotcha'
@@ -58,12 +59,6 @@ def _topic_cluster(
     )
 
 
-# The real post-RRF relevance_score for a rank-1 mem0 hit on the guard's
-# single-store search path — 1/(RRF_K + 1). Task 3658 made relevance_score an
-# ordinal fusion value and moved the cosine to metadata['store_score'].
-_RRF_RANK1 = 1.0 / 61
-
-
 def _near_duplicate_result(
     id_: str = 'm1',
     score: float = 0.97,
@@ -77,13 +72,17 @@ def _near_duplicate_result(
     ``relevance_score`` carries the ordinal RRF value, deliberately unrelated
     to it.  Every gate test in this module therefore exercises the real
     post-task-3658 shape, with its threshold expectations unchanged.
+
+    ``RRF_K`` is imported from production rather than restated as the literal
+    60, so a retune of the constant carries this fixture with it instead of
+    leaving it silently modelling a shape ``search()`` no longer emits.
     """
     return MemoryResult(
         id=id_,
         content=content,
         category=category,
         source_store=SourceStore.mem0,
-        relevance_score=1.0 / (60 + store_rank),
+        relevance_score=1.0 / (RRF_K + store_rank),
         metadata={'store_rank': store_rank, 'store_score': score},
     )
 

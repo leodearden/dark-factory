@@ -34,10 +34,14 @@ from fused_memory.server.near_duplicate_guard import (
     resolve_near_dup_threshold,
     resolve_topic_guard_clusters,
 )
+from fused_memory.services.memory_service import RRF_K
 
 # The real post-RRF relevance_score for a rank-1 hit on the guard's
 # single-store search(stores=['mem0'], limit=5) path — 1/(RRF_K + 1).
-_RRF_RANK1 = 1.0 / 61
+# RRF_K comes from production rather than being restated as the literal 60, so
+# a retune of the constant carries this fixture with it instead of leaving it
+# silently modelling a shape ``search()`` no longer emits.
+_RRF_RANK1 = 1.0 / (RRF_K + 1)
 
 
 def _result(
