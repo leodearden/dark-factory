@@ -938,6 +938,16 @@ class TestCommittedFileMode:
 _MANIFEST_PATHS = discover_manifests() or []
 _MANIFEST_IDS = [str(p.relative_to(REPO_ROOT)) for p in _MANIFEST_PATHS]
 
+#: Derived from _MANIFEST_PATHS, NOT a second corpus walk — script-check
+#: discovery inherits discover_manifests' anti-rglob, worktree-excluding,
+#: non-raising git ls-files behaviour verbatim. iter_script_checks is
+#: likewise non-raising (see its docstring): this runs at module import
+#: time, so anything escaping here takes down collection of the whole module.
+_SCRIPT_CHECKS = [ref for path in _MANIFEST_PATHS for ref in iter_script_checks(path)]
+_SCRIPT_CHECK_IDS = [
+    f'{ref.manifest.relative_to(REPO_ROOT)}::{ref.capability}' for ref in _SCRIPT_CHECKS
+]
+
 
 def _missing_from_worktree_message(manifest_path: Path) -> str:
     """Message for a sidecar ``git ls-files`` tracks but the working tree lacks.
@@ -997,10 +1007,14 @@ class TestCheckedInManifestCorpus:
            dropped the third, tautological parametrization and trimmed
            TestManifestCorpusDiscovery).
 
-    Does NOT assert delivered_check `script:` targets exist on disk —
-    deliberately out of scope (n=1 in the corpus at planning time, and it
-    would couple this authoring guard to script lifecycle rather than
-    manifest shape). Does NOT separately re-validate each capability via
+    Does NOT assert delivered_check `script:` targets exist on disk — that
+    property now has its own sweep, TestCheckedInScriptCheckTargets below.
+    The exclusion this docstring used to record ("out of scope: n=1 in the
+    corpus at planning time") was retired by task 3649: n reached 2, and the
+    second one (plans/agent-transcript-archival-prd.capability-manifest.yaml
+    -> scripts/gc_agent_transcripts.py) was committed at mode 100644 and had
+    been ERRORing forever. This class stays scoped to manifest SHAPE; the
+    sibling class covers script LIFECYCLE. Does NOT separately re-validate each capability via
     `ManifestCapability.model_validate(cap.model_dump()) == cap`
     (code-review amendment, task 3362: dropped as tautological) —
     `load_capability_manifest` already constructs every `ManifestCapability`
@@ -1043,6 +1057,82 @@ class TestCheckedInManifestCorpus:
         expected_prd = rel[: -len(MANIFEST_SUFFIX)] + '.md'
         assert doc.prd == expected_prd
         assert (REPO_ROOT / doc.prd).is_file()
+
+
+class TestCheckedInScriptCheckTargets:
+    """Every checked-in `kind: script` delivered_check names a runnable target.
+
+    The generalization of the per-capability assertion task 3364 left behind in
+    scripts/tests/test_check_method_param_wiring.py::TestManifestScriptCoherence
+    (its own NOTE earmarked this ticket, tkt_0RS3PJJZFSJRJERYB11FNNKF5W /
+    esc-3364-2, for both the generalization and the retirement of that copy).
+
+    Why it matters: `_run_script_check` builds
+    argv = [str(project_root / meta.script), *args] and execs the target
+    DIRECTLY, so a missing or non-executable script raises OSError, which
+    run_delivered_check's catch-all maps to DeliveredCheckResult.ERRORED. The
+    check never FAILs — it ERRORs forever, so the capability it was authored to
+    gate is silently un-gated. That is not hypothetical: this guard arrived
+    NATURALLY RED (task 3649), unlike TestCheckedInManifestCorpus above, which
+    was green on arrival and needed a mutation to prove its RED signal.
+
+    RED on arrival, measured across the corpus (2 script checks in 30 sidecars):
+
+        FAILED ...::test_target_exists_and_is_executable[
+            plans/agent-transcript-archival-prd.capability-manifest.yaml::
+            gc-prunes-archive-by-cap]
+        FAILED ...::test_target_is_committed_executable[  (same id)  ]
+
+    — working tree -rw-rw-r--, committed mode 100644 — while BOTH
+    docs/prds/memory-eval-program.capability-manifest.yaml::
+    qdrant-vector-access-for-ann cases stayed green. A one-line `chmod +x` on
+    scripts/gc_agent_transcripts.py greened both halves with no logic change.
+
+    Both halves are asserted, as two separate methods rather than one combined
+    assertion, because either alone is a hole: os.access is the exact property
+    _run_script_check depends on (it execs against the WORKING checkout), but it
+    is greened by a local `chmod +x` that is never staged — which would leave
+    main exactly as broken while this guard reported green. The committed-mode
+    assertion is what proves the fix LANDS. Two methods means the red tells you
+    WHICH is wrong (patch the tree vs stage the mode).
+    """
+
+    def test_script_check_corpus_is_not_vacuous(self):
+        # @pytest.mark.parametrize over an empty list collects ZERO cases and
+        # reports success — the precise silent-pass this guard exists to
+        # remove. Skip (not fail) on a non-checkout, mirroring
+        # test_corpus_discovery_is_not_vacuous.
+        if discover_manifests() is None:
+            pytest.skip('not a git checkout (git ls-files failed)')
+        assert _SCRIPT_CHECKS, 'no kind: script delivered_check found in any checked-in sidecar'
+
+    def test_both_known_script_targets_are_present(self):
+        # Acceptance criterion 3 as a machine-checked assertion: dropping
+        # either real target from coverage goes red rather than quietly
+        # shrinking the sweep. Mirrors test_known_stable_anchor_is_present.
+        if discover_manifests() is None:
+            pytest.skip('not a git checkout (git ls-files failed)')
+        assert {ref.script for ref in _SCRIPT_CHECKS} >= {
+            'scripts/gc_agent_transcripts.py',
+            'scripts/check_method_param_wiring.py',
+        }
+
+    @pytest.mark.parametrize('ref', _SCRIPT_CHECKS, ids=_SCRIPT_CHECK_IDS)
+    def test_target_exists_and_is_executable(self, ref):
+        # The WORKING-tree property _run_script_check actually execs.
+        message = check_script_target(ref)
+        assert message is None, message
+
+    @pytest.mark.parametrize('ref', _SCRIPT_CHECKS, ids=_SCRIPT_CHECK_IDS)
+    def test_target_is_committed_executable(self, ref):
+        # The INDEX mode — so a local-only `chmod +x` that is never staged
+        # cannot green this guard while main stays broken.
+        mode = committed_file_mode(ref.script)
+        assert mode == '100755', (
+            f'{ref.manifest.relative_to(REPO_ROOT)}: capability {ref.capability!r}: '
+            f'{ref.script} is committed at mode {mode!r}, not 100755 — a working-tree '
+            'chmod that is never staged leaves main ERRORing'
+        )
 
 
 class TestDeliveredCheckMeta:
