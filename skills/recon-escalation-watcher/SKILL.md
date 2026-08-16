@@ -394,33 +394,58 @@ JSON with `description`/`affected_ids`/`actionable`), and `dedupe_count`.
 3. **file-a-real-task** — The finding is genuinely actionable dev work. File it,
    then resolve the escalation. Two-phase pattern:
    ```
+   suggestion_hash = hashlib.sha256(
+       (escalation['detail'] or escalation['summary'] or escalation['id']).encode()
+   ).hexdigest()[:16]   # Case A — escalation_id already in scope; see _shared/ticket-failure-handling.md
+
    sub = mcp__fused-memory__submit_task(
        project_root="<project_root>", title="<title>", description="<what + specifics>",
        priority="medium",
        metadata={"source": "recon-watcher", "escalation_id": escalation_id,
+                 "suggestion_hash": suggestion_hash,   # (escalation_id, suggestion_hash) = R4 idempotency key
                  "spawn_context": "steward-triage"},
    )
    res = mcp__fused-memory__resolve_ticket(ticket=sub["ticket"], project_root="<project_root>",
                                            timeout_seconds=<see _shared/ticket-failure-handling.md>)
    if res["status"] in ("created", "combined"):
-       task_id = res["task_id"]      # `combined` = folded into an existing task, a normal success not an error
-       resolve_issue(..., action='resume', resolution="Filed task <task_id>: <title>")
+       task_id = res.get("task_id")    # `combined` can also omit task_id — see below
+       if task_id:
+           resolve_issue(..., action='resume', resolution="Filed task <task_id>: <title>")
+       else:
+           # `combined` = folded into an existing task, a normal success not
+           # an error — but an idempotency-hit combine can resolve with no
+           # surviving task id. Record the reason instead of a fabricated id.
+           resolve_issue(..., action='resume', resolution="Filed (combined): <res['reason']>")
    elif res["status"] == "refused":
-       # Deliberately NOT in the tuple above: a refusal has no task_id key at
-       # all (absent, not null), so there is nothing to interpolate. A
-       # deterministic guard (cancelled-premise blocklist / recon premise
-       # registry) rejected the candidate because its premise is dead. This
-       # is a SUCCESS, not a failure: do NOT retry (a retry just re-hits the
-       # same guard) and do NOT record a task id.
-       resolve_issue(..., action='close_only', resolution="Ticket refused (no task created): <res['reason']>")
+       # Guaranteed (not just possible, as with `combined` above) to omit
+       # task_id: a deterministic guard (cancelled-premise blocklist / recon
+       # premise registry) rejected the candidate because its premise is
+       # dead. This is a SUCCESS, not a failure: do NOT retry (a retry just
+       # re-hits the same guard) and do NOT record a task id.
+       resolve_issue(..., action='close_only', resolution="Ticket <res['reason']>")   # res["reason"] already reads "refused (no task created): ..."
    elif res["status"] == "failed":
-       # Do NOT call resolve_issue — leave the escalation pending. Record
-       # res["reason"], and append this esc-id to the wrapper-owned exclude
-       # file (`<queue-dir>/.watcher-rearm-exclude`) per Priority Hierarchy
-       # item 3 above. See _shared/ticket-failure-handling.md for the
-       # retryable/terminal reason matrix.
+       # Retryable (`server_restart`, `timeout`): apply
+       # _shared/ticket-failure-handling.md's retry policy (retry
+       # `resolve_ticket` first under `timeout`; re-submit the pair once
+       # under `server_restart`) within its 2-submit/2-resolve cap, then
+       # re-enter this dispatch on the retry's outcome. Once the reason is
+       # terminal — or that budget is exhausted — do NOT call resolve_issue:
+       # leave the escalation pending. Record res["reason"], tell the human,
+       # file a cockpit DecisionRecord via `write-decision` (Priority
+       # Hierarchy item 3 below / C8), and append this esc-id to the
+       # wrapper-owned exclude file (`<queue-dir>/.watcher-rearm-exclude`).
+       # See _shared/ticket-failure-handling.md for the full retryable/
+       # terminal reason matrix and R4 idempotency guidance.
+   else:
+       # Unrecognized status (e.g. `cancelled`, written by cancel_ticket —
+       # the ticket status column has no CHECK constraint, and tools.py's
+       # docstring documents only the four statuses above). Same
+       # follow-through as the `failed` arm above (tell the human, file a
+       # DecisionRecord, append this esc-id to the exclude file; do NOT call
+       # resolve_issue) — plus record the raw `res`, since the status itself
+       # is the anomaly here.
    ```
-   This recipe spells out all four arms where a sibling can get away with less
+   This recipe spells out every arm where a sibling can get away with less
    because this watcher is the SOLE closer of the recon queue — the next
    action after the status check ARCHIVES the finding, so a status-blind
    "Filed task <id>" both fabricates a completion claim and drops the finding
