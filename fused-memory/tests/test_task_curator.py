@@ -6251,11 +6251,16 @@ class TestCuratorPromptResolveFailSafe:
     raise fails where it actually hurts.
     """
 
-    def test_resolve_curator_prompt_falls_back_when_provenance_sidecar_is_unreadable(
+    def test_resolve_curator_prompt_degrades_when_provenance_sidecar_becomes_unreadable(
         self, tmp_path
     ):
-        """An unreadable (here: directory-in-place-of-file) provenance sidecar
-        must degrade to the in-code baseline, not raise into the curator.
+        """A *good* pin must degrade to the in-code baseline, not raise.
+
+        Deliberately starts from a working pin and asserts the curator serves
+        the composed pinned text, so breaking the sidecar afterwards proves a
+        degradation. Asserting only the post-break state would hold just as
+        well for a key that was never pinned at all, which is a weaker claim
+        than the docstring this test exists to pin.
 
         Synchronous — the guard under test is reached before any LLM call, so
         no ``invoke_with_cap_retry`` patch and no event loop are needed.
@@ -6264,15 +6269,32 @@ class TestCuratorPromptResolveFailSafe:
         store = PromptArtifactStore(tmp_path)
         curator = TaskCurator(config=config, taskmaster=None, prompt_store=store)
 
-        key_dir = store._key_dir(
+        heuristics = 'PINNED: prefer combining aggressively when in doubt.'
+        provenance = ArtifactProvenance(
+            **_prompt_artifact_provenance_kwargs(harness_version=_CURATOR_PROMPT_HARNESS_VERSION)
+        )
+        store.pin(
             CURATOR_SINGLE_SPEC.prompt_id,
             config.curator.model,
             _CURATOR_PROMPT_HARNESS_VERSION,
+            heuristics=heuristics,
+            provenance=provenance,
         )
-        key_dir.mkdir(parents=True)
-        # A real heuristics.txt so resolve() reaches the provenance load.
-        (key_dir / 'heuristics.txt').write_text('PINNED heuristics', encoding='utf-8')
-        (key_dir / 'provenance.json').mkdir()
+
+        # Premise: the curator genuinely serves this pin before the break.
+        assert curator._resolve_curator_prompt(CURATOR_SINGLE_SPEC) == compose_prompt(
+            CURATOR_SINGLE_SPEC.contract, heuristics,
+        )
+
+        # Now make the sidecar unreadable in place — directory-in-place-of-file,
+        # the uid-independent trigger (chmod 0o000 is a no-op under root).
+        provenance_path = store._key_dir(
+            CURATOR_SINGLE_SPEC.prompt_id,
+            config.curator.model,
+            _CURATOR_PROMPT_HARNESS_VERSION,
+        ) / 'provenance.json'
+        provenance_path.unlink()
+        provenance_path.mkdir()
 
         assert (
             curator._resolve_curator_prompt(CURATOR_SINGLE_SPEC)
