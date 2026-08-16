@@ -903,20 +903,25 @@ pre-3610 all-of-three rule did not catch either, so nothing regresses."""
 HARNESS_PROMPT_MARKERS: tuple[str, ...] = (
     'you are the trickle coder for the dark-factory agent-confusion codebook',
     'your previous run was interrupted by a usage limit',
+    'you were interrupted by an orchestrator restart',
 )
 """Harness-authored PROSE preamble literals, matched as plain
 case-insensitive substrings (unlike the line-anchored heading markers
 above): the trickle coder's system prompt
-(scripts/legibility/coder.py:174 ``build_prompt``), and the harness's
-cap-hit resume prompt (``shared.cli_invoke.CAP_HIT_RESUME_PROMPT`` -- the
-canonical source of the literal above). That marker is deliberately the
-constant's stable FIRST SENTENCE, not the whole two-sentence string: a
-future rewording of its second sentence ("Continue where you left off and
-complete your task.") must not silently un-cover the marker. Held in
-lockstep with the canonical constant by
-``TestHarnessInjectedTurnFilter.test_usage_limit_resume_prompt_is_excluded_lockstep``
+(scripts/legibility/coder.py:174 ``build_prompt``), and the harness's two
+resume prompts -- ``shared.cli_invoke.CAP_HIT_RESUME_PROMPT`` (cap-hit)
+and ``shared.cli_invoke.CRASH_RECOVERY_RESUME_PROMPT`` (orchestrator
+restart), the canonical sources of the two literals above. Both resume
+prompts are one defect class -- harness-injected continuation boilerplate
+typed into the transcript as an ordinary isMeta=False user turn -- even
+though cli_invoke deliberately keeps the two strings separate because
+their causes differ (a usage-cap interrupt vs. an orchestrator restart).
+Each marker is deliberately its constant's stable FIRST SENTENCE, not the
+whole string: a future rewording of a later sentence must not silently
+un-cover the marker. Held in lockstep with the canonical constants by
+``TestHarnessInjectedTurnFilter.test_resume_prompt_is_excluded_lockstep``
 in scripts/tests/test_legibility_digest.py, which asserts
-``is_harness_injected_turn(CAP_HIT_RESUME_PROMPT) is True`` rather than
+``is_harness_injected_turn(<constant>) is True`` for each rather than
 restating the literal -- a harness rewording turns that test red instead
 of silently regressing coverage. Extend with future harness prompt
 literals as one-line additions."""
