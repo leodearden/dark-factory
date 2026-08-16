@@ -2446,6 +2446,229 @@ class TestRegenCommand:
         assert _mod.render_markdown(report) == _mod.render_markdown(report)
 
 
+def _coverage_md_report(top_n: int = 50, *, history=None, registry=True, **kwargs) -> dict:
+    """A report exercising every new coverage/trend section of the markdown.
+
+    dark_factory carries two legacy-spelled topics, a topic with exactly one
+    canonical, and a DUPLICATE-canonical topic; reify carries a second
+    duplicate. Two rows in every named list, so a ``--top-n 1`` render has
+    something to cut.
+    """
+    payloads = {
+        'dark_factory': [
+            {'topic': 'alpha', 'canonical': True},
+            {'topic': 'alpha'},
+            {'topic': 'legacy_spelling'},
+            {'topic': 'another_legacy'},
+            {'topic': 'dup', 'canonical': True},
+            {'topic': 'dup', 'canonical': True},
+            {},
+        ],
+        'reify': [
+            {'topic': 'beta', 'canonical': True},
+            {'topic': 'beta', 'canonical': True},
+        ],
+    }
+    cells = {pid: {OBS: _census(p)} for pid, p in payloads.items()}
+    cov = {
+        pid: _coverage(
+            f'fused_{pid}',
+            sum(c.records for c in cats.values()),
+            {cat: (c.records, c.records) for cat, c in cats.items()},
+        )
+        for pid, cats in cells.items()
+    }
+    return _mod.build_report(
+        cells, cov, top_n=top_n, page_size=1000,
+        registry=_FakeRegistry([
+            _FakeEntry('alpha', 'dark_factory'),
+            _FakeEntry('gamma', 'dark_factory'),
+            _FakeEntry('delta', 'dark_factory'),
+            _FakeEntry('beta', 'reify'),
+        ]) if registry else None,
+        history=history,
+        **kwargs,
+    )
+
+
+class TestRenderMarkdownTopicCoverage:
+    """The `## Topic & canonical coverage` section.
+
+    The markdown is the twin a human actually reads. A coverage number that
+    lands only in the JSON is a number nobody is accountable to -- which is
+    the failure mode the ask names outright.
+    """
+
+    def test_section_renders_the_rate_and_the_three_way_partition(self):
+        md = _mod.render_markdown(_coverage_md_report())
+        assert '## Topic & canonical coverage' in md
+        # The RATE is the thing the raw counts cannot express.
+        assert '| `dark_factory` | 7 | 6 | 85.7143% | 4 | 1 | 2 | 1 |' in md
+        assert '| `reify` | 2 | 2 | 100.0% | 1 | 0 | 0 | 1 |' in md
+
+    def test_partition_is_rendered_for_the_grand_total_too(self):
+        md = _mod.render_markdown(_coverage_md_report())
+        assert '| **(all)** | 9 | 8 |' in md
+
+    def test_uniqueness_violators_are_NAMED_with_their_project(self):
+        md = _mod.render_markdown(_coverage_md_report())
+        assert '| `dark_factory` | `dup` | 2 |' in md
+        assert '| `reify` | `beta` | 2 |' in md
+
+    def test_enforce_state_is_rendered_inline_as_the_caveat(self):
+        md = _mod.render_markdown(_coverage_md_report(canonical_uniqueness_enforced=False))
+        # Without the regime beside the count a reader cannot tell "the
+        # guard is warn-only, so this is backlog" from "the guard broke".
+        assert '`memory_metadata.enforce`' in md
+        assert 'warn' in md.lower()
+
+    def test_an_unreadable_enforce_flag_renders_as_unknown_not_false(self):
+        md = _mod.render_markdown(_coverage_md_report(canonical_uniqueness_enforced=None))
+        assert 'unknown' in md.lower()
+        assert '**false**' not in md.lower()
+
+    def test_both_slug_conformance_partitions_render_distinctly_labelled(self):
+        md = _mod.render_markdown(_coverage_md_report())
+        # Two columns, two questions -- gate 3626's recipe items 3 and 4.
+        # A reader must not mistake one for the other.
+        assert 'item 3' in md
+        assert 'item 4' in md
+        assert '`canonical: true`' in md
+        assert '| `legacy_spelling` | 1 |' in md
+        assert '| `another_legacy` | 1 |' in md
+
+    def test_registry_gauge_renders_with_its_actionable_worklist(self):
+        md = _mod.render_markdown(_coverage_md_report())
+        assert 'Registry' in md
+        assert '**4**' in md  # registry_topics_total
+        # The worklist: the exact set 3201's retro sweep would stamp.
+        assert '| `dark_factory` | `gamma` |' in md
+        assert '| `dark_factory` | `delta` |' in md
+
+    def test_a_registry_that_did_not_load_is_disclosed_not_omitted(self):
+        md = _mod.render_markdown(_coverage_md_report(registry=False))
+        assert 'no topic registry supplied' in md
+
+
+class TestRenderMarkdownEnforcePreconditions:
+    """The flip-precondition citations, rendered as prose beneath the count.
+
+    Leo's 2026-08-12 ruling (Option B on esc-4006-3): a reader must learn
+    the number, the regime that produced it, AND what remains -- in one
+    place, without reconstructing the last part from the PRD.
+    """
+
+    def test_all_three_citations_render(self):
+        md = _mod.render_markdown(_coverage_md_report())
+        assert 'legacy_topic_spelling_remains' in md
+        assert '3202' in md
+        assert '3626' in md
+
+    def test_legacy_bucket_carries_its_recorded_status_and_a_live_re_measurement(self):
+        md = _mod.render_markdown(_coverage_md_report())
+        # Recorded DISCHARGED on 2026-08-04 -- citing it as flatly open
+        # would be as wrong as omitting it...
+        assert 'discharged_2026_08_04' in md
+        # ...but a bucket recorded empty can regrow (the leaf-alpha census's
+        # own 98 -> 103 history proves it does), so this run's own count
+        # rides alongside as the standing re-measurement.
+        assert 're-measur' in md.lower()
+
+    def test_citations_render_beneath_the_count_and_the_flag(self):
+        md = _mod.render_markdown(_coverage_md_report(canonical_uniqueness_enforced=False))
+        enforce_at = md.index('`memory_metadata.enforce`')
+        citations_at = md.index('legacy_topic_spelling_remains')
+        assert enforce_at < citations_at
+
+    def test_each_citation_names_a_checkable_source(self):
+        md = _mod.render_markdown(_coverage_md_report())
+        assert 'memory-metadata-vocabulary.md' in md
+        assert 'task 3626' in md
+
+    def test_citations_are_NEVER_subject_to_the_top_n_cut(self):
+        # A truncated precondition list silently under-reports what blocks
+        # the flip -- the one list where a cut changes the conclusion.
+        md = _mod.render_markdown(_coverage_md_report(top_n=1))
+        for cited in ('legacy_topic_spelling_remains', '3202', '3626'):
+            assert cited in md
+
+
+class TestRenderMarkdownCoverageTrend:
+    """The `## Coverage trend` section -- and its no-baseline case."""
+
+    @staticmethod
+    def _history():
+        prior = _topic_report(
+            {'dark_factory': [{'topic': 'alpha', 'canonical': True}, {'topic': 'alpha'}]},
+            registry=_FakeRegistry([_FakeEntry('alpha', 'dark_factory')]),
+        )
+        return _mod.append_coverage_run(
+            _mod.empty_coverage_history(), prior, stamp='2026-08-15T05:00:00Z',
+        )
+
+    def test_first_run_prints_an_explicit_no_baseline_line(self):
+        md = _mod.render_markdown(_coverage_md_report())
+        assert '## Coverage trend' in md
+        assert 'No baseline' in md
+        assert 'first recorded run' in md
+
+    def test_first_run_renders_no_delta_table_of_zeros(self):
+        md = _mod.render_markdown(_coverage_md_report())
+        assert '| before | after | delta |' not in md
+
+    def test_baseline_stamp_and_deltas_render(self):
+        md = _mod.render_markdown(_coverage_md_report(history=self._history()))
+        assert '2026-08-15T05:00:00Z' in md
+        assert '| `dark_factory` | `records` | 2 | 7 | +5 |' in md
+
+    def test_an_uncomparable_column_renders_as_not_measured_not_zero(self):
+        md = _mod.render_markdown(_coverage_md_report(history=self._history()))
+        # reify is new_project this run: no deltas, disclosed as such.
+        assert '`reify`' in md
+        assert 'new_project' in md
+
+    def test_regrowth_classes_render_named(self):
+        md = _mod.render_markdown(_coverage_md_report(history=self._history()))
+        assert 'lost' in md.lower()
+        # alpha kept its canonical but grew 2 -> 7 records... the digest
+        # tracks records per registry topic, so the growth is named.
+        assert '`alpha`' in md
+
+    def test_regrowth_scope_is_disclosed_in_the_markdown_too(self):
+        md = _mod.render_markdown(_coverage_md_report(history=self._history()))
+        assert 'registry' in md.lower()
+
+
+class TestRenderMarkdownCoverageCutsDiscloseThemselves:
+    """The new named lists obey the same cut-and-disclose rule as the old."""
+
+    def test_named_lists_are_cut_with_a_disclosure(self):
+        md = _mod.render_markdown(_coverage_md_report(top_n=1))
+        # The cut lands on the NEW lists too: one violator row shown, the
+        # second cut -- and the cut says so and says where the rest is.
+        assert '| `dark_factory` | `dup` | 2 |' in md
+        assert '| `reify` | `beta` | 2 |' not in md
+        assert '**truncated**' in md
+        assert 'JSON artifact carries the full population' in md
+
+    def test_markdown_cut_never_drops_a_value_from_the_json(self):
+        report = _coverage_md_report(top_n=1)
+        md = _mod.render_markdown(report)
+        cov = report['projects']['dark_factory']['topic_coverage']
+        # The JSON keeps every row whatever the markdown shows.
+        assert len(cov['non_conforming_topics']) == 2
+        assert len(report['registry_coverage']['zero_canonical_topics']) == 2
+        # ...and the cut view points at the copy that is not cut.
+        assert md.count('JSON artifact carries the full population') >= 1
+
+    def test_a_wide_top_n_renders_every_named_row(self):
+        md = _mod.render_markdown(_coverage_md_report(top_n=500))
+        assert '| `dark_factory` | `dup` | 2 |' in md
+        assert '| `reify` | `beta` | 2 |' in md
+        assert '| `legacy_spelling` | 1 |' in md
+        assert '| `another_legacy` | 1 |' in md
+
+
 class TestRenderMarkdownDeterminism:
     def test_same_report_renders_identical_string_twice(self):
         report = _rich_report()
