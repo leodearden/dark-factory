@@ -1324,6 +1324,294 @@ class TestRegistryCoverageGauge:
         assert len(registry.entries) == 32
 
 
+def _history_report(registry=None, **kwargs) -> dict:
+    """A two-project report whose topic_coverage blocks carry known scalars.
+
+    dark_factory: 5 records, 3 topic-stamped, distinct {alpha, legacy_spelling},
+    alpha has exactly one canonical, legacy_spelling none, plus one canonical
+    carrying NO topic. reify: 3 records, all stamped 'beta', which holds TWO
+    canonicals (a uniqueness violation, reachable under the warn-mode default).
+    """
+    cells = {
+        'dark_factory': {
+            OBS: _census([
+                {'topic': 'alpha', 'canonical': True},
+                {'topic': 'alpha'},
+                {'topic': 'legacy_spelling'},
+                {'canonical': True},
+                {},
+            ]),
+        },
+        'reify': {
+            OBS: _census([
+                {'topic': 'beta'},
+                {'topic': 'beta', 'canonical': True},
+                {'topic': 'beta', 'canonical': True},
+            ]),
+        },
+    }
+    cov = {
+        pid: _coverage(
+            f'fused_{pid}',
+            sum(c.records for c in cats.values()),
+            {cat: (c.records, c.records) for cat, c in cats.items()},
+        )
+        for pid, cats in cells.items()
+    }
+    return _mod.build_report(cells, cov, top_n=50, registry=registry, **kwargs)
+
+
+def _walk(obj):
+    """Yield every nested value in a JSON-ish structure, including the root."""
+    yield obj
+    if isinstance(obj, dict):
+        for v in obj.values():
+            yield from _walk(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _walk(v)
+
+
+class TestCoverageHistory:
+    """The TREND substrate: a committed, append-only history of headline scalars.
+
+    The ask names trending as the point -- a number measured once is not
+    owned.  Diffing consecutive runs needs durable prior state, and
+    ``docs/legibility/census-state.json`` is the in-repo precedent for a
+    committed one.
+
+    But this file is written by a NIGHTLY timer, so the row must stay
+    compact: persisting the per-topic tables (276 distinct topics in reify
+    alone) would grow the committed repo without bound on every run.  The
+    full tables stay in the regenerated report artifact, which is rewritten
+    rather than appended.
+
+    An absent history is an empty history; a MALFORMED one is an error.
+    Losing the trend must be loud -- restarting silently from empty is how
+    ``census_trigger.extract_done_count`` fabricated a ``0`` baseline twice
+    and armed a threshold with it (task 3291).
+    """
+
+    # ---- the compact row -------------------------------------------------
+
+    def test_appends_exactly_one_row_per_project(self):
+        report = _history_report()
+        history = _mod.append_coverage_run(
+            _mod.empty_coverage_history(), report, stamp='2026-08-16T05:00:00Z',
+        )
+        assert len(history['runs']) == 1
+        run = history['runs'][0]
+        assert set(run['projects']) == {'dark_factory', 'reify'}
+
+    def test_row_carries_the_headline_scalars(self):
+        report = _history_report()
+        history = _mod.append_coverage_run(
+            _mod.empty_coverage_history(), report, stamp='2026-08-16T05:00:00Z',
+        )
+        row = history['runs'][0]['projects']['dark_factory']
+        assert row['records'] == 5
+        assert row['topic_present'] == 3
+        assert row['topic_coverage_pct'] == 60.0
+        assert row['distinct_topics'] == 2
+        assert row['topics_with_one_canonical'] == 1
+        assert row['topics_with_zero_canonical'] == 1
+        assert row['topics_with_multiple_canonical'] == 0
+        assert row['canonical_true'] == 2
+        assert row['canonical_true_without_topic'] == 1
+        assert row['slug_conforming'] == 1
+        assert row['slug_non_conforming'] == 1
+        assert row['canonical_slug_conforming'] == 1
+        assert row['canonical_slug_non_conforming'] == 0
+
+        reify = history['runs'][0]['projects']['reify']
+        assert reify['topics_with_multiple_canonical'] == 1
+
+    def test_row_holds_scalars_only_never_the_per_topic_tables(self):
+        # The bound on the committed file's growth is STRUCTURAL, not a
+        # promise: nothing that scales with the corpus may enter a row.
+        report = _history_report()
+        history = _mod.append_coverage_run(
+            _mod.empty_coverage_history(), report, stamp='2026-08-16T05:00:00Z',
+        )
+        row = history['runs'][0]['projects']['dark_factory']
+        for value in row.values():
+            assert isinstance(value, (bool, int, float, str, type(None))), row
+        for key in (
+            'topic', 'keys', 'kind', 'canonical_true_by_topic',
+            'multiple_canonical_topics', 'non_conforming_topics',
+            'canonical_slug_non_conforming_topics', 'enforce_flip_preconditions',
+        ):
+            assert key not in row
+
+    def test_no_uncapped_value_table_survives_anywhere_in_a_run(self):
+        # _table()'s {'entries': [...], 'distinct_total': n} shape is the
+        # unbounded thing; assert none of it reached the persisted run.
+        report = _history_report()
+        run = _mod.append_coverage_run(
+            _mod.empty_coverage_history(), report, stamp='2026-08-16T05:00:00Z',
+        )['runs'][0]
+        for node in _walk(run):
+            if isinstance(node, dict):
+                assert 'distinct_total' not in node
+
+    def test_run_records_the_enforce_regime_the_counts_were_measured_under(self):
+        report = _history_report(canonical_uniqueness_enforced=False)
+        run = _mod.append_coverage_run(
+            _mod.empty_coverage_history(), report, stamp='2026-08-16T05:00:00Z',
+        )['runs'][0]
+        # A violation count trended across a flag flip is two different
+        # series; without the flag beside it the trend is unreadable.
+        assert run['canonical_uniqueness_enforced'] is False
+
+    # ---- the registry digest: bounded by the TARGET SET, not the corpus ---
+
+    def test_registry_scalars_land_per_project(self):
+        registry = _FakeRegistry([
+            _FakeEntry('alpha', 'dark_factory'),
+            _FakeEntry('legacy_spelling', 'dark_factory'),
+            _FakeEntry('beta', 'reify'),
+        ])
+        report = _history_report(registry=registry)
+        run = _mod.append_coverage_run(
+            _mod.empty_coverage_history(), report, stamp='2026-08-16T05:00:00Z',
+        )['runs'][0]
+        dark = run['projects']['dark_factory']
+        assert dark['registry_topics_total'] == 2
+        assert dark['registry_topics_with_exactly_one_canonical'] == 1
+        assert dark['registry_topics_with_zero_canonical'] == 1
+        assert dark['registry_topics_with_multiple_canonical'] == 0
+        assert run['projects']['reify']['registry_topics_with_multiple_canonical'] == 1
+
+    def test_registry_scalars_are_null_not_zero_when_the_gauge_did_not_run(self):
+        # Three-valued, like every other unread axis here: a 0 would read as
+        # "measured, and no registry topic is stamped" -- a different claim
+        # from "the gauge did not run", and the one that fabricates a trend.
+        report = _history_report()
+        run = _mod.append_coverage_run(
+            _mod.empty_coverage_history(), report, stamp='2026-08-16T05:00:00Z',
+        )['runs'][0]
+        assert run['projects']['dark_factory']['registry_topics_total'] is None
+        assert run['registry_error']
+
+    def test_registry_digest_is_bounded_by_the_registry_not_the_corpus(self):
+        # The ONE per-topic structure a run may carry, and only because the
+        # committed registry bounds it (32 entries). It is what makes
+        # "this registry topic LOST its canonical" nameable in the diff --
+        # the actionable regression -- without persisting 353 live topics.
+        registry = _FakeRegistry([
+            _FakeEntry('alpha', 'dark_factory'),
+            _FakeEntry('legacy_spelling', 'dark_factory'),
+            _FakeEntry('beta', 'reify'),
+        ])
+        report = _history_report(registry=registry)
+        run = _mod.append_coverage_run(
+            _mod.empty_coverage_history(), report, stamp='2026-08-16T05:00:00Z',
+        )['runs'][0]
+        digest = run['registry_topics']
+        assert len(digest) == 3
+        assert digest['dark_factory::alpha'] == {'records': 2, 'canonical': 1}
+        assert digest['dark_factory::legacy_spelling'] == {'records': 1, 'canonical': 0}
+        # Keyed by project too: 3198's invariant is per-(project, topic), so
+        # a canonical in reify must never discharge a dark_factory entry.
+        assert digest['reify::beta'] == {'records': 3, 'canonical': 2}
+        # No live topic outside the registry may appear -- that set is
+        # unbounded and is exactly what must stay in the report artifact.
+        assert not [k for k in digest if k.endswith('::gamma')]
+
+    def test_registry_digest_is_absent_when_the_gauge_did_not_run(self):
+        run = _mod.append_coverage_run(
+            _mod.empty_coverage_history(), _history_report(),
+            stamp='2026-08-16T05:00:00Z',
+        )['runs'][0]
+        assert run['registry_topics'] == {}
+
+    # ---- append-only ordering, purity, retention -------------------------
+
+    def test_history_is_append_only_and_ordered_oldest_first(self):
+        report = _history_report()
+        history = _mod.empty_coverage_history()
+        for stamp in ('2026-08-14T05:00:00Z', '2026-08-15T05:00:00Z', '2026-08-16T05:00:00Z'):
+            history = _mod.append_coverage_run(history, report, stamp=stamp)
+        assert [r['stamp'] for r in history['runs']] == [
+            '2026-08-14T05:00:00Z', '2026-08-15T05:00:00Z', '2026-08-16T05:00:00Z',
+        ]
+
+    def test_append_does_not_mutate_the_history_it_was_given(self):
+        history = _mod.empty_coverage_history()
+        before = json.dumps(history)
+        _mod.append_coverage_run(history, _history_report(), stamp='2026-08-16T05:00:00Z')
+        assert json.dumps(history) == before
+
+    def test_stamp_is_injected_never_read_from_the_clock(self):
+        # Injected so the row is deterministic and testable; a datetime.now()
+        # inside would make the artifact unreproducible and the test racy.
+        with pytest.raises(TypeError):
+            _mod.append_coverage_run(_mod.empty_coverage_history(), _history_report())
+
+    def test_retention_drops_the_oldest_and_DISCLOSES_the_drop(self):
+        report = _history_report()
+        history = _mod.empty_coverage_history()
+        for day in range(1, 6):
+            history = _mod.append_coverage_run(
+                history, report, stamp=f'2026-08-{day:02d}T05:00:00Z', max_runs=3,
+            )
+        assert [r['stamp'] for r in history['runs']] == [
+            '2026-08-03T05:00:00Z', '2026-08-04T05:00:00Z', '2026-08-05T05:00:00Z',
+        ]
+        # Silently truncated history would look like a corpus that only ever
+        # had three runs -- the same no-silent-truncation rule the JSON
+        # tables already follow.
+        assert history['retention']['max_runs'] == 3
+        assert history['retention']['dropped_runs'] == 2
+
+    # ---- load / save -----------------------------------------------------
+
+    def test_absent_history_file_loads_as_an_empty_history(self, tmp_path):
+        history = _mod.load_coverage_history(str(tmp_path / 'nope.json'))
+        assert history['runs'] == []
+        assert history['schema_version'] == _mod.COVERAGE_HISTORY_SCHEMA_VERSION
+
+    def test_malformed_history_raises_rather_than_restarting_from_empty(self, tmp_path):
+        path = tmp_path / 'history.json'
+        path.write_text('{not json', encoding='utf-8')
+        with pytest.raises(_mod.CoverageHistoryError) as exc:
+            _mod.load_coverage_history(str(path))
+        assert 'history.json' in str(exc.value)
+
+    def test_a_history_without_a_runs_list_raises(self, tmp_path):
+        path = tmp_path / 'history.json'
+        path.write_text(json.dumps({'schema_version': 1, 'runs': {}}), encoding='utf-8')
+        with pytest.raises(_mod.CoverageHistoryError):
+            _mod.load_coverage_history(str(path))
+
+    def test_an_unknown_schema_version_raises_rather_than_being_misread(self, tmp_path):
+        path = tmp_path / 'history.json'
+        path.write_text(json.dumps({'schema_version': 99, 'runs': []}), encoding='utf-8')
+        with pytest.raises(_mod.CoverageHistoryError) as exc:
+            _mod.load_coverage_history(str(path))
+        assert '99' in str(exc.value)
+
+    def test_round_trip_write_then_load_is_stable(self, tmp_path):
+        path = str(tmp_path / 'history.json')
+        history = _mod.append_coverage_run(
+            _mod.empty_coverage_history(),
+            _history_report(registry=_FakeRegistry([_FakeEntry('alpha', 'dark_factory')])),
+            stamp='2026-08-16T05:00:00Z',
+        )
+        _mod.save_coverage_history(history, path)
+        assert _mod.load_coverage_history(path) == history
+
+    def test_save_creates_missing_parent_directories(self, tmp_path):
+        path = str(tmp_path / 'nested' / 'dir' / 'history.json')
+        _mod.save_coverage_history(_mod.empty_coverage_history(), path)
+        assert Path(path).is_file()
+
+    def test_default_history_path_is_committed_beside_the_report(self):
+        assert _mod.DEFAULT_HISTORY_OUT.endswith(
+            'plans/memory-metadata-coverage-history.json',
+        )
+
+
 class TestBuildReportDeterminism:
     """A re-run must produce a byte-identical artifact."""
 
