@@ -897,6 +897,255 @@ def _build_topic_coverage(
     }
 
 
+#: Schema of the committed, append-only coverage-history file. Bumped only
+#: when a persisted RUN's shape changes; an unknown version is refused
+#: outright rather than misread (see :func:`load_coverage_history`).
+COVERAGE_HISTORY_SCHEMA_VERSION = 1
+
+#: The trend substrate, committed beside the report artifacts. A number
+#: measured once is not owned -- the ask names TRENDING as the point -- and
+#: diffing consecutive runs needs durable prior state. Precedent:
+#: ``docs/legibility/census-state.json``.
+DEFAULT_HISTORY_OUT = str(
+    _REPO_ROOT / 'plans' / 'memory-metadata-coverage-history.json',
+)
+
+#: Retention bound on the committed history. The file is written by a
+#: NIGHTLY timer, so it is bounded in runs as well as in per-run size: ~90
+#: rows is a quarter of nightly history, enough to see a season's trend at
+#: roughly a hundred KB. Dropping is DISCLOSED in ``retention.dropped_runs``
+#: -- a silently truncated history reads as a corpus that only ever had
+#: ``max_runs`` runs, the same no-silent-truncation rule the JSON value
+#: tables already follow.
+DEFAULT_MAX_HISTORY_RUNS = 90
+
+
+class CoverageHistoryError(RuntimeError):
+    """The coverage history exists but cannot be read as a coverage history.
+
+    Raised rather than degrading to an empty history: silently restarting
+    from empty loses the trend AND fabricates a "first ever run", which is
+    indistinguishable from the real thing. That is the precise failure
+    ``census_trigger.extract_done_count`` was hardened against in task 3291,
+    where an unusable payload became a done-count of 0, was persisted twice
+    as a real baseline, and armed a threshold with it.
+    """
+
+
+#: Scalar columns lifted from a ``topic_coverage`` block into a run row.
+#: Scalars ONLY -- see :func:`_coverage_run_row` for why the per-topic
+#: tables must never enter a persisted row.
+_HISTORY_COVERAGE_COLUMNS: tuple[str, ...] = (
+    'records',
+    'topic_present',
+    'topic_coverage_pct',
+    'distinct_topics',
+    'topics_with_one_canonical',
+    'topics_with_zero_canonical',
+    'topics_with_multiple_canonical',
+    'canonical_true',
+    'canonical_true_without_topic',
+    'slug_conforming',
+    'slug_non_conforming',
+    'canonical_slug_conforming',
+    'canonical_slug_non_conforming',
+)
+
+#: Registry-gauge scalars, rolled up per project from the top-level gauge.
+#: All ``None`` when the gauge did not run -- never 0, which would assert
+#: "measured, and no registry topic is stamped".
+_HISTORY_REGISTRY_COLUMNS: tuple[str, ...] = (
+    'registry_topics_total',
+    'registry_topics_with_exactly_one_canonical',
+    'registry_topics_with_zero_canonical',
+    'registry_topics_with_multiple_canonical',
+)
+
+
+def empty_coverage_history() -> dict[str, Any]:
+    """A fresh, empty history -- what an ABSENT file loads as."""
+    return {
+        'schema_version': COVERAGE_HISTORY_SCHEMA_VERSION,
+        'retention': {
+            'max_runs': DEFAULT_MAX_HISTORY_RUNS,
+            'dropped_runs': 0,
+            'oldest_retained_stamp': None,
+        },
+        'runs': [],
+    }
+
+
+def load_coverage_history(path: str) -> dict[str, Any]:
+    """Read the committed coverage history, or an empty one if absent.
+
+    Absent is a real, expected state (the first ever run) and loads as an
+    empty history. Present-but-unusable is NOT: a malformed file, a
+    non-object, a missing ``runs`` list or an unrecognised
+    ``schema_version`` raises :class:`CoverageHistoryError` naming the path
+    and the offending shape (INV-2 structured-facts-at-failure). The
+    distinction that matters is presence-of-shape, not emptiness-of-content
+    -- exactly as ``extract_done_count`` draws it.
+    """
+    history_path = Path(path)
+    if not history_path.exists():
+        return empty_coverage_history()
+    try:
+        raw = json.loads(history_path.read_text(encoding='utf-8'))
+    except Exception as exc:  # noqa: BLE001 - every unreadable shape is named
+        raise CoverageHistoryError(
+            f'{path}: unreadable coverage history ({type(exc).__name__}: {exc})',
+        ) from exc
+    if not isinstance(raw, dict):
+        raise CoverageHistoryError(
+            f'{path}: coverage history is a {type(raw).__name__}, not an object',
+        )
+    version = raw.get('schema_version')
+    if version != COVERAGE_HISTORY_SCHEMA_VERSION:
+        raise CoverageHistoryError(
+            f'{path}: coverage history schema_version {version!r} is not the '
+            f'{COVERAGE_HISTORY_SCHEMA_VERSION} this build reads -- refusing to '
+            'misread it as one',
+        )
+    if not isinstance(raw.get('runs'), list):
+        raise CoverageHistoryError(
+            f'{path}: coverage history has no "runs" list (found '
+            f'{type(raw.get("runs")).__name__})',
+        )
+    return raw
+
+
+def save_coverage_history(history: dict[str, Any], path: str) -> None:
+    """Write the history file, creating its parent directory if needed."""
+    history_path = Path(path)
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    history_path.write_text(
+        json.dumps(history, indent=2, sort_keys=False) + '\n', encoding='utf-8',
+    )
+
+
+def _registry_history_slices(
+    registry_coverage: dict[str, Any] | None,
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, int]]]:
+    """Split the top-level registry gauge into per-project scalars + a digest.
+
+    The gauge spans projects (each row carries its own ``project_id``), but
+    the history is trended per project, so its rows are rolled up here
+    rather than persisted whole.
+    """
+    if not registry_coverage:
+        return {}, {}
+    per_project: dict[str, dict[str, Any]] = {}
+    digest: dict[str, dict[str, int]] = {}
+    for row in registry_coverage.get('topics') or []:
+        project_id = str(row.get('project_id'))
+        canonical = int(row.get('canonical_count') or 0)
+        bucket = per_project.setdefault(
+            project_id, dict.fromkeys(_HISTORY_REGISTRY_COLUMNS, 0),
+        )
+        bucket['registry_topics_total'] += 1
+        if canonical == 0:
+            bucket['registry_topics_with_zero_canonical'] += 1
+        elif canonical == 1:
+            bucket['registry_topics_with_exactly_one_canonical'] += 1
+        else:
+            bucket['registry_topics_with_multiple_canonical'] += 1
+        digest[f'{project_id}::{row.get("topic")}'] = {
+            'records': int(row.get('records') or 0),
+            'canonical': canonical,
+        }
+    return per_project, {k: digest[k] for k in sorted(digest)}
+
+
+def _coverage_run_row(report: dict[str, Any], *, stamp: str) -> dict[str, Any]:
+    """Distil one census report into a COMPACT persisted run.
+
+    What this row may NOT hold is the load-bearing half. The history is
+    written by a nightly timer and committed, so the bound on the repo's
+    growth has to be STRUCTURAL rather than a promise: every per-project
+    value here is a scalar, and none of ``_table()``'s ``{'entries',
+    'distinct_total'}`` structures may enter. reify alone carries 276
+    distinct topic values; persisting those tables nightly would grow the
+    committed file without bound. The complete tables live in the report
+    artifact, which is REWRITTEN rather than appended.
+
+    The single exception is ``registry_topics``, and only because the
+    COMMITTED 32-entry registry bounds it. It is what lets the trend name
+    the actionable regression -- "this registry topic LOST its canonical"
+    -- at ~32 tiny rows per run instead of 353 live topic values. Its scope
+    is disclosed by construction: a topic outside the registry cannot
+    appear in it.
+
+    *stamp* is INJECTED, never read from the clock here, so a run row is
+    deterministic and testable and the artifact stays reproducible.
+    """
+    registry_by_project, registry_topics = _registry_history_slices(
+        report.get('registry_coverage'),
+    )
+    project_blocks = report.get('projects') or {}
+    projects: dict[str, dict[str, Any]] = {}
+    # The UNION: a registry entry may name a project this run did not
+    # census. Dropping it would shrink the trended target denominator and
+    # make the gauge look closer to met than it is. Its coverage columns
+    # stay None -- not measured is not zero.
+    for project_id in sorted(set(project_blocks) | set(registry_by_project)):
+        coverage_block = (project_blocks.get(project_id) or {}).get('topic_coverage') or {}
+        row: dict[str, Any] = {
+            column: coverage_block.get(column) for column in _HISTORY_COVERAGE_COLUMNS
+        }
+        row.update(
+            registry_by_project.get(project_id)
+            or dict.fromkeys(_HISTORY_REGISTRY_COLUMNS),
+        )
+        projects[project_id] = row
+
+    return {
+        'stamp': stamp,
+        # The regime the counts above were measured under. A uniqueness
+        # violation count trended across a flip of memory_metadata.enforce
+        # is two different series; without the flag beside it the trend is
+        # unreadable. Three-valued -- see read_canonical_uniqueness_enforced.
+        'canonical_uniqueness_enforced': (
+            report.get('topic_coverage') or {}
+        ).get('canonical_uniqueness_enforced'),
+        'registry_error': report.get('registry_error'),
+        'projects': projects,
+        'registry_topics': registry_topics,
+    }
+
+
+def append_coverage_run(
+    history: dict[str, Any],
+    report: dict[str, Any],
+    *,
+    stamp: str,
+    max_runs: int = DEFAULT_MAX_HISTORY_RUNS,
+) -> dict[str, Any]:
+    """Append one run to *history*, oldest-first, returning a NEW history.
+
+    Never mutates its argument: ``_run`` holds the loaded history while it
+    writes artifacts, and an in-place append would leave a half-updated
+    structure behind on a later failure.
+
+    Retention drops from the OLD end when the run count exceeds *max_runs*,
+    and the drop is disclosed in ``retention.dropped_runs`` rather than
+    silently applied -- a truncated history is indistinguishable from a
+    short one, and the whole point of the file is that its span is legible.
+    """
+    runs = [*(history.get('runs') or []), _coverage_run_row(report, stamp=stamp)]
+    dropped_before = int((history.get('retention') or {}).get('dropped_runs') or 0)
+    dropping = max(0, len(runs) - max_runs)
+    kept = runs[dropping:]
+    return {
+        'schema_version': COVERAGE_HISTORY_SCHEMA_VERSION,
+        'retention': {
+            'max_runs': max_runs,
+            'dropped_runs': dropped_before + dropping,
+            'oldest_retained_stamp': kept[0]['stamp'] if kept else None,
+        },
+        'runs': kept,
+    }
+
+
 def _ordered_categories(project_cells: dict[str, CategoryCensus]) -> list[str]:
     """CENSUS_CATEGORIES order first, then any unexpected category, sorted."""
     known = [c.value for c in CENSUS_CATEGORIES if c.value in project_cells]
