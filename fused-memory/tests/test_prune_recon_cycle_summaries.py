@@ -968,13 +968,25 @@ class TestRunApplyStoreMutationPreflight:
         memory.delete_memory = AsyncMock(return_value={'status': 'deleted'})
         return memory
 
+    #: Pure-quiescent boilerplate. ``carries_remediation_history`` is fail-safe
+    #: (anything ambiguous is PRESERVED), so a deletable fixture must be
+    #: unambiguously quiescent or nothing is ever classified for deletion and
+    #: the ``--apply`` assertions become vacuous.
+    _QUIESCENT = 'Cycle summary: quiescent cycle. 0 new episodes, 0 mutations.'
+
     def _records(self) -> list[dict]:
-        """Three summaries in one pool: with keep_recent=2 exactly one is
-        deletable, so ``--apply`` has real work to refuse."""
+        """Three quiescent summaries in one pool: with keep_recent=2 exactly
+        one (the oldest) is deletable, so ``--apply`` has real work to refuse."""
         return [
-            _cycle_summary_record('m1', 'memory_consolidator', '2026-01-01T00:00:00+00:00'),
-            _cycle_summary_record('m2', 'memory_consolidator', '2026-01-02T00:00:00+00:00'),
-            _cycle_summary_record('m3', 'memory_consolidator', '2026-01-03T00:00:00+00:00'),
+            _cycle_summary_record(
+                'm1', 'memory_consolidator', '2026-01-01T00:00:00+00:00', self._QUIESCENT,
+            ),
+            _cycle_summary_record(
+                'm2', 'memory_consolidator', '2026-01-02T00:00:00+00:00', self._QUIESCENT,
+            ),
+            _cycle_summary_record(
+                'm3', 'memory_consolidator', '2026-01-03T00:00:00+00:00', self._QUIESCENT,
+            ),
         ]
 
     def _args(
