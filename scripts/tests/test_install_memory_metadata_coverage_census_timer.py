@@ -227,12 +227,25 @@ def _directives(name) -> dict[str, list[tuple[str, str]]]:
 
     WHY THIS EXISTS. A raw-substring check on a unit's text cannot tell a live
     DIRECTIVE from the COMMENT that explains it -- and these units comment
-    heavily by design. Every literal these tests care about also appears in
-    prose: `Persistent=true` at memory-metadata-coverage-census.timer:20,
-    `census_memory_metadata.py` at memory-metadata-coverage-census.service:7.
-    Deleting the real directive left the substring assertions GREEN, which is
-    the class of finding this closes. Every unit assertion in this file routes
-    through here; no new raw-substring pins.
+    heavily by design. The demonstrated case is `Persistent=true`, which appears
+    BOTH in prose at memory-metadata-coverage-census.timer:20 and as the real
+    directive at :27, so deleting the directive left the substring assertion
+    GREEN. That is the class of finding this closes.
+
+    SCOPED HONESTLY (esc-4006-7). An earlier draft generalized this to "every
+    literal these tests care about also appears in prose" and cited
+    `census_memory_metadata.py` at memory-metadata-coverage-census.service:7 as a
+    second instance. That was measured FALSE and is retracted: the filename
+    occurs exactly ONCE in the service unit, at the real `Documentation=` line,
+    and the comment at :7 never contains it -- so for that directive the old
+    substring form did catch an outright deletion. Routing it through the parser
+    anyway is a STRENGTHENING, not a fix; see
+    `test_service_documents_where_the_normative_contract_lives` for the
+    comment-out edit on which the two forms genuinely diverge.
+
+    Every unit assertion in this file routes through here regardless, so the
+    weaker and stronger cases are not left to be told apart by eye; no new
+    raw-substring pins.
 
     WHY IT IS HAND-ROLLED. Duplicate keys are preserved as separate pairs, never
     collapsed -- the service legitimately carries THREE `Documentation=` lines,
@@ -364,11 +377,24 @@ def test_service_documents_where_the_normative_contract_lives():
     """The census script and the PRD are normative; the unit points a reader at
     them rather than restating any figure that would drift.
 
-    Asserted as parsed `[Unit] Documentation=` VALUES: the bare filename also
-    appears in the unit's own comment at :7, so deleting the real directive left
-    a substring check green. Both entries are checked, which additionally
-    exercises the parser's duplicate-key preservation -- a dict-collapse would
-    keep only the last of the three.
+    Asserted as parsed `[Unit] Documentation=` VALUES rather than as a substring
+    of the file text. CORRECTION (esc-4006-7): an earlier draft of this docstring
+    claimed the bare filename "also appears in the unit's own comment at :7, so
+    deleting the real directive left a substring check green". That was measured
+    FALSE and is retracted -- `census_memory_metadata.py` occurs exactly ONCE in
+    the unit, at the real `Documentation=` line, so the old substring form did
+    catch an outright deletion.
+
+    The parsed form is kept as a STRENGTHENING, not a fix, and this is what it
+    buys: under the plausible comment-out edit (the directive prefixed with `#`
+    rather than removed), the filename is still present in the file text, so a
+    substring check stays green while the unit documents nothing. The parsed form
+    fails, correctly. Do not "simplify" this back to `in text` on the grounds
+    that the two forms are equivalent -- they diverge on exactly that edit.
+
+    Both entries are checked, which additionally exercises the parser's
+    duplicate-key preservation -- a dict-collapse would keep only the last of the
+    three.
     """
     docs = _values(_directives(SERVICE_NAME), 'Unit', 'Documentation')
     assert docs, 'the unit points a reader at nothing'
