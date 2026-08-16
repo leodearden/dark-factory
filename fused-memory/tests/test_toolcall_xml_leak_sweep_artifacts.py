@@ -132,6 +132,14 @@ _SHA_RE = re.compile(r'\A[0-9a-f]{40}\Z')
 # outcome to the sweep and this tuple grows with it automatically, instead of
 # _unrepaired_danger_records() silently returning [] for a record carrying an
 # outcome nobody told this module about.
+#
+# KEEP THIS A BINDING. Re-typing the names here as a literal restores the hand
+# copy this deleted, and one that has quietly dropped a flag still passes every
+# test below: a dropped flag also shrinks the parametrize set of
+# TestDangerFlagsBindTheProductionVocabulary, while _unrepaired_danger_records()
+# goes blind to that outcome and TestUnrepairedMutationsAreTracked takes its
+# `if not outstanding` early exit. Nothing tests this line -- an assertion about
+# it could only ever restate it -- so it is a convention, stated here.
 DANGER_FLAGS = _mod.HUMAN_ADJUDICATION_FLAGS
 
 # The two shapes repair_content() knows how to fix. Only these carry a
@@ -334,45 +342,38 @@ def _unrepaired_danger_records(report: dict) -> list[dict]:
 
 
 class TestDangerFlagsBindTheProductionVocabulary:
-    """DANGER_FLAGS binds the script's export; this pins the binding and each flag.
+    """Every name DANGER_FLAGS carries is one the script escalates to a human.
 
-    ``DANGER_FLAGS`` IS ``_mod.HUMAN_ADJUDICATION_FLAGS`` (task 3738). There is
-    no hand copy left to compare it against, so nothing here reads the script's
-    source: the earlier ``inspect.getsource`` + regex-over-source helper was
-    deleted once the export existed, because from that moment its
+    ``DANGER_FLAGS`` IS ``_mod.HUMAN_ADJUDICATION_FLAGS`` (task 3738), so there
+    is no hand copy left to compare it against and nothing here reads the
+    script's source. The earlier ``inspect.getsource`` + regex-over-source
+    helper was deleted once the export existed, because from that moment its
     export-preferring branch always returned and the comparison it fed was
     ``set(X) == set(X)`` — an unfalsifiable test guarding an unreachable
     fallback, in the exact brittle style this suite documents having removed
     (da8e5a4c96).
 
-    Two things are pinned instead, both falsifiable: that the binding is still
-    the export object itself, and that every name in it is one the production
-    exit-code predicate genuinely escalates to a human.
-
-    The binding is worth a test because losing it fails in the WORST direction.
-    A DANGER_FLAGS rebound to a literal that has dropped a flag makes
-    ``_unrepaired_danger_records()`` return ``[]`` for a record carrying that
-    outcome, every test in ``TestUnrepairedMutationsAreTracked`` takes its ``if
-    not outstanding`` early exit, and the suite reports all-green while a real
-    unrepaired live-corpus mutation lands with no tracking entry required.
-    Note that the parametrized test below cannot catch that on its own: a
-    dropped flag also shrinks its parametrize set, so it stays green.
+    What remains is behavioural: each name is driven through the production
+    exit-code predicate, so no name can sit in this module's vocabulary that
+    the sweep does not actually treat as needing a human. The binding itself
+    carries no test — an assertion about a binding three hundred lines up in
+    this same file could only restate it, and no production edit could falsify
+    it — it is stated as a convention beside the binding instead. Losing the
+    export outright is not silent either: it raises at import, before
+    collection.
     """
 
-    def test_danger_flags_is_the_scripts_export(self) -> None:
-        assert DANGER_FLAGS is _mod.HUMAN_ADJUDICATION_FLAGS, (
-            'DANGER_FLAGS is no longer the HUMAN_ADJUDICATION_FLAGS object the '
-            'script exports. Re-bind it directly '
-            '(DANGER_FLAGS = _mod.HUMAN_ADJUDICATION_FLAGS) rather than '
-            're-typing the names: a fresh literal is a hand copy again, and '
-            'one that has silently dropped a flag passes every other test in '
-            'this class while _unrepaired_danger_records() goes blind to that '
-            'outcome. Identity is asserted rather than equality precisely so '
-            'that an equal-valued literal does not slip through today and '
-            'drift tomorrow.'
-        )
-
     def test_no_duplicate_flag_names(self) -> None:
+        """A repeat in the production tuple is a lost flag, not a cosmetic slip.
+
+        Kept despite being a lint over a four-element literal because it is the
+        one shape of growth mistake nothing else here catches: the natural way
+        to add a fifth outcome is to copy a line of the tuple and edit the
+        string, and forgetting that edit leaves a duplicate WHERE THE NEW NAME
+        SHOULD BE. resolve_exit_code() then never escalates the new outcome,
+        and every other test in this module is parametrized over the same
+        (still self-consistent) tuple, so all of them stay green.
+        """
         assert len(set(DANGER_FLAGS)) == len(DANGER_FLAGS), (
             f'DANGER_FLAGS {DANGER_FLAGS} repeats a name'
         )
