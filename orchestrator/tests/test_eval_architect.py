@@ -769,7 +769,7 @@ def _judge_result_scoring(raw, *, via: str) -> MagicMock:
     docstring in judge.py) — but NOT in this mock: a ``MagicMock`` enforces no
     schema either way, so both deliveries reach the parser with *raw*
     unchecked here. What the ``via`` parametrization actually pins is that the
-    clamp/NaN handling lives AFTER the ``structured_output or
+    clamp / non-finite handling lives AFTER the ``structured_output or
     json.loads(...)`` merge point, so neither delivery path can regress
     independently of the other.
     """
@@ -1223,10 +1223,15 @@ class TestPlanQualityVerdictCarriesJudgeSpend:
         assert verdict.cost_usd == pytest.approx(0.31)
 
     @pytest.mark.asyncio
-    async def test_nan_path_carries_the_invocations_own_spend(self):
+    @pytest.mark.parametrize('raw', [
+        pytest.param(float('nan'), id='nan'),
+        pytest.param(float('inf'), id='positive-infinity'),
+        pytest.param(float('-inf'), id='negative-infinity'),
+    ])
+    async def test_non_finite_path_carries_the_invocations_own_spend(self, raw):
         from orchestrator.evals.judge import judge_plan_quality
 
-        fake = _judge_result_scoring(float('nan'), via='structured_output')
+        fake = _judge_result_scoring(raw, via='structured_output')
         fake.cost_usd = 0.29
         with patch(
             'orchestrator.evals.judge.invoke_agent',
