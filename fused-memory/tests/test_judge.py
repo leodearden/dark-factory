@@ -918,31 +918,52 @@ class TestPhantomRuleIsTheSharedRule:
     "the behaviour comes from one place" are the two halves of the contract.
     """
 
-    def test_issue_prefix_constant_is_rebound_from_shared(self):
-        """Identity, not equality: the prefix must be THE shared object.
+    def test_marker_constants_match_the_shared_spellings(self):
+        """The two module-level constants carry the shared spellings.
 
-        This is the load-bearing half of the constant guard.  ``'Judge
-        response could not be parsed'`` contains spaces, so CPython does not
-        intern it — a re-typed literal in judge.py would be an equal but
-        distinct object and this assertion goes red.
+        EQUALITY, not identity.  The `is`-based assertions this replaces made
+        the suite's pass/fail depend on CPython constant folding: one of them
+        (`'unparseable_judge_response'`, identifier-shaped, therefore interned
+        at compile time) was a no-op that passed even before the hoist, and the
+        other was a genuine check only by accident of the same interning rules.
+        Equality is what the production code actually needs to be true, and it
+        holds under any interpreter.
+
+        Delegation itself is pinned by the two cases below — a spy that proves
+        the call happens, and an equivalence corpus that proves the answers
+        never diverge — neither of which depends on object identity.
         """
-        assert judge_module._UNPARSEABLE_ISSUE_PREFIX is UNPARSEABLE_ISSUE_PREFIX
+        assert judge_module._UNPARSEABLE_ISSUE_PREFIX == UNPARSEABLE_ISSUE_PREFIX
+        assert judge_module._UNPARSEABLE_VERDICT_CODE == UNPARSEABLE_VERDICT_CODE
 
-    def test_verdict_code_constant_is_rebound_from_shared(self):
-        """Same identity check for the structured marker.
+    def test_is_phantom_verdict_calls_the_shared_predicate(self, monkeypatch):
+        """`judge.is_phantom_verdict` DELEGATES; it does not re-implement.
 
-        Honest caveat: this assertion is WEAKER than it looks and passed even
-        before the hoist.  ``'unparseable_judge_response'`` is
-        identifier-shaped (alphanumerics + underscores only), so CPython
-        interns it at compile time and two independently-typed literals are
-        already the same object.  It is kept because it becomes meaningful the
-        moment the marker gains a non-identifier character (a space, a hyphen,
-        a colon), and because a reader comparing the two constant guards
-        should not have to wonder why only one exists.  The real drift guard
-        for this constant is the equivalence corpus below, which fails for any
-        divergence in either constant regardless of interning.
+        Patches the name judge.py bound at import (`judge_module.
+        is_phantom_verdict_row`) with a spy that returns a value the real rule
+        never would for these inputs — an ordinary `ok` verdict with no
+        findings.  If judge.py grew a parallel implementation, it would return
+        False and this goes red.
+
+        This is the assertion the deleted `is`-identity checks were reaching
+        for, without depending on how the interpreter interns str literals.
         """
-        assert judge_module._UNPARSEABLE_VERDICT_CODE is UNPARSEABLE_VERDICT_CODE
+        calls = []
+
+        def _spy(severity, findings):
+            calls.append((severity, findings))
+            return True
+
+        monkeypatch.setattr(judge_module, 'is_phantom_verdict_row', _spy)
+        verdict = JudgeVerdict(
+            run_id='run-delegation',
+            reviewed_at=datetime.now(UTC),
+            severity=VerdictSeverity.ok,
+            findings=[],
+        )
+
+        assert is_phantom_verdict(verdict) is True
+        assert calls == [(VerdictSeverity.ok, [])]
 
     @pytest.mark.parametrize(
         ('severity', 'findings'),
