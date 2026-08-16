@@ -509,14 +509,19 @@ async def test_drain_stats_remediation_inclusive_keys_are_unchanged(recon_db):
 
 
 @pytest.mark.asyncio
-async def test_drain_only_rate_is_the_inclusive_rate_discounted_exactly_once(recon_db):
-    """(d) drain_only = inclusive * (1 - duty), algebraically and exactly.
+async def test_drain_only_rate_excludes_remediation_and_keeps_steady_state(recon_db):
+    """(d) The mode partition is pinned by NUMBER, not by an algebraic identity.
 
-    This identity IS the statement that the inclusive rate already carries the
-    remediation penalty: applying (1 - duty) to it a second time lands on the
-    remediation-free rate, not on a further-degraded one.  A caller wanting the
-    remediation-free figure must therefore READ this key, never re-derive it by
-    discounting the inclusive rate again.
+    Asserting `drain_only == inclusive * (1 - duty)` would be vacuous: both
+    rates share the same event denominator and _CAPACITY_MODES is derived from
+    _DRAIN_ONLY_MODES, so that identity holds for ANY partition — including a
+    wrong one that dropped steady state or kept remediation.  Hand-computed
+    figures do catch that.
+
+    Fixture: backlog 1914s / 719 events, remediation 1495s / 0 events, plus one
+    945s / 50-event steady-state run.
+      drain_only = (1914 + 945) / 769 = 2859 / 769 = 3.7178 s/event
+      inclusive  = (1914 + 945 + 1495) / 769 = 4354 / 769 = 5.6619 s/event
     """
     db = recon_db._db_path
     _seed_addendum_2(db)
@@ -526,14 +531,13 @@ async def test_drain_only_rate_is_the_inclusive_rate_discounted_exactly_once(rec
     )  # a steady-state run, so drain_only covers more than the chunks alone
 
     stats = drain_stats(db, 'reify')
-    duty = remediation_duty_cycle(stats)
 
-    assert stats['drain_only_seconds_per_event'] == pytest.approx(
-        stats['drain_seconds_per_event'] * (1 - duty),
-    )
     # Steady state joins the drain-only wall-clock; remediation still does not.
-    assert stats['drain_only_wall_clock_seconds'] == pytest.approx(1914.0 + 945.0)
+    assert stats['drain_only_wall_clock_seconds'] == pytest.approx(2859.0)
     assert stats['drain_events'] == 769
+    assert stats['drain_only_seconds_per_event'] == pytest.approx(3.7178, abs=0.0001)
+    assert stats['drain_wall_clock_seconds'] == pytest.approx(4354.0)
+    assert stats['drain_seconds_per_event'] == pytest.approx(5.6619, abs=0.0001)
 
 
 @pytest.mark.asyncio
@@ -702,27 +706,31 @@ def test_seconds_per_event_rejects_a_non_positive_batch() -> None:
 
 
 def test_sustainable_events_per_day_applies_utilisation_and_duty_cycle() -> None:
-    """(b) 86400 * utilisation * (1 - duty_cycle) / seconds_per_event."""
+    """(b) 86400 * utilisation * (1 - duty_cycle) / seconds_per_event.
+
+    Hand-computed, not re-implemented: 86400 * 0.562 / 2.43 = 19982.2, halved
+    to 9991.1 at 50% utilisation.  Restating the formula in the assertion would
+    only detect a change made in one place and not the other.
+    """
     # ADDENDUM 2 backlog-chunk rate, with the measured remediation duty cycle.
-    assert sustainable_events_per_day(2.43, 0.438, 1.0) == pytest.approx(
-        86400 * 1.0 * (1 - 0.438) / 2.43,
-    )
     assert sustainable_events_per_day(2.43, 0.438, 1.0) == pytest.approx(19982.2, abs=0.1)
     # Utilisation scales linearly.
-    assert sustainable_events_per_day(2.43, 0.438, 0.5) == pytest.approx(
-        sustainable_events_per_day(2.43, 0.438, 1.0) / 2,
-    )
+    assert sustainable_events_per_day(2.43, 0.438, 0.5) == pytest.approx(9991.1, abs=0.1)
 
 
 def test_sustainable_events_per_day_recovers_the_duty_cycle_lever_1_removes() -> None:
     """(b) Driving the duty cycle to 0 is worth 1/(1-0.438) ~ 1.8x on the same rate.
 
     That is the whole of lever 1: a scheduling change, no per-event work saved.
+    Both endpoints are pinned by value (86400/2.43 = 35555.6 with no
+    remediation, 19982.2 with it), so the ratio cannot be satisfied by two
+    equally-wrong figures.
     """
     with_remediation = sustainable_events_per_day(2.43, 0.438, 1.0)
     without = sustainable_events_per_day(2.43, 0.0, 1.0)
-    assert without / with_remediation == pytest.approx(1 / (1 - 0.438))
-    assert without / with_remediation > 1.7
+    assert with_remediation == pytest.approx(19982.2, abs=0.1)
+    assert without == pytest.approx(35555.6, abs=0.1)
+    assert without / with_remediation == pytest.approx(1.7794, abs=0.0001)
 
 
 def test_sustainable_events_per_day_rejects_impossible_inputs() -> None:
@@ -750,7 +758,8 @@ def test_capacity_verdict_is_insufficient_for_the_pre_fix_ceiling() -> None:
 
     verdict = capacity_verdict(pre_fix, OBSERVED_BURST_EVENTS_PER_DAY)
     assert verdict['verdict'] == 'insufficient'
-    assert verdict['headroom_ratio'] == pytest.approx(pre_fix / 3500)
+    # 2368.6 / 3500, hand-computed rather than re-derived from pre_fix.
+    assert verdict['headroom_ratio'] == pytest.approx(0.6767, abs=0.0001)
     assert verdict['headroom_ratio'] < 1.0
 
 
@@ -863,22 +872,29 @@ async def test_build_report_applies_the_remediation_penalty_exactly_once(recon_d
 async def test_build_report_lever_1_delta_is_exactly_the_duty_cycle(recon_db):
     """The gap between the two capacity figures IS the remediation duty cycle.
 
-    Pinning the identity keeps the pair from drifting apart: whatever the
-    window, the post-lever-1 figure is the observed one scaled by 1/(1-duty),
-    because lever 1 removes remediation from the drain path and changes nothing
-    else.
+    Pinned by hand-computed numbers rather than by `ratio == 1/(1-duty)`: that
+    identity is true of the implementation's own algebra whatever the mode
+    partition, so it would survive a dropped remediation exclusion.  These
+    won't.
+
+    Fixture: 719 events; backlog 1914s; remediation 1495s; total 3409s.
+      duty      = 1495 / 3409                = 0.4385
+      observed  = 86400 * 719 / 3409         = 18222.8/day
+      lever 1   = 86400 * 719 / 1914         = 32456.4/day
+      ratio     = 3409 / 1914                = 1.7811
     """
     db = recon_db._db_path
     _seed_addendum_2(db)
 
     report = build_report(db, 'reify')
-    duty = report['remediation_duty_cycle']
 
-    assert duty == pytest.approx(1495.0 / 3409.0)
+    assert report['remediation_duty_cycle'] == pytest.approx(0.4385, abs=0.0001)
+    assert report['sustainable_events_per_day'] == pytest.approx(18222.8, abs=1.0)
+    assert report['remediation_free_events_per_day'] == pytest.approx(32456.4, abs=1.0)
     assert (
         report['remediation_free_events_per_day']
         / report['sustainable_events_per_day']
-    ) == pytest.approx(1 / (1 - duty))
+    ) == pytest.approx(1.7811, abs=0.0001)
 
 
 @pytest.mark.asyncio
@@ -928,56 +944,6 @@ async def test_build_report_degrades_on_an_empty_database(recon_db):
 
 
 @pytest.mark.asyncio
-async def test_build_report_survives_a_cleanup_drained_signature_change(
-    recon_db, monkeypatch,
-):
-    """A renamed cleanup_drained parameter must not take the whole report down.
-
-    `_retention_note` reads the live cleanup window off
-    `EventBuffer.cleanup_drained`'s signature — good, because that is what
-    stops the caveat drifting into a confident lie.  But an unrelated rename of
-    `max_age_seconds` would turn a KeyError loose at report-BUILD time, killing
-    the drain, inflow and capacity figures an operator actually paged the tool
-    for.  A retention caveat is the least important line in the payload; it
-    must degrade to 'omit one number', never to 'crash'.
-
-    The monkeypatch works because `_retention_note` imports EventBuffer lazily
-    inside the function body (deliberately — event_buffer imports
-    `utc_hour_bucket` from throughput at module scope, so a top-level import
-    back would be circular), so the patched class attribute is picked up.
-    """
-    db = recon_db._db_path
-    _seed_addendum_2(db)
-    # A signature with no `max_age_seconds` parameter at all.
-    monkeypatch.setattr(EventBuffer, 'cleanup_drained', lambda self: None)
-
-    report = build_report(db, 'reify')
-
-    assert isinstance(report['retention_note'], str)
-    assert report['retention_note'], 'the note must degrade, not vanish'
-    # The figures the operator came for are unaffected.
-    assert report['sustainable_events_per_day'] == pytest.approx(18222.8, abs=1.0)
-    assert report['drain']['drain_events'] == 719
-
-
-@pytest.mark.asyncio
-async def test_main_survives_a_cleanup_drained_signature_change(
-    recon_db, monkeypatch, capsys,
-):
-    """The CLI degrades the same way: exit 0 and parseable JSON, not a traceback."""
-    db = recon_db._db_path
-    _seed_addendum_2(db)
-    monkeypatch.setattr(EventBuffer, 'cleanup_drained', lambda self: None)
-
-    rc = main(['--db', str(db), '--project', 'reify', '--json'])
-
-    assert rc == 0
-    printed = json.loads(capsys.readouterr().out)
-    assert isinstance(printed['retention_note'], str)
-    assert printed['retention_note']
-
-
-@pytest.mark.asyncio
 async def test_build_report_threads_since_into_both_halves(recon_db):
     """`since` filters inflow and drain alike, so the two halves stay comparable."""
     db = recon_db._db_path
@@ -987,10 +953,52 @@ async def test_build_report_threads_since_into_both_halves(recon_db):
     report = build_report(db, 'reify', since='2026-07-25T14:00:00+00:00')
 
     assert report['since'] == '2026-07-25T14:00:00+00:00'
+    assert report['since_effective'] == '2026-07-25T14:00:00+00:00'
     assert report['inflow']['hourly'] == {'2026-07-25T14': 2, '2026-07-26T00': 1}
     # Only the 14:13 chunk and the 14:29 remediation started at/after the floor.
     assert report['drain']['modes']['backlog_chunk']['run_count'] == 1
     assert report['drain']['modes']['remediation']['run_count'] == 1
+
+
+@pytest.mark.asyncio
+async def test_build_report_since_covers_one_window_off_the_hour(recon_db):
+    """An off-the-hour `since` must not give the two halves different windows.
+
+    Inflow reads hourly-bucketed data, so it can only floor to the hour; drain
+    compares an exact instant against runs.started_at.  Left unaligned,
+    `--since 14:30` counted arrivals from 14:00 while ignoring every run that
+    started before 14:30 — including the 14:13 chunk and the 14:29:41
+    remediation — so the inflow-vs-capacity comparison, which is the whole
+    point of the tool, silently compared unequal windows.
+
+    Both halves now floor to 14:00, so an off-the-hour `since` produces exactly
+    the same window as the on-the-hour one.
+    """
+    db = recon_db._db_path
+    await _seed_inflow(recon_db)
+    _seed_addendum_2(db)
+
+    off_hour = build_report(db, 'reify', since='2026-07-25T14:30:00+00:00')
+    on_hour = build_report(db, 'reify', since='2026-07-25T14:00:00+00:00')
+
+    assert off_hour['since'] == '2026-07-25T14:30:00+00:00', (
+        'the requested value is echoed verbatim'
+    )
+    assert off_hour['since_effective'] == '2026-07-25T14:00:00+00:00', (
+        'the widening must be visible in the payload, not implicit'
+    )
+
+    # The drain half honours the SAME floor the inflow half was already using:
+    # the 14:13:36 chunk (326 events) and the 14:29:41 remediation are in.
+    assert off_hour['drain']['modes']['backlog_chunk']['run_count'] == 1
+    assert off_hour['drain']['modes']['backlog_chunk']['events'] == 326
+    assert off_hour['drain']['modes']['remediation']['run_count'] == 1
+    assert off_hour['inflow']['hourly'] == {'2026-07-25T14': 2, '2026-07-26T00': 1}
+
+    assert off_hour['drain'] == on_hour['drain']
+    assert off_hour['inflow'] == on_hour['inflow']
+    assert off_hour['sustainable_events_per_day'] == pytest.approx(
+        on_hour['sustainable_events_per_day'])
 
 
 @pytest.mark.asyncio
@@ -1005,7 +1013,11 @@ async def test_main_prints_the_report_as_json_and_returns_zero(recon_db, capsys)
 
     printed = json.loads(capsys.readouterr().out)
     assert printed == build_report(db, 'reify')
+    # Pinned by value too: equality with build_report alone would pass for any
+    # report, including a wrong one.
     assert printed['remediation_duty_cycle'] == pytest.approx(0.438, abs=0.001)
+    assert printed['sustainable_events_per_day'] == pytest.approx(18222.8, abs=1.0)
+    assert printed['inflow']['total_events'] == 7
 
 
 @pytest.mark.asyncio
@@ -1040,6 +1052,55 @@ async def test_main_without_json_prints_a_readable_summary(recon_db, capsys):
     assert 'reify' in out
     assert 'remediation' in out.lower()
     assert out.strip(), 'the default output must not be empty'
+
+
+@pytest.mark.asyncio
+async def test_main_reports_an_unparseable_since_as_a_since_error(recon_db, capsys):
+    """A bad --since names --since, and never reaches the database."""
+    db = recon_db._db_path
+    _seed_addendum_2(db)
+
+    rc = main(['--db', str(db), '--project', 'reify', '--since', 'yesterday-ish'])
+
+    assert rc != 0
+    captured = capsys.readouterr()
+    message = captured.err + captured.out
+    assert '--since' in message
+    assert 'yesterday-ish' in message, 'the message must quote the value that failed'
+    assert 'Traceback' not in message
+
+
+@pytest.mark.asyncio
+async def test_main_reports_a_corrupt_row_as_a_database_error(recon_db, capsys):
+    """A malformed stored timestamp must not be misreported as a --since failure.
+
+    build_report raises ValueError from utc_hour_bucket on a corrupt
+    event_buffer.timestamp, exactly as it does for an unparseable --since.  A
+    blanket `except ValueError` blamed --since for both, so an operator who
+    never passed --since was told `could not parse --since None` and never saw
+    the corrupt-row diagnosis.
+    """
+    db = recon_db._db_path
+    _seed_addendum_2(db)
+    await _seed_inflow(recon_db)
+
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("UPDATE event_buffer SET timestamp = 'not-a-timestamp'")
+        conn.commit()
+    finally:
+        conn.close()
+
+    rc = main(['--db', str(db), '--project', 'reify', '--json'])
+
+    assert rc != 0
+    captured = capsys.readouterr()
+    message = captured.err + captured.out
+    assert str(db) in message, 'the message must name the database that is corrupt'
+    assert '--since' not in message, (
+        'the operator passed no --since; blaming it hides the real diagnosis'
+    )
+    assert 'Traceback' not in message
 
 
 def test_main_reports_a_missing_database_without_a_traceback(tmp_path, capsys):

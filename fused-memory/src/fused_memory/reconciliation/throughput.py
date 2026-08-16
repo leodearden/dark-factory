@@ -144,6 +144,26 @@ def _normalise_since(since: str | None) -> str | None:
     return utc_hour_bucket(since)
 
 
+def _hour_floor_instant(since: str | None) -> str | None:
+    """``since`` floored to the start of its UTC hour, as an ISO8601 instant.
+
+    The inflow half of the report reads hourly-bucketed data, so it can only
+    ever honour a floor at hour granularity — a sub-hour ``since`` is silently
+    rounded DOWN there.  The drain half compares an exact instant against
+    ``runs.started_at`` and would honour it precisely.  Left alone, the two
+    halves would cover different windows (``--since 14:30`` counting arrivals
+    from 14:00 but only runs from 14:30), which quietly breaks the
+    inflow-vs-capacity comparison the tool exists to make.
+
+    So :func:`build_report` floors ONCE, here, and threads the floored instant
+    into both halves.  Flooring rather than rejecting a sub-hour value keeps
+    the CLI forgiving; the floored value is echoed in the payload as
+    ``since_effective`` so the widening is visible rather than assumed.
+    """
+    bucket = _normalise_since(since)
+    return None if bucket is None else f'{bucket}:00:00+00:00'
+
+
 def _arrival_counts(
     db_path: str | Path,
     project_id: str,
@@ -670,66 +690,33 @@ def capacity_verdict(
 
 
 def _retention_note() -> str:
-    """The report's own measurement caveat, derived from the live cleanup window.
+    """The report's own measurement caveat.
 
     ``cleanup_drained`` is the only ``DELETE FROM event_buffer`` in the
     codebase, so before task 3049 added the ``event_arrival_hourly`` rollup a
-    project's arrival history survived only as long as that window — NOT the
-    week the task's ask (a) assumed.  (``event_journal`` is no help either: it
-    is a write-ahead log whose ``mark_processed`` deletes the row.)  Inflow
-    from before the rollup landed is therefore gone for good, and a reader of
-    this report has to know that before drawing a trend from it.
+    project's arrival history survived only as long as that cleanup window —
+    NOT the week the task's ask (a) assumed.  (``event_journal`` is no help
+    either: it is a write-ahead log whose ``mark_processed`` deletes the row.)
+    Inflow from before the rollup landed is therefore gone for good, and a
+    reader of this report has to know that before drawing a trend from it.
 
-    The window is read off ``EventBuffer.cleanup_drained``'s own signature
-    rather than restated here, so retuning the cleanup cannot turn this note
-    into a confident lie.  The import is deliberately LAZY: ``event_buffer``
-    imports ``utc_hour_bucket`` from this module at module scope, so a
-    top-level import back would be circular.
-
-    That introspection is NON-FATAL by design.  A retention caveat is the least
-    important line in the payload, so it must never be able to take down the
-    drain / inflow / capacity figures an operator actually paged the tool for.
-    Renaming ``max_age_seconds`` — an edit with no connection to this module —
-    would otherwise raise a ``KeyError`` at report-BUILD time and kill the
-    whole report and CLI.  When the window cannot be determined the note
-    degrades to a window-free variant of the same caveat: the failure mode goes
-    from 'crash the report' to 'omit one number', and the caveat itself
-    survives intact.
+    Deliberately states NO window figure (amendment).  An earlier shape read
+    the live default off ``EventBuffer.cleanup_drained``'s signature, which
+    bought one interpolated number at the price of a report-build-time coupling
+    to a parameter NAME in another module, a lazy import to dodge a circular
+    one, and a degradation path so an unrelated rename could not take the whole
+    report down.  The caveat is qualitative anyway: what a reader must act on
+    is that pre-rollup inflow is UNRECOVERABLE, not how many seconds of it the
+    sweep kept.  Callers that need the number have the config in hand.
     """
-    window: float | None = None
-    try:
-        import inspect
-
-        from fused_memory.reconciliation.event_buffer import EventBuffer
-
-        parameter = inspect.signature(
-            EventBuffer.cleanup_drained).parameters.get('max_age_seconds')
-        if parameter is not None and isinstance(parameter.default, int | float):
-            window = float(parameter.default)
-    except (ImportError, TypeError, ValueError):
-        window = None
-
-    if window is None:
-        # Window-free variant — never a partially-formatted string naming a
-        # window we could not actually read.
-        scope = (
-            'EventBuffer.cleanup_drained deletes drained rows past a configured '
-            'age, which is the only DELETE FROM event_buffer in the codebase'
-        )
-    else:
-        scope = (
-            f'EventBuffer.cleanup_drained deletes drained rows older than '
-            f'{int(window)}s ({int(window) / 3600:.1f}h), which is the only '
-            f'DELETE FROM event_buffer in the codebase'
-        )
-
     return (
-        f'Inflow retention: {scope}. Task 3049 added the event_arrival_hourly '
-        f'rollup INSIDE that delete transaction, so from then on arrival '
-        f'history is durable and exact. Inflow from before the rollup landed '
-        f'was destroyed by that delete and is unrecoverable — treat any window '
-        f'extending back past the rollup as truncated, not as a period of low '
-        f'inflow.'
+        'Inflow retention: EventBuffer.cleanup_drained deletes drained rows '
+        'past a configured age, and is the only DELETE FROM event_buffer in '
+        'the codebase. Task 3049 added the event_arrival_hourly rollup INSIDE '
+        'that delete transaction, so from then on arrival history is durable '
+        'and exact. Inflow from before the rollup landed was destroyed by that '
+        'delete and is unrecoverable — treat any window extending back past '
+        'the rollup as truncated, not as a period of low inflow.'
     )
 
 
@@ -744,11 +731,16 @@ def build_report(
         db_path: Path to reconciliation.db (opened read-only).
         project_id: Project to report on.
         since: Optional inclusive floor — an ISO8601 timestamp or hour bucket.
-            Threaded into BOTH halves so inflow and drain cover the same
-            window and can be compared directly.
+            FLOORED to the start of its UTC hour and threaded into BOTH halves,
+            so inflow and drain cover the same window and can be compared
+            directly.  Inflow is hourly-bucketed data and cannot honour a
+            sub-hour floor; applying the same floor to drain is what keeps the
+            two halves aligned.  The floored value is echoed as
+            ``since_effective``; ``since`` echoes what was asked for.
 
     Returns:
         A JSON-serialisable dict with ``project_id``, ``db_path``, ``since``,
+        ``since_effective``,
         ``inflow`` (hourly / daily / composition / total_events), ``drain``
         (the :func:`drain_stats` payload), ``remediation_duty_cycle``,
         ``sustainable_events_per_day``, ``capacity_verdict``,
@@ -775,9 +767,11 @@ def build_report(
         number; the REPORT's job is to say 'unknown' instead of propagating
         that to an operator who merely pointed the tool at a fresh database.
     """
-    drain = drain_stats(db_path, project_id, since)
+    # ONE floor, applied to both halves — see _hour_floor_instant.
+    effective_since = _hour_floor_instant(since)
+    drain = drain_stats(db_path, project_id, effective_since)
     duty = remediation_duty_cycle(drain)
-    daily = inflow_daily(db_path, project_id, since)
+    daily = inflow_daily(db_path, project_id, effective_since)
 
     # BOTH duty arguments below are 0.0, and that is NOT a bug to 'fix'.
     # Per the drain_stats two-rates contract, each rate already carries its own
@@ -807,8 +801,9 @@ def build_report(
         'project_id': project_id,
         'db_path': str(db_path),
         'since': since,
+        'since_effective': effective_since,
         'inflow': {
-            'hourly': inflow_hourly(db_path, project_id, since),
+            'hourly': inflow_hourly(db_path, project_id, effective_since),
             'daily': daily['daily'],
             'composition': daily['composition'],
             'total_events': daily['total_events'],
@@ -834,6 +829,9 @@ def _format_report(report: dict[str, Any]) -> str:
     lines = [f'project: {report["project_id"]}  db: {report["db_path"]}']
     if report['since']:
         lines.append(f'since:   {report["since"]}')
+        if report['since_effective'] != report['since']:
+            lines.append(f'         (floored to {report["since_effective"]} for '
+                         f'BOTH inflow and drain — inflow is hourly)')
 
     inflow = report['inflow']
     lines.append(f'inflow:  {inflow["total_events"]} events over '
@@ -924,18 +922,32 @@ def main(argv: list[str] | None = None) -> int:
             --db data/reconciliation/reconciliation.db --project reify --json
 
     Returns:
-        0 on success; 1 when the database is missing or a ``since`` value
-        cannot be parsed.  Both are operator input errors, so they surface as a
-        one-line stderr message and a non-zero exit rather than a traceback.
+        0 on success; 1 when the database is missing, a ``since`` value cannot
+        be parsed, or the database holds a malformed timestamp.  Each surfaces
+        as a one-line stderr message and a non-zero exit rather than a
+        traceback — and each names the thing that was actually wrong.
+
+    The ``--since`` parse is validated EAGERLY, on its own, before the report
+    runs.  ``build_report`` raises ValueError of its own accord on a corrupt
+    ``event_buffer.timestamp`` or ``runs.started_at`` row, so a blanket
+    ``except ValueError`` would report a data-corruption diagnosis as a
+    ``--since`` parse failure — pointing an operator at an argument they may
+    never have supplied and hiding the row that is actually broken.
     """
     args = _build_parser().parse_args(argv)
+    try:
+        _hour_floor_instant(args.since)
+    except ValueError as e:
+        print(f'error: could not parse --since {args.since!r}: {e}', file=sys.stderr)
+        return 1
+
     try:
         report = build_report(args.db, args.project, args.since)
     except FileNotFoundError as e:
         print(f'error: {e}', file=sys.stderr)
         return 1
     except ValueError as e:
-        print(f'error: could not parse --since {args.since!r}: {e}', file=sys.stderr)
+        print(f'error: malformed timestamp in {args.db}: {e}', file=sys.stderr)
         return 1
 
     print(json.dumps(report, indent=2) if args.json else _format_report(report))
