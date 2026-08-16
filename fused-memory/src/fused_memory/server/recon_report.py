@@ -1673,6 +1673,7 @@ class ReconReportState:
 
     def _log_cite_task_fold_purge(
         self,
+        *,
         run_id: str,
         fold: Literal['project_scoped', 'entity_scoped'],
         owning_entry: _ReportEntry,
@@ -1712,6 +1713,14 @@ class ReconReportState:
         ``description`` / ``suggested_action`` need no capping here —
         :meth:`add_finding` already truncates both to
         ``_MAX_FINDING_TEXT_CHARS`` before storage.
+
+        KEYWORD-ONLY deliberately: four of the parameters are plain ``str``
+        (``run_id``, ``surviving_finding_id``, ``attempted_project_id``,
+        ``attempted_task_id``), so a transposed pair at a call site — most
+        plausibly a future third one — would type-check, run, and emit a
+        silently WRONG recovery log on the one path that has no other record
+        to cross-check against. Keeping them named makes that class of
+        mistake unrepresentable rather than merely untested.
         """
         logger.warning(
             'recon_report: cite_task fold purged finding %r (%s fold) — its content is '
@@ -2006,26 +2015,26 @@ class ReconReportState:
         # both would hit, purge runs exactly once, either way.
         if project_existing_id is not None and project_existing_id != finding.finding_id:
             self._log_cite_task_fold_purge(
-                run_id,
-                'project_scoped',
-                finding_entry,
-                finding,
-                project_existing_id,
-                project_id,
-                task_id,
+                run_id=run_id,
+                fold='project_scoped',
+                owning_entry=finding_entry,
+                finding=finding,
+                surviving_finding_id=project_existing_id,
+                attempted_project_id=project_id,
+                attempted_task_id=task_id,
             )
             self._purge_finding(run_id, finding_entry, finding)
             self._persist_run(run_id)
             return _duplicate_finding_error(project_existing_id)
         if entity_existing_id is not None and entity_existing_id != finding.finding_id:
             self._log_cite_task_fold_purge(
-                run_id,
-                'entity_scoped',
-                finding_entry,
-                finding,
-                entity_existing_id,
-                project_id,
-                task_id,
+                run_id=run_id,
+                fold='entity_scoped',
+                owning_entry=finding_entry,
+                finding=finding,
+                surviving_finding_id=entity_existing_id,
+                attempted_project_id=project_id,
+                attempted_task_id=task_id,
             )
             self._purge_finding(run_id, finding_entry, finding)
             self._persist_run(run_id)
