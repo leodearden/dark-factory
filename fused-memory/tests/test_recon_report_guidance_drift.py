@@ -19,7 +19,8 @@ This module asserts:
   _FROZEN_RECON_REPORT_SIGNATURE_SPECS through the same template and
   render_call() as the live guidance — equals render_recon_report_tool_guidance(),
   and the frozen signature snapshot matches the live tool signatures (name,
-  order, required-ness). See TestFallbackIsDerivedFromTheSameRenderer.
+  order, required-ness, and tool-set coverage in both directions). See
+  TestFallbackIsDerivedFromTheSameRenderer.
 
 A minimal smoke test also confirms render_recon_report_tool_guidance() runs
 cleanly and produces non-empty text. For that GENERATED path specifically,
@@ -227,15 +228,22 @@ class TestReconReportGuidanceFallback:
         introspection failure clears should get the real generated guidance
         again in the SAME process, not the fallback forever.
 
-        The self-heal property is proven by the fallback branch NOT running on
-        the healed call (no ERROR log containing "falling back"), rather than by
-        the healed text differing from the fallback. The fallback is
-        derived from a frozen signature snapshot through the same renderer as
-        the live guidance, so the two strings are byte-identical whenever the
-        snapshot is in sync with the live signatures — which is the intended
-        steady state, not a bug. That makes `healed != _frozen_recon_report_tool_guidance()`
-        false by construction, so it can no longer discriminate which code path
-        ran — do not restore it.
+        The self-heal property is proven DIRECTLY (reviewer test-quality
+        finding): the healed call is shown to re-invoke
+        get_recon_report_tool_signatures itself, via a counting spy wrapped
+        around the real function, rather than only indirectly via the
+        absence of a "falling back" ERROR log. Log-absence alone is a fragile
+        discriminator — it silently stops discriminating if the module
+        logger is ever given `propagate=False`, if the log message wording
+        changes, or if a caplog level/handler change hides the record — so it
+        is kept here only as a secondary signal, not the proof. Text equality
+        (`healed == _frozen_recon_report_tool_guidance()`) is not usable as a
+        discriminator at all: the fallback is derived from a frozen signature
+        snapshot through the same renderer as the live guidance, so the two
+        strings are byte-identical whenever the snapshot is in sync with the
+        live signatures — the intended steady state, not a bug — which makes
+        that comparison true on both branches. Do not restore it as the
+        discriminator.
         """
 
         def _raise():
@@ -247,9 +255,32 @@ class TestReconReportGuidanceFallback:
         assert get_recon_report_tool_guidance() == _frozen_recon_report_tool_guidance()
 
         monkeypatch.undo()
+
+        # Wrap the REAL function (the module-level import above, never touched
+        # by monkeypatching fused_memory.server.recon_report's attribute) in a
+        # counting spy so the healed call's re-invocation of live introspection
+        # is an observed fact, not an inference from a log line or a string
+        # comparison that can no longer distinguish the two code paths.
+        real_get_signatures = get_recon_report_tool_signatures
+        call_count = 0
+
+        def _counting_get_signatures():
+            nonlocal call_count
+            call_count += 1
+            return real_get_signatures()
+
+        monkeypatch.setattr(
+            'fused_memory.server.recon_report.get_recon_report_tool_signatures',
+            _counting_get_signatures,
+        )
         caplog.clear()
         with caplog.at_level(logging.ERROR):
             healed = get_recon_report_tool_guidance()
+
+        assert call_count == 1, (
+            'healed call must re-invoke live introspection exactly once — got '
+            f'{call_count} call(s) to get_recon_report_tool_signatures'
+        )
         assert healed == render_recon_report_tool_guidance()
         fallback_error_records = [
             r
@@ -291,8 +322,10 @@ class TestFallbackIsDerivedFromTheSameRenderer:
     render_call() as the live guidance (render_recon_report_tool_guidance()), so
     the two cannot drift apart in WORDING — there is only one prose template and
     one renderer. The only surface that can still go stale is the snapshot's
-    parameter data (names, order, required-ness); the two tests below pin that
-    directly, comparing data structures rather than scanning rendered prose.
+    parameter data (names, order, required-ness, and — per the reviewer's
+    test-coverage finding — tool-set coverage in BOTH directions); the two
+    tests below pin that directly, comparing data structures rather than
+    scanning rendered prose.
     """
 
     def test_fallback_equals_live_generated_guidance(self):
@@ -303,8 +336,53 @@ class TestFallbackIsDerivedFromTheSameRenderer:
         )
 
     def test_frozen_snapshot_matches_live_signatures(self):
-        """Diagnostic partner to the test above: a precise dict diff, not a multi-KB string diff."""
+        """Diagnostic partner to the test above: a precise dict diff, not a multi-KB string diff.
+
+        Also guards the drift check itself against being one-directional
+        (reviewer test-coverage finding): comparing only the tools already
+        present in _FROZEN_RECON_REPORT_SIGNATURE_SPECS can never notice a
+        NEW agent-called tool the snapshot doesn't know about yet — it would
+        silently get no rendered guidance — and a renamed/removed live tool
+        would otherwise surface as a bare `KeyError` below instead of an
+        actionable message. The key-set assertions catch both before the
+        per-tool value comparison runs.
+        """
         sigs = get_recon_report_tool_signatures()
+
+        assert set(_FROZEN_RECON_REPORT_SIGNATURE_SPECS) == set(_AGENT_CALLED_REPORT_TOOLS), (
+            'The frozen snapshot and _AGENT_CALLED_REPORT_TOOLS have diverged — '
+            'update _FROZEN_RECON_REPORT_SIGNATURE_SPECS in '
+            'reconciliation/prompts/__init__.py and/or _AGENT_CALLED_REPORT_TOOLS '
+            'above to match.'
+        )
+        assert set(_AGENT_CALLED_REPORT_TOOLS) <= set(sigs), (
+            'A tool in _AGENT_CALLED_REPORT_TOOLS is no longer registered on the live '
+            'recon_report server — update _AGENT_CALLED_REPORT_TOOLS above and '
+            '_FROZEN_RECON_REPORT_SIGNATURE_SPECS in reconciliation/prompts/__init__.py.'
+        )
+        # start_report is harness-called; delete_finding and
+        # write_entity_standing_decision are registered on the live server but
+        # are never rendered by render_recon_report_tool_guidance() either (see
+        # plan.json's design decision on tool scope — verified empirically
+        # against get_recon_report_tool_signatures() at amendment time: these
+        # 3 plus the 9 in _AGENT_CALLED_REPORT_TOOLS are the complete live set).
+        # Any OTHER live tool is therefore a newly-registered agent-called tool
+        # the guidance would silently omit.
+        not_agent_guidance_tools = {
+            'start_report',
+            'delete_finding',
+            'write_entity_standing_decision',
+        }
+        undeclared = set(sigs) - not_agent_guidance_tools - set(_AGENT_CALLED_REPORT_TOOLS)
+        assert not undeclared, (
+            f'The live recon_report server has tool(s) {undeclared} not covered by '
+            '_AGENT_CALLED_REPORT_TOOLS and not in the known non-agent-guidance set '
+            f'{not_agent_guidance_tools} — a newly registered agent-called tool would '
+            'get no rendered guidance. Add it to _AGENT_CALLED_REPORT_TOOLS above and '
+            'to _FROZEN_RECON_REPORT_SIGNATURE_SPECS and the render_call(...) list in '
+            'reconciliation/prompts/__init__.py.'
+        )
+
         live = {
             tool: tuple(
                 (name, param.default is inspect.Parameter.empty)
