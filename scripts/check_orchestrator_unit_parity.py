@@ -399,6 +399,26 @@ def compare_unit(
     return drifts
 
 
+def _render_kinds(kinds: Sequence[str]) -> str:
+    """Render one unit's verdict kinds in VERDICT_KINDS precedence order.
+
+    Ordering by the published tuple — rather than by insertion or by set
+    iteration — is what makes ``drift,override`` a CONTRACT: the same findings
+    always render the same string, so a consumer can diff one run's verdicts
+    against another's, or one host's against another's.
+
+    A kind outside the vocabulary is APPENDED rather than dropped by the
+    filter.  Dropping it would silently shrink a unit's verdict, and could
+    empty it entirely — which the consumer reads as "no verdict", i.e. a
+    unit skipped with no stated cause.  Surfacing it instead lands it in
+    setup-host.sh's loud ``*)`` arm, which names the kind verbatim.
+    """
+    present = set(kinds)
+    ordered = [kind for kind in VERDICT_KINDS if kind in present]
+    ordered += sorted(present.difference(VERDICT_KINDS))
+    return ",".join(ordered)
+
+
 def find_dropins(installed_dir: pathlib.Path, unit_name: str) -> list[pathlib.Path]:
     """Return the ``.conf`` drop-ins systemd would layer over *unit_name*.
 
@@ -543,7 +563,22 @@ def main(argv: Sequence[str]) -> int:
     # Populated ALONGSIDE the buckets above, at the same points in the loop, so
     # the machine channel and the human report can never describe different
     # runs. Nothing here feeds the exit code or the report.
+    #
+    # The loop's control flow IS the precedence, and it is preserved exactly as
+    # it already stood: a `vanished` or `absent` unit takes a `continue` before
+    # drop-ins are ever consulted, so neither can be combined with anything —
+    # there is nothing installed to override, or nothing committed to compare.
+    # `unreadable` is reached AFTER the drop-in check, so an unreadable unit
+    # can legitimately also be `override`. `clean` requires both no drift and
+    # no drop-in, so it too is mutually exclusive with every other kind: the
+    # two install-eligible kinds (`clean`, `absent`) never appear alongside a
+    # blocking one, which is what lets the consumer decide per unit on the kind
+    # list alone.
     verdicts: dict[str, list[str]] = {}
+
+    def _mark(unit: str, kind: str) -> None:
+        """Record *kind* for *unit*; order is imposed at render time."""
+        verdicts.setdefault(unit, []).append(kind)
 
     for name in selected:
         repo_path = repo_root / UNITS[name]
@@ -553,10 +588,12 @@ def main(argv: Sequence[str]) -> int:
             # The committed unit is the source of truth; without it there is
             # nothing to compare against, so this unit was NOT checked.
             vanished.append((name, repo_path))
+            _mark(name, "vanished")
             continue
 
         if not installed_path.is_file():
             missing.append((name, installed_path))
+            _mark(name, "absent")
             continue
 
         # Checked even when the unit itself is at parity: a drop-in is layered
@@ -565,6 +602,7 @@ def main(argv: Sequence[str]) -> int:
         dropins = find_dropins(installed_dir, name)
         if dropins:
             overridden.append((name, dropins))
+            _mark(name, "override")
 
         # is_file() above establishes the files EXIST, not that they can be
         # read: either side can be mode 000, or not valid UTF-8. Unguarded,
@@ -583,11 +621,13 @@ def main(argv: Sequence[str]) -> int:
             repo_text = repo_path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
             unreadable.append((name, repo_path, str(exc)))
+            _mark(name, "unreadable")
             continue
         try:
             installed_text = installed_path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
             unreadable.append((name, installed_path, str(exc)))
+            _mark(name, "unreadable")
             continue
 
         compared.append(name)
@@ -595,8 +635,14 @@ def main(argv: Sequence[str]) -> int:
         for drift in unit_drifts:
             drifts.append((drift, repo_path, installed_path))
 
-        if not unit_drifts and not dropins:
-            verdicts[name] = ["clean"]
+        if unit_drifts:
+            _mark(name, "drift")
+        elif not dropins:
+            # Neither a directive diff nor a drop-in: this unit was actually
+            # compared and actually matched. `clean` is the only kind that
+            # asserts a positive measurement, so it is the only one gated on
+            # BOTH conditions.
+            _mark(name, "clean")
 
     if args.print_verdicts:
         # Emitted BEFORE the human summary blocks so a consumer reading the
@@ -612,7 +658,7 @@ def main(argv: Sequence[str]) -> int:
         for name in sorted(selected):
             kinds = verdicts.get(name)
             if kinds:
-                _log(f"verdict {name} {','.join(kinds)}")
+                _log(f"verdict {name} {_render_kinds(kinds)}")
 
     for name, path in missing:
         _log(f"[skip] {name}: installed unit not found: {path} (not installed on this host)")
