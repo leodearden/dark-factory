@@ -4245,6 +4245,32 @@ class ReconciliationHarness:
             )
             return False
 
+    async def _in_backlog_mode(self, project_id: str) -> bool:
+        """True while ``project_id``'s buffer is deep enough for chunked drain.
+
+        Task 3049: single definition of the backlog-mode threshold, extracted
+        from ``BacklogIterator.should_iterate`` (which now delegates here) so
+        that ``_maybe_remediate``'s deferral gate provably tests the SAME
+        condition that put the project into chunked mode.
+
+        The read is deliberately FRESH rather than a flag threaded down from
+        BacklogIterator: that makes the gate stateless and self-terminating —
+        as the backlog drains the buffer falls back under the threshold and
+        remediation resumes on its own, notably on the
+        ``backlog_final_consolidation`` pass which runs after the chunks with
+        a drained buffer. It also correctly covers the non-iterator path, where
+        a plain full cycle whose buffer has meanwhile grown past the threshold
+        defers too. Cost is one indexed COUNT(*) against a ~945s cycle.
+
+        Returns:
+            ``size > buffer_size_threshold * opus_threshold_ratio``, strictly:
+            at exactly the threshold the project is NOT in backlog mode.
+        """
+        stats = await self.buffer.get_buffer_stats(project_id)
+        count = stats.get('size', 0)
+        threshold = self.config.buffer_size_threshold * self.config.opus_threshold_ratio
+        return count > threshold
+
     async def _maybe_remediate(
         self,
         project_id: str,
@@ -5025,11 +5051,14 @@ class BacklogIterator:
         self.time_provider = time_provider
 
     async def should_iterate(self, project_id: str) -> bool:
-        """Buffer count > 150% of trigger threshold."""
-        stats = await self.buffer.get_buffer_stats(project_id)
-        count = stats.get('size', 0)
-        threshold = self.config.buffer_size_threshold * self.config.opus_threshold_ratio
-        return count > threshold
+        """Buffer count > 150% of trigger threshold.
+
+        Task 3049: delegates to ``ReconciliationHarness._in_backlog_mode`` so
+        the threshold has exactly ONE definition — the same predicate that
+        puts a project into chunked mode is the one ``_maybe_remediate``
+        consults when deciding to defer its inline remediation pass.
+        """
+        return await self.harness._in_backlog_mode(project_id)
 
     async def run(self, project_id: str) -> None:
         """Process backlog in token-budgeted chunks, oldest-first.
