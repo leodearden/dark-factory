@@ -5259,6 +5259,138 @@ class TestWorktreeReuseIdentityGuard:
         assert not git_ops.quarantine_base.exists()
 
 
+async def _build_cold_orphan_branch(
+    git_ops: GitOps,
+    task_id: str,
+    *,
+    wip_name: str = 'orphan_work.py',
+    wip_content: str = 'value = 42\n',
+) -> str:
+    """Build the reaped-but-retained cold shape for *task_id*.
+
+    Mirrors test_create_worktree_reattaches_reaped_but_retained_wip_branch's
+    setup (above): build ``task/<task_id>`` in a throwaway worktree OUTSIDE
+    ``worktree_base``, commit a foreign WIP file onto it, then force-remove
+    the worktree — leaving the branch as a dangling ref carrying a real
+    commit beyond main, with ``worktree_base/<task_id>`` never having
+    existed. Returns the full branch name (``task/<task_id>``).
+    """
+    full_branch = f'task/{task_id}'
+    tmp_wt = git_ops.project_root.parent / f'tmp-{task_id}'
+    rc, _, err = await _run(
+        ['git', 'worktree', 'add', '-b', full_branch, str(tmp_wt), 'main'],
+        cwd=git_ops.project_root,
+    )
+    assert rc == 0, err
+    (tmp_wt / wip_name).write_text(wip_content)
+    await _run(['git', 'add', '-A'], cwd=tmp_wt)
+    await _run(['git', 'commit', '-m', 'orphan WIP commit'], cwd=tmp_wt)
+    await _run(
+        ['git', 'worktree', 'remove', '--force', str(tmp_wt)], cwd=git_ops.project_root,
+    )
+    return full_branch
+
+
+@pytest.mark.asyncio
+class TestColdReattachIdentityGuard:
+    """create_worktree(expected_title=...)'s cold-path γ reattach guard —
+    mirrors TestWorktreeReuseIdentityGuard above, but for the
+    reaped-but-retained shape (worktree dir gone, only the branch survives)
+    instead of a registered worktree."""
+
+    async def test_cold_reattach_quarantines_on_identity_mismatch(
+        self, git_ops: GitOps, caplog,
+    ):
+        """A recycled task id whose surviving orphan branch belongs to a
+        DIFFERENT (deleted) task must be quarantined — not silently resumed
+        onto the new task."""
+        await _build_cold_orphan_branch(git_ops, 'cold-recycled')
+        _write_sibling_stored_title(
+            git_ops.worktree_base, 'cold-recycled', 'Trajectory beta: spline solver',
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            info = await git_ops.create_worktree(
+                'cold-recycled', expected_title='Cycle-breaker beta: dedup edges',
+            )
+
+        assert info.path == git_ops.worktree_base / 'cold-recycled'
+        assert info.path.exists()
+        assert (info.path / 'README.md').exists(), 'must carry fresh main content'
+        assert not (info.path / 'orphan_work.py').exists(), (
+            "the foreign orphan's WIP must NOT be resumed onto the new task"
+        )
+
+        # The orphan (dir + branch) was relocated to quarantine, file intact.
+        assert git_ops.quarantine_base.exists()
+        quarantined = list(git_ops.quarantine_base.glob('cold-recycled-*'))
+        assert len(quarantined) == 1
+        assert (quarantined[0] / 'orphan_work.py').exists()
+
+        # The new branch is fresh — no trace of the orphan's commit.
+        rc, count_out, _ = await _run(
+            ['git', 'rev-list', '--count', 'main..task/cold-recycled'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        assert int(count_out.strip()) == 0
+
+        # Nothing was destroyed — the quarantined branch still exists.
+        rc, branch_out, _ = await _run(
+            ['git', 'branch', '--list', 'task/cold-recycled-*'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0
+        assert branch_out.strip(), 'quarantined branch must survive — nothing destroyed'
+
+        assert any(
+            'mismatch' in r.message.lower() for r in caplog.records
+        ), 'a WARNING naming the identity mismatch must be logged (loud-over-silent)'
+
+    async def test_cold_reattach_resumes_on_title_match(self, git_ops: GitOps):
+        """A matching stored title must resume the orphan's WIP, not
+        quarantine it."""
+        await _build_cold_orphan_branch(git_ops, 'cold-match')
+        _write_sibling_stored_title(
+            git_ops.worktree_base, 'cold-match', 'Cycle-breaker beta: dedup edges',
+        )
+
+        info = await git_ops.create_worktree(
+            'cold-match', expected_title='Cycle-breaker beta: dedup edges',
+        )
+
+        assert (info.path / 'orphan_work.py').exists(), 'matching WIP must be resumed'
+        assert not git_ops.quarantine_base.exists()
+
+    async def test_cold_reattach_fails_open_on_titleless_orphan(self, git_ops: GitOps):
+        """A legacy orphan with no readable stored title must never be
+        quarantined — identities_match fails open."""
+        await _build_cold_orphan_branch(git_ops, 'cold-titleless')
+        # No .task-meta root written at all.
+
+        info = await git_ops.create_worktree(
+            'cold-titleless', expected_title='Some live task',
+        )
+
+        assert (info.path / 'orphan_work.py').exists(), 'title-less orphan must resume'
+        assert not git_ops.quarantine_base.exists()
+
+    async def test_cold_reattach_guard_skipped_when_expected_title_none(
+        self, git_ops: GitOps,
+    ):
+        """expected_title=None (the default) must skip the guard entirely,
+        exactly like the REUSE path's equivalent test."""
+        await _build_cold_orphan_branch(git_ops, 'cold-noguard')
+        _write_sibling_stored_title(
+            git_ops.worktree_base, 'cold-noguard', 'Some unrelated foreign task',
+        )
+
+        info = await git_ops.create_worktree('cold-noguard')
+
+        assert (info.path / 'orphan_work.py').exists(), 'guard opt-in only — must resume'
+        assert not git_ops.quarantine_base.exists()
+
+
 @pytest.mark.asyncio
 class TestOrphanWorktreeHelpers:
     """Fix B git_ops helpers: quarantine_worktree, worktree_has_unsaved_work."""
