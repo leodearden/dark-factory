@@ -28,6 +28,28 @@ def event_store(tmp_path: Path) -> EventStore:
     return EventStore(tmp_path / 'runs.db', run_id='test')
 
 
+#: ``since`` that admits every fixed 2026-08-01 fixture timestamp.
+_BEFORE_TRACE = F.BASE_TS - timedelta(seconds=1)
+
+
+def _trace_db(tmp_path: Path, rows: list[dict] | None = None, name: str = 'trace.db') -> Path:
+    """A real ``runs.db`` carrying *rows* (default: the canonical 21-row trace).
+
+    ``EventStore.__init__`` only creates the schema, so the fixture's explicit
+    ids cannot collide with anything.  ``EventStore.emit`` cannot stand in:
+    it stamps its own wall-clock timestamp and its own ``run_id``, and this
+    trace needs fixed offsets and TWO run ids.
+    """
+    store = EventStore(tmp_path / name, run_id=F.RUN_A)
+    F.write_trace(store, rows=rows)
+    return store.db_path
+
+
+@pytest.fixture
+def canonical_trace_db(tmp_path: Path) -> Path:
+    return _trace_db(tmp_path, name='canonical.db')
+
+
 def test_parse_since_duration_shorthand():
     # '7d' shouldn't raise and must yield a past timestamp.
     from datetime import UTC, datetime
@@ -117,6 +139,172 @@ def test_aggregate_counts_a_repeated_module_once_per_event(event_store: EventSto
     stats = aggregate(event_store.db_path, datetime.now(UTC) - timedelta(days=1))
 
     assert stats['shared/src'].dispatches == 1
+
+
+# ===========================================================================
+# Hold accounting comes from hold_history.iter_hold_spans (PRD INV-5)
+# ===========================================================================
+#
+# Every expected duration below is the hand-computed literal in
+# ``_hold_history_fixtures`` -- nothing is read back out of the code under
+# test.  The canonical trace covers all four residue classes named in
+# PARKING_MODEL_REPORT.md:100-104, and the CLI's own pairing loop got three of
+# them wrong: it closed no span at an era boundary, LOST the first hold of a
+# double-acquire to a dict overwrite, and keyed its open slot per (module-key,
+# task) so a partial release closed spans it never named.
+
+
+def test_aggregate_hold_stats_match_the_hand_computed_trace(canonical_trace_db: Path):
+    """The whole oracle at once: samples, totals and means for all three modules."""
+    stats = aggregate(canonical_trace_db, _BEFORE_TRACE)
+
+    assert stats['orchestrator/src'].hold_samples == 5
+    assert stats['orchestrator/src'].total_hold_secs == pytest.approx(520.0)
+    assert stats['orchestrator/src'].avg_hold_secs() == pytest.approx(104.0)
+
+    assert stats['shared/src'].hold_samples == 3
+    assert stats['shared/src'].total_hold_secs == pytest.approx(360.0)
+    assert stats['shared/src'].avg_hold_secs() == pytest.approx(120.0)
+
+    assert stats['fused-memory/src'].hold_samples == 3
+    assert stats['fused-memory/src'].total_hold_secs == pytest.approx(600.0)
+    assert stats['fused-memory/src'].avg_hold_secs() == pytest.approx(200.0)
+
+
+def test_aggregate_counts_dispatches_across_the_whole_trace(canonical_trace_db: Path):
+    """Dispatches are per lock_acquired event, independent of how it closes."""
+    stats = aggregate(canonical_trace_db, _BEFORE_TRACE)
+
+    assert stats['orchestrator/src'].dispatches == 6
+    assert stats['shared/src'].dispatches == 3
+    assert stats['fused-memory/src'].dispatches == 3
+
+
+def test_aggregate_reports_truncated_holds_per_module(canonical_trace_db: Path):
+    """Era- and double-acquire-closed spans are right-censored LOWER BOUNDS.
+
+    They are counted -- PARKING_MODEL_REPORT.md:102, "the lock did block
+    others until then" -- but blending them into `avg_hold_s` with no way to
+    tell would trade one silent distortion for another.
+    """
+    stats = aggregate(canonical_trace_db, _BEFORE_TRACE)
+
+    # One per module, matching F.EXPECTED_TRUNCATED_SPANS.
+    assert {m: stats[m].truncated_holds for m in F.EXPECTED_SAMPLES} == {
+        'orchestrator/src': 1,
+        'shared/src': 1,
+        'fused-memory/src': 1,
+    }
+    assert len(F.EXPECTED_TRUNCATED_SPANS) == 3, 'the fixture oracle still says three'
+    assert stats['orchestrator/src'].truncated_fraction() == pytest.approx(1 / 5)
+
+
+# --- the two era-boundary sources, one named test each ---------------------
+
+
+def test_a_service_restart_row_closes_the_hold_it_interrupted(tmp_path: Path):
+    """Era boundary #1.  T5 acquires at 800 and the process is restarted at
+    1000; today's loop drops the hold entirely because no release ever
+    arrives."""
+    db = _trace_db(tmp_path, rows=[
+        F.acquire(10, 800, 'T5', ['fused-memory/src']),
+        F.service_restart(11, 1000),
+    ])
+
+    stats = aggregate(db, _BEFORE_TRACE)
+
+    assert stats['fused-memory/src'].hold_samples == 1
+    assert stats['fused-memory/src'].total_hold_secs == pytest.approx(200.0)
+    assert stats['fused-memory/src'].truncated_holds == 1
+    # The restart row's task_id is the TRIGGER task, not a lock holder.
+    assert F.SERVICE_RESTART_TRIGGER_TASK not in {'T5'}
+    assert list(stats) == ['fused-memory/src'], 'the restart names no module of its own'
+
+
+def test_a_run_transition_closes_at_the_previous_rows_timestamp(tmp_path: Path):
+    """Era boundary #2, and the timestamp it closes at is the point.
+
+    T7 holds shared/src from 1300; run-a's last row is at 1400 and run-b opens
+    at 1500.  Closing at 1500 would charge the whole inter-run gap -- however
+    many days of it in production -- to a hold nobody observed.
+    """
+    db = _trace_db(tmp_path, rows=[
+        F.acquire(14, 1300, 'T7', ['shared/src']),
+        F.acquire(15, 1360, 'T8', ['orchestrator/src']),
+        F.release(16, 1400, 'T8', ['orchestrator/src']),
+        F.acquire(17, 1500, 'T9', ['shared/src'], run_id=F.RUN_B),
+    ])
+
+    stats = aggregate(db, _BEFORE_TRACE)
+
+    assert stats['shared/src'].hold_samples == 1
+    assert stats['shared/src'].total_hold_secs == pytest.approx(100.0), \
+        'closed at 1400 (last evidence of the hold), not at 1500'
+    assert stats['shared/src'].truncated_holds == 1
+
+
+def test_a_double_acquire_keeps_the_hold_it_force_closes(tmp_path: Path):
+    """T4 acquires at 400 and again at 580 without releasing.
+
+    The old `open_acquires[task_id] = start` OVERWROTE the first start, so the
+    180s hold vanished and only the 120s tail was ever counted.
+    """
+    db = _trace_db(tmp_path, rows=[
+        F.acquire(7, 400, 'T4', ['orchestrator/src']),
+        F.acquire(8, 580, 'T4', ['orchestrator/src']),
+        F.release(9, 700, 'T4', ['orchestrator/src']),
+    ])
+
+    stats = aggregate(db, _BEFORE_TRACE)
+
+    assert stats['orchestrator/src'].hold_samples == 2
+    assert stats['orchestrator/src'].total_hold_secs == pytest.approx(300.0), '180 + 120'
+    assert stats['orchestrator/src'].truncated_holds == 1
+
+
+# --- the two refusals that must SURVIVE the convergence --------------------
+
+
+def test_an_orphan_release_contributes_no_hold(tmp_path: Path):
+    """A release with no open span (3,594 DF / 5,780 reify in the measured
+    trace) is skipped, not paired with whatever came before it."""
+    db = _trace_db(tmp_path, rows=[
+        F.acquire(1, 0, 'T1', ['orchestrator/src']),
+        F.release(2, 60, 'T1', ['orchestrator/src']),
+        F.release(3, 350, 'T3', ['orchestrator/src']),   # ORPHAN
+    ])
+
+    stats = aggregate(db, _BEFORE_TRACE)
+
+    assert stats['orchestrator/src'].hold_samples == 1
+    assert stats['orchestrator/src'].total_hold_secs == pytest.approx(60.0)
+    assert stats['orchestrator/src'].truncated_holds == 0
+
+
+def test_a_hold_still_open_at_the_end_of_the_window_is_dropped(tmp_path: Path):
+    """Unlike an era boundary, nothing here observed an end.  Closing at "now"
+    would invent a duration, so the span is dropped -- while the acquire still
+    counts as a dispatch, because it really did happen."""
+    db = _trace_db(tmp_path, rows=[
+        F.acquire(1, 0, 'T1', ['orchestrator/src']),
+        F.release(2, 60, 'T1', ['orchestrator/src']),
+        F.acquire(3, 100, 'T10', ['orchestrator/src']),   # open at end of stream
+    ])
+
+    stats = aggregate(db, _BEFORE_TRACE)
+
+    assert stats['orchestrator/src'].dispatches == 2
+    assert stats['orchestrator/src'].hold_samples == 1
+    assert stats['orchestrator/src'].total_hold_secs == pytest.approx(60.0)
+
+
+def test_the_canonical_trace_drops_its_end_of_stream_hold(canonical_trace_db: Path):
+    """T10's acquire at id 19 is the 6th orchestrator/src dispatch and the 5th
+    -- not 6th -- sample."""
+    stats = aggregate(canonical_trace_db, _BEFORE_TRACE)
+
+    assert stats['orchestrator/src'].dispatches == 6
+    assert stats['orchestrator/src'].hold_samples == 5
 
 
 def test_aggregate_ignores_events_before_since(tmp_path: Path, event_store: EventStore):
