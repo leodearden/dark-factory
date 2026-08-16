@@ -1283,6 +1283,93 @@ def test_a_placeholder_arm_still_issues_no_request_at_all(install_fake_httpx,
 
 
 # ---------------------------------------------------------------------------
+# Both numbers, unambiguously named (task 3781)
+#
+# Before this task the row carried ONE latency under a name that did not say
+# which of the two very different things it was.  It was in fact the cold one:
+# the first request after the arm reached ready.  Both are now on the row under
+# names that mean what they say.
+#
+# Every latency below is INJECTED.  Nothing here asserts cold > warm -- see
+# test_a_row_carries_both_the_cold_and_the_warm_latency for why that ordering
+# is deliberately not a property of this instrument.
+# ---------------------------------------------------------------------------
+
+
+def _latency_probe(cold: float, warm: float):
+    def probe(arm, *, warmup: bool = False):
+        return lms_healthcheck.ProbeResult(
+            verdict='PASS',
+            reason=lms_healthcheck.Reason.OK,
+            detail='ok',
+            latency_ms=cold if warmup else warm,
+        )
+
+    return probe
+
+
+def test_a_row_carries_both_the_cold_and_the_warm_latency():
+    """The measured qwen3.5-9b shape: ~12x between the two.
+
+    Deliberately NOT asserted here, or anywhere: that cold > warm in general.
+    qwen3.5-9b at `reasoning: on` measured 43.5 s cold against 41.0 s warm --
+    a generation-dominated arm where load cost is a rounding error against the
+    generation itself and the ordering sits inside the noise.  A gate on it
+    would fail an arm that is serving correctly.
+    """
+    report = _report(probe=_latency_probe(cold=4249.7, warm=359.1))
+    row = report.arms[0]
+
+    assert row.first_probe_ms == 4249.7
+    assert row.latency_ms == 359.1
+    assert row.first_probe_ms != row.latency_ms
+    assert row.first_probe_ms > 0 and row.latency_ms > 0
+
+
+def test_latency_ms_is_the_measured_probe_not_the_first_one():
+    """The anti-regression assertion.
+
+    Before this task `latency_ms` WAS the first probe after ready.  Pinning
+    which call it comes from means a later refactor that swaps the two turns
+    this red instead of silently restoring a cold number under a warm name.
+    """
+    report = _report(probe=_latency_probe(cold=4249.7, warm=359.1))
+
+    assert report.arms[0].latency_ms == 359.1
+    assert report.arms[0].latency_ms != 4249.7
+
+
+def test_the_two_latency_fields_are_named_for_what_they_measure():
+    """Both present on the dumped row, so the artifact never carries one number
+    whose meaning depends on knowing the run order that produced it."""
+    dumped = _report().arms[0].model_dump(mode='json')
+
+    assert 'first_probe_ms' in dumped
+    assert 'latency_ms' in dumped
+
+
+def test_a_placeholder_row_reports_both_fields_without_inventing_a_measurement():
+    """A refused arm measured nothing.  Both fields are 0.0 rather than either
+    being omitted -- an absent field reads as an older schema, and a nonzero
+    one would be a measurement nobody took."""
+    placeholder = _moe_arm(
+        model_ref='TBD-Q3-pick-a-gguf', image='TBD-Q3', quant='TBD-Q3'
+    )
+
+    def probe(arm, *, warmup: bool = False):
+        return lms_healthcheck.ProbeResult(
+            verdict='FAIL',
+            reason=lms_healthcheck.Reason.PLACEHOLDER_ARM,
+            detail='nothing to probe',
+        )
+
+    row = _report(arms=[placeholder], probe=probe).arms[0]
+
+    assert row.first_probe_ms == 0.0
+    assert row.latency_ms == 0.0
+
+
+# ---------------------------------------------------------------------------
 # Report assembly
 # ---------------------------------------------------------------------------
 
@@ -1818,7 +1905,7 @@ def test_cli_output_writes_the_json_artifact_step_21_validates(cli_env, tmp_path
     ):
         assert key in written['vram']
     for key in ('arm_id', 'axis', 'stack', 'endpoint', 'served_model_name',
-                'verdict', 'reason', 'latency_ms'):
+                'verdict', 'reason', 'latency_ms', 'first_probe_ms'):
         assert key in written['arms'][0]
 
 
