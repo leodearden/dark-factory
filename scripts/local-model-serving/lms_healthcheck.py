@@ -109,10 +109,38 @@ PROBE_TEXT = (
 #: entity keeps a defensible naming difference from failing an arm that worked.
 PROBE_KNOWN_ENTITIES = ('Leo', 'Dark Factory', 'Graphiti', 'FalkorDB')
 PROBE_MIN_ENTITIES = 3
+
+#: The passage sent on the DISCARDED warm-up run, and it must never be
+#: PROBE_TEXT (task 3781).
+#:
+#: The warm-up exists to make the measured probe ENGINE-warm — CUDA graphs
+#: captured, allocator settled, kernels autotuned, grammar compiled — while
+#: leaving it PREFIX-COLD, which is the state a production request actually
+#: arrives in.  Warming with the SAME text destroys the second half of that:
+#: a prefix cache reuses shared LEADING tokens, so an identical warm-up
+#: pre-populates precisely the cache the measured probe is supposed to miss.
+#: Measured 2026-08-06 on moe-stretch, llama.cpp served the warm run with 338
+#: of its 343 prompt tokens from cache — the measurement did not merely get
+#: blunted, it changed subject.
+#:
+#: PROBE_TEXT is placed FIRST in the user message, so a different passage
+#: diverges at the very first user token and only the ~25-token system message
+#: can stay cached.  Do not "simplify" this back to PROBE_TEXT.
+#:
+#: It carries no known-entity contract because its verdict is thrown away; all
+#: it owes is genuine novelty and a comparable shape and length.
+WARMUP_PROBE_TEXT = (
+    'Ada maintains Tidewater Press, a small publishing house whose catalogue '
+    'is indexed by Solstice, a full-text search engine running on SQLite.'
+)
+
 #: Embedding arms are probed with a QUERY, not a passage: the Qwen3-Embedding
 #: family's `query_prefix` is a query-side instruct prefix, so probing with a
 #: document would exercise the wrong half of an asymmetric model.
 EMBEDDING_PROBE_QUERY = 'Which graph database backs the memory layer?'
+#: The embedding axis's own warm-up text — distinct from EMBEDDING_PROBE_QUERY
+#: for exactly the reason WARMUP_PROBE_TEXT is distinct from PROBE_TEXT.
+WARMUP_EMBEDDING_QUERY = 'Which search engine indexes the printed catalogue?'
 EMBEDDING_TIMEOUT_S = 60.0
 #: Below this L2 norm a vector carries no direction, so cosine similarity
 #: against it is undefined and every retrieval score computed from it is noise.
@@ -255,13 +283,19 @@ def _exc_detail(exc: BaseException) -> str:
 # ---------------------------------------------------------------------------
 
 
-def build_llm_probe_request(arm: ArmEntry) -> dict[str, Any]:
+def build_llm_probe_request(arm: ArmEntry, *, warmup: bool = False) -> dict[str, Any]:
     """The chat-completions body for *arm*.
 
     The schema is described IN THE PROMPT for every arm, not only the
     unconstrained one.  Keeping the prompt identical across arms means the
     only difference under measurement is the enforcement mechanism, which is
     the thing the eval is actually comparing.
+
+    `warmup=True` swaps in WARMUP_PROBE_TEXT and changes NOTHING else: same
+    system message, same schema-in-prompt, same temperature, max_tokens,
+    response_format and chat_template_kwargs.  The warm-up's job is to warm
+    the exact server path the measured probe will take, so any other
+    difference would warm the wrong one.  Defaults to the measured probe.
     """
     if arm.axis != 'llm':
         raise HealthcheckError(
@@ -275,6 +309,7 @@ def build_llm_probe_request(arm: ArmEntry) -> dict[str, Any]:
         )
 
     schema = ProbeExtraction.model_json_schema()
+    text = WARMUP_PROBE_TEXT if warmup else PROBE_TEXT
     body: dict[str, Any] = {
         'model': arm.served_model_name,
         'messages': [
@@ -288,7 +323,7 @@ def build_llm_probe_request(arm: ArmEntry) -> dict[str, Any]:
             {
                 'role': 'user',
                 'content': (
-                    f'{PROBE_TEXT}\n\nExtract the entities. Reply with one JSON '
+                    f'{text}\n\nExtract the entities. Reply with one JSON '
                     f'object conforming to this schema:\n{json.dumps(schema)}'
                 ),
             },
@@ -590,7 +625,9 @@ def check_model_identity(arm: ArmEntry, models_body: Any) -> ProbeResult:
 # ---------------------------------------------------------------------------
 
 
-def build_embedding_probe_request(arm: ArmEntry) -> dict[str, Any]:
+def build_embedding_probe_request(
+    arm: ArmEntry, *, warmup: bool = False
+) -> dict[str, Any]:
     """The `/v1/embeddings` body for *arm*, with its declared prefix applied.
 
     The prefix lives in the manifest precisely so it cannot be forgotten at a
@@ -599,6 +636,11 @@ def build_embedding_probe_request(arm: ArmEntry) -> dict[str, Any]:
     vector that is simply worse.  That degradation is invisible to every check
     except a side-by-side retrieval comparison — which is exactly what iota
     runs, and exactly what it would then mis-attribute to the model.
+
+    `warmup=True` swaps in WARMUP_EMBEDDING_QUERY and changes nothing else —
+    the declared prefix is applied EITHER way, because an unprefixed warm-up
+    would warm the document side of an asymmetric model rather than the query
+    side the measured probe takes.
     """
     if arm.axis != 'embedding':
         raise HealthcheckError(
@@ -606,7 +648,8 @@ def build_embedding_probe_request(arm: ArmEntry) -> dict[str, Any]:
             'not apply. Use build_llm_probe_request for the LLM axis.'
         )
 
-    text = f'{arm.query_prefix or ""}{EMBEDDING_PROBE_QUERY}'
+    query = WARMUP_EMBEDDING_QUERY if warmup else EMBEDDING_PROBE_QUERY
+    text = f'{arm.query_prefix or ""}{query}'
     return {
         'model': arm.served_model_name,
         'input': [text],
@@ -792,8 +835,15 @@ def _placeholder_refusal(arm: ArmEntry) -> ProbeResult | None:
     )
 
 
-def probe_llm_arm(arm: ArmEntry) -> ProbeResult:
-    """Probe one LLM arm end to end: identity, then a constrained completion."""
+def probe_llm_arm(arm: ArmEntry, *, warmup: bool = False) -> ProbeResult:
+    """Probe one LLM arm end to end: identity, then a constrained completion.
+
+    Still exactly ONE request either way.  The cold/warm PAIRING lives in
+    `run_healthcheck`, which is the only layer that owns it; `warmup` here just
+    carries the different prompt to the wire.
+    """
+    # BEFORE any request, warm-up included: probing a literal `TBD-Q3` model id
+    # would 404 and record an unresolved PRD Open Question as a transport error.
     refusal = _placeholder_refusal(arm)
     if refusal is not None:
         return refusal
@@ -801,13 +851,13 @@ def probe_llm_arm(arm: ArmEntry) -> ProbeResult:
     return _probe(
         arm,
         path='/v1/chat/completions',
-        request=build_llm_probe_request(arm),
+        request=build_llm_probe_request(arm, warmup=warmup),
         timeout_s=COMPLETION_TIMEOUT_S,
         verify=verify_llm_response,
     )
 
 
-def probe_embedding_arm(arm: ArmEntry) -> ProbeResult:
+def probe_embedding_arm(arm: ArmEntry, *, warmup: bool = False) -> ProbeResult:
     """Probe one embedding arm end to end: identity, then a real vector."""
     refusal = _placeholder_refusal(arm)
     if refusal is not None:
@@ -816,17 +866,17 @@ def probe_embedding_arm(arm: ArmEntry) -> ProbeResult:
     return _probe(
         arm,
         path='/v1/embeddings',
-        request=build_embedding_probe_request(arm),
+        request=build_embedding_probe_request(arm, warmup=warmup),
         timeout_s=EMBEDDING_TIMEOUT_S,
         verify=verify_embedding_response,
     )
 
 
-def probe_arm(arm: ArmEntry) -> ProbeResult:
+def probe_arm(arm: ArmEntry, *, warmup: bool = False) -> ProbeResult:
     """Dispatch one arm to its axis's probe."""
     if arm.axis == 'embedding':
-        return probe_embedding_arm(arm)
-    return probe_llm_arm(arm)
+        return probe_embedding_arm(arm, warmup=warmup)
+    return probe_llm_arm(arm, warmup=warmup)
 
 
 # ---------------------------------------------------------------------------
