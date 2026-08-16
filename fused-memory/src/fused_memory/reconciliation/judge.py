@@ -16,6 +16,12 @@ from shared.cli_invoke import (
     invoke_with_cap_retry,
     no_mcp_servers_config,
 )
+from shared.phantom_verdict import (
+    UNPARSEABLE_ISSUE_PREFIX,
+    UNPARSEABLE_VERDICT_CODE,
+    has_unparseable_marker,
+    is_phantom_verdict_row,
+)
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import (
@@ -100,18 +106,24 @@ _VERDICT_PROBE_RUN_ID = '__verdict_schema_probe__'
 # Machine-readable marker on a JudgeVerdict finding that identifies the
 # verdict as PHANTOM — a placeholder fabricated by _parse_verdict's except
 # block when the judge's raw output could not be parsed, not a genuine
-# review. One spelling, shared by three production call sites (the stamp in
-# _parse_verdict, review_run's is_parse_failure halt-reason branch, and
-# is_phantom_verdict below) so a reword of the marker can never silently
-# desync the detector from the producer.
-_UNPARSEABLE_VERDICT_CODE = 'unparseable_judge_response'
+# review. One spelling, shared by three production call sites in THIS module
+# (the stamp in _parse_verdict, review_run's is_parse_failure halt-reason
+# branch, and is_phantom_verdict below) so a reword of the marker can never
+# silently desync the detector from the producer.
+#
+# RE-BOUND from shared.phantom_verdict rather than typed here, because two
+# consumers outside this package need the same marker and cannot import this
+# module (see that module's docstring, and is_phantom_verdict below). The
+# private aliases are kept so every existing reference in this file keeps
+# working unchanged; test_judge.py pins the re-binding by identity.
+_UNPARSEABLE_VERDICT_CODE = UNPARSEABLE_VERDICT_CODE
 
 # Prefix of the 'issue' text _parse_verdict stamps on its fabricated finding
-# (see the f'{_UNPARSEABLE_ISSUE_PREFIX}: {e}' construction below). Hoisted
-# to a constant for the same reason as _UNPARSEABLE_VERDICT_CODE: it is the
-# ONLY signal available on a pre-2947 row, which was written before the
-# 'code' marker existed and so cannot be identified any other way.
-_UNPARSEABLE_ISSUE_PREFIX = 'Judge response could not be parsed'
+# (see the f'{_UNPARSEABLE_ISSUE_PREFIX}: {e}' construction below). Same
+# re-binding, and it is the ONLY signal available on a pre-2947 row, which
+# was written before the 'code' marker existed and so cannot be identified
+# any other way.
+_UNPARSEABLE_ISSUE_PREFIX = UNPARSEABLE_ISSUE_PREFIX
 
 # Severities counted as "non-ok" by _check_error_trends' streak and count
 # gates. One spelling for both gates so they cannot independently drift on
@@ -123,13 +135,11 @@ def _has_unparseable_marker(verdict: JudgeVerdict) -> bool:
     """True iff any finding on *verdict* carries the structured
     ``code == 'unparseable_judge_response'`` marker.
 
-    This is the machine-readable half of phantom detection: the marker
-    ``_parse_verdict`` stamps on its fabricated placeholder finding for
-    every row written after task 2947 landed (see
-    ``_UNPARSEABLE_VERDICT_CODE``). Shared by :func:`is_phantom_verdict`'s
-    primary branch and :meth:`Judge.review_run`'s halt-reason branch so the
-    marker scan has exactly one spelling and the two call sites can never
-    independently drift on what counts as a match.
+    The model-typed adapter over
+    :func:`shared.phantom_verdict.has_unparseable_marker`, which is where
+    the marker scan actually lives. Kept as a named function because
+    :meth:`Judge.review_run`'s halt-reason branch calls it on a
+    ``JudgeVerdict`` and should not have to unpack ``.findings`` itself.
 
     No isinstance guard on each finding: ``JudgeVerdict.findings`` is
     pydantic-validated ``list[dict]`` (models/reconciliation.py), and
@@ -138,7 +148,7 @@ def _has_unparseable_marker(verdict: JudgeVerdict) -> bool:
     (validating) constructor, so every entry reaching here is already
     guaranteed to be a ``dict``.
     """
-    return any(f.get('code') == _UNPARSEABLE_VERDICT_CODE for f in verdict.findings)
+    return has_unparseable_marker(verdict.findings)
 
 
 def is_phantom_verdict(verdict: JudgeVerdict) -> bool:
@@ -153,33 +163,27 @@ def is_phantom_verdict(verdict: JudgeVerdict) -> bool:
     *content* the judge rated severity=serious: that is a real review
     outcome and must never be treated as phantom.
 
-    Two shapes are recognised:
+    **The rule itself lives in** :mod:`shared.phantom_verdict` — the two
+    recognised shapes, why each conjunct of the legacy branch matters, and
+    the fail-closed fallback are all documented there. This function is the
+    fused-memory-side, model-typed API over it: it stays here, with this
+    exact name and signature, because ``_check_error_trends`` and this
+    module's tests call it with a ``JudgeVerdict``.
 
-    1. **Structured marker** (primary, via :func:`_has_unparseable_marker`):
-       any row written after task 2947 landed (merged 2026-07-23) carries
-       ``code == 'unparseable_judge_response'`` on its (sole) finding.
-    2. **Legacy unmarked shape** (fallback): rows written BEFORE task 2947
-       carry no ``code`` key at all, so they are identified by the shape
-       ``_parse_verdict`` has always fabricated — severity=serious AND
-       exactly one finding AND that finding's ``issue`` starts with
-       ``_UNPARSEABLE_ISSUE_PREFIX``. All three conjuncts matter: the
-       fabrication path only ever emits severity=serious (never moderate);
-       the sole genuine severity=serious row in the live DB (bc9459b8) has
-       FIVE findings, so the single-finding conjunct is what keeps this
-       fallback from swallowing it; and ``startswith`` (not a substring
-       test) means a genuine finding that merely *mentions* parsing
-       somewhere in its prose is not mistaken for the fabricated one. A
-       future variant shape that fails one of these conjuncts falls back to
-       the status quo (still counted as evidence) rather than silently
-       under-counting — fail-closed in the safe direction.
+    The rule was hoisted (task 3287) because two consumers outside this
+    package need it and neither can import this module:
+    ``reconciliation.journal`` would be a circular import (this module
+    imports it at line 27), and the ``dashboard`` package deliberately does
+    not depend on ``fused-memory`` at all. Delegating rather than moving
+    keeps every 3070 call site and its whole test net unchanged as the proof
+    that the hoist was behaviour-preserving.
+
+    ``verdict.severity`` is passed through as-is: ``VerdictSeverity`` is a
+    ``StrEnum`` (models/reconciliation.py), so it compares equal to the
+    plain ``'serious'`` the shared predicate tests against and the
+    comparison stays exact with no conversion.
     """
-    if _has_unparseable_marker(verdict):
-        return True
-    if verdict.severity == VerdictSeverity.serious and len(verdict.findings) == 1:
-        issue = verdict.findings[0].get('issue')
-        if isinstance(issue, str) and issue.startswith(_UNPARSEABLE_ISSUE_PREFIX):
-            return True
-    return False
+    return is_phantom_verdict_row(verdict.severity, verdict.findings)
 
 
 UnhaltCallback = Callable[[str], Awaitable[None] | None]
