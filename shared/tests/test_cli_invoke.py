@@ -921,11 +921,15 @@ class TestLargePayloadHandling:
             captured_kwargs.update(kwargs)
             stdin_arg = kwargs.get('stdin')
             stdin_seen['is_pipe'] = stdin_arg == asyncio.subprocess.PIPE
-            stdin_seen['is_file'] = hasattr(stdin_arg, 'read')
-            if stdin_seen['is_file']:
+            # `is not None` is what narrows for the type checker; hasattr alone
+            # leaves the None arm live on kwargs.get()'s `Any | None`.
+            if stdin_arg is not None and hasattr(stdin_arg, 'read'):
+                stdin_seen['is_file'] = True
                 stdin_seen['pos'] = stdin_arg.tell()
                 stdin_arg.seek(0)
                 stdin_seen['payload'] = stdin_arg.read()
+            else:
+                stdin_seen['is_file'] = False
             proc = MagicMock()
             proc.communicate = AsyncMock(return_value=(
                 _successful_json_output().encode(),
@@ -1005,7 +1009,7 @@ class TestLargePayloadHandling:
         async def fake_exec(*args, **kwargs):
             captured_cmd.extend(args)
             stdin_arg = kwargs.get('stdin')
-            assert hasattr(stdin_arg, 'read'), (
+            assert stdin_arg is not None and hasattr(stdin_arg, 'read'), (
                 f'expected a pre-materialized stdin file object, got {stdin_arg!r}'
             )
             stdin_arg.seek(0)
