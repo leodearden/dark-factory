@@ -86,8 +86,13 @@ def load_wire_evidence() -> dict:
     file text carries none while the parsed value is byte-identical to what was
     harvested. That matters here more than anywhere: this fixture's whole claim
     is byte-identity, so a lossy round-trip would silently invalidate it.
+
+    Which is also why the read pins ``encoding='utf-8'`` rather than inheriting
+    ``locale.getpreferredencoding()``, matching ``scan_plan_file``: a
+    byte-identity claim decoded in the ambient locale is a claim that can hold
+    on one machine and fail on another.
     """
-    return json.loads(WIRE_EVIDENCE_PATH.read_text())
+    return json.loads(WIRE_EVIDENCE_PATH.read_text(encoding='utf-8'))
 
 
 class TestDetectorBlindness:

@@ -595,8 +595,15 @@ def load_corpus() -> list[dict]:
     escape, so the FILE TEXT carries none while the parsed value is
     byte-identical to the harvested text. ``json.loads`` undoes it here; do not
     "helpfully" rewrite the fixture to hold them verbatim.
+
+    Read at ``encoding='utf-8'`` rather than in the ambient locale, matching
+    ``scan_plan_file``. The corpus is pure ASCII today so nothing misbehaves
+    now; the risk is a later regeneration admitting one non-ASCII character,
+    after which this replay — the durable artifact the whole prevalence finding
+    rests on — would give a different answer on two machines.
     """
-    return [json.loads(line) for line in CORPUS_PATH.read_text().splitlines() if line.strip()]
+    lines = CORPUS_PATH.read_text(encoding='utf-8').splitlines()
+    return [json.loads(line) for line in lines if line.strip()]
 
 
 def replay(record: dict) -> MispairingHit | None:
@@ -628,7 +635,7 @@ class TestCommittedCorpus:
         editing this fixture would emit that literal inside its own tool-call
         arguments and truncate its own write.
         """
-        assert chr(60) not in CORPUS_PATH.read_text()
+        assert chr(60) not in CORPUS_PATH.read_text(encoding='utf-8')
 
     def test_every_record_matches_its_committed_expectation(self) -> None:
         disagreements = []

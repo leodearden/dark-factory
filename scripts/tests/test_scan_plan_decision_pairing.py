@@ -171,16 +171,26 @@ def write_plan(root: Path, lane: str, decisions: list, **plan_fields) -> Path:
     }
     plan.update(plan_fields)
     path = lane_dir / 'plan.json'
-    path.write_text(json.dumps(plan, indent=2))
+    # utf-8, matching what scan_plan_file reads with. json.dumps defaults to
+    # ensure_ascii=True so today's bytes are ASCII either way, but a helper
+    # that WRITES in the ambient locale and a scanner that READS utf-8 is an
+    # asymmetry that only shows up on somebody else's machine.
+    path.write_text(json.dumps(plan, indent=2), encoding='utf-8')
     return path
 
 
 def write_raw_plan(root: Path, lane: str, raw: str) -> Path:
-    """Write ``<root>/<lane>/plan.json`` with *raw* text verbatim."""
+    """Write ``<root>/<lane>/plan.json`` with *raw* text verbatim, as utf-8.
+
+    Encoding pinned for the same reason :func:`write_plan`'s is: the scanner
+    reads utf-8, so a specimen written in the ambient locale would be a
+    different specimen on a differently-configured machine. Bytes that are
+    deliberately NOT text go through :func:`write_undecodable_plan` instead.
+    """
     lane_dir = root / lane
     lane_dir.mkdir(parents=True, exist_ok=True)
     path = lane_dir / 'plan.json'
-    path.write_text(raw)
+    path.write_text(raw, encoding='utf-8')
     return path
 
 
