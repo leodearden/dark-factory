@@ -29,6 +29,15 @@ launching -> running -> idle/awaiting-input -> exited (exited is still
 written by spawn-claude.sh's ``finish()``). Hand-launched sessions (no
 CLAUDE_SPAWN_SESSION_ID) still key on session_id, exactly as before.
 
+REFINED (task 4193): ``CLAUDE_SPAWN_SESSION_ID`` is inherited by anything
+the spawned session starts, so a nested ``claude`` (a Bash-tool ``claude
+-p``, an agent shelling out) used to collapse onto the spawning session's
+record and flip its status mid-turn. The first hook event to adopt a slug
+now binds its own stdin ``session_id`` into ``record.claude_session_id``,
+and a later hook arriving with a DIFFERENT one is recognised as an
+inheritor-not-owner: it falls through to the hand-launched keying and gets
+its own record, leaving the spawned session's untouched.
+
 IMPORT CONTRACT (documented env: ``PYTHONPATH=<repo>/orchestrator/src``).
 This module is executed BY ABSOLUTE PATH from a plain shell with no venv and
 no install — ``skills/spawn/hooks/{session-start,stop,notification,
@@ -112,25 +121,69 @@ def resolve_hook_identity(
     return session_registry.parse_spawn_identity(env, title, prompt, cwd)
 
 
+def _env_slug_is_owned(
+    slug: str,
+    hook_input: Mapping[str, Any],
+    root: Path | str | None,
+) -> bool:
+    """Is the inherited CLAUDE_SPAWN_SESSION_ID *slug* THIS session's own?
+
+    The hook stdin ``session_id`` is the only discriminator: a nested claude
+    is also a descendant of the original launcher, so PID lineage cannot
+    tell an owner from an inheritor (task 4193). Answers True -- adopt --
+    whenever ownership is not positively disproved: no stdin session_id (no
+    discriminator at all), no record yet (this hook IS the first sight), or
+    a record carrying no binding (spawn-claude.sh's ``launching`` write, or
+    a pre-task-4193 record; the first matching hook binds it in
+    ``_bind_claude_session_id``). Only a binding that positively MISMATCHES
+    returns False, sending the caller to the hand-launched keying.
+    """
+    hook_session_id = str(hook_input.get('session_id') or '').strip()
+    if not hook_session_id:
+        return True
+    try:
+        record = session_registry.read_record(slug, root=root)
+    except FileNotFoundError:
+        # No record yet: this hook event IS the slug's first sight.
+        return True
+    bound = (record.claude_session_id or '').strip()
+    if not bound:
+        return True
+    return bound == hook_session_id
+
+
 def hook_session_slug(
     hook_input: Mapping[str, Any],
     env: Mapping[str, str],
+    *,
+    root: Path | str | None = None,
 ) -> str:
     """Build the record-identity slug for one hook event.
 
-    Prefers ``CLAUDE_SPAWN_SESSION_ID`` (env) when present: that value is
-    already spawn-claude.sh's own ``launching``-record slug, so it is
-    returned DIRECTLY (sanitized via ``session_registry.sanitize_slug``),
-    NOT fed back through ``build_session_slug`` -- doing so would
-    double-prefix it (e.g. ``'session-cockpit-session-cockpit-3215033'``)
-    and miss the pre-existing launching record. This is what lets all three
-    hook events converge on the SAME pid-keyed record spawn-claude.sh
-    created (module docstring). A missing, empty, or whitespace-only value
-    is treated as absent (mirrors ``_resolve_parent_session_id``'s
-    ``env.get(...) or None`` idiom, extended with a ``.strip()`` so a
-    blank-but-non-empty token also falls through).
+    Prefers ``CLAUDE_SPAWN_SESSION_ID`` (env) when present AND owned by this
+    session: that value is already spawn-claude.sh's own ``launching``-record
+    slug, so it is returned DIRECTLY (sanitized via
+    ``session_registry.sanitize_slug``), NOT fed back through
+    ``build_session_slug`` -- doing so would double-prefix it (e.g.
+    ``'session-cockpit-session-cockpit-3215033'``) and miss the pre-existing
+    launching record. This is what lets all three hook events converge on the
+    SAME pid-keyed record spawn-claude.sh created (module docstring). A
+    missing, empty, or whitespace-only value is treated as absent (mirrors
+    ``_resolve_parent_session_id``'s ``env.get(...) or None`` idiom, extended
+    with a ``.strip()`` so a blank-but-non-empty token also falls through).
 
-    Otherwise reuses ``session_registry.build_session_slug`` with the
+    Adoption is conditional on ownership (task 4193): the variable is
+    inherited by any process the spawned session starts, so a nested
+    ``claude`` carries it too. ``_env_slug_is_owned`` compares the record's
+    bound Claude Code ``session_id`` against this hook's stdin one and
+    returns False only on a proven mismatch, in which case this falls through
+    to the hand-launched keying below and the inheritor gets its OWN record
+    instead of collapsing onto the spawned session's. Pass ``root`` so the
+    probe reads the same registry the caller writes; with ``root=None`` it
+    resolves the default fleet root.
+
+    Otherwise (or on a proven mismatch) reuses
+    ``session_registry.build_session_slug`` with the
     hook's ``session_id`` as the uniqueness token in place of
     ``launcher_pid`` -- ``session_id`` is stable across the
     SessionStart/Notification/Stop events of one Claude Code session, so
@@ -139,7 +192,12 @@ def hook_session_slug(
     """
     spawn_session_id = (env.get('CLAUDE_SPAWN_SESSION_ID') or '').strip() or None
     if spawn_session_id is not None:
-        return session_registry.sanitize_slug(spawn_session_id)
+        # Sanitize BEFORE probing: it keeps the all-dots containment contract
+        # (task 4112) intact, and means an adversarial env token can no more
+        # escape sessions_dir when READ than when written.
+        candidate = session_registry.sanitize_slug(spawn_session_id)
+        if _env_slug_is_owned(candidate, hook_input, root):
+            return candidate
 
     identity = resolve_hook_identity(hook_input, env)
     session_id = str(hook_input.get('session_id') or 'unknown')
@@ -452,7 +510,7 @@ def run_session_start(
     inherited ``CLAUDE_SPAWN_SESSION_ID`` from it.
     """
     identity = resolve_hook_identity(hook_input, env)
-    slug = hook_session_slug(hook_input, env)
+    slug = hook_session_slug(hook_input, env, root=root)
     try:
         record = session_registry.read_record(slug, root=root)
     except FileNotFoundError:
