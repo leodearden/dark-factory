@@ -759,6 +759,59 @@ def range_create_statement(spec: IndexSpec) -> str:
     )
 
 
+def vector_drop_statement(label: str, entity_type: str, prop: str) -> str:
+    """Build the per-property VECTOR DROP statement for one indexed property.
+
+    VECTOR needs its OWN drop verb rather than reusing
+    ``GraphitiBackend.drop_index()``.  MEASURED 2026-08-16 on throwaway graph
+    ``_impl3769_probe`` (seeded, probed, then ``GRAPH.DELETE``'d):
+    ``DROP INDEX ON :Entity(emb)`` — the old-style form ``drop_index()`` issues —
+    fails against a live VECTOR index with
+    ``ERR Unable to drop index on :Entity(emb): no such index.``  That form only
+    targets RANGE.  ``DROP VECTOR INDEX FOR (n:Entity) ON (n.emb)`` returns
+    ``Indices deleted: 1``.
+
+    ``entity_type`` is LOAD-BEARING, not cosmetic.  Measured on the same graph:
+    the NODE form against a RELATIONSHIP vector index
+    (``DROP VECTOR INDEX FOR (n:RELATES_TO) ON (n.fact_embedding)``) fails with
+    ``no such index``, while the edge form deletes it.  Graphiti indexes
+    ``fact_embedding`` on RELATES_TO edges and ``name_embedding`` on Entity nodes,
+    so both branches are live in production.
+
+    ``falkordb``'s own client builds the identical statements
+    (``falkordb/asyncio/graph.py``, ``drop_node_vector_index`` /
+    ``drop_edge_vector_index``), independently corroborating the form — but it
+    speaks ``NODE``/``EDGE`` where this module's normal form speaks
+    ``NODE``/``RELATIONSHIP``, which is why the statement is synthesized here
+    rather than delegated: routing through the client would leave the emitted
+    statement unpinnable and leak the vocabulary mismatch into the backend.
+
+    Args:
+        label: The node label or relationship type carrying the index.
+        entity_type: ``'NODE'`` or ``'RELATIONSHIP'``.
+        prop: A SINGLE property name.  Single-property by construction, matching
+            :func:`range_create_statement` and the per-property fan-out
+            :func:`vector_index_properties` produces.
+
+    Returns:
+        The measured-working DROP statement.
+
+    Raises:
+        ValueError: *entity_type* is not ``'NODE'``/``'RELATIONSHIP'``.
+    """
+    if entity_type == 'NODE':
+        return f'DROP VECTOR INDEX FOR (n:{label}) ON (n.{prop})'
+    if entity_type == 'RELATIONSHIP':
+        return f'DROP VECTOR INDEX FOR ()-[e:{label}]-() ON (e.{prop})'
+    raise ValueError(
+        f'vector_drop_statement() got entity_type {entity_type!r} for '
+        f'{label!r}.{prop!r}, expected one of {sorted(_VALID_ENTITY_TYPES)}. '
+        'Refusing to guess the statement shape: a wrong guess drops NOTHING '
+        '(measured: the node form against a relationship vector index fails with '
+        '"no such index") while the caller reports a successful drop.'
+    )
+
+
 def plan_index_statements(
     missing: set[IndexSpec],
 ) -> list[tuple[str, tuple[IndexSpec, ...]]]:
