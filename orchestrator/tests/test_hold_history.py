@@ -1163,7 +1163,7 @@ def test_predicted_remaining_is_scoped_to_the_asking_task():
 # Each branch below exists to keep bad data out of the window rather than to
 # implement a feature, so none of them is reachable from the canonical trace.
 # Left untested, a regression that made one of them swallow REAL data (say
-# ``_modules_of`` returning [] for a well-formed payload) would pass the whole
+# ``modules_of`` returning [] for a well-formed payload) would pass the whole
 # suite — the failure is silent by construction, which is exactly why it needs
 # a direct test rather than incidental coverage.
 

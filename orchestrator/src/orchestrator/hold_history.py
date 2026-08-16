@@ -115,12 +115,22 @@ def _clean_modules(modules: Iterable[str]) -> list[str]:
     return [m for m in modules if isinstance(m, str) and m]
 
 
-def _modules_of(row: dict) -> list[str]:
-    """Module list from a lock event's ``data`` payload.
+def modules_of(row: dict) -> list[str]:
+    """THE rule for "which modules does this lock/skip event name" (INV-5).
 
-    Both lock event payloads carry ``data['modules']`` as a list; the
-    single-string coercion mirrors analyze_modules.py:135-136, which has to
-    tolerate the same field defensively.
+    Public because there is more than one consumer: :func:`iter_hold_spans`
+    reads it for span pairing, and ``analyze_modules`` reads it directly for
+    its per-module dispatch/skip counters, which spans do not supply.  One
+    shared helper rather than a second copy of the coercion in the CLI —
+    duplicating it is what INV-5 exists to forbid.
+
+    ``data['modules']`` is written by ``Scheduler._emit_lock_event``
+    (scheduler.py:8169) and the skip path (scheduler.py:4932-4941) as a list of
+    already-depth-coarsened module keys.  Everything below that is defence
+    against a payload reconstructed from JSON: a bare string is COERCED (it is
+    unambiguous about which single module it names, so dropping it would throw
+    away a real hold), while an unusable shape yields ``[]`` rather than a
+    phantom key.
     """
     data = row.get('data') or {}
     if not isinstance(data, dict):
@@ -282,9 +292,9 @@ def iter_hold_spans(rows: Iterable[dict]) -> Iterator[HoldSpan]:
         # The acquire/release rules themselves live in the two module-level
         # helpers, shared verbatim with HoldHistory's live feed (INV-5).
         if event_type == _ACQUIRED:
-            yield from _apply_acquire(open_spans, task_id, _modules_of(r), at)
+            yield from _apply_acquire(open_spans, task_id, modules_of(r), at)
         else:
-            yield from _apply_release(open_spans, task_id, _modules_of(r), at)
+            yield from _apply_release(open_spans, task_id, modules_of(r), at)
 
     if open_spans:
         # END OF STREAM.  Unlike an era boundary, nothing here observed an end
