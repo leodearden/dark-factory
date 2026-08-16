@@ -382,8 +382,12 @@ def clamp_unit_score(score: float) -> float:
     :func:`score_plan_structure` has always used. Does NOT handle NaN: ``min``/
     ``max`` are ordering operations and NaN is unordered, so a NaN input passes
     straight through unclamped (``round(min(max(nan, 0.0), 1.0), 4)`` is
-    ``nan``). A caller with untrusted input (:func:`judge_plan_quality`) must
-    check for that itself before calling this.
+    ``nan``). ``+/-Infinity`` DOES clamp mechanically (to ``1.0``/``0.0``), but
+    that answer is a fabricated best/worst score rather than a measurement —
+    not something this function can tell apart from a real one. A caller with
+    untrusted input (:func:`judge_plan_quality`) therefore rejects ALL
+    non-finite input, NaN and +/-Infinity alike, before ever calling this:
+    this function's contract is finite-in, ``[0, 1]``/4dp-out.
     """
     return round(min(max(score, 0.0), 1.0), 4)
 
@@ -539,14 +543,13 @@ async def judge_plan_quality(
     A successfully parsed ``plan_quality`` is put through
     :func:`clamp_unit_score` rather than returned as a raw float — see that
     function's docstring for why a runtime clamp is still needed despite
-    ``PLAN_QUALITY_SCHEMA``'s declared bounds, and for the NaN-is-unorderable
+    ``PLAN_QUALITY_SCHEMA``'s declared bounds, and for the non-finite-input
     mechanics behind the exception below. The parse contract is one rule with
     two LOUD exceptions (never silent — each leaves one WARNING naming the
-    cell): an out-of-range-but-orderable answer (e.g. ``1.5``) is clamped and
-    the WARNING names the raw and clamped values; a non-finite, unorderable
-    answer (``NaN``) degrades to the ``None`` sentinel instead, exactly like a
-    parse failure. ``+/-Infinity`` IS orderable, so it takes the ordinary
-    clamp path (``1.0``/``0.0``), not the NaN one.
+    cell): an out-of-range but FINITE answer (e.g. ``1.5``) is clamped and
+    the WARNING names the raw and clamped values; ANY non-finite answer
+    (``NaN``, ``+/-Infinity``) degrades to the ``None`` sentinel instead,
+    exactly like a parse failure, because it is not a judgement at all.
 
     On any parse failure the verdict's ``plan_quality`` is ``None`` (the
     sentinel :func:`run_architect_eval` degrades on), never a crash. When the
