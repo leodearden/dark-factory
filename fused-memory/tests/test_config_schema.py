@@ -3159,3 +3159,38 @@ class TestMemoryMetadataConfig:
 
         assert d.restart_required[f'memory_metadata.{field}'] == {'old': old, 'new': not old}
         assert f'memory_metadata.{field}' not in d.applied_candidates
+
+
+# ── max_backlog_remediation_deferrals (task 3049) ────────────────────
+#
+# Bounds how long the inline remediation pass may be deferred while a project
+# is in backlog mode.  An UNBOUNDED gate would let a persistently-deep backlog
+# starve remediation indefinitely, turning a throughput fix into an integrity
+# regression; a consecutive-deferral cap makes the debt bounded and explicit.
+
+
+def test_max_backlog_remediation_deferrals_defaults_to_five():
+    """Default bounds the deferral debt at five consecutive cycles."""
+    assert ReconciliationConfig().max_backlog_remediation_deferrals == 5
+
+
+def test_max_backlog_remediation_deferrals_rejects_a_negative_value():
+    """A negative cap is meaningless — reject rather than silently coercing."""
+    with pytest.raises(ValidationError):
+        ReconciliationConfig(max_backlog_remediation_deferrals=-1)
+
+
+def test_max_backlog_remediation_deferrals_accepts_zero_as_the_off_switch():
+    """0 disables deferral entirely, restoring exact pre-task-3049 behaviour.
+
+    One int knob subsumes the on/off switch, so there is no second boolean
+    that can disagree with it.
+    """
+    assert ReconciliationConfig(max_backlog_remediation_deferrals=0
+                                ).max_backlog_remediation_deferrals == 0
+
+
+def test_max_backlog_remediation_deferrals_accepts_a_larger_bound():
+    """A deeper backlog can be given more rope without a schema change."""
+    assert ReconciliationConfig(max_backlog_remediation_deferrals=20
+                                ).max_backlog_remediation_deferrals == 20
