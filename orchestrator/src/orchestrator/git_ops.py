@@ -7788,7 +7788,8 @@ class GitOps:
         AND the commits probe confirms work beyond main (including fail-safe
         ``True`` on git error — retain direction).
 
-        Used by both γ reattach sites in :meth:`acquire_warm_lane` to avoid
+        Used by all three γ reattach sites — :meth:`create_worktree`'s cold
+        path and both sites in :meth:`acquire_warm_lane` — to avoid
         duplicating the two-step existence-then-probe gate.
         """
         rp_rc, _, _ = await _run(
