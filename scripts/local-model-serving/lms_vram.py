@@ -843,6 +843,27 @@ def baseline_path(arm_id: str) -> Path:
     return baseline_dir() / f'{arm_id}.json'
 
 
+def assert_clean_baseline(
+    consumers: Sequence[GpuConsumer], *, context: str = '',
+) -> None:
+    """Raise :class:`PollutedBaselineError` if anything foreign holds the card.
+
+    Exists so the offending-consumer message is authored ONCE and every caller
+    raises the identical, pid-naming error.  There are two callers on purpose,
+    and they are doing different jobs:
+
+    * ``lms_ctl.start`` calls it FIRST, ahead of the pre-flight, to fix
+      operator MISDIRECTION -- see that function for why the order is
+      load-bearing.
+    * :func:`record_baseline` calls it again at the write, as the DATA
+      INTEGRITY backstop: no polluted baseline is ever persisted, whatever a
+      caller did or did not check first.
+    """
+    offenders = unexpected_baseline_consumers(consumers)
+    if offenders:
+        raise PollutedBaselineError(offenders, context=context)
+
+
 def record_baseline(
     arm_id: str,
     reading: GpuReading,
@@ -870,12 +891,9 @@ def record_baseline(
     who else held the card, and downstream that absence reads as "clean".
     """
     consumers = list(consumers)
-    offenders = unexpected_baseline_consumers(consumers)
-    if offenders:
-        raise PollutedBaselineError(
-            offenders,
-            context=f'refusing to record a baseline for arm {arm_id!r}',
-        )
+    assert_clean_baseline(
+        consumers, context=f'refusing to record a baseline for arm {arm_id!r}',
+    )
 
     path = baseline_path(arm_id)
     path.parent.mkdir(parents=True, exist_ok=True)

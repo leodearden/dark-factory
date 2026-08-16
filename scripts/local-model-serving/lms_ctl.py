@@ -117,13 +117,33 @@ def start(
     describe a card that never existed.
 
     Ordering is refuse-then-record-then-start throughout.  A polluted card
-    raises out of :func:`lms_vram.record_baseline` before any systemctl call,
-    so an arm is never launched onto a card it will then be measured against
-    unfairly -- every number such a run produced would be uninterpretable, and
-    nothing downstream would say so.
+    raises before any systemctl call, so an arm is never launched onto a card
+    it will then be measured against unfairly -- every number such a run
+    produced would be uninterpretable, and nothing downstream would say so.
+
+    THE POLLUTION CHECK COMES BEFORE THE PRE-FLIGHT, and that order is
+    load-bearing rather than cosmetic.  The two refusals have OPPOSITE fixes:
+    the pre-flight's means "this arm is too big for this card" (use a smaller
+    arm), pollution means "another process is holding the card" (free it and
+    start the same arm again).  A foreign process big enough to exceed
+    ``POLLUTION_FLOOR_MIB`` is by construction consuming the free VRAM the fit
+    check measures, so checking fit first makes the polluted refusal
+    unreachable in exactly the case it exists for, and sends the operator off
+    to shrink an arm that fits perfectly well once the intruder releases the
+    card.  Measured 2026-08-06: ollama holding 10314 MiB left 9.97 GiB free and
+    qwen3.5-9b declares 12.0 + 0.5, so the fit check fired and the operator was
+    told to use a smaller arm.
+
+    :func:`lms_vram.record_baseline` runs the SAME check again at the write.
+    That is not redundancy: this call fixes operator MISDIRECTION, and the one
+    inside ``record_baseline`` is the DATA INTEGRITY backstop that holds no
+    matter which caller reaches it or in what order.
     """
     reading = gpu if gpu is not None else lms_vram.probe_gpu()
     held_by = consumers if consumers is not None else lms_vram.probe_gpu_consumers()
+    lms_vram.assert_clean_baseline(
+        held_by, context=f'refusing to start arm {arm.arm_id!r}',
+    )
     preflight(arm, reading, exclusive=exclusive)
     # The reading the pre-flight just admitted this arm on IS the "immediately
     # before it started" baseline the budget verdict subtracts (esc-3713-6).
