@@ -2,7 +2,10 @@
 
 Provides:
 - DedupeConfig  — configuration knobs (defaults: enabled, 600s window,
-                  infra_issue category only).
+                  infra_issue category only).  Named constructors for the
+                  non-infra paths: DedupeConfig.for_recon() (recon integrity
+                  findings) and DedupeConfig.for_gate_backlog() (stale gate
+                  backlog); both use an unbounded window + content fingerprint.
 - summary_dedupe_key() — pure function; normalises a summary string and
                          returns the first ≤3 tokens as a tuple.
 - find_dedupe_parent() — scans the live queue and returns the oldest
@@ -160,7 +163,10 @@ class DedupeConfig:
     - key_fn          : None  — use summary_dedupe_key (default, infra path).
 
     The ``infra_dedupe_*`` field names are historical; the config is
-    general-purpose.  Use ``DedupeConfig.for_recon()`` for the recon path.
+    general-purpose.  Use ``DedupeConfig.for_recon()`` for the recon
+    integrity path and ``DedupeConfig.for_gate_backlog()`` for the
+    stale-gate-backlog path — deliberate siblings, not one widened config
+    (see ``for_gate_backlog``'s docstring for why).
 
     ``key_fn`` is resolved at the ``find_dedupe_parent`` use-site: None maps
     to ``_default_summary_key`` (wrapping ``summary_dedupe_key``).  Storing
@@ -195,6 +201,49 @@ class DedupeConfig:
             infra_dedupe_enabled=True,
             infra_dedupe_window_secs=float('inf'),
             infra_dedupe_categories=('recon_integrity_issue',),
+            key_fn=content_fingerprint_key,
+        )
+
+    @classmethod
+    def for_gate_backlog(cls) -> DedupeConfig:
+        """Return a DedupeConfig configured for stale-gate-backlog dedup.
+
+        Used by ``fused_memory.reconciliation.stage1_stall_detector.
+        maybe_escalate_stalled_gate_backlog``, which re-files an L1 every
+        Stage-1 cycle a gate task stays past its human-decision threshold.
+        Folding those into one parent is what makes ``dedupe_count`` a
+        recurrence/triage-order signal instead of a constant 0.
+
+        Properties:
+        - ``infra_dedupe_enabled``     : True
+        - ``infra_dedupe_window_secs`` : float('inf') — UNBOUNDED, and this is
+          load-bearing: a gate that has sat open 300h must still fold into its
+          original parent.  Any bounded window silently mints a second pending
+          record for the same gate and re-pins ``dedupe_count`` at 0, which is
+          exactly the defect this config exists to prevent.
+        - ``infra_dedupe_categories``  : ('reconciliation_stale_gate_backlog',)
+        - ``key_fn``                   : content_fingerprint_key — folds on
+          ``esc.dedupe_fingerprint``, so callers MUST stamp one.
+          ``find_dedupe_parent`` short-circuits to None on a falsy key, so an
+          unstamped escalation would silently never fold (the caller therefore
+          treats an empty fingerprint as a hard error rather than filing).
+
+        Why a SIBLING of ``for_recon()`` rather than widening it: the tuple
+        returned by ``for_recon().infra_dedupe_categories`` is consumed as the
+        eligible-collapse set by ``fused-memory/scripts/
+        backfill_recon_escalations.py`` (:168) and as the complement defining
+        that script's ``blocking_pending`` report field (:290).  Widening
+        ``for_recon`` would silently admit live gate-backlog records into that
+        one-shot operator script's collapse plan and change its report's
+        meaning, and ``for_recon``'s own docstring documents its exclusions as
+        deliberate.
+
+        The ``infra_dedupe_*`` prefix is historical / general-purpose.
+        """
+        return cls(
+            infra_dedupe_enabled=True,
+            infra_dedupe_window_secs=float('inf'),
+            infra_dedupe_categories=('reconciliation_stale_gate_backlog',),
             key_fn=content_fingerprint_key,
         )
 
