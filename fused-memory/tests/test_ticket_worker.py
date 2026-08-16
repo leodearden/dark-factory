@@ -2130,7 +2130,8 @@ class TestCuratorWorkerBatchDrain:
             interceptor_with_store._start_worker_if_needed(project_id)
 
             # Let the worker drain.
-            await asyncio.sleep(0.5)
+            for tid in (t1, t2, t3, t4):
+                await _poll_ticket_resolved(ticket_store, tid, what=f'batch ticket {tid}')
 
         # Worker should have called the prepared variant exactly once with 4 tickets.
         assert len(call_args_log) == 1, (
@@ -2198,7 +2199,7 @@ class TestCuratorWorkerBatchDrain:
             interceptor_with_store._start_worker_if_needed(project_id)
 
             # Give the worker time to process (well under 0.5s is enough).
-            await asyncio.sleep(0.5)
+            await _poll_ticket_resolved(ticket_store, t1)
 
         # Worker should have called the prepared variant exactly once.
         assert len(call_args_log) == 1, (
