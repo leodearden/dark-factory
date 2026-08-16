@@ -173,8 +173,8 @@ L2_AUTO_CLOSE_ALLOWLIST: tuple[_L2CloseClass, ...] = (
         evidence=(
             (
                 r'status\s*[=:]\s*(done|cancelled)',
-                r're-?scoped',
-                r're-?dispatched',
+                r're-?scoped\s+(?:to|into|as)\s+(?:task\s+)?[a-z0-9_.:-]*\d',
+                r're-?dispatched\s+as\s+(?:run|task)?[- ]?[a-z0-9_.:-]*\d',
             ),
         ),
     ),
