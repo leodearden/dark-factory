@@ -69,6 +69,29 @@ _FANOUT_REWARN_EVERY = 500
 _failure_streaks: dict[tuple[str, str], int] = {}
 
 
+class PreformattedFanoutError(ValueError):
+    """A fan-out failure whose message is ALREADY a rendered ``'Type: message'``.
+
+    :func:`first_success` renders every caught exception through
+    :func:`describe_exc`, which unconditionally prepends
+    ``type(exc).__name__``. A call site that has already formatted the *real*
+    cause — because it caught it, logged it, and re-raised to signal
+    fall-through — therefore reached the operator doubled:
+    ``'ValueError: ConnectError: refused'`` in the ``cancel_ticket`` 502
+    ``detail`` and in the dashboard's offline pill. Raise this instead of a
+    bare ``ValueError`` when the message you pass is final.
+
+    Subclassing ``ValueError`` (rather than adding a new type to
+    ``first_success``'s catch tuple) keeps control flow and every caller's own
+    ``except ValueError`` unchanged. A marker type is used rather than having
+    ``describe_exc`` sniff the message for an existing ``'Type: message'``
+    shape because sniffing is a heuristic on operator-visible text: any
+    legitimate message whose first token happened to look like an identifier
+    followed by ``': '`` would be silently stripped of its real type name,
+    with no way for a call site to opt out.
+    """
+
+
 def describe_exc(exc: BaseException) -> str:
     """Render *exc* as ``'Type: message'``, or just ``'Type'`` when empty.
 
@@ -78,8 +101,16 @@ def describe_exc(exc: BaseException) -> str:
     bare ``str(exc)`` turns those into content-free log lines ("failed for
     <url>: ") and content-free offline pills; always naming the type keeps
     client-side saturation distinguishable from a genuinely dead endpoint.
+
+    A non-empty :class:`PreformattedFanoutError` is the one exception: its
+    message is already a rendered cause, so it is returned verbatim rather
+    than gaining a second prefix. An *empty* one still falls through to the
+    generic path above, so opting in can never reintroduce the content-free
+    line this function exists to prevent.
     """
     text = str(exc)
+    if isinstance(exc, PreformattedFanoutError) and text:
+        return text
     return f'{type(exc).__name__}: {text}' if text else type(exc).__name__
 
 
