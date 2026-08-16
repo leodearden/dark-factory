@@ -145,13 +145,13 @@ def test_autouse_reap_fixture_is_active(request):
 # pytest-rename tripwire, so that guard cannot go green-by-absence either.
 # ---------------------------------------------------------------------------
 
-#: ``ORCH_PYPROJECT`` (the inifile these guards pin), ``sanitized_probe_env``
-#: (the env the subprocess arms below run under — it strips ``PYTHONWARNINGS``,
-#: which would otherwise contaminate BOTH arms of the end-to-end pin) and
-#: ``require_orchestrator_inifile`` all come from ``_orch_helpers``. They live
-#: there rather than here because each had already been re-derived in three to
-#: five test modules apiece; see that module's "Pytest-invocation helpers"
-#: section for the full rationale.
+# ``ORCH_PYPROJECT`` (the inifile these guards pin), ``sanitized_probe_env``
+# (the env the subprocess arms below run under — it strips ``PYTHONWARNINGS``,
+# which would otherwise contaminate BOTH arms of the end-to-end pin) and
+# ``require_orchestrator_inifile`` all come from ``_orch_helpers``. They live
+# there rather than here because each had already been re-derived in three to
+# five test modules apiece; see that module's "Pytest-invocation helpers"
+# section for the full rationale.
 
 #: The exact ``filterwarnings`` entry these guards pin. Anchored on the
 #: CATEGORY alone (empty message field) because the thread-exception message
