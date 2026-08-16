@@ -474,6 +474,9 @@ def build_report(
         grand_total.merge(project_total)
         projects[project_id] = {
             'total': _census_to_dict(project_total),
+            # Off the ROLLUP, so the canonical partition is computed at the
+            # project grain 3198's uniqueness invariant is stated at.
+            'topic_coverage': _build_topic_coverage(project_total),
             'categories': rendered,
         }
 
@@ -491,7 +494,14 @@ def build_report(
         # 'counted_recount'/'counted_interval'; 'uncovered_points' is the
         # SURVIVING residue; new delta kind 'surplus_counted' and churn kinds
         # 'collection_total_moved'/'category_count_moved'.
-        'schema_version': 3,
+        # v4 (task 4006): raw counts became COVERAGE. Every census cell gained
+        # the topic x canonical cross-tab ('canonical_true_by_topic',
+        # 'canonical_true_without_topic'), and a new per-project +
+        # grand-total 'topic_coverage' block carries the stamping RATE and
+        # the three-way canonical partition (exactly one / zero / more than
+        # one per topic), computed at PROJECT grain to match 3198's
+        # scope-wide uniqueness probe.
+        'schema_version': 4,
         'params': {
             'projects': sorted(cells),
             'categories': category_order,
@@ -501,7 +511,60 @@ def build_report(
         },
         'projects': projects,
         'grand_total': _census_to_dict(grand_total),
+        'topic_coverage': _build_topic_coverage(grand_total),
         'coverage': _build_coverage(coverage),
+    }
+
+
+def _build_topic_coverage(census: CategoryCensus) -> dict[str, Any]:
+    """Turn a MERGED census rollup into the topic/canonical COVERAGE block.
+
+    Takes the per-project (or grand-total) rollup produced by
+    :meth:`CategoryCensus.merge`, never a single cell.  That is load-bearing,
+    not incidental: 3198's write-time uniqueness probe is
+    ``count_memories_by_metadata(project_id, {'topic': T, 'canonical': True})``
+    (memory_service.py:594) -- scope-wide, NOT category-filtered.  Measuring
+    the partition at a finer grain than the invariant is stated at would
+    score a topic whose canonical sits in a different category from its
+    peers as "zero canonical" and split a genuine cross-category duplicate
+    into two well-formed cells: false gaps and missed violations at once.
+
+    ``topic_coverage_pct`` is the RATE the existing raw counts cannot
+    express.  It is ``None`` -- never ``0.0`` -- for an empty population: a
+    0.0 asserts "measured, and nothing is stamped", which is a different
+    claim from "there was nothing to measure", and fabricating the former is
+    the failure task 3291 hardened ``extract_done_count`` against.
+    """
+    by_topic = census.canonical_true_by_topic
+    exactly_one = zero = multiple = 0
+    for topic in census.topic_values:
+        count = by_topic.get(topic, 0)
+        if count == 0:
+            zero += 1
+        elif count == 1:
+            exactly_one += 1
+        else:
+            multiple += 1
+
+    return {
+        'records': census.records,
+        'topic_present': census.topic_present,
+        'topic_coverage_pct': (
+            round(census.topic_present * 100.0 / census.records, 4)
+            if census.records
+            else None
+        ),
+        'distinct_topics': len(census.topic_values),
+        # Sums to distinct_topics by construction -- the partition is a
+        # walk over topic_values, so no topic can fall out of it.
+        'topics_with_one_canonical': exactly_one,
+        'topics_with_zero_canonical': zero,
+        'topics_with_multiple_canonical': multiple,
+        'canonical_true': census.canonical_true,
+        # Named rather than dropped: these canonicals are invisible to every
+        # per-topic tally above, so without this the block cannot be
+        # reconciled against the canonical_true axis.
+        'canonical_true_without_topic': census.canonical_true_without_topic,
     }
 
 
