@@ -102,6 +102,61 @@ def no_systemd(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(subprocess, "run", _no_systemctl)
 
 
+# Verbatim `systemctl --user show fused-memory.service -p Environment` output,
+# captured from the live unit on this host at base main fc6f048b55. ONE physical
+# line, terminated by a single newline (confirmed with `cat -A`: a lone `$` at the
+# end, no trailing spaces). Pinned here in a comment for the same reason
+# test_orchestrator_watchdog.py pins its _SS_HEADER iproute2 rows verbatim — the
+# helper below must reproduce the shape the REAL command emits, not an invented one,
+# or known_project_roots' regex would be exercised against a fiction:
+#
+# Environment=CONFIG_PATH=/home/leo/src/dark-factory/fused-memory/config/config.yaml PROJECT_ROOT=/home/leo/src/dark-factory TASKMASTER_DIR=/home/leo/src/dark-factory/taskmaster-ai MEM0_TELEMETRY=false DASHBOARD_KNOWN_PROJECT_ROOTS=/home/leo/src/dark-factory,/home/leo/src/reify,/home/leo/src/autopilot-video,/home/leo/src/autotrade,/home/leo/src/know-live,/home/leo/src/solar-challenge,/home/leo/mission-control,/home/leo/src/solar-challenge-platform,/home/leo/src/pump-web-ui "FUSED_MEMORY_PREDONE_HOOK_REIFY=/home/leo/.cargo/bin/reify-audit --task {id} --pre-done"
+#
+# THREE STRUCTURAL FACTS THAT MAKE THE REGEX r"DASHBOARD_KNOWN_PROJECT_ROOTS=([^\s]+)"
+# MATCH FOR THE RIGHT REASON, all reproduced by the helper below:
+#   1. a single `Environment=` prefix, then space-separated KEY=value tokens;
+#   2. DASHBOARD_KNOWN_PROJECT_ROOTS sits in the MIDDLE with further tokens after it,
+#      so `([^\s]+)` genuinely has to stop at whitespace rather than run to EOL;
+#   3. a value containing spaces is DOUBLE-QUOTED by systemd — so a quoted token
+#      follows the roots list, which is the realistic thing the greedy-until-space
+#      capture must not swallow.
+
+
+def _systemctl_env_stdout(roots) -> subprocess.CompletedProcess:
+    """A CompletedProcess whose stdout mirrors the real unit's Environment line."""
+    joined = ",".join(str(r) for r in roots)
+    stdout = (
+        "Environment=CONFIG_PATH=/opt/fake/fused-memory/config/config.yaml "
+        "PROJECT_ROOT=/opt/fake/dark-factory "
+        "TASKMASTER_DIR=/opt/fake/dark-factory/taskmaster-ai "
+        "MEM0_TELEMETRY=false "
+        f"DASHBOARD_KNOWN_PROJECT_ROOTS={joined} "
+        '"FUSED_MEMORY_PREDONE_HOOK_REIFY=/opt/fake/reify-audit --task {id} --pre-done"\n'
+    )
+    return subprocess.CompletedProcess(
+        args=["systemctl", "--user", "show", "fused-memory.service", "-p", "Environment"],
+        returncode=0,
+        stdout=stdout,
+        stderr="",
+    )
+
+
+@pytest.fixture
+def fake_systemd(monkeypatch: pytest.MonkeyPatch):
+    """Factory: install a fake ``systemctl`` reporting *roots* in the unit env.
+
+    Sibling of ``no_systemd`` — that one makes the branch fail, this one makes it
+    succeed. Both patch the GLOBAL ``subprocess.run``; monkeypatch restores it.
+    """
+
+    def _install(roots) -> subprocess.CompletedProcess:
+        completed = _systemctl_env_stdout(roots)
+        monkeypatch.setattr(subprocess, "run", lambda *a, **k: completed)
+        return completed
+
+    return _install
+
+
 def _project_tree(tmp_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
     """Build a hermetic parent-of-projects tree; return ``(parent, df_root)``.
 
@@ -213,3 +268,31 @@ def test_known_project_roots_on_empty_parent_returns_empty_list(
     empty_parent.mkdir()
 
     assert fep.known_project_roots(empty_parent / "dark-factory") == []
+
+
+def test_fake_systemd_helper_round_trips_through_known_project_roots(
+    fep: types.ModuleType, fake_systemd, tmp_path: pathlib.Path
+) -> None:
+    """Verify the helper itself: a root reachable ONLY via the fake unit env is found.
+
+    This asserts nothing about allocation or ordering (steps 3 and 7 own those). It
+    exists so that a later red in the systemd-env tests is attributable to the code
+    under test rather than to a helper emitting a shape systemd never produces.
+
+    ``elsewhere/`` is created OUTSIDE the sibling parent on purpose: it cannot be
+    reached by the glob fallback, so its presence in the result is proof the env
+    branch parsed — and proof the regex stopped at whitespace instead of swallowing
+    the quoted FUSED_MEMORY_PREDONE_HOOK_REIFY token that follows it.
+    """
+    parent, df_root = _project_tree(tmp_path)
+    elsewhere = tmp_path / "outside" / "elsewhere"
+    elsewhere.mkdir(parents=True)
+
+    fake_systemd([elsewhere])
+    got = {p.resolve() for p in fep.known_project_roots(df_root)}
+
+    assert elsewhere.resolve() in got
+    # The glob fallback still contributes; the env branch adds to it, never replaces.
+    assert (parent / "proj-a").resolve() in got
+    # Nothing from the trailing quoted token leaked into the parsed root list.
+    assert not any("reify-audit" in str(p) for p in got)
