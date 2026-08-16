@@ -1038,9 +1038,15 @@ class TestHostAllocatorStrandAccessors:
         plain_alloc.acquire_remote()                       # remoteA busy
         plain_alloc.acquire_local(self._local_factory)     # local busy
 
+        # Fixture preconditions, asserted ONCE against the fixture each applies
+        # to — so the agreement loop below is the test's only real content.
+        assert parked_alloc.is_parked('remoteA') is True
+        assert 'parked' not in {
+            h['slot_state'] for h in self._by_name(plain_alloc).values()
+        }
+
         for alloc in (parked_alloc, plain_alloc):
             states = self._by_name(alloc)
-            assert 'parked' in {h['slot_state'] for h in states.values()} or alloc is plain_alloc
             for name, entry in states.items():
                 assert alloc.is_parked(name) is (entry['slot_state'] == 'parked'), (
                     f'{name}: is_parked={alloc.is_parked(name)} vs '
@@ -1107,6 +1113,42 @@ class TestHostAllocatorStrandAccessors:
         """An unmanaged host name returns None rather than raising."""
         alloc = self._make_allocator()
         assert alloc.remote_runner('no-such-host') is None
+
+    # -- local_name (task 3043 amend) -----------------------------------------
+
+    async def test_local_name_defaults_to_local(self):
+        """The O(1) read that replaces scanning host_states() for is_local."""
+        alloc = self._make_allocator()
+        assert alloc.local_name == 'local'
+
+    async def test_local_name_honours_a_custom_local_name(self):
+        """Not hard-coded: it reports whatever the allocator was built with."""
+        from orchestrator.verify_runner import HostAllocator
+
+        alloc = HostAllocator(
+            [_FakeRemoteRunner('remoteA')], quarantine=set(), local_name='anchor-01',
+        )
+        assert alloc.local_name == 'anchor-01'
+
+    async def test_local_name_agrees_with_host_states_is_local(self):
+        """local_name can never drift from host_states()'s is_local flag.
+
+        The two readers of ``_local_name`` are pinned to agree, over a custom
+        name so a hard-coded ``'local'`` on either side would be caught.
+        """
+        from orchestrator.verify_runner import HostAllocator
+
+        alloc = HostAllocator(
+            [_FakeRemoteRunner('remoteA')], quarantine=set(), local_name='anchor-01',
+        )
+        flagged = [h['name'] for h in alloc.host_states() if h['is_local']]
+        assert flagged == [alloc.local_name]
+
+    async def test_local_name_is_read_only(self):
+        """A property, not a settable attribute — callers cannot retarget the anchor."""
+        alloc = self._make_allocator()
+        with pytest.raises(AttributeError):
+            alloc.local_name = 'somewhere-else'  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------------------

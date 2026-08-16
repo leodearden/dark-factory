@@ -1634,6 +1634,13 @@ class TestSpeculativeStrandedHostAutoReadmission:
         outer never reaches its ``except RunnerUnavailable`` conversion.  The
         inner surfaces the transport failure as it is torn down — the real shape
         for an ssh push to a host that has gone away.
+
+        Returns ``(inner, outer)``.  The OUTER task is returned — and asserted
+        CANCELLED here — because the guard's most load-bearing property is that
+        its ``finally`` never swallows the in-flight ``CancelledError``: the
+        cascade's ``_entry.verify_task.cancelled()`` checks depend on it, and
+        this harness previously discarded the outer entirely (task 3043 amend,
+        reviewer test-coverage finding).
         """
         from unittest.mock import patch
 
@@ -1660,7 +1667,12 @@ class TestSpeculativeStrandedHostAutoReadmission:
                 await outer
             for _ in range(10):
                 await asyncio.sleep(0)
-        return captured[0]
+        assert outer.cancelled() is True, (
+            'the outer _run_inflight_verify must end CANCELLED — a `return` in '
+            'the orphan guard would swallow the in-flight CancelledError and '
+            "silently break the cascade's verify_task.cancelled() checks"
+        )
+        return captured[0], outer
 
     @staticmethod
     def _pending_verify_tasks() -> list:
@@ -1692,9 +1704,12 @@ class TestSpeculativeStrandedHostAutoReadmission:
         loop.set_exception_handler(lambda _l, ctx: unhandled.append(ctx))
         try:
             # 2a. Head-failure cascade cancels the OUTER verify task.
-            inner = await self._cancel_outer_midflight(
+            inner, outer = await self._cancel_outer_midflight(
                 worker, self._make_item(), laptop_lease,
             )
+            # The cascade reads exactly this predicate off its InflightEntry
+            # before manually re-queuing a downstream request.
+            assert outer.cancelled() is True
             # 2b. …then releases the lease against the down host: cancel rc=255
             #     and every probe_clean() False → slot PARKED, non-acquirable.
             ok = await worker._cancel_and_release_tracked(laptop_lease)

@@ -17025,17 +17025,28 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # up.  Before this guard the outer ended immediately on
                     # cancel, so the bound is what keeps that property.
                     #
-                    # The timeout can surface two ways and BOTH are handled by
-                    # re-checking `done()` afterwards rather than by trusting
-                    # the raise: wait_for cancels the awaited coroutine, and
-                    # _teardown_verify_task's `suppress(BaseException)` around
-                    # `await verify_task` may swallow that CancelledError and
-                    # return normally instead of letting TimeoutError out.
+                    # asyncio.shield is LOAD-BEARING, not decoration.  Without
+                    # it the teardown coroutine runs inline in THIS task, whose
+                    # _fut_waiter is then `verify_task` itself — so wait_for's
+                    # timeout cancel chains straight down into the inner task
+                    # (Task.cancel() delegates to _fut_waiter and returns
+                    # WITHOUT setting _must_cancel) and this task is never
+                    # resumed.  The bound would then be a no-op against exactly
+                    # the inner that motivates it: one that does not die on the
+                    # next cancel.  shield() runs the teardown as its own task,
+                    # so the timeout cancels the shield's outer future, TimeoutError
+                    # is raised HERE, and the reap is abandoned rather than awaited.
+                    #
+                    # `done()` is re-checked below rather than keying the WARNING
+                    # off the raise: the reap can also end early with the inner
+                    # still live, and both shapes are the same operator fact.
                     with contextlib.suppress(TimeoutError):
                         await asyncio.wait_for(
-                            self._teardown_verify_task(
-                                None, verify_task, req.task_id,
-                                shutdown_defensive=True,
+                            asyncio.shield(
+                                self._teardown_verify_task(
+                                    None, verify_task, req.task_id,
+                                    shutdown_defensive=True,
+                                )
                             ),
                             timeout=self.ORPHAN_REAP_TIMEOUT_SECS,
                         )
