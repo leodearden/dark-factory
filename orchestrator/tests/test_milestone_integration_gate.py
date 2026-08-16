@@ -462,18 +462,28 @@ class TestExemplarFailAndTimeout:
     milestone_check_failed.  γ's outer ``asyncio.wait_for`` guard is
     ``before_done['timeout_secs'] + run_timeout_grace_secs`` — a STRICT
     superset of ``_default_run_script``'s own inner per-subprocess timeout,
-    which always resolves first for a real, SIGKILL-able subprocess and
-    returns a normal ``(rc=1, tail)`` verdict (the *intended* behaviour:
-    ``run_timeout_grace_secs`` is documented as "a pure safety margin ON TOP
+    which always resolves first for a real, SIGKILL-able subprocess
+    (``run_timeout_grace_secs`` is documented as "a pure safety margin ON TOP
     of before_done['timeout_secs']", not a race to win — see
-    deterministic_runner.py's ``_RUN_TIMEOUT_GRACE_SECS`` comment).  A real
-    subprocess timing out therefore exercises B8 (milestone_check_failed),
-    not B9 — reaching the outer guard needs a leaf that never returns at
-    all, so B9 is exercised with an injected hanging ``script_runner``,
-    exactly mirroring test_deterministic_runner.py's own
-    ``TestPredicateModeTimeout`` unit test.  This still drives the REAL,
-    unmocked ``_run_predicate``/``run()`` composition — only the leaf
-    ``run_fn`` callable differs from the exemplar-script path.
+    deterministic_runner.py's ``_RUN_TIMEOUT_GRACE_SECS`` comment).
+
+    Task 4065 amendment: a real subprocess timing out therefore exercises B9
+    (infra_issue), NOT B8 — ``_default_run_script`` raises ``ScriptTimeout``
+    on that inner timeout instead of returning an ``(rc=1, tail)``
+    indistinguishable from a genuine non-zero exit (see that class's docstring
+    in deterministic_runner.py for the full rationale).  This docstring
+    previously asserted the opposite, and that prose is exactly what 4065
+    falsified.  The default runner's inner-timeout case is unit-covered in
+    test_deterministic_runner.py's ``TestPredicateDefaultRunnerInnerTimeout``.
+
+    Reaching the OUTER guard instead needs a leaf that never returns at all,
+    so the test below keeps exercising it with an injected hanging
+    ``script_runner`` — a custom runner never raises ``ScriptTimeout``, so it
+    remains valid coverage for that distinct arm, exactly mirroring
+    test_deterministic_runner.py's own ``TestPredicateModeTimeout`` unit
+    test.  This still drives the REAL, unmocked ``_run_predicate``/``run()``
+    composition — only the leaf ``run_fn`` callable differs from the
+    exemplar-script path.
     """
 
     TASK_ID_FAIL = '9002'
