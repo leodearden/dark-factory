@@ -2222,8 +2222,11 @@ def test_a_usage_error_does_not_read_as_not_installed_here(
     ) == before
 
 
-# A `_orch_skip_reason` case arm: `*,drift,*)` / `*,drift,*,override,*)`.
-_SKIP_ARM_RE = re.compile(r"^\s*(\*,[a-z,*]+,\*)\)\s*$", re.M)
+# A `_orch_skip_reason` case arm: `*,drift,*)`, or a `|`-alternated one like
+# `*,drift,override,*|*,drift,*,override,*)`. Alternation is included because
+# an arm the parse cannot see reads as a MISSING arm, and this guard's failure
+# would then name a kind that is in fact handled.
+_SKIP_ARM_RE = re.compile(r"^\s*(\*,[a-z,*|]+,\*)\)\s*$", re.M)
 # A literal kind named in the install-eligible condition: `[ "$_kinds" = clean ]`.
 _INSTALL_ELIGIBLE_RE = re.compile(r'\[\s*"\$_kinds"\s*=\s*([a-z]+)\s*\]')
 
@@ -2240,6 +2243,70 @@ def _skip_arm_kinds(section: str) -> set[str]:
 def _install_eligible_kinds(section: str) -> set[str]:
     """Kinds the install condition accepts literally."""
     return set(_INSTALL_ELIGIBLE_RE.findall(section))
+
+
+def _skip_reason(kinds: str, unit: str = "orchestrator-x.service") -> str:
+    """Run setup-host.sh's own `_orch_skip_reason` for *kinds*, under bash.
+
+    Extracted from the live script and EXECUTED rather than read, because the
+    defect class here is a case pattern that parses fine, reads plausibly and
+    never matches — invisible to any test that only greps for the arm.
+    """
+    section = _installer_section()
+    start = section.index("_orch_skip_reason() {")
+    end = section.index("\n}\n", start) + len("\n}\n")
+    result = subprocess.run(
+        ["bash", "-c", f'{section[start:end]}\n_orch_skip_reason "$1" "$2"', "_", kinds, unit],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, f"_orch_skip_reason({kinds!r}) failed: {result.stderr}"
+    return result.stdout
+
+
+def test_every_skip_reason_arm_fires_for_the_kinds_it_claims():
+    """Each arm is EXECUTED, because an arm that never matches is invisible.
+
+    Measured: the combined arm was written `*,drift,*,override,*)`, which can
+    never match `,drift,override,` — the comma the first `,drift,` consumes is
+    the same one `,override,` needs. It parsed, it read correctly, and it
+    silently lost every match to the drift-only arm below it.
+
+    The consequence is not cosmetic. A unit with BOTH byte-drift and a drop-in
+    would be reported as byte-drift alone; the operator reconciles the
+    directive, re-runs, and the unit is skipped AGAIN — for a drop-in nobody
+    ever told them about. A warning that names an incomplete remedy is worse
+    than one that names none, because it looks like progress.
+    """
+    checker = _load_checker()
+    blocking = [k for k in checker.VERDICT_KINDS if k not in {"clean", "absent"}]
+
+    for kind in [*blocking, "unverified"]:
+        message = _skip_reason(kind).strip()
+        assert message, f"{kind} produced an EMPTY reason"
+
+    combined = _skip_reason("drift,override")
+    assert "drift" in combined and "drop-in" in combined, (
+        "A unit with BOTH byte-drift and a drop-in override is told about only "
+        f"one of them: {combined!r}\nThe operator fixes what they were told "
+        "about, re-runs, and is skipped again for the other."
+    )
+
+    # Each single kind must still get ITS OWN message, not the combined one —
+    # a combined arm widened until it swallows the singles is the same defect
+    # with the sign flipped.
+    assert "drop-in" not in _skip_reason("drift"), _skip_reason("drift")
+    assert "byte-drift" not in _skip_reason("override"), _skip_reason("override")
+
+    unknown = _skip_reason("masked")
+    assert "masked" in unknown, (
+        "The `*)` fallback does not name the unhandled kind VERBATIM, so an "
+        f"operator cannot tell which kind went unhandled: {unknown!r}"
+    )
+    assert "setup-host.sh" in unknown, (
+        "The fallback does not name the file that has to change. It is the one "
+        f"message whose reader has no other clue where to look: {unknown!r}"
+    )
 
 
 def test_setup_host_handles_every_verdict_kind_the_checker_can_emit():

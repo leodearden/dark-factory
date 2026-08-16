@@ -316,10 +316,20 @@ while read -r _tag _kw _unit _kinds; do
 done <<< "$(printf '%s\n' "$_orch_parity_out" \
             | grep -F '[orchestrator_unit_parity] verdict ' || true)"
 
-# Operator-facing phrasing for each BLOCKING verdict kind. The kinds come from
-# VERDICT_KINDS in check_orchestrator_unit_parity.py, and a cross-artifact test
-# asserts every member has an arm here — a kind that fell through to `*)` would
-# produce a warning naming no actionable cause.
+# Operator-facing phrasing for each BLOCKING verdict kind. Every kind names its
+# own REMEDY, because the remedies are genuinely different and the whole point
+# of the per-unit channel is that the operator is told what to do about THIS
+# unit: byte-drift is reconciled by editing a directive (after deciding which
+# side is stale), a drop-in is removed with `systemctl --user edit`, and a
+# vanished template is a repo problem, not a host one.
+#
+# The kinds come from VERDICT_KINDS in check_orchestrator_unit_parity.py, and a
+# cross-artifact test asserts every member has an arm here.
+#
+# ARM ORDER IS PRECEDENCE, most-blocking first: the two kinds that mean "the
+# file itself is unusable" (vanished, unreadable) outrank a content finding,
+# and the combined drift+override arm must precede both single arms or a unit
+# with both would be reported as having only one.
 #
 # Defined HERE, inside the region the behavioural tests slice and execute, not
 # near the top of this script: a helper defined above the slice would be
@@ -330,8 +340,15 @@ _orch_skip_reason() {
       printf '%s' "there is no committed copy to install FROM (see the [vanished] report)" ;;
     *,unreadable,*)
       printf '%s' "its unit file exists but could not be read or decoded (see the [unreadable] report)" ;;
-    *,drift,*,override,*)
-      printf '%s' "byte-drift against the committed copy AND a drop-in override" ;;
+    # ALTERNATED, and the first branch is the one that actually fires today.
+    # `*,drift,*,override,*` alone can NEVER match ",drift,override," — the
+    # comma that `,drift,` consumes is the same one `,override,` needs — so it
+    # silently lost every match to the drift-only arm below, telling an
+    # operator with both problems about one of them. The kinds are adjacent in
+    # VERDICT_KINDS, so contiguity holds today; the second branch keeps this
+    # arm firing if a future kind is ever ordered between them.
+    *,drift,override,*|*,drift,*,override,*)
+      printf '%s' "byte-drift against the committed copy AND a drop-in override — BOTH must be resolved" ;;
     *,drift,*)
       printf '%s' "byte-drift against the committed copy — reconcile the directive, checking WHICH side is correct" ;;
     *,override,*)
@@ -339,7 +356,12 @@ _orch_skip_reason() {
     *,unverified,*)
       printf '%s' "the parity gate returned no verdict for this unit — it did not run, or does not know it" ;;
     *)
-      printf '%s' "an unhandled verdict kind '$1'; this installer does not know what that means, so it declined to act" ;;
+      # LOUD, and self-describing down to the remedy. Reaching this arm means
+      # the checker's vocabulary grew without this script following — so the
+      # message names the offending kind VERBATIM and both files that have to
+      # change, rather than degrading to a generic "skipped" that leaves the
+      # operator diffing units looking for a problem the gate already named.
+      printf '%s' "the gate reported verdict kind '$1', which this installer has no case arm for, so it declined to act rather than guess. FIX: add an arm to _orch_skip_reason in scripts/setup-host.sh for every kind in VERDICT_KINDS (scripts/check_orchestrator_unit_parity.py)" ;;
   esac
 }
 
