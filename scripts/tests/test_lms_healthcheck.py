@@ -2016,6 +2016,228 @@ def test_a_failing_arm_row_survives_the_merge():
     assert lms_healthcheck.exit_code_for(merged) == lms_healthcheck.EXIT_ARM_FAILED
 
 
+# --- pollution must survive the merge (task 3755) --------------------------
+#
+# The slate is measured one arm at a time over ~39 minutes, so the ONLY place
+# an operator meets the pollution evidence is the merged artifact.  Binding
+# selection was `failing[0] if any FAIL else max(arm_footprint_mib)` and
+# pollution was not part of it, so a POLLUTED run that lost the footprint
+# contest was silently laundered into a clean slate.
+
+
+#: 8312 used against the 3312 MiB baseline: a 5000 MiB footprint.
+SMALL_USED_MIB = 8312
+#: 12312 used: a 9000 MiB footprint, still well inside the 20811 MiB budget,
+#: so BOTH sizes below are budget PASSes and only the footprint differs.
+LARGE_USED_MIB = 12312
+
+
+def _clean_single(arm, used_mib=MEASURED_USED_MIB):
+    """One arm's run on a card nobody else touched."""
+    return _single(
+        arm,
+        baseline=_baseline(consumers=[WHISPER_CONSUMER]),
+        snapshot=_snapshot(
+            used_mib=used_mib, free_mib=MEASURED_TOTAL_MIB - used_mib,
+            consumers=[WHISPER_CONSUMER, ARM_CONSUMER],
+        ),
+    )
+
+
+def _polluted_single(arm, used_mib=MEASURED_USED_MIB):
+    """One arm's run that ollama gatecrashed: the numbers exist, and mean
+    nothing.  The measured 2026-08-06 scenario, one arm at a time."""
+    return _single(
+        arm,
+        baseline=_baseline(consumers=[WHISPER_CONSUMER]),
+        snapshot=_snapshot(
+            used_mib=used_mib, free_mib=MEASURED_TOTAL_MIB - used_mib,
+            consumers=[WHISPER_CONSUMER, ARM_CONSUMER, OLLAMA_CONSUMER],
+        ),
+    )
+
+
+def _other_arm(arm_id='phi-4-14b', port=8412):
+    return _arm(arm_id=arm_id, served_model_name=arm_id, port=port)
+
+
+def _assert_names_the_intruder(text):
+    assert str(OLLAMA_CONSUMER.pid) in text
+    assert OLLAMA_CONSUMER.process_name in text
+    assert str(OLLAMA_CONSUMER.used_mib) in text
+
+
+@pytest.mark.parametrize(
+    'build', [_clean_single, _polluted_single], ids=['clean', 'polluted'],
+)
+def test_merging_one_report_carries_its_pollution_through_unchanged(build):
+    """THE CLASS-KILLING INVARIANT: a one-report merge is a no-op.
+
+    Any binding rule that can drop, invent or rewrite pollution shows up here
+    first, whatever the arithmetic of the multi-report cases happens to be.
+    """
+    single = build(_arm())
+
+    merged = lms_healthcheck.merge_reports([single])
+
+    assert merged.vram.pollution == single.vram.pollution
+    assert merged.vram.pollution_reason == single.vram.pollution_reason
+    assert (
+        lms_healthcheck.exit_code_for(merged)
+        == lms_healthcheck.exit_code_for(single)
+    )
+
+
+def test_a_polluted_run_survives_a_merge_it_loses_on_footprint():
+    """The flattering direction, and the one the old rule dropped.
+
+    A polluted arm that took LESS than a clean one loses the largest-footprint
+    contest, so its evidence left the artifact entirely: exit 0, no banner, and
+    a slate that reads as measured on an empty card.
+    """
+    polluted = _polluted_single(_arm(), used_mib=SMALL_USED_MIB)
+    clean = _clean_single(_other_arm(), used_mib=LARGE_USED_MIB)
+    assert polluted.vram.arm_footprint_mib < clean.vram.arm_footprint_mib
+
+    merged = lms_healthcheck.merge_reports([polluted, clean])
+
+    assert merged.vram.pollution == lms_vram.PollutionState.POLLUTED
+    _assert_names_the_intruder(merged.vram.pollution_reason)
+    assert 'qwen3.5-9b' in merged.vram.pollution_reason
+    assert (
+        lms_healthcheck.exit_code_for(merged)
+        == lms_healthcheck.EXIT_VRAM_POLLUTED
+    )
+    assert 'POLLUTED' in lms_healthcheck.render_table(merged)
+    # `overall` is what the ARMS earned, exactly as in the single-report case.
+    assert merged.overall == 'PASS'
+
+
+def test_a_polluted_run_survives_a_merge_it_wins_on_footprint():
+    """The growth direction passes today only by luck -- the polluted arm
+    happens to win the footprint contest.  Pinned so it cannot regress."""
+    polluted = _polluted_single(_arm(), used_mib=LARGE_USED_MIB)
+    clean = _clean_single(_other_arm(), used_mib=SMALL_USED_MIB)
+    assert polluted.vram.arm_footprint_mib > clean.vram.arm_footprint_mib
+
+    merged = lms_healthcheck.merge_reports([polluted, clean])
+
+    assert merged.vram.pollution == lms_vram.PollutionState.POLLUTED
+    _assert_names_the_intruder(merged.vram.pollution_reason)
+    assert 'qwen3.5-9b' in merged.vram.pollution_reason
+    assert (
+        lms_healthcheck.exit_code_for(merged)
+        == lms_healthcheck.EXIT_VRAM_POLLUTED
+    )
+    assert 'POLLUTED' in lms_healthcheck.render_table(merged)
+
+
+def test_a_failing_budget_still_outranks_pollution_for_the_binding_block():
+    """Binding precedence is failing > polluted > largest footprint.
+
+    Failing stays FIRST because `overall` is computed from the surviving
+    block: promoting a POLLUTED-but-PASS block over a budget FAIL would flip a
+    failing slate green.  Pollution still propagates alongside it.
+    """
+    over = _single(_arm(), snapshot=_over_budget_snapshot())
+    polluted = _polluted_single(_other_arm(), used_mib=SMALL_USED_MIB)
+
+    merged = lms_healthcheck.merge_reports([over, polluted])
+
+    assert merged.vram.verdict == 'FAIL'
+    assert merged.overall == 'FAIL'
+    assert merged.vram.pollution == lms_vram.PollutionState.POLLUTED
+    assert 'phi-4-14b' in merged.vram.pollution_reason
+    assert (
+        lms_healthcheck.exit_code_for(merged)
+        == lms_healthcheck.EXIT_VRAM_POLLUTED
+    )
+
+
+def test_with_nothing_failing_the_polluted_block_binds_over_a_bigger_footprint():
+    """The surviving block is ONE input's real measurement, so which input it
+    is decides whose consumer lists an operator gets to see.  On a contended
+    card the largest footprint is the least meaningful number in the file."""
+    polluted = _polluted_single(_arm(), used_mib=SMALL_USED_MIB)
+    clean = _clean_single(_other_arm(), used_mib=LARGE_USED_MIB)
+
+    merged = lms_healthcheck.merge_reports([clean, polluted])
+
+    assert merged.vram.arm_footprint_mib == polluted.vram.arm_footprint_mib
+    assert OLLAMA_CONSUMER in merged.vram.probe_consumers
+
+
+def test_two_polluted_runs_union_into_one_reason_naming_both_arms():
+    """The merged block belongs to ONE arm, so the reason is the only place the
+    others' pollution can be recorded at all."""
+    first = _polluted_single(_arm())
+    second = _polluted_single(_other_arm(), used_mib=SMALL_USED_MIB)
+
+    merged = lms_healthcheck.merge_reports([first, second])
+
+    assert merged.vram.pollution == lms_vram.PollutionState.POLLUTED
+    assert 'qwen3.5-9b' in merged.vram.pollution_reason
+    assert 'phi-4-14b' in merged.vram.pollution_reason
+    assert (
+        lms_healthcheck.exit_code_for(merged)
+        == lms_healthcheck.EXIT_VRAM_POLLUTED
+    )
+
+
+def _never_looked(report):
+    """A pre-v5 report as `--merge` reads it back off disk.
+
+    The five consumer fields are absent from the payload, so they default --
+    and `pollution` defaults to UNMEASURED precisely so this state is legible.
+    This producer never emits it; reading an old file is the only way in.
+    """
+    return report.model_copy(update={
+        'vram': report.vram.model_copy(update={
+            'baseline_consumers': [],
+            'probe_consumers': [],
+            'consumer_inventory_note': '',
+            'pollution': lms_vram.PollutionState.UNMEASURED,
+            'pollution_reason': '',
+        }),
+    })
+
+
+def test_merging_refuses_a_report_that_never_looked_at_the_card():
+    """UNMEASURED is not a measurement, so it cannot be unioned into one.
+
+    A v5-shaped slate assembled partly from runs that never looked genuinely IS
+    an assembly defect, which is what EXIT_MERGE_ERROR already means -- and
+    refusing avoids inventing an eighth exit code for a state the producer
+    cannot emit.  POLLUTED propagates instead, because it IS a measurement.
+    """
+    blind = _never_looked(_single(_arm()))
+
+    with pytest.raises(lms_healthcheck.ReportMergeError, match='qwen3.5-9b'):
+        lms_healthcheck.merge_reports([blind, _single(_other_arm())])
+
+
+def test_cli_merge_refuses_a_pre_v5_slate_and_writes_nothing(cli_env, tmp_path):
+    """The one path by which UNMEASURED reaches `merge_reports`: files written
+    before this producer recorded who else held the card."""
+    parts = []
+    for arm_id in lms_healthcheck.load_arms().arm_ids():
+        path = tmp_path / f'{arm_id}.json'
+        assert lms_healthcheck.main(['--arm', arm_id, '--output', str(path)]) == 0
+        payload = json.loads(path.read_text())
+        payload['schema_version'] = 4
+        for key in ('baseline_consumers', 'probe_consumers',
+                    'consumer_inventory_note', 'pollution', 'pollution_reason'):
+            del payload['vram'][key]
+        path.write_text(json.dumps(payload))
+        parts.append(str(path))
+
+    out = tmp_path / 'merged.json'
+    code = lms_healthcheck.main(['--merge', *parts, '--output', str(out)])
+
+    assert code == lms_healthcheck.EXIT_MERGE_ERROR
+    assert not out.exists()
+
+
 def test_the_report_carries_the_delivered_check_marker():
     """JSON carries no comments, so the marker must live in a real field."""
     assert _report().prd_marker == 'PRD-MARKER:local-memory-models-eval serving'
