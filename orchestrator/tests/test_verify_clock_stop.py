@@ -829,7 +829,7 @@ class TestClockStopMessageAttribution:
                 tmp_path,
                 timeout=5400.0,
                 log_path=log_path,
-                clock_stop=self._make_cfg(),
+                clock_stop=_make_clock_stop_cfg(),
             )
 
         assert timed_out is True, f'Expected timed_out=True; got timed_out={timed_out}'
