@@ -8,6 +8,7 @@ remediation duty cycle, and the pure capacity arithmetic.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import uuid
 from datetime import UTC, datetime
@@ -27,11 +28,13 @@ from fused_memory.reconciliation.throughput import (
     FITTED_CYCLE_MARGINAL_SECONDS,
     OBSERVED_BURST_EVENTS_PER_DAY,
     STEADY_STATE_AMORTISATION_MIN_BATCH,
+    build_report,
     capacity_verdict,
     cycle_seconds,
     drain_stats,
     inflow_daily,
     inflow_hourly,
+    main,
     remediation_duty_cycle,
     seconds_per_event,
     sustainable_events_per_day,
@@ -661,3 +664,171 @@ def test_capacity_verdict_boundary_is_sufficient_at_exactly_break_even() -> None
 def test_observed_burst_constant_matches_the_task_measurement() -> None:
     """The burst figure the capacity claim is checked against is ~3.5k/day."""
     assert OBSERVED_BURST_EVENTS_PER_DAY == 3500
+
+
+# ── build_report / CLI ─────────────────────────────────────────────────
+#
+# The report is the deliverable for ask (a): an operator points it at a live
+# reconciliation.db and gets inflow, drain and the resulting capacity claim
+# out, without a live harness process.  It must also state its own retention
+# caveat — inflow BEFORE the event_arrival_hourly rollup landed is gone
+# forever, because cleanup_drained used to just DELETE those rows.
+
+
+@pytest.mark.asyncio
+async def test_build_report_carries_every_section(recon_db):
+    """The report is a JSON-serialisable superset of the component readers."""
+    db = recon_db._db_path
+    await _seed_inflow(recon_db)
+    _seed_addendum_2(db)
+
+    report = build_report(db, 'reify')
+
+    assert report['project_id'] == 'reify'
+    assert report['inflow']['hourly'] == inflow_hourly(db, 'reify')
+    expected_daily = inflow_daily(db, 'reify')
+    assert report['inflow']['daily'] == expected_daily['daily']
+    assert report['inflow']['composition'] == expected_daily['composition']
+    assert report['inflow']['total_events'] == 7
+
+    expected_drain = drain_stats(db, 'reify')
+    assert report['drain'] == expected_drain
+    assert report['remediation_duty_cycle'] == pytest.approx(
+        remediation_duty_cycle(expected_drain))
+    assert report['remediation_duty_cycle'] == pytest.approx(0.438, abs=0.001)
+
+    assert report['sustainable_events_per_day'] == pytest.approx(
+        sustainable_events_per_day(
+            expected_drain['drain_seconds_per_event'],
+            remediation_duty_cycle(expected_drain),
+        )
+    )
+    assert report['capacity_verdict']['verdict'] in {'sufficient', 'insufficient'}
+    assert report['capacity_verdict']['observed_burst_per_day'] == (
+        OBSERVED_BURST_EVENTS_PER_DAY)
+
+    # The whole thing must survive a JSON round-trip — it is a CLI payload.
+    assert json.loads(json.dumps(report)) == report
+
+
+@pytest.mark.asyncio
+async def test_build_report_retention_note_states_the_real_window(recon_db):
+    """The caveat is derived from the live cleanup window, so it cannot drift.
+
+    A hardcoded '1 hour' would silently become a lie the day someone retunes
+    cleanup_drained, so the note has to be generated from the same default the
+    harness actually calls with.
+    """
+    import inspect
+
+    from fused_memory.reconciliation.event_buffer import EventBuffer
+
+    configured = inspect.signature(
+        EventBuffer.cleanup_drained).parameters['max_age_seconds'].default
+
+    note = build_report(recon_db._db_path, 'reify')['retention_note']
+
+    assert note, 'retention_note must not be empty'
+    assert str(int(configured)) in note, (
+        f'retention_note must name the configured cleanup window '
+        f'({configured}s); got: {note!r}'
+    )
+    assert 'event_arrival_hourly' in note
+    # It must warn that pre-rollup inflow is gone, not merely describe the window.
+    assert 'unrecoverable' in note.lower()
+
+
+@pytest.mark.asyncio
+async def test_build_report_degrades_on_an_empty_database(recon_db):
+    """No runs at all: every section present, capacity reported as unknown.
+
+    The capacity arithmetic raises on a non-positive rate by design, so the
+    report must decline to compute rather than propagate that — an empty DB is
+    an operator pointing the tool somewhere new, not a bug.
+    """
+    report = build_report(recon_db._db_path, 'reify')
+
+    assert report['inflow']['hourly'] == {}
+    assert report['drain']['drain_seconds_per_event'] is None
+    assert report['remediation_duty_cycle'] == 0.0
+    assert report['sustainable_events_per_day'] is None
+    assert report['capacity_verdict'] is None
+    assert report['retention_note']
+
+
+@pytest.mark.asyncio
+async def test_build_report_threads_since_into_both_halves(recon_db):
+    """`since` filters inflow and drain alike, so the two halves stay comparable."""
+    db = recon_db._db_path
+    await _seed_inflow(recon_db)
+    _seed_addendum_2(db)
+
+    report = build_report(db, 'reify', since='2026-07-25T14:00:00+00:00')
+
+    assert report['since'] == '2026-07-25T14:00:00+00:00'
+    assert report['inflow']['hourly'] == {'2026-07-25T14': 2, '2026-07-26T00': 1}
+    # Only the 14:13 chunk and the 14:29 remediation started at/after the floor.
+    assert report['drain']['modes']['backlog_chunk']['run_count'] == 1
+    assert report['drain']['modes']['remediation']['run_count'] == 1
+
+
+@pytest.mark.asyncio
+async def test_main_prints_the_report_as_json_and_returns_zero(recon_db, capsys):
+    """--json prints exactly the build_report payload and exits 0."""
+    db = recon_db._db_path
+    await _seed_inflow(recon_db)
+    _seed_addendum_2(db)
+
+    rc = main(['--db', str(db), '--project', 'reify', '--json'])
+    assert rc == 0
+
+    printed = json.loads(capsys.readouterr().out)
+    assert printed == build_report(db, 'reify')
+    assert printed['remediation_duty_cycle'] == pytest.approx(0.438, abs=0.001)
+
+
+@pytest.mark.asyncio
+async def test_main_threads_since_through_to_the_report(recon_db, capsys):
+    """--since reaches build_report rather than being parsed and dropped."""
+    db = recon_db._db_path
+    await _seed_inflow(recon_db)
+    _seed_addendum_2(db)
+
+    rc = main([
+        '--db', str(db), '--project', 'reify',
+        '--since', '2026-07-25T14:00:00+00:00', '--json',
+    ])
+    assert rc == 0
+
+    printed = json.loads(capsys.readouterr().out)
+    assert printed == build_report(db, 'reify', since='2026-07-25T14:00:00+00:00')
+    assert printed['inflow']['hourly'] == {'2026-07-25T14': 2, '2026-07-26T00': 1}
+
+
+@pytest.mark.asyncio
+async def test_main_without_json_prints_a_readable_summary(recon_db, capsys):
+    """The default output is human-readable but still names the headline figures."""
+    db = recon_db._db_path
+    await _seed_inflow(recon_db)
+    _seed_addendum_2(db)
+
+    rc = main(['--db', str(db), '--project', 'reify'])
+    assert rc == 0
+
+    out = capsys.readouterr().out
+    assert 'reify' in out
+    assert 'remediation' in out.lower()
+    assert out.strip(), 'the default output must not be empty'
+
+
+def test_main_reports_a_missing_database_without_a_traceback(tmp_path, capsys):
+    """A wrong --db is an operator typo, not a crash."""
+    missing = tmp_path / 'nope' / 'reconciliation.db'
+
+    rc = main(['--db', str(missing), '--project', 'reify', '--json'])
+
+    assert rc != 0, 'a missing database must be a non-zero exit'
+    captured = capsys.readouterr()
+    message = captured.err + captured.out
+    assert str(missing) in message, 'the message must name the path that was tried'
+    assert 'Traceback' not in message
