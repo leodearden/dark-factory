@@ -26,6 +26,7 @@ intentionally excluded — see reconciliation/prompts/__init__.py.
 """
 from __future__ import annotations
 
+import inspect
 import logging
 import re
 
@@ -33,6 +34,7 @@ import pytest
 
 from fused_memory.reconciliation import prompts as prompts_module
 from fused_memory.reconciliation.prompts import (
+    _FROZEN_RECON_REPORT_SIGNATURE_SPECS,
     _RECON_REPORT_TOOL_GUIDANCE_FALLBACK,
     get_recon_report_tool_guidance,
     render_recon_report_tool_guidance,
@@ -43,6 +45,7 @@ from fused_memory.reconciliation.prompts.stage2 import (
     build_stage2_system_prompt,
 )
 from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
+from fused_memory.server.recon_report import get_recon_report_tool_signatures
 
 # Agent-called report tools (excludes start_report — harness-called).
 _AGENT_CALLED_REPORT_TOOLS = (
@@ -254,3 +257,41 @@ class TestReconReportGuidanceFallback:
                     f'fallback: a `{tool_name}(...)` call example is missing '
                     f'`run_id` — got: {tool_name}({args_substr})'
                 )
+
+
+class TestFallbackIsDerivedFromTheSameRenderer:
+    """The fallback is rendered from a frozen signature snapshot, not hand-written prose.
+
+    _RECON_REPORT_TOOL_GUIDANCE_FALLBACK is no longer a second, hand-transcribed
+    copy of the guidance prose: it is rendered from
+    _FROZEN_RECON_REPORT_SIGNATURE_SPECS through the *same* template and
+    render_call() as the live guidance (render_recon_report_tool_guidance()), so
+    the two cannot drift apart in WORDING — there is only one prose template and
+    one renderer. The only surface that can still go stale is the snapshot's
+    parameter data (names, order, required-ness); the two tests below pin that
+    directly, comparing data structures rather than scanning rendered prose.
+    """
+
+    def test_fallback_equals_live_generated_guidance(self):
+        assert render_recon_report_tool_guidance() == _RECON_REPORT_TOOL_GUIDANCE_FALLBACK, (
+            'The frozen fallback no longer matches the live-generated guidance — '
+            'update _FROZEN_RECON_REPORT_SIGNATURE_SPECS in '
+            'reconciliation/prompts/__init__.py to match the live tool signatures.'
+        )
+
+    def test_frozen_snapshot_matches_live_signatures(self):
+        """Diagnostic partner to the test above: a precise dict diff, not a multi-KB string diff."""
+        sigs = get_recon_report_tool_signatures()
+        live = {
+            tool: tuple(
+                (name, param.default is inspect.Parameter.empty)
+                for name, param in sigs[tool].parameters.items()
+            )
+            for tool in _FROZEN_RECON_REPORT_SIGNATURE_SPECS
+        }
+        assert live == dict(_FROZEN_RECON_REPORT_SIGNATURE_SPECS), (
+            'The frozen signature snapshot has drifted from the live tool '
+            'signatures (a name, param order, or required-ness differs) — update '
+            '_FROZEN_RECON_REPORT_SIGNATURE_SPECS in reconciliation/prompts/__init__.py '
+            'to match.'
+        )
