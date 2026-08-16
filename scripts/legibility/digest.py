@@ -926,19 +926,31 @@ restating the literal -- a harness rewording turns that test red instead
 of silently regressing coverage. Extend with future harness prompt
 literals as one-line additions."""
 
-HARNESS_CONTEXT_BLOCK_MARKERS: tuple[str, ...] = ('_this context was recalled from the ',)
-"""Body-literal prefix of the standing provenance caveat
-(``orchestrator.agents.briefing.MEMORY_CONTEXT_CAVEAT``), rendered by
-``_get_memory_context`` right after its '# Context' heading whenever any
-memory section was actually recalled. The marker deliberately stops
-BEFORE the caveat's ``{project_id}`` interpolation point: a marker
-spanning it would be project-specific and would fail for every
-non-dark_factory project the census runs against (this module has no
-knowledge of which project a transcript belongs to). Matched only in
-CONJUNCTION with a line-anchored '# context' heading (see
-:func:`is_harness_injected_turn`), never as a relaxation of
-HARNESS_BRIEFING_HEADINGS' all() guard -- that guard is load-bearing and
-its two negative tests
+HARNESS_CONTEXT_BLOCK_MARKERS: tuple[str, ...] = (
+    '_this context was recalled from the ',
+    '_memory unavailable — proceed with codebase exploration',
+    '_no memory context available',
+)
+"""Body literals ``_get_memory_context`` renders right after its
+'# Context' heading (orchestrator/src/orchestrator/agents/briefing.py):
+the standing provenance caveat's prefix
+(``orchestrator.agents.briefing.MEMORY_CONTEXT_CAVEAT``, when a memory
+section was actually recalled), and its two no-recalled-sections literal
+families (memory-unavailable / no-memory-context-available). The caveat
+marker deliberately stops BEFORE its ``{project_id}`` interpolation
+point: a marker spanning it would be project-specific and would fail for
+every non-dark_factory project the census runs against (this module has
+no knowledge of which project a transcript belongs to). These three
+markers are EXHAUSTIVE over ``_get_memory_context``'s four return paths
+as of this commit (each no-recalled-sections family has a plain and a
+drop_note-bearing variant, both covered by the same family marker) --
+that exhaustiveness claim is what
+``TestHarnessInjectedTurnFilter.test_no_recalled_sections_variant_is_excluded``'s
+parametrization checks, so a new return path added to that function
+should arrive with a fourth marker here. Matched only in CONJUNCTION with
+a line-anchored '# context' heading (see :func:`is_harness_injected_turn`),
+never as a relaxation of HARNESS_BRIEFING_HEADINGS' all() guard -- that
+guard is load-bearing and its two negative tests
 (test_single_heading_alone_is_not_excluded,
 test_context_heading_mentioned_mid_sentence_is_not_excluded) must keep
 passing unchanged."""
