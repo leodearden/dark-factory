@@ -833,7 +833,12 @@ _ORCH_UNITS_ARRAY_RE = re.compile(
 _DECISION_LOOP_HEADER = 'for _unit in "${_orch_units[@]}"; do'
 _INSTALL_LIST_APPEND = '_orch_install_units+=("$_unit")'
 _INSTALL_LOOP_HEADER = 'for _unit in "${_orch_install_units[@]}"; do'
-_INSTALL_LOOP_CP = f'cp "$REPO_ROOT/scripts/$_unit" "{_UNIT_DIR_VAR}/"'
+# Pinned as the whole `if ...; then` rather than the bare `cp`, so the copy's
+# FAILURE handling is asserted too.  A bare `cp` under `set -euo pipefail`
+# aborts setup-host.sh on the first unit it cannot write — one uncopyable unit
+# would take daemon-reload, every enable and every later installer section
+# with it.
+_INSTALL_LOOP_CP = f'if cp "$REPO_ROOT/scripts/$_unit" "{_UNIT_DIR_VAR}/"; then'
 # The enable obligation is decided at RUN TIME from the unit's own [Install]
 # section — the same rule _unit_has_install_section expresses here in Python —
 # rather than from a hand-maintained exception list naming the static watchdog
@@ -967,9 +972,11 @@ def test_setup_host_installs_every_orchestrator_unit(
         ),
         (
             _INSTALL_LOOP_CP,
-            f"does not copy into {_UNIT_DIR_VAR}; the destination is asserted, "
-            "not just the source, because a cp of the template to a staging "
-            "path leaves the unit just as uninstalled as no cp at all",
+            f"does not copy into {_UNIT_DIR_VAR} with the copy's failure "
+            "handled; the destination is asserted, not just the source (a cp "
+            "of the template to a staging path leaves the unit just as "
+            "uninstalled as no cp at all), and so is the `if` around it (a "
+            "bare cp aborts the whole installer on the first unwritable unit)",
         ),
     ):
         assert expected in SETUP_HOST_STATEMENTS, (

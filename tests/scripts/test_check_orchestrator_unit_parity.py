@@ -50,6 +50,8 @@ import subprocess
 import sys
 import types
 
+import pytest
+
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 CHECKER_PATH = REPO_ROOT / "scripts" / "check_orchestrator_unit_parity.py"
 DASHBOARD_CHECKER_PATH = REPO_ROOT / "scripts" / "check_dashboard_unit_parity.py"
@@ -231,7 +233,7 @@ _ORCH_UNITS_ARRAY_RE = re.compile(
 _DECISION_LOOP_HEADER = 'for _unit in "${_orch_units[@]}"; do'
 _INSTALL_LIST_APPEND = '_orch_install_units+=("$_unit")'
 _INSTALL_LOOP_HEADER = 'for _unit in "${_orch_install_units[@]}"; do'
-_INSTALL_LOOP_CP = 'cp "$REPO_ROOT/scripts/$_unit" "$UNIT_DIR/"'
+_INSTALL_LOOP_CP = 'if cp "$REPO_ROOT/scripts/$_unit" "$UNIT_DIR/"; then'
 
 
 def _shell_statements(script_text: str) -> list[str]:
@@ -2151,6 +2153,71 @@ def test_force_all_still_cannot_copy_a_source_that_does_not_exist(
     assert "orchestrator-know-live.service" in _warnings_naming(
         result.stdout, "orchestrator-know-live.service"
     ), f"The unit with no source was skipped silently.\n{result.stdout}"
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason="root ignores the permission bits this test uses to make `cp` fail",
+)
+def test_a_unit_that_cannot_be_copied_does_not_abort_the_installer(
+    tmp_path: pathlib.Path,
+):
+    """An UNWRITABLE destination must skip that unit, never kill the run.
+
+    The sibling guard above covers a source that does not EXIST. This is the
+    other half, and the existence test cannot reach it: the checker raises
+    `unreadable` on ``(OSError, UnicodeDecodeError)``, and the OSError half is
+    precisely a file `cp` cannot touch. Reproduced here the way an operator
+    meets it — DF_INSTALL_ORCH_UNITS=1 over an installed unit at mode 000, i.e.
+    the override told the installer to write a file this user cannot open for
+    writing. `cp` exits 1 at "cannot create regular file: Permission denied",
+    and under `set -euo pipefail` a bare `cp` would abort setup-host.sh right
+    there: no daemon-reload, no enables, and every LATER section of the host
+    installer (jCodeMunch, Claude config, ...) silently never runs.
+
+    The unwritable unit is deliberately ordered BEFORE the survivor in
+    `_orch_units`, so a run that aborts on it cannot accidentally satisfy the
+    survivor assertion.
+    """
+    repo = _fake_repo(tmp_path)
+    unit_dir = tmp_path / "installed"
+    _install_all_units(repo, unit_dir)
+
+    unwritable = unit_dir / "orchestrator-know-live.service"
+    unwritable.chmod(0o000)
+
+    # Copied last by the array's order, and absent, so only a run that got past
+    # the failure can produce it.
+    survivor = unit_dir / "orchestrator-watchdog.timer"
+    survivor.unlink()
+
+    result = _run_installer_section(
+        tmp_path, repo, unit_dir, env_extra={"DF_INSTALL_ORCH_UNITS": "1"}
+    )
+    unwritable.chmod(0o644)
+
+    assert result.returncode == 0, (
+        "A unit that could not be copied ABORTED the installer. Every section "
+        f"after this one was skipped.\n{result.stdout}\n{result.stderr}"
+    )
+    assert survivor.is_file(), (
+        "The uncopyable unit stopped its siblings from being installed.\n"
+        + result.stdout
+    )
+    assert "orchestrator-watchdog.timer" in _enabled_units(tmp_path), (
+        "The run survived the failure but never reached the enable loop.\n"
+        f"{_systemctl_calls(tmp_path)}"
+    )
+    assert "FAILED" in _warnings_naming(
+        result.stdout, "orchestrator-know-live.service"
+    ), (
+        "The failed copy was not reported. A unit silently not installed is "
+        f"the state this whole section exists to make observable.\n{result.stdout}"
+    )
+    assert "orchestrator-know-live.service" not in _enabled_units(tmp_path), (
+        "A unit whose copy FAILED was enabled anyway — that acts on bytes "
+        f"nobody managed to write.\n{_systemctl_calls(tmp_path)}"
+    )
 
 
 def test_a_missing_checker_does_not_read_as_not_installed_here(

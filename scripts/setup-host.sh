@@ -425,9 +425,12 @@ for _unit in "${_orch_units[@]}"; do
   # also cover a unit the gate never reported on. `_orch_units` and the
   # checker's registry are kept in step by a test, but under the override a
   # unit with no verdict is installed on trust, and trust does not create a
-  # file. (`unreadable` needs no such guard — `cp` copies bytes and never
-  # decodes, so copying to or from an undecodable unit is exactly the repair
-  # the operator asked for.)
+  # file.
+  #
+  # It covers EXISTENCE only, and deliberately so — a source that exists can
+  # still be uncopyable (mode 000, or an installed copy this user cannot
+  # overwrite). That half is caught by the install loop's own failure handling
+  # below rather than by a pre-flight test, because only the copy itself knows.
   if [ ! -f "$REPO_ROOT/scripts/$_unit" ]; then
     warn "SKIPPING $_unit — $(_orch_skip_reason vanished "$_unit"); its installed copy is UNCHANGED"
     continue
@@ -451,8 +454,29 @@ else
     warn "DF_INSTALL_ORCH_UNITS=1 — installing over the reported drift"
   fi
 
+  # Each copy is INDIVIDUALLY fault-tolerant, for the same reason the source
+  # existence test above exists: under `set -euo pipefail` one failing `cp`
+  # aborts this script outright, taking daemon-reload, every enable, and every
+  # LATER section of the host installer (jCodeMunch, Claude config, ...) with
+  # it. A unit is a bad reason to abandon a host setup.
+  #
+  # The existence test cannot cover this: the checker's `unreadable` is raised
+  # on (OSError, UnicodeDecodeError), and the OSError half is exactly a file
+  # `cp` cannot touch. Measured with DF_INSTALL_ORCH_UNITS=1 against a mode-000
+  # installed unit: `cp` exits 1 at "cannot create regular file: Permission
+  # denied". (The UnicodeDecodeError half really is harmless — `cp` copies
+  # bytes and never decodes.)
+  #
+  # A unit whose copy FAILED is dropped from _orch_installed_units, so it is
+  # neither enabled (enabling it would act on bytes nobody managed to write)
+  # nor counted in the success line below.
+  _orch_installed_units=()
   for _unit in "${_orch_install_units[@]}"; do
-    cp "$REPO_ROOT/scripts/$_unit" "$UNIT_DIR/"
+    if cp "$REPO_ROOT/scripts/$_unit" "$UNIT_DIR/"; then
+      _orch_installed_units+=("$_unit")
+    else
+      warn "FAILED to install $_unit — its installed copy is UNCHANGED; check permissions on $REPO_ROOT/scripts/$_unit and $UNIT_DIR/$_unit"
+    fi
   done
 
   # ONCE, between the copies and the enables: systemd must not be asked to
@@ -460,10 +484,11 @@ else
   # repeat work the first call already did.
   systemctl --user daemon-reload
 
-  # Enable exactly what was INSTALLED — _orch_install_units, never _orch_units.
-  # A unit whose install the gate declined must not be enabled either: enabling
-  # it acts on the very state the skip refused to act on (and on a first run it
-  # would enable a unit that is not on disk at all).
+  # Enable exactly what was INSTALLED — _orch_installed_units, never
+  # _orch_units. A unit whose install the gate declined, or whose copy failed,
+  # must not be enabled either: enabling it acts on the very state the skip (or
+  # the failure) left unwritten, and on a first run it would enable a unit that
+  # is not on disk at all.
   #
   # Within that set the obligation is DERIVED from each unit's own [Install]
   # section, not from a hand-listed exception for the static watchdog service.
@@ -476,7 +501,7 @@ else
   #     the array above exists to close.
   # This is the same rule tests/scripts/test_orchestrator_service_files.py's
   # _unit_has_install_section predicate expresses in Python.
-  for _unit in "${_orch_install_units[@]}"; do
+  for _unit in "${_orch_installed_units[@]}"; do
     if grep -q '^\[Install\]' "$REPO_ROOT/scripts/$_unit"; then
       systemctl --user enable "$_unit"
     fi
@@ -484,8 +509,14 @@ else
 
   # Reports what was ACTUALLY done, not what was attempted: with a per-unit
   # gate a partial install is now a normal outcome, and an unqualified success
-  # line would read as "all nine" on a run that installed one.
-  ok "orchestrator units + watchdog installed and enabled (${#_orch_install_units[@]}/${#_orch_units[@]})"
+  # line would read as "all nine" on a run that installed one. Counted from the
+  # units that COPIED, so a failed `cp` is never reported as an install.
+  if [ "${#_orch_installed_units[@]}" -eq 0 ]; then
+    warn "NO orchestrator unit was installed — every copy that cleared the gate"
+    warn "  FAILED; the installed units are UNCHANGED. See the FAILED lines above."
+  else
+    ok "orchestrator units + watchdog installed and enabled (${#_orch_installed_units[@]}/${#_orch_units[@]})"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
