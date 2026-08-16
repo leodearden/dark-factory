@@ -469,6 +469,65 @@ class TestScanTree:
         assert [(s.task_id, s.reason) for s in scan.skipped] == [('4', 'unreadable')]
         assert scan.scanned == 1
 
+    def test_an_unlistable_root_is_reported_rather_than_raising(self, tmp_path):
+        """DISCOVERY can fail too, not just the per-file read.
+
+        The listing is the one step whose failure loses the whole sweep, so it
+        is guarded the same way every read is. The report's shape is the part
+        worth pinning: there is no lane to key the skip by, so it carries the
+        ROOT's own directory name in the ``task_id`` slot and the root
+        directory in ``path`` — a convention a refactor could silently change,
+        leaving an operator grepping for a lane id that was never emitted.
+
+        ``scanned == 0`` beside an empty ``records`` is the whole point: that
+        pair is what tells a reader the sweep read nothing, as opposed to
+        reading a clean corpus.
+        """
+        root = tmp_path / 'task-meta'
+        write_plan(root, '10', [MISPAIRED_ENTRY])
+        root.chmod(0o000)
+        try:
+            scan = scan_tree(root)
+        finally:
+            root.chmod(0o755)
+
+        assert scan.records == []
+        assert scan.scanned == 0
+        assert [(s.task_id, s.reason, s.path) for s in scan.skipped] == [
+            ('task-meta', 'unreadable', str(root))
+        ]
+        assert scan.skipped[0].detail, 'a skip must say what went wrong'
+
+    def test_an_unreadable_lane_directory_does_not_hide_its_siblings(self, tmp_path):
+        """A lane reclaimed or chmod'd mid-sweep makes the PROBES raise.
+
+        ``lane.is_dir()`` still answers — it stats the lane itself — but
+        ``candidate.exists()`` needs search permission on that directory and
+        raises ``PermissionError`` (measured on this interpreter; ``exists()``
+        swallows ENOENT/ENOTDIR/ELOOP, not EACCES). Without the guard around
+        the probes that escapes the loop and discards every lane already
+        scanned, which is the same total-report failure the per-file arms
+        exist to prevent — so the load-bearing assertion here is that the good
+        sibling SURVIVES, not merely that the bad lane is named.
+        """
+        root = tmp_path / 'task-meta'
+        write_plan(root, '10', [MISPAIRED_ENTRY])
+        bad_lane = root / '4'
+        bad_lane.mkdir()
+        (bad_lane / 'plan.json').write_text('{}', encoding='utf-8')
+        bad_lane.chmod(0o000)
+        try:
+            scan = scan_tree(root)
+        finally:
+            bad_lane.chmod(0o755)
+
+        assert [(r.task_id, r.index) for r in scan.records] == [('10', 0)], (
+            'a lane that cannot be probed must not take its siblings with it'
+        )
+        assert [(s.task_id, s.reason) for s in scan.skipped] == [('4', 'unreadable')]
+        assert scan.skipped[0].path == str(bad_lane / 'plan.json')
+        assert scan.scanned == 1
+
     def test_dangling_plan_symlink_is_reported_as_missing(self, tmp_path):
         """The live shape: every lane's plan.json is a symlink into .task-meta.
 
@@ -567,11 +626,26 @@ class TestFormatReport:
             assert record.marker in report
 
     def test_summary_counts_entries_plans_and_files_scanned(self, tree):
+        """All four numbers, asserted on the SUMMARY LINE itself.
+
+        A bare ``'3' in report`` cannot pin this: the body already carries
+        tmp_path components, entry indices and lane names, so both digits are
+        present however the summary counts — a summary reporting ``0 ... across
+        0 plans (scanned 0 ...)`` would satisfy it. The counts are the whole
+        product of a prevalence sweep, so they are pinned verbatim, and pinned
+        as the LAST line so they cannot be buried mid-report where an operator
+        reading the tail would not see them.
+        """
         report = format_report(scan_tree(tree))
 
         # 3 mis-paired entries across 2 plans, out of 3 plan files read.
-        assert '3' in report and '2' in report
-        assert 'scanned' in report.lower()
+        summary = report.splitlines()[-1]
+        assert summary.startswith(
+            '3 mis-paired entries across 2 plans (scanned 3 plan files, skipped 0).'
+        ), f'the summary line reported: {summary!r}'
+        assert 'STRICT LOWER BOUND' in summary, (
+            'the count must never be readable as a prevalence estimate'
+        )
 
     def test_a_clean_tree_yields_an_explicit_message_naming_what_was_read(self, tmp_path):
         """Never a blank report, and never one that hides a zero-file run."""
@@ -663,10 +737,32 @@ class TestDefaultRoot:
             == Path('/repo/.worktrees/.task-meta')
         )
 
-    def test_the_shipped_default_is_the_one_this_checkout_actually_has(self):
-        """This file runs from a worktree or from the main checkout — either
-        way the shipped constant must name a tree that exists here."""
-        assert _default_root(Path(__file__).resolve().parents[2]) == DEFAULT_ROOT
+    def test_the_shipped_default_names_a_lane_tree_that_actually_EXISTS(self):
+        """EXISTENCE, which is the property the two cases above cannot check.
+
+        They compare paths, and a wrong path compares equal to itself — the
+        earlier spelling of this test asserted ``_default_root(<repo root>) ==
+        DEFAULT_ROOT``, which is the same function applied to the same
+        directory and so could only fail if ``_default_root`` were
+        non-deterministic. The defect the helper was written for is a default
+        that resolves to a directory which is NOT THERE (from a task worktree
+        the naive spelling yields ``<repo>/.worktrees/<lane>/.worktrees/
+        .task-meta``), and only a filesystem probe can catch that.
+
+        Skipped rather than failed on a checkout with no ``.worktrees``
+        directory at all: a fresh clone legitimately has no lanes yet, and that
+        is the operator's tree being empty, not this default being wrong.
+        """
+        worktrees_dir = DEFAULT_ROOT.parent
+        if not worktrees_dir.is_dir():
+            pytest.skip(
+                f'no lane tree on this checkout: {worktrees_dir} does not exist'
+            )
+        assert DEFAULT_ROOT.is_dir(), (
+            f'the shipped default names a directory that is not here: '
+            f'{DEFAULT_ROOT} — a sweep with no --root would read nothing and '
+            f'report a clean corpus'
+        )
 
 
 # ---------------------------------------------------------------------------
