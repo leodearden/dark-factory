@@ -84,12 +84,8 @@ A run that compared ZERO units can NEVER report parity.  This vocabulary is
 adopted unchanged from ``check_dashboard_unit_parity.py`` so setup-host.sh's
 existing 0/2/other branch shape carries over verbatim.
 
-NOTE these three codes describe the run as a WHOLE, and cannot say which unit
-they are about: with nine units, one finding collapses the run to 1 and says
-nothing about the other eight.  A consumer that needs to act per unit — as
-``setup-host.sh`` does — should read the PER-UNIT channel instead, via
-``--print-verdicts``; see "Machine-readable verdicts" below.  The exit codes
-are unchanged by that flag, so the two channels never disagree.
+A consumer that needs to act per UNIT rather than per run wants the
+``--print-verdicts`` channel described next, not these codes.
 
 Machine-readable verdicts
 -------------------------

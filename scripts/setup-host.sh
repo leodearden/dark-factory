@@ -141,13 +141,9 @@ fi
 # is never overwritten without DF_INSTALL_ORCH_UNITS=1, because a difference
 # does not tell you which side is stale — only the blast radius shrinks.
 #
-# HARNESS CONSTRAINT, and it bites silently: the behavioural tests slice this
-# file from the FIRST mention of the parity checker's file name through the
-# install construct's closing `fi`, and EXECUTE that slice. Naming that file in
-# the prose below — anywhere above the `_orch_parity_script=` assignment —
-# moves the slice's start upward and makes the test suite run this section's
-# `install -m 0755 ... "$HOME/bin/..."` against the developer's REAL home
-# directory. Refer to it as "the parity gate" up here; name the file below.
+# HARNESS CONSTRAINT: do NOT name the parity checker's file in the prose below
+# — call it "the parity gate" up here. It bites silently, and the whole rule is
+# stated at the `_orch_parity_script=` assignment that anchors it.
 #
 # Installs and enables (kept in step with scripts/orchestrator-*.service by
 # test_setup_host_installs_every_orchestrator_unit — every template must be
@@ -221,13 +217,9 @@ install -m 0755 "$REPO_ROOT/scripts/wait-for-port.py" "$HOME/bin/wait-for-port.p
 # overwrites the units anyway, so the operator is told to check the direction
 # at the one moment they can no longer act on it.
 #
-# PER UNIT since task 4198. The gate runs ONCE and reports a verdict for each
-# unit; the install decision is then taken per unit from those verdicts. What
-# changed is only the blast radius — a unit that did not clear is still never
-# overwritten without DF_INSTALL_ORCH_UNITS=1. What it buys: a permanent,
-# deliberate divergence on ONE unit (the reify warm-lane drop-in) no longer
-# holds the other eight hostage, which is what made the watchdog pair
-# unrepairable by the installer that is supposed to install it.
+# Mechanically: the gate runs ONCE and reports a verdict per unit; the
+# per-unit install decision is taken from those verdicts further down. See the
+# section header for the policy that shape implements.
 #
 # NOTE the report does not mean "the installed copy is stale". Measured
 # 2026-08-02, the direction varies per unit: the repo copy is correct for
@@ -245,6 +237,18 @@ install -m 0755 "$REPO_ROOT/scripts/wait-for-port.py" "$HOME/bin/wait-for-port.p
 # invocation is guarded by an existence check, and NO exit code is believed
 # unless the checker's own [orchestrator_unit_parity] tag appears in the
 # output it produced.
+#
+# HARNESS CONSTRAINT, stated once, HERE, because this next line is what anchors
+# it. tests/scripts/test_check_orchestrator_unit_parity.py slices this file
+# from the FIRST mention of the parity checker's file name through the install
+# construct's closing `fi`, and EXECUTES that slice under bash. Two consequences,
+# both silent:
+#   - naming that file ABOVE this line moves the slice's start upward, so the
+#     suite runs this section's `install -m 0755 ... "$HOME/bin/..."` against
+#     the developer's REAL home directory;
+#   - anything the sliced code needs (the unit array, the skip-reason helper)
+#     must be declared BELOW this line, or it is unbound at run time and kills
+#     the run under `set -u`.
 _orch_parity_script="$REPO_ROOT/scripts/check_orchestrator_unit_parity.py"
 
 # The units this section installs, declared ONCE. Both loops below iterate this
@@ -253,11 +257,8 @@ _orch_parity_script="$REPO_ROOT/scripts/check_orchestrator_unit_parity.py"
 # adding a unit is a one-line edit here instead of a `cp` line plus an
 # `enable` line kept in step by hand.
 #
-# Declared HERE, below the parity-script assignment rather than up beside the
-# section header, for a harness reason worth stating: the behavioural tests
-# slice this file from the first mention of the checker through the install
-# construct's closing `fi` and execute THAT slice. An array declared above the
-# slice's start would be unbound at run time and kill the script under `set -u`.
+# Declared below the parity-script assignment rather than up beside the section
+# header — see the harness constraint stated there.
 #
 # ENABLE POLICY. Every project orchestrator is enabled by default, to match the
 # running production stack — they coexist on separate escalation ports, noted
@@ -333,10 +334,6 @@ fi
 # The gate stays non-fatal (it never aborts the run; sections below still
 # execute), it just declines to act on an unverified diff without being told.
 #
-# Since task 4198 that decision is taken PER UNIT rather than for the block as
-# a whole, so the units that DID clear are still installed and enabled on the
-# same run. The skip itself is unchanged in strength: same default, same
-# DF_INSTALL_ORCH_UNITS=1 override, same refusal to guess which side is stale.
 # Parse the machine-readable verdict lines the gate just printed.
 #
 # `while read` fed by a HERE-STRING, never `... | while read`: a pipeline runs
@@ -374,9 +371,8 @@ done <<< "$(printf '%s\n' "$_orch_parity_out" \
 # take a `continue` before anything else is consulted, and `clean` asserts the
 # absence of every other finding, so none of the three can combine at all.
 #
-# Defined HERE, inside the region the behavioural tests slice and execute, not
-# near the top of this script: a helper defined above the slice would be
-# undefined at run time and kill the run under set -u/set -e.
+# Defined here rather than near the top of this script — see the harness
+# constraint at the parity-script assignment above.
 _orch_skip_reason() {
   case ",$1," in
     *,vanished,*)
@@ -417,11 +413,8 @@ _orch_skip_reason() {
   esac
 }
 
-# The per-unit install decision. This is what the task bought: a unit is judged
-# on ITS OWN verdict, so one drifted or drop-in'd unit no longer declines the
-# install of all nine. The POLICY is unchanged and still ratified — a unit that
-# did not clear is never overwritten without DF_INSTALL_ORCH_UNITS=1, because
-# drift does not tell you which side is stale — only the blast radius shrinks.
+# The per-unit install decision — the gate the section header describes, here
+# in code: each unit is judged on ITS OWN verdict.
 #
 # `clean` and `absent` are the two install-eligible kinds, and the checker
 # guarantees neither ever appears alongside a blocking one, so an exact match
