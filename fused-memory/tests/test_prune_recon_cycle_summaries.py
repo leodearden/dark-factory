@@ -6,6 +6,7 @@ without sys.path pollution — mirrors the pattern in test_cleanup_count_snapsho
 from __future__ import annotations
 
 import argparse
+import asyncio
 import importlib.util
 import sys
 import types
@@ -1013,6 +1014,25 @@ class TestRunApplyStoreMutationPreflight:
 
         monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
 
+    @staticmethod
+    def _fail_closed_records(caplog) -> list:
+        """The guard site's OWN diagnosis.
+
+        ``main`` has no handler at all here -- the refusal exits the
+        interpreter as an uncaught traceback -- so this ERROR record is the
+        ONLY place the operator is told what was refused and what to do
+        instead. Pinned on the fail-closed marker and the remedy rather than
+        the full prose: rewording the message stays cheap, deleting it does
+        not.
+        """
+        return [
+            rec for rec in caplog.records
+            if rec.name == 'prune_recon_cycle_summaries'
+            and rec.levelname == 'ERROR'
+            and 'NOT started (fail-closed)' in rec.getMessage()
+            and 'MCP server' in rec.getMessage()
+        ]
+
     @pytest.mark.asyncio
     async def test_apply_performs_zero_mutations_when_the_store_is_unwritable(
         self, monkeypatch
@@ -1148,21 +1168,46 @@ class TestRunApplyStoreMutationPreflight:
 
         memory.delete_memory.assert_not_awaited()
 
-    @pytest.mark.asyncio
-    async def test_the_refusal_escapes_and_is_never_a_report_shaped_success(
-        self, monkeypatch
+    def test_the_refusal_escapes_main_and_is_never_a_report_shaped_success(
+        self, monkeypatch, caplog
     ):
-        """``main`` calls ``asyncio.run`` with no try/except, so the refusal
-        propagates out of ``run`` and exits non-zero rather than being
-        converted into any report-shaped return value."""
+        """``main`` calls ``asyncio.run`` bare -- no try/except -- and its only
+        other outcomes are ``0``/``1`` derived from ``report['aborted']``. So
+        the refusal must PROPAGATE all the way out and exit the interpreter
+        non-zero via an uncaught traceback, never collapsing into either of
+        those report-shaped returns.
+
+        Driven through ``main`` (the ``purge``/``sweep`` suites' ``_drive``
+        idiom) precisely because that is where the claim lives: asserting only
+        that ``run`` raises leaves the swallowed-on-the-way-out case -- the one
+        that would read as a successful prune -- untested.
+        """
         self._deny(monkeypatch)
         memory = self._make_memory(self._records())
+        monkeypatch.setattr(
+            sys, 'argv', ['prune_recon_cycle_summaries.py', '--apply'],
+        )
+        real_asyncio_run = asyncio.run
 
-        with pytest.raises(_mod.StoreMutationUnavailable) as excinfo:
-            await _mod.run(
-                self._args(apply=True), memory=memory,
-                known_projects_map=self._known_map(),
+        def _drive(coro, *_a, **_kw):
+            coro.close()  # never construct the live MemoryService
+            return real_asyncio_run(
+                _mod.run(
+                    self._args(apply=True), memory=memory,
+                    known_projects_map=self._known_map(),
+                )
             )
 
-        assert not isinstance(excinfo.value, dict)
+        monkeypatch.setattr(_mod.asyncio, 'run', _drive)
+
+        with caplog.at_level('ERROR'), pytest.raises(
+            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+        ):
+            _mod.main()
+
+        assert self._fail_closed_records(caplog), (
+            'nothing else explains this traceback -- the guard site must log '
+            'the fail-closed diagnosis before raising; got: '
+            f'{[rec.getMessage() for rec in caplog.records]}'
+        )
         memory.delete_memory.assert_not_awaited()

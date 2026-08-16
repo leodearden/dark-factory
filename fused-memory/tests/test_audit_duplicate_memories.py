@@ -6106,13 +6106,17 @@ class TestApplyStoreMutationPreflight:
         NORMAL path, a handled outcome an operator can reasonably read past.
 
         A write-capability denial is categorically different: proceeding would
-        leave a half-completed, unrecoverable store mutation. So it RAISES, and
-        that must not degrade into any of this script's ordinary integer
-        returns. ``main`` has no try/except, so it exits non-zero.
+        leave a half-completed, unrecoverable store mutation. So it RAISES
+        rather than degrading into any of this script's ordinary integer
+        returns.
 
         Rigged with an EMPTY scan -- the exact condition that drives
         ``_apply_refusal_reason`` to return 1 -- to prove the write-capability
         refusal wins over, rather than collapsing into, the report-shaped one.
+
+        Scoped to ``_run``: that the raise also survives the trip out through
+        ``main`` is a separate claim, tested in
+        ``TestApplyStoreMutationPreflightThroughMain``.
         """
         self._deny(monkeypatch)
         _install_run_doubles(monkeypatch, {})
@@ -6121,8 +6125,88 @@ class TestApplyStoreMutationPreflight:
             '--metrics-root', str(tmp_path),
         ])
 
-        with pytest.raises(_mod.StoreMutationUnavailable) as excinfo:
+        with pytest.raises(_mod.StoreMutationUnavailable):
             await _run(args)
 
-        assert not isinstance(excinfo.value, int)
         assert _FakeMemoryService.instances == []
+
+
+class TestApplyStoreMutationPreflightThroughMain:
+    """The refusal must survive the trip out through ``main``, not just ``_run``.
+
+    Deliberately a separate, un-``asyncio``-marked class: ``main`` is sync and
+    calls ``asyncio.run`` itself, so it cannot be driven from inside a running
+    loop. Sibling suites (``purge``, ``sweep``, ``prune``) drive ``main`` the
+    same way.
+    """
+
+    @staticmethod
+    def _deny(monkeypatch):
+        """Rig the preflight to refuse, as it would inside an agent sandbox."""
+        def _raise(*_args, **_kwargs):
+            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
+
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
+
+    @staticmethod
+    def _fail_closed_records(caplog) -> list:
+        """The guard site's OWN diagnosis.
+
+        ``main`` is three lines with no handler -- the refusal exits the
+        interpreter as an uncaught traceback -- so this ERROR record is the
+        ONLY place the operator is told what was refused and what to do
+        instead. Pinned on the fail-closed marker and the remedy rather than
+        the full prose: rewording the message stays cheap, deleting it does
+        not.
+        """
+        return [
+            rec for rec in caplog.records
+            if rec.name == 'audit_duplicate_memories'
+            and rec.levelname == 'ERROR'
+            and 'NOT started (fail-closed)' in rec.getMessage()
+            and 'MCP server' in rec.getMessage()
+        ]
+
+    def test_the_refusal_escapes_main_and_is_never_a_report_shaped_return(
+        self, monkeypatch, tmp_path, caplog,
+    ):
+        """``main`` is ``asyncio.run(_run(args))`` with no try/except, and
+        ``_run``'s ordinary outcomes are the integers ``0``/``1`` -- including
+        the ``1`` ``_apply_refusal_reason`` returns for an empty scan.
+
+        So the write-capability refusal must propagate all the way out and exit
+        the interpreter non-zero via an uncaught traceback, never collapsing
+        into either integer on the way. Rigged with the EMPTY scan that drives
+        the report-shaped refusal, so the two are in direct competition.
+
+        ``asyncio.run`` is replaced only to keep the real one reachable; the
+        coroutine really is ``_run(args)`` as ``main`` built it, argv parsing
+        included.
+        """
+        import asyncio  # noqa: PLC0415
+        import sys  # noqa: PLC0415
+
+        self._deny(monkeypatch)
+        _install_run_doubles(monkeypatch, {})
+        monkeypatch.setattr(sys, 'argv', [
+            'audit_duplicate_memories.py', '--project-id', 'p', '--apply',
+            '--metrics-root', str(tmp_path),
+        ])
+        real_asyncio_run = asyncio.run
+        monkeypatch.setattr(
+            _mod.asyncio, 'run', lambda coro, *_a, **_kw: real_asyncio_run(coro),
+        )
+
+        with caplog.at_level('ERROR'), pytest.raises(
+            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+        ):
+            _mod.main()
+
+        assert self._fail_closed_records(caplog), (
+            'nothing else explains this traceback -- the guard site must log '
+            'the fail-closed diagnosis before raising; got: '
+            f'{[rec.getMessage() for rec in caplog.records]}'
+        )
+        assert _FakeMemoryService.instances == [], (
+            'the refusal must precede the client, even driven through main'
+        )
