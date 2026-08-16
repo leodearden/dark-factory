@@ -314,7 +314,7 @@ Legal transitions are a closed table (`shared/src/shared/task_transitions.py`)
 enforced by fused-memory's `TaskInterceptor`, keyed by the actor making the
 change — e.g. reconciliation is never allowed to transition a task *out of*
 `in-progress`. The diagram above is that table in full, not a happy-path
-sketch: every one of its 37 edges is a `TRANSITIONS` pair, and
+sketch: every edge in it is a `TRANSITIONS` pair, and
 `shared/tests/test_architecture_doc_transition_parity.py` asserts set-equality
 in both directions, so an edge added to the table cannot silently rot out of
 the diagram (it had lost 19 of them before that test existed). Many of the

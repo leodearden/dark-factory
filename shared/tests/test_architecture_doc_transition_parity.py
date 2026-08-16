@@ -5,8 +5,7 @@ enumerated transition union in ``shared/src/shared/task_transitions.py``.  It
 is the only prose artifact in that document with a live in-code oracle, so it
 is the only one worth pinning mechanically: this module asserts set-equality
 between the edges drawn in the diagram and the edges in the exported
-``TRANSITIONS`` table, and pins the one numeric claim the surrounding prose
-makes about it (the stated edge count).
+``TRANSITIONS`` table.
 
 ANTI-ROT CONTRACT (the reason this module exists — task 3544 / PRD leaf κ):
 the diagram silently lost **19** of Table A's edges between the day it was
@@ -50,10 +49,6 @@ _MERMAID_FENCE = re.compile(r'^```mermaid$(?P<body>.*?)^```$', re.MULTILINE | re
 _EDGE = re.compile(r'^\s*(?P<src>\S+)\s*-->\s*(?P<dst>[^\s:]+)\s*(?::.*)?$')
 _ARROW = '-->'
 _PSEUDO_STATE = '[*]'
-# The one numeric claim §3.1's prose makes about the diagram.  It is next to
-# the artifact this module pins, so it is pinned by the same oracle rather
-# than left as unguarded prose that rots the next time `_UNION` grows.
-_EDGE_COUNT_CLAIM = re.compile(r'every one of its (?P<count>\d+) edges')
 
 
 def _normalize(node: str) -> str:
@@ -171,26 +166,6 @@ class TestArchitectureDiagramMatchesTransitionTable:
             f'shared/src/shared/task_transitions.py `_UNION`:\n{_fmt(missing)}\n'
             f'Redraw the §3.1 stateDiagram-v2 fence to include them (mermaid state '
             f'ids use underscores: in_progress / merge_deferred / infra_hold).'
-        )
-
-    def test_prose_edge_count_matches_the_table(self, architecture_text):
-        """§3.1's prose states the edge count; pin it to the same oracle.
-
-        The diagram itself is kept honest by the set-equality tests above, but
-        the sentence next to it ("every one of its N edges is a `TRANSITIONS`
-        pair") is prose and would otherwise go stale the moment `_UNION` grows.
-        """
-        claims = _EDGE_COUNT_CLAIM.findall(architecture_text)
-        assert len(claims) == 1, (
-            f'expected exactly one "every one of its N edges" claim in '
-            f'ARCHITECTURE.md §3.1, found {len(claims)}: {claims}. If the sentence '
-            f'was reworded, update `_EDGE_COUNT_CLAIM` — do not leave the count '
-            f'unpinned.'
-        )
-        assert int(claims[0]) == len(EXPECTED), (
-            f'ARCHITECTURE.md §3.1 claims the diagram has {claims[0]} edges, but '
-            f'shared/src/shared/task_transitions.py `_UNION` has {len(EXPECTED)}. '
-            f'Redraw the diagram and update the sentence together.'
         )
 
     def test_deterministic_gate_edge_is_in_the_table(self):
