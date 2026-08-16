@@ -402,9 +402,29 @@ JSON with `description`/`affected_ids`/`actionable`), and `dedupe_count`.
    )
    res = mcp__fused-memory__resolve_ticket(ticket=sub["ticket"], project_root="<project_root>",
                                            timeout_seconds=<see _shared/ticket-failure-handling.md>)
-   # status created|combined -> task_id ; failed -> record reason, leave escalation pending
+   if res["status"] in ("created", "combined"):
+       task_id = res["task_id"]      # `combined` = folded into an existing task, a normal success not an error
+       resolve_issue(..., action='resume', resolution="Filed task <task_id>: <title>")
+   elif res["status"] == "refused":
+       # Deliberately NOT in the tuple above: a refusal has no task_id key at
+       # all (absent, not null), so there is nothing to interpolate. A
+       # deterministic guard (cancelled-premise blocklist / recon premise
+       # registry) rejected the candidate because its premise is dead. This
+       # is a SUCCESS, not a failure: do NOT retry (a retry just re-hits the
+       # same guard) and do NOT record a task id.
+       resolve_issue(..., action='close_only', resolution="Ticket refused (no task created): <res['reason']>")
+   elif res["status"] == "failed":
+       # Do NOT call resolve_issue — leave the escalation pending. Record
+       # res["reason"], and append this esc-id to the wrapper-owned exclude
+       # file (`<queue-dir>/.watcher-rearm-exclude`) per Priority Hierarchy
+       # item 3 above. See _shared/ticket-failure-handling.md for the
+       # retryable/terminal reason matrix.
    ```
-   Then `resolve_issue(..., action='resume', resolution="Filed task <id>: <title>")`.
+   This recipe spells out all four arms where a sibling can get away with less
+   because this watcher is the SOLE closer of the recon queue — the next
+   action after the status check ARCHIVES the finding, so a status-blind
+   "Filed task <id>" both fabricates a completion claim and drops the finding
+   with no other consumer left to re-find it.
 
 4. **fix-directly via fused-memory** — For memory-integrity findings you can
    safely repair yourself, use the fused-memory write tools, then resolve:
