@@ -1573,6 +1573,9 @@ def _fake_repo(
     return repo
 
 
+_SYSTEMCTL_LOG = "systemctl-calls.log"
+
+
 def _run_installer_section(
     tmp_path: pathlib.Path,
     repo: pathlib.Path,
@@ -1584,7 +1587,18 @@ def _run_installer_section(
     stub_bin = tmp_path / "stub-bin"
     stub_bin.mkdir(exist_ok=True)
     systemctl = stub_bin / "systemctl"
-    systemctl.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    # The stub RECORDS its argv (one call per line) before exiting 0, so the
+    # enable half of the install is observable and not merely assumed. Half of
+    # what this section does is `systemctl --user enable`, and a per-unit gate
+    # that copied the right files while enabling the wrong set would pass every
+    # file-content assertion in this module. Purely additive: tests that do not
+    # read the log are unaffected.
+    systemctl.write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf '%s\\n' \"$*\" >> {tmp_path / _SYSTEMCTL_LOG}\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
     systemctl.chmod(0o755)
 
     script = tmp_path / "section.sh"
@@ -1607,6 +1621,29 @@ def _run_installer_section(
     return subprocess.run(
         ["bash", str(script)], capture_output=True, text=True, env=env
     )
+
+
+def _systemctl_calls(tmp_path: pathlib.Path) -> list[list[str]]:
+    """Every `systemctl` invocation the run made, as argv token lists."""
+    log = tmp_path / _SYSTEMCTL_LOG
+    if not log.is_file():
+        return []
+    return [
+        line.split() for line in log.read_text(encoding="utf-8").splitlines() if line
+    ]
+
+
+def _enabled_units(tmp_path: pathlib.Path) -> list[str]:
+    """The units passed to `systemctl ... enable <unit>` during the run.
+
+    Token-matched rather than substring-matched: `enable` naming one unit must
+    never be satisfied by a line naming a different one.
+    """
+    enabled: list[str] = []
+    for argv in _systemctl_calls(tmp_path):
+        if "enable" in argv:
+            enabled.extend(argv[argv.index("enable") + 1 :])
+    return enabled
 
 
 def _install_all_units(repo: pathlib.Path, unit_dir: pathlib.Path) -> None:
@@ -1713,6 +1750,16 @@ def _warnings(stdout: str) -> str:
     )
 
 
+def _warnings_naming(stdout: str, unit: str) -> str:
+    """The installer's own WARN lines that NAME *unit*, joined.
+
+    Scoped to one unit because the aggregate gate warnings describe the run as
+    a whole — asserting a phrase is merely "in the warnings" would be satisfied
+    by a line about some other unit entirely.
+    """
+    return "\n".join(line for line in _warnings(stdout).splitlines() if unit in line)
+
+
 def test_one_drifted_unit_does_not_block_its_clean_siblings(
     tmp_path: pathlib.Path,
 ):
@@ -1789,6 +1836,121 @@ def test_one_drifted_unit_does_not_block_its_clean_siblings(
         f"The installer warned about clean units {wrongly_named}, which it "
         f"installed. A warning naming a unit nothing was wrong with trains an "
         f"operator to ignore the whole block.\n{result.stdout}"
+    )
+
+
+def test_the_live_reify_dropin_blocks_only_reify_and_the_watchdog_is_re_enabled(
+    tmp_path: pathlib.Path,
+):
+    """THE LIVE SCENARIO, end to end, including the ENABLE half.
+
+    Reproduces this host exactly: ``orchestrator-reify.service`` carries a
+    deliberate, permanent ``orchestrator-reify.service.d/warm-lane.conf``
+    drop-in over a unit file that differs from the committed copy only in
+    comments — so its verdict is `override`, not `drift`. Under the old
+    all-or-nothing gate that ONE unit declined the install of all nine, which
+    is why the watchdog pair could not be reinstalled and re-enabled by a plain
+    setup-host.sh run. On 2026-08-10 that left the fleet 31.8h stale: the
+    supervision safety net was the thing the gate was protecting from repair.
+
+    The enable half is asserted from the systemctl stub's call log, not
+    inferred from file contents, because it is a genuinely separate obligation:
+    copying orchestrator-watchdog.timer into place does nothing at all until it
+    is enabled. Three distinct properties are checked:
+      - the timer IS enabled (the repair path the stale fleet needed);
+      - orchestrator-watchdog.service is NOT (it is static — no [Install] — and
+        `systemctl enable` on a static unit is an ERROR, not a no-op, so under
+        `set -e` that would abort the installer outright);
+      - orchestrator-reify.service is NOT (a unit that did not clear the gate is
+        neither copied NOR enabled — enabling a unit whose install was declined
+        would act on exactly the state the skip refused to act on).
+    """
+    repo = _fake_repo(tmp_path)
+    unit_dir = tmp_path / "installed"
+    _install_all_units(repo, unit_dir)
+
+    # Reify: comment-only divergence + a drop-in. The parser strips comments,
+    # so this must read as `override` ALONE — the phrasing matters because the
+    # remedies differ (edit a directive vs. `systemctl --user cat/edit`).
+    reify = unit_dir / "orchestrator-reify.service"
+    reify.write_text(
+        reify.read_text(encoding="utf-8")
+        + "\n# host-local annotation, invisible to the parser\n",
+        encoding="utf-8",
+    )
+    reify_before = reify.read_text(encoding="utf-8")
+    dropin = _add_dropin(
+        unit_dir,
+        "orchestrator-reify.service",
+        body="[Unit]\nWants=reify-warm-lane.service\nAfter=reify-warm-lane.service\n",
+        name="warm-lane.conf",
+    )
+    dropin_before = dropin.read_text(encoding="utf-8")
+
+    # Deleted so their reinstall is positively observable: asserting on units
+    # that were already byte-identical would be satisfied by doing nothing.
+    (unit_dir / "orchestrator-watchdog.timer").unlink()
+    (unit_dir / "orchestrator-watchdog.service").unlink()
+
+    result = _run_installer_section(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, (
+        "The gate must stay NON-FATAL — it declines individual units, it does "
+        f"not abort the installer.\n{result.stdout}\n{result.stderr}"
+    )
+
+    for name in ("orchestrator-watchdog.service", "orchestrator-watchdog.timer"):
+        installed = unit_dir / name
+        assert installed.is_file(), (
+            f"{name} was absent (install-eligible) but was not installed — "
+            "reify's drop-in is still blocking the watchdog pair, which is the "
+            f"exact failure this task exists to fix.\n{result.stdout}"
+        )
+        assert installed.read_text(encoding="utf-8") == (
+            repo / "scripts" / name
+        ).read_text(encoding="utf-8")
+
+    enabled = _enabled_units(tmp_path)
+    assert "orchestrator-watchdog.timer" in enabled, (
+        "orchestrator-watchdog.timer was copied but never enabled. A timer "
+        "unit file on disk supervises nothing; enabling it is the repair the "
+        f"31.8h-stale fleet needed.\ncalls: {_systemctl_calls(tmp_path)}"
+    )
+    assert "orchestrator-watchdog.service" not in enabled, (
+        "orchestrator-watchdog.service is STATIC (no [Install]) — `systemctl "
+        "enable` on it is an error, not a no-op, so under `set -e` this would "
+        f"abort the installer.\ncalls: {_systemctl_calls(tmp_path)}"
+    )
+    assert "orchestrator-reify.service" not in enabled, (
+        "A unit the gate declined to install was still enabled. The skip must "
+        "cover BOTH halves: enabling a unit whose install was declined acts on "
+        f"exactly the unverified state the skip refused.\nenabled: {enabled}"
+    )
+
+    reload_calls = [argv for argv in _systemctl_calls(tmp_path) if "daemon-reload" in argv]
+    assert len(reload_calls) == 1, (
+        "daemon-reload must run exactly once, AFTER the copies and BEFORE the "
+        "enables — systemd must not be asked to enable a unit it has not "
+        f"re-read.\ncalls: {_systemctl_calls(tmp_path)}"
+    )
+
+    assert reify.read_text(encoding="utf-8") == reify_before, (
+        "The installer overwrote a unit the gate reported an override on."
+    )
+    assert dropin.read_text(encoding="utf-8") == dropin_before, (
+        "The installer disturbed the deliberate warm-lane.conf drop-in."
+    )
+
+    reify_warning = _warnings_naming(result.stdout, "orchestrator-reify.service")
+    assert "drop-in" in reify_warning, (
+        "The skip warning for a drop-in'd unit does not say `drop-in`. The "
+        "remedy is `systemctl --user cat/edit`, not reconciling a directive."
+        f"\n{result.stdout}"
+    )
+    assert "byte-drift" not in reify_warning, (
+        "The skip warning blames byte-drift on a unit whose only divergence is "
+        "a drop-in over comment-only edits — sending the operator hunting for "
+        f"a directive diff that does not exist.\n{result.stdout}"
     )
 
 
