@@ -1,0 +1,461 @@
+"""Tests for scripts/install-memory-metadata-coverage-census-timer.sh, the two
+systemd unit files it installs, and the wrapper their ExecStart names (task
+4006).
+
+Drives the installer via subprocess with a FAKE `systemctl` shimmed onto PATH
+(records every invocation, minus `--user`, into a shared JSON state file) --
+mirroring test_install_reify_closure_staleness_sweep_timer.py. Real systemd is
+never touched.
+
+The wrapper half is driven with BOTH `*_CMD` seams pointed at fake recorder
+executables, mirroring test_reify_closure_staleness_sweep_wrapper.py, so the
+census never runs against live Qdrant and 3201's retro sweep never touches the
+live corpus.
+
+WHY THE WRAPPER'S CONTRACT IS PINNED HERE. This job pairs a GAUGE (the census's
+topic/canonical coverage block) with the MECHANISM that closes it (3201's
+retro_stamp_topics.py), on one cadence, so an operator sees the gap and the
+proposed stamping in the same journal entry. The safety property that makes
+that pairing legal is that the second half runs in DRY-RUN: bulk `canonical:
+true` writes stay an operator decision, never an unattended nightly one. A test
+that only checked the units would leave exactly that property unpinned.
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+SCRIPT = (Path(__file__).parent.parent
+          / 'install-memory-metadata-coverage-census-timer.sh')
+TEMPLATES_DIR = Path(__file__).parent.parent
+REPO_ROOT = TEMPLATES_DIR.parent
+
+# The units name the PRODUCTION checkout absolutely, since systemd resolves
+# ExecStart/WorkingDirectory absolutely and the installed unit is a byte copy
+# of the committed one -- so these assertions must not be derived from
+# REPO_ROOT, which is a .worktrees/<id> path when the suite runs in a lane.
+PRODUCTION_ROOT = '/home/leo/src/dark-factory'
+
+SERVICE_NAME = 'memory-metadata-coverage-census.service'
+TIMER_NAME = 'memory-metadata-coverage-census.timer'
+WRAPPER = TEMPLATES_DIR / 'memory-metadata-coverage-census.sh'
+
+
+_FAKE_SYSTEMCTL_SRC = '''#!/usr/bin/env python3
+"""Fake `systemctl` for testing install-memory-metadata-coverage-census-timer.sh.
+
+Records every invocation (minus `--user`) into a JSON state file at
+$FAKE_SYSTEMCTL_STATE. `enable --now <unit>` marks each non-flag arg as an
+enabled unit; `start <unit>` is recorded and always succeeds; `list-timers`
+echoes one line per *.timer enabled so far THIS RUN, unless
+FAKE_SYSTEMCTL_OMIT_LIST_TIMERS=1 -- simulating the self-verify failure where
+`enable` nominally succeeded but the unit is absent from `list-timers`.
+"""
+import json
+import os
+import sys
+
+STATE_PATH = os.environ["FAKE_SYSTEMCTL_STATE"]
+
+
+def _load():
+    with open(STATE_PATH) as f:
+        return json.load(f)
+
+
+def _save(state):
+    with open(STATE_PATH, "w") as f:
+        json.dump(state, f)
+
+
+def main(argv):
+    args = [a for a in argv[1:] if a != "--user"]
+    if not args:
+        return 1
+    verb, rest = args[0], args[1:]
+
+    state = _load()
+    state.setdefault("calls", []).append(args)
+
+    if verb == "daemon-reload":
+        _save(state)
+        return 0
+
+    if verb == "enable":
+        units = [a for a in rest if not a.startswith("-")]
+        enabled = state.setdefault("enabled_timers", [])
+        for u in units:
+            if u not in enabled:
+                enabled.append(u)
+        _save(state)
+        return 0
+
+    if verb == "start":
+        _save(state)
+        return 0
+
+    if verb == "list-timers":
+        _save(state)
+        if os.environ.get("FAKE_SYSTEMCTL_OMIT_LIST_TIMERS") == "1":
+            print("0 timers listed.")
+            return 0
+        enabled = state.get("enabled_timers", [])
+        for unit in enabled:
+            service = unit.replace(".timer", ".service")
+            print(f"Mon 2026-08-17 05:00:00 UTC 8h left n/a n/a {unit} {service}")
+        print(f"{len(enabled)} timers listed.")
+        return 0
+
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
+'''
+
+
+def _fake_systemctl(tmp_path):
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir(exist_ok=True)
+    fake = bin_dir / 'systemctl'
+    fake.write_text(_FAKE_SYSTEMCTL_SRC)
+    fake.chmod(0o755)
+
+    state_path = tmp_path / 'systemctl_state.json'
+    state_path.write_text(json.dumps({'calls': [], 'enabled_timers': []}))
+    return bin_dir, state_path
+
+
+def _systemctl_calls(tmp_path):
+    state_path = tmp_path / 'systemctl_state.json'
+    if not state_path.is_file():
+        return []
+    return json.loads(state_path.read_text())['calls']
+
+
+def _run_script(tmp_path, *, env=None, reset_state=True):
+    bin_dir, state_path = _fake_systemctl(tmp_path) if reset_state else (
+        tmp_path / 'bin', tmp_path / 'systemctl_state.json')
+
+    full_env = dict(os.environ)
+    full_env['PATH'] = f'{bin_dir}{os.pathsep}{full_env["PATH"]}'
+    full_env['FAKE_SYSTEMCTL_STATE'] = str(state_path)
+    if env:
+        full_env.update(env)
+    return subprocess.run(
+        ['bash', str(SCRIPT)],
+        env=full_env, capture_output=True, text=True, timeout=60,
+    )
+
+
+# ── the installer ───────────────────────────────────────────────────────────
+
+
+def test_script_is_executable():
+    assert os.access(SCRIPT, os.X_OK), (
+        f'Expected {SCRIPT} to be executable (os.X_OK); run: chmod +x {SCRIPT}')
+
+
+def test_install_copies_both_units_and_enables_the_timer(tmp_path):
+    xdg_config = tmp_path / 'xdg-config'
+    result = _run_script(tmp_path, env={'XDG_CONFIG_HOME': str(xdg_config)})
+    assert result.returncode == 0, (
+        f'stdout={result.stdout!r} stderr={result.stderr!r}')
+
+    unit_dir = xdg_config / 'systemd' / 'user'
+    for name in (SERVICE_NAME, TIMER_NAME):
+        installed = unit_dir / name
+        assert installed.is_file(), f'Expected {installed} to exist after install'
+        assert installed.read_bytes() == (TEMPLATES_DIR / name).read_bytes()
+
+    calls = _systemctl_calls(tmp_path)
+    assert ['daemon-reload'] in calls, calls
+    assert ['enable', '--now', TIMER_NAME] in calls, calls
+
+
+def test_install_does_not_kick_an_immediate_run(tmp_path):
+    """No surprise run at install time.
+
+    Unlike the flag-marker and reclaim installers, this one never `start`s the
+    service. The census is a paginated full scroll of both live collections and
+    it APPENDS a row to the committed trend history; an install-time firing
+    would put an unreviewed, off-cadence row into the series the nightly job
+    owns. An operator who wants a look now runs the wrapper by hand, or the
+    census with `--no-history`.
+    """
+    result = _run_script(tmp_path, env={'XDG_CONFIG_HOME': str(tmp_path / 'xdg')})
+    assert result.returncode == 0, result.stderr
+    for call in _systemctl_calls(tmp_path):
+        assert call[:1] != ['start'], f'unexpected immediate run: {call!r}'
+
+
+def test_install_fails_loud_when_the_timer_is_absent_from_list_timers(tmp_path):
+    """The self-verify catches "enable nominally succeeded but the unit is
+    absent" -- the case a bare `enable` exit code cannot distinguish."""
+    result = _run_script(tmp_path, env={
+        'XDG_CONFIG_HOME': str(tmp_path / 'xdg'),
+        'FAKE_SYSTEMCTL_OMIT_LIST_TIMERS': '1',
+    })
+    assert result.returncode != 0, (
+        f'Expected non-zero on self-verify failure; stdout={result.stdout!r} '
+        f'stderr={result.stderr!r}')
+    assert TIMER_NAME in result.stderr, result.stderr
+
+
+def test_install_is_idempotent(tmp_path):
+    xdg_config = tmp_path / 'xdg-config'
+    env = {'XDG_CONFIG_HOME': str(xdg_config)}
+    first = _run_script(tmp_path, env=env)
+    second = _run_script(tmp_path, env=env, reset_state=False)
+    assert first.returncode == 0, first.stderr
+    assert second.returncode == 0, second.stderr
+
+    unit_dir = xdg_config / 'systemd' / 'user'
+    for name in (SERVICE_NAME, TIMER_NAME):
+        assert (unit_dir / name).read_bytes() == (TEMPLATES_DIR / name).read_bytes()
+
+
+# ── the committed unit files ────────────────────────────────────────────────
+
+
+def _unit(name):
+    return (TEMPLATES_DIR / name).read_text()
+
+
+def test_timer_fires_at_the_next_free_nightly_slot():
+    """05:00, after 03:00 legibility-trickle, 03:30 flag-marker-sweep, the
+    already-double-booked 04:00 (reclaim-orphaned-worktrees +
+    legibility-transcript-check) and 04:30 reify-closure-staleness-sweep. The
+    stagger is deliberate: these jobs all touch the same machine and, in
+    several cases, the same backing stores -- this one scrolls every point in
+    both live Qdrant collections."""
+    assert 'OnCalendar=*-*-* 05:00:00' in _unit(TIMER_NAME)
+
+
+def test_timer_does_not_collide_with_an_occupied_slot():
+    """Guards the ladder itself, not just this unit's own literal: a future
+    edit that re-cadences this job onto a taken slot fails here rather than
+    silently double-booking a third job."""
+    ours = _unit(TIMER_NAME)
+    our_slots = {ln.strip() for ln in ours.splitlines()
+                 if ln.startswith('OnCalendar=')}
+    assert our_slots, 'the timer declares no OnCalendar at all'
+    for other in sorted(TEMPLATES_DIR.glob('*.timer')):
+        if other.name == TIMER_NAME:
+            continue
+        for line in other.read_text().splitlines():
+            line = line.strip()
+            if line.startswith('OnCalendar=') and line in our_slots:
+                raise AssertionError(
+                    f'{TIMER_NAME} shares {line!r} with {other.name} — pick a '
+                    f'free slot and update the OPERATIONS.md §12 ladder table')
+
+
+def test_timer_catches_up_a_missed_night_and_avoids_a_thundering_herd():
+    text = _unit(TIMER_NAME)
+    assert 'Persistent=true' in text
+    assert 'RandomizedDelaySec=300' in text
+
+
+def test_timer_is_installed_into_timers_target():
+    assert 'WantedBy=timers.target' in _unit(TIMER_NAME)
+
+
+def test_service_is_a_thin_oneshot_around_the_committed_wrapper():
+    """Paths are the PRODUCTION checkout's, not this test run's.
+
+    systemd resolves ExecStart absolutely and the installed unit is a byte copy
+    of the committed one, so the unit must name /home/leo/src/dark-factory even
+    when these tests run from a worktree under .worktrees/.
+    """
+    text = _unit(SERVICE_NAME)
+    assert 'Type=oneshot' in text
+    assert (f'ExecStart={PRODUCTION_ROOT}/scripts/'
+            f'memory-metadata-coverage-census.sh') in text
+    assert f'WorkingDirectory={PRODUCTION_ROOT}' in text
+
+
+def test_service_sends_both_streams_to_the_journal():
+    """The report is written to files, but the run's narration -- and any
+    shortfall the census exits 1 on -- is only ever readable in the journal."""
+    text = _unit(SERVICE_NAME)
+    assert 'StandardOutput=journal' in text
+    assert 'StandardError=journal' in text
+
+
+def test_service_execstart_points_at_a_real_executable_wrapper():
+    """The wrapper named by ExecStart exists and is executable.
+
+    Checked against THIS checkout (the production path's scripts/ tail mapped
+    onto the tree under test) so the assertion is meaningful from a worktree
+    too -- what it pins is that the unit does not name a wrapper that was
+    renamed or never committed.
+    """
+    text = _unit(SERVICE_NAME)
+    exec_line = next(ln for ln in text.splitlines() if ln.startswith('ExecStart='))
+    named = exec_line.split('=', 1)[1]
+    assert named.startswith(f'{PRODUCTION_ROOT}/scripts/'), named
+    here = TEMPLATES_DIR / named.split('/scripts/', 1)[1]
+    assert here.is_file(), here
+    assert os.access(here, os.X_OK), here
+
+
+def test_service_documents_where_the_normative_contract_lives():
+    """The census script and the PRD are normative; the unit points a reader at
+    them rather than restating any figure that would drift."""
+    text = _unit(SERVICE_NAME)
+    assert 'Documentation=' in text
+    assert 'census_memory_metadata.py' in text
+
+
+def test_no_cadence_knob_was_added_to_the_orchestrator_config():
+    """Guards the design decision the whole §12 family shares: the cadence is
+    the .timer's OnCalendar, NOT a dark-factory-orchestrator.yaml key. A knob
+    there would be misplaced (the orchestrator process is not what is being
+    scheduled) and would cost a fleet redeploy to change."""
+    config = REPO_ROOT / 'dark-factory-orchestrator.yaml'
+    if not config.is_file():
+        return
+    text = config.read_text()
+    for token in ('coverage_census', 'coverage-census', 'census_memory_metadata',
+                  'retro_stamp_topics'):
+        assert token not in text, (
+            f'{token!r} found in {config} — the cadence belongs in the .timer '
+            f'unit, not in orchestrator config')
+
+
+# ── the committed wrapper ───────────────────────────────────────────────────
+
+_FAKE_RECORDER_SRC = '''#!/usr/bin/env python3
+"""Fake command recorder. Appends {"who", "argv"} to the JSON list at
+$FAKE_STATE, then exits with $FAKE_EXIT_<WHO> (default 0)."""
+import json
+import os
+import sys
+
+who = os.environ["FAKE_WHO"]
+state_path = os.environ["FAKE_STATE"]
+with open(state_path) as f:
+    state = json.load(f)
+state.append({"who": who, "argv": sys.argv[1:]})
+with open(state_path, "w") as f:
+    json.dump(state, f)
+
+sys.exit(int(os.environ.get(f"FAKE_EXIT_{who}", "0")))
+'''
+
+
+def _wrapper_harness(tmp_path, *, census_exit=0, stamp_exit=0, extra_env=None):
+    """Point both wrapper seams at fake recorders. Returns (env, state_path)."""
+    bin_dir = tmp_path / 'wbin'
+    bin_dir.mkdir(exist_ok=True)
+    state_path = tmp_path / 'wrapper_state.json'
+    state_path.write_text('[]')
+
+    # The interpreter is spelled ABSOLUTELY (sys.executable), never `python3`,
+    # so a PATH-resolved shim can never re-enter itself.
+    for who in ('CENSUS', 'STAMP'):
+        shim = bin_dir / f'fake-{who.lower()}'
+        shim.write_text(
+            '#!/usr/bin/env bash\n'
+            f'FAKE_WHO={who} exec {sys.executable} '
+            f'{bin_dir / "recorder.py"} "$@"\n'
+        )
+        shim.chmod(0o755)
+    (bin_dir / 'recorder.py').write_text(_FAKE_RECORDER_SRC)
+
+    repo = tmp_path / 'fake-repo'
+    (repo / 'fused-memory' / 'scripts').mkdir(parents=True, exist_ok=True)
+
+    env = dict(os.environ)
+    env['PATH'] = f'{bin_dir}{os.pathsep}{env["PATH"]}'
+    env['REPO'] = str(repo)
+    env['COVERAGE_CENSUS_CMD'] = 'fake-census'
+    env['RETRO_STAMP_CMD'] = 'fake-stamp'
+    env['FAKE_STATE'] = str(state_path)
+    env['FAKE_EXIT_CENSUS'] = str(census_exit)
+    env['FAKE_EXIT_STAMP'] = str(stamp_exit)
+    if extra_env:
+        env.update(extra_env)
+    return env, state_path
+
+
+def _run_wrapper(tmp_path, **kwargs):
+    env, state_path = _wrapper_harness(tmp_path, **kwargs)
+    result = subprocess.run(
+        ['bash', str(WRAPPER)],
+        env=env, capture_output=True, text=True, timeout=60,
+    )
+    return result, json.loads(state_path.read_text())
+
+
+def test_wrapper_is_executable():
+    assert os.access(WRAPPER, os.X_OK), (
+        f'Expected {WRAPPER} to be executable; run: chmod +x {WRAPPER}')
+
+
+def test_wrapper_runs_the_census_then_the_retro_stamp_rehearsal(tmp_path):
+    """One cadence, two halves, in that order: measure the gap, then show what
+    closing it would stamp. The census first, so the rehearsal is read against
+    a report generated moments before rather than last night's."""
+    result, calls = _run_wrapper(tmp_path)
+    assert result.returncode == 0, (
+        f'stdout={result.stdout!r} stderr={result.stderr!r}')
+    assert [c['who'] for c in calls] == ['CENSUS', 'STAMP'], calls
+    assert any('census_memory_metadata.py' in a for a in calls[0]['argv']), calls[0]
+    assert any('retro_stamp_topics.py' in a for a in calls[1]['argv']), calls[1]
+
+
+def test_wrapper_never_applies_the_stamps_unattended(tmp_path):
+    """THE safety property of pairing the gauge with its closing mechanism.
+
+    3201's sweep writes `canonical: true` in bulk. Under
+    `memory_metadata.enforce: false` (the shipped default) those writes are not
+    even guarded by the write-time uniqueness check, so an unattended `--apply`
+    could manufacture the very violations this census exists to count. The
+    nightly run is a rehearsal; committing it stays an operator decision.
+    """
+    _, calls = _run_wrapper(tmp_path)
+    stamp = next(c for c in calls if c['who'] == 'STAMP')
+    assert '--apply' not in stamp['argv'], stamp['argv']
+
+
+def test_wrapper_always_exits_zero_so_the_oneshot_never_wedges(tmp_path):
+    """A recurring `oneshot` that can fail enters systemd `failed` state and
+    STAYS there, silently stopping the whole nightly job (the lesson already
+    written into fused-memory-flag-marker-sweep.sh's siblings). The census
+    exits 1 by design whenever `coverage.complete` is false -- a routine,
+    expected outcome on a live corpus -- so propagating it would wedge the
+    timer on the first churny night."""
+    for census_exit, stamp_exit in ((1, 0), (0, 1), (1, 1)):
+        result, calls = _run_wrapper(
+            tmp_path, census_exit=census_exit, stamp_exit=stamp_exit)
+        assert result.returncode == 0, (
+            f'census_exit={census_exit} stamp_exit={stamp_exit} '
+            f'-> rc={result.returncode}; stderr={result.stderr!r}')
+        # And neither half is allowed to abort the other.
+        assert [c['who'] for c in calls] == ['CENSUS', 'STAMP'], calls
+
+
+def test_wrapper_reports_both_exit_codes_rather_than_swallowing_them(tmp_path):
+    """Exiting 0 must not mean the failure is invisible: the journal is the
+    only place a shortfall is readable, so both codes are narrated."""
+    result, _ = _run_wrapper(tmp_path, census_exit=1, stamp_exit=3)
+    combined = result.stdout + result.stderr
+    assert 'census=1' in combined, combined
+    assert 'stamp=3' in combined, combined
+
+
+def test_wrapper_runs_under_the_fused_memory_service_env(tmp_path):
+    """A fused-memory maintenance action must run under the SERVICE env, not a
+    bare shell, or the census silently narrows to a different config/collection
+    -- the cgl_eta_auto_apply.sh runbook lesson already encoded in
+    fused-memory-flag-marker-sweep.sh."""
+    text = WRAPPER.read_text()
+    assert 'CONFIG_PATH' in text
+    assert 'PROJECT_ROOT' in text
+    assert 'uv run' in text, (
+        'the default interpreter prefix must resolve fused_memory.* imports')
