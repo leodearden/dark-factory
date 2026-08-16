@@ -1911,9 +1911,13 @@ class TestHarnessInjectedTurnFilter:
         # Acceptance test at the render_digest level, reproducing the
         # sighting verbatim (session b976febe) minus its one genuine
         # correction: a zero-signal session that used to present as
-        # gold-bearing (3 harness-injected turns, all five signal_counts
-        # 0) must no longer do so once R1's exclusion covers all three
-        # shapes.
+        # gold-bearing (3 harness-injected turns, every signal_counts
+        # bucket 0) must no longer do so once R1's exclusion covers all
+        # three shapes. Asserted as "every bucket is 0" rather than
+        # against a hardcoded key set: the bucket vocabulary grows
+        # independently of this filter (task 4027 added
+        # 'designed_outcome'), and pinning the key set here would turn
+        # every such addition into a spurious failure of an R1 test.
         records = _resume_and_context_block_records()
 
         digest = mod.render_digest(records, agent_class='interactive')
@@ -1921,10 +1925,10 @@ class TestHarnessInjectedTurnFilter:
         frontmatter_yaml, body = _split_frontmatter(digest)
         meta = yaml.safe_load(frontmatter_yaml)
 
-        assert meta['signal_counts'] == {
-            'tool_error': 0, 'self_correct': 0, 'not_found': 0,
-            'df_guard': 0, 'interrupt': 0,
+        assert set(meta['signal_counts']) >= {
+            'tool_error', 'self_correct', 'not_found', 'df_guard', 'interrupt',
         }
+        assert all(count == 0 for count in meta['signal_counts'].values())
         assert '## User Corrections' not in digest
         # n_user_turns inflation is gone: score_signals(all-zero counts, 0).
         assert meta['score'] == 0.0

@@ -957,7 +957,7 @@ claim is what
 (the fifth, composite path) together check, so a new return path added
 to that function should arrive with a fourth marker here. Matched only in CONJUNCTION with
 a line-anchored '# context' heading (see :func:`is_harness_injected_turn`),
-never as a relaxation of HARNESS_BRIEFING_HEADINGS' all() guard -- that
+never as a relaxation of the briefing anchor+corroborator guard -- that
 guard is load-bearing and its two negative tests
 (test_single_heading_alone_is_not_excluded,
 test_context_heading_mentioned_mid_sentence_is_not_excluded) must keep
