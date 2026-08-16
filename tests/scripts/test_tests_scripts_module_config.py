@@ -41,6 +41,15 @@ from orchestrator import verify, verify_plan
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
+# This worktree's own top-level orchestrator config — the one `_root_config`
+# reads. `dark-factory-orchestrator.yaml` is the canonical, REQUIRED filename
+# for a project's top-level config (it is what the dashboard's escalation-URL
+# discovery keys on); the legacy spellings are a discovery fallback for
+# unmigrated projects, not a choice this repo has. Anchored to REPO_ROOT rather
+# than taken from the ambient ORCH_CONFIG_PATH for the reason that helper's
+# docstring records at length.
+ROOT_CONFIG_PATH = REPO_ROOT / 'dark-factory-orchestrator.yaml'
+
 MODULE_PREFIX = 'tests/scripts'
 
 # A file in this suite, used as the representative touched-file for the
@@ -50,6 +59,54 @@ SAMPLE_TOUCHED_FILE = 'tests/scripts/test_spawn_claude.py'
 
 def _discovered() -> dict:
     return _discover_module_configs(REPO_ROOT)
+
+
+def _root_config(monkeypatch: pytest.MonkeyPatch) -> OrchestratorConfig:
+    """Load the repo-root config through the PRODUCTION loader, anchored at ROOT_CONFIG_PATH.
+
+    COPIED (task 3703) from the two sibling guards
+    (``test_scripts_module_config.py`` and ``test_module_verify_budgets.py``),
+    not imported: a test file importing a sibling test file couples two guards
+    that must be able to fail independently, and this anchor is load-bearing
+    enough that it must be visibly present in the file that depends on it.
+
+    ANCHORING ``ORCH_CONFIG_PATH`` IS LOAD-BEARING, not hygiene.
+    ``project_root`` is only a model FIELD and selects nothing:
+    ``OrchestratorConfig.settings_customise_sources`` builds its
+    ``YamlSettingsSource`` from ``os.environ['ORCH_CONFIG_PATH']`` alone,
+    falling back to a CWD-relative ``config.yaml``. Both ambient states are
+    wrong here, in OPPOSITE directions:
+
+      * UNSET — the state INSIDE VERIFY, because
+        ``verify._target_subprocess_env`` deliberately scrubs the whole
+        ``ORCH_`` prefix (task 2957) — finds no file, so every value collapses
+        to the pydantic DEFAULTS, a config this repo does not declare.
+      * SET, as an operator's shell has it, points at whichever checkout that
+        orchestrator serves — typically the MAIN one, not this worktree. Every
+        assertion would then be about a different checkout's yaml and report
+        GREEN on a worktree that had actually regressed: the exact
+        reports-green-while-checking-something-else failure this file exists
+        to prevent, one env var over.
+
+    Setting the env var IS the production load path (``config.load_config``
+    stamps ``os.environ['ORCH_CONFIG_PATH']`` before constructing), so this
+    stays a read through the real loader, pinned to THIS worktree's committed
+    yaml rather than left to the ambient environment.
+
+    Fails LOUDLY on a missing file rather than silently: ``YamlSettingsSource``
+    SKIPS a non-existent ``config_path`` instead of raising, so a bad path
+    would yield the pydantic DEFAULTS with no error at all.
+    """
+    assert ROOT_CONFIG_PATH.is_file(), (
+        f'{ROOT_CONFIG_PATH} does not exist, so anchoring ORCH_CONFIG_PATH at '
+        'it would silently load the pydantic DEFAULTS instead (YamlSettingsSource '
+        'skips a non-existent path rather than raising), and every value read '
+        'from the returned config would be about a config this repo does not '
+        'declare. dark-factory-orchestrator.yaml is the canonical, required '
+        "filename for a project's top-level orchestrator config"
+    )
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(ROOT_CONFIG_PATH))
+    return OrchestratorConfig(project_root=REPO_ROOT)
 
 
 def test_tests_scripts_is_a_registered_module_config() -> None:
@@ -189,7 +246,7 @@ _FLEET_CHAIN_MARKERS = (
 )
 
 
-def _executed_for_touched(files: list[str]):
+def _executed_for_touched(files: list[str], cfg: OrchestratorConfig):
     """Run the PRODUCTION plan->execution bridge and return the single executed config.
 
     ``derive_verify_plan`` decides scope; ``_executed_module_configs_from_plan``
@@ -197,11 +254,23 @@ def _executed_for_touched(files: list[str]):
     executes. Asserting on THAT is what makes "the tests/scripts segment ran" a
     structural claim rather than an exit-code claim.
 
+    *cfg* IS A REQUIRED PARAMETER, not a convenience (task 3703, applying the
+    shape commit 6c72a7da5a landed next door in
+    ``test_module_verify_budgets.py``). It must be a config built by
+    ``_root_config``, whose docstring spells out why the ``ORCH_CONFIG_PATH``
+    anchor is load-bearing: an unset anchor collapses every value to the
+    pydantic defaults, SILENTLY. This helper used to construct its own
+    ``OrchestratorConfig(project_root=REPO_ROOT)``, and — unlike the sibling
+    guard, whose single anchoring caller at least left the env var set as a
+    SIDE EFFECT of an earlier assertion — NO caller in this file anchored it at
+    all. So it read whatever ambient ``ORCH_CONFIG_PATH`` the process happened
+    to carry, with no failure signal either way. Taking the config as an
+    argument makes the dependency structural instead of ambient.
+
     The ``lambda _f: None`` worktree_reader keeps this hermetic: no file reads,
     and nothing classifies STRUCTURAL, so pyright stays FILE_SCOPED.
     """
     mc = _discovered()[MODULE_PREFIX]
-    cfg = OrchestratorConfig(project_root=REPO_ROOT)
     plan = verify_plan.derive_verify_plan(files, [mc], cfg, lambda _f: None)
     executed = verify._executed_module_configs_from_plan([mc], plan)
     assert len(executed) == 1, (
@@ -211,7 +280,9 @@ def _executed_for_touched(files: list[str]):
     return executed[0]
 
 
-def test_tests_scripts_diff_executes_its_own_suite_and_keeps_lint_and_type() -> None:
+def test_tests_scripts_diff_executes_its_own_suite_and_keeps_lint_and_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The task's acceptance criterion, asserted STRUCTURALLY rather than via rc.
 
     "A diff touching only tests/scripts/ should complete verify well inside
@@ -233,7 +304,7 @@ def test_tests_scripts_diff_executes_its_own_suite_and_keeps_lint_and_type() -> 
     ``pyright tests/scripts/test_spawn_claude.py`` rc=0). Closing the TEST gap
     must not open a LINT/TYPE one.
     """
-    executed = _executed_for_touched([SAMPLE_TOUCHED_FILE])
+    executed = _executed_for_touched([SAMPLE_TOUCHED_FILE], _root_config(monkeypatch))
 
     # (a) The tests/scripts segment ACTUALLY RUNS.
     assert executed.test_command is not None, (
