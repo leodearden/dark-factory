@@ -16,6 +16,7 @@ from orchestrator.analyze_modules import (
     _iter_events,
     _parse_since,
     aggregate,
+    main,
     render_json,
     render_table,
     suggest_max_per_module,
@@ -343,14 +344,62 @@ def test_render_json_is_machine_readable():
     # swapped input would be (7, 4) → ratio 4/7 ≈ 0.57 → still suggest 2,
     # so the conflict_rate assertion does the distinguishing.
     stats = {
-        'crates': ModuleStats(dispatches=4, skipped_waiting=7),
+        'crates/foo/src': ModuleStats(
+            dispatches=4, skipped_waiting=7,
+            total_hold_secs=300.0, hold_samples=3, truncated_holds=2,
+        ),
     }
     payload = json.loads(render_json(stats))
-    assert payload['crates']['dispatches'] == 4
-    assert payload['crates']['skipped_waiting'] == 7
+    assert payload['crates/foo/src']['dispatches'] == 4
+    assert payload['crates/foo/src']['skipped_waiting'] == 7
     # conflict = 7/4 = 1.75 (>= 0.5 but < 2.0) → suggest 2.
-    assert payload['crates']['conflict_rate'] == 1.75
-    assert payload['crates']['suggested_max_per_module'] == 2
+    assert payload['crates/foo/src']['conflict_rate'] == 1.75
+    assert payload['crates/foo/src']['suggested_max_per_module'] == 2
+    assert payload['crates/foo/src']['avg_hold_secs'] == 100.0
+    # Two of the three samples are censored lower bounds — a consumer reading
+    # avg_hold_secs alone cannot tell, so the count travels with it.
+    assert payload['crates/foo/src']['truncated_holds'] == 2
+
+
+# --- the table must not collapse two distinct lock keys into one row -------
+
+#: Two REAL sibling paths in this repo that are distinct lock keys and share a
+#: 32-character prefix ('fused-memory/src/fused_memory/re').  The old 32-column
+#: truncation rendered both as the same label — a defect the first-path-
+#: component key space hid, because it never produced a key this long.
+_LONG_KEY = 'fused-memory/src/fused_memory/reconciliation'
+_LONGER_KEY = 'fused-memory/src/fused_memory/reconciliation/prompts'
+
+
+def test_render_table_prints_a_long_lock_module_in_full():
+    assert _LONG_KEY[:32] == _LONGER_KEY[:32], 'the fixture must actually collide at 32'
+
+    table = render_table({
+        _LONG_KEY: ModuleStats(dispatches=10, skipped_waiting=2),
+        _LONGER_KEY: ModuleStats(dispatches=4, skipped_waiting=8),
+    })
+
+    assert _LONG_KEY in table
+    assert _LONGER_KEY in table
+    labels = [line.split()[0] for line in table.splitlines()[1:]]
+    assert sorted(labels) == sorted([_LONG_KEY, _LONGER_KEY]), \
+        'each lock key needs its own distinguishable row'
+
+
+def test_render_table_reports_truncated_holds():
+    """The censoring is visible in the human surface too, not just --json."""
+    table = render_table({
+        'orchestrator/src': ModuleStats(
+            dispatches=5, skipped_waiting=1,
+            total_hold_secs=400.0, hold_samples=4, truncated_holds=2,
+        ),
+    })
+
+    header, row = table.splitlines()
+    assert 'trunc' in header
+    # Distinct values, so a trunc/suggest column swap cannot pass:
+    # conflict 1/5 = 0.2 → suggest 3; truncated_holds is 2.
+    assert row.split()[-3:] == ['100.0', '2', '3']
 
 
 def test_iter_events_opens_runs_db_read_only(event_store: EventStore) -> None:
@@ -452,3 +501,59 @@ def test_iter_events_tolerates_malformed_data(event_store: EventStore):
     assert len(rows) == 1
     assert rows[0]['data'] == {}
     assert rows[0]['event_type'] == 'lock_acquired'
+
+
+# ===========================================================================
+# main() — the CLI interface, which this task does NOT change
+# ===========================================================================
+#
+# The key space and every per-key number move; --since, --json and
+# --min-dispatches must not.  End to end over a real runs.db so the whole
+# path (read -> aggregate -> render -> exit code) is covered at once.
+
+
+def test_main_json_reports_the_full_lock_modules(canonical_trace_db: Path, capsys):
+    assert main([str(canonical_trace_db), '--json', '--since', '2026-07-01']) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+
+    assert sorted(payload) == ['fused-memory/src', 'orchestrator/src', 'shared/src']
+    assert not {'fused-memory', 'orchestrator', 'shared'} & set(payload), \
+        'no bare first-path-component keys survive'
+    assert payload['orchestrator/src']['dispatches'] == 6
+    assert payload['orchestrator/src']['avg_hold_secs'] == 104.0
+    assert payload['orchestrator/src']['truncated_holds'] == 1
+
+
+def test_main_min_dispatches_still_filters(canonical_trace_db: Path, capsys):
+    assert main([
+        str(canonical_trace_db), '--json', '--since', '2026-07-01',
+        '--min-dispatches', '4',
+    ]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+
+    # orchestrator/src has 6; the other two have 3 each.
+    assert list(payload) == ['orchestrator/src']
+
+
+def test_main_reports_an_empty_window_without_failing(canonical_trace_db: Path, capsys):
+    """An empty window is a fact about the window, not an error."""
+    assert main([str(canonical_trace_db), '--since', '2026-09-01']) == 0
+
+    captured = capsys.readouterr()
+    assert '(no module events in window)' in captured.err
+    assert captured.out == ''
+
+
+def test_main_table_mode_prints_the_full_lock_modules(canonical_trace_db: Path, capsys):
+    assert main([str(canonical_trace_db), '--since', '2026-07-01']) == 0
+
+    out = capsys.readouterr().out
+    assert 'orchestrator/src' in out
+    assert 'fused-memory/src' in out
+
+
+def test_main_returns_2_for_a_missing_db(tmp_path: Path, capsys):
+    assert main([str(tmp_path / 'nope.db')]) == 2
+    assert 'runs.db not found' in capsys.readouterr().err
