@@ -117,6 +117,22 @@ not counted as G1 consumers of anything here.
 > task** (`dependencies: [3804]`, added 2026-08-10), so that sequencing is enforced by the scheduler
 > rather than only asserted in prose.
 
+> **Amendment 2026-08-17 (task 3973)** — refreshed the "Est. VRAM" column against
+> `scripts/local-model-serving/arms.yaml`'s measured figures (the drift flagged, and deliberately not
+> fixed, by the 3804 amendment above). Two arms checked:
+> - **Qwen3.5-9B — was stale, now corrected.** `~6GB` → **12.0 GiB** (arms.yaml's `est_vram_gib`, the
+>   admission-floor figure vLLM's own measurement corrected it to on 2026-08-06 — weights alone are
+>   11.21 GiB; 12.0 adds the non-KV allowance). The original ~6GB was a parameter-count guess, ~2x
+>   below the measured weights.
+> - **Phi-4 14B — checked, not stale.** `~9GB` matches arms.yaml's `est_vram_gib: 9.0` exactly (that
+>   file's own comment block confirms this arm's figure sits *above* its 8.51 GiB of on-disk weights,
+>   the opposite of Qwen3.5-9B's defect) — left unchanged.
+>
+> Sites touched: the candidate-slate table (Qwen3.5-9B row); the "Reading the Est. VRAM column"
+> footnote immediately below it; D10's Consequence paragraph, which restates the same two figures.
+> `scripts/local-model-serving/arms.yaml` remains authoritative (measured); this PRD is the narrative
+> record of it, same relationship as the 3804 amendment established for slate composition.
+
 ## Goal
 
 Two evidence-backed, pre-registered verdicts, each observable as a committed decision record plus
@@ -233,17 +249,17 @@ llama.cpp only, see hazard):
 
 | Arm | Size / quant | Est. VRAM | Basis (cited in research appendix) |
 |---|---|---|---|
-| Qwen3.5-9B | dense, Q4/AWQ | ~6GB | IFEval 91.5, BFCL-V4 66.1 (official card) — best published conformance-adjacent scores; huge KV headroom |
+| Qwen3.5-9B | dense, Q4/AWQ | ~~`~6GB`~~ → **12.0 GiB** (measured 2026-08-06; 11.21 GiB weights) | IFEval 91.5, BFCL-V4 66.1 (official card) — best published conformance-adjacent scores; huge KV headroom |
 | ~~Mistral-Small-3.2-24B~~ **DROPPED 2026-08-06** | ~~dense, AWQ~~ | ~~`~14GB`~~ | **Dropped by α after live measurement (Leo's ruling, esc-3713-10): a vision-language model whose quantized repo's tokenizer encodes vLLM's startup `[IMG]` probe to zero image tokens against a text count of one, so the engine never reaches weight loading.** Original basis: mature quant ecosystem; release targeted stronger function calling |
 | Phi-4 14B | dense, Q4 | ~9GB | SOB Value Accuracy 0.798 (top small model); **16K ctx — screening must verify graphiti's longest prompts fit** |
 | MoE stretch: ~~Qwen3.6-35B-A3B or~~ **Gemma-4-26B-A4B-it (QAT)** | ~~GGUF IQ4/Q4~~ **`UD-Q4_K_XL`** | ~~≈17GB (Qwen IQ4 — real, but 16.51 GiB of weights before KV, so it does not fit the measured 16.4 GiB)~~ → **13.27 GiB, fits** (α step 22, Open Q3; `task/3713` @ `a161c2858b`, not yet on `main`) | 115–133 tok/s on a 3090 (6× dense-on-vLLM) — but llama.cpp silently falls back to *unconstrained* output on Pydantic `$ref`/`$defs` schemas (llama.cpp #21228), so this arm runs `json_object` mode + a hard client-side validator; tightest VRAM |
 
-*Reading the **Est. VRAM** column: those are 2026-08-05 research-time **estimates**, and at least one
-is stale against measured reality — Qwen3.5-9B is listed `~6GB` here, but
-`scripts/local-model-serving/arms.yaml` records a **measured 11.21 GiB** (vLLM-reported, 2026-08-06).
-Refreshing this column is **task 3973**, sequenced after this correction (it depends on 3804); this
-pass deliberately corrected only slate composition, so read every figure in the column as an
-estimate, not a measurement.*
+*Reading the **Est. VRAM** column: those were 2026-08-05 research-time **estimates**. Task 3973
+(2026-08-17) checked each surviving figure against `scripts/local-model-serving/arms.yaml`'s measured
+`est_vram_gib` values — the file that is authoritative here. Qwen3.5-9B's `~6GB` was stale and is now
+**12.0 GiB** (arms.yaml, measured 2026-08-06; 11.21 GiB of that is weights alone). Phi-4 14B's `~9GB`
+was checked too and matches arms.yaml's `est_vram_gib: 9.0` exactly, so it stands unchanged. The MoE
+stretch arm's figure was already corrected separately, by α step 22 (13.27 GiB, fits).*
 
 The struck-through row above is **kept** rather than deleted: it is the record of what was
 commissioned, and deleting it would erase the fact that the slate narrowed. Two facts about the
@@ -335,15 +351,15 @@ the real corpus is the primary instrument** and public benchmarks are a sanity a
     - The ruling above (whisper-writer stays resident) is **unchanged** — only the capacity number
       it implies is corrected.
     - **Consequence** (not a decision — see Open Q3): on a **weights-only** basis — the same basis
-      that disqualifies the MoE arm below — the two remaining dense LLM arms (~6, ~9 GiB — the
+      that disqualifies the MoE arm below — the two remaining dense LLM arms (~12, ~9 GiB — the
       ~14 GiB Mistral-Small-3.2-24B arm was dropped 2026-08-06, see the candidate slate) and all
       embedding arms fit inside ~16.4 GiB; the MoE stretch arm as then specified (~17GB, i.e.
-      Qwen3.6-35B-A3B at IQ4) does not. **Caveat on the `~6, ~9` figures, marked here at the point of
-      use:** they are the 2026-08-05 research-time estimates, and the `~6` is known-wrong —
-      arms.yaml records Qwen3.5-9B at a **measured 11.21 GiB**, ~5 GiB above the estimate this
-      sentence's "fits" conclusion leans on. Refreshing the Est. VRAM figures is **task 3973**'s pass,
-      deliberately not this one's (both would edit this paragraph); until it lands, treat the
-      conclusion as resting on stale inputs. **Runtime fit is stricter and separate**: vLLM's paged KV
+      Qwen3.6-35B-A3B at IQ4) does not. **Note on the `~12, ~9` figures, marked here at the point of
+      use:** these are the arms.yaml **measured** `est_vram_gib` values, refreshed by task 3973
+      (2026-08-17) from the 2026-08-05 research-time estimates this sentence originally cited (`~6,
+      ~9`) — the `~6` was known-wrong (arms.yaml measured Qwen3.5-9B at 11.21 GiB of weights, ~5 GiB
+      above the estimate), `~9` for Phi-4 14B was checked and confirmed accurate. **Runtime fit is
+      stricter and separate**: vLLM's paged KV
       cache can balloon well past the weights figure (α's README, `RESOLVED alongside: the pooling
       arms' KV balloon` — a 0.6B embedding arm declared at 2.0 GiB weights measured 16.2 GiB resident
       before `--kv-cache-memory` / `_memory_share_for` bounded it), so "fits" for the dense arms is

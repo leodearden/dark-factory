@@ -125,7 +125,11 @@ arms:
   # ---------------------------------------------------------------------
   # mistral-small-3.2-24b -- DROPPED FROM THE SLATE (Leo, 2026-08-06).
   #
-  # The PRD commissioned it (line 127). It is removed after live measurement,
+  # The PRD commissioned it (PRD §Candidate slate, the Mistral-Small-3.2-24B
+  # row -- a stable locator, not a line number: task 3973 replaced the prior
+  # "line 127" pointer, which drifted twice as amendment banners were
+  # prepended, the same lesson task 3748 learned about pinning a README
+  # heading over a function name). It is removed after live measurement,
   # deliberately and on the record, rather than left in to fail forever.
   #
   # Its declared quant WAS wrong and that was fixed: `awq` -> `compressed-
