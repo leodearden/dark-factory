@@ -12827,11 +12827,35 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         invoked on every further violating call; its own ``has_open_l1``
         dedup (see that function) ensures at most one open L1 regardless of
         how many times this method calls it.
+
+        DETECTION AND ESCALATION USE DIFFERENT AGE FLOORS (task 3622).
+        Detection, the WARNING log, the streak, and
+        ``snapshot()['resource_audit']`` all fire at
+        :attr:`RESOURCE_AUDIT_WORKTREE_GRACE_SECS`, so the leak census stays
+        truthful and immediate.  The ESCALATION, however, re-asks the
+        worktree question at the higher
+        :meth:`_resource_audit_escalation_age_secs` floor: a leaked worktree
+        younger than that is still inside the window in which
+        :meth:`_maybe_reap_orphaned_merge_worktrees` is SCHEDULED to destroy
+        it, so paging a human would report work that is about to happen
+        anyway (this is what produced esc-``__merge_resource_leak__``-46/-47).
+        The escalation waits until that scheduled remediation has
+        demonstrably failed.
+
+        Speculation-accounting violations are NEVER age-suppressed: nothing
+        reclaims a leaked permit or cap slot, so that arm is a genuine
+        "nobody is going to clean this up" from its first heartbeat and
+        passes through unfiltered.
+
+        The streak deliberately keeps counting through the suppressed band —
+        its documented meaning is "consecutive violating heartbeats", which
+        stays literally true, and it is the transient/racy-blip filter rather
+        than the escalate-now decision.  Preserving it means a tree that
+        crosses the escalation floor mid-streak alarms on the very next poll
+        instead of restarting a 3-heartbeat countdown.
         """
-        violations = (
-            self.speculation_accounting_violations()
-            + self.worktree_ledger_violations(now=now)
-        )
+        spec_violations = self.speculation_accounting_violations()
+        violations = spec_violations + self.worktree_ledger_violations(now=now)
 
         if not violations:
             self._resource_audit_violation_streak = 0
@@ -12846,9 +12870,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._resource_audit_violation_streak += 1
 
         if self._resource_audit_violation_streak >= self.RESOURCE_AUDIT_ESCALATION_STREAK:
-            _alarm_resource_audit(
-                self._escalation_queue, violations, event_store=self._event_store,
+            # Re-ask the worktree arm at the ESCALATION floor. Anything it
+            # still returns has outlived its scheduled reclaim; anything it
+            # drops is self-healing and stays logged-only. The permit arm is
+            # reused as-is — it has no scheduled remediation to wait for.
+            escalatable = spec_violations + self.worktree_ledger_violations(
+                now=now, grace_secs=self._resource_audit_escalation_age_secs(),
             )
+            if escalatable:
+                _alarm_resource_audit(
+                    self._escalation_queue, escalatable,
+                    event_store=self._event_store,
+                )
 
     def _maybe_log_queue_heartbeat(self, now: float) -> bool:
         """Emit a queue-depth heartbeat log line and event if conditions are met.
