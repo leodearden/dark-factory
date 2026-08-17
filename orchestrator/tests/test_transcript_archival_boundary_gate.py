@@ -275,6 +275,27 @@ def _identity(path: Path) -> tuple[bytes, int, int]:
     return path.read_bytes(), st.st_mtime_ns, st.st_ino
 
 
+async def _git_worktree_list(git_repo: Path) -> str:
+    """``git worktree list`` output — GIT's own view of what still exists.
+
+    E2's teardown assertions are made through git rather than through
+    ``Path.exists()`` alone: an absent directory would also be reported by a
+    ``cleanup_worktree`` that degenerated into an ``rmtree``, or one that
+    no-op'd over an already-missing path, leaving a stale worktree registration
+    behind. Asking git closes both.
+    """
+    rc, out, err = await _run(['git', 'worktree', 'list'], cwd=git_repo)
+    assert rc == 0, f'git worktree list failed: {err}'
+    return out
+
+
+async def _git_branch_exists(git_repo: Path, branch: str) -> bool:
+    """True iff *branch* is still a local branch in *git_repo*."""
+    rc, out, err = await _run(['git', 'branch', '--list', branch], cwd=git_repo)
+    assert rc == 0, f'git branch --list failed: {err}'
+    return bool(out.strip())
+
+
 def _archive_files(git_repo: Path) -> set[str]:
     """Every FILE under the archive root, as archive-root-relative posix paths."""
     root = _archive_root(git_repo)
@@ -547,6 +568,11 @@ class TestE2SurvivesTeardown:
         # earlier archive can be responsible for what survives below.
         assert git_ops.transcript_archive is None
 
+        # Git's own view BEFORE teardown, so the after-state below is a
+        # transition rather than a fact that may always have been true.
+        assert str(cwd) in await _git_worktree_list(git_repo)
+        assert await _git_branch_exists(git_repo, f'task/{TASK_ID}')
+
         await git_ops.cleanup_worktree(cwd, TASK_ID)
 
         # The destruction really happened: worktree, per-task config dir and
@@ -554,6 +580,14 @@ class TestE2SurvivesTeardown:
         assert not cwd.exists()
         assert not config_dir.exists()
         assert not src.exists()
+
+        # ...and GIT agrees it happened. Directory absence alone would still
+        # hold if cleanup_worktree degenerated into an rmtree (or a no-op over
+        # an already-missing path); asserting git no longer LISTS the worktree,
+        # and that the task branch was deleted, is what stops a future refactor
+        # turning this row green vacuously.
+        assert str(cwd) not in await _git_worktree_list(git_repo)
+        assert not await _git_branch_exists(git_repo, f'task/{TASK_ID}')
 
         # ...and the durable archive is untouched — same bytes, same mtime,
         # same inode.
