@@ -2712,7 +2712,13 @@ class MemoryService:
 
         assert self.durable_queue is not None
 
-        success = True
+        # POSITIVE EVIDENCE ONLY, set after enqueue() commits. `success` on a
+        # write_ops row means "the enqueue was ACCEPTED", so an enqueue that
+        # was cancelled mid-commit is by definition not one. Mirrors
+        # _execute_mem0_write's matching fix — that method's comment already
+        # names this one as the shape it was copied from, so the two are a
+        # documented pair and are kept in step.
+        success = False
         error_msg = None
         try:
             await self.durable_queue.enqueue(
@@ -2738,9 +2744,13 @@ class MemoryService:
                 },
                 callback_type='dual_write_episode',
             )
-        except Exception as e:
-            success = False
-            error_msg = str(e)
+            success = True
+        except BaseException as e:
+            # Observe-and-reraise (see _execute_mem0_write for the full note):
+            # never swallows, so cancellation semantics are unchanged and only
+            # the journal row differs. type(e).__name__ is prefixed because a
+            # bare CancelledError's str() is empty.
+            error_msg = f'{type(e).__name__}: {e}'
             raise
         finally:
             if self._write_journal:
