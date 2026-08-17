@@ -139,6 +139,39 @@ def make_configured_task_knowledge_sync_stage(
     return stage
 
 
+_TKS_LOGGER = 'fused_memory.reconciliation.stages.task_knowledge_sync'
+
+
+def _emit_foreign_log_noise() -> None:
+    """Emit two foreign log records that reproduce this file's caplog flake (task 4329).
+
+    pytest's caplog installs its LogCaptureHandler on the ROOT logger, so
+    ``caplog.at_level(level, logger=X)`` scopes the LEVEL threshold (on logger
+    X and on the handler) but NOT which loggers get captured — a record from
+    ANY logger that propagates to root and clears the level threshold lands
+    in ``caplog.records``. In production, a leaked httpx.AsyncClient finalized
+    nondeterministically on the same xdist worker emits
+    ``ERROR asyncio: Task exception was never retrieved`` at an unpredictable
+    moment, which a level-only ``r.levelno >= logging.WARNING`` filter counts
+    right alongside this module's own WARNING — turning an exact-count or
+    absence assertion flaky (sibling flake class: tasks 1851/2819/3510/3927).
+
+    Emits exactly two records so a single call is RED-effective regardless of
+    comparison operator:
+      - ``logging.getLogger('asyncio').error(...)`` — the exact observed
+        offender; breaks ``>= logging.WARNING`` filters (levelno 40).
+      - ``logging.getLogger('httpx').warning(...)`` — a foreign record at
+        exactly WARNING; breaks ``== logging.WARNING`` filters and
+        ``not any(... == logging.WARNING ...)`` absence assertions, which the
+        asyncio ERROR alone (levelno 40 != 30) would not trip.
+
+    Neither logger is ``_TKS_LOGGER``, so a name-scoped filter
+    (``r.name == _TKS_LOGGER``) excludes both — see TestForeignLogNoiseHelper.
+    """
+    logging.getLogger('asyncio').error('Task exception was never retrieved')
+    logging.getLogger('httpx').warning('mock httpx noise injected for task 4329 caplog de-flake')
+
+
 class TestMockTypesConstant:
     """Validate the _MOCK_TYPES constant that TestProjectIdValidation depends on."""
 
