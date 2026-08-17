@@ -1704,6 +1704,49 @@ class TestUpdateMemoryContentArm:
         assert event.payload['memory_id'] == 'point-1'
         assert event.payload['store'] == 'mem0'
 
+    @pytest.mark.asyncio
+    async def test_content_only_amend_does_not_revalidate_existing_metadata(
+        self, service, caplog
+    ):
+        """A content amend must never be judged on metadata it did not touch.
+
+        Task 3523. The vocabulary seam now runs on the update path, and the
+        line between "judging this write" and "re-validating the corpus" is
+        the whole reason the seam is delta-scoped. A content amend leaves the
+        record's metadata BYTE-IDENTICAL, so this write is responsible for
+        none of it.
+
+        The pre-image staged here is the real hazard, not a contrived one:
+        `eval_worktree_plan_tools_missing` is the snake_case topic the live
+        `dark_factory` canonical record actually carried, and
+        `sweep_toolcall_xml_leak.py` enumerates legacy records that are
+        fatal-invalid today. Validating it here would make a legacy record's
+        TEXT uncorrectable under `enforce` — blocking the very repair sweeps
+        that exist to fix those records — and would quietly convert `enforce`
+        from "rejects WRITES" into "re-validates the corpus", the model task
+        3626's flip measurement (~20 → ~19 false rejections/week) rests on.
+        """
+        service.config.memory_metadata.enforce = True
+        service.mem0.get_point_by_id = AsyncMock(return_value={
+            **DEFAULT_POINT_PAYLOAD,
+            'topic': 'eval_worktree_plan_tools_missing',
+        })
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+
+        result = await service.update_memory(
+            memory_id='point-1', project_id='test',
+            content='amended text', reason='fix typo',
+        )
+
+        assert result['status'] == 'updated'
+        assert result['content_amended'] is True
+        assert result['metadata_patched'] is False
+        service.mem0.update.assert_awaited_once()
+        # Not merely "did not raise": a censused violation would still be a
+        # re-validation of the corpus, inflating the very census stream the
+        # flip decision is measured from.
+        assert _mm_census_codes(caplog) == []
+
 
 class TestUpdateMemoryMetadataArm:
     """§5(b)'s routing decision table — which primitive each argument shape maps to.
