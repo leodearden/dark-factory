@@ -200,6 +200,76 @@ async def _make_workflow(config, git_ops, task_assignment):
     return workflow, cwd
 
 
+# The per-task OAuth credential every live config dir holds beside projects/.
+# _producer_invoke lays it down on EVERY row, so credential-exclusion is probed
+# continuously by the whole orchestrator half of the gate rather than only by E1.
+_CREDENTIAL_DECOY = b'{"claudeAiOauth":{"accessToken":"sk-ant-oat01-GATE-CANARY"}}'
+
+
+async def _producer_invoke(
+    workflow,
+    cwd: Path,
+    *,
+    payload: bytes | None = None,
+    session_id: str | None = None,
+) -> tuple[AgentResult, str, Path]:
+    """Run ONE real ``_invoke``, patching ONLY ``invoke_with_cap_retry``.
+
+    The stand-in agent writes its transcript at the path implied by the session
+    id ``_invoke`` FORWARDS to it — never at a path the test picked — so every
+    row proves the producer located the file rather than that the fixture put
+    one where the assertion looked.
+
+    *payload* is the bytes the stand-in agent writes. ``None`` means "the
+    transcript already on disk IS this session's output": the side effect
+    leaves the file untouched, which is the shape a RESUMED session needs (E6
+    grows the file itself between invocations, and a rewrite here would undo
+    that). *session_id*, when given, asserts ``_invoke`` forwarded exactly that
+    id — the check that makes E6's real resume path observable rather than
+    assumed.
+
+    Returns ``(result, session_id, source_path)``.
+    """
+    config_dir = workflow._config_dir
+    assert config_dir is not None
+    captured: dict[str, Any] = {}
+
+    def _side_effect(**kwargs):
+        sid = kwargs['session_id']
+        if session_id is not None:
+            assert sid == session_id, (
+                f'_invoke forwarded a fresh session id {sid!r}, expected the '
+                f'resumed {session_id!r}'
+            )
+        src = config_dir.path / 'projects' / ENC / f'{sid}.jsonl'
+        src.parent.mkdir(parents=True, exist_ok=True)
+        if payload is not None:
+            src.write_bytes(payload)
+        (config_dir.path / '.credentials.json').write_bytes(_CREDENTIAL_DECOY)
+        captured['sid'] = sid
+        captured['src'] = src
+        return AgentResult(success=True, output='')
+
+    with patch(
+        'orchestrator.workflow.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+        side_effect=_side_effect,
+    ):
+        result = await workflow._invoke(SIMPLE_TASK, 'p', cwd)
+
+    return result, captured['sid'], captured['src']
+
+
+def _archive_files(git_repo: Path) -> set[str]:
+    """Every FILE under the archive root, as archive-root-relative posix paths."""
+    root = _archive_root(git_repo)
+    if not root.is_dir():
+        return set()
+    return {
+        p.relative_to(root).as_posix() for p in root.rglob('*') if p.is_file()
+    }
+
+
 # ---------------------------------------------------------------------------
 # E1 — a completed session's transcript is archived at completion
 # ---------------------------------------------------------------------------
@@ -222,42 +292,21 @@ class TestE1ArchivedAtCompletion:
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = _config(git_repo)  # transcript_archive enabled by default
         workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
-        config_dir = workflow._config_dir
-        assert config_dir is not None
         transcript_bytes = b'{"type":"user","cwd":"/tmp/x"}\n{"type":"assistant"}\n'
-        written: dict[str, Path] = {}
 
-        def _side_effect(**kwargs):
-            # The session id _invoke minted is forwarded as session_id=; write
-            # the transcript where THAT id says it belongs, plus the per-task
-            # OAuth credential file that lives beside projects/ in a live
-            # config dir (the integrated half of E4).
-            sid = kwargs['session_id']
-            p = config_dir.path / 'projects' / ENC / f'{sid}.jsonl'
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_bytes(transcript_bytes)
-            (config_dir.path / '.credentials.json').write_bytes(
-                b'{"claudeAiOauth":{"accessToken":"sk-ant-oat01-E1-CANARY"}}'
-            )
-            written['source'] = p
-            return AgentResult(success=True, output='')
-
-        with patch(
-            'orchestrator.workflow.invoke_with_cap_retry',
-            new_callable=AsyncMock,
-            side_effect=_side_effect,
-        ):
-            result = await workflow._invoke(SIMPLE_TASK, 'p', cwd)
+        result, sid, src = await _producer_invoke(
+            workflow, cwd, payload=transcript_bytes
+        )
 
         assert result.success is True
+        assert workflow._last_invoke_session_id == sid
 
-        sid = workflow._last_invoke_session_id
         archive_root = _archive_root(git_repo)
         archived = _archived(git_repo, sid)
 
         # Archived, at the layout the durable root defines, plain .jsonl.
         assert archived.exists()
-        assert archived.read_bytes() == written['source'].read_bytes()
+        assert archived.read_bytes() == src.read_bytes()
         assert archived.read_bytes() == transcript_bytes
 
         # Plain .jsonl everywhere: task 3618 dropped gzip, so no `.gz` artefact
@@ -272,6 +321,34 @@ class TestE1ArchivedAtCompletion:
 
         # Integrated half of E4: the credential written beside projects/ did
         # not follow the transcript into the archive.
-        archived_names = {p.name for p in archive_root.rglob('*') if p.is_file()}
-        assert '.credentials.json' not in archived_names
-        assert (config_dir.path / '.credentials.json').exists()
+        assert _archive_files(git_repo) == {f'{TASK_ID}/{ENC}/{sid}.jsonl'}
+        assert (workflow._config_dir.path / '.credentials.json').exists()
+
+    async def test_kill_switch_leaves_the_archive_root_uncreated(
+        self, monkeypatch, git_repo, git_ops, task_assignment
+    ):
+        """KILL-SWITCH CONTROL for the row above — the PRODUCER caused that
+        archive, not the tmp layout.
+
+        The identical scenario with ``transcript_archive.enabled = False`` must
+        leave the archive root NON-EXISTENT. Without this, the row above would
+        still pass if the archive were written by anything other than the hook
+        under test (a fixture, a stray helper, a leftover tree), and the
+        documented green-tier kill switch would be untested at the integrated
+        level.
+        """
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = _config(git_repo, transcript_archive={'enabled': False})
+        assert config.transcript_archive.enabled is False
+        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+
+        result, sid, src = await _producer_invoke(
+            workflow, cwd, payload=b'{"type":"user"}\n'
+        )
+
+        assert result.success is True
+        # The agent really did produce a transcript this time too...
+        assert src.exists()
+        # ...and the hook really was the only thing that would have archived it.
+        assert not _archive_root(git_repo).exists()
+        assert not _archived(git_repo, sid).exists()
