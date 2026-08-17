@@ -2425,6 +2425,10 @@ class MemoryService:
 
         result = None
         error_msg = None
+        # POSITIVE EVIDENCE ONLY: set solely after the backend await returns.
+        # `success` used to be derived from the ABSENCE of an error, which made
+        # every path that skips the handler a silent false success.
+        succeeded = False
         try:
             result = await self._journaled_backend_call(
                 write_op_id=write_op_id,
@@ -2436,8 +2440,17 @@ class MemoryService:
                     content=payload['content'], scope=scope, metadata=metadata
                 ),
             )
+            succeeded = True
             return result
-        except Exception as e:
+        except BaseException as e:
+            # Deliberately BaseException, not Exception — this file's usual
+            # rule (see :562, :1002) targets handlers that SWALLOW, where
+            # catching CancelledError would break structured cancellation.
+            # This one only OBSERVES and immediately re-raises: control flow
+            # for a cancellation is byte-for-byte unchanged, and only the
+            # journal row differs. A write the queue cancelled (its
+            # wait_for(write_timeout_seconds), or close()'s worker cancel)
+            # provably never executed, so it must not be journaled as landed.
             error_msg = f'{type(e).__name__}: {e}'
             raise
         finally:
@@ -2448,6 +2461,13 @@ class MemoryService:
             # the failure invisible to the journal. The `finally` mirrors
             # add_episode's, and log_write_op is an upsert, so the retries of a
             # single item converge on one row whose last attempt wins.
+            #
+            # `succeeded` is belt-and-braces over the widened `except`: should
+            # any future BaseException bypass the handler entirely, the row
+            # still cannot claim a success. log_write_op is documented
+            # fire-and-forget/never-raises (write_journal.py), so it is called
+            # undefended here — wrapping it would risk masking the very
+            # CancelledError being propagated.
             if self._write_journal:
                 await self._write_journal.log_write_op(
                     write_op_id=journal_write_op_id,
@@ -2462,7 +2482,7 @@ class MemoryService:
                         'category': metadata.get('category', ''),
                     },
                     result_summary=str(result)[:500] if result else None,
-                    success=error_msg is None,
+                    success=succeeded,
                     error=error_msg,
                 )
 
