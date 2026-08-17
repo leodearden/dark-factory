@@ -31,14 +31,19 @@ from orchestrator.flake_ledger import (
     ensure_schema,
 )
 from orchestrator.flake_report import (
+    DebtReportRow,
+    FlakeLedgerReport,
+    GateBlindCounter,
+    NonConvergenceCounter,
+    SystemicCounter,
     _parse_stamp,
     build_chains,
     build_report,
-    render_report,
     compute_gate_blind,
     compute_non_convergence,
     compute_systemic,
     format_age,
+    render_report,
 )
 
 _NOW = datetime(2026, 8, 10, 12, 0, 0, tzinfo=UTC)
@@ -694,3 +699,121 @@ class TestTruncationHonesty:
         # own name — a bare `'truncated' not in rendered.lower()` matches the word
         # "untruncated" in that path and fails against a perfectly correct render.
         assert not [ln for ln in rendered.splitlines() if 'TRUNCATED' in ln], rendered
+
+
+def _report(
+    *,
+    db_present: bool = True,
+    open_debt: list[DebtReportRow] | None = None,
+    chains: list | None = None,
+    gate_blind: GateBlindCounter | None = None,
+    non_convergence: NonConvergenceCounter | None = None,
+    systemic: SystemicCounter | None = None,
+) -> FlakeLedgerReport:
+    """A hand-built report object — the render tests need no DB."""
+    return FlakeLedgerReport(
+        db_path=Path('/proj/data/orchestrator/runs.db'),
+        db_present=db_present,
+        generated_at=_NOW,
+        window_since='2026-08-03T12:00:00+00:00' if db_present else None,
+        open_debt=open_debt or [],
+        chains=chains or [],
+        gate_blind=gate_blind or compute_gate_blind([]),
+        non_convergence=non_convergence or compute_non_convergence([], _NOW),
+        systemic=systemic or compute_systemic([]),
+    )
+
+
+class TestRenderReport:
+    """render_report's operator-facing contract."""
+
+    def test_three_section_headings_are_present(self):
+        rendered = render_report(_report()).upper()
+        assert 'OPEN DEBT' in rendered
+        assert 'RECURRENCE CHAIN' in rendered
+        assert 'HEALTH COUNTER' in rendered
+
+    def test_an_open_row_shows_test_id_owner_and_age(self):
+        # INV-7 is discharged by an owner AND a bound both being operator-visible.
+        row = DebtReportRow(debt=_debt(test_id='tests/test_a.py::test_one',
+                                       owner_task_id='3552'), age=timedelta(days=2, hours=3))
+        rendered = render_report(_report(open_debt=[row]))
+        assert 'tests/test_a.py::test_one' in rendered
+        assert '3552' in rendered
+        assert '2d 3h' in rendered
+
+    def test_a_missing_owner_renders_loudly_not_as_a_blank_cell(self):
+        # A debt row with no owner means a flaky test is silently no longer blocking
+        # anything and nobody owns fixing it (§5.7/§5.9) — the single most consequential
+        # state this report can encounter.  A blank cell would render the breach as
+        # missing data instead of as the breach it is.
+        row = DebtReportRow(debt=_debt(test_id='orphan', owner_task_id=None),
+                            age=timedelta(days=1))
+        rendered = render_report(_report(open_debt=[row]))
+        breach_lines = [ln for ln in rendered.splitlines() if 'orphan' in ln]
+        assert breach_lines, rendered
+        assert 'NO OWNER' in breach_lines[0].upper(), breach_lines
+
+    def test_an_unparseable_opened_at_renders_unknown_not_zero(self):
+        row = DebtReportRow(debt=_debt(test_id='badclock', opened_at='not-a-date'), age=None)
+        line = [ln for ln in render_report(_report(open_debt=[row])).splitlines()
+                if 'badclock' in ln][0]
+        assert 'unknown' in line, line
+        assert '0d 0h' not in line, line
+
+    def test_a_chain_shows_its_cycle_fields_and_call_site_split(self):
+        chain = build_chains(
+            [
+                _occ(test_id='chronic', call_site=FlakeCallSite.chronic_marker, row_id=1),
+                _occ(test_id='chronic', call_site=FlakeCallSite.merge_gate, row_id=2,
+                     observed_at='2026-08-08T13:00:00+00:00'),
+                _occ(test_id='chronic', call_site=FlakeCallSite.main_probe, row_id=3,
+                     observed_at='2026-08-08T14:00:00+00:00'),
+            ],
+            [],
+            lambda t: _debt(test_id='chronic', open_count=7,
+                            prior_resolved_at='2026-07-25T00:00:00+00:00',
+                            prior_resolving_commit='deadbee'),
+        )
+        rendered = render_report(_report(chains=chain))
+        assert 'chronic' in rendered
+        assert '7' in rendered
+        assert '2026-07-25' in rendered
+        assert 'deadbee' in rendered
+        # κ's signal must stay distinguishable from the two gates.
+        assert 'chronic_marker' in rendered
+        assert 'merge_gate' in rendered
+        assert 'main_probe' in rendered
+
+    def test_insufficient_observations_is_said_not_a_rate(self):
+        two = [_occ(verdict=FlakeVerdict.unconfirmable, row_id=1), _occ(row_id=2)]
+        rendered = render_report(_report(gate_blind=compute_gate_blind(two)))
+        assert 'insufficient observations' in rendered.lower(), rendered
+
+    def test_a_none_rate_renders_as_n_a_never_zero(self):
+        rendered = render_report(_report(gate_blind=compute_gate_blind([])))
+        rate_lines = [ln for ln in rendered.splitlines() if 'rate' in ln.lower()]
+        assert rate_lines, rendered
+        assert 'n/a' in rate_lines[0].lower(), rate_lines
+        assert '0.00' not in rate_lines[0], rate_lines
+
+    def test_all_three_counters_print(self):
+        rendered = render_report(_report()).lower()
+        assert 'gate blind' in rendered
+        assert 'non-convergence' in rendered
+        assert 'systemic' in rendered
+
+    def test_an_empty_report_says_so_explicitly(self):
+        rendered = render_report(_report()).lower()
+        assert rendered.strip(), 'an empty report must not render as an empty string'
+        assert 'no open debt' in rendered, rendered
+        assert 'no occurrences' in rendered, rendered
+
+    def test_render_is_byte_deterministic(self):
+        report = _report(open_debt=[DebtReportRow(debt=_debt(), age=timedelta(days=1))])
+        assert render_report(report) == render_report(report)
+
+    def test_the_db_path_is_stated_and_absence_is_explicit(self):
+        assert '/proj/data/orchestrator/runs.db' in render_report(_report())
+        absent = render_report(_report(db_present=False)).lower()
+        assert 'no ledger' in absent or 'not present' in absent, absent
