@@ -635,6 +635,11 @@ def test_apply_coding_record_does_not_resurrect_rejected_candidate():
 
 
 def test_apply_coding_record_does_not_duplicate_promoted_candidate():
+    """The FALLBACK half of the promoted case: this fixture's candidate is
+    stamped `promoted` but carries no `promoted_to` (a hand-edited or
+    pre-`promote_candidate` record), so there is no entry to route the
+    recurrence to — it lands on the candidate and counts as a conflict,
+    exactly like the rejected case."""
     codebook = _codebook_with_adjudicated_candidate("promoted")
     record = _candidate_record(title="novel shape", session="sess-new", date="2026-07-24")
 
@@ -648,6 +653,76 @@ def test_apply_coding_record_does_not_duplicate_promoted_candidate():
     assert candidate["sightings"][1]["session"] == "sess-new"
     assert stats["candidate_disposition_conflicts"] == 1
     assert stats["candidates_applied"] == 0
+    assert mod.validate(result) == []
+
+
+def test_apply_coding_record_routes_promoted_recurrence_to_its_entry():
+    """A promoted candidate's `sightings` list is a DEAD field for new
+    signal: `census.promote_candidate` deep-copies it into the new entry
+    once, at promotion time, and nothing re-reads it afterwards (the matrix
+    path and the codebook index both read ENTRY sightings). So a recurrence
+    of a promoted title must land on the entry named by `promoted_to` and
+    count as a `matched` sighting — filing it on the candidate would report
+    the signal as preserved while writing it where no consumer looks."""
+    codebook = _codebook_with_adjudicated_candidate("promoted")
+    codebook["candidates"][0]["promoted_to"] = "entry-a"
+    record = _candidate_record(title="novel shape", session="sess-new", date="2026-07-24")
+
+    result, stats = mod.apply_coding_record(codebook, record)
+
+    entry = next(e for e in result["entries"] if e["id"] == "entry-a")
+    assert [s["session"] for s in entry["sightings"]] == ["sess-new"]
+    assert stats["matched"] == 1
+    assert stats["candidate_disposition_conflicts"] == 0
+    assert stats["candidates_applied"] == 0
+
+    # The candidate itself is untouched — verdict AND sightings; no twin.
+    assert len(result["candidates"]) == 1
+    candidate = result["candidates"][0]
+    assert candidate["disposition"] == "promoted"
+    assert len(candidate["sightings"]) == 1
+    assert mod.validate(result) == []
+
+
+def test_apply_coding_record_promoted_recurrence_dedupes_on_the_entry():
+    """Session-level dedup on the ENTRY, mirroring the match path: a record
+    that both matches the entry directly and re-mines the promoted title
+    appends exactly one sighting, not two."""
+    codebook = _codebook_with_adjudicated_candidate("promoted")
+    codebook["candidates"][0]["promoted_to"] = "entry-a"
+    record = _candidate_record(title="novel shape", session="sess-new", date="2026-07-24")
+    record["matches"] = [
+        {"entry_id": "entry-a", "origin_phase": "implement", "manifested_phase": "merge"}
+    ]
+
+    result, stats = mod.apply_coding_record(codebook, record)
+
+    entry = next(e for e in result["entries"] if e["id"] == "entry-a")
+    assert [s["session"] for s in entry["sightings"]] == ["sess-new"]
+    assert stats["matched"] == 1  # the match path's append; the candidate re-sighting deduped
+    assert stats["candidate_disposition_conflicts"] == 0
+    assert stats["candidates_applied"] == 0
+    assert len(result["candidates"][0]["sightings"]) == 1
+    assert mod.validate(result) == []
+
+
+def test_apply_coding_record_promoted_with_dangling_promoted_to_falls_back():
+    """`promoted_to` naming an entry that does not exist must NOT silently
+    drop the recurrence: fall back to the candidate append + conflict
+    counter (the merger never fabricates an entry — only the census does)."""
+    codebook = _codebook_with_adjudicated_candidate("promoted")
+    codebook["candidates"][0]["promoted_to"] = "entry-that-was-never-created"
+    record = _candidate_record(title="novel shape", session="sess-new", date="2026-07-24")
+
+    result, stats = mod.apply_coding_record(codebook, record)
+
+    assert len(result["entries"]) == 1  # no entry fabricated
+    assert result["entries"][0]["sightings"] == []
+    candidate = result["candidates"][0]
+    assert len(candidate["sightings"]) == 2
+    assert candidate["sightings"][1]["session"] == "sess-new"
+    assert stats["matched"] == 0
+    assert stats["candidate_disposition_conflicts"] == 1
     assert mod.validate(result) == []
 
 

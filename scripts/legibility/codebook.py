@@ -429,9 +429,22 @@ def apply_coding_record(codebook: dict, record: dict) -> tuple[dict, dict]:
     `candidates` list. A still-`pending` record of that title absorbs the
     sighting (`candidates_applied`); a genuinely unseen title creates a new
     pending record (`candidates_applied`); a title whose records are ALL
-    already adjudicated (rejected/promoted) takes neither path — the
-    recurrence sighting is appended to the existing record and counted in
-    `candidate_disposition_conflicts`, but no pending twin is fabricated.
+    already adjudicated (rejected/promoted) takes neither path — no pending
+    twin is fabricated, and the recurrence sighting is routed to whichever
+    record a consumer will actually read:
+
+    - `promoted` with a `promoted_to` naming an existing entry → the
+      sighting is appended to THAT ENTRY (session-deduped, counted in
+      `matched`, exactly like the match path). A promoted candidate's own
+      `sightings` list is a dead field: census.promote_candidate deep-copies
+      it into the new entry once at promotion time and nothing re-reads it
+      afterwards, so filing a recurrence there would lose the signal while
+      reporting it preserved.
+    - `rejected`, or `promoted` with a `promoted_to` that resolves to no
+      entry → the sighting is appended to the existing candidate record and
+      counted in `candidate_disposition_conflicts`. The merger never
+      fabricates an entry (only the census promotes), so the candidate is
+      the only place left to keep it.
 
     Never-resurrect: the merger must never re-open a census verdict. Only
     the census writes `disposition` (census.py promote_candidate/
@@ -520,15 +533,41 @@ def apply_coding_record(codebook: dict, record: dict) -> tuple[dict, dict]:
             # promoted). Fabricating a fresh pending twin here would silently
             # undo that verdict (this is exactly how rejected
             # cand-20260722-28 came back as pending cand-20260724-2 in the
-            # live codebook). Append the recurrence sighting to the existing
-            # record so the signal is not lost, leave `disposition` alone --
-            # promote/reject transitions are census-owned (census.py
-            # promote_candidate/reject_candidate) -- and surface the conflict
-            # via stats. `same_title[-1]` (last in list order = most recently
-            # added) is the deterministic tie-break when more than one
-            # adjudicated record shares a title.
-            same_title[-1].setdefault("sightings", []).append(sighting)
-            stats["candidate_disposition_conflicts"] += 1
+            # live codebook). So: never touch `disposition` -- promote/reject
+            # transitions are census-owned (census.py promote_candidate/
+            # reject_candidate) -- and route the recurrence sighting to
+            # wherever it will actually be READ.
+            promoted_entry = None
+            for c in reversed(same_title):
+                if c.get("disposition") == "promoted":
+                    promoted_entry = entries_by_id.get(c.get("promoted_to"))
+                    if promoted_entry is not None:
+                        break
+            if promoted_entry is not None:
+                # The census already turned this title into a real entry.
+                # A promoted candidate's `sightings` list is a DEAD field
+                # from that moment on: promote_candidate deep-copies it into
+                # the entry ONCE, and every consumer afterwards (the matrix
+                # path, build_codebook_index) reads ENTRY sightings. Filing
+                # the recurrence on the candidate would report the signal as
+                # preserved while writing it where nothing looks -- so it
+                # goes on the entry, deduped by session and counted exactly
+                # as the match path above counts its own appends.
+                entry_sightings = promoted_entry.setdefault("sightings", [])
+                if session not in {s.get("session") for s in entry_sightings}:
+                    entry_sightings.append(sighting)
+                    stats["matched"] += 1
+            else:
+                # Rejected, or promoted with a `promoted_to` that names no
+                # existing entry (hand-edited/pre-promote_candidate record).
+                # The merger never fabricates an entry -- only the census
+                # does -- so the sighting lands on the candidate so the
+                # signal is not lost, and the conflict is surfaced via
+                # stats. `same_title[-1]` (last in list order = most recently
+                # added) is the deterministic tie-break when more than one
+                # adjudicated record shares a title.
+                same_title[-1].setdefault("sightings", []).append(sighting)
+                stats["candidate_disposition_conflicts"] += 1
         else:
             n = 1 + sum(
                 1 for c in candidates if str(c.get("id", "")).startswith(date_prefix)
@@ -716,7 +755,10 @@ def _cmd_apply(args: argparse.Namespace) -> int:
     `candidate_disposition_conflicts` counts a DIFFERENT thing and is not a
     fourth failure mode: not a skipped record, but a successfully-merged
     recurrence sighting appended to an already-adjudicated candidate, whose
-    disposition is left to the census.
+    disposition is left to the census. It covers the rejected case and the
+    promoted-with-no-resolvable-`promoted_to` case only — a promoted title's
+    recurrence is routed onto the entry it was promoted to and counted in
+    `matched` instead (see `apply_coding_record`).
     """
     codebook = load(args.codebook)
     if not isinstance(codebook, dict):
