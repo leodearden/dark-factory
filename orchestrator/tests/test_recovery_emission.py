@@ -929,3 +929,162 @@ class TestRecoverySweepTally:
 
         assert tally.pinning_ids == ['esc-9', 'esc-2', 'esc-5', 'esc-1']
         assert tally.render().startswith('held=3 (esc-9, esc-2, esc-5, esc-1);')
+
+
+# ---------------------------------------------------------------------------
+# AMENDMENT (review cycle 1) — the sweep summary's id list is CAPPED
+# ---------------------------------------------------------------------------
+
+
+class TestSweepSummaryIdCap:
+    """``render()`` names a bounded prefix, never every id it holds.
+
+    The summary is logged UNCONDITIONALLY on every reconcile pass, so on a
+    fleet where many tasks are simultaneously pinned an uncapped list would
+    re-print hundreds of ids every ``stranded_reconcile_interval_secs`` for as
+    long as the strands last — the same INV-4 spam the event cadence is gated
+    on, expressed as one unbounded line instead of many rows.  The FIELD stays
+    complete; only the rendering is capped.
+    """
+
+    def _held(self, count: int):
+        """A tally holding *count* distinct ids, plus the configured cap."""
+        from orchestrator.recovery_emission import SWEEP_SUMMARY_ID_CAP
+
+        tally = _tally()
+        for n in range(count):
+            tally.record(_pinned(), [_ref(f'esc-{n:03d}')], task_id=f'T{n}')
+        return tally, SWEEP_SUMMARY_ID_CAP
+
+    def test_a_list_at_the_cap_renders_whole_with_no_overflow_note(self):
+        from orchestrator.recovery_emission import SWEEP_SUMMARY_ID_CAP
+
+        tally, cap = self._held(SWEEP_SUMMARY_ID_CAP)
+
+        rendered = tally.render()
+
+        assert 'more)' not in rendered
+        for n in range(cap):
+            assert f'esc-{n:03d}' in rendered
+
+    def test_a_list_over_the_cap_names_the_prefix_and_counts_the_rest(self):
+        from orchestrator.recovery_emission import SWEEP_SUMMARY_ID_CAP
+
+        tally, cap = self._held(SWEEP_SUMMARY_ID_CAP + 7)
+
+        rendered = tally.render()
+
+        # The prefix an operator acts on first is named in full...
+        assert rendered.startswith(f'held={cap + 7} (esc-000, esc-001,')
+        # ...the tail is a count, not a wall of ids...
+        assert f'esc-{cap:03d}' not in rendered
+        assert '+7 more)' in rendered
+        # ...and nothing was DROPPED from the field itself.
+        assert len(tally.pinning_ids) == cap + 7
+
+    def test_the_capped_line_stays_one_readable_length(self):
+        """The point of the cap, asserted as the property rather than the
+        constant: an arbitrarily large hold set must not grow the line."""
+        tally, cap = self._held(500)
+
+        rendered = tally.render()
+
+        assert len(rendered) < 400
+        assert rendered.count('esc-') == cap
+        assert f'+{500 - cap} more)' in rendered
+
+
+# ---------------------------------------------------------------------------
+# AMENDMENT (review cycle 1) — ONE definition of the veto signature
+# ---------------------------------------------------------------------------
+
+
+class TestVetoSignature:
+    """The one string whose FORMAT is load-bearing.
+
+    ``RecoveryVetoStreakTracker`` decides "unchanged hold, stay quiet" versus
+    "new fact, emit" by comparing two of these, so a per-site copy that drifted
+    would make the same hold gate differently at a sweep site and a tick site —
+    an emission bug with nothing failing anywhere.  The cross-adapter test that
+    both really route through here lives in
+    ``test_recovery_emission_wiring.py``.
+    """
+
+    def _sig(self, *args, **kwargs):
+        from orchestrator.recovery_emission import veto_signature
+
+        return veto_signature(*args, **kwargs)
+
+    def _buckets(self, **kwargs):
+        return {
+            'dead_l0': list(kwargs.get('dead_l0', ())),
+            'queue_handoff': list(kwargs.get('queue_handoff', ())),
+            'non_pinning': list(kwargs.get('non_pinning', ())),
+        }
+
+    def test_the_format_is_reason_shape_then_sorted_ids(self):
+        sig = self._sig(
+            _pinned(), 'in-progress|False|on_main|True|-',
+            self._buckets(queue_handoff=['esc-2', 'esc-1']),
+        )
+
+        assert sig == 'escalation_pinned|in-progress|False|on_main|True|-|esc-1,esc-2'
+
+    def test_store_order_cannot_change_the_signature(self):
+        """Two identical vetoes must produce two identical signatures."""
+        a = self._sig(_pinned(), 'shape', self._buckets(queue_handoff=['b', 'a']))
+        b = self._sig(_pinned(), 'shape', self._buckets(queue_handoff=['a', 'b']))
+
+        assert a == b
+
+    def test_a_record_moving_between_buckets_is_the_same_hold(self):
+        """An L0 whose claimant dies moves queue_handoff -> dead_l0.  Same
+        record, same hold — re-emitting for it would be noise, so the bucket
+        NAMES are deliberately outside the signature."""
+        handoff = self._sig(_pinned(), 'shape', self._buckets(queue_handoff=['e1']))
+        dead = self._sig(_pinned(), 'shape', self._buckets(dead_l0=['e1']))
+
+        assert handoff == dead
+
+    def test_a_different_reason_or_shape_is_a_different_signature(self):
+        from orchestrator.recovery_emission import LeaveReason
+
+        base = self._sig(_pinned(), 'shape', self._buckets(queue_handoff=['e1']))
+
+        assert base != self._sig(
+            LeaveReason.escalation_store_unavailable, 'shape',
+            self._buckets(queue_handoff=['e1']),
+        )
+        assert base != self._sig(
+            _pinned(), 'other', self._buckets(queue_handoff=['e1']),
+        )
+
+    def test_an_empty_or_missing_bucket_set_still_renders(self):
+        """Totality: a store-unavailable emission carries no ids at all."""
+        assert self._sig(_pinned(), 'shape', {}) == 'escalation_pinned|shape|'
+        assert self._sig(_pinned(), 'shape', None) == 'escalation_pinned|shape|'
+
+
+class TestPinBuckets:
+    """The other half the two adapters used to hand-roll."""
+
+    def test_records_bucket_and_the_store_reads_as_available(self):
+        from orchestrator.recovery_emission import pin_buckets
+
+        pins = pin_buckets('3535', [_row('esc-1')], store_unavailable=False)
+
+        assert pins.store_unavailable is False
+        assert sorted(
+            i for ids in pins.buckets.values() for i in ids
+        ) == ['esc-1']
+        assert set(pins.buckets) == {'dead_l0', 'queue_handoff', 'non_pinning'}
+
+    def test_store_unavailable_passes_none_down_never_an_empty_list(self):
+        """classify_pins' third state.  A false ``[]`` reads as 'nothing held
+        this task' — the esc-3163 collapse."""
+        from orchestrator.recovery_emission import pin_buckets
+
+        pins = pin_buckets('3535', [], store_unavailable=True)
+
+        assert pins.store_unavailable is True
+        assert not [i for ids in pins.buckets.values() for i in ids]

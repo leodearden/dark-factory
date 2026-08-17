@@ -918,3 +918,160 @@ class TestPerTickSitesNeverCharge:
             'a per-tick site charging this counter would page an operator '
             'seconds after a hold appeared, not after three 900s sweeps'
         )
+
+
+# ---------------------------------------------------------------------------
+# AMENDMENT (review cycle 1) — the two adapters cannot drift on the signature
+# ---------------------------------------------------------------------------
+
+
+class TestBothAdaptersAgreeOnTheVetoSignature:
+    """``Harness`` and ``Scheduler`` must sign the same hold identically.
+
+    The veto signature is the one string in this mechanism whose FORMAT is
+    load-bearing: the tracker decides "unchanged hold, stay quiet" versus "new
+    fact, emit" by comparing two of them.  Spelled per-site (as it was), the
+    same hold observed at a sweep site and at a tick site could produce unequal
+    signatures and the two sites' cadence gating would diverge with nothing
+    failing anywhere.  Both now route through
+    ``recovery_emission.veto_signature``; these tests pin the AGREEMENT rather
+    than the shared call, so an inlined copy would fail here even if it
+    happened to compile.
+
+    Asserted through the tracker's public API: an adapter that recorded
+    exactly *sig* makes a follow-up ``observe`` with *sig* a non-transition.
+    """
+
+    def _bare_harness(self):
+        from orchestrator.recovery_emission import RecoveryVetoStreakTracker
+
+        h = Harness.__new__(Harness)
+        h.config = MagicMock()
+        h.config.recovery_emission = RecoveryEmissionConfig()
+        h.event_store = None
+        h._escalation_queue = None
+        h._recovery_veto_tracker = RecoveryVetoStreakTracker()
+        h._recovery_process_notices = set()
+        return h
+
+    def _bare_scheduler(self):
+        from orchestrator.recovery_emission import RecoveryVetoStreakTracker
+        from orchestrator.scheduler import Scheduler
+
+        s = Scheduler.__new__(Scheduler)
+        s.config = MagicMock()
+        s.config.recovery_emission = RecoveryEmissionConfig()
+        s.event_store = None
+        s._recovery_veto_tracker = RecoveryVetoStreakTracker()
+        return s
+
+    def _hold(self):
+        """One hold, described by both adapters: same reason, shape, records."""
+        from orchestrator.recovery_emission import LeaveReason
+
+        rows = [
+            Escalation(
+                id='esc-b', task_id='T1', agent_role='implementer',
+                severity='blocking', category='infra_issue', summary='held',
+                level=1,
+            ),
+            Escalation(
+                id='esc-a', task_id='T1', agent_role='implementer',
+                severity='blocking', category='infra_issue', summary='held',
+                level=1,
+            ),
+        ]
+        return LeaveReason.escalation_pinned, 'blocked|False|unknown|True|-', rows
+
+    def _expected(self, reason, shape, rows) -> str:
+        from orchestrator.recovery_emission import pin_buckets, veto_signature
+
+        return veto_signature(
+            reason, shape,
+            pin_buckets('T1', rows, store_unavailable=False).buckets,
+        )
+
+    def test_the_same_hold_signs_identically_at_both_sites(self):
+        from orchestrator.recovery_emission import RecoverySite
+
+        reason, shape, rows = self._hold()
+        expected = self._expected(reason, shape, rows)
+
+        h = self._bare_harness()
+        h._emit_recovery_disposition(
+            'T1',
+            site=RecoverySite.already_landed_gate,
+            reason=reason,
+            shape=shape,
+            records=rows,
+        )
+        s = self._bare_scheduler()
+        s._emit_recovery_disposition(
+            'T1', reason=reason, shape=shape, rows=rows,
+        )
+
+        assert h._recovery_veto_tracker.observe(
+            RecoverySite.already_landed_gate, 'T1', expected,
+        ).changed is False, 'the harness adapter signed this hold differently'
+        assert s._recovery_veto_tracker.observe(
+            RecoverySite.scheduler_blocked_redispatch, 'T1', expected,
+        ).changed is False, 'the scheduler adapter signed this hold differently'
+
+    def test_neither_adapter_is_sensitive_to_record_order(self):
+        """Store order is not guaranteed stable, and an order-sensitive
+        signature would re-emit the SAME hold on every reshuffle."""
+        from orchestrator.recovery_emission import RecoverySite
+
+        reason, shape, rows = self._hold()
+
+        h = self._bare_harness()
+        h._emit_recovery_disposition(
+            'T1', site=RecoverySite.already_landed_gate, reason=reason,
+            shape=shape, records=rows,
+        )
+        s = self._bare_scheduler()
+        s._emit_recovery_disposition(
+            'T1', reason=reason, shape=shape, rows=list(reversed(rows)),
+        )
+
+        expected = self._expected(reason, shape, rows)
+        assert h._recovery_veto_tracker.observe(
+            RecoverySite.already_landed_gate, 'T1', expected,
+        ).changed is False
+        assert s._recovery_veto_tracker.observe(
+            RecoverySite.scheduler_blocked_redispatch, 'T1', expected,
+        ).changed is False
+
+    def test_both_adapters_bucket_a_store_outage_the_same_way(self):
+        """The other half they used to hand-roll: ``records=None`` is
+        classify_pins' third state at BOTH sites, never an empty list."""
+        from orchestrator.recovery_emission import (
+            LeaveReason,
+            RecoverySite,
+            pin_buckets,
+            veto_signature,
+        )
+
+        reason = LeaveReason.escalation_store_unavailable
+        shape = 'blocked|False|unknown|unknown|-'
+        expected = veto_signature(
+            reason, shape,
+            pin_buckets('T1', None, store_unavailable=True).buckets,
+        )
+
+        h = self._bare_harness()
+        h._emit_recovery_disposition(
+            'T1', site=RecoverySite.already_landed_gate, reason=reason,
+            shape=shape, records=None, store_unavailable=True,
+        )
+        s = self._bare_scheduler()
+        s._emit_recovery_disposition(
+            'T1', reason=reason, shape=shape, rows=None,
+        )
+
+        assert h._recovery_veto_tracker.observe(
+            RecoverySite.already_landed_gate, 'T1', expected,
+        ).changed is False
+        assert s._recovery_veto_tracker.observe(
+            RecoverySite.scheduler_blocked_redispatch, 'T1', expected,
+        ).changed is False

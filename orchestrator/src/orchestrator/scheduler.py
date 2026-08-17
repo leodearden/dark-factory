@@ -53,8 +53,10 @@ from orchestrator.recovery_emission import (
     build_recovery_payload,
     emit_recovery_event,
     escalation_ages_secs,
+    pin_buckets,
     render_shape,
     should_emit_event,
+    veto_signature,
 )
 from orchestrator.streaks import StreakCounter, StreakRegistry
 from orchestrator.task_status import ACTIVE_TASK_STATUSES, TERMINAL_STATUSES
@@ -6088,21 +6090,13 @@ class Scheduler:
                 tracker = RecoveryVetoStreakTracker()
                 self._recovery_veto_tracker = tracker
 
-            from escalation.pins import classify_pins  # noqa: PLC0415
-
-            # classify_pins is consulted ONLY to bucket the ids for the payload
-            # and never for the veto answer — that stays the caller's own
-            # untouched ``bool(rows)`` predicate (rewiring it is task 3541).
-            pins = classify_pins(
-                task_id or '',
-                None if store_unavailable else list(rows or ()),
-                live_claimant=False,
-            )
-            buckets = {
-                'dead_l0': list(pins.dead_l0),
-                'queue_handoff': list(pins.queue_handoff),
-                'non_pinning': list(pins.non_pinning),
-            }
+            # Shared with the Harness's twin adapter rather than hand-rolled
+            # here: classify_pins is consulted ONLY to bucket the ids for the
+            # payload and never for the veto answer — that stays the caller's
+            # own untouched ``bool(rows)`` predicate (rewiring it is task
+            # 3541).
+            pins = pin_buckets(task_id, rows, store_unavailable=store_unavailable)
+            buckets = pins.buckets
 
             if task_id is None:
                 if getattr(self, '_recovery_queue_absent_emitted', False):
@@ -6110,10 +6104,11 @@ class Scheduler:
                 self._recovery_queue_absent_emitted = True
                 streak = 1
             else:
-                signature = '|'.join((
-                    str(reason), shape,
-                    ','.join(sorted(i for ids in buckets.values() for i in ids)),
-                ))
+                # ONE definition of this format, shared with the Harness's
+                # twin adapter: it decides "unchanged hold, stay quiet" versus
+                # "new fact, emit", so two sites spelling it differently would
+                # diverge on cadence with nothing failing.
+                signature = veto_signature(reason, shape, buckets)
                 observation = tracker.observe(
                     RecoverySite.scheduler_blocked_redispatch, task_id, signature,
                 )
@@ -6156,6 +6151,43 @@ class Scheduler:
             logger.warning(
                 'Task %s: recovery-disposition emission failed (non-fatal): %s',
                 task_id, exc,
+            )
+
+    def _release_recovery_veto_streaks(self, observed: set[str]) -> None:
+        """End-of-tick: pop every streak this phase did NOT re-observe.
+
+        ``_emit_recovery_disposition`` seeds a ``(site, task_id)`` tracker
+        entry for every task it describes, and this phase runs per dispatch
+        TICK — so without a release edge a task vetoed once here and then gone
+        done or cancelled would leave its entry behind for the life of the
+        process, which is precisely the unbounded growth
+        ``RecoveryVetoStreakTracker.clear``'s docstring says the pop exists to
+        prevent.
+
+        Driven off the tick's own observed set rather than a per-task "the
+        hold ended" signal, for the same reason the Harness's same-named method
+        is driven off its sweep tally: a task can stop being held by leaving
+        the candidate set entirely, and an edge that only fired for a task this
+        phase still visits would never see that.
+
+        Footprint-only, unlike the Harness's version: this site is deliberately
+        absent from ``STREAK_CHARGING_SITES``, so there is no alarm to resolve
+        — and resolving one here would stand down a record only the
+        sweep-frequency sites are entitled to file.
+
+        Whole-body guarded: bookkeeping never aborts a tick phase.
+        """
+        try:
+            tracker = getattr(self, '_recovery_veto_tracker', None)
+            if tracker is None:
+                return
+            site = str(RecoverySite.scheduler_blocked_redispatch)
+            for tracked_site, tid in tuple(tracker.tracked()):
+                if str(tracked_site) == site and tid not in observed:
+                    tracker.clear(tracked_site, tid)
+        except Exception as exc:  # noqa: BLE001 — bookkeeping never aborts a tick
+            logger.warning(
+                'recovery veto-streak release failed (non-fatal): %s', exc,
             )
 
     async def _phase_redispatch_stranded_blocked(self, ctx: TickContext) -> object:
@@ -6252,6 +6284,11 @@ class Scheduler:
 
         now = self._wall_now()
         ttl = timedelta(seconds=self.config.claimant_liveness_ttl_secs)
+        # Every task this tick DESCRIBED a skip for.  Read as the complement
+        # at the end of the loop: a tracked task absent from it has stopped
+        # being held here (or left the candidate set entirely), so its streak
+        # entry is popped rather than left to accumulate on a per-tick path.
+        described: set[str] = set()
 
         for task in ctx.tasks:
             if task.get('status') != 'blocked':
@@ -6300,6 +6337,7 @@ class Scheduler:
                         tid,
                         exc_info=True,
                     )
+                    described.add(tid)
                     self._emit_recovery_disposition(
                         tid,
                         reason=LeaveReason.escalation_store_unavailable,
@@ -6316,6 +6354,7 @@ class Scheduler:
                 # emission adapter for id bucketing only, never for this
                 # answer.
                 if rows:
+                    described.add(tid)
                     self._emit_recovery_disposition(
                         tid,
                         reason=LeaveReason.escalation_pinned,
@@ -6359,7 +6398,19 @@ class Scheduler:
                     tid,
                     exc_info=True,
                 )
+                # DESCRIBED, so the release below leaves this task's streak
+                # alone: the isolation guard means the phase never reached its
+                # verdict, and popping on an unknown verdict would read as
+                # "the hold ended" — the opposite of what an exception says.
+                described.add(tid)
                 continue
+
+        # Complement of `described`: every tracked task this tick did not
+        # describe has stopped being held here (task 3535 amendment — see
+        # _release_recovery_veto_streaks).  After the loop, so a task the loop
+        # skipped for ANY reason (dispatched, cooling down, no longer stranded)
+        # releases too, not just one that reached the veto arms.
+        self._release_recovery_veto_streaks(described)
 
         return _CONTINUE
 

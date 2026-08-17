@@ -1163,3 +1163,122 @@ class TestBlockedRedispatchZeroDispositionChange:
 
         assert result is _CONTINUE
         assert scheduler.set_task_status.await_count == 0  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+class TestBlockedRedispatchReleasesItsVetoStreak:
+    """The phase pops its tracker entries at end of tick (amendment, cycle 1).
+
+    This site runs per dispatch TICK and charges no alarm, so its tracker
+    entries are pure footprint — and without a release edge a task vetoed here
+    once and then gone done would leave its entry behind for the life of the
+    process.  That is exactly the growth
+    ``RecoveryVetoStreakTracker.clear``'s docstring says the pop exists to
+    prevent, and the per-tick sites are where the loss would actually happen.
+    """
+
+    def _tracked(self, scheduler: Scheduler) -> list[tuple[str, str]]:
+        tracker = getattr(scheduler, '_recovery_veto_tracker', None)
+        return [] if tracker is None else list(tracker.tracked())
+
+    async def _tick(self, scheduler: Scheduler, task: dict) -> None:
+        await scheduler._phase_redispatch_stranded_blocked(
+            _ctx_with_done_dep(task),
+        )
+
+    async def test_a_hold_that_ends_pops_the_entry(self, tmp_path: Path):
+        scheduler = _emitting_scheduler(tmp_path)
+        queue = _FakeEscalationQueue({'T1': [_esc('esc-1')]})
+        scheduler.escalation_queue = queue  # type: ignore[assignment]
+
+        await self._tick(scheduler, _blocked_task('T1'))
+        assert self._tracked(scheduler) == [
+            ('scheduler_blocked_redispatch', 'T1'),
+        ]
+
+        # The escalation is resolved: the task is no longer held, and this
+        # tick redispatches it instead.
+        queue._by_task['T1'] = []
+        await self._tick(scheduler, _blocked_task('T1'))
+
+        assert self._tracked(scheduler) == [], (
+            'a tick that described no hold for T1 must pop its streak'
+        )
+
+    async def test_a_task_that_leaves_the_candidate_set_pops_too(
+        self, tmp_path: Path,
+    ):
+        """The case a per-task 'the hold ended' signal can never deliver: the
+        task went done/cancelled, so this phase never looks at it again."""
+        scheduler = _emitting_scheduler(tmp_path)
+        scheduler.escalation_queue = _FakeEscalationQueue(  # type: ignore[assignment]
+            {'T1': [_esc('esc-1')]},
+        )
+
+        await self._tick(scheduler, _blocked_task('T1'))
+        assert self._tracked(scheduler)
+
+        # T1 is gone from ctx.tasks entirely; only an unrelated task remains.
+        await self._tick(scheduler, _blocked_task('T2'))
+
+        assert self._tracked(scheduler) == []
+
+    async def test_a_hold_that_returns_starts_a_fresh_streak(
+        self, tmp_path: Path,
+    ):
+        """The pop is a RELEASE, not a mute: the same hold reappearing is a
+        new fact and must announce itself again (streak back to 1)."""
+        scheduler = _emitting_scheduler(tmp_path)
+        queue = _FakeEscalationQueue({'T1': [_esc('esc-1')]})
+        scheduler.escalation_queue = queue  # type: ignore[assignment]
+
+        await self._tick(scheduler, _blocked_task('T1'))
+        queue._by_task['T1'] = []
+        await self._tick(scheduler, _blocked_task('T1'))
+        queue._by_task['T1'] = [_esc('esc-1')]
+        await self._tick(scheduler, _blocked_task('T1'))
+
+        rows = _recovery_rows(scheduler)
+        assert [r['data']['streak'] for r in rows] == [1, 1], (
+            f'a released-and-returned hold must re-announce at streak 1: {rows}'
+        )
+
+    async def test_an_isolated_exception_does_not_pop_the_entry(
+        self, tmp_path: Path,
+    ):
+        """The isolation guard means the phase never reached a verdict for
+        that task — popping would read as 'the hold ended', which is the
+        opposite of what an exception says."""
+        scheduler = _emitting_scheduler(tmp_path)
+        queue = _FakeEscalationQueue({'T1': [_esc('esc-1')]})
+        scheduler.escalation_queue = queue  # type: ignore[assignment]
+
+        await self._tick(scheduler, _blocked_task('T1'))
+        assert self._tracked(scheduler)
+
+        scheduler.escalation_queue = _RaisingEscalationQueue(  # type: ignore[assignment]
+            RuntimeError('boom'),
+        )
+        scheduler._emit_recovery_disposition = MagicMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError('boom'),
+        )
+        await self._tick(scheduler, _blocked_task('T1'))
+
+        assert self._tracked(scheduler) == [
+            ('scheduler_blocked_redispatch', 'T1'),
+        ], 'an unknown verdict must not be read as a released hold'
+
+    async def test_the_release_never_breaks_the_tick(self, tmp_path: Path):
+        """Bookkeeping is never load-bearing: a tracker that raises must not
+        abort a tick phase."""
+        scheduler = _emitting_scheduler(tmp_path)
+        scheduler.escalation_queue = _FakeEscalationQueue()  # type: ignore[assignment]
+        scheduler._recovery_veto_tracker = MagicMock()
+        scheduler._recovery_veto_tracker.tracked = MagicMock(
+            side_effect=RuntimeError('tracker is gone'),
+        )
+
+        await self._tick(scheduler, _blocked_task('T1'))
+
+        flip: AsyncMock = scheduler.set_task_status  # type: ignore[assignment]
+        flip.assert_awaited_once_with('T1', 'pending')

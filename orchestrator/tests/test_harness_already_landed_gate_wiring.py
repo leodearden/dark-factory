@@ -2361,3 +2361,98 @@ class TestAlreadyLandedGateZeroDispositionChange:
 
         assert result is False
         cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+
+
+@pytest.mark.asyncio
+class TestAlreadyLandedGateReleasesItsVetoStreak:
+    """The gate pops its tracker entry when the hold ends (amendment, cycle 1).
+
+    This site runs per dispatch TICK and charges no alarm, so its tracker entry
+    is pure footprint — and without a release edge a task vetoed here once and
+    then gone done would leave that entry behind for the life of the process.
+    That is exactly the growth ``RecoveryVetoStreakTracker.clear``'s docstring,
+    ``Harness.__init__``'s comment and
+    ``test_clear_pops_the_entry_so_the_footprint_stays_bounded`` all say the pop
+    exists to prevent — pinned HERE at the wiring level, where the bound is
+    actually delivered or lost.
+    """
+
+    def _gate_entries(self, h: Harness) -> list[tuple[str, str]]:
+        from orchestrator.recovery_emission import RecoverySite
+
+        return [
+            (site, tid) for site, tid in h._recovery_veto_tracker.tracked()
+            if site == RecoverySite.already_landed_gate
+        ]
+
+    async def test_a_hold_that_ends_pops_the_entry(
+        self, mock_orch_config, tmp_path,
+    ) -> None:
+        h = _emitting_harness(mock_orch_config, tmp_path)
+        h._escalation_queue = _queue_with_open(
+            _open_escalation('esc-42-9', level=2),
+        )
+
+        assert await h._already_landed_dispatch_gate('42') is False
+        assert self._gate_entries(h) == [('already_landed_gate', '42')]
+
+        # The escalation is resolved; nothing pins the task any more.
+        cast(MagicMock, h._escalation_queue).get_by_task = MagicMock(
+            return_value=[],
+        )
+        assert await h._already_landed_dispatch_gate('42') is True
+
+        assert self._gate_entries(h) == [], (
+            'a gate pass that found no hold must pop the streak, not leave it'
+        )
+
+    async def test_a_never_held_task_leaves_no_entry_at_all(
+        self, mock_orch_config, tmp_path,
+    ) -> None:
+        """The healthy majority of dispatch ticks: no hold, no footprint."""
+        h = _emitting_harness(mock_orch_config, tmp_path)
+        h._escalation_queue = _queue_with_open()
+
+        for _ in range(5):
+            assert await h._already_landed_dispatch_gate('42') is True
+
+        assert self._gate_entries(h) == []
+
+    async def test_a_hold_that_returns_starts_a_fresh_streak(
+        self, mock_orch_config, tmp_path,
+    ) -> None:
+        """The pop is a RELEASE, not a mute: the same hold reappearing is a new
+        fact and must announce itself again (streak back to 1)."""
+        h = _emitting_harness(mock_orch_config, tmp_path)
+        h._escalation_queue = _queue_with_open(
+            _open_escalation('esc-42-9', level=2),
+        )
+
+        await h._already_landed_dispatch_gate('42')
+        cast(MagicMock, h._escalation_queue).get_by_task = MagicMock(
+            return_value=[],
+        )
+        await h._already_landed_dispatch_gate('42')
+        cast(MagicMock, h._escalation_queue).get_by_task = MagicMock(
+            return_value=[_open_escalation('esc-42-9', level=2)],
+        )
+        await h._already_landed_dispatch_gate('42')
+
+        rows = _recovery_rows(h)
+        assert [r['data']['streak'] for r in rows] == [1, 1], (
+            f'a released-and-returned hold must re-announce at streak 1: {rows}'
+        )
+
+    async def test_the_release_never_breaks_the_gate(
+        self, mock_orch_config, tmp_path,
+    ) -> None:
+        """Bookkeeping is never load-bearing: a tracker that raises must not
+        turn a healthy flip into a gate exception."""
+        h = _emitting_harness(mock_orch_config, tmp_path)
+        h._escalation_queue = _queue_with_open()
+        h._recovery_veto_tracker = MagicMock()
+        h._recovery_veto_tracker.clear = MagicMock(
+            side_effect=RuntimeError('tracker is gone'),
+        )
+
+        assert await h._already_landed_dispatch_gate('42') is True

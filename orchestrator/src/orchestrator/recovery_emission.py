@@ -105,17 +105,21 @@ __all__ = [
     'AgeableRecord',
     'LeaveReason',
     'Observation',
+    'PinBuckets',
     'RecoverySite',
     'RecoverySweepTally',
     'RecoveryVetoStreakTracker',
+    'SWEEP_SUMMARY_ID_CAP',
     'as_ageable_records',
     'build_recovery_payload',
     'emit_recovery_event',
     'emit_recovery_veto_streak_escalation',
     'escalation_ages_secs',
+    'pin_buckets',
     'render_shape',
     'resolve_recovery_veto_streak_escalation',
     'should_emit_event',
+    'veto_signature',
 ]
 
 
@@ -350,6 +354,95 @@ def as_ageable_records(records: Any) -> list[AgeableRecord]:
         except Exception:  # noqa: BLE001 — a corrupt record must not abort a sweep
             logger.debug('recovery emission: skipping an unreadable escalation record')
     return adapted
+
+
+@dataclass(frozen=True)
+class PinBuckets:
+    """``classify_pins``' three id buckets plus its store-unavailable verdict.
+
+    The two facts travel together because every consumer needs both: the
+    buckets go into the payload and the signature, and ``store_unavailable``
+    is OR-ed into the caller's own flag (a store the caller read fine can
+    still be reported unreadable by ``classify_pins`` itself).
+    """
+
+    #: ``{'dead_l0': [...], 'queue_handoff': [...], 'non_pinning': [...]}``.
+    buckets: dict[str, list[str]]
+    #: ``PinReport.store_unavailable`` — never inferred from an empty bucket.
+    store_unavailable: bool
+
+
+def pin_buckets(
+    task_id: str | None,
+    records: Any,
+    *,
+    store_unavailable: bool,
+) -> PinBuckets:
+    """Bucket *records* for the payload — never for the veto ANSWER.
+
+    The one place ``classify_pins`` is called from this mechanism.  Both
+    adapters (``Harness._emit_recovery_disposition`` and its twin in
+    ``Scheduler``) previously hand-rolled this call and the three-key dict
+    verbatim; a per-site copy is how the same predicate ends up spelled five
+    slightly-different ways (see :func:`as_ageable_records`' docstring for the
+    same argument), and here a drifted bucket set would silently change the
+    veto SIGNATURE — see :func:`veto_signature`.
+
+    ``store_unavailable=True`` passes ``records=None`` down to
+    ``classify_pins``, which is its documented third state: a read that FAILED
+    must never be collapsed into "no records", because a false ``[]`` reads as
+    "nothing held this task" (the esc-3163 collapse).
+
+    Consulted for id bucketing and reason selection ONLY.  Every call site
+    keeps its own veto predicate (``bool(rows)`` /
+    ``bool(report.open_escalations)``) byte-identical — rewiring those to
+    ``PinReport.pins`` is task eta (3541), and doing it here would change
+    dispositions.
+    """
+    from escalation.pins import classify_pins  # noqa: PLC0415
+
+    pins = classify_pins(
+        task_id or '',
+        None if store_unavailable else list(records or ()),
+        live_claimant=False,
+    )
+    return PinBuckets(
+        buckets={
+            'dead_l0': list(pins.dead_l0),
+            'queue_handoff': list(pins.queue_handoff),
+            'non_pinning': list(pins.non_pinning),
+        },
+        store_unavailable=bool(pins.store_unavailable),
+    )
+
+
+def veto_signature(
+    reason: LeaveReason | str | None,
+    shape: str,
+    buckets: Any,
+) -> str:
+    """Render the ``reason|shape|sorted ids`` veto signature.
+
+    **The single definition of this format**, because it is load-bearing in a
+    way the payload is not: :class:`RecoveryVetoStreakTracker` decides whether
+    a hold is UNCHANGED (stay quiet, keep climbing the streak) or NEW (emit) by
+    comparing two of these strings.  Spelled per-site, the same hold observed
+    at a sweep site and at a tick site could produce unequal signatures and the
+    two sites' cadence gating would diverge silently — an emission bug with no
+    failing assertion anywhere.
+
+    Ids are flattened across buckets and SORTED: two identical vetoes must
+    produce two identical signatures, and store order is not guaranteed stable.
+    The bucket NAMES are deliberately not in the signature — a record moving
+    between ``queue_handoff`` and ``dead_l0`` (an L0 whose claimant died) is
+    the same hold by the same record, not a new fact to re-emit.
+    """
+    ids = (buckets or {}).values() if isinstance(buckets, dict) else (buckets or (),)
+    return '|'.join((
+        str(reason),
+        str(shape),
+        ','.join(sorted(str(i) for group in ids for i in (group or ()))),
+    ))
 
 
 def _jsonable(value: Any) -> Any:
@@ -587,6 +680,26 @@ class RecoveryVetoStreakTracker:
         the pop is the footprint contract: the reconcile sweep visits every
         in-progress and blocked task, so a tracker that zeroed instead of
         popping would grow one entry per task ever swept.
+
+        The contract binds only as far as its CALLERS reach, so every emitting
+        site owns a release edge and they are listed here rather than left to
+        be rediscovered:
+
+        * ``reconcile_sweep`` / ``deterministic_recon_sweep`` /
+          ``deterministic_recon_deploy`` — ``Harness._release_recovery_veto_
+          streaks``, driven off each sweep's own tally, which also resolves the
+          alarm those sites charge;
+        * ``scheduler_blocked_redispatch`` — ``Scheduler._release_recovery_
+          veto_streaks``, driven off the tick's observed set;
+        * ``already_landed_gate`` — the gate's own no-hold fall-through.
+
+        The last two charge no alarm (they are absent from
+        :data:`STREAK_CHARGING_SITES`), so their release is footprint-only and
+        pops without resolving anything.  Their bound is one entry per task
+        held at that site when it last ran: a task vetoed there and then never
+        re-visited — it went done or cancelled while pinned — keeps its entry
+        until the process restarts, because neither site sweeps a candidate set
+        that would ever mention it again.
         """
         dropped = self._streaks.pop(self._key(site, task_id), None)
         return dropped.count if dropped is not None else 0
@@ -956,6 +1069,13 @@ def resolve_recovery_veto_streak_escalation(
     return True
 
 
+#: How many pinning escalation ids the sweep summary NAMES before it renders
+#: the remainder as a bare count.  Sized to stay inside one readable log line
+#: while still naming more holds than a healthy fleet ever has at once; the
+#: full list stays available on ``RecoverySweepTally.pinning_ids``.
+SWEEP_SUMMARY_ID_CAP = 12
+
+
 @dataclass
 class RecoverySweepTally:
     """One reconcile pass's aggregate recovery picture.
@@ -984,8 +1104,15 @@ class RecoverySweepTally:
     #: first-seen ACROSS successive :meth:`record` calls, and sorted WITHIN one
     #: call's own id set (``_flatten_ids`` sorts what it flattens).  Entries
     #: arrive as records or as bare id strings and are normalised to ids by
-    #: :func:`_entry_id` — never as reprs.
+    #: :func:`_entry_id` — never as reprs.  Uncapped: :meth:`render` caps what
+    #: it PRINTS, but a consumer reading the field gets every id.
     pinning_ids: list[str] = field(default_factory=list)
+    #: Membership index over ``pinning_ids``, so :meth:`record` does not
+    #: re-scan the list per id (that scan is O(n^2) across a pass in which many
+    #: tasks are held by many records).  Derived state, never read directly:
+    #: excluded from ``repr``/``==`` so the tally still compares and prints as
+    #: the value object its callers treat it as.
+    _seen_ids: set[str] = field(default_factory=set, repr=False, compare=False)
     #: LeaveReason spelling -> count, for every NON-veto fall-through.
     left: dict[str, int] = field(default_factory=dict)
     #: Dispositions that went ahead UNCHANGED while the store was unreadable.
@@ -1012,7 +1139,8 @@ class RecoverySweepTally:
         if str(reason) == LeaveReason.escalation_pinned:
             self.held += 1
             for esc_id in _flatten_ids(escalation_ids):
-                if esc_id not in self.pinning_ids:
+                if esc_id not in self._seen_ids:
+                    self._seen_ids.add(esc_id)
                     self.pinning_ids.append(esc_id)
             return
         key = str(reason)
@@ -1028,10 +1156,26 @@ class RecoverySweepTally:
         self.store_unavailable += 1
 
     def render(self) -> str:
-        """The operator-facing fragment appended to the sweep summary."""
+        """The operator-facing fragment appended to the sweep summary.
+
+        The id list is CAPPED at :data:`SWEEP_SUMMARY_ID_CAP` and the remainder
+        rendered as ``+K more``.  The line is logged unconditionally on every
+        pass, so on a fleet where many tasks are simultaneously pinned an
+        uncapped list would re-print hundreds of ids every
+        ``stranded_reconcile_interval_secs`` for as long as the strands last —
+        the same INV-4 spam the event cadence is gated on, just expressed as
+        one unbounded line instead of many rows.  The capped prefix still names
+        the holds an operator acts on first, and ``pinning_ids`` keeps every id
+        for a consumer that wants them all.
+        """
         held = f'held={self.held}'
         if self.pinning_ids:
-            held += f' ({", ".join(self.pinning_ids)})'
+            shown = self.pinning_ids[:SWEEP_SUMMARY_ID_CAP]
+            overflow = len(self.pinning_ids) - len(shown)
+            rendered = ', '.join(shown)
+            if overflow > 0:
+                rendered += f', +{overflow} more'
+            held += f' ({rendered})'
         left = f'left={sum(self.left.values())}'
         if self.left:
             breakdown = ', '.join(

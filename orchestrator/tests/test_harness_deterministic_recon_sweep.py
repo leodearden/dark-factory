@@ -2033,3 +2033,130 @@ class TestDeterministicReconStreakReleaseIsSiteScoped:
             'the deterministic sweep still holds this task — its shared alarm '
             'must not be stood down by the other sweep'
         )
+
+
+class TestDeterministicReconQueueAbsentNoticeReArms:
+    """The queue-absent latch RE-ARMS when the queue comes back (cycle 1).
+
+    The Scheduler's twin latch already does this, with the reason spelled out
+    at its re-arm line: the escalation queue is attribute-injected AFTER
+    construction, so queue-absent is a state a process genuinely leaves, and a
+    latch that never re-armed would silently swallow a LATER outage — leaving
+    the second, arguably more alarming, outage completely unannounced.  Both
+    adapters must carry the same latch semantics, so it is pinned for the
+    harness sites too.
+    """
+
+    def _sweep_ready(self, h: Harness) -> None:
+        """Wire the sweep to find nothing, so it reaches its normal end."""
+        h.scheduler.get_tasks = AsyncMock(return_value=[])
+        h._escalation_queue.get_pending = MagicMock(return_value=[])  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_a_second_sweep_outage_is_announced_again(
+        self, tmp_path: Path,
+    ) -> None:
+        h = _emitting_recon_harness(tmp_path)
+        queue = h._escalation_queue
+
+        h._escalation_queue = None
+        await h._run_deterministic_recon_sweep()
+
+        h._escalation_queue = queue
+        self._sweep_ready(h)
+        await h._run_deterministic_recon_sweep()
+
+        h._escalation_queue = None
+        await h._run_deterministic_recon_sweep()
+
+        rows = _recon_recovery_rows(h)
+        assert len(rows) == 2, (
+            f'a LATER outage must not be swallowed by the first latch: {rows}'
+        )
+        assert [r['data']['site'] for r in rows] == [
+            'deterministic_recon_sweep', 'deterministic_recon_sweep',
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_second_deploy_outage_is_announced_again(
+        self, tmp_path: Path,
+    ) -> None:
+        h = _emitting_recon_harness(tmp_path)
+        queue = h._escalation_queue
+        task = _pinned_deploy_strand()
+
+        h._escalation_queue = None
+        await h._recover_stranded_deterministic_task(
+            'tid-pinned', task, task['metadata'],
+        )
+
+        # A pass that CAN read the queue re-arms the notice (this one finds a
+        # pending record and dedups, which is enough to have read the store).
+        h._escalation_queue = queue
+        await h._recover_stranded_deterministic_task(
+            'tid-pinned', task, task['metadata'],
+        )
+
+        h._escalation_queue = None
+        await h._recover_stranded_deterministic_task(
+            'tid-pinned', task, task['metadata'],
+        )
+
+        notices = [
+            r for r in _recon_recovery_rows(h) if r['task_id'] is None
+        ]
+        assert len(notices) == 2, (
+            f'a LATER outage must not be swallowed by the first latch: {notices}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_re_arming_one_site_never_un_silences_the_other(
+        self, tmp_path: Path,
+    ) -> None:
+        """The latch is per SITE, and so is the re-arm."""
+        h = _emitting_recon_harness(tmp_path)
+        queue = h._escalation_queue
+        task = _pinned_deploy_strand()
+
+        h._escalation_queue = None
+        await h._run_deterministic_recon_sweep()
+        await h._recover_stranded_deterministic_task(
+            'tid-pinned', task, task['metadata'],
+        )
+
+        # Only the SWEEP site sees a queue again...
+        h._escalation_queue = queue
+        self._sweep_ready(h)
+        await h._run_deterministic_recon_sweep()
+
+        h._escalation_queue = None
+        await h._run_deterministic_recon_sweep()
+        await h._recover_stranded_deterministic_task(
+            'tid-pinned', task, task['metadata'],
+        )
+
+        notices = [
+            r['data']['site'] for r in _recon_recovery_rows(h)
+            if r['task_id'] is None
+        ]
+        # ...so the sweep re-announces and the deploy half stays latched.
+        assert notices == [
+            'deterministic_recon_sweep',
+            'deterministic_recon_deploy',
+            'deterministic_recon_sweep',
+        ]
+
+    def test_the_latch_survives_a_new_built_harness(self) -> None:
+        """``Harness.__init__`` declares the latch alongside the other 3535
+        state, but several narrow-scope suites (this one included) build a
+        Harness via ``__new__`` — so the accessor stays getattr-tolerant and
+        must hand back one STABLE set, not a fresh one per call.  A fresh set
+        each time would re-arm every notice on every read and turn the
+        one-shot latch into one row per pass."""
+        h = _make_recon_harness()
+
+        first = h._recovery_process_latch()
+        first.add('deterministic_recon_sweep')
+
+        assert h._recovery_process_latch() is first
+        assert h._recovery_process_notices == {'deterministic_recon_sweep'}

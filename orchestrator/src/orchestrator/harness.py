@@ -102,9 +102,11 @@ from orchestrator.recovery_emission import (
     emit_recovery_event,
     emit_recovery_veto_streak_escalation,
     escalation_ages_secs,
+    pin_buckets,
     render_shape,
     resolve_recovery_veto_streak_escalation,
     should_emit_event,
+    veto_signature,
 )
 from orchestrator.repo_paths import (
     rejected_dark_factory_root_override,
@@ -1810,8 +1812,10 @@ class Harness:
         # durable: a fleet restart re-arms every signature, which is exactly
         # the D5 signal that the first post-deploy sweep names each currently-
         # stranded task's pinning escalation ids.  Entries are popped when a
-        # task stops being held, so this stays proportional to the number of
-        # CURRENTLY-held tasks rather than growing over a weeks-long run.
+        # task stops being held — every emitting site owns a release edge, and
+        # RecoveryVetoStreakTracker.clear's docstring lists them and states the
+        # exact bound each one buys — so this stays proportional to the number
+        # of CURRENTLY-held tasks rather than growing over a weeks-long run.
         self._recovery_veto_tracker = RecoveryVetoStreakTracker()
         # task_id -> streak at the last time we asked the escalation queue
         # whether a veto-streak alarm was already open (same memo contract as
@@ -1819,6 +1823,15 @@ class Harness:
         # glob+parse off the per-sweep path).  Popped on recovery so a later
         # recurrence re-files.
         self._recovery_streak_filed_at: dict[str, int] = {}
+        # Sites that have already announced "this whole site has no escalation
+        # queue to read" (task 3535).  PROCESS-scoped, so it is latched rather
+        # than tracked — there is no per-subject signature for a notice with no
+        # subject.  RE-ARMED per site the moment that site sees a queue again
+        # (mirrors Scheduler._recovery_queue_absent_emitted): the queue is
+        # attribute-injected after construction, so "absent" is a state this
+        # process genuinely leaves, and a latch that never re-armed would
+        # silently swallow a LATER outage at that site.
+        self._recovery_process_notices: set[str] = set()
 
         # Consecutive terminal-status poll counts per task.  Incremented each
         # poll a workflow is terminal but still active; reset when it is no
@@ -9683,37 +9696,28 @@ class Harness:
                 tracker = RecoveryVetoStreakTracker()
                 self._recovery_veto_tracker = tracker
 
-            from escalation.pins import classify_pins  # noqa: PLC0415
-
-            # records=None is classify_pins' store-unavailable third state —
-            # never collapsed into "no records", which would read as a task
-            # with nothing holding it.
-            pins = classify_pins(
-                task_id or '',
-                None if store_unavailable else list(records or ()),
-                live_claimant=False,
+            # Shared with the Scheduler's twin adapter rather than hand-rolled
+            # here: classify_pins is consulted for BUCKETING only (never for
+            # the veto answer), and records=None carries its store-unavailable
+            # third state, which must never collapse into "no records".
+            pins = pin_buckets(
+                task_id, records, store_unavailable=store_unavailable,
             )
-            buckets = {
-                'dead_l0': list(pins.dead_l0),
-                'queue_handoff': list(pins.queue_handoff),
-                'non_pinning': list(pins.non_pinning),
-            }
+            buckets = pins.buckets
 
             observation = None
             if task_id is None:
-                latched = getattr(self, '_recovery_process_notices', None)
-                if latched is None:
-                    latched = set()
-                    self._recovery_process_notices = latched
+                latched = self._recovery_process_latch()
                 if str(site) in latched:
                     return None
                 latched.add(str(site))
                 streak = 1
             else:
-                signature = '|'.join((
-                    str(reason), shape,
-                    ','.join(sorted(i for ids in buckets.values() for i in ids)),
-                ))
+                # ONE definition of this format, shared with the Scheduler's
+                # twin adapter: it decides "unchanged hold, stay quiet" versus
+                # "new fact, emit", so two sites spelling it differently would
+                # diverge on cadence with nothing failing.
+                signature = veto_signature(reason, shape, buckets)
                 if transition_gated_by_caller:
                     tracker.clear(site, task_id)
                 observation = tracker.observe(site, task_id, signature)
@@ -9808,6 +9812,67 @@ class Harness:
             self._recovery_streak_filed_at = memo
         return memo
 
+    def _recovery_process_latch(self) -> set[str]:
+        """The per-site "no escalation queue" one-shot latch, seeded on demand.
+
+        Declared in ``__init__``; still getattr-tolerant here for the same
+        reason the tracker and the memo are (narrow-scope tests build a Harness
+        via ``__new__``).  See :meth:`_rearm_recovery_process_notice` for why a
+        latch at all, and why it must be able to re-arm.
+        """
+        latched = getattr(self, '_recovery_process_notices', None)
+        if latched is None:
+            latched = set()
+            self._recovery_process_notices = latched
+        return latched
+
+    def _rearm_recovery_process_notice(self, site: RecoverySite) -> None:
+        """Re-arm *site*'s queue-absent notice now that a queue exists.
+
+        The exact counterpart of the Scheduler's
+        ``self._recovery_queue_absent_emitted = False`` line: the escalation
+        queue is attribute-injected AFTER construction, so queue-absent is a
+        state this process genuinely leaves, and a latch that never re-armed
+        would silently swallow a LATER outage at that site — leaving the
+        second, arguably more alarming, outage completely unannounced.
+
+        Per SITE, matching the latch's own granularity, so re-arming one
+        site's notice never un-silences another's.  Never raises: this is
+        bookkeeping on a sweep's fail-safe path.
+        """
+        try:
+            self._recovery_process_latch().discard(str(site))
+        except Exception as exc:  # noqa: BLE001 — bookkeeping never aborts a sweep
+            logger.warning(
+                'recovery queue-absent notice re-arm failed (non-fatal): %s', exc,
+            )
+
+    def _clear_recovery_veto_streak(
+        self, site: RecoverySite, task_id: str,
+    ) -> None:
+        """Pop ``(site, task_id)``'s streak on a site that charges no alarm.
+
+        The footprint half of :meth:`_release_recovery_veto_streaks`, for the
+        per-dispatch-TICK sites that are deliberately absent from
+        ``STREAK_CHARGING_SITES``: with no alarm to stand down, the release is
+        a bare pop, and pairing it with ``resolve_recovery_veto_streak_
+        escalation`` would let a tick-frequency site resolve an alarm only the
+        sweep sites are entitled to file or clear.
+
+        Without this edge the tracker keeps one entry per task ever vetoed at
+        such a site, which contradicts the bound stated in ``__init__`` and on
+        ``RecoveryVetoStreakTracker.clear``.  Never raises.
+        """
+        try:
+            tracker = getattr(self, '_recovery_veto_tracker', None)
+            if tracker is not None:
+                tracker.clear(site, task_id)
+        except Exception as exc:  # noqa: BLE001 — bookkeeping never aborts a tick
+            logger.warning(
+                'Task %s: recovery veto-streak clear failed (non-fatal): %s',
+                task_id, exc,
+            )
+
     def _release_recovery_veto_streaks(
         self,
         tally: RecoverySweepTally,
@@ -9842,10 +9907,24 @@ class Harness:
             cfg = getattr(self.config, 'recovery_emission', None)
             threshold = cfg.veto_streak_threshold if cfg is not None else 3
             driven = {str(s) for s in sites}
+            tracked = tuple(tracker.tracked())
             stale = [
-                (site, tid) for site, tid in tracker.tracked()
+                (site, tid) for site, tid in tracked
                 if str(site) in driven and tid not in tally.observed_task_ids
             ]
+            # Indexed ONCE, ahead of the loop: tracked() materialises a fresh
+            # tuple per call, so re-scanning it per stale entry made the
+            # release O(len(stale) x len(tracked)) with one allocation per
+            # entry — on the per-sweep path, and scaling with every site's
+            # entries rather than with this sweep's own.  The index is kept
+            # exact by discarding each key as the loop pops it, which is the
+            # only mutation the loop makes to what it indexes.
+            charging_by_task: dict[str, set[str]] = {}
+            for tracked_site, tracked_tid in tracked:
+                if tracked_site in STREAK_CHARGING_SITES:
+                    charging_by_task.setdefault(tracked_tid, set()).add(
+                        str(tracked_site),
+                    )
             for site, tid in stale:
                 # clear() RETURNS the streak it popped, which is exactly the
                 # "how long was this held" the resolver needs to decide whether
@@ -9864,11 +9943,11 @@ class Harness:
                 # This also closes the same latent hazard in the pre-existing
                 # reconcile-only path, which shares the sentinel with both
                 # deterministic sites.
-                if any(
-                    other_tid == tid and other_site in STREAK_CHARGING_SITES
-                    for other_site, other_tid in tracker.tracked()
-                ):
-                    continue
+                remaining = charging_by_task.get(tid)
+                if remaining is not None:
+                    remaining.discard(str(site))
+                    if remaining:
+                        continue
                 resolve_recovery_veto_streak_escalation(
                     escalation_queue=self._escalation_queue,
                     task_id=tid,
@@ -11538,6 +11617,19 @@ class Harness:
                 )
                 return False
 
+            # NEITHER hold binds this task any more, so its veto streak has
+            # ended: pop it.  The twin of the sink's clear_hold_observed
+            # above, and it exists for the same bounding reason — this gate
+            # runs per dispatch TICK, so without a release edge the tracker
+            # would keep one entry per task ever vetoed here for the life of
+            # the process, contradicting the footprint bound stated in
+            # __init__.  A bare pop, never a resolve: already_landed_gate is
+            # deliberately absent from STREAK_CHARGING_SITES and so has no
+            # alarm of its own to stand down.
+            self._clear_recovery_veto_streak(
+                RecoverySite.already_landed_gate, task_id,
+            )
+
         branch_tip_sha = await self.git_ops.resolve_branch_sha(branch)
         branch_exists = branch_tip_sha is not None
 
@@ -12842,6 +12934,9 @@ class Harness:
                 store_unavailable=True,
             )
             return
+        # The queue is present: re-arm this site's one-shot notice, exactly as
+        # Scheduler._phase_redispatch_stranded_blocked re-arms its own latch.
+        self._rearm_recovery_process_notice(RecoverySite.deterministic_recon_deploy)
         _dedup_rows = self._escalation_queue.get_by_task(tid, status='pending')
         if _dedup_rows:
             logger.info(
@@ -13227,6 +13322,9 @@ class Harness:
                 store_unavailable=True,
             )
             return
+        # The queue is present: re-arm this site's one-shot notice, exactly as
+        # Scheduler._phase_redispatch_stranded_blocked re-arms its own latch.
+        self._rearm_recovery_process_notice(RecoverySite.deterministic_recon_sweep)
 
         tasks = await self.scheduler.get_tasks(statuses=['blocked'])
         task_by_id: dict[str, dict] = {}
