@@ -136,3 +136,45 @@ def test_deselection_guard_rejects_a_run_where_collection_never_ran() -> None:
     assert any('exit' in p.lower() or 'returncode' in p.lower() for p in problems), (
         f'expected a problem naming the exit/return code as the reason for rejection, got: {problems}'
     )
+
+
+def test_positive_control_guard_rejects_a_run_that_collected_nothing() -> None:
+    """Regression test for task 4060's positive control (the "never present" half).
+
+    The deselection guard above proves the smoke tests are ABSENT from a
+    default root-config collection -- but that is equally satisfied by
+    smoke tests that do not exist at all (deleted, renamed, or an emptied
+    directory). Nothing in that guard alone distinguishes "deselected" from
+    "never present". The positive control (step-4) re-runs the same target
+    with the root addopts marker filter removed and requires the smoke
+    tests to actually appear; `_collection_problems` is what that control
+    is built on.
+
+    This stub reproduces the shape pytest prints when a target directory
+    truly yields nothing under an overridden addopts -- exit
+    NO_TESTS_COLLECTED (5) with no smoke-test name anywhere in the output
+    -- and pins `_collection_problems` to reject it, reporting BOTH
+    available reasons (the exit code, and the missing test name).
+    """
+    nothing_collected = subprocess.CompletedProcess(
+        args=[],
+        returncode=int(pytest.ExitCode.NO_TESTS_COLLECTED),
+        stdout='no tests ran in 0.01s\n',
+        stderr='',
+    )
+
+    problems = _collection_problems(nothing_collected)
+    assert problems, (
+        f'expected _collection_problems to reject a run that collected nothing, '
+        f'but it did not. Stub: {nothing_collected!r}'
+    )
+    assert len(problems) == 2, (
+        f'expected both reasons (exit code not OK, and smoke test name absent) to be '
+        f'reported, got {len(problems)}: {problems}'
+    )
+    assert any('exit' in p.lower() or 'returncode' in p.lower() for p in problems), (
+        f'expected a problem naming the exit/return code, got: {problems}'
+    )
+    assert any(SMOKE_TEST_NAME in p for p in problems), (
+        f'expected a problem naming the missing smoke test, got: {problems}'
+    )
