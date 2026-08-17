@@ -466,3 +466,147 @@ class TestTimeoutPathRereadOffLoop:
         assert result.transcript_turns is None, (
             f'Expected transcript_turns=None with no session_id, got {result.transcript_turns}'
         )
+
+
+# ── Normal-exit fixture ─────────────────────────────────────────────────────
+# Two assistant records whose tail is an unreaped background launch.  Borrowed
+# from TestDetectEndedAwaitingBackground::test_single_abandoned_launch_is_true
+# (test_cli_invoke_background.py:99) so the expected ended_awaiting_background
+# value is one the detector's own suite already pins, not one invented here.
+#   → transcript_turns == 2 (two type='assistant' records)
+#   → ended_awaiting_background is True (launch never followed by a reap)
+_ABANDONED_LAUNCH_RECORDS = [
+    {
+        'type': 'assistant',
+        'message': {
+            'role': 'assistant',
+            'content': [{'type': 'text', 'text': 'kick off the long build'}],
+        },
+    },
+    {
+        'type': 'assistant',
+        'message': {
+            'role': 'assistant',
+            'content': [{
+                'type': 'tool_use',
+                'name': 'Bash',
+                'input': {'command': './occt-test.sh', 'run_in_background': True},
+            }],
+        },
+    },
+]
+
+
+class TestNormalExitReadOffLoop:
+    """The normal-exit read (``cli_invoke.py:3033``, ``read_transcript_records``)
+    must read off the loop.
+
+    This site had NO direct assertion anywhere in the repo before task 3925 — no
+    test patched ``shared.cli_invoke.read_transcript_records``, and the only
+    tests reaching it did so against an empty cfg_dir (records → None).  These
+    tests add that coverage.
+
+    NOTE ON ISOLATION.  ``count_transcript_turns`` delegates to the module-global
+    ``read_transcript_records``, so a watchdog poll firing during these tests
+    would append to ``recorded`` through that indirection.  Both tests therefore
+    patch ``count_transcript_turns`` to a no-op returning None, which guarantees
+    every entry in ``recorded`` came from the normal-exit site — without which
+    ``len(recorded) == 1`` would not mean what it claims.
+    """
+
+    async def test_normal_exit_transcript_read_runs_off_the_loop_thread(self, tmp_path):
+        """The normal-exit read runs on a worker thread, once, and both derived
+        signals still fall out of the thread-returned list.
+
+        ``len(recorded) == 1`` pins the task-2761 no-double-I/O property: ONE
+        read feeds BOTH ``transcript_turns`` and ``ended_awaiting_background``.
+        That property must survive the thread hop — a refactor that offloaded
+        each derivation separately would read the file twice and still pass every
+        other assertion here.
+        """
+        loop_ident = threading.get_ident()
+        sid = str(uuid.uuid4())
+        cfg_dir = tmp_path / 'cfg'
+        cfg_dir.mkdir()
+
+        proc = _make_delayed_success_proc(0.02)
+        recorded: list[int] = []
+
+        def read_recorder(config_dir, session_id):
+            recorded.append(threading.get_ident())
+            return list(_ABANDONED_LAUNCH_RECORDS)
+
+        with (
+            patch(
+                'shared.cli_invoke.asyncio.create_subprocess_exec',
+                side_effect=_fake_exec_returning(proc),
+            ),
+            patch('shared.cli_invoke.count_transcript_turns', return_value=None),
+            patch('shared.cli_invoke.read_transcript_records', side_effect=read_recorder),
+        ):
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus',
+                timeout_seconds=5.0,
+                session_id=sid, config_dir=cfg_dir,
+            )
+
+        assert result.timed_out is False, 'Expected a normal exit, not a kill'
+        assert len(recorded) == 1, (
+            f'Expected exactly ONE normal-exit transcript read feeding both derived '
+            f'signals (task 2761 no-double-I/O); got {len(recorded)} read(s).'
+        )
+        assert loop_ident not in recorded, (
+            f'read_transcript_records ran on the event-loop thread ({loop_ident}) — the '
+            f'normal-exit read at cli_invoke.py:3033 blocks the shared loop. '
+            f'Recorded idents: {sorted(set(recorded))}'
+        )
+        assert result.transcript_turns == 2, (
+            f'Expected the assistant-turn count derived from the thread-returned list, '
+            f'got {result.transcript_turns}'
+        )
+        assert result.ended_awaiting_background is True, (
+            'Expected the abandoned-background-launch tail to be detected from the '
+            'thread-returned list — both post-read derivation passes must still work.'
+        )
+
+    async def test_normal_exit_skips_read_when_config_dir_missing(self, tmp_path):
+        """PRESERVATION GUARD (expected to pass before and after the change).
+
+        With ``config_dir=None`` the ``if (config_dir and session_id)`` guard
+        short-circuits: no read, no thread hop, and both signals take their
+        documented fail-safe defaults (``transcript_turns=None``,
+        ``ended_awaiting_background=False``).
+        """
+        sid = str(uuid.uuid4())
+        proc = _make_delayed_success_proc(0.02)
+        recorded: list[int] = []
+
+        def read_recorder(config_dir, session_id):
+            recorded.append(threading.get_ident())
+            return list(_ABANDONED_LAUNCH_RECORDS)
+
+        with (
+            patch(
+                'shared.cli_invoke.asyncio.create_subprocess_exec',
+                side_effect=_fake_exec_returning(proc),
+            ),
+            patch('shared.cli_invoke.count_transcript_turns', return_value=None),
+            patch('shared.cli_invoke.read_transcript_records', side_effect=read_recorder),
+        ):
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus',
+                timeout_seconds=5.0,
+                session_id=sid, config_dir=None,
+            )
+
+        assert result.timed_out is False, 'Expected a normal exit, not a kill'
+        assert recorded == [], (
+            f'No transcript read may be attempted without a config_dir — the guard must '
+            f'short-circuit before any to_thread hop. Recorded {len(recorded)} call(s).'
+        )
+        assert result.transcript_turns is None, (
+            f'Expected the fail-safe default transcript_turns=None, got {result.transcript_turns}'
+        )
+        assert result.ended_awaiting_background is False, (
+            'Expected the fail-safe default ended_awaiting_background=False'
+        )
