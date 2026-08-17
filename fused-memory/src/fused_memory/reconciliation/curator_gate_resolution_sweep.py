@@ -54,6 +54,15 @@ logger = logging.getLogger(__name__)
 # reify curator workflow — we do not get to choose the format, we read it.
 CURATOR_GATE_SOURCE_TEMPLATE: str = 'curator_gate_{task_id}'
 
+# Single owners of the emitted flag's dedup key components.  ``flag_type`` is
+# free-form per ``FINDING_ITEM_SCHEMA`` (cli_stage_runner.py); ``category`` must
+# be a member of that schema's category enum, and ``task_memory_mismatch`` is
+# exactly what this finding is — a task whose state does not reflect the memory
+# corpus.  Together they form the ``compute_flag_signature`` key that gives the
+# flag cross-cycle recurrence tracking and suppression.
+GATE_RESOLUTION_FLAG_TYPE: str = 'task_completed_not_reflected'
+GATE_RESOLUTION_FLAG_CATEGORY: str = 'task_memory_mismatch'
+
 
 # ── Pure helpers ─────────────────────────────────────────────────────────────
 
@@ -127,3 +136,80 @@ def extract_open_gate_task_ids(tasks: list[dict]) -> list[str]:
             continue
         seen.add(str(raw_tid))
     return sorted(seen)
+
+
+def build_gate_resolution_flag(task_id, memories, *, task: dict | None = None) -> dict:
+    """Build the Stage-1 flag announcing that gate *task_id* is already resolved.
+
+    Stage 1 runs under ``DISALLOW_TASK_WRITES`` and so cannot close the gate
+    itself; it emits this flag into ``report.items_flagged`` and Stage 2 —
+    which holds ``set_task_status``/``submit_task`` — acts on it.  That relay
+    is the ``flag_for_stage2`` contract
+    ``recon_self_model.render_source_completion_section`` documents.
+
+    The emitted dict follows ``FINDING_ITEM_SCHEMA`` (cli_stage_runner.py):
+
+    - ``flag_type``/``category`` are ``GATE_RESOLUTION_FLAG_TYPE`` /
+      ``GATE_RESOLUTION_FLAG_CATEGORY``, and ``task_id`` is ``str``-coerced —
+      together these are the ``compute_flag_signature`` key, so the flag
+      dedupes across cycles (gaining a ``stage1_flag_marker`` recurrence row
+      and honouring explicit suppression) instead of re-emitting unmarked
+      forever.
+    - ``description`` names the exact ``metadata.source`` key that was matched
+      and how many entries matched (plus the task title when *task* is given),
+      so a Stage-2 reader can re-derive the evidence deterministically rather
+      than trusting the flag's assertion.
+    - ``cited_memories`` carries one ``{'memory_id', 'store': 'mem0'}`` entry
+      per input memory, in input order.  A memory dict with a missing or
+      ``None`` ``'id'`` contributes NO entry rather than raising — a malformed
+      row must not cost the whole finding.
+
+    Args:
+        task_id: The gate task's id (``str`` or ``int``; coerced to ``str``).
+        memories: Mem0 memory dicts matching the gate's curator source key,
+            as returned by ``MemoryService.get_memories_by_metadata``.
+        task: Optional task dict, used only to enrich the description.
+
+    Pure: no I/O, no side effects.
+    """
+    tid = str(task_id)
+    source = curator_gate_source(tid)
+
+    cited_memories = []
+    for memory in memories:
+        mid = memory.get('id') if isinstance(memory, dict) else None
+        if mid is None:
+            continue
+        cited_memories.append({'memory_id': str(mid), 'store': 'mem0'})
+
+    title = None
+    if isinstance(task, dict):
+        raw_title = task.get('title')
+        if isinstance(raw_title, str) and raw_title:
+            title = raw_title
+
+    description = (
+        f'Human-curator gate task {tid}'
+        + (f' ("{title}")' if title else '')
+        + f' is still open, but the curator has already ruled on it: '
+        f'{len(memories)} Mem0 entr{"y" if len(memories) == 1 else "ies"} '
+        f"carry metadata.source == '{source}' (deterministic Qdrant payload-filter "
+        'match, not semantic search). The task state does not reflect the '
+        'recorded resolution — read the cited memories for the ruling, then '
+        'close or update the gate task accordingly.'
+    )
+
+    return {
+        'description': description,
+        'severity': 'moderate',
+        'actionable': True,
+        'task_id': tid,
+        'flag_type': GATE_RESOLUTION_FLAG_TYPE,
+        'category': GATE_RESOLUTION_FLAG_CATEGORY,
+        'suggested_action': (
+            f'Verify the ruling in the cited memories (metadata.source == '
+            f"'{source}'), then set task {tid} to its resolved status and record "
+            'the decision, so the gate stops appearing as an open human decision.'
+        ),
+        'cited_memories': cited_memories,
+    }
