@@ -1147,6 +1147,128 @@ class TestDataclassDoubleExemption:
         )
 
 
+# The 11 files carrying pre-existing Rule B debt, from the AST census over all seven
+# scanned tests/ directories (95 sites total). test_merge_speculation.py is
+# deliberately ABSENT: its single deliberate double gets a per-site pragma instead,
+# so task 3980's freshly-cleaned module stays fully covered.
+_EXPECTED_DEBT_PATHS = frozenset({
+    'orchestrator/tests/test_merge_queue.py',
+    'orchestrator/tests/test_concurrent_verify_boundary.py',
+    'orchestrator/tests/test_merge_queue_permit_conservation.py',
+    'orchestrator/tests/test_merge_queue_resolve_release.py',
+    'orchestrator/tests/test_merge_queue_request_liveness.py',
+    'orchestrator/tests/test_coalesce_integration_gate.py',
+    'orchestrator/tests/test_merge_item_union.py',
+    'orchestrator/tests/test_merge_queue_equivalence.py',
+    'orchestrator/tests/test_merge_queue_lifecycle_registry.py',
+    'orchestrator/tests/test_merge_queue_metrics.py',
+    'orchestrator/tests/test_merge_queue_single_writer_asserts.py',
+})
+
+_REPO_ROOT = Path(__file__).parent.parent.parent
+
+
+class TestDataclassDoubleDebtBaseline:
+    """The shrink-only per-file debt baseline that lets Rule B ship default-ON.
+
+    96 pre-existing sites across 12 files mean a hot default-on rule would turn
+    orchestrator/tests' lint_command red immediately and stall the merge lane
+    repo-wide. The baseline is per-FILE (line numbers churn on every edit above
+    them) and opt-OUT (a brand-new offending file must be covered by default —
+    an opt-in list would exempt exactly the third file this task exists to catch).
+    """
+
+    def test_debt_baseline_holds_exactly_the_eleven_measured_paths(self):
+        """_DATACLASS_DOUBLE_DEBT == the 11 census paths — no more, no less."""
+        debt = _checker._DATACLASS_DOUBLE_DEBT
+        assert set(debt) == _EXPECTED_DEBT_PATHS, (
+            'Debt baseline drifted from the measured census.\n'
+            f'  unexpected additions: {sorted(set(debt) - _EXPECTED_DEBT_PATHS)}\n'
+            f'  missing entries:      {sorted(_EXPECTED_DEBT_PATHS - set(debt))}\n'
+            'The list is SHRINK-ONLY: entries may be removed as files are migrated, '
+            'never added.'
+        )
+
+    def test_test_merge_speculation_is_not_grandfathered(self):
+        """test_merge_speculation.py must NOT be on the baseline.
+
+        Blanket-suppressing Rule B there would silently un-cover the eleven other
+        doubles task 3980 just removed, the moment anyone reintroduced one.
+        """
+        assert 'orchestrator/tests/test_merge_speculation.py' not in _checker._DATACLASS_DOUBLE_DEBT, (
+            'test_merge_speculation.py must stay OFF the debt baseline — its one '
+            'deliberate double carries a per-site pragma so the rest of the module '
+            'stays covered (task 3980 regression)'
+        )
+
+    def test_same_source_opposite_verdicts_by_filename(self):
+        """The identical offending source is suppressed in a debt file and flagged elsewhere."""
+        suppressed = find_violations(_RULE_B_SOURCE, 'orchestrator/tests/test_merge_queue.py')
+        assert suppressed == [], (
+            f'Rule B must be suppressed in a debt-listed file; got {suppressed}'
+        )
+        flagged = find_violations(_RULE_B_SOURCE, 'orchestrator/tests/test_brand_new.py')
+        assert len(flagged) == 1, (
+            'the SAME source in a non-debt file must still flag — otherwise the '
+            f'baseline is not a baseline but a global off switch; got {flagged}'
+        )
+
+    def test_suppression_works_for_absolute_paths(self):
+        """An absolute path ending in the debt components is suppressed too.
+
+        The CLI passes repo-relative paths; pytest passes tmp_path absolutes. Both
+        must reach the same verdict or the baseline would be invisible to one caller.
+        """
+        absolute = str(_REPO_ROOT / 'orchestrator' / 'tests' / 'test_merge_queue.py')
+        assert find_violations(_RULE_B_SOURCE, absolute) == [], (
+            f'an absolute path to a debt file must be suppressed; filename={absolute!r}'
+        )
+
+    def test_matching_is_path_component_aware_not_substring(self):
+        """Trailing-COMPONENT matching: a substring match must not grandfather an unrelated file."""
+        # Real trailing components → suppressed (this is what makes absolute paths work).
+        assert find_violations(_RULE_B_SOURCE, 'evil/orchestrator/tests/test_merge_queue.py') == [], (
+            'a path whose real trailing components are a debt entry is suppressed'
+        )
+        # Substring of a filename, but not a component boundary → NOT suppressed.
+        not_suppressed = find_violations(
+            _RULE_B_SOURCE, 'orchestrator/tests/not_test_merge_queue.py'
+        )
+        assert len(not_suppressed) == 1, (
+            'not_test_merge_queue.py merely CONTAINS a debt filename as a substring; '
+            f'a substring match must not grandfather it. got {not_suppressed}'
+        )
+        # Same basename at a different root → NOT suppressed (fewer components match).
+        bare = find_violations(_RULE_B_SOURCE, 'test_merge_queue.py')
+        assert len(bare) == 1, (
+            'a bare basename at another root shares only ONE trailing component and '
+            f'must not be suppressed. got {bare}'
+        )
+
+    def test_debt_baseline_suppresses_rule_b_only(self):
+        """A Rule A violation in a debt-listed file is still reported.
+
+        The baseline grandfathers dataclass-double debt, not all mock-spec discipline.
+        """
+        violations = find_violations(_RULE_A_SOURCE, 'orchestrator/tests/test_merge_queue.py')
+        assert len(violations) == 1, (
+            'the debt baseline must suppress Rule B ONLY — a bare config MagicMock in '
+            f'a debt-listed file is still a Rule A violation; got {violations}'
+        )
+        assert 'mock_orch_config' in violations[0].message
+
+    def test_every_debt_entry_resolves_to_an_existing_file(self):
+        """A deleted or renamed file must not leave a stale blanket suppression behind."""
+        missing = [
+            entry for entry in _checker._DATACLASS_DOUBLE_DEBT if not (_REPO_ROOT / entry).is_file()
+        ]
+        assert missing == [], (
+            f'Debt baseline entries no longer exist in the repo: {missing}. '
+            'A stale entry silently suppresses Rule B for a path nothing occupies — '
+            'and would grandfather a NEW file created at that path. Remove them.'
+        )
+
+
 class TestFusedMemoryTestsDirectoryClean:
     """Regression guard: fused-memory/tests must have zero bare MagicMock() config sites.
 
