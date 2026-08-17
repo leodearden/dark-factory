@@ -146,6 +146,16 @@ WorkingDirectory -p DropInPaths lms-arm@probe.service`. A non-clean answer
 fails the install with a non-zero exit and a `[lms_unit_parity]` report naming
 the finding.
 
+The installer tells those findings apart rather than describing all of them as a
+drop-in: exit 1 points you at whichever of `[override]` / `[effective]` /
+`[drift]` / `[vanished]` / `[unverifiable]` fired, exit 2 says the unit is not
+where the installer just put it, and a checker that is *missing from the
+checkout* or could not be run at all reports itself — with the command to run by
+hand — instead of blaming an override it never looked for. Each of those still
+FAILS the install: one that could not verify the effective configuration has
+established nothing, which is the state this gate exists to stop reading as
+success.
+
 File presence was never the claim an operator needed, because it is blind to
 the one thing that actually redirects a unit. `systemctl --user edit` never
 touches the unit file; it writes `lms-arm@.service.d/override.conf` beside it,
