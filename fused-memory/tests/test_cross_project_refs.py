@@ -442,11 +442,6 @@ class TestCrossProjectRefIsFrozen:
         with pytest.raises(dataclasses.FrozenInstanceError):
             scan.refs[0].project_id = 'other'  # type: ignore[misc]
 
-    def test_scan_is_immutable(self):
-        scan = find_cross_project_task_refs('see dark_factory:2500', group_id='reify')
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            scan.refs = ()  # type: ignore[misc]
-
 
 class TestCrossProjectRefScanIsFrozen:
     """CrossProjectRefScan is frozen for the same reason CrossProjectRef is:
@@ -458,6 +453,16 @@ class TestCrossProjectRefScanIsFrozen:
     no in-place mutation — so the class docstring's claim is actually
     enforced. Mirrors test_canonical_labels.py::TestLabelScanIsFrozen.
     """
+
+    def test_both_fields_default_empty(self):
+        scan = CrossProjectRefScan()
+        assert scan.refs == ()
+        assert scan.ambiguous == ()
+
+    def test_refs_cannot_be_rebound(self):
+        scan = find_cross_project_task_refs('see dark_factory:2500', group_id='reify')
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            scan.refs = ()  # type: ignore[misc]
 
     @pytest.mark.parametrize('attr', ['refs', 'ambiguous'])
     def test_fields_cannot_be_mutated_in_place(self, attr):
