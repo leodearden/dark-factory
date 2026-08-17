@@ -1999,6 +1999,33 @@ class TestParseMetadataFailurePolicy:
             f'(30 landed tasks carry it); got: {retired_offending}'
         )
 
+    @pytest.mark.parametrize(
+        'near_miss_alias',
+        ['origin_finding', 'origin_stage1_finding_id', 'source_finding', 'finding_id'],
+    )
+    def test_finding_provenance_near_miss_aliases_still_warn(self, near_miss_alias):
+        """The near-miss spellings must KEEP emitting unknown_key (esc-3796-1).
+
+        The negative half of the test above, and the one assertion the Tier-B
+        table actually rests on: `origin_finding_id` is silent by design, so
+        the drift signal for that family lives entirely in these four
+        near-miss spellings. `code=unknown_key` is what an operator greps for
+        to find callers still on a wrong spelling — blessing one of these, or
+        promoting it to a typed `TaskMetadata` field, would void that contract
+        with no other test failing and leave the grep silently returning
+        nothing.
+
+        This asserts parser BEHAVIOUR (warning emitted / not emitted), not the
+        wording of docs/task-authoring.md §8 — so it is a real contract test,
+        not a documentation meta-test.
+        """
+        _, warnings = parse_metadata({near_miss_alias: 'v'}, direction='read')
+        unknown_key_fields = {w.field for w in warnings if w.code == 'unknown_key'}
+        assert near_miss_alias in unknown_key_fields, (
+            f'{near_miss_alias} must stay unblessed so its drift line keeps appearing '
+            f'in the census; got warnings: {warnings}'
+        )
+
     def test_deterministic_invariant_violation_write_enforce_raises(self):
         with pytest.raises(ValidationError):
             parse_metadata({'task_kind': 'deterministic'}, direction='write', enforce=True)
