@@ -24,6 +24,7 @@ import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from graphiti_core.nodes import EpisodeType
 
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.utils.canonical_labels import Referent
@@ -455,3 +456,87 @@ class TestAddEpisodeStampsReferents:
 
         payload = service.durable_queue.enqueue.call_args[1]['payload']
         assert json.loads(json.dumps(payload['referents'])) == payload['referents']
+
+
+def _encoded(source, *referents):
+    from fused_memory.services.memory_service import _encode_referents
+
+    return _encode_referents(
+        ReferentResolution(source=source, referents=tuple(referents)),
+    )
+
+
+#: The exact kwargs `_execute_graphiti_write` hands the backend today, for
+#: `_graphiti_payload()`. Epsilon must not change ANY of them.
+_TODAYS_BACKEND_KWARGS = {
+    'name': 'episode_test',
+    'content': 'test content',
+    'group_id': 'test',
+    'source_description': 'notes',
+    'uuid': 'test-uuid',
+    'temporal_context': None,
+    'reference_time': None,
+    'unverified_claim': False,
+}
+
+
+class TestExecuteGraphitiWriteConsumesReferents:
+    """The executor decodes the blob and stops there — epsilon's job ends at
+    making the set a live local. The backend signature is untouched."""
+
+    @pytest.mark.asyncio
+    async def test_old_format_row_executes_byte_identically(self, service):
+        """The load-bearing back-compat signal: a row written before task 3670
+        reaches Graphiti with exactly today's kwargs."""
+        service._reconcile_episode_identity = AsyncMock(return_value={})
+
+        await service._execute_graphiti_write('add_episode', _graphiti_payload())
+
+        assert service.graphiti.add_episode.call_count == 1
+        assert service.graphiti.add_episode.call_args[1] == {
+            **_TODAYS_BACKEND_KWARGS, 'source': EpisodeType.text,
+        }
+        service._reconcile_episode_identity.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_backend_is_never_handed_a_referents_kwarg(self, service):
+        """Epsilon stops at the executor. Handing the set to the backend is
+        leaf zeta's business, not this leaf's."""
+        await service._execute_graphiti_write(
+            'add_episode',
+            _graphiti_payload(referents=_encoded('derived', Referent(number='3127'))),
+        )
+
+        assert 'referents' not in service.graphiti.add_episode.call_args[1]
+
+    @pytest.mark.asyncio
+    async def test_new_format_row_executes_with_the_same_backend_kwargs(self, service):
+        await service._execute_graphiti_write(
+            'add_episode',
+            _graphiti_payload(referents=_encoded('derived', Referent(number='3127'))),
+        )
+
+        assert service.graphiti.add_episode.call_args[1] == {
+            **_TODAYS_BACKEND_KWARGS, 'source': EpisodeType.text,
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_key_is_popped_off_the_payload(self, service):
+        """The observable proof the executor CONSUMED the blob rather than
+        passing it through to the backend."""
+        payload = _graphiti_payload(
+            referents=_encoded('derived', Referent(number='3127')),
+        )
+
+        await service._execute_graphiti_write('add_episode', payload)
+
+        assert 'referents' not in payload
+
+    @pytest.mark.asyncio
+    async def test_a_malformed_blob_still_completes_the_write(self, service):
+        """Never dead-letters: a telemetry field must not cost a memory."""
+        await service._execute_graphiti_write(
+            'add_episode', _graphiti_payload(referents='garbage'),
+        )
+
+        assert service.graphiti.add_episode.call_count == 1
