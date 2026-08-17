@@ -52,17 +52,14 @@ reproducing the very bug under test. This module needs no such literal today
 from __future__ import annotations
 
 import hashlib
-import importlib.util
-import inspect
 import json
 import re
-import sys
-import types
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from _fm_helpers import load_script_module
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'sweep_toolcall_xml_leak.py'
 
@@ -73,47 +70,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 ARTIFACT_GLOB = 'toolcall-xml-leak-sweep-*'
 
 
-def _load_module() -> types.ModuleType:
-    """Load sweep_toolcall_xml_leak.py from its file path.
-
-    Reuse of test_sweep_toolcall_xml_leak.py's loader: scripts/ is not a
-    package and the script is not on PYTHONPATH, so importlib is how the
-    production detector is reached without sys.path pollution.
-
-    One deliberate difference from that copy: an already-loaded module for the
-    SAME file is reused rather than re-executed. Both test modules register the
-    key ``sweep_toolcall_xml_leak`` in ``sys.modules``, so an unconditional
-    load makes the second import execute the 965-line script a second time and
-    silently REPLACE the first module object -- two live module objects whose
-    identity depends on collection order. Harmless while only pure functions
-    are used, but a latent hazard the moment anything holds module state.
-
-    The remaining half of the reviewer's ask -- hoisting this loader into
-    ``fused-memory/tests/conftest.py`` so the loading contract has ONE
-    definition -- is not applied here: conftest.py is outside this task's
-    locked module set.
-    """
-    mod_name = 'sweep_toolcall_xml_leak'
-    cached = sys.modules.get(mod_name)
-    cached_file = getattr(cached, '__file__', None)
-    if cached is not None and cached_file is not None and (
-        Path(cached_file).resolve() == SCRIPT_PATH.resolve()
-    ):
-        return cached
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='sweep_toolcall_xml_leak')
 
 classify_record = _mod.classify_record
 CLASSIFICATIONS = _mod.CLASSIFICATIONS
@@ -168,27 +125,22 @@ def _provenance_path(report_path: Path) -> Path:
 _SHA_RE = re.compile(r'\A[0-9a-f]{40}\Z')
 
 # The four per-record outcomes the runbook (docs/mcp-toolcall-xml-leak.md §5
-# remediation table) says a HUMAN must adjudicate. Lifted verbatim as a
-# vocabulary rather than re-derived, so this module's notion of "a mutation
-# somebody has to deal with" is the runbook's, not a fresh invention.
+# remediation table) says a HUMAN must adjudicate. Bound directly to the
+# script's own HUMAN_ADJUDICATION_FLAGS export (task 3738) rather than
+# hand-copied, so this module's notion of "a mutation somebody has to deal
+# with" cannot drift from the production predicate's -- add a fifth danger
+# outcome to the sweep and this tuple grows with it automatically, instead of
+# _unrepaired_danger_records() silently returning [] for a record carrying an
+# outcome nobody told this module about.
 #
-# There is no shared constant to import: the script spells the same four
-# inline in resolve_exit_code(). That makes this tuple a HAND COPY, and a hand
-# copy of a growth-prone list is a silent-drift hazard -- add a fifth danger
-# outcome to the sweep and _unrepaired_danger_records() would return [] for a
-# record carrying it, every test below would hit its "if not outstanding"
-# early exit, and the whole class would go GREEN while a real unrepaired live
-# mutation landed untracked. TestDangerFlagsMatchTheProductionScript pins this
-# tuple against resolve_exit_code's own source so that drift is RED, not
-# silent. (Exporting the constant FROM the script, as the reviewer suggested,
-# is the cleaner fix but edits scripts/sweep_toolcall_xml_leak.py, which is
-# outside this task's locked module set.)
-DANGER_FLAGS = (
-    'record_error',
-    'content_lost_in_flight',
-    'skipped_not_mem0_routed',
-    'skipped_metadata_would_be_rejected',
-)
+# KEEP THIS A BINDING. Re-typing the names here as a literal restores the hand
+# copy this deleted, and one that has quietly dropped a flag still passes every
+# test below: a dropped flag also shrinks the parametrize set of
+# TestDangerFlagsBindTheProductionVocabulary, while _unrepaired_danger_records()
+# goes blind to that outcome and TestUnrepairedMutationsAreTracked takes its
+# `if not outstanding` early exit. Nothing tests this line -- an assertion about
+# it could only ever restate it -- so it is a convention, stated here.
+DANGER_FLAGS = _mod.HUMAN_ADJUDICATION_FLAGS
 
 # The two shapes repair_content() knows how to fix. Only these carry a
 # repaired_content, so only for these can the recovery payload be checked for
@@ -385,90 +337,43 @@ def _unrepaired_danger_records(report: dict) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Vocabulary drift — the hand copy vs the production script
+# Vocabulary — DANGER_FLAGS binds the production script's export
 # ---------------------------------------------------------------------------
 
 
-def _production_danger_flags() -> tuple[set[str], str]:
-    """The danger-flag set the SCRIPT actually acts on, plus where it came from.
+class TestDangerFlagsBindTheProductionVocabulary:
+    """Every name DANGER_FLAGS carries is one the script escalates to a human.
 
-    PREFERS a real exported constant. The moment the script grows one (the
-    clean fix — see the note on the getsource exception below), this binds to
-    it and the source-reading branch goes dormant with no test-side edit.
+    ``DANGER_FLAGS`` IS ``_mod.HUMAN_ADJUDICATION_FLAGS`` (task 3738), so there
+    is no hand copy left to compare it against and nothing here reads the
+    script's source. The earlier ``inspect.getsource`` + regex-over-source
+    helper was deleted once the export existed, because from that moment its
+    export-preferring branch always returned and the comparison it fed was
+    ``set(X) == set(X)`` — an unfalsifiable test guarding an unreachable
+    fallback, in the exact brittle style this suite documents having removed
+    (da8e5a4c96).
 
-    Falls back to reading the flag names out of ``resolve_exit_code``'s source,
-    because that function IS the production consumer of these flags and is
-    today the only place they are enumerated.
-
-    NORM EXCEPTION, stated rather than smuggled: fused-memory's tests
-    deliberately avoid ``inspect.getsource`` tripwires — four sites document
-    having REMOVED them as brittle (test_tool_errors.py, test_stages.py,
-    test_mem0_tombstone.py, test_bulk_reset_guard.py, citing da8e5a4c96) — and
-    the standing preference is a runtime-behaviour test instead. That norm
-    targets guards that pin WORDING or assert "pattern X must not reappear",
-    which go stale on any behaviour-preserving rewrite. This is a different
-    thing: it binds a VOCABULARY that has no exported constant to bind to, and
-    the behavioural half is here too (``test_each_flag_forces_a_non_zero_exit``
-    drives the real predicate). The exception is also self-limiting — it
-    disappears when the constant is exported, which is filed as follow-up.
-    """
-    for name in ('HUMAN_ADJUDICATION_FLAGS', 'DANGER_FLAGS'):
-        exported = getattr(_mod, name, None)
-        if exported is not None:
-            return set(exported), f'{name} exported by the script'
-    source = inspect.getsource(_mod.resolve_exit_code)
-    # Only record.get(...) — report.get('counts'/'truncated'/'records') are the
-    # run-level conditions, not per-record human-adjudication outcomes.
-    names = re.findall(r"record\.get\(\s*'([A-Za-z_][A-Za-z0-9_]*)'", source)
-    if not names:
-        # The one brittleness the norm warns about, made ACTIONABLE instead of
-        # cryptic: a behaviour-preserving refactor (iterating some constant
-        # this helper does not know the name of) empties the parse, and a bare
-        # set-difference would then read as "the script dropped all four
-        # flags". Say what actually happened and what to do about it.
-        pytest.fail(
-            'resolve_exit_code() no longer spells the danger flags inline, so '
-            'this module can no longer derive them from it. If they now live '
-            'in a module-level constant, name it HUMAN_ADJUDICATION_FLAGS (or '
-            'add its name to _production_danger_flags) so DANGER_FLAGS binds '
-            'to the real thing instead of drifting from it silently.'
-        )
-    return set(names), 'resolve_exit_code() source'
-
-
-class TestDangerFlagsMatchTheProductionScript:
-    """DANGER_FLAGS is a hand copy. This is what keeps it honest.
-
-    The script spells the same four names inline in ``resolve_exit_code`` and
-    exports no shared constant, so nothing structurally prevents the two lists
-    from diverging. Divergence here fails in the WORST direction: a fifth
-    danger outcome added upstream would make ``_unrepaired_danger_records()``
-    return ``[]`` for a record carrying it, every test in
-    ``TestUnrepairedMutationsAreTracked`` would take its ``if not outstanding``
-    early exit, and the suite would report all-green while a real unrepaired
-    live-corpus mutation landed with no tracking entry required — this module's
-    own failure class, reintroduced one level up.
+    What remains is behavioural: each name is driven through the production
+    exit-code predicate, so no name can sit in this module's vocabulary that
+    the sweep does not actually treat as needing a human. The binding itself
+    carries no test — an assertion about a binding three hundred lines up in
+    this same file could only restate it, and no production edit could falsify
+    it — it is stated as a convention beside the binding instead. Losing the
+    export outright is not silent either: it raises at import, before
+    collection.
     """
 
-    def test_hand_copy_equals_what_the_script_acts_on(self) -> None:
-        production, origin = _production_danger_flags()
-        # Widened to set[str]: the tuple's inferred literal type makes the
-        # difference operator ill-typed against a set[str] read at runtime.
-        hand_copy: set[str] = set(DANGER_FLAGS)
-        assert hand_copy == production, (
-            f'DANGER_FLAGS {sorted(DANGER_FLAGS)} != the flags the script acts '
-            f'on {sorted(production)} (read from {origin}).'
-            '\n  missing here: '
-            f'{sorted(production - hand_copy)}'
-            '\n  stale here:   '
-            f'{sorted(hand_copy - production)}'
-            '\nRe-bind DANGER_FLAGS. Do NOT delete this assertion: while the '
-            'two lists disagree, an unrepaired mutation carrying a flag this '
-            'module does not know about is tracked by nobody and the whole '
-            'TestUnrepairedMutationsAreTracked class silently no-ops.'
-        )
+    def test_no_duplicate_flag_names(self) -> None:
+        """A repeat in the production tuple is a lost flag, not a cosmetic slip.
 
-    def test_no_duplicates_in_the_hand_copy(self) -> None:
+        Kept despite being a lint over a four-element literal because it is the
+        one shape of growth mistake nothing else here catches: the natural way
+        to add a fifth outcome is to copy a line of the tuple and edit the
+        string, and forgetting that edit leaves a duplicate WHERE THE NEW NAME
+        SHOULD BE. resolve_exit_code() then never escalates the new outcome,
+        and every other test in this module is parametrized over the same
+        (still self-consistent) tuple, so all of them stay green.
+        """
         assert len(set(DANGER_FLAGS)) == len(DANGER_FLAGS), (
             f'DANGER_FLAGS {DANGER_FLAGS} repeats a name'
         )

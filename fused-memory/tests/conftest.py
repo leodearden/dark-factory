@@ -4,6 +4,15 @@ Non-fixture helpers (MockEdge, make_rebuild_detail, extract_cypher, …)
 live in `_fm_helpers.py` — a uniquely-named sibling module — so they can
 be imported from test files without conflicting with sibling subprojects'
 conftests under `sys.modules['conftest']`.
+
+Testing a `scripts/` script? `scripts/` is not a package and is not on
+PYTHONPATH, so import it with `from _fm_helpers import
+load_script_module` rather than writing another local
+`spec_from_file_location` loader: the shared one reuses an already-loaded
+module for the same file instead of re-executing it under the same
+`sys.modules` key, and refuses to shadow a module it did not install.
+Many older test modules still carry their own copy (task 3895 migrates
+them); don't add one (task 3738).
 """
 
 import os
