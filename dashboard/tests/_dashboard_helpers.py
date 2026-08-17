@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import aiosqlite
+import httpx
 import pytest
 
 from dashboard.config import DashboardConfig
@@ -111,6 +112,50 @@ def apply_isolated_env(mp: pytest.MonkeyPatch, root: Path) -> None:
     mp.delenv('DASHBOARD_KNOWN_PROJECT_ROOTS', raising=False)
     mp.delenv('RECONCILIATION_DATA_DIR', raising=False)
     mp.delenv('QUEUE_DATA_DIR', raising=False)
+
+
+def cold_session_responses(
+    inner: dict, url: str = 'http://localhost:8000',
+) -> list[httpx.Response]:
+    """The three responses a COLD McpSession consumes, in post order.
+
+    ``mcp_tool_call`` against a cold session issues ``initialize``, then
+    ``notifications/initialized``, then ``tools/call`` — three HTTP posts.
+    An AsyncMock client bypasses MockTransport, which is what normally
+    attaches ``.request``, so each response needs it set by hand or
+    ``raise_for_status()`` raises RuntimeError even on a 200.
+
+    Builds its own init/notify/tools-call response bodies rather than
+    delegating to any test module's local ``_mcp_response``/``_init_response``
+    builders (task 3952): those stay module-local since each is also used
+    independently (e.g. by a module's ``_PerPortHandler``), while this one
+    function — the one with the easy-to-drop ``resp.request`` line — was
+    copy-pasted byte-for-byte across four test modules with no other user.
+    """
+    init_body = {
+        'jsonrpc': '2.0',
+        'id': 1,
+        'result': {
+            'protocolVersion': '2025-03-26',
+            'capabilities': {'tools': {}},
+            'serverInfo': {'name': 'test', 'version': '0.1'},
+        },
+    }
+    mcp_body = {
+        'jsonrpc': '2.0',
+        'id': 1,
+        'result': {
+            'content': [{'type': 'text', 'text': json.dumps(inner)}],
+        },
+    }
+    responses = [
+        httpx.Response(200, json=init_body, headers={'mcp-session-id': 'test-session-id'}),
+        httpx.Response(202, headers={'mcp-session-id': 'test-session-id'}),
+        httpx.Response(200, json=mcp_body, headers={'mcp-session-id': 'test-session-id'}),
+    ]
+    for resp in responses:
+        resp.request = httpx.Request('POST', f'{url.rstrip("/")}/mcp')
+    return responses
 
 
 # ---------------------------------------------------------------------------

@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
+from _dashboard_helpers import cold_session_responses
 
 from dashboard.data.memory import get_curator_state
 
@@ -49,27 +50,6 @@ def _make_init_response(request_id: int = 1) -> httpx.Response:
 def _make_notify_response() -> httpx.Response:
     """Build a 202 Accepted response for notifications."""
     return httpx.Response(202, headers={'mcp-session-id': 'test-session-id'})
-
-
-def _cold_session_responses(
-    inner: dict, url: str = 'http://localhost:8000',
-) -> list[httpx.Response]:
-    """The three responses a COLD McpSession consumes, in post order.
-
-    ``mcp_tool_call`` against a cold session issues ``initialize``, then
-    ``notifications/initialized``, then ``tools/call`` — three HTTP posts.
-    An AsyncMock client bypasses MockTransport, which is what normally
-    attaches ``.request``, so each response needs it set by hand or
-    ``raise_for_status()`` raises RuntimeError even on a 200.
-    """
-    responses = [
-        _make_init_response(),
-        _make_notify_response(),
-        _make_mcp_response(inner),
-    ]
-    for resp in responses:
-        resp.request = httpx.Request('POST', f'{url.rstrip("/")}/mcp')
-    return responses
 
 
 class _SessionAwareHandler:
@@ -356,7 +336,7 @@ class TestMcpToolCallTimeoutBudget:
         from dashboard.data.memory import mcp_tool_call
 
         mock_client = AsyncMock()
-        mock_client.post.side_effect = _cold_session_responses({'ok': True})
+        mock_client.post.side_effect = cold_session_responses({'ok': True})
 
         result = await mcp_tool_call(
             mock_client, 'http://localhost:8000', 'get_status', {}, timeout=2.0,
@@ -379,7 +359,7 @@ class TestMcpToolCallTimeoutBudget:
         from dashboard.data.memory import mcp_tool_call
 
         mock_client = AsyncMock()
-        mock_client.post.side_effect = _cold_session_responses({'ok': True})
+        mock_client.post.side_effect = cold_session_responses({'ok': True})
 
         await mcp_tool_call(mock_client, 'http://localhost:8000', 'get_status', {})
 
@@ -413,7 +393,7 @@ class TestAggregateTimeoutBudget:
         # second, which serves a full cold-session sequence.
         mock_client.post.side_effect = [
             httpx.ConnectError('refused'),
-            *_cold_session_responses({'graphiti': {'connected': True}}, url_b),
+            *cold_session_responses({'graphiti': {'connected': True}}, url_b),
         ]
 
         result = await get_memory_status(mock_client, two_url_config, timeout=3.0)
@@ -435,7 +415,7 @@ class TestAggregateTimeoutBudget:
 
         _url_a, url_b = two_url_config.fused_memory_urls
         mock_client = AsyncMock()
-        mock_client.post.side_effect = _cold_session_responses({'ok': True}, url_b)
+        mock_client.post.side_effect = cold_session_responses({'ok': True}, url_b)
 
         await get_memory_status(mock_client, two_url_config)
 
@@ -450,8 +430,8 @@ class TestAggregateTimeoutBudget:
         mock_client = AsyncMock()
         # get_queue_stats visits ALL urls — two cold sessions, six posts.
         mock_client.post.side_effect = [
-            *_cold_session_responses(stats, url_a),
-            *_cold_session_responses(stats, url_b),
+            *cold_session_responses(stats, url_a),
+            *cold_session_responses(stats, url_b),
         ]
 
         result = await get_queue_stats(mock_client, two_url_config, timeout=3.0)
@@ -471,8 +451,8 @@ class TestAggregateTimeoutBudget:
         stats = {'counts': {'graphiti': 1}, 'oldest_pending_age_seconds': 2.0}
         mock_client = AsyncMock()
         mock_client.post.side_effect = [
-            *_cold_session_responses(stats, url_a),
-            *_cold_session_responses(stats, url_b),
+            *cold_session_responses(stats, url_a),
+            *cold_session_responses(stats, url_b),
         ]
 
         await get_queue_stats(mock_client, two_url_config)
@@ -499,8 +479,8 @@ class TestRemainingHelpersThreadTheirBudget:
         mock_client = AsyncMock()
         # get_wal_status collects from ALL urls — two cold sessions, six posts.
         mock_client.post.side_effect = [
-            *_cold_session_responses(payload, url_a),
-            *_cold_session_responses(payload, url_b),
+            *cold_session_responses(payload, url_a),
+            *cold_session_responses(payload, url_b),
         ]
 
         result = await get_wal_status(mock_client, two_url_config, timeout=3.0)
@@ -519,8 +499,8 @@ class TestRemainingHelpersThreadTheirBudget:
         payload = {'stores': {}}
         mock_client = AsyncMock()
         mock_client.post.side_effect = [
-            *_cold_session_responses(payload, url_a),
-            *_cold_session_responses(payload, url_b),
+            *cold_session_responses(payload, url_a),
+            *cold_session_responses(payload, url_b),
         ]
 
         await get_wal_status(mock_client, two_url_config)
@@ -537,7 +517,7 @@ class TestRemainingHelpersThreadTheirBudget:
         mock_client = AsyncMock()
         mock_client.post.side_effect = [
             httpx.ConnectError('refused'),
-            *_cold_session_responses({'paused': False}, url_b),
+            *cold_session_responses({'paused': False}, url_b),
         ]
 
         result = await get_curator_state(mock_client, two_url_config, timeout=3.0)
@@ -558,7 +538,7 @@ class TestRemainingHelpersThreadTheirBudget:
 
         _url_a, url_b = two_url_config.fused_memory_urls
         mock_client = AsyncMock()
-        mock_client.post.side_effect = _cold_session_responses({'paused': False}, url_b)
+        mock_client.post.side_effect = cold_session_responses({'paused': False}, url_b)
 
         await get_curator_state(mock_client, two_url_config)
 

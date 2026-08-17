@@ -7,6 +7,7 @@ import json
 
 import httpx
 import pytest
+from _dashboard_helpers import cold_session_responses
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 
 
@@ -221,17 +222,6 @@ class TestProbeOneTimeoutBudget:
     surfaces the ``timeout`` kwarg to its handler.
     """
 
-    @staticmethod
-    def _cold_session_responses(inner: dict, url: str) -> list[httpx.Response]:
-        responses = [
-            _init_response(),
-            httpx.Response(202, headers={'mcp-session-id': 'test-session-id'}),
-            _mcp_response(inner),
-        ]
-        for resp in responses:
-            resp.request = httpx.Request('POST', f'{url.rstrip("/")}/mcp')
-        return responses
-
     async def test_budget_reaches_every_post(self):
         from unittest.mock import AsyncMock
 
@@ -239,7 +229,7 @@ class TestProbeOneTimeoutBudget:
 
         url = 'http://127.0.0.1:8100'
         mock_client = AsyncMock()
-        mock_client.post.side_effect = self._cold_session_responses(
+        mock_client.post.side_effect = cold_session_responses(
             TaskRuntimeSnapshot().model_dump(mode='json'), url,
         )
 
