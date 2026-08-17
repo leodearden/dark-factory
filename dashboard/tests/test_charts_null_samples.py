@@ -53,9 +53,11 @@ measured.
 
 WHY THE PROBES ARE PER COMPONENT — the components' folds differ textually
 (LineChart's poisoning fold is ``Math.max(...all``, BarChart's is
-``Math.max(...values``, StackedAreaChart's is ``Math.max(...totals``), so a
-single module-level probe tuple could not express what each component must no
-longer contain.  Each entry in ``_CONTRACTS`` therefore carries its own probe
+``Math.max(...values``, StackedAreaChart's is ``Math.max(...totals``, and
+HBarChart's is ``Math.max(...rows.map`` — it folded over the ROWS, projecting
+each one's value inside the fold, so it does not share a single character of
+its spread with the other four), so a single module-level probe tuple could not
+express what each component must no longer contain.  Each entry in ``_CONTRACTS`` therefore carries its own probe
 set, its own required builders, and — via ``_PRE_FIX_BODIES`` — its own
 verbatim pre-fix body for the negative control at the bottom.
 
