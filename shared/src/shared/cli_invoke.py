@@ -216,6 +216,7 @@ __all__ = [
     'classify_agent_failure',
     'count_transcript_turns',
     'detect_ended_awaiting_background',
+    'detect_resumable_progress',
     'ended_awaiting_background_for_session',
     'invoke_claude_agent',
     'invoke_with_cap_retry',
@@ -226,6 +227,7 @@ __all__ = [
     'note_unreadable_transcript',
     'read_transcript_records',
     'require_non_blank_prompt',
+    'resumable_progress_for_session',
     'transcript_exists',
 ]
 
