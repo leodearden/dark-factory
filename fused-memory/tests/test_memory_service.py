@@ -11774,6 +11774,133 @@ class TestCanonicalUniquenessAtSeam:
             )
 
 
+class TestCanonicalClaimChangeOnTheUpdatePath:
+    """The probe fires only on a NEW claim — so a record is never its OWN incumbent.
+
+    Task 3523. Wiring leaf ε's uniqueness re-check into `update_memory` raises
+    a question the add paths never face: the record being patched may ALREADY
+    hold the claim, and it is in the store, so a naive probe counts it and
+    rejects the record against itself.
+
+    Gating on the claim CHANGING dissolves that structurally rather than
+    patching around it. A probe is issued only when the write is ACQUIRING a
+    `(canonical, topic)` claim the record does not already hold — and a record
+    that does not yet hold the claim in the store cannot appear in the
+    store-side count. So no `exclude_id` is needed, and none should be added:
+    it would cost an extra round-trip on every canonical patch, need
+    `limit=2` to filter self out of the scroll, and risk over-excluding a real
+    duplicate.
+
+    It also preserves ε's contracted "ordinary writes issue ZERO extra
+    round-trips": re-asserting a claim the record already holds is a no-op,
+    and no-ops must not pay for I/O.
+    """
+
+    _TOPIC = 'some-topic'
+    _INCUMBENT = 'incumbent-uuid-1'
+    _POINT = 'point-1'
+
+    @staticmethod
+    def _stage(service, custom):
+        service.mem0.get_point_by_id = AsyncMock(
+            return_value={**DEFAULT_POINT_PAYLOAD, **custom}
+        )
+
+    @staticmethod
+    def _assert_no_probe(service):
+        """Neither half of the two-round-trip probe may have been spent."""
+        service.mem0.count_by_metadata.assert_not_called()
+        service.mem0.scroll_by_metadata.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reasserting_a_held_claim_issues_no_probe(self, service):
+        """THE self-incumbency case, stated as the no-op it is.
+
+        A foreign incumbent is staged, so a probe that ran WOULD find one —
+        without that staging this would pass for the wrong reason.
+        """
+        service.config.memory_metadata.enforce = True
+        self._stage(service, {'topic': self._TOPIC, 'canonical': True})
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+
+        await service.update_memory(
+            memory_id=self._POINT, project_id='dark_factory',
+            metadata_patch={'canonical': True},
+        )
+
+        service.mem0.set_payload.assert_awaited_once()
+        self._assert_no_probe(service)
+
+    @pytest.mark.asyncio
+    async def test_patching_an_unrelated_key_on_a_canonical_record_issues_no_probe(
+        self, service
+    ):
+        """ε's zero-extra-round-trips property, on the update path.
+
+        Every patch to an already-canonical record would otherwise pay a
+        Qdrant count it can only ever answer with "yes, itself".
+        """
+        service.config.memory_metadata.enforce = True
+        self._stage(service, {'topic': self._TOPIC, 'canonical': True})
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+
+        await service.update_memory(
+            memory_id=self._POINT, project_id='dark_factory',
+            metadata_patch={'x_note': 'hi'},
+        )
+
+        service.mem0.set_payload.assert_awaited_once()
+        self._assert_no_probe(service)
+
+    @pytest.mark.asyncio
+    async def test_acquiring_the_claim_does_probe_and_names_the_incumbent(
+        self, service
+    ):
+        """POSITIVE CONTROL — without it the two `assert_not_called`s above
+        cannot distinguish "correctly gated" from "the check is dead on this
+        path".
+
+        The pre-image carries the topic but NOT `canonical`, so this write is
+        genuinely acquiring a claim it does not hold.
+        """
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        service.config.memory_metadata.enforce = True
+        self._stage(service, {'topic': self._TOPIC})
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+
+        with pytest.raises(CanonicalUniquenessViolation) as excinfo:
+            await service.update_memory(
+                memory_id=self._POINT, project_id='dark_factory',
+                metadata_patch={'canonical': True},
+            )
+
+        assert excinfo.value.incumbent_id == self._INCUMBENT
+        service.mem0.set_payload.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_moving_the_claim_probes_the_new_topic(self, service):
+        """A claim that MOVES is acquired at the destination.
+
+        Asserted on the filters, not merely on "a probe happened": a gate
+        that compared only `canonical` would see no change here and skip the
+        check entirely, letting a canonical record be re-homed onto a topic
+        that already has one.
+        """
+        service.config.memory_metadata.enforce = True
+        self._stage(service, {'topic': self._TOPIC, 'canonical': True})
+
+        await service.update_memory(
+            memory_id=self._POINT, project_id='dark_factory',
+            metadata_patch={'topic': 'other-topic'},
+        )
+
+        service.mem0.count_by_metadata.assert_awaited_once()
+        call = service.mem0.count_by_metadata.await_args
+        filters = call.kwargs.get('filters', call.args[1] if len(call.args) > 1 else None)
+        assert filters == {'topic': 'other-topic', 'canonical': True}
+
+
 class TestParentIdLivenessAtSeam:
     """Write-time `metadata.parent_id` LIVENESS (task 3197, leaf δ).
 
