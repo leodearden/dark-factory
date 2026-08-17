@@ -43,9 +43,18 @@ section is hoisted into a named module-level constant --
 shorter variant (it routes back to the architect instead of just naming the
 escalation) -- and every assertion here is a containment check against one
 of those constants, never a string literal or regex against prompt prose.
-Roles are referenced BY IDENTITY (imported objects), not via a scan of
-``ROLES`` or of the module source, so a fourth sandboxed role added later
-requires a deliberate decision to extend this file.
+
+Two tests reference IMPLEMENTER/DEBUGGER/SIMPLE_TASK BY IDENTITY (imported
+objects) to pin WHICH variant each of those three known roles carries. A
+third test (task 4370 review, suggestion 2) instead derives its role set
+from the ``sandboxed`` invariant on ``ROLES``: for every role with
+``sandboxed=True``, at least one of the two constants must appear in its
+``system_prompt``. The by-identity tests alone would let a future sandboxed
+role ship with no Scope Boundary section at all and stay silently green --
+the same silent-pass shape this module's deleted ``'scope_violation'`` check
+had -- so the invariant-based test closes that gap without pinning prose or
+literals, while the by-identity tests keep guarding which variant the three
+known roles get.
 """
 
 from __future__ import annotations
@@ -53,6 +62,7 @@ from __future__ import annotations
 from orchestrator.agents.roles import (
     DEBUGGER,
     IMPLEMENTER,
+    ROLES,
     SCOPE_BOUNDARY_GUIDANCE,
     SCOPE_BOUNDARY_GUIDANCE_SIMPLE,
     SIMPLE_TASK,
@@ -86,4 +96,29 @@ def test_simple_task_carries_the_simple_variant() -> None:
         'system_prompt. Unlike IMPLEMENTER/DEBUGGER, SIMPLE_TASK routes an '
         'out-of-scope write back to the architect -- restore the splice '
         'rather than substituting the shared SCOPE_BOUNDARY_GUIDANCE.'
+    )
+
+
+def test_every_sandboxed_role_carries_scope_boundary_guidance() -> None:
+    """Every ``sandboxed=True`` role in ROLES carries a Scope Boundary variant.
+
+    Derived from the ``sandboxed`` invariant on ``ROLES`` (task 4370 review,
+    suggestion 2) rather than a hand-written tuple, so a future role that
+    sets ``sandboxed=True`` without adding a Scope Boundary splice fails
+    here instead of passing silently. The two tests above keep pinning
+    WHICH variant IMPLEMENTER/DEBUGGER/SIMPLE_TASK each carry by identity;
+    this one only guards that every sandboxed role carries *a* variant.
+    """
+    offenders = [
+        role.name for role in ROLES.values()
+        if role.sandboxed
+        and SCOPE_BOUNDARY_GUIDANCE not in role.system_prompt
+        and SCOPE_BOUNDARY_GUIDANCE_SIMPLE not in role.system_prompt
+    ]
+    assert offenders == [], (
+        f'Sandboxed role(s) missing both Scope Boundary variants from '
+        f'system_prompt: {offenders}. Splice SCOPE_BOUNDARY_GUIDANCE (or '
+        'SCOPE_BOUNDARY_GUIDANCE_SIMPLE for an architect-handback role like '
+        'SIMPLE_TASK) into this role rather than leaving a sandboxed role '
+        'with no Scope Boundary section at all.'
     )
