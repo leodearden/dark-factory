@@ -109,6 +109,28 @@ the same task renamed every PATH-exposed fixture unit to ``orchestrator-fake*``
 :func:`assert_synthetic_units`) — which is why the rename and the guard are one
 defence, not two.
 
+Task 3950 closed the last two exceptions to that claim —
+``scripts/tests/test_restart_orchestrator.py`` and
+``scripts/tests/test_deploy_w11_lane_lifecycle.py``, which task 3799 had to
+leave holding real unit names — so it now holds unqualified across all five
+members of the fake-``systemctl`` family.  HOW, because the mechanism is the
+reusable part: neither was convertible by renaming a constant.  The unit flowed
+SCRIPT → fake → assertion, so a synthetic name would only have broken the
+assertions while closing nothing; ``restart-orchestrator.sh``'s target had to
+become env-overridable (``ORCH_RESTART_UNIT``) FIRST, inverting the flow to
+FIXTURE → script → fake → assertion.  That inversion is the general remedy for
+any future harness in the same position.  THE COST, stated plainly rather than
+left to be rediscovered: retiring those two literals deleted the only pins on
+``restart-orchestrator.sh``'s production default, which is why
+``tests/scripts/test_orchestrator_watchdog.py::test_restart_orchestrator_unit_default_matches_across_tiers``
+exists.  Converting a fixture literal to a synthetic name silently DELETES
+whatever production contract that literal was also carrying — check for one,
+and replace it, before converting.  Finally, the seam in both files is
+``_run_script``, not the fake factory as in the other three harnesses, because
+both fakes parse argv and discard the unit token outright: the name never
+reaches the factory, only the real subprocess.  That divergence is deliberate;
+do not "fix" it back into line with the others.
+
 WHICH ROOTDIRS THE DRAIN-SCRIPT DEFENCES ARE WIRED INTO, and why the rest are
 deliberately not.  Nine conftests import from this module; the git ceiling and
 the deploy-clock guard are in all nine.  ``_df_no_leaked_drain_processes`` is
