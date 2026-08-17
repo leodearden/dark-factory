@@ -30,7 +30,11 @@ echoes it — the same split as ``eval-list-fixtures`` →
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+
+from orchestrator.flake_ledger import FlakeOccurrenceRow, FlakeVerdict
 
 # --- PRD §10 defaults --------------------------------------------------------
 #
@@ -101,3 +105,74 @@ def format_age(delta: timedelta | None) -> str:
         return '(unknown age)'
     total_hours = int(delta.total_seconds() // 3600)
     return f'{total_hours // 24}d {total_hours % 24}h'
+
+
+# --- §5.6 class 1: the gate has gone blind ----------------------------------
+
+
+@dataclass(frozen=True)
+class GateBlindCounter:
+    """The unconfirmable RATE over a window, plus everything needed to read it honestly.
+
+    ``rate`` is ``None`` — never ``0.0`` — when ``total`` is zero, and ``sufficient``
+    is separate from ``exceeds_threshold`` so the renderer can say "insufficient
+    observations" rather than "below threshold".  Those two states mean opposite things
+    to an operator: one is "the gate looks fine", the other is "we cannot tell".
+    """
+
+    unconfirmable: int
+    confirmed: int
+    total: int
+    rate: float | None
+    threshold: float
+    min_observations: int
+    sufficient: bool
+    exceeds_threshold: bool
+    window_hours: int
+    truncated: bool
+
+
+def compute_gate_blind(
+    occurrences: Sequence[FlakeOccurrenceRow],
+    *,
+    threshold: float = DEFAULT_GATE_BLIND_RATE_THRESHOLD,
+    min_observations: int = DEFAULT_GATE_BLIND_MIN_OBSERVATIONS,
+    window_hours: int = DEFAULT_GATE_BLIND_WINDOW_HOURS,
+    truncated: bool = False,
+) -> GateBlindCounter:
+    """Count ``unconfirmable`` against confirmed verdicts over *occurrences*.
+
+    Rows carrying the ``UNKNOWN_TEST_ID`` sentinel are COUNTED, deliberately: an
+    unconfirmable observation that resolved no node-ids is the entire class-1 signal
+    (§5.6 — "6 unconfirmable lines sat at INFO for a month"), so filtering it out
+    because it names no test would delete the measurement.
+
+    Verdicts are bucketed on :class:`FlakeVerdict` members, never on bare string
+    literals, so a typo cannot silently split a bucket.  An unrecognised verdict string
+    should be unreachable (``record_flake_occurrence`` coerces on the way in) but is
+    excluded from BOTH buckets and from ``total`` if it ever appears — inflating the
+    denominator with rows of unknown meaning would understate the rate, which is the
+    dangerous direction for a blindness counter.
+    """
+    unconfirmable = 0
+    confirmed = 0
+    for row in occurrences:
+        if row.verdict == FlakeVerdict.unconfirmable:
+            unconfirmable += 1
+        elif row.verdict in (FlakeVerdict.passes_in_isolation, FlakeVerdict.fails_in_isolation):
+            confirmed += 1
+    total = unconfirmable + confirmed
+    rate = (unconfirmable / total) if total else None
+    sufficient = total >= min_observations
+    return GateBlindCounter(
+        unconfirmable=unconfirmable,
+        confirmed=confirmed,
+        total=total,
+        rate=rate,
+        threshold=threshold,
+        min_observations=min_observations,
+        sufficient=sufficient,
+        exceeds_threshold=sufficient and rate is not None and rate > threshold,
+        window_hours=window_hours,
+        truncated=truncated,
+    )
