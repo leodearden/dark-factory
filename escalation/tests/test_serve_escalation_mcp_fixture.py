@@ -58,6 +58,63 @@ from fastmcp.client.transports import StreamableHttpTransport
 conftest: Any = _conftest_module
 
 # ---------------------------------------------------------------------------
+# The conftest reference must be resolved by IDENTITY, not by bare module name.
+# ---------------------------------------------------------------------------
+
+
+def test_the_conftest_reference_is_resolved_by_identity_not_by_bare_name(
+    escalation_conftest: Any,
+    request: pytest.FixtureRequest,
+) -> None:
+    """The conftest these tests reach into must be THIS directory's conftest.
+
+    Under the repo-wide ``--import-mode=importlib`` addopts, pytest names a
+    conftest module BY COLLISION, so a bare name is not a stable handle.
+    Measured in this repo:
+
+    * ``cd escalation && pytest tests/...`` -- ``escalation/tests/conftest.py``
+      is ``__name__ == 'conftest'``; a bare ``import conftest`` finds it.
+    * ``pytest shared/tests/test_task_statuses.py <this file>`` from the repo
+      root (same with ``orchestrator/tests/test_routing.py`` leading) -- the
+      repo-root ``conftest.py`` sys.path shim claims the bare name first, and
+      escalation's is disambiguated to ``'escalation.tests.conftest'``. A
+      module-level ``import conftest`` then binds the ROOT SHIM, and 3 of this
+      module's 4 tests died with ``AttributeError: module 'conftest' has no
+      attribute 'serve_escalation_mcp'``.
+
+    That is the loud version of the failure. The silent version is worse and is
+    the real reason this contract is pinned: if the module that won the bare
+    name happened to carry a same-named attribute, the tests below would run
+    green against the WRONG object instead of erroring. This module is the
+    single contract test for a harness three modules depend on, so it must not
+    be able to lose its subject to collection order.
+
+    The identity assertion is made against the plugin manager, which keys
+    conftest plugins by absolute PATH (measured) rather than by module name --
+    so it pins the exact module object pytest itself loaded for this directory,
+    which is what makes ``monkeypatch.setattr`` on it patch the live copy the
+    fixtures actually read.
+    """
+    conftest_path = Path(__file__).with_name('conftest.py')
+    registered = request.config.pluginmanager.get_plugin(str(conftest_path))
+
+    assert escalation_conftest is registered, (
+        'escalation_conftest must BE the conftest module object pytest loaded '
+        f'for {conftest_path} (keyed by path in the plugin manager), not a '
+        f'second import of the same file; got {escalation_conftest!r} vs '
+        f'{registered!r}'
+    )
+    assert Path(escalation_conftest.__file__) == conftest_path, (
+        'escalation_conftest resolved to the wrong file -- a bare-name '
+        f'collision is exactly this failure; got {escalation_conftest.__file__}'
+    )
+    assert hasattr(escalation_conftest, 'serve_escalation_mcp'), (
+        'the resolved conftest does not carry serve_escalation_mcp, so it is '
+        'not this suite\'s harness conftest'
+    )
+
+
+# ---------------------------------------------------------------------------
 # A live TCP endpoint that is NOT an MCP server — the readiness discriminator.
 # ---------------------------------------------------------------------------
 
