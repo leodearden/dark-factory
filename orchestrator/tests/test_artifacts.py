@@ -1,14 +1,21 @@
 """Tests for task artifacts management."""
 
+import copy
 import json
 import os
+import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-from orchestrator.artifacts import TaskArtifacts, _normalize_plan
+from orchestrator.artifacts import (
+    PLAN_SCHEMA_VERSION,
+    TaskArtifacts,
+    _normalize_plan,
+)
 
 
 @pytest.fixture
@@ -2349,3 +2356,218 @@ class TestWriteMarkupResidue:
         assert json.loads(
             (first.root / first_id).read_text()
         )['raw_value'] == 'FIRST payload'
+
+
+# ---------------------------------------------------------------------------
+# task 3957 step-1 — the atomicity contract of ``TaskArtifacts._write_json``,
+# stated as an executable property rather than as an assertion about code.
+# ---------------------------------------------------------------------------
+
+
+class TestWriteJsonIsAtomic:
+    """A concurrent reader never observes a partial `.task-meta` artifact.
+
+    ``_write_json`` is the single write seam behind ~13 whole-file JSON
+    artifacts (metadata, plan, review_state, reviews, verdicts,
+    agent_session, reconcile_state, the report artifacts).  The contract it
+    owns: a reader racing a write sees either the complete OLD document or
+    the complete NEW one — never a truncated file, and never a missing one.
+
+    The only convincing evidence for that is to race it, so these tests do.
+    The harness is ported from the plan-tools suite that proved the same
+    property for `_atomic_write_plan`; it is asserted here at the layer that
+    now owns the guarantee, and for a NON-plan artifact too, so the contract
+    is visibly `_write_json`'s rather than plan.json's alone.
+    """
+
+    READERS = 4
+    READS_PER_READER = 300
+    WRITES = 50
+
+    @staticmethod
+    def _race(readers, reads_per_reader, read_once, write_all):
+        """Run *readers* threads calling *read_once* while *write_all* writes.
+
+        Returns the list of values *read_once* produced.  Readers are barrier
+        -synchronised with the writer so the reads genuinely overlap the
+        writes rather than all landing before the first one.
+        """
+        observations: list = []
+        errors: list = []
+        start = threading.Barrier(readers + 1)
+        done = threading.Event()
+
+        def reader():
+            start.wait(timeout=30)
+            for _ in range(reads_per_reader):
+                try:
+                    observations.append(read_once())
+                except Exception as exc:  # noqa: BLE001 — recorded, then asserted on
+                    errors.append(repr(exc))
+                if done.is_set():
+                    break
+
+        threads = [
+            threading.Thread(target=reader, name=f'reader-{i}', daemon=True)
+            for i in range(readers)
+        ]
+        for thread in threads:
+            thread.start()
+
+        start.wait(timeout=30)
+        try:
+            write_all()
+        finally:
+            done.set()
+
+        for thread in threads:
+            thread.join(timeout=60)
+            assert not thread.is_alive(), f'{thread.name} did not finish'
+
+        return observations, errors
+
+    def test_readers_only_ever_observe_a_complete_document(
+        self, artifacts: TaskArtifacts
+    ):
+        plan_path = artifacts.root / 'plan.json'
+
+        # Two documents of DELIBERATELY different sizes: a torn read of the
+        # larger one cannot be mistaken for a clean read of the smaller.
+        doc_a = {'task_id': 'task-1', 'title': 'A' * 4000, 'steps': []}
+        doc_b = {'task_id': 'task-1', 'title': 'B', 'analysis': 'B' * 40000,
+                 'steps': []}
+        # What ``write_plan`` actually lands: the input plus its schema stamp.
+        expected = []
+        for doc in (doc_a, doc_b):
+            stamped = copy.deepcopy(doc)
+            stamped['_schema_version'] = PLAN_SCHEMA_VERSION
+            expected.append(stamped)
+
+        artifacts.write_plan(copy.deepcopy(doc_a))
+
+        def write_all():
+            for i in range(self.WRITES):
+                artifacts.write_plan(copy.deepcopy(doc_b if i % 2 else doc_a))
+
+        observations, errors = self._race(
+            self.READERS,
+            self.READS_PER_READER,
+            lambda: json.loads(plan_path.read_text()),
+            write_all,
+        )
+
+        assert errors == [], (
+            f'a reader observed an unparseable plan.json: {errors[:3]}'
+        )
+        unexpected = [o for o in observations if o not in expected]
+        assert unexpected == [], (
+            'a reader observed a document that is neither the pre-write nor '
+            f'the post-write plan: {[sorted(u) for u in unexpected[:2]]}'
+        )
+        assert observations, 'the readers observed nothing at all'
+
+    # A watcher thread can only sample the unlink→create window of a
+    # hypothetical unlink-then-create writer while it actually holds the GIL,
+    # and that window is a microsecond of bytecode.  Every one of these three
+    # constants was set by MUTATION, not by taste: with
+    # ``path.unlink(missing_ok=True)`` inserted before the write, one watcher
+    # at the stock 5 ms switch interval never caught it, and three watchers at
+    # 1 µs over 50 writes caught it only intermittently (1 of 3 runs).  At 500
+    # writes the same mutant dies on every run with four orders of magnitude
+    # of margin (~20k misses).  Do not lower ABSENCE_WRITES, raise the switch
+    # interval, or drop to one watcher: each silently returns this test to
+    # proving nothing at all.
+    WATCHERS = 3
+    ABSENCE_WRITES = 500
+    SWITCH_INTERVAL = 1e-6
+
+    def test_the_artifact_path_is_never_absent_mid_write(
+        self, artifacts: TaskArtifacts
+    ):
+        """The swap is a replace-in-place — never unlink-then-create.
+
+        Green against the superseded ``path.write_text`` too, which truncates
+        in place and so also never removes the name; this is a forward-looking
+        guard on the tmp+rename implementation, where ``os.replace`` is what
+        keeps the promise and a naive ``unlink`` + create would break it.
+        """
+        plan_path = artifacts.root / 'plan.json'
+        artifacts.write_plan({'task_id': 'task-1', 'steps': []})
+
+        misses: list = []
+        stop = threading.Event()
+
+        def watcher():
+            while not stop.is_set():
+                if not plan_path.exists():
+                    misses.append(1)
+
+        threads = [
+            threading.Thread(target=watcher, name=f'watcher-{i}', daemon=True)
+            for i in range(self.WATCHERS)
+        ]
+        previous_interval = sys.getswitchinterval()
+        sys.setswitchinterval(self.SWITCH_INTERVAL)
+        for thread in threads:
+            thread.start()
+        try:
+            for i in range(self.ABSENCE_WRITES):
+                artifacts.write_plan({'task_id': 'task-1', 'title': f't{i}',
+                                      'steps': []})
+        finally:
+            stop.set()
+            for thread in threads:
+                thread.join(timeout=30)
+            sys.setswitchinterval(previous_interval)
+
+        for thread in threads:
+            assert not thread.is_alive(), f'{thread.name} did not finish'
+        assert misses == [], 'plan.json vanished during an atomic write'
+
+    def test_a_non_plan_artifact_is_equally_atomic(
+        self, artifacts: TaskArtifacts
+    ):
+        """The contract belongs to `_write_json`, not to plan.json.
+
+        Driven through ``write_verdict`` so nothing about it is
+        plan-specific: if only ``write_plan`` were made atomic, this fails.
+        """
+        verdict_path = artifacts.root / 'verdicts' / 'judge.json'
+
+        def envelope(payload: str) -> dict:
+            return {
+                'role': 'judge',
+                'schema_version': 1,
+                'session_id': 's',
+                'emitted_at': 't',
+                'verdict': {'complete': True, 'notes': payload},
+            }
+
+        small = envelope('n' * 4000)
+        large = envelope('N' * 40000)
+        expected = [small, large]
+
+        artifacts.write_verdict('judge', copy.deepcopy(small))
+
+        def write_all():
+            for i in range(self.WRITES):
+                artifacts.write_verdict(
+                    'judge', copy.deepcopy(large if i % 2 else small)
+                )
+
+        observations, errors = self._race(
+            self.READERS,
+            self.READS_PER_READER,
+            lambda: json.loads(verdict_path.read_text()),
+            write_all,
+        )
+
+        assert errors == [], (
+            f'a reader observed an unparseable verdicts/judge.json: {errors[:3]}'
+        )
+        unexpected = [o for o in observations if o not in expected]
+        assert unexpected == [], (
+            'a reader observed a verdict envelope that is neither the '
+            f'pre-write nor the post-write one: {[sorted(u) for u in unexpected[:2]]}'
+        )
+        assert observations, 'the readers observed nothing at all'
