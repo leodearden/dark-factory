@@ -51,7 +51,7 @@ from shared.locking import files_to_modules, modules_conflict
 
 from dashboard.config import DashboardConfig
 from dashboard.data.active_tasks import _all_project_roots, _project_label, collect_active_tasks
-from dashboard.data.mcp_fanout import TTLCache, first_success
+from dashboard.data.mcp_fanout import TTLCache, fanout_label, first_success
 from dashboard.data.memory import mcp_tool_call
 from dashboard.data.utils import resolve_now
 
@@ -679,7 +679,11 @@ async def collect_scheduler_state(
         snapshot, events = await first_success(
             config.fused_memory_urls,
             _call,
-            log_label=f'get_scheduler_state[{label}]',
+            # String-identical to the former f'get_scheduler_state[{label}]' —
+            # fanout_label's basename form IS _project_label's. Routed through
+            # the helper so all four fan-out sites share one definition of the
+            # per-project-root throttle-key convention (see its docstring).
+            log_label=fanout_label('get_scheduler_state', root),
             offline_result=lambda errs: (None, []),
         )
         return label, snapshot, events

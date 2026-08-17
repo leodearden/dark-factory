@@ -16,6 +16,15 @@ Note: the three failover loops below raise ``ValueError`` from within their
 invalidating that URL's cached session. Previously a soft failure here fell
 through with a bare ``continue`` and no session teardown; see
 ``mcp_fanout``'s module docstring for why this normalization is intentional.
+
+Two of those three loops (``fetch_tasks``, ``fetch_statuses``) are
+parameterized by ``project_root``, so they compose their ``log_label``
+through ``mcp_fanout.fanout_label`` to keep each root's failure streak on its
+own throttle key — one fused-memory URL serves every root, so a fixed literal
+label would let a healthy root's success clear a broken root's streak and
+re-arm its opening WARNING every poll cycle. ``fetch_external_statuses`` is
+parameterized by a ``deps`` list rather than a root, so its fixed label is
+already a correct single key.
 """
 
 from __future__ import annotations
@@ -27,7 +36,7 @@ from typing import Any
 import httpx
 
 from dashboard.config import DashboardConfig
-from dashboard.data.mcp_fanout import TTLCache, first_success
+from dashboard.data.mcp_fanout import TTLCache, fanout_label, first_success
 from dashboard.data.memory import mcp_tool_call
 
 # ---------------------------------------------------------------------------
@@ -171,7 +180,7 @@ async def fetch_tasks(
         return await first_success(
             config.fused_memory_urls,
             _call,
-            log_label='fetch_tasks',
+            log_label=fanout_label('fetch_tasks', project_root_str),
             offline_result=lambda errs: {'offline': True, 'error': '; '.join(errs)},
         )
 
@@ -248,6 +257,6 @@ async def fetch_statuses(
     return await first_success(
         config.fused_memory_urls,
         _call,
-        log_label='fetch_statuses',
+        log_label=fanout_label('fetch_statuses', project_root_str),
         offline_result=lambda errs: {'offline': True, 'error': '; '.join(errs)},
     )
