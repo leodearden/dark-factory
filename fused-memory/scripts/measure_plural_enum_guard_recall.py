@@ -929,7 +929,20 @@ def render_markdown(report: Report) -> str:
         '',
     ]
     if report.triage_totals:
-        lines += ['| label | count | meaning |', '| --- | ---: | --- |']
+        # UNIT CHANGE, called out because the per-project table above is
+        # per-FACT and this one is per-MATCH: triage classifies each rejected
+        # match on its own linguistic merits, so a fact carrying two rejected
+        # enumerations contributes 1 to 'guard rejections' above and 2 here.
+        # Rendering both side by side without saying so invites a reader to
+        # subtract one from the other months from now.
+        lines += [
+            'Counts here are per rejected MATCH, not per fact: a fact with two '
+            'rejected enumerations contributes 1 to the `guard rejections` '
+            'column above and 2 below.',
+            '',
+            '| label | rejected matches | meaning |',
+            '| --- | ---: | --- |',
+        ]
         meanings = {
             ADVERBIAL_PREAMBLE:
                 'genuine RECALL LOSS — the enumeration really is the subject',

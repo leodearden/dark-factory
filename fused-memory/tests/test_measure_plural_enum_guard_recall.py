@@ -846,14 +846,26 @@ async def test_run_triages_every_rejection_it_reports():
     would understate recall loss silently — the one direction that matters,
     since it is the number a future reader would use to decide whether to
     tighten.
+
+    The reconciliation is against ``len(totals.rejections)``, NOT
+    ``totals.guard_rejected``: triage labels one entry per rejected MATCH,
+    while guard_rejected counts one per rejected FACT (the probe's documented
+    counting rule — a fact with two rejected enumerations adds 2 and 1
+    respectively). Comparing the triage sum against guard_rejected mixes those
+    units and holds only for corpora with at most one rejected match per fact.
+    The third project below is exactly such a fact, so this test cannot go back
+    to passing vacuously on that coincidence.
     """
     source = _FakeEdgeSource({
         'alpha': (_ALPHA_FACTS, True),
         'beta': (_BETA_FACTS, True),
+        # Two rejected matches in ONE fact — the shape that separates the two
+        # units and falsifies the per-fact spelling of the invariant below.
+        'gamma': ([_TWO_REJECTIONS_IN_ONE_FACT], True),
     })
 
     report = await run(
-        _args(project_id=['alpha', 'beta']), edge_source=source,
+        _args(project_id=['alpha', 'beta', 'gamma']), edge_source=source,
     )
 
     by_id = {p.project_id: p for p in report.projects}
@@ -861,7 +873,14 @@ async def test_run_triages_every_rejection_it_reports():
     assert by_id['alpha'].triage == {'prepositional_complement': 1}
     # 'As of <date>, tasks ...' is the documented recall loss
     assert by_id['beta'].triage == {'adverbial_preamble': 1}
-    assert sum(report.triage_totals.values()) == report.totals.guard_rejected
+    # One FACT, but TWO rejected matches, so two triage labels.
+    assert by_id['gamma'].triage == {'adverbial_preamble': 2}
+    assert by_id['gamma'].scan.guard_rejected == 1
+
+    assert sum(report.triage_totals.values()) == len(report.totals.rejections)
+    # ...and the two units really are distinct here, so the assertion above is
+    # doing work rather than comparing a number to itself.
+    assert len(report.totals.rejections) != report.totals.guard_rejected
 
 
 # A single fact carrying TWO guard-rejected enumerations, so a fact that is fed
