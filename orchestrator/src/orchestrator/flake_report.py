@@ -30,11 +30,17 @@ echoes it — the same split as ``eval-list-fixtures`` →
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from orchestrator.flake_ledger import DebtRow, FlakeOccurrenceRow, FlakeVerdict
+from orchestrator.flake_ledger import (
+    UNKNOWN_TEST_ID,
+    DebtRow,
+    FlakeCallSite,
+    FlakeOccurrenceRow,
+    FlakeVerdict,
+)
 
 # --- PRD §10 defaults --------------------------------------------------------
 #
@@ -328,3 +334,79 @@ def compute_systemic(
         threshold=distinct_tests,
         window_minutes=window_minutes,
     )
+
+
+# --- recurrence chains -------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ChainRow:
+    """One test's recurrence chain: its debt cycle plus its windowed occurrences."""
+
+    test_id: str
+    debt: DebtRow | None
+    occurrence_count: int
+    call_site_counts: dict[str, int]
+    last_observed_at: str | None
+
+
+def build_chains(
+    occurrences: Sequence[FlakeOccurrenceRow],
+    open_debt_rows: Sequence[DebtRow],
+    debt_lookup: Callable[[str], DebtRow | None],
+) -> list[ChainRow]:
+    """Per-test chains over the UNION of open debt and windowed occurrences.
+
+    The union is what makes the chain readable across cycles.  ``list_open_debt``
+    filters on ``resolved_at IS NULL``, so a chain built from it alone goes blank
+    exactly when a test is BETWEEN cycles — hiding the PRD's motivating case
+    (``test_spawn_claude.py``, 7 de-flake tasks in 7 weeks) at the very moment each fix
+    appears to have worked.  ``debt_lookup`` therefore reaches ``read_debt``, which
+    returns RESOLVED rows too (§5.2 retains them deliberately, because the recurrence
+    trigger reads them).
+
+    Including tests that have occurrences but NO debt row is also what makes task κ's
+    signal real: κ's acceptance check is that a ``CHRONIC-FLAKY`` marker with no JSONL
+    present produces an occurrence that appears in THIS REPORT and no second de-flake
+    task, which requires the report to show occurrences carrying no debt.
+
+    ``UNKNOWN_TEST_ID`` is excluded: a sentinel names no test, so it can own no chain —
+    ``open_debt`` itself refuses it for exactly this reason.  It still counts toward the
+    gate-blind rate, where it is the entire point.
+
+    ``call_site_counts`` is keyed on :class:`FlakeCallSite` values, so ``chronic_marker``
+    stays visible beside ``merge_gate`` and ``main_probe`` rather than hiding inside a
+    single per-test total — which is what would leave κ with no way to demonstrate its
+    signal, and would let θ's future per-site rates be derived a second, divergent way.
+
+    Ordering is deterministic — highest ``open_count`` first, then ``test_id`` — because
+    the rendered report must be byte-stable.
+    """
+    universe: set[str] = {row.test_id for row in open_debt_rows}
+    universe |= {row.test_id for row in occurrences if row.test_id != UNKNOWN_TEST_ID}
+
+    chains: list[ChainRow] = []
+    for test_id in universe:
+        mine = [row for row in occurrences if row.test_id == test_id]
+        counts: dict[str, int] = {}
+        for row in mine:
+            # Bucket on the enum's value where the string is a known member, so an
+            # unrecognised call_site stays visible under its own key instead of being
+            # dropped or folded into a neighbour.
+            try:
+                key = FlakeCallSite(row.call_site).value
+            except ValueError:
+                key = row.call_site
+            counts[key] = counts.get(key, 0) + 1
+        stamps = [row.observed_at for row in mine]
+        chains.append(
+            ChainRow(
+                test_id=test_id,
+                debt=debt_lookup(test_id),
+                occurrence_count=len(mine),
+                call_site_counts=counts,
+                last_observed_at=max(stamps) if stamps else None,
+            )
+        )
+    chains.sort(key=lambda c: (-(c.debt.open_count if c.debt else 0), c.test_id))
+    return chains
