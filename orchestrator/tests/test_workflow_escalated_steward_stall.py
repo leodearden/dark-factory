@@ -666,12 +666,24 @@ class TestStaleOutcomeHygiene:
 def _make_steward_config(project_root: Path) -> MagicMock:
     """A MagicMock ``OrchestratorConfig`` for a REAL ``TaskSteward``.
 
-    Same stamping recipe as ``test_steward.py``'s ``mock_config`` fixture so
-    the integration test does not introduce a second config shape.  Only the
-    fields the attempt-cap path actually reads are load-bearing
-    (``steward_max_attempts``, ``steward_lifetime_budget``); the routing stamp
-    is kept because the class's other paths reach ``resolve_route``, and a
-    ``spec_set`` MagicMock must not be the reason a future assertion moves.
+    Same stamping recipe as ``conftest.py``'s ``make_steward`` fixture — the
+    recipe's owner — so the integration test does not introduce a second config
+    shape.  (It previously named ``test_steward.py``'s ``mock_config``; task 3514
+    turned that into a one-line VIEW onto ``make_steward``, so the real owner is
+    the fixture.)  Only the fields the attempt-cap path actually reads are
+    load-bearing (``steward_max_attempts``, ``steward_lifetime_budget``); the
+    routing stamp is kept because the class's other paths reach
+    ``resolve_route``, and a ``spec_set`` MagicMock must not be the reason a
+    future assertion moves.
+
+    This factory stays SEPARATE from ``make_steward`` for three structural
+    reasons, examined by task 3551 and recorded in full in that fixture's
+    docstring: it feeds a ``TaskSteward`` SUBCLASS (``_CapFiringSteward`` below);
+    that construction passes ``config_dir=``, which the fixture does not accept;
+    and ``_make_real_steward_factory`` is a CALLBACK the workflow invokes later
+    with a worktree the workflow chooses, so it cannot request ``tmp_path`` at
+    construction time.  It does share the fixture's sandboxed ``project_root``
+    recipe (task 3551) — hence the required parameter.
 
     Deliberately SEPARATE from the workflow's own ``OrchestratorConfig``: the
     steward-side cap and the workflow-side ``steward_completion_timeout`` are

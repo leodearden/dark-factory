@@ -31,7 +31,8 @@ and are NOT already covered by other tests:
    ``.parent.mkdir()`` and ``sqlite3.connect(str(...))`` without crashing.
 
 6. **``make_steward`` owns its worktree** — the shared steward factory (as of
-   task 3514, the suite's *only* one) must root every worktree it builds
+   task 3514 the suite's only one, save the single documented exception task
+   3551 recorded in its ``conftest.py`` docstring) must root every worktree it builds
    strictly *below* the test's ``tmp_path``, whether the caller supplies one or
    not, so pytest's retention policy reclaims both the worktree and the
    ``.task-meta`` sibling the steward derives from it, and two default builds in
@@ -317,12 +318,19 @@ def test_mock_orch_config_overrides_db_path_default(mock_orch_config, tmp_path):
 class TestMakeStewardFixture:
     """Contract tests for the ``make_steward`` conftest fixture-factory.
 
-    ``make_steward`` is the suite's ONLY steward factory.  Task 3461 merged the
-    two near-identical ``_make_steward`` copies from ``test_suggestion_triage.py``
-    and ``test_workflow_state_machine_boundary.py``; task 3514 folded in the two
-    that remained (``test_out_of_band_routing.py``'s, and ``test_steward.py``'s
+    ``make_steward`` is the suite's steward factory, with one documented
+    exception.  Task 3461 merged the two near-identical ``_make_steward`` copies
+    from ``test_suggestion_triage.py`` and
+    ``test_workflow_state_machine_boundary.py``; task 3514 folded in the two that
+    remained (``test_out_of_band_routing.py``'s, and ``test_steward.py``'s
     five-fixture graph, whose fixture names survive there as views onto a single
-    build).  See the fixture docstring in ``conftest.py``.
+    build).  The exception is
+    ``test_workflow_escalated_steward_stall.py``'s ``_make_steward_config``,
+    which task 3551 examined and deliberately left separate — it builds a
+    ``TaskSteward`` SUBCLASS, passes ``config_dir=``, and hands back a callback
+    the workflow invokes later with a worktree it chooses.  The full rationale
+    lives in the fixture docstring in ``conftest.py``; see it before attempting
+    another consolidation.
 
     Because it closes over ``tmp_path`` it can *own* the worktree directory
     rather than merely documenting a convention, which is what these tests pin:
