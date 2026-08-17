@@ -2626,6 +2626,54 @@ class ReconReportState:
 # FastMCP server factory
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Tool classification (task 3878)
+# ---------------------------------------------------------------------------
+# REGISTERING A NEW @mcp.tool() BELOW MEANS CLASSIFYING IT INTO EXACTLY ONE OF
+# THREE BUCKETS. Two of them are declared here; the third is the derived
+# remainder, so most tools need no edit at all:
+#
+#   shared guidance  — every OTHER registered tool, i.e. the derived remainder
+#                      (`set(get_recon_report_tool_signatures()) -
+#                      HARNESS_CALLED_REPORT_TOOLS - STAGE_GATED_REPORT_TOOLS`).
+#                      These are rendered into the STAGE-AGNOSTIC guidance block
+#                      that reconciliation/prompts/__init__.py's
+#                      render_recon_report_tool_guidance() interpolates into ALL
+#                      THREE stage prompts. A new tool lands here by default and
+#                      is rendered automatically — that default is deliberate:
+#                      it is what makes silently omitting a tool from the
+#                      guidance structurally impossible.
+#   harness-called   — the harness calls it for the agent before the stage
+#                      begins, so a call example would be actively wrong.
+#                      start_report is the only one.
+#   stage-gated      — held by some stages but DENIED in others, so it must stay
+#                      out of the stage-agnostic block.
+#
+# Why stage-gated needs its own bucket rather than being swept into the shared
+# block: `--disallowed-tools` OMITS a denied tool rather than surfacing it and
+# rejecting the call (cli_stage_runner.py). So naming a denied tool in the
+# shared block does not produce a clean refusal — it tells Stage 1 and Stage 3
+# about an action they cannot take, and in write_entity_standing_decision's case
+# licenses a durable SQLite-ledger write from stages that are read-only with
+# respect to the ledger. That is precisely the norm
+# render_escalation_boundary_note() codifies in reconciliation/prompts/__init__.py:
+# never tell a stage about an action it is not sanctioned to take, and never
+# license a durable write from a read-only stage.
+#
+# Counter-example, so the boundary is not over-applied: delete_finding is NOT
+# stage-gated. It writes only in-process ReconReportState, sits in no disallow
+# list, and cli_stage_runner.py's carve-out NOTE plus stage3.py's own
+# post-guidance NOTE sanction it in every stage — so it is a shared-guidance
+# tool and belongs in the block.
+#
+# tests/test_recon_report_guidance_drift.py fails loudly until a newly
+# registered tool is classified: TestReportToolClassificationPartitionsTheLiveToolSet
+# additionally cross-checks STAGE_GATED_REPORT_TOOLS against
+# DISALLOW_RECON_REPORT_LEDGER_WRITES (cli_stage_runner.py) — the list that
+# actually reaches --disallowed-tools — so these two must move together.
+HARNESS_CALLED_REPORT_TOOLS: frozenset[str] = frozenset({'start_report'})
+STAGE_GATED_REPORT_TOOLS: frozenset[str] = frozenset({'write_entity_standing_decision'})
+
 RECON_REPORT_INSTRUCTIONS = """\
 This server provides the recon_report MCP namespace for the Dark Factory
 reconciliation pipeline.
