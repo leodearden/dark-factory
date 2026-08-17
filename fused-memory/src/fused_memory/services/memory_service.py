@@ -2642,6 +2642,18 @@ class MemoryService:
         # the tag reaches the persisted episodic node (and, via
         # _dual_write_callback, every fact derived from it).
         unverified_claim = bool(payload.pop('unverified_claim', False))
+        # task 3670: the referent set resolved at the write boundary, popped on
+        # the same channel. An ABSENT key decodes to ((), 'none'), so a queue
+        # row written before this feature executes byte-identically to today.
+        #
+        # `referents` is the value leaf zeta will hand to
+        # `_verify_episode_referents(result, group_id=..., referents=referents)`
+        # INSIDE the identity-lock critical section below — deliberately inside,
+        # so no wrongly-attached state is ever externally visible between the
+        # write and its verification. Nothing else in this method changes, which
+        # is what keeps an old-format row byte-identical.
+        referents: ReferentSet
+        referents, referent_source = _decode_referents(payload)
         reference_time_iso = payload.pop('reference_time', None)
         reference_time = None
         if reference_time_iso is not None:
