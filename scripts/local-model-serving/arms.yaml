@@ -26,14 +26,23 @@
 # lms_manifest.ArmEntry.is_placeholder is True while they stand, and the tools
 # refuse to launch or fetch such an arm rather than 404ing on a literal "TBD".
 #
-# POINTER STYLE.  Every reference from this file into the PRD is a STABLE
-# LOCATOR (a section heading plus a row/arm name), never a line number.  Task
-# 3973 converted all seven that this file previously carried -- they had all
-# drifted, first by task 3748's amendment banner and again by task 3804's, so
-# each one landed a reader in unrelated amendment prose.  Same lesson task 3748
-# learned when it rejected a README heading as a pin in favour of a function
-# name.  Do not re-introduce a line number here: the PRD grows a new banner at
-# the top on every amendment, which invalidates every number below it at once.
+# POINTER STYLE.  The rule is BIDIRECTIONAL: neither this file nor the PRD
+# cites the other by LINE NUMBER.  Every cross-reference is a STABLE LOCATOR --
+# a section heading plus a row/arm name going that way, an arm_id plus a field
+# or a quoted comment phrase coming this way.  Both files are edited by every
+# pass of this drift-correction class, so a number is invalid in both
+# directions: the PRD grows a new amendment banner at the TOP (invalidating
+# every number below it at once), and this file grows comment blocks in the
+# MIDDLE (shifting everything after them).
+#
+# Task 3973 converted all seven pointers this file previously carried into the
+# PRD -- they had all drifted, first by task 3748's amendment banner and again
+# by task 3804's, so each landed a reader in unrelated amendment prose -- plus
+# the two reciprocal PRD->here pointers, one of which (`arms.yaml:97-101`, for
+# the load-ratio calibration below) that same task had itself introduced one
+# pass earlier and which was already ~16 lines off target.  Same lesson task
+# 3748 learned when it rejected a README heading as a pin in favour of a
+# function name.  Do not re-introduce a line number in either direction.
 #
 # FIVE SIBLING files still carry `PRD line 134` / `PRD line 127` pointers with
 # the same defect -- lms_healthcheck.py, lms_manifest.py,

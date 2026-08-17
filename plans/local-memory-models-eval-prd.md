@@ -155,6 +155,20 @@ not counted as G1 consumers of anything here.
 > `tests/test_lms_healthcheck.py`, `tests/test_lms_vram.py` — still carry `PRD line 134` /
 > `PRD line 127` pointers with the identical defect. They are outside this task's declared file scope
 > and are recorded in arms.yaml's header note and in a follow-up rather than fixed here.
+>
+> **Fourth pass, same amendment (review round 3) — this task broke its own rule, in the direction it
+> had just declared.** The third pass converted the PRD→arms.yaml pointer and wrote that a line
+> number "cannot hold here", while D10's Consequence note — added by the *first* pass and never
+> re-read against the rule the third pass introduced — cited `arms.yaml:97-101` for the 0.972x load
+> ratio. That pointer was wrong when written and wrong now: 97-101 is the admission-floor rationale,
+> and the ratio derivation lives ~16 lines further down, in the `(Calibration, if a ratio is
+> wanted: …)` parenthetical. Converted to that stable locator. **The rule is BIDIRECTIONAL and is
+> now stated that way** in arms.yaml's POINTER STYLE note: neither file cites the other by line
+> number, because *both* are edited by every pass of this drift-correction class — the PRD grows a
+> banner at the top, and arms.yaml grows comment blocks in the middle. A whole-branch grep for
+> surviving `arms.yaml:NN` / `lines NN-NN` pointers returns this one and nothing else; the remaining
+> `line 127` / `line 134` strings in the banners above are **quotations of the broken pointers being
+> described**, not live references, and are correct as such.
 
 ## Goal
 
@@ -394,9 +408,10 @@ the real corpus is the primary instrument** and public benchmarks are a sanity a
       Qwen3.6-35B-A3B at IQ4) does not. **Note on the `~11.2, ~8.3` figures, marked here at the point
       of use:** both are weights, not `est_vram_gib`. Qwen3.5-9B's **11.21 GiB** is vLLM-reported,
       measured 2026-08-06 (arms.yaml's `qwen3.5-9b` comment: "vLLM reports 11.21 GiB FOR WEIGHTS ALONE
-      at this quant"); Phi-4 14B's **~8.27 GiB** is derived, not itself measured — arms.yaml:97-101
-      scales its 8.51 GiB of on-disk safetensors by the 0.972x vLLM load ratio the qwen snapshot
-      calibrated (11.21 / 11.53 GiB). arms.yaml's `est_vram_gib` (12.0 for qwen3.5-9b, 9.0 for
+      at this quant"); Phi-4 14B's **~8.27 GiB** is derived, not itself measured — arms.yaml, the
+      `qwen3.5-9b` arm's `est_vram_gib` comment block, its "(Calibration, if a ratio is wanted: …)"
+      parenthetical, scales phi-4's 8.51 GiB of on-disk safetensors by the 0.972x vLLM load ratio the
+      qwen snapshot calibrated (11.21 / 11.53 GiB). arms.yaml's `est_vram_gib` (12.0 for qwen3.5-9b, 9.0 for
       phi-4-14b) is a **different, stricter** quantity — a **declared** ADMISSION FLOOR, weights plus
       a non-KV allowance (~0.79 GiB for qwen; 8.27 + 0.79 = 9.06, i.e. exactly phi-4's declared 9.0) —
       deliberately NOT the figure used in this sentence, since substituting it would compare admission
