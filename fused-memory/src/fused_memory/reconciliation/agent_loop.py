@@ -29,6 +29,14 @@ from fused_memory.reconciliation import _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SE
 
 logger = logging.getLogger(__name__)
 
+# The CLOSED vocabulary of CLI-failure origins run() will propagate as
+# `warning_origin` (task 4343).  Both members are synthesised by _call_llm_cli
+# below; nothing else may enter, because the value lands in
+# VerificationResult.failure_token and from there in the reconciliation.db
+# `verify/codebase` audit row that operators GROUP BY.  An unbounded or
+# agent-controlled token there would make that census unqueryable.
+CLI_WARNING_ORIGINS = frozenset({'cli_output_unparseable', 'cli_output_empty'})
+
 CLAUDE_CLI_RESPONSE_SCHEMA = {
     'type': 'object',
     'properties': {
@@ -131,8 +139,23 @@ class AgentLoop:
                 # OpenAI adapters do not.  The key is omitted entirely when
                 # there is no origin, rather than emitting an empty string that
                 # would read like a measured value.
-                origin = getattr(response, 'warning', '') or ''
-                if origin:
+                #
+                # The membership test is load-bearing, not belt-and-braces:
+                # _CLIResponseAdapter.warning is structured_output['warning'],
+                # which is only OUR synthesised token when _call_llm_cli built
+                # the dict — on a real turn it is whatever the agent's own JSON
+                # happened to put there.  Propagating that unchecked would let
+                # agent-controlled content (or a non-str) reach
+                # VerificationResult.failure_token, which is a closed-vocabulary
+                # census column an operator groups by.  Unknown values are
+                # dropped: the generic 'no_tool_calls' still travels in
+                # `warning`, so nothing is silently lost.
+                # isinstance before the membership test: an unhashable value
+                # (a dict from agent-authored JSON) makes `in frozenset` raise
+                # TypeError, which would escape run() and turn a recoverable
+                # no-tool-call exit into a crash.
+                origin = getattr(response, 'warning', '')
+                if isinstance(origin, str) and origin in CLI_WARNING_ORIGINS:
                     payload['warning_origin'] = origin
                 return payload, self._journal_entries
 
@@ -467,12 +490,16 @@ class AgentLoop:
                     ' was unparseable JSON; treating as empty tool-call turn. Raw prefix: %s',
                     structured[:200],
                 )
+                # Token must stay a member of CLI_WARNING_ORIGINS (top of file)
+                # or run() will drop it as unknown.
                 structured = {'thinking': structured, 'tool_calls': [], 'warning': 'cli_output_unparseable'}
         if not structured:
             logger.warning(
                 'cli_output_empty: Claude CLI reported success but structured_output'
                 ' was empty/missing; treating as empty tool-call turn.',
             )
+            # Token must stay a member of CLI_WARNING_ORIGINS (top of file)
+            # or run() will drop it as unknown.
             structured = {'thinking': '', 'tool_calls': [], 'warning': 'cli_output_empty'}
 
         return _CLIResponseAdapter(structured, session_id=result.session_id)
@@ -525,6 +552,11 @@ class _CLIResponseAdapter:
     ``VerificationResult.failure_token`` so an operator reading
     ``reconciliation.db`` can tell an empty CLI response from an unparseable
     one without re-running anything.
+
+    Because this attribute is just ``structured_output['warning']``, it holds
+    OUR synthesised token only when ``_call_llm_cli`` built the dict; on a real
+    turn it is whatever the agent's own JSON put under that key.  ``run()``
+    therefore propagates it only if it is a member of ``CLI_WARNING_ORIGINS``.
     """
 
     def __init__(self, structured_output: dict, session_id: str = ''):

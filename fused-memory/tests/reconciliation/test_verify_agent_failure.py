@@ -228,6 +228,50 @@ async def test_verify_failure_token_falls_back_when_no_origin():
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('raw_origin', 'expected_token'),
+    [
+        ({'nested': 'dict'}, 'no_tool_calls'),   # non-str: must not reach pydantic
+        (17, 'no_tool_calls'),
+        (None, 'no_tool_calls'),
+        ('', 'no_tool_calls'),
+        ('  spaced  ', 'spaced'),                # stripped
+        ('x' * 200, 'x' * 64),                   # bounded
+    ],
+    ids=['dict', 'int', 'none', 'empty', 'stripped', 'bounded'],
+)
+async def test_verify_failure_token_coerces_malformed_origin(raw_origin, expected_token):
+    """A malformed `warning_origin` must degrade, never raise.
+
+    AgentLoop.run() gates the key on its closed CLI_WARNING_ORIGINS vocabulary,
+    but verify() is the pydantic construction boundary and must hold
+    independently: a non-str reaching ``failure_token`` would raise
+    ValidationError out of verify(), which targeted.py's except arm would then
+    record as a generic 'error' row — erasing the very diagnosis this task
+    preserves.  So non-strings fall through to the next candidate in the
+    preference chain, and strings are stripped and length-bounded so the
+    audit-row census stays groupable.
+    """
+    result_dict = {'warning': 'no_tool_calls', 'warning_origin': raw_origin, 'text': ''}
+
+    with patch('fused_memory.reconciliation.verify.AgentLoop') as MockAgentLoop:
+        mock_agent_instance = AsyncMock()
+        mock_agent_instance.run = AsyncMock(return_value=(result_dict, []))
+        MockAgentLoop.return_value = mock_agent_instance
+
+        verifier = CodebaseVerifier(_default_config())
+        result = await verifier.verify(claim='Task X completed')
+
+    assert result.agent_failed is True, (
+        f'Expected agent_failed=True but got {result.agent_failed!r}'
+    )
+    assert result.failure_token == expected_token, (
+        f'Expected failure_token={expected_token!r} for raw origin '
+        f'{raw_origin!r} but got {result.failure_token!r}'
+    )
+
+
 # ---------------------------------------------------------------------------
 # SUCCESS-PATH test (written now; must stay green before AND after step-2)
 # ---------------------------------------------------------------------------
