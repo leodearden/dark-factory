@@ -381,6 +381,25 @@ class TestReconReportActionableComputedDefault:
         assert 'finding_id' in result, result
         assert self._actionable_for(state, result['finding_id']) is False
 
+    def test_cross_project_prefixed_category_other_than_routing_defaults_false(self):
+        """Pins the PREFIX match (task-2432 bullet 1a docstring): the check is
+        `category.startswith('cross_project')`, not an allowlist keyed on the
+        one known name 'cross_project_routing'. A differently-named category
+        that merely starts with 'cross_project' must default to non-actionable
+        too; this catches a narrowing to an exact-name comparison."""
+        state = self._make_state()
+        result = state.add_finding(
+            run_id='r1',
+            severity='moderate',
+            category='cross_project_blocker',
+            description='a differently-named cross-project finding',
+            suggested_action='investigate',
+            task_id='123',
+            flag_type='cross_project',
+        )
+        assert 'finding_id' in result, result
+        assert self._actionable_for(state, result['finding_id']) is False
+
     def test_normal_finding_omitted_actionable_defaults_true(self):
         state = self._make_state()
         result = state.add_finding(
