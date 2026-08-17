@@ -59,7 +59,7 @@ import argparse
 import ast
 import re
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import NamedTuple
 
 
@@ -257,6 +257,58 @@ def _dataclass_violation_msg(shape: _DataclassShape, kwargs: set[str]) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Rule B debt baseline — SHRINK-ONLY.
+#
+# These 11 files carried 95 pre-existing dataclass-double sites when Rule B
+# landed (AST census over all seven scanned tests/ directories, task 4016).
+# Shipping the rule hot with no transition would have turned orchestrator/tests'
+# lint_command red on day one and stalled the merge lane repo-wide, so they are
+# grandfathered — Rule B ONLY; Rule A still applies in full to every file here.
+#
+# DO NOT ADD ENTRIES.  The list may only shrink, as files are migrated onto
+# _fake_verify_result / MagicMock(spec=VerifyResult); that migration is filed as
+# a follow-up task. A NEW file with a bare dataclass double must fail the gate —
+# that is the entire reason the baseline is opt-OUT rather than opt-in.
+#
+# orchestrator/tests/test_merge_speculation.py is deliberately NOT here: task
+# 3980 just cleaned that module, and a blanket entry would silently un-cover it.
+# Its one deliberate double carries a per-site pragma instead.
+_DATACLASS_DOUBLE_DEBT: frozenset[str] = frozenset({
+    'orchestrator/tests/test_merge_queue.py',  # 63 sites
+    'orchestrator/tests/test_concurrent_verify_boundary.py',  # 9 sites
+    'orchestrator/tests/test_merge_queue_permit_conservation.py',  # 7 sites
+    'orchestrator/tests/test_merge_queue_resolve_release.py',  # 7 sites
+    'orchestrator/tests/test_merge_queue_request_liveness.py',  # 3 sites
+    'orchestrator/tests/test_coalesce_integration_gate.py',  # 1 site
+    'orchestrator/tests/test_merge_item_union.py',  # 1 site
+    'orchestrator/tests/test_merge_queue_equivalence.py',  # 1 site
+    'orchestrator/tests/test_merge_queue_lifecycle_registry.py',  # 1 site
+    'orchestrator/tests/test_merge_queue_metrics.py',  # 1 site
+    'orchestrator/tests/test_merge_queue_single_writer_asserts.py',  # 1 site
+})
+
+
+def _is_debt_path(filename: str) -> bool:
+    """Return True if *filename* is a Rule B debt-baseline file.
+
+    Compares TRAILING PATH COMPONENTS, not substrings: ``a/b/c.py`` matches an
+    entry ``b/c.py`` because its last two components are exactly ``b`` and ``c.py``.
+    Component-awareness is what stops ``orchestrator/tests/not_test_merge_queue.py``
+    — which merely contains a debt filename as a substring — from being grandfathered.
+
+    Trailing-component matching (rather than an exact string compare) is required
+    because the nine call sites pass repo-relative paths while pytest passes
+    absolutes; both must reach the same verdict.
+    """
+    parts = PurePosixPath(filename.replace('\\', '/')).parts
+    for entry in _DATACLASS_DOUBLE_DEBT:
+        entry_parts = PurePosixPath(entry).parts
+        if len(parts) >= len(entry_parts) and parts[-len(entry_parts) :] == entry_parts:
+            return True
+    return False
+
+
 def _literal_kwarg_names(call: ast.Call) -> set[str]:
     """Return *call*'s literal keyword-argument names.
 
@@ -312,6 +364,10 @@ def _find_dataclass_double_violations(
     trips both rules yields two deterministically-ordered entries rather than a collision.
     """
     violations: list[Violation] = []
+    # Short-circuit before the walk: a debt-baseline file is grandfathered for
+    # Rule B wholesale (Rule A still applies — it runs in a separate pass).
+    if _is_debt_path(filename):
+        return violations
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
