@@ -164,7 +164,9 @@ class _StatusWriteNotPersisted(Exception):
     rather than just building the error dict inline — lets ``_txn``'s
     ``except`` clause roll back the whole transaction first, so on the
     atomic writer a mismatch rolls back the metadata merge too (both-or-
-    neither). Always caught by the same method that raised it and mapped to
+    neither). Raised by the shared :meth:`SqliteTaskBackend._write_status_and_verify`
+    tail and always caught by the public method that invoked it
+    (``set_task_status`` / ``set_status_and_stamp_audit``) and mapped to
     :meth:`to_error_dict`; never escapes to a caller.
     """
 
