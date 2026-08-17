@@ -7,6 +7,7 @@ test_purge_knowlive_namespace.py.
 from __future__ import annotations
 
 import importlib.util
+import logging
 import sys
 import types
 from pathlib import Path
@@ -40,6 +41,29 @@ def _load_module() -> types.ModuleType:
 
 
 _mod = _load_module()
+
+
+@pytest.fixture(autouse=True)
+def _neutralise_store_mutation_preflight(monkeypatch):
+    """Keep this MOCK-unit suite independent of the REAL ``~/.mem0``.
+
+    ``run(..., apply=True)`` runs a fail-closed capability preflight before it
+    enumerates or scrolls (task 4293). That probe touches the real filesystem,
+    so without this fixture every ``--apply`` test would pass or fail according
+    to whether the machine running pytest happens to be able to write mem0's
+    history directory -- and it genuinely cannot inside an agent sandbox, which
+    is the whole reason the guard exists. This suite is deliberately MOCK-unit
+    (MagicMock graphiti + AsyncMock Qdrant, no live backends), so the
+    environment must not be an input to it.
+
+    ``TestRunApplyStoreMutationPreflight`` re-rigs this per test -- to refuse,
+    to record, or to pass -- so the guard's own behaviour is still pinned
+    explicitly rather than assumed away.
+
+    Deliberately NOT ``raising=False``: if the guard is ever removed from the
+    script this fixture must break loudly rather than silently no-op.
+    """
+    monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
 
 
 # ===========================================================================
@@ -2945,3 +2969,210 @@ class TestRunApply:
         assert empty_by_collection['fused_knowlive']['disposition'] == 'DELETE'
         assert empty_by_collection['fused_my-project']['disposition'] == 'UNRESOLVED'
         assert _mod.has_unresolved(report) is True
+
+
+# ===========================================================================
+# Tests: --apply store-mutation preflight
+# ===========================================================================
+
+class TestRunApplyStoreMutationPreflight:
+    """``--apply`` refuses to START when this process cannot write mem0's store.
+
+    Ported from ``test_sweep_toolcall_xml_leak.TestRunApplyStoreMutationPreflight``
+    (task 3686), which is the in-repo precedent for this contract.
+
+    This is the widest blast radius of the eight call sites and the one where
+    PLACEMENT matters most. ``run`` has FOUR independent ``args.apply`` gates
+    -- graph-family merge, collection merge, junk-key ``GRAPH.DELETE`` and
+    empty-collection ``delete_collection`` -- each inside its own per-item
+    loop, and NONE dominates the other three. A guard at any one of them would
+    leave the other three phases unprotected, so only the top of ``run`` is a
+    single site that covers all four, and only there is the probe one per RUN
+    rather than one per item.
+    """
+
+    def _scenario(self):
+        """Mirror of ``TestRunApply._scenario`` -- the fixture that drives all
+        FOUR phases in one pass, which is what makes the one-probe assertion
+        below non-vacuous.
+
+        One mergeable sibling (know-live, whose post-move node count of 0 also
+        makes it DELETE-able as a junk key); one collection with points; and
+        the default-zero counts that make the EMPTY_COLLECTION_CLEANUP entries
+        droppable.
+        """
+        graphiti = _make_run_graphiti_mock(
+            entity_rows_by_key={'know-live': [['uuid-1', 'Node A']]},
+            total_count_by_key={'know-live': 0, 'my-project': 3, 'test-project': 0},
+        )
+        qdrant_client = _make_run_qdrant_mock(
+            points_by_collection={
+                'fused_dark-factory': [
+                    _make_point('p1', payload={'user_id': 'dark-factory'}),
+                ],
+            },
+        )
+        memory_service = _make_run_memory_service(graphiti, qdrant_client)
+        return memory_service, graphiti, qdrant_client
+
+    @staticmethod
+    def _deny(monkeypatch):
+        """Rig the preflight to refuse, as it would inside an agent sandbox."""
+        def _raise(*_args, **_kwargs):
+            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
+
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
+
+    @staticmethod
+    def _fail_closed_records(caplog) -> list:
+        """The guard site's OWN diagnosis.
+
+        ``main`` has no handler at all here, so the refusal exits as an
+        uncaught traceback and this ERROR record is the ONLY place the operator
+        is told what was refused and what to do instead. Pinned on the
+        fail-closed marker and the remedy noun ONLY, so every other word of the
+        message stays free to reword.
+
+        Asserting on message CONTENT is deliberate, and is the narrow exception
+        to the repo's don't-pin-guard-message-prose norm (task 3799): the record
+        this test is about is defined BY its content -- mere record-existence
+        would still pass if the whole diagnosis were replaced by "boom",
+        precisely the regression this exists to catch. Verified non-vacuous:
+        mutating the marker in the script turns this assertion red (task 4127
+        amendment).
+        """
+        return [
+            rec for rec in caplog.records
+            if rec.name == 'consolidate_namespace_families'
+            and rec.levelname == 'ERROR'
+            and 'NOT started (fail-closed)' in rec.getMessage()
+            and 'MCP server' in rec.getMessage()
+        ]
+
+    @pytest.mark.asyncio
+    async def test_apply_performs_zero_mutations_when_the_store_is_unwritable(
+        self, monkeypatch
+    ):
+        """The whole point: refuse to start rather than half-complete.
+
+        EVERY phase's mutation is asserted un-awaited, not one of them. A
+        zero-mutation claim covering a single phase would be vacuous here
+        precisely because the four gates are independent -- and a partial merge
+        is the worst outcome available: it strands records in the sibling
+        namespace with the canonical copy already written.
+        """
+        self._deny(monkeypatch)
+        mocks = _patch_merge_primitives(monkeypatch)
+        memory_service, graphiti, qdrant_client = self._scenario()
+
+        with pytest.raises(
+            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+        ):
+            await _mod.run(_run_args(apply=True), memory_service, limit=1000)
+
+        # Phase A/C -- the graph-family three-phase move.
+        mocks['create_node'].assert_not_awaited()
+        mocks['create_episode'].assert_not_awaited()
+        mocks['recreate'].assert_not_awaited()
+        mocks['delete_node'].assert_not_awaited()
+        mocks['delete_episode'].assert_not_awaited()
+        # Phase B -- the collection merge, and the empty-collection drop.
+        qdrant_client.upsert.assert_not_awaited()
+        qdrant_client.delete_collection.assert_not_awaited()
+        # The junk-key GRAPH.DELETE.
+        for graph in graphiti._graphs_by_key.values():
+            graph.delete.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_guard_sits_before_every_backend_read(self, monkeypatch):
+        """It aborts without a single round-trip: no graph is even resolved,
+        so neither the entity nor the episodic enumeration is paid for by a run
+        that was never going to be allowed to mutate. The Qdrant transport is
+        not opened either."""
+        self._deny(monkeypatch)
+        _patch_merge_primitives(monkeypatch)
+        memory_service, graphiti, _ = self._scenario()
+
+        with pytest.raises(_mod.StoreMutationUnavailable):
+            await _mod.run(_run_args(apply=True), memory_service, limit=1000)
+
+        graphiti._graph_for.assert_not_called()
+        memory_service.mem0._get_async_qdrant.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_dry_run_is_never_gated_on_write_capability(self, monkeypatch):
+        """A PREVIEW mutates nothing, so it must not require the ability to
+        mutate -- the consolidation report stays obtainable from anywhere, with
+        the deny still installed."""
+        self._deny(monkeypatch)
+        mocks = _patch_merge_primitives(monkeypatch)
+        memory_service, _, qdrant_client = self._scenario()
+
+        report = await _mod.run(_run_args(apply=False), memory_service, limit=1000)
+
+        assert report['applied'] is False
+        assert report['graph_family_merges']
+        mocks['create_node'].assert_not_awaited()
+        qdrant_client.upsert.assert_not_awaited()
+        qdrant_client.delete_collection.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_apply_is_unchanged_when_the_preflight_passes(self, monkeypatch):
+        """Happy path: a writable environment consolidates exactly as before,
+        driving all four phases."""
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+        mocks = _patch_merge_primitives(monkeypatch)
+        memory_service, _, qdrant_client = self._scenario()
+
+        report = await _mod.run(_run_args(apply=True), memory_service, limit=1000)
+
+        assert report['applied'] is True
+        mocks['create_node'].assert_awaited_once()
+        mocks['delete_node'].assert_awaited_once()
+        qdrant_client.upsert.assert_awaited()
+        qdrant_client.delete_collection.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_probe_names_the_operation_being_gated(self, monkeypatch):
+        """The refusal has to be attributable in a log, so the operation string
+        identifies this script and its mutating mode -- and for a fixture that
+        drives all FOUR phases it is still probed exactly once."""
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            _mod, 'assert_store_mutation_allowed', lambda **kw: calls.append(kw)
+        )
+        _patch_merge_primitives(monkeypatch)
+        memory_service, _, qdrant_client = self._scenario()
+
+        await _mod.run(_run_args(apply=True), memory_service, limit=1000)
+
+        # Non-vacuity: the fixture really did reach more than one phase.
+        qdrant_client.upsert.assert_awaited()
+        qdrant_client.delete_collection.assert_awaited()
+        assert len(calls) == 1, 'one probe dominates four independent phase gates'
+        assert 'consolidate_namespace_families' in calls[0]['operation']
+        assert '--apply' in calls[0]['operation']
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_is_loud(self, monkeypatch, caplog):
+        """The guard site logs its own fail-closed diagnosis before raising.
+
+        Nothing downstream will: this script's ``main`` has no blanket handler,
+        so without this record the operator sees a bare traceback naming an
+        exception class and no remedy.
+        """
+        self._deny(monkeypatch)
+        _patch_merge_primitives(monkeypatch)
+        memory_service, _, _ = self._scenario()
+
+        with (
+            caplog.at_level(logging.ERROR),
+            pytest.raises(_mod.StoreMutationUnavailable),
+        ):
+            await _mod.run(_run_args(apply=True), memory_service, limit=1000)
+
+        assert self._fail_closed_records(caplog), (
+            'nothing else explains this traceback -- the guard site must log '
+            'the fail-closed diagnosis before raising; got: '
+            f'{[rec.getMessage() for rec in caplog.records]}'
+        )
