@@ -671,6 +671,7 @@ async def _apply_memory_metadata_validation(
         config=config,
         count_canonical=count_canonical,
         find_canonical=find_canonical,
+        baseline=baseline,
     )
 
 
@@ -689,6 +690,7 @@ async def _check_canonical_uniqueness(
     config: MemoryMetadataConfig,
     count_canonical: Callable[[str, dict], Awaitable[int]],
     find_canonical: Callable[..., Awaitable[list[dict]]],
+    baseline: dict | None = None,
 ) -> None:
     """Enforce <=1 canonical memory per ``(project, topic)`` (PRD V1, INV-3).
 
@@ -759,9 +761,30 @@ async def _check_canonical_uniqueness(
        was already reported by the pure validator, and we must never build
        a query on a malformed key (``count_by_metadata`` also rejects an
        empty filter).
-    3. count == 0 → return.  The happy path pays exactly one exact Qdrant
+    3. *baseline* supplied and the effective ``(canonical, topic)`` claim
+       EQUALS the baseline's → return (task 3523).  This write asserts no
+       claim the record does not already hold, so there is nothing new to
+       check, and ε's contracted zero-extra-round-trips property must hold
+       for a no-op too.  Only ``update_memory`` supplies a baseline; the two
+       add paths pass none, keep this guard inert, and so keep today's exact
+       guard order and round-trip count.
+
+       THIS IS WHAT MAKES SELF-INCUMBENCY STRUCTURALLY IMPOSSIBLE — do not
+       "fix" it later by adding an ``exclude_id``.  The probe now runs only
+       when the record is ACQUIRING a claim, and a record that does not yet
+       hold the claim in the store cannot appear in the store-side count.
+       An ``exclude_id`` would instead cost an extra round-trip on every
+       canonical patch, need ``limit=2`` to filter self out of the scroll,
+       add a parameter to both injected collaborators, and risk
+       over-excluding a genuine duplicate — while STILL needing this guard
+       to avoid probing on a no-op.
+
+       Compared as a PAIR, not on ``canonical`` alone: a canonical record
+       re-homed from topic T to topic U changes no ``canonical`` value but
+       is acquiring a claim at U, where it genuinely is not the incumbent.
+    4. count == 0 → return.  The happy path pays exactly one exact Qdrant
        count and never scrolls.
-    4. otherwise resolve the incumbent's id and reject.
+    5. otherwise resolve the incumbent's id and reject.
 
     WHY COUNT THEN SCROLL: V1 contract-fixes ``count_memories_by_metadata``
     as the INV-3 mechanism, but also requires the error to name the existing
@@ -815,6 +838,14 @@ async def _check_canonical_uniqueness(
 
     topic = meta.get('topic')
     if not isinstance(topic, str) or not is_valid_topic_slug(topic):
+        return
+
+    # Guard 3 (task 3523) — no NEW claim, no probe.  See the numbered list in
+    # the docstring: this is what makes the record's own presence in the
+    # store irrelevant, so no `exclude_id` is needed anywhere below.
+    if baseline is not None and (
+        (baseline.get('canonical'), baseline.get('topic')) == (True, topic)
+    ):
         return
 
     filters = {'topic': topic, 'canonical': True}
