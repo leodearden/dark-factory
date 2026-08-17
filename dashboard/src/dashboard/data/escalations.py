@@ -463,8 +463,9 @@ async def fetch_pins_recovery(
     The value is THREE-state, mirroring
     :attr:`escalation.pins.PinReport.store_unavailable`:
 
-    * ``None`` — this project could not be read (transport error, timeout, or
-      a non-list result such as an error envelope).  UNKNOWN.
+    * ``None`` — this project could not be read (transport error, timeout, a
+      non-list result such as an error envelope, or an unanticipated exception
+      escaping the probe).  UNKNOWN.
     * ``{}`` — the read succeeded and no record carried an annotation (zero
       pending escalations, or a pre-3543 server).
     * ``{id: [task_ids]}`` — the read succeeded and these records are annotated.
@@ -489,8 +490,29 @@ async def fetch_pins_recovery(
     labels = list(escalation_urls.keys())
     urls = [escalation_urls[lbl] for lbl in labels]
     base_urls = [u.removesuffix('/mcp').rstrip('/') for u in urls]
-    results = await asyncio.gather(
+    # return_exceptions=True is what makes the per-project isolation promised
+    # above actually hold.  `_fetch_pins_one` catches the transport family it
+    # can anticipate ((TimeoutError, httpx.HTTPError, OSError, ValueError)), but
+    # `mcp_tool_call` reaches `McpSession.call_tool`, whose failure modes are
+    # not contractually narrowed to those — a RuntimeError from session-state
+    # handling, say, or a TypeError while unwrapping an envelope.  With
+    # return_exceptions=False such an escape propagates out of the gather and
+    # app.py's outer `except Exception` blanks the annotation for EVERY
+    # project at once, which is precisely the sinking-the-whole-fleet failure
+    # this fan-out exists to prevent.  Mapped to None, it degrades exactly one
+    # project to UNKNOWN instead.
+    settled = await asyncio.gather(
         *(_fetch_pins_one(client, base, per_call_timeout) for base in base_urls),
-        return_exceptions=False,
+        return_exceptions=True,
     )
+    results: list[dict[str, list[str]] | None] = []
+    for label, outcome in zip(labels, settled, strict=True):
+        if isinstance(outcome, BaseException):
+            logger.debug(
+                'pins_recovery probe for %s raised %s: %s — treating that '
+                'project as unknown', label, type(outcome).__name__, outcome,
+            )
+            results.append(None)
+        else:
+            results.append(outcome)
     return dict(zip(labels, results, strict=True))

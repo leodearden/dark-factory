@@ -1413,6 +1413,50 @@ class TestFetchPinsRecovery:
         assert result['proj8102'] is None
         assert result['proj8107'] == {}
 
+    async def test_unanticipated_exception_sinks_only_its_own_project(self):
+        """An exception class the probe does NOT catch degrades one project.
+
+        ``_fetch_pins_one`` catches the transport family it can anticipate
+        ((TimeoutError, httpx.HTTPError, OSError, ValueError)), but
+        ``mcp_tool_call`` reaches ``McpSession.call_tool``, whose failure modes
+        are not contractually narrowed to those.  If such an escape propagated
+        out of the gather, app.py's outer ``except Exception`` would blank the
+        annotation for EVERY project at once — the fleet-wide collapse this
+        per-project fan-out exists to prevent.  A RuntimeError stands in for
+        the whole unanticipated class.
+        """
+        from unittest.mock import patch
+
+        from dashboard.data.escalations import fetch_pins_recovery
+
+        async def _mcp(_client, base_url, _tool, _args):
+            if '8102' in base_url:
+                raise RuntimeError('session state went sideways')
+            return [_rec('esc-a', pins_recovery=['3543'])]
+
+        handler = _ExplodingHandler()  # every call is intercepted below
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            with patch(
+                'dashboard.data.escalations.mcp_tool_call', side_effect=_mcp,
+            ):
+                result = await fetch_pins_recovery(
+                    client, _pins_urls(8100, 8102, 8107),
+                )
+
+        assert set(result) == {'proj8100', 'proj8102', 'proj8107'}, (
+            'every configured label must still be present; got '
+            f'{sorted(result)!r}'
+        )
+        assert result['proj8102'] is None, (
+            'the raising project degrades to UNKNOWN, not to an empty map'
+        )
+        assert result['proj8100'] == {'esc-a': ['3543']}, (
+            "a sibling's unanticipated exception must not blank this "
+            f"project's annotation; got {result['proj8100']!r}"
+        )
+        assert result['proj8107'] == {'esc-a': ['3543']}
+
     async def test_records_that_are_not_dicts_do_not_raise(self):
         """A ragged list (strings/None mixed in) degrades instead of raising.
 
