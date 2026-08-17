@@ -3110,7 +3110,7 @@ class TestRunApplyStoreMutationPreflight:
 
         report = await _mod.run(_run_args(apply=False), memory_service, limit=1000)
 
-        assert report['applied'] is False
+        assert report['dry_run'] is True
         assert report['graph_family_merges']
         mocks['create_node'].assert_not_awaited()
         qdrant_client.upsert.assert_not_awaited()
@@ -3126,7 +3126,7 @@ class TestRunApplyStoreMutationPreflight:
 
         report = await _mod.run(_run_args(apply=True), memory_service, limit=1000)
 
-        assert report['applied'] is True
+        assert report['dry_run'] is False
         mocks['create_node'].assert_awaited_once()
         mocks['delete_node'].assert_awaited_once()
         qdrant_client.upsert.assert_awaited()
