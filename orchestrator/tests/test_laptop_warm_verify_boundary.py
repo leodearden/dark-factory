@@ -757,6 +757,59 @@ def test_row_watchdog_window_still_matches_production_constants():
 
 
 # ---------------------------------------------------------------------------
+# Task 4014 -- deterministic coverage for the load-scaled discovery ceiling.
+# Pure function, injected seams: no clock, no /proc, no subprocess.
+# ---------------------------------------------------------------------------
+
+
+def test_row_discovery_ceiling_scales_with_load_and_clamps():
+    """The discovery ceiling widens with per-core load and is bounded at both ends.
+
+    This is a WEDGE DETECTOR, not a speed assertion -- the rows assert THAT
+    a tree was discovered, never how fast -- so on the success path a wider
+    ceiling costs ZERO wall clock and is paid only when the test is already
+    failing.  The four properties that matter:
+
+    (a) an IDLE box must get exactly the base ceiling, so a quiet run is
+        never slowed down;
+    (b) real per-core load must actually widen it (3x per core is the BOTTOM
+        of this repo's measured dilation envelope);
+    (c) an absurd load must clamp, so a runaway box cannot stretch a row
+        past the pytest timeout that is DERIVED from that clamp;
+    (d) the mapping is monotone -- more load never yields a tighter deadline.
+    """
+    idle = row_discovery_ceiling_secs(_loadavg=0.1, _cpu_count=32)
+    assert idle == ROW_DISCOVERY_CEILING_BASE_SECS, (
+        f'an idle box must pay exactly the base ceiling '
+        f'({ROW_DISCOVERY_CEILING_BASE_SECS}); got {idle}'
+    )
+
+    loaded = row_discovery_ceiling_secs(_loadavg=96.0, _cpu_count=32)
+    assert loaded > ROW_DISCOVERY_CEILING_BASE_SECS, (
+        f'at 3x per-core load -- the BOTTOM of the measured dilation envelope -- '
+        f'the ceiling must widen past base; got {loaded}'
+    )
+
+    absurd = row_discovery_ceiling_secs(_loadavg=6400.0, _cpu_count=32)
+    assert absurd == ROW_DISCOVERY_CEILING_MAX_SECS, (
+        f'a runaway load must clamp to ROW_DISCOVERY_CEILING_MAX_SECS '
+        f'({ROW_DISCOVERY_CEILING_MAX_SECS}) -- that clamp is what the '
+        f'import-time pytest timeout is derived from; got {absurd}'
+    )
+
+    ladder = [
+        row_discovery_ceiling_secs(_loadavg=load, _cpu_count=32)
+        for load in (0.0, 1.0, 32.0, 64.0, 96.0, 200.0, 1000.0, 6400.0)
+    ]
+    assert ladder == sorted(ladder), (
+        f'more load must never yield a TIGHTER deadline; got {ladder}'
+    )
+    assert all(v >= ROW_DISCOVERY_CEILING_BASE_SECS for v in ladder), (
+        f'no reachable value may drop below the base ceiling; got {ladder}'
+    )
+
+
+# ---------------------------------------------------------------------------
 # Task 2819 -- deterministic unit coverage for wait_for_marker_stable, the
 # create+utimensat settle helper that de-flakes the Row 5 marker-retention
 # assertion below.  Both tests inject a private mtime-reader seam
