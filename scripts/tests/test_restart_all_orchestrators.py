@@ -922,3 +922,79 @@ def test_unit_that_stops_heartbeating_mid_defer_drops_into_the_shorter_grace(
     assert verdict_label in fired, (
         f"the scheduled {verdict_label} transition never landed: fired={fired!r}"
     )
+
+
+def test_unit_that_drains_during_the_unknown_grace_resumes_after_the_await(tmp_path):
+    """drain_gate's SECOND resume site: the post-drain_await_fresh idle
+    verdict (scripts/restart-all-orchestrators.sh:388-390). A unit that stops
+    heartbeating mid-defer, then comes back drained WHILE still inside the
+    bounded unknown grace, must resume the restart from there.
+
+    THE DISCRIMINATOR: this site's resume line
+    (f"resuming restart of {UNIT_R}: drained") is byte-identical to the
+    in-loop resume site's (378-381, pinned by
+    test_busy_unit_that_drains_mid_defer_resumes_and_restarts), so the two
+    can't be told apart by text. They're told apart by an ORDERING
+    INEQUALITY instead: ORCH_RESTART_FORCE_FIRE_AFTER_SECS=5 is deliberately
+    SMALLER than the scheduled idle flip at t=8, and drain_await_fresh never
+    consults the force-fire clock. A resume observed at ~t=8 is therefore
+    only reachable from INSIDE drain_await_fresh -- had control stayed in
+    the outer busy loop, it would have force-fired at t=5 instead. Do not
+    "simplify" the 5-vs-8 relationship; it is the assertion.
+    """
+    fleet_dir = tmp_path / "fleet"
+    bin_dir, state_path = _make_fake_systemctl(
+        tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
+    )
+    _write_heartbeat(fleet_dir, UNIT_R, **_HB_BUSY)
+
+    # ORCH_DRAIN_UNKNOWN_GRACE_SECS is the must-never-elapse bound here (the
+    # unit resumes on its own at t=8, well inside it); ONE binding still
+    # feeds it from spawn_timeout, per test_defer_withholds_restart_while_busy.
+    spawn_timeout = 20
+
+    with _heartbeat_timeline(
+        fleet_dir, UNIT_R,
+        [("stale", 2.0, _HB_STALE), ("idle", 8.0, _HB_IDLE)],
+    ) as fired:
+        result = _run_script(
+            bin_dir, state_path, fleet_dir, "--drain",
+            env={
+                "RESTART_VERIFY_TIMEOUT": "5",
+                "ORCH_RESTART_FORCE_FIRE_AFTER_SECS": "5",
+                "ORCH_DRAIN_UNKNOWN_GRACE_SECS": str(
+                    wait_proof_grace_secs(spawn_timeout)
+                ),
+                "ORCH_DRAIN_POLL_INTERVAL_SECS": "1",
+            },
+            timeout=spawn_timeout,
+        )
+
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert f"deferring restart of {UNIT_R}: mid-merge" in result.stdout, (
+        f"expected a defer line before the stale interlude; got "
+        f"stdout={result.stdout!r}"
+    )
+    assert f"resuming restart of {UNIT_R}: drained" in result.stdout, (
+        f"expected the post-await idle resume line; got stdout={result.stdout!r}"
+    )
+    # THE SITE-2 PROOF -- see the docstring's ordering-inequality argument.
+    assert "force-restarting" not in result.stdout.lower(), (
+        f"expected the resume to come from inside drain_await_fresh, not a "
+        f"force-fire; got stdout={result.stdout!r}"
+    )
+    # Fail-toward-convergence proof: the resume must come from the idle
+    # verdict itself, not from the unknown grace merely elapsing.
+    assert "proceeding with restart" not in result.stdout, (
+        f"expected the idle verdict to resume the restart, not the unknown "
+        f"grace elapsing; got stdout={result.stdout!r}"
+    )
+    state = _load_state(state_path)
+    assert ["--user", "restart", UNIT_R] in state["calls"], (
+        f"expected a restart call for {UNIT_R}; got calls={state['calls']!r}"
+    )
+    assert fired == ["stale", "idle"], (
+        f"expected both scheduled transitions to land in order; got fired={fired!r}"
+    )
