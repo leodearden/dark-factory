@@ -70,6 +70,7 @@ keyed on live host state would encode host state rather than checker behaviour.
 import argparse
 import dataclasses
 import pathlib
+import subprocess
 import sys
 from collections.abc import Sequence
 
@@ -102,6 +103,22 @@ _DEFAULT_INSTALLED_DIR = pathlib.Path.home() / ".config" / "systemd" / "user"
 # operator's report, where "<absent>" reads unambiguously and an empty string
 # would look like a directive set to nothing.
 _ABSENT = "<absent>"
+
+# The instance suffix probed in place of the bare template. `systemctl show`
+# on `lms-arm@.service` does not resolve %i-dependent state the way an
+# instance does, so the probe names one. The spelling matches
+# scripts/remove-lms-arm-worktree-dropin.sh's PROBE="${TEMPLATE}probe.service",
+# so both tools name the same unit and an operator reading either output sees
+# identical vocabulary.
+_PROBE_INSTANCE = "probe"
+
+# The two properties the probe asks for, in the order the argv spells them.
+_PROBE_KEYS = ("WorkingDirectory", "DropInPaths")
+
+# Bounded so a wedged systemd user manager cannot hang an install or a
+# host bring-up run. A timeout lands on the UNVERIFIABLE path, which is the
+# honest answer: the probe did not come back.
+_PROBE_TIMEOUT_SECONDS = 20
 
 
 def _log(message: str, *, stream=None) -> None:
@@ -272,6 +289,116 @@ def compare_unit(spec: UnitSpec, repo_text: str, installed_text: str) -> list[Dr
 
 
 # ---------------------------------------------------------------------------
+# The effective configuration
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class EffectiveConfig:
+    """What systemd says it would actually apply, or why we could not tell."""
+
+    # None when the probe did not answer usably. Distinct from "" (a key
+    # systemd reported as empty, which is the CLEAN answer for DropInPaths).
+    working_directory: str | None
+    dropin_paths: tuple[str, ...]
+    # Set iff the probe established nothing. Rendered verbatim to the operator.
+    unverifiable: str | None = None
+
+
+def probe_instance_name(template_name: str) -> str:
+    """Return the instance to probe for *template_name*.
+
+    ``lms-arm@.service`` -> ``lms-arm@probe.service``. Built from the template
+    rather than hardcoded so a renamed unit takes its probe with it.
+    """
+    stem, _, suffix = template_name.rpartition(".")
+    return f"{stem}{_PROBE_INSTANCE}.{suffix}"
+
+
+def probe_argv(template_name: str) -> list[str]:
+    """Return the exact ``systemctl show`` argv this checker issues.
+
+    Deliberately the SINGLE combined form, and deliberately WITHOUT
+    ``--value``. scripts/remove-lms-arm-worktree-dropin.sh issues two separate
+    ``show -p <KEY> --value`` calls; this diverges because the combined
+    no-``--value`` form yields self-labelling ``KEY=VALUE`` lines, is one
+    subprocess instead of two, and cannot mis-attribute a value to the wrong
+    key. Adding ``--value`` would strip the very keys the parser matches on, so
+    every run would parse nothing and report "unverifiable" forever — which is
+    why the argv is pinned by a test.
+    """
+    argv = ["systemctl", "--user", "show"]
+    for key in _PROBE_KEYS:
+        argv += ["-p", key]
+    argv.append(probe_instance_name(template_name))
+    return argv
+
+
+def _default_probe_runner(argv: Sequence[str]) -> tuple[int, str]:
+    """Run *argv* and return ``(returncode, stdout)``.
+
+    ``check=False`` because a non-zero exit is data here, not an exception:
+    it routes to the UNVERIFIABLE report rather than a traceback.
+    """
+    completed = subprocess.run(
+        list(argv),
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=_PROBE_TIMEOUT_SECONDS,
+    )
+    return completed.returncode, completed.stdout
+
+
+def read_effective_config(template_name: str, probe_runner) -> EffectiveConfig:
+    """Ask systemd what it would actually apply for *template_name*.
+
+    Every failure shape lands on ``unverifiable`` rather than on a plausible
+    default: a probe that did not run has established nothing, and a checker
+    that shrugged and reported parity would reproduce this task's own bug one
+    level up — a green claim covering nothing.
+    """
+    argv = probe_argv(template_name)
+    rendered = " ".join(argv)
+    try:
+        returncode, stdout = probe_runner(argv)
+    except FileNotFoundError:
+        # systemctl absent — a container, or a host with no systemd at all.
+        return EffectiveConfig(None, (), f"`{rendered}` failed: systemctl not found")
+    except subprocess.TimeoutExpired:
+        return EffectiveConfig(None, (), f"`{rendered}` timed out")
+    except OSError as exc:
+        return EffectiveConfig(None, (), f"`{rendered}` failed: {exc}")
+
+    if returncode != 0:
+        return EffectiveConfig(None, (), f"`{rendered}` exited {returncode}")
+
+    working_directory: str | None = None
+    dropin_paths: tuple[str, ...] = ()
+    saw_key = False
+    for line in stdout.splitlines():
+        key, sep, value = line.partition("=")
+        if not sep or key.strip() not in _PROBE_KEYS:
+            continue
+        saw_key = True
+        if key.strip() == "WorkingDirectory":
+            working_directory = value.strip()
+        else:
+            # systemd renders DropInPaths as a space-separated list, empty when
+            # nothing is merged.
+            dropin_paths = tuple(value.split())
+
+    if not saw_key:
+        # Includes the empty-stdout case, which is exactly what an unhandled
+        # subcommand returns from the fake systemctl in the installer tests.
+        return EffectiveConfig(
+            None, (), f"`{rendered}` reported neither {' nor '.join(_PROBE_KEYS)}"
+        )
+
+    return EffectiveConfig(working_directory, dropin_paths)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -310,10 +437,21 @@ def main(argv: Sequence[str], *, probe_runner=None) -> int:
     repo_root: pathlib.Path = args.repo_root
     selected = sorted(UNITS)
 
+    if probe_runner is None:
+        probe_runner = _default_probe_runner
+
     drifts: list[tuple[Drift, pathlib.Path, pathlib.Path]] = []
     missing: list[pathlib.Path] = []
     vanished: list[tuple[str, pathlib.Path]] = []
     overridden: list[tuple[str, list[pathlib.Path]]] = []
+    # (unit, expected, actual) — the effective WorkingDirectory disagreed.
+    effective_drifts: list[tuple[str, str, str]] = []
+    # (unit, reason) — the probe established nothing at all.
+    unverifiable: list[tuple[str, str]] = []
+    # (unit, [paths]) — drop-ins systemd itself named, a SUPERSET of the glob.
+    systemd_dropins: list[tuple[str, tuple[str, ...]]] = []
+    # (unit, resolved WorkingDirectory) — the affirmative clean confirmation.
+    confirmed: list[tuple[str, str]] = []
     # Units that actually reached compare_unit. The success line reports THIS
     # count, never len(selected): a report may only claim what it verified.
     compared: list[str] = []
@@ -341,12 +479,47 @@ def main(argv: Sequence[str], *, probe_runner=None) -> int:
             overridden.append((name, dropins))
 
         compared.append(name)
+        repo_text = repo_path.read_text(encoding="utf-8")
         for drift in compare_unit(
             spec,
-            repo_path.read_text(encoding="utf-8"),
+            repo_text,
             installed_path.read_text(encoding="utf-8"),
         ):
             drifts.append((drift, repo_path, installed_path))
+
+        # Ask systemd what it would ACTUALLY apply. Reached only once the
+        # installed unit is confirmed present: with nothing installed there is
+        # nothing to resolve, and that run already took the exit-2 path above.
+        effective = read_effective_config(name, probe_runner)
+        if effective.unverifiable is not None:
+            unverifiable.append((name, effective.unverifiable))
+            continue
+
+        if effective.dropin_paths:
+            systemd_dropins.append((name, effective.dropin_paths))
+
+        # EXPECTED comes from the committed template's own WorkingDirectory,
+        # never from --repo-root. The template hardcodes the main checkout, so
+        # running this from a worktree gives a --repo-root that is NOT the
+        # declared value — keying off it would false-red on every worktree run,
+        # and a gate that is red every time gets switched off. Sourcing it from
+        # the template also states the claim precisely: not "the unit points at
+        # this checkout" but "the committed template is the effective
+        # configuration".
+        declared = parse_unit_directives(repo_text).get("Service", {}).get(
+            "WorkingDirectory"
+        )
+        expected = declared[0] if declared else None
+        if expected is None:
+            unverifiable.append(
+                (name, "the committed template declares no [Service] WorkingDirectory")
+            )
+        elif effective.working_directory != expected:
+            effective_drifts.append(
+                (name, expected, effective.working_directory or _ABSENT)
+            )
+        elif not effective.dropin_paths:
+            confirmed.append((name, expected))
 
     for path in missing:
         _log(f"[skip] installed unit not found: {path} (not installed on this host)")
@@ -366,6 +539,25 @@ def main(argv: Sequence[str], *, probe_runner=None) -> int:
             "truth. Check --repo-root, and whether the unit was renamed or "
             "moved (the paths live in UNITS in this script)."
         )
+
+    # Fold systemd's own answer into the SAME [override] finding as the
+    # filesystem glob, merged per unit so one overridden unit stays one
+    # finding. systemd's list is a SUPERSET: it also merges
+    # /etc/systemd/user/ and /run/systemd/user/, which globbing
+    # --installed-dir can never see. Anything it names that the glob did not
+    # is therefore a real drop-in from outside the directory we read.
+    for name, paths in systemd_dropins:
+        merged = dict(overridden)
+        known = {str(p) for p in merged.get(name, [])}
+        fresh = [pathlib.Path(p) for p in paths if p not in known]
+        if not fresh:
+            continue
+        for index, (existing_name, existing) in enumerate(overridden):
+            if existing_name == name:
+                overridden[index] = (existing_name, [*existing, *fresh])
+                break
+        else:
+            overridden.append((name, fresh))
 
     if overridden:
         # Worded apart from [drift] for the same reason [vanished] is: this is
@@ -417,7 +609,46 @@ def main(argv: Sequence[str], *, probe_runner=None) -> int:
             "is no --fix)"
         )
 
-    if drifts or vanished or overridden:
+    if effective_drifts:
+        # Its own block, not folded into [drift]: a [drift] is a difference
+        # between two FILES the operator can diff and propagate. This is a
+        # difference between the committed template and what systemd resolved,
+        # which the files cannot show — the merged result is the only place it
+        # is visible.
+        _log(
+            f"[effective] {len(effective_drifts)} unit(s) resolve to a "
+            "WorkingDirectory that is NOT the one the committed template "
+            "declares:"
+        )
+        for name, expected, actual in effective_drifts:
+            _log(f"  {name}")
+            _log(f"      committed template: {expected}")
+            _log(f"      systemd resolved:   {actual}")
+        _log(
+            "[effective] An arm started now would run from the resolved path, "
+            "not the committed one. Inspect with: systemctl --user cat "
+            "lms-arm@<arm>.service"
+        )
+
+    if unverifiable:
+        # NEVER falls through to parity. A run that could not ask systemd has
+        # established nothing, so reporting success would be a green claim
+        # covering exactly zero verification — this task's own bug, one level
+        # up. Shares exit 1 with drift for the same reason [override] does.
+        _log(
+            f"[unverifiable] could not verify the effective configuration for "
+            f"{len(unverifiable)} unit(s):"
+        )
+        for name, reason in unverifiable:
+            _log(f"  {name}: {reason}")
+        _log(
+            "[unverifiable] The unit files may well match; what this run could "
+            "NOT establish is what systemd would actually apply. Check that a "
+            "systemd user manager is running for this user "
+            "(systemctl --user is-system-running)."
+        )
+
+    if drifts or vanished or overridden or effective_drifts or unverifiable:
         return 1
 
     if missing:
@@ -431,6 +662,17 @@ def main(argv: Sequence[str], *, probe_runner=None) -> int:
         # `continue` could quietly break, and it costs three lines.
         _log("[error] no units were compared — nothing was verified.")
         return 1
+
+    # An affirmative claim, not the absence of a complaint. "No complaint" and
+    # "verified clean" look identical in a log until the checker breaks, at
+    # which point silence reads as success — which is precisely how the old
+    # file-presence self-verify passed over a live override.
+    for name, working_directory in confirmed:
+        _log(
+            f"[effective] {name}: the committed template IS the effective "
+            f"configuration — systemd resolves WorkingDirectory="
+            f"{working_directory} and merges no drop-in."
+        )
 
     _log(f"[ok] parity — {len(compared)} unit(s) match their committed copies.")
     return 0
