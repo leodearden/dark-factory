@@ -31,6 +31,7 @@ from orchestrator.flake_report import (
     _parse_stamp,
     compute_gate_blind,
     compute_non_convergence,
+    compute_systemic,
     format_age,
 )
 
@@ -262,3 +263,76 @@ class TestNonConvergenceCounter:
     def test_oldest_age_is_none_when_nothing_parses(self):
         rows = [_debt(test_id='bad', opened_at='not-a-date')]
         assert compute_non_convergence(rows, _NOW).oldest_age is None
+
+
+class TestSystemicCounter:
+    """§5.6 class 3 — systemic host pressure, not N independent flaky tests."""
+
+    def test_four_distinct_tests_in_one_window_exceeds(self):
+        rows = [
+            _occ(test_id=f'tests/test_{i}.py::test_x', observed_at=f'2026-08-08T12:{i:02d}:00+00:00',
+                 row_id=i)
+            for i in range(4)
+        ]
+        counter = compute_systemic(rows)
+        assert counter.peak_distinct_tests == 4
+        assert counter.exceeds_threshold is True
+
+    def test_one_test_suppressed_six_times_is_not_systemic(self):
+        # §5.6's own discriminator, pinned: one test suppressing repeatedly is class 2
+        # (non-convergence), six DIFFERENT tests suppressing at once is class 3.
+        rows = [
+            _occ(test_id='tests/test_a.py::test_one',
+                 observed_at=f'2026-08-08T12:{i * 5:02d}:00+00:00', row_id=i)
+            for i in range(6)
+        ]
+        counter = compute_systemic(rows)
+        assert counter.peak_distinct_tests == 1
+        assert counter.exceeds_threshold is False
+
+    def test_the_window_actually_bounds_the_count(self):
+        rows = [
+            _occ(test_id=f'tests/test_{i}.py::test_x',
+                 observed_at=f'2026-08-08T{12 + i * 2:02d}:00:00+00:00', row_id=i)
+            for i in range(4)
+        ]
+        counter = compute_systemic(rows)
+        assert counter.peak_distinct_tests < 4, 'a 6-hour spread must not read as one window'
+        assert counter.exceeds_threshold is False
+
+    def test_only_passes_in_isolation_rows_count(self):
+        # fails_in_isolation is a real red, not a suppression — four of them are four
+        # genuine failures, and counting them would manufacture a systemic-pressure
+        # signal out of ordinary breakage.
+        rows = [
+            _occ(test_id=f'tests/test_{i}.py::test_x', verdict=FlakeVerdict.fails_in_isolation,
+                 observed_at=f'2026-08-08T12:{i:02d}:00+00:00', row_id=i)
+            for i in range(4)
+        ]
+        counter = compute_systemic(rows)
+        assert counter.peak_distinct_tests == 0
+        assert counter.exceeds_threshold is False
+
+    def test_peak_window_psi_carries_the_max_seen(self):
+        rows = [
+            _occ(test_id=f'tests/test_{i}.py::test_x', observed_at=f'2026-08-08T12:{i:02d}:00+00:00',
+                 psi=float(i) * 10.0, row_id=i)
+            for i in range(4)
+        ]
+        assert compute_systemic(rows).peak_window_psi == pytest.approx(30.0)
+
+    def test_peak_window_psi_is_none_when_every_row_lacks_it(self):
+        # A missing PSI read must never render as 0.0 pressure — that would read as
+        # "the host was idle", the opposite of "we could not measure the host".
+        rows = [
+            _occ(test_id=f'tests/test_{i}.py::test_x', observed_at=f'2026-08-08T12:{i:02d}:00+00:00',
+                 psi=None, row_id=i)
+            for i in range(4)
+        ]
+        assert compute_systemic(rows).peak_window_psi is None
+
+    def test_empty_input_is_zero_and_below_threshold(self):
+        counter = compute_systemic([])
+        assert counter.peak_distinct_tests == 0
+        assert counter.peak_window_start is None
+        assert counter.exceeds_threshold is False
