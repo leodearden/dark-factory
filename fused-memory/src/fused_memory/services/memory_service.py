@@ -2734,7 +2734,26 @@ class MemoryService:
                 causation_id=causation_id,
                 backend='graphiti',
                 operation='add_episode',
-                payload={'content': payload['content'][:200], 'group_id': payload.get('group_id')},
+                # referent_source/referent_count (task 3670) are the DURABLE
+                # half of the telemetry split, and come from the ONE decode
+                # above — never re-derived, so the durable channel and the
+                # in-process counter cannot disagree. The counter is the
+                # unconditional INV-4 escape (it exists even when
+                # `_write_journal` is None); this row is what gives leaf iota
+                # per-project, time-windowed data, through a journal row that
+                # already exists — no new schema, no new table, no new write.
+                # That resolves epsilon's half of PRD open question 2 (which
+                # suggested `write_ops.params`) without pre-empting iota's
+                # read-path choice.
+                #
+                # `len(referents)` is also what keeps the decoded set a live
+                # local rather than dead code until leaf zeta lands.
+                payload={
+                    'content': payload['content'][:200],
+                    'group_id': payload.get('group_id'),
+                    'referent_source': referent_source,
+                    'referent_count': len(referents),
+                },
                 coro=self.graphiti.add_episode(
                     name=payload.get('name', ''),
                     content=payload['content'],
