@@ -13853,8 +13853,8 @@ class TestRemediationSnapshotClockPinnedToTreeRead:
 
         import fused_memory.reconciliation.harness as harness_module
         from fused_memory.reconciliation.harness import (
-            TierConfig,
             _INTEGRITY_FINDING_RECURRENCE_THRESHOLD,
+            TierConfig,
         )
 
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
