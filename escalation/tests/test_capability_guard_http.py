@@ -47,36 +47,59 @@ from escalation.queue import EscalationQueue
 # ---------------------------------------------------------------------------
 # Harness: a real escalation MCP server served over HTTP in a daemon thread.
 #
-# Delegates to the shared ``serve_escalation_mcp`` factory fixture
+# Delegates to the shared ``serve_escalation_mcp_module`` factory fixture
 # (``conftest.py``) instead of a module-local copy of the start/serve/teardown
 # machinery (task 3736, INV-5 lockstep duplication -- this module used to carry
 # its own ephemeral-port picker and pending-task drainer plus the full thread +
 # event-loop dance, which is in fact the copy ``serve_escalation_mcp`` was
-# originally lifted from). ``serve_escalation_mcp`` is module-scoped precisely
-# so this module-scoped fixture can depend on it; pytest forbids the reverse.
+# originally lifted from). The ``_module``-scoped variant is required because
+# a fixture may not depend on a narrower-scoped one; pytest forbids the reverse.
 # All teardown behaviour -- the ``stopping`` flag, the pending-task drain, the
 # bounded 5s join and its loud (never softened) hung-thread assert -- now lives
-# once in ``serve_escalation_mcp``, with its regression test in
+# once in ``_serve_escalation_mcp_impl``, with its regression test in
 # ``test_serve_escalation_mcp_fixture.py``.
+#
+# DELIBERATELY NOT deduped by task 3736, so the remaining copies below do not
+# read as an oversight: the per-tool call helpers (``_resolve_over_http`` /
+# ``_promote_over_http`` / ``_stamp_triage_over_http``) still have near-twins in
+# ``test_status_authority_gate.py``. Task 3736 scoped itself to the SERVER
+# LIFECYCLE half. Within this module they are now one generic
+# ``_call_over_http`` plus three one-line partials, so the
+# X-Escalation-Levels/X-Escalation-Identity header protocol lives in exactly one
+# place HERE and one place there; folding those last two into a shared conftest
+# fixture is a follow-up, because a conftest helper is reachable only as a
+# fixture (a bare ``from conftest import ...`` is unsafe under
+# ``--import-mode=importlib``) and converting ~90 call sites in these two
+# modules to request it is a mechanical change far larger than this one.
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture(scope='module')
 def http_server(
     tmp_path_factory: pytest.TempPathFactory,
-    serve_escalation_mcp,
+    serve_escalation_mcp_module,
 ) -> Iterator[tuple[str, EscalationQueue]]:
     """Serve a real escalation MCP server over HTTP for this module's tests.
 
-    A thin scope/shape adapter over ``serve_escalation_mcp``: it owns no
+    A thin scope/shape adapter over ``serve_escalation_mcp_module``: it owns no
     server-lifecycle state, so there is nothing to tear down here -- teardown
-    happens once, in the shared fixture, at this module's end.
+    happens once, in the shared fixture, at this module's end. The
+    ``_module`` variant specifically, because a fixture may not depend on a
+    narrower-scoped one and this one is module-scoped (see below).
 
-    Two module-specific facts it does own:
+    Three module-specific facts it does own:
 
     * ``startup_sweep=False``, so pre-seeded queue files are not relocated by
       the startup sweep (the existing convention in this suite; also the
       factory's default, passed explicitly to keep it legible here).
+    * Deduplication: NOT passed, so this takes the factory's
+      ``DedupeConfig(infra_dedupe_enabled=False)`` default rather than
+      ``create_server``'s dedupe-ON default. Inert for this module -- every
+      record here is seeded through ``_seed`` (``queue.submit()`` directly),
+      and no test calls the dedupe-guarded ``escalate_*`` tools -- and the
+      safer default for a test: dedupe ON could collapse a
+      double-file regression into one record and let an "exactly one
+      escalation" assertion pass anyway.
     * The yielded shape, ``(base_url, queue)`` -- the factory's ``port`` is
       dropped, since every call site below unpacks a two-tuple.
 
@@ -91,7 +114,7 @@ def http_server(
     sequencing.
     """
     queue_dir = tmp_path_factory.mktemp('esc_capability_guard')
-    base_url, _port, queue = serve_escalation_mcp(queue_dir, startup_sweep=False)
+    base_url, _port, queue = serve_escalation_mcp_module(queue_dir, startup_sweep=False)
     yield base_url, queue
 
 
@@ -128,20 +151,23 @@ def _seed(
     return esc
 
 
-async def _resolve_over_http(
+async def _call_over_http(
     base_url: str,
+    tool_name: str,
     *,
     levels: str | None = None,
     identity: str | None = None,
-    **resolve_kwargs: Any,
+    **tool_kwargs: Any,
 ) -> dict[str, Any]:
-    """Call ``resolve_issue`` over real HTTP, optionally with capability headers.
+    """Call *tool_name* over real HTTP, optionally with capability headers.
 
-    *levels* / *identity*, when not None, are sent as the literal
+    The SINGLE place in this module that knows the capability-header wire
+    protocol. *levels* / *identity*, when not None, are sent as the literal
     ``X-Escalation-Levels`` / ``X-Escalation-Identity`` request headers; when
     None the header is omitted entirely (never sent as an empty string), so a
     header-less call exercises the exact same default-open path a real
-    header-less client would hit.
+    header-less client would hit. The three per-tool helpers below are
+    one-liners over this, so the header construction cannot drift between them.
     """
     headers: dict[str, str] = {}
     if levels is not None:
@@ -150,56 +176,27 @@ async def _resolve_over_http(
         headers['X-Escalation-Identity'] = identity
     transport = StreamableHttpTransport(f'{base_url}/mcp/', headers=headers)
     async with Client(transport) as client:
-        result = await client.call_tool('resolve_issue', resolve_kwargs)
+        result = await client.call_tool(tool_name, tool_kwargs)
         return result.data
 
 
-async def _promote_over_http(
-    base_url: str,
-    *,
-    levels: str | None = None,
-    identity: str | None = None,
-    **promote_kwargs: Any,
-) -> dict[str, Any]:
-    """Call ``promote_to_l2`` over real HTTP, optionally with capability headers.
-
-    Mirrors ``_resolve_over_http`` — used to prove ``promote_to_l2`` is never
-    gated by X-Escalation-Levels (it is intentionally left ungated).
-    """
-    headers: dict[str, str] = {}
-    if levels is not None:
-        headers['X-Escalation-Levels'] = levels
-    if identity is not None:
-        headers['X-Escalation-Identity'] = identity
-    transport = StreamableHttpTransport(f'{base_url}/mcp/', headers=headers)
-    async with Client(transport) as client:
-        result = await client.call_tool('promote_to_l2', promote_kwargs)
-        return result.data
+async def _resolve_over_http(base_url: str, **kwargs: Any) -> dict[str, Any]:
+    """``resolve_issue`` over real HTTP — the tool the capability guard gates."""
+    return await _call_over_http(base_url, 'resolve_issue', **kwargs)
 
 
-async def _stamp_triage_over_http(
-    base_url: str,
-    *,
-    levels: str | None = None,
-    identity: str | None = None,
-    **stamp_kwargs: Any,
-) -> dict[str, Any]:
-    """Call ``stamp_triage`` over real HTTP, optionally with capability headers.
+async def _promote_over_http(base_url: str, **kwargs: Any) -> dict[str, Any]:
+    """``promote_to_l2`` over real HTTP — used to prove it is never gated by
+    X-Escalation-Levels (it is intentionally left ungated)."""
+    return await _call_over_http(base_url, 'promote_to_l2', **kwargs)
 
-    Mirrors ``_resolve_over_http`` / ``_promote_over_http`` — used to prove
-    ``stamp_triage`` is never gated by X-Escalation-Levels (a triage-ack
-    annotation, not a state transition) while ``triaged_by`` is still
-    server-attributed from X-Escalation-Identity when present.
-    """
-    headers: dict[str, str] = {}
-    if levels is not None:
-        headers['X-Escalation-Levels'] = levels
-    if identity is not None:
-        headers['X-Escalation-Identity'] = identity
-    transport = StreamableHttpTransport(f'{base_url}/mcp/', headers=headers)
-    async with Client(transport) as client:
-        result = await client.call_tool('stamp_triage', stamp_kwargs)
-        return result.data
+
+async def _stamp_triage_over_http(base_url: str, **kwargs: Any) -> dict[str, Any]:
+    """``stamp_triage`` over real HTTP — used to prove it is never gated by
+    X-Escalation-Levels (a triage-ack annotation, not a state transition) while
+    ``triaged_by`` is still server-attributed from X-Escalation-Identity when
+    present."""
+    return await _call_over_http(base_url, 'stamp_triage', **kwargs)
 
 
 # ---------------------------------------------------------------------------

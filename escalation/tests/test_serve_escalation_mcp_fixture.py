@@ -1,7 +1,9 @@
 """Tests for the shared ``serve_escalation_mcp`` harness (``conftest.py``).
 
-``serve_escalation_mcp`` is the SINGLE implementation of the escalation
-"real MCP server over real HTTP" test harness in this suite: task 3736 folded
+``_serve_escalation_mcp_impl`` is the SINGLE implementation of the escalation
+"real MCP server over real HTTP" test harness in this suite, exposed at two
+scopes by the thin ``serve_escalation_mcp`` (function) and
+``serve_escalation_mcp_module`` (module) delegates: task 3736 folded
 ``test_capability_guard_http.py`` and ``test_status_authority_gate.py`` onto
 it, and ``test_legibility_census_escalation_e2e.py`` already drove it. Because
 it is shared, its contract is tested HERE, once — rather than as N byte-similar
@@ -11,14 +13,14 @@ lockstep duplication (INV-5) task 3736 exists to remove.
 These tests need the RAW module attributes — the undecorated fixture generator
 via ``__wrapped__``, so one server's startup and teardown can be observed in
 isolation from the module-scoped instance serving other tests, plus
-module-level helpers that are not fixtures at all. conftest hands ITSELF over
-for exactly that, through the ``escalation_conftest`` fixture. Injection, not
-a module-level ``import conftest``, is what makes the reference correct under
-any collection order: under the repo-wide ``--import-mode=importlib`` addopts
-pytest names a conftest BY COLLISION, so the bare name belongs to whichever
-conftest claimed it first — which in any repo-root multi-package run is not
-this one. See
-``test_the_conftest_reference_is_resolved_by_identity_not_by_bare_name``.
+module-level helpers and constants that are not fixtures at all. conftest hands
+ITSELF over for exactly that, through the ``escalation_conftest`` fixture.
+Injection, not a module-level ``import conftest``, is what makes the reference
+correct under any collection order: under the repo-wide
+``--import-mode=importlib`` addopts pytest names a conftest BY COLLISION, so
+the bare name belongs to whichever conftest claimed it first — which in any
+repo-root multi-package run is not this one. See
+``test_the_injected_conftest_is_this_directorys_conftest``.
 """
 
 from __future__ import annotations
@@ -43,59 +45,41 @@ from fastmcp.client.transports import StreamableHttpTransport
 # through that undeclared attribute.
 
 # ---------------------------------------------------------------------------
-# The conftest reference must be resolved by IDENTITY, not by bare module name.
+# The conftest reference must resolve to THIS directory's conftest.
 # ---------------------------------------------------------------------------
 
 
-def test_the_conftest_reference_is_resolved_by_identity_not_by_bare_name(
+def test_the_injected_conftest_is_this_directorys_conftest(
     escalation_conftest: Any,
-    request: pytest.FixtureRequest,
 ) -> None:
     """The conftest these tests reach into must be THIS directory's conftest.
 
     Under the repo-wide ``--import-mode=importlib`` addopts, pytest names a
     conftest module BY COLLISION, so a bare name is not a stable handle.
-    Measured in this repo:
+    Measured in this repo: ``escalation/tests/conftest.py`` is
+    ``__name__ == 'conftest'`` under ``cd escalation && pytest tests/...``, but
+    once the repo-root ``conftest.py`` shim claims the bare name first (any
+    repo-root multi-package run) escalation's is disambiguated to
+    ``'escalation.tests.conftest'`` -- and a module-level ``import conftest``
+    then binds the ROOT SHIM. Measured: 3 of this module's tests died with
+    ``AttributeError: module 'conftest' has no attribute
+    'serve_escalation_mcp'``. That is the loud version; the silent version --
+    the winner happening to carry a same-named attribute, so these tests run
+    green against the WRONG object -- is why this is pinned at all.
 
-    * ``cd escalation && pytest tests/...`` -- ``escalation/tests/conftest.py``
-      is ``__name__ == 'conftest'``; a bare ``import conftest`` finds it.
-    * ``pytest shared/tests/test_task_statuses.py <this file>`` from the repo
-      root (same with ``orchestrator/tests/test_routing.py`` leading) -- the
-      repo-root ``conftest.py`` sys.path shim claims the bare name first, and
-      escalation's is disambiguated to ``'escalation.tests.conftest'``. A
-      module-level ``import conftest`` then binds the ROOT SHIM, and 3 of this
-      module's 4 tests died with ``AttributeError: module 'conftest' has no
-      attribute 'serve_escalation_mcp'``.
-
-    That is the loud version of the failure. The silent version is worse and is
-    the real reason this contract is pinned: if the module that won the bare
-    name happened to carry a same-named attribute, the tests below would run
-    green against the WRONG object instead of erroring. This module is the
-    single contract test for a harness three modules depend on, so it must not
-    be able to lose its subject to collection order.
-
-    The identity assertion is made against the plugin manager, which keys
-    conftest plugins by absolute PATH (measured) rather than by module name --
-    so it pins the exact module object pytest itself loaded for this directory,
-    which is what makes ``monkeypatch.setattr`` on it patch the live copy the
-    fixtures actually read.
+    Only the file assertion is made. The stronger property, that the injected
+    object is the LIVE module pytest loaded rather than a second import of the
+    same file, is pinned BEHAVIOURALLY by the two tests below that
+    ``monkeypatch.setattr`` ``_free_escalation_port`` / ``_READY_TIMEOUT_S`` on
+    it and observe the fixture body pick both up -- something no second import
+    could satisfy. Asserting it here instead against
+    ``request.config.pluginmanager.get_plugin(str(path))`` would buy nothing
+    extra while adding a dependency on pytest's undocumented
+    conftest-keyed-by-str(path) internals, which can change on a version bump.
     """
-    conftest_path = Path(__file__).with_name('conftest.py')
-    registered = request.config.pluginmanager.get_plugin(str(conftest_path))
-
-    assert escalation_conftest is registered, (
-        'escalation_conftest must BE the conftest module object pytest loaded '
-        f'for {conftest_path} (keyed by path in the plugin manager), not a '
-        f'second import of the same file; got {escalation_conftest!r} vs '
-        f'{registered!r}'
-    )
-    assert Path(escalation_conftest.__file__) == conftest_path, (
+    assert Path(escalation_conftest.__file__) == Path(__file__).with_name('conftest.py'), (
         'escalation_conftest resolved to the wrong file -- a bare-name '
         f'collision is exactly this failure; got {escalation_conftest.__file__}'
-    )
-    assert hasattr(escalation_conftest, 'serve_escalation_mcp'), (
-        'the resolved conftest does not carry serve_escalation_mcp, so it is '
-        'not this suite\'s harness conftest'
     )
 
 
@@ -207,16 +191,24 @@ def test_startup_failure_that_is_not_a_runtimeerror_is_named_in_the_timeout(
     therefore reports the generic "did not become ready" and DROPS the one
     fact a reader needs, which is what this test forbids.
 
+    The CLIENT half of the wire is asserted too: ``_mcp_handshake_ready``
+    swallows every exception and returns False, so unless it records the last
+    one, a failure that is purely client-side (transport/protocol mismatch, a
+    proxy env var, a fastmcp version skew) leaves a healthy server thread, an
+    empty ``serve_error``, and a timeout message that merely restates the
+    timeout. Both halves must be named.
+
     Driven by monkeypatching the port allocator to hand back a port this test
     is already holding, so the failure is a real bind conflict rather than a
-    simulated one.
-
-    NOTE: this test necessarily waits out the fixture's full ~10s readiness
-    bound before raising -- that is the assertion, not a hang. It sits well
-    inside the suite's 60s per-test pytest-timeout.
+    simulated one, and by shortening ``_READY_TIMEOUT_S`` -- the timeout PATH
+    is the subject here, not its production duration, and paying the full ~10s
+    bound on every suite run to re-measure a constant buys nothing. Both
+    patches land on the injected conftest module, which is also what proves it
+    is the live one the fixture body reads.
     """
     with _listener_without_mcp_route() as port:
         monkeypatch.setattr(escalation_conftest, '_free_escalation_port', lambda: port)
+        monkeypatch.setattr(escalation_conftest, '_READY_TIMEOUT_S', 0.5)
 
         gen = escalation_conftest.serve_escalation_mcp.__wrapped__()
         try:
@@ -239,28 +231,71 @@ def test_startup_failure_that_is_not_a_runtimeerror_is_named_in_the_timeout(
             'actually happened (the bind conflict), not just report that the '
             'server never became ready; got: ' + repr(message)
         )
+        _, handshake_marker, handshake_detail = message.partition(
+            'last handshake error: '
+        )
+        assert handshake_marker and handshake_detail.strip(' )'), (
+            'the readiness-timeout error must also name the last CLIENT-side '
+            'handshake failure -- without it, a timeout whose server thread is '
+            'healthy reports nothing at all about why the handshake never '
+            'completed; got: ' + repr(message)
+        )
 
 
 # ---------------------------------------------------------------------------
-# serve_escalation_mcp must be MODULE-scoped: the migration rests on it.
+# The two scoped fixtures are adapters over ONE implementation.
+# ---------------------------------------------------------------------------
+
+
+def test_both_serve_escalation_mcp_fixtures_share_one_implementation(
+    escalation_conftest: Any,
+) -> None:
+    """``serve_escalation_mcp`` and ``serve_escalation_mcp_module`` must both
+    be thin ``yield from _serve_escalation_mcp_impl()`` delegates.
+
+    The two scopes exist for different consumers -- function-scoped callers
+    (``test_legibility_census_escalation_e2e.py``) keep per-TEST teardown and
+    per-test attribution of the bounded-join hung-thread assert, while
+    module-scoped ``http_server`` adapters need a factory at least as broad as
+    themselves -- but the SCOPE is meant to be the only difference between
+    them.
+
+    Pinned because the cheap way to add a scope is to copy the body, which
+    would restore exactly the INV-5 lockstep duplication task 3736 removed,
+    one layer up: two harnesses that must then be fixed in lockstep, with the
+    load-bearing teardown protocol (task 2741) in both. Asserting on
+    ``__code__.co_names`` rather than source text keeps this a check on what
+    the wrapper actually CALLS.
+    """
+    for name in ('serve_escalation_mcp', 'serve_escalation_mcp_module'):
+        wrapper = getattr(escalation_conftest, name).__wrapped__
+        assert '_serve_escalation_mcp_impl' in wrapper.__code__.co_names, (
+            f'{name} must delegate to _serve_escalation_mcp_impl rather than '
+            'carry its own copy of the start/serve/teardown protocol; it '
+            f'references {wrapper.__code__.co_names}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# serve_escalation_mcp_module must be MODULE-scoped: the migration rests on it.
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture(scope='module')
 def module_scoped_consumer(
     tmp_path_factory: pytest.TempPathFactory,
-    serve_escalation_mcp,
+    serve_escalation_mcp_module,
 ) -> tuple[str, object]:
-    """A module-scoped consumer of ``serve_escalation_mcp``, exactly the shape
-    both converted ``http_server`` fixtures take.
+    """A module-scoped consumer of ``serve_escalation_mcp_module``, exactly the
+    shape both converted ``http_server`` fixtures take.
 
-    This dependency is the whole reason ``serve_escalation_mcp`` is
-    module-scoped: pytest forbids a fixture from depending on a NARROWER-scoped
-    one, so while the factory was function-scoped this raised ``ScopeMismatch``
-    at setup and no module-scoped consumer could exist.
+    This dependency is the whole reason the ``_module`` variant exists: pytest
+    forbids a fixture from depending on a NARROWER-scoped one, so requesting
+    the function-scoped ``serve_escalation_mcp`` from here raises
+    ``ScopeMismatch`` at setup and no module-scoped consumer could exist.
     """
     queue_dir = tmp_path_factory.mktemp('serve_escalation_mcp_scope')
-    base_url, _port, queue = serve_escalation_mcp(queue_dir)
+    base_url, _port, queue = serve_escalation_mcp_module(queue_dir)
     return base_url, queue
 
 
@@ -273,9 +308,9 @@ def test_a_module_scoped_fixture_may_depend_on_serve_escalation_mcp(
     This is the self-enforcing guard for the rest of task 3736: it takes the
     same dependency ``test_capability_guard_http.py`` and
     ``test_status_authority_gate.py`` now take, so a future narrowing of
-    ``serve_escalation_mcp`` back to function scope fails HERE, loudly and by
-    name, instead of surfacing as two unrelated modules going red for reasons
-    that read like a server bug.
+    ``serve_escalation_mcp_module`` back to function scope fails HERE, loudly
+    and by name, instead of surfacing as two unrelated modules going red for
+    reasons that read like a server bug.
 
     The ``list_tools()`` round-trip is deliberate: a fixture that resolved
     scope correctly but handed back a dead base_url would otherwise pass.

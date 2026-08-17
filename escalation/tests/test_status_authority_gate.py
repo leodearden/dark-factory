@@ -97,11 +97,11 @@ def _seed(
 @pytest.fixture(scope='module')
 def http_server(
     tmp_path_factory: pytest.TempPathFactory,
-    serve_escalation_mcp,
+    serve_escalation_mcp_module,
 ) -> Iterator[tuple[str, EscalationQueue]]:
     """Serve a real escalation MCP server over HTTP for this module's tests.
 
-    A thin scope/shape adapter over the shared ``serve_escalation_mcp``
+    A thin scope/shape adapter over the shared ``serve_escalation_mcp_module``
     factory (``conftest.py``): it owns no server-lifecycle state, so the whole
     start/serve/teardown protocol -- readiness gated on a real MCP handshake,
     the ``stopping`` flag, the pending-task drain, the bounded 5s join and its
@@ -109,16 +109,25 @@ def http_server(
     ``test_serve_escalation_mcp_fixture.py`` (task 3736, INV-5). This module's
     former local copy was the HARDENED variant; both of its hardenings were
     promoted into the shared factory before this conversion, so nothing was
-    lost. The yielded ``(base_url, queue)`` shape is preserved for the C1-C4
-    call sites (the factory's ``port`` is dropped here).
+    lost. The ``_module``-scoped variant specifically, because a fixture may
+    not depend on a narrower-scoped one and this one is module-scoped (below).
+    The yielded ``(base_url, queue)`` shape is preserved for the C1-C4 call
+    sites (the factory's ``port`` is dropped here).
 
-    Two facts remain module-specific and are the reason this indirection
+    Three facts remain module-specific and are the reason this indirection
     exists at all:
 
     * Why real HTTP is required: only a real ASGI request context resolves
       ``X-Escalation-Levels``/``X-Escalation-Identity`` via
       ``get_http_headers()`` -- an in-process ``tool.fn(...)`` call always sees
       ``{}``, which would make the C1-C4 capability-guard cells untestable.
+    * Deduplication: NOT passed, so this takes the factory's
+      ``DedupeConfig(infra_dedupe_enabled=False)`` default rather than
+      ``create_server``'s dedupe-ON default. Inert here -- every record in this
+      module is seeded through ``_seed`` (``queue.submit()`` directly) and no
+      test calls the dedupe-guarded ``escalate_*`` tools -- and the safer
+      default for a test, since dedupe ON could collapse a double-file
+      regression into one record and let a count assertion pass anyway.
     * The isolation contract: module-scoped, so every C1-C4 test shares this
       ONE ``EscalationQueue``. Each test MUST seed its escalation(s) under a
       unique ``task_id`` (the existing ``zeta-c1-*``/``zeta-c2-*``/... prefixes
@@ -126,23 +135,36 @@ def http_server(
       sequencing, or tests can silently interfere via shared queue state.
     """
     queue_dir = tmp_path_factory.mktemp('status_authority_gate_http')
-    base_url, _port, queue = serve_escalation_mcp(queue_dir)
+    base_url, _port, queue = serve_escalation_mcp_module(queue_dir)
     yield base_url, queue
 
 
-async def _resolve_over_http(
+async def _call_over_http(
     base_url: str,
+    tool_name: str,
     *,
     levels: str | None = None,
     identity: str | None = None,
-    **resolve_kwargs: Any,
+    **tool_kwargs: Any,
 ) -> dict[str, Any]:
-    """Call ``resolve_issue`` over real HTTP, optionally with capability
-    headers (mirrors test_capability_guard_http.py's ``_resolve_over_http``).
+    """Call *tool_name* over real HTTP, optionally with capability headers.
 
-    *levels*/*identity*, when not None, are sent as the literal
+    The SINGLE place in this module that knows the capability-header wire
+    protocol. *levels*/*identity*, when not None, are sent as the literal
     ``X-Escalation-Levels``/``X-Escalation-Identity`` request headers; when
-    None the header is omitted entirely (never sent as an empty string).
+    None the header is omitted entirely (never sent as an empty string). The
+    per-tool helpers below are one-liners over this, so the header construction
+    cannot drift between them.
+
+    STILL a near-twin of ``test_capability_guard_http.py``'s ``_call_over_http``
+    -- deliberately, not by oversight. Task 3736 deduped the SERVER LIFECYCLE
+    half of this harness (``serve_escalation_mcp_module``); folding these last
+    two call helpers into a shared conftest fixture is a follow-up, because a
+    conftest helper is reachable only AS a fixture (a bare
+    ``from conftest import ...`` is unsafe under ``--import-mode=importlib``)
+    and converting every call site across both modules to request it is a much
+    larger mechanical change. See the harness comment in
+    ``test_capability_guard_http.py``.
     """
     headers: dict[str, str] = {}
     if levels is not None:
@@ -151,30 +173,19 @@ async def _resolve_over_http(
         headers['X-Escalation-Identity'] = identity
     transport = StreamableHttpTransport(f'{base_url}/mcp/', headers=headers)
     async with Client(transport) as client:
-        result = await client.call_tool('resolve_issue', resolve_kwargs)
+        result = await client.call_tool(tool_name, tool_kwargs)
         return result.data
 
 
-async def _promote_over_http(
-    base_url: str,
-    *,
-    levels: str | None = None,
-    identity: str | None = None,
-    **promote_kwargs: Any,
-) -> dict[str, Any]:
-    """Call ``promote_to_l2`` over real HTTP, optionally with capability
-    headers (mirrors test_capability_guard_http.py's ``_promote_over_http``).
-    Proves ``promote_to_l2`` is gated by identity (``PROMOTE_ALLOWED``) but
-    never by ``X-Escalation-Levels``."""
-    headers: dict[str, str] = {}
-    if levels is not None:
-        headers['X-Escalation-Levels'] = levels
-    if identity is not None:
-        headers['X-Escalation-Identity'] = identity
-    transport = StreamableHttpTransport(f'{base_url}/mcp/', headers=headers)
-    async with Client(transport) as client:
-        result = await client.call_tool('promote_to_l2', promote_kwargs)
-        return result.data
+async def _resolve_over_http(base_url: str, **kwargs: Any) -> dict[str, Any]:
+    """``resolve_issue`` over real HTTP — the C1-C4 subject."""
+    return await _call_over_http(base_url, 'resolve_issue', **kwargs)
+
+
+async def _promote_over_http(base_url: str, **kwargs: Any) -> dict[str, Any]:
+    """``promote_to_l2`` over real HTTP. Proves ``promote_to_l2`` is gated by
+    identity (``PROMOTE_ALLOWED``) but never by ``X-Escalation-Levels``."""
+    return await _call_over_http(base_url, 'promote_to_l2', **kwargs)
 
 
 # ---------------------------------------------------------------------------

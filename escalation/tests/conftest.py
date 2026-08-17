@@ -127,6 +127,12 @@ def pytest_configure(config):
 # escalation_e2e.py` already drove it. There is no other copy to keep in
 # lockstep — which is the point, per INV-5.
 #
+# It is exposed at TWO scopes — `serve_escalation_mcp` (function) and
+# `serve_escalation_mcp_module` (module) — both of which are thin `yield from`
+# delegates to the one `_serve_escalation_mcp_impl` generator below. The split
+# is a scope adapter, NOT a second implementation; see the two fixture
+# docstrings for why each scope exists.
+#
 # Two properties below are load-bearing and must not be softened:
 #
 # * The teardown semantics (`stopping` flag, `_drain_pending_tasks`, bounded
@@ -139,6 +145,13 @@ def pytest_configure(config):
 #   deduped these copies by UNION rather than by intersection.
 #
 # Both are pinned by tests in `test_serve_escalation_mcp_fixture.py`.
+
+# How long `_start` waits for a server to complete its first MCP handshake.
+# A module-level constant rather than a literal inside `_start` so a test that
+# deliberately drives the timeout path (the not-a-RuntimeError startup-failure
+# regression test) can `monkeypatch.setattr` it down instead of paying the full
+# production bound on every run -- `_start` reads it as a global at call time.
+_READY_TIMEOUT_S = 10.0
 
 
 def _free_escalation_port() -> int:
@@ -178,14 +191,29 @@ def _drain_pending_tasks(loop) -> None:
     loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
 
 
-async def _mcp_handshake_ready(base_url: str) -> bool:
+async def _mcp_handshake_ready(
+    base_url: str, error_box: list[BaseException] | None = None,
+) -> bool:
     """True iff a real MCP client completes initialize+ping against
     ``{base_url}/mcp/``.
 
     A bare TCP connect only proves the OS accept queue is up; it does not
     prove the FastMCP ASGI app has finished mounting the ``/mcp/`` route.
     Polling a real handshake instead of a TCP probe closes that window — the
-    first call racing a 404/hang before the route is live."""
+    first call racing a 404/hang before the route is live.
+
+    Every failure reads as "not ready yet", so this returns a plain bool and
+    never raises. But swallowing the exception ENTIRELY would leave the
+    readiness timeout with nothing to say whenever the failure is on the CLIENT
+    side of the wire -- a transport/protocol mismatch, a proxy env var, a
+    fastmcp version skew -- because the server thread is healthy in those cases
+    and ``serve_error`` stays None. That is the same "drops the one fact a
+    reader needs" failure the BaseException widening in ``_serve_forever``
+    exists to prevent, just from the other end. So when *error_box* is passed,
+    the most recent exception is recorded into it (last write wins: the final
+    poll's failure is the one that describes why the deadline was reached) for
+    the caller to name in its timeout message.
+    """
     from fastmcp import Client
     from fastmcp.client.transports import StreamableHttpTransport
 
@@ -193,35 +221,23 @@ async def _mcp_handshake_ready(base_url: str) -> bool:
     try:
         async with Client(transport) as client:
             await client.ping()
-    except Exception:  # noqa: BLE001 - any failure just means "not ready yet"
+    except Exception as exc:  # noqa: BLE001 - any failure just means "not ready yet"
+        if error_box is not None:
+            error_box[:] = [exc]
         return False
     return True
 
 
-@pytest.fixture(scope='module')
-def serve_escalation_mcp():
-    """Factory: serve a REAL escalation MCP server over REAL HTTP.
+def _serve_escalation_mcp_impl():
+    """The ONE body behind ``serve_escalation_mcp`` and
+    ``serve_escalation_mcp_module``.
 
-    MODULE-scoped (task 3736), which is a contract, not a tuning choice:
-    pytest caches one instance per REQUESTING module, and a fixture may not
-    depend on a NARROWER-scoped one. Both consumer ``http_server`` fixtures
-    (``test_capability_guard_http.py``, ``test_status_authority_gate.py``) are
-    module-scoped by design -- each shares ONE server and ONE
-    ``EscalationQueue`` across its whole module -- so while this factory was
-    function-scoped they could not delegate to it at all (``ScopeMismatch``),
-    which is why each carried its own copy of this machinery.
-
-    Function-scoped consumers (``test_legibility_census_escalation_e2e.py``)
-    are unaffected in SAFETY: requesting a broader-scoped fixture from a
-    narrower one is always legal, and every factory call still starts an
-    independent server on its own ephemeral port. What changes for them is
-    teardown TIMING -- every server started within one test module is now torn
-    down together at that module's end, under the same bounded 5s join +
-    assert below, instead of one-by-one after each test. Bounded and small
-    today (that module has 5 tests, so ~5 concurrent servers at peak); if a
-    module ever grows enough for the accumulation to matter, the mechanical
-    fix is to split this into a shared ``_impl`` generator plus two thin
-    fixtures of differing scope.
+    A plain generator, not a fixture: pytest caches one fixture instance per
+    scope, and the two consumer shapes in this suite need DIFFERENT scopes (see
+    the two fixture docstrings below). Both delegate here with ``yield from``,
+    so there is exactly one copy of the start/serve/teardown protocol to keep
+    correct -- the whole point of task 3736, per INV-5. Do not inline this into
+    either fixture.
 
     Call as ``serve_escalation_mcp(queue_dir)`` -> ``(base_url, port, queue)``.
     Builds ``EscalationQueue(queue_dir)`` + ``create_server(queue,
@@ -331,18 +347,29 @@ def serve_escalation_mcp():
         # just fails the handshake and retries), so no separate TCP wait is
         # needed. Bounded ~10s instead of a fixed sleep.
         base_url = f'http://127.0.0.1:{port}'
-        deadline = time.monotonic() + 10.0
+        deadline = time.monotonic() + _READY_TIMEOUT_S
+        handshake_errors: list[BaseException] = []
         ready = False
         while time.monotonic() < deadline:
-            if asyncio.run(_mcp_handshake_ready(base_url)):
+            if asyncio.run(_mcp_handshake_ready(base_url, handshake_errors)):
                 ready = True
                 break
             time.sleep(0.05)
         if not ready:
+            # BOTH sides of the wire get named. `serve_error` covers a server
+            # thread that died; `handshake_errors` covers the case where the
+            # thread is perfectly healthy and it is the CLIENT half that cannot
+            # complete -- without it that case reports only "did not complete an
+            # MCP handshake", i.e. restates the timeout and explains nothing.
             detail = f' (server thread raised: {serve_error!r})' if serve_error else ''
+            handshake_detail = (
+                f' (last handshake error: {handshake_errors[-1]!r})'
+                if handshake_errors else ''
+            )
             raise RuntimeError(
                 f'escalation HTTP test server did not complete an MCP handshake '
-                f'on 127.0.0.1:{port} within 10s{detail}'
+                f'on 127.0.0.1:{port} within {_READY_TIMEOUT_S:g}s'
+                f'{detail}{handshake_detail}'
             )
 
         return f'http://127.0.0.1:{port}', port, queue
@@ -374,6 +401,49 @@ def serve_escalation_mcp():
 
 
 @pytest.fixture
+def serve_escalation_mcp():
+    """FUNCTION-scoped ``serve_escalation_mcp`` -- the default, and the one
+    ``test_legibility_census_escalation_e2e.py`` takes.
+
+    Every server started inside one test is torn down at the END OF THAT TEST.
+    That is worth keeping (task 3736 review): the alternative -- letting a
+    module's servers accumulate and stop together -- leaves N daemon threads,
+    event loops and listening sockets live for the rest of the module, and
+    attributes the bounded-join hung-thread assert to the MODULE rather than to
+    the test that actually hung, which is precisely the failure mode task
+    2741's assert exists to make legible.
+
+    Body: ``_serve_escalation_mcp_impl`` (see it for the full contract).
+    """
+    yield from _serve_escalation_mcp_impl()
+
+
+@pytest.fixture(scope='module')
+def serve_escalation_mcp_module():
+    """MODULE-scoped ``serve_escalation_mcp`` -- for consumers that must share
+    ONE server across a whole module.
+
+    Its existence is a scope contract, not a tuning choice: pytest forbids a
+    fixture from depending on a NARROWER-scoped one, so a module-scoped
+    ``http_server`` cannot request the function-scoped fixture above at all
+    (``ScopeMismatch``) -- which is exactly why
+    ``test_capability_guard_http.py`` and ``test_status_authority_gate.py``
+    each used to carry their own copy of this machinery. Both now adapt over
+    this fixture instead (task 3736, INV-5).
+
+    Request this ONLY from a module- or session-scoped consumer. A
+    function-scoped test that takes it gets deferred teardown (all of the
+    module's servers stopping together at module end) for no benefit; take
+    ``serve_escalation_mcp`` instead.
+
+    Body: the SAME ``_serve_escalation_mcp_impl`` generator -- the scope is the
+    only difference, and the two must never grow separate bodies (pinned by
+    ``test_both_serve_escalation_mcp_fixtures_share_one_implementation``).
+    """
+    yield from _serve_escalation_mcp_impl()
+
+
+@pytest.fixture
 def escalation_conftest():
     """This conftest module itself, for tests that need its RAW attributes.
 
@@ -396,15 +466,15 @@ def escalation_conftest():
     repo-root multi-package run). A bare ``import conftest`` asks for a name
     another package's conftest may already own, and binds whatever won it.
 
-    Two measured properties callers rely on:
-
-    * The object is ``is``-identical to
-      ``request.config.pluginmanager.get_plugin(str(Path(__file__)))`` -- the
-      live module pytest itself loaded, not a second import of the same file
-      (pinned by ``test_the_conftest_reference_is_resolved_by_identity_...``).
-    * Because it is that live module, ``monkeypatch.setattr`` against it really
-      does patch what ``serve_escalation_mcp``'s body reads (verified: the
-      fixture picked up a patched ``_free_escalation_port``).
+    The property callers actually rely on -- and the reason this is a fixture
+    and not a second import of the same file -- is that ``sys.modules[__name__]``
+    is the LIVE module object pytest itself loaded, so ``monkeypatch.setattr``
+    against it really does patch what ``_serve_escalation_mcp_impl``'s body
+    reads. That is pinned behaviourally rather than by introspection: the
+    startup-failure and readiness-bound tests in
+    ``test_serve_escalation_mcp_fixture.py`` monkeypatch
+    ``_free_escalation_port`` / ``_READY_TIMEOUT_S`` here and observe the
+    fixture pick both up, which no second import could satisfy.
 
     Function-scoped deliberately -- it holds no state and is cheap, so it
     imposes no scope floor on the tests that request it.
