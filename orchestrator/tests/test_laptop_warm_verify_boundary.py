@@ -55,6 +55,7 @@ import ast
 import asyncio
 import contextlib
 import fcntl
+import math
 import os
 import re
 import select
@@ -776,12 +777,22 @@ def _resolve_ceiling_override(environ) -> float | None:
     """Parse :data:`_DISCOVERY_CEILING_OVERRIDE_ENV` out of *environ*.
 
     Returns None when unset, and warns-then-returns-None on a value that is
-    unparseable or non-positive.  Deliberately does NOT raise: this is
-    resolved at import, so raising would fail COLLECTION for the entire
-    module -- every row and every helper test taken down by one mistyped
-    debugging knob, a strictly worse and far more confusing failure than the
-    one being guarded against.  Silently ignoring it would be worse still,
-    hence the warning.
+    unparseable, non-finite, or non-positive.  Deliberately does NOT raise:
+    this is resolved at import, so raising would fail COLLECTION for the
+    entire module -- every row and every helper test taken down by one
+    mistyped debugging knob, a strictly worse and far more confusing failure
+    than the one being guarded against.  Silently ignoring it would be worse
+    still, hence the warning.
+
+    NON-FINITE is rejected for exactly that reason, and is not a hypothetical:
+    ``inf`` is the natural spelling an operator reaches for to mean "never
+    time out", and ``float('inf')`` parses cleanly while satisfying every
+    ordering guard (``inf <= 0`` and ``nan <= 0`` are both False).  It would
+    therefore flow into ROW_DISCOVERY_CEILING_MAX_SECS and blow up the very
+    next module-level statement -- ``int(... + 2 * inf)`` raises OverflowError,
+    ``nan`` raises ValueError -- taking down collection of the whole module,
+    i.e. precisely the failure this warn-instead-of-raise contract exists to
+    prevent.
 
     Takes an environ MAPPING rather than reading ``os.environ`` so it is
     deterministically testable with no monkeypatch-versus-import-order race.
@@ -793,9 +804,9 @@ def _resolve_ceiling_override(environ) -> float | None:
         value = float(raw)
     except (TypeError, ValueError):
         value = None
-    if value is None or value <= 0:
+    if value is None or not math.isfinite(value) or value <= 0:
         warnings.warn(
-            f'{_DISCOVERY_CEILING_OVERRIDE_ENV}={raw!r} is not a positive number; '
+            f'{_DISCOVERY_CEILING_OVERRIDE_ENV}={raw!r} is not a finite positive number; '
             f'ignoring it and using the load-scaled discovery ceiling instead',
             stacklevel=2,
         )
@@ -1038,6 +1049,15 @@ def test_discovery_ceiling_env_override_parses_and_pins():
         ignoring it would be worse still (the project's no-silent-fail-soft
         norm), hence the warning.
 
+        NON-FINITE inputs are covered alongside the typo because they defeat
+        that contract in a way a typo does not: 'banana' fails float(), but
+        'inf'/'nan' PARSE, and `inf <= 0` / `nan <= 0` are both False, so
+        without an explicit finiteness guard they sail through into
+        ROW_DISCOVERY_CEILING_MAX_SECS and detonate the next module-level
+        statement (`int(... + 2*inf)` -> OverflowError; nan -> ValueError),
+        failing collection for the whole module.  'inf' is not an exotic
+        input either: it is what an operator writes to mean "never time out".
+
     (b) Pinning.  An explicit operator pin wins in BOTH directions -- it must
         override load scaling upward and downward alike, or "pin it to 7.5 to
         reproduce the timeout quickly" silently does nothing on a busy box.
@@ -1049,10 +1069,20 @@ def test_discovery_ceiling_env_override_parses_and_pins():
     assert _resolve_ceiling_override({'ORCH_TEST_DISCOVERY_CEILING_SECS': '7.5'}) == 7.5
     assert _resolve_ceiling_override({}) is None
 
-    with pytest.warns(UserWarning, match='ORCH_TEST_DISCOVERY_CEILING_SECS'):
-        assert _resolve_ceiling_override(
-            {'ORCH_TEST_DISCOVERY_CEILING_SECS': 'banana'}
-        ) is None
+    for bad in ('banana', 'inf', '-inf', 'nan', '0', '-1'):
+        with pytest.warns(UserWarning, match='ORCH_TEST_DISCOVERY_CEILING_SECS'):
+            assert _resolve_ceiling_override(
+                {'ORCH_TEST_DISCOVERY_CEILING_SECS': bad}
+            ) is None, f'{bad!r} must be rejected, not pinned'
+
+    # The consequence the rejection above exists to prevent: whatever the
+    # resolver returns must survive the int() the module performs on it at
+    # import time.  Asserting on the derivation (not just on None) is what
+    # keeps this test honest if the guard is ever moved or loosened.
+    for value in (_resolve_ceiling_override({'ORCH_TEST_DISCOVERY_CEILING_SECS': '7.5'}),
+                  _resolve_ceiling_override({})):
+        ceiling = ROW_DISCOVERY_CEILING_BASE_SECS * _DISCOVERY_CEILING_MAX_SCALE if value is None else value
+        assert int(2 * _ROW_WORST_CASE_FIXED_SECS + 2 * ceiling) > 0
 
     assert row_discovery_ceiling_secs(_override=7.5, _loadavg=6400.0, _cpu_count=32) == 7.5
     assert row_discovery_ceiling_secs(_override=7.5, _loadavg=0.0, _cpu_count=32) == 7.5
