@@ -51,6 +51,7 @@ discovery ceiling that did not track load.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
 import fcntl
@@ -1042,6 +1043,242 @@ def test_row_per_test_timeout_still_covers_the_max_discovery_ceiling():
         f'the bounded worst case at the MAX discovery ceiling ({required}) -- '
         f'both discovery waits, one full watchdog window, and both '
         f'kill-confirmation waits run to their ceiling'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Task 4014 (review fix) -- widen the coupling guard from "the derived
+# constant is big enough" to "every CALL SITE performing a scaled discovery
+# wait is actually covered by the mark it runs under".
+#
+# The defect this pair exists to catch is not a wrong number, it is a guard
+# whose SCOPE did not include a call site.  The test above pins
+# ROW_PER_TEST_TIMEOUT_SECS against ROW_DISCOVERY_CEILING_MAX_SECS but never
+# looks at WHO performs a discovery wait -- so Row 5, which relies on the bare
+# (now load-scaled) defaults while carrying task 2921's unrelated LITERAL
+# @pytest.mark.timeout(120), was invisible to it.  Two 120s-capable waits
+# inside a 120s mark means a wedged Row 5 discovery gets truncated by
+# pytest-timeout's thread-mode os._exit() of the whole xdist worker instead of
+# raising this module's self-diagnosing AssertionError (leader rc taxonomy +
+# bounded stderr tail) -- the exact silent-truncation class the derivation
+# chain exists to prevent.
+#
+# The sweep is ENUMERATION-FREE: it derives its call-site list from this
+# module's own AST, so a future Row 6 registers itself with the guard simply
+# by calling the helper.  A hand-maintained row list would have the identical
+# failure mode the day one lands.  Self-parsing AST guards are an established
+# idiom in this suite (test_marker_registration_drift.py,
+# test_git_repo_isolation_guard.py, test_lock_release_single_writer_guard.py,
+# test_event_loop_antipattern_guard.py) and cost nothing at runtime -- pure
+# parse, no subprocess, no timing.
+# ---------------------------------------------------------------------------
+
+#: The helpers whose ``timeout`` default now resolves to
+#: :func:`row_discovery_ceiling_secs`, i.e. can spend up to
+#: ROW_DISCOVERY_CEILING_MAX_SECS each.
+_SCALED_DISCOVERY_HELPERS: frozenset[str] = frozenset(
+    {'wait_for_pgid_file', 'wait_subtree_live'}
+)
+
+#: Private seams that mean "this call never touches real /proc" -- see
+#: :func:`_scaled_discovery_call_count`.
+_DISCOVERY_SEAM_KWARGS: frozenset[str] = frozenset({'_probe_children', '_ppid_map'})
+
+#: orchestrator/pyproject.toml's ``timeout = 60`` / ``timeout_method = "thread"``,
+#: inherited by every test here that carries no timeout mark of its own.
+_INHERITED_INI_TIMEOUT_SECS: float = 60.0
+
+#: Anti-vacuity floor for the sweep below: an AST matcher that silently stops
+#: matching is a guard reporting PASS while guarding nothing.
+_KNOWN_DISCOVERY_ROWS: frozenset[str] = frozenset({
+    'test_cancel_verify_tree_kills_under_live_watchdog',                  # Row 4
+    'test_orchestrator_killed_mid_build_tree_killed_via_eof',             # Row 1
+    'test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive',    # Row 2
+    'test_heartbeat_starved_hard_partition_tree_killed_via_timeout',      # Row 3
+    'test_flock_contention_full_two_way_seam_blocks_and_escalates',       # Row 5
+})
+
+
+def _scaled_discovery_call_count(func_node) -> int:
+    """How many LOAD-SCALED discovery waits *func_node* performs.
+
+    A call to one of :data:`_SCALED_DISCOVERY_HELPERS` counts when its
+    ``timeout=`` kwarg is ABSENT (the bare default, which now resolves to
+    ``row_discovery_ceiling_secs()``) or is exactly
+    ``row_discovery_ceiling_secs()``.  An explicit unscaled value (e.g.
+    ``timeout=30.0``) does not count -- it cannot exceed what it names.
+
+    Calls passing a private ``_probe_children``/``_ppid_map`` seam are
+    EXEMPT, and that rule is load-bearing: a seam-injected call never touches
+    real /proc and returns in microseconds at ``interval=0``.  Without it the
+    three deterministic helper tests below would each be told to carry a 240s
+    mark -- the guard would push this module toward SLOWER tests rather than
+    safer ones.
+    """
+    count = 0
+    for node in ast.walk(func_node):
+        if not isinstance(node, ast.Call):
+            continue
+        if not (
+            isinstance(node.func, ast.Name)
+            and node.func.id in _SCALED_DISCOVERY_HELPERS
+        ):
+            continue
+        if {kw.arg for kw in node.keywords} & _DISCOVERY_SEAM_KWARGS:
+            continue
+        timeout_arg = next(
+            (kw.value for kw in node.keywords if kw.arg == 'timeout'), None
+        )
+        if timeout_arg is None:
+            count += 1  # bare default -> row_discovery_ceiling_secs()
+        elif (
+            isinstance(timeout_arg, ast.Call)
+            and isinstance(timeout_arg.func, ast.Name)
+            and timeout_arg.func.id == 'row_discovery_ceiling_secs'
+        ):
+            count += 1
+    return count
+
+
+def _timeout_mark_argument(func_node):
+    """The single argument node of *func_node*'s ``@pytest.mark.timeout(...)``.
+
+    Returns None when the function carries no such decorator (it then
+    inherits :data:`_INHERITED_INI_TIMEOUT_SECS`).
+    """
+    for decorator in func_node.decorator_list:
+        if not isinstance(decorator, ast.Call):
+            continue
+        func = decorator.func
+        if (
+            isinstance(func, ast.Attribute)
+            and func.attr == 'timeout'
+            and isinstance(func.value, ast.Attribute)
+            and func.value.attr == 'mark'
+            and isinstance(func.value.value, ast.Name)
+            and func.value.value.id == 'pytest'
+        ):
+            return decorator.args[0] if decorator.args else None
+    return None
+
+
+def test_row5_per_test_timeout_covers_its_own_bounded_work():
+    """Row 5's pytest timeout must cover ITS bounded worst case, and be DERIVED.
+
+    Row 5 does not share Rows 1-4's shape -- no watchdog window, no
+    ``wait_subtree_gone`` kill confirmation -- so it cannot share their
+    constant.  Its bounded terms are: two discovery waits (both on the
+    load-scaled ceiling), the marker wait, the waiter subprocess's completion
+    ceiling, and the ``finally`` block's holder teardown.
+
+    The marker term is counted TWICE on purpose:
+    :func:`wait_for_marker_stable` spends its ``timeout`` on the
+    :func:`wait_for_marker` existence gate and then a FRESH ``timeout`` on the
+    settle loop, so its worst case is 2x, not 1x -- a term the old literal 120
+    hid entirely.
+
+    The second half reads the mark ACTUALLY APPLIED to the live function
+    object rather than trusting the constant in isolation, so the derivation
+    and the decorator cannot diverge.
+    """
+    required = (
+        2 * ROW_DISCOVERY_CEILING_MAX_SECS
+        + 2 * ROW_MARKER_CEILING_SECS
+        + ROW5_WAITER_COMPLETION_CEILING_SECS
+        + ROW5_HOLDER_TEARDOWN_CEILING_SECS
+    )
+    assert required <= ROW5_PER_TEST_TIMEOUT_SECS, (
+        f'ROW5_PER_TEST_TIMEOUT_SECS ({ROW5_PER_TEST_TIMEOUT_SECS}) does not cover '
+        f"Row 5's bounded worst case ({required}) -- both discovery waits at the "
+        f'MAX ceiling, the marker existence gate AND its settle loop, the waiter '
+        f"subprocess's completion ceiling, and the holder teardown"
+    )
+
+    applied = [
+        mark
+        for mark in getattr(
+            test_flock_contention_full_two_way_seam_blocks_and_escalates,
+            'pytestmark',
+            [],
+        )
+        if mark.name == 'timeout'
+    ]
+    assert len(applied) == 1, (
+        f'expected exactly one @pytest.mark.timeout on Row 5, got {applied!r}'
+    )
+    assert applied[0].args[0] == ROW5_PER_TEST_TIMEOUT_SECS, (
+        f'Row 5 runs under a {applied[0].args[0]}s mark but its derivation says '
+        f'{ROW5_PER_TEST_TIMEOUT_SECS}s -- the decorator and the derived constant '
+        f'have diverged, so the derivation is guarding nothing'
+    )
+
+
+def test_every_scaled_discovery_wait_is_covered_by_its_test_timeout_mark():
+    """No test may perform more discovery waiting than its own mark allows.
+
+    Enumeration-free sweep of this module's own AST (see the banner above).
+    For every ``test_*`` function it counts the LOAD-SCALED discovery waits
+    the source actually contains, resolves the EFFECTIVE pytest-timeout
+    budget that test runs under, and asserts the budget covers those waits at
+    the widest ceiling they can reach.
+
+    It additionally BANS a literal timeout mark on any test performing such a
+    wait.  That kills the root cause directly rather than the symptom: task
+    2921's ``@pytest.mark.timeout(120)`` was a literal that no re-derivation
+    could reach into, which is precisely why task 4014's load-scaled
+    discovery ceiling could not propagate to Row 5.
+    """
+    tree = ast.parse(Path(__file__).read_text(encoding='utf-8'))
+    swept: dict[str, tuple[int, ast.AST]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        if not node.name.startswith('test_'):
+            continue
+        n_scaled = _scaled_discovery_call_count(node)
+        if n_scaled:
+            swept[node.name] = (n_scaled, node)
+
+    missing = sorted(_KNOWN_DISCOVERY_ROWS - set(swept))
+    assert not missing, (
+        f'the AST sweep matched no scaled discovery wait in {missing} -- a matcher '
+        f'that silently stops matching is a guard reporting PASS while guarding '
+        f'nothing (matched: {sorted(swept)})'
+    )
+
+    under_budget: list[str] = []
+    literal_marked: list[str] = []
+    for name, (n_scaled, func_node) in sorted(swept.items()):
+        arg = _timeout_mark_argument(func_node)
+        if arg is None:
+            effective = _INHERITED_INI_TIMEOUT_SECS
+        elif isinstance(arg, ast.Name) and arg.id in globals():
+            effective = float(globals()[arg.id])
+        else:
+            literal_marked.append(f'{name}: @pytest.mark.timeout({ast.unparse(arg)})')
+            effective = (
+                float(arg.value)
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, int | float)
+                else _INHERITED_INI_TIMEOUT_SECS
+            )
+        required = n_scaled * ROW_DISCOVERY_CEILING_MAX_SECS
+        if effective < required:
+            under_budget.append(
+                f'{name}: {n_scaled} scaled discovery wait(s) needing {required}s '
+                f'but running under a {effective}s budget'
+            )
+
+    assert not under_budget, (
+        'these tests can spend more time in discovery waits than their pytest '
+        'timeout allows, so a wedged discovery is truncated by pytest-timeout\'s '
+        'thread-mode os._exit() of the xdist worker instead of raising the '
+        'self-diagnosing AssertionError:\n  ' + '\n  '.join(under_budget)
+    )
+    assert not literal_marked, (
+        'these tests perform a load-scaled discovery wait but pin their pytest '
+        'timeout to a LITERAL, which no re-derivation of the discovery ceiling '
+        'can reach into -- use a module-level derived constant instead:\n  '
+        + '\n  '.join(literal_marked)
     )
 
 
