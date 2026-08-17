@@ -70,3 +70,60 @@ def curator_gate_source(task_id) -> str:
     Pure: no I/O, no side effects.
     """
     return CURATOR_GATE_SOURCE_TEMPLATE.format(task_id=str(task_id))
+
+
+def extract_open_gate_task_ids(tasks: list[dict]) -> list[str]:
+    """Return sorted, deduped str ids of open human-curator gate tasks.
+
+    A task qualifies when ALL hold:
+
+    - it is a ``dict`` (a non-dict element is skipped, never fed to ``.get``);
+    - ``task['metadata']`` is a ``dict`` (absent/``None``/str/list metadata is
+      skipped — a gate's markers are only readable off a parsed dict);
+    - ``metadata['operational_mode'] == 'gate'`` — an EXACT, value-sensitive
+      match, mirroring ``TaskInterceptor._is_gate_metadata``'s deliberate
+      strictness.  ``'llm'``, ``'GATE'`` and ``None`` are all non-matches;
+    - ``task['id']`` is not ``None`` (coerced to ``str``).  A gate with a
+      missing/``None`` id is dropped rather than contributing a spurious id:
+      the id is formatted straight into the Mem0 source key, so a wrong id
+      queries the wrong key.
+
+    Callers pass ``filtered_task_tree.active_tasks`` (the dataclass field on
+    ``task_filter.FilteredTaskTree``), which excludes done/cancelled gates for
+    free while still including ``status == 'blocked'`` — the state a filed
+    human gate sits in.
+
+    Structure, first-seen dedup, ``str(id)`` coercion and sorted return mirror
+    ``stage1_stall_detector.extract_stalled_gate_backlog_task_ids``.  Two
+    deliberate divergences from that helper:
+
+    1. It keys on the ``gate_escalated_at`` stamp and explicitly does NOT
+       filter on ``operational_mode`` (see its rationale block under
+       ``gate_escalated_age_secs``: the operational-routing contract can coerce
+       an ``operational_mode='llm'`` task into a pure gate while leaving the
+       ``'llm'`` value in place, so a mode filter would miss that population).
+       Here the mode filter IS the right key and the divergence is deliberate,
+       not an oversight: this sweep's evidence is a ``curator_gate_{id}`` Mem0
+       entry, which only exists for tasks the reify curator actually gated —
+       exactly the ``operational_mode == 'gate'`` population — and a broader
+       selection would just spend one Qdrant count per non-gate task to learn
+       nothing.
+    2. It uses bare ``task.get(...)`` with no ``isinstance(task, dict)`` guard;
+       the guard added here is a strictly-safer divergence.
+
+    Pure: no I/O, no side effects.  Empty input returns ``[]``.
+    """
+    seen: set[str] = set()
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        metadata = task.get('metadata')
+        if not isinstance(metadata, dict):
+            continue
+        if metadata.get('operational_mode') != 'gate':
+            continue
+        raw_tid = task.get('id')
+        if raw_tid is None:
+            continue
+        seen.add(str(raw_tid))
+    return sorted(seen)
