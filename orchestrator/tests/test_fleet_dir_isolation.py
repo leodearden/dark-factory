@@ -45,17 +45,16 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-import df_pytest_isolation
 import pytest
-from df_pytest_isolation import fixture_marker, fleet_dir_redirect_violation_reason
+from df_pytest_isolation import fleet_dir_redirect_violation_reason
 
 from orchestrator.fleet_heartbeat import DEFAULT_FLEET_DIR, resolve_fleet_dir
 
 # NOT `from df_pytest_isolation import _df_...`. Importing a FIXTURE into a test
 # module binds it as a module-scoped fixture that SHADOWS the conftest's — which
-# would make the liveness tests below resolve their own import and pass even
-# with the conftest wiring removed, i.e. exactly the dead defence they exist to
-# detect. Reach them through the module instead.
+# would make the liveness test below resolve this module's own import and pass
+# even with the conftest wiring removed, i.e. exactly the dead defence it exists
+# to detect. Name them as plain strings and resolve them through `request`.
 _REDIRECT_NAME = '_df_fleet_dir_redirect'
 _GUARD_NAME = '_df_no_synthetic_heartbeats_in_live_fleet'
 
@@ -142,6 +141,20 @@ class TestBothFixturesAreLiveInThisRun:
     ``test_git_repo_isolation_guard.py::TestSessionCeilingIsLiveInThisSuite``:
     asserting the fixture *exists* would prove nothing; this asserts it FIRED.
 
+    DELIBERATELY ONLY THE REGISTRATION ASSERTION.  That sibling class also
+    pins the fixtures' EXISTENCE and their session/autouse SHAPE, but both are
+    properties of the ``df_pytest_isolation`` MODULE — one module object,
+    imported identically by every root — so a copy here would prove nothing new
+    while adding a second body to keep in sync.  That is the same drift hazard
+    that put :func:`fleet_dir_redirect_violation_reason` in the shared module
+    rather than in each root's test.  The existence check would additionally be
+    unfalsifiable here: ``orchestrator/tests/conftest.py`` imports both fixture
+    names, so a missing attribute aborts collection with an ImportError long
+    before any assertion in this file could run.  What is genuinely per-root is
+    whether THIS conftest bound them — this class, plus
+    ``test_fleet_dir_is_redirected_away_from_the_live_checkout`` above, which
+    requests the redirect by name.
+
     WHY THE LEAK GUARD IS WIRED HERE AT ALL, given it cannot catch this task's
     own leak: it is keyed on the SYNTHETIC unit-name prefix
     (``orchestrator-fake``), so ``unknown-unit.json`` will never match it.  That
@@ -153,32 +166,6 @@ class TestBothFixturesAreLiveInThisRun:
     SYNTHETIC-named leak from this root, wired for parity with the two roots
     that already carry it.
     """
-
-    @pytest.mark.parametrize('name', [_REDIRECT_NAME, _GUARD_NAME])
-    def test_the_fixture_exists(self, name: str) -> None:
-        assert hasattr(df_pytest_isolation, name), (
-            f'df_pytest_isolation defines no {name}; the pure helpers behind it '
-            'protect nothing on their own.'
-        )
-
-    @pytest.mark.parametrize('name', [_REDIRECT_NAME, _GUARD_NAME])
-    def test_the_fixture_is_session_scoped_and_autouse(self, name: str) -> None:
-        """Both properties pinned STRUCTURALLY, not inferred from behaviour.
-
-        Function scope would miss writes from module-/session-scoped fixtures —
-        which is where expensive harness setup tends to live — and would
-        re-point ``ORCH_FLEET_DIR`` at a fresh directory per test, so a writer
-        and a later reader could disagree about where the heartbeats went.
-        Without ``autouse`` nothing here would ever request either one.
-
-        Read through ``fixture_marker`` rather than ``_pytestfixturefunction``
-        directly: pytest 9 moved that private attribute, and the helper accepts
-        both spellings and fails loudly when neither is found.
-        """
-        marker = fixture_marker(getattr(df_pytest_isolation, name))
-
-        assert marker.scope == 'session', f'{name} scope is {marker.scope!r}'
-        assert marker.autouse is True, f'{name} must be autouse — nothing requests it'
 
     @pytest.mark.parametrize('name', [_REDIRECT_NAME, _GUARD_NAME])
     def test_the_fixture_is_registered_in_this_run(self, name: str, request) -> None:

@@ -131,7 +131,7 @@ class TestWriteMergeHeartbeatFailOpen:
         """An unset ORCH_UNIT is refused LOUDLY but never stops the run loop.
 
         The producer-level half of the behaviour pinned at unit level by
-        ``test_fleet_heartbeat.py``'s ``TestEmptyUnitIsRefused``, exercised
+        ``test_fleet_heartbeat.py``'s ``TestMalformedUnitIsRefused``, exercised
         through the REAL ``write_heartbeat`` (no patch) so the two halves cannot
         drift.  All three properties matter and are asserted together:
 
@@ -141,7 +141,14 @@ class TestWriteMergeHeartbeatFailOpen:
         2. the existing ``merge heartbeat write failed`` WARNING fires, which is
            where the loudness actually lands at the production call site; and
         3. nothing is created — the substantive half, which holds regardless of
-           what the caller does with the exception.
+           what the caller does with the exception.  Asserted UNCONDITIONALLY on
+           the fleet dir itself: ``write_heartbeat`` refuses before any
+           filesystem work, so the directory must not exist AT ALL.  An
+           ``if fleet_dir.exists():``-guarded emptiness check would be dead code
+           here and would still pass if the refusal were ever moved after
+           ``safe_io.atomic_write_text(..., mkdir=True)`` created the parent —
+           precisely the regression worth catching.  One line also subsumes the
+           retired ``unknown-unit.json`` name and any ``.json.tmp`` residue.
 
         ``delenv`` is REQUIRED, not defensive: ORCH_UNIT is AMBIENT-SET in an
         orchestrator-dispatched session (measured: ``orchestrator-dark-factory.service``,
@@ -160,6 +167,8 @@ class TestWriteMergeHeartbeatFailOpen:
             await harness._write_merge_heartbeat()  # must not raise
 
         assert 'merge heartbeat write failed' in caplog.text
-        assert not (fleet_dir / 'unknown-unit.json').exists()
-        if fleet_dir.exists():
-            assert list(fleet_dir.iterdir()) == []
+        assert not fleet_dir.exists(), (
+            f'{fleet_dir} exists, so the refusal ran AFTER filesystem work had '
+            'already begun. write_heartbeat must reject a blank unit name before '
+            'safe_io.atomic_write_text(..., mkdir=True) can create the parent.'
+        )
