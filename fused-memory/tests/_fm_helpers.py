@@ -1385,26 +1385,36 @@ async def build_journal_with_closed_run(
     """
     from datetime import UTC, datetime
 
-    from fused_memory.models.reconciliation import ReconciliationRun, StageReport
+    from fused_memory.models.reconciliation import (
+        ReconciliationRun,
+        RunStatus,
+        RunType,
+        StageId,
+        StageReport,
+    )
     from fused_memory.reconciliation.journal import ReconciliationJournal
 
     journal = ReconciliationJournal(pathlib.Path(tmp_path))
     await journal.initialize()
     now = datetime.now(UTC)
+    # ``status``/``stage`` stay plain ``str`` in the signature so a caller writes
+    # the same literal the journal row holds; coerced here because the model
+    # fields are StrEnums (pydantic would coerce anyway — this just makes the
+    # conversion visible to the type checker rather than implicit).
     await journal.start_run(
         ReconciliationRun(
             id=run_id,
             project_id=project_id,
-            run_type='full',
+            run_type=RunType.full,
             trigger_reason='test',
             started_at=now,
             completed_at=None if status == 'running' else now,
-            status=status,
+            status=RunStatus(status),
         )
     )
     reports: dict[str, Any] = {
         stage: StageReport(
-            stage=stage,
+            stage=StageId(stage),
             started_at=now,
             completed_at=now,
             items_flagged=findings,
