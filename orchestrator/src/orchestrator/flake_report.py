@@ -33,6 +33,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from orchestrator.flake_ledger import (
     UNKNOWN_TEST_ID,
@@ -40,6 +41,9 @@ from orchestrator.flake_ledger import (
     FlakeCallSite,
     FlakeOccurrenceRow,
     FlakeVerdict,
+    list_open_debt,
+    read_debt,
+    read_occurrences,
 )
 
 # --- PRD §10 defaults --------------------------------------------------------
@@ -410,3 +414,129 @@ def build_chains(
         )
     chains.sort(key=lambda c: (-(c.debt.open_count if c.debt else 0), c.test_id))
     return chains
+
+
+# --- the assembled report ----------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DebtReportRow:
+    """One open debt row plus its computed age (``None`` when ``opened_at`` won't parse)."""
+
+    debt: DebtRow
+    age: timedelta | None
+
+
+@dataclass(frozen=True)
+class FlakeLedgerReport:
+    """Everything the operator report prints, already aggregated.
+
+    ``db_present`` is carried explicitly because "no ledger here" and "an empty ledger"
+    are different facts, and α's readers cannot distinguish them: they PROVISION on
+    read, so reading an absent DB would hand back an empty result set from a database
+    this report had just created.
+    """
+
+    db_path: Path
+    db_present: bool
+    generated_at: datetime
+    window_since: str | None
+    open_debt: list[DebtReportRow]
+    chains: list[ChainRow]
+    gate_blind: GateBlindCounter
+    non_convergence: NonConvergenceCounter
+    systemic: SystemicCounter
+
+
+def build_report(
+    db_path: Path,
+    *,
+    now: datetime | None = None,
+    window_hours: int = DEFAULT_GATE_BLIND_WINDOW_HOURS,
+    age_days: int = DEFAULT_DEBT_AGE_ESCALATE_DAYS,
+    gate_blind_threshold: float = DEFAULT_GATE_BLIND_RATE_THRESHOLD,
+    gate_blind_min_observations: int = DEFAULT_GATE_BLIND_MIN_OBSERVATIONS,
+    systemic_distinct_tests: int = DEFAULT_SYSTEMIC_DISTINCT_TESTS,
+    systemic_window_minutes: int = DEFAULT_SYSTEMIC_WINDOW_MINUTES,
+    occurrence_limit: int = DEFAULT_OCCURRENCE_READ_LIMIT,
+) -> FlakeLedgerReport:
+    """Read the ledger at *db_path* and aggregate it into a :class:`FlakeLedgerReport`.
+
+    Reaches ONLY α's public read API — ``list_open_debt`` / ``read_occurrences`` /
+    ``read_debt`` — and writes no SQL of its own.  *now* defaults to the wall clock and
+    is injectable so the whole report is deterministic under test.
+
+    The occurrence read is bounded on BOTH axes: ``since`` (so the counters divide by a
+    known window) and ``limit`` (because ``flake_occurrence`` is append-only and
+    unpruned by design).  α's docstring is explicit that a count over a ``limit``-capped
+    read is a count over an unknown window and dividing by it is meaningless, so a read
+    that fills the limit is surfaced rather than silently yielding a rate.
+    """
+    now = now or datetime.now(UTC)
+
+    # READ-ONLY GUARD — load-bearing, not defensive.  Every one of α's readers routes
+    # through `_open`, which does `db_path.parent.mkdir(parents=True, exist_ok=True)`,
+    # `sqlite3.connect()` (which CREATES the file) and `executescript(_SCHEMA)`, plus
+    # `-wal`/`-shm` sidecars from the `journal_mode=WAL` pragma.  So calling ANY read
+    # here against a project that has no ledger would provision
+    # `data/orchestrator/runs.db` and two sidecar files as a side effect of printing a
+    # report.  Reporting absence is also strictly more informative than reporting an
+    # empty ledger, since α's readers cannot tell "no data" from "freshly provisioned".
+    if not db_path.exists():
+        return FlakeLedgerReport(
+            db_path=db_path,
+            db_present=False,
+            generated_at=now,
+            window_since=None,
+            open_debt=[],
+            chains=[],
+            gate_blind=compute_gate_blind(
+                [],
+                threshold=gate_blind_threshold,
+                min_observations=gate_blind_min_observations,
+                window_hours=window_hours,
+            ),
+            non_convergence=compute_non_convergence([], now, age_days=age_days),
+            systemic=compute_systemic(
+                [],
+                distinct_tests=systemic_distinct_tests,
+                window_minutes=systemic_window_minutes,
+            ),
+        )
+
+    since = (now - timedelta(hours=window_hours)).isoformat()
+    open_rows = list_open_debt(db_path)
+    occurrences = read_occurrences(db_path, since=since, limit=occurrence_limit)
+    truncated = len(occurrences) >= occurrence_limit
+
+    # `list_open_debt`'s `opened_at, test_id` ordering is contractual (its docstring
+    # names ι as the reason), so it is relied on directly and never re-sorted here.
+    open_debt = [
+        DebtReportRow(
+            debt=row,
+            age=(now - opened) if (opened := _parse_stamp(row.opened_at)) is not None else None,
+        )
+        for row in open_rows
+    ]
+
+    return FlakeLedgerReport(
+        db_path=db_path,
+        db_present=True,
+        generated_at=now,
+        window_since=since,
+        open_debt=open_debt,
+        chains=build_chains(occurrences, open_rows, lambda t: read_debt(db_path, t)),
+        gate_blind=compute_gate_blind(
+            occurrences,
+            threshold=gate_blind_threshold,
+            min_observations=gate_blind_min_observations,
+            window_hours=window_hours,
+            truncated=truncated,
+        ),
+        non_convergence=compute_non_convergence(open_rows, now, age_days=age_days),
+        systemic=compute_systemic(
+            occurrences,
+            distinct_tests=systemic_distinct_tests,
+            window_minutes=systemic_window_minutes,
+        ),
+    )
