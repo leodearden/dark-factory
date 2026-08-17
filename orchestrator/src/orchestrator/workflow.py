@@ -16844,11 +16844,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             return
         try:
             import httpx as httpx_mod
-            async with httpx_mod.AsyncClient() as client:
+            async with httpx_mod.AsyncClient(follow_redirects=True) as client:
                 for arguments in arguments_list:
                     try:
-                        await client.post(
-                            f'{self.mcp.url}/mcp/',
+                        resp = await client.post(
+                            mcp_endpoint_url(self.mcp.url),
+                            headers=MCP_POST_HEADERS,
                             json={
                                 'jsonrpc': '2.0',
                                 'id': 1,
@@ -16859,6 +16860,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                                 },
                             },
                             timeout=10,
+                        )
+                        check_mcp_post_response(
+                            resp,
+                            context=f'curator submit_task for task {self.task_id}',
                         )
                     except Exception as exc:
                         logger.warning(

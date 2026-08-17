@@ -1453,9 +1453,11 @@ class TestCuratorSubmitTransport:
             )
 
         wf = _make_workflow()
-        with caplog.at_level(logging.WARNING):
-            with patch('httpx.AsyncClient.post', side_effect=redirect_post):
-                await self._route_and_drain(wf, self._suggestions())
+        with (
+            caplog.at_level(logging.WARNING),
+            patch('httpx.AsyncClient.post', side_effect=redirect_post),
+        ):
+            await self._route_and_drain(wf, self._suggestions())
 
         warnings = [
             r for r in caplog.records
