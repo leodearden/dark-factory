@@ -395,3 +395,47 @@ async def test_journaled_backend_call_records_cancellation_in_layer_2(
     assert len(backend_ops) == 1, 'a cancelled backend call must still be journaled'
     assert backend_ops[0]['success'] == 0
     assert 'CancelledError' in (backend_ops[0]['error'] or '')
+
+
+@pytest.mark.asyncio
+async def test_add_episode_journals_cancellation_as_failure(service, write_journal):
+    """A cancelled add_episode enqueue must never journal as a success.
+
+    Per the write_ops schema, a row's ``success`` means "the enqueue was
+    ACCEPTED" — it is stamped the instant durable_queue.enqueue() commits.
+    An enqueue cancelled mid-commit was therefore never accepted, and is by
+    definition not a success.
+
+    This is the same defect as ``_execute_mem0_write``'s (optimistic
+    ``success = True`` initialiser + ``except Exception`` + a ``finally``
+    that journals it) on the far higher-traffic producer: the ``mem0_add``
+    queue operation has no live producer at all, while ``add_episode`` is
+    the hot Layer-1 path. The two are a documented pair — each file's
+    comment already names the other as its mirror — so they are fixed
+    together.
+    """
+    cid = str(uuid.uuid4())
+
+    async def _hang(*_args, **_kwargs):
+        await asyncio.sleep(30)
+
+    service.durable_queue.enqueue = _hang
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(
+            service.add_episode(
+                content='never enqueued',
+                project_id='test',
+                causation_id=cid,
+            ),
+            0.2,
+        )
+
+    # add_episode mints its write_op_id internally and never returns it, so
+    # causation_id is the only join key available here.
+    ops = await write_journal.get_ops_by_causation(cid)
+    write_ops = [o for o in ops if o['layer'] == 'write_op']
+    assert len(write_ops) == 1, 'a cancelled add_episode must still be journaled'
+    assert write_ops[0]['operation'] == 'add_episode'
+    assert write_ops[0]['success'] == 0, 'an enqueue that never committed is not accepted'
+    assert 'CancelledError' in (write_ops[0]['error'] or '')
