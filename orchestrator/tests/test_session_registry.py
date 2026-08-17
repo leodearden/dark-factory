@@ -3757,6 +3757,79 @@ def test_resolve_session_pid_defaults_to_os_environ(monkeypatch: pytest.MonkeyPa
     assert sr.resolve_session_pid() == 424242
 
 
+# --- default_lease_slug (task 4248) ----------------------------------------
+#
+# 3994 moved the lease PID into code because it depended on every skill doc
+# getting one shell token right. The SLUG stayed in shell -- and 3994 then made
+# it load-bearing, since a mismatch on `lease-heartbeat`/`lease-release` is
+# REFUSED. These tests pin the builder that moves it into code too.
+
+
+def test_default_lease_slug_reproduces_the_measured_production_slug() -> None:
+    """The defaulted slug is BYTE-IDENTICAL to what the watcher skills build today.
+
+    ``watcher-df-1894895`` is the slug measured in the live fleet root on
+    2026-08-15 and recorded in ``TestLeaseSlugAndRecordSlugAreDisjoint``. This
+    equality is the back-compat oracle: an IN-FLIGHT watcher session that stops
+    passing ``--slug`` keeps its lease, with no restart, because the CLI
+    re-derives exactly the token that session already claimed with.
+    """
+    assert sr.default_lease_slug('watcher-df', {sr.SESSION_PID_ENV: '1894895'}) == 'watcher-df-1894895'
+
+
+@pytest.mark.parametrize(
+    'env',
+    [
+        {},
+        {'CLAUDE_PID': ''},
+        {'CLAUDE_PID': '   '},
+        {'CLAUDE_PID': 'not-a-pid'},
+        {'CLAUDE_PID': '0'},
+        {'CLAUDE_PID': '-1'},
+    ],
+    ids=['unset', 'empty', 'blank', 'non-numeric', 'zero', 'negative'],
+)
+def test_default_lease_slug_refuses_to_derive_when_the_session_pid_is_unresolvable(
+    env: dict[str, str],
+) -> None:
+    """An underivable slug is None -- and specifically NOT ``f'{name}-0'``.
+
+    Same parametrize set as ``resolve_session_pid``'s degradation sweep, on
+    purpose: these are exactly the envs where that function degrades to pid 0.
+
+    THE assertion is the second one. ``resolve_session_pid`` may degrade to 0
+    because a pid is a LIVENESS probe and 0 is provably dead, which keeps a
+    crashed holder's lease reapable. A slug is an IDENTITY, and ``{name}-0``
+    is not unique: two concurrently-degraded sessions contending the same lease
+    name would compute an IDENTICAL slug, so each would pass the other's
+    ``_is_lease_owner`` check and could heartbeat or release the other's lease
+    -- 3994 defect 1 ("any caller may evict/refresh any lease") reopened on the
+    degraded path. Refusing to synthesize a token it cannot make unique is the
+    only answer that keeps the ownership guard honest; the CLI then exits 2 and
+    names ``--slug`` as the escape hatch.
+    """
+    assert sr.default_lease_slug('watcher-df', env) is None
+    assert sr.default_lease_slug('watcher-df', env) != 'watcher-df-0'
+
+
+def test_default_lease_slug_defaults_to_os_environ(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv('CLAUDE_PID', '424242')
+    assert sr.default_lease_slug('watcher-df') == 'watcher-df-424242'
+
+
+def test_default_lease_slug_passes_a_task_scoped_name_through_verbatim() -> None:
+    """``build_lease_name``'s ``#`` separator survives into the slug untouched.
+
+    A lease slug is never a filesystem path: ``lease_path_for_name`` sanitizes
+    only the NAME, and ``sanitize_slug`` applies only to session-RECORD slugs.
+    A lease slug lives inside the lease's JSON body and is compared for
+    equality alone, so the task-scoped ``unblock-df#2085`` needs no escaping.
+    """
+    name = sr.build_lease_name('unblock', 'df', '2085')
+    assert name == 'unblock-df#2085'
+    assert sr.default_lease_slug(name, {sr.SESSION_PID_ENV: '55'}) == 'unblock-df#2085-55'
+
+
 def test_a_degraded_pid_lease_still_ages_out_and_is_reaped(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
