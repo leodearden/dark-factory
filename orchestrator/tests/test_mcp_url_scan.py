@@ -22,7 +22,6 @@ from __future__ import annotations
 import textwrap
 
 import pytest
-
 from _mcp_url_scan import find_trailing_slash_mcp_urls
 
 
