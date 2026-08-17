@@ -645,8 +645,11 @@ class TestMergeVerifyLeaseParametrizedLane:
         — a non-blocking flock re-acquire on that path raises BlockingIOError
         — WHILE lane_lock_path(persistent_merge_worktree_path) stays FREE
         (acquirable), proving it locked the GIVEN lane and not the hardcoded
-        persistent lane. The GLOBAL holder-pgid rendezvous
-        (read_lock_holder_pgid(worktree_base)) is still recorded, unchanged.
+        persistent lane. As of task 4189 the GLOBAL holder-pgid rendezvous
+        (read_lock_holder_pgid(worktree_base)) is NOT recorded for an
+        ephemeral lane — see TestEphemeralLaneLeaseLeavesGlobalRendezvousUntouched
+        below for why (the cold-shadow GC defer and the remove-side stomp).
+        The task-2873 lane-parametrization pins here are unchanged.
         """
         git_ops = _git_ops(tmp_path)
         # An ephemeral speculation lane (the incident's _merge-<hash> shape).
@@ -678,13 +681,16 @@ class TestMergeVerifyLeaseParametrizedLane:
             finally:
                 os.close(fd_persist)
 
-            # The global holder-pgid rendezvous stays keyed to worktree_base.
-            assert read_lock_holder_pgid(git_ops.worktree_base) == os.getpgrp(), (
-                'the GLOBAL holder-pgid must still be recorded even for an '
+            # The GLOBAL holder-pgid rendezvous is left untouched: it is
+            # keyed to worktree_base and consumed only by PERSISTENT-lane
+            # actors, so an ephemeral lane must not record it (task 4189).
+            assert read_lock_holder_pgid(git_ops.worktree_base) is None, (
+                'the GLOBAL holder-pgid must NOT be recorded for an '
                 'ephemeral-lane lease'
             )
 
-        # Released on exit — holder-pgid cleared, flock dropped.
+        # Released on exit — flock dropped; the global rendezvous was never
+        # written, and so is still absent.
         assert read_lock_holder_pgid(git_ops.worktree_base) is None
 
     async def test_default_lane_dir_still_locks_persistent(self, tmp_path: Path):

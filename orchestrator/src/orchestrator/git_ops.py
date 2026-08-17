@@ -3602,12 +3602,42 @@ class GitOps:
         ``_merge-<hash>`` speculation worktree the DF 2822 per-land REMOTE-green
         cross-check actually verifies in) flocks THAT lane instead, so the
         cross-check mutually excludes a concurrent reseed/reclaim of its OWN
-        lane (task 2873). Only the flocked inode is parametrized — the
-        holder-pgid rendezvous below stays keyed to the GLOBAL
-        :attr:`worktree_base` (a fail-open liveness hint consumed only by
-        persistent-lane actors; an ephemeral-lane lease writing it is a safe
-        over-approximation that at worst makes a concurrent persistent
-        reseed/GC defer during the cross-check, never a clobber).
+        lane (task 2873).
+
+        The GLOBAL holder-pgid rendezvous below — the single FIXED-key
+        ``verify_cancel.LOCK_HOLDER_PGID_KEY`` file under
+        :attr:`worktree_base`, a fail-open liveness hint consumed only by
+        PERSISTENT-lane actors — is written AND removed ONLY when *lane_dir*
+        is ``None`` or resolves to :attr:`persistent_merge_worktree_path`
+        (task 4189). An ephemeral lane still gets the flock and the
+        fail-closed contended raise below; it simply never touches the
+        global. Task 2873 kept the rendezvous unconditional as "a safe
+        over-approximation", but that argument contemplated only the SHORT
+        DF-2822 cross-check and only the DEFER direction, and it cost two
+        things:
+
+        (i) :meth:`_run_warm_lane_gc_reclaim` defers (127) unconditionally
+            while the rendezvous names a live pgid and deliberately does NOT
+            exclude self, so an hours-long cold-shadow verify on an ephemeral
+            lane (``merge_shadow.py``) blocked warm-lane reclaim for its WHOLE
+            window — while touching nothing in the pool that reclaim resets.
+
+        (ii) The key is not refcounted and carries no owner check (last writer
+            wins, first remover wins). Shadow compares run as background
+            asyncio tasks alongside the NEXT merge's persistent-lane verify,
+            so whichever lease exited FIRST stripped the other's LIVE
+            rendezvous — the exact remove-side stomp
+            :meth:`task_verify_lease`'s docstring already cites as its own
+            reason for being flock-only. On an ephemeral lane the two leases
+            now agree on the rendezvous.
+
+        :meth:`reset_persistent_merge_worktree` is unaffected either way: its
+        guard already excludes our own pgid, so an in-process ephemeral lease
+        never blocked it. The ``records_rendezvous`` flag is computed ONCE,
+        before the acquire, and reused for both the write and the ``finally``'s
+        remove, so the pair can never go asymmetric (a write with no remove
+        would leak a permanently live-looking rendezvous; a remove with no
+        write is stomp (ii) itself).
 
         On a contended flock (the bounded wait in
         :func:`acquire_merge_verify_flock` times out after
@@ -3630,6 +3660,32 @@ class GitOps:
         """
         lock_path = lane_lock_path(
             lane_dir if lane_dir is not None else self.persistent_merge_worktree_path
+        )
+        # Does this lease record the GLOBAL holder-pgid rendezvous?  ONLY for
+        # the persistent merge lane (task 4189) — see the docstring above.
+        #
+        # Computed ONCE and reused for BOTH the write and the finally's
+        # remove, because two independent evaluations could in principle
+        # disagree (a .resolve() re-read crossing a mount/symlink change) and
+        # each asymmetry is worse than the bug this closes: a write with no
+        # remove leaks a permanent live-looking rendezvous that wedges
+        # warm-lane GC until process exit, and a remove with no write is the
+        # very cross-lease stomp being fixed.
+        #
+        # Computed BEFORE the acquire, so an OSError out of .resolve() raises
+        # while NO fd is held and can never orphan a lane flock (B12).
+        #
+        # Keyed on the RESOLVED PATH, not on "was an argument passed": the
+        # DF-2822 cross-check (merge_queue.py) passes lane_dir=merge_wt
+        # EXPLICITLY, and that IS the persistent lane whenever the merge ran
+        # there.  .resolve() on both sides matches the two other
+        # persistent-lane comparisons in this codebase
+        # (remove_merge_worktree_guarded's persistent exemption,
+        # merge_queue.py's LOCAL-dispatch gate), so a symlinked .worktrees
+        # pool mount cannot misclassify the persistent lane as ephemeral.
+        records_rendezvous = (
+            lane_dir is None
+            or lane_dir.resolve() == self.persistent_merge_worktree_path.resolve()
         )
         # Off-thread bounded-wait acquire (shared skeleton, task 3027):
         # _acquire_lane_flock_off_thread wraps the asyncio.to_thread(
@@ -3689,11 +3745,13 @@ class GitOps:
                 _MERGE_VERIFY_LEASE_WAIT_SECS,
                 holder_facts=_lane_lock_holder_facts(lock_path, holder_pids),
             )
-        write_lock_holder_pgid(self.worktree_base, os.getpgrp())
+        if records_rendezvous:
+            write_lock_holder_pgid(self.worktree_base, os.getpgrp())
         try:
             yield
         finally:
-            remove_lock_holder_pgid(self.worktree_base)
+            if records_rendezvous:
+                remove_lock_holder_pgid(self.worktree_base)
             self._release_lane_flock(fd)
 
     @contextlib.asynccontextmanager
@@ -5547,13 +5605,21 @@ class GitOps:
         'nothing reclaimed' by the caller (``_warm_lane_disk_admission_blocked``).
 
         **Merge-verify lease guard (task 2315, BUG 1)**: defers (127) while
-        ANY merge-verify lease is held — INCLUDING our own.  The reclaim
-        script operates over the whole pool mount (which CONTAINS
+        any PERSISTENT-LANE merge-verify lease is held — INCLUDING our own.
+        The reclaim script operates over the whole pool mount (which CONTAINS
         ``_merge-verify``), so an in-process local verify must be deferred
         to just as much as a foreign one; unlike
         :meth:`reset_persistent_merge_worktree`'s lease guard, self is NOT
         excluded here.  Checked BEFORE the pool-storage guard below so the
         skip is attributable to the lease even when the sentinel is fine.
+
+        An EPHEMERAL ``_merge-<hash>`` speculation-lane lease no longer
+        records the holder-pgid rendezvous this predicate reads (task 4189),
+        so it no longer defers the reclaim: such a lane is not one the
+        reclaim resets, and an hours-long cold-shadow verify
+        (``merge_shadow.py``) previously blocked the whole pool's reclaim for
+        its entire window.  Its own lane stays protected by the lane flock
+        the reclaim script itself takes.
 
         **Pool-storage guard (task 2099, self-heal task 2315)**: routes
         through :meth:`_reconcile_pool_storage_before_sweep`, which refuses
