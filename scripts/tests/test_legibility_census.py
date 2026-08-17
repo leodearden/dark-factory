@@ -1202,6 +1202,49 @@ def _capped_mining_result(*, stop_reason, max_batches, batches=2):
     )
 
 
+def _storm_capped_mining_result():
+    """A capped run whose second batch is a storm. Mirrors the exact fixture
+    shape already pinned by test_mine_to_saturation_storm_batch_never_counts_as_saturated
+    (:352-389: total=10, succeeded=4, failed=6, status="failure") so this is
+    provably a shape mine_to_saturation really produces, not an invented one.
+    Batch 0 is healthy (10/10 coded); batch 1 is a storm (6 of 10 digests
+    failed to parse and so contributed no signal). drawn = 20, coded = 14."""
+    return mod.MiningResult(
+        records=[],
+        batch_stats=[
+            mod.BatchStats(
+                index=0, total=10, succeeded=10, failed=0, dup_rate=0.1,
+                saturated=False, status="ok",
+            ),
+            mod.BatchStats(
+                index=1, total=10, succeeded=4, failed=6, dup_rate=1.0,
+                saturated=False, status="failure",
+            ),
+        ],
+        stop_reason="capped",
+        max_batches=2,
+    )
+
+
+def _coverage_line(report):
+    """Isolate the single "- coverage:" line inside "## Saturation" from the
+    rest of the section. The per-batch bullets rendered below it already
+    contain digit-bearing substrings like "total=10 ... succeeded=4", so
+    asserting against the whole section (the same trap
+    test_render_report_capped_run_names_cap_and_partial_coverage's own
+    precision comment below calls out for the bare cap digit) would pass
+    even against unfixed code and prove nothing. Assert only against what
+    this returns."""
+    saturation_section = report.split("## Saturation", 1)[1].split("##", 1)[0]
+    coverage_lines = [
+        line for line in saturation_section.splitlines() if line.strip().startswith("- coverage:")
+    ]
+    assert len(coverage_lines) == 1, (
+        f"expected exactly one '- coverage:' line, found {coverage_lines!r}"
+    )
+    return coverage_lines[0]
+
+
 def _render(**overrides):
     # Annotated for the same reason as _run_census_kwargs: a heterogeneous
     # dict whose inferred value union would otherwise be re-reported once per
@@ -1237,6 +1280,26 @@ def test_render_report_capped_run_names_cap_and_partial_coverage():
     # A capped report must be unreadable as full coverage.
     assert "partial" in lowered
     assert "not mined" in lowered
+
+
+def test_render_report_capped_coverage_states_coded_digests_not_drawn_digests():
+    # A storm batch's `total` counts digests DRAWN into the batch, including
+    # ones that failed to code and so contributed zero signal to the
+    # codebook (coder.code_digests, PRD §8.6). This is the ONE line whose
+    # documented job (render_report's docstring, "NO SILENT CAPS") is that a
+    # bounded run is never read as fuller coverage than it actually was --
+    # so it must lead with what was CODED (succeeded), not merely what was
+    # DRAWN (total).
+    report = _render(mining_result=_storm_capped_mining_result())
+
+    coverage_line = _coverage_line(report)
+    assert "14" in coverage_line, "digests actually coded (10 healthy + 4 from the storm) must be stated"
+    assert "20" in coverage_line, "the drawn count must still be present, not silently dropped"
+    assert "drawn" in coverage_line.lower(), "the 20 figure must be labelled as drawn, not as coded/mined"
+    assert "mined 20 session digest(s)" not in coverage_line, (
+        "the buggy rendering reported the drawn count as though all 20 had "
+        "been coded -- this must no longer render"
+    )
 
 
 def test_render_report_capped_run_says_the_skipped_sessions_are_not_re_mined():
