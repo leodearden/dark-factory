@@ -91,6 +91,7 @@ from fused_memory.services.live_workflow_detector import (
     corroboration_for_task,
     is_pure_gate_metadata,
     is_workflow_live_for_task,
+    worktree_index_for,
 )
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.services.orchestrator_detector import orchestrator_started_at
@@ -4949,6 +4950,37 @@ class ReconciliationHarness:
                 except Exception:
                     _orch_started = None
 
+                # Task 3778: hoist the whole-repo `git worktree list --porcelain`
+                # out of the cited-task fan-out below, the same way
+                # _render_live_workflow_section hoists it out of its per-task
+                # loop (and the same way the is_orchestrator_live_for hoist
+                # noted above already works here). It is invariant across every
+                # cited task in this pass, so the doubly-nested loop pays ONE
+                # worktree list rather than one per cited task.
+                #
+                # Fail-safe → None, which is worktree_index_for's "unknown"
+                # sentinel: the kwarg is then omitted entirely and each probe
+                # falls back to its own list. Passing `{}` instead would report
+                # every cited task as worktree_registered=False from a hoisted
+                # ERROR — a transient git glitch would become a project-wide
+                # "nothing is live" verdict and fire stranded escalations for
+                # genuinely live tasks. `{}` from a SUCCESSFUL probe is a real
+                # answer (no registered worktrees) and is threaded through.
+                try:
+                    _worktree_index: dict[str, bool] | None = await worktree_index_for(
+                        project_root,
+                    )
+                except Exception:
+                    logger.warning(
+                        'reconciliation.integrity_gate_worktree_index_hoist_failed',
+                        extra={'category': '', 'project_id': project_id},
+                        exc_info=True,
+                    )
+                    _worktree_index = None
+                _index_kwargs: dict = (
+                    {} if _worktree_index is None else {'worktree_index': _worktree_index}
+                )
+
                 for finding in actionable_remaining:
                     persistence = await self._finding_persistence_count(project_id, finding)
                     if persistence >= _INTEGRITY_FINDING_RECURRENCE_THRESHOLD:
@@ -5035,9 +5067,13 @@ class ReconciliationHarness:
                                         tid, _corr_exc,
                                     )
                             try:
-                                if is_workflow_live_for_task(
+                                # Awaited (task 3778): the detector's three git
+                                # probes are async now, so this whole gate no
+                                # longer blocks the loop this pass runs on.
+                                if await is_workflow_live_for_task(
                                     tid, project_root,
                                     status=_status,
+                                    **_index_kwargs,
                                     task_kind=(
                                         _metadata.get('task_kind')
                                         if isinstance(_metadata, dict) else None
