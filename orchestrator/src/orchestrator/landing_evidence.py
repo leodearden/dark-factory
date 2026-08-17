@@ -133,6 +133,7 @@ def is_valid_sha_40(s: object) -> TypeGuard[str]:
 
 async def branch_is_degenerate(
     git_ops: GitOps, branch: str, metadata: dict[str, Any],
+    *, branch_tip_sha: str | None = None,
 ) -> bool:
     """Return True iff the branch is a provisioning-only degenerate branch.
 
@@ -156,14 +157,28 @@ async def branch_is_degenerate(
 
     Args:
         git_ops: A ``GitOps`` instance (or a duck-typed stand-in exposing
-            ``resolve_branch_sha``).
+            ``resolve_branch_sha``).  Not consulted when *branch_tip_sha*
+            is supplied.
         branch: The task's branch name (e.g. ``f'task/{task_id}'``).
         metadata: The task's metadata dict, read for ``branch_base_sha``.
+        branch_tip_sha: An already-resolved tip for *branch*.  When given,
+            it is used verbatim and ``resolve_branch_sha`` is NOT called.
+            This is not merely a saved subprocess: a caller that already
+            ran an ancestry (or patch-id) check against a tip it observed
+            must judge degeneracy against that SAME tip.  Re-reading the
+            ref here would let a concurrent warm-lane reseed land between
+            the two reads, so a branch whose ancestry was checked at SHA A
+            could be judged degenerate/non-degenerate at SHA B and the
+            resulting verdict would be anchored on evidence validated for
+            a tip that is no longer current (task 3103 review).  Pass
+            ``None`` (the default) only when you have not resolved the ref
+            yourself — the harness call sites do exactly that.
     """
     branch_base_sha = metadata.get('branch_base_sha')
     if not is_valid_sha_40(branch_base_sha):
         return False
-    branch_tip_sha = await git_ops.resolve_branch_sha(branch)
+    if branch_tip_sha is None:
+        branch_tip_sha = await git_ops.resolve_branch_sha(branch)
     return branch_tip_sha is not None and branch_tip_sha == branch_base_sha
 
 

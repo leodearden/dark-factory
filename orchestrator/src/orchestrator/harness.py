@@ -490,13 +490,6 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
-# _is_valid_sha_40 is now defined in landing_evidence.py (task 3103) and
-# imported above verbatim; re-bound to this name so existing call sites here
-# and any `from orchestrator.harness import _is_valid_sha_40` importer keep
-# working unchanged.  The move gives the escalation server's merge_status
-# marker-arm veto the SAME implementation rather than a second copy.
-_is_valid_sha_40 = is_valid_sha_40
-
 # _deterministic_deploy_health_verdict is now defined in systemd_inspect.py
 # (task 2119) and imported above verbatim; re-bound to this name so existing
 # `from orchestrator.harness import _deterministic_deploy_health_verdict`
@@ -10196,7 +10189,7 @@ class Harness:
             )
             if marker:
                 branch_base_sha = metadata.get('branch_base_sha')
-                if _is_valid_sha_40(
+                if is_valid_sha_40(
                     branch_base_sha,
                 ) and await self.git_ops.is_ancestor(marker, branch_base_sha):
                     return False

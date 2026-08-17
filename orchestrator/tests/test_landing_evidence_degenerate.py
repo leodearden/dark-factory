@@ -9,7 +9,10 @@ fast-path.  This module pins:
 (A) ``is_valid_sha_40``'s exact acceptance set,
 (B) ``branch_is_degenerate``'s fail-open contract and short-circuit ordering,
 (C) that ``Harness._branch_is_degenerate`` is a behaviour-preserving
-    delegation to the extracted function, over one shared case table.
+    delegation to the extracted function, over one shared case table,
+(D) the ``branch_tip_sha`` override: a caller that already resolved the ref
+    judges degeneracy against that SAME observed tip, with no second
+    ``git rev-parse``.
 
 (C) is the regression pin that the extraction did not change semantics — the
 whole point of the move is that there is exactly ONE implementation, so the
@@ -23,8 +26,6 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-import orchestrator.harness as harness_mod
-import orchestrator.landing_evidence as landing_evidence_mod
 from orchestrator.harness import Harness
 from orchestrator.landing_evidence import branch_is_degenerate, is_valid_sha_40
 
@@ -56,17 +57,6 @@ OTHER = 'b' * 40
 )
 def test_is_valid_sha_40(value: object, expected: bool) -> None:
     assert is_valid_sha_40(value) is expected
-
-
-def test_harness_rebinds_the_extracted_is_valid_sha_40() -> None:
-    """harness._is_valid_sha_40 must BE the extracted function, not a copy.
-
-    The extraction exists to eliminate lockstep duplication; a future
-    copy-paste regression that reintroduces a second implementation in
-    harness.py would silently pass every behavioural test above but fail
-    this identity assertion.
-    """
-    assert harness_mod._is_valid_sha_40 is landing_evidence_mod.is_valid_sha_40
 
 
 # ---------------------------------------------------------------------------
@@ -160,3 +150,60 @@ async def test_harness_method_matches_extracted_function(
     assert method_result == fn_result
     assert method_result is expected
     assert method_git.resolve_branch_sha.await_count == (1 if git_called else 0)
+
+
+# ---------------------------------------------------------------------------
+# (D) branch_tip_sha override — one observed tip, no second ref read
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('supplied_tip', 'expected'),
+    [
+        (BASE, True),      # supplied tip == recorded base → degenerate
+        (OTHER, False),    # supplied tip advanced past base → not degenerate
+    ],
+    ids=['supplied_tip_equals_base', 'supplied_tip_advanced'],
+)
+async def test_branch_tip_sha_is_used_verbatim_without_resolving(
+    supplied_tip: str, expected: bool,
+) -> None:
+    """A supplied tip decides the verdict and suppresses resolve_branch_sha.
+
+    The git stub is wired to return the OPPOSITE answer, so a regression that
+    re-reads the ref flips the verdict rather than merely costing a
+    subprocess.  That is the point of the parameter: the escalation call
+    sites have already run an ancestry / patch-id check against a tip they
+    observed, and a concurrent warm-lane reseed between the two reads would
+    otherwise let the degeneracy verdict be computed against a different SHA
+    than the evidence it gates.
+    """
+    git_ops = _stub_git_ops(OTHER if supplied_tip == BASE else BASE)
+
+    result = await branch_is_degenerate(
+        git_ops, 'task/999', {'branch_base_sha': BASE},  # type: ignore[arg-type]
+        branch_tip_sha=supplied_tip,
+    )
+
+    assert result is expected
+    git_ops.resolve_branch_sha.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_branch_tip_sha_still_short_circuits_on_bad_base() -> None:
+    """The metadata check keeps precedence over a supplied tip.
+
+    An absent/malformed ``branch_base_sha`` fails OPEN (False) even when the
+    caller hands in a tip, so the backward-compat direction is identical on
+    both entry forms.
+    """
+    git_ops = _stub_git_ops(BASE)
+
+    result = await branch_is_degenerate(
+        git_ops, 'task/999', {},  # type: ignore[arg-type]
+        branch_tip_sha=BASE,
+    )
+
+    assert result is False
+    git_ops.resolve_branch_sha.assert_not_awaited()
