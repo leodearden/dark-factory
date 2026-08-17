@@ -34,7 +34,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from orchestrator.flake_ledger import FlakeOccurrenceRow, FlakeVerdict
+from orchestrator.flake_ledger import DebtRow, FlakeOccurrenceRow, FlakeVerdict
 
 # --- PRD §10 defaults --------------------------------------------------------
 #
@@ -175,4 +175,78 @@ def compute_gate_blind(
         exceeds_threshold=sufficient and rate is not None and rate > threshold,
         window_hours=window_hours,
         truncated=truncated,
+    )
+
+
+# --- §5.6 class 2: the de-flake cycle is not converging ----------------------
+
+
+@dataclass(frozen=True)
+class NonConvergenceCounter:
+    """Open debt that is not resolving: recurrence, age, and unowned rows."""
+
+    open_tests: int
+    recurrent_tests: int
+    over_age_tests: int
+    unowned_tests: int
+    unparseable_opened_at: int
+    oldest_age: timedelta | None
+    age_threshold_days: int
+
+
+def compute_non_convergence(
+    open_debt_rows: Sequence[DebtRow],
+    now: datetime,
+    *,
+    age_days: int = DEFAULT_DEBT_AGE_ESCALATE_DAYS,
+) -> NonConvergenceCounter:
+    """Summarise open debt against §5.6's class-2 triggers.
+
+    READING THE TWO TRIGGERS (§5.6): ``recurrent_tests`` (``open_count > 1``) is the
+    PRIMARY signal — a test that has been in debt more than once has already had a fix
+    that did not hold.  ``over_age_tests`` is only the BACKSTOP.  The PRD's "0 of 35
+    de-flake tasks ever exceeded 3 days" figure must NOT be read as evidence the
+    backstop is inert: §2 records that it is survivorship-filtered over CLOSED tasks,
+    so the rows it would have caught are precisely the ones missing from the sample.
+
+    ``unowned_tests`` counts open rows with no ``owner_task_id`` — a live §5.9 invariant
+    breach, and the single most consequential state this report can encounter, because
+    §5.7's suppression LANDS the merge: once a test is suppressed, nothing except the
+    debt invariant keeps it visible at all.  Counting it (and rendering it loudly) is a
+    READ of the ledger; ι files nothing.
+
+    An unparseable ``opened_at`` is counted in its own bucket and contributes to neither
+    ``over_age_tests`` nor ``oldest_age``, so a row whose clock cannot be read is
+    visibly unknown rather than silently brand-new.
+    """
+    threshold = timedelta(days=age_days)
+    recurrent = 0
+    over_age = 0
+    unowned = 0
+    unparseable = 0
+    oldest: timedelta | None = None
+    for row in open_debt_rows:
+        if row.open_count > 1:
+            recurrent += 1
+        if row.owner_task_id is None:
+            unowned += 1
+        opened = _parse_stamp(row.opened_at)
+        if opened is None:
+            unparseable += 1
+            continue
+        age = now - opened
+        # Strictly greater: a row opened exactly `age_days` ago has not yet EXCEEDED
+        # the bound.
+        if age > threshold:
+            over_age += 1
+        if oldest is None or age > oldest:
+            oldest = age
+    return NonConvergenceCounter(
+        open_tests=len(open_debt_rows),
+        recurrent_tests=recurrent,
+        over_age_tests=over_age,
+        unowned_tests=unowned,
+        unparseable_opened_at=unparseable,
+        oldest_age=oldest,
+        age_threshold_days=age_days,
     )
