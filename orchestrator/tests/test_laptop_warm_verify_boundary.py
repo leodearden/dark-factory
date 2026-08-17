@@ -35,6 +35,7 @@ import subprocess
 import sys
 import threading
 import time
+import warnings
 from pathlib import Path
 from typing import NamedTuple
 from unittest.mock import AsyncMock, MagicMock
@@ -700,15 +701,65 @@ ROW_DISCOVERY_CEILING_BASE_SECS: float = 20.0
 #: so /proc/pressure readings are deliberately untrustworthy here.
 _DISCOVERY_CEILING_MAX_SCALE: float = 6.0
 
+#: Operator knob: pin the discovery ceiling outright (e.g. to reproduce a
+#: discovery timeout quickly instead of waiting out a load-scaled deadline).
+#: Namespaced ORCH_TEST_*, NOT bare ORCH_*: subprocess_env() copies
+#: os.environ into every spawned verify-merge, and the ORCH_* namespace there
+#: is production knobs the CLI actually reads.
+_DISCOVERY_CEILING_OVERRIDE_ENV: str = 'ORCH_TEST_DISCOVERY_CEILING_SECS'
+
+
+def _resolve_ceiling_override(environ) -> float | None:
+    """Parse :data:`_DISCOVERY_CEILING_OVERRIDE_ENV` out of *environ*.
+
+    Returns None when unset, and warns-then-returns-None on a value that is
+    unparseable or non-positive.  Deliberately does NOT raise: this is
+    resolved at import, so raising would fail COLLECTION for the entire
+    module -- every row and every helper test taken down by one mistyped
+    debugging knob, a strictly worse and far more confusing failure than the
+    one being guarded against.  Silently ignoring it would be worse still,
+    hence the warning.
+
+    Takes an environ MAPPING rather than reading ``os.environ`` so it is
+    deterministically testable with no monkeypatch-versus-import-order race.
+    """
+    raw = environ.get(_DISCOVERY_CEILING_OVERRIDE_ENV)
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = None
+    if value is None or value <= 0:
+        warnings.warn(
+            f'{_DISCOVERY_CEILING_OVERRIDE_ENV}={raw!r} is not a positive number; '
+            f'ignoring it and using the load-scaled discovery ceiling instead',
+            stacklevel=2,
+        )
+        return None
+    return value
+
+
+#: Resolved ONCE at import -- see the module's discovery-ceiling notes and
+#: :func:`row_discovery_ceiling_secs`.  A per-call env read could return a
+#: value the already-baked @pytest.mark.timeout below cannot accommodate.
+_DISCOVERY_CEILING_OVERRIDE_SECS: float | None = _resolve_ceiling_override(os.environ)
+
 #: The bound the import-time @pytest.mark.timeout below is derived from.  No
 #: value row_discovery_ceiling_secs() can return may exceed it -- see
-#: test_row_per_test_timeout_still_covers_the_max_discovery_ceiling.
+#: test_row_per_test_timeout_still_covers_the_max_discovery_ceiling.  The
+#: override is folded in (rather than sitting outside the bound) so that
+#: invariant holds for every reachable value, pinned or scaled.
 ROW_DISCOVERY_CEILING_MAX_SECS: float = (
-    ROW_DISCOVERY_CEILING_BASE_SECS * _DISCOVERY_CEILING_MAX_SCALE
-)  # 120.0
+    _DISCOVERY_CEILING_OVERRIDE_SECS
+    if _DISCOVERY_CEILING_OVERRIDE_SECS is not None
+    else ROW_DISCOVERY_CEILING_BASE_SECS * _DISCOVERY_CEILING_MAX_SCALE
+)  # 120.0 unpinned
 
 
-def row_discovery_ceiling_secs(*, _loadavg=None, _cpu_count=None) -> float:
+def row_discovery_ceiling_secs(
+    *, _loadavg=None, _cpu_count=None, _override=_DISCOVERY_CEILING_OVERRIDE_SECS
+) -> float:
     """Resolve the discovery ceiling for a wait that is starting NOW.
 
     A WEDGE DETECTOR, not a speed assertion: the rows assert THAT a tree was
@@ -724,13 +775,26 @@ def row_discovery_ceiling_secs(*, _loadavg=None, _cpu_count=None) -> float:
     never wider than :data:`ROW_DISCOVERY_CEILING_MAX_SECS` (the bound the
     import-time pytest timeout is derived from).
 
-    *_loadavg* / *_cpu_count* are private injectable seams for deterministic
-    coverage, defaulting to the real readers.
+    An operator pin via :data:`_DISCOVERY_CEILING_OVERRIDE_ENV` is returned
+    VERBATIM, bypassing load scaling in both directions -- otherwise "pin it
+    low to reproduce the timeout quickly" would silently do nothing on a busy
+    box.  It is safe against the clamp invariant because
+    :data:`ROW_DISCOVERY_CEILING_MAX_SECS` folds the same pin in.
+
+    *_loadavg* / *_cpu_count* / *_override* are private injectable seams for
+    deterministic coverage, defaulting to the real readers.
     """
+    if _override is not None:
+        return _override
     loadavg = os.getloadavg()[0] if _loadavg is None else _loadavg
     cpu_count = (os.cpu_count() or 1) if _cpu_count is None else _cpu_count
     scaled = ROW_DISCOVERY_CEILING_BASE_SECS * (loadavg / max(cpu_count, 1))
-    return min(ROW_DISCOVERY_CEILING_MAX_SECS, max(ROW_DISCOVERY_CEILING_BASE_SECS, scaled))
+    # Clamp against the UNPINNED bound, not ROW_DISCOVERY_CEILING_MAX_SECS:
+    # the latter folds an operator pin in, and a pin is already returned above.
+    # Reading it here would make a low pin silently re-clamp the scaled branch
+    # too, so the `_override=None` seam would not mean "as if unpinned".
+    unpinned_max = ROW_DISCOVERY_CEILING_BASE_SECS * _DISCOVERY_CEILING_MAX_SCALE
+    return min(unpinned_max, max(ROW_DISCOVERY_CEILING_BASE_SECS, scaled))
 
 
 #: TRANSITIONAL: the pre-4014 flat name, still read by the worst-case
@@ -827,27 +891,28 @@ def test_row_discovery_ceiling_scales_with_load_and_clamps():
         past the pytest timeout that is DERIVED from that clamp;
     (d) the mapping is monotone -- more load never yields a tighter deadline.
     """
-    idle = row_discovery_ceiling_secs(_loadavg=0.1, _cpu_count=32)
+    idle = row_discovery_ceiling_secs(_override=None, _loadavg=0.1, _cpu_count=32)
     assert idle == ROW_DISCOVERY_CEILING_BASE_SECS, (
         f'an idle box must pay exactly the base ceiling '
         f'({ROW_DISCOVERY_CEILING_BASE_SECS}); got {idle}'
     )
 
-    loaded = row_discovery_ceiling_secs(_loadavg=96.0, _cpu_count=32)
+    loaded = row_discovery_ceiling_secs(_override=None, _loadavg=96.0, _cpu_count=32)
     assert loaded > ROW_DISCOVERY_CEILING_BASE_SECS, (
         f'at 3x per-core load -- the BOTTOM of the measured dilation envelope -- '
         f'the ceiling must widen past base; got {loaded}'
     )
 
-    absurd = row_discovery_ceiling_secs(_loadavg=6400.0, _cpu_count=32)
-    assert absurd == ROW_DISCOVERY_CEILING_MAX_SECS, (
-        f'a runaway load must clamp to ROW_DISCOVERY_CEILING_MAX_SECS '
-        f'({ROW_DISCOVERY_CEILING_MAX_SECS}) -- that clamp is what the '
-        f'import-time pytest timeout is derived from; got {absurd}'
+    unpinned_clamp = ROW_DISCOVERY_CEILING_BASE_SECS * _DISCOVERY_CEILING_MAX_SCALE
+    absurd = row_discovery_ceiling_secs(_override=None, _loadavg=6400.0, _cpu_count=32)
+    assert absurd == unpinned_clamp, (
+        f'a runaway load must clamp to {unpinned_clamp} -- that clamp is what '
+        f'ROW_DISCOVERY_CEILING_MAX_SECS, and in turn the import-time pytest '
+        f'timeout, are derived from; got {absurd}'
     )
 
     ladder = [
-        row_discovery_ceiling_secs(_loadavg=load, _cpu_count=32)
+        row_discovery_ceiling_secs(_override=None, _loadavg=load, _cpu_count=32)
         for load in (0.0, 1.0, 32.0, 64.0, 96.0, 200.0, 1000.0, 6400.0)
     ]
     assert ladder == sorted(ladder), (
