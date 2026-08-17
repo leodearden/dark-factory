@@ -23,6 +23,7 @@ from orchestrator.verify_cmd import (
     VerifyCmd,
     describe_dropped_clauses,
     has_unpreserved_chain_clauses,
+    keyword_truncation_end,
     parse_config_command,
     promote_cwd_to_project,
     render,
@@ -427,7 +428,12 @@ def _scope_prefix_to_keyword(raw: str, keyword: str, files: list[str]) -> Verify
     idx = head.find(keyword)
     if idx == -1:
         return unscoped
-    retained = head[: idx + len(keyword)]
+    # Task 3931 / esc-3805-1: token-aware, in LOCKSTEP with
+    # verify._scope_to_keyword's identical line — the shared
+    # `keyword_truncation_end` helper is what makes that lockstep structural
+    # rather than a convention. The old byte-offset slice cut mid-token at the
+    # `@` of a pinned npx package spec, destroying the pin before the re-parse.
+    retained = head[: keyword_truncation_end(head, idx + len(keyword))]
     prefix_parsed = parse_config_command(retained)
     if prefix_parsed.tool is ToolKind.OPAQUE or prefix_parsed.raw is not None:
         return unscoped

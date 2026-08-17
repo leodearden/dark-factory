@@ -66,6 +66,7 @@ from orchestrator.verify_cmd import (
     cargo_scope,
     govern_cpu,
     has_unpreserved_chain_clauses,
+    keyword_truncation_end,
     parse_config_command,
     promote_cwd_to_project,
     render,
@@ -208,7 +209,15 @@ def _scope_to_keyword(cmd: str | None, keyword: str, files: list[str]) -> str | 
     idx = head.find(keyword)
     if idx == -1:
         return cmd
-    retained = head[: idx + len(keyword)]
+    # Task 3931 / esc-3805-1: token-aware, not a bare byte-offset slice. The
+    # old `head[: idx + len(keyword)]` cut mid-token at the `@` of a pinned npx
+    # package spec, silently dropping `@1.1.408` before the string was
+    # re-parsed — so the gate advertised a pinned pyright and ran whatever npx
+    # last cached. See `keyword_truncation_end` for the boundary rule and why
+    # it is anchored on `@` rather than "keep the whole token"; the shared
+    # helper is also what keeps this in structural lockstep with
+    # `verify_plan._scope_prefix_to_keyword`.
+    retained = head[: keyword_truncation_end(head, idx + len(keyword))]
     parsed = parse_config_command(retained)
     if parsed.tool is ToolKind.OPAQUE or parsed.raw is not None:
         return cmd

@@ -517,6 +517,55 @@ def _segment_invokes_tool(segment: str, keyword: str) -> bool:
     return False
 
 
+def keyword_truncation_end(head: str, end: int) -> int:
+    """Extend a keyword-match end offset across an npx ``@<version>`` suffix.
+
+    Task 3931 / esc-3805-1. Both scopers — ``verify._scope_to_keyword`` and
+    ``verify_plan._scope_prefix_to_keyword`` — truncate their matched segment
+    to everything up to and including the first occurrence of the keyword,
+    historically with the BYTE-OFFSET slice ``head[: idx + len(keyword)]``.
+    That slice cuts mid-token at the ``@`` of a pinned npx package spec, so
+    ``npx pyright@1.1.408`` was truncated to ``npx pyright`` BEFORE being
+    re-parsed: the pin was destroyed by the truncation, independently of
+    whether the parser could carry it. A gate spelled as pinned therefore ran
+    whatever npx last cached — MEASURED byte-identical output for the pinned
+    and unpinned fleet chains.
+
+    Both callers route through this one helper for the same reason they route
+    through ``split_chain_tail``: their lockstep is STRUCTURAL, not a
+    convention kept by hand.
+
+    THE BOUNDARY RULE, and why it is this narrow. The extension applies ONLY
+    when the very next character is ``@`` — the npm package-spec version
+    separator — and then runs to the end of that token (stopping at whitespace
+    or any shell metacharacter, so a chain operator can never be swallowed).
+    Every other mid-token keyword occurrence keeps its pre-3931 truncation
+    byte-for-byte.
+
+    The rejected alternative was "retain whatever token the keyword ends
+    inside". That would also absorb an unrelated LONGER token: ``npx
+    pyright-foo`` is a DIFFERENT tool whose name merely starts with the
+    keyword, and retaining ``pyright-foo`` whole would reclassify the command
+    as ``ToolKind.NPX``, where ``scope_to`` treats the tool name as a target
+    and REPLACES it with the touched file. Anchoring on ``@`` keeps the
+    widening to exactly the shape that needs it. Pinned by
+    ``test_verify.py::TestVersionPinSurvivesScoping`` and
+    ``test_verify_plan.py::TestVersionPinSurvivesPrefixScoping``.
+    """
+    if head[end : end + 1] != '@':
+        return end
+    stop = end + 1
+    while stop < len(head) and not head[stop].isspace() and head[stop] not in _SHELL_METACHARS:
+        stop += 1
+    return stop
+
+
+# Characters that can never be part of an npx package-spec token — every one
+# of them would start (or be part of) shell control flow, so
+# `keyword_truncation_end`'s scan must stop before it swallows one.
+_SHELL_METACHARS = frozenset('&|;()<>`$"\'')
+
+
 def split_chain_tail(raw: str, keyword: str) -> tuple[str, str]:
     """Split *raw* into a *keyword*-bearing head and a preservable trailing chain.
 
