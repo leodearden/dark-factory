@@ -265,9 +265,15 @@ def build_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
                 # visibly; whereas before, an operator hitting truncation had no
                 # working lever on this arm at all.
                 llm_client = OpenAIClient(config=llm_config, max_tokens=cfg.llm.max_tokens)
+            # max_tokens is named here deliberately (task 3864): it is now
+            # authoritative on BOTH sub-arms, and the default arm's effective
+            # value changed from upstream's 16384 to the configured one without
+            # any other signal to the operator. Log cfg.llm.max_tokens rather
+            # than llm_client.max_tokens — the two are equal, and the config
+            # value is the one an operator can act on.
             logger.info(
                 f'Graphiti LLM: {cfg.llm.provider}/{cfg.llm.model} '
-                f'({type(llm_client).__name__})'
+                f'({type(llm_client).__name__}, max_tokens={cfg.llm.max_tokens})'
             )
             return llm_client
     elif cfg.llm.provider == 'anthropic' and cfg.llm.providers.anthropic:
@@ -283,7 +289,14 @@ def build_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
                     max_tokens=cfg.llm.max_tokens,
                 )
                 llm_client = AnthropicClient(config=llm_config)
-                logger.info(f'Graphiti LLM: {cfg.llm.provider}/{cfg.llm.model}')
+                # Same addition as the openai arm above, so the observability is
+                # uniform across arms rather than present only where the value
+                # changed. This arm has always honoured the knob (AnthropicClient
+                # .__init__ overrides config.max_tokens only when config is None).
+                logger.info(
+                    f'Graphiti LLM: {cfg.llm.provider}/{cfg.llm.model} '
+                    f'(max_tokens={cfg.llm.max_tokens})'
+                )
                 return llm_client
             except ImportError:
                 logger.warning('Anthropic client not available for Graphiti')
