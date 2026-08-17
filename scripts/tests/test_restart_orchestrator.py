@@ -196,6 +196,47 @@ def test_invokes_systemctl_restart_on_correct_unit(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# task 3950: the target unit must be env-overridable
+# ---------------------------------------------------------------------------
+
+def test_target_unit_is_env_overridable(tmp_path):
+    """`ORCH_RESTART_UNIT` must RETARGET the script, not merely add a call.
+
+    THE HAZARD, in the terms this fake-systemctl family established: the fake
+    shadows `systemctl` only for as long as its tmpdir sits on PATH. A unit
+    name that outlives that window resolves /usr/bin/systemctl instead and
+    issues a REAL restart of whatever unit the script names --
+    `orchestrator-dark-factory.service` is INSTALLED on this box, so that
+    worst case is a real restart of the live orchestrator. The fixture can
+    only hand the script an inert synthetic name if the script's target is
+    overridable in the first place, which is what this test pins.
+
+    The override must RETARGET: a script that read the variable but still also
+    called the hardcoded default would leave the real unit exposed, so the
+    second assertion is as load-bearing as the first.
+    """
+    bin_dir, state_path = _make_fake_systemctl(tmp_path, scenario="fresh")
+
+    override = "orchestrator-fake-dark-factory.service"
+    _run_script(
+        bin_dir,
+        state_path,
+        env={"ORCH_RESTART_UNIT": override, "RESTART_VERIFY_TIMEOUT": "5"},
+    )
+
+    calls = _load_state(state_path)["calls"]
+    assert ["--user", "restart", override] in calls, (
+        f"Expected ORCH_RESTART_UNIT to retarget the restart at {override!r}; "
+        f"got calls={calls!r}"
+    )
+    assert not any("orchestrator-dark-factory.service" in call for call in calls), (
+        "ORCH_RESTART_UNIT must RETARGET the script, not merely add a call: the "
+        "real unit name orchestrator-dark-factory.service must appear in NO "
+        f"recorded call. got calls={calls!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # step-3: RED -- fresh MainPID after restart must be verified and reported
 # ---------------------------------------------------------------------------
 
