@@ -117,6 +117,22 @@ _WATCHDOG_WORKING_POLL_SECS = 60.0
 #                                         is caught and converted to a
 #                                         retryable 'infra_failure' proposal
 #                                         entry instead of raising.
+#
+# orchestrator/evals/runner.py            _EVAL_CAP_WAIT_SANITY_SECS = 1800 s (30 min).
+#   (run_architect_eval invocation)       One cell of a bounded, queue-blocking
+#                                         eval campaign; the 14-day default
+#                                         would park the whole campaign on a
+#                                         single capped cell.
+#                                         AllAccountsCappedException is caught
+#                                         and recorded as a `cap_exhausted:`
+#                                         marker on the cell (tainted, so the
+#                                         cell is EXCLUDED from the reported
+#                                         mean rather than scored a fabricated
+#                                         0.0), never raised.  No
+#                                         max_cap_retries: cooldown doubles per
+#                                         pool cycle, so a fixed count would
+#                                         give a BIGGER account pool LESS
+#                                         wall-clock patience.
 # ─────────────────────────────────────────────────────────────────────────────
 _DEFAULT_CAP_WAIT_SANITY_SECS = 14 * 86400  # 14 days: outer sanity bound for patient cap waits
 _CAP_WAIT_LOG_INTERVAL_SECS = 600.0  # emit at most one cap_wait log per ~10 min

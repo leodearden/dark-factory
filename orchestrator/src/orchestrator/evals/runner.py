@@ -13,7 +13,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from shared.cli_invoke import AgentResult, invoke_with_cap_retry
+from shared.cli_invoke import (
+    AgentResult,
+    AllAccountsCappedException,
+    invoke_with_cap_retry,
+)
 from shared.usage_gate import UsageGate
 
 from orchestrator.agents.briefing import BriefingAssembler
@@ -57,6 +61,27 @@ from .snapshots import create_eval_worktree, read_python_pin
 logger = logging.getLogger(__name__)
 
 RESULTS_DIR = Path(__file__).parent / 'results'
+
+# Cap-wait patience for the architect eval invoke (eval-revival φ) — the INV-4
+# storm escape. `invoke_with_cap_retry` otherwise inherits
+# `_DEFAULT_CAP_WAIT_SANITY_SECS` (14 days), which is the right answer for a
+# per-task AFK implementer and the WRONG one here: an eval campaign is a
+# bounded, queue-blocking job, so a fully-capped pool must fail LOUD into the
+# existing cap_tainted/cap_excluded backstop rather than park a campaign for
+# two weeks. 1800 s is the established house value for short-lived,
+# queue-blocking callers — `_DRY_RUN_CAP_WAIT_SANITY_SECS` (dry_run_unblock.py)
+# and `_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS` (the three reconciliation
+# stage runners) — both recorded in cli_invoke.py's per-caller policy table
+# alongside this one.
+#
+# Deliberately NO `max_cap_retries` companion: a fixed count scales the wrong
+# way. Cooldown doubles per full cycle through the pool, so a fixed count buys
+# a 4-account pool far LESS wall-clock patience than a 1-account pool — a
+# bigger, healthier pool would give up sooner. Wall clock is also the bound
+# that literally expresses the requirement ("never hang a campaign"). Both
+# bounds raise the same AllAccountsCappedException from one chokepoint, so the
+# handler below is correct either way.
+_EVAL_CAP_WAIT_SANITY_SECS = 30 * 60
 
 
 @dataclass
@@ -653,6 +678,12 @@ async def run_architect_eval(
     )
 
     plan: dict = {}
+    # Pre-initialised so the cap-exhaustion handler below can best-effort
+    # re-read the plan artifact: that handler runs on an exception raised AT
+    # the invoke, which is before the normal ``artifacts.read_plan()``, and on
+    # the earlier failure paths (worktree/config) the name is genuinely unbound
+    # — which pyright correctly flags without this.
+    artifacts: TaskArtifacts | None = None
     # Renamed from ``cost_usd`` (eval-revival υ): this local is ONLY the
     # architect invocation's spend. The cell's persisted ``cost_usd`` below
     # additionally folds in the plan judge's spend (``judge_cost_usd``), so
@@ -803,6 +834,7 @@ async def run_architect_eval(
         result = await invoke_with_cap_retry(
             usage_gate,
             f'Architect eval {task_id} × {config.name}',
+            cap_wait_sanity_secs=_EVAL_CAP_WAIT_SANITY_SECS,
             invoke_fn=_timed_invoke,
             backend=config.backend,
             prompt=prompt,
@@ -857,6 +889,49 @@ async def run_architect_eval(
         # MARKED but NOT unmeasurable: see the scoring block for why a timeout
         # keeps scoring on content while a cap hit does not.
         arch_error = arch_error or f'timeout: no answer within {timeout_minutes}m'
+    except AllAccountsCappedException as e:
+        # Every account in the pool was capped for longer than this eval's
+        # patience bound. Caught HERE, ahead of the generic handler, for two
+        # reasons that both matter to the persisted cell:
+        #
+        # 1. LABELLING. The generic handler stamps
+        #    `harness_error: AllAccountsCappedException: ...`, which charges a
+        #    TRANSPORT refusal to our own crash and collapses two rows of the
+        #    docstring's taint table that exist precisely to stay
+        #    distinguishable. Legibility of the failure marker is the whole
+        #    point of the 3118 marker machinery.
+        #
+        # 2. THE ARTIFACT RE-READ. The exception is raised at the invoke, so
+        #    the normal `artifacts.read_plan()` above never ran. A plan the
+        #    architect wrote through plan-tools BEFORE the pool ran dry would
+        #    otherwise be silently discarded — converting a scorable cell into
+        #    an exclusion and re-opening the differential-exclusion hazard from
+        #    the other side. Re-reading makes cap exhaustion obey the SAME
+        #    taint-table row an inline mid-run 429 already obeys, with zero
+        #    change to the taint predicate itself.
+        #
+        # `arch_cost_usd` correctly stays at its 0.0 default: no AgentResult
+        # exists, so there is no spend to attribute.
+        logger.error(
+            f'Architect eval {task_id} × {config.name}: all accounts capped '
+            f'after {e.retries} retries ({e.elapsed_secs:.1f}s) — giving up on '
+            f'this cell rather than stalling the campaign'
+        )
+        outcome = 'blocked'
+        reason = ' '.join(str(e).split())[:80]
+        arch_error = arch_error or f'cap_exhausted: {reason}'
+        arch_unmeasurable = True
+        if artifacts is not None:
+            # Best-effort: an unreadable artifact here must degrade to the
+            # tainted path, never turn a cap into a harness crash.
+            try:
+                plan = artifacts.read_plan() or {}
+            except Exception:
+                logger.warning(
+                    f'plan re-read after cap exhaustion failed for {task_id} × '
+                    f'{config.name}; cell stays unmeasurable',
+                    exc_info=True,
+                )
     except Exception as e:
         logger.error(f'Architect eval {task_id} × {config.name} failed: {e}')
         outcome = 'blocked'
