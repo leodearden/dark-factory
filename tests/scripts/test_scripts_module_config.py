@@ -131,8 +131,12 @@ _VACUOUS_PASS = (
 
 # The two extraPaths entries the declared type gate depends on, and the flat
 # modules that stop resolving without them. Measured, not assumed: at the
-# commit before task 3456 added these entries, `npx pyright scripts/` reported
-# exactly 9 reportMissingImports naming these five modules.
+# commit before task 3456 added these entries, the then-declared
+# `npx pyright scripts/` reported exactly 9 reportMissingImports naming these
+# five modules. That npx spelling is kept because it names the command that was
+# ACTUALLY RUN for this measurement; task 4358 later switched the declaration to
+# `uv run --project shared pyright scripts/`, which resolves the same root
+# [tool.pyright] table, so the measurement carries over unchanged.
 _REQUIRED_EXTRA_PATHS = ('scripts', 'scripts/legibility')
 _UNRESOLVED_WITHOUT = ('census', 'codebook', 'coder', 'digest', 'inventory')
 
@@ -155,8 +159,9 @@ def _load_root_pyright_config() -> dict[str, Any]:
 # the command line changing at all: `exclude` drops the files from analysis
 # entirely, `ignore` keeps analysing them but suppresses every diagnostic they
 # produce. Either one naming scripts/ un-gates it while the declared
-# `npx pyright scripts/` stays byte-identical and still exits 0 — the same
-# reports-green failure mode as a None command, reached a different way.
+# `uv run --project shared pyright scripts/` stays byte-identical and still
+# exits 0 — the same reports-green failure mode as a None command, reached a
+# different way.
 _CARVE_OUT_KEYS = ('exclude', 'ignore')
 
 
@@ -951,17 +956,23 @@ def test_root_pyright_extrapaths_resolves_scripts_imports() -> None:
 
     A PRECONDITION for the type gate, not a general pyright-config preference,
     which is why it lives beside the gate it protects rather than in its own
-    file. The declared ``type_check_command`` is ``npx pyright scripts/``: it
-    runs from the repo root, so it resolves against the ROOT ``[tool.pyright]``
-    table — NOT against any per-package pyproject.toml.
+    file. The declared ``type_check_command`` is
+    ``uv run --project shared pyright scripts/`` (task 4358; it was
+    ``npx pyright scripts/`` when this test was written): it carries no
+    ``--directory``, so it runs from the repo root either way and resolves
+    against the ROOT ``[tool.pyright]`` table — NOT against any per-package
+    pyproject.toml, and NOT against ``shared/``'s, since ``--project shared``
+    selects only the environment pyright is resolved from.
 
     ``scripts/tests/conftest.py`` inserts BOTH ``scripts/`` and
     ``scripts/legibility/`` onto sys.path at runtime, so the test modules
     import flat names (``import census``, ``import digest``) that only resolve
     for pyright if the same two directories are on extraPaths. Measured at the
-    commit before these entries were added: ``npx pyright scripts/`` reported
-    exactly 9 reportMissingImports naming census/codebook/coder/digest/
-    inventory. The gate would then be RED for reasons unrelated to any diff —
+    commit before these entries were added, with the command declared AT THAT
+    TIME (``npx pyright scripts/`` — named as run, not retro-fitted to the
+    current uv spelling): exactly 9 reportMissingImports naming
+    census/codebook/coder/digest/inventory. The gate would then be RED for
+    reasons unrelated to any diff —
     an unresolved import is not a finding about the change under review, and a
     permanently-red gate gets suppressed or ignored, which is how a gate dies.
 
@@ -972,13 +983,16 @@ def test_root_pyright_extrapaths_resolves_scripts_imports() -> None:
     reason it performs two separate sys.path insertions.
 
     TWO module gates depend on these entries, not one. The ``tests/scripts``
-    module config next door declares its own ``npx pyright tests/scripts/``,
-    which also runs from the repo root against this same root table, and five
+    module config next door declares its own
+    ``uv run --project shared pyright tests/scripts/`` (task 3842), which also
+    runs from the repo root against this same root table, and five
     of its modules import flat ``scripts/`` names. Those imports used to carry
     ``# pyright: ignore[reportMissingImports]``; task 3456 dropped the pragmas
     precisely BECAUSE the extraPaths entries made them resolve, so the masking
     is gone and the dependency is now live. RE-MEASURED at the branch tip by
-    deleting both entries and re-running each command: ``pyright scripts/`` ->
+    deleting both entries and re-running each command — under the npx-fronted
+    declarations both configs carried at that time, which changes which pyright
+    BINARY ran but not which config table it read: ``pyright scripts/`` ->
     23 errors, 9 of them reportMissingImports; ``pyright tests/scripts/`` -> 8
     errors, ALL reportMissingImports, naming migrate_metadata_modules_to_files,
     drain_check, audit_wiped_metadata_files, repair_wiped_metadata_files,
@@ -998,7 +1012,8 @@ def test_root_pyright_extrapaths_resolves_scripts_imports() -> None:
             f'{required!r} missing from ROOT [tool.pyright] extraPaths = '
             f'{extra_paths!r} in {REPO_ROOT / "pyproject.toml"} (task 3456). '
             f'The declared type gate for the {MODULE_PREFIX} module runs '
-            f'`npx pyright {MODULE_PREFIX}/` FROM THE REPO ROOT, so it resolves '
+            f'`uv run --project shared pyright {MODULE_PREFIX}/` FROM THE REPO '
+            f'ROOT (no --directory), so it resolves '
             f'against this root table. Without both '
             f'{list(_REQUIRED_EXTRA_PATHS)!r} entries, pyright cannot resolve '
             f'the flat modules {list(_UNRESOLVED_WITHOUT)!r} that '
@@ -1010,7 +1025,8 @@ def test_root_pyright_extrapaths_resolves_scripts_imports() -> None:
             f'{_REQUIRED_EXTRA_PATHS[1]!r} importable only as a namespace '
             f'package, not its contents as bare top-level names. '
             f'BLAST RADIUS IS TWO GATES, NOT ONE: the {SIBLING_PREFIX} module '
-            f'config declares its own `npx pyright {SIBLING_PREFIX}/`, which '
+            f'config declares its own '
+            f'`uv run --project shared pyright {SIBLING_PREFIX}/`, which '
             f'also runs from the repo root against this same table, and task '
             f'3456 dropped the `# pyright: ignore[reportMissingImports]` '
             f'pragmas that were masking its five modules\' flat '
@@ -1143,7 +1159,8 @@ def test_scripts_diff_is_type_gated(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
     # (d) part 2 — the OTHER carve-out vector, which NO inspection of the
-    # command can reach. `npx pyright scripts/` runs from the repo root, so it
+    # command can reach. `uv run --project shared pyright scripts/` runs from
+    # the repo root, so it
     # resolves against the ROOT [tool.pyright] table — the same table
     # test_root_pyright_extrapaths_resolves_scripts_imports pins, read here
     # through the same _load_root_pyright_config helper. An `exclude` or

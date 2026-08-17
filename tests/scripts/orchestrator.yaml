@@ -249,16 +249,29 @@ test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --tim
 #
 # MATCHES ALL SEVEN WORKSPACE-MEMBER CONFIGS (shared, dashboard, cockpit,
 # escalation, fused-memory, orchestrator, sampler), every one already on
-# `uv run --project <member> ... pyright src/ tests/`. The closest
-# structural sibling, scripts/orchestrator.yaml:275 (`npx pyright scripts/`),
-# is now the LAST module config still npx-fronted, carrying the exposure
-# this change narrows — left on npx here deliberately: task 3842 is scoped
-# to tests/scripts/orchestrator.yaml only (this file's own module list), and
-# switching scripts/ needs its own measurement and its own comment fix
-# (scripts/orchestrator.yaml's "matches the sibling tests/scripts/
-# invocation style exactly" line, ~line 239, is now stale). Filed as a
-# follow-up from this task's review pass (not yet assigned a task id as of
-# this comment — see task 3842's iteration log for the tracking ticket).
+# `uv run --project <member> ... pyright src/ tests/`.
+#
+# AND NOW THE EIGHTH. When task 3842 wrote the paragraph above, the closest
+# structural sibling — scripts/orchestrator.yaml's type_check_command, under
+# its "WHY ... AND NOT A NARROWER FORM" heading — was still `npx pyright
+# scripts/`, the LAST npx-fronted module config, left that way deliberately
+# because 3842 held locks for this file only. That gap is CLOSED: the
+# follow-up 3842 filed without an id became TASK 4358, which landed the same
+# switch there (`uv run --project shared pyright scripts/`), re-measured it,
+# and corrected the stale "matches the sibling tests/scripts/ invocation
+# style exactly" sentence rather than silently rewriting it. All nine
+# discovered module configs are now uv-resolved; NONE is npx-fronted.
+#
+# Referred to by HEADING, not by file:line, deliberately — the `:275` pin
+# this paragraph used to carry had already rotted by the time 4358 read it
+# (the line had moved), and a stale pin reads as authoritative. That is the
+# same standard this file's own docstring and its sibling guard test apply.
+#
+# The invocation style of BOTH non-member configs is now held as a contract
+# by tests/scripts/test_scripts_module_config.py::
+# test_type_gates_resolve_pyright_without_npx (task 4358), which sweeps this
+# file and scripts/orchestrator.yaml together — so a revert to npx in either
+# one goes red rather than merely going uncommented.
 #
 # Note both run VERBATIM (not file-scoped) under merge-role
 # merge_verify_breadth=full, and type_check widens to this directory form when a
