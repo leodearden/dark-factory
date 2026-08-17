@@ -3954,6 +3954,66 @@ def _claim_via_cli(slug: str = 'watcher-df-100', pid: int | None = None) -> None
     )
 
 
+@pytest.mark.parametrize('verb', ['lease-claim', 'lease-heartbeat', 'lease-release'])
+def test_main_lease_verbs_refuse_loudly_when_the_slug_cannot_be_derived(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    verb: str,
+) -> None:
+    """An underivable slug FAILS LOUDLY — it never drifts to a colliding token.
+
+    This is the half of task 4248 that is not "move it into the CLI": having
+    moved it, the CLI must refuse rather than synthesize. `{name}-0` would be
+    IDENTICAL for two concurrently-degraded sessions, so each would pass the
+    other's `_is_lease_owner` check — 3994 defect 1 reopened. Exit 2 is not a
+    regression: pre-4248 a slug-less lease verb ALSO exited 2, so the
+    underivable case keeps its exit code and only the derivable case changed.
+
+    The stderr assertions matter as much as the code: an operator who is
+    refused must also be told the escape hatch, not merely told no.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.setenv('CLAUDE_PID', str(os.getpid()))
+    _claim_via_cli()
+    lease_path = sr.lease_path_for_name('watcher-df', root=tmp_path)
+    original_body = lease_path.read_text()
+    capsys.readouterr()
+
+    monkeypatch.delenv('CLAUDE_PID', raising=False)
+    with pytest.raises(SystemExit) as excinfo:
+        sr.main([verb, '--name', 'watcher-df'])
+
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert 'CLAUDE_PID' in err
+    assert '--slug' in err
+    # Nothing was mutated on the way out.
+    assert lease_path.read_text() == original_body
+
+
+def test_an_explicit_slug_is_still_the_escape_hatch_under_an_unresolvable_pid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The refusal above is escapable, and does not break the degraded-pid path.
+
+    `test_a_degraded_pid_lease_still_ages_out_and_is_reaped` depends on being
+    able to CLAIM a lease with an unresolvable `CLAUDE_PID` (recording pid 0, so
+    a crashed holder still ages out). Refusing to DERIVE a slug must not refuse
+    to ACCEPT one — the operator supplies a stable token and the pid degrades
+    exactly as 3994 designed.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    monkeypatch.delenv('CLAUDE_PID', raising=False)
+
+    rc = sr.main(['lease-claim', '--name', 'watcher-df', '--slug', 'watcher-df-degraded'])
+
+    assert rc == 0
+    holder = sr.LeaseHolder.from_json(sr.lease_path_for_name('watcher-df', root=tmp_path).read_text())
+    assert holder.session_slug == 'watcher-df-degraded'
+    assert holder.pid == 0
+
+
 # `test_main_lease_mutating_verbs_require_slug` lived here until task 4248.
 # It asserted that OMITTING `--slug` exits 2 — true only while the token had
 # to be spelled in shell. It is superseded, not dropped: its surviving half
