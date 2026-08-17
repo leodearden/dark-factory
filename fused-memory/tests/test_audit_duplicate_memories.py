@@ -4596,7 +4596,7 @@ class TestRunWiring:
         assert f'near_duplicate_clusters.{_PK}' in ids
         for key in (*_ANN_DISCLOSURE_KEYS, *_PLAN_DISCLOSURE_KEYS,
                     'ann_query_errors', 'ann_disabled_uncalibrated',
-                    'ann_pooled_fallback_categories'):
+                    'ann_pooled_fallback_categories', 'apply_withheld_clusters'):
             assert f'{key}.{_GLOBAL_SCOPE}' in ids, f'{key} must be disclosed'
         assert f'scan_truncated.{_PK}' in ids
 
@@ -4646,30 +4646,6 @@ class TestRunWiring:
         assert metric.value == 1.0
         assert metric.kind == 'count'
         assert metric.direction == 'higher_is_worse'
-
-    async def test_the_withheld_gate_metric_is_emitted_even_when_nothing_is_withheld(
-        self, monkeypatch, tmp_path,
-    ):
-        """Pins the zero case of ``compute_cluster_metrics``' own contract.
-
-        Its docstring (:1832-1834) says EVERY disclosure key is emitted, zeros
-        included, because an absent metric reads as "not measured" — which is
-        exactly the alarm hole this task closes for this key.
-        """
-        from shared.memory_eval_metrics import (  # noqa: PLC0415
-            RUN_STAMP_ENV_VAR,
-            load_metric_series,
-        )
-
-        monkeypatch.setenv(RUN_STAMP_ENV_VAR, _STAMP)
-        _install_run_doubles(monkeypatch, {_PK: [_raw('m1', 'x')]})
-        await _run(await self._parse(tmp_path))
-
-        series = load_metric_series(tmp_path / _EVAL_ID / f'metrics-{_STAMP}.json')
-        by_id = _by_id(series.metrics)
-        metric_id = f'apply_withheld_clusters.{_GLOBAL_SCOPE}'
-        assert metric_id in by_id, 'zero withheld must still emit, not be absent'
-        assert by_id[metric_id].value == 0.0
 
     async def test_no_metrics_writes_nothing(self, monkeypatch, tmp_path):
         _install_run_doubles(monkeypatch, {_PK: [_raw('m1', 'x')]})
