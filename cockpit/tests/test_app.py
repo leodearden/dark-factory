@@ -484,6 +484,26 @@ class TestSelectedSlugRestore:
             assert table.get_row_index('target-1') != 0
             assert table.highlighted_slug() == 'target-1'
 
+    @pytest.mark.timeout(10)
+    async def test_persisted_slug_that_no_longer_exists_degrades_to_row_zero(self, tmp_path):
+        """A session selected before a restart may well have exited by the
+        next launch; select_slug returns False rather than raising, so the
+        cockpit must still mount and land on row 0. This test is a
+        fail-soft regression guard, NOT a second proof of the restore --
+        it passes with or without the restore branch, by design."""
+        from cockpit.app import CockpitApp
+        from cockpit.panes.session_table import SessionTable
+        from cockpit.ui_config import CockpitUIConfig, save_ui_config
+
+        save_ui_config(CockpitUIConfig(selected_slug='gone-1'), tmp_path)
+        sr.write_record(_make_record(session_slug='live-1'), root=tmp_path)
+
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=60)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            table = app.query_one(SessionTable)
+            assert table.highlighted_slug() == 'live-1'
+
 
 class TestDecisionQueueRender:
     @pytest.mark.timeout(10)
