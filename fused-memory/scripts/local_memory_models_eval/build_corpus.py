@@ -1459,12 +1459,12 @@ def render_report(manifest: dict) -> str:
 
 
 class _LoudArgumentParser(argparse.ArgumentParser):
-    """An ``ArgumentParser`` whose help text cannot vanish down a closed pipe.
+    """An ``ArgumentParser`` whose help text cannot vanish down a failed stdout.
 
-    ``argparse`` writes its messages inside a suppressed ``except OSError``, and
-    ``BrokenPipeError`` is an ``OSError`` — so on ``--help | head`` it discards
-    the help text and exits 0 anyway: a success status for a run whose entire
-    output went nowhere.
+    ``argparse`` writes its messages inside a suppressed ``except OSError`` — so
+    on ``--help | head`` (``BrokenPipeError``, an ``OSError``) or
+    ``--help > /full/disk`` (``ENOSPC``) it discards the help text and exits 0
+    anyway: a success status for a run whose entire output went nowhere.
 
     Only reachable when stdout is UNBUFFERED or line-buffered
     (``PYTHONUNBUFFERED=1``, ``python -u``, a tty), where the write hits fd 1
@@ -1479,10 +1479,12 @@ class _LoudArgumentParser(argparse.ArgumentParser):
     untouched — an unrecognized flag still reports to stderr and still exits 2.
 
     The re-raised exception leaves ``parse_args`` — which runs before
-    :func:`main`'s own ``try`` — and lands in :func:`_cli`'s
-    ``except BrokenPipeError``, giving a closed stdout ONE outcome in BOTH
-    buffering regimes: :data:`EXIT_RUN_FAILED` plus a single ``error: ...``
-    line.
+    :func:`main`'s own ``try`` — and lands in :func:`_cli`'s stdout handlers:
+    ``except BrokenPipeError`` for a closed reader, ``except OSError`` for
+    every other way the write can fail. So a broken stdout gets ONE outcome
+    across BOTH buffering regimes AND both failure kinds:
+    :data:`EXIT_RUN_FAILED` plus a single ``error: ...`` line naming which of
+    the two it was.
     """
 
     def print_help(self, file: IO[str] | None = None) -> None:
@@ -1822,10 +1824,23 @@ def _handle_stdout_error(exc: OSError) -> int:
 
     A closed reader is not the only way ``> file`` or ``| cmd`` ends badly: a
     full disk or quota (``ENOSPC``/``EDQUOT``) and a disconnected terminal
-    (``EIO``) fail the same flush, and are at least as likely for a builder
+    (``EIO``) fail the same write, and are at least as likely for a builder
     whose report is routinely redirected. Reported through the same single
     ``error: ...`` line, with the errno text kept so the remedy is visible —
     "no space left on device" and "closed the output pipe" are different jobs.
+
+    Serves BOTH frames such a failure can surface in, because a handler on one
+    is not a handler on the other:
+
+    * DEFERRED — every write is buffered and :func:`_flush_stdout`'s flush is
+      what reaches the device.
+    * IN-BAND — the write itself reaches the device and raises mid-run, from
+      ``print`` in :func:`_run_build` or from
+      :class:`_LoudArgumentParser`'s re-raise during ``parse_args``. Neither is
+      inside a flush; both arrive at :func:`_cli`'s ``except OSError``.
+
+    One handler for both, so a full disk produces the same line and the same
+    :data:`EXIT_RUN_FAILED` whichever frame it was noticed in.
     """
     _silence_stream_fd(sys.stdout)
     return _report_stdout_failure(f'cannot write to stdout: {exc}')
@@ -1918,7 +1933,28 @@ def _cli() -> int:
       reaches fd 1 during ``parse_args`` and fails there, inside the
       ``except OSError: pass`` argparse wraps its own message writes in,
       leaving nothing for a later flush to find. :class:`_LoudArgumentParser`
-      re-raises it, and it arrives at the ``BrokenPipeError`` handler below.
+      re-raises it, and it arrives at one of the two stdout handlers below.
+
+    A closed reader is not the only way stdout fails, so the arms below are a
+    PAIR, and their order is the mechanism rather than a style choice:
+
+    * ``except BrokenPipeError`` — the ``| head`` shape, which gets its own
+      message because "the reader went away" has its own remedy.
+    * ``except OSError`` — every other stdout failure raised IN-BAND: a full
+      disk or quota on ``print(render_report(...))``, a disconnected tty,
+      ``print_help``'s re-raise onto anything that is not a pipe. It must stay
+      SECOND, because ``BrokenPipeError`` is an ``OSError`` and a wide arm
+      first would swallow the closed-pipe case and its distinct message.
+
+    That second arm is safe HERE and would not be inside ``main()``, which is
+    the distinction task 3757 turned on: every non-stdout ``OSError`` in the
+    run is already converted at the seam that knows what it means — the store
+    at :func:`_fetch_population`, the manifest write at :func:`_run_build`, the
+    manifest read at :func:`_run_verify` — so what is still an ``OSError`` by
+    the time it reaches this frame is stdout-shaped by construction. ``main``'s
+    ``try`` wraps the WHOLE run, so the same arm there would go back to
+    mis-attributing a store or filesystem failure to stdout. It belongs at the
+    process boundary and nowhere else.
 
     The ``SystemExit`` handler RE-RAISES on a successful flush rather than
     returning a normalised code: ``SystemExit.code`` may be ``None`` or a
@@ -1936,6 +1972,11 @@ def _cli() -> int:
         # Only reachable from _LoudArgumentParser's re-raise, which happens in
         # parse_args — outside main()'s own try.
         return _handle_broken_pipe()
+    except OSError as exc:
+        # MUST stay below the BrokenPipeError arm: BrokenPipeError IS an
+        # OSError, so the wide arm first would swallow the closed-pipe case and
+        # lose its distinct message. Ordering is the whole mechanism here.
+        return _handle_stdout_error(exc)
     except SystemExit:
         failed = _flush_stdout()
         if failed is not None:
