@@ -117,6 +117,65 @@ def _git_side_effect(
     return side_effect, calls
 
 
+def _as_async_run_git(side_effect):
+    """Adapt a `subprocess.run` side_effect to a `shared.git_async.run_git` fake.
+
+    Task 3778 moved the detector's three git probes off blocking
+    `subprocess.run` and onto the async `run_git` helper, which invalidated the
+    `patch('subprocess.run', ...)` seam this suite was built on. Rather than
+    hand-rewrite ~90 canned git responses, every existing side_effect is passed
+    through this one adapter, so the *responses* stay byte-for-byte what they
+    were and only the seam changes.
+
+    It faithfully reproduces `run_git`'s contract, which differs from
+    `subprocess.run`'s in exactly two ways that matter here:
+
+    - stdout/stderr are `.strip()`ed by `run_git` itself, so the adapter strips
+      too (a fake that did not would let a test pass against behaviour the real
+      helper cannot produce).
+    - a TIMEOUT is RETURNED as `timed_out=True` with a non-zero returncode, not
+      raised. `subprocess.run` raises `TimeoutExpired`, so any side_effect that
+      raises it is converted here. Every other exception (notably `OSError`)
+      propagates, because `run_git` propagates it too.
+
+    Accepts the two shapes `unittest.mock` accepts for `side_effect`: a
+    callable, or an exception instance/class to raise.
+    """
+    from shared.git_async import TIMEOUT_RETURNCODE, GitResult
+
+    def _timed_out(timeout) -> GitResult:
+        return GitResult(
+            returncode=TIMEOUT_RETURNCODE,
+            stdout='',
+            stderr=f'timed out after {timeout}s',
+            timed_out=True,
+        )
+
+    async def fake_run_git(cmd, cwd=None, *, input_text=None, timeout=None):
+        # mock's own semantics: a bare exception instance/class means "raise".
+        if isinstance(side_effect, BaseException) or (
+            isinstance(side_effect, type) and issubclass(side_effect, BaseException)
+        ):
+            if isinstance(side_effect, subprocess.TimeoutExpired) or (
+                side_effect is subprocess.TimeoutExpired
+            ):
+                return _timed_out(timeout)
+            raise side_effect
+
+        try:
+            completed = side_effect(list(cmd), timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return _timed_out(timeout)
+
+        return GitResult(
+            returncode=completed.returncode,
+            stdout=(completed.stdout or '').strip(),
+            stderr=(completed.stderr or '').strip(),
+        )
+
+    return fake_run_git
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -2416,3 +2475,238 @@ class TestWorktreeIndexFor:
 
         with patch('subprocess.run', side_effect=side_effect):
             assert detector_module.worktree_index_for(str(tmp_path)) == {}
+
+
+# ---------------------------------------------------------------------------
+# Task 3778 — the async surface and its new patch seam
+# ---------------------------------------------------------------------------
+
+class TestDetectorIsAsyncOverRunGit:
+    """The detector's git probes are non-blocking, via `shared.git_async.run_git`.
+
+    The measured defect: `detect_live_workflow` shelled out with blocking
+    `subprocess.run` while being fanned out across every active task from
+    inside a coroutine, pinning the event loop for 15-43 s at a time.
+
+    Two properties are pinned here. (1) The public entry points are coroutine
+    functions, so a caller physically cannot invoke them without an `await`.
+    (2) `run_git` is bound as an attribute of the detector MODULE — a bare-name
+    import, not a qualified `shared.git_async.run_git` call — which is what
+    makes `patch.object(detector_module, 'run_git', ...)` the single seam
+    intercepting every git call the detector can make. That binding is load
+    bearing for the ~90 canned-response tests migrated onto it.
+    """
+
+    _NOW = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+
+    @staticmethod
+    def _recording_run_git(calls: list):
+        """A `run_git` fake recording every invocation; reports no signals."""
+        from shared.git_async import GitResult
+
+        async def fake(cmd, cwd=None, *, input_text=None, timeout=None):
+            calls.append({'cmd': list(cmd), 'timeout': timeout})
+            return GitResult(returncode=1, stdout='', stderr='')
+
+        return fake
+
+    # ----- (a) the surface is async -----
+
+    def test_public_entry_points_are_coroutine_functions(self):
+        import inspect
+
+        assert inspect.iscoroutinefunction(detector_module.detect_live_workflow), (
+            'detect_live_workflow must be async — a sync detector shelling out to '
+            'git is the event-loop stall task 3778 exists to fix'
+        )
+        assert inspect.iscoroutinefunction(detector_module.is_workflow_live_for_task)
+
+    def test_probe_helpers_are_coroutine_functions(self):
+        import inspect
+
+        for name in (
+            '_check_worktree_registered',
+            '_check_recent_commit',
+            '_branch_own_commit_count',
+            'worktree_index_for',
+        ):
+            fn = getattr(detector_module, name)
+            assert inspect.iscoroutinefunction(fn), f'{name} still blocks the loop'
+
+    # ----- (b) every git call goes through the module-bound run_git -----
+
+    @pytest.mark.asyncio
+    async def test_all_probes_route_through_module_bound_run_git(self, tmp_path):
+        """No `subprocess.run` survives anywhere under a detect call."""
+        calls: list = []
+        with (
+            patch.object(detector_module, 'run_git', self._recording_run_git(calls)),
+            patch('subprocess.run') as blocking,
+        ):
+            await detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert not blocking.called, (
+            'the detector still reaches blocking subprocess.run — '
+            f'{blocking.call_args_list}'
+        )
+        assert calls, 'no git call was routed through run_git at all'
+        subcommands = {' '.join(c['cmd']) for c in calls}
+        assert any('worktree list' in s for s in subcommands), subcommands
+
+    @pytest.mark.asyncio
+    async def test_every_call_carries_the_per_call_git_timeout(self, tmp_path):
+        """(d) `_GIT_TIMEOUT` is still applied per call, not dropped in the move.
+
+        `run_git` degrades a timeout into a fail-open result, but only when it
+        is given one; an un-timed-out probe can hang the caller forever.
+        """
+        calls: list = []
+        with patch.object(detector_module, 'run_git', self._recording_run_git(calls)):
+            await detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert calls
+        assert all(c['timeout'] == detector_module._GIT_TIMEOUT for c in calls), (
+            f'expected every probe to pass timeout={detector_module._GIT_TIMEOUT}; '
+            f'got {[c["timeout"] for c in calls]}'
+        )
+
+    # ----- (c) the fail-open contract survives the seam change -----
+
+    @pytest.mark.asyncio
+    async def test_run_git_raising_oserror_is_fail_safe(self, tmp_path):
+        """`run_git` propagates OSError (git binary missing); the detector absorbs it."""
+        async def boom(cmd, cwd=None, *, input_text=None, timeout=None):
+            raise OSError('git: command not found')
+
+        with patch.object(detector_module, 'run_git', boom):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.is_live is False
+        assert result.worktree_registered is False
+        assert result.recent_commit is False
+
+    @pytest.mark.asyncio
+    async def test_timed_out_result_is_fail_safe(self, tmp_path):
+        """A timeout is RETURNED by run_git, not raised — it must read as no signal."""
+        from shared.git_async import TIMEOUT_RETURNCODE, GitResult
+
+        async def timed_out(cmd, cwd=None, *, input_text=None, timeout=None):
+            return GitResult(
+                returncode=TIMEOUT_RETURNCODE, stdout='', stderr='timed out',
+                timed_out=True,
+            )
+
+        with patch.object(detector_module, 'run_git', timed_out):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.is_live is False
+        assert result.worktree_registered is False
+        assert result.recent_commit is False
+        assert await detector_module.worktree_index_for(str(tmp_path)) is None
+
+    @pytest.mark.asyncio
+    async def test_nonzero_returncode_is_fail_safe(self, tmp_path):
+        from shared.git_async import GitResult
+
+        async def rc1(cmd, cwd=None, *, input_text=None, timeout=None):
+            return GitResult(returncode=1, stdout='', stderr='fatal: not a git repo')
+
+        with patch.object(detector_module, 'run_git', rc1):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.is_live is False
+        assert await detector_module.worktree_index_for(str(tmp_path)) is None
+
+    @pytest.mark.asyncio
+    async def test_unparseable_stdout_is_fail_safe(self, tmp_path):
+        """rc==0 with garbage output must not fabricate a signal."""
+        from shared.git_async import GitResult
+
+        async def garbage(cmd, cwd=None, *, input_text=None, timeout=None):
+            return GitResult(returncode=0, stdout='not-a-timestamp', stderr='')
+
+        with patch.object(detector_module, 'run_git', garbage):
+            result = await detect_live_workflow(_TASK_ID, str(tmp_path), now=self._NOW)
+
+        assert result.recent_commit is False
+        assert result.last_commit_at is None
+
+    # ----- (e) the step-6 hoist still short-circuits on the new seam -----
+
+    @pytest.mark.asyncio
+    async def test_injected_worktree_index_still_skips_the_probe(self, tmp_path):
+        """The task-3778 hoist must survive the async conversion."""
+        calls: list = []
+        with patch.object(detector_module, 'run_git', self._recording_run_git(calls)):
+            result = await detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW,
+                worktree_index={f'refs/heads/{_BRANCH}': False},
+            )
+
+        assert result.worktree_registered is True
+        assert not any('worktree' in ' '.join(c['cmd']) for c in calls), (
+            f'hoisted index was ignored — worktree list still probed: {calls}'
+        )
+
+
+class TestAsyncRunGitAdapter:
+    """The migration adapter itself is load-bearing, so it is tested.
+
+    ~90 tests are re-pointed at `run_git` through `_as_async_run_git`. If the
+    adapter silently mistranslated a canned response, those tests would keep
+    passing while asserting against behaviour the real helper never produces.
+    """
+
+    @pytest.mark.asyncio
+    async def test_completed_process_becomes_a_git_result(self):
+        def side_effect(args, **kwargs):
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout='  out\n', stderr=' err ',
+            )
+
+        result = await _as_async_run_git(side_effect)(['git', 'status'])
+
+        assert result.returncode == 0
+        assert result.stdout == 'out', 'run_git strips stdout; the adapter must too'
+        assert result.stderr == 'err'
+        assert result.timed_out is False
+        assert result.ok is True
+
+    @pytest.mark.asyncio
+    async def test_timeout_expired_is_converted_not_raised(self):
+        """`subprocess.run` raises on timeout; `run_git` returns a flagged result."""
+        def side_effect(args, **kwargs):
+            raise subprocess.TimeoutExpired(cmd=args, timeout=10)
+
+        result = await _as_async_run_git(side_effect)(['git', 'log'], timeout=10)
+
+        assert result.timed_out is True
+        assert result.returncode != 0
+        assert result.ok is False
+
+    @pytest.mark.asyncio
+    async def test_bare_exception_side_effect_is_raised(self):
+        """mock semantics: a bare exception instance means 'raise this'."""
+        with pytest.raises(OSError, match='boom'):
+            await _as_async_run_git(OSError('boom'))(['git', 'status'])
+
+    @pytest.mark.asyncio
+    async def test_bare_timeout_expired_instance_is_converted(self):
+        result = await _as_async_run_git(
+            subprocess.TimeoutExpired(cmd=['git'], timeout=10)
+        )(['git', 'log'], timeout=10)
+
+        assert result.timed_out is True
+
+    @pytest.mark.asyncio
+    async def test_argv_is_forwarded_to_the_side_effect(self):
+        """Dispatching side_effects branch on argv, so it must arrive intact."""
+        seen: list = []
+
+        def side_effect(args, **kwargs):
+            seen.append(args)
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout='', stderr='')
+
+        await _as_async_run_git(side_effect)(['git', '-C', '/p', 'worktree', 'list'])
+
+        assert seen == [['git', '-C', '/p', 'worktree', 'list']]
