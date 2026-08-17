@@ -134,22 +134,31 @@ def _hook_session_id(hook_input: Mapping[str, Any]) -> str:
     return str(hook_input.get('session_id') or '').strip()
 
 
-_OWNER_ONLY_SESSION_START_SOURCES = frozenset({'clear', 'resume', 'compact'})
+_OWNER_ONLY_SESSION_START_SOURCES = frozenset({'clear', 'compact'})
 """SessionStart ``source`` values only the session's OWN process can emit.
 
 The stdin ``session_id`` is NOT constant for the life of one Claude Code
-process: ``/clear`` (and the resume/compact paths) re-mints it in place. So
-an owning spawned session's later hooks legitimately arrive carrying an id
-that mismatches the binding its first SessionStart stamped -- and reading
-that as "an inheritor" would fork the real session onto a second record and
-freeze spawn-claude.sh's converged one at ``running``, re-introducing the
-exact task-2511 split for any spawned session the user ``/clear``s.
+process: ``/clear`` (and compaction) re-mints it in place. So an owning
+spawned session's later hooks legitimately arrive carrying an id that
+mismatches the binding its first SessionStart stamped -- and reading that as
+"an inheritor" would fork the real session onto a second record and freeze
+spawn-claude.sh's converged one at ``running``, re-introducing the exact
+task-2511 split for any spawned session the user ``/clear``s.
 
-``source`` discriminates cleanly: a nested ``claude`` is always a brand-new
-process and therefore always reports ``'startup'``, whereas these values can
-only come from the process that already owns the session. On them the
-ownership probe adopts anyway and ``run_session_start`` RE-binds the fresh
-id, so the record keeps tracking the session it belongs to.
+These two discriminate because they have no command-line spelling: only the
+process already holding the session can produce them. On them the ownership
+probe adopts anyway and ``run_session_start`` RE-binds the fresh id, so the
+record keeps tracking the session it belongs to.
+
+``'resume'`` is deliberately EXCLUDED even though it is also a re-mint:
+Claude Code emits it for ``--resume``/``--continue`` as well as an
+in-session ``/resume``, so a brand-new nested process (``claude -c -p
+'...'`` shelled out from inside a spawned session) reports it too. It is
+therefore no evidence of ownership at all, and honouring it would let any
+inheritor RE-bind its spawner's record to itself -- inverting ownership
+without any hook fault. A spawned session ``/resume``d in place forks onto
+its own record and recovers on its next ``/clear``/compact -- the fail-safe
+direction, and strictly better than the inversion.
 """
 
 
@@ -189,7 +198,7 @@ def _env_slug_is_owned(
 
     With *allow_remint* a mismatch is ALSO forgiven when the event's
     SessionStart ``source`` says only the owning process could have fired it
-    (``/clear`` and friends re-mint ``session_id`` in place -- see
+    (``/clear`` and compaction re-mint ``session_id`` in place -- see
     ``_OWNER_ONLY_SESSION_START_SOURCES``); ``run_session_start`` re-binds
     the record to the new id on that path. Only SessionStart passes it: a
     Notification/Stop carrying a ``source`` at all is malformed, and
