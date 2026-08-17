@@ -20,6 +20,33 @@ cross-test-module import pattern -- see test_concurrent_verify_boundary.py) and
 from orchestrator.verify_cancel (the SAME /proc walkers the production
 watchdog/cancel kill paths use) -- single source of truth, zero divergent
 ad-hoc process-tree parsing.
+
+That single-source rule holds exactly where it decides anything, and task
+4014 added ONE deliberate, narrow exception on the other side of a
+discovery/assertion split:
+
+* ASSERTIONS -- ``subtree_and_leader_gone``, ``wait_subtree_gone`` -- and the
+  descendant set ``wait_subtree_live`` RETURNS still come only from the
+  production walkers ``collect_descendants``/``read_ppid_map``.
+* the ARRANGE-phase discovery GATE adds a cheap Linux
+  ``/proc/<pid>/task/*/children`` pre-filter (:func:`_read_direct_children`)
+  that decides nothing except whether to spend a full rescan on a given poll
+  tick.
+
+The measurement that motivates it: ``read_ppid_map()`` costs 49.67 ms at 917
+live processes, one ``children`` read costs 0.0183 ms -- ~2700x, against a
+50 ms poll interval.  So the old shape already doubled the effective
+sampling period AT IDLE, and under a full-suite storm (~8000 procs, ~400ms
+per scan) it collapsed ~10x -- while burning ~917 file reads per tick in CPU
+competition with the very leader it was waiting to see fork.  The probe is
+tri-state and degrades to the pre-4014 full walk when it cannot answer, so a
+kernel without CONFIG_PROC_CHILDREN keeps today's exact behaviour.
+
+Division of labour with the sibling de-flake: task 4025 addressed the
+WATCHDOG WINDOW (and its banner below is explicit that this "MOVES the cliff
+from 1.0s to 10s, it does not remove it"); task 4014 addressed the POLLER
+above it -- the per-tick cost, the transient-child race, and the flat 20s
+discovery ceiling that did not track load.
 """
 
 from __future__ import annotations
