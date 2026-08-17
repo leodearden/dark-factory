@@ -734,6 +734,68 @@ def test_wait_for_marker_stable_raises_when_never_settles(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Task 4014 -- deterministic unit coverage for wait_subtree_live's descendant
+# discovery poll (the "no descendant appeared within 20.0s" flake).  Every
+# test here injects the two private seams (_probe_children / _ppid_map) and
+# runs with interval=0, so there is ZERO real timing and ZERO real
+# subprocess -- the same task-2819 precedent as the wait_for_marker_stable
+# tests above.  Fixing a flake with a flake is the failure mode to avoid, and
+# the 3689 steward failed to reproduce this one in 19 of 19 attempts
+# (including synthetic pressure at load 100 / ~8000 processes), so a
+# load-based test would be non-deterministic in BOTH directions.  The
+# efficiency property that actually prevents sampling-rate collapse is
+# therefore pinned STRUCTURALLY, by call count, which is exact at any load.
+# ---------------------------------------------------------------------------
+
+
+def test_wait_subtree_live_gates_the_proc_walk_on_a_cheap_probe():
+    """The expensive full /proc rescan runs only once the cheap probe goes positive.
+
+    This is the load-bearing efficiency property of the discovery poll.
+    Measured on this box: ``read_ppid_map()`` costs 49.67 ms at 917 live
+    processes, while one ``/proc/<pid>/task/<tid>/children`` read costs
+    0.0183 ms -- ~2700x.  Against the 50 ms poll interval the full rescan
+    already DOUBLES the effective sampling period at idle, and the poller
+    burns ~917 file reads per tick competing for CPU with the very leader it
+    is waiting to see fork; under a full-suite storm (~8000 procs) the scan
+    is ~400ms+ and the sampling period collapses by ~10x.  So the cost is
+    worst exactly when the test needs the samples most.
+
+    The call-count assertion below pins "the sampling rate cannot collapse
+    under a large process table" as a STRUCTURAL property rather than a
+    timing hope: 26 ticks may cost at most ONE expensive walk.
+    """
+    probe_calls = [0]
+    ppid_map_calls = [0]
+
+    def fake_probe(_pid):
+        # 25 cheap negatives (leader live, hasn't forked yet), then a child.
+        probe_calls[0] += 1
+        return {5678} if probe_calls[0] > 25 else set()
+
+    def fake_ppid_map():
+        ppid_map_calls[0] += 1
+        return {5678: 1234}
+
+    result = wait_subtree_live(
+        1234, interval=0, _probe_children=fake_probe, _ppid_map=fake_ppid_map,
+    )
+
+    assert result == {5678}, (
+        f'expected the production walker\'s descendant set {{5678}}; got {result}'
+    )
+    assert probe_calls[0] == 26, (
+        f'expected the cheap probe on every one of the 26 ticks; '
+        f'got {probe_calls[0]} calls'
+    )
+    assert ppid_map_calls[0] <= 1, (
+        f'the expensive read_ppid_map() walk ran {ppid_map_calls[0]} times across '
+        f'26 ticks -- it must run ONLY on the tick the cheap probe goes positive, '
+        f'or the sampling rate collapses exactly when the process table is largest'
+    )
+
+
+# ---------------------------------------------------------------------------
 # Task 3369 -- in-child stopwatch for the flock GATE, replacing task 2921/2941's
 # outer wall-clock subtraction in test_flock_wait_env_override_speeds_up_
 # contention_result below.
