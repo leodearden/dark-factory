@@ -569,7 +569,7 @@ def test_cli_warning_origins_matches_the_tokens_call_llm_cli_synthesises():
     updating CLI_WARNING_ORIGINS, run() would silently start dropping a real
     diagnosis.  Pin the set.
     """
-    assert CLI_WARNING_ORIGINS == {'cli_output_unparseable', 'cli_output_empty'}, (
+    assert set(CLI_WARNING_ORIGINS) == {'cli_output_unparseable', 'cli_output_empty'}, (
         f'CLI_WARNING_ORIGINS drifted from _call_llm_cli: {CLI_WARNING_ORIGINS!r}'
     )
 

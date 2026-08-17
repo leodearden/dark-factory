@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class EventType(StrEnum):
@@ -204,6 +204,28 @@ class VerificationResult(BaseModel):
     # 'no_tool_calls', 'max_steps_reached', 'verify_failed', ...  Empty string on
     # the success path, so a non-empty value is itself a failure signal.
     failure_token: str = ''
+
+    @model_validator(mode='after')
+    def _failure_fields_agree(self) -> 'VerificationResult':
+        """`agent_failed` and a non-empty `failure_token` must co-occur.
+
+        The two fields encode the same fact from different angles — the boolean
+        is what consumers branch on, the token is what they store and group by —
+        so an unvalidated pair is redundant state that can silently desync.  A
+        desync produces exactly the ambiguity task 4343 closes: an
+        ``agent_failed`` audit row carrying no token (undiagnosable), or an
+        ``inconclusive`` row carrying a ``failure_token`` in its detail (a
+        healthy outcome that reads as a failure).  Fail loudly at construction
+        instead: every caller either has both or neither.
+        """
+        if bool(self.failure_token) != self.agent_failed:
+            raise ValueError(
+                'agent_failed and failure_token must agree: got '
+                f'agent_failed={self.agent_failed!r}, '
+                f'failure_token={self.failure_token!r} — set both on a failure '
+                'and neither on success'
+            )
+        return self
 
 
 def _normalize_project_id(v: object, *, allow_empty: bool = False) -> object:

@@ -15,14 +15,22 @@ invariant INV-2 ``structured-facts-at-failure`` forbids.  ``VerificationResult``
 now also carries ``agent_failed: bool`` and ``failure_token: str``, and the
 assertions below pin them on every path (both failure shapes, the non-dict
 shape, and the success path where both must stay at their defaults).
+
+Amendment pass: the two fields encode one fact twice, so
+``TestFailureFieldsCannotDesync`` pins the model validator that keeps them in
+lockstep, and ``test_verify_failure_token_coerces_malformed_origin`` pins that a
+malformed ``warning_origin`` degrades through the preference chain rather than
+raising ValidationError out of ``verify()``.
 """
 
 import logging
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from pydantic import ValidationError
 
 from fused_memory.config.schema import ReconciliationConfig
+from fused_memory.models.reconciliation import VerificationResult, VerificationVerdict
 from fused_memory.reconciliation.verify import CodebaseVerifier
 
 # ---------------------------------------------------------------------------
@@ -270,6 +278,60 @@ async def test_verify_failure_token_coerces_malformed_origin(raw_origin, expecte
         f'Expected failure_token={expected_token!r} for raw origin '
         f'{raw_origin!r} but got {result.failure_token!r}'
     )
+
+
+# ---------------------------------------------------------------------------
+# MODEL-INVARIANT tests (task 4343): the two structured fields cannot desync.
+# ---------------------------------------------------------------------------
+
+class TestFailureFieldsCannotDesync:
+    """`agent_failed` and `failure_token` must be set together or not at all.
+
+    They encode one fact from two angles — the boolean is what consumers branch
+    on, the token is what they store and GROUP BY — so an unvalidated pair is
+    redundant state that drifts silently.  Either drift direction recreates the
+    ambiguity this task closes: an ``agent_failed`` audit row with no token is
+    undiagnosable, and an ``inconclusive`` row carrying a ``failure_token`` in
+    its detail reads as a failure that never happened.
+    """
+
+    def test_failed_without_token_rejected(self):
+        with pytest.raises(ValidationError, match='must agree'):
+            VerificationResult(
+                verdict=VerificationVerdict.inconclusive,
+                confidence=0.0,
+                agent_failed=True,
+                failure_token='',
+            )
+
+    def test_token_without_failed_rejected(self):
+        with pytest.raises(ValidationError, match='must agree'):
+            VerificationResult(
+                verdict=VerificationVerdict.inconclusive,
+                confidence=0.4,
+                agent_failed=False,
+                failure_token='no_tool_calls',
+            )
+
+    def test_both_set_accepted(self):
+        r = VerificationResult(
+            verdict=VerificationVerdict.inconclusive,
+            confidence=0.0,
+            agent_failed=True,
+            failure_token='cli_output_empty',
+        )
+        assert r.agent_failed is True
+        assert r.failure_token == 'cli_output_empty'
+
+    def test_neither_set_accepted(self):
+        """The healthy default: both fields absent from the call entirely.
+
+        Guards the many pre-existing construction sites that predate task 4343
+        and never mention either field.
+        """
+        r = VerificationResult(verdict=VerificationVerdict.confirmed, confidence=0.9)
+        assert r.agent_failed is False
+        assert r.failure_token == ''
 
 
 # ---------------------------------------------------------------------------
