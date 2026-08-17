@@ -22,19 +22,28 @@ import pytest
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'measure_plural_enum_guard_recall.py'
 )
+SWEEP_TEST_PATH = (
+    Path(__file__).parent / 'reconciliation' / 'test_stale_status_snapshot_edge_sweep.py'
+)
 
 
-def _load_module() -> types.ModuleType:
-    """Load measure_plural_enum_guard_recall.py from its file path.
+def _load_module(mod_name: str, path: Path) -> types.ModuleType:
+    """Load a module from its file path, bypassing sys.path entirely.
 
-    The module is registered in sys.modules under its name so that
+    The module is registered in sys.modules under *mod_name* so that
     @dataclass and other reflection-based decorators work correctly
     (they call sys.modules.get(cls.__module__)).
+
+    Used for BOTH the script under test (not on PYTHONPATH) and the sweep
+    TEST module whose parametrize markers this file re-validates against:
+    ``tests/`` carries no __init__.py, so the sweep suite's importable name
+    depends on pytest's rootdir insertion and differs between a direct run
+    and a collected one. Loading by path sidesteps that entirely — the
+    re-validation gate must not be able to break on an import-path detail.
     """
-    mod_name = 'measure_plural_enum_guard_recall'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
+    spec = importlib.util.spec_from_file_location(mod_name, path)
     if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
+        raise ImportError(f'Cannot load {path}')
     module = importlib.util.module_from_spec(spec)
     sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
     try:
@@ -45,7 +54,7 @@ def _load_module() -> types.ModuleType:
     return module
 
 
-_mod = _load_module()
+_mod = _load_module('measure_plural_enum_guard_recall', SCRIPT_PATH)
 scan_corpus = _mod.scan_corpus
 triage_rejection = _mod.triage_rejection
 simulate_candidate = _mod.simulate_candidate
@@ -67,7 +76,9 @@ def _pinned_shapes(test_name: str) -> list:
     """
     import inspect
 
-    import tests.reconciliation.test_stale_status_snapshot_edge_sweep as sweep_tests
+    sweep_tests = _load_module(
+        '_sweep_tests_for_revalidation', SWEEP_TEST_PATH,
+    )
 
     for _cls_name, cls in inspect.getmembers(sweep_tests, inspect.isclass):
         fn = getattr(cls, test_name, None)

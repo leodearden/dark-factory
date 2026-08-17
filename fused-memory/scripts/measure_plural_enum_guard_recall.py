@@ -63,6 +63,7 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (  # noqa: E402
+    _BARE_DIGIT_RE,
     _ENUM_PREP_WORD_RE,
     PLURAL_ENUM_SNAPSHOT_RE,
     _enumeration_is_prepositional_complement,
@@ -244,3 +245,151 @@ def triage_rejection(fact: str, match_start: int) -> str:
             return PREPOSITIONAL_COMPLEMENT
 
     return ADVERBIAL_PREAMBLE
+
+
+# ---------------------------------------------------------------------------
+# Candidate tightenings (REPORT-ONLY SIMULATION)
+# ---------------------------------------------------------------------------
+#
+# The two candidates task 3079 named and declined to apply on speculation.
+# Simulated here so the decision is measured rather than argued.
+#
+# THESE ARE NOT SHIPPABLE GUARDS AND MUST NOT BE IMPORTED BY PRODUCTION
+# CODE. They exist to answer 'what would this have cost?' against the
+# pinned shape corpus, and they are wired into nothing but the report.
+#
+# A caveat that bounds what the simulation can prove: each candidate below
+# is ONE plausible spelling of the idea, and a different spelling could
+# measure differently. That is why the corpus zero, not the simulation,
+# carries the verdict — the simulation is corroboration. A candidate that
+# looked clean here would still have zero measured benefit on a corpus
+# where the regex matches nothing.
+
+
+def _guard_candidate_a(prefix: str) -> bool:
+    """(a) Require a capitalized-or-plural head token before the preposition.
+
+    Spelling assumed: fire only when SOME listed preposition in the clause
+    is IMMEDIATELY preceded by a token that looks like a noun-phrase head —
+    capitalized, or plural-looking ('...s'). The intent is that 'Reviews of
+    tasks ...' fires (head 'Reviews') while a bare adverbial preamble does
+    not.
+
+    Measured limitation: it does not recover 'As of <date>, tasks ...',
+    because 'of' there is immediately preceded by the capitalized
+    sentence-initial 'As'. That is the finding's own motivating shape.
+    """
+    clause = prefix[_last_clause_break(prefix) + 1:]
+    for prep in _ENUM_PREP_WORD_RE.finditer(clause):
+        tokens = _WORD_TOKEN_RE.findall(clause[: prep.start()])
+        if tokens and (tokens[-1][:1].isupper() or tokens[-1].lower().endswith('s')):
+            return True
+    return False
+
+
+def _guard_candidate_b(prefix: str) -> bool:
+    """(b) Restart the backward scan after a comma that no preposition follows.
+
+    Spelling assumed: if the clause's LAST comma is followed by no listed
+    preposition, treat that comma as a preamble boundary and search only
+    the text after it; otherwise scan the whole clause as shipped.
+
+    Measured limitation: a comma can be intra-clause rather than a preamble
+    boundary — 'Blockers for down-stream, still-unmerged tasks 1020 and
+    1030 are pending.' has a coordinate-adjective comma — so this restart
+    discards the governing 'for' and re-opens a pinned over-selection.
+    """
+    clause = prefix[_last_clause_break(prefix) + 1:]
+    comma = clause.rfind(',')
+    if comma >= 0 and not _ENUM_PREP_WORD_RE.search(clause, comma + 1):
+        clause = clause[comma + 1:]
+    return _ENUM_PREP_WORD_RE.search(clause) is not None
+
+
+_CANDIDATE_GUARDS = {
+    'shipped': _enumeration_is_prepositional_complement,
+    'a': _guard_candidate_a,
+    'b': _guard_candidate_b,
+}
+
+CANDIDATE_NAMES: tuple[str, ...] = ('shipped', 'a', 'b')
+
+
+def extract_plural_ids(fact: str, *, candidate: str = 'shipped') -> set[int]:
+    """Ids the PLURAL path yields for *fact* under the named guard.
+
+    Ids come from the match's ``'ids'`` capture group ONLY, via the sweep
+    module's ``_BARE_DIGIT_RE`` — preserving extract_snapshot_edge_task_ids'
+    invariant (d), that a bare '\\d+' contributes an id only from inside an
+    already-detected, marker-anchored span.
+
+    This is the plural path in isolation, deliberately: it is the only path
+    either candidate can change, so comparing it isolates the candidate's
+    effect from the whole-fact status gate and the other extraction paths.
+    """
+    guard = _CANDIDATE_GUARDS[candidate]
+    ids: set[int] = set()
+    for match in PLURAL_ENUM_SNAPSHOT_RE.finditer(fact):
+        if guard(fact[: match.start()]):
+            continue
+        ids.update(int(d) for d in _BARE_DIGIT_RE.findall(match.group('ids')))
+    return ids
+
+
+@dataclass(frozen=True)
+class CandidateResult:
+    """What one candidate tightening would change against a shape corpus.
+
+    ``over_selected`` is disqualifying and ``recovered`` is the benefit; the
+    two are separated by ``triage_rejection``, so the same newly-admitted
+    match is scored as a regression or a recovery on its own linguistic
+    merits rather than on which list the caller passed it in.
+    """
+
+    name: str
+    over_selected: list[str] = field(default_factory=list)
+    recovered: list[str] = field(default_factory=list)
+    unchanged: list[str] = field(default_factory=list)
+
+
+def simulate_candidate(name: str, facts: Iterable[str]) -> CandidateResult:
+    """Compare the named candidate guard's outcome against the shipped one.
+
+    For every regex match the SHIPPED guard rejects but the candidate
+    admits, the newly-admitted match is triaged: an 'adverbial_preamble'
+    counts as ``recovered`` (the tightening's benefit), a
+    'prepositional_complement' counts as ``over_selected`` (a re-opened
+    precision regression, the unrecoverable direction).
+
+    A candidate can only ever ADMIT matches the shipped guard rejects if it
+    is strictly weaker on some prefix; a candidate that instead rejects
+    something the shipped guard admits shows up as a changed id set in
+    ``extract_plural_ids``, which the subject-position positives pin.
+    """
+    over_selected: list[str] = []
+    recovered: list[str] = []
+    unchanged: list[str] = []
+
+    guard = _CANDIDATE_GUARDS[name]
+    for fact in facts:
+        changed = False
+        for match in PLURAL_ENUM_SNAPSHOT_RE.finditer(fact):
+            prefix = fact[: match.start()]
+            if not _enumeration_is_prepositional_complement(prefix):
+                continue  # shipped already selects it; nothing to recover
+            if guard(prefix):
+                continue  # candidate agrees with the shipped rejection
+            changed = True
+            if triage_rejection(fact, match.start()) == ADVERBIAL_PREAMBLE:
+                recovered.append(fact)
+            else:
+                over_selected.append(fact)
+        if not changed:
+            unchanged.append(fact)
+
+    return CandidateResult(
+        name=name,
+        over_selected=over_selected,
+        recovered=recovered,
+        unchanged=unchanged,
+    )
