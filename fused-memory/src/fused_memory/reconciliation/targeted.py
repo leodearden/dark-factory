@@ -676,6 +676,11 @@ class TargetedReconciler:
 
         # 2. If sparse knowledge, verify against codebase and write findings
         if len(related) < 2:
+            # Declared OUTSIDE the try so the except arm can always read it:
+            # False means the verifier itself never produced an outcome, True
+            # means the outcome row already landed and any later raise belongs
+            # to a downstream stage (the memory write), not to the verifier.
+            verify_audited = False
             try:
                 verification = await self.verifier.verify(
                     claim=f"Task '{title}' has been completed",
@@ -683,20 +688,24 @@ class TargetedReconciler:
                     scope_hints=_extract_scope_hints(task),
                 )
                 # ── verify/codebase audit row contract (task 4343) ──────────
-                # ONE row per invocation of this branch, so the record is a
-                # complete census by construction:
+                # Exactly ONE *outcome* row per invocation of this branch, so
+                # the record is a complete census by construction:
                 #   action_type='verify', target='codebase'
                 #   operation ∈ {confirmed, contradicted, inconclusive,
                 #                agent_failed}  from here, plus 'error' from
-                #                the except arm below.
+                #                the except arm below when the verifier itself
+                #                raised before producing any outcome.
+                # The except arm may ALSO emit a non-outcome 'post_verify_error'
+                # row — when the verifier answered and a later stage inside this
+                # same try (the memory write) raised.  So the outcome census is
+                #   SELECT operation, COUNT(*) FROM run_actions
+                #    WHERE action_type='verify' AND operation != 'post_verify_error'
+                # and it stays exact: no invocation is missing, none double-counted.
                 # Recording only the failure outcomes would leave "the agent
                 # failed" distinguishable from "genuinely inconclusive" solely
                 # by a row being present vs absent — and absence already means
                 # "this branch never opened" for the overwhelming majority of
-                # runs.  Emitting on every outcome makes
-                # `SELECT operation, COUNT(*) FROM run_actions
-                #  WHERE action_type='verify'` truthful without parsing detail
-                # JSON.  Mirrors task 1184's distinct-verb precedent below.
+                # runs.  Mirrors task 1184's distinct-verb precedent below.
                 outcome = 'agent_failed' if verification.agent_failed else str(verification.verdict)
                 audit_detail = {'task_id': task_id, 'verdict': str(verification.verdict)}
                 if verification.failure_token:
@@ -705,6 +714,7 @@ class TargetedReconciler:
                     run_id, 'verify', 'codebase', outcome, audit_detail,
                     causation_id=run_id,
                 )
+                verify_audited = True
 
                 # An agent that never produced a parseable verdict returns the
                 # caller-supplied default ('inconclusive'), which collides with
@@ -764,10 +774,24 @@ class TargetedReconciler:
                 # failure into a crash.  The try boundary above is deliberately
                 # NOT widened: _fenced_add_memory stays inside it and keeps
                 # failing closed exactly as before.
-                result['actions'].append({'type': 'verification_error', 'error': str(e)[:200]})
+                #
+                # But `_fenced_add_memory` is INSIDE this try and genuinely can
+                # raise (unguarded self.memory.add_memory / buffer.defer_write
+                # network calls), so this arm is reachable with the outcome row
+                # already written.  Attributing that to the verifier would both
+                # double-count the census and blame the wrong stage — the
+                # verifier answered 'confirmed'; it was the write that failed.
+                # Hence the distinct operation + explicit 'stage' in detail.
+                if verify_audited:
+                    stage, operation = 'post_verify_write', 'post_verify_error'
+                    action_kind = 'post_verification_error'
+                else:
+                    stage, operation = 'verify', 'error'
+                    action_kind = 'verification_error'
+                result['actions'].append({'type': action_kind, 'error': str(e)[:200]})
                 await self.journal.add_run_action(
-                    run_id, 'verify', 'codebase', 'error',
-                    {'task_id': task_id, 'error': str(e)[:500]},
+                    run_id, 'verify', 'codebase', operation,
+                    {'task_id': task_id, 'error': str(e)[:500], 'stage': stage},
                     causation_id=run_id,
                 )
 

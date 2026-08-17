@@ -4023,7 +4023,12 @@ async def test_reopen_then_redone_cites_fresh_provenance(
 
 
 def _verify_rows(actions: list[dict]) -> list[dict]:
-    """The verify/codebase audit rows from a run's action list."""
+    """The verify/codebase audit rows from a run's action list.
+
+    Includes the non-outcome ``post_verify_error`` row, which the operator
+    census excludes (``operation != 'post_verify_error'``) — see the row
+    contract comment in targeted.py.
+    """
     return [
         a for a in actions
         if a['action_type'] == 'verify' and a['target'] == 'codebase'
@@ -4088,7 +4093,11 @@ class TestVerificationFailureAudit:
         )
 
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert any('cli_output_empty' in r.getMessage() and '1' in r.getMessage()
+        # Match the actual formatted fragment from the
+        # 'verification_agent_failed task=%s token=%s ...' format string: a bare
+        # `'1' in message` substring check is satisfied by any stray digit
+        # (a timestamp, a future token) and would pin nothing about identity.
+        assert any('cli_output_empty' in r.getMessage() and 'task=1' in r.getMessage()
                    for r in warnings), (
             f'Expected a WARNING naming the token and the task, got '
             f'{[r.getMessage() for r in warnings]}'
@@ -4311,3 +4320,74 @@ class TestVerificationFailureAudit:
             f'Expected the specific CLI origin to survive into the journal, got '
             f'{rows[0]["detail"]!r}'
         )
+
+    @pytest.mark.asyncio
+    async def test_post_verify_write_failure_is_not_attributed_to_the_verifier(
+        self, reconciler, journal, mock_memory_service, caplog
+    ):
+        """A memory-write failure AFTER a good verdict must not read as a verify failure.
+
+        ``_fenced_add_memory`` lives inside the same try as the audit row and
+        genuinely can raise (unguarded memory.add_memory / buffer.defer_write
+        network calls), so the except arm is reachable with the outcome row
+        already written.  Emitting a second ``'error'`` row there would
+        double-count `WHERE action_type='verify'` — breaking the one-outcome-row
+        -per-invocation contract — and attribute a store outage to the verifier,
+        misleading exactly the operator this task exists for.  The outcome row
+        must stay 'confirmed'; the write failure gets its own distinct,
+        stage-naming operation.
+        """
+        async def _add_memory(**kwargs):
+            # Only the verification write carries verification_verdict; the
+            # fast-path completion echo must still succeed so the run reaches
+            # the verify branch normally.
+            if 'verification_verdict' in (kwargs.get('metadata') or {}):
+                raise RuntimeError('qdrant unavailable')
+            return {'id': 'mem-1'}
+
+        mock_memory_service.add_memory = AsyncMock(side_effect=_add_memory)
+        reconciler.verifier.verify = AsyncMock(return_value=VerificationResult(
+            verdict=VerificationVerdict.confirmed,
+            confidence=0.9,
+            evidence=[{'file_path': 'test.py', 'snippet': 'def test()'}],
+            summary='Confirmed via test.py',
+        ))
+
+        with caplog.at_level(logging.WARNING):
+            result = await _run_done_transition(reconciler)
+
+        runs = await journal.get_recent_runs('test-project', limit=1)
+        actions = await journal.get_run_actions(runs[0].id)
+        rows = _verify_rows(actions)
+
+        outcome_rows = [a for a in rows if a['operation'] != 'post_verify_error']
+        assert len(outcome_rows) == 1, (
+            f'Expected exactly one verify/codebase OUTCOME row, got '
+            f'{[(a["operation"], a["detail"]) for a in rows]}'
+        )
+        assert outcome_rows[0]['operation'] == 'confirmed', (
+            f"The verifier answered 'confirmed'; a downstream write failure must "
+            f'not relabel it, got {outcome_rows[0]["operation"]!r}'
+        )
+        assert not [a for a in rows if a['operation'] == 'error'], (
+            f'A post-verify write failure must not emit a verifier-error row, got '
+            f'{[(a["operation"], a["detail"]) for a in rows]}'
+        )
+
+        post = [a for a in rows if a['operation'] == 'post_verify_error']
+        assert len(post) == 1, (
+            f'Expected one post_verify_error row naming the failed stage, got '
+            f'{[(a["operation"], a["detail"]) for a in rows]}'
+        )
+        assert post[0]['detail'].get('stage') == 'post_verify_write', (
+            f'Expected the stage named in detail, got {post[0]["detail"]!r}'
+        )
+        assert 'qdrant unavailable' in post[0]['detail'].get('error', ''), (
+            f'Expected the raised message in detail, got {post[0]["detail"]!r}'
+        )
+        assert any(a['type'] == 'post_verification_error'
+                   for a in result.get('actions', [])), (
+            f'Expected a post_verification_error action, got {result.get("actions")}'
+        )
+        # Containment preserved: the exception does not propagate.
+        assert 'task_id' in result
