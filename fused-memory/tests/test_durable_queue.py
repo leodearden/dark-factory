@@ -1775,6 +1775,120 @@ class TestTerminalHook:
             await q.close()
 
     @pytest.mark.asyncio
+    async def test_post_execute_flag_survives_a_retry_into_a_later_failed_attempt(
+        self, tmp_path
+    ):
+        """"The backend write LANDED" is an ITEM-level fact, not a per-attempt one.
+
+        POST_EXECUTE_DEAD_PREFIX's own definition, and the write journal's
+        terminal_status schema comment, both describe it as separating "safe to
+        replay" from "already landed; do not blind-replay" — a property of the
+        ITEM. It was computed from a fresh per-attempt local, so it evaporated
+        the instant an item retried.
+
+        The sequence here is ordinary, not exotic: attempt 1 executes (the
+        write LANDS), its callback raises, the item reschedules; attempt 2 dies
+        inside _execute_write and dead-letters. The operator is then told the
+        exact opposite of the truth — no prefix, i.e. "safe to replay" — and a
+        replay DUPLICATES the landed write.
+        """
+        calls, hook = self._recorder()
+
+        async def exploding_callback(_ctype, _result, _payload):
+            raise RuntimeError('callback keeps failing')
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(side_effect=[
+                {'episode_uuid': 'ep-1'},
+                RuntimeError('attempt 2 never reached the backend'),
+            ]),
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=2,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            on_terminal=hook,
+        )
+        q.register_callback('dual_write_episode', exploding_callback)
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'x', '_write_op_id': 'W9'},
+                callback_type='dual_write_episode',
+            )
+            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until(lambda: len(calls) >= 1, timeout=20.0, interval=0.05)
+            assert len(calls) == 1
+            write_op_id, status, error = calls[0]
+            assert (write_op_id, status) == ('W9', 'dead')
+            assert error is not None
+            assert error.startswith(dq_module.POST_EXECUTE_DEAD_PREFIX), (
+                'attempt 1 landed a write; the item is NOT safe to blind-replay '
+                'just because the attempt that finally killed it never reached '
+                'the backend'
+            )
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
+    async def test_executed_fact_is_sticky_across_replay_dead(self, tmp_path):
+        """replay_dead resets the retry BUDGET, not the item's history.
+
+        "A backend write for this item landed at some point" does not stop
+        being true because an operator pressed replay — and it is precisely
+        the fact that makes a SECOND blind replay dangerous. So the flag is
+        deliberately sticky even though replay_dead does reset attempts and
+        error.
+        """
+        calls, hook = self._recorder()
+
+        async def exploding_callback(_ctype, _result, _payload):
+            raise RuntimeError('callback keeps failing')
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=AsyncMock(side_effect=[
+                {'episode_uuid': 'ep-1'},
+                RuntimeError('attempt 2 never reached the backend'),
+                RuntimeError('post-replay attempt 1 never reached the backend'),
+                RuntimeError('post-replay attempt 2 never reached the backend'),
+            ]),
+            workers_per_group=1,
+            semaphore_limit=5,
+            max_attempts=2,
+            retry_base_seconds=0.01,
+            write_timeout_seconds=2.0,
+            on_terminal=hook,
+        )
+        q.register_callback('dual_write_episode', exploding_callback)
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'content': 'x', '_write_op_id': 'W10'},
+                callback_type='dual_write_episode',
+            )
+            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until(lambda: len(calls) >= 1, timeout=20.0, interval=0.05)
+
+            assert await q.replay_dead(group_id='proj1') == 1
+            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until(lambda: len(calls) >= 2, timeout=20.0, interval=0.05)
+
+            assert len(calls) == 2
+            write_op_id, status, error = calls[1]
+            assert (write_op_id, status) == ('W10', 'dead')
+            assert error is not None
+            assert error.startswith(dq_module.POST_EXECUTE_DEAD_PREFIX), (
+                'a replayed item is fresh with respect to its retry budget, '
+                'not with respect to whether a write already landed'
+            )
+        finally:
+            await q.close()
+
+    @pytest.mark.asyncio
     async def test_callback_still_sees_journal_metadata_popped_by_execute(
         self, tmp_path
     ):
