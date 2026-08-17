@@ -723,8 +723,9 @@ class TaskSteward:
 
         Kwargs are forwarded verbatim to :func:`invoke_agent` — including the
         ``backend`` kwarg ``invoke_with_cap_retry`` injects for custom
-        ``invoke_fn`` callers (cli_invoke.py:1079-1086), whose disposition is
-        unchanged by this shim.
+        ``invoke_fn`` callers (its ``if invoke_fn is not None:
+        invoke_kwargs.setdefault('backend', ...)`` guard in
+        shared/cli_invoke.py), whose disposition is unchanged by this shim.
         """
         self.metrics.subprocess_attempts += 1
         return await invoke_agent(**kwargs)
