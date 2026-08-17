@@ -28,6 +28,7 @@ from _verify_config_corpus import (
     load_config_scalar,
 )
 
+from orchestrator import verify
 from orchestrator.verify_cmd import (
     _CHAIN_OPERATOR_TOKENS,
     ChainSegment,
@@ -43,6 +44,7 @@ from orchestrator.verify_cmd import (
     govern_cpu,
     has_unpreserved_chain_clauses,
     parse_config_command,
+    promote_cwd_to_project,
     render,
     reproject,
     scope_to,
@@ -505,6 +507,113 @@ class TestReproject:
         raw = 'cargo test --workspace && cargo test --workspace'
         cmd = parse_config_command(raw)
         assert reproject(cmd, 'shared') == cmd
+
+
+class TestPromoteCwdToProject:
+    """promote_cwd_to_project(cmd) copies cwd_rel into an EMPTY uv_project.
+
+    ``--directory X`` and ``--project X`` select the same uv project, but
+    ``strip_cwd`` discards only the former — it clears ``cwd_rel`` and
+    deliberately keeps ``uv_project`` ("it selects the venv, independent of
+    cwd"). So a command that expresses its project SOLELY via ``--directory X``
+    loses that selection at scope time and renders as a bare ``uv run <tool>``
+    against the depless workspace root: the 'Failed to spawn: pytest' / exit-127
+    shape of regression ef68777a17 / task 2036. Promoting BEFORE ``strip_cwd``
+    keeps the selection alive (task 3830).
+    """
+
+    def test_promotes_cwd_rel_into_empty_uv_project(self):
+        cmd = parse_config_command('uv run --directory sampler pyright src/ tests/')
+        assert cmd.uv_project == ''
+        assert cmd.cwd_rel == 'sampler'
+        promoted = promote_cwd_to_project(cmd)
+        assert promoted.uv_project == 'sampler'
+        # Promotion ONLY: clearing cwd_rel remains strip_cwd's job, so this
+        # mutator stays composable with (and independent of) it.
+        assert promoted.cwd_rel == 'sampler'
+
+    def test_noop_when_project_already_set(self):
+        """An explicit --project is never second-guessed — reproject's own rule."""
+        cmd = parse_config_command('uv run --project sampler --directory sampler ruff check x')
+        assert promote_cwd_to_project(cmd) == cmd
+
+    def test_noop_when_project_already_set_and_differs_from_directory(self):
+        """A deliberately DIFFERING --project/--directory pair keeps its --project.
+
+        Distinct semantics (run from ``scripts/`` against ``shared``'s
+        project), not the self-defeating same-value pairing task 3830 retires.
+        """
+        cmd = parse_config_command('uv run --project shared --directory scripts ruff check x')
+        assert promote_cwd_to_project(cmd) == cmd
+
+    def test_noop_when_not_uv_wrapped(self):
+        """``cd X && npx pyright`` carries a cwd_rel but no uv context at all.
+
+        ``uv_project is None`` (not uv-wrapped) is distinct from ``''``
+        (uv-wrapped, no explicit --project) — see the tri-state note on
+        ``VerifyCmd.uv_project``. Promoting here would invent a --project for
+        a command that never had a uv wrapper to put it on.
+        """
+        cmd = parse_config_command('cd fused-memory && npx pyright')
+        assert cmd.uv_project is None
+        assert cmd.cwd_rel == 'fused-memory'
+        assert promote_cwd_to_project(cmd) == cmd
+
+    def test_noop_when_no_cwd_set(self):
+        """A bare ``uv run`` has no cwd to promote — that is reproject's case."""
+        cmd = parse_config_command('uv run ruff check x')
+        assert cmd.uv_project == ''
+        assert cmd.cwd_rel is None
+        assert promote_cwd_to_project(cmd) == cmd
+
+    def test_noop_on_opaque(self):
+        cmd = parse_config_command('mypy src/')
+        assert promote_cwd_to_project(cmd) == cmd
+
+    def test_noop_on_raw_retained_chain(self):
+        raw = 'cargo test --workspace && cargo test --workspace'
+        cmd = parse_config_command(raw)
+        assert promote_cwd_to_project(cmd) == cmd
+
+    def test_idempotent(self):
+        cmd = parse_config_command('uv run --directory sampler pyright src/')
+        once = promote_cwd_to_project(cmd)
+        twice = promote_cwd_to_project(once)
+        assert twice == once
+
+
+class TestScopedRenderKeepsDirectoryOnlyProject:
+    """A ``--directory``-only module command must not scope to a BARE ``uv run``.
+
+    The integration hazard task 3830 closes: retiring the self-defeating
+    ``--project X --directory X`` pairing from every module orchestrator.yaml
+    leaves the project expressed solely as ``--directory X``, which
+    ``strip_cwd`` discards. Without the promotion these render project-less at
+    the depless workspace root, where ruff/pyright/pytest are not installed.
+    """
+
+    _FILES = ['sampler/src/a.py']
+    _EXPECTED = 'uv run --project sampler pyright sampler/src/a.py'
+
+    def test_directory_only_command_keeps_its_project(self):
+        scoped = verify._scope_to_keyword(
+            'uv run --directory sampler pyright src/ tests/', 'pyright', self._FILES
+        )
+        assert scoped == self._EXPECTED
+
+    def test_paired_command_scopes_to_the_same_string(self):
+        """Scoped-render EQUIVALENCE: dropping ``--project X`` costs nothing.
+
+        The old paired shape and the new ``--directory``-only shape must scope
+        to the identical string, which is what makes the orchestrator.yaml
+        change render-preserving rather than merely non-fatal.
+        """
+        scoped = verify._scope_to_keyword(
+            'uv run --project sampler --directory sampler pyright src/ tests/',
+            'pyright',
+            self._FILES,
+        )
+        assert scoped == self._EXPECTED
 
 
 class TestCargoScopeStructured:
