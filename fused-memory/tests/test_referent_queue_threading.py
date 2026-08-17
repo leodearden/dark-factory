@@ -280,3 +280,97 @@ class TestReferentWireCodecDegradation:
         assert referents == ()
         assert source == 'none'
         assert Referent(number='3127') not in referents
+
+
+class TestAddMemoryStampsReferents:
+    """`add_memory`'s Graphiti leg resolves and stamps the set at enqueue time.
+
+    'decisions_and_rationale' is a GRAPHITI_PRIMARY category, so `write_graphiti`
+    is True without needing `dual_write`.
+    """
+
+    @pytest.mark.asyncio
+    async def test_derived_from_content_when_no_metadata_bridge(self, service):
+        await service.add_memory(
+            content='the fix for Task 3127 landed',
+            category='decisions_and_rationale',
+            project_id='dark_factory',
+        )
+
+        payload = service.durable_queue.enqueue.call_args[1]['payload']
+        assert payload['referents'] == {
+            'source': 'derived',
+            'refs': [{'kind': 'task', 'project_id': '', 'number': '3127'}],
+        }
+
+    @pytest.mark.asyncio
+    async def test_metadata_task_id_outranks_the_derived_scan(self, service):
+        """Same prose naming 3127, but ambient metadata says 3129. The bridge
+        wins — and reading an INT proves the resolver sees `meta` AFTER
+        `_normalize_task_id_metadata` has coerced it to a str."""
+        await service.add_memory(
+            content='the fix for Task 3127 landed',
+            category='decisions_and_rationale',
+            project_id='dark_factory',
+            metadata={'task_id': 3129},
+        )
+
+        payload = service.durable_queue.enqueue.call_args[1]['payload']
+        assert payload['referents'] == {
+            'source': 'metadata',
+            'refs': [{'kind': 'task', 'project_id': '', 'number': '3129'}],
+        }
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_prose_still_stamps_an_explicit_empty_set(self, service):
+        """The key is stamped even when empty, so a new-format row stays
+        distinguishable from an old one at the wire level."""
+        await service.add_memory(
+            content='the merge-lane hardening task',
+            category='decisions_and_rationale',
+            project_id='dark_factory',
+        )
+
+        payload = service.durable_queue.enqueue.call_args[1]['payload']
+        assert payload['referents'] == {'source': 'none', 'refs': []}
+
+    @pytest.mark.asyncio
+    async def test_mem0_only_write_never_enqueues_at_all(self, service):
+        """No Graphiti leg means no resolution is paid for: the scan is scoped
+        to the `write_graphiti` branch."""
+        await service.add_memory(
+            content='the fix for Task 3127 landed',
+            category='observations_and_summaries',
+            project_id='dark_factory',
+            dual_write=False,
+        )
+
+        service.durable_queue.enqueue.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_stamped_blob_is_json_safe(self, service):
+        await service.add_memory(
+            content='the fix for Task 3127 landed',
+            category='decisions_and_rationale',
+            project_id='dark_factory',
+        )
+
+        payload = service.durable_queue.enqueue.call_args[1]['payload']
+        assert json.loads(json.dumps(payload['referents'])) == payload['referents']
+
+    @pytest.mark.asyncio
+    async def test_preexisting_payload_keys_are_untouched(self, service):
+        """The referent set is ADDITIVE, never a replacement."""
+        await service.add_memory(
+            content='the fix for Task 3127 landed',
+            category='decisions_and_rationale',
+            project_id='dark_factory',
+        )
+
+        payload = service.durable_queue.enqueue.call_args[1]['payload']
+        assert payload['name'] == 'memory_decisions_and_rationale'
+        assert payload['content'] == 'the fix for Task 3127 landed'
+        assert payload['source'] == 'text'
+        assert payload['source_description'] == 'add_memory:decisions_and_rationale'
+        assert '_causation_id' in payload
+        assert '_write_op_id' in payload
