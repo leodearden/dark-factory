@@ -1321,9 +1321,12 @@ class TestMergePlans:
     def test_at_most_one_canonical_per_project_topic(self):
         """ε's <=1-canonical-per-topic invariant, pinned at PLAN level.
 
-        Checked before any write, because ``update_memory`` never reaches the
-        service-side uniqueness probe — so a plan that violated this would
-        reach Qdrant unchallenged.
+        Checked before any write.  ``update_memory`` does reach the
+        service-side probe as of task 3523, but that probe adjudicates one
+        write at a time against live state: it would admit the FIRST member
+        of a within-plan duplicate pair and refuse only the second, making
+        the outcome depend on iteration order.  Rejecting the pair AS a pair
+        is a plan-level property, and only this layer can see it.
         """
         targets, _ = _mod.merge_plans(
             [_plan('topic-one', canonical=C1, members=(M1,)),
@@ -1552,10 +1555,12 @@ class TestStampOne:
     async def test_canonical_uniqueness_is_probed_before_the_write(self):
         """The probe runs FIRST, with ε's exact filter.
 
-        ``update_memory`` never reaches
-        ``_apply_memory_metadata_validation``, so this script is the only
-        layer standing between a plan and a second ``canonical: true`` for
-        one ``(project, topic)``.  A probe issued after the write would
+        ``update_memory`` reaches ``_apply_memory_metadata_validation`` as of
+        task 3523, so this is no longer the ONLY layer standing between a
+        plan and a second ``canonical: true`` for one ``(project, topic)``.
+        It is still the strictest one: under the shipped ``enforce = false``
+        the seam warn-fails OPEN, while this script refuses.  Ordering stays
+        load-bearing either way — a probe issued after the write would
         observe the violation it was meant to prevent.
         """
         service = _service(record=_record())
