@@ -1154,14 +1154,40 @@ def test_hook_session_slug_adopts_env_slug_when_a_clear_remints_the_session_id(
     assert sh.hook_session_slug(hook_input, env, root=tmp_path) != slug
 
 
-@pytest.mark.parametrize('source', ['clear', 'resume', 'compact'])
+def test_hook_session_slug_does_not_forgive_a_resume_remint(tmp_path: Path) -> None:
+    # `allow_remint` is not blanket forgiveness -- it is scoped to the two
+    # sources with no CLI spelling. `--resume`/`--continue` make a brand-new
+    # nested process report 'resume' too, so honouring it here would let any
+    # inheritor claim its spawner's record even with the opt-in withheld.
+    slug = 'session-cockpit-3215087'
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug,
+            status=sr.Status.RUNNING,
+            launcher_pid=3215087,
+            claude_session_id='uuid-before',
+        ),
+        root=tmp_path,
+    )
+    hook_input = {
+        'session_id': 'uuid-nested',
+        'source': 'resume',
+        'cwd': '/home/leo/src/dark-factory',
+    }
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+
+    assert sh.hook_session_slug(hook_input, env, root=tmp_path, allow_remint=True) != slug
+    assert sh.hook_session_slug(hook_input, env, root=tmp_path) != slug
+
+
+@pytest.mark.parametrize('source', ['clear', 'compact'])
 def test_run_session_start_rebinds_on_an_owner_only_source(
     tmp_path: Path,
     source: str,
 ) -> None:
     # ... and the record is RE-bound to the new id, so the session stays
     # discriminable from a nested claude on every subsequent event.
-    slug = f'session-cockpit-321508{["clear", "resume", "compact"].index(source) + 1}'
+    slug = f'session-cockpit-321508{["clear", "compact"].index(source) + 1}'
     sr.write_record(
         sr.SessionRecord(
             session_slug=slug,
@@ -1211,6 +1237,39 @@ def test_run_session_start_startup_source_with_mismatched_id_still_forks(
     sh.run_session_start(hook_input, env, root=tmp_path)
 
     assert sr.read_record(slug, root=tmp_path).claude_session_id == 'uuid-parent'
+    assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 2
+
+
+def test_run_session_start_resume_source_with_mismatched_id_still_forks(
+    tmp_path: Path,
+) -> None:
+    # `resume` is NOT owner-only -- `--resume`/`--continue` make a brand-new
+    # process report it, so a nested `claude -c -p ...` would otherwise
+    # rebind the spawner's record to itself. It is deliberately excluded from
+    # _OWNER_ONLY_SESSION_START_SOURCES; a spawned session /resume'd in place
+    # simply forks, which is the fail-safe direction.
+    slug = 'session-cockpit-3215086'
+    sr.write_record(
+        sr.SessionRecord(
+            session_slug=slug,
+            status=sr.Status.RUNNING,
+            launcher_pid=3215086,
+            claude_session_id='uuid-parent',
+        ),
+        root=tmp_path,
+    )
+    hook_input = {
+        'session_id': 'uuid-nested',
+        'source': 'resume',
+        'cwd': '/home/leo/src/dark-factory',
+    }
+    env = {'CLAUDE_SPAWN_SESSION_ID': slug}
+
+    sh.run_session_start(hook_input, env, root=tmp_path)
+
+    parent = sr.read_record(slug, root=tmp_path)
+    assert parent.claude_session_id == 'uuid-parent'
+    assert parent.status == sr.Status.RUNNING
     assert len(list(sr.sessions_dir(root=tmp_path).iterdir())) == 2
 
 
