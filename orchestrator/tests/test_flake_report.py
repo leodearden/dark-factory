@@ -34,6 +34,7 @@ from orchestrator.flake_report import (
     _parse_stamp,
     build_chains,
     build_report,
+    render_report,
     compute_gate_blind,
     compute_non_convergence,
     compute_systemic,
@@ -652,3 +653,39 @@ class TestReadOnlyContract:
         assert report.db_present is True
         assert len(report.open_debt) == 1
         assert report.gate_blind.total == 1
+
+
+class TestTruncationHonesty:
+    """A limit-capped read must not silently yield a rate over an unknown window."""
+
+    def _seed_n(self, tmp_path: Path, n: int) -> Path:
+        db_path = tmp_path / 'runs.db'
+        ensure_schema(db_path)
+        for i in range(n):
+            _seed_occurrence(db_path, test_id=f'tests/test_{i}.py::test_x',
+                             observed_at=f'2026-08-09T12:00:{i:02d}+00:00')
+        return db_path
+
+    def test_a_filled_limit_marks_the_counter_truncated(self, tmp_path):
+        db_path = self._seed_n(tmp_path, 10)
+        report = build_report(db_path, now=_NOW, occurrence_limit=5)
+        assert report.gate_blind.truncated is True
+
+    def test_a_limit_above_the_row_count_is_not_truncated(self, tmp_path):
+        db_path = self._seed_n(tmp_path, 10)
+        report = build_report(db_path, now=_NOW, occurrence_limit=500)
+        assert report.gate_blind.truncated is False
+
+    def test_the_render_caveats_a_truncated_window(self, tmp_path):
+        # α's read_occurrences docstring: "a count over a limit-capped read is a count
+        # over an unknown window, and dividing by it is meaningless".  A silently-wrong
+        # rate is worse than a caveated one, so the caveat must reach the operator.
+        db_path = self._seed_n(tmp_path, 10)
+        rendered = render_report(build_report(db_path, now=_NOW, occurrence_limit=5))
+        assert 'partial' in rendered.lower(), rendered
+        assert 'truncated' in rendered.lower(), rendered
+
+    def test_an_untruncated_render_carries_no_caveat(self, tmp_path):
+        db_path = self._seed_n(tmp_path, 10)
+        rendered = render_report(build_report(db_path, now=_NOW, occurrence_limit=500))
+        assert 'truncated' not in rendered.lower(), rendered
