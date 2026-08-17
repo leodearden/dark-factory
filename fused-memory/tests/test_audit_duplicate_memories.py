@@ -4596,9 +4596,56 @@ class TestRunWiring:
         assert f'near_duplicate_clusters.{_PK}' in ids
         for key in (*_ANN_DISCLOSURE_KEYS, *_PLAN_DISCLOSURE_KEYS,
                     'ann_query_errors', 'ann_disabled_uncalibrated',
-                    'ann_pooled_fallback_categories'):
+                    'ann_pooled_fallback_categories', 'apply_withheld_clusters'):
             assert f'{key}.{_GLOBAL_SCOPE}' in ids, f'{key} must be disclosed'
         assert f'scan_truncated.{_PK}' in ids
+
+    async def test_the_apply_withheld_gate_becomes_a_metric_series(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        """A cluster the apply gate withholds must be alarmable, not reported only.
+
+        The plan JSON already carries ``apply_withheld_clusters``, but the plan
+        is not the artifact the eval programme reads — only the metrics series
+        is. Without this metric, a growing share of ``--apply`` coverage
+        silently withheld by the evidence gate would be un-alarmable recall
+        loss.
+        """
+        from shared.memory_eval_metrics import (  # noqa: PLC0415
+            RUN_STAMP_ENV_VAR,
+            load_metric_series,
+        )
+
+        monkeypatch.setenv(RUN_STAMP_ENV_VAR, _STAMP)
+        raw = {_OS: [
+            _raw('m1', 'alpha one', '2026-01-01T00:00:00+00:00', category=_OS,
+                 vector=[1.0, 0.0]),
+            _raw('m2', 'beta two', '2026-01-02T00:00:00+00:00', category=_OS,
+                 vector=[0.0, 1.0]),
+        ]}
+        ann_hits = {(1.0, 0.0): [('m2', 0.95)], (0.0, 1.0): [('m1', 0.95)]}
+        _install_run_doubles(
+            monkeypatch, raw, ann_hits=ann_hits, t_high_by_category={_PK: 0.9},
+        )
+
+        rc = await _run(await self._parse(tmp_path, '--threshold', '0.99'))
+        plan = json.loads(capsys.readouterr().out)
+
+        assert rc == 0, 'a dry run (no --apply) returns cleanly'
+        assert plan['apply_withheld_clusters'] == 1, (
+            'observations_and_summaries has no cutoff of its own, so this '
+            'clique runs on the pooled fallback and is withheld'
+        )
+
+        series = load_metric_series(tmp_path / _EVAL_ID / f'metrics-{_STAMP}.json')
+        by_id = _by_id(series.metrics)
+        metric_id = f'apply_withheld_clusters.{_GLOBAL_SCOPE}'
+        assert metric_id in by_id, 'the gate must be alarmable, not just reported'
+
+        metric = by_id[metric_id]
+        assert metric.value == 1.0
+        assert metric.kind == 'count'
+        assert metric.direction == 'higher_is_worse'
 
     async def test_no_metrics_writes_nothing(self, monkeypatch, tmp_path):
         _install_run_doubles(monkeypatch, {_PK: [_raw('m1', 'x')]})

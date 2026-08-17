@@ -107,7 +107,9 @@ sub-graph is a CLIQUE. Otherwise a member could be in the cluster purely by
 transitivity — A~B and B~C above the cutoff while A~C is far below it — and
 under ``--apply`` every non-survivor of that chain is an irreversible delete.
 Withheld clusters are reported (``apply_withheld_groups``), never silently
-dropped. See ``restrict_delete_candidates_for_apply``.
+dropped, and their count is also a metric series
+(``apply_withheld_clusters``) so recall loss from the gate is alarmable, not
+just visible in the plan JSON. See ``restrict_delete_candidates_for_apply``.
 
 Scope: all three Mem0 categories (``procedural_knowledge``,
 ``preferences_and_norms``, ``observations_and_summaries``). Clustering runs
@@ -2812,6 +2814,18 @@ async def _run(args: argparse.Namespace) -> int:
                         c: int(scan_stats.get(c, {}).get('truncated', 0))
                         for c in categories
                     },
+                    # Run-global: the apply gate is one pass over the whole
+                    # plan, not a per-category decision — per-category detail
+                    # for drill-down stays available in
+                    # plan['apply_withheld_groups']. Must be a series because
+                    # the plan JSON carries the number but the plan is not the
+                    # artifact the eval programme reads; without this, a
+                    # growing share of clusters withheld from --apply would be
+                    # un-alarmable recall loss. Direct subscript (not .get):
+                    # build_sweep_plan returns this key unconditionally, and a
+                    # defaulted read would silently emit a fabricated 0.0 if a
+                    # future refactor ever dropped it.
+                    'apply_withheld_clusters': plan['apply_withheld_clusters'],
                 },
                 details_path=details_artifact_path(stamp),
             )
