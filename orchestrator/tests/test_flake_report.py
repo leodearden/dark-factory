@@ -832,7 +832,10 @@ class TestFlakeLedgerCommand:
 
         project = tmp_path / 'project'
         project.mkdir()
-        cfg = tmp_path / 'dark-factory-orchestrator.yaml'
+        # The config lives AT the project root — CLAUDE.md's canonical
+        # <project_root>/dark-factory-orchestrator.yaml layout, which is also what
+        # load_config resolves project_root from.
+        cfg = project / 'dark-factory-orchestrator.yaml'
         cfg.write_text(yaml.dump({'project_root': str(project)}))
         if seed:
             db_path = project / 'data' / 'orchestrator' / 'runs.db'
