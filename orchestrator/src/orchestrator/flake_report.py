@@ -540,3 +540,28 @@ def build_report(
             window_minutes=systemic_window_minutes,
         ),
     )
+
+
+# --- rendering ---------------------------------------------------------------
+
+
+def render_report(report: FlakeLedgerReport) -> str:
+    """Render *report* as text.
+
+    Pure and byte-deterministic — the same :class:`FlakeLedgerReport` always renders
+    identically (fixed section order, every section rendered even when empty, no
+    wall-clock or dict-iteration-order dependence), following
+    ``format_stratification_table``'s determinism property.  No ``click`` import: this
+    returns a string and the CLI only echoes it.
+    """
+    lines: list[str] = [f'flake ledger: {report.db_path}']
+    if report.gate_blind.truncated:
+        # α's read_occurrences docstring: a count over a limit-capped read is a count
+        # over an unknown window, and dividing by it is meaningless.  The counters are
+        # still printed — a bounded read is better than an unbounded one — but they are
+        # labelled so an operator cannot mistake them for a full-window measurement.
+        lines.append(
+            '  WARNING: the occurrence read was TRUNCATED at its limit — the counters '
+            'below cover a PARTIAL window, not the full one.'
+        )
+    return '\n'.join(lines)

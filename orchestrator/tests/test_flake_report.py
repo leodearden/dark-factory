@@ -682,10 +682,15 @@ class TestTruncationHonesty:
         # rate is worse than a caveated one, so the caveat must reach the operator.
         db_path = self._seed_n(tmp_path, 10)
         rendered = render_report(build_report(db_path, now=_NOW, occurrence_limit=5))
-        assert 'partial' in rendered.lower(), rendered
-        assert 'truncated' in rendered.lower(), rendered
+        caveats = [ln for ln in rendered.splitlines() if 'TRUNCATED' in ln]
+        assert caveats, rendered
+        assert 'PARTIAL' in caveats[0], caveats
 
     def test_an_untruncated_render_carries_no_caveat(self, tmp_path):
         db_path = self._seed_n(tmp_path, 10)
         rendered = render_report(build_report(db_path, now=_NOW, occurrence_limit=500))
-        assert 'truncated' not in rendered.lower(), rendered
+        # Scanned per-line and case-sensitively on purpose: the db_path printed in the
+        # header sits under pytest's tmp_path, whose directory name embeds this test's
+        # own name — a bare `'truncated' not in rendered.lower()` matches the word
+        # "untruncated" in that path and fails against a perfectly correct render.
+        assert not [ln for ln in rendered.splitlines() if 'TRUNCATED' in ln], rendered
