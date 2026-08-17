@@ -128,6 +128,29 @@ def test_mock_gate_defaults_include_release_probe_slot():
     )
 
 
+async def test_mock_gate_auth_failed_reason_mirrors_production():
+    """The SHIPPED mock-gate double must not drift from production on the
+    AuthFailed arm (task 4042).
+
+    ``make_gate_mock``'s ``_slot_report`` is a mirror of production
+    ``InvokeSlot.report``, and its own docstring requires it byte-for-byte in
+    step. Once production renders the reason via ``auth_failure_reason``, a
+    hand-built ``f'HTTP {status}'`` here would make every downstream consumer
+    of the double assert against a reason shape production no longer emits.
+    """
+    gate = _mock_gate()
+    async with gate.invoke_slot() as slot:
+        slot.report(AuthFailed(status=401, body='OAuth token has been revoked'))
+    assert gate._handle_auth_failure.call_args.args[0] == (
+        'HTTP 401: OAuth token has been revoked'
+    )
+
+    bodiless = _mock_gate()
+    async with bodiless.invoke_slot() as slot:
+        slot.report(AuthFailed(status=401))
+    assert bodiless._handle_auth_failure.call_args.args[0] == 'HTTP 401'
+
+
 # ---------------------------------------------------------------------------
 # Probe-release fidelity: production InvokeSlot vs. the MagicMock double
 # ---------------------------------------------------------------------------
