@@ -363,3 +363,106 @@ class TestWorkingRegimeExtensionPollOffLoop:
             f'the shared loop for every agent, for its entire working lifetime. '
             f'Recorded idents: {sorted(set(recorded))}'
         )
+
+
+class TestTimeoutPathRereadOffLoop:
+    """The one-shot post-kill re-read (``cli_invoke.py:2970``, inside the
+    ``except TimeoutError:`` handler) must read off the loop.
+
+    This read stamps ``transcript_turns`` onto the returned ``_SubprocessResult``,
+    which ``classify_agent_failure`` surfaces in its ``diagnostic_detail`` — so
+    the value must still arrive intact across the thread hop, not just off-loop.
+    """
+
+    async def test_timeout_path_transcript_reread_runs_off_the_loop_thread(self, tmp_path):
+        """The post-kill re-read runs on a worker thread, and its value still lands.
+
+        The fake returns a fixed sentinel 7 on every call.  7 >= 1 latches
+        ``seen_turn`` on the first poll, so the run is killed by the flat
+        ``timeout_seconds`` ceiling rather than the startup-wedge branch — either
+        route reaches the same ``except TimeoutError:`` handler and its re-read.
+
+        Because the extension params are NOT passed, ``extension_engaged`` stays
+        False and no further poll reads happen after the latch: ``recorded`` is
+        the (off-loop, post-step-2) latching poll plus the handler's re-read, so
+        any loop-thread ident in it can only have come from the handler.
+        """
+        loop_ident = threading.get_ident()
+        sid = str(uuid.uuid4())
+        cfg_dir = tmp_path / 'cfg'
+        cfg_dir.mkdir()
+
+        proc, _ = _make_hanging_proc()
+        recorded: list[int] = []
+
+        with (
+            patch(
+                'shared.cli_invoke.asyncio.create_subprocess_exec',
+                side_effect=_fake_exec_returning(proc),
+            ),
+            patch('shared.cli_invoke.terminate_process_group', AsyncMock()),
+            patch(
+                'shared.cli_invoke.count_transcript_turns',
+                side_effect=_ident_recorder(recorded, 7),
+            ),
+            patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.05),
+        ):
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus',
+                timeout_seconds=0.4, startup_grace_secs=0.05,
+                session_id=sid, config_dir=cfg_dir,
+            )
+
+        assert result.timed_out is True, 'Expected the ceiling kill to fire'
+        assert result.transcript_turns == 7, (
+            f'The one-shot re-read must still execute and its value still reach the '
+            f'_SubprocessResult stamp across the thread hop; got '
+            f'transcript_turns={result.transcript_turns}'
+        )
+        assert loop_ident not in recorded, (
+            f'count_transcript_turns ran on the event-loop thread ({loop_ident}) — the '
+            f'post-kill re-read at cli_invoke.py:2970 blocks the shared loop. '
+            f'Recorded idents: {sorted(set(recorded))}'
+        )
+
+    async def test_timeout_path_skips_read_when_session_id_missing(self, tmp_path):
+        """PRESERVATION GUARD (expected to pass before and after the change).
+
+        With ``session_id=None`` the ``if (config_dir and session_id)`` guard
+        short-circuits: no read happens at all, so no thread hop is paid when
+        there is nothing to read, and ``transcript_turns`` stays None.  Mirrors
+        ``test_run_subprocess_transcript_turns_none_when_no_session_id``
+        (test_cli_invoke.py:1842).
+        """
+        cfg_dir = tmp_path / 'cfg'
+        cfg_dir.mkdir()
+
+        proc, _ = _make_hanging_proc()
+        recorded: list[int] = []
+
+        with (
+            patch(
+                'shared.cli_invoke.asyncio.create_subprocess_exec',
+                side_effect=_fake_exec_returning(proc),
+            ),
+            patch('shared.cli_invoke.terminate_process_group', AsyncMock()),
+            patch(
+                'shared.cli_invoke.count_transcript_turns',
+                side_effect=_ident_recorder(recorded, 7),
+            ),
+            patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.05),
+        ):
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus',
+                timeout_seconds=0.4, startup_grace_secs=0.05,
+                session_id=None, config_dir=cfg_dir,
+            )
+
+        assert result.timed_out is True, 'Expected the ceiling kill to fire'
+        assert recorded == [], (
+            f'No transcript read may be attempted without a session_id — the guard '
+            f'must short-circuit before any to_thread hop. Recorded {len(recorded)} call(s).'
+        )
+        assert result.transcript_turns is None, (
+            f'Expected transcript_turns=None with no session_id, got {result.transcript_turns}'
+        )
