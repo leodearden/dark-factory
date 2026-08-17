@@ -1689,13 +1689,23 @@ class TestWorktreeMissingTolerance:
         worktree.mkdir()
         ta = TaskArtifacts(worktree)
         ta.init('task-z', 'present', 'desc')
-        # Root exists; make write_text raise PermissionError
+        # Root exists, so the FileNotFoundError tolerance in ``_write_json``
+        # must NOT engage and a genuine I/O failure must surface.
+        #
+        # The patch deliberately targets ``Path.mkdir`` — a seam BOTH write
+        # strategies traverse: the historical ``path.parent.mkdir(...)`` +
+        # ``path.write_text(...)`` pair, and the atomic
+        # ``safe_io.atomic_write_text(..., mkdir=True)`` delegation that
+        # replaced it (which calls ``p.parent.mkdir(parents=True,
+        # exist_ok=True)`` itself).  Do NOT re-narrow this to ``write_text``:
+        # the atomic writer writes through an ``os.fdopen`` handle and never
+        # calls it, so such a patch would stop exercising anything.
         import pathlib
 
         def _raise_permission(self, *args, **kwargs):
             raise PermissionError('denied')
 
-        monkeypatch.setattr(pathlib.Path, 'write_text', _raise_permission)
+        monkeypatch.setattr(pathlib.Path, 'mkdir', _raise_permission)
         with pytest.raises(PermissionError):
             ta.write_review('rev', {'verdict': 'PASS', 'issues': []})
 
