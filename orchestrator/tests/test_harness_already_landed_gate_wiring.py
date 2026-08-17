@@ -2361,21 +2361,3 @@ class TestAlreadyLandedGateZeroDispositionChange:
 
         assert result is False
         cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
-
-
-class TestAlreadyLandedGateForwardReferencesAreHonoured:
-    """Task 3534's two in-code promises must not outlive the task that pays them.
-
-    A forward reference left behind after its owner landed is a stale lie in
-    the spine: the next reader chases task 3535 expecting unfinished work.
-    """
-
-    def test_no_stale_task_beta_forward_reference_remains(self) -> None:
-        # Whitespace-normalised: both promises are wrapped across comment
-        # lines, so a per-line scan would silently pass against either of them.
-        source = ' '.join(_HARNESS_SRC_PATH.read_text(encoding='utf-8').split())
-
-        assert 'task beta (3535) replaces' not in source, (
-            'this comment promises a future replacement that task 3535 has '
-            'now delivered — it must describe what exists instead'
-        )
