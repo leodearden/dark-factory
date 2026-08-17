@@ -1061,6 +1061,92 @@ class TestDataclassDoubleMessage:
             )
 
 
+_RULE_B_SOURCE = "bare = MagicMock(passed=False, summary='x')\n"
+_RULE_A_SOURCE = 'config = MagicMock()\n'
+
+
+class TestDataclassDoubleExemption:
+    """Rule B honours its OWN noqa code, on the preceding non-blank line, with a reason.
+
+    The two rules deliberately do NOT share a suppression code: their remedies are
+    unrelated, so a pragma written for one is never informed consent for the other.
+    """
+
+    def test_em_dash_exemption_suppresses_rule_b(self):
+        """# noqa: bare-dataclass-double — reason above the call → 0 violations."""
+        source = '# noqa: bare-dataclass-double — deliberate mutation leg\n' + _RULE_B_SOURCE
+        assert find_violations(source, 'test_b_exempt.py') == []
+
+    def test_ascii_hyphen_exemption_suppresses_rule_b(self):
+        """ASCII-hyphen separator is accepted, same as Rule A."""
+        source = '# noqa: bare-dataclass-double - deliberate mutation leg\n' + _RULE_B_SOURCE
+        assert find_violations(source, 'test_b_exempt_hyphen.py') == []
+
+    def test_exemption_tolerates_intervening_blank_lines(self):
+        """Blank lines between the pragma and the call are tolerated."""
+        source = (
+            '# noqa: bare-dataclass-double — deliberate mutation leg\n\n    \n' + _RULE_B_SOURCE
+        )
+        assert find_violations(source, 'test_b_exempt_blank.py') == []
+
+    def test_no_exemption_without_a_reason(self):
+        """# noqa: bare-dataclass-double with no reason after the separator → still flagged."""
+        for header in (
+            '# noqa: bare-dataclass-double\n',
+            '# noqa: bare-dataclass-double —\n',
+        ):
+            violations = find_violations(header + _RULE_B_SOURCE, 'test_b_no_reason.py')
+            assert len(violations) == 1, (
+                f'a reasonless pragma must NOT suppress Rule B; header={header!r} '
+                f'gave {violations}'
+            )
+
+    def test_intervening_code_line_breaks_the_exemption(self):
+        """A non-blank, non-matching line between pragma and call breaks the exemption."""
+        source = (
+            '# noqa: bare-dataclass-double — a reason\nsome_code = 42\n' + _RULE_B_SOURCE
+        )
+        assert len(find_violations(source, 'test_b_broken.py')) == 1
+
+    def test_inline_trailing_exemption_is_not_honored(self):
+        """Inline trailing placement is not honored for Rule B either."""
+        source = (
+            "bare = MagicMock(passed=False, summary='x')"
+            '  # noqa: bare-dataclass-double — inline\n'
+        )
+        assert len(find_violations(source, 'test_b_inline.py')) == 1, (
+            'only the nearest PRECEDING non-blank line is consulted, for both rules'
+        )
+
+    def test_rule_a_code_does_not_suppress_rule_b(self):
+        """CROSS-RULE ISOLATION: # noqa: bare-magicmock must NOT suppress a Rule B violation.
+
+        Otherwise a pragma written years ago for a config assignment would silently
+        exempt a VerifyResult-shaped double that later lands on the following line.
+        """
+        source = '# noqa: bare-magicmock — legacy config exemption\n' + _RULE_B_SOURCE
+        violations = find_violations(source, 'test_cross_a_to_b.py')
+        assert len(violations) == 1, (
+            "Rule A's noqa code must not suppress Rule B — the remedies are unrelated, "
+            f'so it is not informed consent; got {violations}'
+        )
+
+    def test_rule_b_code_does_not_suppress_rule_a(self):
+        """CROSS-RULE ISOLATION, the other direction: bare-dataclass-double ⊅ bare-magicmock."""
+        source = '# noqa: bare-dataclass-double — a reason\n' + _RULE_A_SOURCE
+        violations = find_violations(source, 'test_cross_b_to_a.py')
+        assert len(violations) == 1, (
+            f"Rule B's noqa code must not suppress a Rule A violation; got {violations}"
+        )
+
+    def test_rule_a_exemption_still_works_unchanged(self):
+        """Regression pin: parameterising _is_exempted did not change Rule A's behaviour."""
+        source = '# noqa: bare-magicmock — needed for legacy fixture migration\n' + _RULE_A_SOURCE
+        assert find_violations(source, 'test_a_still_exempt.py') == [], (
+            "Rule A's own exemption must remain bit-identical after parameterisation"
+        )
+
+
 class TestFusedMemoryTestsDirectoryClean:
     """Regression guard: fused-memory/tests must have zero bare MagicMock() config sites.
 
