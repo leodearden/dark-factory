@@ -187,14 +187,18 @@ class TestWriteHeartbeat:
         assert result == tmp_path / 'orchestrator-reify.service.json'
 
 
-class TestEmptyUnitIsRefused:
-    """An empty ``ORCH_UNIT`` must never produce a heartbeat file (task 3951).
+class TestMalformedUnitIsRefused:
+    """A malformed unit name must never produce a heartbeat file (task 3951).
 
     The unit-level half of one behaviour; the producer-level half is
     ``test_harness_merge_heartbeat.py``'s ``test_empty_unit_writes_nothing_and_
     is_logged_not_raised``.
 
-    This replaces the former ``unknown-unit.json`` fallback, which was written
+    ONE RULE, TWO REJECTIONS.  The unit name is the heartbeat's identity AND is
+    interpolated straight into the destination path, so it must be a non-blank,
+    single path component:
+
+    BLANK replaces the former ``unknown-unit.json`` fallback, which was written
     to make an unresolved unit produce a deterministic filename rather than a
     file literally named ``.json``.  That trade was wrong in the direction it
     chose: nothing READS ``unknown-unit.json`` (``scripts/drain_check.py``
@@ -204,24 +208,43 @@ class TestEmptyUnitIsRefused:
     misconfiguration — into a plausible-looking file in a machine-global,
     cross-project directory.  Raising makes the next unnamed writer loud at the
     moment it appears.
+
+    NOT-A-BARE-FILENAME is the same defect class one degree worse: the value
+    reaches this function from the ambient environment (measured during this
+    task as inherited, and sometimes wrong), and a ``..`` component or an
+    absolute path does not merely mislabel a file inside the fleet dir — it
+    writes clean outside it.
+
+    Matched on ``unit name``, deliberately NOT on ``ORCH_UNIT``:
+    ``write_heartbeat`` never reads that variable (its caller does), and this
+    module is the shared on-disk contract for future producers that may resolve
+    their unit from config instead.
+
+    Every case asserts the fleet dir was never CREATED, not merely left empty —
+    the guard has to run before ``safe_io.atomic_write_text(..., mkdir=True)``,
+    and directory-absence is the one assertion that catches a guard which moved
+    after it.  It also subsumes the final name, the retired
+    ``unknown-unit.json``, and any ``.json.tmp`` residue from a partial write.
     """
 
-    def test_empty_unit_raises_and_writes_nothing(self, tmp_path):
-        """unit='' raises ValueError naming ORCH_UNIT, and creates NO file."""
-        payload = build_heartbeat_payload(
-            unit='',
+    @staticmethod
+    def _payload(unit: str):
+        return build_heartbeat_payload(
+            unit=unit,
             merge_idle=True,
             depth=0,
             queue_empty=True,
             ts_epoch=555.0,
         )
 
-        with pytest.raises(ValueError, match='ORCH_UNIT'):
-            write_heartbeat(tmp_path, '', payload)
+    def test_empty_unit_raises_and_writes_nothing(self, tmp_path):
+        """unit='' raises ValueError naming the unit name, and creates NO file."""
+        fleet_dir = tmp_path / 'fleet'
 
-        # The assertion that actually pins "no corruption": it covers the final
-        # name, the retired unknown-unit.json, AND any .json.tmp residue from a
-        # partial write — so the guard must run BEFORE any filesystem work.
+        with pytest.raises(ValueError, match='unit name'):
+            write_heartbeat(fleet_dir, '', self._payload(''))
+
+        assert not fleet_dir.exists()
         assert list(tmp_path.iterdir()) == []
 
     def test_whitespace_only_unit_raises_and_writes_nothing(self, tmp_path):
@@ -234,17 +257,46 @@ class TestEmptyUnitIsRefused:
         repairing it into a plausible name is the silent-degradation this guard
         exists to end; the caller learns its unit name is malformed instead.
         """
-        payload = build_heartbeat_payload(
-            unit='   ',
-            merge_idle=True,
-            depth=0,
-            queue_empty=True,
-            ts_epoch=666.0,
-        )
+        fleet_dir = tmp_path / 'fleet'
 
-        with pytest.raises(ValueError, match='ORCH_UNIT'):
-            write_heartbeat(tmp_path, '   ', payload)
+        with pytest.raises(ValueError, match='unit name'):
+            write_heartbeat(fleet_dir, '   ', self._payload('   '))
 
+        assert not fleet_dir.exists()
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.parametrize(
+        'unit',
+        [
+            'a/b',
+            '../escaped',
+            '../../tmp/x',
+            '/abs/unit',
+            '.',
+            '..',
+        ],
+    )
+    def test_unit_that_is_not_a_bare_filename_raises_and_writes_nothing(
+        self, tmp_path, unit
+    ):
+        """A separator, a traversal or an absolute unit escapes the fleet dir.
+
+        ``fleet_dir / f'{unit}.json'`` is plain interpolation, VERIFIED:
+        ``'../escaped'`` lands one level ABOVE the fleet dir and ``'/abs/unit'``
+        discards *fleet_dir* entirely, yielding ``/abs/unit.json``
+        (``Path.__truediv__`` with an absolute right operand).  ``'.'``/``'..'``
+        are the degenerate spellings caught by the same rule — both have an
+        empty ``Path.name`` — and would write the hidden, unattributable
+        ``<fleet_dir>/..json`` / ``<fleet_dir>/...json``.
+        """
+        fleet_dir = tmp_path / 'fleet'
+
+        with pytest.raises(ValueError, match='unit name'):
+            write_heartbeat(fleet_dir, unit, self._payload(unit))
+
+        assert not fleet_dir.exists()
+        # Covers the sibling-escape target too: '../escaped' would have landed
+        # at tmp_path/'escaped.json', outside fleet_dir but inside tmp_path.
         assert list(tmp_path.iterdir()) == []
 
 

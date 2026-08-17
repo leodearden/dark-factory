@@ -77,17 +77,38 @@ def write_heartbeat(fleet_dir: Path, unit: str, payload: Mapping[str, Any]) -> P
     creates missing parent directories and does the tmp + ``os.replace`` dance
     so concurrent readers (γ, ε) never observe a partial write.
 
-    An empty or whitespace-only ``unit`` raises :class:`ValueError` BEFORE any
-    filesystem work, so a writer that reached this point without a real unit
-    name creates nothing at all (task 3951).  It used to fall back to a
-    deterministic ``unknown-unit.json``; nothing ever read that file
-    (``scripts/drain_check.py`` addresses heartbeats by name via
-    ``heartbeat_path(fleet_dir, unit)`` and never enumerates the directory), so
-    the fallback bought no consumer anything while turning a real
-    misconfiguration into a plausible-looking file in a machine-global,
-    cross-project directory.  A whitespace-only unit is REJECTED, never
-    ``.strip()``ed into a "fixed" name: silently repairing a malformed unit name
-    is the same silent corruption this guard exists to end.
+    ``unit`` must be a non-blank, single path component: it is the heartbeat's
+    identity, its only link back to the writer, and it is interpolated straight
+    into the destination path.  Anything else raises :class:`ValueError` BEFORE
+    any filesystem work, so a writer that reached this point without a usable
+    unit name creates nothing at all — not even the parent directory (task
+    3951).  Two rejections, one rule:
+
+    * BLANK (empty or whitespace-only).  This used to fall back to a
+      deterministic ``unknown-unit.json``; nothing ever read that file
+      (``scripts/drain_check.py`` addresses heartbeats by name via
+      ``heartbeat_path(fleet_dir, unit)`` and never enumerates the directory),
+      so the fallback bought no consumer anything while turning a real
+      misconfiguration into a plausible-looking file in a machine-global,
+      cross-project directory.  A whitespace-only unit is REJECTED, never
+      ``.strip()``ed into a "fixed" name: silently repairing a malformed unit
+      name is the same silent corruption this guard exists to end.
+    * NOT A BARE FILENAME (contains a separator, or is ``.``/``..``).  The same
+      defect one degree worse.  ``fleet_dir / f'{unit}.json'`` is plain
+      interpolation, so a ``..`` component walks out of the fleet directory and
+      an ABSOLUTE unit discards *fleet_dir* altogether (``Path.__truediv__``
+      keeps only the absolute right operand): a unit of ``/abs/unit`` writes
+      ``/abs/unit.json``.  Unit names arrive from the ambient environment, so
+      this is reachable by misconfiguration, not just by malice.  Rejecting
+      makes the returned path provably inside *fleet_dir*.
+
+    Both messages are CALLER-NEUTRAL, and deliberately name no environment
+    variable.  This module is the shared on-disk contract for every producer
+    and reader (γ drain gate, ε ``--report``), and is kept dependency-free of
+    ``Harness``; HOW a caller resolves its unit — ``ORCH_UNIT`` today, config or
+    argv for the next producer — is the caller's business, so a hardcoded
+    "set ORCH_UNIT" hint would point a future producer at the wrong knob.  The
+    caller-specific remediation belongs at the call site's own log line.
 
     ``mode`` is deliberately left at the helper's umask default rather than
     narrowed: these heartbeats are read by other processes. Exceptions
@@ -102,12 +123,26 @@ def write_heartbeat(fleet_dir: Path, unit: str, payload: Mapping[str, Any]) -> P
     fleet_dir = Path(fleet_dir)
     if not unit or not unit.strip():
         raise ValueError(
-            f'refusing to write a heartbeat with no unit name (unit={unit!r}) '
-            f'into {fleet_dir}. ORCH_UNIT is unset or blank in the process '
-            'calling Harness._write_merge_heartbeat; set it to this '
-            'orchestrator\'s systemd unit (e.g. orchestrator-dark-factory.service). '
-            'Writing anyway would put an unattributable file in a '
+            f'refusing to write a heartbeat with a blank unit name (unit={unit!r}) '
+            f'into {fleet_dir}. The unit name is the heartbeat\'s identity and its '
+            'only link back to the writer, so the caller must resolve a real, '
+            'non-blank one (e.g. "orchestrator-dark-factory.service") before '
+            'calling. Writing anyway would put an unattributable file in a '
             'machine-global, cross-project fleet directory.'
+        )
+    is_bare_component = (
+        unit not in {os.curdir, os.pardir}
+        and unit == Path(unit).name
+        and (os.altsep is None or os.altsep not in unit)
+    )
+    if not is_bare_component:
+        raise ValueError(
+            f'refusing to write a heartbeat with a unit name that is not a single '
+            f'path component (unit={unit!r}) into {fleet_dir}. The name is '
+            'interpolated straight into <fleet_dir>/<unit>.json, so a separator, a '
+            '".." traversal or an absolute path escapes the fleet directory and '
+            'writes an arbitrary file. The caller must resolve a bare unit name '
+            '(e.g. "orchestrator-dark-factory.service") before calling.'
         )
     path = fleet_dir / f'{unit}.json'
     safe_io.atomic_write_text(
