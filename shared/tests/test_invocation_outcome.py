@@ -358,6 +358,7 @@ class TestClassifyInvocationAuthFailedPrecedence:
         assert len(body) <= 120  # guards the assertion below against truncation
         result = AgentResult(success=False, output=body, api_error_status=401)
         outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
         assert outcome.body == body
 
     def test_403_captures_output_body(self):
@@ -368,6 +369,7 @@ class TestClassifyInvocationAuthFailedPrecedence:
         assert len(body) <= 120
         result = AgentResult(success=False, output=body, api_error_status=403)
         outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
         assert outcome.body == body
 
     def test_body_falls_back_to_stderr_when_output_empty(self):
@@ -378,6 +380,7 @@ class TestClassifyInvocationAuthFailedPrecedence:
             stderr='Error: invalid bearer token',
         )
         outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
         assert outcome.body == 'Error: invalid bearer token'
 
     def test_output_wins_over_stderr_when_both_present(self):
@@ -388,11 +391,13 @@ class TestClassifyInvocationAuthFailedPrecedence:
             stderr='Error: invalid bearer token',
         )
         outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
         assert outcome.body == 'invalid x-api-key'
 
     def test_body_truncated_to_120_chars(self):
         result = AgentResult(success=False, output='x' * 500, api_error_status=401)
         outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
         assert len(outcome.body) == 120
         assert outcome.body == 'x' * 120
 
@@ -400,6 +405,7 @@ class TestClassifyInvocationAuthFailedPrecedence:
         # This is what keeps the bare-equality assertions above valid.
         result = AgentResult(success=False, output='', api_error_status=401)
         outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
         assert outcome.body == ''
         assert outcome == AuthFailed(status=401)
 
@@ -408,6 +414,7 @@ class TestClassifyInvocationAuthFailedPrecedence:
         # the persisted cost-event reason.
         result = AgentResult(success=False, output='\n  Unauthorized  \n', api_error_status=401)
         outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
         assert outcome.body == 'Unauthorized'
 
 

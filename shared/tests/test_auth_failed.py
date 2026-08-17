@@ -20,7 +20,7 @@ import pytest
 
 from shared.cli_invoke import AgentResult
 from shared.config_models import AccountConfig, UsageCapConfig
-from shared.invocation_outcome import auth_failure_reason, classify_invocation
+from shared.invocation_outcome import AuthFailed, auth_failure_reason, classify_invocation
 from shared.usage_gate import AccountState, UsageGate
 
 
@@ -258,6 +258,7 @@ class TestAuthFailedPersistsResetsAt:
             api_error_status=401,
         )
         outcome = classify_invocation(result, strict_confirm=True)
+        assert isinstance(outcome, AuthFailed)
         gate._handle_auth_failure(auth_failure_reason(outcome), oauth_token='fake-token-a')
         _, _, details_json = captured[0]
         details = json.loads(details_json)
