@@ -355,6 +355,33 @@ class TestConfiguredMaxTokensReachesEveryArm:
         assert type(client) is _expected_client_class(arm)
         assert client.max_tokens == MAX_TOKENS_SENTINEL
 
+    @pytest.mark.parametrize('arm', MAX_TOKENS_ARMS)
+    def test_construction_log_names_the_effective_max_tokens(
+        self, mock_config, monkeypatch, caplog, arm,
+    ):
+        """The effective value must be observable in the startup log.
+
+        Task 3864 changed the wire request of every existing shipped-config
+        deployment on the default arm (16384 -> the configured value) with no
+        error, no config edit and nothing else on the operator's side. Under
+        this repo's loud-over-silent posture a silent wire change needs an
+        observable record, and the cheapest correct one is the line that already
+        runs at exactly this seam and already names provider/model/client class.
+
+        Asserts only that some INFO record carries the substring ``max_tokens``
+        and the VALUE — not an exact sentence — so the message stays rewordable.
+        """
+        _configure_arm(mock_config, arm, monkeypatch)
+        mock_config.llm.max_tokens = MAX_TOKENS_SENTINEL
+
+        with caplog.at_level(logging.INFO, logger=graphiti_client_module.__name__):
+            build_llm_client(mock_config)
+
+        infos = [r.message for r in caplog.records if r.levelno == logging.INFO]
+        assert any(
+            'max_tokens' in m and str(MAX_TOKENS_SENTINEL) in m for m in infos
+        ), f'no INFO record named the effective max_tokens; got {infos}'
+
 
 class _Inner(BaseModel):
     """Nested submodel — its presence is what makes model_json_schema() emit
