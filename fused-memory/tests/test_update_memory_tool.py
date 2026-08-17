@@ -435,3 +435,148 @@ class TestEnvelopeMetadataStaysDistinct:
             'let a record key silently steer the event graph'
         )
         assert kwargs.get('metadata_patch') == {'topic': 'x', '_causation_id': 'planted'}
+
+
+class TestVocabularyRejectionIsNeverSwallowed:
+    """(j) A vocabulary rejection from the SERVICE seam must reach the caller as
+    a rejection — never as a `{'status': 'updated'}` success envelope.
+
+    Task 3523 routes `update_memory`'s metadata patch through
+    `_apply_memory_metadata_validation`, so this tool grew a second rejection
+    CLASS the caller can see: alongside the `ValidationError` envelopes every
+    other class here pins (argument shape, decided before dispatch), a
+    well-formed argument set can now be turned away by the seam AFTER dispatch.
+    These are a regression lock, not a RED — they pass on the tool code as
+    written and exist so a later change cannot quietly re-route either
+    rejection into a success envelope.
+
+    MEASURED, not assumed — and NOT what task 3523's plan predicted. The plan
+    expected both exceptions to PROPAGATE out of the tool call. They do not:
+    `update_memory` carries `@mcp_tool_errors()`, whose blanket
+    `except Exception` converts any exception into
+    `{'error': str(e), 'error_type': type(e).__name__}`. The plan's actual
+    requirement is still met, and by a stronger mechanism than it assumed —
+    `add_memory` and `add_system_record` carry the SAME decorator, so all three
+    write paths surface a seam rejection identically. There is no asymmetry
+    between the add and update paths to close; see
+    `test_all_three_write_paths_share_the_error_convention`.
+
+    What that makes load-bearing is the `error_type` FIELD. PRD V1 requires the
+    two rejection contracts to stay distinguishable ("your metadata is
+    malformed" vs "it is well-formed but collides with live state"), and at
+    this layer `type(e).__name__` is the whole of that distinction — a caller
+    cannot `except` an envelope. Collapsing either class into a shared
+    'ValidationError' string, or letting one inherit from the other, would
+    erase it while every assertion about *rejecting* still passed.
+    """
+
+    @staticmethod
+    def _violation():
+        from fused_memory.memory_metadata import MetadataViolation
+
+        return MetadataViolation(
+            key='topic',
+            code='topic_not_slug',
+            message="topic 'Not A Slug' is not a lowercase-hyphen slug",
+            fatal=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_malformed_metadata_rejection_is_not_a_success_envelope(self):
+        """A seam rejection must not be reported as an applied write."""
+        from fused_memory.memory_metadata import MemoryMetadataValidationError
+
+        mock_service = _mock_service()
+        mock_service.update_memory.side_effect = MemoryMetadataValidationError(
+            [self._violation()]
+        )
+
+        result = await _call_tool(mock_service, metadata_patch={'topic': 'Not A Slug'})
+
+        assert result.get('status') != 'updated', (
+            'a rejected patch reported as updated is the exact failure this tool '
+            f'is built to make impossible; got {result!r}'
+        )
+        assert result.get('error_type') == 'MemoryMetadataValidationError', result
+        # The service WAS reached: this is a post-dispatch rejection, so it
+        # cannot be confused with the pre-dispatch argument checks above.
+        mock_service.update_memory.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_rejection_message_survives_to_the_caller(self):
+        """V1 requires the hint to name the violated rule AND where the
+        vocabulary lives, so an agent that trips it can find the registry
+        rather than guess. That text is built into the exception; the envelope
+        must carry it through instead of flattening it to a bare class name."""
+        from fused_memory.memory_metadata import MemoryMetadataValidationError
+
+        mock_service = _mock_service()
+        mock_service.update_memory.side_effect = MemoryMetadataValidationError(
+            [self._violation()]
+        )
+
+        result = await _call_tool(mock_service, metadata_patch={'topic': 'Not A Slug'})
+
+        message = result.get('error')
+        assert isinstance(message, str) and message, result
+        assert 'topic_not_slug' in message, message
+        assert MemoryMetadataValidationError.REGISTRY_LOCATION in message, message
+
+    @pytest.mark.asyncio
+    async def test_canonical_collision_is_reported_as_its_own_class(self):
+        """The second rejection contract. It must NOT arrive wearing the first
+        one's name, or a caller handling 'malformed metadata' would retry a
+        reshaped patch forever against a collision that reshaping cannot fix."""
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        mock_service = _mock_service()
+        mock_service.update_memory.side_effect = CanonicalUniquenessViolation(
+            project_id=_PROJECT_ID, topic='some-topic', incumbent_id='incumbent-uuid-1',
+        )
+
+        result = await _call_tool(mock_service, metadata_patch={'canonical': True})
+
+        assert result.get('status') != 'updated', result
+        assert result.get('error_type') == 'CanonicalUniquenessViolation', result
+        assert 'incumbent-uuid-1' in result.get('error', ''), (
+            'V1 requires the incumbent id by name — counting is not enough, '
+            'because whoever trips this needs to go look at that record'
+        )
+        mock_service.update_memory.assert_awaited_once()
+
+    def test_the_two_rejection_contracts_stay_distinguishable(self):
+        """PRD V1, at the layer where the seam actually raises.
+
+        The envelope distinction above is only as real as the type distinction
+        underneath it. Subclassing would let the many existing
+        `pytest.raises(MemoryMetadataValidationError)` sites silently swallow a
+        uniqueness violation — passing for the wrong reason — and would make
+        `update_memory`'s two rejection classes indistinguishable at an
+        `except` for every in-process caller.
+        """
+        from fused_memory.memory_metadata import (
+            CanonicalUniquenessViolation,
+            MemoryMetadataValidationError,
+        )
+
+        assert not issubclass(CanonicalUniquenessViolation, MemoryMetadataValidationError)
+        assert not issubclass(MemoryMetadataValidationError, CanonicalUniquenessViolation)
+
+    def test_all_three_write_paths_share_the_error_convention(self):
+        """No add-vs-update asymmetry in how a seam rejection surfaces.
+
+        Task 3523 closed the asymmetry in which write paths RUN the vocabulary
+        seam. This pins the matching property for how a rejection is REPORTED:
+        an envelope on one path and a raised exception on another would install
+        a new asymmetry in place of the one just closed.
+        """
+        from fused_memory.server.tools import create_mcp_server
+
+        mock_service = _mock_service()
+        manager = create_mcp_server(mock_service)._tool_manager
+        for tool_name in ('add_memory', 'add_system_record', 'update_memory'):
+            handler = manager.get_tool(tool_name).fn
+            assert getattr(handler, '__mcp_tool_errors__', False), (
+                f'{tool_name} lost @mcp_tool_errors(); a seam rejection would '
+                'then escape as a raw exception on that path only'
+            )
