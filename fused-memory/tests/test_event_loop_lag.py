@@ -202,8 +202,13 @@ class TestLoopLagMonitorMeasurement:
         A 10 ms sample interval that returns after 10 ms is a lag of ~0, not of
         10.  Getting this wrong would make every idle sample look like a stall
         the size of the sample interval.
+
+        Asserted on the MINIMUM over several samples against half the interval:
+        an implementation that counted the sleep would report ~interval on
+        *every* sample, so failing this needs only one quiet sample, while a
+        momentarily loaded box (which delays some samples) cannot fail it.
         """
-        interval = 0.05
+        interval = 0.1
         recorded: list[float] = []
         monkeypatch.setattr(
             server_main, '_loop_lag_iteration',
@@ -215,7 +220,7 @@ class TestLoopLagMonitorMeasurement:
             server_main._loop_lag_monitor(threshold_ms=10_000.0, interval=interval),
         )
         try:
-            await asyncio.sleep(interval * 2.5)
+            await asyncio.sleep(interval * 5.5)
         finally:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -249,7 +254,9 @@ class TestLoopLagMonitorMeasurement:
             server_main._loop_lag_monitor(threshold_ms=1.0, interval=interval),
         )
         try:
-            await asyncio.sleep(interval * 8)
+            # ~15 samples' worth of wall clock; two are enough to prove the
+            # loop survived the first raise, with slack for a loaded box.
+            await asyncio.sleep(interval * 15)
             assert len(calls) >= 2, 'monitor stopped after the first raise'
             assert not task.done(), 'monitor task died on a logging error'
         finally:
@@ -433,15 +440,16 @@ class TestLoopLagReportingCadence:
             server_main._loop_lag_monitor(threshold_ms=10_000.0, interval=interval),
         )
         try:
-            await asyncio.sleep(interval * 10)
+            await asyncio.sleep(interval * 20)
         finally:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
 
-        # ~10 samples elapsed; at one report per 5 samples that is ~2, and must
-        # in any case be strictly fewer than the number of samples taken.
-        assert len(reported) <= 4, f'INFO cadence not throttled: {len(reported)} reports'
+        # ~20 samples' worth of wall clock; at one report per 5 samples that is
+        # ~4, while an unthrottled implementation reports every sample. The bar
+        # sits between the two so a loaded box (fewer samples) cannot fail it.
+        assert len(reported) <= 8, f'INFO cadence not throttled: {len(reported)} reports'
 
     @pytest.mark.asyncio
     async def test_above_threshold_samples_are_never_throttled(self, monkeypatch):
@@ -458,7 +466,10 @@ class TestLoopLagReportingCadence:
             server_main._loop_lag_monitor(threshold_ms=0.0, interval=interval),
         )
         try:
-            await asyncio.sleep(interval * 5)
+            # ~15 samples' worth of wall clock. Only two reports are required:
+            # under the throttle constant patched above, a throttled
+            # implementation emits at most one in any realistic window.
+            await asyncio.sleep(interval * 15)
         finally:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

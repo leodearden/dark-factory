@@ -153,6 +153,18 @@ class ServerConfig(BaseModel):
             'Above the observed ~40-thread normal but low enough to flag a real leak quickly.'
         ),
     )
+    loop_lag_warn_ms: int = Field(
+        default=1000,
+        description=(
+            'Event-loop scheduling overshoot (ms) above which the on-loop heartbeat '
+            '(_loop_lag_monitor) emits a WARNING instead of an INFO line. Sits two '
+            'orders of magnitude above the observed idle baseline (a few ms) and an '
+            'order of magnitude below the 15-43s stalls of task 3778, so it neither '
+            'cries wolf nor misses a real wedge. The complement to '
+            'thread_warn_threshold: that one watches thread growth, this one watches '
+            'whether the loop is still being scheduled at all.'
+        ),
+    )
     recon_report_port: int = Field(
         default=8003,
         description='Second uvicorn port for the recon_report MCP namespace (PRD §12 OQ1)',
