@@ -3691,14 +3691,13 @@ class TestInvariantAfterTask643:
             other_count=0,
             total_count=2,
         )
-        with caplog.at_level(
-            logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
-        ):
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
             stage._check_filtered_tree_invariant(ok_tree)
             _emit_foreign_log_noise()  # task 4329: RED-drive the absence assertion below
 
-        assert not any(rec.levelno == logging.WARNING for rec in caplog.records)
+        assert not any(
+            rec.name == _TKS_LOGGER and rec.levelno == logging.WARNING for rec in caplog.records
+        )
 
     def test_check_filtered_tree_invariant_no_warning_when_ok(self, mock_deps, caplog):
         """Unit test for _check_filtered_tree_invariant: no warning when invariant holds."""
@@ -3712,14 +3711,13 @@ class TestInvariantAfterTask643:
             other_count=0,
             total_count=1,
         )
-        with caplog.at_level(
-            logging.WARNING,
-            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
-        ):
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
             stage._check_filtered_tree_invariant(ok_tree)
             _emit_foreign_log_noise()  # task 4329: RED-drive the absence assertion below
 
-        assert not any(rec.levelno == logging.WARNING for rec in caplog.records)
+        assert not any(
+            rec.name == _TKS_LOGGER and rec.levelno == logging.WARNING for rec in caplog.records
+        )
 
     def test_filter_task_tree_invariant_cancelled_count_and_cancelled_tasks_populated_together(self):
         """Regression guard: filter_task_tree() sets cancelled_count>0 ↔ cancelled_tasks non-empty.
