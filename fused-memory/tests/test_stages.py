@@ -14527,6 +14527,7 @@ class TestSweepStaleMem0PoolProtectsMirrorRecords:
                 log_name='_sweep_stale_mem0_flag_markers',
                 now=fixed_now,
             )
+            _emit_foreign_log_noise()  # task 4329: RED-drive the level-only filter below
 
         deleted_ids = {
             call.kwargs.get('memory_id')
