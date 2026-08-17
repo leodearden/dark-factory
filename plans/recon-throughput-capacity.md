@@ -97,6 +97,23 @@ fixture:
 Remediation duty cycle = 1495 / (1495 + 1914) = **0.438**. Nearly half of lock-held
 backlog-mode wall-clock was spent in passes that drained zero events.
 
+**This fixture validates the capacity formula end-to-end.** Taking both inputs at the
+same scope — drain-only rate `(954+960)/(393+326)` = **2.662 s/event**, duty **0.438** —
+`sustainable_events_per_day(2.662, 0.438, 1.0) / 24` returns **759.3 events/h**, which is
+exactly the gross rate computed independently of the formula as total events over total
+lock-held wall-clock: `719 / 3409s` = **759.3 events/h**. The formula is not merely
+plausible here; it reproduces its own fixture.
+
+> **Two figures that look like this one and are not** (esc-3049-1). ADDENDUM 2's prose
+> quotes "~655 events/h gross", and pairing the plan's stated 2.43 s/event with duty
+> 0.438 yields 832.6 events/h. Neither is the observed rate, and both are the same
+> mistake in opposite directions: **mixing scopes**. 2.43 s/event is chunk 1 *alone*
+> (393/954s) while 0.438 is the aggregate over *both* chunks; and ~655/h is the
+> *average* event count (359.5) divided by chunk 1's *own* cycle period (33.1 min) =
+> 652/h. Use aggregate-with-aggregate and the discrepancy disappears. Pinned by
+> `test_sustainable_events_per_day_reproduces_the_addendum_2_observed_gross_rate`, so
+> the capacity claim cannot drift from the measurement that justifies it.
+
 Independently confirmed at production scale by the new report over the live DB
 (2026-08-16, lifetime aggregate, n≫4): **reify** shows 1157 remediation runs consuming
 1,519,299s against 3,949,761s of chunk+steady wall-clock — a **0.278** duty cycle;

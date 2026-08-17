@@ -733,6 +733,59 @@ def test_sustainable_events_per_day_recovers_the_duty_cycle_lever_1_removes() ->
     assert without / with_remediation == pytest.approx(1.7794, abs=0.0001)
 
 
+def test_sustainable_events_per_day_reproduces_the_addendum_2_observed_gross_rate() -> None:
+    """(b) End-to-end validation: the formula reproduces the fixture it was fitted against.
+
+    esc-3049-1 observed that the plan's cross-check figure of "~655 events/h
+    gross" does not fall out of the stated formula, and no reading of the
+    ADDENDUM 2 fixture produces it.  Both halves of that are true, but the
+    conclusion is narrower than "the figure does not reproduce": the formula
+    reproduces the fixture EXACTLY once its two inputs are taken at the same
+    scope.
+
+    The plan paired 2.43 s/event -- which is chunk 1 ALONE (393 events / 954s)
+    -- with duty 0.438, which is the aggregate over BOTH chunks.  Mixing a
+    single-chunk rate with a two-chunk duty is what breaks the cross-check.
+    Taken consistently over the whole fixture:
+
+        drain-only rate = (954 + 960)s / (393 + 326) events = 2.662 s/event
+        duty            = 1495 / (1495 + 1914)              = 0.4386
+
+    and the formula returns the observed gross rate, computed independently as
+    total events over total lock-held wall-clock, to within a rounding step:
+
+        719 events / 3409s = 759.3 events/h
+
+    This is the strongest evidence available that the capacity claim is sound,
+    so it is pinned here rather than left as prose.  The "~655/h" figure is a
+    scope-mix in the opposite direction -- the AVERAGE event count (359.5) over
+    chunk 1's cycle period (33.1 min) = 652/h -- which is why no consistent
+    reading of the fixture reaches it.
+    """
+    events, drain_s, remediation_s = 393 + 326, 954.0 + 960.0, 756.0 + 739.0
+
+    drain_only_rate = drain_s / events
+    duty = remediation_s / (remediation_s + drain_s)
+    assert drain_only_rate == pytest.approx(2.662, abs=0.001)
+    assert duty == pytest.approx(0.4386, abs=0.0001)
+
+    # Observed, computed WITHOUT the formula: events over total lock-held time.
+    observed_per_hour = events / (drain_s + remediation_s) * 3600.0
+    assert observed_per_hour == pytest.approx(759.3, abs=0.1)
+
+    predicted_per_hour = sustainable_events_per_day(drain_only_rate, duty, 1.0) / 24.0
+    assert predicted_per_hour == pytest.approx(observed_per_hour, rel=1e-9), (
+        'the formula must reproduce the fixture it was fitted against when its '
+        'rate and duty are taken at the same scope; a mismatch here means the '
+        'capacity claim no longer rests on the ADDENDUM 2 measurement'
+    )
+
+    # The plan's scope-mixed pairing is the higher figure, and is NOT the
+    # observed rate -- pinned so the two are never conflated again.
+    assert sustainable_events_per_day(2.43, 0.438, 1.0) / 24.0 == pytest.approx(
+        832.6, abs=0.1)
+
+
 def test_sustainable_events_per_day_rejects_impossible_inputs() -> None:
     """A non-positive rate or an out-of-range duty/utilisation is a caller bug."""
     with pytest.raises(ValueError):
