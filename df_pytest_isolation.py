@@ -111,21 +111,26 @@ defence, not two.
 
 WHICH ROOTDIRS THE DRAIN-SCRIPT DEFENCES ARE WIRED INTO, and why the rest are
 deliberately not.  Nine conftests import from this module; the git ceiling and
-the deploy-clock guard are in all nine, while ``_df_no_leaked_drain_processes``
-and task 3799's ``_df_fleet_dir_redirect`` /
-``_df_no_synthetic_heartbeats_in_live_fleet`` are wired only into the ROOT
-conftest (covering ``tests/``) and ``scripts/tests/conftest.py``.  Those are
-exactly the two rootdirs that spawn the drain script — and they are the two the
-incident came from.  The seven subproject rootdirs (``cockpit``, ``dashboard``,
-``escalation``, ``fused-memory``, ``orchestrator``, ``sampler``, ``shared``) run
-as their own pytest sessions from their own venvs, so the root conftest does not
-reach them: no token is stamped, and ``leaked_drain_processes`` fails CLOSED on
-an absent token, so those sessions report all-clear unconditionally rather than
-falsely.  That is a real gap, not a proof of safety: ``orchestrator`` is the one
-to watch, since ``orchestrator/src/orchestrator/service_restart.py`` is the
-PRODUCTION caller of the drain script and its tests today only assert on config
-strings.  Widening the wiring is a mechanical edit to those seven files and is
-out of task 3798's locked scope; until then, read a green subproject run as
+the deploy-clock guard are in all nine.  ``_df_no_leaked_drain_processes`` is
+wired only into the ROOT conftest (covering ``tests/``) and
+``scripts/tests/conftest.py`` — exactly the two rootdirs that spawn the drain
+script, and the two the incident came from.  Task 3799's
+``_df_fleet_dir_redirect`` / ``_df_no_synthetic_heartbeats_in_live_fleet``
+started on those same two and gained a THIRD in task 3951:
+``orchestrator/tests/conftest.py``, which is the fleet heartbeat's PRODUCER
+rootdir rather than a drain-script spawner (see the next two paragraphs).  Of
+the seven subproject rootdirs (``cockpit``, ``dashboard``, ``escalation``,
+``fused-memory``, ``orchestrator``, ``sampler``, ``shared``) that run as their
+own pytest sessions from their own venvs, ``orchestrator`` therefore now carries
+the fleet-dir pair and the remaining six carry neither; none carries the
+drain-process guard, so the root conftest does not reach them: no token is
+stamped, and ``leaked_drain_processes`` fails CLOSED on an absent token, so
+those sessions report all-clear unconditionally rather than falsely.  That is a
+real gap, not a proof of safety: ``orchestrator`` was the one to watch, since
+``orchestrator/src/orchestrator/service_restart.py`` is the PRODUCTION caller of
+the drain script and its tests today only assert on config strings.  Widening
+the drain-process wiring is a mechanical edit to those seven files and is out of
+task 3798's locked scope; until then, read a green subproject run as
 "unmeasured", never as "no leak".
 
 THE WRITE-SIDE GAP IN THAT RATIONALE, stated explicitly rather than left to be
@@ -139,17 +144,30 @@ so an orchestrator test that drives the run loop without setting
 cross-project directory, and with a REAL unit name that
 ``_df_no_synthetic_heartbeats_in_live_fleet`` is deliberately blind to.
 
-Accepted as latent, not safe, on a MEASURED basis: every producer call site in
-``orchestrator/tests/`` today takes an explicit env — both heartbeat-writing
-tests (``test_harness_merge_heartbeat.py``) ``monkeypatch.setenv`` the var first,
-and ``test_fleet_heartbeat.py``'s ``delenv`` case only computes a path and writes
-nothing.  So there is no live leak to fix, and wiring those two fixtures into
-``orchestrator/tests/conftest.py`` is a file outside task 3799's locked scope.
-What would invalidate this: the FIRST orchestrator test that writes a heartbeat
-without an explicit ``ORCH_FLEET_DIR``.  Wire the two fixtures there rather than
-patching that one test — the defect class is "a spawner that forgets", and this
-paragraph exists because the producer's rootdir is where the next forgetful one
-will be written.
+That gap was live, and CLOSED BY TASK 3951 exactly as this paragraph prescribed.
+Task 3799 accepted it as latent on the basis that every producer call site in
+``orchestrator/tests/`` took an explicit env, and named its own invalidation
+condition: the FIRST orchestrator test that writes a heartbeat without an
+explicit ``ORCH_FLEET_DIR``.  That condition was met.  MEASURED:
+``data/fleet/unknown-unit.json`` at mtime 2026-08-10 00:50:32 (esc-3799-6, which
+reproduced the advance INSIDE a ``pytest tests/`` run of this suite) and again
+2026-08-17 02:28:46 during task 3951 — the write comes not from the two
+heartbeat-writing test modules (which do set the var) but from the ~20 modules
+that drive ``harness.run()`` for real and never think about heartbeats at all,
+which is why per-test patching was never the tractable fix.  Worse than inert
+pollution whenever ``ORCH_UNIT`` is set: it is AMBIENT-SET in an
+orchestrator-dispatched agent session (measured: ``orchestrator-dark-factory.service``,
+inherited from the systemd unit), so there the same forgetful test overwrites the
+REAL unit's heartbeat — the file ``scripts/drain_check.py`` and
+``scripts/orchestrator-watchdog.py`` read BY NAME — rather than the inert
+``unknown-unit.json``, and ``_df_no_synthetic_heartbeats_in_live_fleet`` is
+deliberately blind to both.  Task 3951 wired the two fixtures into
+``orchestrator/tests/conftest.py`` rather than patching any one test, because
+the defect class is "a spawner that forgets" and the producer's rootdir is where
+the next forgetful one will be written.  Its own proofs — including the
+producer-side one, that ``resolve_fleet_dir()`` read against the ambient env
+lands in this run's basetemp — live in
+``orchestrator/tests/test_fleet_dir_isolation.py``.
 
 Import constraint: STDLIB + PYTEST ONLY.  Every subproject conftest imports this
 module, so it must import cleanly inside every member venv — escalation's lacks
@@ -1300,13 +1318,23 @@ def fleet_dir_redirect_violation_reason(
     ``None`` when the redirect is sound: a non-empty path, inside this run's
     *basetemp*, and neither the live fleet dir nor anything under it.
 
-    THE RULE LIVES HERE, not in the tests, because BOTH test roots must prove
-    their own wiring and each therefore has its own copy of the test function.
-    Two copies of a ~20-line assertion body drift — these two already had, at
+    THE RULE LIVES HERE, not in the tests, because EVERY test root must prove
+    its own wiring and each therefore has its own copy of the test function.
+    Two copies of a ~20-line assertion body drift — the first two already had, at
     birth, in the text of the basetemp message.  Each root keeps the one-line
     test (which is what proves ITS conftest binding is real) and shares the
     comparison and the messages, exactly as ``scripts/tests/`` already reuses
     :func:`deploy_clock_snapshot` rather than re-implementing it.
+
+    BOTH DIRECTIONS, since task 3951: this is the rule a READER's rootdir fails
+    by (``scripts/restart-all-orchestrators.sh``'s ``${VAR:-…}`` default and
+    ``drain_check``, which then decide the real fleet's drain state from other
+    projects' live heartbeats) AND the rule a WRITER's fails by
+    (``orchestrator.fleet_heartbeat.resolve_fleet_dir``, called from
+    ``Harness._write_merge_heartbeat``, reads the same bare ``os.environ`` and
+    falls back to the same default — so an orchestrator test driving the run
+    loop OVERWRITES a live heartbeat).  The messages name both, because the
+    rootdir that trips this rule is as likely to be a producer as a consumer.
 
     Ordered most-specific-first: a value pointing AT the live dir is reported as
     that, not as the generic "outside basetemp" it also happens to be.
@@ -1314,9 +1342,11 @@ def fleet_dir_redirect_violation_reason(
     if not value:
         return (
             f'{_FLEET_DIR_ENV} is {value!r}. Unset AND empty both fall through '
-            "the script's ${VAR:-…} default to the machine-global "
+            "the script's ${VAR:-…} default — and fleet_heartbeat."
+            'resolve_fleet_dir\'s — to the machine-global '
             f'{LIVE_FLEET_DIR}, so a test-spawned drain gate reads other '
-            "projects' LIVE production heartbeats. "
+            "projects' LIVE production heartbeats, and a test that drives the "
+            'harness run loop OVERWRITES one. '
             'Fix: df_pytest_isolation._df_fleet_dir_redirect.'
         )
 
@@ -1327,7 +1357,9 @@ def fleet_dir_redirect_violation_reason(
             f'{_FLEET_DIR_ENV}={resolved} is the live fleet dir {live} (or '
             'inside it). That directory is a MACHINE-GLOBAL, CROSS-PROJECT '
             "rendezvous dir holding seven projects' live orchestrator "
-            'heartbeats. Fix: df_pytest_isolation._df_fleet_dir_redirect.'
+            'heartbeats — read by scripts/drain_check.py and written by '
+            'Harness._write_merge_heartbeat. '
+            'Fix: df_pytest_isolation._df_fleet_dir_redirect.'
         )
 
     basetemp = Path(basetemp).resolve()
@@ -1335,7 +1367,7 @@ def fleet_dir_redirect_violation_reason(
         return (
             f'{_FLEET_DIR_ENV}={resolved} is outside this run\'s basetemp '
             f'{basetemp}. The redirect must land in pytest tmp space, or the '
-            'suite is writing heartbeats somewhere that outlives it. '
+            'suite is reading or writing heartbeats somewhere that outlives it. '
             'Fix: df_pytest_isolation._df_fleet_dir_redirect.'
         )
 

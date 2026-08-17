@@ -45,9 +45,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-import pytest
-
 import df_pytest_isolation
+import pytest
 from df_pytest_isolation import fixture_marker, fleet_dir_redirect_violation_reason
 
 from orchestrator.fleet_heartbeat import DEFAULT_FLEET_DIR, resolve_fleet_dir
