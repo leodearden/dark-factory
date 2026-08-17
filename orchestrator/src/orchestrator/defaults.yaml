@@ -351,7 +351,15 @@ budgets:
   architect: 15.0
   implementer: 10.0
   debugger: 5.0
-  reviewer: 5.0
+  # 5.0 -> 12.0 (2026-08-17, task-3543 /unblock investigation; see task 3321).
+  # Measured over 475 reviewer_comprehensive invocations since 2026-08-10:
+  # 5.3% hit the $5 ceiling, and $268 of $908 total reviewer spend (29.5%) went
+  # to cap-killed runs that produced nothing. Successful reviews cost p50=$1.46,
+  # p95=$3.10, max=$4.92 — the ceiling sat barely above the largest legitimate
+  # review. $12 is ~4x p95 / ~2.4x observed max: a runaway guard normal
+  # operation never touches. Reduces net spend, since a cap-killed run burns the
+  # full ceiling, yields nothing, then retries up to 4 more times.
+  reviewer: 12.0
   merger: 5.0
   steward: 5.0
   triage: 2.0
@@ -367,7 +375,16 @@ max_turns:
   architect: 100
   implementer: 80
   debugger: 50
-  reviewer: 30
+  # 30 -> 60 (2026-08-17, task-3543 /unblock investigation; see task 3321).
+  # Same failure mode simple_task hit below, and worse: over 475
+  # reviewer_comprehensive invocations since 2026-08-10, 19.6% exceeded 30
+  # turns, and of 79 failures 43 sat at EXACTLY turns=31 while only 11 were
+  # anything other than a cap hit. Successful reviews run p50=19, p90=31,
+  # p95=33, max=43 — so the cap was firing BELOW the p90 of normal successful
+  # operation, which makes it a throttle rather than a runaway guard. 60 leaves
+  # ~40% headroom over the observed max. NB the observed maxima are CENSORED by
+  # the cap itself, so true demand may run higher.
+  reviewer: 60
   merger: 50
   steward: 100
   triage: 25
