@@ -755,6 +755,104 @@ class TestWorktreeLedgerViolations:
 
         assert worker.worktree_ledger_violations(now=self._NOW) == []
 
+    # -- task 3622: the `grace_secs` floor override ------------------------
+    #
+    # Mirrors reap_orphaned_merge_worktrees' `min_age_secs` idiom (same
+    # module, same "None means inherit the class default" semantics), so
+    # detection and remediation expose the identical override shape. Raising
+    # the floor narrows WHICH leaks are reported; it never disables the check
+    # and never touches any other exclusion.
+
+    def test_grace_secs_override_can_raise_the_floor_above_an_aged_tree(
+        self, git_ops: GitOps,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
+        _mkdir_worktree(
+            git_ops, '_merge-justpast', mtime=self._NOW - self._GRACE - 10,
+        )
+
+        # Flagged at the default floor...
+        assert len(worker.worktree_ledger_violations(now=self._NOW)) == 1
+        # ...but not once the floor is raised past its age.
+        assert worker.worktree_ledger_violations(
+            now=self._NOW, grace_secs=self._GRACE * 10,
+        ) == []
+
+    def test_grace_secs_none_is_identical_to_omitting_it(
+        self, git_ops: GitOps,
+    ) -> None:
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
+        _mkdir_worktree(
+            git_ops, '_merge-inherit', mtime=self._NOW - self._GRACE - 10,
+        )
+
+        omitted = worker.worktree_ledger_violations(now=self._NOW)
+        explicit_none = worker.worktree_ledger_violations(
+            now=self._NOW, grace_secs=None,
+        )
+
+        assert len(omitted) == 1
+        assert explicit_none == omitted
+
+    def test_tree_older_than_the_explicit_grace_is_still_flagged(
+        self, git_ops: GitOps,
+    ) -> None:
+        """The override RAISES the floor — it does not disable the check."""
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
+        raised = self._GRACE * 10
+        wt = _mkdir_worktree(
+            git_ops, '_merge-ancient', mtime=self._NOW - raised - 10,
+        )
+
+        violations = worker.worktree_ledger_violations(
+            now=self._NOW, grace_secs=raised,
+        )
+
+        assert len(violations) == 1, f'expected exactly one violation, got: {violations!r}'
+        assert str(wt.resolve()) in violations[0]
+
+    def test_grace_secs_override_does_not_disturb_the_other_exclusions(
+        self, git_ops: GitOps,
+    ) -> None:
+        """Ownership / prefix / persistent-worktree / _running exclusions are
+        orthogonal to the floor: an excluded tree stays unflagged at ANY
+        grace_secs, including 0 (which admits every age).
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = self._GRACE
+        aged = self._NOW - self._GRACE - 10
+
+        owned = _mkdir_worktree(git_ops, '_merge-owned', mtime=aged)
+        worker._register_owned_merge_worktree(owned)
+        _mkdir_worktree(git_ops, PERSISTENT_MERGE_WORKTREE_NAME, mtime=aged)
+        _mkdir_worktree(git_ops, '_solo-xyz', mtime=aged)
+
+        for grace in (0.0, self._GRACE, self._GRACE * 10):
+            assert worker.worktree_ledger_violations(
+                now=self._NOW, grace_secs=grace,
+            ) == [], f'exclusions must hold at grace_secs={grace}'
+
+        # ...and the _running guard still short-circuits ahead of the floor.
+        _mkdir_worktree(git_ops, '_merge-leaked', mtime=aged)
+        assert len(worker.worktree_ledger_violations(
+            now=self._NOW, grace_secs=0.0,
+        )) == 1
+        worker._running = False
+        assert worker.worktree_ledger_violations(
+            now=self._NOW, grace_secs=0.0,
+        ) == []
+
 
 # ---------------------------------------------------------------------------
 # step-5 RED / step-6 GREEN: additive snapshot()['resource_audit'] key
