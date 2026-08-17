@@ -8629,6 +8629,37 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # attribute so tests can monkeypatch it small, matching the
     # RESOURCE_AUDIT_*/MAX_* convention above.
     PERIODIC_REAP_MIN_AGE_SECS: float = 21600.0
+    # task 3622: number of periodic reaper SWEEPS (a COUNT, not seconds) of
+    # slack added on top of PERIODIC_REAP_MIN_AGE_SECS to derive the
+    # ESCALATION age floor — see _resource_audit_escalation_age_secs().
+    #
+    # A leaked worktree between the DETECTION floor
+    # (RESOURCE_AUDIT_WORKTREE_GRACE_SECS) and the DESTRUCTION floor
+    # (PERIODIC_REAP_MIN_AGE_SECS) is a condition the periodic sweep
+    # (_maybe_reap_orphaned_merge_worktrees) is already SCHEDULED to clear, so
+    # paging a human about it reports work that is about to happen anyway.
+    # Escalation therefore waits until that scheduled remediation has
+    # demonstrably FAILED, which is what this sweep count buys.
+    #
+    # The count is DERIVED, not picked.  The periodic sweep destroys any
+    # unowned `_merge-*` past PERIODIC_REAP_MIN_AGE_SECS on its NEXT firing,
+    # and it fires at most once per self._reap_interval_s — so ONE interval is
+    # the guaranteed-opportunity bound (the tree is certain to have been
+    # offered to the reaper at least once).  The SECOND interval covers
+    # exactly one fail-open cleanup_merge_worktree failure and its retry (the
+    # 'failed for %s — leaving for a later sweep' continue in
+    # reap_orphaned_merge_worktrees, which logs and moves on rather than
+    # raising).  Reaching the resulting floor means the reaper demonstrably
+    # had >= 2 opportunities and the tree is STILL on disk — a genuine
+    # "nobody is going to clean this up".
+    #
+    # Expressed in sweeps rather than seconds so it tracks the reaper's
+    # cadence: a deployment that changes _reap_interval_s moves the escalation
+    # floor with it instead of silently changing how many chances the reaper
+    # gets.  Kept as a class attribute so tests can monkeypatch it
+    # per-instance (e.g. worker.RESOURCE_AUDIT_REAP_GRACE_SWEEPS = 1.0),
+    # matching the RESOURCE_AUDIT_*/MAX_* convention above.
+    RESOURCE_AUDIT_REAP_GRACE_SWEEPS: float = 2.0
     # MQ-invariants iota (task 1994): number of CONSECUTIVE
     # _check_resource_audit heartbeats a resource-conservation violation
     # (speculation_accounting_violations / worktree_ledger_violations) must
@@ -12711,6 +12742,44 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             _alarm_merge_request_stuck(
                 self._escalation_queue, stuck, event_store=self._event_store,
             )
+
+    def _resource_audit_escalation_age_secs(self) -> float:
+        """Age past which a leaked worktree is genuinely escalation-worthy (task 3622).
+
+        The DETECTION floor (:attr:`RESOURCE_AUDIT_WORKTREE_GRACE_SECS`,
+        9000 s) answers "old enough to be worth REPORTING"; the DESTRUCTION
+        floor (:attr:`PERIODIC_REAP_MIN_AGE_SECS`, 21600 s) answers "old
+        enough that destroying it cannot interrupt live work".  Neither
+        answers "old enough that nobody is going to clean this up" — which is
+        the only question an L1 page to a human should turn on.  This method
+        answers that third question.
+
+        Returns ``PERIODIC_REAP_MIN_AGE_SECS +
+        RESOURCE_AUDIT_REAP_GRACE_SWEEPS * self._reap_interval_s`` (defaults:
+        21600 + 2 x 300 = 22200 s).  Below it, the periodic sweep
+        (:meth:`_maybe_reap_orphaned_merge_worktrees`) is still SCHEDULED to
+        destroy the tree, so the condition is self-healing and not yet a
+        human's problem.  At or above it the reaper has demonstrably had at
+        least :attr:`RESOURCE_AUDIT_REAP_GRACE_SWEEPS` opportunities and the
+        tree survived them all — the scheduled remediation has failed.  See
+        that constant's declaration for the full derivation.
+
+        A METHOD, not a class constant, because ``_reap_interval_s`` is an
+        INSTANCE attribute set in ``__init__``: a class-level constant could
+        neither see a per-instance reap interval nor stay coherent with the
+        many tests that monkeypatch :attr:`PERIODIC_REAP_MIN_AGE_SECS`
+        per-instance.  Recomputed on every call for the same reason — it
+        never caches a stale interval.
+
+        Consumed only by :meth:`_check_resource_audit`'s escalation
+        predicate.  Detection, the WARNING log, and
+        ``snapshot()['resource_audit']`` all keep using the lower detection
+        floor, so the leak census stays truthful throughout the band.
+        """
+        return (
+            self.PERIODIC_REAP_MIN_AGE_SECS
+            + self.RESOURCE_AUDIT_REAP_GRACE_SWEEPS * self._reap_interval_s
+        )
 
     def _check_resource_audit(self, now: float) -> None:
         """Run both resource-conservation audits and alarm on a persisting violation.
