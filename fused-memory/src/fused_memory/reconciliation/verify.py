@@ -286,10 +286,18 @@ Investigate this claim against the codebase and call `verification_complete` wit
             error_summary='verify_failed',
         )
         raw = verdict.raw or {}
+        # Task 4343: stop discarding AgentVerdict.failed.  The 'agent-failed:'
+        # prefix that task 1811 put in `summary` is human-facing prose; the
+        # structured fields below are what downstream consumers branch on.
+        # `raw` is {} when the loop returned None/a non-dict, so the fallback
+        # naturally yields the error_summary token passed above.
+        token = (raw.get('warning') or 'verify_failed') if verdict.failed else ''
         return VerificationResult(
             verdict=VerificationVerdict(verdict.verdict),
             confidence=raw.get('confidence', 0.0),
             evidence=raw.get('evidence', []),
             summary=verdict.summary,
             git_context=raw.get('git_context'),
+            agent_failed=verdict.failed,
+            failure_token=token,
         )
