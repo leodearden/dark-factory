@@ -17,6 +17,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'measure_plural_enum_guard_recall.py'
 )
@@ -45,6 +47,7 @@ def _load_module() -> types.ModuleType:
 
 _mod = _load_module()
 scan_corpus = _mod.scan_corpus
+triage_rejection = _mod.triage_rejection
 
 
 # The five synthetic facts below are the probe's own positive control: the
@@ -108,6 +111,59 @@ def test_scan_corpus_rejections_are_triageable_records():
     by_fact = {r.fact: r.match_start for r in result.rejections}
     assert by_fact[_COMPLEMENT_REJECTION] == _COMPLEMENT_REJECTION.index('tasks 1020')
     assert by_fact[_PREAMBLE_REJECTION] == _PREAMBLE_REJECTION.index('tasks 1020')
+
+
+@pytest.mark.parametrize(
+    'fact',
+    [
+        # The three shapes pinned by the sweep suite's
+        # test_adverbial_preamble_is_a_documented_under_selection. These are
+        # the RECALL LOSS: the enumeration really is its copula's subject and
+        # the preposition belongs to a scene-setting preamble in front of it.
+        'As of 2026-08-09, tasks 1020 and 1030 are pending.',
+        'In the merge queue, tasks 1020 and 1030 are pending.',
+        'For this cycle, tasks 1020 and 1030 are pending.',
+    ],
+)
+def test_triage_rejection_labels_adverbial_preamble(fact):
+    """Rejections that cost recall must be separable from correct ones.
+
+    Task 3949 asks for a hand-classification of guard rejections into
+    genuine complements (correct) and adverbial-preamble subjects (recall
+    loss). Mechanizing it here means a future nonzero run is triaged by the
+    committed probe rather than by whoever happens to read the artifact.
+    """
+    match_start = fact.index('tasks 1020')
+    assert triage_rejection(fact, match_start) == 'adverbial_preamble'
+
+
+@pytest.mark.parametrize(
+    'fact',
+    [
+        # A representative spread of the pinned precision shapes: in each,
+        # the copula's real subject is an OUTER HEAD NOUN and the marker
+        # describes that, not the tasks. Rejecting these is correct.
+        'Reviews of tasks 1020, 1030, and 1031 are pending.',  # plural outer head
+        'Statuses of the tasks 1020 and 1030 are pending.',  # determiner
+        'Notes on remaining tasks 1020 and 1030 are pending.',  # open-class gap
+        # LOAD-BEARING. This one contains a comma but is NOT a preamble —
+        # the comma is intra-clause, inside a compound modifier. It is the
+        # exact shape candidate (b) was measured to get wrong, so a triage
+        # that keyed naively on 'is there a comma' would mislabel it as
+        # recall loss and thereby manufacture the very evidence that would
+        # wrongly justify tightening.
+        'Blockers for down-stream, still-unmerged tasks 1020 and 1030 are pending.',
+    ],
+)
+def test_triage_rejection_labels_prepositional_complement(fact):
+    """Correct rejections must not be reported as recall loss.
+
+    Over-reporting recall loss is the failure that matters here: it is what
+    would wrongly justify a tightening, and a tightening trades toward the
+    unrecoverable over-selection direction.
+    """
+    match_start = fact.index('tasks 1020')
+    assert triage_rejection(fact, match_start) == 'prepositional_complement'
 
 
 def test_scan_corpus_of_empty_corpus_is_all_zeroes():
