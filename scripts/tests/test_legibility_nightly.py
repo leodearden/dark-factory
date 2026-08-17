@@ -16,7 +16,7 @@ import contextlib
 import json
 import logging
 import subprocess
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -3143,3 +3143,132 @@ def test_post_escalation_reports_false_on_a_tool_error_envelope(
     warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert any('escalation post failed' in m for m in warned), warned
     assert any('isError' in m or 'reported an error' in m for m in warned), warned
+
+
+# ---------------------------------------------------------------------------
+# task 4148: the tasks-landed condition, end to end through the PRODUCTION
+# entrypoint.
+#
+# Every other census test in this file enters at run_nightly or below, and
+# run_nightly has ALWAYS accepted a status_fetcher -- so all of them passed
+# throughout the dead period. The defect was specifically that the systemd
+# ExecStart (`nightly.py run --project-id %i` -> main()) wired nothing, which
+# only a test entering at main() can catch. The journal shows the resulting
+# fail-safe line on 2026-08-10, 2026-08-11 and 2026-08-12:
+# "tasks-landed: no status_fetcher configured -- condition (b) fails safe".
+# ---------------------------------------------------------------------------
+
+def test_main_run_fires_the_tasks_landed_condition_end_to_end(
+    tmp_path, monkeypatch, caplog, install_fake_httpx,
+):
+    """Drive `nightly.main(['run', '--config', ...])` -- the systemd-invoked
+    CLI -- against a project whose census baseline is 8 days and 130 done
+    tasks stale, and assert condition (b) fires, that the absolute
+    project_root crossed the MCP wire, and that the decision reaches the
+    journal.
+
+    8 days is chosen against the shipped config.py:66-77 defaults so ONLY
+    condition (b) can fire: clear of (a) max_interval_days=10, at/above (b)'s
+    tasks_landed_min_days=7, and above the floor_days=5 hard floor. main()
+    exposes no `now` seam, so the anchor is relative to real now.
+    """
+    config_path = _write_config(tmp_path, project_id='proj_a')
+    legibility_dir = tmp_path / 'docs' / 'legibility'
+
+    # A genuine non-negative int baseline: task 4085's validity arm
+    # (census_trigger.py:724-733) returns None BEFORE the fetcher is reached
+    # for a bool/float/str, which would make this test pass for the wrong
+    # reason -- or rather, fail for one.
+    (legibility_dir / 'census-state.json').write_text(
+        json.dumps({
+            'last_census_at': (datetime.now(UTC) - timedelta(days=8)).isoformat(),
+            'last_census_report': 'docs/legibility/census-2026-08-09.md',
+            'last_census_done_count': 1000,
+        }),
+        encoding='utf-8',
+    )
+    # Present-but-empty, so condition (c) sees 0 candidates AND
+    # decide_for_project logs no unreadable-codebook warning.
+    codebook.dump(
+        {'version': 2, 'entries': [], 'candidates': []},
+        legibility_dir / 'confusion-codebook.yaml',
+    )
+
+    # 1130 done - 1000 baseline = 130 landed, over the 120 threshold.
+    recorded = []
+
+    def _fake_post(url, **kwargs):
+        recorded.append((url, kwargs))
+        return _FakeStatefulResponse(
+            headers={'content-type': 'application/json'},
+            payload={
+                'jsonrpc': '2.0',
+                'id': 1,
+                'result': {
+                    'structuredContent': {
+                        'statuses': {f't{i}': 'done' for i in range(1130)},
+                    },
+                },
+            },
+        )
+
+    install_fake_httpx(_fake_post)
+
+    # MANDATORY, not cosmetic: on FIRE the real launcher subprocess-runs
+    # scripts/legibility/census.py (real LLM spend + git writes), and
+    # _default_entrypoint_exists is true in a real checkout -- and reaching
+    # FIRE is the entire point of this test.
+    launcher_calls = []
+    monkeypatch.setattr(
+        nightly, '_default_census_launcher', lambda: launcher_calls.append(1),
+    )
+
+    # Empty -> empty sample -> no digests -> `invoke` is never called and
+    # nothing is committed, so no LLM and no git.
+    projects_root = tmp_path / 'projects'
+    projects_root.mkdir()
+
+    # caplog rather than `_isolated_root_logging`: that helper empties
+    # root.handlers, which is exactly where pytest's own capture handler
+    # lives, so nothing would be captured. It is also unnecessary here --
+    # `configure_logging` goes through `logging.basicConfig`, a documented
+    # no-op while root has handlers, so main()'s call cannot leak root state
+    # for as long as caplog's handler is installed.
+    with caplog.at_level(logging.INFO, logger='legibility.nightly'):
+        exit_code = nightly.main([
+            'run', '--config', str(config_path),
+            '--projects-root', str(projects_root),
+            '--date', '2026-07-13',
+        ])
+
+    messages = [r.getMessage() for r in caplog.records]
+
+    # (i) condition (b) fired all the way through the production entrypoint.
+    assert exit_code == 0
+    assert launcher_calls == [1], (
+        'the census launcher never fired end-to-end. Read the captured log '
+        'BEFORE suspecting the wiring: task 4085 turns any exception out of '
+        '`decide` into a quiet synthetic NO-FIRE line rather than a '
+        f'traceback. messages={messages}'
+    )
+
+    # (ii) task 3291's wire contract, now exercised from the nightly path:
+    # fused-memory's _normalize_project_root hard-rejects a relative path.
+    cfg = load_config(config_path)
+    get_statuses_calls = [
+        kwargs for _url, kwargs in recorded
+        if (kwargs.get('json') or {}).get('params', {}).get('name') == 'get_statuses'
+    ]
+    assert len(get_statuses_calls) == 1, recorded
+    sent_root = get_statuses_calls[0]['json']['params']['arguments']['project_root']
+    assert sent_root == str(cfg.project_root)
+    assert Path(sent_root).is_absolute()
+
+    # (iii) the decision reaches the journal. Without this, a healthy
+    # condition-(b) evaluation is indistinguishable from the still-dead one
+    # in `journalctl --user -u legibility-trickle@dark_factory` -- the very
+    # channel that diagnosed task 4148.
+    assert any(
+        'tasks-landed: 130 landed since last census (threshold 120) -> FIRE' in m
+        for m in messages
+    ), messages
