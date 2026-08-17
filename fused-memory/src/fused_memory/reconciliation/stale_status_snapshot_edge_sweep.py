@@ -160,6 +160,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from collections.abc import Callable
 from datetime import UTC, datetime
 
 from fused_memory.reconciliation.task_filter import (
@@ -888,6 +889,59 @@ PLURAL_ENUM_SNAPSHOT_RE: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 
+
+def _plural_enum_ids(
+    fact: str,
+    *,
+    guard: Callable[[str], bool] = _enumeration_is_prepositional_complement,
+) -> tuple[set[int], list[tuple[int, int]]]:
+    """The plural-enumeration arm, in ONE place. (task 3079; task 3949)
+
+    Returns ``(ids, rejected_spans)``: the ids the plural path yields, and the
+    spans of every enumeration *guard* rejected. Both outputs are needed by
+    the production extractor — a rejected span is, by construction, a region
+    established to be a preposition's complement, so the drop it implies is
+    applied to every other anchored path too (see
+    ``extract_snapshot_edge_task_ids``).
+
+    Ids come from the match's ``'ids'`` group only, via ``_BARE_DIGIT_RE``,
+    preserving invariant (d): a bare ``\\d+`` contributes an id only from
+    inside an already-detected, marker-anchored span.
+
+    WHY THIS IS A FUNCTION AND NOT AN INLINE LOOP. ``guard`` is injectable
+    solely so task 3949's recall probe
+    (``fused-memory/scripts/measure_plural_enum_guard_recall.py``) can run the
+    IDENTICAL arm under a candidate guard instead of re-implementing it. A
+    hand-copied arm in the probe would keep measuring the old spelling after
+    this one gained a step, and would report a reassuring zero while doing it
+    — the same staleness argument that makes the probe import
+    ``PLURAL_ENUM_SNAPSHOT_RE`` rather than re-spell it. Any future drift now
+    surfaces as a signature change rather than as a silently stale copy.
+
+    The default is the shipped guard, so production callers pass nothing and
+    the injection point costs them nothing. It is a REPORTING seam, not an
+    extension point: no production caller may pass a different guard.
+
+    Pure: no I/O, no side effects.
+    """
+    ids: set[int] = set()
+    rejected_spans: list[tuple[int, int]] = []
+    for enum in PLURAL_ENUM_SNAPSHOT_RE.finditer(fact):
+        # Subjecthood guard, second half: reject an enumeration that is a
+        # PREPOSITION'S COMPLEMENT rather than the copula's subject
+        # ('Reviews of the tasks A and B are pending' — the REVIEWS are
+        # pending). Lives here rather than as an in-pattern lookbehind
+        # because Python lookbehind is fixed-width, and a fixed offset is
+        # defeated by a single intervening determiner — while the words that
+        # may sit in that gap are an open class no bound can cover. See
+        # _ENUM_PREP_WORDS.
+        if guard(fact[: enum.start()]):
+            rejected_spans.append(enum.span())
+            continue
+        ids.update(int(tok) for tok in _BARE_DIGIT_RE.findall(enum.group('ids')))
+    return ids, rejected_spans
+
+
 # Detects the start of an aggregate list segment: '<marker> tasks [' or
 # '<marker> tasks are [' or '<marker> tasks:' or '<marker> tasks are:'. The
 # 'open' group records which delimiter opened the segment ('[' vs ':') so
@@ -1028,22 +1082,9 @@ def extract_snapshot_edge_task_ids(fact: str) -> set[int]:
     if not SNAPSHOT_STATUS_RE.search(fact):
         return set()
 
-    ids: set[int] = set()
-    rejected_spans: list[tuple[int, int]] = []
-
-    for enum in PLURAL_ENUM_SNAPSHOT_RE.finditer(fact):
-        # Subjecthood guard, second half: reject an enumeration that is a
-        # PREPOSITION'S COMPLEMENT rather than the copula's subject
-        # ('Reviews of the tasks A and B are pending' — the REVIEWS are
-        # pending). Lives here rather than as an in-pattern lookbehind
-        # because Python lookbehind is fixed-width, and a fixed offset is
-        # defeated by a single intervening determiner — while the words that
-        # may sit in that gap are an open class no bound can cover. See
-        # _ENUM_PREP_WORDS.
-        if _enumeration_is_prepositional_complement(fact[: enum.start()]):
-            rejected_spans.append(enum.span())
-            continue
-        ids.update(int(tok) for tok in _BARE_DIGIT_RE.findall(enum.group('ids')))
+    # The plural arm lives in _plural_enum_ids so task 3949's recall probe can
+    # measure THIS code rather than a copy of it (see that function).
+    ids, rejected_spans = _plural_enum_ids(fact)
 
     # Suppressing only the PLURAL match left the rejected enumeration's tail
     # extractable by the other anchored paths, because an enumeration may

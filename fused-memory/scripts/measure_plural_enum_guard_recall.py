@@ -68,11 +68,11 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (  # noqa: E402
-    _BARE_DIGIT_RE,
     _ENUM_PREP_WORD_RE,
     PLURAL_ENUM_SNAPSHOT_RE,
     _enumeration_is_prepositional_complement,
     _last_clause_break,
+    _plural_enum_ids,
 )
 
 # The necessary lexical prefix of PLURAL_ENUM_SNAPSHOT_RE, spelled here on
@@ -331,21 +331,23 @@ CANDIDATE_NAMES: tuple[str, ...] = ('shipped', 'a', 'b')
 def extract_plural_ids(fact: str, *, candidate: str = 'shipped') -> set[int]:
     """Ids the PLURAL path yields for *fact* under the named guard.
 
-    Ids come from the match's ``'ids'`` capture group ONLY, via the sweep
-    module's ``_BARE_DIGIT_RE`` — preserving extract_snapshot_edge_task_ids'
-    invariant (d), that a bare '\\d+' contributes an id only from inside an
-    already-detected, marker-anchored span.
+    Delegates to the sweep module's own ``_plural_enum_ids``, passing the
+    candidate guard in — it does NOT re-implement the arm. That is the same
+    argument the import block at the top of this file makes about the regex
+    and the guard, applied one step further out: a hand-copied arm keeps
+    measuring the old spelling after the production arm gains a step (a count
+    -quantity strip, an extra suppression), and keeps reporting a reassuring
+    zero while doing it. Ids therefore come from the match's ``'ids'`` group
+    via ``_BARE_DIGIT_RE`` because the PRODUCTION code says so, not because
+    this file remembered to.
 
     This is the plural path in isolation, deliberately: it is the only path
     either candidate can change, so comparing it isolates the candidate's
     effect from the whole-fact status gate and the other extraction paths.
     """
-    guard = _CANDIDATE_GUARDS[candidate]
-    ids: set[int] = set()
-    for match in PLURAL_ENUM_SNAPSHOT_RE.finditer(fact):
-        if guard(fact[: match.start()]):
-            continue
-        ids.update(int(d) for d in _BARE_DIGIT_RE.findall(match.group('ids')))
+    ids, _rejected_spans = _plural_enum_ids(
+        fact, guard=_CANDIDATE_GUARDS[candidate],
+    )
     return ids
 
 
