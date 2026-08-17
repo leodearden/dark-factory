@@ -411,7 +411,8 @@ def apply_coding_record(codebook: dict, record: dict) -> tuple[dict, dict]:
 
     Operates on a deep copy — never mutates `codebook` in place. Returns
     `(new_codebook, stats)` where stats has keys `matched`,
-    `skipped_unknown_entry`, `candidates_applied`, `record_invalid`.
+    `skipped_unknown_entry`, `candidates_applied`,
+    `candidate_disposition_conflicts`, `record_invalid`.
 
     A record that fails `validate_coding_record()` is skipped WHOLE (never
     partially applied): the input codebook comes back unchanged (deep
@@ -423,6 +424,35 @@ def apply_coding_record(codebook: dict, record: dict) -> tuple[dict, dict]:
     matched entry only if no existing sighting on that entry already
     carries this session (dedup key: (session, entry_id), the entry being
     implicit in "that entry's sightings list").
+
+    Candidate handling: a candidate title is resolved against the existing
+    `candidates` list. A still-`pending` record of that title absorbs the
+    sighting (`candidates_applied`); a genuinely unseen title creates a new
+    pending record (`candidates_applied`); a title whose records are ALL
+    already adjudicated (rejected/promoted) takes neither path — no pending
+    twin is fabricated, and the recurrence sighting is routed to whichever
+    record a consumer will actually read:
+
+    - `promoted` with a `promoted_to` naming an existing entry → the
+      sighting is appended to THAT ENTRY (session-deduped, counted in
+      `matched`, exactly like the match path). A promoted candidate's own
+      `sightings` list is a dead field: census.promote_candidate deep-copies
+      it into the new entry once at promotion time and nothing re-reads it
+      afterwards, so filing a recurrence there would lose the signal while
+      reporting it preserved.
+    - `rejected`, or `promoted` with a `promoted_to` that resolves to no
+      entry → the sighting is appended to the existing candidate record and
+      counted in `candidate_disposition_conflicts`. The merger never
+      fabricates an entry (only the census promotes), so the candidate is
+      the only place left to keep it.
+
+    Never-resurrect: the merger must never re-open a census verdict. Only
+    the census writes `disposition` (census.py promote_candidate/
+    reject_candidate), so an adjudicated-title collision leaves that field
+    untouched and surfaces itself via `candidate_disposition_conflicts`
+    rather than by manufacturing a byte-identical-title pending record —
+    which is precisely how rejected `cand-20260722-28` reappeared as
+    pending `cand-20260724-2` in the live registry.
 
     Never-delete: a deletion-shaped `record` (top-level delete/remove/
     retract/drop key, or a match with a delete/remove action) raises
@@ -447,6 +477,7 @@ def apply_coding_record(codebook: dict, record: dict) -> tuple[dict, dict]:
         "matched": 0,
         "skipped_unknown_entry": 0,
         "candidates_applied": 0,
+        "candidate_disposition_conflicts": 0,
         "record_invalid": False,
     }
 
@@ -496,6 +527,47 @@ def apply_coding_record(codebook: dict, record: dict) -> tuple[dict, dict]:
         )
         if pending_match is not None:
             pending_match.setdefault("sightings", []).append(sighting)
+            stats["candidates_applied"] += 1
+        elif same_title:
+            # Every same-title candidate is already adjudicated (rejected/
+            # promoted). Fabricating a fresh pending twin here would silently
+            # undo that verdict (this is exactly how rejected
+            # cand-20260722-28 came back as pending cand-20260724-2 in the
+            # live codebook). So: never touch `disposition` -- promote/reject
+            # transitions are census-owned (census.py promote_candidate/
+            # reject_candidate) -- and route the recurrence sighting to
+            # wherever it will actually be READ.
+            promoted_entry = None
+            for c in reversed(same_title):
+                if c.get("disposition") == "promoted":
+                    promoted_entry = entries_by_id.get(c.get("promoted_to"))
+                    if promoted_entry is not None:
+                        break
+            if promoted_entry is not None:
+                # The census already turned this title into a real entry.
+                # A promoted candidate's `sightings` list is a DEAD field
+                # from that moment on: promote_candidate deep-copies it into
+                # the entry ONCE, and every consumer afterwards (the matrix
+                # path, build_codebook_index) reads ENTRY sightings. Filing
+                # the recurrence on the candidate would report the signal as
+                # preserved while writing it where nothing looks -- so it
+                # goes on the entry, deduped by session and counted exactly
+                # as the match path above counts its own appends.
+                entry_sightings = promoted_entry.setdefault("sightings", [])
+                if session not in {s.get("session") for s in entry_sightings}:
+                    entry_sightings.append(sighting)
+                    stats["matched"] += 1
+            else:
+                # Rejected, or promoted with a `promoted_to` that names no
+                # existing entry (hand-edited/pre-promote_candidate record).
+                # The merger never fabricates an entry -- only the census
+                # does -- so the sighting lands on the candidate so the
+                # signal is not lost, and the conflict is surfaced via
+                # stats. `same_title[-1]` (last in list order = most recently
+                # added) is the deterministic tie-break when more than one
+                # adjudicated record shares a title.
+                same_title[-1].setdefault("sightings", []).append(sighting)
+                stats["candidate_disposition_conflicts"] += 1
         else:
             n = 1 + sum(
                 1 for c in candidates if str(c.get("id", "")).startswith(date_prefix)
@@ -511,7 +583,7 @@ def apply_coding_record(codebook: dict, record: dict) -> tuple[dict, dict]:
                     "sightings": [sighting],
                 }
             )
-        stats["candidates_applied"] += 1
+            stats["candidates_applied"] += 1
 
     assert_no_deletion(codebook, result)
     return result, stats
@@ -667,6 +739,27 @@ def _cmd_migrate(args: argparse.Namespace) -> int:
 
 
 def _cmd_apply(args: argparse.Namespace) -> int:
+    """Merge a JSONL batch of §7.3 coding records into a v2 codebook.
+
+    Per-record failures are skipped-and-counted, never fatal to the batch:
+    a malformed JSON line (`malformed_json`), a record that fails
+    `validate_coding_record()` (`record_invalid`, skipped whole inside
+    `apply_coding_record`), and a deletion-shaped record
+    (`deletion_directive`, rejected by `_reject_deletion_directive` before
+    the codebook is even copied). Each prints a `path:lineno:` line to
+    stderr and increments its counter in the stdout summary; the return
+    value stays 0 so a batch that did land its other work is not
+    misreported after a successful `dump()`. Only a codebook that fails
+    `validate()` after the merge returns 1, leaving the file untouched.
+
+    `candidate_disposition_conflicts` counts a DIFFERENT thing and is not a
+    fourth failure mode: not a skipped record, but a successfully-merged
+    recurrence sighting appended to an already-adjudicated candidate, whose
+    disposition is left to the census. It covers the rejected case and the
+    promoted-with-no-resolvable-`promoted_to` case only — a promoted title's
+    recurrence is routed onto the entry it was promoted to and counted in
+    `matched` instead (see `apply_coding_record`).
+    """
     codebook = load(args.codebook)
     if not isinstance(codebook, dict):
         print(
@@ -679,8 +772,10 @@ def _cmd_apply(args: argparse.Namespace) -> int:
         "matched": 0,
         "skipped_unknown_entry": 0,
         "candidates_applied": 0,
+        "candidate_disposition_conflicts": 0,
         "record_invalid": 0,
         "malformed_json": 0,
+        "deletion_directive": 0,
     }
 
     with open(args.records, encoding="utf-8") as f:
@@ -702,10 +797,28 @@ def _cmd_apply(args: argparse.Namespace) -> int:
                 )
                 totals["malformed_json"] += 1
                 continue
-            codebook, stats = apply_coding_record(codebook, record)
+            try:
+                codebook, stats = apply_coding_record(codebook, record)
+            except NeverDeleteError as exc:
+                # Mirror the malformed-JSON sibling above: one deletion-shaped
+                # record is dropped and counted, never aborts the rest of the
+                # nightly/trickle batch (dump() is after this loop, so an
+                # escaping exception discarded every already-applied in-memory
+                # record). apply_coding_record raises before it even
+                # deep-copies, so `codebook` is provably untouched by the bad
+                # record.
+                print(
+                    f"{args.records}:{lineno}: deletion directive rejected, skipping: {exc}",
+                    file=sys.stderr,
+                )
+                totals["deletion_directive"] += 1
+                continue
             totals["matched"] += stats["matched"]
             totals["skipped_unknown_entry"] += stats["skipped_unknown_entry"]
             totals["candidates_applied"] += stats["candidates_applied"]
+            totals["candidate_disposition_conflicts"] += stats[
+                "candidate_disposition_conflicts"
+            ]
             totals["record_invalid"] += int(stats["record_invalid"])
 
     errors = validate(codebook)
@@ -717,8 +830,10 @@ def _cmd_apply(args: argparse.Namespace) -> int:
     dump(codebook, args.codebook)
     print(
         "applied: matched={matched} candidates_applied={candidates_applied} "
+        "candidate_disposition_conflicts={candidate_disposition_conflicts} "
         "skipped_unknown_entry={skipped_unknown_entry} "
-        "record_invalid={record_invalid} malformed_json={malformed_json}".format(**totals)
+        "record_invalid={record_invalid} malformed_json={malformed_json} "
+        "deletion_directive={deletion_directive}".format(**totals)
     )
     return 0
 

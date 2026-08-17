@@ -648,7 +648,8 @@ class NightlyResult:
     ExecStart / CLI caller: 0 on success (including a genuine no-change
     night), non-zero on a fail-loud trigger (PRD decision 8, layered on by
     later steps). ``applied`` is the total number of codebook mutations
-    (matched sightings + applied candidates) across every coding record
+    (matched sightings + applied candidates + recurrence sightings appended
+    to an already-adjudicated candidate) across every coding record
     this run merged -- 0 on a dedup-only or empty-coding night, which is
     exactly what gates the dump/commit below, giving a re-run its
     idempotency for free (PRD §6.7/§8.8).
@@ -661,7 +662,16 @@ class NightlyResult:
     census_line: str | None = None
     census_fire: bool = False
     escalated: bool = False
+
     reason: str | None = None
+    """Why this run went the way it did, when there is a why.
+
+    Carries the escalation summary of whichever fail-loud trigger ended the
+    run (extractor crash, coder storm, validation failure, commit failure),
+    AND — on an otherwise-successful night — the fact that records were
+    dropped: a deletion-directive skip keeps ``exit_code`` 0 by design, but
+    is never an unremarkable night. ``None`` only when nothing notable
+    happened."""
 
     budget_suppressed: bool = False
     """True when this night found real signal and then discarded ALL of it on
@@ -1117,9 +1127,70 @@ def run_nightly(
             return result
 
         applied = 0
+        conflicts = 0
+        deletion_skipped: list[str] = []
         for record in run.records:
-            cb, stats = codebook.apply_coding_record(cb, record)
-            applied += stats['matched'] + stats['candidates_applied']
+            try:
+                cb, stats = codebook.apply_coding_record(cb, record)
+            except codebook.NeverDeleteError as exc:
+                # One deletion-shaped coder record must not cost the whole
+                # night's merge: apply_coding_record raises before it deep-
+                # copies, so `cb` is untouched, but this loop's dump/commit are
+                # BELOW it -- an escaping exception discarded every
+                # already-merged record AND escaped run_nightly entirely
+                # (main() calls it bare, so it surfaced as an uncaught
+                # traceback with no escalation). Skip the record, collect it,
+                # keep the batch going. Non-fatal but loud: exit_code stays 0,
+                # the same shape census.py uses for its mass-rejection signal.
+                # The escalation itself is posted ONCE after the loop -- see
+                # below.
+                detail = f"session={record.get('session')}: {exc}"
+                logger.warning(
+                    'legibility trickle: coding record carries a deletion '
+                    'directive; record skipped (%s)', detail,
+                )
+                deletion_skipped.append(detail)
+                continue
+            conflicts += stats['candidate_disposition_conflicts']
+            # A conflict-appended sighting IS a codebook mutation (a
+            # recurrence appended to an already-adjudicated candidate), so it
+            # must count toward the dump/commit gate below -- otherwise a
+            # night whose ONLY effect is conflict sightings ends with
+            # applied == 0, `if applied > 0` skips dump(), and the merged `cb`
+            # is discarded as a "no-change night", destroying the exact signal
+            # the elif-branch exists to preserve.
+            applied += (
+                stats['matched']
+                + stats['candidates_applied']
+                + stats['candidate_disposition_conflicts']
+            )
+
+        if conflicts:
+            logger.info(
+                'legibility trickle: %d candidate sighting(s) appended to an '
+                'already-adjudicated record; disposition left to the census',
+                conflicts,
+            )
+
+        # ONE escalation for the whole night, not one per record -- mirroring
+        # the extractor-crash and coder-storm triggers above, which both
+        # aggregate every failure into a single summary+detail. A SYSTEMIC
+        # cause (a coder prompt regression, a model that starts emitting
+        # `action: delete` for every digest) makes every record in the batch
+        # deletion-shaped, and a per-record POST would turn that into an
+        # escalation storm -- exactly the shape a human is least able to read.
+        # Posted BEFORE the validation/commit fail-loud returns below so it
+        # cannot be lost to an early return.
+        deletion_escalated = False
+        deletion_reason: str | None = None
+        if deletion_skipped:
+            deletion_reason = (
+                f'legibility trickle: {len(deletion_skipped)} coding record(s) '
+                f'carried a deletion directive; skipped'
+            )
+            deletion_escalated = post_escalation(
+                cfg, deletion_reason, '; '.join(deletion_skipped), poster=poster,
+            )
 
         validation_errors = codebook.validate(cb)
         if validation_errors:
@@ -1139,7 +1210,7 @@ def run_nightly(
                 exit_code=1,
                 applied=applied,
                 coder_status=run.status,
-                escalated=escalated or suppression_escalated,
+                escalated=escalated or suppression_escalated or deletion_escalated,
                 budget_suppressed=budget_suppressed,
                 reason=summary,
             )
@@ -1163,7 +1234,7 @@ def run_nightly(
                         exit_code=1,
                         applied=applied,
                         coder_status=run.status,
-                        escalated=escalated or suppression_escalated,
+                        escalated=escalated or suppression_escalated or deletion_escalated,
                         budget_suppressed=budget_suppressed,
                         reason=summary,
                     )
@@ -1191,8 +1262,15 @@ def run_nightly(
             coder_status=run.status,
             census_line=census_line,
             census_fire=census_fire,
-            escalated=suppression_escalated,
+            escalated=suppression_escalated or deletion_escalated,
             budget_suppressed=budget_suppressed,
+            # A dropped record is never an unremarkable night, even though it
+            # is deliberately not exit-worthy: when the escalation server is
+            # down `post_escalation` returns False, and without this the whole
+            # never-delete contract violation would survive only as a WARNING
+            # line in the journal -- `escalated` False, `reason` empty, every
+            # other field identical to a clean run.
+            reason=deletion_reason,
         )
         return result
     finally:
