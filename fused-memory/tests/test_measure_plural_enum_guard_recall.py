@@ -889,6 +889,50 @@ async def test_run_triages_every_rejection_it_reports():
     assert sum(report.triage_totals.values()) == report.totals.guard_rejected
 
 
+# A single fact carrying TWO guard-rejected enumerations, so a fact that is fed
+# to the simulation once per rejected MATCH (rather than once per fact) scores
+# every one of its matches twice.
+_TWO_REJECTIONS_IN_ONE_FACT = (
+    'As of 2026-08-09, tasks 1020 and 1030 are pending. '
+    'In the queue, tasks 2040 and 2050 are pending.'
+)
+
+
+@pytest.mark.asyncio
+async def test_candidate_simulation_scores_each_match_once_per_fact():
+    """A multi-rejection fact must not be simulated once per rejection.
+
+    ``totals.rejections`` holds one entry per rejected MATCH while
+    ``simulate_candidate`` itself re-scans every match of every fact handed to
+    it, so feeding it the raw rejection list enters an N-rejection fact N times
+    and scores each of its matches N times — an N-fold inflation of exactly the
+    ``recovered`` / ``over_selected`` pair the committed report tells a future
+    reader to re-decide the tightening against.
+
+    The live corpus currently has zero matches, which masks this entirely; it
+    would first surface on precisely the re-run this script exists to enable.
+    """
+    source = _FakeEdgeSource({'alpha': ([_TWO_REJECTIONS_IN_ONE_FACT], True)})
+
+    report = await run(_args(project_id=['alpha']), edge_source=source)
+
+    # Both enumerations are rejected, and both are the documented recall loss.
+    assert len(report.totals.rejections) == 2
+    assert report.triage_totals == {'adverbial_preamble': 2}
+
+    by_name = {c.name: c for c in report.candidates}
+    # Candidate 'b' admits both matches: 2 recovered, one per MATCH — not 4.
+    assert len(by_name['b'].recovered) == 2
+    # Candidate 'a' admits only the 'As of ...' shape: 1, not 2.
+    assert len(by_name['a'].recovered) == 1
+    # Neither re-opens an over-selection, and the shipped baseline changes
+    # nothing — one unchanged FACT, not one per rejection.
+    for name, candidate in by_name.items():
+        assert candidate.over_selected == [], name
+        assert len(candidate.unchanged) <= 1, name
+    assert len(by_name['shipped'].unchanged) == 1
+
+
 # ---------------------------------------------------------------------------
 # Artifact rendering
 # ---------------------------------------------------------------------------

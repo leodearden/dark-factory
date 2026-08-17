@@ -766,7 +766,19 @@ async def run(args: Any, *, edge_source: Any) -> Report:
     # The candidates are simulated over the LIVE facts that actually reached
     # the guard. With zero such facts this is empty — which is precisely the
     # measurement: a tightening has nothing to act on.
-    live_facts = [r.fact for r in totals.rejections]
+    #
+    # DEDUPED, and that is load-bearing: totals.rejections holds one entry per
+    # rejected MATCH, but simulate_candidate re-scans every match of every fact
+    # it is handed. Passing the raw list would enter a fact carrying N rejected
+    # matches N times and score each of its matches N times, inflating
+    # recovered/over_selected/unchanged by a factor of N — precisely the two
+    # numbers this report tells a future reader to re-decide the tightening
+    # against. dict.fromkeys preserves first-seen order, so the simulation stays
+    # deterministic. Two distinct edges carrying identical fact TEXT collapse to
+    # one simulated shape too, which is right: the candidates are compared on
+    # linguistic shapes, and per-edge occurrence counts remain in the
+    # per-project rejection rows.
+    live_facts = list(dict.fromkeys(r.fact for r in totals.rejections))
     candidates = [
         simulate_candidate(name, live_facts) for name in CANDIDATE_NAMES
     ]
