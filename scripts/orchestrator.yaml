@@ -331,11 +331,38 @@ lint_command: "uv run --project shared ruff check scripts/"
 # bool(mc.type_check_command), so a diff touching a module that defines a
 # TypedDict or Protocol — scripts/repair_wiped_metadata_files.py is the one
 # such module here — widens pyright from FILE_SCOPED to the unscoped
-# FULL_SUITE form. MEASURED at declaration time on this host, two runs of the
-# unscoped `npx pyright scripts/`: 46.3s and 42.1s, both at 0 errors / 0
-# warnings / 0 informations (3445 measured 57s on the same command against the
-# pre-burn-down tree).
-type_check_command: "npx pyright scripts/"
+# FULL_SUITE form.
+#
+# MEASURED — BOTH commands, on this host, kept side by side so the switch's
+# cost is readable rather than asserted. The npx numbers are HISTORY, labelled
+# as such and NOT rewritten to name a command that was never run:
+#
+#   HISTORICAL, `npx pyright scripts/` (declared 3456 -> 4358): 46.3s and
+#   42.1s at declaration time, both 0 errors / 0 warnings / 0 informations
+#   (3445 measured 57s on the same command against the pre-burn-down tree).
+#
+#   CURRENT, `uv run --project shared pyright scripts/` (task 4358): 83.1s on
+#   the first re-measurement, then 27.61s and 33.15s on two later sequential
+#   runs. All three at 0 errors / 0 warnings / 0 informations, rc=0.
+#
+# The 83.1s outlier is RECORDED, not dropped for the convenient 27.61s, per
+# the MEASUREMENT PROVENANCE standard the verify-budget block below sets for
+# this same file. Read the spread as host load and warm-vs-cold filesystem
+# cache on this oversubscribed host — the same cause that block names for its
+# own ~293s-to-~931s spread — rather than as a property of the invocation:
+# nothing about resolving pyright through uv instead of npx plausibly doubles
+# a 30s run, and the fastest uv run is faster than either npx run. Size
+# anything off the SLOWEST observation, never the mean.
+#
+# Both current-command runs also emit, at rc=0 and harmlessly: uv's stderr
+# `VIRTUAL_ENV=... does not match the project environment path .venv and will
+# be ignored` (the ambient VIRTUAL_ENV points at the workspace-root .venv; uv
+# resolves the member environment itself), and pyright's stdout `WARNING:
+# there is a new pyright version available (v1.1.408 -> v1.1.411).` — the
+# latter being the whole of the residual described above. Neither is a
+# failure, and neither has ever been one; they are named here so a reader
+# grepping a green log does not read them as one.
+type_check_command: "uv run --project shared pyright scripts/"
 
 # PER-MODULE VERIFY BUDGET (task 3458, closing the gap this file recorded as
 # knowingly-open above — see the CLOSURE RECORD in the COST DELTA block).
@@ -381,8 +408,12 @@ type_check_command: "npx pyright scripts/"
 # (3) SCOPE: this is a PER-COMMAND budget. It bounds the TEST leg on its own,
 # not test+lint+type summed — each leg is timed independently by
 # verify._resolve_verify_timeout / run_verification. The type leg is
-# separately measured above at 46.3s / 42.1s (TYPE block); lint was not
-# separately timed but is orders of magnitude cheaper than either.
+# separately measured above (TYPE block): 46.3s / 42.1s when this text was
+# written against the then-declared `npx pyright scripts/`, and 83.1s / 27.61s
+# / 33.15s for the `uv run --project shared pyright scripts/` that task 4358
+# replaced it with — the numbers moved, but the point they support did not,
+# since even the worst of them is well inside this per-command budget. Lint
+# was not separately timed but is orders of magnitude cheaper than either.
 #
 # (4) HOW MUCH THIS ACTUALLY BUYS, stated plainly rather than oversold: a
 # narrowing from the repo-root 3600s ceiling to 2400s — a hang surfaces in
