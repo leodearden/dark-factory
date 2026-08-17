@@ -18793,6 +18793,16 @@ def _alarm_resource_audit(
         'for multiple consecutive heartbeats:\n\n'
         + '\n'.join(f'- {v}' for v in violations)
         + '\n\n'
+        'AUTOMATIC RECLAIM HAS ALREADY FAILED HERE (task 3622). Any worktree '
+        'named above has outlived PERIODIC_REAP_MIN_AGE_SECS plus at least '
+        'RESOURCE_AUDIT_REAP_GRACE_SWEEPS periodic reaper sweeps, so '
+        '_maybe_reap_orphaned_merge_worktrees has already had multiple '
+        'opportunities to destroy it and the tree is still on disk — this is '
+        'not a leak that is about to clean itself up. (A leak still inside '
+        'that reclaim window is logged and censused in '
+        "snapshot()['resource_audit'] but deliberately does not escalate.) "
+        'Leaked permits/cap slots have no automatic reclaim at all and '
+        'escalate from their first persisting heartbeat.\n\n'
         'The orchestrator has NOT halted or mutated any pipeline state — '
         'this is observation-only (PRD design decision 4).'
     )
@@ -18810,7 +18820,16 @@ def _alarm_resource_audit(
             "Inspect the merge worker's snapshot()['resource_audit'] key "
             '(speculation_accounting / worktree_ledger sub-lists) to '
             'identify the leaked permit, cap, or worktree; fix the code '
-            'path that failed to release it.'
+            'path that failed to release it. For a WORKTREE violation, start '
+            'by asking why the periodic reaper did not remove it — it has '
+            'already tried and failed at least twice. The two known reasons '
+            'are a still-held verify lease (remove_merge_worktree_guarded '
+            "returns 'skipped_lease_held' and skips the tree regardless of "
+            'age — look for the lease holder that never released) and a '
+            'fail-open removal error (cleanup_merge_worktree logs '
+            "'failed for <path> — leaving for a later sweep' and continues, "
+            'so grep the orchestrator log for that line and the exception '
+            'under it).'
         ),
     )
     escalation_queue.submit(esc)
