@@ -39,6 +39,11 @@ import logging
 import sys
 from typing import Any
 
+from fused_memory.utils.store_mutation_preflight import (
+    StoreMutationUnavailable,
+    assert_store_mutation_allowed,
+)
+
 logger = logging.getLogger('clear_false_dep_invalidations')
 
 # Six dependency-edge UUIDs that were falsely invalidated by the upstream
@@ -76,6 +81,35 @@ async def repair(
         A JSON-serialisable report dict with keys:
         ``project``, ``dry_run``, ``edges_total``, ``cleared``, ``edges``.
     """
+    # Fail-CLOSED capability preflight, one probe per run, BEFORE the scan.
+    #
+    # Hoisted ABOVE the loop deliberately. ``StoreMutationUnavailable``
+    # subclasses ``RuntimeError``, so a probe at the in-loop ``if apply:`` gate
+    # below would be caught by that iteration's ``except Exception`` and
+    # downgraded into six ``{'status': 'error'}`` rows -- while ``update_edge``
+    # was attempted six times anyway, against a store whose history this
+    # process cannot write. Probing here, outside the swallowing handler, turns
+    # a run-wide environment denial into a run-wide refusal instead of six
+    # irreversible half-writes plus six log lines.
+    if apply:
+        try:
+            assert_store_mutation_allowed(
+                operation='clear_false_dependency_invalidations --apply'
+            )
+        except StoreMutationUnavailable:
+            logger.error(
+                'clear_false_dependency_invalidations: --apply NOT started '
+                "(fail-closed) -- this process cannot write mem0's history "
+                'directory, so each clearing would save the edge and then fail '
+                'to record it, leaving the repair half-applied and untracked. '
+                'No edge was updated and nothing was mutated. Route the '
+                'invalidations through the fused-memory MCP server (the '
+                'unsandboxed owner of the store), or re-run from an '
+                'unsandboxed operator shell. To obtain the repair report '
+                'safely from anywhere, re-run without --apply.'
+            )
+            raise
+
     edges_report: list[dict[str, Any]] = []
     cleared = 0
 
