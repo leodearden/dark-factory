@@ -1846,6 +1846,25 @@ async def invoke_with_cap_retry(
     account switches.  If resume itself fails (non-cap-hit error), falls
     back to a fresh invocation with the original prompt.
 
+    Resume eligibility is a TWO-PART rule, and both parts require a
+    *config_dir* (without one there is no correct place to glob for the
+    transcript, so nothing can be proven and the resume proceeds unchecked):
+
+    1. REACHABLE — a Claude CLI session is a local JSONL file at
+       ``<config_dir>/projects/*/<session_id>.jsonl`` and ``--resume`` replays
+       it, so a session whose transcript is gone resumes into an effectively
+       empty one (``transcript_exists``).
+    2. NON-EMPTY — the transcript must record work to CONTINUE: at least one
+       assistant tool call, or more than one assistant turn
+       (``resumable_progress_for_session``).  Otherwise
+       ``CAP_HIT_RESUME_PROMPT`` ("continue where you left off") would point
+       at nowhere.
+
+    Failing either part retries FRESH, which replays the real task prompt.
+    Both guards fire only on affirmative proof; every ambiguous or unreadable
+    transcript resumes, because a wrong downgrade discards real agent work.
+    The specific reason is named in the cap-hit warning (``resume_or_fresh``).
+
     *cap_wait_sanity_secs* is the outer wall-clock bound for cap-hit patience.
     When total elapsed time since the first cap hit exceeds this value,
     ``AllAccountsCappedException`` is raised so the caller can escalate.
@@ -2434,11 +2453,27 @@ async def invoke_with_cap_retry(
                     # orchestrator's own resume-eligibility guard
                     # (harness.py, 'no_transcript').
                     #
+                    # ...but reachability is NECESSARY, not SUFFICIENT (task
+                    # 4274).  A session capped before it did anything has a
+                    # perfectly reachable transcript holding only a statement of
+                    # intent, and resuming it injects CAP_HIT_RESUME_PROMPT
+                    # ("continue where you left off") pointing at nowhere — a
+                    # continuity claim the transcript does not support, and a
+                    # retry spent re-deriving context that never existed
+                    # (legibility census 2026-08-16 §1.2, session 4396db7a).  So
+                    # eligibility asks TWO questions: can I reach the transcript,
+                    # AND does it record work to continue
+                    # (resumable_progress_for_session)?  That second guard only
+                    # ever downgrades resume -> fresh and a wrong downgrade
+                    # DISCARDS REAL WORK, so it fires only on affirmatively
+                    # proven emptiness; every ambiguity resumes.
+                    #
                     # config_dir is None -> resume as today: without a concrete
                     # directory there is no correct place to glob (the process
                     # default ~/.claude would be wrong for any caller under an
-                    # isolated CLAUDE_CONFIG_DIR), so the veto is scoped to "we
-                    # have a directory and the transcript is provably not in it".
+                    # isolated CLAUDE_CONFIG_DIR), so both vetoes are scoped to
+                    # "we have a directory and can PROVE the transcript is not
+                    # in it / carries nothing".
                     #
                     # resume_or_fresh carries the REASON, not just the verdict:
                     # it is interpolated into both cap-hit warnings below, so a
@@ -2461,6 +2496,19 @@ async def invoke_with_cap_retry(
                         _reset_for_fresh_retry(invoke_kwargs, original_prompt)
                         await _rebuild_fresh_prompt()
                         resume_or_fresh = 'fresh (transcript unreachable)'
+                    elif config_dir is not None and not resumable_progress_for_session(
+                        config_dir.path, result.session_id
+                    ):
+                        logger.warning(
+                            f'{label}: capped session {result.session_id} recorded no work '
+                            f'to continue (no tool calls, at most one assistant turn) — '
+                            f'retrying FRESH instead of resuming, because '
+                            f'CAP_HIT_RESUME_PROMPT would tell the agent to continue from '
+                            f'nowhere',
+                        )
+                        _reset_for_fresh_retry(invoke_kwargs, original_prompt)
+                        await _rebuild_fresh_prompt()
+                        resume_or_fresh = 'fresh (no resumable progress)'
                     else:
                         invoke_kwargs['resume_session_id'] = result.session_id
                         invoke_kwargs['prompt'] = CAP_HIT_RESUME_PROMPT
