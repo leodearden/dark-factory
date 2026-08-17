@@ -388,3 +388,264 @@ def test_a_dropin_is_never_removed_by_the_checker(tmp_path: pathlib.Path, capsys
     assert dropin.is_file()
     assert dropin.read_text(encoding="utf-8") == _WORKTREE_DROPIN
     assert dropin.parent.is_dir()
+
+
+# ---------------------------------------------------------------------------
+# The EFFECTIVE-CONFIG layer  (step-7 / step-8)
+# ---------------------------------------------------------------------------
+#
+# What the file layer structurally CANNOT see. Globbing <installed-dir>/
+# lms-arm@.service.d/ reads one directory; systemd also merges drop-ins from
+# /etc/systemd/user/ and /run/systemd/user/, so asking systemd is strictly
+# stronger. Every test drives the probe through an INJECTED runner, so nothing
+# here needs a live systemd user manager.
+
+# The exact argv this checker must issue. Pinned as a literal rather than
+# rebuilt from the checker's own constants: a test that derives the command
+# from the code under test would follow it wherever it went, which is not a
+# pin at all.
+_EXPECTED_PROBE_ARGV = [
+    "systemctl",
+    "--user",
+    "show",
+    "-p",
+    "WorkingDirectory",
+    "-p",
+    "DropInPaths",
+    "lms-arm@probe.service",
+]
+
+
+def _recording_probe(returncode: int, stdout: str):
+    """Return ``(runner, calls)`` — a probe runner that records its argv."""
+    calls: list[list[str]] = []
+
+    def _runner(argv):
+        calls.append(list(argv))
+        return returncode, stdout
+
+    return _runner, calls
+
+
+def test_probe_command_is_the_documented_one(tmp_path: pathlib.Path, capsys):
+    """The probe argv is pinned EXACTLY, including the absence of --value.
+
+    This deliberately diverges from scripts/remove-lms-arm-worktree-dropin.sh,
+    which issues two separate `show -p <KEY> --value` calls. The combined
+    no---value form yields self-labelling KEY=VALUE lines, is one subprocess
+    instead of two, and cannot mis-attribute a value to the wrong key.
+
+    Pinning it stops a later refactor from quietly adding --value — which
+    strips the very keys the parser matches on, so the parse would silently
+    yield nothing and the run would report "unverifiable" forever — or from
+    narrowing to a single -p and losing a whole half of the check.
+    """
+    checker = _load_checker()
+    repo_root = _fake_repo(tmp_path)
+    installed_dir = _installed_from(tmp_path, repo_root)
+    runner, calls = _recording_probe(
+        0, f"WorkingDirectory={_declared_working_directory(repo_root)}\nDropInPaths=\n"
+    )
+
+    checker.main(
+        ["--repo-root", str(repo_root), "--installed-dir", str(installed_dir)],
+        probe_runner=runner,
+    )
+    capsys.readouterr()
+
+    assert calls == [_EXPECTED_PROBE_ARGV]
+
+
+def test_probe_instance_is_derived_from_the_template_name(
+    tmp_path: pathlib.Path, capsys
+):
+    """The probed unit is an INSTANCE, not the bare `lms-arm@.service` template.
+
+    `systemctl show` on a bare template does not resolve %i-dependent state the
+    way an instance does. scripts/remove-lms-arm-worktree-dropin.sh already
+    established the `${TEMPLATE}probe.service` spelling; reusing it means both
+    tools name the same unit, so an operator reading either output sees the
+    same vocabulary.
+    """
+    checker = _load_checker()
+    repo_root = _fake_repo(tmp_path)
+    installed_dir = _installed_from(tmp_path, repo_root)
+    runner, calls = _recording_probe(
+        0, f"WorkingDirectory={_declared_working_directory(repo_root)}\nDropInPaths=\n"
+    )
+
+    checker.main(
+        ["--repo-root", str(repo_root), "--installed-dir", str(installed_dir)],
+        probe_runner=runner,
+    )
+    capsys.readouterr()
+
+    probed = calls[0][-1]
+    assert probed != UNIT_NAME
+    assert probed.startswith("lms-arm@")
+    assert probed.endswith(".service")
+    # An instance name has something between the '@' and the suffix.
+    assert probed[len("lms-arm@") : -len(".service")]
+
+
+def test_clean_effective_config_is_parity(tmp_path: pathlib.Path, capsys):
+    """A clean probe is parity, and the success case is a POSITIVE claim.
+
+    "No complaint" and "verified clean" look identical in a log until the
+    checker breaks, at which point silence reads as success. So the clean path
+    states what it resolved, naming the effective WorkingDirectory.
+    """
+    checker = _load_checker()
+    repo_root = _fake_repo(tmp_path)
+    installed_dir = _installed_from(tmp_path, repo_root)
+    declared = _declared_working_directory(repo_root)
+
+    rc = checker.main(
+        ["--repo-root", str(repo_root), "--installed-dir", str(installed_dir)],
+        probe_runner=lambda argv: (0, f"WorkingDirectory={declared}\nDropInPaths=\n"),
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "[ok] parity" in out
+    assert declared in out
+    assert "[effective]" in out
+
+
+def test_dropinpaths_reported_by_systemd_fails_the_run(
+    tmp_path: pathlib.Path, capsys
+):
+    """systemd naming a drop-in fails the run even with an EMPTY filesystem glob.
+
+    This is the case the tmp_path file layer cannot reach: systemd also merges
+    drop-ins from /etc/systemd/user/ and /run/systemd/user/, so DropInPaths is
+    a superset of globbing one directory. A checker trusting only the glob
+    would report parity on a unit systemd is actively overriding.
+    """
+    checker = _load_checker()
+    repo_root = _fake_repo(tmp_path)
+    installed_dir = _installed_from(tmp_path, repo_root)
+    declared = _declared_working_directory(repo_root)
+    elsewhere = "/home/leo/.config/systemd/user/lms-arm@.service.d/10-worktree-3713.conf"
+
+    # Precondition: the filesystem layer sees nothing at all.
+    assert not (installed_dir / f"{UNIT_NAME}.d").exists()
+
+    rc = checker.main(
+        ["--repo-root", str(repo_root), "--installed-dir", str(installed_dir)],
+        probe_runner=lambda argv: (
+            0,
+            f"WorkingDirectory={declared}\nDropInPaths={elsewhere}\n",
+        ),
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert elsewhere in out
+    assert "[ok] parity" not in out
+
+
+def test_effective_workingdirectory_elsewhere_fails_the_run(
+    tmp_path: pathlib.Path, capsys
+):
+    """A resolved WorkingDirectory that is not the committed one fails, loudly.
+
+    Both values reach the operator: "they differ" without them sends someone
+    back to systemctl to work out what it actually resolved to.
+    """
+    checker = _load_checker()
+    repo_root = _fake_repo(tmp_path)
+    installed_dir = _installed_from(tmp_path, repo_root)
+    declared = _declared_working_directory(repo_root)
+    actual = "/home/leo/src/dark-factory/.worktrees/3713"
+
+    rc = checker.main(
+        ["--repo-root", str(repo_root), "--installed-dir", str(installed_dir)],
+        probe_runner=lambda argv: (0, f"WorkingDirectory={actual}\nDropInPaths=\n"),
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert actual in out
+    assert declared in out
+    assert "[ok] parity" not in out
+
+
+def test_a_failed_probe_is_unverifiable_not_parity(tmp_path: pathlib.Path, capsys):
+    """A probe that did not answer has established NOTHING. Never rc 0.
+
+    No silent fail-soft: a checker that shrugs when systemctl is missing and
+    reports parity would reproduce this task's own bug one level up — a green
+    claim covering nothing. All four failure shapes are exercised, because they
+    arrive by different routes and only the last is an exception.
+    """
+    checker = _load_checker()
+    repo_root = _fake_repo(tmp_path)
+    installed_dir = _installed_from(tmp_path, repo_root)
+
+    def _missing_systemctl(argv):
+        raise FileNotFoundError(2, "No such file or directory", "systemctl")
+
+    failures = {
+        "non-zero exit": lambda argv: (1, ""),
+        # Exactly what the fake systemctl in scripts/tests/test_lms_ctl.py
+        # returns for an unhandled subcommand, so this is not hypothetical.
+        "empty stdout": lambda argv: (0, ""),
+        "garbage stdout": lambda argv: (0, "Failed to get properties: no such unit\n"),
+        "systemctl absent": _missing_systemctl,
+    }
+
+    for label, runner in failures.items():
+        rc = checker.main(
+            ["--repo-root", str(repo_root), "--installed-dir", str(installed_dir)],
+            probe_runner=runner,
+        )
+        out = capsys.readouterr().out
+        assert rc == 1, label
+        assert "could not verify" in out.lower(), label
+        assert "[ok] parity" not in out, label
+
+
+def test_expected_workingdirectory_comes_from_the_committed_template_not_repo_root(
+    tmp_path: pathlib.Path, capsys
+):
+    """The expected value is read from the TEMPLATE, never from --repo-root.
+
+    This is the worktree case, and the single most likely place to get it
+    wrong. The committed template hardcodes the main checkout, so running from
+    .worktrees/3775 gives a --repo-root that is NOT the declared
+    WorkingDirectory. Keying the assertion off --repo-root would report a false
+    red on every worktree run — and a gate that is red every time gets switched
+    off, taking the real drift with it.
+
+    The claim this gate actually makes is "the committed template is the
+    effective configuration", which is exactly the template-sourced comparison.
+    """
+    checker = _load_checker()
+    repo_root = _fake_repo(tmp_path)
+    installed_dir = _installed_from(tmp_path, repo_root)
+    declared = _declared_working_directory(repo_root)
+
+    # The fixture repo deliberately is NOT where the template says to run.
+    assert str(repo_root) != declared
+
+    rc = checker.main(
+        ["--repo-root", str(repo_root), "--installed-dir", str(installed_dir)],
+        probe_runner=lambda argv: (0, f"WorkingDirectory={declared}\nDropInPaths=\n"),
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "[ok] parity" in out
+
+    # And the converse: matching --repo-root instead of the template is NOT
+    # parity, which is what pins the value's source rather than its shape.
+    rc_repo_root = checker.main(
+        ["--repo-root", str(repo_root), "--installed-dir", str(installed_dir)],
+        probe_runner=lambda argv: (
+            0,
+            f"WorkingDirectory={repo_root}\nDropInPaths=\n",
+        ),
+    )
+    capsys.readouterr()
+    assert rc_repo_root == 1
