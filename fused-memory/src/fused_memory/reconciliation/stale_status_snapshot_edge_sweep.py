@@ -94,7 +94,8 @@ Known residuals (deliberate; all fail-safe/under-selection unless noted)
   residual pointed the WRONG way (an unlisted preposition over-selects)
   and one fail-safe residual (a genuine subject-position enumeration
   sharing a clause with a listed preposition is missed) — see
-  ``_ENUM_PREP_WORDS``.
+  ``_ENUM_PREP_WORDS``. The fail-safe one is MEASURED, not open: zero
+  cost on the live corpus (task 3949).
 - task 4149: ``_CLAUSE_BREAK_CHARS``'s ';' and '?' are unconditional
   breaks (only '.' gets the occurrence-level flanking test), so one
   residual is pointed the WRONG way: a '?' inside a URL query string or a
@@ -612,8 +613,51 @@ _PLURAL_COPULA_ALT = r'(?:are|were|remain)'
 # speculation: every candidate tightening (requiring a plural/capitalized head
 # before the preposition, or stopping the backward scan at a comma when no
 # preposition follows it) trades back toward the unrecoverable over-selection
-# direction, so it needs measurement against the real edge corpus first.
+# direction, so it needed measurement against the real edge corpus first.
 # (amendment, reviewer_comprehensive correctness-recall finding, task 3079)
+#
+# THAT MEASUREMENT IS NOW DONE (task 3949, measured 2026-08-17 against the
+# live FalkorDB graphs):
+#
+#     dark_factory              12488 valid edges | 169 'tasks <n>' near-misses
+#     reify                     15871 valid edges | 168 near-misses
+#     solar_challenge_platform   1056 valid edges |   9 near-misses
+#     (all)                     29415 valid edges | 346 near-misses
+#                                                 | 0 PLURAL_ENUM_SNAPSHOT_RE
+#                                                 |   matches, 0 rejections
+#
+# Not one live fact reaches this guard, so its recall cost on the real corpus
+# is exactly ZERO edges. What the plural path loses here it loses at the
+# REGEX, not at the guard: the 346 near-misses carry 'tasks <digits>' but no
+# status marker, no copula, or broken copula-marker adjacency ('Tasks 1752 and
+# 1753 are related to ...', 'Both tasks 1920 and 1921 edit ...').
+#
+# Both candidates were re-validated against the full precision
+# parametrization, as the finding required before shipping either:
+#   (a) plural/capitalized head before the preposition — re-opens none of the
+#       47 pinned precision+suppression shapes, but does NOT recover
+#       'As of <date>, tasks ...', the finding's OWN motivating shape,
+#       because 'of' there follows the capitalized sentence-initial 'As'.
+#   (b) restart the backward scan after a preposition-free comma — recovers
+#       all three preamble shapes, but RE-OPENS the pinned over-selection
+#       'Blockers for down-stream, still-unmerged tasks 1020 and 1030 are
+#       pending.', where the comma is intra-clause. It fails the required
+#       re-validation outright.
+#
+# VERDICT: NOT TIGHTENED. A tightening can only change an outcome on a fact
+# the regex already matched, and there are none — so both candidates have
+# provably zero measured benefit against nonzero unrecoverable over-selection
+# risk, on a module whose stated invariant is that under-selection self-heals
+# and over-selection never does.
+#
+# Re-checkable as the corpus grows — the verdict is only as good as its
+# re-runnability, and 'zero matches' is a point-in-time fact:
+#     cd fused-memory && \
+#       uv run python scripts/measure_plural_enum_guard_recall.py
+# Artifacts: plans/plural-enum-guard-recall-report.{json,md}. The candidate
+# re-validation is mechanical (it reads the pinned shapes off this suite's
+# own parametrize markers) in
+# tests/test_measure_plural_enum_guard_recall.py.
 #
 # Kept as a single flat tuple rather than inlined into the pattern so the
 # vocabulary has ONE source of truth: the regression test parametrizes

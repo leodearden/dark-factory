@@ -1057,10 +1057,20 @@ class TestExtractSnapshotEdgeTaskIds:
         here so the recall cost is VISIBLE and intentional — if the guard
         widens further, these cases are where it shows up, and if the real
         edge corpus ever makes the cost matter, this is the test that has to
-        be renegotiated first. Deliberately NOT fixed speculatively:
-        tightening the guard means measuring against the actual edge set,
-        and every candidate tightening trades back toward the unrecoverable
-        over-selection direction.
+        be renegotiated first.
+
+        The corpus has now been measured and says it does NOT (task 3949):
+        across 29415 live valid edges spanning three project graphs, ZERO
+        facts match PLURAL_ENUM_SNAPSHOT_RE at all, so this guard rejects
+        nothing and its recall cost is exactly zero edges. Both candidate
+        tightenings were re-validated against the full precision
+        parametrization: (b) re-opens a pinned over-selection, and (a)
+        re-opens none but does not even recover the 'As of <date>, ...'
+        case above. VERDICT: not tightened — see the measurement block at
+        ``_ENUM_PREP_WORDS``, and re-run
+        ``scripts/measure_plural_enum_guard_recall.py`` before renegotiating
+        this test, since 'zero matches' is a point-in-time fact about a
+        growing corpus.
         """
         assert extract_snapshot_edge_task_ids(fact) == set()
 
