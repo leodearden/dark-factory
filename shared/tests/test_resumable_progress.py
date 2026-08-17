@@ -1,0 +1,203 @@
+"""Tests for the cap-hit resume progress predicate (task 4274).
+
+A session killed by the WEEKLY usage cap was resumed with
+CAP_HIT_RESUME_PROMPT ("Continue where you left off and complete your task")
+when its only captured output was one sentence of stated intent — "where you
+left off" was, verifiably, nowhere (legibility census 2026-08-16 §1.2, session
+4396db7a).  The cap-hit branch decided resume-vs-fresh on ONE question: is the
+transcript REACHABLE?  A transcript that EXISTS was assumed to carry resumable
+work.
+
+``detect_resumable_progress`` is the pure half of the answer to the next
+question — does the transcript record work to CONTINUE? — and
+``resumable_progress_for_session`` is its session-level wrapper.
+
+FAIL-SAFE DIRECTION (the load-bearing property these tests pin).  The predicate
+can only ever cause a resume→fresh DOWNGRADE, and a wrong downgrade DISCARDS
+REAL AGENT WORK — strictly worse than the confusing-but-harmless prompt this
+fixes.  So every ambiguous input must resolve to True (resume, today's
+behaviour); only the affirmatively-proven-empty case may return False.
+
+Structured on ``test_cli_invoke_background.py``, the direct precedent for a
+transcript predicate + session-wrapper pair.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from shared.cli_invoke import (
+    detect_resumable_progress,
+    resumable_progress_for_session,
+)
+
+# ── Fixture builders ────────────────────────────────────────────────────────
+# Hand-authored transcript record dicts mirroring the on-disk JSONL shape: an
+# assistant record carries content blocks either nested under
+# ``record['message']['content']`` (the real CLI shape) or flat under
+# ``record['content']`` (the shape the existing read_transcript_records tests
+# use).  Both nestings are supported and both are covered here.
+
+
+def _assistant(blocks: list, *, nested: bool = True) -> dict:
+    """An assistant transcript record wrapping *blocks*.
+
+    ``nested=True`` → record['message']['content'] (real CLI shape).
+    ``nested=False`` → flat record['content'].
+    """
+    if nested:
+        return {'type': 'assistant', 'message': {'role': 'assistant', 'content': blocks}}
+    return {'type': 'assistant', 'content': blocks}
+
+
+def _text(text: str = 'I will start by reading the plan.') -> dict:
+    return {'type': 'text', 'text': text}
+
+
+def _tool_use(name: str = 'Read', **inp) -> dict:
+    return {'type': 'tool_use', 'name': name, 'input': inp or {'file_path': '/tmp/x.py'}}
+
+
+def _user(text: str = 'do the task') -> dict:
+    return {'type': 'user', 'content': text}
+
+
+def _write_transcript(base: Path, session_id: str, records: list) -> Path:
+    """Write *records* as a JSONL transcript under
+    base/projects/<slug>/<session_id>.jsonl — the layout
+    ``_resolve_transcript_path`` globs for."""
+    slug_dir = base / 'projects' / 'myproject'
+    slug_dir.mkdir(parents=True, exist_ok=True)
+    transcript = slug_dir / f'{session_id}.jsonl'
+    transcript.write_text('\n'.join(json.dumps(r) for r in records) + '\n')
+    return transcript
+
+
+class TestDetectResumableProgress:
+    """The pure predicate returns False ONLY when it can affirmatively prove
+    there is nothing to continue: a non-None record list with ZERO assistant
+    ``tool_use`` blocks AND at most one assistant record.  Everything else —
+    including every malformed or ambiguous shape — returns True."""
+
+    # ── The two proven-empty shapes (False) ─────────────────────────────────
+
+    def test_empty_list_is_false(self) -> None:
+        """No records at all → nothing to continue → False."""
+        assert detect_resumable_progress([]) is False
+
+    def test_single_text_only_assistant_turn_is_false(self) -> None:
+        """The observed 4396db7a shape: one sentence of stated intent, no tool
+        call.  This is the whole point of the predicate."""
+        records = [
+            _user(),
+            _assistant([_text('I will start by reading the task plan.')]),
+        ]
+        assert detect_resumable_progress(records) is False
+
+    def test_single_text_only_assistant_turn_flat_nesting_is_false(self) -> None:
+        """Same proven-empty shape under the flat ``record['content']`` nesting."""
+        records = [
+            _user(),
+            _assistant([_text()], nested=False),
+        ]
+        assert detect_resumable_progress(records) is False
+
+    def test_user_records_alone_do_not_count_as_progress(self) -> None:
+        """Only ASSISTANT turns are evidence the agent did anything; a pile of
+        user records is still a session that produced nothing."""
+        records = [_user('do the task'), _user('are you there?'), _user('hello?')]
+        assert detect_resumable_progress(records) is False
+
+    # ── Real progress (True) ────────────────────────────────────────────────
+
+    def test_assistant_tool_use_is_true(self) -> None:
+        """A tool call is durable evidence the agent DID something."""
+        records = [
+            _user(),
+            _assistant([_text('reading the plan'), _tool_use('Read')]),
+        ]
+        assert detect_resumable_progress(records) is True
+
+    def test_assistant_tool_use_flat_nesting_is_true(self) -> None:
+        """tool_use must be found under the flat nesting too."""
+        records = [_user(), _assistant([_tool_use('Bash', command='ls')], nested=False)]
+        assert detect_resumable_progress(records) is True
+
+    def test_two_text_only_assistant_turns_is_true(self) -> None:
+        """Deliberately protects prose-only workers (synthesis, judge, review
+        agents) whose accumulated reasoning IS the thing worth resuming."""
+        records = [
+            _user(),
+            _assistant([_text('first, the trade-offs are ...')]),
+            _assistant([_text('on balance I recommend ...')]),
+        ]
+        assert detect_resumable_progress(records) is True
+
+    def test_many_text_only_assistant_turns_is_true(self) -> None:
+        """A long prose-only run must never be discarded."""
+        records = [_user()] + [_assistant([_text(f'para {i}')]) for i in range(12)]
+        assert detect_resumable_progress(records) is True
+
+    def test_tool_use_in_single_assistant_turn_beats_the_turn_count(self) -> None:
+        """<=1 assistant turn is only half the False condition — a lone turn
+        that made a tool call is genuine progress."""
+        assert detect_resumable_progress([_assistant([_tool_use('Write')])]) is True
+
+    # ── Fail-safe: ambiguity NEVER yields False ─────────────────────────────
+
+    def test_none_records_is_true(self) -> None:
+        """An unreadable transcript is ambiguous, not proven-empty → resume."""
+        assert detect_resumable_progress(None) is True
+
+    def test_non_dict_records_are_true(self) -> None:
+        """Garbage records cannot prove emptiness → resume, and never raise."""
+        assert detect_resumable_progress(['nonsense', 42, None, ['x']]) is True
+
+    def test_mixed_garbage_and_text_turn_is_true(self) -> None:
+        """A single text-only turn ALONGSIDE unparseable records is ambiguous:
+        the garbage may itself have been an assistant turn."""
+        records = [_user(), 'garbage', _assistant([_text()])]
+        assert detect_resumable_progress(records) is True
+
+    def test_assistant_with_non_list_content_is_true(self) -> None:
+        """An unrecognised content shape is ambiguous → resume."""
+        assert detect_resumable_progress(
+            [{'type': 'assistant', 'message': {'content': 'a bare string'}}]
+        ) is True
+
+    def test_assistant_with_no_content_key_is_true(self) -> None:
+        """A record with no content at all is an unknown shape → resume."""
+        assert detect_resumable_progress([{'type': 'assistant'}]) is True
+
+    def test_non_dict_blocks_are_true(self) -> None:
+        """Blocks that are not dicts are ambiguous → resume, and never raise."""
+        assert detect_resumable_progress([_assistant(['a string block', 7, None])]) is True
+
+    def test_blocks_missing_type_key_are_true(self) -> None:
+        """A block with no 'type' could be anything, including a tool call."""
+        assert detect_resumable_progress(
+            [_assistant([{'name': 'Read', 'input': {'file_path': '/x'}}])]
+        ) is True
+
+    def test_unknown_block_type_is_true(self) -> None:
+        """A block type this predicate does not model (e.g. a future
+        'thinking'/'server_tool_use' shape) must not be read as emptiness."""
+        assert detect_resumable_progress(
+            [_assistant([{'type': 'server_tool_use', 'name': 'WebSearch'}])]
+        ) is True
+
+    def test_malformed_input_never_raises(self) -> None:
+        """Totality contract: every hostile shape returns a bool, never raises."""
+        for records in (
+            None,
+            [],
+            [None],
+            [{}],
+            [{'type': 'assistant', 'message': None}],
+            [{'type': 'assistant', 'message': {'content': None}}],
+            [{'type': 'assistant', 'content': {'not': 'a list'}}],
+            [{'type': None}],
+            ['', 0, False, ()],
+        ):
+            assert isinstance(detect_resumable_progress(records), bool)
