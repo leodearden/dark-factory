@@ -21,6 +21,7 @@ tautology.
 """
 from __future__ import annotations
 
+import logging
 import re
 
 import pytest
@@ -196,3 +197,226 @@ class TestPagedRoQueryHappyPath:
         # Rows arrive in corpus order, un-reshuffled and un-dropped.
         assert paged.rows[0] == graph.corpus[0]
         assert paged.rows[-1] == graph.corpus[-1]
+
+
+# ---------------------------------------------------------------------------
+# step-3: the four independent fail-closed completeness paths
+# ---------------------------------------------------------------------------
+#
+# The two KINDS are deliberately not redundant. ``resultset_size`` is an
+# ASSUMPTION about server configuration that this repo does not set; if the
+# live server is ever configured BELOW it, the structural check passes and the
+# short-page break lies exactly as it does today — the identical silent
+# truncation, undetected. The census is a single-row count over the identical
+# MATCH/WHERE, and a single row can never be truncated by the row cap it is
+# being used to detect, which is what makes ``rows_seen >= expected_rows`` a
+# proof rather than one more heuristic. Conversely the structural check fails
+# FAST, before any work, with an operator-actionable reason. Neither subsumes
+# the other.
+
+
+def _warnings(caplog) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno >= logging.WARNING
+    ]
+
+
+class TestPagedRoQueryStructuralGuards:
+    """Guards that fire on the numbers alone, before any evidence is gathered."""
+
+    @pytest.mark.parametrize('page_size', [10000, 10001, 20000])
+    @pytest.mark.asyncio
+    async def test_page_size_at_or_above_cap_refuses_to_enumerate(
+        self, page_size, caplog
+    ):
+        """At or above the cap, refuse outright and return NO rows.
+
+        The short-page break reasons "this page was not full, so the data is
+        exhausted", which is sound ONLY if the server cannot be what shortened
+        it. At or above the cap those two causes are indistinguishable, so
+        there is nothing trustworthy to return — and a partial list would
+        simply invite a caller to use it anyway, recreating the
+        silently-short-collection defect one layer up.
+
+        The comparison is ``>=`` and not ``>`` deliberately: equality is
+        arithmetically safe on a server configured at exactly 10000, but since
+        that constant is an assumption, equality leaves zero margin.
+        """
+        from fused_memory.backends.graphiti_client import _paged_ro_query
+
+        graph = FakeCappedGraph(make_edge_corpus(100), resultset_cap=None)
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            paged = await _paged_ro_query(
+                graph,
+                _PAGE_TEMPLATE,
+                _CENSUS_CYPHER,
+                page_size=page_size,
+                resultset_size=_LIVE_RESULTSET_CAP,
+            )
+        assert paged.complete is False
+        assert paged.rows == []
+        assert paged.rows_seen == 0
+        assert paged.expected_rows is None
+        assert isinstance(paged.reason, str) and paged.reason
+        assert str(page_size) in paged.reason
+        assert str(_LIVE_RESULTSET_CAP) in paged.reason
+        # Fails FAST: not one query was issued.
+        assert graph.queries == []
+        assert any(
+            str(page_size) in m and str(_LIVE_RESULTSET_CAP) in m
+            for m in _warnings(caplog)
+        )
+
+    @pytest.mark.asyncio
+    async def test_max_pages_exhausted_on_a_full_page_reports_shortfall(self, caplog):
+        """Running out of pages while the last one was still full is REPORTED.
+
+        A page cap that truncated in silence would just be the defect this
+        module exists to fix, moved one layer up. The rows fetched so far ARE
+        returned here — they were really fetched — but ``complete`` is False.
+        """
+        from fused_memory.backends.graphiti_client import _paged_ro_query
+
+        graph = FakeCappedGraph(make_edge_corpus(100), resultset_cap=None)
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            paged = await _paged_ro_query(
+                graph, _PAGE_TEMPLATE, _CENSUS_CYPHER, page_size=10, max_pages=2
+            )
+        assert paged.complete is False
+        assert paged.rows_seen == 20
+        assert len(paged.rows) == 20
+        assert isinstance(paged.reason, str) and paged.reason
+        assert '2' in paged.reason and '20' in paged.reason
+        assert any('20' in m for m in _warnings(caplog))
+
+
+class TestPagedRoQueryCensusGuards:
+    """Guards that compare what was fetched against what the server says exists."""
+
+    @pytest.mark.parametrize(
+        'census_result_set',
+        [
+            pytest.param([], id='empty-result-set'),
+            pytest.param(None, id='null-result-set'),
+            pytest.param([[]], id='row-with-no-columns'),
+            pytest.param([[None]], id='null-count'),
+            pytest.param([['not-a-number']], id='non-integer-count'),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_unusable_census_is_not_a_passing_proof(
+        self, census_result_set, caplog
+    ):
+        """An unavailable proof is not a passing proof — but the rows still come back.
+
+        Unlike the structural refusal, the DATA here was fetched fine; only the
+        PROOF is missing. Every "the store did not say" shape collapses to the
+        same fail-closed verdict because the caller treats them identically and
+        there is nothing to gain from distinguishing flavours of missing
+        evidence.
+        """
+        from fused_memory.backends.graphiti_client import _paged_ro_query
+
+        graph = FakeCappedGraph(
+            make_edge_corpus(100),
+            resultset_cap=None,
+            census_result_set=census_result_set,
+            census_result_set_set=True,
+        )
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            paged = await _paged_ro_query(
+                graph, _PAGE_TEMPLATE, _CENSUS_CYPHER, page_size=10
+            )
+        assert paged.expected_rows is None
+        assert paged.complete is False
+        assert isinstance(paged.reason, str) and paged.reason
+        assert paged.rows_seen == 100
+        assert len(paged.rows) == 100
+        assert _warnings(caplog)
+
+    @pytest.mark.asyncio
+    async def test_census_reports_more_rows_than_enumerated_is_incomplete(self, caplog):
+        """A SHORTFALL is the truncation signature: report it, naming both numbers."""
+        from fused_memory.backends.graphiti_client import _paged_ro_query
+
+        graph = FakeCappedGraph(
+            make_edge_corpus(100), resultset_cap=None, census_override=150
+        )
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            paged = await _paged_ro_query(
+                graph, _PAGE_TEMPLATE, _CENSUS_CYPHER, page_size=10
+            )
+        assert paged.complete is False
+        assert paged.rows_seen == 100
+        assert paged.expected_rows == 150
+        assert isinstance(paged.reason, str) and paged.reason
+        assert '100' in paged.reason and '150' in paged.reason
+        assert any('100' in m and '150' in m for m in _warnings(caplog))
+
+    @pytest.mark.asyncio
+    async def test_census_reports_fewer_rows_than_enumerated_is_complete(self, caplog):
+        """THE ASYMMETRY PIN: growth between the census and the last page is not truncation.
+
+        Completeness is ``rows_seen >= expected_rows``, not ``==``. These
+        graphs are written to continuously by the live memory service, so
+        strict equality would flip a healthy read to INCOMPLETE on any
+        concurrent add_memory — and a warning that fires constantly is a
+        warning nobody reads, which would reintroduce the exact silence this
+        task exists to remove, just noisier. Only a SHORTFALL is the
+        truncation signature.
+        """
+        from fused_memory.backends.graphiti_client import _paged_ro_query
+
+        graph = FakeCappedGraph(
+            make_edge_corpus(100), resultset_cap=None, census_override=50
+        )
+        with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+            paged = await _paged_ro_query(
+                graph, _PAGE_TEMPLATE, _CENSUS_CYPHER, page_size=10
+            )
+        assert paged.complete is True
+        assert paged.reason is None
+        assert paged.rows_seen == 100
+        assert paged.expected_rows == 50
+        assert _warnings(caplog) == []
+
+
+class TestPagedReadReasonInvariant:
+    """``reason`` is None exactly when ``complete`` is True — in every case above."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'kwargs, graph_kwargs',
+        [
+            pytest.param({'page_size': 10}, {}, id='complete'),
+            pytest.param(
+                {'page_size': 10, 'resultset_size': 10}, {}, id='structural-refusal'
+            ),
+            pytest.param(
+                {'page_size': 10, 'max_pages': 2}, {}, id='max-pages-exhausted'
+            ),
+            pytest.param(
+                {'page_size': 10},
+                {'census_result_set': [], 'census_result_set_set': True},
+                id='unusable-census',
+            ),
+            pytest.param(
+                {'page_size': 10}, {'census_override': 150}, id='census-shortfall'
+            ),
+        ],
+    )
+    async def test_reason_is_none_exactly_when_complete(self, kwargs, graph_kwargs):
+        from fused_memory.backends.graphiti_client import _paged_ro_query
+
+        graph = FakeCappedGraph(
+            make_edge_corpus(100), resultset_cap=None, **graph_kwargs
+        )
+        paged = await _paged_ro_query(
+            graph, _PAGE_TEMPLATE, _CENSUS_CYPHER, **kwargs
+        )
+        if paged.complete:
+            assert paged.reason is None
+        else:
+            assert isinstance(paged.reason, str) and paged.reason
