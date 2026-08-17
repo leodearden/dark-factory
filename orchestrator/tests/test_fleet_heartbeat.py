@@ -203,6 +203,67 @@ class TestWriteHeartbeat:
         assert result == tmp_path / 'unknown-unit.json'
 
 
+class TestEmptyUnitIsRefused:
+    """An empty ``ORCH_UNIT`` must never produce a heartbeat file (task 3951).
+
+    The unit-level half of one behaviour; the producer-level half is
+    ``test_harness_merge_heartbeat.py``'s ``test_empty_unit_writes_nothing_and_
+    is_logged_not_raised``.
+
+    This replaces the former ``unknown-unit.json`` fallback, which was written
+    to make an unresolved unit produce a deterministic filename rather than a
+    file literally named ``.json``.  That trade was wrong in the direction it
+    chose: nothing READS ``unknown-unit.json`` (``scripts/drain_check.py``
+    addresses heartbeats BY NAME via ``heartbeat_path(fleet_dir, unit)`` and
+    never enumerates the directory), so the fallback bought no consumer
+    anything while quietly turning "this writer has no unit name" — a real
+    misconfiguration — into a plausible-looking file in a machine-global,
+    cross-project directory.  Raising makes the next unnamed writer loud at the
+    moment it appears.
+    """
+
+    def test_empty_unit_raises_and_writes_nothing(self, tmp_path):
+        """unit='' raises ValueError naming ORCH_UNIT, and creates NO file."""
+        payload = build_heartbeat_payload(
+            unit='',
+            merge_idle=True,
+            depth=0,
+            queue_empty=True,
+            ts_epoch=555.0,
+        )
+
+        with pytest.raises(ValueError, match='ORCH_UNIT'):
+            write_heartbeat(tmp_path, '', payload)
+
+        # The assertion that actually pins "no corruption": it covers the final
+        # name, the retired unknown-unit.json, AND any .json.tmp residue from a
+        # partial write — so the guard must run BEFORE any filesystem work.
+        assert list(tmp_path.iterdir()) == []
+
+    def test_whitespace_only_unit_raises_and_writes_nothing(self, tmp_path):
+        """unit='   ' is the same defect: rejected, never stripped into a name.
+
+        ``unit if unit else …`` treated a whitespace-only unit as truthy and
+        would have written a file literally named ``   .json`` — an equally
+        corrupt artifact in the same directory, from the same defect class (a
+        writer that reached production without a real unit set).  Silently
+        repairing it into a plausible name is the silent-degradation this guard
+        exists to end; the caller learns its unit name is malformed instead.
+        """
+        payload = build_heartbeat_payload(
+            unit='   ',
+            merge_idle=True,
+            depth=0,
+            queue_empty=True,
+            ts_epoch=666.0,
+        )
+
+        with pytest.raises(ValueError, match='ORCH_UNIT'):
+            write_heartbeat(tmp_path, '   ', payload)
+
+        assert list(tmp_path.iterdir()) == []
+
+
 class TestDelegatesToSharedAtomicWriter:
     """``fleet_heartbeat.write_heartbeat`` delegates to ``shared.safe_io.atomic_write_text``.
 
