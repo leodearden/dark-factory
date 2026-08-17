@@ -53,6 +53,8 @@ Fixtures are kept module-local (no conftest.py additions), matching
 from __future__ import annotations
 
 import asyncio
+import errno
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -61,6 +63,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
 from shared.config_dir import TaskConfigDir
+from shared.transcript_archive import _archival_failures, _reset_archival_failures
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import SIMPLE_TASK
@@ -680,3 +683,87 @@ class TestE3BackstopIdempotent:
         assert not src_b.exists()
         assert str(cwd) not in await _git_worktree_list(git_repo)
         assert not list(_archive_root(git_repo).rglob('*.archive-tmp'))
+
+
+# ---------------------------------------------------------------------------
+# E7 — an archive failure is SOFT (task still succeeds) and LOUD (counted+logged)
+# ---------------------------------------------------------------------------
+
+# The producer's own defense-in-depth log line. E7 asserts it is ABSENT, which
+# is what pins the division of labour: archive_task_transcripts is TOTAL, so a
+# per-file OSError is absorbed and counted INSIDE the helper and never reaches
+# _invoke's `except Exception`.
+_PRODUCER_HOOK_WARNING = 'Transcript archival hook failed'
+
+
+@pytest.mark.asyncio
+class TestE7FailureIsSoftAndLoud:
+    """E7 — a broken archive destination never breaks the task, and never
+    fails silently.
+
+    The failure is induced by placing a regular FILE at
+    ``<archive_root>/<task_id>``, so ``_archive_one``'s
+    ``dest.parent.mkdir(parents=True, exist_ok=True)`` raises
+    ``NotADirectoryError`` (ENOTDIR). Deliberately NOT a ``chmod`` of the
+    archive root as Appendix B literally suggests: a chmod row silently becomes
+    a NO-OP when tests run as root (passing vacuously while asserting nothing),
+    and a restrictive-mode directory left behind breaks pytest's tmp_path
+    teardown. ENOTDIR is deterministic, self-cleaning, and produces a real
+    ``OSError`` with a real ``errno`` for the structured-fact assertion —
+    exercising the same ``except OSError`` -> ``_record_failure`` path a full
+    disk would.
+    """
+
+    async def test_broken_archive_root_neither_breaks_nor_silences(
+        self, monkeypatch, caplog, git_repo, git_ops, task_assignment
+    ):
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        config = _config(git_repo)
+        workflow, cwd = await _make_workflow(config, git_ops, task_assignment)
+
+        # A regular FILE where the per-task archive DIRECTORY needs to be.
+        archive_root = _archive_root(git_repo)
+        archive_root.mkdir(parents=True)
+        blocker = archive_root / TASK_ID
+        blocker.write_bytes(b'not a directory\n')
+
+        # The counter is a process-global; start from a known value.
+        _reset_archival_failures()
+
+        with caplog.at_level(logging.WARNING):
+            result, sid, src = await _producer_invoke(
+                workflow, cwd, payload=b'{"type":"user"}\n'
+            )
+
+        # SOFT — the task completed. Archival must never break a task.
+        assert result.success is True
+        assert workflow._last_invoke_session_id == sid
+
+        # LOUD (machine-readable half) — the failure was counted.
+        assert _archival_failures() == 1
+
+        # LOUD (human half) — exactly one structured WARNING from the archiver,
+        # naming the source transcript and carrying path/task_id/errno.
+        archiver_warnings = [
+            r for r in caplog.records
+            if r.name == 'shared.transcript_archive' and r.levelno == logging.WARNING
+        ]
+        assert len(archiver_warnings) == 1
+        record = archiver_warnings[0]
+        assert str(src) in record.getMessage()
+        assert record.path == str(src)
+        assert record.task_id == TASK_ID
+        assert record.errno == errno.ENOTDIR
+
+        # DIVISION OF LABOUR — the helper is TOTAL, so the OSError was absorbed
+        # inside it and the producer's own `except Exception` never fired.
+        assert not [
+            r for r in caplog.records if _PRODUCER_HOOK_WARNING in r.getMessage()
+        ]
+
+        # NOTHING PUBLISHED — no staging debris, and the blocker is untouched
+        # (no directory was created over it, no partial written beside it).
+        assert blocker.is_file()
+        assert blocker.read_bytes() == b'not a directory\n'
+        assert not list(archive_root.rglob('*.archive-tmp'))
+        assert {p.name for p in archive_root.iterdir()} == {TASK_ID}
