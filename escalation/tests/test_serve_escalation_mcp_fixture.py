@@ -8,17 +8,17 @@ it is shared, its contract is tested HERE, once — rather than as N byte-simila
 copies of the same regression test, one per consumer module, which is the
 lockstep duplication (INV-5) task 3736 exists to remove.
 
-``import conftest`` rather than fixture injection: these tests need the RAW
-module attributes — the undecorated fixture generator via ``__wrapped__``, so
-one server's startup and teardown can be observed in isolation from the
-module-scoped instance serving other tests, plus module-level helpers that are
-not fixtures at all. conftest.py's own header notes that ``from conftest
-import ...`` is fragile under the repo-wide ``--import-mode=importlib``
-addopts; a plain ``import conftest`` is verified to resolve to
-``escalation/tests/conftest.py`` under BOTH rootdirs this suite is run from
-(``cd escalation && uv run pytest tests/`` in the verify lane, and ``uv run
-pytest escalation/tests`` from the repo root, where a repo-root conftest.py
-also exists).
+These tests need the RAW module attributes — the undecorated fixture generator
+via ``__wrapped__``, so one server's startup and teardown can be observed in
+isolation from the module-scoped instance serving other tests, plus
+module-level helpers that are not fixtures at all. conftest hands ITSELF over
+for exactly that, through the ``escalation_conftest`` fixture. Injection, not
+a module-level ``import conftest``, is what makes the reference correct under
+any collection order: under the repo-wide ``--import-mode=importlib`` addopts
+pytest names a conftest BY COLLISION, so the bare name belongs to whichever
+conftest claimed it first — which in any repo-root multi-package run is not
+this one. See
+``test_the_conftest_reference_is_resolved_by_identity_not_by_bare_name``.
 """
 
 from __future__ import annotations
@@ -32,30 +32,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-import conftest as _conftest_module
 import pytest
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 
-# Deliberately re-bound through an ``Any`` alias, so the accesses below are not
-# type-checked against whichever ``conftest`` pyright happened to resolve. Two
-# things make a statically-checked ``conftest.<attr>`` unreliable HERE, and the
-# alias closes both:
-#
-# 1. WHICH conftest. ``escalation/pyproject.toml``'s ``[tool.pyright]`` carries
-#    BOTH ``tests`` and ``..`` on extraPaths, and each holds a ``conftest.py``
-#    (this suite's, and the repo-root sys.path shim). Measured: pyright resolves
-#    the bare name to a different one of the two depending on the directory it
-#    is invoked from, so the attributes below read as missing from "module
-#    conftest" in some invocations and resolve fine in others.
-# 2. ``__wrapped__``. ``@pytest.fixture`` types its result as
-#    ``FixtureFunctionDefinition``, which does not declare the ``__wrapped__``
-#    that pytest sets at runtime -- the undecorated generator this module needs
-#    (see the docstring) is reachable only through that undeclared attribute.
-#
-# Runtime is untouched: this is the same ``import conftest``, so the empirically
-# verified resolution to ``escalation/tests/conftest.py`` still applies.
-conftest: Any = _conftest_module
+# The injected ``escalation_conftest`` is annotated ``Any`` for one reason:
+# ``@pytest.fixture`` types its result as ``FixtureFunctionDefinition``, which
+# does not declare the ``__wrapped__`` that pytest sets at runtime -- and the
+# undecorated generator this module needs (see the docstring) is reachable only
+# through that undeclared attribute.
 
 # ---------------------------------------------------------------------------
 # The conftest reference must be resolved by IDENTITY, not by bare module name.
@@ -170,7 +155,9 @@ def _listener_without_mcp_route() -> Iterator[int]:
 # ---------------------------------------------------------------------------
 
 
-def test_handshake_readiness_rejects_a_live_port_without_the_mcp_route() -> None:
+def test_handshake_readiness_rejects_a_live_port_without_the_mcp_route(
+    escalation_conftest: Any,
+) -> None:
     """``_mcp_handshake_ready`` must reject a port that merely ACCEPTS.
 
     Both assertions below are made against the SAME port, so the
@@ -189,7 +176,9 @@ def test_handshake_readiness_rejects_a_live_port_without_the_mcp_route() -> None
         with socket.create_connection(('127.0.0.1', port), timeout=1.0):
             pass  # the weaker probe succeeds here, i.e. would report "ready"
 
-        ready = asyncio.run(conftest._mcp_handshake_ready(f'http://127.0.0.1:{port}'))
+        ready = asyncio.run(
+            escalation_conftest._mcp_handshake_ready(f'http://127.0.0.1:{port}')
+        )
 
         assert ready is False, (
             'a live TCP port with no /mcp/ route must NOT read as ready -- '
@@ -204,6 +193,7 @@ def test_handshake_readiness_rejects_a_live_port_without_the_mcp_route() -> None
 
 
 def test_startup_failure_that_is_not_a_runtimeerror_is_named_in_the_timeout(
+    escalation_conftest: Any,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -226,9 +216,9 @@ def test_startup_failure_that_is_not_a_runtimeerror_is_named_in_the_timeout(
     inside the suite's 60s per-test pytest-timeout.
     """
     with _listener_without_mcp_route() as port:
-        monkeypatch.setattr(conftest, '_free_escalation_port', lambda: port)
+        monkeypatch.setattr(escalation_conftest, '_free_escalation_port', lambda: port)
 
-        gen = conftest.serve_escalation_mcp.__wrapped__()
+        gen = escalation_conftest.serve_escalation_mcp.__wrapped__()
         try:
             start = next(gen)
             with pytest.raises(RuntimeError) as excinfo:
@@ -308,6 +298,7 @@ def test_a_module_scoped_fixture_may_depend_on_serve_escalation_mcp(
 
 
 def test_the_fixture_stops_its_serving_thread_on_teardown(
+    escalation_conftest: Any,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> None:
     """Regression test (task 2741): ``serve_escalation_mcp`` must explicitly
@@ -331,7 +322,7 @@ def test_the_fixture_stops_its_serving_thread_on_teardown(
     name identify exactly one thread, this test's.
     """
     before = set(threading.enumerate())
-    gen = conftest.serve_escalation_mcp.__wrapped__()
+    gen = escalation_conftest.serve_escalation_mcp.__wrapped__()
     try:
         start = next(gen)
         _base_url, port, _queue = start(tmp_path_factory.mktemp('serve_teardown'))
