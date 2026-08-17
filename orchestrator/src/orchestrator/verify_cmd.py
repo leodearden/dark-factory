@@ -83,6 +83,12 @@ class VerifyCmd:
     entry (set by ``govern_cpu``) is treated as a resolved cpu-governed-exec
     path and wraps the *entire* rendered command as an outermost
     ``/bin/bash -c`` payload.
+
+    ``tool_version`` carries the ``@<version>`` suffix of an npx PACKAGE SPEC
+    (``npx pyright@1.1.408`` -> ``'1.1.408'``), so ``render`` can reproduce a
+    pinned spelling that ``_TOOL_HEAD`` alone cannot. It defaults to ``None``
+    — the unpinned spelling — which keeps dataclass equality and ``replace()``
+    semantics identical to before task 3931 for every command in the tree.
     """
 
     tool: ToolKind
@@ -93,6 +99,7 @@ class VerifyCmd:
     env: Mapping[str, str] = field(default_factory=dict)
     wrappers: tuple[str, ...] = ()
     raw: str | None = None
+    tool_version: str | None = None
 
 
 # Shell chain-delimiter tokens. shlex.split has no concept of shell operators —
@@ -496,7 +503,18 @@ def _segment_invokes_tool(segment: str, keyword: str) -> bool:
         head_positions.add(idx + 2)
 
     kw_tokens = keyword.split()
-    return any(tokens[i : i + len(kw_tokens)] == kw_tokens for i in head_positions)
+    if any(tokens[i : i + len(kw_tokens)] == kw_tokens for i in head_positions):
+        return True
+    # Task 3931 / esc-3805-1: a VERSIONED npx package spec still invokes the
+    # tool. `npx pyright@1.1.408` puts `pyright@1.1.408` at the head position,
+    # which exact token equality above reads as "does not invoke pyright" — so
+    # split_chain_tail's later-segment scan stops seeing a pinned clause and
+    # can flip the chain's accept/reject verdict purely because a version was
+    # pinned. Matched only at an npx head position and only for a single-token
+    # keyword, so a `@` in any other position is still no match.
+    if tokens[0:1] == ['npx'] and len(kw_tokens) == 1 and len(tokens) > 1:
+        return tokens[1].startswith(f'{kw_tokens[0]}@')
+    return False
 
 
 def split_chain_tail(raw: str, keyword: str) -> tuple[str, str]:
@@ -1056,6 +1074,7 @@ def _parse_single_segment(raw: str, tokens: list[str]) -> VerifyCmd:
 
     head = rest[0]
     wrappers: tuple[str, ...] = ()
+    tool_version: str | None = None
     if head == 'pytest':
         tool = ToolKind.PYTEST
         rest = rest[1:]
@@ -1072,9 +1091,23 @@ def _parse_single_segment(raw: str, tokens: list[str]) -> VerifyCmd:
         tool = ToolKind.CARGO_CLIPPY
         rest = rest[2:]
     elif head == 'npx':
-        if rest[1:2] == ['pyright']:
+        # Task 3931 / esc-3805-1: accept a VERSIONED npx package spec
+        # (`npx pyright@1.1.408`) as a pyright invocation, not just the bare
+        # token. This branch previously compared by exact token equality, so
+        # any pinned spelling fell through to ToolKind.NPX below — the command
+        # stopped being recognised as pyright at all, and `scope_to` then
+        # treated `pyright@1.1.408` as a TARGET and REPLACED it with the
+        # touched file (measured: `npx pyright@1.1.408` scoped to `a/b.py`
+        # rendered as `npx a/b.py`). Pinning the YAML alone was therefore a
+        # silent no-op on precisely the FILE_SCOPED path that generated
+        # esc-3805-1. Split on the FIRST `@` only: npm scoped names
+        # (`@scope/pkg@ver`) keep their leading `@` in the package part.
+        pkg = rest[1] if len(rest) > 1 else ''
+        pkg_name, _, pkg_version = pkg.partition('@') if not pkg.startswith('@') else (pkg, '', '')
+        if pkg_name == 'pyright':
             tool = ToolKind.PYRIGHT
             wrappers = ('npx',)
+            tool_version = pkg_version or None
             rest = rest[2:]
         else:
             tool = ToolKind.NPX
@@ -1111,6 +1144,7 @@ def _parse_single_segment(raw: str, tokens: list[str]) -> VerifyCmd:
         targets=targets,
         wrappers=wrappers,
         raw=None,
+        tool_version=tool_version,
     )
 
 
@@ -1197,9 +1231,21 @@ def _render_structured(cmd: VerifyCmd) -> str:
             segments.append(f'uv run --project {shlex.quote(cmd.uv_project)}')
         else:
             segments.append('uv run')
-    if 'npx' in cmd.wrappers:
+    npx_wrapped = 'npx' in cmd.wrappers
+    if npx_wrapped:
         segments.append('npx')
-    segments.append(_TOOL_HEAD[cmd.tool])
+    head = _TOOL_HEAD[cmd.tool]
+    if npx_wrapped and cmd.tool_version is not None:
+        # Task 3931 / esc-3805-1: emit the VERSIONED npx package spec
+        # (`pyright@1.1.408`) rather than the bare `_TOOL_HEAD` value.
+        # Rebuilding the head from that constant unconditionally is what made
+        # a pin unrecoverable — a pinned YAML clause rendered back out
+        # UNPINNED, so the gate advertised a fixed pyright while running
+        # whatever npx last cached. Gated on the npx wrapper deliberately:
+        # `_TOOL_HEAD` is shared with the non-npx `pyright` spelling, which
+        # names a resolved executable and takes no package version.
+        head = f'{head}@{cmd.tool_version}'
+    segments.append(head)
     segments.extend(shlex.quote(flag) for flag in cmd.base_flags)
     segments.extend(shlex.quote(target) for target in cmd.targets)
     return ' '.join(segments)
