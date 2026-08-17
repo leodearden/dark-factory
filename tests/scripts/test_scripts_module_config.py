@@ -462,6 +462,93 @@ def _dir_keys(targets: list[str]) -> list[str]:
     return [_dir_key(t) for t in targets]
 
 
+def test_narrowing_flag_detection_is_scoped_to_the_checkers_own_arguments() -> None:
+    """``_narrowing_flag_args`` must read only the tokens AFTER the checker anchor.
+
+    Task 4358. ``uv run --project <member> pyright <dir>`` and
+    ``pyright --project <file> <dir>`` contain the SAME CHARACTERS naming two
+    unrelated things, and only POSITION tells them apart:
+
+      * ``uv``'s ``--project`` (PRE-anchor) selects the ENVIRONMENT the checker
+        is resolved from — which member venv supplies the ``pyright`` binary. It
+        narrows NOTHING about what gets checked.
+      * pyright's own ``-p``/``--project`` (POST-anchor) points pyright at a
+        DIFFERENT CONFIG FILE, which can relax ``typeCheckingMode``, add
+        excludes, or drop ``extraPaths`` wholesale. That is the sharpest
+        carve-out vector this file guards, and assertion (c) of
+        ``test_scripts_diff_is_type_gated`` provably cannot see it — ``_targets``
+        discards every ``-``-prefixed token, so ``pyright -p /tmp/lax.json
+        scripts/`` still lists ``'scripts/'`` among its targets.
+
+    THE OBVIOUS "FIX" FOR CASE (a) IS THE WRONG ONE, which is why case (b)
+    exists. Deleting ``-p``/``--project`` from ``_NARROWING_FLAGS[_PYRIGHT]``
+    also makes (a) pass, and simultaneously un-guards the real config-redirect
+    vector — trading a false positive for a silent hole. Discriminate by
+    position, not by dropping the flag.
+
+    The property is not new to this file: ``_targets`` has always sliced
+    ``tokens[tokens.index(anchor) + 1:]``, and the ``_PYTEST`` comment above
+    records that "the anchor placement is what excludes the pre-anchor
+    positional ``shared`` of ``uv run --project shared pytest ...``".
+    ``_narrowing_flag_args`` is the one helper that never received it, latent
+    only because ruff's three exclude spellings happen not to collide with any
+    ``uv run`` flag — so the already-uv-fronted ``lint_command`` never tripped
+    it.
+    """
+    # (a) uv's environment selector is NOT a pyright narrowing flag. RED before
+    # task 4358: whole-segment tokenisation returns ['--project'] here.
+    assert _narrowing_flag_args('uv run --project shared pyright scripts/', _PYRIGHT) == [], (
+        "uv's PRE-anchor `--project shared` selects the ENVIRONMENT pyright is "
+        'resolved from, not a pyright config file, so it narrows nothing about '
+        'what gets checked. Reading it as a narrowing flag makes '
+        'test_scripts_diff_is_type_gated assertion (d) fail with a message '
+        'accusing the author of un-gating the type check, on a command that '
+        'gates it fully — a false positive on two homographic flags in '
+        'different segments of one command line. Scope the scan to the tokens '
+        'AFTER the checker anchor, as _targets already does; do NOT fix this by '
+        'removing --project from _NARROWING_FLAGS (see case (b))'
+    )
+
+    # (b) A REAL post-anchor redirect is still caught, so (a) does not buy its
+    # pass by disabling the check.
+    assert _narrowing_flag_args(
+        'uv run --project shared pyright -p /tmp/lax.json scripts/', _PYRIGHT
+    ) == ['-p'], (
+        "pyright's OWN post-anchor -p/--project points it at a different config "
+        'file, which can relax typeCheckingMode, add excludes or drop '
+        'extraPaths wholesale while the declared command still names scripts/ '
+        'and still exits 0. This assertion is what stops case (a) being '
+        '"fixed" by deleting -p/--project from _NARROWING_FLAGS[_PYRIGHT]: that '
+        'edit would silence the false positive AND leave the sharpest carve-out '
+        'vector in this file unguarded'
+    )
+
+    # (c) The other genuine pyright narrowing spelling, also post-anchor.
+    assert _narrowing_flag_args(
+        'uv run --project shared pyright --skipunannotated scripts/', _PYRIGHT
+    ) == ['--skipunannotated'], (
+        '--skipunannotated drops every unannotated function from analysis, so a '
+        'directory-wide target checks far less than it appears to. It is '
+        'prefix-matched via --skip so a future --skip<x> is caught too; '
+        'anchor-scoping must not cost that'
+    )
+
+    # (d) ruff shares this helper through _ruff_exclude_flags and must not be
+    # regressed by the fix — its spellings are all post-anchor too.
+    assert _ruff_exclude_flags(
+        'uv run --project shared ruff check scripts/ --exclude foo'
+    ) == ['--exclude'], (
+        "ruff's three exclude spellings never collided with a `uv run` flag, "
+        'which is why this helper survived un-scoped for so long. '
+        'Anchor-scoping is a strict improvement for ruff rather than a '
+        'trade-off, and this assertion pins that it stays one'
+    )
+    assert _ruff_exclude_flags('uv run --project shared ruff check scripts/') == [], (
+        "the repo's actual scripts/ lint_command carries no exclude flag, and "
+        "uv's pre-anchor --project must not be mistaken for one here either"
+    )
+
+
 def test_executed_for_touched_is_hermetic_against_the_ambient_orch_config_path(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
