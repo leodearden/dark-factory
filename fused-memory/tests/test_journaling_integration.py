@@ -1,5 +1,6 @@
 """Integration tests verifying causation_id flows through all paths."""
 
+import asyncio
 import uuid
 from unittest.mock import AsyncMock, MagicMock
 
@@ -299,3 +300,51 @@ async def test_execute_mem0_write_still_journals_on_success(service, write_journ
     assert row['success'] == 1
     assert row['error'] is None
     assert row['result_summary'] is not None
+
+
+@pytest.mark.asyncio
+async def test_execute_mem0_write_journals_cancellation_as_failure(
+    service, write_journal
+):
+    """A CANCELLED queued mem0 write must never journal as a success.
+
+    The durable queue cancels a write in two ordinary ways: the
+    ``asyncio.wait_for(..., self._write_timeout_seconds)`` around every
+    execute (durable_queue.py), and ``close()`` cancelling its worker tasks.
+    Either way the write provably never executed — so the Layer-1 row must
+    say so. ``success`` was derived from the ABSENCE of a recorded error, and
+    ``asyncio.CancelledError`` is a BaseException that sails past
+    ``except Exception``, so the ``finally`` journalled ``success=True`` for a
+    write that never reached mem0 at all.
+
+    Task 3582's property is preserved, not traded away: the row must still
+    EXIST on the cancellation path. Only its content changes.
+    """
+    op_id = str(uuid.uuid4())
+
+    # A plain hanging coroutine function, deliberately NOT an AsyncMock
+    # side_effect: the await must be a real suspension point so wait_for can
+    # actually cancel it mid-flight.
+    async def _hang(*_args, **_kwargs):
+        await asyncio.sleep(30)
+
+    service.mem0.add = _hang
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(
+            service._execute_mem0_write(
+                {
+                    'content': 'a fact cancelled mid-flight',
+                    'project_id': 'test',
+                    '_write_op_id': op_id,
+                    'metadata': {'category': 'preferences_and_norms'},
+                }
+            ),
+            0.2,
+        )
+
+    row = await write_journal.get_write_op(op_id)
+    assert row is not None, 'a cancelled queued mem0 write must still be journaled'
+    assert row['operation'] == 'add_memory'
+    assert row['success'] == 0, 'a cancelled write never landed — it is not a success'
+    assert 'CancelledError' in (row['error'] or '')
