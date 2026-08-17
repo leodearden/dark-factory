@@ -1291,6 +1291,20 @@ def run_nightly(
             )
 
         census_line, census_fire = evaluate_census_step(cfg, now=now, status_fetcher=status_fetcher)
+        # Task 4148. The decision was computed and returned on NightlyResult
+        # below, but never LOGGED -- so only the census's failure modes
+        # (census_trigger's own WARNINGs, FIRE-WITHOUT-LAUNCH, 4085's
+        # evaluation-failed line) ever reached the journal. With condition (b)
+        # now wired, a healthy evaluation would otherwise be indistinguishable
+        # from the still-dead one in
+        # `journalctl --user -u legibility-trickle@dark_factory` -- the same
+        # channel that diagnosed this task. Always-on INFO, like the sampler
+        # summary and no-change-night lines above; main()'s configure_logging()
+        # is what makes INFO visible there (gap (b) of the trickle-legibility
+        # incident). Safe to log unconditionally: evaluate_census_step never
+        # raises and always returns a fully-formed one-line reason string,
+        # even on a failed evaluation (task 4085).
+        logger.info('legibility trickle: %s', census_line)
 
         result = NightlyResult(
             exit_code=0,
