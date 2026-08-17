@@ -206,15 +206,31 @@ _INTEGRITY_FINDING_RECURRENCE_THRESHOLD = 4
 #
 # Derivation.  A deferred cycle produces ONE completed run (the parent) instead
 # of the usual two (parent + remediation), and _finding_persistence_count counts
-# completed runs that re-flag a finding.  So after D consecutive deferrals the
-# cycle that finally remediates sees D+1 consecutive parent runs all carrying the
-# finding, and its post-remediation escalation gate reads persistence = D+1.
-# Requiring D + 1 < _INTEGRITY_FINDING_RECURRENCE_THRESHOLD, i.e.
-# D <= THRESHOLD - 2, preserves what that counter MEANS: 'this finding recurs
+# completed runs that re-flag a finding.
+#
+# The count the gate reads must include the remediation run's OWN re-flag.
+# _run_remediation_pass calls journal.complete_run(run_id, 'completed') and
+# journal.update_run_stage_reports(run_id, ...) BEFORE reaching the persistence
+# gate, and the findings still actionable at that gate are by construction the
+# ones in that same run's integrity_check.items_flagged.  So the cycle that
+# finally remediates after D consecutive deferrals reads
+#
+#     persistence = D (deferred parents) + 1 (this cycle's parent)
+#                     + 1 (this cycle's own remediation run)
+#                 = D + 2
+#
+# The un-deferred baseline (D = 0) is therefore 2 — pinned by
+# test_harness.py::...unresolved_after_remediation_suppressed, which asserts
+# persistence == 2 with no prior runs seeded — and escalation fires on the
+# SECOND failed remediation, matching the module note above that a threshold of
+# 4 'fires after 2 complete reconciliation cycles'.
+#
+# Requiring D + 2 < _INTEGRITY_FINDING_RECURRENCE_THRESHOLD, i.e.
+# D <= THRESHOLD - 3, preserves what that counter MEANS: 'this finding recurs
 # DESPITE remediation'.  Above the ceiling, a backlogged project would escalate
-# recon_integrity_issue on the FIRST failed remediation instead of the fourth
-# re-flagging — a throughput lever silently changing escalation semantics.
-_MAX_BACKLOG_REMEDIATION_DEFERRALS = _INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 2
+# recon_integrity_issue on the FIRST failed remediation instead of the second —
+# a throughput lever silently changing escalation semantics.
+_MAX_BACKLOG_REMEDIATION_DEFERRALS = _INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 3
 
 # Task 1669: suppress re-firing of a finding whose matching escalation was
 # resolved within this window.  Beyond it, a recurrence re-escalates so a

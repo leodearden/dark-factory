@@ -41,15 +41,20 @@ DEFAULT_CONFIG_PATH = 'config/config.yaml'
 # Deferring the inline remediation pass is a THROUGHPUT lever, and it must not
 # become an escalation-semantics change: a deferred cycle writes one completed
 # run instead of two, so after D consecutive deferrals the cycle that finally
-# remediates already sees D+1 completed runs re-flagging the finding.  Keeping
-# D + 1 below reconciliation.harness._INTEGRITY_FINDING_RECURRENCE_THRESHOLD
-# (= 4) — i.e. D <= 2 — keeps that counter meaning 'recurs DESPITE remediation'.
+# remediates sees D deferred parents + this cycle's parent + this cycle's OWN
+# remediation run (which completes and persists its stage reports before the
+# escalation gate reads the count) = D + 2 completed runs re-flagging the
+# finding.  Keeping D + 2 below
+# reconciliation.harness._INTEGRITY_FINDING_RECURRENCE_THRESHOLD (= 4) — i.e.
+# D <= 1 — keeps that counter meaning 'recurs DESPITE remediation'.  The
+# un-deferred baseline is D = 0 → 2, so escalation still needs a second failed
+# remediation, exactly as without this lever.
 #
 # Restated here rather than imported because config.schema must not import the
 # reconciliation harness (which imports this module).  The derivation is pinned
 # against the live harness constant by a runtime test in tests/test_harness.py,
 # and the harness independently clamps to the same ceiling at the point of use.
-MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING = 2
+MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING = 1
 
 
 class YamlSettingsSource(PydanticBaseSettingsSource):

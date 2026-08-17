@@ -16648,19 +16648,23 @@ async def test_in_backlog_mode_treats_a_missing_size_as_not_backlogged(
 _DEFER_LOG = 'reconciliation.remediation_deferred_backlog'
 
 
-async def _persist_parent_run(journal, project_id: str, findings: list[dict]):
-    """Persist a completed parent run carrying *findings* as its S3 report.
+async def _persist_parent_run(
+    journal, project_id: str, findings: list[dict], run_type: RunType = RunType.full,
+):
+    """Persist a completed run carrying *findings* as its S3 report.
 
     Mirrors run_full_cycle's ordering: the stage reports are written (and the
     run marked completed) BEFORE _maybe_remediate is ever called, which is what
-    makes a deferral lossless.
+    makes a deferral lossless.  _run_remediation_pass persists in the same
+    order before its own escalation gate reads the persistence count, so
+    passing run_type=RunType.remediation models that run too.
     """
     from fused_memory.models.reconciliation import StageId
 
     run = ReconciliationRun(
         id=f'run-{uuid.uuid4().hex[:8]}',
         project_id=project_id,
-        run_type=RunType.full,
+        run_type=run_type,
         trigger_reason='backlog_chunk:1:393',
         started_at=datetime.now(UTC),
         events_processed=393,
@@ -16816,18 +16820,17 @@ async def test_maybe_remediate_deferral_debt_is_bounded(
     harness, remediation = _remediation_harness(
         journal, event_buffer, mock_memory_service, buffer_size=900,
     )
-    harness.config.max_backlog_remediation_deferrals = 2
+    harness.config.max_backlog_remediation_deferrals = 1
     parent_run = await _persist_parent_run(journal, 'test-project', [_make_s3_findings()[0]])
 
     with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
         await _call_maybe_remediate(harness, parent_run)
-        await _call_maybe_remediate(harness, parent_run)
-        deferred_after_two = remediation.await_count
+        deferred_after_one = remediation.await_count
         await _call_maybe_remediate(harness, parent_run)
 
-    assert deferred_after_two == 0, 'The first two cycles must defer'
-    assert len(_defer_records(caplog)) == 2
-    assert [getattr(r, 'consecutive_deferrals', None) for r in _defer_records(caplog)] == [1, 2]
+    assert deferred_after_one == 0, 'The first cycle must defer'
+    assert len(_defer_records(caplog)) == 1
+    assert [getattr(r, 'consecutive_deferrals', None) for r in _defer_records(caplog)] == [1]
     assert remediation.await_count == 1, (
         'The cycle after the bound is reached must remediate despite the deep buffer'
     )
@@ -16842,8 +16845,10 @@ async def test_maybe_remediate_deferral_streak_cannot_outlast_the_persistence_ga
 
     A deferred cycle writes ONE completed run (the parent) instead of the usual
     two (parent + remediation), and _finding_persistence_count counts completed
-    runs that re-flag a finding.  After D consecutive deferrals the cycle that
-    finally remediates therefore already sees D+1 re-flaggings.  Left
+    runs that re-flag a finding — including the remediating cycle's OWN
+    remediation run, which completes and persists its stage reports before the
+    escalation gate reads the count.  After D consecutive deferrals the cycle
+    that finally remediates therefore already sees D+2 re-flaggings.  Left
     unclamped at the old default of 5, a backlogged project would reach
     _INTEGRITY_FINDING_RECURRENCE_THRESHOLD with ZERO remediation attempts
     behind it and escalate recon_integrity_issue on the FIRST failed
@@ -16863,13 +16868,13 @@ async def test_maybe_remediate_deferral_streak_cannot_outlast_the_persistence_ga
     parent_run = await _persist_parent_run(journal, 'test-project', [_make_s3_findings()[0]])
 
     with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
-        for _ in range(3):
+        for _ in range(2):
             await _call_maybe_remediate(harness, parent_run)
 
-    # Unclamped, all three cycles would have deferred (5 > 3) and remediation
-    # would never have been attempted.
-    assert _MAX_BACKLOG_REMEDIATION_DEFERRALS == 2
-    assert len(_defer_records(caplog)) == 2
+    # Unclamped, both cycles would have deferred (5 > 2) and remediation would
+    # never have been attempted.
+    assert _MAX_BACKLOG_REMEDIATION_DEFERRALS == 1
+    assert len(_defer_records(caplog)) == 1
     assert remediation.await_count == 1, (
         'the clamped streak must end in a real remediation attempt, so a '
         'finding that survives it is genuinely recurring DESPITE remediation'
@@ -16877,7 +16882,7 @@ async def test_maybe_remediate_deferral_streak_cannot_outlast_the_persistence_ga
     assert harness._remediation_deferrals.get('test-project', 0) == 0
 
     rec = _defer_records(caplog)[0]
-    assert getattr(rec, 'max_backlog_remediation_deferrals', None) == 2, (
+    assert getattr(rec, 'max_backlog_remediation_deferrals', None) == 1, (
         'the log must report the EFFECTIVE bound, not the configured one'
     )
     assert getattr(rec, 'configured_max_backlog_remediation_deferrals', None) == 5, (
@@ -16900,8 +16905,75 @@ def test_max_backlog_remediation_deferrals_ceiling_matches_the_config_schema():
     )
 
     assert _MAX_BACKLOG_REMEDIATION_DEFERRALS == (
-        _INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 2)
+        _INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 3)
     assert MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING == _MAX_BACKLOG_REMEDIATION_DEFERRALS
+
+
+@pytest.mark.asyncio
+async def test_maximal_deferral_streak_leaves_the_persistence_gate_below_threshold(
+    journal, event_buffer, mock_memory_service,
+):
+    """The ceiling's arithmetic, asserted against the count the gate actually reads.
+
+    The constant-pin test above only checks THRESHOLD - 3 as an expression; it
+    cannot catch the derivation being wrong.  This one seeds the run sequence a
+    maximally-deferred streak really produces and asks
+    _finding_persistence_count for the number, so an off-by-one in the ceiling
+    fails here rather than in production.
+
+    The sequence after D consecutive deferrals, when remediation finally runs
+    and FAILS (the finding is re-flagged rather than fixed):
+
+        D  x  deferred parent run   — each writes ONE completed run, no remediation
+        1  x  this cycle's parent run
+        1  x  this cycle's remediation run — _run_remediation_pass calls
+              complete_run() and update_run_stage_reports() BEFORE the
+              escalation gate reads the count, and a FAILED remediation
+              re-flags the finding, so this run counts too
+
+    = D + 2, which must stay strictly below
+    _INTEGRITY_FINDING_RECURRENCE_THRESHOLD so the gate keeps meaning "recurs
+    DESPITE remediation" — i.e. escalation still waits for a SECOND failed
+    remediation, exactly as with the lever disabled.
+    """
+    from fused_memory.reconciliation.harness import (
+        _INTEGRITY_FINDING_RECURRENCE_THRESHOLD,
+        _MAX_BACKLOG_REMEDIATION_DEFERRALS,
+    )
+
+    harness, _ = _remediation_harness(
+        journal, event_buffer, mock_memory_service, buffer_size=900,
+    )
+    finding = _make_s3_findings()[0]
+    d = _MAX_BACKLOG_REMEDIATION_DEFERRALS
+
+    # The deferred cycles: parent run only, no remediation behind it.
+    for _ in range(d):
+        await _persist_parent_run(journal, 'test-project', [finding])
+    # The cycle that finally remediates: its parent, then its own remediation
+    # run, whose S3 re-flags the same finding because remediation failed.
+    await _persist_parent_run(journal, 'test-project', [finding])
+    await _persist_parent_run(
+        journal, 'test-project', [finding], run_type=RunType.remediation,
+    )
+
+    persistence = await harness._finding_persistence_count('test-project', finding)
+
+    assert persistence == d + 2, (
+        f'The gate reads D deferred parents + this cycle\'s parent + this '
+        f'cycle\'s OWN remediation run = D + 2 = {d + 2}, got {persistence}. '
+        f'If this is '
+        f'{d + 1}, the remediation run stopped persisting before the gate and the '
+        f'ceiling derivation must be re-done.'
+    )
+    assert persistence < _INTEGRITY_FINDING_RECURRENCE_THRESHOLD, (
+        f'A maximal deferral streak ({d}) followed by ONE failed remediation must '
+        f'NOT reach the recurrence threshold '
+        f'({_INTEGRITY_FINDING_RECURRENCE_THRESHOLD}) — otherwise a throughput '
+        f'lever has silently made recon_integrity_issue escalate on the first '
+        f'failed remediation instead of the second. Lower '
+        f'_MAX_BACKLOG_REMEDIATION_DEFERRALS.'
+    )
 
 
 @pytest.mark.asyncio

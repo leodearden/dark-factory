@@ -3173,7 +3173,7 @@ def test_max_backlog_remediation_deferrals_defaults_to_the_ceiling():
     """Default is the largest streak the escalation semantics can absorb."""
     from fused_memory.config.schema import MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING
 
-    assert ReconciliationConfig().max_backlog_remediation_deferrals == 2
+    assert ReconciliationConfig().max_backlog_remediation_deferrals == 1
     assert (ReconciliationConfig().max_backlog_remediation_deferrals
             == MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING)
 
@@ -3198,11 +3198,13 @@ def test_max_backlog_remediation_deferrals_rejects_more_rope_than_the_ceiling():
     """A longer streak would change escalation semantics, so the schema refuses it.
 
     A deferred cycle writes ONE completed run instead of two, and
-    _finding_persistence_count counts completed runs that re-flag a finding.
+    _finding_persistence_count counts completed runs that re-flag a finding —
+    including the remediating cycle's own remediation run, which completes
+    before the escalation gate reads the count (so the gate sees D + 2).
     Past the ceiling a backlogged project accumulates enough re-flaggings to
     reach _INTEGRITY_FINDING_RECURRENCE_THRESHOLD without a single remediation
     attempt having run, so the first failed remediation escalates immediately
-    instead of the fourth recurrence.  Rejecting at config-load is louder than
+    instead of the second.  Rejecting at config-load is louder than
     letting the operator believe the extra rope was granted.
     """
     from fused_memory.config.schema import MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING

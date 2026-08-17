@@ -255,14 +255,17 @@ reconciliation:
   # the backlog drains). The cap bounds the debt so a deep backlog cannot starve
   # remediation; 0 disables deferral entirely.
   #
-  # 2 is the schema ceiling (MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING), not a
+  # 1 is the schema ceiling (MAX_BACKLOG_REMEDIATION_DEFERRALS_CEILING), not a
   # taste call: a deferred cycle writes ONE completed run instead of two, so a
   # longer streak would let the integrity-finding persistence counter reach its
   # recurrence threshold without a single remediation attempt having run — the
-  # first failed remediation would then escalate immediately. Costs some of
-  # lever 1's ideal 1.78x (remediation runs once per three cycles rather than
-  # never during a backlog); correctness of the escalation semantics wins.
-  max_backlog_remediation_deferrals: 2
+  # first failed remediation would then escalate immediately. The gate reads
+  # D deferred parents + this cycle's parent + this cycle's own remediation run
+  # = D + 2, and that must stay below the recurrence threshold of 4, so D <= 1.
+  # Costs some of lever 1's ideal 1.78x (remediation runs once per two cycles
+  # rather than never during a backlog); correctness of the escalation
+  # semantics wins.
+  max_backlog_remediation_deferrals: 1
   sonnet_episode_limit: 125
   sonnet_memory_limit: 250
   opus_episode_limit: 500
