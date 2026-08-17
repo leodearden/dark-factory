@@ -1893,7 +1893,18 @@ def _regen_command(params: dict[str, Any]) -> str:
     non-default value for one of those, reproducing it exactly is the
     caller's responsibility, not this header's.
     """
-    parts = ['uv run python scripts/census_memory_metadata.py']
+    # REPO-ROOT relative, and identical to what the nightly wrapper runs and
+    # what OPERATIONS.md §12 documents. The earlier spelling named the script
+    # relative to `fused-memory/` while `--registry` / `--history-out` carry
+    # `_repo_relative` values -- relative to the repo ROOT -- so a run using
+    # either non-default path emitted a command whose script and whose flags
+    # could not both resolve from any single directory. `--frozen` is not
+    # decoration: regenerating a committed artifact under a resolved-fresh
+    # dependency set is not a reproduction of the run that wrote it.
+    parts = [
+        'uv run --frozen --project fused-memory python '
+        'fused-memory/scripts/census_memory_metadata.py',
+    ]
     projects = params.get('projects') or []
     if sorted(projects) != sorted(DEFAULT_PROJECT_IDS):
         parts.extend(f'--project-id {project_id}' for project_id in projects)

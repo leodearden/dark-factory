@@ -1346,16 +1346,23 @@ is the exact ambiguity this instrument exists to resolve.
 
 The history file carries scalars and no per-topic tables on purpose: a
 nightly timer appending a full topic breakdown would grow a committed file
-without bound. Retention is capped and any drop is **disclosed in the file**
-rather than silently truncated.
+without bound. Retention is capped at 90 runs and any drop is **disclosed in
+the file** rather than silently truncated. Measured on the committed file
+(10,736 bytes for 2 runs at the current two-project shape): **~5.2 KiB per
+run, so ~470 KiB once the retention window is full** — the bound the cap
+buys, worth knowing before reading the per-night figure below, because the
+file is rewritten whole every night rather than appended to in place.
 
 **What committing all three nightly costs, stated rather than assumed.** The
 two report artifacts are full rewrites every run (measured: JSON 1.04 MiB /
 markdown 223 KiB raw; 90 KiB / 47 KiB zlib-compressed, which is what git
-stores loose), against 5.3 KiB for the history. Counts shift nightly on a
-live corpus, so a quiet night is rare and the job writes roughly **140 KiB
-of new loose object content per night, ~50 MiB per year** before `git gc`
-delta-compresses the near-identical successive versions. That is deliberate,
+stores loose), against 5.2 KiB for the history *today* — the history is
+rewritten whole each night too, so its share of the nightly write grows with
+the series toward the ~470 KiB full-window bound above, rather than staying
+at one row's worth. Counts shift nightly on a live corpus, so a quiet night
+is rare and the job writes roughly **140 KiB of new loose object content per
+night, ~50 MiB per year** before `git gc` delta-compresses the
+near-identical successive versions. That is deliberate,
 not an oversight: the JSON is a **cited, read** artifact — leaf beta's
 grandfather list and `fused-memory/scripts/memory_eval_retrieval_probe.py`
 (`DEFAULT_CENSUS_PATH`) both read it from the repo, so a snapshot that is

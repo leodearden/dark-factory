@@ -2636,6 +2636,19 @@ def _both_default_projects_report(*, top_n: int = 50, page_size: int = 1000) -> 
     return _mod.build_report(cells, cov, top_n=top_n, page_size=page_size)
 
 
+#: The bare regen command every artifact header starts from: repo-root
+#: relative, `--frozen`, and identical to what the nightly wrapper runs and
+#: what OPERATIONS.md §12 documents. Single-homed here so the flag-
+#: reconstruction tests below assert what they are about -- which FLAGS are
+#: emitted -- while the spelling itself is pinned exactly once, by
+#: TestRegenCommandCoversTheNewFlags::
+#: test_the_command_is_the_invocation_the_nightly_wrapper_makes.
+_BARE_REGEN = (
+    'uv run --frozen --project fused-memory python '
+    'fused-memory/scripts/census_memory_metadata.py'
+)
+
+
 class TestRegenCommand:
     """The header's regen command must always reproduce the artifact it is
     embedded in (task 3507): a bare-default invocation silently truncated
@@ -2646,20 +2659,19 @@ class TestRegenCommand:
     def test_all_default_params_render_the_bare_command(self):
         md = _mod.render_markdown(_both_default_projects_report())
         assert (
-            'Regenerate with `uv run python scripts/census_memory_metadata.py`.'
+            f'Regenerate with `{_BARE_REGEN}`.'
             in md
         )
 
     def test_non_default_top_n_is_named_in_the_regen_command(self):
         md = _mod.render_markdown(_both_default_projects_report(top_n=400))
         assert (
-            'Regenerate with `uv run python scripts/census_memory_metadata.py '
-            '--top-n 400`.' in md
+            f'Regenerate with `{_BARE_REGEN} --top-n 400`.' in md
         )
         # And the bare command -- which would silently under-render -- must
         # NOT be what's documented.
         assert (
-            'Regenerate with `uv run python scripts/census_memory_metadata.py`.'
+            f'Regenerate with `{_BARE_REGEN}`.'
             not in md
         )
 
@@ -3753,9 +3765,72 @@ class TestRegenCommandCoversTheNewFlags:
     def test_default_new_flags_keep_the_bare_command(self):
         md = _mod.render_markdown(_both_default_projects_report())
         assert (
-            'Regenerate with `uv run python scripts/census_memory_metadata.py`.'
+            f'Regenerate with `{_BARE_REGEN}`.'
             in md
         )
+
+    def test_every_path_in_the_command_resolves_from_ONE_working_directory(self):
+        """The script path and the flag paths must share a cwd.
+
+        The emitted prefix named the script relative to ``fused-memory/``,
+        while ``--registry`` / ``--history-out`` carry the values recorded by
+        ``_repo_relative`` -- relative to the REPO ROOT. A run that used
+        either non-default path therefore printed a command whose script and
+        whose flags could not both resolve from any single directory, which
+        is precisely the drift ``_repo_relative``'s own docstring cites task
+        3507 for: "a documented regen command that no longer reproduces the
+        artifact is worse than none".
+
+        Asserted by RESOLVING every path in the command against one base,
+        not by pinning its spelling -- so it stays true through a rename and
+        fails the moment the two bases diverge again.
+        """
+        # Two real, non-default, repo-root-relative paths, so both flags are
+        # emitted and both can be resolved.
+        params = {
+            'projects': ['dark_factory', 'reify'],
+            'registry': 'fused-memory/tests/fixtures/census-grandfather-oracle.json',
+            'history_out': 'plans/memory-metadata-census-report.json',
+        }
+        command = _mod._regen_command(params)
+        tokens = command.split()
+        repo_root = Path(_mod._REPO_ROOT)
+
+        script = next(t for t in tokens if t.endswith('census_memory_metadata.py'))
+        paths = {'script': script}
+        for flag in ('--registry', '--history-out'):
+            assert flag in tokens, command
+            paths[flag] = tokens[tokens.index(flag) + 1]
+
+        unresolvable = {
+            name: value for name, value in paths.items()
+            if not (repo_root / value).is_file()
+        }
+        assert not unresolvable, (
+            f'{command!r} mixes path bases; these do not resolve from the '
+            f'repo root: {unresolvable}'
+        )
+
+    def test_the_command_is_the_invocation_the_nightly_wrapper_makes(self):
+        """One spelling, shared by the wrapper, OPERATIONS.md and this header.
+
+        The wrapper runs `uv run --frozen --project "$FM" python
+        "$FM/scripts/census_memory_metadata.py"`; OPERATIONS.md §12 documents
+        that same form and claims it is "what the report's own regen line
+        reproduces". That claim was false while this function emitted a
+        different, cwd-incompatible spelling -- so a reader following the
+        artifact header and a reader following the runbook ran two different
+        commands.
+        """
+        command = _mod._regen_command({'projects': ['dark_factory', 'reify']})
+        assert command == (
+            'uv run --frozen --project fused-memory python '
+            'fused-memory/scripts/census_memory_metadata.py'
+        )
+        # --frozen matters on its own: an unpinned resolve could regenerate a
+        # committed artifact under a different dependency set than the run
+        # that produced it.
+        assert '--frozen' in command
 
     def test_non_default_registry_is_named(self):
         params = {'projects': ['dark_factory', 'reify'], 'registry': '/tmp/r.json'}
@@ -3776,9 +3851,7 @@ class TestRegenCommandCoversTheNewFlags:
             'history_out': _mod.DEFAULT_HISTORY_OUT,
             'no_history': False,
         }
-        assert _mod._regen_command(params) == (
-            'uv run python scripts/census_memory_metadata.py'
-        )
+        assert _mod._regen_command(params) == _BARE_REGEN
 
     @pytest.mark.asyncio
     async def test_run_records_the_new_flags_in_params(self, tmp_path, monkeypatch):
@@ -3849,9 +3922,7 @@ class TestCommittedParamsAreCheckoutIndependent:
             'history_out': 'plans/memory-metadata-coverage-history.json',
             'no_history': False,
         }
-        assert _mod._regen_command(params) == (
-            'uv run python scripts/census_memory_metadata.py'
-        )
+        assert _mod._regen_command(params) == _BARE_REGEN
 
     def test_a_pre_4006_absolute_default_is_normalised_too(self):
         # Artifacts already committed carry the absolute spelling; reading
@@ -3861,9 +3932,7 @@ class TestCommittedParamsAreCheckoutIndependent:
             'registry': _mod.DEFAULT_REGISTRY_PATH,
             'history_out': _mod.DEFAULT_HISTORY_OUT,
         }
-        assert _mod._regen_command(params) == (
-            'uv run python scripts/census_memory_metadata.py'
-        )
+        assert _mod._regen_command(params) == _BARE_REGEN
 
 
 class TestTheDisclosedRegimeIsTheOneTheRunUsed:
