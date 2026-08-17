@@ -2709,7 +2709,26 @@ def test_section_12_reports_the_install_did_not_take_on_drift(
 # without failing here. Sites are DERIVED from the file text rather than
 # hardcoded, so a new checker is covered the moment it is wired up.
 
-_PARITY_SCRIPT_RE = re.compile(r"scripts/(check_\w+_unit_parity\.py)")
+# A site is a line that USES the checker path — hoists it into the block's
+# `_<gate>_parity_script` variable, or hands it straight to `python3`. Both
+# forms are matched, so a future gate wired either way is swept the moment it
+# lands; the prefix must sit IMMEDIATELY before the path, so a `python3 ...`
+# mentioned earlier in a message cannot drag a later prose path in with it.
+#
+# A bare mention is NOT a site, and the distinction is load-bearing rather than
+# cosmetic: `_orch_skip_reason`'s fallback arm names
+# `scripts/check_orchestrator_unit_parity.py` inside a printf as the remedy for
+# an unknown verdict kind. Matching any occurrence read that remediation text as
+# a fifth call site and sliced a block from mid-`case` to the next column-0
+# `fi` — an unbalanced fragment bash rejects with a syntax error, which is a
+# vacuous case: it fails (or would "pass" a no-output assertion) for reasons
+# having nothing to do with the rule under test. This is also the convention
+# setup_host_sections.py's module docstring already states.
+_PARITY_SCRIPT_RE = re.compile(
+    r"(?:parity_script=|python3\s+)"          # the path is USED, not merely named
+    r"\"?(?:\$\{?REPO_ROOT\}?/)?"             # optional "$REPO_ROOT/ prefix
+    r"scripts/(check_\w+_unit_parity\.py)"
+)
 
 # Deliberate, updated by hand when a site is added or removed. Today: the
 # orchestrator gate, the section-8 dashboard pre-install gate, the section-12
@@ -2725,14 +2744,18 @@ _KNOWN_PARITY_CALL_SITES = 4
 def _parity_call_sites() -> list[tuple[int, str, str]]:
     """Every parity-checker call site, as (line number, checker filename, block).
 
-    A site is a NON-COMMENT line naming a `scripts/check_*_unit_parity.py`
+    A site is a NON-COMMENT line that USES a `scripts/check_*_unit_parity.py`
     path — either the hoisted `_x_parity_script="..."` assignment or a direct
-    `python3 "..."` invocation. Its block runs to the next column-0 `fi`, which
-    closes the enclosing verdict construct at all sites.
+    `python3 "..."` invocation (see `_PARITY_SCRIPT_RE`). Its block runs to the
+    next column-0 `fi`, which closes the enclosing verdict construct at all
+    sites.
 
-    Comment lines are excluded deliberately: the fused-memory block cites
-    `tests/scripts/test_check_fused_memory_unit_parity.py` by name, and a
-    citation is not a call site.
+    Lines that merely NAME a checker are excluded, whether or not they are
+    comments: the fused-memory block cites
+    `tests/scripts/test_check_fused_memory_unit_parity.py` by name, and the
+    orchestrator block's unknown-kind arm prints its checker's path as the
+    remedy. A citation is not a call site, and slicing a block from one yields
+    a bash fragment that cannot run.
     """
     text = setup_host_text()
     sites: list[tuple[int, str, str]] = []
