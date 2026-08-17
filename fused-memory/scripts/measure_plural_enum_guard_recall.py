@@ -679,12 +679,38 @@ async def enumerate_valid_edge_facts(
 # Report assembly
 # ---------------------------------------------------------------------------
 
-SCHEMA_VERSION = 1
+# 2: the report gained `project_ids_source`, `unmeasured_graphs` and
+#    `max_samples`, when the measured GRAPH SET stopped being assumed and
+#    started being discovered and cross-checked (see DEFAULT_PROJECT_IDS).
+SCHEMA_VERSION = 2
 
+# FALLBACK ONLY — not the normal project set. The measured graphs are
+# DISCOVERED from the store via ``GraphitiBackend.list_graphs()``, because a
+# hardcoded tuple is a coverage claim nothing checks: a project graph absent
+# from it was silently excluded while the artifact still said `complete: true`
+# and the verdict still read 'no fact in any project graph'.
+#
+# That was not hypothetical. Measured 2026-08-17, the store held valid edges in
+# `autopilot_video` (723), `know_live` (1588), `my_solar_challenge` (390),
+# `pump_web_ui` (62), `solar_challenge` (62) and a test leftover (4) — 2829
+# edges, ~9% of the corpus, that this probe's three-name tuple never looked at
+# while reporting complete coverage. Of every shortfall class the enumerator
+# guards against, the un-enumerated GRAPH was the one with no detection at all.
+#
+# This tuple survives only for a caller with no graph inventory to discover
+# from (``run(..., graph_lister=None)``, which is every test). A report built
+# that way records ``project_ids_source='fallback'`` so the artifact says its
+# graph set was never cross-checked, rather than implying it was.
 DEFAULT_PROJECT_IDS: tuple[str, ...] = (
     'dark_factory', 'reify', 'solar_challenge_platform',
 )
 DEFAULT_MAX_SAMPLES = 20
+
+# How the measured graph set was arrived at. Recorded in the artifact because
+# 'no fact in ANY project graph' is only as strong as the set it quantified over.
+PROJECT_IDS_DISCOVERED = 'discovered'  # list_graphs() — the full store
+PROJECT_IDS_CLI = 'cli'                # narrowed by --project-id
+PROJECT_IDS_FALLBACK = 'fallback'      # DEFAULT_PROJECT_IDS, un-cross-checked
 
 # The test that mechanically re-validates both candidates against the full
 # pinned precision parametrization. Named in the report so a reader can go
@@ -739,6 +765,11 @@ class Report:
     verdict: str
     complete: bool
     max_samples: int
+    project_ids_source: str = PROJECT_IDS_FALLBACK
+    # Graphs the store reports as populated that this run did NOT measure.
+    # Nonempty is a coverage shortfall and forces ``complete`` False, the same
+    # fail-closed treatment a row-count shortfall gets.
+    unmeasured_graphs: list[str] = field(default_factory=list)
     revalidation_test: str = REVALIDATION_TEST
 
 
@@ -777,16 +808,59 @@ def _triage_counts(scan: ScanResult) -> dict[str, int]:
     return counts
 
 
-async def run(args: Any, *, edge_source: Any) -> Report:
+async def run(
+    args: Any, *, edge_source: Any, graph_lister: Any = None,
+) -> Report:
     """Measure every requested project through the injected *edge_source*.
 
     ``edge_source(project_id, *, page_size) -> (facts_by_uuid, complete)`` is
     the only corpus access, mirroring cleanup_count_snapshots.run(args, *,
     memory): every test drives a fake through it, so the whole aggregation
     band is checkable with no live backend.
+
+    ``graph_lister() -> list[str]`` is the second seam, and it decides WHICH
+    graphs get measured. The enumerator can prove it read every row of a
+    graph; only this can say the set of graphs was the whole store. Without
+    it the two are conflated, and a project graph nobody remembered to list
+    is excluded with no trace while the artifact reports complete coverage.
+
+    Precedence: an explicit ``--project-id`` narrows (and, being a narrowing,
+    marks the report INCOMPLETE and names what it left out); otherwise the
+    lister's inventory is measured whole; otherwise — no lister, as in every
+    test — ``DEFAULT_PROJECT_IDS``, recorded as ``'fallback'`` so the artifact
+    admits its graph set was never cross-checked.
     """
+    requested = list(args.project_id) if args.project_id else None
+    populated: list[str] | None = None
+    if graph_lister is not None:
+        populated = sorted(await graph_lister())
+
+    if requested is not None:
+        project_ids = requested
+        project_ids_source = PROJECT_IDS_CLI
+    elif populated is not None:
+        project_ids = list(populated)
+        project_ids_source = PROJECT_IDS_DISCOVERED
+    else:
+        project_ids = list(DEFAULT_PROJECT_IDS)
+        project_ids_source = PROJECT_IDS_FALLBACK
+
+    unmeasured_graphs = (
+        sorted(set(populated) - set(project_ids)) if populated is not None else []
+    )
+    if unmeasured_graphs:
+        # No silent exclusions. The verdict quantifies over 'any project
+        # graph', so a graph the store reports as populated and this run did
+        # not read is a coverage shortfall, not a scoping preference.
+        logger.warning(
+            'COVERAGE SHORTFALL: %d populated graph(s) were NOT measured: %s. '
+            'The store reports them as populated, so this run cannot support '
+            'a claim about every project graph. Reporting INCOMPLETE.',
+            len(unmeasured_graphs), ', '.join(unmeasured_graphs),
+        )
+
     projects: list[ProjectReport] = []
-    for project_id in args.project_id:
+    for project_id in project_ids:
         logger.info('enumerating project=%s', project_id)
         facts_by_uuid, complete = await edge_source(
             project_id, page_size=args.page_size,
@@ -844,8 +918,10 @@ async def run(args: Any, *, edge_source: Any) -> Report:
             _VERDICT_ZERO_MATCHES if totals.regex_matched == 0
             else _VERDICT_PROVISIONAL
         ),
-        complete=all(p.complete for p in projects),
+        complete=all(p.complete for p in projects) and not unmeasured_graphs,
         max_samples=args.max_samples,
+        project_ids_source=project_ids_source,
+        unmeasured_graphs=unmeasured_graphs,
     )
 
 
@@ -861,6 +937,66 @@ async def run(args: Any, *, edge_source: Any) -> Report:
 REGENERATE_COMMAND = (
     'cd fused-memory && uv run python scripts/measure_plural_enum_guard_recall.py'
 )
+
+# How the measured graph set was arrived at, said out loud in the artifact.
+# 'No fact in ANY project graph' is only as strong as the set it quantified
+# over, and a reader months from now cannot tell a discovered set from a
+# hardcoded one by looking at the rows.
+_GRAPH_SET_NOTES = {
+    PROJECT_IDS_DISCOVERED:
+        'The measured graph set was DISCOVERED from the store '
+        '(`GraphitiBackend.list_graphs()`), not hardcoded — so the verdict '
+        'below quantifies over every populated graph the store holds, not '
+        'over a list someone remembered to keep up to date.',
+    PROJECT_IDS_CLI:
+        'The measured graph set was NARROWED by `--project-id`. A narrowed '
+        'run cannot support a claim about every project graph, so it is '
+        'reported as incomplete whenever the store holds a populated graph '
+        'it skipped.',
+    PROJECT_IDS_FALLBACK:
+        'The measured graph set came from this script\'s built-in default '
+        'list and was NOT cross-checked against the store\'s inventory — the '
+        'caller supplied no `graph_lister`. Treat the coverage claim as '
+        'per-graph only: each graph below was fully enumerated, but nothing '
+        'here shows the SET of graphs was the whole store.',
+}
+
+
+def regenerate_command(report: Report) -> str:
+    """The invocation that reproduces *report* — flags and all.
+
+    A fixed string reproduces only a run made entirely with defaults. This
+    script models itself on census_memory_metadata.py, which learned that the
+    hard way (task 3507: the committed artifact was generated with a
+    non-default ``--top-n`` while the header printed the bare command, so
+    following it silently produced a ~4,800-row-shorter markdown and still
+    exited 0). Here the analogous trap is worse than short: an artifact
+    produced with ``--project-id reify`` measures a DIFFERENT POPULATION, and
+    a bare regenerate command would quietly re-measure another one.
+
+    Reconstructed from the report itself, so the command is derivable from
+    the committed artifact alone: ``--project-id`` per measured graph but only
+    when the set was narrowed at the CLI (a discovered set must stay
+    discovered, or re-running would freeze today's inventory into tomorrow's
+    command), ``--page-size`` and ``--max-samples`` when they depart from
+    their argparse defaults.
+
+    ``--json-out``, ``--md-out``, ``--config`` and ``--measured-at`` are
+    deliberately not reconstructed — none of them shapes the measurement, and
+    the first three are not recorded in the artifact to reconstruct from.
+    Same boundary census_memory_metadata.py draws.
+    """
+    parts = [REGENERATE_COMMAND]
+    if report.project_ids_source == PROJECT_IDS_CLI:
+        parts.extend(
+            f'--project-id {project.project_id}'
+            for project in _sorted_projects(report)
+        )
+    if report.page_size != DEFAULT_PAGE_SIZE:
+        parts.append(f'--page-size {report.page_size}')
+    if report.max_samples != DEFAULT_MAX_SAMPLES:
+        parts.append(f'--max-samples {report.max_samples}')
+    return ' '.join(parts)
 
 
 def _sorted_projects(report: Report) -> list[ProjectReport]:
@@ -895,9 +1031,14 @@ def render_json(report: Report) -> str:
         'schema_version': report.schema_version,
         'measured_at': report.measured_at,
         'generated_by': 'fused-memory/scripts/measure_plural_enum_guard_recall.py',
-        'regenerate': REGENERATE_COMMAND,
+        'regenerate': regenerate_command(report),
         'page_size': report.page_size,
+        # Recorded so the regenerate command above is reconstructible from the
+        # artifact ALONE, without knowing this script's argparse defaults.
+        'max_samples': report.max_samples,
         'complete': report.complete,
+        'project_ids_source': report.project_ids_source,
+        'unmeasured_graphs': sorted(report.unmeasured_graphs),
         'verdict': report.verdict,
         'revalidation_test': report.revalidation_test,
         'total_valid_edges': report.total_valid_edges,
@@ -935,9 +1076,11 @@ def render_markdown(report: Report) -> str:
         '_Generated by `fused-memory/scripts/measure_plural_enum_guard_recall.py` '
         '(task 3949). Do not hand-edit — regenerate:_',
         '',
-        f'    {REGENERATE_COMMAND}',
+        f'    {regenerate_command(report)}',
         '',
         f'- Measured at: `{report.measured_at}`',
+        f'- Graphs measured: `{len(report.projects)}` '
+        f'(set: `{report.project_ids_source}`)',
         f'- Enumeration page size: `{report.page_size}`',
         f'- Enumeration complete: `{report.complete}`',
         f'- Schema version: `{report.schema_version}`',
@@ -954,7 +1097,19 @@ def render_markdown(report: Report) -> str:
         'guard rejections | selections | complete |',
         '| --- | ---: | ---: | ---: | ---: | ---: | :---: |',
     ]
+    # A graph with zero valid edges and a proven-complete enumeration has
+    # nothing the verdict could have missed, so it is collapsed into one line
+    # below rather than given a row of zeroes. The store holds dozens of
+    # empty probe/test graphs and listing them individually buries the rows
+    # that carry data. The collapse is STATED (and the JSON carries every
+    # graph in full), so it is a legibility cut, not a silent one.
+    empty_projects = [
+        p for p in _sorted_projects(report) if p.valid_edges == 0 and p.complete
+    ]
+    empty_ids = {p.project_id for p in empty_projects}
     for project in _sorted_projects(report):
+        if project.project_id in empty_ids:
+            continue
         scan = project.scan
         lines.append(
             f'| `{project.project_id}` | {project.valid_edges:,} | '
@@ -969,6 +1124,18 @@ def render_markdown(report: Report) -> str:
         f'**{totals.guard_rejected:,}** | **{totals.selected:,}** | '
         f'**{"yes" if report.complete else "NO"}** |',
         '',
+    ]
+    if empty_projects:
+        lines += [
+            f'{len(empty_projects)} further graph(s) were enumerated and '
+            f'proven to hold ZERO valid edges, so they are collapsed out of '
+            f'the table rather than shown as rows of zeroes (the JSON '
+            f'artifact carries every one): '
+            + ', '.join(f'`{p.project_id}`' for p in empty_projects)
+            + '.',
+            '',
+        ]
+    lines += [
         'The near-miss column is what makes a zero interpretable: it separates '
         '"the corpus holds no plural-task shapes at all" from "it holds them '
         'and the guard is eating them".',
@@ -1066,12 +1233,27 @@ def render_markdown(report: Report) -> str:
         '',
         f'    {report.revalidation_test}',
         '',
-        'That gate reads the pinned shapes off the sweep suite\'s own '
-        '`parametrize` markers, so a shape added upstream re-validates both '
-        'candidates automatically.',
+        'That gate parametrizes over the shared pinned corpora in '
+        '`fused-memory/tests/reconciliation/plural_enum_shapes.py`, which the '
+        'sweep suite parametrizes off too, so a shape appended there '
+        're-validates both candidates automatically.',
         '',
         '## Enumeration coverage',
         '',
+        _GRAPH_SET_NOTES[report.project_ids_source],
+        '',
+    ]
+    if report.unmeasured_graphs:
+        lines += [
+            '**COVERAGE SHORTFALL.** The store reports these graphs as '
+            'populated and this run did NOT measure them, so the verdict '
+            'below does not quantify over them: '
+            + ', '.join(f'`{g}`' for g in sorted(report.unmeasured_graphs))
+            + '. The report is marked incomplete for this reason alone — the '
+            'same fail-closed treatment a row-count shortfall gets.',
+            '',
+        ]
+    lines += [
         'This probe pages with `SKIP`/`LIMIT` instead of calling '
         '`GraphitiBackend.get_all_valid_edges`. That is deliberate: '
         "FalkorDB's server-wide `RESULTSET_SIZE` is 10000 and nothing in this "
@@ -1164,10 +1346,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         '--project-id', dest='project_id', action=_AppendReplacingDefault,
-        default=list(DEFAULT_PROJECT_IDS),
+        default=None,
         help=(
-            'Project graph to measure; repeatable. '
-            f'Default: {" ".join(DEFAULT_PROJECT_IDS)}'
+            'Project graph to measure; repeatable. Default: EVERY graph the '
+            'store reports via list_graphs(). Passing this NARROWS the '
+            'measurement, which makes the report incomplete (exit 1) and '
+            'names the graphs it left out — the verdict quantifies over every '
+            'project graph, so a narrowed run cannot support it.'
         ),
     )
     parser.add_argument(
@@ -1225,11 +1410,14 @@ def _build_live_edge_source(config: Any) -> Any:
     backend = GraphitiBackend(config)
     initialized = False
 
-    async def edge_source(project_id: str, *, page_size: int):
+    async def _ensure_initialized() -> None:
         nonlocal initialized
         if not initialized:
             await backend.initialize(skip_maintenance=True)
             initialized = True
+
+    async def edge_source(project_id: str, *, page_size: int):
+        await _ensure_initialized()
         graph = backend._graph_for(project_id)  # noqa: SLF001
 
         async def query_fn(cypher: str):
@@ -1238,7 +1426,19 @@ def _build_live_edge_source(config: Any) -> Any:
 
         return await enumerate_valid_edge_facts(query_fn, page_size=page_size)
 
+    async def list_graphs() -> list[str]:
+        """Every populated graph the store holds — also a read.
+
+        This is what turns 'complete' from a per-graph claim into a
+        whole-store one. ``GraphitiBackend.list_graphs`` already excludes
+        ``default_db`` and the ``*_db`` internals, and is the same call
+        migrate_cross_graph_leak.py uses for exactly this purpose.
+        """
+        await _ensure_initialized()
+        return await backend.list_graphs()
+
     edge_source.backend = backend  # type: ignore[attr-defined]
+    edge_source.list_graphs = list_graphs  # type: ignore[attr-defined]
     return edge_source
 
 
@@ -1271,10 +1471,14 @@ async def _main(argv: list[str] | None = None) -> int:
 
     edge_source = _build_live_edge_source(FusedMemoryConfig())
     try:
-        report = await run(args, edge_source=edge_source)
+        report = await run(
+            args, edge_source=edge_source, graph_lister=edge_source.list_graphs,
+        )
         _write_artifacts(report, args.json_out, args.md_out)
         logger.info(
-            'measured edges=%d matched=%d rejected=%d complete=%s json=%s md=%s',
+            'measured graphs=%d (%s) edges=%d matched=%d rejected=%d '
+            'complete=%s json=%s md=%s',
+            len(report.projects), report.project_ids_source,
             report.total_valid_edges, report.totals.regex_matched,
             report.totals.guard_rejected, report.complete,
             args.json_out, args.md_out,
@@ -1286,6 +1490,12 @@ async def _main(argv: list[str] | None = None) -> int:
                         'COVERAGE SHORTFALL: project=%s enumeration incomplete',
                         project.project_id,
                     )
+            if report.unmeasured_graphs:
+                logger.error(
+                    'COVERAGE SHORTFALL: %d populated graph(s) never measured: %s',
+                    len(report.unmeasured_graphs),
+                    ', '.join(report.unmeasured_graphs),
+                )
         return exit_code(report)
     finally:
         close = getattr(edge_source.backend, 'close', None)

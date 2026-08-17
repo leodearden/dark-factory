@@ -1120,6 +1120,221 @@ async def test_rendered_markdown_opens_with_provenance_and_regenerate_command():
     assert _mod.REVALIDATION_TEST in markdown
 
 
+# ---------------------------------------------------------------------------
+# Graph-set completeness
+# ---------------------------------------------------------------------------
+#
+# The enumerator can prove it read every ROW of a graph. Nothing proved the
+# SET of graphs was the whole store — a project graph that existed in FalkorDB
+# but was absent from the hardcoded DEFAULT_PROJECT_IDS was silently excluded
+# while the artifact still said `complete: true` and the verdict still read
+# 'No fact in any enumerated project graph'.
+#
+# Measured 2026-08-17, that was 2829 valid edges (~9% of the corpus) across
+# autopilot_video, know_live, my_solar_challenge, pump_web_ui, solar_challenge
+# and a test leftover. Of every shortfall class this probe guards against, the
+# un-enumerated GRAPH was the one with no detection at all.
+
+
+def _lister(*names: str):
+    async def graph_lister() -> list[str]:
+        return list(names)
+    return graph_lister
+
+
+@pytest.mark.asyncio
+async def test_the_measured_graph_set_is_discovered_not_hardcoded():
+    """With a lister and no --project-id, every populated graph is measured."""
+    source = _FakeEdgeSource({
+        'alpha': (_ALPHA_FACTS, True),
+        'beta': (_BETA_FACTS, True),
+        'gamma': ([], True),
+    })
+
+    report = await run(
+        _args(project_id=None),
+        edge_source=source,
+        # deliberately unsorted, and deliberately NOT DEFAULT_PROJECT_IDS
+        graph_lister=_lister('gamma', 'alpha', 'beta'),
+    )
+
+    assert sorted(source.asked) == ['alpha', 'beta', 'gamma']
+    assert report.project_ids_source == 'discovered'
+    assert report.unmeasured_graphs == []
+    assert report.complete is True
+    assert exit_code(report) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_populated_graph_left_unmeasured_fails_closed(caplog):
+    """The shortfall class that previously had NO detection at all.
+
+    A populated graph the run did not read is a coverage shortfall, not a
+    scoping preference: the verdict quantifies over 'any project graph'. It
+    gets the same fail-closed treatment as a row-count shortfall — incomplete,
+    non-zero exit, and named in the artifact rather than merely absent from it.
+    """
+    source = _FakeEdgeSource({'alpha': (_ALPHA_FACTS, True)})
+
+    with caplog.at_level('WARNING'):
+        report = await run(
+            _args(project_id=['alpha']),
+            edge_source=source,
+            graph_lister=_lister('alpha', 'omega', 'sigma'),
+        )
+
+    assert source.asked == ['alpha'], 'the narrowing must still be honoured'
+    assert report.project_ids_source == 'cli'
+    assert report.unmeasured_graphs == ['omega', 'sigma']
+    assert report.complete is False, 'un-enumerated graphs are a shortfall'
+    assert exit_code(report) != 0
+    # ...every project it DID measure was complete, so nothing else explains it
+    assert all(p.complete for p in report.projects)
+
+    warnings = '\n'.join(r.getMessage() for r in caplog.records)
+    assert 'COVERAGE SHORTFALL' in warnings
+    assert 'omega' in warnings and 'sigma' in warnings
+
+    # and the shortfall is IN the artifacts, not just in a log nobody kept
+    payload = json.loads(render_json(report))
+    assert payload['unmeasured_graphs'] == ['omega', 'sigma']
+    assert payload['project_ids_source'] == 'cli'
+    markdown = render_markdown(report)
+    assert 'COVERAGE SHORTFALL' in markdown
+    assert '`omega`' in markdown and '`sigma`' in markdown
+
+
+@pytest.mark.asyncio
+async def test_without_a_lister_the_report_says_its_graph_set_was_unchecked():
+    """No inventory to compare against is not the same as a verified set.
+
+    ``graph_lister=None`` is every test and any future caller with no store
+    behind it. Falling back to the built-in list is fine; implying the set was
+    cross-checked would not be, so the artifact records `fallback`.
+    """
+    source = _FakeEdgeSource(
+        {p: ([], True) for p in _mod.DEFAULT_PROJECT_IDS},
+    )
+
+    report = await run(_args(project_id=None), edge_source=source)
+
+    assert source.asked == list(_mod.DEFAULT_PROJECT_IDS)
+    assert report.project_ids_source == 'fallback'
+    assert report.unmeasured_graphs == []
+    assert 'NOT cross-checked' in render_markdown(report)
+
+
+@pytest.mark.asyncio
+async def test_an_empty_but_complete_graph_is_collapsed_out_of_the_table():
+    """A legibility cut that says so — the store holds dozens of probe graphs.
+
+    Zero valid edges and a proven-complete enumeration means there is nothing
+    the verdict could have missed there, so a row of zeroes is noise. The
+    collapse must be STATED and the JSON must still carry the graph, or it is
+    exactly the silent truncation this report is written not to do.
+    """
+    source = _FakeEdgeSource({
+        'alpha': (_ALPHA_FACTS, True),
+        'probe_e1_gw0': ([], True),
+    })
+
+    report = await run(
+        _args(project_id=None, measured_at=_FIXED_TIMESTAMP),
+        edge_source=source,
+        graph_lister=_lister('alpha', 'probe_e1_gw0'),
+    )
+    markdown = render_markdown(report)
+
+    table = markdown[markdown.index('| project |'): markdown.index('## Rejection')]
+    assert '`alpha`' in table
+    assert '1 further graph(s)' in table, 'the cut must be stated'
+    assert '`probe_e1_gw0`' in table, 'and must name what it cut'
+    row_prefixes = [ln for ln in table.splitlines() if ln.startswith('| `')]
+    assert row_prefixes == [ln for ln in row_prefixes if 'probe_e1_gw0' not in ln]
+
+    payload = json.loads(render_json(report))
+    assert [p['project_id'] for p in payload['projects']] == [
+        'alpha', 'probe_e1_gw0',
+    ], 'the JSON is the untruncated record'
+
+
+# ---------------------------------------------------------------------------
+# The regenerate command
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_regenerate_command_is_bare_for_an_all_defaults_run():
+    """No flags to reconstruct means no flags emitted."""
+    source = _FakeEdgeSource({'alpha': (_ALPHA_FACTS, True)})
+    report = await run(
+        _args(project_id=None, measured_at=_FIXED_TIMESTAMP),
+        edge_source=source,
+        graph_lister=_lister('alpha'),
+    )
+
+    assert _mod.regenerate_command(report) == _mod.REGENERATE_COMMAND
+    assert json.loads(render_json(report))['regenerate'] == _mod.REGENERATE_COMMAND
+
+
+@pytest.mark.asyncio
+async def test_the_regenerate_command_reconstructs_the_flags_that_were_used():
+    """An artifact must not tell the reader to run a DIFFERENT measurement.
+
+    census_memory_metadata.py grew _regen_command for exactly this (task 3507:
+    the committed artifact came from a non-default --top-n while the header
+    printed the bare command, so following it silently produced a ~4,800-row
+    -shorter markdown and still exited 0). Here the trap is worse than short:
+    `--project-id reify` measures a different POPULATION, so a bare command
+    would quietly re-measure another one and disagree with the numbers it is
+    printed above.
+    """
+    source = _FakeEdgeSource({'alpha': (_ALPHA_FACTS, True)})
+    report = await run(
+        _args(
+            project_id=['alpha'],
+            page_size=1000,
+            max_samples=5,
+            measured_at=_FIXED_TIMESTAMP,
+        ),
+        edge_source=source,
+    )
+
+    command = _mod.regenerate_command(report)
+
+    assert command.startswith(_mod.REGENERATE_COMMAND)
+    assert '--project-id alpha' in command
+    assert '--page-size 1000' in command
+    assert '--max-samples 5' in command
+    # the reconstruction has to survive the artifact round-trip
+    payload = json.loads(render_json(report))
+    assert payload['regenerate'] == command
+    assert payload['max_samples'] == 5
+    assert payload['page_size'] == 1000
+    assert command in render_markdown(report)
+
+
+@pytest.mark.asyncio
+async def test_a_discovered_graph_set_is_not_frozen_into_the_command():
+    """Re-running must re-discover, not replay today's inventory.
+
+    Emitting --project-id per graph for a DISCOVERED set would turn the
+    regenerate command into the very hardcoded list the discovery replaced:
+    a graph created after this artifact was written would then be excluded by
+    the artifact's own instructions.
+    """
+    source = _FakeEdgeSource({
+        'alpha': (_ALPHA_FACTS, True), 'beta': (_BETA_FACTS, True),
+    })
+    report = await run(
+        _args(project_id=None, measured_at=_FIXED_TIMESTAMP),
+        edge_source=source,
+        graph_lister=_lister('alpha', 'beta'),
+    )
+
+    assert '--project-id' not in _mod.regenerate_command(report)
+
+
 def test_build_parser_rejects_a_max_samples_below_one():
     """A cap of zero is not a cap, it is a hide — and it had no validator.
 
