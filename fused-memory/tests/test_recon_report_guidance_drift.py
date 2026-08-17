@@ -169,6 +169,63 @@ class TestEveryRegisteredToolIsDocumented:
         )
 
 
+class TestRendererCoversEverySignatureItIsGiven:
+    """_render_recon_report_tool_guidance() renders EVERY tool in the mapping it is handed.
+
+    This is the load-bearing, NON-TAUTOLOGICAL assertion of task 3878. The
+    renderer's only argument is already a plain
+    ``{tool: ((param, required), ...)}`` mapping (deliberately not
+    ``inspect.Signature`` objects), which makes it a dependency-injection seam:
+    a synthetic tool the renderer has never heard of can be injected with no
+    monkeypatching and no fake FastMCP server. Because that tool is NOT
+    registered anywhere, the renderer cannot have hard-coded it — so this
+    proves the actual new property ("never silently omit a tool I was handed")
+    from a signature source independent of the renderer, unlike the
+    derived-coverage tests elsewhere in this module which re-read the same live
+    signatures the renderer generates from.
+    """
+
+    # A tool the renderer has never heard of. `commit_sha` deliberately has no
+    # entry in _RECON_REPORT_PLACEHOLDERS, so it also exercises the generic
+    # <param_name> fallback.
+    SYNTHETIC_TOOL = 'cite_commit'
+    SYNTHETIC_SPEC = (('run_id', True), ('finding_id', True), ('commit_sha', True))
+
+    def _render_with_synthetic_tool(self) -> str:
+        signatures = dict(_FROZEN_RECON_REPORT_SIGNATURE_SPECS)
+        signatures[self.SYNTHETIC_TOOL] = self.SYNTHETIC_SPEC
+        return prompts_module._render_recon_report_tool_guidance(signatures)
+
+    def test_unknown_tool_is_rendered_as_a_call_example(self):
+        rendered = self._render_with_synthetic_tool()
+        assert f'mcp__recon-report__{self.SYNTHETIC_TOOL}(' in rendered, (
+            f'_render_recon_report_tool_guidance() silently omitted `{self.SYNTHETIC_TOOL}` '
+            'from its output even though it was handed that tool\'s signature — the '
+            'renderer must render every key of the mapping it is given, so a '
+            'newly-registered tool can never be silently absent from the guidance.'
+        )
+
+    def test_unknown_tool_renders_all_of_its_parameters(self):
+        rendered = self._render_with_synthetic_tool()
+        openers = list(_iter_call_openers(rendered, self.SYNTHETIC_TOOL))
+        assert openers, f'no `{self.SYNTHETIC_TOOL}(` call example found in the rendered guidance'
+        args_substr = _extract_call_args_at(rendered, openers[0])
+        for param_name, _required in self.SYNTHETIC_SPEC:
+            assert param_name in args_substr, (
+                f'the rendered `{self.SYNTHETIC_TOOL}(...)` example is missing the '
+                f'`{param_name}` parameter — got: {self.SYNTHETIC_TOOL}({args_substr})'
+            )
+
+    def test_known_tools_still_render_when_an_unknown_one_is_present(self):
+        """An unrecognised tool must be ADDITIVE, never displace the curated prose."""
+        rendered = self._render_with_synthetic_tool()
+        for tool_name in _FROZEN_RECON_REPORT_SIGNATURE_SPECS:
+            assert f'mcp__recon-report__{tool_name}(' in rendered, (
+                f'rendering with an unrecognised tool present dropped the curated '
+                f'`{tool_name}` call example'
+            )
+
+
 # Fully assembled stage-prompt texts to scan for inline report-tool call examples.
 # build_stage2_system_prompt('autopilot_video') is included because it injects
 # AUTOPILOT_VIDEO_CONTAMINATION_GUARDRAIL, which carries its own cross-project
