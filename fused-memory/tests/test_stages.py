@@ -3696,6 +3696,7 @@ class TestInvariantAfterTask643:
             logger='fused_memory.reconciliation.stages.task_knowledge_sync',
         ):
             stage._check_filtered_tree_invariant(ok_tree)
+            _emit_foreign_log_noise()  # task 4329: RED-drive the absence assertion below
 
         assert not any(rec.levelno == logging.WARNING for rec in caplog.records)
 
@@ -3716,6 +3717,7 @@ class TestInvariantAfterTask643:
             logger='fused_memory.reconciliation.stages.task_knowledge_sync',
         ):
             stage._check_filtered_tree_invariant(ok_tree)
+            _emit_foreign_log_noise()  # task 4329: RED-drive the absence assertion below
 
         assert not any(rec.levelno == logging.WARNING for rec in caplog.records)
 
