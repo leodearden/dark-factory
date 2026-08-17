@@ -7008,11 +7008,12 @@ class TestSweepStalePersistenceMarkers:
             logger='fused_memory.reconciliation.stages.task_knowledge_sync',
         ):
             result = await _sweep_stale_persistence_markers(memory_service, 'reify', run_id='r1')
+            _emit_foreign_log_noise()  # task 4329: RED-drive the level-only filter below
 
         assert result == 0
         memory_service.delete_memory.assert_not_awaited()
         warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
-        assert len(warning_records) >= 1
+        assert len(warning_records) == 1
 
     @pytest.mark.asyncio
     async def test_empty_enumeration_returns_zero_and_no_deletes(self):
@@ -7061,6 +7062,7 @@ class TestSweepStalePersistenceMarkers:
             result = await _sweep_stale_persistence_markers(
                 memory_service, 'reify', run_id='r1', now=fixed_now,
             )
+            _emit_foreign_log_noise()  # task 4329: RED-drive the level-only filter below
 
         assert result == 1
         warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
@@ -7097,9 +7099,10 @@ class TestSweepStalePersistenceMarkers:
             await _sweep_stale_persistence_markers(
                 memory_service, 'reify', run_id='r1', now=fixed_now, scroll_limit=3,
             )
+            _emit_foreign_log_noise()  # task 4329: RED-drive the level-only filter below
 
         warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
-        assert len(warning_records) >= 1
+        assert len(warning_records) == 1
 
     @pytest.mark.asyncio
     async def test_kind_only_member_emits_no_drift_warning_single_variant_pool(self, caplog):
@@ -7387,11 +7390,12 @@ class TestSweepStaleMem0FlagMarkers:
             logger='fused_memory.reconciliation.stages.task_knowledge_sync',
         ):
             result = await _sweep_stale_mem0_flag_markers(memory_service, 'reify', run_id='r1')
+            _emit_foreign_log_noise()  # task 4329: RED-drive the level-only filter below
 
         assert result == 0
         memory_service.delete_memory.assert_not_awaited()
         warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
-        assert len(warning_records) >= 1
+        assert len(warning_records) == 1
 
     @pytest.mark.asyncio
     async def test_empty_enumeration_returns_zero_and_no_deletes(self):
@@ -7440,6 +7444,7 @@ class TestSweepStaleMem0FlagMarkers:
             result = await _sweep_stale_mem0_flag_markers(
                 memory_service, 'reify', run_id='r1', now=fixed_now,
             )
+            _emit_foreign_log_noise()  # task 4329: RED-drive the level-only filter below
 
         assert result == 1
         warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
@@ -7476,9 +7481,10 @@ class TestSweepStaleMem0FlagMarkers:
             await _sweep_stale_mem0_flag_markers(
                 memory_service, 'reify', run_id='r1', now=fixed_now, scroll_limit=3,
             )
+            _emit_foreign_log_noise()  # task 4329: RED-drive the level-only filter below
 
         warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
-        assert len(warning_records) >= 1
+        assert len(warning_records) == 1
 
     @pytest.mark.asyncio
     async def test_count_short_circuit_skips_scroll_when_count_is_zero(self):
