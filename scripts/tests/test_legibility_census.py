@@ -2090,6 +2090,34 @@ def test_run_census_storm_batch_is_logged_and_noted_in_report(tmp_path, caplog):
     report_text = kwargs["report_path"].read_text(encoding="utf-8")
     assert "storm" in report_text.lower(), "the report's cost note must call out degraded data"
 
+    # LOCK, not RED: pins an asymmetry that is already correct today, so it
+    # is tempting to "clean up" once the coverage line (above) starts
+    # reporting `succeeded` instead of `total` -- doing so would silently
+    # UNDER-report real spend. The coverage line answers "how much signal
+    # did this run gather?" (succeeded is correct there). The cost note
+    # answers "what did this run bill?" (total is correct here):
+    # coder.code_digests calls code_digest once per digest, each in its own
+    # try/except, so a digest that fails to parse has ALREADY spent its
+    # invoke call by the time it's counted as failed. Derived from the
+    # fixture, not hardcoded, so this survives a batch resize.
+    cost_section = report_text.split("## Cost", 1)[1]
+    assert f"miner={len(batch)}" in cost_section, (
+        "the cost note must count every digest DRAWN into the batch "
+        "(including the 2 that failed to parse), not just the ones that "
+        "coded successfully -- they already burned their invoke call"
+    )
+
+    # This run passed no max_batches, so it is uncapped: mine_to_saturation
+    # exhausts the single-batch source rather than hitting an operator cap.
+    # render_report's entire capped-coverage block -- including the step-4
+    # shortfall clause -- is gated on `mining_result.max_batches is not
+    # None` and so renders NOTHING on this path. Asserting the shortfall
+    # clause fired here would be a false premise about an uncapped run;
+    # assert instead what this path actually renders (nothing), rather than
+    # adding a cap this test never passed just to force it to appear.
+    assert outcome.stop_reason == "exhausted"
+    assert "coverage" not in report_text.lower()
+
 
 # ---------------------------------------------------------------------------
 # task 3280 step-9: RED — run_census(max_batches=) threads the operator batch
