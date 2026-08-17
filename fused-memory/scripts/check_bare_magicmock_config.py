@@ -213,16 +213,41 @@ _DATACLASS_VIOLATION_MSG = (
 )
 
 
-def _matching_shape(call: ast.Call) -> _DataclassShape | None:
-    """Return the first registered shape *call*'s literal kwarg names match, else None.
+def _literal_kwarg_names(call: ast.Call) -> set[str]:
+    """Return *call*'s literal keyword-argument names.
 
-    Only the FIRST match is returned: a call must never produce one violation per
-    registered shape.
+    The ``kw.arg is not None`` guard is what makes a ``**spread`` a non-match: CPython
+    represents ``MagicMock(**kw)`` as a keyword whose ``arg`` is None.  A spread exposes
+    no literal name, so it can never satisfy an anchor gate.
     """
-    kwargs = {kw.arg for kw in call.keywords if kw.arg is not None}
+    return {kw.arg for kw in call.keywords if kw.arg is not None}
+
+
+def _matching_shape(call: ast.Call) -> tuple[_DataclassShape, set[str]] | None:
+    """Return the first registered shape *call* matches (with its kwarg names), else None.
+
+    ANCHOR + OVERLAP, both required:
+      1. every name in ``shape.anchors`` appears among the literal kwarg names, AND
+      2. at least ``shape.min_field_matches`` of ``shape.fields`` are matched.
+
+    Gate 1 alone would flag a stray ``MagicMock(passed=True)`` on an unrelated object;
+    gate 2 alone would flag ``MagicMock(summary=..., timed_out=...)`` with no anchor.
+    Neither is sufficient by itself.
+
+    Kwargs that are NOT fields neither block nor weaken the match — they are drift
+    evidence surfaced in the message.  A subset rule (``kwargs <= fields``) would have
+    missed all ten task-3980 sites, every one of which carried ``verify_skipped=``.
+
+    Only the FIRST matching shape is returned: a call must never produce one violation
+    per registered shape.
+    """
+    kwargs = _literal_kwarg_names(call)
     for shape in _DATACLASS_SHAPES:
-        if shape.anchors <= kwargs:
-            return shape
+        if not shape.anchors <= kwargs:
+            continue
+        if len(kwargs & shape.fields) < shape.min_field_matches:
+            continue
+        return shape, kwargs
     return None
 
 
@@ -250,9 +275,10 @@ def _find_dataclass_double_violations(
             continue
         if _is_specced(node):
             continue
-        shape = _matching_shape(node)
-        if shape is None:
+        match = _matching_shape(node)
+        if match is None:
             continue
+        shape, kwargs = match
         violations.append(
             Violation(
                 filename=filename,
