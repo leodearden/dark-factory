@@ -24,6 +24,7 @@ from orchestrator.verify_cmd import (
     describe_dropped_clauses,
     has_unpreserved_chain_clauses,
     parse_config_command,
+    promote_cwd_to_project,
     render,
     scope_to,
     split_chain_tail,
@@ -440,7 +441,7 @@ def _scope_prefix_to_keyword(raw: str, keyword: str, files: list[str]) -> Verify
     # point, so the clauses past it are exactly the ones this call discards.
     if has_unpreserved_chain_clauses(raw, tail):
         log_dropped_chain_clauses(logger, raw, keyword, retained)
-    scoped = strip_cwd(scope_to(prefix_parsed, files))
+    scoped = strip_cwd(promote_cwd_to_project(scope_to(prefix_parsed, files)))
     if not tail:
         return scoped
     return VerifyCmd(tool=scoped.tool, raw=f'{render(scoped)} {tail}')

@@ -67,6 +67,7 @@ from orchestrator.verify_cmd import (
     govern_cpu,
     has_unpreserved_chain_clauses,
     parse_config_command,
+    promote_cwd_to_project,
     render,
     reproject,
     scope_to,
@@ -241,7 +242,7 @@ def _scope_to_keyword(cmd: str | None, keyword: str, files: list[str]) -> str | 
     # the ones this call discards — which is what makes the count right.
     if has_unpreserved_chain_clauses(cmd, tail):
         verify_plan.log_dropped_chain_clauses(logger, cmd, keyword, retained)
-    rendered = render(strip_cwd(scope_to(parsed, files)))
+    rendered = render(strip_cwd(promote_cwd_to_project(scope_to(parsed, files))))
     return f'{rendered} {tail}' if tail else rendered
 
 

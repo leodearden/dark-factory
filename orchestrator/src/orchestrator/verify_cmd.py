@@ -1235,6 +1235,49 @@ def strip_cwd(cmd: VerifyCmd) -> VerifyCmd:
     return replace(cmd, cwd_rel=None)
 
 
+def promote_cwd_to_project(cmd: VerifyCmd) -> VerifyCmd:
+    """Return *cmd* with ``cwd_rel`` copied into an EMPTY ``uv_project`` (task 3830).
+
+    ``--directory X`` and ``--project X`` select the same uv project, but
+    ``strip_cwd`` discards only the former — it clears ``cwd_rel`` and
+    deliberately keeps ``uv_project`` ("it selects the venv, independent of
+    cwd"). A command that expresses its project SOLELY via ``--directory X``
+    therefore loses that selection the moment it is scoped, rendering a bare
+    ``uv run <tool> <root-relative files>`` against the workspace root — which
+    is depless by design ("not a package, just coordinates subprojects"), so
+    on a cold merge-verify worktree the tool is not installed at all. That is
+    the 'Failed to spawn: pytest' / exit-127 shape of regression ef68777a17 /
+    task 2036, independently recorded as a standing review invariant in
+    ``review/briefing.yaml``.
+
+    Applying this BEFORE ``strip_cwd`` keeps a scoped ``--directory``-only
+    command byte-identical to the ``--project X --directory X`` form it
+    replaces, which is what lets the module ``orchestrator.yaml`` files retire
+    the self-defeating pairing (uv resolves ``--project X`` against the cwd
+    ``--directory X`` just established, looking for ``X/X``) without
+    degrading any scoped render.
+
+    Promotion ONLY: ``cwd_rel`` is left set, so this composes with — rather
+    than duplicates — ``strip_cwd``, which remains the single place a cwd
+    shift is cleared.
+
+    No-op when: an explicit ``--project`` is already set (``uv_project``
+    non-empty — the same "don't second-guess an explicit uv context" rule
+    ``reproject`` follows, so a deliberately DIFFERING pair like
+    ``--project shared --directory scripts`` keeps its own project); there is
+    no cwd to promote (``cwd_rel is None`` — that is ``reproject``'s case);
+    the command is not uv-wrapped at all (``uv_project is None``, e.g. a
+    ``cd X && npx pyright`` clause — see the tri-state note on
+    ``VerifyCmd.uv_project``); OPAQUE (P1); or a raw-retained chain.
+    Idempotent: ``uv_project`` is non-empty after the first application.
+    """
+    if cmd.tool is ToolKind.OPAQUE or cmd.raw is not None:
+        return cmd
+    if cmd.uv_project != '' or cmd.cwd_rel is None:
+        return cmd
+    return replace(cmd, uv_project=cmd.cwd_rel)
+
+
 def reproject(cmd: VerifyCmd, project: str) -> VerifyCmd:
     """Return *cmd* with ``uv_project`` set to *project* (regression ef68777a17).
 
