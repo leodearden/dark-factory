@@ -26,6 +26,7 @@ from shared.invocation_outcome import (
     ZeroOutputWedge,
     _extract_cap_message,
     _parse_resets_at,
+    auth_failure_reason,
     classify_invocation,
 )
 
@@ -128,6 +129,29 @@ class TestInvocationOutcomeSumType:
         assert CapHit(resets_at=None, reason='r') != NearCap(reason='r')
         assert OK() != ZeroOutputWedge()
         assert AuthFailed(status=401) != AuthFailed(status=403)
+
+
+class TestAuthFailureReason:
+    """The reason string handed to UsageGate._handle_auth_failure.
+
+    Single-sourced on purpose: production ``usage_gate.InvokeSlot.report`` and
+    the shipped mock-gate mirror ``shared.testing.make_gate_mock`` both render
+    it, and their docstrings require them to stay byte-for-byte in step.
+    """
+
+    def test_renders_status_and_body(self):
+        # Matches the pre-refactor f'HTTP {status}: {output[:120]}' shape.
+        outcome = AuthFailed(status=401, body='OAuth token has been revoked')
+        assert auth_failure_reason(outcome) == 'HTTP 401: OAuth token has been revoked'
+
+    def test_renders_bare_status_when_body_empty(self):
+        # Backward-compatibility pin: EXACTLY the string produced today, with no
+        # trailing ': '. An empty body must leave the persisted reason and the
+        # `Account X AUTH-FAILED: ...` log line byte-identical to current behaviour.
+        assert auth_failure_reason(AuthFailed(status=403)) == 'HTTP 403'
+
+    def test_is_exported(self):
+        assert 'auth_failure_reason' in invocation_outcome_module.__all__
 
 
 class TestParseResetsAt:
