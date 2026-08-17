@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import sys
 import types
 from collections.abc import Callable
@@ -867,6 +868,139 @@ async def test_main_async_refuses_the_write_when_the_backup_path_is_already_take
     assert str(occupied) in err
     assert 'Refusing to write without a recoverable snapshot' in err
     assert occupied.read_text() == sentinel, 'the occupying file is left byte-identical'
+
+
+def test_default_backup_path_shape_advertises_the_stamp_without_resolving_it():
+    """The shape is the resolved path with the instant left as a placeholder.
+
+    A dry run cannot honestly print a resolved path — the `--apply` that
+    actually writes it runs in a different second — so it prints this instead.
+    Rendering both from one template is what keeps the advertised shape and
+    the real filename from drifting apart.
+    """
+    shape = _mod.default_backup_path_shape('3083')
+
+    assert '<UTC-stamp>' in shape
+    assert '3083' in shape
+    assert shape.endswith('.json')
+
+    resolved = default_backup_path('3083', now=datetime(2026, 8, 15, 9, 30, 0, tzinfo=UTC))
+    assert shape.replace('<UTC-stamp>', '20260815T093000Z') == str(resolved)
+
+
+@pytest.mark.asyncio
+async def test_dry_run_advertises_the_shape_it_cannot_yet_resolve(
+    monkeypatch, tmp_path, capsys,
+):
+    """A rehearsal must not name a file the later --apply will never write.
+
+    Rehearse-then-apply is the workflow this script is built around, and under
+    a fixed default path the printed `Backup:` line was authoritative. With a
+    per-run stamp it no longer can be, so the dry run stops pretending: it
+    prints the shape and says when the name is chosen.
+
+    `_utcnow` is monkeypatched to RAISE, which is the actual assertion — a dry
+    run that resolved an instant at all would blow up here rather than quietly
+    printing a stale one.
+    """
+    _install_fake_client(monkeypatch, _FakeClient())
+    monkeypatch.setattr(_mod, 'DEFAULT_BACKUP_DIR', tmp_path)
+
+    def _no_clock_in_a_dry_run():
+        raise AssertionError('a dry run must not resolve a backup instant')
+
+    monkeypatch.setattr(_mod, '_utcnow', _no_clock_in_a_dry_run)
+
+    args = build_parser().parse_args(['--task-id', '3083', '--keys', 'origin_escalation'])
+    assert await _mod.main_async(args) == 0
+
+    out = capsys.readouterr().out
+    assert '<UTC-stamp>' in out
+    assert 'resolved at write time' in out
+    assert not re.search(r'\d{8}T\d{6}Z', out), 'no resolved instant in a rehearsal'
+    assert list(tmp_path.iterdir()) == [], 'a dry run writes nothing'
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_backup_path_is_printed_verbatim_in_a_dry_run(
+    monkeypatch, tmp_path, capsys,
+):
+    """An operator-chosen path IS authoritative, so it is printed as given.
+
+    The shape exists because a machine-chosen name is not knowable until write
+    time. `--backup-path` is knowable — it was typed — and rehearsing it has to
+    show exactly the file the apply will create.
+    """
+    _install_fake_client(monkeypatch, _FakeClient())
+    chosen = tmp_path / 'chosen.json'
+
+    args = build_parser().parse_args(
+        ['--task-id', '3083', '--keys', 'origin_escalation', '--backup-path', str(chosen)],
+    )
+    assert await _mod.main_async(args) == 0
+
+    out = capsys.readouterr().out
+    assert str(chosen) in out
+    assert '<UTC-stamp>' not in out
+
+
+@pytest.mark.asyncio
+async def test_a_same_second_default_collision_steps_aside_instead_of_aborting(
+    monkeypatch, tmp_path, capsys,
+):
+    """A machine-chosen name that collides gets disambiguated, not refused.
+
+    "Move it aside, or pass a different --backup-path" is sound advice about a
+    path the operator chose and nonsense about one they never saw. Two runs
+    inside one second is the only way the stamped default collides, and the
+    script can simply pick the next free name — the create stays exclusive, so
+    the safety property (never replace an existing snapshot) is untouched.
+    """
+    _install_fake_client(monkeypatch, _FakeClient())
+    monkeypatch.setattr(_mod, 'DEFAULT_BACKUP_DIR', tmp_path)
+    monkeypatch.setattr(
+        _mod, '_utcnow', lambda: datetime(2026, 8, 15, 9, 30, 0, tzinfo=UTC),
+    )
+
+    first = build_parser().parse_args(
+        ['--task-id', '3083', '--keys', 'origin_escalation', '--apply'],
+    )
+    assert await _mod.main_async(first) == 0
+    second = build_parser().parse_args(
+        ['--task-id', '3083', '--keys', 'origin_reify_task', '--apply'],
+    )
+    assert await _mod.main_async(second) == 0, 'a machine-chosen collision must not abort'
+
+    stamped = tmp_path / 'task-3083-metadata-before-20260815T093000Z.json'
+    stepped_aside = tmp_path / 'task-3083-metadata-before-20260815T093000Z-2.json'
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted(
+        [stamped.name, stepped_aside.name]
+    )
+    assert str(stepped_aside) in capsys.readouterr().out, 'the run names what it actually wrote'
+
+    run_1 = json.loads(stamped.read_text())['metadata']
+    assert 'origin_escalation' in run_1, 'run 1 still holds the TRUE pre-migration row'
+    assert 'x_origin_escalation' not in run_1
+    run_2 = json.loads(stepped_aside.read_text())['metadata']
+    assert 'x_origin_escalation' in run_2
+
+
+def test_stepping_aside_gives_up_after_a_bounded_number_of_tries(tmp_path):
+    """Bounded, so a wedged directory fails loudly instead of spinning.
+
+    Giving up is the same refusal as an occupied explicit path — a
+    `FileExistsError`, hence an `OSError`, hence `main_async`'s existing
+    "Refusing to write without a recoverable snapshot" before any write.
+    """
+    base = tmp_path / 'before.json'
+    base.write_text('{}')
+    (tmp_path / 'before-2.json').write_text('{}')
+
+    with pytest.raises(FileExistsError) as caught:
+        _mod.write_backup_at_a_free_path(base, _deep_copy(_PENDING_TASK_ROW), attempts=2)
+
+    assert isinstance(caught.value, OSError), 'main_async catches OSError, so this must be one'
+    assert str(base) in str(caught.value)
 
 
 # --- case 13: every post-write exit points at the backup --------------------

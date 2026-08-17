@@ -18,7 +18,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 **The default `--backup-path` is now stamped per run** —
 `/tmp/task-<id>-metadata-before-<UTC-stamp>.json` (`%Y%m%dT%H%M%SZ`, the stamp
 the rest of the repo already uses) rather than one fixed
-`/tmp/task-<id>-metadata-before.json`. `docs/task-authoring.md` §8 prescribes a
+`/tmp/task-<id>-metadata-before.json`. It is resolved at write time, so a dry
+run now prints that shape and `(resolved at write time)` instead of a concrete
+name the later `--apply` — running in a different second — would never write. `docs/task-authoring.md` §8 prescribes a
 mechanical per-task re-run of this script with different `--keys`, and under
 the fixed path run 2 wrote its already-partially-migrated row straight over run
 1's TRUE pre-migration row — silently destroying the one artifact the SAFETY
@@ -31,7 +33,11 @@ flag: an operator reusing an explicit `--backup-path` across runs now gets the
 run refused — `FileExistsError`, which the existing `except OSError` turns into
 "Refusing to write without a recoverable snapshot" and exit 1 *before*
 `update_task` is called — where previously the earlier snapshot was lost with
-no sign. Move the file aside, or pass a different `--backup-path`.
+no sign. Move the file aside, or pass a different `--backup-path`. A collision
+on the *default* path (only reachable from two `--apply` runs inside one
+second) is not an operator error and does not abort: the run steps aside to
+`...-2.json`. The create is exclusive either way, so no existing snapshot is
+ever replaced.
 
 **Every exit that leaves the stored row unverified now names that snapshot** —
 the read-back that crashed, and the write call that never returned. Both used
