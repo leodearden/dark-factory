@@ -442,6 +442,168 @@ async def test_edge_enumeration_of_empty_graph_is_complete_and_empty():
 
 
 # ---------------------------------------------------------------------------
+# `complete` must be EARNED, not asserted
+# ---------------------------------------------------------------------------
+#
+# The defect these tests pin, reproduced first-hand against the shipped code:
+# ``if len(rows) < page_size: break`` mistakes the SERVER's ceiling for
+# end-of-data. With a cap of 10 and page_size=20 over a 50-edge corpus the
+# first page returns 10 rows, the break fires, and the function returns
+# 10 of 50 edges with ``complete=True`` — after which run() publishes a
+# fifth-of-the-corpus zero as a COMPLETE measurement.
+#
+# The band was untested because every pre-existing enumeration test uses
+# cap == page_size, which is precisely the BENIGN case: there a short page
+# really is end-of-data, so the bug cannot show. And the fail-closed rule at
+# run() level was only ever asserted against _FakeEdgeSource's hand-supplied
+# flag, never against a flag real code had to compute.
+
+
+def _fake_rows(count: int) -> list[list]:
+    """*count* distinct edge rows, one row per uuid.
+
+    Deliberately repeat-free (unlike ``_fake_corpus``, which models the
+    undirected MATCH's double-attribution): here a shortfall can only ever
+    come from truncation, never from dedup, so an assertion on ``len(facts)``
+    is unambiguous.
+    """
+    return [[f'edge-{i:03d}', f'Fact number {i}.'] for i in range(count)]
+
+
+@pytest.mark.asyncio
+async def test_enumeration_fails_closed_when_page_size_exceeds_the_server_cap():
+    """A page_size above the server cap makes the short-page break a LIE.
+
+    This is the exact repro: cap=10, page_size=20, 50 edges. The shipped code
+    returns 10 of 50 with complete=True. Fail-closed is the only acceptable
+    answer — an under-enumerated corpus is a FAILURE, not a smaller report,
+    because this task's headline is a zero and a truncated zero is worthless.
+    """
+    query_fn = _FakeCappedEdgeQuery(_fake_rows(50), cap=10)
+
+    facts, complete = await enumerate_valid_edge_facts(
+        query_fn, page_size=20, resultset_size=10,
+    )
+
+    assert complete is False, (
+        'a page_size at or above the server cap cannot yield a provably '
+        'complete enumeration'
+    )
+    assert facts == {}, (
+        'a PARTIAL dict invites the caller to use it anyway; an unsound '
+        'paging configuration must yield nothing at all'
+    )
+    assert query_fn.cyphers == [], (
+        'the configuration is unsound before any row is read — refuse up '
+        'front rather than after doing the work'
+    )
+
+
+@pytest.mark.asyncio
+async def test_enumeration_fails_closed_at_the_module_default_cap():
+    """The boundary is `>=`, not `>`, deliberately.
+
+    page_size == RESULTSET_SIZE is arithmetically safe on a server configured
+    at exactly the constant we assume: a full page would genuinely be a full
+    page. But RESULTSET_SIZE is an ASSUMPTION about server configuration —
+    nothing in this repo sets it — so equality leaves ZERO margin, and a
+    server configured one row lower silently re-opens the truncation.
+    Refusing at the boundary costs one page of throughput and buys the margin.
+    """
+    query_fn = _FakeCappedEdgeQuery(_fake_rows(50), cap=10)
+
+    facts, complete = await enumerate_valid_edge_facts(
+        query_fn, page_size=_mod.RESULTSET_SIZE,
+    )
+
+    assert _mod.RESULTSET_SIZE == 10000, "FalkorDB's server-wide default"
+    assert complete is False
+    assert facts == {}
+    assert query_fn.cyphers == []
+
+
+@pytest.mark.asyncio
+async def test_enumeration_fails_closed_when_the_page_cap_is_exhausted():
+    """A bounded loop must report the bound it hit, not pretend it finished.
+
+    Mirrors census_foreign_nodes' MAX_CENSUS_PAGES precedent
+    (scripts/migrate_cross_graph_leak.py:161, :302): bound the loop so a
+    pathological corpus cannot spin the probe forever, and WARN + report
+    incomplete when the cap is hit while the last page was still full.
+    No silent caps.
+    """
+    query_fn = _FakeCappedEdgeQuery(_fake_rows(50), cap=_PAGE_SIZE)
+
+    facts, complete = await enumerate_valid_edge_facts(
+        query_fn, page_size=_PAGE_SIZE, max_pages=3,
+    )
+
+    page_cyphers = [c for c in query_fn.cyphers if 'SKIP' in c]
+    assert len(page_cyphers) == 3, 'the loop must TERMINATE at the cap'
+    assert complete is False, (
+        'hitting the page cap on a still-full page is a suspected shortfall, '
+        'not a successful enumeration'
+    )
+    assert len(facts) < 50
+
+
+@pytest.mark.asyncio
+async def test_benign_pagination_is_still_complete():
+    """The regression guard: the fix must not degenerate to 'always False'.
+
+    cap == page_size, both well under RESULTSET_SIZE, over a corpus needing
+    many pages — the ordinary case, and the one the live run depends on. All
+    50 edges, complete True.
+    """
+    query_fn = _FakeCappedEdgeQuery(_fake_rows(50), cap=_PAGE_SIZE)
+
+    facts, complete = await enumerate_valid_edge_facts(
+        query_fn, page_size=_PAGE_SIZE,
+    )
+
+    assert complete is True
+    assert len(facts) == 50
+
+
+@pytest.mark.asyncio
+async def test_paged_cypher_requests_a_stable_order():
+    """DISTINCT + SKIP/LIMIT with no ORDER BY has no cross-query boundary.
+
+    Every page is a SEPARATE query. Absent an explicit total order the store
+    is free to return rows in a different order per query, so `SKIP n` on
+    page 2 can skip rows page 1 never returned (silently dropped) or
+    re-return rows it did (duplicated — masked here by the uuid dedup, but
+    the drop is silent and permanent). Ordering on e.uuid makes the page
+    boundary mean the same thing in every query.
+    """
+    query_fn = _FakeCappedEdgeQuery(_fake_rows(20), cap=_PAGE_SIZE)
+
+    await enumerate_valid_edge_facts(query_fn, page_size=_PAGE_SIZE)
+
+    page_cyphers = [c for c in query_fn.cyphers if 'SKIP' in c]
+    assert page_cyphers, 'no paged query was issued at all'
+    for cypher in page_cyphers:
+        assert 'ORDER BY' in cypher, cypher
+        assert cypher.index('ORDER BY') < cypher.index('SKIP'), cypher
+
+
+def test_build_parser_rejects_a_page_size_at_or_above_the_server_cap():
+    """The operator gets a clear CLI error, not a fail-closed exit later.
+
+    The in-function check stays regardless — it is the one that is testable
+    and that protects direct callers — but an argparse error names the
+    problem at the moment the operator makes it.
+    """
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(['--page-size', str(_mod.RESULTSET_SIZE)])
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(['--page-size', str(_mod.RESULTSET_SIZE + 1)])
+
+    ok = build_parser().parse_args(['--page-size', '5000'])
+    assert ok.page_size == 5000
+
+
+# ---------------------------------------------------------------------------
 # run(): aggregation and the fail-closed rule
 # ---------------------------------------------------------------------------
 
