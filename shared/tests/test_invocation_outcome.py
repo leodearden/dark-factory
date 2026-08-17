@@ -57,6 +57,23 @@ class TestInvocationOutcomeSumType:
         assert isinstance(outcome, InvocationOutcome)
         assert outcome.status == 401
 
+    def test_auth_failed_round_trips_body(self):
+        body = '{"type":"error","error":{"type":"authentication_error"}}'
+        outcome = AuthFailed(status=401, body=body)
+        assert outcome.status == 401
+        assert outcome.body == body
+
+    def test_auth_failed_body_defaults_to_empty(self):
+        # The field MUST default so the ~10 existing bare AuthFailed(status=...)
+        # construction sites across test_invocation_outcome.py, test_cap_retry.py
+        # and test_api_health.py keep constructing.
+        assert AuthFailed(status=401).body == ''
+
+    def test_auth_failed_body_participates_in_equality(self):
+        # Pins that the frozen-dataclass value semantics extend to the new field.
+        assert AuthFailed(status=401, body='a') != AuthFailed(status=401, body='b')
+        assert AuthFailed(status=401, body='a') == AuthFailed(status=401, body='a')
+
     def test_cli_local_error_round_trips_marker(self):
         outcome = CliLocalError(marker='is already in use')
         assert isinstance(outcome, InvocationOutcome)
