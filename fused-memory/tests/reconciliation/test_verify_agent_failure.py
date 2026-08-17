@@ -7,6 +7,14 @@ an empty-summary inconclusive.
 
 Step-2 (GREEN): Implement the fix in verify.py (extract_agent_verdict).
 The success-path test guards behavior-preservation across the refactor.
+
+Task 4343 extends site-22's task-1811 work with STRUCTURED fields: the
+``agent-failed:<token>`` sentinel lives in the human-facing ``summary`` prose,
+so any consumer wanting the fact has to string-parse it — which design
+invariant INV-2 ``structured-facts-at-failure`` forbids.  ``VerificationResult``
+now also carries ``agent_failed: bool`` and ``failure_token: str``, and the
+assertions below pin them on every path (both failure shapes, the non-dict
+shape, and the success path where both must stay at their defaults).
 """
 
 import logging
@@ -48,6 +56,9 @@ async def test_verify_agent_failure_emits_warning_and_sentinel_summary(
     - return summary='agent-failed:<token>' (NOT empty)
     - return confidence=0.0, evidence=[], git_context=None
     - emit at least one WARNING record containing the failure token
+    - (task 4343) set agent_failed=True and failure_token=<token> as
+      STRUCTURED fields, so a downstream consumer never has to parse the
+      ``agent-failed:`` prefix back out of the summary prose
     """
     result_dict, journal = agent_return
     expected_token = result_dict['warning']
@@ -71,6 +82,14 @@ async def test_verify_agent_failure_emits_warning_and_sentinel_summary(
     assert result.confidence == 0.0
     assert result.evidence == []
     assert result.git_context is None
+
+    # Task 4343: the failure must also be legible WITHOUT parsing the summary.
+    assert result.agent_failed is True, (
+        f'Expected agent_failed=True but got {result.agent_failed!r}'
+    )
+    assert result.failure_token == expected_token, (
+        f'Expected failure_token={expected_token!r} but got {result.failure_token!r}'
+    )
 
     warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert warning_records, 'Expected at least one WARNING record, got none'
@@ -97,6 +116,9 @@ async def test_verify_agent_failure_non_dict_uses_error_summary(caplog):
     - return confidence=0.0, evidence=[], git_context=None
       (all from ``verdict.raw or {}`` which resolves to ``{}`` when raw is None)
     - emit at least one WARNING record containing 'verify_failed'
+    - (task 4343) set agent_failed=True and failure_token='verify_failed' —
+      the structured fields must survive the raw-is-None path too, where
+      there is no ``warning`` key to read a token from
     """
     with patch('fused_memory.reconciliation.verify.AgentLoop') as MockAgentLoop:
         mock_agent_instance = AsyncMock()
@@ -118,6 +140,14 @@ async def test_verify_agent_failure_non_dict_uses_error_summary(caplog):
     assert result.evidence == []
     assert result.git_context is None
 
+    # Task 4343: structured fields survive the raw-is-None path.
+    assert result.agent_failed is True, (
+        f'Expected agent_failed=True but got {result.agent_failed!r}'
+    )
+    assert result.failure_token == 'verify_failed', (
+        f"Expected failure_token='verify_failed' but got {result.failure_token!r}"
+    )
+
     warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert warning_records, 'Expected at least one WARNING record, got none'
     assert any('verify_failed' in r.message for r in warning_records), (
@@ -137,6 +167,11 @@ async def test_verify_success_path_preserved(caplog):
 
     This characterizes current behavior and guards against regressions in
     the step-2 refactor.
+
+    (task 4343) The success path must leave BOTH new structured fields at
+    their defaults — a healthy verdict that arrives carrying agent_failed=True
+    or a non-empty failure_token would make the two states indistinguishable
+    in the opposite direction.
     """
     terminal_result = {
         'verdict': 'confirmed',
@@ -162,6 +197,14 @@ async def test_verify_success_path_preserved(caplog):
     assert result.confidence == 0.9
     assert result.evidence == [{'file_path': 'a.py', 'line_range': '1-10', 'snippet': 'x = 1', 'relevance': 'direct'}]
     assert result.git_context == {'author': 'x', 'latest_relevant_commit': 'abc123'}
+
+    # Task 4343: both structured fields stay at their defaults on success.
+    assert result.agent_failed is False, (
+        f'Expected agent_failed=False on the success path but got {result.agent_failed!r}'
+    )
+    assert result.failure_token == '', (
+        f'Expected an empty failure_token on the success path but got {result.failure_token!r}'
+    )
 
     warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert not warning_records, (
