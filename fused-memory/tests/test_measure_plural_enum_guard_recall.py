@@ -55,6 +55,7 @@ def _load_module(mod_name: str, path: Path) -> types.ModuleType:
 
 
 _mod = _load_module('measure_plural_enum_guard_recall', SCRIPT_PATH)
+enumerate_valid_edge_facts = _mod.enumerate_valid_edge_facts
 scan_corpus = _mod.scan_corpus
 triage_rejection = _mod.triage_rejection
 simulate_candidate = _mod.simulate_candidate
@@ -315,6 +316,122 @@ def test_subject_position_positives_extract_unchanged_under_both_candidates(
     """
     for fact, expected in _POSITIVE_SHAPES:
         assert extract_plural_ids(fact, candidate=candidate) == expected, fact
+
+
+# ---------------------------------------------------------------------------
+# Edge enumeration must survive FalkorDB's server-wide result-set cap
+# ---------------------------------------------------------------------------
+
+_PAGE_SIZE = 4
+
+
+class _FakeCappedEdgeQuery:
+    """A query_fn that truncates every response exactly as the server does.
+
+    FalkorDB's server-wide RESULTSET_SIZE is 10000 and nothing in this repo
+    overrides it, so an unpaginated query is SILENTLY cut at that many rows
+    — no error, no warning. Measured on the live dark_factory graph at
+    planning time: get_all_valid_edges' exact query has 24902 rows and
+    returns 10000, exposing 6376 of 12488 distinct valid edges (51%).
+
+    This fake reproduces that hazard at test scale by setting its cap equal
+    to the page size, which is the worst case: a full page is
+    indistinguishable from a truncated one by row count alone, so the
+    enumerator cannot cheat by noticing a suspiciously round number.
+    """
+
+    def __init__(self, rows: list[list], cap: int) -> None:
+        self.rows = rows
+        self.cap = cap
+        self.cyphers: list[str] = []
+
+    async def __call__(self, cypher: str) -> list[list]:
+        import re as _re
+
+        self.cyphers.append(cypher)
+        window = _re.search(r'SKIP\s+(\d+)\s+LIMIT\s+(\d+)', cypher)
+        if window:
+            skip, limit = int(window.group(1)), int(window.group(2))
+            page = self.rows[skip: skip + limit]
+        else:
+            page = list(self.rows)
+        return page[: self.cap]  # server-side RESULTSET_SIZE truncation
+
+
+def _fake_corpus() -> tuple[list[list], int]:
+    """10 distinct edges spread over 13 rows — N > 2 * page_size, with repeats.
+
+    The repeated uuids model the undirected MATCH's double-attribution, which
+    get_all_valid_edges' own docstring documents: a directed A->B edge matches
+    from both endpoints, so the same edge uuid legitimately arrives twice.
+    """
+    rows: list[list] = [[f'edge-{i:02d}', f'Fact number {i}.'] for i in range(10)]
+    rows[3][1] = None  # a NULL fact must survive as '', not crash or vanish
+    # double-attribution repeats, interleaved so they land on different pages
+    rows = rows[:2] + [rows[0]] + rows[2:6] + [rows[4]] + rows[6:] + [rows[9]]
+    return rows, 10
+
+
+@pytest.mark.asyncio
+async def test_edge_enumeration_paginates_past_the_resultset_cap():
+    """All N distinct edges must be enumerated, not just the first page.
+
+    A probe that reuses the unpaginated production query would measure a
+    51% sample and report it as the whole corpus. Since this task's headline
+    result is a ZERO, a truncated zero would be worthless — it would say
+    'no plural-enum facts found' when half the corpus was never looked at.
+    """
+    rows, distinct = _fake_corpus()
+    query_fn = _FakeCappedEdgeQuery(rows, cap=_PAGE_SIZE)
+
+    facts, complete = await enumerate_valid_edge_facts(
+        query_fn, page_size=_PAGE_SIZE,
+    )
+
+    assert complete is True
+    assert len(facts) == distinct
+    assert set(facts) == {f'edge-{i:02d}' for i in range(10)}
+    # fact text is preserved verbatim...
+    assert facts['edge-07'] == 'Fact number 7.'
+    # ...and a NULL fact becomes '' rather than None
+    assert facts['edge-03'] == ''
+    # pagination actually happened: more than one page was requested
+    assert len(query_fn.cyphers) > 1
+    assert all('SKIP' in c and 'LIMIT' in c for c in query_fn.cyphers)
+
+
+@pytest.mark.asyncio
+async def test_unpaginated_query_against_the_same_fake_is_truncated():
+    """The anti-regression, asserted directly rather than assumed.
+
+    This is what the paginated enumerator exists to defeat. If someone
+    'simplifies' enumerate_valid_edge_facts back to a single query, the
+    test above goes red — and this one documents exactly what that
+    simplification would silently cost.
+    """
+    rows, distinct = _fake_corpus()
+    query_fn = _FakeCappedEdgeQuery(rows, cap=_PAGE_SIZE)
+
+    single_page = await query_fn(
+        'MATCH (n:Entity)-[e:RELATES_TO]-() WHERE e.invalid_at IS NULL '
+        'RETURN DISTINCT e.uuid, e.fact'
+    )
+
+    assert len(single_page) == _PAGE_SIZE
+    assert len({row[0] for row in single_page}) < distinct
+
+
+@pytest.mark.asyncio
+async def test_edge_enumeration_of_empty_graph_is_complete_and_empty():
+    """Zero edges is a valid, COMPLETE result — knowlive held exactly that."""
+    query_fn = _FakeCappedEdgeQuery([], cap=_PAGE_SIZE)
+
+    facts, complete = await enumerate_valid_edge_facts(
+        query_fn, page_size=_PAGE_SIZE,
+    )
+
+    assert facts == {}
+    assert complete is True
 
 
 def test_scan_corpus_of_empty_corpus_is_all_zeroes():
