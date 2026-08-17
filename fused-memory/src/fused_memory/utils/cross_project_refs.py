@@ -121,8 +121,13 @@ class CrossProjectRefScan:
     ambiguous: tuple[CrossProjectRef, ...] = ()
 
 
-def _foreign_refs(referents: Sequence[Referent]) -> list[CrossProjectRef]:
+def _foreign_refs(referents: Sequence[Referent]) -> tuple[CrossProjectRef, ...]:
     """Map FOREIGN referents to CrossProjectRefs, preserving order.
+
+    Returns a tuple — not a list — so the immutability
+    :class:`CrossProjectRefScan` promises is established once, here, at the
+    point that produces the values, rather than by a second wrapping pass at
+    the call site.
 
     The ``if r.project_id`` filter is what makes this module's output mean
     'cross-project'. Own-project referents — which canonical_labels reports
@@ -134,11 +139,11 @@ def _foreign_refs(referents: Sequence[Referent]) -> list[CrossProjectRef]:
     because extraction collapsing it onto 'Task 5181' inside its own graph is
     correct, not a bug.
     """
-    return [
+    return tuple(
         CrossProjectRef(project_id=r.project_id, task_number=r.number)
         for r in referents
         if r.project_id
-    ]
+    )
 
 
 def find_cross_project_task_refs(
@@ -176,6 +181,6 @@ def find_cross_project_task_refs(
     """
     scan = scan_content(content, group_id=group_id, known_project_ids=known_project_ids)
     return CrossProjectRefScan(
-        refs=tuple(_foreign_refs(scan.refs)),
-        ambiguous=tuple(_foreign_refs(scan.ambiguous)),
+        refs=_foreign_refs(scan.refs),
+        ambiguous=_foreign_refs(scan.ambiguous),
     )
