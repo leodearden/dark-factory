@@ -12,6 +12,7 @@ import re
 from pathlib import Path
 
 import pytest
+
 from fused_memory.config.schema import _default_topic_guard_clusters
 from fused_memory.memory_metadata import (
     KIND_REGISTRY,
