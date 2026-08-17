@@ -164,3 +164,119 @@ class TestReferentWireCodec:
         _decode_referents(payload)
 
         assert 'referents' not in payload
+
+
+#: Every way the wire value can be unreadable.  Each must decode to exactly
+#: ``((), 'none')`` — never a partial set.
+_UNREADABLE_PAYLOADS = [
+    pytest.param({}, id='key-absent'),
+    pytest.param({'referents': None}, id='explicit-none'),
+    pytest.param({'referents': 'garbage'}, id='non-dict'),
+    pytest.param({'referents': ['derived']}, id='list-not-dict'),
+    pytest.param(
+        {'referents': {'refs': []}}, id='source-missing',
+    ),
+    pytest.param(
+        {'referents': {'source': 'declared_v2', 'refs': []}},
+        id='source-outside-vocabulary',
+    ),
+    pytest.param(
+        {'referents': {'source': 'derived', 'refs': 'not-a-list'}},
+        id='refs-not-a-list',
+    ),
+    pytest.param(
+        {'referents': {'source': 'derived', 'refs': ['3127']}},
+        id='entry-not-a-dict',
+    ),
+    pytest.param(
+        {'referents': {'source': 'derived', 'refs': [{'kind': 'task'}]}},
+        id='entry-lacks-number',
+    ),
+    pytest.param(
+        {'referents': {'source': 'derived', 'refs': [
+            {'kind': 'task', 'number': '3127'},
+            {'kind': 'unregistered_kind', 'number': '9'},
+        ]}},
+        id='partially-malformed-set',
+    ),
+]
+
+
+class TestReferentWireCodecDegradation:
+    """ONE degradation story: every unreadable blob decodes to exactly
+    ``((), 'none')``, never a partial set.
+
+    A partial set is WORSE than no set for the consumer this exists to serve.
+    Leaf zeta reads "endpoint not in the referent set" as a conflation and leaf
+    eta repairs it by repointing the edge — so a referent silently dropped by a
+    lenient decoder would manufacture a false conflation and drive destructive
+    edge surgery onto the wrong node, the precise failure this PRD exists to
+    prevent.  Hence the `partially-malformed-set` case: the one salvageable
+    referent must NOT survive.
+
+    Degrading rather than raising is equally deliberate: raising inside the
+    queue executor would route the item to `_handle_failure` and eventually
+    dead-letter it, LOSING the memory.  Degradation is safe here only because
+    the 'none' bucket makes it loud (INV-4).
+    """
+
+    @pytest.mark.parametrize('payload', _UNREADABLE_PAYLOADS)
+    def test_unreadable_blob_degrades_to_the_empty_set(self, payload):
+        from fused_memory.services.memory_service import _decode_referents
+
+        assert _decode_referents(dict(payload)) == ((), 'none')
+
+    @pytest.mark.parametrize('payload', _UNREADABLE_PAYLOADS)
+    def test_key_is_popped_in_every_case(self, payload):
+        from fused_memory.services.memory_service import _decode_referents
+
+        mutable = dict(payload)
+
+        _decode_referents(mutable)
+
+        assert 'referents' not in mutable
+
+    @pytest.mark.parametrize(
+        'payload',
+        [p for p in _UNREADABLE_PAYLOADS if p.id not in ('key-absent', 'explicit-none')],
+    )
+    def test_malformed_blob_warns(self, payload, caplog):
+        """Mirrors the invalid-`reference_time` WARNING-and-degrade arm already
+        in `_execute_graphiti_write`: degradation is loud, not silent."""
+        from fused_memory.services.memory_service import _decode_referents
+
+        with caplog.at_level('WARNING'):
+            _decode_referents(dict(payload))
+
+        assert any(
+            rec.levelname == 'WARNING' and 'referents' in rec.getMessage()
+            for rec in caplog.records
+        ), f'no WARNING naming the payload key; got {[r.getMessage() for r in caplog.records]}'
+
+    def test_absent_key_does_not_warn(self, caplog):
+        """The old-format row is the LOAD-BEARING back-compat case, not an
+        anomaly — warning on it would drown the log during a drain of a queue
+        written before this feature."""
+        from fused_memory.services.memory_service import _decode_referents
+
+        with caplog.at_level('WARNING'):
+            _decode_referents({})
+
+        assert not caplog.records
+
+    def test_the_one_salvageable_referent_does_not_escape(self):
+        """Named separately from the parametrized sweep because it is the whole
+        reason the decode is all-or-nothing."""
+        from fused_memory.services.memory_service import _decode_referents
+
+        referents, source = _decode_referents({'referents': {
+            'source': 'derived',
+            'refs': [
+                {'kind': 'task', 'number': '3127'},
+                {'kind': 'unregistered_kind', 'number': '9'},
+            ],
+        }})
+
+        assert referents == ()
+        assert source == 'none'
+        assert Referent(number='3127') not in referents
