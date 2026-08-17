@@ -1,59 +1,26 @@
-"""ε B+H boundary gate — orchestrator-consumer half (task 2732).
+"""ε B+H boundary gate — orchestrator half (task 2732).
 
-The end-to-end transcript-archival boundary gate over the ALREADY-INTEGRATED
-code paths landed by α (producer hook + archiver primitive), β (teardown
-backstop), γ (legibility archive mining) and δ (retention GC). See
-``plans/agent-transcript-archival-prd.md`` Appendix B for the matrix::
-
-    E1  a completed session's transcript is archived at completion
-    E2  the archive survives worktree teardown
-    E3  the teardown backstop is idempotent w.r.t. the producer
-    E4  the archive is credential-safe (only projects/**.jsonl is ever copied)
-    E5  legibility mining enumerates the archived transcript
-    E6  a resumed session re-archives its grown transcript (last-write-wins)
-    E7  an archive failure is SOFT (task still succeeds) and LOUD (counted+logged)
-    E8  the retention GC prunes by cap, loudly; default caps are a no-op
+The end-to-end transcript-archival gate over the ALREADY-INTEGRATED code paths
+landed by α (producer hook + archiver primitive), β (teardown backstop), γ
+(legibility archive mining) and δ (retention GC). The E1-E8 row matrix itself
+lives in ``plans/agent-transcript-archival-prd.md`` Appendix B — read it there
+rather than from a copy in three test files that can drift out of agreement.
 
 **This file owns E1, E6, E2, E3 and E7** — every row that runs through the REAL
 ``TaskWorkflow._invoke`` producer hook and/or the REAL
-``GitOps.cleanup_worktree`` teardown backstop. Its two siblings own the rest:
-
-* ``shared/tests/test_transcript_archival_boundary_gate.py`` — E4 (the
-  credential-safety row, kept orchestrator-free so ``shared`` stays a leaf).
-* ``scripts/tests/test_transcript_archival_boundary_gate.py`` — E5, E8 (the
-  legibility-mining and retention-GC rows).
-
-VERDICT — ALL EIGHT ROWS GREEN over the integrated α/β/γ/δ paths, and NO
-production change was required by any of them. That is the gate's finding, not
-a formality: ε exists to answer whether four independently-merged leaves
-actually compose end to end, and the answer measured here is yes. Because the
-matrix is split three ways, NO SINGLE FILE CAN REPORT THAT VERDICT — each of
-the three states it and names the other two, so a reader who lands on any one
-of them can reach the whole result:
-
-* this file — E1, E6, E2, E3, E7 (7 rows incl. controls)
-* ``shared/tests/...`` — E4 (1 row)
-* ``scripts/tests/...`` — E5, E8 (7 rows incl. controls)
-
-Provenance (a point-in-time measurement, NOT an invariant to keep updated):
-branch ``task/2732`` on base main ``7ef5ccdcf6``, each package's VERBATIM
-``test_command`` — shared 4212 passed / orchestrator 17104 passed / scripts
-3623 passed, all rc=0. Rows were additionally checked non-tautological by
-mutation (each deliberate production mutant fails its row; all reverted).
-
-The gate is three files rather than one because ``verify`` is directory-scoped:
-each package's ``orchestrator.yaml`` declares its own ``test_command``, so a
-single cross-package module would run in exactly one lane and a shared-only or
-scripts-only diff would never exercise its rows. Convention copied from the
-two-file ``test_liveness_boundary_gate.py`` pair (orchestrator/tests +
-shared/tests).
+``GitOps.cleanup_worktree`` teardown backstop. The rest of the matrix lives in
+the two sibling modules of the same name under ``shared/tests/`` and
+``scripts/tests/``. The gate is three files rather than one because ``verify``
+is directory-scoped: each package's ``orchestrator.yaml`` declares its own
+``test_command``, so a single cross-package module would run in exactly one lane
+and a shared-only or scripts-only diff would never exercise its rows.
 
 ARCHIVE FORMAT: plain ``.jsonl``, byte-verbatim, NO added suffix. Task 3618
 (leaf α of ``plans/transcript-preservation-seam-prd.md``) dropped gzip from the
 archive AFTER the PRD was written, so Appendix B's "gz round-trips" wording for
 E1/E5 is stale — do not read it as a gap. The residual-``.jsonl.gz`` contract
-that survived 3618 (not enumerated, but counted + warned) is pinned by E5 in
-the scripts file.
+that survived 3618 (not enumerated, but counted + warned) is pinned in the
+scripts file.
 
 No row mocks the component under test. ``archive_task_transcripts``,
 ``cleanup_worktree`` and the real ``git worktree remove`` all run for real;
@@ -684,8 +651,16 @@ class TestE3BackstopIdempotent:
         # assertion that proves "skipped": _archive_one publishes by
         # os.replace of a fresh staging sibling, so a re-archive necessarily
         # allocates a NEW inode, while identical bytes would pass even on a
-        # full rewrite (A's source and this sweep run within one second, which
-        # is exactly the int-truncated skip firing as designed).
+        # full rewrite.
+        #
+        # The skip here is DETERMINISTIC, not a race this row happens to win:
+        # A's source is never modified after archival, and _archive_one mirrors
+        # the source mtime onto the published copy (os.utime on the staging file
+        # before the replace), so `int(dest.st_mtime) == int(src.st_mtime)` holds
+        # BY CONSTRUCTION no matter how much wall-clock separates the producer
+        # run from this teardown sweep. Do not "fix" this row with a sleep or an
+        # mtime bump — a bump would make the source look grown and turn the
+        # idempotency assertion into its exact opposite.
         assert _identity(archived_a) == before_a
 
         # SET EQUALITY, not two independent existence checks: the backstop

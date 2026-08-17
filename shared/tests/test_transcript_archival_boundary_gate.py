@@ -1,58 +1,28 @@
 """ε B+H boundary gate — shared-primitive half (task 2732).
 
-The end-to-end transcript-archival boundary gate over the ALREADY-INTEGRATED
-code paths landed by α (producer hook + archiver primitive), β (teardown
-backstop), γ (legibility archive mining) and δ (retention GC). See
-``plans/agent-transcript-archival-prd.md`` Appendix B for the matrix::
+The end-to-end transcript-archival gate over the ALREADY-INTEGRATED code paths
+landed by α (producer hook + archiver primitive), β (teardown backstop), γ
+(legibility archive mining) and δ (retention GC). The E1-E8 row matrix itself
+lives in ``plans/agent-transcript-archival-prd.md`` Appendix B — read it there
+rather than from a copy in three test files that can drift out of agreement.
 
-    E1  a completed session's transcript is archived at completion
-    E2  the archive survives worktree teardown
-    E3  the teardown backstop is idempotent w.r.t. the producer
-    E4  the archive is credential-safe (only projects/**.jsonl is ever copied)
-    E5  legibility mining enumerates the archived transcript
-    E6  a resumed session re-archives its grown transcript (last-write-wins)
-    E7  an archive failure is SOFT (task still succeeds) and LOUD (counted+logged)
-    E8  the retention GC prunes by cap, loudly; default caps are a no-op
-
-**This file owns E4.** Its two siblings own the rest:
-
-* ``orchestrator/tests/test_transcript_archival_boundary_gate.py`` — E1, E6,
-  E2, E3, E7 (the producer-hook and teardown-backstop rows).
-* ``scripts/tests/test_transcript_archival_boundary_gate.py`` — E5, E8 (the
-  legibility-mining and retention-GC rows).
-
-VERDICT — ALL EIGHT ROWS GREEN over the integrated α/β/γ/δ paths, and NO
-production change was required by any of them. That is the gate's finding, not
-a formality: ε exists to answer whether four independently-merged leaves
-actually compose end to end, and the answer measured here is yes. Because the
-matrix is split three ways, NO SINGLE FILE CAN REPORT THAT VERDICT — each of
-the three states it and names the other two, so a reader who lands on any one
-of them can reach the whole result:
-
-* this file — E4 (1 row)
-* ``orchestrator/tests/...`` — E1, E6, E2, E3, E7 (7 rows incl. controls)
-* ``scripts/tests/...`` — E5, E8 (7 rows incl. controls)
-
-Provenance (a point-in-time measurement, NOT an invariant to keep updated):
-branch ``task/2732`` on base main ``7ef5ccdcf6``, each package's VERBATIM
-``test_command`` — shared 4212 passed / orchestrator 17104 passed / scripts
-3623 passed, all rc=0. Rows were additionally checked non-tautological by
-mutation (each deliberate production mutant fails its row; all reverted).
-
-The gate is three files rather than one because ``verify`` is directory-scoped:
-each package's ``orchestrator.yaml`` declares its own ``test_command``, so a
-single cross-package module would run in exactly one lane and a shared-only or
+**This file owns E4** — the credential-safety row, kept orchestrator-free so
+``shared`` stays a leaf. The rest of the matrix lives in the two sibling modules
+of the same name under ``orchestrator/tests/`` and ``scripts/tests/``. The gate
+is three files rather than one because ``verify`` is directory-scoped: each
+package's ``orchestrator.yaml`` declares its own ``test_command``, so a single
+cross-package module would run in exactly one lane and a shared-only or
 scripts-only diff would never exercise its rows. This file additionally imports
-ONLY :mod:`shared.transcript_archive`, so the package dependency direction
-holds and ``test_pure_stdlib_leaves.py``'s pure-stdlib-leaf guarantee for that
-module is not disturbed.
+ONLY :mod:`shared.transcript_archive`, so the package dependency direction holds
+and ``test_pure_stdlib_leaves.py``'s pure-stdlib-leaf guarantee for that module
+is not disturbed.
 
 ARCHIVE FORMAT: plain ``.jsonl``, byte-verbatim, NO added suffix. Task 3618
 (leaf α of ``plans/transcript-preservation-seam-prd.md``) dropped gzip from the
 archive AFTER the PRD was written, so Appendix B's "gz round-trips" wording for
 E1/E5 is stale — do not read it as a gap. The residual-``.jsonl.gz`` contract
-that survived 3618 (not enumerated, but counted + warned) is pinned by E5 in
-the scripts file.
+that survived 3618 (not enumerated, but counted + warned) is pinned in the
+scripts file.
 
 No row mocks the component under test: every row here drives the REAL
 :func:`shared.transcript_archive.archive_task_transcripts`.

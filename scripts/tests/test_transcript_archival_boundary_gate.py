@@ -1,49 +1,18 @@
 """ε B+H boundary gate — scripts-consumer half (task 2732).
 
-The end-to-end transcript-archival boundary gate over the ALREADY-INTEGRATED
-code paths landed by α (producer hook + archiver primitive), β (teardown
-backstop), γ (legibility archive mining) and δ (retention GC). See
-``plans/agent-transcript-archival-prd.md`` Appendix B for the matrix::
-
-    E1  a completed session's transcript is archived at completion
-    E2  the archive survives worktree teardown
-    E3  the teardown backstop is idempotent w.r.t. the producer
-    E4  the archive is credential-safe (only projects/**.jsonl is ever copied)
-    E5  legibility mining enumerates the archived transcript
-    E6  a resumed session re-archives its grown transcript (last-write-wins)
-    E7  an archive failure is SOFT (task still succeeds) and LOUD (counted+logged)
-    E8  the retention GC prunes by cap, loudly; default caps are a no-op
+The end-to-end transcript-archival gate over the ALREADY-INTEGRATED code paths
+landed by α (producer hook + archiver primitive), β (teardown backstop), γ
+(legibility archive mining) and δ (retention GC). The E1-E8 row matrix itself
+lives in ``plans/agent-transcript-archival-prd.md`` Appendix B — read it there
+rather than from a copy in three test files that can drift out of agreement.
 
 **This file owns E5 and E8** — the two rows that read the archive from OUTSIDE
-the orchestrator (the legibility miner and the retention GC). Its two siblings
-own the rest:
-
-* ``orchestrator/tests/test_transcript_archival_boundary_gate.py`` — E1, E6,
-  E2, E3, E7 (the producer-hook and teardown-backstop rows).
-* ``shared/tests/test_transcript_archival_boundary_gate.py`` — E4 (the
-  credential-safety row, kept orchestrator-free so ``shared`` stays a leaf).
-
-VERDICT — ALL EIGHT ROWS GREEN over the integrated α/β/γ/δ paths, and NO
-production change was required by any of them. That is the gate's finding, not
-a formality: ε exists to answer whether four independently-merged leaves
-actually compose end to end, and the answer measured here is yes. Because the
-matrix is split three ways, NO SINGLE FILE CAN REPORT THAT VERDICT — each of
-the three states it and names the other two, so a reader who lands on any one
-of them can reach the whole result:
-
-* this file — E5, E8 (7 rows incl. controls)
-* ``orchestrator/tests/...`` — E1, E6, E2, E3, E7 (7 rows incl. controls)
-* ``shared/tests/...`` — E4 (1 row)
-
-Provenance (a point-in-time measurement, NOT an invariant to keep updated):
-branch ``task/2732`` on base main ``7ef5ccdcf6``, each package's VERBATIM
-``test_command`` — shared 4212 passed / orchestrator 17104 passed / scripts
-3623 passed, all rc=0. Rows were additionally checked non-tautological by
-mutation (each deliberate production mutant fails its row; all reverted).
-
-The gate is three files rather than one because ``verify`` is directory-scoped:
-each package's ``orchestrator.yaml`` declares its own ``test_command``, so a
-single cross-package module would run in exactly one lane and a shared-only or
+the orchestrator (the legibility miner and the retention GC). The rest of the
+matrix lives in the two sibling modules of the same name under
+``orchestrator/tests/`` and ``shared/tests/``. The gate is three files rather
+than one because ``verify`` is directory-scoped: each package's
+``orchestrator.yaml`` declares its own ``test_command``, so a single
+cross-package module would run in exactly one lane and a shared-only or
 scripts-only diff would never exercise its rows.
 
 ARCHIVE FORMAT: plain ``.jsonl``, byte-verbatim, NO added suffix. Task 3618
@@ -167,20 +136,33 @@ class TestE5MiningEnumeratesTheArchive:
     """
 
     def test_shipped_config_turns_archive_mining_on_with_no_operator_flip(self):
+        """The claim is "archive mining is ON in the shipped config, with no
+        operator flip" — asserted as MEMBERSHIP, deliberately not list equality.
+
+        ``agent_transcript_roots`` and ``cwd_prefixes`` are operator-tunable:
+        adding a second checkout root, or a second archive root, is a legitimate
+        ops edit that must not fail a boundary-gate row in a package that did
+        not change. What this row pins is only what γ's signal actually needs —
+        the archive root is present, and the worktree cwd E5 mines is covered by
+        some configured prefix.
+        """
         cfg = legibility_config.load_config(SHIPPED_LEGIBILITY_YAML)
-        assert cfg.agent_transcript_roots == ['data/orchestrator/agent-transcripts']
-        assert cfg.cwd_prefixes == ['/home/leo/src/dark-factory']
+        assert 'data/orchestrator/agent-transcripts' in cfg.agent_transcript_roots
+        assert any(WORKTREE_CWD.startswith(prefix) for prefix in cfg.cwd_prefixes)
 
     def test_real_archive_is_enumerated_and_classified(self, tmp_path):
         project_root, _archive_root, archived = _archive_a_real_session(tmp_path)
         cfg = legibility_config.load_config(SHIPPED_LEGIBILITY_YAML)
 
         # Production resolution of the project_root-relative root, against the
-        # TMP root — never the live tree.
+        # TMP root — never the live tree. Membership, not list equality: a
+        # second operator-configured root is a legitimate ops edit, and every
+        # such root resolves under the tmp project root anyway (so it is empty
+        # and cannot perturb what is enumerated below).
         resolved = inventory.resolve_agent_transcript_roots(
             project_root, cfg.agent_transcript_roots
         )
-        assert resolved == [project_root / 'data/orchestrator/agent-transcripts']
+        assert project_root / 'data/orchestrator/agent-transcripts' in resolved
 
         # An empty stand-in for ~/.claude/projects, so everything enumerated
         # below came from the ARCHIVE root.
@@ -470,11 +452,21 @@ class TestE8RetentionGcPrunesByCap:
                 for m in removal_lines
             ), f'no removal line for {task_id} in {removal_lines!r}'
 
-        # ...and once for the sweep as a whole.
-        summary_lines = [m for m in messages if 'sweep complete' in m]
-        assert len(summary_lines) == 1
-        assert summary_lines[0].startswith(GC_LOG_PREFIX)
-        assert 'scanned=5 kept=2 pruned=3 removed=3 failed=0' in summary_lines[0]
+        # ...and once for the sweep as a whole. The COUNTS are already pinned
+        # structurally off the JSON report above, which is the machine-readable
+        # oracle; re-asserting the summary line's exact concatenated wording
+        # would only make a benign reformat (reordered fields, an added
+        # `dry_run=`, different separators) break this gate from a package that
+        # did not change. What the LOUD contract actually needs is that the
+        # sweep announces itself exactly once, greppably, on its own logger.
+        summary_records = [
+            record for record in caplog.records
+            if record.name == 'gc_agent_transcripts'
+            and record.levelno == logging.INFO
+            and 'sweep complete' in record.getMessage()
+        ]
+        assert len(summary_records) == 1
+        assert summary_records[0].getMessage().startswith(GC_LOG_PREFIX)
 
     def test_default_caps_are_a_no_op(self, tmp_path, caplog, capsys):
         """(b) DEFAULT CAPS — the same real archive under the shipped defaults
