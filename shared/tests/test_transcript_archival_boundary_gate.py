@@ -47,8 +47,22 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from shared.transcript_archive import archive_task_transcripts
+
 # The encoded-project dir the fake transcripts are laid down under.
 ENC = '-home-leo-projX'
+
+TASK_ID = '2732'
+SID = 'sess-A'
+
+# An OAuth-token-shaped payload, distinctive enough that a substring scan of
+# the whole archive tree is a meaningful "no credential leaked" oracle.
+CREDENTIAL_PAYLOAD = (
+    b'{"claudeAiOauth":{"accessToken":'
+    b'"sk-ant-oat01-E4-BOUNDARY-GATE-CANARY-DO-NOT-LEAK","refreshToken":'
+    b'"sk-ant-ort01-E4-BOUNDARY-GATE-CANARY-DO-NOT-LEAK"}}'
+)
+CREDENTIAL_CANARY = b'E4-BOUNDARY-GATE-CANARY-DO-NOT-LEAK'
 
 
 def _config_dir(root: Path, task_id: str) -> Path:
@@ -62,3 +76,97 @@ def _write_transcript(config_dir: Path, rel: str, data: bytes) -> Path:
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_bytes(data)
     return p
+
+
+def _build_realistic_config_dir(root: Path) -> tuple[Path, dict[str, Path]]:
+    """Build a per-task config dir with the real mix of files a live one holds.
+
+    Returns ``(config_dir, sources)`` where ``sources`` maps the archive-relative
+    path each transcript SHOULD land at to its source file. Everything else laid
+    down here is a decoy that must never reach the archive: the per-task OAuth
+    ``.credentials.json`` and a ``settings.json`` at the config-dir ROOT (both
+    structurally outside ``projects/``), a ``shell-snapshots/`` dir beside them,
+    and a non-``.jsonl`` ``notes.txt`` INSIDE ``projects/<enc>/`` — the one decoy
+    the ``projects/``-rooted glob alone would not exclude, so it is the file that
+    makes the ``*.jsonl`` half of the filter load-bearing.
+    """
+    config_dir = _config_dir(root, TASK_ID)
+    (config_dir).mkdir(parents=True, exist_ok=True)
+
+    (config_dir / '.credentials.json').write_bytes(CREDENTIAL_PAYLOAD)
+    (config_dir / 'settings.json').write_bytes(b'{"decoy": true}\n')
+    snapshots = config_dir / 'shell-snapshots'
+    snapshots.mkdir()
+    (snapshots / 'snapshot-bash-1.sh').write_bytes(b'# decoy\n')
+
+    main = _write_transcript(
+        config_dir, f'{ENC}/{SID}.jsonl', b'{"type":"user","cwd":"/tmp/x"}\n'
+    )
+    subagent = _write_transcript(
+        config_dir,
+        f'{ENC}/{SID}/subagents/agent-deadbeef.jsonl',
+        b'{"type":"assistant","subagent":"deadbeef"}\n',
+    )
+    _write_transcript(config_dir, f'{ENC}/notes.txt', b'not a transcript\n')
+
+    return config_dir, {
+        f'{TASK_ID}/{ENC}/{SID}.jsonl': main,
+        f'{TASK_ID}/{ENC}/{SID}/subagents/agent-deadbeef.jsonl': subagent,
+    }
+
+
+class TestE4CredentialSafe:
+    """E4 — the archive is credential-safe by CONSTRUCTION.
+
+    ``archive_task_transcripts`` only ever globs ``*.jsonl`` UNDER
+    ``projects/``, so the per-task OAuth ``.credentials.json`` (which lives at
+    the config-dir root) is structurally unreachable, as is any non-``.jsonl``
+    file. This row drives the REAL helper in BOTH of its production call
+    shapes against one realistic config dir and asserts the property by
+    walking the WHOLE archive tree, not by checking two expected paths exist.
+    """
+
+    def test_only_projects_jsonl_reaches_the_archive(self, tmp_path: Path):
+        config_dir, sources = _build_realistic_config_dir(tmp_path / 'wt')
+        archive_root = tmp_path / 'archive'
+
+        # Both production call shapes, into the SAME archive root: α's producer
+        # hook passes the just-finished session id; β's teardown backstop passes
+        # None to sweep whatever is still un-archived.
+        archive_task_transcripts(
+            config_dir, TASK_ID, SID, archive_root=archive_root
+        )
+        archive_task_transcripts(
+            config_dir, TASK_ID, None, archive_root=archive_root
+        )
+
+        archived = sorted(
+            p.relative_to(archive_root).as_posix()
+            for p in archive_root.rglob('*')
+            if p.is_file()
+        )
+
+        # The whole tree is exactly the two transcripts — nothing else, at any
+        # depth, under any name.
+        assert archived == sorted(sources)
+
+        # Suffix invariant, stated independently of the set equality so a future
+        # layout change cannot quietly admit a non-.jsonl artefact.
+        assert all(name.endswith('.jsonl') for name in archived)
+
+        # None of the decoys is present under ANY name anywhere in the tree.
+        basenames = {Path(name).name for name in archived}
+        assert '.credentials.json' not in basenames
+        assert 'settings.json' not in basenames
+        assert 'notes.txt' not in basenames
+        assert 'snapshot-bash-1.sh' not in basenames
+
+        # ...and the credential BYTES do not appear in any archived file either
+        # (an inlined/renamed copy would pass the name checks above).
+        for name in archived:
+            assert CREDENTIAL_CANARY not in (archive_root / name).read_bytes()
+
+        # Byte-verbatim plain .jsonl: the archived copy IS the source, with no
+        # container to decompress (task 3618 dropped gzip).
+        for rel, src in sources.items():
+            assert (archive_root / rel).read_bytes() == src.read_bytes()
