@@ -2297,6 +2297,19 @@ def _parse_resets_at(text: str) -> datetime:
     - "resets Mar 30, 6pm (Europe/London)" (date + time + tz)
     - "resets 9pm (Europe/London)" / "resets 3:00 AM (US/Pacific)"
     - Falls back to 1 hour from now
+
+    NO PRODUCTION CALLERS as of task 4042. This is the fabricating fork of
+    ``shared.invocation_outcome._parse_resets_at``: it invents ``now + 1h`` on
+    parse failure, where the strict copy returns ``None`` (PRD 7.1.a — an
+    unknown reset time must be reported as explicitly unknown, never
+    fabricated). Both live paths now use the strict copy: ``classify_invocation``
+    for its CapHit tier, and ``_handle_auth_failure`` via
+    ``_parse_resets_at_strict``. What survives here is the re-export consumed by
+    ``orchestrator/src/orchestrator/usage_gate.py`` and the ~20 tests across
+    ``shared`` and ``orchestrator`` that pin the ``now + 1h`` fallback contract —
+    which is why task 4042 did not simply delete it. Retiring or repairing this
+    fork is a separate cleanup, not a rider on a regression fix; do not add new
+    callers.
     """
     # Relative: "resets in Xh", "resets in Xm", "resets in Xd"
     m = re.search(r'resets\s+in\s+(\d+)\s*([hmd])', text, re.IGNORECASE)

@@ -10,6 +10,13 @@ This module is additive only — it does not modify ``usage_gate.py`` or
 ``cli_invoke.py``. Rewiring those consumers to call ``classify_invocation``
 is a follow-up task; until then the string tables are intentionally
 duplicated between the old and new homes.
+
+Provenance note: consolidating the auth-failure path here originally LOST the
+401/403 response-body snippet — b68eea415b (task 2134 step-4) replaced
+``_handle_auth_failure(f'HTTP {status}: {output[:120]}')`` with
+``slot.report(outcome)``, and ``AuthFailed`` carried only the numeric status.
+Task 4042 restored it as :attr:`AuthFailed.body`, rendered into the gate's
+reason string by :func:`auth_failure_reason`.
 """
 
 from __future__ import annotations
@@ -197,8 +204,14 @@ _MONTH_ABBR = {
 # the module docstring), so a future edit to one is not expected to be
 # mirrored in the other — but it also won't be caught if it should have
 # been. The beta consumer-rewire collapsed the string tables but
-# deliberately left these two functions forked — usage_gate.py:2209/2318
-# remain live copies with the divergent fallback semantics described above.
+# deliberately left these two functions forked. Task 4042 then moved
+# usage_gate.py's ONE live _parse_resets_at call site (_handle_auth_failure)
+# onto THIS copy, imported there as _parse_resets_at_strict — so the
+# usage_gate.py fork of _parse_resets_at now has no production callers and
+# survives only as the re-export consumed by
+# orchestrator/src/orchestrator/usage_gate.py and its tests (see the note at
+# its definition). usage_gate.py's _extract_cap_message fork remains a live
+# copy with the divergent semantics described above.
 
 
 def _parse_resets_at(text: str, *, now: datetime | None = None) -> datetime | None:
