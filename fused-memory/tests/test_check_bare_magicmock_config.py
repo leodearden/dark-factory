@@ -845,6 +845,108 @@ class TestDataclassDoublePositionBlindness:
         )
 
 
+class TestDataclassDoubleNegatives:
+    """Precision: shapes Rule B must NOT flag, drawn from the measured repo-wide census.
+
+    Each negative below corresponds to a real construction pattern that occurs in the
+    seven scanned tests/ directories.  A rule that flagged any of them would be
+    unshippable — hence the positive floor case at the end, which makes it impossible
+    to satisfy this class with a rule that simply flags nothing.
+    """
+
+    def test_positive_floor_case_still_flags(self):
+        """MagicMock(passed=True, summary='x') → 1 violation (anchor + exactly 2 fields).
+
+        Asserted FIRST so the negatives below cannot be trivially satisfied by a
+        rule that matches nothing at all.
+        """
+        source = "d = MagicMock(passed=True, summary='x')\n"
+        violations = find_violations(source, 'test_floor.py')
+        assert len(violations) == 1, (
+            'anchor present + exactly min_field_matches fields must flag; '
+            f'got {violations}'
+        )
+
+    def test_spec_keyword_exempts(self):
+        """MagicMock(spec=VerifyResult, passed=..., summary=...) → 0 violations."""
+        source = "d = MagicMock(spec=VerifyResult, passed=False, summary='x')\n"
+        assert find_violations(source, 'test_spec_kw.py') == []
+
+    def test_spec_set_keyword_exempts(self):
+        """MagicMock(spec_set=VerifyResult, passed=..., summary=...) → 0 violations."""
+        source = "d = MagicMock(spec_set=VerifyResult, passed=False, summary='x')\n"
+        assert find_violations(source, 'test_spec_set_kw.py') == []
+
+    def test_positional_spec_exempts(self):
+        """MagicMock(VerifyResult, passed=..., summary=...) → 0 (first positional IS spec)."""
+        source = "d = MagicMock(VerifyResult, passed=False, summary='x')\n"
+        assert find_violations(source, 'test_positional_spec.py') == [], (
+            "MagicMock's first positional argument IS spec — a positionally-specced "
+            'double is the remedy, not a violation'
+        )
+
+    def test_single_field_is_below_the_overlap_floor(self):
+        """MagicMock(passed=True) alone → 0 violations (anchor present, only 1 field).
+
+        This is precisely what the overlap floor buys: a stray ``passed=`` on an
+        unrelated object (a fake process result, a predicate double) is not a
+        VerifyResult impersonation.
+        """
+        source = 'd = MagicMock(passed=True)\n'
+        violations = find_violations(source, 'test_one_field.py')
+        assert violations == [], (
+            'a lone passed= kwarg is below the 2-field overlap floor and must NOT '
+            f'flag; got {violations}'
+        )
+
+    def test_return_value_kwarg_does_not_flag(self):
+        """MagicMock(return_value=x) → 0 violations (660 unspecced occurrences repo-wide)."""
+        source = 'd = MagicMock(return_value=sentinel)\n'
+        assert find_violations(source, 'test_return_value.py') == []
+
+    def test_side_effect_kwarg_does_not_flag(self):
+        """MagicMock(side_effect=e) → 0 violations (161 unspecced occurrences repo-wide)."""
+        source = 'd = MagicMock(side_effect=RuntimeError("boom"))\n'
+        assert find_violations(source, 'test_side_effect.py') == []
+
+    def test_plain_mock_is_not_targeted(self):
+        """Mock(passed=..., summary=...) → 0 violations (only MagicMock is targeted)."""
+        source = "d = Mock(passed=False, summary='x')\n"
+        assert find_violations(source, 'test_plain_mock_shape.py') == []
+
+    def test_async_mock_is_not_targeted(self):
+        """AsyncMock(passed=..., summary=...) → 0 violations (only MagicMock is targeted)."""
+        source = "d = AsyncMock(passed=False, summary='x')\n"
+        assert find_violations(source, 'test_async_mock_shape.py') == []
+
+    def test_kwargs_spread_alone_does_not_flag(self):
+        """MagicMock(**kw) → 0 violations (no LITERAL anchor kwarg is visible).
+
+        A ``**spread`` contributes a keyword whose ``.arg`` is None.  Rule B matches on
+        literal kwarg NAMES only, so a spread can never satisfy the anchor gate.
+        (Rule A's separate, conservative stance — flagging ``config = MagicMock(**kw)``
+        as unspecced — is unaffected and pinned by its own test above.)
+        """
+        source = 'd = MagicMock(**kw)\n'
+        violations = find_violations(source, 'test_spread_only.py')
+        assert violations == [], (
+            f'a **kwargs spread exposes no literal anchor name and must not flag; got {violations}'
+        )
+
+    def test_two_real_fields_without_the_anchor_does_not_flag(self):
+        """MagicMock(summary='x', timed_out=False) → 0 violations (anchor absent).
+
+        Two genuine VerifyResult field names are matched, but ``passed`` — the anchor
+        — is missing, so the overlap floor alone must not be sufficient.
+        """
+        source = "d = MagicMock(summary='x', timed_out=False)\n"
+        violations = find_violations(source, 'test_no_anchor.py')
+        assert violations == [], (
+            'the anchor gate is mandatory — two field matches without passed= must '
+            f'NOT flag; got {violations}'
+        )
+
+
 class TestFusedMemoryTestsDirectoryClean:
     """Regression guard: fused-memory/tests must have zero bare MagicMock() config sites.
 
