@@ -324,7 +324,13 @@ async def _annotate_pins_recovery(
     """
     if not dicts:
         return
-    scheduler = getattr(harness, 'scheduler', None) if harness is not None else None
+    # No `if harness is not None` guard: getattr(None, 'scheduler', None) is
+    # already None, so the test is redundant AND actively harmful — it narrows
+    # `harness` to None for the whole function under pyright (the `else None`
+    # arm survives the `scheduler is None` return, since narrowing does not
+    # propagate backwards from `scheduler` to `harness`), which is what made
+    # the liveness read below a reportOptionalMemberAccess error.
+    scheduler = getattr(harness, 'scheduler', None)
     if scheduler is None:
         logger.debug(
             'pins_recovery omitted for %d pending record(s): no orchestrator '
@@ -334,11 +340,13 @@ async def _annotate_pins_recovery(
         return
 
     task_ids = sorted({e.task_id for e in escalations})
-    try:
-        statuses, err = await scheduler.get_statuses(task_ids)
-    except Exception as exc:  # noqa: BLE001 — an annotation must never fail the tool
-        logger.debug('pins_recovery omitted: status read raised: %s', exc)
-        return
+    # Deliberately unguarded.  Scheduler.get_statuses is TOTAL: it wraps its
+    # own body and returns ({}, exc) on any failure, logging the traceback
+    # itself (scheduler.py:2560).  Its designed failure channel is the `err`
+    # slot read just below.  A raise here would mean the duck-typed harness
+    # violated that contract — a seam failure, caught once by the call site's
+    # guard in get_pending_escalations, not swallowed at DEBUG per call.
+    statuses, err = await scheduler.get_statuses(task_ids)
     if err is not None:
         # get_statuses' failure shape is ({}, exc); reading only the dict would
         # make a failed read indistinguishable from "no tasks" and report [].
@@ -358,19 +366,31 @@ async def _annotate_pins_recovery(
         for tid in task_ids:
             try:
                 open_by_task[tid] = queue.get_by_task(tid, status='pending')
-            except Exception as exc:  # noqa: BLE001
-                logger.debug('pins_recovery omitted for task %s: re-read failed: %s', tid, exc)
+            except Exception as exc:  # noqa: BLE001 — real I/O, see below
+                # The ONE genuinely-reachable failure in this function (a
+                # filesystem scan plus JSON parse over esc-*.json), and the one
+                # place per-task recovery is real rather than nominal: a single
+                # unreadable file degrades exactly one task.  Leaving `tid` out
+                # of open_by_task makes the loop below skip it, so its key stays
+                # ABSENT (= UNKNOWN) instead of becoming a false [].  WARNING
+                # because a queue directory this process cannot read is
+                # operator-actionable and otherwise invisible on this surface.
+                logger.warning(
+                    'pins_recovery UNKNOWN for task %s: pending re-read failed: %s',
+                    tid, exc,
+                )
 
     reports: dict[str, Any] = {}
     live_by_task: dict[str, bool] = {}
     for tid in task_ids:
         if tid not in open_by_task:
             continue
-        try:
-            live = bool(harness.is_workflow_active(tid))
-        except Exception as exc:  # noqa: BLE001
-            logger.debug('pins_recovery omitted for task %s: liveness read failed: %s', tid, exc)
-            continue
+        # Deliberately unguarded.  is_workflow_active is a dict membership test
+        # (harness.py:11182), so it cannot fail for one task id and succeed for
+        # the next — a per-task `continue` here would be granularity in name
+        # only.  A harness that cannot answer at all is a seam failure, handled
+        # once by the call site's guard.
+        live = bool(harness.is_workflow_active(tid))
         live_by_task[tid] = live
         # live_claimant_id is unavailable here (the harness exposes no composed
         # claimant id), which classify_pins treats as UNKNOWN and fails safe to
@@ -1215,7 +1235,23 @@ def create_server(
                 escalations = [e for e in escalations if e.level == level]
 
         dicts = [e.to_dict() for e in escalations]
-        await _annotate_pins_recovery(queue, harness, escalations, dicts, level=level)
+        try:
+            await _annotate_pins_recovery(queue, harness, escalations, dicts, level=level)
+        except Exception:
+            # THE seam guard.  `harness` is duck-typed Any because this package
+            # deliberately does not import orchestrator, so the annotation can
+            # never fully trust its contract.  Stating "an annotation must never
+            # fail the tool" once, here, makes it true BY CONSTRUCTION for every
+            # line inside _annotate_pins_recovery — including ones added later —
+            # instead of by enumerating which calls someone guessed might throw.
+            # Records already stamped keep their value; the rest keep the key
+            # ABSENT, which is the contract's UNKNOWN, never a false [].
+            # logger.exception (not .debug) so a real seam violation yields a
+            # traceback rather than a one-line repr.
+            logger.exception(
+                'pins_recovery annotation failed for %d pending record(s); '
+                'unstamped records report UNKNOWN (key absent)', len(dicts),
+            )
         if compact:
             # `if k in d` because pins_recovery is deliberately absent when
             # unknown — projecting it unconditionally would KeyError on
