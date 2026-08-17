@@ -120,7 +120,10 @@ Independently confirmed at production scale by the new report over the live DB
 **dark_factory** shows 0.254. The 4-run ADDENDUM 2 window was not a fluke, and it was on
 the high side of the lifetime average, as a backlog-mode window should be.
 
-`_maybe_remediate` now defers the inline pass while `_in_backlog_mode(project_id)` holds.
+`_maybe_remediate` now defers the inline pass while `_backlog_state(project_id)` reports
+the project backlogged (one buffer read yielding both the verdict and the logged depth,
+via the shared pure `is_backlog_size` predicate that `BacklogIterator.should_iterate` and
+`_select_tier` also evaluate).
 Three properties make this safe:
 
 - **Lossless.** Stage-3 findings are persisted by `update_run_stage_reports` *before*

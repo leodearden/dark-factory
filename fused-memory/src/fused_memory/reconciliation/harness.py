@@ -4336,21 +4336,6 @@ class ReconciliationHarness:
         size = stats.get('size', 0)
         return is_backlog_size(size, self.config), size
 
-    async def _in_backlog_mode(self, project_id: str) -> bool:
-        """True while ``project_id``'s buffer is deep enough for chunked drain.
-
-        Thin convenience over :meth:`_backlog_state` for callers that need only
-        the verdict.  The threshold itself lives in one place — the pure
-        module-level :func:`is_backlog_size` — which ``BacklogIterator``
-        (against its own injected config/buffer) and ``_select_tier`` also use.
-
-        Returns:
-            ``size > buffer_size_threshold * opus_threshold_ratio``, strictly:
-            at exactly the threshold the project is NOT in backlog mode.
-        """
-        in_backlog, _size = await self._backlog_state(project_id)
-        return in_backlog
-
     async def _maybe_remediate(
         self,
         project_id: str,
@@ -4525,7 +4510,7 @@ class ReconciliationHarness:
             # cycle's S1/S2 by _get_prior_s3_findings.  Deferring therefore
             # delays remediation; it never drops a finding.
             #
-            # WHY IT SELF-TERMINATES: _in_backlog_mode re-reads the buffer, so
+            # WHY IT SELF-TERMINATES: _backlog_state re-reads the buffer, so
             # as the backlog drains the answer flips on its own — notably on
             # BacklogIterator's backlog_final_consolidation pass, which runs
             # against a drained buffer.  No flag has to be threaded down, and

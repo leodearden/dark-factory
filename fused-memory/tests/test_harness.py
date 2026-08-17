@@ -16564,13 +16564,15 @@ class TestPerRunConfigDirGC:
         gc_spy.assert_any_call(journal.data_dir, run.id)
 
 
-# ── _in_backlog_mode (task 3049) ──────────────────────────────────────
+# ── the backlog-mode predicate (task 3049) ────────────────────────────
 #
-# The backlog-mode threshold must have exactly ONE definition.  Extracting it
-# from BacklogIterator.should_iterate onto the harness lets _maybe_remediate's
-# deferral gate call the SAME predicate, so the condition that defers
-# remediation is provably identical to the condition that put the project into
-# chunked mode in the first place.
+# The backlog-mode threshold must have exactly ONE definition.  It lives in the
+# pure module-level is_backlog_size; the harness reaches it through
+# _backlog_state (which _maybe_remediate's deferral gate and _select_tier use)
+# and BacklogIterator.should_iterate evaluates the same function against its own
+# injected config/buffer.  So the condition that defers remediation is provably
+# identical to the condition that put the project into chunked mode — these
+# tests pin that agreement rather than any one call path.
 
 
 @pytest.mark.asyncio
@@ -16584,28 +16586,33 @@ class TestPerRunConfigDirGC:
         (400, True),
     ],
 )
-async def test_in_backlog_mode_uses_a_strict_threshold(
+async def test_backlog_state_uses_a_strict_threshold(
     journal, event_buffer, mock_memory_service, buffer_size, expected,
 ):
-    """True iff buffer size > buffer_size_threshold * opus_threshold_ratio."""
+    """True iff buffer size > buffer_size_threshold * opus_threshold_ratio.
+
+    The reported depth comes from the same single read as the verdict, so a
+    caller cannot log a size that contradicts its own gate.
+    """
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     harness.config.buffer_size_threshold = 10
     harness.config.opus_threshold_ratio = 1.5  # threshold = 15
     harness.buffer.get_buffer_stats = AsyncMock(return_value={'size': buffer_size})
 
-    assert await harness._in_backlog_mode('reify') is expected
+    assert await harness._backlog_state('reify') == (expected, buffer_size)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('buffer_size', [0, 14, 15, 16, 400])
-async def test_should_iterate_delegates_to_in_backlog_mode(
+async def test_should_iterate_agrees_with_the_harness_backlog_predicate(
     journal, event_buffer, mock_memory_service, buffer_size,
 ):
     """BacklogIterator.should_iterate stays behaviourally identical.
 
-    Straddling the threshold, the iterator's answer and the harness predicate
-    agree exactly — so the existing should_iterate expectations elsewhere in
-    this suite still hold after the extraction.
+    Straddling the threshold, the iterator's answer and the harness's own
+    _backlog_state verdict agree exactly — both evaluate the shared pure
+    is_backlog_size — so the existing should_iterate expectations elsewhere in
+    this suite still hold.
     """
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     harness.config.buffer_size_threshold = 10
@@ -16613,11 +16620,12 @@ async def test_should_iterate_delegates_to_in_backlog_mode(
     harness.buffer.get_buffer_stats = AsyncMock(return_value={'size': buffer_size})
 
     iterator = BacklogIterator(harness.config, harness.journal, harness.buffer, harness)
-    assert await iterator.should_iterate('reify') == await harness._in_backlog_mode('reify')
+    in_backlog, _size = await harness._backlog_state('reify')
+    assert await iterator.should_iterate('reify') == in_backlog
 
 
 @pytest.mark.asyncio
-async def test_in_backlog_mode_treats_a_missing_size_as_not_backlogged(
+async def test_backlog_state_treats_a_missing_size_as_not_backlogged(
     journal, event_buffer, mock_memory_service,
 ):
     """A stats dict with no 'size' key must not crash the caller."""
@@ -16626,7 +16634,7 @@ async def test_in_backlog_mode_treats_a_missing_size_as_not_backlogged(
     harness.config.opus_threshold_ratio = 1.5
     harness.buffer.get_buffer_stats = AsyncMock(return_value={})
 
-    assert await harness._in_backlog_mode('reify') is False
+    assert await harness._backlog_state('reify') == (False, 0)
 
 
 # ── Task 3049 lever 1: defer the inline remediation pass in backlog mode ──────
