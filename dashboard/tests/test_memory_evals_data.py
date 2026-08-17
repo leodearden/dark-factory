@@ -3393,7 +3393,7 @@ class TestRootScanCacheability:
         assert payload['issue_count'] == 2
         assert root_scan_succeeded(payload) is False
 
-    def test_a_bug_in_one_eval_row_leaves_the_payload_cacheable(
+    def test_per_eval_bugs_name_every_row_they_cost_and_stay_cacheable(
         self, tmp_path: Path, monkeypatch,
     ) -> None:
         """End-to-end against the REAL per-eval emitter, not a hand-built dict.
@@ -3403,67 +3403,17 @@ class TestRootScanCacheability:
         predicate against a second, independently-authored copy of that claim —
         so if the emitter's ``eval_id`` convention ever drifted, every unit case
         above would still pass while the cache silently reverted to stampeding.
-        This closes the loop on the real payload, and is also the first test of
+        This closes the loop on the real payload, and is also the only test of
         the per-eval bug boundary in ``_build_payload``, which had none.
-        """
-        from dashboard.data import memory_evals as memory_evals_mod
-        from dashboard.data.memory_evals import build_memory_evals, root_scan_succeeded
 
-        root, esc_dir = _healthy_tree(tmp_path)
-        monkeypatch.setattr(
-            memory_evals_mod, '_build_eval', _raiser(TypeError('unhashable type: dict')),
-        )
+        The tree carries TWO eval dirs, so breaking ``_build_eval`` costs both
+        rows and the boundary must name each one separately rather than
+        aborting on the first.  A single-eval variant of this test was folded in
+        here rather than kept alongside: the same fixture, the same monkeypatch
+        and the same assertions at N=1, which the N=2 case already exercises on
+        its way through the loop.
 
-        payload = build_memory_evals(root, esc_dir)
-
-        # The never-500 contract still holds.
-        assert set(payload) == _PAYLOAD_KEYS
-        assert payload['issue_count'] == len(payload['issues']) == 1
-        issue = payload['issues'][0]
-        assert issue['kind'] == 'internal_error'
-        # Scoped to the eval dir that broke — the discriminator the predicate reads.
-        assert issue['eval_id'] == 'eval-a'
-        assert 'TypeError' in issue['detail']
-        # The issue rides the payload, so caching costs no operator visibility.
-        assert root_scan_succeeded(payload) is True
-
-    def test_a_build_aborting_bug_leaves_the_payload_uncacheable(
-        self, tmp_path: Path, monkeypatch,
-    ) -> None:
-        """The preserved half, against the real top-level emitter.
-
-        ``_read_verdicts`` is called before the per-eval loop, so a bug there
-        escapes to the outermost guard in ``build_memory_evals`` — which passes
-        no ``eval_id``, leaving ``None``.
-        """
-        from dashboard.data import memory_evals as memory_evals_mod
-        from dashboard.data.memory_evals import build_memory_evals, root_scan_succeeded
-
-        root, esc_dir = _healthy_tree(tmp_path)
-        monkeypatch.setattr(
-            memory_evals_mod, '_read_verdicts', _raiser(TypeError('unhashable type: dict')),
-        )
-
-        payload = build_memory_evals(root, esc_dir)
-
-        assert set(payload) == _PAYLOAD_KEYS
-        assert payload['issue_count'] == len(payload['issues']) == 1
-        issue = payload['issues'][0]
-        assert issue['kind'] == 'internal_error'
-        assert issue['eval_id'] is None
-        assert root_scan_succeeded(payload) is False
-
-    def test_every_per_eval_bug_names_the_eval_row_it_cost(
-        self, tmp_path: Path, monkeypatch,
-    ) -> None:
-        """The multi-row generalisation of the single-row case above.
-
-        Breaking ``_build_eval`` for a tree with TWO eval dirs costs both rows,
-        and the per-eval boundary must name each one separately rather than
-        aborting on the first — so the assertion below is over EVERY issue the
-        payload carries, not just the one a single-eval fixture can produce.
-
-        This replaces a deleted AST guard that counted ``_issue(...,
+        This also replaces a deleted AST guard that counted ``_issue(...,
         'internal_error', ...)`` call sites and checked for an ``eval_id=``
         keyword.  The convention worth protecting is not a fact about the
         source text but an observable property of the payload: every per-eval
@@ -3498,17 +3448,47 @@ class TestRootScanCacheability:
         # Each lost row is named separately — it did not abort on the first.
         assert payload['issue_count'] == len(payload['issues']) == 2
         assert [issue['kind'] for issue in payload['issues']] == ['internal_error'] * 2
+        # Every issue rides the payload naming the bug that cost its row, so
+        # caching this payload costs no operator visibility.
+        assert all('TypeError' in issue['detail'] for issue in payload['issues'])
         # The load-bearing assertion: no per-eval emitter left its issue unscoped.
         assert all(issue['eval_id'] is not None for issue in payload['issues']), (
             'a per-eval `internal_error` emitter left `eval_id` unset — '
             '`root_scan_succeeded` reads that as the build-aborting top-level '
             f'case and will never cache this payload: {payload["issues"]}'
         )
+        # Scoped to the eval dirs that broke, in `sorted(iterdir())` order.
         assert [issue['eval_id'] for issue in payload['issues']] == ['eval-a', 'eval-b']
         # Both rows were lost, which is what makes this the worst per-eval case.
         assert payload['evals'] == []
         # The point: per-eval bugs stay cacheable no matter how many rows they cost.
         assert root_scan_succeeded(payload) is True
+
+    def test_a_build_aborting_bug_leaves_the_payload_uncacheable(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """The preserved half, against the real top-level emitter.
+
+        ``_read_verdicts`` is called before the per-eval loop, so a bug there
+        escapes to the outermost guard in ``build_memory_evals`` — which passes
+        no ``eval_id``, leaving ``None``.
+        """
+        from dashboard.data import memory_evals as memory_evals_mod
+        from dashboard.data.memory_evals import build_memory_evals, root_scan_succeeded
+
+        root, esc_dir = _healthy_tree(tmp_path)
+        monkeypatch.setattr(
+            memory_evals_mod, '_read_verdicts', _raiser(TypeError('unhashable type: dict')),
+        )
+
+        payload = build_memory_evals(root, esc_dir)
+
+        assert set(payload) == _PAYLOAD_KEYS
+        assert payload['issue_count'] == len(payload['issues']) == 1
+        issue = payload['issues'][0]
+        assert issue['kind'] == 'internal_error'
+        assert issue['eval_id'] is None
+        assert root_scan_succeeded(payload) is False
 
     def test_a_partial_payload_cannot_raise_inside_the_predicate(self) -> None:
         """It runs inside the cache write path, where raising would 500 the poll.
