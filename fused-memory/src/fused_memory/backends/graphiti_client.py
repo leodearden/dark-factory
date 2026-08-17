@@ -375,6 +375,36 @@ class AmbiguousEntityError(Exception):
     """
 
 
+class IncompleteEnumerationError(Exception):
+    """Raised when a whole-graph enumeration was STRUCTURALLY incomplete.
+
+    Not "the read failed" — the read was never validly performed.  Either it
+    refused to start (``INCOMPLETE_STRUCTURAL_REFUSAL``: zero queries issued,
+    so the emptiness is fabricated rather than observed) or it ran out of page
+    budget mid-corpus (``INCOMPLETE_PAGE_CAP``: the rows are a PREFIX in
+    ``ORDER BY`` order, not a sample).
+
+    WHY THIS RAISES INSTEAD OF RETURNING THE COLLECTION, which is what made
+    the original defect corrupting rather than merely under-reporting: a
+    caller cannot tell a fabricated empty from a genuinely empty graph, and
+    the consumer downstream is a WRITE.  ``MemoryService.rebuild_entity_summaries``
+    -> ``_rebuild_one`` -> ``all_edges.get(uuid, [])`` -> ``rebuild_entity_from_edges``
+    computes ``'\\n'.join([]) == ''`` and ``update_node_summary`` persists it,
+    blanking a real summary with the *absence of evidence* that the read was
+    never performed.  The ``force=True`` path is the sharpest vector: it does
+    not consult staleness at all, so it writes to every entity returned.
+
+    Deliberately an ``Exception``, never a ``BaseException``: both
+    reconciliation sweeps catch ``Exception`` while re-raising
+    ``CancelledError``/``KeyboardInterrupt``/``SystemExit``, so subclassing
+    ``BaseException`` would escape their handlers and turn a handled per-cycle
+    error into an outage.
+
+    Empirical incompleteness (``INCOMPLETE_CENSUS_UNAVAILABLE``,
+    ``INCOMPLETE_SHORT_READ``) does NOT raise — see the shims for why.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Paginated whole-graph reads (task 4340)
 # ---------------------------------------------------------------------------
@@ -477,12 +507,28 @@ kind, so a future fifth structural path is covered by construction.
 # ``n.summary``.  Corrupting, not merely under-reporting.
 #   - get_all_valid_edges  -> enumerate_all_valid_edges
 #   - list_entity_nodes    -> enumerate_entity_nodes
-# The old names survive as thin shims with UNCHANGED signatures that WARN on
-# an incomplete read; the completeness signal itself is a first-class return
-# value on the enumerate_* methods.  No consumer ACTS on it yet — the two
+# The old names survive as thin shims with UNCHANGED signatures applying a
+# SPLIT incompleteness policy: they RAISE IncompleteEnumerationError on a
+# STRUCTURAL incompleteness (a read that was never validly performed — its
+# emptiness or prefix is fabricated, and returning it is what let '' be
+# written back over real summaries) and WARN-and-return on an EMPIRICAL one
+# (a census disagreement, transient on a continuously-written graph).  The
+# completeness signal itself is a first-class return value on the enumerate_*
+# methods, which never raise.  No consumer ACTS on it yet — the two
 # reconciliation sweeps and cleanup_count_snapshots still call the shims, so
 # they cannot yet distinguish "swept a complete corpus" from "swept what we
 # could fetch".  Filed as ticket tkt_0RSJP8CH1M9GAAJTABV8FZB4AH.
+#
+# RESIDUAL LEFT OPEN DELIBERATELY, and not an oversight: a materially-short
+# INCOMPLETE_SHORT_READ still returns a partial collection that the
+# force=True path in MemoryService.rebuild_entity_summaries will write back,
+# blanking the summary of any entity whose edges fell in the missing
+# remainder.  Do NOT close it by tightening the shims — guard 4 fires on any
+# shortfall at all, including a single concurrently-invalidated edge, so
+# raising there would take down the live rebuild for exactly the transient
+# the warn-not-raise decision rejected.  The fix belongs at the consumer, as
+# a policy on how short is too short applied where the destructive write is
+# decided, which is the same code the ticket above must touch.
 #
 # STILL UNPAGINATED and assessed AT RISK.  Left out of 4340 only because they
 # are separable — different call chains, no shared verdict, no write-back —
@@ -2083,13 +2129,36 @@ class GraphitiBackend:
         query; see _paged_ro_query for the ORDER BY and completeness rules
         that make paging safe.
 
-        This method deliberately does NOT raise on an incomplete enumeration
-        — it logs a WARNING naming the numbers and returns what it fetched.
-        These graphs are written to continuously by the live memory service,
-        so raising would take down rebuild_entity_summaries, both
-        reconciliation sweeps and a cleanup script for a transient.  The
-        completeness signal is available as a first-class value from
-        enumerate_all_valid_edges for consumers that want to act on it.
+        INCOMPLETENESS POLICY — SPLIT BY KIND, and the split is the point:
+
+          STRUCTURAL (``INCOMPLETE_STRUCTURAL_KINDS``) -> RAISES
+          ``IncompleteEnumerationError``.  A refusal issues zero queries, so
+          its emptiness is fabricated, not observed; a page-cap read returns a
+          PREFIX in uuid order, so entities sorting into the unread tail look
+          edge-less.  Returning either as a dict is indistinguishable from a
+          real answer, and the consumer downstream is a WRITE that blanks
+          summaries — see IncompleteEnumerationError.
+
+          EMPIRICAL (census unavailable, or a short read) -> WARNs naming the
+          numbers and returns what it fetched, exactly as before.
+
+        This is NOT a reversal of the warn-not-raise decision; that decision
+        was reasoned about the CENSUS-DISAGREEMENT case, which is transient —
+        these graphs are written to continuously, so raising there would take
+        down rebuild_entity_summaries, both reconciliation sweeps and a
+        cleanup script for something that self-heals next cycle.  A structural
+        failure is not transient: it issues zero queries, is fully determined
+        by configuration, and reproduces identically on retry.  Neither
+        structural kind is even reachable at the shipped defaults (page_size
+        5000 < cap 10000; max_pages 1000 x 5000 = 5,000,000 rows against a
+        live maximum near 32,000), so this raise cannot fire in production
+        today — it fires only under the misconfiguration or downward re-tune
+        that would otherwise silently corrupt the graph.  Safety at zero flap
+        risk, which is the opposite of the trade-off that decision rejected.
+
+        The completeness signal is also available as a first-class value from
+        enumerate_all_valid_edges, which never raises, for consumers that want
+        to inspect it rather than be interrupted by it.
 
         Args:
             group_id: Project graph to query.
@@ -2100,6 +2169,10 @@ class GraphitiBackend:
             Each directed edge appears under both its source and target entity UUID
             (double-attribution from the undirected MATCH pattern).
 
+        Raises:
+            IncompleteEnumerationError: The underlying enumeration was
+                structurally incomplete — see the policy above.
+
         Note:
             Using a directed pattern (n:Entity)-[e:RELATES_TO]->() would give
             single-appearance semantics per edge if ever needed.  It would also
@@ -2108,6 +2181,14 @@ class GraphitiBackend:
             Halving buys margin, not correctness.
         """
         grouped, paged = await self.enumerate_all_valid_edges(group_id=group_id)
+        if paged.incomplete_kind in INCOMPLETE_STRUCTURAL_KINDS:
+            raise IncompleteEnumerationError(
+                f'get_all_valid_edges(group_id={group_id!r}): the enumeration '
+                f'was structurally incomplete '
+                f'(incomplete_kind={paged.incomplete_kind!r}), so the '
+                f'{len(grouped)} entities it would have returned are not an '
+                f'answer and must not be written back. {paged.reason}'
+            )
         if not paged.complete:
             logger.warning(
                 'get_all_valid_edges(group_id=%r): enumeration INCOMPLETE — '
@@ -3420,9 +3501,15 @@ class GraphitiBackend:
         rather than merely under-reporting, which is why it was fixed rather
         than deferred.
 
-        Like get_all_valid_edges, this deliberately WARNs rather than raising
-        on an incomplete enumeration; the first-class completeness signal is
-        on enumerate_entity_nodes.
+        Like get_all_valid_edges, this applies the SPLIT incompleteness
+        policy: it RAISES ``IncompleteEnumerationError`` on a structurally
+        incomplete enumeration (``INCOMPLETE_STRUCTURAL_KINDS`` — a read that
+        was never validly performed, whose emptiness or prefix is fabricated
+        rather than observed), and WARNs-and-returns on an empirically
+        incomplete one (a census disagreement, which on a continuously-written
+        graph is a transient that self-heals next cycle).  See
+        get_all_valid_edges for the full rationale, and enumerate_entity_nodes
+        for the never-raising variant that returns the signal instead.
 
         Args:
             group_id: Project graph to query.
@@ -3430,8 +3517,21 @@ class GraphitiBackend:
         Returns:
             List of dicts with keys: uuid, name, summary (summary defaults to
             empty string when the node property is NULL).
+
+        Raises:
+            IncompleteEnumerationError: The underlying enumeration was
+                structurally incomplete.
         """
         nodes, paged = await self.enumerate_entity_nodes(group_id=group_id)
+        if paged.incomplete_kind in INCOMPLETE_STRUCTURAL_KINDS:
+            raise IncompleteEnumerationError(
+                f'list_entity_nodes(group_id={group_id!r}): the enumeration '
+                f'was structurally incomplete '
+                f'(incomplete_kind={paged.incomplete_kind!r}), so the '
+                f'{len(nodes)} nodes it would have returned are not an answer '
+                f'and must not drive a staleness verdict or a summary '
+                f'rewrite. {paged.reason}'
+            )
         if not paged.complete:
             logger.warning(
                 'list_entity_nodes(group_id=%r): enumeration INCOMPLETE — '
@@ -3461,6 +3561,18 @@ class GraphitiBackend:
         ``len(entities)``, and so was a silently-capped denominator (10000 on
         any graph above the cap) that made every rate computed against it
         wrong.  With pagination it is the true node count.
+
+        PROTECTED AT THE SOURCE.  Both calls below are the back-compat shims,
+        which RAISE ``IncompleteEnumerationError`` on a structurally
+        incomplete read.  So this method can no longer manufacture a stale
+        verdict from a non-enumeration: were the edge read to return a
+        fabricated ``{}`` (or a uuid-ordered PREFIX), ``_build_stale_entry``
+        would compute ``canonical = '\\n'.join([]) == ''`` for every affected
+        entity, find ``summary != canonical`` for every non-empty summary, and
+        report the whole graph stale — which ``rebuild_entity_from_edges``
+        would then write back as ``''``.  The raise stops that before a single
+        verdict is formed.  An empirically short read still reaches here and
+        is only WARNed about; see the residual noted in the module audit.
 
         Args:
             group_id: Project graph to query.
