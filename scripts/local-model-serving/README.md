@@ -121,7 +121,10 @@ measured probe N times behind the same single warm-up and records every sample
 in `repeat_latencies_ms`. Samples after the **first** are prefix-cache **warm**
 — the first measured probe populates the cache the rest are served from — so
 they are not independent samples, `latency_ms` stays pinned to the first, and
-`--repeat` can never change a verdict.
+`--repeat` can never change a verdict. It composes with the measurement
+selectors (`--all` / `--arm` / `--active`) and is **refused** alongside
+`--merge`, which measures nothing: pairing them would exit 0 having done none
+of what was asked.
 
 Logs are the journal: `journalctl --user -u lms-arm@qwen3.5-9b.service -f`.
 
@@ -779,7 +782,18 @@ probes are **not** independent samples:
 On llama.cpp, `measured_cached_prompt_tokens` proves the cold prefix directly
 (26 of ~343 on the 2026-08-16 run). vLLM returns `prompt_tokens_details: null`,
 so on those arms the claim rests on latency alone — which the artifact records
-honestly as `null` rather than a misleading `0`.
+honestly as `null` rather than a misleading `0`. The diagnostic is suppressed
+only by the STACK's silence, never by axis: an embedding server that answered
+the question would be reporting on the same prefix cache, and dropping that
+answer would delete the only direct evidence for that row's split.
+
+**One offset in the table above.** Those figures were measured with the probe
+clock starting *before* the `GET /v1/models` identity gate, so each includes one
+loopback GET on top of the model's own request — a few ms, but a double-digit
+percentage of a 41 ms warm embedding number. The clock now starts after the
+gate, so a fresh run reads slightly **lower** than the committed table on the
+fast arms. The FAIL path still times from before the gate, where the elapsed
+time *is* the gate.
 
 Naming the mode each figure belongs to, since two numbers for `qwen3.5-9b` have
 read as contradictory: at **`reasoning: off`** it measured 2849 ms cold against

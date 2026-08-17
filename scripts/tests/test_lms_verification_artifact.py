@@ -439,12 +439,13 @@ def test_every_passing_row_carries_both_a_cold_and_a_warm_latency(
     re-measured one.
 
     POSITIVITY ONLY.  Do NOT "strengthen" this into
-    `first_probe_ms > latency_ms`: qwen3.5-9b at `reasoning: on` measured 43.5 s
-    cold against 41.0 s warm, a generation-dominated arm where the load cost is
-    a rounding error against the generation itself and the ordering sits inside
-    the noise.  A cold-greater-than-warm gate would fail an arm that is serving
-    correctly — the exact failure mode esc-3713-6 already had to undo once for
-    the VRAM verdict.
+    `first_probe_ms > latency_ms`: the counter-example is in THIS artifact —
+    phi-4-14b measured 1893.3 ms cold against 2241.2 ms warm on 2026-08-16, a
+    generation-dominated arm where the load cost is a rounding error against the
+    generation itself and the ordering sits inside the noise.  A
+    cold-greater-than-warm gate would fail an arm that is serving correctly —
+    the exact failure mode esc-3713-6 already had to undo once for the VRAM
+    verdict.
     """
     unmeasured = sorted(
         row.arm_id for row in report.arms
@@ -468,12 +469,22 @@ def test_the_artifact_states_it_is_not_a_comparable_ranking_metric(
     comparability the correction was for, and the consumers most at risk of
     reading these seven numbers as a ranking (eta 3720, theta 3721) read this
     JSON — not the README the caveat would otherwise live in alone.
+
+    PRESENCE AND NON-EMPTINESS, deliberately, not byte-equality with
+    `LATENCY_CAVEAT`.  The only sanctioned way to regenerate this file is a live
+    per-arm re-measure of all seven arms, so pinning the committed bytes to a
+    live English paragraph would make every wording edit — the kind of change
+    that gets made freely — depend on GPU availability, for no verification
+    gain.  Producer-side identity is where that belongs and is already pinned
+    there, against a report regeneration cannot cost anything:
+    test_lms_healthcheck.py's
+    `test_the_report_carries_the_not_comparable_caveat_in_a_field`.
     """
-    assert raw_artifact.get('latency_caveat') == LATENCY_CAVEAT, (
-        f'{ARTIFACT_PATH.name} must carry lms_healthcheck.LATENCY_CAVEAT '
-        'verbatim in a `latency_caveat` field; JSON carries no comments, so a '
-        'caveat that lives only in prose is absent from the exact document '
-        'that would mislead a consumer'
+    caveat = raw_artifact.get('latency_caveat')
+    assert isinstance(caveat, str) and caveat.strip(), (
+        f'{ARTIFACT_PATH.name} must carry a non-empty `latency_caveat` field; '
+        'JSON carries no comments, so a caveat that lives only in prose is '
+        'absent from the exact document that would mislead a consumer'
     )
     assert LATENCY_CAVEAT.strip()
 

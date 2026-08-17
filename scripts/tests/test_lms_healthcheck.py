@@ -829,12 +829,73 @@ def test_a_malformed_usage_block_is_tolerated_not_raised(install_fake_httpx, usa
     assert result.cached_prompt_tokens is None
 
 
-def test_an_embedding_row_records_no_cached_prompt_tokens():
-    """The question does not apply to an embedding arm, so the answer is None
-    rather than a 0 that reads like a measured cold cache."""
-    row = _report(arms=[_unprefixed_arm()]).arms[0]
+def _healthy_embedding_wire(install_fake_httpx, arm, body=None):
+    """Install a fake httpx serving a valid vector from a correctly-identified
+    embedding arm.  *body* overrides the whole response, for the shapes that
+    need a `usage` block the default payload does not carry."""
+    dims = arm.dims
+    assert dims is not None
+    payload = body if body is not None else _embedding_payload(
+        [0.01 * i for i in range(dims)], model=arm.served_model_name
+    )
+    install_fake_httpx(
+        get=lambda url, **kw: _Resp(200, _models_payload(arm.served_model_name)),
+        post=lambda url, **kw: _Resp(200, payload),
+    )
 
+
+def test_an_embedding_row_records_no_cached_prompt_tokens(install_fake_httpx):
+    """A vLLM embedding arm answers with no `usage` block, so the honest answer
+    is None rather than a 0 that reads like a measured cold cache.  All four
+    embedding arms on the committed slate are vLLM, which is why they all read
+    `null` there.
+
+    Driven through the REAL probe path (`run_healthcheck` with no injected
+    prober) on purpose.  The version of this test that ran through the
+    `_passing_probe` stub asserted a property of the STUB -- whose
+    `cached_prompt_tokens` was simply left at its `None` default -- and would
+    have stayed green no matter what `_probe` did to a real response body.
+    """
+    arm = _unprefixed_arm()
+    _healthy_embedding_wire(install_fake_httpx, arm)
+
+    row = lms_healthcheck.run_healthcheck(
+        [arm], gpu_probe=lambda: _snapshot(), baseline=_baseline(),
+    ).arms[0]
+
+    assert row.verdict == 'PASS'
     assert row.measured_cached_prompt_tokens is None
+
+
+def test_an_embedding_server_that_answers_the_cache_question_is_recorded(
+    install_fake_httpx,
+):
+    """The diagnostic is gated on the STACK's silence, not on the axis.
+
+    No embedding arm on this slate answers it — but one that did would be
+    reporting on the same prefix cache the LLM axis reports on, and suppressing
+    that answer by axis would delete the only DIRECT evidence for that row's
+    cold/warm split, leaving it resting on latency alone for no reason.
+    Reported and non-gating either way, exactly like the LLM axis.
+    """
+    arm = _unprefixed_arm()
+    _healthy_embedding_wire(
+        install_fake_httpx,
+        arm,
+        body={
+            **_embedding_payload(
+                [0.01 * i for i in range(R2_DIMS)], model=arm.served_model_name
+            ),
+            'usage': {'prompt_tokens': 11, 'prompt_tokens_details': {
+                'cached_tokens': 7
+            }},
+        },
+    )
+
+    result = lms_healthcheck.probe_embedding_arm(arm)
+
+    assert result.verdict == 'PASS'
+    assert result.cached_prompt_tokens == 7
 
 
 # ===========================================================================
@@ -1441,13 +1502,16 @@ def _latency_probe(cold: float, warm: float):
 
 
 def test_a_row_carries_both_the_cold_and_the_warm_latency():
-    """The measured qwen3.5-9b shape: ~12x between the two.
+    """A ~12x gap between the two, the shape a load-dominated arm shows.  The
+    injected figures below are from a `reasoning: off` dev run and are NOT in
+    the committed artifact; the comparable committed pair is
+    qwen3-embedding-0.6b at 604.7 ms cold against 44.7 ms warm.
 
     Deliberately NOT asserted here, or anywhere: that cold > warm in general.
-    qwen3.5-9b at `reasoning: on` measured 43.5 s cold against 41.0 s warm --
-    a generation-dominated arm where load cost is a rounding error against the
-    generation itself and the ordering sits inside the noise.  A gate on it
-    would fail an arm that is serving correctly.
+    phi-4-14b measured 1893.3 ms cold against 2241.2 ms warm in the committed
+    2026-08-16 slate -- a generation-dominated arm where load cost is a rounding
+    error against the generation itself and the ordering sits inside the noise.
+    A gate on it would fail an arm that is serving correctly.
     """
     report = _report(probe=_latency_probe(cold=4249.7, warm=359.1))
     row = report.arms[0]
@@ -2167,11 +2231,51 @@ def test_run_healthcheck_rejects_a_non_positive_repeat_as_a_caller_error():
 @pytest.mark.parametrize('selector', [['--arm', 'qwen3.5-9b'], ['--all'], ['--active']])
 def test_repeat_is_not_part_of_the_selector_group(cli_env, selector):
     """A plain option, not a member of the required mutually-exclusive group,
-    so it composes with every way of choosing arms."""
+    so it composes with every MEASUREMENT way of choosing arms.  `--merge` is
+    the one selector it does not compose with — see the test below."""
     code = lms_healthcheck.main([*selector, '--repeat', '2'])
 
     # --active finds nothing under cli_env, which is its own non-zero code.
     assert code in (0, lms_healthcheck.EXIT_NO_ACTIVE_ARMS)
+
+
+def test_repeat_with_merge_is_refused_rather_than_silently_ignored(
+    cli_env, tmp_path, capsys
+):
+    """`--merge` assembles parts that were already measured, so there is nothing
+    for `--repeat` to fire.  Accepting the pair would exit 0 having done none of
+    what was asked, and the operator's next move is to trust a spread that was
+    never measured -- the silent-degradation shape this package refuses
+    everywhere else.
+    """
+    path = tmp_path / 'one.json'
+    assert lms_healthcheck.main(['--arm', 'qwen3.5-9b', '--output', str(path)]) == 0
+    out = tmp_path / 'merged.json'
+
+    with pytest.raises(SystemExit) as excinfo:
+        lms_healthcheck.main(
+            ['--merge', str(path), '--repeat', '5', '--output', str(out)]
+        )
+
+    # argparse's own usage-error code, and NOT a merge error: the assembly was
+    # never attempted, so reporting one would name the wrong fix.
+    assert excinfo.value.code == 2
+    assert '--repeat measures' in capsys.readouterr().err
+    assert not out.exists()
+
+
+def test_merge_without_repeat_is_still_accepted(cli_env, tmp_path):
+    """The refusal above is keyed on `--repeat` being ASKED FOR, not on its
+    default: a plain `--merge` must stay unaffected."""
+    parts = []
+    for arm_id in lms_healthcheck.load_arms().arm_ids():
+        part = tmp_path / f'{arm_id}.json'
+        assert lms_healthcheck.main(['--arm', arm_id, '--output', str(part)]) == 0
+        parts.append(str(part))
+    out = tmp_path / 'merged.json'
+
+    assert lms_healthcheck.main(['--merge', *parts, '--output', str(out)]) == 0
+    assert out.exists()
 
 
 def test_cli_written_artifact_is_pure_json_with_no_enum_repr(cli_env, tmp_path):
@@ -3393,3 +3497,45 @@ def test_a_v4_artifact_no_longer_reads_as_current():
         lms_healthcheck.ReportMergeError, match='mixed schema versions'
     ):
         lms_healthcheck.merge_reports([stale, current])
+
+
+def test_uniformly_stale_parts_do_not_merge_into_a_current_looking_artifact():
+    """Agreeing with each other is not the same as being current.
+
+    Refusing only DISAGREEMENT left the worse case open: a set of parts that are
+    all v4 agrees with itself, merges cleanly, and emits `schema_version=4` --
+    while pydantic silently fills in this producer's defaults for
+    `first_probe_ms` (0.0) and `latency_caveat`.  The result asserts its
+    latencies were taken "with the engine warm and the prefix cache COLD" over
+    numbers that are pre-3781 cold single samples: precisely the
+    reinterpretation `REPORT_SCHEMA_VERSION`'s own contract tells a consumer to
+    refuse, and it makes the caveat carried from the binding input vacuous for
+    exactly the case that comment names.
+    """
+    parts = [
+        _single(_arm()).model_copy(update={'schema_version': 4}),
+        _single(
+            _arm(arm_id='phi-4-14b', served_model_name='phi-4-14b', port=8412)
+        ).model_copy(update={'schema_version': 4}),
+    ]
+
+    with pytest.raises(
+        lms_healthcheck.ReportMergeError, match='stale schema versions'
+    ) as excinfo:
+        lms_healthcheck.merge_reports(parts)
+
+    # The message must name what is stale AND what this producer writes, so an
+    # operator holding old parts knows a re-measure is the fix.
+    assert '[4]' in str(excinfo.value)
+    assert f'v{lms_healthcheck.REPORT_SCHEMA_VERSION}' in str(excinfo.value)
+
+
+def test_a_current_slate_still_merges():
+    """The refusal above must not have closed the door on the normal path."""
+    merged = lms_healthcheck.merge_reports([
+        _single(_arm()),
+        _single(_arm(arm_id='phi-4-14b', served_model_name='phi-4-14b', port=8412)),
+    ])
+
+    assert merged.schema_version == lms_healthcheck.REPORT_SCHEMA_VERSION
+    assert [row.arm_id for row in merged.arms] == ['qwen3.5-9b', 'phi-4-14b']
