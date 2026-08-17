@@ -202,24 +202,27 @@ class TestContainment:
 # open-tag shape this module exists to keep out of its own source, even
 # though it is regex syntax rather than an envelope literal.
 #
-# The comment delimiter is matched as the literal text '&#60;!--', NOT as an
-# escaped-then-decoded real HTML comment opener: the report spells its own
-# structural markup with the same '&#60;' convention as everything else in
-# it (design decision -- see plan.json), so that is what is actually on
-# disk. Matching a real, decoded comment opener here would never find it,
-# and re-escaping this text back to search for one would recreate the exact
-# literal this module exists to keep out of its own source for no benefit.
+# The comment delimiter is matched as a REAL HTML comment opener, spelled
+# '\x3c!--' here per this module's own sentinel-literal hygiene. The report
+# escapes every angle bracket that forms part of a MARKUP TAG as '&#60;',
+# but the comment delimiter is deliberately exempt and written literally on
+# disk: an entity reference is decoded to text and re-escaped on output by
+# any CommonMark/GFM renderer, so an escaped opener would render as four
+# lines of visible junk instead of the invisible metadata this gate assumes.
+# A literal '\x3c!--' is safe to carry here and in the report -- it is not a
+# member of ENVELOPE_LITERALS, and it matches neither detect(), ALT1, nor
+# ALT2 -- so the containment gate above is unaffected.
 #
 # Group order: id, tool, param, supplied, schema, dropped, block.
 _SPECIMEN_HEADER_RE = re.compile(
-    r'&#60;!--\s*specimen\s+'
+    r'\x3c!--\s*specimen\s+'
     r'id="([^"]*)"\s+'
     r'tool="([^"]*)"\s+'
     r'param="([^"]*)"\s+'
     r'supplied="([^"]*)"\s+'
     r'schema="([^"]*)"\s+'
     r'dropped="([^"]*)"\s*'
-    r'--&gt;\s*'
+    r'--\x3e\s*'
     r'```text\s*\n'
     r'(.*?)\n'
     r'```',

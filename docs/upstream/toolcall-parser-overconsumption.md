@@ -115,7 +115,7 @@ evidence the model is interpolating between the canonical
 `&#60;parameter name="X">` form and the name-echoing `&#60;X>` form, not
 cleanly using either one.
 
-&#60;!-- specimen id="S1" tool="submit_task" param="description" supplied="project_root,title,description" schema="project_root,prompt,title,description,details,dependencies,priority,metadata,tag,planning_mode,routing_override_reason,task_kind,agent_id" dropped="priority,agent_id,metadata" --&gt;
+<!-- specimen id="S1" tool="submit_task" param="description" supplied="project_root,title,description" schema="project_root,prompt,title,description,details,dependencies,priority,metadata,tag,planning_mode,routing_override_reason,task_kind,agent_id" dropped="priority,agent_id,metadata" -->
 ```text
 Investigate the elevated error rate on the ingest pipeline and file a fix.&#60;/description>
 &#60;priority>medium&#60;/priority>
@@ -133,7 +133,7 @@ value ("low") runs out. The parser has no next terminator to over-consume
 *to*, so the entire remainder of the text, starting from the mis-close,
 becomes `description`'s value and `priority` never arrives.
 
-&#60;!-- specimen id="S2" tool="submit_task" param="description" supplied="project_root,title,description" schema="project_root,prompt,title,description,details,dependencies,priority,metadata,tag,planning_mode,routing_override_reason,task_kind,agent_id" dropped="priority" --&gt;
+<!-- specimen id="S2" tool="submit_task" param="description" supplied="project_root,title,description" schema="project_root,prompt,title,description,details,dependencies,priority,metadata,tag,planning_mode,routing_override_reason,task_kind,agent_id" dropped="priority" -->
 ```text
 Retry the failed webhook delivery; this can likely be resolved automatically).&#60;/description>
 &#60;parameter name="priority">low
@@ -150,7 +150,7 @@ completely invisible whenever the mis-closed parameter happens to be listed
 last, and harmful whenever it isn't — nothing about the mistake itself
 signals which case a given call falls into.
 
-&#60;!-- specimen id="S3" tool="add_memory" param="content" supplied="content,project_id,category,agent_id" schema="content,project_id,category,agent_id,session_id,metadata,dual_write" dropped="" --&gt;
+<!-- specimen id="S3" tool="add_memory" param="content" supplied="content,project_id,category,agent_id" schema="content,project_id,category,agent_id,session_id,metadata,dual_write" dropped="" -->
 ```text
 This memory is being stored verbatim, matching the schema by design.&#60;/content>
 &#60;/invoke>
@@ -165,7 +165,7 @@ what the parser is supposed to expect, on the wrong parameter — which is
 enough by itself to send it looking further ahead, past `agent_id`, for the
 next tag it recognizes.
 
-&#60;!-- specimen id="S4" tool="update_memory" param="content" supplied="memory_id,store,project_id,content" schema="memory_id,store,project_id,content,metadata_patch,metadata_delete_keys,metadata_mode,reason,agent_id,session_id,metadata" dropped="agent_id" --&gt;
+<!-- specimen id="S4" tool="update_memory" param="content" supplied="memory_id,store,project_id,content" schema="memory_id,store,project_id,content,metadata_patch,metadata_delete_keys,metadata_mode,reason,agent_id,session_id,metadata" dropped="agent_id" -->
 ```text
 The memory has been re-scoped).&#60;/parameter>
 &#60;parameter name="agent_id">escalation-watcher-l2
