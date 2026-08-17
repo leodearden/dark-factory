@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -27,6 +28,30 @@ PLAN_SCHEMA_VERSION = 1
 # than stacking provenance.  The ``+`` also cleans up any tags that a prior
 # (pre-strip) implementation may have already stacked.
 _COMMITTED_TAG_RE = re.compile(r'^(?:\[COMMITTED [0-9a-fA-F]+\]\s*)+')
+
+
+def _existing_mode(target: Path) -> int | None:
+    """The permission bits *target* must carry AFTER an atomic replace.
+
+    An existing target's own mode is preserved verbatim, matching what
+    ``Path.write_text`` (which truncates rather than recreates) did before
+    every artifact write became a tmp+rename.  Without this, the first write
+    after that migration would silently re-mode every `.task-meta` artifact.
+
+    ``None`` for a target that does not exist yet lets ``atomic_write_text``
+    create the temp 0o666 and have the KERNEL apply the process umask —
+    exactly what ``write_text`` produces for a new file, and free of the
+    non-thread-safe ``os.umask(os.umask(0))`` read-back that the superseded
+    ``plan_tools._target_file_mode`` needed to compute the same answer.
+
+    Swallows ONLY FileNotFoundError.  EACCES/ELOOP/ENAMETOOLONG on the stat
+    are genuine failures and must surface, not be papered over as "new file".
+    """
+    try:
+        return stat.S_IMODE(target.stat().st_mode)
+    except FileNotFoundError:
+        return None
+
 
 # Sidecar schema for ``agent_session.json`` (task 2771).  v1 carried only
 # session_id/role/started_at/owner_pid; v2 adds the durable task_id binding,
@@ -1541,6 +1566,11 @@ class TaskArtifacts:
         was truncate-then-write, and a reader racing it could and did observe
         a half-written file — see ``TestWriteJsonIsAtomic``.)
 
+        An EXISTING target keeps its own permission bits across the swap (see
+        :func:`_existing_mode`), which the superseded ``write_text`` got for
+        free by truncating rather than recreating; a new one lands with the
+        umask-derived mode ``write_text`` would have given it.
+
         The tmp+rename itself is DELEGATED to ``shared.safe_io`` rather than
         re-implemented here: that helper is the repo's single blessed home for
         the pattern (its unique-per-writer O_CREAT|O_EXCL temp, fchmod on the
@@ -1558,9 +1588,14 @@ class TaskArtifacts:
         # opportunistic writes (reviews, iteration log) just want a no-op
         # when the worktree has been deleted out-of-band.
         try:
+            # Inside the try, so a NON-FileNotFoundError stat failure is
+            # reported through the same path as any other write failure, while
+            # a stat FileNotFoundError on a vanished root still lands in the
+            # tolerated no-op branch below.
             safe_io.atomic_write_text(
                 path,
                 json.dumps(data, indent=2) + '\n',  # byte format UNCHANGED
+                mode=_existing_mode(path),
                 fsync=True,
                 mkdir=True,
             )
