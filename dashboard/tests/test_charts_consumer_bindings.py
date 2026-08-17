@@ -40,13 +40,20 @@ _REDUX_DIR = pathlib.Path(__file__).parent.parent / 'src' / 'dashboard' / 'stati
 # shape (see the module docstring for the three shapes it deliberately skips).
 _DF_CHARTS_DESTRUCTURE_RE = re.compile(r'const\s*\{([^{}]*)\}\s*=\s*window\.DF_CHARTS')
 
-# Measured on base main @ a4c86d0c8e: tab_curator 3, tab_memory_evals 3,
-# tab_overview 9, tab_tasks 1, tabs 13.  The floors below sit UNDER these on
-# purpose — see the vacuity guard.
+# Measured after the sweep above was made green (task 3681): tab_curator 3,
+# tab_memory_evals 3, tab_overview 4, tab_tasks 1, tabs 12.  It was 29 across
+# the same five files before that — six of those bindings were the dead ones
+# this file was written to find (tab_overview's five, tabs' one).
+#
+# The floors sit well UNDER the current census on purpose, and specifically
+# under it by more than one tab's worth of imports: deleting dead bindings is a
+# NORMAL outcome of this suite passing, so a floor set snugly against today's
+# count would be failed by the very next cleanup it prompts.  See the vacuity
+# guard for why the floors exist at all.
 _MEASURED_FILES = 5
-_MEASURED_BINDINGS = 29
+_MEASURED_BINDINGS = 23
 _MIN_FILES = 4
-_MIN_BINDINGS = 24
+_MIN_BINDINGS = 18
 
 
 def _local_names(destructured: str) -> list[str]:
@@ -158,7 +165,7 @@ def test_the_sweep_actually_found_the_destructure_shaped_consumers() -> None:
         f'file(s) and {total} binding(s), below the floor of {_MIN_FILES}/'
         f'{_MIN_BINDINGS}. Measured at task 3681: {_MEASURED_FILES} files, '
         f'{_MEASURED_BINDINGS} bindings (tab_curator 3, tab_memory_evals 3, '
-        f'tab_overview 9, tab_tasks 1, tabs 13). A sweep this far below that '
+        f'tab_overview 4, tab_tasks 1, tabs 12). A sweep this far below that '
         f'is almost certainly a broken path or regex rather than real drift, '
         f'and it would make the assertions in this file vacuously green. '
         f'Found: { {k: len(v) for k, v in sorted(bindings.items())} }'
