@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -30,6 +30,7 @@ from escalation.models import (
     Escalation,
     EvidenceEntry,
 )
+from escalation.pins import classify_pins
 from escalation.queue import EscalationQueue
 from escalation.queue import observed_submit_response as _observed_submit_response
 
@@ -294,6 +295,125 @@ _COMPACT_ESCALATION_FIELDS = (
     'summary', 'suggested_action', 'timestamp',
     'triaged_at', 'triaged_by', 'triage_note', 'updated_at',
 )
+
+# get_pending_escalations(compact=True) additionally keeps its computed
+# pins_recovery annotation: the dashboard reads compact records, so dropping it
+# here would blank the whole PINNING surface.  Kept as a separate tuple so
+# get_task_escalations — which never computes the annotation — is untouched.
+_COMPACT_PENDING_FIELDS = (*_COMPACT_ESCALATION_FIELDS, 'pins_recovery')
+
+# Task statuses from which a recovery/redispatch is still possible.  A record
+# on a task outside this set pins nothing: there is no recovery to block.
+_RECOVERABLE_STATUSES = frozenset({'in-progress', 'blocked'})
+
+
+async def _annotate_pins_recovery(
+    queue: EscalationQueue,
+    harness: Any,
+    escalations: Sequence[Any],
+    dicts: list[dict[str, Any]],
+    *,
+    level: int | None,
+) -> None:
+    """Stamp ``pins_recovery`` on *dicts* in place, or leave the key ABSENT.
+
+    See ``get_pending_escalations``' docstring for the contract.  The key is
+    omitted rather than defaulted to ``[]`` on every path where the answer is
+    unknown, because ``[]`` reads as "nothing pins this task" — the esc-3163
+    collapse that routes a genuinely-pinned strand down the wrong branch.
+    """
+    if not dicts:
+        return
+    # No `if harness is not None` guard: getattr(None, 'scheduler', None) is
+    # already None, so the test is redundant AND actively harmful — it narrows
+    # `harness` to None for the whole function under pyright (the `else None`
+    # arm survives the `scheduler is None` return, since narrowing does not
+    # propagate backwards from `scheduler` to `harness`), which is what made
+    # the liveness read below a reportOptionalMemberAccess error.
+    scheduler = getattr(harness, 'scheduler', None)
+    if scheduler is None:
+        logger.debug(
+            'pins_recovery omitted for %d pending record(s): no orchestrator '
+            'harness/scheduler wired in, so task status is unreadable',
+            len(dicts),
+        )
+        return
+
+    task_ids = sorted({e.task_id for e in escalations})
+    # Deliberately unguarded.  Scheduler.get_statuses is TOTAL: it wraps its
+    # own body and returns ({}, exc) on any failure, logging the traceback
+    # itself (scheduler.py:2560).  Its designed failure channel is the `err`
+    # slot read just below.  A raise here would mean the duck-typed harness
+    # violated that contract — a seam failure, caught once by the call site's
+    # guard in get_pending_escalations, not swallowed at DEBUG per call.
+    statuses, err = await scheduler.get_statuses(task_ids)
+    if err is not None:
+        # get_statuses' failure shape is ({}, exc); reading only the dict would
+        # make a failed read indistinguishable from "no tasks" and report [].
+        logger.debug('pins_recovery omitted: status read failed: %s', err)
+        return
+
+    # classify_pins judges a record against its task's WHOLE open set, so a
+    # filtered view must not become a filtered classification.  Only a `level`
+    # filter narrows that set; without one the selection already IS the full
+    # open set for every task it mentions.
+    if level is None:
+        open_by_task: dict[str, list[Any]] = {}
+        for esc in escalations:
+            open_by_task.setdefault(esc.task_id, []).append(esc)
+    else:
+        open_by_task = {}
+        for tid in task_ids:
+            try:
+                open_by_task[tid] = queue.get_by_task(tid, status='pending')
+            except Exception as exc:  # noqa: BLE001 — real I/O, see below
+                # The ONE genuinely-reachable failure in this function (a
+                # filesystem scan plus JSON parse over esc-*.json), and the one
+                # place per-task recovery is real rather than nominal: a single
+                # unreadable file degrades exactly one task.  Leaving `tid` out
+                # of open_by_task makes the loop below skip it, so its key stays
+                # ABSENT (= UNKNOWN) instead of becoming a false [].  WARNING
+                # because a queue directory this process cannot read is
+                # operator-actionable and otherwise invisible on this surface.
+                logger.warning(
+                    'pins_recovery UNKNOWN for task %s: pending re-read failed: %s',
+                    tid, exc,
+                )
+
+    reports: dict[str, Any] = {}
+    live_by_task: dict[str, bool] = {}
+    for tid in task_ids:
+        if tid not in open_by_task:
+            continue
+        # Deliberately unguarded.  is_workflow_active is a dict membership test
+        # (harness.py:11182), so it cannot fail for one task id and succeed for
+        # the next — a per-task `continue` here would be granularity in name
+        # only.  A harness that cannot answer at all is a seam failure, handled
+        # once by the call site's guard.
+        live = bool(harness.is_workflow_active(tid))
+        live_by_task[tid] = live
+        # live_claimant_id is unavailable here (the harness exposes no composed
+        # claimant id), which classify_pins treats as UNKNOWN and fails safe to
+        # pinning for a live-claimant L0.  Fail-safe is the correct direction:
+        # this annotation must never under-report a pin.
+        reports[tid] = classify_pins(tid, open_by_task[tid], live_claimant=live)
+
+    for esc, d in zip(escalations, dicts, strict=True):
+        tid = esc.task_id
+        status = statuses.get(tid)
+        report = reports.get(tid)
+        if status is None or report is None:
+            logger.debug(
+                'pins_recovery omitted for %s: task %s status/classification unresolved',
+                d.get('id'), tid,
+            )
+            continue
+        pins = (
+            status in _RECOVERABLE_STATUSES
+            and not live_by_task.get(tid, True)
+            and esc.id in report.queue_handoff
+        )
+        d['pins_recovery'] = [tid] if pins else []
 
 
 def create_server(
@@ -1060,7 +1180,7 @@ def create_server(
         return esc.to_dict()
 
     @mcp.tool()
-    def get_pending_escalations(
+    async def get_pending_escalations(
         task_id: str | None = None,
         level: int | None = None,
         compact: bool = False,
@@ -1087,6 +1207,25 @@ def create_server(
         context small as the pending pile grows; fetch the full record for a
         specific id via ``get_escalation`` only when you are about to act on it.
         Default False preserves the full-dict shape for existing callers.
+
+        *pins_recovery* — each returned dict carries a computed
+        ``pins_recovery`` list: ``[task_id]`` when THIS record is what stops
+        that task from being recovered/redispatched, else ``[]``.  It is the
+        conjunction of four things (spec S8): the task is ``in-progress`` or
+        ``blocked`` (there is something to recover), no live claimant holds it
+        (it is stranded, not running), the record lands in
+        :attr:`~escalation.pins.PinReport.queue_handoff` (so an info record and
+        a dead L0 do NOT pin — derived from the classifier, never from
+        ``bool(open_escalations)``), and the task's status could be read.
+
+        The key is **OMITTED entirely** — never emitted as ``[]`` — when the
+        annotation cannot be computed: no harness/scheduler wired in, the
+        status read failed or raised, or that record's task is missing from
+        the status map.  A false ``[]`` reads as "nothing pins this task",
+        which is the exact collapse (esc-3163) that
+        :attr:`~escalation.pins.PinReport.store_unavailable` exists to
+        prevent, so callers must treat an absent key as UNKNOWN and render
+        nothing rather than "not pinning".
         """
         if task_id:
             escalations = queue.get_by_task(task_id, status='pending', level=level)
@@ -1094,12 +1233,31 @@ def create_server(
             escalations = queue.get_pending()
             if level is not None:
                 escalations = [e for e in escalations if e.level == level]
+
+        dicts = [e.to_dict() for e in escalations]
+        try:
+            await _annotate_pins_recovery(queue, harness, escalations, dicts, level=level)
+        except Exception:
+            # THE seam guard.  `harness` is duck-typed Any because this package
+            # deliberately does not import orchestrator, so the annotation can
+            # never fully trust its contract.  Stating "an annotation must never
+            # fail the tool" once, here, makes it true BY CONSTRUCTION for every
+            # line inside _annotate_pins_recovery — including ones added later —
+            # instead of by enumerating which calls someone guessed might throw.
+            # Records already stamped keep their value; the rest keep the key
+            # ABSENT, which is the contract's UNKNOWN, never a false [].
+            # logger.exception (not .debug) so a real seam violation yields a
+            # traceback rather than a one-line repr.
+            logger.exception(
+                'pins_recovery annotation failed for %d pending record(s); '
+                'unstamped records report UNKNOWN (key absent)', len(dicts),
+            )
         if compact:
-            return [
-                {k: d[k] for k in _COMPACT_ESCALATION_FIELDS}
-                for d in (e.to_dict() for e in escalations)
-            ]
-        return [e.to_dict() for e in escalations]
+            # `if k in d` because pins_recovery is deliberately absent when
+            # unknown — projecting it unconditionally would KeyError on
+            # exactly the degraded path the omission contract exists for.
+            return [{k: d[k] for k in _COMPACT_PENDING_FIELDS if k in d} for d in dicts]
+        return dicts
 
     @mcp.tool()
     def get_task_escalations(
@@ -1536,10 +1694,19 @@ def create_server(
           that verify has been running.  Cancel it (merge_cancel) then resubmit.
         - Already merged: ``{status='already_merged', commit, reason='',
           conflict_details='', push_status=None}``.  Either the branch tip is
-          already an ancestor of main (fast-path — no enqueue, no request_id)
+          already an ancestor of main AND the branch is not degenerate — i.e.
+          it advanced past its recorded ``branch_base_sha``; a zero-commit
+          branch is parked at an OLD main commit, which satisfies ancestry
+          while carrying none of the task's work (task 3103)
+          (fast-path — no enqueue, no request_id)
           or the worker detected the branch was already merged via merge marker
           (worker-path — also carries request_id and a None commit from
-          outcome.merge_sha).  All keys are present in both paths; callers
+          outcome.merge_sha).  The degeneracy guard REDIRECTS a degenerate
+          branch from the fast path to the worker rather than eliminating it:
+          the worker reaches ``already_merged`` by its own ancestry
+          short-circuit, so this status is still reachable for that shape — but
+          it arrives with ``commit=None`` and a request_id instead of the
+          parked foreign SHA.  All keys are present in both paths; callers
           can safely read reason/conflict_details/push_status without KeyError.
         """
         if merge_queue is None:
@@ -1552,6 +1719,9 @@ def create_server(
         # resolves at runtime because the escalation server is hosted inside the
         # orchestrator process; it is unresolvable in escalation's standalone
         # typecheck env (orchestrator is not on its path), hence the suppression.
+        from orchestrator.landing_evidence import (  # type: ignore[reportMissingImports]
+            branch_is_degenerate,
+        )
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             MergeOutcome,
             MergeRequest,
@@ -1593,9 +1763,121 @@ def create_server(
                 'conflict_details': '',
                 'push_status': None,
             }
-            if resolved_tip is not None and await git_ops_for_scan.is_ancestor(
+            # Degeneracy guard (task 3103).  Gates BOTH fast-path arms,
+            # deliberately.  patch_content_contained runs
+            # `git cherry <main> <tip>` and returns True when no `+` lines
+            # appear, which for a ZERO-COMMIT branch is true VACUOUSLY (git
+            # emits nothing), so gating only the is_ancestor arm would leak the
+            # degenerate branch into the backstop and still return
+            # {status:'already_merged', commit:<parked foreign SHA>} — a phantom
+            # done on a WRITE path (the runbooks treat already_merged the same
+            # as done and stamp done_provenance from result['commit']).  The
+            # 2945 backstop's own logic is untouched: a rebased landing has
+            # commits beyond its base, so it is non-degenerate by construction
+            # and this guard never fires on it.
+            #
+            # Evaluated LAST in each arm, and memoized across the two (review
+            # #1).  The guard's only power is to SUPPRESS an already_merged
+            # return, so it is pure cost on the overwhelmingly common
+            # submission where neither arm hits.  Hoisting it above the block
+            # made every merge_request pay a scheduler.get_task round-trip —
+            # a Taskmaster MCP dispatch with an internal timeout=15
+            # (scheduler.py:2485) — on the submit path.  Ordering it after the
+            # arm test is logically identical (`not degenerate and (A or B)`
+            # ≡ `(A and not degenerate) or (B and not degenerate)`) and pays
+            # that cost only when an arm is about to return.
+            #
+            # Fail-soft with its OWN try/except (merge_request's fast-path has
+            # no enclosing fire-safe wrapper): a probe fault must never break
+            # submission.
+            #
+            # What declining the fast path actually does.  NOT "the worker
+            # re-detects already-merged, a redundant no-op merge" — the worker
+            # performs no merge at all here.  merge_queue.py:5616 finds
+            # effective_tip (the parked base) an ancestor of main;
+            # _already_merged_is_genuine (:5455) resolves candidate_tip to that
+            # same parked base and returns True at its FIRST ancestry check
+            # (:5515); :5650 returns a terminal MergeOutcome('already_merged')
+            # with merge_sha=None, which the terminal-outcome block below maps
+            # to {'status':'already_merged', 'commit': None, 'request_id': ...}.
+            # A degenerate branch is therefore REDIRECTED to the worker, not
+            # eliminated, and this guard buys exactly three things:
+            #   (i)   the submit-time response can no longer carry the parked
+            #         foreign SHA as 'commit', which skills/unblock/SKILL.md
+            #         stamps verbatim as done_provenance={"commit": ...} — a
+            #         fabricated provenance record pointing at an unrelated
+            #         task's commit;
+            #   (ii)  the submission becomes an auditable queue record (a
+            #         request_id and a merge_queued event) instead of a silent
+            #         submit-time short-circuit;
+            #   (iii) on the worker path 'commit' is None, which routes that
+            #         same runbook clause to its exact-subject marker search —
+            #         empty for a genuinely unmerged branch — and thence to a
+            #         {"note": ...} provenance rather than a SHA.
+            # Residual, stated plainly: 'status' is still 'already_merged',
+            # which the runbooks treat as terminal success, so the phantom-done
+            # hole is narrowed, not closed.  Follow-up
+            # tkt_0RSHM98C6F78MW4J0SK3S29YZG; single fix point
+            # merge_queue.py:5515.
+            #
+            # Why this task does NOT instead gate _already_merged_is_genuine on
+            # branch_is_degenerate: that makes the worker fall THROUGH and
+            # merge.  _classify_branch_presence (merge_queue.py:3939) returns
+            # None because the ref is present, and `git merge --no-ff
+            # <ancestor>` is a no-op ("Already up to date.", rc 0, HEAD
+            # unchanged), so merge_to_main's `git rev-parse HEAD`
+            # (git_ops.py:9306) reads back that unchanged main HEAD and reports
+            # MergeResult(success=True, merge_commit=<unrelated main commit>).
+            # That converts today's already_merged/None into a 'done' carrying
+            # a real-looking foreign SHA — strictly worse — and burns a
+            # head-of-line verify slot on a guaranteed no-op.  Long form lives
+            # in the ticket above.
+            _degenerate_verdict: bool | None = None
+
+            async def _declined() -> bool:
+                """True iff the branch is degenerate → decline the fast path.
+
+                Memoized so the two arms share one scheduler round-trip and
+                one verdict.  ``branch_tip_sha=resolved_tip`` hands the probe
+                the tip the arm above just tested, so the degeneracy verdict
+                and the ancestry/patch-id evidence it gates are computed
+                against the SAME observed SHA (review #2) — a warm-lane
+                reseed between two independent ref reads cannot split them.
+                """
+                nonlocal _degenerate_verdict
+                if _degenerate_verdict is not None:
+                    return _degenerate_verdict
+                try:
+                    # Derive the id from the branch, exactly as merge_status
+                    # does (server.py `tid = full_branch.removeprefix(prefix)`),
+                    # NOT from the caller-supplied task_id parameter (review
+                    # #6).  merge_request takes task_id and branch as two
+                    # independent parameters; keying the metadata off one and
+                    # the tip off the other would compare task X's recorded
+                    # branch_base_sha against task Y's branch tip, silently
+                    # disabling the guard on any mismatched submission.  The
+                    # branch is the single source of truth here because it is
+                    # what resolved_tip was read from.
+                    _degenerate_verdict = await branch_is_degenerate(
+                        git_ops_for_scan, full_branch,
+                        await _git_authority_task_metadata(
+                            full_branch.removeprefix(orch_config.git.branch_prefix),
+                            site='merge_request',
+                        ),
+                        branch_tip_sha=resolved_tip,
+                    )
+                except Exception:
+                    logger.warning(
+                        'merge_request: degeneracy probe failed for %s — proceeding '
+                        'as non-degenerate',
+                        full_branch, exc_info=True,
+                    )
+                    _degenerate_verdict = False
+                return _degenerate_verdict
+
+            if (resolved_tip is not None and await git_ops_for_scan.is_ancestor(
                 resolved_tip, orch_config.git.main_branch
-            ):
+            ) and not await _declined()):
                 return already_merged_response
             # Rebased-landing backstop (task 2945): a branch whose content
             # landed on main as a rebased/cherry-picked commit is NOT a literal
@@ -1605,9 +1887,9 @@ def create_server(
             # resubmission at the door — NO enqueue, NO merge_queued event, same
             # already_merged shape as the ancestor arm.  Fail-open: any git
             # error → False → falls through to the normal coalesce/enqueue path.
-            if resolved_tip is not None and await patch_content_contained(
+            if (resolved_tip is not None and await patch_content_contained(
                 resolved_tip, orch_config.git.main_branch, git_ops_for_scan
-            ):
+            ) and not await _declined()):
                 return already_merged_response
 
         # module_configs_or_empty normalises the post-1405 None sentinel (direct-
@@ -1860,8 +2142,10 @@ def create_server(
         # Resolved within clamp → fall through to terminal outcome shape below.
         # 'commit' (outcome.merge_sha) is included for shape convergence with the
         # fast-path already_merged response.  It is None for most statuses and for
-        # the worker-produced already_merged case (merge marker path returns no SHA);
-        # it is non-None for 'done' and 'done_wip_recovery' where main was advanced.
+        # the worker-produced already_merged case (neither the merge-marker path
+        # nor the ancestry short-circuit that a degenerate branch takes returns a
+        # SHA); it is non-None for 'done' and 'done_wip_recovery' where main was
+        # advanced.
         result: dict[str, Any] = {
             'status': outcome.status,
             'request_id': merge_req.request_id,
@@ -2481,17 +2765,38 @@ def create_server(
     def _found_on_main_response(request_id: str | None, merge_sha: str) -> dict[str, Any]:
         """Build the git-authority Tier-3.5 done/found_on_main response.
 
-        ``merge_sha`` semantics differ between the two resolution paths:
+        ``merge_sha`` is a commit ON MAIN on both resolution paths, with one
+        explicit exception stated below (task 3103):
 
-        - **Live-branch path** (``is_ancestor`` hit): ``merge_sha`` is the
-          *branch tip* SHA — an ancestor of main but, for ``--no-ff`` merges,
-          NOT the merge-commit SHA (they are distinct commits).
-        - **Deleted-branch path** (``find_merge_marker`` hit): ``merge_sha``
-          is the *merge-commit* SHA found on main via ``git log``.
+        - **Live-branch path** (``is_ancestor`` hit): the citation commit
+          discovered by ``validate_landing_evidence`` — a commit on main
+          whose subject cites the task.
+        - **Deleted-branch path** (``find_merge_marker`` hit): the
+          merge-commit SHA found on main via ``git log``.
 
-        Callers that specifically need the merge commit (e.g. for provenance
-        that must reference the commit on main's first-parent chain) should
-        prefer the deleted-branch path's value or resolve via ``git log``.
+        Both are effect-present-checked against current main HEAD before
+        being returned, so ``merge_sha`` is safe to record as provenance
+        as-is.  (Before task 3103 the live-branch path returned the *branch
+        tip*, which for a ``--no-ff`` merge is a distinct commit that is not
+        on main's first-parent chain — callers were told to prefer the
+        deleted-branch path's value.  That caveat no longer applies.)
+
+        **The one exception — ``git.commit_citation_pattern == ''``.**  That
+        is the documented per-project opt-out for projects with no citation
+        convention (config.py; ``find_task_citation_commit`` honours it by
+        returning None for everything, so running the gate would reject
+        unconditionally and turn this tier into dead code).  On that setting
+        the live-branch path skips the citation gate entirely and
+        ``merge_sha`` is the raw BRANCH TIP, neither citation-discovered nor
+        effect-present-checked — i.e. exactly the pre-3103 ``--no-ff`` wart,
+        deliberately retained as the price of the opt-out (the degeneracy
+        guard still applies).  Do not read the paragraphs above as
+        unconditional: on such a project a caller stamping ``merge_sha`` as
+        provenance is recording a branch tip, and a reverted landing is
+        indistinguishable from a live one (review #4).  The opt-out is
+        ``''`` only; ``None`` means "use the built-in default pattern" and
+        keeps the full guarantee.  Both SKILL.md runbooks carry the same
+        exception.
         """
         return {
             'state': 'done',
@@ -2501,6 +2806,52 @@ def create_server(
             'merge_sha': merge_sha,
             'outcome': 'found_on_main',
         }
+
+    async def _git_authority_task_metadata(tid: str, *, site: str) -> dict[str, Any]:
+        """Best-effort task metadata for the git-authority guards (task 3103).
+
+        Returns ``{}`` on EVERY failure mode — no harness, no ``scheduler``
+        attribute, ``get_task`` raising, or a None/metadata-less task — and
+        never raises.  A scheduler fault must degrade a single guard, not
+        swallow the whole probe.
+
+        ``{}`` deliberately FAILS OPEN out of the degeneracy check.  On the
+        ``merge_status`` path it then falls THROUGH to the citation gate,
+        which is git-only and needs no task metadata; on the
+        ``merge_request`` fast path there is no citation gate, so the block
+        simply reverts to its pre-3103 ancestry/patch-id behaviour.  Either
+        way this is exact parity with the harness, which treats an absent or
+        non-40-hex ``branch_base_sha`` as "no degeneracy signal" rather than
+        as grounds to reject: a metadata fault must never fabricate a
+        confident answer, and must never hard-fail a genuinely merged branch.
+
+        Args:
+            tid: Bare task id (no ``task/`` prefix).  Both callers derive it
+                from the branch ref they resolved the tip from, so the
+                metadata and the tip always describe the same branch.
+            site: The calling tool (``'merge_status'`` / ``'merge_request'``),
+                interpolated into the degradation warning.  Without it a
+                scheduler fault on the SUBMIT path was logged as a
+                merge_status failure, so an operator grepping for a
+                submit-path degradation would not find it (review #3).
+        """
+        if harness is None:
+            return {}
+        scheduler = getattr(harness, 'scheduler', None)
+        if scheduler is None:
+            return {}
+        try:
+            task = await scheduler.get_task(tid)
+        except Exception:
+            logger.warning(
+                '%s: scheduler.get_task(%s) failed — proceeding without task '
+                'metadata (degeneracy check skipped)',
+                site, tid, exc_info=True,
+            )
+            return {}
+        if not task:
+            return {}
+        return task.get('metadata') or {}
 
     @mcp.tool()
     async def merge_status(
@@ -2523,16 +2874,40 @@ def create_server(
         ``orch_config.git.branch_prefix`` unless the value already starts
         with the prefix — the same shape-tolerant rule shared with
         ``recover_pending_merges``), then:
-        - If the branch still exists: calls ``is_ancestor(tip, main)``.
-          An additional ``tip != main_tip`` guard prevents a false-positive
-          ``done`` when the branch sits at exactly main's HEAD with no extra
-          commits (a commit is its own ancestor).  On hit →
-          state='done', kind='found_on_main',
-          merge_sha=<branch-tip SHA>.
-          Note: for ``--no-ff`` merges the branch tip is NOT the merge-commit;
-          see ``_found_on_main_response`` for the semantic distinction.
+        - If the branch still exists: calls ``is_ancestor(tip, main)``, then
+          applies THREE guards in order (task 3103 brought the last two to
+          parity with the orchestrator harness's already-landed dispatch
+          gate, which has had them since task 1226):
+            1. ``tip != main_tip`` — a branch sitting at exactly main's HEAD
+               satisfies ``is_ancestor`` trivially (a commit is its own
+               ancestor) but nothing has been merged;
+            2. NOT degenerate — a tip still equal to the recorded
+               ``branch_base_sha`` proves zero commits were ever pushed, so
+               the branch is merely parked at an OLD main commit (which IS an
+               ancestor of main and IS distinct from main_tip, so guard 1
+               does not catch it);
+            3. ``validate_landing_evidence`` DISCOVERY mode — a commit on
+               main must positively cite the task and its effect must still
+               be present at main HEAD.
+          On hit → state='done', kind='found_on_main',
+          merge_sha=<the citation commit on main>.
+          Guards 2 and 3 are independent and both required: a re-seeded
+          branch is non-degenerate yet uncited, while a degenerate branch may
+          still have a citing commit on main.  When
+          ``git.commit_citation_pattern`` is ``''`` (the documented
+          per-project opt-out) guard 3 is skipped and merge_sha is the branch
+          tip — not a commit on main, and not effect-present-checked; guard 2
+          still applies.  See ``_found_on_main_response`` for what that costs
+          a caller stamping merge_sha as provenance.
         - If the branch ref is gone (tip is None): calls ``find_merge_marker``
-          which searches git log for the merge commit subject.
+          which searches git log for the merge commit subject.  On hit, two
+          further guards (task 3103, mirroring the harness marker arm):
+          the marker must NOT predate the recorded ``branch_base_sha`` (else
+          the branch was deleted and recreated under the same id and the
+          marker belongs to a previous incarnation), and
+          ``validate_landing_evidence`` CANDIDATE mode must find the marker's
+          effect still present at main HEAD (the marker's subject match
+          already establishes attribution).
           On hit → state='done', kind='found_on_main',
           merge_sha=<merge-commit SHA on main>.
         Fire-safe: any git failure degrades to the honest Tier-4 unknown
@@ -2545,9 +2920,9 @@ def create_server(
         Live entries also carry: position, enqueued_at, eta_seconds.
         Terminal entries carry: outcome (raw state), finished_at.
         git-authority terminal shape: state='done', kind='found_on_main',
-            merge_sha=<branch-tip or merge-commit SHA — see
-            ``_found_on_main_response`` docstring for path-specific
-            semantics>, outcome='found_on_main'.
+            merge_sha=<a commit ON MAIN — the discovered citation or the
+            merge marker; see ``_found_on_main_response``>,
+            outcome='found_on_main'.
         Unknown carries: hint.
         """
         # Validation — at least one key required
@@ -2626,15 +3001,92 @@ def create_server(
                     full_branch = canonical_queued_branch_name(key, prefix)
                     tip = await git_ops.resolve_branch_sha(full_branch)
                     main_tip = await git_ops.resolve_branch_sha(orch_config.git.main_branch)
+                    tid = full_branch.removeprefix(prefix)
+                    # Runtime-only reverse import: orchestrator depends on escalation,
+                    # not vice versa, so this lazy import deliberately avoids a static
+                    # cycle (same shape as server.py:1423 / :2049 / :2148).  It resolves
+                    # at runtime because the escalation server is hosted inside the
+                    # orchestrator process.  An ImportError is an Exception and therefore
+                    # already degrades to the honest Tier-4 unknown via the wrapper below.
+                    from orchestrator.landing_evidence import (  # type: ignore[reportMissingImports]
+                        branch_is_degenerate,
+                        is_valid_sha_40,
+                        validate_landing_evidence,
+                    )
                     if (tip is not None and tip != main_tip
                             and await git_ops.is_ancestor(tip, orch_config.git.main_branch)):
                         # Live branch is already an ancestor of main (normal merged case).
                         # tip != main_tip guards against the no-op case: a branch sitting at
                         # exactly main's HEAD satisfies is_ancestor trivially (a commit is
                         # its own ancestor) but nothing has been merged.
-                        # merge_sha = branch tip (NOT the merge commit for --no-ff; see
-                        # _found_on_main_response docstring for the semantic distinction).
-                        return _found_on_main_response(request_id, tip)
+                        # Degeneracy guard (task 3103): a tip still equal to the
+                        # recorded branch_base_sha proves ZERO commits were ever
+                        # pushed beyond the creation point.  Such a branch is parked
+                        # at an OLD main commit, which makes it an ancestor of main
+                        # AND distinct from main_tip — both conjuncts above pass — so
+                        # without this guard the tier stamps a confident `done`
+                        # against a commit containing none of the task's work.  A
+                        # degenerate branch falls through to the honest Tier-4
+                        # unknown.  Runs FIRST and independently of the citation gate:
+                        # a degenerate branch whose task DOES have a citing commit on
+                        # main (reify 5493) is caught only by this ordering.
+                        # branch_tip_sha=tip: the probe judges degeneracy
+                        # against the SAME tip the is_ancestor check above
+                        # just ran on, instead of re-reading the ref (review
+                        # #2) — one subprocess fewer, and no window for a
+                        # warm-lane reseed to split the two observations.
+                        metadata = await _git_authority_task_metadata(
+                            tid, site='merge_status',
+                        )
+                        if not await branch_is_degenerate(
+                            git_ops, full_branch, metadata, branch_tip_sha=tip,
+                        ):
+                            # Citation gate.  Read the pattern off orch_config.git for
+                            # consistency with the adjacent .main_branch / .branch_prefix
+                            # reads (same object as git_ops.config in production).
+                            pattern = orch_config.git.commit_citation_pattern
+                            if pattern == '':
+                                # Documented per-project opt-out (config.py
+                                # commit_citation_pattern): '' disables the citation
+                                # check entirely for projects without citation
+                                # conventions, and find_task_citation_commit honours it
+                                # by returning None for EVERYTHING.  Running the gate
+                                # here would therefore reject unconditionally and turn
+                                # Tier 3.5 into dead code rather than merely un-gated —
+                                # a silent capability loss for an explicit opt-in.
+                                # Note: None means "use the built-in
+                                # DEFAULT_COMMIT_CITATION_PATTERN" and is NOT the
+                                # opt-out.  The degeneracy guard above still applies in
+                                # this mode.
+                                # The returned merge_sha is therefore the raw BRANCH
+                                # TIP — not a commit on main, and NOT effect-present
+                                # checked.  That is the price of the opt-out, and it is
+                                # called out explicitly in _found_on_main_response's
+                                # docstring and in both SKILL.md runbooks so a caller
+                                # on such a project does not stamp it as verified
+                                # provenance (review #4).
+                                return _found_on_main_response(request_id, tip)
+                            # DISCOVERY mode: a commit on main must positively cite the
+                            # task (FIX 2) AND its effect must still be present at main
+                            # HEAD (FIX 1', the task-1175 reverted-landing guard).  The
+                            # accepted evidence_sha is a commit ON MAIN, which also
+                            # retires the old wart of answering with the branch tip.
+                            # No escalation on reject — mirrors the harness ancestor
+                            # arm's silent-False, and merge_status is a read-only probe.
+                            verdict = await validate_landing_evidence(
+                                git_ops, tid, full_branch,
+                                branch_tip_sha=tip,
+                                pattern_template=pattern,
+                            )
+                            # `accepted` implies a non-None evidence_sha (see
+                            # LandingEvidenceVerdict), but assert it explicitly:
+                            # _found_on_main_response's merge_sha is a hard `str`,
+                            # and a contract violation must degrade to Tier-4
+                            # unknown rather than emit a `done` with a null sha.
+                            if verdict.accepted and verdict.evidence_sha is not None:
+                                return _found_on_main_response(
+                                    request_id, verdict.evidence_sha,
+                                )
                     elif tip is None:
                         # Branch ref gone — the canonical 4352 deleted-branch shape.
                         # find_merge_marker internally gates on branch existence so it only
@@ -2644,7 +3096,41 @@ def create_server(
                         # merge_sha = merge-commit SHA on main (via git log scan).
                         marker = await git_ops.find_merge_marker(full_branch)
                         if marker is not None:
-                            return _found_on_main_response(request_id, marker)
+                            metadata = await _git_authority_task_metadata(
+                                tid, site='merge_status',
+                            )
+                            branch_base_sha = metadata.get('branch_base_sha')
+                            # Predates-this-incarnation veto (task 3103, mirroring
+                            # the harness marker arm): the branch was deleted and
+                            # recreated under the SAME task id, so a marker older
+                            # than this incarnation's base attributes a previous
+                            # run's merge to the current task.  is_valid_sha_40 sits
+                            # on the LEFT of the `and` so a missing or malformed
+                            # base never reaches is_ancestor with a bad argument.
+                            if not (
+                                is_valid_sha_40(branch_base_sha)
+                                and await git_ops.is_ancestor(marker, branch_base_sha)
+                            ):
+                                # CANDIDATE mode: the marker's subject match already
+                                # establishes attribution, so only the FIX 1'
+                                # effect-present guard remains — closing the
+                                # task-1175 clobber where a reverted merge still
+                                # read as a genuine landing.  No escalation on
+                                # reject (unlike the harness marker path):
+                                # merge_status is a read-only probe with no write
+                                # side, so a reject degrades to Tier-4 unknown.
+                                verdict = await validate_landing_evidence(
+                                    git_ops, tid, full_branch,
+                                    branch_tip_sha=None,
+                                    candidate_sha=marker,
+                                )
+                                # Same non-None assertion as the ancestor arm
+                                # above: reject a null evidence sha into Tier-4
+                                # unknown rather than into a `done` response.
+                                if verdict.accepted and verdict.evidence_sha is not None:
+                                    return _found_on_main_response(
+                                        request_id, verdict.evidence_sha,
+                                    )
                 except Exception:
                     logger.warning(
                         'merge_status: git-authority probe failed, returning unknown',

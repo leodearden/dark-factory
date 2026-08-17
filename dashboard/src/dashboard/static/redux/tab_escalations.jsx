@@ -224,9 +224,10 @@ function sliceDailyByWindow(dailyObj, cutoff) {
   return out;
 }
 
-// ── EscalationStatStrip — four-tile summary (benign rate, 6h breaches,
-//    esc/done, churn), reading the ESCALATION_ANALYTICS payload already
-//    wired into DF_DATA by the analytics tab (no duplicated computation) ──
+// ── EscalationStatStrip — five-tile summary (benign rate, 6h breaches,
+//    esc/done, churn, pinning), reading the ESCALATION_ANALYTICS payload
+//    already wired into DF_DATA by the analytics tab (no duplicated
+//    computation) ──
 
 function EscalationStatStrip({ analytics, projectFilter }) {
   const a = analytics || DF.ESCALATION_ANALYTICS;
@@ -288,6 +289,16 @@ function EscalationStatStrip({ analytics, projectFilter }) {
     openItems = openItems.concat((p.lifespan || {}).open_items || []);
   }
   const breachCount = openItems.filter(item => item.breach_6h).length;
+
+  // (b2) pinning — same live open_items array, no extra payload. Truthiness,
+  // never an equality test: the backend OMITS pins_recovery when it could not
+  // compute the annotation, so `item.pins_recovery === false` would count an
+  // unclassified item as "does not pin". Unknown simply falls out of the count.
+  const pinningItems = openItems.filter(item => item.pins_recovery);
+  const pinnedTasks = new Set();
+  for (const item of pinningItems) {
+    for (const tid of item.pins_recovery_task_ids || []) pinnedTasks.add(String(tid));
+  }
 
   // (c) esc-per-done — aggregate ratio sum(filings)/sum(done) over the
   // WINDOWED rows, NOT a mean of daily ratios (undefined/biased on
@@ -365,6 +376,11 @@ function EscalationStatStrip({ analytics, projectFilter }) {
         value={churnRate != null ? `${Math.round(churnRate * 100)}%` : '—'}
         spark={churnSpark}
         sparkColor={C.PALETTE.bad}
+      />
+      <C.StatTile
+        label="pinning"
+        value={pinningItems.length}
+        hint={`blocking ${pinnedTasks.size} task${pinnedTasks.size === 1 ? '' : 's'}`}
       />
     </div>
   );

@@ -15,7 +15,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, Any, TypeGuard
+from typing import IO, TYPE_CHECKING, Any
 
 from shared.cli_invoke import (
     AllAccountsCappedException,
@@ -61,7 +61,9 @@ from orchestrator.git_ops import GitOps, classify_worktree_entry
 from orchestrator.landed_outbox import MergeProvenance
 from orchestrator.landing_evidence import (
     LandingEvidenceVerdict,
+    branch_is_degenerate,
     file_unattributed_landing_escalation,
+    is_valid_sha_40,
     validate_landing_evidence,
 )
 from orchestrator.lane_lifecycle import LaneRecord
@@ -491,21 +493,6 @@ def _pid_alive(pid: int) -> bool:
         return True
     except OSError:
         return False
-
-
-def _is_valid_sha_40(s: object) -> TypeGuard[str]:
-    """Return True iff *s* is a well-formed 40-char lowercase hex SHA.
-
-    Used to validate ``branch_base_sha`` values read from task metadata
-    before comparing them against live git output.  Any non-conforming
-    value is treated as missing so the reconciler falls through to the
-    existing citation-grep guard rather than making a bogus comparison.
-    """
-    return (
-        isinstance(s, str)
-        and len(s) == 40
-        and all(c in '0123456789abcdef' for c in s)
-    )
 
 
 # _deterministic_deploy_health_verdict is now defined in systemd_inspect.py
@@ -5235,18 +5222,15 @@ class Harness:
         ON_MAIN — and from _revert_in_progress_if_no_live_claimant's
         infra-held guard, which share this same degeneracy signal.
 
-        Returns False when:
-        - branch_base_sha is absent or not a valid 40-hex SHA (backward compat
-          for pre-#1226 tasks or tasks whose metadata write failed transiently);
-        - resolve_branch_sha returns None (branch ref vanished mid-sweep —
-          treat as non-degenerate so the caller falls through to escalate); or
-        - the live tip has advanced past the recorded base SHA.
+        The predicate itself now lives in
+        :func:`orchestrator.landing_evidence.branch_is_degenerate` (task 3103)
+        so the escalation server's merge_status Tier-3.5 and merge_request
+        fast-path guard this class with the SAME implementation rather than a
+        divergent copy.  See that function for the full fail-open contract
+        (absent/non-40-hex base or a vanished ref → False).  This method is
+        retained as a delegation because gate-wiring tests mock it by name.
         """
-        branch_base_sha = metadata.get('branch_base_sha')
-        if not _is_valid_sha_40(branch_base_sha):
-            return False
-        branch_tip_sha = await self.git_ops.resolve_branch_sha(branch)
-        return branch_tip_sha is not None and branch_tip_sha == branch_base_sha
+        return await branch_is_degenerate(self.git_ops, branch, metadata)
 
     async def _reconcile_one_stranded(
         self, tid: str, status: str, *, mid_run: bool,
@@ -10860,7 +10844,7 @@ class Harness:
             )
             if marker:
                 branch_base_sha = metadata.get('branch_base_sha')
-                if _is_valid_sha_40(
+                if is_valid_sha_40(
                     branch_base_sha,
                 ) and await self.git_ops.is_ancestor(marker, branch_base_sha):
                     return False

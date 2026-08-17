@@ -31,13 +31,16 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
+from datetime import datetime, timedelta
 from typing import Any
 
 import httpx
+from shared.task_claimant import is_stranded
 
 from dashboard.config import DashboardConfig
 from dashboard.data.mcp_fanout import TTLCache, fanout_label, first_success
 from dashboard.data.memory import mcp_tool_call
+from dashboard.data.utils import resolve_now
 
 # ---------------------------------------------------------------------------
 # Per-project_root TTL cache for fetch_tasks
@@ -86,6 +89,19 @@ def _shape_task(task: dict) -> dict | None:
     that the dashboard does not render. Cast id at the boundary; drop those.
     ``updatedAt`` is preserved as ``updated_at`` — it is the recency key for
     ordering done tasks and the ``completed`` display timestamp.
+
+    ``claimant_run_id`` and ``heartbeat_at`` are carried through for the
+    STRANDED projection (task 3543 / PRD ι): they are the two columns
+    :func:`task_is_stranded` reads, and dropping them here is what previously
+    made a strand invisible on every dashboard surface.  Both are read with
+    ``.get`` so a pre-migration row (or an older fused-memory that does not
+    emit them) surfaces ``None`` rather than raising — the shaped dict always
+    carries the keys, so consumers never have to guard for their absence.
+
+    Mutation warning: :func:`fetch_tasks` caches these dicts by reference and
+    hands the same objects to every caller within the TTL window, so callers
+    must NOT mutate ``claimant_run_id``/``heartbeat_at`` (or any other field)
+    in place — build a fresh row instead.
     """
     raw_id = task.get('id')
     if raw_id is None:
@@ -117,7 +133,55 @@ def _shape_task(task: dict) -> dict | None:
         'dependencies': deps,
         'metadata': metadata,
         'updated_at': task.get('updatedAt'),
+        'claimant_run_id': task.get('claimant_run_id'),
+        'heartbeat_at': task.get('heartbeat_at'),
     }
+
+
+# ---------------------------------------------------------------------------
+# Stranded-task projection (task 3543 / PRD ι, spec S8)
+# ---------------------------------------------------------------------------
+
+# Mirrors the orchestrator's ``harness._RECONCILE_HEARTBEAT_TTL`` (10 minutes):
+# a claim whose heartbeat has not advanced within this window is treated as
+# abandoned.  The dashboard deliberately does NOT import the orchestrator
+# package — it is a separate deployable and the dashboard's dependency set is
+# intentionally narrow — so the value is restated here.  If the orchestrator's
+# TTL moves, this constant must move with it; the two are a documented pair,
+# not an accident.
+STRANDED_HEARTBEAT_TTL = timedelta(minutes=10)
+
+
+def task_is_stranded(task: Mapping[str, Any], now: datetime | None = None) -> bool:
+    """Return True when *task* is an in-progress task with no live claimant.
+
+    THE single dashboard-side strand predicate.  A thin wrapper binding
+    :data:`STRANDED_HEARTBEAT_TTL` and the request-scoped clock onto
+    :func:`shared.task_claimant.is_stranded` (Table C4 of the
+    task-status-authority contract), so every dashboard surface that renders a
+    strand — the task-row badge, the burndown live/stranded split — resolves
+    it through one function and the surfaces cannot disagree (INV-5).
+
+    ``is_stranded`` specifically, NOT its siblings:
+
+    * ``has_live_claimant`` carries neither the ``status == 'in-progress'``
+      gate nor the ``metadata.infra_hold`` carve-out, so
+      ``not has_live_claimant(...)`` is a different — and, for this projection,
+      wrong — predicate that would flag every pending/done task as stranded.
+    * ``is_stranded_blocked`` is the blocked-status variant, out of scope here.
+
+    Args:
+        task: A dashboard-shaped task row (or a raw MCP row) — reads
+            ``status``, ``claimant_run_id``, ``heartbeat_at``, ``metadata``.
+        now: Request-scoped reference timestamp.  Resolved through
+            :func:`dashboard.data.utils.resolve_now`, never a bare clock read.
+            Callers doing a batch pass should resolve once and thread the
+            concrete value through rather than passing None per row.
+
+    Returns:
+        True when the task is stranded, else False.
+    """
+    return is_stranded(task, resolve_now(now), STRANDED_HEARTBEAT_TTL)
 
 
 async def fetch_tasks(
@@ -233,7 +297,17 @@ async def fetch_statuses(
 ) -> Mapping[Any, Any]:
     """Fetch a compact ``{int(id): status}`` map for *project_root* via MCP.
 
-    Used by the burndown collector — ~95% smaller than ``fetch_tasks``.
+    ~95% smaller than ``fetch_tasks``, so it is the right seam for a
+    status-only caller.  The sole consumer today is
+    ``active_tasks.collect_done_counts``, which needs nothing but a per-status
+    count.
+
+    NOTE: the burndown collector used to be the headline consumer and is NOT
+    one any more — ``burndown.collect_snapshot`` moved to ``fetch_tasks`` in
+    task 3543 because this compact map carries no claimant columns, so the
+    live/stranded split is physically underivable from it.  (The mirror of
+    this note lives on ``collect_done_counts``; keep the two in step.)
+
     Returns ``{'offline': True, 'error': str}`` if every server fails.
     """
     project_root_str = str(project_root)

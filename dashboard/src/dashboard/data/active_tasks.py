@@ -14,7 +14,14 @@ Output shape (per task) matches ``data.js`` mock fixtures:
         'description': '...',
         'details': '...',         # may be empty; many tasks have none
         'status': 'in-progress',
-        'agent': 'claude-task-19',  # TaskRuntimeEntry.has_worktree; None if no worktree
+        'agent': 'claude-task-19',  # TaskRuntimeEntry.has_worktree; None if no worktree.
+                                    # WORKTREE PRESENCE, NOT LIVENESS — see 'stranded'.
+        'claimant_run_id': 'run-1/sess-1/pid=42',  # MCP get_tasks claim column; None if unclaimed
+        'heartbeat_at': '2026-08-08T12:00:00+00:00',  # MCP get_tasks claim column; None if never
+        'stranded': False,          # tasks.task_is_stranded(task, now) — in-progress with no live
+                                    # claimant (null/blank claimant, or a heartbeat older than
+                                    # STRANDED_HEARTBEAT_TTL). Independent of 'agent': a leftover
+                                    # worktree makes 'agent' truthy while nothing is running.
         'started': 14,              # minutes since TaskRuntimeEntry.started (runtime snapshot)
         'loops': 2,                 # TaskRuntimeEntry.loops (runtime snapshot)
         'attempts': 3,              # TaskRuntimeEntry.attempts (runtime snapshot)
@@ -51,7 +58,12 @@ from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 
 from dashboard.config import DashboardConfig
 from dashboard.data.task_runtime import fetch_task_runtime
-from dashboard.data.tasks import fetch_external_statuses, fetch_statuses, fetch_tasks
+from dashboard.data.tasks import (
+    fetch_external_statuses,
+    fetch_statuses,
+    fetch_tasks,
+    task_is_stranded,
+)
 from dashboard.data.utils import resolve_now
 
 logger = logging.getLogger(__name__)
@@ -141,6 +153,7 @@ def _build_task_row(
     uid: str,
     *,
     prd: str | None = None,
+    now: datetime | None = None,
 ) -> dict:
     """Build the common row fields shared by active and done task rows.
 
@@ -148,6 +161,17 @@ def _build_task_row(
     status.  Callers add status-specific fields afterwards:
     active rows add ``started`` (minutes) and ``deps``; done rows add
     ``started: 0``, ``deps: []``, and ``completed`` (ISO timestamp or '').
+
+    Every row carries the claim projection: the two raw MCP ``get_tasks``
+    columns ``claimant_run_id``/``heartbeat_at`` (``None`` when the row
+    predates them or the task is unclaimed) plus the computed ``stranded``
+    boolean from :func:`dashboard.data.tasks.task_is_stranded`.  They are on
+    BOTH the active and the terminal row shapes so the wire shape is uniform
+    (a terminal row is simply never stranded — the shared predicate gates on
+    ``status == 'in-progress'``).
+
+    ``stranded`` is deliberately independent of ``agent``: see the comment at
+    the ``agent`` assignment in :func:`_runtime_fields`.
 
     *rt* is the runtime-fields dict produced by :func:`_runtime_fields`
     (``agent``/``loops``/``attempts``/``lane``/``phase``/``lane_state``/
@@ -163,6 +187,11 @@ def _build_task_row(
     split/strip work twice. Omitting it (or passing ``None``, the actual
     no-provenance value) falls back to deriving it from metadata, which is
     safe because re-deriving a true ``None`` is idempotent.
+
+    *now* is the reference instant for the strand verdict, threaded from the
+    caller's single per-pass ``resolve_now`` (see ``_shape_one_project``) —
+    this function never reads the clock itself, so every row in one pass is
+    judged against the same instant.
     """
     metadata = task.get('metadata') or {}
     meta_files = list(metadata.get('files') or [])
@@ -193,6 +222,9 @@ def _build_task_row(
         'phase': rt.get('phase'),
         'lane_state': rt.get('lane_state'),
         'runtime_offline': rt.get('runtime_offline', False),
+        'claimant_run_id': task.get('claimant_run_id'),
+        'heartbeat_at': task.get('heartbeat_at'),
+        'stranded': task_is_stranded(task, now=now),
         'meta_files': meta_files,
         'train': train,
         'external_deps': external_deps,
@@ -238,6 +270,12 @@ def _runtime_fields(
             'runtime_offline': False,
         }
     return {
+        # ``agent`` is a WORKTREE-PRESENCE signal, not evidence of liveness: it
+        # is truthy whenever a ``.worktrees/<id>`` directory exists, including
+        # long after the agent that created it died. Reading it as "an agent is
+        # working on this" is exactly the confusion this projection removes —
+        # the liveness verdict is the row's independent ``stranded`` field,
+        # derived from the claim columns via ``tasks.task_is_stranded``.
         'agent': f'claude-task-{task_id}' if entry.has_worktree else None,
         'loops': entry.loops,
         'attempts': entry.attempts,
@@ -308,6 +346,9 @@ async def _shape_one_project(
     the task-tree ``offline`` return value above.
     """
     project = _project_label(project_root)
+    # Resolve the reference instant ONCE per build pass — never per row — so
+    # every row's ``started`` and ``stranded`` verdict share one instant.
+    effective_now = resolve_now(now)
     fetched = await fetch_tasks(client, config, project_root)
     if isinstance(fetched, dict) and fetched.get('offline'):
         return [], True, 0
@@ -335,10 +376,10 @@ async def _shape_one_project(
             continue
 
         task_id = task['id']
-        rt = _runtime_fields(runtime_index, is_runtime_offline, task_id, now=now)
+        rt = _runtime_fields(runtime_index, is_runtime_offline, task_id, now=effective_now)
 
         uid = _task_uid(project, task_id)
-        row = _build_task_row(project, task, task_id, rt, uid)
+        row = _build_task_row(project, task, task_id, rt, uid, now=effective_now)
         # active rows: started from the runtime entry; deps from task tree.
         row['started'] = rt['started']
         row['deps'] = _resolve_deps(task, by_id, project)
@@ -377,8 +418,8 @@ async def _shape_one_project(
             if beyond_cap:
                 exempted_count += 1
             uid = _task_uid(project, task_id)
-            rt = _runtime_fields(runtime_index, is_runtime_offline, task_id, now=now)
-            row = _build_task_row(project, task, task_id, rt, uid, prd=prd)
+            rt = _runtime_fields(runtime_index, is_runtime_offline, task_id, now=effective_now)
+            row = _build_task_row(project, task, task_id, rt, uid, prd=prd, now=effective_now)
             # terminal rows: no meaningful start time; deps only for live-PRD
             # members (the terminal-member exemption), else unsurfaced.
             row['started'] = 0
@@ -527,8 +568,13 @@ async def collect_done_counts(
 ) -> dict[str, int]:
     """Return a ``{project_label: done_count}`` map for all reachable projects.
 
-    Uses the compact ``fetch_statuses`` (the same source the burndown collector
-    uses) so the count agrees with the burndown snapshot.
+    Uses the compact ``fetch_statuses`` because only a per-status count is
+    needed here.  NOTE: this is no longer the burndown collector's source —
+    that switched to ``fetch_tasks`` (task 3543) because the compact map
+    carries no claimant columns and so cannot express the live/stranded
+    split.  The two agree on the ``done`` count (both ultimately read the same
+    task store), but they are separate reads at separate instants, so a task
+    completing between them can show a transient off-by-one.
 
     All projects are fetched concurrently to minimise latency.  Projects whose
     ``fetch_statuses`` returns an offline marker are silently omitted.
