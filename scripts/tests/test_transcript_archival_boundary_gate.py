@@ -49,11 +49,14 @@ sys.path wiring is what makes ``import gc_agent_transcripts`` and
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from datetime import date
 from pathlib import Path
 
+import gc_agent_transcripts as gct
+import pytest
 from legibility import config as legibility_config
 from legibility import inventory, sampling
 from shared.transcript_archive import archive_task_transcripts
@@ -66,10 +69,15 @@ DAY = 86_400
 NOW = 1_000_000_000.0
 
 
-def _touch(path: Path, mtime: float) -> None:
-    """Create *path* (and parents) as a small file with the given mtime."""
+def _touch(path: Path, mtime: float, content: bytes = b'x') -> None:
+    """Create *path* (and parents) with *content* and the given mtime.
+
+    The ``os.utime`` stamp is the load-bearing half for E8: α mirrors a SOURCE
+    transcript's mtime onto its archived copy, and that mirrored mtime is what
+    δ's ``scan_task_dirs`` reads back as the task dir's retention age.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(b'x')
+    path.write_bytes(content)
     os.utime(path, (mtime, mtime))
 
 
@@ -269,3 +277,190 @@ class TestE5MiningEnumeratesTheArchive:
         # The signal disappears on its own once the migration has run.
         residual.unlink()
         assert inventory.count_residual_gz(archive_root) == 0
+
+
+# ---------------------------------------------------------------------------
+# E8 — the retention GC prunes by cap, loudly; default caps are a no-op
+# ---------------------------------------------------------------------------
+
+# Five per-task archive dirs, NEWEST FIRST: GC_TASK_IDS[i] carries mtime
+# NOW - i*DAY, so [0] is the newest and [4] the oldest. All five sit far inside
+# the default 90-day age cap, so the age arm never fires and the count arm is
+# the only thing the cap row measures.
+GC_TASK_IDS = ('8100', '8101', '8102', '8103', '8104')
+GC_CAP = 2
+GC_KEPT_IDS = GC_TASK_IDS[:GC_CAP]
+GC_PRUNED_IDS = GC_TASK_IDS[GC_CAP:]
+
+GC_LOG_PREFIX = 'gc_agent_transcripts:'
+
+
+def _gc_transcript_bytes(task_id: str) -> bytes:
+    """Per-task transcript content, so "survived intact" is content-checkable."""
+    return (
+        f'{{"type":"user","cwd":"/home/leo/src/dark-factory/.worktrees/{task_id}",'
+        f'"message":{{"role":"user","content":"task {task_id}"}}}}\n'
+    ).encode()
+
+
+def _archive_five_real_task_dirs(tmp_path: Path) -> tuple[Path, dict[str, Path]]:
+    """Build a five-task archive by running the REAL archiver once per task.
+
+    Returns ``(archive_root, {task_id: archived_transcript})``.
+
+    Each source transcript is stamped to a distinct fixed epoch with
+    ``os.utime`` BEFORE archival, and α's :func:`_archive_one` mirrors that
+    mtime onto the published copy — which is precisely what δ's
+    :func:`gc_agent_transcripts.scan_task_dirs` reads back as the dir's
+    retention age. Hand-building ``<root>/<id>/enc/x.jsonl`` with a stamped
+    mtime (what ``test_gc_agent_transcripts.py`` does, correctly, for a δ-only
+    unit) would assert only that δ can read a shape the TEST invented; driving
+    α's writer is what makes E8 a cross-leaf composition and lets a drift
+    between the mirror and the scan actually fail this row.
+    """
+    project_root = tmp_path / 'fake-project-root'
+    archive_root = project_root / 'data' / 'orchestrator' / 'agent-transcripts'
+
+    archived: dict[str, Path] = {}
+    for index, task_id in enumerate(GC_TASK_IDS):
+        # Each task really does run in its own worktree, hence its own <enc>.
+        enc = inventory.encode_cwd(f'/home/leo/src/dark-factory/.worktrees/{task_id}')
+        sid = f'{task_id}0000-0000-4000-8000-abcdefabcdef'
+        config_dir = project_root / '.task' / f'claude-config-{task_id}'
+        src = config_dir / 'projects' / enc / f'{sid}.jsonl'
+        _touch(src, NOW - index * DAY, content=_gc_transcript_bytes(task_id))
+
+        assert archive_task_transcripts(
+            config_dir, task_id, sid, archive_root=archive_root
+        ) == 1
+        dest = archive_root / task_id / enc / f'{sid}.jsonl'
+        assert dest.exists()
+        archived[task_id] = dest
+
+    return archive_root, archived
+
+
+def _gc_log_messages(caplog) -> list[str]:
+    """Formatted INFO+ messages emitted by the GC's own logger."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == 'gc_agent_transcripts'
+    ]
+
+
+class TestE8RetentionGcPrunesByCap:
+    """E8 — δ's retention sweep run for real over an archive α actually wrote.
+
+    Both halves drive ``gc_agent_transcripts.main`` in-process (so ``caplog``
+    can see the LOUD lines that are half the contract) with an explicit
+    ``--now``, against a tmp archive root — the live, concurrently-written
+    ``data/orchestrator/agent-transcripts`` tree is never swept.
+    """
+
+    def test_alpha_mtime_mirror_is_what_delta_reads_as_retention_age(self, tmp_path):
+        """The cross-leaf seam E8 rests on, asserted rather than assumed.
+
+        If α ever stamps the archived copy with ``now`` instead of mirroring the
+        source mtime, every task dir would read to the GC as freshly active and
+        retention would silently stop expiring anything — this row is where that
+        drift surfaces.
+        """
+        archive_root, _archived = _archive_five_real_task_dirs(tmp_path)
+
+        scanned = dict(gct.scan_task_dirs(archive_root))
+
+        assert set(scanned) == {archive_root / task_id for task_id in GC_TASK_IDS}
+        for index, task_id in enumerate(GC_TASK_IDS):
+            assert scanned[archive_root / task_id] == pytest.approx(
+                NOW - index * DAY, abs=1
+            )
+
+    def test_count_cap_prunes_the_oldest_dirs_loudly(self, tmp_path, caplog, capsys):
+        """(a) CAP — ``--max-task-dirs 2`` over a real 5-task archive removes
+        the 3 oldest dirs, keeps the 2 newest INTACT, and says so both ways:
+        one greppable INFO line per removal plus the summary counts, and a
+        machine-readable JSON report on stdout."""
+        archive_root, archived = _archive_five_real_task_dirs(tmp_path)
+        caplog.set_level(logging.INFO, logger='gc_agent_transcripts')
+
+        exit_code = gct.main([
+            '--root', str(archive_root),
+            '--max-task-dirs', str(GC_CAP),
+            '--now', str(NOW),
+        ])
+
+        assert exit_code == 0
+
+        # The 2 newest survive INTACT — the dir is still there AND its archived
+        # transcript is still readable and byte-correct, not an emptied husk.
+        for task_id in GC_KEPT_IDS:
+            assert (archive_root / task_id).is_dir()
+            assert archived[task_id].read_bytes() == _gc_transcript_bytes(task_id)
+        # ...and the 3 oldest are gone from disk, not merely classified.
+        for task_id in GC_PRUNED_IDS:
+            assert not (archive_root / task_id).exists()
+
+        report = json.loads(capsys.readouterr().out)
+        assert report['scanned'] == 5
+        assert report['kept'] == 2
+        assert report['pruned'] == 3
+        assert report['removed'] == 3
+        assert report['failed'] == 0
+        assert report['check'] is False
+        # The age arm never fired: every drop is attributed to the count cap.
+        assert report['reason_counts'] == {'count': 3}
+        assert sorted(report['removed_paths']) == sorted(
+            str(archive_root / task_id) for task_id in GC_PRUNED_IDS
+        )
+
+        messages = _gc_log_messages(caplog)
+
+        # LOUD, per removal: prefix + the exact dir + the reason.
+        removal_lines = [m for m in messages if 'pruned task dir' in m]
+        assert len(removal_lines) == 3
+        for task_id in GC_PRUNED_IDS:
+            assert any(
+                m.startswith(GC_LOG_PREFIX)
+                and str(archive_root / task_id) in m
+                and 'reason=count' in m
+                for m in removal_lines
+            ), f'no removal line for {task_id} in {removal_lines!r}'
+
+        # ...and once for the sweep as a whole.
+        summary_lines = [m for m in messages if 'sweep complete' in m]
+        assert len(summary_lines) == 1
+        assert summary_lines[0].startswith(GC_LOG_PREFIX)
+        assert 'scanned=5 kept=2 pruned=3 removed=3 failed=0' in summary_lines[0]
+
+    def test_default_caps_are_a_no_op(self, tmp_path, caplog, capsys):
+        """(b) DEFAULT CAPS — the same real archive under the shipped defaults
+        (90 days / 5000 dirs) is untouched: nothing removed, nothing even
+        classified as prunable, and not one prune line emitted."""
+        archive_root, archived = _archive_five_real_task_dirs(tmp_path)
+        caplog.set_level(logging.INFO, logger='gc_agent_transcripts')
+
+        exit_code = gct.main(['--root', str(archive_root), '--now', str(NOW)])
+
+        assert exit_code == 0
+
+        for task_id in GC_TASK_IDS:
+            assert (archive_root / task_id).is_dir()
+            assert archived[task_id].read_bytes() == _gc_transcript_bytes(task_id)
+
+        report = json.loads(capsys.readouterr().out)
+        # The defaults really are the shipped ones, not a fixture's invention.
+        assert report['caps'] == {
+            'max_age_days': gct.DEFAULT_MAX_AGE_DAYS,
+            'max_task_dirs': gct.DEFAULT_MAX_TASK_DIRS,
+        }
+        assert (gct.DEFAULT_MAX_AGE_DAYS, gct.DEFAULT_MAX_TASK_DIRS) == (90, 5000)
+        assert report['scanned'] == 5
+        assert report['kept'] == 5
+        assert report['pruned'] == 0
+        assert report['removed'] == 0
+        assert report['reason_counts'] == {}
+
+        messages = _gc_log_messages(caplog)
+        assert [m for m in messages if 'task dir' in m] == []
+        assert any('sweep complete' in m for m in messages)
