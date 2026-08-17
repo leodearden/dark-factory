@@ -14224,3 +14224,147 @@ class TestRenderLiveWorkflowSectionHoistsWorktreeList:
 
         assert 'Live-Workflow Signals' in result, 'a broken hoist dropped the section'
         assert counts['worktree_list'] == 3, 'each task must fall back to its own probe'
+
+
+class TestRenderLiveWorkflowSectionCapsFanOut:
+    """The detector fan-out is bounded by `MAX_ACTIVE_TASKS_RENDERED` (task 3778).
+
+    The renderer is handed the FULL `filtered.active_tasks` list, but the
+    Active Task Tree both call sites render is capped at
+    `task_filter.MAX_ACTIVE_TASKS_RENDERED` (= 50) via the prefix slice
+    `tree.active_tasks[:max_tasks]` (task_filter.py:1614). So on a large
+    project ~90% of the per-task git probing was computed and then discarded,
+    and the section could name a task the tree had already omitted.
+
+    Capping in the RENDERER rather than at the two call sites means
+    task_knowledge_sync and memory_consolidator cannot drift apart. The cap
+    must use the SAME deterministic prefix slice as the tree, so the section is
+    always a subset of what the tree shows.
+
+    Per the no-silent-caps principle (mirroring
+    `reconciliation.done_task_audit_render_capped`, task_knowledge_sync.py:3618)
+    the drop must be LOUD: a WARNING naming total / rendered / omitted.
+    """
+
+    _NOW = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+    _LOGGER = 'fused_memory.reconciliation.stages.task_knowledge_sync'
+    _CAP_EVENT = 'reconciliation.live_workflow_render_capped'
+
+    @staticmethod
+    def _tasks(n: int) -> list[dict]:
+        return [{'id': str(i), 'status': 'pending'} for i in range(n)]
+
+    @staticmethod
+    def _recording_detector(probed: list[str]):
+        """A `detect_live_workflow` fake recording every task_id it is asked about.
+
+        Reports every task live, so a cap can only come from the renderer
+        declining to probe — never from a task being filtered out downstream.
+        """
+        from fused_memory.services.live_workflow_detector import WorkflowLiveness
+
+        def fake(task_id, project_root, **kwargs):
+            probed.append(str(task_id))
+            return WorkflowLiveness(
+                is_live=True,
+                worktree_registered=True,
+                recent_commit=False,
+                orchestrator_live=False,
+                branch=f'task/{task_id}',
+                last_commit_at=None,
+            )
+
+        return fake
+
+    def _render(self, tasks, monkeypatch):
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _render_live_workflow_section,
+        )
+
+        probed: list[str] = []
+        monkeypatch.setattr(
+            tks_module, 'detect_live_workflow', self._recording_detector(probed)
+        )
+        # Neutralise the (already-tested) per-render hoists so this class
+        # measures only the fan-out, with no real subprocess.
+        monkeypatch.setattr(tks_module, 'worktree_index_for', lambda _pr: {})
+        result = _render_live_workflow_section(
+            tasks=tasks, project_root=ProjectRoot('/p'), now=self._NOW,
+        )
+        return result, probed
+
+    # ----- cases -----
+
+    def test_probes_only_the_first_max_active_tasks_rendered(self, monkeypatch):
+        """(a) 60 tasks in => exactly the first 50 probed, none beyond.
+
+        The prefix slice must match `render_active_section`'s, so the section
+        can never name a task the Active Task Tree omitted.
+        """
+        from fused_memory.reconciliation.task_filter import MAX_ACTIVE_TASKS_RENDERED
+
+        tasks = self._tasks(60)
+        result, probed = self._render(tasks, monkeypatch)
+
+        assert probed == [str(i) for i in range(MAX_ACTIVE_TASKS_RENDERED)], (
+            f'expected the first {MAX_ACTIVE_TASKS_RENDERED} task ids probed in '
+            f'order; got {len(probed)} probes ({probed[:3]}...{probed[-3:]})'
+        )
+        # ...and nothing past the cap leaked into the rendered section.
+        assert 'task/50' not in result
+        assert 'task/59' not in result
+        assert 'task/49' in result
+
+    def test_overflow_is_logged_loudly(self, monkeypatch, caplog):
+        """(b) No silent truncation: a WARNING names total, rendered, omitted."""
+        from fused_memory.reconciliation.task_filter import MAX_ACTIVE_TASKS_RENDERED
+
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            self._render(self._tasks(60), monkeypatch)
+
+        capped = [r for r in caplog.records if self._CAP_EVENT in r.getMessage()]
+        assert capped, (
+            f'expected a {self._CAP_EVENT} WARNING when the fan-out is clipped; '
+            f'got {[r.getMessage() for r in caplog.records]}'
+        )
+        record = capped[0]
+        assert record.levelno == logging.WARNING
+        assert getattr(record, 'total_active', None) == 60
+        assert getattr(record, 'rendered', None) == MAX_ACTIVE_TASKS_RENDERED
+        assert getattr(record, 'omitted', None) == 60 - MAX_ACTIVE_TASKS_RENDERED
+
+    @pytest.mark.parametrize('n_tasks', [1, 7, 50])
+    def test_at_or_below_the_cap_probes_everything_and_stays_quiet(
+        self, n_tasks, monkeypatch, caplog
+    ):
+        """(c) The steady state must not raise a false alarm."""
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            _result, probed = self._render(self._tasks(n_tasks), monkeypatch)
+
+        assert probed == [str(i) for i in range(n_tasks)], (
+            f'{n_tasks} tasks is at/below the cap — all of them must be probed'
+        )
+        capped = [r for r in caplog.records if self._CAP_EVENT in r.getMessage()]
+        assert not capped, f'false overflow alarm at n={n_tasks}: {capped}'
+
+    def test_cap_follows_the_constant_not_a_second_literal(self, monkeypatch, caplog):
+        """(d) The bound is the imported constant, so it cannot drift from the tree.
+
+        Monkeypatching `MAX_ACTIVE_TASKS_RENDERED` in the renderer's namespace
+        must move the cap; a hard-coded `50` in the renderer reads RED here.
+        """
+        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+
+        monkeypatch.setattr(tks_module, 'MAX_ACTIVE_TASKS_RENDERED', 5)
+
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            _result, probed = self._render(self._tasks(12), monkeypatch)
+
+        assert probed == [str(i) for i in range(5)], (
+            f'cap did not follow the constant — expected 5 probes, got {len(probed)}'
+        )
+        capped = [r for r in caplog.records if self._CAP_EVENT in r.getMessage()]
+        assert capped, 'overflow against the patched cap must still be reported'
+        assert getattr(capped[0], 'rendered', None) == 5
+        assert getattr(capped[0], 'omitted', None) == 7
