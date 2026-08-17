@@ -1188,6 +1188,117 @@ def test_scripts_diff_is_type_gated(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+def test_type_gates_resolve_pyright_without_npx() -> None:
+    """Both non-member type gates must resolve pyright through uv, never npx.
+
+    Task 4358, mirroring task 3842's switch on the sibling. NOT a style rule —
+    the failure it prevents was MEASURED, twice, on the GREEN path:
+
+    esc-3473-2 recorded a bare ``npx pyright`` re-resolving through the shared,
+    mutable, concurrently-written npm cache under ``$HOME`` on EVERY invocation,
+    and once turning a clean 0-error type leg RED on a transient npm-cache write
+    failure (npm could not write ``~/.npm/_logs``) with no real type errors in
+    the tree. Because ``verify.run_full_verification`` asyncio-gathers over ALL
+    ``module_configs.values()`` and the repo root sets
+    ``merge_verify_breadth: "full"``, that is a fleet-wide false-red blocking
+    every merge, review checkpoint and main-tip sweep — on branches with no
+    defect. Task 3842 fixed ``tests/scripts/``; this task fixed ``scripts/``,
+    which was the last holdout among the nine discovered module configs.
+
+    (b) IS WHY THIS IS NOT JUST A BAN. Satisfying (a) by dropping to a bare
+    ``pyright scripts/`` would resolve whatever ``pyright`` happens to sit on
+    PATH — or none at all, since pyright is not on PATH at the worktree root,
+    only inside a member venv (``verify.py``'s ``_FALLBACK_UV_PROJECT =
+    'shared'`` encodes the same pairing). That trades a flaky red for a
+    command-not-found red. The contract is the uv-resolved form specifically.
+
+    Scoped to the two NON-WORKSPACE-MEMBER configs deliberately. They are the
+    only two that were ever npx-fronted and the only realistic regression
+    surface; the seven workspace members have always been
+    ``uv run --project MEMBER ... pyright src/ tests/`` because they need their
+    own member environment anyway. Asserting over all nine from inside a
+    scripts-module-specific guard would put a repo-wide invariant in a file
+    whose ownership and lock scope are module-local — the confusion
+    ``tests/scripts/test_module_verify_budgets.py``'s own PLACEMENT docstring
+    warns about. That file is the established home for the promoted form, and
+    it was GENERALISED FROM these per-module guards after both existed rather
+    than bolted on ahead of them.
+    """
+    discovered = _discovered()
+    with open(REPO_ROOT / 'pyproject.toml', 'rb') as fh:
+        members = tomllib.load(fh)['tool']['uv']['workspace']['members']
+
+    for prefix in (MODULE_PREFIX, SIBLING_PREFIX):
+        mc = discovered.get(prefix)
+        assert mc is not None, (
+            f'{prefix}/orchestrator.yaml is no longer discovered by '
+            '_discover_module_configs, so its type gate cannot be checked '
+            '(task 4358)'
+        )
+        cmd = mc.type_check_command
+        assert cmd, (
+            f'{prefix}/orchestrator.yaml declares no type_check_command, so '
+            f'{_VACUOUS_PASS} — the invocation-style contract below is moot '
+            'until the gate exists at all (tasks 3456 / 3350)'
+        )
+
+        tokens = shlex.split(_segment(cmd, _PYRIGHT))
+        anchor_at = tokens.index(_PYRIGHT)
+
+        # (a) EXACT-TOKEN, not substring: `npx` must not appear anywhere in the
+        # segment. RED for `scripts` before this task, which declared
+        # `npx pyright scripts/`; `tests/scripts` has satisfied it since 3842.
+        assert 'npx' not in tokens, (
+            f'{prefix}/orchestrator.yaml declares type_check_command={cmd!r}, '
+            'which fronts pyright with npx (task 4358). esc-3473-2 measured '
+            'bare `npx pyright` re-resolving through the shared, mutable, '
+            'concurrently-written npm cache under $HOME on every invocation, '
+            'and once turning a clean 0-error type leg RED on a transient '
+            'npm-cache write failure (npm could not write ~/.npm/_logs) with '
+            'no real type errors. verify.run_full_verification gathers over '
+            'ALL module_configs and the repo root sets merge_verify_breadth: '
+            'full, so that is a fleet-wide false-red on the green path, not a '
+            'local flake. Resolve pyright through uv instead: '
+            f'`uv run --project <member> pyright {prefix}/`'
+        )
+
+        # (b) POSITIVELY the uv-resolved form, so (a) cannot be satisfied by
+        # dropping to a bare `pyright <dir>` that resolves off PATH or nowhere.
+        assert tokens[:2] == ['uv', 'run'], (
+            f'{prefix}/orchestrator.yaml declares type_check_command={cmd!r}, '
+            f'whose pyright segment does not begin `uv run` (task 4358). '
+            'Merely removing npx is not the contract: pyright is not on PATH '
+            'at the worktree root, only inside a member venv, so a bare '
+            f'`pyright {prefix}/` trades a flaky red for a command-not-found '
+            "red. verify.py's _FALLBACK_UV_PROJECT = 'shared' encodes the same "
+            'environment pairing'
+        )
+        assert '--project' in tokens[:anchor_at], (
+            f'{prefix}/orchestrator.yaml declares type_check_command={cmd!r}, '
+            'which carries no PRE-anchor `--project` selecting the environment '
+            'pyright is resolved from (task 4358). A post-anchor --project is a '
+            'different thing entirely — it redirects pyright at another CONFIG '
+            'file — and is rejected by test_scripts_diff_is_type_gated '
+            'assertion (d); see the _NARROWING_FLAGS comment on why the two '
+            'are distinguished by position'
+        )
+        member = tokens[tokens.index('--project') + 1]
+        assert member in members, (
+            f'{prefix}/orchestrator.yaml declares type_check_command={cmd!r}, '
+            f'whose `uv run --project {member}` names {member!r}, which is not '
+            'among the declared [tool.uv.workspace].members '
+            f'{sorted(members)!r} in the root pyproject.toml (task 4358). uv '
+            'resolves a non-member project name to nothing usable, so the gate '
+            'would fail to start rather than run — the same reports-nothing '
+            'outcome a missing command produces, reached a different way'
+        )
+        assert tokens.index('--project') < anchor_at, (
+            f'{prefix}/orchestrator.yaml declares type_check_command={cmd!r}, '
+            "whose `--project` follows the `pyright` anchor — that is PYRIGHT's "
+            'config-file redirect, not uv\'s environment selector (task 4358)'
+        )
+
+
 def test_scripts_full_suite_pytest_covers_scripts_tests(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
