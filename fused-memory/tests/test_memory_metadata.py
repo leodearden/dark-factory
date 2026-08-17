@@ -12,7 +12,6 @@ import re
 from pathlib import Path
 
 import pytest
-
 from fused_memory.config.schema import _default_topic_guard_clusters
 from fused_memory.memory_metadata import (
     KIND_REGISTRY,
@@ -48,7 +47,14 @@ from fused_memory.memory_metadata import (
 #: ``KIND_REGISTRY`` IS materially stale against today's corpus.  That is
 #: not lost — it is handed to leaf β's owner as a reviewed re-derivation
 #: (with the removal policy the −14 need, and the question of whether a
-#: live-artifact drift check should exist at all).  It is not urgent:
+#: live-artifact drift check should exist at all), filed as ticket
+#: **tkt_0RSH6HFNT4YWRX20663ZGJ9YGZ** carrying the measured deltas and all
+#: three open decisions.  Naming the ticket is the point: without it this
+#: note records a known-stale registry with no traceable owner, and no test
+#: will ever notice further drift now that the tripwire is gone.  (A ticket,
+#: not a task id — the curator files asynchronously, so the resulting task
+#: is found by searching that ticket, not by a number predicted here.)
+#: It is not urgent:
 #: ``memory_metadata.enforce_kind_registry`` ships default **False** and is
 #: deliberately kept off (PRD §10 open question 1 — 242 of 329 measured
 #: values are singletons), so a stale registry rejects no live write.

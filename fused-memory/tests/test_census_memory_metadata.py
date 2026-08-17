@@ -18,7 +18,6 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
 from fused_memory.models.enums import GRAPHITI_PRIMARY, MEM0_PRIMARY, MemoryCategory
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'census_memory_metadata.py'
@@ -2601,8 +2600,11 @@ class TestRenderMarkdownDisclosure:
 
     def test_incomplete_coverage_renders_a_warning_naming_the_deltas(self):
         md = _mod.render_markdown(_rich_report(complete=False))
-        lowered = md.lower()
-        assert 'incomplete' in lowered or 'warning' in lowered
+        # The banner itself, not 'incomplete' OR 'warning' anywhere: the
+        # disjunction could be satisfied by either word appearing in unrelated
+        # prose, and the complete-coverage twin below already pins its
+        # absence by this exact spelling.
+        assert '**WARNING — COVERAGE INCOMPLETE.**' in md
         # The named delta itself, not just a flag.
         assert 'category_shortfall' in md or '-3' in md
         assert OBS in md
@@ -2617,8 +2619,13 @@ class TestRenderMarkdownDisclosure:
         cov = {'reify': _coverage('fused_reify', 100, {OBS: (20, 20)})}
         md = _mod.render_markdown(_mod.build_report(cells, cov, top_n=50))
         assert 'uncovered' in md.lower()
-        assert '80' in md
-        assert 'carry a category outside the censused set' in md
+        # Anchored to the line that REPORTS the residue: a bare `'80' in md`
+        # matches any of the hundreds of numbers in a ~200 KiB document.
+        residue = next(
+            line for line in md.split('\n')
+            if 'carry a category outside the censused set' in line
+        )
+        assert '80' in residue, residue
 
 
 def _both_default_projects_report(*, top_n: int = 50, page_size: int = 1000) -> dict:
@@ -2715,13 +2722,16 @@ class TestRegenCommand:
         cells = {'dark_factory': {OBS: _census([])}}
         cov = {'dark_factory': _coverage('fused_dark_factory', 101, {OBS: (100, 101, 101)})}
         md = _mod.render_markdown(_mod.build_report(cells, cov, top_n=50))
-        assert '**WARNING — COVERAGE INCOMPLETE**' not in md
+        assert '**WARNING — COVERAGE INCOMPLETE.**' not in md
         assert 'Named shortfalls' not in md
         assert 'carry a category outside the censused set' not in md
         # ...but the movement is still visible, with both intervals named.
         assert '### Corpus churn during the scan' in md
-        assert 'collection total' in md.lower()
-        assert '100' in md and '101' in md
+        churn = _md_section(md, '### Corpus churn during the scan')
+        assert 'collection total' in churn.lower()
+        # Both interval endpoints inside the CHURN section -- unanchored,
+        # '100'/'101' matched the record counts rendered elsewhere.
+        assert '100' in churn and '101' in churn, churn
 
     def test_churn_render_tolerates_a_collection_level_entry(self):
         # A 'collection_total_moved' entry has no 'category'/'expected'/
@@ -2860,8 +2870,12 @@ class TestRenderMarkdownTopicCoverage:
 
     def test_registry_gauge_renders_with_its_actionable_worklist(self):
         md = _mod.render_markdown(_coverage_md_report())
-        assert 'Registry' in md
-        assert '**4**' in md  # registry_topics_total
+        registry = _md_section(
+            md, '### Registry coverage — the accountable target', stop='### ',
+        )
+        # registry_topics_total, inside the registry section. Unanchored,
+        # '**4**' matched any bolded 4 anywhere in the document.
+        assert '**4**' in registry, registry
         # The worklist: the exact set 3201's retro sweep would stamp.
         assert '| `dark_factory` | `gamma` |' in md
         assert '| `dark_factory` | `delta` |' in md
@@ -2881,9 +2895,25 @@ class TestRenderMarkdownEnforcePreconditions:
 
     def test_all_three_citations_render(self):
         md = _mod.render_markdown(_coverage_md_report())
-        assert 'legacy_topic_spelling_remains' in md
-        assert '3202' in md
-        assert '3626' in md
+        # Default stop='#': the citation block ONLY, cut at the very next
+        # heading of any level -- the tightest slice available. Unanchored,
+        # a task id matched anywhere in a ~200 KiB document, so the ruling's
+        # requirement was not guarded where it applies.
+        block = _md_section(
+            md, '#### What still blocks flipping `memory_metadata.enforce`',
+        )
+        # Driven off the SINGLE-HOMED constant rather than three literals, so
+        # what this catches is the RENDERER dropping an entry the report still
+        # claims to cite -- the regression Leo's 2026-08-12 ruling is actually
+        # exposed to. WHICH three ids are cited is pinned on the JSON side by
+        # test_the_three_cited_ids and is deliberately not restated here.
+        cited = [entry['id'] for entry in _mod.ENFORCE_FLIP_PRECONDITIONS]
+        assert len(cited) == 3, cited
+        for precondition_id in cited:
+            # The rendered ROW, not the bare id: the block's own intro prose
+            # reads "task 3626 decides", so `'3626' in block` survived the
+            # renderer dropping 3626's entry entirely. Verified by mutation.
+            assert f'- **`{precondition_id}`**' in block, (precondition_id, block)
 
     # DELIBERATELY NOT TESTED HERE (review of 2026-08-16): the rendered
     # WORDING, the citation ORDER relative to the count/flag, and the
@@ -3706,7 +3736,15 @@ class TestCliHistoryFlags:
         await _mod._run(_args(tmp_path, history_out=history_out))
         await _mod._run(_args(tmp_path, history_out=history_out, no_history=True))
         written = json.loads((tmp_path / 'census.json').read_text())
-        assert written['coverage_trend']['baseline'] is not None
+
+        # The baseline must be the PRIOR RUN's stamp, not merely non-None:
+        # the behaviour under test is that the ad-hoc run trends against the
+        # recorded series it declined to extend. `is not None` also passes on
+        # a wrong stamp or an empty-ish placeholder, which is the one way
+        # this could plausibly break.
+        recorded = _mod.load_coverage_history(history_out)['runs']
+        assert len(recorded) == 1, 'the --no-history run must not have appended'
+        assert written['coverage_trend']['baseline'] == recorded[-1]['stamp']
 
     @pytest.mark.asyncio
     async def test_a_malformed_history_fails_the_run_loudly(self, tmp_path, monkeypatch):
