@@ -682,12 +682,61 @@ ROW_WATCHDOG_ENV: dict[str, str] = {
 #: is already failing.
 ROW_TREE_KILL_CEILING_SECS: float = ROW_WATCHDOG_WINDOW_SECS + 15.0  # 30.0
 
-#: Ceiling for the two DISCOVERY waits every row runs BEFORE the watchdog is
-#: even armed -- wait_for_pgid_file and wait_subtree_live, both of which
-#: default to timeout=20.0.  Rows 1/2/3 pass this explicitly at their call
-#: sites below (instead of relying on the bare default) so this value and
-#: those defaults cannot silently drift apart.
-ROW_DISCOVERY_CEILING_SECS: float = 20.0
+#: Base ceiling for the two DISCOVERY waits every row runs BEFORE the
+#: watchdog is even armed -- wait_for_pgid_file and wait_subtree_live.  Rows
+#: 1/2/3 pass the resolved ceiling explicitly at their call sites below
+#: (instead of relying on the bare default) so this value and those defaults
+#: cannot silently drift apart.
+ROW_DISCOVERY_CEILING_BASE_SECS: float = 20.0
+
+#: Task 4014.  Top of the measured per-core dilation envelope, NOT a guess.
+#: Every dilation figure this repo has actually measured is expressed in
+#: loadavg-per-core terms and lands in the 3-6x band: tests/warm-lane's
+#: README records 3-6x at loadavg 124 on 32 cores plus a 6.2x module figure;
+#: this module's own banner records producer gaps at loadavg 113-178; and the
+#: 3689 steward measured THIS test pair stretching 10s -> 51-59s (~5-6x).
+#: Scaling keys on loadavg-per-core rather than PSI because this suite's
+#: autouse _hermetic_psi_reader fixture injects a stub PSI reader suite-wide,
+#: so /proc/pressure readings are deliberately untrustworthy here.
+_DISCOVERY_CEILING_MAX_SCALE: float = 6.0
+
+#: The bound the import-time @pytest.mark.timeout below is derived from.  No
+#: value row_discovery_ceiling_secs() can return may exceed it -- see
+#: test_row_per_test_timeout_still_covers_the_max_discovery_ceiling.
+ROW_DISCOVERY_CEILING_MAX_SECS: float = (
+    ROW_DISCOVERY_CEILING_BASE_SECS * _DISCOVERY_CEILING_MAX_SCALE
+)  # 120.0
+
+
+def row_discovery_ceiling_secs(*, _loadavg=None, _cpu_count=None) -> float:
+    """Resolve the discovery ceiling for a wait that is starting NOW.
+
+    A WEDGE DETECTOR, not a speed assertion: the rows assert THAT a tree was
+    discovered, never how fast, so on the success path a wider ceiling costs
+    ZERO wall clock and is paid only when the test is already failing.  That
+    asymmetry is what makes scaling all the way to
+    :data:`_DISCOVERY_CEILING_MAX_SCALE` safe for suite runtime -- an idle
+    box still pays exactly :data:`ROW_DISCOVERY_CEILING_BASE_SECS`.
+
+    Sampled per CALL rather than at import so a row that starts mid-storm
+    sees the storm, and clamped at both ends: never tighter than base (a
+    quiet box must not get a stricter deadline than it has always had) and
+    never wider than :data:`ROW_DISCOVERY_CEILING_MAX_SECS` (the bound the
+    import-time pytest timeout is derived from).
+
+    *_loadavg* / *_cpu_count* are private injectable seams for deterministic
+    coverage, defaulting to the real readers.
+    """
+    loadavg = os.getloadavg()[0] if _loadavg is None else _loadavg
+    cpu_count = (os.cpu_count() or 1) if _cpu_count is None else _cpu_count
+    scaled = ROW_DISCOVERY_CEILING_BASE_SECS * (loadavg / max(cpu_count, 1))
+    return min(ROW_DISCOVERY_CEILING_MAX_SECS, max(ROW_DISCOVERY_CEILING_BASE_SECS, scaled))
+
+
+#: TRANSITIONAL: the pre-4014 flat name, still read by the worst-case
+#: derivation and the row call sites below until both are rewired onto the
+#: resolved ceiling.  Deleted then; do not add new readers.
+ROW_DISCOVERY_CEILING_SECS: float = ROW_DISCOVERY_CEILING_BASE_SECS
 
 #: Worst-case BOUNDED work in a row on the failure path: both discovery
 #: waits, then one full watchdog window, then both ceiling-bounded
