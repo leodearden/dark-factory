@@ -22,11 +22,19 @@ import pytest
 
 from orchestrator.flake_ledger import (
     UNKNOWN_TEST_ID,
+    DebtRow,
     FlakeCallSite,
     FlakeOccurrenceRow,
     FlakeVerdict,
 )
-from orchestrator.flake_report import _parse_stamp, compute_gate_blind, format_age
+from orchestrator.flake_report import (
+    _parse_stamp,
+    compute_gate_blind,
+    compute_non_convergence,
+    format_age,
+)
+
+_NOW = datetime(2026, 8, 10, 12, 0, 0, tzinfo=UTC)
 
 
 def _occ(
@@ -51,6 +59,31 @@ def _occ(
         task_id=None,
         psi_cpu_some10=psi,
         detail='{}',
+    )
+
+
+def _debt(
+    *,
+    test_id: str = 'tests/test_a.py::test_one',
+    opened_at: str = '2026-08-09T12:00:00+00:00',
+    resolved_at: str | None = None,
+    owner_task_id: str | None = '3552',
+    open_count: int = 1,
+    prior_resolved_at: str | None = None,
+    prior_resolving_commit: str | None = None,
+    last_occurrence_at: str = '2026-08-09T12:00:00+00:00',
+) -> DebtRow:
+    """A hand-built debt row — the pure counter tests need no DB at all."""
+    return DebtRow(
+        test_id=test_id,
+        project_id='dark_factory',
+        opened_at=opened_at,
+        resolved_at=resolved_at,
+        owner_task_id=owner_task_id,
+        open_count=open_count,
+        prior_resolved_at=prior_resolved_at,
+        prior_resolving_commit=prior_resolving_commit,
+        last_occurrence_at=last_occurrence_at,
     )
 
 
@@ -177,3 +210,55 @@ class TestGateBlindCounter:
         assert counter.sufficient is True
         assert counter.rate == pytest.approx(0.5)
         assert counter.exceeds_threshold is True
+
+
+class TestNonConvergenceCounter:
+    """§5.6 class 2 — a de-flake cycle that is not converging."""
+
+    def test_recurrence_is_open_count_over_one(self):
+        rows = [
+            _debt(test_id='a', open_count=3),
+            _debt(test_id='b', open_count=1),
+        ]
+        counter = compute_non_convergence(rows, _NOW)
+        assert counter.open_tests == 2
+        assert counter.recurrent_tests == 1
+
+    def test_over_age_uses_the_injected_now(self):
+        rows = [
+            _debt(test_id='old', opened_at='2026-08-06T12:00:00+00:00'),  # 4d before now
+            _debt(test_id='new', opened_at='2026-08-08T12:00:00+00:00'),  # 2d before now
+        ]
+        assert compute_non_convergence(rows, _NOW).over_age_tests == 1
+
+    def test_exactly_at_the_threshold_is_not_over_age(self):
+        # Strictly greater: a row opened exactly age_days ago has not yet EXCEEDED the
+        # bound, so pinning the boundary keeps the backstop from firing a day early.
+        rows = [_debt(test_id='boundary', opened_at='2026-08-07T12:00:00+00:00')]  # exactly 3d
+        assert compute_non_convergence(rows, _NOW).over_age_tests == 0
+
+    def test_missing_owner_counts_as_an_invariant_breach(self):
+        rows = [
+            _debt(test_id='unowned', owner_task_id=None),
+            _debt(test_id='owned', owner_task_id='3552'),
+        ]
+        assert compute_non_convergence(rows, _NOW).unowned_tests == 1
+
+    def test_malformed_opened_at_is_counted_and_never_treated_as_age_zero(self):
+        rows = [_debt(test_id='bad', opened_at='not-a-date')]
+        counter = compute_non_convergence(rows, _NOW)
+        assert counter.unparseable_opened_at == 1
+        # Never silently age-zero: that would hide a stale row from the backstop.
+        assert counter.over_age_tests == 0
+
+    def test_oldest_age_reflects_the_oldest_parseable_row(self):
+        rows = [
+            _debt(test_id='bad', opened_at='not-a-date'),
+            _debt(test_id='old', opened_at='2026-08-06T12:00:00+00:00'),
+            _debt(test_id='new', opened_at='2026-08-09T12:00:00+00:00'),
+        ]
+        assert compute_non_convergence(rows, _NOW).oldest_age == timedelta(days=4)
+
+    def test_oldest_age_is_none_when_nothing_parses(self):
+        rows = [_debt(test_id='bad', opened_at='not-a-date')]
+        assert compute_non_convergence(rows, _NOW).oldest_age is None
