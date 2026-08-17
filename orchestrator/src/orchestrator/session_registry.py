@@ -3258,7 +3258,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
     lease_claim_p = sub.add_parser('lease-claim', help='claim a single-owner-per-role lease (T7)')
     lease_claim_p.add_argument('--name', required=True, help='lease name, see build_lease_name')
-    lease_claim_p.add_argument('--slug', required=True, help="this claimant's own session_slug")
+    lease_claim_p.add_argument(
+        '--slug',
+        default=None,
+        help="this claimant's own session_slug; defaults to "
+        'default_lease_slug(--name) (`<name>-$CLAUDE_PID`). Only pass this as '
+        'an explicit operator override -- the derived value is what every '
+        'later lease-heartbeat/lease-release re-derives and matches against',
+    )
     lease_claim_p.add_argument(
         '--pid',
         type=int,
@@ -3350,6 +3357,16 @@ def main(argv: list[str] | None = None) -> int:
     """
     parser = _build_parser()
     args = parser.parse_args(argv)
+
+    # ONE derivation point for the lease slug, shared by all three lease verbs
+    # (task 4248). It lives HERE, in main(), and not inside _run_lease_claim /
+    # _run_lease_mutation, because all three must derive a BYTE-IDENTICAL slug
+    # or the whole scheme fails -- a claim the holder's own later heartbeat
+    # cannot match is precisely the drift this change removes. One shared point
+    # makes that structural instead of a three-way convention nobody enforces.
+    # An explicit --slug always wins: it stays the operator's override.
+    if args.verb in ('lease-claim', 'lease-heartbeat', 'lease-release'):
+        args.slug = args.slug or default_lease_slug(args.name)
 
     try:
         if args.verb == 'launching':
