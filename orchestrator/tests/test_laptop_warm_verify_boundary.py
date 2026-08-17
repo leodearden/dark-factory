@@ -832,6 +832,50 @@ def test_wait_subtree_live_gates_the_proc_walk_on_a_cheap_probe():
     )
 
 
+def test_wait_subtree_live_skips_a_vanished_transient_and_returns_the_durable_set():
+    """A transient child that exits between probe and walk is skipped, not returned.
+
+    The first child the CLI forks for a not-yet-materialised worktree is a
+    SHORT-LIVED ``git`` subprocess (``git worktree add`` / ``git reset`` /
+    ``git clean`` inside ``acquire_host_verify_worktree``), not the eventual
+    build shell.  Scripted here deterministically: the probe sees pid 111 on
+    tick 1, nothing on ticks 2-3, then the durable 300s sleeper (222) from
+    tick 4; the paired walk comes back EMPTY on its first call because 111
+    had already exited by the time the rescan ran.
+
+    The helper must keep polling rather than hand back that empty set.  Two
+    reasons: it makes the return contract "a NON-EMPTY descendant set"
+    total, and it biases what the rows observe toward the durable sleeper --
+    a transient that self-exits could otherwise let the ``wait_subtree_gone``
+    assertion each row makes next pass without the watchdog having killed
+    anything.
+    """
+    probe_calls = [0]
+    ppid_map_calls = [0]
+
+    def fake_probe(_pid):
+        probe_calls[0] += 1
+        if probe_calls[0] == 1:
+            return {111}  # transient `git worktree add`
+        if probe_calls[0] <= 3:
+            return set()  # transient has exited; sleeper not forked yet
+        return {222}  # the durable 300s sleeper
+
+    def fake_ppid_map():
+        ppid_map_calls[0] += 1
+        # First walk races the transient's exit and sees nothing.
+        return {} if ppid_map_calls[0] == 1 else {222: 1234}
+
+    result = wait_subtree_live(
+        1234, interval=0, _probe_children=fake_probe, _ppid_map=fake_ppid_map,
+    )
+
+    assert result == {222}, (
+        f'expected the durable sleeper {{222}} -- never the empty set a walk '
+        f'racing the transient git child returns; got {result}'
+    )
+
+
 # ---------------------------------------------------------------------------
 # Task 3369 -- in-child stopwatch for the flock GATE, replacing task 2921/2941's
 # outer wall-clock subtraction in test_flock_wait_env_override_speeds_up_
