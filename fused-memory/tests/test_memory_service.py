@@ -6106,6 +6106,42 @@ class TestSearchGraphitiIncludePlanned:
             "Planned edges must have metadata['planned'] = True when include_planned=True"
         )
 
+    # task 3658: the RRF stamping must not clobber the planned marker, and a
+    # planned edge that survives include_planned=True DOES consume a rank.
+    @pytest.mark.asyncio
+    async def test_planned_marker_survives_alongside_rrf_fields(
+        self, service_with_registry
+    ):
+        """metadata['planned'] coexists with store_rank/store_score stamping."""
+        from _fm_helpers import MockEdge
+
+        from fused_memory.models.scope import Scope
+        from fused_memory.services.memory_service import RRF_K
+
+        ep1 = 'plan-ep-1'
+        service_with_registry.planned_episode_registry.get_planned_uuids = AsyncMock(
+            return_value={ep1}
+        )
+        service_with_registry.graphiti.search = AsyncMock(return_value=[
+            MockEdge(fact='Real fact', uuid='edge-real', episodes=['real-ep']),
+            MockEdge(fact='PRD: planned fact', uuid='edge-planned', episodes=[ep1]),
+        ])
+
+        scope = Scope(project_id='test')
+        results = await service_with_registry._search_graphiti(
+            'planned', scope, 10, include_planned=True
+        )
+
+        assert [r.id for r in results] == ['edge-real', 'edge-planned']
+        assert 'planned' not in results[0].metadata
+        assert results[1].metadata['planned'] is True, (
+            'RRF stamping must not clobber the planned marker'
+        )
+        # Both edges survive, so both consume a rank.
+        assert [r.metadata['store_rank'] for r in results] == [1, 2]
+        assert [r.metadata['store_score'] for r in results] == [None, None]
+        assert results[1].relevance_score == pytest.approx(1.0 / (RRF_K + 2))
+
 
 class TestSearchMem0Filtering:
     """step-15: _search_mem0 filtering — exclude planned=True by default, include with flag."""
@@ -6176,6 +6212,143 @@ class TestSearchMem0Filtering:
         results = await service._search_mem0('PostgreSQL', scope, 10)
 
         assert len(results) == 1, 'Non-planned result must NOT be excluded'
+
+
+class TestSearchMem0RrfFields:
+    """Task 3658: _search_mem0 stamps store_rank/store_score and scores via RRF.
+
+    The Mem0 cosine no longer reaches relevance_score at all — it moves to
+    metadata['store_score'], the honest per-store signal the E1 retrieval probe
+    and the task 3212 telemetry read.  relevance_score becomes the ordinal
+    fused value.
+    """
+
+    @pytest.mark.asyncio
+    async def test_rank_is_contiguous_over_survivors_and_score_is_rrf(self, service):
+        """Ranks are 1-based over survivors; a planned skip does not consume one."""
+        from fused_memory.models.scope import Scope
+        from fused_memory.services.memory_service import RRF_K
+
+        service.mem0.search = AsyncMock(return_value={
+            'results': [
+                {
+                    'id': 'm-1', 'memory': 'Postgres for persistence', 'score': 0.79,
+                    'metadata': {'category': 'decisions_and_rationale'},
+                },
+                {
+                    # Skipped (planned) — must NOT consume rank 2.
+                    'id': 'm-planned', 'memory': 'PRD: maybe GraphQL', 'score': 0.71,
+                    'metadata': {'category': 'decisions_and_rationale', 'planned': True},
+                },
+                {
+                    'id': 'm-3', 'memory': 'Qdrant for vectors', 'score': 0.62,
+                    'metadata': {'category': 'decisions_and_rationale'},
+                },
+            ]
+        })
+
+        scope = Scope(project_id='test')
+        results = await service._search_mem0('storage', scope, 10)
+
+        assert [r.id for r in results] == ['m-1', 'm-3']
+        assert [r.metadata['store_rank'] for r in results] == [1, 2], (
+            'A result skipped for planned=True must not consume a rank'
+        )
+        assert [r.metadata['store_score'] for r in results] == [0.79, 0.62], (
+            'store_score must carry the raw Mem0 cosine verbatim'
+        )
+        for r in results:
+            assert isinstance(r.metadata['store_score'], float)
+            assert r.relevance_score == pytest.approx(
+                1.0 / (RRF_K + r.metadata['store_rank'])
+            )
+            assert r.relevance_score != pytest.approx(r.metadata['store_score']), (
+                'The cosine must no longer reach relevance_score'
+            )
+
+    @pytest.mark.asyncio
+    async def test_preexisting_metadata_keys_survive_stamping(self, service):
+        """category/planned and other backend keys coexist with the two new keys."""
+        from fused_memory.models.scope import Scope
+
+        service.mem0.search = AsyncMock(return_value={
+            'results': [
+                {
+                    'id': 'm-p', 'memory': 'PRD: planned thing', 'score': 0.88,
+                    'metadata': {
+                        'category': 'procedural_knowledge',
+                        'planned': True,
+                        'topic': 'docs-prd-landing',
+                    },
+                },
+            ]
+        })
+
+        scope = Scope(project_id='test')
+        results = await service._search_mem0('planned', scope, 10, include_planned=True)
+
+        meta = results[0].metadata
+        assert meta['category'] == 'procedural_knowledge'
+        assert meta['planned'] is True
+        assert meta['topic'] == 'docs-prd-landing'
+        assert meta['store_rank'] == 1
+        assert meta['store_score'] == 0.88
+        assert results[0].category == MemoryCategory.procedural_knowledge
+
+    @pytest.mark.asyncio
+    async def test_stamping_does_not_mutate_the_backend_response_dict(self, service):
+        """_search_mem0 must COPY the backend metadata dict before stamping.
+
+        `meta` is the dict object lifted straight out of the Mem0Backend.search
+        response; stamping into it would mutate the caller's response structure
+        in place — invisible in the common path, and exactly the kind of
+        aliasing bug no other test would catch.
+        """
+        from fused_memory.models.scope import Scope
+
+        meta_1 = {'category': 'observations_and_summaries'}
+        meta_2 = {'category': 'observations_and_summaries'}
+        service.mem0.search = AsyncMock(return_value={
+            'results': [
+                {'id': 'm-a', 'memory': 'A', 'score': 0.9, 'metadata': meta_1},
+                {'id': 'm-b', 'memory': 'B', 'score': 0.8, 'metadata': meta_2},
+            ]
+        })
+
+        scope = Scope(project_id='test')
+        results = await service._search_mem0('anything', scope, 10)
+
+        for original in (meta_1, meta_2):
+            assert 'store_rank' not in original, (
+                'store_rank leaked into the backend response dict (aliasing bug)'
+            )
+            assert 'store_score' not in original, (
+                'store_score leaked into the backend response dict (aliasing bug)'
+            )
+        # The results carry the stamped copies.
+        assert results[0].metadata is not meta_1
+        assert results[0].metadata['store_rank'] == 1
+        assert results[1].metadata['store_rank'] == 2
+
+    @pytest.mark.asyncio
+    async def test_missing_score_defaults_to_zero_and_still_gets_a_rank(self, service):
+        """A result with no 'score' key keeps the existing 0.0 default."""
+        from fused_memory.models.scope import Scope
+        from fused_memory.services.memory_service import RRF_K
+
+        service.mem0.search = AsyncMock(return_value={
+            'results': [
+                {'id': 'm-noscore', 'memory': 'No score field', 'metadata': {}},
+            ]
+        })
+
+        scope = Scope(project_id='test')
+        results = await service._search_mem0('anything', scope, 10)
+
+        assert len(results) == 1
+        assert results[0].metadata['store_score'] == 0.0
+        assert results[0].metadata['store_rank'] == 1
+        assert results[0].relevance_score == pytest.approx(1.0 / (RRF_K + 1))
 
 
 class TestSearchMem0CreatedAt:
@@ -6504,29 +6677,35 @@ class TestSearchGraphitiInvalidatedFiltering:
             'Results must be truncated to limit=10 when Graphiti returns more valid edges'
         )
 
-    # step-11: scores reflect original rank position from Graphiti, not re-ranked positions
+    # step-11 (task 3658): scores are ORDINAL RRF values over the SURVIVING rank.
+    # Supersedes the pre-RRF contract this test used to pin (synthesized
+    # score = max(0, 1 - i*0.05), keyed on the raw pre-filter index i), which
+    # task 3658 deleted: Graphiti exposes no scores at all, so a synthesized
+    # similarity was never an honest number to merge against Mem0 cosines.
     @pytest.mark.asyncio
-    async def test_scores_reflect_original_rank_position(self, service):
-        """Surviving edges keep scores from their original Graphiti rank positions.
+    async def test_scores_are_rrf_over_surviving_rank(self, service):
+        """Surviving edges are scored 1/(RRF_K + rank), rank contiguous over survivors.
 
-        Graphiti returns 5 edges at positions 0-4. Edges at positions 1 and 3
-        are invalidated (invalid_at set). The surviving edges at positions 0, 2,
-        and 4 must score 1.0, 0.9, 0.8 respectively (score = max(0, 1 - i*0.05)),
-        NOT re-ranked to 1.0, 0.95, 0.9 based on their post-filter positions.
+        Graphiti returns 5 edges at positions 0-4; the edges at positions 1 and
+        3 are invalidated (invalid_at set).  The three survivors must take
+        ranks 1, 2, 3 — NOT 1, 3, 5 — because a filtered edge must not consume
+        a rank: RRF maps rank directly to score, so a gap would silently
+        penalize the store for facts the caller never sees.
         """
         from _fm_helpers import MockEdge
 
         from fused_memory.models.scope import Scope
+        from fused_memory.services.memory_service import RRF_K
 
         dt_valid = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
         dt_invalid = datetime(2024, 9, 1, 0, 0, 0, tzinfo=UTC)
 
         service.graphiti.search = AsyncMock(return_value=[
-            MockEdge(fact='Fact at pos 0', uuid='pos-0', valid_at=dt_valid, invalid_at=None),        # i=0, score=1.00
+            MockEdge(fact='Fact at pos 0', uuid='pos-0', valid_at=dt_valid, invalid_at=None),        # survivor -> rank 1
             MockEdge(fact='Superseded at pos 1', uuid='pos-1', valid_at=dt_valid, invalid_at=dt_invalid),  # filtered
-            MockEdge(fact='Fact at pos 2', uuid='pos-2', valid_at=dt_valid, invalid_at=None),        # i=2, score=0.90
+            MockEdge(fact='Fact at pos 2', uuid='pos-2', valid_at=dt_valid, invalid_at=None),        # survivor -> rank 2
             MockEdge(fact='Superseded at pos 3', uuid='pos-3', valid_at=dt_valid, invalid_at=dt_invalid),  # filtered
-            MockEdge(fact='Fact at pos 4', uuid='pos-4', valid_at=dt_valid, invalid_at=None),        # i=4, score=0.80
+            MockEdge(fact='Fact at pos 4', uuid='pos-4', valid_at=dt_valid, invalid_at=None),        # survivor -> rank 3
         ])
 
         scope = Scope(project_id='test')
@@ -6534,15 +6713,228 @@ class TestSearchGraphitiInvalidatedFiltering:
 
         assert len(results) == 3, 'Three edges should survive filtering'
 
-        scores_by_id = {r.id: r.relevance_score for r in results}
-        assert scores_by_id['pos-0'] == pytest.approx(1.00), (
-            'Edge at original rank 0 must score 1.0 (1.0 - 0*0.05)'
+        # Ranks are 1-based and contiguous over SURVIVORS, in Graphiti's order.
+        assert [r.id for r in results] == ['pos-0', 'pos-2', 'pos-4']
+        assert [r.metadata['store_rank'] for r in results] == [1, 2, 3], (
+            'store_rank must be contiguous 1..N over surviving edges — a '
+            'filtered edge must not consume a rank'
         )
-        assert scores_by_id['pos-2'] == pytest.approx(0.90), (
-            'Edge at original rank 2 must score 0.9 (1.0 - 2*0.05)'
+
+        # Graphiti has no scores of its own: store_score is honestly absent.
+        for r in results:
+            assert r.metadata['store_score'] is None, (
+                "Graphiti's public search() exposes no scores, so store_score "
+                'must be None rather than a synthesized stand-in'
+            )
+
+        # relevance_score is the ordinal RRF value derived from that rank.
+        for r in results:
+            assert r.relevance_score == pytest.approx(
+                1.0 / (RRF_K + r.metadata['store_rank'])
+            ), f'{r.id}: relevance_score must be 1/(RRF_K + store_rank)'
+
+        # The old synthesized sequence is gone entirely.
+        for r in results:
+            for stale in (1.0, 0.95, 0.90, 0.80):
+                assert r.relevance_score != pytest.approx(stale), (
+                    f'{r.id} still carries the pre-RRF synthesized score {stale}'
+                )
+
+        scores = [r.relevance_score for r in results]
+        assert scores == sorted(scores, reverse=True) and len(set(scores)) == 3, (
+            'RRF scores must be strictly decreasing in rank order'
         )
-        assert scores_by_id['pos-4'] == pytest.approx(0.80), (
-            'Edge at original rank 4 must score 0.8 (1.0 - 4*0.05)'
+
+
+class TestSearchRrfMerge:
+    """Task 3658: MemoryService.search merges the two stores by RRF, not by precedence.
+
+    This is the contract the merge lane actually gates.  The seeded
+    real-embedder probe in tests/test_rrf_cross_store_merge.py is
+    `integration`-marked and therefore deselected by the package's default
+    addopts, so it corroborates the signal but cannot pin it — these unit tests
+    must stand alone.
+
+    Because the two stores never return the same result id (Graphiti edge uuid
+    vs Mem0 memory id, and there is no cross-store dedup), every result's fused
+    score is the single term 1/(RRF_K + its own store rank).  Merged order is
+    therefore a rank INTERLEAVE, which is precisely what ends the Mem0
+    shut-out: on the old (is_primary, -score) sort, five Graphiti results filled
+    limit=5 and truncation dropped Mem0 entirely.
+    """
+
+    @staticmethod
+    def _route(primary):
+        """A deterministic two-store route, bypassing the real classifier."""
+        from fused_memory.models.enums import QueryType
+        from fused_memory.models.memory import ReadRouteResult
+
+        return ReadRouteResult(
+            query_type=QueryType.broad,
+            stores=[SourceStore.graphiti, SourceStore.mem0],
+            primary_store=primary,
+        )
+
+    @staticmethod
+    def _seed_both_stores(service, *, graphiti_edges=5, mem0_results=5):
+        """Seed N Graphiti edges and M Mem0 results with descending cosines."""
+        from _fm_helpers import MockEdge
+
+        dt_valid = datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC)
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(
+                fact=f'Graphiti fact {n}', uuid=f'g-{n}',
+                valid_at=dt_valid, invalid_at=None,
+            )
+            for n in range(1, graphiti_edges + 1)
+        ])
+        service.mem0.search = AsyncMock(return_value={
+            'results': [
+                {
+                    'id': f'm-{n}',
+                    'memory': f'Mem0 memory {n}',
+                    # Descending, and deliberately high for m-1: under RRF its
+                    # placement must come from its RANK, not its cosine.
+                    'score': round(0.79 - 0.05 * (n - 1), 4),
+                    'metadata': {'category': 'observations_and_summaries'},
+                }
+                for n in range(1, mem0_results + 1)
+            ]
+        })
+
+    @pytest.mark.asyncio
+    async def test_mem0_rank1_is_not_shut_out_under_graphiti_primary(self, service):
+        """Boundary test 1: the Mem0 top hit reaches the merged top-5 at index 1.
+
+        FAILS ON MAIN: the (is_primary, -relevance_score) sort put all five
+        Graphiti results first and results[:limit] discarded every Mem0 result.
+        """
+        service.router.route = AsyncMock(return_value=self._route(SourceStore.graphiti))
+        self._seed_both_stores(service)
+
+        merged = await service.search('anything', project_id='test', limit=5)
+
+        assert merged[0].id == 'g-1', 'Graphiti rank-1 still leads under a graphiti-primary route'
+        assert merged[1].id == 'm-1', (
+            'The Mem0 rank-1 result must land at merged index 1 — under RRF it '
+            'ties Graphiti rank-1 and loses only the primary-store tiebreak'
+        )
+        assert 'm-1' in {r.id for r in merged}, 'Mem0 must not be shut out of the top-5'
+        assert [r.source_store for r in merged] == [
+            SourceStore.graphiti, SourceStore.mem0, SourceStore.graphiti,
+            SourceStore.mem0, SourceStore.graphiti,
+        ], 'Merged order must be a rank interleave'
+
+        needle = next(r for r in merged if r.id == 'm-1')
+        assert needle.metadata['store_score'] == pytest.approx(0.79), (
+            'The Mem0 cosine must survive verbatim in metadata.store_score'
+        )
+
+    @pytest.mark.asyncio
+    async def test_graphiti_is_not_shut_out_under_mem0_primary(self, service):
+        """Boundary test 2: the interleave is symmetric — no reverse shut-out."""
+        service.router.route = AsyncMock(return_value=self._route(SourceStore.mem0))
+        self._seed_both_stores(service)
+
+        merged = await service.search('anything', project_id='test', limit=5)
+
+        graphiti_hits = [r for r in merged if r.source_store == SourceStore.graphiti]
+        assert graphiti_hits, 'Graphiti must not be shut out under a mem0-primary route'
+        assert [r.source_store for r in merged] == [
+            SourceStore.mem0, SourceStore.graphiti, SourceStore.mem0,
+            SourceStore.graphiti, SourceStore.mem0,
+        ], 'The interleave must flip with the primary store'
+        assert merged[0].id == 'm-1'
+        assert merged[1].id == 'g-1'
+
+    @pytest.mark.asyncio
+    async def test_primary_store_is_a_tiebreak_not_precedence(self, service):
+        """A higher-ranked secondary result beats a lower-ranked primary one."""
+        service.router.route = AsyncMock(return_value=self._route(SourceStore.graphiti))
+        self._seed_both_stores(service)
+
+        merged = await service.search('anything', project_id='test', limit=10)
+
+        order = [r.id for r in merged]
+        assert order.index('m-1') < order.index('g-2'), (
+            'Mem0 rank-1 (1/61) must outrank Graphiti rank-2 (1/62) even though '
+            'graphiti is the primary store — primary is a tiebreak, not precedence'
+        )
+        # ...and the tie it does win is only against the SAME rank.
+        assert order.index('g-1') < order.index('m-1')
+
+    @pytest.mark.asyncio
+    async def test_relevance_score_is_the_fused_ordinal(self, service):
+        """Every merged result scores 1/(RRF_K + its own store_rank)."""
+        from fused_memory.services.memory_service import RRF_K
+
+        service.router.route = AsyncMock(return_value=self._route(SourceStore.graphiti))
+        self._seed_both_stores(service)
+
+        merged = await service.search('anything', project_id='test', limit=10)
+
+        assert len(merged) == 10
+        for r in merged:
+            assert r.relevance_score == pytest.approx(
+                1.0 / (RRF_K + r.metadata['store_rank'])
+            ), f'{r.id}: relevance_score must be the fused ordinal'
+            # No raw cosine leaks into the fused value.
+            assert r.relevance_score != pytest.approx(0.79)
+            assert r.relevance_score < 0.02, (
+                'A fused RRF value is ordinal and lives in the 1/61..1/70 band'
+            )
+        # The seeded cosine is reachable, but only as per-store truth.
+        assert next(r for r in merged if r.id == 'm-1').metadata['store_score'] == pytest.approx(0.79)
+        # Graphiti has no cosine to report.
+        for r in merged:
+            if r.source_store == SourceStore.graphiti:
+                assert r.metadata['store_score'] is None
+
+    @pytest.mark.asyncio
+    async def test_unequal_store_depths_fill_every_slot(self, service):
+        """A shallow store simply stops contributing; no crash, no gap."""
+        service.router.route = AsyncMock(return_value=self._route(SourceStore.graphiti))
+        self._seed_both_stores(service, graphiti_edges=1, mem0_results=5)
+
+        merged = await service.search('anything', project_id='test', limit=5)
+
+        assert [r.id for r in merged] == ['g-1', 'm-1', 'm-2', 'm-3', 'm-4'], (
+            'Once Graphiti is exhausted, Mem0 fills the remaining slots in rank order'
+        )
+
+    @pytest.mark.asyncio
+    async def test_category_filter_and_inference_still_apply(self, service):
+        """Regression guard: the category block (which runs AFTER the sort) is untouched."""
+        service.router.route = AsyncMock(return_value=self._route(SourceStore.graphiti))
+        self._seed_both_stores(service, graphiti_edges=2, mem0_results=2)
+
+        merged = await service.search(
+            'anything', project_id='test', limit=10,
+            categories=['decisions_and_rationale'],
+        )
+
+        # Mem0 results carry observations_and_summaries and are filtered out;
+        # the category=None Graphiti results survive and are assigned the
+        # unambiguously inferred category.
+        assert [r.id for r in merged] == ['g-1', 'g-2']
+        for r in merged:
+            assert r.category == MemoryCategory.decisions_and_rationale, (
+                'An unambiguous Graphiti category must still be inferred'
+            )
+
+    @pytest.mark.asyncio
+    async def test_degraded_and_failed_stores_still_reported(self, service):
+        """Regression guard: per-store error absorption is unchanged by the new sort."""
+        service.router.route = AsyncMock(return_value=self._route(SourceStore.graphiti))
+        self._seed_both_stores(service)
+        service.graphiti.search = AsyncMock(side_effect=RuntimeError('falkor down'))
+
+        merged = await service.search('anything', project_id='test', limit=5)
+
+        assert merged.degraded is True
+        assert merged.failed_stores == ['graphiti']
+        assert [r.id for r in merged] == ['m-1', 'm-2', 'm-3', 'm-4', 'm-5'], (
+            "A single responding store returns its results in that store's own rank order"
         )
 
 

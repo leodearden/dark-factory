@@ -97,6 +97,44 @@ logger = logging.getLogger(__name__)
 # must dominate 6 * _SUBCLOSE_TIMEOUT (guarded by TestShutdownBudgetArithmetic).
 _SUBCLOSE_TIMEOUT = 3.0
 
+# Reciprocal Rank Fusion constant for the cross-store merge in
+# MemoryService.search (task 3658, PRD D4 — deliberately a module constant, not
+# config: it is part of the documented read contract, not an operator knob).
+#
+# The consequence worth internalizing: because K dominates the ranks in play
+# (limit is typically <= 20), the fused value is an ORDINAL, never a similarity.
+# Every possible score lives in the narrow band 1/(K+1) .. 1/(K+limit) — for
+# K=60, roughly 0.0164 down to 0.0125. Do not read a fused score as "how
+# similar"; per-store truth lives in metadata['store_score'].
+RRF_K = 60
+
+
+def _rrf_score(rank: int) -> float:
+    """Reciprocal Rank Fusion score for a 1-based per-store rank (task 3658).
+
+    The value is ORDINAL, never a similarity: rank-1 scores 1/(RRF_K + 1) =
+    1/61 ~ 0.0164 and rank-2 scores 1/62 ~ 0.0161, regardless of how good
+    either result actually is.  Consumers must not compare it across API
+    versions or treat it as a distance; the honest per-store signal is
+    ``metadata['store_score']`` (the Mem0 cosine; ``None`` for Graphiti, which
+    exposes no scores at all — the very reason RRF was chosen over score
+    calibration).
+
+    The PRD writes fusion as ``Σ over stores of 1/(K + rank_store(r))``, but
+    that sum degenerates to this single term for every result here: Graphiti
+    results are keyed by edge uuid and Mem0 results by memory id, and there is
+    no cross-store dedup anywhere in the pipeline, so no result is ever
+    contributed by more than one store.  A real multi-term accumulator would be
+    dead code no input can exercise.
+
+    That degeneracy is exactly what fixes the Mem0 shut-out: with one term per
+    result, the merged order becomes a rank INTERLEAVE (graphiti-1, mem0-1,
+    graphiti-2, mem0-2, ...) rather than one store's results wholesale
+    preceding the other's.
+    """
+    return 1.0 / (RRF_K + rank)
+
+
 # Canonical relational verb for dependency facts (mirrors routing/classifier.py:19).
 # Used by _restore_superseded_dependency_edges to identify edges that should
 # never be superseded by LLM edge-resolution.
@@ -3310,6 +3348,14 @@ class MemoryService:
 
     # ------------------------------------------------------------------
     # Read: search
+    #
+    # Cross-store merge is Reciprocal Rank Fusion with RRF_K (task 3658, PRD
+    # D4). The router's primary_store is a TIEBREAK, not precedence: it used to
+    # order results wholesale, which let one store fill `limit` and made the
+    # other structurally unreachable no matter how well it matched. Graphiti
+    # emits no synthesized scores any more — it has none of its own to report,
+    # which is why fusion is by rank rather than by calibrated score. See
+    # `_rrf_score` and the `search` docstring for the full consumer contract.
     # ------------------------------------------------------------------
 
     async def search(
@@ -3329,6 +3375,30 @@ class MemoryService:
         When include_planned=False (default), edges and memories from planning
         episodes (temporal_context='planning') are excluded.  Set include_planned=True
         to include them — useful for reconciliation and auditing.
+
+        Ordering (task 3658, PRD D4).  Each responding store ranks its own
+        results — Mem0 by cosine descending, Graphiti by its backend rank — and
+        the two are merged by Reciprocal Rank Fusion with ``K = RRF_K``, ties
+        broken by (router primary store, store-internal rank).  The router's
+        primary store is a TIEBREAK ONLY; it is no longer precedence, so
+        neither store can fill ``limit`` and shut the other out.
+
+        Scores.  ``relevance_score`` is the fused RRF value and is **ORDINAL,
+        never a similarity**: single-store rank-1 is 1/61 ~ 0.0164 no matter
+        how good the match is.  Do not threshold it, do not compare it across
+        API versions, and do not compare it to a cosine.  Per-store truth lives
+        in ``metadata``:
+
+          - ``store_rank`` — int, 1-based rank within the store that returned
+            it (over that store's surviving results; deliberately not
+            renumbered by the category filter below, since it is a per-store
+            telemetry fact rather than a position in the merged output).
+          - ``store_score`` — the Mem0 cosine, verbatim; ``None`` for Graphiti,
+            whose public search() exposes no scores at all.
+
+        ``degraded`` / ``failed_stores`` / ``failure_diagnostics`` and
+        per-store error absorption are unchanged: a store that raises or times
+        out is absorbed, and the surviving store's results are still returned.
         """
         scope = Scope(project_id=project_id, agent_id=agent_id, session_id=session_id)
 
@@ -3391,10 +3461,17 @@ class MemoryService:
                     failed_stores.append(store_list[i])
                     failure_diagnostics.append(diag)
 
-        # Sort: primary store results first, then by relevance score
-        def sort_key(r: MemoryResult) -> tuple[int, float]:
-            is_primary = 0 if r.source_store == route.primary_store else 1
-            return (is_primary, -r.relevance_score)
+        # Merge by Reciprocal Rank Fusion (task 3658, PRD D4).  Primary sort is
+        # the fused score descending; the router's primary store is only a
+        # TIEBREAK — it used to be outright precedence, which let one store
+        # fill `limit` and made the other structurally unreachable.  Store rank
+        # is the final tiebreak, which makes the ordering total and
+        # deterministic (is_primary already distinguishes the only two stores
+        # that can tie on score).  Read store_rank defensively so a result from
+        # a future code path that lacks the key can never raise here.
+        def sort_key(r: MemoryResult) -> tuple[float, int, int]:
+            primary_rank = 0 if r.source_store == route.primary_store else 1
+            return (-r.relevance_score, primary_rank, r.metadata.get('store_rank', 0))
 
         results.sort(key=sort_key)
 
@@ -3458,6 +3535,19 @@ class MemoryService:
         When include_planned=False (default), edges whose entire provenance is
         composed of planned-only episodes are excluded.  When include_planned=True,
         those edges are returned and marked with metadata['planned'] = True.
+
+        Results are ranked by Graphiti's own backend ordering and carry, in
+        metadata (task 3658):
+
+          - ``store_rank``: 1-based rank, contiguous over the SURVIVING edges
+            (an edge dropped for ``invalid_at`` or planned-only provenance does
+            not consume a rank).
+          - ``store_score``: always ``None`` — Graphiti's public ``search()``
+            exposes no scores, and synthesizing one would be a lie the
+            cross-store merge would then act on.
+
+        ``relevance_score`` is the ordinal ``_rrf_score(store_rank)``, not a
+        similarity.
         """
         edges = await self.graphiti.search(
             query=query,
@@ -3473,7 +3563,7 @@ class MemoryService:
             )
 
         results = []
-        for i, edge in enumerate(edges):
+        for edge in edges:
             fact = getattr(edge, 'fact', str(edge))
             valid_at = getattr(edge, 'valid_at', None)
             invalid_at = getattr(edge, 'invalid_at', None)
@@ -3508,19 +3598,22 @@ class MemoryService:
                 # Skip planning-only edges in normal search results.
                 continue
 
-            # Score: rank-based (no explicit score from Graphiti search)
-            score = max(0.0, 1.0 - (i * 0.05))
+            # Rank over SURVIVORS only (task 3658): the raw enumerate index
+            # counted edges skipped above, and since RRF maps rank directly to
+            # score, a gap would silently penalize Graphiti for facts the
+            # caller never sees.
+            rank = len(results) + 1
 
-            metadata: dict[str, Any] = {}
+            metadata: dict[str, Any] = {'store_rank': rank, 'store_score': None}
             if is_planned_edge:
                 metadata['planned'] = True
 
             results.append(MemoryResult(
-                id=getattr(edge, 'uuid', str(i)),
+                id=getattr(edge, 'uuid', str(rank)),
                 content=fact,
                 category=None,
                 source_store=SourceStore.graphiti,
-                relevance_score=score,
+                relevance_score=_rrf_score(rank),
                 provenance=provenance,
                 temporal=temporal,
                 entities=entities,
@@ -3541,6 +3634,19 @@ class MemoryService:
 
         When include_planned=False (default), results tagged with planned=True
         in their metadata are excluded.  When include_planned=True they are returned.
+
+        Results are ranked by Mem0's own cosine-descending ordering and carry,
+        in metadata (task 3658):
+
+          - ``store_rank``: 1-based rank, contiguous over the SURVIVING results
+            (a result dropped for ``planned`` does not consume a rank).
+          - ``store_score``: Mem0's raw cosine, verbatim and un-clamped — the
+            honest per-store signal for the E1 retrieval probe and the task
+            3212 telemetry.
+
+        ``relevance_score`` is the ordinal ``_rrf_score(store_rank)``: the
+        cosine no longer reaches it, so it is no longer comparable to a
+        similarity.
         """
         # Forward categories so Mem0Backend pushes the filter down to Qdrant
         # (task 1083: prevents false-negatives caused by post-filtering on
@@ -3562,13 +3668,29 @@ class MemoryService:
                 with contextlib.suppress(ValueError):
                     category = MemoryCategory(meta['category'])
 
+            # Rank over SURVIVORS only (task 3658) — a result skipped above must
+            # not consume a rank, since RRF maps rank directly to score.
+            rank = len(results) + 1
+
+            # COPY before stamping: `meta` is the dict object handed back by
+            # Mem0Backend.search, i.e. the caller's own response structure.
+            # Stamping into it would mutate that response in place.  The cosine
+            # is stored raw and un-clamped — store_score is a plain dict value
+            # with no pydantic bound, and clamping would corrupt the honest
+            # per-store signal.  (The old min(score, 1.0) existed only to
+            # satisfy MemoryResult.relevance_score's le=1.0; the RRF value is
+            # <= 1/61, so that clamp is no longer needed there either.)
+            metadata = dict(meta)
+            metadata['store_rank'] = rank
+            metadata['store_score'] = score
+
             results.append(MemoryResult(
                 id=item.get('id', ''),
                 content=content,
                 category=category,
                 source_store=SourceStore.mem0,
-                relevance_score=min(score, 1.0),
-                metadata=meta,
+                relevance_score=_rrf_score(rank),
+                metadata=metadata,
                 created_at=item.get('created_at'),
             ))
         return results
