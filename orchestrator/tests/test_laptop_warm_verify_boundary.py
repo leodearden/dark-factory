@@ -1194,51 +1194,52 @@ _SCALED_DISCOVERY_HELPERS: frozenset[str] = frozenset(
 #: leaves the other half of the poll tick reading real /proc.
 _DISCOVERY_SEAM_KWARGS: frozenset[str] = frozenset({'_probe_children', '_ppid_map'})
 
-#: Last-resort stand-in for pytest-timeout's ``timeout`` ini value, used ONLY
-#: when the live config cannot supply it (plugin absent / key unregistered).
-#: The real value is read from the running config by
-#: :func:`_inherited_ini_timeout_secs` -- hardcoding
-#: orchestrator/pyproject.toml's ``timeout = 60`` would make this guard reason
-#: from exactly the kind of unreachable literal its closing assertion bans.
-_INHERITED_INI_TIMEOUT_FALLBACK_SECS: float = 60.0
+#: Last-resort stand-in for the pytest-timeout budget an unmarked test
+#: inherits, used ONLY when pytest-timeout did not configure this run at all
+#: (``-p no:timeout``, or a version that stops exposing its resolved value).
+#: The live value is read by :func:`_inherited_timeout_budget_secs` --
+#: hardcoding orchestrator/pyproject.toml's ``timeout = 60`` would make this
+#: guard reason from exactly the kind of unreachable literal its closing
+#: assertion bans.
+_INHERITED_TIMEOUT_FALLBACK_SECS: float = 60.0
 
 
-def _inherited_ini_timeout_secs(config) -> float:
-    """The per-test timeout budget an UNMARKED test in this module inherits.
+def _inherited_timeout_budget_secs(config) -> float:
+    """The pytest-timeout budget an UNMARKED test in this module inherits.
 
-    Read from the live pytest config (``timeout`` ini, paired with
-    ``timeout_method = "thread"``) rather than duplicated as a literal, so a
-    change to orchestrator/pyproject.toml cannot leave the sweep below
-    reasoning from -- and misreporting -- a stale number.
+    Read from ``config._env_timeout`` -- the plugin's OWN resolved value, i.e.
+    literally what ``pytest_timeout._get_item_settings`` hands an item carrying
+    no ``timeout`` marker -- rather than duplicated as a literal, so a change to
+    orchestrator/pyproject.toml cannot leave the sweep below reasoning from, and
+    misreporting, a stale number.
 
-    Falling back to the literal is WARNED, not silent: the fallback means the
-    sweep is once again reasoning from a duplicated constant, which is the
-    defect this function exists to remove.  Warning rather than raising keeps a
-    missing/renamed ini key from failing the guard outright -- the sweep's real
-    subject is the marked call sites, and today every swept test carries an
-    explicit mark, so the inherited budget is a backstop for a future unmarked
-    one.
+    ``getini('timeout')`` alone will NOT do, MEASURED here on pytest-timeout
+    2.4.0: it returns the STRING ``'60'`` (so float() coercion is mandatory),
+    returns ``''`` on a root-bound run because the repo-root pyproject declares
+    no ``timeout`` key at all, and -- the one that matters -- stays STALE at
+    ``'60'`` under ``--timeout=300``, which this repo's per-module verify
+    commands do pass.  ``get_env_settings()`` resolves ``--timeout`` ->
+    ``PYTEST_TIMEOUT`` -> truthy ini and stores the winner as ``_env_timeout``;
+    reading the winner cannot drift from the plugin's chain the way a local
+    re-implementation of that chain would.
+
+    ``None`` means no timeout was configured anywhere (measured: a root-bound
+    run), so nothing can truncate an unmarked test and its budget really is
+    unbounded.  Reporting the literal there would make this guard fail tests
+    over a truncation that cannot happen.
     """
-    try:
-        raw = config.getini('timeout')
-    except (ValueError, KeyError) as exc:  # pytest-timeout not registered
+    if not hasattr(config, '_env_timeout'):
         warnings.warn(
-            f'pytest-timeout ini key "timeout" unavailable ({exc!r}); the '
-            f'discovery-wait sweep is falling back to the duplicated literal '
-            f'{_INHERITED_INI_TIMEOUT_FALLBACK_SECS}s for unmarked tests',
+            'pytest-timeout did not configure this run (no config._env_timeout), '
+            'so the discovery-wait sweep is falling back to the duplicated '
+            f'literal {_INHERITED_TIMEOUT_FALLBACK_SECS}s for unmarked tests',
             stacklevel=2,
         )
-        return _INHERITED_INI_TIMEOUT_FALLBACK_SECS
-    try:
-        return float(raw)
-    except (TypeError, ValueError):  # key registered but unset ('') or non-numeric
-        warnings.warn(
-            f'pytest-timeout ini "timeout" is {raw!r}, not a number; the '
-            f'discovery-wait sweep is falling back to the duplicated literal '
-            f'{_INHERITED_INI_TIMEOUT_FALLBACK_SECS}s for unmarked tests',
-            stacklevel=2,
-        )
-        return _INHERITED_INI_TIMEOUT_FALLBACK_SECS
+        return _INHERITED_TIMEOUT_FALLBACK_SECS
+    resolved = config._env_timeout
+    if resolved is None:
+        return math.inf  # no timeout anywhere: an unmarked test cannot be truncated
+    return float(resolved)
 
 
 #: Anti-vacuity floor for the sweep below: an AST matcher that silently stops
@@ -1309,7 +1310,7 @@ def _timeout_mark_argument(func_node):
     """The single argument node of *func_node*'s ``@pytest.mark.timeout(...)``.
 
     Returns None when the function carries no such decorator (it then
-    inherits the ini budget -- see :func:`_inherited_ini_timeout_secs`).
+    inherits the run's budget -- see :func:`_inherited_timeout_budget_secs`).
     """
     for decorator in func_node.decorator_list:
         if not isinstance(decorator, ast.Call):
@@ -1412,7 +1413,7 @@ def test_every_scaled_discovery_wait_is_covered_by_its_test_timeout_mark(request
         f'nothing (matched: {sorted(swept)})'
     )
 
-    inherited = _inherited_ini_timeout_secs(request.config)
+    inherited = _inherited_timeout_budget_secs(request.config)
     under_budget: list[str] = []
     literal_marked: list[str] = []
     for name, (n_scaled, func_node) in sorted(swept.items()):
