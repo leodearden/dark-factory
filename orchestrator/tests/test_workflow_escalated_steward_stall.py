@@ -663,7 +663,7 @@ class TestStaleOutcomeHygiene:
         )
 
 
-def _make_steward_config() -> MagicMock:
+def _make_steward_config(project_root: Path) -> MagicMock:
     """A MagicMock ``OrchestratorConfig`` for a REAL ``TaskSteward``.
 
     Same stamping recipe as ``test_steward.py``'s ``mock_config`` fixture so
@@ -679,7 +679,10 @@ def _make_steward_config() -> MagicMock:
     enough that fix C cannot be what satisfies it.
     """
     cfg = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-    cfg.project_root = Path('/tmp/fake-project')
+    # Same recipe as conftest.py's make_steward (parents=True, exist_ok=True), so
+    # the call cannot collide with a directory the enclosing test already built.
+    project_root.mkdir(parents=True, exist_ok=True)
+    cfg.project_root = project_root
     cfg.models.steward = 'opus'
     cfg.budgets.steward = 5.0
     cfg.max_turns.steward = 100
@@ -729,7 +732,7 @@ def test_make_steward_config_project_root_is_sandboxed(tmp_path):
 
 
 def _make_real_steward_factory(
-    queue: EscalationQueue, esc: Escalation, task_id: str,
+    queue: EscalationQueue, esc: Escalation, task_id: str, project_root: Path,
 ):
     """A ``_steward_factory`` that builds a GENUINE ``TaskSteward``.
 
@@ -746,7 +749,7 @@ def _make_real_steward_factory(
     steward passes against a fake contract.  Task 2248 shipped the strand
     precisely because only the ``_mark_blocked`` half was ever tested.
     """
-    steward_config = _make_steward_config()
+    steward_config = _make_steward_config(project_root)
 
     class _CapFiringSteward(TaskSteward):
         async def start(self) -> None:
@@ -809,7 +812,7 @@ class TestRealStewardGiveUpUnblocksEscalatedRun:
         )
         _wire_resolve_callback(queue, workflow)
         workflow._steward_factory = _make_real_steward_factory(
-            queue, esc, task_assignment.task_id,
+            queue, esc, task_assignment.task_id, tmp_path / 'project',
         )
         evrl_mock, _state = _make_evrl_returner(
             [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],
